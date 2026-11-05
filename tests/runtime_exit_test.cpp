@@ -120,20 +120,62 @@ int RunAndSignal(const fs::path& executable,
     return -2;
 }
 
+struct PanelConsoleEntry {
+    std::string timestamp;
+    std::string message;
+    std::string name;
+    std::string node;
+
+    bool Matches(std::string_view event, std::string_view node_id) const {
+        return name == "replay-panel" && node == node_id && message.starts_with(event);
+    }
+};
+
+PanelConsoleEntry ParsePanelConsole(const std::string& line) {
+    PanelConsoleEntry entry;
+    std::istringstream fields(line);
+    std::string key, value;
+    while (std::getline(fields >> std::ws, key, '=') && fields >> std::quoted(value)) {
+        if (key == "time") entry.timestamp = value;
+        else if (key == "msg") entry.message = value;
+        else if (key == "Name") entry.name = value;
+        else if (key == "ID") entry.node = value;
+    }
+    return entry;
+}
+
+size_t CountPanelEvents(const std::string& output, std::string_view event, int node,
+                       std::string_view detail = {}) {
+    const auto node_id = std::to_string(node);
+    std::istringstream lines(output);
+    std::string line;
+    size_t count = 0;
+    while (std::getline(lines, line)) {
+        const auto entry = ParsePanelConsole(line);
+        if (entry.Matches(event, node_id) && entry.message.find(detail) != std::string::npos) ++count;
+    }
+    return count;
+}
+
 bool HasFixedPanelHeartbeat(const std::string& output) {
     std::istringstream lines(output);
     std::string line;
     std::vector<std::time_t> times;
     bool ready = false;
     while (std::getline(lines, line)) {
-        if (line.find("Panel replay-panel/1 status:") == std::string::npos) continue;
+        const auto entry = ParsePanelConsole(line);
+        if (!entry.Matches("Panel status:", "1")) continue;
         std::tm timestamp{};
-        timestamp.tm_isdst = -1;
-        std::istringstream prefix(line);
-        prefix >> std::get_time(&timestamp, "%Y/%m/%d %H:%M:%S");
-        if (prefix.fail()) return false;
-        times.push_back(std::mktime(&timestamp));
-        ready = line.find("status: ready | inbound ready") != std::string::npos;
+        std::istringstream prefix(entry.timestamp);
+        prefix >> std::get_time(&timestamp, "%Y-%m-%dT%H:%M:%S");
+        char sign = 0, colon = 0;
+        int hours = 0, minutes = 0;
+        prefix >> sign >> hours >> colon >> minutes;
+        if (prefix.fail() || (sign != '+' && sign != '-') || colon != ':' ||
+            hours > 23 || minutes > 59) return false;
+        const int offset = (hours * 60 + minutes) * 60 * (sign == '+' ? 1 : -1);
+        times.push_back(timegm(&timestamp) - offset);
+        ready = entry.message.find("state=ready inbound=ready") != std::string::npos;
     }
     if (times.size() != 2 || !ready) return false;
     // Log timestamps have second resolution; allow scheduler jitter without
@@ -145,7 +187,7 @@ bool HasFixedPanelHeartbeat(const std::string& output) {
 }
 
 bool WaitForOutput(const fs::path& path, std::string_view needle,
-                   size_t count, std::chrono::seconds timeout) {
+                   size_t count, std::chrono::seconds timeout, int panel_node = 0) {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     do {
         const auto read = [](const fs::path& file_path) {
@@ -161,8 +203,9 @@ bool WaitForOutput(const fs::path& path, std::string_view needle,
         } else {
             output = read(path);
         }
-        size_t found = 0;
-        for (size_t at = 0; (at = output.find(needle, at)) != std::string::npos; at += needle.size()) {
+        size_t found = panel_node ? CountPanelEvents(output, needle, panel_node) : 0;
+        for (size_t at = 0; !panel_node && (at = output.find(needle, at)) != std::string::npos;
+             at += needle.size()) {
             ++found;
         }
         if (found >= count) return true;
@@ -229,8 +272,7 @@ int WaitForReadyNode(const fs::path& path) {
         std::ifstream file(path, std::ios::binary);
         const std::string output{std::istreambuf_iterator<char>(file), {}};
         for (const int node : {1, 2}) {
-            if (output.find("Panel replay-panel/" + std::to_string(node) + " config: ready") !=
-                std::string::npos) return node;
+            if (CountPanelEvents(output, "Panel configuration ready:", node)) return node;
         }
         std::this_thread::sleep_for(50ms);
     } while (std::chrono::steady_clock::now() < deadline);
@@ -288,11 +330,9 @@ int main(int argc, char** argv) {
         bool listeners_ready = false;
         const auto output_path = root / "child-output.log";
         const int exit_code = RunAndSignal(executable, root, output_path, expected_ready, [&] {
-            listeners_ready = WaitForOutput(output_path,
-                "static_inbound ready tag=test-vmess-10086 port=10086", 1, 8s) && NodeListening(10086);
-            if (test_coexist) listeners_ready = listeners_ready &&
-                WaitForOutput(output_path, "static_inbound ready tag=static-test-owner", 1, 1s) &&
-                NodeListening(static_port);
+            listeners_ready = WaitForOutput(output_path, "server started", 1, 8s) &&
+                NodeListening(10086);
+            if (test_coexist) listeners_ready = listeners_ready && NodeListening(static_port);
         }, !test_implicit);
         std::ifstream file(output_path, std::ios::binary);
         const std::string output{std::istreambuf_iterator<char>(file), {}};
@@ -336,16 +376,18 @@ int main(int argc, char** argv) {
                         collision_loser = winner == 1 ? 2 : 1;
                         owner_ready = winner != 0 && NodeListening(port);
                     } else {
-                        owner_ready = WaitForOutput(output_path, "Panel replay-panel/1 config: ready", 1, 12s) &&
+                        owner_ready = WaitForOutput(output_path, "Panel configuration ready:", 1, 12s, 1) &&
                             NodeListening(port);
                     }
                     fixture.ReleaseCompanion();
                     collision_valid = owner_ready &&
-                        WaitForOutput(root / "logs", "Panel replay-panel/" + std::to_string(collision_loser) +
-                                      " sync: unavailable | pull", 1, 8s) &&
+                        WaitForOutput(output_path, "Panel sync unavailable: operation=pull", 1, 8s,
+                                      collision_loser) &&
                         WaitForOutput(root / "logs", panel_static_collision ?
-                            "TCP listener conflict tag=panel/replay-panel/2/vmess/" :
-                            "panel listener endpoint conflict owner=", 1, 1s) &&
+                            "tag=panel/replay-panel/2/vmess/" + std::to_string(port) +
+                                " owner=static-owner port=" + std::to_string(port) :
+                            "owner=replay-panel/" + std::to_string(3 - collision_loser) +
+                                " port=" + std::to_string(port), 1, 1s) &&
                         NodeListening(port);
                     std::cout << "panel same-endpoint rejection preserves original listener="
                               << collision_valid << '\n';
@@ -383,8 +425,7 @@ int main(int argc, char** argv) {
             const std::string output{std::istreambuf_iterator<char>(output_file), {}};
             if (any_collision) {
                 if (exit_code != 0 || !collision_valid ||
-                    output.find("Panel replay-panel/" + std::to_string(collision_loser) +
-                                " config: ready") != std::string::npos) {
+                    CountPanelEvents(output, "Panel configuration ready:", collision_loser) != 0) {
                     std::cerr << "unexpected panel collision: exit=" << exit_code << '\n' << output;
                     return 14;
                 }
@@ -398,12 +439,12 @@ int main(int argc, char** argv) {
                 return 0;
             }
             const auto expected_address = panel_fallback ? "127.77.0.3" : "127.77.0.2";
-            const auto expected_report = panel_fallback ? "traffic ok/0" : "traffic failed/0";
+            const auto expected_report = panel_fallback
+                ? "traffic=ok traffic_users=0" : "traffic=failed traffic_users=0";
             const bool report_valid = panel_heartbeat
                 ? held_open_for_heartbeat && HasFixedPanelHeartbeat(output) &&
-                    output.find("traffic failed/0") == std::string::npos &&
-                    output.find("traffic ok/0") == std::string::npos
-                : output.find(expected_report) != std::string::npos;
+                    CountPanelEvents(output, "Panel report:", 1) == 0
+                : CountPanelEvents(output, "Panel report:", 1, expected_report) != 0;
             if (exit_code != 0 || !posted || !closed_before_stop || !closed_after_stop || posts.size() != 1 ||
                 posts[0].address != expected_address || posts[0].body != "{}" ||
                 !report_valid) {

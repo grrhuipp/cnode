@@ -33,8 +33,7 @@ bool ParseDecryptedHeader(const uint8_t* data, size_t len,
                           VMessRequest& request) {
     static constexpr size_t kFixedHeaderSize = 38;
     if (len < kFixedHeaderSize + 4) {
-        LOG_NET_TRACE("[conn={}] VMess: decrypted header too short len={} min={}",
-                         trace_conn_id,
+        LOG_CONN_TRACE(trace_conn_id, "decrypted header too short len={} min={}",
                          len,
                          kFixedHeaderSize + 4);
         return false;
@@ -44,8 +43,7 @@ bool ParseDecryptedHeader(const uint8_t* data, size_t len,
 
     request.version = reader.ReadU8();
     if (!reader.Ok() || request.version != VERSION) {
-        LOG_NET_DEBUG("VMess: unsupported version {}", request.version);
-        LOG_NET_TRACE("[conn={}] VMess: unsupported version={}", trace_conn_id, request.version);
+        LOG_CONN_DEBUG(trace_conn_id, "unsupported version {}", request.version);
         return false;
     }
 
@@ -65,7 +63,7 @@ bool ParseDecryptedHeader(const uint8_t* data, size_t len,
     request.security = static_cast<Security>(ps & 0x0F);
     // Reject before routing: an unknown body security can never be framed.
     if (!IsSupportedSecurity(request.security)) {
-        LOG_NET_DEBUG("VMess: unsupported security {}", static_cast<int>(request.security));
+        LOG_CONN_DEBUG(trace_conn_id, "unsupported security {}", static_cast<int>(request.security));
         return false;
     }
 
@@ -84,9 +82,7 @@ bool ParseDecryptedHeader(const uint8_t* data, size_t len,
         reader.Skip(address.consumed);
         request.target = std::move(address.target);
     } else {
-        LOG_NET_DEBUG("VMess: unsupported command {}", static_cast<int>(request.command));
-        LOG_NET_TRACE("[conn={}] VMess: unsupported command={}",
-                      trace_conn_id, static_cast<int>(request.command));
+        LOG_CONN_DEBUG(trace_conn_id, "unsupported command {}", static_cast<int>(request.command));
         return false;
     }
 
@@ -100,13 +96,11 @@ bool ParseDecryptedHeader(const uint8_t* data, size_t len,
     uint32_t actual_fnv = reader.ReadU32BE();
 
     if (!reader.Ok() || expected_fnv != actual_fnv) {
-        LOG_NET_DEBUG("VMess: FNV1a checksum mismatch");
-        LOG_NET_TRACE("[conn={}] VMess: request header checksum mismatch", trace_conn_id);
+        LOG_CONN_DEBUG(trace_conn_id, "request header checksum mismatch");
         return false;
     }
 
-    LOG_NET_TRACE("[conn={}] VMess: header ok target={} command={} security={} options={:#04x} padding={}",
-                     trace_conn_id,
+    LOG_CONN_TRACE(trace_conn_id, "header decoded target={} command={} security={} options={:#04x} padding={}",
                      request.target,
                      static_cast<int>(request.command),
                      static_cast<int>(request.security),
@@ -121,7 +115,8 @@ bool OpenRequestHeader(const uint8_t* packet,
                        const proxyman::inbound::UserStore::VmessCredential& user,
                        size_t header_len,
                        uint64_t trace_conn_id,
-                       VMessRequest& request) {
+                       VMessRequest& request,
+                       std::string_view& failure_reason) {
     const auto key = RequestHeaderPayloadKey(
         user.cmd_key,
         std::span<const uint8_t, 16>(packet, 16),
@@ -131,10 +126,15 @@ bool OpenRequestHeader(const uint8_t* packet,
     if (!AES128GCMDecryptTo(key.key.data(), key.nonce.data(), key.nonce.size(),
             packet + kRequestHeaderPrefixSize, header_len + 16, packet, 16,
             plain.data(), plain.size(), written)) {
-        LOG_NET_DEBUG("VMess: request header authentication failed");
+        failure_reason = "authentication failed: request header integrity check failed";
+        LOG_CONN_DEBUG(trace_conn_id, "request header authentication failed");
         return false;
     }
-    return ParseDecryptedHeader(plain.data(), written, trace_conn_id, request);
+    if (!ParseDecryptedHeader(plain.data(), written, trace_conn_id, request)) {
+        failure_reason = "invalid authenticated request header";
+        return false;
+    }
+    return true;
 }
 
 [[nodiscard]] BodyOptions RequestBodyOptions(const VMessRequest& request) noexcept {
@@ -284,6 +284,7 @@ std::pair<std::optional<VMessRequest>, size_t> ServerSession::DecodeRequestHeade
         int64_t timestamp = 0;
         header_user_ = validator_->FindByAuthIDForTag(tag_, auth_id.data(), timestamp);
         if (!header_user_) {
+            header_failure_reason_ = "authentication failed: no acceptable AuthID";
             required_header_bytes_ = 0;
             return {std::nullopt, 0};
         }
@@ -295,6 +296,7 @@ std::pair<std::optional<VMessRequest>, size_t> ServerSession::DecodeRequestHeade
                 data + 16, 18, auth_id.data(), auth_id.size(),
                 plain.data(), plain.size(), written) ||
             written != plain.size()) {
+            header_failure_reason_ = "authentication failed: header length integrity check failed";
             header_user_.reset();
             required_header_bytes_ = 0;
             return {std::nullopt, 0};
@@ -308,9 +310,10 @@ std::pair<std::optional<VMessRequest>, size_t> ServerSession::DecodeRequestHeade
     VMessRequest request;
     const size_t consumed = required_header_bytes_;
     required_header_bytes_ = 0;
-    if (!OpenRequestHeader(data, *header_user_, header_length_, trace_conn_id, request)) {
+    if (!OpenRequestHeader(data, *header_user_, header_length_, trace_conn_id, request,
+                           header_failure_reason_)) {
         header_user_.reset();
-        LOG_NET_DEBUG("VMess: invalid authenticated request header");
+        LOG_CONN_DEBUG(trace_conn_id, "request rejected > {}", header_failure_reason_);
         return {std::nullopt, 0};
     }
     request.user = std::move(header_user_);

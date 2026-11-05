@@ -751,7 +751,8 @@ private:
             // CloseAll retains the first terminal cause.
             session->CloseAll(error);
             owner->Remove(session);
-            if (failure && error != ErrorCode::CANCELLED) {
+            if (failure && error != ErrorCode::CANCELLED &&
+                error != ErrorCode::CONNECTION_CLOSED && error != ErrorCode::SOCKET_EOF) {
                 try {
                     LOG_WARN("AnyTLS outbound '{}': physical session task failed: {}",
                         owner->tag, ErrorCodeToString(error));
@@ -924,16 +925,19 @@ DialOutboundStream(
     });
     if (!transport_target) {
         if (transport_target.error() == ErrorCode::DNS_RESOLVE_FAILED) {
-            LOG_CONN_DEBUG(ctx, "[AnyTLSOutbound] DNS resolve failed for {}", prepared.settings.address);
+            LOG_CONN_DEBUG(ctx, "DNS resolve failed for {}", prepared.settings.address);
         }
         co_return tl::unexpected(transport_target.error());
     }
 
     auto dial_result = co_await DialOutboundTransport(io_context, ctx, *transport_target);
     if (!dial_result.Ok()) {
-        LOG_CONN_WARN(ctx, "[AnyTLSOutbound] dial failed {} -> {} via {}: {}",
-                          ctx.inbound.source_ip, ctx.outbound.target,
-                          ctx.outbound.tag, dial_result.error_msg);
+        if (dial_result.error != ErrorCode::CANCELLED &&
+            dial_result.error != ErrorCode::CONNECTION_CLOSED &&
+            dial_result.error != ErrorCode::SOCKET_EOF) {
+            LOG_CONN_WARN(ctx, "dial failed {} -> {} > {}",
+                          ctx.inbound.source_ip, ctx.outbound.target, dial_result.error_msg);
+        }
         co_return tl::unexpected(dial_result.error);
     }
 
@@ -1091,7 +1095,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
                 io_context, std::move(*dialed), padding_, std::move(opening_scheme));
             transport_lease = pool_->Adopt(session);
         } else if (session->stream) {
-            LOG_CONN_DEBUG(ctx, "[AnyTLSOutbound] reuse idle session sid={}", session->next_sid);
+            LOG_CONN_DEBUG(ctx, "reusing idle session sid={}", session->next_sid);
         }
     }
 

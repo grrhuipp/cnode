@@ -160,7 +160,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
 
     // redirect：替换目标地址（Xray freedom redirect 语义）
     if (redirect_target_) {
-        LOG_CONN_DEBUG(ctx, "Freedom redirect {} -> {}",
+        LOG_CONN_DEBUG(ctx, "redirect {} -> {}",
                        ctx.outbound.target, *redirect_target_);
         ctx.outbound.route_target = *redirect_target_;
         ctx.outbound.target = *redirect_target_;
@@ -189,7 +189,7 @@ Handler::DialOutboundStream(
         co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
     }
 
-    LOG_CONN_DEBUG(ctx, "Freedom resolve target {}", target);
+    LOG_CONN_DEBUG(ctx, "resolving target {}", target);
 
     OutboundTransportTarget transport_target;
     transport_target.timeout = dial_timeout_;
@@ -244,17 +244,17 @@ Handler::DialOutboundStream(
     if (transport_target.single_candidate) {
         const auto& candidate = *transport_target.single_candidate;
         if (candidate.bind_local) {
-            LOG_CONN_DEBUG(ctx, "Freedom target {}:{} bind {}",
+            LOG_CONN_DEBUG(ctx, "target {}:{} bind {}",
                            iputil::AddressText(candidate.endpoint.address()).View(),
                            candidate.endpoint.port(),
                            iputil::AddressText(*candidate.bind_local).View());
         } else {
-            LOG_CONN_DEBUG(ctx, "Freedom target {}:{} (system bind)",
+            LOG_CONN_DEBUG(ctx, "target {}:{} (system bind)",
                            iputil::AddressText(candidate.endpoint.address()).View(),
                            candidate.endpoint.port());
         }
     } else {
-        LOG_CONN_DEBUG(ctx, "Freedom target {} resolved {} candidates",
+        LOG_CONN_DEBUG(ctx, "target {} resolved {} candidates",
                        target,
                        transport_target.candidates.size());
     }
@@ -262,15 +262,13 @@ Handler::DialOutboundStream(
     ctx.outbound.connected_local_addr.reset();
     auto dial_result = co_await DialOutboundTransport(io_context, ctx, transport_target);
     if (!dial_result.Ok()) {
-        LOG_CONN_DEBUG(ctx, "failed to dial {} -> {} via {} > {}",
-                       ctx.inbound.source_ip, ctx.outbound.target,
-                       ctx.outbound.tag, dial_result.error_msg);
+        LOG_CONN_DEBUG(ctx, "failed to dial {} -> {} > {}",
+                       ctx.inbound.source_ip, ctx.outbound.target, dial_result.error_msg);
         co_return tl::unexpected(dial_result.error);
     }
 
     auto stream = std::move(dial_result.stream);
-    LOG_CONN_DEBUG(ctx, "[Outbound] TCP dial ok -> {} via {}",
-                   ctx.outbound.target, ctx.outbound.tag);
+    LOG_CONN_DEBUG(ctx, "TCP dial succeeded -> {}", ctx.outbound.target);
     if (auto local_ep = stream->LocalEndpoint()) {
         const auto local_ip = iputil::NormalizeAddress(local_ep->address());
         if (!local_ip.is_unspecified()) {

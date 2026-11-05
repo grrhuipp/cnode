@@ -43,7 +43,7 @@ void LogProxySource(std::string_view version, const ProxyProtocolResult& result)
         numeric.emplace(*result.src_addr);
         source = numeric->View();
     }
-    LOG_NET_DEBUG("[ProxyProtocol] {} parsed: src={}:{} consumed={}",
+    LOG_NET_DEBUG("PROXY protocol {} parsed src={}:{} consumed={}",
                   version, source, result.src_port, result.consumed);
 }
 
@@ -222,27 +222,27 @@ ProxyProtocolResult ParseProxyProtocolHeader(std::span<const uint8_t> bytes) {
     }
 
     if (len >= sizeof(kSignatureV2) && std::memcmp(data, kSignatureV2, sizeof(kSignatureV2)) == 0) {
-        LOG_NET_DEBUG("[ProxyProtocol] detected v2 binary header ({} bytes)", len);
+        LOG_NET_DEBUG("PROXY protocol v2 binary header detected ({} bytes)", len);
         auto r = ParseV2(data, len);
         if (r.success()) {
             LogProxySource("v2", r);
         } else if (r.incomplete()) {
-            LOG_NET_DEBUG("[ProxyProtocol] v2 parse incomplete");
+            LOG_NET_DEBUG("PROXY protocol v2 header incomplete");
         } else {
-            LOG_NET_DEBUG("[ProxyProtocol] v2 parse failed (incomplete or invalid)");
+            LOG_NET_DEBUG("PROXY protocol v2 parsing failed > incomplete or invalid header");
         }
         return r;
     }
 
     if (len >= 6 && std::memcmp(data, "PROXY ", 6) == 0) {
-        LOG_NET_DEBUG("[ProxyProtocol] detected v1 text header");
+        LOG_NET_DEBUG("PROXY protocol v1 text header detected");
         auto r = ParseV1(data, len);
         if (r.success()) {
             LogProxySource("v1", r);
         } else if (r.incomplete()) {
-            LOG_NET_DEBUG("[ProxyProtocol] v1 parse incomplete");
+            LOG_NET_DEBUG("PROXY protocol v1 header incomplete");
         } else {
-            LOG_NET_DEBUG("[ProxyProtocol] v1 parse failed (malformed or incomplete)");
+            LOG_NET_DEBUG("PROXY protocol v1 parsing failed > malformed or incomplete header");
         }
         return r;
     }

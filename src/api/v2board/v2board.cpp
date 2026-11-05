@@ -115,7 +115,9 @@ std::string CompactLogText(std::string_view text) {
 }
 
 std::string FormatHttpFailure(const HttpResponse& resp) {
-    const std::string detail = CompactLogText(resp.body);
+    // Server response bodies can echo request queries, API keys or credentials.
+    // Only locally generated transport/parser diagnostics are safe to include.
+    const std::string detail = resp.status <= 0 ? CompactLogText(resp.body) : std::string{};
 
     if (resp.status <= 0) {
         if (!detail.empty()) {
@@ -127,9 +129,6 @@ std::string FormatHttpFailure(const HttpResponse& resp) {
                            resp.status);
     }
 
-    if (!detail.empty()) {
-        return std::format("HTTP status {}: {}", resp.status, detail);
-    }
     return std::format("HTTP status {}", resp.status);
 }
 
@@ -168,7 +167,7 @@ std::string JoinRouteMatches(const json::array& matches) {
 }
 
 std::vector<rule::DetectRule>
-ExtractBlockDetectRules(const json::object& config, std::string_view panel_name) {
+ExtractBlockDetectRules(const json::object& config) {
     std::vector<rule::DetectRule> rules;
     const auto* routes_value = config.if_contains("routes");
     if (!routes_value || routes_value->is_null()) {
@@ -208,8 +207,7 @@ ExtractBlockDetectRules(const json::object& config, std::string_view panel_name)
             rules.push_back(std::move(rule));
         } catch (const std::regex_error& e) {
             throw std::invalid_argument(std::format(
-                "V2Board[{}]: invalid block route detect rule {}: {}",
-                panel_name, i, e.what()));
+                "Invalid block route detect rule {}: {}", i, e.what()));
         }
     }
     return rules;
@@ -271,8 +269,7 @@ APIClient::Impl::Impl(net::io_context& io_context,
 
     auto parts = ParseUrl(config.APIHost);
     if (!parts) {
-        throw std::invalid_argument(std::format(
-            "V2Board[{}]: invalid API host: {}", config.Name, config.APIHost));
+        throw std::invalid_argument("Invalid panel API host");
     }
     url_parts_ = std::move(*parts);
 
@@ -395,6 +392,7 @@ APIClient::Impl::HttpExchange(HttpMethod method,
                               std::string body_text,
                               std::string if_none_match) {
     HttpResponse result;
+    const PanelLogContext log_context{config_.Name, config_.APIHost, config_.NodeID, config_.NodeType};
 
     // 面板同步是冷路径；保留完整候选地址，避免双栈环境只尝试第一个解析结果。
     std::vector<tcp::endpoint> endpoints;
@@ -475,8 +473,7 @@ APIClient::Impl::HttpExchange(HttpMethod method,
                 co_await stream.async_handshake(ssl::stream_base::client, net::use_awaitable);
             } catch (const std::exception& e) {
                 last_error = e.what();
-                LOG_DEBUG("V2Board[{}]: HTTPS endpoint {} failed: {}",
-                          config_.Name,
+                LOG_PANEL_DEBUG(log_context, "HTTPS endpoint connection failed: endpoint={} reason={}",
                           iputil::FormatEndpointForLog(iputil::AddressText(endpoint.address()).View(), endpoint.port()),
                           last_error);
                 continue;
@@ -510,8 +507,7 @@ APIClient::Impl::HttpExchange(HttpMethod method,
                 co_await stream.async_connect(endpoint, net::use_awaitable);
             } catch (const std::exception& e) {
                 last_error = e.what();
-                LOG_DEBUG("V2Board[{}]: HTTP endpoint {} failed: {}",
-                          config_.Name,
+                LOG_PANEL_DEBUG(log_context, "HTTP endpoint connection failed: endpoint={} reason={}",
                           iputil::FormatEndpointForLog(iputil::AddressText(endpoint.address()).View(), endpoint.port()),
                           last_error);
                 continue;
@@ -536,6 +532,7 @@ APIClient::Impl::HttpExchange(HttpMethod method,
 net::awaitable<NodeInfoFetchResult>
 APIClient::Impl::GetNodeInfo(std::string committed_etag) {
     const int node_id = config_.NodeID;
+    const PanelLogContext log_context{config_.Name, config_.APIHost, node_id, config_.NodeType};
 
     // GET /api/v1/server/UniProxy/config?node_id=X&node_type=Y
     std::string path = std::format("/api/v1/server/UniProxy/config?node_id={}&node_type={}",
@@ -553,8 +550,7 @@ APIClient::Impl::GetNodeInfo(std::string committed_etag) {
 
     if (resp.status != 200) {
         const auto error_message = FormatHttpFailure(resp);
-        LOG_DEBUG("V2Board[{}]: GetNodeInfo failed: {}", config_.Name,
-                  error_message);
+        LOG_PANEL_DEBUG(log_context, "Node configuration pull failed: {}", error_message);
         co_return NodeInfoFetchResult::Fail(
             ErrorCode::PANEL_API_FAILED,
             error_message);
@@ -566,24 +562,23 @@ APIClient::Impl::GetNodeInfo(std::string committed_etag) {
 
         auto parsed_config = ParseNodeInfo(j, config_.NodeType);
         if (!parsed_config) {
-            LOG_ERROR("V2Board[{}]: invalid node config: {}",
-                      config_.Name, parsed_config.error());
+            LOG_PANEL_ERROR(log_context, "Invalid node configuration: {}", parsed_config.error());
             co_return NodeInfoFetchResult::Fail(
                 ErrorCode::PANEL_INVALID_RESPONSE,
                 std::move(parsed_config.error()));
         }
         auto config = std::move(*parsed_config);
 
-        auto rules = ExtractBlockDetectRules(j, config_.Name);
+        auto rules = ExtractBlockDetectRules(j);
 
-        LOG_DEBUG("V2Board[{}]: node {} config: protocol={}, port={}, network={}",
-                 config_.Name, node_id, config.NodeType, config.Port, config.TransportProtocol);
+        LOG_PANEL_DEBUG(log_context, "Node configuration received: protocol={} port={} network={}",
+                        config.NodeType, config.Port, config.TransportProtocol);
 
         co_return NodeInfoFetchResult::Success(
             std::move(config), std::move(rules), std::move(resp.etag));
 
     } catch (const std::exception& e) {
-        LOG_ERROR("V2Board[{}]: parse config error: {}", config_.Name, e.what());
+        LOG_PANEL_ERROR(log_context, "Node configuration parsing failed: {}", e.what());
         co_return NodeInfoFetchResult::Fail(ErrorCode::PANEL_INVALID_RESPONSE, e.what());
     }
 }
@@ -591,6 +586,7 @@ APIClient::Impl::GetNodeInfo(std::string committed_etag) {
 net::awaitable<UserListFetchResult>
 APIClient::Impl::GetUserList(std::string committed_etag) {
     const int node_id = config_.NodeID;
+    const PanelLogContext log_context{config_.Name, config_.APIHost, node_id, config_.NodeType};
 
     // GET /api/v1/server/UniProxy/user?node_id=X&node_type=Y
     std::string path = std::format("/api/v1/server/UniProxy/user?node_id={}&node_type={}",
@@ -607,15 +603,13 @@ APIClient::Impl::GetUserList(std::string committed_etag) {
                 ErrorCode::PANEL_INVALID_RESPONSE,
                 "received 304 without a committed user ETag");
         }
-        LOG_DEBUG("V2Board[{}]: node {} users not modified (304)",
-                 config_.Name, node_id);
+        LOG_PANEL_DEBUG(log_context, "Node users unchanged: HTTP status=304");
         co_return UserListFetchResult::NotModified();
     }
 
     if (resp.status != 200) {
         const auto error_message = FormatHttpFailure(resp);
-        LOG_DEBUG("V2Board[{}]: GetUserList failed: {}", config_.Name,
-                  error_message);
+        LOG_PANEL_DEBUG(log_context, "User list pull failed: {}", error_message);
         co_return UserListFetchResult::Fail(
             ErrorCode::PANEL_API_FAILED,
             error_message);
@@ -627,19 +621,17 @@ APIClient::Impl::GetUserList(std::string committed_etag) {
 
         auto users = ParseUserList(j);
         if (!users) {
-            LOG_ERROR("V2Board[{}]: parse users error: {}",
-                      config_.Name, users.error());
+            LOG_PANEL_ERROR(log_context, "User list parsing failed: {}", users.error());
             co_return UserListFetchResult::Fail(
                 ErrorCode::PANEL_INVALID_RESPONSE,
                 std::move(users.error()));
         }
 
-        LOG_DEBUG("V2Board[{}]: fetched {} users for node {}",
-                 config_.Name, users->size(), node_id);
+        LOG_PANEL_DEBUG(log_context, "User list received: users={}", users->size());
         co_return UserListFetchResult::Success(std::move(*users), std::move(resp.etag));
 
     } catch (const std::exception& e) {
-        LOG_ERROR("V2Board[{}]: parse users error: {}", config_.Name, e.what());
+        LOG_PANEL_ERROR(log_context, "User list parsing failed: {}", e.what());
         co_return UserListFetchResult::Fail(ErrorCode::PANEL_INVALID_RESPONSE, e.what());
     }
 }
@@ -647,6 +639,7 @@ APIClient::Impl::GetUserList(std::string committed_etag) {
 net::awaitable<bool>
 APIClient::Impl::ReportUserTraffic(const std::vector<::acpp::api::UserTraffic>& data) {
     const int node_id = config_.NodeID;
+    const PanelLogContext log_context{config_.Name, config_.APIHost, node_id, config_.NodeType};
 
     // V2Board UniProxy push 格式: {user_id: [upload, download], ...}
     json::object body;
@@ -663,19 +656,18 @@ APIClient::Impl::ReportUserTraffic(const std::vector<::acpp::api::UserTraffic>& 
         HttpMethod::Post, std::move(path), json::serialize(json::value(std::move(body))), {});
 
     if (resp.status != 200) {
-        LOG_WARN("V2Board[{}]: traffic API acceptance unknown for node {}: HTTP status {}",
-                 config_.Name, node_id, resp.status);
+        LOG_PANEL_WARN(log_context, "Traffic API acceptance unknown: HTTP status={}", resp.status);
         co_return false;
     }
 
-    LOG_DEBUG("V2Board[{}]: traffic API accepted {} users (not a billing commit acknowledgement)",
-              config_.Name, data.size());
+    LOG_PANEL_DEBUG(log_context, "Traffic API accepted: users={} (not a billing commit acknowledgement)", data.size());
     co_return true;
 }
 
 net::awaitable<bool>
 APIClient::Impl::ReportNodeOnlineUsers(const std::vector<::acpp::api::OnlineUser>& online_users) {
     const int node_id = config_.NodeID;
+    const PanelLogContext log_context{config_.Name, config_.APIHost, node_id, config_.NodeType};
     auto report = BuildOnlineReportPayload(online_users, node_id);
 
     if (!report.alive_body.empty()) {
@@ -685,14 +677,12 @@ APIClient::Impl::ReportNodeOnlineUsers(const std::vector<::acpp::api::OnlineUser
         auto alive_resp = co_await HttpRequest(
             HttpMethod::Post, alive_path, json::serialize(json::value(std::move(report.alive_body))), {});
         if (alive_resp.status != 200) {
-            LOG_WARN("V2Board[{}]: online device report failed for node {}: {}",
-                     config_.Name, node_id, FormatHttpFailure(alive_resp));
+            LOG_PANEL_WARN(log_context, "Online device report failed: {}", FormatHttpFailure(alive_resp));
             co_return false;
         }
     }
 
-    LOG_DEBUG("V2Board[{}]: reported {} connected users across {} devices",
-              config_.Name, report.user_count, report.device_count);
+    LOG_PANEL_DEBUG(log_context, "Online devices reported: users={} devices={}", report.user_count, report.device_count);
     co_return true;
 }
 

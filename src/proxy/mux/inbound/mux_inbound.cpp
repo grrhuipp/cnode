@@ -759,9 +759,8 @@ public:
         if (!reply_queue_.CanPushUdp(datagram.payload_size)) {
             const uint64_t dropped = ++reply_queue_.udp_dropped;
             if (dropped % 100 == 1) {
-                LOG_NET_DEBUG(
-                    "[conn={}] [MuxRelay] UDP reply queue full, dropped {} packets",
-                    parent_conn_id_, dropped);
+                LOG_CONN_DEBUG(parent_conn_id_,
+                    "UDP reply queue full, dropped {} packets", dropped);
             }
             mb.clear();
             Cancel();
@@ -856,7 +855,7 @@ net::awaitable<void> RunSubDispatch(
             stats,
             timeouts);
     } catch (...) {
-        LOG_CONN_DEBUG(sub->ctx, "[MuxRelay] sub-session dispatch failed with an exception");
+        LOG_CONN_DEBUG(sub->ctx, "sub-session dispatch failed with an exception");
         sub->Cancel();
     }
 
@@ -1058,7 +1057,7 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                 co_return false;
             };
         try {
-            LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] Start");
+            LOG_CONN_DEBUG(parent_ctx, "starting mux relay");
 
             while (running) {
             // --------------------------------------------------------------------
@@ -1091,7 +1090,7 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                         payload_size);
                     if (header_len == 0) {
                         LOG_CONN_DEBUG(parent_ctx,
-                            "[MuxRelay] UDP reply header encode failed sid={} src={} payload={}B",
+                            "UDP reply header encode failed sid={} src={} payload={}B",
                             reply.session_id, reply.udp_src, payload_size);
                         continue;
                     }
@@ -1127,7 +1126,7 @@ net::awaitable<RelayResult> ProcessInboundImpl(
             if (reply_queue.tcp_overflowed) {
                 reply_queue.tcp_overflowed = false;
                 LOG_CONN_DEBUG(parent_ctx,
-                    "[MuxRelay] Reply queue overflow: tcp={}B udp={}B items={} emergency_limit={}B",
+                    "reply queue overflow: tcp={}B udp={}B items={} emergency_limit={}B",
                     reply_queue.tcp_queued_bytes, reply_queue.udp_queued_bytes,
                     reply_queue.queue.size(), kMuxQueueEmergencyBytes);
                 result.error = ErrorCode::RESOURCE_EXHAUSTED;
@@ -1171,7 +1170,7 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                 if (client_reads.done) {
                     if (client_reads.error != ErrorCode::OK) {
                         if (client_reads.error == ErrorCode::RELAY_TIMEOUT) {
-                            LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] Read-side timeout");
+                            LOG_CONN_DEBUG(parent_ctx, "read-side timeout");
                         }
                         result.error = client_reads.error;
                         running = false;
@@ -1190,7 +1189,7 @@ net::awaitable<RelayResult> ProcessInboundImpl(
             const size_t read_bytes = read_mb.byte_size();
             if (read_bytes == 0) {
                 if (client_reads.done && client_reads.error == ErrorCode::RELAY_TIMEOUT) {
-                    LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] Read-side timeout");
+                    LOG_CONN_DEBUG(parent_ctx, "read-side timeout");
                     result.error = ErrorCode::RELAY_TIMEOUT;
                     running = false;
                     break;
@@ -1217,7 +1216,7 @@ net::awaitable<RelayResult> ProcessInboundImpl(
 
                 const mux::FrameHeader& hdr = *opt_hdr;
                 if (hdr.frame_size == 0) {
-                    LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] Invalid frame");
+                    LOG_CONN_DEBUG(parent_ctx, "invalid frame");
                     result.error = ErrorCode::PROTOCOL_DECODE_FAILED;
                     running = false;
                     break;
@@ -1227,7 +1226,7 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                 if (hdr.has_data && hdr.data_len > 0) {
                     if (frame_buf.DropPrefixBytes(hdr.data_offset) != hdr.data_offset ||
                         !frame_buf.MovePrefixTo(frame_payload, hdr.data_len)) {
-                        LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] payload extraction failed");
+                        LOG_CONN_DEBUG(parent_ctx, "payload extraction failed");
                         result.error = ErrorCode::RESOURCE_EXHAUSTED;
                         running = false;
                         break;
@@ -1259,8 +1258,11 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                     if (sub_sessions.contains(hdr.session_id) ||
                         sub_sessions.size() >= kMaxConcurrentSubSessions) {
                         LOG_CONN_DEBUG(parent_ctx,
-                            "[MuxRelay] refused NEW sid={} active={}",
+                            "refused NEW sid={} active={}",
                             hdr.session_id, sub_sessions.size());
+                        LOG_ACCESS(FormatAccessLog(parent_ctx, AccessStatus::Rejected,
+                            sub_sessions.contains(hdr.session_id)
+                                ? "duplicate stream ID" : "concurrent stream limit"));
                         const size_t header_len =
                             mux::EncodeEndTo(write_frame, hdr.session_id, true);
                         if (!co_await write_frame_to_client(
@@ -1273,7 +1275,7 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                     if (hdr.network == mux::NetworkType::UDP) {
                         // ---- 新建 UDP 子会话 ----
                         LOG_CONN_DEBUG(parent_ctx,
-                            "[MuxRelay] New UDP sid={} target={} data={}B global_id={}",
+                            "new UDP sid={} target={} data={}B global_id={}",
                             hdr.session_id, hdr.target, hdr.data_len, hdr.has_global_id);
 
                         auto sub_state = std::make_unique<UdpSubState>(
@@ -1324,10 +1326,10 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                     } else {
                         // ---- 新建 TCP 子会话 ----
                         if (hdr.has_target) {
-                            LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] New TCP sid={} -> {}",
+                            LOG_CONN_DEBUG(parent_ctx, "new TCP sid={} -> {}",
                                 hdr.session_id, hdr.target);
                         } else {
-                            LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] New TCP sid={} -> ?",
+                            LOG_CONN_DEBUG(parent_ctx, "new TCP sid={} without target",
                                 hdr.session_id);
                         }
 
@@ -1462,7 +1464,7 @@ net::awaitable<RelayResult> ProcessInboundImpl(
         client_reads.running = false;
         client_reads.WakeSpace();
         client_control.Cancel();
-        LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] Cleanup: sub_sessions={}",
+        LOG_CONN_DEBUG(parent_ctx, "cleaning up sub_sessions={}",
             sub_sessions.size());
 
         for (auto& [sid, sub] : sub_sessions) {
@@ -1483,7 +1485,7 @@ net::awaitable<RelayResult> ProcessInboundImpl(
 #ifndef NDEBUG
     const uint64_t udp_dropped = reply_queue.udp_dropped;
     if (udp_dropped > 0) {
-        LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] UDP replies dropped={}", udp_dropped);
+        LOG_CONN_DEBUG(parent_ctx, "UDP replies dropped={}", udp_dropped);
     }
 #endif
 

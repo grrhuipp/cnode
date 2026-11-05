@@ -79,8 +79,11 @@ public:
     [[nodiscard]] static const char* RejectReasonToString(
         RejectReason r) noexcept {
         static constexpr const char* kNames[] = {
-            "NONE", "MAX_CONNECTIONS", "MAX_CONNECTIONS_PER_IP", "IP_BANNED",
-            "TRACKING_CAPACITY"};
+            "not rejected (NONE)",
+            "total connection limit exceeded (MAX_CONNECTIONS)",
+            "per-IP connection limit exceeded (MAX_CONNECTIONS_PER_IP)",
+            "IP banned (IP_BANNED)",
+            "IP tracking capacity exhausted (TRACKING_CAPACITY)"};
         return kNames[static_cast<size_t>(r)];
     }
 
@@ -167,7 +170,7 @@ public:
             s->ban_until = now > std::numeric_limits<uint32_t>::max() - cfg_.auth_ban_seconds
                 ? std::numeric_limits<uint32_t>::max()
                 : now + cfg_.auth_ban_seconds;
-            LOG_NET_WARN("[{}] IP {} banned for {}s (auth failures: {})",
+            LOG_NET_WARN("IP banned inbound={} source={} duration={}s authentication_failures={}",
                          tag, ip, cfg_.auth_ban_seconds, cnt);
             s->auth_fails = 0;
         }

@@ -2080,14 +2080,9 @@ public:
             CancelAll(error.code());
             co_return;
         } catch (const std::exception& e) {
-            LOG_NET_DEBUG(
-                "[HTTP/2:{}] server: read loop exception: {}",
-                conn_id_,
-                e.what());
+            LOG_CONN_DEBUG(conn_id_, "HTTP/2 server read loop failed > {}", e.what());
         } catch (...) {
-            LOG_NET_DEBUG(
-                "[HTTP/2:{}] server: read loop exception: unknown",
-                conn_id_);
+            LOG_CONN_DEBUG(conn_id_, "HTTP/2 server read loop failed > unknown exception");
         }
         CancelAll();
     }
@@ -2165,9 +2160,9 @@ private:
             co_await stream_handler_->OnInboundTransportStream(
                 std::move(stream), std::move(metadata));
         } catch (const std::exception& error) {
-            LOG_NET_DEBUG("[HTTP/2:{}] logical request failed: {}", conn_id_, error.what());
+            LOG_CONN_DEBUG(conn_id_, "HTTP/2 logical request failed > {}", error.what());
         } catch (...) {
-            LOG_NET_DEBUG("[HTTP/2:{}] logical request failed", conn_id_);
+            LOG_CONN_DEBUG(conn_id_, "HTTP/2 logical request failed > unknown exception");
         }
     }
 
@@ -2412,10 +2407,9 @@ private:
             co_return false;
         }
 
-        LOG_NET_DEBUG(
-            "[{}:{}] server: accepted logical stream_id={}",
+        LOG_CONN_DEBUG(conn_id_,
+            "{} server accepted logical stream_id={}",
             payload_codec_ == H2PayloadCodec::RawData ? "HTTP/2" : "gRPC",
-            conn_id_,
             stream_id);
         DeliverRequest(std::move(sub), nullptr, std::move(request->metadata));
         co_return true;
@@ -2429,11 +2423,10 @@ private:
         if (const std::string_view expected_host = TrimAscii(ExpectedHttpHost(*http_config_));
             !expected_host.empty() &&
             !EqualsAsciiCI(TrimAscii(request.authority), expected_host)) {
-            LOG_NET_DEBUG(
-                "[XHTTP:{}] server: H2 host mismatch expected='{}' actual='{}'",
-                conn_id_,
-                SanitizeForLog(expected_host),
-                SanitizeForLog(request.authority));
+            LOG_CONN_DEBUG(conn_id_,
+                "XHTTP server H2 host mismatch expected='{}' actual='{}'",
+                PublicHttpTargetForLog(expected_host),
+                PublicHttpTargetForLog(request.authority));
             co_return co_await ResetStream(stream_id, H2Error::Protocol);
         }
 
@@ -2449,8 +2442,7 @@ private:
             if (!co_await AcceptStream(stream_id, end_stream, *sub)) {
                 co_return false;
             }
-            LOG_NET_DEBUG("[XHTTP:{}] server: H2 stream-one ready stream_id={}",
-                          conn_id_,
+            LOG_CONN_DEBUG(conn_id_, "XHTTP server H2 stream-one ready stream_id={}",
                           stream_id);
             DeliverRequest(std::move(sub), nullptr, std::move(request.metadata));
             co_return true;
@@ -2469,8 +2461,7 @@ private:
             if (!co_await AcceptStream(stream_id, end_stream, *sub)) {
                 co_return false;
             }
-            LOG_NET_DEBUG("[XHTTP:{}] server: H2 split downlink ready session={} stream_id={} mode={}",
-                          conn_id_,
+            LOG_CONN_DEBUG(conn_id_, "XHTTP server H2 split downlink ready session={} stream_id={} mode={}",
                           meta.session_id,
                           stream_id,
                           xhttp_config_->AcceptsStreamUp() ? "stream-up" : "packet-up");
@@ -2490,17 +2481,15 @@ private:
             if (!co_await AcceptStream(stream_id, end_stream, *sub)) {
                 co_return false;
             }
-            LOG_NET_DEBUG("[XHTTP:{}] server: H2 stream-up upload ready session={} stream_id={}",
-                          conn_id_,
+            LOG_CONN_DEBUG(conn_id_, "XHTTP server H2 stream-up upload ready session={} stream_id={}",
                           meta.session_id,
                           stream_id);
             sub->SetUploadBudget(xsession);
             auto upload = std::make_unique<Http2ServerSubStream>(sub);
             Spawn(Http2ServerSubStreamState::JoinOwner(std::move(sub)));
             if (!xsession->AttachStream(std::move(upload))) {
-                LOG_NET_DEBUG(
-                    "[XHTTP:{}] server: rejected concurrent H2 stream-up session={}",
-                    conn_id_,
+                LOG_CONN_DEBUG(conn_id_,
+                    "XHTTP server rejected concurrent H2 stream-up session={}",
                     meta.session_id);
             }
             co_return true;
@@ -2534,10 +2523,9 @@ private:
         case XHttpRequestMeta::Kind::Unknown:
             break;
         }
-        LOG_NET_DEBUG("[XHTTP:{}] server: unknown H2 request method='{}' path='{}'",
-                      conn_id_,
+        LOG_CONN_DEBUG(conn_id_, "XHTTP server received unknown H2 request method='{}' path='{}'",
                       SanitizeForLog(request.method),
-                      SanitizeForLog(request.path));
+                      PublicHttpTargetForLog(request.path));
         co_return co_await ResetStream(stream_id, H2Error::Protocol);
     }
 
@@ -3191,7 +3179,7 @@ net::awaitable<TransportBuildResult> DoGrpcServerHandshake(
     if (!co_await ReadFullFromStream(*stream, preface.data(), preface.size()) ||
         std::string_view(unsafe::ptr_cast<const char>(preface.data()), preface.size()) !=
             kHttp2ClientPreface) {
-        LOG_NET_DEBUG("[gRPC:{}] server: invalid HTTP/2 client preface", conn_id);
+        LOG_CONN_DEBUG(conn_id, "gRPC server received invalid HTTP/2 client preface");
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
@@ -3248,11 +3236,10 @@ net::awaitable<TransportBuildResult> DoGrpcClientHandshake(
         co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
     }
 
-    LOG_NET_DEBUG(
-        "[gRPC:{}] client: handshake sent authority={} path={}",
-        conn_id,
-        authority.empty() ? std::string_view("-") : authority,
-        path);
+    LOG_CONN_DEBUG(conn_id,
+        "gRPC client handshake sent authority={} path={}",
+        authority.empty() ? std::string_view("-") : PublicHttpTargetForLog(authority),
+        PublicHttpTargetForLog(path));
     co_return std::make_unique<Http2ClientStream>(
         std::move(stream),
         1,
@@ -3278,11 +3265,10 @@ net::awaitable<TransportBuildResult> DoHttp2ClientHandshake(
         co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
     }
 
-    LOG_NET_DEBUG(
-        "[HTTP/2:{}] client: handshake sent authority={} path={}",
-        conn_id,
-        authority.empty() ? std::string_view("-") : authority,
-        detail::EffectiveHttpPath(cfg.path));
+    LOG_CONN_DEBUG(conn_id,
+        "HTTP/2 client handshake sent authority={} path={}",
+        authority.empty() ? std::string_view("-") : PublicHttpTargetForLog(authority),
+        PublicHttpTargetForLog(detail::EffectiveHttpPath(cfg.path)));
     co_return std::make_unique<Http2ClientStream>(
         std::move(stream),
         1,

@@ -83,8 +83,9 @@ Controller::Impl::PanelRuntime::PanelRuntime(
     traffic_journal = std::make_unique<controller::TrafficJournal>(config);
     const auto unknown = traffic_journal->UnknownCount();
     if (unknown != 0) {
-        LOG_ERROR("Panel {}/{} accounting: {} unknown records require reconciliation; directory={}",
-                  config.Name, config.NodeIDs.Front(), unknown, traffic_journal->Directory().string());
+        const PanelLogContext log_context{config.Name, config.APIHost, config.NodeIDs.Front(), config.NodeType};
+        LOG_PANEL_ERROR(log_context, "Traffic accounting requires reconciliation: unknown_records={} directory={}",
+                        unknown, traffic_journal->Directory().string());
     }
 }
 
@@ -121,19 +122,21 @@ void Controller::Impl::Start() {
                 },
                 [self, panel, kind](std::string_view loop_name, std::exception_ptr failure) {
                     if (self->stopping_ && !failure) return;
+                    const PanelLogContext log_context{panel->config.Name, panel->config.APIHost,
+                        panel->config.NodeIDs.Front(), panel->config.NodeType};
                     if (kind == LoopKind::Sync) {
                         panel->state = PanelState::Unavailable;
                     }
                     if (!failure) {
-                        LOG_WARN("Panel {} monitor: stopped", loop_name);
+                        LOG_PANEL_WARN(log_context, "Panel monitor stopped unexpectedly: loop={}", loop_name);
                         return;
                     }
                     try {
                         std::rethrow_exception(failure);
                     } catch (const std::exception& error) {
-                        LOG_ERROR("Panel {} monitor: failed | {}", loop_name, error.what());
+                        LOG_PANEL_ERROR(log_context, "Panel monitor failed: loop={} reason={}", loop_name, error.what());
                     } catch (...) {
-                        LOG_ERROR("Panel {} monitor: failed | unknown exception", loop_name);
+                        LOG_PANEL_ERROR(log_context, "Panel monitor failed: loop={} reason=unknown exception", loop_name);
                     }
                 });
             slot = loop;
@@ -173,6 +176,8 @@ std::vector<Controller::NodeStatsInfo> Controller::Impl::GetNodeStats() const {
 
         NodeStatsInfo info;
         info.panel_name  = panel->config.Name;
+        info.panel_host  = panel->config.APIHost;
+        info.node_type   = panel->config.NodeType;
         info.node_id     = panel->config.NodeIDs.Front();
         info.network    = state.config.TransportProtocol;
         info.port       = state.config.Port;
@@ -188,8 +193,8 @@ std::vector<Controller::NodeStatsInfo> Controller::Impl::GetNodeStats() const {
 net::awaitable<void> Controller::Impl::panelSyncLoop(
     PanelRuntime& panel) {
     using Clock = std::chrono::steady_clock;
-    const int node_id = panel.config.NodeIDs.Front();
-    const auto& panel_name = panel.config.Name;
+    const PanelLogContext log_context{panel.config.Name, panel.config.APIHost,
+        panel.config.NodeIDs.Front(), panel.config.NodeType};
     auto next_pull = Clock::now();
     // Match v2node reporting semantics: the first traffic/online snapshot
     // needs one complete push interval to accumulate meaningful activity.
@@ -220,16 +225,11 @@ net::awaitable<void> Controller::Impl::panelSyncLoop(
             } catch (const std::exception& e) {
                 if (stopping_) throw;
                 panel.state = PanelState::Unavailable;
-                LOG_WARN("Panel {}/{} sync: unavailable | pull | {}",
-                         panel_name,
-                         node_id,
-                         e.what());
+                LOG_PANEL_WARN(log_context, "Panel sync unavailable: operation=pull reason={}", e.what());
             } catch (...) {
                 if (stopping_) throw;
                 panel.state = PanelState::Unavailable;
-                LOG_WARN("Panel {}/{} sync: unavailable | pull | unknown error",
-                         panel_name,
-                         node_id);
+                LOG_PANEL_WARN(log_context, "Panel sync unavailable: operation=pull reason=unknown error");
             }
             now = Clock::now();
             next_pull = now + interval(true);
@@ -254,15 +254,10 @@ net::awaitable<void> Controller::Impl::panelSyncLoop(
                     co_await userInfoMonitor(panel, tag);
                 } catch (const std::exception& e) {
                     if (stopping_) throw;
-                    LOG_WARN("Panel {}/{} report: unavailable | {}",
-                             panel_name,
-                             node_id,
-                             e.what());
+                    LOG_PANEL_WARN(log_context, "Panel report unavailable: operation=push reason={}", e.what());
                 } catch (...) {
                     if (stopping_) throw;
-                    LOG_WARN("Panel {}/{} report: unavailable | unknown error",
-                             panel_name,
-                             node_id);
+                    LOG_PANEL_WARN(log_context, "Panel report unavailable: operation=push reason=unknown error");
                 }
             }
             next_push = Clock::now() + interval(false);
@@ -297,6 +292,7 @@ net::awaitable<void> Controller::Impl::panelStatusLoop(const PanelRuntime& panel
 net::awaitable<void> Controller::Impl::nodeInfoMonitor(PanelRuntime& panel) {
     const int node_id = panel.config.NodeIDs.Front();
     const auto& panel_name = panel.config.Name;
+    const PanelLogContext log_context{panel_name, panel.config.APIHost, node_id, panel.config.NodeType};
 
     controller::NodeRuntime runtime(io_context_, workers_, panel.config, panel.node, stopping_);
 
@@ -340,8 +336,7 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(PanelRuntime& panel) {
             if (transition.mode == controller::NodeTransitionMode::StageNewEndpoint
                 || transition.mode == controller::NodeTransitionMode::ReplaceInPlace
                 || transition.mode == controller::NodeTransitionMode::SwapSameEndpoint) {
-                LOG_CONSOLE("Panel {}/{} config: changed | recreate",
-                            panel_name, node_id);
+                LOG_PANEL_INFO(log_context, "Panel configuration changed; recreating inbound");
             }
 
             const bool replace_rules = !config_result.not_modified || transitioning;
@@ -355,8 +350,7 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(PanelRuntime& panel) {
                     throw std::runtime_error(ErrorMessage(
                         users_result.error, users_result.error_msg));
                 }
-                LOG_WARN("Panel {}/{} sync: degraded | users | {}",
-                         panel_name, node_id,
+                LOG_PANEL_WARN(log_context, "Panel sync degraded: operation=pull resource=users reason={}",
                          users_result.error_msg.empty()
                             ? ErrorCodeToString(users_result.error)
                             : users_result.error_msg);
@@ -406,7 +400,7 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(PanelRuntime& panel) {
                 (next_users.has_value() && !users_result.not_modified);
             if (rebuild_users) {
                 auto users = BuildUsersForInbound(
-                    *candidate->inbound, candidate->config, candidate->users);
+                    panel.config, *candidate->inbound, candidate->config, candidate->users);
                 if (!users) throw std::runtime_error("failed to build candidate user snapshot");
                 candidate->prepared_users =
                     std::make_shared<const proxyman::inbound::UserSet>(std::move(*users));
@@ -434,26 +428,24 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(PanelRuntime& panel) {
             co_await controller::ApplyNodeChange(runtime, panel.node, std::move(change));
             ThrowIfStopping();
             if (transitioning) {
-                LOG_CONSOLE("Panel {}/{} config: ready | {} | replaced {}",
-                    panel_name, node_id, tag, old_state ? "yes" : "no");
+                LOG_PANEL_INFO(log_context, "Panel configuration ready: tag={} replaced={}",
+                    tag, old_state ? "yes" : "no");
             }
             panel.state = users_result.Ok() ? PanelState::Ready : PanelState::Degraded;
         } catch (const std::exception& e) {
             if (stopping_) throw;
             panel.state = PanelState::Unavailable;
-            LOG_ERROR("Panel {}/{} sync: unavailable | pull | {}",
-                panel_name, node_id, e.what());
+            LOG_PANEL_ERROR(log_context, "Panel sync unavailable: operation=pull reason={}", e.what());
             if (panel.node.HasPendingCleanup()) {
-                LOG_ERROR("Panel {}/{} sync: recovery required | pending runtime cleanup",
-                    panel_name, node_id);
+                LOG_PANEL_ERROR(log_context, "Panel sync requires recovery: pending runtime cleanup");
             }
         }
     }
 }
 
 void Controller::Impl::logPanelStatus(const PanelRuntime& panel) const {
-    const int node_id = panel.config.NodeIDs.Front();
-    const auto& panel_name = panel.config.Name;
+    const PanelLogContext log_context{panel.config.Name, panel.config.APIHost,
+        panel.config.NodeIDs.Front(), panel.config.NodeType};
     const std::string_view state_text = [&]() -> std::string_view {
         switch (panel.state) {
             case PanelState::Connecting: return "connecting";
@@ -474,14 +466,8 @@ void Controller::Impl::logPanelStatus(const PanelRuntime& panel) const {
     }();
 
     if (!panel.node.committed) {
-        LOG_CONSOLE(
-            "Panel {}/{} status: {} | inbound {} | {} | {}",
-            panel_name,
-            node_id,
-            state_text,
-            runtime_text,
-            panel.config.NodeType,
-            panel.config.APIHost);
+        LOG_PANEL_INFO(log_context, "Panel status: state={} inbound={} protocol={}",
+            state_text, runtime_text, panel.config.NodeType);
         return;
     }
 
@@ -493,15 +479,13 @@ void Controller::Impl::logPanelStatus(const PanelRuntime& panel) const {
     const auto push_interval = controller::PanelInterval(
         committed_state.config.PushInterval,
         defaults::kPanelPushInterval);
-    LOG_CONSOLE(
-        "Panel {}/{} status: {} | inbound {} | {}:{} | users {} | rules {} | "
-        "pull/push {}s/{}s",
-        panel_name,
-        node_id,
+    LOG_PANEL_INFO(log_context,
+        "Panel status: state={} inbound={} protocol={} port={} network={} users={} rules={} pull={}s push={}s",
         state_text,
         runtime_text,
         protocol,
         committed_state.config.Port,
+        committed_state.config.TransportProtocol,
         committed_state.users.size(),
         committed_state.rules.size(),
         pull_interval.count(),
@@ -509,9 +493,12 @@ void Controller::Impl::logPanelStatus(const PanelRuntime& panel) const {
 }
 
 std::optional<proxyman::inbound::UserSet> Controller::Impl::BuildUsersForInbound(
+    const PanelConfig& panel_config,
     const controller::InboundBuild& inbound,
     const api::NodeInfo& node_config,
     const std::vector<api::UserInfo>& api_users) const {
+    const PanelLogContext log_context{panel_config.Name, panel_config.APIHost,
+        panel_config.NodeIDs.Front(), panel_config.NodeType};
 
     std::vector<proxyman::inbound::RuntimeUser> users;
     users.reserve(api_users.size());
@@ -529,11 +516,11 @@ std::optional<proxyman::inbound::UserSet> Controller::Impl::BuildUsersForInbound
     auto result = proxyman::inbound::BuildUsers(
         inbound.protocol, inbound.handler_request, users);
     if (!result) {
-        LOG_WARN("BuildUsersForInbound: unsupported user builder for protocol '{}'", inbound.protocol);
+        LOG_PANEL_WARN(log_context, "Cannot build inbound users: unsupported protocol={}", inbound.protocol);
     } else if (std::visit([](const auto& prepared) { return prepared.size(); }, *result) != api_users.size()) {
         // Invalid credentials must not turn a non-empty panel response into a
         // partial or empty authentication snapshot.
-        LOG_WARN("BuildUsersForInbound: incomplete user snapshot for protocol '{}'", inbound.protocol);
+        LOG_PANEL_WARN(log_context, "Cannot build inbound users: incomplete snapshot protocol={}", inbound.protocol);
         return std::nullopt;
     }
     return result;

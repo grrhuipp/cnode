@@ -378,6 +378,7 @@ void VlessEncryptionServerTicketStore::Store(
         Session{
             .pfs_key = pfs_key,
             .expires_at = expires_at,
+            .identity = std::nullopt,
             .seen_nfs_keys = decltype(Session::seen_nfs_keys)(
                 0, sessions_.hash_function(), sessions_.key_eq()),
         });

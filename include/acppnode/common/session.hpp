@@ -117,6 +117,11 @@ struct Context {
 
 }  // namespace session
 
-std::string FormatAccessLog(const session::Context& ctx);
+enum class AccessStatus { Accepted, Rejected };
+
+std::string FormatAccessLog(
+    const session::Context& ctx,
+    AccessStatus status = AccessStatus::Accepted,
+    std::string_view reason = {});
 
 }  // namespace acpp

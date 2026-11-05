@@ -62,7 +62,7 @@ struct Peer {
             const bool v6 = packet[packet.size() - 3] == 28;
             packet[2] = 0x81;
             packet[3] = refuse ? 0x82 : negative ? 0x83 : 0x80;
-            if (!refuse && !negative) {
+            if (!refuse && !negative && !nodata) {
                 packet[7] = 1;
                 const uint8_t size = v6 ? 16 : 4;
                 packet.insert(packet.end(), {0xc0, 0x0c, 0, static_cast<uint8_t>(v6 ? 28 : 1),
@@ -105,7 +105,8 @@ struct Peer {
     std::set<uint16_t> ports;
     std::map<uint16_t, std::bitset<65536>> ids;
     size_t packets = 0, batch_size = 4;
-    bool hold = false, refuse = false, negative = false, noise = false, duplicate_id = false;
+    bool hold = false, refuse = false, negative = false, nodata = false;
+    bool noise = false, duplicate_id = false;
 };
 
 acpp::app::dns::Config Config(Peer& peer) {
@@ -140,6 +141,17 @@ void TestQueries(bool ipv6) {
         Require(result.error == acpp::ErrorCode::DNS_NO_RECORD, "NXDOMAIN must be retained");
         result = co_await dns.Resolve("negative.example");
         Require(result.from_cache && peer.packets == 12, "negative answers must be cached");
+        peer.negative = false;
+        peer.nodata = true;
+        result = co_await dns.Resolve("nodata.example");
+        Require(result.error == acpp::ErrorCode::DNS_NO_RECORD &&
+                    result.error_msg.find("NODATA") != std::string::npos,
+                "an existing name without addresses must be distinguished from NXDOMAIN");
+        result = co_await dns.Resolve("nodata.example");
+        Require(result.from_cache && peer.packets == 16 &&
+                    result.error_msg.find("NODATA") != std::string::npos &&
+                    result.error_msg.find("NXDOMAIN") == std::string::npos,
+                "negative cache must not turn NODATA into NXDOMAIN");
     };
     net::co_spawn(io, run(), [&](std::exception_ptr e) { error = e; done = true; peer.Stop(); });
     io.run_for(4s);

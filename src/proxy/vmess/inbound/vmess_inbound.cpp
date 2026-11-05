@@ -63,7 +63,10 @@ ParseHandshake(AsyncStream& stream,
         request = std::move(decoded.first);
         consumed = decoded.second;
         if (!request && vmess_session.RequiredHeaderBytes() == 0) {
-            LOG_NET_WARN("[{}] VMess auth failed from {}", tag, client_ip);
+            const auto reason = vmess_session.HeaderFailureReason();
+            LOG_CONN_WARN(ctx, "request rejected from {}:{} > {}",
+                          client_ip, ctx.inbound.source_port, reason);
+            LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, reason));
             if (limiter && ctx.inbound.HasProxyProtocolClientIP()) {
                 co_await limiter->OnAuthFailTracked(tag, client_ip);
             }
@@ -75,14 +78,19 @@ ParseHandshake(AsyncStream& stream,
 
     if (!request->user || !co_await validator.RegisterSessionIfNew(
             *request->user, request->body_key, request->body_iv)) {
+        const auto reason = request->user
+            ? "session replay admission rejected"
+            : "authentication failed: no authenticated user";
+        LOG_CONN_WARN(ctx, "request rejected from {}:{} > {}",
+                      client_ip, ctx.inbound.source_port, reason);
+        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, reason));
         if (limiter && ctx.inbound.HasProxyProtocolClientIP())
             co_await limiter->OnAuthFailTracked(tag, client_ip);
         co_return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
     }
 
     LOG_CONN_TRACE(ctx,
-                   "[VMess][{}] parsed command={} security={} options={:#04x} target={} consumed={}",
-                   tag,
+                   "parsed command={} security={} options={:#04x} target={} consumed={}",
                    static_cast<int>(request->command),
                    static_cast<int>(request->security),
                    static_cast<int>(request->options),
@@ -99,18 +107,16 @@ ParseHandshake(AsyncStream& stream,
         user_session = co_await validator.TryConnectSession(
             tag, profile.user_id, ctx.inbound.source_ip, profile.device_limit);
         if (!user_session) {
-            LOG_NET_DEBUG("{} from {}:{} rejected device_limit [{}] user={} limit={} domain_online_devices={}",
-                FormatTimestamp(ctx.accept_time_us),
-                ctx.inbound.source_ip, ctx.inbound.source_port, tag, ctx.inbound.user_email,
-                profile.device_limit,
+            LOG_CONN_DEBUG(ctx, "connection rejected from {}:{} > device limit={} domain_online_devices={}",
+                ctx.inbound.source_ip, ctx.inbound.source_port, profile.device_limit,
                 validator.OnlineDeviceCount(tag, static_cast<uint64_t>(profile.user_id)));
+            LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "device limit"));
             co_return tl::unexpected(ErrorCode::PERMISSION_DENIED);
         }
     }
 
-    LOG_CONN_DEBUG(ctx, "[VMess][{}] auth ok: {} -> {} user={}",
-                   tag, client_ip, request->target,
-                   ctx.inbound.user_email);
+    LOG_CONN_DEBUG(ctx, "authentication succeeded from {}:{} -> {}",
+                   client_ip, ctx.inbound.source_port, request->target);
 
     // Header authentication and replay checks are finished. Body/response keys
     // are already owned by request; do not move a user-table owner into Session.
@@ -159,6 +165,8 @@ proxy::vmess::inbound::Handler::Process(
 {
     const std::string_view tag   = ctx.inbound.tag;
     const std::string_view client_ip = ctx.inbound.source_ip;
+    ctx.inbound.user_id = 0;
+    ctx.inbound.user_email.clear();
     auto fail = [&](ErrorCode error) {
         stats_->OnError();
         RelayResult result;
@@ -166,13 +174,13 @@ proxy::vmess::inbound::Handler::Process(
         return result;
     };
 
-    LOG_CONN_DEBUG(ctx, "[VMess][{}] Process start from {}", tag, client_ip);
+    LOG_CONN_DEBUG(ctx, "processing connection from {}:{}", client_ip, ctx.inbound.source_port);
 
     if (limiter_ && ctx.inbound.HasProxyProtocolClientIP() &&
         co_await limiter_->IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {
-        LOG_NET_DEBUG("{} from {}:{} rejected ip_banned [{}]",
-            FormatTimestamp(ctx.accept_time_us),
-            ctx.inbound.source_ip, ctx.inbound.source_port, ctx.inbound.tag);
+        LOG_CONN_DEBUG(ctx, "connection rejected from {}:{} > IP banned",
+                       ctx.inbound.source_ip, ctx.inbound.source_port);
+        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "IP banned"));
         co_return fail(ErrorCode::BLOCKED);
     }
     ::acpp::vmess::encoding::ServerSession vmess_session(validator_, tag);

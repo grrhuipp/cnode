@@ -20,6 +20,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <exception>
+#include <format>
 #include <thread>
 #include <stdexcept>
 
@@ -53,9 +54,9 @@ public:
         try {
             if (error) std::rethrow_exception(error);
         } catch (const std::exception& failure) {
-            try { LOG_ERROR("runtime failure: {}", failure.what()); } catch (...) {}
+            try { Log::WriteConsole(LogLevel::ERROR, std::format("Runtime failed: {}", failure.what())); } catch (...) {}
         } catch (...) {
-            try { LOG_ERROR("runtime failure: unknown exception"); } catch (...) {}
+            try { Log::WriteConsole(LogLevel::ERROR, "Runtime failed: unknown exception"); } catch (...) {}
         }
     }
 
@@ -83,10 +84,10 @@ public:
                     if (ctx.enable_controller) ctx.controller.Start();
                     monitor.Start();
                     for (const auto& inbound : ctx.inbound_startup.entries) {
-                        LOG_CONSOLE("static_inbound ready tag={} port={} protocol={} network={}",
+                        LOG_CONSOLE("Static inbound ready: tag={} port={} protocol={} network={}",
                             inbound.tag, inbound.port, inbound.protocol, inbound.stream_settings.network);
                     }
-                    LOG_CONSOLE("server started workers={} accept=SO_REUSEPORT", ctx.workers.size());
+                    LOG_CONSOLE("Server ready; server started workers={} accept=SO_REUSEPORT", ctx.workers.size());
                 }
             } catch (const IoSystemError& error) {
                 if (!stopping || error.code() != net::error::operation_aborted)

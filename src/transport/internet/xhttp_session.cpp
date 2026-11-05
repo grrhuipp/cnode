@@ -1276,8 +1276,7 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
             try {
                 n = co_await stream->AsyncRead(net::buffer(request_start));
             } catch (const IoSystemError& error) {
-                LOG_NET_DEBUG("[XHTTP:{}] server: idle H1 connection ended: {}",
-                              conn_id, error.what());
+                LOG_CONN_DEBUG(conn_id, "XHTTP server idle H1 connection ended > {}", error.what());
             }
             if (n == 0) {
                 co_return std::unique_ptr<AsyncStream>{};
@@ -1288,9 +1287,9 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
         auto head = co_await ReadHttp1MessageHead(*stream, received);
         if (!head) {
             if (head.error() == ErrorCode::SOCKET_EOF) {
-                LOG_NET_DEBUG("[XHTTP:{}] server: peer closed during H1 request read", conn_id);
+                LOG_CONN_DEBUG(conn_id, "XHTTP server peer closed during H1 request read");
             } else if (head.error() == ErrorCode::PROTOCOL_DECODE_FAILED) {
-                LOG_NET_DEBUG("[XHTTP:{}] server: H1 request too large or incomplete", conn_id);
+                LOG_CONN_DEBUG(conn_id, "XHTTP server H1 request too large or incomplete");
             }
             co_return tl::unexpected(head.error());
         }
@@ -1303,13 +1302,12 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
         const std::string_view expect_header = ExtractHeaderValueCI(request, "Expect");
         const auto meta = ParseXHttpRequestMeta(cfg.path, request_path, method);
 
-        LOG_NET_TRACE(
-            "[XHTTP:{}] server: H1 request line='{}' method='{}' path='{}' host='{}' bytes={}",
-            conn_id,
-            SanitizeForLog(request_line),
+        LOG_CONN_TRACE(conn_id,
+            "XHTTP server H1 request line='{}' method='{}' path='{}' host='{}' bytes={}",
+            SanitizeHttpRequestLineForLog(request_line),
             SanitizeForLog(method),
-            SanitizeForLog(request_path),
-            SanitizeForLog(host),
+            PublicHttpTargetForLog(request_path),
+            PublicHttpTargetForLog(host),
             head->size);
 
         if (method.empty() || meta.kind == XHttpRequestMeta::Kind::Unknown) {
@@ -1317,11 +1315,10 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
         }
         if (const std::string_view expected_host = TrimAscii(ExpectedHttpHost(cfg));
             !expected_host.empty() && !EqualsAsciiCI(host, expected_host)) {
-            LOG_NET_DEBUG(
-                "[XHTTP:{}] server: host mismatch expected='{}' actual='{}'",
-                conn_id,
-                SanitizeForLog(expected_host),
-                SanitizeForLog(host));
+            LOG_CONN_DEBUG(conn_id,
+                "XHTTP server host mismatch expected='{}' actual='{}'",
+                PublicHttpTargetForLog(expected_host),
+                PublicHttpTargetForLog(host));
             co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
         }
 
@@ -1351,8 +1348,7 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
 
             auto downlink = MakeHttp1BodyStream(
                 std::move(stream), Http1BodyUntilClose{}, true, head->ReadAhead());
-            LOG_NET_DEBUG("[XHTTP:{}] server: split downlink ready session={} mode={}",
-                          conn_id,
+            LOG_CONN_DEBUG(conn_id, "XHTTP server split downlink ready session={} mode={}",
                           meta.session_id,
                           xhttp_cfg.AcceptsStreamUp() ? "stream-up" : "packet-up");
             auto logical = MakeXHttpSplitStream(std::move(session), std::move(downlink));
@@ -1367,8 +1363,7 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
         // Every other request kind carries an upload in its body.
         const auto body_framing = XHttpUploadFraming(request);
         if (!body_framing) {
-            LOG_NET_DEBUG("[XHTTP:{}] server: H1 upload requires exactly one valid body framing",
-                          conn_id);
+            LOG_CONN_DEBUG(conn_id, "XHTTP server H1 upload requires exactly one valid body framing");
             co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
         }
 
@@ -1402,8 +1397,7 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
                         *body, BuildXHttpResponseHeaders(cfg, false, true))) {
                     co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
                 }
-                LOG_NET_TRACE("[XHTTP:{}] server: packet-up payload accepted session={} seq={}",
-                              conn_id,
+                LOG_CONN_TRACE(conn_id, "XHTTP server packet-up payload accepted session={} seq={}",
                               meta.session_id,
                               meta.seq);
                 co_return std::unique_ptr<AsyncStream>{};
@@ -1444,8 +1438,7 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
             if (!co_await WriteFullToStream(*stream, response)) {
                 co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
             }
-            LOG_NET_TRACE("[XHTTP:{}] server: packet-up session={} seq={} status={}",
-                          conn_id,
+            LOG_CONN_TRACE(conn_id, "XHTTP server packet-up response session={} seq={} status={}",
                           meta.session_id,
                           meta.seq,
                           rejection.empty() ? std::string_view("200 OK") : rejection);
@@ -1486,8 +1479,7 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
             auto body = MakeHttp1BodyStream(
                 std::move(stream), *body_framing, false, head->ReadAhead());
             if (stream_handler) stream_handler->OnInboundTransportReady(*body);
-            LOG_NET_DEBUG("[XHTTP:{}] server: stream-up upload ready session={}",
-                          conn_id,
+            LOG_CONN_DEBUG(conn_id, "XHTTP server stream-up upload ready session={}",
                           meta.session_id);
             if (!session->AttachStream(std::move(body))) {
                 co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
@@ -1511,7 +1503,7 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
         }
         auto body = MakeHttp1BodyStream(
             std::move(stream), *body_framing, true, head->ReadAhead());
-        LOG_NET_DEBUG("[XHTTP:{}] server: H1 stream-one ready", conn_id);
+        LOG_CONN_DEBUG(conn_id, "XHTTP server H1 stream-one ready");
         if (!stream_handler) {
             co_return body;
         }
@@ -1581,9 +1573,8 @@ net::awaitable<TransportBuildResult> DoXHttp1ClientRequest(
         } catch (...) {
             co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
         }
-        LOG_NET_DEBUG("[XHTTP:{}] client: H1 stream-up ready path={} initial={}B",
-                      conn_id,
-                      detail::EffectiveHttpPath(cfg.path),
+        LOG_CONN_DEBUG(conn_id, "XHTTP client H1 stream-up ready path={} initial={}B",
+                      PublicHttpTargetForLog(detail::EffectiveHttpPath(cfg.path)),
                       payload_len);
         const auto executor = co_await net::this_coro::executor;
         auto domain = ExecutionDomain::Current();
@@ -1621,9 +1612,8 @@ net::awaitable<TransportBuildResult> DoXHttp1ClientRequest(
     if (HeaderContainsTokenCI(ExtractHeaderValueCI(response, "Transfer-Encoding"), "chunked")) {
         read_framing = Http1BodyChunked{};
     }
-    LOG_NET_DEBUG("[XHTTP:{}] client: H1 downlink ready path={}",
-                  conn_id,
-                  detail::EffectiveHttpPath(cfg.path));
+    LOG_CONN_DEBUG(conn_id, "XHTTP client H1 downlink ready path={}",
+                  PublicHttpTargetForLog(detail::EffectiveHttpPath(cfg.path)));
     co_return MakeHttp1BodyStream(
         std::move(stream), read_framing, false, head->ReadAhead());
 }

@@ -48,6 +48,7 @@ struct Controller::Impl : std::enable_shared_from_this<Controller::Impl> {
     GetOnlineSnapshot(const std::string& tag);
 
     [[nodiscard]] std::optional<proxyman::inbound::UserSet> BuildUsersForInbound(
+        const PanelConfig& panel_config,
         const controller::InboundBuild& inbound,
         const api::NodeInfo& node_config,
         const std::vector<api::UserInfo>& api_users) const;

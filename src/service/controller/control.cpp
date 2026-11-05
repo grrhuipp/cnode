@@ -52,8 +52,9 @@ net::awaitable<void> Controller::Impl::FlushTraffic() {
             co_await collectTraffic(*panel, key);
         } catch (const std::exception& error) {
             if (!failure) failure = std::current_exception();
-            LOG_ERROR("Panel {}/{} final traffic persistence failed: {}",
-                      panel->config.Name, panel->config.NodeIDs.Front(), error.what());
+            const PanelLogContext log_context{panel->config.Name, panel->config.APIHost,
+                panel->config.NodeIDs.Front(), panel->config.NodeType};
+            LOG_PANEL_ERROR(log_context, "Final traffic persistence failed: {}", error.what());
         }
     }
     if (failure) std::rethrow_exception(failure);
@@ -94,8 +95,8 @@ Controller::Impl::GetOnlineSnapshot(const std::string& tag) {
 
 net::awaitable<void> Controller::Impl::userInfoMonitor(PanelRuntime& panel,
                                                  const std::string& tag) {
-    const int node_id = panel.config.NodeIDs.Front();
-    const auto& panel_name = panel.config.Name;
+    const PanelLogContext log_context{panel.config.Name, panel.config.APIHost,
+        panel.config.NodeIDs.Front(), panel.config.NodeType};
 
     ThrowIfStopping();
     // Drain never-attempted crash/backpressure records before collecting more;
@@ -143,17 +144,15 @@ net::awaitable<void> Controller::Impl::userInfoMonitor(PanelRuntime& panel,
         }
         ThrowIfStopping();
         if (traffic_ok) {
-            LOG_DEBUG("Panel {}/{} report: traffic ok | users {}",
-                      panel_name, node_id, traffic_data.size());
+            LOG_PANEL_DEBUG(log_context, "Traffic report accepted: users={}", traffic_data.size());
         }
     } catch (const std::exception& e) {
         if (stopping_) throw;
-        LOG_WARN("Panel {}/{} report: traffic failed | {}",
-                 panel_name, node_id, e.what());
+        LOG_PANEL_WARN(log_context, "Traffic report failed: operation=push reason={}", e.what());
     }
     if (!traffic_ok && !batch.records.empty()) {
-        LOG_ERROR("Panel {}/{} accounting: API acceptance unknown; {} records retained without retry; directory={}",
-                  panel_name, node_id, batch.records.size(), panel.traffic_journal->Directory().string());
+        LOG_PANEL_ERROR(log_context, "Traffic accounting API acceptance unknown: records={} retained without retry; directory={}",
+                        batch.records.size(), panel.traffic_journal->Directory().string());
     }
 
     ThrowIfStopping();
@@ -163,15 +162,12 @@ net::awaitable<void> Controller::Impl::userInfoMonitor(PanelRuntime& panel,
         ThrowIfStopping();
     } catch (const std::exception& e) {
         if (stopping_) throw;
-        LOG_WARN("Panel {}/{} report: online failed | {}",
-                 panel_name, node_id, e.what());
+        LOG_PANEL_WARN(log_context, "Online report failed: operation=push reason={}", e.what());
     }
 
     const bool report_ok = traffic_ok && online_ok;
-    LOG_CONSOLE(
-        "Panel {}/{} report: {} | traffic {}/{} | online {}/{} | devices {}",
-        panel_name,
-        node_id,
+    LOG_PANEL_INFO(log_context,
+        "Panel report: state={} operation=push traffic={} traffic_users={} online={} online_users={} devices={}",
         report_ok ? "ok" : "degraded",
         traffic_ok ? "ok" : "failed",
         traffic_data.size(),

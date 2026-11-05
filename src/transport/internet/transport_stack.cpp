@@ -42,12 +42,6 @@ namespace {
 using transport::internet::EqualsAsciiCI;
 using transport::internet::TrimAscii;
 
-// Log correlation only: callers without an upstream connection number get a
-// Worker-local one.
-[[nodiscard]] uint64_t ResolveTraceConnId(uint64_t trace_conn_id) noexcept {
-    thread_local uint64_t next_conn_id = 1;
-    return trace_conn_id != 0 ? trace_conn_id : next_conn_id++;
-}
 
 [[nodiscard]] bool ReceivesSupportedReality(const StreamSettings& s) {
     return !s.IsReality() ||
@@ -192,16 +186,17 @@ net::awaitable<TransportBuildResult> AcceptInboundSecurity(
     std::unique_ptr<AsyncStream> stream,
     const StreamSettings& s,
     SslContext* ctx,
-    app::dns::DNS* dns_service) {
+    app::dns::DNS* dns_service,
+    uint64_t conn_id) {
     if (!ctx) {
-        LOG_ERROR("[Transport] BuildInbound: {} requested without a Worker-owned server context",
+        LOG_CONN_ERROR(conn_id, "{} inbound security requires a Worker-owned server context",
                   s.IsReality() ? "REALITY" : "TLS");
         co_return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
     }
 
     auto tcp = TakeOwnedTcpStream(stream);
     if (!tcp) {
-        LOG_ERROR("[Transport] BuildInbound: TLS-like security requested but base stream is not TcpStream");
+        LOG_CONN_ERROR(conn_id, "inbound TLS security requires a TCP base stream");
         co_return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
     }
     std::unique_ptr<RealityServerConnState> reality_conn_state;
@@ -225,8 +220,8 @@ net::awaitable<TransportBuildResult> AcceptInboundSecurity(
         }
         auto initial_bytes = reader.TakeWire();
         if (!reality_conn_state) {
-            LOG_NET_DEBUG(
-                "[Transport] BuildInbound: REALITY unauthenticated handshake, falling back to {}:{}",
+            LOG_CONN_DEBUG(conn_id,
+                "REALITY server handshake unauthenticated; falling back to {}:{}",
                 s.reality.dest_host,
                 s.reality.dest_port);
             co_await RunRealityFallbackProxy(
@@ -253,11 +248,11 @@ net::awaitable<TransportBuildResult> AcceptInboundSecurity(
         tls = co_await WrapTlsServer(std::move(tcp), *ctx);
     }
     if (!tls) {
-        LOG_NET_DEBUG("[Transport] BuildInbound: {} server handshake failed",
+        LOG_CONN_DEBUG(conn_id, "{} server handshake failed",
                       s.IsReality() ? "REALITY" : "TLS");
         co_return tl::unexpected(ErrorCode::TLS_HANDSHAKE_FAILED);
     }
-    LOG_NET_DEBUG("[Transport] BuildInbound: {} handshake ok",
+    LOG_CONN_DEBUG(conn_id, "{} server handshake completed",
                   s.IsReality() ? "REALITY" : "TLS");
     co_return std::unique_ptr<AsyncStream>(std::move(tls));
 }
@@ -267,28 +262,29 @@ net::awaitable<TransportBuildResult> ConnectOutboundSecurity(
     std::unique_ptr<AsyncStream> stream,
     const StreamSettings& s,
     SslContext* ctx,
-    std::string_view sni) {
+    std::string_view sni,
+    uint64_t conn_id) {
     if (!ctx) {
-        LOG_ERROR("[Transport] BuildOutbound: {} requested without a Worker-owned client context",
+        LOG_CONN_ERROR(conn_id, "{} outbound security requires a Worker-owned client context",
                   s.IsReality() ? "REALITY" : "TLS");
         co_return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
     }
 
     auto tcp = TakeOwnedTcpStream(stream);
     if (!tcp) {
-        LOG_ERROR("[Transport] BuildOutbound: TLS-like security requested but base stream is not TcpStream");
+        LOG_CONN_ERROR(conn_id, "outbound TLS security requires a TCP base stream");
         co_return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
     }
     auto tls = s.IsReality()
         ? co_await WrapRealityClient(std::move(tcp), *ctx, s.reality, sni)
         : co_await WrapTlsClient(std::move(tcp), *ctx, sni);
     if (!tls) {
-        LOG_NET_DEBUG("[Transport] BuildOutbound: {} client handshake failed (sni={})",
+        LOG_CONN_DEBUG(conn_id, "{} client handshake failed (sni={})",
                       s.IsReality() ? "REALITY" : "TLS",
                       sni);
         co_return tl::unexpected(ErrorCode::TLS_HANDSHAKE_FAILED);
     }
-    LOG_NET_DEBUG("[Transport] BuildOutbound: {} handshake ok (sni={}, alpn={})",
+    LOG_CONN_DEBUG(conn_id, "{} client handshake completed (sni={} alpn={})",
                   s.IsReality() ? "REALITY" : "TLS",
                   sni,
                   tls->NegotiatedAlpn().empty() ? "-" : tls->NegotiatedAlpn());
@@ -374,8 +370,8 @@ net::awaitable<TransportBuildResult> DoXHttp2PacketUpClientRequest(
     co_return std::unique_ptr<AsyncStream>{};
 }
 
-void LogLayerFailure(std::string_view layer, ErrorCode error) {
-    LOG_NET_DEBUG("[Transport] {} failed ({})", layer, ErrorCodeToString(error));
+void LogLayerFailure(uint64_t conn_id, std::string_view layer, ErrorCode error) {
+    LOG_CONN_DEBUG(conn_id, "{} failed > {}", layer, ErrorCodeToString(error));
 }
 
 }  // namespace
@@ -391,9 +387,10 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
     app::dns::DNS* dns_service)
 {
     std::unique_ptr<AsyncStream> stream = std::move(raw);
+    const uint64_t conn_id = trace_conn_id;
 
     if (s.IsUnsupported() || !ReceivesSupportedReality(s)) {
-        LOG_ERROR("[Transport] BuildInbound: unsupported transport combination network={} security={}",
+        LOG_CONN_ERROR(conn_id, "unsupported inbound transport combination network={} security={}",
                   s.network,
                   s.security);
         co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
@@ -402,14 +399,12 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
     // 1. TLS / REALITY 层（服务端）
     if (s.IsTlsLike()) {
         auto secured = co_await AcceptInboundSecurity(
-            io_context, std::move(stream), s, security_context, dns_service);
+            io_context, std::move(stream), s, security_context, dns_service, conn_id);
         if (!secured || !*secured) {
             co_return secured;
         }
         stream = std::move(*secured);
     }
-
-    const uint64_t conn_id = ResolveTraceConnId(trace_conn_id);
 
     // 2. gRPC 层（服务端）
     if (s.IsGrpc()) {
@@ -420,7 +415,7 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
             std::move(stream_handler),
             conn_id);
         if (!grpc_result) {
-            LogLayerFailure("BuildInbound: gRPC server handshake", grpc_result.error());
+            LogLayerFailure(conn_id, "gRPC server handshake", grpc_result.error());
             co_return tl::unexpected(grpc_result.error());
         }
         stream = std::move(*grpc_result);
@@ -437,7 +432,7 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
             metadata,
             nullptr);
         if (!http_result) {
-            LogLayerFailure("BuildInbound: HTTP server handshake", http_result.error());
+            LogLayerFailure(conn_id, "HTTP server handshake", http_result.error());
             co_return tl::unexpected(http_result.error());
         }
         stream = std::move(*http_result);
@@ -456,7 +451,7 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
             metadata,
             &s.xhttp);
         if (!xhttp_result) {
-            LogLayerFailure("BuildInbound: XHTTP server handshake", xhttp_result.error());
+            LogLayerFailure(conn_id, "XHTTP server handshake", xhttp_result.error());
             co_return tl::unexpected(xhttp_result.error());
         }
         stream = std::move(*xhttp_result);
@@ -467,7 +462,7 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
         auto ws_result = co_await transport::internet::DoWsServerHandshake(
             std::move(stream), s.ws, conn_id, metadata);
         if (!ws_result) {
-            LogLayerFailure("BuildInbound: WS server handshake", ws_result.error());
+            LogLayerFailure(conn_id, "WebSocket server handshake", ws_result.error());
             co_return tl::unexpected(ws_result.error());
         }
         stream = std::move(*ws_result);
@@ -478,7 +473,7 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
         auto http_upgrade_result = co_await transport::internet::DoHttpUpgradeServerHandshake(
             std::move(stream), s.http_upgrade, conn_id, metadata);
         if (!http_upgrade_result) {
-            LogLayerFailure("BuildInbound: HTTPUpgrade server handshake",
+            LogLayerFailure(conn_id, "HTTPUpgrade server handshake",
                             http_upgrade_result.error());
             co_return tl::unexpected(http_upgrade_result.error());
         }
@@ -497,9 +492,10 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
     uint64_t trace_conn_id)
 {
     std::unique_ptr<AsyncStream> stream = std::move(raw);
+    const uint64_t conn_id = trace_conn_id;
 
     if (s.IsUnsupported() || !ReceivesSupportedReality(s)) {
-        LOG_ERROR("[Transport] BuildOutbound: unsupported transport combination network={} security={}",
+        LOG_CONN_ERROR(conn_id, "unsupported outbound transport combination network={} security={}",
                   s.network,
                   s.security);
         co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
@@ -514,14 +510,12 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
     // 1. TLS / REALITY 层（客户端）
     if (s.IsTlsLike()) {
         auto secured = co_await ConnectOutboundSecurity(
-            std::move(stream), s, security_context, sni);
+            std::move(stream), s, security_context, sni, conn_id);
         if (!secured) {
             co_return secured;
         }
         stream = std::move(*secured);
     }
-
-    const uint64_t conn_id = ResolveTraceConnId(trace_conn_id);
 
     // 2. gRPC 层（客户端）
     if (s.IsGrpc()) {
@@ -534,7 +528,7 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
         auto grpc_result = co_await transport::internet::DoGrpcClientHandshake(
             std::move(stream), s.grpc, authority, s.IsTlsLike(), conn_id);
         if (!grpc_result) {
-            LogLayerFailure("BuildOutbound: gRPC client handshake", grpc_result.error());
+            LogLayerFailure(conn_id, "gRPC client handshake", grpc_result.error());
             co_return tl::unexpected(grpc_result.error());
         }
         stream = std::move(*grpc_result);
@@ -549,7 +543,7 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
             : co_await transport::internet::DoHttp1ClientHandshake(
                   std::move(stream), s.http, host, conn_id);
         if (!http_result) {
-            LogLayerFailure("BuildOutbound: HTTP client handshake", http_result.error());
+            LogLayerFailure(conn_id, "HTTP client handshake", http_result.error());
             co_return tl::unexpected(http_result.error());
         }
         stream = std::move(*http_result);
@@ -558,7 +552,7 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
     // 4. XHTTP stream-one 层（客户端，HTTP/2 raw body/response）
     if (s.IsXHttp()) {
         if (const XHttpMode mode = ResolveXHttpOutboundMode(s); mode != XHttpMode::StreamOne) {
-            LOG_ERROR("[Transport] BuildOutbound: XHTTP {} needs the split dialer",
+            LOG_CONN_ERROR(conn_id, "XHTTP client {} requires the split dialer",
                       XHttpModeName(mode));
             co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
         }
@@ -570,7 +564,7 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
             s.IsTlsLike(),
             conn_id);
         if (!xhttp_result) {
-            LogLayerFailure("BuildOutbound: XHTTP client handshake", xhttp_result.error());
+            LogLayerFailure(conn_id, "XHTTP client handshake", xhttp_result.error());
             co_return tl::unexpected(xhttp_result.error());
         }
         stream = std::move(*xhttp_result);
@@ -584,7 +578,7 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
             s.ws.path.empty() ? "/" : s.ws.path,
             &s.ws.headers);
         if (!ws_result) {
-            LogLayerFailure("BuildOutbound: WS client handshake", ws_result.error());
+            LogLayerFailure(conn_id, "WebSocket client handshake", ws_result.error());
             co_return tl::unexpected(ws_result.error());
         }
         stream = std::move(ws);
@@ -595,7 +589,7 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
         auto http_upgrade_result = co_await transport::internet::DoHttpUpgradeClientHandshake(
             std::move(stream), s.http_upgrade, dial_host, conn_id);
         if (!http_upgrade_result) {
-            LogLayerFailure("BuildOutbound: HTTPUpgrade client handshake",
+            LogLayerFailure(conn_id, "HTTPUpgrade client handshake",
                             http_upgrade_result.error());
             co_return tl::unexpected(http_upgrade_result.error());
         }
@@ -625,7 +619,7 @@ net::awaitable<TransportBuildResult> BuildOutboundXHttpClientRequest(
     std::unique_ptr<AsyncStream> stream = std::move(raw);
     if (s.IsTlsLike()) {
         auto secured = co_await ConnectOutboundSecurity(
-            std::move(stream), s, security_context, sni);
+            std::move(stream), s, security_context, sni, trace_conn_id);
         if (!secured) {
             co_return secured;
         }

@@ -9,7 +9,6 @@
 #include "acppnode/common/defaults.hpp"
 #include "acppnode/common/memory_stats.hpp"
 #include "acppnode/service/controller/controller.hpp"
-#include "acppnode/core/naming.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
 #include "acppnode/app/dns/dns.hpp"
@@ -168,13 +167,13 @@ net::awaitable<void> RuntimeSamplingLoop(
             if (((burst_drain || newly_idle) && cooldown_ok) || churn_collect_due) {
                 const char* reason =
                     churn_collect_due ? "churn" : (newly_idle ? "idle" : "burst-drain");
-                LOG_INFO("mem-collect force reason={} conn={} churn={}",
+                LOG_CONSOLE("Forcing worker heap collection: reason={} conn={} churn={}",
                          reason, total_conns, churn_since_force);
                 try {
                     co_await CollectWorkerHeaps(ctx);
                 } catch (const std::exception& error) {
                     ctx.ThrowIfStopping();
-                    LOG_WARN("Worker heap collection skipped: {}", error.what());
+                    LOG_CONSOLE_WARN("Worker heap collection skipped: {}", error.what());
                 }
                 last_force_collect_at = now;
                 last_force_collect_total_connections = aggregate_stats.connections_total;
@@ -230,43 +229,37 @@ net::awaitable<void> RuntimeStatsOutputLoop(
             pool_chunks += worker_snapshot.memory.pool_chunks;
         }
         const auto total_users = proxyman::inbound::UserStore::TotalUsers();
-        LOG_INFO(
-            "runtime conn={} mem={:.1f}MB pool_mapped={}MB pool_direct={}MB pool_idle={}KB pool_chunks={} pmr_wrong_thread={} traffic_in={} traffic_out={} rate_down={} rate_up={} dns_hit={:.0f}% dns_cache={}/{} udp_sockets={} users={}",
-            total_conns,
-            mem_mb,
-            pool_mapped_bytes / (1024 * 1024),
-            pool_direct_bytes / (1024 * 1024),
-            pool_idle_bytes / 1024,
-            pool_chunks,
-            memory::CrossThreadFreeCount(),
-            acpp::FormatBytes(snapshot.bytes_in),
-            acpp::FormatBytes(snapshot.bytes_out),
-            FormatRate(snapshot.bytes_in_rate),
-            FormatRate(snapshot.bytes_out_rate),
-            dns_hit_rate,
-            dns_stats.entries,
-            dns_stats.capacity,
-            total_udp_sockets,
-            total_users);
+        LOG_CONSOLE("Runtime activity: conn={} users={} udp_sockets={}",
+                    total_conns, total_users, total_udp_sockets);
+        LOG_CONSOLE("Runtime memory: resident={:.1f}MB pool_mapped={}MB pool_direct={}MB pool_idle={}KB pool_chunks={} pmr_wrong_thread={}",
+                    mem_mb, pool_mapped_bytes / (1024 * 1024),
+                    pool_direct_bytes / (1024 * 1024), pool_idle_bytes / 1024,
+                    pool_chunks, memory::CrossThreadFreeCount());
+        LOG_CONSOLE("Runtime traffic: traffic_in={} traffic_out={} rate_down={} rate_up={}",
+                    acpp::FormatBytes(snapshot.bytes_in), acpp::FormatBytes(snapshot.bytes_out),
+                    FormatRate(snapshot.bytes_in_rate), FormatRate(snapshot.bytes_out_rate));
+        LOG_CONSOLE("Runtime DNS cache: dns_hit={:.0f}% dns_cache={}/{}",
+                    dns_hit_rate, dns_stats.entries, dns_stats.capacity);
 
         const auto descriptors = ReadProcessDescriptors();
-        LOG_INFO("runtime.process fds={} soft_limit={}",
+        LOG_CONSOLE("Process descriptors: fds={} soft_limit={}",
                  descriptors.open ? std::to_string(*descriptors.open) : "unknown",
                  descriptors.soft_limit ? std::to_string(*descriptors.soft_limit)
                      : descriptors.soft_limit_unlimited ? "unlimited" : "unknown");
         for (const auto& worker : worker_snapshots) {
             const auto& r = *worker.resources;
-            LOG_INFO(
-                "runtime.worker id={} conn={} udp_sockets={} udp_listeners={} udp_receive_loops={} udp_resource_drops={} udp_associations={} udp_closed={} udp_input_packets={} udp_input_bytes={} udp_reply_packets={} udp_reply_bytes={} udp_reply_senders={} udp_native_dispatches={} timeout_heap={}/{} timeout_waiters={} pool_mapped={} pool_direct={} pool_idle={} pool_chunks={}",
-                worker.worker_id, worker.active_connections, worker.memory.udp_sockets,
-                r.udp_listeners, r.udp_receive_loops, r.udp_resource_drops,
-                r.udp_associations, r.udp_closed_associations,
-                r.udp_input_datagrams, r.udp_input_bytes,
-                r.udp_reply_datagrams, r.udp_reply_bytes, r.udp_reply_senders,
-                r.udp_native_dispatches, r.timeout_events, r.timeout_heap_capacity,
-                r.timeout_waiters,
-                worker.memory.pool_mapped_bytes, worker.memory.pool_direct_bytes,
-                worker.memory.pool_idle_bytes, worker.memory.pool_chunks);
+            LOG_CONSOLE("Worker activity: id={} conn={} udp_sockets={} timeout_heap={}/{} timeout_waiters={}",
+                        worker.worker_id, worker.active_connections, worker.memory.udp_sockets,
+                        r.timeout_events, r.timeout_heap_capacity, r.timeout_waiters);
+            LOG_CONSOLE("Worker memory: id={} pool_mapped={} pool_direct={} pool_idle={} pool_chunks={}",
+                        worker.worker_id, worker.memory.pool_mapped_bytes, worker.memory.pool_direct_bytes,
+                        worker.memory.pool_idle_bytes, worker.memory.pool_chunks);
+            LOG_CONSOLE("Worker UDP resources: id={} udp_listeners={} udp_receive_loops={} udp_resource_drops={} udp_associations={} udp_closed={} udp_reply_senders={}",
+                        worker.worker_id, r.udp_listeners, r.udp_receive_loops, r.udp_resource_drops,
+                        r.udp_associations, r.udp_closed_associations, r.udp_reply_senders);
+            LOG_CONSOLE("Worker UDP traffic: id={} udp_input_packets={} udp_input_bytes={} udp_reply_packets={} udp_reply_bytes={} udp_native_dispatches={}",
+                        worker.worker_id, r.udp_input_datagrams, r.udp_input_bytes,
+                        r.udp_reply_datagrams, r.udp_reply_bytes, r.udp_native_dispatches);
         }
 
         auto node_stats = ctx.controller.GetNodeStats();
@@ -280,9 +273,9 @@ net::awaitable<void> RuntimeStatsOutputLoop(
                 node_online += ns.online_users;
                 node_up += ns.bytes_up;
                 node_down += ns.bytes_down;
-                LOG_DEBUG(
-                    "runtime.node name={} port={} network={} users={} online={} upload={} download={}",
-                    naming::BuildPanelNodeStatsKey(ns.panel_name, ns.node_id),
+                const PanelLogContext log_context{ns.panel_name, ns.panel_host, ns.node_id, ns.node_type};
+                LOG_PANEL_DEBUG(log_context,
+                    "Node activity: port={} network={} users={} online={} upload={} download={}",
                     ns.port,
                     ns.network,
                     ns.total_users,
@@ -290,7 +283,7 @@ net::awaitable<void> RuntimeStatsOutputLoop(
                     acpp::FormatBytes(ns.bytes_up),
                     acpp::FormatBytes(ns.bytes_down));
             }
-            LOG_INFO("runtime.nodes count={} users={} online={} upload={} download={}",
+            LOG_CONSOLE("Panel node totals: count={} users={} online={} upload={} download={}",
                      node_stats.size(),
                      node_users,
                      node_online,
@@ -306,15 +299,15 @@ net::awaitable<void> RuntimeStatsOutputLoop(
 
 void ReportMonitorExit(std::string_view name, std::exception_ptr failure) {
     if (!failure) {
-        LOG_WARN("runtime monitor loop={} stopped", name);
+        LOG_CONSOLE_WARN("Runtime monitor stopped unexpectedly: loop={}", name);
         return;
     }
     try {
         std::rethrow_exception(failure);
     } catch (const std::exception& error) {
-        LOG_ERROR("runtime monitor loop={} failed: {}", name, error.what());
+        LOG_CONSOLE_ERROR("Runtime monitor failed: loop={} reason={}", name, error.what());
     } catch (...) {
-        LOG_ERROR("runtime monitor loop={} failed with unknown exception", name);
+        LOG_CONSOLE_ERROR("Runtime monitor failed: loop={} reason=unknown exception", name);
     }
 }
 

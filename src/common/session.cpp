@@ -3,8 +3,8 @@
 #include "acppnode/common/ip_utils.hpp"
 #include "acppnode/common/network.hpp"
 
+#include <charconv>
 #include <array>
-#include <chrono>
 #include <format>
 #include <iterator>
 #include <optional>
@@ -33,7 +33,9 @@ void Context::InitSubstreamFrom(const Context& parent, uint16_t sub_source_port)
 }
 }  // namespace session
 
-std::string FormatAccessLog(const session::Context& ctx) {
+std::string FormatAccessLog(const session::Context& ctx,
+                            AccessStatus status,
+                            std::string_view reason) {
     std::optional<iputil::AddressText> src_host_storage;
     std::string_view src_host = ctx.inbound.source_ip;
     if (src_host.empty()) {
@@ -58,41 +60,57 @@ std::string FormatAccessLog(const session::Context& ctx) {
         }
     }
 
-    const std::string_view in_tag = ctx.inbound.tag.empty()
-        ? std::string_view("-")
-        : ctx.inbound.tag;
-    const std::string_view out_tag = ctx.outbound.tag.empty()
-        ? std::string_view("-")
-        : ctx.outbound.tag;
+    const std::string_view in_tag = ctx.inbound.tag;
+    const std::string_view out_tag = ctx.outbound.tag;
+    const bool accepted = status == AccessStatus::Accepted;
+    const bool has_target = accepted || t.IsValid();
 
     // Only the final owning string crosses the logging queue. Do not use the
     // Worker PMR for it or retain connection-local formatting scratch.
     std::string access;
     access.reserve(128 + src_host.size() + target_host.size() +
-                   in_tag.size() + out_tag.size() + ctx.inbound.user_email.size());
+                   in_tag.size() + out_tag.size() +
+                   ctx.inbound.user_email.size() + reason.size());
     auto endpoint = [&](std::string_view host, uint16_t port) {
         const bool brackets = iputil::NeedsIpv6Brackets(host);
         std::format_to(std::back_inserter(access), "{}{}{}:{}",
                        brackets ? "[" : "", host, brackets ? "]" : "", port);
     };
-    access.append("from ");
-    endpoint(src_host, ctx.inbound.source_port);
-    access.append(" accepted ");
-    access.append(net_str);
-    access.push_back(':');
-    endpoint(target_host, t.port);
-    access.append(" [");
-    access.append(in_tag);
-    if (in_tag != out_tag) {
-        access.append(" -> ");
-        access.append(out_tag);
+    if (accepted || src_host != "unknown") {
+        access.append("from ");
+        endpoint(src_host, ctx.inbound.source_port);
+        access.push_back(' ');
     }
-    access.push_back(']');
+    access.append(accepted ? "accepted" : "rejected");
+    if (has_target) {
+        access.push_back(' ');
+        access.append(net_str);
+        access.push_back(':');
+        endpoint(target_host, t.port);
+    }
+    if (!accepted && !reason.empty()) {
+        access.push_back(' ');
+        access.append(reason);
+    }
+    if (!in_tag.empty() || !out_tag.empty()) {
+        access.append(" [");
+        access.append(in_tag);
+        if (!out_tag.empty() && in_tag != out_tag) {
+            if (!in_tag.empty()) access.append(" -> ");
+            access.append(out_tag);
+        }
+        access.push_back(']');
+    }
+    std::array<char, 20> uid_buffer{};
+    std::string_view uid;
     if (ctx.inbound.user_id > 0) {
-        std::format_to(std::back_inserter(access), " user:{}", ctx.inbound.user_id);
-    } else if (!ctx.inbound.user_email.empty()) {
-        access.append(" user:");
-        access.append(ctx.inbound.user_email);
+        const auto result = std::to_chars(
+            uid_buffer.data(), uid_buffer.data() + uid_buffer.size(), ctx.inbound.user_id);
+        uid = {uid_buffer.data(), static_cast<size_t>(result.ptr - uid_buffer.data())};
+        access.append(" user:").append(uid);
+    }
+    if (!ctx.inbound.user_email.empty() && ctx.inbound.user_email != uid) {
+        access.append(" email:").append(ctx.inbound.user_email);
     }
     if (ctx.outbound.connected_local_addr &&
         !ctx.outbound.connected_local_addr->is_unspecified()) {
@@ -101,35 +119,6 @@ std::string FormatAccessLog(const session::Context& ctx) {
             *ctx.outbound.connected_local_addr)).View());
     }
     return access;
-}
-
-// 格式化时间戳（本地时区，跨平台）
-std::string FormatTimestamp(int64_t timestamp_us) {
-    using namespace std::chrono;
-    struct CachedTimestamp {
-        int64_t sec = -1;
-        std::string value;
-    };
-
-    constexpr size_t kTimestampCacheSize = 8;
-    thread_local std::array<CachedTimestamp, kTimestampCacheSize> cache;
-    thread_local size_t next_slot = 0;
-
-    const auto sec = duration_cast<seconds>(microseconds{timestamp_us}).count();
-    for (const auto& entry : cache) {
-        if (entry.sec == sec) {
-            return entry.value;
-        }
-    }
-
-    const auto tp = system_clock::time_point{seconds{sec}};
-    auto value = FormatLocalTime(tp, "%Y-%m-%d %H:%M:%S");
-    cache[next_slot] = CachedTimestamp{
-        .sec = sec,
-        .value = value,
-    };
-    next_slot = (next_slot + 1) % kTimestampCacheSize;
-    return value;
 }
 
 }  // namespace acpp

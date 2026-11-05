@@ -1439,7 +1439,7 @@ std::optional<Config> ParseConfig(const json::object& j) {
         return cfg;
 
     } catch (const std::exception& e) {
-        LOG_ERROR("Failed to parse config: {}", e.what());
+        LOG_CONSOLE_ERROR("Failed to parse config: {}", e.what());
         return std::nullopt;
     }
 }

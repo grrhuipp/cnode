@@ -469,9 +469,18 @@ void PhysicalSessionCapabilities::Leave() noexcept {
 }
 void PhysicalSessionCapabilities::OnFailure(std::exception_ptr error) noexcept {
     RequestStop();
-    try { if (error) std::rethrow_exception(error); }
-    catch (const std::exception& failure) { LOG_ERROR("Session domain failed: {}", failure.what()); }
-    catch (...) { LOG_ERROR("Session domain failed"); }
+    try {
+        try { if (error) std::rethrow_exception(error); }
+        catch (const IoSystemError& failure) {
+            if (failure.code() != net::error::operation_aborted &&
+                failure.code() != net::error::eof)
+                LOG_ERROR("session domain failed > {}", failure.what());
+        }
+        catch (const std::exception& failure) {
+            LOG_ERROR("session domain failed > {}", failure.what());
+        }
+        catch (...) { LOG_ERROR("session domain failed > unknown error"); }
+    } catch (...) {} // Failure reporting must remain noexcept, including under OOM.
 }
 
 } // namespace acpp::app

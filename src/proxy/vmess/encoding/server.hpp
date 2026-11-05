@@ -24,6 +24,7 @@ public:
         size_t len,
         uint64_t trace_conn_id = 0);
     [[nodiscard]] size_t RequiredHeaderBytes() const noexcept { return required_header_bytes_; }
+    [[nodiscard]] std::string_view HeaderFailureReason() const noexcept { return header_failure_reason_; }
 
     void SetRequest(VMessRequest request);
 
@@ -41,6 +42,7 @@ private:
     std::shared_ptr<const proxyman::inbound::UserStore::VmessCredential> header_user_;
     size_t required_header_bytes_ = 42;
     uint16_t header_length_ = 0;
+    std::string_view header_failure_reason_;
 };
 
 }  // namespace acpp::vmess::encoding

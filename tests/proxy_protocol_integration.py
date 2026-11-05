@@ -15,6 +15,9 @@ async def run(binary, output):
     output.mkdir(parents=True, exist_ok=True)
     resources = Resources()
     observations = []
+    diagnostics = output / "error.log"
+    previous_size = diagnostics.stat().st_size if diagnostics.exists() else 0
+    closed_probes = []
     try:
         async def echo(reader, writer):
             data = await reader.readexactly(len(PAYLOAD))
@@ -35,7 +38,9 @@ async def run(binary, output):
         config = {
             "config.json": {"workers": 2,
                             "timeouts": {"handshake": 2, "connIdle": 5},
-                            "log": {"enable": False}},
+                            "log": {"loglevel": "info", "logDir": str(output),
+                                    "access": "access.log", "error": "error.log",
+                                    "rotateDaily": False, "gzip": False}},
             "inbounds.json": [dict(inbound, tag="required", port=required, proxyProtocol="on"),
                               dict(inbound, tag="disabled", port=disabled, proxyProtocol="off"),
                               dict(inbound, tag="automatic", port=automatic, proxyProtocol="auto"),
@@ -105,10 +110,36 @@ async def run(binary, output):
                 except ConnectionResetError:
                     pass
                 observations.append({"case": name, "accepted": False})
+        for truncated in (False, True):
+            async with asyncio.timeout(5):
+                reader, writer = await resources.connect(automatic)
+                source_port = writer.get_extra_info("sockname")[1]
+                closed_probes.append((source_port, truncated))
+                if truncated:
+                    writer.write(b"PROX")
+                    await writer.drain()
+                writer.write_eof()
+                try:
+                    assert await reader.read() == b""
+                except ConnectionResetError:
+                    pass
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except ConnectionResetError:
+                    pass
+                observations.append({"case": "auto-truncated" if truncated else "auto-empty-eof",
+                                     "accepted": False})
         assert child.poll() is None, "product exited during PROXY boundary smoke"
     finally:
         await resources.close()
     assert not resources.errors, resources.errors
+    error_lines = diagnostics.read_bytes()[previous_size:].decode().splitlines()
+    for source_port, truncated in closed_probes:
+        warnings = [line for line in error_lines if "[Warning]" in line and
+                    f"127.0.0.1:{source_port}" in line]
+        assert len(warnings) == int(truncated), (
+            "empty EOF must be quiet; a truncated PROXY prefix must remain diagnosable", warnings)
     (output / "result.json").write_text(json.dumps(observations, indent=2), encoding="utf-8")
     print(json.dumps(observations, indent=2))
 

@@ -57,7 +57,7 @@ private:
                 try {
                     Run(stop);
                 } catch (const std::exception& error) {
-                    LOG_ERROR("TLS auto-sign renewal scheduler stopped: {}", error.what());
+                    LOG_ERROR("TLS auto-sign renewal scheduler stopped > {}", error.what());
                     std::lock_guard lock(mutex_);
                     failed_ = true;
                 }
@@ -132,9 +132,9 @@ private:
             try {
                 renewed = due->Publish(due->builder_());
             } catch (const std::exception& error) {
-                LOG_ERROR("TLS auto-sign renewal failed: {}", error.what());
+                LOG_ERROR("TLS auto-sign renewal failed > {}", error.what());
             } catch (...) {
-                LOG_ERROR("TLS auto-sign renewal failed");
+                LOG_ERROR("TLS auto-sign renewal failed > unknown exception");
             }
             if (!renewed) {
                 // Existing connections retain their own SSL_CTX. New handshakes

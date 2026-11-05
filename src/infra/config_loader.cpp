@@ -39,7 +39,7 @@ ConfigFileLoad LoadJsonFile(const std::filesystem::path& path) {
         if (error == ENOENT) {
             return ConfigFileAbsent{};
         }
-        LOG_ERROR("config.read_failed file={} error={}",
+        LOG_CONSOLE_ERROR("Configuration read failed: file={} reason={}",
                   file_name, std::generic_category().message(error));
         return ConfigFileInvalid{};
     }
@@ -50,7 +50,7 @@ ConfigFileLoad LoadJsonFile(const std::filesystem::path& path) {
         const size_t read = std::fread(chunk.data(), 1, chunk.size(), file.get());
         if (read < chunk.size() && std::ferror(file.get())) {
             const int error = errno;
-            LOG_ERROR("config.read_failed file={} error={}",
+            LOG_CONSOLE_ERROR("Configuration read failed: file={} reason={}",
                       file_name, std::generic_category().message(error));
             return ConfigFileInvalid{};
         }
@@ -63,7 +63,7 @@ ConfigFileLoad LoadJsonFile(const std::filesystem::path& path) {
     try {
         return json::parse(content, json::KeyComparison::AsciiCaseInsensitive);
     } catch (const std::exception& e) {
-        LOG_ERROR("config.parse_failed file={} error={}", file_name, e.what());
+        LOG_CONSOLE_ERROR("Configuration parsing failed: file={} reason={}", file_name, e.what());
         return ConfigFileInvalid{};
     }
 }
@@ -79,13 +79,13 @@ bool LoadSidecarFile(const std::filesystem::path& config_dir,
     }
     auto* value = std::get_if<json::value>(&loaded);
     if (!value) {
-        LOG_ERROR("config.sidecar_load_failed file={}", file_name);
+        LOG_CONSOLE_ERROR("Configuration sidecar load failed: file={}", file_name);
         return false;
     }
     try {
         apply(*value);
     } catch (const std::exception& e) {
-        LOG_ERROR("config.sidecar_parse_failed file={} error={}", file_name, e.what());
+        LOG_CONSOLE_ERROR("Configuration sidecar parsing failed: file={} reason={}", file_name, e.what());
         return false;
     }
     return true;
@@ -112,7 +112,7 @@ void LoadInboundItems(
     LoadConfigItems(value, [&](const json::object& item) {
         inbounds.push_back(StaticInboundConfig::FromJson(item));
     });
-    LOG_CONSOLE("config.sidecar loaded file={} inbounds={}",
+    LOG_CONSOLE("Configuration sidecar loaded: file={} inbounds={}",
                 source_name,
                 inbounds.size() - count_before);
 }
@@ -125,7 +125,7 @@ void LoadOutboundItems(
     LoadConfigItems(value, [&](const json::object& item) {
         outbounds.push_back(infra::OutboundSourceConfig::FromJson(item));
     });
-    LOG_CONSOLE("config.sidecar loaded file={} outbounds={}",
+    LOG_CONSOLE("Configuration sidecar loaded: file={} outbounds={}",
                 source_name,
                 outbounds.size() - count_before);
 }
@@ -136,24 +136,24 @@ std::optional<Config> LoadConfig(const std::filesystem::path& path) {
     std::filesystem::path config_dir;
     json::value main_config;
 
-    LOG_CONSOLE("config loading source={}", path.string());
+    LOG_CONSOLE("Loading configuration: source={}", path.string());
 
     if (std::filesystem::is_directory(path)) {
         config_dir = path;
-        LOG_CONSOLE("config mode=directory dir={}", config_dir.string());
+        LOG_CONSOLE("Loading configuration directory: mode=directory dir={}", config_dir.string());
 
         auto loaded = LoadJsonFile(path / constants::paths::kDefaultConfigFile);
         if (std::holds_alternative<ConfigFileInvalid>(loaded)) {
-            LOG_ERROR("config.main_load_failed file={}",
+            LOG_CONSOLE_ERROR("Main configuration load failed: file={}",
                       constants::paths::kDefaultConfigFile);
             return std::nullopt;
         }
         if (auto* loaded_config = std::get_if<json::value>(&loaded)) {
             main_config = std::move(*loaded_config);
-            LOG_CONSOLE("config.main loaded file={}", constants::paths::kDefaultConfigFile);
+            LOG_CONSOLE("Main configuration loaded: file={}", constants::paths::kDefaultConfigFile);
         } else {
             main_config = json::object{};
-            LOG_CONSOLE("config.main missing file={} using_defaults=true",
+            LOG_CONSOLE("Main configuration missing; using defaults: file={} using_defaults=true",
                         constants::paths::kDefaultConfigFile);
         }
     } else {
@@ -163,23 +163,23 @@ std::optional<Config> LoadConfig(const std::filesystem::path& path) {
         if (config_dir.empty()) {
             config_dir = ".";
         }
-        LOG_CONSOLE("config mode=file dir={}", config_dir.string());
+        LOG_CONSOLE("Loading configuration file: mode=file dir={}", config_dir.string());
 
         auto loaded = LoadJsonFile(file_path);
         auto* loaded_config = std::get_if<json::value>(&loaded);
         if (!loaded_config) {
             // 显式指定的配置文件不存在同样是错误，不回落到默认配置。
-            LOG_ERROR("config.main_load_failed file={} missing={}",
+            LOG_CONSOLE_ERROR("Main configuration load failed: file={} missing={}",
                       file_path.filename().string(),
                       std::holds_alternative<ConfigFileAbsent>(loaded));
             return std::nullopt;
         }
         main_config = std::move(*loaded_config);
-        LOG_CONSOLE("config.main loaded file={}", file_path.filename().string());
+        LOG_CONSOLE("Main configuration loaded: file={}", file_path.filename().string());
     }
 
     if (!main_config.is_object()) {
-        LOG_ERROR("config.main_invalid reason=expected_object");
+        LOG_CONSOLE_ERROR("Main configuration must be an object");
         return std::nullopt;
     }
     auto cfg_opt = ParseConfig(main_config.as_object());
@@ -209,7 +209,7 @@ std::optional<Config> LoadConfig(const std::filesystem::path& path) {
                         "routing sidecar must be a direct routing object");
                 }
                 cfg.routing = RoutingConfig::FromJson(value.as_object());
-                LOG_CONSOLE("config.sidecar loaded file={} rules={}",
+                LOG_CONSOLE("Configuration sidecar loaded: file={} rules={}",
                             constants::paths::kRouteFile,
                             cfg.routing.rules.size());
             });
@@ -229,7 +229,7 @@ std::optional<Config> LoadConfig(const std::filesystem::path& path) {
         direct.tag = std::string(constants::protocol::kDirect);
         direct.protocol = std::string(constants::protocol::kFreedom);
         cfg.outbounds.insert(cfg.outbounds.begin(), std::move(direct));
-        LOG_CONSOLE("config.outbound builtin tag={} sendThrough={}",
+        LOG_CONSOLE("Built-in outbound configured: tag={} sendThrough={}",
                     constants::protocol::kDirect, constants::binding::kAuto);
     }
 
@@ -238,19 +238,19 @@ std::optional<Config> LoadConfig(const std::filesystem::path& path) {
         blackhole.tag = std::string(constants::protocol::kBlackhole);
         blackhole.protocol = std::string(constants::protocol::kBlackhole);
         cfg.outbounds.push_back(std::move(blackhole));
-        LOG_CONSOLE("config.outbound builtin tag={}", constants::protocol::kBlackhole);
+        LOG_CONSOLE("Built-in outbound configured: tag={}", constants::protocol::kBlackhole);
     }
 
     auto geoip_path = config_dir / constants::paths::kGeoIpFile;
     auto geosite_path = config_dir / constants::paths::kGeoSiteFile;
     if (std::filesystem::exists(geoip_path)) {
-        LOG_CONSOLE("config.geo found file={}", constants::paths::kGeoIpFile);
+        LOG_CONSOLE("Geodata file found: file={}", constants::paths::kGeoIpFile);
     }
     if (std::filesystem::exists(geosite_path)) {
-        LOG_CONSOLE("config.geo found file={}", constants::paths::kGeoSiteFile);
+        LOG_CONSOLE("Geodata file found: file={}", constants::paths::kGeoSiteFile);
     }
 
-    LOG_CONSOLE("config summary workers={} inbounds={} outbounds={} rules={} panels={}",
+    LOG_CONSOLE("Configuration loaded: workers={} inbounds={} outbounds={} rules={} panels={}",
                 cfg.workers,
                 cfg.static_inbounds.size(),
                 cfg.outbounds.size(),

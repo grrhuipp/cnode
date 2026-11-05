@@ -593,20 +593,20 @@ net::awaitable<void> UdpIngress::RunNativeDispatch(ClientSessionPtr client_sessi
             InitialPayload{}, request.context, *request.stats, request.timeouts);
         if (result.error != ErrorCode::OK) {
             LOG_CONN_DEBUG(request.context,
-                "[UDP] dispatcher session end: {} up={}B down={}B",
+                "UDP dispatcher ended > {} up={}B down={}B",
                 ErrorCodeToString(result.error), result.bytes_up,
                 result.bytes_down);
         }
     } catch (const IoSystemError& error) {
-        if (error.code() != net::error::operation_aborted) {
-            LOG_ERROR("Worker[{}]: UDP dispatcher failed: {}",
-                      request.worker_id, error.what());
+        if (error.code() != net::error::operation_aborted && error.code() != net::error::eof) {
+            LOG_CONN_ERROR(request.context, "UDP dispatcher failed worker={} > {}",
+                           request.worker_id, error.what());
         }
     } catch (const std::exception& e) {
-        LOG_ERROR("Worker[{}]: UDP dispatcher coroutine failed: {}",
+        LOG_CONN_ERROR(request.context, "UDP dispatcher coroutine failed worker={} > {}",
                   request.worker_id, e.what());
     } catch (...) {
-        LOG_ERROR("Worker[{}]: UDP dispatcher coroutine failed: unknown",
+        LOG_CONN_ERROR(request.context, "UDP dispatcher coroutine failed worker={} > unknown error",
                   request.worker_id);
     }
     client_session->Close();
@@ -620,7 +620,7 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
     }
     if (!datagram.receiver) {
         LOG_NET_DEBUG(
-            "Worker[{}]: UDP datagram missing prepared receiver tag={}",
+            "UDP datagram rejected worker={} tag={} > missing prepared receiver",
             datagram.worker_id,
             impl_->tag);
         return;
@@ -637,6 +637,20 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
         .payload = datagram.payload,
     });
     if (!decoded) {
+        if (decoded.error() == ErrorCode::PROTOCOL_AUTH_FAILED) {
+            session::Context rejected;
+            rejected.worker_id = datagram.worker_id;
+            rejected.inbound.tag = impl_->tag;
+            rejected.inbound.source_addr = normalized_client_addr;
+            rejected.inbound.source_ip = iputil::AddressText(normalized_client_addr).View();
+            rejected.inbound.source_port = datagram.client_endpoint.port();
+            rejected.content.network = Network::UDP;
+            LOG_WARN("UDP datagram rejected worker={} inbound={} source={}:{} > datagram authentication or validation failed",
+                     datagram.worker_id, impl_->tag,
+                     rejected.inbound.source_ip, rejected.inbound.source_port);
+            LOG_ACCESS(FormatAccessLog(rejected, AccessStatus::Rejected,
+                                      "datagram authentication or validation failed"));
+        }
         return;
     }
 
@@ -647,7 +661,7 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
         decoded->session_owner, decoded->session_id, datagram.client_endpoint};
     if (decoded->session_owner.size == 0) {
         LOG_NET_DEBUG(
-            "Worker[{}]: UDP decode missing authenticated session owner for client={}",
+            "UDP datagram rejected worker={} client={} > missing authenticated session owner",
             datagram.worker_id,
             client_key_log());
         return;
@@ -682,7 +696,7 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
     if (need_new_session) {
         auto response = impl_->proxy->CreateDatagramResponse(*decoded);
         if (!response || !*response) {
-            LOG_NET_DEBUG("Worker[{}]: UDP response preparation failed for client={}",
+            LOG_NET_DEBUG("UDP response preparation failed worker={} client={}",
                           datagram.worker_id, client_key_log());
             return;
         }
@@ -770,12 +784,18 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
                     client_session->Close();
                     RetireNativeJob(*client_session);
                     if (error) {
-                        try { std::rethrow_exception(error); }
-                        catch (const std::exception& failure) {
-                            LOG_ERROR("Worker[{}]: UDP completion failed: {}", worker_id, failure.what());
-                        } catch (...) {
-                            LOG_ERROR("Worker[{}]: UDP completion failed", worker_id);
-                        }
+                        try {
+                            try { std::rethrow_exception(error); }
+                            catch (const IoSystemError& failure) {
+                                if (failure.code() != net::error::operation_aborted &&
+                                    failure.code() != net::error::eof)
+                                    LOG_ERROR("UDP completion failed worker={} > {}", worker_id, failure.what());
+                            } catch (const std::exception& failure) {
+                                LOG_ERROR("UDP completion failed worker={} > {}", worker_id, failure.what());
+                            } catch (...) {
+                                LOG_ERROR("UDP completion failed worker={} > unknown error", worker_id);
+                            }
+                        } catch (...) {} // Completion cleanup must survive logging allocation failures.
                     }
                 });
         } catch (...) {
@@ -794,7 +814,7 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
     // insertion inside `CreateClientSession`).
     packet_session->UpdateReplyEndpoint(datagram.client_endpoint);
     if (!packet_session->Push(decoded->target, std::move(decoded->payload))) {
-        LOG_NET_DEBUG("Worker[{}]: UDP link enqueue failed for client={}",
+        LOG_NET_DEBUG("UDP link enqueue failed worker={} client={}",
                          datagram.worker_id, client_key_log());
     } else if (preparation_session) {
         preparation_session.reset();

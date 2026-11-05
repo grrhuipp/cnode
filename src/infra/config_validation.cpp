@@ -11,22 +11,22 @@ namespace acpp {
 
 bool ValidateConfig(const Config& config) {
     if (config.workers == 0 || config.workers > defaults::kMaxWorkers) {
-        LOG_ERROR("Worker count must be between 1 and {}", defaults::kMaxWorkers);
+        LOG_CONSOLE_ERROR("Worker count must be between 1 and {}", defaults::kMaxWorkers);
         return false;
     }
 
     if (config.dns.servers.empty()) {
-        LOG_ERROR("At least one DNS server is required");
+        LOG_CONSOLE_ERROR("At least one DNS server is required");
         return false;
     }
 
     if (config.timeouts.handshake == 0 || config.timeouts.dial == 0) {
-        LOG_ERROR("Timeout values must be positive");
+        LOG_CONSOLE_ERROR("Timeout values must be positive");
         return false;
     }
 
     if (config.dns.min_ttl > config.dns.max_ttl) {
-        LOG_ERROR("DNS minTTL must be less than or equal to maxTTL");
+        LOG_CONSOLE_ERROR("DNS minTTL must be less than or equal to maxTTL");
         return false;
     }
 
@@ -38,7 +38,8 @@ bool ValidateConfig(const Config& config) {
         for (const int node_id : panel.NodeIDs.Values()) {
             auto key = naming::BuildPanelNodeStatsKey(panel.Name, node_id);
             if (!panel_nodes.insert(key).second) {
-                LOG_ERROR("Duplicate panel node identity: {}", key);
+                const PanelLogContext log_context{panel.Name, panel.APIHost, node_id, panel.NodeType};
+                LOG_PANEL_ERROR(log_context, "Duplicate panel node identity");
                 return false;
             }
         }
@@ -46,7 +47,7 @@ bool ValidateConfig(const Config& config) {
 
     const auto inbound_semantic = ValidateStaticInboundSemantics(config.static_inbounds);
     if (!inbound_semantic.Ok()) {
-        LOG_ERROR("Static inbound {}", inbound_semantic.Message());
+        LOG_CONSOLE_ERROR("Static inbound {}", inbound_semantic.Message());
         return false;
     }
 
@@ -56,31 +57,31 @@ bool ValidateConfig(const Config& config) {
         case ConfigSemanticError::None:
             break;
         case ConfigSemanticError::NoOutbounds:
-            LOG_ERROR("At least one outbound is required");
+            LOG_CONSOLE_ERROR("At least one outbound is required");
             return false;
         case ConfigSemanticError::EmptyOutboundTag:
-            LOG_ERROR("Outbound at index {} has an empty tag", semantic.index);
+            LOG_CONSOLE_ERROR("Outbound at index {} has an empty tag", semantic.index);
             return false;
         case ConfigSemanticError::ReservedOutboundTag:
-            LOG_ERROR("Outbound at index {} uses reserved panel tag '{}'", semantic.index, semantic.tag);
+            LOG_CONSOLE_ERROR("Outbound at index {} uses reserved panel tag '{}'", semantic.index, semantic.tag);
             return false;
         case ConfigSemanticError::DuplicateOutboundTag:
-            LOG_ERROR("Duplicate outbound tag '{}' at index {}",
+            LOG_CONSOLE_ERROR("Duplicate outbound tag '{}' at index {}",
                       semantic.tag, semantic.index);
             return false;
         case ConfigSemanticError::EmptyRouteOutboundTag:
-            LOG_ERROR("Routing rule at index {} has an empty outbound tag",
+            LOG_CONSOLE_ERROR("Routing rule at index {} has an empty outbound tag",
                       semantic.index);
             return false;
         case ConfigSemanticError::UnknownRouteOutboundTag:
-            LOG_ERROR("Routing rule at index {} references unknown outbound '{}'",
+            LOG_CONSOLE_ERROR("Routing rule at index {} references unknown outbound '{}'",
                       semantic.index, semantic.tag);
             return false;
         case ConfigSemanticError::EmptyStaticInboundOutboundTag:
-            LOG_ERROR("Static inbound at index {} has an empty outboundTag", semantic.index);
+            LOG_CONSOLE_ERROR("Static inbound at index {} has an empty outboundTag", semantic.index);
             return false;
         case ConfigSemanticError::UnknownStaticInboundOutboundTag:
-            LOG_ERROR("Static inbound at index {} references unknown outboundTag '{}'",
+            LOG_CONSOLE_ERROR("Static inbound at index {} references unknown outboundTag '{}'",
                       semantic.index, semantic.tag);
             return false;
     }

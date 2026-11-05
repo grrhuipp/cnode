@@ -13,6 +13,7 @@
 #include <iostream>
 #include <exception>
 #include <filesystem>
+#include <format>
 #include <optional>
 #include <string_view>
 #include <system_error>
@@ -31,15 +32,14 @@ namespace {
 
 std::optional<Config> LoadConfigFromCli(
     const CommandLineOptions& cli,
-    std::ostream& err,
     bool& error_reported) {
     const std::filesystem::path config_path(cli.config_path);
 
     if (cli.config_mode == ConfigPathMode::Directory) {
         std::error_code ec;
         if (!std::filesystem::is_directory(config_path, ec)) {
-            err << "--config-dir expects an existing directory: "
-                << cli.config_path << "\n";
+            Log::WriteConsole(LogLevel::ERROR, std::format(
+                "--config-dir expects an existing directory: {}", cli.config_path));
             error_reported = true;
             return std::nullopt;
         }
@@ -48,8 +48,8 @@ std::optional<Config> LoadConfigFromCli(
     if (cli.config_mode == ConfigPathMode::File) {
         std::error_code ec;
         if (std::filesystem::is_directory(config_path, ec)) {
-            err << "--config-file expects a file, got directory: "
-                << cli.config_path << "\n";
+            Log::WriteConsole(LogLevel::ERROR, std::format(
+                "--config-file expects a file, got directory: {}", cli.config_path));
             error_reported = true;
             return std::nullopt;
         }
@@ -90,10 +90,10 @@ int RunFromCommandLine(int argc, char* argv[]) {
     }
 
     bool config_error_reported = false;
-    auto config_opt = LoadConfigFromCli(cli, std::cerr, config_error_reported);
+    auto config_opt = LoadConfigFromCli(cli, config_error_reported);
     if (!config_opt) {
         if (!config_error_reported) {
-            std::cerr << "Failed to load config from: " << cli.config_path << "\n";
+            Log::WriteConsole(LogLevel::ERROR, std::format("Failed to load config from: {}", cli.config_path));
         }
         return 1;
     }
@@ -106,16 +106,16 @@ int RunFromCommandLine(int argc, char* argv[]) {
                    config.log.error_path,
                    config.log.rotate_daily,
                    config.log.gzip)) {
-        std::cerr << "Failed to initialize logging\n";
+        Log::WriteConsole(LogLevel::ERROR, "Failed to initialize logging");
         return 1;
     }
 
-    LOG_CONSOLE("cnode v1.0.0 starting channel={} build={}", BUILD_CHANNEL, BUILD_ID);
-    LOG_CONSOLE("runtime workers={} io={} accept=SO_REUSEPORT allocator=thread-local",
+    LOG_CONSOLE("Starting cnode v1.0.0: channel={} build={}", BUILD_CHANNEL, BUILD_ID);
+    LOG_CONSOLE("Runtime configured: workers={} io={} accept=SO_REUSEPORT allocator=thread-local",
                 config.workers, IoBackendName());
 
     if (!ValidateConfig(config)) {
-        std::cerr << "Invalid configuration\n";
+        Log::WriteConsole(LogLevel::ERROR, "Invalid configuration");
         Log::Shutdown();
         return 1;
     }
@@ -125,8 +125,8 @@ int RunFromCommandLine(int argc, char* argv[]) {
         auto env = CreateBootstrapEnvironment(config, cli.test_mode);
         result = RunApplicationRuntime(MakeRuntimeContext(env));
     } catch (const std::exception& e) {
+        Log::WriteConsole(LogLevel::ERROR, std::format("Failed to initialize runtime: {}", e.what()));
         Log::Shutdown();
-        std::cerr << "Failed to initialize runtime: " << e.what() << "\n";
         return 1;
     }
     Log::Shutdown();

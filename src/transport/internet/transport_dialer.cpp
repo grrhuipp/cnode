@@ -650,7 +650,7 @@ net::awaitable<DialResult> DialAndBuildCandidatesSequential(
         }
 
         LOG_CONN_DEBUG(ctx,
-                       "DIAL_CANDIDATE_FAILED endpoint={}:{} error={}",
+                       "dial candidate failed endpoint={}:{} > {}",
                        iputil::AddressText(candidate.endpoint.address()).View(),
                        candidate.endpoint.port(),
                        attempt.error_msg);
@@ -709,7 +709,7 @@ net::awaitable<DialResult> DialXHttpSplitOutboundTransport(
         }
 
         LOG_CONN_DEBUG(ctx,
-                       "XHTTP_DOWNLINK_CANDIDATE_FAILED endpoint={}:{} error={}",
+                       "XHTTP downlink candidate failed endpoint={}:{} > {}",
                        iputil::AddressText(candidate.endpoint.address()).View(),
                        candidate.endpoint.port(),
                        attempt.error_msg);

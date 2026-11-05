@@ -48,6 +48,8 @@ public:
 
     struct NodeStatsInfo {
         std::string panel_name;
+        std::string panel_host;
+        std::string node_type;
         int         node_id      = 0;
         std::string network;
         uint16_t    port         = 0;

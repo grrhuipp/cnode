@@ -48,7 +48,7 @@ async def scenario(args, size, unicode, array, output, result, resources):
         error_log = '\n'.join(path.read_text(encoding='utf-8') for path in diagnostics)
         reason_found = 'padding scheme exceeds 65535 bytes' in error_log
         result.update(passed=size > 65535 and child.returncode != 0 and 'server started' not in log
-                      and 'has invalid protocol settings' in log and reason_found,
+                      and reason_found,
                       rejection_reason_found=reason_found,
                       diagnostic_files=[path.relative_to(output).as_posix() for path in diagnostics],
                       target_requests=0)

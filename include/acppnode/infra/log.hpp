@@ -8,6 +8,7 @@
 #include <source_location>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 
 namespace acpp {
@@ -23,18 +24,26 @@ enum class LogLevel {
 
 struct ConnectionLogContext {
     uint64_t conn_id{0};
-    std::string inbound_tag;
+    std::string inbound_tag{};
     int64_t user_id{0};
+    std::string outbound_tag{};
+};
+
+struct PanelLogContext {
+    std::string_view name;
+    std::string_view host;
+    int64_t node_id;
+    std::string_view type;
 };
 
 // Single authority for configured level names; unknown names are rejected
 // rather than mapped to a default.
 [[nodiscard]] std::optional<LogLevel> ParseLogLevel(std::string_view name) noexcept;
 
-// Xray-compatible local logging:
-// - general and connection diagnostics go to the error logger and are filtered
-//   by loglevel;
-// - access records go to the access logger and intentionally have no severity.
+// Console lifecycle records use XrayR logfmt; error and access files use
+// Xray text records. Diagnostic macros obey the configured severity.
+// Direct WriteConsole(ERROR) keeps fatal startup failures visible even at none.
+// Access facts are independent of severity and never contain credentials.
 class Log {
 public:
     [[nodiscard]] static bool Init(const std::string& level,
@@ -72,21 +81,23 @@ public:
         const Context& context,
         std::string message,
         std::source_location location = std::source_location::current()) {
-        ConnectionLogContext log_context{
-            .conn_id = context.conn_id,
-            .inbound_tag = {},
-            .user_id = 0,
-        };
-        if constexpr (requires {
-                          std::string(context.inbound.tag);
-                          static_cast<int64_t>(context.inbound.user_id);
-                      }) {
-            const auto user_id =
-                static_cast<int64_t>(context.inbound.user_id);
-            if (user_id > 0) {
-                log_context.inbound_tag = std::string(context.inbound.tag);
-                log_context.user_id = user_id;
+        ConnectionLogContext log_context;
+        if constexpr (std::is_integral_v<Context>) {
+            log_context.conn_id = static_cast<uint64_t>(context);
+        } else {
+            log_context.conn_id = context.conn_id;
+        }
+        if constexpr (requires { std::string(context.inbound.tag); }) {
+            log_context.inbound_tag = std::string(context.inbound.tag);
+        }
+        if constexpr (requires { static_cast<int64_t>(context.inbound.user_id); }) {
+            if (context.inbound.user_id > 0) {
+                log_context.user_id = static_cast<int64_t>(context.inbound.user_id);
             }
+        }
+        if constexpr (requires { std::string_view(context.outbound.tag); }) {
+            const std::string_view outbound = context.outbound.tag;
+            if (outbound != log_context.inbound_tag) log_context.outbound_tag = outbound;
         }
         WriteConnection(
             level,
@@ -100,6 +111,12 @@ public:
         std::string message,
         std::source_location location = std::source_location::current());
 
+    static void WritePanel(
+        LogLevel level,
+        PanelLogContext context,
+        std::string message,
+        std::source_location location = std::source_location::current());
+
     [[nodiscard]] static bool ShouldLog(LogLevel level) noexcept;
 
 private:
@@ -108,7 +125,46 @@ private:
 };
 
 #define LOG_CONSOLE(fmt_str, ...) \
-    acpp::Log::WriteConsole(acpp::LogLevel::INFO, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__))
+    do { \
+        if (acpp::Log::ShouldLog(acpp::LogLevel::INFO)) \
+            acpp::Log::WriteConsole(acpp::LogLevel::INFO, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__)); \
+    } while (0)
+#define LOG_CONSOLE_WARN(fmt_str, ...) \
+    do { \
+        if (acpp::Log::ShouldLog(acpp::LogLevel::WARN)) \
+            acpp::Log::WriteConsole(acpp::LogLevel::WARN, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__)); \
+    } while (0)
+#define LOG_CONSOLE_ERROR(fmt_str, ...) \
+    do { \
+        if (acpp::Log::ShouldLog(acpp::LogLevel::ERROR)) \
+            acpp::Log::WriteConsole(acpp::LogLevel::ERROR, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__)); \
+    } while (0)
+#define LOG_CONSOLE_DEBUG(fmt_str, ...) \
+    do { \
+        if (acpp::Log::ShouldLog(acpp::LogLevel::DEBUG)) \
+            acpp::Log::WriteConsole(acpp::LogLevel::DEBUG, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__)); \
+    } while (0)
+
+#define LOG_PANEL_INFO(ctx, fmt_str, ...) \
+    do { \
+        if (acpp::Log::ShouldLog(acpp::LogLevel::INFO)) \
+            acpp::Log::WritePanel(acpp::LogLevel::INFO, ctx, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__)); \
+    } while (0)
+#define LOG_PANEL_WARN(ctx, fmt_str, ...) \
+    do { \
+        if (acpp::Log::ShouldLog(acpp::LogLevel::WARN)) \
+            acpp::Log::WritePanel(acpp::LogLevel::WARN, ctx, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__)); \
+    } while (0)
+#define LOG_PANEL_ERROR(ctx, fmt_str, ...) \
+    do { \
+        if (acpp::Log::ShouldLog(acpp::LogLevel::ERROR)) \
+            acpp::Log::WritePanel(acpp::LogLevel::ERROR, ctx, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__)); \
+    } while (0)
+#define LOG_PANEL_DEBUG(ctx, fmt_str, ...) \
+    do { \
+        if (acpp::Log::ShouldLog(acpp::LogLevel::DEBUG)) \
+            acpp::Log::WritePanel(acpp::LogLevel::DEBUG, ctx, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__)); \
+    } while (0)
 
 #define LOG_TRACE(fmt_str, ...) \
     do { \

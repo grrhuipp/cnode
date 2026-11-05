@@ -418,15 +418,18 @@ DialOutboundStream(
     });
     if (!transport_target) {
         if (transport_target.error() == ErrorCode::DNS_RESOLVE_FAILED) {
-            LOG_CONN_WARN(ctx, "[VLESS] DNS resolve failed for {}", config.address);
+            LOG_CONN_WARN(ctx, "DNS resolve failed for {}", config.address);
         }
         co_return tl::unexpected(transport_target.error());
     }
     auto dial_result = co_await DialOutboundTransport(io_context, ctx, *transport_target);
     if (!dial_result.Ok()) {
-        LOG_CONN_WARN(ctx, "[VLESS] dial failed {} -> {} via {}: {}",
-                          ctx.inbound.source_ip, ctx.outbound.target,
-                          ctx.outbound.tag, dial_result.error_msg);
+        if (dial_result.error != ErrorCode::CANCELLED &&
+            dial_result.error != ErrorCode::CONNECTION_CLOSED &&
+            dial_result.error != ErrorCode::SOCKET_EOF) {
+            LOG_CONN_WARN(ctx, "dial failed {} -> {} > {}",
+                          ctx.inbound.source_ip, ctx.outbound.target, dial_result.error_msg);
+        }
         co_return tl::unexpected(dial_result.error);
     }
     auto stream = std::move(dial_result.stream);
@@ -688,9 +691,8 @@ const bool kVlessRegistered = (acpp::proxyman::outbound::RegisterProxy(
             auto parsed = acpp::vless::ParseVlessClientEncryption(
                 encryption);
             if (!parsed) {
-                LOG_WARN("VLESS outbound '{}': invalid encryption '{}': {}",
+                LOG_WARN("VLESS outbound '{}': invalid encryption: {}",
                          cfg.tag,
-                         encryption,
                          acpp::vless::VlessEncryptionParseErrorMessage(
                              parsed.error));
                 return std::nullopt;

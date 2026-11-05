@@ -549,7 +549,7 @@ net::awaitable<void> AnyTLSDemuxSession::RunStream(
     }
     if (error == ErrorCode::CONNECTION_CLOSED && sub->RemoteClosed()) error = ErrorCode::OK;
     if (error != ErrorCode::OK) {
-        LOG_CONN_DEBUG(sub->ctx, "[AnyTLS] stream sid={} ended: {}",
+        LOG_CONN_DEBUG(sub->ctx, "stream sid={} ended > {}",
                        sub->Sid(), ErrorCodeToString(error));
     }
     // The request owner closes exactly once on every completion path. A remote
@@ -647,6 +647,10 @@ net::awaitable<RelayResult> AnyTLSDemuxSession::ReadFrames(AwaitableTaskGroup& t
             if (!rejection.empty())
                 co_return co_await RejectSession(rejection, ErrorCode::PROTOCOL_INVALID_COMMAND);
             if (streams_.size() >= kMaxConcurrentSubstreams) {
+                LOG_CONN_DEBUG(session_ctx_,
+                    "stream rejected sid={} active={} > concurrent stream limit={}",
+                    sid, streams_.size(), kMaxConcurrentSubstreams);
+                LOG_ACCESS(FormatAccessLog(session_ctx_, AccessStatus::Rejected, "concurrent stream limit"));
                 last_stream_id_ = sid; // A refused ID is retired, never reusable.
                 stats_.OnError();
                 if (session_version_ == anytls::SessionVersion::V2) {
@@ -773,6 +777,9 @@ AuthenticateSession(
     }
     auto user = proxyman::inbound::UserStore::FindAnyTlsUser(ctx.inbound.tag, auth_hash);
     if (!user) {
+        LOG_CONN_WARN(ctx, "authentication failed from {}:{} > no matching credential",
+                      ctx.inbound.source_ip, ctx.inbound.source_port);
+        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "authentication failed: no matching credential"));
         if (limiter && ctx.inbound.HasProxyProtocolClientIP()) {
             co_await limiter->OnAuthFailTracked(ctx.inbound.tag, ctx.inbound.source_ip);
         }
@@ -800,14 +807,10 @@ AuthenticateSession(
     auto user_session = co_await validator.TryConnectSession(
         ctx.inbound.tag, profile.user_id, ctx.inbound.source_ip, profile.device_limit);
     if (!user_session) {
-        LOG_NET_DEBUG("{} from {}:{} rejected device_limit [{}] user={} limit={} domain_online_devices={}",
-            FormatTimestamp(ctx.accept_time_us),
-            ctx.inbound.source_ip,
-            ctx.inbound.source_port,
-            ctx.inbound.tag,
-            ctx.inbound.user_email,
-            profile.device_limit,
+        LOG_CONN_DEBUG(ctx, "connection rejected from {}:{} > device limit={} domain_online_devices={}",
+            ctx.inbound.source_ip, ctx.inbound.source_port, profile.device_limit,
             validator.OnlineDeviceCount(ctx.inbound.tag, static_cast<uint64_t>(profile.user_id)));
+        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "device limit"));
         stats.OnError();
         co_return tl::unexpected(ErrorCode::PERMISSION_DENIED);
     }
@@ -830,6 +833,8 @@ Handler::Process(
     session::Context& ctx,
     const TimeoutsConfig& timeouts,
     uint32_t pressure_idle_timeout) {
+    ctx.inbound.user_id = 0;
+    ctx.inbound.user_email.clear();
     if (!stream) {
         RelayResult result;
         result.error = ErrorCode::PROTOCOL_DECODE_FAILED;

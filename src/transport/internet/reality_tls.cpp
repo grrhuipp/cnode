@@ -395,7 +395,7 @@ BuildRealityClientAuthPlain(
     const RealityConfig& config,
     EVP_PKEY* mldsa65_verify_key) {
     if (!config.public_key) {
-        LOG_ERROR("REALITY client publicKey is empty");
+        LOG_ERROR("REALITY client public key is missing");
         return nullptr;
     }
     auto state = std::make_unique<RealityClientState>();
@@ -488,13 +488,13 @@ bool VerifyRealityClientHandshake(
 
     UniqueX509 cert(SSL_get_peer_certificate(ssl));
     if (!cert) {
-        LOG_NET_DEBUG("REALITY client verification failed: missing peer certificate");
+        LOG_NET_DEBUG("REALITY client verification failed > missing peer certificate");
         return false;
     }
 
     EVP_PKEY* pubkey = X509_get0_pubkey(cert.get());
     if (!pubkey || EVP_PKEY_id(pubkey) != EVP_PKEY_ED25519) {
-        LOG_NET_DEBUG("REALITY client verification failed: peer key is not Ed25519");
+        LOG_NET_DEBUG("REALITY client verification failed > peer key is not Ed25519");
         return false;
     }
 
@@ -505,7 +505,7 @@ bool VerifyRealityClientHandshake(
             peer_public.data(),
             &peer_public_len) != 1 ||
         peer_public_len != peer_public.size()) {
-        LOG_NET_DEBUG("REALITY client verification failed: peer public key export failed");
+        LOG_NET_DEBUG("REALITY client verification failed > peer public key export failed");
         return false;
     }
 
@@ -516,7 +516,7 @@ bool VerifyRealityClientHandshake(
     if (!sig ||
         ASN1_STRING_length(sig) != 64 ||
         !ASN1_STRING_get0_data(sig)) {
-        LOG_NET_DEBUG("REALITY client verification failed: certificate signature invalid");
+        LOG_NET_DEBUG("REALITY client verification failed > invalid certificate signature");
         return false;
     }
 
@@ -530,14 +530,14 @@ bool VerifyRealityClientHandshake(
               expected.data(),
               &expected_len) ||
         expected_len != expected.size()) {
-        LOG_NET_DEBUG("REALITY client verification failed: signature hmac failed");
+        LOG_NET_DEBUG("REALITY client verification failed > signature HMAC failed");
         return false;
     }
 
     // HMAC verification: compare in constant time.
     const uint8_t* signature = ASN1_STRING_get0_data(sig);
     if (CRYPTO_memcmp(expected.data(), signature, expected.size()) != 0) {
-        LOG_NET_DEBUG("REALITY client verification failed: signature mismatch");
+        LOG_NET_DEBUG("REALITY client verification failed > signature mismatch");
         return false;
     }
 
@@ -545,7 +545,7 @@ bool VerifyRealityClientHandshake(
         if (X509_get_ext_count(cert.get()) <= 0 ||
             state.client_hello_raw.empty() ||
             state.server_hello_raw.empty()) {
-            LOG_NET_DEBUG("REALITY client verification failed: missing ML-DSA-65 extension or transcript");
+            LOG_NET_DEBUG("REALITY client verification failed > missing ML-DSA-65 extension or transcript");
             return false;
         }
         X509_EXTENSION* ext = X509_get_ext(cert.get(), 0);
@@ -555,7 +555,7 @@ bool VerifyRealityClientHandshake(
             static_cast<size_t>(ASN1_STRING_length(ext_data)) !=
                 transport::internet::kRealityMldsa65SignatureSize ||
             !ASN1_STRING_get0_data(ext_data)) {
-            LOG_NET_DEBUG("REALITY client verification failed: invalid ML-DSA-65 extension");
+            LOG_NET_DEBUG("REALITY client verification failed > invalid ML-DSA-65 extension");
             return false;
         }
 
@@ -593,12 +593,12 @@ bool VerifyRealityClientHandshake(
                 static_cast<size_t>(ASN1_STRING_length(ext_data)),
                 mldsa_msg.data(),
                 mldsa_msg.size()) != 1) {
-            LOG_NET_DEBUG("REALITY client verification failed: ML-DSA-65 signature invalid");
+            LOG_NET_DEBUG("REALITY client verification failed > invalid ML-DSA-65 signature");
             return false;
         }
     }
 
-    LOG_NET_DEBUG("REALITY client verification ok");
+    LOG_NET_DEBUG("REALITY client verification completed");
     return true;
 }
 
@@ -790,7 +790,7 @@ void RealityServerMsgCallback(int is_write,
 [[nodiscard]] ssl_select_cert_result_t RealitySelectCertificateCallback(
     const SSL_CLIENT_HELLO* hello) {
     auto fail = [](std::string_view reason) {
-        LOG_NET_DEBUG("REALITY server handshake reject: {}", reason);
+        LOG_NET_DEBUG("REALITY server handshake rejected > {}", reason);
         return ssl_select_cert_error;
     };
 
@@ -903,15 +903,15 @@ void RealityServerMsgCallback(int is_write,
 [[nodiscard]] std::unique_ptr<RealityServerState> BuildRealityServerState(
     const RealityConfig& config) {
     if (!config.private_key) {
-        LOG_ERROR("REALITY server privateKey is empty");
+        LOG_ERROR("REALITY server private key is missing");
         return {};
     }
     if (config.server_names.empty()) {
-        LOG_ERROR("REALITY serverNames is empty");
+        LOG_ERROR("REALITY server name list is empty");
         return {};
     }
     if (config.short_ids.empty()) {
-        LOG_ERROR("REALITY shortIds is empty");
+        LOG_ERROR("REALITY short ID list is empty");
         return {};
     }
 
@@ -1079,7 +1079,7 @@ std::unique_ptr<SslContext> SslContext::CreateServerReality(
 
     SSL_CTX* ctx = SSL_CTX_new(TLS_server_method());
     if (!ctx) {
-        LOG_ERROR("Failed to create REALITY SSL server context");
+        LOG_ERROR("failed to create REALITY server TLS context");
         return nullptr;
     }
 
@@ -1089,7 +1089,7 @@ std::unique_ptr<SslContext> SslContext::CreateServerReality(
     SSL_CTX_set_reality_ignore_peer_signature_algorithm_prefs(ctx, 1);
 
     if (SSL_CTX_set_ex_data(ctx, RealityStateExIndex(), state.get()) != 1) {
-        LOG_ERROR("Failed to attach REALITY server state");
+        LOG_ERROR("failed to attach REALITY server state");
         SSL_CTX_free(ctx);
         return nullptr;
     }
@@ -1101,7 +1101,7 @@ std::unique_ptr<SslContext> SslContext::CreateServerReality(
     auto out = std::unique_ptr<SslContext>(
         new SslContext(ctx, std::move(state)));
     if (!out->ConfigureServerAlpn(tls_config.alpn)) {
-        LOG_ERROR("Invalid REALITY server ALPN policy");
+        LOG_ERROR("invalid REALITY server ALPN policy");
         return nullptr;
     }
     LOG_INFO("REALITY server context enabled (serverNames={}, shortIds={})",
@@ -1114,14 +1114,14 @@ std::unique_ptr<SslContext> SslContext::CreateClientReality(
     const RealityConfig& reality,
     const TlsConfig& tls_config) {
     if (!reality.IsClient()) {
-        LOG_ERROR("REALITY client publicKey is empty");
+        LOG_ERROR("REALITY client public key is missing");
         return nullptr;
     }
 
     const SSL_METHOD* method = TLS_client_method();
     SSL_CTX* ctx = SSL_CTX_new(method);
     if (!ctx) {
-        LOG_ERROR("Failed to create REALITY SSL client context");
+        LOG_ERROR("failed to create REALITY client TLS context");
         return nullptr;
     }
 
@@ -1135,7 +1135,7 @@ std::unique_ptr<SslContext> SslContext::CreateClientReality(
         return nullptr;
     }
     if (!ConfigureTlsClientAlpn(ctx, tls_config.alpn)) {
-        LOG_ERROR("Invalid REALITY client ALPN policy");
+        LOG_ERROR("invalid REALITY client ALPN policy");
         SSL_CTX_free(ctx);
         return nullptr;
     }
@@ -1154,7 +1154,7 @@ std::unique_ptr<SslContext> SslContext::CreateClientReality(
         }
         if (SSL_CTX_set_ex_data(
                 ctx, RealityClientContextStateExIndex(), state.get()) != 1) {
-            LOG_ERROR("Failed to attach REALITY client state to SSL_CTX");
+            LOG_ERROR("failed to attach REALITY client state to TLS context");
             SSL_CTX_free(ctx);
             return nullptr;
         }

@@ -58,8 +58,7 @@ void ApplyProxyProtocolResult(
     ctx.inbound.client_ip_source = "proxy_protocol";
     LOG_CONN_DEBUG(
         ctx,
-        "[{}] PROXY protocol: proxy={} real_ip={}:{}",
-        ctx.inbound.tag,
+        "PROXY protocol applied proxy={} real_ip={}:{}",
         proxy_ip,
         ctx.inbound.source_ip,
         ctx.inbound.source_port);
@@ -116,10 +115,10 @@ net::awaitable<void> RunInboundProxy(
     } catch (const IoSystemError&) {
         stats.OnError();
     } catch (const std::exception& e) {
-        LOG_CONN_WARN(ctx, "[Session] inbound process exception: {}", e.what());
+        LOG_CONN_WARN(ctx, "inbound processing failed > {}", e.what());
         stats.OnError();
     } catch (...) {
-        LOG_CONN_WARN(ctx, "[Session] inbound process exception: unknown");
+        LOG_CONN_WARN(ctx, "inbound processing failed > unknown error");
         stats.OnError();
     }
 }
@@ -234,9 +233,11 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
         ctx.inbound.HasProxyProtocolClientIP());
     const auto reject = admission.reason;
     if (reject != ConnectionLimiter::RejectReason::NONE) {
-        LOG_CONN_DEBUG(ctx, "rejected conn_limit src={}:{} reason={}",
+        LOG_CONN_DEBUG(ctx, "connection rejected from {}:{} > {}",
                        ctx.inbound.source_ip, ctx.inbound.source_port,
                        ConnectionLimiter::RejectReasonToString(reject));
+        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected,
+                                  ConnectionLimiter::RejectReasonToString(reject)));
         stats.OnError();
         co_return;
     }
@@ -244,7 +245,7 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
 
     (void)stream->StartPhaseDeadline(timeouts.HandshakeTimeout());
 
-    LOG_CONN_DEBUG(ctx, "[Session] Logical transport stream ready ({}/{})",
+    LOG_CONN_DEBUG(ctx, "logical transport stream ready security={} network={}",
                    listener.stream_settings.security,
                    listener.stream_settings.network);
 
@@ -290,7 +291,13 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
                         ctx.inbound.source_ip);
                     break;
                 case ProxyProtocolReadStatus::Truncated:
-                    LOG_CONN_WARN(ctx, "failed to read PROXY protocol > truncated header");
+                    if (proxy_read.result.status == ProxyProtocolParseStatus::NotProxy) {
+                        LOG_CONN_DEBUG(ctx, "connection ended before PROXY protocol header from {}:{}",
+                                       ctx.inbound.source_ip, ctx.inbound.source_port);
+                    } else {
+                        LOG_CONN_WARN(ctx, "failed to read PROXY protocol from {}:{} > truncated header",
+                                      ctx.inbound.source_ip, ctx.inbound.source_port);
+                    }
                     break;
                 case ProxyProtocolReadStatus::TooLarge:
                     LOG_CONN_WARN(
@@ -325,8 +332,9 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
 
     if (ctx.inbound.HasProxyProtocolClientIP() &&
         co_await limiter_.IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {
-        LOG_CONN_DEBUG(ctx, "rejected ip_banned (early) src={}:{}",
+        LOG_CONN_DEBUG(ctx, "connection rejected source={}:{} > IP banned before transport handshake",
                        ctx.inbound.source_ip, ctx.inbound.source_port);
+        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "IP banned"));
         stats.OnError();
         co_return;
     }
@@ -334,9 +342,11 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
     auto physical_admission = co_await limiter_.ReservePhysical();
     auto reject = physical_admission.reason;
     if (reject != ConnectionLimiter::RejectReason::NONE) {
-        LOG_CONN_DEBUG(ctx, "rejected conn_limit src={}:{} reason={}",
+        LOG_CONN_DEBUG(ctx, "connection rejected from {}:{} > {}",
                        ctx.inbound.source_ip, ctx.inbound.source_port,
                        ConnectionLimiter::RejectReasonToString(reject));
+        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected,
+                                  ConnectionLimiter::RejectReasonToString(reject)));
         stats.OnError();
         co_return;
     }
@@ -345,7 +355,7 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
     raw_conn->SetIdleTimeout(timeouts.HandshakeTimeout());
     (void)raw_conn->StartPhaseDeadline(timeouts.HandshakeTimeout());
 
-    LOG_CONN_DEBUG(ctx, "[Session] Building transport ({}/{})",
+    LOG_CONN_DEBUG(ctx, "building transport security={} network={}",
                    listener.stream_settings.security,
                    listener.stream_settings.network);
 
@@ -381,7 +391,7 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
         transport_metadata,
         dns_service);
     if (!build_result) {
-        LOG_CONN_DEBUG(ctx, "[Session] Transport handshake failed ({}/{})",
+        LOG_CONN_DEBUG(ctx, "transport handshake failed security={} network={}",
                        listener.stream_settings.security,
                        listener.stream_settings.network);
         stats.OnError();
@@ -389,14 +399,14 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
     }
     auto stream = std::move(*build_result);
     if (!stream) {
-        LOG_CONN_DEBUG(ctx, "[Session] Transport consumed connection ({}/{})",
+        LOG_CONN_DEBUG(ctx, "transport consumed connection security={} network={}",
                        listener.stream_settings.security,
                        listener.stream_settings.network);
         co_return;
     }
 
     if (!transport_metadata->real_ip.empty()) {
-        LOG_CONN_DEBUG(ctx, "[Session] HTTP transport real IP from header: {} -> {}",
+        LOG_CONN_DEBUG(ctx, "HTTP transport client address overridden by header: {} -> {}",
                        ctx.inbound.source_ip, transport_metadata->real_ip);
         ApplyHttpRealIp(ctx, transport_metadata->real_ip);
     }
@@ -408,15 +418,17 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
         ctx.inbound.HasProxyProtocolClientIP());
     reject = ip_admission.reason;
     if (reject != ConnectionLimiter::RejectReason::NONE) {
-        LOG_CONN_DEBUG(ctx, "rejected conn_limit src={}:{} reason={}",
+        LOG_CONN_DEBUG(ctx, "connection rejected from {}:{} > {}",
                        ctx.inbound.source_ip, ctx.inbound.source_port,
                        ConnectionLimiter::RejectReasonToString(reject));
+        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected,
+                                  ConnectionLimiter::RejectReasonToString(reject)));
         stats.OnError();
         co_return;
     }
     auto ip_limit = std::move(ip_admission.reservation);
 
-    LOG_CONN_DEBUG(ctx, "[Session] Transport ready ({}/{})",
+    LOG_CONN_DEBUG(ctx, "transport ready security={} network={}",
                    listener.stream_settings.security,
                    listener.stream_settings.network);
 

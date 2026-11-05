@@ -103,7 +103,7 @@ bool ConfigureTlsCertificatePem(SSL_CTX* context, const TlsPemMaterial& pem) {
                PEM_read_bio_X509(chain.get(), nullptr, nullptr, nullptr)}) {
         if (SSL_CTX_add1_chain_cert(context, intermediate.get()) != 1) {
             ERR_clear_error();
-            LOG_ERROR("Failed to install TLS certificate chain");
+            LOG_ERROR("failed to install TLS certificate chain");
             return false;
         }
     }
@@ -197,18 +197,18 @@ bool ConfigureTlsServerIdentity(
 std::unique_ptr<SslContext> SslContext::CreateClient(const TlsConfig& config) {
     SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
     if (!ctx) {
-        LOG_ERROR("Failed to create SSL client context");
+        LOG_ERROR("failed to create TLS client context");
         return nullptr;
     }
 
     if (!ConfigureTlsProtocolVersions(
             ctx, config.min_version, config.max_version)) {
-        LOG_ERROR("Invalid TLS client protocol version policy");
+        LOG_ERROR("invalid TLS client protocol version policy");
         SSL_CTX_free(ctx);
         return nullptr;
     }
     if (!ConfigureTlsClientAlpn(ctx, config.alpn)) {
-        LOG_ERROR("Invalid TLS client ALPN policy");
+        LOG_ERROR("invalid TLS client ALPN policy");
         SSL_CTX_free(ctx);
         return nullptr;
     }
@@ -225,7 +225,7 @@ std::unique_ptr<SslContext> SslContext::CreateClient(const TlsConfig& config) {
     }
     if (config.HasCertificatePair() &&
         !ConfigureTlsCertificatePem(ctx, *config.pem)) {
-        LOG_ERROR("Failed to load TLS client certificate: {}", config.cert_file);
+        LOG_ERROR("failed to load TLS client certificate from {}", config.cert_file);
         SSL_CTX_free(ctx);
         return nullptr;
     }
@@ -243,7 +243,7 @@ std::unique_ptr<SslContext> SslContext::CreateClient(const TlsConfig& config) {
             ? SSL_CTX_set_default_verify_paths(ctx) == 1
             : ConfigureTlsTrustedCaPem(ctx, config.pem->trusted_ca);
         if (!trust_loaded) {
-            LOG_ERROR("Failed to load TLS client trust store: {}",
+            LOG_ERROR("failed to load TLS client trust store from {}",
                       config.ca_file.empty() ? "system defaults"
                                              : config.ca_file);
             SSL_CTX_free(ctx);

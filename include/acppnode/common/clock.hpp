@@ -39,7 +39,4 @@ inline std::string FormatLocalTime(
 // 格式化字节数
 std::string FormatBytes(uint64_t bytes);
 
-// 格式化时间戳
-std::string FormatTimestamp(int64_t timestamp_us);
-
 }  // namespace acpp

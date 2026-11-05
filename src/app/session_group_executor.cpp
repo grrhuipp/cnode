@@ -366,7 +366,7 @@ net::awaitable<void> ExecutionDomain::MergeGroups(
     if (destination->rank == source->rank) ++destination->rank;
     source->parent.store(destination, std::memory_order_release);
     destination->frozen.store(false, std::memory_order_release);
-    LOG_DEBUG("Session group migrated owner={} -> {} domains={}",
+    LOG_DEBUG("session group migrated owner={} -> {} domains={}",
               source->owner, destination->owner, destination->members.size());
     for (const auto& member : destination->members)
         if (auto domain = member.lock()) domain->Notify(true);

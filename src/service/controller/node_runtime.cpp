@@ -88,8 +88,7 @@ net::awaitable<void> NodeRuntime::AddOutbound(
 
 net::awaitable<bool> NodeRuntime::AddInbound(const InboundBuild& inbound) {
     ThrowIfStopping();
-    const int node_id = config_.NodeIDs.Front();
-    const auto& panel_name = config_.Name;
+    const PanelLogContext log_context{config_.Name, config_.APIHost, config_.NodeIDs.Front(), config_.NodeType};
 
 
     std::exception_ptr publish_failure;
@@ -126,8 +125,7 @@ net::awaitable<bool> NodeRuntime::AddInbound(const InboundBuild& inbound) {
             });
 
         if (std::ranges::find(registered, uint8_t{0}) != registered.end()) {
-            LOG_WARN("Node {}/{}: create inbound handler failed, protocol={}",
-                     panel_name, node_id, inbound.protocol);
+            LOG_PANEL_WARN(log_context, "Inbound handler creation failed: protocol={}", inbound.protocol);
             co_await RemoveInbound(inbound.tag);
             co_return false;
         }
@@ -164,8 +162,7 @@ net::awaitable<bool> NodeRuntime::AddInbound(const InboundBuild& inbound) {
                 return !result.tcp || !result.udp;
             });
         if (failed_bind != bound.end()) {
-            LOG_WARN("Node {}/{}: {} bind failed, tag={}",
-                     panel_name, node_id,
+            LOG_PANEL_WARN(log_context, "Inbound bind failed: network={} tag={}",
                      failed_bind->tcp ? "UDP" : "TCP",
                      inbound.tag);
             co_await RemoveInbound(inbound.tag);
@@ -180,18 +177,17 @@ net::awaitable<bool> NodeRuntime::AddInbound(const InboundBuild& inbound) {
         try {
             co_await RemoveInbound(inbound.tag);
         } catch (const std::exception& cleanup_error) {
-            LOG_ERROR("Node {}/{}: inbound cleanup after publish failure raised: {}",
-                      panel_name, node_id, cleanup_error.what());
+            LOG_PANEL_ERROR(log_context, "Inbound cleanup after publish failure failed: {}", cleanup_error.what());
         } catch (...) {
-            LOG_ERROR("Node {}/{}: inbound cleanup after publish failure raised unknown exception",
-                      panel_name, node_id);
+            LOG_PANEL_ERROR(log_context, "Inbound cleanup after publish failure failed: unknown exception");
         }
         std::rethrow_exception(publish_failure);
     }
     ThrowIfStopping();
 
-    LOG_CONSOLE("inbound ready tag={} port={} protocol={} workers={} accept=SO_REUSEPORT",
-                inbound.tag, inbound.binding.port, inbound.protocol, workers_.size());
+    LOG_PANEL_INFO(log_context, "inbound ready: tag={} port={} protocol={} network={} workers={} accept=SO_REUSEPORT",
+                   inbound.tag, inbound.binding.port, inbound.protocol,
+                   inbound.stream_settings.network, workers_.size());
     co_return true;
 }
 

@@ -305,7 +305,7 @@ net::awaitable<buf::MultiBuffer> BodyDecoder::ReadChunk(transport::MultiBufferRe
         }
         if (*chunk_len < overhead + padding_len_ ||
             *chunk_len > MAX_CHUNK_SIZE + overhead + kMaxPaddingSize) {
-            LOG_NET_DEBUG("VMess body: invalid chunk length {} overhead={} padding={}",
+            LOG_NET_DEBUG("invalid chunk length {} overhead={} padding={}",
                           *chunk_len, overhead, padding_len_);
             Fail("VMess body chunk length invalid");
         }

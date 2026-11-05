@@ -185,7 +185,7 @@ net::awaitable<std::optional<Resumed>> LookupOnOwner(
     }
     auto* store = net::use_service<LocalTicketService>(owner->Services()).Get(config, tag);
     auto result = store ? store->Lookup(ticket, nfs, Clock::now()) : std::nullopt;
-    LOG_NET_DEBUG("[VLESS][{}] ticket lookup owner={} receiver={} accepted={}",
+    LOG_NET_DEBUG("inbound '{}' ticket lookup owner={} receiver={} accepted={}",
                   tag, owner->OwnerId(), receiver, result.has_value());
     co_return result;
 }

@@ -16,7 +16,7 @@ std::unique_ptr<net::signal_set> InstallShutdownHandler(
 
     signals->async_wait([request_stop = std::move(request_stop)](const IoErrorCode& ec, int signo) {
         if (ec) return;
-        LOG_CONSOLE("shutdown signal={}", signo);
+        LOG_CONSOLE("Shutdown requested: signal={}", signo);
         request_stop();
     });
 

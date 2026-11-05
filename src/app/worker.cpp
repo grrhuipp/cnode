@@ -72,6 +72,7 @@ namespace acpp {
 struct Worker::ConnectionRecord {
     std::shared_ptr<ExecutionDomain> domain;
     std::shared_ptr<app::PhysicalSessionCapabilities> capabilities;
+    uint64_t conn_id = 0;
     std::atomic<bool> initialized{false};
     bool finished = false;
     bool pending_accounting = false;
@@ -163,16 +164,19 @@ struct Worker::ListenerState : worker_detail::UdpReplySink {
                         if (!error) return;
                         try { std::rethrow_exception(error); }
                         catch (const IoSystemError& failure) {
-                            if (failure.code() == net::error::operation_aborted) return;
+                            if (failure.code() == net::error::operation_aborted ||
+                                (!listener && failure.code() == net::error::eof)) return;
                         } catch (...) {}
                         if (listener) worker.ReportFailure(error);
                         else {
-                            try { std::rethrow_exception(error); }
-                            catch (const std::exception& failure) {
-                                LOG_ERROR("Worker[{}]: TCP task failed: {}", worker.id_, failure.what());
-                            } catch (...) {
-                                LOG_ERROR("Worker[{}]: TCP task failed", worker.id_);
-                            }
+                            try {
+                                try { std::rethrow_exception(error); }
+                                catch (const std::exception& failure) {
+                                    LOG_ERROR("TCP task failed worker={} > {}", worker.id_, failure.what());
+                                } catch (...) {
+                                    LOG_ERROR("TCP task failed worker={} > unknown error", worker.id_);
+                                }
+                            } catch (...) {} // Reporting must not fail completion under memory pressure.
                         }
                     }));
         } catch (...) { --tcp_tasks; throw; }
@@ -568,11 +572,11 @@ void Worker::RuntimeState::Start(Worker& worker) {
                 "failed to install prepared outbound '" +
                 prepared_outbound.tag + "'");
         }
-        LOG_DEBUG("Worker[{}]: registered {} outbound '{}'",
+        LOG_DEBUG("registered outbound worker={} protocol={} tag={}",
                   worker.id_, prepared_outbound.protocol, prepared_outbound.tag);
     }
     router = std::make_shared<app::router::Router>(config->routing, geo_database);
-    LOG_DEBUG("Worker[{}]: router initialized, {} rules",
+    LOG_DEBUG("router initialized worker={} rules={}",
               worker.id_, config->routing.rules.size());
     dispatcher = std::make_unique<app::dispatcher::DefaultDispatcher>(
         *router, *outbound_handlers, *detect_rule_policy, *session_tracking,
@@ -592,7 +596,7 @@ void Worker::RuntimeState::Start(Worker& worker) {
 bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& binding) {
     auto inbound_handler = worker.runtime_->inbound_handlers->GetHandler(binding.tag);
     if (!inbound_handler) {
-        LOG_ERROR("Worker[{}]: TCP listener tag={} has no inbound handler",
+        LOG_ERROR("TCP listener unavailable worker={} tag={} > no inbound handler",
                   worker.id_, binding.tag);
         return false;
     }
@@ -601,7 +605,7 @@ bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
         if (tag != std::string_view(binding.tag) && slot->tcp_binding &&
             slot->tcp_binding->port == binding.port &&
             slot->tcp_binding->listen.Overlaps(binding.listen)) {
-            LOG_ERROR("Worker[{}]: TCP listener conflict tag={} owner={} port={}",
+            LOG_ERROR("TCP listener conflict worker={} tag={} owner={} port={}",
                       worker.id_, binding.tag, tag, binding.port);
             return false;
         }
@@ -638,7 +642,7 @@ bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
         auto candidate_acceptor =
             replacement_listeners->CreateAcceptor(listener_key, worker.runtime_->io_context);
         if (!candidate_acceptor) {
-            LOG_ERROR("Worker[{}]: failed to create TCP acceptor tag={} key={}",
+            LOG_ERROR("failed to create TCP acceptor worker={} tag={} key={}",
                       worker.id_, binding.tag, listener_key);
             continue;
         }
@@ -646,14 +650,14 @@ bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
         auto fail_candidate = [&](std::string_view op, std::string_view msg) -> bool {
             replacement_listeners->CloseAcceptor(listener_key);
             if (listen_candidates.size() > 1) {
-                LOG_WARN("Worker[{}]: TCP {} {} failed: {}, continuing dual-stack bind",
+                LOG_WARN("TCP listener operation failed worker={} operation={} endpoint={} > {}; continuing dual-stack bind",
                          worker.id_,
                          op,
                          iputil::FormatEndpointForLog(listen_addr, binding.port),
                          msg);
                 return true;
             }
-            LOG_ERROR("Worker[{}]: TCP {} {} failed: {}",
+            LOG_ERROR("TCP listener operation failed worker={} operation={} endpoint={} > {}",
                       worker.id_, op,
                       iputil::FormatEndpointForLog(listen_addr, binding.port),
                       msg);
@@ -706,7 +710,7 @@ bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
     }
 
     if (bound_count == 0) {
-        LOG_ERROR("Worker[{}]: no TCP listener bound tag={} protocol={}",
+        LOG_ERROR("no TCP listener bound worker={} tag={} protocol={}",
                   worker.id_, binding.tag, binding.protocol);
         return false;
     }
@@ -715,7 +719,7 @@ bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
     auto& listener_slot = *slot_it->second;
 
     if (replacing) {
-        LOG_WARN("Worker[{}]: replacing existing TCP listeners tag={}", worker.id_, binding.tag);
+        LOG_WARN("replacing existing TCP listeners worker={} tag={}", worker.id_, binding.tag);
     }
     if (listener_slot.tcp_listeners) {
         listener_slot.tcp_listeners->Close();
@@ -731,7 +735,7 @@ bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
                                  std::move(prepared.acceptor), slot_it->second),
               true, std::move(registration));
 
-        LOG_DEBUG("worker.listener ready worker={} key={} tag={} protocol={} accept=SO_REUSEPORT",
+        LOG_DEBUG("TCP listener ready worker={} key={} tag={} protocol={} accept=SO_REUSEPORT",
                   worker.id_, listener_key, binding.tag, binding.protocol);
     }
     return true;
@@ -825,13 +829,15 @@ void Worker::ListenerState::StartUdpReplySend(worker_detail::UdpIngress& ingress
                     --udp_reply_sends;
                     NotifyCompletion();
                     if (!failure) return;
-                    try { std::rethrow_exception(failure); }
-                    catch (const std::exception& error) {
-                        LOG_NET_DEBUG("Worker[{}]: UDP reply sender failed: {}",
-                                      worker_id, error.what());
-                    } catch (...) {
-                        LOG_NET_DEBUG("Worker[{}]: UDP reply sender failed", worker_id);
-                    }
+                    try {
+                        try { std::rethrow_exception(failure); }
+                        catch (const std::exception& error) {
+                            LOG_NET_DEBUG("UDP reply sender failed worker={} > {}",
+                                          worker_id, error.what());
+                        } catch (...) {
+                            LOG_NET_DEBUG("UDP reply sender failed worker={} > unknown error", worker_id);
+                        }
+                    } catch (...) {} // Reporting must not fail completion under memory pressure.
                 });
         } catch (...) {
             --udp_reply_sends;
@@ -862,7 +868,7 @@ net::awaitable<void> Worker::ListenerState::SendUdpReplies(
             auto* ingress = FindUdpIngress(socket_key);
             if (!ingress || !ingress->OwnsSocket(socket_key, sock.get())) co_return;
             if (ec && ec != io_error::operation_aborted) {
-                LOG_NET_DEBUG("Worker[{}]: UDP reply send failed tag={}: {}",
+                LOG_NET_DEBUG("UDP reply send failed worker={} tag={} > {}",
                               worker_id, socket_key, ec.message());
             }
             auto next = ingress->CompleteReplySend(socket_key, packet.id);
@@ -900,7 +906,7 @@ net::awaitable<void> Worker::ListenerState::AcceptLoop(
 
         if (ec == io_error::operation_aborted) co_return;
         if (ec) {
-            LOG_WARN("Worker[{}]: accept error tag={}: {}", worker.id_, tag, ec.message());
+            LOG_WARN("TCP accept failed worker={} tag={} > {}", worker.id_, tag, ec.message());
             const auto backoff = MapAsioError(ec) == ErrorCode::RESOURCE_EXHAUSTED
                 ? kAcceptResourceBackoff
                 : kAcceptErrorBackoff;
@@ -920,7 +926,7 @@ net::awaitable<void> Worker::ListenerState::AcceptLoop(
 
         auto inbound_handler = slot ? slot->handler : nullptr;
         if (!inbound_handler) {
-            LOG_ERROR("Worker[{}]: no inbound handler for tag={}", worker.id_, tag);
+            LOG_ERROR("TCP connection rejected worker={} tag={} > no inbound handler", worker.id_, tag);
             socket.close();
             continue;
         }
@@ -952,13 +958,18 @@ net::awaitable<void> Worker::ListenerState::AcceptLoop(
                         if (!record->pending_accounting)
                             worker.runtime_->connections.erase(record.get());
                         if (error) {
-                            try { std::rethrow_exception(error); }
-                            catch (const IoSystemError& failure) {
-                                if (failure.code() != net::error::operation_aborted)
-                                    LOG_WARN("Session domain ended: {}", failure.what());
-                            } catch (const std::exception& failure) {
-                                LOG_WARN("Session domain ended: {}", failure.what());
-                            }
+                            try {
+                                try { std::rethrow_exception(error); }
+                                catch (const IoSystemError& failure) {
+                                    if (failure.code() != net::error::operation_aborted &&
+                                        failure.code() != net::error::eof)
+                                        LOG_CONN_WARN(record->conn_id, "session domain ended worker={} > {}", worker.id_, failure.what());
+                                } catch (const std::exception& failure) {
+                                    LOG_CONN_WARN(record->conn_id, "session domain ended worker={} > {}", worker.id_, failure.what());
+                                } catch (...) {
+                                    LOG_CONN_WARN(record->conn_id, "session domain ended worker={} > unknown error", worker.id_);
+                                }
+                            } catch (...) {} // Completion must remain safe when logging cannot allocate.
                         }
                     }));
         } catch (...) {
@@ -978,12 +989,13 @@ net::awaitable<void> Worker::ListenerState::ProcessReceivedConnection(
     tcp::endpoint remote_ep, proxyman::inbound::ReceiverSettings listener,
     uint32_t accepted_worker) {
     std::exception_ptr failure;
+    record->conn_id = session::NewID(accepted_worker);
     try {
         record->capabilities->Initialize(record->domain->Reactor());
         record->initialized.store(true, std::memory_order_release);
         auto tcp_stream = std::make_unique<TcpStream>(std::move(socket));
         session::Context ctx;
-        ctx.conn_id = session::NewID(accepted_worker);
+        ctx.conn_id = record->conn_id;
         ctx.worker_id = accepted_worker;
         ctx.inbound.tag = listener.inbound_tag;
         if (const auto* route_tags = listener.RouteInboundTags()) {
@@ -999,9 +1011,8 @@ net::awaitable<void> Worker::ListenerState::ProcessReceivedConnection(
         ctx.inbound.source_addr = normalized_remote;
         ctx.inbound.source_ip = iputil::AddressText(normalized_remote).View();
         ctx.inbound.source_port = remote_ep.port();
-        LOG_CONN_DEBUG(ctx, "Worker[{}]: accepted TCP tag={} from {}:{}",
-                       accepted_worker, ctx.inbound.tag, ctx.inbound.source_ip,
-                       ctx.inbound.source_port);
+        LOG_CONN_DEBUG(ctx, "accepted TCP worker={} source={}:{}",
+                       accepted_worker, ctx.inbound.source_ip, ctx.inbound.source_port);
         co_await record->capabilities->ProcessTCP(std::move(tcp_stream), ctx);
     } catch (...) { failure = std::current_exception(); }
     try { co_await record->capabilities->AsyncJoin(); }
@@ -1037,7 +1048,7 @@ bool Worker::RegisterInbound(
     auto handler = runtime_->inbound_handlers->NewHandler(
         runtime_->connection_limiter.get(), req);
     if (!handler) {
-        LOG_WARN("Worker[{}]: failed to create inbound handler tag={} protocol={}",
+        LOG_WARN("failed to create inbound handler worker={} tag={} protocol={}",
                  id_, receiver.inbound_tag, req.protocol);
         return false;
     }
@@ -1062,7 +1073,7 @@ bool Worker::RegisterInbound(
         if (slot_inserted) {
             runtime_->listener_state->listener_slots.erase(slot_it);
         }
-        LOG_WARN("Worker[{}]: failed to install inbound handler tag={}", id_, key);
+        LOG_WARN("failed to install inbound handler worker={} tag={}", id_, key);
         return false;
     }
     slot_it->second->handler = registered;
@@ -1084,7 +1095,7 @@ void Worker::AddOutbound(proxyman::outbound::PreparedOutboundConfig config) {
     }
     runtime_->session_configuration->outbounds->Replace(config);
 
-    LOG_DEBUG("Worker[{}]: registered dynamic {} outbound '{}'",
+    LOG_DEBUG("registered dynamic outbound worker={} protocol={} tag={}",
               id_, config.protocol, config.tag);
 }
 
@@ -1356,7 +1367,7 @@ net::awaitable<bool> Worker::ListenerState::StartUdpListening(
         if (tag != std::string_view(binding.tag) && slot->udp_binding &&
             slot->udp_binding->port == binding.port &&
             slot->udp_binding->listen.Overlaps(binding.listen)) {
-            LOG_ERROR("Worker[{}]: UDP listener conflict tag={} owner={} port={}",
+            LOG_ERROR("UDP listener conflict worker={} tag={} owner={} port={}",
                       worker.id_, binding.tag, tag, binding.port);
             co_return false;
         }
@@ -1404,14 +1415,14 @@ net::awaitable<bool> Worker::ListenerState::StartUdpListening(
 
         auto fail_candidate = [&](std::string_view op, std::string_view msg) -> bool {
             if (listen_candidates.size() > 1) {
-                LOG_WARN("Worker[{}]: UDP {} {} failed: {}, continuing dual-stack bind",
+                LOG_WARN("UDP listener operation failed worker={} operation={} endpoint={} > {}; continuing dual-stack bind",
                          worker.id_,
                          op,
                          iputil::FormatEndpointForLog(listen_addr, binding.port),
                          msg);
                 return true;
             }
-            LOG_ERROR("Worker[{}]: UDP {} {} failed: {}",
+            LOG_ERROR("UDP listener operation failed worker={} operation={} endpoint={} > {}",
                       worker.id_, op, iputil::FormatEndpointForLog(listen_addr, binding.port), msg);
             return false;
         };
@@ -1462,7 +1473,7 @@ net::awaitable<bool> Worker::ListenerState::StartUdpListening(
         auto bound_sock =
             replacement_ingress->AttachSocket(socket_key, std::move(candidate_sock));
         if (!bound_sock) {
-            LOG_ERROR("Worker[{}]: failed to attach UDP socket tag={} key={}",
+            LOG_ERROR("failed to attach UDP socket worker={} tag={} key={}",
                       worker.id_, binding.tag, socket_key);
             continue;
         }
@@ -1471,7 +1482,7 @@ net::awaitable<bool> Worker::ListenerState::StartUdpListening(
     }
 
     if (bound_count == 0) {
-        LOG_ERROR("Worker[{}]: no UDP listener bound tag={} protocol={}",
+        LOG_ERROR("no UDP listener bound worker={} tag={} protocol={}",
                   worker.id_, binding.tag, binding.protocol);
         co_return false;
     }
@@ -1498,7 +1509,7 @@ net::awaitable<bool> Worker::ListenerState::StartUdpListening(
             prepared_receives.push_back({socket_key, std::move(socket), std::move(receive)});
         }
         if (replacing) {
-            LOG_WARN("Worker[{}]: replacing existing UDP listeners tag={}", worker.id_, binding.tag);
+            LOG_WARN("replacing existing UDP listeners worker={} tag={}", worker.id_, binding.tag);
         }
     } catch (...) {
         if (inserted_slot) listener_slots.erase(slot_it);
@@ -1573,7 +1584,7 @@ net::awaitable<bool> Worker::ListenerState::StartUdpListening(
             worker_udp_listener_runtime_test::OnStage("ready", index);
 #endif
 
-            LOG_DEBUG("worker.udp_listener ready worker={} key={} tag={} protocol={} accept=SO_REUSEPORT",
+            LOG_DEBUG("UDP listener ready worker={} key={} tag={} protocol={} accept=SO_REUSEPORT",
                       worker.id_, socket_key, binding.tag, binding.protocol);
         }
     } catch (...) {

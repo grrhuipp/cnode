@@ -165,9 +165,12 @@ DialOutboundStream(
     }
     auto dial_result = co_await DialOutboundTransport(io_context, ctx, *transport_target);
     if (!dial_result.Ok()) {
-        LOG_CONN_WARN(ctx, "[SsOutbound] dial failed {} -> {} via {}: {}",
-                          ctx.inbound.source_ip, ctx.outbound.target,
-                          ctx.outbound.tag, dial_result.error_msg);
+        if (dial_result.error != ErrorCode::CANCELLED &&
+            dial_result.error != ErrorCode::CONNECTION_CLOSED &&
+            dial_result.error != ErrorCode::SOCKET_EOF) {
+            LOG_CONN_WARN(ctx, "dial failed {} -> {} > {}",
+                          ctx.inbound.source_ip, ctx.outbound.target, dial_result.error_msg);
+        }
         co_return tl::unexpected(dial_result.error);
     }
     auto stream = std::move(dial_result.stream);

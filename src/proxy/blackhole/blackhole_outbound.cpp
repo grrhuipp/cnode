@@ -48,11 +48,10 @@ net::awaitable<OutboundProcessResult> Handler::Process(
                 std::span<const net::const_buffer>{&response, 1});
             co_await inbound.writer->AsyncShutdownWrite();
         } catch (...) {
-            LOG_CONN_DEBUG(ctx, "[Blackhole][{}] failed to write http response", tag_);
+            LOG_CONN_DEBUG(ctx, "failed to write HTTP response");
         }
     }
-    LOG_CONN_DEBUG(ctx, "[Blackhole][{}] blocked before relay response={}",
-                   tag_, http_response_ ? "http" : "none");
+    LOG_CONN_DEBUG(ctx, "blocked before relay response={}", http_response_ ? "http" : "none");
     co_return tl::unexpected(ErrorCode::BLOCKED);
 }
 

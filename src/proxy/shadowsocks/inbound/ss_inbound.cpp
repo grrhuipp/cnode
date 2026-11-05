@@ -73,14 +73,22 @@ PrepareSsTcpSession(
     if (!session_result) {
         const ErrorCode error = session_result.error();
         if (error == ErrorCode::PROTOCOL_AUTH_FAILED) {
-            LOG_NET_WARN("[{}] SS auth failed from {}", tag, client_ip);
+            LOG_CONN_WARN(ctx, "authentication failed from {}:{} > no matching credential",
+                          client_ip, ctx.inbound.source_port);
+            LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "authentication failed: no matching credential"));
             if (limiter && ctx.inbound.HasProxyProtocolClientIP()) {
                 co_await limiter->OnAuthFailTracked(tag, client_ip);
             }
             stats.OnError();
-        } else {
-            LOG_CONN_WARN(ctx, "[SS][{}] ReadTCPSession failed from {}: {}",
-                          tag, client_ip, ErrorCodeToString(error));
+        } else if (error == ErrorCode::SOCKET_READ_FAILED) {
+            // ReadTCPSession returns this code when ReadFull reaches EOF;
+            // transport errors throw instead.
+            LOG_CONN_DEBUG(ctx, "TCP session header ended before completion from {}:{} > {}",
+                           client_ip, ctx.inbound.source_port, ErrorCodeToString(error));
+        } else if (error != ErrorCode::SOCKET_EOF && error != ErrorCode::CONNECTION_CLOSED &&
+                   error != ErrorCode::CANCELLED) {
+            LOG_CONN_WARN(ctx, "TCP session handshake failed from {}:{} > {}",
+                          client_ip, ctx.inbound.source_port, ErrorCodeToString(error));
         }
         co_return tl::unexpected(error);
     }
@@ -88,7 +96,9 @@ PrepareSsTcpSession(
     auto request_reader = std::move(session_result->body_reader);
     const auto* matched = session_result->user.get();
     if (!matched) {
-        LOG_NET_WARN("[{}] SS auth failed from {}", tag, client_ip);
+        LOG_CONN_WARN(ctx, "authentication failed from {}:{} > no authenticated user",
+                      client_ip, ctx.inbound.source_port);
+        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "authentication failed: no authenticated user"));
         if (limiter && ctx.inbound.HasProxyProtocolClientIP()) {
             co_await limiter->OnAuthFailTracked(tag, client_ip);
         }
@@ -104,16 +114,15 @@ PrepareSsTcpSession(
     auto user_session = co_await validator.TryConnectSession(
         tag, profile.user_id, ctx.inbound.source_ip, profile.device_limit);
     if (!user_session) {
-        LOG_NET_DEBUG("{} from {}:{} rejected device_limit [{}] user={} limit={} domain_online_devices={}",
-            FormatTimestamp(ctx.accept_time_us),
-            ctx.inbound.source_ip, ctx.inbound.source_port, tag, ctx.inbound.user_email,
-            profile.device_limit,
+        LOG_CONN_DEBUG(ctx, "connection rejected from {}:{} > device limit={} domain_online_devices={}",
+            ctx.inbound.source_ip, ctx.inbound.source_port, profile.device_limit,
             validator.OnlineDeviceCount(tag, static_cast<uint64_t>(profile.user_id)));
+        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "device limit"));
         co_return tl::unexpected(ErrorCode::PERMISSION_DENIED);
     }
 
-    LOG_CONN_DEBUG(ctx, "[SS][{}] auth ok: {} -> {} user={}",
-                   tag, client_ip, session_result->target, ctx.inbound.user_email);
+    LOG_CONN_DEBUG(ctx, "authentication succeeded from {}:{} -> {}",
+                   client_ip, ctx.inbound.source_port, session_result->target);
     const auto uot_version = proxy::uot::VersionFromMagicAddress(session_result->target);
     ctx.outbound.original_target = session_result->target;
     ctx.outbound.target = std::move(session_result->target);
@@ -230,6 +239,8 @@ proxy::shadowsocks::inbound::Handler::Process(
 
     const std::string_view tag   = ctx.inbound.tag;
     const std::string_view client_ip = ctx.inbound.source_ip;
+    ctx.inbound.user_id = 0;
+    ctx.inbound.user_email.clear();
     auto fail = [&](ErrorCode error) {
         stats_->OnError();
         RelayResult result;
@@ -237,13 +248,13 @@ proxy::shadowsocks::inbound::Handler::Process(
         return result;
     };
 
-    LOG_CONN_DEBUG(ctx, "[SS][{}] Process start from {}", tag, client_ip);
+    LOG_CONN_DEBUG(ctx, "processing connection from {}:{}", client_ip, ctx.inbound.source_port);
 
     if (limiter_ && ctx.inbound.HasProxyProtocolClientIP() &&
         co_await limiter_->IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {
-        LOG_NET_DEBUG("{} from {}:{} rejected ip_banned [{}]",
-            FormatTimestamp(ctx.accept_time_us),
-            ctx.inbound.source_ip, ctx.inbound.source_port, ctx.inbound.tag);
+        LOG_CONN_DEBUG(ctx, "connection rejected from {}:{} > IP banned",
+                       ctx.inbound.source_ip, ctx.inbound.source_port);
+        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "IP banned"));
         co_return fail(ErrorCode::BLOCKED);
     }
     std::unique_ptr<transport::MultiBufferReader> request_reader;

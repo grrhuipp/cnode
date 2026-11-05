@@ -98,30 +98,31 @@ PanelConfig PanelConfig::FromJson(const json::object& j) {
 }
 
 bool PanelConfig::Validate() const {
+    const PanelLogContext log_context{Name, APIHost, NodeIDs.Empty() ? 0 : NodeIDs.Front(), NodeType};
     if (RequestTimeout <= std::chrono::seconds::zero() ||
         RequestTimeout > std::chrono::seconds(defaults::kMaxPanelRequestTimeout)) {
-        LOG_ERROR("Panel {} RequestTimeout must be between 1 and {} seconds",
-                  Name, defaults::kMaxPanelRequestTimeout);
+        LOG_PANEL_ERROR(log_context, "Panel RequestTimeout must be between 1 and {} seconds",
+                        defaults::kMaxPanelRequestTimeout);
         return false;
     }
     if (Name.empty()) {
-        LOG_ERROR("Panel name is required");
+        LOG_PANEL_ERROR(log_context, "Panel name is required");
         return false;
     }
     if (APIHost.empty()) {
-        LOG_ERROR("Panel {} ApiHost is required", Name);
+        LOG_PANEL_ERROR(log_context, "Panel ApiHost is required");
         return false;
     }
     if (Key.empty()) {
-        LOG_ERROR("Panel {} ApiKey is required", Name);
+        LOG_PANEL_ERROR(log_context, "Panel ApiKey is required");
         return false;
     }
     if (NodeIDs.Empty()) {
-        LOG_ERROR("Panel {} NodeIDs is required", Name);
+        LOG_PANEL_ERROR(log_context, "Panel NodeIDs is required");
         return false;
     }
     if (Type != constants::panel::kV2BoardType) {
-        LOG_ERROR("Panel {} Type must be {}", Name, constants::panel::kV2BoardType);
+        LOG_PANEL_ERROR(log_context, "Panel Type must be {}", constants::panel::kV2BoardType);
         return false;
     }
     if (NodeType != constants::protocol::kVmess &&
@@ -129,8 +130,7 @@ bool PanelConfig::Validate() const {
         NodeType != constants::protocol::kTrojan &&
         NodeType != constants::protocol::kShadowsocks &&
         NodeType != constants::protocol::kAnyTLS) {
-        LOG_ERROR("Panel {} NodeType must be {}, {}, {}, {} or {}",
-                  Name,
+        LOG_PANEL_ERROR(log_context, "Panel NodeType must be {}, {}, {}, {} or {}",
                   constants::protocol::kVmess,
                   constants::protocol::kVless,
                   constants::protocol::kTrojan,
@@ -140,15 +140,15 @@ bool PanelConfig::Validate() const {
     }
     if (TLSEnable) {
         if (TLSCert.empty() != TLSKey.empty()) {
-            LOG_ERROR("Panel {} TLSCert and TLSKey must be configured together", Name);
+            LOG_PANEL_ERROR(log_context, "Panel TLSCert and TLSKey must be configured together");
             return false;
         }
         if (!TLSCert.empty() && !std::filesystem::exists(TLSCert)) {
-            LOG_ERROR("Panel {} TlsCert not found: {}", Name, TLSCert);
+            LOG_PANEL_ERROR(log_context, "Panel TlsCert not found: {}", TLSCert);
             return false;
         }
         if (!TLSKey.empty() && !std::filesystem::exists(TLSKey)) {
-            LOG_ERROR("Panel {} TlsKey not found: {}", Name, TLSKey);
+            LOG_PANEL_ERROR(log_context, "Panel TlsKey not found: {}", TLSKey);
             return false;
         }
     }

@@ -7,6 +7,7 @@
 
 #include <optional>
 #include <string_view>
+#include <variant>
 
 namespace acpp::app::dns {
 
@@ -24,9 +25,9 @@ public:
 
 private:
     struct DnsCacheEntry {
-        memory::ThreadLocalVector<net::ip::address> addresses;
+        std::variant<memory::ThreadLocalVector<net::ip::address>,
+                     memory::ThreadLocalString> answer;
         time_point expire_time;
-        bool negative = false;
     };
     struct CacheNode {
         memory::ThreadLocalString domain;

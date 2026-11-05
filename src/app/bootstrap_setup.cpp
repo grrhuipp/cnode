@@ -64,7 +64,7 @@ std::unique_ptr<geo::GeoDatabase> LoadGeoDatabase(const Config& config) {
     auto geo_database = std::make_unique<geo::GeoDatabase>(
         geoip_path, geoip_tags, geosite_path, geosite_tags);
     const auto gs = geo_database->GetStats();
-    LOG_CONSOLE("geodata ready geoip_tags={} geosite_tags={}",
+    LOG_CONSOLE("Geodata ready: geoip_tags={} geosite_tags={}",
                 gs.geoip_tags_loaded, gs.geosite_tags_loaded);
     return geo_database;
 }
@@ -182,8 +182,7 @@ BootstrapEnvironment CreateBootstrapEnvironment(
 
     SetupPanels(*env.main_ctx, *env.controller, config, *env.panel_dns_service);
     if (enable_test_mode) {
-        LOG_CONSOLE("test_mode enabled port={} uuid={}",
-                    constants::test::kTestPort, constants::test::kTestVmessUuid);
+        LOG_CONSOLE("Test mode enabled: port={}", constants::test::kTestPort);
     }
     env.inbound_startup.entries.reserve(inbounds.size());
     for (const auto& inbound : inbounds)

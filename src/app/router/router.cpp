@@ -292,7 +292,7 @@ routing::RouteDecision Router::Route(const session::Context& ctx) const {
     // 顺序检查复合规则（AND 语义）
     for (const auto& rule : impl_->compound_rules) {
         if (rule.Match(ctx)) {
-            LOG_NET_DEBUG("Router: {} matched compound rule -> {}",
+            LOG_CONN_DEBUG(ctx, "matched compound routing rule target={} outbound={}",
                       target, rule.outbound_tag);
             return routing::RouteDecision{
                 .outbound_tag = rule.outbound_tag,
@@ -303,7 +303,7 @@ routing::RouteDecision Router::Route(const session::Context& ctx) const {
 
     // No match is an explicit empty decision. Dispatcher owns the receiver's
     // explicit fallback.
-    LOG_NET_DEBUG("Router: {} no matching rule", target);
+    LOG_CONN_DEBUG(ctx, "no matching routing rule target={}", target);
     return routing::RouteDecision{
         .outbound_tag = {},
         .matched = false,

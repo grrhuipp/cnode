@@ -57,6 +57,9 @@ void RecordExtractedRealIp(std::string_view head,
                            InboundTransportMetadata* metadata);
 
 [[nodiscard]] std::string SanitizeForLog(std::string_view value, size_t max_len = 160);
+// Removes URL credentials, query and fragment without changing protocol input.
+[[nodiscard]] std::string_view PublicHttpTargetForLog(std::string_view value);
+[[nodiscard]] std::string SanitizeHttpRequestLineForLog(std::string_view value);
 [[nodiscard]] std::string_view ExpectedHttpHost(const HttpConfig& cfg);
 
 // Returns false instead of throwing; the caller maps it to SOCKET_WRITE_FAILED.

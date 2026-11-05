@@ -82,13 +82,13 @@ std::unique_ptr<SslContext> SslContext::CreateServer(const TlsConfig& config) {
     const SSL_METHOD* method = TLS_server_method();
     SSL_CTX* ctx = SSL_CTX_new(method);
     if (!ctx) {
-        LOG_ERROR("Failed to create SSL server context");
+        LOG_ERROR("failed to create TLS server context");
         return nullptr;
     }
 
     if (!ConfigureTlsProtocolVersions(
             ctx, config.min_version, config.max_version)) {
-        LOG_ERROR("Invalid TLS server protocol version policy");
+        LOG_ERROR("invalid TLS server protocol version policy");
         SSL_CTX_free(ctx);
         return nullptr;
     }
@@ -99,14 +99,14 @@ std::unique_ptr<SslContext> SslContext::CreateServer(const TlsConfig& config) {
         return nullptr;
     }
     if (!ConfigureTlsCertificatePem(ctx, *config.pem)) {
-        LOG_ERROR("Failed to load TLS certificate: {}", config.cert_file);
+        LOG_ERROR("failed to load TLS certificate from {}", config.cert_file);
         SSL_CTX_free(ctx);
         return nullptr;
     }
 
     auto out = std::unique_ptr<SslContext>(new SslContext(ctx));
     if (!out->ConfigureServerAlpn(config.alpn)) {
-        LOG_ERROR("Invalid TLS server ALPN policy");
+        LOG_ERROR("invalid TLS server ALPN policy");
         return nullptr;
     }
     return out;
@@ -164,7 +164,7 @@ std::unique_ptr<SslContext> SslContext::CreateAutoSignSnapshot(const TlsConfig& 
     const std::string default_name = ResolveAutoSignDefaultName(config);
     auto material = transport::internet::AutoSignCertificate::Create(default_name);
     if (!material) {
-        LOG_ERROR("默认自签证书生成失败");
+        LOG_ERROR("failed to generate default self-signed TLS certificate");
         return nullptr;
     }
 
@@ -173,23 +173,23 @@ std::unique_ptr<SslContext> SslContext::CreateAutoSignSnapshot(const TlsConfig& 
 
     if (!ConfigureTlsProtocolVersions(
             ctx, config.min_version, config.max_version)) {
-        LOG_ERROR("Invalid auto-sign TLS protocol version policy");
+        LOG_ERROR("invalid auto-sign TLS protocol version policy");
         SSL_CTX_free(ctx);
         return nullptr;
     }
 
     if (SSL_CTX_use_certificate(ctx, material->Certificate()) != 1 ||
         SSL_CTX_use_PrivateKey(ctx, material->Key()) != 1) {
-        LOG_ERROR("默认自签证书安装失败");
+        LOG_ERROR("failed to install default self-signed TLS certificate");
         SSL_CTX_free(ctx);
         return nullptr;
     }
 
-    LOG_INFO("TLS 自动签名证书已构建（配置域名={}，有效期一年，提前30天后台续期）",
+    LOG_INFO("TLS auto-sign certificate created (domain={} validity=one year renewal=30 days before expiry)",
              default_name);
     auto out = std::unique_ptr<SslContext>(new SslContext(ctx));
     if (!out->ConfigureServerAlpn(config.alpn)) {
-        LOG_ERROR("Invalid auto-sign TLS ALPN policy");
+        LOG_ERROR("invalid auto-sign TLS ALPN policy");
         return nullptr;
     }
     return out;
@@ -733,11 +733,14 @@ net::awaitable<bool> TlsStream::Handshake() {
         (void)co_await impl_->Perform(Impl::Kind::Handshake);
     } catch (const IoSystemError& error) {
         const auto& ec = error.code();
-        if (is_server_ && ec.category() == net::error::get_ssl_category() &&
-            IsBenignServerHandshakeError(static_cast<unsigned long>(ec.value()))) {
-            LOG_NET_DEBUG("TLS handshake ignored (non-TLS traffic on TLS port): {}", ec.message());
+        if (ec == io_error::operation_aborted || ec == io_error::eof ||
+            ec == net::ssl::error::stream_truncated) {
+            LOG_NET_DEBUG("TLS handshake ended > {}", ec.message());
+        } else if (is_server_ && ec.category() == net::error::get_ssl_category() &&
+                   IsBenignServerHandshakeError(static_cast<unsigned long>(ec.value()))) {
+            LOG_NET_DEBUG("TLS handshake ignored (non-TLS traffic on TLS port) > {}", ec.message());
         } else {
-            LOG_NET_WARN("TLS handshake error: {}", ec.message());
+            LOG_NET_WARN("TLS handshake failed > {}", ec.message());
         }
         impl_->Abort();
         co_return false;

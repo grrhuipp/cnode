@@ -260,8 +260,8 @@ bash scripts/cnode.sh -variant glibc -debug_file true
 - 原生 UDP 回包按 socket 保持一个在途发送任务；payload 按值存于该任务帧内，普通数据报出队不额外申请堆节点，也不逐包复制监听字符串键。旧 socket 的发送完成不能清除替换 socket 的活动队列；删除队列后，在途 payload 仍计入共享预算，直至 I/O 完成并释放。
 - `limits.maxConnections` 和 `limits.maxConnectionsPerIP` 使用未拆分的进程配置值，所有 Worker／入站共享，`0` 表示不限；不再按 Worker 数向上取整。物理连接保留一个额度 floor，额外并发逻辑请求增加额度。IP 跟踪满时拒绝新准入；半关闭仍在工作的请求继续占用额度，完整结束后通过预留控制通道归还，业务邮箱满或关闭不能丢失归还。
 - TCP 和原生 UDP 的 idle/read/write/phase 超时共用聚合状态，由所属执行域／原生资源调度器承载；逻辑读写结束或连接关闭时撤销预算。超时终止在通知取消前设置 abortive close，排队写数据不会在逻辑失败后无限期继续发送。
-- `info` 级别的周期资源日志包括 `runtime.process`（Linux 当前 FD 数及软上限）与 `runtime.worker`（各 Worker 的 UDP association、待处理输入/回包、调度事件及池内存）。`udp_listeners` 是当前注册的入站 socket 数，`udp_receive_loops` 包含尚未完成退役的接收任务，`udp_native_dispatches` 是尚未实际完成的原生 UDP 分发任务数，包含退休中的任务；association 记录归零不代表此计数也已归零，不统计 TCP 或 Mux 子流。`udp_resource_drops` 累计记录接收资源不足、处理分配失败或截断导致的丢包。队列指标是当前占用，不是累计吞吐；回包统计包含正在发送的包，`udp_reply_senders` 是活跃发送 socket 数。`timeout_heap=活跃事件数/索引容量` 区分当前超时占用与历史峰值容量保留；取消会立即移除索引，不保留过期节点。容量未回落不等于泄漏，PMR 映射量也不等于 RSS。FD 采样不可用时显示 `unknown`，不会伪报为零。这些日志用于故障前后的趋势对照，不能单凭重启恢复判定资源耗尽。
-- 本地日志：`error` 保存受 `loglevel` 控制的诊断与错误，`access` 保存无级别的访问事实。`loglevel` 取 `none`、`trace`、`debug`、`info`、`warning`（或 `warn`）、`error`；缺省为 `info`，其他取值拒绝启动。默认启用 `rotateDaily` 和 `gzip`：`access` / `error` 配置作为基础文件名，运行时写入 `access_YYYY-MM-DD.log` / `error_YYYY-MM-DD.log`，历史日志轮转后压缩为 `.gz`，`maxDays` 控制保留天数。不提供集中上传。
+- `info` 级别的周期资源日志按 `Runtime activity / memory / traffic / DNS cache`、`Process descriptors`、`Worker activity / memory / UDP resources / UDP traffic` 和 `Panel node totals` 分行输出，不把原有指标隐藏到 `debug`。`udp_listeners` 是当前注册的入站 socket 数，`udp_receive_loops` 包含尚未完成退役的接收任务，`udp_native_dispatches` 是尚未实际完成的原生 UDP 分发任务数，包含退休中的任务；association 记录归零不代表此计数也已归零，不统计 TCP 或 Mux 子流。`udp_resource_drops` 累计记录接收资源不足、处理分配失败或截断导致的丢包。队列指标是当前占用，不是累计吞吐；回包统计包含正在发送的包，`udp_reply_senders` 是活跃发送 socket 数。`timeout_heap=活跃事件数/索引容量` 区分当前超时占用与历史峰值容量保留；取消会立即移除索引，不保留过期节点。容量未回落不等于泄漏，PMR 映射量也不等于 RSS。FD 采样不可用时显示 `unknown`，不会伪报为零。这些日志用于故障前后的趋势对照，不能单凭重启恢复判定资源耗尽。
+- 本地日志格式与分流见[日志格式](#日志格式)。`loglevel` 取 `none`、`trace`、`debug`、`info`、`warning`（或 `warn`）、`error`；缺省为 `info`，其他取值拒绝启动。默认启用 `rotateDaily` 和 `gzip`：`access` / `error` 配置作为基础文件名，运行时写入 `access_YYYY-MM-DD.log` / `error_YYYY-MM-DD.log`，历史日志轮转后压缩为 `.gz`，`maxDays` 控制保留天数。不提供集中上传。
 - `logDir`、`access`、`error` 和面板 `Name` 未配置时可使用显式缺省；显式空字符串属于错误配置，不能用默认值掩盖。
 - 空闲 Worker 不再执行固定周期的内存回收；回收由真实负载变化、资源归还或最近到期事件驱动。周期资源日志与内存回收不是同一机制。
 - WS 入站默认使用 `X-Forwarded-For` 的首个 IP 作为客户端地址；缺失或无效时保留 TCP 对端。`streamSettings.wsSettings.realIpHeader` 可指定其他头，设为 `""` 可关闭该行为。此头可被伪造：仅应通过可信代理访问源站，且代理必须覆盖客户端传入的同名头；当前程序不自行校验代理来源。通过 HTTP 头无法恢复客户端源端口，日志记为 `:0`。
@@ -277,6 +277,33 @@ bash scripts/cnode.sh -variant glibc -debug_file true
 AnyTLS FIN 关闭整个逻辑流：远端 FIN 之前的已接收数据按有界队列排空，同时停止新的反向写入且不回复 FIN；本地关闭只发送一次 FIN。请求的两个方向结束后，完整且正常的物理会话可供新流复用；物理帧写入中断则关闭会话。第四十八轮已通过固定提交官方实现对照、双向直接互通和提前 FIN 检查，验证范围及当前环境限制见[架构审查记录](docs/architecture-review-20260909.md#第四十八轮anytls-完整关闭与-tls-取消传递)。
 - REALITY 支持 TLS 1.3 + X25519 + Ed25519 临时证书签发与验证、服务端准入控制（`serverNames`、`shortIds`、`minClientVer`、`maxClientVer`、`maxTimeDiff`）、可选后量子 `mldsa65Seed` / `mldsa65Verify`（ML-DSA-65 证书扩展签名与验签）、未认证连接透明回落转发（`dest` + `xver` 0/1/2 PROXY Protocol v1/v2）、客户端 `fingerprint` 浏览器指纹模拟（`chrome`/`firefox`/`safari`/`ios`/`android`/`edge`/`360`/`qq`/`random`）、客户端 `spiderX` 回退路径访问，以及 V2Board 面板 `tls=2` REALITY 节点自动同步。握手阶段的认证状态与 transcript 缓冲在握手结束时立即释放，不随连接常驻；无读者的 `show`、`type`、`masterKeyLog` 字段会被配置加载器拒绝。
 - REALITY 按实际到达字节增量重组跨记录 ClientHello，未认证回落保留原始线面字节；只在冷路径预计算可复用的证书部分，每次握手必要的认证／transcript 签名仍独立执行，临时密钥与缓冲在阶段结束后释放。DNS 名称比较接受末尾根点。
+
+## 日志格式
+
+控制台采用 [XrayR v25.3.6](https://github.com/XrayR-project/XrayR/blob/974abc9a98d8b64f7f0a7b7b3044140087a1bc4e/service/controller/controller.go) 的 logrus 文本风格，访问和错误文件采用 Xray 文本风格；三个通道不混用前缀。
+
+**控制台**：显示启动、配置、面板状态、上报结果和资源统计。时间为带本地时区偏移的 RFC3339；面板记录附加真实 `Host`、`ID`、`Name`、`Type`，未知字段省略。`Host` 只保留 origin，不含 URL 用户信息、路径、query 或 fragment。
+
+```text
+time="2026-11-05T12:30:00+08:00" level=info msg="Panel status: state=ready inbound=ready protocol=vless port=443 network=tcp users=128 rules=12 pull=60s push=60s" Host="https://panel.example.com" ID=1041 Name=main Type=vless
+```
+
+**访问文件**：只记录访问事实，不带日志级别。`accepted` 的记录时机不变；认证、配额和策略拒绝使用 `rejected` 并说明实际原因。`user:` 是已确认的数字 UID，`email:` 是已有用户标识，不用其冒充 UID；与 UID 完全相同的标识不重复输出。`sendThrough:` 只记录实际连接的本地地址。认证前不记录候选用户，尚无有效目标或出口时不填写虚构值。
+
+```text
+2026/11/05 12:30:01.123456 from 192.0.2.10:52000 accepted tcp:example.com:443 [vless-in -> direct] user:123 email:user@example.com sendThrough:198.51.100.2
+2026/11/05 12:30:02.123456 from 192.0.2.10:52001 rejected authentication failed: no matching user [vless-in]
+```
+
+**错误文件**：保存受 `loglevel` 控制的诊断，时间精确到微秒。连接记录保留完整 64 位 ID、组件、已有路由与已确认 UID；不截断 Worker 位，不在正文重复 ID，也不为缺失上下文伪造 ID。认证失败与认证后的设备数、连接数或策略拒绝分别说明原因。
+
+```text
+2026/11/05 12:30:02.123456 [Warning] [4294967303] proxy/vless/inbound: [vless-in] authentication failed from 192.0.2.10:52001 > no matching user
+```
+
+控制台普通诊断同样遵守 `loglevel`，连接认证失败不刷控制台；面板警告与错误同时进入控制台和错误文件。控制台 Error 使用 stderr，其余控制台级别使用 stdout。`none` 不隐藏访问事实或致命启动失败。正常 EOF、取消和停机不输出对应 Warning/Error；已到达但未完成的 PROXY 头仍按截断诊断。内存耗尽等 allocation-free 紧急退出保留最小 stderr 文本，避免错误路径再次分配。
+
+日志统一转义换行、NUL、ESC 等控制字符，控制台消息同时转义引号与反斜杠；不记录认证 UUID、密码、认证摘要、密钥或原始认证包。HTTP 请求诊断去除 URL 用户信息、query 和 fragment，面板 HTTP 失败不回显响应正文。依赖旧 `[Info]` 控制台前缀、秒级时间或低 32 位连接 ID 的采集规则需迁移，不保留旧格式旁路。
 
 ## 运行时状态
 
@@ -303,6 +330,10 @@ IP 字段必须是完整地址：IPv4 使用四段无前导零的十进制格式
 连接超时和会话池空闲检查由所属执行域的 TimeoutScheduler 汇聚；原生等待结束后才释放调度器与域。事件嵌入宿主，取消不保留失效节点。限速、Mux 背压和 accept 退避使用可取消等待；协议协程继承当前域 executor，native reactor 不能直接执行用户回调或访问域私有池。
 
 DNSWorker 将多个调用者的并发同域查询合并为一次解析，每个调用者独立取得结果。每个上游复用一个 UDP socket，三次 A 地址采样与 AAAA 查询并发执行，仍保留多地址合并与按顺序切换上游的语义。主控线程只有一层 DNS 缓存；缓存写入分配失败不会丢失已经取得的答案，缓存在完整构建新条目后才淘汰旧条目。
+
+DNS 缓存默认容量为 `dns.cacheSize: 10240`，设置为 `0` 可禁用；`minTTL` / `maxTTL` 默认分别为 60 / 3600 秒。仅成功地址结果与无记录结果进入缓存，超时、SERVFAIL、REFUSED 等临时失败不缓存。
+
+DNS 最终解析失败在 `warning` 级别写入 error 日志，记录域名、错误码、`source=upstream` 或 `source=negative cache`，以及最后使用的上游地址／端口和 A、AAAA 查询原因。`NXDOMAIN` 表示域名不存在，`NODATA` 表示响应没有所需地址记录；仅含不支持的记录、服务失败、拒绝、超时与畸形响应分别保留具体原因。负缓存命中保留原始原因，不将所有无记录结果改写成 NXDOMAIN。只要 A 或 AAAA 提供可用地址，解析仍成功；正常取消不记录成解析故障。
 
 无锁设计的前提是唯一执行租约，而非连接终身固定在接入线程。listener slot 与原生 UDP 监听仍由原 Worker 独占；可迁移宿主、stats shard、allocator 与 buffer provider 只能在所属会话组的租约内访问。跨线程只投递有界元数据／就绪通知或发布只读快照，不共享可并发修改的 live handler。
 

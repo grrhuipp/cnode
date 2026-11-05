@@ -387,7 +387,7 @@ net::awaitable<RelayResult> DoRelayLink(
     result.error = state.reason;
     result.client_closed_first = state.client_closed_first;
     result.close_side_known = state.close_side_known;
-    LOG_CONN_DEBUG(ctx, "Relay finished: up={} down={} error={}", result.bytes_up,
+    LOG_CONN_DEBUG(ctx, "relay finished up={}B down={}B error={}", result.bytes_up,
                    result.bytes_down, ErrorCodeToString(result.error));
     co_return result;
 }

@@ -151,7 +151,6 @@ net::awaitable<tl::expected<::acpp::vless::RequestHeader, ErrorCode>>
 ReadVlessRequestHeader(VlessBufferedReader& active_reader,
                        AsyncStream& stream,
                        session::Context& ctx,
-                       std::string_view tag,
                        std::string_view client_ip) {
     using ::acpp::vless::RequestHeaderDecodeStatus;
     std::array<uint8_t, ::acpp::vless::kMaxRequestHeaderSize> handshake{};
@@ -164,8 +163,8 @@ ReadVlessRequestHeader(VlessBufferedReader& active_reader,
                 handshake.data() + total_read, required - total_read);
         } catch (const IoSystemError&) {
             if (stream.ConsumePhaseDeadline()) {
-                LOG_CONN_WARN(ctx, "[VLESS][{}] handshake phase deadline from {}",
-                              tag, client_ip);
+                LOG_CONN_WARN(ctx, "handshake phase deadline from {}:{}",
+                              client_ip, ctx.inbound.source_port);
                 co_return tl::unexpected(ErrorCode::TIMEOUT);
             }
             co_return tl::unexpected(ErrorCode::SOCKET_READ_FAILED);
@@ -187,14 +186,21 @@ ReadVlessRequestHeader(VlessBufferedReader& active_reader,
             required = decoded.required;
             continue;
         case RequestHeaderDecodeStatus::InvalidVersion:
+            LOG_CONN_WARN(ctx, "request rejected from {}:{} > invalid protocol version",
+                          client_ip, ctx.inbound.source_port);
+            LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "invalid protocol version"));
             co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_VERSION);
         case RequestHeaderDecodeStatus::InvalidAddress:
+            LOG_CONN_WARN(ctx, "request rejected from {}:{} > invalid target address",
+                          client_ip, ctx.inbound.source_port);
+            LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "invalid target address"));
             co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
         case RequestHeaderDecodeStatus::InvalidCommand:
         case RequestHeaderDecodeStatus::InvalidAddons:
             break;
         }
-        LOG_NET_WARN("[VLESS][{}] parse failed from {}", tag, client_ip);
+        LOG_CONN_WARN(ctx, "invalid request header from {}:{}", client_ip, ctx.inbound.source_port);
+        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "invalid request header"));
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 }
@@ -233,8 +239,9 @@ CompleteVlessInboundHandshake(
                     decryption,
                     std::string(tag));
             if (!runtime) {
-                LOG_NET_WARN("[VLESS][{}] encryption handshake failed from {}",
-                              tag, client_ip);
+                LOG_CONN_WARN(ctx, "encryption handshake failed from {}:{} > handshake rejected",
+                              client_ip, ctx.inbound.source_port);
+                LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "encryption handshake rejected"));
                 co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
             }
             issued_ticket = std::move(runtime->issued_ticket);
@@ -250,76 +257,94 @@ CompleteVlessInboundHandshake(
         } catch (const WorkerMailboxFull&) {
             co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
         } catch (...) {
+            LOG_CONN_WARN(ctx, "encryption handshake failed from {}:{} > handshake exception",
+                          client_ip, ctx.inbound.source_port);
+            LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "encryption handshake exception"));
             co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
         }
     }
 
     auto parsed_request = co_await ReadVlessRequestHeader(
-        *active_reader, stream, ctx, tag, client_ip);
+        *active_reader, stream, ctx, client_ip);
     if (!parsed_request) {
         co_return tl::unexpected(parsed_request.error());
     }
     auto& request = *parsed_request;
     if (resumed_identity &&
         CRYPTO_memcmp(resumed_identity->data(), request.uuid.data(), request.uuid.size()) != 0) {
+        LOG_CONN_WARN(ctx, "authentication failed from {}:{} > resumed identity mismatch",
+                      client_ip, ctx.inbound.source_port);
+        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "authentication failed: resumed identity mismatch"));
         co_return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
     }
     auto user_info = proxyman::inbound::UserStore::FindVlessUser(tag, request.uuid);
     if (!user_info) {
-        LOG_NET_WARN("[VLESS][{}] auth failed from {}", tag, client_ip);
+        LOG_CONN_WARN(ctx, "authentication failed from {}:{} > no matching user",
+                      client_ip, ctx.inbound.source_port);
+        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "authentication failed: no matching user"));
         if (limiter && ctx.inbound.HasProxyProtocolClientIP()) {
             co_await limiter->OnAuthFailTracked(tag, client_ip);
         }
         co_return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
     }
+    ctx.inbound.user_id = user_info->profile.user_id;
+    ctx.inbound.user_email = user_info->profile.email;
     if (request.addons_len != 0 && request.flow.empty()) {
-        LOG_NET_WARN("[VLESS][{}] unsupported request addons from {}", tag, client_ip);
+        LOG_CONN_WARN(ctx, "request rejected from {}:{} > unsupported addons", client_ip, ctx.inbound.source_port);
+        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "unsupported request addons"));
         co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
     }
     const bool use_vision = ::acpp::vless::IsVisionFlow(request.flow);
     if (!request.flow.empty()) {
         if (std::string_view(request.flow) != user_info->flow) {
-            LOG_NET_WARN("[VLESS][{}] request flow '{}' not allowed for user",
-                          tag, request.flow);
+            LOG_CONN_WARN(ctx, "request rejected from {}:{} > flow '{}' not allowed",
+                          client_ip, ctx.inbound.source_port, request.flow);
+            LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "request flow not allowed"));
             co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
         }
         if (!use_vision) {
-            LOG_NET_WARN("[VLESS][{}] unknown request flow '{}'", tag, request.flow);
+            LOG_CONN_WARN(ctx, "request rejected from {}:{} > unknown flow '{}'",
+                          client_ip, ctx.inbound.source_port, request.flow);
+            LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "unknown request flow"));
             co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
         }
     }
     if (!user_info->flow.empty() && !::acpp::vless::IsVisionFlow(user_info->flow)) {
-        LOG_NET_WARN("[VLESS][{}] unsupported flow '{}'", tag, user_info->flow);
+        LOG_CONN_WARN(ctx, "request rejected from {}:{} > unsupported configured flow '{}'",
+                      client_ip, ctx.inbound.source_port, user_info->flow);
+        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "unsupported configured flow"));
         co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
     }
     if (request.flow.empty() && ::acpp::vless::IsVisionFlow(user_info->flow)) {
-        LOG_NET_WARN("[VLESS][{}] missing required flow '{}'", tag, user_info->flow);
+        LOG_CONN_WARN(ctx, "request rejected from {}:{} > missing required flow '{}'",
+                      client_ip, ctx.inbound.source_port, user_info->flow);
+        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "missing required flow"));
         co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
     }
     if (use_vision && request.command != ::acpp::vless::Command::TCP) {
-        LOG_NET_WARN("[VLESS][{}] flow '{}' only supports TCP", tag, request.flow);
+        LOG_CONN_WARN(ctx, "request rejected from {}:{} > flow '{}' only supports TCP",
+                      client_ip, ctx.inbound.source_port, request.flow);
+        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "flow only supports TCP"));
         co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
     }
     if (use_vision &&
         (!receiver.stream_settings.IsTlsLike() ||
          receiver.stream_settings.network_mode != NetworkMode::Tcp)) {
-        LOG_NET_WARN("[VLESS][{}] flow '{}' requires raw TCP TLS-like transport",
-                      tag, request.flow);
+        LOG_CONN_WARN(ctx, "request rejected from {}:{} > flow '{}' requires raw TCP TLS-like transport",
+                      client_ip, ctx.inbound.source_port, request.flow);
+        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "flow requires raw TCP TLS-like transport"));
         co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
     }
 
     const auto& profile = user_info->profile;
-    ctx.inbound.user_id = profile.user_id;
-    ctx.inbound.user_email = profile.email;
     ctx.content.speed_limit = profile.speed_limit;
     auto user_session = co_await validator.TryConnectSession(
         tag, profile.user_id, ctx.inbound.source_ip, profile.device_limit);
     if (!user_session) {
-        LOG_NET_DEBUG("{} from {}:{} rejected device_limit [{}] user={} limit={} domain_online_devices={}",
-            FormatTimestamp(ctx.accept_time_us),
-            ctx.inbound.source_ip, ctx.inbound.source_port, tag, ctx.inbound.user_email,
-            profile.device_limit,
+        LOG_CONN_DEBUG(ctx, "connection rejected from {}:{} > device limit={} domain_online_devices={}",
+            ctx.inbound.source_ip, ctx.inbound.source_port, profile.device_limit,
             validator.OnlineDeviceCount(tag, static_cast<uint64_t>(profile.user_id)));
+        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "device limit"));
         co_return tl::unexpected(ErrorCode::PERMISSION_DENIED);
     }
 
@@ -385,6 +410,8 @@ proxy::vless::inbound::Handler::Process(
     uint32_t pressure_idle_timeout) {
     const std::string_view tag = ctx.inbound.tag;
     const std::string_view client_ip = ctx.inbound.source_ip;
+    ctx.inbound.user_id = 0;
+    ctx.inbound.user_email.clear();
 
     auto fail = [&](ErrorCode error) {
         stats_->OnError();
@@ -401,9 +428,9 @@ proxy::vless::inbound::Handler::Process(
 
     if (limiter_ && ctx.inbound.HasProxyProtocolClientIP() &&
         co_await limiter_->IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {
-        LOG_NET_DEBUG("{} from {}:{} rejected ip_banned [{}]",
-            FormatTimestamp(ctx.accept_time_us),
-            ctx.inbound.source_ip, ctx.inbound.source_port, ctx.inbound.tag);
+        LOG_CONN_DEBUG(ctx, "connection rejected from {}:{} > IP banned",
+                       ctx.inbound.source_ip, ctx.inbound.source_port);
+        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "IP banned"));
         co_return fail_abortive(ErrorCode::BLOCKED);
     }
 

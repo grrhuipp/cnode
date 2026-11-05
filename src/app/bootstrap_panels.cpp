@@ -31,17 +31,11 @@ void SetupPanels(net::io_context& main_ctx,
 
             auto panel = api::CreatePanelClient(main_ctx, api_config, panel_dns_service);
             controller.AddPanel(std::move(panel), node_panel_config);
+            const PanelLogContext log_context{panel_config.Name, panel_config.APIHost,
+                node_id, panel_config.NodeType};
+            LOG_PANEL_INFO(log_context, "Panel node configured");
         }
 
-        std::string node_ids_str;
-        const auto node_ids = panel_config.NodeIDs.Values();
-        for (size_t i = 0; i < node_ids.size(); ++i) {
-            if (i > 0) node_ids_str += ", ";
-            node_ids_str += std::to_string(node_ids[i]);
-        }
-        LOG_CONSOLE("Panel {}: configured | {} | nodes [{}] | {}",
-                    panel_config.Name, panel_config.NodeType,
-                    node_ids_str, panel_config.APIHost);
     }
 }
 

@@ -225,7 +225,7 @@ async def main(args):
                 logs = (root / 'child.log').read_text(errors='replace')
                 for path in (root / 'logs').glob('error*.log'):
                     logs += path.read_text(errors='replace')
-                accepted_workers = sorted(set(re.findall(r'Worker\[(\d+)\]: accepted TCP', logs)))
+                accepted_workers = sorted(set(re.findall(r'accepted TCP worker=(\d+)\b', logs)))
                 results.append(dict(tls=tls, mode=mode, accepted_workers=accepted_workers, **result))
             finally:
                 await resources.close()

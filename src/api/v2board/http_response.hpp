@@ -263,7 +263,7 @@ net::awaitable<Response> ReadResponse(Stream& stream) {
         status_parser >> http_version >> result.status;
         if (result.status <= 0) {
             result.status = -1;
-            result.body = "invalid HTTP status line: " + *status_line_result;
+            result.body = "invalid HTTP status line";
             co_return result;
         }
 

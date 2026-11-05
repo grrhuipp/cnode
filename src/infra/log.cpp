@@ -45,7 +45,7 @@ struct LogRecord {
     LogLevel level{LogLevel::INFO};
     int64_t timestamp_us{0};
     std::string message;
-    std::string source_file;
+    std::string_view source_file;
     std::optional<ConnectionLogContext> connection;
 };
 
@@ -91,7 +91,34 @@ std::string FormatLogTimestamp(int64_t timestamp_us) {
     const auto written = std::strftime(
         buffer, sizeof(buffer), "%Y/%m/%d %H:%M:%S", &tm);
     if (written == 0) return {};
-    return std::string(buffer, written);
+    return std::format("{}.{:06}", std::string_view(buffer, written),
+                       timestamp_us % 1'000'000);
+}
+
+std::string FormatConsoleTimestamp(int64_t timestamp_us) {
+    const auto tm = LocalTime(static_cast<std::time_t>(timestamp_us / 1'000'000));
+    char buffer[48]{};
+    const auto written = std::strftime(
+        buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%S%z", &tm);
+    if (written == 0) return {};
+    std::string result(buffer, written);
+    if (result.size() >= 5 &&
+        (result[result.size() - 5] == '+' || result[result.size() - 5] == '-')) {
+        result.insert(result.size() - 2, 1, ':');
+    }
+    return result;
+}
+
+std::string_view ConsoleLevelName(LogLevel level) noexcept {
+    switch (level) {
+        case LogLevel::TRACE: return "trace";
+        case LogLevel::DEBUG: return "debug";
+        case LogLevel::INFO: return "info";
+        case LogLevel::WARN: return "warning";
+        case LogLevel::ERROR: return "error";
+        case LogLevel::NONE: return "none";
+    }
+    return "unknown";
 }
 
 size_t FindPathSegment(std::string_view file, std::string_view name) {
@@ -210,53 +237,97 @@ std::string ComponentName(std::string_view file) {
     return normalized;
 }
 
-std::string SingleLine(std::string_view message) {
-    std::string result(message);
-    for (char& ch : result) {
-        if (ch == '\r' || ch == '\n') ch = ' ';
+std::string EscapeLogText(std::string_view text, bool quoted = false) {
+    constexpr char hex[] = "0123456789abcdef";
+    std::string result;
+    result.reserve(text.size() + (quoted ? 2 : 0));
+    if (quoted) result.push_back('"');
+    for (const unsigned char ch : text) {
+        switch (ch) {
+            case '\n': result.append("\\n"); break;
+            case '\r': result.append("\\r"); break;
+            case '\t': result.append("\\t"); break;
+            case '"': result.append(quoted ? "\\\"" : "\""); break;
+            case '\\': result.append(quoted ? "\\\\" : "\\"); break;
+            default:
+                if (ch < 0x20 || ch == 0x7f) {
+                    result.append("\\x");
+                    result.push_back(hex[ch >> 4]);
+                    result.push_back(hex[ch & 0x0f]);
+                } else {
+                    result.push_back(static_cast<char>(ch));
+                }
+                break;
+        }
     }
+    if (quoted) result.push_back('"');
     return result;
 }
 
+std::string ConsoleField(std::string_view value) {
+    const bool quote = value.empty() || value.find_first_not_of(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_./-") !=
+        std::string_view::npos;
+    return EscapeLogText(value, quote);
+}
+
+std::string PanelOrigin(std::string_view host) {
+    const auto scheme_end = host.find("://");
+    if (scheme_end == std::string_view::npos) return "<invalid host>";
+    const auto scheme = host.substr(0, scheme_end);
+    if (scheme != "https" && scheme != "http") return "<invalid host>";
+    auto authority = host.substr(scheme_end + 3);
+    authority = authority.substr(0, authority.find_first_of("/?#"));
+    if (const auto credentials = authority.rfind('@'); credentials != std::string_view::npos) {
+        authority.remove_prefix(credentials + 1);
+    }
+    if (authority.empty() || authority.find_first_of("\r\n\t\\ ") != std::string_view::npos)
+        return "<invalid host>";
+    return std::format("{}://{}", scheme, authority);
+}
+
+std::string FormatConsoleRecord(const LogRecord& record,
+                                const PanelLogContext* panel = nullptr) {
+    auto line = std::format("time=\"{}\" level={} msg={}",
+        FormatConsoleTimestamp(record.timestamp_us), ConsoleLevelName(record.level),
+        EscapeLogText(record.message, true));
+    if (panel) {
+        if (!panel->host.empty()) line.append(" Host=").append(ConsoleField(PanelOrigin(panel->host)));
+        if (panel->node_id > 0) line.append(std::format(" ID={}", panel->node_id));
+        if (!panel->name.empty()) line.append(" Name=").append(ConsoleField(panel->name));
+        if (!panel->type.empty()) line.append(" Type=").append(ConsoleField(panel->type));
+    }
+    return line;
+}
+
 std::string FormatRecord(const LogRecord& record) {
+    if (record.channel == LogChannel::Console) return FormatConsoleRecord(record);
     const auto timestamp = FormatLogTimestamp(record.timestamp_us);
-    const auto message = SingleLine(record.message);
+    const auto message = EscapeLogText(record.message);
     if (record.channel == LogChannel::Access) {
         return std::format("{} {}", timestamp, message);
     }
-    if (record.channel == LogChannel::Console) {
-        return std::format(
-            "{} [{}] {}", timestamp, LevelName(record.level), message);
+    auto line = std::format("{} [{}] ", timestamp, LevelName(record.level));
+    if (record.connection && record.connection->conn_id != 0) {
+        line.append(std::format("[{}] ", record.connection->conn_id));
     }
+    line.append(ComponentName(record.source_file)).append(": ");
     if (record.connection) {
-        if (record.connection->user_id > 0) {
-            const auto inbound_tag = record.connection->inbound_tag.empty()
-                ? std::string{"unknown"}
-                : SingleLine(record.connection->inbound_tag);
-            return std::format(
-                "{} [{}] [{}] {}: inbound={} user={} {}",
-                timestamp,
-                LevelName(record.level),
-                static_cast<std::uint32_t>(record.connection->conn_id),
-                ComponentName(record.source_file),
-                inbound_tag,
-                record.connection->user_id,
-                message);
+        const auto& context = *record.connection;
+        if (!context.inbound_tag.empty()) {
+            line.push_back('[');
+            line.append(EscapeLogText(context.inbound_tag));
+            if (!context.outbound_tag.empty() && context.inbound_tag != context.outbound_tag) {
+                line.append(" -> ").append(EscapeLogText(context.outbound_tag));
+            }
+            line.append("] ");
+        } else if (!context.outbound_tag.empty()) {
+            line.append("[outbound ").append(EscapeLogText(context.outbound_tag)).append("] ");
         }
-        return std::format(
-            "{} [{}] [{}] {}: {}",
-            timestamp,
-            LevelName(record.level),
-            static_cast<std::uint32_t>(record.connection->conn_id),
-            ComponentName(record.source_file),
-            message);
+        if (context.user_id > 0) line.append(std::format("user:{} ", context.user_id));
     }
-    return std::format(
-        "{} [{}] {}: {}",
-        timestamp,
-        LevelName(record.level),
-        ComponentName(record.source_file),
-        message);
+    line.append(message);
+    return line;
 }
 
 std::string DateString(std::chrono::system_clock::time_point now) {
@@ -486,7 +557,7 @@ std::optional<std::string> ExtractDailyDate(std::string_view filename,
 void WriteStderrFallback(LogLevel level, const std::string& msg) {
     std::lock_guard lock(g_console_mutex);
     LogRecord record{
-        .channel = LogChannel::Error,
+        .channel = LogChannel::Console,
         .level = level,
         .timestamp_us = NowMicros(),
         .message = msg,
@@ -898,8 +969,8 @@ bool Log::Init(const std::string& level,
 
         const auto min_level = ParseLogLevel(level);
         if (!min_level) {
-            std::cerr << "Log initialization failed: unsupported level '" << level
-                      << "'" << std::endl;
+            WriteConsole(LogLevel::ERROR,
+                         std::format("Failed to initialize logging > unsupported level '{}'", level));
             return false;
         }
         min_level_.store(*min_level, std::memory_order_release);
@@ -907,8 +978,8 @@ bool Log::Init(const std::string& level,
         try {
             if (!g_async_log_backend.Start(
                     log_dir, error_path, access_path, max_days, rotate_daily, gzip)) {
-                std::cerr << "Log initialization failed: cannot open access/error log files"
-                          << std::endl;
+                WriteConsole(LogLevel::ERROR,
+                             "Failed to initialize logging > cannot open access/error log files");
                 return false;
             }
 
@@ -919,24 +990,13 @@ bool Log::Init(const std::string& level,
 
             initialized_.store(true, std::memory_order_release);
             WriteConsole(LogLevel::INFO, std::format(
-                "logging level={} access={} error={} rotation={} compression={} retention={}d",
-                level,
-                resolved_access_path.string(),
-                resolved_error_path.string(),
-                rotation,
-                compression,
-                max_days));
-            WriteSystem(LogLevel::INFO, std::format(
-                "logging initialized level={} access={} error={} dir={} rotation={} compression={} retention_days={}",
-                level,
-                resolved_access_path.string(),
-                resolved_error_path.string(),
-                log_dir.string(),
-                rotation,
-                compression,
-                max_days));
+                "Logging initialized: level {}; access {}; error {}; directory {}; "
+                "{} rotation; compression {}; retention {} days",
+                level, resolved_access_path.string(), resolved_error_path.string(),
+                log_dir.string(), rotation, compression, max_days));
         } catch (const std::exception& e) {
-            std::cerr << "Log initialization failed: " << e.what() << std::endl;
+            WriteConsole(LogLevel::ERROR,
+                         std::format("Failed to initialize logging > {}", e.what()));
             g_async_log_backend.Stop();
             return false;
         }
@@ -1032,21 +1092,58 @@ void Log::WriteAccess(std::string message) {
 
 void Log::WriteConsole(LogLevel level,
                        std::string message,
-                       [[maybe_unused]] std::source_location location) {
-    std::lock_guard lock(g_console_mutex);
-    if (message.empty()) {
-        std::cout << std::endl;
-        return;
+                       std::source_location location) {
+    // Fatal startup callers use this direct API even with logging disabled;
+    // ordinary diagnostic macros perform the configured severity check first.
+    if (level != LogLevel::ERROR && !ShouldLog(level)) return;
+    if (message.empty()) return;
+    if (level >= LogLevel::WARN && initialized_.load(std::memory_order_acquire)) {
+        WriteSystem(level, message, location);
     }
     LogRecord record{
         .channel = LogChannel::Console,
         .level = level,
         .timestamp_us = NowMicros(),
         .message = std::move(message),
-        .source_file = {},
+        .source_file = location.file_name(),
         .connection = std::nullopt,
     };
-    std::cout << FormatRecord(record) << std::endl;
+    std::lock_guard lock(g_console_mutex);
+    auto& stream = level == LogLevel::ERROR ? std::cerr : std::cout;
+    stream << FormatConsoleRecord(record) << std::endl;
+}
+
+void Log::WritePanel(LogLevel level,
+                     PanelLogContext context,
+                     std::string message,
+                     std::source_location location) {
+    if (!ShouldLog(level)) return;
+    if (level < LogLevel::INFO || level >= LogLevel::WARN) {
+        auto diagnostic = context.node_id > 0
+            ? std::format("[{}/{}] {}", context.name, context.node_id, message)
+            : std::format("[{}] {}", context.name, message);
+        if (!context.host.empty()) {
+            diagnostic.append(" Host=").append(ConsoleField(PanelOrigin(context.host)));
+        }
+        if (!context.type.empty()) {
+            diagnostic.append(" Type=").append(ConsoleField(context.type));
+        }
+        if (initialized_.load(std::memory_order_acquire) || level < LogLevel::INFO) {
+            WriteSystem(level, std::move(diagnostic), location);
+        }
+    }
+    if (level < LogLevel::INFO) return;
+    LogRecord record{
+        .channel = LogChannel::Console,
+        .level = level,
+        .timestamp_us = NowMicros(),
+        .message = std::move(message),
+        .source_file = location.file_name(),
+        .connection = std::nullopt,
+    };
+    std::lock_guard lock(g_console_mutex);
+    auto& stream = level == LogLevel::ERROR ? std::cerr : std::cout;
+    stream << FormatConsoleRecord(record, &context) << std::endl;
 }
 
 bool Log::ShouldLog(LogLevel level) noexcept {

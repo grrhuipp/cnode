@@ -10,7 +10,7 @@
   "dns": {
     "servers": ["8.8.8.8", "1.1.1.1:53"],
     "timeout": 5,
-    "cacheSize": 10000,
+    "cacheSize": 10240,
     "minTTL": 60,
     "maxTTL": 3600
   },

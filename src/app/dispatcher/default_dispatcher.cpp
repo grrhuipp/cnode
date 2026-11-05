@@ -49,7 +49,7 @@ void ApplySniffOverride(
         return;
     }
     const std::string_view sniff_domain(result.domain.data(), result.domain.size());
-    LOG_CONN_DEBUG(ctx, "[Session] Sniff: proto={} domain={}",
+    LOG_CONN_DEBUG(ctx, "sniffed protocol={} domain={}",
                    result.protocol, sniff_domain);
     if (sniffing.IsDomainExcluded(sniff_domain) ||
         !sniffing.MatchesDestOverride(result.protocol)) {
@@ -96,7 +96,8 @@ net::awaitable<std::vector<net::ip::address>> ResolveRoutingAddresses(
     if (cancellation.cancelled() != net::cancellation_type::none)
         throw IoSystemError(net::error::operation_aborted);
     if (!dns_result.Ok()) {
-        LOG_CONN_DEBUG(ctx, "[Dispatcher] route DNS resolve failed for {}", target.host);
+        LOG_CONN_DEBUG(ctx, "routing DNS lookup failed target={} > {}: {}",
+                       target.host, ErrorCodeToString(dns_result.error), dns_result.error_msg);
         co_return std::vector<net::ip::address>{};
     }
 
@@ -163,11 +164,13 @@ net::awaitable<RelayResult> DefaultDispatcher::Dispatch(
     } catch (const std::bad_alloc&) {
         stats.OnError();
         result = MakeRelayError(ErrorCode::RESOURCE_EXHAUSTED);
-        LOG_CONN_WARN(ctx, "failed to process outbound traffic > out of memory");
+        try { LOG_CONN_WARN(ctx, "failed to process outbound traffic > out of memory"); }
+        catch (...) {} // Logging must not escape the allocation-failure boundary.
     } catch (const IoSystemError& e) {
         stats.OnError();
         result = MakeRelayError(MapAsioError(e.code()));
-        LOG_CONN_WARN(ctx, "failed to process outbound traffic > {}", e.what());
+        if (e.code() != net::error::operation_aborted && e.code() != net::error::eof)
+            LOG_CONN_WARN(ctx, "failed to process outbound traffic > {}", e.what());
     } catch (const std::exception& e) {
         stats.OnError();
         result = MakeRelayError(ErrorCode::INTERNAL);
@@ -239,13 +242,13 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
 
     if (!ctx.outbound.target.IsValid()) {
         stats.OnError();
-        LOG_CONN_DEBUG(ctx, "[Session] Reject invalid outbound target");
+        LOG_CONN_DEBUG(ctx, "rejected outbound request > invalid target");
         result = MakeRelayError(ErrorCode::PROTOCOL_DECODE_FAILED);
         co_return;
     }
 
-    LOG_CONN_DEBUG(ctx, "[Session] Protocol auth ok: [{}] -> {} user={}",
-                   ctx.inbound.tag, ctx.outbound.original_target, ctx.inbound.user_email);
+    LOG_CONN_DEBUG(ctx, "protocol authenticated target={} email={}",
+                   ctx.outbound.original_target, ctx.inbound.user_email);
 
     buf::MultiBufferBatch outbound_first_payload;
     if (policy.sniffing.enabled && !policy.sniffing.metadata_only) {
@@ -426,14 +429,18 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
     auto outbound_handler = std::move(dispatch.handler);
     if (!outbound_handler) {
         if (dispatch.error == ErrorCode::BLOCKED) {
-            LOG_CONN_WARN(ctx, "destination rejected user={} target={}",
-                              ctx.inbound.user_email, ctx.outbound.target);
+            LOG_CONN_WARN(ctx, "destination rejected source={}:{} target={} email={} > policy blocked",
+                          ctx.inbound.source_ip, ctx.inbound.source_port,
+                          ctx.outbound.target, ctx.inbound.user_email);
+            if (ctx.inbound.user_id > 0 && ctx.outbound.target.IsValid()) {
+                LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "policy blocked"));
+            }
             stats.OnError();
             result = MakeRelayError(ErrorCode::BLOCKED);
             co_return;
         }
-        LOG_CONN_WARN(ctx, "failed to find outbound handler {} -> {} via {}",
-                          ctx.inbound.source_ip, ctx.outbound.target, ctx.outbound.tag);
+        LOG_CONN_WARN(ctx, "failed to find outbound handler source={}:{} target={}",
+                          ctx.inbound.source_ip, ctx.inbound.source_port, ctx.outbound.target);
         stats.OnError();
         result = MakeRelayError(ErrorCode::ROUTER_OUTBOUND_NOT_FOUND);
         co_return;
@@ -453,7 +460,7 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
     if (pressure_idle_timeout > 0 &&
         relay_idle_timeout < timeouts.IdleTimeout()) {
         LOG_CONN_DEBUG(ctx,
-                       "[Session] Pressure mode: relay_idle={}s -> {}s",
+                       "pressure mode reduced relay idle timeout from {}s to {}s",
                        timeouts.IdleTimeout().count(),
                        relay_idle_timeout.count());
     }
@@ -476,9 +483,9 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
     first_packet = {};
     const size_t relay_payload_size = outbound_first_payload.byte_size();
 
-    LOG_CONN_DEBUG(ctx, "[Session] Relay start: {} -> {} via {} payload={}B",
-                   ctx.inbound.source_ip, ctx.outbound.target, ctx.outbound.tag,
-                   relay_payload_size);
+    LOG_CONN_DEBUG(ctx, "relay started source={}:{} target={} payload={}B",
+                   ctx.inbound.source_ip, ctx.inbound.source_port,
+                   ctx.outbound.target, relay_payload_size);
 
     ActiveSessionScope relay_scope{ctx, session_tracking_};
     auto outbound_process = co_await outbound_handler->Process(
@@ -497,9 +504,12 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
         if (process_error == ErrorCode::OK) {
             process_error = ErrorCode::PROTOCOL_AUTH_FAILED;
         }
-        LOG_CONN_WARN(ctx, "failed to process outbound traffic {} -> {} via {} > {}",
-                          ctx.inbound.source_ip, ctx.outbound.target,
-                          ctx.outbound.tag, ErrorCodeToLogReason(process_error));
+        if (process_error != ErrorCode::CANCELLED && process_error != ErrorCode::SOCKET_EOF &&
+            process_error != ErrorCode::SOCKET_CLOSED && process_error != ErrorCode::CONNECTION_CLOSED) {
+            LOG_CONN_WARN(ctx, "failed to process outbound traffic source={}:{} target={} > {}",
+                          ctx.inbound.source_ip, ctx.inbound.source_port,
+                          ctx.outbound.target, ErrorCodeToLogReason(process_error));
+        }
         stats.OnError();
         result = MakeRelayError(process_error);
         co_return;
@@ -507,13 +517,13 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
     RelayResult relay_result = std::move(*outbound_process);
 
     if (relay_result.error != ErrorCode::OK) {
-        LOG_CONN_DEBUG(ctx, "[Session] Relay end: {} up={}B down={}B closer={} target={}",
+        LOG_CONN_DEBUG(ctx, "relay ended > {} up={}B down={}B closer={} target={}",
                        ErrorCodeToString(relay_result.error),
                        ctx.traffic.bytes_up, ctx.traffic.bytes_down,
                        relay_result.client_closed_first ? "client" : "target",
                        ctx.outbound.target);
     } else {
-        LOG_CONN_DEBUG(ctx, "[Session] Relay end: OK up={}B down={}B target={}",
+        LOG_CONN_DEBUG(ctx, "relay completed up={}B down={}B target={}",
                        ctx.traffic.bytes_up, ctx.traffic.bytes_down,
                        ctx.outbound.target);
     }
@@ -526,11 +536,9 @@ DefaultDispatcher::RouteResult DefaultDispatcher::FinishRoute(
     const detail::OutboundSelection& selection) const {
     ctx.outbound.tag = selection.outbound_tag;
     if (selection.source == detail::SelectionSource::Forced) {
-        LOG_CONN_DEBUG(ctx, "[Dispatcher] {} -> outbound={} (fixed)",
-                       ctx.outbound.target, ctx.outbound.tag);
+        LOG_CONN_DEBUG(ctx, "selected fixed route target={}", ctx.outbound.target);
     } else {
-        LOG_CONN_DEBUG(ctx, "[Dispatcher] {} -> outbound={}",
-                       ctx.outbound.target, ctx.outbound.tag);
+        LOG_CONN_DEBUG(ctx, "selected route target={}", ctx.outbound.target);
     }
 
     if (request_policy_.Blocked(ctx)) {

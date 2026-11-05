@@ -125,10 +125,14 @@ ParseTrojanRequest(AsyncStream& stream,
             break;
         }
         if (decoded.status == ::acpp::trojan::RequestDecodeStatus::InvalidAddress) {
+            LOG_CONN_WARN(ctx, "request rejected from {}:{} > invalid target address",
+                          client_ip, ctx.inbound.source_port);
+            LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "invalid target address"));
             co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
         }
         if (decoded.status == ::acpp::trojan::RequestDecodeStatus::InvalidHeader) {
-            LOG_NET_WARN("[{}] Trojan parse failed from {}", tag, client_ip);
+            LOG_CONN_WARN(ctx, "invalid request header from {}:{}", client_ip, ctx.inbound.source_port);
+            LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "invalid request header"));
             co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
         }
         required = decoded.required;
@@ -139,7 +143,9 @@ ParseTrojanRequest(AsyncStream& stream,
     auto user_info = proxyman::inbound::UserStore::FindTrojanUser(
         tag, request.PasswordHashView());
     if (!user_info) {
-        LOG_NET_WARN("[{}] Trojan auth failed from {}", tag, client_ip);
+        LOG_CONN_WARN(ctx, "authentication failed from {}:{} > no matching credential",
+                      client_ip, ctx.inbound.source_port);
+        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "authentication failed: no matching credential"));
         if (limiter && ctx.inbound.HasProxyProtocolClientIP()) {
             co_await limiter->OnAuthFailTracked(tag, client_ip);
         }
@@ -191,6 +197,8 @@ proxy::trojan::inbound::Handler::Process(
 {
     const std::string_view tag   = ctx.inbound.tag;
     const std::string_view client_ip = ctx.inbound.source_ip;
+    ctx.inbound.user_id = 0;
+    ctx.inbound.user_email.clear();
     auto fail = [&](ErrorCode error) {
         stats_->OnError();
         RelayResult result;
@@ -204,13 +212,13 @@ proxy::trojan::inbound::Handler::Process(
         return fail(error);
     };
 
-    LOG_CONN_DEBUG(ctx, "[Trojan][{}] Process start from {}", tag, client_ip);
+    LOG_CONN_DEBUG(ctx, "processing connection from {}:{}", client_ip, ctx.inbound.source_port);
 
     if (limiter_ && ctx.inbound.HasProxyProtocolClientIP() &&
         co_await limiter_->IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {
-        LOG_NET_DEBUG("{} from {}:{} rejected ip_banned [{}]",
-            FormatTimestamp(ctx.accept_time_us),
-            ctx.inbound.source_ip, ctx.inbound.source_port, ctx.inbound.tag);
+        LOG_CONN_DEBUG(ctx, "connection rejected from {}:{} > IP banned",
+                       ctx.inbound.source_ip, ctx.inbound.source_port);
+        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "IP banned"));
         co_return fail_abortive(ErrorCode::BLOCKED);
     }
     std::optional<UserOnlineSessionGuard> user_session;
@@ -230,18 +238,17 @@ proxy::trojan::inbound::Handler::Process(
         user_session = co_await validator_.TryConnectSession(
             tag, profile.user_id, ctx.inbound.source_ip, profile.device_limit);
         if (!user_session) {
-            LOG_NET_DEBUG("{} from {}:{} rejected device_limit [{}] user={} limit={} domain_online_devices={}",
-                FormatTimestamp(ctx.accept_time_us),
-                ctx.inbound.source_ip, ctx.inbound.source_port, tag, ctx.inbound.user_email,
-                profile.device_limit,
+            LOG_CONN_DEBUG(ctx, "connection rejected from {}:{} > device limit={} domain_online_devices={}",
+                ctx.inbound.source_ip, ctx.inbound.source_port, profile.device_limit,
                 validator_.OnlineDeviceCount(tag, static_cast<uint64_t>(profile.user_id)));
+            LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "device limit"));
             co_return fail_abortive(ErrorCode::PERMISSION_DENIED);
         }
         // Session metadata is owned; release the authentication snapshot before I/O.
         handshake->user.reset();
 
-        LOG_CONN_DEBUG(ctx, "[Trojan][{}] auth ok: {} -> {} user={}",
-                       tag, client_ip, handshake->target, ctx.inbound.user_email);
+        LOG_CONN_DEBUG(ctx, "authentication succeeded from {}:{} -> {}",
+                       client_ip, ctx.inbound.source_port, handshake->target);
 
         net = (handshake->command == ::acpp::trojan::TrojanCommand::UDP_ASSOCIATE)
               ? Network::UDP : Network::TCP;

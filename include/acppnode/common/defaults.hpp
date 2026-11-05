@@ -29,7 +29,7 @@ constexpr uint32_t kPressureIdleTimeout = 60;          // 高压时空闲超时�
 
 // DNS 配置
 constexpr uint32_t kDnsTimeout = 5;
-constexpr uint32_t kDnsCacheSize = 10000;
+constexpr uint32_t kDnsCacheSize = 10240;
 constexpr uint32_t kDnsMinTTL = 60;
 constexpr uint32_t kDnsMaxTTL = 3600;
 

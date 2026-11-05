@@ -134,15 +134,18 @@ DialOutboundStream(
     });
     if (!transport_target) {
         if (transport_target.error() == ErrorCode::DNS_RESOLVE_FAILED) {
-            LOG_CONN_DEBUG(ctx, "[TrojanOutbound] DNS resolve failed for {}", config.address);
+            LOG_CONN_DEBUG(ctx, "DNS resolve failed for {}", config.address);
         }
         co_return tl::unexpected(transport_target.error());
     }
     auto dial_result = co_await DialOutboundTransport(io_context, ctx, *transport_target);
     if (!dial_result.Ok()) {
-        LOG_CONN_WARN(ctx, "[TrojanOutbound] dial failed {} -> {} via {}: {}",
-                          ctx.inbound.source_ip, ctx.outbound.target,
-                          ctx.outbound.tag, dial_result.error_msg);
+        if (dial_result.error != ErrorCode::CANCELLED &&
+            dial_result.error != ErrorCode::CONNECTION_CLOSED &&
+            dial_result.error != ErrorCode::SOCKET_EOF) {
+            LOG_CONN_WARN(ctx, "dial failed {} -> {} > {}",
+                          ctx.inbound.source_ip, ctx.outbound.target, dial_result.error_msg);
+        }
         co_return tl::unexpected(dial_result.error);
     }
     auto stream = std::move(dial_result.stream);
@@ -175,7 +178,7 @@ SendTrojanHandshake(
         header_buf.data(),
         header_buf.size());
     if (header_len == 0) {
-        LOG_CONN_WARN(ctx, "TrojanOutbound: Handshake encode failed");
+        LOG_CONN_WARN(ctx, "handshake encode failed");
         co_return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
 
@@ -183,7 +186,7 @@ SendTrojanHandshake(
         ConstBufferSpanBuilder<1> header_buffers;
         header_buffers.Append(net::const_buffer(header_buf.data(), header_len));
         co_await stream.WriteBuffers(header_buffers.Span());
-        LOG_CONN_DEBUG(ctx, "[Trojan] Handshake sent {} bytes", header_len);
+        LOG_CONN_DEBUG(ctx, "handshake sent {} bytes", header_len);
         co_return tl::expected<void, ErrorCode>{};
     } catch (const IoSystemError& e) {
         co_return tl::unexpected(outbound_protocol_deadline.Expired()

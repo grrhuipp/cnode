@@ -32,11 +32,12 @@ std::optional<DnsResult> DnsCache::GetResult(std::string_view domain) {
 
     const DnsCacheEntry& entry = node->entry;
     DnsResult result;
-    if (entry.negative) {
+    if (const auto* reason = std::get_if<memory::ThreadLocalString>(&entry.answer)) {
         result.error = ErrorCode::DNS_NO_RECORD;
-        result.error_msg = "NXDOMAIN (cached)";
+        result.error_msg.assign(reason->data(), reason->size());
     } else {
-        result.addresses.assign(entry.addresses.begin(), entry.addresses.end());
+        const auto& addresses = std::get<memory::ThreadLocalVector<net::ip::address>>(entry.answer);
+        result.addresses.assign(addresses.begin(), addresses.end());
     }
     const auto remaining = std::chrono::duration_cast<std::chrono::seconds>(
         entry.expire_time - now);
@@ -52,9 +53,12 @@ void DnsCache::Store(std::string_view domain, const DnsResult& result) {
     }
 
     DnsCacheEntry prepared;
-    prepared.negative = !result.Ok();
-    if (!prepared.negative) {
-        prepared.addresses.assign(result.addresses.begin(), result.addresses.end());
+    if (result.Ok()) {
+        auto& addresses = std::get<memory::ThreadLocalVector<net::ip::address>>(prepared.answer);
+        addresses.assign(result.addresses.begin(), result.addresses.end());
+    } else {
+        prepared.answer.emplace<memory::ThreadLocalString>(
+            result.error_msg.data(), result.error_msg.size());
     }
     const uint32_t ttl = std::clamp(result.ttl, min_ttl_, max_ttl_);
     prepared.expire_time = steady_clock::now() + std::chrono::seconds(ttl);

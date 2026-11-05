@@ -3,6 +3,7 @@
 #include "acppnode/app/worker_mailbox.hpp"
 #include "acppnode/common/domain_name.hpp"
 #include "acppnode/common/ip_address.hpp"
+#include "acppnode/infra/log.hpp"
 #include "datagram_exchange.hpp"
 #include "../../common/awaitable_task_group.hpp"
 #include "inflight_resolves.hpp"
@@ -112,13 +113,17 @@ net::awaitable<DnsResult> DNSWorker::Impl::ResolveOwned(std::string owned_domain
 
     acpp::domain::NormalizeDnsHostnameInPlace(owned_domain);
     domain = owned_domain;
-    if (auto cached = cache.GetResult(domain)) {
-        co_return std::move(*cached);
+    auto cached = cache.GetResult(domain);
+    auto result = cached ? std::move(*cached) :
+        co_await inflight_resolves.Run(domain, [this, domain] {
+            return ResolveUncached(domain);
+        });
+    if (!result.Ok() && result.error != ErrorCode::CANCELLED) {
+        LOG_WARN("failed to resolve {} (error={} source={}) > {}",
+                 domain, ErrorCodeToString(result.error),
+                 result.from_cache ? "negative cache" : "upstream", result.error_msg);
     }
-
-    co_return co_await inflight_resolves.Run(domain, [this, domain] {
-        return ResolveUncached(domain);
-    });
+    co_return result;
 }
 
 net::awaitable<DnsResult> DNSWorker::Impl::ResolveUncached(std::string_view domain) {
@@ -128,6 +133,7 @@ net::awaitable<DnsResult> DNSWorker::Impl::ResolveUncached(std::string_view doma
     } catch (const IoSystemError& error) {
         result.error = error.code() == io_error::operation_aborted
             ? ErrorCode::CANCELLED : ErrorCode::DNS_RESOLVE_FAILED;
+        result.error_msg = error.code().message();
     } catch (const std::exception& e) {
         result.error = ErrorCode::DNS_RESOLVE_FAILED;
         result.error_msg = e.what();
@@ -156,7 +162,8 @@ net::awaitable<DnsResult> DNSWorker::Impl::DoResolve(
     last_result.error = ErrorCode::DNS_RESOLVE_FAILED;
     last_result.error_msg = "DNS server unavailable";
 
-    for (const auto& server : upstreams) {
+    for (size_t server_index = 0; server_index < upstreams.size(); ++server_index) {
+        const auto& server = upstreams[server_index];
         if (stopping) {
             last_result.error = ErrorCode::CANCELLED;
             co_return last_result;
@@ -222,14 +229,19 @@ net::awaitable<DnsResult> DNSWorker::Impl::DoResolve(
             co_return result;
         }
 
-        if (a_result.error == ErrorCode::DNS_NO_RECORD &&
-            aaaa_result.error == ErrorCode::DNS_NO_RECORD) {
-            co_return a_result;
-        }
-
-        last_result = a_result.error == ErrorCode::DNS_NO_RECORD
+        const bool no_records = a_result.error == ErrorCode::DNS_NO_RECORD &&
+                                aaaa_result.error == ErrorCode::DNS_NO_RECORD;
+        const auto& endpoint = config.servers[server_index];
+        auto reason = std::format(
+            "server {} port {} > A: {} > {}; AAAA: {} > {}",
+            endpoint.address().to_string(), endpoint.port(),
+            ErrorCodeToString(a_result.error), a_result.error_msg,
+            ErrorCodeToString(aaaa_result.error), aaaa_result.error_msg);
+        last_result = a_result.error == ErrorCode::DNS_NO_RECORD && !no_records
             ? std::move(aaaa_result)
             : std::move(a_result);
+        last_result.error_msg = std::move(reason);
+        if (no_records) co_return last_result;
     }
 
     co_return last_result;

@@ -135,21 +135,24 @@ DialOutboundStream(
     });
     if (!transport_target) {
         if (transport_target.error() == ErrorCode::DNS_RESOLVE_FAILED) {
-            LOG_CONN_WARN(ctx, "[VMess] DNS resolve failed for {}", prepared.config.address);
+            LOG_CONN_WARN(ctx, "DNS resolve failed for {}", prepared.config.address);
         }
         co_return tl::unexpected(transport_target.error());
     }
 
-    LOG_CONN_DEBUG(ctx, "[VMess] transport target {}:{} ({}/{})",
+    LOG_CONN_DEBUG(ctx, "transport target {}:{} ({}/{})",
                    prepared.config.address, prepared.config.port,
                    prepared.config.stream_settings.security,
                    prepared.config.stream_settings.network);
 
     auto dial_result = co_await DialOutboundTransport(io_context, ctx, *transport_target);
     if (!dial_result.Ok()) {
-        LOG_CONN_WARN(ctx, "[VMess] dial failed {} -> {} via {}: {}",
-                          ctx.inbound.source_ip, ctx.outbound.target,
-                          ctx.outbound.tag, dial_result.error_msg);
+        if (dial_result.error != ErrorCode::CANCELLED &&
+            dial_result.error != ErrorCode::CONNECTION_CLOSED &&
+            dial_result.error != ErrorCode::SOCKET_EOF) {
+            LOG_CONN_WARN(ctx, "dial failed {} -> {} > {}",
+                          ctx.inbound.source_ip, ctx.outbound.target, dial_result.error_msg);
+        }
         co_return tl::unexpected(dial_result.error);
     }
 
@@ -175,14 +178,16 @@ SendVMessHandshake(
     auto handshake_result = co_await vmess_session.EncodeRequestHeader(stream);
     if (!handshake_result) {
         const ErrorCode code = handshake_result.error();
-        LOG_NET_WARN("[conn={}] VMessOutbound: protocol handshake failed: {}",
-                      ctx.conn_id, ErrorCodeToString(code));
+        if (code != ErrorCode::CANCELLED && code != ErrorCode::CONNECTION_CLOSED &&
+            code != ErrorCode::SOCKET_EOF) {
+            LOG_CONN_WARN(ctx, "protocol handshake failed > {}", ErrorCodeToString(code));
+        }
         stream.Cancel();
         co_return tl::unexpected(outbound_protocol_deadline.Expired()
             ? ErrorCode::TIMEOUT
             : code);
     }
-    LOG_CONN_DEBUG(ctx, "[VMess] Process OK");
+    LOG_CONN_DEBUG(ctx, "protocol handshake succeeded");
     co_return tl::expected<void, ErrorCode>{};
 }
 
