@@ -2,6 +2,7 @@
 
 #include "acppnode/common/asio_types.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <optional>
@@ -16,6 +17,10 @@ enum class ProxyProtocolParseStatus : uint8_t {
     Invalid,
 };
 
+// Upper bound for one PROXY v1/v2 header read from an accepted stream; it
+// bounds the header itself, not payload read along with it.
+inline constexpr std::size_t kProxyHeaderMaxBytes = 2048;
+
 enum class ProxyProtocolReadStatus : uint8_t {
     Ok = 0,
     TimedOut,
@@ -29,7 +34,7 @@ enum class ProxyProtocolReadStatus : uint8_t {
 // ============================================================================
 struct ProxyProtocolResult {
     ProxyProtocolParseStatus status = ProxyProtocolParseStatus::NotProxy;
-    std::string src_ip;
+    // Normalized source; absent for v1 UNKNOWN, v2 LOCAL and non-INET families.
     std::optional<net::ip::address> src_addr;
     uint16_t src_port = 0;
     size_t consumed = 0;  // 消耗的字节数
@@ -56,33 +61,15 @@ struct ProxyProtocolReadResult {
     }
 };
 
-// ============================================================================
-// PROXY Protocol 解析器（静态工具类）
-//
-// 支持自动检测 v1（文本）和 v2（二进制），非 PROXY 报文返回 success=false。
-// ============================================================================
-class ProxyProtocolParser {
-public:
-    // PROXY Protocol v2 签名 (12 字节)
-    static constexpr uint8_t kSignatureV2[12] = {
-        0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A
-    };
+// Auto-detects v1 (text) and v2 (binary). Bytes that cannot start a PROXY
+// header yield NotProxy; a valid prefix of one yields Incomplete.
+[[nodiscard]] ProxyProtocolResult ParseProxyProtocolHeader(std::span<const uint8_t> data);
 
-    // 解析 PROXY Protocol（自动检测 v1/v2）
-    [[nodiscard]] static ProxyProtocolResult Parse(const uint8_t* data, size_t len);
-
-    // 解析 v1（文本格式）
-    [[nodiscard]] static ProxyProtocolResult ParseV1(const uint8_t* data, size_t len);
-
-    // 解析 v2（二进制格式）
-    [[nodiscard]] static ProxyProtocolResult ParseV2(const uint8_t* data, size_t len);
-
-    // 编码 PROXY Protocol v1 (version=1) 或 v2 (version=2) 头部
-    [[nodiscard]] static size_t Encode(
-        uint8_t version,
-        const tcp::endpoint& src,
-        const tcp::endpoint& dst,
-        std::span<uint8_t, 108> out) noexcept;
-};
+// Encodes a v1 (version=1) or v2 (version=2) header; 0 for other versions.
+[[nodiscard]] size_t EncodeProxyProtocolHeader(
+    uint8_t version,
+    const tcp::endpoint& src,
+    const tcp::endpoint& dst,
+    std::span<uint8_t, 108> out) noexcept;
 
 }  // namespace acpp

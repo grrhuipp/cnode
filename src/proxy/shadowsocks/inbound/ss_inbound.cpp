@@ -75,7 +75,7 @@ PrepareSsTcpSession(
         if (error == ErrorCode::PROTOCOL_AUTH_FAILED) {
             LOG_NET_WARN("[{}] SS auth failed from {}", tag, client_ip);
             if (limiter && ctx.inbound.HasProxyProtocolClientIP()) {
-                limiter->OnAuthFailTracked(tag, client_ip);
+                co_await limiter->OnAuthFailTracked(tag, client_ip);
             }
             stats.OnError();
         } else {
@@ -90,7 +90,7 @@ PrepareSsTcpSession(
     if (!matched) {
         LOG_NET_WARN("[{}] SS auth failed from {}", tag, client_ip);
         if (limiter && ctx.inbound.HasProxyProtocolClientIP()) {
-            limiter->OnAuthFailTracked(tag, client_ip);
+            co_await limiter->OnAuthFailTracked(tag, client_ip);
         }
         stats.OnError();
         co_return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
@@ -101,10 +101,10 @@ PrepareSsTcpSession(
     ctx.inbound.user_email = profile.email;
     ctx.content.speed_limit = profile.speed_limit;
 
-    auto user_session = validator.TryConnectSession(
+    auto user_session = co_await validator.TryConnectSession(
         tag, profile.user_id, ctx.inbound.source_ip, profile.device_limit);
     if (!user_session) {
-        LOG_NET_DEBUG("{} from {}:{} rejected device_limit [{}] user={} limit={} online_devices={}",
+        LOG_NET_DEBUG("{} from {}:{} rejected device_limit [{}] user={} limit={} domain_online_devices={}",
             FormatTimestamp(ctx.accept_time_us),
             ctx.inbound.source_ip, ctx.inbound.source_port, tag, ctx.inbound.user_email,
             profile.device_limit,
@@ -189,11 +189,11 @@ net::awaitable<RelayResult> DispatchSsUotSession(
 proxy::shadowsocks::inbound::Handler::Handler(
     UserOnlineTracker& validator,
     StatsShard& stats,
-    ConnectionLimiterPtr limiter,
+    ConnectionLimiter* limiter,
     ss::SsCipherInfo cipher_info)
     : validator_(validator)
     , stats_(&stats)
-    , limiter_(std::move(limiter))
+    , limiter_(limiter)
     , cipher_info_(cipher_info) {}
 
 void proxy::shadowsocks::inbound::Handler::AdoptWorkerStateFrom(
@@ -240,7 +240,7 @@ proxy::shadowsocks::inbound::Handler::Process(
     LOG_CONN_DEBUG(ctx, "[SS][{}] Process start from {}", tag, client_ip);
 
     if (limiter_ && ctx.inbound.HasProxyProtocolClientIP() &&
-        limiter_->IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {
+        co_await limiter_->IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {
         LOG_NET_DEBUG("{} from {}:{} rejected ip_banned [{}]",
             FormatTimestamp(ctx.accept_time_us),
             ctx.inbound.source_ip, ctx.inbound.source_port, ctx.inbound.tag);
@@ -340,7 +340,7 @@ proxy::shadowsocks::inbound::Handler::CreateDatagramResponse(
     if (!key.assign(std::span(decoded.session_owner.bytes).first(decoded.session_owner.size))) {
         return tl::unexpected(ErrorCode::INTERNAL);
     }
-    if (!ss::Is2022Cipher(cipher_info_)) {
+    if (!ss::Is2022Cipher(cipher_info_.type)) {
         return memory::AllocateShared<ShadowsocksUdpResponseContext>(key, cipher_info_);
     }
     if (!decoded.session_id) return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
@@ -479,25 +479,6 @@ buf::MultiBuffer ShadowsocksUdpResponseContext::Encode(UDPPacketView packet) {
 // 自注册（静态初始化）
 // ============================================================================
 namespace {
-acpp::proxyman::inbound::PreparedAeadCipher ToPreparedCipher(acpp::ss::SsCipherType type) {
-    using Prepared = acpp::proxyman::inbound::PreparedAeadCipher;
-    switch (type) {
-        case acpp::ss::SsCipherType::AES_128_GCM:
-            return Prepared::AES_128_GCM;
-        case acpp::ss::SsCipherType::AES_256_GCM:
-            return Prepared::AES_256_GCM;
-        case acpp::ss::SsCipherType::CHACHA20_POLY1305:
-            return Prepared::CHACHA20_POLY1305;
-        case acpp::ss::SsCipherType::AES_128_GCM_2022:
-            return Prepared::AES_128_GCM_2022;
-        case acpp::ss::SsCipherType::AES_256_GCM_2022:
-            return Prepared::AES_256_GCM_2022;
-        case acpp::ss::SsCipherType::CHACHA20_POLY1305_2022:
-            return Prepared::CHACHA20_POLY1305_2022;
-    }
-    return Prepared::AES_256_GCM;
-}
-
 acpp::proxyman::inbound::PreparedKeyBytes ToPreparedKey(acpp::ss::KeyBytes key) {
     acpp::proxyman::inbound::PreparedKeyBytes prepared;
     prepared.assign(key.span());
@@ -539,7 +520,7 @@ const bool kSsInboundRegistered = [] {
     reg.create_tcp_handler =
         [](acpp::proxyman::inbound::ProtocolRuntime& runtime,
            acpp::StatsShard& stats,
-           acpp::ConnectionLimiterPtr limiter,
+           acpp::ConnectionLimiter* limiter,
            const acpp::proxyman::inbound::BuildRequest& req) -> std::unique_ptr<acpp::Inbound> {
             auto* ss_runtime = dynamic_cast<ShadowsocksRuntime*>(&runtime);
             const auto* settings = GetSettings(req);
@@ -556,7 +537,7 @@ const bool kSsInboundRegistered = [] {
     reg.create_datagram_handler =
         [](acpp::proxyman::inbound::ProtocolRuntime& runtime,
            acpp::StatsShard& stats,
-           acpp::ConnectionLimiterPtr limiter,
+           acpp::ConnectionLimiter* limiter,
            const acpp::proxyman::inbound::BuildRequest& req)
             -> std::unique_ptr<acpp::Inbound> {
             auto* ss_runtime = dynamic_cast<ShadowsocksRuntime*>(&runtime);
@@ -599,7 +580,7 @@ const bool kSsInboundRegistered = [] {
             int64_t synthetic_uid = -1;
             acpp::proxyman::inbound::PreparedKeyBytes identity_key;
             const bool use_identity =
-                acpp::ss::Is2022Cipher(*cipher_info) &&
+                acpp::ss::Is2022Cipher(cipher_info->type) &&
                 !config.identity_password.empty() &&
                 (config.clients.size() > 1 ||
                  (config.clients.size() == 1 &&
@@ -621,7 +602,6 @@ const bool kSsInboundRegistered = [] {
                 acpp::proxyman::inbound::PreparedShadowsocksUser info;
                 info.password    = client.password;
                 info.profile.user_id = synthetic_uid--;
-                info.cipher_type = ToPreparedCipher(cipher_info->type);
                 info.key_size    = cipher_info->key_size;
                 info.salt_size   = cipher_info->salt_size;
                 info.derived_key = ToPreparedKey(
@@ -663,7 +643,7 @@ const bool kSsInboundRegistered = [] {
                          req.tag);
                 return std::nullopt;
             }
-            if (acpp::ss::Is2022Cipher(cipher_info) &&
+            if (acpp::ss::Is2022Cipher(cipher_info.type) &&
                 !settings->identity_password.empty()) {
                 identity_key = ToPreparedKey(
                     acpp::ss::BuildMasterKey(
@@ -684,10 +664,9 @@ const bool kSsInboundRegistered = [] {
                 info.profile.user_id = runtime_user.user_id;
                 info.profile.speed_limit = runtime_user.speed_limit;
                 info.profile.device_limit = runtime_user.device_limit;
-                info.cipher_type = ToPreparedCipher(cipher_info.type);
                 info.key_size = cipher_info.key_size;
                 info.salt_size = cipher_info.salt_size;
-                info.derived_key = ToPreparedKey(acpp::ss::Is2022Cipher(cipher_info)
+                info.derived_key = ToPreparedKey(acpp::ss::Is2022Cipher(cipher_info.type)
                     ? acpp::ss::Build2022UserKeyFromUuid(runtime_user.credential, cipher_info)
                     : acpp::ss::BuildMasterKey(runtime_user.credential, cipher_info));
                 info.identity_key = identity_key;

@@ -10,11 +10,6 @@ namespace acpp {
 
 // ============================================================================
 // Relay 配置
-//
-// Buffer 管理已移至 buf::MultiBuffer（multi_buffer.hpp）：
-//   - relay 数据面固定 8KB Buffer，从当前线程 PMR 池借用，用完归还
-//   - 短生命周期 scratch 同样借用后归还，空闲连接不保留容量
-//   - 不再需要协议私有 pool / buffer_size / upload_hint / download_hint
 // ============================================================================
 struct RelayConfig {
     std::chrono::seconds uplink_only{defaults::kUplinkOnlyTimeout};     // 下行 EOF 后上行最多保留多久

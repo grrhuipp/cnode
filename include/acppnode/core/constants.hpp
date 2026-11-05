@@ -20,8 +20,6 @@ inline constexpr std::string_view kDefaultLevel = "info";
 }  // namespace logging
 
 namespace network {
-inline constexpr std::string_view kAnyIpv4 = "0.0.0.0";
-inline constexpr std::string_view kAnyIpv6 = "::";
 inline constexpr std::string_view kDualStackAuto = "auto";
 }  // namespace network
 
@@ -47,19 +45,6 @@ inline constexpr std::string_view kHttp = "http";
 inline constexpr std::string_view kHttps = "https";
 inline constexpr std::string_view kBitTorrent = "bittorrent";
 inline constexpr std::string_view kQuic = "quic";
-inline constexpr std::string_view kAsIs = "AsIs";
-inline constexpr std::string_view kIPIfNonMatch = "IPIfNonMatch";
-inline constexpr std::string_view kIPOnDemand = "IPOnDemand";
-inline constexpr std::string_view kUseIP = "UseIP";
-inline constexpr std::string_view kUseIPv6v4 = "UseIPv6v4";
-inline constexpr std::string_view kUseIPv4 = "UseIPv4";
-inline constexpr std::string_view kUseIPv4v6 = "UseIPv4v6";
-inline constexpr std::string_view kUseIPv6 = "UseIPv6";
-inline constexpr std::string_view kForceIP = "ForceIP";
-inline constexpr std::string_view kForceIPv6v4 = "ForceIPv6v4";
-inline constexpr std::string_view kForceIPv6 = "ForceIPv6";
-inline constexpr std::string_view kForceIPv4v6 = "ForceIPv4v6";
-inline constexpr std::string_view kForceIPv4 = "ForceIPv4";
 
 inline constexpr std::string_view kVmess = "vmess";
 inline constexpr std::string_view kVless = "vless";
@@ -85,13 +70,6 @@ namespace panel {
 inline constexpr std::string_view kV2BoardType = protocol::kV2Board;
 inline constexpr std::string_view kDefaultNodeType = protocol::kDefaultNodeProtocol;
 }  // namespace panel
-
-namespace state {
-inline constexpr std::string_view kNone = protocol::kNone;
-inline constexpr std::string_view kCache = "cache";
-inline constexpr std::string_view kResolve = "resolve";
-inline constexpr std::string_view kFailed = "failed";
-}  // namespace state
 
 namespace test {
 inline constexpr uint16_t kTestPort = 10086;

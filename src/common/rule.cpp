@@ -11,40 +11,31 @@
 
 namespace acpp::rule {
 
-Manager::Manager() = default;
-Manager::~Manager() = default;
-Manager::Manager(Manager&&) noexcept = default;
-Manager& Manager::operator=(Manager&&) noexcept = default;
+DetectRulePolicy::DetectRulePolicy()
+    : rules_(std::make_shared<const InboundRule>()) {}
+DetectRulePolicy::~DetectRulePolicy() = default;
 
-void Manager::UpdateRule(std::string_view tag,
-                         const std::vector<DetectRule>& new_rule_list) {
-    if (tag.empty()) {
-        return;
-    }
-
+void DetectRulePolicy::UpdateRule(std::string_view tag,
+                                  const std::vector<DetectRule>& new_rule_list) {
+    if (tag.empty()) return;
+    const std::lock_guard lock(update_mutex_);
+    auto next = std::make_shared<InboundRule>(*rules_.load(std::memory_order_acquire));
     if (new_rule_list.empty()) {
-        if (auto it = rules_.find(tag); it != rules_.end()) {
-            rules_.erase(it);
-        }
-        return;
-    }
-
-    RuleList candidate(new_rule_list.begin(), new_rule_list.end());
-    const auto it = rules_.find(tag);
-    if (it == rules_.end()) {
-        rules_.try_emplace(memory::ThreadLocalString(tag), std::move(candidate));
+        if (auto it = next->find(tag); it != next->end()) next->erase(it);
     } else {
-        it->second.swap(candidate);
+        next->insert_or_assign(std::string(tag), new_rule_list);
     }
+    rules_.store(std::move(next), std::memory_order_release);
 }
 
-bool Manager::Blocked(const session::Context& ctx) {
+bool DetectRulePolicy::Blocked(const session::Context& ctx) {
     if (ctx.inbound.user_id <= 0) {
         return false;
     }
 
-    const auto rules_it = rules_.find(ctx.inbound.tag);
-    if (rules_it == rules_.end()) {
+    const auto rules = rules_.load(std::memory_order_acquire);
+    const auto rules_it = rules->find(ctx.inbound.tag);
+    if (rules_it == rules->end()) {
         return false;
     }
 

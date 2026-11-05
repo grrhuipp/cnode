@@ -168,6 +168,32 @@ void UdpFramer::Finish() const {
     pending_.Finish();
 }
 
+net::awaitable<buf::MultiBuffer> UdpFramer::ReadDatagram(
+    transport::MultiBufferReader& src,
+    const TargetAddress& session_target) {
+    for (;;) {
+        FramedUdpPacket packet;
+        if (Next(packet)) {
+            const TargetAddress& target = packet.target
+                ? *packet.target
+                : session_target;
+            for (buf::Buffer* buffer : packet.payload) {
+                if (buffer && !buffer->IsEmpty()) {
+                    buffer->SetUDP(target);
+                }
+            }
+            co_return std::move(packet.payload);
+        }
+
+        buf::MultiBuffer raw = co_await src.ReadMultiBuffer();
+        if (raw.byte_size() == 0) {
+            Finish();
+            co_return buf::MultiBuffer{};
+        }
+        Feed(std::move(raw));
+    }
+}
+
 net::awaitable<void> WriteUdpDatagram(
     transport::MultiBufferWriter& writer,
     buf::MultiBuffer payload,
@@ -199,20 +225,8 @@ net::awaitable<void> WriteUdpDatagram(
 
     ConstBufferSpanBuilder<1 + buf::MultiBuffer::kInlineCapacity> framed;
     framed.Append(net::buffer(header.data(), header_size));
-    for (const buf::Buffer* buffer : payload) {
-        if (!buffer || buffer->IsEmpty()) {
-            continue;
-        }
-        const auto bytes = buffer->Bytes();
-        framed.Append(net::buffer(bytes.data(), bytes.size()));
-    }
+    framed.AppendMultiBuffer(payload);
     co_await writer.WriteBuffers(framed.Span());
-}
-
-net::awaitable<void> WriteUdpDatagram(
-    transport::MultiBufferWriter& writer,
-    std::span<const net::const_buffer> payload) {
-    co_await WriteUdpDatagram(writer, TargetAddress{}, false, payload);
 }
 
 net::awaitable<void> WriteUdpDatagram(

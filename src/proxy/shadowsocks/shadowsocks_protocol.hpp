@@ -30,11 +30,9 @@ struct SsCipherInfo {
     static constexpr size_t tag_size = 16;
 };
 
-// 根据方法名获取密码参数（不区分大小写）
-// 支持: aes-128-gcm, aes-256-gcm, chacha20-ietf-poly1305
+// 根据方法名获取密码参数（不区分大小写），含 AEAD 与 2022-blake3 方法。
 [[nodiscard]] std::optional<SsCipherInfo> ParseCipherMethod(std::string_view method);
 [[nodiscard]] bool Is2022Cipher(SsCipherType type) noexcept;
-[[nodiscard]] bool Is2022Cipher(const SsCipherInfo& info) noexcept;
 [[nodiscard]] bool Is2022AesCipher(SsCipherType type) noexcept;
 [[nodiscard]] SsCipherType BaseCipherType(SsCipherType type) noexcept;
 

@@ -1,6 +1,8 @@
 #include "acppnode/app/proxyman/inbound/prepared_config.hpp"
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
+#include <array>
 #include <iostream>
+#include <stdexcept>
 #include <type_traits>
 #include <variant>
 
@@ -53,11 +55,44 @@ bool TestTypedClearStaysProtocolLocal() {
     Commit(UserStore::PrepareClearUsers(UserProtocol::Vmess, tag));
     return UserStore::VmessUsers(tag).empty() && UserStore::FindTrojanUser(tag, "hash");
 }
+
+// Two users deriving the same credential are ambiguous even when their source
+// text differs (VMess/VLESS parse UUIDs case- and hyphen-insensitively); the
+// update must fail before any snapshot is published.
+bool TestAmbiguousCredentialsRejected() {
+    constexpr std::string_view tag = "ambiguous-tag";
+    Commit(UserStore::PrepareUsers(tag, UserSet{PreparedVmessUsers{Vmess("kept", 1)}}));
+    const auto before = UserStore::CaptureSnapshot();
+    auto upper = Vmess("6BA7B810-9DAD-11D1-80B4-00C04FD430C8", 2);
+    auto lower = Vmess("6ba7b8109dad11d180b400c04fd430c8", 3);
+    upper.uuid_bytes.fill(0x6b);
+    lower.uuid_bytes.fill(0x6b);
+    PreparedVlessUser vless_a;
+    PreparedVlessUser vless_b;
+    const std::array<UserSet, 3> ambiguous{
+        UserSet{PreparedVmessUsers{upper, lower}},
+        UserSet{PreparedVlessUsers{vless_a, vless_b}},
+        UserSet{PreparedTrojanUsers{Trojan("same-hash", 4), Trojan("same-hash", 5)}}};
+    for (const auto& users : ambiguous) {
+        try {
+            static_cast<void>(UserStore::PrepareUsers(tag, users));
+            return false;
+        } catch (const std::invalid_argument&) {
+        }
+    }
+    return UserStore::CaptureSnapshot() == before &&
+           UserStore::VmessUsers(tag).size() == 1 &&
+           UserStore::VmessUsers(tag)[0].profile.user_id == 1;
+}
 }  // namespace
 
 int main() {
     if (!TestTypedUpdatesStayProtocolLocal() || !TestTypedClearStaysProtocolLocal()) {
         std::cerr << "typed replacement/clear crossed protocol storage boundaries\n";
+        return 1;
+    }
+    if (!TestAmbiguousCredentialsRejected()) {
+        std::cerr << "ambiguous credentials were published or silently merged\n";
         return 1;
     }
     UserStore::ClearWorkerView();

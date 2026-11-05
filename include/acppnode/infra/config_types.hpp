@@ -8,6 +8,7 @@
 #include "acppnode/proxy/sniff_config.hpp"
 #include "acppnode/transport/internet/stream_settings.hpp"
 #include "acppnode/transport/internet/inbound_listen.hpp"
+#include "acppnode/transport/internet/proxy_protocol_mode.hpp"
 
 #include <cstdint>
 #include <filesystem>
@@ -21,7 +22,7 @@ namespace acpp {
 // 日志配置
 // ============================================================================
 struct LogConfig {
-    std::string level = std::string(constants::logging::kDefaultLevel);  // trace/debug/info/warn/error
+    std::string level = std::string(constants::logging::kDefaultLevel);  // none/trace/debug/info/warning(warn)/error
     std::filesystem::path log_dir = std::filesystem::path(constants::paths::kDefaultLogDir);
     std::filesystem::path access_path;
     std::filesystem::path error_path;
@@ -74,6 +75,7 @@ struct StaticInboundConfig {
     StaticUserConfig static_users;
     StreamSettings stream_settings;
     SniffConfig sniffing;
+    ProxyProtocolMode proxy_protocol = ProxyProtocolMode::Auto;
     bool routing_enabled = false;
     std::optional<std::string> outbound_tag;
     static StaticInboundConfig FromJson(const json::object& j);

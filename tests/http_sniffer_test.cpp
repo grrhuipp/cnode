@@ -7,8 +7,7 @@
 namespace {
 
 acpp::SniffResult SniffHttp(std::string_view request) {
-    acpp::HttpSniffer sniffer;
-    return sniffer.Sniff(std::span<const uint8_t>(
+    return acpp::SniffHttp(std::span<const uint8_t>(
         reinterpret_cast<const uint8_t*>(request.data()), request.size()));
 }
 

@@ -18,7 +18,7 @@ public:
         auto packet = co_await read.Receive();
         // MultiBuffer links cannot represent an empty datagram independently
         // of EOF. Reject it explicitly instead of pretending the socket closed.
-        if (!buf::HasData(packet.payload))
+        if (packet.payload.byte_size() == 0)
             throw transport::LinkError(ErrorCode::INVALID_ARGUMENT);
         const TargetAddress source(iputil::NormalizeAddress(packet.source.address()),
                                    packet.source.port());

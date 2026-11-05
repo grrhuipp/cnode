@@ -56,9 +56,15 @@ void TestInvalidPortsAreRejected() {
     CheckInvalid(R"({"server_port":443.0})");
     CheckInvalid(R"({"server_port":null})");
     CheckInvalid(R"({"server_port":443,"cipher":123})");
-    CheckInvalid(R"({"server_port":443,"cipher":null})");
     CheckInvalid(R"({"server_port":443,"server_key":[]})");
     CheckInvalid(R"({"server_port":443,"server_key":false})");
+    CheckInvalid(R"({"server_port":443,"tls":3})");
+    CheckInvalid(R"({"server_port":443,"tls":"1"})");
+    CheckInvalid(R"({"server_port":443,"network":42})");
+    CheckInvalid(R"({"server_port":443,"networkSettings":"ws"})");
+    CheckInvalid(R"({"server_port":443,"base_config":{"pull_interval":-1}})");
+    CheckInvalid(R"({"server_port":443,"base_config":{"push_interval":"60"}})");
+    CheckInvalid(R"({"server_port":443,"base_config":{"pull_interval":4294967297}})");
 
     acpp::json::object source{
         {"server_port", std::numeric_limits<uint64_t>::max()},
@@ -118,6 +124,20 @@ void TestRealityNodeResponseIsNormalized() {
     CheckInvalid(R"({"server_port":443,"tls":2,"server_name":"www.apple.com","tls_settings":{"private_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","max_time_diff":-1}})");
 }
 
+void TestOptionalCipherNullValues() {
+    for (const auto* text : {
+             R"({"server_port":443})",
+             R"({"server_port":443,"cipher":null,"server_key":null})",
+             R"({"server_port":443,"cipher":"","server_key":""})"}) {
+        const auto result = ParseResponse(text);
+        Check(result.has_value() && result->CypherMethod.empty() &&
+                  result->ShadowsocksServerKey.empty(),
+              "optional cipher/server_key absence/null/empty must remain unset");
+    }
+    CheckInvalid(R"({"server_port":443,"cipher":42})");
+    CheckInvalid(R"({"server_port":443,"server_key":false})");
+}
+
 }  // namespace
 
 int main() {
@@ -125,6 +145,7 @@ int main() {
     TestInvalidPortsAreRejected();
     TestInvalidNetworkHostIsRejected();
     TestRealityNodeResponseIsNormalized();
+    TestOptionalCipherNullValues();
     std::cout << "v2board_node_info_json_test: ok\n";
     return 0;
 }

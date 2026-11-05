@@ -6,10 +6,10 @@
 #include <vector>
 
 int main() {
-    acpp::rule::Manager manager;
+    acpp::rule::DetectRulePolicy detect_rule_policy;
     constexpr std::string_view tag = "panel|vmess|443";
 
-    manager.UpdateRule(tag, {
+    detect_rule_policy.UpdateRule(tag, {
         acpp::rule::DetectRule{
             .Pattern = std::regex("blocked\\.example"),
         },
@@ -20,7 +20,7 @@ int main() {
     ctx.inbound.user_id = 42;
     ctx.inbound.user_email = "alice@example.com";
     ctx.outbound.target = acpp::TargetAddress("blocked.example", 443);
-    acpp::features::policy::RequestPolicy& policy = manager;
+    acpp::features::policy::RequestPolicy& policy = detect_rule_policy;
     if (!policy.Blocked(ctx)) return 2;
 
     if (!policy.Blocked(ctx)) return 3;
@@ -34,7 +34,7 @@ int main() {
     if (policy.Blocked(ctx)) return 6;
     ctx.inbound.tag = tag;
 
-    manager.UpdateRule(tag, {
+    detect_rule_policy.UpdateRule(tag, {
         acpp::rule::DetectRule{
             .Pattern = std::regex("replacement\\.example"),
         },
@@ -42,7 +42,7 @@ int main() {
     if (policy.Blocked(ctx)) return 7;
     ctx.outbound.target = acpp::TargetAddress("replacement.example", 443);
     if (!policy.Blocked(ctx)) return 8;
-    manager.UpdateRule(tag, {});
+    detect_rule_policy.UpdateRule(tag, {});
     if (policy.Blocked(ctx)) return 10;
     return 0;
 }

@@ -31,7 +31,6 @@ enum class Version : uint8_t {
 struct Request {
     bool is_connect = false;
     TargetAddress destination;
-    size_t consumed = 0;
 };
 
 struct EncodedRequest {
@@ -86,7 +85,6 @@ public:
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override;
 
-    void SetInitialDecoded(buf::MultiBuffer packet) noexcept;
     [[nodiscard]] buf::MultiBuffer TakePending() noexcept;
 private:
     transport::MultiBufferReader& reader_;

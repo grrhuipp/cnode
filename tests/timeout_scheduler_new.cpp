@@ -21,3 +21,4 @@ void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
     try { return ::operator new(size); } catch (...) { return nullptr; }
 }
 void operator delete(void* pointer, const std::nothrow_t&) noexcept { ::operator delete(pointer); }
+

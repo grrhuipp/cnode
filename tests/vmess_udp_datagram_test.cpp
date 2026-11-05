@@ -2,12 +2,14 @@
 #include "acppnode/common/buf/contiguous_buffer_view.hpp"
 #include "encoding/server.hpp"
 #include "vmess_cipher.hpp"
+#include "vmess_crypto.hpp"
 #include "acppnode/transport/internet/tcp_stream.hpp"
 
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/cancellation_signal.hpp>
 #include <asio/co_spawn.hpp>
 #include <asio/this_coro.hpp>
+#include <openssl/sha.h>
 
 #include <algorithm>
 #include <array>
@@ -76,12 +78,14 @@ vmess::VMessRequest MakeRequest(vmess::Security security, uint8_t options,
 class RequestEncoder {
 public:
     explicit RequestEncoder(const vmess::VMessRequest& request)
-        : cipher_(request.security, request.body_key.data(), request.body_iv.data())
+        : cipher_(request.security, request.body_key.data(), request.body_iv.data(),
+                  proxy::AeadDirection::Encrypt)
         , padding_((request.options & vmess::Option::GLOBAL_PADDING) != 0) {
         if ((request.options & vmess::Option::AUTHENTICATED_LENGTH) != 0) {
             const std::array<std::string_view, 1> path{"auth_len"};
             auto key = vmess::KDF16(request.body_key.data(), request.body_key.size(), path);
-            length_cipher_.emplace(request.security, key.data(), request.body_iv.data());
+            length_cipher_.emplace(request.security, key.data(), request.body_iv.data(),
+                                   proxy::AeadDirection::Encrypt);
         }
         if ((request.options & vmess::Option::CHUNK_MASKING) != 0) {
             mask_.emplace(request.body_iv.data());
@@ -120,6 +124,73 @@ public:
     }
 
 private:
+    vmess::VMessCipher cipher_;
+    std::optional<vmess::VMessCipher> length_cipher_;
+    std::optional<vmess::ShakeMask> mask_;
+    bool padding_;
+};
+
+// Response framing as Xray-core decodes it (DecodeResponseBody): payload
+// cipher and mask use the response key/IV, the authenticated length always
+// uses the request body key and the request body IV.
+class ResponseDecoder {
+public:
+    explicit ResponseDecoder(const vmess::VMessRequest& request)
+        : key_(Sha256(request.body_key))
+        , iv_(Sha256(request.body_iv))
+        , cipher_(request.security, key_.data(), iv_.data(), proxy::AeadDirection::Decrypt)
+        , padding_((request.options & vmess::Option::GLOBAL_PADDING) != 0) {
+        if ((request.options & vmess::Option::AUTHENTICATED_LENGTH) != 0) {
+            const std::array<std::string_view, 1> path{"auth_len"};
+            length_key_ = vmess::KDF16(request.body_key.data(), request.body_key.size(), path);
+            length_cipher_.emplace(request.security, length_key_.data(), request.body_iv.data(),
+                                   proxy::AeadDirection::Decrypt);
+        }
+        if ((request.options & vmess::Option::CHUNK_MASKING) != 0) {
+            mask_.emplace(iv_.data());
+        }
+    }
+
+    memory::ByteVector Decode(std::span<const uint8_t> wire, size_t& offset) {
+        const size_t padding = padding_ && mask_ ? mask_->NextMask() % 64 : 0;
+        const size_t header_size = length_cipher_ ? length_cipher_->Overhead() + 2 : 2;
+        Check(wire.size() - offset >= header_size, "VMess response chunk header truncated");
+        size_t total_size = 0;
+        if (length_cipher_) {
+            std::array<uint8_t, 2> length{};
+            Check(length_cipher_->Decrypt(wire.data() + offset, header_size, length.data()) ==
+                      static_cast<ssize_t>(length.size()),
+                  "VMess response authenticated length does not decrypt with the request IV");
+            total_size = ((size_t{length[0]} << 8) | length[1]) + length_cipher_->Overhead();
+        } else {
+            auto length = static_cast<uint16_t>((wire[offset] << 8) | wire[offset + 1]);
+            if (mask_) {
+                length ^= mask_->NextMask();
+            }
+            total_size = length;
+        }
+        offset += header_size;
+        Check(total_size >= padding + cipher_.Overhead() && wire.size() - offset >= total_size,
+              "VMess response chunk body truncated");
+        const size_t sealed_size = total_size - padding;
+        memory::ByteVector payload(sealed_size - cipher_.Overhead());
+        Check(cipher_.Decrypt(wire.data() + offset, sealed_size, payload.data()) ==
+                  static_cast<ssize_t>(payload.size()),
+              "VMess response chunk payload failed authentication");
+        offset += total_size;
+        return payload;
+    }
+
+private:
+    static std::array<uint8_t, SHA256_DIGEST_LENGTH> Sha256(const std::array<uint8_t, 16>& value) {
+        std::array<uint8_t, SHA256_DIGEST_LENGTH> digest{};
+        SHA256(value.data(), value.size(), digest.data());
+        return digest;
+    }
+
+    std::array<uint8_t, SHA256_DIGEST_LENGTH> key_;
+    std::array<uint8_t, SHA256_DIGEST_LENGTH> iv_;
+    std::array<uint8_t, 16> length_key_{};
     vmess::VMessCipher cipher_;
     std::optional<vmess::VMessCipher> length_cipher_;
     std::optional<vmess::ShakeMask> mask_;
@@ -226,8 +297,8 @@ void TestCancellationResume(vmess::Security security, uint8_t options,
     const auto later_wire = encoder.Encode(later_payload);
     const auto eof_wire = encoder.Encode({});
     const size_t request_prefix = payload_size > buf::Buffer::kSize ? 1 : 0;
-    request.SetPendingData(std::span<const uint8_t>(wire).first(request_prefix));
     Connection connection;
+    connection.stream.PrependReadData(std::span<const uint8_t>(wire).first(request_prefix));
     vmess::TimedUserValidator validator;
     vmess::encoding::ServerSession session(validator, "cancellation-test");
     session.SetRequest(request);
@@ -290,17 +361,27 @@ void TestTransportEOF(vmess::Security security, uint8_t options, size_t prefix_s
     RequestEncoder encoder(request);
     const auto payload = MakePayload(113, 0x57);
     const auto wire = encoder.Encode(payload);
-    // Also cover bytes coalesced with the request header, not only transport
-    // pending data. Cancellation must preserve progress from either source.
-    request.SetPendingData(std::span<const uint8_t>(wire).first(prefix_size));
     Connection connection;
+    connection.stream.PrependReadData(std::span<const uint8_t>(wire).first(prefix_size));
     vmess::TimedUserValidator validator;
     vmess::encoding::ServerSession session(validator, "transport-eof-test");
     session.SetRequest(request);
     auto reader = session.DecodeRequestBody(connection.stream);
     CancelBlockedRead(connection, *reader, false);
     connection.peer.shutdown(tcp::socket::shutdown_send);
-    Check(ReadReady(connection, *reader).empty(), "real VMess TCP EOF became a cancellation error");
+    if (prefix_size == 0) {
+        Check(ReadReady(connection, *reader).empty(),
+              "real VMess TCP EOF became a cancellation error");
+    } else {
+        // EOF inside a record is truncation, never a clean end of body.
+        bool reset = false;
+        try {
+            static_cast<void>(ReadReady(connection, *reader));
+        } catch (const IoSystemError& error) {
+            reset = error.code() == io_error::connection_reset;
+        }
+        Check(reset, "truncated VMess record ended as a clean EOF");
+    }
     Check(ReadReady(connection, *reader).empty(), "real VMess TCP EOF was not permanent");
 }
 
@@ -358,6 +439,64 @@ void TestEncryptedCancellation() {
     }
 }
 
+void WriteReady(Connection& connection, transport::MultiBufferWriter& writer,
+                buf::MultiBuffer payload) {
+    bool completed = false;
+    std::exception_ptr failure;
+    connection.io.restart();
+    net::co_spawn(connection.io, writer.WriteMultiBuffer(std::move(payload)),
+        [&](std::exception_ptr error) {
+            failure = error;
+            completed = true;
+        });
+    connection.io.run_for(std::chrono::seconds(1));
+    Check(completed && !failure, "VMess response write failed");
+}
+
+// A server response with AUTHENTICATED_LENGTH must decode with Xray-core's
+// nonce choice; the production client decoder cannot prove this alone.
+void TestResponseAuthenticatedLength(vmess::Security security) {
+    constexpr size_t kResponseHeaderSize = 38;
+    const uint8_t options = vmess::Option::CHUNK_STREAM | vmess::Option::CHUNK_MASKING |
+        vmess::Option::GLOBAL_PADDING | vmess::Option::AUTHENTICATED_LENGTH;
+    const auto request = MakeRequest(security, options, vmess::Command::TCP);
+    Connection connection;
+    vmess::TimedUserValidator validator;
+    vmess::encoding::ServerSession session(validator, "response-length-test");
+    session.SetRequest(request);
+    auto writer = session.EncodeResponseBodyWithHeader(connection.stream);
+    Check(writer != nullptr, "VMess response writer was not created");
+
+    const std::array<std::pair<size_t, uint8_t>, 2> chunks{{{113, 0x5a}, {257, 0x3c}}};
+    for (const auto& [size, value] : chunks) {
+        buf::MultiBuffer payload;
+        payload.push_back(MakeBuffer(size, nullptr, value));
+        WriteReady(connection, *writer, std::move(payload));
+    }
+
+    memory::ByteVector wire;
+    connection.peer.non_blocking(true);
+    for (;;) {
+        std::array<uint8_t, 4096> block{};
+        IoErrorCode ec;
+        const size_t n = connection.peer.read_some(net::buffer(block), ec);
+        if (ec) break;
+        wire.insert(wire.end(), block.begin(), block.begin() + n);
+    }
+    Check(wire.size() > kResponseHeaderSize, "VMess response was not written");
+
+    ResponseDecoder decoder(request);
+    size_t offset = kResponseHeaderSize;
+    for (const auto& [size, value] : chunks) {
+        const auto payload = decoder.Decode(wire, offset);
+        Check(payload.size() == size &&
+                  std::all_of(payload.begin(), payload.end(),
+                              [value](uint8_t byte) { return byte == value; }),
+              "VMess response chunk payload changed");
+    }
+    Check(offset == wire.size(), "VMess response carried unexpected trailing bytes");
+}
+
 }  // namespace
 
 int main() {
@@ -410,6 +549,8 @@ int main() {
         "wrong fixed VMess UDP endpoint was accepted");
 
     TestEncryptedCancellation();
+    TestResponseAuthenticatedLength(vmess::Security::AES_128_GCM);
+    TestResponseAuthenticatedLength(vmess::Security::CHACHA20_POLY1305);
 
     return 0;
 }

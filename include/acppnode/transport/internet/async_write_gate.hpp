@@ -59,10 +59,6 @@ public:
     };
 
     AsyncWriteGate() noexcept = default;
-
-    explicit AsyncWriteGate(net::io_context&) noexcept {}
-
-    explicit AsyncWriteGate(const net::any_io_executor&) noexcept {}
     AsyncWriteGate(const AsyncWriteGate&) = delete;
     AsyncWriteGate& operator=(const AsyncWriteGate&) = delete;
 

@@ -163,9 +163,10 @@ private:
 };
 
 // Applies comparison to every object, including those nested in arrays.
-// AsciiCaseInsensitive stores ASCII-lowercase keys and rejects equivalent
-// duplicates without changing string values. CaseSensitive preserves key spelling
-// and retains last-value-wins for identical keys.
+// AsciiCaseInsensitive stores ASCII-lowercase keys without changing string
+// values; CaseSensitive preserves key spelling. Keys equal under the chosen
+// comparison are duplicates and reject the document, as does nesting deeper
+// than 128 arrays/objects.
 [[nodiscard]] value parse(
     std::string_view text,
     KeyComparison comparison = KeyComparison::CaseSensitive);

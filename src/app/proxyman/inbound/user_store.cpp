@@ -4,6 +4,10 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <format>
+#include <stdexcept>
+#include <string_view>
+#include <unordered_set>
 #include <utility>
 
 namespace acpp::proxyman::inbound {
@@ -48,6 +52,7 @@ struct UserStore::Snapshot {
 
 struct UserStore::WorkerLease {
     PublishedSnapshot snapshot;
+    uint64_t revision;
 };
 
 namespace {
@@ -63,36 +68,36 @@ UserStore::WorkerView& LocalView() {
     return view;
 }
 
-uint64_t& LocalRevision() noexcept {
-    static thread_local uint64_t revision = 0;
-    return revision;
-}
 
+// Two users deriving one credential would let authentication pick an
+// arbitrary owner for traffic, limits and online devices; reject the update.
+[[noreturn]] void ThrowAmbiguousCredential(std::string_view protocol) {
+    throw std::invalid_argument(std::format("{} users share one credential", protocol));
+}
 
 UserStore::VmessCredential
 BuildVmessCredential(const PreparedVmessUser& user) {
-    return UserStore::VmessCredential{
+    UserStore::VmessCredential credential{
         .uuid_bytes = user.uuid_bytes,
         .cmd_key = user.cmd_key,
-        .auth_key = user.auth_key,
-        .cached_auth_aes_key = user.cached_auth_aes_key,
+        .auth_id_key = {},
         .profile = user.profile,
     };
+    if (AES_set_decrypt_key(user.auth_key.data(), 128, &credential.auth_id_key) != 0) {
+        throw std::logic_error("VMess AuthID key schedule rejected a 128-bit key");
+    }
+    return credential;
 }
 
 std::shared_ptr<const UserStore::VmessUserMap>
 BuildVmessUsers(const std::vector<PreparedVmessUser>& users) {
     auto list = std::make_shared<UserStore::VmessUserMap>();
     list->reserve(users.size());
-    std::unordered_map<std::string_view, size_t> index_by_uuid;
-    index_by_uuid.reserve(users.size());
+    std::unordered_set<std::array<uint8_t, 16>, UserStore::Array16Hash> seen;
+    seen.reserve(users.size());
     for (const auto& user : users) {
-        auto [it, inserted] = index_by_uuid.emplace(user.uuid, list->size());
-        if (inserted) {
-            list->push_back(BuildVmessCredential(user));
-        } else {
-            (*list)[it->second] = BuildVmessCredential(user);
-        }
+        if (!seen.insert(user.uuid_bytes).second) ThrowAmbiguousCredential("VMess");
+        list->push_back(BuildVmessCredential(user));
     }
     return list;
 }
@@ -111,7 +116,9 @@ BuildVlessUsers(const std::vector<PreparedVlessUser>& users) {
     auto map = std::make_shared<UserStore::VlessUserMap>();
     map->reserve(users.size());
     for (const auto& user : users) {
-        (*map)[user.uuid_bytes] = BuildVlessCredential(user);
+        if (!map->try_emplace(user.uuid_bytes, BuildVlessCredential(user)).second) {
+            ThrowAmbiguousCredential("VLESS");
+        }
     }
     return map;
 }
@@ -128,7 +135,9 @@ BuildTrojanUsers(const std::vector<PreparedTrojanUser>& users) {
     auto map = std::make_shared<UserStore::TrojanUserMap>();
     map->reserve(users.size());
     for (const auto& user : users) {
-        (*map)[user.password_hash] = BuildTrojanCredential(user);
+        if (!map->try_emplace(user.password_hash, BuildTrojanCredential(user)).second) {
+            ThrowAmbiguousCredential("Trojan");
+        }
     }
     return map;
 }
@@ -139,7 +148,6 @@ BuildShadowsocksCredential(const PreparedShadowsocksUser& user) {
         .derived_key = user.derived_key,
         .identity_key = user.identity_key,
         .psk_hash = user.psk_hash,
-        .cipher_type = user.cipher_type,
         .key_size = user.key_size,
         .salt_size = user.salt_size,
         .profile = user.profile,
@@ -150,7 +158,12 @@ std::shared_ptr<const UserStore::ShadowsocksUserList>
 BuildShadowsocksUsers(const std::vector<PreparedShadowsocksUser>& users) {
     auto list = std::make_shared<UserStore::ShadowsocksUserList>();
     list->reserve(users.size());
+    std::unordered_set<std::string_view> seen;
+    seen.reserve(users.size());
     for (const auto& user : users) {
+        const std::string_view key(
+            reinterpret_cast<const char*>(user.derived_key.data()), user.derived_key.size);
+        if (!seen.insert(key).second) ThrowAmbiguousCredential("Shadowsocks");
         list->push_back(BuildShadowsocksCredential(user));
     }
     return list;
@@ -169,7 +182,9 @@ BuildAnyTlsUsers(const std::vector<PreparedAnyTlsUser>& users) {
     auto map = std::make_shared<UserStore::AnyTlsUserMap>();
     map->reserve(users.size());
     for (const auto& user : users) {
-        (*map)[user.password_hash] = BuildAnyTlsCredential(user);
+        if (!map->try_emplace(user.password_hash, BuildAnyTlsCredential(user)).second) {
+            ThrowAmbiguousCredential("AnyTLS");
+        }
     }
     return map;
 }
@@ -226,12 +241,22 @@ UserStore::PublishedSnapshot UserStore::CaptureSnapshot() {
 }
 
 UserStore::WorkerView UserStore::PrepareWorkerView(PublishedSnapshot snapshot) {
-    return std::make_shared<const WorkerLease>(WorkerLease{std::move(snapshot)});
+    static std::atomic<uint64_t> next_revision{1};
+    return std::make_shared<const WorkerLease>(WorkerLease{
+        std::move(snapshot), next_revision.fetch_add(1, std::memory_order_relaxed)});
 }
 
 void UserStore::InstallWorkerView(WorkerView view) noexcept {
     LocalView() = std::move(view);
-    ++LocalRevision();
+}
+
+UserStore::WorkerView UserStore::ExchangeWorkerView(WorkerView view) noexcept {
+    LocalView().swap(view);
+    return view;
+}
+
+UserStore::WorkerView UserStore::CaptureWorkerView() noexcept {
+    return LocalView();
 }
 
 void UserStore::ClearWorkerView() noexcept {
@@ -239,7 +264,8 @@ void UserStore::ClearWorkerView() noexcept {
 }
 
 uint64_t UserStore::WorkerViewRevision() noexcept {
-    return LocalRevision();
+    const auto& view = LocalView();
+    return view ? view->revision : 0;
 }
 
 void UserStore::CommitSnapshot(PublishedSnapshot snapshot) noexcept {

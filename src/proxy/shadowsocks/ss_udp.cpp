@@ -1,4 +1,5 @@
 #include "ss_udp.hpp"
+#include "acppnode/common/byte_reader.hpp"
 #include "shadowsocks_crypto.hpp"
 #include "acppnode/common/address_codec.hpp"
 #include "acppnode/common/allocator.hpp"
@@ -44,7 +45,7 @@ struct Parsed2022Body {
                                             const uint8_t* payload,
                                             size_t payload_len,
                                             std::span<uint8_t> plaintext) noexcept {
-    const size_t addr_size = AddressEncodedSize(target, AddressWireFormat::Socks5);
+    const size_t addr_size = AddressEncodedSize(target);
     if (addr_size == 0 || plaintext.size() != addr_size + payload_len) {
         return false;
     }
@@ -58,7 +59,7 @@ struct Parsed2022Body {
                                                 const uint8_t* payload,
                                                 size_t payload_len,
                                                 std::span<uint8_t> plaintext) noexcept {
-    const size_t addr_size = AddressEncodedSize(target, AddressWireFormat::Socks5);
+    const size_t addr_size = AddressEncodedSize(target);
     constexpr size_t kHeaderSize = 1 + 8 + 2;
     if (addr_size == 0 || plaintext.size() != kHeaderSize + addr_size + payload_len) {
         return false;
@@ -68,9 +69,9 @@ struct Parsed2022Body {
     }
     size_t pos = 0;
     plaintext[pos++] = kSs2022ClientPacket;
-    PutU64BE(plaintext.data() + pos, UnixSecondsNow());
+    StoreU64BE(plaintext.data() + pos, UnixSecondsNow());
     pos += 8;
-    PutU16BE(plaintext.data() + pos, 0);
+    StoreU16BE(plaintext.data() + pos, 0);
     pos += 2;
     return EncodeAddressTo(target, plaintext.data() + pos, addr_size, AddressWireFormat::Socks5) == addr_size;
 }
@@ -80,7 +81,7 @@ struct Parsed2022Body {
                                                 size_t payload_len,
                                                 std::span<const uint8_t, 8> client_session_id,
                                                 std::span<uint8_t> plaintext) noexcept {
-    const size_t addr_size = AddressEncodedSize(target, AddressWireFormat::Socks5);
+    const size_t addr_size = AddressEncodedSize(target);
     constexpr size_t kHeaderSize = 1 + 8 + 8 + 2;
     if (addr_size == 0 || plaintext.size() != kHeaderSize + addr_size + payload_len) {
         return false;
@@ -90,11 +91,11 @@ struct Parsed2022Body {
     }
     size_t pos = 0;
     plaintext[pos++] = kSs2022ServerPacket;
-    PutU64BE(plaintext.data() + pos, UnixSecondsNow());
+    StoreU64BE(plaintext.data() + pos, UnixSecondsNow());
     pos += 8;
     std::memcpy(plaintext.data() + pos, client_session_id.data(), client_session_id.size());
     pos += client_session_id.size();
-    PutU16BE(plaintext.data() + pos, 0);
+    StoreU16BE(plaintext.data() + pos, 0);
     pos += 2;
     return EncodeAddressTo(target, plaintext.data() + pos, addr_size, AddressWireFormat::Socks5) == addr_size;
 }
@@ -106,10 +107,10 @@ struct Parsed2022Body {
     if (plaintext.size() < kMinHeader || plaintext[0] != kSs2022ClientPacket) {
         return std::nullopt;
     }
-    if (!TimestampFresh(GetU64BE(plaintext.data() + 1), UnixSecondsNow())) {
+    if (!TimestampFresh(LoadU64BE(plaintext.data() + 1), UnixSecondsNow())) {
         return std::nullopt;
     }
-    const size_t padding_len = GetU16BE(plaintext.data() + 1 + 8);
+    const size_t padding_len = LoadU16BE(plaintext.data() + 1 + 8);
     size_t pos = kMinHeader;
     if (pos + padding_len > plaintext.size()) {
         return std::nullopt;
@@ -137,7 +138,7 @@ struct Parsed2022Body {
     if (plaintext.size() < kMinHeader || plaintext[0] != kSs2022ServerPacket) {
         return std::nullopt;
     }
-    if (!TimestampFresh(GetU64BE(plaintext.data() + 1), UnixSecondsNow())) {
+    if (!TimestampFresh(LoadU64BE(plaintext.data() + 1), UnixSecondsNow())) {
         return std::nullopt;
     }
     if (!std::equal(expected_client_session_id.begin(),
@@ -145,7 +146,7 @@ struct Parsed2022Body {
                    plaintext.begin() + 1 + 8)) {
         return std::nullopt;
     }
-    const size_t padding_len = GetU16BE(plaintext.data() + 1 + 8 + 8);
+    const size_t padding_len = LoadU16BE(plaintext.data() + 1 + 8 + 8);
     size_t pos = kMinHeader;
     if (pos + padding_len > plaintext.size()) {
         return std::nullopt;
@@ -398,7 +399,8 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
                 previous_identity = identity_plain;
             }
 
-            if (previous_identity != user.psk_hash) {
+            if (CRYPTO_memcmp(previous_identity.data(), user.psk_hash.data(),
+                              previous_identity.size()) != 0) {
                 continue;
             }
             body_offset += kSs2022UdpSeparateHeaderSize;
@@ -431,7 +433,7 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
         if (!parsed) {
             continue;
         }
-        const uint64_t packet_id = GetU64BE(
+        const uint64_t packet_id = LoadU64BE(
             separate.data() + kSs2022UdpSessionIdSize);
         if (!replay_cache.Accept(user.derived_key.span(), client_session_id, packet_id)) {
             return std::nullopt;
@@ -475,7 +477,7 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
 
         std::array<uint8_t, 8> client_session_id{};
         std::memcpy(client_session_id.data(), plaintext.data(), client_session_id.size());
-        const uint64_t packet_id = GetU64BE(
+        const uint64_t packet_id = LoadU64BE(
             plaintext.data() + kSs2022UdpSessionIdSize);
         const auto body = std::span<const uint8_t>(plaintext).subspan(
             kSs2022UdpSessionIdSize + kSs2022UdpPacketIdSize);
@@ -509,7 +511,7 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
         return 0;
     }
 
-    const size_t addr_size = AddressEncodedSize(target, AddressWireFormat::Socks5);
+    const size_t addr_size = AddressEncodedSize(target);
     if (addr_size == 0) {
         return 0;
     }
@@ -565,7 +567,7 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
         return 0;
     }
 
-    const size_t addr_size = AddressEncodedSize(target, AddressWireFormat::Socks5);
+    const size_t addr_size = AddressEncodedSize(target);
     if (addr_size == 0) {
         return 0;
     }
@@ -599,7 +601,7 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
     std::memcpy(separate.data(),
                 response ? state.server_session_id.data() : state.client_session_id.data(),
                 kSs2022UdpSessionIdSize);
-    PutU64BE(separate.data() + kSs2022UdpSessionIdSize, state.next_packet_id);
+    StoreU64BE(separate.data() + kSs2022UdpSessionIdSize, state.next_packet_id);
 
     const KeyBytes* header_key = response ? &state.key : body_key;
     if (!response && !psk_chain.empty()) {
@@ -667,7 +669,7 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
         return 0;
     }
 
-    const size_t addr_size = AddressEncodedSize(target, AddressWireFormat::Socks5);
+    const size_t addr_size = AddressEncodedSize(target);
     if (addr_size == 0) {
         return 0;
     }
@@ -697,7 +699,7 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
     std::memcpy(cipher_out,
                 response ? state.server_session_id.data() : state.client_session_id.data(),
                 kSs2022UdpSessionIdSize);
-    PutU64BE(cipher_out + kSs2022UdpSessionIdSize, state.next_packet_id);
+    StoreU64BE(cipher_out + kSs2022UdpSessionIdSize, state.next_packet_id);
 
     std::array<uint8_t, 24> nonce{};
     if (!RandomBytes(nonce)) {
@@ -777,7 +779,7 @@ bool Ss2022UdpReplayCache::Accept(
     std::chrono::steady_clock::time_point now) {
     SessionKey key;
     if (authenticated_key.empty() || !key.credential.assign(authenticated_key)) return false;
-    key.session_id = GetU64BE(session_id.data());
+    key.session_id = LoadU64BE(session_id.data());
     auto it = sessions_.find(key);
     if (it != sessions_.end()) {
         if (now - it->second.last_seen < kRetention) {
@@ -985,7 +987,7 @@ bool Init2022UdpSessionState(
     const SsCipherInfo& cipher_info,
     const KeyBytes& key) {
 
-    if (!Is2022Cipher(cipher_info) || key.empty()) {
+    if (!Is2022Cipher(cipher_info.type) || key.empty()) {
         return false;
     }
     state = Ss2022UdpSessionState{};
@@ -1042,7 +1044,7 @@ std::optional<SsUdpDecodeResult> Decode2022UdpResponsePacket(
     size_t datagram_len,
     Ss2022UdpSessionState& state) {
 
-    if (!Is2022Cipher(state.cipher_info) || state.key.empty()) {
+    if (!Is2022Cipher(state.cipher_info.type) || state.key.empty()) {
         return std::nullopt;
     }
 
@@ -1064,7 +1066,7 @@ std::optional<SsUdpDecodeResult> Decode2022UdpResponsePacket(
         }
         std::memcpy(
             server_session_id.data(), separate.data(), server_session_id.size());
-        packet_id = GetU64BE(separate.data() + kSs2022UdpSessionIdSize);
+        packet_id = LoadU64BE(separate.data() + kSs2022UdpSessionIdSize);
         const size_t body_offset = kSs2022UdpSeparateHeaderSize;
         const size_t ciphertext_len = datagram_len - body_offset;
         plaintext.resize(ciphertext_len - SsAeadCipher::kTagSize);
@@ -1104,7 +1106,7 @@ std::optional<SsUdpDecodeResult> Decode2022UdpResponsePacket(
         }
         std::memcpy(
             server_session_id.data(), plaintext.data(), server_session_id.size());
-        packet_id = GetU64BE(
+        packet_id = LoadU64BE(
             plaintext.data() + kSs2022UdpSessionIdSize);
         body_span = std::span<const uint8_t>(plaintext).subspan(
             kSs2022UdpSessionIdSize + kSs2022UdpPacketIdSize);

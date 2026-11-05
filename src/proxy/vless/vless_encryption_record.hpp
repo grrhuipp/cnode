@@ -30,7 +30,7 @@ enum class VlessEncryptionAeadCipher : uint8_t {
 [[nodiscard]] std::array<uint8_t, kVlessEncryptionLengthSize>
 EncodeVlessEncryptionLength(size_t length) noexcept;
 
-[[nodiscard]] std::optional<uint16_t> DecodeVlessEncryptionLength(
+[[nodiscard]] uint16_t DecodeVlessEncryptionLength(
     std::span<const uint8_t, kVlessEncryptionLengthSize> encoded) noexcept;
 
 [[nodiscard]] bool EncodeVlessEncryptionRecordHeader(

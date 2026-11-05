@@ -3,6 +3,7 @@
 #include <blake3.h>
 #include <openssl/aead.h>
 #include <openssl/err.h>
+#include <openssl/mem.h>
 
 #include <algorithm>
 
@@ -34,6 +35,7 @@ DeriveAeadKey(std::span<const uint8_t> context,
         blake3_hasher_update(&hasher, key.data(), key.size());
     }
     blake3_hasher_finalize(&hasher, out.data(), out.size());
+    OPENSSL_cleanse(&hasher, sizeof(hasher));
     return out;
 }
 
@@ -48,7 +50,7 @@ EncodeVlessEncryptionLength(size_t length) noexcept {
     };
 }
 
-std::optional<uint16_t> DecodeVlessEncryptionLength(
+uint16_t DecodeVlessEncryptionLength(
     std::span<const uint8_t, kVlessEncryptionLengthSize> encoded) noexcept {
     return static_cast<uint16_t>(
         (static_cast<uint16_t>(encoded[0]) << 8) |
@@ -112,15 +114,17 @@ std::optional<VlessEncryptionAead> VlessEncryptionAead::Create(
     }
 
     VlessEncryptionAead aead;
-    const auto derived = DeriveAeadKey(context, key);
+    auto derived = DeriveAeadKey(context, key);
     aead.cipher_ = cipher;
-    if (EVP_AEAD_CTX_init(
-            &aead.aead_ctx_,
-            algorithm,
-            derived.data(),
-            derived.size(),
-            kVlessEncryptionTagSize,
-            nullptr) != 1) {
+    const bool initialized = EVP_AEAD_CTX_init(
+                                 &aead.aead_ctx_,
+                                 algorithm,
+                                 derived.data(),
+                                 derived.size(),
+                                 kVlessEncryptionTagSize,
+                                 nullptr) == 1;
+    OPENSSL_cleanse(derived.data(), derived.size());
+    if (!initialized) {
         ERR_clear_error();
         return std::nullopt;
     }

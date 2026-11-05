@@ -232,7 +232,7 @@ async def outbound_case(binary, output, mode):
                           'port': port, 'routingEnabled': True,
                           'settings': {'clients': [{'id': str(uuid.UUID(bytes=USER_ID))}]}}],
         'outbounds.json': [{'tag': 'negotiation-out', 'protocol': 'anytls',
-                           'settings': {'server': '127.0.0.1', 'server_port': server.sockets[0].getsockname()[1],
+                           'settings': {'address': '127.0.0.1', 'port': server.sockets[0].getsockname()[1],
                                         'password': 'secret', 'minIdleSession': 1},
                            'streamSettings': {'network': 'tcp', 'security': 'tls',
                                               'tlsSettings': {'serverName': 'localhost', 'allowInsecure': True}}}],

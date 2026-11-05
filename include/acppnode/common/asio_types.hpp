@@ -21,41 +21,14 @@ using udp = net::ip::udp;
 using IoErrorCode = std::error_code;
 using IoSystemError = std::system_error;
 
+// asio's default channel traits store queued values in std::deque; RingDeque
+// keeps an idle channel at zero bytes and returns storage once drained.
 template <typename... Signatures>
 struct ChannelTraits {
     template <typename... NewSignatures>
     struct rebind {
         using other = ChannelTraits<NewSignatures...>;
     };
-};
-
-template <typename R>
-struct ChannelTraits<R(asio::error_code)> {
-    template <typename... NewSignatures>
-    struct rebind {
-        using other = ChannelTraits<NewSignatures...>;
-    };
-
-    template <typename Element>
-    struct container {
-        using type = memory::RingDeque<Element>;
-    };
-
-    using receive_cancelled_signature = R(asio::error_code);
-
-    template <typename F>
-    static void invoke_receive_cancelled(F f) {
-        const asio::error_code e = asio::experimental::error::channel_cancelled;
-        static_cast<F&&>(f)(e);
-    }
-
-    using receive_closed_signature = R(asio::error_code);
-
-    template <typename F>
-    static void invoke_receive_closed(F f) {
-        const asio::error_code e = asio::experimental::error::channel_closed;
-        static_cast<F&&>(f)(e);
-    }
 };
 
 template <typename R, typename... Args, typename... Signatures>

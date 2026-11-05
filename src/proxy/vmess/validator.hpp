@@ -28,9 +28,9 @@ namespace vmess {
 // TimedUserValidator — 用户验证器
 //
 // 线程模型：
-//   - 认证用户表为进程级唯一只读快照；热路径仅借 Worker 独立 lease
-//   - 面板/静态更新在有界冷入口安装 Worker view 后发布
-//   - 在线追踪与热点凭据指针缓存均为 Worker 私有状态
+//   - Credentials are immutable snapshots leased by the current session domain.
+//   - Online leases and hot credential caches stay in that stable domain.
+//   - Replay admission runs on the bounded process control coordinator.
 // ============================================================================
 class TimedUserValidator : public UserOnlineTracker {
 public:
@@ -39,8 +39,6 @@ public:
 
     TimedUserValidator(const TimedUserValidator&) = delete;
     TimedUserValidator& operator=(const TimedUserValidator&) = delete;
-    TimedUserValidator(TimedUserValidator&&) noexcept;
-    TimedUserValidator& operator=(TimedUserValidator&&) noexcept;
 
     // 通过 AuthID 查找用户，限定 tag（优化：O(N_tag) 而非 O(N_total)）
     std::shared_ptr<const proxyman::inbound::UserStore::VmessCredential>
@@ -50,7 +48,7 @@ public:
 
     // Records AEAD request body key/IV for replay protection.
     // Returns false if the same user/key/IV tuple is still inside the replay window.
-    [[nodiscard]] bool RegisterSessionIfNew(
+    [[nodiscard]] net::awaitable<bool> RegisterSessionIfNew(
         const proxyman::inbound::UserStore::VmessCredential& user,
         const std::array<uint8_t, 16>& body_key,
         const std::array<uint8_t, 16>& body_iv) const;

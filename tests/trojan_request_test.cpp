@@ -57,22 +57,38 @@ void TestRequest(acpp::trojan::TrojanCommand command, const acpp::TargetAddress&
     expected.insert(expected.end(), payload.begin(), payload.end());
     std::array<uint8_t, 512> output{};
     reject_allocation = true;
-    const auto length = acpp::trojan::TrojanCodec::EncodeRequestTo(
+    const auto length = acpp::trojan::EncodeRequestTo(
         hash, command, target, output.data(), output.size(), payload.data(), payload.size());
     reject_allocation = false;
     Check(length == expected.size(), "request size mismatch");
     Check(std::equal(expected.begin(), expected.end(), output.begin()), "Trojan wire bytes changed");
 
-    size_t consumed = 0;
-    const auto parsed = acpp::trojan::TrojanCodec::ParseRequest(output.data(), length, consumed);
-    Check(parsed && consumed == header_size, "request parser did not preserve trailing payload");
-    Check(parsed->command == command && parsed->target.SameEndpoint(target), "request metadata changed");
-    Check(std::string_view(parsed->password_hash.data(), parsed->password_hash.size()) == expected_hash,
-          "authentication digest changed");
+    using acpp::trojan::RequestDecodeStatus;
+    const auto decoded = acpp::trojan::DecodeRequest(std::span<const uint8_t>(output.data(), length));
+    Check(decoded.status == RequestDecodeStatus::Complete && decoded.consumed == header_size,
+          "request parser did not preserve trailing payload");
+    Check(decoded.request.command == command && decoded.request.target.SameEndpoint(target),
+          "request metadata changed");
+    Check(decoded.request.PasswordHashView() == expected_hash, "authentication digest changed");
+
+    // Each Incomplete result names the next boundary and never asks past the
+    // header, so a reader driven by it cannot consume payload bytes.
+    size_t available = 0;
+    for (;;) {
+        const auto step = acpp::trojan::DecodeRequest(std::span<const uint8_t>(output.data(), available));
+        if (step.status == RequestDecodeStatus::Complete) {
+            Check(step.consumed == header_size, "incremental Trojan decode consumed a different header");
+            break;
+        }
+        Check(step.status == RequestDecodeStatus::Incomplete && step.required > available &&
+                  step.required <= header_size,
+              "incremental Trojan decode asked beyond the request header");
+        available = step.required;
+    }
 
     output.fill(0x5a);
     reject_allocation = true;
-    const auto short_length = acpp::trojan::TrojanCodec::EncodeRequestTo(
+    const auto short_length = acpp::trojan::EncodeRequestTo(
         hash, command, target, output.data(), expected.size() - 1, payload.data(), payload.size());
     reject_allocation = false;
     Check(short_length == 0 && std::all_of(output.begin(), output.end(), [](auto b) { return b == 0x5a; }),

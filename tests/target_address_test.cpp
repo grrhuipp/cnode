@@ -84,13 +84,10 @@ int main() {
         const acpp::iputil::AddressText text(test.address);
         if (!Require(text.View() == test.text, "numeric IP text or scope changed")) return 12;
         const acpp::TargetAddress target(test.address, 65535);
-        acpp::memory::ThreadLocalString destination;
-        target.ToStringInto(destination);
         std::array<char, 128> logged;
         const auto end = std::format_to(logged.begin(), "{}", target);
-        if (!Require(destination == test.endpoint &&
-                         std::string_view(logged.data(), end - logged.begin()) == test.endpoint,
-                     "routing and logging must preserve normalized endpoint text")) return 13;
+        if (!Require(std::string_view(logged.data(), end - logged.begin()) == test.endpoint,
+                     "logging must preserve normalized endpoint text")) return 13;
     }
     const acpp::net::ip::address_v6 named_scope(
         acpp::net::ip::make_address_v6("fe80::1").to_bytes(), 1);

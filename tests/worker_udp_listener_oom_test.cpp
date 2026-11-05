@@ -202,7 +202,7 @@ void Send(acpp::udp::socket& sender, const acpp::udp::endpoint& target,
 struct Fixture {
     explicit Fixture(TargetedPmrResource& resource)
         : pmr(resource), reclaimer(acpp::TimeoutScheduler::ForIoContext(io),
-              [](std::exception_ptr) { std::terminate(); }),
+              nullptr, [](void*, std::exception_ptr) { std::terminate(); }),
           receiver(std::make_shared<acpp::udp::socket>(io)),
           sender(io, acpp::udp::v4()), dispatcher(state) {
         acpp::IoErrorCode ec;

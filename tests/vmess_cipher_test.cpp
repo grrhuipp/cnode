@@ -33,6 +33,7 @@ extern "C" int __wrap_EVP_DigestSqueeze(EVP_MD_CTX* ctx, uint8_t* out, size_t si
 
 namespace {
 using namespace acpp::vmess;
+using acpp::proxy::AeadDirection;
 
 void Check(bool condition, std::string_view message) {
     if (!condition) {
@@ -49,17 +50,17 @@ int main() {
     bool mask_failed = false, key_failed = false;
     try { ShakeMask mask(iv.data()); }
     catch (const std::bad_alloc&) { mask_failed = true; }
-    try { VMessCipher cipher(Security::CHACHA20_POLY1305, key.data(), iv.data()); }
+    try { VMessCipher cipher(Security::CHACHA20_POLY1305, key.data(), iv.data(), AeadDirection::Encrypt); }
     catch (const std::bad_alloc&) { key_failed = true; }
     fail_digest_allocation = false;
     Check(mask_failed && key_failed, "crypto allocation failure produced usable protocol state");
-    for (const int allocation : {1, 2}) {
-        cipher_allocation_countdown = allocation;
+    for (const AeadDirection direction : {AeadDirection::Encrypt, AeadDirection::Decrypt}) {
+        cipher_allocation_countdown = 1;
         bool failed = false;
-        try { VMessCipher cipher(Security::AES_128_GCM, key.data(), iv.data()); }
+        try { VMessCipher cipher(Security::AES_128_GCM, key.data(), iv.data(), direction); }
         catch (const std::bad_alloc&) { failed = true; }
         cipher_allocation_countdown = 0;
-        Check(failed, "partial AEAD context allocation did not fail construction");
+        Check(failed, "AEAD context allocation failure did not fail construction");
     }
     ShakeMask mask(iv.data());
     fail_mask_output = true;
@@ -76,8 +77,8 @@ int main() {
     for (const Security security : {Security::AES_128_GCM,
                                    Security::CHACHA20_POLY1305,
                                    Security::NONE, Security::ZERO}) {
-        VMessCipher encoder(security, key.data(), iv.data());
-        VMessCipher decoder(security, key.data(), iv.data());
+        VMessCipher encoder(security, key.data(), iv.data(), AeadDirection::Encrypt);
+        VMessCipher decoder(security, key.data(), iv.data(), AeadDirection::Decrypt);
 #ifdef CNODE_TEST_CRYPTO_FAULT
         const auto contexts = cipher_contexts;
 #endif
@@ -102,8 +103,8 @@ int main() {
         Check(cipher_contexts == contexts, "VMess records allocated additional EVP contexts");
 #endif
         if (encoder.Overhead()) {
-            VMessCipher fresh_encoder(security, key.data(), iv.data());
-            VMessCipher fresh_decoder(security, key.data(), iv.data());
+            VMessCipher fresh_encoder(security, key.data(), iv.data(), AeadDirection::Encrypt);
+            VMessCipher fresh_decoder(security, key.data(), iv.data(), AeadDirection::Decrypt);
             std::array<uint8_t, 16> tag{};
             uint8_t unused = 0;
             Check(fresh_encoder.Encrypt(nullptr, 0, tag.data()) == 16,

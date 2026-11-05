@@ -17,6 +17,8 @@ public:
 
     // Re-submit the same growing prefix until complete. RequiredHeaderBytes()
     // is the next structured boundary; zero with no request is terminal failure.
+    // This step authenticates/decrypts syntax only. The inbound handshake must
+    // await validator.RegisterSessionIfNew before accepting or dispatching it.
     std::pair<std::optional<VMessRequest>, size_t> DecodeRequestHeader(
         const uint8_t* data,
         size_t len,

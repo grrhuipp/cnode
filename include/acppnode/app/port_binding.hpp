@@ -15,13 +15,6 @@ struct PortBinding {
     std::string protocol;           // "vmess" / "trojan"
     std::string tag;                // inbound tag
     InboundListen listen;
-
-    // Protocol/credentials are handler state and do not change the bound
-    // socket. Listener reuse is safe when the tag and endpoint shape match.
-    [[nodiscard]] bool UsesSameSocket(const PortBinding& other) const noexcept {
-        return port == other.port && tag == other.tag && listen == other.listen;
-    }
 };
-
 
 }  // namespace acpp

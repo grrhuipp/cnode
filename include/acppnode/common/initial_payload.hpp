@@ -59,17 +59,7 @@ public:
         if (overflow_.empty()) {
             return std::span<const uint8_t>(inline_.data(), len);
         }
-        for (const auto* buffer : overflow_) {
-            if (!buffer || buffer->IsEmpty()) {
-                continue;
-            }
-            const auto bytes = buffer->Bytes();
-            if (bytes.size() >= len) {
-                return bytes.first(len);
-            }
-            return {};
-        }
-        return {};
+        return overflow_.PrefixSpan(len);
     }
     // 复制最多 out_size 字节的前缀到 out，返回实际复制量。用于嗅探：只需首部
     // 若干字节即可解析 TLS ClientHello SNI / HTTP Host，无需拷贝整个首包。
@@ -82,20 +72,7 @@ public:
             std::memcpy(out, inline_.data(), want);
             return want;
         }
-        size_t offset = 0;
-        for (const auto* buffer : overflow_) {
-            if (offset >= want) {
-                break;
-            }
-            if (!buffer || buffer->IsEmpty()) {
-                continue;
-            }
-            const auto bytes = buffer->Bytes();
-            const size_t n = std::min(bytes.size(), want - offset);
-            std::memcpy(out + offset, bytes.data(), n);
-            offset += n;
-        }
-        return offset;
+        return overflow_.CopyPrefixTo(std::span<uint8_t>(out, want));
     }
 
     [[nodiscard]] buf::MultiBuffer MoveToMultiBuffer() {

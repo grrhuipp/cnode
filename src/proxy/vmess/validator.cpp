@@ -5,12 +5,15 @@
 #include "acppnode/common/string_hash.hpp"
 #include "vmess_crypto.hpp"
 #include "vmess_request.hpp"
+#include "acppnode/app/session_group_executor.hpp"
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstring>
 #include <utility>
+#include <deque>
+#include <unordered_map>
 
 namespace acpp {
 namespace vmess {
@@ -46,13 +49,13 @@ struct TimedUserValidator::Impl : memory::ThreadAllocated {
         static constexpr int64_t kCleanupIntervalSeconds = 30;
         static constexpr size_t kMaxEntries = 65536;
 
-        memory::ThreadLocalUnorderedMap<SessionKey, int64_t, SessionKeyHash> entries;
-        memory::ThreadLocalDeque<std::pair<SessionKey, int64_t>> order;
+        std::unordered_map<SessionKey, int64_t, SessionKeyHash> entries;
+        std::deque<std::pair<SessionKey, int64_t>> order;
         int64_t last_cleanup = 0;
 
         void Cleanup(int64_t now) {
             if (now - last_cleanup < kCleanupIntervalSeconds &&
-                entries.size() <= kMaxEntries) {
+                entries.size() < kMaxEntries) {
                 return;
             }
             last_cleanup = now;
@@ -63,7 +66,7 @@ struct TimedUserValidator::Impl : memory::ThreadAllocated {
                     order.pop_front();
                     continue;
                 }
-                if (expires_at > now && entries.size() <= kMaxEntries) {
+                if (expires_at > now) {
                     break;
                 }
                 entries.erase(it);
@@ -77,17 +80,14 @@ struct TimedUserValidator::Impl : memory::ThreadAllocated {
             if (it != entries.end() && it->second > now) {
                 return false;
             }
+            if (entries.size() >= kMaxEntries && it == entries.end()) return false;
             const int64_t expires_at = now + kTtlSeconds;
-            entries[key] = expires_at;
-            order.emplace_back(std::move(key), expires_at);
+            order.emplace_back(key, expires_at);
+            try { entries.insert_or_assign(std::move(key), expires_at); }
+            catch (...) { order.pop_back(); throw; }
             return true;
         }
 
-        void Clear() {
-            entries.clear();
-            order.clear();
-            last_cleanup = 0;
-        }
     };
 
     struct alignas(64) HotUserCache {
@@ -151,15 +151,18 @@ struct TimedUserValidator::Impl : memory::ThreadAllocated {
     // requests alternate between tags sharing this validator.
     mutable uint64_t view_revision = 0;
     mutable int64_t last_hot_cache_cleanup = 0;
-    mutable SessionHistory session_history;
+    struct HistoryService final : net::execution_context::service {
+        inline static net::execution_context::id id;
+        explicit HistoryService(net::execution_context& context) : service(context) {}
+        void shutdown() override {}
+        SessionHistory history;
+    };
 };
 
 TimedUserValidator::TimedUserValidator()
     : impl_(std::make_unique<Impl>()) {}
 
 TimedUserValidator::~TimedUserValidator() = default;
-TimedUserValidator::TimedUserValidator(TimedUserValidator&&) noexcept = default;
-TimedUserValidator& TimedUserValidator::operator=(TimedUserValidator&&) noexcept = default;
 
 std::shared_ptr<const proxyman::inbound::UserStore::VmessCredential>
 TimedUserValidator::FindByAuthIDForTag(
@@ -172,7 +175,7 @@ TimedUserValidator::FindByAuthIDForTag(
 
     auto tryUser = [&](const proxyman::inbound::UserStore::VmessCredential& user) -> bool {
         std::array<uint8_t, 16> plaintext;
-        AES128ECBDecrypt(user.cached_auth_aes_key.data(), auth_id, plaintext.data());
+        AES_decrypt(auth_id, plaintext.data(), &user.auth_id_key);
 
         int64_t timestamp = 0;
         for (int i = 0; i < 8; i++) {
@@ -235,18 +238,23 @@ TimedUserValidator::FindByAuthIDForTag(
     return {};
 }
 
-bool TimedUserValidator::RegisterSessionIfNew(
+net::awaitable<bool> TimedUserValidator::RegisterSessionIfNew(
     const proxyman::inbound::UserStore::VmessCredential& user,
     const std::array<uint8_t, 16>& body_key,
     const std::array<uint8_t, 16>& body_iv) const {
-    const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-
+    auto domain = ExecutionDomain::Current();
+    if (!domain) throw std::logic_error("VMess replay admission requires an execution domain");
     Impl::SessionKey key;
     key.user = user.uuid_bytes;
     key.key = body_key;
     key.iv = body_iv;
-    return impl_->session_history.AddIfNew(std::move(key), now);
+    auto* coordinator = &domain->Coordinator();
+    return coordinator->PostCall([coordinator, key] {
+        const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        return net::use_service<Impl::HistoryService>(
+            coordinator->Services()).history.AddIfNew(key, now);
+    });
 }
 
 

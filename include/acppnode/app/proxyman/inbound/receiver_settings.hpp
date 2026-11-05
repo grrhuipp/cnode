@@ -24,7 +24,7 @@ struct ReceiverSettings {
     std::string      accounting_key{};  // Opaque stable reporting identity; empty disables per-user reporting.
     StreamSettings   stream_settings;  // 传输层配置（network/security）
     routing::DispatchPolicy dispatch_policy;
-    ProxyProtocolMode proxy_protocol = ProxyProtocolMode::Auto; // PROXY Protocol 处理模式
+    ProxyProtocolMode proxy_protocol = ProxyProtocolMode::Auto;
     bool             has_route_inbound_tags = false;  // 构建期归一化，热入口只读位
 
     [[nodiscard]] const std::vector<std::string>* RouteInboundTags() const noexcept {
@@ -41,7 +41,6 @@ struct ReceiverSettings {
     ProxyProtocolMode proxy_protocol,
     routing::OutboundSelectionPolicy outbound_policy,
     std::string accounting_key) {
-    sniff_config.RefreshHotPathFields();
     const bool has_route_inbound_tags =
         !inbound_tags.empty() &&
         !(inbound_tags.size() == 1 && inbound_tags.front() == inbound_tag);

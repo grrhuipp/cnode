@@ -1,81 +1,67 @@
 #include "trojan_codec.hpp"
+#include "acppnode/common/binary_text_codec.hpp"
 #include "acppnode/common/address_codec.hpp"
 #include "acppnode/common/byte_reader.hpp"
+
+#include <cstring>
+
 namespace acpp::trojan {
-
-namespace {
-
-[[nodiscard]] constexpr bool IsHexDigit(uint8_t ch) noexcept {
-    return (ch >= '0' && ch <= '9') ||
-           (ch >= 'a' && ch <= 'f') ||
-           (ch >= 'A' && ch <= 'F');
-}
-
-}  // namespace
 
 // ============================================================================
 // TCP 请求编解码
 // ============================================================================
 
-std::optional<TrojanRequest> TrojanCodec::ParseRequest(
-    const uint8_t* data,
-    size_t len,
-    size_t& consumed) {
-
-    consumed = 0;
-
-    // 最小长度：56(hash) + 2(CRLF) + 1(cmd) + 1(atype) + 1(addr) + 2(port) + 2(CRLF) = 65
-    if (len < 65) {
-        return std::nullopt;
+RequestDecodeResult DecodeRequest(std::span<const uint8_t> data) {
+    RequestDecodeResult result;
+    // hash(56) + CRLF + command, validated before the address is awaited.
+    if (data.size() < kRequestPrefixSize) {
+        result.required = kRequestPrefixSize;
+        return result;
     }
-
-    ByteReader reader(data, len);
-    TrojanRequest req;
-
-    // 解析密码哈希（56 字节十六进制）
-    auto hash_span = reader.ReadBytes(56);
-    if (!reader.Ok()) return std::nullopt;
-    for (uint8_t ch : hash_span) {
-        if (!IsHexDigit(ch)) {
-            return std::nullopt;
+    for (size_t i = 0; i < kPasswordHashSize; ++i) {
+        if (HexDigitValue(data[i]) < 0) {
+            result.status = RequestDecodeStatus::InvalidHeader;
+            return result;
         }
     }
-    std::memcpy(req.password_hash.data(), hash_span.data(), req.password_hash.size());
-    // CRLF
-    uint8_t cr = reader.ReadU8();
-    uint8_t lf = reader.ReadU8();
-    if (!reader.Ok() || cr != 0x0D || lf != 0x0A) {
-        return std::nullopt;
+    const uint8_t command = data[kPasswordHashSize + 2];
+    if (data[kPasswordHashSize] != 0x0D || data[kPasswordHashSize + 1] != 0x0A ||
+        (command != static_cast<uint8_t>(TrojanCommand::CONNECT) &&
+         command != static_cast<uint8_t>(TrojanCommand::UDP_ASSOCIATE))) {
+        result.status = RequestDecodeStatus::InvalidHeader;
+        return result;
     }
 
-    // 命令
-    uint8_t cmd = reader.ReadU8();
-    if (!reader.Ok()) return std::nullopt;
-    req.command = static_cast<TrojanCommand>(cmd);
-    if (req.command != TrojanCommand::CONNECT && req.command != TrojanCommand::UDP_ASSOCIATE) {
-        return std::nullopt;
+    auto address = DecodeAddress(
+        data.subspan(kRequestPrefixSize), AddressWireFormat::Socks5, {253, true});
+    if (address.status == AddressDecodeStatus::Invalid) {
+        result.status = RequestDecodeStatus::InvalidAddress;
+        return result;
+    }
+    // A request always ends with CRLF after the address, so asking for it with
+    // every partial address stage never reads past the header and lets the
+    // final stage complete without decoding the address again.
+    const size_t address_end = kRequestPrefixSize + address.consumed;
+    if (address.status == AddressDecodeStatus::Incomplete || data.size() < address_end + 2) {
+        result.required = address.status == AddressDecodeStatus::Incomplete
+            ? kRequestPrefixSize + address.required + 2
+            : address_end + 2;
+        return result;
+    }
+    if (data[address_end] != 0x0D || data[address_end + 1] != 0x0A) {
+        result.status = RequestDecodeStatus::InvalidHeader;
+        return result;
     }
 
-    auto parsed_addr = DecodeAddress(
-        std::span<const uint8_t>(data + reader.Position(), reader.Remaining()),
-        AddressWireFormat::Socks5, {253, true});
-    if (parsed_addr.status != AddressDecodeStatus::Complete ||
-        !reader.Skip(parsed_addr.consumed)) {
-        return std::nullopt;
-    }
-    req.target = std::move(parsed_addr.target);
-    // CRLF
-    cr = reader.ReadU8();
-    lf = reader.ReadU8();
-    if (!reader.Ok() || cr != 0x0D || lf != 0x0A) {
-        return std::nullopt;
-    }
-
-    consumed = reader.Position();
-    return req;
+    std::memcpy(result.request.password_hash.data(), data.data(), kPasswordHashSize);
+    result.request.command = static_cast<TrojanCommand>(command);
+    result.request.target = std::move(address.target);
+    result.consumed = address_end + 2;
+    result.status = RequestDecodeStatus::Complete;
+    return result;
 }
 
-size_t TrojanCodec::EncodeRequestTo(
+size_t EncodeRequestTo(
     std::span<const char, 56> password_hash,
     TrojanCommand cmd,
     const TargetAddress& target,
@@ -84,7 +70,7 @@ size_t TrojanCodec::EncodeRequestTo(
     const uint8_t* payload,
     size_t payload_len) {
 
-    const size_t addr_size = AddressEncodedSize(target, AddressWireFormat::Socks5);
+    const size_t addr_size = AddressEncodedSize(target);
     if (addr_size == 0 || payload_len > output_size ||
         (payload_len != 0 && !payload)) {
         return 0;
@@ -117,7 +103,7 @@ size_t TrojanCodec::EncodeRequestTo(
     return writer.Position() + encoded + tail.Position();
 }
 
-size_t TrojanCodec::EncodeUdpPacketHeaderTo(
+size_t EncodeUdpPacketHeaderTo(
     const TargetAddress& target,
     size_t payload_len,
     uint8_t* output,
@@ -126,7 +112,7 @@ size_t TrojanCodec::EncodeUdpPacketHeaderTo(
         return 0;
     }
 
-    const size_t address_size = AddressEncodedSize(target, AddressWireFormat::Socks5);
+    const size_t address_size = AddressEncodedSize(target);
     if (!output || address_size == 0 || address_size + 4 > output_size) return 0;
     const size_t encoded = EncodeAddressTo(
         target, output, output_size, AddressWireFormat::Socks5);

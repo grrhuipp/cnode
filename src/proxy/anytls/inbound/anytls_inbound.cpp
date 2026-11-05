@@ -49,7 +49,7 @@ constexpr size_t kMaxConcurrentSubstreams = 128;
 
 Handler::Handler(UserOnlineTracker& validator,
                  StatsShard& stats,
-                 ConnectionLimiterPtr limiter,
+                 ConnectionLimiter* limiter,
                  std::shared_ptr<const ::acpp::anytls::PaddingScheme> padding_scheme)
     : validator_(validator)
     , stats_(&stats)
@@ -227,8 +227,7 @@ public:
         , session_ctx_(session_ctx)
         , stats_(stats)
         , timeouts_(timeouts)
-        , padding_scheme_(padding_scheme)
-        , write_gate_(io_context) {}
+        , padding_scheme_(padding_scheme) {}
 
     ~AnyTLSDemuxSession() noexcept {
         CancelAll();
@@ -275,18 +274,10 @@ public:
         else throw transport::WriteClosed();
 
         try {
-            anytls::FrameBatch batch;
-            auto result = batch.Encode(cmd, sid, mb);
-            if (result && !batch.Buffers().empty()) {
-                co_await stream_->WriteBuffers(batch.Buffers());
-            }
-            mb.clear();
+            auto result = co_await anytls::WriteMultiBufferAsFrameBatch(
+                *stream_, cmd, sid, std::move(mb));
             if (!result) CancelAll();
             co_return result;
-        } catch (const IoSystemError& e) {
-            mb.clear();
-            CancelAll();
-            co_return tl::unexpected(MapAsioError(e.code()));
         } catch (...) {
             CancelAll();
             throw;
@@ -316,10 +307,8 @@ public:
 
         if (auto sub = FindStream(sid)) sub->CheckWrite();
         else throw transport::WriteClosed();
-        const PaddingScheme no_padding;
         try {
-            auto result = co_await anytls::WriteBuffersAsFramesWithPadding(
-                *stream_, no_padding, 0, cmd, sid, buffers);
+            auto result = co_await anytls::WriteBuffersAsFrameBatch(*stream_, cmd, sid, buffers);
             if (!result) CancelAll();
             co_return result;
         } catch (...) {
@@ -367,6 +356,57 @@ private:
         RelayResult result;
         result.error = error;
         co_return result;
+    }
+
+    // Runs one header phase under the substream's absolute handshake budget.
+    // The phase and its timer are joined before this returns; an expired
+    // budget yields TIMEOUT even when the phase itself completed.
+    template<class Phase>
+    net::awaitable<ErrorCode> RunHandshakePhase(
+        AnyTLSSubStream& sub, std::chrono::steady_clock::time_point opened_at, Phase& phase) {
+        bool timed_out = false;
+        ErrorCode phase_error = ErrorCode::INTERNAL;
+        auto bounded = [&](AwaitableTaskGroup& tasks) -> net::awaitable<void> {
+            const auto elapsed = std::chrono::ceil<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - opened_at);
+            const auto remaining = std::max(std::chrono::milliseconds::zero(),
+                std::chrono::duration_cast<std::chrono::milliseconds>(timeouts_.HandshakeTimeout()) - elapsed);
+            if (remaining == std::chrono::milliseconds::zero()) {
+                timed_out = true;
+                sub.Cancel();
+                co_return;
+            }
+            // Embedded in this child; cannot outlive the task group it borrows.
+            // Cancellation covers both reads and SYNACK I/O.
+            struct HandshakeDeadline final : TimeoutEvent {
+                HandshakeDeadline(bool& timed_out, AnyTLSSubStream& sub, AwaitableTaskGroup& tasks)
+                    : timed_out(timed_out), sub(sub), tasks(tasks) {}
+                void OnTimeout() override {
+                    timed_out = true;
+                    sub.Cancel();
+                    tasks.Cancel();
+                }
+                bool& timed_out;
+                AnyTLSSubStream& sub;
+                AwaitableTaskGroup& tasks;
+            } deadline(timed_out, sub, tasks);
+            if (!TimeoutScheduler::ForIoContext(io_context_).ScheduleAfter(remaining, deadline))
+                throw IoSystemError(io_error::operation_aborted);
+            phase_error = co_await phase();
+            // Ready continuations can run before an already-due timer callback.
+            // Do not dispatch a header that completed beyond its absolute budget.
+            if (std::chrono::steady_clock::now() >= opened_at + timeouts_.HandshakeTimeout()) {
+                timed_out = true;
+                sub.Cancel();
+            }
+        };
+        try {
+            co_await RunAwaitableTaskGroup(co_await net::this_coro::executor,
+                [&](AwaitableTaskGroup& tasks) { tasks.Spawn(bounded(tasks)); });
+        } catch (const IoSystemError&) {
+            if (!timed_out) throw;
+        }
+        co_return timed_out ? ErrorCode::TIMEOUT : phase_error;
     }
 
     net::awaitable<ErrorCode> ProcessUdpSubstream(
@@ -424,53 +464,17 @@ net::awaitable<ErrorCode> AnyTLSDemuxSession::ProcessUdpSubstream(
     buf::MultiBuffer pending,
     std::chrono::steady_clock::time_point opened_at) {
     std::optional<proxy::uot::PreparedRequest> prepared;
-    ErrorCode prepare_error = ErrorCode::INTERNAL;
-    bool timed_out = false;
-    auto handshake = [&](AwaitableTaskGroup& tasks) -> net::awaitable<void> {
-        const auto elapsed = std::chrono::ceil<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - opened_at);
-        const auto remaining = std::max(std::chrono::milliseconds::zero(),
-            std::chrono::duration_cast<std::chrono::milliseconds>(timeouts_.HandshakeTimeout()) - elapsed);
-        if (remaining == std::chrono::milliseconds::zero()) {
-            timed_out = true;
-            sub.Cancel();
-            co_return;
-        }
-        struct HandshakeDeadline final : TimeoutEvent {
-            HandshakeDeadline(bool& timed_out, AnyTLSSubStream& sub, AwaitableTaskGroup& tasks)
-                : timed_out(timed_out), sub(sub), tasks(tasks) {}
-            void OnTimeout() override {
-                timed_out = true;
-                sub.Cancel();
-                tasks.Cancel();
-            }
-            bool& timed_out;
-            AnyTLSSubStream& sub;
-            AwaitableTaskGroup& tasks;
-        } deadline(timed_out, sub, tasks);
-        if (!TimeoutScheduler::ForIoContext(io_context_).ScheduleAfter(remaining, deadline))
-            throw IoSystemError(io_error::operation_aborted);
+    auto read_header = [&]() -> net::awaitable<ErrorCode> {
         auto uot_header = co_await proxy::uot::ReadUotRequestHeader(
             uot_version, sub, std::move(pending), ErrorCode::CONNECTION_CLOSED);
-        if (!uot_header) {
-            prepare_error = uot_header.error();
-        } else {
-            prepared.emplace(std::move(*uot_header));
-            prepare_error = ErrorCode::OK;
-        }
-        if (std::chrono::steady_clock::now() >= opened_at + timeouts_.HandshakeTimeout()) {
-            timed_out = true;
-            sub.Cancel();
-        }
+        if (!uot_header) co_return uot_header.error();
+        prepared.emplace(std::move(*uot_header));
+        co_return ErrorCode::OK;
     };
-    try {
-        co_await RunAwaitableTaskGroup(io_context_.get_executor(),
-            [&](AwaitableTaskGroup& tasks) { tasks.Spawn(handshake(tasks)); });
-    } catch (const IoSystemError&) {
-        if (!timed_out) throw;
+    if (const auto error = co_await RunHandshakePhase(sub, opened_at, read_header);
+        error != ErrorCode::OK) {
+        co_return error;
     }
-    if (timed_out) co_return ErrorCode::TIMEOUT;
-    if (prepare_error != ErrorCode::OK || !prepared) co_return prepare_error;
     if (sub.IsClosed()) co_return ErrorCode::CONNECTION_CLOSED;
 
     session::Context& ctx = sub.ctx;
@@ -513,50 +517,10 @@ net::awaitable<ErrorCode> AnyTLSDemuxSession::ProcessStream(
         co_return ErrorCode::OK;
     };
 
-    bool timed_out = false;
-    ErrorCode prepare_error = ErrorCode::INTERNAL;
-    auto handshake = [&](AwaitableTaskGroup& tasks) -> net::awaitable<void> {
-        const auto elapsed = std::chrono::ceil<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - opened_at);
-        const auto remaining = std::max(std::chrono::milliseconds::zero(),
-            std::chrono::duration_cast<std::chrono::milliseconds>(timeouts_.HandshakeTimeout()) - elapsed);
-        if (remaining == std::chrono::milliseconds::zero()) {
-            timed_out = true;
-            sub.Cancel();
-            co_return;
-        }
-        // Embedded in this child; cannot outlive the task group it borrows.
-        // Cancellation covers both reads and SYNACK I/O.
-        struct HandshakeDeadline final : TimeoutEvent {
-            HandshakeDeadline(bool& timed_out, AnyTLSSubStream& sub, AwaitableTaskGroup& tasks)
-                : timed_out(timed_out), sub(sub), tasks(tasks) {}
-            void OnTimeout() override {
-                timed_out = true;
-                sub.Cancel();
-                tasks.Cancel();
-            }
-            bool& timed_out;
-            AnyTLSSubStream& sub;
-            AwaitableTaskGroup& tasks;
-        } deadline(timed_out, sub, tasks);
-        if (!TimeoutScheduler::ForIoContext(io_context_).ScheduleAfter(remaining, deadline))
-            throw IoSystemError(io_error::operation_aborted);
-        prepare_error = co_await prepare();
-        // Ready continuations can run before an already-due timer callback.
-        // Do not dispatch a header that completed beyond its absolute budget.
-        if (std::chrono::steady_clock::now() >= opened_at + timeouts_.HandshakeTimeout()) {
-            timed_out = true;
-            sub.Cancel();
-        }
-    };
-    try {
-        co_await RunAwaitableTaskGroup(io_context_.get_executor(),
-            [&](AwaitableTaskGroup& tasks) { tasks.Spawn(handshake(tasks)); });
-    } catch (const IoSystemError&) {
-        if (!timed_out) throw;
+    if (const auto error = co_await RunHandshakePhase(sub, opened_at, prepare);
+        error != ErrorCode::OK) {
+        co_return error;
     }
-    if (timed_out) co_return ErrorCode::TIMEOUT;
-    if (prepare_error != ErrorCode::OK) co_return prepare_error;
     if (sub.IsClosed()) co_return ErrorCode::CONNECTION_CLOSED;
     // Header preparation is joined and its timer removed before Dispatcher.
     if (uot_version) {
@@ -584,8 +548,13 @@ net::awaitable<void> AnyTLSDemuxSession::RunStream(
         error = ErrorCode::INTERNAL;
     }
     if (error == ErrorCode::CONNECTION_CLOSED && sub->RemoteClosed()) error = ErrorCode::OK;
+    if (error != ErrorCode::OK) {
+        LOG_CONN_DEBUG(sub->ctx, "[AnyTLS] stream sid={} ended: {}",
+                       sub->Sid(), ErrorCodeToString(error));
+    }
     // The request owner closes exactly once on every completion path. A remote
-    // close is already terminal and produces no FIN reply.
+    // close is already terminal and produces no FIN reply. A failed FIN write
+    // has already cancelled the whole physical session.
     try { co_await sub->AsyncShutdownWrite(); } catch (...) {}
     RemoveStream(sub->Sid());
 }
@@ -604,7 +573,7 @@ net::awaitable<RelayResult> AnyTLSDemuxSession::Run() {
         // cleanup, even when the frame loop returns normally.
         tasks.Cancel();
     };
-    co_await RunAwaitableTaskGroup(io_context_.get_executor(),
+    co_await RunAwaitableTaskGroup(co_await net::this_coro::executor,
         [&](AwaitableTaskGroup& tasks) { tasks.Spawn(read_frames(tasks)); });
     if (result.error == ErrorCode::CONNECTION_CLOSED) result.error = ErrorCode::OK;
     co_return result;
@@ -805,7 +774,7 @@ AuthenticateSession(
     auto user = proxyman::inbound::UserStore::FindAnyTlsUser(ctx.inbound.tag, auth_hash);
     if (!user) {
         if (limiter && ctx.inbound.HasProxyProtocolClientIP()) {
-            limiter->OnAuthFailTracked(ctx.inbound.tag, ctx.inbound.source_ip);
+            co_await limiter->OnAuthFailTracked(ctx.inbound.tag, ctx.inbound.source_ip);
         }
         stats.OnError();
         co_return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
@@ -828,10 +797,10 @@ AuthenticateSession(
     ctx.inbound.user_id = profile.user_id;
     ctx.content.speed_limit = profile.speed_limit;
 
-    auto user_session = validator.TryConnectSession(
+    auto user_session = co_await validator.TryConnectSession(
         ctx.inbound.tag, profile.user_id, ctx.inbound.source_ip, profile.device_limit);
     if (!user_session) {
-        LOG_NET_DEBUG("{} from {}:{} rejected device_limit [{}] user={} limit={} online_devices={}",
+        LOG_NET_DEBUG("{} from {}:{} rejected device_limit [{}] user={} limit={} domain_online_devices={}",
             FormatTimestamp(ctx.accept_time_us),
             ctx.inbound.source_ip,
             ctx.inbound.source_port,
@@ -927,7 +896,7 @@ const bool kInboundRegistered = [] {
     reg.create_tcp_handler =
         [](acpp::proxyman::inbound::ProtocolRuntime& runtime,
            acpp::StatsShard& stats,
-           acpp::ConnectionLimiterPtr limiter,
+           acpp::ConnectionLimiter* limiter,
            const acpp::proxyman::inbound::BuildRequest& req) -> std::unique_ptr<acpp::Inbound> {
             auto* anytls_runtime = dynamic_cast<AnyTlsRuntime*>(&runtime);
             const auto* settings = GetAnyTlsSettings(req);

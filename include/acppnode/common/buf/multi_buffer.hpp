@@ -37,22 +37,35 @@ struct Buffer {
     // 回包=来源。TCP relay 路径通常不携带 endpoint，因此懒构造 TargetAddress。
     std::optional<TargetAddress> udp_;
 
+    // Payload storage stays in its original domain when a group migrates.
+    // Joined domains may borrow it only while their common group is leased.
+    memory::worker_memory* allocation_pool_ = &memory::ThreadMemoryPool();
+    void RequireLease() const noexcept {
+        allocation_pool_->RequireLease();
+    }
+
     // 有效数据视图 [start, end)
-    std::span<uint8_t>       Bytes() noexcept       { return {data + start, end - start}; }
-    std::span<const uint8_t> Bytes() const noexcept { return {data + start, end - start}; }
+    std::span<uint8_t> Bytes() noexcept {
+        RequireLease();
+        return {data + start, end - start};
+    }
+    std::span<const uint8_t> Bytes() const noexcept {
+        RequireLease();
+        return {data + start, end - start};
+    }
 
     // 可写尾部 [end, kSize)
-    std::span<uint8_t> Tail() noexcept { return {data + end, kSize - end}; }
+    std::span<uint8_t> Tail() noexcept { RequireLease(); return {data + end, kSize - end}; }
 
-    uint32_t Len()       const noexcept { return end - start; }
-    uint32_t Available() const noexcept { return kSize - end; }
-    bool     IsEmpty()   const noexcept { return start == end; }
+    uint32_t Len()       const noexcept { RequireLease(); return end - start; }
+    uint32_t Available() const noexcept { RequireLease(); return kSize - end; }
+    bool     IsEmpty()   const noexcept { RequireLease(); return start == end; }
 
     // 消费 n 字节（移动 start 游标，零 memmove）
-    void Advance(uint32_t n) noexcept { start += n; }
+    void Advance(uint32_t n) noexcept { RequireLease(); start += n; }
 
     // 写入 n 字节后调用（移动 end 游标）
-    void Produce(uint32_t n) noexcept { end += n; }
+    void Produce(uint32_t n) noexcept { RequireLease(); end += n; }
 
     // 将有效数据挪回 data[0]，为尾部追加腾出空间。只在已经消费过头部
     // 且调用方明确需要合并极小跨界片段时使用，避免常规 Advance 做 memmove。
@@ -70,6 +83,7 @@ struct Buffer {
 
     // 重置游标（复用 buffer），同时清除 UDP endpoint 标记。
     void Reset() noexcept {
+        RequireLease();
         start = 0;
         end = 0;
         ClearUDP();
@@ -77,18 +91,21 @@ struct Buffer {
 
     // 设置/清除本 Buffer 的 UDP 对端地址。
     void SetUDP(const TargetAddress& dest) {
+        RequireLease();
         udp_ = dest;
     }
     void SetUDP(TargetAddress&& dest) {
+        RequireLease();
         udp_ = std::move(dest);
     }
     void ClearUDP() noexcept {
+        RequireLease();
         udp_.reset();
     }
-    [[nodiscard]] bool HasUDP() const noexcept { return udp_.has_value(); }
-    [[nodiscard]] TargetAddress& UDP() noexcept { return *udp_; }
-    [[nodiscard]] const TargetAddress& UDP() const noexcept { return *udp_; }
-    // 从 Worker-local PMR 取得固定 8KB 块。只初始化游标，payload 保持
+    [[nodiscard]] bool HasUDP() const noexcept { RequireLease(); return udp_.has_value(); }
+    [[nodiscard]] TargetAddress& UDP() noexcept { RequireLease(); return *udp_; }
+    [[nodiscard]] const TargetAddress& UDP() const noexcept { RequireLease(); return *udp_; }
+    // 从当前会话域（或控制面 Worker-local PMR）取得固定 8KB 块。只初始化游标，payload 保持
     // 未初始化，避免热路径无谓 memset。
     [[nodiscard]] static Buffer* New() noexcept {
         void* raw = memory::AllocatePmr(sizeof(Buffer), alignof(Buffer));
@@ -107,6 +124,8 @@ struct Buffer {
         if (!b) {
             return;
         }
+        b->RequireLease();
+        memory::RequireAllocationLease(b);
         memory::OnBufferFree();
         b->~Buffer();
         memory::DeallocatePmr(b, sizeof(Buffer), alignof(Buffer));
@@ -156,7 +175,7 @@ struct BufferGuard {
 //   - std::move(mb) 即为所有权转移，零数据拷贝（只移动指针）
 //   - 常规协议/分帧路径最多 8 个 Buffer，指针链内联保存，避免每次
 //     ReadMultiBuffer() 为 vector 元数据再做一次堆分配；超过 8 个才 spill
-//     到同一 Worker thread-local heap。
+//     到所属会话域的地址稳定资源。
 // ============================================================================
 class MultiBuffer {
 public:
@@ -527,16 +546,7 @@ public:
 
     // Drop retained blocks and spill capacity once the queue has no payload.
     void ReleaseIfIdle() noexcept {
-        if (total_bytes_ != 0) {
-            return;
-        }
-        clear();
-        if (using_spill_) {
-            memory::ThreadLocalVector<Buffer*> empty;
-            spill_.swap(empty);
-            using_spill_ = false;
-            spill_start_ = 0;
-        }
+        if (total_bytes_ == 0) clear();
     }
 
     void RecordTailProduced(size_t bytes) noexcept {
@@ -693,11 +703,6 @@ private:
     memory::ThreadLocalVector<Buffer*> spill_;
 };
 
-// 计算 MultiBuffer 中所有 Buffer 的有效字节总数
-inline size_t TotalLen(const MultiBuffer& mb) noexcept {
-    return mb.byte_size();
-}
-
 enum class UdpDatagramStatus : uint8_t {
     Empty,
     Valid,
@@ -752,18 +757,13 @@ struct UdpDatagramInfo {
     return info;
 }
 
-[[nodiscard]] inline bool HasData(const MultiBuffer& mb) noexcept {
-    return mb.byte_size() != 0;
-}
-
 [[nodiscard]] inline bool AppendSpanToMultiBuffer(std::span<const uint8_t> data,
-                                                  MultiBuffer& out_mb,
-                                                  bool coalesce_tail = true) {
+                                                  MultiBuffer& out_mb) {
     if (data.empty()) return true;
     if (data.size() > std::numeric_limits<size_t>::max() - out_mb.byte_size())
         throw std::length_error("MultiBuffer byte size overflow");
 
-    Buffer* tail = coalesce_tail ? out_mb.back() : nullptr;
+    Buffer* tail = out_mb.back();
     const size_t tail_bytes = tail && !tail->HasUDP()
         ? std::min(data.size(), static_cast<size_t>(tail->Available())) : 0;
 

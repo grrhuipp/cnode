@@ -62,13 +62,14 @@ net::awaitable<void> NodeRuntime::RemoveOutbound(const std::string& tag) {
             return [](NodeRuntime* runtime, Worker* current, std::string current_tag)
                        -> net::awaitable<void> {
                 runtime->ThrowIfStopping();
-                co_await current->PostTask(
-                    current->RemoveOutboundTask(std::move(current_tag)));
+                co_await current->PostCall([current, tag = std::move(current_tag)] {
+                    current->RemoveOutbound(tag);
+                });
             }(this, &worker, tag);
         });
 }
 
-net::awaitable<bool> NodeRuntime::AddOutbound(
+net::awaitable<void> NodeRuntime::AddOutbound(
     const proxyman::outbound::PreparedOutboundConfig& prepared) {
     ThrowIfStopping();
     co_await RunWorkerMutationBatch(
@@ -78,11 +79,11 @@ net::awaitable<bool> NodeRuntime::AddOutbound(
                       proxyman::outbound::PreparedOutboundConfig config)
                        -> net::awaitable<void> {
                 runtime->ThrowIfStopping();
-                co_await current->PostTask(
-                    current->AddOutboundTask(std::move(config)));
+                co_await current->PostCall([current, config = std::move(config)]() mutable {
+                    current->AddOutbound(std::move(config));
+                });
             }(this, &worker, prepared);
         });
-    co_return true;
 }
 
 net::awaitable<bool> NodeRuntime::AddInbound(const InboundBuild& inbound) {
@@ -112,10 +113,12 @@ net::awaitable<bool> NodeRuntime::AddInbound(const InboundBuild& inbound) {
                           proxyman::inbound::ReceiverSettings current_receiver,
                           uint8_t* result) -> net::awaitable<void> {
                     runtime->ThrowIfStopping();
-                    *result = co_await current->PostTask(
-                        current->RegisterInboundTask(
-                            std::move(request),
-                            std::move(current_receiver)));
+                    *result = co_await current->PostCall(
+                        [current, request = std::move(request),
+                         receiver = std::move(current_receiver)]() mutable {
+                            return current->RegisterInbound(
+                                std::move(request), std::move(receiver));
+                        });
                 }(this, &worker,
                   inbound.handler_request,
                   std::move(receiver),
@@ -139,8 +142,9 @@ net::awaitable<bool> NodeRuntime::AddInbound(const InboundBuild& inbound) {
                           proxyman::inbound::BuildRequest request,
                           WorkerBindResult* result) -> net::awaitable<void> {
                     runtime->ThrowIfStopping();
-                    result->tcp = co_await current->PostTask(
-                        current->AddListenerTask(binding));
+                    result->tcp = co_await current->PostCall([current, binding] {
+                        return current->AddListener(binding);
+                    });
                     if (!result->tcp) {
                         co_return;
                     }
@@ -203,9 +207,10 @@ net::awaitable<void> NodeRuntime::UpdateRules(
                std::string current_tag,
                std::vector<rule::DetectRule> rules) -> net::awaitable<void> {
                 runtime->ThrowIfStopping();
-                co_await current->PostTask(
-                    current->UpdateRuleTask(
-                        std::move(current_tag), std::move(rules)));
+                co_await current->PostCall(
+                    [current, tag = std::move(current_tag), rules = std::move(rules)] {
+                        current->UpdateRule(tag, rules);
+                    });
             }(this, worker.get(), tag, new_rule_list));
     }
     co_await RunAwaitableBatch(
@@ -222,7 +227,9 @@ net::awaitable<void> NodeRuntime::RecoverUsers() {
             return [](NodeRuntime* runtime, Worker* current,
                       proxyman::inbound::UserStore::WorkerView view) -> net::awaitable<void> {
                 runtime->ThrowIfStopping();
-                co_await current->PostTask(current->InstallUserViewTask(std::move(view)));
+                co_await current->PostCall([current, view = std::move(view)]() mutable {
+                    current->InstallUserView(std::move(view));
+                });
             }(this, &worker, recovery.worker_views[index]);
         });
     ThrowIfStopping();
@@ -254,7 +261,9 @@ net::awaitable<void> NodeRuntime::PublishUsers(
         [this, &candidate_views](Worker& worker, size_t index) {
             return [](NodeRuntime* runtime, Worker* current, Store::WorkerView view) -> net::awaitable<void> {
                 runtime->ThrowIfStopping();
-                co_await current->PostTask(current->InstallUserViewTask(std::move(view)));
+                co_await current->PostCall([current, view = std::move(view)]() mutable {
+                    current->InstallUserView(std::move(view));
+                });
             }(this, &worker, std::move(candidate_views[index]));
         });
     ThrowIfStopping();

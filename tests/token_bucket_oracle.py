@@ -1,7 +1,6 @@
 """Compare the compiled TokenBucket with an independent exact integer model."""
 import argparse
 import json
-import os
 from pathlib import Path
 import random
 import subprocess
@@ -60,8 +59,7 @@ def run(args):
     trace = '\n'.join(commands) + '\n'
     (args.output / 'commands.txt').write_text(trace, encoding='utf-8')
     process = subprocess.run([str(args.binary.resolve()), '--trace'], input=trace,
-                             text=True, capture_output=True, timeout=30,
-                             creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+                             text=True, capture_output=True, timeout=30)
     actual = [int(line) for line in process.stdout.splitlines()]
     mismatches = [dict(**descriptions[i], expected=wanted, actual=got)
                   for i, (wanted, got) in enumerate(zip(expected, actual)) if wanted != got]

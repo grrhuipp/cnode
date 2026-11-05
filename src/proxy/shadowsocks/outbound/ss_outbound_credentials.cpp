@@ -8,7 +8,7 @@ std::optional<Credentials> Credentials::Prepare(
     if (!cipher || password.empty()) {
         return std::nullopt;
     }
-    if (!ss::Is2022Cipher(*cipher)) {
+    if (!ss::Is2022Cipher(cipher->type)) {
         auto key = ss::DeriveKey(std::string(password), cipher->key_size);
         if (key.size != cipher->key_size) {
             return std::nullopt;

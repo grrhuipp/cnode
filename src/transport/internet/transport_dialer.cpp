@@ -1,5 +1,6 @@
 #include "acppnode/transport/internet/transport_dialer.hpp"
 #include "acppnode/common/buffer_util.hpp"
+#include "acppnode/transport/internet/async_write_gate.hpp"
 #include "acppnode/common/session.hpp"
 #include "acppnode/transport/internet/tcp_stream.hpp"
 #include "acppnode/transport/internet/transport_stack.hpp"
@@ -24,51 +25,12 @@ net::awaitable<DialResult> DialSingleCandidate(
     const OutboundTransportTarget& target,
     const OutboundDialCandidate& candidate);
 
-enum class XHttpOutboundMode {
-    StreamOne,
-    PacketUp,
-    StreamUp,
-    Unsupported,
-};
-
-[[nodiscard]] bool HasOnlyHttp11Alpn(const StreamSettings& settings) noexcept {
-    return settings.tls.alpn.size() == 1 &&
-           settings.tls.alpn.front() == "http/1.1";
-}
-
-[[nodiscard]] XHttpOutboundMode ResolveXHttpOutboundMode(
-    const StreamSettings& settings) noexcept {
-    const XHttpConfig& cfg = settings.xhttp;
-    if (cfg.mode.empty() || cfg.mode == "auto") {
-        if (cfg.download_settings) {
-            return XHttpOutboundMode::StreamUp;
-        }
-        if (settings.IsReality()) {
-            return XHttpOutboundMode::StreamOne;
-        }
-        if (settings.IsTls() && !HasOnlyHttp11Alpn(settings)) {
-            return XHttpOutboundMode::StreamUp;
-        }
-        return XHttpOutboundMode::PacketUp;
-    }
-    if (cfg.mode == "packet-up") {
-        return XHttpOutboundMode::PacketUp;
-    }
-    if (cfg.mode == "stream-up") {
-        return XHttpOutboundMode::StreamUp;
-    }
-    if (cfg.mode == "stream-one") {
-        return XHttpOutboundMode::StreamOne;
-    }
-    return XHttpOutboundMode::Unsupported;
-}
-
 [[nodiscard]] bool IsXHttpSplitOutbound(const OutboundTransportTarget& target) noexcept {
     if (!target.stream_settings || !target.stream_settings->IsXHttp()) {
         return false;
     }
     const auto mode = ResolveXHttpOutboundMode(*target.stream_settings);
-    return mode == XHttpOutboundMode::PacketUp || mode == XHttpOutboundMode::StreamUp;
+    return mode == XHttpMode::PacketUp || mode == XHttpMode::StreamUp;
 }
 
 [[nodiscard]] std::optional<OutboundDialCandidate> FirstDialCandidate(
@@ -107,19 +69,9 @@ void AppendU64Hex(memory::ThreadLocalString& out, uint64_t value) {
 
 [[nodiscard]] memory::ThreadLocalString BuildXHttpSplitPath(
     const XHttpConfig& cfg,
-    std::string_view session_id,
-    std::optional<uint64_t> seq) {
-    const std::string normalized = cfg.NormalizedPath();
-    memory::ThreadLocalString path(normalized.data(), normalized.size());
+    std::string_view session_id) {
+    memory::ThreadLocalString path(cfg.normalized_path);
     path.append(session_id);
-    if (seq) {
-        path.push_back('/');
-        std::array<char, 32> buf{};
-        auto [ptr, ec] = std::to_chars(buf.data(), buf.data() + buf.size(), *seq);
-        if (ec == std::errc{}) {
-            path.append(buf.data(), static_cast<size_t>(ptr - buf.data()));
-        }
-    }
     return path;
 }
 
@@ -127,22 +79,19 @@ void AppendU64Hex(memory::ThreadLocalString& out, uint64_t value) {
     throw IoSystemError(io_error::broken_pipe, what);
 }
 
+// Upload bytes written before the first upload request are coalesced into it,
+// so the protocol header shares that request; the limit bounds that deferral.
+constexpr size_t kMaxDeferredUploadBytes = 64 * 1024;
+
 class XHttpSplitClientStream final : public AsyncStream {
 public:
-    XHttpSplitClientStream(std::unique_ptr<AsyncStream> downlink,
-                           std::unique_ptr<AsyncStream> upload,
-                           uint64_t conn_id)
-        : downlink_(std::move(downlink))
-        , upload_(std::move(upload))
-        , conn_id_(conn_id) {}
-
     XHttpSplitClientStream(net::io_context& io_context,
                            std::unique_ptr<AsyncStream> downlink,
                            const OutboundTransportTarget& target,
                            const OutboundDialCandidate& candidate,
                            memory::ThreadLocalString upload_path,
                            uint64_t conn_id)
-        : io_context_(&io_context)
+        : io_context_(io_context)
         , downlink_(std::move(downlink))
         , target_(target)
         , candidate_(candidate)
@@ -163,8 +112,8 @@ public:
         if (!downlink_) {
             co_return 0;
         }
-        if (!upload_ && buf::HasData(pending_initial_)) {
-            co_await OpenUploadWithPendingInitial();
+        if (ReaderMustSendDeferredUpload()) {
+            co_await WriteUpload({});
         }
         co_return co_await downlink_->AsyncRead(buffer);
     }
@@ -173,7 +122,13 @@ public:
         if (buffer.size() == 0) {
             co_return 0;
         }
-        if (!upload_) {
+        // upload_failed_ is provisionally set while an open is in flight;
+        // only a finished failed open poisons the stream.
+        if (closed_ || (upload_failed_ && !upload_opening_)) {
+            ThrowXHttpPacketError("xhttp stream-up upload unavailable");
+        }
+        if (!upload_ && !upload_opening_ &&
+            buffer.size() <= kMaxDeferredUploadBytes - pending_initial_.byte_size()) {
             const auto* data = static_cast<const uint8_t*>(buffer.data());
             if (!buf::AppendSpanToMultiBuffer(
                     std::span<const uint8_t>(data, buffer.size()),
@@ -182,61 +137,37 @@ public:
             }
             co_return buffer.size();
         }
-        co_return co_await upload_->AsyncWrite(buffer);
+        if (upload_) co_return co_await upload_->AsyncWrite(buffer);
+        co_await WriteUpload({&buffer, 1});
+        co_return buffer.size();
     }
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
         if (!downlink_) {
             co_return buf::MultiBuffer{};
         }
-        if (!upload_ && buf::HasData(pending_initial_)) {
-            co_await OpenUploadWithPendingInitial();
+        if (ReaderMustSendDeferredUpload()) {
+            co_await WriteUpload({});
         }
         co_return co_await downlink_->ReadMultiBuffer();
     }
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
-        if (!upload_) {
-            ConstBufferSpanBuilder<16> payloads;
-            AppendPendingInitialBuffers(payloads);
-            payloads.AppendMultiBuffer(mb);
-            try {
-                if (!payloads.empty()) {
-                    co_await OpenUploadWithInitial(payloads.Span());
-                }
-            } catch (...) {
-                mb.clear();
-                throw;
-            }
-            mb.clear();
+        if (upload_) {
+            co_await upload_->WriteMultiBuffer(std::move(mb));
             co_return;
         }
-        co_await upload_->WriteMultiBuffer(std::move(mb));
+        ConstBufferSpanBuilder<16> payloads;
+        payloads.AppendMultiBuffer(mb);
+        co_await WriteUpload(payloads.Span());
     }
 
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
-        if (!upload_) {
-            bool has_data = buf::HasData(pending_initial_);
-            for (const auto& buffer : buffers) {
-                if (buffer.size() > 0) {
-                    has_data = true;
-                    break;
-                }
-            }
-            if (!has_data) {
-                co_return;
-            }
-            if (!buf::HasData(pending_initial_)) {
-                co_await OpenUploadWithInitial(buffers);
-            } else {
-                ConstBufferSpanBuilder<16> payloads;
-                AppendPendingInitialBuffers(payloads);
-                payloads.AppendBuffers(buffers);
-                co_await OpenUploadWithInitial(payloads.Span());
-            }
+        if (upload_) {
+            co_await upload_->WriteBuffers(buffers);
             co_return;
         }
-        co_await upload_->WriteBuffers(buffers);
+        co_await WriteUpload(buffers);
     }
 
     void ShutdownRead() override {
@@ -252,8 +183,8 @@ public:
     }
 
     net::awaitable<void> AsyncShutdownWrite() override {
-        if (!upload_ && buf::HasData(pending_initial_)) {
-            co_await OpenUploadWithPendingInitial();
+        if (!upload_ && (upload_opening_ || pending_initial_.byte_size() != 0)) {
+            co_await WriteUpload({});
         }
         if (upload_) {
             co_await upload_->AsyncShutdownWrite();
@@ -276,6 +207,7 @@ public:
             return;
         }
         closed_ = true;
+        upload_gate_.Cancel();
         if (upload_) {
             upload_->Close();
         }
@@ -290,6 +222,7 @@ public:
             return;
         }
         closed_ = true;
+        upload_gate_.Cancel();
         if (upload_) {
             upload_->CloseAbortive();
         }
@@ -316,27 +249,41 @@ protected:
     }
 
 private:
-    void AppendPendingInitialBuffers(ConstBufferSpanBuilder<16>& out) {
-        out.AppendMultiBuffer(pending_initial_);
+    // A reader may wait for the reply to deferred bytes (e.g. a protocol
+    // header); it sends them unless a writer is already opening the upload.
+    [[nodiscard]] bool ReaderMustSendDeferredUpload() const noexcept {
+        return !upload_ && !upload_opening_ && pending_initial_.byte_size() != 0;
     }
 
-    net::awaitable<void> OpenUploadWithPendingInitial() {
-        ConstBufferSpanBuilder<16> payloads;
-        AppendPendingInitialBuffers(payloads);
-        co_await OpenUploadWithInitial(payloads.Span());
-    }
-
-    net::awaitable<void> OpenUploadWithInitial(
-        std::span<const net::const_buffer> initial_payload) {
+    // Single-flight: the first caller opens the upload request carrying the
+    // deferred bytes followed by |payload|; callers queued behind it write
+    // |payload| to the opened upload. A failed open poisons the stream, since
+    // the deferred bytes are gone with it.
+    net::awaitable<void> WriteUpload(std::span<const net::const_buffer> payload) {
+        auto lease = upload_gate_.TryAcquire();
+        if (!lease) lease = co_await upload_gate_.Acquire();
+        if (!lease || closed_ || upload_failed_) {
+            ThrowXHttpPacketError("xhttp stream-up upload unavailable");
+        }
         if (upload_) {
-            co_await upload_->WriteBuffers(initial_payload);
+            if (!payload.empty()) co_await upload_->WriteBuffers(payload);
             co_return;
         }
-        if (!io_context_ || !target_.stream_settings) {
-            ThrowXHttpPacketError("xhttp stream-up missing target");
-        }
 
-        auto tcp_result = co_await DialSingleCandidate(*io_context_, target_, candidate_);
+        const buf::MultiBuffer initial = std::move(pending_initial_);
+        ConstBufferSpanBuilder<16> initial_payload;
+        initial_payload.AppendMultiBuffer(initial);
+        initial_payload.AppendBuffers(payload);
+        if (initial_payload.empty()) co_return;
+
+        upload_failed_ = true;
+        upload_opening_ = true;
+        struct OpeningScope {
+            bool& opening;
+            ~OpeningScope() { opening = false; }
+        } opening_scope{upload_opening_};
+
+        auto tcp_result = co_await DialSingleCandidate(io_context_, target_, candidate_);
         if (!tcp_result.Ok()) {
             ThrowXHttpPacketError("xhttp stream-up dial failed");
         }
@@ -346,29 +293,37 @@ private:
         auto build_result = co_await BuildOutboundXHttpClientRequest(
             std::move(tcp_result.stream),
             *target_.stream_settings,
+            target_.security_context,
             target_.tls_server_name,
             target_.ws_host,
             upload_path_,
             XHttpClientRequestKind::StreamUp,
-            initial_payload,
+            initial_payload.Span(),
             conn_id_);
         if (!build_result || !*build_result) {
             ThrowXHttpPacketError("xhttp stream-up request failed");
         }
+        if (closed_) {
+            (*build_result)->CloseAbortive();
+            ThrowXHttpPacketError("xhttp stream-up closed while opening");
+        }
         upload_ = std::move(*build_result);
         upload_->ClearPhaseDeadline();
         upload_->SetIdleTimeout(std::chrono::seconds(0));
-        pending_initial_.clear();
+        upload_failed_ = false;
     }
 
-    net::io_context* io_context_ = nullptr;
+    net::io_context& io_context_;
     std::unique_ptr<AsyncStream> downlink_;
     std::unique_ptr<AsyncStream> upload_;
     OutboundTransportTarget target_;
     OutboundDialCandidate candidate_;
     memory::ThreadLocalString upload_path_;
     buf::MultiBuffer pending_initial_;
+    transport::internet::AsyncWriteGate upload_gate_;
     uint64_t conn_id_ = 0;
+    bool upload_opening_ = false;
+    bool upload_failed_ = false;
     bool closed_ = false;
 };
 
@@ -378,13 +333,13 @@ public:
                               std::unique_ptr<AsyncStream> downlink,
                               const OutboundTransportTarget& target,
                               const OutboundDialCandidate& candidate,
-                              memory::ThreadLocalString session_id,
+                              memory::ThreadLocalString upload_path,
                               uint64_t conn_id)
         : io_context_(io_context)
         , downlink_(std::move(downlink))
         , target_(target)
         , candidate_(candidate)
-        , session_id_(std::move(session_id))
+        , upload_path_(std::move(upload_path))
         , conn_id_(conn_id) {
         if (!target_.stream_settings) {
             ThrowXHttpPacketError("xhttp packet-up missing stream settings");
@@ -519,13 +474,14 @@ protected:
 
 private:
     net::awaitable<void> SendPacket(std::span<const net::const_buffer> payloads) {
-        if (!target_.stream_settings) {
-            ThrowXHttpPacketError("xhttp packet-up missing stream settings");
-        }
-        memory::ThreadLocalString path = BuildXHttpSplitPath(
-            target_.stream_settings->xhttp,
-            session_id_,
-            next_seq_);
+        // Packet-up request target: "<upload path>/<seq>".
+        memory::ThreadLocalString path(upload_path_);
+        path.push_back('/');
+        std::array<char, 20> seq_text{};
+        const auto [seq_end, ec] = std::to_chars(
+            seq_text.data(), seq_text.data() + seq_text.size(), next_seq_);
+        (void)ec;  // 20 digits always fit a uint64_t.
+        path.append(seq_text.data(), static_cast<size_t>(seq_end - seq_text.data()));
 
         auto tcp_result = co_await DialSingleCandidate(io_context_, target_, candidate_);
         if (!tcp_result.Ok()) {
@@ -537,6 +493,7 @@ private:
         auto build_result = co_await BuildOutboundXHttpClientRequest(
             std::move(tcp_result.stream),
             *target_.stream_settings,
+            target_.security_context,
             target_.tls_server_name,
             target_.ws_host,
             path,
@@ -553,7 +510,7 @@ private:
     std::unique_ptr<AsyncStream> downlink_;
     OutboundTransportTarget target_;
     OutboundDialCandidate candidate_;
-    memory::ThreadLocalString session_id_;
+    memory::ThreadLocalString upload_path_;
     uint64_t conn_id_ = 0;
     uint64_t next_seq_ = 0;
     bool write_closed_ = false;
@@ -600,6 +557,7 @@ net::awaitable<DialResult> DialAndBuildXHttpRequestCandidate(
     auto build_result = co_await BuildOutboundXHttpClientRequest(
         std::move(tcp_result.stream),
         *target.stream_settings,
+        target.security_context,
         target.tls_server_name,
         target.ws_host,
         path,
@@ -651,6 +609,7 @@ net::awaitable<DialResult> DialAndBuildSingleCandidate(
     auto build_result = co_await BuildOutboundTransport(
         std::move(tcp_result.stream),
         *target.stream_settings,
+        target.security_context,
         target.tls_server_name,
         target.ws_host,
         ctx.conn_id);
@@ -704,15 +663,14 @@ net::awaitable<DialResult> DialAndBuildCandidatesSequential(
 net::awaitable<DialResult> DialXHttpSplitOutboundTransport(
     net::io_context& io_context,
     session::Context& ctx,
-    const OutboundTransportTarget& target,
-    std::span<const OutboundDialCandidate> candidates) {
+    const OutboundTransportTarget& target) {
 
     if (!target.stream_settings) {
         co_return DialResult::Fail(ErrorCode::INVALID_ARGUMENT, "missing stream settings");
     }
 
     const auto mode = ResolveXHttpOutboundMode(*target.stream_settings);
-    if (mode != XHttpOutboundMode::PacketUp && mode != XHttpOutboundMode::StreamUp) {
+    if (mode != XHttpMode::PacketUp && mode != XHttpMode::StreamUp) {
         co_return DialResult::Fail(ErrorCode::PROTOCOL_UNSUPPORTED, "unsupported xhttp mode");
     }
 
@@ -726,13 +684,9 @@ net::awaitable<DialResult> DialXHttpSplitOutboundTransport(
 
     const memory::ThreadLocalString session_id = MakeXHttpSessionId(ctx.conn_id);
     const memory::ThreadLocalString downlink_path = BuildXHttpSplitPath(
-        downlink_target.stream_settings->xhttp,
-        session_id,
-        std::nullopt);
+        downlink_target.stream_settings->xhttp, session_id);
     const memory::ThreadLocalString upload_path = BuildXHttpSplitPath(
-        target.stream_settings->xhttp,
-        session_id,
-        std::nullopt);
+        target.stream_settings->xhttp, session_id);
 
     DialResult last_result =
         DialResult::Fail(ErrorCode::DIAL_CONNECT_FAILED, "all xhttp candidates failed");
@@ -785,14 +739,14 @@ net::awaitable<DialResult> DialXHttpSplitOutboundTransport(
             "missing xhttp upload candidate");
     }
 
-    if (mode == XHttpOutboundMode::PacketUp) {
+    if (mode == XHttpMode::PacketUp) {
         auto result = DialResult::Success(
             std::make_unique<XHttpPacketUpClientStream>(
                 io_context,
                 std::move(downlink),
                 target,
                 *upload_candidate,
-                session_id,
+                upload_path,
                 ctx.conn_id));
         result.attempted_remote_addr = selected->endpoint.address();
         co_return result;
@@ -824,20 +778,7 @@ net::awaitable<DialResult> DialOutboundTransport(
         result = DialResult::Fail(
             ErrorCode::INVALID_ARGUMENT, "invalid outbound transport target");
     } else if (IsXHttpSplitOutbound(target)) {
-        if (target.single_candidate) {
-            std::array<OutboundDialCandidate, 1> candidates{*target.single_candidate};
-            result = co_await DialXHttpSplitOutboundTransport(
-                io_context,
-                ctx,
-                target,
-                candidates);
-        } else {
-            result = co_await DialXHttpSplitOutboundTransport(
-                io_context,
-                ctx,
-                target,
-                target.candidates);
-        }
+        result = co_await DialXHttpSplitOutboundTransport(io_context, ctx, target);
     } else if (target.single_candidate) {
         result = co_await DialAndBuildSingleCandidate(
             io_context, ctx, target, *target.single_candidate);

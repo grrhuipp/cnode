@@ -14,33 +14,23 @@
 
 namespace acpp {
 
-// ============================================================================
-// OutboundDialCandidate - 单个候选拨号地址
-// ============================================================================
+class SslContext;
+
+// 单个候选拨号地址
 struct OutboundDialCandidate {
     tcp::endpoint endpoint;
     std::optional<net::ip::address> bind_local;  // 可按候选 IP 单独决定绑定地址
 };
 
-// ============================================================================
-// OutboundTransportTarget - 出站传输目标（仅携带已解析拨号候选）
-//
-// 这是 transport/internet 的拨号输入，不属于 proxy 出站协议壳。
-// ============================================================================
+// 出站传输目标（仅携带已解析拨号候选）：transport/internet 的拨号输入，
+// 不属于 proxy 出站协议壳。
 struct OutboundTransportTarget {
-    enum class BindMode : uint8_t {
-        None = 0,
-        Auto,
-        Explicit,
-        Ordered,
-    };
-
     std::optional<OutboundDialCandidate> single_candidate; // 单个已解析候选，避免每连接 vector 分配
     memory::ThreadLocalVector<OutboundDialCandidate> candidates; // 已解析候选地址（按优先级排序）
-    BindMode bind_mode = BindMode::None;
     std::string_view tls_server_name;               // TLS SNI（冷路径配置视图，可空）
-    memory::ThreadLocalString ws_host;              // WS Host header（已按端口格式化，仅 WS 使用）
+    memory::ThreadLocalString ws_host;              // HTTP Host/authority（WS、HTTPUpgrade、gRPC、XHTTP，已按端口格式化）
     const StreamSettings* stream_settings = nullptr; // 必填：冷路径准备好的传输层组合配置
+    SslContext* security_context = nullptr;          // TLS/REALITY 时必填：出站 handler 的 Worker 私有上下文
     std::chrono::seconds timeout{defaults::kDialTimeout};
 
     // XHTTP packet-up / stream-up 可用独立下行入口；仅保存已解析候选和不可变配置视图。

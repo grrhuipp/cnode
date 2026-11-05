@@ -31,12 +31,6 @@ ParseRealityMldsa65Seed(std::string_view value) noexcept;
 [[nodiscard]] tl::expected<RealityMldsa65PublicKey, RealityKeyError>
 ParseRealityMldsa65PublicKey(std::string_view value) noexcept;
 
-[[nodiscard]] std::optional<RealityMldsa65PublicKey>
-DeriveRealityMldsa65PublicKeyFromSeed(const RealityKey& seed) noexcept;
-
-[[nodiscard]] std::string
-EncodeRealityBase64Url(std::span<const uint8_t> bytes);
-
 [[nodiscard]] std::optional<std::string>
 NormalizeRealityFingerprint(std::string_view value);
 

@@ -48,7 +48,6 @@ struct DNSWorker::Impl {
     Impl(net::io_context& io_context, const Config& config, size_t mailbox_capacity);
 
     net::awaitable<DnsResult> ResolveOwned(std::string domain);
-    net::awaitable<DnsCacheStats> ReadCacheStats();
 
     net::awaitable<DnsResult> ResolveUncached(std::string_view domain);
     net::awaitable<DnsResult> DoResolve(std::string_view domain);
@@ -56,9 +55,9 @@ struct DNSWorker::Impl {
         DatagramExchange& server,
         std::string_view domain,
         bool query_aaaa);
+    // Leaves the ID zero; DatagramExchange writes an unpredictable ID before send.
     static size_t BuildQueryTo(std::span<uint8_t, 280> query,
                                std::string_view domain,
-                               uint16_t txid,
                                bool query_aaaa) noexcept;
     DnsResult ParseResponse(std::span<const uint8_t> response, uint16_t expected_txid);
 
@@ -111,8 +110,7 @@ net::awaitable<DnsResult> DNSWorker::Impl::ResolveOwned(std::string owned_domain
         co_return result;
     }
 
-    if (owned_domain.back() == '.') owned_domain.pop_back();
-    for (char& c : owned_domain) if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+    acpp::domain::NormalizeDnsHostnameInPlace(owned_domain);
     domain = owned_domain;
     if (auto cached = cache.GetResult(domain)) {
         co_return std::move(*cached);
@@ -170,7 +168,7 @@ net::awaitable<DnsResult> DNSWorker::Impl::DoResolve(
         auto collect = [&](size_t index) -> net::awaitable<void> {
             answers[index] = co_await QueryServer(*server, domain, index == kAddressQueryAttempts);
         };
-        co_await RunAwaitableTaskGroup(io_context.get_executor(), [&](AwaitableTaskGroup& group) {
+        co_await RunAwaitableTaskGroup(co_await net::this_coro::executor, [&](AwaitableTaskGroup& group) {
             for (size_t i = 0; i < answers.size(); ++i) group.Spawn(collect(i));
         });
         if (stopping || std::ranges::any_of(answers, [](const DnsResult& answer) {
@@ -243,7 +241,7 @@ net::awaitable<DnsResult> DNSWorker::Impl::QueryServer(
     bool query_aaaa) {
     DnsResult result;
     std::array<uint8_t, 280> query{};
-    const size_t query_size = BuildQueryTo(query, domain, 0, query_aaaa);
+    const size_t query_size = BuildQueryTo(query, domain, query_aaaa);
     auto response = co_await server.Exchange(
         std::span<uint8_t>(query.data(), query_size),
         std::chrono::seconds(config.timeout_sec));
@@ -262,10 +260,7 @@ net::awaitable<DnsResult> DNSWorker::Impl::QueryServer(
 size_t DNSWorker::Impl::BuildQueryTo(
     std::span<uint8_t, 280> query,
     std::string_view domain,
-    uint16_t txid,
     bool query_aaaa) noexcept {
-    query[0] = static_cast<uint8_t>(txid >> 8);
-    query[1] = static_cast<uint8_t>(txid & 0xFF);
     query[2] = 0x01;
     query[3] = 0x00;
     query[4] = 0x00;
@@ -455,10 +450,6 @@ DnsResult DNSWorker::Impl::ParseResponse(
     return result;
 }
 
-net::awaitable<DnsCacheStats> DNSWorker::Impl::ReadCacheStats() {
-    co_return cache.GetStats();
-}
-
 DNSWorker::DNSWorker(net::io_context& main_context,
                      const Config& config, size_t mailbox_capacity)
     : impl_(std::make_unique<Impl>(main_context, config, mailbox_capacity)) {}
@@ -498,7 +489,7 @@ net::awaitable<DnsResult> DNSWorker::Resolve(std::string domain) {
 }
 
 net::awaitable<DnsCacheStats> DNSWorker::GetCacheStats() {
-    return impl_->mailbox.Post(impl_->ReadCacheStats());
+    return impl_->mailbox.PostCall([impl = impl_.get()] { return impl->cache.GetStats(); });
 }
 
 net::awaitable<DnsResult> DNS::Resolve(std::string_view domain) {

@@ -38,10 +38,11 @@ public:
     SessionTrackingState();
     ~SessionTrackingState();
 
+    // Active sessions borrow bucket and account addresses inside this owner.
     SessionTrackingState(const SessionTrackingState&) = delete;
     SessionTrackingState& operator=(const SessionTrackingState&) = delete;
-    SessionTrackingState(SessionTrackingState&&) noexcept;
-    SessionTrackingState& operator=(SessionTrackingState&&) noexcept;
+    SessionTrackingState(SessionTrackingState&&) = delete;
+    SessionTrackingState& operator=(SessionTrackingState&&) = delete;
 
     void RegisterActiveSession(ActiveSession& node,
                                std::string_view tag,
@@ -50,7 +51,10 @@ public:
 
     void UnregisterActiveSession(ActiveSession& node) noexcept;
 
-    [[nodiscard]] UserTrafficSnapshot CollectAndResetTraffic(std::string_view tag);
+    [[nodiscard]] UserTrafficSnapshot SnapshotTraffic(std::string_view tag);
+    // Deduct only an already-durable snapshot. Later traffic remains pending.
+    void CommitTraffic(std::string_view tag, const UserTrafficCounters& snapshot);
+    [[nodiscard]] bool HasPendingTraffic() const noexcept;
 
 private:
     struct AccountBucket {

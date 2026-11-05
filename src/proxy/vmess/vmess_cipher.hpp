@@ -26,12 +26,12 @@ namespace vmess {
 // ============================================================================
 // VMessCipher — 单方向 AEAD per-chunk 加密/解密器
 //
-// 支持：AES-128-GCM、ChaCha20-Poly1305
+// 支持：AES-128-GCM、ChaCha20-Poly1305；NONE/ZERO 原样复制。
 // 每次 Encrypt/Decrypt 递增内部计数器（16-bit，嵌入 nonce）。
+// 其他 Security 值构造即抛出，不进入数据路径。
 // ============================================================================
 class VMessCipher {
 public:
-    VMessCipher(Security security, const uint8_t* key, const uint8_t* iv);
     VMessCipher(Security security, const uint8_t* key, const uint8_t* iv,
                 proxy::AeadDirection direction);
     ~VMessCipher() = default;
@@ -54,10 +54,6 @@ public:
 
 private:
     void BuildNonce(uint16_t count, uint8_t* nonce);
-
-    // ChaCha20-Poly1305 需要 32 字节密钥，从 16 字节扩展：
-    //   key32[0:16] = MD5(key16), key32[16:32] = MD5(key32[0:16])
-    static void GenerateChaCha20Key(const uint8_t* key16, uint8_t* key32);
 
     Security security_;
     std::array<uint8_t, 16> iv_;

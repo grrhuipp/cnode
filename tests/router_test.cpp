@@ -133,7 +133,7 @@ private:
 void TestInboundMetadataOwnershipAndRouting() {
     using acpp::session::Context;
     {
-        acpp::memory::ThreadPoolFacade worker_pool;
+        acpp::memory::ThreadMemoryResource worker_pool;
         CountingPmrResource counted_worker_pool(worker_pool);
         {
             ScopedDefaultResource use_counted_worker_pool(counted_worker_pool);
@@ -173,15 +173,13 @@ void TestInboundMetadataOwnershipAndRouting() {
                             counted_worker_pool.OutstandingAllocations() > baseline_allocations &&
                             counted_worker_pool.OutstandingBytes() > baseline_bytes,
                         "long inbound metadata and its copy must allocate through Worker PMR");
-                Require(ctx.pool() == &counted_worker_pool &&
-                            copy.pool() == &counted_worker_pool &&
-                            ctx.inbound.tag.get_allocator().resource() == ctx.pool() &&
-                            ctx.inbound.accounting_key.get_allocator().resource() == ctx.pool() &&
-                            ctx.inbound.user_email.get_allocator().resource() == ctx.pool() &&
-                            ctx.inbound.tags.get_allocator().resource() == ctx.pool() &&
-                            ctx.inbound.tags[0].get_allocator().resource() == ctx.pool() &&
-                            copy.inbound.tag.get_allocator().resource() == copy.pool() &&
-                            copy.inbound.tags[0].get_allocator().resource() == copy.pool(),
+                Require(ctx.inbound.tag.get_allocator().resource() == &counted_worker_pool &&
+                            ctx.inbound.accounting_key.get_allocator().resource() == &counted_worker_pool &&
+                            ctx.inbound.user_email.get_allocator().resource() == &counted_worker_pool &&
+                            ctx.inbound.tags.get_allocator().resource() == &counted_worker_pool &&
+                            ctx.inbound.tags[0].get_allocator().resource() == &counted_worker_pool &&
+                            copy.inbound.tag.get_allocator().resource() == &counted_worker_pool &&
+                            copy.inbound.tags[0].get_allocator().resource() == &counted_worker_pool,
                         "inbound metadata and Context copies must use the Context pool resource");
                 ctx.inbound.tag[0] = 'c';
                 const size_t allocs_before_ipv6 = counted_worker_pool.TotalAllocations();

@@ -2,14 +2,16 @@
 #include "acppnode/common/domain_name.hpp"
 #include "acppnode/common/ip_address.hpp"
 #include "../encoding/client.hpp"
+#include "../vmess_crypto.hpp"
 #include "../udp_datagram.hpp"
 #include "acppnode/app/relay.hpp"
 #include "acppnode/app/dns/dns.hpp"
 #include "acppnode/app/proxyman/outbound/factory.hpp"
 #include "../../../app/proxyman/outbound/registration.hpp"
-#include "acppnode/infra/json_port.hpp"
+#include "acppnode/infra/json_field.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/infra/config_types.hpp"
+#include "acppnode/core/naming.hpp"
 #include "acppnode/common/error.hpp"
 #include "acppnode/common/session.hpp"
 #include "acppnode/transport/link.hpp"
@@ -40,15 +42,7 @@ public:
         , udp_target_(udp_target) {}
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
-        if (!response_header_read_) {
-            if (!co_await session_.DecodeResponseHeader(stream_)) {
-                throw IoSystemError(
-                    io_error::connection_reset,
-                    "VMess client read response header failed");
-            }
-            response_header_read_ = true;
-        }
-        auto mb = co_await session_.DecodeResponseBody(stream_);
+        auto mb = co_await session_.DecodeResponse(stream_);
         if (is_udp_) {
             for (buf::Buffer* buffer : mb) {
                 if (buffer && !buffer->IsEmpty()) {
@@ -62,13 +56,6 @@ public:
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
         if (is_udp_) {
             ::acpp::vmess::ValidateFixedUdpDatagram(mb, udp_target_);
-            for (buf::Buffer* buffer : mb) {
-                if (buffer) {
-                    buffer->ClearUDP();
-                }
-            }
-            co_await session_.EncodeRequestBody(stream_, std::move(mb));
-            co_return;
         }
         co_await session_.EncodeRequestBody(stream_, std::move(mb));
     }
@@ -117,7 +104,6 @@ public:
 private:
     vmess::encoding::ClientSession& session_;
     AsyncStream& stream_;
-    bool response_header_read_ = false;
     bool is_udp_ = false;
     const TargetAddress& udp_target_;
 };
@@ -127,6 +113,7 @@ DialOutboundStream(
     net::io_context& io_context,
     app::dns::DNS& dns_service,
     const proxy::vmess::outbound::PreparedSettings& prepared,
+    const TransportSecurity& security,
     std::chrono::seconds dial_timeout,
     const tcp::endpoint* inbound_local_addr,
     session::Context& ctx) {
@@ -136,6 +123,7 @@ DialOutboundStream(
         .literal_address = prepared.config.literal_address,
         .port = prepared.config.port,
         .stream_settings = &prepared.config.stream_settings,
+        .security = &security,
         .timeout = dial_timeout,
         .send_through = &prepared.config.send_through,
         .inbound_local_addr = inbound_local_addr,
@@ -186,10 +174,7 @@ SendVMessHandshake(
 
     auto handshake_result = co_await vmess_session.EncodeRequestHeader(stream);
     if (!handshake_result) {
-        ErrorCode code = handshake_result.error();
-        if (code == ErrorCode::OK) {
-            code = ErrorCode::PROTOCOL_AUTH_FAILED;
-        }
+        const ErrorCode code = handshake_result.error();
         LOG_NET_WARN("[conn={}] VMessOutbound: protocol handshake failed: {}",
                       ctx.conn_id, ErrorCodeToString(code));
         stream.Cancel();
@@ -209,8 +194,9 @@ SendVMessHandshake(
 proxy::vmess::outbound::Handler::Handler(
     std::string_view tag, std::shared_ptr<const PreparedSettings> prepared,
     ::acpp::app::dns::DNS& dns_service, std::chrono::seconds dial_timeout)
-    : tag_(tag), prepared_(std::move(prepared)), dial_timeout_(dial_timeout),
-      dns_service_(dns_service) {
+    : tag_(tag), prepared_(std::move(prepared)),
+      security_(prepared_->config.stream_settings, StreamEndpointRole::Outbound),
+      dial_timeout_(dial_timeout), dns_service_(dns_service) {
     LOG_DEBUG("VMess outbound '{}' created: {}:{}, network={}, security={}",
               tag_, prepared_->config.address, prepared_->config.port,
               prepared_->config.stream_settings.network,
@@ -235,7 +221,8 @@ proxy::vmess::outbound::Handler::Process(
     const auto& target = ctx.outbound.target;
 
     auto dialed = co_await DialOutboundStream(
-        io_context, dns_service_, *prepared_, dial_timeout_, inbound_local_addr, ctx);
+        io_context, dns_service_, *prepared_, security_, dial_timeout_,
+        inbound_local_addr, ctx);
     if (!dialed) {
         co_return tl::unexpected(dialed.error());
     }
@@ -244,6 +231,7 @@ proxy::vmess::outbound::Handler::Process(
     const bool is_udp = ctx.content.network == Network::UDP;
     ::acpp::vmess::encoding::ClientSession vmess_session(
         prepared_->user,
+        prepared_->auth_id_key,
         target,
         prepared_->config.security,
         is_udp ? ::acpp::vmess::Command::UDP : ::acpp::vmess::Command::TCP);
@@ -258,13 +246,8 @@ proxy::vmess::outbound::Handler::Process(
     stream->ClearPhaseDeadline();
 
     VMessOutboundEndpoint target_endpoint(vmess_session, *stream, is_udp, target);
-    if (inbound.control) {
-        co_return co_await DoRelayLink(
-            io_context, *inbound.reader, *inbound.writer, *inbound.control,
-            target_endpoint, ctx, stats, relay_config, std::move(first_payload));
-    }
     co_return co_await DoRelayLink(
-        io_context, *inbound.reader, *inbound.writer,
+        io_context, *inbound.reader, *inbound.writer, inbound.control,
         target_endpoint, ctx, stats, relay_config, std::move(first_payload));
 }
 
@@ -280,33 +263,28 @@ const bool kVMessRegistered = (acpp::proxyman::outbound::RegisterProxy(
         -> std::optional<acpp::proxyman::outbound::PreparedOutboundCreator> {
         const auto& s = cfg.settings;
 
-        auto json_string = [](const acpp::json::object& obj,
-                              std::string_view key) -> std::string {
-            if (const auto* v = obj.if_contains(key); v && v->is_string()) {
-                return std::string(v->as_string());
+        // A present field of the wrong type is a configuration error, never
+        // an implicit default.
+        bool invalid_field = false;
+        auto json_string = [&](const acpp::json::object& obj,
+                               std::string_view key) -> std::string {
+            auto parsed = acpp::ParseJsonString(obj, key);
+            if (!parsed) {
+                LOG_ERROR("VMess outbound '{}': {}", cfg.tag, parsed.error());
+                invalid_field = true;
+                return {};
             }
-            return {};
+            return std::move(*parsed).value_or(std::string{});
         };
         auto has_supported_alter_id = [](const acpp::json::object& obj) {
             const auto* value = obj.if_contains("alterId");
             if (!value) return true;
-            if (value->is_int64() && value->as_int64() == 0) return true;
-            if (value->is_uint64() && value->as_uint64() == 0) return true;
-            return false;
-        };
-        auto lower_ascii = [](std::string text) {
-            std::transform(
-                text.begin(),
-                text.end(),
-                text.begin(),
-                [](unsigned char c) {
-                    return static_cast<char>(std::tolower(c));
-                });
-            return text;
+            const auto alter_id = acpp::JsonUnsignedInteger(*value);
+            return alter_id && *alter_id == 0;
         };
         auto parse_security = [&](std::string security)
             -> std::optional<acpp::vmess::Security> {
-            security = lower_ascii(std::move(security));
+            security = acpp::naming::LowerAscii(std::move(security));
             if (security.empty() ||
                 security == acpp::constants::protocol::kAes128Gcm ||
                 security == acpp::constants::binding::kAuto) {
@@ -377,6 +355,9 @@ const bool kVMessRegistered = (acpp::proxyman::outbound::RegisterProxy(
             }
             vmess_config.security = *parsed_security;
         }
+        if (invalid_field) {
+            return std::nullopt;
+        }
 
         vmess_config.send_through = cfg.send_through.value_or(acpp::OutboundBind{});
         vmess_config.stream_settings = acpp::NormalizeOutboundStreamSettings(
@@ -402,6 +383,8 @@ const bool kVMessRegistered = (acpp::proxyman::outbound::RegisterProxy(
             LOG_ERROR("vmess outbound '{}': address must be an IP literal or DNS hostname", cfg.tag);
             return std::nullopt;
         }
+        acpp::TransportSecurity::Prepare(
+            vmess_config.stream_settings, acpp::StreamEndpointRole::Outbound);
 
         using PreparedSettings = acpp::proxy::vmess::outbound::PreparedSettings;
         return acpp::proxyman::outbound::MakePreparedOutboundCreator<
@@ -410,9 +393,11 @@ const bool kVMessRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 std::shared_ptr<const PreparedSettings> state,
                 acpp::net::io_context& /*io_context*/,
                 acpp::app::dns::DNS& dns,
-                std::chrono::seconds timeout) -> std::unique_ptr<acpp::Outbound> {
+                std::chrono::seconds timeout,
+                acpp::AwaitableTaskGroup& /*tasks*/) -> std::unique_ptr<acpp::Outbound> {
                 return std::make_unique<acpp::proxy::vmess::outbound::Handler>(
                     tag, std::move(state), dns, timeout);
-            }>(PreparedSettings{std::move(vmess_config), std::move(*user)});
+            }>(PreparedSettings{std::move(vmess_config), *user,
+                                acpp::vmess::ExpandAuthIDEncryptKey(user->auth_key)});
     }), true);
 }  // namespace

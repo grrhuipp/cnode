@@ -4,105 +4,20 @@
 #include "acppnode/common/address_codec.hpp"
 
 #include <algorithm>
-#include <cstring>
+#include <array>
 #include <limits>
-#include <string>
 
 namespace acpp::mux {
 
+namespace {
 
-class MultiBufferFrameReader {
-public:
-    MultiBufferFrameReader(const buf::MultiBuffer& data, size_t offset, size_t size) noexcept
-        : data_(data), offset_(offset), size_(size) {}
+// 元数据必须被完整消费，超出最大合法布局（含 GlobalID）的 MetaLen 无需等待数据即可判定非法；
+// Xray-core 解码端同样拒绝超长 metaLen。
+constexpr size_t kMaxFrameMetadataBytes = 4 + 1 + kMaxEncodedAddressSize + 8;
+// MetaLen + 元数据 + DataLen：解码所需的全部连续前缀
+constexpr size_t kMaxFramePrefixBytes = 2 + kMaxFrameMetadataBytes + 2;
 
-    [[nodiscard]] bool Ok() const noexcept { return !error_; }
-    [[nodiscard]] size_t Remaining() const noexcept {
-        return error_ || pos_ > size_ ? 0 : size_ - pos_;
-    }
-    [[nodiscard]] size_t Position() const noexcept { return pos_; }
-
-    [[nodiscard]] uint8_t ReadU8() noexcept {
-        uint8_t out = 0;
-        if (!ReadBytes(std::span<uint8_t>(&out, 1))) {
-            return 0;
-        }
-        return out;
-    }
-
-    [[nodiscard]] uint16_t ReadU16BE() noexcept {
-        std::array<uint8_t, 2> bytes{};
-        if (!ReadBytes(bytes)) {
-            return 0;
-        }
-        return static_cast<uint16_t>(
-            (static_cast<uint16_t>(bytes[0]) << 8) |
-            static_cast<uint16_t>(bytes[1]));
-    }
-
-    [[nodiscard]] std::optional<uint8_t> Peek() noexcept {
-        if (!CanRead(1)) {
-            return std::nullopt;
-        }
-        uint8_t out = 0;
-        if (!CopyAt(offset_ + pos_, std::span<uint8_t>(&out, 1))) {
-            return std::nullopt;
-        }
-        return out;
-    }
-
-    [[nodiscard]] bool ReadBytes(std::span<uint8_t> out) noexcept {
-        if (!CanRead(out.size())) {
-            return false;
-        }
-        if (!CopyAt(offset_ + pos_, out)) {
-            error_ = true;
-            return false;
-        }
-        pos_ += out.size();
-        return true;
-    }
-
-private:
-    [[nodiscard]] bool CanRead(size_t n) noexcept {
-        if (error_ || pos_ + n > size_) {
-            error_ = true;
-            return false;
-        }
-        return true;
-    }
-
-    [[nodiscard]] bool CopyAt(size_t absolute_offset, std::span<uint8_t> out) const noexcept {
-        size_t skip = absolute_offset;
-        size_t copied = 0;
-        for (const auto* buffer : data_) {
-            if (!buffer || buffer->IsEmpty()) {
-                continue;
-            }
-            const auto bytes = buffer->Bytes();
-            if (skip >= bytes.size()) {
-                skip -= bytes.size();
-                continue;
-            }
-            const size_t n = std::min(bytes.size() - skip, out.size() - copied);
-            std::memcpy(out.data() + copied, bytes.data() + skip, n);
-            copied += n;
-            if (copied == out.size()) {
-                return true;
-            }
-            skip = 0;
-        }
-        return copied == out.size();
-    }
-
-    const buf::MultiBuffer& data_;
-    size_t offset_ = 0;
-    size_t size_ = 0;
-    size_t pos_ = 0;
-    bool error_ = false;
-};
-
-static bool ParsePortThenAddress(ByteReader& reader, TargetAddress& target) {
+[[nodiscard]] bool ParsePortThenAddress(ByteReader& reader, TargetAddress& target) {
     auto view = reader;
     auto decoded = DecodeAddress(view.ReadBytes(view.Remaining()),
                                  AddressWireFormat::PortFirst);
@@ -112,50 +27,7 @@ static bool ParsePortThenAddress(ByteReader& reader, TargetAddress& target) {
     return target.IsValid();
 }
 
-static bool ParsePortThenAddress(MultiBufferFrameReader& reader, TargetAddress& target) {
-    std::array<uint8_t, kMaxEncodedAddressSize> bytes{};
-    size_t size = 0;
-    for (;;) {
-        auto decoded = DecodeAddress(std::span<const uint8_t>(bytes.data(), size),
-                                     AddressWireFormat::PortFirst);
-        if (decoded.status == AddressDecodeStatus::Invalid) return false;
-        if (decoded.status == AddressDecodeStatus::Complete) {
-            target = std::move(decoded.target);
-            return target.IsValid();
-        }
-        if (!reader.ReadBytes(std::span<uint8_t>(
-                bytes.data() + size, decoded.required - size))) return false;
-        size = decoded.required;
-    }
-}
-
-// ============================================================================
-// DecodeFrame
-// ============================================================================
-
-[[nodiscard]] static FrameHeader InvalidFrame() noexcept {
-    return FrameHeader{};
-}
-
-[[nodiscard]] static bool ReadGlobalId(
-    ByteReader& reader,
-    std::array<uint8_t, 8>& out) noexcept {
-    const auto bytes = reader.ReadBytes(out.size());
-    if (!reader.Ok()) {
-        return false;
-    }
-    std::memcpy(out.data(), bytes.data(), out.size());
-    return true;
-}
-
-[[nodiscard]] static bool ReadGlobalId(
-    MultiBufferFrameReader& reader,
-    std::array<uint8_t, 8>& out) noexcept {
-    return reader.ReadBytes(out) && reader.Ok();
-}
-
-template <typename Reader>
-[[nodiscard]] bool DecodeFrameMetadata(Reader& meta, FrameHeader& out) {
+[[nodiscard]] bool DecodeFrameMetadata(ByteReader& meta, FrameHeader& out) {
     const uint16_t session_id = meta.ReadU16BE();
     const uint8_t status_raw = meta.ReadU8();
     const uint8_t option = meta.ReadU8();
@@ -196,7 +68,7 @@ template <typename Reader>
 
         if (out.status == SessionStatus::NEW &&
             out.network == NetworkType::UDP && meta.Remaining() == 8) {
-            if (!ReadGlobalId(meta, out.global_id)) {
+            if (!meta.Skip(8)) {
                 return false;
             }
             out.has_global_id = true;
@@ -206,41 +78,38 @@ template <typename Reader>
     return meta.Ok() && meta.Remaining() == 0;
 }
 
-
-std::optional<FrameHeader> DecodeFramePrefix(
-    const uint8_t* data,
-    size_t contiguous_len,
+// prefix 必须是帧首 min(total_len, kMaxFramePrefixBytes) 字节。
+[[nodiscard]] std::optional<FrameHeader> DecodeFramePrefix(
+    std::span<const uint8_t> prefix,
     size_t total_len) {
-    if (!data || contiguous_len < 2 || total_len < 2) {
+    if (prefix.size() < 2) {
         return std::nullopt;
     }
 
-    const uint16_t meta_len =
-        (static_cast<uint16_t>(data[0]) << 8) |
-        static_cast<uint16_t>(data[1]);
-    if (meta_len < 4) {
-        return InvalidFrame();
+    const uint16_t meta_len = static_cast<uint16_t>(
+        (static_cast<uint16_t>(prefix[0]) << 8) | prefix[1]);
+    if (meta_len < 4 || meta_len > kMaxFrameMetadataBytes) {
+        return FrameHeader{};
     }
-    const size_t metadata_end = 2 + meta_len;
-    if (total_len < metadata_end || contiguous_len < metadata_end) {
+    const size_t metadata_end = 2 + static_cast<size_t>(meta_len);
+    if (prefix.size() < metadata_end) {
         return std::nullopt;
     }
 
-    ByteReader meta(data + 2, meta_len);
+    ByteReader meta(prefix.data() + 2, meta_len);
     FrameHeader out;
     if (!DecodeFrameMetadata(meta, out)) {
-        return InvalidFrame();
+        return FrameHeader{};
     }
 
     size_t frame_size = metadata_end;
     if ((out.option & kOptionData) != 0) {
-        if (total_len < frame_size + 2 || contiguous_len < frame_size + 2) {
+        if (prefix.size() < frame_size + 2) {
             return std::nullopt;
         }
-        const uint16_t data_len =
-            (static_cast<uint16_t>(data[frame_size]) << 8) |
-            static_cast<uint16_t>(data[frame_size + 1]);
-        frame_size += 2 + data_len;
+        const uint16_t data_len = static_cast<uint16_t>(
+            (static_cast<uint16_t>(prefix[frame_size]) << 8) | prefix[frame_size + 1]);
+        frame_size += 2 + static_cast<size_t>(data_len);
         if (total_len < frame_size) {
             return std::nullopt;
         }
@@ -252,52 +121,17 @@ std::optional<FrameHeader> DecodeFramePrefix(
     return out;
 }
 
-std::optional<FrameHeader> DecodeFrame(
-    const buf::MultiBuffer& data,
-    size_t offset,
-    size_t len) {
-    if (len < 2) {
-        return std::nullopt;
-    }
+}  // namespace
 
-    MultiBufferFrameReader frame_reader(data, offset, len);
-    const uint16_t meta_len = frame_reader.ReadU16BE();
-    if (!frame_reader.Ok()) {
-        return std::nullopt;
+std::optional<FrameHeader> DecodeFrame(const buf::MultiBuffer& data) {
+    const size_t total_len = data.byte_size();
+    const auto front = data.FrontSpan();
+    if (front.size() >= std::min(total_len, kMaxFramePrefixBytes)) {
+        return DecodeFramePrefix(front, total_len);
     }
-    if (meta_len < 4) {
-        return InvalidFrame();
-    }
-    if (len < static_cast<size_t>(2 + meta_len)) {
-        return std::nullopt;
-    }
-
-    MultiBufferFrameReader meta(data, offset + 2, meta_len);
-    FrameHeader out;
-    if (!DecodeFrameMetadata(meta, out)) {
-        return InvalidFrame();
-    }
-
-    size_t frame_size = 2 + meta_len;
-    if ((out.option & kOptionData) != 0) {
-        if (len < frame_size + 2) {
-            return std::nullopt;
-        }
-        MultiBufferFrameReader data_len_reader(data, offset + frame_size, 2);
-        const uint16_t data_len = data_len_reader.ReadU16BE();
-        if (!data_len_reader.Ok()) {
-            return std::nullopt;
-        }
-        frame_size += 2 + data_len;
-        if (len < frame_size) {
-            return std::nullopt;
-        }
-        out.has_data = true;
-        out.data_len = data_len;
-        out.data_offset = frame_size - data_len;
-    }
-    out.frame_size = frame_size;
-    return out;
+    std::array<uint8_t, kMaxFramePrefixBytes> prefix;
+    const size_t copied = data.CopyPrefixTo(prefix);
+    return DecodeFramePrefix(std::span<const uint8_t>(prefix.data(), copied), total_len);
 }
 
 // ============================================================================
@@ -358,12 +192,6 @@ size_t EncodeKeepAliveTo(std::span<uint8_t> out) noexcept {
     out[4] = static_cast<uint8_t>(SessionStatus::KEEPALIVE);
     out[5] = 0x00;
     return 6;
-}
-
-void EncodeKeepAliveTo(memory::ByteVector& out) {
-    std::array<uint8_t, 6> header{};
-    const size_t n = EncodeKeepAliveTo(header);
-    out.assign(header.data(), header.data() + n);
 }
 
 size_t EncodeNewHeaderTo(std::span<uint8_t> out,
@@ -448,20 +276,6 @@ size_t EncodeKeepDataHeaderTo(std::span<uint8_t> out,
         return 0;
     }
     return FinalizeFrameHeaderSpan(out, pos, payload_len, true);
-}
-
-bool EncodeKeepDataHeaderTo(
-    memory::ByteVector& out,
-    uint16_t session_id,
-    size_t payload_len) {
-    std::array<uint8_t, 8> header{};
-    const size_t n = EncodeKeepDataHeaderTo(header, session_id, payload_len);
-    if (n == 0) {
-        out.clear();
-        return false;
-    }
-    out.assign(header.data(), header.data() + n);
-    return true;
 }
 
 // ============================================================================

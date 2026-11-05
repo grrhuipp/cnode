@@ -7,13 +7,14 @@
 #include <cstdint>
 #include <atomic>
 #include <functional>
-#include <future>
 #include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace acpp {
+
+class GroupCoordinator;
 
 namespace proxyman::inbound {
 struct BuildRequest;
@@ -23,22 +24,19 @@ namespace proxyman::outbound {
 struct PreparedOutboundConfig;
 }
 namespace geo {
-class GeoManager;
+class GeoDatabase;
 }
 namespace app::dns {
 class DNSWorker;
 }
 namespace app {
-struct UserTraffic;
 struct UserTrafficSnapshot;
+struct AccountingDomain;
 }
-class Inbound;
 struct OnlineDevice;
 struct PortBinding;
 struct StatsShard;
-struct RoutingConfig;
 struct WorkerRuntimeConfig;
-struct WorkerMemoryStats;
 struct WorkerRuntimeStatsSnapshot;
 namespace rule {
 struct DetectRule;
@@ -55,31 +53,42 @@ public:
     Worker(uint32_t id, net::io_context& io_context,
            const WorkerRuntimeConfig& runtime_config, StatsShard& stats,
            app::dns::DNSWorker& dns_worker,
-           geo::GeoManager* geo_manager = nullptr);
+           geo::GeoDatabase* geo_database = nullptr);
     ~Worker();
+
+    // Shared, bounded control directory for this pool; installed before startup.
+    void SetGroupCoordinator(std::shared_ptr<GroupCoordinator> coordinator);
+    [[nodiscard]] std::shared_ptr<GroupCoordinator> Coordinator() const noexcept {
+        return group_coordinator_;
+    }
 
     // ── 基本访问 ─────────────────────────────────────────────────────────────
 
     [[nodiscard]] uint32_t Id() const noexcept { return id_; }
 
-    // Cross-thread control-plane entry. Full mailbox throws WorkerMailboxFull.
-    // *Task methods themselves must still run on this Worker's executor.
+    // Cross-thread control-plane entries. Full mailbox throws WorkerMailboxFull;
+    // after RequestStop admission throws operation_aborted. PostTask carries a
+    // coroutine that genuinely suspends on this Worker; PostCall carries a
+    // self-contained synchronous callable. Both bodies run on this Worker.
     template <typename T>
     net::awaitable<T> PostTask(net::awaitable<T> task) {
         return mailbox_->Post(std::move(task));
     }
-    template <typename T>
-    std::future<T> PostForFuture(net::awaitable<T> task) {
-        return mailbox_->PostForFuture(std::move(task));
+    template <typename Fn>
+    auto PostCall(Fn fn) {
+        return mailbox_->PostCall(std::move(fn));
     }
 
     // Static startup transaction. Must run on this Worker's executor before
-    // inbound registration; failures propagate to the awaiting startup owner.
-    net::awaitable<void> StartRuntimeTask();
+    // inbound registration; failures propagate to the caller.
+    void StartRuntime();
 
     // Lifecycle notification has one reserved pending slot, independent of
     // ordinary admission. The shell remains alive through the global join.
     void RequestStop() noexcept;
+    // Stop data admission/work but keep accounting/control admission available.
+    void RequestDrain() noexcept;
+    net::awaitable<void> AsyncDrain();
     // After RequestStop, one observer awaits all accepted work and live state.
     // Repeated joins after completion are harmless.
     net::awaitable<void> AsyncJoin();
@@ -88,89 +97,73 @@ public:
     // global cancellation, and keeps driving completion until live teardown.
     void RunEventLoop() noexcept;
 
-    // ── 监听管理（必须在所属 Worker 上执行；跨线程经 PostTask）──────────
+    // ── 冷路径变更：必须在所属 Worker executor 上执行（跨线程经 PostCall/PostTask）──
 
-    // 动态控制面使用：必须在 Worker executor 上执行，并返回真实 bind 结果。
-    net::awaitable<bool> AddListenerTask(PortBinding binding);
+    // 返回真实 bind 结果。
+    [[nodiscard]] bool AddListener(PortBinding binding);
 
-    // 注册 receiver settings + 协议处理器。Task 必须在 Worker executor 上执行。
-    net::awaitable<bool> RegisterInboundTask(
+    // 注册 receiver settings + 协议处理器。
+    [[nodiscard]] bool RegisterInbound(
         proxyman::inbound::BuildRequest req,
         proxyman::inbound::ReceiverSettings receiver);
 
     // 添加 UDP 监听（同端口 UDP socket，SO_REUSEPORT）。协议 handler 在
     // Worker 线程内构造，避免跨线程触碰 Worker-local validator / allocator。
+    // 替换旧 socket 时等待旧原生分发任务实际结束，因此是协程。
     net::awaitable<bool> AddUdpListenerTask(
         PortBinding binding,
         proxyman::inbound::BuildRequest req);
 
     // 动态出站：XrayR Controller 面板节点 addOutbound/removeOutbound。
-    net::awaitable<void> AddOutboundTask(
-        proxyman::outbound::PreparedOutboundConfig config);
-    net::awaitable<void> RemoveOutboundTask(std::string tag);
+    void AddOutbound(proxyman::outbound::PreparedOutboundConfig config);
+    void RemoveOutbound(std::string_view tag);
 
-    // 动态控制面使用：必须在所属 Worker 上执行，完成后才返回。
+    // 注销监听与 handler；等待 UDP 原生分发任务实际结束后才返回。
     net::awaitable<void> UnregisterListenerTask(std::string tag);
 
-    net::awaitable<void> UpdateRuleTask(
-        std::string tag,
-        std::vector<rule::DetectRule> rules);
-    net::awaitable<void> InstallUserViewTask(
-        proxyman::inbound::UserStore::WorkerView view);
+    void UpdateRule(std::string_view tag, const std::vector<rule::DetectRule>& rules);
+    void InstallUserView(proxyman::inbound::UserStore::WorkerView view);
 
-    // ── Per-Worker 流量统计（无锁，仅 Worker 线程写）────────────────────────
+    // ── 数据收集（在所属 Worker 线程执行，无竞争）──
 
-    using UserTraffic = app::UserTraffic;
-    using UserTrafficSnapshot = app::UserTrafficSnapshot;
+    // Snapshot on this Worker; acknowledge only after off-thread durable storage.
+    [[nodiscard]] net::awaitable<app::UserTrafficSnapshot> SnapshotTraffic(std::string tag);
+    net::awaitable<void> CommitTraffic(std::string tag, const app::UserTrafficSnapshot& snapshot);
+    [[nodiscard]] std::vector<app::AccountingDomain>
+        AccountingDomains() const;
 
-    // ── 数据收集（经 PostTask 投递到所属 Worker 后调用）──
-
-    // 收集并清空指定 tag 的用户流量（在 Worker 线程执行，无竞争）
-    net::awaitable<UserTrafficSnapshot> GetTrafficTask(std::string tag);
-
-    // 收集指定 tag 的在线设备（在 Worker 线程执行，无竞争）
-    // 协议类型由 inbound handler 的 ReceiverSettings 自动判断，无需外部传入
-    net::awaitable<std::vector<OnlineDevice>>
-        GetOnlineDeviceTask(std::string tag);
-
-    // ── 运行时统计（通过 CollectRuntimeStatsTask 投递到 Worker 线程读取）──
-
-    using MemoryStats = WorkerMemoryStats;
-    using RuntimeStatsSnapshot = WorkerRuntimeStatsSnapshot;
+    // 协议类型由 inbound handler 的 ReceiverSettings 自动判断，无需外部传入。
+    [[nodiscard]] net::awaitable<std::vector<OnlineDevice>> GetOnlineDevices(std::string tag) const;
 
     // Resource traversal is requested only by the low-frequency diagnostics loop.
-    net::awaitable<RuntimeStatsSnapshot> CollectRuntimeStatsTask(
-        bool include_resources) const;
-    net::awaitable<void> CollectHeapTask(bool force);
+    [[nodiscard]] net::awaitable<WorkerRuntimeStatsSnapshot> CollectRuntimeStats(bool include_resources) const;
+    void CollectHeap();
 
 private:
     struct ListenerSlot;
     struct ListenerState;
     struct RuntimeState;
+    struct ConnectionRecord;
     void BeginStopOnWorker() noexcept;
     net::awaitable<void> StopRuntimeTask();
+    net::awaitable<void> DrainRuntimeTask();
+    net::awaitable<void> ReapAccountingDomains();
+    WorkerRuntimeStatsSnapshot CollectNativeRuntimeStats(bool include_resources) const;
     void ReportFailure(std::exception_ptr error) noexcept;
-
-    [[nodiscard]] bool RegisterInboundOnWorkerThread(
-        const proxyman::inbound::BuildRequest& req,
-        proxyman::inbound::ReceiverSettings receiver);
-
-    void AddOutboundOnWorkerThread(
-        proxyman::outbound::PreparedOutboundConfig config);
-    void RemoveOutboundOnWorkerThread(std::string_view tag);
-
-    [[nodiscard]] MemoryStats GetMemoryStats() const;
 
     // ── 成员 ────────────────────────────────────────────────────────────────
 
     uint32_t              id_;
     net::io_context& io_context_;
     std::atomic<bool> stop_requested_{false};
+    std::atomic<bool> drain_requested_{false};
     std::atomic<bool> joined_{false};
     bool stop_notification_delivered_ = false; // owner executor only
     std::function<void(std::exception_ptr)> failure_handler_;
     std::unique_ptr<RuntimeState> runtime_;
     std::unique_ptr<WorkerMailbox> mailbox_;
+    std::shared_ptr<GroupCoordinator> group_coordinator_;
+    bool owns_group_coordinator_ = false;
 
 };
 

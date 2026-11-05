@@ -45,7 +45,7 @@ private:
     bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
         return this == &other;
     }
-    acpp::memory::ThreadPoolFacade pool;
+    acpp::memory::ThreadMemoryResource pool;
 };
 
 // An independent public-API TLS peer. Memory BIOs are test wire capture only:
@@ -137,11 +137,13 @@ struct Fixture {
         acpp::TlsConfig server_config;
         server_config.cert_file = (dir / "cert.pem").string();
         server_config.key_file = (dir / "key.pem").string();
+        acpp::LoadTlsPemMaterial(server_config);
         server_config.alpn = {"h2"};
         server_config.min_version = acpp::TlsVersion::V1_3;
         server = acpp::SslContext::CreateServer(server_config);
         acpp::TlsConfig client_config;
         client_config.allow_insecure = true;
+        client_config.alpn = {"h2"};
         client = acpp::SslContext::CreateClient(client_config);
         Require(server && client, "TLS fixture contexts failed");
         SSL_CTX_set_num_tickets(server->Native(), 0);
@@ -166,9 +168,7 @@ struct Fixture {
             product_server ? client->Native() : server->Native(), !product_server);
         stream = std::make_unique<acpp::TlsStream>(
             std::make_unique<acpp::TcpStream>(std::move(socket)),
-            product_server ? server->Native() : client->Native(), product_server);
-        const std::array<std::string, 1> alpn{"h2"};
-        if (!product_server) Require(stream->SetAlpn(alpn), "ALPN preparation failed");
+            product_server ? *server : *client, product_server);
         if (resource) retained_before_handshake = resource->large_live;
         try {
             auto first = net::co_spawn(io, stream->Handshake(), net::use_future);

@@ -1,123 +1,66 @@
 #include "autosign_cert.hpp"
 
-#include <openssl/evp.h>
-#include <openssl/x509.h>
+#include <openssl/ssl.h>
 #include <openssl/x509v3.h>
-
-#include <chrono>
 #include <cstdio>
-#include <vector>
+#include <string>
 
 namespace {
-
-std::vector<unsigned char> DerEncodeCert(X509* cert) {
-    int len = i2d_X509(cert, nullptr);
-    if (len <= 0) return {};
-
-    std::vector<unsigned char> der(static_cast<size_t>(len));
-    unsigned char* out = der.data();
-    if (i2d_X509(cert, &out) != len) return {};
-    return der;
-}
-
-std::vector<unsigned char> DerEncodePublicKey(EVP_PKEY* key) {
-    int len = i2d_PUBKEY(key, nullptr);
-    if (len <= 0) return {};
-
-    std::vector<unsigned char> der(static_cast<size_t>(len));
-    unsigned char* out = der.data();
-    if (i2d_PUBKEY(key, &out) != len) return {};
-    return der;
-}
-
 bool Require(bool condition, const char* message) {
-    if (!condition) {
-        std::fprintf(stderr, "%s\n", message);
-        return false;
-    }
-    return true;
+    if (!condition) std::fprintf(stderr, "%s\n", message);
+    return condition;
 }
-
-}  // namespace
+}
 
 int main() {
-    using acpp::transport::internet::AutoSignState;
+    using acpp::transport::internet::AutoSignCertificate;
+    auto injected_dns = AutoSignCertificate::Create("first.example,DNS:second.example");
+    if (!Require(injected_dns && X509_check_host(injected_dns->Certificate(), "second.example", 0,
+                    X509_CHECK_FLAG_NEVER_CHECK_SUBJECT, nullptr) == 0,
+                 "literal identity must not inject a second DNS SAN")) return 1;
+    auto injected_ip = AutoSignCertificate::Create("first.example,IP:192.0.2.55");
+    if (!Require(injected_ip && X509_check_ip_asc(injected_ip->Certificate(), "192.0.2.55", 0) == 0,
+                 "literal identity must not inject an IP SAN")) return 1;
+    auto exact = AutoSignCertificate::Create("example.co.uk");
+    if (!Require(exact && X509_check_host(exact->Certificate(), "example.co.uk", 0,
+                    X509_CHECK_FLAG_NEVER_CHECK_SUBJECT, nullptr) == 1 &&
+                    X509_check_host(exact->Certificate(), "bank.co.uk", 0,
+                    X509_CHECK_FLAG_NEVER_CHECK_SUBJECT, nullptr) == 0,
+                 "SAN must cover only the configured identity")) return 1;
+    auto ip = AutoSignCertificate::Create("192.0.2.1");
+    if (!Require(ip && X509_check_ip_asc(ip->Certificate(), "192.0.2.1", 0) == 1,
+                 "IP identity must use an IP SAN")) return 1;
+    auto wildcard = AutoSignCertificate::Create("*.example.com");
+    if (!Require(wildcard && X509_check_host(wildcard->Certificate(), "example.com", 0,
+                    X509_CHECK_FLAG_NEVER_CHECK_SUBJECT, nullptr) == 1 &&
+                    X509_check_host(wildcard->Certificate(), "www.example.com", 0,
+                    X509_CHECK_FLAG_NEVER_CHECK_SUBJECT, nullptr) == 1,
+                 "explicit wildcard covers its apex and one-label children")) return 1;
+    const std::string long_name = std::string(63, 'a') + "." + std::string(63, 'b') + ".example.com";
+    auto long_cert = AutoSignCertificate::Create(long_name);
+    if (!Require(long_cert && X509_check_host(long_cert->Certificate(), long_name.c_str(), 0,
+                    X509_CHECK_FLAG_NEVER_CHECK_SUBJECT, nullptr) == 1,
+                 "DNS SAN beyond CN's 64-byte limit must be supported")) return 1;
+    auto root_dot = AutoSignCertificate::Create("example.com.");
+    if (!Require(root_dot && X509_check_host(root_dot->Certificate(), "example.com", 0,
+                    X509_CHECK_FLAG_NEVER_CHECK_SUBJECT, nullptr) == 1,
+                 "configured DNS root dot must normalize for SAN")) return 1;
+    if (!Require(!AutoSignCertificate::Create(std::string_view("a\0b", 3)),
+                 "embedded NUL must not truncate a configured identity")) return 1;
 
-    AutoSignState state;
-    const auto t0 = AutoSignState::Clock::time_point{};
-
-    auto injected_dns = state.GetOrCreate(
-        "first.example,DNS:second.example", t0);
-    if (!Require(injected_dns.cert != nullptr,
-                 "literal DNS injection input must produce test material")) return 1;
-    if (!Require(X509_check_host(injected_dns.cert, "second.example", 0,
-                                 X509_CHECK_FLAG_NEVER_CHECK_SUBJECT, nullptr) == 0,
-                 "certificate name must not inject a second DNS SAN")) return 1;
-
-    auto injected_ip = state.GetOrCreate(
-        "first.example,IP:192.0.2.55", t0);
-    if (!Require(injected_ip.cert != nullptr,
-                 "literal IP injection input must produce test material")) return 1;
-    if (!Require(X509_check_ip_asc(injected_ip.cert, "192.0.2.55", 0) == 0,
-                 "certificate name must not inject an IP SAN")) return 1;
-
-    auto public_suffix = state.GetOrCreate("example.co.uk", t0);
-    if (!Require(public_suffix.cert != nullptr,
-                 "public-suffix domain certificate must be generated")) return 1;
-    if (!Require(X509_check_host(public_suffix.cert, "example.co.uk", 0,
-                                 X509_CHECK_FLAG_NEVER_CHECK_SUBJECT, nullptr) == 1,
-                 "certificate must cover the requested public-suffix domain")) return 1;
-    if (!Require(X509_check_host(public_suffix.cert, "bank.co.uk", 0,
-                                 X509_CHECK_FLAG_NEVER_CHECK_SUBJECT, nullptr) == 0,
-                 "certificate must not cover an unrelated public-suffix sibling")) return 1;
-
-    auto apex = state.GetOrCreate("example.com", t0);
-    if (!Require(apex.cert != nullptr, "apex certificate must be generated")) return 1;
-    if (!Require(X509_check_host(apex.cert, "example.com", 0,
-                                 X509_CHECK_FLAG_NEVER_CHECK_SUBJECT, nullptr) == 1,
-                 "apex certificate SAN must cover the apex domain")) return 1;
-    if (!Require(X509_check_host(apex.cert, "www.example.com", 0,
-                                 X509_CHECK_FLAG_NEVER_CHECK_SUBJECT, nullptr) == 0,
-                 "exact certificate SAN must not cover a subdomain")) return 1;
-
-    auto ip = state.GetOrCreate("192.0.2.1", t0);
-    if (!Require(ip.cert != nullptr, "IP certificate must be generated")) return 1;
-    if (!Require(X509_check_ip_asc(ip.cert, "192.0.2.1", 0) == 1,
-                 "IP certificate SAN must contain the exact IP address")) return 1;
-
-    auto first = state.GetOrCreate("*.example.com", t0);
-    if (!Require(first.cert != nullptr, "first cert must be generated")) return 1;
-    if (!Require(first.key != nullptr, "first key must be generated")) return 1;
-    if (!Require(X509_check_host(first.cert, "example.com", 0,
-                                 X509_CHECK_FLAG_NEVER_CHECK_SUBJECT, nullptr) == 1,
-                 "explicit wildcard certificate SAN must cover its apex")) return 1;
-    if (!Require(X509_check_host(first.cert, "www.example.com", 0,
-                                 X509_CHECK_FLAG_NEVER_CHECK_SUBJECT, nullptr) == 1,
-                 "explicit wildcard certificate SAN must cover one-label subdomains")) return 1;
-
-    const auto first_cert = DerEncodeCert(first.cert);
-    const auto first_key = DerEncodePublicKey(first.key);
-    if (!Require(!first_cert.empty(), "first cert DER must encode")) return 1;
-    if (!Require(!first_key.empty(), "first key DER must encode")) return 1;
-
-    AutoSignState isolated_state;
-    auto isolated = isolated_state.GetOrCreate("*.example.com", t0);
-    if (!Require(isolated.cert != nullptr && isolated.key != nullptr,
-                 "isolated state material must be generated")) return 1;
-    if (!Require(DerEncodePublicKey(isolated.key) != first_key,
-                 "separate Worker-local states must use separate private keys")) return 1;
-
-    auto reused = state.GetOrCreate("*.example.com", t0 + std::chrono::seconds(299));
-    if (!Require(DerEncodeCert(reused.cert) == first_cert,
-                 "cert must be reused before five minutes")) return 1;
-    if (!Require(DerEncodePublicKey(reused.key) == first_key,
-                 "key must be reused before five minutes")) return 1;
-
-    auto rotated = state.GetOrCreate("*.example.com", t0 + std::chrono::seconds(301));
-    if (!Require(DerEncodeCert(rotated.cert) != first_cert,
-                 "cert must rotate after five minutes")) return 1;
-    if (!Require(DerEncodePublicKey(rotated.key) != first_key,
-                 "key must rotate after five minutes")) return 1;
-
+    // SSL_CTX takes references; credentials remain valid after the temporary
+    // startup builder dies. Each SSL has its own state and shares only context.
+    SSL_CTX* ctx = SSL_CTX_new(TLS_server_method());
+    if (!Require(ctx && SSL_CTX_use_certificate(ctx, long_cert->Certificate()) == 1 &&
+                    SSL_CTX_use_PrivateKey(ctx, long_cert->Key()) == 1,
+                 "startup material must install into SSL_CTX")) return 1;
+    long_cert.reset();
+    SSL* first = SSL_new(ctx);
+    SSL* second = SSL_new(ctx);
+    const bool retained = first && second && SSL_get_certificate(first) && SSL_get_certificate(second);
+    SSL_free(first);
+    SSL_free(second);
+    SSL_CTX_free(ctx);
+    if (!Require(retained, "independent SSL connections must retain shared certificate material")) return 1;
     return 0;
 }

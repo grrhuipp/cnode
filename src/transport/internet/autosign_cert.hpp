@@ -2,50 +2,25 @@
 
 #include <openssl/evp.h>
 #include <openssl/x509.h>
-
-#include <chrono>
-#include <list>
-#include <string>
-#include <unordered_map>
+#include <memory>
+#include <string_view>
 
 namespace acpp::transport::internet {
 
-struct AutoSignMaterial {
-    X509* cert = nullptr;
-    EVP_PKEY* key = nullptr;
-};
-
-class AutoSignState {
+// Built from trusted configuration before accepting connections. No SNI-driven
+// generation, mutable certificate cache, or request-path key rotation.
+class AutoSignCertificate {
 public:
-    using Clock = std::chrono::steady_clock;
-
-    static constexpr size_t kMaxCachedCerts = 256;
-    static constexpr auto kRotateInterval = std::chrono::minutes(5);
-
-    // Owned by one Worker-local TLS context; not thread-safe by design.
-    AutoSignState() = default;
-    ~AutoSignState();
-
-    AutoSignState(const AutoSignState&) = delete;
-    AutoSignState& operator=(const AutoSignState&) = delete;
-
-    [[nodiscard]] AutoSignMaterial GetOrCreate(const std::string& cn);
-    [[nodiscard]] AutoSignMaterial GetOrCreate(const std::string& cn, Clock::time_point now);
-
+    [[nodiscard]] static std::unique_ptr<AutoSignCertificate> Create(std::string_view identity);
+    ~AutoSignCertificate();
+    AutoSignCertificate(const AutoSignCertificate&) = delete;
+    AutoSignCertificate& operator=(const AutoSignCertificate&) = delete;
+    [[nodiscard]] X509* Certificate() const noexcept { return certificate_; }
+    [[nodiscard]] EVP_PKEY* Key() const noexcept { return key_; }
 private:
-    struct CachedCert {
-        X509* cert = nullptr;
-        std::list<std::string>::iterator lru_it;
-    };
-
-    bool EnsureKey(Clock::time_point now);
-    void ClearCertCache();
-
-    EVP_PKEY* pkey_ = nullptr;
-    Clock::time_point key_created_at_{};
-    std::unordered_map<std::string, CachedCert> cert_cache_;
-    std::list<std::string> cert_lru_;
-    long next_serial_ = 1;
+    AutoSignCertificate() = default;
+    X509* certificate_ = nullptr;
+    EVP_PKEY* key_ = nullptr;
 };
 
-}  // namespace acpp::transport::internet
+} // namespace acpp::transport::internet

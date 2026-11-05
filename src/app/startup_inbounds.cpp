@@ -5,6 +5,7 @@
 #include "acppnode/core/constants.hpp"
 #include "acppnode/core/naming.hpp"
 #include "acppnode/infra/config_types.hpp"
+#include "acppnode/transport/internet/transport_security.hpp"
 
 #include <stdexcept>
 #include <utility>
@@ -18,12 +19,7 @@ StaticInboundConfig MakeTestInboundConfig() {
     source.protocol = constants::protocol::kDefaultNodeProtocol;
     source.tags.emplace_back(constants::test::kTestInboundTag);
     source.port = constants::test::kTestPort;
-    // The ordinary StreamSettings default is already normalized TCP/none.
-    source.sniffing.enabled = true;
-    source.sniffing.dest_override = {
-        std::string(constants::protocol::kTls),
-        std::string(constants::protocol::kHttp),
-        std::string(constants::protocol::kQuic)};
+    // The ordinary StreamSettings and SniffConfig defaults are already normalized.
     source.static_users.clients.push_back(StaticUser{
         .id = std::string(constants::test::kTestVmessUuid),
         .password = {}, .email = "test@example.com", .flow = {}});
@@ -45,6 +41,7 @@ PreparedStartupInbound PrepareInbound(
         .listen = source.listen,
         .stream_settings = source.stream_settings,
         .sniffing = source.sniffing,
+        .proxy_protocol = source.proxy_protocol,
         .outbound_policy = source.outbound_tag
             ? routing::OutboundSelectionPolicy{routing::ForceOutbound(*source.outbound_tag)}
             : (source.routing_enabled
@@ -84,6 +81,8 @@ PreparedStartupInbound PrepareInbound(
         throw std::invalid_argument(
             "static inbound '" + entry.tag + "' has no valid users");
     }
+
+    TransportSecurity::Prepare(entry.stream_settings, StreamEndpointRole::Inbound);
 
     return PreparedStartupInbound{
         .runtime = std::move(entry),

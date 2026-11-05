@@ -43,7 +43,7 @@ public:
             return true;
         }
 
-        const size_t bytes = buf::TotalLen(payload);
+        const size_t bytes = payload.byte_size();
         const size_t capacity = payload.size() * buf::Buffer::kSize;
         if (queued_packets_ >= kMaxQueuedPackets ||
             capacity > kMaxQueuedBytes - queued_capacity_ - reserved_) {
@@ -132,7 +132,7 @@ private:
     }
 
     void PruneEmptyFront() {
-        while (!ready_.empty() && !buf::HasData(ready_.front().payload)) {
+        while (!ready_.empty() && ready_.front().payload.byte_size() == 0) {
             queued_bytes_ -= std::min(queued_bytes_, ready_.front().bytes);
             queued_capacity_ -= ready_.front().payload.size() * buf::Buffer::kSize;
             queued_packets_ -= std::min<size_t>(queued_packets_, 1);

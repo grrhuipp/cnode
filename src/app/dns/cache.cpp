@@ -56,9 +56,8 @@ void DnsCache::Store(std::string_view domain, const DnsResult& result) {
     if (!prepared.negative) {
         prepared.addresses.assign(result.addresses.begin(), result.addresses.end());
     }
-    prepared.ttl = std::clamp(result.ttl, min_ttl_, max_ttl_);
-    const auto now = steady_clock::now();
-    prepared.expire_time = now + std::chrono::seconds(prepared.ttl);
+    const uint32_t ttl = std::clamp(result.ttl, min_ttl_, max_ttl_);
+    prepared.expire_time = steady_clock::now() + std::chrono::seconds(ttl);
 
     const auto existing = entries_.find(domain);
     if (existing != entries_.end()) {
@@ -80,21 +79,13 @@ void DnsCache::Store(std::string_view domain, const DnsResult& result) {
         throw;
     }
 
+    // Insertion is the only growth path and adds one entry, so one eviction
+    // restores the bound. Expired entries leave lazily on lookup; sweeping the
+    // whole table here would make every insert into a full cache O(capacity).
     if (entries_.size() > capacity_) {
-        for (auto it = entries_.begin(); it != entries_.end();) {
-            const auto candidate = it->second;
-            if (now >= candidate->entry.expire_time) {
-                it = entries_.erase(it);
-                order_.erase(candidate);
-            } else {
-                ++it;
-            }
-        }
-        while (entries_.size() > capacity_) {
-            const auto victim = std::prev(order_.end());
-            entries_.erase(std::string_view(victim->domain));
-            order_.erase(victim);
-        }
+        const auto victim = std::prev(order_.end());
+        entries_.erase(std::string_view(victim->domain));
+        order_.erase(victim);
     }
 }
 

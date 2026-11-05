@@ -3,6 +3,8 @@
 #include "../../app/proxyman/outbound/registration.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
 #include "acppnode/common/session.hpp"
+#include "acppnode/core/constants.hpp"
+#include "acppnode/infra/json_field.hpp"
 #include "acppnode/infra/log.hpp"
 
 namespace acpp::proxy::blackhole::outbound {
@@ -15,10 +17,6 @@ constexpr std::string_view kHttp403Response =
     "Content-Length: 0\r\n"
     "\r\n";
 
-[[nodiscard]] bool IsHttpResponse(std::string_view response) noexcept {
-    return response == constants::protocol::kHttp || response == "HTTP";
-}
-
 }  // namespace
 
 // ============================================================================
@@ -28,7 +26,7 @@ constexpr std::string_view kHttp403Response =
 Handler::Handler(std::string_view tag,
                  const BlackholeSettings& settings)
     : tag_(tag)
-    , http_response_(IsHttpResponse(settings.response)) {
+    , http_response_(settings.http_response) {
 }
 
 net::awaitable<OutboundProcessResult> Handler::Process(
@@ -70,11 +68,23 @@ const bool kBlackholeRegistered = (acpp::proxyman::outbound::RegisterProxy(
         -> std::optional<acpp::proxyman::outbound::PreparedOutboundCreator> {
         acpp::proxy::blackhole::outbound::BlackholeSettings settings;
         if (const auto* p = cfg.settings.if_contains("response")) {
-            // Xray 格式: {"response": {"type": "http"}}
-            if (p->is_object()) {
-                const auto& resp = p->as_object();
-                if (auto* tp = resp.if_contains("type"); tp && tp->is_string()) {
-                    settings.response = std::string(tp->as_string());
+            // Xray 格式: {"response": {"type": "http"}}；未知类型或错误类型拒绝加载。
+            if (!p->is_object()) {
+                LOG_ERROR("blackhole outbound '{}': response must be an object", cfg.tag);
+                return std::nullopt;
+            }
+            const auto type = acpp::ParseJsonString(p->as_object(), "type");
+            if (!type) {
+                LOG_ERROR("blackhole outbound '{}': response {}", cfg.tag, type.error());
+                return std::nullopt;
+            }
+            if (*type) {
+                const std::string_view value = **type;
+                if (value == acpp::constants::protocol::kHttp || value == "HTTP") {
+                    settings.http_response = true;
+                } else if (value != acpp::constants::protocol::kNone) {
+                    LOG_ERROR("blackhole outbound '{}': response type must be http or none", cfg.tag);
+                    return std::nullopt;
                 }
             }
         }
@@ -84,7 +94,8 @@ const bool kBlackholeRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 std::shared_ptr<const acpp::proxy::blackhole::outbound::BlackholeSettings> s,
                 acpp::net::io_context& /*io_context*/,
                 acpp::app::dns::DNS& /*dns*/,
-                std::chrono::seconds /*dial_timeout*/) -> std::unique_ptr<acpp::Outbound> {
+                std::chrono::seconds /*dial_timeout*/,
+                acpp::AwaitableTaskGroup& /*tasks*/) -> std::unique_ptr<acpp::Outbound> {
                 return std::make_unique<acpp::proxy::blackhole::outbound::Handler>(
                     tag, *s);
             }>(std::move(settings));

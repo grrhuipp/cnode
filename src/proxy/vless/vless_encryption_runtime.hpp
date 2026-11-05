@@ -1,82 +1,148 @@
 #pragma once
 
+#include "vless_buffered_reader.hpp"
 #include "vless_encryption.hpp"
 #include "vless_encryption_handshake.hpp"
+#include "vless_encryption_io.hpp"
 #include "vless_encryption_record.hpp"
 #include "vless_encryption_xor.hpp"
-#include "vless_io_util.hpp"
 
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/asio_types.hpp"
 
+#include <openssl/mem.h>
+#include <openssl/siphash.h>
+
 #include <array>
 #include <chrono>
 #include <optional>
-#include <vector>
+#include <memory>
+#include <string>
+#include <deque>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
 
 namespace acpp::vless {
 
+struct VlessEncryptionIssuedTicket {
+    std::array<uint8_t, kVlessEncryptionTicketSize> ticket{};
+    VlessEncryptionPfsKey pfs_key;
+    uint16_t seconds = 0;
+    std::chrono::steady_clock::time_point issued_at{};
+};
+
 struct VlessEncryptionRuntime {
-    memory::ByteVector united_key;
-    VlessEncryptionAead read_aead;
+    VlessEncryptionUnitedKey united_key;
+    VlessEncryptionReadKeys read_keys;
     VlessEncryptionAead write_aead;
     std::optional<VlessEncryptionHeaderXor> read_xor;
     std::optional<VlessEncryptionHeaderXor> write_xor;
-    bool read_aead_ready = true;
-    size_t lazy_read_context_size = 0;
-    bool lazy_read_xor_from_context = false;
-    VlessEncryptionAeadCipher cipher = VlessEncryptionAeadCipher::Aes256Gcm;
+    // Server-only authentication binding; never changes the wire ticket format.
+    std::optional<VlessEncryptionIssuedTicket> issued_ticket;
+    std::optional<std::array<uint8_t, 16>> resumed_identity;
+};
+
+// Record layer installed over the raw connection after a completed handshake.
+// `plain_reader` borrows `reader` and both borrow the raw endpoints, so the
+// owner is address-stable and must outlive every borrowed raw endpoint use.
+struct VlessEncryptedIo : memory::ThreadAllocated {
+    VlessEncryptedIo(VlessBufferedReader& raw_reader,
+                     transport::MultiBufferWriter& raw_writer,
+                     VlessEncryptionRuntime runtime);
+
+    VlessEncryptedIo(const VlessEncryptedIo&) = delete;
+    VlessEncryptedIo& operator=(const VlessEncryptedIo&) = delete;
+    VlessEncryptedIo(VlessEncryptedIo&&) = delete;
+    VlessEncryptedIo& operator=(VlessEncryptedIo&&) = delete;
+
+    VlessEncryptionReader reader;
+    VlessEncryptionWriter writer;
+    VlessBufferedReader plain_reader;
 };
 
 struct VlessEncryptionClientTicketCache : memory::ThreadAllocated {
-    memory::ByteVector pfs_key;
+    VlessEncryptionPfsKey pfs_key;
     std::array<uint8_t, kVlessEncryptionTicketSize> ticket{};
     std::chrono::steady_clock::time_point expires_at{};
 
     [[nodiscard]] bool Valid(std::chrono::steady_clock::time_point now) const noexcept;
     void Store(const VlessEncryptionClientPfsOpenResult& open,
-               std::chrono::steady_clock::time_point now);
+               std::chrono::steady_clock::time_point now) noexcept;
     void Clear() noexcept;
 };
 
+// Executor-local 0-RTT ticket table. Tickets are server-chosen, but lookups and
+// replay keys are peer-chosen, so buckets use a per-store SipHash key and key
+// equality is constant time.
 class VlessEncryptionServerTicketStore {
 public:
-    [[nodiscard]] std::optional<memory::ByteVector> Lookup(
+    VlessEncryptionServerTicketStore();
+    struct ResumedSession {
+        VlessEncryptionPfsKey pfs_key;
+        std::array<uint8_t, 16> identity;
+    };
+
+    // Records `nfs_key` against the ticket and refuses a repeated one.
+    [[nodiscard]] std::optional<ResumedSession> Lookup(
         std::span<const uint8_t, kVlessEncryptionTicketSize> ticket,
-        std::span<const uint8_t> nfs_key,
+        const VlessEncryptionNfsKey& nfs_key,
         std::chrono::steady_clock::time_point now);
 
     void Store(std::span<const uint8_t, kVlessEncryptionTicketSize> ticket,
-               std::span<const uint8_t> pfs_key,
+               const VlessEncryptionPfsKey& pfs_key,
                uint16_t seconds,
                std::chrono::steady_clock::time_point now);
+    [[nodiscard]] bool BindIdentity(
+        std::span<const uint8_t, kVlessEncryptionTicketSize> ticket,
+        const std::array<uint8_t, 16>& identity,
+        std::chrono::steady_clock::time_point now);
 
 private:
-    using TicketArray = std::array<uint8_t, kVlessEncryptionTicketSize>;
-    using NfsKeyArray = std::array<uint8_t, kVlessMlKem768SharedSecretSize>;
+    static constexpr size_t kMaxSessions = 1024;
+    // Upper bound of replay keys held across all sessions; reaching it evicts
+    // the oldest sessions, the same policy as the session bound.
+    static constexpr size_t kMaxSeenNfsKeys = 65536;
 
-    struct ByteArrayHash {
+    using TicketArray = std::array<uint8_t, kVlessEncryptionTicketSize>;
+    // Replay keys are BLAKE3 digests so no NFS secret outlives its handshake.
+    using NfsKeyDigest = std::array<uint8_t, 32>;
+
+    struct KeyedHash {
+        std::array<uint64_t, 2> key{};
+
         template <size_t N>
         [[nodiscard]] size_t operator()(const std::array<uint8_t, N>& value) const noexcept {
-            uint64_t h = 1469598103934665603ull;
-            for (size_t i = 0; i < N; ++i) {
-                h ^= value[i];
-                h *= 1099511628211ull;
-            }
-            return static_cast<size_t>(h);
+            return static_cast<size_t>(SIPHASH_24(key.data(), value.data(), N));
+        }
+    };
+
+    struct ConstantTimeEqual {
+        template <size_t N>
+        [[nodiscard]] bool operator()(const std::array<uint8_t, N>& a,
+                                      const std::array<uint8_t, N>& b) const noexcept {
+            return CRYPTO_memcmp(a.data(), b.data(), N) == 0;
         }
     };
 
     struct Session {
-        memory::ByteVector pfs_key;
+        VlessEncryptionPfsKey pfs_key;
         std::chrono::steady_clock::time_point expires_at{};
-        memory::ThreadLocalUnorderedSet<NfsKeyArray, ByteArrayHash> seen_nfs_keys;
+        std::optional<std::array<uint8_t, 16>> identity;
+        std::unordered_set<NfsKeyDigest, KeyedHash, ConstantTimeEqual>
+            seen_nfs_keys;
     };
 
-    void Prune(std::chrono::steady_clock::time_point now);
+    using SessionMap =
+        std::unordered_map<TicketArray, Session, KeyedHash, ConstantTimeEqual>;
 
-    memory::ThreadLocalUnorderedMap<TicketArray, Session, ByteArrayHash> sessions_;
-    memory::ThreadLocalDeque<std::pair<TicketArray, std::chrono::steady_clock::time_point>> order_;
+    void Prune(std::chrono::steady_clock::time_point now);
+    void EraseOldest();
+    void Erase(SessionMap::iterator it) noexcept;
+
+    SessionMap sessions_;
+    std::deque<std::pair<TicketArray, std::chrono::steady_clock::time_point>> order_;
+    size_t seen_nfs_keys_ = 0;
 };
 
 [[nodiscard]] net::awaitable<std::optional<VlessEncryptionRuntime>>
@@ -90,7 +156,7 @@ RunVlessEncryptionClientHandshake(
 RunVlessEncryptionServerHandshake(
     VlessBufferedReader& raw_reader,
     transport::MultiBufferWriter& raw_writer,
-    const VlessEncryptionConfig& config,
-    VlessEncryptionServerTicketStore* ticket_store = nullptr);
+    std::shared_ptr<const VlessEncryptionConfig> config,
+    std::string inbound_tag);
 
 }  // namespace acpp::vless

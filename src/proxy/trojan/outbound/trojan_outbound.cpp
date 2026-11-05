@@ -6,19 +6,21 @@
 #include "acppnode/app/relay.hpp"
 #include "acppnode/app/proxyman/outbound/factory.hpp"
 #include "../../../app/proxyman/outbound/registration.hpp"
-#include "acppnode/infra/json_port.hpp"
+#include "acppnode/infra/json_field.hpp"
 #include "acppnode/app/dns/dns.hpp"
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/buffer_util.hpp"
 #include "acppnode/common/container_util.hpp"
 #include "acppnode/infra/config_types.hpp"
 #include "acppnode/transport/link.hpp"
+#include "acppnode/transport/link_error.hpp"
 #include "acppnode/transport/internet/transport_dialer.hpp"
 #include "acppnode/transport/internet/outbound_target_builder.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <new>
 #include <span>
 #include <utility>
 #include <vector>
@@ -48,7 +50,7 @@ public:
             }
 
             buf::MultiBuffer raw = co_await stream_.ReadMultiBuffer();
-            if (!buf::HasData(raw)) {
+            if (raw.byte_size() == 0) {
                 framer_.Finish();
                 co_return buf::MultiBuffer{};
             }
@@ -66,8 +68,7 @@ public:
     }
 
     net::awaitable<void> AsyncShutdownWrite() override {
-        stream_.ShutdownWrite();
-        co_return;
+        co_await stream_.AsyncShutdownWrite();
     }
 
     bool ConsumeIdleTimeout() noexcept {
@@ -111,6 +112,7 @@ DialOutboundStream(
     net::io_context& io_context,
     app::dns::DNS& dns_service,
     const TrojanOutboundConfig& config,
+    const TransportSecurity& security,
     std::chrono::seconds dial_timeout,
     const tcp::endpoint* inbound_local_addr,
     session::Context& ctx) {
@@ -120,6 +122,7 @@ DialOutboundStream(
         .literal_address = config.literal_address,
         .port = config.port,
         .stream_settings = &config.stream_settings,
+        .security = &security,
         .timeout = dial_timeout,
         .send_through = &config.send_through,
         .inbound_local_addr = inbound_local_addr,
@@ -164,7 +167,7 @@ SendTrojanHandshake(
         stream.StartPhaseDeadline(handshake_timeout);
 
     std::array<uint8_t, 320> header_buf{};
-    const size_t header_len = ::acpp::trojan::TrojanCodec::EncodeRequestTo(
+    const size_t header_len = ::acpp::trojan::EncodeRequestTo(
         config.password_hash,
         is_udp ? ::acpp::trojan::TrojanCommand::UDP_ASSOCIATE
                : ::acpp::trojan::TrojanCommand::CONNECT,
@@ -202,8 +205,9 @@ SendTrojanHandshake(
 proxy::trojan::outbound::Handler::Handler(
     std::string_view tag, std::shared_ptr<const TrojanOutboundConfig> config,
     ::acpp::app::dns::DNS& dns_service, std::chrono::seconds dial_timeout)
-    : tag_(tag), config_(std::move(config)), dial_timeout_(dial_timeout),
-      dns_service_(dns_service) {}
+    : tag_(tag), config_(std::move(config)),
+      security_(config_->stream_settings, StreamEndpointRole::Outbound),
+      dial_timeout_(dial_timeout), dns_service_(dns_service) {}
 
 proxy::trojan::outbound::Handler::~Handler() = default;
 
@@ -226,7 +230,8 @@ proxy::trojan::outbound::Handler::Process(
     const auto& target = ctx.outbound.target;
 
     auto dialed = co_await DialOutboundStream(
-        io_context, dns_service_, *config_, dial_timeout_, inbound_local_addr, ctx);
+        io_context, dns_service_, *config_, security_, dial_timeout_,
+        inbound_local_addr, ctx);
     if (!dialed) {
         co_return tl::unexpected(dialed.error());
     }
@@ -252,34 +257,24 @@ proxy::trojan::outbound::Handler::Process(
     try {
         if (is_udp) {
             TrojanUdpOutboundEndpoint target_endpoint(*stream, target);
-            if (inbound.control) {
-                co_return co_await DoRelayLink(
-                    io_context, *inbound.reader, *inbound.writer, *inbound.control,
-                    target_endpoint, ctx, stats, relay_config, std::move(first_payload));
-            }
             co_return co_await DoRelayLink(
-                io_context, *inbound.reader, *inbound.writer,
+                io_context, *inbound.reader, *inbound.writer, inbound.control,
                 target_endpoint, ctx, stats, relay_config, std::move(first_payload));
         }
 
-        if (inbound.control) {
-            co_return co_await DoRelayLink(
-                io_context, *inbound.reader, *inbound.writer, *inbound.control,
-                *stream, ctx, stats, relay_config, std::move(first_payload));
-        }
         co_return co_await DoRelayLink(
-            io_context, *inbound.reader, *inbound.writer,
+            io_context, *inbound.reader, *inbound.writer, inbound.control,
             *stream, ctx, stats, relay_config, std::move(first_payload));
     } catch (const IoSystemError& e) {
         co_return fail_abortive(MapAsioError(e.code()));
+    } catch (const transport::LinkError& e) {
+        co_return fail_abortive(e.code());
+    } catch (const std::bad_alloc&) {
+        co_return fail_abortive(ErrorCode::RESOURCE_EXHAUSTED);
     } catch (...) {
-        co_return fail_abortive(ErrorCode::SOCKET_WRITE_FAILED);
+        co_return fail_abortive(ErrorCode::INTERNAL);
     }
 }
-
-// ============================================================================
-// 工厂函数
-// ============================================================================
 
 }  // namespace acpp
 
@@ -293,56 +288,39 @@ const bool kTrojanRegistered = (acpp::proxyman::outbound::RegisterProxy(
         -> std::optional<acpp::proxyman::outbound::PreparedOutboundCreator> {
         const auto& s = cfg.settings;
 
-        auto json_string = [](const acpp::json::object& obj,
-                              std::string_view key) -> std::string {
-            if (const auto* v = obj.if_contains(key); v && v->is_string()) {
-                return std::string(v->as_string());
-            }
-            return {};
-        };
-        auto json_bool = [](const acpp::json::object& obj,
-                            std::string_view key,
-                            bool fallback = false) -> bool {
-            if (const auto* v = obj.if_contains(key); v && v->is_bool()) {
-                return v->as_bool();
-            }
-            return fallback;
-        };
-        auto json_string_array = [](const acpp::json::object& obj,
-                                    std::string_view key) {
-            std::vector<std::string> out;
-            const auto* v = obj.if_contains(key);
-            if (!v || !v->is_array()) {
-                return out;
-            }
-            for (const auto& item : v->as_array()) {
-                if (item.is_string()) {
-                    out.emplace_back(item.as_string());
-                }
-            }
-            return out;
-        };
         std::string password;
         std::string server_name;
         bool allow_insecure = false;
         std::vector<std::string> alpn;
+        // A present field of the wrong type is a configuration error, never
+        // an implicit default.
         auto read_trojan_server = [&](const acpp::json::object& obj,
                                       acpp::TrojanOutboundConfig& config) {
-            config.address = json_string(obj, "address");
-            const auto port = acpp::ReadJsonPort(obj, "port");
-            if (port.Invalid()) {
+            const auto fail = [&](std::string_view error) {
+                LOG_ERROR("trojan outbound '{}': {}", cfg.tag, error);
                 return false;
-            }
+            };
+            auto address = acpp::ParseJsonString(obj, "address");
+            if (!address) return fail(address.error());
+            const auto port = acpp::ReadJsonPort(obj, "port");
+            if (port.Invalid()) return fail("invalid port");
+            auto source_password = acpp::ParseJsonString(obj, "password");
+            if (!source_password) return fail(source_password.error());
+            auto source_server_name = acpp::ParseJsonString(obj, "serverName");
+            if (!source_server_name) return fail(source_server_name.error());
+            const auto source_allow_insecure = acpp::ParseJsonBool(obj, "allowInsecure");
+            if (!source_allow_insecure) return fail(source_allow_insecure.error());
+            auto source_alpn = acpp::ParseJsonStringArray(obj, "alpn");
+            if (!source_alpn) return fail(source_alpn.error());
+
+            config.address = std::move(*address).value_or(std::string{});
             if (port.Valid()) {
                 config.port = port.value;
             }
-            password = json_string(obj, "password");
-            server_name = json_string(obj, "serverName");
-            allow_insecure = json_bool(
-                obj,
-                "allowInsecure",
-                allow_insecure);
-            alpn = json_string_array(obj, "alpn");
+            password = std::move(*source_password).value_or(std::string{});
+            server_name = std::move(*source_server_name).value_or(std::string{});
+            allow_insecure = source_allow_insecure->value_or(false);
+            alpn = std::move(*source_alpn).value_or(std::vector<std::string>{});
             return true;
         };
 
@@ -387,6 +365,8 @@ const bool kTrojanRegistered = (acpp::proxyman::outbound::RegisterProxy(
             LOG_ERROR("trojan outbound '{}': address must be an IP literal or DNS hostname", cfg.tag);
             return std::nullopt;
         }
+        acpp::TransportSecurity::Prepare(
+            trojan_config.stream_settings, acpp::StreamEndpointRole::Outbound);
 
         return acpp::proxyman::outbound::MakePreparedOutboundCreator<
             acpp::TrojanOutboundConfig,
@@ -394,7 +374,8 @@ const bool kTrojanRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 std::shared_ptr<const acpp::TrojanOutboundConfig> cfg_state,
                 acpp::net::io_context& /*io_context*/,
                 acpp::app::dns::DNS& dns,
-                std::chrono::seconds timeout) -> std::unique_ptr<acpp::Outbound> {
+                std::chrono::seconds timeout,
+                acpp::AwaitableTaskGroup& /*tasks*/) -> std::unique_ptr<acpp::Outbound> {
                 return std::make_unique<acpp::proxy::trojan::outbound::Handler>(
                     tag, std::move(cfg_state), dns, timeout);
             }>(std::move(trojan_config));

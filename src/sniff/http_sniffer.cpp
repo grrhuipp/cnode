@@ -14,19 +14,10 @@
 namespace acpp {
 namespace {
 
-[[nodiscard]] bool EqualsAsciiCI(std::string_view lhs,
-                                 std::string_view rhs) noexcept {
-    return lhs.size() == rhs.size() &&
-           std::ranges::equal(lhs, rhs, [](char left, char right) {
-               auto lower = [](unsigned char value) {
-                   return value >= 'A' && value <= 'Z'
-                       ? static_cast<unsigned char>(value + ('a' - 'A'))
-                       : value;
-               };
-               return lower(static_cast<unsigned char>(left)) ==
-                      lower(static_cast<unsigned char>(right));
-           });
-}
+struct HostPortView {
+    std::string_view host;
+    uint16_t port = 0;
+};
 
 [[nodiscard]] std::string_view TrimOws(std::string_view value) noexcept {
     while (!value.empty() &&
@@ -78,47 +69,71 @@ namespace {
     return version == "HTTP/1.0" || version == "HTTP/1.1";
 }
 
-}  // namespace
-
-SniffResult HttpSniffer::Sniff(std::span<const uint8_t> data) {
-    SniffResult result;
-    auto host_port = ParseHttpHost(data);
-    if (host_port) {
-        result.success = true;
-        result.protocol = constants::protocol::kHttp;
-        result.domain.assign(host_port->host);
-        result.port = host_port->port;
+[[nodiscard]] std::optional<HostPortView> ParseHostValue(
+    std::string_view value) {
+    if (value.empty() || !transport::internet::IsValidHttpAuthority(value)) {
+        return std::nullopt;
     }
-    return result;
+
+    HostPortView parsed;
+    if (value.front() == '[') {
+        const size_t close = value.find(']');
+        if (close == std::string_view::npos || close == 1 ||
+            value.substr(1, close - 1).find(':') == std::string_view::npos) {
+            return std::nullopt;
+        }
+        parsed.host = value.substr(1, close - 1);
+        const auto address = iputil::ParseLiteral(parsed.host);
+        if (!address || !address->is_v6()) return std::nullopt;
+        const std::string_view suffix = value.substr(close + 1);
+        if (!suffix.empty() &&
+            (suffix.front() != ':' ||
+             !ParsePort(suffix.substr(1), parsed.port))) {
+            return std::nullopt;
+        }
+        return parsed;
+    }
+
+    if (value.find('[') != std::string_view::npos ||
+        value.find(']') != std::string_view::npos) {
+        return std::nullopt;
+    }
+    const size_t colon = value.find(':');
+    if (colon == std::string_view::npos) {
+        parsed.host = value;
+    } else {
+        if (value.rfind(':') != colon || colon == 0 ||
+            !ParsePort(value.substr(colon + 1), parsed.port)) {
+            return std::nullopt;
+        }
+        parsed.host = value.substr(0, colon);
+    }
+    if (!domain::IsValidDnsHostname(
+            parsed.host, domain::TrailingDotPolicy::Allow)) {
+        return std::nullopt;
+    }
+    return parsed;
 }
 
-std::optional<HttpSniffer::HostPortView> HttpSniffer::ParseHttpHost(
-    std::span<const uint8_t> data) {
-    if (data.empty()) return std::nullopt;
-    const std::string_view request(
-        unsafe::ptr_cast<const char>(data.data()), data.size());
-    const size_t header_end = request.find("\r\n\r\n");
-    if (header_end == std::string_view::npos) return std::nullopt;
-
-    const size_t request_line_end = request.find("\r\n");
-    if (request_line_end == std::string_view::npos ||
-        request_line_end > header_end ||
-        !IsSupportedRequestLine(request.substr(0, request_line_end))) {
+// Single pass over CRLF-terminated lines: the request line, then header fields
+// until the empty line. An unterminated header block yields no result.
+[[nodiscard]] std::optional<HostPortView> ParseHttpHost(
+    std::string_view request) {
+    size_t line_end = request.find("\r\n");
+    if (line_end == std::string_view::npos ||
+        !IsSupportedRequestLine(request.substr(0, line_end))) {
         return std::nullopt;
     }
 
     std::optional<HostPortView> host;
-    size_t position = request_line_end + 2;
-    while (position < header_end) {
-        const size_t line_end = request.find("\r\n", position);
-        if (line_end == std::string_view::npos || line_end > header_end) {
-            return std::nullopt;
-        }
+    for (size_t position = line_end + 2;; position = line_end + 2) {
+        line_end = request.find("\r\n", position);
+        if (line_end == std::string_view::npos) return std::nullopt;
         const std::string_view line =
             request.substr(position, line_end - position);
-        if (line.empty() || line.front() == ' ' || line.front() == '\t') {
-            return std::nullopt;
-        }
+        if (line.empty()) return host;
+        // obs-fold is rejected (RFC 9112 §5.2).
+        if (line.front() == ' ' || line.front() == '\t') return std::nullopt;
 
         const size_t colon = line.find(':');
         if (colon == std::string_view::npos || colon == 0) {
@@ -130,59 +145,27 @@ std::optional<HttpSniffer::HostPortView> HttpSniffer::ParseHttpHost(
             !transport::internet::IsValidHttpHeaderValue(value)) {
             return std::nullopt;
         }
-
-        if (EqualsAsciiCI(name, "host")) {
-            if (host || value.empty() ||
-                !transport::internet::IsValidHttpAuthority(value)) {
-                return std::nullopt;
-            }
-
-            HostPortView parsed;
-            if (value.front() == '[') {
-                const size_t close = value.find(']');
-                if (close == std::string_view::npos || close == 1 ||
-                    value.substr(1, close - 1).find(':') ==
-                        std::string_view::npos) {
-                    return std::nullopt;
-                }
-                parsed.host = value.substr(1, close - 1);
-                const auto address = iputil::ParseLiteral(parsed.host);
-                if (!address || !address->is_v6()) return std::nullopt;
-                const std::string_view suffix = value.substr(close + 1);
-                if (!suffix.empty() &&
-                    (suffix.front() != ':' ||
-                     !ParsePort(suffix.substr(1), parsed.port))) {
-                    return std::nullopt;
-                }
-            } else {
-                if (value.find('[') != std::string_view::npos ||
-                    value.find(']') != std::string_view::npos) {
-                    return std::nullopt;
-                }
-                const size_t colon_position = value.find(':');
-                if (colon_position == std::string_view::npos) {
-                    parsed.host = value;
-                } else {
-                    if (value.rfind(':') != colon_position ||
-                        colon_position == 0 ||
-                        !ParsePort(
-                            value.substr(colon_position + 1), parsed.port)) {
-                        return std::nullopt;
-                    }
-                    parsed.host = value.substr(0, colon_position);
-                }
-            }
-            if (parsed.host.empty() ||
-                (value.front() != '[' &&
-                 !domain::IsValidDnsHostname(
-                     parsed.host, domain::TrailingDotPolicy::Allow))) {
-                return std::nullopt;
-            }
-            host = parsed;
-        }
-        position = line_end + 2;
+        if (!transport::internet::EqualsAsciiCI(name, "host")) continue;
+        // RFC 9112 §3.2: more than one Host field is a bad request.
+        if (host) return std::nullopt;
+        host = ParseHostValue(value);
+        if (!host) return std::nullopt;
     }
-    return host;
+}
+
+}  // namespace
+
+SniffResult SniffHttp(std::span<const uint8_t> data) {
+    SniffResult result;
+    const auto host_port = ParseHttpHost(std::string_view(
+        unsafe::ptr_cast<const char>(data.data()), data.size()));
+    if (host_port) {
+        result.success = true;
+        result.protocol = constants::protocol::kHttp;
+        result.domain.assign(host_port->host);
+        result.port = host_port->port;
+    }
+    return result;
 }
 
 }  // namespace acpp

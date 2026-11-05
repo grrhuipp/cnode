@@ -1,49 +1,34 @@
 #pragma once
 
 #include "../account.hpp"
-#include "../vmess_cipher.hpp"
+#include "body.hpp"
 #include "acppnode/transport/async_stream.hpp"
 #include "acppnode/transport/link.hpp"
 
+#include <openssl/aes.h>
+
 #include <array>
 #include <tl/expected.hpp>
-#include <optional>
 #include <span>
-#include <string_view>
 
 namespace acpp::vmess::encoding {
 
 using VMessHandshakeResult = tl::expected<void, ErrorCode>;
 
-struct EncodeRequestBodyState final {
-    std::optional<VMessCipher> cipher;
-    std::optional<VMessCipher> length_cipher;
-    std::optional<ShakeMask> mask;
-    bool global_padding = false;
-    bool packet_mode = false;
-    bool eof_sent = false;
-};
-
-struct DecodeResponseBodyState final {
-    std::optional<VMessCipher> cipher;
-    std::optional<VMessCipher> length_cipher;
-    std::optional<ShakeMask> mask;
-    bool global_padding = false;
-    bool eof = false;
-};
-
 class ClientSession final {
 public:
+    // `user`, its prepared `auth_id_key` and `target` are borrowed until the
+    // request header is sent.
     ClientSession(const MemoryAccount& user,
+                  const AES_KEY& auth_id_key,
                   const TargetAddress& target,
                   Security security,
-                  Command command = Command::TCP,
-                  uint8_t options = 0);
+                  Command command);
+
+    ClientSession(const ClientSession&) = delete;
+    ClientSession& operator=(const ClientSession&) = delete;
 
     net::awaitable<VMessHandshakeResult> EncodeRequestHeader(AsyncStream& stream);
-    net::awaitable<VMessHandshakeResult> EncodeRequestBody(
-        AsyncStream& stream,
-        std::span<const uint8_t> payload);
     net::awaitable<void> EncodeRequestBody(
         AsyncStream& stream,
         buf::MultiBuffer mb);
@@ -51,26 +36,36 @@ public:
         AsyncStream& stream,
         std::span<const net::const_buffer> buffers);
     net::awaitable<void> EncodeRequestBodyEOF(AsyncStream& stream);
-    net::awaitable<bool> DecodeResponseHeader(AsyncStream& stream);
-    net::awaitable<buf::MultiBuffer> DecodeResponseBody(AsyncStream& stream);
+    // Authenticates the response header on first use, then returns body
+    // chunks; empty at the end of the response body.
+    net::awaitable<buf::MultiBuffer> DecodeResponse(AsyncStream& stream);
 
 private:
+    struct SessionKeys {
+        BodyKey request;
+        BodyKey response;
+        uint8_t response_header = 0;
+    };
+
+    [[nodiscard]] static SessionKeys GenerateKeys();
+    net::awaitable<void> DecodeResponseHeader(AsyncStream& stream);
+
     const MemoryAccount* user_ = nullptr;
+    const AES_KEY* auth_id_key_ = nullptr;
     const TargetAddress* target_ = nullptr;
     Security security_ = Security::AES_128_GCM;
     Command command_ = Command::TCP;
-    std::array<uint8_t, 16> request_body_key_{};
-    std::array<uint8_t, 16> request_body_iv_{};
-    uint8_t response_header_ = 0;
-    uint8_t options_ = 0;
-    std::array<uint8_t, 16> response_key_{};
-    std::array<uint8_t, 16> response_iv_{};
-    std::array<uint8_t, 16> request_key_{};
-    std::array<uint8_t, 16> request_iv_{};
-    bool sent_ = false;
-    bool response_header_initialized_ = false;
-    EncodeRequestBodyState request_body_state_;
-    DecodeResponseBodyState response_body_state_;
+    SessionKeys keys_;
+    bool request_header_sent_ = false;
+    bool request_eof_sent_ = false;
+    BodyEncoder request_encoder_;
+    BodyDecoder response_decoder_;
+    // Response header progress survives a cancelled read.
+    std::array<uint8_t, 18> response_length_{};
+    size_t response_length_read_ = 0;
+    memory::ByteVector response_header_sealed_;
+    size_t response_header_read_ = 0;
+    bool response_header_received_ = false;
 };
 
 }  // namespace acpp::vmess::encoding

@@ -3,7 +3,6 @@ import argparse
 import asyncio
 import hashlib
 import json
-import os
 from pathlib import Path
 import socket
 import ssl
@@ -136,8 +135,14 @@ async def request(port, udp, action):
             if action != 'fast':
                 await asyncio.sleep(1.4 if action == 'timeout' else 0.4)
                 writer.transport.resume_reading()
-            while data := await asyncio.wait_for(reader.read(131072), 15):
-                output.extend(data)
+            try:
+                while data := await asyncio.wait_for(reader.read(131072), 15):
+                    output.extend(data)
+            except ConnectionResetError:
+                # A timed-out transport discards queued bytes instead of
+                # draining them after the request deadline.
+                if action != 'timeout':
+                    raise
         return bytes(output), started, aborted
     finally:
         writer.close()
@@ -172,7 +177,7 @@ async def run_case(binary, output, udp, action):
                           'port': inbound_port, 'routingEnabled': True,
                           'settings': {'clients': [{'id': str(USER)}]}}],
         'outbounds.json': [{'tag': 'pressure-out', 'protocol': 'anytls',
-                           'settings': {'server': '127.0.0.1', 'server_port': peer_port, 'password': 'secret',
+                           'settings': {'address': '127.0.0.1', 'port': peer_port, 'password': 'secret',
                                         'idleSessionCheckInterval': 1, 'idleSessionTimeout': 30, 'minIdleSession': 1},
                            'streamSettings': {'network': 'tcp', 'security': 'tls',
                                               'tlsSettings': {'serverName': 'localhost', 'allowInsecure': True}}}],
@@ -184,8 +189,7 @@ async def run_case(binary, output, udp, action):
               'expected_sha256': hashlib.sha256(payload).hexdigest()}
     with (output / 'child.log').open('w', encoding='utf-8') as logfile:
         child = subprocess.Popen([str(binary), '--config-dir', str(output)], stdout=logfile,
-                                 stderr=subprocess.STDOUT,
-                                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+                                 stderr=subprocess.STDOUT)
         try:
             deadline = time.monotonic() + 8
             while 'server started' not in (output / 'child.log').read_text(encoding='utf-8', errors='replace'):
@@ -234,7 +238,8 @@ async def run_case(binary, output, udp, action):
         finally:
             if child.poll() is None:
                 child.terminate()
-            child.wait(timeout=5)
+            result['shutdown_exit'] = child.wait(timeout=5)
+            result['passed'] &= result['shutdown_exit'] == 0
             server.close()
             await server.wait_closed()
             await peer.close()

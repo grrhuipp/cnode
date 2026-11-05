@@ -61,6 +61,13 @@ class Peer:
         self.pending = {}
         self.closed = False
         self.error = None
+        self.initial_send_window = 65535
+        self.connection_send_window = 65535
+        self.stream_send_windows = {}
+        self.sent_data = {}
+        self.resets = {}
+        self.goaway = False
+        self.credit_changed = asyncio.Event()
         self.task = asyncio.create_task(self.read())
         resources.tasks.add(self.task)
 
@@ -75,7 +82,38 @@ class Peer:
                     raise AssertionError(f'malformed HTTP/2 frame header {header.hex()}')
                 body = await self.reader.readexactly(length)
                 self.frames.append((kind, flags, sid, body if kind != 0 else len(body)))
+                if kind == 8:
+                    assert len(body) == 4
+                    increment = int.from_bytes(body, 'big') & 0x7fffffff
+                    assert increment, 'zero HTTP/2 window increment'
+                    if sid == 0:
+                        self.connection_send_window += increment
+                    else:
+                        self.stream_send_windows[sid] = (
+                            self.stream_send_windows.get(sid, self.initial_send_window) + increment)
+                    self.credit_changed.set()
+                elif kind == 3:
+                    self.resets[sid] = body
+                    self.credit_changed.set()
+                elif kind == 7:
+                    self.goaway = True
+                    self.credit_changed.set()
+                if kind == 0 and body:
+                    # Return DATA credit as it is consumed, like a real client
+                    # (RFC 9113 6.9); the server never exceeds this window.
+                    credit = struct.pack('!I', len(body))
+                    self.writer.write(h2frame(8, 0, 0, credit) + h2frame(8, 0, sid, credit))
                 if kind == 4 and not flags & 1:
+                    assert len(body) % 6 == 0
+                    for offset in range(0, len(body), 6):
+                        if int.from_bytes(body[offset:offset + 2], 'big') == 4:
+                            window = int.from_bytes(body[offset + 2:offset + 6], 'big')
+                            assert window <= 0x7fffffff
+                            delta = window - self.initial_send_window
+                            for stream_id in self.stream_send_windows:
+                                self.stream_send_windows[stream_id] += delta
+                            self.initial_send_window = window
+                    self.credit_changed.set()
                     self.writer.write(h2frame(4, 1))
                 elif kind == 0 and self.raw:
                     self.messages.setdefault(sid, bytearray()).extend(body)
@@ -110,15 +148,40 @@ class Peer:
             self.error = repr(error)
         finally:
             self.closed = True
+            self.credit_changed.set()
+
+    def send_capacity(self, sid):
+        return min(self.connection_send_window,
+                   self.stream_send_windows.get(sid, self.initial_send_window))
+
+    async def send_data(self, sid, data, end=False):
+        """Send DATA only against advertised connection AND stream credit."""
+        self.stream_send_windows.setdefault(sid, self.initial_send_window)
+        offset = 0
+        while offset < len(data):
+            assert not self.closed and not self.goaway and sid not in self.resets, \
+                f'stream {sid} closed while sending DATA: {self.error or self.resets.get(sid)}'
+            size = min(16384, len(data) - offset, self.send_capacity(sid))
+            if size <= 0:
+                self.credit_changed.clear()
+                await self.credit_changed.wait()
+                continue
+            self.connection_send_window -= size
+            self.stream_send_windows[sid] -= size
+            self.sent_data[sid] = self.sent_data.get(sid, 0) + size
+            self.writer.write(h2frame(0, int(end and offset + size == len(data)),
+                                      sid, data[offset:offset + size]))
+            offset += size
+            await self.writer.drain()
+        if end and not data:
+            self.writer.write(h2frame(0, 1, sid))
+            await self.writer.drain()
 
     async def open(self, sid, target_port, tag, tls, end=False):
         self.writer.write(h2frame(1, 4, sid, headers(tls, self.raw)))
         payload = vless(target_port, tag)
         encoded = payload if self.raw else grpc(payload)
-        for offset in range(0, len(encoded), 16384):
-            last = offset + 16384 >= len(encoded)
-            self.writer.write(h2frame(0, int(end and last), sid, encoded[offset:offset + 16384]))
-        await self.writer.drain()
+        await self.send_data(sid, encoded, end=end)
 
     async def wait_message(self, sid, value):
         await until(lambda: self.closed or bytes(self.messages.get(sid, b'')) == value, 5)

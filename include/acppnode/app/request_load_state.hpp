@@ -1,14 +1,15 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
+#include <memory>
+#include <mutex>
 #include <cstdint>
 
 namespace acpp::app {
 
-// Worker-local request load. Physical transports and dispatcher requests are
-// tracked separately because one multiplexed transport may own many requests,
-// while a regular TCP request appears in both sets. The larger set is the
-// effective load, avoiding double counting without hiding logical substreams.
+// Process-wide request pressure. Stable shared ownership survives the accepting
+// Worker and migration; physical and dispatch counts are not added together.
 class RequestLoadState final {
 public:
     RequestLoadState(uint32_t pressure_threshold,
@@ -16,8 +17,20 @@ public:
         : pressure_threshold_(std::max<uint32_t>(pressure_threshold, 1)),
           pressure_idle_timeout_(pressure_idle_timeout) {}
 
+    [[nodiscard]] static std::shared_ptr<RequestLoadState> Acquire(
+        uint32_t threshold, uint32_t idle_timeout) {
+        static std::mutex mutex;
+        static std::weak_ptr<RequestLoadState> published;
+        const std::lock_guard lock(mutex);
+        if (auto existing = published.lock()) return existing;
+        auto state = std::make_shared<RequestLoadState>(threshold, idle_timeout);
+        published = state;
+        return state;
+    }
+
     [[nodiscard]] uint32_t ActiveConnections() const noexcept {
-        return std::max(physical_connections_, active_dispatches_);
+        return std::max(physical_connections_.load(std::memory_order_relaxed),
+                        active_dispatches_.load(std::memory_order_relaxed));
     }
 
     [[nodiscard]] uint32_t PressureIdleTimeout() const noexcept {
@@ -30,11 +43,11 @@ public:
     public:
         explicit PhysicalConnectionScope(RequestLoadState& state) noexcept
             : state_(&state) {
-            ++state_->physical_connections_;
+            state_->physical_connections_.fetch_add(1, std::memory_order_relaxed);
         }
 
         ~PhysicalConnectionScope() noexcept {
-            --state_->physical_connections_;
+            state_->physical_connections_.fetch_sub(1, std::memory_order_relaxed);
         }
 
         PhysicalConnectionScope(const PhysicalConnectionScope&) = delete;
@@ -50,11 +63,11 @@ public:
     public:
         explicit DispatchScope(RequestLoadState& state) noexcept
             : state_(state) {
-            ++state_.active_dispatches_;
+            state_.active_dispatches_.fetch_add(1, std::memory_order_relaxed);
         }
 
         ~DispatchScope() noexcept {
-            --state_.active_dispatches_;
+            state_.active_dispatches_.fetch_sub(1, std::memory_order_relaxed);
         }
 
         DispatchScope(const DispatchScope&) = delete;
@@ -67,8 +80,8 @@ public:
     };
 
 private:
-    uint32_t physical_connections_ = 0;
-    uint32_t active_dispatches_ = 0;
+    std::atomic<uint32_t> physical_connections_{0};
+    std::atomic<uint32_t> active_dispatches_{0};
     const uint32_t pressure_threshold_;
     const uint32_t pressure_idle_timeout_;
 };

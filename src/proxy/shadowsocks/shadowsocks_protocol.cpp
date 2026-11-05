@@ -1,13 +1,13 @@
 #include "shadowsocks_crypto.hpp"
 
 #include "acppnode/core/constants.hpp"
+#include "acppnode/core/naming.hpp"
 
 #include <blake3.h>
 #include <openssl/evp.h>
 #include <openssl/hkdf.h>
 
 #include <algorithm>
-#include <cctype>
 #include <cstring>
 #include <limits>
 #include <utility>
@@ -21,28 +21,25 @@ namespace acpp::ss {
 // ParseCipherMethod
 // ============================================================================
 std::optional<SsCipherInfo> ParseCipherMethod(std::string_view method) {
-    // 转小写比较
-    std::string lower(method);
-    std::transform(lower.begin(), lower.end(), lower.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    const std::string lower = naming::LowerAscii(std::string(method));
 
-    if (lower == std::string(constants::protocol::kAes128Gcm)) {
+    if (lower == constants::protocol::kAes128Gcm) {
         return SsCipherInfo{SsCipherType::AES_128_GCM, 16, 16};
     }
-    if (lower == std::string(constants::protocol::kAes256Gcm)) {
+    if (lower == constants::protocol::kAes256Gcm) {
         return SsCipherInfo{SsCipherType::AES_256_GCM, 32, 32};
     }
-    if (lower == std::string(constants::protocol::kChacha20IetfPoly1305) ||
+    if (lower == constants::protocol::kChacha20IetfPoly1305 ||
         lower == "chacha20-poly1305") {
         return SsCipherInfo{SsCipherType::CHACHA20_POLY1305, 32, 32};
     }
-    if (lower == std::string(constants::protocol::kSs2022Blake3Aes128Gcm)) {
+    if (lower == constants::protocol::kSs2022Blake3Aes128Gcm) {
         return SsCipherInfo{SsCipherType::AES_128_GCM_2022, 16, 16};
     }
-    if (lower == std::string(constants::protocol::kSs2022Blake3Aes256Gcm)) {
+    if (lower == constants::protocol::kSs2022Blake3Aes256Gcm) {
         return SsCipherInfo{SsCipherType::AES_256_GCM_2022, 32, 32};
     }
-    if (lower == std::string(constants::protocol::kSs2022Blake3Chacha20Poly1305)) {
+    if (lower == constants::protocol::kSs2022Blake3Chacha20Poly1305) {
         return SsCipherInfo{SsCipherType::CHACHA20_POLY1305_2022, 32, 32};
     }
     return std::nullopt;
@@ -57,10 +54,6 @@ bool Is2022Cipher(SsCipherType type) noexcept {
         default:
             return false;
     }
-}
-
-bool Is2022Cipher(const SsCipherInfo& info) noexcept {
-    return Is2022Cipher(info.type);
 }
 
 bool Is2022AesCipher(SsCipherType type) noexcept {
@@ -171,7 +164,7 @@ KeyBytes Build2022UserKeyFromUuid(
     std::string_view uuid,
     const SsCipherInfo& info) {
     KeyBytes key;
-    if (!Is2022Cipher(info) ||
+    if (!Is2022Cipher(info.type) ||
         info.key_size == 0 ||
         info.key_size > KeyBytes::kMaxSize ||
         uuid.size() < info.key_size) {
@@ -189,7 +182,7 @@ KeyBytes Build2022UserKeyFromUuid(
 }
 
 KeyBytes BuildMasterKey(std::string_view password, const SsCipherInfo& info) {
-    if (Is2022Cipher(info)) {
+    if (Is2022Cipher(info.type)) {
         return Decode2022Psk(password, info.key_size);
     }
     return DeriveKey(std::string(password), info.key_size);

@@ -5,9 +5,16 @@
 #include "acppnode/infra/config_types.hpp"
 #include "acppnode/features/routing/dispatch_policy.hpp"
 #include "acppnode/proxy/inbound.hpp"
+#include "acppnode/transport/internet/transport_security.hpp"
 
 #include <iostream>
 #include <stdexcept>
+
+namespace acpp {
+void TransportSecurity::Prepare(StreamSettings& settings, StreamEndpointRole) {
+    if (settings.IsTlsLike()) throw std::logic_error("unexpected TLS in plaintext startup fixture");
+}
+}
 
 namespace {
 using namespace acpp;
@@ -47,7 +54,7 @@ int main() {
     ProxyRegistration registration;
     registration.user_protocol = UserProtocol::Vmess;
     registration.create_runtime = []() -> std::unique_ptr<ProtocolRuntime> { return {}; };
-    registration.create_tcp_handler = [](ProtocolRuntime&, StatsShard&, ConnectionLimiterPtr,
+    registration.create_tcp_handler = [](ProtocolRuntime&, StatsShard&, ConnectionLimiter*,
                                           const BuildRequest&) -> std::unique_ptr<Inbound> { return {}; };
     registration.build_static_users = &BuildUsers;
     RegisterProxy("vmess", registration);
@@ -65,6 +72,8 @@ int main() {
         !Rejected({Source("static-owner", constants::test::kTestPort)}, true) || user_builds != 0) return 1;
 
     const auto prepared = PrepareStartupInbounds({Source("static-owner", 12000)}, true);
+    if (prepared.size() != 2 || prepared[0].runtime.proxy_protocol != ProxyProtocolMode::Auto ||
+        prepared[1].runtime.proxy_protocol != ProxyProtocolMode::Auto) return 6;
     if (user_builds != 2 || prepared.size() != 2 ||
         prepared[0].runtime.tag != "static-owner" || prepared[0].runtime.build_request.tag != "static-owner" ||
         prepared[1].runtime.tag != constants::test::kTestInboundTag ||
@@ -86,6 +95,7 @@ int main() {
 
     auto routed = Source("routed", 12002);
     routed.routing_enabled = true;
+    routed.proxy_protocol = ProxyProtocolMode::On;
     auto forced = Source("forced", 12001);
     forced.outbound_tag = "custom-out";
     auto forced_override = Source("forced-override", 12003);
@@ -93,6 +103,8 @@ int main() {
     forced_override.outbound_tag = "custom-out";
     const auto policies = PrepareStartupInbounds(
         {Source("default-direct", 12000), routed, forced, forced_override}, false);
+    if (policies.size() != 4 || policies[1].runtime.proxy_protocol != ProxyProtocolMode::On ||
+        policies[0].runtime.proxy_protocol != ProxyProtocolMode::Auto) return 7;
     if (policies.size() != 4 ||
         !std::holds_alternative<routing::ForceOutbound>(policies[0].runtime.outbound_policy) ||
         std::get<routing::ForceOutbound>(policies[0].runtime.outbound_policy).outbound_tag != "direct" ||

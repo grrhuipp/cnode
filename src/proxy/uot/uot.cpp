@@ -1,4 +1,5 @@
 #include "uot.hpp"
+#include "acppnode/common/byte_reader.hpp"
 #include "acppnode/common/address_codec.hpp"
 
 #include "acppnode/common/buffer_util.hpp"
@@ -19,25 +20,14 @@ enum class PendingStatus : uint8_t {
 };
 
 
-void PutU16BE(uint8_t* out, uint16_t value) noexcept {
-    out[0] = static_cast<uint8_t>(value >> 8);
-    out[1] = static_cast<uint8_t>(value);
-}
-
-uint16_t ReadU16BE(const uint8_t* in) noexcept {
-    return static_cast<uint16_t>(
-        (static_cast<uint16_t>(in[0]) << 8) |
-        static_cast<uint16_t>(in[1]));
-}
-
 
 net::awaitable<PendingStatus> EnsurePending(
     transport::MultiBufferReader& reader,
     buf::MultiBuffer& pending,
     size_t required) {
-    while (buf::TotalLen(pending) < required) {
+    while (pending.byte_size() < required) {
         auto next = co_await reader.ReadMultiBuffer();
-        if (!buf::HasData(next)) {
+        if (next.byte_size() == 0) {
             co_return PendingStatus::Eof;
         }
         next.MoveTo(pending, true);
@@ -104,8 +94,7 @@ net::awaitable<tl::expected<Request, ErrorCode>> ReadRequest(
     Request request;
     request.is_connect = first[0] != 0;
     request.destination = std::move(address->target);
-    request.consumed = 1 + address->consumed;
-    pending.DropPrefixBytes(request.consumed);
+    pending.DropPrefixBytes(1 + address->consumed);
     pending.ReleaseIfIdle();
     co_return request;
 }
@@ -132,7 +121,7 @@ net::awaitable<tl::expected<PreparedRequest, ErrorCode>> ReadUotRequestHeader(
     PacketReader packet_reader(reader, false, TargetAddress{}, std::move(pending));
     try {
         auto first_packet = co_await packet_reader.ReadMultiBuffer();
-        if (!buf::HasData(first_packet)) {
+        if (first_packet.byte_size() == 0) {
             co_return tl::unexpected(v1_eof_error);
         }
         for (const buf::Buffer* buffer : first_packet) {
@@ -169,17 +158,13 @@ PacketReader::PacketReader(transport::MultiBufferReader& reader,
     , pending_(std::move(prepared.pending))
     , initial_decoded_(std::move(prepared.initial_decoded)) {}
 
-void PacketReader::SetInitialDecoded(buf::MultiBuffer packet) noexcept {
-    initial_decoded_ = std::move(packet);
-}
-
 buf::MultiBuffer PacketReader::TakePending() noexcept {
     buf::MultiBuffer out = std::move(pending_);
     pending_.ReleaseIfIdle();
     return out;
 }
 net::awaitable<buf::MultiBuffer> PacketReader::ReadMultiBuffer() {
-    if (buf::HasData(initial_decoded_)) {
+    if (initial_decoded_.byte_size() != 0) {
         co_return std::move(initial_decoded_);
     }
 
@@ -190,7 +175,7 @@ net::awaitable<buf::MultiBuffer> PacketReader::ReadMultiBuffer() {
         size_t header_size = 0;
         if (is_connect_) {
             if (co_await EnsurePending(reader_, pending_, 2) != PendingStatus::Ready) {
-                if (!buf::HasData(pending_)) {
+                if (pending_.byte_size() == 0) {
                     co_return buf::MultiBuffer{};
                 }
                 ThrowDecodeFailure();
@@ -215,7 +200,7 @@ net::awaitable<buf::MultiBuffer> PacketReader::ReadMultiBuffer() {
             ThrowDecodeFailure();
         }
         const size_t length_offset = header_size - 2;
-        const size_t payload_size = ReadU16BE(header.data() + length_offset);
+        const size_t payload_size = LoadU16BE(header.data() + length_offset);
         if (co_await EnsurePending(reader_, pending_, header_size + payload_size) !=
             PendingStatus::Ready) {
             ThrowDecodeFailure();
@@ -268,7 +253,7 @@ net::awaitable<void> PacketWriter::WritePacket(
             ThrowDecodeFailure();
         }
     }
-    PutU16BE(header.data() + header_size, static_cast<uint16_t>(payload_size));
+    StoreU16BE(header.data() + header_size, static_cast<uint16_t>(payload_size));
     header_size += 2;
 
     ConstBufferSpanBuilder<8> buffers;

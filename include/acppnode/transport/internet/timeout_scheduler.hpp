@@ -10,8 +10,9 @@ namespace acpp {
 
 class TimeoutSchedulerService;
 class TimeoutScheduler;
+class ExecutionDomain;
 
-// An owner-thread event embedded in its owner, never separately allocated.
+// An owner-domain event embedded in its owner, never separately allocated.
 // Its address is stable from scheduling through cancellation/completion. An
 // expiry detaches it before calling OnTimeout, which may rearm or destroy it.
 class TimeoutEvent {
@@ -48,7 +49,8 @@ private:
     friend class TimeoutScheduler;
 };
 
-// One owner-thread indexed heap and one outstanding timer per io_context.
+// One indexed heap and one outstanding timer per execution domain (or per
+// io_context for Worker control-plane callers outside a domain).
 // Heap entries borrow embedded events; cancellation removes an entry in place,
 // with no event-map nodes, stale indices, callback allocations or ready list.
 class TimeoutScheduler {
@@ -63,6 +65,9 @@ public:
     // Call on the owner after all users join; drain cancellation before
     // destroying the io_context and its PMR-backed scheduler service.
     static void ReleaseForIoContext(net::io_context& io_context);
+    // Cancel and await the last native timer notification before retiring a
+    // domain. Unlike the synchronous release, this completes the I/O boundary.
+    static net::awaitable<void> AsyncReleaseForIoContext(net::io_context& io_context);
 
     // Rearming an existing event reuses its heap slot. False means released.
     // Failure leaves this event unarmed; unrelated events remain scheduled.
@@ -77,7 +82,7 @@ public:
 
 private:
     friend class TimeoutSchedulerService;
-    explicit TimeoutScheduler(net::io_context& io_context);
+    explicit TimeoutScheduler(net::io_context& io_context, std::weak_ptr<ExecutionDomain> domain);
     void Release() noexcept;
     struct Impl;
     std::unique_ptr<Impl> impl_;

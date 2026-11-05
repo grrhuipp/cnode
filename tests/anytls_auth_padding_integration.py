@@ -79,7 +79,7 @@ async def scenario(args, candidate, expected_range, output, result, resources):
     configure(output,
         {'protocol': 'vless', 'listen': '127.0.0.1', 'port': front_port,
          'settings': {'clients': [{'id': str(USER)}]}},
-        {'protocol': 'anytls', 'settings': {'server': '127.0.0.1', 'server_port': peer_port,
+        {'protocol': 'anytls', 'settings': {'address': '127.0.0.1', 'port': peer_port,
          'password': 'auth-policy-fixture', 'minIdleSession': 1}, 'streamSettings': tls_settings()})
     resources.spawn([args.binary, '--config-dir', output], output / 'child.log')
     samples = 32 if expected_range == (45, 77) else 2

@@ -1,4 +1,5 @@
 #include "anytls_codec.hpp"
+#include "acppnode/common/byte_reader.hpp"
 #include "padding.hpp"
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/transport/async_stream.hpp"
@@ -15,38 +16,14 @@ namespace acpp::anytls {
 
 namespace {
 
-void WriteU16BE(uint8_t* out, uint16_t value) noexcept {
-    out[0] = static_cast<uint8_t>(value >> 8);
-    out[1] = static_cast<uint8_t>(value);
-}
-
-void WriteU32BE(uint8_t* out, uint32_t value) noexcept {
-    out[0] = static_cast<uint8_t>(value >> 24);
-    out[1] = static_cast<uint8_t>(value >> 16);
-    out[2] = static_cast<uint8_t>(value >> 8);
-    out[3] = static_cast<uint8_t>(value);
-}
-
-uint16_t ReadU16BE(const uint8_t* in) noexcept {
-    return static_cast<uint16_t>((static_cast<uint16_t>(in[0]) << 8) |
-                                 static_cast<uint16_t>(in[1]));
-}
-
-uint32_t ReadU32BE(const uint8_t* in) noexcept {
-    return (static_cast<uint32_t>(in[0]) << 24) |
-           (static_cast<uint32_t>(in[1]) << 16) |
-           (static_cast<uint32_t>(in[2]) << 8) |
-           static_cast<uint32_t>(in[3]);
-}
-
 std::array<uint8_t, kFrameHeaderSize> BuildFrameHeaderBytes(
     uint8_t cmd,
     uint32_t sid,
     size_t payload_size) noexcept {
     std::array<uint8_t, kFrameHeaderSize> header{};
     header[0] = cmd;
-    WriteU32BE(header.data() + 1, sid);
-    WriteU16BE(header.data() + 5, static_cast<uint16_t>(payload_size));
+    StoreU32BE(header.data() + 1, sid);
+    StoreU16BE(header.data() + 5, static_cast<uint16_t>(payload_size));
     return header;
 }
 
@@ -57,83 +34,46 @@ void AppendWaste(memory::ByteVector& out, uint16_t payload_size) {
     std::memcpy(out.data() + offset, header.data(), header.size());
 }
 
-net::awaitable<tl::expected<void, ErrorCode>>
-WriteMultiBufferAsFrameBatchImpl(AsyncStream& stream,
-                                 uint8_t cmd,
-                                 uint32_t sid,
-                                 buf::MultiBuffer mb) {
-    FrameBatch batch;
-    auto encoded = batch.Encode(cmd, sid, mb);
-    if (!encoded) {
-        mb.clear();
-        co_return encoded;
-    }
-    const auto buffers = batch.Buffers();
-
-    if (!buffers.empty()) {
-        try {
-            co_await stream.WriteBuffers(buffers);
-        } catch (const IoSystemError& e) {
-            mb.clear();
-            co_return tl::unexpected(MapAsioError(e.code()));
-        }
-    }
-
-    mb.clear();
-    co_return tl::expected<void, ErrorCode>{};
-}
-
-net::awaitable<tl::expected<void, ErrorCode>>
-WriteBuffersAsFrameBatchImpl(AsyncStream& stream,
-                             uint8_t cmd,
-                             uint32_t sid,
-                             std::span<const net::const_buffer> input) {
-    FrameBatch batch;
-    auto encoded = batch.Encode(cmd, sid, input);
-    if (!encoded) {
-        co_return encoded;
-    }
-    const auto buffers = batch.Buffers();
-    if (!buffers.empty()) {
-        try {
-            co_await stream.WriteBuffers(buffers);
-        } catch (const IoSystemError& e) {
-            co_return tl::unexpected(MapAsioError(e.code()));
-        }
-    }
-    co_return tl::expected<void, ErrorCode>{};
-}
-
 }  // namespace
 
-tl::expected<void, ErrorCode> FrameBatch::Encode(
-    uint8_t cmd, uint32_t sid, const buf::MultiBuffer& payload) {
+void FrameBatch::Begin(size_t frames) {
     count_ = 0;
     spill_headers_.clear();
     spill_buffers_.clear();
-    spilled_ = payload.size() > kInlineFrames;
+    spilled_ = frames > kInlineFrames;
     if (spilled_) {
-        spill_headers_.reserve(payload.size());
-        spill_buffers_.reserve(payload.size() * 2);
+        spill_headers_.reserve(frames);
+        spill_buffers_.reserve(frames * 2);
     }
+}
+
+bool FrameBatch::Append(uint8_t cmd, uint32_t sid, std::span<const uint8_t> bytes) {
+    if (bytes.size() > kMaxFramePayload) {
+        count_ = 0;
+        spill_buffers_.clear();
+        return false;
+    }
+    if (spilled_) {
+        auto& header = spill_headers_.emplace_back(
+            BuildFrameHeaderBytes(cmd, sid, bytes.size()));
+        spill_buffers_.emplace_back(header.data(), header.size());
+        spill_buffers_.emplace_back(bytes.data(), bytes.size());
+    } else {
+        auto& header = headers_[count_ / 2];
+        header = BuildFrameHeaderBytes(cmd, sid, bytes.size());
+        buffers_[count_++] = net::const_buffer(header.data(), header.size());
+        buffers_[count_++] = net::const_buffer(bytes.data(), bytes.size());
+    }
+    return true;
+}
+
+tl::expected<void, ErrorCode> FrameBatch::Encode(
+    uint8_t cmd, uint32_t sid, const buf::MultiBuffer& payload) {
+    Begin(payload.size());
     for (const auto* buffer : payload) {
         if (!buffer || buffer->IsEmpty()) continue;
-        const auto bytes = buffer->Bytes();
-        if (bytes.size() > kMaxFramePayload) {
-            count_ = 0;
-            spill_buffers_.clear();
+        if (!Append(cmd, sid, buffer->Bytes())) {
             return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
-        }
-        if (spilled_) {
-            auto& header = spill_headers_.emplace_back(
-                BuildFrameHeaderBytes(cmd, sid, bytes.size()));
-            spill_buffers_.emplace_back(header.data(), header.size());
-            spill_buffers_.emplace_back(bytes.data(), bytes.size());
-        } else {
-            auto& header = headers_[count_ / 2];
-            header = BuildFrameHeaderBytes(cmd, sid, bytes.size());
-            buffers_[count_++] = net::const_buffer(header.data(), header.size());
-            buffers_[count_++] = net::const_buffer(bytes.data(), bytes.size());
         }
     }
     return {};
@@ -141,38 +81,18 @@ tl::expected<void, ErrorCode> FrameBatch::Encode(
 
 tl::expected<void, ErrorCode> FrameBatch::Encode(
     uint8_t cmd, uint32_t sid, std::span<const net::const_buffer> input) {
-    count_ = 0;
-    spill_headers_.clear();
-    spill_buffers_.clear();
     size_t non_empty_count = 0;
     for (const net::const_buffer& buffer : input) {
         if (buffer.data() && buffer.size() > 0) {
             ++non_empty_count;
         }
     }
-    spilled_ = non_empty_count > kInlineFrames;
-    if (spilled_) {
-        spill_headers_.reserve(non_empty_count);
-        spill_buffers_.reserve(non_empty_count * 2);
-    }
+    Begin(non_empty_count);
     for (const net::const_buffer& buffer : input) {
         const auto* data = static_cast<const uint8_t*>(buffer.data());
         if (!data || buffer.size() == 0) continue;
-        if (buffer.size() > kMaxFramePayload) {
-            count_ = 0;
-            spill_buffers_.clear();
+        if (!Append(cmd, sid, std::span<const uint8_t>(data, buffer.size()))) {
             return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
-        }
-        if (spilled_) {
-            auto& header = spill_headers_.emplace_back(
-                BuildFrameHeaderBytes(cmd, sid, buffer.size()));
-            spill_buffers_.emplace_back(header.data(), header.size());
-            spill_buffers_.emplace_back(data, buffer.size());
-        } else {
-            auto& header = headers_[count_ / 2];
-            header = BuildFrameHeaderBytes(cmd, sid, buffer.size());
-            buffers_[count_++] = net::const_buffer(header.data(), header.size());
-            buffers_[count_++] = net::const_buffer(data, buffer.size());
         }
     }
     return {};
@@ -183,7 +103,44 @@ WriteMultiBufferAsFrameBatch(AsyncStream& stream,
                              uint8_t cmd,
                              uint32_t sid,
                              buf::MultiBuffer mb) {
-    return WriteMultiBufferAsFrameBatchImpl(stream, cmd, sid, std::move(mb));
+    FrameBatch batch;
+    auto encoded = batch.Encode(cmd, sid, mb);
+    if (!encoded) {
+        mb.clear();
+        co_return encoded;
+    }
+    const auto buffers = batch.Buffers();
+    if (!buffers.empty()) {
+        try {
+            co_await stream.WriteBuffers(buffers);
+        } catch (const IoSystemError& e) {
+            mb.clear();
+            co_return tl::unexpected(MapAsioError(e.code()));
+        }
+    }
+    mb.clear();
+    co_return tl::expected<void, ErrorCode>{};
+}
+
+net::awaitable<tl::expected<void, ErrorCode>>
+WriteBuffersAsFrameBatch(AsyncStream& stream,
+                         uint8_t cmd,
+                         uint32_t sid,
+                         std::span<const net::const_buffer> buffers) {
+    FrameBatch batch;
+    auto encoded = batch.Encode(cmd, sid, buffers);
+    if (!encoded) {
+        co_return encoded;
+    }
+    const auto framed = batch.Buffers();
+    if (!framed.empty()) {
+        try {
+            co_await stream.WriteBuffers(framed);
+        } catch (const IoSystemError& e) {
+            co_return tl::unexpected(MapAsioError(e.code()));
+        }
+    }
+    co_return tl::expected<void, ErrorCode>{};
 }
 
 tl::expected<PeerSettings, ErrorCode> ParsePeerSettings(std::string_view text) {
@@ -242,8 +199,8 @@ tl::expected<void, ErrorCode> AppendFrameBytesTo(
     out.resize(offset + kFrameHeaderSize + payload.size());
     auto* header = out.data() + offset;
     header[0] = cmd;
-    WriteU32BE(header + 1, sid);
-    WriteU16BE(header + 5, static_cast<uint16_t>(payload.size()));
+    StoreU32BE(header + 1, sid);
+    StoreU16BE(header + 5, static_cast<uint16_t>(payload.size()));
     if (!payload.empty()) {
         std::memcpy(out.data() + offset + kFrameHeaderSize, payload.data(), payload.size());
     }
@@ -354,7 +311,7 @@ WritePaddedMultiBufferFrames(AsyncStream& stream,
                             buf::MultiBuffer mb) {
 
     memory::ByteVector packet;
-    packet.reserve(buf::TotalLen(mb) + (mb.size() * kFrameHeaderSize));
+    packet.reserve(mb.byte_size() + (mb.size() * kFrameHeaderSize));
     for (auto* buffer : mb) {
         if (!buffer || buffer->IsEmpty()) {
             continue;
@@ -428,7 +385,7 @@ WriteBuffersAsFramesWithPadding(AsyncStream& stream,
                                 uint32_t sid,
                                 std::span<const net::const_buffer> buffers) {
     if (scheme.RecordFor(packet_index).empty()) {
-        return WriteBuffersAsFrameBatchImpl(stream, cmd, sid, buffers);
+        return WriteBuffersAsFrameBatch(stream, cmd, sid, buffers);
     }
     return WritePaddedBufferFrames(stream, scheme, packet_index, cmd, sid, buffers);
 }
@@ -452,8 +409,8 @@ ReadFrameHeader(AsyncStream& stream) {
 
     FrameHeader out;
     out.cmd = header[0];
-    out.sid = ReadU32BE(header.data() + 1);
-    out.length = ReadU16BE(header.data() + 5);
+    out.sid = LoadU32BE(header.data() + 1);
+    out.length = LoadU16BE(header.data() + 5);
     co_return out;
 }
 

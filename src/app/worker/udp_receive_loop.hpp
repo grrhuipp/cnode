@@ -16,7 +16,6 @@
 
 namespace acpp::worker_detail {
 
-namespace {
 [[nodiscard]] inline bool IsTransientReceiveError(
     const IoErrorCode& error) noexcept {
     return error == io_error::would_block || error == io_error::try_again ||
@@ -24,7 +23,6 @@ namespace {
         error == io_error::connection_refused ||
         error == io_error::connection_reset;
 }
-}  // namespace
 
 template <class IsOwned, class ProcessDatagram>
 net::awaitable<void> RunUdpReceiveLoop(

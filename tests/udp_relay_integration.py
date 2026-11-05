@@ -506,8 +506,7 @@ async def run_case(binary, output, protocol, mode):
     result = {'protocol': protocol, 'mode': mode}
     with (output / 'child.log').open('w', encoding='utf-8') as logfile:
         child = subprocess.Popen([str(binary), '--config-dir', str(output)], stdout=logfile,
-                                 stderr=subprocess.STDOUT,
-                                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+                                 stderr=subprocess.STDOUT)
         try:
             deadline = time.monotonic() + 8
             while 'server started' not in (output / 'child.log').read_text(encoding='utf-8', errors='replace'):

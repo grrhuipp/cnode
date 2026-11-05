@@ -12,7 +12,6 @@ struct StatsShard;
 
 namespace acpp::vless {
 struct VlessEncryptionConfig;
-class VlessEncryptionServerTicketStore;
 }  // namespace acpp::vless
 
 namespace acpp::proxy::vless::inbound {
@@ -21,7 +20,7 @@ class Handler final : public ::acpp::Inbound {
 public:
     Handler(::acpp::UserOnlineTracker& validator,
             ::acpp::StatsShard& stats,
-            ::acpp::ConnectionLimiterPtr limiter,
+            ::acpp::ConnectionLimiter* limiter,
             std::shared_ptr<
                 const ::acpp::vless::VlessEncryptionConfig> decryption = {});
     ~Handler() override;
@@ -38,10 +37,8 @@ public:
 private:
     ::acpp::UserOnlineTracker& validator_;
     ::acpp::StatsShard* stats_ = nullptr;
-    ::acpp::ConnectionLimiterPtr limiter_;
+    ::acpp::ConnectionLimiter* limiter_;
     std::shared_ptr<const ::acpp::vless::VlessEncryptionConfig> decryption_;
-    std::unique_ptr<::acpp::vless::VlessEncryptionServerTicketStore>
-        decryption_tickets_;
 };
 
 }  // namespace acpp::proxy::vless::inbound

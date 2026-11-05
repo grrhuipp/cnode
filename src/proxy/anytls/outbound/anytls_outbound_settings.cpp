@@ -3,7 +3,7 @@
 #include "acppnode/common/ip_address.hpp"
 #include "../credentials.hpp"
 
-#include "acppnode/infra/json_port.hpp"
+#include "acppnode/infra/json_field.hpp"
 
 #include <chrono>
 #include <format>
@@ -16,40 +16,11 @@ namespace acpp::proxy::anytls::outbound {
 
 namespace {
 
-tl::expected<std::optional<uint64_t>, std::string> ReadOptionalUnsigned(
-    const json::object& source,
-    std::string_view key) {
-    const auto* raw = source.if_contains(key);
-    if (!raw) {
-        return std::optional<uint64_t>{};
-    }
-
-    if (raw->is_int64()) {
-        const int64_t signed_value = raw->as_int64();
-        if (signed_value < 0) {
-            return tl::unexpected(std::format(
-                "{} must not be negative", key));
-        }
-        return std::optional<uint64_t>{static_cast<uint64_t>(signed_value)};
-    }
-    if (raw->is_uint64()) {
-        return std::optional<uint64_t>{raw->as_uint64()};
-    }
-    return tl::unexpected(std::format("{} must be an integer", key));
-}
-
-std::string ReadString(const json::object& source, std::string_view key) {
-    const auto* value = source.if_contains(key);
-    return value && value->is_string()
-        ? std::string(value->as_string())
-        : std::string{};
-}
-
 tl::expected<std::chrono::seconds, std::string> ReadPositiveSeconds(
     const json::object& source,
     std::string_view key,
     std::chrono::seconds fallback) {
-    auto parsed = ReadOptionalUnsigned(source, key);
+    auto parsed = ParseJsonUint64(source, key);
     if (!parsed) return tl::unexpected(std::move(parsed.error()));
     if (!*parsed) return fallback;
     if (**parsed == 0) {
@@ -75,7 +46,11 @@ tl::expected<std::chrono::seconds, std::string> ReadPositiveSeconds(
 tl::expected<Settings, std::string> ParseSettings(const json::object& source) {
     Settings result;
 
-    result.address = ReadString(source, "address");
+    // A present field of the wrong type is a configuration error, never an
+    // implicit default.
+    auto address = ParseJsonString(source, "address");
+    if (!address) return tl::unexpected(std::move(address.error()));
+    result.address = std::move(*address).value_or(std::string{});
 
     const auto port = ReadJsonPort(source, "port");
     if (port.Invalid()) {
@@ -83,8 +58,12 @@ tl::expected<Settings, std::string> ParseSettings(const json::object& source) {
     }
     if (port.Valid()) result.port = port.value;
 
-    auto password = ReadString(source, "password");
-    if (password.empty()) password = ReadString(source, "key");
+    auto source_password = ParseJsonString(source, "password");
+    if (!source_password) return tl::unexpected(std::move(source_password.error()));
+    auto source_key = ParseJsonString(source, "key");
+    if (!source_key) return tl::unexpected(std::move(source_key.error()));
+    auto password = std::move(*source_password).value_or(std::string{});
+    if (password.empty()) password = std::move(*source_key).value_or(std::string{});
 
     auto check_interval = ReadPositiveSeconds(
         source,
@@ -102,15 +81,10 @@ tl::expected<Settings, std::string> ParseSettings(const json::object& source) {
     if (!idle_timeout) return tl::unexpected(std::move(idle_timeout.error()));
     result.idle_session_timeout = *idle_timeout;
 
-    auto min_idle = ReadOptionalUnsigned(
-        source, "minIdleSession");
+    auto min_idle = ParseJsonUint64(
+        source, "minIdleSession", std::numeric_limits<size_t>::max());
     if (!min_idle) return tl::unexpected(std::move(min_idle.error()));
-    if (*min_idle) {
-        if (**min_idle > std::numeric_limits<size_t>::max()) {
-            return tl::unexpected("minIdleSession exceeds the size range");
-        }
-        result.min_idle_sessions = static_cast<size_t>(**min_idle);
-    }
+    if (*min_idle) result.min_idle_sessions = static_cast<size_t>(**min_idle);
 
     if (result.address.empty()) return tl::unexpected("AnyTLS address is required");
     result.literal_address = iputil::ParseLiteral(result.address);

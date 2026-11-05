@@ -93,7 +93,7 @@ net::awaitable<void> WriteUdpDatagram(
     }
 
     std::array<uint8_t, 272> header{};
-    const size_t header_size = TrojanCodec::EncodeUdpPacketHeaderTo(
+    const size_t header_size = EncodeUdpPacketHeaderTo(
         *datagram.target,
         datagram.payload_size,
         header.data(),
@@ -133,7 +133,7 @@ net::awaitable<void> WriteUdpDatagram(
     }
 
     std::array<uint8_t, 272> header{};
-    const size_t header_size = TrojanCodec::EncodeUdpPacketHeaderTo(
+    const size_t header_size = EncodeUdpPacketHeaderTo(
         target,
         payload_size,
         header.data(),

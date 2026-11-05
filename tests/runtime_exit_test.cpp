@@ -377,6 +377,7 @@ int main(int argc, char** argv) {
                 // This is shorter than the configured 2-second push interval.
                 if (posted) std::this_thread::sleep_for(500ms);
             });
+            const bool closed_after_stop = !panel_heartbeat || fixture.WaitForClientClose();
             const auto posts = fixture.Posts();
             std::ifstream output_file(output_path, std::ios::binary);
             const std::string output{std::istreambuf_iterator<char>(output_file), {}};
@@ -403,11 +404,12 @@ int main(int argc, char** argv) {
                     output.find("traffic failed/0") == std::string::npos &&
                     output.find("traffic ok/0") == std::string::npos
                 : output.find(expected_report) != std::string::npos;
-            if (exit_code != 0 || !posted || !closed_before_stop || posts.size() != 1 ||
+            if (exit_code != 0 || !posted || !closed_before_stop || !closed_after_stop || posts.size() != 1 ||
                 posts[0].address != expected_address || posts[0].body != "{}" ||
                 !report_valid) {
                 std::cerr << "unexpected panel request behavior: exit=" << exit_code
                           << " posts=" << posts.size() << " closed_before_stop=" << closed_before_stop
+                          << " closed_after_stop=" << closed_after_stop
                           << '\n' << output;
                 return 12;
             }

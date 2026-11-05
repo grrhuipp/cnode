@@ -58,20 +58,19 @@ std::string FormatRate(double bytes_per_sec) {
     return acpp::FormatBytes(static_cast<uint64_t>(bytes_per_sec)) + "/s";
 }
 
-net::awaitable<std::vector<Worker::RuntimeStatsSnapshot>>
+net::awaitable<std::vector<WorkerRuntimeStatsSnapshot>>
 CollectWorkerRuntimeStats(const MonitorContext& ctx, bool include_resources) {
     ctx.ThrowIfStopping();
-    std::vector<Worker::RuntimeStatsSnapshot> snapshots(ctx.workers.size());
+    std::vector<WorkerRuntimeStatsSnapshot> snapshots(ctx.workers.size());
     std::vector<net::awaitable<void>> tasks;
     tasks.reserve(ctx.workers.size());
     for (size_t i = 0; i < ctx.workers.size(); ++i) {
         tasks.push_back(
             [](const MonitorContext& context, Worker* worker,
-               Worker::RuntimeStatsSnapshot& out,
+               WorkerRuntimeStatsSnapshot& out,
                bool collect_resources) -> net::awaitable<void> {
                 context.ThrowIfStopping();
-                out = co_await worker->PostTask(
-                    worker->CollectRuntimeStatsTask(collect_resources));
+                out = co_await worker->PostTask(worker->CollectRuntimeStats(collect_resources));
             }(ctx, ctx.workers[i].get(), snapshots[i], include_resources)
         );
     }
@@ -81,29 +80,25 @@ CollectWorkerRuntimeStats(const MonitorContext& ctx, bool include_resources) {
     co_return snapshots;
 }
 
-net::awaitable<void> CollectWorkerHeaps(const MonitorContext& ctx, bool force) {
+net::awaitable<void> CollectWorkerHeaps(const MonitorContext& ctx) {
     ctx.ThrowIfStopping();
     std::vector<net::awaitable<void>> tasks;
     tasks.reserve(ctx.workers.size());
     for (const auto& worker : ctx.workers) {
         tasks.push_back(
-            [](const MonitorContext& context, Worker* owner, bool burst) -> net::awaitable<void> {
+            [](const MonitorContext& context, Worker* owner) -> net::awaitable<void> {
                 context.ThrowIfStopping();
-                co_await owner->PostTask(owner->CollectHeapTask(burst));
-            }(ctx, worker.get(), force));
+                co_await owner->PostCall([owner] { owner->CollectHeap(); });
+            }(ctx, worker.get()));
     }
     co_await RunAwaitableBatch(ctx.main_ctx.get_executor(), std::move(tasks));
     ctx.ThrowIfStopping();
     // The control thread may also hold short-lived PMR allocations.
-    if (force) {
-        memory::CollectBurst();
-    } else {
-        memory::CollectSteady();
-    }
+    memory::CollectBurst();
 }
 
 StatsSnapshot AggregateWorkerStats(
-    const std::vector<Worker::RuntimeStatsSnapshot>& worker_snapshots) {
+    const std::vector<WorkerRuntimeStatsSnapshot>& worker_snapshots) {
     StatsSnapshot snapshot;
     for (const auto& worker_snapshot : worker_snapshots) {
         const auto& s = worker_snapshot.stats;
@@ -119,18 +114,17 @@ StatsSnapshot AggregateWorkerStats(
 net::awaitable<void> RuntimeSamplingLoop(
     const MonitorContext& ctx) {
     net::steady_timer timer(ctx.main_ctx);
-    [[maybe_unused]] uint32_t last_sample_total_conns = 0;
-    [[maybe_unused]] uint64_t last_force_collect_total_connections = 0;
-    [[maybe_unused]] bool churn_collect_baseline_set = false;
-    [[maybe_unused]] auto last_force_collect_at = steady_clock::time_point{};
-    [[maybe_unused]] auto last_steady_collect_at = steady_clock::time_point{};
+    uint32_t last_sample_total_conns = 0;
+    uint64_t last_force_collect_total_connections = 0;
+    bool churn_collect_baseline_set = false;
+    auto last_force_collect_at = steady_clock::time_point{};
     auto last_log_flush_at = steady_clock::time_point{};
     while (true) {
         auto worker_snapshots = co_await CollectWorkerRuntimeStats(ctx, false);
         auto aggregate_stats = AggregateWorkerStats(worker_snapshots);
         ctx.stats.SampleNow(aggregate_stats);
         constexpr auto kAsyncLogFlushInterval = std::chrono::seconds(5);
-        if constexpr (memory::kAllocatorCollects) {
+        {
             constexpr uint32_t kForceCollectMinPrevConns = 4096;
             constexpr uint32_t kForceCollectDropFactor = 4;
             constexpr uint32_t kForceCollectConnFloor = 64;
@@ -138,8 +132,6 @@ net::awaitable<void> RuntimeSamplingLoop(
             constexpr uint64_t kChurnForceCollectConnections = 2048;
             constexpr uint32_t kChurnForceCollectMinConns = 512;
             constexpr auto kChurnForceCollectCooldown = std::chrono::seconds(60);
-            constexpr auto kSteadyCollectInterval = std::chrono::seconds(10);
-            constexpr auto kIdleCollectInterval = std::chrono::seconds(1);
 
             uint32_t total_conns = 0;
             for (const auto& worker_snapshot : worker_snapshots) {
@@ -172,11 +164,6 @@ net::awaitable<void> RuntimeSamplingLoop(
                 churn_since_force >= kChurnForceCollectConnections &&
                 (last_force_collect_at.time_since_epoch().count() == 0 ||
                  now - last_force_collect_at >= kChurnForceCollectCooldown);
-            const auto steady_interval = total_conns == 0
-                ? kIdleCollectInterval : kSteadyCollectInterval;
-            const bool steady_collect_due =
-                last_steady_collect_at.time_since_epoch().count() == 0 ||
-                now - last_steady_collect_at >= steady_interval;
 
             if (((burst_drain || newly_idle) && cooldown_ok) || churn_collect_due) {
                 const char* reason =
@@ -184,22 +171,13 @@ net::awaitable<void> RuntimeSamplingLoop(
                 LOG_INFO("mem-collect force reason={} conn={} churn={}",
                          reason, total_conns, churn_since_force);
                 try {
-                    co_await CollectWorkerHeaps(ctx, true);
+                    co_await CollectWorkerHeaps(ctx);
                 } catch (const std::exception& error) {
                     ctx.ThrowIfStopping();
                     LOG_WARN("Worker heap collection skipped: {}", error.what());
                 }
                 last_force_collect_at = now;
-                last_steady_collect_at = now;
                 last_force_collect_total_connections = aggregate_stats.connections_total;
-            } else if (steady_collect_due) {
-                try {
-                    co_await CollectWorkerHeaps(ctx, false);
-                } catch (const std::exception& error) {
-                    ctx.ThrowIfStopping();
-                    LOG_WARN("Worker heap collection skipped: {}", error.what());
-                }
-                last_steady_collect_at = now;
             }
 
             last_sample_total_conns = total_conns;
@@ -272,8 +250,7 @@ net::awaitable<void> RuntimeStatsOutputLoop(
             total_users);
 
         const auto descriptors = ReadProcessDescriptors();
-        LOG_INFO("runtime.process {}={} soft_limit={}",
-                 descriptors.kind,
+        LOG_INFO("runtime.process fds={} soft_limit={}",
                  descriptors.open ? std::to_string(*descriptors.open) : "unknown",
                  descriptors.soft_limit ? std::to_string(*descriptors.soft_limit)
                      : descriptors.soft_limit_unlimited ? "unlimited" : "unknown");

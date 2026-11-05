@@ -410,8 +410,8 @@ net::awaitable<void> TestRelayRateAndAccounting(Fixture& fixture) {
     context.content.network = Network::UDP;
     StatsShard stats;
     const auto started = std::chrono::steady_clock::now();
-    auto result = co_await DoRelayLink(fixture.io, input, output, target, context, stats,
-                                      RelayConfig{.downlink_only = 1s, .speed_limit = 1000});
+    auto result = co_await DoRelayLink(fixture.io, input, output, static_cast<AsyncStream*>(nullptr),
+        target, context, stats, RelayConfig{.downlink_only = 1s, .speed_limit = 1000});
     const auto elapsed = std::chrono::steady_clock::now() - started;
     Check(result.error == ErrorCode::RELAY_TIMEOUT && result.bytes_up == 2000 && result.bytes_down == 0,
           "generic UDP relay traffic result changed");
@@ -429,7 +429,8 @@ net::awaitable<void> TestRelayErrorCode(Fixture& fixture) {
     session::Context context;
     context.content.network = Network::UDP;
     StatsShard stats;
-    auto result = co_await DoRelayLink(fixture.io, input, output, target, context, stats);
+    auto result = co_await DoRelayLink(fixture.io, input, output, static_cast<AsyncStream*>(nullptr),
+                                      target, context, stats);
     Check(result.error == ErrorCode::INVALID_ARGUMENT && result.bytes_up == 0 &&
           stats.Snapshot().bytes_out == 0, "logical UDP failure or failed-send accounting was lost");
 }
@@ -450,8 +451,8 @@ net::awaitable<void> TestRelayExternalCancellation(Fixture& fixture, bool deadli
     if (deadline) target.StartPhaseDeadline(1s);
     else (void)TimeoutScheduler::ForIoContext(fixture.io).ScheduleAfter(50ms, cancellation);
     const auto start = std::chrono::steady_clock::now();
-    const auto result = co_await DoRelayLink(fixture.io, input, output, target, context, stats,
-        RelayConfig{.speed_limit = 100});
+    const auto result = co_await DoRelayLink(fixture.io, input, output, static_cast<AsyncStream*>(nullptr),
+        target, context, stats, RelayConfig{.speed_limit = 100});
     const auto elapsed = std::chrono::steady_clock::now() - start;
     const auto expected = deadline ? ErrorCode::RELAY_TIMEOUT : ErrorCode::CANCELLED;
     Check(result.error == expected,

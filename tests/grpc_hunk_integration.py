@@ -62,21 +62,17 @@ def encode(mode, payload):
     return wire[:-1] if mode == 'truncated-body' else wire
 
 
-async def send_data(writer, wire, fragmented=False, end=False):
+async def send_data(peer, wire, fragmented=False, end=False):
     offset = 0
     for size in ([1, 1, 1, 1, 1, 1, 1, 2] if fragmented else []):
         if offset >= len(wire):
             break
         part = wire[offset:offset + size]
         offset += len(part)
-        writer.write(h2frame(0, int(end and offset == len(wire)), 1, part))
-        await writer.drain()
+        await peer.send_data(1, part, end=end and offset == len(wire))
         await asyncio.sleep(0.01)
-    while offset < len(wire):
-        part = wire[offset:offset + 16384]
-        offset += len(part)
-        writer.write(h2frame(0, int(end and offset == len(wire)), 1, part))
-        await writer.drain()
+    if offset < len(wire):
+        await peer.send_data(1, wire[offset:], end=end)
 
 
 async def inbound(args, mode, tls, output, result, resources):
@@ -101,15 +97,15 @@ async def inbound(args, mode, tls, output, result, resources):
     peer = Peer(resources, reader, writer)
     wire = encode(mode, vless(target, body))
     result['wire_bytes'] = len(wire)
-    await send_data(writer, wire, fragmented=mode == 'fragmented', end=True)
-    await until(lambda: peer.closed or any(sid == 1 and (
-                (mode in VALID and kind == 1 and flags & 1) or
-                (mode not in VALID and kind == 3 and payload == b'\0\0\0\x08'))
+    await send_data(peer, wire, fragmented=mode == 'fragmented', end=True)
+    await until(lambda: peer.closed or 1 in peer.resets or any(sid == 1 and (
+                mode in VALID and kind == 1 and flags & 1)
                 for kind, flags, sid, payload in peer.frames), 5)
     assert not peer.closed and not peer.error, f'physical connection lost: {peer.error}'
     result['first_target_requests'] = len(requests)
     result['first_response_hex'] = bytes(peer.messages.get(1, b'')).hex()
     if mode in VALID:
+        assert 1 not in peer.resets, f'legal Hunk reset: {peer.resets[1].hex()}'
         assert requests == [body] and bytes(peer.messages.get(1, b'')) == b'\0\0' + READY
     else:
         assert not requests and not peer.messages.get(1), 'rejected message reached proxy protocol/target'
@@ -138,7 +134,7 @@ async def outbound(args, mode, tls, output, result, resources):
         wire = encode(mode, b'\0\0' + body) if index == 0 else grpc(b'\0\0' + READY)
         if index == 0:
             result['wire_bytes'] = len(wire)
-        await send_data(writer, wire, fragmented=index == 0 and mode == 'fragmented')
+        await send_data(peer, wire, fragmented=index == 0 and mode == 'fragmented')
         writer.write(h2frame(1, 5, 1, b'\0\x0bgrpc-status\x010'))
         await writer.drain()
         await until(lambda: peer.closed, 5)

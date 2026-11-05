@@ -81,9 +81,9 @@
     "tag": "proxy-vless-xhttp-reality",
     "protocol": "vless",
     "settings": {
-      "server": "vless.example.com",
-      "server_port": 443,
-      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "address": "vless.example.com",
+      "port": 443,
+      "id": "b831381d-6324-4d53-ad4f-8cda48b30811",
       "encryption": "none",
       "packetEncoding": "xudp"
     },
@@ -106,9 +106,9 @@
     "tag": "proxy-vless-xhttp-split",
     "protocol": "vless",
     "settings": {
-      "server": "upload.example.com",
-      "server_port": 443,
-      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "address": "upload.example.com",
+      "port": 443,
+      "id": "b831381d-6324-4d53-ad4f-8cda48b30811",
       "encryption": "none",
       "packetEncoding": "xudp"
     },

@@ -18,7 +18,7 @@ class Handler final : public ::acpp::Inbound {
 public:
     Handler(::acpp::vmess::TimedUserValidator& validator,
             ::acpp::StatsShard& stats,
-            ::acpp::ConnectionLimiterPtr limiter);
+            ::acpp::ConnectionLimiter* limiter);
 
     // 从已建立的传输流解析 VMess AEAD 头，完成用户认证，填充 ctx
     ::acpp::net::awaitable<::acpp::RelayResult> Process(
@@ -33,7 +33,7 @@ public:
 private:
     ::acpp::vmess::TimedUserValidator& validator_;
     ::acpp::StatsShard* stats_ = nullptr;
-    ::acpp::ConnectionLimiterPtr limiter_;
+    ::acpp::ConnectionLimiter* limiter_;
 };
 
 }  // namespace acpp::proxy::vmess::inbound

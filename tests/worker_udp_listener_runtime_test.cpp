@@ -4,6 +4,7 @@
 #include "acppnode/app/port_binding.hpp"
 #include "acppnode/app/proxyman/inbound/factory.hpp"
 #include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
+#include "acppnode/app/session_group_executor.hpp"
 #include "acppnode/app/stats.hpp"
 #include "acppnode/app/worker.hpp"
 #include "acppnode/app/worker_runtime_config.hpp"
@@ -137,14 +138,14 @@ const TokenSettings& Settings(const acpp::proxyman::inbound::BuildRequest& reque
 }
 std::unique_ptr<acpp::Inbound> MakeTcp(
     acpp::proxyman::inbound::ProtocolRuntime&, acpp::StatsShard&,
-    acpp::ConnectionLimiterPtr,
+    acpp::ConnectionLimiter*,
     const acpp::proxyman::inbound::BuildRequest& request) {
     const auto& settings = Settings(request);
     return std::make_unique<Datagram>(*g_state, settings.token, settings.create_association);
 }
 std::unique_ptr<acpp::Inbound> MakeUdp(
     acpp::proxyman::inbound::ProtocolRuntime&, acpp::StatsShard&,
-    acpp::ConnectionLimiterPtr,
+    acpp::ConnectionLimiter*,
     const acpp::proxyman::inbound::BuildRequest& request) {
     const auto& settings = Settings(request);
     return std::make_unique<Datagram>(*g_state, settings.token, settings.create_association);
@@ -214,11 +215,6 @@ acpp::net::awaitable<void> Pause(acpp::net::io_context& io,
     co_await timer.async_wait(acpp::net::use_awaitable);
 }
 
-acpp::net::awaitable<acpp::Worker::RuntimeStatsSnapshot> Snapshot(
-    acpp::Worker& worker) {
-    co_return co_await worker.CollectRuntimeStatsTask(true);
-}
-
 acpp::net::awaitable<void> WaitForObservation(
     acpp::net::io_context& io, const FixtureState& state, std::size_t previous_count,
     unsigned expected_handler, uint8_t expected_nonce) {
@@ -253,7 +249,7 @@ acpp::net::awaitable<void> WaitForListenerCounts(
     std::size_t listeners, std::size_t loops) {
     const auto deadline = std::chrono::steady_clock::now() + 2s;
     while (std::chrono::steady_clock::now() < deadline) {
-        const auto snapshot = co_await Snapshot(worker);
+        const auto snapshot = co_await worker.CollectRuntimeStats(true);
         if (snapshot.resources &&
             snapshot.resources->udp_listeners == listeners &&
             snapshot.resources->udp_receive_loops == loops) co_return;
@@ -287,9 +283,9 @@ acpp::net::awaitable<void> RunAssociationWorker(
     bool ready_published = false;
     bool listener_registered = false;
     try {
-        co_await worker.StartRuntimeTask();
+        worker.StartRuntime();
         const auto request = BuildRequest(worker.Id() + 1, true);
-        if (!co_await worker.RegisterInboundTask(request, BuildReceiver()))
+        if (!worker.RegisterInbound(request, BuildReceiver()))
             Fail("two-worker inbound registration failed");
         const auto listen = acpp::InboundListen::Parse("0.0.0.0");
         if (!listen) Fail("could not prepare shared IPv4 listener");
@@ -297,7 +293,7 @@ acpp::net::awaitable<void> RunAssociationWorker(
         if (!co_await worker.AddUdpListenerTask(binding, request))
             Fail("two-worker UDP listener registration failed");
         listener_registered = true;
-        auto initial = co_await Snapshot(worker);
+        auto initial = co_await worker.CollectRuntimeStats(true);
         if (!initial.resources || initial.resources->udp_listeners == 0 ||
             initial.resources->udp_listeners > 2 ||
             initial.resources->udp_receive_loops != initial.resources->udp_listeners)
@@ -311,7 +307,7 @@ acpp::net::awaitable<void> RunAssociationWorker(
 
         // This is the sole final owner-thread collection. No monitoring,
         // intermediate stats, explicit cleanup or new packets during silence.
-        const auto final = co_await Snapshot(worker);
+        const auto final = co_await worker.CollectRuntimeStats(true);
         if (!final.resources || final.resources->udp_listeners == 0 ||
             final.resources->udp_listeners > 2 ||
             final.resources->udp_receive_loops != final.resources->udp_listeners ||
@@ -328,7 +324,7 @@ acpp::net::awaitable<void> RunAssociationWorker(
 
         co_await worker.UnregisterListenerTask(std::string(kTag));
         for (unsigned attempt = 0; ; ++attempt) {
-            const auto retired = co_await Snapshot(worker);
+            const auto retired = co_await worker.CollectRuntimeStats(true);
             if (retired.resources && retired.resources->udp_listeners == 0 &&
                 retired.resources->udp_receive_loops == 0) break;
             if (attempt == 100) Fail("two-worker retired receive loops did not finish");
@@ -362,6 +358,14 @@ acpp::net::awaitable<void> RunAssociationWorker(
 void RunTwoWorkerAssociations(acpp::app::dns::DNSWorker& dns,
                               const acpp::WorkerRuntimeConfig& base_config,
                               uint16_t port) {
+    acpp::net::io_context control;
+    auto coordinator = std::make_shared<acpp::GroupCoordinator>(control);
+    coordinator->Start();
+    std::exception_ptr control_failure;
+    std::thread control_thread([&] {
+        try { control.run(); }
+        catch (...) { control_failure = std::current_exception(); }
+    });
     std::array<std::promise<bool>, 2> ready_promises;
     std::array<std::future<bool>, 2> ready;
     std::array<std::promise<TwoWorkerResult>, 2> done_promises;
@@ -382,6 +386,7 @@ void RunTwoWorkerAssociations(acpp::app::dns::DNSWorker& dns,
                 g_state = &state;
                 auto worker = std::make_unique<acpp::Worker>(
                     static_cast<uint32_t>(i), io, config, stats, dns);
+                worker->SetGroupCoordinator(coordinator);
                 acpp::net::co_spawn(io,
                     RunAssociationWorker(io, *worker, state, port,
                                          ready_promises[i], done_promises[i], packets_sent),
@@ -418,20 +423,28 @@ void RunTwoWorkerAssociations(acpp::app::dns::DNSWorker& dns,
         });
     }
 
-    for (auto& future : ready) {
-        if (!future.get()) {
-            sent_promise.set_value(); // release any successfully started peer
-            for (auto& thread : workers) if (thread.joinable()) thread.join();
-            Fail("a two-worker runtime failed before becoming ready");
-        }
+    bool all_ready = true;
+    for (auto& future : ready) all_ready &= future.get();
+    if (all_ready) {
+        acpp::net::io_context sender_io;
+        acpp::udp::socket sender(sender_io, acpp::udp::v4());
+        for (uint8_t nonce = 1; nonce <= 30; ++nonce) Send(sender, port, nonce);
     }
-    acpp::net::io_context sender_io;
-    acpp::udp::socket sender(sender_io, acpp::udp::v4());
-    for (uint8_t nonce = 1; nonce <= 30; ++nonce) Send(sender, port, nonce);
-    sent_promise.set_value(); // the common post-send quiet interval starts here
+    sent_promise.set_value(); // also releases a peer when setup failed
     std::array<TwoWorkerResult, 2> results;
     for (std::size_t i = 0; i != 2; ++i) results[i] = done[i].get();
     for (auto& thread : workers) if (thread.joinable()) thread.join();
+    acpp::net::co_spawn(control,
+        [](std::shared_ptr<acpp::GroupCoordinator> owner) -> acpp::net::awaitable<void> {
+            owner->CloseAdmission();
+            co_await owner->AsyncJoin();
+            owner->ReleaseServices();
+            co_await owner->Finalize();
+        }(coordinator), [&](std::exception_ptr error) {
+            if (error) control_failure = error;
+        });
+    control_thread.join();
+    if (control_failure) std::rethrow_exception(control_failure);
     for (const auto& result : results)
         if (!result.ok) Fail(result.error.empty() ? "two-worker runtime failed" : result.error);
     const unsigned created = results[0].responses_created + results[1].responses_created;
@@ -498,14 +511,14 @@ acpp::net::awaitable<void> RunCases(
     FixtureState& state, uint16_t port, Options options, int& result,
     std::exception_ptr& runtime_failure) {
     try {
-        co_await worker.StartRuntimeTask();
+        worker.StartRuntime();
         const auto auto_listen = acpp::InboundListen::Parse("auto");
         const auto ipv4_wildcard = acpp::InboundListen::Parse("0.0.0.0");
         if (!auto_listen || !ipv4_wildcard) Fail("could not prepare listener endpoints");
 
         auto old_request = BuildRequest(1, options.mode == Mode::Associations);
-        if (!co_await worker.RegisterInboundTask(old_request, BuildReceiver()))
-            Fail("Worker::RegisterInboundTask failed");
+        if (!worker.RegisterInbound(old_request, BuildReceiver()))
+            Fail("Worker::RegisterInbound failed");
         const auto old_listen = (options.mode == Mode::Spawn || options.mode == Mode::Ready)
             ? *ipv4_wildcard : *auto_listen;
         const auto old_binding = acpp::PortBinding{.port = port, .protocol = std::string(kProtocol), .tag = std::string(kTag), .listen = old_listen};
@@ -513,7 +526,7 @@ acpp::net::awaitable<void> RunCases(
             Fail("initial Worker::AddUdpListenerTask failed");
 
         acpp::udp::socket sender(io, acpp::udp::v4());
-        const auto initial = co_await Snapshot(worker);
+        const auto initial = co_await worker.CollectRuntimeStats(true);
         if (!initial.resources || initial.resources->udp_listeners == 0 ||
             initial.resources->udp_receive_loops != initial.resources->udp_listeners)
             Fail("initial real listener and receive-loop metrics are inconsistent");
@@ -523,7 +536,7 @@ acpp::net::awaitable<void> RunCases(
             // No monitoring, intermediate stats, cleanup, collection or new
             // packet during this quiet period. Only maintenance may erase rows.
             co_await Pause(io, 350ms);
-            const auto final = co_await Snapshot(worker);
+            const auto final = co_await worker.CollectRuntimeStats(true);
             if (!final.resources || final.resources->udp_associations != 0 ||
                 final.resources->udp_closed_associations != 0 ||
                 final.resources->udp_input_datagrams != 0 ||
@@ -608,7 +621,7 @@ acpp::net::awaitable<void> RunCases(
                 worker_udp_listener_runtime_test::fault.hooks_after_arm !=
                     options.budget_or_index + 1)
                 Fail("standard allocation budget did not fail at the requested hook");
-            const auto after_failure = co_await Snapshot(worker);
+            const auto after_failure = co_await worker.CollectRuntimeStats(true);
             if (!after_failure.resources ||
                 after_failure.resources->udp_listeners != initial.resources->udp_listeners ||
                 after_failure.resources->udp_receive_loops != initial.resources->udp_receive_loops)

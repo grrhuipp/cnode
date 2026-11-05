@@ -1,5 +1,6 @@
 #include "acppnode/transport/internet/timeout_scheduler.hpp"
 #include "acppnode/transport/internet/async_delay.hpp"
+#include "acppnode/app/session_group_executor.hpp"
 #include "../src/app/worker_memory_reclaimer.hpp"
 
 #include <asio/co_spawn.hpp>
@@ -38,7 +39,7 @@ struct CounterEvent final : TimeoutEvent {
 };
 
 struct ResourceScope {
-    memory::ThreadPoolFacade resource;
+    memory::ThreadMemoryResource resource;
     std::pmr::memory_resource* previous = std::pmr::set_default_resource(&resource);
     ~ResourceScope() { std::pmr::set_default_resource(previous); }
 };
@@ -147,11 +148,13 @@ bool TestWaitInitiationFailureAndRecovery() {
     failed.counter = &failed_calls;
     recovered.counter = &recovered_calls;
     bool rejected = false;
-    timeout_allocation_test::reject_asio_allocations = true;
+    const auto before = memory::rejected_process_allocations;
+    memory::reject_next_process_allocation = true;
     try { (void)scheduler.ScheduleAfter(1ms, failed); }
     catch (const std::bad_alloc&) { rejected = true; }
-    timeout_allocation_test::reject_asio_allocations = false;
-    if (!rejected || failed.Valid()) return false;
+    memory::reject_next_process_allocation = false;
+    if (!rejected || failed.Valid() ||
+        memory::rejected_process_allocations != before + 1) return false;
     (void)scheduler.ScheduleAfter(1ms, recovered);
     io.run();
     return failed_calls == 0 && recovered_calls == 1;
@@ -159,7 +162,7 @@ bool TestWaitInitiationFailureAndRecovery() {
 
 bool TestHeapGrowthAndReentrantMaintenance() {
     ResourceScope resource;
-    auto& pool = memory::ThreadPool();
+    auto& pool = memory::ThreadMemoryPool();
     pool.PurgeIdle();
     bool passed = false;
     {
@@ -244,7 +247,7 @@ bool TestMaximumDelay() {
 bool TestPoolMaintenance() {
     net::io_context io;
     auto& scheduler = TimeoutScheduler::ForIoContext(io);
-    auto& pool = memory::ThreadPool();
+    auto& pool = memory::ThreadMemoryPool();
     pool.PurgeIdle();
     WorkerMemoryReclaimer reclaimer;
     reclaimer.Start(scheduler);
@@ -284,11 +287,12 @@ bool TestPoolMaintenance() {
 
     io.restart();
     p = memory::AllocatePmr(8192, 16);
-    const auto before = timeout_allocation_test::rejected_asio_allocations;
-    timeout_allocation_test::reject_asio_allocations = true;
+    const auto before = memory::rejected_process_allocations;
+    memory::reject_next_process_allocation = true;
     memory::DeallocatePmr(p);
-    timeout_allocation_test::reject_asio_allocations = false;
-    if (timeout_allocation_test::rejected_asio_allocations == before || pool.GetFootprint().idle_bytes) return false;
+    memory::reject_next_process_allocation = false;
+    if (memory::rejected_process_allocations != before + 1 ||
+        pool.GetFootprint().idle_bytes) return false;
     p = memory::AllocatePmr(8192, 16);
     memory::DeallocatePmr(p);
     io.run();
@@ -342,7 +346,7 @@ bool TestOwnerThreadServiceDestruction() {
             io->run();
             const bool drained = !scheduler.GetResourceStats().wait_pending;
             io.reset();
-            auto& pool = memory::ThreadPool();
+            auto& pool = memory::ThreadMemoryPool();
             pool.PurgeIdle();
             const auto footprint = pool.GetFootprint();
             finished.set_value(drained && footprint.mapped_bytes == 0 && footprint.direct_bytes == 0);
@@ -409,6 +413,78 @@ bool TestDelayConcurrentWaitAndMaximum() {
     return rejected && timeout_allocation_test::rejected_asio_allocations == before &&
         rejected_allocations == ordinary_before;
 }
+bool TestDomainSchedulerIsolationAndJoin() {
+    struct Hooks final : ExecutionDomain::Hooks {
+        memory::AllocationDomain allocation;
+        std::optional<memory::ScopedAllocationDomain> lease;
+        std::exception_ptr failure;
+        void Enter() noexcept override { lease.emplace(allocation); }
+        void Leave() noexcept override { lease.reset(); }
+        void OnFailure(std::exception_ptr error) noexcept override { failure = error; }
+    };
+    net::io_context io;
+    auto coordinator = std::make_shared<GroupCoordinator>(io);
+    auto first_hooks = std::make_shared<Hooks>();
+    auto second_hooks = std::make_shared<Hooks>();
+    auto first = ExecutionDomain::Create(io, 0, io.get_executor(), first_hooks, coordinator);
+    auto second = ExecutionDomain::Create(io, 0, io.get_executor(), second_hooks, coordinator);
+    first_hooks->allocation.SetLeaseGroup(first->LeaseIdentity(), ExecutionDomain::SharesLeaseIdentity);
+    second_hooks->allocation.SetLeaseGroup(second->LeaseIdentity(), ExecutionDomain::SharesLeaseIdentity);
+    TimeoutScheduler* first_scheduler = nullptr;
+    TimeoutScheduler* second_scheduler = nullptr;
+    bool first_owner = false, second_owner = false;
+    bool first_joined = false, second_joined = false;
+    SignalChannel scheduler_joins(io, 2);
+    CounterEvent first_pending, second_pending;
+    Event first_event([&] {
+        first_owner = ExecutionDomain::Current() == first &&
+            memory::CurrentAllocationDomain() == &first_hooks->allocation;
+        net::co_spawn(first->Executor(), TimeoutScheduler::AsyncReleaseForIoContext(io),
+            [&](std::exception_ptr error) {
+                first_joined = !error;
+                (void)scheduler_joins.try_send(IoErrorCode{});
+            });
+    });
+    Event second_event([&] {
+        second_owner = ExecutionDomain::Current() == second &&
+            memory::CurrentAllocationDomain() == &second_hooks->allocation;
+        net::co_spawn(second->Executor(), TimeoutScheduler::AsyncReleaseForIoContext(io),
+            [&](std::exception_ptr error) {
+                second_joined = !error;
+                (void)scheduler_joins.try_send(IoErrorCode{});
+            });
+    });
+    first->Execute([&] {
+        first_scheduler = &TimeoutScheduler::ForIoContext(io);
+        (void)first_scheduler->ScheduleAfter(0ms, first_event);
+        (void)first_scheduler->ScheduleAfter(1h, first_pending);
+    });
+    second->Execute([&] {
+        second_scheduler = &TimeoutScheduler::ForIoContext(io);
+        (void)second_scheduler->ScheduleAfter(0ms, second_event);
+        (void)second_scheduler->ScheduleAfter(1h, second_pending);
+    });
+    bool passed = false, finalized = false;
+    auto finalize = [&](std::shared_ptr<GroupCoordinator> owner) -> net::awaitable<void> {
+        co_await scheduler_joins.async_receive(net::use_awaitable);
+        co_await scheduler_joins.async_receive(net::use_awaitable);
+        passed = first_scheduler && second_scheduler &&
+            first_scheduler != second_scheduler && first_owner && second_owner &&
+            first_joined && second_joined && !first_pending.Valid() &&
+            !second_pending.Valid() && !first_hooks->failure && !second_hooks->failure;
+        first.reset();
+        second.reset();
+        owner->CloseAdmission();
+        co_await owner->AsyncJoin();
+        owner->ReleaseServices();
+        co_await owner->Finalize();
+    };
+    net::co_spawn(io, finalize(coordinator),
+        [&](std::exception_ptr error) { finalized = !error; });
+    io.run_for(1s);
+    return passed && finalized;
+}
+
 }  // namespace
 
 int main() {
@@ -425,6 +501,7 @@ int main() {
         {"owner-thread service destruction", TestOwnerThreadServiceDestruction},
         {"delay cancellation and reuse", TestDelayCancellationAndReuse},
         {"delay concurrent wait and maximum", TestDelayConcurrentWaitAndMaximum},
+        {"domain scheduler isolation and native timer join", TestDomainSchedulerIsolationAndJoin},
     };
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     bool passed = true;
@@ -433,6 +510,7 @@ int main() {
         try { result = test.run(); }
         catch (const std::exception& error) { std::printf("%s: %s\n", test.name, error.what()); }
         timeout_allocation_test::reject_asio_allocations = reject_allocations = false;
+        memory::reject_next_process_allocation = false;
         std::printf("%s: %s\n", test.name, result ? "PASS" : "FAIL");
         passed = passed && result;
     }

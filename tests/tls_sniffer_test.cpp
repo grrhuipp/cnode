@@ -89,51 +89,50 @@ bool Require(bool condition, const char* message) {
 }  // namespace
 
 int main() {
-    acpp::TlsSniffer sniffer;
     auto valid = BuildClientHello();
-    const auto valid_result = sniffer.Sniff(valid.bytes);
+    const auto valid_result = acpp::SniffTls(valid.bytes);
     if (!Require(valid_result.success && valid_result.domain == "example.com",
                  "a canonical ClientHello must be sniffed")) return 1;
 
     auto malformed_sni = BuildClientHello(true);
-    if (!Require(!sniffer.Sniff(malformed_sni.bytes).success,
+    if (!Require(!acpp::SniffTls(malformed_sni.bytes).success,
                  "malformed bytes after SNI must be rejected")) return 2;
 
     auto short_record = BuildClientHello();
     SetU16(short_record.bytes, 3, short_record.bytes.size() - 6);
-    if (!Require(!sniffer.Sniff(short_record.bytes).success,
+    if (!Require(!acpp::SniffTls(short_record.bytes).success,
                  "bytes outside the declared TLS record must be ignored")) return 3;
 
     auto long_record = BuildClientHello();
     SetU16(long_record.bytes, 3, long_record.bytes.size() - 4);
-    if (!Require(!sniffer.Sniff(long_record.bytes).success,
+    if (!Require(!acpp::SniffTls(long_record.bytes).success,
                  "a truncated TLS record must be rejected")) return 4;
 
     auto short_handshake = BuildClientHello();
     SetU24(short_handshake.bytes, 6, short_handshake.bytes.size() - 10);
-    if (!Require(!sniffer.Sniff(short_handshake.bytes).success,
+    if (!Require(!acpp::SniffTls(short_handshake.bytes).success,
                  "bytes outside the declared ClientHello must be ignored")) return 5;
 
     auto long_extensions = BuildClientHello();
     SetU16(long_extensions.bytes, long_extensions.extensions_length_offset,
            long_extensions.bytes.size());
-    if (!Require(!sniffer.Sniff(long_extensions.bytes).success,
+    if (!Require(!acpp::SniffTls(long_extensions.bytes).success,
                  "truncated ClientHello extensions must be rejected")) return 6;
 
     const auto ipv4_sni = BuildClientHello(false, "192.0.2.1");
-    if (!Require(!sniffer.Sniff(ipv4_sni.bytes).success,
+    if (!Require(!acpp::SniffTls(ipv4_sni.bytes).success,
                  "an IPv4 literal must not be accepted as TLS host_name")) return 7;
 
     const auto trailing_dot_sni = BuildClientHello(false, "example.com.");
-    if (!Require(!sniffer.Sniff(trailing_dot_sni.bytes).success,
+    if (!Require(!acpp::SniffTls(trailing_dot_sni.bytes).success,
                  "TLS host_name must not contain a trailing dot")) return 8;
 
     const auto empty_label_sni = BuildClientHello(false, "bad..example");
-    if (!Require(!sniffer.Sniff(empty_label_sni.bytes).success,
+    if (!Require(!acpp::SniffTls(empty_label_sni.bytes).success,
                  "TLS host_name must not contain an empty DNS label")) return 9;
 
     const auto invalid_label_sni = BuildClientHello(false, "bad_name.example");
-    if (!Require(!sniffer.Sniff(invalid_label_sni.bytes).success,
+    if (!Require(!acpp::SniffTls(invalid_label_sni.bytes).success,
                  "TLS host_name must use DNS hostname labels")) return 10;
     return 0;
 }

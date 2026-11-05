@@ -6,6 +6,7 @@
 #include "acppnode/transport/internet/dial_target.hpp"
 #include "acppnode/transport/internet/outbound_bind.hpp"
 #include "acppnode/transport/internet/stream_settings.hpp"
+#include "acppnode/transport/internet/transport_security.hpp"
 
 #include <chrono>
 #include <tl/expected.hpp>
@@ -24,6 +25,9 @@ struct OutboundTargetOptions {
     std::optional<net::ip::address> literal_address;
     uint16_t port = 0;
     const StreamSettings* stream_settings = nullptr;
+    // The outbound handler's contexts for |stream_settings|; the XHTTP
+    // download leg uses its XHttpDownload() contexts.
+    const TransportSecurity* security = nullptr;
     std::chrono::seconds timeout{defaults::kDialTimeout};
     const OutboundBind* send_through = nullptr; // Borrowed from the outbound handler.
     const tcp::endpoint* inbound_local_addr = nullptr;

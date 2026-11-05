@@ -2,6 +2,8 @@
 #include "acppnode/common/allocator.hpp"
 #include <asio/co_spawn.hpp>
 #include <asio/bind_cancellation_slot.hpp>
+#include <asio/bind_allocator.hpp>
+#include <asio/post.hpp>
 #include <asio/cancellation_signal.hpp>
 #include <asio/read.hpp>
 #include <asio/write.hpp>
@@ -61,10 +63,8 @@ void TestIO(CountingResource& resource) {
             Require(co_await stream.AsyncRead(net::buffer(&byte, 1)) == 1 && byte == 'a', "read failed");
             Require(resource.live == live, "read operation must release before resuming its caller");
         }
-        Require(resource.allocations >= before + 2 * count,
-                "real TCP read/write operations must use the associated PMR allocator");
-        std::cout << "TCP read/write operations=" << 2 * count << " PMR allocations="
-                  << resource.allocations - before << '\n';
+        Require(resource.allocations == before,
+                "native TCP operations must not allocate from the private PMR resource");
     };
     auto finish = [&](std::exception_ptr e) {
         if (e && !error) { error = e; stream.Close(); peer.close(); }
@@ -88,8 +88,8 @@ void TestIO(CountingResource& resource) {
         }));
     timer.async_wait([&](acpp::IoErrorCode ec) { if (!ec) signal.emit(net::cancellation_type::terminal); });
     io.run_for(1s);
-    Require(cancelled && resource.allocations > before && resource.live == live,
-            "cancellation must release its PMR socket operation on the owner");
+    Require(cancelled && resource.allocations == before && resource.live == live,
+            "cancellation must release process-allocated socket operations without touching private PMR");
 }
 
 void TestReadCancellation(CountingResource& resource, bool multi_buffer) {
@@ -124,32 +124,102 @@ void TestReadCancellation(CountingResource& resource, bool multi_buffer) {
     });
     io.run_for(1s);
     if (error) std::rethrow_exception(error);
-    Require(completed && cancelled && resource.allocations > before,
-            "read cancellation must propagate through the allocator-bound operation");
+    Require(completed && cancelled && resource.allocations == before,
+            "read cancellation must not allocate native operations from private PMR");
     Require(peer.is_open() && stream.IsOpen(), "cancellation must not close the connection");
 }
 
-void TestInitiationFailure(CountingResource& resource) {
+void TestPrivateAllocatorIsolation(CountingResource& resource) {
     net::io_context io;
     acpp::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
     acpp::tcp::socket socket(io), peer(io);
     socket.connect(acceptor.local_endpoint());
     acceptor.accept(peer);
     acpp::TcpStream stream(std::move(socket));
-    bool failed = false;
+    net::cancellation_signal signal;
+    net::steady_timer timer(io, 5ms);
+    bool cancelled = false;
     resource.fail_next = true;
-    net::co_spawn(io, stream.WaitReadable(), [&](std::exception_ptr e, acpp::IoErrorCode) {
-        if (e) { try { std::rethrow_exception(e); } catch (const std::bad_alloc&) { failed = true; } }
+    net::co_spawn(io, stream.WaitReadable(), net::bind_cancellation_slot(signal.slot(),
+        [&](std::exception_ptr error, acpp::IoErrorCode ec) {
+            if (error) std::rethrow_exception(error);
+            cancelled = ec == net::error::operation_aborted;
+        }));
+    timer.async_wait([&](acpp::IoErrorCode ec) {
+        if (!ec) signal.emit(net::cancellation_type::terminal);
     });
-    // Asio may propagate initiation allocation failure out of io_context::run
-    // rather than into the suspended awaitable. Both paths must destroy owners.
-    try { io.run_for(1s); } catch (const std::bad_alloc&) { failed = true; }
-    Require(failed && !resource.fail_next, "must exercise actual operation allocation failure");
-}
+    io.run_for(1s);
+    const bool untouched = std::exchange(resource.fail_next, false);
+    Require(cancelled && untouched,
+            "native operation initiation must not consult the private allocation resource");
 }
 
+void TestQueuedReadinessAcrossMigration() {
+    using namespace acpp::memory;
+    AllocationDomain domain;
+    net::io_context reactor, destination;
+    acpp::tcp::acceptor acceptor(reactor, {net::ip::address_v4::loopback(), 0});
+    acpp::tcp::socket socket(reactor), peer(reactor);
+    socket.connect(acceptor.local_endpoint());
+    acceptor.accept(peer);
+    acpp::buf::Buffer* payload = nullptr;
+    bool delivered = false;
+    bool consumed = false;
+    {
+        ScopedAllocationDomain lease(domain);
+        payload = acpp::buf::Buffer::New();
+        Require(payload != nullptr, "payload allocation failed");
+        const auto footprint = domain.pool().GetFootprint().mapped_bytes;
+        socket.async_wait(acpp::tcp::socket::wait_read,
+            net::bind_allocator(ProcessAllocator<std::byte>{},
+                [&](acpp::IoErrorCode ec) {
+                    // Reactor completion transports metadata only. No payload
+                    // access or private-object destruction occurs on this thread.
+                    delivered = !ec;
+                    net::post(destination, net::bind_allocator(ProcessAllocator<std::byte>{}, [&, ec] {
+                        ScopedAllocationDomain migrated(domain);
+                        Require(!ec, "readiness failed");
+                        const auto count = socket.read_some(net::buffer(payload->Tail().data(), 1));
+                        payload->Produce(static_cast<uint32_t>(count));
+                        consumed = payload->Bytes()[0] == 'q';
+                        acpp::buf::Buffer::Free(payload);
+                        payload = nullptr;
+                    }));
+                }));
+        Require(domain.pool().GetFootprint().mapped_bytes == footprint,
+                "queued operation must not borrow domain slabs");
+    }
+    const char value = 'q';
+    peer.write_some(net::buffer(&value, 1));
+    std::thread completion([&] { reactor.run_for(1s); });
+    completion.join();
+    Require(delivered && !consumed, "completion must be retained before owner resumes");
+    std::thread migrated([&] { destination.run(); });
+    migrated.join();
+    Require(consumed && !payload, "new owner must consume readiness and destroy payload");
+}
+
+void TestPendingOperationDestruction() {
+    using namespace acpp::memory;
+    AllocationDomain domain;
+    auto reactor = std::make_unique<net::io_context>();
+    auto timer = std::make_unique<net::steady_timer>(*reactor, 1h);
+    {
+        ScopedAllocationDomain lease(domain);
+        timer->async_wait(net::bind_allocator(ProcessAllocator<std::byte>{},
+            [](acpp::IoErrorCode) {}));
+        Require(domain.pool().GetFootprint().mapped_bytes == 0,
+                "pending operation storage must belong to process allocator");
+    }
+    // Asio destroys the still-pending handler without calling it and without
+    // entering a domain when its reactor is destroyed on another thread.
+    std::thread shutdown([&] { timer.reset(); reactor.reset(); });
+    shutdown.join();
+}
+} // namespace
+
 int main() {
-    acpp::memory::ThreadPoolFacade pool;
+    acpp::memory::ThreadMemoryResource pool;
     CountingResource resource(&pool);
     auto original = std::pmr::set_default_resource(&resource);
     bool passed = true;
@@ -157,8 +227,11 @@ int main() {
         TestIO(resource);
         TestReadCancellation(resource, false);
         TestReadCancellation(resource, true);
-        TestInitiationFailure(resource);
-        Require(resource.live == 0 && !resource.wrong_thread, "all operations and scheduler allocations must be released on owner");
+        TestPrivateAllocatorIsolation(resource);
+        TestQueuedReadinessAcrossMigration();
+        TestPendingOperationDestruction();
+        Require(resource.live == 0 && !resource.wrong_thread,
+                "all private scheduler allocations must be released on their owner");
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; passed = false; }
     std::pmr::set_default_resource(original);
     return passed ? 0 : 1;

@@ -8,7 +8,7 @@
 #include "acppnode/app/relay.hpp"
 #include "acppnode/app/proxyman/outbound/factory.hpp"
 #include "../../../app/proxyman/outbound/registration.hpp"
-#include "acppnode/infra/json_port.hpp"
+#include "acppnode/infra/json_field.hpp"
 #include "acppnode/app/dns/dns.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/infra/config_types.hpp"
@@ -140,6 +140,7 @@ DialOutboundStream(
     net::io_context& io_context,
     app::dns::DNS& dns_service,
     const proxy::shadowsocks::outbound::PreparedSettings& prepared,
+    const TransportSecurity& security,
     std::chrono::seconds dial_timeout,
     const tcp::endpoint* inbound_local_addr,
     session::Context& ctx) {
@@ -149,6 +150,7 @@ DialOutboundStream(
         .literal_address = prepared.config.literal_address,
         .port = prepared.config.port,
         .stream_settings = &prepared.config.stream_settings,
+        .security = &security,
         .timeout = dial_timeout,
         .send_through = &prepared.config.send_through,
         .inbound_local_addr = inbound_local_addr,
@@ -271,18 +273,14 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
             prepared_->credentials.PskChain());
         target_endpoint.SetIdleTimeout(relay_idle_timeout);
         target_endpoint.SetWriteTimeout(relay_write_timeout);
-        if (inbound.control) {
-            co_return co_await DoRelayLink(
-                io_context, *inbound.reader, *inbound.writer, *inbound.control,
-                target_endpoint, ctx, stats, relay_config, std::move(first_payload));
-        }
         co_return co_await DoRelayLink(
-            io_context, *inbound.reader, *inbound.writer,
+            io_context, *inbound.reader, *inbound.writer, inbound.control,
             target_endpoint, ctx, stats, relay_config, std::move(first_payload));
     }
 
     auto dialed = co_await DialOutboundStream(
-        io_context, dns_service_, *prepared_, dial_timeout_, inbound_local_addr, ctx);
+        io_context, dns_service_, *prepared_, security_, dial_timeout_,
+        inbound_local_addr, ctx);
     if (!dialed) {
         co_return tl::unexpected(dialed.error());
     }
@@ -314,13 +312,8 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
     }
 
     auto relay_endpoint = [&](auto& endpoint) -> net::awaitable<RelayResult> {
-        if (inbound.control) {
-            co_return co_await DoRelayLink(
-                io_context, *inbound.reader, *inbound.writer, *inbound.control,
-                endpoint, ctx, stats, relay_config, std::move(first_payload));
-        }
         co_return co_await DoRelayLink(
-            io_context, *inbound.reader, *inbound.writer,
+            io_context, *inbound.reader, *inbound.writer, inbound.control,
             endpoint, ctx, stats, relay_config, std::move(first_payload));
     };
 
@@ -335,8 +328,9 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
 proxy::shadowsocks::outbound::Handler::Handler(
     std::string_view tag, std::shared_ptr<const PreparedSettings> prepared,
     ::acpp::app::dns::DNS& dns_service, std::chrono::seconds dial_timeout)
-    : tag_(tag), prepared_(std::move(prepared)), dial_timeout_(dial_timeout),
-      dns_service_(dns_service) {}
+    : tag_(tag), prepared_(std::move(prepared)),
+      security_(prepared_->config.stream_settings, StreamEndpointRole::Outbound),
+      dial_timeout_(dial_timeout), dns_service_(dns_service) {}
 
 }  // namespace acpp
 
@@ -348,34 +342,38 @@ const bool kSsOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
     acpp::constants::protocol::kShadowsocks,
     [](const acpp::infra::OutboundSourceConfig& cfg)
         -> std::optional<acpp::proxyman::outbound::PreparedOutboundCreator> {
-        auto json_string = [](const acpp::json::object& obj,
-                              std::string_view key) -> std::string {
-            if (const auto* v = obj.if_contains(key); v && v->is_string()) {
-                return std::string(v->as_string());
-            }
-            return {};
-        };
         std::string password;
         std::string method(acpp::constants::protocol::kAes256Gcm);
+        // A present field of the wrong type is a configuration error, never
+        // an implicit default.
         auto read_ss_server = [&](const acpp::json::object& obj,
                                   acpp::SsOutboundConfig& config) {
-            config.address = json_string(obj, "address");
-            const auto port = acpp::ReadJsonPort(obj, "port");
-            if (port.Invalid()) {
+            const auto fail = [&](std::string_view error) {
+                LOG_ERROR("Shadowsocks outbound '{}': {}", cfg.tag, error);
                 return false;
-            }
+            };
+            auto address = acpp::ParseJsonString(obj, "address");
+            if (!address) return fail(address.error());
+            const auto port = acpp::ReadJsonPort(obj, "port");
+            if (port.Invalid()) return fail("invalid port");
+            auto source_password = acpp::ParseJsonString(obj, "password");
+            if (!source_password) return fail(source_password.error());
+            auto source_key = acpp::ParseJsonString(obj, "key");
+            if (!source_key) return fail(source_key.error());
+            auto source_method = acpp::ParseJsonString(obj, "method");
+            if (!source_method) return fail(source_method.error());
+            if (*source_method && (*source_method)->empty()) return fail("method must not be empty");
+
+            config.address = std::move(*address).value_or(std::string{});
             if (port.Valid()) {
                 config.port = port.value;
             }
-            password = json_string(obj, "password");
+            password = std::move(*source_password).value_or(std::string{});
             if (password.empty()) {
-                password = json_string(obj, "key");
+                password = std::move(*source_key).value_or(std::string{});
             }
-            if (const auto* source_method = obj.if_contains("method")) {
-                if (!source_method->is_string() || source_method->as_string().empty()) {
-                    return false;
-                }
-                method = std::string(source_method->as_string());
+            if (*source_method) {
+                method = std::move(**source_method);
             }
             auto uot_version =
                 acpp::proxy::shadowsocks::outbound::ParseUotVersion(obj);
@@ -429,6 +427,8 @@ const bool kSsOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
             LOG_ERROR("shadowsocks outbound '{}': address must be an IP literal or DNS hostname", cfg.tag);
             return std::nullopt;
         }
+        acpp::TransportSecurity::Prepare(
+            ss_config.stream_settings, acpp::StreamEndpointRole::Outbound);
         using PreparedSettings = acpp::proxy::shadowsocks::outbound::PreparedSettings;
         return acpp::proxyman::outbound::MakePreparedOutboundCreator<
             PreparedSettings,
@@ -436,7 +436,8 @@ const bool kSsOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 std::shared_ptr<const PreparedSettings> state,
                 acpp::net::io_context& /*io_context*/,
                 acpp::app::dns::DNS& dns_service,
-                std::chrono::seconds timeout) -> std::unique_ptr<acpp::Outbound> {
+                std::chrono::seconds timeout,
+                acpp::AwaitableTaskGroup& /*tasks*/) -> std::unique_ptr<acpp::Outbound> {
                 return std::make_unique<acpp::proxy::shadowsocks::outbound::Handler>(
                     tag, std::move(state), dns_service, timeout);
             }>(PreparedSettings{std::move(ss_config), std::move(*credentials)});

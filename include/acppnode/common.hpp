@@ -6,7 +6,7 @@
 // 子模块头文件（可单独 include）：
 //   common/network.hpp          — Network 枚举、AddressType 枚举
 //   common/defaults.hpp         — defaults:: 命名空间常量
-//   common/clock.hpp            — 时间工具（NowMicros/NowMillis/FormatBytes 等）
+//   common/clock.hpp            — 时间工具（NowMicros/FormatBytes 等）
 // ============================================================================
 
 #include <asio.hpp>

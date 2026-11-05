@@ -8,6 +8,10 @@ endif()
 file(TO_CMAKE_PATH "${CMAKE_CURRENT_LIST_FILE}" EXISTING_TEST_FILE)
 string(REPEAT "a" 256 ALPN_TOO_LONG)
 set(VALID_REALITY_KEY "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+# TLS files are read while the configuration loads, so cases that must start
+# reference these real fixtures through the placeholders below.
+file(TO_CMAKE_PATH "${CMAKE_CURRENT_LIST_DIR}/fixtures/anytls-pool/cert.pem" TLS_FIXTURE_CERT)
+file(TO_CMAKE_PATH "${CMAKE_CURRENT_LIST_DIR}/fixtures/anytls-pool/key.pem" TLS_FIXTURE_KEY)
 
 function(normalize_test_sidecar input output)
     set(normalized "${input}")
@@ -17,6 +21,10 @@ function(normalize_test_sidecar input output)
         normalized "${normalized}")
     string(REPLACE "invalid-until-after-version-validation"
         "${VALID_REALITY_KEY}" normalized "${normalized}")
+    string(REPLACE "fixture-cert.pem" "${TLS_FIXTURE_CERT}"
+        normalized "${normalized}")
+    string(REPLACE "fixture-key.pem" "${TLS_FIXTURE_KEY}"
+        normalized "${normalized}")
     set(${output} "${normalized}" PARENT_SCOPE)
 endfunction()
 
@@ -157,6 +165,13 @@ expect_rejected(non_object_limits
     [=[{"limits":"none"}]=] "" "" "limits must be an object")
 expect_rejected(non_array_panels
     [=[{"panels":{}}]=] "" "" "panels must be an array")
+foreach(log_path IN ITEMS logDir access error)
+    expect_rejected("empty_log_${log_path}"
+        "{\"log\":{\"${log_path}\":\"\"}}" "" "" "${log_path} must not be empty")
+endforeach()
+expect_rejected(empty_panel_name
+    [=[{"panels":[{"name":"","apiHost":"http://127.0.0.1","key":"secret","nodeIDs":[1]}]}]=]
+    "" "" "Panel name must not be empty")
 set(request_timeout_cases 0 -1 1.5 "\"30\"" null true 3601 18446744073709551615)
 set(request_timeout_case_index 0)
 foreach(request_timeout IN LISTS request_timeout_cases)
@@ -170,6 +185,20 @@ foreach(dns_type IN ITEMS "\"misspelled\"" "\"\"" "42" "null" "true")
     expect_rejected("invalid_panel_dns_type_${case_id}"
         "{\"panels\":[{\"name\":\"bad-dns\",\"apiHost\":\"http://127.0.0.1\",\"key\":\"secret\",\"nodeIDs\":[1],\"dnsType\":${dns_type}}]}"
         "" "")
+endforeach()
+foreach(proxy_mode IN ITEMS "\"optional\"" "true" "null" "1")
+    string(MD5 case_id "${proxy_mode}")
+    expect_rejected("invalid_panel_proxy_protocol_${case_id}"
+        "{\"panels\":[{\"name\":\"bad-proxy\",\"apiHost\":\"http://127.0.0.1\",\"key\":\"secret\",\"nodeIDs\":[1],\"proxyProtocol\":${proxy_mode}}]}"
+        "" "" "proxyProtocol")
+    expect_rejected("invalid_static_proxy_protocol_${case_id}" "{}" "inbounds.json"
+        "[{\"tag\":\"proxy\",\"protocol\":\"vless\",\"port\":12100,\"proxyProtocol\":${proxy_mode},\"settings\":{\"clients\":[{\"id\":\"11111111-1111-4111-8111-111111111111\"}]}}]"
+        "proxyProtocol")
+endforeach()
+foreach(proxy_mode IN ITEMS "off" "auto" "on" "OFF" "AUTO" "ON")
+    expect_started("valid_static_proxy_protocol_${proxy_mode}"
+        [=[{"workers":1,"log":{"enable":false}}]=] "inbounds.json"
+        "[{\"tag\":\"proxy\",\"protocol\":\"vless\",\"listen\":\"127.0.0.1\",\"port\":12100,\"proxyProtocol\":\"${proxy_mode}\",\"settings\":{\"clients\":[{\"id\":\"11111111-1111-4111-8111-111111111111\"}]}}]")
 endforeach()
 foreach(node_type IN ITEMS "" "v2ray" "ss" "shadowsocks-plugin" "VMESS")
     string(MD5 case_id "${node_type}")
@@ -214,6 +243,9 @@ expect_started(valid_log_compression
 expect_rejected(non_string_log_level
     [=[{"log":{"loglevel":123}}]=] "" ""
     "loglevel must be a string")
+expect_rejected(unsupported_log_level
+    [=[{"log":{"loglevel":"verbose"}}]=] "" ""
+    "loglevel 'verbose'")
 expect_rejected(non_string_transport_network "{}" "outbounds.json"
     [=[[{"tag":"bad-network-type","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":123,"security":"none"}}]]=]
     "network must be a string")
@@ -310,7 +342,7 @@ expect_rejected(sniffing_fakedns "{}" "inbounds.json"
     "sniffing destOverride fakedns is not supported")
 expect_started(valid_tls_ca
     [=[{"workers":1}]=] "outbounds.json"
-    [=[[{"tag":"valid-tls-ca-alias","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","caFile":"same.pem"}}}]]=])
+    [=[[{"tag":"valid-tls-ca-alias","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","caFile":"fixture-cert.pem"}}}]]=])
 expect_rejected(non_array_tls_certificates "{}" "outbounds.json"
     [=[[{"tag":"bad-tls-certificates","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","certificates":{}}}}]]=]
     "tls certificates must be an array")
@@ -328,7 +360,13 @@ expect_rejected(conflicting_tls_certificate_sources "{}" "outbounds.json"
     "tls certificates and certFile/keyFile must match")
 expect_started(equal_tls_certificate_sources
     [=[{"workers":1}]=] "outbounds.json"
-    [=[[{"tag":"valid-certificate-alias","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","certificates":[{"certificateFile":"same.pem","keyFile":"same.key"}],"certFile":"same.pem","keyFile":"same.key"}}}]]=])
+    [=[[{"tag":"valid-certificate-alias","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","certificates":[{"certificateFile":"fixture-cert.pem","keyFile":"fixture-key.pem"}],"certFile":"fixture-cert.pem","keyFile":"fixture-key.pem"}}}]]=])
+expect_rejected(missing_tls_certificate_file "{}" "inbounds.json"
+    [=[[{"tag":"missing-cert","protocol":"vless","listen":"127.0.0.1","port":43194,"settings":{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}]},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"certificates":[{"certificateFile":"missing-cert.pem","keyFile":"missing-key.pem"}]}}}]]=]
+    "cannot open TLS certificate file")
+expect_rejected(unusable_tls_private_key "{}" "inbounds.json"
+    [=[[{"tag":"unusable-key","protocol":"vless","listen":"127.0.0.1","port":43195,"settings":{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}]},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"certificates":[{"certificateFile":"fixture-cert.pem","keyFile":"fixture-cert.pem"}]}}}]]=]
+    "cannot build TLS server context")
 expect_started(valid_grpc_service_name
     [=[{"workers":1}]=] "outbounds.json"
     [=[[{"tag":"valid-grpc-alias","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"grpc","security":"none","grpcSettings":{"serviceName":"same"}}}]]=])
@@ -534,6 +572,8 @@ expect_rejected(stream_one_xhttp_download "{}" "outbounds.json"
     [=[[{"tag":"bad-xhttp-mode","protocol":"vless","settings":{"address":"upload.example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"extra":{"downloadSettings":{"address":"download.example.com","port":443,"network":"xhttp","xhttpSettings":{"mode":"stream-one"}}}}}}]]=])
 expect_rejected(stream_one_xhttp_upload_with_download "{}" "outbounds.json"
     [=[[{"tag":"bad-xhttp-mode","protocol":"vless","settings":{"address":"upload.example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"mode":"stream-one","extra":{"downloadSettings":{"address":"download.example.com","port":443,"network":"xhttp","xhttpSettings":{"mode":"auto"}}}}}}]]=])
+expect_rejected(unknown_xhttp_mode "{}" "outbounds.json"
+    [=[[{"tag":"bad-xhttp-mode","protocol":"vless","settings":{"address":"upload.example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"mode":"stream_one"}}}]]=])
 expect_rejected(non_object_xhttp_download_settings "{}" "outbounds.json"
     [=[[{"tag":"bad-xhttp-shape","protocol":"vless","settings":{"address":"upload.example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"downloadSettings":443}}}]]=])
 expect_rejected(duplicate_xhttp_download_settings "{}" "outbounds.json"
@@ -769,9 +809,7 @@ expect_rejected(negative_anytls_min_idle_sessions "{}" "outbounds.json"
     [=[[{"tag":"proxy","protocol":"anytls","settings":{"address":"example.com","port":443,"password":"secret","minIdleSession":-1}}]]=])
 expect_rejected(non_integer_anytls_min_idle_sessions "{}" "outbounds.json"
     [=[[{"tag":"proxy","protocol":"anytls","settings":{"address":"example.com","port":443,"password":"secret","minIdleSession":"1"}}]]=])
-file(TO_CMAKE_PATH "${CMAKE_CURRENT_LIST_DIR}/fixtures/anytls-pool/cert.pem" AUTH_PADDING_CERT)
-file(TO_CMAKE_PATH "${CMAKE_CURRENT_LIST_DIR}/fixtures/anytls-pool/key.pem" AUTH_PADDING_KEY)
-set(AUTH_PADDING_TLS "\"streamSettings\":{\"network\":\"tcp\",\"security\":\"tls\",\"tlsSettings\":{\"certificates\":[{\"certificateFile\":\"${AUTH_PADDING_CERT}\",\"keyFile\":\"${AUTH_PADDING_KEY}\"}]}}")
+set(AUTH_PADDING_TLS "\"streamSettings\":{\"network\":\"tcp\",\"security\":\"tls\",\"tlsSettings\":{\"certificates\":[{\"certificateFile\":\"${TLS_FIXTURE_CERT}\",\"keyFile\":\"${TLS_FIXTURE_KEY}\"}]}}")
 expect_rejected(invalid_anytls_auth_range_text
     [=[{"workers":1,"log":{"enable":false}}]=] "inbounds.json"
     "[{\"tag\":\"auth-padding\",\"protocol\":\"anytls\",\"listen\":\"127.0.0.1\",\"port\":12006,\"settings\":{\"password\":\"fixture\",\"paddingScheme\":\"stop=2\\n0=65534-65537\\n1=64-65\"},${AUTH_PADDING_TLS}}]"

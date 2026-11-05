@@ -157,7 +157,7 @@ std::string JoinRouteMatches(const json::array& matches) {
     std::string pattern;
     for (const auto& match : matches) {
         if (!match.is_string()) {
-            continue;
+            throw std::invalid_argument("block route match entries must be strings");
         }
         if (!pattern.empty()) {
             pattern.push_back('|');
@@ -171,8 +171,11 @@ std::vector<rule::DetectRule>
 ExtractBlockDetectRules(const json::object& config, std::string_view panel_name) {
     std::vector<rule::DetectRule> rules;
     const auto* routes_value = config.if_contains("routes");
-    if (!routes_value || !routes_value->is_array()) {
+    if (!routes_value || routes_value->is_null()) {
         return rules;
+    }
+    if (!routes_value->is_array()) {
+        throw std::invalid_argument("routes must be an array");
     }
 
     const auto& routes = routes_value->as_array();
@@ -180,7 +183,7 @@ ExtractBlockDetectRules(const json::object& config, std::string_view panel_name)
     for (size_t i = 0; i < routes.size(); ++i) {
         const auto& route_value = routes[i];
         if (!route_value.is_object()) {
-            continue;
+            throw std::invalid_argument("route entries must be objects");
         }
 
         const auto& route = route_value.as_object();
@@ -191,7 +194,7 @@ ExtractBlockDetectRules(const json::object& config, std::string_view panel_name)
 
         const auto* match_value = route.if_contains("match");
         if (!match_value || !match_value->is_array()) {
-            continue;
+            throw std::invalid_argument("block route match must be an array");
         }
 
         const std::string pattern = JoinRouteMatches(match_value->as_array());
@@ -204,16 +207,12 @@ ExtractBlockDetectRules(const json::object& config, std::string_view panel_name)
             rule.Pattern = std::regex(pattern);
             rules.push_back(std::move(rule));
         } catch (const std::regex_error& e) {
-            LOG_WARN("V2Board[{}]: invalid block route detect rule {}: {}",
-                     panel_name, i, e.what());
+            throw std::invalid_argument(std::format(
+                "V2Board[{}]: invalid block route detect rule {}: {}",
+                panel_name, i, e.what()));
         }
     }
     return rules;
-}
-
-template <typename Stream>
-net::awaitable<void> WriteHttpRequest(Stream& stream, const std::string& request) {
-    co_await net::async_write(stream, net::buffer(request), net::use_awaitable);
 }
 
 }  // namespace
@@ -231,25 +230,19 @@ struct APIClient::Impl {
 
     [[nodiscard]] std::string ApiNodeType() const;
 
-    net::ssl::context* GetOrCreateHttpsContext();
-
-    net::awaitable<HttpResponse>
-    HttpGet(const std::string& path, const std::string& etag = "");
-
-    net::awaitable<HttpResponse>
-    HttpPost(const std::string& path, const json::value& body);
-
+    // Parameters are owned by the coroutine frame: RunRequest starts the
+    // exchange lazily and may cancel it after the caller's arguments are gone.
     net::awaitable<HttpResponse>
     HttpRequest(HttpMethod method,
-                const std::string& path,
-                const std::optional<json::value>& body,
-                const std::string& if_none_match = "");
+                std::string path,
+                std::string body_text,
+                std::string if_none_match);
 
     net::awaitable<HttpResponse>
     HttpExchange(HttpMethod method,
-                 const std::string& path,
-                 const std::optional<json::value>& body,
-                 const std::string& if_none_match);
+                 std::string path,
+                 std::string body_text,
+                 std::string if_none_match);
 
     net::awaitable<NodeInfoFetchResult> GetNodeInfo(std::string committed_etag);
     net::awaitable<UserListFetchResult> GetUserList(std::string committed_etag);
@@ -282,6 +275,17 @@ APIClient::Impl::Impl(net::io_context& io_context,
             "V2Board[{}]: invalid API host: {}", config.Name, config.APIHost));
     }
     url_parts_ = std::move(*parts);
+
+    if (url_parts_.use_ssl) {
+        // Negotiate TLS 1.3 when the panel offers it; TLS 1.2 stays the floor
+        // (RFC 8996 deprecates TLS 1.0/1.1).
+        https_context_ = std::make_unique<ssl::context>(ssl::context::tls_client);
+        if (SSL_CTX_set_min_proto_version(https_context_->native_handle(), TLS1_2_VERSION) != 1) {
+            throw std::runtime_error("V2Board: failed to set the HTTPS minimum TLS version");
+        }
+        https_context_->set_default_verify_paths();
+        https_context_->set_verify_mode(ssl::verify_peer);
+    }
 }
 
 std::string APIClient::Impl::ApiNodeType() const {
@@ -375,50 +379,22 @@ static std::optional<UrlParts> ParseUrl(const std::string& url) {
 }
 
 net::awaitable<HttpResponse>
-APIClient::Impl::HttpPost(const std::string& path, const json::value& body) {
-    co_return co_await HttpRequest(HttpMethod::Post, path, body, "");
-}
-
-net::awaitable<HttpResponse>
-APIClient::Impl::HttpGet(const std::string& path, const std::string& etag) {
-    co_return co_await HttpRequest(HttpMethod::Get, path, std::nullopt, etag);
-}
-
-net::ssl::context* APIClient::Impl::GetOrCreateHttpsContext() {
-    if (!url_parts_.use_ssl) {
-        return nullptr;
-    }
-    if (https_context_) {
-        return https_context_.get();
-    }
-
-    auto ctx = std::make_unique<ssl::context>(ssl::context::tlsv12_client);
-    ctx->set_default_verify_paths();
-    ctx->set_verify_mode(ssl::verify_peer);
-    https_context_ = std::move(ctx);
-    return https_context_.get();
-}
-
-net::awaitable<HttpResponse>
-APIClient::Impl::HttpRequest(HttpMethod method, const std::string& path,
-                           const std::optional<json::value>& body,
-                           const std::string& if_none_match) {
+APIClient::Impl::HttpRequest(HttpMethod method,
+                             std::string path,
+                             std::string body_text,
+                             std::string if_none_match) {
     return http::RunRequest(
-        HttpExchange(method, path, body, if_none_match), config_.RequestTimeout);
+        HttpExchange(method, std::move(path), std::move(body_text),
+                     std::move(if_none_match)),
+        config_.RequestTimeout);
 }
 
 net::awaitable<HttpResponse>
-APIClient::Impl::HttpExchange(HttpMethod method, const std::string& path,
-                          const std::optional<json::value>& body,
-                          const std::string& if_none_match) {
-
+APIClient::Impl::HttpExchange(HttpMethod method,
+                              std::string path,
+                              std::string body_text,
+                              std::string if_none_match) {
     HttpResponse result;
-
-    if (url_parts_.host.empty() || url_parts_.port == 0) {
-        result.status = -1;
-        result.body = "invalid API host";
-        co_return result;
-    }
 
     // 面板同步是冷路径；保留完整候选地址，避免双栈环境只尝试第一个解析结果。
     std::vector<tcp::endpoint> endpoints;
@@ -439,23 +415,12 @@ APIClient::Impl::HttpExchange(HttpMethod method, const std::string& path,
         }
     }
 
-    if (endpoints.empty()) {
-        result.status = 0;
-        result.body = "DNS resolve failed";
-        co_return result;
-    }
-
     // 构建完整路径（所有请求都在 URL 参数中传 token）
     std::string full_path = url_parts_.path_prefix + path;
     if (full_path.find('?') != std::string::npos) {
         full_path += "&token=" + config_.Key;
     } else {
         full_path += "?token=" + config_.Key;
-    }
-
-    std::string body_text;
-    if (body.has_value()) {
-        body_text = json::serialize(*body);
     }
 
     std::string request;
@@ -475,7 +440,7 @@ APIClient::Impl::HttpExchange(HttpMethod method, const std::string& path,
         request += if_none_match;
         request += "\r\n";
     }
-    if (body.has_value()) {
+    if (method == HttpMethod::Post) {
         request += "Content-Type: application/json\r\nContent-Length: ";
         request += std::to_string(body_text.size());
         request += "\r\n";
@@ -484,17 +449,9 @@ APIClient::Impl::HttpExchange(HttpMethod method, const std::string& path,
     request += body_text;
 
     if (url_parts_.use_ssl) {
-        // HTTPS
-        auto ssl_ctx = GetOrCreateHttpsContext();
-        if (!ssl_ctx) {
-            result.status = -1;
-            result.body = "SSL context init failed";
-            co_return result;
-        }
-
         std::string last_error;
         for (const auto& endpoint : endpoints) {
-            ssl::stream<tcp::socket> stream(io_context_, *ssl_ctx);
+            ssl::stream<tcp::socket> stream(io_context_, *https_context_);
             try {
                 if (url_parts_.literal_address) {
                     auto* verify_param = SSL_get0_param(stream.native_handle());
@@ -528,7 +485,7 @@ APIClient::Impl::HttpExchange(HttpMethod method, const std::string& path,
             // Only connection setup may try another address. Once HTTP
             // transmission starts, a failure cannot prove the peer did not
             // apply the request (in particular, an additive traffic POST).
-            co_await WriteHttpRequest(stream, request);
+            co_await net::async_write(stream, net::buffer(request), net::use_awaitable);
             result = co_await http::ReadResponse(stream);
 
             // The HTTP response is complete. TLS close_notify is best effort
@@ -560,7 +517,7 @@ APIClient::Impl::HttpExchange(HttpMethod method, const std::string& path,
                 continue;
             }
 
-            co_await WriteHttpRequest(stream, request);
+            co_await net::async_write(stream, net::buffer(request), net::use_awaitable);
             result = co_await http::ReadResponse(stream);
 
             IoErrorCode ec;
@@ -584,7 +541,7 @@ APIClient::Impl::GetNodeInfo(std::string committed_etag) {
     std::string path = std::format("/api/v1/server/UniProxy/config?node_id={}&node_type={}",
                                    node_id, ApiNodeType());
 
-    auto resp = co_await HttpGet(path, committed_etag);
+    auto resp = co_await HttpRequest(HttpMethod::Get, std::move(path), {}, committed_etag);
     if (resp.not_modified) {
         if (committed_etag.empty()) {
             co_return NodeInfoFetchResult::Fail(
@@ -641,7 +598,7 @@ APIClient::Impl::GetUserList(std::string committed_etag) {
 
     // Only the owner of a committed user snapshot may supply its validator.
     // A successful fetch alone must not acknowledge a failed runtime update.
-    auto resp = co_await HttpGet(path, committed_etag);
+    auto resp = co_await HttpRequest(HttpMethod::Get, std::move(path), {}, committed_etag);
 
     // 304 Not Modified - 交给上层直接跳过用户重建，避免额外常驻缓存和拷贝
     if (resp.not_modified) {
@@ -702,15 +659,17 @@ APIClient::Impl::ReportUserTraffic(const std::vector<::acpp::api::UserTraffic>& 
     std::string path = std::format("/api/v1/server/UniProxy/push?node_id={}&node_type={}",
                                    node_id, ApiNodeType());
 
-    auto resp = co_await HttpPost(path, body);
+    auto resp = co_await HttpRequest(
+        HttpMethod::Post, std::move(path), json::serialize(json::value(std::move(body))), {});
 
     if (resp.status != 200) {
-        LOG_WARN("V2Board[{}]: ReportUserTraffic failed for node {}: {}",
-                 config_.Name, node_id, FormatHttpFailure(resp));
+        LOG_WARN("V2Board[{}]: traffic API acceptance unknown for node {}: HTTP status {}",
+                 config_.Name, node_id, resp.status);
         co_return false;
     }
 
-    LOG_DEBUG("V2Board[{}]: reported traffic for {} users", config_.Name, data.size());
+    LOG_DEBUG("V2Board[{}]: traffic API accepted {} users (not a billing commit acknowledgement)",
+              config_.Name, data.size());
     co_return true;
 }
 
@@ -723,7 +682,8 @@ APIClient::Impl::ReportNodeOnlineUsers(const std::vector<::acpp::api::OnlineUser
         const std::string alive_path = std::format(
             "/api/v1/server/UniProxy/alive?node_id={}&node_type={}",
             node_id, ApiNodeType());
-        auto alive_resp = co_await HttpPost(alive_path, report.alive_body);
+        auto alive_resp = co_await HttpRequest(
+            HttpMethod::Post, alive_path, json::serialize(json::value(std::move(report.alive_body))), {});
         if (alive_resp.status != 200) {
             LOG_WARN("V2Board[{}]: online device report failed for node {}: {}",
                      config_.Name, node_id, FormatHttpFailure(alive_resp));

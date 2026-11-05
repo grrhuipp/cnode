@@ -1,10 +1,9 @@
-"""Exercise HTTP/2 resource rejection and connection errors on real shared sockets."""
+"""Exercise bounded consumer backpressure and HTTP/2 errors on real shared sockets."""
 import argparse
 import asyncio
 import hashlib
 import json
 from pathlib import Path
-import socket
 import struct
 import traceback
 
@@ -12,8 +11,8 @@ from anytls_fin_integration import Resources, USER, available_port, configure, t
 from grpc_substream_integration import Peer, READY, ECHO, grpc, h2frame, vless
 
 
-MODES = ('overflow', 'capacity', 'initial-end', 'reset-empty', 'reset-long', 'reset-zero', 'reset-idle',
-         'early-reset', 'early-settings', 'early-ping', 'packet-reset', 'packet-capacity', 'packet-tiny')
+MODES = ('backpressure', 'capacity', 'malformed-pseudo', 'malformed-host', 'initial-end', 'reset-empty', 'reset-long', 'reset-zero', 'reset-idle',
+         'early-reset', 'early-settings', 'early-ping', 'early-hpack', 'packet-reset', 'packet-capacity', 'packet-tiny')
 
 
 def request_headers(network, tls, path=None, method='POST'):
@@ -30,16 +29,28 @@ def request_headers(network, tls, path=None, method='POST'):
 
 async def scenario(args, network, tls, mode, output, result, resources):
     states = {}
+    resume_upload = asyncio.Event()
+    upload_done = asyncio.Event()
+    upload_size = 768 * 32768
+    upload_digest = hashlib.sha256()
+    upload_received = 0
 
     async def destination(reader, writer):
+        nonlocal upload_received
         tag = await reader.readexactly(1)
         states[tag] = writer
         writer.write(READY)
         await writer.drain()
         if tag == b'A':
-            writer.get_extra_info('socket').setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
             writer.transport.pause_reading()
-            await asyncio.Event().wait()
+            await resume_upload.wait()
+            writer.transport.resume_reading()
+            while upload_received < upload_size:
+                data = await reader.read(min(65536, upload_size - upload_received))
+                assert data, 'backpressured upload ended prematurely'
+                upload_digest.update(data)
+                upload_received += len(data)
+            upload_done.set()
         while data := await reader.read(8192):
             writer.write(data)
             await writer.drain()
@@ -76,10 +87,7 @@ async def scenario(args, network, tls, mode, output, result, resources):
         return grpc(data) if network == 'grpc' else data
 
     async def send(peer, sid, data):
-        encoded = encode(data)
-        for offset in range(0, len(encoded), 16384):
-            peer.writer.write(h2frame(0, 0, sid, encoded[offset:offset + 16384]))
-        await peer.writer.drain()
+        await peer.send_data(sid, encode(data))
 
     async def open_stream(peer, sid, tag):
         peer.writer.write(h2frame(1, 4, sid, request_headers(network, tls)))
@@ -205,6 +213,8 @@ async def scenario(args, network, tls, mode, output, result, resources):
             'early-reset': (h2frame(3, 0, 1, struct.pack('!I', 8)), 1),
             'early-settings': (h2frame(4, 1, 0, b'\0' * 6), 6),
             'early-ping': (h2frame(6, 0, 1, b'bad-ping'), 1),
+            # RFC 7541 6.1: index 0 is invalid; RFC 9113 4.3 COMPRESSION_ERROR.
+            'early-hpack': (h2frame(1, 5, 1, b'\x80'), 9),
         }[mode]
         peer.writer.write(wire)
         await peer.writer.drain()
@@ -237,30 +247,57 @@ async def scenario(args, network, tls, mode, output, result, resources):
                       for t, flags, sid, body in peer.frames if sid == 1])
         result['passed'] = result['initial_end_observed'] and not peer.closed and not peer.error
         return
-    await open_stream(peer, 1, b'A' if mode == 'overflow' else b'V')
+    await open_stream(peer, 1, b'A' if mode == 'backpressure' else b'V')
     await open_stream(peer, 3, b'S')
     await peer.wait_message(1, b'\0\0' + READY)
     await peer.wait_message(3, b'\0\0' + READY)
     await peer.ping(b'prepared')
     recovery_sid = 5
-    if mode == 'overflow':
-        # Keep reading control frames and pace bounded batches on connection
-        # credit updates. This pressure fixture is not a full flow-control oracle.
-        # The target is explicitly paused. Only receipt of RST proves exhaustion.
-        sent = 0
-        for _ in range(768):
-            if peer.closed or any(t == 3 and sid == 1 for t, _, sid, _ in peer.frames):
-                break
-            before = len(peer.frames)
-            await send(peer, 1, b'F' * 32768)
-            sent += 32768
-            await until(lambda: peer.closed or any(t == 8 and sid == 0
-                        for t, _, sid, _ in peer.frames[before:]), 3)
-        resets = [body for t, _, sid, body in peer.frames if t == 3 and sid == 1]
-        result.update(upload_bytes=sent, target_reading_paused=not states[b'A'].transport.is_reading(),
-                      resets=[body.hex() for body in resets])
-        assert resets, 'queue exhaustion did not produce RST_STREAM within 24 MiB'
-        result['valid_reset'] = resets == [struct.pack('!I', 11)]
+    if mode == 'backpressure':
+        # A compliant sender must stop at the advertised stream window, not
+        # overflow the receiver's queue or expect credit for unread bytes.
+        async def flood():
+            for _ in range(768):
+                await send(peer, 1, b'F' * 32768)
+
+        upload = asyncio.create_task(flood())
+        resources.tasks.add(upload)
+        previous = peer.sent_data.get(1, 0)
+        stable_since = asyncio.get_running_loop().time()
+
+        def stalled():
+            nonlocal previous, stable_since
+            assert not peer.closed and not peer.error and 1 not in peer.resets
+            assert not upload.done(), 'unread consumer did not backpressure DATA'
+            now = asyncio.get_running_loop().time()
+            current = peer.sent_data.get(1, 0)
+            if current != previous or peer.send_capacity(1) > 0:
+                previous, stable_since = current, now
+                return False
+            return now - stable_since >= 0.3
+
+        await until(stalled, 5)
+        assert peer.stream_send_windows[1] == 0
+        assert peer.connection_send_window > 0, 'one stalled stream monopolized the connection'
+        assert not states[b'A'].transport.is_reading()
+        result.update(stalled_wire_bytes=previous, target_reading_paused=True,
+                      stream_window_exhausted=True)
+        await send(peer, 3, ECHO)
+        await peer.wait_message(3, b'\0\0' + READY + ECHO)
+        await peer.ping(b'paused!!')
+        resume_upload.set()
+        await upload
+        await until(upload_done.is_set, 5)
+        assert upload_received == upload_size
+        assert upload_digest.digest() == hashlib.sha256(b'F' * upload_size).digest()
+        assert 1 not in peer.resets, 'compliant upload was reset instead of resumed'
+        await send(peer, 1, ECHO)
+        await peer.wait_message(1, b'\0\0' + READY + ECHO)
+        result.update(upload_bytes=upload_received, upload_sha256=upload_digest.hexdigest(),
+                      backpressure_recovered=True, sibling_while_paused=True)
+        peer.writer.write(h2frame(3, 0, 1, struct.pack('!I', 8)))
+        await peer.writer.drain()
+        await peer.ping(b'released')
     elif mode == 'capacity':
         for sid in range(5, 512, 2):
             peer.writer.write(h2frame(1, 4, sid, request_headers(network, tls)))
@@ -282,6 +319,18 @@ async def scenario(args, network, tls, mode, output, result, resources):
             await peer.writer.drain()
             await peer.ping(b'freedone')
         recovery_sid = 515
+    elif mode.startswith('malformed-'):
+        # RFC 9113 8.1.1: a malformed request is a stream error; the shared
+        # connection and its open streams continue.
+        extra = {'malformed-pseudo': (':path', '/fixture'),
+                 'malformed-host': ('host', 'other.example')}[mode]
+        field = b'\0' + bytes([len(extra[0])]) + extra[0].encode() + bytes([len(extra[1])]) + extra[1].encode()
+        peer.writer.write(h2frame(1, 4, 5, request_headers(network, tls) + field))
+        await peer.writer.drain()
+        await until(lambda: peer.closed or any(t == 3 and sid == 5 for t, _, sid, _ in peer.frames), 3)
+        resets = [body for t, _, sid, body in peer.frames if t == 3 and sid == 5]
+        result.update(resets=[body.hex() for body in resets], valid_reset=resets == [struct.pack('!I', 1)])
+        recovery_sid = 7
     else:
         sid, body, code = {
             'reset-empty': (1, b'', 6), 'reset-long': (1, b'\0' * 8, 6),
@@ -302,7 +351,8 @@ async def scenario(args, network, tls, mode, output, result, resources):
         result.update(passed=True, new_connection_recovered=True)
         return
 
-    await send(peer, 3, ECHO)
+    if mode != 'backpressure':
+        await send(peer, 3, ECHO)
     await peer.wait_message(3, b'\0\0' + READY + ECHO)
     await peer.ping(b'survived')
     barrier = len(peer.frames)
@@ -317,7 +367,8 @@ async def scenario(args, network, tls, mode, output, result, resources):
     late = [(t, flags, sid) for t, flags, sid, _ in peer.frames[barrier:] if sid == 1]
     result.update(shared_connection_survived=True, recovered_stream=recovery_sid,
                   late_frames=late, peer_frame_error=peer.error,
-                  passed=result['valid_reset'] and not late and not peer.error and not peer.closed)
+                  passed=(result.get('valid_reset', False) or result.get('backpressure_recovered', False))
+                  and not late and not peer.error and not peer.closed)
 
 
 async def main(args):

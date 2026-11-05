@@ -1,5 +1,5 @@
 #include "acppnode/infra/outbound_source_config.hpp"
-#include "acppnode/infra/json_object.hpp"
+#include "acppnode/infra/json_field.hpp"
 #include "acppnode/infra/outbound_bind_config.hpp"
 
 #include <stdexcept>
@@ -10,15 +10,8 @@ namespace acpp::infra {
 OutboundSourceConfig OutboundSourceConfig::FromJson(const json::object& j) {
     OutboundSourceConfig cfg;
 
-    auto read_string = [&](std::string_view key) -> std::string {
-        if (const auto* value = j.if_contains(key);
-            value && value->is_string()) {
-            return std::string(value->as_string());
-        }
-        return {};
-    };
-    cfg.tag = read_string("tag");
-    cfg.protocol = read_string("protocol");
+    cfg.tag = JsonStringOr(j, "tag", "");
+    cfg.protocol = JsonStringOr(j, "protocol", "");
 
     auto settings = ParseJsonObject(j, "settings");
     if (!settings) {

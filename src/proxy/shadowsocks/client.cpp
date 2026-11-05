@@ -1,4 +1,5 @@
 #include "shadowsocks_crypto.hpp"
+#include "acppnode/common/byte_reader.hpp"
 #include "stream_crypto.hpp"
 #include "client.hpp"
 #include "acppnode/common/address_codec.hpp"
@@ -16,24 +17,9 @@ namespace acpp::ss {
 
 namespace {
 
-[[noreturn]] void ThrowSsWriteError(const char* what) {
-    throw IoSystemError(io_error::connection_reset, what);
-}
-
-net::awaitable<bool> ReadFull(AsyncStream& stream, uint8_t* buf, size_t len) {
-    size_t got = 0;
-    while (got < len) {
-        size_t r = co_await stream.AsyncRead(net::buffer(buf + got, len - got));
-        if (r == 0) {
-            co_return false;
-        }
-        got += r;
-    }
-    co_return true;
-}
-
 using detail::MakeNonce;
-
+using detail::ReadFull;
+using detail::ThrowSsWriteError;
 
 class RequestBodyWriter final
     : public memory::ThreadAllocated
@@ -55,7 +41,7 @@ public:
         if (!stream_) {
             throw IoSystemError(io_error::not_connected, "Shadowsocks request writer has no stream");
         }
-        if (!buf::HasData(mb)) {
+        if (mb.byte_size() == 0) {
             co_return;
         }
         if (!write_cipher_) {
@@ -74,7 +60,7 @@ public:
         }
 
         mb.clear();
-        if (buf::HasData(out_mb)) {
+        if (out_mb.byte_size() != 0) {
             co_await stream_->WriteMultiBuffer(std::move(out_mb));
         }
     }
@@ -101,7 +87,7 @@ public:
                 std::span<const uint8_t>{data, size},
                 out_mb);
         }
-        if (buf::HasData(out_mb)) {
+        if (out_mb.byte_size() != 0) {
             co_await stream_->WriteMultiBuffer(std::move(out_mb));
         }
     }
@@ -205,14 +191,14 @@ WriteTCPRequest2022(const TargetAddress& target,
 
     std::array<uint8_t, kSs2022RequestFixedHeaderSize> fixed_plain{};
     fixed_plain[0] = 0;
-    PutU64BE(fixed_plain.data() + 1, UnixSecondsNow());
-    PutU16BE(fixed_plain.data() + 9, static_cast<uint16_t>(variable_len));
+    StoreU64BE(fixed_plain.data() + 1, UnixSecondsNow());
+    StoreU16BE(fixed_plain.data() + 9, static_cast<uint16_t>(variable_len));
 
     constexpr size_t kMaxVariablePlain =
         259 + 2 + kPaddingLen;
     std::array<uint8_t, kMaxVariablePlain> variable_plain{};
     std::memcpy(variable_plain.data(), addr_bytes.data(), addr_size);
-    PutU16BE(variable_plain.data() + addr_size, static_cast<uint16_t>(kPaddingLen));
+    StoreU16BE(variable_plain.data() + addr_size, static_cast<uint16_t>(kPaddingLen));
     if (RAND_bytes(variable_plain.data() + addr_size + 2, static_cast<int>(kPaddingLen)) != 1) {
         co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
     }
@@ -294,7 +280,7 @@ WriteTCPRequest(const TargetAddress& target,
                 const KeyBytes& master_key,
                 std::span<const KeyBytes> psk_chain,
                 AsyncStream& stream) {
-    if (Is2022Cipher(cipher_info)) {
+    if (Is2022Cipher(cipher_info.type)) {
         co_return co_await WriteTCPRequest2022(
             target, cipher_info, master_key, psk_chain, stream);
     }
@@ -389,7 +375,7 @@ ReadTCPResponse(const SsCipherInfo& cipher_info,
     }
 
     try {
-        if (Is2022Cipher(cipher_info)) {
+        if (Is2022Cipher(cipher_info.type)) {
             if (request_salt.size != cipher_info.salt_size) {
                 co_return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
             }
@@ -428,7 +414,7 @@ ReadTCPResponse(const SsCipherInfo& cipher_info,
                 co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
             }
             if (fixed_plain[0] != 1 ||
-                !TimestampFresh(GetU64BE(fixed_plain.data() + 1), UnixSecondsNow()) ||
+                !TimestampFresh(LoadU64BE(fixed_plain.data() + 1), UnixSecondsNow()) ||
                 std::memcmp(fixed_plain.data() + 9,
                             request_salt.data(),
                             request_salt.size) != 0) {
@@ -436,7 +422,7 @@ ReadTCPResponse(const SsCipherInfo& cipher_info,
             }
 
             const uint16_t payload_len =
-                GetU16BE(fixed_plain.data() + 9 + cipher_info.salt_size);
+                LoadU16BE(fixed_plain.data() + 9 + cipher_info.salt_size);
             buf::MultiBuffer pending;
             uint64_t next_nonce = 1;
             if (payload_len > 0) {

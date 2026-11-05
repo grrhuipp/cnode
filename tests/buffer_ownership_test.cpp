@@ -414,7 +414,7 @@ void EdgeCases() {
     sparse.push_back(Buffer(0));
     sparse.push_back(Buffer(5));
     buf::MultiBuffer moved;
-    Check(sparse.MovePrefixTo(moved, 8) && !buf::HasData(sparse) && moved.byte_size() == 8 &&
+    Check(sparse.MovePrefixTo(moved, 8) && sparse.byte_size() == 0 && moved.byte_size() == 8 &&
           moved.size() == 2 && Consistent(sparse) && Consistent(moved), "whole prefix skips empty slots");
 }
 }

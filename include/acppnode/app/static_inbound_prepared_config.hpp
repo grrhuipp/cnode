@@ -5,6 +5,7 @@
 #include "acppnode/proxy/sniff_config.hpp"
 #include "acppnode/transport/internet/stream_settings.hpp"
 #include "acppnode/transport/internet/inbound_listen.hpp"
+#include "acppnode/transport/internet/proxy_protocol_mode.hpp"
 
 #include <cstdint>
 #include <string>
@@ -20,6 +21,7 @@ struct StaticInboundRuntimeEntry {
     InboundListen listen;
     StreamSettings stream_settings;
     SniffConfig sniffing;
+    ProxyProtocolMode proxy_protocol = ProxyProtocolMode::Auto;
     routing::OutboundSelectionPolicy outbound_policy;
     proxyman::inbound::BuildRequest build_request;
 };

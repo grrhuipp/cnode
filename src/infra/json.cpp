@@ -1,4 +1,5 @@
 #include "acppnode/infra/json.hpp"
+#include "acppnode/common/binary_text_codec.hpp"
 
 #include <charconv>
 #include <cmath>
@@ -170,6 +171,12 @@ const array& value::as_array() const { return *std::get<array_ptr>(data_); }
 
 namespace {
 
+// RFC 8259 §9 lets a parser bound nesting depth. Parsing recurses per level on
+// the caller's stack, and panel responses are remote input, so the bound keeps
+// a hostile body from exhausting the control-plane thread stack. 128 levels
+// (serde_json's default) far exceed every configuration or panel schema.
+constexpr size_t kMaxNestingDepth = 128;
+
 class Parser {
 public:
     Parser(std::string_view text, KeyComparison comparison)
@@ -241,11 +248,19 @@ private:
         return v;
     }
 
+    void EnterNesting() {
+        if (++depth_ > kMaxNestingDepth) Fail("nesting too deep");
+    }
+
     object ParseObject() {
         object obj(comparison_);
         Expect('{');
+        EnterNesting();
         SkipWs();
-        if (Consume('}')) return obj;
+        if (Consume('}')) {
+            --depth_;
+            return obj;
+        }
 
         while (true) {
             SkipWs();
@@ -254,13 +269,19 @@ private:
             std::string key = ParseString();
             SkipWs();
             Expect(':');
+            // RFC 8259 §4 leaves duplicate names unpredictable across parsers;
+            // last-wins would let one field silently shadow another, so any
+            // repeat under the active key comparison rejects the document.
             auto [entry, inserted] = obj.insert_or_assign(std::move(key), ParseValue());
-            if (!inserted && comparison_ == KeyComparison::AsciiCaseInsensitive) {
+            if (!inserted) {
                 throw parse_error(std::format(
                     "duplicate object key '{}' at byte {}", entry->first, key_position));
             }
             SkipWs();
-            if (Consume('}')) return obj;
+            if (Consume('}')) {
+                --depth_;
+                return obj;
+            }
             Expect(',');
         }
     }
@@ -268,13 +289,20 @@ private:
     array ParseArray() {
         array arr;
         Expect('[');
+        EnterNesting();
         SkipWs();
-        if (Consume(']')) return arr;
+        if (Consume(']')) {
+            --depth_;
+            return arr;
+        }
 
         while (true) {
             arr.push_back(ParseValue());
             SkipWs();
-            if (Consume(']')) return arr;
+            if (Consume(']')) {
+                --depth_;
+                return arr;
+            }
             Expect(',');
         }
     }
@@ -328,12 +356,9 @@ private:
     uint32_t ReadHex4() {
         uint32_t cp = 0;
         for (int i = 0; i < 4; ++i) {
-            const char c = Take();
-            cp <<= 4;
-            if (c >= '0' && c <= '9') cp |= static_cast<uint32_t>(c - '0');
-            else if (c >= 'a' && c <= 'f') cp |= static_cast<uint32_t>(c - 'a' + 10);
-            else if (c >= 'A' && c <= 'F') cp |= static_cast<uint32_t>(c - 'A' + 10);
-            else Fail("invalid unicode escape");
+            const int digit = HexDigitValue(Take());
+            if (digit < 0) Fail("invalid unicode escape");
+            cp = (cp << 4) | static_cast<uint32_t>(digit);
         }
         return cp;
     }
@@ -406,6 +431,7 @@ private:
     std::string_view text_;
     KeyComparison comparison_;
     size_t pos_ = 0;
+    size_t depth_ = 0;
 };
 
 void SerializeString(const std::string& s, std::string& out) {

@@ -2,10 +2,61 @@
 
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/string_hash.hpp"
+#include "acppnode/app/session_group_executor.hpp"
 
 #include <string>
+#include <unordered_map>
 
 namespace acpp {
+
+namespace {
+struct DeviceQuota {
+    using IpMap = std::unordered_map<std::string, uint32_t,
+                                    TransparentStringHash, TransparentStringEq>;
+    using Users = std::unordered_map<uint64_t, IpMap>;
+    std::unordered_map<std::string, Users, TransparentStringHash, TransparentStringEq> devices;
+
+    void Release(std::string_view tag, uint64_t user, std::string_view ip) noexcept {
+        const auto tag_it = devices.find(tag);
+        if (tag_it == devices.end()) return;
+        const auto user_it = tag_it->second.find(user);
+        if (user_it == tag_it->second.end()) return;
+        const auto ip_it = user_it->second.find(ip);
+        if (ip_it == user_it->second.end()) return;
+        if (--ip_it->second == 0) user_it->second.erase(ip_it);
+        if (user_it->second.empty()) tag_it->second.erase(user_it);
+        if (tag_it->second.empty()) devices.erase(tag_it);
+    }
+};
+
+struct DeviceQuotaService final : net::execution_context::service {
+    inline static net::execution_context::id id;
+    explicit DeviceQuotaService(net::execution_context& context)
+        : service(context), quota(std::make_shared<DeviceQuota>()) {}
+    void shutdown() override { quota.reset(); }
+    std::shared_ptr<DeviceQuota> quota;
+};
+
+struct DeviceReturn final : GroupCoordinator::ReservedOperation {
+    GroupCoordinator* coordinator = nullptr;
+    std::shared_ptr<DeviceQuota> quota;
+    std::string tag;
+    std::string ip;
+    uint64_t user = 0;
+    bool admitted = false;
+    void Invoke() noexcept override { quota->Release(tag, user, ip); }
+};
+
+struct DeviceReservation {
+    std::unique_ptr<DeviceReturn> node;
+    ~DeviceReservation() {
+        if (node && node->admitted) {
+            auto* coordinator = node->coordinator;
+            coordinator->PostReserved(std::move(node));
+        }
+    }
+};
+} // namespace
 
 struct UserOnlineTracker::Impl : memory::ThreadAllocated {
     using DeviceIpMap =
@@ -26,62 +77,55 @@ struct UserOnlineTracker::Impl : memory::ThreadAllocated {
 UserOnlineTracker::UserOnlineTracker() : impl_(std::make_unique<Impl>()) {}
 
 UserOnlineTracker::~UserOnlineTracker() = default;
-UserOnlineTracker::UserOnlineTracker(UserOnlineTracker&&) noexcept = default;
-UserOnlineTracker& UserOnlineTracker::operator=(UserOnlineTracker&&) noexcept = default;
 
-std::optional<UserOnlineSessionGuard> UserOnlineTracker::TryConnectSession(
+net::awaitable<std::optional<UserOnlineSessionGuard>> UserOnlineTracker::TryConnectSession(
     std::string_view tag,
     int64_t user_id,
     std::string_view client_ip,
     uint32_t device_limit) {
     if (user_id <= 0 || client_ip.empty()) {
-        return std::optional<UserOnlineSessionGuard>(std::in_place);
+        co_return std::optional<UserOnlineSessionGuard>(std::in_place);
     }
     const auto uid = static_cast<uint64_t>(user_id);
+    // Prepare the guard's owned strings before reserving either counter.
+    std::optional<UserOnlineSessionGuard> guard(std::in_place, tag, uid, client_ip);
+    auto domain = ExecutionDomain::Current();
+    if (!domain) throw std::logic_error("user admission requires an execution domain");
+    auto reservation = std::make_shared<DeviceReservation>();
+    reservation->node = std::make_unique<DeviceReturn>();
+    auto& node = *reservation->node;
+    node.coordinator = &domain->Coordinator();
+    node.tag = tag;
+    node.ip = client_ip;
+    node.user = uid;
+    guard->quota_reservation_ = reservation;
+    const bool admitted = co_await domain->Coordinator().PostCall(
+        [reservation, device_limit] {
+            auto& node = *reservation->node;
+            node.quota = net::use_service<DeviceQuotaService>(
+                node.coordinator->Services()).quota;
+            auto& all_users = node.quota->devices.try_emplace(node.tag).first->second;
+            auto& all_ips = all_users.try_emplace(node.user).first->second;
+            const auto global_ip = all_ips.find(node.ip);
+            if (global_ip == all_ips.end() && device_limit != 0 &&
+                all_ips.size() >= device_limit) return false;
+            ++all_ips.try_emplace(node.ip, 0u).first->second;
+            node.admitted = true;
+            return true;
+        });
+    if (!admitted) co_return std::nullopt;
     auto tag_it = impl_->devices.find(tag);
-    if (tag_it == impl_->devices.end()) {
+    if (tag_it == impl_->devices.end())
         tag_it = impl_->devices.try_emplace(memory::ThreadLocalString(tag)).first;
-    }
-    auto [user_it, inserted] = tag_it->second.try_emplace(uid);
-    auto& user_devices = user_it->second;
-    if (!inserted) {
-        auto ip_it = user_devices.find(client_ip);
-        if (ip_it != user_devices.end()) {
-            ++ip_it->second;
-            return std::optional<UserOnlineSessionGuard>(
-                std::in_place, *this, tag, uid, client_ip);
-        }
-        if (device_limit != 0 && user_devices.size() >= device_limit) {
-            return std::nullopt;
-        }
-    }
-    user_devices.try_emplace(memory::ThreadLocalString(client_ip), 1u);
-    return std::optional<UserOnlineSessionGuard>(
-        std::in_place, *this, tag, uid, client_ip);
-}
-
-void UserOnlineTracker::OnUserConnected(std::string_view tag,
-                                        uint64_t user_id,
-                                        std::string_view client_ip) {
-    if (user_id == 0 || client_ip.empty()) {
-        return;
-    }
-    auto tag_it = impl_->devices.find(tag);
-    if (tag_it == impl_->devices.end()) {
-        tag_it = impl_->devices.try_emplace(memory::ThreadLocalString(tag)).first;
-    }
-    auto& user_devices = tag_it->second[user_id];
-    auto ip_it = user_devices.find(client_ip);
-    if (ip_it == user_devices.end()) {
-        user_devices.try_emplace(memory::ThreadLocalString(client_ip), 1u);
-    } else {
-        ++ip_it->second;
-    }
+    auto& local_ips = tag_it->second.try_emplace(uid).first->second;
+    ++local_ips.try_emplace(memory::ThreadLocalString(client_ip), 0u).first->second;
+    guard->Arm(*this);
+    co_return std::move(guard);
 }
 
 void UserOnlineTracker::OnUserDisconnected(std::string_view tag,
                                            uint64_t user_id,
-                                           std::string_view client_ip) {
+                                           std::string_view client_ip) noexcept {
     if (client_ip.empty()) {
         return;
     }
@@ -109,42 +153,15 @@ void UserOnlineTracker::OnUserDisconnected(std::string_view tag,
     }
 }
 
-bool UserOnlineTracker::CanAcceptDevice(std::string_view tag,
-                                        uint64_t user_id,
-                                        std::string_view client_ip,
-                                        uint32_t device_limit) const {
-    if (device_limit == 0 || client_ip.empty()) {
-        return true;
-    }
-
-    auto tag_it = impl_->devices.find(tag);
-    if (tag_it == impl_->devices.end()) {
-        return true;
-    }
-    auto user_it = tag_it->second.find(user_id);
-    if (user_it == tag_it->second.end()) {
-        return true;
-    }
-    if (user_it->second.find(client_ip) != user_it->second.end()) {
-        return true;
-    }
-    return user_it->second.size() < device_limit;
-}
-
 size_t UserOnlineTracker::OnlineDeviceCount(std::string_view tag,
                                             uint64_t user_id) const {
-    auto tag_it = impl_->devices.find(tag);
-    if (tag_it == impl_->devices.end()) {
-        return 0;
-    }
-    auto user_it = tag_it->second.find(user_id);
-    if (user_it == tag_it->second.end()) {
-        return 0;
-    }
-    return user_it->second.size();
+    const auto tag_it = impl_->devices.find(tag);
+    if (tag_it == impl_->devices.end()) return 0;
+    const auto user_it = tag_it->second.find(user_id);
+    return user_it == tag_it->second.end() ? 0 : user_it->second.size();
 }
 
-std::vector<UserOnlineTracker::OnlineDevice>
+std::vector<OnlineDevice>
 UserOnlineTracker::GetOnlineDevices(std::string_view tag) const {
     std::vector<OnlineDevice> result;
     auto tag_it = impl_->devices.find(tag);

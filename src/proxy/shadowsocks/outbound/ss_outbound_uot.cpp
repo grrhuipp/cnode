@@ -1,5 +1,7 @@
 #include "ss_outbound_uot.hpp"
 
+#include "acppnode/infra/json_field.hpp"
+
 #include <format>
 #include <string_view>
 #include <utility>
@@ -11,21 +13,14 @@ namespace {
 tl::expected<SsUotVersion, std::string> ParseVersionValue(
     const json::value& value,
     std::string_view field) {
-    uint64_t raw = 0;
-    if (value.is_int64()) {
-        const int64_t signed_value = value.as_int64();
-        if (signed_value < 0) {
-            return tl::unexpected(std::format("{} must be 1 or 2", field));
-        }
-        raw = static_cast<uint64_t>(signed_value);
-    } else if (value.is_uint64()) {
-        raw = value.as_uint64();
-    } else {
-        return tl::unexpected(std::format("{} must be an integer", field));
+    const auto raw = JsonUnsignedInteger(value);
+    if (!raw) {
+        return tl::unexpected(std::format("{} must be 1 or 2", field));
     }
 
-    if (raw == 1) return SsUotVersion::V1;
-    if (raw == 2) return SsUotVersion::V2;
+    if (*raw == 1) return SsUotVersion::V1;
+    if (*raw == 2) return SsUotVersion::V2;
+
     return tl::unexpected(std::format("{} must be 1 or 2", field));
 }
 

@@ -3,6 +3,7 @@
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/proxy/outbound.hpp"
 #include "acppnode/transport/internet/stream_settings.hpp"
+#include "acppnode/transport/internet/transport_security.hpp"
 #include "acppnode/transport/internet/outbound_bind.hpp"
 
 #include <array>
@@ -18,6 +19,8 @@
 
 namespace acpp {
 
+class AwaitableTaskGroup;
+
 namespace app::dns {
 class DNS;
 }  // namespace app::dns
@@ -25,8 +28,6 @@ class DNS;
 // 协议核心 codec/validator 位于 acpp::anytls；handler 与其它协议一致归于
 // acpp::proxy::<name>::outbound（对应 vmess core=acpp::vmess, handler=acpp::proxy::vmess::*）。
 namespace proxy::anytls::outbound {
-
-template<class Session> class SessionPool;
 
 struct Settings {
     std::string address;
@@ -53,11 +54,14 @@ struct PreparedSettings {
 // ============================================================================
 class Handler final : public Outbound {
 public:
+    // Physical session read loops outlive requests and this Handler; `tasks`
+    // owns and joins them, and must outlive the Handler.
     Handler(std::string_view tag,
             net::io_context& io_context,
             std::shared_ptr<const PreparedSettings> prepared,
             std::chrono::seconds dial_timeout,
-            app::dns::DNS& dns_service);
+            app::dns::DNS& dns_service,
+            AwaitableTaskGroup& tasks);
     ~Handler() noexcept override;
 
     net::awaitable<OutboundProcessResult> Process(
@@ -79,14 +83,16 @@ public:
 private:
     struct PaddingState;
     struct ClientSession;
+    class SessionPool;
     struct LogicalStreamLease;
 
     memory::ThreadLocalString tag_;
     std::shared_ptr<const PreparedSettings> prepared_;
+    TransportSecurity security_;  // This Worker's contexts for prepared_->stream_settings.
     std::chrono::seconds dial_timeout_;
     app::dns::DNS& dns_service_;
     std::shared_ptr<PaddingState> padding_;
-    std::unique_ptr<SessionPool<ClientSession>> pool_;
+    std::unique_ptr<SessionPool> pool_;
 };
 
 }  // namespace proxy::anytls::outbound

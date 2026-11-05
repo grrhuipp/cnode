@@ -5,7 +5,10 @@
 #include "../account.hpp"
 #include "../types.hpp"
 #include "acppnode/transport/internet/stream_settings.hpp"
+#include "acppnode/transport/internet/transport_security.hpp"
 #include "acppnode/transport/internet/outbound_bind.hpp"
+
+#include <openssl/aes.h>
 
 #include <chrono>
 #include <cstdint>
@@ -44,6 +47,7 @@ namespace proxy::vmess::outbound {
 struct PreparedSettings {
     VMessOutboundConfig config;
     ::acpp::vmess::MemoryAccount user;
+    AES_KEY auth_id_key{};  // Encrypt schedule of user.auth_key, built on prepare.
 };
 
 class Handler final : public ::acpp::Outbound {
@@ -70,6 +74,7 @@ public:
 private:
     memory::ThreadLocalString tag_;
     std::shared_ptr<const PreparedSettings> prepared_;
+    ::acpp::TransportSecurity security_;  // This Worker's contexts for prepared_->config.stream_settings.
     std::chrono::seconds dial_timeout_;
     ::acpp::app::dns::DNS& dns_service_;
 };

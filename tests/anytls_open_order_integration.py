@@ -68,7 +68,7 @@ async def scenario(args, with_payload, output, result, resources):
     port = available_port()
     configure(output, {'protocol': 'vless', 'listen': '127.0.0.1', 'port': port,
                        'settings': {'clients': [{'id': str(USER)}]}},
-              {'protocol': 'anytls', 'settings': {'server': '127.0.0.1', 'server_port': server_port,
+              {'protocol': 'anytls', 'settings': {'address': '127.0.0.1', 'port': server_port,
                'password': 'secret', 'minIdleSession': 1}, 'streamSettings': tls_settings()})
     resources.spawn([args.binary, '--config-dir', output], output / 'child.log')
     reader, _ = await open_application(resources, port, False)

@@ -28,7 +28,7 @@ class Handler final : public Inbound {
 public:
     Handler(::acpp::UserOnlineTracker& validator,
             ::acpp::StatsShard& stats,
-            ::acpp::ConnectionLimiterPtr limiter,
+            ::acpp::ConnectionLimiter* limiter,
             std::shared_ptr<const ::acpp::anytls::PaddingScheme> padding_scheme = {});
 
     net::awaitable<RelayResult> Process(
@@ -43,7 +43,7 @@ public:
 private:
     ::acpp::UserOnlineTracker& validator_;
     ::acpp::StatsShard* stats_ = nullptr;
-    ::acpp::ConnectionLimiterPtr limiter_;
+    ::acpp::ConnectionLimiter* limiter_;
     std::shared_ptr<const ::acpp::anytls::PaddingScheme> padding_scheme_;
 };
 

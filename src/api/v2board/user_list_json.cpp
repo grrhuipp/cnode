@@ -1,8 +1,12 @@
 #include "user_list_json.hpp"
 
+#include "acppnode/infra/json_field.hpp"
+
 #include <format>
 #include <limits>
 #include <string>
+#include <string_view>
+#include <unordered_set>
 #include <utility>
 
 namespace acpp::api::v2board {
@@ -20,17 +24,12 @@ tl::expected<uint64_t, std::string> ParseOptionalLimit(
     const auto* value = source.if_contains(field);
     if (!value || value->is_null()) return 0;
 
-    if (value->is_int64()) {
-        const int64_t signed_value = value->as_int64();
-        if (signed_value < 0) {
-            return tl::unexpected(std::format(
-                "users[{}].{} must not be negative", user_index, field));
-        }
-        return static_cast<uint64_t>(signed_value);
+    const auto limit = JsonUnsignedInteger(*value);
+    if (!limit) {
+        return tl::unexpected(std::format(
+            "users[{}].{} must be a non-negative integer or null", user_index, field));
     }
-    if (value->is_uint64()) return value->as_uint64();
-    return tl::unexpected(std::format(
-        "users[{}].{} must be an integer or null", user_index, field));
+    return *limit;
 }
 
 tl::expected<std::string, std::string> ParseOptionalString(
@@ -61,6 +60,10 @@ ParseUserList(const json::object& source) {
     const auto& users_array = users_value->as_array();
     std::vector<::acpp::api::UserInfo> users;
     users.reserve(users_array.size());
+    // A repeated id would merge accounting for two users. Credentials are
+    // compared after protocol derivation, when the UserStore snapshot is built.
+    std::unordered_set<int64_t> seen_ids;
+    seen_ids.reserve(users_array.size());
     for (size_t i = 0; i < users_array.size(); ++i) {
         const auto& user_value = users_array[i];
         if (!user_value.is_object()) {
@@ -75,6 +78,9 @@ ParseUserList(const json::object& source) {
                 "users[{}].id must be a positive int64", i));
         }
         user.UID = id->as_int64();
+        if (!seen_ids.insert(user.UID).second) {
+            return tl::unexpected(std::format("users[{}].id duplicates another user", i));
+        }
 
         const auto* uuid = source_user.if_contains("uuid");
         if (!uuid || !uuid->is_string() || uuid->as_string().empty()) {

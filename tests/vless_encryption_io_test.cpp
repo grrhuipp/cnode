@@ -41,7 +41,7 @@ void Check(bool condition, std::string_view message) {
 
 std::vector<uint8_t> Flatten(const buf::MultiBuffer& payload) {
     std::vector<uint8_t> out;
-    out.reserve(buf::TotalLen(payload));
+    out.reserve(payload.byte_size());
     for (const buf::Buffer* buffer : payload) {
         if (buffer && !buffer->IsEmpty()) {
             const auto bytes = buffer->Bytes();
@@ -161,13 +161,18 @@ void RunResumeCase(vless::VlessEncryptionAeadCipher cipher,
     net::cancellation_signal signal;
     const auto exercise = [&]() -> net::awaitable<void> {
         std::array<uint8_t, vless::kVlessEncryptionCtrIvSize> context{};
-        std::array<uint8_t, vless::kVlessEncryptionAeadKeySize> key{};
+        vless::VlessEncryptionUnitedKey key;
         for (size_t i = 0; i < context.size(); ++i) {
             context[i] = static_cast<uint8_t>(0x31 + i * 7);
         }
-        for (size_t i = 0; i < key.size(); ++i) {
-            key[i] = static_cast<uint8_t>(0xa7 ^ (i * 13));
+        for (size_t i = 0; i < key.bytes.size(); ++i) {
+            key.bytes[i] = static_cast<uint8_t>(0xa7 ^ (i * 13));
         }
+        const auto create_aead = [&] {
+            auto aead = vless::VlessEncryptionAead::Create(context, key.bytes, cipher);
+            Check(aead.has_value(), "failed to create VLESS encryption AEAD");
+            return std::move(*aead);
+        };
 
         std::array<std::vector<uint8_t>, 4> plaintext;
         constexpr std::array<size_t, 4> sizes{37, 4097, 73, 129};
@@ -175,9 +180,9 @@ void RunResumeCase(vless::VlessEncryptionAeadCipher cipher,
         if (lazy_context) {
             capture.bytes.insert(capture.bytes.end(), context.begin(), context.end());
         }
-        auto writer = vless::VlessEncryptionWriter::Create(
-            capture, context, key, cipher, MakeHeaderXor(header_xor, key, context));
-        Check(writer.has_value(), "failed to create VLESS encryption writer");
+        std::optional<vless::VlessEncryptionWriter> writer;
+        writer.emplace(capture, create_aead(), key,
+                       MakeHeaderXor(header_xor, key.bytes, context));
         std::array<size_t, 5> boundaries{};
         for (size_t record = 0; record < plaintext.size(); ++record) {
             auto& data = plaintext[record];
@@ -211,14 +216,18 @@ void RunResumeCase(vless::VlessEncryptionAeadCipher cipher,
             boundaries[2] - 1,
         });
         InterruptedReader source(capture.bytes, cutpoints, signal, empty_on_cancel);
-        auto reader = lazy_context
-            ? std::optional<vless::VlessEncryptionReader>(
-                  vless::VlessEncryptionReader::CreateLazyReadContext(
-                      source, context.size(), key, cipher, header_xor))
-            : vless::VlessEncryptionReader::Create(
-                  source, context, key, cipher,
-                  MakeHeaderXor(header_xor, key, context));
-        Check(reader.has_value(), "failed to create VLESS encryption reader");
+        std::optional<vless::VlessEncryptionReader> reader;
+        if (lazy_context) {
+            reader.emplace(source,
+                           vless::VlessEncryptionDeferredRead{
+                               .cipher = cipher,
+                               .header_xor = header_xor,
+                           },
+                           key, std::nullopt);
+        } else {
+            reader.emplace(source, create_aead(), key,
+                           MakeHeaderXor(header_xor, key.bytes, context));
+        }
 
         size_t decoded = 0;
         size_t cancelled = 0;
@@ -253,9 +262,9 @@ void RunResumeCase(vless::VlessEncryptionAeadCipher cipher,
               "encrypted reader did not exercise every cancellation cutpoint");
         Check(source.Offset() == capture.bytes.size(),
               "encrypted reader left wire bytes unconsumed");
-        Check(!buf::HasData(co_await reader->ReadMultiBuffer()),
+        Check((co_await reader->ReadMultiBuffer()).byte_size() == 0,
               "real encrypted stream EOF returned plaintext");
-        Check(!buf::HasData(co_await reader->ReadMultiBuffer()),
+        Check((co_await reader->ReadMultiBuffer()).byte_size() == 0,
               "repeated encrypted stream EOF returned plaintext");
     };
     auto future = net::co_spawn(io, exercise(),

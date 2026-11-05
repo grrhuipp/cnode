@@ -2,7 +2,6 @@
 import argparse
 import asyncio
 import json
-import os
 from pathlib import Path
 import socket
 import struct
@@ -121,7 +120,6 @@ async def run_live(binary, root, mixed_case=False):
             ([str(binary), "--config-file", str(root / "live" / "config.json")]
              if mixed_case else [str(binary), "--config-dir", str(root / "live")]),
             stdout=logfile, stderr=subprocess.STDOUT,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
         try:
             deadline = time.monotonic() + 10

@@ -1,21 +1,16 @@
 #include "credentials.hpp"
 
+#include "../uuid.hpp"
+#include "acppnode/core/naming.hpp"
+
 #include <openssl/sha.h>
 
 #include <algorithm>
-#include <cctype>
 #include <cstring>
 
 namespace acpp::vless {
 
 namespace {
-
-[[nodiscard]] int HexValue(char c) noexcept {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
-}
 
 [[nodiscard]] std::array<uint8_t, 16>
 MapCustomIdToUuidV5(std::string_view id) noexcept {
@@ -36,30 +31,8 @@ MapCustomIdToUuidV5(std::string_view id) noexcept {
 
 std::optional<std::array<uint8_t, 16>>
 ParseUuidBytes(std::string_view uuid) noexcept {
-    std::array<uint8_t, 16> out{};
-    size_t nibble_index = 0;
-    bool uuid_candidate = true;
-
-    for (char ch : uuid) {
-        if (ch == '-') {
-            continue;
-        }
-        const int value = HexValue(ch);
-        if (value < 0 || nibble_index >= 32) {
-            uuid_candidate = false;
-            break;
-        }
-        const size_t byte_index = nibble_index / 2;
-        if ((nibble_index & 1) == 0) {
-            out[byte_index] = static_cast<uint8_t>(value << 4);
-        } else {
-            out[byte_index] |= static_cast<uint8_t>(value);
-        }
-        ++nibble_index;
-    }
-
-    if (uuid_candidate && nibble_index == 32) {
-        return out;
+    if (auto parsed = proxy::ParseUuid(uuid)) {
+        return parsed;
     }
     if (!uuid.empty() && uuid.size() <= 30) {
         return MapCustomIdToUuidV5(uuid);
@@ -68,11 +41,7 @@ ParseUuidBytes(std::string_view uuid) noexcept {
 }
 
 std::string NormalizeFlow(std::string_view flow) {
-    std::string out(flow);
-    std::ranges::transform(out, out.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
-    return out;
+    return naming::LowerAscii(std::string(flow));
 }
 
 }  // namespace acpp::vless

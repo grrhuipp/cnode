@@ -4,11 +4,12 @@
 #include "reality_tls.hpp"
 #include "acppnode/transport/internet/async_write_gate.hpp"
 #include "acppnode/transport/internet/stream_settings.hpp"
+#include "acppnode/transport/internet/transport_security.hpp"
 #include "acppnode/common/buffer_util.hpp"
-#include "acppnode/common/memory_stats.hpp"
 #include "acppnode/infra/log.hpp"
-#include "acppnode/common/unsafe.hpp"       // ISSUE-02-02: unsafe cast 收敛
+#include "acppnode/common/unsafe.hpp"
 #include "autosign_cert.hpp"
+#include "autosign_context.hpp"
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/tls1.h>
@@ -21,7 +22,9 @@
 #include <span>
 #include <exception>
 #include <climits>
+#include <format>
 #include <optional>
+#include <stdexcept>
 
 namespace acpp {
 
@@ -31,24 +34,30 @@ namespace acpp {
 
 namespace {
 
+[[nodiscard]] bool AlpnWireContains(
+    const unsigned char* wire, unsigned int size, std::string_view protocol) noexcept {
+    for (unsigned int offset = 0; offset < size;) {
+        const unsigned int length = wire[offset++];
+        if (size - offset < length) return false;
+        if (std::string_view(unsafe::ptr_cast<const char>(wire + offset), length) == protocol) {
+            return true;
+        }
+        offset += length;
+    }
+    return false;
+}
+
+// RFC 7301 §3.2: without a common protocol the server answers with a fatal
+// no_application_protocol alert. Like Go crypto/tls (the Xray server), an
+// h2 server still accepts an http/1.1-only client without selecting ALPN.
 int SelectServerAlpnCallback(
-    SSL* ssl,
+    SSL* /*ssl*/,
     const unsigned char** out,
     unsigned char* outlen,
     const unsigned char* in,
     unsigned int inlen,
-    void* /*arg*/) {
-    auto* ctx = static_cast<SslContext*>(
-        SSL_CTX_get_app_data(SSL_get_SSL_CTX(ssl)));
-    if (!ctx) {
-        return SSL_TLSEXT_ERR_NOACK;
-    }
-
-    const auto& configured = ctx->ServerAlpnWire();
-    if (configured.empty()) {
-        return SSL_TLSEXT_ERR_NOACK;
-    }
-
+    void* arg) {
+    const auto& configured = *static_cast<const std::vector<unsigned char>*>(arg);
     unsigned char* selected = nullptr;
     const int rc = SSL_select_next_proto(
         &selected,
@@ -57,11 +66,14 @@ int SelectServerAlpnCallback(
         static_cast<unsigned int>(configured.size()),
         in,
         inlen);
-    if (rc != OPENSSL_NPN_NEGOTIATED || !selected || *outlen == 0) {
-        return SSL_TLSEXT_ERR_NOACK;
+    if (rc == OPENSSL_NPN_NEGOTIATED) {
+        *out = selected;
+        return SSL_TLSEXT_ERR_OK;
     }
-    *out = selected;
-    return SSL_TLSEXT_ERR_OK;
+    const bool http11_fallback =
+        AlpnWireContains(configured.data(), static_cast<unsigned int>(configured.size()), "h2") &&
+        AlpnWireContains(in, inlen, "http/1.1");
+    return http11_fallback ? SSL_TLSEXT_ERR_NOACK : SSL_TLSEXT_ERR_ALERT_FATAL;
 }
 
 }  // namespace
@@ -81,23 +93,13 @@ std::unique_ptr<SslContext> SslContext::CreateServer(const TlsConfig& config) {
         return nullptr;
     }
 
-    // 加载证书
-    if (SSL_CTX_use_certificate_chain_file(ctx, config.cert_file.c_str()) <= 0) {
-        LOG_ERROR("Failed to load certificate: {}", config.cert_file);
+    if (!config.pem) {
+        LOG_ERROR("TLS certificate files were not loaded with the configuration");
         SSL_CTX_free(ctx);
         return nullptr;
     }
-
-    // 加载私钥
-    if (SSL_CTX_use_PrivateKey_file(ctx, config.key_file.c_str(), SSL_FILETYPE_PEM) <= 0) {
-        LOG_ERROR("Failed to load private key: {}", config.key_file);
-        SSL_CTX_free(ctx);
-        return nullptr;
-    }
-
-    // 验证私钥与证书匹配
-    if (!SSL_CTX_check_private_key(ctx)) {
-        LOG_ERROR("Private key does not match certificate");
+    if (!ConfigureTlsCertificatePem(ctx, *config.pem)) {
+        LOG_ERROR("Failed to load TLS certificate: {}", config.cert_file);
         SSL_CTX_free(ctx);
         return nullptr;
     }
@@ -111,16 +113,12 @@ std::unique_ptr<SslContext> SslContext::CreateServer(const TlsConfig& config) {
 }
 
 // ============================================================================
-// 自动签名：根据 SNI 动态生成自签证书
+// 自动签名：启动时为配置域名生成固定自签证书
 // ============================================================================
 
 namespace {
 
-[[noreturn]] void ThrowTlsWriteError(const char* what) {
-    throw IoSystemError(io_error::connection_reset, what);
-}
-
-[[noreturn]] void ThrowTlsReadError(const char* what) {
+[[noreturn]] void ThrowTlsHandshakeFailure(const char* what) {
     throw IoSystemError(io_error::connection_reset, what);
 }
 
@@ -136,13 +134,6 @@ bool IsBenignServerHandshakeError(unsigned long err_code) {
     return false;
 }
 
-struct AutoSignContextState final : SslContext::ContextState {
-    explicit AutoSignContextState(std::string name)
-        : default_name(std::move(name)) {}
-
-    std::string default_name;
-    transport::internet::AutoSignState certificates;
-};
 
 std::string ResolveAutoSignDefaultName(const TlsConfig& config) {
     if (config.server_name.empty()) {
@@ -151,31 +142,28 @@ std::string ResolveAutoSignDefaultName(const TlsConfig& config) {
     return config.server_name;
 }
 
-int AutoSignCertCallback(SSL* ssl, void* arg) {
-    auto* state = static_cast<AutoSignContextState*>(arg);
-    const char* sni = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
-    const std::string certificate_name =
-        sni ? std::string(sni) : state->default_name;
-
-    auto material = state->certificates.GetOrCreate(certificate_name);
-    if (!material.cert || !material.key) return 0;
-
-    if (SSL_use_certificate(ssl, material.cert) != 1 ||
-        SSL_use_PrivateKey(ssl, material.key) != 1) {
-        return 0;
-    }
-    return 1;
-}
-
 
 }  // namespace
 
 std::unique_ptr<SslContext> SslContext::CreateServerAutoSign(const TlsConfig& config) {
-    // 默认证书优先使用配置的 server_name，避免无 SNI 时退回 localhost。
+    auto context = CreateAutoSignSnapshot(config);
+    if (!context) return {};
+    context->renewal_ = AutoSignContextRenewal::Start(
+        context->native_owner_, [config] {
+            auto replacement = CreateAutoSignSnapshot(config);
+            return replacement ? replacement->native_owner_ : std::shared_ptr<SSL_CTX>{};
+        });
+    return context;
+}
+
+std::shared_ptr<SSL_CTX> SslContext::AcquireNative() const noexcept {
+    return renewal_ ? renewal_->Acquire() : native_owner_;
+}
+
+std::unique_ptr<SslContext> SslContext::CreateAutoSignSnapshot(const TlsConfig& config) {
     const std::string default_name = ResolveAutoSignDefaultName(config);
-    auto state = std::make_unique<AutoSignContextState>(default_name);
-    auto default_material = state->certificates.GetOrCreate(default_name);
-    if (!default_material.cert || !default_material.key) {
+    auto material = transport::internet::AutoSignCertificate::Create(default_name);
+    if (!material) {
         LOG_ERROR("默认自签证书生成失败");
         return nullptr;
     }
@@ -190,15 +178,16 @@ std::unique_ptr<SslContext> SslContext::CreateServerAutoSign(const TlsConfig& co
         return nullptr;
     }
 
-    SSL_CTX_use_certificate(ctx, default_material.cert);
-    SSL_CTX_use_PrivateKey(ctx, default_material.key);
+    if (SSL_CTX_use_certificate(ctx, material->Certificate()) != 1 ||
+        SSL_CTX_use_PrivateKey(ctx, material->Key()) != 1) {
+        LOG_ERROR("默认自签证书安装失败");
+        SSL_CTX_free(ctx);
+        return nullptr;
+    }
 
-    SSL_CTX_set_cert_cb(ctx, AutoSignCertCallback, state.get());
-
-    LOG_INFO("TLS 自动签名模式已启用（按 SNI 动态生成证书，默认域名={}）",
+    LOG_INFO("TLS 自动签名证书已构建（配置域名={}，有效期一年，提前30天后台续期）",
              default_name);
-    auto out = std::unique_ptr<SslContext>(
-        new SslContext(ctx, std::move(state)));
+    auto out = std::unique_ptr<SslContext>(new SslContext(ctx));
     if (!out->ConfigureServerAlpn(config.alpn)) {
         LOG_ERROR("Invalid auto-sign TLS ALPN policy");
         return nullptr;
@@ -208,13 +197,71 @@ std::unique_ptr<SslContext> SslContext::CreateServerAutoSign(const TlsConfig& co
 
 bool SslContext::ConfigureServerAlpn(
     const std::vector<std::string>& protocols) {
-    if (!EncodeTlsAlpnProtocols(protocols, server_alpn_wire_)) return false;
+    auto& wire = shared_state_->server_alpn_wire;
+    if (!EncodeTlsAlpnProtocols(protocols, wire)) return false;
 
-    if (!server_alpn_wire_.empty()) {
-        SSL_CTX_set_app_data(ctx_, this);
-        SSL_CTX_set_alpn_select_cb(ctx_, SelectServerAlpnCallback, nullptr);
+    if (!wire.empty()) {
+        SSL_CTX_set_alpn_select_cb(ctx_, SelectServerAlpnCallback, &wire);
     }
     return true;
+}
+
+// ============================================================================
+// TransportSecurity 实现
+// ============================================================================
+
+namespace {
+
+[[nodiscard]] std::unique_ptr<SslContext> CreateSecurityContext(
+    const StreamSettings& settings, StreamEndpointRole role) {
+    if (role == StreamEndpointRole::Inbound) {
+        if (settings.IsReality()) {
+            return SslContext::CreateServerReality(settings.reality, settings.tls);
+        }
+        return settings.tls.HasCertificatePair()
+            ? SslContext::CreateServer(settings.tls)
+            : SslContext::CreateServerAutoSign(settings.tls);
+    }
+    return settings.IsReality()
+        ? SslContext::CreateClientReality(settings.reality, settings.tls)
+        : SslContext::CreateClient(settings.tls);
+}
+
+}  // namespace
+
+TransportSecurity::TransportSecurity(
+    const StreamSettings& settings, StreamEndpointRole role) : role_(role) {
+    if (settings.prepared_security && settings.prepared_security->role_ == role) {
+        context_ = settings.prepared_security->context_;
+        xhttp_download_ = settings.prepared_security->xhttp_download_;
+        return;
+    }
+    if (settings.IsTlsLike()) {
+        context_ = CreateSecurityContext(settings, role);
+        if (!context_) {
+            throw std::invalid_argument(std::format(
+                "cannot build {} {} context",
+                settings.IsReality() ? "REALITY" : "TLS",
+                role == StreamEndpointRole::Inbound ? "server" : "client"));
+        }
+    }
+    if (role == StreamEndpointRole::Outbound && settings.IsXHttp() &&
+        settings.xhttp.download_settings) {
+        xhttp_download_ = std::make_shared<TransportSecurity>(
+            settings.xhttp.download_settings->stream_settings,
+            StreamEndpointRole::Outbound);
+    }
+}
+
+TransportSecurity::~TransportSecurity() = default;
+
+void TransportSecurity::Prepare(StreamSettings& settings, StreamEndpointRole role) {
+    // Build independently first; a failed replacement leaves the published
+    // configuration intact. Avoid inheriting a stale prepared context when a
+    // caller updates TLS/REALITY fields in a copied settings object.
+    auto source = settings;
+    source.prepared_security.reset();
+    settings.prepared_security = std::make_shared<TransportSecurity>(source, role);
 }
 
 // ============================================================================
@@ -290,21 +337,25 @@ struct TlsStream::Impl : memory::ThreadAllocated, private transport::Cancellatio
         bool& active;
     };
 
-    struct PendingReadData : memory::ThreadAllocated {
+    // Decrypted read-ahead returned by a handshake consumer. Heap-held so an
+    // idle connection without read-ahead carries no MultiBuffer state.
+    struct PrependedPlaintext : memory::ThreadAllocated {
         buf::MultiBuffer data;
     };
 
-    Impl(std::unique_ptr<TcpStream> inner, SSL_CTX* context, bool server)
+    Impl(std::unique_ptr<TcpStream> inner, const SslContext& context, bool server)
         : tcp(std::move(inner))
-        , ssl(nullptr, SSL_free)
-        , engine_gate(Executor())
-        , input_gate(Executor()) {
+        , ssl(nullptr, SSL_free) {
+        if (!tcp) throw std::invalid_argument("TlsStream requires TcpStream");
         if (!tls_bio_method)
             throw std::logic_error("TlsStream::InitializeIo must precede Worker startup");
         tcp->PrepareTlsIo();
-        ssl.reset(SSL_new(context));
+        const auto snapshot = context.AcquireNative();
+        if (!snapshot) throw std::runtime_error("TLS certificate expired without a renewed snapshot");
+        ssl.reset(SSL_new(snapshot.get()));
         if (!ssl) throw std::bad_alloc();
         SSL_set_mode(ssl.get(), SSL_MODE_RELEASE_BUFFERS);
+        SSL_set_read_ahead(ssl.get(), 0);
         SSL_set_max_send_fragment(ssl.get(), buf::Buffer::kSize);
         BIO* bio = BIO_new(tls_bio_method.get());
         if (!bio) throw std::bad_alloc();
@@ -321,7 +372,6 @@ struct TlsStream::Impl : memory::ThreadAllocated, private transport::Cancellatio
     }
 
     acpp::tcp::socket::executor_type Executor() {
-        if (!tcp) throw std::invalid_argument("TlsStream requires TcpStream");
         return tcp->GetExecutor();
     }
 
@@ -354,6 +404,10 @@ struct TlsStream::Impl : memory::ThreadAllocated, private transport::Cancellatio
         auto& self = *static_cast<Impl*>(BIO_get_data(bio));
         if (size <= 0) return 0;
         if (!self.invocation) return -1;
+        if (self.raw_read) {
+            self.invocation->transport_error = io_error::operation_not_supported;
+            return -1;
+        }
         IoErrorCode ec;
         const auto n = self.tcp->ReadAvailable(net::buffer(data, size), ec);
         if (n != 0) {
@@ -496,7 +550,7 @@ struct TlsStream::Impl : memory::ThreadAllocated, private transport::Cancellatio
                             lease.Reset();
                         if (turn.previous) {
                             auto [ec] = co_await turn.wake->async_receive(
-                                net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{},
+                                net::bind_allocator(memory::ProcessAllocator<std::byte>{},
                                     net::as_tuple(net::use_awaitable)));
                             if (ec) throw IoSystemError(io_error::operation_aborted);
                             CheckCancellation(epoch);
@@ -550,14 +604,48 @@ struct TlsStream::Impl : memory::ThreadAllocated, private transport::Cancellatio
     net::awaitable<void> Write(std::span<const net::const_buffer> buffers) {
         ActiveDirection active(write_active);
         try {
-            for (auto buffer : buffers) {
-                while (buffer.size() != 0) {
-                    // Bound each application operation's output independently
-                    // of the caller's payload size and keep SSL retries stable.
-                    const auto fragment = net::buffer(
-                        buffer, std::min<std::size_t>(buffer.size(), buf::Buffer::kSize));
-                    const int n = co_await Perform(Kind::Write, {}, fragment);
-                    buffer += static_cast<std::size_t>(n);
+            // Bound each application operation's output independently of the
+            // caller's payload size and keep SSL retries stable. A fragment is
+            // packed across caller buffers: one frame's header and payload
+            // share a record and a TCP send, rather than leaving the payload
+            // record behind the header under Nagle until the peer's delayed ACK.
+            buf::BufferGuard staging;
+            std::size_t index = 0;
+            std::size_t offset = 0;
+            const auto skip_empty = [&] {
+                while (index != buffers.size() && offset == buffers[index].size()) {
+                    ++index;
+                    offset = 0;
+                }
+            };
+            skip_empty();
+            while (index != buffers.size()) {
+                const auto current = buffers[index] + offset;
+                net::const_buffer fragment;
+                if (current.size() >= buf::Buffer::kSize || index + 1 == buffers.size()) {
+                    fragment = net::buffer(
+                        current, std::min<std::size_t>(current.size(), buf::Buffer::kSize));
+                } else {
+                    if (!staging) {
+                        staging = buf::BufferGuard{buf::Buffer::New()};
+                        if (!staging) throw std::bad_alloc();
+                    }
+                    const auto target = staging->Tail();
+                    std::size_t packed = 0;
+                    for (auto i = index, at = offset;
+                         i != buffers.size() && packed != target.size(); ++i, at = 0) {
+                        const auto piece = buffers[i] + at;
+                        packed += net::buffer_copy(
+                            net::buffer(target.data() + packed, target.size() - packed), piece);
+                    }
+                    fragment = net::buffer(target.data(), packed);
+                }
+                auto n = static_cast<std::size_t>(co_await Perform(Kind::Write, {}, fragment));
+                while (n != 0) {
+                    const auto step = std::min(n, buffers[index].size() - offset);
+                    offset += step;
+                    n -= step;
+                    skip_empty();
                 }
             }
         } catch (...) {
@@ -572,7 +660,7 @@ struct TlsStream::Impl : memory::ThreadAllocated, private transport::Cancellatio
     std::unique_ptr<SSL, decltype(&SSL_free)> ssl;
     Gate engine_gate;
     Gate input_gate;
-    std::unique_ptr<PendingReadData> pending_read;
+    std::unique_ptr<PrependedPlaintext> prepended_plaintext;
     Invocation* invocation = nullptr; // Borrowed only inside one synchronous SSL call.
     OutputTurn* output_tail = nullptr;
     net::cancellation_signal* input_wait = nullptr;
@@ -581,6 +669,7 @@ struct TlsStream::Impl : memory::ThreadAllocated, private transport::Cancellatio
     bool read_active = false;
     bool write_active = false;
     bool handshaking = false;
+    bool raw_read = false;
 };
 
 void TlsStream::InitializeIo() {
@@ -595,68 +684,38 @@ void TlsStream::InitializeIo() {
     tls_bio_method = std::move(method);
 }
 
-TlsStream::TlsStream(std::unique_ptr<TcpStream> inner, SSL_CTX* ctx, bool is_server)
+TlsStream::TlsStream(std::unique_ptr<TcpStream> inner, const SslContext& ctx, bool is_server)
     : impl_(std::make_unique<Impl>(std::move(inner), ctx, is_server))
     , is_server_(is_server) {}
 
 TlsStream::~TlsStream() = default;
 
-TlsStream::TlsStream(TlsStream&& other) noexcept
-    : impl_(std::move(other.impl_))
-    , is_server_(other.is_server_)
-    , handshake_done_(other.handshake_done_)
-    , shutdown_initiated_(other.shutdown_initiated_)
-    , reality_client_state_(std::move(other.reality_client_state_)) {
-    other.shutdown_initiated_ = true;
-}
-
-TlsStream& TlsStream::operator=(TlsStream&& other) noexcept {
-    if (this != &other) {
-        impl_ = std::move(other.impl_);
-        is_server_ = other.is_server_;
-        handshake_done_ = other.handshake_done_;
-        shutdown_initiated_ = other.shutdown_initiated_;
-        reality_client_state_ = std::move(other.reality_client_state_);
-        other.shutdown_initiated_ = true;
-    }
-    return *this;
-}
-
+// impl_, its TcpStream and its SSL exist from construction until destruction.
 SSL* TlsStream::NativeSsl() noexcept {
-    return impl_ ? impl_->ssl.get() : nullptr;
+    return impl_->ssl.get();
 }
 
 const SSL* TlsStream::NativeSsl() const noexcept {
-    return impl_ ? impl_->ssl.get() : nullptr;
+    return impl_->ssl.get();
 }
 
 TcpStream* TlsStream::BaseTcpStream() {
-    return impl_ ? impl_->tcp.get() : nullptr;
+    return impl_->tcp.get();
 }
 
 const TcpStream* TlsStream::BaseTcpStream() const {
-    return impl_ ? impl_->tcp.get() : nullptr;
+    return impl_->tcp.get();
 }
 
 bool TlsStream::SetServerIdentity(std::string_view identity) {
-    SSL* ssl = NativeSsl();
-    return !is_server_ && ConfigureTlsServerIdentity(ssl, identity);
-}
-
-bool TlsStream::SetAlpn(std::span<const std::string> protocols) {
-    SSL* ssl = NativeSsl();
-    if (!ssl) return false;
-
-    memory::ByteVector alpn;
-    if (!EncodeTlsAlpnProtocols(protocols, alpn)) return false;
-    return SSL_set_alpn_protos(ssl, alpn.data(), alpn.size()) == 0;
+    return !is_server_ && ConfigureTlsServerIdentity(NativeSsl(), identity);
 }
 
 net::awaitable<bool> TlsStream::Handshake() {
     if (handshake_done_) {
         co_return true;
     }
-    if (!impl_ || !impl_->tcp->IsOpen()) co_return false;
+    if (!impl_->tcp->IsOpen()) co_return false;
     Impl::ActiveDirection active(impl_->handshaking);
 
     struct RealityHandshakeCleanup {
@@ -724,7 +783,6 @@ net::awaitable<bool> TlsStream::Handshake() {
 
 std::string TlsStream::NegotiatedAlpn() const {
     const SSL* ssl = NativeSsl();
-    if (!ssl) return "";
 
     const unsigned char* data = nullptr;
     unsigned int len = 0;
@@ -736,33 +794,48 @@ std::string TlsStream::NegotiatedAlpn() const {
     return "";
 }
 
+bool TlsStream::EnableRawRead() noexcept {
+    if (!handshake_done_ || impl_->handshaking || impl_->read_active ||
+        impl_->invocation || !impl_->tcp->CanRead()) return false;
+    // With read-ahead disabled, completed SSL_read never fetches the next
+    // record. Refuse an outstanding partial encrypted record rather than
+    // losing it or mistaking it for raw Vision bytes.
+    if (SSL_has_pending(NativeSsl()) && SSL_pending(NativeSsl()) == 0) return false;
+    impl_->raw_read = true;
+    return true;
+}
+
 void TlsStream::PrependReadData(std::span<const uint8_t> data) {
     if (data.empty()) return;
-    if (!impl_ || !impl_->tcp->CanRead()) {
+    if (!impl_->tcp->CanRead()) {
         throw IoSystemError(io_error::operation_aborted, "TLS read closed");
     }
     buf::MultiBuffer prefix;
     if (!buf::AppendSpanToMultiBuffer(data, prefix)) {
         throw std::bad_alloc();
     }
-    if (impl_->pending_read) {
-        impl_->pending_read->data.MoveTo(prefix);
+    if (impl_->prepended_plaintext) {
+        impl_->prepended_plaintext->data.MoveTo(prefix);
     } else {
-        impl_->pending_read = std::make_unique<Impl::PendingReadData>();
+        impl_->prepended_plaintext = std::make_unique<Impl::PrependedPlaintext>();
     }
-    impl_->pending_read->data = std::move(prefix);
+    impl_->prepended_plaintext->data = std::move(prefix);
 }
 
 net::awaitable<std::size_t> TlsStream::AsyncRead(net::mutable_buffer buffer) {
-    if (!impl_ || !impl_->tcp->CanRead() || buffer.size() == 0) co_return 0;
-    if (impl_->pending_read) {
-        const auto n = impl_->pending_read->data.ConsumePrefixTo(
+    if (!impl_->tcp->CanRead() || buffer.size() == 0) co_return 0;
+    if (impl_->prepended_plaintext) {
+        const auto n = impl_->prepended_plaintext->data.ConsumePrefixTo(
             std::span<uint8_t>(static_cast<uint8_t*>(buffer.data()), buffer.size()));
-        if (impl_->pending_read->data.empty()) impl_->pending_read.reset();
+        if (impl_->prepended_plaintext->data.empty()) impl_->prepended_plaintext.reset();
         co_return n;
     }
     if (!handshake_done_ && !co_await Handshake())
-        ThrowTlsReadError("TLS handshake failed during read");
+        ThrowTlsHandshakeFailure("TLS handshake failed during read");
+    if (impl_->raw_read && SSL_pending(NativeSsl()) == 0) {
+        Impl::ActiveDirection active(impl_->read_active);
+        co_return co_await impl_->tcp->AsyncRead(buffer);
+    }
     try {
         co_return static_cast<std::size_t>(co_await impl_->Read(buffer, nullptr));
     } catch (const IoSystemError& error) {
@@ -772,14 +845,18 @@ net::awaitable<std::size_t> TlsStream::AsyncRead(net::mutable_buffer buffer) {
 }
 
 net::awaitable<buf::MultiBuffer> TlsStream::ReadMultiBuffer() {
-    if (!impl_ || !impl_->tcp->CanRead()) co_return buf::MultiBuffer{};
-    if (impl_->pending_read) {
-        auto data = std::move(impl_->pending_read->data);
-        impl_->pending_read.reset();
+    if (!impl_->tcp->CanRead()) co_return buf::MultiBuffer{};
+    if (impl_->prepended_plaintext) {
+        auto data = std::move(impl_->prepended_plaintext->data);
+        impl_->prepended_plaintext.reset();
         co_return data;
     }
     if (!handshake_done_ && !co_await Handshake())
-        ThrowTlsReadError("TLS handshake failed during read");
+        ThrowTlsHandshakeFailure("TLS handshake failed during read");
+    if (impl_->raw_read && SSL_pending(NativeSsl()) == 0) {
+        Impl::ActiveDirection active(impl_->read_active);
+        co_return co_await impl_->tcp->ReadMultiBuffer();
+    }
     buf::BufferGuard out;
     try {
         const int n = co_await impl_->Read({}, &out);
@@ -801,17 +878,17 @@ net::awaitable<std::size_t> TlsStream::AsyncWrite(net::const_buffer buffer) {
 
 net::awaitable<void> TlsStream::WriteBuffers(
     std::span<const net::const_buffer> buffers) {
-    if (!impl_ || !impl_->tcp->CanWrite() || shutdown_initiated_)
+    if (!impl_->tcp->CanWrite() || shutdown_initiated_)
         throw IoSystemError(io_error::broken_pipe);
     if (!handshake_done_ && !co_await Handshake())
-        ThrowTlsWriteError("TLS handshake failed during write");
+        ThrowTlsHandshakeFailure("TLS handshake failed during write");
     if (buffers.empty()) co_return;
     if (impl_->tcp->IsWriteCancellationDeferred()) {
         // Isolate the whole physical frame, not just individual socket writes:
         // coroutine cancellation must not abandon later TLS records mid-frame.
         co_await net::co_spawn(impl_->tcp->GetExecutor(), impl_->Write(buffers),
             net::bind_cancellation_slot(net::cancellation_slot{},
-                net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{},
+                net::bind_allocator(memory::ProcessAllocator<std::byte>{},
                     net::use_awaitable)));
     } else {
         co_await impl_->Write(buffers);
@@ -819,33 +896,32 @@ net::awaitable<void> TlsStream::WriteBuffers(
 }
 
 net::awaitable<void> TlsStream::WriteMultiBuffer(buf::MultiBuffer mb) {
-    if (!buf::HasData(mb)) co_return;
+    if (mb.byte_size() == 0) co_return;
     ConstBufferSpanBuilder<8> buffers;
     buffers.AppendMultiBuffer(mb);
     co_await WriteBuffers(buffers.Span());
 }
 
 void TlsStream::ShutdownRead() {
-    if (impl_) {
-        impl_->pending_read.reset();
-        impl_->tcp->ShutdownRead();
-    }
+    impl_->prepended_plaintext.reset();
+    impl_->tcp->ShutdownRead();
 }
 
 void TlsStream::ShutdownWrite() {
     if (handshake_done_ && !shutdown_initiated_) {
         shutdown_initiated_ = true;
     }
-    if (impl_) {
-        impl_->tcp->ShutdownWrite();
-    }
+    impl_->tcp->ShutdownWrite();
 }
 
 net::awaitable<void> TlsStream::AsyncShutdownWrite() {
-    if (!impl_ || shutdown_initiated_) co_return;
+    if (shutdown_initiated_) co_return;
     if (impl_->handshaking) throw std::logic_error("TLS shutdown during handshake");
     shutdown_initiated_ = true;
-    if (handshake_done_ && impl_->tcp->CanWrite()) {
+    // Vision cmd2 removes the outer TLS framing in the peer's raw direction.
+    // An outer close_notify would then corrupt its inner TLS stream. Ordinary
+    // opposite-direction SSL_write remains enabled until this half-close.
+    if (handshake_done_ && impl_->tcp->CanWrite() && !impl_->raw_read) {
         Impl::ActiveDirection active(impl_->write_active);
         try {
             (void)co_await impl_->Perform(Impl::Kind::Shutdown);
@@ -860,34 +936,28 @@ net::awaitable<void> TlsStream::AsyncShutdownWrite() {
 void TlsStream::Close() {
     NotifyClosed();
     shutdown_initiated_ = true;
-    if (impl_) {
-        impl_->pending_read.reset();
-        impl_->tcp->Close();
-    }
+    impl_->prepended_plaintext.reset();
+    impl_->tcp->Close();
 }
 
 void TlsStream::CloseAbortive() {
     NotifyClosed();
     shutdown_initiated_ = true;
-    if (impl_) {
-        impl_->pending_read.reset();
-        impl_->Abort();
-    }
+    impl_->prepended_plaintext.reset();
+    impl_->Abort();
 }
 
 void TlsStream::Cancel() noexcept {
     NotifyCancellation();
-    if (impl_) {
-        impl_->tcp->Cancel();
-    }
+    impl_->tcp->Cancel();
 }
 
 int TlsStream::NativeHandle() const {
-    return impl_ ? impl_->tcp->NativeHandle() : -1;
+    return impl_->tcp->NativeHandle();
 }
 
 bool TlsStream::IsOpen() const {
-    return impl_ && impl_->tcp->IsOpen() && NativeSsl() != nullptr;
+    return impl_->tcp->IsOpen();
 }
 
 
@@ -899,7 +969,7 @@ net::awaitable<std::unique_ptr<TlsStream>> WrapTlsServer(
     std::unique_ptr<TcpStream> inner,
     SslContext& ctx) {
 
-    auto stream = std::make_unique<TlsStream>(std::move(inner), ctx.Native(), true);
+    auto stream = std::make_unique<TlsStream>(std::move(inner), ctx, true);
 
     if (!co_await stream->Handshake()) {
         co_return nullptr;
@@ -911,15 +981,11 @@ net::awaitable<std::unique_ptr<TlsStream>> WrapTlsServer(
 net::awaitable<std::unique_ptr<TlsStream>> WrapTlsClient(
     std::unique_ptr<TcpStream> inner,
     SslContext& ctx,
-    std::string_view server_name,
-    std::span<const std::string> alpn) {
+    std::string_view server_name) {
 
-    auto stream = std::make_unique<TlsStream>(std::move(inner), ctx.Native(), false);
+    auto stream = std::make_unique<TlsStream>(std::move(inner), ctx, false);
 
     if (!server_name.empty() && !stream->SetServerIdentity(server_name)) {
-        co_return nullptr;
-    }
-    if (!alpn.empty() && !stream->SetAlpn(alpn)) {
         co_return nullptr;
     }
 
@@ -934,15 +1000,11 @@ net::awaitable<std::unique_ptr<TlsStream>> WrapRealityClient(
     std::unique_ptr<TcpStream> inner,
     SslContext& ctx,
     const RealityConfig& reality,
-    std::string_view server_name,
-    std::span<const std::string> alpn) {
+    std::string_view server_name) {
 
-    auto stream = std::make_unique<TlsStream>(std::move(inner), ctx.Native(), false);
+    auto stream = std::make_unique<TlsStream>(std::move(inner), ctx, false);
 
     if (!server_name.empty() && !stream->SetServerIdentity(server_name)) {
-        co_return nullptr;
-    }
-    if (!alpn.empty() && !stream->SetAlpn(alpn)) {
         co_return nullptr;
     }
     if (!stream->SetRealityClient(reality)) {

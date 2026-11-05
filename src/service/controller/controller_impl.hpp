@@ -8,6 +8,8 @@
 #include "online_snapshot.hpp"
 #include "node_state.hpp"
 #include "node_transaction.hpp"
+#include "traffic_journal.hpp"
+#include "journal_executor.hpp"
 
 #include <optional>
 #include <string>
@@ -29,6 +31,7 @@ struct Controller::Impl : std::enable_shared_from_this<Controller::Impl> {
     void Start();
     void RequestStop() noexcept;
     net::awaitable<void> AsyncJoin();
+    net::awaitable<void> FlushTraffic();
     void ThrowIfStopping() const;
 
     [[nodiscard]] std::vector<Controller::NodeStatsInfo> GetNodeStats() const;
@@ -40,7 +43,7 @@ struct Controller::Impl : std::enable_shared_from_this<Controller::Impl> {
     net::awaitable<void> userInfoMonitor(PanelRuntime& panel,
                                          const std::string& tag);
 
-    net::awaitable<std::vector<api::UserTraffic>> getTraffic(const std::string& tag);
+    net::awaitable<void> collectTraffic(PanelRuntime& panel, const std::string& tag);
     net::awaitable<controller::OnlineSnapshot>
     GetOnlineSnapshot(const std::string& tag);
 
@@ -53,6 +56,7 @@ struct Controller::Impl : std::enable_shared_from_this<Controller::Impl> {
     const std::vector<std::unique_ptr<Worker>>&  workers_;
     bool stopping_ = false;
     controller::NodeMutationGate node_mutations_;
+    std::unique_ptr<controller::JournalExecutor> journal_executor_;
 
     enum class PanelState {
         Connecting,
@@ -76,6 +80,7 @@ struct Controller::Impl : std::enable_shared_from_this<Controller::Impl> {
         controller::NodeState node;
         controller::NodeMutationGate::Participant mutation;
         NodeStats stats;
+        std::unique_ptr<controller::TrafficJournal> traffic_journal;
         // Active loops retain Impl, which owns these address-stable entities.
         std::weak_ptr<monitor_detail::MonitorLoop> sync_loop;
         std::weak_ptr<monitor_detail::MonitorLoop> status_loop;

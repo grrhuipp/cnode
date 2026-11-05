@@ -22,17 +22,14 @@ struct Context;
 
 using ID = uint64_t;
 
-}  // namespace session
-
-namespace session {
-
 [[nodiscard]] inline std::pmr::memory_resource* SessionPoolResource() noexcept {
     auto* resource = std::pmr::get_default_resource();
     return resource != std::pmr::new_delete_resource()
         ? resource
-        : memory::ThreadPool().resource();
+        : memory::ThreadMemoryPool().resource();
 }
 
+// 高 32 位为 worker_id，低 32 位为 Worker 线程本地序号，避免全局原子计数器的跨线程争用。
 [[nodiscard]] ID NewID(uint32_t worker_id) noexcept;
 
 // xray-core common/session.Inbound 对应的连接入站元数据。
@@ -89,12 +86,10 @@ struct Traffic {
     uint64_t bytes_down = 0;
 };
 
-
 // Per-connection xray-style session metadata. The object itself stays
 // Worker-local; protocol, routing, outbound and relay code read/write the
-// records directly instead of going through the old app-layer context shell.
+// records directly.
 struct Context {
-public:
     // 连接标识
     ID conn_id = 0;
 
@@ -103,7 +98,7 @@ public:
     Content content;
     Traffic traffic;
 
-    // 接入时间戳（微秒，使用 steady_clock），用于访问日志。
+    // 接入时间戳（微秒，Unix 纪元），用于访问日志。
     int64_t accept_time_us = 0;
 
     uint32_t worker_id = 0;
@@ -118,15 +113,6 @@ public:
     Context& operator=(Context&&) = delete;
 
     void InitSubstreamFrom(const Context& parent, uint16_t sub_source_port = 0);
-
-    void CopySubstreamBaseFrom(const Context& parent) {
-        InitSubstreamFrom(parent);
-    }
-
-    // Worker-local reclaimable pool resource.
-    [[nodiscard]] std::pmr::memory_resource* pool() const noexcept {
-        return SessionPoolResource();
-    }
 };
 
 }  // namespace session

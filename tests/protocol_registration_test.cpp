@@ -5,6 +5,7 @@
 #include "acppnode/proxy/inbound.hpp"
 #include "acppnode/transport/async_stream.hpp"
 #include "registration.hpp"
+#include "../src/common/awaitable_task_group.hpp"
 
 #include <iostream>
 #include <stdexcept>
@@ -88,7 +89,7 @@ CreateInboundRuntime() {
 std::unique_ptr<acpp::Inbound> CreateInboundHandler(
     acpp::proxyman::inbound::ProtocolRuntime&,
     acpp::StatsShard&,
-    acpp::ConnectionLimiterPtr,
+    acpp::ConnectionLimiter*,
     const acpp::proxyman::inbound::BuildRequest&) {
     return nullptr;
 }
@@ -96,7 +97,7 @@ std::unique_ptr<acpp::Inbound> CreateInboundHandler(
 std::unique_ptr<acpp::Inbound> FailDatagramHandler(
     acpp::proxyman::inbound::ProtocolRuntime&,
     acpp::StatsShard&,
-    acpp::ConnectionLimiterPtr,
+    acpp::ConnectionLimiter*,
     const acpp::proxyman::inbound::BuildRequest&) {
     return nullptr;
 }
@@ -104,7 +105,7 @@ std::unique_ptr<acpp::Inbound> FailDatagramHandler(
 std::unique_ptr<acpp::Inbound> CreateDatagramHandler(
     acpp::proxyman::inbound::ProtocolRuntime&,
     acpp::StatsShard&,
-    acpp::ConnectionLimiterPtr,
+    acpp::ConnectionLimiter*,
     const acpp::proxyman::inbound::BuildRequest&) {
     return std::make_unique<DummyDatagramHandler>();
 }
@@ -131,7 +132,8 @@ CreateOutboundConfig(
         [](std::string_view tag,
            acpp::net::io_context&,
            acpp::app::dns::DNS&,
-           std::chrono::seconds) -> std::unique_ptr<acpp::Outbound> {
+           std::chrono::seconds,
+           acpp::AwaitableTaskGroup&) -> std::unique_ptr<acpp::Outbound> {
             return std::make_unique<DummyOutbound>(std::string(tag));
         }};
 }
@@ -143,7 +145,8 @@ CreateMismatchedOutboundConfig(
         [](std::string_view,
            acpp::net::io_context&,
            acpp::app::dns::DNS&,
-           std::chrono::seconds) -> std::unique_ptr<acpp::Outbound> {
+           std::chrono::seconds,
+           acpp::AwaitableTaskGroup&) -> std::unique_ptr<acpp::Outbound> {
             return std::make_unique<DummyOutbound>("wrong-tag");
         }};
 }
@@ -155,7 +158,8 @@ CreateNullOutboundConfig(
         [](std::string_view,
            acpp::net::io_context&,
            acpp::app::dns::DNS&,
-           std::chrono::seconds) -> std::unique_ptr<acpp::Outbound> {
+           std::chrono::seconds,
+           acpp::AwaitableTaskGroup&) -> std::unique_ptr<acpp::Outbound> {
             return nullptr;
         }};
 }
@@ -340,8 +344,9 @@ bool TestOutboundRegistration() {
     }
     acpp::net::io_context io_context;
     acpp::app::dns::DNS dns;
+    acpp::ResidentTaskGroup tasks(io_context.get_executor());
     auto handler = acpp::proxyman::outbound::NewHandler(
-        *prepared, io_context, dns, std::chrono::seconds(1));
+        *prepared, io_context, dns, std::chrono::seconds(1), tasks.Tasks());
     if (!handler || handler->Tag() != source.tag) {
         return false;
     }
@@ -353,7 +358,7 @@ bool TestOutboundRegistration() {
     if (!prepared || !Throws<std::logic_error>([&] {
             (void)acpp::proxyman::outbound::NewHandler(
                 *prepared, io_context, dns,
-                std::chrono::seconds(1));
+                std::chrono::seconds(1), tasks.Tasks());
         })) {
         return false;
     }
@@ -365,7 +370,7 @@ bool TestOutboundRegistration() {
     if (!prepared || !Throws<std::logic_error>([&] {
             (void)acpp::proxyman::outbound::NewHandler(
                 *prepared, io_context, dns,
-                std::chrono::seconds(1));
+                std::chrono::seconds(1), tasks.Tasks());
         })) {
         return false;
     }
@@ -375,7 +380,7 @@ bool TestOutboundRegistration() {
     if (!Throws<std::logic_error>([&] {
             (void)acpp::proxyman::outbound::NewHandler(
                 missing_creator, io_context, dns,
-                std::chrono::seconds(1));
+                std::chrono::seconds(1), tasks.Tasks());
         })) {
         return false;
     }

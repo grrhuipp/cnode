@@ -13,26 +13,6 @@
 
 namespace acpp {
 
-// 空闲缓冲区归还当前线程 PMR 池。用完不保留容量。
-template <class ByteContainer>
-inline void ReleaseIdleBuffer(ByteContainer& buf) {
-    if (buf.empty()) {
-        ByteContainer().swap(buf);
-    }
-}
-
-template <class ByteContainer>
-inline void EnsureAppendCapacity(ByteContainer& buf,
-                                 size_t additional,
-                                 size_t min_slack = 8192) {
-    const size_t required = buf.size() + additional;
-    if (required <= buf.capacity()) {
-        return;
-    }
-    const size_t grown = buf.capacity() + (buf.capacity() / 2) + min_slack;
-    buf.reserve(std::max(required, grown));
-}
-
 template <size_t StackCapacity>
 class ConstBufferSpanBuilder {
 public:

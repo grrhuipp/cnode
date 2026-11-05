@@ -19,7 +19,7 @@
 
 namespace acpp {
 
-class TcpStream;  // 前置声明
+class TcpStream;
 class BaseWsStream;  // 允许 WS 包装链透传底层 TCP 能力
 
 // ============================================================================
@@ -243,14 +243,17 @@ private:
 // 超时辅助函数 — relay 层统一判定读/写侧是否因超时被 Cancel
 // ============================================================================
 
-inline bool ConsumeReadSideTimeout(AsyncStream& stream) {
+// Stream 为 AsyncStream 或任何暴露同名 Consume*Timeout 的出站端点/UDP 请求控制面。
+template <typename Stream>
+bool ConsumeReadSideTimeout(Stream& stream) {
     // 不使用 || 短路：两个标志位都需要被消费，避免残留
     bool read  = stream.ConsumeReadTimeout();
     bool idle  = stream.ConsumeIdleTimeout();
     return read || idle;
 }
 
-inline bool ConsumeWriteSideTimeout(AsyncStream& stream) {
+template <typename Stream>
+bool ConsumeWriteSideTimeout(Stream& stream) {
     bool write = stream.ConsumeWriteTimeout();
     bool idle  = stream.ConsumeIdleTimeout();
     return write || idle;

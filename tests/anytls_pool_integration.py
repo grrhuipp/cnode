@@ -10,7 +10,6 @@ import argparse
 import asyncio
 import hashlib
 import json
-import os
 from pathlib import Path
 import socket
 import ssl
@@ -229,7 +228,7 @@ async def run_case(binary, output, minimum, mode='complete', timeouts=None):
                           'port': inbound_port, 'routingEnabled': True,
                           'settings': {'clients': [{'id': str(uuid.UUID(bytes=USER_ID))}]}}],
         'outbounds.json': [{'tag': 'pool-out', 'protocol': 'anytls',
-                           'settings': {'server': '127.0.0.1', 'server_port': peer_port, 'password': 'secret',
+                           'settings': {'address': '127.0.0.1', 'port': peer_port, 'password': 'secret',
                                         'idleSessionCheckInterval': 1, 'idleSessionTimeout': 1,
                                         'minIdleSession': minimum},
                            'streamSettings': {'network': 'tcp', 'security': 'tls',
@@ -243,8 +242,7 @@ async def run_case(binary, output, minimum, mode='complete', timeouts=None):
     result = {'minimum': minimum, 'mode': mode}
     with (output / 'child.log').open('w', encoding='utf-8') as logfile:
         child = subprocess.Popen([str(binary), '--config-dir', str(output)], stdout=logfile,
-                                 stderr=subprocess.STDOUT,
-                                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+                                 stderr=subprocess.STDOUT)
         try:
             deadline = time.monotonic() + 8
             while 'server started' not in (output / 'child.log').read_text(encoding='utf-8', errors='replace'):
@@ -285,7 +283,8 @@ async def run_case(binary, output, minimum, mode='complete', timeouts=None):
         finally:
             if child.poll() is None:
                 child.terminate()
-            child.wait(timeout=5)
+            result['shutdown_exit'] = child.wait(timeout=5)
+            result['passed'] &= result['shutdown_exit'] == 0
             server.close()
             await server.wait_closed()
             await peer.close()

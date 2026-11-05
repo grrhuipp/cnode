@@ -1,5 +1,6 @@
 #include "http2_initial_window.hpp"
-#include "json_unsigned.hpp"
+
+#include "acppnode/infra/json_field.hpp"
 
 #include <utility>
 
@@ -7,6 +8,11 @@ namespace acpp {
 
 tl::expected<std::optional<uint32_t>, std::string>
 ParseHttp2InitialWindow(const json::object& source) {
+    if (source.contains("initial_windows_size") ||
+        source.contains("initial_window_size")) {
+        return tl::unexpected(std::string(
+            "initial_windows_size/initial_window_size is not supported; use initialWindowSize"));
+    }
     auto parsed = ParseJsonUint64(
         source,
         "initialWindowSize",

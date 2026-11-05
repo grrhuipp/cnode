@@ -4,6 +4,7 @@
 
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
+#include "acppnode/transport/async_stream.hpp"
 #include "acppnode/transport/link.hpp"
 
 #include <algorithm>
@@ -17,6 +18,23 @@ namespace acpp::ss::detail {
 
 inline constexpr size_t kStreamChunkPayloadSize =
     buf::Buffer::kSize - (2 + SsAeadCipher::kTagSize) - SsAeadCipher::kTagSize;
+
+[[noreturn]] inline void ThrowSsWriteError(const char* what) {
+    throw IoSystemError(io_error::connection_reset, what);
+}
+
+// Returns false on EOF before len bytes arrived.
+inline net::awaitable<bool> ReadFull(AsyncStream& stream, uint8_t* buf, size_t len) {
+    size_t got = 0;
+    while (got < len) {
+        const size_t r = co_await stream.AsyncRead(net::buffer(buf + got, len - got));
+        if (r == 0) {
+            co_return false;
+        }
+        got += r;
+    }
+    co_return true;
+}
 
 inline std::array<uint8_t, 12> MakeNonce(uint64_t counter) noexcept {
     std::array<uint8_t, 12> nonce{};
@@ -127,21 +145,21 @@ public:
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
         if (failure_) std::rethrow_exception(failure_);
-        if (buf::HasData(plaintext_)) co_return std::move(plaintext_);
+        if (plaintext_.byte_size() != 0) co_return std::move(plaintext_);
         for (;;) {
             try {
                 auto record = DecodePending();
-                if (buf::HasData(record)) co_return record;
+                if (record.byte_size() != 0) co_return record;
             } catch (...) {
                 failure_ = std::current_exception();
                 throw;
             }
             auto raw = co_await stream_.ReadMultiBuffer();
-            if (!buf::HasData(raw)) {
+            if (raw.byte_size() == 0) {
                 const auto cancellation = co_await net::this_coro::cancellation_state;
                 if (cancellation.cancelled() != net::cancellation_type::none)
                     throw IoSystemError(io_error::operation_aborted);
-                if (length_ || buf::HasData(ciphertext_)) {
+                if (length_ || ciphertext_.byte_size() != 0) {
                     try { throw transport::LinkError(ErrorCode::PROTOCOL_DECODE_FAILED); }
                     catch (...) { failure_ = std::current_exception(); throw; }
                 }
@@ -205,7 +223,7 @@ private:
                 throw transport::LinkError(ErrorCode::PROTOCOL_AUTH_FAILED);
             length_.reset();
             ++nonce_;
-            if (buf::HasData(decoded)) return decoded;
+            if (decoded.byte_size() != 0) return decoded;
             // An authenticated zero-length record carries no application data;
             // it is not transport EOF and cannot hide later malformed bytes.
         }

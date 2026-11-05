@@ -66,6 +66,7 @@ void TestMalformedUsersAreRejected() {
     CheckInvalid(R"({"users":[1]})");
     CheckInvalid(R"({"users":[{"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811"}]})");
     CheckInvalid(R"({"users":[{"id":7}]})");
+    CheckInvalid(R"({"users":[{"id":7,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811"},{"id":7,"uuid":"11111111-1111-1111-1111-111111111111"}]})");
 }
 
 }  // namespace

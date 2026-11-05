@@ -25,7 +25,6 @@ struct TargetAddress {
     // DNS 解析后的地址
     std::optional<net::ip::address> resolved_addr;
 
-    // 构造函数
     TargetAddress() = default;
 
     TargetAddress(std::string_view h, uint16_t p)
@@ -45,7 +44,6 @@ struct TargetAddress {
         }
     }
 
-    // 判断是否有效
     bool IsValid() const {
         if (port == 0) return false;
         switch (type) {
@@ -73,12 +71,10 @@ struct TargetAddress {
                *resolved_addr == *other.resolved_addr;
     }
 
-    // 判断是否为域名
     bool IsDomain() const {
         return type == AddressType::Domain;
     }
 
-    // 判断是否为 IP
     bool IsIP() const {
         return type == AddressType::IPv4 || type == AddressType::IPv6;
     }
@@ -91,19 +87,6 @@ struct TargetAddress {
         return type == AddressType::IPv6;
     }
 
-
-    // Writes into the caller's owning string, using its allocator and capacity.
-    // Numeric addresses are formatted through stack storage.
-    template<class Allocator>
-    void ToStringInto(std::basic_string<char, std::char_traits<char>, Allocator>& out) const {
-        if (host.empty() && resolved_addr) {
-            iputil::FormatEndpointForLogInto(out, iputil::AddressText(*resolved_addr).View(), port);
-            return;
-        }
-        iputil::FormatEndpointForLogInto(out, std::string_view(host.data(), host.size()), port);
-    }
-
-    // 从字符串解析
     [[nodiscard]]
     static std::optional<TargetAddress> Parse(std::string_view addr);
 
@@ -150,7 +133,6 @@ private:
     }
 };
 
-// 从字符串解析地址
 inline std::optional<TargetAddress> TargetAddress::Parse(std::string_view addr) {
     if (addr.empty()) {
         return std::nullopt;
@@ -187,9 +169,12 @@ inline std::optional<TargetAddress> TargetAddress::Parse(std::string_view addr) 
     }
 
     TargetAddress target(host, port);
-    if (addr.front() == '[') {
-        const auto literal = iputil::ParseLiteral(host);
-        if (!literal || !literal->is_v6()) return std::nullopt;
+    // Brackets must enclose exactly an IPv6 literal. ParseLiteral takes the
+    // IPv6 path iff the text contains ':', and v4-mapped literals normalize to
+    // IPv4, so the bracket check uses the source text rather than the type.
+    if (addr.front() == '[' &&
+        (!target.IsIP() || host.find(':') == std::string_view::npos)) {
+        return std::nullopt;
     }
     if (!target.IsValid()) {
         return std::nullopt;

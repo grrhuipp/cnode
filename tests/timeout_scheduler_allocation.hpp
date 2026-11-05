@@ -1,8 +1,9 @@
 #pragma once
 
-// Test-only forced include: intercept Asio's actual aligned allocation path,
-// including _aligned_malloc on Windows. Production targets and dependency
-// sources are unchanged; the original allocation/deallocation pair is kept.
+// Test-only forced include: enable the process allocation boundary fault seam
+// in every translation unit, including native timer initiation under mimalloc,
+// and intercept Asio's remaining aligned allocation paths.
+#define CNODE_TEST_ALLOCATOR_FAULT
 #include <asio/detail/memory.hpp>
 
 #include <cstddef>

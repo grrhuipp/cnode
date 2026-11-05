@@ -23,7 +23,7 @@ int main() {
     try {
         PreparedVmessUser user;
         user.uuid = "11111111-1111-1111-1111-111111111111";
-        user.cached_auth_aes_key.fill(0x19);
+        user.auth_key.fill(0x19);
         user.profile.user_id = 1;
         constexpr auto tag = "snapshot-lifetime";
         const UserSet users = PreparedVmessUsers{user};
@@ -32,7 +32,8 @@ int main() {
         const auto now = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
         std::array<uint8_t, 16> auth;
-        acpp::vmess::GenerateAuthID(user.cached_auth_aes_key.data(), now, auth.data());
+        acpp::vmess::GenerateAuthID(
+            acpp::vmess::ExpandAuthIDEncryptKey(user.auth_key), now, auth.data());
         int64_t timestamp = 0;
         auto authenticated = validator.FindByAuthIDForTag(tag, auth.data(), timestamp);
         Check(authenticated && timestamp == now, "authentication failed");
@@ -51,7 +52,7 @@ int main() {
 
         PreparedVmessUser other = user;
         other.uuid = "22222222-2222-2222-2222-222222222222";
-        other.cached_auth_aes_key.fill(0x27);
+        other.auth_key.fill(0x27);
         other.profile.user_id = 2;
         const UserSet other_users = PreparedVmessUsers{other};
         const std::array updates{
@@ -61,7 +62,8 @@ int main() {
               "preparation changed an installed Worker view");
         Commit(std::move(prepared));
         std::array<uint8_t, 16> other_auth;
-        acpp::vmess::GenerateAuthID(other.cached_auth_aes_key.data(), now, other_auth.data());
+        acpp::vmess::GenerateAuthID(
+            acpp::vmess::ExpandAuthIDEncryptKey(other.auth_key), now, other_auth.data());
         for (int round = 0; round < 64; ++round) {
             auto first = validator.FindByAuthIDForTag(tag, auth.data(), timestamp);
             auto second = validator.FindByAuthIDForTag("other-tag", other_auth.data(), timestamp);

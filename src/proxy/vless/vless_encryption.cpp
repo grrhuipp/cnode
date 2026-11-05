@@ -1,6 +1,7 @@
 #include "vless_encryption.hpp"
 
 #include "vless_encryption_crypto.hpp"
+#include "acppnode/common/binary_text_codec.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -41,51 +42,6 @@ constexpr int kMaxPaddingLength = 18 + 65535;
     return true;
 }
 
-[[nodiscard]] int Base64RawUrlValue(char c) noexcept {
-    if (c >= 'A' && c <= 'Z') {
-        return c - 'A';
-    }
-    if (c >= 'a' && c <= 'z') {
-        return c - 'a' + 26;
-    }
-    if (c >= '0' && c <= '9') {
-        return c - '0' + 52;
-    }
-    if (c == '-') {
-        return 62;
-    }
-    if (c == '_') {
-        return 63;
-    }
-    return -1;
-}
-
-[[nodiscard]] std::optional<std::vector<uint8_t>> DecodeRawUrlBase64(
-    std::string_view value) {
-    if (value.empty() || value.find('=') != std::string_view::npos ||
-        value.size() % 4 == 1) {
-        return std::nullopt;
-    }
-
-    std::vector<uint8_t> out;
-    out.reserve(value.size() * 3 / 4);
-    uint32_t bits = 0;
-    int bit_count = 0;
-    for (char c : value) {
-        const int v = Base64RawUrlValue(c);
-        if (v < 0) {
-            return std::nullopt;
-        }
-        bits = (bits << 6) | static_cast<uint32_t>(v);
-        bit_count += 6;
-        if (bit_count >= 8) {
-            bit_count -= 8;
-            out.push_back(static_cast<uint8_t>((bits >> bit_count) & 0xff));
-        }
-    }
-    return out;
-}
-
 [[nodiscard]] VlessEncryptionParseError ParseMode(
     std::string_view value,
     VlessEncryptionMode& out) noexcept {
@@ -104,32 +60,18 @@ constexpr int kMaxPaddingLength = 18 + 65535;
     return VlessEncryptionParseError::InvalidMode;
 }
 
-[[nodiscard]] std::vector<std::string_view> SplitDot(std::string_view value) {
+[[nodiscard]] std::vector<std::string_view> Split(std::string_view value,
+                                                  char separator) {
     std::vector<std::string_view> parts;
     size_t start = 0;
     while (start <= value.size()) {
-        const size_t dot = value.find('.', start);
-        if (dot == std::string_view::npos) {
+        const size_t pos = value.find(separator, start);
+        if (pos == std::string_view::npos) {
             parts.push_back(value.substr(start));
             break;
         }
-        parts.push_back(value.substr(start, dot - start));
-        start = dot + 1;
-    }
-    return parts;
-}
-
-[[nodiscard]] std::vector<std::string_view> SplitHyphen(std::string_view value) {
-    std::vector<std::string_view> parts;
-    size_t start = 0;
-    while (start <= value.size()) {
-        const size_t hyphen = value.find('-', start);
-        if (hyphen == std::string_view::npos) {
-            parts.push_back(value.substr(start));
-            break;
-        }
-        parts.push_back(value.substr(start, hyphen - start));
-        start = hyphen + 1;
+        parts.push_back(value.substr(start, pos - start));
+        start = pos + 1;
     }
     return parts;
 }
@@ -137,9 +79,9 @@ constexpr int kMaxPaddingLength = 18 + 65535;
 [[nodiscard]] VlessEncryptionParseError ParsePadding(
     const std::vector<std::string_view>& parts,
     VlessEncryptionConfig& out) {
-    int max_len = 0;
+    int64_t max_len = 0;
     for (size_t i = 0; i < parts.size(); ++i) {
-        const auto fields = SplitHyphen(parts[i]);
+        const auto fields = Split(parts[i], '-');
         if (fields.size() < 3 || fields[0].empty() ||
             fields[1].empty() || fields[2].empty()) {
             return VlessEncryptionParseError::InvalidPadding;
@@ -159,14 +101,14 @@ constexpr int kMaxPaddingLength = 18 + 65535;
             return VlessEncryptionParseError::InvalidPadding;
         }
 
+        // Odd parts are inter-fragment gaps; the handshake writes padding as
+        // one block, so they are validated but not retained.
         if (i % 2 == 0) {
             out.padding_lens.push_back(padding);
             max_len += std::max(padding.from, padding.to);
             if (max_len > kMaxPaddingLength) {
                 return VlessEncryptionParseError::PaddingTooLarge;
             }
-        } else {
-            out.padding_gaps.push_back(padding);
         }
     }
     return VlessEncryptionParseError::None;
@@ -182,7 +124,7 @@ VlessEncryptionParseResult ParseErrorResult(VlessEncryptionParseError error) {
 [[nodiscard]] VlessEncryptionParseResult ParseVlessEncryption(
     std::string_view value,
     VlessEncryptionRole role) {
-    auto parts = SplitDot(value);
+    auto parts = Split(value, '.');
     if (parts.size() < 4) {
         return ParseErrorResult(VlessEncryptionParseError::TooFewParts);
     }
@@ -231,25 +173,25 @@ VlessEncryptionParseResult ParseErrorResult(VlessEncryptionParseError error) {
             continue;
         }
 
-        auto key = DecodeRawUrlBase64(part);
-        if (!key) {
+        std::vector<uint8_t> key(Base64UrlDecodedSize(part.size()));
+        if (!DecodeBase64Url(part, key)) {
             return ParseErrorResult(VlessEncryptionParseError::InvalidBase64);
         }
-        const size_t len = key->size();
+        const size_t len = key.size();
         if (role == VlessEncryptionRole::Client) {
             if (len == kVlessX25519KeySize) {
                 config.client_keys.push_back(VlessClientPfsKey{
-                    .public_key = std::move(*key),
+                    .public_key = std::move(key),
                     .mlkem_key = nullptr,
                 });
             } else if (len == kVlessMlKem768PublicKeySize) {
-                auto mlkem_key = CreateVlessMlKem768PublicKey(*key);
+                auto mlkem_key = CreateVlessMlKem768PublicKey(key);
                 if (!mlkem_key) {
                     return ParseErrorResult(
                         VlessEncryptionParseError::InvalidKeyMaterial);
                 }
                 config.client_keys.push_back(VlessClientPfsKey{
-                    .public_key = std::move(*key),
+                    .public_key = std::move(key),
                     .mlkem_key = std::move(mlkem_key),
                 });
             } else {
@@ -259,25 +201,25 @@ VlessEncryptionParseResult ParseErrorResult(VlessEncryptionParseError error) {
         } else {
             if (len == kVlessX25519KeySize) {
                 std::array<uint8_t, kVlessX25519KeySize> public_key{};
-                if (!DeriveVlessX25519PublicKey(*key, public_key)) {
+                if (!DeriveVlessX25519PublicKey(key, public_key)) {
                     return ParseErrorResult(
                         VlessEncryptionParseError::InvalidKeyMaterial);
                 }
                 config.server_keys.push_back(VlessServerPfsKey{
-                    .private_key = std::move(*key),
+                    .private_key = std::move(key),
                     .public_key = std::vector<uint8_t>(
                         public_key.begin(), public_key.end()),
                     .mlkem_key = nullptr,
                 });
             } else if (len == kVlessMlKem768SeedSize) {
-                auto mlkem_key = CreateVlessMlKem768PrivateKeyFromSeed(*key);
+                auto mlkem_key = CreateVlessMlKem768PrivateKeyFromSeed(key);
                 auto public_key = DeriveVlessMlKem768PublicKey(mlkem_key.get());
                 if (!mlkem_key || !public_key) {
                     return ParseErrorResult(
                         VlessEncryptionParseError::InvalidKeyMaterial);
                 }
                 config.server_keys.push_back(VlessServerPfsKey{
-                    .private_key = std::move(*key),
+                    .private_key = std::move(key),
                     .public_key = std::vector<uint8_t>(
                         public_key->begin(), public_key->end()),
                     .mlkem_key = std::move(mlkem_key),
@@ -311,18 +253,6 @@ VlessEncryptionParseResult ParseErrorResult(VlessEncryptionParseError error) {
 
 bool IsNoVlessEncryption(std::string_view value) noexcept {
     return value.empty() || value == "none";
-}
-
-uint32_t VlessEncryptionXorModeValue(VlessEncryptionMode mode) noexcept {
-    switch (mode) {
-    case VlessEncryptionMode::Native:
-        return 0;
-    case VlessEncryptionMode::XorPub:
-        return 1;
-    case VlessEncryptionMode::Random:
-        return 2;
-    }
-    return 0;
 }
 
 VlessEncryptionParseResult ParseVlessClientEncryption(

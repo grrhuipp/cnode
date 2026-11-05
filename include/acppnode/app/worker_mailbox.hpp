@@ -9,13 +9,13 @@
 #include <asio/experimental/channel.hpp>
 #include <asio/this_coro.hpp>
 #include <asio/use_awaitable.hpp>
-#include <asio/use_future.hpp>
 
 #include <atomic>
+#include <concepts>
 #include <memory>
 #include <cstddef>
 #include <exception>
-#include <future>
+#include <functional>
 #include <limits>
 #include <stdexcept>
 #include <type_traits>
@@ -35,14 +35,14 @@ public:
 class WorkerMailbox {
 public:
     WorkerMailbox(net::io_context& io_context, size_t capacity)
-        : io_context_(io_context), capacity_(capacity == 0 ? 1 : capacity),
+        : io_context_(io_context), capacity_(capacity),
           joined_(std::make_unique<CompletionChannel>(io_context, 1)) {
-        if (capacity_ >= kClosed) throw std::invalid_argument("mailbox capacity");
+        if (capacity_ == 0 || capacity_ >= kClosed)
+            throw std::invalid_argument("mailbox capacity");
     }
     WorkerMailbox(const WorkerMailbox&) = delete;
     WorkerMailbox& operator=(const WorkerMailbox&) = delete;
 
-    [[nodiscard]] size_t Capacity() const noexcept { return capacity_; }
     [[nodiscard]] size_t Outstanding() const noexcept {
         return state_.load(std::memory_order_acquire) & ~kClosed;
     }
@@ -62,6 +62,7 @@ public:
         joined_.reset();
     }
 
+    // Runs an owner-executor coroutine that may genuinely suspend.
     template <typename T>
     net::awaitable<T> Post(net::awaitable<T> task) {
         Slot slot = Acquire();
@@ -73,16 +74,19 @@ public:
                 RunHeld(std::move(slot), std::move(task)), net::use_awaitable);
         }
     }
-    template <typename T>
-    std::future<T> PostForFuture(net::awaitable<T> task) {
-        try {
-            Slot slot = Acquire();
-            return net::co_spawn(io_context_.get_executor(),
-                RunHeld(std::move(slot), std::move(task)), net::use_future);
-        } catch (...) {
-            std::promise<T> rejected;
-            rejected.set_exception(std::current_exception());
-            return rejected.get_future();
+    // Runs a synchronous, self-contained callable on the owner executor. Only
+    // the cross-thread hop and the completion back to the caller are
+    // asynchronous; the owner-side frame exists solely to carry that result.
+    template <typename Fn>
+        requires std::invocable<Fn&>
+    net::awaitable<std::invoke_result_t<Fn&>> PostCall(Fn fn) {
+        Slot slot = Acquire();
+        if constexpr (std::is_void_v<std::invoke_result_t<Fn&>>) {
+            co_await net::co_spawn(io_context_.get_executor(),
+                CallHeld(std::move(slot), std::move(fn)), net::use_awaitable);
+        } else {
+            co_return co_await net::co_spawn(io_context_.get_executor(),
+                CallHeld(std::move(slot), std::move(fn)), net::use_awaitable);
         }
     }
 
@@ -132,6 +136,12 @@ private:
     static net::awaitable<T> RunHeld([[maybe_unused]] Slot slot, net::awaitable<T> task) {
         if constexpr (std::is_void_v<T>) co_await std::move(task);
         else co_return co_await std::move(task);
+    }
+    template <typename Fn>
+    static net::awaitable<std::invoke_result_t<Fn&>> CallHeld(
+        [[maybe_unused]] Slot slot, Fn fn) {
+        if constexpr (std::is_void_v<std::invoke_result_t<Fn&>>) { std::invoke(fn); co_return; }
+        else co_return std::invoke(fn);
     }
 
     net::io_context& io_context_;

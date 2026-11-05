@@ -42,6 +42,9 @@ public:
     // Main-executor only. Stop is terminal; join waits every started loop.
     void RequestStop() noexcept;
     net::awaitable<void> AsyncJoin();
+    // After AsyncJoin and session drain, while Worker control queues remain open.
+    // Persists final deltas for next startup; throws on any durability failure.
+    net::awaitable<void> FlushTraffic();
 
     struct NodeStatsInfo {
         std::string panel_name;

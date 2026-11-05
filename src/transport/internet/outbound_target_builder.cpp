@@ -1,46 +1,19 @@
 #include "acppnode/transport/internet/outbound_target_builder.hpp"
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/ip_address.hpp"
+#include "acppnode/transport/internet/http_headers.hpp"
 
 #include "acppnode/app/dns/dns.hpp"
 #include "acppnode/common/ip_utils.hpp"
 #include "acppnode/core/constants.hpp"
 
 #include <algorithm>
-#include <cctype>
 #include <memory>
 #include <utility>
 
 namespace acpp {
 
-net::awaitable<tl::expected<OutboundTransportTarget, ErrorCode>>
-BuildOutboundTransportTargetInternal(OutboundTargetOptions options,
-                                     bool allow_xhttp_download);
-
 namespace {
-
-std::optional<net::ip::address> SelectBindAddress(
-    const OutboundBind& bind,
-    const tcp::endpoint* inbound_local_addr,
-    const net::ip::address& remote_addr) {
-    if (bind.GetMode() == OutboundBind::Mode::Explicit) {
-        return bind.ExplicitAddress();
-    }
-    if (bind.GetMode() != OutboundBind::Mode::Auto || !inbound_local_addr) {
-        return std::nullopt;
-    }
-
-    const auto inbound_local =
-        iputil::NormalizeAddress(inbound_local_addr->address());
-    if (inbound_local.is_unspecified() || inbound_local.is_loopback()) {
-        return std::nullopt;
-    }
-    if ((remote_addr.is_v4() && inbound_local.is_v4()) ||
-        (remote_addr.is_v6() && inbound_local.is_v6())) {
-        return inbound_local;
-    }
-    return std::nullopt;
-}
 
 void AppendCandidate(
     OutboundTransportTarget& target,
@@ -50,7 +23,7 @@ void AppendCandidate(
     uint16_t port) {
     OutboundDialCandidate candidate;
     candidate.endpoint = tcp::endpoint(remote_addr, port);
-    candidate.bind_local = SelectBindAddress(bind, inbound_local_addr, remote_addr);
+    candidate.bind_local = bind.BindAddressFor(inbound_local_addr, remote_addr);
     target.candidates.push_back(std::move(candidate));
 }
 
@@ -67,133 +40,31 @@ bool WantsIPv6(const OutboundBind& bind, const tcp::endpoint* inbound_local_addr
            !inbound_local.is_loopback();
 }
 
-[[nodiscard]] char LowerAsciiChar(char ch) {
-    return static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-}
-
-[[nodiscard]] bool EqualsAsciiCI(std::string_view lhs, std::string_view rhs) {
-    if (lhs.size() != rhs.size()) {
-        return false;
-    }
-    for (size_t i = 0; i < lhs.size(); ++i) {
-        if (LowerAsciiChar(lhs[i]) != LowerAsciiChar(rhs[i])) {
-            return false;
-        }
-    }
-    return true;
-}
-
-[[nodiscard]] std::string_view FindHttpHeaderCI(
-    const transport::internet::HttpHeaders& headers,
-    std::string_view name) {
-    for (const auto& [key, value] : headers) {
-        if (EqualsAsciiCI(key, name)) {
-            return value;
-        }
-    }
-    return {};
-}
-
-[[nodiscard]] memory::ThreadLocalString FormatOutboundHostHeader(
-    std::string_view fallback_host,
-    uint16_t port,
-    bool use_ssl) {
-    memory::ThreadLocalString out;
-    iputil::FormatHttpHostHeaderInto(out, fallback_host, port, use_ssl);
-    return out;
-}
-
-[[nodiscard]] memory::ThreadLocalString BuildWsHostHeader(
-    const StreamSettings& settings,
-    std::string_view fallback_host,
-    uint16_t port) {
-    if (!settings.IsWs()) {
-        return {};
-    }
-    if (const std::string_view explicit_host = FindHttpHeaderCI(settings.ws.headers, "Host");
-        !explicit_host.empty()) {
-        return memory::ThreadLocalString(explicit_host);
-    }
-    return FormatOutboundHostHeader(fallback_host, port, settings.IsTls());
-}
-
-[[nodiscard]] memory::ThreadLocalString BuildHttpUpgradeHostHeader(
-    const StreamSettings& settings,
-    std::string_view fallback_host,
-    uint16_t port) {
-    if (!settings.IsHttpUpgrade()) {
-        return {};
-    }
-    if (!settings.http_upgrade.host.empty()) {
-        return memory::ThreadLocalString(settings.http_upgrade.host);
-    }
-    if (const std::string_view explicit_host =
-            FindHttpHeaderCI(settings.http_upgrade.headers, "Host");
-        !explicit_host.empty()) {
-        return memory::ThreadLocalString(explicit_host);
-    }
-    return FormatOutboundHostHeader(fallback_host, port, settings.IsTls());
-}
-
-[[nodiscard]] memory::ThreadLocalString BuildGrpcAuthority(
-    const StreamSettings& settings,
-    std::string_view fallback_host,
-    uint16_t port) {
-    if (!settings.IsGrpc()) {
-        return {};
-    }
-    if (!settings.grpc.authority.empty()) {
-        return memory::ThreadLocalString(settings.grpc.authority);
-    }
-    if (settings.IsReality()) {
-        return {};
-    }
-    return FormatOutboundHostHeader(fallback_host, port, settings.IsTls());
-}
-
-[[nodiscard]] memory::ThreadLocalString BuildXHttpHostHeader(
-    const StreamSettings& settings,
-    std::string_view fallback_host,
-    uint16_t port) {
-    if (!settings.IsXHttp()) {
-        return {};
-    }
-    if (!settings.xhttp.host.empty()) {
-        return memory::ThreadLocalString(settings.xhttp.host);
-    }
-    if (const std::string_view explicit_host =
-            FindHttpHeaderCI(settings.xhttp.headers, "Host");
-        !explicit_host.empty()) {
-        return memory::ThreadLocalString(explicit_host);
-    }
-    return FormatOutboundHostHeader(fallback_host, port, settings.IsTls());
-}
-
+// The explicit host is resolved once by stream-settings normalization; only
+// the dial-address fallback is formatted per target.
 [[nodiscard]] memory::ThreadLocalString BuildHttpHostHeader(
     const StreamSettings& settings,
     std::string_view fallback_host,
     uint16_t port) {
-    if (settings.IsWs()) {
-        return BuildWsHostHeader(settings, fallback_host, port);
+    if (!settings.IsWs() && !settings.IsHttpUpgrade() &&
+        !settings.IsGrpc() && !settings.IsXHttp()) {
+        return {};
     }
-    if (settings.IsHttpUpgrade()) {
-        return BuildHttpUpgradeHostHeader(settings, fallback_host, port);
+    if (!settings.configured_http_host.empty()) {
+        return memory::ThreadLocalString(settings.configured_http_host);
     }
-    if (settings.IsGrpc()) {
-        return BuildGrpcAuthority(settings, fallback_host, port);
+    if (settings.IsGrpc() && settings.IsReality()) {
+        return {};
     }
-    if (settings.IsXHttp()) {
-        return BuildXHttpHostHeader(settings, fallback_host, port);
-    }
-    return {};
+    memory::ThreadLocalString out;
+    iputil::FormatHttpHostHeaderInto(out, fallback_host, port, settings.IsTls());
+    return out;
 }
 
 net::awaitable<tl::expected<OutboundTransportTarget, ErrorCode>>
 AttachXHttpDownloadTarget(OutboundTransportTarget target,
-                          const OutboundTargetOptions& options,
-                          bool allow_xhttp_download) {
-    if (!allow_xhttp_download ||
-        !options.stream_settings ||
+                          const OutboundTargetOptions& options) {
+    if (!options.stream_settings ||
         !options.stream_settings->IsXHttp() ||
         !options.stream_settings->xhttp.download_settings) {
         co_return target;
@@ -208,19 +79,23 @@ AttachXHttpDownloadTarget(OutboundTransportTarget target,
     if (download.address.empty() || download.port == 0) {
         co_return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
     }
+    // A download target never carries its own downloadSettings; reject rather
+    // than silently ignore a nested one.
     if (!download.stream_settings.IsXHttp() ||
         download.stream_settings.IsUnsupported() ||
-        download.stream_settings.xhttp.IsStreamOne()) {
+        download.stream_settings.xhttp.IsStreamOne() ||
+        download.stream_settings.xhttp.download_settings) {
         co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
     }
 
-    auto download_target = co_await BuildOutboundTransportTargetInternal(
+    auto download_target = co_await BuildOutboundTransportTarget(
         OutboundTargetOptions{
             .dns_service = options.dns_service,
             .address = download.address,
             .literal_address = std::nullopt,
             .port = download.port,
             .stream_settings = &download.stream_settings,
+            .security = options.security ? options.security->XHttpDownload() : nullptr,
             .timeout = options.timeout,
             .send_through = &download.send_through,
             .inbound_local_addr = options.inbound_local_addr,
@@ -230,8 +105,7 @@ AttachXHttpDownloadTarget(OutboundTransportTarget target,
                 download.stream_settings,
                 download.address),
             .ws_host = download.address,
-        },
-        false);
+        });
     if (!download_target) {
         co_return tl::unexpected(download_target.error());
     }
@@ -253,8 +127,7 @@ std::string_view ResolveOutboundTlsServerName(
 }
 
 net::awaitable<tl::expected<OutboundTransportTarget, ErrorCode>>
-BuildOutboundTransportTargetInternal(OutboundTargetOptions options,
-                                     bool allow_xhttp_download) {
+BuildOutboundTransportTarget(OutboundTargetOptions options) {
     if (!options.stream_settings || options.port == 0) {
         co_return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
     }
@@ -276,22 +149,9 @@ BuildOutboundTransportTargetInternal(OutboundTargetOptions options,
         : OutboundBind::Selection{};
 
     OutboundTransportTarget target;
-    switch (bind.GetMode()) {
-        case OutboundBind::Mode::None:
-            target.bind_mode = OutboundTransportTarget::BindMode::None;
-            break;
-        case OutboundBind::Mode::Auto:
-            target.bind_mode = OutboundTransportTarget::BindMode::Auto;
-            break;
-        case OutboundBind::Mode::Explicit:
-            target.bind_mode = OutboundTransportTarget::BindMode::Explicit;
-            break;
-        case OutboundBind::Mode::Ordered:
-            target.bind_mode = OutboundTransportTarget::BindMode::Ordered;
-            break;
-    }
     target.timeout = options.timeout;
     target.stream_settings = options.stream_settings;
+    target.security_context = options.security ? options.security->Context() : nullptr;
     target.tls_server_name = options.tls_server_name;
     target.ws_host = BuildHttpHostHeader(
         *options.stream_settings,
@@ -305,25 +165,18 @@ BuildOutboundTransportTargetInternal(OutboundTargetOptions options,
             const auto& selected = remote_addr.is_v6() ? ordered_v6 : ordered_v4;
             candidate.bind_local = selected.address;
         } else {
-            candidate.bind_local = SelectBindAddress(
-                bind, options.inbound_local_addr, remote_addr);
+            candidate.bind_local = bind.BindAddressFor(options.inbound_local_addr, remote_addr);
         }
         target.single_candidate = std::move(candidate);
     };
 
     if (options.literal_address) {
         append_single(*options.literal_address);
-        co_return co_await AttachXHttpDownloadTarget(
-            std::move(target),
-            options,
-            allow_xhttp_download);
+        co_return co_await AttachXHttpDownloadTarget(std::move(target), options);
     }
     if (auto literal = iputil::ParseLiteral(options.address)) {
         append_single(*literal);
-        co_return co_await AttachXHttpDownloadTarget(
-            std::move(target),
-            options,
-            allow_xhttp_download);
+        co_return co_await AttachXHttpDownloadTarget(std::move(target), options);
     }
     if (!options.dns_service) {
         co_return tl::unexpected(ErrorCode::DNS_RESOLVE_FAILED);
@@ -349,8 +202,7 @@ BuildOutboundTransportTargetInternal(OutboundTargetOptions options,
             target.single_candidate = std::move(target.candidates.front());
             target.candidates.clear();
         }
-        co_return co_await AttachXHttpDownloadTarget(
-            std::move(target), options, allow_xhttp_download);
+        co_return co_await AttachXHttpDownloadTarget(std::move(target), options);
     }
 
     const bool wants_v6 = WantsIPv6(bind, options.inbound_local_addr);
@@ -362,10 +214,7 @@ BuildOutboundTransportTargetInternal(OutboundTargetOptions options,
         for (const auto& addr : dns_result.addresses) {
             if (addr.is_v6()) {
                 append_single(addr);
-                co_return co_await AttachXHttpDownloadTarget(
-                    std::move(target),
-                    options,
-                    allow_xhttp_download);
+                co_return co_await AttachXHttpDownloadTarget(std::move(target), options);
             }
         }
         co_return tl::unexpected(ErrorCode::DNS_RESOLVE_FAILED);
@@ -385,10 +234,7 @@ BuildOutboundTransportTargetInternal(OutboundTargetOptions options,
         }
         if (v4_count == 1) {
             append_single(*first_v4);
-            co_return co_await AttachXHttpDownloadTarget(
-                std::move(target),
-                options,
-                allow_xhttp_download);
+            co_return co_await AttachXHttpDownloadTarget(std::move(target), options);
         }
         target.candidates.reserve(v4_count);
         for (const auto& addr : dns_result.addresses) {
@@ -396,25 +242,14 @@ BuildOutboundTransportTargetInternal(OutboundTargetOptions options,
                 AppendCandidate(target, bind, options.inbound_local_addr, addr, options.port);
             }
         }
-        co_return co_await AttachXHttpDownloadTarget(
-            std::move(target),
-            options,
-            allow_xhttp_download);
+        co_return co_await AttachXHttpDownloadTarget(std::move(target), options);
     }
 
     target.candidates.reserve(dns_result.addresses.size());
     for (const auto& addr : dns_result.addresses) {
         AppendCandidate(target, bind, options.inbound_local_addr, addr, options.port);
     }
-    co_return co_await AttachXHttpDownloadTarget(
-        std::move(target),
-        options,
-        allow_xhttp_download);
-}
-
-net::awaitable<tl::expected<OutboundTransportTarget, ErrorCode>>
-BuildOutboundTransportTarget(OutboundTargetOptions options) {
-    return BuildOutboundTransportTargetInternal(std::move(options), true);
+    co_return co_await AttachXHttpDownloadTarget(std::move(target), options);
 }
 
 }  // namespace acpp

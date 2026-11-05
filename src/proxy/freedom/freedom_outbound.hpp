@@ -32,7 +32,7 @@ namespace acpp::proxy::freedom::outbound {
 struct FreedomSettings {
     OutboundBind send_through = OutboundBind::Auto();
     DomainStrategy domain_strategy = DomainStrategy::AsIs;
-    std::string redirect;                 // 重定向目标 "host:port"（空=不重定向）
+    std::optional<TargetAddress> redirect;  // 重定向目标（缺省=不重定向），加载时已校验
 };
 
 [[nodiscard]] proxyman::outbound::PreparedOutboundCreator
@@ -71,11 +71,6 @@ private:
     // 解析目标地址列表（保留多 IP 顺序，按策略过滤/排序）
     net::awaitable<tl::expected<memory::ThreadLocalVector<net::ip::address>, ErrorCode>>
     ResolveTargets(session::Context& ctx);
-
-    // 确定本地绑定地址
-    std::optional<net::ip::address> DetermineLocalAddress(
-        const tcp::endpoint* inbound_local_addr,
-        const net::ip::address& remote_addr);
 
     memory::ThreadLocalString tag_;
     OutboundBind send_through_;

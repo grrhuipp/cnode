@@ -27,7 +27,7 @@ void Check(bool condition, std::string_view message) {
 
 std::vector<uint8_t> Flatten(const buf::MultiBuffer& payload) {
     std::vector<uint8_t> out;
-    out.reserve(buf::TotalLen(payload));
+    out.reserve(payload.byte_size());
     for (const buf::Buffer* buffer : payload) {
         if (!buffer || buffer->IsEmpty()) {
             continue;
@@ -107,7 +107,6 @@ void Check2022(const TargetAddress& target,
                std::span<const uint8_t> payload,
                ss::SsCipherType cipher_type,
                size_t key_size,
-               proxyman::inbound::PreparedAeadCipher prepared_cipher,
                bool identity = false) {
     const ss::SsCipherInfo cipher{cipher_type, key_size, key_size};
     ss::KeyBytes key;
@@ -156,7 +155,6 @@ void Check2022(const TargetAddress& target,
               ss::Hash2022Psk(key.span(), user.psk_hash),
               "failed to prepare identity credential");
     }
-    user.cipher_type = prepared_cipher;
     user.key_size = cipher.key_size;
     user.salt_size = cipher.salt_size;
     if (identity) {
@@ -321,22 +319,11 @@ int main() {
         Check(cipher.has_value(), "test cipher unavailable");
         CheckClassic(target, source, payload.Bytes(), *cipher);
     }
-    Check2022(
-        target, source, payload.Bytes(),
-        ss::SsCipherType::AES_256_GCM_2022, 32,
-        proxyman::inbound::PreparedAeadCipher::AES_256_GCM_2022);
-    Check2022(
-        target, source, payload.Bytes(),
-        ss::SsCipherType::AES_128_GCM_2022, 16,
-        proxyman::inbound::PreparedAeadCipher::AES_128_GCM_2022);
-    Check2022(
-        target, source, payload.Bytes(),
-        ss::SsCipherType::CHACHA20_POLY1305_2022, 32,
-        proxyman::inbound::PreparedAeadCipher::CHACHA20_POLY1305_2022);
-    Check2022(target, source, payload.Bytes(), ss::SsCipherType::AES_128_GCM_2022, 16,
-              proxyman::inbound::PreparedAeadCipher::AES_128_GCM_2022, true);
-    Check2022(target, source, payload.Bytes(), ss::SsCipherType::AES_256_GCM_2022, 32,
-              proxyman::inbound::PreparedAeadCipher::AES_256_GCM_2022, true);
+    Check2022(target, source, payload.Bytes(), ss::SsCipherType::AES_256_GCM_2022, 32);
+    Check2022(target, source, payload.Bytes(), ss::SsCipherType::AES_128_GCM_2022, 16);
+    Check2022(target, source, payload.Bytes(), ss::SsCipherType::CHACHA20_POLY1305_2022, 32);
+    Check2022(target, source, payload.Bytes(), ss::SsCipherType::AES_128_GCM_2022, 16, true);
+    Check2022(target, source, payload.Bytes(), ss::SsCipherType::AES_256_GCM_2022, 32, true);
     Check2022ReplayWindow();
     return 0;
 }

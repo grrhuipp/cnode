@@ -1,5 +1,6 @@
 #include "acppnode/sniff/sniffer.hpp"
 #include "acppnode/common/allocator.hpp"
+#include "acppnode/common/byte_reader.hpp"
 #include "acppnode/core/constants.hpp"
 
 #include <openssl/evp.h>
@@ -58,13 +59,6 @@ constexpr QuicVersion kV2{
     if (ver == kV2.ver) return &kV2;
     if (ver == kDraft29.ver) return &kDraft29;
     return nullptr;
-}
-
-[[nodiscard]] uint32_t ReadU32(std::span<const uint8_t> data, size_t offset) noexcept {
-    return (static_cast<uint32_t>(data[offset]) << 24) |
-           (static_cast<uint32_t>(data[offset + 1]) << 16) |
-           (static_cast<uint32_t>(data[offset + 2]) << 8) |
-           static_cast<uint32_t>(data[offset + 3]);
 }
 
 [[nodiscard]] bool ReadVarint(std::span<const uint8_t> data,
@@ -154,7 +148,7 @@ constexpr size_t kMaxCrypto = 64 * 1024;
 constexpr size_t kMaxInputs = 64;
 
 // Explicit reservation prevents vector's geometric growth from exceeding the cap.
-void Grow(memory::ByteVector& bytes, size_t size) {
+void Grow(std::pmr::vector<uint8_t>& bytes, size_t size) {
     if (size > bytes.capacity()) {
         bytes.reserve(std::bit_ceil(std::max(size, size_t{256})));
     }
@@ -171,7 +165,7 @@ bool AesGcmDecrypt(std::span<const uint8_t, 16> key,
     if (ciphertext.size() <= 16) return false; // A QUIC packet must contain a frame.
     const auto tag = ciphertext.subspan(ciphertext.size() - 16, 16);
     const auto body = ciphertext.first(ciphertext.size() - 16);
-    Grow(plaintext, body.size());
+    plaintext.resize(body.size());
 
     EVP_CIPHER_CTX* ctx = ThreadLocalQuicCipherCtx();
     if (!ctx) return false;
@@ -217,6 +211,8 @@ SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
     ++input_count_;
     input_bytes_ += data.size();
 
+    // Released on return: no plaintext is held while waiting for the next datagram.
+    memory::ByteVector decrypted;
     size_t offset = 0;
     bool decrypted_initial = false;
     while (offset < data.size()) {
@@ -228,7 +224,7 @@ SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
             return fail();
         }
         if (remaining.size() < 7) return fail();
-        const uint32_t version = ReadU32(remaining, 1);
+        const uint32_t version = ByteReader(remaining.subspan(1, 4)).ReadU32BE();
         const auto* spec = LookupVersion(version);
         if (!spec) return fail();
         const uint8_t packet_type = (remaining[0] >> 4) & 3;
@@ -311,7 +307,7 @@ SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
                 std::span<const uint8_t>(pn_bytes.data(), pn_len),
                 remaining.subspan(hdr_len + pn_len,
                                   static_cast<size_t>(packet_len) - pn_len),
-                decrypted_)) return fail();
+                decrypted)) return fail();
         if (version_ == 0) {
             version_ = version;
             dcid_size_ = dcid_len;
@@ -320,7 +316,7 @@ SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
         largest_pn_ = std::max(largest_pn_, packet_number);
         decrypted_initial = true;
 
-        const auto plaintext = std::span<const uint8_t>(decrypted_);
+        const auto plaintext = std::span<const uint8_t>(decrypted);
         size_t frame = 0;
         while (frame < plaintext.size()) {
             uint64_t frame_type = 0;
@@ -386,8 +382,7 @@ SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
                 (static_cast<size_t>(crypto_[2]) << 8) | crypto_[3];
             if (handshake_size > kMaxCrypto - 4) return fail();
             if (contiguous_ >= handshake_size + 4) {
-                TlsSniffer tls;
-                auto sni = tls.ParseHandshake(
+                auto sni = ParseClientHelloServerName(
                     std::span<const uint8_t>(crypto_).first(handshake_size + 4));
                 if (!sni) return fail();
                 SniffResult result;

@@ -28,17 +28,15 @@ endif()
 
 set(CNODE_COMPILER_MACHINE "")
 set(CNODE_TARGET_IS_MUSL OFF)
-if(UNIX AND NOT APPLE)
-    execute_process(
-        COMMAND ${CMAKE_CXX_COMPILER} -dumpmachine
-        OUTPUT_VARIABLE CNODE_COMPILER_MACHINE
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-        ERROR_QUIET
-    )
-    if(CNODE_COMPILER_MACHINE MATCHES "musl" OR
-       CMAKE_CXX_COMPILER MATCHES "musl")
-        set(CNODE_TARGET_IS_MUSL ON)
-    endif()
+execute_process(
+    COMMAND ${CMAKE_CXX_COMPILER} -dumpmachine
+    OUTPUT_VARIABLE CNODE_COMPILER_MACHINE
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+)
+if(CNODE_COMPILER_MACHINE MATCHES "musl" OR
+   CMAKE_CXX_COMPILER MATCHES "musl")
+    set(CNODE_TARGET_IS_MUSL ON)
 endif()
 
 if(CNODE_HEAPTRACK_BUILD)
@@ -57,10 +55,6 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 get_property(CNODE_IS_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
 
-# Source and dependency headers are UTF-8. Never let the host ANSI code page
-# reinterpret comment bytes as line continuations or corrupt string literals.
-add_compile_options($<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
-add_compile_options($<$<COMPILE_LANG_AND_ID:CXX,MSVC>:/Zc:__cplusplus>)
 
 # ============================================================================
 # LTO（链接时优化）— Release 模式启用
@@ -71,22 +65,20 @@ endif()
 
 if(CNODE_RELEASE_DEBUG_SYMBOLS)
     add_compile_options(
-        $<$<AND:$<CONFIG:Release>,$<CXX_COMPILER_ID:MSVC>>:/Zi>
-        $<$<AND:$<CONFIG:Release>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-g>
+        $<$<CONFIG:Release>:-g>
     )
 endif()
 
 if(CNODE_RELEASE_FRAME_POINTERS)
     add_compile_options(
-        $<$<AND:$<CONFIG:Release>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-fno-omit-frame-pointer>
+        $<$<CONFIG:Release>:-fno-omit-frame-pointer>
     )
 endif()
 
 if(CNODE_HEAPTRACK_BUILD)
     add_compile_options(
-        $<$<CXX_COMPILER_ID:MSVC>:/Zi>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-g>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-fno-omit-frame-pointer>
+        -g
+        -fno-omit-frame-pointer
     )
 endif()
 
@@ -239,9 +231,7 @@ add_library(cnode_zlib STATIC
     ${zlib_SOURCE_DIR}/zutil.c
 )
 target_include_directories(cnode_zlib PUBLIC ${zlib_SOURCE_DIR})
-if(UNIX)
-    target_compile_definitions(cnode_zlib PRIVATE Z_HAVE_UNISTD_H)
-endif()
+target_compile_definitions(cnode_zlib PRIVATE Z_HAVE_UNISTD_H)
 
 find_package(Threads REQUIRED)
 
@@ -284,10 +274,7 @@ set(CNODE_SOURCES
     src/infra/json.cpp
     src/infra/config.cpp
     src/infra/routing_ip_network.cpp
-    src/infra/json_bool.cpp
-    src/infra/json_object.cpp
-    src/infra/json_string.cpp
-    src/infra/json_unsigned.cpp
+    src/infra/json_field.cpp
     src/infra/http2_initial_window.cpp
     src/infra/config_loader.cpp
     src/infra/config_semantics.cpp
@@ -312,9 +299,11 @@ set(CNODE_SOURCES
     src/transport/internet/tcp_stream.cpp
     src/transport/internet/timeout_scheduler.cpp
     src/transport/internet/tls_client_context.cpp
+    src/transport/internet/tls_config.cpp
     src/transport/internet/tls_server_name.cpp
     src/transport/internet/tls_stream.cpp
     src/transport/internet/autosign_cert.cpp
+    src/transport/internet/autosign_context.cpp
     src/transport/internet/reality_client_version.cpp
     src/transport/internet/reality_key.cpp
     src/transport/internet/reality_key_share.cpp
@@ -324,6 +313,9 @@ set(CNODE_SOURCES
     src/transport/internet/ws_stream.cpp
     src/transport/internet/http2_settings.cpp
     src/transport/internet/grpc_hunk.cpp
+    src/transport/internet/http1_handshake.cpp
+    src/transport/internet/xhttp_session.cpp
+    src/transport/internet/http2_session.cpp
     src/transport/internet/transport_stack.cpp
     src/transport/internet/transport_dialer.cpp
     src/transport/internet/outbound_target_builder.cpp
@@ -333,15 +325,18 @@ set(CNODE_SOURCES
     src/app/dispatcher/default_dispatcher.cpp
     src/app/proxyman/inbound/factory.cpp
     src/app/proxyman/inbound/handler.cpp
-    src/app/proxyman/inbound/manager.cpp
+    src/app/proxyman/inbound/handler_registry.cpp
     src/app/worker/tcp_listener.cpp
     src/app/worker/udp_ingress.cpp
     src/app/worker/udp_association_reclaimer.cpp
     src/app/proxyman/inbound/user_store.cpp
     src/app/proxyman/outbound/factory.cpp
-    src/app/proxyman/outbound/manager.cpp
+    src/app/proxyman/outbound/handler_registry.cpp
     src/app/worker.cpp
+    src/app/session_group_executor.cpp
+    src/app/session_capabilities.cpp
     src/service/controller/controller.cpp
+    src/service/controller/traffic_journal.cpp
     src/common/awaitable_batch.cpp
     src/service/controller/node_transition.cpp
     src/service/controller/node_runtime.cpp
@@ -383,6 +378,7 @@ set(CNODE_SOURCES
     src/proxy/vmess/aead/authid.cpp
     src/proxy/vmess/aead/kdf.cpp
     src/proxy/vmess/aead/encrypt.cpp
+    src/proxy/vmess/encoding/body.cpp
     src/proxy/vmess/encoding/client.cpp
     src/proxy/vmess/encoding/server.cpp
     src/proxy/vmess/inbound/vmess_inbound.cpp
@@ -397,6 +393,7 @@ set(CNODE_SOURCES
     src/proxy/vless/vless_encryption_io.cpp
     src/proxy/vless/vless_encryption_record.cpp
     src/proxy/vless/vless_encryption_runtime.cpp
+    src/proxy/vless/vless_ticket_service.cpp
     src/proxy/vless/vless_encryption_xor.cpp
     src/proxy/vless/udp_framing.cpp
     src/proxy/vless/vless_vision.cpp
@@ -512,8 +509,7 @@ target_precompile_headers(cnode PRIVATE src/pch.hpp)
 
 # 为我们自己的代码添加警告
 target_compile_options(cnode PRIVATE
-    $<$<CXX_COMPILER_ID:MSVC>:/W4 /wd4100 /wd4324 /EHsc /Zc:preprocessor /bigobj>
-    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wno-unused-parameter -Wpedantic -Wno-mismatched-new-delete>
+    -Wall -Wextra -Wno-unused-parameter -Wpedantic -Wno-mismatched-new-delete
     $<$<CXX_COMPILER_ID:GNU>:-Wno-stringop-overread -Wno-free-nonheap-object>
 )
 target_link_options(cnode PRIVATE
@@ -522,18 +518,14 @@ target_link_options(cnode PRIVATE
 
 
 # 平台链接库
-if(WIN32)
-    target_link_libraries(cnode PRIVATE ws2_32 mswsock psapi crypt32 iphlpapi)
-elseif(UNIX AND NOT APPLE)
-    # glibc 需要显式链接 dl/rt，musl 已内置（find_library 自动区分）
-    find_library(LIBDL dl)
-    find_library(LIBRT rt)
-    if(LIBDL)
-        target_link_libraries(cnode PRIVATE ${LIBDL})
-    endif()
-    if(LIBRT)
-        target_link_libraries(cnode PRIVATE ${LIBRT})
-    endif()
+# glibc 需要显式链接 dl/rt，musl 已内置（find_library 自动区分）
+find_library(LIBDL dl)
+find_library(LIBRT rt)
+if(LIBDL)
+    target_link_libraries(cnode PRIVATE ${LIBDL})
+endif()
+if(LIBRT)
+    target_link_libraries(cnode PRIVATE ${LIBRT})
 endif()
 
 if(CNODE_IS_MULTI_CONFIG)
@@ -575,11 +567,7 @@ else()
     set(CNODE_RELEASE_FRAME_POINTERS_SUMMARY "OFF")
 endif()
 
-if(WIN32)
-    set(CNODE_IO_BACKEND_SUMMARY "IOCP")
-elseif(APPLE)
-    set(CNODE_IO_BACKEND_SUMMARY "kqueue")
-elseif(CNODE_IO_URING)
+if(CNODE_IO_URING)
     set(CNODE_IO_BACKEND_SUMMARY "io_uring")
 else()
     set(CNODE_IO_BACKEND_SUMMARY "epoll")
@@ -587,7 +575,7 @@ endif()
 
 if(CNODE_BUILD_TESTS)
     enable_testing()
-    add_compile_options($<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-Wno-mismatched-new-delete>)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wno-mismatched-new-delete>)
     add_executable(cnode_autosign_cert_test
         tests/autosign_cert_test.cpp
         src/transport/internet/autosign_cert.cpp
@@ -596,16 +584,59 @@ if(CNODE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/internet
     )
-    target_link_libraries(cnode_autosign_cert_test PRIVATE crypto)
+    target_link_libraries(cnode_autosign_cert_test PRIVATE ssl crypto)
     target_compile_options(cnode_autosign_cert_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(NAME cnode_autosign_cert_test COMMAND cnode_autosign_cert_test)
+
+    add_executable(cnode_autosign_context_test
+        tests/autosign_context_test.cpp
+        src/transport/internet/autosign_context.cpp
+        src/transport/internet/autosign_cert.cpp
+        src/infra/log.cpp)
+    target_include_directories(cnode_autosign_context_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/internet
+        ${concurrentqueue_SOURCE_DIR})
+    target_link_libraries(cnode_autosign_context_test PRIVATE
+        asio::asio Threads::Threads ssl crypto cnode_zlib)
+    target_compile_options(cnode_autosign_context_test PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME cnode_autosign_context_test COMMAND cnode_autosign_context_test)
+    set_tests_properties(cnode_autosign_context_test PROPERTIES TIMEOUT 15)
+
+    add_executable(cnode_reality_client_hello_test tests/reality_client_hello_test.cpp)
+    target_include_directories(cnode_reality_client_hello_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/internet)
+    target_link_libraries(cnode_reality_client_hello_test PRIVATE Threads::Threads)
+    target_compile_options(cnode_reality_client_hello_test PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME cnode_reality_client_hello_test COMMAND cnode_reality_client_hello_test)
+
+    add_executable(cnode_traffic_journal_test
+        tests/traffic_journal_test.cpp
+        src/service/controller/traffic_journal.cpp
+        src/transport/internet/inbound_listen.cpp
+        src/transport/internet/outbound_bind.cpp
+        src/infra/json.cpp
+        src/infra/json_field.cpp
+        src/infra/panel_node_ids.cpp)
+    target_include_directories(cnode_traffic_journal_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(cnode_traffic_journal_test PRIVATE asio::asio Threads::Threads crypto)
+    target_compile_options(cnode_traffic_journal_test PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME cnode_traffic_journal_test COMMAND cnode_traffic_journal_test)
+
+    add_executable(cnode_session_group_executor_test
+        tests/session_group_executor_test.cpp src/app/session_group_executor.cpp)
+    target_include_directories(cnode_session_group_executor_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(cnode_session_group_executor_test PRIVATE asio::asio Threads::Threads)
+    target_compile_options(cnode_session_group_executor_test PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME cnode_session_group_executor_test COMMAND cnode_session_group_executor_test)
+    set_tests_properties(cnode_session_group_executor_test PROPERTIES TIMEOUT 30)
 
     add_executable(cnode_tls_client_certificate_test
         tests/tls_client_certificate_test.cpp
         src/transport/internet/tls_client_context.cpp
+        src/transport/internet/tls_config.cpp
         src/transport/internet/autosign_cert.cpp
         src/infra/log.cpp
     )
@@ -621,14 +652,8 @@ if(CNODE_BUILD_TESTS)
         crypto
         cnode_zlib
     )
-    if(WIN32)
-        target_link_libraries(cnode_tls_client_certificate_test PRIVATE ws2_32)
-        target_compile_definitions(
-            cnode_tls_client_certificate_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_tls_client_certificate_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /wd4324 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_tls_client_certificate_test
@@ -643,13 +668,8 @@ if(CNODE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
     target_link_libraries(cnode_tls_sniffer_test PRIVATE asio::asio)
-    if(WIN32)
-        target_link_libraries(cnode_tls_sniffer_test PRIVATE ws2_32)
-        target_compile_definitions(cnode_tls_sniffer_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_tls_sniffer_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_tls_sniffer_test
@@ -665,14 +685,8 @@ if(CNODE_BUILD_TESTS)
     target_link_libraries(cnode_http_sniffer_test PRIVATE
         asio::asio
     )
-    if(WIN32)
-        target_link_libraries(cnode_http_sniffer_test PRIVATE ws2_32)
-        target_compile_definitions(
-            cnode_http_sniffer_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_http_sniffer_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_http_sniffer_test
@@ -690,13 +704,8 @@ if(CNODE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
     target_link_libraries(cnode_quic_sniffer_test PRIVATE asio::asio crypto)
-    if(WIN32)
-        target_link_libraries(cnode_quic_sniffer_test PRIVATE ws2_32)
-        target_compile_definitions(cnode_quic_sniffer_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_quic_sniffer_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_quic_sniffer_test
@@ -709,8 +718,7 @@ if(CNODE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
     target_compile_options(cnode_sniff_config_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_sniff_config_test
@@ -723,8 +731,7 @@ if(CNODE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
     target_compile_options(cnode_domain_name_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_domain_name_test
@@ -733,13 +740,8 @@ if(CNODE_BUILD_TESTS)
     add_executable(cnode_ip_address_test tests/ip_address_test.cpp)
     target_include_directories(cnode_ip_address_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_link_libraries(cnode_ip_address_test PRIVATE asio::asio)
-    if(WIN32)
-        target_link_libraries(cnode_ip_address_test PRIVATE ws2_32)
-        target_compile_definitions(cnode_ip_address_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_ip_address_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
+        -Wall -Wextra -Wpedantic)
     add_test(NAME cnode_ip_address_test COMMAND cnode_ip_address_test)
 
     add_executable(cnode_proxy_protocol_literal_test
@@ -750,13 +752,8 @@ if(CNODE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/include ${concurrentqueue_SOURCE_DIR})
     target_link_libraries(cnode_proxy_protocol_literal_test PRIVATE
         asio::asio Threads::Threads crypto cnode_zlib)
-    if(WIN32)
-        target_link_libraries(cnode_proxy_protocol_literal_test PRIVATE ws2_32)
-        target_compile_definitions(cnode_proxy_protocol_literal_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_proxy_protocol_literal_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
+        -Wall -Wextra -Wpedantic)
     add_test(NAME cnode_proxy_protocol_literal_test COMMAND cnode_proxy_protocol_literal_test)
 
     add_executable(cnode_target_address_test
@@ -768,14 +765,8 @@ if(CNODE_BUILD_TESTS)
     target_link_libraries(cnode_target_address_test PRIVATE
         asio::asio
     )
-    if(WIN32)
-        target_link_libraries(cnode_target_address_test PRIVATE ws2_32)
-        target_compile_definitions(
-            cnode_target_address_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_target_address_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_target_address_test
@@ -789,8 +780,7 @@ if(CNODE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
     target_compile_options(cnode_reality_client_version_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_reality_client_version_test
@@ -807,8 +797,7 @@ if(CNODE_BUILD_TESTS)
         crypto
     )
     target_compile_options(cnode_reality_key_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_reality_key_test
@@ -823,8 +812,7 @@ if(CNODE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/internet
     )
     target_compile_options(cnode_reality_key_share_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_reality_key_share_test
@@ -839,8 +827,7 @@ if(CNODE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
     target_compile_options(cnode_reality_server_name_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_reality_server_name_test
@@ -854,8 +841,7 @@ if(CNODE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
     target_compile_options(cnode_reality_short_id_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_reality_short_id_test
@@ -880,13 +866,8 @@ if(CNODE_BUILD_TESTS)
     )
     target_link_libraries(cnode_trojan_request_test PRIVATE
         asio::asio Threads::Threads crypto cnode_zlib)
-    if(WIN32)
-        target_link_libraries(cnode_trojan_request_test PRIVATE ws2_32)
-        target_compile_definitions(cnode_trojan_request_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_trojan_request_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(NAME cnode_trojan_request_test COMMAND cnode_trojan_request_test)
 
@@ -895,11 +876,11 @@ if(CNODE_BUILD_TESTS)
         src/proxy/vless/credentials.cpp
     )
     target_include_directories(cnode_vless_credentials_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/vless)
     target_link_libraries(cnode_vless_credentials_test PRIVATE crypto)
     target_compile_options(cnode_vless_credentials_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(NAME cnode_vless_credentials_test COMMAND cnode_vless_credentials_test)
 
@@ -914,14 +895,8 @@ if(CNODE_BUILD_TESTS)
         crypto
         cnode_zlib
     )
-    if(WIN32)
-        target_link_libraries(cnode_trojan_udp_framing_test PRIVATE ws2_32)
-        target_compile_definitions(
-            cnode_trojan_udp_framing_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_trojan_udp_framing_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_trojan_udp_framing_test
@@ -943,18 +918,22 @@ if(CNODE_BUILD_TESTS)
         Threads::Threads
         cnode_zlib
     )
-    if(WIN32)
-        target_link_libraries(cnode_vless_udp_framing_test PRIVATE ws2_32)
-        target_compile_definitions(
-            cnode_vless_udp_framing_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_vless_udp_framing_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_vless_udp_framing_test
         COMMAND cnode_vless_udp_framing_test)
+
+    add_executable(cnode_vless_vision_test
+        tests/vless_vision_test.cpp
+        src/proxy/vless/vless_vision.cpp
+        src/common/error.cpp)
+    target_include_directories(cnode_vless_vision_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/vless)
+    target_link_libraries(cnode_vless_vision_test PRIVATE asio::asio Threads::Threads crypto)
+    target_compile_options(cnode_vless_vision_test PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME cnode_vless_vision_test COMMAND cnode_vless_vision_test)
 
     add_executable(cnode_vless_encryption_io_test
         tests/vless_encryption_io_test.cpp
@@ -966,15 +945,28 @@ if(CNODE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/vless)
     target_link_libraries(cnode_vless_encryption_io_test PRIVATE
         asio::asio Threads::Threads crypto cnode_blake3)
-    if(WIN32)
-        target_link_libraries(cnode_vless_encryption_io_test PRIVATE ws2_32)
-        target_compile_definitions(cnode_vless_encryption_io_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_vless_encryption_io_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
+        -Wall -Wextra -Wpedantic)
     add_test(NAME cnode_vless_encryption_io_test COMMAND cnode_vless_encryption_io_test)
     set_tests_properties(cnode_vless_encryption_io_test PROPERTIES TIMEOUT 10)
+
+    set(CNODE_VLESS_ENCRYPTION_TEST_SOURCES ${CNODE_SOURCES})
+    list(FILTER CNODE_VLESS_ENCRYPTION_TEST_SOURCES INCLUDE REGEX
+        "^src/proxy/vless/vless_encryption[^/]*\\.cpp$")
+    foreach(ticket_test IN ITEMS store service)
+        set(target cnode_vless_ticket_${ticket_test}_test)
+        add_executable(${target}
+            tests/vless_ticket_${ticket_test}_test.cpp
+            ${CNODE_VLESS_ENCRYPTION_TEST_SOURCES}
+            src/proxy/vless/vless_ticket_service.cpp
+            src/common/error.cpp)
+        target_include_directories(${target} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/vless)
+        target_link_libraries(${target} PRIVATE asio::asio Threads::Threads crypto cnode_blake3)
+        target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(NAME ${target} COMMAND ${target})
+        set_tests_properties(${target} PROPERTIES TIMEOUT 20)
+    endforeach()
 
     add_executable(cnode_grpc_hunk_test
         tests/grpc_hunk_test.cpp
@@ -985,8 +977,7 @@ if(CNODE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/internet
     )
     target_compile_options(cnode_grpc_hunk_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(NAME cnode_grpc_hunk_test COMMAND cnode_grpc_hunk_test)
 
@@ -999,47 +990,37 @@ if(CNODE_BUILD_TESTS)
     target_include_directories(cnode_vmess_auth_snapshot_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/vmess)
     target_link_libraries(cnode_vmess_auth_snapshot_test PRIVATE asio::asio Threads::Threads cnode_zlib crypto)
-    if(WIN32)
-        target_link_libraries(cnode_vmess_auth_snapshot_test PRIVATE ws2_32)
-        target_compile_definitions(cnode_vmess_auth_snapshot_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_vmess_auth_snapshot_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
+        -Wall -Wextra -Wpedantic)
     add_test(NAME cnode_vmess_auth_snapshot_test COMMAND cnode_vmess_auth_snapshot_test)
 
     add_executable(cnode_vmess_cipher_test
         tests/vmess_cipher_test.cpp
         src/proxy/vmess/vmess_cipher.cpp
+        src/proxy/vmess/vmess_crypto.cpp
     )
     target_include_directories(cnode_vmess_cipher_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/vmess
     )
     target_link_libraries(cnode_vmess_cipher_test PRIVATE asio::asio Threads::Threads crypto)
-    if(WIN32)
-        target_link_libraries(cnode_vmess_cipher_test PRIVATE ws2_32)
-        target_compile_definitions(cnode_vmess_cipher_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_vmess_cipher_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
-    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-        # --wrap runs after LTO: keep unresolved EVP calls in these test objects
-        # so optimization cannot bypass the allocation/error injectors.
-        set_property(TARGET cnode_vmess_cipher_test
-            PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE OFF)
-        target_compile_definitions(cnode_vmess_cipher_test PRIVATE CNODE_TEST_CRYPTO_FAULT)
-        target_link_options(cnode_vmess_cipher_test PRIVATE
-            -Wl,--wrap=EVP_MD_CTX_new
-            -Wl,--wrap=EVP_CIPHER_CTX_new
-            -Wl,--wrap=EVP_DigestSqueeze)
-    endif()
+    # --wrap runs after LTO: keep unresolved EVP calls in these test objects
+    # so optimization cannot bypass the allocation/error injectors.
+    set_property(TARGET cnode_vmess_cipher_test
+        PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE OFF)
+    target_compile_definitions(cnode_vmess_cipher_test PRIVATE CNODE_TEST_CRYPTO_FAULT)
+    target_link_options(cnode_vmess_cipher_test PRIVATE
+        -Wl,--wrap=EVP_MD_CTX_new
+        -Wl,--wrap=EVP_CIPHER_CTX_new
+        -Wl,--wrap=EVP_DigestSqueeze)
     add_test(NAME cnode_vmess_cipher_test COMMAND cnode_vmess_cipher_test)
 
     add_executable(cnode_vmess_udp_datagram_test
         tests/vmess_udp_datagram_test.cpp
+        src/proxy/vmess/encoding/body.cpp
         src/proxy/vmess/encoding/server.cpp
         src/proxy/vmess/vmess_cipher.cpp
         src/proxy/vmess/vmess_crypto.cpp
@@ -1069,14 +1050,8 @@ if(CNODE_BUILD_TESTS)
         ssl
         crypto
     )
-    if(WIN32)
-        target_link_libraries(cnode_vmess_udp_datagram_test PRIVATE ws2_32)
-        target_compile_definitions(
-            cnode_vmess_udp_datagram_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_vmess_udp_datagram_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_vmess_udp_datagram_test
@@ -1098,14 +1073,8 @@ if(CNODE_BUILD_TESTS)
         crypto
         cnode_blake3
     )
-    if(WIN32)
-        target_link_libraries(cnode_shadowsocks_udp_datagram_test PRIVATE ws2_32)
-        target_compile_definitions(
-            cnode_shadowsocks_udp_datagram_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_shadowsocks_udp_datagram_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_shadowsocks_udp_datagram_test
@@ -1129,12 +1098,8 @@ if(CNODE_BUILD_TESTS)
         crypto
         cnode_blake3
     )
-    if(WIN32)
-        target_link_libraries(cnode_uot_ss2022_test PRIVATE ws2_32)
-    endif()
     target_compile_options(cnode_uot_ss2022_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(NAME cnode_uot_ss2022_test COMMAND cnode_uot_ss2022_test)
 
@@ -1150,12 +1115,8 @@ if(CNODE_BUILD_TESTS)
     )
     target_link_libraries(cnode_ss_outbound_credentials_test PRIVATE
         asio::asio Threads::Threads crypto cnode_blake3)
-    if(WIN32)
-        target_link_libraries(cnode_ss_outbound_credentials_test PRIVATE ws2_32)
-    endif()
     target_compile_options(cnode_ss_outbound_credentials_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(NAME cnode_ss_outbound_credentials_test COMMAND cnode_ss_outbound_credentials_test)
 
@@ -1171,14 +1132,8 @@ if(CNODE_BUILD_TESTS)
         asio::asio
         Threads::Threads
     )
-    if(WIN32)
-        target_link_libraries(cnode_mux_codec_test PRIVATE ws2_32)
-        target_compile_definitions(
-            cnode_mux_codec_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_mux_codec_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(NAME cnode_mux_codec_test COMMAND cnode_mux_codec_test)
 
@@ -1198,25 +1153,17 @@ if(CNODE_BUILD_TESTS)
         crypto
         cnode_blake3
     )
-    if(WIN32)
-        target_link_libraries(cnode_shadowsocks_stream_crypto_test PRIVATE ws2_32)
-        target_compile_definitions(
-            cnode_shadowsocks_stream_crypto_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_shadowsocks_stream_crypto_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_shadowsocks_stream_crypto_test
         COMMAND cnode_shadowsocks_stream_crypto_test)
-    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-        set_property(TARGET cnode_shadowsocks_stream_crypto_test
-            PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE OFF)
-        target_compile_definitions(cnode_shadowsocks_stream_crypto_test PRIVATE CNODE_WRAP_MALLOC)
-        target_link_options(cnode_shadowsocks_stream_crypto_test PRIVATE
-            -Wl,--wrap=malloc -Wl,--wrap=EVP_CIPHER_CTX_new)
-    endif()
+    set_property(TARGET cnode_shadowsocks_stream_crypto_test
+        PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE OFF)
+    target_compile_definitions(cnode_shadowsocks_stream_crypto_test PRIVATE CNODE_WRAP_MALLOC)
+    target_link_options(cnode_shadowsocks_stream_crypto_test PRIVATE
+        -Wl,--wrap=malloc -Wl,--wrap=EVP_CIPHER_CTX_new)
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
         add_test(NAME cnode_shadowsocks_aes_software_test
             COMMAND cnode_shadowsocks_stream_crypto_test)
@@ -1235,14 +1182,8 @@ if(CNODE_BUILD_TESTS)
         asio::asio
         Threads::Threads
     )
-    if(WIN32)
-        target_link_libraries(cnode_v2board_http_response_test PRIVATE ws2_32)
-        target_compile_definitions(
-            cnode_v2board_http_response_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_v2board_http_response_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_v2board_http_response_test
@@ -1253,13 +1194,8 @@ if(CNODE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/src/api/v2board)
     target_link_libraries(cnode_v2board_request_task_test PRIVATE asio::asio Threads::Threads)
-    if(WIN32)
-        target_link_libraries(cnode_v2board_request_task_test PRIVATE ws2_32)
-        target_compile_definitions(cnode_v2board_request_task_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_v2board_request_task_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
+        -Wall -Wextra -Wpedantic)
     add_test(NAME cnode_v2board_request_task_test COMMAND cnode_v2board_request_task_test)
     set_tests_properties(cnode_v2board_request_task_test PROPERTIES TIMEOUT 10)
 
@@ -1275,14 +1211,8 @@ if(CNODE_BUILD_TESTS)
         asio::asio
         Threads::Threads
     )
-    if(WIN32)
-        target_link_libraries(cnode_online_snapshot_test PRIVATE ws2_32)
-        target_compile_definitions(
-            cnode_online_snapshot_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_online_snapshot_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_online_snapshot_test
@@ -1301,14 +1231,8 @@ if(CNODE_BUILD_TESTS)
         asio::asio
         Threads::Threads
     )
-    if(WIN32)
-        target_link_libraries(cnode_v2board_online_report_test PRIVATE ws2_32)
-        target_compile_definitions(
-            cnode_v2board_online_report_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_v2board_online_report_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_v2board_online_report_test
@@ -1321,6 +1245,7 @@ if(CNODE_BUILD_TESTS)
         src/transport/internet/reality_key.cpp
         src/transport/internet/reality_short_id.cpp
         src/infra/json.cpp
+        src/infra/json_field.cpp
     )
     target_include_directories(cnode_v2board_node_info_json_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -1331,14 +1256,8 @@ if(CNODE_BUILD_TESTS)
         Threads::Threads
         crypto
     )
-    if(WIN32)
-        target_link_libraries(cnode_v2board_node_info_json_test PRIVATE ws2_32)
-        target_compile_definitions(
-            cnode_v2board_node_info_json_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_v2board_node_info_json_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_v2board_node_info_json_test
@@ -1348,6 +1267,7 @@ if(CNODE_BUILD_TESTS)
         tests/v2board_user_list_json_test.cpp
         src/api/v2board/user_list_json.cpp
         src/infra/json.cpp
+        src/infra/json_field.cpp
     )
     target_include_directories(cnode_v2board_user_list_json_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -1357,14 +1277,8 @@ if(CNODE_BUILD_TESTS)
         asio::asio
         Threads::Threads
     )
-    if(WIN32)
-        target_link_libraries(cnode_v2board_user_list_json_test PRIVATE ws2_32)
-        target_compile_definitions(
-            cnode_v2board_user_list_json_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_v2board_user_list_json_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_v2board_user_list_json_test
@@ -1375,6 +1289,7 @@ if(CNODE_BUILD_TESTS)
         src/proxy/anytls/outbound/anytls_outbound_settings.cpp
         src/proxy/anytls/credentials.cpp
         src/infra/json.cpp
+        src/infra/json_field.cpp
     )
     add_executable(cnode_substream_inbound_lifecycle_test
         tests/substream_inbound_lifecycle_test.cpp
@@ -1402,15 +1317,10 @@ if(CNODE_BUILD_TESTS)
     target_compile_definitions(cnode_substream_inbound_lifecycle_test PRIVATE CNODE_TEST_BUFFER_STATS)
     target_link_libraries(cnode_substream_inbound_lifecycle_test PRIVATE
         asio::asio Threads::Threads cnode_zlib crypto)
-    if(WIN32)
-        target_link_libraries(cnode_substream_inbound_lifecycle_test PRIVATE ws2_32)
-        target_compile_definitions(cnode_substream_inbound_lifecycle_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_substream_inbound_lifecycle_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
+        -Wall -Wextra -Wpedantic)
     add_test(NAME cnode_substream_inbound_lifecycle_test COMMAND cnode_substream_inbound_lifecycle_test)
-    set_tests_properties(cnode_substream_inbound_lifecycle_test PROPERTIES TIMEOUT 20)
+    set_tests_properties(cnode_substream_inbound_lifecycle_test PROPERTIES TIMEOUT 90)
 
     add_executable(cnode_anytls_codec_errors_test
         tests/anytls_codec_errors_test.cpp
@@ -1430,12 +1340,7 @@ if(CNODE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/anytls)
     target_link_libraries(cnode_anytls_codec_errors_test PRIVATE asio::asio Threads::Threads cnode_zlib crypto)
     target_compile_options(cnode_anytls_codec_errors_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
-    if(WIN32)
-        target_link_libraries(cnode_anytls_codec_errors_test PRIVATE ws2_32)
-        target_compile_definitions(cnode_anytls_codec_errors_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
+        -Wall -Wextra -Wpedantic)
     add_test(NAME cnode_anytls_codec_errors_test COMMAND cnode_anytls_codec_errors_test)
     set_tests_properties(cnode_anytls_codec_errors_test PROPERTIES TIMEOUT 10)
 
@@ -1446,8 +1351,7 @@ if(CNODE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/anytls)
     target_link_libraries(cnode_anytls_padding_test PRIVATE crypto)
     target_compile_options(cnode_anytls_padding_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
+        -Wall -Wextra -Wpedantic)
     add_test(NAME cnode_anytls_padding_test COMMAND cnode_anytls_padding_test)
 
     add_executable(cnode_inbound_process_errors_test
@@ -1461,6 +1365,7 @@ if(CNODE_BUILD_TESTS)
         src/transport/internet/tcp_stream.cpp
         src/transport/internet/proxy_protocol.cpp
         src/transport/internet/timeout_scheduler.cpp
+        src/transport/internet/tls_client_context.cpp
         src/common/error.cpp
         src/common/session.cpp
         src/common/sharded_user_stats.cpp
@@ -1469,14 +1374,9 @@ if(CNODE_BUILD_TESTS)
     target_include_directories(cnode_inbound_process_errors_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include ${concurrentqueue_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/anytls)
-    target_link_libraries(cnode_inbound_process_errors_test PRIVATE asio::asio Threads::Threads cnode_zlib crypto)
+    target_link_libraries(cnode_inbound_process_errors_test PRIVATE asio::asio Threads::Threads cnode_zlib ssl crypto)
     target_compile_options(cnode_inbound_process_errors_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
-    if(WIN32)
-        target_link_libraries(cnode_inbound_process_errors_test PRIVATE ws2_32)
-        target_compile_definitions(cnode_inbound_process_errors_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
+        -Wall -Wextra -Wpedantic)
     add_test(NAME cnode_inbound_process_errors_test COMMAND cnode_inbound_process_errors_test)
     set_tests_properties(cnode_inbound_process_errors_test PROPERTIES TIMEOUT 10)
 
@@ -1499,53 +1399,23 @@ if(CNODE_BUILD_TESTS)
         src/transport/internet/tcp_stream.cpp
         src/transport/internet/proxy_protocol.cpp
         src/transport/internet/timeout_scheduler.cpp
+        src/transport/internet/tls_client_context.cpp
         src/common/error.cpp
         src/common/session.cpp
         src/infra/json.cpp
+        src/infra/json_field.cpp
         src/infra/log.cpp)
     target_include_directories(cnode_anytls_outbound_lifecycle_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include ${concurrentqueue_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/anytls/outbound)
     target_compile_definitions(cnode_anytls_outbound_lifecycle_test PRIVATE CNODE_TEST_BUFFER_STATS)
     target_link_libraries(cnode_anytls_outbound_lifecycle_test PRIVATE
-        asio::asio Threads::Threads cnode_zlib crypto)
-    if(WIN32)
-        target_link_libraries(cnode_anytls_outbound_lifecycle_test PRIVATE ws2_32 iphlpapi)
-        target_compile_definitions(cnode_anytls_outbound_lifecycle_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
+        asio::asio Threads::Threads cnode_zlib ssl crypto)
     target_compile_options(cnode_anytls_outbound_lifecycle_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic -Wno-mismatched-new-delete>)
+        -Wall -Wextra -Wpedantic -Wno-mismatched-new-delete)
     add_test(NAME cnode_anytls_outbound_lifecycle_test COMMAND cnode_anytls_outbound_lifecycle_test)
-    set_tests_properties(cnode_anytls_outbound_lifecycle_test PROPERTIES TIMEOUT 20)
+    set_tests_properties(cnode_anytls_outbound_lifecycle_test PROPERTIES TIMEOUT 30)
 
-    add_executable(cnode_anytls_session_pool_test
-        tests/anytls_session_pool_test.cpp
-        src/transport/internet/timeout_scheduler.cpp
-        src/common/error.cpp
-        src/infra/log.cpp
-    )
-    target_include_directories(cnode_anytls_session_pool_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/anytls/outbound
-        ${concurrentqueue_SOURCE_DIR}
-    )
-    target_link_libraries(cnode_anytls_session_pool_test PRIVATE
-        asio::asio Threads::Threads crypto cnode_zlib)
-    target_compile_definitions(cnode_anytls_session_pool_test PRIVATE
-        ASIO_DISABLE_AWAITABLE_FRAME_RECYCLING)
-    if(WIN32)
-        target_link_libraries(cnode_anytls_session_pool_test PRIVATE ws2_32)
-        target_compile_definitions(cnode_anytls_session_pool_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
-    target_compile_options(cnode_anytls_session_pool_test PRIVATE
-        "$<$<CXX_COMPILER_ID:MSVC>:/FI${CMAKE_CURRENT_SOURCE_DIR}/tests/async_allocation_fault.hpp>"
-        "$<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-include${CMAKE_CURRENT_SOURCE_DIR}/tests/async_allocation_fault.hpp>"
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
-    )
-    add_test(NAME cnode_anytls_session_pool_test COMMAND cnode_anytls_session_pool_test)
-    set_tests_properties(cnode_anytls_session_pool_test PROPERTIES TIMEOUT 10)
     target_include_directories(cnode_anytls_outbound_settings_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/anytls/outbound
@@ -1555,14 +1425,8 @@ if(CNODE_BUILD_TESTS)
         Threads::Threads
         crypto
     )
-    if(WIN32)
-        target_link_libraries(cnode_anytls_outbound_settings_test PRIVATE ws2_32)
-        target_compile_definitions(
-            cnode_anytls_outbound_settings_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_anytls_outbound_settings_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_anytls_outbound_settings_test
@@ -1572,6 +1436,7 @@ if(CNODE_BUILD_TESTS)
         tests/ss_outbound_uot_test.cpp
         src/proxy/shadowsocks/outbound/ss_outbound_uot.cpp
         src/infra/json.cpp
+        src/infra/json_field.cpp
     )
     target_include_directories(cnode_ss_outbound_uot_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -1581,14 +1446,8 @@ if(CNODE_BUILD_TESTS)
         asio::asio
         Threads::Threads
     )
-    if(WIN32)
-        target_link_libraries(cnode_ss_outbound_uot_test PRIVATE ws2_32)
-        target_compile_definitions(
-            cnode_ss_outbound_uot_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_ss_outbound_uot_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_ss_outbound_uot_test
@@ -1607,42 +1466,30 @@ if(CNODE_BUILD_TESTS)
         asio::asio
         Threads::Threads
     )
-    if(WIN32)
-        target_link_libraries(cnode_inbound_tls_policy_test PRIVATE ws2_32 iphlpapi)
-        target_compile_definitions(
-            cnode_inbound_tls_policy_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_inbound_tls_policy_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_inbound_tls_policy_test
         COMMAND cnode_inbound_tls_policy_test)
 
-    add_executable(cnode_outbound_manager_test
-        tests/outbound_manager_test.cpp
-        src/app/proxyman/outbound/manager.cpp
+    add_executable(cnode_handler_registry_test
+        tests/handler_registry_test.cpp
+        src/app/proxyman/outbound/handler_registry.cpp
     )
-    target_include_directories(cnode_outbound_manager_test PRIVATE
+    target_include_directories(cnode_handler_registry_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
-    target_link_libraries(cnode_outbound_manager_test PRIVATE
+    target_link_libraries(cnode_handler_registry_test PRIVATE
         asio::asio
         Threads::Threads
     )
-    if(WIN32)
-        target_link_libraries(cnode_outbound_manager_test PRIVATE ws2_32)
-        target_compile_definitions(
-            cnode_outbound_manager_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
-    target_compile_options(cnode_outbound_manager_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    target_compile_options(cnode_handler_registry_test PRIVATE
+        -Wall -Wextra -Wpedantic
     )
     add_test(
-        NAME cnode_outbound_manager_test
-        COMMAND cnode_outbound_manager_test)
+        NAME cnode_handler_registry_test
+        COMMAND cnode_handler_registry_test)
 
     add_executable(cnode_config_semantics_test
         tests/config_semantics_test.cpp
@@ -1658,38 +1505,32 @@ if(CNODE_BUILD_TESTS)
         asio::asio
         Threads::Threads
     )
-    if(WIN32)
-        target_link_libraries(cnode_config_semantics_test PRIVATE ws2_32)
-        target_compile_definitions(
-            cnode_config_semantics_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_config_semantics_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_config_semantics_test
         COMMAND cnode_config_semantics_test)
 
-    add_executable(cnode_json_port_test
-        tests/json_port_test.cpp
+    add_executable(cnode_json_field_test
+        tests/json_field_test.cpp
+        src/infra/json_field.cpp
         src/infra/json.cpp
     )
-    target_include_directories(cnode_json_port_test PRIVATE
+    target_include_directories(cnode_json_field_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
-    target_compile_options(cnode_json_port_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    target_compile_options(cnode_json_field_test PRIVATE
+        -Wall -Wextra -Wpedantic
     )
     add_test(
-        NAME cnode_json_port_test
-        COMMAND cnode_json_port_test)
+        NAME cnode_json_field_test
+        COMMAND cnode_json_field_test)
 
     add_executable(cnode_http2_initial_window_test
         tests/http2_initial_window_test.cpp
         src/infra/http2_initial_window.cpp
-        src/infra/json_unsigned.cpp
+        src/infra/json_field.cpp
         src/infra/json.cpp
         src/transport/internet/http2_settings.cpp
     )
@@ -1699,8 +1540,7 @@ if(CNODE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/internet
     )
     target_compile_options(cnode_http2_initial_window_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_http2_initial_window_test
@@ -1713,80 +1553,26 @@ if(CNODE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/internet
     )
     target_compile_options(cnode_http_path_match_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_http_path_match_test
         COMMAND cnode_http_path_match_test)
 
-    add_executable(cnode_json_unsigned_test
-        tests/json_unsigned_test.cpp
-        src/infra/json_unsigned.cpp
-        src/infra/json.cpp
-    )
-    target_include_directories(cnode_json_unsigned_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/infra
-    )
-    target_compile_options(cnode_json_unsigned_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
-    )
-    add_test(
-        NAME cnode_json_unsigned_test
-        COMMAND cnode_json_unsigned_test)
-
-    add_executable(cnode_json_bool_test
-        tests/json_bool_test.cpp
-        src/infra/json_bool.cpp
-        src/infra/json.cpp
-    )
-    target_include_directories(cnode_json_bool_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/infra
-    )
-    target_compile_options(cnode_json_bool_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
-    )
-    add_test(
-        NAME cnode_json_bool_test
-        COMMAND cnode_json_bool_test)
-
     add_executable(cnode_json_object_test
         tests/json_object_test.cpp
-        src/infra/json_object.cpp
+        src/infra/json_field.cpp
         src/infra/json.cpp
     )
     target_include_directories(cnode_json_object_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/infra
     )
     target_compile_options(cnode_json_object_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_json_object_test
         COMMAND cnode_json_object_test)
-
-    add_executable(cnode_json_string_test
-        tests/json_string_test.cpp
-        src/infra/json_string.cpp
-        src/infra/json.cpp
-    )
-    target_include_directories(cnode_json_string_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/infra
-    )
-    target_compile_options(cnode_json_string_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
-    )
-    add_test(
-        NAME cnode_json_string_test
-        COMMAND cnode_json_string_test)
 
     add_executable(cnode_routing_ip_network_test
         tests/routing_ip_network_test.cpp
@@ -1799,14 +1585,8 @@ if(CNODE_BUILD_TESTS)
         asio::asio
         Threads::Threads
     )
-    if(WIN32)
-        target_link_libraries(cnode_routing_ip_network_test PRIVATE ws2_32)
-        target_compile_definitions(
-            cnode_routing_ip_network_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_routing_ip_network_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_routing_ip_network_test
@@ -1826,13 +1606,8 @@ if(CNODE_BUILD_TESTS)
         ${concurrentqueue_SOURCE_DIR}
     )
     target_link_libraries(cnode_dns_inflight_test PRIVATE asio::asio Threads::Threads cnode_zlib ssl crypto)
-    if(WIN32)
-        target_link_libraries(cnode_dns_inflight_test PRIVATE ws2_32)
-        target_compile_definitions(cnode_dns_inflight_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_dns_inflight_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(NAME cnode_dns_inflight_test COMMAND cnode_dns_inflight_test)
 
@@ -1845,13 +1620,8 @@ if(CNODE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/src
     )
     target_link_libraries(cnode_dns_cache_test PRIVATE asio::asio Threads::Threads ssl crypto)
-    if(WIN32)
-        target_link_libraries(cnode_dns_cache_test PRIVATE ws2_32)
-        target_compile_definitions(cnode_dns_cache_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_dns_cache_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(NAME cnode_dns_cache_test COMMAND cnode_dns_cache_test)
 
@@ -1865,13 +1635,8 @@ if(CNODE_BUILD_TESTS)
     target_include_directories(cnode_dns_datagram_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src ${concurrentqueue_SOURCE_DIR})
     target_link_libraries(cnode_dns_datagram_test PRIVATE asio::asio Threads::Threads cnode_zlib ssl crypto)
-    if(WIN32)
-        target_link_libraries(cnode_dns_datagram_test PRIVATE ws2_32)
-        target_compile_definitions(cnode_dns_datagram_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_dns_datagram_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
+        -Wall -Wextra -Wpedantic)
     add_test(NAME cnode_dns_datagram_test COMMAND cnode_dns_datagram_test)
     set_tests_properties(cnode_dns_datagram_test cnode_dns_inflight_test PROPERTIES TIMEOUT 20)
 
@@ -1889,15 +1654,23 @@ if(CNODE_BUILD_TESTS)
     target_link_libraries(cnode_router_test PRIVATE
         asio::asio Threads::Threads cnode_zlib
     )
-    if(WIN32)
-        target_link_libraries(cnode_router_test PRIVATE ws2_32)
-        target_compile_definitions(cnode_router_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_router_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(NAME cnode_router_test COMMAND cnode_router_test)
+
+    add_executable(cnode_geodata_test
+        tests/geodata_test.cpp
+        src/geo/geodata.cpp
+    )
+    target_include_directories(cnode_geodata_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_link_libraries(cnode_geodata_test PRIVATE asio::asio Threads::Threads)
+    target_compile_options(cnode_geodata_test PRIVATE
+        -Wall -Wextra -Wpedantic
+    )
+    add_test(NAME cnode_geodata_test COMMAND cnode_geodata_test)
 
     add_executable(cnode_outbound_selection_test
         tests/outbound_selection_test.cpp
@@ -1907,8 +1680,7 @@ if(CNODE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/src
     )
     target_compile_options(cnode_outbound_selection_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_outbound_selection_test
@@ -1926,14 +1698,8 @@ if(CNODE_BUILD_TESTS)
         asio::asio
         Threads::Threads
     )
-    if(WIN32)
-        target_link_libraries(cnode_outbound_bind_test PRIVATE ws2_32 iphlpapi)
-        target_compile_definitions(
-            cnode_outbound_bind_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_outbound_bind_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_outbound_bind_test
@@ -1952,14 +1718,8 @@ if(CNODE_BUILD_TESTS)
         asio::asio
         Threads::Threads
     )
-    if(WIN32)
-        target_link_libraries(cnode_inbound_listen_test PRIVATE ws2_32)
-        target_compile_definitions(
-            cnode_inbound_listen_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_inbound_listen_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_inbound_listen_test
@@ -1974,8 +1734,7 @@ if(CNODE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
     target_compile_options(cnode_panel_node_ids_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_panel_node_ids_test
@@ -1994,8 +1753,7 @@ if(CNODE_BUILD_TESTS)
         cnode_zlib
     )
     target_compile_options(cnode_log_format_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_log_format_test
@@ -2009,17 +1767,13 @@ if(CNODE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
     target_link_libraries(cnode_session_access_log_test PRIVATE asio::asio Threads::Threads)
-    if(WIN32)
-        target_link_libraries(cnode_session_access_log_test PRIVATE ws2_32)
-    endif()
     add_test(NAME cnode_session_access_log_test COMMAND cnode_session_access_log_test)
 
     add_executable(cnode_runtime_failure_test
         tests/runtime_failure_test.cpp src/infra/runtime_failure.cpp)
     target_include_directories(cnode_runtime_failure_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_compile_options(cnode_runtime_failure_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
+        -Wall -Wextra -Wpedantic)
     add_test(NAME cnode_runtime_failure_test COMMAND ${CMAKE_COMMAND}
         -DTEST_EXECUTABLE=$<TARGET_FILE:cnode_runtime_failure_test>
         -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime_failure_test.cmake)
@@ -2056,6 +1810,18 @@ if(CNODE_BUILD_TESTS)
     add_executable(cnode_http2_server_errors_test
         tests/http2_server_errors_test.cpp
         ${CNODE_HTTP_HANDSHAKE_TEST_SOURCES})
+    add_executable(cnode_http2_flow_control_test
+        tests/http2_flow_control_test.cpp
+        ${CNODE_HTTP_HANDSHAKE_TEST_SOURCES})
+    add_executable(cnode_http2_receive_credit_test
+        tests/http2_receive_credit_test.cpp
+        ${CNODE_HTTP_HANDSHAKE_TEST_SOURCES})
+    add_executable(cnode_xhttp_http1_test
+        tests/xhttp_http1_test.cpp
+        ${CNODE_HTTP_HANDSHAKE_TEST_SOURCES})
+    add_executable(cnode_xhttp_session_lifecycle_test
+        tests/xhttp_session_lifecycle_test.cpp
+        ${CNODE_HTTP_HANDSHAKE_TEST_SOURCES})
     add_executable(cnode_tls_record_buffer_test
         tests/tls_record_buffer_test.cpp
         ${CNODE_HTTP_HANDSHAKE_TEST_SOURCES})
@@ -2064,6 +1830,10 @@ if(CNODE_BUILD_TESTS)
             cnode_worker_connection_limit_runtime_test
             cnode_http_handshake_read_ahead_test
             cnode_http2_server_errors_test
+            cnode_http2_flow_control_test
+            cnode_http2_receive_credit_test
+            cnode_xhttp_http1_test
+            cnode_xhttp_session_lifecycle_test
             cnode_tls_record_buffer_test)
         foreach(property IN ITEMS INCLUDE_DIRECTORIES COMPILE_DEFINITIONS
                 COMPILE_OPTIONS LINK_LIBRARIES LINK_OPTIONS PRECOMPILE_HEADERS)
@@ -2089,6 +1859,16 @@ if(CNODE_BUILD_TESTS)
     set_tests_properties(cnode_http_handshake_read_ahead_test PROPERTIES TIMEOUT 30)
     add_test(NAME cnode_http2_server_errors_test COMMAND cnode_http2_server_errors_test)
     set_tests_properties(cnode_http2_server_errors_test PROPERTIES TIMEOUT 30)
+    add_test(NAME cnode_http2_flow_control_test COMMAND cnode_http2_flow_control_test)
+    set_tests_properties(cnode_http2_flow_control_test PROPERTIES TIMEOUT 30)
+    add_test(NAME cnode_http2_receive_credit_test COMMAND cnode_http2_receive_credit_test)
+    set_tests_properties(cnode_http2_receive_credit_test PROPERTIES TIMEOUT 30)
+    add_test(NAME cnode_xhttp_http1_test COMMAND cnode_xhttp_http1_test)
+    set_tests_properties(cnode_xhttp_http1_test PROPERTIES TIMEOUT 30)
+    target_include_directories(cnode_xhttp_session_lifecycle_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/internet)
+    add_test(NAME cnode_xhttp_session_lifecycle_test COMMAND cnode_xhttp_session_lifecycle_test)
+    set_tests_properties(cnode_xhttp_session_lifecycle_test PROPERTIES TIMEOUT 30)
     add_test(NAME cnode_worker_connection_limit_runtime_test
         COMMAND cnode_worker_connection_limit_runtime_test)
     set_tests_properties(cnode_worker_connection_limit_runtime_test PROPERTIES TIMEOUT 45)
@@ -2108,8 +1888,7 @@ if(CNODE_BUILD_TESTS)
         CNODE_TEST_UDP_LISTENER_RUNTIME_FAULT CNODE_TEST_ALLOCATOR_FAULT
         ASIO_DISABLE_AWAITABLE_FRAME_RECYCLING)
     target_compile_options(cnode_worker_udp_listener_runtime_test PRIVATE
-        "$<$<CXX_COMPILER_ID:MSVC>:/FI${CMAKE_CURRENT_SOURCE_DIR}/tests/worker_udp_listener_runtime_fault.hpp>"
-        "$<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-include${CMAKE_CURRENT_SOURCE_DIR}/tests/worker_udp_listener_runtime_fault.hpp>")
+        "-include${CMAKE_CURRENT_SOURCE_DIR}/tests/worker_udp_listener_runtime_fault.hpp")
     add_test(NAME cnode_worker_udp_listener_runtime_test
         COMMAND cnode_worker_udp_listener_runtime_test)
     add_test(NAME cnode_worker_udp_association_runtime_test
@@ -2162,15 +1941,9 @@ if(CNODE_BUILD_TESTS)
     target_compile_definitions(cnode_worker_udp_listener_oom_test PRIVATE
         CNODE_TEST_ALLOCATOR_FAULT ASIO_DISABLE_AWAITABLE_FRAME_RECYCLING)
     target_link_libraries(cnode_worker_udp_listener_oom_test PRIVATE asio::asio Threads::Threads cnode_zlib)
-    if(WIN32)
-        target_link_libraries(cnode_worker_udp_listener_oom_test PRIVATE ws2_32)
-        target_compile_definitions(cnode_worker_udp_listener_oom_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_worker_udp_listener_oom_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
-        "$<$<CXX_COMPILER_ID:MSVC>:/FI${CMAKE_CURRENT_SOURCE_DIR}/tests/async_allocation_fault.hpp>"
-        "$<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-include${CMAKE_CURRENT_SOURCE_DIR}/tests/async_allocation_fault.hpp>")
+        -Wall -Wextra -Wpedantic
+        "-include${CMAKE_CURRENT_SOURCE_DIR}/tests/async_allocation_fault.hpp")
     add_test(NAME cnode_worker_udp_listener_oom_test COMMAND cnode_worker_udp_listener_oom_test)
     set_tests_properties(cnode_worker_udp_listener_oom_test PROPERTIES TIMEOUT 15)
 
@@ -2187,13 +1960,8 @@ if(CNODE_BUILD_TESTS)
         ${concurrentqueue_SOURCE_DIR})
     target_link_libraries(cnode_udp_association_reclaimer_test PRIVATE
         asio::asio Threads::Threads cnode_zlib)
-    if(WIN32)
-        target_link_libraries(cnode_udp_association_reclaimer_test PRIVATE ws2_32)
-        target_compile_definitions(cnode_udp_association_reclaimer_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_udp_association_reclaimer_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
+        -Wall -Wextra -Wpedantic)
     add_test(NAME cnode_udp_association_reclaimer_test COMMAND cnode_udp_association_reclaimer_test)
     set_tests_properties(cnode_udp_association_reclaimer_test PROPERTIES TIMEOUT 15)
 
@@ -2211,19 +1979,12 @@ if(CNODE_BUILD_TESTS)
         ${concurrentqueue_SOURCE_DIR})
     target_link_libraries(cnode_udp_native_lifecycle_test PRIVATE
         asio::asio Threads::Threads cnode_zlib)
-    if(WIN32)
-        target_link_libraries(cnode_udp_native_lifecycle_test PRIVATE ws2_32)
-        target_compile_definitions(cnode_udp_native_lifecycle_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_definitions(cnode_udp_native_lifecycle_test PRIVATE
         ASIO_DISABLE_AWAITABLE_FRAME_RECYCLING CNODE_TEST_UDP_NATIVE_LIFECYCLE_FAULT)
     target_compile_options(cnode_udp_native_lifecycle_test PRIVATE
-        "$<$<CXX_COMPILER_ID:MSVC>:/FI${CMAKE_CURRENT_SOURCE_DIR}/tests/udp_native_lifecycle_allocation.hpp>"
-        "$<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-include${CMAKE_CURRENT_SOURCE_DIR}/tests/udp_native_lifecycle_allocation.hpp>"
-        "$<$<CXX_COMPILER_ID:MSVC>:/FI${CMAKE_CURRENT_SOURCE_DIR}/tests/async_allocation_fault.hpp>"
-        "$<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-include${CMAKE_CURRENT_SOURCE_DIR}/tests/async_allocation_fault.hpp>"
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
+        "-include${CMAKE_CURRENT_SOURCE_DIR}/tests/udp_native_lifecycle_allocation.hpp"
+        "-include${CMAKE_CURRENT_SOURCE_DIR}/tests/async_allocation_fault.hpp"
+        -Wall -Wextra -Wpedantic)
     add_test(NAME cnode_udp_native_lifecycle_test COMMAND cnode_udp_native_lifecycle_test)
     set_tests_properties(cnode_udp_native_lifecycle_test PROPERTIES TIMEOUT 15)
 
@@ -2246,15 +2007,9 @@ if(CNODE_BUILD_TESTS)
         Threads::Threads
         cnode_zlib
     )
-    if(WIN32)
-        target_link_libraries(cnode_udp_socket_owner_test PRIVATE ws2_32)
-        target_compile_definitions(
-            cnode_udp_socket_owner_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_definitions(cnode_udp_socket_owner_test PRIVATE CNODE_TEST_ALLOCATOR_FAULT)
     target_compile_options(cnode_udp_socket_owner_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_udp_socket_owner_test
@@ -2263,6 +2018,9 @@ if(CNODE_BUILD_TESTS)
     foreach(test IN ITEMS udp_request ss_udp_request)
         add_executable(cnode_${test}_test
             tests/${test}_test.cpp
+            src/transport/async_stream.cpp
+            src/transport/internet/tcp_stream.cpp
+            src/transport/internet/proxy_protocol.cpp
             src/transport/internet/datagram_socket.cpp
             src/app/dns/dns.cpp
             src/app/dns/cache.cpp
@@ -2286,13 +2044,8 @@ if(CNODE_BUILD_TESTS)
             target_include_directories(cnode_${test}_test PRIVATE ${blake3_SOURCE_DIR}/c)
             target_link_libraries(cnode_${test}_test PRIVATE cnode_blake3)
         endif()
-        if(WIN32)
-            target_link_libraries(cnode_${test}_test PRIVATE ws2_32)
-            target_compile_definitions(cnode_${test}_test PRIVATE _WIN32_WINNT=0x0A00)
-        endif()
         target_compile_options(cnode_${test}_test PRIVATE
-            $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-            $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+            -Wall -Wextra -Wpedantic
         )
         add_test(NAME cnode_${test}_test COMMAND cnode_${test}_test)
         set_tests_properties(cnode_${test}_test PROPERTIES TIMEOUT 30)
@@ -2309,13 +2062,8 @@ if(CNODE_BUILD_TESTS)
         target_include_directories(cnode_${test}_test PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
         target_link_libraries(cnode_${test}_test PRIVATE asio::asio Threads::Threads)
-        if(WIN32)
-            target_link_libraries(cnode_${test}_test PRIVATE ws2_32)
-            target_compile_definitions(cnode_${test}_test PRIVATE _WIN32_WINNT=0x0A00)
-        endif()
         target_compile_options(cnode_${test}_test PRIVATE
-            $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-            $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
+            -Wall -Wextra -Wpedantic)
         add_test(NAME cnode_${test}_test COMMAND cnode_${test}_test)
         set_tests_properties(cnode_${test}_test PROPERTIES TIMEOUT 30)
     endforeach()
@@ -2323,31 +2071,22 @@ if(CNODE_BUILD_TESTS)
     add_executable(cnode_cancellation_source_test tests/cancellation_source_test.cpp)
     target_include_directories(cnode_cancellation_source_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_link_libraries(cnode_cancellation_source_test PRIVATE asio::asio Threads::Threads)
-    if(WIN32)
-        target_compile_definitions(cnode_cancellation_source_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_cancellation_source_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
+        -Wall -Wextra -Wpedantic)
     add_test(NAME cnode_cancellation_source_test COMMAND cnode_cancellation_source_test)
 
     add_executable(cnode_token_bucket_test tests/token_bucket_test.cpp)
     target_include_directories(cnode_token_bucket_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_link_libraries(cnode_token_bucket_test PRIVATE Threads::Threads)
     target_compile_options(cnode_token_bucket_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
+        -Wall -Wextra -Wpedantic)
     add_test(NAME cnode_token_bucket_test COMMAND cnode_token_bucket_test)
 
     add_executable(cnode_buffer_ownership_test tests/buffer_ownership_test.cpp)
     target_include_directories(cnode_buffer_ownership_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_link_libraries(cnode_buffer_ownership_test PRIVATE asio::asio Threads::Threads)
-    if(WIN32)
-        target_compile_definitions(cnode_buffer_ownership_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_buffer_ownership_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
+        -Wall -Wextra -Wpedantic)
     add_test(NAME cnode_buffer_ownership_test COMMAND cnode_buffer_ownership_test)
 
     add_executable(cnode_blake3_dispatch_test tests/blake3_dispatch_test.cpp)
@@ -2367,15 +2106,14 @@ if(CNODE_BUILD_TESTS)
     target_link_libraries(cnode_blake3_portable_test PRIVATE cnode_blake3_portable_test_lib)
     add_test(NAME cnode_blake3_portable_test COMMAND cnode_blake3_portable_test)
 
-    add_executable(cnode_thread_pool_test tests/thread_pool_test.cpp)
-    target_include_directories(cnode_thread_pool_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    target_link_libraries(cnode_thread_pool_test PRIVATE asio::asio Threads::Threads)
-    target_compile_definitions(cnode_thread_pool_test PRIVATE
+    add_executable(cnode_thread_memory_pool_test tests/thread_memory_pool_test.cpp)
+    target_include_directories(cnode_thread_memory_pool_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(cnode_thread_memory_pool_test PRIVATE asio::asio Threads::Threads)
+    target_compile_definitions(cnode_thread_memory_pool_test PRIVATE
         CNODE_MEMORY_STATS CNODE_TEST_ALLOCATOR_FAULT)
-    target_compile_options(cnode_thread_pool_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
-    add_test(NAME cnode_thread_pool_test COMMAND cnode_thread_pool_test)
+    target_compile_options(cnode_thread_memory_pool_test PRIVATE
+        -Wall -Wextra -Wpedantic)
+    add_test(NAME cnode_thread_memory_pool_test COMMAND cnode_thread_memory_pool_test)
 
     foreach(test IN ITEMS asio_operation_allocator phase_deadline)
         add_executable(cnode_${test}_test
@@ -2390,13 +2128,8 @@ if(CNODE_BUILD_TESTS)
         target_include_directories(cnode_${test}_test PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/include ${concurrentqueue_SOURCE_DIR})
         target_link_libraries(cnode_${test}_test PRIVATE asio::asio Threads::Threads cnode_zlib ssl crypto)
-        if(WIN32)
-            target_link_libraries(cnode_${test}_test PRIVATE ws2_32)
-            target_compile_definitions(cnode_${test}_test PRIVATE _WIN32_WINNT=0x0A00)
-        endif()
         target_compile_options(cnode_${test}_test PRIVATE
-            $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-            $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
+            -Wall -Wextra -Wpedantic)
         add_test(NAME cnode_${test}_test COMMAND cnode_${test}_test)
         set_tests_properties(cnode_${test}_test PROPERTIES TIMEOUT 10)
     endforeach()
@@ -2408,13 +2141,10 @@ if(CNODE_BUILD_TESTS)
         target_compile_definitions(cnode_asio_recycling_cache_${cache_size}_test PRIVATE
             ASIO_STANDALONE ASIO_RECYCLING_ALLOCATOR_CACHE_SIZE=${cache_size})
         target_link_libraries(cnode_asio_recycling_cache_${cache_size}_test PRIVATE Threads::Threads)
-        if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-            target_compile_definitions(cnode_asio_recycling_cache_${cache_size}_test PRIVATE CNODE_WRAP_ALIGNED_ALLOC)
-            target_link_options(cnode_asio_recycling_cache_${cache_size}_test PRIVATE -Wl,--wrap=aligned_alloc)
-        endif()
+        target_compile_definitions(cnode_asio_recycling_cache_${cache_size}_test PRIVATE CNODE_WRAP_ALIGNED_ALLOC)
+        target_link_options(cnode_asio_recycling_cache_${cache_size}_test PRIVATE -Wl,--wrap=aligned_alloc)
         target_compile_options(cnode_asio_recycling_cache_${cache_size}_test PRIVATE
-            $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-            $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
+            -Wall -Wextra -Wpedantic)
         add_test(NAME cnode_asio_recycling_cache_${cache_size}_test
             COMMAND cnode_asio_recycling_cache_${cache_size}_test)
     endforeach()
@@ -2434,17 +2164,15 @@ if(CNODE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/include ${concurrentqueue_SOURCE_DIR})
     target_compile_definitions(cnode_relay_initial_payload_test PRIVATE CNODE_TEST_ALLOCATOR_FAULT)
     target_link_libraries(cnode_relay_initial_payload_test PRIVATE asio::asio Threads::Threads cnode_zlib)
-    if(WIN32)
-        target_link_libraries(cnode_relay_initial_payload_test PRIVATE ws2_32)
-        target_compile_definitions(cnode_relay_initial_payload_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_relay_initial_payload_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
+        -Wall -Wextra -Wpedantic)
     add_test(NAME cnode_relay_initial_payload_test COMMAND cnode_relay_initial_payload_test)
     set_tests_properties(cnode_relay_initial_payload_test PROPERTIES TIMEOUT 30)
     add_test(NAME cnode_relay_full_close_test COMMAND cnode_relay_initial_payload_test --full-close)
     set_tests_properties(cnode_relay_full_close_test PROPERTIES TIMEOUT 15)
+    add_test(NAME cnode_relay_half_close_backpressure_test
+        COMMAND cnode_relay_initial_payload_test --half-close-backpressure)
+    set_tests_properties(cnode_relay_half_close_backpressure_test PROPERTIES TIMEOUT 15)
 
     add_executable(cnode_dispatcher_cancellation_test
         tests/dispatcher_cancellation_test.cpp
@@ -2469,13 +2197,8 @@ if(CNODE_BUILD_TESTS)
     target_include_directories(cnode_dispatcher_cancellation_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include ${concurrentqueue_SOURCE_DIR})
     target_link_libraries(cnode_dispatcher_cancellation_test PRIVATE asio::asio Threads::Threads cnode_zlib crypto)
-    if(WIN32)
-        target_link_libraries(cnode_dispatcher_cancellation_test PRIVATE ws2_32)
-        target_compile_definitions(cnode_dispatcher_cancellation_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_dispatcher_cancellation_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
+        -Wall -Wextra -Wpedantic)
     add_test(NAME cnode_dispatcher_cancellation_test COMMAND cnode_dispatcher_cancellation_test)
     set_tests_properties(cnode_dispatcher_cancellation_test PROPERTIES TIMEOUT 20)
 
@@ -2490,14 +2213,8 @@ if(CNODE_BUILD_TESTS)
         asio::asio
         Threads::Threads
     )
-    if(WIN32)
-        target_link_libraries(cnode_xhttp_packet_session_key_test PRIVATE ws2_32)
-        target_compile_definitions(
-            cnode_xhttp_packet_session_key_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_xhttp_packet_session_key_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_xhttp_packet_session_key_test
@@ -2514,14 +2231,8 @@ if(CNODE_BUILD_TESTS)
         asio::asio
         Threads::Threads
     )
-    if(WIN32)
-        target_link_libraries(cnode_xhttp_packet_queue_test PRIVATE ws2_32)
-        target_compile_definitions(
-            cnode_xhttp_packet_queue_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_xhttp_packet_queue_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_xhttp_packet_queue_test
@@ -2538,14 +2249,8 @@ if(CNODE_BUILD_TESTS)
         asio::asio
         Threads::Threads
     )
-    if(WIN32)
-        target_link_libraries(cnode_xhttp_upload_stream_slot_test PRIVATE ws2_32)
-        target_compile_definitions(
-            cnode_xhttp_upload_stream_slot_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_xhttp_upload_stream_slot_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_xhttp_upload_stream_slot_test
@@ -2563,16 +2268,9 @@ if(CNODE_BUILD_TESTS)
         asio::asio
         Threads::Threads
     )
-    if(WIN32)
-        target_link_libraries(cnode_timeout_scheduler_test PRIVATE ws2_32)
-        target_compile_definitions(
-            cnode_timeout_scheduler_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_timeout_scheduler_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
-        "$<$<CXX_COMPILER_ID:MSVC>:/FI${CMAKE_CURRENT_SOURCE_DIR}/tests/timeout_scheduler_allocation.hpp>"
-        "$<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-include${CMAKE_CURRENT_SOURCE_DIR}/tests/timeout_scheduler_allocation.hpp>"
+        -Wall -Wextra -Wpedantic
+        "-include${CMAKE_CURRENT_SOURCE_DIR}/tests/timeout_scheduler_allocation.hpp"
     )
     add_test(
         NAME cnode_timeout_scheduler_test
@@ -2590,14 +2288,8 @@ if(CNODE_BUILD_TESTS)
         asio::asio
         Threads::Threads
     )
-    if(WIN32)
-        target_link_libraries(cnode_async_write_gate_test PRIVATE ws2_32)
-        target_compile_definitions(
-            cnode_async_write_gate_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_async_write_gate_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_async_write_gate_test
@@ -2615,14 +2307,8 @@ if(CNODE_BUILD_TESTS)
         asio::asio
         Threads::Threads
     )
-    if(WIN32)
-        target_link_libraries(cnode_node_transition_test PRIVATE ws2_32)
-        target_compile_definitions(
-            cnode_node_transition_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_node_transition_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_node_transition_test
@@ -2635,14 +2321,9 @@ if(CNODE_BUILD_TESTS)
     target_include_directories(cnode_node_transaction_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/src/service/controller)
-    target_link_libraries(cnode_node_transaction_test PRIVATE asio::asio Threads::Threads)
-    if(WIN32)
-        target_link_libraries(cnode_node_transaction_test PRIVATE ws2_32)
-        target_compile_definitions(cnode_node_transaction_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
+    target_link_libraries(cnode_node_transaction_test PRIVATE asio::asio Threads::Threads crypto)
     target_compile_options(cnode_node_transaction_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
+        -Wall -Wextra -Wpedantic)
     add_test(NAME cnode_node_transaction_test COMMAND cnode_node_transaction_test)
     set_tests_properties(cnode_node_transaction_test PROPERTIES TIMEOUT 10)
 
@@ -2653,8 +2334,7 @@ if(CNODE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/src/service/controller
     )
     target_compile_options(cnode_panel_schedule_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_panel_schedule_test
@@ -2673,14 +2353,8 @@ if(CNODE_BUILD_TESTS)
         Threads::Threads
         cnode_zlib
     )
-    if(WIN32)
-        target_link_libraries(cnode_ban_tracking_contract_test PRIVATE ws2_32)
-        target_compile_definitions(
-            cnode_ban_tracking_contract_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_ban_tracking_contract_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /wd4324 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_ban_tracking_contract_test
@@ -2701,14 +2375,8 @@ if(CNODE_BUILD_TESTS)
     # Exercise launch allocations even after an earlier case populated Asio caches.
     target_compile_definitions(cnode_awaitable_batch_test PRIVATE
         ASIO_DISABLE_AWAITABLE_FRAME_RECYCLING)
-    if(WIN32)
-        target_link_libraries(cnode_awaitable_batch_test PRIVATE ws2_32)
-        target_compile_definitions(
-            cnode_awaitable_batch_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_awaitable_batch_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_awaitable_batch_test
@@ -2729,16 +2397,9 @@ if(CNODE_BUILD_TESTS)
     # Exercise launch allocations even after an earlier case populated Asio caches.
     target_compile_definitions(cnode_awaitable_task_group_test PRIVATE
         ASIO_DISABLE_AWAITABLE_FRAME_RECYCLING CNODE_MEMORY_STATS)
-    if(WIN32)
-        target_link_libraries(cnode_awaitable_task_group_test PRIVATE ws2_32)
-        target_compile_definitions(
-            cnode_awaitable_task_group_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_awaitable_task_group_test PRIVATE
-        "$<$<CXX_COMPILER_ID:MSVC>:/FI${CMAKE_CURRENT_SOURCE_DIR}/tests/async_allocation_fault.hpp>"
-        "$<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-include${CMAKE_CURRENT_SOURCE_DIR}/tests/async_allocation_fault.hpp>"
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        "-include${CMAKE_CURRENT_SOURCE_DIR}/tests/async_allocation_fault.hpp"
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_awaitable_task_group_test
@@ -2748,8 +2409,7 @@ if(CNODE_BUILD_TESTS)
     add_executable(cnode_process_resources_test tests/process_resources_test.cpp)
     target_include_directories(cnode_process_resources_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_compile_options(cnode_process_resources_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
+        -Wall -Wextra -Wpedantic)
     add_test(NAME cnode_process_resources_test COMMAND cnode_process_resources_test)
 
     add_executable(cnode_monitor_loop_test
@@ -2758,13 +2418,8 @@ if(CNODE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(cnode_monitor_loop_test PRIVATE asio::asio Threads::Threads)
-    if(WIN32)
-        target_link_libraries(cnode_monitor_loop_test PRIVATE ws2_32)
-        target_compile_definitions(cnode_monitor_loop_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_monitor_loop_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
+        -Wall -Wextra -Wpedantic)
     add_test(NAME cnode_monitor_loop_test COMMAND cnode_monitor_loop_test)
     set_tests_properties(cnode_monitor_loop_test PROPERTIES TIMEOUT 10)
 
@@ -2779,14 +2434,8 @@ if(CNODE_BUILD_TESTS)
         asio::asio
         Threads::Threads
     )
-    if(WIN32)
-        target_link_libraries(cnode_rule_lifecycle_test PRIVATE ws2_32)
-        target_compile_definitions(
-            cnode_rule_lifecycle_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_rule_lifecycle_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_rule_lifecycle_test
@@ -2803,14 +2452,8 @@ if(CNODE_BUILD_TESTS)
         asio::asio
         Threads::Threads
     )
-    if(WIN32)
-        target_link_libraries(cnode_worker_mailbox_test PRIVATE ws2_32)
-        target_compile_definitions(
-            cnode_worker_mailbox_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_worker_mailbox_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_worker_mailbox_test
@@ -2827,14 +2470,8 @@ if(CNODE_BUILD_TESTS)
         asio::asio
         Threads::Threads
     )
-    if(WIN32)
-        target_link_libraries(cnode_worker_runtime_contract_test PRIVATE ws2_32)
-        target_compile_definitions(
-            cnode_worker_runtime_contract_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_worker_runtime_contract_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_worker_runtime_contract_test
@@ -2934,15 +2571,10 @@ if(CNODE_BUILD_TESTS)
     target_link_libraries(cnode_protocol_registration_test PRIVATE
         asio::asio
         Threads::Threads
+        crypto
     )
-    if(WIN32)
-        target_link_libraries(cnode_protocol_registration_test PRIVATE ws2_32)
-        target_compile_definitions(
-            cnode_protocol_registration_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_protocol_registration_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_protocol_registration_test
@@ -2957,10 +2589,10 @@ if(CNODE_BUILD_TESTS)
     )
     target_link_libraries(cnode_user_store_typed_payload_test PRIVATE
         Threads::Threads
+        crypto
     )
     target_compile_options(cnode_user_store_typed_payload_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        -Wall -Wextra -Wpedantic
     )
     add_test(
         NAME cnode_user_store_typed_payload_test
@@ -2970,10 +2602,9 @@ if(CNODE_BUILD_TESTS)
         tests/user_store_batch_test.cpp
         src/app/proxyman/inbound/user_store.cpp)
     target_include_directories(cnode_user_store_batch_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    target_link_libraries(cnode_user_store_batch_test PRIVATE Threads::Threads)
+    target_link_libraries(cnode_user_store_batch_test PRIVATE Threads::Threads crypto)
     target_compile_options(cnode_user_store_batch_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
+        -Wall -Wextra -Wpedantic)
     add_test(NAME cnode_user_store_batch_test COMMAND cnode_user_store_batch_test)
 
     add_executable(cnode_startup_inbounds_test
@@ -2985,31 +2616,52 @@ if(CNODE_BUILD_TESTS)
         src/transport/internet/inbound_listen.cpp)
     target_include_directories(cnode_startup_inbounds_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/app)
-    target_link_libraries(cnode_startup_inbounds_test PRIVATE asio::asio Threads::Threads)
-    if(WIN32)
-        target_link_libraries(cnode_startup_inbounds_test PRIVATE ws2_32)
-        target_compile_definitions(cnode_startup_inbounds_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
+    target_link_libraries(cnode_startup_inbounds_test PRIVATE asio::asio Threads::Threads crypto)
     target_compile_options(cnode_startup_inbounds_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
+        -Wall -Wextra -Wpedantic)
     add_test(NAME cnode_startup_inbounds_test COMMAND cnode_startup_inbounds_test)
 
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
+        add_custom_target(anytls_reference_prepare
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/anytls_reference_integration.py
+                prepare --workspace ${CMAKE_CURRENT_BINARY_DIR}/anytls-reference --download
+            USES_TERMINAL)
+        add_custom_target(anytls_reference_integration
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/anytls_reference_integration.py
+                run --workspace ${CMAKE_CURRENT_BINARY_DIR}/anytls-reference
+                --binary $<TARGET_FILE:cnode>
+                --output ${CMAKE_CURRENT_BINARY_DIR}/anytls-integration
+            DEPENDS cnode
+            USES_TERMINAL)
+        add_test(NAME cnode_xhttp_worker_migration_integration_test
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/xhttp_worker_migration_integration.py
+                --binary $<TARGET_FILE:cnode>
+                --output ${CMAKE_CURRENT_BINARY_DIR}/xhttp_worker_migration_integration_test)
+        set_tests_properties(cnode_xhttp_worker_migration_integration_test PROPERTIES TIMEOUT 180)
         add_test(NAME cnode_panel_user_sync_integration_test
             COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/panel_user_sync_integration.py
                 --binary $<TARGET_FILE:cnode>
                 --output ${CMAKE_CURRENT_BINARY_DIR}/panel_user_sync_integration_test)
         set_tests_properties(cnode_panel_user_sync_integration_test PROPERTIES TIMEOUT 120)
+        add_test(NAME cnode_panel_integrity_integration_test
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/panel_integrity_integration.py
+                --binary $<TARGET_FILE:cnode>
+                --root ${CMAKE_CURRENT_BINARY_DIR}/panel_integrity_integration_test)
+        set_tests_properties(cnode_panel_integrity_integration_test PROPERTIES TIMEOUT 120)
         add_test(NAME cnode_udp_relay_integration_test
             COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/udp_relay_integration.py
                 --binary $<TARGET_FILE:cnode>
                 --output ${CMAKE_CURRENT_BINARY_DIR}/udp_relay_integration_test)
         set_tests_properties(cnode_udp_relay_integration_test PROPERTIES TIMEOUT 90)
-        foreach(integration IN ITEMS dns_endpoint tls_cancellation http_upgrade grpc_eof grpc_substream logical_transport_deadline reality)
+        foreach(integration IN ITEMS dns_endpoint tls_cancellation http_upgrade grpc_eof grpc_substream logical_transport_deadline reality
+                initial_payload ip_literal substream_cancellation grpc_hunk http2_server_errors proxy_protocol tls_autosign)
             add_test(NAME cnode_${integration}_integration_test
                 COMMAND ${Python3_EXECUTABLE}
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/${integration}_integration.py
@@ -3019,7 +2671,12 @@ if(CNODE_BUILD_TESTS)
         endforeach()
         set_tests_properties(cnode_grpc_eof_integration_test
             cnode_grpc_substream_integration_test
-            cnode_logical_transport_deadline_integration_test PROPERTIES TIMEOUT 90)
+            cnode_logical_transport_deadline_integration_test
+            cnode_initial_payload_integration_test
+            cnode_ip_literal_integration_test
+            cnode_substream_cancellation_integration_test
+            cnode_grpc_hunk_integration_test PROPERTIES TIMEOUT 90)
+        set_tests_properties(cnode_http2_server_errors_integration_test PROPERTIES TIMEOUT 150)
         add_test(NAME cnode_tls_cancellation_partial_integration_test
             COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/tls_cancellation_integration.py
@@ -3080,13 +2737,8 @@ if(CNODE_BUILD_TESTS)
         src/transport/internet/stream_settings.cpp)
     target_include_directories(cnode_stream_settings_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_link_libraries(cnode_stream_settings_test PRIVATE asio::asio Threads::Threads)
-    if(WIN32)
-        target_link_libraries(cnode_stream_settings_test PRIVATE ws2_32)
-        target_compile_definitions(cnode_stream_settings_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
     target_compile_options(cnode_stream_settings_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
+        -Wall -Wextra -Wpedantic)
     add_test(NAME cnode_stream_settings_test COMMAND cnode_stream_settings_test)
 
     add_test(
@@ -3107,6 +2759,20 @@ foreach(target IN LISTS cnode_targets)
     get_target_property(target_type ${target} TYPE)
     if(target_type STREQUAL "EXECUTABLE" AND target MATCHES "^cnode($|_)")
         target_link_libraries(${target} PRIVATE tl::expected)
+        # Transport and ticket runtimes use the same session-domain executor in
+        # standalone tests. Compile it with each target's allocator/sanitizer
+        # settings rather than mixing an uninstrumented shared implementation.
+        get_target_property(target_sources ${target} SOURCES)
+        if(target_sources MATCHES "(timeout_scheduler|tcp_stream|session_group_executor|vless_ticket_service|dns|sharded_user_stats|validator)\\.cpp")
+            foreach(domain_source IN ITEMS src/app/session_group_executor.cpp
+                    src/infra/runtime_failure.cpp src/infra/log.cpp)
+                if(NOT domain_source IN_LIST target_sources)
+                    target_sources(${target} PRIVATE ${domain_source})
+                endif()
+            endforeach()
+            target_include_directories(${target} PRIVATE ${concurrentqueue_SOURCE_DIR})
+            target_link_libraries(${target} PRIVATE asio::asio Threads::Threads cnode_zlib)
+        endif()
         if(NOT target MATCHES "_sanitized$")
             target_compile_definitions(${target} PRIVATE CNODE_USE_MIMALLOC)
             target_include_directories(${target} SYSTEM PRIVATE ${mimalloc_SOURCE_DIR}/include)

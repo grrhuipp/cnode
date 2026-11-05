@@ -1,6 +1,5 @@
 #pragma once
 
-#include "acppnode/core/constants.hpp"
 #include "acppnode/proxy/outbound.hpp"
 
 #include <chrono>
@@ -15,7 +14,7 @@ namespace acpp::proxy::blackhole::outbound {
 // Blackhole 出站设置
 // ============================================================================
 struct BlackholeSettings {
-    std::string response = std::string(constants::protocol::kNone);  // none / http
+    bool http_response = false;  // response.type == "http"
 };
 
 // ============================================================================

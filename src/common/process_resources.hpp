@@ -3,7 +3,6 @@
 #include <cerrno>
 #include <cstddef>
 #include <optional>
-#include <string_view>
 
 #include <dirent.h>
 #include <sys/resource.h>
@@ -11,7 +10,6 @@
 namespace acpp {
 
 struct ProcessDescriptors {
-    std::string_view kind = "fds";
     std::optional<size_t> open;
     std::optional<size_t> soft_limit;
     bool soft_limit_unlimited = false;

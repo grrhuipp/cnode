@@ -108,7 +108,7 @@ async def outbound(args, name, output, result, resources):
     port = available_port()
     configure(output, {'protocol': 'vless', 'listen': '127.0.0.1', 'port': port,
                        'settings': {'clients': [{'id': str(USER)}]}},
-              {'protocol': 'anytls', 'settings': {'server': '127.0.0.1', 'server_port': peer_port,
+              {'protocol': 'anytls', 'settings': {'address': '127.0.0.1', 'port': peer_port,
                'password': 'secret', 'minIdleSession': 1}, 'streamSettings': tls_settings()})
     resources.spawn([args.binary, '--config-dir', output], output / 'child.log')
     for sid in (1, 2, 3):

@@ -21,7 +21,7 @@ class Handler final : public ::acpp::Inbound {
 public:
     Handler(::acpp::UserOnlineTracker& validator,
             ::acpp::StatsShard& stats,
-            ::acpp::ConnectionLimiterPtr limiter,
+            ::acpp::ConnectionLimiter* limiter,
             ::acpp::ss::SsCipherInfo cipher_info);
 
     void AdoptWorkerStateFrom(
@@ -50,7 +50,7 @@ public:
 private:
     ::acpp::UserOnlineTracker& validator_;
     ::acpp::StatsShard* stats_ = nullptr;
-    ::acpp::ConnectionLimiterPtr limiter_;
+    ::acpp::ConnectionLimiter* limiter_;
     ::acpp::ss::SsCipherInfo cipher_info_;
     ::acpp::ss::Ss2022UdpReplayCache udp_replay_cache_;
     // 上次匹配成功的用户索引，用于优先尝试（大概率命中同一活跃用户）

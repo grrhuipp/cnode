@@ -142,11 +142,11 @@ struct Runtime {
             resources[tag].version = inbound.stream_settings.ws.path;
         });
     }
-    net::awaitable<bool> AddOutbound(const acpp::proxyman::outbound::PreparedOutboundConfig& outbound) {
+    net::awaitable<void> AddOutbound(const acpp::proxyman::outbound::PreparedOutboundConfig& outbound) {
         ++operations_started;
         co_await net::post(net::use_awaitable);
         const auto& tag = outbound.tag;
-        co_return Step("add-out:" + tag, [&] { resources[tag].outbound = true; });
+        Step("add-out:" + tag, [&] { resources[tag].outbound = true; });
     }
     net::awaitable<void> UpdateRules(const std::string& tag, const std::vector<acpp::rule::DetectRule>& rules) {
         ++operations_started;
@@ -246,7 +246,7 @@ void TestFailureMatrix() {
                 "a failed update must not acknowledge fetched user or config validators");
         }
     }
-    for (const auto& operation : {"add-in:" + next->tag, "add-out:" + next->tag}) {
+    for (const auto& operation : {"add-in:" + next->tag}) {
         for (const bool after : {false, true}) {
             Runtime runtime;
             NodeState state;

@@ -241,9 +241,7 @@ net::awaitable<void> ApplyNodeChange(
             users_attempted = true;
             co_await runtime.ApplyUsers(tag, *next->prepared_users);
             outbound_attempted = true;
-            if (!co_await runtime.AddOutbound(*next->outbound)) {
-                throw std::runtime_error("candidate outbound creation failed");
-            }
+            co_await runtime.AddOutbound(*next->outbound);
             inbound_attempted = true;
             if (!co_await runtime.AddInbound(*next->inbound)) {
                 throw std::runtime_error("candidate inbound creation failed");
@@ -307,9 +305,8 @@ net::awaitable<void> ApplyNodeChange(
             catch (...) { restored = false; }
         }
         if ((!different_tag && outbound_attempted) || old_outbound_retired) {
-            try {
-                if (!co_await runtime.AddOutbound(*old->outbound)) restored = false;
-            } catch (...) { restored = false; }
+            try { co_await runtime.AddOutbound(*old->outbound); }
+            catch (...) { restored = false; }
         }
         if ((!different_tag && rules_attempted) || old_rules_retired) {
             try { co_await runtime.UpdateRules(old_tag, old->rules); }

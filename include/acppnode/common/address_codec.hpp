@@ -42,8 +42,8 @@ struct AddressDecodeResult {
     size_t required = 1;
 };
 
-[[nodiscard]] inline size_t AddressEncodedSize(
-    const TargetAddress& target, AddressWireFormat) noexcept {
+// Every AddressWireFormat encodes the same fields, so the size is format-free.
+[[nodiscard]] inline size_t AddressEncodedSize(const TargetAddress& target) noexcept {
     if (target.IsDomain()) {
         return target.host.size() <= 255 ? 4 + target.host.size() : 0;
     }
@@ -57,7 +57,7 @@ struct AddressDecodeResult {
 [[nodiscard]] inline size_t EncodeAddressTo(
     const TargetAddress& target, uint8_t* output, size_t capacity,
     AddressWireFormat format) noexcept {
-    const size_t size = AddressEncodedSize(target, format);
+    const size_t size = AddressEncodedSize(target);
     if (!output || size == 0 || size > capacity) return 0;
     // An address may borrow from an existing frame, but never from the region
     // being overwritten by this encoding operation.
@@ -158,7 +158,7 @@ template <typename Reader>
     std::array<uint8_t, kMaxEncodedAddressSize> bytes{};
     size_t copied = 0;
     for (;;) {
-        const size_t total = buf::TotalLen(pending);
+        const size_t total = pending.byte_size();
         const size_t available = total > offset
             ? std::min(total - offset, bytes.size()) : 0;
         size_t skip = offset + copied;
@@ -183,7 +183,7 @@ template <typename Reader>
         if (decoded.status == AddressDecodeStatus::Invalid)
             co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
         auto next = co_await reader.ReadMultiBuffer();
-        if (!buf::HasData(next))
+        if (next.byte_size() == 0)
             co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
         next.MoveTo(pending, true);
     }

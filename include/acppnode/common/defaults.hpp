@@ -39,7 +39,6 @@ constexpr uint32_t kPanelPushInterval = 60;
 constexpr uint32_t kPanelStatusLogInterval = 60;
 constexpr uint32_t kPanelRequestTimeout = 30;
 constexpr uint32_t kMaxPanelRequestTimeout = 3600;
-constexpr uint32_t kPanelConfigRefreshInterval = 300;
 
 // 统计输出间隔
 constexpr uint32_t kStatsOutputInterval = 10;

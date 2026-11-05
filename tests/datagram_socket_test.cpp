@@ -2,6 +2,9 @@
 
 #include "acppnode/common/buf/multi_buffer.hpp"
 #include "acppnode/transport/link_error.hpp"
+#include "acppnode/app/session_group_executor.hpp"
+#include <optional>
+#include <thread>
 
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/cancellation_signal.hpp>
@@ -296,6 +299,80 @@ bool TestSocketLimitAndReclamation() {
     sockets.clear();
     return DatagramSocket::ActiveCount() == baseline;
 }
+bool TestZeroLengthNativeSends() {
+    acpp::net::io_context io;
+    DatagramSocket sender(io, acpp::net::ip::address_v4::loopback());
+    DatagramSocket receiver(io, acpp::net::ip::address_v4::loopback());
+    for (bool owned : {false, true}) {
+        auto operation = receiver.StartRead();
+        auto receiving = acpp::net::co_spawn(io, operation.Receive(), acpp::net::use_future);
+        auto sending = acpp::net::co_spawn(io,
+            owned ? SendPayload(sender, receiver.LocalEndpoint(), {})
+                  : SendBuffers(sender, receiver.LocalEndpoint(), {}),
+            acpp::net::use_future);
+        io.run_for(1s);
+        if (sending.wait_for(0s) != std::future_status::ready ||
+            receiving.wait_for(0s) != std::future_status::ready) {
+            sender.Close();
+            receiver.Close();
+            io.restart();
+            io.run();
+            return false;
+        }
+        sending.get();
+        if (!receiving.get().payload.empty()) return false;
+        io.restart();
+    }
+    return true;
+}
+
+bool TestAdmissionBucketSurvivesDomainMigration() {
+    struct Hooks final : acpp::ExecutionDomain::Hooks {
+        acpp::memory::AllocationDomain allocation;
+        std::optional<acpp::memory::ScopedAllocationDomain> lease;
+        std::exception_ptr failure;
+        void Enter() noexcept override { lease.emplace(allocation); }
+        void Leave() noexcept override { lease.reset(); }
+        void OnFailure(std::exception_ptr error) noexcept override { failure = error; }
+    };
+    acpp::net::io_context io;
+    auto coordinator = std::make_shared<acpp::GroupCoordinator>(io);
+    auto hooks = std::make_shared<Hooks>();
+    auto domain = acpp::ExecutionDomain::Create(io, 0, io.get_executor(), hooks, coordinator);
+    hooks->allocation.SetLeaseGroup(domain->LeaseIdentity(), acpp::ExecutionDomain::SharesLeaseIdentity);
+    const auto baseline = DatagramSocket::ActiveCount();
+    std::unique_ptr<DatagramSocket> socket;
+    domain->Execute([&] {
+        socket = std::make_unique<DatagramSocket>(io, acpp::net::ip::address_v4::loopback());
+    });
+    io.poll();
+    if (!socket || DatagramSocket::ActiveCount() != baseline + 1) return false;
+    bool remote_clean = false;
+    domain->Execute([&] {
+        socket.reset();
+        remote_clean = DatagramSocket::ActiveCount() == 0;
+    });
+    // The same stable domain is now executed on another native thread.
+    std::thread migrated([&] { io.poll(); });
+    migrated.join();
+    const bool passed = remote_clean && !hooks->failure &&
+        DatagramSocket::ActiveCount() == baseline;
+    domain.reset();
+    bool finalized = false;
+    auto finalize = [](std::shared_ptr<acpp::GroupCoordinator> owner)
+        -> acpp::net::awaitable<void> {
+        owner->CloseAdmission();
+        co_await owner->AsyncJoin();
+        owner->ReleaseServices();
+        co_await owner->Finalize();
+    };
+    acpp::net::co_spawn(io, finalize(coordinator),
+        [&](std::exception_ptr error) { finalized = !error; });
+    io.restart();
+    io.run_for(1s);
+    return passed && finalized;
+}
+
 }  // namespace
 
 int main() {
@@ -306,10 +383,13 @@ int main() {
         const bool ipv6 = TestIPv6MaximumAndFamilyValidation();
         const bool timeout_close = TestCloseAndReadScopeTimeout();
         const bool limit = TestSocketLimitAndReclamation();
+        const bool empty = TestZeroLengthNativeSends();
+        const bool migrated = TestAdmissionBucketSurvivesDomainMigration();
         const bool reclaimed = DatagramSocket::ActiveCount() == 0;
-        std::printf("datagram socket: bindings=%d cancel=%d parent_cancel=%d ipv6=%d timeout_close=%d limit=%d reclaimed=%d\n",
-                    bindings, cancel, parent_cancel, ipv6, timeout_close, limit, reclaimed);
-        return bindings && cancel && parent_cancel && ipv6 && timeout_close && limit && reclaimed ? 0 : 1;
+        std::printf("datagram socket: bindings=%d cancel=%d parent_cancel=%d ipv6=%d timeout_close=%d limit=%d empty=%d migrated=%d reclaimed=%d\n",
+                    bindings, cancel, parent_cancel, ipv6, timeout_close, limit, empty, migrated, reclaimed);
+        return bindings && cancel && parent_cancel && ipv6 && timeout_close && limit &&
+            empty && migrated && reclaimed ? 0 : 1;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "datagram socket test exception: %s\n", error.what());
         return 1;

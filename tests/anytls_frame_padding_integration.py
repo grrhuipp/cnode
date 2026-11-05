@@ -84,7 +84,7 @@ async def scenario(args, record, padding_expected, valid, output, result, resour
     configure(output,
         {'protocol': 'vless', 'listen': '127.0.0.1', 'port': front_port,
          'settings': {'clients': [{'id': str(USER)}]}},
-        {'protocol': 'anytls', 'settings': {'server': '127.0.0.1', 'server_port': peer_port,
+        {'protocol': 'anytls', 'settings': {'address': '127.0.0.1', 'port': peer_port,
          'password': 'frame-padding-fixture', 'minIdleSession': 1}, 'streamSettings': tls_settings()})
     if args.reference_client:
         resources.spawn([args.reference_client, '-l', f'127.0.0.1:{front_port}', '-s',

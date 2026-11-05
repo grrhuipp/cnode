@@ -37,7 +37,7 @@ void Check(bool condition, std::string_view message) {
 
 std::vector<uint8_t> Flatten(const buf::MultiBuffer& mb) {
     std::vector<uint8_t> out;
-    out.reserve(buf::TotalLen(mb));
+    out.reserve(mb.byte_size());
     for (const buf::Buffer* buffer : mb) {
         if (!buffer || buffer->IsEmpty()) {
             continue;
@@ -424,7 +424,7 @@ void TestSharedAddressCodec() {
             std::array<uint8_t, kMaxEncodedAddressSize> encoded{};
             const size_t size = EncodeAddressTo(
                 target, encoded.data(), encoded.size(), format);
-            Check(size == AddressEncodedSize(target, format) && size != 0,
+            Check(size == AddressEncodedSize(target) && size != 0,
                   "shared address size mismatch");
             const size_t type_pos = format == AddressWireFormat::PortFirst ? 2 : 0;
             const uint8_t expected_type = target.IsDomain()
@@ -476,7 +476,7 @@ void TestSharedAddressCodec() {
                     Check(pending.byte_size() >= size + 1,
                           "incremental address consumed caller-owned prefix");
                     pending.DropPrefixBytes(size + 1);
-                    if (!buf::HasData(pending)) {
+                    if (pending.byte_size() == 0) {
                         auto remaining = co_await source.ReadMultiBuffer();
                         remaining.MoveTo(pending, true);
                     }
@@ -533,11 +533,11 @@ void TestPacketEofBoundaries() {
             try {
                 Run([&]() -> net::awaitable<void> {
                     auto packet = co_await reader.ReadMultiBuffer();
-                    Check(length == 0 ? !buf::HasData(packet)
+                    Check(length == 0 ? packet.byte_size() == 0
                         : Flatten(packet) == std::vector<uint8_t>({'e','n','d'}),
                         "UoT boundary EOF lost a complete packet");
                     auto eof = co_await reader.ReadMultiBuffer();
-                    Check(!buf::HasData(eof), "UoT boundary EOF returned data");
+                    Check(eof.byte_size() == 0, "UoT boundary EOF returned data");
                 });
             } catch (const IoSystemError&) {
                 failed = true;

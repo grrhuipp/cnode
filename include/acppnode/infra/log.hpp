@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <format>
+#include <optional>
 #include <source_location>
 #include <string>
 #include <string_view>
@@ -25,6 +26,10 @@ struct ConnectionLogContext {
     std::string inbound_tag;
     int64_t user_id{0};
 };
+
+// Single authority for configured level names; unknown names are rejected
+// rather than mapped to a default.
+[[nodiscard]] std::optional<LogLevel> ParseLogLevel(std::string_view name) noexcept;
 
 // Xray-compatible local logging:
 // - general and connection diagnostics go to the error logger and are filtered

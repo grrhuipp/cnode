@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -26,18 +27,41 @@ void Check(bool condition, std::string_view message) {
     }
 }
 
+std::optional<acpp::mux::FrameHeader> DecodeSplit(
+    std::span<const uint8_t> frame,
+    size_t split) {
+    acpp::buf::MultiBuffer buffers;
+    acpp::buf::MultiBuffer suffix;
+    split = std::min(split, frame.size());
+    Check(acpp::buf::AppendSpanToMultiBuffer(frame.first(split), buffers) &&
+              acpp::buf::AppendSpanToMultiBuffer(frame.subspan(split), suffix),
+          "failed to allocate Mux test input");
+    // A separate suffix keeps the split as a real Buffer boundary.
+    suffix.MoveTo(buffers);
+    return acpp::mux::DecodeFrame(buffers);
+}
+
+std::optional<acpp::mux::FrameHeader> Decode(std::span<const uint8_t> frame) {
+    return DecodeSplit(frame, frame.size());
+}
+
+bool EncodeKeepDataHeader(
+    acpp::memory::ByteVector& out,
+    uint16_t session_id,
+    size_t payload_len) {
+    std::array<uint8_t, acpp::mux::kMaxFrameHeaderBytes> header{};
+    const size_t n = acpp::mux::EncodeKeepDataHeaderTo(header, session_id, payload_len);
+    out.assign(header.data(), header.data() + n);
+    return n != 0;
+}
+
 void CheckInvalidAcrossLayouts(
     std::span<const uint8_t> frame,
     std::string_view message) {
-    const auto prefix = acpp::mux::DecodeFramePrefix(
-        frame.data(), frame.size(), frame.size());
+    const auto contiguous = Decode(frame);
+    const auto fragmented = DecodeSplit(frame, 3);
 
-    acpp::buf::MultiBuffer buffers;
-    Check(acpp::buf::AppendSpanToMultiBuffer(frame, buffers),
-          "failed to allocate fragmented Mux test input");
-    const auto fragmented = acpp::mux::DecodeFrame(buffers, 0, frame.size());
-
-    Check(prefix.has_value() && prefix->frame_size == 0 &&
+    Check(contiguous.has_value() && contiguous->frame_size == 0 &&
               fragmented.has_value() && fragmented->frame_size == 0,
           message);
 }
@@ -116,31 +140,28 @@ int main() {
           "large Mux NEW header was rejected");
     encoded.insert(
         encoded.end(), large_xudp_packet.begin(), large_xudp_packet.end());
-    const auto large_new_frame = mux::DecodeFramePrefix(
-        encoded.data(), encoded.size(), encoded.size());
+    const auto large_new_frame = Decode(encoded);
     Check(large_new_frame.has_value() && large_new_frame->frame_size == encoded.size() &&
               large_new_frame->data_len == large_xudp_packet.size(),
           "Mux NEW header did not preserve a multi-buffer datagram length");
 
-    Check(mux::EncodeKeepDataHeaderTo(
+    Check(EncodeKeepDataHeader(
               encoded, 7, maximum.size()),
           "maximum Mux payload was rejected");
     encoded.insert(encoded.end(), maximum.begin(), maximum.end());
-    const auto decoded = mux::DecodeFramePrefix(
-        encoded.data(), encoded.size(), encoded.size());
+    const auto decoded = Decode(encoded);
     Check(decoded.has_value() && decoded->frame_size == encoded.size() &&
               decoded->data_len == kMaxPayload,
           "maximum Mux payload did not round-trip");
 
-    Check(mux::EncodeKeepDataHeaderTo(encoded, 7, 0),
+    Check(EncodeKeepDataHeader(encoded, 7, 0),
           "zero-length Mux DATA frame was rejected");
-    const auto empty_decoded = mux::DecodeFramePrefix(
-        encoded.data(), encoded.size(), encoded.size());
+    const auto empty_decoded = Decode(encoded);
     Check(empty_decoded.has_value() &&
               empty_decoded->frame_size == encoded.size() &&
               empty_decoded->has_data && empty_decoded->data_len == 0,
           "zero-length Mux DATA frame omitted its wire length");
-    Check(!mux::EncodeKeepDataHeaderTo(encoded, 7, oversized.size()) &&
+    Check(!EncodeKeepDataHeader(encoded, 7, oversized.size()) &&
               encoded.empty(),
           "oversized Mux TCP header was truncated instead of rejected");
 
@@ -191,7 +212,7 @@ int main() {
               encoded.empty(),
           "oversized Mux UDP header was truncated instead of rejected");
 
-    Check(mux::EncodeKeepDataHeaderTo(encoded, 7, 0),
+    Check(EncodeKeepDataHeader(encoded, 7, 0),
           "failed to encode option validation fixture");
     encoded[5] |= 0x80;
     CheckInvalidAcrossLayouts(
@@ -227,6 +248,11 @@ int main() {
         trailing_keepalive_metadata,
         "Mux KEEPALIVE trailing metadata was accepted");
 
+    const std::vector<uint8_t> oversized_metadata_prefix{0x02, 0x00, 0x00};
+    CheckInvalidAcrossLayouts(
+        oversized_metadata_prefix,
+        "Mux MetaLen beyond the largest valid metadata waited for more data");
+
     Check(mux::EncodeNewHeaderTo(
               encoded,
               7,
@@ -240,10 +266,13 @@ int main() {
     const uint16_t global_meta_len = static_cast<uint16_t>(base_meta_len + 8);
     encoded[0] = static_cast<uint8_t>(global_meta_len >> 8);
     encoded[1] = static_cast<uint8_t>(global_meta_len);
-    const auto global_id_frame = mux::DecodeFramePrefix(
-        encoded.data(), encoded.size(), encoded.size());
+    const auto global_id_frame = Decode(encoded);
+    const auto fragmented_global_id_frame = DecodeSplit(encoded, 5);
     Check(global_id_frame.has_value() && global_id_frame->frame_size != 0 &&
-              global_id_frame->has_global_id,
+              global_id_frame->has_global_id &&
+              fragmented_global_id_frame.has_value() &&
+              fragmented_global_id_frame->frame_size == global_id_frame->frame_size &&
+              fragmented_global_id_frame->has_global_id,
           "exact eight-byte Mux GlobalID was rejected");
 
     encoded.push_back(0x43);

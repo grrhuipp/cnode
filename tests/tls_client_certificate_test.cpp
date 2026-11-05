@@ -8,6 +8,8 @@
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
+#include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -110,12 +112,11 @@ bool ReplaceCommonName(X509* certificate,
 }  // namespace
 
 int main() {
-    acpp::transport::internet::AutoSignState certificates;
-    auto material = certificates.GetOrCreate("client.example");
+    auto material = acpp::transport::internet::AutoSignCertificate::Create("client.example");
     CertificateFiles files;
-    if (!Require(material.cert && material.key,
+    if (!Require(material != nullptr,
                  "client certificate material must be generated") ||
-        !Require(WriteCertificateFiles(files, material.cert, material.key),
+        !Require(WriteCertificateFiles(files, material->Certificate(), material->Key()),
                  "client certificate files must be written")) {
         return 1;
     }
@@ -124,6 +125,7 @@ int main() {
     config.cert_file = files.cert.string();
     config.key_file = files.key.string();
     config.allow_insecure = true;
+    acpp::LoadTlsPemMaterial(config);
 
     auto context = acpp::SslContext::CreateClient(config);
     if (!Require(context != nullptr, "client context must be created")) return 2;
@@ -142,15 +144,42 @@ int main() {
 
     acpp::TlsConfig private_ca_config;
     private_ca_config.ca_file = files.cert.string();
+    acpp::LoadTlsPemMaterial(private_ca_config);
     auto private_ca_context = acpp::SslContext::CreateClient(private_ca_config);
     if (!Require(private_ca_context != nullptr,
                  "client context with private CA must be created")) {
         return 6;
     }
     if (!Require(VerifyCertificateWithContextStore(
-                     material.cert, private_ca_context->Native()),
+                     material->Certificate(), private_ca_context->Native()),
                  "configured private CA must be present in the client trust store")) {
         return 7;
+    }
+
+    // Like SSL_CTX_use_certificate_chain_file, only a clean end of input may
+    // follow the leaf: a malformed later block fails the whole chain.
+    auto malformed_chain = std::make_shared<acpp::TlsPemMaterial>();
+    malformed_chain->certificate_chain = config.pem->certificate_chain +
+        "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
+    malformed_chain->private_key = config.pem->private_key;
+    acpp::TlsConfig malformed_chain_config = config;
+    malformed_chain_config.pem = std::move(malformed_chain);
+    if (!Require(acpp::SslContext::CreateClient(malformed_chain_config) == nullptr,
+                 "a malformed PEM block after the leaf certificate must be rejected")) {
+        return 32;
+    }
+
+    acpp::TlsConfig unreadable_config;
+    unreadable_config.ca_file = files.cert.string() + ".missing";
+    bool unreadable_rejected = false;
+    try {
+        acpp::LoadTlsPemMaterial(unreadable_config);
+    } catch (const std::invalid_argument&) {
+        unreadable_rejected = true;
+    }
+    if (!Require(unreadable_rejected && !unreadable_config.pem,
+                 "an unreadable TLS file must be rejected while loading configuration")) {
+        return 33;
     }
 
     acpp::TlsConfig tls13_config;
@@ -187,16 +216,16 @@ int main() {
         if (!Require(configured, "IPv6 TLS identity must use IP SAN bytes without SNI")) return 31;
     }
 
-    auto ip_material = certificates.GetOrCreate("192.0.2.1");
+    auto ip_material = acpp::transport::internet::AutoSignCertificate::Create("192.0.2.1");
     SSL* ip_client = SSL_new(context->Native());
-    if (!Require(ip_material.cert != nullptr && ip_material.key != nullptr &&
+    if (!Require(ip_material != nullptr &&
                      ip_client != nullptr,
                  "IP identity test material must be created")) {
         if (ip_client) SSL_free(ip_client);
         return 10;
     }
     if (!Require(ReplaceCommonName(
-                     ip_material.cert, ip_material.key, "unrelated.example"),
+                     ip_material->Certificate(), ip_material->Key(), "unrelated.example"),
                  "IP identity certificate common name must be replaced")) {
         SSL_free(ip_client);
         return 11;
@@ -213,7 +242,7 @@ int main() {
         return 13;
     }
     const bool ip_verified = VerifyCertificate(
-        ip_material.cert, SSL_get0_param(ip_client));
+        ip_material->Certificate(), SSL_get0_param(ip_client));
     SSL_free(ip_client);
     if (!Require(ip_verified,
                  "IP SAN certificate must verify for its configured identity")) {
@@ -229,7 +258,7 @@ int main() {
         return 15;
     }
     const bool wrong_ip_verified = VerifyCertificate(
-        ip_material.cert, SSL_get0_param(wrong_ip_client));
+        ip_material->Certificate(), SSL_get0_param(wrong_ip_client));
     SSL_free(wrong_ip_client);
     if (!Require(!wrong_ip_verified,
                  "IP SAN certificate must reject a different IP identity")) {
@@ -247,7 +276,7 @@ int main() {
     const char* configured_sni = SSL_get_servername(
         dns_client, TLSEXT_NAMETYPE_host_name);
     const bool dns_verified = VerifyCertificate(
-        material.cert, SSL_get0_param(dns_client));
+        material->Certificate(), SSL_get0_param(dns_client));
     if (!Require(configured_sni != nullptr &&
                      std::string_view(configured_sni) == "client.example",
                  "DNS server identity must be sent as SNI")) {

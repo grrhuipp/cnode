@@ -19,7 +19,7 @@ public:
                std::span<const ss::KeyBytes> psk_chain)
         : io_(io), dns_(dns), socket_(io, bind_address), server_(std::move(server)),
           cipher_info_(cipher_info), master_key_(master_key), psk_chain_(psk_chain) {
-        if (ss::Is2022Cipher(cipher_info_)) {
+        if (ss::Is2022Cipher(cipher_info_.type)) {
             ss2022_state_.emplace();
             if (!ss::Init2022UdpSessionState(*ss2022_state_, cipher_info_, master_key_))
                 throw transport::LinkError(ErrorCode::INTERNAL);
@@ -41,7 +41,7 @@ public:
                 ? ss::Decode2022UdpResponsePacket(bytes.data(), bytes.size(), *ss2022_state_)
                 : ss::DecodeUdpPacketWithKey(bytes.data(), bytes.size(), master_key_.span(),
                     cipher_info_.type, cipher_info_.key_size, cipher_info_.salt_size);
-            if (!decoded || !buf::HasData(decoded->payload)) continue;
+            if (!decoded || decoded->payload.byte_size() == 0) continue;
             for (auto* buffer : decoded->payload) buffer->SetUDP(decoded->target);
             socket_.TouchActivity();
             co_return std::move(decoded->payload);

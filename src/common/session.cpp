@@ -14,9 +14,10 @@ namespace acpp {
 namespace session {
 
 ID NewID(uint32_t worker_id) noexcept {
-    return GenerateWorkerConnId(worker_id);
+    thread_local uint32_t local_counter = 0;
+    const uint32_t seq = ++local_counter;
+    return (static_cast<uint64_t>(worker_id) << 32) | seq;
 }
-
 
 void Context::InitSubstreamFrom(const Context& parent, uint16_t sub_source_port) {
     worker_id = parent.worker_id;
@@ -129,12 +130,6 @@ std::string FormatTimestamp(int64_t timestamp_us) {
     };
     next_slot = (next_slot + 1) % kTimestampCacheSize;
     return value;
-}
-
-uint64_t GenerateWorkerConnId(uint32_t worker_id) {
-    thread_local uint32_t local_counter = 0;
-    const uint32_t seq = ++local_counter;
-    return (static_cast<uint64_t>(worker_id) << 32) | seq;
 }
 
 }  // namespace acpp

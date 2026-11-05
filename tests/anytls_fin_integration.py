@@ -2,13 +2,16 @@
 
 Build cmd/client and cmd/server at REFERENCE_COMMIT outside the source tree.
 All peers, ports, credentials and certificates below belong to this loopback test.
-FIN expectations come from the published protocol, not cnode's relay behavior.
+FIN expectations come from docs/protocol.md#cmdfin at REFERENCE_COMMIT:
+https://github.com/anytls/anytls-go/blob/fd6167acd6d73b9fa3e607659951847fbc9e6c50/docs/protocol.md#cmdfin
+FIN closes the entire logical stream, unlike TCP's directional FIN. The pinned
+session.recvLoop removes the ID then calls Stream.closeLocally (no FIN reply).
+Do not require a destination to successfully write after that full close.
 """
 import argparse
 import asyncio
 import hashlib
 import json
-import os
 from pathlib import Path
 import socket
 import ssl
@@ -87,8 +90,7 @@ class Resources:
     def spawn(self, command, log):
         file = log.open('w', encoding='utf-8')
         self.files.append(file)
-        child = subprocess.Popen([str(x) for x in command], stdout=file, stderr=subprocess.STDOUT,
-                                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+        child = subprocess.Popen([str(x) for x in command], stdout=file, stderr=subprocess.STDOUT)
         self.children.append(child)
         return child
 
@@ -220,9 +222,10 @@ async def server_case(args, implementation, mode, output, resources):
         writer.write(BANNER)
         await writer.drain()
         await release.wait()
-        writer.write(LATE)
-        await writer.drain()
-        writer.write_eof()
+        if mode == 'local-eof':
+            writer.write(LATE)
+            await writer.drain()
+            writer.write_eof()
         while data := await reader.read(65536):
             late_target.extend(data)
         target_eof = True
@@ -244,25 +247,26 @@ async def server_case(args, implementation, mode, output, resources):
     await until(lambda: received.payload(1) == BANNER)
     if mode == 'remote-fin':
         writer.write(frame(3, 1))
-        await received.barrier(writer)  # FIN has passed the session parser before the late response.
-    release.set()
-    await asyncio.sleep(0.35)
-    await received.barrier(writer)
-    if mode == 'local-eof':
+        await received.barrier(writer)  # The stream ID has been removed by the parser.
+        # A post-FIN PSH must not reopen the removed stream or reach its target.
+        writer.write(frame(2, 1, LATE))
+        await received.barrier(writer)
+        release.set()
+        # Observe the destination close directly instead of attempting write_eof
+        # on a socket the reference has already closed (an invalid fixture step).
+        await until(lambda: target_eof)
+    else:
+        release.set()
         await until(lambda: received.count(3, 1) > 0)
         writer.write(frame(2, 1, LATE))
         await received.barrier(writer)
-        try:
-            await until(lambda: target_eof or late_target, timeout=1)
-        except TimeoutError:
-            pass
+        await until(lambda: target_eof)
     response = received.payload(1)
     fins = received.count(3, 1)
     first_passed = response == (BANNER if mode == 'remote-fin' else BANNER + LATE)
     first_passed &= fins == (0 if mode == 'remote-fin' else 1)
     first_passed &= not late_target
-    if mode == 'local-eof':
-        first_passed &= target_eof
+    first_passed &= target_eof
     # The same TLS session must still accept a different logical stream.
     writer.write(frame(1, 3) + frame(2, 3, target(destination_port) + REQUEST))
     await writer.drain()
@@ -353,7 +357,7 @@ async def client_case(args, implementation, mode, output, resources):
     else:
         configure(output, {'protocol': 'vless', 'listen': '127.0.0.1', 'port': port,
                            'settings': {'clients': [{'id': str(USER)}]}},
-                  {'protocol': 'anytls', 'settings': {'server': '127.0.0.1', 'server_port': peer_port,
+                  {'protocol': 'anytls', 'settings': {'address': '127.0.0.1', 'port': peer_port,
                    'password': 'secret', 'minIdleSession': 1, 'idleSessionTimeout': 30,
                    'idleSessionCheckInterval': 1}, 'streamSettings': tls_settings()})
         resources.spawn([args.binary, '--config-dir', output], output / 'child.log')
@@ -372,8 +376,7 @@ async def client_case(args, implementation, mode, output, resources):
         resources.tasks.add(observation)
         await peer.barrier(session)
         # Observe delivery and EOF with the upload still open before attempting
-        # a post-close write. On Windows that write can abort this same local
-        # socket's pending read with 10053, even after all bytes were delivered.
+        # a post-close write.
         data, eof, seconds = await observation
         try:
             writer.write(LATE)

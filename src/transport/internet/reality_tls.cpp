@@ -1,5 +1,6 @@
 #include "reality_tls.hpp"
 #include "reality_key_share.hpp"
+#include "tls_client_context.hpp"
 #include "acppnode/transport/internet/reality_client_version.hpp"
 #include "acppnode/transport/internet/reality_key.hpp"
 #include "acppnode/transport/internet/reality_server_name.hpp"
@@ -18,6 +19,7 @@
 #include <openssl/evp.h>
 #include <openssl/hkdf.h>
 #include <openssl/hmac.h>
+#include <openssl/mem.h>
 #include <openssl/nid.h>
 #include <openssl/obj.h>
 #include <openssl/rand.h>
@@ -47,6 +49,12 @@ constexpr size_t kRealitySessionIdSize = 32;
 constexpr size_t kRealityPlainAuthSize = 16;
 constexpr size_t kRealityShortIdSize = transport::internet::kRealityShortIdSize;
 constexpr size_t kRealityAesGcmNonceSize = 12;
+
+struct ScopedCleanse {
+    void* data;
+    size_t size;
+    ~ScopedCleanse() { OPENSSL_cleanse(data, size); }
+};
 
 struct EvpPkeyDeleter {
     void operator()(EVP_PKEY* key) const noexcept {
@@ -92,6 +100,10 @@ using UniqueAsn1OctetString = std::unique_ptr<ASN1_OCTET_STRING, Asn1OctetString
 using UniqueX509Extension = std::unique_ptr<X509_EXTENSION, X509ExtensionDeleter>;
 
 struct RealityServerState final : SslContext::ContextState {
+    ~RealityServerState() override {
+        OPENSSL_cleanse(private_key.data(), private_key.size());
+        for (auto& id : short_ids) OPENSSL_cleanse(id.data(), id.size());
+    }
     std::array<uint8_t, kRealityX25519KeySize> private_key{};
     std::vector<std::string> server_names;
     std::vector<transport::internet::RealityShortId> short_ids;
@@ -101,6 +113,7 @@ struct RealityServerState final : SslContext::ContextState {
     UniqueEvpPkey ed25519_key;
     std::array<uint8_t, 32> ed25519_public{};
     UniqueEvpPkey mldsa65_key;
+    std::vector<uint8_t> certificate_template;
 };
 
 struct RealityClientContextState final : SslContext::ContextState {
@@ -182,27 +195,37 @@ ParseRealityPeerPublicKey(const SSL_CLIENT_HELLO& hello) noexcept {
     return *parsed;
 }
 
-[[nodiscard]] memory::ByteVector BuildRealityClientHelloAad(
-    const SSL_CLIENT_HELLO& hello) {
-    memory::ByteVector aad;
-    const bool has_handshake_header =
-        hello.client_hello_len >= 4 &&
-        hello.client_hello[0] == 0x01 &&
+// RFC 8446 §4.4.1: transcript messages include the 4-byte handshake header,
+// which the early callback may omit from |client_hello|.
+[[nodiscard]] bool HasHandshakeHeader(const SSL_CLIENT_HELLO& hello) noexcept {
+    return hello.client_hello_len >= 4 &&
+        hello.client_hello[0] == SSL3_MT_CLIENT_HELLO &&
         (static_cast<size_t>(hello.client_hello[1]) << 16 |
          static_cast<size_t>(hello.client_hello[2]) << 8 |
          static_cast<size_t>(hello.client_hello[3])) ==
             hello.client_hello_len - 4;
-    if (has_handshake_header) {
-        aad.assign(hello.client_hello,
-                   hello.client_hello + hello.client_hello_len);
-    } else {
-        aad.resize(4 + hello.client_hello_len);
-        aad[0] = 0x01;
-        aad[1] = static_cast<uint8_t>((hello.client_hello_len >> 16) & 0xff);
-        aad[2] = static_cast<uint8_t>((hello.client_hello_len >> 8) & 0xff);
-        aad[3] = static_cast<uint8_t>(hello.client_hello_len & 0xff);
-        std::copy_n(hello.client_hello, hello.client_hello_len, aad.data() + 4);
+}
+
+[[nodiscard]] std::vector<uint8_t> FramedClientHello(const SSL_CLIENT_HELLO& hello) {
+    std::vector<uint8_t> framed;
+    if (HasHandshakeHeader(hello)) {
+        framed.assign(hello.client_hello,
+                      hello.client_hello + hello.client_hello_len);
+        return framed;
     }
+    framed.resize(4 + hello.client_hello_len);
+    framed[0] = SSL3_MT_CLIENT_HELLO;
+    framed[1] = static_cast<uint8_t>((hello.client_hello_len >> 16) & 0xff);
+    framed[2] = static_cast<uint8_t>((hello.client_hello_len >> 8) & 0xff);
+    framed[3] = static_cast<uint8_t>(hello.client_hello_len & 0xff);
+    std::copy_n(hello.client_hello, hello.client_hello_len, framed.data() + 4);
+    return framed;
+}
+
+[[nodiscard]] std::vector<uint8_t> BuildRealityClientHelloAad(
+    const SSL_CLIENT_HELLO& hello) {
+    const bool has_handshake_header = HasHandshakeHeader(hello);
+    std::vector<uint8_t> aad = FramedClientHello(hello);
 
     std::optional<size_t> aad_session_offset;
     if (hello.session_id &&
@@ -213,8 +236,8 @@ ParseRealityPeerPublicKey(const SSL_CLIENT_HELLO& hello) noexcept {
             static_cast<size_t>(hello.session_id - hello.client_hello);
         aad_session_offset = session_offset + (has_handshake_header ? 0 : 4);
     } else {
-        const size_t body_start = has_handshake_header ? 4 : 0;
-        const size_t session_len_offset = body_start + 2 + kRealityRandomSize;
+        // |aad| is always framed, so the body starts after the 4-byte header.
+        const size_t session_len_offset = 4 + 2 + kRealityRandomSize;
         if (aad.size() >= session_len_offset + 1) {
             const size_t session_len = aad[session_len_offset];
             const size_t session_offset = session_len_offset + 1;
@@ -244,6 +267,7 @@ ParseRealityPeerPublicKey(const SSL_CLIENT_HELLO& hello) noexcept {
     std::span<const uint8_t, kRealityX25519KeySize> peer_public,
     std::span<const uint8_t, 20> random_salt) noexcept {
     std::array<uint8_t, kRealityX25519KeySize> shared{};
+    const ScopedCleanse wipe_shared{shared.data(), shared.size()};
     if (X25519(shared.data(), state.private_key.data(), peer_public.data()) != 1) {
         return std::nullopt;
     }
@@ -258,6 +282,7 @@ ParseRealityPeerPublicKey(const SSL_CLIENT_HELLO& hello) noexcept {
     std::span<const uint8_t> shared,
     std::span<const uint8_t, 20> random_salt) noexcept {
     std::array<uint8_t, 32> auth_key{};
+    const ScopedCleanse wipe_auth{auth_key.data(), auth_key.size()};
     static constexpr std::string_view kRealityInfo = "REALITY";
     if (HKDF(auth_key.data(),
              auth_key.size(),
@@ -291,6 +316,7 @@ OpenRealitySessionId(
     }
 
     std::array<uint8_t, kRealityPlainAuthSize> plain{};
+    const ScopedCleanse wipe_plain{plain.data(), plain.size()};
     size_t plain_len = 0;
     const int ok = EVP_AEAD_CTX_open(&aead,
                                      plain.data(),
@@ -428,10 +454,12 @@ int RealityClientHelloCallback(SSL* /*ssl*/,
     if (!auth_key) {
         return 0;
     }
+    const ScopedCleanse wipe_auth{auth_key->data(), auth_key->size()};
 
-    const auto plain = BuildRealityClientAuthPlain(
+    auto plain = BuildRealityClientAuthPlain(
         std::span<const uint8_t, kRealityShortIdSize>(
             state->short_id.data(), state->short_id.size()));
+    const ScopedCleanse wipe_plain{plain.data(), plain.size()};
     auto encrypted = SealRealitySessionId(
         std::span<const uint8_t, 32>(auth_key->data(), auth_key->size()),
         std::span<const uint8_t, kRealityAesGcmNonceSize>(
@@ -449,7 +477,9 @@ int RealityClientHelloCallback(SSL* /*ssl*/,
     return 1;
 }
 
-[[nodiscard]] bool VerifyRealityPeerCertificate(
+}  // namespace
+
+bool VerifyRealityClientHandshake(
     SSL* ssl,
     const RealityClientState& state) {
     if (!ssl || !state.auth_key_ready) {
@@ -504,8 +534,9 @@ int RealityClientHelloCallback(SSL* /*ssl*/,
         return false;
     }
 
+    // HMAC verification: compare in constant time.
     const uint8_t* signature = ASN1_STRING_get0_data(sig);
-    if (!std::equal(expected.begin(), expected.end(), signature)) {
+    if (CRYPTO_memcmp(expected.data(), signature, expected.size()) != 0) {
         LOG_NET_DEBUG("REALITY client verification failed: signature mismatch");
         return false;
     }
@@ -571,6 +602,8 @@ int RealityClientHelloCallback(SSL* /*ssl*/,
     return true;
 }
 
+namespace {
+
 [[nodiscard]] bool IsRealityClientTimeAllowed(uint32_t client_unix_seconds,
                                               uint64_t max_diff_ms) noexcept {
     if (max_diff_ms == 0) {
@@ -613,27 +646,26 @@ int RealityClientHelloCallback(SSL* /*ssl*/,
         return false;
     }
 
-    transport::internet::RealityShortId short_id{};
-    std::copy_n(plain.data() + 8, short_id.size(), short_id.begin());
-    return std::find(state.short_ids.begin(), state.short_ids.end(), short_id) !=
-           state.short_ids.end();
+    // Short IDs are the shared client credential: scan all of them in
+    // constant time per entry instead of stopping at the first match.
+    bool matched = false;
+    for (const auto& candidate : state.short_ids) {
+        matched |= CRYPTO_memcmp(
+            candidate.data(), plain.data() + 8, candidate.size()) == 0;
+    }
+    return matched;
 }
 
 [[nodiscard]] UniqueX509 BuildRealityCertificate(
-    RealityServerState& state,
+    const RealityServerState& state,
     std::span<const uint8_t, 32> auth_key,
     std::span<const uint8_t> mldsa65_signature = {}) {
-    UniqueX509 cert(X509_new());
-    if (!cert) {
-        return {};
-    }
-
-    X509_set_version(cert.get(), 2);
-    ASN1_INTEGER_set(X509_get_serialNumber(cert.get()), 0);
-    X509_gmtime_adj(X509_get_notBefore(cert.get()), 0);
-    X509_gmtime_adj(X509_get_notAfter(cert.get()), 365 * 24 * 60 * 60);
-    X509_set_pubkey(cert.get(), state.ed25519_key.get());
-    X509_set_issuer_name(cert.get(), X509_get_subject_name(cert.get()));
+    // REALITY replaces the X.509 signature with HMAC(authKey, publicKey).
+    // Only that HMAC (and optional transcript-bound ML-DSA) is per-session;
+    // the ordinary Ed25519 certificate signature is prepared once at startup.
+    const uint8_t* encoded = state.certificate_template.data();
+    UniqueX509 cert(d2i_X509(nullptr, &encoded, state.certificate_template.size()));
+    if (!cert) return {};
 
     if (!mldsa65_signature.empty()) {
         static constexpr uint8_t kOidZero[] = {0x00};
@@ -655,7 +687,7 @@ int RealityClientHelloCallback(SSL* /*ssl*/,
         }
     }
 
-    if (X509_sign(cert.get(), state.ed25519_key.get(), nullptr) <= 0) {
+    if (!mldsa65_signature.empty() && i2d_re_X509_tbs(cert.get(), nullptr) <= 0) {
         return {};
     }
 
@@ -822,6 +854,7 @@ void RealityServerMsgCallback(int is_write,
     if (!auth_key) {
         return fail("auth key derivation failed");
     }
+    const ScopedCleanse wipe_auth{auth_key->data(), auth_key->size()};
 
     auto aad = BuildRealityClientHelloAad(*hello);
     auto plain = OpenRealitySessionId(
@@ -834,6 +867,7 @@ void RealityServerMsgCallback(int is_write,
     if (!plain) {
         return fail("session id decrypt failed");
     }
+    const ScopedCleanse wipe_plain{plain->data(), plain->size()};
     if (!IsRealityClientAuthAllowed(
             *state,
             std::span<const uint8_t, kRealityPlainAuthSize>(
@@ -845,30 +879,7 @@ void RealityServerMsgCallback(int is_write,
         auto conn_state = std::make_unique<RealityServerConnState>();
         conn_state->auth_key = *auth_key;
         conn_state->authenticated = true;
-        const bool has_handshake_header =
-            hello->client_hello_len >= 4 &&
-            hello->client_hello[0] == 0x01 &&
-            (static_cast<size_t>(hello->client_hello[1]) << 16 |
-             static_cast<size_t>(hello->client_hello[2]) << 8 |
-             static_cast<size_t>(hello->client_hello[3])) ==
-                hello->client_hello_len - 4;
-        if (has_handshake_header) {
-            conn_state->client_hello_raw.assign(
-                hello->client_hello,
-                hello->client_hello + hello->client_hello_len);
-        } else {
-            conn_state->client_hello_raw.resize(4 + hello->client_hello_len);
-            conn_state->client_hello_raw[0] = 0x01;
-            conn_state->client_hello_raw[1] =
-                static_cast<uint8_t>((hello->client_hello_len >> 16) & 0xff);
-            conn_state->client_hello_raw[2] =
-                static_cast<uint8_t>((hello->client_hello_len >> 8) & 0xff);
-            conn_state->client_hello_raw[3] =
-                static_cast<uint8_t>(hello->client_hello_len & 0xff);
-            std::copy_n(hello->client_hello,
-                        hello->client_hello_len,
-                        conn_state->client_hello_raw.data() + 4);
-        }
+        conn_state->client_hello_raw = FramedClientHello(*hello);
         if (SSL_set_ex_data(
                 hello->ssl, RealityConnStateExIndex(), conn_state.get()) != 1) {
             return fail("failed to store REALITY connection state");
@@ -924,6 +935,7 @@ void RealityServerMsgCallback(int is_write,
     }
 
     std::array<uint8_t, 32> seed{};
+    const ScopedCleanse wipe_seed{seed.data(), seed.size()};
     if (RAND_bytes(seed.data(), static_cast<int>(seed.size())) != 1) {
         LOG_ERROR("REALITY Ed25519 seed generation failed");
         return {};
@@ -947,6 +959,24 @@ void RealityServerMsgCallback(int is_write,
         LOG_ERROR("REALITY Ed25519 public key export failed");
         return {};
     }
+
+    UniqueX509 certificate(X509_new());
+    if (!certificate ||
+        X509_set_version(certificate.get(), 2) != 1 ||
+        ASN1_INTEGER_set(X509_get_serialNumber(certificate.get()), 0) != 1 ||
+        !X509_gmtime_adj(X509_get_notBefore(certificate.get()), 0) ||
+        !X509_gmtime_adj(X509_get_notAfter(certificate.get()), 365 * 24 * 60 * 60) ||
+        X509_set_pubkey(certificate.get(), state->ed25519_key.get()) != 1 ||
+        X509_set_issuer_name(certificate.get(), X509_get_subject_name(certificate.get())) != 1 ||
+        X509_sign(certificate.get(), state->ed25519_key.get(), nullptr) <= 0) {
+        LOG_ERROR("REALITY certificate template creation failed");
+        return {};
+    }
+    const int encoded_size = i2d_X509(certificate.get(), nullptr);
+    if (encoded_size <= 0) return {};
+    state->certificate_template.resize(static_cast<size_t>(encoded_size));
+    auto* encoded = state->certificate_template.data();
+    if (i2d_X509(certificate.get(), &encoded) != encoded_size) return {};
 
     return state;
 }
@@ -998,6 +1028,43 @@ void ConfigureRealityClientFingerprint(SSL_CTX* ctx,
         "ECDHE-RSA-CHACHA20-POLY1305:ECDHE-RSA-AES128-SHA:"
         "ECDHE-RSA-AES256-SHA:AES128-GCM-SHA256:AES256-GCM-SHA384:"
         "AES128-SHA:AES256-SHA");
+}
+
+// Groups and signature algorithms are part of the fingerprint: parse them once
+// into the context; SSL_new copies both lists into every connection.
+[[nodiscard]] bool ConfigureRealityClientKeyExchange(SSL_CTX* ctx,
+                                                     std::string_view fingerprint) {
+    const char* groups = "X25519MLKEM768:X25519:P-256:P-384";
+    const char* sigalgs =
+        "ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:rsa_pkcs1_sha256:"
+        "ecdsa_secp384r1_sha384:rsa_pss_rsae_sha384:rsa_pkcs1_sha384:"
+        "rsa_pss_rsae_sha512:rsa_pkcs1_sha512";
+    if (fingerprint == "firefox") {
+        groups = "X25519MLKEM768:X25519:P-256:P-384:P-521";
+        sigalgs =
+            "ecdsa_secp256r1_sha256:ecdsa_secp384r1_sha384:"
+            "ecdsa_secp521r1_sha512:rsa_pss_rsae_sha256:rsa_pss_rsae_sha384:"
+            "rsa_pss_rsae_sha512:rsa_pkcs1_sha256:rsa_pkcs1_sha384:"
+            "rsa_pkcs1_sha512";
+    } else if (fingerprint == "safari" || fingerprint == "ios") {
+        groups = "X25519MLKEM768:X25519:P-256:P-384:P-521";
+        sigalgs =
+            "ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:rsa_pkcs1_sha256:"
+            "ecdsa_secp384r1_sha384:ecdsa_secp521r1_sha512:"
+            "rsa_pss_rsae_sha384:rsa_pss_rsae_sha512:rsa_pkcs1_sha384:"
+            "rsa_pkcs1_sha512:rsa_pkcs1_sha1";
+    } else if (fingerprint == "random" || fingerprint == "randomized") {
+        groups = "X25519MLKEM768:X25519:P-256:P-384:P-521";
+    }
+    if (SSL_CTX_set1_groups_list(ctx, groups) != 1) {
+        LOG_ERROR("REALITY client failed to configure key share groups");
+        return false;
+    }
+    if (SSL_CTX_set1_sigalgs_list(ctx, sigalgs) != 1) {
+        LOG_ERROR("REALITY client failed to configure signature algorithms");
+        return false;
+    }
+    return true;
 }
 
 }  // namespace
@@ -1063,6 +1130,15 @@ std::unique_ptr<SslContext> SslContext::CreateClientReality(
     SSL_CTX_set_options(ctx, SSL_OP_NO_TICKET);
     SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nullptr);
     ConfigureRealityClientFingerprint(ctx, reality.fingerprint);
+    if (!ConfigureRealityClientKeyExchange(ctx, reality.fingerprint)) {
+        SSL_CTX_free(ctx);
+        return nullptr;
+    }
+    if (!ConfigureTlsClientAlpn(ctx, tls_config.alpn)) {
+        LOG_ERROR("Invalid REALITY client ALPN policy");
+        SSL_CTX_free(ctx);
+        return nullptr;
+    }
 
     std::unique_ptr<RealityClientContextState> state;
     if (reality.mldsa65_verify) {
@@ -1084,13 +1160,12 @@ std::unique_ptr<SslContext> SslContext::CreateClientReality(
         }
     }
 
-    (void)tls_config;
     return std::unique_ptr<SslContext>(new SslContext(ctx, std::move(state)));
 }
 
 bool TlsStream::SetRealityClient(const RealityConfig& reality) {
     SSL* ssl = NativeSsl();
-    if (is_server_ || !ssl) {
+    if (is_server_) {
         return false;
     }
 
@@ -1119,37 +1194,6 @@ bool TlsStream::SetRealityClient(const RealityConfig& reality) {
         return false;
     }
 
-    const char* groups = "X25519MLKEM768:X25519:P-256:P-384";
-    const char* sigalgs =
-        "ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:rsa_pkcs1_sha256:"
-        "ecdsa_secp384r1_sha384:rsa_pss_rsae_sha384:rsa_pkcs1_sha384:"
-        "rsa_pss_rsae_sha512:rsa_pkcs1_sha512";
-    if (reality.fingerprint == "firefox") {
-        groups = "X25519MLKEM768:X25519:P-256:P-384:P-521";
-        sigalgs =
-            "ecdsa_secp256r1_sha256:ecdsa_secp384r1_sha384:"
-            "ecdsa_secp521r1_sha512:rsa_pss_rsae_sha256:rsa_pss_rsae_sha384:"
-            "rsa_pss_rsae_sha512:rsa_pkcs1_sha256:rsa_pkcs1_sha384:"
-            "rsa_pkcs1_sha512";
-    } else if (reality.fingerprint == "safari" || reality.fingerprint == "ios") {
-        groups = "X25519MLKEM768:X25519:P-256:P-384:P-521";
-        sigalgs =
-            "ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:rsa_pkcs1_sha256:"
-            "ecdsa_secp384r1_sha384:ecdsa_secp521r1_sha512:"
-            "rsa_pss_rsae_sha384:rsa_pss_rsae_sha512:rsa_pkcs1_sha384:"
-            "rsa_pkcs1_sha512:rsa_pkcs1_sha1";
-    } else if (reality.fingerprint == "random" || reality.fingerprint == "randomized") {
-        groups = "X25519MLKEM768:X25519:P-256:P-384:P-521";
-    }
-    if (SSL_set1_groups_list(ssl, groups) != 1) {
-        LOG_ERROR("REALITY client failed to configure key share groups");
-        return false;
-    }
-    if (SSL_set1_sigalgs_list(ssl, sigalgs) != 1) {
-        LOG_ERROR("REALITY client failed to configure signature algorithms");
-        return false;
-    }
-
     if (state->mldsa65_verify_key) {
         SSL_set_msg_callback(ssl, RealityClientMsgCallback);
         SSL_set_msg_callback_arg(ssl, state.get());
@@ -1162,14 +1206,8 @@ bool TlsStream::SetRealityClient(const RealityConfig& reality) {
     return true;
 }
 
-bool VerifyRealityClientHandshake(
-    SSL* ssl,
-    const RealityClientState& state) {
-    return VerifyRealityPeerCertificate(ssl, state);
-}
-
-std::unique_ptr<RealityServerConnState> VerifyRealityClientHelloRecord(
-    std::span<const uint8_t> record,
+std::unique_ptr<RealityServerConnState> VerifyRealityClientHello(
+    std::span<const uint8_t> handshake,
     const SslContext& ctx,
     std::string* out_sni) {
     const SSL_CTX* ssl_ctx = ctx.Native();
@@ -1177,22 +1215,12 @@ std::unique_ptr<RealityServerConnState> VerifyRealityClientHelloRecord(
         ? static_cast<const RealityServerState*>(
               SSL_CTX_get_ex_data(ssl_ctx, RealityStateExIndex()))
         : nullptr;
-    if (!state || state->server_names.empty() || state->short_ids.empty()) {
+    if (!state) {
         return nullptr;
     }
-    // TLS record header (5B) + Handshake header (4B) + Version (2B) +
-    // Random (32B) + SessionIdLen (1B) + SessionId (32B)
-    if (record.size() < 5 + 4 + 2 + 32 + 1 + 32 || record[0] != 0x16) {
-        return nullptr;
-    }
-    const size_t record_len =
-        (static_cast<size_t>(record[3]) << 8) | record[4];
-    if (record.size() < 5 + record_len || record_len < 4 + 2 + 32 + 1 + 32) {
-        return nullptr;
-    }
-
-    const auto handshake = record.subspan(5, record_len);
-    if (handshake[0] != 0x01) {
+    // This is the reassembled handshake, including its four-byte header.
+    if (handshake.size() < 4 + 2 + 32 + 1 + 32 ||
+        handshake[0] != SSL3_MT_CLIENT_HELLO) {
         return nullptr;
     }
     const size_t hello_len =
@@ -1302,6 +1330,7 @@ std::unique_ptr<RealityServerConnState> VerifyRealityClientHelloRecord(
     if (!auth_key) {
         return nullptr;
     }
+    const ScopedCleanse wipe_auth{auth_key->data(), auth_key->size()};
 
     memory::ByteVector aad(handshake.begin(), handshake.end());
     std::fill_n(aad.data() + 4 + 35, kRealitySessionIdSize, uint8_t{0});
@@ -1312,9 +1341,9 @@ std::unique_ptr<RealityServerConnState> VerifyRealityClientHelloRecord(
         std::span<const uint8_t, kRealitySessionIdSize>(
             session_id.data(), session_id.size()),
         aad);
-    if (!plain || !IsRealityClientAuthAllowed(*state, *plain)) {
-        return nullptr;
-    }
+    if (!plain) return nullptr;
+    const ScopedCleanse wipe_plain{plain->data(), plain->size()};
+    if (!IsRealityClientAuthAllowed(*state, *plain)) return nullptr;
 
     auto conn_state = std::make_unique<RealityServerConnState>();
     conn_state->auth_key = *auth_key;
@@ -1328,7 +1357,7 @@ std::unique_ptr<RealityServerConnState> VerifyRealityClientHelloRecord(
 bool TlsStream::SetRealityServerPreverified(
     std::unique_ptr<RealityServerConnState> state) noexcept {
     SSL* ssl = NativeSsl();
-    if (!ssl || !state) {
+    if (!state) {
         return false;
     }
     if (SSL_set_ex_data(ssl, RealityConnStateExIndex(), state.get()) != 1) {

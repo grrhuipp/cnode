@@ -77,7 +77,6 @@ public:
 
     void Clear() noexcept {
         pending_.clear();
-        pending_.ReleaseIfIdle();
         failed_ = false;
     }
     [[nodiscard]] size_t PendingBytes() const noexcept { return pending_.byte_size(); }

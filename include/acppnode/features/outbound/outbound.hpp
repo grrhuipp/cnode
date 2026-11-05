@@ -10,16 +10,17 @@ class Outbound;
 namespace acpp::features::outbound {
 
 // ============================================================================
-// Manager - outbound feature manager interface. Returned handles own the
-// selected handler for the complete dispatcher/outbound coroutine lifetime.
+// HandlerLookup - dispatcher-facing outbound handler lookup. Returned handles
+// own the selected handler for the complete dispatcher/outbound coroutine
+// lifetime.
 // ============================================================================
-class Manager {
+class HandlerLookup {
 public:
     using HandlerPtr = std::shared_ptr<Outbound>;
 
-    virtual ~Manager() noexcept = default;
+    virtual ~HandlerLookup() noexcept = default;
 
-    [[nodiscard]] virtual HandlerPtr GetHandler(std::string_view tag) noexcept = 0;
+    [[nodiscard]] virtual HandlerPtr GetHandler(std::string_view tag) = 0;
 };
 
 }  // namespace acpp::features::outbound

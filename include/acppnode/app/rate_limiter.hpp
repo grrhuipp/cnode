@@ -1,21 +1,21 @@
 #pragma once
 #include "acppnode/app/rate_limiter_fwd.hpp"
 #include "acppnode/common/allocator.hpp"
+#include "acppnode/app/session_group_executor.hpp"
 // ============================================================================
-// Worker 私有连接限制器 (Per-Worker Rate Limiter)
-//
-// 设计特点：
-// 1. Worker 私有 - 只在所属 io_context 上访问，无锁/无 atomic
-// 2. 固定内存 - 无动态分配，启动时分配固定大小
-// 3. O(1) 操作 - 开放寻址哈希表，最坏 O(探测长度)
-// 4. Cache 友好 - 每个槽位 64 字节对齐
-// 5. 统一接口 - 所有协议共用（VMess/Trojan/SS）
+// Process-wide connection/admission control. Session domains share this bounded
+// table; migration never creates a new global or per-IP allowance.
 // ============================================================================
 
 #include <array>
 #include <chrono>
-#include <string_view>
 #include <cstdint>
+#include <limits>
+#include <string_view>
+#include <utility>
+#include <memory>
+#include <mutex>
+#include <string>
 #include "acppnode/infra/log.hpp"
 
 namespace acpp {
@@ -32,50 +32,9 @@ struct RateLimitConfig {
 };
 
 // ============================================================================
-// 时间戳（秒）
-// ============================================================================
-[[nodiscard]] inline uint32_t Now() noexcept {
-    using namespace std::chrono;
-    return static_cast<uint32_t>(
-        duration_cast<seconds>(steady_clock::now().time_since_epoch()).count());
-}
-
-// ============================================================================
-// IP 哈希 (FNV-1a)
-// ============================================================================
-[[nodiscard]] constexpr uint64_t Hash(const char* s, size_t len) noexcept {
-    uint64_t h = 14695981039346656037ULL;
-    for (size_t i = 0; i < len; ++i) {
-        h ^= static_cast<uint8_t>(s[i]);
-        h *= 1099511628211ULL;
-    }
-    return h == 0 ? 1ULL : h;
-}
-
-[[nodiscard]] constexpr uint64_t Hash(std::string_view s) noexcept {
-    return Hash(s.data(), s.size());
-}
-
-[[nodiscard]] constexpr uint64_t HashPair(
-    std::string_view a, std::string_view b) noexcept {
-    uint64_t h = 14695981039346656037ULL;
-    for (char ch : a) {
-        h ^= static_cast<uint8_t>(ch);
-        h *= 1099511628211ULL;
-    }
-    h ^= static_cast<uint8_t>(':');
-    h *= 1099511628211ULL;
-    for (char ch : b) {
-        h ^= static_cast<uint8_t>(ch);
-        h *= 1099511628211ULL;
-    }
-    return h == 0 ? 1ULL : h;
-}
-
-// ============================================================================
-// ConnectionLimiter — Worker 私有无锁连接与认证屏蔽限制器
-// ============================================================================
-class ConnectionLimiter : public memory::ThreadAllocated {
+// Sans-I/O bounded model, accessed only by its owning control executor.
+// Production requests use ConnectionLimiter below, never this model directly.
+class ConnectionLimiterCore {
     static constexpr size_t kSlotCount = 16384;
     static_assert((kSlotCount & (kSlotCount - 1)) == 0,
                   "kSlotCount must be power of 2");
@@ -103,8 +62,12 @@ class ConnectionLimiter : public memory::ThreadAllocated {
         }
     };
     static_assert(sizeof(Slot) == 24, "Slot must remain compact (24 bytes)");
-
 public:
+    // 单 IP 连接槽位键（FNV-1a，0 保留为空槽）。
+    [[nodiscard]] static constexpr uint64_t IpHash(std::string_view ip) noexcept {
+        return NonZero(Fnv1a(kFnvOffset, ip));
+    }
+
     enum class RejectReason : uint8_t {
         NONE = 0,
         MAX_CONNECTIONS,
@@ -121,9 +84,9 @@ public:
         return kNames[static_cast<size_t>(r)];
     }
 
-    ConnectionLimiter() = default;
-    explicit ConnectionLimiter(const RateLimitConfig& cfg) noexcept
+    explicit ConnectionLimiterCore(const RateLimitConfig& cfg) noexcept
         : cfg_(cfg) {}
+
 
     [[nodiscard]] RejectReason TryAcceptGlobal() noexcept {
         if (cfg_.max_connections == 0) {
@@ -140,10 +103,10 @@ public:
         std::string_view tag,
         std::string_view ip,
         bool check_auth_ban = true) noexcept {
-        const uint32_t now = Now();
+        const uint32_t now = NowSeconds();
         if (check_auth_ban && cfg_.auth_fail_limit > 0) {
-            const uint64_t ban_h = HashPair(tag, ip);
-            if (const Slot* ban_s = FindConst(ban_h)) {
+            const uint64_t ban_h = BanHash(tag, ip);
+            if (const Slot* ban_s = Find(ban_h)) {
                 if (ban_s->ban_until > now) {
                     return RejectReason::IP_BANNED;
                 }
@@ -154,7 +117,7 @@ public:
             return RejectReason::NONE;
         }
 
-        const uint64_t h = Hash(ip);
+        const uint64_t h = IpHash(ip);
         Slot* s = FindOrCreate(h, now);
         if (!s) {
             return RejectReason::TRACKING_CAPACITY;
@@ -186,8 +149,8 @@ public:
     void OnAuthFailTracked(std::string_view tag, std::string_view ip) noexcept {
         if (cfg_.auth_fail_limit == 0) return;
 
-        const uint64_t h = HashPair(tag, ip);
-        const uint32_t now = Now();
+        const uint64_t h = BanHash(tag, ip);
+        const uint32_t now = NowSeconds();
         Slot* s = FindOrCreate(h, now);
         if (!s || s->ban_until > now) return;
 
@@ -201,7 +164,9 @@ public:
 
         const uint32_t cnt = ++s->auth_fails;
         if (cnt >= cfg_.auth_fail_limit) {
-            s->ban_until = now + cfg_.auth_ban_seconds;
+            s->ban_until = now > std::numeric_limits<uint32_t>::max() - cfg_.auth_ban_seconds
+                ? std::numeric_limits<uint32_t>::max()
+                : now + cfg_.auth_ban_seconds;
             LOG_NET_WARN("[{}] IP {} banned for {}s (auth failures: {})",
                          tag, ip, cfg_.auth_ban_seconds, cnt);
             s->auth_fails = 0;
@@ -211,26 +176,55 @@ public:
     [[nodiscard]] bool IsBanned(
         std::string_view tag, std::string_view ip) const noexcept {
         if (cfg_.auth_fail_limit == 0) return false;
-        const uint64_t h = HashPair(tag, ip);
-        const uint32_t now = Now();
-        if (const Slot* s = FindConst(h)) {
+        const uint64_t h = BanHash(tag, ip);
+        const uint32_t now = NowSeconds();
+        if (const Slot* s = Find(h)) {
             return s->ban_until > now;
         }
         return false;
     }
 
 private:
-    [[nodiscard]] Slot* Find(uint64_t h) noexcept {
-        const size_t idx = h & kMask;
-        for (size_t i = 0; i < kProbe; ++i) {
-            Slot& s = slots_[(idx + i) & kMask];
-            if (s.Match(h)) return &s;
-            if (s.Empty()) return nullptr;
+    static constexpr uint64_t kFnvOffset = 14695981039346656037ULL;
+    static constexpr uint64_t kFnvPrime = 1099511628211ULL;
+
+    [[nodiscard]] static constexpr uint64_t Fnv1a(
+        uint64_t h, std::string_view bytes) noexcept {
+        for (const char ch : bytes) {
+            h ^= static_cast<uint8_t>(ch);
+            h *= kFnvPrime;
         }
-        return nullptr;
+        return h;
     }
 
-    [[nodiscard]] const Slot* FindConst(uint64_t h) const noexcept {
+    [[nodiscard]] static constexpr uint64_t NonZero(uint64_t h) noexcept {
+        return h == 0 ? 1ULL : h;
+    }
+
+    // 认证屏蔽键与单 IP 连接键共用槽表：标签长度前缀使 (tag, ip) 编码单射，
+    // 且其输入以 NUL 字节开头的长度编码，不会与纯文本 IP 键的输入流重合。
+    [[nodiscard]] static constexpr uint64_t BanHash(
+        std::string_view tag, std::string_view ip) noexcept {
+        uint64_t h = kFnvOffset;
+        uint64_t length = tag.size();
+        for (size_t i = 0; i < sizeof(length); ++i, length >>= 8) {
+            h ^= length & 0xFF;
+            h *= kFnvPrime;
+        }
+        return NonZero(Fnv1a(Fnv1a(h, tag), ip));
+    }
+
+    [[nodiscard]] static uint32_t NowSeconds() noexcept {
+        using namespace std::chrono;
+        return static_cast<uint32_t>(
+            duration_cast<seconds>(steady_clock::now().time_since_epoch()).count());
+    }
+
+    [[nodiscard]] Slot* Find(uint64_t h) noexcept {
+        return const_cast<Slot*>(std::as_const(*this).Find(h));
+    }
+
+    [[nodiscard]] const Slot* Find(uint64_t h) const noexcept {
         const size_t idx = h & kMask;
         for (size_t i = 0; i < kProbe; ++i) {
             const Slot& s = slots_[(idx + i) & kMask];
@@ -264,6 +258,158 @@ private:
     RateLimitConfig cfg_;
     uint32_t total_ = 0;
     std::array<Slot, kSlotCount> slots_{};
+};
+
+// The control actor owns the only table. Reservations preallocate their return
+// node before admission; destruction publishes metadata without allocation,
+// waiting, or competing for bounded business-call capacity.
+class ConnectionLimiter final : public std::enable_shared_from_this<ConnectionLimiter> {
+public:
+    using RejectReason = ConnectionLimiterCore::RejectReason;
+    static const char* RejectReasonToString(RejectReason reason) noexcept {
+        return ConnectionLimiterCore::RejectReasonToString(reason);
+    }
+    struct Family {
+        size_t children = 0; // control-executor only
+        bool physical = true;
+    };
+private:
+    struct Return final : GroupCoordinator::ReservedOperation {
+        std::shared_ptr<ConnectionLimiter> owner;
+        std::shared_ptr<Family> family;
+        uint64_t ip_hash = 0;
+        bool physical = false;
+        bool child = false;
+        bool admitted = false;
+        void Invoke() noexcept override {
+            if (!admitted) return;
+            if (ip_hash) owner->core_.ReleaseHash(ip_hash);
+            if (physical) {
+                family->physical = false;
+                if (family->children == 0) owner->core_.ReleaseGlobal();
+            } else if (child) {
+                --family->children;
+                if (family->children != 0 || !family->physical) owner->core_.ReleaseGlobal();
+            }
+        }
+    };
+public:
+    class Reservation {
+    public:
+        Reservation() = default;
+        Reservation(Reservation&&) noexcept = default;
+        Reservation& operator=(Reservation&& other) noexcept {
+            Reset();
+            node_ = std::move(other.node_);
+            return *this;
+        }
+        Reservation(const Reservation&) = delete;
+        Reservation& operator=(const Reservation&) = delete;
+        ~Reservation() { Reset(); }
+        [[nodiscard]] const std::shared_ptr<Family>& FamilyLease() const noexcept {
+            return node_->family;
+        }
+    private:
+        friend class ConnectionLimiter;
+        explicit Reservation(std::unique_ptr<Return> node) : node_(std::move(node)) {}
+        void Reset() noexcept {
+            if (!node_) return;
+            if (!node_->admitted) { node_.reset(); return; }
+            auto coordinator = node_->owner->coordinator_;
+            coordinator->PostReserved(std::move(node_));
+        }
+        std::unique_ptr<Return> node_;
+    };
+    struct Admission {
+        RejectReason reason = RejectReason::NONE;
+        Reservation reservation;
+    };
+
+    static std::shared_ptr<ConnectionLimiter> Acquire(
+        const RateLimitConfig& config, std::shared_ptr<GroupCoordinator> coordinator) {
+        // Cold bootstrap publication only; no request acquires this mutex.
+        static std::mutex publication_mutex;
+        static std::weak_ptr<ConnectionLimiter> published;
+        const std::lock_guard lock(publication_mutex);
+        if (auto existing = published.lock()) {
+            if (existing->coordinator_ != coordinator)
+                throw std::logic_error("connection limiter coordinator mismatch");
+            return existing;
+        }
+        auto limiter = std::shared_ptr<ConnectionLimiter>(
+            new ConnectionLimiter(config, std::move(coordinator)));
+        published = limiter;
+        return limiter;
+    }
+
+    net::awaitable<Admission> ReservePhysical() {
+        auto node = std::make_unique<Return>();
+        node->owner = shared_from_this();
+        node->family = std::make_shared<Family>();
+        node->physical = true;
+        auto reservation = Reservation(std::move(node));
+        co_return co_await coordinator_->PostCall(
+            [reservation = std::move(reservation)]() mutable {
+                auto& node = *reservation.node_;
+                const auto reason = node.owner->core_.TryAcceptGlobal();
+                node.admitted = reason == RejectReason::NONE;
+                return Admission{reason, std::move(reservation)};
+            });
+    }
+
+    net::awaitable<Admission> ReserveIP(std::string_view tag, std::string_view ip,
+                                      bool check_ban) {
+        return Reserve({}, tag, ip, check_ban);
+    }
+    net::awaitable<Admission> ReserveLogical(std::shared_ptr<Family> family,
+        std::string_view tag, std::string_view ip, bool check_ban) {
+        return Reserve(std::move(family), tag, ip, check_ban);
+    }
+    net::awaitable<bool> IsBanned(std::string_view tag, std::string_view ip) {
+        return coordinator_->PostCall([self = shared_from_this(),
+            tag = std::string(tag), ip = std::string(ip)] {
+            return self->core_.IsBanned(tag, ip);
+        });
+    }
+    net::awaitable<void> OnAuthFailTracked(std::string_view tag, std::string_view ip) {
+        return coordinator_->PostCall([self = shared_from_this(),
+            tag = std::string(tag), ip = std::string(ip)] {
+            self->core_.OnAuthFailTracked(tag, ip);
+        });
+    }
+private:
+    ConnectionLimiter(const RateLimitConfig& config, std::shared_ptr<GroupCoordinator> coordinator)
+        : core_(config), coordinator_(std::move(coordinator)) {
+        if (!coordinator_) throw std::invalid_argument("missing admission coordinator");
+    }
+    net::awaitable<Admission> Reserve(std::shared_ptr<Family> family,
+        std::string_view tag, std::string_view ip, bool check_ban) {
+        auto node = std::make_unique<Return>();
+        node->owner = shared_from_this();
+        node->family = std::move(family);
+        node->child = bool(node->family);
+        auto reservation = Reservation(std::move(node));
+        return coordinator_->PostCall([reservation = std::move(reservation),
+            tag = std::string(tag), ip = std::string(ip), check_ban]() mutable {
+            auto& node = *reservation.node_;
+            auto& core = node.owner->core_;
+            const bool extra_global = node.child &&
+                (node.family->children != 0 || !node.family->physical);
+            auto reason = extra_global ? core.TryAcceptGlobal() : RejectReason::NONE;
+            if (reason == RejectReason::NONE) {
+                reason = core.TryAcceptIP(tag, ip, check_ban);
+                if (reason != RejectReason::NONE && extra_global) core.ReleaseGlobal();
+            }
+            if (reason == RejectReason::NONE) {
+                node.admitted = true;
+                node.ip_hash = ConnectionLimiterCore::IpHash(ip);
+                if (node.child) ++node.family->children;
+            }
+            return Admission{reason, std::move(reservation)};
+        });
+    }
+    ConnectionLimiterCore core_;
+    std::shared_ptr<GroupCoordinator> coordinator_;
 };
 
 }  // namespace acpp

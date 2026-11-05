@@ -3,7 +3,6 @@
 #include <openssl/ssl.h>
 
 #include "acppnode/transport/internet/tls_config.hpp"
-#include "acppnode/common/allocator.hpp"
 
 #include <span>
 #include <string>
@@ -23,8 +22,15 @@ namespace acpp {
 [[nodiscard]] bool EncodeTlsAlpnProtocols(
     std::span<const std::string> protocols,
     std::vector<unsigned char>& wire);
-[[nodiscard]] bool EncodeTlsAlpnProtocols(
-    std::span<const std::string> protocols,
-    memory::ByteVector& wire);
+
+// Client ALPN is a context property: configured once at load time.
+[[nodiscard]] bool ConfigureTlsClientAlpn(
+    SSL_CTX* context, std::span<const std::string> protocols);
+
+// Installs the PEM certificate chain (leaf first) and its private key, the
+// in-memory equivalent of SSL_CTX_use_certificate_chain_file plus
+// SSL_CTX_use_PrivateKey_file. Logs the failing step.
+[[nodiscard]] bool ConfigureTlsCertificatePem(
+    SSL_CTX* context, const TlsPemMaterial& pem);
 
 }  // namespace acpp

@@ -1,17 +1,10 @@
 #include "acppnode/transport/internet/tls_server_name.hpp"
+#include "acppnode/common/byte_reader.hpp"
 
 #include <algorithm>
 #include <bitset>
 
 namespace acpp::transport::internet {
-namespace {
-
-[[nodiscard]] uint16_t ReadBigEndianU16(const uint8_t* data) noexcept {
-    return static_cast<uint16_t>((static_cast<uint16_t>(data[0]) << 8) |
-                                 static_cast<uint16_t>(data[1]));
-}
-
-}  // namespace
 
 tl::expected<std::string_view, TlsServerNameExtensionError>
 ParseTlsServerNameExtension(std::span<const uint8_t> extension) noexcept {
@@ -19,7 +12,7 @@ ParseTlsServerNameExtension(std::span<const uint8_t> extension) noexcept {
         return tl::unexpected(TlsServerNameExtensionError::InvalidFormat);
     }
 
-    const uint16_t list_size = ReadBigEndianU16(extension.data());
+    const uint16_t list_size = LoadU16BE(extension.data());
     if (static_cast<std::size_t>(list_size) + 2 != extension.size()) {
         return tl::unexpected(TlsServerNameExtensionError::InvalidFormat);
     }
@@ -38,7 +31,7 @@ ParseTlsServerNameExtension(std::span<const uint8_t> extension) noexcept {
         }
         seen_types.set(name_type);
         const uint16_t name_size =
-            ReadBigEndianU16(extension.data() + position);
+            LoadU16BE(extension.data() + position);
         position += 2;
         if (name_size == 0 || name_size > end - position) {
             return tl::unexpected(TlsServerNameExtensionError::InvalidFormat);

@@ -1,7 +1,6 @@
 """Real VLESS -> freedom TCP dials verify ordered source binding and fallback."""
 import argparse
 import asyncio
-import os
 from pathlib import Path
 import socket
 import struct
@@ -112,7 +111,6 @@ async def run_case(binary, root, addresses, strategy, succeeds, *, domain=False)
             child = subprocess.Popen(
                 [str(binary), "--config-dir", str(root)], stdout=log,
                 stderr=subprocess.STDOUT,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
             try:
                 deadline = time.monotonic() + 10

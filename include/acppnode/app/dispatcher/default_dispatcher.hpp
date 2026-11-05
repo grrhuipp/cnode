@@ -5,7 +5,6 @@
 
 #include <cstdint>
 #include <memory>
-#include <string_view>
 
 namespace acpp {
 
@@ -16,7 +15,7 @@ class Router;
 }  // namespace routing
 
 namespace features::outbound {
-class Manager;
+class HandlerLookup;
 }  // namespace features::outbound
 
 namespace features::policy {
@@ -41,15 +40,15 @@ struct OutboundSelection;
 // ============================================================================
 // DefaultDispatcher - app/dispatcher implementation
 //
-// 对齐 xray-core app/dispatcher.DefaultDispatcher 的实现职责。全部依赖在
-// Worker 冷路径一次性构造；热路径只消费窄 DispatchPolicy，编排强制出口、
-// Router 规则决策、显式 fallback 和通用请求策略。
+// Stable session-domain orchestration: mutable request/tracking/outbound hosts
+// share its executor; routing/policy snapshots are immutable control products.
+// Hot dispatch consumes only the narrow DispatchPolicy.
 // ============================================================================
 class DefaultDispatcher final : public routing::Dispatcher, public memory::ThreadAllocated {
 public:
     DefaultDispatcher(
         const routing::Router& router,
-        features::outbound::Manager& outbound_manager,
+        features::outbound::HandlerLookup& outbound_handlers,
         features::policy::RequestPolicy& request_policy,
         app::SessionTrackingState& session_tracking,
         app::dns::DNS& dns_service,
@@ -84,8 +83,6 @@ private:
         RelayResult& result,
         AwaitableTaskGroup& request_group,
         ErrorCode& cancellation_reason);
-    [[nodiscard]] std::shared_ptr<Outbound> ResolveOutboundHandler(
-        std::string_view tag) const noexcept;
     [[nodiscard]] detail::OutboundSelection SelectRoute(
         session::Context& ctx,
         const routing::DispatchPolicy& policy) const;
@@ -97,7 +94,7 @@ private:
         const routing::DispatchPolicy& policy);
 
     const routing::Router& router_;
-    features::outbound::Manager& outbound_manager_;
+    features::outbound::HandlerLookup& outbound_handlers_;
     features::policy::RequestPolicy& request_policy_;
     app::SessionTrackingState& session_tracking_;
     app::dns::DNS& dns_service_;

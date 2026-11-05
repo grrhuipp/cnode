@@ -82,12 +82,14 @@ void TestModes() {
 }
 
 void TestAlpnAndDefaults() {
-    struct AlpnCase { const char* network; const char* security; const char* mode; bool h2; };
-    for (const auto& item : {AlpnCase{"grpc", "tls", "", true}, {"grpc", "none", "", false},
-                            {"h2", "none", "", true}, {"http", "none", "", false},
-                            {"http", "tls", "", true}, {"xhttp", "none", "auto", true},
-                            {"xhttp", "none", "packet-up", false}, {"xhttp", "tls", "packet-up", true},
-                            {"xhttp", "reality", "auto", false}}) {
+    struct AlpnCase { const char* network; const char* security; XHttpMode mode; bool h2; };
+    for (const auto& item : {AlpnCase{"grpc", "tls", XHttpMode::Auto, true},
+                            {"grpc", "none", XHttpMode::Auto, false},
+                            {"h2", "none", XHttpMode::Auto, true}, {"http", "none", XHttpMode::Auto, false},
+                            {"http", "tls", XHttpMode::Auto, true}, {"xhttp", "none", XHttpMode::Auto, true},
+                            {"xhttp", "none", XHttpMode::PacketUp, false},
+                            {"xhttp", "tls", XHttpMode::PacketUp, true},
+                            {"xhttp", "reality", XHttpMode::Auto, false}}) {
         StreamSettings source;
         source.network = item.network;
         source.security = item.security;
@@ -154,7 +156,7 @@ void TestQueries() {
     XHttpConfig xhttp;
     xhttp.path = "demo?x=1";
     Require(xhttp.NormalizedPath() == "/demo/", "XHTTP path normalization changed");
-    xhttp.mode = "stream-up";
+    xhttp.mode = XHttpMode::StreamUp;
     Require(xhttp.AcceptsStreamOne() && xhttp.AcceptsStreamUp() && !xhttp.AcceptsPacketUp() && !xhttp.IsStreamOne(),
         "XHTTP mode predicates changed");
     GrpcConfig grpc;
@@ -163,17 +165,35 @@ void TestQueries() {
     grpc.multi_mode = true;
     Require(grpc.RequestPath() == "/service/TunMulti", "gRPC multiplexed path changed");
 
-    StreamSettings with_tls;
-    with_tls.prepared_tls.client_ctx = std::shared_ptr<SslContext>(
-        reinterpret_cast<SslContext*>(0x1), [](SslContext*) {});
-    with_tls.prepared_tls.server_ctx = std::shared_ptr<SslContext>(
-        reinterpret_cast<SslContext*>(0x2), [](SslContext*) {});
-    StreamSettings copied = with_tls;
-    Require(!copied.prepared_tls.client_ctx && !copied.prepared_tls.server_ctx,
-        "copying StreamSettings across Workers must reset prepared SslContext handles");
-    StreamSettings moved = std::move(with_tls);
-    Require(moved.prepared_tls.client_ctx != nullptr && moved.prepared_tls.server_ctx != nullptr,
-        "moving StreamSettings must preserve prepared SslContext handles");
+    // Explicit outbound host precedence is resolved once at normalization.
+    StreamSettings upgrade;
+    upgrade.network = "httpupgrade";
+    upgrade.http_upgrade.headers.emplace("Host", "header.example");
+    Require(NormalizeStreamSettings(upgrade).configured_http_host == "header.example",
+        "HTTPUpgrade Host header was not used");
+    upgrade.http_upgrade.host = "field.example";
+    Require(NormalizeStreamSettings(upgrade).configured_http_host == "field.example",
+        "HTTPUpgrade host field must override the Host header");
+    StreamSettings grpc_settings;
+    grpc_settings.network = "grpc";
+    grpc_settings.grpc.service_name = "service";
+    const auto normalized_grpc = NormalizeStreamSettings(grpc_settings);
+    Require(normalized_grpc.grpc.request_path == "/service/Tun" &&
+            normalized_grpc.configured_http_host.empty(), "gRPC derived fields changed");
+
+    // Auto resolves to a concrete client mode; explicit modes pass through.
+    struct ModeCase { const char* security; bool download; XHttpMode expected; };
+    for (const auto& item : {ModeCase{"none", false, XHttpMode::PacketUp},
+                            {"tls", false, XHttpMode::StreamUp},
+                            {"reality", false, XHttpMode::StreamOne},
+                            {"reality", true, XHttpMode::StreamUp}}) {
+        StreamSettings source;
+        source.network = "xhttp";
+        source.security = item.security;
+        if (item.download) source.xhttp.download_settings = std::make_shared<XHttpDownloadSettings>();
+        Require(ResolveXHttpOutboundMode(NormalizeStreamSettings(source)) == item.expected,
+            "XHTTP auto mode resolution changed");
+    }
 }
 }
 

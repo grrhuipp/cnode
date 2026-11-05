@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <string>
 #include <vector>
@@ -26,6 +27,20 @@ enum class TlsVersion : uint8_t {
     return true;
 }
 
+// Contents of configured certificate, key and CA files. Read in the cold
+// configuration path to prepare immutable SSL_CTX snapshots; handshakes never
+// reload files or rebuild a context per Worker.
+struct TlsPemMaterial {
+    std::string certificate_chain;
+    std::string private_key;  // Wiped when the last owner releases it.
+    std::string trusted_ca;
+
+    TlsPemMaterial() = default;
+    ~TlsPemMaterial();
+    TlsPemMaterial(const TlsPemMaterial&) = delete;
+    TlsPemMaterial& operator=(const TlsPemMaterial&) = delete;
+};
+
 // ============================================================================
 // TLS 配置
 // ============================================================================
@@ -34,6 +49,9 @@ struct TlsConfig {
     std::string cert_file;              // 证书链文件路径
     std::string key_file;               // 私钥文件路径
     std::string ca_file;                // CA 证书（可选，用于客户端验证）
+    // Loaded from the three paths above by LoadTlsPemMaterial; null when none
+    // is configured.
+    std::shared_ptr<const TlsPemMaterial> pem;
 
     // 客户端配置
     std::string server_name;            // 客户端 SNI / 自签证书默认域名
@@ -48,5 +66,9 @@ struct TlsConfig {
         return !cert_file.empty() && !key_file.empty();
     }
 };
+
+// Cold path only (configuration load). Reads every configured file into
+// |config.pem|; throws std::invalid_argument naming the unreadable file.
+void LoadTlsPemMaterial(TlsConfig& config);
 
 }  // namespace acpp

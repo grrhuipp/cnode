@@ -118,14 +118,12 @@ public:
         }
         if (!relay) co_return RelayResult{};
         Stream target(target_state);
-        if (inbound.control) co_return co_await DoRelayLink(io, *inbound.reader,
-            *inbound.writer, *inbound.control, target, ctx, stats, config, std::move(first));
         co_return co_await DoRelayLink(io, *inbound.reader, *inbound.writer,
-            target, ctx, stats, config, std::move(first));
+            inbound.control, target, ctx, stats, config, std::move(first));
     }
 };
 
-class Manager final : public features::outbound::Manager {
+class FakeHandlerLookup final : public features::outbound::HandlerLookup {
 public:
     std::shared_ptr<Handler> handler = std::make_shared<Handler>();
     std::shared_ptr<Handler> second;
@@ -170,13 +168,13 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
         (which == Case::RelayFailure || which == Case::RelayCancelled);
     auto stream = std::make_unique<Stream>(source_state);
     auto* reader = stream.get();
-    Manager manager;
+    FakeHandlerLookup outbound_handlers;
     Router router;
     if (which == Case::RuleMatch) {
-        manager.second = std::make_shared<Handler>();
+        outbound_handlers.second = std::make_shared<Handler>();
         router.decision = {.outbound_tag = "second", .matched = true};
     }
-    auto& outbound = which == Case::RuleMatch ? *manager.second : *manager.handler;
+    auto& outbound = which == Case::RuleMatch ? *outbound_handlers.second : *outbound_handlers.handler;
     outbound.state.load = &load;
     outbound.target_state.phase_stream = &phase_stream;
     outbound.state.block = which == Case::Handshake || which == Case::Parent || which == Case::Pending;
@@ -214,7 +212,7 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
     app::dns::DNSWorker dns_worker(io, dns_config, 8);
     app::dns::DNS dns(dns_worker);
     app::SessionTrackingState session_tracking;
-    rule::Manager request_policy;
+    rule::DetectRulePolicy request_policy;
     if (which == Case::PolicyBlockedForce || which == Case::PolicyBlockedRoute ||
         which == Case::PolicyAllowed) {
         request_policy.UpdateRule(ctx.inbound.tag, {{
@@ -223,7 +221,7 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
         }});
     }
     app::dispatcher::DefaultDispatcher dispatcher(
-        router, manager, request_policy, session_tracking, dns, load);
+        router, outbound_handlers, request_policy, session_tracking, dns, load);
     if (which == Case::PreStopped) reader->Cancellation().Stop(reason);
     bool done = false;
     bool triggered = false;
@@ -269,7 +267,7 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
         expected = ErrorCode::BLOCKED;
     passed &= result.error == expected;
     if (which == Case::PreStopped || which == Case::Sniff || which == Case::RoutingDns ||
-        which == Case::SniffMemory || which == Case::SniffLinkError) passed &= manager.lookups == 0 && outbound.state.entered == 0;
+        which == Case::SniffMemory || which == Case::SniffLinkError) passed &= outbound_handlers.lookups == 0 && outbound.state.entered == 0;
     if (source_state.block || outbound.state.block) {
         const auto& waiting = source_state.block ? source_state : outbound.state;
         passed &= triggered && waiting.cancelled == 1 && waiting.cleanup_has_owner && outbound.state.committed == 0;
@@ -283,10 +281,10 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
     }
     if (which == Case::RuleMatch) {
         passed &= ctx.outbound.tag == "second" &&
-            manager.handler->state.entered == 0 && outbound.state.committed == 1;
+            outbound_handlers.handler->state.entered == 0 && outbound.state.committed == 1;
     }
     if (which == Case::PolicyBlockedForce || which == Case::PolicyBlockedRoute) {
-        passed &= manager.lookups == 0 && outbound.state.entered == 0 &&
+        passed &= outbound_handlers.lookups == 0 && outbound.state.entered == 0 &&
             outbound.state.committed == 0;
     }
     if (which == Case::PolicyAllowed) {
@@ -295,7 +293,8 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
     }
     if (which == Case::RelaySuccess) passed &= result.bytes_up == 7 && result.bytes_down == 13 &&
         source_state.written == 13 && outbound.target_state.written == 7 && (!controlled || source_state.closed);
-    const auto traffic = session_tracking.CollectAndResetTraffic(ctx.inbound.accounting_key);
+    const auto traffic = session_tracking.SnapshotTraffic(ctx.inbound.accounting_key);
+    session_tracking.CommitTraffic(ctx.inbound.accounting_key, traffic);
     if (which == Case::RelaySuccess) {
         const auto user = traffic.users.find(42);
         passed &= user != traffic.users.end() &&
@@ -304,7 +303,7 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
     // Completed requests must no longer contribute live traffic to reporting.
     ++ctx.traffic.bytes_up;
     ++ctx.traffic.bytes_down;
-    passed &= session_tracking.CollectAndResetTraffic(ctx.inbound.accounting_key).empty();
+    passed &= session_tracking.SnapshotTraffic(ctx.inbound.accounting_key).empty();
     if (!controlled && done) {
         // Borrowed logical inputs may outlive Dispatcher and notify again.
         // No callback may retain its completed task group or stack context.
@@ -313,7 +312,7 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
     }
     std::printf("case=%d controlled=%d reason=%s result=%s timely=%d triggered=%d lookups=%d committed=%d joined=%d: %s\n",
         int(which), controlled, ErrorCodeToString(reason).data(), ErrorCodeToString(result.error).data(),
-        completed_in_budget, triggered, manager.lookups, outbound.state.committed,
+        completed_in_budget, triggered, outbound_handlers.lookups, outbound.state.committed,
         source_state.active + outbound.state.active == 0, passed ? "PASS" : "FAIL");
     return passed;
 }
@@ -325,21 +324,21 @@ bool SiblingIsolation(bool controlled) {
     auto first = std::make_unique<Stream>(a);
     auto second = std::make_unique<Stream>(b);
     auto* source = first.get();
-    Manager manager;
-    manager.second = std::make_shared<Handler>();
-    for (const auto& handler : {manager.handler, manager.second}) {
+    FakeHandlerLookup outbound_handlers;
+    outbound_handlers.second = std::make_shared<Handler>();
+    for (const auto& handler : {outbound_handlers.handler, outbound_handlers.second}) {
         handler->state.block = true;
         handler->state.load = &load;
     }
     Router router;
-    rule::Manager request_policy;
+    rule::DetectRulePolicy request_policy;
     app::SessionTrackingState session_tracking;
     udp::socket dns_peer(io, udp::endpoint(net::ip::address_v4::loopback(), 0));
     app::dns::Config dns_config{.servers = {dns_peer.local_endpoint()}};
     app::dns::DNSWorker dns_worker(io, dns_config, 8);
     app::dns::DNS dns(dns_worker);
     app::dispatcher::DefaultDispatcher dispatcher(
-        router, manager, request_policy, session_tracking, dns, load);
+        router, outbound_handlers, request_policy, session_tracking, dns, load);
     routing::DispatchPolicy policy_a{SniffConfig{.enabled = false, .domains_excluded = {}}, routing::ForceOutbound{"direct"}};
     routing::DispatchPolicy policy_b{SniffConfig{.enabled = false, .domains_excluded = {}}, routing::ForceOutbound{"second"}};
     session::Context ctx_a, ctx_b;
@@ -355,7 +354,7 @@ bool SiblingIsolation(bool controlled) {
             failed |= bool(error);
             first_done = true;
             result_a = result;
-            first_joined = manager.handler->state.active == 0 && load.ActiveConnections() == 1;
+            first_joined = outbound_handlers.handler->state.active == 0 && load.ActiveConnections() == 1;
         });
     net::co_spawn(io, dispatcher.Dispatch(io, policy_b, controlled ? std::move(second) : nullptr,
         link_b, InitialPayload{}, ctx_b, stats, timeouts), [&](std::exception_ptr error, RelayResult result) {
@@ -367,15 +366,15 @@ bool SiblingIsolation(bool controlled) {
     net::steady_timer stop(io, 30ms);
     stop.async_wait([&](IoErrorCode error) {
         if (error) return;
-        both_waiting = manager.handler->state.active == 1 && manager.second->state.active == 1;
+        both_waiting = outbound_handlers.handler->state.active == 1 && outbound_handlers.second->state.active == 1;
         source->Cancellation().Stop(ErrorCode::RESOURCE_EXHAUSTED);
     });
     io.run_for(1s);
     const bool passed = !failed && first_done && second_done && both_waiting && first_joined &&
         result_a.error == ErrorCode::RESOURCE_EXHAUSTED && result_b.error == ErrorCode::OK &&
-        manager.handler->state.cancelled == 1 && manager.handler->state.committed == 0 &&
-        manager.second->state.cancelled == 0 && manager.second->state.committed == 1 &&
-        manager.second->state.active == 0 && load.ActiveConnections() == 0;
+        outbound_handlers.handler->state.cancelled == 1 && outbound_handlers.handler->state.committed == 0 &&
+        outbound_handlers.second->state.cancelled == 0 && outbound_handlers.second->state.committed == 1 &&
+        outbound_handlers.second->state.active == 0 && load.ActiveConnections() == 0;
     std::printf("sibling isolation controlled=%d first=%s second=%s joined=%d: %s\n", controlled,
         ErrorCodeToString(result_a.error).data(), ErrorCodeToString(result_b.error).data(), first_joined,
         passed ? "PASS" : "FAIL");
@@ -414,8 +413,12 @@ bool StableAccounting() {
     new_traffic.bytes_up = 13;
     new_traffic.bytes_down = 17;
     static_traffic.bytes_up = 1000;
-    auto first = tracking.CollectAndResetTraffic(key);
+    auto first = tracking.SnapshotTraffic(key);
     bool passed = first.users.at(42).upload == 20 && first.users.at(42).download == 28;
+    // Failed persistence leaves the same delta visible; sampling is not reset.
+    const auto uncommitted = tracking.SnapshotTraffic(key);
+    passed &= uncommitted.users.at(42).upload == 20 &&
+        uncommitted.users.at(42).download == 28;
     old_traffic.bytes_up += 19;
     new_traffic.bytes_down += 23;
     resource.reject = true;
@@ -423,15 +426,20 @@ bool StableAccounting() {
     tracking.UnregisterActiveSession(new_port);
     tracking.UnregisterActiveSession(static_inbound);
     resource.reject = false;
-    const auto remaining = tracking.CollectAndResetTraffic(key);
+    // Completion during off-thread persistence must survive committing the
+    // older snapshot. This also exercises account address stability on close.
+    tracking.CommitTraffic(key, first);
+    const auto remaining = tracking.SnapshotTraffic(key);
+    tracking.CommitTraffic(key, remaining);
     passed &= remaining.users.at(42).upload == 19 && remaining.users.at(42).download == 23 &&
-        resource.attempts == 0 && tracking.CollectAndResetTraffic(key).empty() &&
-        tracking.CollectAndResetTraffic({}).empty();
+        resource.attempts == 0 && tracking.SnapshotTraffic(key).empty() &&
+        tracking.SnapshotTraffic({}).empty();
     tracking.RegisterActiveSession(new_port, key, 42, new_traffic);
     new_traffic.bytes_up = 3;
     new_traffic.bytes_down = 5;
     tracking.UnregisterActiveSession(new_port);
-    const auto reused = tracking.CollectAndResetTraffic(key);
+    const auto reused = tracking.SnapshotTraffic(key);
+    tracking.CommitTraffic(key, reused);
     passed &= reused.users.at(42).upload == 3 && reused.users.at(42).download == 5;
     std::printf("stable accounting with retired sessions and teardown OOM: %s\n",
                 passed ? "PASS" : "FAIL");

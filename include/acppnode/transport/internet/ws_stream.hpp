@@ -41,9 +41,23 @@ enum class Opcode : uint8_t {
     PONG = 0x0A,
 };
 
-// Mask/Unmask 数据（对称操作）
+// RFC 6455 §5.3 mask/unmask (symmetric). |offset| is the payload position of
+// data[0]; eight bytes are XORed per step with the key rotated to that offset.
 inline void MaskData(uint8_t* data, size_t len, const uint8_t* mask_key,
-                     size_t offset = 0);
+                     size_t offset = 0) {
+    std::array<uint8_t, 8> pattern;
+    for (size_t i = 0; i < pattern.size(); ++i) pattern[i] = mask_key[(offset + i) & 3];
+    uint64_t word_mask;
+    std::memcpy(&word_mask, pattern.data(), sizeof(word_mask));
+    size_t i = 0;
+    for (; len - i >= sizeof(word_mask); i += sizeof(word_mask)) {
+        uint64_t word;
+        std::memcpy(&word, data + i, sizeof(word));
+        word ^= word_mask;
+        std::memcpy(data + i, &word, sizeof(word));
+    }
+    for (; i < len; ++i) data[i] ^= pattern[i & 7];
+}
 
 // 编码帧头
 inline EncodedFrameHeader EncodeFrameHeader(
@@ -82,13 +96,6 @@ inline EncodedFrameHeader EncodeFrameHeader(
 
     header.size = offset;
     return header;
-}
-
-inline void MaskData(uint8_t* data, size_t len, const uint8_t* mask_key,
-                     size_t offset) {
-    for (size_t i = 0; i < len; ++i) {
-        data[i] ^= mask_key[(offset + i) % 4];
-    }
 }
 
 [[nodiscard]] std::string ComputeWsAccept(std::string_view ws_key);

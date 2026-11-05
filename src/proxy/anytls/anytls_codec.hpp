@@ -67,6 +67,9 @@ public:
                         : std::span<const net::const_buffer>(buffers_.data(), count_);
     }
 private:
+    void Begin(size_t frames);
+    [[nodiscard]] bool Append(uint8_t cmd, uint32_t sid, std::span<const uint8_t> bytes);
+
     static constexpr size_t kInlineFrames = buf::MultiBuffer::kInlineCapacity;
     std::array<std::array<uint8_t, kFrameHeaderSize>, kInlineFrames> headers_{};
     std::array<net::const_buffer, kInlineFrames * 2> buffers_{};
@@ -101,6 +104,12 @@ WritePacketWithPadding(AsyncStream& stream,
 
 net::awaitable<tl::expected<void, ErrorCode>>
 WriteMultiBufferAsFrameBatch(AsyncStream& stream, uint8_t cmd, uint32_t sid, buf::MultiBuffer mb);
+
+net::awaitable<tl::expected<void, ErrorCode>>
+WriteBuffersAsFrameBatch(AsyncStream& stream,
+                         uint8_t cmd,
+                         uint32_t sid,
+                         std::span<const net::const_buffer> buffers);
 
 net::awaitable<tl::expected<void, ErrorCode>>
 WriteMultiBufferAsFramesWithPadding(AsyncStream& stream,

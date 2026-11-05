@@ -50,13 +50,6 @@ inline void NormalizeDnsHostnameInPlace(String& hostname) noexcept {
     }
 }
 
-[[nodiscard]] inline std::string CanonicalDnsHostname(
-    std::string_view hostname) {
-    std::string canonical(hostname);
-    NormalizeDnsHostnameInPlace(canonical);
-    return canonical;
-}
-
 [[nodiscard]] inline bool IsValidDnsHostname(
     std::string_view hostname,
     TrailingDotPolicy trailing_dot_policy) noexcept {

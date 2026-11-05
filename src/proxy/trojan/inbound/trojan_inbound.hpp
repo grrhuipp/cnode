@@ -18,7 +18,7 @@ class Handler final : public ::acpp::Inbound {
 public:
     Handler(::acpp::UserOnlineTracker& validator,
             ::acpp::StatsShard& stats,
-            ::acpp::ConnectionLimiterPtr limiter);
+            ::acpp::ConnectionLimiter* limiter);
 
     // 从已建立的传输流解析 Trojan 头（password_hash + CRLF + target + CRLF）
     ::acpp::net::awaitable<::acpp::RelayResult> Process(
@@ -33,7 +33,7 @@ public:
 private:
     ::acpp::UserOnlineTracker& validator_;
     ::acpp::StatsShard* stats_ = nullptr;
-    ::acpp::ConnectionLimiterPtr limiter_;
+    ::acpp::ConnectionLimiter* limiter_;
 };
 
 }  // namespace acpp::proxy::trojan::inbound

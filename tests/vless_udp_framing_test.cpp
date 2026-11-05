@@ -36,7 +36,7 @@ void Check(bool condition, std::string_view message) {
 
 std::vector<uint8_t> Flatten(const buf::MultiBuffer& payload) {
     std::vector<uint8_t> out;
-    out.reserve(buf::TotalLen(payload));
+    out.reserve(payload.byte_size());
     for (const buf::Buffer* buffer : payload) {
         if (!buffer || buffer->IsEmpty()) {
             continue;

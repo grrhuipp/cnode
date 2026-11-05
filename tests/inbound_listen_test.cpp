@@ -1,5 +1,4 @@
 #include "acppnode/transport/internet/inbound_listen.hpp"
-#include "acppnode/app/port_binding.hpp"
 #include "worker/tcp_listener.hpp"
 
 #include <array>
@@ -62,18 +61,6 @@ int main() {
              "fe80::1%invalid", std::string_view("127.0.0.1\0ignored", 17),
              std::string_view("::1\0ignored", 11)}) {
         if (acpp::InboundListen::Parse(value)) return 20;
-    }
-
-    auto socket_binding = acpp::PortBinding{.port = 443, .protocol = "vmess", .tag = "stable-inbound", .listen = *ipv4};
-    auto protocol_update = acpp::PortBinding{.port = 443, .protocol = "trojan", .tag = "stable-inbound", .listen = *ipv4};
-    auto port_update = acpp::PortBinding{.port = 8443, .protocol = "vmess", .tag = "stable-inbound", .listen = *ipv4};
-    auto address_update = acpp::PortBinding{.port = 443, .protocol = "vmess", .tag = "stable-inbound", .listen = *ipv6};
-    auto tag_update = acpp::PortBinding{.port = 443, .protocol = "vmess", .tag = "other-inbound", .listen = *ipv4};
-    if (!socket_binding.UsesSameSocket(protocol_update) ||
-        socket_binding.UsesSameSocket(port_update) ||
-        socket_binding.UsesSameSocket(address_update) ||
-        socket_binding.UsesSameSocket(tag_update)) {
-        return 6;
     }
 
     acpp::net::io_context io_context;

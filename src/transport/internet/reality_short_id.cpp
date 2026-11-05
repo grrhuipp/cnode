@@ -1,17 +1,7 @@
 #include "acppnode/transport/internet/reality_short_id.hpp"
+#include "acppnode/common/binary_text_codec.hpp"
 
 namespace acpp::transport::internet {
-namespace {
-
-int HexValue(char value) noexcept {
-    if (value >= '0' && value <= '9') return value - '0';
-    if (value >= 'a' && value <= 'f') return value - 'a' + 10;
-    if (value >= 'A' && value <= 'F') return value - 'A' + 10;
-    return -1;
-}
-
-}  // namespace
-
 tl::expected<RealityShortId, RealityShortIdError>
 ParseRealityShortId(std::string_view value) noexcept {
     if (value.size() % 2 != 0 || value.size() > kRealityShortIdSize * 2) {
@@ -20,8 +10,8 @@ ParseRealityShortId(std::string_view value) noexcept {
 
     RealityShortId parsed{};
     for (std::size_t i = 0; i < value.size(); i += 2) {
-        const int high = HexValue(value[i]);
-        const int low = HexValue(value[i + 1]);
+        const int high = HexDigitValue(value[i]);
+        const int low = HexDigitValue(value[i + 1]);
         if (high < 0 || low < 0) {
             return tl::unexpected(RealityShortIdError::InvalidFormat);
         }

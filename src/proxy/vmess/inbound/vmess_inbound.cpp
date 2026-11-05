@@ -65,7 +65,7 @@ ParseHandshake(AsyncStream& stream,
         if (!request && vmess_session.RequiredHeaderBytes() == 0) {
             LOG_NET_WARN("[{}] VMess auth failed from {}", tag, client_ip);
             if (limiter && ctx.inbound.HasProxyProtocolClientIP()) {
-                limiter->OnAuthFailTracked(tag, client_ip);
+                co_await limiter->OnAuthFailTracked(tag, client_ip);
             }
             co_return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
         }
@@ -73,15 +73,21 @@ ParseHandshake(AsyncStream& stream,
 
     memory::ByteVector{}.swap(header_buf);
 
+    if (!request->user || !co_await validator.RegisterSessionIfNew(
+            *request->user, request->body_key, request->body_iv)) {
+        if (limiter && ctx.inbound.HasProxyProtocolClientIP())
+            co_await limiter->OnAuthFailTracked(tag, client_ip);
+        co_return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
+    }
+
     LOG_CONN_TRACE(ctx,
-                   "[VMess][{}] parsed command={} security={} options={:#04x} target={} consumed={} pending={}",
+                   "[VMess][{}] parsed command={} security={} options={:#04x} target={} consumed={}",
                    tag,
                    static_cast<int>(request->command),
                    static_cast<int>(request->security),
                    static_cast<int>(request->options),
                    request->target,
-                   consumed,
-                   request->PendingDataSize());
+                   consumed);
 
     std::optional<UserOnlineSessionGuard> user_session;
     if (request->user) {
@@ -90,10 +96,10 @@ ParseHandshake(AsyncStream& stream,
         ctx.inbound.user_email = profile.email;
         ctx.content.speed_limit = profile.speed_limit;
 
-        user_session = validator.TryConnectSession(
+        user_session = co_await validator.TryConnectSession(
             tag, profile.user_id, ctx.inbound.source_ip, profile.device_limit);
         if (!user_session) {
-            LOG_NET_DEBUG("{} from {}:{} rejected device_limit [{}] user={} limit={} online_devices={}",
+            LOG_NET_DEBUG("{} from {}:{} rejected device_limit [{}] user={} limit={} domain_online_devices={}",
                 FormatTimestamp(ctx.accept_time_us),
                 ctx.inbound.source_ip, ctx.inbound.source_port, tag, ctx.inbound.user_email,
                 profile.device_limit,
@@ -135,10 +141,10 @@ ParseHandshake(AsyncStream& stream,
 proxy::vmess::inbound::Handler::Handler(
     ::acpp::vmess::TimedUserValidator& validator,
     StatsShard& stats,
-    ConnectionLimiterPtr limiter)
+    ConnectionLimiter* limiter)
     : validator_(validator)
     , stats_(&stats)
-    , limiter_(std::move(limiter))
+    , limiter_(limiter)
 {}
 
 net::awaitable<RelayResult>
@@ -163,7 +169,7 @@ proxy::vmess::inbound::Handler::Process(
     LOG_CONN_DEBUG(ctx, "[VMess][{}] Process start from {}", tag, client_ip);
 
     if (limiter_ && ctx.inbound.HasProxyProtocolClientIP() &&
-        limiter_->IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {
+        co_await limiter_->IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {
         LOG_NET_DEBUG("{} from {}:{} rejected ip_banned [{}]",
             FormatTimestamp(ctx.accept_time_us),
             ctx.inbound.source_ip, ctx.inbound.source_port, ctx.inbound.tag);
@@ -239,7 +245,7 @@ const bool kVmessInboundRegistered = [] {
     reg.create_tcp_handler =
         [](acpp::proxyman::inbound::ProtocolRuntime& runtime,
            acpp::StatsShard& stats,
-           acpp::ConnectionLimiterPtr limiter,
+           acpp::ConnectionLimiter* limiter,
            const acpp::proxyman::inbound::BuildRequest&) -> std::unique_ptr<acpp::Inbound> {
             auto* vmess_runtime = dynamic_cast<VmessRuntime*>(&runtime);
             if (!vmess_runtime) {
@@ -272,7 +278,6 @@ const bool kVmessInboundRegistered = [] {
                     .uuid_bytes = user->uuid_bytes,
                     .cmd_key = user->cmd_key,
                     .auth_key = user->auth_key,
-                    .cached_auth_aes_key = user->cached_auth_aes_key,
                     .profile = user->profile,
                 });
             }
@@ -299,7 +304,6 @@ const bool kVmessInboundRegistered = [] {
                         .uuid_bytes = user->uuid_bytes,
                         .cmd_key = user->cmd_key,
                         .auth_key = user->auth_key,
-                        .cached_auth_aes_key = user->cached_auth_aes_key,
                         .profile = user->profile,
                     });
                 } else {

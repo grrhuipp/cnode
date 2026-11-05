@@ -1,14 +1,15 @@
 #include "account.hpp"
 #include "vmess_crypto.hpp"
 #include "vmess_request.hpp"
+#include "../uuid.hpp"
 
 #include <cstring>
+#include <string_view>
 
 namespace acpp::vmess {
 
 namespace {
-static const char* VMESS_MAGIC = "c48619fe-8f02-49e0-b9e9-edf763e17e21";
-static constexpr size_t kVmessMagicLen = 36;
+constexpr std::string_view kVmessMagic = "c48619fe-8f02-49e0-b9e9-edf763e17e21";
 }  // namespace
 
 std::optional<MemoryAccount> MemoryAccount::FromUUID(
@@ -17,7 +18,7 @@ std::optional<MemoryAccount> MemoryAccount::FromUUID(
     const std::string& email,
     uint64_t speed_limit,
     uint32_t device_limit) {
-    auto uuid_bytes = ParseUUID(uuid_str);
+    auto uuid_bytes = proxy::ParseUuid(uuid_str);
     if (!uuid_bytes) {
         return std::nullopt;
     }
@@ -30,16 +31,16 @@ std::optional<MemoryAccount> MemoryAccount::FromUUID(
     account.profile.speed_limit = speed_limit;
     account.profile.device_limit = device_limit;
 
-    std::array<uint8_t, 16 + kVmessMagicLen> key_material{};
+    std::array<uint8_t, 16 + kVmessMagic.size()> key_material{};
     std::memcpy(key_material.data(), account.uuid_bytes.data(), account.uuid_bytes.size());
-    std::memcpy(key_material.data() + account.uuid_bytes.size(), VMESS_MAGIC, kVmessMagicLen);
+    std::memcpy(key_material.data() + account.uuid_bytes.size(),
+                kVmessMagic.data(), kVmessMagic.size());
     account.cmd_key = MD5Hash(key_material.data(), key_material.size());
 
     const std::array<std::string_view, 1> auth_key_path{
         KDFSalt::AUTH_ID_ENCRYPTION_KEY
     };
     account.auth_key = KDF16(account.cmd_key.data(), 16, auth_key_path);
-    account.cached_auth_aes_key = account.auth_key;
 
     return account;
 }

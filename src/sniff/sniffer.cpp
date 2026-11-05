@@ -5,7 +5,7 @@
 
 namespace acpp {
 
-SniffResult BittorrentSniffer::Sniff(std::span<const uint8_t> data) {
+SniffResult SniffBittorrent(std::span<const uint8_t> data) {
     SniffResult result;
     static constexpr std::string_view kHandshake = "BitTorrent protocol";
     if (data.size() >= kHandshake.size() + 1 &&
@@ -22,22 +22,13 @@ SniffResult Sniffer::Sniff(std::span<const uint8_t> data, Network network) {
         return quic_.Sniff(data);
     }
 
-    TlsSniffer tls;
-    if (auto result = tls.Sniff(data); result.success) {
+    if (auto result = SniffTls(data); result.success) {
         return result;
     }
-
-    HttpSniffer http;
-    if (auto result = http.Sniff(data); result.success) {
+    if (auto result = SniffHttp(data); result.success) {
         return result;
     }
-
-    BittorrentSniffer bittorrent;
-    if (auto result = bittorrent.Sniff(data); result.success) {
-        return result;
-    }
-
-    return SniffResult{};
+    return SniffBittorrent(data);
 }
 
 }  // namespace acpp

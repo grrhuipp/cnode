@@ -13,7 +13,7 @@ namespace acpp {
 net::awaitable<void> StartWorkerInbounds(
     Worker& worker,
     std::vector<StaticInboundRuntimeEntry> inbounds) {
-    co_await worker.StartRuntimeTask();
+    worker.StartRuntime();
 
     for (const auto& inbound : inbounds) {
         const auto fail = [&](const char* stage) {
@@ -27,18 +27,18 @@ net::awaitable<void> StartWorkerInbounds(
             inbound.protocol,
             inbound.stream_settings,
             inbound.sniffing,
-            ProxyProtocolMode::Auto,
+            inbound.proxy_protocol,
             inbound.outbound_policy,
             {});
 
-        if (!co_await worker.RegisterInboundTask(
+        if (!worker.RegisterInbound(
                 inbound.build_request,
                 std::move(receiver))) {
             fail("register");
         }
 
         auto binding = PortBinding{.port = inbound.port, .protocol = inbound.protocol, .tag = inbound.tag, .listen = inbound.listen};
-        if (!co_await worker.AddListenerTask(binding)) {
+        if (!worker.AddListener(binding)) {
             fail("tcp-listen");
         }
 

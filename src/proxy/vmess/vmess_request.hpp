@@ -26,7 +26,6 @@ namespace vmess {
 
 constexpr uint8_t VERSION           = 1;
 constexpr size_t  GCM_TAG_SIZE      = 16;
-constexpr size_t  GCM_NONCE_SIZE    = 12;
 constexpr size_t  MAX_CHUNK_SIZE    = 16 * 1024;  // 16KB
 constexpr int64_t TIMESTAMP_TOLERANCE = 60;        // ±60秒，防重放攻击
 
@@ -72,98 +71,13 @@ namespace KDFSalt {
 }
 
 // ============================================================================
-// 握手失败原因
-// ============================================================================
-
-// ============================================================================
 // VMess 请求头（Process 解析后填充，VMess Link 读取）
 // ============================================================================
 
 struct VMessRequest {
-    VMessRequest() = default;
-    ~VMessRequest() noexcept = default;
-
-    VMessRequest(const VMessRequest& other)
-        : version(other.version)
-        , body_iv(other.body_iv)
-        , body_key(other.body_key)
-        , response_header(other.response_header)
-        , options(other.options)
-        , padding_len(other.padding_len)
-        , security(other.security)
-        , command(other.command)
-        , target(other.target)
-        , user(other.user) {
-        if (other.HasPendingData()) {
-            SetPendingData(other.PendingDataSpan());
-        }
-    }
-
-    VMessRequest& operator=(const VMessRequest& other) {
-        if (this == &other) {
-            return *this;
-        }
-        version = other.version;
-        body_iv = other.body_iv;
-        body_key = other.body_key;
-        response_header = other.response_header;
-        options = other.options;
-        padding_len = other.padding_len;
-        security = other.security;
-        command = other.command;
-        target = other.target;
-        user = other.user;
-        if (other.HasPendingData()) {
-            SetPendingData(other.PendingDataSpan());
-        } else {
-            ClearPendingData();
-        }
-        return *this;
-    }
-
-    VMessRequest(VMessRequest&& other) noexcept
-        : version(other.version)
-        , body_iv(other.body_iv)
-        , body_key(other.body_key)
-        , response_header(other.response_header)
-        , options(other.options)
-        , padding_len(other.padding_len)
-        , security(other.security)
-        , command(other.command)
-        , target(std::move(other.target))
-        , user(std::move(other.user))
-        , pending_buffer_(std::move(other.pending_buffer_))
-        , pending_offset_(other.pending_offset_)
-        , pending_size_(other.pending_size_) {
-        other.pending_offset_ = 0;
-        other.pending_size_ = 0;
-    }
-
-    VMessRequest& operator=(VMessRequest&& other) noexcept {
-        if (this == &other) {
-            return *this;
-        }
-        version = other.version;
-        body_iv = other.body_iv;
-        body_key = other.body_key;
-        response_header = other.response_header;
-        options = other.options;
-        padding_len = other.padding_len;
-        security = other.security;
-        command = other.command;
-        target = std::move(other.target);
-        user = std::move(other.user);
-        pending_buffer_ = std::move(other.pending_buffer_);
-        pending_offset_ = other.pending_offset_;
-        pending_size_ = other.pending_size_;
-        other.pending_offset_ = 0;
-        other.pending_size_ = 0;
-        return *this;
-    }
-
     uint8_t version = VERSION;
-    std::array<uint8_t, 16> body_iv;
-    std::array<uint8_t, 16> body_key;
+    std::array<uint8_t, 16> body_iv{};
+    std::array<uint8_t, 16> body_key{};
     uint8_t response_header = 0;
     uint8_t options         = 0;
     uint8_t padding_len     = 0;
@@ -172,80 +86,6 @@ struct VMessRequest {
     TargetAddress target;
 
     std::shared_ptr<const proxyman::inbound::UserStore::VmessCredential> user;
-    [[nodiscard]] bool HasPendingData() const noexcept {
-        return pending_buffer_ && pending_size_ > 0;
-    }
-
-    [[nodiscard]] size_t PendingDataSize() const noexcept {
-        return HasPendingData() ? pending_size_ : 0;
-    }
-
-    [[nodiscard]] std::span<const uint8_t> PendingDataSpan() const noexcept {
-        if (!HasPendingData()) {
-            return {};
-        }
-        return {pending_buffer_->data + pending_offset_, pending_size_};
-    }
-
-    void SetPendingData(std::span<const uint8_t> data) {
-        if (data.empty()) {
-            ClearPendingData();
-            return;
-        }
-        buf::BufferGuard buffer{buf::Buffer::New()};
-        if (!buffer) {
-            throw std::bad_alloc();
-        }
-        const size_t len = std::min(data.size(), static_cast<size_t>(buffer->Available()));
-        std::memcpy(buffer->Tail().data(), data.data(), len);
-        buffer->Produce(static_cast<uint32_t>(len));
-        pending_buffer_ = std::move(buffer);
-        pending_offset_ = 0;
-        pending_size_ = len;
-    }
-
-    void SetPendingBuffer(buf::BufferGuard buffer, size_t offset, size_t size) noexcept {
-        if (!buffer || size == 0) {
-            ClearPendingData();
-            return;
-        }
-        const size_t clamped_offset = std::min(offset, static_cast<size_t>(buffer->end));
-        const size_t available = static_cast<size_t>(buffer->end) - clamped_offset;
-        pending_buffer_ = std::move(buffer);
-        pending_offset_ = clamped_offset;
-        pending_size_ = std::min(size, available);
-        if (pending_size_ == 0) {
-            ClearPendingData();
-        }
-    }
-
-    void ConsumePendingData(size_t bytes) noexcept {
-        if (!HasPendingData()) {
-            return;
-        }
-        const size_t consumed = std::min(bytes, pending_size_);
-        pending_offset_ += consumed;
-        pending_size_ -= consumed;
-        if (pending_size_ == 0) {
-            ClearPendingData();
-        }
-    }
-
-    void ClearPendingData() noexcept {
-        pending_buffer_ = buf::BufferGuard{};
-        pending_offset_ = 0;
-        pending_size_ = 0;
-    }
-
-    bool HasChunkMasking()       const { return (options & Option::CHUNK_MASKING)       != 0; }
-    bool HasAuthenticatedLength() const { return (options & Option::AUTHENTICATED_LENGTH) != 0; }
-    bool HasGlobalPadding()      const { return (options & Option::GLOBAL_PADDING)       != 0; }
-
-private:
-    // 握手后的预读数据（加密的数据块），从握手 Buffer 转移所有权。
-    buf::BufferGuard pending_buffer_;
-    size_t pending_offset_ = 0;
-    size_t pending_size_ = 0;
 };
 
 }  // namespace vmess

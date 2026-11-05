@@ -7,7 +7,7 @@ ErrorCode MapAsioError(const IoErrorCode& ec) {
         return ErrorCode::OK;
     }
 
-    // 常见的 Asio 错误映射
+    // asio::error 枚举在 POSIX 上即 system_category 的 errno，比较同时覆盖原始 errno。
     if (ec == io_error::eof) {
         return ErrorCode::SOCKET_EOF;
     }
@@ -42,22 +42,9 @@ ErrorCode MapAsioError(const IoErrorCode& ec) {
         return ErrorCode::DNS_SERVER_FAILED;
     }
 
-    // 系统错误码映射
     if (ec.category() == std::system_category()) {
         switch (ec.value()) {
-            case ECONNRESET:
-            case EPIPE:
-                return ErrorCode::SOCKET_CLOSED;
-            case ECONNREFUSED:
-                return ErrorCode::DIAL_REFUSED;
-            case ETIMEDOUT:
-                return ErrorCode::TIMEOUT;
-            case ENETUNREACH:
-                return ErrorCode::DIAL_NETWORK_UNREACHABLE;
-            case EHOSTUNREACH:
-                return ErrorCode::DIAL_HOST_UNREACHABLE;
             case EADDRINUSE:
-                return ErrorCode::SOCKET_BIND_FAILED;
             case EADDRNOTAVAIL:
                 return ErrorCode::SOCKET_BIND_FAILED;
             case EACCES:
@@ -65,7 +52,6 @@ ErrorCode MapAsioError(const IoErrorCode& ec) {
                 return ErrorCode::PERMISSION_DENIED;
             case EMFILE:
             case ENFILE:
-            case ENOBUFS:
             case ENOMEM:
                 return ErrorCode::RESOURCE_EXHAUSTED;
             default:

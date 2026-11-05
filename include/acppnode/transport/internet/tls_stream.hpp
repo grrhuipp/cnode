@@ -14,6 +14,7 @@ struct RealityClientState;
 struct RealityServerConnState;
 struct RealityConfig;
 struct TlsConfig;
+class AutoSignContextRenewal;
 // ============================================================================
 // OpenSSL 上下文管理（RAII）
 // ============================================================================
@@ -26,7 +27,7 @@ public:
     // 创建服务端上下文（从文件加载证书）
     static std::unique_ptr<SslContext> CreateServer(const TlsConfig& config);
 
-    // 创建服务端上下文（自签名，根据 SNI 动态生成证书）
+    // 创建服务端上下文（启动时为配置域名生成固定自签证书）
     static std::unique_ptr<SslContext> CreateServerAutoSign(const TlsConfig& config);
 
     // 创建 REALITY 服务端上下文
@@ -46,24 +47,29 @@ public:
 
     SSL_CTX* Native() { return ctx_; }
     const SSL_CTX* Native() const { return ctx_; }
-    const std::vector<unsigned char>& ServerAlpnWire() const noexcept {
-        return server_alpn_wire_;
-    }
+    // Pin a published immutable context until SSL_new takes its own reference.
+    [[nodiscard]] std::shared_ptr<SSL_CTX> AcquireNative() const noexcept;
 
     // 禁止拷贝
     SslContext(const SslContext&) = delete;
     SslContext& operator=(const SslContext&) = delete;
 
 private:
-    explicit SslContext(SSL_CTX* ctx, std::unique_ptr<ContextState> context_state = nullptr)
-        : ctx_(ctx)
-        , context_state_(std::move(context_state)) {}
+    static std::unique_ptr<SslContext> CreateAutoSignSnapshot(const TlsConfig& config);
+    struct SharedState {
+        std::unique_ptr<ContextState> context;
+        std::vector<unsigned char> server_alpn_wire;
+    };
+    // SSL_CTX owns callback data until its last SSL reference is released,
+    // even after the configuration wrapper/Worker that created it disappears.
+    explicit SslContext(SSL_CTX* ctx, std::unique_ptr<ContextState> context_state = nullptr);
     [[nodiscard]] bool ConfigureServerAlpn(
         const std::vector<std::string>& protocols);
 
     SSL_CTX* ctx_ = nullptr;
-    std::unique_ptr<ContextState> context_state_;
-    std::vector<unsigned char> server_alpn_wire_;
+    SharedState* shared_state_ = nullptr;
+    std::shared_ptr<SSL_CTX> native_owner_;
+    std::shared_ptr<AutoSignContextRenewal> renewal_;
 };
 
 // ============================================================================
@@ -72,26 +78,19 @@ private:
 class TlsStream final : public AsyncStream {
 public:
     // 从底层 TCP 流和 SSL 上下文构造（TcpStream 是 final，编译器可去虚化）
-    TlsStream(std::unique_ptr<TcpStream> inner, SSL_CTX* ctx, bool is_server);
+    TlsStream(std::unique_ptr<TcpStream> inner, const SslContext& ctx, bool is_server);
 
     ~TlsStream() override;
 
     // Process startup only, before creating Workers. No lazy shared initialization.
     static void InitializeIo();
 
-    // 禁止拷贝
+    // Pinned: handshake coroutines and OpenSSL callbacks borrow this stream.
     TlsStream(const TlsStream&) = delete;
     TlsStream& operator=(const TlsStream&) = delete;
 
-    // 允许移动
-    TlsStream(TlsStream&& other) noexcept;
-    TlsStream& operator=(TlsStream&& other) noexcept;
-
     // 设置客户端验证身份；DNS 名称同时作为 SNI，IP 地址只做 IP SAN 校验。
     [[nodiscard]] bool SetServerIdentity(std::string_view identity);
-
-    // 设置 ALPN（客户端调用）
-    [[nodiscard]] bool SetAlpn(std::span<const std::string> protocols);
 
     // 设置 REALITY 客户端认证（客户端调用）
     bool SetRealityClient(const RealityConfig& reality);
@@ -122,6 +121,9 @@ public:
     // Return decrypted handshake read-ahead before OpenSSL's unread plaintext.
     // Never forwards these bytes to the TCP ciphertext layer.
     void PrependReadData(std::span<const uint8_t> data) override;
+    // Vision cmd2 read-direction cutover; retain already-decrypted bytes,
+    // then read the raw TCP stream without touching the independent writer.
+    [[nodiscard]] bool EnableRawRead() noexcept override;
 
 protected:
     TcpStream* BaseTcpStream() override;
@@ -150,13 +152,12 @@ net::awaitable<std::unique_ptr<TlsStream>> WrapTlsServer(
     std::unique_ptr<TcpStream> inner,
     SslContext& ctx);
 
-// 包装现有 TCP 流为 TLS 客户端
+// 包装现有 TCP 流为 TLS 客户端；ALPN 已在 SslContext 加载期配置
 [[nodiscard]]
 net::awaitable<std::unique_ptr<TlsStream>> WrapTlsClient(
     std::unique_ptr<TcpStream> inner,
     SslContext& ctx,
-    std::string_view server_name = {},
-    std::span<const std::string> alpn = {});
+    std::string_view server_name = {});
 
 // 包装现有 TCP 流为 REALITY 客户端
 [[nodiscard]]
@@ -164,7 +165,6 @@ net::awaitable<std::unique_ptr<TlsStream>> WrapRealityClient(
     std::unique_ptr<TcpStream> inner,
     SslContext& ctx,
     const RealityConfig& reality,
-    std::string_view server_name = {},
-    std::span<const std::string> alpn = {});
+    std::string_view server_name = {});
 
 }  // namespace acpp

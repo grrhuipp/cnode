@@ -6,6 +6,8 @@
 #include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
 #include "acppnode/app/stats.hpp"
+#include "acppnode/app/session_group_executor.hpp"
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/common/buffer_util.hpp"
 #include "acppnode/common/memory_stats.hpp"
 #include "acppnode/common/session.hpp"
@@ -19,66 +21,16 @@
 #include <asio/co_spawn.hpp>
 #include <asio/this_coro.hpp>
 #include <chrono>
-#include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <thread>
 #include <vector>
 
 namespace {
-thread_local bool fail_next_allocation = false;
-thread_local bool fail_next_pmr_allocation = false;
-thread_local int allocation_failures = 0;
-thread_local size_t failed_allocation_size = 0;
-}
-void* operator new(std::size_t size) {
-    if (std::exchange(fail_next_allocation, false)) {
-        ++allocation_failures; failed_allocation_size = size; throw std::bad_alloc();
-    }
-    if (auto* result = std::malloc(size ? size : 1)) return result;
-    throw std::bad_alloc();
-}
-void operator delete(void* value) noexcept { std::free(value); }
-void operator delete(void* value, std::size_t) noexcept { ::operator delete(value); }
-void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
-    try { return ::operator new(size); } catch (...) { return nullptr; }
-}
-void operator delete(void* value, const std::nothrow_t&) noexcept { ::operator delete(value); }
-
-namespace {
-void InstallUsers(std::span<const acpp::proxyman::inbound::UserStore::UserUpdate> updates) {
-    using acpp::proxyman::inbound::UserStore;
-    auto snapshot = UserStore::PrepareUsers(updates);
-    auto view = UserStore::PrepareWorkerView(snapshot);
-    UserStore::CommitSnapshot(std::move(snapshot));
-    UserStore::InstallWorkerView(std::move(view));
-}
 using namespace acpp;
 using namespace std::chrono_literals;
-
-class FailingPmrResource final : public std::pmr::memory_resource {
-public:
-    explicit FailingPmrResource(std::pmr::memory_resource* upstream) : upstream_(upstream) {}
-private:
-    void* do_allocate(size_t size, size_t alignment) override {
-        if (std::exchange(fail_next_allocation, false) ||
-            (fail_next_pmr_allocation && size == 128)) {
-            fail_next_pmr_allocation = false;
-            ++allocation_failures;
-            failed_allocation_size = size;
-            throw std::bad_alloc();
-        }
-        return upstream_->allocate(size, alignment);
-    }
-    void do_deallocate(void* pointer, size_t size, size_t alignment) override {
-        upstream_->deallocate(pointer, size, alignment);
-    }
-    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
-        return this == &other;
-    }
-    std::pmr::memory_resource* upstream_;
-};
 
 size_t BufferCount() noexcept { return memory::detail::test_buffers_live; }
 size_t BufferPeak() noexcept { return memory::detail::test_buffers_peak; }
@@ -86,6 +38,79 @@ size_t BufferPeak() noexcept { return memory::detail::test_buffers_peak; }
 void Check(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
+
+// Setup and teardown use the same allocation lease as protocol callbacks.
+// The coordinator stays alive until domain services and reserved returns drain.
+class DomainFixture {
+    using UserStore = proxyman::inbound::UserStore;
+    struct Hooks final : ExecutionDomain::Hooks {
+        memory::AllocationDomain memory;
+        std::optional<memory::ScopedAllocationDomain> allocation;
+        UserStore::WorkerView users;
+        UserStore::WorkerView previous_users;
+
+        void Enter() noexcept override {
+            allocation.emplace(memory);
+            previous_users = UserStore::ExchangeWorkerView(users);
+        }
+        void Leave() noexcept override {
+            users = UserStore::ExchangeWorkerView(std::move(previous_users));
+            allocation.reset();
+        }
+        void OnFailure(std::exception_ptr) noexcept override { std::terminate(); }
+    };
+
+public:
+    explicit DomainFixture(net::io_context& io)
+        : io_(io), hooks_(std::make_shared<Hooks>()),
+          previous_users_(UserStore::ExchangeWorkerView({})),
+          coordinator_(std::make_shared<GroupCoordinator>(io)),
+          domain_(ExecutionDomain::Create(io, 0, io.get_executor(), hooks_, coordinator_)) {
+        hooks_->memory.SetLeaseGroup(domain_->LeaseIdentity(), &ExecutionDomain::SharesLeaseIdentity);
+    }
+    ~DomainFixture() {
+        Shutdown();
+        memory::ScopedAllocationDomain allocation(hooks_->memory);
+        hooks_->users.reset();
+        UserStore::InstallWorkerView(std::move(previous_users_));
+    }
+
+    memory::AllocationDomain& Memory() noexcept { return hooks_->memory; }
+    net::any_io_executor Executor() { return domain_->Executor(); }
+
+    void InstallUsers(std::span<const UserStore::UserUpdate> updates) {
+        auto snapshot = UserStore::PrepareUsers(updates);
+        auto view = UserStore::PrepareWorkerView(snapshot);
+        UserStore::CommitSnapshot(std::move(snapshot));
+        hooks_->users = view;
+        UserStore::InstallWorkerView(std::move(view));
+    }
+
+    void Shutdown() {
+        if (!domain_) return;
+        memory::ScopedAllocationDomain allocation(hooks_->memory);
+        coordinator_->CloseAdmission();
+        std::exception_ptr failure;
+        bool joined = false;
+        net::co_spawn(io_, [this]() -> net::awaitable<void> {
+            co_await coordinator_->AsyncJoin();
+            coordinator_->ReleaseServices();
+            domain_.reset();
+            co_await coordinator_->Finalize();
+        }, [&](std::exception_ptr error) { failure = error; joined = true; });
+        io_.restart();
+        io_.poll();
+        Check(joined && !failure && io_.stopped(),
+              "coordinator must join controls, retire domains, and finalize returns without pending work");
+    }
+
+private:
+    net::io_context& io_;
+    std::shared_ptr<Hooks> hooks_;
+    UserStore::WorkerView previous_users_;
+    std::shared_ptr<GroupCoordinator> coordinator_;
+    std::shared_ptr<ExecutionDomain> domain_;
+};
 
 void Frame(std::vector<uint8_t>& out, uint8_t command, uint32_t sid,
            std::span<const uint8_t> payload = {}) {
@@ -111,9 +136,8 @@ struct StreamState {
     bool delayed_write_cleanup = false;
     bool stall_payload = false;
     bool record_payload_buffers = false;
-    bool fail_queue_reserve = false;
     std::vector<const void*> payload_buffers;
-    bool fail_new_stream = false;
+    bool fail_syn_read = false;
     void FeedInvalidFrame(bool mux) {
         if (mux) input.insert(input.end(), {0, 3, 0, 1, 2, 0});
         else Frame(input, 99, 0);
@@ -139,19 +163,15 @@ public:
         std::memcpy(output.data(), state_.input.data() + state_.offset, count);
         if (state_.record_payload_buffers && count >= 4096) state_.payload_buffers.push_back(output.data());
         state_.offset += count;
-        if (state_.fail_queue_reserve && count == 4096) {
-            state_.fail_queue_reserve = false;
-            fail_next_pmr_allocation = true;
-        }
         if (state_.stall_payload && count == 7 && static_cast<const uint8_t*>(output.data())[0] == 2) {
             state_.stall_payload = false;
             std::this_thread::sleep_for(1100ms); // Ready I/O and an overdue timer now compete on one Worker.
         }
-        // Fail the real substream allocation after its SYN header was decoded.
-        if (state_.fail_new_stream && count == 7 &&
+        // Model allocation failure while reading a new SYN with established children live.
+        if (state_.fail_syn_read && count == 7 &&
             static_cast<const uint8_t*>(output.data())[0] == 1) {
-            state_.fail_new_stream = false;
-            fail_next_allocation = true;
+            state_.fail_syn_read = false;
+            throw std::bad_alloc();
         }
         co_return count;
     }
@@ -270,6 +290,8 @@ net::awaitable<RelayResult> RunMux(std::unique_ptr<AsyncStream> stream,
 
 bool RunCase(int mode, bool baseline, bool blocked_writes = false, bool mux = false) {
     net::io_context io;
+    DomainFixture domain(io);
+    memory::ScopedAllocationDomain allocation(domain.Memory());
     StreamState stream(io);
     const auto hash = anytls::PasswordHash("lifecycle-test");
     stream.input.assign(hash.begin(), hash.end());
@@ -294,7 +316,7 @@ bool RunCase(int mode, bool baseline, bool blocked_writes = false, bool mux = fa
     user.profile.email = "lifecycle@test";
     const UserSet users = PreparedAnyTlsUsers{user};
     const std::array updates{UserStore::UserUpdate{"lifecycle", users}};
-    InstallUsers(updates);
+    domain.InstallUsers(updates);
     std::weak_ptr<const UserStore::AnyTlsCredential> old_table =
         UserStore::FindAnyTlsUser("lifecycle", hash);
     UserOnlineTracker validator;
@@ -316,7 +338,7 @@ bool RunCase(int mode, bool baseline, bool blocked_writes = false, bool mux = fa
     auto request = mux
         ? RunMux(std::make_unique<Stream>(stream), dispatcher, receiver, io, context, stats, timeouts)
         : handler.Process(std::make_unique<Stream>(stream), dispatcher, receiver, io, context, timeouts, 0);
-    net::co_spawn(io, std::move(request),
+    net::co_spawn(domain.Executor(), std::move(request),
         net::bind_cancellation_slot(cancellation.slot(), [&](std::exception_ptr error, RelayResult result) {
             returned = true;
             active_at_return = dispatcher.active;
@@ -328,7 +350,7 @@ bool RunCase(int mode, bool baseline, bool blocked_writes = false, bool mux = fa
     Check(dispatcher.active == 2 && stream.pending_reads == 1, "both logical requests must be pending");
     if (!mux && !baseline) {
         Check(!old_table.expired(), "published snapshot must still own its users");
-        InstallUsers(updates);
+        domain.InstallUsers(updates);
         Check(old_table.expired(), "authenticated control transport must not retain the old user table");
         Check(context.inbound.user_id == 1 && context.inbound.user_email == "lifecycle@test",
               "session metadata must survive destruction of its authentication snapshot");
@@ -346,13 +368,13 @@ bool RunCase(int mode, bool baseline, bool blocked_writes = false, bool mux = fa
     else if (mode == 2) { stream.closed = true; stream.wake.cancel(); }
     else {
         Frame(stream.input, 1, 3);
-        stream.fail_new_stream = true;
+        stream.fail_syn_read = true;
         stream.wake.cancel();
     }
     io.run_for(500ms);
     const bool joined = returned && dispatcher.active == 0 && finished_at_return == 2 &&
                         stream.destroyed && stream.pending_reads == 0 && stream.pending_writes == 0;
-    constexpr std::array names{"parent-cancel", "session-failure", "physical-eof", "substream-allocation"};
+    constexpr std::array names{"parent-cancel", "session-failure", "physical-eof", "physical-read-allocation-failure"};
     std::cout << (mux ? "mux-" : "anytls-") << names[mode] << (blocked_writes ? "-blocked-writes" : "")
               << " returned=" << returned << " active-at-return=" << active_at_return
               << " finished-at-return=" << finished_at_return << " joined=" << joined << '\n';
@@ -372,7 +394,7 @@ bool RunCase(int mode, bool baseline, bool blocked_writes = false, bool mux = fa
                 catch (const IoSystemError& error) { Check(error.code() == io_error::operation_aborted, "cancel error changed"); }
             }
         } else if (mode == 3) {
-            Check(bool(failure) && allocation_failures == 1, "real substream allocation must fail");
+            Check(bool(failure), "physical-read-allocation-failure must propagate the original exception");
             try { std::rethrow_exception(failure); }
             catch (const std::bad_alloc&) {}
         } else {
@@ -411,6 +433,8 @@ void RunHandshakeCase(int mode, bool baseline = false) {
         "write-gate-timeout-isolation", "capacity-rejected-id-retired", "overdue-ready-header",
         "synack-memory-error", "synack-link-error", "synack-unexpected-error"};
     net::io_context io;
+    DomainFixture domain(io);
+    memory::ScopedAllocationDomain allocation(domain.Memory());
     StreamState stream(io);
     const auto hash = anytls::PasswordHash("handshake-test");
     stream.input.assign(hash.begin(), hash.end());
@@ -427,7 +451,7 @@ void RunHandshakeCase(int mode, bool baseline = false) {
     user.password_hash = hash;
     const UserSet users = PreparedAnyTlsUsers{user};
     const std::array updates{UserStore::UserUpdate{"handshake", users}};
-    InstallUsers(updates);
+    domain.InstallUsers(updates);
     UserOnlineTracker validator;
     StatsShard stats;
     proxy::anytls::inbound::Handler handler(validator, stats, {});
@@ -445,7 +469,7 @@ void RunHandshakeCase(int mode, bool baseline = false) {
     net::cancellation_signal cancellation;
     bool returned = false;
     int active_at_return = -1;
-    net::co_spawn(io, handler.Process(std::make_unique<Stream>(stream), dispatcher,
+    net::co_spawn(domain.Executor(), handler.Process(std::make_unique<Stream>(stream), dispatcher,
         receiver, io, context, timeouts, 0), net::bind_cancellation_slot(cancellation.slot(),
         [&](std::exception_ptr, RelayResult) {
             returned = true; active_at_return = dispatcher.active;
@@ -510,6 +534,7 @@ void RunHandshakeCase(int mode, bool baseline = false) {
           "handshake children and physical writes must join before transport destruction");
     io.restart();
     io.run_for(1100ms); // A removed deadline must not retain pending work or touch dead stream state.
+    domain.Shutdown();
     Check(io.stopped(), "joined handshakes must leave no live deadline work");
     std::cout << "handshake-" << names[mode] << " joined=1 passed=1\n";
 }
@@ -518,6 +543,8 @@ void RunIdentityCase(int mode, bool baseline) {
     constexpr std::array names{"duplicate-active", "duplicate-pending", "reuse-completed",
         "descending", "zero", "syn-payload", "wraparound", "valid-gap", "fin-before-target", "payload-after-retirement"};
     net::io_context io;
+    DomainFixture domain(io);
+    memory::ScopedAllocationDomain allocation(domain.Memory());
     StreamState stream(io);
     const auto hash = anytls::PasswordHash("identity-test");
     stream.input.assign(hash.begin(), hash.end());
@@ -535,7 +562,7 @@ void RunIdentityCase(int mode, bool baseline) {
     user.password_hash = hash;
     const UserSet users = PreparedAnyTlsUsers{user};
     const std::array updates{UserStore::UserUpdate{"identity", users}};
-    InstallUsers(updates);
+    domain.InstallUsers(updates);
     UserOnlineTracker validator;
     StatsShard stats;
     proxy::anytls::inbound::Handler handler(validator, stats, {});
@@ -549,7 +576,7 @@ void RunIdentityCase(int mode, bool baseline) {
     bool returned = false;
     ErrorCode result_error = ErrorCode::INTERNAL;
     std::exception_ptr failure;
-    net::co_spawn(io, handler.Process(std::make_unique<Stream>(stream), dispatcher,
+    net::co_spawn(domain.Executor(), handler.Process(std::make_unique<Stream>(stream), dispatcher,
         receiver, io, context, timeouts, 0), [&](std::exception_ptr error, RelayResult result) {
             returned = true;
             failure = error;
@@ -566,7 +593,9 @@ void RunIdentityCase(int mode, bool baseline) {
     if (mode == 9) {
         constexpr std::array<uint8_t, 32> payload{};
         Frame(stream.input, 2, first_sid, payload);
-        stream.input.resize(stream.input.size() - payload.size());
+        // Keep only the frame header: the payload bytes arrive later.
+        stream.input.erase(stream.input.end() - static_cast<std::ptrdiff_t>(payload.size()),
+                           stream.input.end());
         stream.wake.cancel();
         io.poll();
         Check(stream.pending_reads == 1 && dispatcher.active == 1,
@@ -619,7 +648,7 @@ public:
             }
             if (bytes.size() >= 60000) break;
             data = co_await link.reader->ReadMultiBuffer();
-            if (!buf::HasData(data)) break;
+            if (data.byte_size() == 0) break;
         }
         co_return RelayResult{};
     }
@@ -629,6 +658,8 @@ void RunParsingCase(int mode) {
     constexpr std::array names{"coalesced", "ipv4-fragmented", "ipv6-fragmented", "max-domain",
         "invalid-type", "empty-domain", "zero-port", "truncated", "cancel-pending", "oversized-domain", "invalid-uot-request"};
     net::io_context io;
+    DomainFixture execution(io);
+    memory::ScopedAllocationDomain allocation(execution.Memory());
     StreamState stream(io);
     const auto hash = anytls::PasswordHash("parsing-test");
     stream.input.assign(hash.begin(), hash.end());
@@ -672,7 +703,7 @@ void RunParsingCase(int mode) {
     user.password_hash = hash;
     const UserSet users = PreparedAnyTlsUsers{user};
     const std::array updates{UserStore::UserUpdate{"parsing", users}};
-    InstallUsers(updates);
+    execution.InstallUsers(updates);
     UserOnlineTracker validator;
     StatsShard stats;
     proxy::anytls::inbound::Handler handler(validator, stats, {});
@@ -685,7 +716,7 @@ void RunParsingCase(int mode) {
     net::cancellation_signal cancellation;
     bool returned = false;
     std::exception_ptr failure;
-    net::co_spawn(io, handler.Process(std::make_unique<Stream>(stream), dispatcher,
+    net::co_spawn(execution.Executor(), handler.Process(std::make_unique<Stream>(stream), dispatcher,
         receiver, io, context, timeouts, 0), net::bind_cancellation_slot(cancellation.slot(),
         [&](std::exception_ptr error, RelayResult) { returned = true; failure = error; }));
     io.poll();
@@ -731,7 +762,7 @@ public:
                     }
                     data.clear();
                     data = co_await link.reader->ReadMultiBuffer();
-                    if (!buf::HasData(data)) break;
+                    if (data.byte_size() == 0) break;
                 }
             } catch (const IoSystemError&) {}
         }
@@ -746,8 +777,10 @@ public:
 
 void RunQueueCase(int mode, bool baseline = false, uint32_t seed = 0) {
     constexpr std::array names{"tiny-fragments", "whole-frame", "sparse-mixed", "boundary-fragments",
-        "byte-budget-backpressure", "cancel-full-queue", "maximum-tiny-fragments", "random-fragments", "reserve-failure"};
+        "byte-budget-backpressure", "cancel-full-queue", "maximum-tiny-fragments", "random-fragments"};
     net::io_context io;
+    DomainFixture domain(io);
+    memory::ScopedAllocationDomain allocation(domain.Memory());
     StreamState stream(io);
     const auto hash = anytls::PasswordHash("queue-test");
     stream.input.assign(hash.begin(), hash.end());
@@ -762,7 +795,7 @@ void RunQueueCase(int mode, bool baseline = false, uint32_t seed = 0) {
     user.password_hash = hash;
     const UserSet users = PreparedAnyTlsUsers{user};
     const std::array updates{UserStore::UserUpdate{"queue", users}};
-    InstallUsers(updates);
+    domain.InstallUsers(updates);
     UserOnlineTracker validator;
     StatsShard stats;
     proxy::anytls::inbound::Handler handler(validator, stats, {});
@@ -775,17 +808,16 @@ void RunQueueCase(int mode, bool baseline = false, uint32_t seed = 0) {
     net::cancellation_signal cancellation;
     bool returned = false;
     int active_at_return = -1;
-    std::exception_ptr failure;
     Check(BufferCount() == 0, "buffer accounting must start empty");
     memory::detail::test_buffers_peak = 0;
-    net::co_spawn(io, handler.Process(std::make_unique<Stream>(stream), dispatcher,
+    net::co_spawn(domain.Executor(), handler.Process(std::make_unique<Stream>(stream), dispatcher,
         receiver, io, context, timeouts, 0), net::bind_cancellation_slot(cancellation.slot(),
-        [&](std::exception_ptr error, RelayResult) {
-            returned = true; active_at_return = dispatcher.active; failure = error;
+        [&](std::exception_ptr, RelayResult) {
+            returned = true; active_at_return = dispatcher.active;
         }));
     io.poll();
     Check(dispatcher.active == 1 && stream.pending_reads == 1, "request must pause before consuming its logical input");
-    std::vector<uint8_t> expected(mode == 0 ? 2048 : mode == 8 ? 7 * 4097 : 65535);
+    std::vector<uint8_t> expected(mode == 0 ? 2048 : 65535);
     for (size_t i = 0; i < expected.size(); ++i) expected[i] = uint8_t(i % 251);
     size_t offset = 0;
     size_t fragments = 0;
@@ -795,8 +827,7 @@ void RunQueueCase(int mode, bool baseline = false, uint32_t seed = 0) {
         random ^= random << 13; random ^= random >> 17; random ^= random << 5;
         const size_t want = mode == 0 || mode == 6 ? 1 : mode == 2 ? (fragments % 2 == 0 ? 1 : 8192)
             : mode == 3 ? boundaries[fragments % boundaries.size()]
-            : mode == 7 ? (random % 4 == 0 ? 1 : 1 + random % 8192)
-            : mode == 8 ? 4097 : 65535;
+            : mode == 7 ? (random % 4 == 0 ? 1 : 1 + random % 8192) : 65535;
         const size_t count = std::min(want, expected.size() - offset);
         Frame(stream.input, 2, 1, std::span(expected).subspan(offset, count));
         offset += count;
@@ -817,18 +848,7 @@ void RunQueueCase(int mode, bool baseline = false, uint32_t seed = 0) {
               "the next payload must wait for capacity without entering the queue");
         expected.push_back(expected[0]);
     }
-    if (mode == 8) {
-        std::array<uint8_t, 4096> added{};
-        Frame(stream.input, 2, 1, added);
-        stream.fail_queue_reserve = true;
-        const int previous_failures = allocation_failures;
-        stream.wake.cancel();
-        io.run_for(100ms);
-        Check(returned && failure && allocation_failures == previous_failures + 1 && failed_allocation_size == 128,
-              "queue growth must fail at its reserved pointer slots and join existing requests");
-        try { std::rethrow_exception(failure); }
-        catch (const std::bad_alloc&) {}
-    } else if (mode == 5) {
+    if (mode == 5) {
         cancellation.emit(net::cancellation_type::terminal);
         io.poll();
         Check(!returned && !stream.destroyed, "queue cancellation must join delayed request cleanup");
@@ -888,12 +908,6 @@ void TestPeerSettings() {
 }  // namespace
 
 int main(int argc, char** argv) {
-    FailingPmrResource resource(std::pmr::get_default_resource());
-    auto* original = std::pmr::set_default_resource(&resource);
-    struct RestoreResource {
-        std::pmr::memory_resource* original;
-        ~RestoreResource() { std::pmr::set_default_resource(original); }
-    } restore{original};
     try {
         const bool baseline = argc == 2 && std::string_view(argv[1]) == "--observe-baseline";
         if (argc == 2 && std::string_view(argv[1]) == "--identity-baseline") {
@@ -924,7 +938,6 @@ int main(int argc, char** argv) {
             for (int mode = 0; mode < 8; ++mode) RunHandshakeCase(mode);
             for (int mode = 0; mode < 7; ++mode) RunQueueCase(mode);
             for (uint32_t seed = 0; seed < 16; ++seed) RunQueueCase(7, false, seed);
-            RunQueueCase(8);
             TestPeerSettings();
         }
     } catch (const std::exception& error) {

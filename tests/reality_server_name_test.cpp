@@ -66,6 +66,12 @@ int main() {
                  "an unconfigured server name must be rejected")) return 9;
     if (!Require(!IsRealityServerNameAllowed(names, "sub.example.com"),
                  "server name matching must remain exact")) return 10;
+    if (!Require(IsRealityServerNameAllowed(names, "example.com."),
+                 "one DNS root dot must retain the same identity")) return 12;
+    if (!Require(!IsRealityServerNameAllowed(names, "example.com.."),
+                 "multiple trailing dots must not normalize to a valid name")) return 13;
+    if (!Require(!IsRealityServerNameAllowed(names, "."),
+                 "a root name must not match missing SNI")) return 14;
 
     const std::vector<std::string> named_only{"example.com"};
     if (!Require(!IsRealityServerNameAllowed(named_only, ""),

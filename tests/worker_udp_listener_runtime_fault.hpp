@@ -9,9 +9,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <new>
-#ifdef _WIN32
-#include <malloc.h>
-#endif
 
 namespace worker_udp_listener_runtime_test {
 
@@ -97,20 +94,12 @@ inline void* AllocateAligned(std::size_t alignment, std::size_t size) {
     if (alignment < alignof(void*)) alignment = alignof(void*);
     void* p = nullptr;
     const std::size_t bytes = size == 0 ? 1 : size;
-#if defined(_WIN32)
-    p = _aligned_malloc(bytes, alignment);
-#else
     if (::posix_memalign(&p, alignment, bytes) != 0) p = nullptr;
-#endif
     if (!p) throw std::bad_alloc();
     return p;
 }
 inline void DeallocateAligned(void* p) noexcept {
-#if defined(_WIN32)
-    _aligned_free(p);
-#else
     std::free(p);
-#endif
 }
 
 }  // namespace worker_udp_listener_runtime_test

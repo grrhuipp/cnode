@@ -1,4 +1,5 @@
 #include "shadowsocks_crypto.hpp"
+#include "acppnode/common/byte_reader.hpp"
 #include "stream_crypto.hpp"
 #include "server.hpp"
 #include "acppnode/common/address_codec.hpp"
@@ -19,44 +20,9 @@ namespace {
 using detail::kStreamChunkPayloadSize;
 constexpr size_t kSs2022SmallVariableBufferSize = 512;
 
-[[noreturn]] void ThrowSsWriteError(const char* what) {
-    throw IoSystemError(io_error::connection_reset, what);
-}
-
-net::awaitable<bool> ReadFull(AsyncStream& stream, uint8_t* buf, size_t len) {
-    size_t got = 0;
-    while (got < len) {
-        size_t r = co_await stream.AsyncRead(net::buffer(buf + got, len - got));
-        if (r == 0) {
-            co_return false;
-        }
-        got += r;
-    }
-    co_return true;
-}
-
 using detail::MakeNonce;
-
-SsCipherType ToSsCipher(proxyman::inbound::PreparedAeadCipher type) {
-    using Prepared = proxyman::inbound::PreparedAeadCipher;
-    switch (type) {
-        case Prepared::AES_128_GCM:
-            return SsCipherType::AES_128_GCM;
-        case Prepared::AES_256_GCM:
-            return SsCipherType::AES_256_GCM;
-        case Prepared::CHACHA20_POLY1305:
-            return SsCipherType::CHACHA20_POLY1305;
-        case Prepared::AES_128_GCM_2022:
-            return SsCipherType::AES_128_GCM_2022;
-        case Prepared::AES_256_GCM_2022:
-            return SsCipherType::AES_256_GCM_2022;
-        case Prepared::CHACHA20_POLY1305_2022:
-            return SsCipherType::CHACHA20_POLY1305_2022;
-    }
-    return SsCipherType::AES_256_GCM;
-}
-
-
+using detail::ReadFull;
+using detail::ThrowSsWriteError;
 
 class ResponseBodyWriter final
     : public memory::ThreadAllocated
@@ -66,11 +32,11 @@ public:
                        const SsCipherInfo& cipher_info,
                        const KeyBytes& request_salt,
                        AsyncStream& stream)
-        : cipher_type_(ToSsCipher(user.cipher_type))
+        : cipher_type_(cipher_info.type)
         , key_size_(user.key_size)
         , salt_size_(user.salt_size)
         , request_salt_(request_salt)
-        , is_2022_(Is2022Cipher(cipher_info)) {
+        , is_2022_(Is2022Cipher(cipher_info.type)) {
         if (user.derived_key.size <= master_key_.size()) {
             std::memcpy(master_key_.data(), user.derived_key.data(), user.derived_key.size);
         } else {
@@ -91,18 +57,17 @@ public:
         auto& state = *this;
         AsyncStream& stream = *stream_;
 
-        if (!buf::HasData(mb)) co_return;
+        if (mb.byte_size() == 0) co_return;
 
         if (!state.write_init_) {
             if (!state.is_2022_) {
-                if (!co_await EnsureTCPResponseWriter(state, stream)) {
+                if (!InitResponseCipher(state)) {
                     ThrowSsWriteError("Shadowsocks server init write cipher failed");
                 }
             } else {
                 auto first_plain = state.FirstChunkView(mb);
                 const auto first_plain_bytes = first_plain.Bytes();
-                if (!co_await EnsureTCPResponseWriter2022(
-                        state, stream, first_plain_bytes)) {
+                if (!InitResponseCipher2022(state, first_plain_bytes)) {
                     ThrowSsWriteError("Shadowsocks server init write cipher failed");
                 }
                 state.skip_first_bytes_ = first_plain_bytes.size();
@@ -144,14 +109,13 @@ public:
 
         if (!state.write_init_) {
             if (!state.is_2022_) {
-                if (!co_await EnsureTCPResponseWriter(state, stream)) {
+                if (!InitResponseCipher(state)) {
                     ThrowSsWriteError("Shadowsocks server init write cipher failed");
                 }
             } else {
                 auto first_plain = state.FirstChunkView(buffers);
                 const auto first_plain_bytes = first_plain.Bytes();
-                if (!co_await EnsureTCPResponseWriter2022(
-                        state, stream, first_plain_bytes)) {
+                if (!InitResponseCipher2022(state, first_plain_bytes)) {
                     ThrowSsWriteError("Shadowsocks server init write cipher failed");
                 }
                 state.skip_first_bytes_ = first_plain_bytes.size();
@@ -201,7 +165,7 @@ private:
 
     FirstChunk FirstChunkView(const buf::MultiBuffer& mb) const {
         FirstChunk first;
-        const size_t want = std::min(buf::TotalLen(mb), kStreamChunkPayloadSize);
+        const size_t want = std::min(mb.byte_size(), kStreamChunkPayloadSize);
         if (want == 0) {
             return first;
         }
@@ -278,10 +242,10 @@ private:
     net::awaitable<void> FlushPendingAndWrite(
         AsyncStream& stream,
         buf::MultiBuffer out_mb) {
-        if (!buf::HasData(out_mb) && !buf::HasData(pending_prefix_)) {
+        if (out_mb.byte_size() == 0 && pending_prefix_.byte_size() == 0) {
             co_return;
         }
-        if (buf::HasData(pending_prefix_)) {
+        if (pending_prefix_.byte_size() != 0) {
             buf::MultiBuffer merged;
             merged.reserve(pending_prefix_.size() + out_mb.size());
             pending_prefix_.MoveTo(merged);
@@ -291,22 +255,23 @@ private:
         co_await stream.WriteMultiBuffer(std::move(out_mb));
     }
 
-    static net::awaitable<bool> EnsureTCPResponseWriter(ResponseBodyWriter& state,
-                                                         AsyncStream& stream) {
+    // Synchronous key setup; the salt and header are staged in pending_prefix_
+    // and sent with the first response write.
+    static bool InitResponseCipher(ResponseBodyWriter& state) {
         if (state.salt_size_ > 64 || state.key_size_ > 64) {
-            co_return false;
+            return false;
         }
 
         std::array<uint8_t, 64> server_salt{};
         if (RAND_bytes(server_salt.data(), static_cast<int>(state.salt_size_)) != 1) {
-            co_return false;
+            return false;
         }
 
         std::array<uint8_t, 64> write_subkey{};
         if (!DeriveSubkey(state.master_key_.data(), state.key_size_,
                           server_salt.data(), state.salt_size_,
                           write_subkey.data())) {
-            co_return false;
+            return false;
         }
 
         state.write_cipher_.emplace(state.cipher_type_, write_subkey.data(), state.key_size_,
@@ -316,34 +281,33 @@ private:
         if (!buf::AppendSpanToMultiBuffer(
                 std::span<const uint8_t>(server_salt.data(), state.salt_size_),
                 state.pending_prefix_)) {
-            co_return false;
+            return false;
         }
 
         state.write_init_ = true;
-        co_return true;
+        return true;
     }
 
-    static net::awaitable<bool> EnsureTCPResponseWriter2022(
+    static bool InitResponseCipher2022(
         ResponseBodyWriter& state,
-        AsyncStream& stream,
         std::span<const uint8_t> first_payload) {
         if (state.salt_size_ > KeyBytes::kMaxSize ||
             state.key_size_ > KeyBytes::kMaxSize ||
             state.request_salt_.size != state.salt_size_ ||
             first_payload.size() > kSs2022MaxChunkPayload) {
-            co_return false;
+            return false;
         }
 
         std::array<uint8_t, 32> server_salt{};
         if (RAND_bytes(server_salt.data(), static_cast<int>(state.salt_size_)) != 1) {
-            co_return false;
+            return false;
         }
 
         std::array<uint8_t, 32> write_subkey{};
         if (!Derive2022Subkey(state.master_key_.data(), state.key_size_,
                               server_salt.data(), state.salt_size_,
                               write_subkey.data())) {
-            co_return false;
+            return false;
         }
 
         state.write_cipher_.emplace(state.cipher_type_, write_subkey.data(), state.key_size_,
@@ -356,9 +320,9 @@ private:
         const size_t fixed_plain_size = 1 + 8 + state.salt_size_ + 2;
         std::array<uint8_t, kFixedPlainMaxSize> fixed_plain{};
         fixed_plain[0] = 1;
-        PutU64BE(fixed_plain.data() + 1, UnixSecondsNow());
+        StoreU64BE(fixed_plain.data() + 1, UnixSecondsNow());
         std::memcpy(fixed_plain.data() + 9, state.request_salt_.data(), state.salt_size_);
-        PutU16BE(fixed_plain.data() + 9 + state.salt_size_,
+        StoreU16BE(fixed_plain.data() + 9 + state.salt_size_,
                  static_cast<uint16_t>(first_payload.size()));
 
         std::array<uint8_t, kFixedCipherMaxSize> fixed_cipher{};
@@ -366,7 +330,7 @@ private:
         auto nonce0 = MakeNonce(0);
         if (!state.write_cipher_->Encrypt(nonce0.data(), fixed_plain.data(), fixed_plain_size,
                                           fixed_cipher.data())) {
-            co_return false;
+            return false;
         }
         state.write_nonce_ = 1;
 
@@ -376,20 +340,20 @@ private:
             !buf::AppendSpanToMultiBuffer(
                 std::span<const uint8_t>(fixed_cipher.data(), fixed_cipher_size),
                 state.pending_prefix_)) {
-            co_return false;
+            return false;
         }
 
         if (!first_payload.empty()) {
             buf::BufferGuard payload_cipher{buf::Buffer::New()};
             if (!payload_cipher ||
                 first_payload.size() + SsAeadCipher::kTagSize > payload_cipher->Available()) {
-                co_return false;
+                return false;
             }
             auto nonce1 = MakeNonce(1);
             if (!state.write_cipher_->Encrypt(nonce1.data(), first_payload.data(),
                                                first_payload.size(),
                                                payload_cipher->Tail().data())) {
-                co_return false;
+                return false;
             }
             state.write_nonce_ = 2;
             payload_cipher->Produce(static_cast<uint32_t>(
@@ -397,7 +361,7 @@ private:
             state.pending_prefix_.push_back(std::move(payload_cipher));
         }
         state.write_init_ = true;
-        co_return true;
+        return true;
     }
 
     SsCipherType cipher_type_;
@@ -449,7 +413,7 @@ bool MatchIdentityHeader(const proxyman::inbound::UserStore::ShadowsocksCredenti
         return false;
     }
 
-    return identity_hash == user.psk_hash;
+    return CRYPTO_memcmp(identity_hash.data(), user.psk_hash.data(), identity_hash.size()) == 0;
 }
 
 bool DecryptSs2022FixedHeader(const proxyman::inbound::UserStore::ShadowsocksCredential& user,
@@ -541,11 +505,11 @@ net::awaitable<tl::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession2022
         co_return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
     }
     if (fixed_plain[0] != 0 ||
-        !TimestampFresh(GetU64BE(fixed_plain.data() + 1), UnixSecondsNow())) {
+        !TimestampFresh(LoadU64BE(fixed_plain.data() + 1), UnixSecondsNow())) {
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
-    const uint16_t variable_len = GetU16BE(fixed_plain.data() + 9);
+    const uint16_t variable_len = LoadU16BE(fixed_plain.data() + 9);
     if (variable_len == 0) {
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
@@ -589,7 +553,7 @@ net::awaitable<tl::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession2022
     if (offset + 2 > variable_len) {
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
-    const uint16_t padding_len = GetU16BE(variable_plain + offset);
+    const uint16_t padding_len = LoadU16BE(variable_plain + offset);
     offset += 2;
     if (offset + padding_len > variable_len) {
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
@@ -616,7 +580,7 @@ net::awaitable<tl::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession(
     const SsCipherInfo& cipher_info,
     std::string_view tag,
     size_t& last_matched_index) {
-    if (Is2022Cipher(cipher_info)) {
+    if (Is2022Cipher(cipher_info.type)) {
         co_return co_await ReadTCPSession2022(
             stream, cipher_info, tag, last_matched_index);
     }

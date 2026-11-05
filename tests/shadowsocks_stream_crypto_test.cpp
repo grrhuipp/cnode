@@ -146,7 +146,7 @@ void TestDeriveSubkey() {
 
 std::vector<uint8_t> Flatten(const buf::MultiBuffer& mb) {
     std::vector<uint8_t> out;
-    out.reserve(buf::TotalLen(mb));
+    out.reserve(mb.byte_size());
     for (const buf::Buffer* buffer : mb) {
         Check(buffer != nullptr, "decoded MultiBuffer contains a null slot");
         Check(buffer->start <= buffer->end && buffer->end <= buf::Buffer::kSize,
@@ -201,7 +201,7 @@ void TestLargeRecord(size_t payload_size, ss::SsCipherType cipher_type) {
         (payload_size + buf::Buffer::kSize - 1) / buf::Buffer::kSize;
     Check(decoded.size() == expected_buffers,
           "large Shadowsocks record was not split at 8KB boundaries");
-    Check(buf::TotalLen(decoded) == payload_size,
+    Check(decoded.byte_size() == payload_size,
           "large Shadowsocks record decoded byte count mismatch");
     Check(Flatten(decoded) == plaintext,
           "large Shadowsocks record plaintext mismatch");
@@ -238,7 +238,7 @@ void TestInvalidTagDoesNotPublishPartialPlaintext() {
                ciphertext.data() + plaintext.size(),
                decoded),
           "invalid Shadowsocks record tag was accepted");
-    Check(decoded.empty() && buf::TotalLen(decoded) == 0,
+    Check(decoded.empty() && decoded.byte_size() == 0,
           "unauthenticated plaintext escaped into the output");
 }
 
@@ -360,8 +360,8 @@ void TestReaderResume(ss::SsCipherType type, uint64_t initial_nonce, bool empty_
             co_await net::this_coro::reset_cancellation_state();
         }
         Check(cancelled == source.cuts.size(), "reader missed a real record cancellation boundary");
-        Check(!buf::HasData(co_await reader.ReadMultiBuffer()), "clean record boundary was not EOF");
-        Check(!buf::HasData(co_await reader.ReadMultiBuffer()), "repeated record EOF returned data");
+        Check((co_await reader.ReadMultiBuffer()).byte_size() == 0, "clean record boundary was not EOF");
+        Check((co_await reader.ReadMultiBuffer()).byte_size() == 0, "repeated record EOF returned data");
     };
     auto done = net::co_spawn(io, exercise(),
         net::bind_cancellation_slot(signal.slot(), net::use_future));

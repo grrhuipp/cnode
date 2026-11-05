@@ -56,6 +56,24 @@ OutboundBind OutboundBind::Auto() noexcept {
     return bind;
 }
 
+std::optional<net::ip::address> OutboundBind::BindAddressFor(
+    const tcp::endpoint* inbound_local, const net::ip::address& remote) const noexcept {
+    if (mode_ == Mode::Explicit) {
+        return explicit_address_;
+    }
+    if (mode_ != Mode::Auto || !inbound_local) {
+        return std::nullopt;
+    }
+    // Same-in-same-out: reuse the inbound local address when it can source
+    // a connection to `remote`.
+    const auto local = iputil::NormalizeAddress(inbound_local->address());
+    if (local.is_unspecified() || local.is_loopback() ||
+        local.is_v4() != remote.is_v4()) {
+        return std::nullopt;
+    }
+    return local;
+}
+
 std::optional<OutboundBind> OutboundBind::Parse(std::string_view value) {
     OutboundBind bind;
     if (value.empty()) return bind;

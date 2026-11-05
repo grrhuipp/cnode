@@ -8,6 +8,7 @@
 #include "acppnode/infra/runtime_failure.hpp"
 #include "acppnode/service/controller/controller.hpp"
 #include "acppnode/app/worker.hpp"
+#include "acppnode/app/session_group_executor.hpp"
 #include "acppnode/transport/internet/timeout_scheduler.hpp"
 #include "../common/awaitable_batch.hpp"
 
@@ -40,7 +41,7 @@ public:
         stopping = true;
         ctx.controller.RequestStop();
         monitor.RequestStop();
-        for (size_t i = 0; i < started_threads; ++i) ctx.workers[i]->RequestStop();
+        for (size_t i = 0; i < started_threads; ++i) ctx.workers[i]->RequestDrain();
         ctx.dns_worker.RequestStop();
         stop_event.cancel();
         IoErrorCode ignored;
@@ -96,13 +97,30 @@ public:
             IoErrorCode ec;
             co_await stop_event.async_wait(net::redirect_error(net::use_awaitable, ec));
         }
-        // Every owner must join even if an earlier component reports a real
-        // failure. Worker admission is already closed: do not start rollback
-        // mutations; retained prepared state dies only after Workers finish.
+        // Drain data tasks first, retaining bounded control admission for the
+        // final durable accounting snapshot. Every owner still joins on failure.
         try { co_await ctx.controller.AsyncJoin(); }
         catch (...) { RecordFailure(std::current_exception()); }
         try { co_await monitor.AsyncJoin(); }
         catch (...) { RecordFailure(std::current_exception()); }
+        for (size_t i = 0; i < started_threads; ++i) {
+            try { co_await ctx.workers[i]->AsyncDrain(); }
+            catch (...) { RecordFailure(std::current_exception()); }
+        }
+        try { co_await ctx.controller.FlushTraffic(); }
+        catch (...) { RecordFailure(std::current_exception()); }
+        auto coordinator = started_threads ? ctx.workers.front()->Coordinator() : nullptr;
+        if (coordinator) {
+            coordinator->CloseAdmission();
+            try {
+                co_await net::co_spawn(coordinator->Reactor(),
+                    [coordinator]() -> net::awaitable<void> {
+                        co_await coordinator->AsyncJoin();
+                        coordinator->ReleaseServices();
+                    }, net::use_awaitable);
+            } catch (...) { RecordFailure(std::current_exception()); }
+        }
+        for (size_t i = 0; i < started_threads; ++i) ctx.workers[i]->RequestStop();
         for (size_t i = 0; i < started_threads; ++i) {
             bool joined = false;
             while (!joined) {
@@ -111,8 +129,19 @@ public:
                     joined = true;
                 } catch (...) { RecordFailure(std::current_exception()); }
             }
-            ctx.work_guards[i].reset();
         }
+        if (coordinator) {
+            auto executor = coordinator->Reactor().get_executor();
+            co_await net::co_spawn(executor,
+                [coordinator = std::move(coordinator)]() mutable -> net::awaitable<void> {
+                    co_await coordinator->Finalize();
+                    coordinator.reset();
+                    co_return;
+                }, net::use_awaitable);
+        }
+        // A migrated domain can retain a different Worker's native reactor.
+        // No reactor work guard is released until every Worker has joined.
+        for (size_t i = 0; i < started_threads; ++i) ctx.work_guards[i].reset();
         bool dns_joined = false;
         while (!dns_joined) {
             try {

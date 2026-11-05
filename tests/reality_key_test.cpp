@@ -1,25 +1,69 @@
 #include "acppnode/transport/internet/reality_key.hpp"
 
+#include <openssl/evp.h>
+#include <openssl/nid.h>
+
 #include <cstdio>
+#include <memory>
+#include <optional>
+#include <span>
 #include <string>
 
 namespace {
+
+using acpp::transport::internet::RealityKey;
+using acpp::transport::internet::RealityMldsa65PublicKey;
 
 bool Require(bool condition, const char* message) {
     if (!condition) std::fprintf(stderr, "%s\n", message);
     return condition;
 }
 
+// Test fixture helper (also used by reality_integration.py): the product only
+// parses configured keys, it never derives or encodes them.
+std::optional<RealityMldsa65PublicKey> DeriveRealityMldsa65PublicKeyFromSeed(
+    const RealityKey& seed) {
+    std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> pkey(
+        EVP_PKEY_pqdsa_new_raw_private_key(NID_MLDSA65, seed.data(), seed.size()),
+        EVP_PKEY_free);
+    if (!pkey) return std::nullopt;
+    RealityMldsa65PublicKey pub{};
+    std::size_t pub_len = pub.size();
+    if (EVP_PKEY_get_raw_public_key(pkey.get(), pub.data(), &pub_len) != 1 ||
+        pub_len != pub.size()) {
+        return std::nullopt;
+    }
+    return pub;
+}
+
+std::string EncodeRealityBase64Url(std::span<const uint8_t> bytes) {
+    static constexpr char kAlphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    std::string out;
+    out.reserve((bytes.size() * 8 + 5) / 6);
+    uint32_t accumulator = 0;
+    unsigned int bit_count = 0;
+    for (const uint8_t byte : bytes) {
+        accumulator = (accumulator << 8) | byte;
+        bit_count += 8;
+        while (bit_count >= 6) {
+            bit_count -= 6;
+            out.push_back(kAlphabet[(accumulator >> bit_count) & 0x3f]);
+        }
+    }
+    if (bit_count > 0) {
+        out.push_back(kAlphabet[(accumulator << (6 - bit_count)) & 0x3f]);
+    }
+    return out;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-    using acpp::transport::internet::DeriveRealityMldsa65PublicKeyFromSeed;
-    using acpp::transport::internet::EncodeRealityBase64Url;
     using acpp::transport::internet::NormalizeRealityFingerprint;
     using acpp::transport::internet::ParseRealityKey;
     using acpp::transport::internet::ParseRealityMldsa65PublicKey;
     using acpp::transport::internet::ParseRealityMldsa65Seed;
-    using acpp::transport::internet::RealityKey;
 
     if (argc == 3 && std::string(argv[1]) == "--derive-mldsa65") {
         const auto seed = ParseRealityMldsa65Seed(argv[2]);

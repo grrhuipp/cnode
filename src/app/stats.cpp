@@ -1,6 +1,7 @@
 #include "acppnode/app/stats.hpp"
 
 #include <format>
+#include <stdexcept>
 #include <string_view>
 
 namespace acpp {
@@ -12,7 +13,7 @@ namespace acpp {
 ShardedStats::ShardedStats(uint32_t num_workers)
     : shards_(num_workers)
     , last_sample_time_(steady_clock::now()) {
-    // samples_ 默认初始化（valid = false），无需额外处理
+    if (shards_.empty()) throw std::invalid_argument("stats require at least one worker shard");
 }
 
 StatsSnapshot ShardedStats::WithCurrentRate(StatsSnapshot snapshot) const {
@@ -29,10 +30,9 @@ void ShardedStats::SampleNow(const StatsSnapshot& snapshot) {
 
     uint64_t delta_in   = snapshot.bytes_in         - last_bytes_in_;
     uint64_t delta_out  = snapshot.bytes_out        - last_bytes_out_;
-    uint64_t delta_conn = snapshot.connections_total - last_connections_;
 
     // 写入环形缓冲区：start_time = 本周期起始（上次采样时间）
-    samples_[sample_index_] = {delta_in, delta_out, delta_conn, last_sample_time_, true};
+    samples_[sample_index_] = {delta_in, delta_out, last_sample_time_, true};
     sample_index_ = (sample_index_ + 1) % kWindowSize;
 
     // 滑动窗口：遍历所有有效采样点，累加增量 / 计算时间跨度
@@ -61,7 +61,6 @@ void ShardedStats::SampleNow(const StatsSnapshot& snapshot) {
 
     last_bytes_in_    = snapshot.bytes_in;
     last_bytes_out_   = snapshot.bytes_out;
-    last_connections_ = snapshot.connections_total;
     last_sample_time_ = now;
 }
 

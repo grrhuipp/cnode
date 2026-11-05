@@ -1,7 +1,7 @@
 #include "anytls_outbound.hpp"
 #include "acppnode/common/address_codec.hpp"
 #include "anytls_outbound_settings.hpp"
-#include "session_pool.hpp"
+#include "../../../common/awaitable_task_group.hpp"
 
 #include "../anytls_codec.hpp"
 #include "../padding.hpp"
@@ -21,10 +21,14 @@
 #include "acppnode/transport/internet/transport_dialer.hpp"
 #include "acppnode/transport/internet/outbound_target_builder.hpp"
 #include "acppnode/transport/internet/timeout_scheduler.hpp"
+#include "acppnode/transport/link_error.hpp"
 
-#include <asio/cancellation_signal.hpp>
 #include <asio/experimental/channel.hpp>
 #include <algorithm>
+#include <chrono>
+#include <exception>
+#include <new>
+#include <stdexcept>
 #include <memory>
 #include <optional>
 #include <string>
@@ -32,12 +36,30 @@
 namespace {
 
 constexpr size_t kMaxLogicalQueuedPayloadBytes = acpp::anytls::kMaxFramePayload;
+// anytls-go Session.OpenStream: a v2 stream with sid >= 2 must see SYNACK
+// within 3 s or the whole session closes (proxy/session/session.go).
+constexpr std::chrono::seconds kSynAckTimeout{3};
 
 }  // namespace
 
 namespace acpp::proxy::anytls::outbound {
 
 using namespace ::acpp::anytls;
+
+namespace {
+
+// Classify before CloseAll broadcasts cancellation to logical consumers. An
+// unknown physical write failure must not arrive at a relay as a read failure.
+ErrorCode SessionExceptionError(const std::exception_ptr& failure,
+                               ErrorCode unknown = ErrorCode::INTERNAL) noexcept {
+    try { std::rethrow_exception(failure); }
+    catch (const transport::LinkError& e) { return e.code(); }
+    catch (const std::bad_alloc&) { return ErrorCode::RESOURCE_EXHAUSTED; }
+    catch (const IoSystemError& e) { return MapAsioError(e.code()); }
+    catch (...) { return unknown; }
+}
+
+}  // namespace
 
 // One outbound client on its owning Worker. Physical tasks own this state,
 // never the Handler; retiring a Handler cannot publish into its replacement.
@@ -205,8 +227,7 @@ struct Handler::ClientSession {
         : io_context_(io_context)
         , stream(std::move(s))
         , padding_state_(std::move(padding_state))
-        , opening_scheme_(std::move(opening_scheme))
-        , write_gate(io_context) {}
+        , opening_scheme_(std::move(opening_scheme)) {}
 
     net::io_context& io_context_;
     std::unique_ptr<AsyncStream> stream;
@@ -223,12 +244,19 @@ struct Handler::ClientSession {
         std::weak_ptr<LogicalStream>>
         logical_streams;
     size_t active_streams = 0;
-    net::cancellation_signal task_cancellation;
+    // Stopped by CloseAll; cancels only this session's physical read loop.
+    transport::CancellationSource task_cancellation;
     bool closed = false;
-
-    net::cancellation_slot CancellationSlot() noexcept { return task_cancellation.slot(); }
+    // First terminal cause. The physical loop can fail inline while Adopt
+    // starts it, before the request registers its logical stream; requests
+    // that then find the session closed report this cause, not a generic close.
+    ErrorCode close_error = ErrorCode::OK;
 
     [[nodiscard]] bool IsClosed() const noexcept { return closed || !stream; }
+
+    [[nodiscard]] ErrorCode ClosedError() const noexcept {
+        return close_error != ErrorCode::OK ? close_error : ErrorCode::CONNECTION_CLOSED;
+    }
 
     uint32_t NextPacketIndex() noexcept {
         const auto index = packet_index;
@@ -254,8 +282,9 @@ struct Handler::ClientSession {
     void CloseAll(ErrorCode error) noexcept {
         if (closed) return;
         closed = true;
+        close_error = error;
         write_gate.Cancel();
-        task_cancellation.emit(net::cancellation_type::all);
+        task_cancellation.Stop();
         for (auto& [sid, weak] : logical_streams) {
             (void)sid;
             if (auto logical = weak.lock()) {
@@ -273,7 +302,7 @@ struct Handler::ClientSession {
         auto write_lease = write_gate.TryAcquire();
         if (!write_lease) write_lease = co_await write_gate.Acquire();
         if (!write_lease || closed || !stream) {
-            co_return tl::unexpected(ErrorCode::CONNECTION_CLOSED);
+            co_return tl::unexpected(ClosedError());
         }
 
         try {
@@ -305,7 +334,7 @@ struct Handler::ClientSession {
             opening_scheme_.reset();
             co_return tl::expected<void, ErrorCode>{};
         } catch (...) {
-            CloseAll(SessionExceptionError(std::current_exception()));
+            CloseAll(SessionExceptionError(std::current_exception(), ErrorCode::RELAY_WRITE_FAILED));
             throw;
         }
     }
@@ -316,7 +345,7 @@ struct Handler::ClientSession {
         if (!write_lease) write_lease = co_await write_gate.Acquire();
         if (!write_lease || closed || !stream) {
             mb.clear();
-            co_return tl::unexpected(ErrorCode::CONNECTION_CLOSED);
+            co_return tl::unexpected(ClosedError());
         }
 
         logical.CheckWrite();
@@ -338,7 +367,7 @@ struct Handler::ClientSession {
             }
             co_return tl::expected<void, ErrorCode>{};
         } catch (...) {
-            CloseAll(SessionExceptionError(std::current_exception()));
+            CloseAll(SessionExceptionError(std::current_exception(), ErrorCode::RELAY_WRITE_FAILED));
             throw;
         }
     }
@@ -359,7 +388,7 @@ struct Handler::ClientSession {
         auto write_lease = write_gate.TryAcquire();
         if (!write_lease) write_lease = co_await write_gate.Acquire();
         if (!write_lease || closed || !stream) {
-            co_return tl::unexpected(ErrorCode::CONNECTION_CLOSED);
+            co_return tl::unexpected(ClosedError());
         }
 
         logical.CheckWrite();
@@ -368,8 +397,7 @@ struct Handler::ClientSession {
             const uint32_t this_packet = NextPacketIndex();
             tl::expected<void, ErrorCode> ok;
             if (padding_state_->scheme->RecordFor(this_packet).empty()) {
-                ok = co_await WriteBuffersAsFramesWithPadding(
-                    *stream, *padding_state_->scheme, this_packet, kCmdPSH, sid, buffers);
+                ok = co_await WriteBuffersAsFrameBatch(*stream, kCmdPSH, sid, buffers);
             } else {
                 auto scheme_snapshot = padding_state_->scheme;
                 ok = co_await WriteBuffersAsFramesWithPadding(
@@ -381,7 +409,7 @@ struct Handler::ClientSession {
             }
             co_return tl::expected<void, ErrorCode>{};
         } catch (...) {
-            CloseAll(SessionExceptionError(std::current_exception()));
+            CloseAll(SessionExceptionError(std::current_exception(), ErrorCode::RELAY_WRITE_FAILED));
             throw;
         }
     }
@@ -391,7 +419,7 @@ struct Handler::ClientSession {
         auto write_lease = write_gate.TryAcquire();
         if (!write_lease) write_lease = co_await write_gate.Acquire();
         if (!write_lease || closed || !stream) {
-            co_return tl::unexpected(ErrorCode::CONNECTION_CLOSED);
+            co_return tl::unexpected(ClosedError());
         }
         if (cmd == kCmdFIN) {
             const auto found = logical_streams.find(sid);
@@ -409,7 +437,7 @@ struct Handler::ClientSession {
             }
             co_return tl::expected<void, ErrorCode>{};
         } catch (...) {
-            CloseAll(SessionExceptionError(std::current_exception()));
+            CloseAll(SessionExceptionError(std::current_exception(), ErrorCode::RELAY_WRITE_FAILED));
             throw;
         }
     }
@@ -518,6 +546,8 @@ struct Handler::ClientSession {
                 continue;
             }
 
+            // A failed payload read leaves the physical stream at an unknown
+            // frame boundary, so it retires the session, not only this stream.
             switch (header->cmd) {
                 case kCmdSYNACK:
                     if (header->length > 0) {
@@ -533,52 +563,300 @@ struct Handler::ClientSession {
                     break;
                 case kCmdWaste:
                     if (auto ok = co_await discard_current(); !ok) {
-                        logical->Close(ok.error());
+                        CloseAll(ok.error());
+                        co_return;
                     }
                     break;
                 case kCmdPSH: {
                     auto payload = co_await ReadFramePayload(*stream, header->length);
                     if (!payload) {
-                        logical->Close(payload.error());
-                        break;
+                        CloseAll(payload.error());
+                        co_return;
                     }
                     co_await logical->PushPayload(std::move(*payload));
                     break;
                 }
                 case kCmdFIN:
                     if (auto ok = co_await discard_current(); !ok) {
-                        logical->Close(ok.error());
-                    } else {
-                        logical->CloseRemote();
+                        CloseAll(ok.error());
+                        co_return;
                     }
+                    logical->CloseRemote();
                     break;
                 case kCmdAlert: {
-                    auto text = co_await ReadFrameText(*stream, header->length);
-                    (void)text;
+                    if (auto text = co_await ReadFrameText(*stream, header->length); !text) {
+                        CloseAll(text.error());
+                        co_return;
+                    }
                     logical->Close(ErrorCode::PROTOCOL_DECODE_FAILED);
                     break;
                 }
                 default:
                     if (auto ok = co_await discard_current(); !ok) {
-                        logical->Close(ok.error());
-                    } else {
-                        logical->Close(ErrorCode::PROTOCOL_INVALID_COMMAND);
+                        CloseAll(ok.error());
+                        co_return;
                     }
+                    logical->Close(ErrorCode::PROTOCOL_INVALID_COMMAND);
                     break;
             }
         }
     }
 };
 
+// Worker-local physical-session ownership. A checkout is busy before any
+// suspension; an unreturned checkout closes its session on every exit path.
+// Each physical read loop is a child of the Worker's resident task group and
+// owns State and its session until it actually completes. Retirement closes
+// the sessions, which cancels their loops; the Worker joins them. Neither the
+// loops nor the idle timer borrow the Handler.
+class Handler::SessionPool final : public memory::ThreadAllocated {
+    using Clock = std::chrono::steady_clock;
+    struct State;
+
+    static void Close(const std::shared_ptr<ClientSession>& session) noexcept {
+        if (session) session->CloseAll(ErrorCode::CANCELLED);
+    }
+
+public:
+    class Lease {
+    public:
+        Lease() = default;
+        Lease(const Lease&) = delete;
+        Lease& operator=(const Lease&) = delete;
+        Lease(Lease&& other) noexcept = default;
+        Lease& operator=(Lease&& other) noexcept {
+            if (this != &other) {
+                Discard();
+                state_ = std::move(other.state_);
+                session_ = std::move(other.session_);
+            }
+            return *this;
+        }
+        ~Lease() noexcept { Discard(); }
+
+        [[nodiscard]] const std::shared_ptr<ClientSession>& Get() const noexcept { return session_; }
+
+        void Reuse() noexcept {
+            if (state_ && session_) state_->Release(session_);
+            session_.reset();
+            state_.reset();
+        }
+
+    private:
+        friend class SessionPool;
+        Lease(std::shared_ptr<State> state, std::shared_ptr<ClientSession> session) noexcept
+            : state_(std::move(state)), session_(std::move(session)) {}
+        void Discard() noexcept {
+            if (state_ && session_) state_->Remove(session_);
+            session_.reset();
+            state_.reset();
+        }
+        std::shared_ptr<State> state_;
+        std::shared_ptr<ClientSession> session_;
+    };
+
+    SessionPool(net::io_context& io_context, AwaitableTaskGroup& tasks,
+                Clock::duration check_interval, Clock::duration idle_timeout,
+                size_t minimum_idle, std::string_view tag)
+        : state_(memory::AllocateShared<State>(io_context, tasks, check_interval,
+                                               idle_timeout, minimum_idle, tag)) {}
+    SessionPool(const SessionPool&) = delete;
+    SessionPool& operator=(const SessionPool&) = delete;
+    ~SessionPool() noexcept { state_->Retire(); }
+
+    template<class Accept>
+    [[nodiscard]] Lease AcquireIf(Accept&& accept) {
+        state_->CheckActive();
+        state_->Prune();
+        for (auto it = state_->entries.rbegin(); it != state_->entries.rend(); ++it) {
+            if (it->idle_since && it->session->Available() && accept(*it->session)) {
+                it->idle_since.reset();
+                return Lease(state_, it->session);
+            }
+        }
+        return {};
+    }
+
+    [[nodiscard]] Lease Acquire() {
+        return AcquireIf([](const ClientSession&) { return true; });
+    }
+
+    [[nodiscard]] Lease Adopt(std::shared_ptr<ClientSession> session) {
+        try {
+            state_->CheckActive();
+            if (!session || session->IsClosed()) {
+                throw std::invalid_argument("cannot adopt a closed AnyTLS session");
+            }
+            state_->entries.push_back({session, std::nullopt});
+            if (!state_->Valid()) state_->Schedule();
+            state_->Start(session);
+            return Lease(state_, std::move(session));
+        } catch (...) {
+            state_->Remove(session);
+            throw;
+        }
+    }
+
+private:
+    struct State : std::enable_shared_from_this<State>, TimeoutEvent {
+        struct Entry {
+            std::shared_ptr<ClientSession> session;
+            std::optional<Clock::time_point> idle_since;
+        };
+
+        State(net::io_context& io_context, AwaitableTaskGroup& owner_tasks,
+              Clock::duration check, Clock::duration timeout,
+              size_t minimum, std::string_view name)
+            : tasks(owner_tasks), scheduler(TimeoutScheduler::ForIoContext(io_context)),
+              check_interval(check), idle_timeout(timeout),
+              minimum_idle(minimum), tag(name) {
+            if (check <= Clock::duration::zero() || timeout <= Clock::duration::zero()) {
+                throw std::invalid_argument("AnyTLS session intervals must be positive");
+            }
+        }
+
+        void CheckActive() const {
+            if (failure) std::rethrow_exception(failure);
+            if (retired) throw std::logic_error("AnyTLS session pool is retired");
+        }
+
+        void Remove(const std::shared_ptr<ClientSession>& session) noexcept {
+            // Keep an owner while erasing the index, before cancellation can
+            // notify logical requests or finish the physical operation.
+            const auto closing = session;
+            std::erase_if(entries, [&](const auto& entry) { return entry.session == session; });
+            StopIfEmpty();
+            Close(closing);
+        }
+
+        void Start(const std::shared_ptr<ClientSession>& session) {
+            // CloseAll stops the session's source, cancelling only this child.
+            tasks.Spawn(RunPhysical(this->shared_from_this(), session),
+                        &session->task_cancellation);
+        }
+
+        // A resident group child must contain every failure: an escaping
+        // exception would stop all physical sessions of this Worker.
+        static net::awaitable<void> RunPhysical(std::shared_ptr<State> owner,
+                                                std::shared_ptr<ClientSession> session) {
+            std::exception_ptr failure;
+            try {
+                co_await session->Run();
+            } catch (...) {
+                failure = std::current_exception();
+            }
+            const ErrorCode error = failure ? SessionExceptionError(failure)
+                                            : ErrorCode::CONNECTION_CLOSED;
+            // A loop that returned or threw must never remain reusable.
+            // CloseAll retains the first terminal cause.
+            session->CloseAll(error);
+            owner->Remove(session);
+            if (failure && error != ErrorCode::CANCELLED) {
+                try {
+                    LOG_WARN("AnyTLS outbound '{}': physical session task failed: {}",
+                        owner->tag, ErrorCodeToString(error));
+                } catch (...) {}
+            }
+        }
+
+        void Release(const std::shared_ptr<ClientSession>& session) noexcept {
+            auto it = std::find_if(entries.begin(), entries.end(),
+                [&](const auto& entry) { return entry.session == session; });
+            if (retired || it == entries.end() || !session->Available()) {
+                Remove(session);
+                return;
+            }
+            it->idle_since = Clock::now();
+            // Keep most recently returned idle sessions at the back, without
+            // allocating a second list or changing the ownership count.
+            std::rotate(it, it + 1, entries.end());
+        }
+
+        void Prune() noexcept {
+            const auto now = Clock::now();
+            size_t retained_idle = 0;
+            for (size_t i = entries.size(); i-- > 0;) {
+                const auto& entry = entries[i];
+                bool remove = entry.session->IsClosed();
+                if (!remove && entry.idle_since) {
+                    if (!entry.session->Available()) {
+                        remove = true;
+                    } else if (retained_idle >= minimum_idle &&
+                               now - *entry.idle_since >= idle_timeout) {
+                        remove = true;
+                    } else {
+                        ++retained_idle;
+                    }
+                }
+                if (remove) {
+                    const auto closing = entry.session;
+                    entries.erase(entries.begin() + static_cast<std::ptrdiff_t>(i));
+                    Close(closing);
+                }
+            }
+            StopIfEmpty();
+        }
+
+        void StopIfEmpty() noexcept {
+            if (!entries.empty()) return;
+            Cancel();
+            memory::ThreadLocalVector<Entry>{}.swap(entries);
+        }
+
+        void Schedule() {
+            if (!scheduler.ScheduleAfter(
+                    std::chrono::ceil<std::chrono::milliseconds>(check_interval), *this))
+                throw IoSystemError(io_error::operation_aborted);
+        }
+
+        void OnTimeout() noexcept override {
+            // Pruning can drop the last indexed session and notify its users.
+            // Keep this event's owner alive until rescheduling has finished.
+            const auto self = this->shared_from_this();
+            if (retired) return;
+            try {
+                Prune();
+                if (!entries.empty()) Schedule();
+            } catch (...) {
+                failure = std::current_exception();
+                Retire();
+                try {
+                    LOG_ERROR("AnyTLS outbound '{}': idle session scheduler failed", tag);
+                } catch (...) {}
+            }
+        }
+
+        void Retire() noexcept {
+            retired = true;
+            Cancel();
+            memory::ThreadLocalVector<Entry> closing;
+            closing.swap(entries);
+            for (const auto& entry : closing) Close(entry.session);
+        }
+
+        AwaitableTaskGroup& tasks;
+        TimeoutScheduler& scheduler;
+        const Clock::duration check_interval;
+        const Clock::duration idle_timeout;
+        const size_t minimum_idle;
+        const memory::ThreadLocalString tag;
+        memory::ThreadLocalVector<Entry> entries;
+        bool retired = false;
+        std::exception_ptr failure;
+    };
+
+    const std::shared_ptr<State> state_;
+};
+
 struct Handler::LogicalStreamLease {
-    SessionPool<ClientSession>::Lease& transport_lease;
+    SessionPool::Lease& transport_lease;
     std::shared_ptr<ClientSession> session;
     std::shared_ptr<ClientSession::LogicalStream> logical;
     uint32_t sid = 0;
     bool cleaned = false;
 
     LogicalStreamLease(
-        SessionPool<ClientSession>::Lease& transport_lease,
+        SessionPool::Lease& transport_lease,
         std::shared_ptr<ClientSession> session,
         std::shared_ptr<ClientSession::LogicalStream> logical,
         uint32_t sid) noexcept
@@ -615,6 +893,7 @@ DialOutboundStream(
     net::io_context& io_context,
     app::dns::DNS& dns_service,
     const PreparedSettings& prepared,
+    const TransportSecurity& security,
     std::chrono::seconds dial_timeout,
     const tcp::endpoint* inbound_local_addr,
     bool ordered_bind,
@@ -629,6 +908,7 @@ DialOutboundStream(
         .literal_address = prepared.settings.literal_address,
         .port = prepared.settings.port,
         .stream_settings = &prepared.stream_settings,
+        .security = &security,
         .timeout = dial_timeout,
         .send_through = &prepared.settings.send_through,
         .inbound_local_addr = inbound_local_addr,
@@ -735,14 +1015,16 @@ Handler::Handler(std::string_view tag,
                  net::io_context& io_context,
                  std::shared_ptr<const PreparedSettings> prepared,
                  std::chrono::seconds dial_timeout,
-                 app::dns::DNS& dns_service)
+                 app::dns::DNS& dns_service,
+                 AwaitableTaskGroup& tasks)
     : tag_(tag)
     , prepared_(std::move(prepared))
+    , security_(prepared_->stream_settings, StreamEndpointRole::Outbound)
     , dial_timeout_(dial_timeout)
     , dns_service_(dns_service)
     , padding_(memory::AllocateShared<PaddingState>())
-    , pool_(std::make_unique<SessionPool<ClientSession>>(
-          io_context, prepared_->settings.idle_session_check_interval,
+    , pool_(std::make_unique<SessionPool>(
+          io_context, tasks, prepared_->settings.idle_session_check_interval,
           prepared_->settings.idle_session_timeout, prepared_->settings.min_idle_sessions, tag_)) {}
 
 Handler::~Handler() noexcept = default;
@@ -762,7 +1044,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
-    SessionPool<ClientSession>::Lease transport_lease;
+    SessionPool::Lease transport_lease;
     std::shared_ptr<ClientSession> session;
     {
         const bool ordered_bind = prepared_->settings.send_through.GetMode() == OutboundBind::Mode::Ordered;
@@ -793,6 +1075,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
                 io_context,
                 dns_service_,
                 *prepared_,
+                security_,
                 dial_timeout_,
                 inbound_local_addr,
                 ordered_bind,
@@ -841,7 +1124,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
             co_return tl::unexpected(deadline.Expired() ? ErrorCode::TIMEOUT : ok.error());
         }
         if (sid >= 2 && session->session_version == SessionVersion::V2) {
-            if (auto ok = co_await logical->WaitOpenResult(std::chrono::seconds(3)); !ok) {
+            if (auto ok = co_await logical->WaitOpenResult(kSynAckTimeout); !ok) {
                 session->CloseAll(ok.error());
                 co_return tl::unexpected(ok.error());
             }
@@ -909,7 +1192,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
         bool WriteShutdownClosesLink() const noexcept override { return true; }
 
         net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
-            if (!buf::HasData(mb)) {
+            if (mb.byte_size() == 0) {
                 co_return;
             }
             if (cancelled) {
@@ -985,15 +1268,9 @@ net::awaitable<OutboundProcessResult> Handler::Process(
         original_target);
 
     RelayResult result;
-    auto* inbound_control = inbound.control;
     auto relay_endpoint = [&](auto& endpoint) {
-        if (inbound_control) {
-            return DoRelayLink(
-                io_context, *inbound.reader, *inbound.writer, *inbound_control,
-                endpoint, ctx, stats, relay_config, std::move(first_payload));
-        }
         return DoRelayLink(
-            io_context, *inbound.reader, *inbound.writer,
+            io_context, *inbound.reader, *inbound.writer, inbound.control,
             endpoint, ctx, stats, relay_config, std::move(first_payload));
     };
 
@@ -1038,6 +1315,8 @@ const bool kOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 .allow_insecure = false,
                 .alpn = {},
             });
+        acpp::TransportSecurity::Prepare(
+            prepared_stream_settings, acpp::StreamEndpointRole::Outbound);
         using PreparedSettings = acpp::proxy::anytls::outbound::PreparedSettings;
         return acpp::proxyman::outbound::MakePreparedOutboundCreator<
             PreparedSettings,
@@ -1045,13 +1324,15 @@ const bool kOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 std::shared_ptr<const PreparedSettings> state,
                 acpp::net::io_context& io_context,
                 acpp::app::dns::DNS& dns,
-                std::chrono::seconds dial_timeout) -> std::unique_ptr<acpp::Outbound> {
+                std::chrono::seconds dial_timeout,
+                acpp::AwaitableTaskGroup& tasks) -> std::unique_ptr<acpp::Outbound> {
                 return std::make_unique<acpp::proxy::anytls::outbound::Handler>(
                     tag,
                     io_context,
                     std::move(state),
                     dial_timeout,
-                    dns);
-            }>(PreparedSettings{std::move(*settings), std::move(prepared_stream_settings)});
+                    dns,
+                    tasks);
+            }>(PreparedSettings{std::move(*settings), std::move(prepared_stream_settings)}, true);
     }), true);
 }  // namespace

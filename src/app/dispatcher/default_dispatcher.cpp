@@ -128,22 +128,17 @@ struct ActiveSessionScope {
 
 DefaultDispatcher::DefaultDispatcher(
     const routing::Router& router,
-    features::outbound::Manager& outbound_manager,
+    features::outbound::HandlerLookup& outbound_handlers,
     features::policy::RequestPolicy& request_policy,
     app::SessionTrackingState& session_tracking,
     app::dns::DNS& dns_service,
     app::RequestLoadState& request_load) noexcept
     : router_(router)
-    , outbound_manager_(outbound_manager)
+    , outbound_handlers_(outbound_handlers)
     , request_policy_(request_policy)
     , session_tracking_(session_tracking)
     , dns_service_(dns_service)
     , request_load_(request_load) {}
-
-std::shared_ptr<Outbound> DefaultDispatcher::ResolveOutboundHandler(
-    std::string_view tag) const noexcept {
-    return outbound_manager_.GetHandler(tag);
-}
 
 net::awaitable<RelayResult> DefaultDispatcher::Dispatch(
     net::io_context& io_context,
@@ -159,7 +154,7 @@ net::awaitable<RelayResult> DefaultDispatcher::Dispatch(
     RelayResult result;
     ErrorCode cancellation_reason = ErrorCode::OK;
     try {
-        co_await RunAwaitableTaskGroup(io_context.get_executor(), [&](AwaitableTaskGroup& group) {
+        co_await RunAwaitableTaskGroup(co_await net::this_coro::executor, [&](AwaitableTaskGroup& group) {
             group.Spawn(DispatchPreparedLink(
                 io_context, policy, std::move(inbound), inbound_link,
                 std::move(first_packet), ctx, stats, timeouts, pressure_idle_timeout,
@@ -266,7 +261,7 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
         size_t cached_datagrams = 0;
 
         auto copy_cached_bytes = [&](const buf::MultiBuffer& mb) {
-            const size_t total = buf::TotalLen(mb);
+            const size_t total = mb.byte_size();
             if (total == 0) {
                 return std::span<const uint8_t>{};
             }
@@ -297,7 +292,7 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
                     if (payload.empty()) {
                         co_return false;
                     }
-                    cached_bytes += buf::TotalLen(payload);
+                    cached_bytes += payload.byte_size();
                     ++cached_datagrams;
                     if (datagram) {
                         sniff_payload = std::move(payload);
@@ -308,7 +303,7 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
                 };
                 if (!first_packet.empty()) {
                     sniff_payload = first_packet.MoveToMultiBuffer();
-                    cached_bytes = buf::TotalLen(sniff_payload);
+                    cached_bytes = sniff_payload.byte_size();
                     cached_datagrams = 1;
                 } else {
                     if (inbound_control) {
@@ -545,7 +540,7 @@ DefaultDispatcher::RouteResult DefaultDispatcher::FinishRoute(
         };
     }
 
-    auto handler = ResolveOutboundHandler(selection.outbound_tag);
+    auto handler = outbound_handlers_.GetHandler(selection.outbound_tag);
     if (!handler) {
         return RouteResult{
             .handler = {},
@@ -588,11 +583,6 @@ net::awaitable<DefaultDispatcher::RouteResult> DefaultDispatcher::RouteAsync(
         [&](const std::vector<net::ip::address>& addresses) -> detail::OutboundSelection {
             auto select_address = [&](const net::ip::address& addr) {
                 ctx.outbound.target.resolved_addr = addr;
-                if (ctx.outbound.route_target.IsDomain() &&
-                    ctx.outbound.route_target.host == ctx.outbound.target.host &&
-                    ctx.outbound.route_target.port == ctx.outbound.target.port) {
-                    ctx.outbound.route_target.resolved_addr = addr;
-                }
                 return SelectRoute(ctx, policy);
             };
 

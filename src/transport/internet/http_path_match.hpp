@@ -4,15 +4,28 @@
 
 namespace acpp::transport::internet::detail {
 
-[[nodiscard]] inline bool PathPrefixMatchesSegment(
+// An unset configured path addresses the origin root.
+[[nodiscard]] constexpr std::string_view EffectiveHttpPath(
+    std::string_view configured) noexcept {
+    return configured.empty() ? std::string_view("/") : configured;
+}
+
+[[nodiscard]] constexpr std::string_view PathWithoutQuery(
+    std::string_view path) noexcept {
+    return path.substr(0, path.find('?'));
+}
+
+[[nodiscard]] constexpr bool PathMatchesExactly(
     std::string_view configured,
     std::string_view actual) noexcept {
-    const std::string_view expected = configured.empty()
-        ? std::string_view("/")
-        : configured;
-    if (const size_t query = actual.find('?'); query != std::string_view::npos) {
-        actual = actual.substr(0, query);
-    }
+    return PathWithoutQuery(actual) == EffectiveHttpPath(configured);
+}
+
+[[nodiscard]] constexpr bool PathPrefixMatchesSegment(
+    std::string_view configured,
+    std::string_view actual) noexcept {
+    const std::string_view expected = EffectiveHttpPath(configured);
+    actual = PathWithoutQuery(actual);
     if (!actual.starts_with(expected)) {
         return false;
     }

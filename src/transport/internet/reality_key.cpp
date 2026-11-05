@@ -1,10 +1,11 @@
 #include "acppnode/transport/internet/reality_key.hpp"
+#include "acppnode/core/naming.hpp"
+#include "acppnode/common/binary_text_codec.hpp"
 
 #include <openssl/evp.h>
 #include <openssl/nid.h>
 
 #include <array>
-#include <cctype>
 #include <memory>
 
 namespace acpp::transport::internet {
@@ -17,50 +18,17 @@ struct EvpPkeyDeleter {
 };
 using UniquePkey = std::unique_ptr<EVP_PKEY, EvpPkeyDeleter>;
 
-int Base64UrlValue(char value) noexcept {
-    if (value >= 'A' && value <= 'Z') return value - 'A';
-    if (value >= 'a' && value <= 'z') return value - 'a' + 26;
-    if (value >= '0' && value <= '9') return value - '0' + 52;
-    if (value == '-' || value == '+') return 62;
-    if (value == '_' || value == '/') return 63;
-    return -1;
-}
-
 template <std::size_t N>
 tl::expected<std::array<uint8_t, N>, RealityKeyError>
 DecodeFixedBase64Url(std::string_view value) noexcept {
-    while (!value.empty() && value.back() == '=') {
-        value.remove_suffix(1);
-    }
     constexpr std::size_t kEncodedSize = (N * 8 + 5) / 6;
+    static_assert(Base64UrlDecodedSize(kEncodedSize) == N);
+    std::array<uint8_t, N> decoded{};
     if (value.size() != kEncodedSize) {
         return tl::unexpected(RealityKeyError::InvalidFormat);
     }
-
-    std::array<uint8_t, N> decoded{};
-    std::size_t output = 0;
-    uint32_t accumulator = 0;
-    unsigned int bit_count = 0;
-    for (const char character : value) {
-        if (character == '+' || character == '/') {
-            return tl::unexpected(RealityKeyError::InvalidFormat);
-        }
-        const int digit = Base64UrlValue(character);
-        if (digit < 0) {
-            return tl::unexpected(RealityKeyError::InvalidFormat);
-        }
-        accumulator = (accumulator << 6) | static_cast<uint32_t>(digit);
-        bit_count += 6;
-        if (bit_count >= 8) {
-            bit_count -= 8;
-            if (output >= decoded.size()) {
-                return tl::unexpected(RealityKeyError::InvalidFormat);
-            }
-            decoded[output++] = static_cast<uint8_t>(accumulator >> bit_count);
-            accumulator &= bit_count == 0 ? 0u : (uint32_t{1} << bit_count) - 1;
-        }
-    }
-    if (output != decoded.size() || accumulator != 0) {
+    const auto result = DecodeBase64Url(value, decoded);
+    if (!result || result->nonzero_pad_bits) {
         return tl::unexpected(RealityKeyError::InvalidFormat);
     }
     return decoded;
@@ -70,9 +38,6 @@ DecodeFixedBase64Url(std::string_view value) noexcept {
 
 tl::expected<RealityKey, RealityKeyError>
 ParseRealityKey(std::string_view value) noexcept {
-    if (!value.empty() && value.back() == '=') {
-        return tl::unexpected(RealityKeyError::InvalidFormat);
-    }
     return DecodeFixedBase64Url<kRealityKeySize>(value);
 }
 
@@ -92,9 +57,6 @@ ParseRealityMldsa65Seed(std::string_view value) noexcept {
 
 tl::expected<RealityMldsa65PublicKey, RealityKeyError>
 ParseRealityMldsa65PublicKey(std::string_view value) noexcept {
-    if (!value.empty() && value.back() == '=') {
-        return tl::unexpected(RealityKeyError::InvalidFormat);
-    }
     auto pub = DecodeFixedBase64Url<kRealityMldsa65PublicKeySize>(value);
     if (!pub) {
         return tl::unexpected(pub.error());
@@ -107,49 +69,9 @@ ParseRealityMldsa65PublicKey(std::string_view value) noexcept {
     return *pub;
 }
 
-std::optional<RealityMldsa65PublicKey>
-DeriveRealityMldsa65PublicKeyFromSeed(const RealityKey& seed) noexcept {
-    UniquePkey pkey(EVP_PKEY_pqdsa_new_raw_private_key(
-        NID_MLDSA65, seed.data(), seed.size()));
-    if (!pkey) {
-        return std::nullopt;
-    }
-    RealityMldsa65PublicKey pub{};
-    std::size_t pub_len = pub.size();
-    if (EVP_PKEY_get_raw_public_key(pkey.get(), pub.data(), &pub_len) != 1 ||
-        pub_len != pub.size()) {
-        return std::nullopt;
-    }
-    return pub;
-}
-
-std::string EncodeRealityBase64Url(std::span<const uint8_t> bytes) {
-    static constexpr char kAlphabet[] =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    std::string out;
-    out.reserve((bytes.size() * 8 + 5) / 6);
-    uint32_t accumulator = 0;
-    unsigned int bit_count = 0;
-    for (const uint8_t byte : bytes) {
-        accumulator = (accumulator << 8) | byte;
-        bit_count += 8;
-        while (bit_count >= 6) {
-            bit_count -= 6;
-            out.push_back(kAlphabet[(accumulator >> bit_count) & 0x3f]);
-        }
-    }
-    if (bit_count > 0) {
-        out.push_back(kAlphabet[(accumulator << (6 - bit_count)) & 0x3f]);
-    }
-    return out;
-}
-
 std::optional<std::string>
 NormalizeRealityFingerprint(std::string_view value) {
-    std::string normalized(value);
-    for (char& ch : normalized) {
-        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-    }
+    const std::string normalized = naming::LowerAscii(std::string(value));
     if (normalized.empty() ||
         normalized == "chrome" ||
         normalized == "firefox" ||

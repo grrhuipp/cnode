@@ -24,24 +24,8 @@ enum class StreamEndpointRole {
     Outbound,
 };
 
-class SslContext;
-
-struct PreparedTlsContextHolder {
-    mutable std::shared_ptr<SslContext> server_ctx;
-    mutable std::shared_ptr<SslContext> client_ctx;
-
-    PreparedTlsContextHolder() = default;
-    PreparedTlsContextHolder(const PreparedTlsContextHolder&) noexcept {}
-    PreparedTlsContextHolder& operator=(const PreparedTlsContextHolder&) noexcept {
-        server_ctx.reset();
-        client_ctx.reset();
-        return *this;
-    }
-    PreparedTlsContextHolder(PreparedTlsContextHolder&&) noexcept = default;
-    PreparedTlsContextHolder& operator=(PreparedTlsContextHolder&&) noexcept = default;
-};
-
 struct XHttpDownloadSettings;
+class TransportSecurity;
 
 // ============================================================================
 // 传输模式缓存（初始化期归一化，运行时零字符串比较）
@@ -133,6 +117,8 @@ struct GrpcConfig {
     std::string user_agent;
     bool multi_mode = false;
     std::optional<uint32_t> initial_window_size;
+    // Derived by stream-settings normalization from RequestPath().
+    std::string request_path;
 
     static GrpcConfig FromJson(const json::object& j);
     [[nodiscard]] std::string RequestPath() const;
@@ -141,22 +127,52 @@ struct GrpcConfig {
 // ============================================================================
 // XHTTP / SplitHTTP 传输配置
 // ============================================================================
+// Xray-core accepts exactly these modes; "" means auto.
+enum class XHttpMode : uint8_t {
+    Auto,
+    PacketUp,
+    StreamUp,
+    StreamOne,
+};
+
+[[nodiscard]] constexpr std::string_view XHttpModeName(XHttpMode mode) noexcept {
+    switch (mode) {
+    case XHttpMode::PacketUp: return "packet-up";
+    case XHttpMode::StreamUp: return "stream-up";
+    case XHttpMode::StreamOne: return "stream-one";
+    case XHttpMode::Auto: break;
+    }
+    return "auto";
+}
+
 struct XHttpConfig {
     std::string path = std::string(constants::binding::kRootPath);
     std::string host;
-    std::string mode;
+    XHttpMode mode = XHttpMode::Auto;
     transport::internet::HttpHeaders headers;
     std::shared_ptr<const XHttpDownloadSettings> download_settings;
 
     bool no_grpc_header = false;
     bool no_sse_header = false;
+    // Derived by stream-settings normalization from NormalizedPath().
+    std::string normalized_path;
+    // Runtime identity of this inbound configuration generation, never parsed
+    // from the wire. Separates equal session ids on different listeners.
+    std::string session_namespace;
 
     static XHttpConfig FromJson(const json::object& j);
     [[nodiscard]] std::string NormalizedPath() const;
-    [[nodiscard]] bool IsStreamOne() const noexcept;
-    [[nodiscard]] bool AcceptsStreamOne() const noexcept;
-    [[nodiscard]] bool AcceptsPacketUp() const noexcept;
-    [[nodiscard]] bool AcceptsStreamUp() const noexcept;
+    [[nodiscard]] bool IsStreamOne() const noexcept { return mode == XHttpMode::StreamOne; }
+    [[nodiscard]] bool AcceptsStreamOne() const noexcept {
+        return mode == XHttpMode::Auto || mode == XHttpMode::StreamOne ||
+               mode == XHttpMode::StreamUp;
+    }
+    [[nodiscard]] bool AcceptsPacketUp() const noexcept {
+        return mode == XHttpMode::Auto || mode == XHttpMode::PacketUp;
+    }
+    [[nodiscard]] bool AcceptsStreamUp() const noexcept {
+        return mode == XHttpMode::Auto || mode == XHttpMode::StreamUp;
+    }
 };
 
 // ============================================================================
@@ -235,11 +251,16 @@ struct StreamSettings {
     GrpcConfig grpc;           // 当 network == "grpc" 时生效
     XHttpConfig xhttp;          // 当 network == "xhttp" / "splithttp" 时生效
 
-    PreparedTlsContextHolder prepared_tls;
     // 归一化后的缓存字段（热路径使用）
     NetworkMode  network_mode  = NetworkMode::Tcp;
     SecurityMode security_mode = SecurityMode::None;
     uint8_t      flags         = kFlagNone;
+    // Explicit outbound Host/:authority of the ws/httpupgrade/grpc/xhttp
+    // layer; empty means derive it from the dial address.
+    std::string configured_http_host;
+    // Configuration-prepared, read-only security shared by all physical domains.
+    // Not part of wire configuration identity; rebuild on config changes.
+    std::shared_ptr<const TransportSecurity> prepared_security;
 
     bool IsTls() const noexcept { return (flags & kFlagTls) != 0; }
     bool IsReality() const noexcept { return (flags & kFlagReality) != 0; }
@@ -275,6 +296,14 @@ struct OutboundStreamDefaults {
 // Cold-path value transformations. The source remains unchanged, including
 // when normalization or default construction fails to allocate.
 [[nodiscard]] StreamSettings NormalizeStreamSettings(const StreamSettings& source);
+// The one network-name classification (case-insensitive) used by normalization;
+// lets builders select the transport sub-config before normalizing once.
+[[nodiscard]] NetworkMode ParseNetworkMode(std::string_view network) noexcept;
+// Concrete XHTTP client mode; auto follows Xray-core: downloadSettings →
+// stream-up, REALITY → stream-one, TLS without an http/1.1-only ALPN →
+// stream-up, otherwise packet-up. Never returns XHttpMode::Auto.
+[[nodiscard]] XHttpMode ResolveXHttpOutboundMode(const StreamSettings& settings) noexcept;
+
 [[nodiscard]] StreamSettings NormalizeOutboundStreamSettings(
     const StreamSettings& source, const OutboundStreamDefaults& defaults = {});
 

@@ -39,7 +39,7 @@ struct FixtureState {
     unsigned created = 0;
     unsigned destroyed = 0;
     bool wrong_thread = false;
-    bool invalid_limiter = false;
+    std::weak_ptr<ConnectionLimiter> limiter;
 };
 thread_local FixtureState* fixture = nullptr;
 
@@ -48,16 +48,14 @@ public:
     std::vector<OnlineDevice> GetOnlineDevices(std::string_view) const override { return {}; }
 };
 
-// Only the local protocol factory receives the capability. The fixture never
-// publishes it to the test coordinator or retains it outside the Worker.
+// Observe actor identity without extending its lifetime. Request admission still
+// travels through the real Worker handlers and physical session capabilities.
 class HoldingInbound final : public Inbound {
 public:
-    HoldingInbound(FixtureState& state, ConnectionLimiter& limiter)
-        : state_(state), limiter_(limiter) { ++state_.created; }
+    explicit HoldingInbound(FixtureState& state)
+        : state_(state) { ++state_.created; }
     ~HoldingInbound() override {
         state_.wrong_thread |= std::this_thread::get_id() != state_.owner;
-        // Old handlers must still be able to borrow the limiter at destruction.
-        state_.invalid_limiter |= limiter_.IsBanned("fixture", "127.0.0.1");
         ++state_.destroyed;
     }
     net::awaitable<RelayResult> Process(
@@ -72,7 +70,6 @@ public:
     }
 private:
     FixtureState& state_;
-    ConnectionLimiter& limiter_;
 };
 
 void RegisterProtocol() {
@@ -82,10 +79,16 @@ void RegisterProtocol() {
             return std::make_unique<Runtime>();
         },
         .create_tcp_handler = [](proxyman::inbound::ProtocolRuntime&, StatsShard&,
-                                 ConnectionLimiterPtr limiter,
+                                 ConnectionLimiter* limiter,
                                  const proxyman::inbound::BuildRequest&) -> std::unique_ptr<Inbound> {
-            Require(fixture && limiter, "factory did not receive Worker-local limiter");
-            return std::make_unique<HoldingInbound>(*fixture, *limiter);
+            Require(fixture && limiter, "factory did not receive the shared limiter");
+            if (fixture->created == 0) {
+                fixture->limiter = limiter->weak_from_this();
+            } else {
+                Require(fixture->limiter.lock().get() == limiter,
+                        "handler replacement changed the live admission actor");
+            }
+            return std::make_unique<HoldingInbound>(*fixture);
         },
     });
 }
@@ -95,7 +98,7 @@ net::awaitable<void> Pause(net::io_context& io) {
     co_await timer.async_wait(net::use_awaitable);
 }
 
-net::awaitable<void> Register(Worker& worker, std::string tag) {
+void Register(Worker& worker, std::string tag) {
     proxyman::inbound::BuildRequest request{
         .tag = tag, .protocol = std::string(kProtocol), .settings = {}};
     proxyman::inbound::ReceiverSettings receiver{
@@ -103,18 +106,18 @@ net::awaitable<void> Register(Worker& worker, std::string tag) {
         .stream_settings = {},
         .dispatch_policy = {{}, routing::ForceOutbound{"unused"}},
         .proxy_protocol = ProxyProtocolMode::Off};
-    Require(co_await worker.RegisterInboundTask(std::move(request), std::move(receiver)),
+    Require(worker.RegisterInbound(std::move(request), std::move(receiver)),
             "inbound registration failed");
 }
 
 net::awaitable<uint16_t> Listen(net::io_context& io, Worker& worker, std::string tag) {
-    co_await Register(worker, tag);
+    Register(worker, tag);
     tcp::acceptor reservation(io, {net::ip::address_v4::loopback(), 0});
     const auto port = reservation.local_endpoint().port();
     reservation.close();
     const auto listen = InboundListen::Parse("127.0.0.1");
     Require(listen.has_value(), "loopback listen parsing failed");
-    Require(co_await worker.AddListenerTask(
+    Require(worker.AddListener(
                 PortBinding{.port = port, .protocol = std::string(kProtocol), .tag = tag, .listen = *listen}),
             "TCP listener failed");
     co_return port;
@@ -138,7 +141,7 @@ net::awaitable<tcp::socket> Connect(net::io_context& io, uint16_t port, bool adm
             Require(!ec && count == 1 && marker[0] == 'A', "connection budget rejected an eligible request");
         } else {
             Require(count == 0 && (ec == net::error::eof || ec == net::error::connection_reset),
-                    "different inbound tag bypassed the Worker budget");
+                    "different inbound tag bypassed the shared connection budget");
         }
         co_return std::move(client);
     }
@@ -146,7 +149,7 @@ net::awaitable<tcp::socket> Connect(net::io_context& io, uint16_t port, bool adm
 
 net::awaitable<void> WaitActive(net::io_context& io, Worker& worker, uint32_t expected) {
     const auto deadline = std::chrono::steady_clock::now() + 3s;
-    while ((co_await worker.CollectRuntimeStatsTask(false)).active_connections != expected) {
+    while ((co_await worker.CollectRuntimeStats(false)).active_connections != expected) {
         Require(std::chrono::steady_clock::now() < deadline, "active request guards did not drain");
         co_await Pause(io);
     }
@@ -157,18 +160,15 @@ net::awaitable<void> Exercise(net::io_context& io, Worker& worker, FixtureState&
     std::exception_ptr failure;
     std::optional<tcp::socket> shutdown_client;
     try {
-        co_await worker.StartRuntimeTask();
-        const auto memory = (co_await worker.CollectRuntimeStatsTask(false)).memory;
-        Require(memory.pool_direct_bytes >= sizeof(ConnectionLimiter),
-                "Worker limiter was not allocated from its PMR pool");
+        worker.StartRuntime();
         const auto first_port = co_await Listen(io, worker, "first");
         const auto second_port = co_await Listen(io, worker, "second");
         auto first = co_await Connect(io, first_port, true);
         ready.fetch_add(1, std::memory_order_release);
         const auto deadline = std::chrono::steady_clock::now() + 3s;
-        while (ready.load(std::memory_order_acquire) != 2) {
+        while (ready.load(std::memory_order_acquire) < 2) {
             Require(std::chrono::steady_clock::now() < deadline,
-                    "another Worker could not independently consume its budget");
+                    "another Worker could not consume its shared admission slot");
             co_await Pause(io);
         }
         auto second = co_await Connect(io, second_port, !limited);
@@ -176,30 +176,32 @@ net::awaitable<void> Exercise(net::io_context& io, Worker& worker, FixtureState&
         co_await WaitActive(io, worker, 1);
 
         // Repeated startup and a handler replacement must not reset live counts.
-        co_await worker.StartRuntimeTask();
-        co_await Register(worker, "first");
-        const auto before_retirement = state.destroyed;
+        worker.StartRuntime();
+        Register(worker, "first");
         co_await worker.UnregisterListenerTask("first");
-        Require(state.destroyed == before_retirement + 1,
-                "active old handler was destroyed with its replacement");
+        co_await WaitActive(io, worker, 1);
         auto after_remove = co_await Connect(io, second_port, !limited);
         after_remove.close();
         co_await WaitActive(io, worker, 1);
+        ready.fetch_add(1, std::memory_order_release);
+        const auto rejection_deadline = std::chrono::steady_clock::now() + 3s;
+        while (ready.load(std::memory_order_acquire) < 4) {
+            Require(std::chrono::steady_clock::now() < rejection_deadline,
+                    "another Worker did not finish its shared-budget rejection checks");
+            co_await Pause(io);
+        }
 
         first.close();
         co_await WaitActive(io, worker, 0);
-        Require(state.destroyed == before_retirement + 2,
-                "old handler did not retire after its last request");
         shutdown_client.emplace(co_await Connect(io, second_port, true));
     } catch (...) {
         failure = std::current_exception();
     }
-    if (!failure) co_await Register(worker, "idle");
+    if (!failure) Register(worker, "idle");
     worker.RequestStop();
     co_await worker.AsyncJoin();
     co_await worker.AsyncJoin();
-    Require(state.created == state.destroyed && !state.wrong_thread &&
-                !state.invalid_limiter,
+    Require(state.created == state.destroyed && !state.wrong_thread,
             "Worker join returned before owner-thread handler completion");
     if (failure) std::rethrow_exception(failure);
     std::array<char, 1> byte{};
@@ -210,8 +212,17 @@ net::awaitable<void> Exercise(net::io_context& io, Worker& worker, FixtureState&
 }
 
 void RunCase(app::dns::DNSWorker& dns, uint32_t global, uint32_t per_ip, bool limited) {
+    net::io_context control;
+    auto coordinator = std::make_shared<GroupCoordinator>(control);
+    coordinator->Start();
+    std::exception_ptr control_failure;
+    std::thread control_thread([&] {
+        try { control.run(); }
+        catch (...) { control_failure = std::current_exception(); }
+    });
     std::atomic<unsigned> ready{0};
     std::array<std::exception_ptr, 2> failures{};
+    std::array<std::weak_ptr<ConnectionLimiter>, 2> limiter_identities;
     std::array<std::thread, 2> threads;
     for (uint32_t id = 0; id < threads.size(); ++id) {
         threads[id] = std::thread([&, id] {
@@ -220,7 +231,6 @@ void RunCase(app::dns::DNSWorker& dns, uint32_t global, uint32_t per_ip, bool li
                 StatsShard stats;
                 FixtureState state;
                 fixture = &state;
-                const auto baseline = memory::ThreadPool().GetFootprint().direct_bytes;
                 WorkerRuntimeConfig config;
                 config.workers = 2;
                 config.limits.max_connections = global;
@@ -228,19 +238,16 @@ void RunCase(app::dns::DNSWorker& dns, uint32_t global, uint32_t per_ip, bool li
                 config.timeouts.idle = 0;
                 config.timeouts.read = 0;
                 auto worker = std::make_unique<Worker>(id, io, config, stats, dns);
-                Require(memory::ThreadPool().GetFootprint().direct_bytes == baseline,
-                        "limiter allocated before Worker startup");
+                worker->SetGroupCoordinator(coordinator);
                 net::co_spawn(io, Exercise(io, *worker, state, ready, limited),
                     [&](std::exception_ptr error) { failures[id] = error; });
                 io.run();
                 worker.reset();
                 io.restart();
                 while (io.poll() != 0) {}
-                Require(state.created == state.destroyed && !state.wrong_thread &&
-                            !state.invalid_limiter,
-                        "handler teardown lost its owning thread or live limiter");
-                Require(memory::ThreadPool().GetFootprint().direct_bytes == baseline,
-                        "Worker teardown retained its limiter PMR allocation");
+                Require(state.created == state.destroyed && !state.wrong_thread,
+                        "handler teardown lost its owning execution domain");
+                limiter_identities[id] = state.limiter;
                 fixture = nullptr;
             } catch (...) {
                 failures[id] = std::current_exception();
@@ -248,7 +255,24 @@ void RunCase(app::dns::DNSWorker& dns, uint32_t global, uint32_t per_ip, bool li
         });
     }
     for (auto& thread : threads) thread.join();
+    net::co_spawn(control, [](std::shared_ptr<GroupCoordinator> owner) -> net::awaitable<void> {
+        owner->CloseAdmission();
+        co_await owner->AsyncJoin();
+        owner->ReleaseServices();
+        co_await owner->Finalize();
+    }(coordinator), [&](std::exception_ptr error) {
+        if (error) control_failure = error;
+    });
+    control_thread.join();
+    if (control_failure) std::rethrow_exception(control_failure);
     for (const auto& failure : failures) if (failure) std::rethrow_exception(failure);
+    Require(!limiter_identities[0].owner_before(limiter_identities[1]) &&
+            !limiter_identities[1].owner_before(limiter_identities[0]),
+            "Workers did not share the same admission actor");
+    for (const auto& limiter : limiter_identities) {
+        Require(limiter.expired(),
+                "coordinator shutdown retained an admission actor or reservation return");
+    }
 }
 } // namespace
 

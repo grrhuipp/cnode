@@ -475,8 +475,7 @@ void TestDNSWorkerCrossExecutorStop() {
 }  // namespace
 
 void* operator new(std::size_t size) {
-    // MSVC adds alignment bookkeeping to large vector allocations.
-    if (fail_size && size >= fail_size && size - fail_size <= 128) {
+    if (fail_size && size == fail_size) {
         fail_size = 0;
         ++injected_failures;
         throw std::bad_alloc();

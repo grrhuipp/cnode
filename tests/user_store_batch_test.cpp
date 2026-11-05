@@ -48,9 +48,11 @@ int main() {
     const UserSet first_new = PreparedVmessUsers{
         PreparedVmessUser{
             .uuid = "new-first-1",
+            .uuid_bytes = {1},
             .profile = {.user_id = 201, .email = {}}},
         PreparedVmessUser{
             .uuid = "new-first-2",
+            .uuid_bytes = {2},
             .profile = {.user_id = 202, .email = {}}}};
     const UserSet second_new = PreparedTrojanUsers{PreparedTrojanUser{
         .password_hash = "new-second",

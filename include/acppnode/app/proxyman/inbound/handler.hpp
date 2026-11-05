@@ -1,13 +1,14 @@
 #pragma once
 
 #include "acppnode/common/allocator.hpp"
-#include "acppnode/app/rate_limiter_fwd.hpp"
+#include "acppnode/app/rate_limiter.hpp"
 #include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
 #include "acppnode/app/stats.hpp"
 #include "acppnode/features/routing/dispatcher.hpp"
 #include "acppnode/infra/config_types.hpp"
 #include "acppnode/proxy/inbound.hpp"
 #include "acppnode/transport/async_stream.hpp"
+#include "acppnode/transport/internet/transport_security.hpp"
 
 #include <memory>
 #include <string_view>
@@ -22,17 +23,24 @@ class DNS;
 namespace acpp::proxyman::inbound {
 
 // ============================================================================
-// Handler - per-Worker inbound handler
-//
-// 对齐 xray-core features/inbound.Handler 的职责：一个 handler 绑定 tag、
-// receiver settings 和 proxy.Inbound 实例。Worker 仍拥有
-// SO_REUSEPORT socket，但不再分散持有 receiver settings 与协议对象。
+// Handler - address-stable session-domain inbound transport host.
+// Listener descriptors may use an eagerly prepared protocol; physical domains
+// create protocol state only when a real logical request reaches the proxy.
 // ============================================================================
 class Handler final
     : public memory::ThreadAllocated
     , public std::enable_shared_from_this<Handler> {
 public:
+    class ProtocolProvider {
+    public:
+        virtual ~ProtocolProvider() = default;
+        virtual Inbound& GetProxy() = 0;
+    };
+    // Prepared TransportSecurity is shared; SSL contexts are never rebuilt for
+    // each short HTTP packet upload.
     Handler(inbound::ReceiverSettings receiver, std::unique_ptr<Inbound> proxy,
+            ConnectionLimiter& limiter);
+    Handler(inbound::ReceiverSettings receiver, ProtocolProvider& provider,
             ConnectionLimiter& limiter);
 
     Handler(const Handler&) = delete;
@@ -69,10 +77,12 @@ private:
         const TimeoutsConfig& timeouts,
         std::unique_ptr<AsyncStream> stream,
         session::Context& ctx,
-        size_t& active_children);
+        const std::shared_ptr<ConnectionLimiter::Family>& family);
 
     inbound::ReceiverSettings receiver_;
+    TransportSecurity security_;
     std::unique_ptr<Inbound> proxy_;
+    ProtocolProvider* provider_ = nullptr;
     ConnectionLimiter& limiter_;
 };
 

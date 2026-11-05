@@ -7,11 +7,15 @@
 #include "acppnode/common/asio_types.hpp"
 #include "acppnode/infra/log.hpp"
 
+#include <openssl/bio.h>
+#include <openssl/err.h>
+#include <openssl/pem.h>
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
 
 #include <array>
 #include <cstring>
+#include <memory>
 #include <string>
 
 namespace acpp {
@@ -28,7 +32,102 @@ uint16_t ToOpenSslVersion(TlsVersion version) noexcept {
     return 0;
 }
 
+[[nodiscard]] bssl::UniquePtr<BIO> PemReader(const std::string& pem) {
+    return bssl::UniquePtr<BIO>(BIO_new_mem_buf(
+        pem.data(), static_cast<ossl_ssize_t>(pem.size())));
+}
+
+// PEM readers report the end of input as PEM_R_NO_START_LINE; anything else
+// is a malformed block. Clears the queue so no stale error reaches later
+// SSL_get_error calls on this thread.
+[[nodiscard]] bool ConsumePemEndOfInput() noexcept {
+    const uint32_t error = ERR_peek_last_error();
+    ERR_clear_error();
+    return ERR_GET_LIB(error) == ERR_LIB_PEM &&
+        ERR_GET_REASON(error) == PEM_R_NO_START_LINE;
+}
+
+// In-memory SSL_CTX_load_verify_locations: like X509_load_cert_crl_file it
+// reads every PEM_X509_INFO block (including TRUSTED CERTIFICATE and CRLs);
+// a bundle without any certificate or CRL is rejected.
+[[nodiscard]] bool ConfigureTlsTrustedCaPem(SSL_CTX* context, const std::string& pem) {
+    auto reader = PemReader(pem);
+    X509_STORE* store = SSL_CTX_get_cert_store(context);
+    if (!reader || !store) return false;
+    struct InfoStackFree {
+        void operator()(STACK_OF(X509_INFO)* infos) const noexcept {
+            sk_X509_INFO_pop_free(infos, X509_INFO_free);
+        }
+    };
+    std::unique_ptr<STACK_OF(X509_INFO), InfoStackFree> infos(
+        PEM_X509_INFO_read_bio(reader.get(), nullptr, nullptr, nullptr));
+    if (!infos) {
+        ERR_clear_error();
+        return false;
+    }
+    size_t loaded = 0;
+    for (size_t i = 0; i < sk_X509_INFO_num(infos.get()); ++i) {
+        const X509_INFO* info = sk_X509_INFO_value(infos.get(), i);
+        if (info->x509) {
+            if (X509_STORE_add_cert(store, info->x509) != 1) {
+                ERR_clear_error();
+                return false;
+            }
+            ++loaded;
+        }
+        if (info->crl) {
+            if (X509_STORE_add_crl(store, info->crl) != 1) {
+                ERR_clear_error();
+                return false;
+            }
+            ++loaded;
+        }
+    }
+    ERR_clear_error();
+    return loaded != 0;
+}
+
 }  // namespace
+
+bool ConfigureTlsCertificatePem(SSL_CTX* context, const TlsPemMaterial& pem) {
+    auto chain = PemReader(pem.certificate_chain);
+    if (!chain) return false;
+    bssl::UniquePtr<X509> leaf(
+        PEM_read_bio_X509_AUX(chain.get(), nullptr, nullptr, nullptr));
+    if (!leaf || SSL_CTX_use_certificate(context, leaf.get()) != 1) {
+        ERR_clear_error();
+        LOG_ERROR("TLS certificate file does not start with a valid PEM certificate");
+        return false;
+    }
+    while (bssl::UniquePtr<X509> intermediate{
+               PEM_read_bio_X509(chain.get(), nullptr, nullptr, nullptr)}) {
+        if (SSL_CTX_add1_chain_cert(context, intermediate.get()) != 1) {
+            ERR_clear_error();
+            LOG_ERROR("Failed to install TLS certificate chain");
+            return false;
+        }
+    }
+    if (!ConsumePemEndOfInput()) {
+        LOG_ERROR("TLS certificate file contains a malformed PEM block");
+        return false;
+    }
+
+    auto key_reader = PemReader(pem.private_key);
+    bssl::UniquePtr<EVP_PKEY> key(key_reader
+        ? PEM_read_bio_PrivateKey(key_reader.get(), nullptr, nullptr, nullptr)
+        : nullptr);
+    if (!key || SSL_CTX_use_PrivateKey(context, key.get()) != 1) {
+        ERR_clear_error();
+        LOG_ERROR("TLS private key file does not contain a valid PEM private key");
+        return false;
+    }
+    if (SSL_CTX_check_private_key(context) != 1) {
+        ERR_clear_error();
+        LOG_ERROR("TLS private key does not match certificate");
+        return false;
+    }
+    return true;
+}
 
 bool ConfigureTlsProtocolVersions(
     SSL_CTX* context,
@@ -41,12 +140,9 @@ bool ConfigureTlsProtocolVersions(
         SSL_CTX_set_max_proto_version(context, maximum) == 1;
 }
 
-namespace {
-
-template <typename ByteContainer>
-bool EncodeTlsAlpnProtocolsImpl(
+bool EncodeTlsAlpnProtocols(
     std::span<const std::string> protocols,
-    ByteContainer& wire) {
+    std::vector<unsigned char>& wire) {
     wire.clear();
     if (!IsValidTlsAlpn(protocols)) return false;
 
@@ -62,18 +158,12 @@ bool EncodeTlsAlpnProtocolsImpl(
     return true;
 }
 
-}  // namespace
-
-bool EncodeTlsAlpnProtocols(
-    std::span<const std::string> protocols,
-    std::vector<unsigned char>& wire) {
-    return EncodeTlsAlpnProtocolsImpl(protocols, wire);
-}
-
-bool EncodeTlsAlpnProtocols(
-    std::span<const std::string> protocols,
-    memory::ByteVector& wire) {
-    return EncodeTlsAlpnProtocolsImpl(protocols, wire);
+bool ConfigureTlsClientAlpn(
+    SSL_CTX* context, std::span<const std::string> protocols) {
+    std::vector<unsigned char> wire;
+    // SSL_new copies the context list, so no handshake encodes it again.
+    return EncodeTlsAlpnProtocols(protocols, wire) &&
+        (wire.empty() || SSL_CTX_set_alpn_protos(context, wire.data(), wire.size()) == 0);
 }
 
 bool ConfigureTlsServerIdentity(
@@ -117,32 +207,27 @@ std::unique_ptr<SslContext> SslContext::CreateClient(const TlsConfig& config) {
         SSL_CTX_free(ctx);
         return nullptr;
     }
+    if (!ConfigureTlsClientAlpn(ctx, config.alpn)) {
+        LOG_ERROR("Invalid TLS client ALPN policy");
+        SSL_CTX_free(ctx);
+        return nullptr;
+    }
 
     if (config.cert_file.empty() != config.key_file.empty()) {
         LOG_ERROR("TLS client certificate and private key must be configured together");
         SSL_CTX_free(ctx);
         return nullptr;
     }
-    if (config.HasCertificatePair()) {
-        if (SSL_CTX_use_certificate_chain_file(
-                ctx, config.cert_file.c_str()) <= 0) {
-            LOG_ERROR("Failed to load TLS client certificate: {}",
-                      config.cert_file);
-            SSL_CTX_free(ctx);
-            return nullptr;
-        }
-        if (SSL_CTX_use_PrivateKey_file(
-                ctx, config.key_file.c_str(), SSL_FILETYPE_PEM) <= 0) {
-            LOG_ERROR("Failed to load TLS client private key: {}",
-                      config.key_file);
-            SSL_CTX_free(ctx);
-            return nullptr;
-        }
-        if (SSL_CTX_check_private_key(ctx) != 1) {
-            LOG_ERROR("TLS client private key does not match certificate");
-            SSL_CTX_free(ctx);
-            return nullptr;
-        }
+    if ((config.HasCertificatePair() || !config.ca_file.empty()) && !config.pem) {
+        LOG_ERROR("TLS client files were not loaded with the configuration");
+        SSL_CTX_free(ctx);
+        return nullptr;
+    }
+    if (config.HasCertificatePair() &&
+        !ConfigureTlsCertificatePem(ctx, *config.pem)) {
+        LOG_ERROR("Failed to load TLS client certificate: {}", config.cert_file);
+        SSL_CTX_free(ctx);
+        return nullptr;
     }
 
     if (config.allow_insecure && !config.ca_file.empty()) {
@@ -154,11 +239,10 @@ std::unique_ptr<SslContext> SslContext::CreateClient(const TlsConfig& config) {
         SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nullptr);
     } else {
         SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nullptr);
-        const int trust_loaded = config.ca_file.empty()
-            ? SSL_CTX_set_default_verify_paths(ctx)
-            : SSL_CTX_load_verify_locations(
-                ctx, config.ca_file.c_str(), nullptr);
-        if (trust_loaded != 1) {
+        const bool trust_loaded = config.ca_file.empty()
+            ? SSL_CTX_set_default_verify_paths(ctx) == 1
+            : ConfigureTlsTrustedCaPem(ctx, config.pem->trusted_ca);
+        if (!trust_loaded) {
             LOG_ERROR("Failed to load TLS client trust store: {}",
                       config.ca_file.empty() ? "system defaults"
                                              : config.ca_file);
@@ -170,10 +254,22 @@ std::unique_ptr<SslContext> SslContext::CreateClient(const TlsConfig& config) {
     return std::unique_ptr<SslContext>(new SslContext(ctx));
 }
 
-SslContext::~SslContext() {
-    if (ctx_) {
-        SSL_CTX_free(ctx_);
-    }
+SslContext::SslContext(SSL_CTX* ctx, std::unique_ptr<ContextState> context_state)
+    : ctx_(ctx) {
+    std::unique_ptr<SSL_CTX, decltype(&SSL_CTX_free)> guard(ctx, SSL_CTX_free);
+    static const int index = SSL_CTX_get_ex_new_index(
+        0, nullptr, nullptr, nullptr,
+        [](void*, void* ptr, CRYPTO_EX_DATA*, int, long, void*) {
+            delete static_cast<SharedState*>(ptr);
+        });
+    auto state = std::make_unique<SharedState>();
+    state->context = std::move(context_state);
+    if (index < 0 || SSL_CTX_set_ex_data(ctx_, index, state.get()) != 1)
+        throw std::bad_alloc();
+    shared_state_ = state.release();
+    native_owner_ = std::shared_ptr<SSL_CTX>(guard.release(), SSL_CTX_free);
 }
+
+SslContext::~SslContext() = default;
 
 }  // namespace acpp

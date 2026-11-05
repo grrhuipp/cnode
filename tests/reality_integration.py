@@ -8,6 +8,7 @@
 
 import argparse
 import asyncio
+import copy
 import http.server
 import json
 import os
@@ -19,6 +20,7 @@ import subprocess
 import threading
 import time
 import uuid
+from tls_fragmentation import FragmentingProxy
 
 USER = uuid.UUID("11111111-1111-4111-8111-111111111111")
 PAYLOAD = b"reality-end-to-end-verification-payload"
@@ -297,6 +299,10 @@ async def main(binary: Path, root: Path):
     port_xver0 = free_port()
     port_xver1 = free_port()
     port_xver2 = free_port()
+    fragmented_chrome = await FragmentingProxy(port_xver0).start()
+    fragmented_firefox = await FragmentingProxy(port_xver1).start()
+    port_classic = free_port()
+    fragmented_classic = await FragmentingProxy(port_classic).start()
 
     server_cfg = {
         "config.json": {"workers": 1, "log": {"level": "debug"}},
@@ -373,6 +379,11 @@ async def main(binary: Path, root: Path):
         ],
         "outbounds.json": [{"tag": "direct", "protocol": "freedom"}],
     }
+    classic_server = copy.deepcopy(server_cfg["inbounds.json"][0])
+    classic_server["tag"] = "reality-classic"
+    classic_server["port"] = port_classic
+    del classic_server["streamSettings"]["realitySettings"]["mldsa65Seed"]
+    server_cfg["inbounds.json"].append(classic_server)
     write_config_dir(root / "server", server_cfg)
 
     # 4. Configure and start cnode client with 4 VLESS entry inbounds mapped to 4 REALITY outbounds:
@@ -384,6 +395,7 @@ async def main(binary: Path, root: Path):
     entry_firefox = free_port()
     entry_bad_mldsa = free_port()
     entry_spider = free_port()
+    entry_classic = free_port()
 
     client_cfg = {
         "config.json": {"workers": 1, "log": {"level": "debug"}},
@@ -427,7 +439,7 @@ async def main(binary: Path, root: Path):
                 "protocol": "vless",
                 "settings": {
                     "address": "127.0.0.1",
-                    "port": port_xver0,
+                    "port": fragmented_chrome.port,
                     "id": str(USER),
                     "encryption": "none",
                 },
@@ -448,7 +460,7 @@ async def main(binary: Path, root: Path):
                 "protocol": "vless",
                 "settings": {
                     "address": "127.0.0.1",
-                    "port": port_xver1,
+                    "port": fragmented_firefox.port,
                     "id": str(USER),
                     "encryption": "none",
                 },
@@ -508,6 +520,14 @@ async def main(binary: Path, root: Path):
             },
         ],
     }
+    classic_inbound = copy.deepcopy(client_cfg["inbounds.json"][0])
+    classic_inbound.update(tag="in-classic", port=entry_classic, outboundTag="out-classic")
+    classic_outbound = copy.deepcopy(client_cfg["outbounds.json"][0])
+    classic_outbound["tag"] = "out-classic"
+    classic_outbound["settings"]["port"] = fragmented_classic.port
+    del classic_outbound["streamSettings"]["realitySettings"]["mldsa65Verify"]
+    client_cfg["inbounds.json"].append(classic_inbound)
+    client_cfg["outbounds.json"].append(classic_outbound)
     write_config_dir(root / "client", client_cfg)
 
     server_proc = start_cnode(binary, root / "server")
@@ -519,6 +539,11 @@ async def main(binary: Path, root: Path):
 
         resp_firefox = await send_vless_probe(entry_firefox, echo_port)
         assert resp_firefox == b"\x00\x00" + PAYLOAD, f"firefox REALITY failed: {resp_firefox!r}"
+        assert fragmented_chrome.fragmented == 1 and fragmented_firefox.fragmented == 1
+        assert not fragmented_chrome.errors and not fragmented_firefox.errors
+        resp_classic = await send_vless_probe(entry_classic, echo_port)
+        assert resp_classic == b"\x00\x00" + PAYLOAD, f"classic REALITY failed: {resp_classic!r}"
+        assert fragmented_classic.fragmented == 1 and not fragmented_classic.errors
 
         # Test B: Wrong mldsa65Verify public key must fail handshake
         try:
@@ -573,6 +598,9 @@ async def main(binary: Path, root: Path):
     finally:
         stop_cnode(client_proc)
         stop_cnode(server_proc)
+        await fragmented_chrome.close()
+        await fragmented_firefox.close()
+        await fragmented_classic.close()
 
     # Test E: V2Board panel REALITY (tls=2) node sync + client connection
     panel_node_port = free_port()

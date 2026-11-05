@@ -6,6 +6,7 @@
 #include "acppnode/core/constants.hpp"
 #include "acppnode/core/naming.hpp"
 #include "acppnode/infra/config_types.hpp"
+#include "acppnode/transport/internet/transport_security.hpp"
 
 #include <stdexcept>
 
@@ -38,6 +39,46 @@ InboundBuild InboundBuilder(const PanelConfig& panel_config,
         build.stream_settings.tls.cert_file = panel_config.TLSCert;
         build.stream_settings.tls.key_file = panel_config.TLSKey;
         build.stream_settings.tls.server_name = node_config.TLSServerName;
+        LoadTlsPemMaterial(build.stream_settings.tls);
+    }
+
+    // Fill the transport sub-config first: normalization derives cached
+    // fields (gRPC request path, XHTTP path, Host) from it.
+    switch (ParseNetworkMode(build.stream_settings.network)) {
+    case NetworkMode::Ws:
+        build.stream_settings.ws.path = node_config.Path.empty()
+            ? std::string(constants::binding::kRootPath)
+            : node_config.Path;
+        if (!node_config.Host.empty()) {
+            build.stream_settings.ws.headers["Host"] = node_config.Host;
+        }
+        break;
+    case NetworkMode::HttpUpgrade:
+        build.stream_settings.http_upgrade.path = node_config.Path.empty()
+            ? std::string(constants::binding::kRootPath)
+            : node_config.Path;
+        if (!node_config.Host.empty()) {
+            build.stream_settings.http_upgrade.host = node_config.Host;
+        }
+        break;
+    case NetworkMode::Grpc:
+        build.stream_settings.grpc.service_name = !node_config.ServiceName.empty()
+            ? node_config.ServiceName
+            : node_config.Path;
+        if (!node_config.Host.empty()) {
+            build.stream_settings.grpc.authority = node_config.Host;
+        }
+        break;
+    case NetworkMode::XHttp:
+        build.stream_settings.xhttp.path = node_config.Path.empty()
+            ? std::string(constants::binding::kRootPath)
+            : node_config.Path;
+        if (!node_config.Host.empty()) {
+            build.stream_settings.xhttp.host = node_config.Host;
+        }
+        break;
+    default:
+        break;
     }
 
     build.stream_settings = NormalizeStreamSettings(build.stream_settings);
@@ -45,41 +86,18 @@ InboundBuild InboundBuilder(const PanelConfig& panel_config,
         build.stream_settings.security_mode == SecurityMode::Unsupported) {
         throw std::invalid_argument("panel inbound has unsupported stream settings");
     }
-
-    if (build.stream_settings.IsWs()) {
-        build.stream_settings.ws.path = node_config.Path.empty()
-            ? std::string(constants::binding::kRootPath)
-            : node_config.Path;
-        if (!node_config.Host.empty()) {
-            build.stream_settings.ws.headers["Host"] = node_config.Host;
-        }
-    }
-    if (build.stream_settings.IsHttpUpgrade()) {
-        build.stream_settings.http_upgrade.path = node_config.Path.empty()
-            ? std::string(constants::binding::kRootPath)
-            : node_config.Path;
-        if (!node_config.Host.empty()) {
-            build.stream_settings.http_upgrade.host = node_config.Host;
-        }
-    }
-    if (build.stream_settings.IsGrpc()) {
-        build.stream_settings.grpc.service_name = !node_config.ServiceName.empty()
-            ? node_config.ServiceName
-            : node_config.Path;
-        if (!node_config.Host.empty()) {
-            build.stream_settings.grpc.authority = node_config.Host;
-        }
-    }
-    if (build.stream_settings.IsXHttp()) {
-        build.stream_settings.xhttp.path = node_config.Path.empty()
-            ? std::string(constants::binding::kRootPath)
-            : node_config.Path;
-        if (!node_config.Host.empty()) {
-            build.stream_settings.xhttp.host = node_config.Host;
-        }
-    }
+    TransportSecurity::Prepare(build.stream_settings, StreamEndpointRole::Inbound);
     build.sniff.enabled = node_config.SniffEnabled;
-    build.sniff.dest_override = node_config.DestOverride;
+    build.sniff.dest_override = 0;
+    for (const auto& protocol : node_config.DestOverride) {
+        const uint8_t bit = SniffConfig::DestOverrideBit(protocol);
+        if (bit == 0) {
+            throw std::invalid_argument(std::format(
+                "panel inbound '{}' has unsupported sniffing destOverride '{}'",
+                build.tag, protocol));
+        }
+        build.sniff.dest_override |= bit;
+    }
 
     StaticUserConfig protocol_source;
     protocol_source.method = node_config.CypherMethod;

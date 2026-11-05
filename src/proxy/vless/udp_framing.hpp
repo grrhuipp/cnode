@@ -33,6 +33,13 @@ public:
     [[nodiscard]] bool Next(FramedUdpPacket& out);
     void Finish() const;
 
+    // Returns one framed datagram whose buffers carry its packet address, or
+    // `session_target` without one; empty only at a clean EOF. Partial frames
+    // stay in this framer when `src` throws or is cancelled.
+    net::awaitable<buf::MultiBuffer> ReadDatagram(
+        transport::MultiBufferReader& src,
+        const TargetAddress& session_target);
+
 private:
     bool packet_addr_ = false;
     bool failed_ = false;
@@ -44,10 +51,6 @@ net::awaitable<void> WriteUdpDatagram(
     buf::MultiBuffer payload,
     bool packet_addr,
     const TargetAddress* fixed_target = nullptr);
-
-net::awaitable<void> WriteUdpDatagram(
-    transport::MultiBufferWriter& writer,
-    std::span<const net::const_buffer> payload);
 
 net::awaitable<void> WriteUdpDatagram(
     transport::MultiBufferWriter& writer,

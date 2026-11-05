@@ -3,6 +3,7 @@
 #include "acppnode/proxy/outbound.hpp"
 #include "ss_outbound_credentials.hpp"
 #include "acppnode/transport/internet/stream_settings.hpp"
+#include "acppnode/transport/internet/transport_security.hpp"
 #include "acppnode/transport/internet/outbound_bind.hpp"
 
 #include <chrono>
@@ -72,6 +73,7 @@ public:
 private:
     memory::ThreadLocalString tag_;
     std::shared_ptr<const PreparedSettings> prepared_;
+    ::acpp::TransportSecurity security_;  // This Worker's contexts for prepared_->config.stream_settings.
     std::chrono::seconds dial_timeout_;
     ::acpp::app::dns::DNS& dns_service_;
 };

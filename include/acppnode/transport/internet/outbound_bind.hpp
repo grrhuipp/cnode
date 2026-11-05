@@ -44,6 +44,9 @@ public:
         const net::ip::address& remote,
         std::string_view inbound_source_ip,
         uint16_t inbound_source_port) const noexcept;
+    // Local address for the None/Auto/Explicit modes; Ordered binds use Select.
+    [[nodiscard]] std::optional<net::ip::address> BindAddressFor(
+        const tcp::endpoint* inbound_local, const net::ip::address& remote) const noexcept;
 
 private:
     struct Entry {

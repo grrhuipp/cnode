@@ -9,7 +9,7 @@ from anytls_fin_integration import Resources, USER, available_port, tls_settings
 
 PAYLOAD = bytes(range(251)) * 719
 UPGRADE = (b"GET /up HTTP/1.1\r\nHost: localhost\r\n"
-           b"Connection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+           b"Connection: keep-alive\r\ncOnNeCtIoN: UpGrAdE\r\nUpgrade: websocket\r\n\r\n")
 
 
 def transport(tls=False, server=False):

@@ -2,6 +2,16 @@
 
 目标：持续审查并重构，明确职责边界与抽象层次；每轮验证后继续，直到用户要求停止。本记录是阶段检查点，不表示全项目审查完成。
 
+## 2026-11-05 会话域分配与原生完成边界（待统一验证）
+
+- `memory::AllocationDomain` 是不可移动的执行租约根；`ScopedAllocationDomain` 在每个 callback 及其销毁期间取得独占租约并恢复上一域。Worker 控制面仍使用原线程池，同一会话迁移不搬移池、挂起帧或 payload。
+- 池是独立地址稳定宿主。活跃分配和 `ThreadLocalAllocator` / `RingDeque` 的资源句柄保留池，不保留整个会话能力对象；原物理域结束后，同组借出的 Buffer 和空容器仍可使用原资源，最后一个资源持有者退出才销毁池。`SetLeaseGroup` 持有调度器稳定组身份，禁止借用已销毁的 ExecutionDomain 裸指针。
+- 容器默认捕获创建时所属资源；移动/交换转移资源所有权，不因 TLS 变化重新选择释放池。Buffer 访问、池分配/释放及 request arena 的内联分配均检查租约；无租约或未合并异域访问立即拒绝。已合并子域仅在共同 Group 独占执行时互借。
+- Asio native operation 内存使用 `ProcessAllocator`，允许原 reactor 交付或销毁完成；它不接触私有池。UDP 接收和发送均由 reactor 等待 readiness，再由当前 owner 执行非阻塞 payload 系统调用；重等不重置整次操作预算，空 payload 仍发送实际零长 datagram。
+- `TimeoutScheduler::ForIoContext` 在会话内选 `ExecutionDomain::Services()`，域外保留 Worker 服务与缓存；定时器完成绑定当前域 executor，定时器操作内存使用 process resource。Scheduler 仅弱持 domain，避免 service/executor 自循环；能力对象收束任务后调用 `AsyncReleaseForIoContext`，取消事件并等到唯一 native timer 完成交付，不能用一次 post 代替 join。
+- 行为入口：`thread_memory_pool_test.cpp` 覆盖租约拒绝、同域跨线程、原物理域销毁后合并域继续借用原池及完整 RAII 销毁；`asio_operation_allocator_test.cpp` 覆盖真实 TCP、取消、private allocator 隔离、排队 readiness 后迁移和异线程销毁未完成 timer；`timeout_scheduler_test.cpp` 覆盖同 reactor 不同域服务隔离与取消 join；`datagram_socket_test.cpp` 覆盖两种零长发送和迁移后归还原接纳计数。本轮工作代理未执行构建或测试，不能将这些新增场景表述为已验证结果。
+
+
 ## 工作区与验证环境
 
 - 基线：`804d7e7`。
@@ -625,3 +635,30 @@ MSVC Release 全量构建成功；**CTest 145/145，84.79 秒，无跳过**。�
 完整 MSVC Release 构建成功；**CTest 147/147，93.52 秒，无跳过**，其中 gRPC EOF 与隔离测试分别用时 9.01、7.65 秒。证据在临时目录的 `h2-eof-build.log`、`h2-eof-integration.log`（旧夹具失败）、`h2-eof-current-config.log`、`h2-isolation-integration.log`、`h2-suite-build.log`、`h2-suite-ctest.log`，独立逐项结果在 `build/h2-eof-current-config/results.json` 和 `build/h2-isolation-audit/results.json`。未提交、推送或部署。全仓目标仍 active。
 
 补充本轮覆盖审计：原 12 项 EOF 场景中的 raw 测试验证的是出站，不直接执行此次改动的 raw 服务端 EOF 入口。因此另增 raw 服务端 TCP/TLS × 有响应/空响应四项，每项在同一物理连接连续执行 8 个流，校验 48,001 字节上传、目标 EOF、精确响应、响应 END_STREAM 及最后 PING 屏障。Peer 测试端按 raw 模式发送未封装的 VLESS 数据，并使用对应 HTTP path；gRPC 模式不变。扩展后 EOF **16/16** 通过，隔离仍 **6/6**。重复运行 CTest 暴露 bridge 夹具的 remote/local 目录不能已存在，修正为可重复运行；其 FileExistsError 是启动前夹具错误，不作为产品故障。最终重新运行完整套件 **147/147，89.47 秒，无跳过**，日志 `h2-suite-final-ctest.log`，独立扩展报告 `build/h2-eof-with-server/results.json`。这里新增的 raw 服务端场景才是对修改入口的实际网络覆盖，不用旧出站场景替代。
+
+## 2026-11-05：会话组迁移与协议生命周期收束
+
+采用地址稳定的 `ExecutionDomain`、单一执行租约与会话组整体迁移，不采用跨 Worker 包转发，也不把整个入站固定到单个 Worker。跨 Worker 的 XHTTP 请求和共享 H2 物理连接先冻结用户回调、合并组归属，再恢复执行。原 reactor 仅投递就绪通知，实际 socket 读写由当前组 owner 执行。移除源地址 CBPF 亲和；独立会话组仍独立调度。
+
+物理连接 capabilities 按需持有协议运行态和私有分配域；进程级连接／设备配额及认证重放状态通过有界控制入口协作。AnyTLS 池与启用 VLESS Encryption 的跨请求状态拥有独立池执行域，按原准入 Worker、配置快照及 tag 隔离，借用请求先合组，避免短连接销毁健康池或票据缓存。停机关闭准入、收束请求与池任务、释放服务及域根，最后等待域退休；reactor 与保留完成通道在此之前保持存活。
+
+按用户要求恢复 `PROXY auto` 及默认 `auto`，保留 `off/on`。协议验证覆盖 v1/v2 分片、普通流量保留及畸形输入；部署信任边界见 README。HTTP chunk 与 Connection token 解析、H2/gRPC 消费后返还 credit、padding／reset credit 回收、REALITY 跨记录 ClientHello、共享 TLS 上下文、AnyTLS 超时取消和持久流量账本一并接入现有主链路，不保留旧兼容旁路。
+
+验证中修复了两个独立的生命周期问题：已完成 `co_spawn` 的 cancellation slot 仍保有域 executor，阻止真正的 Finalize；TCP 超时先普通关闭再设置 abortive，导致内核已排队数据继续排空。前者在所属执行域完成边界清除 slot，后者在通知与关闭前标记 abortive。AnyTLS 背压验证只在预期超时路径接受 TCP reset，仍检查限时关闭、旧连接淘汰、新连接恢复和停机退出码；正常传输出现 reset 仍失败。
+
+最终验证环境为 Linux、GNU 14.2、RelWithDebInfo、epoll、mimalloc，未启用 LTO：
+
+| 验证 | 结果与证据 |
+| --- | --- |
+| 完整 CTest | 176/176，通过；最终运行 62.16 秒。迁移测试使用优化构建下仍执行的断言，覆盖在途 readiness 迁移、并发合组、有界拒绝及域退休 |
+| XHTTP 会话迁移 | 明文／TLS × packet-up、stream-up、H2 合组、命名空间隔离，8/8；报告与 syscall 跟踪位于 `build/xhttp-migration-traced/` |
+| 原生 I/O 归属 | `plain-h2-merge/ownership.strace` 中同一存活 fd 28 的 recv/send 从 TID 2271088 转到 2271087，中间没有 close；对应目标 socket fd 29 也迁移，非仅应用层回声 |
+| AnyTLS 参考场景 | 15 个脚本、16 次调用全部通过，覆盖官方双向互通、帧／padding、背压、取消、超时、池复用与停机；`build/anytls-verified/` |
+| 官方 Xray Vision | 双向 × 明文／TLS 1.2／TLS 1.3，6/6；`build/vless-xray-final/` |
+| 官方 Xray VLESS Encryption | native／xorpub／random 各 17 次认证请求、16 次恢复、64 次重放拒绝；四个接收 Worker 均有实证；`build/vless-encryption-xray-final/` |
+| 官方 Xray XHTTP | 4 个并发 stream-up 请求通过；`build/xhttp-xray-final/` |
+| 空闲堆回收 | 两 Worker 真实进程运行 15 秒，启动 3 秒后无 `Worker::CollectHeap` 调用，正常退出；`build/idle-heap-verification/gdb.log` |
+
+参考版本固定为 Xray `a4a3dff5b20c2faae567b742c172c7b95e75c083` 与 anytls-go `fd6167acd6d73b9fa3e607659951847fbc9e6c50`。临时跟踪包装器、GDB 命令及验证脚本已清理，保留结果日志。
+
+边界：本轮没有 Windows 或 Release LTO 验证，也没有性能对比结论。Vision 写端仍使用 cmd 0/1，本轮不宣称新增双向 raw-write。面板 HTTP 200 不等同于远端账本事务提交；unknown 批次不自动重发，未采样的 SIGKILL 前流量不在持久保证内。未提交、推送或部署。

@@ -1,5 +1,12 @@
 #include "acppnode/transport/internet/timeout_scheduler.hpp"
 #include "acppnode/common/allocator.hpp"
+#include "acppnode/app/session_group_executor.hpp"
+#include <asio/bind_allocator.hpp>
+#include <asio/bind_executor.hpp>
+#include <asio/as_tuple.hpp>
+#include <asio/this_coro.hpp>
+#include <asio/use_awaitable.hpp>
+#include <optional>
 
 #include <asio/execution_context.hpp>
 #include <asio/steady_timer.hpp>
@@ -10,12 +17,17 @@
 namespace acpp {
 
 struct TimeoutScheduler::Impl : memory::ThreadAllocated {
-    explicit Impl(net::io_context& io_context) : timer(io_context) {
+    explicit Impl(net::io_context& io_context, std::weak_ptr<ExecutionDomain> owner)
+        : timer(io_context), domain(std::move(owner)) {
         heap.reserve(1024);
     }
 
     net::steady_timer timer;
+    // A permanent strong executor here would cycle domain -> service -> domain.
+    // Each outstanding timer retains only its own associated owner executor.
+    std::weak_ptr<ExecutionDomain> domain;
     memory::ThreadLocalVector<TimeoutEvent*> heap;
+    std::optional<SignalChannel> join;
     bool wait_pending = false;
     bool wakeup_requested = false;
     bool released = false;
@@ -86,7 +98,11 @@ struct TimeoutScheduler::Impl : memory::ThreadAllocated {
             return;
         }
         timer.expires_at(deadline);
-        timer.async_wait([this](const IoErrorCode& ec) { OnTimer(ec); });
+        net::any_io_executor executor = timer.get_executor();
+        if (auto owner = domain.lock()) executor = owner->Executor();
+        timer.async_wait(net::bind_executor(std::move(executor),
+            net::bind_allocator(memory::ProcessAllocator<std::byte>{},
+                [this](const IoErrorCode& ec) { OnTimer(ec); })));
         armed_deadline = deadline;
         wait_pending = true;
         wakeup_requested = false;
@@ -96,9 +112,13 @@ struct TimeoutScheduler::Impl : memory::ThreadAllocated {
             RequestWakeup();
     }
     void OnTimer(const IoErrorCode& ec) {
+        memory::RequireAllocationLease(this);
         wait_pending = false;
         wakeup_requested = false;
-        if (released) return;
+        if (released) {
+            if (join) (void)join->try_send(IoErrorCode{});
+            return;
+        }
         if (ec && ec != io_error::operation_aborted) throw IoSystemError(ec);
 
         // Inspect the heap anew after every callback: one event may cancel and
@@ -125,6 +145,7 @@ struct TimeoutScheduler::Impl : memory::ThreadAllocated {
         if (!released) ArmTimer();
     }
     void Release() noexcept {
+        memory::RequireAllocationLease(this);
         released = true;
         maintenance_deadline = std::chrono::steady_clock::time_point::max();
         maintenance = nullptr;
@@ -143,10 +164,17 @@ class TimeoutSchedulerService final : public asio::execution_context::service {
 public:
     static asio::execution_context::id id;
     explicit TimeoutSchedulerService(asio::execution_context& ctx)
-        : asio::execution_context::service(ctx), scheduler_(static_cast<net::io_context&>(ctx)) {}
+        : TimeoutSchedulerService(ctx, DomainFor(ctx)) {}
     TimeoutScheduler& Scheduler() noexcept { return scheduler_; }
     void ShutdownNow() noexcept { ClearThreadCache(); scheduler_.Release(); }
 private:
+    static std::shared_ptr<ExecutionDomain> DomainFor(asio::execution_context& ctx) {
+        auto domain = ExecutionDomain::Current();
+        return domain && &domain->Services() == &ctx ? domain : nullptr;
+    }
+    TimeoutSchedulerService(asio::execution_context& ctx, std::shared_ptr<ExecutionDomain> domain)
+        : asio::execution_context::service(ctx)
+        , scheduler_(domain ? domain->Reactor() : static_cast<net::io_context&>(ctx), domain) {}
     void ClearThreadCache() noexcept {
         if (tl_cached_scheduler == &scheduler_) {
             tl_cached_context = nullptr;
@@ -158,11 +186,14 @@ private:
 };
 asio::execution_context::id TimeoutSchedulerService::id;
 
-TimeoutScheduler::TimeoutScheduler(net::io_context& context) : impl_(std::make_unique<Impl>(context)) {}
+TimeoutScheduler::TimeoutScheduler(net::io_context& context, std::weak_ptr<ExecutionDomain> domain)
+    : impl_(std::make_unique<Impl>(context, std::move(domain))) {}
 TimeoutEvent::~TimeoutEvent() noexcept { Cancel(); }
 void TimeoutEvent::Cancel() noexcept { if (owner_) owner_->Cancel(*this); }
 
 TimeoutScheduler& TimeoutScheduler::ForIoContext(net::io_context& context) {
+    if (auto domain = ExecutionDomain::Current())
+        return asio::use_service<TimeoutSchedulerService>(domain->Services()).Scheduler();
     if (tl_cached_context == &context && tl_cached_scheduler) return *tl_cached_scheduler;
     auto& service = asio::use_service<TimeoutSchedulerService>(context);
     tl_cached_context = &context;
@@ -170,6 +201,11 @@ TimeoutScheduler& TimeoutScheduler::ForIoContext(net::io_context& context) {
     return *tl_cached_scheduler;
 }
 void TimeoutScheduler::ReleaseForIoContext(net::io_context& context) {
+    if (auto domain = ExecutionDomain::Current()) {
+        if (asio::has_service<TimeoutSchedulerService>(domain->Services()))
+            asio::use_service<TimeoutSchedulerService>(domain->Services()).ShutdownNow();
+        return;
+    }
     if (tl_cached_context == &context) {
         tl_cached_context = nullptr;
         tl_cached_scheduler = nullptr;
@@ -177,9 +213,31 @@ void TimeoutScheduler::ReleaseForIoContext(net::io_context& context) {
     if (asio::has_service<TimeoutSchedulerService>(context))
         asio::use_service<TimeoutSchedulerService>(context).ShutdownNow();
 }
+net::awaitable<void> TimeoutScheduler::AsyncReleaseForIoContext(net::io_context& context) {
+    co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
+    auto domain = ExecutionDomain::Current();
+    net::execution_context& services = domain ? domain->Services() : context;
+    if (!asio::has_service<TimeoutSchedulerService>(services)) co_return;
+    auto& service = asio::use_service<TimeoutSchedulerService>(services);
+    auto& impl = *service.Scheduler().impl_;
+    service.ShutdownNow();
+    if (!impl.wait_pending) co_return;
+    if (impl.join) throw std::logic_error("concurrent timeout scheduler join");
+    impl.join.emplace(co_await net::this_coro::executor, 1);
+    struct JoinReset {
+        std::optional<SignalChannel>& channel;
+        ~JoinReset() { channel.reset(); }
+    } reset{impl.join};
+    auto [ec] = co_await impl.join->async_receive(
+        net::bind_allocator(memory::ProcessAllocator<std::byte>{},
+            net::as_tuple(net::use_awaitable)));
+    if (ec) throw IoSystemError(ec);
+}
+
 void TimeoutScheduler::Release() noexcept { impl_->Release(); }
 
 bool TimeoutScheduler::ScheduleAfter(std::chrono::milliseconds delay, TimeoutEvent& event) {
+    memory::RequireAllocationLease(impl_.get());
     if (impl_->released) return false;
     if (event.owner_ && event.owner_ != this)
         throw std::logic_error("timeout event belongs to another scheduler");
@@ -204,12 +262,14 @@ bool TimeoutScheduler::ScheduleAfter(std::chrono::milliseconds delay, TimeoutEve
     return true;
 }
 void TimeoutScheduler::Cancel(TimeoutEvent& event) noexcept {
+    memory::RequireAllocationLease(impl_.get());
     if (event.owner_ != this) return;
     impl_->Remove(event);
     impl_->ReconcileCancellation();
 }
 bool TimeoutScheduler::SetMaintenanceDeadline(
     TimeoutMaintenance& owner, std::chrono::steady_clock::time_point deadline) {
+    memory::RequireAllocationLease(impl_.get());
     if (impl_->released) return false;
     if (impl_->maintenance && impl_->maintenance != &owner)
         throw std::logic_error("timeout maintenance owner conflict");
@@ -219,6 +279,7 @@ bool TimeoutScheduler::SetMaintenanceDeadline(
     return true;
 }
 void TimeoutScheduler::CancelMaintenance(TimeoutMaintenance& owner) noexcept {
+    memory::RequireAllocationLease(impl_.get());
     if (impl_->maintenance != &owner) return;
     impl_->maintenance_deadline = std::chrono::steady_clock::time_point::max();
     impl_->maintenance = nullptr;
@@ -226,6 +287,7 @@ void TimeoutScheduler::CancelMaintenance(TimeoutMaintenance& owner) noexcept {
     impl_->RequestWakeup();
 }
 TimeoutScheduler::ResourceStats TimeoutScheduler::GetResourceStats() const noexcept {
+    memory::RequireAllocationLease(impl_.get());
     return {.active_events = impl_->heap.size(),
         .heap_capacity = impl_->heap.capacity(), .wait_pending = impl_->wait_pending};
 }

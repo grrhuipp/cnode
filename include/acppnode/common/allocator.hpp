@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -25,40 +26,33 @@
 #include <utility>
 #include <vector>
 
-#if defined(__linux__)
 #include <sys/prctl.h>
 #include <unistd.h>
-#endif
 #if defined(CNODE_USE_MIMALLOC) && !defined(__SANITIZE_ADDRESS__)
 #include <mimalloc.h>
 #endif
 
 namespace acpp::memory {
 
-inline constexpr bool kAllocatorCollects = true;
-inline constexpr std::size_t kThreadPoolTargetBytes = 64 * 1024;
-inline constexpr std::size_t kThreadPoolMaxClass = 16 * 1024;
+inline constexpr std::size_t kThreadMemoryPoolTargetBytes = 64 * 1024;
+inline constexpr std::size_t kThreadMemoryPoolMaxClass = 16 * 1024;
 inline constexpr std::size_t kLargeBlockGranularity = 4 * 1024;
 inline constexpr std::size_t kMaxCachedBlockBytes = 1024 * 1024;
 inline constexpr std::size_t kMaxCachedBlockAlignment = 64;
 inline constexpr std::size_t request_arena_initial_bytes = std::size_t{4} * 1024;
 inline constexpr std::size_t default_retained_block_bytes = std::size_t{8} * 1024 * 1024;
 inline constexpr std::size_t max_retained_block_bytes = static_cast<std::size_t>(PTRDIFF_MAX);
-inline constexpr std::chrono::milliseconds kThreadPoolPurgeDelay{10};
+inline constexpr std::chrono::milliseconds kThreadMemoryPoolPurgeDelay{10};
 
 inline const std::size_t kAllocationPageBytes = []() noexcept -> std::size_t {
-#if defined(__linux__)
     const long page = ::sysconf(_SC_PAGESIZE);
     if (page > 0 && (page & (page - 1)) == 0)
         return static_cast<std::size_t>(page);
-#endif
     return 4096;
 }();
 
 inline void DisableTransparentHugePages() noexcept {
-#if defined(__linux__) && defined(PR_SET_THP_DISABLE)
     (void)::prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
-#endif
 }
 
 [[nodiscard]] inline constexpr bool ValidAlignment(std::size_t alignment) noexcept {
@@ -69,7 +63,16 @@ inline void DisableTransparentHugePages() noexcept {
     return (value + unit - 1) & ~(unit - 1);
 }
 
+class AllocationDomain;
+
+#ifdef CNODE_TEST_ALLOCATOR_FAULT
+inline thread_local bool reject_next_process_allocation = false;
+inline thread_local size_t rejected_process_allocations = 0;
+#endif
+
 namespace detail {
+inline thread_local AllocationDomain* current_allocation_domain = nullptr;
+
 [[nodiscard]] inline std::uintptr_t CurrentThreadToken() noexcept {
     thread_local std::uint8_t anchor = 0;
     return reinterpret_cast<std::uintptr_t>(&anchor);
@@ -77,6 +80,13 @@ namespace detail {
 
 
 [[nodiscard]] inline void* AllocateProcessRaw(std::size_t bytes_value, std::size_t alignment) {
+#ifdef CNODE_TEST_ALLOCATOR_FAULT
+    if (reject_next_process_allocation) {
+        reject_next_process_allocation = false;
+        ++rejected_process_allocations;
+        throw std::bad_alloc();
+    }
+#endif
     if (!ValidAlignment(alignment)) {
         throw std::bad_alloc();
     }
@@ -133,185 +143,6 @@ private:
     return resource;
 }
 
-struct resolved_pmr_resource_tag final {};
-
-[[nodiscard]] inline std::pmr::memory_resource* pmr_resource_or_default(
-    std::pmr::memory_resource* resource) noexcept {
-    return resource == nullptr ? process_resource() : resource;
-}
-
-template <typename t_type, typename... args_type>
-[[nodiscard]] t_type* construct_pmr_object(
-    resolved_pmr_resource_tag, std::pmr::memory_resource* resource, args_type&&... args) {
-    auto* storage = resource->allocate(sizeof(t_type), alignof(t_type));
-    try {
-        return std::construct_at(static_cast<t_type*>(storage), std::forward<args_type>(args)...);
-    } catch (...) {
-        resource->deallocate(storage, sizeof(t_type), alignof(t_type));
-        throw;
-    }
-}
-
-template <typename t_type, typename... args_type>
-[[nodiscard]] t_type* construct_pmr_object(
-    std::pmr::memory_resource* resource, args_type&&... args) {
-    return construct_pmr_object<t_type>(
-        resolved_pmr_resource_tag{}, pmr_resource_or_default(resource),
-        std::forward<args_type>(args)...);
-}
-
-template <typename t_type>
-void destroy_pmr_object(
-    resolved_pmr_resource_tag, t_type* value, std::pmr::memory_resource* resource) noexcept {
-    if (value == nullptr) {
-        return;
-    }
-    std::destroy_at(value);
-    resource->deallocate(value, sizeof(t_type), alignof(t_type));
-}
-
-template <typename t_type>
-void destroy_pmr_object(t_type* value, std::pmr::memory_resource* resource) noexcept {
-    destroy_pmr_object(resolved_pmr_resource_tag{}, value, pmr_resource_or_default(resource));
-}
-
-template <typename t_type>
-struct pmr_object_deleter final {
-    std::pmr::memory_resource* resource_{nullptr};
-
-    void operator()(t_type* value) const noexcept {
-        destroy_pmr_object(value, resource_);
-    }
-};
-
-template <typename t_type, typename... args_type>
-[[nodiscard]] std::unique_ptr<t_type, pmr_object_deleter<t_type>> make_pmr_object(
-    std::pmr::memory_resource* resource, args_type&&... args) {
-    auto* memory_resource = pmr_resource_or_default(resource);
-    return std::unique_ptr<t_type, pmr_object_deleter<t_type>>(
-        construct_pmr_object<t_type>(
-            resolved_pmr_resource_tag{}, memory_resource, std::forward<args_type>(args)...),
-        pmr_object_deleter<t_type>{memory_resource});
-}
-
-namespace detail {
-
-inline constexpr std::size_t task_frame_cache_granularity = 128;
-inline constexpr std::size_t task_frame_cache_max_block_bytes = 16 * 1024;
-inline constexpr std::size_t task_frame_cache_budget_bytes = 512 * 1024;
-inline constexpr std::size_t task_frame_cache_bin_count =
-    task_frame_cache_max_block_bytes / task_frame_cache_granularity;
-
-[[nodiscard]] inline constexpr std::size_t task_frame_class_bytes(std::size_t bytes_value) noexcept {
-    if (bytes_value > task_frame_cache_max_block_bytes) {
-        return bytes_value;
-    }
-    return (bytes_value + task_frame_cache_granularity - 1) & ~(task_frame_cache_granularity - 1);
-}
-
-inline thread_local bool task_frame_cache_destroyed = false;
-
-class task_frame_cache final {
-public:
-    task_frame_cache() noexcept = default;
-    task_frame_cache(const task_frame_cache&) = delete;
-    task_frame_cache& operator=(const task_frame_cache&) = delete;
-
-    ~task_frame_cache() {
-        task_frame_cache_destroyed = true;
-        release_all();
-    }
-
-    void release_all() noexcept {
-        for (std::size_t idx = 0; idx < bins_.size(); ++idx) {
-            const std::size_t class_bytes = (idx + 1) * task_frame_cache_granularity;
-            void*& head = bins_[idx];
-            while (head != nullptr) {
-                void* next_value = *static_cast<void**>(head);
-                DeallocateProcessRaw(head, class_bytes, alignof(std::max_align_t));
-                head = next_value;
-            }
-        }
-        cached_bytes_ = 0;
-    }
-
-    [[nodiscard]] std::size_t cached_bytes() const noexcept {
-        return cached_bytes_;
-    }
-
-    [[nodiscard]] void* take_block(std::size_t class_bytes) noexcept {
-        void*& head = bins_[bin_index(class_bytes)];
-        void* block = head;
-        if (block != nullptr) {
-            head = *static_cast<void**>(block);
-            cached_bytes_ -= class_bytes;
-        }
-        return block;
-    }
-
-    [[nodiscard]] bool store_block(void* block, std::size_t class_bytes) noexcept {
-        if (cached_bytes_ + class_bytes > task_frame_cache_budget_bytes) {
-            return false;
-        }
-        void*& head = bins_[bin_index(class_bytes)];
-        *static_cast<void**>(block) = head;
-        head = block;
-        cached_bytes_ += class_bytes;
-        return true;
-    }
-
-private:
-    [[nodiscard]] static constexpr std::size_t bin_index(std::size_t class_bytes) noexcept {
-        return class_bytes / task_frame_cache_granularity - 1;
-    }
-
-    std::array<void*, task_frame_cache_bin_count> bins_{};
-    std::size_t cached_bytes_{0};
-};
-
-inline thread_local task_frame_cache g_task_frame_cache;
-
-[[nodiscard]] inline void* task_frame_allocate(std::size_t bytes_value) {
-    const std::size_t class_bytes = task_frame_class_bytes(bytes_value == 0 ? 1 : bytes_value);
-    if (!task_frame_cache_destroyed && class_bytes <= task_frame_cache_max_block_bytes) {
-        if (void* cached = g_task_frame_cache.take_block(class_bytes)) {
-            return cached;
-        }
-    }
-    return AllocateProcessRaw(class_bytes, alignof(std::max_align_t));
-}
-
-inline void task_frame_deallocate_sized(void* pointer, std::size_t bytes_value) noexcept {
-    if (!pointer) return;
-    const std::size_t class_bytes = task_frame_class_bytes(bytes_value == 0 ? 1 : bytes_value);
-    if (!task_frame_cache_destroyed && class_bytes <= task_frame_cache_max_block_bytes &&
-        g_task_frame_cache.store_block(pointer, class_bytes)) {
-        return;
-    }
-    DeallocateProcessRaw(pointer, class_bytes, alignof(std::max_align_t));
-}
-
-[[nodiscard]] inline void* task_frame_allocate_aligned(std::size_t bytes_value, std::size_t alignment) {
-    return AllocateProcessRaw(bytes_value, alignment);
-}
-
-inline void task_frame_deallocate_aligned(
-    void* pointer, std::size_t bytes_value = 0, std::size_t alignment = alignof(std::max_align_t)) noexcept {
-    DeallocateProcessRaw(pointer, bytes_value, alignment);
-}
-
-[[nodiscard]] inline std::size_t task_frame_cached_bytes() noexcept {
-    return task_frame_cache_destroyed ? 0 : g_task_frame_cache.cached_bytes();
-}
-
-inline void task_frame_cache_release() noexcept {
-    if (!task_frame_cache_destroyed) {
-        g_task_frame_cache.release_all();
-    }
-}
-
-} // namespace detail
-
 struct memory_pool_config {
     std::size_t request_initial_buffer_bytes_{request_arena_initial_bytes};
     std::size_t retained_block_bytes_{default_retained_block_bytes};
@@ -367,55 +198,66 @@ public:
                            const memory_pool_config& config = {})
         : upstream_((validate_memory_pool_config(config), &upstream))
         , request_initial_buffer_bytes_(config.request_initial_buffer_bytes_)
-        , retained_block_bytes_(config.retained_block_bytes_)
-        , owner_thread_(detail::CurrentThreadToken()) {}
+        , retained_block_bytes_(config.retained_block_bytes_) {}
 
     worker_memory(const worker_memory&) = delete;
     worker_memory& operator=(const worker_memory&) = delete;
+    worker_memory(std::pmr::memory_resource& upstream,
+                  const memory_pool_config& config, bool domain_private)
+        : worker_memory(upstream, config) {
+        domain_private_ = domain_private;
+    }
+
+    void RequireLease() const noexcept;
+    [[nodiscard]] std::shared_ptr<worker_memory> Lifetime() const noexcept {
+        return lifetime_.lock();
+    }
+    [[nodiscard]] std::size_t OutstandingAllocations() const noexcept {
+        RequireLease();
+        return live_allocations_;
+    }
+
+    [[nodiscard]] static worker_memory& OwnerOf(const void* pointer) noexcept {
+        return *(reinterpret_cast<const SlotHeader*>(pointer) - 1)->chunk->pool;
+    }
+
 
     ~worker_memory() override {
+        if (live_allocations_ != 0) std::terminate();
         while (all_) {
             ReleaseChunk(*all_);
         }
     }
 
-    [[nodiscard]] Footprint GetFootprint() const noexcept { return footprint_; }
+    [[nodiscard]] Footprint GetFootprint() const noexcept {
+        RequireLease();
+        return footprint_;
+    }
 
     void Purge() noexcept {
+        RequireLease();
         if (!idle_head_) return;
         const auto now = Clock::now();
-        while (idle_head_ && now - idle_head_->idle_at >= kThreadPoolPurgeDelay) {
+        while (idle_head_ && now - idle_head_->idle_at >= kThreadMemoryPoolPurgeDelay) {
             ReleaseChunk(*idle_head_);
         }
     }
 
     void PurgeIdle() noexcept {
+        RequireLease();
         while (idle_head_) {
             ReleaseChunk(*idle_head_);
         }
-        detail::task_frame_cache_release();
-    }
-
-    // Releases cached blocks and drains the calling thread's coroutine frame
-    // cache on the bound owner thread.
-    void trim() {
-        const auto caller = detail::CurrentThreadToken();
-        if (trimmed_owner_ != 0 && caller != trimmed_owner_) {
-            throw std::logic_error("worker memory trim must run on its owner worker");
-        }
-        trimmed_owner_ = caller;
-        PurgeIdle();
-#if defined(CNODE_USE_MIMALLOC) && !defined(__SANITIZE_ADDRESS__)
-        mi_collect(false);
-#endif
     }
 
     [[nodiscard]] Clock::time_point NextPurgeDeadline() const noexcept {
-        return idle_head_ ? idle_head_->idle_at + kThreadPoolPurgeDelay
+        RequireLease();
+        return idle_head_ ? idle_head_->idle_at + kThreadMemoryPoolPurgeDelay
                           : Clock::time_point::max();
     }
 
     [[nodiscard]] bool BindIdleWakeup(IdleWakeup& owner) noexcept {
+        RequireLease();
         if (wakeup_ && wakeup_ != &owner) return false;
         wakeup_ = &owner;
         if (idle_head_) wakeup_->OnPoolIdle();
@@ -423,6 +265,7 @@ public:
     }
 
     void UnbindIdleWakeup(IdleWakeup& owner) noexcept {
+        RequireLease();
         if (wakeup_ == &owner) wakeup_ = nullptr;
     }
 
@@ -440,23 +283,15 @@ public:
     [[nodiscard]] std::pmr::memory_resource* resource() && = delete;
     [[nodiscard]] std::pmr::memory_resource* resource() const&& = delete;
 
-    [[nodiscard]] std::pmr::memory_resource* upstream_resource() const noexcept {
-        return upstream_;
-    }
-
     [[nodiscard]] std::size_t request_initial_buffer_bytes() const noexcept {
         return request_initial_buffer_bytes_;
-    }
-
-    [[nodiscard]] std::size_t retained_block_bytes() const noexcept {
-        return retained_block_bytes_;
     }
 
     [[nodiscard]] static Layout Describe(
         std::size_t bytes, std::size_t alignment, std::size_t depth = 0) noexcept {
         if (!ValidAlignment(alignment)) return {};
         bytes = std::max(bytes, std::size_t{1});
-        if (alignment > kSlotAlignment || bytes > kThreadPoolMaxClass - sizeof(SlotHeader)) {
+        if (alignment > kSlotAlignment || bytes > kThreadMemoryPoolMaxClass - sizeof(SlotHeader)) {
             const bool cacheable =
                 alignment <= kMaxCachedBlockAlignment && bytes <= kMaxCachedBlockBytes;
             const std::size_t payload_bytes =
@@ -474,9 +309,18 @@ public:
     }
 
     [[nodiscard]] void* Allocate(std::size_t bytes, std::size_t alignment) noexcept {
+        RequireLease();
+        void* pointer = AllocateImpl(bytes, alignment);
+        if (pointer && domain_private_ && live_allocations_++ == 0)
+            live_lifetime_ = lifetime_.lock();
+        return pointer;
+    }
+
+private:
+    [[nodiscard]] void* AllocateImpl(std::size_t bytes, std::size_t alignment) noexcept {
         if (!ValidAlignment(alignment)) return nullptr;
         bytes = std::max(bytes, std::size_t{1});
-        if (alignment > kSlotAlignment || bytes > kThreadPoolMaxClass - sizeof(SlotHeader)) {
+        if (alignment > kSlotAlignment || bytes > kThreadMemoryPoolMaxClass - sizeof(SlotHeader)) {
             if (alignment <= kMaxCachedBlockAlignment && bytes <= kMaxCachedBlockBytes) {
                 return AllocateLargeCached(bytes, alignment);
             }
@@ -504,13 +348,16 @@ public:
         return Carve(*chunk);
     }
 
+public:
     void Deallocate(void* pointer, std::size_t bytes = 0,
                     std::size_t alignment = 0) noexcept {
         if (!pointer) return;
+        RequireLease();
         auto* header = reinterpret_cast<SlotHeader*>(pointer) - 1;
         auto* chunk = header->chunk;
         if (!chunk) return;
-        if (chunk->owner != detail::CurrentThreadToken()) {
+        chunk->pool->RequireLease();
+        if (!domain_private_ && chunk->owner != detail::CurrentThreadToken()) {
             OnCrossThreadFree();
             return;
         }
@@ -518,6 +365,11 @@ public:
             bytes > chunk->slot_capacity ||
             (alignment && (!ValidAlignment(alignment) ||
              reinterpret_cast<std::uintptr_t>(pointer) % alignment != 0))) return;
+        // Detach the self-reference only after the final allocation is
+        // returned; this local keeps the pool alive through all bookkeeping.
+        std::shared_ptr<worker_memory> retiring;
+        if (domain_private_ && --live_allocations_ == 0)
+            retiring = std::move(live_lifetime_);
         --chunk->live;
         if (chunk->live == 0) {
             if (chunk->direct) {
@@ -567,7 +419,7 @@ protected:
 
 private:
     static constexpr std::size_t kSlotAlignment = 16;
-    static constexpr std::size_t kClassCount = 25 + (kThreadPoolMaxClass - 1024) / 256;
+    static constexpr std::size_t kClassCount = 25 + (kThreadMemoryPoolMaxClass - 1024) / 256;
     static constexpr std::size_t kLargeBinCount =
         kMaxCachedBlockBytes / kLargeBlockGranularity;
 
@@ -627,7 +479,7 @@ private:
     }
     [[nodiscard]] static Layout PooledLayout(std::size_t stride, std::size_t depth) noexcept {
         const auto page = kAllocationPageBytes;
-        const auto target = std::max(page, kThreadPoolTargetBytes);
+        const auto target = std::max(page, kThreadMemoryPoolTargetBytes);
         const auto min_pages = RoundUp(ChunkLead() + stride, page) / page;
         const auto max_pages = std::max(
             min_pages,
@@ -709,10 +561,9 @@ private:
             return nullptr;
         }
         if (!mapped) return nullptr;
-        owner_thread_ = detail::CurrentThreadToken();
         auto* chunk = ::new (mapped) Chunk;
         chunk->pool = this;
-        chunk->owner = owner_thread_;
+        chunk->owner = detail::CurrentThreadToken();
         chunk->map_bytes = layout.map_bytes;
         chunk->map_alignment = map_alignment;
         chunk->stride = layout.slot_bytes;
@@ -818,11 +669,17 @@ private:
     }
 
     std::pmr::memory_resource* upstream_;
+    friend class AllocationDomain;
+    using SharesLeaseGroup = bool (*)(const void*, const void*) noexcept;
+    bool domain_private_ = false;
+    std::weak_ptr<worker_memory> lifetime_;
+    std::shared_ptr<worker_memory> live_lifetime_;
+    std::size_t live_allocations_ = 0;
+    std::shared_ptr<const void> group_identity_;
+    SharesLeaseGroup shares_group_ = nullptr;
     std::size_t request_initial_buffer_bytes_;
     std::size_t retained_block_bytes_;
     std::size_t cached_large_bytes_ = 0;
-    std::uintptr_t owner_thread_ = 0;
-    std::uintptr_t trimmed_owner_ = 0;
     std::array<Class, kClassCount> classes_{};
     std::array<Chunk*, kLargeBinCount> large_bins_{};
     Chunk* all_ = nullptr;
@@ -831,43 +688,120 @@ private:
     Footprint footprint_{};
     IdleWakeup* wakeup_ = nullptr;
 };
+// The root is callback-owned; the independent arena survives that root while
+// borrowed allocations or container allocators remain in the merged group.
+// No arena reference retains a session host or its transport stack.
+class AllocationDomain final {
+public:
+    explicit AllocationDomain(const memory_pool_config& config = {})
+        : pool_(std::make_shared<worker_memory>(*process_resource(), config, true)) {
+        pool_->lifetime_ = pool_;
+    }
+    AllocationDomain(const AllocationDomain&) = delete;
+    AllocationDomain& operator=(const AllocationDomain&) = delete;
+    ~AllocationDomain() {
+        if (lease_.load(std::memory_order_relaxed) != 0) std::terminate();
+    }
+    [[nodiscard]] worker_memory& pool() noexcept { return *pool_; }
+    [[nodiscard]] std::pmr::memory_resource* resource() noexcept { return pool_.get(); }
+    using SharesLeaseGroup = bool (*)(const void*, const void*) noexcept;
+    // The identity is a stable scheduler group node, never a session pointer.
+    void SetLeaseGroup(std::shared_ptr<const void> identity, SharesLeaseGroup shares_group) noexcept {
+        pool_->group_identity_ = std::move(identity);
+        pool_->shares_group_ = shares_group;
+    }
+    [[nodiscard]] std::size_t OutstandingAllocations() const noexcept {
+        return pool_->OutstandingAllocations();
+    }
+
+private:
+    friend class ScopedAllocationDomain;
+    std::atomic<std::uintptr_t> lease_{0};
+    std::shared_ptr<worker_memory> pool_;
+};
+
+inline void worker_memory::RequireLease() const noexcept {
+    if (!domain_private_) return;
+    const auto* current = detail::current_allocation_domain;
+    if (!current) std::terminate();
+    const auto& active = const_cast<AllocationDomain*>(current)->pool();
+    if (&active == this) return;
+    if (!shares_group_ || shares_group_ != active.shares_group_ ||
+        !group_identity_ || !active.group_identity_ ||
+        !shares_group_(group_identity_.get(), active.group_identity_.get()))
+        std::terminate();
+}
+
+[[nodiscard]] inline std::shared_ptr<worker_memory> RetainResource(
+    std::pmr::memory_resource* resource) noexcept {
+    if (auto* pool = dynamic_cast<worker_memory*>(resource)) return pool->Lifetime();
+    return {};
+}
+
+class ScopedAllocationDomain final {
+public:
+    explicit ScopedAllocationDomain(AllocationDomain& domain) noexcept
+        : domain_(domain), previous_(detail::current_allocation_domain) {
+        const auto token = detail::CurrentThreadToken();
+        auto expected = std::uintptr_t{0};
+        acquired_ = domain_.lease_.compare_exchange_strong(
+            expected, token, std::memory_order_acquire);
+        if (!acquired_ && expected != token) std::terminate();
+        detail::current_allocation_domain = &domain_;
+    }
+    ~ScopedAllocationDomain() {
+        if (detail::current_allocation_domain != &domain_) std::terminate();
+        detail::current_allocation_domain = previous_;
+        if (acquired_) domain_.lease_.store(0, std::memory_order_release);
+    }
+    ScopedAllocationDomain(const ScopedAllocationDomain&) = delete;
+    ScopedAllocationDomain& operator=(const ScopedAllocationDomain&) = delete;
+
+private:
+    AllocationDomain& domain_;
+    AllocationDomain* previous_;
+    bool acquired_ = false;
+};
+
+[[nodiscard]] inline AllocationDomain* CurrentAllocationDomain() noexcept {
+    return detail::current_allocation_domain;
+}
+
+[[nodiscard]] inline std::pmr::memory_resource* CurrentResource() noexcept {
+    if (auto* domain = CurrentAllocationDomain()) return domain->resource();
+    return std::pmr::get_default_resource();
+}
+
 
 
 // Request/handshake lifetime monotonic arena borrowing its worker_memory and
 // optional initial buffer. Individual deallocation is a no-op; destruction
 // returns overflow blocks to the worker_memory pool.
-class request_memory final {
+class request_memory final : private std::pmr::memory_resource {
 public:
     explicit request_memory(worker_memory& worker_value)
-        : request_memory(worker_value.request_initial_buffer_bytes(), worker_value.resource()) {}
+        : owner_(worker_value)
+        , arena_(worker_value.request_initial_buffer_bytes(), worker_value.resource()) {}
 
     request_memory(worker_memory& worker_value, std::span<std::byte> initial_buffer)
-        : arena_(initial_buffer.data(), initial_buffer.size(), worker_value.resource())
-        , initial_bytes_(worker_value.request_initial_buffer_bytes()) {}
-
-    request_memory(std::size_t initial_bytes, std::pmr::memory_resource* upstream)
-        : arena_(initial_bytes, pmr_resource_or_default(upstream))
-        , initial_bytes_(initial_bytes) {}
-
-    ~request_memory() = default;
+        : owner_(worker_value)
+        , arena_(initial_buffer.data(), initial_buffer.size(), worker_value.resource()) {}
 
     request_memory(const request_memory&) = delete;
     request_memory& operator=(const request_memory&) = delete;
-
-    [[nodiscard]] request_memory fork() const& {
-        return request_memory(initial_bytes_, arena_.upstream_resource());
-    }
-    request_memory fork() const&& = delete;
+    ~request_memory() override { owner_.RequireLease(); }
 
     template <typename t_type = std::byte>
     [[nodiscard]] std::pmr::polymorphic_allocator<t_type> allocator() & noexcept {
-        return std::pmr::polymorphic_allocator<t_type>(&arena_);
+        return std::pmr::polymorphic_allocator<t_type>(this);
     }
     template <typename t_type = std::byte>
     [[nodiscard]] std::pmr::polymorphic_allocator<t_type> allocator() && = delete;
 
-    [[nodiscard]] std::pmr::memory_resource* resource() & noexcept { return &arena_; }
-    [[nodiscard]] std::pmr::memory_resource* resource() const& noexcept { return &arena_; }
+    [[nodiscard]] std::pmr::memory_resource* resource() & noexcept { return this; }
+    [[nodiscard]] std::pmr::memory_resource* resource() const& noexcept {
+        return const_cast<request_memory*>(this);
+    }
     [[nodiscard]] std::pmr::memory_resource* resource() && = delete;
     [[nodiscard]] std::pmr::memory_resource* resource() const&& = delete;
 
@@ -881,11 +815,23 @@ public:
     [[nodiscard]] std::pmr::memory_resource* upstream_resource() const&& = delete;
 
 private:
+    void* do_allocate(std::size_t bytes, std::size_t alignment) override {
+        owner_.RequireLease();
+        return arena_.allocate(bytes, alignment);
+    }
+    void do_deallocate(void*, std::size_t, std::size_t) override {
+        owner_.RequireLease();
+    }
+    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
+        return this == &other;
+    }
+    worker_memory& owner_;
+    std::shared_ptr<worker_memory> owner_lifetime_{owner_.Lifetime()};
     mutable std::pmr::monotonic_buffer_resource arena_;
-    std::size_t initial_bytes_;
 };
 
-[[nodiscard]] inline worker_memory& ThreadPool() noexcept {
+[[nodiscard]] inline worker_memory& ThreadMemoryPool() noexcept {
+    if (auto* domain = CurrentAllocationDomain()) return domain->pool();
     thread_local worker_memory pool;
     return pool;
 }
@@ -904,13 +850,28 @@ inline thread_local size_t rejected_pmr_allocations = 0;
         return nullptr;
     }
 #endif
-    return ThreadPool().Allocate(size, alignment);
+    return ThreadMemoryPool().Allocate(size, alignment);
 }
 
 inline void DeallocatePmr(void* p, size_t size = 0,
                           size_t alignment = 0) noexcept {
-    if (p) ThreadPool().Deallocate(p, size, alignment);
+    if (p) worker_memory::OwnerOf(p).Deallocate(p, size, alignment);
 }
+
+inline void RequireAllocationLease(const void* pointer) noexcept {
+    if (pointer) worker_memory::OwnerOf(pointer).RequireLease();
+}
+
+// Native Asio operation storage can be allocated, delivered, cancelled, or
+// destroyed by different reactor threads. It never belongs to a session pool.
+template <class T>
+class ProcessAllocator : public std::pmr::polymorphic_allocator<T> {
+public:
+    ProcessAllocator() noexcept : std::pmr::polymorphic_allocator<T>(process_resource()) {}
+    template <class U>
+    ProcessAllocator(const ProcessAllocator<U>&) noexcept : ProcessAllocator() {}
+    template <class U> struct rebind { using other = ProcessAllocator<U>; };
+};
 
 struct ThreadAllocated {
     static void* operator new(std::size_t size) {
@@ -927,7 +888,7 @@ struct ThreadAllocated {
     static void operator delete(void* p, std::size_t, std::align_val_t) noexcept { DeallocatePmr(p); }
 };
 
-class ThreadPoolFacade final : public std::pmr::memory_resource {
+class ThreadMemoryResource final : public std::pmr::memory_resource {
 protected:
     void* do_allocate(size_t bytes, size_t alignment) override {
         if (void* p = AllocatePmr(bytes, alignment)) return p;
@@ -947,32 +908,78 @@ inline void ConfigureProcessAllocator() noexcept {
     mi_option_set(mi_option_allow_thp, 0);
     mi_option_set(mi_option_purge_delay, 10);
 #endif
-    static ThreadPoolFacade default_resource;
+    static ThreadMemoryResource default_resource;
     std::pmr::set_default_resource(&default_resource);
 }
 
 inline void CollectSteady() noexcept {
-    ThreadPool().Purge();
-    detail::task_frame_cache_release();
+    ThreadMemoryPool().Purge();
 #if defined(CNODE_USE_MIMALLOC) && !defined(__SANITIZE_ADDRESS__)
     mi_collect(false);
 #endif
 }
 
 inline void CollectBurst() noexcept {
-    ThreadPool().PurgeIdle();
+    ThreadMemoryPool().PurgeIdle();
 #if defined(CNODE_USE_MIMALLOC) && !defined(__SANITIZE_ADDRESS__)
     mi_collect(true);
 #endif
 }
 
 template <class T>
-using ThreadLocalAllocator = std::pmr::polymorphic_allocator<T>;
+class ThreadLocalAllocator {
+public:
+    using value_type = T;
+    using propagate_on_container_move_assignment = std::true_type;
+    using propagate_on_container_swap = std::true_type;
+    ThreadLocalAllocator() noexcept : ThreadLocalAllocator(CurrentResource()) {}
+    ThreadLocalAllocator(std::pmr::memory_resource* resource) noexcept
+        : resource_(resource), lifetime_(RetainResource(resource)) {}
+    ThreadLocalAllocator(const ThreadLocalAllocator&) noexcept = default;
+    ThreadLocalAllocator& operator=(const ThreadLocalAllocator&) noexcept = default;
+    ThreadLocalAllocator(ThreadLocalAllocator&& other) noexcept
+        : ThreadLocalAllocator(static_cast<const ThreadLocalAllocator&>(other)) {}
+    ThreadLocalAllocator& operator=(ThreadLocalAllocator&& other) noexcept {
+        return *this = static_cast<const ThreadLocalAllocator&>(other);
+    }
+    template <class U>
+    ThreadLocalAllocator(const ThreadLocalAllocator<U>& other) noexcept
+        : resource_(other.resource()), lifetime_(other.lifetime_) {}
+    template <class U>
+    ThreadLocalAllocator(const std::pmr::polymorphic_allocator<U>& other) noexcept
+        : ThreadLocalAllocator(other.resource()) {}
+    template <class U> struct rebind { using other = ThreadLocalAllocator<U>; };
+    [[nodiscard]] ThreadLocalAllocator select_on_container_copy_construction() const noexcept {
+        return {};
+    }
+    [[nodiscard]] std::pmr::memory_resource* resource() const noexcept { return resource_; }
+    [[nodiscard]] T* allocate(std::size_t count) {
+        return std::pmr::polymorphic_allocator<T>(resource_).allocate(count);
+    }
+    void deallocate(T* pointer, std::size_t count) noexcept {
+        std::pmr::polymorphic_allocator<T>(resource_).deallocate(pointer, count);
+    }
+    template <class U, class... Args>
+    void construct(U* pointer, Args&&... args) {
+        // Preserve uses-allocator construction for nested strings/containers.
+        std::pmr::polymorphic_allocator<T>(resource_).construct(
+            pointer, std::forward<Args>(args)...);
+    }
+    template <class U>
+    [[nodiscard]] bool operator==(const ThreadLocalAllocator<U>& other) const noexcept {
+        return resource_->is_equal(*other.resource());
+    }
+
+private:
+    template <class> friend class ThreadLocalAllocator;
+    std::pmr::memory_resource* resource_;
+    std::shared_ptr<worker_memory> lifetime_;
+};
 template <class T, class... Args>
 [[nodiscard]] std::shared_ptr<T> AllocateShared(Args&&... args) {
     return std::allocate_shared<T>(ThreadLocalAllocator<T>{}, std::forward<Args>(args)...);
 }
-template <class T> using ThreadLocalVector = std::pmr::vector<T>;
+template <class T> using ThreadLocalVector = std::vector<T, ThreadLocalAllocator<T>>;
 
 // Zero-allocation-when-empty PMR ring deque. Allocates a contiguous power-of-2
 // array from its memory_resource on demand and returns it immediately when the
@@ -981,20 +988,20 @@ template <class T>
 class RingDeque {
 public:
     using value_type = T;
-    using allocator_type = std::pmr::polymorphic_allocator<T>;
+    using allocator_type = ThreadLocalAllocator<T>;
     using size_type = std::size_t;
     using difference_type = std::ptrdiff_t;
     using reference = T&;
     using const_reference = const T&;
 
-    RingDeque() noexcept : resource_(std::pmr::get_default_resource()) {}
+    RingDeque() noexcept : resource_(CurrentResource()) {}
     explicit RingDeque(std::pmr::memory_resource* resource) noexcept
-        : resource_(resource ? resource : std::pmr::get_default_resource()) {}
+        : resource_(resource ? resource : CurrentResource()) {}
     explicit RingDeque(const allocator_type& alloc) noexcept
         : resource_(alloc.resource()) {}
 
     RingDeque(const RingDeque& other)
-        : resource_(std::pmr::get_default_resource()) {
+        : resource_(CurrentResource()) {
         if (!other.empty()) {
             Reserve(other.size_);
             for (std::size_t i = 0; i < other.size_; ++i) {
@@ -1028,21 +1035,12 @@ public:
     RingDeque& operator=(RingDeque&& other) noexcept {
         if (this != &other) {
             clear();
-            if (resource_ == other.resource_) {
-                data_ = std::exchange(other.data_, nullptr);
-                head_ = std::exchange(other.head_, 0);
-                size_ = std::exchange(other.size_, 0);
-                capacity_ = std::exchange(other.capacity_, 0);
-            } else {
-                if (!other.empty()) {
-                    Reserve(other.size_);
-                    for (std::size_t i = 0; i < other.size_; ++i) {
-                        std::construct_at(data_ + size_, std::move(other[i]));
-                        ++size_;
-                    }
-                }
-                other.clear();
-            }
+            resource_ = other.resource_;
+            resource_lifetime_ = other.resource_lifetime_;
+            data_ = std::exchange(other.data_, nullptr);
+            head_ = std::exchange(other.head_, 0);
+            size_ = std::exchange(other.size_, 0);
+            capacity_ = std::exchange(other.capacity_, 0);
         }
         return *this;
     }
@@ -1137,16 +1135,12 @@ public:
 
     void swap(RingDeque& other) noexcept {
         if (this == &other) return;
-        if (resource_ == other.resource_) {
-            std::swap(data_, other.data_);
-            std::swap(head_, other.head_);
-            std::swap(size_, other.size_);
-            std::swap(capacity_, other.capacity_);
-            return;
-        }
-        RingDeque temp(std::move(*this));
-        *this = std::move(other);
-        other = std::move(temp);
+        std::swap(resource_, other.resource_);
+        std::swap(resource_lifetime_, other.resource_lifetime_);
+        std::swap(data_, other.data_);
+        std::swap(head_, other.head_);
+        std::swap(size_, other.size_);
+        std::swap(capacity_, other.capacity_);
     }
 
 private:
@@ -1197,6 +1191,7 @@ private:
     }
 
     std::pmr::memory_resource* resource_;
+    std::shared_ptr<worker_memory> resource_lifetime_{RetainResource(resource_)};
     T* data_ = nullptr;
     std::size_t head_ = 0;
     std::size_t size_ = 0;
@@ -1204,14 +1199,15 @@ private:
 };
 
 template <class T> using ThreadLocalDeque = RingDeque<T>;
-template <class T> using ThreadLocalList = std::pmr::list<T>;
+template <class T> using ThreadLocalList = std::list<T, ThreadLocalAllocator<T>>;
 template <class Key, class Value, class Compare = std::less<Key>>
-using ThreadLocalMap = std::pmr::map<Key, Value, Compare>;
+using ThreadLocalMap = std::map<Key, Value, Compare, ThreadLocalAllocator<std::pair<const Key, Value>>>;
 template <class Key, class Value, class Hash = std::hash<Key>, class Eq = std::equal_to<Key>>
-using ThreadLocalUnorderedMap = std::pmr::unordered_map<Key, Value, Hash, Eq>;
+using ThreadLocalUnorderedMap = std::unordered_map<Key, Value, Hash, Eq,
+    ThreadLocalAllocator<std::pair<const Key, Value>>>;
 template <class Key, class Hash = std::hash<Key>, class Eq = std::equal_to<Key>>
-using ThreadLocalUnorderedSet = std::pmr::unordered_set<Key, Hash, Eq>;
-using ThreadLocalString = std::pmr::string;
+using ThreadLocalUnorderedSet = std::unordered_set<Key, Hash, Eq, ThreadLocalAllocator<Key>>;
+using ThreadLocalString = std::basic_string<char, std::char_traits<char>, ThreadLocalAllocator<char>>;
 using ByteVector = ThreadLocalVector<uint8_t>;
 
 } // namespace acpp::memory

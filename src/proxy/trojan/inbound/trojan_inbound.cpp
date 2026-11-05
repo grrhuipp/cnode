@@ -9,7 +9,6 @@
 #include "acppnode/app/proxyman/inbound/factory.hpp"
 #include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
-#include "acppnode/common/address_codec.hpp"
 #include "acppnode/infra/config_types.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/common/allocator.hpp"
@@ -55,7 +54,7 @@ public:
                 co_return std::move(packet.payload);
             }
             buf::MultiBuffer raw = co_await src_.ReadMultiBuffer();
-            if (!buf::HasData(raw)) {
+            if (raw.byte_size() == 0) {
                 framer_.Finish();
                 co_return buf::MultiBuffer{};
             }
@@ -97,7 +96,8 @@ ParseTrojanRequest(AsyncStream& stream,
                    std::string_view client_ip) {
     std::array<uint8_t, kMaxTrojanHandshakeBytes> handshake_buf{};
     size_t total_read = 0;
-    size_t required = 59;
+    size_t required = ::acpp::trojan::kRequestPrefixSize;
+    ::acpp::trojan::RequestDecodeResult decoded;
     while (true) {
         if (required > kMaxTrojanHandshakeBytes) {
             co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
@@ -119,41 +119,37 @@ ParseTrojanRequest(AsyncStream& stream,
             }
             total_read += n;
         }
-        auto address = DecodeAddress(
-            std::span(handshake_buf.data() + 59, total_read - 59),
-            AddressWireFormat::Socks5, {253, true});
-        if (address.status == AddressDecodeStatus::Invalid) {
-            co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
-        }
-        const size_t next_required = 59 + (address.status == AddressDecodeStatus::Complete
-            ? address.consumed + 2 : address.required);
-        if (address.status == AddressDecodeStatus::Complete && total_read >= next_required) {
+        decoded = ::acpp::trojan::DecodeRequest(
+            std::span<const uint8_t>(handshake_buf.data(), total_read));
+        if (decoded.status == ::acpp::trojan::RequestDecodeStatus::Complete) {
             break;
         }
-        required = next_required;
+        if (decoded.status == ::acpp::trojan::RequestDecodeStatus::InvalidAddress) {
+            co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+        }
+        if (decoded.status == ::acpp::trojan::RequestDecodeStatus::InvalidHeader) {
+            LOG_NET_WARN("[{}] Trojan parse failed from {}", tag, client_ip);
+            co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        }
+        required = decoded.required;
     }
 
-    size_t consumed = 0;
-    auto request = ::acpp::trojan::TrojanCodec::ParseRequest(
-        handshake_buf.data(), total_read, consumed);
-    if (!request) {
-        LOG_NET_WARN("[{}] Trojan parse failed from {}", tag, client_ip);
-        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
-    }
+    auto& request = decoded.request;
+    const size_t consumed = decoded.consumed;
     auto user_info = proxyman::inbound::UserStore::FindTrojanUser(
-        tag, request->PasswordHashView());
+        tag, request.PasswordHashView());
     if (!user_info) {
         LOG_NET_WARN("[{}] Trojan auth failed from {}", tag, client_ip);
         if (limiter && ctx.inbound.HasProxyProtocolClientIP()) {
-            limiter->OnAuthFailTracked(tag, client_ip);
+            co_await limiter->OnAuthFailTracked(tag, client_ip);
         }
         co_return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
     }
 
     TrojanHandshakeResult result{
         .user = std::move(user_info),
-        .command = request->command,
-        .target = std::move(request->target),
+        .command = request.command,
+        .target = std::move(request.target),
         .initial_payload = {},
     };
     if (total_read > consumed) {
@@ -177,10 +173,10 @@ ParseTrojanRequest(AsyncStream& stream,
 proxy::trojan::inbound::Handler::Handler(
     ::acpp::UserOnlineTracker& validator,
     StatsShard& stats,
-    ConnectionLimiterPtr limiter)
+    ConnectionLimiter* limiter)
     : validator_(validator)
     , stats_(&stats)
-    , limiter_(std::move(limiter))
+    , limiter_(limiter)
 {}
 
 net::awaitable<RelayResult>
@@ -211,7 +207,7 @@ proxy::trojan::inbound::Handler::Process(
     LOG_CONN_DEBUG(ctx, "[Trojan][{}] Process start from {}", tag, client_ip);
 
     if (limiter_ && ctx.inbound.HasProxyProtocolClientIP() &&
-        limiter_->IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {
+        co_await limiter_->IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {
         LOG_NET_DEBUG("{} from {}:{} rejected ip_banned [{}]",
             FormatTimestamp(ctx.accept_time_us),
             ctx.inbound.source_ip, ctx.inbound.source_port, ctx.inbound.tag);
@@ -231,10 +227,10 @@ proxy::trojan::inbound::Handler::Process(
         ctx.inbound.user_id = profile.user_id;
         ctx.inbound.user_email = profile.email;
         ctx.content.speed_limit = profile.speed_limit;
-        user_session = validator_.TryConnectSession(
+        user_session = co_await validator_.TryConnectSession(
             tag, profile.user_id, ctx.inbound.source_ip, profile.device_limit);
         if (!user_session) {
-            LOG_NET_DEBUG("{} from {}:{} rejected device_limit [{}] user={} limit={} online_devices={}",
+            LOG_NET_DEBUG("{} from {}:{} rejected device_limit [{}] user={} limit={} domain_online_devices={}",
                 FormatTimestamp(ctx.accept_time_us),
                 ctx.inbound.source_ip, ctx.inbound.source_port, tag, ctx.inbound.user_email,
                 profile.device_limit,
@@ -252,7 +248,7 @@ proxy::trojan::inbound::Handler::Process(
         ctx.outbound.original_target = handshake->target;
         ctx.outbound.target = std::move(handshake->target);
         ctx.content.network = net;
-        if (buf::HasData(handshake->initial_payload)) {
+        if (handshake->initial_payload.byte_size() != 0) {
             initial_payload = InitialPayload(std::move(handshake->initial_payload));
         }
     }
@@ -311,7 +307,7 @@ const bool kTrojanInboundRegistered = [] {
     reg.create_tcp_handler =
         [](acpp::proxyman::inbound::ProtocolRuntime& runtime,
            acpp::StatsShard& stats,
-           acpp::ConnectionLimiterPtr limiter,
+           acpp::ConnectionLimiter* limiter,
            const acpp::proxyman::inbound::BuildRequest&) -> std::unique_ptr<acpp::Inbound> {
             auto* trojan_runtime = dynamic_cast<TrojanRuntime*>(&runtime);
             if (!trojan_runtime) {

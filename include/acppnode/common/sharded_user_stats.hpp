@@ -1,17 +1,15 @@
 #pragma once
 
 // ============================================================================
-// sharded_user_stats.hpp — Worker 私有在线用户追踪
-//
-// 从 TimedUserValidator / Validator 中提取的公共逻辑。
-// 协议特有内容（用户存储、认证、HotCache、IP 封禁）各自保留在协议 manager 中。
-//
-// 在线状态归属 Worker 线程：连接建立、断开和面板在线采集都通过
-// 对应 Worker executor 执行，因此无需锁、原子或跨线程协调。
+// Session-domain online tracking with process-wide device admission.
+// Protocol caches remain private to the domain; the bounded control coordinator
+// owns device admission across all Workers and domains. Preallocated return
+// notices release quotas without blocking. Reporting reads domain-local leases.
 // ============================================================================
 
 #include "acppnode/common/online_device.hpp"
 #include "acppnode/common/allocator.hpp"
+#include "acppnode/common/asio_types.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -28,33 +26,22 @@ class UserOnlineSessionGuard;
 
 class UserOnlineTracker {
 public:
-    using OnlineDevice = ::acpp::OnlineDevice;
-
     UserOnlineTracker();
     ~UserOnlineTracker();
 
+    // UserOnlineSessionGuard 借用本对象地址：禁止拷贝，且不声明移动。
     UserOnlineTracker(const UserOnlineTracker&) = delete;
     UserOnlineTracker& operator=(const UserOnlineTracker&) = delete;
-    UserOnlineTracker(UserOnlineTracker&&) noexcept;
-    UserOnlineTracker& operator=(UserOnlineTracker&&) noexcept;
-    [[nodiscard]] std::optional<UserOnlineSessionGuard> TryConnectSession(
+    [[nodiscard]] net::awaitable<std::optional<UserOnlineSessionGuard>> TryConnectSession(
         std::string_view tag,
         int64_t user_id,
         std::string_view client_ip,
         uint32_t device_limit);
 
-    void OnUserConnected(std::string_view tag,
-                         uint64_t user_id,
-                         std::string_view client_ip);
-
+    // 只做查找与摘除，不分配。
     void OnUserDisconnected(std::string_view tag,
                             uint64_t user_id,
-                            std::string_view client_ip);
-
-    [[nodiscard]] bool CanAcceptDevice(std::string_view tag,
-                                       uint64_t user_id,
-                                       std::string_view client_ip,
-                                       uint32_t device_limit) const;
+                            std::string_view client_ip) noexcept;
 
     [[nodiscard]] size_t OnlineDeviceCount(std::string_view tag,
                                            uint64_t user_id) const;
@@ -69,12 +56,10 @@ class UserOnlineSessionGuard {
 public:
     UserOnlineSessionGuard() noexcept = default;
 
-    UserOnlineSessionGuard(UserOnlineTracker& tracker,
-                           std::string_view tag,
+    UserOnlineSessionGuard(std::string_view tag,
                            uint64_t user_id,
                            std::string_view client_ip)
-        : tracker_(&tracker)
-        , tag_(tag)
+        : tag_(tag)
         , user_id_(user_id)
         , client_ip_(client_ip) {}
 
@@ -89,7 +74,8 @@ public:
         : tracker_(std::exchange(other.tracker_, nullptr))
         , tag_(std::move(other.tag_))
         , user_id_(std::exchange(other.user_id_, 0))
-        , client_ip_(std::move(other.client_ip_)) {}
+        , client_ip_(std::move(other.client_ip_))
+        , quota_reservation_(std::move(other.quota_reservation_)) {}
 
     UserOnlineSessionGuard& operator=(UserOnlineSessionGuard&& other) noexcept {
         if (this == &other) {
@@ -100,26 +86,27 @@ public:
         tag_ = std::move(other.tag_);
         user_id_ = std::exchange(other.user_id_, 0);
         client_ip_ = std::move(other.client_ip_);
+        quota_reservation_ = std::move(other.quota_reservation_);
         return *this;
     }
 
 private:
+    friend class UserOnlineTracker;
+    void Arm(UserOnlineTracker& tracker) noexcept { tracker_ = &tracker; }
     void Reset() noexcept {
         if (!tracker_ || user_id_ == 0) {
             return;
         }
         auto* tracker = std::exchange(tracker_, nullptr);
-        const auto user_id = std::exchange(user_id_, 0);
-        try {
-            tracker->OnUserDisconnected(tag_, user_id, client_ip_);
-        } catch (...) {
-        }
+        tracker->OnUserDisconnected(tag_, std::exchange(user_id_, 0), client_ip_);
+        quota_reservation_.reset();
     }
 
     UserOnlineTracker* tracker_ = nullptr;
     memory::ThreadLocalString tag_;
     uint64_t user_id_ = 0;
     memory::ThreadLocalString client_ip_;
+    std::shared_ptr<void> quota_reservation_;
 };
 
 }  // namespace acpp

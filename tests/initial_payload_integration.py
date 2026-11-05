@@ -7,7 +7,6 @@ import argparse
 import asyncio
 import hashlib
 import json
-import os
 from pathlib import Path
 import socket
 import ssl
@@ -121,7 +120,7 @@ async def run_case(binary, output, protocol, prefix_size, key_transform=None):
     elif protocol == 'trojan':
         outbound['settings'] = {'servers': [{'address': '127.0.0.1', 'port': peer_port, 'password': PASSWORD}]}
     elif protocol == 'anytls':
-        outbound['settings'] = {'server': '127.0.0.1', 'server_port': peer_port, 'password': PASSWORD,
+        outbound['settings'] = {'address': '127.0.0.1', 'port': peer_port, 'password': PASSWORD,
                                 'idleSessionCheckInterval': 1, 'idleSessionTimeout': 1, 'minIdleSession': 0}
     if tls:
         outbound['streamSettings'] = {'network': 'tcp', 'security': 'tls',
@@ -143,8 +142,7 @@ async def run_case(binary, output, protocol, prefix_size, key_transform=None):
     client = None
     with (output / 'child.log').open('w', encoding='utf-8') as logfile:
         child = subprocess.Popen([str(binary), '--config-dir', str(output)], stdout=logfile,
-                                 stderr=subprocess.STDOUT,
-                                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+                                 stderr=subprocess.STDOUT)
         try:
             deadline = time.monotonic() + 8
             while 'server started' not in (output / 'child.log').read_text(encoding='utf-8', errors='replace'):

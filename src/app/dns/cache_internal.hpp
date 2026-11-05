@@ -26,7 +26,6 @@ private:
     struct DnsCacheEntry {
         memory::ThreadLocalVector<net::ip::address> addresses;
         time_point expire_time;
-        uint32_t ttl;
         bool negative = false;
     };
     struct CacheNode {

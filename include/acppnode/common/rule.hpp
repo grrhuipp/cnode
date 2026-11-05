@@ -6,32 +6,37 @@
 #include "acppnode/common/string_hash.hpp"
 
 #include <string_view>
+#include <atomic>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace acpp::rule {
 
-// Owned by one Worker and accessed only on that Worker's io_context.
-class Manager final : public features::policy::RequestPolicy, public memory::ThreadAllocated {
+// Process-owned cold publication endpoint. Requests read immutable snapshots;
+// neither rules nor their allocation lifetime depend on the accepting Worker.
+class DetectRulePolicy final : public features::policy::RequestPolicy {
 public:
-    Manager();
-    ~Manager();
+    DetectRulePolicy();
+    ~DetectRulePolicy();
 
-    Manager(const Manager&) = delete;
-    Manager& operator=(const Manager&) = delete;
-    Manager(Manager&&) noexcept;
-    Manager& operator=(Manager&&) noexcept;
+    DetectRulePolicy(const DetectRulePolicy&) = delete;
+    DetectRulePolicy& operator=(const DetectRulePolicy&) = delete;
+    DetectRulePolicy(DetectRulePolicy&&) = delete;
+    DetectRulePolicy& operator=(DetectRulePolicy&&) = delete;
 
     void UpdateRule(std::string_view tag, const std::vector<DetectRule>& new_rule_list);
     [[nodiscard]] bool Blocked(
         const session::Context& ctx) override;
 private:
-    using RuleList = memory::ThreadLocalVector<DetectRule>;
-    using InboundRule =
-        memory::ThreadLocalUnorderedMap<memory::ThreadLocalString,
-                                        RuleList,
-                                        TransparentStringHash,
-                                        TransparentStringEq>;
-    InboundRule rules_;
+    using RuleList = std::vector<DetectRule>;
+    using InboundRule = std::unordered_map<std::string, RuleList,
+                                          TransparentStringHash,
+                                          TransparentStringEq>;
+    std::mutex update_mutex_;
+    std::atomic<std::shared_ptr<const InboundRule>> rules_;
 };
 
 }  // namespace acpp::rule

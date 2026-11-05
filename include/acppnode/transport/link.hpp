@@ -37,6 +37,9 @@ public:
     virtual net::awaitable<buf::MultiBuffer> ReadMultiBuffer() = 0;
     virtual CancellationSource& Cancellation() noexcept = 0;
     virtual EofAction ReadEofAction() const noexcept { return EofAction::WaitForPeer; }
+    // Vision command 2 is a read-direction transition at an idle read boundary.
+    // Wrappers retain already-read bytes; unsupported transports fail closed.
+    [[nodiscard]] virtual bool EnableRawRead() noexcept { return false; }
 };
 
 class MultiBufferWriter {

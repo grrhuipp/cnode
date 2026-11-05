@@ -5,6 +5,7 @@
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/cancellation_signal.hpp>
 #include <asio/co_spawn.hpp>
+#include <asio/detached.hpp>
 #include <asio/executor_work_guard.hpp>
 #include <asio/post.hpp>
 #include <asio/this_coro.hpp>
@@ -42,7 +43,7 @@ private:
     bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
         return this == &other;
     }
-    acpp::memory::ThreadPoolFacade upstream_;
+    acpp::memory::ThreadMemoryResource upstream_;
 };
 
 void Check(bool condition, const char* message) {
@@ -378,6 +379,45 @@ void TestExecutor() {
     result.get();
     Check(child && parent, "executor ownership must be preserved");
 }
+
+// Children started by coroutines outside the group stay owned until
+// AsyncJoin, which cancels them, waits for their cleanup and closes admission;
+// a per-child source cancels only its own child.
+void TestResidentGroup() {
+    net::io_context io;
+    net::steady_timer gate(io);
+    gate.expires_at(net::steady_timer::time_point::max());
+    Counts counts;
+    bool joined = false;
+    bool rejected = false;
+    {
+        acpp::ResidentTaskGroup resident(io.get_executor());
+        acpp::transport::CancellationSource own;
+        net::co_spawn(io, [&]() -> net::awaitable<void> {
+            resident.Tasks().Spawn(Wait(gate, counts, true));
+            resident.Tasks().Spawn(Wait(gate, counts, true), &own);
+            co_return;
+        }, net::detached);
+        io.poll();
+        Check(counts.active == 2, "resident children must start from a foreign coroutine");
+        own.Stop();
+        io.run_for(std::chrono::milliseconds(100));
+        Check(counts.active == 1 && counts.finished == 1,
+              "a child source must cancel only its own resident child");
+        net::co_spawn(io, resident.AsyncJoin(), [&](std::exception_ptr error) {
+            joined = !error && counts.active == 0;
+        });
+        io.poll();
+        Check(!joined, "resident join must wait for asynchronous child cleanup");
+        io.run_for(std::chrono::milliseconds(200));
+        try { resident.Tasks().Spawn(Wait(gate, counts)); }
+        catch (const acpp::IoSystemError& error) {
+            rejected = error.code() == net::error::operation_aborted;
+        }
+    }
+    Check(joined && rejected && counts.active == 0 && counts.finished == 2,
+          "resident join must cancel, join and close admission");
+}
 }  // namespace
 
 void* operator new(std::size_t size) {
@@ -404,6 +444,7 @@ int main() {
         TestAllocationFailures();
         TestMoveOnlyStart();
         TestExecutor();
+        TestResidentGroup();
         Check(resource.live.load() == 0, "all PMR task bookkeeping must be released");
         Check(acpp::memory::CrossThreadFreeCount() == 0,
               "group and child PMR objects must be freed on the target executor");

@@ -1,5 +1,6 @@
 #include "acppnode/transport/internet/ws_stream.hpp"
-#include "acppnode/common/base64.hpp"
+#include "http1_handshake.hpp"
+#include "acppnode/common/binary_text_codec.hpp"
 #include "acppnode/common/unsafe.hpp"
 #include "acppnode/common/buffer_util.hpp"
 #include "acppnode/infra/log.hpp"
@@ -10,7 +11,6 @@
 #include <asio/co_spawn.hpp>
 #include <algorithm>
 #include <limits>
-#include <cctype>
 #include <string_view>
 #include <stdexcept>
 
@@ -20,110 +20,20 @@ namespace ws {
 
 std::string ComputeWsAccept(std::string_view ws_key) {
     constexpr std::string_view kWsGuid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-    std::array<char, 256> inline_buf;
-    uint8_t sha1[20];
-    if (ws_key.size() + kWsGuid.size() <= inline_buf.size()) {
-        std::memcpy(inline_buf.data(), ws_key.data(), ws_key.size());
-        std::memcpy(inline_buf.data() + ws_key.size(), kWsGuid.data(), kWsGuid.size());
-        SHA1(unsafe::ptr_cast<const uint8_t>(inline_buf.data()),
-             ws_key.size() + kWsGuid.size(),
-             sha1);
-    } else {
-        std::string accept_src;
-        accept_src.reserve(ws_key.size() + kWsGuid.size());
-        accept_src.append(ws_key);
-        accept_src.append(kWsGuid);
-        SHA1(unsafe::ptr_cast<const uint8_t>(accept_src.data()), accept_src.size(), sha1);
-    }
+    uint8_t sha1[SHA_DIGEST_LENGTH];
+    SHA_CTX context;
+    SHA1_Init(&context);
+    SHA1_Update(&context, ws_key.data(), ws_key.size());
+    SHA1_Update(&context, kWsGuid.data(), kWsGuid.size());
+    SHA1_Final(sha1, &context);
     return Base64Encode(sha1, sizeof(sha1));
 }
 
 }  // namespace ws
 
 namespace {
-[[nodiscard]] char LowerAsciiChar(char ch) {
-    return static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-}
-
-[[nodiscard]] bool EqualsAsciiCI(std::string_view lhs, std::string_view rhs) {
-    if (lhs.size() != rhs.size()) {
-        return false;
-    }
-    for (size_t i = 0; i < lhs.size(); ++i) {
-        if (LowerAsciiChar(lhs[i]) != LowerAsciiChar(rhs[i])) {
-            return false;
-        }
-    }
-    return true;
-}
-
-[[nodiscard]] std::string_view TrimAscii(std::string_view value) {
-    while (!value.empty() &&
-           (value.front() == ' ' || value.front() == '\t' ||
-            value.front() == '\r' || value.front() == '\n')) {
-        value.remove_prefix(1);
-    }
-    while (!value.empty() &&
-           (value.back() == ' ' || value.back() == '\t' ||
-            value.back() == '\r' || value.back() == '\n')) {
-        value.remove_suffix(1);
-    }
-    return value;
-}
-
-[[nodiscard]] std::string_view ExtractHttpHeaderCI(
-    std::string_view response,
-    std::string_view name) {
-    size_t line_start = 0;
-    while (line_start < response.size()) {
-        const size_t line_end = response.find("\r\n", line_start);
-        if (line_end == std::string_view::npos) {
-            break;
-        }
-        if (line_end == line_start) {
-            break;
-        }
-
-        const std::string_view line = response.substr(line_start, line_end - line_start);
-        if (const size_t colon = line.find(':'); colon != std::string_view::npos) {
-            if (EqualsAsciiCI(line.substr(0, colon), name)) {
-                size_t value_start = colon + 1;
-                while (value_start < line.size() &&
-                       (line[value_start] == ' ' || line[value_start] == '\t')) {
-                    ++value_start;
-                }
-                return TrimAscii(line.substr(value_start));
-            }
-        }
-        line_start = line_end + 2;
-    }
-    return {};
-}
-
-[[nodiscard]] std::string_view ExtractStatusLine(std::string_view response) {
-    const size_t crlf = response.find("\r\n");
-    return crlf == std::string_view::npos ? response : response.substr(0, crlf);
-}
-
-[[nodiscard]] bool IsSwitchingProtocolsStatus(std::string_view status_line) {
-    if (!status_line.starts_with("HTTP/")) {
-        return false;
-    }
-    size_t pos = status_line.find(' ');
-    if (pos == std::string_view::npos) {
-        return false;
-    }
-    while (pos < status_line.size() && status_line[pos] == ' ') {
-        ++pos;
-    }
-    if (pos + 3 > status_line.size() ||
-        status_line[pos] != '1' ||
-        status_line[pos + 1] != '0' ||
-        status_line[pos + 2] != '1') {
-        return false;
-    }
-    return pos + 3 == status_line.size() || status_line[pos + 3] == ' ';
-}
+using transport::internet::EqualsAsciiCI;
+using transport::internet::TrimAscii;
 
 class WriteGateWait final : private transport::CancellationSubscription {
 public:
@@ -174,15 +84,8 @@ BaseWsStream::~BaseWsStream() noexcept {
 }
 
 void BaseWsStream::SetPendingData(const uint8_t* data, size_t len) {
-    size_t offset = 0;
-    while (offset < len) {
-        buf::BufferGuard buffer{buf::Buffer::New()};
-        if (!buffer) throw std::bad_alloc();
-        const size_t n = std::min(len - offset, static_cast<size_t>(buffer->Available()));
-        std::memcpy(buffer->Tail().data(), data + offset, n);
-        buffer->Produce(static_cast<uint32_t>(n));
-        pending_data_.push_back(std::move(buffer));
-        offset += n;
+    if (!buf::AppendSpanToMultiBuffer(std::span<const uint8_t>(data, len), pending_data_)) {
+        throw std::bad_alloc();
     }
 }
 
@@ -643,13 +546,7 @@ net::awaitable<WsHandshakeResult> WsClientStream::Handshake(
     std::string ws_key = Base64Encode(raw_key, sizeof(raw_key));
 
     const std::string_view req_path = path.empty() ? "/" : std::string_view(path);
-    auto is_host_header = [](std::string_view key) {
-        if (key.size() != 4) return false;
-        return std::tolower(static_cast<unsigned char>(key[0])) == 'h' &&
-               std::tolower(static_cast<unsigned char>(key[1])) == 'o' &&
-               std::tolower(static_cast<unsigned char>(key[2])) == 's' &&
-               std::tolower(static_cast<unsigned char>(key[3])) == 't';
-    };
+    auto is_host_header = [](std::string_view key) { return EqualsAsciiCI(key, "host"); };
 
     size_t reserve_size = 256 + req_path.size() + host.size() + ws_key.size();
     if (headers) {
@@ -661,7 +558,7 @@ net::awaitable<WsHandshakeResult> WsClientStream::Handshake(
     }
 
     std::array<std::byte, 512> arena_buf{};
-    memory::request_memory arena(memory::ThreadPool(), arena_buf);
+    memory::request_memory arena(memory::ThreadMemoryPool(), arena_buf);
     memory::ThreadLocalString request(arena.resource());
     request.reserve(reserve_size);
     request.append("GET ");
@@ -690,48 +587,30 @@ net::awaitable<WsHandshakeResult> WsClientStream::Handshake(
     const net::const_buffer request_buffer(request.data(), request.size());
     co_await inner_->WriteBuffers({&request_buffer, 1});
 
-    buf::BufferGuard response_buf{buf::Buffer::New()};
-    if (!response_buf) {
-        co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
-    }
-    char* response_data = unsafe::ptr_cast<char>(response_buf->Tail().data());
-    const size_t response_capacity = response_buf->Available();
-    size_t response_len = 0;
-    bool found_end = false;
-    size_t header_end = 0;
-
-    while (!found_end && response_len < response_capacity) {
-        size_t n = co_await inner_->AsyncRead(
-            net::buffer(response_data + response_len, response_capacity - response_len));
-        if (n == 0) {
-            LOG_NET_DEBUG("[conn={}] WS client: peer closed during upgrade response read", conn_id_);
-            co_return tl::unexpected(ErrorCode::SOCKET_EOF);
-        }
-
-        response_len += n;
-        std::string_view response(response_data, response_len);
-        size_t pos = response.find("\r\n\r\n");
-        if (pos != std::string_view::npos) {
-            found_end = true;
-            header_end = pos + 4;
-        }
+    auto head = co_await transport::internet::ReadHttp1MessageHead(*inner_);
+    if (!head) {
+        LOG_NET_DEBUG("[conn={}] WS client: upgrade response read failed", conn_id_);
+        co_return tl::unexpected(head.error());
     }
 
-    if (!found_end) {
-        LOG_NET_DEBUG("[conn={}] WS client: incomplete upgrade response", conn_id_);
-        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
-    }
-
-    const std::string_view response(response_data, response_len);
-    const std::string_view first_line = ExtractStatusLine(response);
-    if (!IsSwitchingProtocolsStatus(first_line)) {
+    const std::string_view response = head->Text();
+    const std::string_view first_line = transport::internet::ExtractStartLine(response);
+    if (!transport::internet::HasStatusCode(first_line, "101")) {
         LOG_NET_DEBUG("[conn={}] WS client: server rejected upgrade: {}",
                   conn_id_,
                   first_line);
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
+    // RFC 6455 4.1: both Upgrade and Connection are mandatory. Connection
+    // is a case-insensitive token list combined across all same-name lines.
+    if (!transport::internet::EqualsAsciiCI(TrimAscii(
+            transport::internet::ExtractHeaderValueCI(response, "Upgrade")), "websocket") ||
+        !transport::internet::HeaderListContainsTokenCI(response, "Connection", "upgrade")) {
+        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+    }
 
-    const std::string_view accept = ExtractHttpHeaderCI(response, "Sec-WebSocket-Accept");
+    const std::string_view accept = TrimAscii(
+        transport::internet::ExtractHeaderValueCI(response, "Sec-WebSocket-Accept"));
     if (accept.empty()) {
         LOG_NET_DEBUG("[conn={}] WS client: missing Sec-WebSocket-Accept", conn_id_);
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
@@ -743,9 +622,8 @@ net::awaitable<WsHandshakeResult> WsClientStream::Handshake(
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
-    if (header_end < response_len) {
-        SetPendingData(unsafe::ptr_cast<const uint8_t>(response_data + header_end),
-                       response_len - header_end);
+    if (const auto read_ahead = head->ReadAhead(); !read_ahead.empty()) {
+        SetPendingData(read_ahead.data(), read_ahead.size());
     }
 
     LOG_NET_DEBUG("[conn={}] WS client: handshake ok (host={} path={})", conn_id_, host, path);

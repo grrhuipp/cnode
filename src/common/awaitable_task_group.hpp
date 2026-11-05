@@ -8,9 +8,12 @@
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/cancellation_signal.hpp>
 #include <asio/co_spawn.hpp>
+#include <asio/redirect_error.hpp>
+#include <asio/steady_timer.hpp>
 #include <asio/this_coro.hpp>
 #include <asio/use_awaitable.hpp>
 
+#include <chrono>
 #include <exception>
 #include <memory>
 #include <optional>
@@ -19,10 +22,11 @@
 
 namespace acpp {
 
-// A finite group on one executor. Spawn is only valid during start or from a
-// running child. The group joins actual completion callbacks, including children
-// added by another child. Parent cancellation and uncaught failure stop every
-// child; an optional request source cancels only the child bound to that source.
+// A finite group on one executor. Spawn is only valid while the group is alive:
+// during start, from a running child, or under a ResidentTaskGroup owner. The
+// group joins actual completion callbacks, including children added by another
+// child. Parent cancellation and uncaught failure stop every child; an optional
+// request source cancels only the child bound to that source.
 class AwaitableTaskGroup {
 public:
     virtual void Spawn(net::awaitable<void> task,
@@ -197,5 +201,67 @@ net::awaitable<void> RunAwaitableTaskGroup(net::any_io_executor executor, Start 
         throw IoSystemError(net::error::operation_aborted);
     }
 }
+
+// Owner for tasks that outlive the coroutine starting them, such as pooled
+// physical sessions held for a Worker's lifetime. Spawn through Tasks() is
+// valid on the executor until AsyncJoin, which cancels every child and resumes
+// after each actual completion. As in any group, an uncaught child failure
+// stops all siblings: resident children must contain their own failures.
+class ResidentTaskGroup final {
+    struct JoinState {
+        explicit JoinState(const net::any_io_executor& executor)
+            : wake(executor, std::chrono::steady_clock::time_point::max()) {}
+        net::steady_timer wake;
+        std::exception_ptr failure;
+        bool done = false;
+    };
+
+    // Owns the join state: children that a destroyed, never-joined owner
+    // cancelled still complete into valid storage.
+    struct Completion {
+        std::shared_ptr<JoinState> join;
+        void operator()(std::exception_ptr failure) {
+            join->failure = std::move(failure);
+            join->done = true;
+            join->wake.cancel();
+        }
+    };
+    using Group = task_group_detail::Group<Completion>;
+
+public:
+    explicit ResidentTaskGroup(net::any_io_executor executor)
+        : join_(memory::AllocateShared<JoinState>(executor))
+        , group_(memory::AllocateShared<Group>(std::move(executor), Completion{join_})) {}
+    ResidentTaskGroup(const ResidentTaskGroup&) = delete;
+    ResidentTaskGroup& operator=(const ResidentTaskGroup&) = delete;
+    ~ResidentTaskGroup() { Close(); }
+
+    [[nodiscard]] AwaitableTaskGroup& Tasks() noexcept { return *group_; }
+
+    // A join is never abandoned halfway: caller cancellation is ignored.
+    net::awaitable<void> AsyncJoin() {
+        co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
+        Close();
+        while (!join_->done) {
+            IoErrorCode ignored;
+            co_await join_->wake.async_wait(net::redirect_error(net::use_awaitable, ignored));
+        }
+        if (join_->failure && !IsOperationCancelled(join_->failure)) {
+            std::rethrow_exception(join_->failure);
+        }
+    }
+
+private:
+    void Close() {
+        if (closed_) return;
+        closed_ = true;
+        group_->Cancel();
+        group_->Finish();  // releases the launch sentinel
+    }
+
+    std::shared_ptr<JoinState> join_;
+    std::shared_ptr<Group> group_;
+    bool closed_ = false;
+};
 
 }  // namespace acpp

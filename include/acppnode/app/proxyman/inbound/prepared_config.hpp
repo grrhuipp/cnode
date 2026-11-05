@@ -64,21 +64,11 @@ struct PreparedKeyBytes {
     }
 };
 
-enum class PreparedAeadCipher : uint8_t {
-    AES_128_GCM = 0,
-    AES_256_GCM = 1,
-    CHACHA20_POLY1305 = 2,
-    AES_128_GCM_2022 = 3,
-    AES_256_GCM_2022 = 4,
-    CHACHA20_POLY1305_2022 = 5,
-};
-
 struct PreparedVmessUser {
     std::string uuid;
     std::array<uint8_t, 16> uuid_bytes{};
     std::array<uint8_t, 16> cmd_key{};
     std::array<uint8_t, 16> auth_key{};
-    std::array<uint8_t, 16> cached_auth_aes_key{};
     ::acpp::UserProfile profile;
 };
 
@@ -98,7 +88,6 @@ struct PreparedShadowsocksUser {
     PreparedKeyBytes derived_key;
     PreparedKeyBytes identity_key;
     std::array<uint8_t, 16> psk_hash{};
-    PreparedAeadCipher cipher_type = PreparedAeadCipher::AES_256_GCM;
     size_t key_size = 32;
     size_t salt_size = 32;
     ::acpp::UserProfile profile;

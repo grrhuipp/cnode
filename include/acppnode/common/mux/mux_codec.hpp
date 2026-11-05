@@ -64,9 +64,8 @@ struct FrameHeader {
     bool          has_target    = false;
     TargetAddress target;
 
-    // GlobalID（New UDP 帧，全零 = 不启用跨连接复用）
-    bool                    has_global_id = false;
-    std::array<uint8_t, 8>  global_id{};
+    // New UDP 帧是否携带 8 字节 GlobalID（XUDP），其取值不参与本端语义
+    bool          has_global_id = false;
 
     // 载荷
     bool     has_data  = false;
@@ -81,28 +80,18 @@ struct FrameHeader {
 // ============================================================================
 // DecodeFrame
 //
-// DecodeFrame 解析 MultiBuffer 中 [offset, offset + len) 的完整帧。
-// DecodeFramePrefix 只借用连续元数据前缀；total_len 包含分散存储的载荷。
+// 解析 MultiBuffer 首部的完整帧，不消费输入。
 // 返回 nullopt 表示数据不足；frame_size == 0 表示非法帧，不能跳字节重同步。
-// 成功时 data_offset 表示载荷相对帧首的偏移，不消费输入。
+// 成功时 data_offset 表示载荷相对帧首的偏移。
 // ============================================================================
 
-[[nodiscard]] std::optional<FrameHeader> DecodeFramePrefix(
-    const uint8_t* data,
-    size_t contiguous_len,
-    size_t total_len);
-
-[[nodiscard]] std::optional<FrameHeader> DecodeFrame(
-    const buf::MultiBuffer& data,
-    size_t offset,
-    size_t len);
+[[nodiscard]] std::optional<FrameHeader> DecodeFrame(const buf::MultiBuffer& data);
 
 // ============================================================================
 // 序列化：服务器 → 客户端
 // ============================================================================
 
 [[nodiscard]] size_t EncodeKeepAliveTo(std::span<uint8_t> out) noexcept;
-void EncodeKeepAliveTo(memory::ByteVector& out);
 
 [[nodiscard]] size_t EncodeNewHeaderTo(std::span<uint8_t> out,
                                        uint16_t session_id,
@@ -124,9 +113,6 @@ void EncodeEndTo(memory::ByteVector& out,
 [[nodiscard]] size_t EncodeKeepDataHeaderTo(std::span<uint8_t> out,
                                             uint16_t session_id,
                                             size_t payload_len) noexcept;
-[[nodiscard]] bool EncodeKeepDataHeaderTo(memory::ByteVector& out,
-                                          uint16_t session_id,
-                                          size_t payload_len);
 
 [[nodiscard]] size_t EncodeKeepUDPHeaderTo(std::span<uint8_t> out,
                                            uint16_t session_id,

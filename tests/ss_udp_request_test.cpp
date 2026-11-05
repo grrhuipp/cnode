@@ -85,7 +85,7 @@ buf::MultiBuffer MakePayload(
 
 std::vector<uint8_t> Flatten(const buf::MultiBuffer& payload) {
     std::vector<uint8_t> bytes;
-    bytes.reserve(buf::TotalLen(payload));
+    bytes.reserve(payload.byte_size());
     for (const auto* buffer : payload) {
         const auto part = buffer->Bytes();
         bytes.insert(bytes.end(), part.begin(), part.end());

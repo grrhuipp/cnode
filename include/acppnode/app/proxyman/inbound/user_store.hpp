@@ -4,6 +4,8 @@
 #include "acppnode/common/string_hash.hpp"
 #include "acppnode/common/user_profile.hpp"
 
+#include <openssl/aes.h>
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -35,8 +37,9 @@ public:
     struct VmessCredential {
         std::array<uint8_t, 16> uuid_bytes{};
         std::array<uint8_t, 16> cmd_key{};
-        std::array<uint8_t, 16> auth_key{};
-        std::array<uint8_t, 16> cached_auth_aes_key{};
+        // AES-128 decrypt schedule of the AuthID key, expanded once when the
+        // snapshot is built; handshakes never rebuild it per candidate user.
+        AES_KEY auth_id_key{};
         Profile profile;
     };
 
@@ -54,7 +57,6 @@ public:
         PreparedKeyBytes derived_key;
         PreparedKeyBytes identity_key;
         std::array<uint8_t, 16> psk_hash{};
-        PreparedAeadCipher cipher_type = PreparedAeadCipher::AES_256_GCM;
         size_t key_size = 32;
         size_t salt_size = 32;
         Profile profile;
@@ -146,6 +148,10 @@ public:
     // Install/Clear execute only on the destination Worker's thread.
     [[nodiscard]] static WorkerView PrepareWorkerView(PublishedSnapshot snapshot);
     static void InstallWorkerView(WorkerView view) noexcept;
+    // Domain callback entry/exit swaps a lease without dropping the suspended
+    // Worker's view. Credential aliases retain their immutable snapshot.
+    [[nodiscard]] static WorkerView ExchangeWorkerView(WorkerView view) noexcept;
+    [[nodiscard]] static WorkerView CaptureWorkerView() noexcept;
     static void ClearWorkerView() noexcept;
     [[nodiscard]] static uint64_t WorkerViewRevision() noexcept;
 

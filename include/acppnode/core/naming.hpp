@@ -3,7 +3,6 @@
 #include "acppnode/core/constants.hpp"
 
 #include <algorithm>
-#include <cctype>
 #include <cstdint>
 #include <format>
 #include <string>
@@ -30,8 +29,8 @@ inline constexpr std::string_view kPanelNodeTagPrefix = "panel/";
 }
 
 [[nodiscard]] inline std::string LowerAscii(std::string value) {
-    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
-        return static_cast<char>(std::tolower(ch));
+    std::transform(value.begin(), value.end(), value.begin(), [](char ch) {
+        return ch >= 'A' && ch <= 'Z' ? static_cast<char>(ch - 'A' + 'a') : ch;
     });
     return value;
 }

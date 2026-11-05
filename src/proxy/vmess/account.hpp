@@ -22,7 +22,6 @@ struct MemoryAccount {
     std::array<uint8_t, 16> uuid_bytes;
     std::array<uint8_t, 16> cmd_key;
     std::array<uint8_t, 16> auth_key;
-    std::array<uint8_t, 16> cached_auth_aes_key;
     ::acpp::UserProfile profile;
 
     static std::optional<MemoryAccount> FromUUID(

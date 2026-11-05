@@ -10,6 +10,7 @@
 #include "acppnode/proxy/freedom_domain_strategy.hpp"
 
 #include <chrono>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -30,6 +31,8 @@ struct PanelConfig {
     std::chrono::seconds RequestTimeout{defaults::kPanelRequestTimeout};
     PanelNodeIds NodeIDs;
     std::string NodeType = std::string(constants::panel::kDefaultNodeType);
+    // Local durable accounting state; resolved relative to the loaded config directory.
+    std::filesystem::path TrafficJournalDir = "traffic-journal";
     InboundListen ListenIP;
     OutboundBind SendIP = OutboundBind::Auto();
     bool EnableDNS = true;

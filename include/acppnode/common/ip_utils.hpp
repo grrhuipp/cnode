@@ -96,18 +96,6 @@ inline bool NeedsIpv6Brackets(std::string_view host) noexcept {
            !(host.size() >= 2 && host.front() == '[' && host.back() == ']');
 }
 
-inline std::string FormatHostForEndpoint(std::string_view host) {
-    if (NeedsIpv6Brackets(host)) {
-        std::string out;
-        out.reserve(host.size() + 2);
-        out.push_back('[');
-        out.append(host);
-        out.push_back(']');
-        return out;
-    }
-    return std::string(host);
-}
-
 template<class Allocator>
 inline void FormatHttpHostHeaderInto(
     std::basic_string<char, std::char_traits<char>, Allocator>& out,
@@ -150,11 +138,7 @@ inline std::string FormatHttpHostHeader(
     return header;
 }
 
-// 把 "host:port" 写入 out（先 clear，复用其容量）。供需要按连接复用 scratch
-// 的热路径调用，避免每次都分配新串。
-template<class Allocator>
-inline void FormatEndpointForLogInto(
-    std::basic_string<char, std::char_traits<char>, Allocator>& out,
+inline std::string FormatEndpointForLog(
     std::string_view host,
     uint16_t port) {
     const bool bracket_ipv6 = NeedsIpv6Brackets(host);
@@ -162,7 +146,7 @@ inline void FormatEndpointForLogInto(
     auto [ptr, ec] = std::to_chars(port_buf, port_buf + sizeof(port_buf), port);
     (void)ec;
 
-    out.clear();
+    std::string out;
     out.reserve(host.size() + (bracket_ipv6 ? 2 : 0) + 1 +
                 static_cast<size_t>(ptr - port_buf));
     if (bracket_ipv6) {
@@ -174,13 +158,6 @@ inline void FormatEndpointForLogInto(
     }
     out.push_back(':');
     out.append(port_buf, ptr);
-}
-
-inline std::string FormatEndpointForLog(
-    std::string_view host,
-    uint16_t port) {
-    std::string out;
-    FormatEndpointForLogInto(out, host, port);
     return out;
 }
 

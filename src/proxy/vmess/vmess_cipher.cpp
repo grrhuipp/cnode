@@ -14,53 +14,39 @@ namespace vmess {
 // VMessCipher 实现
 // ============================================================================
 
-// OpenSSL 实现（使用 EVP_CIPHER API）
-// 优化：预分配 EVP_CIPHER_CTX，避免每次加解密都分配/释放
-VMessCipher::VMessCipher(Security security, const uint8_t* key, const uint8_t* iv)
-    : security_(security) {
-    std::memcpy(iv_.data(), iv, iv_.size());
-    const EVP_CIPHER* algorithm = nullptr;
-    std::span<const uint8_t> actual_key(key, 16);
-    std::array<uint8_t, 32> expanded{};
-    if (security == Security::CHACHA20_POLY1305) {
-        GenerateChaCha20Key(key, expanded.data());
-        actual_key = expanded;
-        algorithm = EVP_chacha20_poly1305();
-    } else if (security == Security::AES_128_GCM) {
-        algorithm = EVP_aes_128_gcm();
-    }
-    if (algorithm && (!encryptor_.Configure(algorithm, actual_key) ||
-                      !decryptor_.Configure(algorithm, actual_key)))
-        throw std::runtime_error("VMess AEAD initialization failed");
-}
-
 VMessCipher::VMessCipher(Security security, const uint8_t* key, const uint8_t* iv,
                          proxy::AeadDirection direction)
     : security_(security) {
     std::memcpy(iv_.data(), iv, iv_.size());
-    const EVP_CIPHER* algorithm = nullptr;
-    std::span<const uint8_t> actual_key(key, 16);
+    if (security == Security::NONE || security == Security::ZERO) {
+        return;
+    }
+    if (security != Security::AES_128_GCM && security != Security::CHACHA20_POLY1305) {
+        throw std::invalid_argument("unsupported VMess body security");
+    }
+    // ChaCha20-Poly1305 needs 32 bytes: MD5(key16) || MD5(MD5(key16)).
     std::array<uint8_t, 32> expanded{};
+    std::span<const uint8_t> actual_key(key, 16);
+    const EVP_CIPHER* algorithm = EVP_aes_128_gcm();
     if (security == Security::CHACHA20_POLY1305) {
-        GenerateChaCha20Key(key, expanded.data());
+        const auto first = MD5Hash(key, 16);
+        const auto second = MD5Hash(first.data(), first.size());
+        std::memcpy(expanded.data(), first.data(), first.size());
+        std::memcpy(expanded.data() + first.size(), second.data(), second.size());
         actual_key = expanded;
         algorithm = EVP_chacha20_poly1305();
-    } else if (security == Security::AES_128_GCM) {
-        algorithm = EVP_aes_128_gcm();
     }
-    if (algorithm) {
-        const bool ok = direction == proxy::AeadDirection::Encrypt
-            ? encryptor_.Configure(algorithm, actual_key)
-            : decryptor_.Configure(algorithm, actual_key);
-        if (!ok) {
-            throw std::runtime_error("VMess AEAD initialization failed");
-        }
+    const bool ok = direction == proxy::AeadDirection::Encrypt
+        ? encryptor_.Configure(algorithm, actual_key)
+        : decryptor_.Configure(algorithm, actual_key);
+    if (!ok) {
+        throw std::runtime_error("VMess AEAD initialization failed");
     }
 }
 
 ssize_t VMessCipher::Encrypt(const uint8_t* plaintext, size_t len, uint8_t* ciphertext) {
     if (security_ == Security::NONE || security_ == Security::ZERO) {
-        if (len > 0 && plaintext) memcpy(ciphertext, plaintext, len);
+        if (len > 0 && plaintext != ciphertext) std::memcpy(ciphertext, plaintext, len);
         return static_cast<ssize_t>(len);
     }
 
@@ -73,7 +59,7 @@ ssize_t VMessCipher::Encrypt(const uint8_t* plaintext, size_t len, uint8_t* ciph
 
 ssize_t VMessCipher::Decrypt(const uint8_t* ciphertext, size_t len, uint8_t* plaintext) {
     if (security_ == Security::NONE || security_ == Security::ZERO) {
-        memcpy(plaintext, ciphertext, len);
+        if (len > 0 && plaintext != ciphertext) std::memcpy(plaintext, ciphertext, len);
         return static_cast<ssize_t>(len);
     }
 
@@ -93,20 +79,6 @@ size_t VMessCipher::Overhead() const {
         default:
             return 0;
     }
-}
-
-void VMessCipher::GenerateChaCha20Key(const uint8_t* key16, uint8_t* key32) {
-    const std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)>
-        ctx(EVP_MD_CTX_new(), EVP_MD_CTX_free);
-    if (!ctx) throw std::bad_alloc();
-    unsigned int md_len = 0;
-    if (EVP_DigestInit_ex(ctx.get(), EVP_md5(), nullptr) != 1 ||
-        EVP_DigestUpdate(ctx.get(), key16, 16) != 1 ||
-        EVP_DigestFinal_ex(ctx.get(), key32, &md_len) != 1 || md_len != 16 ||
-        EVP_DigestInit_ex(ctx.get(), EVP_md5(), nullptr) != 1 ||
-        EVP_DigestUpdate(ctx.get(), key32, 16) != 1 ||
-        EVP_DigestFinal_ex(ctx.get(), key32 + 16, &md_len) != 1 || md_len != 16)
-        throw std::runtime_error("VMess key derivation failed");
 }
 
 void VMessCipher::BuildNonce(uint16_t count, uint8_t* nonce) {

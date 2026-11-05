@@ -60,6 +60,10 @@ net::awaitable<void> Controller::AsyncJoin() {
     co_await impl_->AsyncJoin();
 }
 
+net::awaitable<void> Controller::FlushTraffic() {
+    co_await impl_->FlushTraffic();
+}
+
 std::vector<Controller::NodeStatsInfo> Controller::GetNodeStats() const {
     return impl_->GetNodeStats();
 }
@@ -76,14 +80,24 @@ Controller::Impl::PanelRuntime::PanelRuntime(
     if (!client || config.Name.empty() || config.NodeIDs.Values().size() != 1) {
         throw std::invalid_argument("panel runtime requires a client, a name and one node ID");
     }
+    traffic_journal = std::make_unique<controller::TrafficJournal>(config);
+    const auto unknown = traffic_journal->UnknownCount();
+    if (unknown != 0) {
+        LOG_ERROR("Panel {}/{} accounting: {} unknown records require reconciliation; directory={}",
+                  config.Name, config.NodeIDs.Front(), unknown, traffic_journal->Directory().string());
+    }
 }
 
 void Controller::Impl::AddPanel(std::unique_ptr<api::API> panel,
                                 const PanelConfig& panel_config) {
     ThrowIfStopping();
     // Construct the complete entity before publishing it to the owner.
-    panels_.push_back(std::make_unique<PanelRuntime>(
-        std::move(panel), panel_config, node_mutations_, io_context_.get_executor()));
+    auto runtime = std::make_unique<PanelRuntime>(
+        std::move(panel), panel_config, node_mutations_, io_context_.get_executor());
+    if (!journal_executor_) {
+        journal_executor_ = std::make_unique<controller::JournalExecutor>();
+    }
+    panels_.push_back(std::move(runtime));
 }
 
 void Controller::Impl::Start() {

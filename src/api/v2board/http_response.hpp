@@ -1,6 +1,8 @@
 #pragma once
 
 #include "acppnode/common/asio_types.hpp"
+#include "acppnode/transport/internet/http_headers.hpp"
+#include "acppnode/core/naming.hpp"
 
 #include <asio/as_tuple.hpp>
 #include <asio/buffers_iterator.hpp>
@@ -10,7 +12,6 @@
 
 #include <algorithm>
 #include <array>
-#include <cctype>
 #include <charconv>
 #include <tl/expected.hpp>
 #include <istream>
@@ -34,12 +35,7 @@ struct Response {
 };
 
 inline std::string HeaderNameLower(std::string_view name) {
-    std::string out;
-    out.reserve(name.size());
-    for (unsigned char ch : name) {
-        out.push_back(static_cast<char>(std::tolower(ch)));
-    }
-    return out;
+    return naming::LowerAscii(std::string(name));
 }
 
 inline std::string TrimHeaderValue(std::string_view value) {
@@ -53,32 +49,6 @@ inline std::string TrimHeaderValue(std::string_view value) {
     return std::string(value);
 }
 
-inline int HexValue(char ch) noexcept {
-    if (ch >= '0' && ch <= '9') return ch - '0';
-    if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
-    if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
-    return -1;
-}
-
-inline std::optional<size_t> ParseChunkSize(std::string_view line) noexcept {
-    size_t size = 0;
-    bool has_digit = false;
-    for (char ch : line) {
-        if (ch == ';') break;
-        if (ch == ' ' || ch == '\t' || ch == '\r') continue;
-        const int value = HexValue(ch);
-        if (value < 0) {
-            return std::nullopt;
-        }
-        has_digit = true;
-        if (size > (std::numeric_limits<size_t>::max() -
-                    static_cast<size_t>(value)) / 16) {
-            return std::nullopt;
-        }
-        size = size * 16 + static_cast<size_t>(value);
-    }
-    return has_digit ? std::optional<size_t>{size} : std::nullopt;
-}
 
 inline bool AppendStreambuf(net::streambuf& buffer, std::string& out) {
     if (out.size() > kMaxHttpBodySize ||
@@ -136,7 +106,11 @@ net::awaitable<tl::expected<std::string, std::string>> ReadCrlfLine(
             }
             co_return line;
         }
-        if (buffer.size() > kMaxHttpLineSize) {
+        // A maximum-length line can have its CR buffered while the LF is
+        // still in flight. The delimiter is not part of the line-size limit.
+        if (buffer.size() > kMaxHttpLineSize &&
+            (buffer.size() != kMaxHttpLineSize + 1 ||
+             *(net::buffers_begin(buffer.data()) + kMaxHttpLineSize) != '\r')) {
             co_return tl::unexpected("HTTP line too large");
         }
 
@@ -164,7 +138,7 @@ net::awaitable<tl::expected<std::string, std::string>> ReadChunkedBody(
                 "invalid chunked HTTP response: " + size_line.error());
         }
 
-        const auto chunk_size = ParseChunkSize(*size_line);
+        const auto chunk_size = transport::internet::ParseHttpChunkSize(*size_line);
         if (!chunk_size) {
             co_return tl::unexpected("invalid chunked HTTP response: invalid chunk size");
         }
@@ -221,91 +195,180 @@ net::awaitable<tl::expected<std::string, std::string>> ReadChunkedBody(
     }
 }
 
+// RFC 9112 §6.1: Transfer-Encoding lists codings in the order they were
+// applied and multiple field lines form one combined list. This client sends no
+// TE field (RFC 9110 §10.1.4), so chunked is the only coding it can decode and
+// it must be the single, hence final, coding.
+struct TransferCodings {
+    size_t count = 0;
+    bool only_chunked = true;
+};
+
+inline void AppendTransferCodings(std::string_view value, TransferCodings& codings) {
+    while (!value.empty()) {
+        const size_t comma = value.find(',');
+        const std::string coding = TrimHeaderValue(value.substr(0, comma));
+        value = comma == std::string_view::npos ? std::string_view{} : value.substr(comma + 1);
+        // RFC 9110 §5.6.1: recipients ignore empty list elements.
+        if (coding.empty()) {
+            continue;
+        }
+        ++codings.count;
+        if (naming::LowerAscii(coding) != "chunked") {
+            codings.only_chunked = false;
+        }
+    }
+}
+
+// Charges one CRLF-terminated line against the cumulative response-head budget,
+// which also bounds how many interim 1xx heads a peer can send.
+inline bool ChargeHeaderLine(size_t& used, size_t line_size) noexcept {
+    if (used > kMaxHttpHeaderSize - 2 || line_size > kMaxHttpHeaderSize - used - 2) {
+        return false;
+    }
+    used += line_size + 2;
+    return true;
+}
+
 template <typename Stream>
 net::awaitable<Response> ReadResponse(Stream& stream) {
     Response result;
     net::streambuf buffer;
-
-    auto status_line_result = co_await ReadCrlfLine(stream, buffer);
-    if (!status_line_result) {
-        result.status = -1;
-        result.body = "invalid HTTP response headers: " + status_line_result.error();
-        co_return result;
-    }
-    std::string status_line = std::move(*status_line_result);
-    size_t header_size = status_line.size() + 2;
-
-    std::istringstream status_parser(status_line);
+    size_t header_size = 0;
     std::string http_version;
-    status_parser >> http_version >> result.status;
-    if (result.status <= 0) {
-        result.status = -1;
-        result.body = "invalid HTTP status line: " + status_line;
-        co_return result;
-    }
-    result.not_modified = result.status == 304;
+    std::optional<size_t> content_length;
+    std::optional<TransferCodings> transfer_codings;
 
-    size_t content_length = 0;
-    bool has_content_length = false;
-    bool is_chunked = false;
-
+    // RFC 9110 §15.2: a client must parse interim 1xx responses that precede
+    // the final response, even unsolicited ones.
     for (;;) {
-        auto line_result = co_await ReadCrlfLine(stream, buffer);
-        if (!line_result) {
+        auto status_line_result = co_await ReadCrlfLine(stream, buffer);
+        if (!status_line_result) {
             result.status = -1;
-            result.body = "invalid HTTP response headers: " + line_result.error();
+            result.body = "invalid HTTP response headers: " + status_line_result.error();
             co_return result;
         }
-        if (header_size > kMaxHttpHeaderSize - 2 ||
-            line_result->size() > kMaxHttpHeaderSize - header_size - 2) {
+        if (!ChargeHeaderLine(header_size, status_line_result->size())) {
             result.status = -1;
             result.body = "HTTP response headers too large";
             co_return result;
         }
-        header_size += line_result->size() + 2;
-        if (line_result->empty()) break;
 
-        const std::string& line = *line_result;
+        result = Response{};
+        http_version.clear();
+        content_length.reset();
+        transfer_codings.reset();
 
-        const size_t colon = line.find(':');
-        if (colon == std::string::npos) continue;
+        std::istringstream status_parser(*status_line_result);
+        status_parser >> http_version >> result.status;
+        if (result.status <= 0) {
+            result.status = -1;
+            result.body = "invalid HTTP status line: " + *status_line_result;
+            co_return result;
+        }
 
-        const auto name = HeaderNameLower(std::string_view(line).substr(0, colon));
-        const auto value = TrimHeaderValue(std::string_view(line).substr(colon + 1));
-
-        if (name == "etag") {
-            result.etag = value;
-            if (result.etag.size() >= 2 && result.etag.front() == '"' &&
-                result.etag.back() == '"') {
-                result.etag = result.etag.substr(1, result.etag.size() - 2);
-            }
-        } else if (name == "transfer-encoding") {
-            std::string lowered = value;
-            for (char& ch : lowered) {
-                ch = static_cast<char>(
-                    std::tolower(static_cast<unsigned char>(ch)));
-            }
-            is_chunked = lowered.find("chunked") != std::string::npos;
-        } else if (name == "content-length") {
-            const auto parsed_length = ParseContentLength(value);
-            if (!parsed_length ||
-                (has_content_length && content_length != *parsed_length)) {
+        for (;;) {
+            auto line_result = co_await ReadCrlfLine(stream, buffer);
+            if (!line_result) {
                 result.status = -1;
-                result.body = "invalid Content-Length";
+                result.body = "invalid HTTP response headers: " + line_result.error();
                 co_return result;
             }
-            content_length = *parsed_length;
-            has_content_length = true;
+            if (!ChargeHeaderLine(header_size, line_result->size())) {
+                result.status = -1;
+                result.body = "HTTP response headers too large";
+                co_return result;
+            }
+            if (line_result->empty()) break;
+
+            const std::string& line = *line_result;
+
+            const size_t colon = line.find(':');
+            if (colon == std::string::npos) continue;
+
+            const auto name = HeaderNameLower(std::string_view(line).substr(0, colon));
+            const auto value = TrimHeaderValue(std::string_view(line).substr(colon + 1));
+
+            if (name == "etag") {
+                result.etag = value;
+                if (result.etag.size() >= 2 && result.etag.front() == '"' &&
+                    result.etag.back() == '"') {
+                    result.etag = result.etag.substr(1, result.etag.size() - 2);
+                }
+                // The validator is echoed verbatim in If-None-Match. RFC 9110 etag
+                // characters are visible ASCII or obs-text (weak W/"..." tags from
+                // intermediaries included); control bytes would inject request
+                // header lines and reject the response instead.
+                if (!std::ranges::all_of(result.etag, [](unsigned char ch) {
+                        return ch > 0x20 && ch != 0x7f;
+                    })) {
+                    result.status = -1;
+                    result.body = "invalid ETag";
+                    co_return result;
+                }
+            } else if (name == "transfer-encoding") {
+                if (!transfer_codings) {
+                    transfer_codings.emplace();
+                }
+                AppendTransferCodings(value, *transfer_codings);
+            } else if (name == "content-length") {
+                const auto parsed_length = ParseContentLength(value);
+                if (!parsed_length ||
+                    (content_length && *content_length != *parsed_length)) {
+                    result.status = -1;
+                    result.body = "invalid Content-Length";
+                    co_return result;
+                }
+                content_length = parsed_length;
+            }
+        }
+
+        if (result.status >= 200) break;
+        if (result.status == 101) {
+            // No request asks for an upgrade, so a protocol switch has no
+            // defined continuation for this client.
+            result.status = -1;
+            result.body = "unexpected HTTP 101 Switching Protocols";
+            co_return result;
         }
     }
+    result.not_modified = result.status == 304;
 
-    if (has_content_length && content_length > kMaxHttpBodySize) {
+    // RFC 9112 §6.3 rule 1: 204 and 304 responses end with the header section
+    // whatever framing fields they carry; a 304 may announce the selected
+    // representation's Content-Length (RFC 9110 §8.6) without sending it.
+    if (result.status == 204 || result.status == 304) {
+        co_return result;
+    }
+
+    if (content_length && *content_length > kMaxHttpBodySize) {
         result.status = -1;
         result.body = "HTTP body too large";
         co_return result;
     }
 
-    if (is_chunked) {
+    if (transfer_codings) {
+        // RFC 9112 §6.1: Transfer-Encoding in an HTTP/1.0 message means the
+        // framing is faulty even when Content-Length is present.
+        if (http_version == "HTTP/1.0") {
+            result.status = -1;
+            result.body = "invalid HTTP framing: Transfer-Encoding in HTTP/1.0 response";
+            co_return result;
+        }
+        // RFC 9112 §6.3 rule 3: Transfer-Encoding with Content-Length is a
+        // smuggling/splitting signal that ought to be handled as an error.
+        if (content_length) {
+            result.status = -1;
+            result.body = "invalid HTTP framing: both Transfer-Encoding and Content-Length";
+            co_return result;
+        }
+        // RFC 9112 §6.3 rule 4 would read a non-chunked-final body until close,
+        // but that body still carries a coding this client cannot decode.
+        if (transfer_codings->count != 1 || !transfer_codings->only_chunked) {
+            result.status = -1;
+            result.body = "unsupported HTTP Transfer-Encoding";
+            co_return result;
+        }
         auto decoded = co_await ReadChunkedBody(stream, buffer);
         if (!decoded) {
             result.status = -1;
@@ -322,20 +385,20 @@ net::awaitable<Response> ReadResponse(Stream& stream) {
         co_return result;
     }
 
-    if (has_content_length) {
-        if (result.body.size() < content_length) {
+    if (content_length) {
+        if (result.body.size() < *content_length) {
             co_await net::async_read(
                 stream,
                 buffer,
-                net::transfer_exactly(content_length - result.body.size()),
+                net::transfer_exactly(*content_length - result.body.size()),
                 net::use_awaitable);
             if (!AppendStreambuf(buffer, result.body)) {
                 result.status = -1;
                 result.body = "HTTP body too large";
                 co_return result;
             }
-        } else if (result.body.size() > content_length) {
-            result.body.resize(content_length);
+        } else if (result.body.size() > *content_length) {
+            result.body.resize(*content_length);
         }
     } else {
         for (;;) {

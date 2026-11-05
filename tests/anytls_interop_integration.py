@@ -74,7 +74,7 @@ async def run_case(args, direction, mode, output):
             configure(output,
                       {'protocol': 'vless', 'listen': '127.0.0.1', 'port': front_port,
                        'settings': {'clients': [{'id': str(USER)}]}},
-                      {'protocol': 'anytls', 'settings': {'server': '127.0.0.1', 'server_port': bridge_port,
+                      {'protocol': 'anytls', 'settings': {'address': '127.0.0.1', 'port': bridge_port,
                        'password': 'secret', 'minIdleSession': 1}, 'streamSettings': tls_settings()})
             resources.spawn([args.binary, '--config-dir', output], output / 'cnode.log')
 

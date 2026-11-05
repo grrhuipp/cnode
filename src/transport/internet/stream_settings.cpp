@@ -2,6 +2,7 @@
 #include "acppnode/core/naming.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <utility>
 
 namespace acpp {
@@ -23,29 +24,6 @@ std::string XHttpConfig::NormalizedPath() const {
     return normalized;
 }
 
-bool XHttpConfig::IsStreamOne() const noexcept {
-    return mode == "stream-one";
-}
-
-bool XHttpConfig::AcceptsStreamOne() const noexcept {
-    return mode.empty() ||
-           mode == "auto" ||
-           mode == "stream-one" ||
-           mode == "stream-up";
-}
-
-bool XHttpConfig::AcceptsPacketUp() const noexcept {
-    return mode.empty() ||
-           mode == "auto" ||
-           mode == "packet-up";
-}
-
-bool XHttpConfig::AcceptsStreamUp() const noexcept {
-    return mode.empty() ||
-           mode == "auto" ||
-           mode == "stream-up";
-}
-
 std::string GrpcConfig::RequestPath() const {
     if (!service_name.empty() && service_name.front() == '/') {
         return service_name;
@@ -60,30 +38,38 @@ std::string GrpcConfig::RequestPath() const {
 
 namespace {
 
+// Explicit host precedence per layer: dedicated field, then a configured
+// Host header. gRPC has no Host header; its :authority comes from `authority`.
+[[nodiscard]] std::string ConfiguredHttpHost(const StreamSettings& settings) {
+    const auto header_host = [](const transport::internet::HttpHeaders& headers) {
+        const auto* host = transport::internet::FindHttpHeader(headers, "Host");
+        return host ? *host : std::string{};
+    };
+    switch (settings.network_mode) {
+    case NetworkMode::Ws:
+        return header_host(settings.ws.headers);
+    case NetworkMode::HttpUpgrade:
+        return settings.http_upgrade.host.empty()
+            ? header_host(settings.http_upgrade.headers) : settings.http_upgrade.host;
+    case NetworkMode::Grpc:
+        return settings.grpc.authority;
+    case NetworkMode::XHttp:
+        return settings.xhttp.host.empty()
+            ? header_host(settings.xhttp.headers) : settings.xhttp.host;
+    default:
+        return {};
+    }
+}
+
 void NormalizeInPlace(StreamSettings& settings) {
     // 仅初始化/配置更新时调用，热路径不再做字符串比较
+    settings.prepared_security.reset();
     settings.network = naming::LowerAscii(std::move(settings.network));
     settings.security = naming::LowerAscii(std::move(settings.security));
 
-    if (settings.network.empty() ||
-        settings.network == constants::protocol::kTcp ||
-        settings.network == constants::protocol::kRaw) {
-        settings.network_mode = NetworkMode::Tcp;
-    } else if (settings.network == constants::protocol::kWs ||
-               settings.network == constants::protocol::kWebSocket) {
-        settings.network_mode = NetworkMode::Ws;
-    } else if (settings.network == constants::protocol::kHttpUpgrade) {
-        settings.network_mode = NetworkMode::HttpUpgrade;
-        settings.network = std::string(constants::protocol::kHttpUpgrade);
-    } else if (settings.network == constants::protocol::kGrpc) {
-        settings.network_mode = NetworkMode::Grpc;
-    } else if (settings.network == constants::protocol::kHttp || settings.network == "h2") {
-        settings.http.force_http2 = settings.http.force_http2 || (settings.network == "h2");
-        settings.network_mode = NetworkMode::Http;
-    } else if (settings.network == constants::protocol::kXHttp || settings.network == "splithttp") {
-        settings.network_mode = NetworkMode::XHttp;
-    } else {
-        settings.network_mode = NetworkMode::Unsupported;
+    settings.network_mode = ParseNetworkMode(settings.network);
+    if (settings.network_mode == NetworkMode::Http && settings.network == "h2") {
+        settings.http.force_http2 = true;
     }
 
     if (settings.security.empty() || settings.security == constants::protocol::kNone) {
@@ -142,9 +128,58 @@ void NormalizeInPlace(StreamSettings& settings) {
             settings.tls.alpn.insert(settings.tls.alpn.begin(), "h2");
         }
     }
+
+    settings.grpc.request_path = settings.grpc.RequestPath();
+    settings.xhttp.normalized_path = settings.xhttp.NormalizedPath();
+    if (settings.IsXHttp() && settings.xhttp.session_namespace.empty()) {
+        static std::atomic<uint64_t> next_namespace{1};
+        settings.xhttp.session_namespace =
+            std::to_string(next_namespace.fetch_add(1, std::memory_order_relaxed));
+    }
+    settings.configured_http_host = ConfiguredHttpHost(settings);
 }
 
 }  // namespace
+
+NetworkMode ParseNetworkMode(std::string_view network) noexcept {
+    using transport::internet::EqualsAsciiCI;
+    if (network.empty() || EqualsAsciiCI(network, constants::protocol::kTcp) ||
+        EqualsAsciiCI(network, constants::protocol::kRaw)) {
+        return NetworkMode::Tcp;
+    }
+    if (EqualsAsciiCI(network, constants::protocol::kWs) ||
+        EqualsAsciiCI(network, constants::protocol::kWebSocket)) {
+        return NetworkMode::Ws;
+    }
+    if (EqualsAsciiCI(network, constants::protocol::kHttpUpgrade)) return NetworkMode::HttpUpgrade;
+    if (EqualsAsciiCI(network, constants::protocol::kGrpc)) return NetworkMode::Grpc;
+    if (EqualsAsciiCI(network, constants::protocol::kHttp) || EqualsAsciiCI(network, "h2")) {
+        return NetworkMode::Http;
+    }
+    if (EqualsAsciiCI(network, constants::protocol::kXHttp) || EqualsAsciiCI(network, "splithttp")) {
+        return NetworkMode::XHttp;
+    }
+    return NetworkMode::Unsupported;
+}
+
+XHttpMode ResolveXHttpOutboundMode(const StreamSettings& settings) noexcept {
+    const XHttpConfig& cfg = settings.xhttp;
+    if (cfg.mode != XHttpMode::Auto) {
+        return cfg.mode;
+    }
+    if (cfg.download_settings) {
+        return XHttpMode::StreamUp;
+    }
+    if (settings.IsReality()) {
+        return XHttpMode::StreamOne;
+    }
+    const bool http11_only = settings.tls.alpn.size() == 1 &&
+                             settings.tls.alpn.front() == "http/1.1";
+    if (settings.IsTls() && !http11_only) {
+        return XHttpMode::StreamUp;
+    }
+    return XHttpMode::PacketUp;
+}
 
 StreamSettings NormalizeStreamSettings(const StreamSettings& source) {
     auto settings = source;

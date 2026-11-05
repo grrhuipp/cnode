@@ -9,10 +9,15 @@
 #include <cstdio>
 #include <cstring>
 #include <optional>
+#include <string_view>
 
 namespace acpp {
 
 namespace {
+
+constexpr uint8_t kSignatureV2[12] = {
+    0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A
+};
 
 bool PrefixMatches(const uint8_t* data, size_t len, const uint8_t* prefix, size_t prefix_len) {
     return len <= prefix_len && std::memcmp(data, prefix, len) == 0;
@@ -33,9 +38,9 @@ ProxyProtocolResult MakeInvalid() {
 void LogProxySource(std::string_view version, const ProxyProtocolResult& result) {
     if (!Log::ShouldLog(LogLevel::DEBUG)) return;
     std::optional<iputil::AddressText> numeric;
-    std::string_view source(result.src_ip.data(), result.src_ip.size());
+    std::string_view source = "-";
     if (result.src_addr) {
-        numeric.emplace(iputil::NormalizeAddress(*result.src_addr));
+        numeric.emplace(*result.src_addr);
         source = numeric->View();
     }
     LOG_NET_DEBUG("[ProxyProtocol] {} parsed: src={}:{} consumed={}",
@@ -54,8 +59,6 @@ bool ParsePort(std::string_view text, uint16_t& port) {
     return true;
 }
 
-}  // namespace
-
 // ============================================================================
 // PROXY Protocol v1 格式：
 //   "PROXY TCP4 192.168.1.1 10.0.0.1 12345 80\r\n"
@@ -66,101 +69,39 @@ bool ParsePort(std::string_view text, uint16_t& port) {
 // ============================================================================
 
 // ----------------------------------------------------------------------------
-// 自动检测 v1/v2
-// ----------------------------------------------------------------------------
-ProxyProtocolResult ProxyProtocolParser::Parse(const uint8_t* data, size_t len) {
-    if (len == 0) {
-        return {};
-    }
-
-    if (PrefixMatches(data, len, kSignatureV2, sizeof(kSignatureV2))) {
-        if (len < sizeof(kSignatureV2)) {
-            return MakeIncomplete();
-        }
-    }
-
-    static constexpr char kProxyPrefix[] = "PROXY ";
-    if (PrefixMatches(data, len, reinterpret_cast<const uint8_t*>(kProxyPrefix), sizeof(kProxyPrefix) - 1)) {
-        if (len < sizeof(kProxyPrefix) - 1) {
-            return MakeIncomplete();
-        }
-    }
-
-    // v2：以固定 12 字节签名开头
-    if (len >= 12 && std::memcmp(data, kSignatureV2, 12) == 0) {
-        LOG_NET_DEBUG("[ProxyProtocol] detected v2 binary header ({} bytes)", len);
-        auto r = ParseV2(data, len);
-        if (r.success()) {
-            LogProxySource("v2", r);
-        } else if (r.incomplete()) {
-            LOG_NET_DEBUG("[ProxyProtocol] v2 parse incomplete");
-        } else {
-            LOG_NET_DEBUG("[ProxyProtocol] v2 parse failed (incomplete or invalid)");
-        }
-        return r;
-    }
-
-    // v1：以 "PROXY " 开头
-    if (len >= 6 && std::memcmp(data, "PROXY ", 6) == 0) {
-        LOG_NET_DEBUG("[ProxyProtocol] detected v1 text header");
-        auto r = ParseV1(data, len);
-        if (r.success()) {
-            LogProxySource("v1", r);
-        } else if (r.incomplete()) {
-            LOG_NET_DEBUG("[ProxyProtocol] v1 parse incomplete");
-        } else {
-            LOG_NET_DEBUG("[ProxyProtocol] v1 parse failed (malformed or incomplete)");
-        }
-        return r;
-    }
-
-    // 不是 PROXY Protocol，返回 success=false
-    return {};
-}
-
-// ----------------------------------------------------------------------------
 // v1 解析（文本格式）
 // ----------------------------------------------------------------------------
-ProxyProtocolResult ProxyProtocolParser::ParseV1(const uint8_t* data, size_t len) {
-    // 找 \r\n 结尾
-    const uint8_t* crlf = nullptr;
-    for (size_t i = 0; i + 1 < len; ++i) {
-        if (data[i] == '\r' && data[i + 1] == '\n') {
-            crlf = data + i;
-            break;
-        }
+ProxyProtocolResult ParseV1(const uint8_t* data, size_t len) {
+    // Spec §2.1: the whole line, CRLF included, fits in 107 bytes; without a
+    // CRLF by then the receiver declares the line invalid.
+    constexpr size_t kMaxV1LineBytes = 107;
+    const std::string_view text(
+        reinterpret_cast<const char*>(data), std::min(len, kMaxV1LineBytes));
+    const size_t crlf_offset = text.find("\r\n");
+    if (crlf_offset == std::string_view::npos) {
+        return len >= kMaxV1LineBytes ? MakeInvalid() : MakeIncomplete();
     }
+    const size_t consumed = crlf_offset + 2;
+    std::string_view line = text.substr(0, crlf_offset);
 
-    if (!crlf) {
-        // 数据不完整，等待更多数据
-        return MakeIncomplete();
-    }
-
-    // 把首行转成 string_view 来解析
-    std::string_view line(reinterpret_cast<const char*>(data),
-                          static_cast<size_t>(crlf - data));
-
-    // 跳过 "PROXY "
     if (line.size() < 6) return MakeInvalid();
     line.remove_prefix(6);
 
-    // 解析协议族："TCP4"/"TCP6"/"UNKNOWN"
+    // Spec §2.1: after "UNKNOWN" the sender may omit the rest of the line and
+    // the receiver ignores whatever precedes the CRLF.
+    if (line == "UNKNOWN" || line.starts_with("UNKNOWN ")) {
+        ProxyProtocolResult r;
+        r.status   = ProxyProtocolParseStatus::Success;
+        r.consumed = consumed;
+        return r;
+    }
+
     auto sp1 = line.find(' ');
     if (sp1 == std::string_view::npos) return MakeInvalid();
     std::string_view family = line.substr(0, sp1);
     line.remove_prefix(sp1 + 1);
-
-    if (family == "UNKNOWN") {
-        // UNKNOWN：连接合法但不携带地址信息，回退到直连 IP
-        ProxyProtocolResult r;
-        r.status   = ProxyProtocolParseStatus::Success;
-        r.consumed = static_cast<size_t>(crlf - data) + 2;  // +2 for \r\n
-        return r;
-    }
-
     if (family != "TCP4" && family != "TCP6") return MakeInvalid();
 
-    // src_ip
     auto sp2 = line.find(' ');
     if (sp2 == std::string_view::npos) return MakeInvalid();
     std::string_view src_ip = line.substr(0, sp2);
@@ -172,25 +113,21 @@ ProxyProtocolResult ProxyProtocolParser::ParseV1(const uint8_t* data, size_t len
     }
     line.remove_prefix(sp2 + 1);
 
-    // dst_ip（忽略）
+    // The destination address is not used.
     auto sp3 = line.find(' ');
     if (sp3 == std::string_view::npos) return MakeInvalid();
     line.remove_prefix(sp3 + 1);
 
-    // src_port
     auto sp4 = line.find(' ');
     if (sp4 == std::string_view::npos) return MakeInvalid();
-    std::string_view src_port_sv = line.substr(0, sp4);
-
     uint16_t src_port = 0;
-    if (!ParsePort(src_port_sv, src_port)) return MakeInvalid();
+    if (!ParsePort(line.substr(0, sp4), src_port)) return MakeInvalid();
 
     ProxyProtocolResult r;
     r.status   = ProxyProtocolParseStatus::Success;
-    r.src_ip.assign(src_ip.data(), src_ip.size());
     r.src_addr = iputil::NormalizeAddress(*src_addr);
     r.src_port = src_port;
-    r.consumed = static_cast<size_t>(crlf - data) + 2;
+    r.consumed = consumed;
     return r;
 }
 
@@ -210,37 +147,35 @@ ProxyProtocolResult ProxyProtocolParser::ParseV1(const uint8_t* data, size_t len
 // 附加数据（INET）： src(4B)+dst(4B)+src_port(2B)+dst_port(2B) = 12B
 // 附加数据（INET6）：src(16B)+dst(16B)+src_port(2B)+dst_port(2B) = 36B
 // ----------------------------------------------------------------------------
-ProxyProtocolResult ProxyProtocolParser::ParseV2(const uint8_t* data, size_t len) {
+ProxyProtocolResult ParseV2(const uint8_t* data, size_t len) {
     constexpr size_t kHeaderSize = 16;
     if (len < kHeaderSize) return MakeIncomplete();
 
-    const uint8_t ver_cmd = data[12];
-    const uint8_t fam_proto = data[13];
+    const uint8_t version = (data[12] >> 4) & 0x0F;
+    const uint8_t command = data[12] & 0x0F;
+    const uint8_t family = (data[13] >> 4) & 0x0F;
+    const uint8_t transport = data[13] & 0x0F;
+    // Spec §2.2: other versions and commands, and for PROXY other families and
+    // transport protocols, must be rejected (LOCAL ignores the protocol block).
+    // Decide before waiting for the declared address block.
+    if (version != 2 || command > 0x01 ||
+        (command == 0x01 && (family > 0x03 || transport > 0x02))) {
+        return MakeInvalid();
+    }
+
     const uint16_t extra_len =
         static_cast<uint16_t>((data[14] << 8) | data[15]);
-
     const size_t total = kHeaderSize + extra_len;
     if (len < total) return MakeIncomplete();
-
-    const uint8_t version = (ver_cmd >> 4) & 0x0F;
-    const uint8_t command = ver_cmd & 0x0F;
-
-    if (version != 2) return MakeInvalid();
 
     ProxyProtocolResult r;
     r.consumed = total;
     r.status   = ProxyProtocolParseStatus::Success;
 
-    // LOCAL 命令（健康检查等）：不携带地址，直接通过
+    // LOCAL (health checks) carries no address: keep the real peer.
     if (command == 0x00) {
         return r;
     }
-
-    // 只处理 PROXY 命令
-    if (command != 0x01) return MakeInvalid();
-
-    const uint8_t family = (fam_proto >> 4) & 0x0F;
-    // const uint8_t proto = fam_proto & 0x0F;  // TCP/UDP，此处不需要区分
 
     const uint8_t* addr = data + kHeaderSize;
 
@@ -259,12 +194,63 @@ ProxyProtocolResult ProxyProtocolParser::ParseV2(const uint8_t* data, size_t len
         r.src_addr = iputil::NormalizeAddress(net::ip::address_v6(bytes));
         r.src_port = static_cast<uint16_t>((addr[32] << 8) | addr[33]);
     }
-    // UNIX 套接字（family==3）：不携带网络地址，保持 src_ip 为空
+    // UNSPEC and UNIX carry no network source: keep the real peer.
 
     return r;
 }
 
-size_t ProxyProtocolParser::Encode(
+}  // namespace
+
+ProxyProtocolResult ParseProxyProtocolHeader(std::span<const uint8_t> bytes) {
+    const uint8_t* data = bytes.data();
+    const size_t len = bytes.size();
+    if (len == 0) {
+        return {};
+    }
+
+    if (PrefixMatches(data, len, kSignatureV2, sizeof(kSignatureV2))) {
+        if (len < sizeof(kSignatureV2)) {
+            return MakeIncomplete();
+        }
+    }
+
+    static constexpr char kProxyPrefix[] = "PROXY ";
+    if (PrefixMatches(data, len, reinterpret_cast<const uint8_t*>(kProxyPrefix), sizeof(kProxyPrefix) - 1)) {
+        if (len < sizeof(kProxyPrefix) - 1) {
+            return MakeIncomplete();
+        }
+    }
+
+    if (len >= sizeof(kSignatureV2) && std::memcmp(data, kSignatureV2, sizeof(kSignatureV2)) == 0) {
+        LOG_NET_DEBUG("[ProxyProtocol] detected v2 binary header ({} bytes)", len);
+        auto r = ParseV2(data, len);
+        if (r.success()) {
+            LogProxySource("v2", r);
+        } else if (r.incomplete()) {
+            LOG_NET_DEBUG("[ProxyProtocol] v2 parse incomplete");
+        } else {
+            LOG_NET_DEBUG("[ProxyProtocol] v2 parse failed (incomplete or invalid)");
+        }
+        return r;
+    }
+
+    if (len >= 6 && std::memcmp(data, "PROXY ", 6) == 0) {
+        LOG_NET_DEBUG("[ProxyProtocol] detected v1 text header");
+        auto r = ParseV1(data, len);
+        if (r.success()) {
+            LogProxySource("v1", r);
+        } else if (r.incomplete()) {
+            LOG_NET_DEBUG("[ProxyProtocol] v1 parse incomplete");
+        } else {
+            LOG_NET_DEBUG("[ProxyProtocol] v1 parse failed (malformed or incomplete)");
+        }
+        return r;
+    }
+
+    return {};
+}
+
+size_t EncodeProxyProtocolHeader(
     uint8_t version,
     const tcp::endpoint& src,
     const tcp::endpoint& dst,

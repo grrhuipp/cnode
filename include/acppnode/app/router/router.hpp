@@ -6,7 +6,7 @@
 #include <memory>
 
 namespace acpp::geo {
-class GeoManager;
+class GeoDatabase;
 }  // namespace acpp::geo
 
 namespace acpp {
@@ -15,11 +15,11 @@ struct RoutingConfig;
 
 namespace acpp::app::router {
 
-class Router final : public routing::Router, public memory::ThreadAllocated {
+class Router final : public routing::Router {
 public:
-    // Build on the owning Worker before binding to Dispatcher. Failed builds
-    // never publish partial matchers, and a published Router cannot be changed.
-    Router(const RoutingConfig& config, const ::acpp::geo::GeoManager* geo_manager);
+    // Immutable process-allocated routing snapshot, shared by session domains.
+    // Failed builds never publish partial matchers.
+    Router(const RoutingConfig& config, const ::acpp::geo::GeoDatabase* geo_database);
     ~Router() noexcept override;
     Router(const Router&) = delete;
     Router& operator=(const Router&) = delete;

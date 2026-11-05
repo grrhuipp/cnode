@@ -3,17 +3,21 @@
 #include "acppnode/common/clock.hpp"
 
 #include <concurrentqueue.h>
+#include <lightweightsemaphore.h>
 #include <zlib.h>
 
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -62,8 +66,10 @@ std::mutex g_console_mutex;
 // The writer drains continuously. Keep a bounded burst window without paying
 // for 65K preallocated LogRecord slots throughout the process lifetime.
 constexpr size_t kAsyncLogQueueCapacity = 8 * 1024;
-constexpr auto kLogIdleSleep = 1ms;
-constexpr auto kRotationCheckInterval = 1s;
+constexpr size_t kWriterBatchSize = 64;
+// Retry delay after a daily rotation fails to open the new files; the old
+// files stay active until a retry succeeds.
+constexpr auto kRotationRetryDelay = 1s;
 
 std::string_view LevelName(LogLevel level) noexcept {
     switch (level) {
@@ -257,8 +263,22 @@ std::string DateString(std::chrono::system_clock::time_point now) {
     return FormatLocalTime(now, "%Y-%m-%d");
 }
 
-std::string TodayDateString() {
-    return DateString(std::chrono::system_clock::now());
+// Next local day boundary; tm_isdst = -1 lets mktime resolve DST changes.
+// The writer compares it against the system clock before every batch, so a
+// clock step still rotates before the next record is written.
+std::chrono::system_clock::time_point NextLocalMidnight(
+    std::chrono::system_clock::time_point now) {
+    auto tm = LocalTime(std::chrono::system_clock::to_time_t(now));
+    tm.tm_mday += 1;
+    tm.tm_hour = 0;
+    tm.tm_min = 0;
+    tm.tm_sec = 0;
+    tm.tm_isdst = -1;
+    const auto midnight = std::mktime(&tm);
+    if (midnight == static_cast<std::time_t>(-1)) {
+        return now + kRotationRetryDelay;
+    }
+    return std::chrono::system_clock::from_time_t(midnight);
 }
 
 bool IsDateString(std::string_view value) noexcept {
@@ -427,13 +447,6 @@ std::filesystem::path MakeDailyLogPath(const DailyLogSpec& spec,
     return spec.directory / filename;
 }
 
-std::filesystem::path ResolveFixedLogPath(
-    const std::filesystem::path& log_dir,
-    const std::filesystem::path& configured_path,
-    std::string_view fallback_prefix) {
-    return ResolveConfiguredLogPath(log_dir, configured_path, fallback_prefix);
-}
-
 std::filesystem::path ResolveLogPath(
     const std::filesystem::path& log_dir,
     const std::filesystem::path& configured_path,
@@ -441,7 +454,7 @@ std::filesystem::path ResolveLogPath(
     bool rotate_daily,
     std::string_view date) {
     if (!rotate_daily) {
-        return ResolveFixedLogPath(log_dir, configured_path, fallback_prefix);
+        return ResolveConfiguredLogPath(log_dir, configured_path, fallback_prefix);
     }
     return MakeDailyLogPath(
         MakeDailySpec(log_dir, configured_path, fallback_prefix), date);
@@ -470,46 +483,6 @@ std::optional<std::string> ExtractDailyDate(std::string_view filename,
     return std::string(date);
 }
 
-void CleanupManagedFiles(const std::vector<DailyLogSpec>& specs,
-                         std::string_view today,
-                         uint16_t max_days,
-                         bool gzip_enabled) {
-    try {
-        for (const auto& spec : specs) {
-            const auto dir = spec.directory.empty()
-                ? std::filesystem::path(".")
-                : spec.directory;
-            if (!std::filesystem::exists(dir) ||
-                !std::filesystem::is_directory(dir)) {
-                continue;
-            }
-
-            for (const auto& entry : std::filesystem::directory_iterator(dir)) {
-                if (!entry.is_regular_file()) continue;
-
-                const auto name = entry.path().filename().string();
-                const auto file_date = ExtractDailyDate(name, spec);
-                if (!file_date) continue;
-
-                if (max_days > 0) {
-                    const auto age_days = DateAgeDays(*file_date, today);
-                    if (age_days && *age_days > max_days) {
-                        RemovePath(entry.path());
-                        continue;
-                    }
-                }
-
-                if (gzip_enabled &&
-                    *file_date != today &&
-                    name.ends_with(spec.extension)) {
-                    GzipFile(entry.path());
-                }
-            }
-        }
-    } catch (...) {
-    }
-}
-
 void WriteStderrFallback(LogLevel level, const std::string& msg) {
     std::lock_guard lock(g_console_mutex);
     LogRecord record{
@@ -521,17 +494,6 @@ void WriteStderrFallback(LogLevel level, const std::string& msg) {
         .connection = std::nullopt,
     };
     std::cerr << FormatRecord(record) << std::endl;
-}
-
-LogLevel ParseLevel(std::string_view level) {
-    if (level == "none") return LogLevel::NONE;
-    if (level == "trace") return LogLevel::TRACE;
-    if (level == "debug") return LogLevel::DEBUG;
-    if (level == "info") return LogLevel::INFO;
-    if (level == "warning") return LogLevel::WARN;
-    if (level == "warn") return LogLevel::WARN;
-    if (level == "error") return LogLevel::ERROR;
-    return LogLevel::INFO;
 }
 
 class AsyncLogBackend {
@@ -557,9 +519,9 @@ public:
         max_days_ = max_days;
         rotate_daily_ = rotate_daily;
         gzip_enabled_ = gzip_enabled;
-        current_date_ = TodayDateString();
-        next_rotation_check_ = std::chrono::steady_clock::now() +
-            kRotationCheckInterval;
+        const auto now = std::chrono::system_clock::now();
+        current_date_ = DateString(now);
+        next_rotation_at_ = NextLocalMidnight(now);
         error_target_ = LogTarget{
             .fallback_prefix = "error",
             .configured_path = error_path,
@@ -572,7 +534,7 @@ public:
         };
 
         if (rotate_daily_) {
-            CleanupManagedFiles(DailySpecs(), current_date_, max_days_, gzip_enabled_);
+            CleanupManagedFiles();
         }
 
         const auto resolved_error_path = ResolveTargetPath(error_target_, current_date_);
@@ -590,12 +552,14 @@ public:
 
     void Stop() {
         accepting_.store(false, std::memory_order_release);
-        if (running_.exchange(false, std::memory_order_acq_rel) && writer_.joinable()) {
-            writer_.join();
-        } else if (writer_.joinable()) {
+        if (running_.exchange(false, std::memory_order_acq_rel)) {
+            writer_wakeup_.signal();
+        }
+        if (writer_.joinable()) {
             writer_.join();
         }
-        DrainUntilEmpty();
+        std::array<LogRecord, kWriterBatchSize> batch;
+        DrainAvailable(batch);
         ReportDrops();
         FlushFiles();
         CloseFiles();
@@ -607,11 +571,14 @@ public:
         thread_local moodycamel::ProducerToken producer_token(queue_);
         if (!queue_.try_enqueue(producer_token, std::move(record))) {
             dropped_.fetch_add(1, std::memory_order_relaxed);
+            return;
         }
+        writer_wakeup_.signal();
     }
 
-    void RequestFlush() noexcept {
+    void RequestFlush() {
         flush_requested_.store(true, std::memory_order_release);
+        writer_wakeup_.signal();
     }
 
     const std::filesystem::path& ErrorPath() const noexcept {
@@ -657,38 +624,51 @@ private:
         return true;
     }
 
+    // Each successful enqueue, flush request, and shutdown posts one semaphore
+    // count after publishing its state; the writer consumes every pending count
+    // per wakeup and then drains the queue, so no posted record is left behind.
     void Run() {
+        std::array<LogRecord, kWriterBatchSize> batch;
         while (running_.load(std::memory_order_acquire)) {
+            writer_wakeup_.waitMany(
+                std::numeric_limits<moodycamel::LightweightSemaphore::ssize_t>::max(),
+                IdleWaitMicros());
             MaybeRotate();
-            const bool wrote = DrainAvailable();
+            DrainAvailable(batch);
             ReportDrops();
             if (flush_requested_.exchange(false, std::memory_order_acq_rel)) {
                 FlushFiles();
             }
-            if (!wrote) {
-                std::this_thread::sleep_for(kLogIdleSleep);
-            }
         }
 
-        DrainUntilEmpty();
+        DrainAvailable(batch);
         ReportDrops();
         FlushFiles();
+    }
+
+    // Fixed-path logging has no deadline: the writer sleeps until signalled.
+    std::int64_t IdleWaitMicros() const {
+        if (!rotate_daily_) return -1;
+        const auto remaining = next_rotation_at_ - std::chrono::system_clock::now();
+        if (remaining <= std::chrono::system_clock::duration::zero()) return 0;
+        return std::chrono::ceil<std::chrono::microseconds>(remaining).count();
     }
 
     void MaybeRotate() {
         if (!rotate_daily_) return;
 
-        const auto now = std::chrono::steady_clock::now();
-        if (now < next_rotation_check_) return;
-        next_rotation_check_ = now + kRotationCheckInterval;
+        const auto now = std::chrono::system_clock::now();
+        if (now < next_rotation_at_) return;
 
-        const auto today = TodayDateString();
-        if (today != current_date_) {
-            RotateToDate(today);
+        const auto today = DateString(now);
+        if (today == current_date_ || RotateToDate(today)) {
+            next_rotation_at_ = NextLocalMidnight(now);
+        } else {
+            next_rotation_at_ = now + kRotationRetryDelay;
         }
     }
 
-    void RotateToDate(std::string_view date) {
+    [[nodiscard]] bool RotateToDate(std::string_view date) {
         const auto old_error_path = error_target_.active_path;
         const auto old_access_path = access_target_.active_path;
         const auto new_error_path = ResolveTargetPath(error_target_, date);
@@ -708,7 +688,7 @@ private:
                     std::format("log reopen failed access={} error={}",
                                 old_access_path.string(), old_error_path.string()));
             }
-            return;
+            return false;
         }
 
         current_date_ = std::string(date);
@@ -721,7 +701,58 @@ private:
         if (old_access_path != old_error_path) {
             CompressClosedFile(old_access_path);
         }
-        CleanupManagedFiles(DailySpecs(), current_date_, max_days_, gzip_enabled_);
+        CleanupManagedFiles();
+        return true;
+    }
+
+    // Retention and compression sweep over the date-suffixed files of both
+    // targets; failures are reported, never silently dropped.
+    void CleanupManagedFiles() {
+        try {
+            for (const auto& spec : DailySpecs()) {
+                const auto dir = spec.directory.empty()
+                    ? std::filesystem::path(".")
+                    : spec.directory;
+                if (!std::filesystem::exists(dir) ||
+                    !std::filesystem::is_directory(dir)) {
+                    continue;
+                }
+
+                for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+                    if (!entry.is_regular_file()) continue;
+
+                    const auto name = entry.path().filename().string();
+                    const auto file_date = ExtractDailyDate(name, spec);
+                    if (!file_date) continue;
+
+                    if (max_days_ > 0) {
+                        const auto age_days = DateAgeDays(*file_date, current_date_);
+                        if (age_days && *age_days > max_days_) {
+                            if (!RemovePath(entry.path())) {
+                                WriteBackendLine(
+                                    LogLevel::WARN,
+                                    std::format("log retention remove failed file={}",
+                                                entry.path().string()));
+                            }
+                            continue;
+                        }
+                    }
+
+                    if (gzip_enabled_ &&
+                        *file_date != current_date_ &&
+                        name.ends_with(spec.extension) &&
+                        !GzipFile(entry.path())) {
+                        WriteBackendLine(
+                            LogLevel::WARN,
+                            std::format("log gzip failed file={}", entry.path().string()));
+                    }
+                }
+            }
+        } catch (const std::exception& e) {
+            WriteBackendLine(
+                LogLevel::WARN,
+                std::format("log cleanup failed error={}", e.what()));
+        }
     }
 
     void CompressClosedFile(const std::filesystem::path& path) {
@@ -738,18 +769,13 @@ private:
         }
     }
 
-    bool DrainAvailable() {
-        bool wrote = false;
-        LogRecord record;
-        while (queue_.try_dequeue(record)) {
-            WriteRecord(record);
-            wrote = true;
-        }
-        return wrote;
-    }
-
-    void DrainUntilEmpty() {
-        while (DrainAvailable()) {
+    void DrainAvailable(std::span<LogRecord> batch) {
+        size_t count = 0;
+        while ((count = queue_.try_dequeue_bulk(batch.begin(), batch.size())) > 0) {
+            for (auto& record : batch.first(count)) {
+                WriteRecord(record);
+                record = LogRecord{};
+            }
         }
     }
 
@@ -819,6 +845,7 @@ private:
     }
 
     moodycamel::ConcurrentQueue<LogRecord> queue_;
+    moodycamel::LightweightSemaphore writer_wakeup_{0, 0};
     std::atomic_bool accepting_{false};
     std::atomic_bool running_{false};
     std::atomic_bool flush_requested_{false};
@@ -829,7 +856,7 @@ private:
     bool rotate_daily_{true};
     bool gzip_enabled_{true};
     std::string current_date_;
-    std::chrono::steady_clock::time_point next_rotation_check_{};
+    std::chrono::system_clock::time_point next_rotation_at_{};
     LogTarget error_target_{
         .fallback_prefix = "error",
         .configured_path = {},
@@ -848,6 +875,16 @@ AsyncLogBackend g_async_log_backend;
 
 }  // namespace
 
+std::optional<LogLevel> ParseLogLevel(std::string_view name) noexcept {
+    if (name == "none") return LogLevel::NONE;
+    if (name == "trace") return LogLevel::TRACE;
+    if (name == "debug") return LogLevel::DEBUG;
+    if (name == "info") return LogLevel::INFO;
+    if (name == "warning" || name == "warn") return LogLevel::WARN;
+    if (name == "error") return LogLevel::ERROR;
+    return std::nullopt;
+}
+
 bool Log::Init(const std::string& level,
                const std::filesystem::path& log_dir,
                uint16_t max_days,
@@ -859,7 +896,13 @@ bool Log::Init(const std::string& level,
         std::lock_guard lock(g_lifecycle_mutex);
         if (initialized_.load(std::memory_order_acquire)) return true;
 
-        min_level_.store(ParseLevel(level), std::memory_order_release);
+        const auto min_level = ParseLogLevel(level);
+        if (!min_level) {
+            std::cerr << "Log initialization failed: unsupported level '" << level
+                      << "'" << std::endl;
+            return false;
+        }
+        min_level_.store(*min_level, std::memory_order_release);
 
         try {
             if (!g_async_log_backend.Start(

@@ -1,11 +1,10 @@
 # One build/test graph for local runs and every CI libc variant. Test commands
 # remain registered beside their targets; CI does not maintain a second list.
 if(CNODE_TEST_SANITIZERS)
-    if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR
-       NOT CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-        message(FATAL_ERROR "CNODE_TEST_SANITIZERS requires Linux GCC or Clang with ASan/UBSan")
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        message(FATAL_ERROR "CNODE_TEST_SANITIZERS requires GCC or Clang with ASan/UBSan")
     endif()
-    foreach(base IN ITEMS cnode_thread_pool_test cnode_timeout_scheduler_test)
+    foreach(base IN ITEMS cnode_thread_memory_pool_test cnode_timeout_scheduler_test)
         set(target "${base}_sanitized")
         get_target_property(sources ${base} SOURCES)
         add_executable(${target} ${sources})

@@ -60,14 +60,14 @@ struct ProxyRegistration {
     std::unique_ptr<::acpp::Inbound> (*create_tcp_handler)(
         ProtocolRuntime& runtime,
         ::acpp::StatsShard& stats,
-        ::acpp::ConnectionLimiterPtr limiter,
+        ::acpp::ConnectionLimiter* limiter,
         const BuildRequest& req) = nullptr;
 
     // 创建 UDP 入站处理器（可选）
     std::unique_ptr<::acpp::Inbound> (*create_datagram_handler)(
         ProtocolRuntime& runtime,
         ::acpp::StatsShard& stats,
-        ::acpp::ConnectionLimiterPtr limiter,
+        ::acpp::ConnectionLimiter* limiter,
         const BuildRequest& req) = nullptr;
 
     // Parse protocol-specific source fields on the cold path. The returned
@@ -104,14 +104,14 @@ void RegisterProxy(std::string_view protocol, ProxyRegistration registration);
     std::string_view protocol,
     ProtocolRuntime& runtime,
     ::acpp::StatsShard& stats,
-    ::acpp::ConnectionLimiterPtr limiter,
+    ::acpp::ConnectionLimiter* limiter,
     const BuildRequest& req);
 
 [[nodiscard]] DatagramHandlerBuildResult NewDatagramHandler(
     std::string_view protocol,
     ProtocolRuntime& runtime,
     ::acpp::StatsShard& stats,
-    ::acpp::ConnectionLimiterPtr limiter,
+    ::acpp::ConnectionLimiter* limiter,
     const BuildRequest& req);
 
 [[nodiscard]] std::optional<BuildRequest> PrepareBuildRequest(

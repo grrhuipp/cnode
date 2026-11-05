@@ -30,8 +30,6 @@ struct StatsSnapshot {
 
     double bytes_in_rate = 0;
     double bytes_out_rate = 0;
-    double connections_rate = 0;
-
 };
 
 // ============================================================================
@@ -56,13 +54,10 @@ struct LocalStatsAccumulator {
 // 热点数据（频繁更新）和冷数据（偶尔更新）分离
 // ============================================================================
 
-// 热点数据 - 流量统计（每次 I/O 都更新）
+// 热点数据 - 流量统计（每次 I/O 都更新）；alignas 隔离冷热数据所在缓存行
 struct alignas(64) HotStatsShard {
     uint64_t bytes_in = 0;
     uint64_t bytes_out = 0;
-
-    // 填充到 64 字节
-    char padding_[48];
 
     void AddBytesIn(uint64_t n) {
         bytes_in += n;
@@ -88,9 +83,6 @@ struct alignas(64) ColdStatsShard {
     uint64_t connections_total = 0;
     uint64_t connections_active = 0;
     uint64_t errors = 0;
-
-    // 填充到 64 字节（3 × atomic<uint64_t> = 24 字节有效，padding 补齐）
-    char padding_[40];
 
     void OnConnectionAccepted() {
         ++connections_total;
@@ -140,11 +132,13 @@ struct alignas(64) StatsShard {
 // ============================================================================
 class ShardedStats {
 public:
+    // Requires at least one Worker; each Worker owns exactly one shard.
     explicit ShardedStats(uint32_t num_workers);
 
-    // 获取指定 worker 的分片
+    // A Worker id outside the configured range has no owner shard; sharing
+    // another Worker's executor-exclusive shard would race, so it throws.
     StatsShard& GetShard(uint32_t worker_id) {
-        return shards_[worker_id % shards_.size()];
+        return shards_.at(worker_id);
     }
 
     [[nodiscard]] StatsSnapshot WithCurrentRate(StatsSnapshot snapshot) const;
@@ -161,7 +155,6 @@ private:
     struct Sample {
         uint64_t bytes_in   = 0;
         uint64_t bytes_out  = 0;
-        uint64_t connections = 0;
         time_point start_time;   // 本采样周期的起始时刻（= 上次采样时间）
         bool valid = false;      // 是否已写入有效数据
     };
@@ -171,7 +164,6 @@ private:
 
     uint64_t last_bytes_in_ = 0;
     uint64_t last_bytes_out_ = 0;
-    uint64_t last_connections_ = 0;
     time_point last_sample_time_;
 
     double current_in_rate_ = 0;

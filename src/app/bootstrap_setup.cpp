@@ -10,6 +10,7 @@
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
 #include "proxyman/outbound/registration.hpp"
 #include "acppnode/app/worker.hpp"
+#include "acppnode/app/session_group_executor.hpp"
 #include "acppnode/app/worker_runtime_config.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/service/controller/controller.hpp"
@@ -41,13 +42,16 @@ namespace {
     return dns_config;
 }
 
-std::unique_ptr<geo::GeoManager> CreateGeoManager(const Config& config) {
-    std::unique_ptr<geo::GeoManager> geo_manager;
-    auto geoip_path   = config.config_dir / constants::paths::kGeoIpFile;
-    auto geosite_path = config.config_dir / constants::paths::kGeoSiteFile;
+// 只有路由实际引用 geo 分类时才加载数据；未引用时 Router 不需要 GeoDatabase。
+std::unique_ptr<geo::GeoDatabase> LoadGeoDatabase(const Config& config) {
     const auto geoip_tags = GetUsedGeoIPTags(config.routing);
     const auto geosite_tags = GetUsedGeoSiteTags(config.routing);
+    if (geoip_tags.empty() && geosite_tags.empty()) {
+        return nullptr;
+    }
 
+    const auto geoip_path   = config.config_dir / constants::paths::kGeoIpFile;
+    const auto geosite_path = config.config_dir / constants::paths::kGeoSiteFile;
     if (!geoip_tags.empty() && !std::filesystem::exists(geoip_path)) {
         throw std::runtime_error(std::format(
             "routing geoip tags require '{}'", geoip_path.string()));
@@ -57,34 +61,12 @@ std::unique_ptr<geo::GeoManager> CreateGeoManager(const Config& config) {
             "routing geosite tags require '{}'", geosite_path.string()));
     }
 
-    if (!std::filesystem::exists(geoip_path) && !std::filesystem::exists(geosite_path)) {
-        return geo_manager;
-    }
-
-    geo_manager = std::make_unique<geo::GeoManager>();
-    if (geo_manager->Init(geoip_path, geosite_path)) {
-        geo_manager->PreloadTags(geoip_tags, geosite_tags);
-        for (const auto& tag : geoip_tags) {
-            if (!geo_manager->ResolveGeoIPTag(tag).Valid()) {
-                throw std::runtime_error(std::format(
-                    "routing geoip tag '{}' was not loaded from '{}'",
-                    tag, geoip_path.string()));
-            }
-        }
-        for (const auto& tag : geosite_tags) {
-            if (!geo_manager->ResolveGeoSiteTag(tag).Valid()) {
-                throw std::runtime_error(std::format(
-                    "routing geosite tag '{}' was not loaded from '{}'",
-                    tag, geosite_path.string()));
-            }
-        }
-        auto gs = geo_manager->GetStats();
-        LOG_CONSOLE("geodata ready geoip_tags={} geosite_tags={}",
-                    gs.geoip_tags_loaded, gs.geosite_tags_loaded);
-    } else {
-        throw std::runtime_error("geodata initialization failed");
-    }
-    return geo_manager;
+    auto geo_database = std::make_unique<geo::GeoDatabase>(
+        geoip_path, geoip_tags, geosite_path, geosite_tags);
+    const auto gs = geo_database->GetStats();
+    LOG_CONSOLE("geodata ready geoip_tags={} geosite_tags={}",
+                gs.geoip_tags_loaded, gs.geosite_tags_loaded);
+    return geo_database;
 }
 
 
@@ -142,7 +124,7 @@ WorkerRuntimeConfig MakeWorkerRuntimeConfig(
 
 WorkerPool CreateWorkerPool(const WorkerRuntimeConfig& runtime_config,
                             ShardedStats& stats,
-                            geo::GeoManager* geo_manager,
+                            geo::GeoDatabase* geo_database,
                             app::dns::DNSWorker& dns_worker) {
     WorkerPool pool;
     const uint32_t workers = std::max<uint32_t>(1, runtime_config.workers);
@@ -150,17 +132,17 @@ WorkerPool CreateWorkerPool(const WorkerRuntimeConfig& runtime_config,
     pool.io_contexts.reserve(workers);
     pool.work_guards.reserve(workers);
 
-    constexpr int kSingleThreadIoConcurrencyHint =
-        static_cast<int>(ASIO_CONCURRENCY_HINT_ID | ASIO_CONCURRENCY_HINT_LOCKING_SCHEDULER);
     for (uint32_t i = 0; i < workers; ++i) {
         pool.io_contexts.push_back(
-            std::make_unique<net::io_context>(kSingleThreadIoConcurrencyHint));
+            std::make_unique<net::io_context>());
         pool.work_guards.push_back(net::make_work_guard(*pool.io_contexts[i]));
         auto& worker_stats = stats.GetShard(i);
         pool.workers.push_back(std::make_unique<Worker>(
             i, *pool.io_contexts[i], runtime_config, worker_stats, dns_worker,
-            geo_manager));
+            geo_database));
     }
+    auto coordinator = std::make_shared<GroupCoordinator>(*pool.io_contexts.front());
+    for (const auto& worker : pool.workers) worker->SetGroupCoordinator(coordinator);
 
     return pool;
 }
@@ -180,7 +162,7 @@ BootstrapEnvironment CreateBootstrapEnvironment(
     env.dns_worker = std::make_unique<app::dns::DNSWorker>(
         *env.main_ctx, MakeDnsServiceConfig(config), defaults::kWorkerMailboxCapacity);
     env.panel_dns_service = std::make_unique<app::dns::DNS>(*env.dns_worker);
-    env.geo_manager = CreateGeoManager(config);
+    env.geo_database = LoadGeoDatabase(config);
     env.stats = std::make_unique<ShardedStats>(config.workers);
     const WorkerRuntimeConfig worker_runtime_config =
         MakeWorkerRuntimeConfig(config, std::move(outbounds));
@@ -194,7 +176,7 @@ BootstrapEnvironment CreateBootstrapEnvironment(
     proxyman::inbound::UserStore::CommitSnapshot(
         proxyman::inbound::UserStore::PrepareUsers(user_updates));
     env.worker_pool = CreateWorkerPool(
-        worker_runtime_config, *env.stats, env.geo_manager.get(), *env.dns_worker);
+        worker_runtime_config, *env.stats, env.geo_database.get(), *env.dns_worker);
     env.controller = std::make_unique<Controller>(
         *env.main_ctx, env.worker_pool.workers);
 

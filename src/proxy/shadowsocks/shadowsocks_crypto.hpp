@@ -1,6 +1,7 @@
 #pragma once
 
 #include "shadowsocks_protocol.hpp"
+#include "acppnode/common/byte_reader.hpp"
 #include "../aead.hpp"
 
 #include <openssl/evp.h>
@@ -62,35 +63,12 @@ static constexpr size_t kMaxChunkPayload = 0x3FFF;
 // ============================================================================
 // SS2022 (AEAD-2022) 共享原语
 //
-// 大端整数读写、Unix 时间戳、AES-ECB 单块（identity header）等握手辅助逻辑，
+// Unix 时间戳、AES-ECB 单块（identity header）等握手辅助逻辑，
 // 客户端（client.cpp）与服务端（server.cpp）完全一致，集中在协议私有头里避免
 // 两份逐字复制。仅服务握手语义，不对外暴露为请求链路对象。
 // ============================================================================
 static constexpr size_t kSs2022MaxChunkPayload = 0xFFFF;
 static constexpr size_t kSs2022RequestFixedHeaderSize = 1 + 8 + 2;
-
-inline void PutU16BE(uint8_t* out, uint16_t value) noexcept {
-    out[0] = static_cast<uint8_t>(value >> 8);
-    out[1] = static_cast<uint8_t>(value & 0xFF);
-}
-
-inline uint16_t GetU16BE(const uint8_t* data) noexcept {
-    return static_cast<uint16_t>((data[0] << 8) | data[1]);
-}
-
-inline void PutU64BE(uint8_t* out, uint64_t value) noexcept {
-    for (int i = 7; i >= 0; --i) {
-        out[static_cast<size_t>(7 - i)] = static_cast<uint8_t>(value >> (8 * i));
-    }
-}
-
-inline uint64_t GetU64BE(const uint8_t* data) noexcept {
-    uint64_t value = 0;
-    for (size_t i = 0; i < 8; ++i) {
-        value = (value << 8) | data[i];
-    }
-    return value;
-}
 
 inline uint64_t UnixSecondsNow() noexcept {
     return static_cast<uint64_t>(

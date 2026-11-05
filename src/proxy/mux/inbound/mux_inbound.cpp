@@ -8,6 +8,7 @@
 #include "acppnode/app/stats.hpp"
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/transport/async_stream.hpp"
+#include "acppnode/transport/link_error.hpp"
 #include "acppnode/common/buffer_util.hpp"
 #include "acppnode/infra/log.hpp"
 
@@ -37,6 +38,10 @@ constexpr size_t kMuxQueueHighWaterBytes = 4 * 1024 * 1024;
 constexpr size_t kMuxQueueLowWaterBytes  = 2 * 1024 * 1024;
 constexpr size_t kMuxQueueEmergencyBytes = 8 * 1024 * 1024;
 constexpr size_t kMuxReplyOverhead       = 128;
+// Above what one Xray client connection can carry (its MaxConnection is 128),
+// so compliant clients never hit it; every accepted sub-session owns a
+// dispatch task and outbound resources.
+constexpr size_t kMaxConcurrentSubSessions = 1024;
 
 [[nodiscard]] constexpr bool QueueBytesWouldExceed(
     size_t queued,
@@ -45,6 +50,14 @@ constexpr size_t kMuxReplyOverhead       = 128;
     return queued > limit || incoming > limit - queued;
 }
 
+struct QueuedInput {
+    QueuedInput(buf::MultiBuffer p, size_t n) noexcept
+        : payload(std::move(p))
+        , bytes(n) {}
+
+    buf::MultiBuffer payload;
+    size_t bytes = 0;
+};
 
 // 回包元素（出站 → 客户端）
 struct MuxReply {
@@ -78,6 +91,10 @@ struct ReplyQueueState {
     bool running = true;
     bool tcp_overflowed = false;
     uint64_t udp_dropped = 0;
+    // Client input queued in all sub-sessions and not yet taken by their
+    // dispatchers. The frame loop stops parsing client frames at the high
+    // watermark, so the aggregate never grows with the sub-session count.
+    size_t sub_input_bytes = 0;
 
     size_t TotalBytes() const noexcept { return tcp_queued_bytes + udp_queued_bytes; }
 
@@ -180,6 +197,22 @@ struct ReplyQueueState {
         }
         WakeReplyWriter();
     }
+
+    void AddSubInput(size_t bytes) noexcept {
+        sub_input_bytes += bytes;
+    }
+
+    void ReleaseSubInput(size_t bytes) noexcept {
+        const bool was_backpressured = sub_input_bytes > kMuxQueueLowWaterBytes;
+        sub_input_bytes -= std::min(sub_input_bytes, bytes);
+        if (was_backpressured && sub_input_bytes <= kMuxQueueLowWaterBytes) {
+            WakeReplyWriter();
+        }
+    }
+
+    [[nodiscard]] bool ShouldBackpressureClientFrames() const noexcept {
+        return sub_input_bytes >= kMuxQueueHighWaterBytes;
+    }
 };
 
 class SubLoopLease final {
@@ -216,14 +249,6 @@ struct ClientReadQueueState {
     net::io_context& io_context_;
     SignalChannel space_signal;
     SignalChannel& main_signal_;
-    struct QueuedInput {
-        QueuedInput(buf::MultiBuffer p, size_t n) noexcept
-            : payload(std::move(p))
-            , bytes(n) {}
-
-        buf::MultiBuffer payload;
-        size_t bytes = 0;
-    };
     memory::ThreadLocalDeque<QueuedInput> queue;
     size_t queued_bytes = 0;
     bool running = true;
@@ -288,54 +313,19 @@ struct ClientReadQueueState {
     }
 };
 
-class TcpSubState final
+// Shared state machine of one Mux sub-session: the bounded client-input queue
+// consumed by its dispatcher, cancellation, and the END / dispatch-done
+// notifications queued for the frame loop. Queued input is charged to the
+// connection-wide budget until it is read or discarded.
+class MuxSubSession
     : public memory::ThreadAllocated
     , public transport::MultiBufferReader
     , public transport::MultiBufferWriter {
 public:
     transport::CancellationSource& Cancellation() noexcept override { return cancellation_; }
 
-    TcpSubState(
-        net::io_context& io_context,
-        uint16_t session_id,
-        ReplyQueueState& reply_queue)
-        : io_context_(io_context)
-        , output_signal_(io_context, 1)
-        , input_signal_(io_context, 1)
-        , session_id_(session_id)
-        , reply_queue_(reply_queue) {}
-    ~TcpSubState() noexcept override {
-        Cancel();
-    }
-
-    TcpSubState(const TcpSubState&) = delete;
-    TcpSubState& operator=(const TcpSubState&) = delete;
-
-    [[nodiscard]] bool PushClientPayload(buf::MultiBuffer mb) {
-        const size_t bytes = buf::TotalLen(mb);
-        if (cancelled_ || input_done_ || bytes == 0) {
-            mb.clear();
-            return true;
-        }
-        if (QueueBytesWouldExceed(
-                queued_bytes_, bytes, kMuxQueueEmergencyBytes)) {
-            mb.clear();
-            Cancel(ErrorCode::RESOURCE_EXHAUSTED);
-            return false;
-        }
-        input_queue_.emplace_back(std::move(mb), bytes);
-        queued_bytes_ += bytes;
-        WakeInputReader();
-        return true;
-    }
-
-    void CloseClientInput() {
-        if (input_done_) {
-            return;
-        }
-        input_done_ = true;
-        WakeInputReader();
-    }
+    MuxSubSession(const MuxSubSession&) = delete;
+    MuxSubSession& operator=(const MuxSubSession&) = delete;
 
     void MarkDispatchDone() noexcept {
         dispatch_done_ = true;
@@ -355,9 +345,11 @@ public:
         while (!cancelled_) {
             if (!input_queue_.empty()) {
                 auto& input = input_queue_.front();
-                queued_bytes_ -= std::min(queued_bytes_, input.bytes);
+                const size_t bytes = input.bytes;
                 buf::MultiBuffer payload = std::move(input.payload);
                 input_queue_.pop_front();
+                queued_bytes_ -= std::min(queued_bytes_, bytes);
+                reply_queue_.ReleaseSubInput(bytes);
                 co_return payload;
             }
             if (input_done_) {
@@ -369,10 +361,139 @@ public:
             if (ec) {
                 throw IoSystemError(
                     io_error::operation_aborted,
-                    "Mux TCP input cancelled");
+                    "Mux sub-session input cancelled");
             }
         }
-        ThrowInputError("Mux TCP input cancelled");
+        if (terminal_error_ == ErrorCode::RESOURCE_EXHAUSTED) {
+            throw IoSystemError(io_error::no_buffer_space, "Mux sub-session input overflow");
+        }
+        throw IoSystemError(io_error::operation_aborted, "Mux sub-session input cancelled");
+    }
+
+    net::awaitable<void> AsyncShutdownWrite() override {
+        PushEnd();
+        co_return;
+    }
+
+    void Cancel(ErrorCode error = ErrorCode::CANCELLED) noexcept {
+        if (cancelled_) {
+            return;
+        }
+        cancelled_ = true;
+        terminal_error_ = error;
+        cancellation_.Stop(error);
+        input_done_ = true;
+        OnCancel();
+        WakeInputReader();
+        input_queue_.clear();
+        reply_queue_.ReleaseSubInput(std::exchange(queued_bytes_, 0));
+    }
+
+    session::Context ctx;
+
+protected:
+    MuxSubSession(net::io_context& io_context, uint16_t session_id, ReplyQueueState& reply_queue)
+        : io_context_(io_context)
+        , session_id_(session_id)
+        , reply_queue_(reply_queue)
+        , input_signal_(io_context, 1) {}
+    // Derived destructors call Cancel() so their OnCancel still runs.
+    ~MuxSubSession() noexcept override = default;
+
+    // Called once from Cancel() before queued input is discarded.
+    virtual void OnCancel() noexcept {}
+
+    [[nodiscard]] bool InputClosed() const noexcept {
+        return cancelled_ || input_done_;
+    }
+
+    // Per-sub backlog needs no own cap: the frame loop stops parsing client
+    // frames once all sub-sessions together hold kMuxQueueHighWaterBytes.
+    void QueueInput(buf::MultiBuffer mb, size_t bytes) {
+        input_queue_.emplace_back(std::move(mb), bytes);
+        queued_bytes_ += bytes;
+        reply_queue_.AddSubInput(bytes);
+        WakeInputReader();
+    }
+
+    void FinishInput() noexcept {
+        input_done_ = true;
+        WakeInputReader();
+    }
+
+    void PushEnd() {
+        if (!reply_queue_.running) {
+            return;
+        }
+        const bool send_end = !end_sent_;
+        const bool notify_dispatch_done =
+            dispatch_done_ && !dispatch_done_notified_;
+        if (!send_end && !notify_dispatch_done) {
+            return;
+        }
+        MuxReply reply;
+        reply.session_id = session_id_;
+        reply.is_end = send_end;
+        reply.dispatch_done = notify_dispatch_done;
+        end_sent_ = end_sent_ || send_end;
+        dispatch_done_notified_ =
+            dispatch_done_notified_ || notify_dispatch_done;
+        if (!reply_queue_.PushTcp(std::move(reply))) {
+            reply_queue_.tcp_overflowed = true;
+            Cancel();
+        }
+    }
+
+    net::io_context& io_context_;
+    const uint16_t session_id_;
+    ReplyQueueState& reply_queue_;
+    bool input_done_ = false;
+    bool cancelled_ = false;
+
+private:
+    void WakeInputReader() noexcept {
+        if (io_context_.stopped()) {
+            return;
+        }
+        (void)input_signal_.try_send(IoErrorCode{});
+    }
+
+    SignalChannel input_signal_;
+    transport::CancellationSource cancellation_;
+    memory::ThreadLocalDeque<QueuedInput> input_queue_;
+    size_t queued_bytes_ = 0;
+    ErrorCode terminal_error_ = ErrorCode::CANCELLED;
+    bool end_sent_ = false;
+    bool dispatch_done_ = false;
+    bool dispatch_done_notified_ = false;
+};
+
+class TcpSubState final : public MuxSubSession {
+public:
+    TcpSubState(
+        net::io_context& io_context,
+        uint16_t session_id,
+        ReplyQueueState& reply_queue)
+        : MuxSubSession(io_context, session_id, reply_queue)
+        , output_signal_(io_context, 1) {}
+    ~TcpSubState() noexcept override {
+        Cancel();
+    }
+
+    void PushClientPayload(buf::MultiBuffer mb) {
+        const size_t bytes = mb.byte_size();
+        if (InputClosed() || bytes == 0) {
+            mb.clear();
+            return;
+        }
+        QueueInput(std::move(mb), bytes);
+    }
+
+    void CloseClientInput() {
+        if (input_done_) {
+            return;
+        }
+        FinishInput();
     }
 
     transport::EofAction ReadEofAction() const noexcept override {
@@ -492,47 +613,10 @@ public:
         }
     }
 
-    net::awaitable<void> AsyncShutdownWrite() override {
-        PushEnd();
-        co_return;
-    }
-
-    void Cancel(ErrorCode error = ErrorCode::CANCELLED) noexcept {
-        if (cancelled_) {
-            return;
-        }
-        cancelled_ = true;
-        terminal_error_ = error;
-        cancellation_.Stop(error);
-        input_done_ = true;
+private:
+    void OnCancel() noexcept override {
         reply_queue_.RemoveWaitingWriter(this);
         WakeOutputWriter();
-        WakeInputReader();
-        input_queue_.clear();
-        queued_bytes_ = 0;
-    }
-
-    void Close() {
-        Cancel();
-    }
-
-    session::Context ctx;
-
-private:
-    transport::CancellationSource cancellation_;
-
-    [[noreturn]] void ThrowInputError(const char* what) const {
-        if (terminal_error_ == ErrorCode::RESOURCE_EXHAUSTED) {
-            throw IoSystemError(io_error::no_buffer_space, what);
-        }
-        throw IoSystemError(io_error::operation_aborted, what);
-    }
-
-    void WakeInputReader() noexcept {
-        if (io_context_.stopped()) {
-            return;
-        }
-        (void)input_signal_.try_send(IoErrorCode{});
     }
 
     void WakeOutputWriter() noexcept {
@@ -555,54 +639,11 @@ private:
         }
     }
 
-    void PushEnd() {
-        if (!reply_queue_.running) {
-            return;
-        }
-        const bool send_end = !end_sent_;
-        const bool notify_dispatch_done =
-            dispatch_done_ && !dispatch_done_notified_;
-        if (!send_end && !notify_dispatch_done) {
-            return;
-        }
-        MuxReply reply;
-        reply.session_id = session_id_;
-        reply.is_end = send_end;
-        reply.dispatch_done = notify_dispatch_done;
-        end_sent_ = end_sent_ || send_end;
-        dispatch_done_notified_ =
-            dispatch_done_notified_ || notify_dispatch_done;
-        if (!reply_queue_.PushTcp(std::move(reply))) {
-            reply_queue_.tcp_overflowed = true;
-            Cancel();
-        }
-    }
-
     friend struct ReplyQueueState;
 
-    net::io_context& io_context_;
     SignalChannel output_signal_;
-    SignalChannel input_signal_;
-    uint16_t session_id_ = 0;
-    ReplyQueueState& reply_queue_;
     TcpSubState* next_waiting_writer_ = nullptr;
     bool waiting_in_reply_queue_ = false;
-    struct QueuedInput {
-        QueuedInput(buf::MultiBuffer p, size_t n) noexcept
-            : payload(std::move(p))
-            , bytes(n) {}
-
-        buf::MultiBuffer payload;
-        size_t bytes = 0;
-    };
-    memory::ThreadLocalDeque<QueuedInput> input_queue_;
-    size_t queued_bytes_ = 0;
-    bool input_done_ = false;
-    bool cancelled_ = false;
-    ErrorCode terminal_error_ = ErrorCode::CANCELLED;
-    bool end_sent_ = false;
-    bool dispatch_done_ = false;
-    bool dispatch_done_notified_ = false;
 };
 
 void ReplyQueueState::AddWaitingWriter(TcpSubState* writer) noexcept {
@@ -644,13 +685,8 @@ void ReplyQueueState::WakeWaitingWriters() noexcept {
 
 using TcpSubInfo = std::unique_ptr<TcpSubState>;
 
-class UdpSubState final
-    : public memory::ThreadAllocated
-    , public transport::MultiBufferReader
-    , public transport::MultiBufferWriter {
+class UdpSubState final : public MuxSubSession {
 public:
-    transport::CancellationSource& Cancellation() noexcept override { return cancellation_; }
-
     UdpSubState(
         net::io_context& io_context,
         uint16_t session_id,
@@ -658,10 +694,7 @@ public:
         uint64_t parent_conn_id,
         TargetAddress default_target,
         bool xudp_packet_mode)
-        : io_context_(io_context)
-        , input_signal_(io_context, 1)
-        , session_id_(session_id)
-        , reply_queue_(reply_queue)
+        : MuxSubSession(io_context, session_id, reply_queue)
         , parent_conn_id_(parent_conn_id)
         , default_target_(std::move(default_target))
         , xudp_packet_mode_(xudp_packet_mode) {}
@@ -670,23 +703,9 @@ public:
         Cancel();
     }
 
-    UdpSubState(const UdpSubState&) = delete;
-    UdpSubState& operator=(const UdpSubState&) = delete;
-
-    void PushClientPayload(buf::MultiBuffer mb) {
-        const size_t bytes = buf::TotalLen(mb);
-        PushClientPayload(std::move(mb), bytes);
-    }
-
     void PushClientPayload(buf::MultiBuffer mb, size_t bytes) {
-        if (cancelled_ || input_done_ || bytes == 0) {
+        if (InputClosed() || bytes == 0) {
             mb.clear();
-            return;
-        }
-        if (QueueBytesWouldExceed(
-                queued_bytes_, bytes, kMuxQueueEmergencyBytes)) {
-            mb.clear();
-            Cancel(ErrorCode::RESOURCE_EXHAUSTED);
             return;
         }
         if (xudp_packet_mode_) {
@@ -700,9 +719,7 @@ public:
             return;
         }
         StampDefaultTarget(mb);
-        input_queue_.emplace_back(std::move(mb), bytes);
-        queued_bytes_ += bytes;
-        WakeInputReader();
+        QueueInput(std::move(mb), bytes);
     }
 
     void CloseClientInput() {
@@ -717,46 +734,7 @@ public:
                 return;
             }
         }
-        input_done_ = true;
-        WakeInputReader();
-    }
-
-    void MarkDispatchDone() noexcept {
-        dispatch_done_ = true;
-        try {
-            PushEnd();
-        } catch (...) {
-            reply_queue_.tcp_overflowed = true;
-            Cancel();
-        }
-    }
-
-    [[nodiscard]] bool DispatchDone() const noexcept {
-        return dispatch_done_;
-    }
-
-    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
-        while (!cancelled_) {
-            if (!input_queue_.empty()) {
-                auto& input = input_queue_.front();
-                queued_bytes_ -= std::min(queued_bytes_, input.bytes);
-                buf::MultiBuffer payload = std::move(input.payload);
-                input_queue_.pop_front();
-                co_return payload;
-            }
-            if (input_done_) {
-                co_return buf::MultiBuffer{};
-            }
-
-            auto [ec] = co_await input_signal_.async_receive(
-                net::as_tuple(net::use_awaitable));
-            if (ec) {
-                throw IoSystemError(
-                    io_error::operation_aborted,
-                    "Mux UDP input cancelled");
-            }
-        }
-        ThrowInputError("Mux UDP input cancelled");
+        FinishInput();
     }
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
@@ -804,95 +782,10 @@ public:
         co_return;
     }
 
-    net::awaitable<void> AsyncShutdownWrite() override {
-        PushEnd();
-        co_return;
-    }
-
-    void Cancel(ErrorCode error = ErrorCode::CANCELLED) noexcept {
-        if (cancelled_) {
-            return;
-        }
-        cancelled_ = true;
-        terminal_error_ = error;
-        cancellation_.Stop(error);
-        input_done_ = true;
-        WakeInputReader();
-        input_queue_.clear();
-        xudp_packets_.Clear();
-        queued_bytes_ = 0;
-    }
-
-    void Close() {
-        Cancel();
-    }
-
-    session::Context ctx;
-
 private:
-    transport::CancellationSource cancellation_;
-
-    [[noreturn]] void ThrowInputError(const char* what) const {
-        if (terminal_error_ == ErrorCode::RESOURCE_EXHAUSTED) {
-            throw IoSystemError(io_error::no_buffer_space, what);
-        }
-        throw IoSystemError(io_error::operation_aborted, what);
+    void OnCancel() noexcept override {
+        xudp_packets_.Clear();
     }
-
-    void WakeInputReader() noexcept {
-        if (io_context_.stopped()) {
-            return;
-        }
-        (void)input_signal_.try_send(IoErrorCode{});
-    }
-
-    void PushEnd() {
-        if (!reply_queue_.running) {
-            return;
-        }
-        const bool send_end = !end_sent_;
-        const bool notify_dispatch_done =
-            dispatch_done_ && !dispatch_done_notified_;
-        if (!send_end && !notify_dispatch_done) {
-            return;
-        }
-        MuxReply reply;
-        reply.session_id = session_id_;
-        reply.is_end = send_end;
-        reply.dispatch_done = notify_dispatch_done;
-        end_sent_ = end_sent_ || send_end;
-        dispatch_done_notified_ =
-            dispatch_done_notified_ || notify_dispatch_done;
-        if (!reply_queue_.PushTcp(std::move(reply))) {
-            reply_queue_.tcp_overflowed = true;
-            Cancel();
-        }
-    }
-
-    net::io_context& io_context_;
-    SignalChannel input_signal_;
-    uint16_t session_id_ = 0;
-    ReplyQueueState& reply_queue_;
-    uint64_t parent_conn_id_ = 0;
-    TargetAddress default_target_;
-    bool xudp_packet_mode_ = false;
-    buf::LengthPrefixedPacketBuffer xudp_packets_;
-    struct QueuedInput {
-        QueuedInput(buf::MultiBuffer p, size_t n) noexcept
-            : payload(std::move(p))
-            , bytes(n) {}
-
-        buf::MultiBuffer payload;
-        size_t bytes = 0;
-    };
-    memory::ThreadLocalDeque<QueuedInput> input_queue_;
-    size_t queued_bytes_ = 0;
-    bool input_done_ = false;
-    bool cancelled_ = false;
-    ErrorCode terminal_error_ = ErrorCode::CANCELLED;
-    bool end_sent_ = false;
-    bool dispatch_done_ = false;
-    bool dispatch_done_notified_ = false;
 
     void StampDefaultTarget(buf::MultiBuffer& mb) {
         for (auto* buffer : mb) {
@@ -902,25 +795,8 @@ private:
         }
     }
 
-    void QueueDecodedPayload(buf::MultiBuffer payload, size_t bytes) {
-        if (bytes == 0) {
-            payload.clear();
-            return;
-        }
-        if (QueueBytesWouldExceed(
-                queued_bytes_, bytes, kMuxQueueEmergencyBytes)) {
-            payload.clear();
-            Cancel(ErrorCode::RESOURCE_EXHAUSTED);
-            return;
-        }
-        StampDefaultTarget(payload);
-        input_queue_.emplace_back(std::move(payload), bytes);
-        queued_bytes_ += bytes;
-        WakeInputReader();
-    }
-
     void FeedXudpPackets(buf::MultiBuffer mb) {
-        if (!buf::HasData(mb)) {
+        if (mb.byte_size() == 0) {
             return;
         }
         xudp_packets_.Append(std::move(mb));
@@ -935,21 +811,30 @@ private:
                 Cancel();
                 return;
             }
-            const size_t packet_len = buf::TotalLen(payload);
-            QueueDecodedPayload(std::move(payload), packet_len);
+            const size_t packet_len = payload.byte_size();
+            if (packet_len == 0) {
+                continue;
+            }
+            StampDefaultTarget(payload);
+            QueueInput(std::move(payload), packet_len);
         }
         xudp_packets_.Clear();
     }
+
+    uint64_t parent_conn_id_ = 0;
+    TargetAddress default_target_;
+    bool xudp_packet_mode_ = false;
+    buf::LengthPrefixedPacketBuffer xudp_packets_;
 };
 
 using UdpSubInfo = std::unique_ptr<UdpSubState>;
 using MuxSubInfo = std::variant<TcpSubInfo, UdpSubInfo>;
 
-net::awaitable<void> RunTcpSubDispatch(
+net::awaitable<void> RunSubDispatch(
     net::io_context& io_context,
     routing::Dispatcher& dispatcher,
     const routing::DispatchPolicy& policy,
-    TcpSubState* sub,
+    MuxSubSession* sub,
     StatsShard& stats,
     const TimeoutsConfig& timeouts,
     SubLoopLease sub_loop)
@@ -971,38 +856,7 @@ net::awaitable<void> RunTcpSubDispatch(
             stats,
             timeouts);
     } catch (...) {
-        sub->Cancel();
-    }
-
-    sub->MarkDispatchDone();
-}
-
-net::awaitable<void> RunUdpSubDispatch(
-    net::io_context& io_context,
-    routing::Dispatcher& dispatcher,
-    const routing::DispatchPolicy& policy,
-    UdpSubState* sub,
-    StatsShard& stats,
-    const TimeoutsConfig& timeouts,
-    SubLoopLease sub_loop)
-{
-    (void)sub_loop;
-    transport::Link link{
-        static_cast<transport::MultiBufferReader*>(sub),
-        static_cast<transport::MultiBufferWriter*>(sub)
-    };
-
-    try {
-        (void)co_await dispatcher.Dispatch(
-            io_context,
-            policy,
-            nullptr,
-            link,
-            InitialPayload{},
-            sub->ctx,
-            stats,
-            timeouts);
-    } catch (...) {
+        LOG_CONN_DEBUG(sub->ctx, "[MuxRelay] sub-session dispatch failed with an exception");
         sub->Cancel();
     }
 
@@ -1074,11 +928,11 @@ net::awaitable<RelayResult> ProcessInboundImpl(
         while (client_reads.running) {
             try {
                 buf::MultiBuffer read_mb = co_await client_link.reader->ReadMultiBuffer();
-                if (!buf::HasData(read_mb)) {
+                if (read_mb.byte_size() == 0) {
                     client_reads.MarkDone(ErrorCode::OK);
                     co_return;
                 }
-                const size_t read_bytes = buf::TotalLen(read_mb);
+                const size_t read_bytes = read_mb.byte_size();
                 if (!client_reads.Push(std::move(read_mb), read_bytes)) {
                     client_reads.MarkDone(ErrorCode::RESOURCE_EXHAUSTED);
                     co_return;
@@ -1126,7 +980,12 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                     if (ConsumeWriteSideTimeout(client_control)) {
                         result.error = ErrorCode::RELAY_TIMEOUT;
                     }
+                } catch (const transport::LinkError&) {
+                    // Logical carrier close ends the session like a socket error.
+                } catch (const std::bad_alloc&) {
+                    result.error = ErrorCode::RESOURCE_EXHAUSTED;
                 } catch (...) {
+                    result.error = ErrorCode::INTERNAL;
                 }
                 co_return false;
             };
@@ -1188,7 +1047,12 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                     if (ConsumeWriteSideTimeout(client_control)) {
                         result.error = ErrorCode::RELAY_TIMEOUT;
                     }
+                } catch (const transport::LinkError&) {
+                    // Logical carrier close ends the session like a socket error.
+                } catch (const std::bad_alloc&) {
+                    result.error = ErrorCode::RESOURCE_EXHAUSTED;
                 } catch (...) {
+                    result.error = ErrorCode::INTERNAL;
                 }
                 reply.payload.clear();
                 co_return false;
@@ -1283,6 +1147,18 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                 continue;
             }
 
+            // Sub-session input shares one budget. Parsing more client frames
+            // waits until dispatchers drain it below the low watermark.
+            if (reply_queue.ShouldBackpressureClientFrames()) {
+                auto [ec] = co_await main_signal.async_receive(
+                    net::as_tuple(net::use_awaitable));
+                if (ec) {
+                    running = false;
+                    break;
+                }
+                continue;
+            }
+
             // --------------------------------------------------------------------
             // 2. 消费客户端读队列。读操作由独立协程持有，避免为了轮询回包而
             //    Cancel 底层协议 reader，导致 VMess/VLESS 流被提前关闭。
@@ -1311,7 +1187,7 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                 continue;
             }
 
-            const size_t read_bytes = buf::TotalLen(read_mb);
+            const size_t read_bytes = read_mb.byte_size();
             if (read_bytes == 0) {
                 if (client_reads.done && client_reads.error == ErrorCode::RELAY_TIMEOUT) {
                     LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] Read-side timeout");
@@ -1336,17 +1212,7 @@ net::awaitable<RelayResult> ProcessInboundImpl(
             // 3. 循环解析并分发 Mux 帧
             // --------------------------------------------------------------------
             while (running && frame_buf_bytes > 0) {
-                std::optional<mux::FrameHeader> opt_hdr;
-                const auto prefix = frame_buf.FrontSpan();
-                if (!prefix.empty()) {
-                    opt_hdr = mux::DecodeFramePrefix(
-                        prefix.data(),
-                        prefix.size(),
-                        frame_buf_bytes);
-                }
-                if (!opt_hdr) {
-                    opt_hdr = mux::DecodeFrame(frame_buf, 0, frame_buf_bytes);
-                }
+                const auto opt_hdr = mux::DecodeFrame(frame_buf);
                 if (!opt_hdr) break;  // 数据不足，等待下次读取
 
                 const mux::FrameHeader& hdr = *opt_hdr;
@@ -1388,20 +1254,27 @@ net::awaitable<RelayResult> ProcessInboundImpl(
 
                 // ----------------------------------------------------------------
                 case mux::SessionStatus::NEW: {
+                    // A reused ID or a sub-session beyond the budget is refused
+                    // with an error END; the refused frame's payload is dropped.
+                    if (sub_sessions.contains(hdr.session_id) ||
+                        sub_sessions.size() >= kMaxConcurrentSubSessions) {
+                        LOG_CONN_DEBUG(parent_ctx,
+                            "[MuxRelay] refused NEW sid={} active={}",
+                            hdr.session_id, sub_sessions.size());
+                        const size_t header_len =
+                            mux::EncodeEndTo(write_frame, hdr.session_id, true);
+                        if (!co_await write_frame_to_client(
+                                std::span<const uint8_t>(write_frame.data(), header_len))) {
+                            running = false;
+                        }
+                        break;
+                    }
+                    const uint16_t sid = hdr.session_id;
                     if (hdr.network == mux::NetworkType::UDP) {
                         // ---- 新建 UDP 子会话 ----
                         LOG_CONN_DEBUG(parent_ctx,
                             "[MuxRelay] New UDP sid={} target={} data={}B global_id={}",
                             hdr.session_id, hdr.target, hdr.data_len, hdr.has_global_id);
-
-                        uint16_t sid = hdr.session_id;
-                        if (sub_sessions.contains(sid)) {
-                            const size_t header_len =
-                                mux::EncodeEndTo(write_frame, hdr.session_id, true);
-                            (void)co_await write_frame_to_client(
-                                std::span<const uint8_t>(write_frame.data(), header_len));
-                            break;
-                        }
 
                         auto sub_state = std::make_unique<UdpSubState>(
                             io_context,
@@ -1416,7 +1289,7 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                         sub_ctx.outbound.original_target = hdr.target;
                         sub_ctx.outbound.target          = hdr.target;
 
-                        if (buf::HasData(frame_payload)) {
+                        if (frame_payload.byte_size() != 0) {
                             for (auto* buffer : frame_payload) {
                                 if (buffer && !buffer->IsEmpty()) {
                                     buffer->SetUDP(hdr.target);
@@ -1433,7 +1306,7 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                             std::get<UdpSubInfo>(insert_it->second).get();
 
                         try {
-                            tasks.Spawn(RunUdpSubDispatch(
+                            tasks.Spawn(RunSubDispatch(
                                     io_context,
                                     dispatcher,
                                     policy,
@@ -1458,18 +1331,6 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                                 hdr.session_id);
                         }
 
-                        uint16_t    sid  = hdr.session_id;
-
-                        if (sub_sessions.contains(sid)) {
-                            LOG_CONN_DEBUG(parent_ctx,
-                                "[MuxRelay] duplicate TCP sid={}", sid);
-                            const size_t header_len =
-                                mux::EncodeEndTo(write_frame, hdr.session_id, true);
-                            (void)co_await write_frame_to_client(
-                                std::span<const uint8_t>(write_frame.data(), header_len));
-                            break;
-                        }
-
                         auto sub_state = std::make_unique<TcpSubState>(
                             io_context, sid, reply_queue);
                         auto& sub_ctx = sub_state->ctx;
@@ -1480,15 +1341,8 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                             sub_ctx.outbound.target          = hdr.target;
                         }
 
-                        if (buf::HasData(frame_payload) &&
-                            !sub_state->PushClientPayload(std::move(frame_payload))) {
-                            LOG_CONN_DEBUG(parent_ctx,
-                                "[MuxRelay] TCP input queue overflow sid={}", sid);
-                            const size_t header_len =
-                                mux::EncodeEndTo(write_frame, hdr.session_id, true);
-                            (void)co_await write_frame_to_client(
-                                std::span<const uint8_t>(write_frame.data(), header_len));
-                            break;
+                        if (frame_payload.byte_size() != 0) {
+                            sub_state->PushClientPayload(std::move(frame_payload));
                         }
 
                         auto [insert_it, inserted] = sub_sessions.try_emplace(
@@ -1500,7 +1354,7 @@ net::awaitable<RelayResult> ProcessInboundImpl(
 
                         // 计数仅用于正常 EOF 排空；任务组持有并 join 真正的完成回调。
                         try {
-                            tasks.Spawn(RunTcpSubDispatch(
+                            tasks.Spawn(RunSubDispatch(
                                     io_context,
                                     dispatcher,
                                     policy,
@@ -1525,14 +1379,14 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                         ? nullptr
                         : std::get_if<UdpSubInfo>(&session_it->second);
                     if (udp_sub) {
-                        if (hdr.has_target && buf::HasData(frame_payload)) {
+                        if (hdr.has_target && frame_payload.byte_size() != 0) {
                             for (auto* buffer : frame_payload) {
                                 if (buffer && !buffer->IsEmpty()) {
                                     buffer->SetUDP(hdr.target);
                                 }
                             }
                         }
-                        if (buf::HasData(frame_payload)) {
+                        if (frame_payload.byte_size() != 0) {
                             (*udp_sub)->PushClientPayload(std::move(frame_payload), hdr.data_len);
                         }
                     } else {
@@ -1540,20 +1394,8 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                         auto* tcp_sub = session_it == sub_sessions.end()
                             ? nullptr
                             : std::get_if<TcpSubInfo>(&session_it->second);
-                        bool tcp_write_failed = false;
-                        if (tcp_sub && buf::HasData(frame_payload)) {
-                            if (!(*tcp_sub)->PushClientPayload(std::move(frame_payload))) {
-                                tcp_write_failed = true;
-                            }
-                        }
-                        if (tcp_write_failed) {
-                            (*tcp_sub)->Cancel();
-                            const size_t header_len =
-                                mux::EncodeEndTo(write_frame, hdr.session_id);
-                            if (!co_await write_frame_to_client(
-                                    std::span<const uint8_t>(write_frame.data(), header_len))) {
-                                running = false;
-                            }
+                        if (tcp_sub && frame_payload.byte_size() != 0) {
+                            (*tcp_sub)->PushClientPayload(std::move(frame_payload));
                         }
                     }
                     break;
@@ -1567,36 +1409,31 @@ net::awaitable<RelayResult> ProcessInboundImpl(
 
                     if (known_session) {
                         if (auto* udp_sub = std::get_if<UdpSubInfo>(&session_it->second)) {
-                            if (hdr.has_target && buf::HasData(frame_payload)) {
+                            if (hdr.has_target && frame_payload.byte_size() != 0) {
                                 for (auto* buffer : frame_payload) {
                                     if (buffer && !buffer->IsEmpty()) {
                                         buffer->SetUDP(hdr.target);
                                     }
                                 }
                             }
-                            if (buf::HasData(frame_payload)) {
+                            if (frame_payload.byte_size() != 0) {
                                 (*udp_sub)->PushClientPayload(
                                     std::move(frame_payload), hdr.data_len);
                             }
                             (*udp_sub)->CloseClientInput();
-                            if ((*udp_sub)->DispatchDone()) {
-                                sub_sessions.erase(session_it);
-                            }
                         } else if (auto* tcp_sub =
                                        std::get_if<TcpSubInfo>(&session_it->second)) {
-                            if (buf::HasData(frame_payload) &&
-                                !(*tcp_sub)->PushClientPayload(std::move(frame_payload))) {
-                                (*tcp_sub)->Cancel();
+                            if (frame_payload.byte_size() != 0) {
+                                (*tcp_sub)->PushClientPayload(std::move(frame_payload));
                             }
                             (*tcp_sub)->CloseClientInput();
-                            if ((*tcp_sub)->DispatchDone()) {
-                                sub_sessions.erase(session_it);
-                            }
                         }
                     }
 
                     // 已知子会话的 END 只表示客户端输入结束；真正回给客户端的
                     // END 由子会话 dispatch 完成时发送，避免先于最后一批回包到达。
+                    // 映射项只由 dispatch_done 回包移除：此处提前移除会让排队中的
+                    // 旧回包在同 sid 的新 NEW 之后误删新子会话。
                     if (!known_session) {
                         const size_t header_len = mux::EncodeEndTo(write_frame, sid);
                         if (!co_await write_frame_to_client(
@@ -1637,7 +1474,7 @@ net::awaitable<RelayResult> ProcessInboundImpl(
     // Acquire the join continuation before any task starts. Session storage is
     // released only after the reader, frame loop and every dynamic dispatch have
     // delivered their co_spawn completion, including failure/cancellation.
-    co_await RunAwaitableTaskGroup(io_context.get_executor(),
+    co_await RunAwaitableTaskGroup(co_await net::this_coro::executor,
         [&](AwaitableTaskGroup& tasks) {
             tasks.Spawn(client_reader_loop());
             tasks.Spawn(process_frames(tasks));

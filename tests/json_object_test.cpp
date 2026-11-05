@@ -1,4 +1,4 @@
-#include "acppnode/infra/json_object.hpp"
+#include "acppnode/infra/json_field.hpp"
 
 #include <cstdlib>
 #include <iostream>
@@ -153,15 +153,48 @@ void CheckDuplicateKeys() {
         } catch (const acpp::json::parse_error&) {
         }
     }
-    const auto repeated = acpp::json::parse(R"({"key":1,"key":2})");
-    Check(repeated.as_object().size() == 1 &&
-              repeated.as_object().at("key").as_int64() == 2,
-          "ordinary JSON duplicate-key behavior changed");
+    for (const auto body : {
+             R"({"key":1,"key":2})",
+             R"({"users":[{"id":1,"uuid":"a","uuid":"b"}]})"}) {
+        try {
+            (void)acpp::json::parse(body);
+            Fail("case-sensitive parser accepted a duplicate key");
+        } catch (const acpp::json::parse_error&) {
+        }
+    }
+    const auto distinct_case = acpp::json::parse(R"({"Key":1,"key":2})");
+    Check(distinct_case.as_object().size() == 2,
+          "case-sensitive parser merged keys differing only in case");
     const auto siblings = acpp::json::parse(
         R"([{"Key":1},{"KEY":2}])", KeyComparison::AsciiCaseInsensitive);
     Check(siblings.as_array()[0].as_object().at("key").as_int64() == 1 &&
               siblings.as_array()[1].as_object().at("key").as_int64() == 2,
           "keys in different objects were treated as duplicates");
+}
+
+void CheckNestingDepth() {
+    const auto nested = [](size_t depth) {
+        return std::string(depth, '[') + std::string(depth, ']');
+    };
+    Check(acpp::json::parse(nested(128)).is_array(),
+          "nesting at the depth limit was rejected");
+    for (const std::string& body : {nested(129), std::string(1'000'000, '[')}) {
+        try {
+            (void)acpp::json::parse(body);
+            Fail("nesting beyond the depth limit was accepted");
+        } catch (const acpp::json::parse_error& error) {
+            Check(std::string_view(error.what()).find("nesting too deep") !=
+                      std::string_view::npos,
+                  "deep nesting was rejected for the wrong reason");
+        }
+    }
+    std::string nested_objects;
+    for (size_t i = 1; i < 127; ++i) nested_objects += R"({"k":)";
+    nested_objects += "{}" + std::string(126, '}');
+    const std::string siblings = "[" + nested(127) + "," + nested_objects + "," +
+                                 nested_objects + "]";
+    Check(acpp::json::parse(siblings).is_array(),
+          "depth accounting leaked across closed containers");
 }
 
 void CheckNormalizedKeysAndValues() {
@@ -184,6 +217,21 @@ void CheckNormalizedKeysAndValues() {
     Check(acpp::json::serialize(object) ==
               R"({"insert":"OtherValue","subscript":"MixedValue"})",
           "programmatic insertion retained uppercase key storage");
+}
+
+void CheckUnicodeEscapes() {
+    const auto supplementary = acpp::json::parse(R"("\uD83D\uDE00")");
+    Check(supplementary.as_string() == "\xF0\x9F\x98\x80",
+          "unicode surrogate pair was not decoded as one code point");
+    for (const std::string_view lone_surrogate : {R"("\uD83D")", R"("\uDE00")"}) {
+        bool rejected = false;
+        try {
+            (void)acpp::json::parse(lone_surrogate);
+        } catch (const acpp::json::parse_error&) {
+            rejected = true;
+        }
+        Check(rejected, "invalid JSON unicode escape was accepted");
+    }
 }
 
 }  // namespace
@@ -209,7 +257,9 @@ int main() {
     CheckNestedKeyComparison();
     CheckCopiesAndMoves();
     CheckDuplicateKeys();
+    CheckNestingDepth();
     CheckNormalizedKeysAndValues();
+    CheckUnicodeEscapes();
 
     std::cout << "json_object_test: ok\n";
     return 0;

@@ -20,7 +20,7 @@ public:
     void Start(TimeoutScheduler& scheduler) {
         if (pool_) return;
         scheduler_ = &scheduler;
-        pool_ = &memory::ThreadPool();
+        pool_ = &memory::ThreadMemoryPool();
         if (!pool_->BindIdleWakeup(*this)) {
             pool_ = nullptr;
             scheduler_ = nullptr;

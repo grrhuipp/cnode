@@ -1,8 +1,11 @@
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/transport/internet/tcp_stream.hpp"
 #include "acppnode/transport/internet/tls_stream.hpp"
+#include "acppnode/transport/internet/tls_config.hpp"
 #include "acppnode/transport/internet/transport_stack.hpp"
+#include "acppnode/transport/internet/transport_security.hpp"
 #include "acppnode/transport/internet/ws_stream.hpp"
+#include "../src/transport/internet/http1_handshake.hpp"
 
 #include <asio/co_spawn.hpp>
 #include <asio/experimental/channel.hpp>
@@ -16,10 +19,8 @@
 #include <stdexcept>
 #include <string>
 
-#ifndef _WIN32
 #include <netinet/tcp.h>
 #include <sys/socket.h>
-#endif
 
 namespace {
 namespace net = acpp::net;
@@ -73,7 +74,10 @@ void Case(bool outbound, bool tls, bool upgrade, bool fragmented, bool abortive)
         settings.tls.cert_file = (fixtures / "cert.pem").string();
         settings.tls.key_file = (fixtures / "key.pem").string();
     }
+    acpp::LoadTlsPemMaterial(settings.tls);
     settings = acpp::NormalizeStreamSettings(settings);
+    const acpp::TransportSecurity security(
+        settings, outbound ? acpp::StreamEndpointRole::Outbound : acpp::StreamEndpointRole::Inbound);
     net::ssl::context context(net::ssl::context::tls);
     context.set_verify_mode(net::ssl::verify_none);
     if (tls && outbound) {
@@ -170,9 +174,9 @@ void Case(bool outbound, bool tls, bool upgrade, bool fragmented, bool abortive)
         }
         acpp::TransportBuildResult built;
         if (outbound) {
-            built = co_await acpp::BuildOutboundTransport(std::move(raw), settings);
+            built = co_await acpp::BuildOutboundTransport(std::move(raw), settings, security.Context());
         } else {
-            built = co_await acpp::BuildInboundTransport(io, std::move(raw), settings);
+            built = co_await acpp::BuildInboundTransport(io, std::move(raw), settings, security.Context());
         }
         Require(built.has_value(), "HTTP transport handshake failed");
         stream = std::move(*built);
@@ -196,7 +200,7 @@ void Case(bool outbound, bool tls, bool upgrade, bool fragmented, bool abortive)
         }
         while (received.size() < payload.size() + 6) {
             auto buffers = co_await stream->ReadMultiBuffer();
-            Require(acpp::buf::HasData(buffers), "multi-buffer read truncated payload");
+            Require(buffers.byte_size() != 0, "multi-buffer read truncated payload");
             received += Flatten(buffers);
         }
         Require(received == "prefix" + payload, "read-ahead lost, duplicated, decrypted at wrong layer, or reordered");
@@ -230,7 +234,7 @@ void Case(bool outbound, bool tls, bool upgrade, bool fragmented, bool abortive)
             stream->ShutdownRead();
             stream->ShutdownRead();
             Require(co_await stream->AsyncRead(net::buffer(small)) == 0, "read shutdown leaked retained plaintext");
-            Require(!acpp::buf::HasData(co_await stream->ReadMultiBuffer()), "read shutdown leaked multi-buffer data");
+            Require((co_await stream->ReadMultiBuffer()).byte_size() == 0, "read shutdown leaked multi-buffer data");
             // Join the peer's graceful half-close before a repeated abortive close
             // can reset its socket; otherwise its shutdown_send races with RST.
             co_await peer_finished.async_receive(net::use_awaitable);
@@ -242,7 +246,7 @@ void Case(bool outbound, bool tls, bool upgrade, bool fragmented, bool abortive)
         stream->Close();
         Require(!stream->IsOpen(), "repeated close left transport open");
         Require(co_await stream->AsyncRead(net::buffer(small)) == 0, "closed transport leaked read-ahead");
-        Require(!acpp::buf::HasData(co_await stream->ReadMultiBuffer()), "closed transport leaked multi-buffer data");
+        Require((co_await stream->ReadMultiBuffer()).byte_size() == 0, "closed transport leaked multi-buffer data");
         Require(acpp::memory::detail::test_buffers_live == 0, "shutdown/close retained payload blocks");
     };
     auto finish = [&](std::exception_ptr failure) {
@@ -272,29 +276,61 @@ void ConnectedSocketOptions() {
     acpp::TcpStream stream(std::move(socket));
     const auto require_option = [&](int level, int option, int expected) {
         int value = 0;
-#ifdef _WIN32
-        int size = sizeof(value);
-        const int status = ::getsockopt(native, level, option,
-            reinterpret_cast<char*>(&value), &size);
-#else
         socklen_t size = sizeof(value);
         const int status = ::getsockopt(native, level, option, &value, &size);
-#endif
         Require(status == 0 && value == expected,
                 "connected TCP socket has incorrect keepalive settings");
     };
     require_option(SOL_SOCKET, SO_KEEPALIVE, 1);
-#if defined(__APPLE__) && defined(TCP_KEEPALIVE)
-    require_option(IPPROTO_TCP, TCP_KEEPALIVE, 60);
-#elif defined(TCP_KEEPIDLE)
     require_option(IPPROTO_TCP, TCP_KEEPIDLE, 60);
-#endif
-#if defined(TCP_KEEPINTVL)
     require_option(IPPROTO_TCP, TCP_KEEPINTVL, 10);
-#endif
-#if defined(TCP_KEEPCNT)
     require_option(IPPROTO_TCP, TCP_KEEPCNT, 6);
-#endif
+}
+
+void WriteTimeoutResetsQueuedPayload() {
+    net::io_context io;
+    acpp::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
+    acpp::tcp::socket socket(io), peer(io);
+    socket.connect(acceptor.local_endpoint());
+    acceptor.accept(peer);
+    socket.set_option(net::socket_base::send_buffer_size(4096));
+    peer.set_option(net::socket_base::receive_buffer_size(4096));
+    acpp::TcpStream stream(std::move(socket));
+    stream.SetWriteTimeout(1s);
+    bool completed = false;
+    std::exception_ptr error;
+    auto exercise = [&]() -> net::awaitable<void> {
+        // No peer reads until the blocked writer's deadline has fired. A
+        // graceful close would leave the kernel draining this queued payload.
+        const std::string payload(1024 * 1024, 'x');
+        bool cancelled = false;
+        try { (void)co_await stream.AsyncWrite(net::buffer(payload)); }
+        catch (const acpp::IoSystemError& failure) {
+            Require(failure.code() == acpp::io_error::operation_aborted,
+                    "write deadline failed with unrelated I/O error");
+            cancelled = true;
+        }
+        Require(cancelled && stream.ConsumeWriteTimeout() && !stream.IsOpen(),
+                "write deadline did not cancel and retire its socket");
+        std::array<char, 8192> buffer{};
+        for (;;) {
+            auto [ec, size] = co_await peer.async_read_some(
+                net::buffer(buffer), net::as_tuple(net::use_awaitable));
+            if (ec) {
+                Require(ec == net::error::connection_reset,
+                        "write deadline gracefully drained payload instead of resetting");
+                break;
+            }
+            Require(size != 0, "write deadline peer read made no progress");
+        }
+    };
+    net::co_spawn(io, exercise(), [&](std::exception_ptr failure) {
+        error = failure;
+        completed = true;
+    });
+    io.run_for(3s);
+    if (error) std::rethrow_exception(error);
+    Require(completed, "write deadline left queued payload or native readiness unjoined");
 }
 
 void ExistingTcpResidual() {
@@ -319,7 +355,7 @@ void ExistingTcpResidual() {
         data.clear();
         stream.PrependReadData(Bytes("discard"));
         stream.Close();
-        Require(!acpp::buf::HasData(co_await stream.ReadMultiBuffer()), "close leaked old residual");
+        Require((co_await stream.ReadMultiBuffer()).byte_size() == 0, "close leaked old residual");
     };
     net::co_spawn(io, read(), [&](std::exception_ptr failure) { error = failure; done = true; });
     io.run_for(1s);
@@ -337,11 +373,13 @@ void TlsReadTermination(bool multi_buffer, bool clean) {
     net::ssl::context server_context(net::ssl::context::tls_server);
     server_context.use_certificate_chain_file((fixtures / "cert.pem").string());
     server_context.use_private_key_file((fixtures / "key.pem").string(), net::ssl::context::pem);
-    net::ssl::context client_context(net::ssl::context::tls_client);
-    client_context.set_verify_mode(net::ssl::verify_none);
+    acpp::TlsConfig client_config;
+    client_config.allow_insecure = true;
+    auto client_context = acpp::SslContext::CreateClient(client_config);
+    Require(bool(client_context), "TLS termination client context creation failed");
     net::ssl::stream<acpp::tcp::socket> peer(std::move(peer_socket), server_context);
     acpp::TlsStream stream(std::make_unique<acpp::TcpStream>(std::move(socket)),
-                           client_context.native_handle(), false);
+                           *client_context, false);
     std::exception_ptr failure;
     unsigned completed = 0;
     auto send = [&]() -> net::awaitable<void> {
@@ -367,7 +405,7 @@ void TlsReadTermination(bool multi_buffer, bool clean) {
         bool truncated = false;
         try {
             if (multi_buffer) {
-                Require(!acpp::buf::HasData(co_await stream.ReadMultiBuffer()), "unexpected TLS payload");
+                Require((co_await stream.ReadMultiBuffer()).byte_size() == 0, "unexpected TLS payload");
             } else {
                 char byte{};
                 Require(co_await stream.AsyncRead(net::buffer(&byte, 1)) == 0, "unexpected TLS payload");
@@ -765,20 +803,168 @@ void WsProtocolBoundaries() {
         for (auto action : {WsConcurrent::Ping, WsConcurrent::Close, WsConcurrent::Cancel})
             WsWriteBoundary(action, owned);
 }
+
+void UpgradeHeaderTokens(bool outbound, bool websocket,
+                         std::string_view connection, bool accepted) {
+    net::io_context io;
+    acpp::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
+    acpp::tcp::socket socket(io), peer(io);
+    socket.connect(acceptor.local_endpoint());
+    acceptor.accept(peer);
+    auto raw = std::make_unique<acpp::TcpStream>(std::move(socket));
+    raw->SetIdleTimeout(2s);
+    acpp::StreamSettings settings;
+    settings.network = websocket ? "ws" : "httpupgrade";
+    settings.ws.path = settings.http_upgrade.path = "/up";
+    settings.security = "none";
+    settings = acpp::NormalizeStreamSettings(settings);
+    std::exception_ptr error;
+    size_t completed = 0;
+    auto finish = [&](std::exception_ptr failure) {
+        if (failure && !error) { error = failure; io.stop(); }
+        ++completed;
+    };
+    auto wire = [&]() -> net::awaitable<void> {
+        std::string message;
+        if (outbound) {
+            std::string request;
+            char byte;
+            do {
+                co_await net::async_read(peer, net::buffer(&byte, 1), net::use_awaitable);
+                request += byte;
+            } while (!request.ends_with("\r\n\r\n"));
+            message = "HTTP/1.1 101 Switching Protocols\r\n";
+            if (websocket) {
+                const auto key = acpp::transport::internet::TrimAscii(
+                    acpp::transport::internet::ExtractHeaderValueCI(request, "Sec-WebSocket-Key"));
+                message += "Sec-WebSocket-Accept: " + acpp::ws::ComputeWsAccept(key) + "\r\n";
+            }
+        } else {
+            message = "GET /up HTTP/1.1\r\nHost: localhost\r\n"
+                      "Sec-WebSocket-Version: 13\r\n"
+                      "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n";
+        }
+        message += "Upgrade: WebSocket\r\n";
+        message += connection;
+        message += "\r\n";
+        co_await net::async_write(peer, net::buffer(message), net::use_awaitable);
+    };
+    auto product = [&]() -> net::awaitable<void> {
+        acpp::TransportBuildResult built;
+        if (outbound) {
+            built = co_await acpp::BuildOutboundTransport(std::move(raw), settings, nullptr);
+        } else {
+            built = co_await acpp::BuildInboundTransport(io, std::move(raw), settings, nullptr);
+        }
+        Require(built.has_value() == accepted, "Connection header token handshake mismatch");
+        if (built) (*built)->Close();
+    };
+    net::co_spawn(io, wire(), finish);
+    net::co_spawn(io, product(), finish);
+    io.run();
+    if (error) std::rethrow_exception(error);
+    Require(completed == 2, "Connection token handshake stalled");
+}
+
+void ChunkExtensionBody(std::string_view wire, bool accepted, bool multi_buffer) {
+    net::io_context io;
+    acpp::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
+    acpp::tcp::socket socket(io), peer(io);
+    socket.connect(acceptor.local_endpoint());
+    acceptor.accept(peer);
+    auto raw = std::make_unique<acpp::TcpStream>(std::move(socket));
+    raw->SetIdleTimeout(2s);
+    auto stream = acpp::transport::internet::MakeHttp1BodyStream(
+        std::move(raw), acpp::transport::internet::Http1BodyChunked{}, false);
+    std::exception_ptr error;
+    size_t completed = 0;
+    auto finish = [&](std::exception_ptr failure) {
+        if (failure && !error) { error = failure; io.stop(); }
+        ++completed;
+        // The stream is retained by this fixture, not by either coroutine.
+        // Once both peers have joined, retire its idle timer as well; otherwise
+        // every successful grammar rejection keeps io.run alive for two seconds.
+        if (completed == 2) stream->Close();
+    };
+    auto sender = [&]() -> net::awaitable<void> {
+        // Separate asynchronous writes exercise parser state at every byte.
+        for (const char& byte : wire)
+            co_await net::async_write(peer, net::buffer(&byte, 1), net::use_awaitable);
+        peer.shutdown(acpp::tcp::socket::shutdown_send);
+    };
+    auto receiver = [&]() -> net::awaitable<void> {
+        bool rejected = false;
+        std::string body;
+        try {
+            for (;;) {
+                if (multi_buffer) {
+                    auto buffers = co_await stream->ReadMultiBuffer();
+                    if (buffers.empty()) break;
+                    body += Flatten(buffers);
+                } else {
+                    std::array<char, 2> bytes;
+                    const auto n = co_await stream->AsyncRead(net::buffer(bytes));
+                    if (n == 0) break;
+                    body.append(bytes.data(), n);
+                }
+            }
+        } catch (const acpp::IoSystemError& failure) {
+            Require(failure.code() == acpp::io_error::invalid_argument,
+                    "chunk boundary failed with unrelated I/O error");
+            rejected = true;
+        }
+        Require(rejected != accepted, "transport chunk grammar acceptance mismatch");
+        if (accepted) Require(body == "OK", "transport chunk decoder leaked framing bytes");
+    };
+    net::co_spawn(io, sender(), finish);
+    net::co_spawn(io, receiver(), finish);
+    io.run();
+    if (error) std::rethrow_exception(error);
+    Require(completed == 2, "chunk boundary parser stalled");
+}
+
+void HttpBoundaryCases() {
+    for (bool outbound : {false, true}) {
+        for (bool websocket : {false, true}) {
+            for (const std::string_view headers : {
+                     "Connection: keep-alive\r\ncOnNeCtIoN: UpGrAdE\r\n",
+                     "Connection: , keep-alive, ,UPGRADE,\r\n",
+                     "Connection: Upgrade\r\nConnection: keep-alive\r\n"})
+                UpgradeHeaderTokens(outbound, websocket, headers, true);
+            for (const std::string_view headers : {
+                     "", "Connection: x-upgrade\r\n", "Connection: upgraded\r\n",
+                     "Connection: keep-alive\r\nConnection: not-upgrade\r\n"})
+                UpgradeHeaderTokens(outbound, websocket, headers, false);
+        }
+    }
+    for (bool multi_buffer : {false, true}) {
+        ChunkExtensionBody("2 \t; name = \"a;\\\"b\\\\c\";flag\r\nOK\r\n0\r\n\r\n",
+                           true, multi_buffer);
+        for (const std::string_view body : {
+                 "2;x=\"unterminated\r\nOK\r\n0\r\n\r\n",
+                 "2;x=\r\nOK\r\n0\r\n\r\n", "2;\r\nOK\r\n0\r\n\r\n",
+                 "2 0\r\nOK\r\n0\r\n\r\n", "2\nOK\r\n0\r\n\r\n",
+                 "2\r\nOK\n0\r\n\r\n", "2\r\nO", "0\r\n",
+                 "10000000000000000\r\nOK\r\n0\r\n\r\n"})
+            ChunkExtensionBody(body, false, multi_buffer);
+    }
+}
 }  // namespace
 
 int main() {
     acpp::TlsStream::InitializeIo();
-    acpp::memory::ThreadPoolFacade resource;
+    acpp::memory::ThreadMemoryResource resource;
     auto* previous = std::pmr::set_default_resource(&resource);
     bool passed = true;
     try {
         ConnectedSocketOptions();
+        WriteTimeoutResetsQueuedPayload();
         ExistingTcpResidual();
         for (bool multi_buffer : {false, true})
             for (bool clean : {true, false})
                 TlsReadTermination(multi_buffer, clean);
         WsProtocolBoundaries();
+        HttpBoundaryCases();
         for (bool outbound : {false, true})
             for (bool tls : {false, true})
                 for (bool upgrade : {false, true})

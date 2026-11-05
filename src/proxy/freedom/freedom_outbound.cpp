@@ -102,20 +102,6 @@ net::ip::address SelectUdpBindAddress(
     return net::ip::address_v4::any();
 }
 
-OutboundTransportTarget::BindMode ToTransportBindMode(OutboundBind::Mode mode) {
-    switch (mode) {
-        case OutboundBind::Mode::None:
-            return OutboundTransportTarget::BindMode::None;
-        case OutboundBind::Mode::Auto:
-            return OutboundTransportTarget::BindMode::Auto;
-        case OutboundBind::Mode::Explicit:
-            return OutboundTransportTarget::BindMode::Explicit;
-        case OutboundBind::Mode::Ordered:
-            return OutboundTransportTarget::BindMode::Ordered;
-    }
-    return OutboundTransportTarget::BindMode::None;
-}
-
 }  // namespace
 
 Handler::Handler(
@@ -127,15 +113,8 @@ Handler::Handler(
     , send_through_(settings.send_through)
     , domain_strategy_(settings.domain_strategy)
     , dns_service_(dns_service)
-    , dial_timeout_(dial_timeout) {
-    if (!settings.redirect.empty()) {
-        auto redir = TargetAddress::Parse(settings.redirect);
-        if (redir && redir->IsValid()) {
-            redirect_target_ = std::move(*redir);
-        }
-    }
-
-}
+    , dial_timeout_(dial_timeout)
+    , redirect_target_(settings.redirect) {}
 
 net::awaitable<OutboundProcessResult> Handler::Process(
     net::io_context& io_context,
@@ -175,13 +154,8 @@ net::awaitable<OutboundProcessResult> Handler::Process(
         }
         target->SetIdleTimeout(relay_idle_timeout);
         target->SetWriteTimeout(relay_write_timeout);
-        if (inbound.control) {
-            co_return co_await DoRelayLink(io_context, *inbound.reader, *inbound.writer,
-                *inbound.control, *target, ctx, stats, relay_config,
-                std::move(first_payload));
-        }
         co_return co_await DoRelayLink(io_context, *inbound.reader, *inbound.writer,
-            *target, ctx, stats, relay_config, std::move(first_payload));
+            inbound.control, *target, ctx, stats, relay_config, std::move(first_payload));
     }
 
     // redirect：替换目标地址（Xray freedom redirect 语义）
@@ -200,15 +174,8 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     stream->SetIdleTimeout(relay_idle_timeout);
     stream->SetReadTimeout(std::chrono::seconds(0));
     stream->SetWriteTimeout(relay_write_timeout);
-    AsyncStream* inbound_control = inbound.control;
-
-    if (inbound_control) {
-        co_return co_await DoRelayLink(
-            io_context, *inbound.reader, *inbound.writer, *inbound_control,
-            *stream, ctx, stats, relay_config, std::move(first_payload));
-    }
     co_return co_await DoRelayLink(
-        io_context, *inbound.reader, *inbound.writer,
+        io_context, *inbound.reader, *inbound.writer, inbound.control,
         *stream, ctx, stats, relay_config, std::move(first_payload));
 }
 
@@ -225,7 +192,6 @@ Handler::DialOutboundStream(
     LOG_CONN_DEBUG(ctx, "Freedom resolve target {}", target);
 
     OutboundTransportTarget transport_target;
-    transport_target.bind_mode = ToTransportBindMode(send_through_.GetMode());
     transport_target.timeout = dial_timeout_;
     transport_target.stream_settings = &stream_settings_;
 
@@ -242,7 +208,7 @@ Handler::DialOutboundStream(
         -> std::optional<net::ip::address> {
         return ordered_bind
             ? (remote_addr.is_v6() ? selected_v6.address : selected_v4.address)
-            : DetermineLocalAddress(inbound_local_addr, remote_addr);
+            : send_through_.BindAddressFor(inbound_local_addr, remote_addr);
     };
     auto set_single_candidate = [&](const net::ip::address& remote_addr) {
         OutboundDialCandidate candidate;
@@ -378,37 +344,12 @@ Handler::ResolveTargets(session::Context& ctx) {
     co_return addresses;
 }
 
-std::optional<net::ip::address> Handler::DetermineLocalAddress(
-    const tcp::endpoint* inbound_local_addr,
-    const net::ip::address& remote_addr) {
-
-    if (send_through_.GetMode() == OutboundBind::Mode::Auto) {
-        // auto 模式：源进源出
-        // 使用入站连接的本地 IP 作为出站绑定地址
-        // 这样可以实现「哪个 IP 进哪个 IP 出」
-
-        if (!inbound_local_addr) {
-            return std::nullopt;
-        }
-        auto inbound_local = iputil::NormalizeAddress(inbound_local_addr->address());
-        if (!inbound_local.is_unspecified() && !inbound_local.is_loopback()) {
-            if ((remote_addr.is_v4() && inbound_local.is_v4()) ||
-                (remote_addr.is_v6() && inbound_local.is_v6())) {
-                return inbound_local;
-            }
-        }
-        return std::nullopt;
-    }
-
-    return send_through_.ExplicitAddress();
-}
-
 proxyman::outbound::PreparedOutboundCreator PrepareOutbound(FreedomSettings settings) {
     return proxyman::outbound::MakePreparedOutboundCreator<
         FreedomSettings,
         +[](std::string_view tag, std::shared_ptr<const FreedomSettings> config,
             net::io_context&, app::dns::DNS& dns,
-            std::chrono::seconds timeout) -> std::unique_ptr<Outbound> {
+            std::chrono::seconds timeout, AwaitableTaskGroup&) -> std::unique_ptr<Outbound> {
             return std::make_unique<Handler>(tag, *config, dns, timeout);
         }>(std::move(settings));
 }
@@ -445,8 +386,17 @@ const bool kFreedomRegistered = (acpp::proxyman::outbound::RegisterProxy(
             return std::nullopt;
         }
         settings.domain_strategy = *domain_strategy;
-        if (const auto* v = s.if_contains("redirect"); v && v->is_string()) {
-            settings.redirect = std::string(v->as_string());
+        // 空字符串与缺省同义（Xray 示例配置写法），其他值必须是合法的 host:port。
+        if (const auto* v = s.if_contains("redirect");
+            v && !(v->is_string() && v->as_string().empty())) {
+            auto redirect = v->is_string()
+                ? acpp::TargetAddress::Parse(v->as_string())
+                : std::nullopt;
+            if (!redirect || !redirect->IsValid()) {
+                LOG_ERROR("freedom outbound '{}': redirect must be a valid host:port", cfg.tag);
+                return std::nullopt;
+            }
+            settings.redirect = std::move(*redirect);
         }
 
         // Xray 顶级 sendThrough 优先于 settings 内的

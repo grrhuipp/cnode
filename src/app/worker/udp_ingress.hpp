@@ -138,21 +138,15 @@ public:
         std::string_view socket_key,
         udp::endpoint endpoint,
         buf::MultiBuffer payload);
-    [[nodiscard]] ReplyEnqueueResult EnqueueReply(
-        std::string_view socket_key,
-        udp::endpoint endpoint,
-        buf::BufferGuard payload);
+    // Hands the oldest queued datagram to the sender admitted by StartSend.
     [[nodiscard]] std::optional<PendingUdpReply> BeginReplySend(std::string_view socket_key);
-    [[nodiscard]] bool CompleteReplySend(
+    // Completes the active send and hands the next queued datagram to the same
+    // sender. A stale id (cleared or replaced queue) changes nothing.
+    [[nodiscard]] std::optional<PendingUdpReply> CompleteReplySend(
         std::string_view socket_key,
         uint64_t completed_id);
     void ClearReplyQueue(std::string_view socket_key);
 
-    [[nodiscard]] bool HasClientSession(std::string_view socket_key,
-                                        const ClientSessionKey& client_key) const noexcept;
-    [[nodiscard]] ClientSessionPtr FindClientSession(
-        std::string_view socket_key,
-        const ClientSessionKey& client_key) const noexcept;
     [[nodiscard]] ClientSessionPtr CreateClientSession(
         std::string_view socket_key,
         const ClientSessionKey& client_key,
@@ -160,15 +154,8 @@ public:
         ReplyRoute reply,
         udp::endpoint reply_endpoint,
         ::acpp::InboundDatagramOwner session_owner,
-        std::chrono::steady_clock::time_point now,
+        std::chrono::steady_clock::time_point last_active,
         std::chrono::seconds idle_timeout);
-    [[nodiscard]] bool PushClientPayload(std::string_view socket_key,
-                                         const ClientSessionKey& client_key,
-                                         const TargetAddress& target,
-                                         udp::endpoint reply_endpoint,
-                                         const ::acpp::InboundDatagramOwner& session_owner,
-                                         buf::MultiBuffer payload,
-                                         std::chrono::steady_clock::time_point now);
     void CleanupClientSessions(std::string_view socket_key) noexcept;
     void CleanupAllClientSessions() noexcept;
 
@@ -181,8 +168,6 @@ public:
         std::string_view socket_key,
         SocketPtr socket);
     [[nodiscard]] SocketPtr FindSocket(std::string_view socket_key) noexcept;
-    [[nodiscard]] std::shared_ptr<const udp::socket> FindSocket(
-        std::string_view socket_key) const noexcept;
     [[nodiscard]] bool OwnsSocket(
         std::string_view socket_key,
         const udp::socket* socket) const noexcept;
@@ -194,8 +179,6 @@ private:
     friend class UdpAssociationReclaimer;
     void ReclaimAssociation(UdpAssociationHook& hook,
                             std::chrono::steady_clock::time_point now) noexcept;
-    void FinishNativeJob(ClientSession& session) noexcept;
-    void RollbackNativeJob(ClientSession& session) noexcept;
     void RetireNativeJob(ClientSession& session) noexcept;
     static net::awaitable<void> RunNativeDispatch(ClientSessionPtr session);
     struct Impl;

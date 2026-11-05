@@ -64,7 +64,7 @@ std::unique_ptr<::acpp::Inbound> NewHandler(
     std::string_view protocol,
     ProtocolRuntime& runtime,
     ::acpp::StatsShard& stats,
-    ::acpp::ConnectionLimiterPtr limiter,
+    ::acpp::ConnectionLimiter* limiter,
     const BuildRequest& req) {
     auto& registrations = Registrations();
     auto it = registrations.find(protocol);
@@ -78,7 +78,7 @@ DatagramHandlerBuildResult NewDatagramHandler(
     std::string_view protocol,
     ProtocolRuntime& runtime,
     ::acpp::StatsShard& stats,
-    ::acpp::ConnectionLimiterPtr limiter,
+    ::acpp::ConnectionLimiter* limiter,
     const BuildRequest& req) {
     auto& registrations = Registrations();
     auto it = registrations.find(protocol);
