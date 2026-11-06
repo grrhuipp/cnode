@@ -200,12 +200,16 @@ foreach(proxy_mode IN ITEMS "off" "auto" "on" "OFF" "AUTO" "ON")
         [=[{"workers":1,"log":{"enable":false}}]=] "inbounds.json"
         "[{\"tag\":\"proxy\",\"protocol\":\"vless\",\"listen\":\"127.0.0.1\",\"port\":12100,\"proxyProtocol\":\"${proxy_mode}\",\"settings\":{\"clients\":[{\"id\":\"11111111-1111-4111-8111-111111111111\"}]}}]")
 endforeach()
-foreach(node_type IN ITEMS "" "v2ray" "ss" "shadowsocks-plugin" "VMESS")
+foreach(node_type IN ITEMS "" "v2ray" "ss" "shadowsocks-plugin")
     string(MD5 case_id "${node_type}")
     expect_rejected("removed_panel_node_type_${case_id}"
         "{\"panels\":[{\"name\":\"bad-type\",\"apiHost\":\"http://127.0.0.1\",\"key\":\"secret\",\"nodeIDs\":[1],\"nodeType\":\"${node_type}\"}]}"
         "" "")
 endforeach()
+# Enum values are case-insensitive: VMESS is the lowercase vmess node type.
+expect_started(case_insensitive_panel_node_type
+    [=[{"workers":1,"log":{"enable":false},"panels":[{"name":"mixed-type","type":"V2BOARD","apiHost":"http://127.0.0.1:9","key":"secret","nodeIDs":[1],"nodeType":"VMESS"}]}]=]
+    "" "")
 expect_started(case_insensitive_uppercase_config_keys
     [=[{"WORKERS":1,"LOG":{"ENABLE":false,"LOGLEVEL":"info"}}]=]
     "outbounds.json"

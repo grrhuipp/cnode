@@ -158,9 +158,11 @@ geosite.dat
 
 `config.json` 顶层必须是对象，数组、标量和 `null` 均拒绝加载。`inbounds.json` 和 `outbounds.json` 顶层固定为对象数组，`routing.json` 顶层固定为 routing 对象，不接受 `{ "inbounds": [...] }`、`{ "outbounds": [...] }`、`{ "routing": { ... } }` 等冗余外层包装。
 
-所有本地配置键（含 `config.json`、侧车、`panels` 和嵌套 `settings`）不区分 ASCII 大小写，解析时统一转为小写；示例采用 camelCase。因此 `APIHost`、`apiHost`、`apihost` 等价，`NodeIDs`、`nodeIDs`、`nodeIds` 等价，无需因大小写差异迁移旧配置。仅转换键名，密码、路径、标签等字段值保持原样，仍遵循各字段自身的校验规则；面板远端 API 的字段匹配不受影响。大小写归一化后重复的键直接报错，即使值相同也不允许。`api_host` 等下划线别名以及已删除字段不会因此恢复支持，配置文件名仍固定为下列小写文件名。
+所有本地配置键（含 `config.json`、侧车、`panels` 和嵌套 `settings`）不区分 ASCII 大小写，解析时统一转为小写；示例采用 camelCase。因此 `APIHost`、`apiHost`、`apihost` 等价，`NodeIDs`、`nodeIDs`、`nodeIds` 等价，无需因大小写差异迁移旧配置。大小写归一化后重复的键直接报错，即使值相同也不允许。`api_host` 等下划线别名以及已删除字段不会因此恢复支持，配置文件名仍固定为下列小写文件名。
 
-配置键大小写无关不等于字段值大小写无关：`nodeType` 只接受 `vmess`、`vless`、`trojan`、`shadowsocks`、`anytls`、`hysteria`、`hysteria2`，不再接受空值或旧协议别名。面板 `dnsType` 与 Freedom 的 `domainStrategy` 共用策略值：`AsIs`、`UseIP`、`UseIPv4`、`UseIPv6`、`UseIPv4v6`、`UseIPv6v4` 及对应的 `ForceIP`／`ForceIPv4`／`ForceIPv6`／`ForceIPv4v6`／`ForceIPv6v4`；未知值、空值或错误类型拒绝加载。路由引用不存在的 outbound 也直接报错，不丢弃该规则或回退到其他出口。
+语义上大小写无关的字段值同样在冷路径统一为小写：协议、`nodeType`、面板 `type`、`network`、`security`、日志级别、加密方法、`flow`、`decryption`/`encryption` 中的模式名、`packetEncoding`、`listen`/`sendThrough` 的 `auto`、`sendThroughStrategy`、Freedom `domainStrategy`／面板 `dnsType`、Blackhole 响应类型，以及 DNS 主机名语义的 Host、SNI、`serverName`、gRPC `authority`。路径、gRPC `serviceName`、Header 值、标签、邮箱、UUID、密码、密钥与 padding 方案区分大小写，保持原值。`nodeType` 只接受 `vmess`、`vless`、`trojan`、`shadowsocks`、`anytls`、`hysteria`、`hysteria2`；未知枚举、空值或错误类型拒绝加载。路由引用不存在的 outbound 也直接报错，不丢弃该规则或回退到其他出口。
+
+面板 UniProxy `config` / `user` 下发以 xv2board 的 `UniProxyController` 为契约：整数字段（`server_port`、`base_config.*_interval`、`tls`、Hysteria `version`/`up_mbps`/`down_mbps`、用户 `id`/`speed_limit`/`device_limit`、REALITY `server_port`/`xver`/`max_time_diff`）同时接受 JSON 非负整数与纯十进制字符串；`tls` 另接受布尔值及 `"true"`/`"false"`；PHP 空关联数组 `[]` 视为空对象。浮点、负数、带空白或符号的数字字符串仍拒绝。Hysteria 按下发的 `version` 选择 v1/v2，并使用 `up_mbps`/`down_mbps`；面板下发的 Shadowsocks/Hysteria 混淆及 VLESS Encryption 当前运行时不支持，出现非空值时拒绝该节点而不是静默忽略。
 
 部署模式添加面板时同样按大小写无关的字段名查找，但面板名称区分大小写；替换同名面板不会改写其他配置键或字段值。配置 JSON 损坏、面板列表类型错误或存在大小写冲突的字段时停止写入，保留原文件，不尝试猜测修复。
 

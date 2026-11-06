@@ -2,11 +2,13 @@
 
 #include "acppnode/common/target_address.hpp"
 #include "acppnode/core/constants.hpp"
+#include "acppnode/core/naming.hpp"
 #include "acppnode/infra/json_field.hpp"
 #include "acppnode/transport/internet/http_headers.hpp"
 #include "acppnode/transport/internet/reality_client_version.hpp"
 #include "acppnode/transport/internet/reality_key.hpp"
 #include "acppnode/transport/internet/reality_short_id.hpp"
+#include "panel_json_compat.hpp"
 
 #include <format>
 #include <limits>
@@ -18,18 +20,19 @@ namespace acpp::api::v2board {
 namespace {
 
 tl::expected<uint16_t, std::string> ParseServerPort(const json::object& source) {
-    const auto result = ReadJsonPort(source, "server_port");
-    switch (result.error) {
-        case JsonPortError::None:
-            return result.value;
-        case JsonPortError::Missing:
-            return tl::unexpected("server_port is required");
-        case JsonPortError::InvalidType:
-            return tl::unexpected("server_port must be an integer");
-        case JsonPortError::OutOfRange:
-            return tl::unexpected("server_port must be between 1 and 65535");
+    const auto* raw = source.if_contains("server_port");
+    if (!raw || raw->is_null()) {
+        return tl::unexpected("server_port is required");
     }
-    return tl::unexpected("server_port is invalid");
+    const auto result = PanelUnsignedInteger(*raw);
+    if (!result) {
+        return tl::unexpected(
+            "server_port must be an integer or decimal integer string");
+    }
+    if (*result == 0 || *result > std::numeric_limits<uint16_t>::max()) {
+        return tl::unexpected("server_port must be between 1 and 65535");
+    }
+    return static_cast<uint16_t>(*result);
 }
 
 // 0 keeps the local default cadence; the bound keeps the value representable
@@ -40,7 +43,7 @@ tl::expected<int, std::string> ParseReportInterval(
     if (!raw || raw->is_null()) {
         return current;
     }
-    const auto seconds = JsonUnsignedInteger(*raw);
+    const auto seconds = PanelUnsignedInteger(*raw);
     if (!seconds || *seconds > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
         return tl::unexpected(std::format(
             "base_config.{} must be a non-negative integer number of seconds", field));
@@ -69,6 +72,22 @@ tl::expected<const json::value*, std::string> ResolveAlias(
     return primary_val ? primary_val : secondary_val;
 }
 
+tl::expected<uint32_t, std::string> ParseRequiredPanelUint32(
+    const json::object& source,
+    std::string_view field) {
+    const auto* raw = source.if_contains(field);
+    if (!raw || raw->is_null()) {
+        return tl::unexpected(std::format("{} is required", field));
+    }
+    const auto value = PanelUnsignedInteger(*raw);
+    if (!value || *value > std::numeric_limits<uint32_t>::max()) {
+        return tl::unexpected(std::format(
+            "{} must be a non-negative 32-bit integer or decimal integer string",
+            field));
+    }
+    return static_cast<uint32_t>(*value);
+}
+
 }  // namespace
 
 tl::expected<::acpp::api::NodeInfo, std::string> ParseNodeInfo(
@@ -80,7 +99,7 @@ tl::expected<::acpp::api::NodeInfo, std::string> ParseNodeInfo(
     }
 
     ::acpp::api::NodeInfo config;
-    config.NodeType = std::string(node_type);
+    config.NodeType = naming::LowerAscii(std::string(node_type));
     config.Port = *port;
 
     if (const auto* network = source.if_contains("network");
@@ -88,11 +107,13 @@ tl::expected<::acpp::api::NodeInfo, std::string> ParseNodeInfo(
         if (!network->is_string()) {
             return tl::unexpected("network must be a string");
         }
-        config.TransportProtocol = std::string(network->as_string());
+        config.TransportProtocol =
+            naming::LowerAscii(std::string(network->as_string()));
     }
 
     if (const auto* network_settings = source.if_contains("networkSettings");
-        network_settings && !network_settings->is_null()) {
+        network_settings && !network_settings->is_null() &&
+        !IsPanelEmptyObject(*network_settings)) {
         if (!network_settings->is_object()) {
             return tl::unexpected("networkSettings must be an object");
         }
@@ -125,7 +146,7 @@ tl::expected<::acpp::api::NodeInfo, std::string> ParseNodeInfo(
             }
         }
         if (const auto* headers = settings.if_contains("headers");
-            headers && !headers->is_null()) {
+            headers && !headers->is_null() && !IsPanelEmptyObject(*headers)) {
             if (!headers->is_object()) {
                 return tl::unexpected(
                     "networkSettings headers must be an object");
@@ -156,7 +177,7 @@ tl::expected<::acpp::api::NodeInfo, std::string> ParseNodeInfo(
                     host = value;
                 }
             }
-            config.Host = std::move(host).value_or("");
+            config.Host = naming::LowerAscii(std::move(host).value_or(""));
         }
     }
 
@@ -164,13 +185,14 @@ tl::expected<::acpp::api::NodeInfo, std::string> ParseNodeInfo(
         tls && !tls->is_null()) {
         // V2Board encodes 0 = none, 1 = TLS, 2 = REALITY; older panels send a
         // boolean. Any other value is ambiguous and rejects the node.
-        if (tls->is_bool()) {
-            config.EnableTLS = tls->as_bool();
-        } else if (const auto mode = JsonUnsignedInteger(*tls); mode && *mode <= 2) {
+        if (const auto mode = PanelBoolean(*tls)) {
+            config.EnableTLS = *mode;
+        } else if (const auto mode = PanelUnsignedInteger(*tls); mode && *mode <= 2) {
             config.EnableTLS = (*mode == 1);
             config.EnableReality = (*mode == 2);
         } else {
-            return tl::unexpected("tls must be 0, 1, 2 or a boolean");
+            return tl::unexpected(
+                "tls must be a boolean or integer 0, 1, or 2");
         }
     }
 
@@ -179,7 +201,7 @@ tl::expected<::acpp::api::NodeInfo, std::string> ParseNodeInfo(
         if (!flow->is_string()) {
             return tl::unexpected("flow must be a string");
         }
-        config.Flow = std::string(flow->as_string());
+        config.Flow = naming::LowerAscii(std::string(flow->as_string()));
     }
 
     if (const auto* server_name = source.if_contains("server_name");
@@ -187,14 +209,16 @@ tl::expected<::acpp::api::NodeInfo, std::string> ParseNodeInfo(
         if (!server_name->is_string()) {
             return tl::unexpected("server_name must be a string");
         }
-        config.TLSServerName = std::string(server_name->as_string());
+        config.TLSServerName =
+            naming::LowerAscii(std::string(server_name->as_string()));
     }
     if (const auto* cipher = source.if_contains("cipher");
         cipher && !cipher->is_null()) {
         if (!cipher->is_string()) {
             return tl::unexpected("cipher must be a string");
         }
-        config.CypherMethod = std::string(cipher->as_string());
+        config.CypherMethod =
+            naming::LowerAscii(std::string(cipher->as_string()));
     }
     if (const auto* server_key = source.if_contains("server_key");
         server_key && !server_key->is_null()) {
@@ -203,6 +227,126 @@ tl::expected<::acpp::api::NodeInfo, std::string> ParseNodeInfo(
         }
         config.ShadowsocksServerKey = std::string(server_key->as_string());
     }
+    if (const auto* host = source.if_contains("host");
+        host && !host->is_null() && !host->is_string()) {
+        return tl::unexpected("host must be a string");
+    }
+
+    if (config.NodeType == constants::protocol::kShadowsocks) {
+        if (const auto* obfs = source.if_contains("obfs");
+            obfs && !obfs->is_null()) {
+            if (!obfs->is_string()) {
+                return tl::unexpected("obfs must be a string or null");
+            }
+            const std::string mode =
+                naming::LowerAscii(std::string(obfs->as_string()));
+            if (!mode.empty() && mode != constants::protocol::kNone) {
+                return tl::unexpected(
+                    "Shadowsocks obfs is not supported by this runtime");
+            }
+        }
+        if (const auto* settings = source.if_contains("obfs_settings");
+            settings && !settings->is_null() && !settings->is_object() &&
+            !IsPanelEmptyObject(*settings)) {
+            return tl::unexpected("obfs_settings must be an object or null");
+        }
+    }
+
+    if (config.NodeType == constants::protocol::kVless) {
+        if (const auto* encryption = source.if_contains("encryption");
+            encryption && !encryption->is_null()) {
+            if (!encryption->is_string()) {
+                return tl::unexpected("encryption must be a string or null");
+            }
+            const std::string mode =
+                naming::LowerAscii(std::string(encryption->as_string()));
+            if (!mode.empty() && mode != constants::protocol::kNone) {
+                return tl::unexpected(
+                    "panel VLESS encryption is not supported by this runtime");
+            }
+        }
+        if (const auto* settings = source.if_contains("encryption_settings");
+            settings && !settings->is_null() && !settings->is_object() &&
+            !IsPanelEmptyObject(*settings)) {
+            return tl::unexpected(
+                "encryption_settings must be an object or null");
+        }
+        if (const auto* settings = source.if_contains("tls_settings");
+            settings && !settings->is_null() && !settings->is_object() &&
+            !IsPanelEmptyObject(*settings)) {
+            return tl::unexpected("tls_settings must be an object or null");
+        }
+    }
+
+    if (config.NodeType == constants::protocol::kAnyTLS) {
+        if (const auto* padding = source.if_contains("padding_scheme");
+            padding && !padding->is_null()) {
+            if (padding->is_string()) {
+                config.PaddingScheme = std::string(padding->as_string());
+            } else if (padding->is_array()) {
+                bool first = true;
+                for (const auto& item : padding->as_array()) {
+                    if (!item.is_string()) {
+                        return tl::unexpected(
+                            "padding_scheme must contain only strings");
+                    }
+                    if (!first) {
+                        config.PaddingScheme.push_back('\n');
+                    }
+                    config.PaddingScheme.append(item.as_string());
+                    first = false;
+                }
+            } else {
+                return tl::unexpected(
+                    "padding_scheme must be a string, array of strings, or null");
+            }
+        }
+    }
+
+    if (config.NodeType == constants::protocol::kHysteria ||
+        config.NodeType == constants::protocol::kHysteria2) {
+        auto version = ParseRequiredPanelUint32(source, "version");
+        if (!version || (*version != 1 && *version != 2)) {
+            return tl::unexpected(
+                version ? "version must be 1 or 2" : std::move(version.error()));
+        }
+        config.NodeType = *version == 1
+            ? std::string(constants::protocol::kHysteria)
+            : std::string(constants::protocol::kHysteria2);
+
+        auto up_mbps = ParseRequiredPanelUint32(source, "up_mbps");
+        if (!up_mbps) {
+            return tl::unexpected(std::move(up_mbps.error()));
+        }
+        auto down_mbps = ParseRequiredPanelUint32(source, "down_mbps");
+        if (!down_mbps) {
+            return tl::unexpected(std::move(down_mbps.error()));
+        }
+        config.HysteriaUpMbps = *up_mbps;
+        config.HysteriaDownMbps = *down_mbps;
+
+        if (const auto* ignored = source.if_contains("ignore_client_bandwidth");
+            ignored && !ignored->is_null() && !PanelBoolean(*ignored)) {
+            return tl::unexpected(
+                "ignore_client_bandwidth must be a boolean or 0/1");
+        }
+
+        for (const std::string_view field : {"obfs", "obfs-password"}) {
+            const auto* value = source.if_contains(field);
+            if (!value || value->is_null()) {
+                continue;
+            }
+            if (!value->is_string()) {
+                return tl::unexpected(std::format(
+                    "{} must be a string or null", field));
+            }
+            if (!value->as_string().empty()) {
+                return tl::unexpected(
+                    "Hysteria obfs is not supported by this runtime");
+            }
+        }
+    }
+
 
     if (config.EnableReality) {
         const auto tls_settings_res =
@@ -239,7 +383,7 @@ tl::expected<::acpp::api::NodeInfo, std::string> ParseNodeInfo(
                 !domain::IsValidDnsHostname(name, domain::TrailingDotPolicy::Forbid)) {
                 return false;
             }
-            out.emplace_back(name);
+            out.push_back(naming::LowerAscii(std::string(name)));
             return true;
         };
         const auto sn_list_res =
@@ -361,7 +505,7 @@ tl::expected<::acpp::api::NodeInfo, std::string> ParseNodeInfo(
         }
         std::optional<uint16_t> sp_port;
         if (const auto* sp_val = *sp_res) {
-            const auto port = JsonUnsignedInteger(*sp_val);
+            const auto port = PanelUnsignedInteger(*sp_val);
             if (!port || *port == 0 ||
                 *port > std::numeric_limits<uint16_t>::max()) {
                 return tl::unexpected("REALITY tls_settings.server_port is invalid");
@@ -395,7 +539,7 @@ tl::expected<::acpp::api::NodeInfo, std::string> ParseNodeInfo(
 
         if (const auto* xver_val = rs.if_contains("xver");
             xver_val && !xver_val->is_null()) {
-            const auto xver = JsonUnsignedInteger(*xver_val);
+            const auto xver = PanelUnsignedInteger(*xver_val);
             if (!xver) {
                 return tl::unexpected("REALITY xver must be an integer between 0 and 2");
             }
@@ -471,7 +615,7 @@ tl::expected<::acpp::api::NodeInfo, std::string> ParseNodeInfo(
             return tl::unexpected(std::move(max_time_res.error()));
         }
         if (const auto* max_time_val = *max_time_res) {
-            const auto max_time_diff = JsonUnsignedInteger(*max_time_val);
+            const auto max_time_diff = PanelUnsignedInteger(*max_time_val);
             if (!max_time_diff) {
                 return tl::unexpected(
                     "REALITY max_time_diff must be a non-negative integer");

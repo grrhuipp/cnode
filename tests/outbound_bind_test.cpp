@@ -24,10 +24,12 @@ int main() {
     auto ipv6 = acpp::OutboundBind::Parse("2001:db8::10");
     if (!ipv4 || ipv4->ExplicitAddress() != make_address("192.0.2.10") ||
         !ipv6 || ipv6->ExplicitAddress() != make_address("2001:db8::10")) return 3;
-    for (const auto value : std::array<std::string_view, 4>{
-             "not-an-ip", "192.0.2.1junk", "AUTO", "  auto"}) {
+    for (const auto value : std::array<std::string_view, 3>{
+             "not-an-ip", "192.0.2.1junk", "  auto"}) {
         if (acpp::OutboundBind::Parse(value)) return 4;
     }
+    if (auto upper = acpp::OutboundBind::Parse("AUTO");
+        !upper || upper->GetMode() != Mode::Auto) return 4;
     for (const auto value : std::array<std::string_view, 7>{
              "127.0.0.1:9", "[127.0.0.1]", "[::1]", "127.0.0.1 ",
              "fe80::1%invalid", std::string_view("127.0.0.1\0ignored", 17),

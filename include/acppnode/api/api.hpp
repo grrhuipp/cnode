@@ -53,6 +53,9 @@ struct NodeInfo {
     RealityConfig Reality;
     std::string CypherMethod;
     std::string ShadowsocksServerKey;
+    std::string PaddingScheme;
+    uint32_t HysteriaUpMbps = 0;
+    uint32_t HysteriaDownMbps = 0;
     // cnode local runtime extensions that are normalized from panel/config cold path.
     std::string TLSServerName;
     bool SniffEnabled = true;

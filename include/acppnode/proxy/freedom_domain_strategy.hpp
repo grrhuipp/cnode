@@ -1,5 +1,6 @@
 #pragma once
 
+#include "acppnode/transport/internet/http_headers.hpp"
 #include <cstdint>
 #include <optional>
 #include <string_view>
@@ -21,17 +22,18 @@ enum class DomainStrategy : uint8_t {
 };
 
 [[nodiscard]] inline std::optional<DomainStrategy> ParseDomainStrategy(std::string_view value) {
-    if (value == "AsIs") return DomainStrategy::AsIs;
-    if (value == "UseIP") return DomainStrategy::UseIP;
-    if (value == "UseIPv6v4") return DomainStrategy::UseIPv6v4;
-    if (value == "UseIPv4") return DomainStrategy::UseIPv4;
-    if (value == "UseIPv4v6") return DomainStrategy::UseIPv4v6;
-    if (value == "UseIPv6") return DomainStrategy::UseIPv6;
-    if (value == "ForceIP") return DomainStrategy::ForceIP;
-    if (value == "ForceIPv6v4") return DomainStrategy::ForceIPv6v4;
-    if (value == "ForceIPv6") return DomainStrategy::ForceIPv6;
-    if (value == "ForceIPv4v6") return DomainStrategy::ForceIPv4v6;
-    if (value == "ForceIPv4") return DomainStrategy::ForceIPv4;
+    using transport::internet::EqualsAsciiCI;
+    if (EqualsAsciiCI(value, "asis")) return DomainStrategy::AsIs;
+    if (EqualsAsciiCI(value, "useip")) return DomainStrategy::UseIP;
+    if (EqualsAsciiCI(value, "useipv6v4")) return DomainStrategy::UseIPv6v4;
+    if (EqualsAsciiCI(value, "useipv4")) return DomainStrategy::UseIPv4;
+    if (EqualsAsciiCI(value, "useipv4v6")) return DomainStrategy::UseIPv4v6;
+    if (EqualsAsciiCI(value, "useipv6")) return DomainStrategy::UseIPv6;
+    if (EqualsAsciiCI(value, "forceip")) return DomainStrategy::ForceIP;
+    if (EqualsAsciiCI(value, "forceipv6v4")) return DomainStrategy::ForceIPv6v4;
+    if (EqualsAsciiCI(value, "forceipv6")) return DomainStrategy::ForceIPv6;
+    if (EqualsAsciiCI(value, "forceipv4v6")) return DomainStrategy::ForceIPv4v6;
+    if (EqualsAsciiCI(value, "forceipv4")) return DomainStrategy::ForceIPv4;
     return std::nullopt;
 }
 

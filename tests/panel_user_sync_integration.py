@@ -119,9 +119,11 @@ class PanelHandler(http.server.BaseHTTPRequestHandler):
             if requested_etag == etag:
                 self.reply(304, b"")
             else:
+                # xv2board/PHP may emit integers as decimal strings and enums in any case.
                 self.reply(200, {
-                    "server_port": port, "network": "tcp", "tls": 0,
-                    "base_config": {"pull_interval": 1, "push_interval": 3600},
+                    "server_port": str(port), "network": "TCP", "tls": "0",
+                    "networkSettings": [],
+                    "base_config": {"pull_interval": "1", "push_interval": "3600"},
                 }, f'"{etag}"')
             return
 
@@ -158,7 +160,8 @@ class PanelHandler(http.server.BaseHTTPRequestHandler):
         if etag and requested_etag == etag:
             self.reply(304, b"")
         else:
-            users = [] if phase == "empty" else [{"id": 1, "uuid": str(user)}]
+            users = [] if phase == "empty" else [{
+                "id": "1", "uuid": str(user), "speed_limit": None, "device_limit": "0"}]
             self.reply(200, {"users": users}, f'"{etag}"' if etag else None)
 
 
@@ -207,11 +210,13 @@ def main(binary, root):
             thread.start()
             threads.append(thread)
         config = {
-            "WoRkErS": 2, "LoG": {"EnAbLe": False, "LoGdIr": str(root / "logs")},
-            "PaNeLs": [{"Name": "user-sync", "tYpE": "V2board",
+            "WoRkErS": 2, "LoG": {"EnAbLe": False, "LoGlEvEl": "WARNING",
+                                  "LoGdIr": str(root / "logs")},
+            "PaNeLs": [{"Name": "user-sync", "tYpE": "V2Board",
                         "APIHOST": f"http://127.0.0.1:{panel.server_port}",
-                        "KeY": "fixture-key", "NODEids": [1], "NoDeTyPe": "vless",
-                        "LiStEnIp": "127.0.0.1", "ReQuEsTtImEoUt": 1}],
+                        "KeY": "fixture-key", "NODEids": [1], "NoDeTyPe": "VLESS",
+                        "LiStEnIp": "127.0.0.1", "SeNdIp": "AUTO", "DnStYpE": "useipv4",
+                        "ReQuEsTtImEoUt": 1}],
         }
         (root / "config.json").write_text(json.dumps(config), encoding="utf-8")
         output = stack.enter_context((root / "child.log").open("w", encoding="utf-8"))

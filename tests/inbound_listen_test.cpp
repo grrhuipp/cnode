@@ -34,9 +34,10 @@ int main() {
     }
 
     for (const auto value :
-         std::array<std::string_view, 4>{"not-an-ip", "127.0.0.1junk", "AUTO", " auto"}) {
+         std::array<std::string_view, 3>{"not-an-ip", "127.0.0.1junk", " auto"}) {
         if (acpp::InboundListen::Parse(value)) return 5;
     }
+    if (auto upper = acpp::InboundListen::Parse("AUTO"); !upper || !upper->IsAuto()) return 5;
 
     struct OverlapCase { std::string_view left, right; bool overlaps; };
     for (const auto& item : std::array{

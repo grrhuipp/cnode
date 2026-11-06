@@ -114,6 +114,9 @@ InboundBuild InboundBuilder(const PanelConfig& panel_config,
     StaticUserConfig protocol_source;
     protocol_source.method = node_config.CypherMethod;
     protocol_source.identity_password = node_config.ShadowsocksServerKey;
+    protocol_source.padding_scheme = node_config.PaddingScheme;
+    protocol_source.hysteria_up_mbps = node_config.HysteriaUpMbps;
+    protocol_source.hysteria_down_mbps = node_config.HysteriaDownMbps;
     auto handler_request = proxyman::inbound::PrepareBuildRequest(
         build.protocol,
         build.tag,

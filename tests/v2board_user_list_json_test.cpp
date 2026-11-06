@@ -57,7 +57,19 @@ void TestInvalidLimitsAreRejected() {
     CheckInvalid(R"({"users":[{"id":7,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","speed_limit":140737488355328}]})");
     CheckInvalid(R"({"users":[{"id":7,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","device_limit":4294967296}]})");
     CheckInvalid(R"({"users":[{"id":7,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","speed_limit":-1}]})");
-    CheckInvalid(R"({"users":[{"id":7,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","device_limit":"1"}]})");
+    CheckInvalid(R"({"users":[{"id":7,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","device_limit":"+1"}]})");
+    CheckInvalid(R"({"users":[{"id":7,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","speed_limit":"1.5"}]})");
+}
+
+void TestXv2BoardUserTypesAreCompatible() {
+    auto result = Parse(
+        R"({"users":[{"id":"7","uuid":"B831381D-6324-4D53-AD4F-8CDA48B30811","flow":"XTLS-RPRX-VISION","speed_limit":"8","device_limit":"3"}]})");
+    Check(result && result->size() == 1, "xv2board string user integers were rejected");
+    Check((*result)[0].UID == 7 && (*result)[0].SpeedLimit == 1024ULL * 1024ULL &&
+              (*result)[0].DeviceLimit == 3 &&
+              (*result)[0].Flow == "xtls-rprx-vision" &&
+              (*result)[0].UUID == "B831381D-6324-4D53-AD4F-8CDA48B30811",
+          "user field compatibility mismatch");
 }
 
 void TestMalformedUsersAreRejected() {
@@ -77,6 +89,7 @@ int main() {
     TestValidUsersAreNormalized();
     TestInvalidLimitsAreRejected();
     TestMalformedUsersAreRejected();
+    TestXv2BoardUserTypesAreCompatible();
     std::cout << "v2board_user_list_json_test: ok\n";
     return 0;
 }

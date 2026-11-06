@@ -382,7 +382,7 @@ void AppendRoutingPortField(const json::object& object,
 // ============================================================================
 LogConfig LogConfig::FromJson(const json::object& j) {
     LogConfig cfg;
-    cfg.level = JsonStringOr(j, "loglevel", cfg.level);
+    cfg.level = naming::LowerAscii(JsonStringOr(j, "loglevel", cfg.level));
     if (!ParseLogLevel(cfg.level)) {
         throw std::invalid_argument(std::format(
             "loglevel '{}' must be none, trace, debug, info, warning, warn, or error",
@@ -748,7 +748,8 @@ WsConfig WsConfig::FromJson(const json::object& j) {
     cfg.path = JsonStringOr(j, "path", std::string(constants::binding::kRootPath));
     require_http_request_target(cfg.path, "ws path");
     parse_http_headers(j, cfg.headers);
-    cfg.real_ip_header = JsonStringOr(j, "realIpHeader", cfg.real_ip_header);
+    cfg.real_ip_header = naming::LowerAscii(
+        JsonStringOr(j, "realIpHeader", cfg.real_ip_header));
     require_http_header_name(cfg.real_ip_header, "ws realIpHeader");
     return cfg;
 }
@@ -756,11 +757,11 @@ WsConfig WsConfig::FromJson(const json::object& j) {
 HttpUpgradeConfig HttpUpgradeConfig::FromJson(const json::object& j) {
     HttpUpgradeConfig cfg;
     cfg.path = JsonStringOr(j, "path", std::string(constants::binding::kRootPath));
-    cfg.host = JsonStringOr(j, "host", "");
+    cfg.host = naming::LowerAscii(JsonStringOr(j, "host", ""));
     require_http_request_target(cfg.path, "http upgrade path");
     require_http_authority(cfg.host, "http upgrade host");
     parse_http_headers(j, cfg.headers);
-    cfg.real_ip_header = JsonStringOr(j, "realIpHeader", "");
+    cfg.real_ip_header = naming::LowerAscii(JsonStringOr(j, "realIpHeader", ""));
     require_http_header_name(
         cfg.real_ip_header, "http upgrade realIpHeader");
     return cfg;
@@ -769,7 +770,7 @@ HttpUpgradeConfig HttpUpgradeConfig::FromJson(const json::object& j) {
 HttpConfig HttpConfig::FromJson(const json::object& j) {
     HttpConfig cfg;
     cfg.path = JsonStringOr(j, "path", std::string(constants::binding::kRootPath));
-    cfg.host = JsonStringOr(j, "host", "");
+    cfg.host = naming::LowerAscii(JsonStringOr(j, "host", ""));
     cfg.method = JsonStringOr(j, "method", "");
     require_http_request_target(cfg.path, "http path");
     require_http_authority(cfg.host, "http host");
@@ -778,7 +779,7 @@ HttpConfig HttpConfig::FromJson(const json::object& j) {
         throw std::invalid_argument("http method must be a valid HTTP token");
     }
     parse_http_headers(j, cfg.headers);
-    cfg.real_ip_header = JsonStringOr(j, "realIpHeader", "");
+    cfg.real_ip_header = naming::LowerAscii(JsonStringOr(j, "realIpHeader", ""));
     require_http_header_name(cfg.real_ip_header, "http realIpHeader");
     cfg.force_http2 = JsonBoolOr(j, "forceHttp2", false);
     auto initial_window = ParseHttp2InitialWindow(j);
@@ -791,7 +792,7 @@ HttpConfig HttpConfig::FromJson(const json::object& j) {
 
 GrpcConfig GrpcConfig::FromJson(const json::object& j) {
     GrpcConfig cfg;
-    cfg.authority = JsonStringOr(j, "authority", "");
+    cfg.authority = naming::LowerAscii(JsonStringOr(j, "authority", ""));
     cfg.service_name = JsonStringOr(j, "serviceName", "");
     cfg.user_agent = JsonStringOr(j, "userAgent", "");
     cfg.multi_mode = JsonBoolOr(j, "multiMode", false);
@@ -879,7 +880,7 @@ XHttpMode ParseXHttpMode(std::string_view value) {
 XHttpConfig XHttpConfig::FromJson(const json::object& j) {
     XHttpConfig cfg;
     cfg.path = JsonStringOr(j, "path", std::string(constants::binding::kRootPath));
-    cfg.host = JsonStringOr(j, "host", "");
+    cfg.host = naming::LowerAscii(JsonStringOr(j, "host", ""));
     cfg.mode = ParseXHttpMode(JsonStringOr(j, "mode", ""));
     require_http_request_target(cfg.path, "xhttp path");
     require_http_authority(cfg.host, "xhttp host");
@@ -952,7 +953,8 @@ RealityConfig RealityConfig::FromJson(const json::object& j) {
                    name, domain::TrailingDotPolicy::Forbid);
     };
     cfg.server_names = JsonStringArrayOrEmpty(j, "serverNames");
-    for (const auto& name : cfg.server_names) {
+    for (auto& name : cfg.server_names) {
+        name = naming::LowerAscii(std::move(name));
         // An empty entry in serverNames explicitly permits a REALITY ClientHello without SNI.
         if (!name.empty() && !is_valid_reality_server_name(name)) {
             throw std::invalid_argument(
@@ -1045,7 +1047,7 @@ RealityConfig RealityConfig::FromJson(const json::object& j) {
     } else if (j.contains("fingerprint")) {
         throw std::invalid_argument("realitySettings.fingerprint must not be empty");
     }
-    cfg.server_name = JsonStringOr(j, "serverName", "");
+    cfg.server_name = naming::LowerAscii(JsonStringOr(j, "serverName", ""));
     if (j.contains("serverName") &&
         !is_valid_reality_server_name(cfg.server_name)) {
         throw std::invalid_argument("REALITY serverName is invalid");
@@ -1107,7 +1109,7 @@ StreamSettings StreamSettings::FromJson(
             throw std::invalid_argument(
                 "tls minVersion must not exceed maxVersion");
         }
-        cfg.tls.server_name = JsonStringOr(*tls, "serverName", "");
+        cfg.tls.server_name = naming::LowerAscii(JsonStringOr(*tls, "serverName", ""));
         cfg.tls.allow_insecure = JsonBoolOr(*tls, "allowInsecure", false);
         cfg.tls.ca_file = JsonStringOr(*tls, "caFile", "");
         if (role == StreamEndpointRole::Inbound &&
@@ -1262,9 +1264,12 @@ StaticUserConfig ParseStaticUserConfig(
     std::string_view protocol,
     const json::object& settings) {
     StaticUserConfig config;
-    config.method = JsonStringOr(settings, "method", config.method);
+    config.method = naming::LowerAscii(JsonStringOr(settings, "method", config.method));
     if (protocol == constants::protocol::kVless) {
         config.vless_decryption = JsonStringOr(settings, "decryption", std::string(constants::protocol::kNone));
+        if (transport::internet::EqualsAsciiCI(config.vless_decryption, constants::protocol::kNone)) {
+            config.vless_decryption = std::string(constants::protocol::kNone);
+        }
     }
     if (protocol == constants::protocol::kHysteria ||
         protocol == constants::protocol::kHysteria2) {
@@ -1329,7 +1334,7 @@ StaticUserConfig ParseStaticUserConfig(
             user.id = JsonStringOr(client_obj, "id", "");
             user.password = JsonStringOr(client_obj, "password", "");
             user.email = JsonStringOr(client_obj, "email", "");
-            user.flow = JsonStringOr(client_obj, "flow", "");
+            user.flow = naming::LowerAscii(JsonStringOr(client_obj, "flow", ""));
             config.clients.push_back(std::move(user));
         }
         saw_user_array = !config.clients.empty();
@@ -1379,7 +1384,7 @@ StaticInboundConfig StaticInboundConfig::FromJson(const json::object& j) {
         if (!proto->is_string()) {
             throw std::invalid_argument("static inbound protocol must be a string");
         }
-        cfg.protocol = std::string(proto->as_string());
+        cfg.protocol = naming::LowerAscii(std::string(proto->as_string()));
     }
 
     if (j.contains("listen")) {

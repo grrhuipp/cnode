@@ -1,4 +1,5 @@
 #include "acppnode/infra/outbound_source_config.hpp"
+#include "acppnode/core/naming.hpp"
 #include "acppnode/infra/json_field.hpp"
 #include "acppnode/infra/outbound_bind_config.hpp"
 
@@ -11,7 +12,7 @@ OutboundSourceConfig OutboundSourceConfig::FromJson(const json::object& j) {
     OutboundSourceConfig cfg;
 
     cfg.tag = JsonStringOr(j, "tag", "");
-    cfg.protocol = JsonStringOr(j, "protocol", "");
+    cfg.protocol = naming::LowerAscii(JsonStringOr(j, "protocol", ""));
 
     auto settings = ParseJsonObject(j, "settings");
     if (!settings) {

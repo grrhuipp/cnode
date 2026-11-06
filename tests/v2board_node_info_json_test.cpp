@@ -52,18 +52,19 @@ void TestInvalidPortsAreRejected() {
     CheckInvalid(R"({"server_port":0})");
     CheckInvalid(R"({"server_port":-1})");
     CheckInvalid(R"({"server_port":65536})");
-    CheckInvalid(R"({"server_port":"443"})");
+    CheckInvalid(R"({"server_port":"443x"})");
+    CheckInvalid(R"({"server_port":" 443"})");
     CheckInvalid(R"({"server_port":443.0})");
     CheckInvalid(R"({"server_port":null})");
     CheckInvalid(R"({"server_port":443,"cipher":123})");
     CheckInvalid(R"({"server_port":443,"server_key":[]})");
     CheckInvalid(R"({"server_port":443,"server_key":false})");
     CheckInvalid(R"({"server_port":443,"tls":3})");
-    CheckInvalid(R"({"server_port":443,"tls":"1"})");
+    CheckInvalid(R"({"server_port":443,"tls":"3"})");
     CheckInvalid(R"({"server_port":443,"network":42})");
     CheckInvalid(R"({"server_port":443,"networkSettings":"ws"})");
     CheckInvalid(R"({"server_port":443,"base_config":{"pull_interval":-1}})");
-    CheckInvalid(R"({"server_port":443,"base_config":{"push_interval":"60"}})");
+    CheckInvalid(R"({"server_port":443,"base_config":{"push_interval":"-1"}})");
     CheckInvalid(R"({"server_port":443,"base_config":{"pull_interval":4294967297}})");
 
     acpp::json::object source{
@@ -77,7 +78,7 @@ void TestInvalidNetworkHostIsRejected() {
     CheckInvalid(R"({"server_port":443,"networkSettings":{"headers":{"Host":42}}})");
     CheckInvalid(R"({"server_port":443,"networkSettings":{"headers":{"Host":"edge.example\r\nInjected: yes"}}})");
     CheckInvalid(R"({"server_port":443,"networkSettings":{"headers":{"Host":"one.example","host":"two.example"}}})");
-    CheckInvalid(R"({"server_port":443,"networkSettings":{"headers":[]}})");
+    CheckInvalid(R"({"server_port":443,"networkSettings":{"headers":["Host"]}})");
     CheckInvalid(R"({"server_port":443,"networkSettings":{"path":"/ws\r\nInjected: yes"}})");
     CheckInvalid(R"({"server_port":443,"networkSettings":{"path":42}})");
     CheckInvalid(R"({"server_port":443,"networkSettings":{"headers":{"Host":"bad host"}}})");
@@ -145,6 +146,47 @@ void TestOptionalCipherNullValues() {
     CheckInvalid(R"({"server_port":443,"server_key":false})");
 }
 
+void TestXv2BoardTypesAreCompatible() {
+    auto parsed = acpp::json::parse(
+        R"({"server_port":"8443","network":"WS","networkSettings":{"path":"/Edge","headers":{"Host":"Edge.Example"}},"tls":"1","flow":"XTLS-RPRX-VISION","server_name":"SNI.Example","cipher":"AES-128-GCM","server_key":"Identity","base_config":{"pull_interval":"45","push_interval":"30"}})");
+    auto result = ParseNodeInfo(parsed.as_object(), "VMESS");
+    Check(result.has_value(), "string integers and mixed-case enums were rejected");
+    Check(result->NodeType == "vmess" && result->Port == 8443 &&
+              result->TransportProtocol == "ws" && result->EnableTLS &&
+              result->Flow == "xtls-rprx-vision" &&
+              result->CypherMethod == "aes-128-gcm" &&
+              result->Host == "edge.example" &&
+              result->TLSServerName == "sni.example" &&
+              result->Path == "/Edge" && result->ShadowsocksServerKey == "Identity" &&
+              result->PullInterval == 45 && result->PushInterval == 30,
+          "panel enum, hostname and opaque value normalization mismatch");
+
+    for (const auto* tls : {"true", "\"TRUE\"", "\"1\""}) {
+        const auto body = std::string(R"({"server_port":443,"tls":)") + tls + "}";
+        const auto parsed_tls = ParseResponse(body);
+        Check(parsed_tls && parsed_tls->EnableTLS, "boolean-compatible tls was rejected");
+    }
+    const auto empty_php_objects = ParseResponse(
+        R"({"server_port":443,"networkSettings":[]})");
+    Check(empty_php_objects.has_value(), "PHP empty associative array was rejected");
+
+    auto hysteria = acpp::json::parse(
+        R"({"version":"2","host":"node.example","server_port":"443","server_name":"Node.Example","up_mbps":"100","down_mbps":200,"ignore_client_bandwidth":false,"obfs":null,"obfs-password":null})");
+    auto hy = ParseNodeInfo(hysteria.as_object(), "hysteria");
+    Check(hy && hy->NodeType == "hysteria2" && hy->HysteriaUpMbps == 100 &&
+              hy->HysteriaDownMbps == 200 && hy->TLSServerName == "node.example",
+          "xv2board Hysteria config mismatch");
+    auto obfs = acpp::json::parse(
+        R"({"server_port":443,"cipher":"aes-128-gcm","obfs":"http","obfs_settings":{"host":"a"}})");
+    Check(!ParseNodeInfo(obfs.as_object(), "shadowsocks"),
+          "unsupported Shadowsocks obfs was silently ignored");
+
+    auto anytls = acpp::json::parse(
+        R"({"server_port":443,"padding_scheme":["stop=2","1=64-65"]})");
+    auto any = ParseNodeInfo(anytls.as_object(), "anytls");
+    Check(any && any->PaddingScheme == "stop=2\n1=64-65", "AnyTLS padding mismatch");
+}
+
 }  // namespace
 
 int main() {
@@ -153,6 +195,7 @@ int main() {
     TestInvalidNetworkHostIsRejected();
     TestRealityNodeResponseIsNormalized();
     TestOptionalCipherNullValues();
+    TestXv2BoardTypesAreCompatible();
     std::cout << "v2board_node_info_json_test: ok\n";
     return 0;
 }

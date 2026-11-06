@@ -2,6 +2,7 @@
 #include "acppnode/common/domain_name.hpp"
 #include "acppnode/common/ip_address.hpp"
 #include "acppnode/common/ip_utils.hpp"
+#include "acppnode/core/naming.hpp"
 #include "ss_outbound_uot.hpp"
 #include "udp_request.hpp"
 #include "../client.hpp"
@@ -374,7 +375,7 @@ const bool kSsOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 password = std::move(*source_key).value_or(std::string{});
             }
             if (*source_method) {
-                method = std::move(**source_method);
+                method = acpp::naming::LowerAscii(std::move(**source_method));
             }
             auto uot_version =
                 acpp::proxy::shadowsocks::outbound::ParseUotVersion(obj);

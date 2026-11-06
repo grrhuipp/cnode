@@ -2,6 +2,7 @@
 
 #include "vless_encryption_crypto.hpp"
 #include "acppnode/common/binary_text_codec.hpp"
+#include "acppnode/transport/internet/http_headers.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -45,15 +46,15 @@ constexpr int kMaxPaddingLength = 18 + 65535;
 [[nodiscard]] VlessEncryptionParseError ParseMode(
     std::string_view value,
     VlessEncryptionMode& out) noexcept {
-    if (value == "native") {
+    if (transport::internet::EqualsAsciiCI(value, "native")) {
         out = VlessEncryptionMode::Native;
         return VlessEncryptionParseError::None;
     }
-    if (value == "xorpub") {
+    if (transport::internet::EqualsAsciiCI(value, "xorpub")) {
         out = VlessEncryptionMode::XorPub;
         return VlessEncryptionParseError::None;
     }
-    if (value == "random") {
+    if (transport::internet::EqualsAsciiCI(value, "random")) {
         out = VlessEncryptionMode::Random;
         return VlessEncryptionParseError::None;
     }
@@ -129,7 +130,7 @@ VlessEncryptionParseResult ParseErrorResult(VlessEncryptionParseError error) {
     if (parts.size() < 4) {
         return ParseErrorResult(VlessEncryptionParseError::TooFewParts);
     }
-    if (parts[0] != kEncryptionName) {
+    if (!transport::internet::EqualsAsciiCI(parts[0], kEncryptionName)) {
         return ParseErrorResult(VlessEncryptionParseError::UnsupportedName);
     }
 
@@ -141,16 +142,16 @@ VlessEncryptionParseResult ParseErrorResult(VlessEncryptionParseError error) {
     }
 
     if (role == VlessEncryptionRole::Client) {
-        if (parts[2] == "1rtt") {
+        if (transport::internet::EqualsAsciiCI(parts[2], "1rtt")) {
             config.zero_rtt = false;
-        } else if (parts[2] == "0rtt") {
+        } else if (transport::internet::EqualsAsciiCI(parts[2], "0rtt")) {
             config.zero_rtt = true;
         } else {
             return ParseErrorResult(VlessEncryptionParseError::InvalidRtt);
         }
     } else {
         std::string_view seconds = parts[2];
-        if (seconds.ends_with('s')) {
+        if (seconds.ends_with('s') || seconds.ends_with('S')) {
             seconds.remove_suffix(1);
         }
         const size_t hyphen = seconds.find('-');
@@ -256,7 +257,7 @@ VlessEncryptionParseResult ParseErrorResult(VlessEncryptionParseError error) {
 }  // namespace
 
 bool IsNoVlessEncryption(std::string_view value) noexcept {
-    return value.empty() || value == "none";
+    return value.empty() || transport::internet::EqualsAsciiCI(value, "none");
 }
 
 VlessEncryptionParseResult ParseVlessClientEncryption(

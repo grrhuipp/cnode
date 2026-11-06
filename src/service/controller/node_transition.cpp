@@ -16,6 +16,9 @@ bool NodeConfigChanged(const api::NodeInfo& current,
         || current.TLSServerName != candidate.TLSServerName
         || current.CypherMethod != candidate.CypherMethod
         || current.ShadowsocksServerKey != candidate.ShadowsocksServerKey
+        || current.PaddingScheme != candidate.PaddingScheme
+        || current.HysteriaUpMbps != candidate.HysteriaUpMbps
+        || current.HysteriaDownMbps != candidate.HysteriaDownMbps
         || current.SniffEnabled != candidate.SniffEnabled
         || current.DestOverride != candidate.DestOverride;
 }

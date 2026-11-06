@@ -1,6 +1,8 @@
 #include "user_list_json.hpp"
 
 #include "acppnode/infra/json_field.hpp"
+#include "acppnode/core/naming.hpp"
+#include "panel_json_compat.hpp"
 
 #include <format>
 #include <limits>
@@ -24,7 +26,7 @@ tl::expected<uint64_t, std::string> ParseOptionalLimit(
     const auto* value = source.if_contains(field);
     if (!value || value->is_null()) return 0;
 
-    const auto limit = JsonUnsignedInteger(*value);
+    const auto limit = PanelUnsignedInteger(*value);
     if (!limit) {
         return tl::unexpected(std::format(
             "users[{}].{} must be a non-negative integer or null", user_index, field));
@@ -86,7 +88,7 @@ ParseUserList(const json::object& source) {
         ::acpp::api::UserInfo user;
 
         const auto* id = source_user.if_contains("id");
-        const auto parsed_id = id ? JsonUnsignedInteger(*id) : std::nullopt;
+        const auto parsed_id = id ? PanelUnsignedInteger(*id) : std::nullopt;
         if (!parsed_id || *parsed_id == 0 ||
             *parsed_id > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
             return tl::unexpected(std::format(
@@ -110,7 +112,7 @@ ParseUserList(const json::object& source) {
 
         auto flow = ParseOptionalString(source_user, "flow", i);
         if (!flow) return tl::unexpected(std::move(flow.error()));
-        user.Flow = std::move(*flow);
+        user.Flow = naming::LowerAscii(std::move(*flow));
 
         auto speed_limit = ParseOptionalLimit(source_user, "speed_limit", i);
         if (!speed_limit) {

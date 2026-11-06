@@ -3,6 +3,7 @@
 #include "acppnode/common/ip_utils.hpp"
 #include "acppnode/common/ip_address.hpp"
 #include "acppnode/core/constants.hpp"
+#include "acppnode/transport/internet/http_headers.hpp"
 
 #include <asio/ip/network_v4.hpp>
 #include <asio/ip/network_v6.hpp>
@@ -83,7 +84,7 @@ std::optional<net::ip::address> OutboundBind::BindAddressFor(
 std::optional<OutboundBind> OutboundBind::Parse(std::string_view value) {
     OutboundBind bind;
     if (value.empty()) return bind;
-    if (value == constants::binding::kAuto) return Auto();
+    if (transport::internet::EqualsAsciiCI(value, constants::binding::kAuto)) return Auto();
 
     auto address = iputil::ParseLiteral(value);
     if (!address) return std::nullopt;

@@ -3,6 +3,7 @@
 #include "acppnode/common/ip_utils.hpp"
 #include "acppnode/common/ip_address.hpp"
 #include "acppnode/core/constants.hpp"
+#include "acppnode/transport/internet/http_headers.hpp"
 
 namespace acpp {
 
@@ -34,7 +35,7 @@ bool InboundListen::operator==(const InboundListen& other) const noexcept {
 }
 
 std::optional<InboundListen> InboundListen::Parse(std::string_view value) {
-    if (value.empty() || value == constants::network::kDualStackAuto) {
+    if (value.empty() || transport::internet::EqualsAsciiCI(value, constants::network::kDualStackAuto)) {
         return InboundListen{};
     }
     auto address = iputil::ParseLiteral(value);

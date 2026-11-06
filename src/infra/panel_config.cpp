@@ -178,7 +178,10 @@ PanelConfig PanelConfig::FromJson(const json::object& j) {
     if (j.contains("name") && cfg.Name.empty()) {
         throw std::invalid_argument("Panel name must not be empty");
     }
-    cfg.Type      = JsonStringOr(j, "type", constants::panel::kV2BoardType);
+    cfg.Type = JsonStringOr(j, "type", constants::panel::kV2BoardType);
+    if (transport::internet::EqualsAsciiCI(cfg.Type, constants::panel::kV2BoardType)) {
+        cfg.Type = std::string(constants::panel::kV2BoardType);
+    }
     cfg.APIHost   = JsonStringOr(j, "apiHost", "");
     cfg.Key       = JsonStringOr(j, "key", "");
 
@@ -192,7 +195,8 @@ PanelConfig PanelConfig::FromJson(const json::object& j) {
         cfg.RequestTimeout = std::chrono::seconds(static_cast<int64_t>(*seconds));
     }
 
-    cfg.NodeType = JsonStringOr(j, "nodeType", constants::panel::kDefaultNodeType);
+    cfg.NodeType = naming::LowerAscii(
+        JsonStringOr(j, "nodeType", constants::panel::kDefaultNodeType));
 
     if (const auto* node_ids = j.if_contains("nodeIDs")) {
         cfg.NodeIDs = PanelNodeIds::Parse(*node_ids);

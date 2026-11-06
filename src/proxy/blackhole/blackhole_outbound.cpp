@@ -4,6 +4,7 @@
 #include "acppnode/common/buf/multi_buffer.hpp"
 #include "acppnode/common/session.hpp"
 #include "acppnode/core/constants.hpp"
+#include "acppnode/core/naming.hpp"
 #include "acppnode/infra/json_field.hpp"
 #include "acppnode/infra/log.hpp"
 
@@ -80,8 +81,8 @@ const bool kBlackholeRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 return std::nullopt;
             }
             if (*type) {
-                const std::string_view value = **type;
-                if (value == acpp::constants::protocol::kHttp || value == "HTTP") {
+                const std::string value = acpp::naming::LowerAscii(**type);
+                if (value == acpp::constants::protocol::kHttp) {
                     settings.http_response = true;
                 } else if (value != acpp::constants::protocol::kNone) {
                     LOG_ERROR("blackhole outbound '{}': response type must be http or none", cfg.tag);

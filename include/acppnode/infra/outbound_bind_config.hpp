@@ -2,6 +2,7 @@
 
 #include "acppnode/infra/json.hpp"
 #include "acppnode/transport/internet/outbound_bind.hpp"
+#include "acppnode/transport/internet/http_headers.hpp"
 
 #include <stdexcept>
 #include <string_view>
@@ -35,9 +36,9 @@ namespace acpp::infra {
         if (!strategy->is_string()) {
             throw std::invalid_argument("sendThroughStrategy must be hash or random");
         }
-        if (strategy->as_string() == "random") {
+        if (transport::internet::EqualsAsciiCI(strategy->as_string(), "random")) {
             policy = OutboundBind::ChoicePolicy::Random;
-        } else if (strategy->as_string() != "hash") {
+        } else if (!transport::internet::EqualsAsciiCI(strategy->as_string(), "hash")) {
             throw std::invalid_argument("sendThroughStrategy must be hash or random");
         }
     }
