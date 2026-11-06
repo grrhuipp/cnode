@@ -1266,6 +1266,13 @@ StaticUserConfig ParseStaticUserConfig(
     if (protocol == constants::protocol::kVless) {
         config.vless_decryption = JsonStringOr(settings, "decryption", std::string(constants::protocol::kNone));
     }
+    if (protocol == constants::protocol::kHysteria ||
+        protocol == constants::protocol::kHysteria2) {
+        config.hysteria_up_mbps =
+            JsonUint32Or(settings, "upMbps", config.hysteria_up_mbps);
+        config.hysteria_down_mbps =
+            JsonUint32Or(settings, "downMbps", config.hysteria_down_mbps);
+    }
     if (const auto* padding = settings.if_contains("paddingScheme")) {
         if (padding->is_string()) {
             config.padding_scheme = std::string(padding->as_string());
@@ -1292,7 +1299,9 @@ StaticUserConfig ParseStaticUserConfig(
     StaticUser top_level_user;
     if (protocol == constants::protocol::kShadowsocks ||
         protocol == constants::protocol::kTrojan ||
-        protocol == constants::protocol::kAnyTLS) {
+        protocol == constants::protocol::kAnyTLS ||
+        protocol == constants::protocol::kHysteria ||
+        protocol == constants::protocol::kHysteria2) {
         top_level_user.password = JsonStringOr(settings, "password", "");
         if (protocol == constants::protocol::kShadowsocks) {
             config.identity_password = top_level_user.password;
@@ -1331,7 +1340,9 @@ StaticUserConfig ParseStaticUserConfig(
         (!ss2022_method || !saw_user_array)) {
         config.clients.insert(config.clients.begin(), std::move(top_level_user));
     } else if ((protocol == constants::protocol::kTrojan ||
-                protocol == constants::protocol::kAnyTLS) &&
+                protocol == constants::protocol::kAnyTLS ||
+                protocol == constants::protocol::kHysteria ||
+                protocol == constants::protocol::kHysteria2) &&
                !top_level_user.password.empty() &&
                !saw_user_array) {
         config.clients.insert(config.clients.begin(), std::move(top_level_user));

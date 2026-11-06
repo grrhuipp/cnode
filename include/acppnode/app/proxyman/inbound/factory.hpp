@@ -28,6 +28,12 @@ enum class DatagramHandlerBuildStatus : uint8_t {
     Ready,
 };
 
+enum class DatagramTransport : uint8_t {
+    None,
+    Packet,
+    Quic,
+};
+
 struct DatagramHandlerBuildResult {
     DatagramHandlerBuildStatus status =
         DatagramHandlerBuildStatus::Unsupported;
@@ -52,6 +58,7 @@ struct ProxyRegistration {
     // Required when either user builder is present. This maps arbitrary
     // registration names to one concrete UserStore partition.
     std::optional<UserProtocol> user_protocol;
+    DatagramTransport datagram_transport = DatagramTransport::None;
 
     // 创建当前 Worker 独占的协议运行态（必须）。
     std::unique_ptr<ProtocolRuntime> (*create_runtime)() = nullptr;
@@ -97,6 +104,8 @@ void RegisterProxy(std::string_view protocol, ProxyRegistration registration);
 [[nodiscard]] std::optional<UserProtocol> RegisteredUserProtocol(
     std::string_view protocol);
 
+[[nodiscard]] DatagramTransport RegisteredDatagramTransport(
+    std::string_view protocol);
 [[nodiscard]] std::unique_ptr<ProtocolRuntime> NewProtocolRuntime(
     std::string_view protocol);
 

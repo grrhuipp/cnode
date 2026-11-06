@@ -185,6 +185,8 @@ void RegisterProtocol() {
     static const bool registered = [] {
         acpp::proxyman::inbound::RegisterProxy(kProtocol, {
             .user_protocol = std::nullopt,
+            .datagram_transport =
+                acpp::proxyman::inbound::DatagramTransport::Packet,
             .create_runtime = MakeRuntime,
             .create_tcp_handler = MakeHandler,
             .create_datagram_handler = MakeHandler,

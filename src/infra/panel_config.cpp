@@ -304,13 +304,18 @@ bool PanelConfig::Validate() const {
         NodeType != constants::protocol::kVless &&
         NodeType != constants::protocol::kTrojan &&
         NodeType != constants::protocol::kShadowsocks &&
-        NodeType != constants::protocol::kAnyTLS) {
-        LOG_PANEL_ERROR(log_context, "Panel NodeType must be {}, {}, {}, {} or {}",
+        NodeType != constants::protocol::kAnyTLS &&
+        NodeType != constants::protocol::kHysteria &&
+        NodeType != constants::protocol::kHysteria2) {
+        LOG_PANEL_ERROR(log_context,
+                  "Panel NodeType must be {}, {}, {}, {}, {}, {} or {}",
                   constants::protocol::kVmess,
                   constants::protocol::kVless,
                   constants::protocol::kTrojan,
                   constants::protocol::kShadowsocks,
-                  constants::protocol::kAnyTLS);
+                  constants::protocol::kAnyTLS,
+                  constants::protocol::kHysteria,
+                  constants::protocol::kHysteria2);
         return false;
     }
     if (TLSEnable) {

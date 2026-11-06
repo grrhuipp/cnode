@@ -140,11 +140,17 @@ net::awaitable<bool> NodeRuntime::AddInbound(const InboundBuild& inbound) {
                           proxyman::inbound::BuildRequest request,
                           WorkerBindResult* result) -> net::awaitable<void> {
                     runtime->ThrowIfStopping();
-                    result->tcp = co_await current->PostCall([current, binding] {
-                        return current->AddListener(binding);
-                    });
-                    if (!result->tcp) {
-                        co_return;
+                    const bool quic_only =
+                        proxyman::inbound::RegisteredDatagramTransport(
+                            request.protocol) ==
+                        proxyman::inbound::DatagramTransport::Quic;
+                    if (!quic_only) {
+                        result->tcp = co_await current->PostCall([current, binding] {
+                            return current->AddListener(binding);
+                        });
+                        if (!result->tcp) co_return;
+                    } else {
+                        result->tcp = true;
                     }
                     runtime->ThrowIfStopping();
                     result->udp = co_await current->PostTask(

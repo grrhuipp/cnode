@@ -250,6 +250,8 @@ bool TestInboundRegistration() {
 
     auto failed_udp_registration = valid;
     failed_udp_registration.create_datagram_handler = &FailDatagramHandler;
+    failed_udp_registration.datagram_transport =
+        acpp::proxyman::inbound::DatagramTransport::Packet;
     acpp::proxyman::inbound::RegisterProxy(
         "failed-udp", failed_udp_registration);
     auto failed_udp = acpp::proxyman::inbound::NewDatagramHandler(
@@ -262,6 +264,8 @@ bool TestInboundRegistration() {
 
     auto ready_udp_registration = valid;
     ready_udp_registration.create_datagram_handler = &CreateDatagramHandler;
+    ready_udp_registration.datagram_transport =
+        acpp::proxyman::inbound::DatagramTransport::Packet;
     acpp::proxyman::inbound::RegisterProxy(
         "ready-udp", ready_udp_registration);
     auto ready_udp = acpp::proxyman::inbound::NewDatagramHandler(

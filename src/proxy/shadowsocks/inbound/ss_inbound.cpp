@@ -464,6 +464,8 @@ public:
 const bool kSsInboundRegistered = [] {
     acpp::proxyman::inbound::ProxyRegistration reg;
     reg.user_protocol = acpp::proxyman::inbound::UserProtocol::Shadowsocks;
+    reg.datagram_transport =
+        acpp::proxyman::inbound::DatagramTransport::Packet;
 
     reg.create_runtime = []() -> std::unique_ptr<
         acpp::proxyman::inbound::ProtocolRuntime> {

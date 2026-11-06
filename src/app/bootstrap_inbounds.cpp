@@ -2,6 +2,7 @@
 
 #include "acppnode/app/port_binding.hpp"
 #include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
+#include "acppnode/app/proxyman/inbound/factory.hpp"
 #include "acppnode/app/worker.hpp"
 
 #include <format>
@@ -38,7 +39,10 @@ net::awaitable<void> StartWorkerInbounds(
         }
 
         auto binding = PortBinding{.port = inbound.port, .protocol = inbound.protocol, .tag = inbound.tag, .listen = inbound.listen};
-        if (!worker.AddListener(binding)) {
+        const bool quic_only =
+            proxyman::inbound::RegisteredDatagramTransport(inbound.protocol) ==
+            proxyman::inbound::DatagramTransport::Quic;
+        if (!quic_only && !worker.AddListener(binding)) {
             fail("tcp-listen");
         }
 

@@ -10,6 +10,8 @@
 #include "acppnode/app/worker_runtime_config.hpp"
 #include "acppnode/app/rate_limiter.hpp"
 #include "../common/awaitable_task_group.hpp"
+#include "../proxy/hysteria/hysteria_ingress.hpp"
+#include "../proxy/inbound_admission.hpp"
 #include "worker_memory_reclaimer.hpp"
 #include "acppnode/app/worker_stats.hpp"
 #include "acppnode/common/session.hpp"
@@ -98,10 +100,12 @@ struct Worker::ListenerSlot {
     std::shared_ptr<const proxyman::inbound::BuildRequest> prepared;
     std::unique_ptr<worker_detail::TcpListenerOwner> tcp_listeners;
     std::unique_ptr<worker_detail::UdpIngress> udp_ingress;
+    std::unique_ptr<proxy::hysteria::HysteriaIngress> quic_ingress;
     std::optional<SocketBinding> tcp_binding;
     std::optional<SocketBinding> udp_binding;
     // Keeps a stopped ingress alive until every native dispatch job completes.
     std::unique_ptr<worker_detail::UdpIngress> retiring_udp_ingress;
+    std::unique_ptr<proxy::hysteria::HysteriaIngress> retiring_quic_ingress;
 };
 
 struct Worker::ListenerState : worker_detail::UdpReplySink {
@@ -191,6 +195,9 @@ struct Worker::ListenerState : worker_detail::UdpReplySink {
         Worker& worker,
         const PortBinding& binding,
         std::unique_ptr<Inbound> handler);
+    net::awaitable<bool> StartQuicListening(
+        Worker& worker,
+        const PortBinding& binding);
     net::awaitable<void> RetireUdpListening(std::string_view tag);
 
     net::awaitable<void> AcceptLoop(
@@ -464,6 +471,9 @@ net::awaitable<void> Worker::DrainRuntimeTask() {
     for (const auto& slot : slots) {
         if (slot->udp_ingress) co_await slot->udp_ingress->AsyncJoin();
         if (slot->retiring_udp_ingress) co_await slot->retiring_udp_ingress->AsyncJoin();
+        if (slot->quic_ingress) co_await slot->quic_ingress->AsyncJoin();
+        if (slot->retiring_quic_ingress)
+            co_await slot->retiring_quic_ingress->AsyncJoin();
     }
     while (listeners.tcp_tasks || listeners.udp_receive_loops || listeners.udp_reply_sends) {
         IoErrorCode ec;
@@ -499,6 +509,9 @@ void Worker::BeginStopOnWorker() noexcept {
         if (slot->tcp_listeners) slot->tcp_listeners->Close();
         if (slot->udp_ingress) slot->udp_ingress->RequestStop();
         if (slot->retiring_udp_ingress) slot->retiring_udp_ingress->RequestStop();
+        if (slot->quic_ingress) slot->quic_ingress->RequestStop();
+        if (slot->retiring_quic_ingress)
+            slot->retiring_quic_ingress->RequestStop();
     }
     for (auto* task = listeners.tasks; task; task = task->next) {
         if (task->stream) task->stream->Cancel();
@@ -808,6 +821,13 @@ net::awaitable<void> Worker::ListenerState::RetireUdpListening(std::string_view 
         }
         slot_it->second->retiring_udp_ingress = std::move(slot_it->second->udp_ingress);
     }
+    if (slot_it != listener_slots.end() && slot_it->second->quic_ingress) {
+        if (slot_it->second->retiring_quic_ingress) {
+            FailRuntime("quic-retirement", "missing or occupied retiring QUIC slot");
+        }
+        slot_it->second->retiring_quic_ingress =
+            std::move(slot_it->second->quic_ingress);
+    }
     if (slot_it != listener_slots.end()) slot_it->second->udp_binding.reset();
 
     if (slot_it != listener_slots.end() && slot_it->second->retiring_udp_ingress) {
@@ -821,6 +841,19 @@ net::awaitable<void> Worker::ListenerState::RetireUdpListening(std::string_view 
             FailRuntime("udp-join", "unknown UDP native-job join failure");
         }
         slot_it->second->retiring_udp_ingress.reset();
+    }
+    if (slot_it != listener_slots.end() &&
+        slot_it->second->retiring_quic_ingress) {
+        auto& retiring = *slot_it->second->retiring_quic_ingress;
+        retiring.RequestStop();
+        try {
+            co_await retiring.AsyncJoin();
+        } catch (const std::exception& error) {
+            FailRuntime("quic-join", error.what());
+        } catch (...) {
+            FailRuntime("quic-join", "unknown QUIC join failure");
+        }
+        slot_it->second->retiring_quic_ingress.reset();
     }
     co_return;
 }
@@ -1105,7 +1138,10 @@ bool Worker::RegisterInbound(
     auto prepared = std::make_shared<const proxyman::inbound::BuildRequest>(req);
     auto handler = runtime_->inbound_handlers->NewHandler(
         runtime_->connection_limiter.get(), req);
-    if (!handler) {
+    const bool quic_only =
+        proxyman::inbound::RegisteredDatagramTransport(req.protocol) ==
+        proxyman::inbound::DatagramTransport::Quic;
+    if (!handler && !quic_only) {
         LOG_WARN("failed to create inbound handler worker={} tag={} protocol={}",
                  id_, receiver.inbound_tag, req.protocol);
         return false;
@@ -1225,7 +1261,10 @@ net::awaitable<void> Worker::UnregisterListenerTask(std::string tag) {
         slot_it->second->handler.reset();
         slot_it->second->prepared.reset();
         if (!slot_it->second->tcp_binding && !slot_it->second->udp_binding &&
-            !slot_it->second->udp_ingress && !slot_it->second->retiring_udp_ingress) {
+            !slot_it->second->udp_ingress &&
+            !slot_it->second->retiring_udp_ingress &&
+            !slot_it->second->quic_ingress &&
+            !slot_it->second->retiring_quic_ingress) {
             runtime_->listener_state->listener_slots.erase(slot_it);
         }
     }
@@ -1483,6 +1522,11 @@ net::awaitable<bool> Worker::AddUdpListenerTask(
         !runtime_ || runtime_->listener_state->stopping)
         throw IoSystemError(net::error::operation_aborted);
     ColdMutationGuard mutation(runtime_->cold_mutation_active, runtime_->listener_state.get());
+    if (proxyman::inbound::RegisteredDatagramTransport(req.protocol) ==
+        proxyman::inbound::DatagramTransport::Quic) {
+        co_return co_await runtime_->listener_state->StartQuicListening(
+            *this, binding);
+    }
     auto result =
         runtime_->inbound_handlers->NewDatagramHandler(
             runtime_->connection_limiter.get(), req);
@@ -1499,6 +1543,91 @@ net::awaitable<bool> Worker::AddUdpListenerTask(
     }
     co_return co_await runtime_->listener_state->StartUdpListening(
         *this, binding, std::move(result.handler));
+}
+
+
+net::awaitable<bool> Worker::ListenerState::StartQuicListening(
+    Worker& worker,
+    const PortBinding& binding) {
+    // A QUIC connection remains on one Worker for its whole lifetime. A single
+    // owner socket lets kernel path migration reach that owner without
+    // user-space packet forwarding or per-connection cross-Worker queues.
+    if (worker.id_ != 0) co_return true;
+
+    auto slot_it = listener_slots.find(binding.tag);
+    if (slot_it == listener_slots.end() || !slot_it->second->handler ||
+        !slot_it->second->prepared) {
+        LOG_ERROR("QUIC listener unavailable worker={} tag={} > missing prepared inbound",
+                  worker.id_, binding.tag);
+        co_return false;
+    }
+    auto* runtime = dynamic_cast<proxy::UserOnlineProtocolRuntime*>(
+        worker.runtime_->inbound_handlers->GetOrCreateRuntime(binding.protocol));
+    if (!runtime) {
+        LOG_ERROR("QUIC listener unavailable worker={} tag={} > invalid protocol runtime",
+                  worker.id_, binding.tag);
+        co_return false;
+    }
+    auto replacement = std::make_unique<proxy::hysteria::HysteriaIngress>(
+        worker.id_, worker.runtime_->io_context, *worker.runtime_->dispatcher,
+        worker.runtime_->stats, worker.runtime_->connection_limiter,
+        runtime->validator, worker.runtime_->timeouts,
+        slot_it->second->prepared,
+        slot_it->second->handler->SharedReceiverSettings());
+
+    size_t bound = 0;
+    const auto candidates = binding.listen.Candidates();
+    for (const auto& address : candidates) {
+        const iputil::AddressText text(address);
+        const auto listen_text = text.View();
+        udp::endpoint endpoint(address, binding.port);
+        auto socket = replacement->MakeSocket();
+        IoErrorCode error;
+        socket->open(endpoint.protocol(), error);
+        if (!error && address.is_v6())
+            socket->set_option(net::ip::v6_only(true), error);
+        if (!error)
+            socket->set_option(net::socket_base::reuse_address(true), error);
+        if (!error) socket->bind(endpoint, error);
+        if (error) {
+            if (candidates.size() > 1) {
+                LOG_WARN("QUIC listener bind failed worker={} endpoint={} > {}; continuing dual-stack bind",
+                         worker.id_,
+                         iputil::FormatEndpointForLog(listen_text, binding.port),
+                         error.message());
+                continue;
+            }
+            LOG_ERROR("QUIC listener bind failed worker={} endpoint={} > {}",
+                      worker.id_,
+                      iputil::FormatEndpointForLog(listen_text, binding.port),
+                      error.message());
+            co_return false;
+        }
+        const auto key = BuildListenerKey(
+            binding.tag, listen_text, binding.port);
+        if (!replacement->AttachSocket(key, std::move(socket))) {
+            LOG_ERROR("failed to attach QUIC socket worker={} key={}",
+                      worker.id_, key);
+            co_return false;
+        }
+        ++bound;
+        LOG_DEBUG("QUIC listener ready worker={} key={} tag={} protocol={} owner=dedicated",
+                  worker.id_, key, binding.tag, binding.protocol);
+    }
+    if (bound == 0) co_return false;
+
+    if (slot_it->second->quic_ingress) {
+        slot_it->second->retiring_quic_ingress =
+            std::move(slot_it->second->quic_ingress);
+        slot_it->second->retiring_quic_ingress->RequestStop();
+        co_await slot_it->second->retiring_quic_ingress->AsyncJoin();
+        slot_it->second->retiring_quic_ingress.reset();
+    }
+    replacement->Start();
+    slot_it->second->quic_ingress = std::move(replacement);
+    slot_it->second->udp_binding =
+        ListenerSlot::SocketBinding{binding.port, binding.listen};
+    co_return true;
 }
 
 net::awaitable<bool> Worker::ListenerState::StartUdpListening(

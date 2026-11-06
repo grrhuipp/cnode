@@ -98,11 +98,17 @@ struct PreparedAnyTlsUser {
     ::acpp::UserProfile profile;
 };
 
+struct PreparedHysteriaUser {
+    std::array<uint8_t, 32> credential_hash{};
+    ::acpp::UserProfile profile;
+};
+
 using PreparedVmessUsers = std::vector<PreparedVmessUser>;
 using PreparedVlessUsers = std::vector<PreparedVlessUser>;
 using PreparedTrojanUsers = std::vector<PreparedTrojanUser>;
 using PreparedShadowsocksUsers = std::vector<PreparedShadowsocksUser>;
 using PreparedAnyTlsUsers = std::vector<PreparedAnyTlsUser>;
+using PreparedHysteriaUsers = std::vector<PreparedHysteriaUser>;
 
 // A prepared user payload belongs to exactly one protocol. Keeping the protocol
 // implicit in the variant makes contradictory protocol + payload pairs
@@ -112,7 +118,8 @@ using UserSet = std::variant<
     PreparedVlessUsers,
     PreparedTrojanUsers,
     PreparedShadowsocksUsers,
-    PreparedAnyTlsUsers>;
+    PreparedAnyTlsUsers,
+    PreparedHysteriaUsers>;
 
 enum class UserProtocol : uint8_t {
     Vmess,
@@ -120,6 +127,7 @@ enum class UserProtocol : uint8_t {
     Trojan,
     Shadowsocks,
     AnyTls,
+    Hysteria,
 };
 
 [[nodiscard]] inline UserProtocol UserProtocolOf(const UserSet& users) noexcept {
@@ -133,9 +141,11 @@ enum class UserProtocol : uint8_t {
             return UserProtocol::Trojan;
         } else if constexpr (std::is_same_v<Users, PreparedShadowsocksUsers>) {
             return UserProtocol::Shadowsocks;
-        } else {
-            static_assert(std::is_same_v<Users, PreparedAnyTlsUsers>);
+        } else if constexpr (std::is_same_v<Users, PreparedAnyTlsUsers>) {
             return UserProtocol::AnyTls;
+        } else {
+            static_assert(std::is_same_v<Users, PreparedHysteriaUsers>);
+            return UserProtocol::Hysteria;
         }
     }, users);
 }

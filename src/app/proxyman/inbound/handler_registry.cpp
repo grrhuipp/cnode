@@ -77,6 +77,11 @@ DatagramHandlerBuildResult HandlerRegistry::NewDatagramHandler(
         req.protocol, *runtime, impl_->stats, std::move(limiter), req);
 }
 
+ProtocolRuntime* HandlerRegistry::GetOrCreateRuntime(
+    std::string_view protocol) {
+    return impl_->EnsureRuntime(protocol);
+}
+
 HandlerRegistry::HandlerPtr HandlerRegistry::ReplaceHandler(std::unique_ptr<Handler> handler) {
     if (!handler) {
         return nullptr;

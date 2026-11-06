@@ -64,6 +64,8 @@ struct StaticUserConfig {
     std::string identity_password;
     std::string padding_scheme;
     std::string vless_decryption = std::string(constants::protocol::kNone);
+    uint32_t hysteria_up_mbps = 0;
+    uint32_t hysteria_down_mbps = 0;
     std::vector<StaticUser> clients;
 };
 

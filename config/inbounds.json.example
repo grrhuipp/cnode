@@ -118,5 +118,30 @@
         "keyFile": "/etc/cnode/certs/privkey.pem"
       }
     }
+  },
+  {
+    "tag": "static-hysteria2",
+    "protocol": "hysteria2",
+    "listen": "0.0.0.0",
+    "port": 9444,
+    "settings": {
+      "upMbps": 100,
+      "downMbps": 100,
+      "clients": [
+        {
+          "password": "your-hysteria-password",
+          "email": "hysteria-static@example.com"
+        }
+      ]
+    },
+    "streamSettings": {
+      "network": "tcp",
+      "security": "tls",
+      "tlsSettings": {
+        "serverName": "example.com",
+        "certFile": "/etc/cnode/certs/fullchain.pem",
+        "keyFile": "/etc/cnode/certs/privkey.pem"
+      }
+    }
   }
 ]

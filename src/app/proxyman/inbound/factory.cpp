@@ -23,8 +23,15 @@ void RegisterProxy(
     ProxyRegistration registration) {
     const bool has_user_builders = registration.build_static_users ||
                                    registration.build_users;
+    const bool has_tcp = registration.create_tcp_handler != nullptr;
+    const bool has_packet_datagrams =
+        registration.create_datagram_handler != nullptr;
+    const bool transport_consistent =
+        (registration.datagram_transport == DatagramTransport::Packet) ==
+            has_packet_datagrams;
     if (protocol.empty() || !registration.create_runtime ||
-        !registration.create_tcp_handler ||
+        (!has_tcp && registration.datagram_transport != DatagramTransport::Quic) ||
+        !transport_consistent ||
         has_user_builders != registration.user_protocol.has_value()) {
         throw std::invalid_argument(
             "invalid inbound protocol registration for '" +
@@ -48,6 +55,15 @@ std::optional<UserProtocol> RegisteredUserProtocol(
     auto& registrations = Registrations();
     auto it = registrations.find(protocol);
     return it == registrations.end() ? std::nullopt : it->second.user_protocol;
+}
+
+DatagramTransport RegisteredDatagramTransport(
+    std::string_view protocol) {
+    auto& registrations = Registrations();
+    auto it = registrations.find(protocol);
+    return it == registrations.end()
+        ? DatagramTransport::None
+        : it->second.datagram_transport;
 }
 
 std::unique_ptr<ProtocolRuntime> NewProtocolRuntime(

@@ -39,6 +39,11 @@ using AnyTlsTagMap =
                        std::shared_ptr<const UserStore::AnyTlsUserMap>,
                        TransparentStringHash,
                        TransparentStringEq>;
+using HysteriaTagMap =
+    std::unordered_map<std::string,
+                       std::shared_ptr<const UserStore::HysteriaUserMap>,
+                       TransparentStringHash,
+                       TransparentStringEq>;
 
 }  // namespace
 
@@ -48,6 +53,7 @@ struct UserStore::Snapshot {
     TrojanTagMap trojan;
     ShadowsocksTagMap shadowsocks;
     AnyTlsTagMap anytls;
+    HysteriaTagMap hysteria;
 };
 
 struct UserStore::WorkerLease {
@@ -189,6 +195,27 @@ BuildAnyTlsUsers(const std::vector<PreparedAnyTlsUser>& users) {
     return map;
 }
 
+UserStore::HysteriaCredential
+BuildHysteriaCredential(const PreparedHysteriaUser& user) {
+    return UserStore::HysteriaCredential{
+        .credential_hash = user.credential_hash,
+        .profile = user.profile,
+    };
+}
+
+std::shared_ptr<const UserStore::HysteriaUserMap>
+BuildHysteriaUsers(const std::vector<PreparedHysteriaUser>& users) {
+    auto map = std::make_shared<UserStore::HysteriaUserMap>();
+    map->reserve(users.size());
+    for (const auto& user : users) {
+        if (!map->try_emplace(
+                user.credential_hash, BuildHysteriaCredential(user)).second) {
+            ThrowAmbiguousCredential("Hysteria");
+        }
+    }
+    return map;
+}
+
 template <typename TagMap>
 void EraseByTag(TagMap& map, std::string_view tag) {
     if (auto it = map.find(tag); it != map.end()) {
@@ -292,6 +319,8 @@ UserStore::PublishedSnapshot UserStore::PrepareUsers(
             SetOrErase(next->shadowsocks, tag, BuildShadowsocksUsers(*shadowsocks));
         } else if (const auto* anytls = std::get_if<PreparedAnyTlsUsers>(&users)) {
             SetOrErase(next->anytls, tag, BuildAnyTlsUsers(*anytls));
+        } else if (const auto* hysteria = std::get_if<PreparedHysteriaUsers>(&users)) {
+            SetOrErase(next->hysteria, tag, BuildHysteriaUsers(*hysteria));
         }
     }
     return next;
@@ -307,6 +336,7 @@ UserStore::PublishedSnapshot UserStore::PrepareClearUsers(
         case UserProtocol::Trojan: EraseByTag(next->trojan, tag); break;
         case UserProtocol::Shadowsocks: EraseByTag(next->shadowsocks, tag); break;
         case UserProtocol::AnyTls: EraseByTag(next->anytls, tag); break;
+        case UserProtocol::Hysteria: EraseByTag(next->hysteria, tag); break;
     }
     return next;
 }
@@ -372,6 +402,19 @@ UserStore::FindAnyTlsUser(std::string_view tag,
     return std::shared_ptr<const AnyTlsCredential>(view, &user_it->second);
 }
 
+std::shared_ptr<const UserStore::HysteriaCredential>
+UserStore::FindHysteriaUser(
+    std::string_view tag,
+    const std::array<uint8_t, 32>& credential_hash) {
+    const auto& view = LocalView();
+    if (!view || !view->snapshot) return nullptr;
+    auto tag_it = view->snapshot->hysteria.find(tag);
+    if (tag_it == view->snapshot->hysteria.end()) return nullptr;
+    auto user_it = tag_it->second->find(credential_hash);
+    if (user_it == tag_it->second->end()) return nullptr;
+    return std::shared_ptr<const HysteriaCredential>(view, &user_it->second);
+}
+
 size_t UserStore::TotalUsers() {
     auto snapshot = CaptureSnapshot();
     size_t total = 0;
@@ -386,6 +429,7 @@ size_t UserStore::TotalUsers() {
     count(snapshot->trojan);
     count(snapshot->shadowsocks);
     count(snapshot->anytls);
+    count(snapshot->hysteria);
     return total;
 }
 

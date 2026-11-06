@@ -8,8 +8,6 @@
 
 namespace {
 using namespace acpp::proxyman::inbound;
-static_assert(std::variant_size_v<UserSet> == 5);
-static_assert(std::is_same_v<std::variant_alternative_t<0, UserSet>, PreparedVmessUsers>);
 
 void Commit(UserStore::PublishedSnapshot snapshot) {
     auto view = UserStore::PrepareWorkerView(snapshot);
@@ -26,6 +24,12 @@ PreparedVmessUser Vmess(std::string uuid, int64_t id) {
 PreparedTrojanUser Trojan(std::string hash, int64_t id) {
     PreparedTrojanUser user;
     user.password_hash = std::move(hash);
+    user.profile.user_id = id;
+    return user;
+}
+PreparedHysteriaUser Hysteria(uint8_t hash_byte, int64_t id) {
+    PreparedHysteriaUser user;
+    user.credential_hash.fill(hash_byte);
     user.profile.user_id = id;
     return user;
 }
@@ -69,10 +73,13 @@ bool TestAmbiguousCredentialsRejected() {
     lower.uuid_bytes.fill(0x6b);
     PreparedVlessUser vless_a;
     PreparedVlessUser vless_b;
-    const std::array<UserSet, 3> ambiguous{
+    const std::array<UserSet, 4> ambiguous{
         UserSet{PreparedVmessUsers{upper, lower}},
         UserSet{PreparedVlessUsers{vless_a, vless_b}},
-        UserSet{PreparedTrojanUsers{Trojan("same-hash", 4), Trojan("same-hash", 5)}}};
+        UserSet{PreparedTrojanUsers{
+            Trojan("same-hash", 4), Trojan("same-hash", 5)}},
+        UserSet{PreparedHysteriaUsers{
+            Hysteria(0x42, 6), Hysteria(0x42, 7)}}};
     for (const auto& users : ambiguous) {
         try {
             static_cast<void>(UserStore::PrepareUsers(tag, users));
@@ -82,7 +89,13 @@ bool TestAmbiguousCredentialsRejected() {
     }
     return UserStore::CaptureSnapshot() == before &&
            UserStore::VmessUsers(tag).size() == 1 &&
-           UserStore::VmessUsers(tag)[0].profile.user_id == 1;
+           UserStore::VmessUsers(tag)[0].profile.user_id == 1 &&
+           [&] {
+               const auto credential =
+                   UserStore::FindHysteriaUser(
+                       tag, Hysteria(0x42, 0).credential_hash);
+               return !credential;
+           }();
 }
 }  // namespace
 

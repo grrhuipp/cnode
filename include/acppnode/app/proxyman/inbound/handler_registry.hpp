@@ -19,6 +19,7 @@ namespace acpp::proxyman::inbound {
 class Handler;
 struct BuildRequest;
 struct DatagramHandlerBuildResult;
+class ProtocolRuntime;
 // ============================================================================
 // HandlerRegistry - per-Worker inbound handler registry
 //
@@ -46,6 +47,8 @@ public:
     [[nodiscard]] DatagramHandlerBuildResult NewDatagramHandler(
         ::acpp::ConnectionLimiter* limiter,
         const BuildRequest& req);
+    [[nodiscard]] ProtocolRuntime* GetOrCreateRuntime(
+        std::string_view protocol);
 
     // ReplaceHandler 在所属 Worker 上替换同 tag handler。调用方持有的
     // shared_ptr 让在途物理连接及其任务组持有的逻辑子任务继续使用原 handler。

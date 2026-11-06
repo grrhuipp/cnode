@@ -67,6 +67,11 @@ public:
         Profile profile;
     };
 
+    struct HysteriaCredential {
+        std::array<uint8_t, 32> credential_hash{};
+        Profile profile;
+    };
+
     using VmessUserMap = std::vector<VmessCredential>;
     using TrojanUserMap =
         std::unordered_map<std::string,
@@ -81,6 +86,10 @@ public:
     using AnyTlsUserMap =
         std::unordered_map<std::array<uint8_t, 32>,
                            AnyTlsCredential,
+                           Array32Hash>;
+    using HysteriaUserMap =
+        std::unordered_map<std::array<uint8_t, 32>,
+                           HysteriaCredential,
                            Array32Hash>;
 
     struct VmessUsersView {
@@ -171,6 +180,9 @@ public:
     [[nodiscard]] static std::shared_ptr<const AnyTlsCredential>
     FindAnyTlsUser(std::string_view tag,
                    const std::array<uint8_t, 32>& password_hash);
+    [[nodiscard]] static std::shared_ptr<const HysteriaCredential>
+    FindHysteriaUser(std::string_view tag,
+                     const std::array<uint8_t, 32>& credential_hash);
 
     [[nodiscard]] static size_t TotalUsers();
 };

@@ -181,6 +181,45 @@ include(cmake/patch_aws_lc_reality.cmake)
 cnode_patch_aws_lc_reality("${aws_lc_SOURCE_DIR}")
 message(STATUS "Using AWS-LC via FetchContent")
 
+# Hysteria v1/v2 use ngtcp2 for QUIC and nghttp3 only for the mandatory
+# Hysteria 2 HTTP/3 authentication/masquerade exchange. Both are static,
+# library-only builds; TLS stays on the existing AWS-LC instance.
+set(ENABLE_STATIC_LIB ON CACHE BOOL "" FORCE)
+set(ENABLE_SHARED_LIB OFF CACHE BOOL "" FORCE)
+set(ENABLE_LIB_ONLY ON CACHE BOOL "" FORCE)
+set(ENABLE_WERROR OFF CACHE BOOL "" FORCE)
+set(ENABLE_DEBUG OFF CACHE BOOL "" FORCE)
+set(ENABLE_ASAN OFF CACHE BOOL "" FORCE)
+set(ENABLE_POPCNT ON CACHE BOOL "" FORCE)
+FetchContent_Declare(
+    nghttp3
+    GIT_REPOSITORY https://github.com/ngtcp2/nghttp3.git
+    GIT_TAG v1.12.0
+    GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(nghttp3)
+
+set(ENABLE_OPENSSL OFF CACHE BOOL "" FORCE)
+set(ENABLE_BORINGSSL ON CACHE BOOL "" FORCE)
+set(ENABLE_GNUTLS OFF CACHE BOOL "" FORCE)
+set(ENABLE_PICOTLS OFF CACHE BOOL "" FORCE)
+set(ENABLE_WOLFSSL OFF CACHE BOOL "" FORCE)
+set(ENABLE_JEMALLOC OFF CACHE BOOL "" FORCE)
+set(BORINGSSL_INCLUDE_DIR "${aws_lc_SOURCE_DIR}/include" CACHE PATH "" FORCE)
+set(BORINGSSL_LIBRARIES ssl crypto CACHE STRING "" FORCE)
+FetchContent_Declare(
+    ngtcp2
+    GIT_REPOSITORY https://github.com/ngtcp2/ngtcp2.git
+    GIT_TAG v1.16.0
+    GIT_SHALLOW TRUE
+    PATCH_COMMAND
+        ${CMAKE_COMMAND}
+            -DNGTCP2_SOURCE_DIR=<SOURCE_DIR>
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_ngtcp2_check_target.cmake
+)
+FetchContent_MakeAvailable(ngtcp2)
+message(STATUS "Using ngtcp2 v1.16.0 and nghttp3 v1.12.0 via FetchContent")
+
 FetchContent_Declare(
     zlib
     GIT_REPOSITORY https://github.com/madler/zlib.git
@@ -410,6 +449,13 @@ set(CNODE_SOURCES
     # Proxy - UDP over TCP
     src/proxy/uot/uot.cpp
 
+    # Proxy - Hysteria
+    src/proxy/hysteria/hysteria_protocol.cpp
+    src/proxy/hysteria/quic_memory.cpp
+    src/proxy/hysteria/quic_stream.cpp
+    src/proxy/hysteria/hysteria_registration.cpp
+    src/proxy/hysteria/hysteria_ingress.cpp
+
     # Proxy - Shadowsocks
     src/proxy/shadowsocks/client.cpp
     src/proxy/shadowsocks/server.cpp
@@ -455,11 +501,16 @@ add_executable(cnode ${CNODE_SOURCES})
 target_include_directories(cnode PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${concurrentqueue_SOURCE_DIR}
+    ${nghttp3_SOURCE_DIR}/lib/includes
+    ${nghttp3_BINARY_DIR}/lib/includes
 )
 
 target_link_libraries(cnode PRIVATE
     asio::asio
     Threads::Threads
+    ngtcp2_static
+    ngtcp2_crypto_boringssl_static
+    nghttp3_static
     ssl
     crypto
     cnode_blake3
@@ -576,6 +627,17 @@ endif()
 if(CNODE_BUILD_TESTS)
     enable_testing()
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wno-mismatched-new-delete>)
+    add_executable(cnode_hysteria_protocol_test
+        tests/hysteria_protocol_test.cpp
+        src/proxy/hysteria/hysteria_protocol.cpp)
+    target_include_directories(cnode_hysteria_protocol_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/hysteria)
+    target_link_libraries(cnode_hysteria_protocol_test PRIVATE asio::asio crypto)
+    target_compile_options(cnode_hysteria_protocol_test PRIVATE
+        -Wall -Wextra -Wpedantic)
+    add_test(NAME cnode_hysteria_protocol_test COMMAND cnode_hysteria_protocol_test)
+
     add_executable(cnode_autosign_cert_test
         tests/autosign_cert_test.cpp
         src/transport/internet/autosign_cert.cpp

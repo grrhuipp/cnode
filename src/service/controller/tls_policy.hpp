@@ -13,12 +13,13 @@ namespace acpp::controller {
         return false;
     }
 
-    // V2Board AnyTLS and Trojan nodes do not expose the generic `tls` field;
-    // both subscription protocols always connect through TLS. The local panel
-    // switch is authoritative for whether this process may terminate TLS.
+    // These protocols always terminate TLS; the panel switch declares that
+    // this cnode instance owns a usable certificate.
     return node_config.EnableTLS ||
         node_config.NodeType == constants::protocol::kAnyTLS ||
-        node_config.NodeType == constants::protocol::kTrojan;
+        node_config.NodeType == constants::protocol::kTrojan ||
+        node_config.NodeType == constants::protocol::kHysteria ||
+        node_config.NodeType == constants::protocol::kHysteria2;
 }
 
 }  // namespace acpp::controller

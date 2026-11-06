@@ -12,8 +12,8 @@ cnode 是面向 V2Board 面板的高性能 Linux 代理节点服务端。项目�
 
 ## 项目定位
 
-- 支持 VMess、VLESS、Trojan、Shadowsocks、AnyTLS、Freedom、Blackhole。
-- 支持 TCP、TLS、WebSocket、PROXY protocol、原生 datagram、UDP-over-TCP 和 Mux/子流。
+- 支持 VMess、VLESS、Trojan、Shadowsocks、AnyTLS、Hysteria、Hysteria2、Freedom、Blackhole。
+- 支持 TCP、TLS、WebSocket、PROXY protocol、QUIC、原生 datagram、UDP-over-TCP 和 Mux/子流。
 - 支持单进程接入多个 V2Board 面板和多个节点。
 - 支持 geoip、geosite、域名、IP、端口、协议、用户等路由条件。
 - 默认按多数据 Worker 运行；各数据 Worker 同构，通过 `SO_REUSEPORT` 分别拥有监听和转发资源。主线程作为唯一主控 Worker，面板、监控与 DNS 共用一个事件循环；数据 Worker 通过有界入口提交 DNS 请求。
@@ -68,7 +68,7 @@ main
   -> listener / accept
   -> ExecutionDomain / session group
   -> TransportStack(TCP / TLS / WebSocket / PROXY protocol)
-  -> InboundHandler(VMess / VLESS / Trojan / Shadowsocks / AnyTLS)
+  -> InboundHandler(VMess / VLESS / Trojan / Shadowsocks / AnyTLS / Hysteria / Hysteria2)
   -> Dispatcher::Dispatch(immutable DispatchPolicy)
        -> sniffing
        -> forced outbound, or Router matched-rule decision
@@ -160,7 +160,7 @@ geosite.dat
 
 所有本地配置键（含 `config.json`、侧车、`panels` 和嵌套 `settings`）不区分 ASCII 大小写，解析时统一转为小写；示例采用 camelCase。因此 `APIHost`、`apiHost`、`apihost` 等价，`NodeIDs`、`nodeIDs`、`nodeIds` 等价，无需因大小写差异迁移旧配置。仅转换键名，密码、路径、标签等字段值保持原样，仍遵循各字段自身的校验规则；面板远端 API 的字段匹配不受影响。大小写归一化后重复的键直接报错，即使值相同也不允许。`api_host` 等下划线别名以及已删除字段不会因此恢复支持，配置文件名仍固定为下列小写文件名。
 
-配置键大小写无关不等于字段值大小写无关：`nodeType` 只接受 `vmess`、`vless`、`trojan`、`shadowsocks`、`anytls`，不再接受空值或旧协议别名。面板 `dnsType` 与 Freedom 的 `domainStrategy` 共用策略值：`AsIs`、`UseIP`、`UseIPv4`、`UseIPv6`、`UseIPv4v6`、`UseIPv6v4` 及对应的 `ForceIP`／`ForceIPv4`／`ForceIPv6`／`ForceIPv4v6`／`ForceIPv6v4`；未知值、空值或错误类型拒绝加载。路由引用不存在的 outbound 也直接报错，不丢弃规则后回落放行。
+配置键大小写无关不等于字段值大小写无关：`nodeType` 只接受 `vmess`、`vless`、`trojan`、`shadowsocks`、`anytls`、`hysteria`、`hysteria2`，不再接受空值或旧协议别名。面板 `dnsType` 与 Freedom 的 `domainStrategy` 共用策略值：`AsIs`、`UseIP`、`UseIPv4`、`UseIPv6`、`UseIPv4v6`、`UseIPv6v4` 及对应的 `ForceIP`／`ForceIPv4`／`ForceIPv6`／`ForceIPv4v6`／`ForceIPv6v4`；未知值、空值或错误类型拒绝加载。路由引用不存在的 outbound 也直接报错，不丢弃该规则或回退到其他出口。
 
 部署模式添加面板时同样按大小写无关的字段名查找，但面板名称区分大小写；替换同名面板不会改写其他配置键或字段值。配置 JSON 损坏、面板列表类型错误或存在大小写冲突的字段时停止写入，保留原文件，不尝试猜测修复。
 
@@ -273,6 +273,7 @@ bash scripts/cnode.sh -variant glibc -debug_file true
 - 面板创建的 direct outbound 是 routing 未命中时的 fallback，命中规则始终优先生效。
 - 出口列表顺序不表达默认出口；动态增删 outbound 不会改变其他 receiver 的选择。明确的 forced / fallback tag 不存在时请求失败，不隐式切换到第一个 outbound。
 - AnyTLS 使用 TLS session pool、单物理 session read loop、按 sid demux、共享 session 串行写，以及 `settings.clients` 和 `settings.paddingScheme` 配置。
+- Hysteria v1 使用 ALPN `hysteria`，Hysteria2 使用 HTTP/3 `/auth` 后切换原生 QUIC stream；两代均支持 QUIC DATAGRAM UDP、分片重组和路径迁移。QUIC 监听由固定 Worker 独占，连接及其路径变化始终由该 Worker 处理，不建立跨 Worker 数据包转发队列。`ngtcp2`、`nghttp3` 及流队列借用 Worker PMR，监听入口共享收发循环和超时调度。`ngtcp2` 不提供 Hysteria v1 的 Brutal 拥塞控制，v1 服务端使用其 BBR v2 实现；线协议与官方 v1 客户端互通，但带宽控制行为不是 Brutal。
 
 AnyTLS FIN 关闭整个逻辑流：远端 FIN 之前的已接收数据按有界队列排空，同时停止新的反向写入且不回复 FIN；本地关闭只发送一次 FIN。请求的两个方向结束后，完整且正常的物理会话可供新流复用；物理帧写入中断则关闭会话。第四十八轮已通过固定提交官方实现对照、双向直接互通和提前 FIN 检查，验证范围及当前环境限制见[架构审查记录](docs/architecture-review-20260909.md#第四十八轮anytls-完整关闭与-tls-取消传递)。
 - REALITY 支持 TLS 1.3 + X25519 + Ed25519 临时证书签发与验证、服务端准入控制（`serverNames`、`shortIds`、`minClientVer`、`maxClientVer`、`maxTimeDiff`）、可选后量子 `mldsa65Seed` / `mldsa65Verify`（ML-DSA-65 证书扩展签名与验签）、未认证连接透明回落转发（`dest` + `xver` 0/1/2 PROXY Protocol v1/v2）、客户端 `fingerprint` 浏览器指纹模拟（`chrome`/`firefox`/`safari`/`ios`/`android`/`edge`/`360`/`qq`/`random`）、客户端 `spiderX` 回退路径访问，以及 V2Board 面板 `tls=2` REALITY 节点自动同步。握手阶段的认证状态与 transcript 缓冲在握手结束时立即释放，不随连接常驻；无读者的 `show`、`type`、`masterKeyLog` 字段会被配置加载器拒绝。
