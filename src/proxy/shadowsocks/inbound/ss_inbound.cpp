@@ -308,7 +308,6 @@ proxy::shadowsocks::inbound::Handler::Process(
     }
 
     const auto& user = users[decoded->user_index];
-    const auto& profile = user.profile;
 
     InboundDatagramResult result;
     if (!result.session_owner.Assign(user.derived_key.span())) {
@@ -317,9 +316,10 @@ proxy::shadowsocks::inbound::Handler::Process(
     result.target = std::move(decoded->target);
     result.payload = std::move(decoded->payload);
     result.session_id = decoded->session_id;
-    result.user_id = profile.user_id;
-    result.user_email = profile.email;
-    result.speed_limit = profile.speed_limit;
+    // The Worker's user view keeps the profile alive through the handoff.
+    result.user = &user.profile;
+    result.tracker = &validator_;
+    result.limiter = limiter_;
     return result;
 }
 

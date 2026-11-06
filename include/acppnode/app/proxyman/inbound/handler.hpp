@@ -21,6 +21,10 @@ class DNS;
 }  // namespace dns
 }  // namespace acpp::app
 
+namespace acpp {
+class InboundTransportStreamHandler;
+}  // namespace acpp
+
 namespace acpp::proxyman::inbound {
 
 // ============================================================================
@@ -77,6 +81,21 @@ public:
         std::unique_ptr<AsyncStream> raw_conn,
         session::Context& ctx,
         app::dns::DNS* dns_service = nullptr);
+
+    // Logical-stream sink for a transport session that authenticated its
+    // client itself (Hysteria QUIC, as Xray's hysteria hub). Each delivered
+    // stream runs ProcessPreparedTransportStream with a child of |session_ctx|
+    // that keeps the session's identity and client endpoint, and takes a
+    // logical admission under the session's physical |family|.
+    [[nodiscard]] std::shared_ptr<InboundTransportStreamHandler>
+    NewAuthenticatedStreamSink(
+        net::io_context& io_context,
+        routing::Dispatcher& dispatcher,
+        StatsShard& stats,
+        app::RequestLoadState& request_load,
+        const TimeoutsConfig& timeouts,
+        const session::Context& session_ctx,
+        std::shared_ptr<ConnectionLimiter::Family> family);
 
     // Null until a lazily built protocol has handled its first request.
     [[nodiscard]] const ProtocolRuntime* Runtime() const noexcept {

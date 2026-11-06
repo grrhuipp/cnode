@@ -49,6 +49,8 @@ struct SniffConfig {
         }
         return false;
     }
+
+    [[nodiscard]] bool operator==(const SniffConfig&) const = default;
 };
 
 }  // namespace acpp

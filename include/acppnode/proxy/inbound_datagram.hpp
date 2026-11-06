@@ -3,6 +3,7 @@
 #include "acppnode/app/udp_types.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
 #include "acppnode/common/target_address.hpp"
+#include "acppnode/common/user_profile.hpp"
 
 #include <algorithm>
 #include <array>
@@ -10,10 +11,13 @@
 #include <memory>
 #include <optional>
 #include <span>
-#include <string>
 #include <string_view>
 
 namespace acpp {
+
+class ConnectionLimiter;
+class UserOnlineTracker;
+
 
 class InboundDatagramResponse {
 public:
@@ -57,10 +61,15 @@ struct InboundDatagramResult {
     std::optional<uint64_t> session_id;
     // Protocol session IDs are scoped by the authenticated credential.
     InboundDatagramOwner session_owner;
-    int64_t user_id = 0;
-    // Borrowed only until the synchronous datagram handoff completes.
-    std::string_view user_email;
-    uint64_t speed_limit = 0;
+    // The authenticated credential's profile. Borrowed only until the
+    // synchronous datagram handoff completes; a new association copies it.
+    const UserProfile* user = nullptr;
+    // Admission handles of the authenticating protocol runtime. A new
+    // association copies them and holds its reservations through them; the
+    // runtime's tracker and the Worker's limiter outlive every association.
+    // An authenticated result without a tracker cannot start an association.
+    UserOnlineTracker* tracker = nullptr;
+    ConnectionLimiter* limiter = nullptr;
 };
 
 }  // namespace acpp

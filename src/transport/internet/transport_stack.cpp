@@ -5,16 +5,18 @@
 #include "reality_tls.hpp"
 #include "reality_client_hello.hpp"
 #include "xhttp_session.hpp"
-#include "acppnode/app/dns/dns.hpp"
+#include "acppnode/app/relay.hpp"
 #include "acppnode/common/allocator.hpp"
+#include "acppnode/common/session.hpp"
 #include "acppnode/common/unsafe.hpp"
 #include "acppnode/infra/log.hpp"
+#include "acppnode/infra/runtime_config_types.hpp"
 #include "acppnode/transport/internet/http_headers.hpp"
+#include "acppnode/transport/internet/outbound_target_builder.hpp"
 #include "acppnode/transport/internet/tcp_stream.hpp"
 #include "acppnode/transport/internet/tls_stream.hpp"
+#include "acppnode/transport/internet/transport_dialer.hpp"
 #include "acppnode/transport/internet/ws_stream.hpp"
-
-#include <asio/experimental/awaitable_operators.hpp>
 
 #include <algorithm>
 #include <array>
@@ -84,40 +86,42 @@ std::unique_ptr<TcpStream> TakeOwnedTcpStream(std::unique_ptr<AsyncStream>& stre
     return s.http.force_http2 || (s.IsTlsLike() && OffersHttp2(s));
 }
 
+// Xray keeps REALITY dest fallback in the transport layer. It dials dest through
+// the shared outbound target builder/dialer and forwards with the shared relay
+// (stats, timeouts, half-close, cancellation). The unauthenticated session never
+// enters dispatch, routing or user accounting; the caller's physical admission
+// reservation outlives BuildInboundTransport and so covers this whole relay.
 net::awaitable<void> RunRealityFallbackProxy(
     net::io_context& io_context,
-    app::dns::DNS* dns_service,
+    const InboundFallbackContext& fallback,
     std::unique_ptr<TcpStream> client_tcp,
     const RealityConfig& reality,
     memory::ByteVector initial_bytes) {
-    if (!client_tcp || !reality.HasDest()) {
-        co_return;
-    }
+    session::Context& ctx = fallback.ctx;
+    const TimeoutsConfig& timeouts = fallback.timeouts;
 
+    // A plain TCP dest; no send-through binding, as in Xray's dest dial.
+    static const StreamSettings kRawTcp{};
     std::unique_ptr<AsyncStream> dest_stream;
-    constexpr auto kFallbackDialTimeout = std::chrono::seconds(10);
-    if (const auto literal = iputil::ParseLiteral(reality.dest_host)) {
-        auto dial = co_await TcpStream::Connect(
-            io_context,
-            tcp::endpoint(iputil::NormalizeAddress(*literal), reality.dest_port),
-            kFallbackDialTimeout);
+    auto dest_target = co_await BuildOutboundTransportTarget(OutboundTargetOptions{
+        .dns_service = fallback.dns_service,
+        .address = reality.dest_host,
+        .port = reality.dest_port,
+        .stream_settings = &kRawTcp,
+        .timeout = timeouts.DialTimeout(),
+    });
+    if (dest_target) {
+        auto dial = co_await DialOutboundTransport(io_context, ctx, *dest_target);
         if (dial.Ok()) {
             dest_stream = std::move(dial.stream);
+        } else {
+            LOG_CONN_DEBUG(ctx, "REALITY fallback dial {}:{} failed > {}",
+                           reality.dest_host, reality.dest_port, dial.error_msg);
         }
-    } else if (dns_service) {
-        auto dns_result = co_await dns_service->Resolve(reality.dest_host);
-        if (dns_result.Ok()) {
-            for (const auto& addr : dns_result.addresses) {
-                auto dial = co_await TcpStream::Connect(
-                    io_context,
-                    tcp::endpoint(iputil::NormalizeAddress(addr), reality.dest_port),
-                    kFallbackDialTimeout);
-                if (dial.Ok()) {
-                    dest_stream = std::move(dial.stream);
-                    break;
-                }
-            }
-        }
+    } else {
+        LOG_CONN_DEBUG(ctx, "REALITY fallback target {}:{} failed > {}",
+                       reality.dest_host, reality.dest_port,
+                       ErrorCodeToString(dest_target.error()));
     }
 
     if (!dest_stream || !client_tcp->IsOpen()) {
@@ -126,59 +130,51 @@ net::awaitable<void> RunRealityFallbackProxy(
         co_return;
     }
 
-    client_tcp->ClearPhaseDeadline();
-    client_tcp->SetIdleTimeout(std::chrono::seconds(60));
-    dest_stream->SetIdleTimeout(std::chrono::seconds(60));
-
-    std::array<uint8_t, 108> proxy_header{};
-    size_t proxy_header_len = 0;
+    // The PROXY header and the sniffed ClientHello leave as the relay's first
+    // upload write, so dest receives them in one gathered write as before.
+    buf::MultiBuffer first;
+    bool first_ok = true;
     if (reality.xver == 1 || reality.xver == 2) {
-        proxy_header_len = EncodeProxyProtocolHeader(
+        std::array<uint8_t, 108> proxy_header{};
+        const size_t proxy_header_len = EncodeProxyProtocolHeader(
             reality.xver,
             client_tcp->RemoteEndpoint(),
             client_tcp->LocalEndpoint(),
             proxy_header);
+        first_ok = buf::AppendSpanToMultiBuffer(
+            std::span<const uint8_t>(proxy_header.data(), proxy_header_len), first);
     }
-
-    const std::array<net::const_buffer, 2> initial_buffers{
-        net::const_buffer(proxy_header.data(), proxy_header_len),
-        net::const_buffer(initial_bytes.data(), initial_bytes.size()),
-    };
-    bool initial_write_ok = true;
-    try {
-        co_await dest_stream->WriteBuffers(
-            std::span<const net::const_buffer>(initial_buffers)
-                .subspan(proxy_header_len == 0 ? 1 : 0));
-    } catch (...) {
-        initial_write_ok = false;
-    }
+    first_ok = first_ok && buf::AppendSpanToMultiBuffer(initial_bytes, first);
     memory::ByteVector{}.swap(initial_bytes);
-    if (!initial_write_ok) {
+    if (!first_ok) {
         dest_stream->CloseAbortive();
         client_tcp->CloseAbortive();
         co_return;
     }
 
-    auto forward_half = [](AsyncStream& from, AsyncStream& to) -> net::awaitable<void> {
-        try {
-            for (;;) {
-                buf::MultiBuffer mb = co_await from.ReadMultiBuffer();
-                if (mb.byte_size() == 0) {
-                    to.ShutdownWrite();
-                    co_return;
-                }
-                co_await to.WriteMultiBuffer(std::move(mb));
-            }
-        } catch (...) {
-            from.CloseAbortive();
-            to.CloseAbortive();
-        }
-    };
-    using net::experimental::awaitable_operators::operator&&;
-    co_await (forward_half(*client_tcp, *dest_stream) &&
-              forward_half(*dest_stream, *client_tcp));
-    dest_stream->Close();
-    client_tcp->Close();
+    const auto idle_timeout = timeouts.IdleTimeout();
+    const auto write_timeout = std::min(timeouts.WriteTimeout(), idle_timeout);
+    client_tcp->ClearPhaseDeadline();
+    for (AsyncStream* stream : {static_cast<AsyncStream*>(client_tcp.get()), dest_stream.get()}) {
+        stream->SetIdleTimeout(idle_timeout);
+        stream->SetReadTimeout(std::chrono::seconds(0));
+        stream->SetWriteTimeout(write_timeout);
+    }
+
+    AsyncStream& client = *client_tcp;
+    (void)co_await DoRelayLink(
+        io_context,
+        static_cast<transport::MultiBufferReader&>(client),
+        static_cast<transport::MultiBufferWriter&>(client),
+        &client,
+        *dest_stream,
+        ctx,
+        fallback.stats,
+        RelayConfig{
+            .uplink_only = timeouts.UplinkOnlyTimeout(),
+            .downlink_only = timeouts.DownlinkOnlyTimeout(),
+        },
+        buf::MultiBufferBatch(std::move(first)));
 }
 
 // Server TLS or REALITY layer. A REALITY ClientHello that fails
@@ -188,7 +184,7 @@ net::awaitable<TransportBuildResult> AcceptInboundSecurity(
     std::unique_ptr<AsyncStream> stream,
     const StreamSettings& s,
     SslContext* ctx,
-    app::dns::DNS* dns_service,
+    const InboundFallbackContext* fallback,
     uint64_t conn_id) {
     if (!ctx) {
         LOG_CONN_ERROR(conn_id, "{} inbound security requires a Worker-owned server context",
@@ -203,6 +199,10 @@ net::awaitable<TransportBuildResult> AcceptInboundSecurity(
     }
     std::unique_ptr<RealityServerConnState> reality_conn_state;
     if (s.IsReality() && s.reality.HasDest()) {
+        if (!fallback) {
+            LOG_CONN_ERROR(conn_id, "REALITY dest fallback requires an inbound fallback context");
+            co_return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
+        }
         memory::ByteVector initial_bytes;
         {
             // The caller's absolute phase deadline covers sniffing and SSL_accept;
@@ -231,7 +231,7 @@ net::awaitable<TransportBuildResult> AcceptInboundSecurity(
                 s.reality.dest_port);
             co_await RunRealityFallbackProxy(
                 io_context,
-                dns_service,
+                *fallback,
                 std::move(tcp),
                 s.reality,
                 std::move(initial_bytes));
@@ -390,7 +390,7 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
     uint64_t trace_conn_id,
     std::shared_ptr<InboundTransportStreamHandler> stream_handler,
     InboundTransportMetadata* metadata,
-    app::dns::DNS* dns_service)
+    const InboundFallbackContext* fallback)
 {
     std::unique_ptr<AsyncStream> stream = std::move(raw);
     const uint64_t conn_id = trace_conn_id;
@@ -405,7 +405,7 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
     // 1. TLS / REALITY 层（服务端）
     if (s.IsTlsLike()) {
         auto secured = co_await AcceptInboundSecurity(
-            io_context, std::move(stream), s, security_context, dns_service, conn_id);
+            io_context, std::move(stream), s, security_context, fallback, conn_id);
         if (!secured || !*secured) {
             co_return secured;
         }

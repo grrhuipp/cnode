@@ -30,7 +30,7 @@ void RegisterProxy(
         (registration.datagram_transport == DatagramTransport::Packet) ==
             has_packet_datagrams;
     if (protocol.empty() || !registration.create_runtime ||
-        (!has_tcp && registration.datagram_transport != DatagramTransport::Quic) ||
+        !has_tcp ||
         !transport_consistent ||
         has_user_builders != registration.user_protocol.has_value()) {
         throw std::invalid_argument(

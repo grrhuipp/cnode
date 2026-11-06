@@ -10,7 +10,7 @@
 #include "acppnode/app/worker_runtime_config.hpp"
 #include "acppnode/app/rate_limiter.hpp"
 #include "../common/awaitable_task_group.hpp"
-#include "../proxy/hysteria/hysteria_ingress.hpp"
+#include "../transport/internet/hysteria/hysteria_ingress.hpp"
 #include "../proxy/inbound_admission.hpp"
 #include "worker_memory_reclaimer.hpp"
 #include "acppnode/app/worker_stats.hpp"
@@ -100,12 +100,12 @@ struct Worker::ListenerSlot {
     std::shared_ptr<const proxyman::inbound::BuildRequest> prepared;
     std::unique_ptr<worker_detail::TcpListenerOwner> tcp_listeners;
     std::unique_ptr<worker_detail::UdpIngress> udp_ingress;
-    std::unique_ptr<proxy::hysteria::HysteriaIngress> quic_ingress;
+    std::unique_ptr<transport::internet::hysteria::HysteriaIngress> quic_ingress;
     std::optional<SocketBinding> tcp_binding;
     std::optional<SocketBinding> udp_binding;
     // Keeps a stopped ingress alive until every native dispatch job completes.
     std::unique_ptr<worker_detail::UdpIngress> retiring_udp_ingress;
-    std::unique_ptr<proxy::hysteria::HysteriaIngress> retiring_quic_ingress;
+    std::unique_ptr<transport::internet::hysteria::HysteriaIngress> retiring_quic_ingress;
 };
 
 struct Worker::ListenerState : worker_detail::UdpReplySink {
@@ -1138,10 +1138,7 @@ bool Worker::RegisterInbound(
     auto prepared = std::make_shared<const proxyman::inbound::BuildRequest>(req);
     auto handler = runtime_->inbound_handlers->NewHandler(
         runtime_->connection_limiter.get(), req);
-    const bool quic_only =
-        proxyman::inbound::RegisteredDatagramTransport(req.protocol) ==
-        proxyman::inbound::DatagramTransport::Quic;
-    if (!handler && !quic_only) {
+    if (!handler) {
         LOG_WARN("failed to create inbound handler worker={} tag={} protocol={}",
                  id_, receiver.inbound_tag, req.protocol);
         return false;
@@ -1549,11 +1546,9 @@ net::awaitable<bool> Worker::AddUdpListenerTask(
 net::awaitable<bool> Worker::ListenerState::StartQuicListening(
     Worker& worker,
     const PortBinding& binding) {
-    // A QUIC connection remains on one Worker for its whole lifetime. A single
-    // owner socket lets kernel path migration reach that owner without
-    // user-space packet forwarding or per-connection cross-Worker queues.
-    if (worker.id_ != 0) co_return true;
-
+    // Every Worker binds its own SO_REUSEPORT socket; the kernel spreads new
+    // QUIC connections by 4-tuple and each Worker serves only the connections
+    // it accepted (no packet forwarding between Workers).
     auto slot_it = listener_slots.find(binding.tag);
     if (slot_it == listener_slots.end() || !slot_it->second->handler ||
         !slot_it->second->prepared) {
@@ -1568,12 +1563,12 @@ net::awaitable<bool> Worker::ListenerState::StartQuicListening(
                   worker.id_, binding.tag);
         co_return false;
     }
-    auto replacement = std::make_unique<proxy::hysteria::HysteriaIngress>(
+    auto replacement = std::make_unique<transport::internet::hysteria::HysteriaIngress>(
         worker.id_, worker.runtime_->io_context, *worker.runtime_->dispatcher,
-        worker.runtime_->stats, worker.runtime_->connection_limiter,
-        runtime->validator, worker.runtime_->timeouts,
-        slot_it->second->prepared,
-        slot_it->second->handler->SharedReceiverSettings());
+        worker.runtime_->stats, *worker.runtime_->connection_limiter,
+        runtime->validator, *worker.runtime_->request_load,
+        worker.runtime_->timeouts, *slot_it->second->prepared,
+        slot_it->second->handler);
 
     size_t bound = 0;
     const auto candidates = binding.listen.Candidates();
@@ -1583,22 +1578,41 @@ net::awaitable<bool> Worker::ListenerState::StartQuicListening(
         udp::endpoint endpoint(address, binding.port);
         auto socket = replacement->MakeSocket();
         IoErrorCode error;
+        std::string_view operation = "open";
         socket->open(endpoint.protocol(), error);
-        if (!error && address.is_v6())
+        if (!error && address.is_v6()) {
+            operation = "set IPV6_V6ONLY";
             socket->set_option(net::ip::v6_only(true), error);
-        if (!error)
+        }
+        if (!error) {
+            operation = "set SO_REUSEADDR";
             socket->set_option(net::socket_base::reuse_address(true), error);
-        if (!error) socket->bind(endpoint, error);
+        }
+        if (!error) {
+            operation = "SO_REUSEPORT";
+            int optval = 1;
+            if (::setsockopt(socket->native_handle(), SOL_SOCKET, SO_REUSEPORT,
+                             &optval, sizeof(optval)) < 0)
+                error = IoErrorCode(errno, std::system_category());
+        }
+        if (!error) {
+            operation = "set nonblocking";
+            socket->non_blocking(true, error);
+        }
+        if (!error) {
+            operation = "bind";
+            socket->bind(endpoint, error);
+        }
         if (error) {
             if (candidates.size() > 1) {
-                LOG_WARN("QUIC listener bind failed worker={} endpoint={} > {}; continuing dual-stack bind",
-                         worker.id_,
+                LOG_WARN("QUIC listener operation failed worker={} operation={} endpoint={} > {}; continuing dual-stack bind",
+                         worker.id_, operation,
                          iputil::FormatEndpointForLog(listen_text, binding.port),
                          error.message());
                 continue;
             }
-            LOG_ERROR("QUIC listener bind failed worker={} endpoint={} > {}",
-                      worker.id_,
+            LOG_ERROR("QUIC listener operation failed worker={} operation={} endpoint={} > {}",
+                      worker.id_, operation,
                       iputil::FormatEndpointForLog(listen_text, binding.port),
                       error.message());
             co_return false;
@@ -1611,7 +1625,7 @@ net::awaitable<bool> Worker::ListenerState::StartQuicListening(
             co_return false;
         }
         ++bound;
-        LOG_DEBUG("QUIC listener ready worker={} key={} tag={} protocol={} owner=dedicated",
+        LOG_DEBUG("QUIC listener ready worker={} key={} tag={} protocol={}",
                   worker.id_, key, binding.tag, binding.protocol);
     }
     if (bound == 0) co_return false;

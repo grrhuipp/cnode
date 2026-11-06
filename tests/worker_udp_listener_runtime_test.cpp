@@ -9,6 +9,8 @@
 #include "acppnode/app/worker.hpp"
 #include "acppnode/app/worker_runtime_config.hpp"
 #include "acppnode/app/worker_stats.hpp"
+#include "acppnode/common/sharded_user_stats.hpp"
+#include "acppnode/common/user_profile.hpp"
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/proxy/inbound.hpp"
@@ -78,12 +80,15 @@ struct Runtime final : acpp::proxyman::inbound::ProtocolRuntime {
     std::vector<acpp::OnlineDevice> GetOnlineDevices(std::string_view) const override {
         return {};
     }
+    acpp::UserOnlineTracker tracker;
 };
 
 class Datagram final : public acpp::Inbound {
 public:
-    Datagram(FixtureState& state, unsigned token, bool association)
-        : state_(state), token_(token), create_association_(association) { ++state_.handlers_created; }
+    Datagram(FixtureState& state, unsigned token, bool association,
+             acpp::UserOnlineTracker& tracker, acpp::ConnectionLimiter* limiter)
+        : state_(state), token_(token), create_association_(association),
+          tracker_(tracker), limiter_(limiter) { ++state_.handlers_created; }
     ~Datagram() override {
         state_.wrong_destructor_thread |= std::this_thread::get_id() != state_.owner;
         ++state_.handlers_destroyed;
@@ -103,6 +108,9 @@ public:
         if (!create_association_ || request.payload.empty())
             return tl::unexpected(acpp::ErrorCode::PROTOCOL_AUTH_FAILED);
         acpp::InboundDatagramResult decoded;
+        decoded.user = &profile_;
+        decoded.tracker = &tracker_;
+        decoded.limiter = limiter_;
         const std::array<uint8_t, 1> owner{1};
         if (!decoded.session_owner.Assign(owner)) throw std::bad_alloc();
         decoded.session_id = request.payload.front();
@@ -123,6 +131,9 @@ private:
     FixtureState& state_;
     unsigned token_;
     bool create_association_;
+    acpp::UserOnlineTracker& tracker_;
+    acpp::ConnectionLimiter* limiter_;
+    acpp::UserProfile profile_;
 };
 
 thread_local FixtureState* g_state = nullptr;
@@ -137,18 +148,20 @@ const TokenSettings& Settings(const acpp::proxyman::inbound::BuildRequest& reque
     return *settings;
 }
 std::unique_ptr<acpp::Inbound> MakeTcp(
-    acpp::proxyman::inbound::ProtocolRuntime&, acpp::StatsShard&,
-    acpp::ConnectionLimiter*,
+    acpp::proxyman::inbound::ProtocolRuntime& runtime, acpp::StatsShard&,
+    acpp::ConnectionLimiter* limiter,
     const acpp::proxyman::inbound::BuildRequest& request) {
     const auto& settings = Settings(request);
-    return std::make_unique<Datagram>(*g_state, settings.token, settings.create_association);
+    return std::make_unique<Datagram>(*g_state, settings.token, settings.create_association,
+                                      static_cast<Runtime&>(runtime).tracker, limiter);
 }
 std::unique_ptr<acpp::Inbound> MakeUdp(
-    acpp::proxyman::inbound::ProtocolRuntime&, acpp::StatsShard&,
-    acpp::ConnectionLimiter*,
+    acpp::proxyman::inbound::ProtocolRuntime& runtime, acpp::StatsShard&,
+    acpp::ConnectionLimiter* limiter,
     const acpp::proxyman::inbound::BuildRequest& request) {
     const auto& settings = Settings(request);
-    return std::make_unique<Datagram>(*g_state, settings.token, settings.create_association);
+    return std::make_unique<Datagram>(*g_state, settings.token, settings.create_association,
+                                      static_cast<Runtime&>(runtime).tracker, limiter);
 }
 
 void RegisterFixtureProtocol() {

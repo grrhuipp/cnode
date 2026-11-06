@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <string>
 #include <string_view>
 
 namespace {
@@ -187,6 +188,47 @@ void TestXv2BoardTypesAreCompatible() {
     Check(any && any->PaddingScheme == "stop=2\n1=64-65", "AnyTLS padding mismatch");
 }
 
+// The panel maps onto the same validators as local configuration.
+void TestSharedFieldContract() {
+    constexpr std::string_view kKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const auto reality = [&](std::string_view settings) {
+        const auto body = std::string(R"({"server_port":443,"tls":2,"tls_settings":{"private_key":")") +
+            std::string(kKey) + "\"," + std::string(settings) + "}}";
+        const auto parsed = acpp::json::parse(body);
+        return ParseNodeInfo(parsed.as_object(), "vless");
+    };
+    const auto no_sni = reality(R"("server_names":["","www.apple.com"])");
+    Check(no_sni && no_sni->Reality.server_names.size() == 2 &&
+              no_sni->Reality.server_names[0].empty(),
+          "REALITY empty serverNames entry must permit missing SNI");
+    Check(no_sni && no_sni->Reality.short_ids.size() == 1 &&
+              no_sni->Reality.short_ids[0] == acpp::transport::internet::RealityShortId{},
+          "missing panel short id must map to the empty short id");
+    Check(!reality(R"("server_names":["www.apple.com"],"short_ids":[])"),
+          "an empty short id list must be rejected");
+    const auto port_dest = reality(R"("server_name":"www.apple.com","server_port":8443)");
+    Check(port_dest && port_dest->Reality.dest_host == "www.apple.com" &&
+              port_dest->Reality.dest_port == 8443,
+          "server_port must map to dest on the first server name");
+
+    const auto grpc = ParseResponse(
+        R"({"server_port":443,"network":"grpc","networkSettings":{"path":"/gun"}})");
+    Check(grpc && grpc->ServiceName == "/gun" && grpc->Path.empty(),
+          "gRPC path must map to serviceName");
+    const auto ws = ParseResponse(R"({"server_port":443,"network":"ws"})");
+    Check(ws && ws->Path == "/", "transport path must default to /");
+    CheckInvalid(R"({"server_port":443,"server_name":"bad host"})");
+
+    const auto padding = [](std::string_view value) {
+        const auto parsed = acpp::json::parse(
+            std::string(R"({"server_port":443,"padding_scheme":)") + std::string(value) + "}");
+        return ParseNodeInfo(parsed.as_object(), "anytls");
+    };
+    Check(!padding(R"("stop=2\n1=65536-65536")"), "invalid padding must be rejected at parse");
+    const auto unset = padding("null");
+    Check(unset && unset->PaddingScheme.empty(), "null padding must stay unset");
+}
+
 }  // namespace
 
 int main() {
@@ -196,6 +238,7 @@ int main() {
     TestRealityNodeResponseIsNormalized();
     TestOptionalCipherNullValues();
     TestXv2BoardTypesAreCompatible();
+    TestSharedFieldContract();
     std::cout << "v2board_node_info_json_test: ok\n";
     return 0;
 }

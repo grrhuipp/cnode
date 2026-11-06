@@ -69,10 +69,10 @@ int main() {
     changed.NodeType = "shadowsocks";
     if (!acpp::controller::NodeConfigChanged(current, changed)) return 8;
     changed = current;
-    changed.SniffEnabled = !current.SniffEnabled;
+    changed.Sniffing.enabled = !current.Sniffing.enabled;
     if (!acpp::controller::NodeConfigChanged(current, changed)) return 9;
     changed = current;
-    changed.DestOverride = {"http"};
+    changed.Sniffing.dest_override = acpp::SniffConfig::kHttp;
     if (!acpp::controller::NodeConfigChanged(current, changed)) return 10;
 
     changed = current;

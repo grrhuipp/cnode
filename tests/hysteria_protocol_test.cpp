@@ -6,13 +6,13 @@
 #include <string_view>
 #include <vector>
 
-using acpp::proxy::hysteria::EncodeUdpMessage;
-using acpp::proxy::hysteria::ParseUdpMessage;
-using acpp::proxy::hysteria::ParseV1ClientHello;
-using acpp::proxy::hysteria::ParseV1Request;
-using acpp::proxy::hysteria::ParseV2TcpRequest;
-using acpp::proxy::hysteria::UdpMessage;
-using acpp::proxy::hysteria::Version;
+using acpp::transport::internet::hysteria::EncodeUdpMessage;
+using acpp::transport::internet::hysteria::ParseUdpMessage;
+using acpp::transport::internet::hysteria::ParseV1ClientHello;
+using acpp::transport::internet::hysteria::ParseV1Request;
+using acpp::transport::internet::hysteria::ParseV2TcpRequest;
+using acpp::transport::internet::hysteria::UdpMessage;
+using acpp::transport::internet::hysteria::Version;
 
 namespace {
 

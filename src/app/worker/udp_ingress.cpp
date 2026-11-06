@@ -1,5 +1,6 @@
 #include "udp_ingress.hpp"
 #include "udp_association_reclaimer.hpp"
+#include "../../proxy/inbound_admission.hpp"
 
 #include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
 #include "acppnode/common/initial_payload.hpp"
@@ -113,6 +114,71 @@ template <class Function>
     return ScopeExit<Function>(std::move(function));
 }
 
+// Ownership of every admission an association holds until it ends.
+struct NativeAssociationAdmission {
+    ConnectionLimiter::Reservation connection;
+    ConnectionLimiter::Reservation ip;
+    UserOnlineSessionGuard user_session;
+};
+
+void RejectNativeAssociation(const session::Context& ctx, StatsShard& stats,
+                             std::string_view reason) {
+    LOG_CONN_DEBUG(ctx, "UDP association rejected from {}:{} > {}",
+                   ctx.inbound.source_ip, ctx.inbound.source_port, reason);
+    LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, reason));
+    stats.OnError();
+}
+
+// The unified admission contract for one native association, in TCP order:
+// global and per-IP connection reservations, then session-level devices.
+net::awaitable<std::optional<NativeAssociationAdmission>> AdmitNativeAssociation(
+    session::Context& ctx,
+    const UserProfile& profile,
+    UserOnlineTracker* tracker,
+    ConnectionLimiter* limiter,
+    StatsShard& stats) {
+    NativeAssociationAdmission admitted;
+    if (limiter) {
+        const bool check_ban = ctx.inbound.HasProxyProtocolClientIP();
+        auto physical = co_await limiter->ReservePhysical(
+            ctx.inbound.tag, ctx.inbound.source_ip, check_ban);
+        if (physical.reason != ConnectionLimiter::RejectReason::NONE) {
+            RejectNativeAssociation(
+                ctx, stats, ConnectionLimiter::RejectReasonToString(physical.reason));
+            co_return std::nullopt;
+        }
+        admitted.connection = std::move(physical.reservation);
+        auto ip = co_await limiter->ReserveIP(
+            ctx.inbound.tag, ctx.inbound.source_ip, check_ban);
+        if (ip.reason != ConnectionLimiter::RejectReason::NONE) {
+            RejectNativeAssociation(
+                ctx, stats, ConnectionLimiter::RejectReasonToString(ip.reason));
+            co_return std::nullopt;
+        }
+        admitted.ip = std::move(ip.reservation);
+    }
+    if (!tracker) {
+        RejectNativeAssociation(ctx, stats, "missing user admission");
+        co_return std::nullopt;
+    }
+    // Native associations run outside an execution domain; the limiter's
+    // coordinator owns the device quota. Without a limiter only the domain
+    // entry remains, which rejects registered users by throwing.
+    std::optional<UserOnlineSessionGuard> user_session;
+    if (limiter) {
+        user_session = co_await proxy::AdmitAuthenticatedInbound(
+            *tracker, limiter->Coordinator(), ctx, profile);
+    } else {
+        user_session = co_await proxy::AdmitAuthenticatedInbound(*tracker, ctx, profile);
+    }
+    if (!user_session) {
+        stats.OnError();
+        co_return std::nullopt;
+    }
+    admitted.user_session = std::move(*user_session);
+    co_return std::move(admitted);
+}
+
 }  // namespace
 
 bool UdpIngress::ReplyRoute::Send(UDPPacketView packet, const udp::endpoint& endpoint) {
@@ -132,6 +198,11 @@ struct UdpIngress::ClientSession::Impl : memory::ThreadAllocated {
         StatsShard* stats = nullptr;
         TimeoutsConfig timeouts;
         uint32_t worker_id = 0;
+        // Owned copy of the authenticating credential's profile.
+        UserProfile profile;
+        // Admission handles copied from the authenticating datagram.
+        UserOnlineTracker* tracker = nullptr;
+        ConnectionLimiter* limiter = nullptr;
     };
 
     Impl(net::io_context& io_context,
@@ -574,10 +645,26 @@ void UdpIngress::RetireNativeJob(ClientSession& session) noexcept {
     }
 }
 
+// One run per association. Admission happens before the first Dispatch;
+// packets arriving meanwhile wait in the bounded association queue, and a
+// rejection closes the association, dropping them. The frame owns the
+// connection reservations and the online-device guard until it ends.
 net::awaitable<void> UdpIngress::RunNativeDispatch(ClientSessionPtr client_session) {
     auto& job = *client_session->impl_;
     auto& request = *job.request;
+    request.stats->OnConnectionAccepted();
+    auto connection_stats = MakeScopeExit([stats = request.stats]() noexcept {
+        stats->OnConnectionClosed();
+    });
+    std::optional<NativeAssociationAdmission> admission;
     try {
+        admission = co_await AdmitNativeAssociation(
+            request.context, request.profile, request.tracker, request.limiter,
+            *request.stats);
+        if (!admission || client_session->Closed()) {
+            client_session->Close();
+            co_return;
+        }
         RelayResult result = co_await request.dispatcher->Dispatch(
             *request.io_context, request.policy, nullptr,
             transport::Link{client_session.get(), client_session.get()},
@@ -629,6 +716,8 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
     });
     if (!decoded) {
         if (decoded.error() == ErrorCode::PROTOCOL_AUTH_FAILED) {
+            // Datagram sources are socket peers, never PROXY protocol clients,
+            // so a credential failure is logged without feeding the ban table.
             session::Context rejected;
             rejected.worker_id = datagram.worker_id;
             rejected.inbound.tag = impl_->tag;
@@ -636,11 +725,8 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
             rejected.inbound.source_ip = iputil::AddressText(normalized_client_addr).View();
             rejected.inbound.source_port = datagram.client_endpoint.port();
             rejected.content.network = Network::UDP;
-            LOG_WARN("UDP datagram rejected worker={} inbound={} source={}:{} > datagram authentication or validation failed",
-                     datagram.worker_id, impl_->tag,
-                     rejected.inbound.source_ip, rejected.inbound.source_port);
-            LOG_ACCESS(FormatAccessLog(rejected, AccessStatus::Rejected,
-                                      "datagram authentication or validation failed"));
+            ::acpp::proxy::LogInboundAuthFailure(
+                rejected, "datagram authentication or validation failed");
         }
         return;
     }
@@ -685,6 +771,13 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
     });
 
     if (need_new_session) {
+        if (!decoded->user) {
+            LOG_NET_DEBUG(
+                "UDP datagram rejected worker={} client={} > missing authenticated user",
+                datagram.worker_id,
+                client_key_log());
+            return;
+        }
         auto response = impl_->proxy->CreateDatagramResponse(*decoded);
         if (!response || !*response) {
             LOG_NET_DEBUG("UDP response preparation failed worker={} client={}",
@@ -743,12 +836,12 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
         ctx.inbound.source_addr = normalized_client_addr;
         ctx.inbound.source_port = datagram.client_endpoint.port();
         ctx.inbound.local_endpoint = local_endpoint;
-        ctx.content.network = Network::UDP;
-        ctx.outbound.original_target = decoded->target;
-        ctx.outbound.target = decoded->target;
-        ctx.inbound.user_id = decoded->user_id;
-        ctx.inbound.user_email.assign(decoded->user_email);
-        ctx.content.speed_limit = decoded->speed_limit;
+        request.profile = *decoded->user;
+        request.tracker = decoded->tracker;
+        request.limiter = decoded->limiter;
+        ::acpp::proxy::BindAuthenticatedInbound(
+            ctx, request.profile,
+            ::acpp::proxy::InboundRequestTarget{Network::UDP, decoded->target});
         request.dispatcher = &datagram.dispatcher;
         request.io_context = &datagram.io_context;
         request.stats = &datagram.stats;

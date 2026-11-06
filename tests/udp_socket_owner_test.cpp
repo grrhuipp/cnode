@@ -2,6 +2,7 @@
 #include "worker/udp_association_reclaimer.hpp"
 #include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
 #include "acppnode/app/stats.hpp"
+#include "acppnode/common/sharded_user_stats.hpp"
 #include "acppnode/features/routing/dispatcher.hpp"
 #include "acppnode/infra/config_types.hpp"
 #include "acppnode/transport/async_stream.hpp"
@@ -71,6 +72,8 @@ public:
         const acpp::InboundDatagramRequest& request) override {
         if (!script_) return tl::unexpected(acpp::ErrorCode::PROTOCOL_AUTH_FAILED);
         acpp::InboundDatagramResult result;
+        result.user = &profile_;
+        result.tracker = &tracker_;
         result.session_owner = script_->owner;
         result.session_id = script_->session_id;
         result.target = script_->target;
@@ -89,6 +92,8 @@ private:
     std::shared_ptr<int> adopted_state_;
     DatagramScript* script_ = nullptr;
     int worker_state_ = 73;
+    acpp::UserOnlineTracker tracker_;
+    acpp::UserProfile profile_;
 };
 
 class CountingThreadResource final : public std::pmr::memory_resource {

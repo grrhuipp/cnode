@@ -1,0 +1,244 @@
+#include "../inbound_admission.hpp"
+#include "../../transport/internet/hysteria/hysteria_protocol.hpp"
+#include "../../transport/internet/hysteria/hysteria_settings.hpp"
+#include "../../transport/internet/hysteria/quic_stream.hpp"
+
+#include "acppnode/app/proxyman/inbound/factory.hpp"
+#include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
+#include "acppnode/app/stats.hpp"
+#include "acppnode/common/buf/multi_buffer.hpp"
+#include "acppnode/common/initial_payload.hpp"
+#include "acppnode/common/session.hpp"
+#include "acppnode/core/constants.hpp"
+#include "acppnode/features/routing/dispatcher.hpp"
+#include "acppnode/infra/config_types.hpp"
+#include "acppnode/infra/log.hpp"
+#include "acppnode/proxy/inbound.hpp"
+#include "acppnode/transport/async_stream.hpp"
+#include "acppnode/transport/link.hpp"
+
+#include <tl/expected.hpp>
+
+#include <algorithm>
+#include <memory>
+#include <span>
+#include <utility>
+
+namespace acpp::proxy::hysteria {
+namespace {
+
+namespace wire = ::acpp::transport::internet::hysteria;
+
+constexpr size_t kMaxRequestHeaderBytes = 8192;
+
+struct TcpRequest {
+    TargetAddress target;
+    // Request-stream bytes that followed the header in the same read.
+    buf::MultiBuffer early_data;
+};
+
+[[nodiscard]] tl::expected<TargetAddress, wire::ProtocolError>
+ParseTcpRequest(wire::Version version, std::span<const uint8_t> header,
+                size_t& header_bytes) {
+    if (version == wire::Version::V1) {
+        auto request = wire::ParseV1Request(header);
+        if (!request) return tl::unexpected(request.error());
+        if (request->udp) return tl::unexpected(wire::ProtocolError::Invalid);
+        header_bytes = request->header_bytes;
+        return std::move(request->target);
+    }
+    auto request = wire::ParseV2TcpRequest(header);
+    if (!request) return tl::unexpected(request.error());
+    header_bytes = request->header_bytes;
+    return std::move(request->target);
+}
+
+net::awaitable<tl::expected<TcpRequest, ErrorCode>>
+ReadTcpRequest(AsyncStream& stream, wire::Version version, session::Context& ctx) {
+    buf::MultiBuffer received;
+    for (;;) {
+        buf::MultiBuffer chunk;
+        try {
+            chunk = co_await stream.ReadMultiBuffer();
+        } catch (const IoSystemError& error) {
+            co_return tl::unexpected(ClassifyHandshakeReadException(stream, error));
+        }
+        if (chunk.byte_size() == 0) {
+            co_return tl::unexpected(ResolveHandshakeReadFailure(
+                stream, ErrorCode::PROTOCOL_DECODE_FAILED));
+        }
+        chunk.MoveTo(received);
+
+        size_t header_bytes = 0;
+        tl::expected<TargetAddress, wire::ProtocolError> target =
+            tl::unexpected(wire::ProtocolError::Incomplete);
+        {
+            memory::ThreadLocalVector<uint8_t> header(
+                std::min(received.byte_size(), kMaxRequestHeaderBytes));
+            (void)received.CopyPrefixTo(header);
+            target = ParseTcpRequest(version, header, header_bytes);
+        }
+        if (target) {
+            (void)received.DropPrefixBytes(header_bytes);
+            co_return TcpRequest{std::move(*target), std::move(received)};
+        }
+        if (target.error() == wire::ProtocolError::Incomplete &&
+            received.byte_size() < kMaxRequestHeaderBytes) {
+            continue;
+        }
+        const std::string_view reason = target.error() == wire::ProtocolError::Incomplete
+            ? "request header too large" : "invalid request header";
+        LOG_CONN_WARN(ctx, "request rejected from {}:{} > {}",
+                      ctx.inbound.source_ip, ctx.inbound.source_port, reason);
+        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, reason));
+        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+    }
+}
+
+// proxy/hysteria server: the transport has authenticated the connection and
+// bound its identity; each logical stream is either a UDP session or a TCP
+// request whose target this handler reads before dispatch.
+class HysteriaInbound final : public ::acpp::Inbound {
+public:
+    HysteriaInbound(StatsShard& stats, wire::Version version) noexcept
+        : stats_(stats), version_(version) {}
+
+    net::awaitable<RelayResult> Process(
+        std::unique_ptr<AsyncStream> stream,
+        routing::Dispatcher& dispatcher,
+        const proxyman::inbound::ReceiverSettings& receiver,
+        net::io_context& io_context,
+        session::Context& ctx,
+        const TimeoutsConfig& timeouts,
+        uint32_t /*pressure_idle_timeout*/) override {
+        if (auto* session = dynamic_cast<wire::UdpSessionStream*>(stream.get())) {
+            BindInboundRequestTarget(
+                ctx, InboundRequestTarget{Network::UDP, session->FirstTarget()});
+            co_return co_await dispatcher.Dispatch(
+                io_context, receiver.dispatch_policy, std::move(stream),
+                transport::Link{session, session}, InitialPayload{},
+                ctx, stats_, timeouts);
+        }
+
+        auto request = co_await ReadTcpRequest(*stream, version_, ctx);
+        if (!request) {
+            co_return RejectInbound(stats_, stream.get(), request.error());
+        }
+        const auto response = version_ == wire::Version::V1
+            ? wire::EncodeV1Response(true, 0, "")
+            : wire::EncodeV2TcpResponse(true, "");
+        co_await stream->AsyncWrite(net::buffer(response));
+        BindInboundRequestTarget(
+            ctx, InboundRequestTarget{Network::TCP, std::move(request->target)});
+        stream->ClearPhaseDeadline();
+
+        auto* tcp_stream = stream.get();
+        co_return co_await dispatcher.Dispatch(
+            io_context, receiver.dispatch_policy, std::move(stream),
+            transport::Link{tcp_stream, tcp_stream},
+            InitialPayload(std::move(request->early_data)),
+            ctx, stats_, timeouts);
+    }
+
+private:
+    StatsShard& stats_;
+    wire::Version version_;
+};
+
+constexpr uint64_t kBytesPerSecondPerMbps = 125000;
+
+[[nodiscard]] uint64_t MbpsToBytesPerSecond(uint32_t mbps) noexcept {
+    return static_cast<uint64_t>(mbps) * kBytesPerSecondPerMbps;
+}
+
+std::optional<std::shared_ptr<const proxyman::inbound::ProtocolSettings>>
+PrepareSettings(wire::Version version, const StaticUserConfig& config) {
+    auto settings = std::make_shared<wire::Settings>();
+    settings->version = version;
+    settings->upload_bytes_per_second =
+        MbpsToBytesPerSecond(config.hysteria_up_mbps);
+    settings->download_bytes_per_second =
+        MbpsToBytesPerSecond(config.hysteria_down_mbps);
+    return settings;
+}
+
+std::unique_ptr<::acpp::Inbound> CreateInbound(
+    proxyman::inbound::ProtocolRuntime&,
+    StatsShard& stats,
+    ConnectionLimiter*,
+    const proxyman::inbound::BuildRequest& request) {
+    const auto* settings = wire::GetSettings(request);
+    if (!settings) return nullptr;
+    return std::make_unique<HysteriaInbound>(stats, settings->version);
+}
+
+std::optional<proxyman::inbound::UserSet> BuildStaticUsers(
+    std::string_view tag,
+    const StaticUserConfig& config) {
+    std::vector<proxyman::inbound::PreparedHysteriaUser> users;
+    users.reserve(config.clients.size());
+    for (const auto& client : config.clients) {
+        const auto& credential = client.password.empty() ? client.id : client.password;
+        if (credential.empty()) {
+            LOG_WARN("Hysteria inbound '{}': static user credential is empty", tag);
+            return std::nullopt;
+        }
+        proxyman::inbound::PreparedHysteriaUser user;
+        user.credential_hash = wire::HashCredential(credential);
+        user.profile.email = client.email.empty() ? std::string(tag) : client.email;
+        users.push_back(std::move(user));
+    }
+    return proxyman::inbound::UserSet{std::move(users)};
+}
+
+std::optional<proxyman::inbound::UserSet> BuildRuntimeUsers(
+    const proxyman::inbound::BuildRequest&,
+    std::span<const proxyman::inbound::RuntimeUser> runtime_users) {
+    std::vector<proxyman::inbound::PreparedHysteriaUser> users;
+    users.reserve(runtime_users.size());
+    for (const auto& runtime_user : runtime_users) {
+        if (runtime_user.credential.empty()) return std::nullopt;
+        proxyman::inbound::PreparedHysteriaUser user;
+        user.credential_hash = wire::HashCredential(runtime_user.credential);
+        user.profile.email = runtime_user.email;
+        user.profile.user_id = runtime_user.user_id;
+        user.profile.speed_limit = runtime_user.speed_limit;
+        user.profile.device_limit = runtime_user.device_limit;
+        users.push_back(std::move(user));
+    }
+    return proxyman::inbound::UserSet{std::move(users)};
+}
+
+proxyman::inbound::ProxyRegistration Registration() {
+    proxyman::inbound::ProxyRegistration registration;
+    registration.user_protocol = proxyman::inbound::UserProtocol::Hysteria;
+    registration.datagram_transport = proxyman::inbound::DatagramTransport::Quic;
+    registration.create_runtime = []() -> std::unique_ptr<
+        proxyman::inbound::ProtocolRuntime> {
+        return std::make_unique<UserOnlineProtocolRuntime>();
+    };
+    registration.create_tcp_handler = &CreateInbound;
+    registration.build_static_users = &BuildStaticUsers;
+    registration.build_users = &BuildRuntimeUsers;
+    return registration;
+}
+
+const bool kHysteriaRegistered = [] {
+    auto v1 = Registration();
+    v1.prepare_settings = [](std::string_view, const StaticUserConfig& config)
+        -> std::optional<std::shared_ptr<const proxyman::inbound::ProtocolSettings>> {
+        return PrepareSettings(wire::Version::V1, config);
+    };
+    proxyman::inbound::RegisterProxy(constants::protocol::kHysteria, std::move(v1));
+
+    auto v2 = Registration();
+    v2.prepare_settings = [](std::string_view, const StaticUserConfig& config)
+        -> std::optional<std::shared_ptr<const proxyman::inbound::ProtocolSettings>> {
+        return PrepareSettings(wire::Version::V2, config);
+    };
+    proxyman::inbound::RegisterProxy(constants::protocol::kHysteria2, std::move(v2));
+    return true;
+}();
+
+}  // namespace
+}  // namespace acpp::proxy::hysteria

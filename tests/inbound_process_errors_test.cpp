@@ -317,7 +317,7 @@ TransportSecurity::~TransportSecurity() = default;
 net::awaitable<TransportBuildResult> BuildInboundTransport(net::io_context&,
     std::unique_ptr<AsyncStream> raw, const StreamSettings&, SslContext*, uint64_t,
     std::shared_ptr<InboundTransportStreamHandler> streams, InboundTransportMetadata*,
-    app::dns::DNS*) {
+    const InboundFallbackContext*) {
     if (streams) {
         streams->OnInboundTransportReady(*raw);
         if (quota_case) {

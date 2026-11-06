@@ -8,7 +8,7 @@
 #include <charconv>
 #include <limits>
 
-namespace acpp::proxy::hysteria {
+namespace acpp::transport::internet::hysteria {
 namespace {
 
 class Cursor final {
@@ -371,4 +371,4 @@ std::array<uint8_t, 32> HashCredential(std::string_view credential) noexcept {
     return digest;
 }
 
-}  // namespace acpp::proxy::hysteria
+}  // namespace acpp::transport::internet::hysteria

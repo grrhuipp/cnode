@@ -5,6 +5,8 @@
 
 #include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
 #include "acppnode/app/stats.hpp"
+#include "acppnode/common/sharded_user_stats.hpp"
+#include "acppnode/common/user_profile.hpp"
 #include "acppnode/common/session.hpp"
 #include "acppnode/features/routing/dispatcher.hpp"
 #include "acppnode/infra/config_types.hpp"
@@ -84,6 +86,8 @@ public:
     tl::expected<acpp::InboundDatagramResult, acpp::ErrorCode> Process(
         const acpp::InboundDatagramRequest& request) override {
         acpp::InboundDatagramResult result;
+        result.user = &profile_;
+        result.tracker = &tracker_;
         constexpr std::array<uint8_t, 1> owner{0x47};
         if (!result.session_owner.Assign(owner))
             return tl::unexpected(acpp::ErrorCode::RESOURCE_EXHAUSTED);
@@ -109,6 +113,8 @@ public:
 private:
     LongMetadataFaultResource* fault_ = nullptr;
     bool fault_injected_ = false;
+    acpp::UserOnlineTracker tracker_;
+    acpp::UserProfile profile_;
 };
 
 class GateDispatcher final : public acpp::routing::Dispatcher {

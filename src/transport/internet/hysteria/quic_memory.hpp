@@ -6,7 +6,7 @@
 #include <nghttp3/nghttp3.h>
 #include <ngtcp2/ngtcp2.h>
 
-namespace acpp::proxy::hysteria {
+namespace acpp::transport::internet::hysteria {
 
 // ngtcp2/nghttp3 do not provide allocation sizes to free(). Prefix each block
 // with its exact PMR layout so the connection's lightweight AllocationDomain
@@ -29,4 +29,4 @@ private:
     nghttp3_mem nghttp3_;
 };
 
-}  // namespace acpp::proxy::hysteria
+}  // namespace acpp::transport::internet::hysteria

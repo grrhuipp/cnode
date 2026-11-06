@@ -7,6 +7,8 @@
 #include "acppnode/app/worker.hpp"
 #include "acppnode/app/worker_runtime_config.hpp"
 #include "acppnode/app/worker_stats.hpp"
+#include "acppnode/common/sharded_user_stats.hpp"
+#include "acppnode/common/user_profile.hpp"
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/session.hpp"
 #include "acppnode/infra/outbound_source_config.hpp"
@@ -125,11 +127,18 @@ struct Runtime final : acpp::proxyman::inbound::ProtocolRuntime {
     std::vector<acpp::OnlineDevice> GetOnlineDevices(std::string_view) const override {
         return {};
     }
+    acpp::UserOnlineTracker tracker;
 };
 
 class NativeDecoder final : public acpp::Inbound {
 public:
-    explicit NativeDecoder(FixtureState& state) : state_(state) { ++state_.handlers_created; }
+    NativeDecoder(FixtureState& state, acpp::UserOnlineTracker& tracker,
+                  acpp::ConnectionLimiter* limiter)
+        : state_(state), tracker_(tracker), limiter_(limiter) {
+        ++state_.handlers_created;
+        profile_.user_id = 71;
+        profile_.email = "udp-owner@example.test";
+    }
     ~NativeDecoder() override {
         if (std::this_thread::get_id() != state_.owner)
             state_.wrong_destructor_thread = true;
@@ -152,8 +161,9 @@ public:
         decoded.session_id = 0x444e532d73657373;
         const std::array<uint8_t, 8> owner{0x44, 0x4e, 0x53, 0x2d, 0x6f, 0x77, 0x6e, 0x72};
         if (!decoded.session_owner.Assign(owner)) throw std::bad_alloc();
-        decoded.user_id = 71;
-        decoded.user_email = "udp-owner@example.test";
+        decoded.user = &profile_;
+        decoded.tracker = &tracker_;
+        decoded.limiter = limiter_;
         auto* first = acpp::buf::Buffer::New();
         if (!first) throw std::bad_alloc();
         first->data[0] = 0x51;
@@ -168,6 +178,9 @@ public:
     }
 private:
     FixtureState& state_;
+    acpp::UserOnlineTracker& tracker_;
+    acpp::ConnectionLimiter* limiter_;
+    acpp::UserProfile profile_;
 };
 
 thread_local FixtureState* g_state = nullptr;
@@ -175,11 +188,12 @@ std::unique_ptr<acpp::proxyman::inbound::ProtocolRuntime> MakeRuntime() {
     return std::make_unique<Runtime>();
 }
 std::unique_ptr<acpp::Inbound> MakeHandler(
-    acpp::proxyman::inbound::ProtocolRuntime&, acpp::StatsShard&,
-    acpp::ConnectionLimiter*,
+    acpp::proxyman::inbound::ProtocolRuntime& runtime, acpp::StatsShard&,
+    acpp::ConnectionLimiter* limiter,
     const acpp::proxyman::inbound::BuildRequest&) {
     if (!g_state) throw std::logic_error("fixture state not installed on Worker thread");
-    return std::make_unique<NativeDecoder>(*g_state);
+    return std::make_unique<NativeDecoder>(
+        *g_state, static_cast<Runtime&>(runtime).tracker, limiter);
 }
 void RegisterProtocol() {
     static const bool registered = [] {

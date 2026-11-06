@@ -717,7 +717,7 @@ expect_rejected(out_of_range_reality_proxy_protocol "{}" "inbounds.json"
     "between 0 and 2")
 expect_rejected(non_integer_reality_proxy_protocol "{}" "inbounds.json"
     [=[[{"tag":"bad-reality-xver","protocol":"vless","listen":"127.0.0.1","port":12100,"settings":{"decryption":"none","clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","flow":"xtls-rprx-vision"}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"xver":"1","serverNames":["example.com"],"privateKey":"unused-before-handshake","shortIds":["0123456789abcdef"]}}}]]=]
-    "must be an integer between 0 and 2")
+    "xver must be an integer")
 expect_started(valid_zero_reality_proxy_protocol
     [=[{"workers":1}]=] "inbounds.json"
     [=[[{"tag":"valid-reality-xver-zero","protocol":"vless","listen":"127.0.0.1","port":12101,"settings":{"decryption":"none","clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","flow":"xtls-rprx-vision"}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"xver":0,"serverNames":["example.com"],"privateKey":"unused-before-handshake","shortIds":["0123456789abcdef"]}}}]]=])
@@ -817,19 +817,19 @@ set(AUTH_PADDING_TLS "\"streamSettings\":{\"network\":\"tcp\",\"security\":\"tls
 expect_rejected(invalid_anytls_auth_range_text
     [=[{"workers":1,"log":{"enable":false}}]=] "inbounds.json"
     "[{\"tag\":\"auth-padding\",\"protocol\":\"anytls\",\"listen\":\"127.0.0.1\",\"port\":12006,\"settings\":{\"password\":\"fixture\",\"paddingScheme\":\"stop=2\\n0=65534-65537\\n1=64-65\"},${AUTH_PADDING_TLS}}]"
-    "static inbound 'auth-padding' has invalid protocol settings")
+    "paddingScheme is invalid")
 expect_rejected(invalid_anytls_auth_segments_array
     [=[{"workers":1,"log":{"enable":false}}]=] "inbounds.json"
     "[{\"tag\":\"auth-padding\",\"protocol\":\"anytls\",\"listen\":\"127.0.0.1\",\"port\":12006,\"settings\":{\"password\":\"fixture\",\"paddingScheme\":[\"stop=2\",\"0=c,45-45\",\"1=64-65\"]},${AUTH_PADDING_TLS}}]"
-    "static inbound 'auth-padding' has invalid protocol settings")
+    "paddingScheme is invalid")
 expect_rejected(invalid_anytls_frame_size_text
     [=[{"workers":1,"log":{"enable":false}}]=] "inbounds.json"
     "[{\"tag\":\"frame-padding\",\"protocol\":\"anytls\",\"listen\":\"127.0.0.1\",\"port\":12006,\"settings\":{\"password\":\"fixture\",\"paddingScheme\":\"stop=2\\n1=65536-65536\"},${AUTH_PADDING_TLS}}]"
-    "static inbound 'frame-padding' has invalid protocol settings")
+    "paddingScheme is invalid")
 expect_rejected(invalid_anytls_frame_range_array
     [=[{"workers":1,"log":{"enable":false}}]=] "inbounds.json"
     "[{\"tag\":\"frame-padding\",\"protocol\":\"anytls\",\"listen\":\"127.0.0.1\",\"port\":12006,\"settings\":{\"password\":\"fixture\",\"paddingScheme\":[\"stop=2\",\"1=65534-65537\"]},${AUTH_PADDING_TLS}}]"
-    "static inbound 'frame-padding' has invalid protocol settings")
+    "paddingScheme is invalid")
 expect_rejected(unsupported_inbound "{}" "inbounds.json"
     [=[[{"tag":"bad","protocol":"does-not-exist","port":12001,"settings":{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}]}}]]=])
 expect_rejected(invalid_ss_inbound "{}" "inbounds.json"

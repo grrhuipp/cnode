@@ -43,6 +43,15 @@ struct InboundRequestTarget {
     TargetAddress target;
 };
 
+// The single writer of a request target into the session.
+inline void BindInboundRequestTarget(
+    session::Context& ctx,
+    InboundRequestTarget request) {
+    ctx.content.network = request.network;
+    ctx.outbound.original_target = request.target;
+    ctx.outbound.target = std::move(request.target);
+}
+
 // The single writer of an authenticated identity and its request target into
 // the session. Protocols call it as soon as the credential matches, so their
 // own later protocol rejections (flow, replay, transport) log the user and
@@ -54,23 +63,18 @@ inline void BindAuthenticatedInbound(
     ctx.inbound.user_id = profile.user_id;
     ctx.inbound.user_email = profile.email;
     ctx.content.speed_limit = profile.speed_limit;
-    if (request) {
-        ctx.content.network = request->network;
-        ctx.outbound.original_target = request->target;
-        ctx.outbound.target = std::move(request->target);
-    }
+    if (request) BindInboundRequestTarget(ctx, std::move(*request));
 }
 
-// The single session-level online-device admission for every inbound
-// protocol, after BindAuthenticatedInbound. The returned guard owns the
-// device reservation for the whole authenticated session; substreams inherit.
+namespace detail {
+
 [[nodiscard]] inline net::awaitable<std::optional<UserOnlineSessionGuard>>
-AdmitAuthenticatedInbound(
+FinishAuthenticatedAdmission(
     UserOnlineTracker& tracker,
     session::Context& ctx,
-    const UserProfile& profile) {
-    auto user_session = co_await tracker.TryConnectSession(
-        ctx.inbound.tag, profile.user_id, ctx.inbound.source_ip, profile.device_limit);
+    const UserProfile& profile,
+    net::awaitable<std::optional<UserOnlineSessionGuard>> reservation) {
+    auto user_session = co_await std::move(reservation);
     if (!user_session) {
         LOG_CONN_DEBUG(ctx, "User {} exceeded device limit ({}/{})",
                        profile.user_id,
@@ -91,15 +95,53 @@ AdmitAuthenticatedInbound(
     co_return user_session;
 }
 
+}  // namespace detail
+
+// The single session-level online-device admission for every inbound
+// protocol, after BindAuthenticatedInbound. The returned guard owns the
+// device reservation for the whole authenticated session; substreams inherit.
+// `coordinator` owns the process-wide device quota.
+[[nodiscard]] inline net::awaitable<std::optional<UserOnlineSessionGuard>>
+AdmitAuthenticatedInbound(
+    UserOnlineTracker& tracker,
+    GroupCoordinator& coordinator,
+    session::Context& ctx,
+    const UserProfile& profile) {
+    return detail::FinishAuthenticatedAdmission(
+        tracker, ctx, profile,
+        tracker.TryConnectSession(coordinator, ctx.inbound.tag, profile.user_id,
+                                  ctx.inbound.source_ip, profile.device_limit));
+}
+
+// Sessions running inside an execution domain admit through its coordinator;
+// registered users without one are a logic error.
+[[nodiscard]] inline net::awaitable<std::optional<UserOnlineSessionGuard>>
+AdmitAuthenticatedInbound(
+    UserOnlineTracker& tracker,
+    session::Context& ctx,
+    const UserProfile& profile) {
+    return detail::FinishAuthenticatedAdmission(
+        tracker, ctx, profile,
+        tracker.TryConnectSession(ctx.inbound.tag, profile.user_id,
+                                  ctx.inbound.source_ip, profile.device_limit));
+}
+
+// The single credential-failure log shape for every protocol.
+inline void LogInboundAuthFailure(
+    const session::Context& ctx,
+    std::string_view reason) {
+    LOG_CONN_WARN(ctx, "authentication failed from {}:{} > {}",
+                  ctx.inbound.source_ip, ctx.inbound.source_port, reason);
+    LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, reason));
+}
+
 // The single credential-failure entry: one log shape and one ban counter for
 // every protocol. Only a trusted client address may feed the ban table.
 inline net::awaitable<void> RecordInboundAuthFailure(
     ConnectionLimiter* limiter,
     session::Context& ctx,
     std::string_view reason) {
-    LOG_CONN_WARN(ctx, "authentication failed from {}:{} > {}",
-                  ctx.inbound.source_ip, ctx.inbound.source_port, reason);
-    LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, reason));
+    LogInboundAuthFailure(ctx, reason);
     if (limiter && ctx.inbound.HasProxyProtocolClientIP()) {
         co_await limiter->OnAuthFailTracked(ctx.inbound.tag, ctx.inbound.source_ip);
     }

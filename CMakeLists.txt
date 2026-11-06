@@ -324,6 +324,7 @@ set(CNODE_SOURCES
     src/infra/runtime_failure.cpp
     src/infra/json.cpp
     src/infra/config.cpp
+    src/infra/inbound_field_rules.cpp
     src/infra/routing_ip_network.cpp
     src/infra/json_field.cpp
     src/infra/http2_initial_window.cpp
@@ -370,6 +371,10 @@ set(CNODE_SOURCES
     src/transport/internet/transport_stack.cpp
     src/transport/internet/transport_dialer.cpp
     src/transport/internet/outbound_target_builder.cpp
+    src/transport/internet/hysteria/hysteria_protocol.cpp
+    src/transport/internet/hysteria/quic_memory.cpp
+    src/transport/internet/hysteria/quic_stream.cpp
+    src/transport/internet/hysteria/hysteria_ingress.cpp
     src/transport/internet/proxy_protocol.cpp
 
     # App (Application layer)
@@ -462,11 +467,7 @@ set(CNODE_SOURCES
     src/proxy/uot/uot.cpp
 
     # Proxy - Hysteria
-    src/proxy/hysteria/hysteria_protocol.cpp
-    src/proxy/hysteria/quic_memory.cpp
-    src/proxy/hysteria/quic_stream.cpp
-    src/proxy/hysteria/hysteria_registration.cpp
-    src/proxy/hysteria/hysteria_ingress.cpp
+    src/proxy/hysteria/hysteria_inbound.cpp
 
     # Proxy - Shadowsocks
     src/proxy/shadowsocks/client.cpp
@@ -641,10 +642,10 @@ if(CNODE_BUILD_TESTS)
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wno-mismatched-new-delete>)
     add_executable(cnode_hysteria_protocol_test
         tests/hysteria_protocol_test.cpp
-        src/proxy/hysteria/hysteria_protocol.cpp)
+        src/transport/internet/hysteria/hysteria_protocol.cpp)
     target_include_directories(cnode_hysteria_protocol_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/hysteria)
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/internet/hysteria)
     target_link_libraries(cnode_hysteria_protocol_test PRIVATE asio::asio crypto)
     target_compile_options(cnode_hysteria_protocol_test PRIVATE
         -Wall -Wextra -Wpedantic)
@@ -1318,6 +1319,9 @@ if(CNODE_BUILD_TESTS)
         src/transport/internet/reality_client_version.cpp
         src/transport/internet/reality_key.cpp
         src/transport/internet/reality_short_id.cpp
+        src/infra/inbound_field_rules.cpp
+        src/transport/internet/stream_settings.cpp
+        src/proxy/anytls/padding.cpp
         src/infra/json.cpp
         src/infra/json_field.cpp
     )
@@ -1872,9 +1876,10 @@ if(CNODE_BUILD_TESTS)
         "^src/(transport/|common/(error|session)\\.cpp$|infra/(json[^/]*|http2_initial_window|log)\\.cpp$)")
     list(REMOVE_ITEM CNODE_HTTP_HANDSHAKE_TEST_SOURCES
         src/transport/internet/datagram_socket.cpp
-        src/transport/internet/transport_dialer.cpp
-        src/transport/internet/outbound_target_builder.cpp
-        src/transport/internet/outbound_bind.cpp)
+        src/transport/internet/hysteria/hysteria_protocol.cpp
+        src/transport/internet/hysteria/quic_memory.cpp
+        src/transport/internet/hysteria/quic_stream.cpp
+        src/transport/internet/hysteria/hysteria_ingress.cpp)
     list(APPEND CNODE_HTTP_HANDSHAKE_TEST_SOURCES
         src/app/dns/dns.cpp
         src/infra/runtime_failure.cpp
@@ -2005,6 +2010,7 @@ if(CNODE_BUILD_TESTS)
         tests/worker_udp_listener_oom_test.cpp
         tests/worker_udp_listener_new.cpp
         src/app/worker/udp_ingress.cpp
+        src/common/sharded_user_stats.cpp
         src/app/worker/udp_association_reclaimer.cpp
         src/transport/internet/timeout_scheduler.cpp
         src/common/session.cpp
@@ -2025,6 +2031,7 @@ if(CNODE_BUILD_TESTS)
     add_executable(cnode_udp_association_reclaimer_test
         tests/udp_association_reclaimer_test.cpp
         src/app/worker/udp_ingress.cpp
+        src/common/sharded_user_stats.cpp
         src/app/worker/udp_association_reclaimer.cpp
         src/transport/internet/timeout_scheduler.cpp
         src/common/session.cpp
@@ -2044,6 +2051,7 @@ if(CNODE_BUILD_TESTS)
         tests/udp_native_lifecycle_test.cpp
         tests/udp_native_lifecycle_allocation.cpp
         src/app/worker/udp_ingress.cpp
+        src/common/sharded_user_stats.cpp
         src/app/worker/udp_association_reclaimer.cpp
         src/transport/internet/timeout_scheduler.cpp
         src/common/session.cpp
@@ -2066,6 +2074,7 @@ if(CNODE_BUILD_TESTS)
     add_executable(cnode_udp_socket_owner_test
         tests/udp_socket_owner_test.cpp
         src/app/worker/udp_ingress.cpp
+        src/common/sharded_user_stats.cpp
         src/app/worker/udp_association_reclaimer.cpp
         src/transport/internet/timeout_scheduler.cpp
         src/common/session.cpp

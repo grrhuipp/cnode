@@ -5,8 +5,11 @@
 
 #include <cstdint>
 
-namespace acpp::proxy::hysteria {
+namespace acpp::transport::internet::hysteria {
 
+// Prepared Hysteria settings, built by the proxy registration on the cold
+// path. The QUIC transport selects ALPN/auth/framing by version and announces
+// the bandwidth; the inbound handler reads the request format by version.
 class Settings final : public proxyman::inbound::ProtocolSettings {
 public:
     Version version = Version::V2;
@@ -19,4 +22,4 @@ public:
     return dynamic_cast<const Settings*>(request.settings.get());
 }
 
-}  // namespace acpp::proxy::hysteria
+}  // namespace acpp::transport::internet::hysteria

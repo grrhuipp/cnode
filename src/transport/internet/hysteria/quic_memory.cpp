@@ -5,7 +5,7 @@
 #include <limits>
 #include <new>
 
-namespace acpp::proxy::hysteria {
+namespace acpp::transport::internet::hysteria {
 namespace {
 
 struct alignas(std::max_align_t) AllocationHeader {
@@ -79,4 +79,4 @@ void* QuicMemory::Reallocate(void* pointer, size_t size, void* user_data) {
     return replacement;
 }
 
-}  // namespace acpp::proxy::hysteria
+}  // namespace acpp::transport::internet::hysteria

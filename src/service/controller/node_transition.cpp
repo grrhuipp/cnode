@@ -19,8 +19,7 @@ bool NodeConfigChanged(const api::NodeInfo& current,
         || current.PaddingScheme != candidate.PaddingScheme
         || current.HysteriaUpMbps != candidate.HysteriaUpMbps
         || current.HysteriaDownMbps != candidate.HysteriaDownMbps
-        || current.SniffEnabled != candidate.SniffEnabled
-        || current.DestOverride != candidate.DestOverride;
+        || current.Sniffing != candidate.Sniffing;
 }
 
 NodeTransitionPlan PlanNodeTransition(const api::NodeInfo* current,

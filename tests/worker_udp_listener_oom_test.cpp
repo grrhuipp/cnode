@@ -3,6 +3,8 @@
 
 #include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
 #include "acppnode/app/stats.hpp"
+#include "acppnode/common/sharded_user_stats.hpp"
+#include "acppnode/common/user_profile.hpp"
 #include "acppnode/features/routing/dispatcher.hpp"
 #include "acppnode/infra/runtime_config_types.hpp"
 #include "acppnode/proxy/inbound.hpp"
@@ -114,6 +116,8 @@ public:
         if (request.payload.size() == 1 && request.payload[0] == 0x42) {
             acpp::InboundDatagramResult result;
             SetAuthenticatedResult(result);
+            result.user = &profile_;
+            result.tracker = &tracker_;
             auto payload = acpp::buf::BufferGuard{acpp::buf::Buffer::New()};
             if (!payload) throw std::bad_alloc();
             payload->data[0] = 0x5a;
@@ -128,6 +132,8 @@ public:
         if (request.payload.size() == 1 && request.payload[0] == 0x44) {
             acpp::InboundDatagramResult result;
             SetAuthenticatedResult(result);
+            result.user = &profile_;
+            result.tracker = &tracker_;
             acpp::memory::reject_next_pmr_allocation = true;
             return result;
         }
@@ -153,6 +159,8 @@ private:
     }
 
     TestState& state_;
+    acpp::UserOnlineTracker tracker_;
+    acpp::UserProfile profile_;
 };
 
 class TestDispatcher final : public acpp::routing::Dispatcher {

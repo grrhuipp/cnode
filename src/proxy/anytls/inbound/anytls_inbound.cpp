@@ -900,12 +900,8 @@ const bool kInboundRegistered = [] {
         [](std::string_view tag, const acpp::StaticUserConfig& config)
             -> std::optional<std::shared_ptr<
                 const acpp::proxyman::inbound::ProtocolSettings>> {
-            // The advertised raw scheme must fit in one UpdatePaddingScheme frame.
-            if (config.padding_scheme.size() > acpp::anytls::kMaxFramePayload) {
-                LOG_WARN("AnyTLS inbound '{}': padding scheme exceeds {} bytes",
-                    tag, acpp::anytls::kMaxFramePayload);
-                return std::nullopt;
-            }
+            // Text was validated (size and grammar) by infra::ParseAnyTlsPaddingScheme;
+            // this only builds the runtime scheme object.
             auto settings = std::make_shared<AnyTlsSettings>();
             if (!config.padding_scheme.empty()) {
                 auto parsed =

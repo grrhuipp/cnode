@@ -10,9 +10,14 @@
 
 namespace acpp {
 class SslContext;
+struct StatsShard;
+struct TimeoutsConfig;
 namespace app::dns {
 class DNS;
 }  // namespace app::dns
+namespace session {
+struct Context;
+}  // namespace session
 
 
 using TransportBuildResult = tl::expected<std::unique_ptr<AsyncStream>, ErrorCode>;
@@ -32,6 +37,20 @@ public:
     virtual void OnInboundTransportRequest(AsyncStream&) {}
 };
 
+// REALITY dest fallback stays in the transport layer (as in Xray) but reuses
+// the shared dial path, relay, stats and timeouts. Every member is borrowed
+// for the BuildInboundTransport call. |ctx| is the accepted connection's
+// unauthenticated session: it only carries conn id/logging and the relay byte
+// counters; it never reaches dispatch, routing or user accounting. The
+// caller's physical admission reservation must outlive the call, which then
+// covers the whole fallback relay.
+struct InboundFallbackContext {
+    session::Context& ctx;
+    StatsShard& stats;
+    const TimeoutsConfig& timeouts;
+    app::dns::DNS* dns_service = nullptr;
+};
+
 
 // Detect and consume a PROXY v1/v2 prefix, preserving ordinary application
 // bytes. The caller decides whether an absent header is allowed (auto) or
@@ -42,7 +61,9 @@ net::awaitable<ProxyProtocolReadResult> ReadInboundProxyProtocol(
 
 // 根据 StreamSettings 将原始 TCP 流包装成最终传输流。|security_context| is
 // the owning handler's TransportSecurity::Context(): borrowed for the call,
-// required exactly when the settings use TLS or REALITY.
+// required exactly when the settings use TLS or REALITY. |fallback| is
+// required for REALITY with dest; an unauthenticated ClientHello is then
+// relayed to dest and the call yields a null stream.
 net::awaitable<TransportBuildResult> BuildInboundTransport(
     net::io_context& io_context,
     std::unique_ptr<AsyncStream> raw,
@@ -51,7 +72,7 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
     uint64_t trace_conn_id = 0,
     std::shared_ptr<InboundTransportStreamHandler> stream_handler = nullptr,
     InboundTransportMetadata* metadata = nullptr,
-    app::dns::DNS* dns_service = nullptr);
+    const InboundFallbackContext* fallback = nullptr);
 
 net::awaitable<TransportBuildResult> BuildOutboundTransport(
     std::unique_ptr<AsyncStream> raw,

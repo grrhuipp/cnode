@@ -86,20 +86,34 @@ net::awaitable<std::optional<UserOnlineSessionGuard>> UserOnlineTracker::TryConn
     if (user_id <= 0 || client_ip.empty()) {
         co_return std::optional<UserOnlineSessionGuard>(std::in_place);
     }
+    // Held across the admission: the domain owns the coordinator reference.
+    auto domain = ExecutionDomain::Current();
+    if (!domain) throw std::logic_error("user admission requires an execution domain");
+    co_return co_await TryConnectSession(
+        domain->Coordinator(), tag, user_id, client_ip, device_limit);
+}
+
+net::awaitable<std::optional<UserOnlineSessionGuard>> UserOnlineTracker::TryConnectSession(
+    GroupCoordinator& coordinator,
+    std::string_view tag,
+    int64_t user_id,
+    std::string_view client_ip,
+    uint32_t device_limit) {
+    if (user_id <= 0 || client_ip.empty()) {
+        co_return std::optional<UserOnlineSessionGuard>(std::in_place);
+    }
     const auto uid = static_cast<uint64_t>(user_id);
     // Prepare the guard's owned strings before reserving either counter.
     std::optional<UserOnlineSessionGuard> guard(std::in_place, tag, uid, client_ip);
-    auto domain = ExecutionDomain::Current();
-    if (!domain) throw std::logic_error("user admission requires an execution domain");
     auto reservation = std::make_shared<DeviceReservation>();
     reservation->node = std::make_unique<DeviceReturn>();
     auto& node = *reservation->node;
-    node.coordinator = &domain->Coordinator();
+    node.coordinator = &coordinator;
     node.tag = tag;
     node.ip = client_ip;
     node.user = uid;
     guard->quota_reservation_ = reservation;
-    const bool admitted = co_await domain->Coordinator().PostCall(
+    const bool admitted = co_await coordinator.PostCall(
         [reservation, device_limit] {
             auto& node = *reservation->node;
             node.quota = net::use_service<DeviceQuotaService>(

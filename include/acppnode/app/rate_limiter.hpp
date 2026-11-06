@@ -393,6 +393,9 @@ public:
             self->core_.OnAuthFailTracked(tag, ip);
         });
     }
+    // The control coordinator that also owns session-level device admission
+    // for runtimes without an execution domain (native UDP associations).
+    [[nodiscard]] GroupCoordinator& Coordinator() const noexcept { return *coordinator_; }
 private:
     class Service final : public net::execution_context::service {
     public:

@@ -1,5 +1,7 @@
 #include "quic_stream.hpp"
 
+#include "hysteria_protocol.hpp"
+
 #include "acppnode/common/buf/multi_buffer.hpp"
 #include "acppnode/transport/link_error.hpp"
 
@@ -8,7 +10,7 @@
 
 #include <cstring>
 
-namespace acpp::proxy::hysteria {
+namespace acpp::transport::internet::hysteria {
 
 QuicStreamState::QuicStreamState(
     net::io_context& io_context, int64_t stream_id,
@@ -28,6 +30,10 @@ bool QuicStreamState::PushInput(std::span<const uint8_t> data, bool fin) {
     input_done_ = fin;
     WakeReader();
     return true;
+}
+
+void QuicStreamState::DiscardInput(size_t bytes) noexcept {
+    AcknowledgeInput(input_.DropPrefixBytes(bytes));
 }
 
 void QuicStreamState::AcknowledgeInput(size_t bytes) noexcept {
@@ -112,10 +118,12 @@ void QuicStreamState::WakeReader() noexcept {
     if (!io_context_.stopped()) (void)input_signal_.try_send(IoErrorCode{});
 }
 
-QuicStream::QuicStream(std::shared_ptr<QuicStreamState> state) noexcept
-    : state_(std::move(state)) {}
+QuicStream::QuicStream(std::shared_ptr<QuicStreamState> state)
+    : state_(std::move(state))
+    , deadline_(state_->IoContext(), *this) {}
 
 QuicStream::~QuicStream() noexcept {
+    deadline_.Clear();
     if (state_) state_->Cancel();
 }
 
@@ -168,6 +176,7 @@ void QuicStream::Cancel() noexcept {
 }
 
 void QuicStream::Close() {
+    deadline_.Clear();
     Cancel();
     state_.reset();
     NotifyClosed();
@@ -177,4 +186,118 @@ bool QuicStream::IsOpen() const {
     return state_ && state_->Open();
 }
 
-}  // namespace acpp::proxy::hysteria
+UdpSessionStream::UdpSessionStream(
+    net::io_context& io_context, uint32_t session_id,
+    TargetAddress first_target, std::weak_ptr<QuicStreamOwner> owner)
+    : io_context_(io_context)
+    , session_id_(session_id)
+    , first_target_(std::move(first_target))
+    , owner_(std::move(owner))
+    , signal_(io_context, 1)
+    , deadline_(io_context, *this) {}
+
+UdpSessionStream::~UdpSessionStream() noexcept {
+    Close();
+}
+
+bool UdpSessionStream::Push(
+    const TargetAddress& target, std::span<const uint8_t> payload) {
+    if (closed_ || cancelled_ || payload.empty() ||
+        queued_bytes_ > kMaxQueuedBytes - payload.size()) return false;
+    buf::MultiBuffer packet;
+    if (!buf::AppendSpanToMultiBuffer(payload, packet)) return false;
+    for (auto* buffer : packet) buffer->SetUDP(target);
+    input_.push_back(std::move(packet));
+    queued_bytes_ += payload.size();
+    WakeReader();
+    return true;
+}
+
+void UdpSessionStream::Detach() noexcept {
+    owner_.reset();
+    if (closed_) return;
+    closed_ = true;
+    input_.clear();
+    queued_bytes_ = 0;
+    WakeReader();
+    NotifyClosed();
+}
+
+net::awaitable<size_t> UdpSessionStream::AsyncRead(net::mutable_buffer) {
+    throw transport::LinkError(ErrorCode::NOT_SUPPORTED);
+}
+
+net::awaitable<size_t> UdpSessionStream::AsyncWrite(net::const_buffer) {
+    throw transport::LinkError(ErrorCode::NOT_SUPPORTED);
+}
+
+net::awaitable<buf::MultiBuffer> UdpSessionStream::ReadMultiBuffer() {
+    for (;;) {
+        if (cancelled_) throw transport::LinkError(ErrorCode::CANCELLED);
+        if (!input_.empty()) {
+            auto packet = std::move(input_.front());
+            input_.pop_front();
+            queued_bytes_ -= std::min(queued_bytes_, packet.byte_size());
+            co_return packet;
+        }
+        if (closed_) co_return buf::MultiBuffer{};
+        auto [error] = co_await signal_.async_receive(
+            net::as_tuple(net::use_awaitable));
+        if (error)
+            throw IoSystemError(error, "Hysteria UDP session input cancelled");
+    }
+}
+
+net::awaitable<void> UdpSessionStream::WriteMultiBuffer(buf::MultiBuffer packet) {
+    const auto datagram = buf::InspectUdpDatagram(packet);
+    if (datagram.status == buf::UdpDatagramStatus::Empty) co_return;
+    if (!datagram.Valid() || datagram.payload_size > kMaxUdpPayloadLength) {
+        packet.clear();
+        throw transport::LinkError(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+    }
+    auto owner = owner_.lock();
+    if (closed_ || !owner) {
+        packet.clear();
+        throw transport::LinkError(ErrorCode::CONNECTION_CLOSED);
+    }
+    bool sent = false;
+    if (datagram.buffer_count == 1) {
+        sent = owner->SendUdpMessage(
+            session_id_, *datagram.target, datagram.single_buffer->Bytes());
+    } else {
+        memory::ThreadLocalVector<uint8_t> payload;
+        payload.reserve(datagram.payload_size);
+        for (const auto* buffer : packet) {
+            if (!buffer || buffer->IsEmpty()) continue;
+            const auto bytes = buffer->Bytes();
+            payload.insert(payload.end(), bytes.begin(), bytes.end());
+        }
+        sent = owner->SendUdpMessage(session_id_, *datagram.target, payload);
+    }
+    packet.clear();
+    if (!sent) throw transport::LinkError(ErrorCode::RESOURCE_EXHAUSTED);
+}
+
+void UdpSessionStream::Cancel() noexcept {
+    cancelled_ = true;
+    WakeReader();
+    NotifyCancellation();
+}
+
+void UdpSessionStream::Close() {
+    deadline_.Clear();
+    if (closed_) return;
+    closed_ = true;
+    input_.clear();
+    queued_bytes_ = 0;
+    WakeReader();
+    if (auto owner = std::exchange(owner_, {}).lock())
+        owner->CloseUdpSession(session_id_);
+    NotifyClosed();
+}
+
+void UdpSessionStream::WakeReader() noexcept {
+    if (!io_context_.stopped()) (void)signal_.try_send(IoErrorCode{});
+}
+
+}  // namespace acpp::transport::internet::hysteria

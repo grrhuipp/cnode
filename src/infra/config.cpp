@@ -5,6 +5,7 @@
 #include "acppnode/common/target_address.hpp"
 #include "acppnode/core/naming.hpp"
 #include "acppnode/infra/json_field.hpp"
+#include "acppnode/infra/inbound_field_rules.hpp"
 #include "acppnode/infra/proxy_protocol_config.hpp"
 #include "acppnode/infra/outbound_bind_config.hpp"
 #include "acppnode/infra/log.hpp"
@@ -208,20 +209,17 @@ TlsVersion ParseTlsVersion(
         "tls {} must be 1.2 or 1.3", field));
 }
 
-void require_http_request_target(
-    std::string_view value, std::string_view field) {
-    if (!value.empty() &&
-        !transport::internet::IsValidHttpRequestTarget(value)) {
-        throw std::invalid_argument(std::format(
-            "{} must be a valid HTTP request target", field));
+template <typename T>
+T RequireField(tl::expected<T, std::string> result) {
+    if (!result) {
+        throw std::invalid_argument(std::move(result.error()));
     }
+    return std::move(*result);
 }
 
-void require_http_authority(
-    std::string_view value, std::string_view field) {
-    if (!value.empty() && !transport::internet::IsValidHttpAuthority(value)) {
-        throw std::invalid_argument(std::format(
-            "{} must be a valid HTTP authority", field));
+void RequireField(tl::expected<void, std::string> result) {
+    if (!result) {
+        throw std::invalid_argument(std::move(result.error()));
     }
 }
 
@@ -249,18 +247,17 @@ void parse_http_headers(const json::object& j,
             throw std::invalid_argument(std::format(
                 "HTTP header '{}' must be a string", name));
         }
-        const std::string& value = raw_value.as_string();
         const std::string normalized =
             transport::internet::NormalizeHttpHeaderName(name);
-        if (!transport::internet::IsValidHttpHeaderValue(value)) {
+        if (!transport::internet::IsValidHttpHeaderValue(raw_value.as_string())) {
             throw std::invalid_argument(std::format(
                 "HTTP header '{}' contains invalid control characters",
                 normalized));
         }
-        if (normalized == "host" &&
-            !transport::internet::IsValidHttpAuthority(value)) {
-            throw std::invalid_argument(
-                "HTTP header 'host' must be a valid HTTP authority");
+        std::string value(raw_value.as_string());
+        if (normalized == "host") {
+            value = RequireField(infra::NormalizeHttpAuthority(
+                value, "HTTP header 'host'"));
         }
         const auto [existing, inserted] = headers.emplace(normalized, value);
         if (!inserted && existing->second != value) {
@@ -745,8 +742,8 @@ RoutingConfig RoutingConfig::FromJson(const json::object& j) {
 
 WsConfig WsConfig::FromJson(const json::object& j) {
     WsConfig cfg;
-    cfg.path = JsonStringOr(j, "path", std::string(constants::binding::kRootPath));
-    require_http_request_target(cfg.path, "ws path");
+    cfg.path = RequireField(infra::NormalizeTransportPath(
+        JsonStringOr(j, "path", ""), "ws path"));
     parse_http_headers(j, cfg.headers);
     cfg.real_ip_header = naming::LowerAscii(
         JsonStringOr(j, "realIpHeader", cfg.real_ip_header));
@@ -756,10 +753,10 @@ WsConfig WsConfig::FromJson(const json::object& j) {
 
 HttpUpgradeConfig HttpUpgradeConfig::FromJson(const json::object& j) {
     HttpUpgradeConfig cfg;
-    cfg.path = JsonStringOr(j, "path", std::string(constants::binding::kRootPath));
-    cfg.host = naming::LowerAscii(JsonStringOr(j, "host", ""));
-    require_http_request_target(cfg.path, "http upgrade path");
-    require_http_authority(cfg.host, "http upgrade host");
+    cfg.path = RequireField(infra::NormalizeTransportPath(
+        JsonStringOr(j, "path", ""), "http upgrade path"));
+    cfg.host = RequireField(infra::NormalizeHttpAuthority(
+        JsonStringOr(j, "host", ""), "http upgrade host"));
     parse_http_headers(j, cfg.headers);
     cfg.real_ip_header = naming::LowerAscii(JsonStringOr(j, "realIpHeader", ""));
     require_http_header_name(
@@ -769,11 +766,11 @@ HttpUpgradeConfig HttpUpgradeConfig::FromJson(const json::object& j) {
 
 HttpConfig HttpConfig::FromJson(const json::object& j) {
     HttpConfig cfg;
-    cfg.path = JsonStringOr(j, "path", std::string(constants::binding::kRootPath));
-    cfg.host = naming::LowerAscii(JsonStringOr(j, "host", ""));
+    cfg.path = RequireField(infra::NormalizeTransportPath(
+        JsonStringOr(j, "path", ""), "http path"));
+    cfg.host = RequireField(infra::NormalizeHttpAuthority(
+        JsonStringOr(j, "host", ""), "http host"));
     cfg.method = JsonStringOr(j, "method", "");
-    require_http_request_target(cfg.path, "http path");
-    require_http_authority(cfg.host, "http host");
     if (!cfg.method.empty() &&
         !transport::internet::IsValidHttpHeaderName(cfg.method)) {
         throw std::invalid_argument("http method must be a valid HTTP token");
@@ -792,12 +789,13 @@ HttpConfig HttpConfig::FromJson(const json::object& j) {
 
 GrpcConfig GrpcConfig::FromJson(const json::object& j) {
     GrpcConfig cfg;
-    cfg.authority = naming::LowerAscii(JsonStringOr(j, "authority", ""));
+    cfg.authority = RequireField(infra::NormalizeHttpAuthority(
+        JsonStringOr(j, "authority", ""), "grpc authority"));
     cfg.service_name = JsonStringOr(j, "serviceName", "");
     cfg.user_agent = JsonStringOr(j, "userAgent", "");
     cfg.multi_mode = JsonBoolOr(j, "multiMode", false);
-    require_http_authority(cfg.authority, "grpc authority");
-    require_http_request_target(cfg.RequestPath(), "grpc serviceName path");
+    RequireField(infra::ValidateGrpcServiceName(
+        cfg.service_name, "grpc serviceName"));
     if (!transport::internet::IsValidHttpHeaderValue(cfg.user_agent)) {
         throw std::invalid_argument(
             "grpc userAgent contains invalid control characters");
@@ -879,11 +877,11 @@ XHttpMode ParseXHttpMode(std::string_view value) {
 
 XHttpConfig XHttpConfig::FromJson(const json::object& j) {
     XHttpConfig cfg;
-    cfg.path = JsonStringOr(j, "path", std::string(constants::binding::kRootPath));
-    cfg.host = naming::LowerAscii(JsonStringOr(j, "host", ""));
+    cfg.path = RequireField(infra::NormalizeTransportPath(
+        JsonStringOr(j, "path", ""), "xhttp path"));
+    cfg.host = RequireField(infra::NormalizeHttpAuthority(
+        JsonStringOr(j, "host", ""), "xhttp host"));
     cfg.mode = ParseXHttpMode(JsonStringOr(j, "mode", ""));
-    require_http_request_target(cfg.path, "xhttp path");
-    require_http_authority(cfg.host, "xhttp host");
     parse_http_headers(j, cfg.headers);
     cfg.no_grpc_header = JsonBoolOr(j, "noGRPCHeader", false);
     cfg.no_sse_header = JsonBoolOr(j, "noSSEHeader", false);
@@ -925,103 +923,37 @@ RealityConfig RealityConfig::FromJson(const json::object& j) {
         throw std::invalid_argument(
             "REALITY target is not supported; use dest");
     }
-    const std::string dest_str = JsonStringOr(j, "dest", "");
-    if (!dest_str.empty()) {
-        const auto parsed_dest = TargetAddress::Parse(dest_str);
-        if (!parsed_dest) {
-            throw std::invalid_argument("REALITY dest is invalid");
-        }
-        cfg.dest_host = parsed_dest->IsIP()
-            ? iputil::NormalizeAddressString(*parsed_dest->resolved_addr)
-            : std::string(parsed_dest->host);
-        cfg.dest_port = parsed_dest->port;
-    } else if (j.contains("dest")) {
-        throw std::invalid_argument("REALITY dest is invalid");
+    infra::RealityServerInput server;
+    if (j.contains("dest")) {
+        server.dest = JsonStringOr(j, "dest", "");
     }
-    auto xver = ParseJsonUint64(j, "xver", 2);
+    auto xver = ParseJsonUint64(j, "xver");
     if (!xver) {
         throw std::invalid_argument(std::move(xver.error()));
     }
-    cfg.xver = static_cast<uint8_t>(xver->value_or(0));
-    if (cfg.xver != 0 && !cfg.HasDest()) {
-        throw std::invalid_argument(
-            "REALITY xver 1 and 2 require dest for PROXY protocol forwarding");
+    server.xver = xver->value_or(0);
+    server.server_names = JsonStringArrayOrEmpty(j, "serverNames");
+    if (j.contains("privateKey")) {
+        server.private_key = JsonStringOr(j, "privateKey", "");
     }
-    const auto is_valid_reality_server_name = [](std::string_view name) noexcept {
-        return !name.empty() && !iputil::ParseLiteral(name) &&
-               domain::IsValidDnsHostname(
-                   name, domain::TrailingDotPolicy::Forbid);
-    };
-    cfg.server_names = JsonStringArrayOrEmpty(j, "serverNames");
-    for (auto& name : cfg.server_names) {
-        name = naming::LowerAscii(std::move(name));
-        // An empty entry in serverNames explicitly permits a REALITY ClientHello without SNI.
-        if (!name.empty() && !is_valid_reality_server_name(name)) {
-            throw std::invalid_argument(
-                "REALITY serverNames contains an invalid hostname");
-        }
-    }
-    const std::string private_key =
-        JsonStringOr(j, "privateKey", "");
-    if (!private_key.empty()) {
-        auto parsed = transport::internet::ParseRealityKey(private_key);
-        if (!parsed) {
-            throw std::invalid_argument("REALITY privateKey is invalid");
-        }
-        cfg.private_key = *parsed;
-    } else if (j.contains("privateKey")) {
-        throw std::invalid_argument("realitySettings.privateKey must not be empty");
-    }
-    const auto short_ids = JsonStringArrayOrEmpty(j, "shortIds");
-    cfg.short_ids.reserve(short_ids.size());
-    for (const auto& short_id : short_ids) {
-        auto parsed = transport::internet::ParseRealityShortId(short_id);
-        if (!parsed) {
-            throw std::invalid_argument(
-                "REALITY shortIds contains an invalid value");
-        }
-        cfg.short_ids.push_back(*parsed);
-    }
-    const auto min_client_version = transport::internet::ParseRealityClientVersion(
-        JsonStringOr(j, "minClientVer", ""));
-    if (!min_client_version) {
-        throw std::invalid_argument("REALITY minClientVer is invalid");
-    }
-    cfg.min_client_version = *min_client_version;
-
-    const auto max_client_version = transport::internet::ParseRealityClientVersion(
-        JsonStringOr(j, "maxClientVer", ""));
-    if (!max_client_version) {
-        throw std::invalid_argument("REALITY maxClientVer is invalid");
-    }
-    cfg.max_client_version = *max_client_version;
-    if (cfg.min_client_version && cfg.max_client_version &&
-        transport::internet::RealityClientVersionValue(*cfg.min_client_version) >
-            transport::internet::RealityClientVersionValue(
-                *cfg.max_client_version)) {
-        throw std::invalid_argument(
-            "REALITY minClientVer must not exceed maxClientVer");
-    }
-    auto max_time_diff = ParseJsonUint64(
-        j, "maxTimeDiff");
+    server.short_ids = JsonStringArrayOrEmpty(j, "shortIds");
+    server.min_client_ver = JsonStringOr(j, "minClientVer", "");
+    server.max_client_ver = JsonStringOr(j, "maxClientVer", "");
+    auto max_time_diff = ParseJsonUint64(j, "maxTimeDiff");
     if (!max_time_diff) {
         throw std::invalid_argument(std::move(max_time_diff.error()));
     }
-    cfg.max_time_diff = max_time_diff->value_or(0);
+    server.max_time_diff = max_time_diff->value_or(0);
     if (j.contains("mldsa65_seed") || j.contains("mldsa65_verify")) {
         throw std::invalid_argument(
             "REALITY mldsa65_seed/mldsa65_verify is not supported; use "
             "mldsa65Seed/mldsa65Verify");
     }
-    const std::string mldsa65_seed = JsonStringOr(j, "mldsa65Seed", "");
-    if (!mldsa65_seed.empty()) {
-        auto parsed = transport::internet::ParseRealityMldsa65Seed(mldsa65_seed);
-        if (!parsed) {
-            throw std::invalid_argument("REALITY mldsa65Seed is invalid");
-        }
-        cfg.mldsa65_seed = *parsed;
-    } else if (j.contains("mldsa65Seed")) {
-        throw std::invalid_argument("REALITY mldsa65Seed is invalid");
+    if (j.contains("mldsa65Seed")) {
+        server.mldsa65_seed = JsonStringOr(j, "mldsa65Seed", "");
+    }
+    if (auto applied = infra::ApplyRealityServerInput(server, cfg); !applied) {
+        throw std::invalid_argument(std::move(applied.error()));
     }
     const std::string mldsa65_verify = JsonStringOr(j, "mldsa65Verify", "");
     if (!mldsa65_verify.empty()) {
@@ -1049,7 +981,7 @@ RealityConfig RealityConfig::FromJson(const json::object& j) {
     }
     cfg.server_name = naming::LowerAscii(JsonStringOr(j, "serverName", ""));
     if (j.contains("serverName") &&
-        !is_valid_reality_server_name(cfg.server_name)) {
+        !infra::IsValidRealityServerName(cfg.server_name)) {
         throw std::invalid_argument("REALITY serverName is invalid");
     }
     const std::string public_key = JsonStringOr(j, "publicKey", "");
@@ -1109,7 +1041,8 @@ StreamSettings StreamSettings::FromJson(
             throw std::invalid_argument(
                 "tls minVersion must not exceed maxVersion");
         }
-        cfg.tls.server_name = naming::LowerAscii(JsonStringOr(*tls, "serverName", ""));
+        cfg.tls.server_name = RequireField(infra::NormalizeTlsServerName(
+            JsonStringOr(*tls, "serverName", ""), "tls serverName"));
         cfg.tls.allow_insecure = JsonBoolOr(*tls, "allowInsecure", false);
         cfg.tls.ca_file = JsonStringOr(*tls, "caFile", "");
         if (role == StreamEndpointRole::Inbound &&
@@ -1208,18 +1141,7 @@ StreamSettings StreamSettings::FromJson(
                     "outbound REALITY requires publicKey");
             }
         } else {
-            if (!cfg.reality.private_key) {
-                throw std::invalid_argument(
-                    "inbound REALITY requires privateKey");
-            }
-            if (cfg.reality.server_names.empty()) {
-                throw std::invalid_argument(
-                    "inbound REALITY requires at least one serverName");
-            }
-            if (cfg.reality.short_ids.empty()) {
-                throw std::invalid_argument(
-                    "inbound REALITY requires at least one shortId");
-            }
+            RequireField(infra::ValidateInboundReality(cfg.reality));
         }
     }
     if (cfg.tls.server_name.empty() && !cfg.reality.server_name.empty()) {
@@ -1278,25 +1200,10 @@ StaticUserConfig ParseStaticUserConfig(
         config.hysteria_down_mbps =
             JsonUint32Or(settings, "downMbps", config.hysteria_down_mbps);
     }
-    if (const auto* padding = settings.if_contains("paddingScheme")) {
-        if (padding->is_string()) {
-            config.padding_scheme = std::string(padding->as_string());
-        } else if (padding->is_array()) {
-            bool first = true;
-            for (const auto& item : padding->as_array()) {
-                if (!item.is_string()) {
-                    throw std::invalid_argument(
-                        "paddingScheme must contain only strings");
-                }
-                if (!first) {
-                    config.padding_scheme.push_back('\n');
-                }
-                config.padding_scheme.append(item.as_string());
-                first = false;
-            }
-        } else {
-            throw std::invalid_argument(
-                "paddingScheme must be a string or array of strings");
+    if (protocol == constants::protocol::kAnyTLS) {
+        if (const auto* padding = settings.if_contains("paddingScheme")) {
+            config.padding_scheme = RequireField(
+                infra::ParseAnyTlsPaddingScheme(*padding, "paddingScheme"));
         }
     }
 
@@ -1428,21 +1335,8 @@ StaticInboundConfig StaticInboundConfig::FromJson(const json::object& j) {
             }
             domain::NormalizeDnsHostnameInPlace(excluded);
         }
-        cfg.sniffing.dest_override = 0;
-        for (auto& protocol : JsonStringArrayOrEmpty(*sniffing, "destOverride")) {
-            protocol = naming::LowerAscii(std::move(protocol));
-            if (protocol == "fakedns" || protocol == "fakedns+others") {
-                throw std::invalid_argument(
-                    "sniffing destOverride fakedns is not supported");
-            }
-            const uint8_t bit = SniffConfig::DestOverrideBit(protocol);
-            if (bit == 0) {
-                throw std::invalid_argument(std::format(
-                    "sniffing destOverride contains unsupported value '{}'",
-                    protocol));
-            }
-            cfg.sniffing.dest_override |= bit;
-        }
+        cfg.sniffing.dest_override = RequireField(infra::ParseSniffDestOverride(
+            JsonStringArrayOrEmpty(*sniffing, "destOverride")));
     }
 
     if (j.contains("routing_enabled")) {

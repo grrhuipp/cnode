@@ -6,6 +6,7 @@
 #include "acppnode/common/rule_types.hpp"
 #include "acppnode/core/constants.hpp"
 #include "acppnode/transport/internet/stream_settings.hpp"
+#include "acppnode/proxy/sniff_config.hpp"
 
 #include <chrono>
 #include <optional>
@@ -58,12 +59,8 @@ struct NodeInfo {
     uint32_t HysteriaDownMbps = 0;
     // cnode local runtime extensions that are normalized from panel/config cold path.
     std::string TLSServerName;
-    bool SniffEnabled = true;
-    std::vector<std::string> DestOverride = {
-        std::string(constants::protocol::kTls),
-        std::string(constants::protocol::kHttp),
-        std::string(constants::protocol::kQuic),
-    };
+    // V2board does not deliver sniffing; panel nodes use the local default.
+    SniffConfig Sniffing{};
     int PullInterval = defaults::kPanelPullInterval;
     int PushInterval = defaults::kPanelPushInterval;
 };

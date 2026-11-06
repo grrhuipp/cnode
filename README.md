@@ -275,11 +275,12 @@ bash scripts/cnode.sh -variant glibc -debug_file true
 - 面板创建的 direct outbound 是 routing 未命中时的 fallback，命中规则始终优先生效。
 - 出口列表顺序不表达默认出口；动态增删 outbound 不会改变其他 receiver 的选择。明确的 forced / fallback tag 不存在时请求失败，不隐式切换到第一个 outbound。
 - AnyTLS 使用 TLS session pool、单物理 session read loop、按 sid demux、共享 session 串行写，以及 `settings.clients` 和 `settings.paddingScheme` 配置。
-- Hysteria v1 使用 ALPN `hysteria`，Hysteria2 使用 HTTP/3 `/auth` 后切换原生 QUIC stream；两代均支持 QUIC DATAGRAM UDP、分片重组和路径迁移。QUIC 监听由固定 Worker 独占，连接及其路径变化始终由该 Worker 处理，不建立跨 Worker 数据包转发队列。`ngtcp2`、`nghttp3` 及流队列借用 Worker PMR，监听入口共享收发循环和超时调度。`ngtcp2` 不提供 Hysteria v1 的 Brutal 拥塞控制，v1 服务端使用其 BBR v2 实现；线协议与官方 v1 客户端互通，但带宽控制行为不是 Brutal。
+- Hysteria v1 使用 ALPN `hysteria`，Hysteria2 使用 HTTP/3 `/auth` 后切换原生 QUIC stream；两代均支持 QUIC DATAGRAM UDP 与分片重组。按 Xray `transport/internet/hysteria` 的划分，QUIC、认证与流/数据报会话属于传输层，认证后每个 TCP 请求流与 UDP 会话作为逻辑传输流交给同一入站 Handler 与 `Inbound::Process`，连接级物理准入与连接统计在认证前完成。QUIC 与 TCP 一样由全部数据 Worker 以 `SO_REUSEPORT` 监听，连接归接受它的 Worker；路径变化后落到其他 Worker 的短包头数据包因连接 ID 未知被丢弃（RFC 9000 §10.3），不跨 Worker 转发，因此只有仍落在原 Worker 的路径迁移可继续。`ngtcp2`、`nghttp3` 及流队列借用 Worker PMR，监听入口共享收发循环和超时调度。`ngtcp2` 不提供 Hysteria v1 的 Brutal 拥塞控制，v1 服务端使用其 BBR v2 实现；线协议与官方 v1 客户端互通，但带宽控制行为不是 Brutal。
 
 AnyTLS FIN 关闭整个逻辑流：远端 FIN 之前的已接收数据按有界队列排空，同时停止新的反向写入且不回复 FIN；本地关闭只发送一次 FIN。请求的两个方向结束后，完整且正常的物理会话可供新流复用；物理帧写入中断则关闭会话。第四十八轮已通过固定提交官方实现对照、双向直接互通和提前 FIN 检查，验证范围及当前环境限制见[架构审查记录](docs/architecture-review-20260909.md#第四十八轮anytls-完整关闭与-tls-取消传递)。
 - REALITY 支持 TLS 1.3 + X25519 + Ed25519 临时证书签发与验证、服务端准入控制（`serverNames`、`shortIds`、`minClientVer`、`maxClientVer`、`maxTimeDiff`）、可选后量子 `mldsa65Seed` / `mldsa65Verify`（ML-DSA-65 证书扩展签名与验签）、未认证连接透明回落转发（`dest` + `xver` 0/1/2 PROXY Protocol v1/v2）、客户端 `fingerprint` 浏览器指纹模拟（`chrome`/`firefox`/`safari`/`ios`/`android`/`edge`/`360`/`qq`/`random`）、客户端 `spiderX` 回退路径访问，以及 V2Board 面板 `tls=2` REALITY 节点自动同步。握手阶段的认证状态与 transcript 缓冲在握手结束时立即释放，不随连接常驻；无读者的 `show`、`type`、`masterKeyLog` 字段会被配置加载器拒绝。
 - REALITY 按实际到达字节增量重组跨记录 ClientHello，未认证回落保留原始线面字节；只在冷路径预计算可复用的证书部分，每次握手必要的认证／transcript 签名仍独立执行，临时密钥与缓冲在阶段结束后释放。DNS 名称比较接受末尾根点。
+- REALITY 未认证回落按 Xray 留在传输层，但经公共拨号（`timeouts.dial`，默认 10 秒；域名 `dest` 与普通出站相同，存在 IPv4 记录时只拨 IPv4）与公共 relay 转发：沿用 `timeouts.connIdle`／`write`／`uplinkOnly`／`downlinkOnly`，字节计入 Worker 流量统计；PROXY 头与原始 ClientHello 仍作为首次写入一并发往 `dest`。回落连接在整个转发期间持有物理连接准入，不进入分发、路由或用户计费。
 
 ## 日志格式
 

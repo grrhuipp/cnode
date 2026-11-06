@@ -12,7 +12,7 @@
 
 #include <tl/expected.hpp>
 
-namespace acpp::proxy::hysteria {
+namespace acpp::transport::internet::hysteria {
 
 enum class Version : uint8_t {
     V1,
@@ -88,4 +88,4 @@ EncodeUdpMessage(Version version, const UdpMessage& message);
 
 [[nodiscard]] std::array<uint8_t, 32> HashCredential(std::string_view credential) noexcept;
 
-}  // namespace acpp::proxy::hysteria
+}  // namespace acpp::transport::internet::hysteria

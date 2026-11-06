@@ -3,6 +3,8 @@
 
 #include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
 #include "acppnode/app/stats.hpp"
+#include "acppnode/common/sharded_user_stats.hpp"
+#include "acppnode/common/user_profile.hpp"
 #include "acppnode/common/session.hpp"
 #include "acppnode/common/target_address.hpp"
 #include "acppnode/features/routing/dispatcher.hpp"
@@ -135,6 +137,8 @@ public:
     tl::expected<acpp::InboundDatagramResult, acpp::ErrorCode> Process(
         const acpp::InboundDatagramRequest& request) override {
         acpp::InboundDatagramResult result;
+        result.user = &profile_;
+        result.tracker = &tracker_;
         const std::array<uint8_t, 1> owner{0x71};
         if (!result.session_owner.Assign(owner)) {
             return tl::unexpected(acpp::ErrorCode::RESOURCE_EXHAUSTED);
@@ -153,6 +157,9 @@ public:
     CreateDatagramResponse(const acpp::InboundDatagramResult&) override {
         return std::make_shared<DatagramResponse>();
     }
+private:
+    acpp::UserOnlineTracker tracker_;
+    acpp::UserProfile profile_;
 };
 
 bool IsDecodedPayload(const acpp::buf::MultiBuffer& payload) {

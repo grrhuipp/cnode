@@ -136,6 +136,11 @@ net::awaitable<void> RunInboundProxy(
 class Handler::LogicalTransportStreamSink final
     : public InboundTransportStreamHandler {
 public:
+    // HTTP/2-family transports authenticate per stream in the protocol, so
+    // their children start anonymous; a transport that authenticated the
+    // session (Hysteria) passes its bound identity to every child.
+    enum class SessionIdentity : uint8_t { Unauthenticated, Authenticated };
+
     LogicalTransportStreamSink(std::shared_ptr<Handler> handler,
                                net::io_context& io_context,
                                routing::Dispatcher& dispatcher,
@@ -143,6 +148,7 @@ public:
                                app::RequestLoadState& request_load,
                                const TimeoutsConfig& timeouts,
                                const session::Context& base_ctx,
+                               SessionIdentity identity,
                                InboundTransportMetadata metadata,
                                std::shared_ptr<ConnectionLimiter::Family> family)
         : handler_(std::move(handler))
@@ -156,8 +162,10 @@ public:
         base_ctx_.InitSubstreamFrom(base_ctx);
         base_ctx_.conn_id = base_ctx.conn_id;
         base_ctx_.accept_time_us = base_ctx.accept_time_us;
-        base_ctx_.inbound.user_id = 0;
-        base_ctx_.inbound.user_email.clear();
+        if (identity == SessionIdentity::Unauthenticated) {
+            base_ctx_.inbound.user_id = 0;
+            base_ctx_.inbound.user_email.clear();
+        }
     }
 
     [[nodiscard]] InboundTransportMetadata& Metadata() noexcept {
@@ -245,6 +253,20 @@ void Handler::ReleaseProtocol() noexcept {
     // Handler state may refer to runtime state; release in reverse order.
     if (lazy_.prepared) proxy_.reset();
     runtime_.reset();
+}
+
+std::shared_ptr<InboundTransportStreamHandler> Handler::NewAuthenticatedStreamSink(
+    net::io_context& io_context,
+    routing::Dispatcher& dispatcher,
+    StatsShard& stats,
+    app::RequestLoadState& request_load,
+    const TimeoutsConfig& timeouts,
+    const session::Context& session_ctx,
+    std::shared_ptr<ConnectionLimiter::Family> family) {
+    return memory::AllocateShared<LogicalTransportStreamSink>(
+        shared_from_this(), io_context, dispatcher, stats, request_load, timeouts,
+        session_ctx, LogicalTransportStreamSink::SessionIdentity::Authenticated,
+        InboundTransportMetadata{}, std::move(family));
 }
 
 net::awaitable<void> Handler::ProcessPreparedTransportStream(
@@ -405,6 +427,7 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
             request_load,
             timeouts,
             ctx,
+            LogicalTransportStreamSink::SessionIdentity::Unauthenticated,
             std::move(local_metadata), connection_limit.FamilyLease());
         transport_metadata = &logical_stream_handler->Metadata();
     }
@@ -412,6 +435,10 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
     // stream; keep the sink that owns the extracted metadata until read.
     auto metadata_owner = logical_stream_handler;
 
+    // The physical reservation above stays held while a REALITY fallback runs
+    // inside the transport build.
+    const InboundFallbackContext fallback{
+        .ctx = ctx, .stats = stats, .timeouts = timeouts, .dns_service = dns_service};
     auto build_result = co_await BuildInboundTransport(
         io_context,
         std::move(raw_conn),
@@ -420,7 +447,7 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
         ctx.conn_id,
         std::move(logical_stream_handler),
         transport_metadata,
-        dns_service);
+        &fallback);
     if (!build_result) {
         LOG_CONN_DEBUG(ctx, "transport handshake failed security={} network={}",
                        listener.stream_settings.security,
