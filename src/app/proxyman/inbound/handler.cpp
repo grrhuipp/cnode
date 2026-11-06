@@ -217,19 +217,35 @@ Handler::Handler(std::shared_ptr<const inbound::ReceiverSettings> receiver,
     , proxy_(std::move(proxy))
     , limiter_(limiter) {}
 
-Handler::Handler(inbound::ReceiverSettings receiver, ProtocolProvider& provider,
-                 ConnectionLimiter& limiter)
-    : Handler(std::make_shared<const inbound::ReceiverSettings>(std::move(receiver)),
-              provider, limiter) {}
-
 Handler::Handler(std::shared_ptr<const inbound::ReceiverSettings> receiver,
-                 ProtocolProvider& provider,
+                 LazyProtocol lazy,
                  ConnectionLimiter& limiter)
     : receiver_(receiver ? std::move(receiver)
                          : throw std::invalid_argument("missing receiver settings"))
     , security_(receiver_->stream_settings, StreamEndpointRole::Inbound)
-    , provider_(&provider)
+    , lazy_(lazy.prepared && lazy.stats
+                ? std::move(lazy)
+                : throw std::invalid_argument("missing lazy protocol source"))
     , limiter_(limiter) {}
+
+Inbound& Handler::Proxy() {
+    if (proxy_) return *proxy_;
+    if (!lazy_.prepared) throw std::logic_error("inbound handler has no protocol");
+    if (!runtime_) {
+        runtime_ = NewProtocolRuntime(lazy_.prepared->protocol);
+        if (!runtime_) throw std::invalid_argument("missing session protocol runtime");
+    }
+    proxy_ = NewHandler(lazy_.prepared->protocol, *runtime_, *lazy_.stats,
+                        lazy_.limiter, *lazy_.prepared);
+    if (!proxy_) throw std::invalid_argument("missing session inbound handler");
+    return *proxy_;
+}
+
+void Handler::ReleaseProtocol() noexcept {
+    // Handler state may refer to runtime state; release in reverse order.
+    if (lazy_.prepared) proxy_.reset();
+    runtime_.reset();
+}
 
 net::awaitable<void> Handler::ProcessPreparedTransportStream(
     net::io_context& io_context,
@@ -271,13 +287,8 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
                    listener.stream_settings.security,
                    listener.stream_settings.network);
 
-    if (!proxy_ && !provider_) {
-        stats.OnError();
-        co_return;
-    }
     co_await RunInboundProxy(
-        proxy_ ? *proxy_ : provider_->GetProxy(),
-        std::move(stream), dispatcher, listener, io_context, ctx, timeouts,
+        Proxy(), std::move(stream), dispatcher, listener, io_context, ctx, timeouts,
         request_load.PressureIdleTimeout(), stats);
 }
 
@@ -448,13 +459,8 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
                    listener.stream_settings.security,
                    listener.stream_settings.network);
 
-    if (!proxy_ && !provider_) {
-        stats.OnError();
-        co_return;
-    }
     co_await RunInboundProxy(
-        proxy_ ? *proxy_ : provider_->GetProxy(),
-        std::move(stream), dispatcher, listener, io_context, ctx, timeouts,
+        Proxy(), std::move(stream), dispatcher, listener, io_context, ctx, timeouts,
         request_load.PressureIdleTimeout(), stats);
 }
 

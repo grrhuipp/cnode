@@ -766,27 +766,16 @@ AuthenticateSession(
     AsyncStream& stream,
     UserOnlineTracker& validator,
     ConnectionLimiter* limiter,
-    StatsShard& stats,
     session::Context& ctx,
     const TimeoutsConfig& timeouts,
     uint32_t pressure_idle_timeout) {
     std::array<uint8_t, 32> auth_hash{};
     if (auto ok = co_await ReadAuth(stream, auth_hash); !ok) {
-        if (ok.error() != ErrorCode::CANCELLED &&
-            ok.error() != ErrorCode::SOCKET_EOF) {
-            stats.OnError();
-        }
         co_return tl::unexpected(ok.error());
     }
     auto user = proxyman::inbound::UserStore::FindAnyTlsUser(ctx.inbound.tag, auth_hash);
     if (!user) {
-        LOG_CONN_WARN(ctx, "authentication failed from {}:{} > no matching credential",
-                      ctx.inbound.source_ip, ctx.inbound.source_port);
-        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "authentication failed: no matching credential"));
-        if (limiter && ctx.inbound.HasProxyProtocolClientIP()) {
-            co_await limiter->OnAuthFailTracked(ctx.inbound.tag, ctx.inbound.source_ip);
-        }
-        stats.OnError();
+        co_await proxy::RecordInboundAuthFailure(limiter, ctx, "no matching credential");
         co_return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
     }
 
@@ -799,15 +788,12 @@ AuthenticateSession(
     stream.SetReadTimeout(std::chrono::seconds(0));
     stream.SetWriteTimeout(
         std::min(timeouts.WriteTimeout(), control_idle_timeout));
-    const auto& profile = user->profile;
-    ctx.inbound.user_email = profile.email;
-    ctx.inbound.user_id = profile.user_id;
-    ctx.content.speed_limit = profile.speed_limit;
 
-    auto user_session = co_await proxy::TryAcquireInboundUserSession(
-        validator, ctx.inbound.tag, profile.user_id, profile.device_limit, ctx);
+    // Session-level authentication: no target exists until streams open.
+    proxy::BindAuthenticatedInbound(ctx, user->profile, std::nullopt);
+    auto user_session = co_await proxy::AdmitAuthenticatedInbound(
+        validator, ctx, user->profile);
     if (!user_session) {
-        stats.OnError();
         co_return tl::unexpected(ErrorCode::PERMISSION_DENIED);
     }
 
@@ -838,22 +824,15 @@ Handler::Process(
     }
 
     if (co_await proxy::CheckInboundIpBanned(limiter_, ctx)) {
-        stream->CloseAbortive();
-        stats_->OnError();
-        RelayResult result;
-        result.error = ErrorCode::BLOCKED;
-        co_return result;
+        co_return proxy::RejectInbound(*stats_, stream.get(), ErrorCode::BLOCKED);
     }
 
     UserOnlineSessionGuard user_session;
     {
         auto auth = co_await AuthenticateSession(
-            *stream, validator_, limiter_, *stats_, ctx, timeouts, pressure_idle_timeout);
+            *stream, validator_, limiter_, ctx, timeouts, pressure_idle_timeout);
         if (!auth) {
-            stream->CloseAbortive();
-            RelayResult result;
-            result.error = auth.error();
-            co_return result;
+            co_return proxy::RejectInbound(*stats_, stream.get(), auth.error());
         }
         user_session = std::move(*auth);
     }

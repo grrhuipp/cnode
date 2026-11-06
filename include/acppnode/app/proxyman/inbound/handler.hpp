@@ -3,6 +3,7 @@
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/app/rate_limiter.hpp"
 #include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
+#include "acppnode/app/proxyman/inbound/factory.hpp"
 #include "acppnode/app/stats.hpp"
 #include "acppnode/features/routing/dispatcher.hpp"
 #include "acppnode/infra/config_types.hpp"
@@ -26,15 +27,17 @@ namespace acpp::proxyman::inbound {
 // Handler - address-stable session-domain inbound transport host.
 // Listener descriptors may use an eagerly prepared protocol; physical domains
 // create protocol state only when a real logical request reaches the proxy.
+// Either way each request crosses exactly one virtual Inbound::Process.
 // ============================================================================
 class Handler final
     : public memory::ThreadAllocated
     , public std::enable_shared_from_this<Handler> {
 public:
-    class ProtocolProvider {
-    public:
-        virtual ~ProtocolProvider() = default;
-        virtual Inbound& GetProxy() = 0;
+    // Plain cold inputs for building the protocol handler on first use.
+    struct LazyProtocol {
+        std::shared_ptr<const BuildRequest> prepared;
+        StatsShard* stats = nullptr;
+        ConnectionLimiter* limiter = nullptr;
     };
     // Prepared TransportSecurity is shared; SSL contexts are never rebuilt for
     // each short HTTP packet upload.
@@ -43,10 +46,8 @@ public:
     Handler(std::shared_ptr<const inbound::ReceiverSettings> receiver,
             std::unique_ptr<Inbound> proxy,
             ConnectionLimiter& limiter);
-    Handler(inbound::ReceiverSettings receiver, ProtocolProvider& provider,
-            ConnectionLimiter& limiter);
     Handler(std::shared_ptr<const inbound::ReceiverSettings> receiver,
-            ProtocolProvider& provider,
+            LazyProtocol lazy,
             ConnectionLimiter& limiter);
 
     Handler(const Handler&) = delete;
@@ -77,8 +78,17 @@ public:
         session::Context& ctx,
         app::dns::DNS* dns_service = nullptr);
 
+    // Null until a lazily built protocol has handled its first request.
+    [[nodiscard]] const ProtocolRuntime* Runtime() const noexcept {
+        return runtime_.get();
+    }
+    // Releases lazily built protocol state; the caller has joined all requests.
+    void ReleaseProtocol() noexcept;
+
 private:
     class LogicalTransportStreamSink;
+
+    Inbound& Proxy();
 
     net::awaitable<void> ProcessPreparedTransportStream(
         net::io_context& io_context,
@@ -92,8 +102,9 @@ private:
 
     std::shared_ptr<const inbound::ReceiverSettings> receiver_;
     TransportSecurity security_;
+    LazyProtocol lazy_;
+    std::unique_ptr<ProtocolRuntime> runtime_;
     std::unique_ptr<Inbound> proxy_;
-    ProtocolProvider* provider_ = nullptr;
     ConnectionLimiter& limiter_;
 };
 

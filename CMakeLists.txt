@@ -1431,6 +1431,7 @@ if(CNODE_BUILD_TESTS)
     add_executable(cnode_inbound_process_errors_test
         tests/inbound_process_errors_test.cpp
         src/app/proxyman/inbound/handler.cpp
+        src/app/proxyman/inbound/factory.cpp
         src/proxy/anytls/anytls_codec.cpp
         src/proxy/anytls/padding.cpp
         src/proxy/uot/uot.cpp

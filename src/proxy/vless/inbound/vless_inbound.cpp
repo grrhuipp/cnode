@@ -316,23 +316,14 @@ CompleteVlessInboundHandshake(
     auto& request = *parsed_request;
     if (resumed_identity &&
         CRYPTO_memcmp(resumed_identity->data(), request.uuid.data(), request.uuid.size()) != 0) {
-        LOG_CONN_WARN(ctx, "authentication failed from {}:{} > resumed identity mismatch",
-                      client_ip, ctx.inbound.source_port);
-        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "authentication failed: resumed identity mismatch"));
+        co_await proxy::RecordInboundAuthFailure(limiter, ctx, "resumed identity mismatch");
         co_return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
     }
     auto user_info = proxyman::inbound::UserStore::FindVlessUser(tag, request.uuid);
     if (!user_info) {
-        LOG_CONN_WARN(ctx, "authentication failed from {}:{} > no matching user",
-                      client_ip, ctx.inbound.source_port);
-        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "authentication failed: no matching user"));
-        if (limiter && ctx.inbound.HasProxyProtocolClientIP()) {
-            co_await limiter->OnAuthFailTracked(tag, client_ip);
-        }
+        co_await proxy::RecordInboundAuthFailure(limiter, ctx, "no matching user");
         co_return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
     }
-    ctx.inbound.user_id = user_info->profile.user_id;
-    ctx.inbound.user_email = user_info->profile.email;
     Network net = Network::TCP;
     if (request.command == ::acpp::vless::Command::UDP) {
         net = Network::UDP;
@@ -342,9 +333,11 @@ CompleteVlessInboundHandshake(
     const bool packet_addr_udp =
         request.command == ::acpp::vless::Command::UDP &&
         ::acpp::vless::IsPacketAddrMagic(request.target);
-    ctx.outbound.original_target = request.target;
-    ctx.outbound.target = std::move(request.target);
-    ctx.content.network = net;
+    // Published before flow/transport validation so those rejections log the
+    // authenticated user and the requested target.
+    proxy::BindAuthenticatedInbound(
+        ctx, user_info->profile,
+        proxy::InboundRequestTarget{net, std::move(request.target)});
     if (request.addons_len != 0 && request.flow.empty()) {
         LOG_CONN_WARN(ctx, "request rejected from {}:{} > unsupported addons", client_ip, ctx.inbound.source_port);
         LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "unsupported request addons"));
@@ -392,10 +385,8 @@ CompleteVlessInboundHandshake(
         co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
     }
 
-    const auto& profile = user_info->profile;
-    ctx.content.speed_limit = profile.speed_limit;
-    auto user_session = co_await proxy::TryAcquireInboundUserSession(
-        validator, tag, profile.user_id, profile.device_limit, ctx);
+    auto user_session = co_await proxy::AdmitAuthenticatedInbound(
+        validator, ctx, user_info->profile);
     if (!user_session) {
         co_return tl::unexpected(ErrorCode::PERMISSION_DENIED);
     }
@@ -448,19 +439,8 @@ proxy::vless::inbound::Handler::Process(
     uint32_t pressure_idle_timeout) {
     const std::string_view tag = ctx.inbound.tag;
     const std::string_view client_ip = ctx.inbound.source_ip;
-    auto fail = [&](ErrorCode error) {
-        if (error != ErrorCode::CANCELLED && error != ErrorCode::SOCKET_EOF) {
-            stats_->OnError();
-        }
-        RelayResult result;
-        result.error = error;
-        return result;
-    };
     auto fail_abortive = [&](ErrorCode error) {
-        if (stream) {
-            stream->CloseAbortive();
-        }
-        return fail(error);
+        return proxy::RejectInbound(*stats_, stream.get(), error);
     };
 
     if (co_await proxy::CheckInboundIpBanned(limiter_, ctx)) {

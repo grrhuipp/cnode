@@ -133,12 +133,7 @@ ParseTrojanRequest(AsyncStream& stream,
     auto user_info = proxyman::inbound::UserStore::FindTrojanUser(
         tag, request.PasswordHashView());
     if (!user_info) {
-        LOG_CONN_WARN(ctx, "authentication failed from {}:{} > no matching credential",
-                      client_ip, ctx.inbound.source_port);
-        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "authentication failed: no matching credential"));
-        if (limiter && ctx.inbound.HasProxyProtocolClientIP()) {
-            co_await limiter->OnAuthFailTracked(tag, client_ip);
-        }
+        co_await proxy::RecordInboundAuthFailure(limiter, ctx, "no matching credential");
         co_return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
     }
 
@@ -176,25 +171,11 @@ proxy::trojan::inbound::Handler::Process(
 {
     const std::string_view tag   = ctx.inbound.tag;
     const std::string_view client_ip = ctx.inbound.source_ip;
-    auto fail = [&](ErrorCode error) {
-        if (error != ErrorCode::CANCELLED && error != ErrorCode::SOCKET_EOF) {
-            stats_->OnError();
-        }
-        RelayResult result;
-        result.error = error;
-        return result;
-    };
-    auto fail_abortive = [&](ErrorCode error) {
-        if (stream) {
-            stream->CloseAbortive();
-        }
-        return fail(error);
-    };
 
     LOG_CONN_DEBUG(ctx, "processing connection from {}:{}", client_ip, ctx.inbound.source_port);
 
     if (co_await proxy::CheckInboundIpBanned(limiter_, ctx)) {
-        co_return fail_abortive(ErrorCode::BLOCKED);
+        co_return proxy::RejectInbound(*stats_, stream.get(), ErrorCode::BLOCKED);
     }
     std::optional<UserOnlineSessionGuard> user_session;
     Network net = Network::TCP;
@@ -202,28 +183,21 @@ proxy::trojan::inbound::Handler::Process(
         auto handshake = co_await ParseTrojanRequest(
             *stream, ctx, limiter_, tag, client_ip);
         if (!handshake) {
-            co_return fail_abortive(handshake.error());
+            co_return proxy::RejectInbound(*stats_, stream.get(), handshake.error());
         }
-
-        const auto& profile = handshake->user->profile;
-        ctx.inbound.user_id = profile.user_id;
-        ctx.inbound.user_email = profile.email;
-        ctx.content.speed_limit = profile.speed_limit;
         net = (handshake->command == ::acpp::trojan::TrojanCommand::UDP_ASSOCIATE)
               ? Network::UDP : Network::TCP;
-        ctx.outbound.original_target = handshake->target;
-        ctx.outbound.target = std::move(handshake->target);
-        ctx.content.network = net;
-        user_session = co_await proxy::TryAcquireInboundUserSession(
-            validator_, tag, profile.user_id, profile.device_limit, ctx);
+        proxy::BindAuthenticatedInbound(
+            ctx, handshake->user->profile,
+            proxy::InboundRequestTarget{net, std::move(handshake->target)});
+        user_session = co_await proxy::AdmitAuthenticatedInbound(
+            validator_, ctx, handshake->user->profile);
         if (!user_session) {
-            co_return fail_abortive(ErrorCode::PERMISSION_DENIED);
+            co_return proxy::RejectInbound(
+                *stats_, stream.get(), ErrorCode::PERMISSION_DENIED);
         }
         // Session metadata is owned; release the authentication snapshot before I/O.
         handshake->user.reset();
-
-        LOG_CONN_DEBUG(ctx, "authentication succeeded from {}:{} -> {}",
-                       client_ip, ctx.inbound.source_port, ctx.outbound.target);
     }
 
     if (net == Network::UDP) {

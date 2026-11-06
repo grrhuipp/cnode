@@ -24,13 +24,18 @@ namespace acpp {
 
 namespace {
 
-net::awaitable<tl::expected<std::optional<UserOnlineSessionGuard>, ErrorCode>>
+Network RequestNetwork(::acpp::vmess::Command command) noexcept {
+    return command == ::acpp::vmess::Command::UDP
+        ? Network::UDP : command == ::acpp::vmess::Command::Mux
+        ? Network::MUX : Network::TCP;
+}
+
+net::awaitable<tl::expected<UserOnlineSessionGuard, ErrorCode>>
 ParseHandshake(AsyncStream& stream,
                ::acpp::vmess::encoding::ServerSession& vmess_session,
                ::acpp::vmess::TimedUserValidator& validator,
                ConnectionLimiter* limiter,
                session::Context& ctx,
-               std::string_view tag,
                std::string_view client_ip) {
     memory::ByteVector header_buf;
     size_t total_read = 0;
@@ -65,49 +70,39 @@ ParseHandshake(AsyncStream& stream,
         if (!request && vmess_session.RequiredHeaderBytes() == 0) {
             const auto reason = vmess_session.HeaderFailureReason();
             const auto* authenticated = vmess_session.AuthenticatedRejectedHeader();
-            if (authenticated) {
-                ctx.inbound.user_id = authenticated->user->profile.user_id;
-                ctx.inbound.user_email = authenticated->user->profile.email;
-                ctx.outbound.original_target = authenticated->target;
-                ctx.outbound.target = authenticated->target;
-                ctx.content.network = authenticated->command == ::acpp::vmess::Command::UDP
-                    ? Network::UDP : authenticated->command == ::acpp::vmess::Command::Mux
-                    ? Network::MUX : Network::TCP;
+            if (!authenticated) {
+                co_await proxy::RecordInboundAuthFailure(limiter, ctx, reason);
+                co_return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
             }
+            proxy::BindAuthenticatedInbound(
+                ctx, authenticated->user->profile,
+                proxy::InboundRequestTarget{
+                    RequestNetwork(authenticated->command), authenticated->target});
             LOG_CONN_WARN(ctx, "request rejected from {}:{} > {}",
                           client_ip, ctx.inbound.source_port, reason);
             LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, reason));
-            if (!authenticated && limiter && ctx.inbound.HasProxyProtocolClientIP()) {
-                co_await limiter->OnAuthFailTracked(tag, client_ip);
-            }
-            co_return tl::unexpected(authenticated
-                ? ErrorCode::PROTOCOL_DECODE_FAILED : ErrorCode::PROTOCOL_AUTH_FAILED);
+            co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
         }
     }
 
     memory::ByteVector{}.swap(header_buf);
 
-    if (request->user) {
-        ctx.inbound.user_id = request->user->profile.user_id;
-        ctx.inbound.user_email = request->user->profile.email;
-        ctx.outbound.original_target = request->target;
-        ctx.outbound.target = request->target;
-        ctx.content.network = request->command == ::acpp::vmess::Command::UDP
-            ? Network::UDP : request->command == ::acpp::vmess::Command::Mux
-            ? Network::MUX : Network::TCP;
+    if (!request->user) {
+        co_await proxy::RecordInboundAuthFailure(
+            limiter, ctx, "authentication failed: no authenticated user");
+        co_return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
     }
-    if (!request->user || !co_await validator.RegisterSessionIfNew(
+    proxy::BindAuthenticatedInbound(
+        ctx, request->user->profile,
+        proxy::InboundRequestTarget{RequestNetwork(request->command), request->target});
+    if (!co_await validator.RegisterSessionIfNew(
             *request->user, request->body_key, request->body_iv)) {
-        const auto reason = request->user
-            ? "session replay admission rejected"
-            : "authentication failed: no authenticated user";
+        // Replay is not a credential failure: it never feeds the ban table.
+        constexpr std::string_view reason = "session replay admission rejected";
         LOG_CONN_WARN(ctx, "request rejected from {}:{} > {}",
                       client_ip, ctx.inbound.source_port, reason);
         LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, reason));
-        if (!request->user && limiter && ctx.inbound.HasProxyProtocolClientIP())
-            co_await limiter->OnAuthFailTracked(tag, client_ip);
-        co_return tl::unexpected(request->user
-            ? ErrorCode::PERMISSION_DENIED : ErrorCode::PROTOCOL_AUTH_FAILED);
+        co_return tl::unexpected(ErrorCode::PERMISSION_DENIED);
     }
 
     LOG_CONN_TRACE(ctx,
@@ -118,20 +113,11 @@ ParseHandshake(AsyncStream& stream,
                    request->target,
                    consumed);
 
-    std::optional<UserOnlineSessionGuard> user_session;
-    if (request->user) {
-        const auto& profile = request->user->profile;
-        ctx.content.speed_limit = profile.speed_limit;
-
-        user_session = co_await proxy::TryAcquireInboundUserSession(
-            validator, tag, profile.user_id, profile.device_limit, ctx);
-        if (!user_session) {
-            co_return tl::unexpected(ErrorCode::PERMISSION_DENIED);
-        }
+    auto user_session = co_await proxy::AdmitAuthenticatedInbound(
+        validator, ctx, request->user->profile);
+    if (!user_session) {
+        co_return tl::unexpected(ErrorCode::PERMISSION_DENIED);
     }
-
-    LOG_CONN_DEBUG(ctx, "authentication succeeded from {}:{} -> {}",
-                   client_ip, ctx.inbound.source_port, request->target);
 
     // Header authentication and replay checks are finished. Body/response keys
     // are already owned by request; do not move a user-table owner into Session.
@@ -139,7 +125,7 @@ ParseHandshake(AsyncStream& stream,
 
     vmess_session.SetRequest(std::move(*request));
 
-    co_return std::move(user_session);
+    co_return std::move(*user_session);
 }
 
 }  // namespace
@@ -169,39 +155,28 @@ proxy::vmess::inbound::Handler::Process(
 {
     const std::string_view tag   = ctx.inbound.tag;
     const std::string_view client_ip = ctx.inbound.source_ip;
-    auto fail = [&](ErrorCode error) {
-        if (stream) {
-            stream->CloseAbortive();
-        }
-        if (error != ErrorCode::CANCELLED && error != ErrorCode::SOCKET_EOF) {
-            stats_->OnError();
-        }
-        RelayResult result;
-        result.error = error;
-        return result;
-    };
 
     LOG_CONN_DEBUG(ctx, "processing connection from {}:{}", client_ip, ctx.inbound.source_port);
 
     if (co_await proxy::CheckInboundIpBanned(limiter_, ctx)) {
-        co_return fail(ErrorCode::BLOCKED);
+        co_return proxy::RejectInbound(*stats_, stream.get(), ErrorCode::BLOCKED);
     }
     ::acpp::vmess::encoding::ServerSession vmess_session(validator_, tag);
     std::optional<UserOnlineSessionGuard> user_session;
     {
         auto parsed_session = co_await ParseHandshake(
-            *stream, vmess_session, validator_, limiter_, ctx, tag, client_ip);
+            *stream, vmess_session, validator_, limiter_, ctx, client_ip);
         if (!parsed_session) {
-            co_return fail(parsed_session.error());
+            co_return proxy::RejectInbound(*stats_, stream.get(), parsed_session.error());
         }
-        user_session = std::move(*parsed_session);
+        user_session.emplace(std::move(*parsed_session));
     }
     const Network net = ctx.content.network;
 
     auto request_reader = vmess_session.DecodeRequestBody(*stream);
     auto response_writer = vmess_session.EncodeResponseBodyWithHeader(*stream);
     if (!request_reader || !response_writer) {
-        co_return fail(ErrorCode::RESOURCE_EXHAUSTED);
+        co_return proxy::RejectInbound(*stats_, stream.get(), ErrorCode::RESOURCE_EXHAUSTED);
     }
 
     if (net == Network::MUX) {

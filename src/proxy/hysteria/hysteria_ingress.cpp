@@ -516,6 +516,8 @@ private:
                       std::span<const uint8_t> data);
     void StartRawStream(int64_t stream_id, StreamRecord& stream);
     net::awaitable<void> RunRawStream(int64_t stream_id);
+    enum class AdmitResult { Admitted, AuthFailed, Limited, DeviceLimited };
+    net::awaitable<AdmitResult> AdmitConnection(std::string_view credential);
     net::awaitable<void> RunV1Control(int64_t stream_id);
     net::awaitable<void> AuthenticateV2(int64_t stream_id);
     bool SetupHttp3();
@@ -1114,6 +1116,43 @@ net::awaitable<void> Connection::RunUdpSession(
     core_->udp_sessions.erase(session_id);
 }
 
+net::awaitable<Connection::AdmitResult> Connection::AdmitConnection(
+    std::string_view credential) {
+    base_context_.conn_id = session::NewID(worker_id_);
+    base_context_.worker_id = worker_id_;
+    base_context_.inbound.source_addr = core_->remote.address();
+    base_context_.inbound.source_ip = core_->remote.address().to_string();
+    base_context_.inbound.source_port = core_->remote.port();
+    base_context_.inbound.tag = receiver_.inbound_tag;
+    base_context_.inbound.accounting_key = receiver_.accounting_key;
+    base_context_.content.protocol = receiver_.protocol;
+    user_ = proxyman::inbound::UserStore::FindHysteriaUser(
+        receiver_.inbound_tag, HashCredential(credential));
+    if (!user_) {
+        co_await RecordInboundAuthFailure(
+            limiter_.get(), base_context_, "no matching credential");
+        stats_.OnError();
+        co_return AdmitResult::AuthFailed;
+    }
+    if (limiter_) {
+        auto admission = co_await limiter_->ReservePhysical(
+            receiver_.inbound_tag, base_context_.inbound.source_ip, true);
+        if (admission.reason != ConnectionLimiter::RejectReason::NONE) {
+            co_return AdmitResult::Limited;
+        }
+        admission_.emplace(std::move(admission));
+    }
+    const auto profile = user_->profile;
+    user_.reset();
+    BindAuthenticatedInbound(base_context_, profile, std::nullopt);
+    auto session = co_await AdmitAuthenticatedInbound(
+        online_tracker_, base_context_, profile);
+    if (!session) co_return AdmitResult::DeviceLimited;
+    online_session_.emplace(std::move(*session));
+    authenticated_ = true;
+    co_return AdmitResult::Admitted;
+}
+
 net::awaitable<void> Connection::RunV1Control(int64_t stream_id) {
     auto it = core_->streams.find(stream_id);
     if (it == core_->streams.end()) co_return;
@@ -1129,39 +1168,13 @@ net::awaitable<void> Connection::RunV1Control(int64_t stream_id) {
         hello = ParseV1ClientHello(hello_bytes);
         if (!hello && hello.error() != ProtocolError::Incomplete) co_return;
     }
-    base_context_.conn_id = session::NewID(worker_id_);
-    base_context_.worker_id = worker_id_;
-    base_context_.inbound.source_addr = core_->remote.address();
-    base_context_.inbound.source_ip = core_->remote.address().to_string();
-    base_context_.inbound.source_port = core_->remote.port();
-    base_context_.inbound.tag = receiver_.inbound_tag;
-    base_context_.inbound.accounting_key = receiver_.accounting_key;
-    base_context_.content.protocol = receiver_.protocol;
-    user_ = proxyman::inbound::UserStore::FindHysteriaUser(
-        receiver_.inbound_tag, HashCredential(hello->auth));
-    if (!user_) {
+    const auto result = co_await AdmitConnection(hello->auth);
+    if (result == AdmitResult::AuthFailed) {
         auto response = EncodeV1ServerHello(false, 0, 0, "authentication failed");
         co_await state->WriteMultiBuffer(CopyPacket(response));
-        stats_.OnError();
         co_return;
     }
-    if (limiter_) {
-        auto admission = co_await limiter_->ReservePhysical(
-            receiver_.inbound_tag, base_context_.inbound.source_ip, true);
-        if (admission.reason != ConnectionLimiter::RejectReason::NONE) co_return;
-        admission_.emplace(std::move(admission));
-    }
-    const auto profile = user_->profile;
-    user_.reset();
-    base_context_.inbound.user_email = profile.email;
-    base_context_.inbound.user_id = profile.user_id;
-    base_context_.content.speed_limit = profile.speed_limit;
-    auto session = co_await TryAcquireInboundUserSession(
-        online_tracker_, receiver_.inbound_tag, profile.user_id,
-        profile.device_limit, base_context_);
-    if (!session) co_return;
-    online_session_.emplace(std::move(*session));
-    authenticated_ = true;
+    if (result != AdmitResult::Admitted) co_return;
     auto response = EncodeV1ServerHello(
         true, settings_.download_bytes_per_second,
         settings_.upload_bytes_per_second, "");
@@ -1272,44 +1285,15 @@ net::awaitable<void> Connection::AuthenticateV2(int64_t stream_id) {
         SubmitHttpStatus(stream_id, "404", false);
         co_return;
     }
-    base_context_.conn_id = session::NewID(worker_id_);
-    base_context_.worker_id = worker_id_;
-    base_context_.inbound.source_addr = core_->remote.address();
-    base_context_.inbound.source_ip = core_->remote.address().to_string();
-    base_context_.inbound.source_port = core_->remote.port();
-    base_context_.inbound.tag = receiver_.inbound_tag;
-    base_context_.inbound.accounting_key = receiver_.accounting_key;
-    base_context_.content.protocol = receiver_.protocol;
-    user_ = proxyman::inbound::UserStore::FindHysteriaUser(
-        receiver_.inbound_tag, HashCredential(request.auth));
-    if (!user_) {
+    const auto result = co_await AdmitConnection(request.auth);
+    if (result == AdmitResult::AuthFailed) {
         SubmitHttpStatus(stream_id, "404", false);
-        stats_.OnError();
         co_return;
     }
-    if (limiter_) {
-        auto admission = co_await limiter_->ReservePhysical(
-            receiver_.inbound_tag, base_context_.inbound.source_ip, true);
-        if (admission.reason != ConnectionLimiter::RejectReason::NONE) {
-            SubmitHttpStatus(stream_id, "429", false);
-            co_return;
-        }
-        admission_.emplace(std::move(admission));
-    }
-    const auto profile = user_->profile;
-    user_.reset();
-    base_context_.inbound.user_email = profile.email;
-    base_context_.inbound.user_id = profile.user_id;
-    base_context_.content.speed_limit = profile.speed_limit;
-    auto session = co_await TryAcquireInboundUserSession(
-        online_tracker_, receiver_.inbound_tag, profile.user_id,
-        profile.device_limit, base_context_);
-    if (!session) {
+    if (result != AdmitResult::Admitted) {
         SubmitHttpStatus(stream_id, "429", false);
         co_return;
     }
-    online_session_.emplace(std::move(*session));
-    authenticated_ = true;
     SubmitHttpStatus(stream_id, "233", true);
 }
 

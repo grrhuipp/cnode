@@ -80,12 +80,7 @@ PrepareSsTcpSession(
     if (!session_result) {
         const ErrorCode error = session_result.error();
         if (error == ErrorCode::PROTOCOL_AUTH_FAILED) {
-            LOG_CONN_WARN(ctx, "authentication failed from {}:{} > no matching credential",
-                          client_ip, ctx.inbound.source_port);
-            LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "authentication failed: no matching credential"));
-            if (limiter && ctx.inbound.HasProxyProtocolClientIP()) {
-                co_await limiter->OnAuthFailTracked(tag, client_ip);
-            }
+            co_await proxy::RecordInboundAuthFailure(limiter, ctx, "no matching credential");
         } else if (error == ErrorCode::SOCKET_READ_FAILED) {
             // ReadTCPSession returns this code when ReadFull reaches EOF;
             // transport errors throw instead.
@@ -102,32 +97,21 @@ PrepareSsTcpSession(
     auto request_reader = std::move(session_result->body_reader);
     const auto* matched = session_result->user.get();
     if (!matched) {
-        LOG_CONN_WARN(ctx, "authentication failed from {}:{} > no authenticated user",
-                      client_ip, ctx.inbound.source_port);
-        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "authentication failed: no authenticated user"));
-        if (limiter && ctx.inbound.HasProxyProtocolClientIP()) {
-            co_await limiter->OnAuthFailTracked(tag, client_ip);
-        }
+        co_await proxy::RecordInboundAuthFailure(limiter, ctx, "no authenticated user");
         co_return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
     }
 
-    const auto& profile = matched->profile;
-    ctx.inbound.user_id = profile.user_id;
-    ctx.inbound.user_email = profile.email;
-    ctx.content.speed_limit = profile.speed_limit;
+    // UoT resolves its UDP destination only after admission; the magic address
+    // is admitted as the TCP request target, as before.
     const auto uot_version = proxy::uot::VersionFromMagicAddress(session_result->target);
-    ctx.outbound.original_target = session_result->target;
-    ctx.outbound.target = std::move(session_result->target);
-    ctx.content.network = Network::TCP;
-
-    auto user_session = co_await proxy::TryAcquireInboundUserSession(
-        validator, tag, profile.user_id, profile.device_limit, ctx);
+    proxy::BindAuthenticatedInbound(
+        ctx, matched->profile,
+        proxy::InboundRequestTarget{Network::TCP, std::move(session_result->target)});
+    auto user_session = co_await proxy::AdmitAuthenticatedInbound(
+        validator, ctx, matched->profile);
     if (!user_session) {
         co_return tl::unexpected(ErrorCode::PERMISSION_DENIED);
     }
-
-    LOG_CONN_DEBUG(ctx, "authentication succeeded from {}:{} -> {}",
-                   client_ip, ctx.inbound.source_port, ctx.outbound.target);
 
     auto response_writer_result = ss::WriteTCPResponse(
         *matched, cipher_info, session_result->request_salt, stream);
@@ -175,16 +159,7 @@ net::awaitable<RelayResult> DispatchSsUotSession(
                    : MapAsioError(e.code()));
     }
     if (!prepared) {
-        if (stream) {
-            stream->CloseAbortive();
-        }
-        if (prepared.error() != ErrorCode::CANCELLED &&
-            prepared.error() != ErrorCode::SOCKET_EOF) {
-            stats.OnError();
-        }
-        RelayResult result;
-        result.error = prepared.error();
-        co_return result;
+        co_return proxy::RejectInbound(stats, stream.get(), prepared.error());
     }
     const bool is_connect = prepared->is_connect;
     const TargetAddress udp_target = prepared->destination;
@@ -256,22 +231,11 @@ proxy::shadowsocks::inbound::Handler::Process(
 
     const std::string_view tag   = ctx.inbound.tag;
     const std::string_view client_ip = ctx.inbound.source_ip;
-    auto fail = [&](ErrorCode error) {
-        if (stream) {
-            stream->CloseAbortive();
-        }
-        if (error != ErrorCode::CANCELLED && error != ErrorCode::SOCKET_EOF) {
-            stats_->OnError();
-        }
-        RelayResult result;
-        result.error = error;
-        return result;
-    };
 
     LOG_CONN_DEBUG(ctx, "processing connection from {}:{}", client_ip, ctx.inbound.source_port);
 
     if (co_await proxy::CheckInboundIpBanned(limiter_, ctx)) {
-        co_return fail(ErrorCode::BLOCKED);
+        co_return proxy::RejectInbound(*stats_, stream.get(), ErrorCode::BLOCKED);
     }
     std::unique_ptr<transport::MultiBufferReader> request_reader;
     std::unique_ptr<transport::MultiBufferWriter> response_writer;
@@ -289,7 +253,7 @@ proxy::shadowsocks::inbound::Handler::Process(
             tag,
             client_ip);
         if (!prepared) {
-            co_return fail(prepared.error());
+            co_return proxy::RejectInbound(*stats_, stream.get(), prepared.error());
         }
         request_reader = std::move(prepared->request_reader);
         response_writer = std::move(prepared->response_writer);

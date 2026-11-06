@@ -448,8 +448,7 @@ SessionConfiguration::SessionConfiguration(const WorkerRuntimeConfig& config,
     if (!router || !policy) throw std::invalid_argument("missing session configuration");
 }
 
-struct PhysicalSessionCapabilities::Impl final : memory::ThreadAllocated,
-                                                proxyman::inbound::Handler::ProtocolProvider {
+struct PhysicalSessionCapabilities::Impl final : memory::ThreadAllocated {
     // Stateless tags remain physical-local. Stateful tags return a lease that
     // joins their independent host before entering the real protocol handler.
     class Outbounds final : public features::outbound::HandlerLookup {
@@ -498,31 +497,21 @@ struct PhysicalSessionCapabilities::Impl final : memory::ThreadAllocated,
         : owner(owner_value), reactor(io), dns(owner.dns_worker_),
           tasks(owner.Domain()->Executor()) {
         handler = memory::AllocateShared<proxyman::inbound::Handler>(
-            owner.receiver_, *this, *owner.limiter_);
+            owner.receiver_,
+            proxyman::inbound::Handler::LazyProtocol{
+                owner.prepared_, &owner.stats_, owner.limiter_.get()},
+            *owner.limiter_);
         outbounds = std::make_unique<Outbounds>(*owner.configuration_, io, dns, tasks.Tasks());
         dispatcher = std::make_unique<dispatcher::DefaultDispatcher>(
             *owner.configuration_->router, *outbounds, *owner.configuration_->policy,
             *owner.tracking_, dns, *owner.request_load_);
     }
 
-    Inbound& GetProxy() override {
-        if (!proxy) {
-            if (!protocol)
-                protocol = proxyman::inbound::NewProtocolRuntime(owner.prepared_->protocol);
-            if (!protocol) throw std::invalid_argument("missing session protocol runtime");
-            proxy = proxyman::inbound::NewHandler(owner.prepared_->protocol,
-                *protocol, owner.stats_, owner.limiter_.get(), *owner.prepared_);
-            if (!proxy) throw std::invalid_argument("missing session inbound handler");
-        }
-        return *proxy;
-    }
 
     PhysicalSessionCapabilities& owner;
     net::io_context& reactor;
     dns::DNS dns;
     ResidentTaskGroup tasks;
-    std::unique_ptr<proxyman::inbound::ProtocolRuntime> protocol;
-    std::unique_ptr<Inbound> proxy;
     std::shared_ptr<proxyman::inbound::Handler> handler;
     std::unique_ptr<Outbounds> outbounds;
     std::unique_ptr<dispatcher::DefaultDispatcher> dispatcher;
@@ -626,10 +615,12 @@ net::awaitable<void> PhysicalSessionCapabilities::AsyncJoin() {
     catch (...) { if (!failure) failure = std::current_exception(); }
     // Break transport/executor leases only after real completion callbacks.
     impl_->dispatcher.reset();
-    impl_->handler.reset();
+    // The handler's lazily built protocol state goes with the protocol layer:
+    // after outbounds, before the reactor's timeout scheduler is released.
+    auto handler = std::move(impl_->handler);
     impl_->outbounds.reset();
-    impl_->proxy.reset();
-    impl_->protocol.reset();
+    handler->ReleaseProtocol();
+    handler.reset();
     auto& reactor = impl_->reactor;
     try { co_await TimeoutScheduler::AsyncReleaseForIoContext(reactor); }
     catch (...) { if (!failure) failure = std::current_exception(); }
@@ -648,8 +639,8 @@ PhysicalSessionCapabilities::TrackingOwner() const noexcept {
 }
 StatsShard& PhysicalSessionCapabilities::Stats() noexcept { return stats_; }
 std::vector<OnlineDevice> PhysicalSessionCapabilities::GetOnlineDevices(std::string_view tag) const {
-    return impl_ && impl_->protocol ? impl_->protocol->GetOnlineDevices(tag)
-                                   : std::vector<OnlineDevice>{};
+    const auto* runtime = impl_ && impl_->handler ? impl_->handler->Runtime() : nullptr;
+    return runtime ? runtime->GetOnlineDevices(tag) : std::vector<OnlineDevice>{};
 }
 void PhysicalSessionCapabilities::UpdateUserView(
     proxyman::inbound::UserStore::WorkerView view) noexcept {

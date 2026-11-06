@@ -87,7 +87,8 @@
 ## 请求主链路
 
 - **唯一热路径**：所有 TCP / UDP / QUIC 请求只能走“入站处理 → 分发 → 出站处理 → 转发”。任意协议都只是 Handler 实现，不拥有独立架构；删除一个协议不影响分发、路由、转发和 Worker。
-- **统一入站契约**：认证结果之后的接入编排（准入与连接限制、IP 封禁计数、用户上下文写入、在线设备占位、连接统计、失败收尾）只有一个公共入口；协议只返回认证与目标解析结果，不各自复制这段编排，也不跳过其中任一步。
+- **主链路对象模型对齐 Xray-core**：类型职责与调用顺序以 Xray-core 为权威范式，保留 C++ 的值所有权与单次分派实现。proxyman 入站 Handler 构造会话上下文并调用 `proxy::Inbound::Process(stream, dispatcher, …)`；协议认证后写入用户身份并调用 `routing::Dispatcher::Dispatch`；Dispatcher 经嗅探、路由、策略选出 proxyman 出站 Handler（具体类，持有 `proxy::Outbound`、会话池/mux 与 sendThrough/流设置，并作为该出站唯一的 Dial 提供者），再调用一次 `proxy::Outbound::Process(link, dialer)`；转发统一由 relay 完成。QUIC 类协议（Hysteria）按 Xray `transport/internet/hysteria` 的划分：QUIC、HTTP/3 认证与流/数据报会话属于传输层，每个逻辑流或 UDP 会话作为逻辑传输流交给同一入站 Handler 与 `Inbound::Process`。传输层回落（REALITY dest）按 Xray 留在传输层，但复用公共拨号、转发、准入与统计。新增或重构主链路组件时先对照 Xray-core 对应类型，不发明平行对象模型。
+- **统一入站契约**：认证结果之后的接入编排（准入与连接限制、IP 封禁计数、用户上下文写入、在线设备占位、连接统计、失败收尾）只有一个公共入口；协议只返回认证与目标解析结果，不各自复制这段编排，也不跳过其中任一步。在线设备按会话级占位：物理会话（或 QUIC 连接）认证成功后占位一次，子流继承，不在每次分发重复占位。
 - **窄 helper**：原生 datagram、UDP-over-TCP、Mux/子流与传输层回落只能是服务主链路的窄 helper，不得承载协议私有架构、路由选择、panel 字段或第二条请求链路，不得自行拨号、转发或绕过准入、限速与统计。
 - **单次分派**：协议边界只允许一次虚调用或无捕获函数指针分派。协议内部与出站外层不得再套 wrapper、adapter、代理 handler 或第二条请求链路；单实现运行时组件不得叠加无意义的多层虚接口或 `shared_ptr` 句柄转发。
 - **零抽象成本**：注册表、无捕获函数指针与一次虚函数绑定只发生在启动或配置准备期。请求期不得新增 mutex、rwlock、spinlock、共享原子争用、`std::function` 链、多余 `shared_ptr`/`weak_ptr` 分配、`void*`/`shared_ptr<void>` 类型擦除，或按包/按请求动态拼接字符串键与路由规则名。
