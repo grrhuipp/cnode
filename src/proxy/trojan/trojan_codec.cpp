@@ -52,7 +52,10 @@ RequestDecodeResult DecodeRequest(std::span<const uint8_t> data) {
         result.status = RequestDecodeStatus::InvalidHeader;
         return result;
     }
-
+    if (!address.target.IsValid()) {
+        result.status = RequestDecodeStatus::InvalidAddress;
+        return result;
+    }
     std::memcpy(result.request.password_hash.data(), data.data(), kPasswordHashSize);
     result.request.command = static_cast<TrojanCommand>(command);
     result.request.target = std::move(address.target);
@@ -80,8 +83,18 @@ size_t EncodeRequestTo(
     if (!output || header_size > output_size - payload_len) {
         return 0;
     }
+    if (target.IsDomain() && !target.host.empty()) {
+        const auto host = reinterpret_cast<uintptr_t>(target.host.data());
+        const auto addr_out = reinterpret_cast<uintptr_t>(output + 56 + 2 + 1);
+        if (host <= addr_out ? addr_out - host < target.host.size() : host - addr_out < addr_size) {
+            return 0;
+        }
+    }
+    if (payload && payload_len > 0) {
+        std::memmove(output + header_size, payload, payload_len);
+    }
 
-    ByteWriter writer(output, output_size);
+    ByteWriter writer(output, header_size);
 
     writer.WriteString(std::string_view(password_hash.data(), password_hash.size()));
     writer.WriteU8(0x0D);
@@ -89,18 +102,14 @@ size_t EncodeRequestTo(
     writer.WriteU8(static_cast<uint8_t>(cmd));
 
     const size_t encoded = EncodeAddressTo(target, output + writer.Position(),
-        output_size - writer.Position(), AddressWireFormat::Socks5);
+        header_size - writer.Position(), AddressWireFormat::Socks5);
     if (encoded == 0) return 0;
     ByteWriter tail(output + writer.Position() + encoded,
-                    output_size - writer.Position() - encoded);
+                    header_size - writer.Position() - encoded);
     tail.WriteU8(0x0D);
     tail.WriteU8(0x0A);
 
-    if (payload && payload_len > 0) {
-        tail.WriteBytes(payload, payload_len);
-    }
-
-    return writer.Position() + encoded + tail.Position();
+    return writer.Position() + encoded + tail.Position() + payload_len;
 }
 
 size_t EncodeUdpPacketHeaderTo(

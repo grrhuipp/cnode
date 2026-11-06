@@ -157,6 +157,64 @@ void TestFailedReplacement() {
             "failed replacement must retain the complete old answer");
 }
 
+struct NegativeEvent {
+    std::string domain, reason, event;
+    uint64_t hits;
+};
+std::vector<NegativeEvent> negative_events;
+
+void RecordNegativeEvent(std::string_view domain, std::string_view reason,
+                         uint64_t hits, std::string_view event) {
+    negative_events.push_back({std::string(domain), std::string(reason), std::string(event), hits});
+}
+
+void TestNegativeEventLifecycle() {
+    negative_events.clear();
+    DnsResult negative;
+    negative.error = acpp::ErrorCode::DNS_NO_RECORD;
+    negative.error_msg = "NXDOMAIN";
+    negative.ttl = 60;
+    {
+        DnsCache cache(1, 0, 600, RecordNegativeEvent);
+        cache.Store("negative.example", negative);
+        for (size_t i = 0; i < 128; ++i) {
+            const auto result = cache.GetResult("negative.example");
+            Require(result && result->error_msg == "NXDOMAIN",
+                    "every suppressed hit must retain the original negative reason");
+        }
+        Require(negative_events.empty(), "repeated cache hits must not emit repeated diagnostics");
+        cache.Store("negative.example", Answer("192.0.2.1"));
+        Require(negative_events.size() == 1 && negative_events[0].event == "recovered" &&
+                    negative_events[0].hits == 128 && negative_events[0].reason == "NXDOMAIN",
+                "recovery must publish the exact suppressed hit count and initial reason");
+
+        negative.error_msg = "NODATA";
+        negative.ttl = 0;
+        cache.Store("expired.example", negative);
+        Require(!cache.GetResult("expired.example") && cache.GetStats().entries == 0,
+                "expired negatives must not be served or counted as live cache entries");
+        Require(negative_events.size() == 2 && negative_events.back().event == "expired",
+                "expiry must publish one summary");
+        Require(!cache.GetResult("expired.example") && negative_events.size() == 2,
+                "repeated expired lookups must not repeat expiry diagnostics");
+        cache.Store("expired.example", Answer("192.0.2.2"));
+        Require(negative_events.size() == 3 && negative_events.back().event == "recovered" &&
+                    negative_events.back().reason == "NODATA",
+                "successful refresh after expiry must retain the old negative reason");
+
+        negative.ttl = 60;
+        cache.Store("evicted.example", negative);
+        (void)cache.GetResult("evicted.example");
+        cache.Store("shutdown.example", negative);
+        Require(negative_events.size() == 4 && negative_events.back().event == "evicted" &&
+                    negative_events.back().hits == 1 && cache.GetStats().entries == 1,
+                "eviction must summarize counts and keep metadata inside the cache capacity");
+    }
+    Require(negative_events.size() == 5 && negative_events.back().event == "shutdown",
+            "shutdown must summarize remaining live negative entries");
+    negative_events.clear();
+}
+
 }  // namespace
 
 int main() {
@@ -169,6 +227,7 @@ int main() {
         TestFailedInsertion(true);
         TestFailedReplacement();
         TestCapacityAndResults();
+        TestNegativeEventLifecycle();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         passed = false;

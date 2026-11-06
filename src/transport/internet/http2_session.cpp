@@ -130,8 +130,16 @@ net::awaitable<std::optional<H2Frame>> ReadH2Frame(AsyncStream& stream) {
     std::array<uint8_t, kHttp2FrameHeaderSize> header{};
     size_t received = 0;
     while (received != header.size()) {
-        const size_t n = co_await stream.AsyncRead(
-            net::buffer(header.data() + received, header.size() - received));
+        size_t n = 0;
+        try {
+            n = co_await stream.AsyncRead(
+                net::buffer(header.data() + received, header.size() - received));
+        } catch (const IoSystemError& error) {
+            if (received != 0 && error.code() == io_error::operation_aborted) {
+                throw IoSystemError(io_error::connection_reset, "cancelled mid-HTTP/2 frame header");
+            }
+            throw;
+        }
         if (n == 0) {
             if (received == 0) co_return std::nullopt;
             throw IoSystemError(io_error::connection_reset, "truncated HTTP/2 frame header");
@@ -149,10 +157,20 @@ net::awaitable<std::optional<H2Frame>> ReadH2Frame(AsyncStream& stream) {
         throw IoSystemError(io_error::message_size, "HTTP/2 frame exceeds receive limit");
     }
     frame.payload.resize(frame.length);
-    if (frame.length > 0 &&
-        !co_await ReadFullFromStream(
-            stream, frame.payload.data(), frame.payload.size())) {
-        throw IoSystemError(io_error::connection_reset, "truncated HTTP/2 frame payload");
+    if (frame.length > 0) {
+        bool ok = false;
+        try {
+            ok = co_await ReadFullFromStream(
+                stream, frame.payload.data(), frame.payload.size());
+        } catch (const IoSystemError& error) {
+            if (error.code() == io_error::operation_aborted) {
+                throw IoSystemError(io_error::connection_reset, "cancelled mid-HTTP/2 frame payload");
+            }
+            throw;
+        }
+        if (!ok) {
+            throw IoSystemError(io_error::connection_reset, "truncated HTTP/2 frame payload");
+        }
     }
     co_return frame;
 }
@@ -299,6 +317,35 @@ void AppendHpackLiteralNewName(memory::ByteVector& out,
     return h;
 }
 
+[[nodiscard]] bool IsConnectionSpecificHttp2Header(std::string_view key) noexcept {
+    return EqualsAsciiCI(key, "host") ||
+          EqualsAsciiCI(key, "connection") ||
+          EqualsAsciiCI(key, "keep-alive") ||
+          EqualsAsciiCI(key, "proxy-connection") ||
+          EqualsAsciiCI(key, "transfer-encoding") ||
+          EqualsAsciiCI(key, "upgrade");
+}
+
+[[nodiscard]] memory::ThreadLocalString LowercaseAscii(std::string_view input) {
+    memory::ThreadLocalString out(input);
+    for (char& ch : out) {
+        if (ch >= 'A' && ch <= 'Z') {
+            ch = static_cast<char>(ch - 'A' + 'a');
+        }
+    }
+    return out;
+}
+
+[[nodiscard]] constexpr bool IsValidHttp2HeaderName(std::string_view name) noexcept {
+    if (name.empty()) return false;
+    for (const unsigned char ch : name) {
+        if (!(ch > 0x20 && ch < 0x7f && !(ch >= 'A' && ch <= 'Z') && ch != ':')) {
+            return false;
+        }
+    }
+    return true;
+}
+
 [[nodiscard]] memory::ByteVector EncodeHttpRequestHeaders(
     std::string_view authority,
     bool tls,
@@ -327,10 +374,11 @@ void AppendHpackLiteralNewName(memory::ByteVector& out,
         AppendHpackLiteralIndexedName(h, 1, authority); // :authority
     }
     for (const auto& [key, value] : cfg.headers) {
-        if (key.empty() || EqualsAsciiCI(key, "Host")) {
+        if (key.empty() || IsConnectionSpecificHttp2Header(key)) {
             continue;
         }
-        AppendHpackLiteralNewName(h, key, value);
+        const auto lower_key = LowercaseAscii(key);
+        AppendHpackLiteralNewName(h, lower_key, value);
     }
     return h;
 }
@@ -341,10 +389,11 @@ void AppendHpackLiteralNewName(memory::ByteVector& out,
     AppendHpackIndexed(h, 8); // :status: 200
     AppendHpackLiteralNewName(h, "cache-control", "no-store");
     for (const auto& [key, value] : headers) {
-        if (key.empty()) {
+        if (key.empty() || IsConnectionSpecificHttp2Header(key)) {
             continue;
         }
-        AppendHpackLiteralNewName(h, key, value);
+        const auto lower_key = LowercaseAscii(key);
+        AppendHpackLiteralNewName(h, lower_key, value);
     }
     return h;
 }
@@ -573,9 +622,11 @@ public:
             return true;
         };
         size_t offset = 0;
+        bool allow_dynamic_resize = true;
         while (offset < block.size()) {
             const uint8_t first = block[offset];
             if ((first & 0x80) != 0) {
+                allow_dynamic_resize = false;
                 const auto index = ReadInteger(block, offset, 7);
                 const auto field = index ? Lookup(*index) : std::nullopt;
                 if (!field ||
@@ -587,6 +638,7 @@ public:
                 continue;
             }
             if ((first & 0x40) != 0) {
+                allow_dynamic_resize = false;
                 auto field = ReadLiteral(block, offset, 6);
                 if (!field) {
                     return std::nullopt;
@@ -598,12 +650,16 @@ public:
                 continue;
             }
             if ((first & 0x20) != 0) {
+                if (!allow_dynamic_resize) {
+                    return std::nullopt;
+                }
                 auto size = ReadInteger(block, offset, 5);
                 if (!size || !ResizeDynamic(*size)) {
                     return std::nullopt;
                 }
                 continue;
             }
+            allow_dynamic_resize = false;
             auto field = ReadLiteral(block, offset, 4);
             if (!field || !append_field(std::move(*field))) {
                 return std::nullopt;
@@ -997,6 +1053,32 @@ struct H2RequestHeaders {
 // RFC 9113 8.3: each request pseudo-header appears at most once, none in
 // trailers, and Host must agree with :authority. Ambiguous requests are
 // malformed (8.1.1) rather than resolved by field order.
+[[nodiscard]] bool AuthorityMatchesHost(std::string_view authority,
+                                        std::string_view expected_host) noexcept {
+    authority = TrimAscii(authority);
+    expected_host = TrimAscii(expected_host);
+    if (EqualsAsciiCI(authority, expected_host)) {
+        return true;
+    }
+    const auto strip_port = [](std::string_view value) noexcept {
+        if (value.starts_with('[')) {
+            const size_t close = value.find(']');
+            if (close != std::string_view::npos) {
+                return value.substr(0, close + 1);
+            }
+            return value;
+        }
+        const size_t colon = value.find(':');
+        if (colon != std::string_view::npos &&
+            value.find(':', colon + 1) == std::string_view::npos) {
+            return value.substr(0, colon);
+        }
+        return value;
+    };
+    return strip_port(expected_host) == expected_host &&
+           EqualsAsciiCI(strip_port(authority), expected_host);
+}
+
 [[nodiscard]] std::optional<H2RequestHeaders> ParseH2RequestHeaders(
     HpackDecoder::HeaderFields fields, std::string_view real_ip_header, bool trailers) {
     H2RequestHeaders request;
@@ -1004,6 +1086,8 @@ struct H2RequestHeaders {
     bool has_method = false;
     bool has_path = false;
     bool has_authority = false;
+    bool has_scheme = false;
+    bool seen_regular = false;
     const auto take_once = [](bool& seen, memory::ThreadLocalString& out,
                               memory::ThreadLocalString& value) {
         if (seen) return false;
@@ -1014,30 +1098,46 @@ struct H2RequestHeaders {
     for (auto& field : fields) {
         const std::string_view name = field.name;
         if (name.starts_with(':')) {
-            if (trailers) return std::nullopt;
-            bool accepted = true;
+            if (trailers || seen_regular) return std::nullopt;
+            bool accepted = false;
             if (name == ":method") {
                 accepted = take_once(has_method, request.method, field.value);
             } else if (name == ":path") {
                 accepted = take_once(has_path, request.path, field.value);
             } else if (name == ":authority") {
                 accepted = take_once(has_authority, request.authority, field.value);
+            } else if (name == ":scheme") {
+                if (!has_scheme && !field.value.empty()) {
+                    has_scheme = true;
+                    accepted = true;
+                }
             }
             if (!accepted) return std::nullopt;
-        } else if (name == "host") {
-            if (host) return std::nullopt;
-            host = std::move(field.value);
-        } else if (!real_ip_header.empty() && EqualsAsciiCI(name, real_ip_header)) {
-            if (!request.metadata.real_ip.empty()) return std::nullopt;
-            request.metadata.real_ip = std::move(field.value);
-            request.metadata.real_ip_header.assign(real_ip_header);
+        } else {
+            if (!IsValidHttp2HeaderName(name)) return std::nullopt;
+            seen_regular = true;
+            if (name == "host") {
+                if (host) return std::nullopt;
+                host = std::move(field.value);
+            } else if (!trailers && !real_ip_header.empty() &&
+                       EqualsAsciiCI(name, real_ip_header)) {
+                if (request.metadata.real_ip.empty()) {
+                    const std::string_view value(field.value);
+                    const std::string_view real_ip =
+                        TrimAscii(value.substr(0, value.find(',')));
+                    if (!real_ip.empty()) {
+                        request.metadata.real_ip.assign(real_ip);
+                        request.metadata.real_ip_header.assign(real_ip_header);
+                    }
+                }
+            }
         }
     }
     if (host) {
         if (has_authority && !EqualsAsciiCI(request.authority, *host)) return std::nullopt;
         if (!has_authority) request.authority = std::move(*host);
     }
-    if (!trailers && (request.method.empty() || request.path.empty())) {
+    if (!trailers && (request.method.empty() || request.path.empty() || !has_scheme)) {
         return std::nullopt;
     }
     return request;
@@ -1049,7 +1149,8 @@ struct H2RequestHeaders {
 // against the receive windows this client advertised and queues for the
 // reader; its credit returns to the peer only when the reader takes it, so the
 // queue never outgrows those windows (RFC 9113 6.9.1).
-class Http2ClientStream final : public AsyncStream {
+class Http2ClientStream final : public AsyncStream,
+                                private transport::CancellationSubscription {
 public:
     transport::EofAction ReadEofAction() const noexcept override {
         return transport::EofAction::ShutdownPeerWrite;
@@ -1058,13 +1159,24 @@ public:
     Http2ClientStream(std::unique_ptr<AsyncStream> inner,
                       uint32_t stream_id,
                       H2PayloadCodec payload_codec,
-                      uint32_t local_initial_window)
+                      uint32_t local_initial_window,
+                      uint32_t conn_recv_window = H2SendWindow::kDefault,
+                      bool write_closed = false)
         : inner_(std::move(inner))
         , stream_id_(stream_id)
         , payload_codec_(payload_codec)
-        , local_initial_window_(local_initial_window) {}
+        , conn_recv_window_(std::max<int64_t>(conn_recv_window, H2SendWindow::kDefault))
+        , stream_recv_window_(std::max<int64_t>(local_initial_window, H2SendWindow::kDefault))
+        , local_initial_window_(local_initial_window)
+        , write_closed_(write_closed) {
+        if (inner_) {
+            (void)inner_->DeferWriteCancellation();
+            Resubscribe(inner_->Cancellation());
+        }
+    }
 
     ~Http2ClientStream() noexcept override {
+        Unsubscribe();
         Close();
     }
 
@@ -1153,15 +1265,10 @@ public:
         hunk_.Clear();
         ReleaseDataFrame();
         received_.clear();
-        inner_->ShutdownRead();
     }
 
     void ShutdownWrite() override {
-        if (write_closed_) {
-            return;
-        }
         write_closed_ = true;
-        inner_->ShutdownWrite();
     }
 
     net::awaitable<void> AsyncShutdownWrite() override {
@@ -1175,13 +1282,16 @@ public:
     }
 
     void Cancel() noexcept override {
-        write_gate_.Cancel();
         AbortPumpWaits();
-        NotifyCancellation();
         inner_->Cancel();
     }
 
+    transport::CancellationSource& Cancellation() noexcept override {
+        return inner_->Cancellation();
+    }
+
     void Close() override {
+        Unsubscribe();
         write_gate_.Cancel();
         AbortPumpWaits();
         NotifyClosed();
@@ -1196,6 +1306,7 @@ public:
     }
 
     void CloseAbortive() override {
+        Unsubscribe();
         write_gate_.Cancel();
         AbortPumpWaits();
         NotifyClosed();
@@ -1203,6 +1314,9 @@ public:
             return;
         }
         closed_ = true;
+        hunk_.Clear();
+        ReleaseDataFrame();
+        received_.clear();
         inner_->CloseAbortive();
     }
 
@@ -1230,6 +1344,7 @@ private:
         memory::ByteVector payload;
         size_t offset = 0;
         size_t end = 0;
+        uint32_t flow_bytes = 0;
     };
 
     void ReleaseDataFrame() noexcept {
@@ -1277,13 +1392,20 @@ private:
             const auto consumed = hunk_.Feed(bytes);
             if (!consumed) ThrowHttp2StreamError(consumed.error().data());
             data_offset_ += *consumed;
+            if (data_offset_ >= data_end_) ReleaseDataFrame();
         }
         co_return true;
     }
 
     net::awaitable<AsyncWriteGate::Lease> AcquireWrite() {
         auto lease = co_await write_gate_.Acquire();
-        if (!lease) ThrowHttp2StreamError("HTTP/2 write cancelled");
+        if (!lease) {
+            const auto cancellation = co_await net::this_coro::cancellation_state;
+            if (cancellation.cancelled() != net::cancellation_type::none) {
+                throw IoSystemError(io_error::operation_aborted, "HTTP/2 write cancelled");
+            }
+            ThrowHttp2StreamError("HTTP/2 write cancelled");
+        }
         co_return lease;
     }
 
@@ -1301,9 +1423,16 @@ private:
     // a reader pumping frames can still answer SETTINGS and PING meanwhile.
     net::awaitable<void> SendData(std::span<const net::const_buffer> buffers) {
         H2DataCursor cursor(buffers);
+        const auto cancellation = co_await net::this_coro::cancellation_state;
         while (cursor.Remaining() != 0) {
+            if (cancellation.cancelled() != net::cancellation_type::none) {
+                throw IoSystemError(io_error::operation_aborted);
+            }
             auto lease = write_gate_.TryAcquire();
             if (!lease) lease = co_await AcquireWrite();
+            if (cancellation.cancelled() != net::cancellation_type::none) {
+                throw IoSystemError(io_error::operation_aborted);
+            }
             if (write_closed_) ThrowHttp2StreamError("HTTP/2 write on closed stream");
             const size_t credit = std::min({cursor.Remaining(),
                                             kHttp2MaxFramePayload,
@@ -1311,7 +1440,7 @@ private:
                                             stream_send_window_.Available()});
             if (credit == 0) {
                 lease.Reset();
-                co_await AdvanceFrames(writer_wake_);
+                co_await AdvanceFrames(writer_wake_, writer_waiting_);
                 continue;
             }
             const auto payload = cursor.Next(credit);
@@ -1341,31 +1470,37 @@ private:
     net::awaitable<bool> TakeReceivedData() {
         while (received_.empty()) {
             if (read_closed_ || input_done_) co_return false;
-            co_await AdvanceFrames(reader_wake_);
+            co_await AdvanceFrames(reader_wake_, reader_waiting_);
+        }
+        if (read_closed_) co_return false;
+        AsyncWriteGate::Lease lease;
+        if (received_.front().flow_bytes != 0) {
+            lease = write_gate_.TryAcquire();
+            if (!lease) lease = co_await AcquireWrite();
+            if (read_closed_ || received_.empty()) co_return false;
         }
         auto& front = received_.front();
+        const uint32_t credit = front.flow_bytes;
         data_frame_ = std::move(front.payload);
         data_offset_ = front.offset;
         data_end_ = front.end;
         received_.pop_front();
 
-        const auto credit = static_cast<uint32_t>(data_frame_.size());
         if (credit != 0) {
-            auto lease = write_gate_.TryAcquire();
-            if (!lease) lease = co_await AcquireWrite();
-            conn_recv_window_ += credit;
             co_await SendWindowUpdate(*inner_, 0, credit);
+            conn_recv_window_ += credit;
             // After END_STREAM the peer sends no more DATA on this stream.
             if (!input_done_) {
-                stream_recv_window_ += credit;
                 co_await SendWindowUpdate(*inner_, stream_id_, credit);
+                stream_recv_window_ += credit;
             }
         }
         co_return true;
     }
 
     // Pumps one frame, or waits for the pump another operation is running.
-    net::awaitable<void> AdvanceFrames(std::optional<SignalChannel>& wake) {
+    net::awaitable<void> AdvanceFrames(std::optional<SignalChannel>& wake,
+                                       bool& waiting) {
         if (pump_failure_) std::rethrow_exception(pump_failure_);
         if (!pumping_) {
             co_await PumpFrame();
@@ -1373,10 +1508,21 @@ private:
         }
         const uint64_t epoch = abort_epoch_;
         if (!wake) wake.emplace(co_await net::this_coro::executor, 1);
+        else wake->reset();
+        waiting = true;
+        struct WaitScope {
+            SignalChannel& channel;
+            bool& waiting;
+            ~WaitScope() noexcept {
+                waiting = false;
+                channel.reset();
+            }
+        } scope{*wake, waiting};
         auto [ec] = co_await wake->async_receive(net::as_tuple(net::use_awaitable));
         if (ec || epoch != abort_epoch_) {
             throw IoSystemError(io_error::operation_aborted, "HTTP/2 frame wait aborted");
         }
+        if (pump_failure_) std::rethrow_exception(pump_failure_);
     }
 
     // A failed pump may have consumed part of a frame, so its error is kept
@@ -1384,30 +1530,70 @@ private:
     net::awaitable<void> PumpFrame() {
         pumping_ = true;
         std::exception_ptr failure;
+        std::exception_ptr stored_failure;
+        bool store_failure = true;
+        bool frame_read = false;
         try {
-            auto frame = co_await ReadH2Frame(*inner_);
+            std::optional<H2Frame> frame;
+            try {
+                frame = co_await ReadH2Frame(*inner_);
+            } catch (const IoSystemError& error) {
+                if (error.code() == io_error::operation_aborted) {
+                    store_failure = false;
+                }
+                throw;
+            }
             if (!frame) {
                 throw IoSystemError(io_error::connection_reset,
                                     "HTTP/2 peer closed before END_STREAM");
             }
+            frame_read = true;
             co_await DispatchFrame(std::move(*frame));
+        } catch (const IoSystemError& error) {
+            failure = std::current_exception();
+            stored_failure = failure;
+            if (frame_read) {
+                inner_->CloseAbortive();
+                if (error.code() == io_error::operation_aborted) {
+                    stored_failure = std::make_exception_ptr(
+                        IoSystemError(io_error::connection_reset,
+                                      "cancelled mid-HTTP/2 frame dispatch"));
+                }
+            }
         } catch (...) {
             failure = std::current_exception();
+            stored_failure = failure;
+            if (frame_read) {
+                inner_->CloseAbortive();
+            }
         }
         pumping_ = false;
-        if (failure) pump_failure_ = failure;
+        if (failure && store_failure) pump_failure_ = stored_failure;
         WakePumpWaiters();
         if (failure) std::rethrow_exception(failure);
     }
 
     void WakePumpWaiters() noexcept {
-        if (reader_wake_) (void)reader_wake_->try_send(IoErrorCode{});
-        if (writer_wake_) (void)writer_wake_->try_send(IoErrorCode{});
+        if (std::exchange(reader_waiting_, false) && reader_wake_) {
+            (void)reader_wake_->try_send(IoErrorCode{});
+        }
+        if (std::exchange(writer_waiting_, false) && writer_wake_) {
+            (void)writer_wake_->try_send(IoErrorCode{});
+        }
     }
 
     void AbortPumpWaits() noexcept {
         ++abort_epoch_;
         WakePumpWaiters();
+    }
+
+    void OnCancellation(transport::Cancellation event) noexcept override {
+        AbortPumpWaits();
+        if (event.terminal) {
+            write_gate_.Cancel();
+        } else if (inner_) {
+            Resubscribe(inner_->Cancellation());
+        }
     }
 
     net::awaitable<void> DispatchFrame(H2Frame frame) {
@@ -1416,32 +1602,70 @@ private:
             co_await ReceiveSettings(frame);
             break;
         case H2FrameType::PING:
-            if (frame.payload.size() == 8 && (frame.flags & kFlagAck) == 0) {
+            if (frame.stream_id != 0) {
+                co_await FailConnection(H2Error::Protocol);
+                ThrowHttp2StreamError("HTTP/2 PING on non-zero stream");
+            }
+            if (frame.payload.size() != 8) {
+                co_await FailConnection(H2Error::FrameSize);
+                ThrowHttp2StreamError("invalid HTTP/2 PING frame size");
+            }
+            if ((frame.flags & kFlagAck) == 0) {
                 co_await WriteControlFrame(H2FrameType::PING, kFlagAck, 0, frame.payload);
             }
             break;
         case H2FrameType::WINDOW_UPDATE:
-            ReceiveWindowUpdate(frame);
+            co_await ReceiveWindowUpdate(frame);
             break;
         case H2FrameType::HEADERS:
-            if (frame.stream_id == stream_id_) {
-                if (!response_headers_received_) {
-                    if (co_await ReadResponseHeaders(std::move(frame))) input_done_ = true;
-                } else if ((frame.flags & kFlagEndStream) != 0) {
+            if (frame.stream_id != stream_id_) {
+                co_await FailConnection(H2Error::Protocol);
+                ThrowHttp2StreamError("HTTP/2 HEADERS on unexpected stream");
+            }
+            if (!response_headers_received_) {
+                if (co_await ReadResponseHeaders(std::move(frame))) {
                     input_done_ = true;
+                    response_decoder_.Clear();
                 }
+            } else {
+                co_await ReadResponseTrailers(std::move(frame));
+                input_done_ = true;
+                response_decoder_.Clear();
             }
             break;
         case H2FrameType::DATA:
             co_await ReceiveData(std::move(frame));
             break;
-        case H2FrameType::RST_STREAM:
-            if (frame.stream_id == stream_id_) {
-                ThrowHttp2StreamError("HTTP/2 stream reset by peer");
+        case H2FrameType::PRIORITY:
+            if (frame.stream_id == 0) {
+                co_await FailConnection(H2Error::Protocol);
+                ThrowHttp2StreamError("HTTP/2 PRIORITY on stream 0");
+            }
+            if (frame.payload.size() != 5) {
+                co_await FailConnection(H2Error::FrameSize);
+                ThrowHttp2StreamError("invalid HTTP/2 PRIORITY frame size");
             }
             break;
+        case H2FrameType::RST_STREAM:
+            if (frame.stream_id == 0) {
+                co_await FailConnection(H2Error::Protocol);
+                ThrowHttp2StreamError("HTTP/2 RST_STREAM on stream 0");
+            }
+            if (frame.payload.size() != 4) {
+                co_await FailConnection(H2Error::FrameSize);
+                ThrowHttp2StreamError("invalid HTTP/2 RST_STREAM frame size");
+            }
+            if (frame.stream_id != stream_id_) {
+                co_await FailConnection(H2Error::Protocol);
+                ThrowHttp2StreamError("HTTP/2 RST_STREAM on idle stream");
+            }
+            ThrowHttp2StreamError("HTTP/2 stream reset by peer");
         case H2FrameType::GOAWAY:
             ThrowHttp2StreamError("HTTP/2 connection closed by peer");
+        case H2FrameType::CONTINUATION:
+        case H2FrameType::PUSH_PROMISE:
+            co_await FailConnection(H2Error::Protocol);
+            ThrowHttp2StreamError("unexpected HTTP/2 frame");
         default:
             break;
         }
@@ -1452,8 +1676,12 @@ private:
     // floor, so the peer's larger limit needs no tracking.
     net::awaitable<void> ReceiveSettings(const H2Frame& frame) {
         const bool ack = (frame.flags & kFlagAck) != 0;
-        if (frame.stream_id != 0 || frame.payload.size() % 6 != 0 ||
-            (ack && !frame.payload.empty())) {
+        if (frame.stream_id != 0) {
+            co_await FailConnection(H2Error::Protocol);
+            ThrowHttp2StreamError("invalid HTTP/2 SETTINGS frame");
+        }
+        if (frame.payload.size() % 6 != 0 || (ack && !frame.payload.empty())) {
+            co_await FailConnection(H2Error::FrameSize);
             ThrowHttp2StreamError("invalid HTTP/2 SETTINGS frame");
         }
         if (ack) {
@@ -1462,16 +1690,20 @@ private:
             if (!local_settings_acked_) {
                 local_settings_acked_ = true;
                 stream_recv_window_ += static_cast<int64_t>(local_initial_window_) -
-                                       H2SendWindow::kDefault;
+                                       std::max<int64_t>(local_initial_window_, H2SendWindow::kDefault);
             }
             co_return;
         }
         const auto initial_window = PeerInitialWindowSetting(frame.payload);
-        if (!initial_window) ThrowHttp2StreamError("HTTP/2 initial window exceeds 2^31-1");
+        if (!initial_window) {
+            co_await FailConnection(H2Error::FlowControl);
+            ThrowHttp2StreamError("HTTP/2 initial window exceeds 2^31-1");
+        }
         if (*initial_window) {
             const int64_t delta = static_cast<int64_t>(**initial_window) -
                                   static_cast<int64_t>(peer_initial_window_);
             if (!stream_send_window_.Adjust(delta)) {
+                co_await FailConnection(H2Error::FlowControl);
                 ThrowHttp2StreamError("HTTP/2 stream window overflow");
             }
             peer_initial_window_ = **initial_window;
@@ -1479,15 +1711,24 @@ private:
         co_await WriteControlFrame(H2FrameType::SETTINGS, kFlagAck, 0);
     }
 
-    void ReceiveWindowUpdate(const H2Frame& frame) {
+    net::awaitable<void> ReceiveWindowUpdate(const H2Frame& frame) {
+        if (frame.stream_id != 0 && frame.stream_id != stream_id_) {
+            co_await FailConnection(H2Error::Protocol);
+            ThrowHttp2StreamError("HTTP/2 WINDOW_UPDATE on idle stream");
+        }
         const auto increment = WindowUpdateIncrement(frame);
-        if (!increment) ThrowHttp2StreamError("invalid HTTP/2 WINDOW_UPDATE");
+        if (!increment) {
+            co_await FailConnection(increment.error());
+            ThrowHttp2StreamError("invalid HTTP/2 WINDOW_UPDATE");
+        }
         if (frame.stream_id == 0) {
             if (!conn_send_window_.Adjust(*increment)) {
+                co_await FailConnection(H2Error::FlowControl);
                 ThrowHttp2StreamError("HTTP/2 connection window overflow");
             }
         } else if (frame.stream_id == stream_id_) {
             if (!stream_send_window_.Adjust(*increment)) {
+                co_await FailConnection(H2Error::FlowControl);
                 ThrowHttp2StreamError("HTTP/2 stream window overflow");
             }
         }
@@ -1497,17 +1738,37 @@ private:
     // windows (6.1, 6.9.1); exceeding either is a FLOW_CONTROL_ERROR
     // connection error (6.9.1, 5.4.1).
     net::awaitable<void> ReceiveData(H2Frame frame) {
+        if (frame.stream_id == 0) {
+            co_await FailConnection(H2Error::Protocol);
+            ThrowHttp2StreamError("HTTP/2 DATA on stream 0");
+        }
+        if (frame.stream_id != stream_id_) {
+            co_await FailConnection(H2Error::Protocol);
+            ThrowHttp2StreamError("HTTP/2 DATA on unexpected stream");
+        }
         const auto flow_len = static_cast<int64_t>(frame.payload.size());
-        const bool own_stream = frame.stream_id == stream_id_;
-        if (flow_len > conn_recv_window_ || (own_stream && flow_len > stream_recv_window_)) {
+        if (flow_len > conn_recv_window_ || flow_len > stream_recv_window_) {
             co_await FailConnection(H2Error::FlowControl);
             ThrowHttp2StreamError("HTTP/2 DATA exceeded the advertised receive window");
         }
         conn_recv_window_ -= flow_len;
-        if (!own_stream) {
-            // Nobody reads DATA of another stream; its connection credit
-            // returns at once (6.9).
-            if (flow_len != 0) {
+        stream_recv_window_ -= flow_len;
+        if ((frame.flags & kFlagPadded) != 0 &&
+            (frame.payload.empty() || frame.payload.front() >= frame.payload.size())) {
+            co_await FailConnection(H2Error::Protocol);
+            ThrowHttp2StreamError("invalid HTTP/2 DATA padding");
+        }
+        if (!response_headers_received_) {
+            co_await FailConnection(H2Error::Protocol);
+            ThrowHttp2StreamError("HTTP/2 DATA arrived before response headers");
+        }
+        if (input_done_) {
+            co_await FailConnection(H2Error::StreamClosed);
+            ThrowHttp2StreamError("HTTP/2 DATA after END_STREAM");
+        }
+        input_done_ = (frame.flags & kFlagEndStream) != 0;
+        if (read_closed_) {
+            if (flow_len > 0) {
                 auto lease = write_gate_.TryAcquire();
                 if (!lease) lease = co_await AcquireWrite();
                 conn_recv_window_ += flow_len;
@@ -1515,24 +1776,31 @@ private:
             }
             co_return;
         }
-        stream_recv_window_ -= flow_len;
-        if (!response_headers_received_) {
-            ThrowHttp2StreamError("HTTP/2 DATA arrived before response headers");
-        }
-        if (input_done_) {
-            ThrowHttp2StreamError("HTTP/2 DATA after END_STREAM");
-        }
-        input_done_ = (frame.flags & kFlagEndStream) != 0;
-        if (read_closed_ || frame.payload.empty()) {
+        if (frame.payload.empty()) {
             co_return;
         }
         const auto data = H2DataPayload(frame);
-        const size_t offset = data.empty()
-            ? 0 : static_cast<size_t>(data.data() - frame.payload.data());
+        if (data.empty()) {
+            if (!received_.empty()) {
+                received_.back().flow_bytes += static_cast<uint32_t>(flow_len);
+            } else if (flow_len > 0) {
+                auto lease = write_gate_.TryAcquire();
+                if (!lease) lease = co_await AcquireWrite();
+                conn_recv_window_ += flow_len;
+                co_await SendWindowUpdate(*inner_, 0, static_cast<uint32_t>(flow_len));
+                if (!input_done_) {
+                    stream_recv_window_ += flow_len;
+                    co_await SendWindowUpdate(*inner_, stream_id_, static_cast<uint32_t>(flow_len));
+                }
+            }
+            co_return;
+        }
+        const size_t offset = static_cast<size_t>(data.data() - frame.payload.data());
         received_.push_back(ReceivedData{
             .payload = std::move(frame.payload),
             .offset = offset,
             .end = offset + data.size(),
+            .flow_bytes = static_cast<uint32_t>(flow_len),
         });
     }
 
@@ -1550,23 +1818,73 @@ private:
         const auto fields = co_await ReadH2HeaderFields(
             *inner_, response_decoder_, std::move(frame));
         if (!fields) {
+            co_await FailConnection(fields.error());
             ThrowHttp2StreamError("invalid HTTP/2 response header block");
         }
         std::string_view status;
+        bool has_status = false;
+        bool seen_regular = false;
         for (const auto& field : *fields) {
-            if (field.name == ":status") {
+            const std::string_view name = field.name;
+            if (name.starts_with(':')) {
+                if (seen_regular || name != ":status" || has_status) {
+                    co_await FailConnection(H2Error::Protocol);
+                    ThrowHttp2StreamError("invalid HTTP/2 response pseudo-headers");
+                }
+                has_status = true;
                 status = field.value;
-                break;
+            } else {
+                if (!IsValidHttp2HeaderName(name)) {
+                    co_await FailConnection(H2Error::Protocol);
+                    ThrowHttp2StreamError("invalid HTTP/2 response header name");
+                }
+                seen_regular = true;
             }
         }
-        if (status.size() != 3 || status.front() != '2') {
+        const auto is_digit = [](char ch) noexcept {
+            return ch >= '0' && ch <= '9';
+        };
+        if (!has_status || status.size() != 3 ||
+            !is_digit(status[0]) || !is_digit(status[1]) || !is_digit(status[2])) {
+            co_await FailConnection(H2Error::Protocol);
+            ThrowHttp2StreamError("invalid HTTP/2 :status header");
+        }
+        if (status.front() == '1') {
+            if (status == "101" || end_stream) {
+                co_await FailConnection(H2Error::Protocol);
+                ThrowHttp2StreamError("invalid HTTP/2 informational response");
+            }
+            co_return false;
+        }
+        if (status.front() != '2') {
             ThrowHttp2StreamError("HTTP/2 server rejected request");
         }
         response_headers_received_ = true;
-        response_decoder_.Clear();
         co_return end_stream;
     }
 
+    net::awaitable<void> ReadResponseTrailers(H2Frame frame) {
+        if ((frame.flags & kFlagEndStream) == 0 || input_done_) {
+            co_await FailConnection(H2Error::Protocol);
+            ThrowHttp2StreamError("invalid HTTP/2 response trailers");
+        }
+        const auto fields = co_await ReadH2HeaderFields(
+            *inner_, response_decoder_, std::move(frame));
+        if (!fields) {
+            co_await FailConnection(fields.error());
+            ThrowHttp2StreamError("invalid HTTP/2 trailer header block");
+        }
+        for (const auto& field : *fields) {
+            if (field.name.starts_with(':')) {
+                co_await FailConnection(H2Error::Protocol);
+                ThrowHttp2StreamError("pseudo-header in HTTP/2 response trailers");
+            }
+            if (!IsValidHttp2HeaderName(field.name)) {
+                co_await FailConnection(H2Error::Protocol);
+                ThrowHttp2StreamError("invalid HTTP/2 trailer header name");
+            }
+        }
+    }
     std::unique_ptr<AsyncStream> inner_;
     AsyncWriteGate write_gate_;
     uint32_t stream_id_ = 1;
@@ -1597,6 +1915,8 @@ private:
     std::optional<SignalChannel> writer_wake_;
     std::exception_ptr pump_failure_;
     uint64_t abort_epoch_ = 0;
+    bool reader_waiting_ = false;
+    bool writer_waiting_ = false;
     bool pumping_ = false;
     bool read_closed_ = false;
     bool write_closed_ = false;
@@ -1617,14 +1937,15 @@ public:
                               uint32_t stream_id,
                               H2PayloadCodec payload_codec,
                               int64_t initial_send_window);
+    ~Http2ServerSubStreamState() noexcept { DropQueuedData(); }
 
     transport::CancellationSource& Cancellation() noexcept { return cancellation_; }
     [[nodiscard]] std::shared_ptr<Http2ServerSession> LockSession() const noexcept {
         return session_.lock();
     }
     [[nodiscard]] net::io_context& IoContext() noexcept { return io_context_; }
-    void SetUploadBudget(std::shared_ptr<XHttpPacketUpSession> budget) {
-        upload_budget_ = std::move(budget);
+    void SetUploadBudget(const std::shared_ptr<XHttpPacketUpSession>& budget) noexcept {
+        upload_budget_ = budget;
     }
 
     // Queues a received DATA payload. False asks the session to reset the
@@ -1664,7 +1985,9 @@ public:
         owner_released_ = true;
         (void)owner_signal_.try_send(IoErrorCode{});
     }
-    static net::awaitable<void> JoinOwner(std::shared_ptr<Http2ServerSubStreamState> state);
+    static net::awaitable<void> JoinOwner(
+        std::shared_ptr<Http2ServerSubStreamState> state,
+        std::shared_ptr<XHttpPacketUpSession> upload_session = {});
 
 private:
     struct QueuedDataFrame {
@@ -1696,13 +2019,14 @@ private:
     H2SendWindow send_window_;
     int64_t receive_window_ = H2SendWindow::kDefault;
     uint32_t consumed_credit_ = 0;
-    // Cancel() bumps this so a pending send-credit wait fails.
+    // Cancel() bumps these so pending read/send-credit waits fail.
+    uint64_t read_abort_epoch_ = 0;
     uint64_t write_abort_epoch_ = 0;
     bool owner_released_ = false;
     IoErrorCode terminal_error_ = io_error::operation_aborted;
     std::weak_ptr<Http2ServerSession> session_;
     transport::CancellationSource cancellation_;
-    std::shared_ptr<XHttpPacketUpSession> upload_budget_;
+    std::weak_ptr<XHttpPacketUpSession> upload_budget_;
     size_t upload_reserved_ = 0;
     uint32_t stream_id_ = 0;
     H2PayloadCodec payload_codec_ = H2PayloadCodec::GrpcHunk;
@@ -1714,7 +2038,6 @@ private:
     size_t decoder_reserved_ = 0;
     GrpcHunkDecoder hunk_;
     bool input_done_ = false;
-    bool read_cancelled_ = false;
     bool read_closed_ = false;
     bool write_closed_ = false;
     bool trailers_sent_ = false;
@@ -1844,6 +2167,7 @@ public:
                        uint64_t conn_id,
                        const HttpConfig* http_config,
                        const XHttpConfig* xhttp_config,
+                       const GrpcConfig* grpc_config,
                        uint32_t initial_receive_window,
                        net::any_io_executor executor)
         : io_context_(io_context)
@@ -1853,6 +2177,7 @@ public:
         , payload_codec_(payload_codec)
         , http_config_(http_config)
         , xhttp_config_(xhttp_config)
+        , grpc_config_(grpc_config)
         , conn_id_(conn_id) {
         initial_receive_window_ = initial_receive_window;
         if (!stream_ || !stream_->DeferWriteCancellation()) {
@@ -1864,6 +2189,11 @@ public:
             }
             response_header_block_ = EncodeHttpResponseHeaders(http_config_->headers);
         } else {
+            if (grpc_config_) {
+                grpc_request_path_ = grpc_config_->request_path.empty()
+                    ? grpc_config_->RequestPath()
+                    : grpc_config_->request_path;
+            }
             response_header_block_ = EncodeGrpcResponseHeaders();
             trailer_block_ = EncodeGrpcTrailers();
         }
@@ -2028,9 +2358,16 @@ public:
         uint32_t stream_id,
         std::span<const net::const_buffer> buffers) {
         H2DataCursor cursor(buffers);
+        const auto cancellation = co_await net::this_coro::cancellation_state;
         while (cursor.Remaining() != 0) {
+            if (cancellation.cancelled() != net::cancellation_type::none) {
+                throw IoSystemError(io_error::operation_aborted);
+            }
             auto write_lease = write_gate_.TryAcquire();
             if (!write_lease) write_lease = co_await write_gate_.Acquire();
+            if (cancellation.cancelled() != net::cancellation_type::none) {
+                throw IoSystemError(io_error::operation_aborted);
+            }
             const auto it = streams_.find(stream_id);
             if (!write_lease || !ConnectionWritable() || it == streams_.end()) {
                 co_return false;
@@ -2146,6 +2483,11 @@ private:
             }
             if (!upload.Commit(seq, std::move(payload)))
                 throw IoSystemError(io_error::no_buffer_space);
+            if (!session->DownlinkAttached() &&
+                !co_await session->AwaitDownlink(stream->Cancellation())) {
+                throw IoSystemError(io_error::timed_out);
+            }
+            session.reset();
             co_await stream->AsyncShutdownWrite();
             stream->Close();
         } catch (...) {
@@ -2172,25 +2514,36 @@ private:
                         std::shared_ptr<XHttpPacketUpSession> split_session,
                         InboundTransportMetadata metadata) {
         if (!stream_handler_) {
+            if (split_session) split_session->Close();
             sub->CloseLocal();
             return;
         }
-        std::unique_ptr<AsyncStream> stream =
-            std::make_unique<Http2ServerSubStream>(std::move(sub));
-        if (split_session) {
-            stream = MakeXHttpSplitStream(std::move(split_session), std::move(stream));
+        try {
+            std::unique_ptr<AsyncStream> stream =
+                std::make_unique<Http2ServerSubStream>(sub);
+            if (split_session) {
+                stream = MakeXHttpSplitStream(split_session, std::move(stream));
+            }
+            if (cancelled_ || !tasks_) throw IoSystemError(io_error::operation_aborted);
+            auto& source = stream->Cancellation();
+            // Bind before the proxy handshake, which can write (and wait for the
+            // physical gate) before the dispatcher installs its read subscription.
+            tasks_->Spawn(RunRequest(std::move(stream), std::move(metadata)), &source);
+        } catch (...) {
+            if (split_session) split_session->Close();
+            sub->AbortLocal();
+            throw;
         }
-        if (cancelled_ || !tasks_) throw IoSystemError(io_error::operation_aborted);
-        auto& source = stream->Cancellation();
-        // Bind before the proxy handshake, which can write (and wait for the
-        // physical gate) before the dispatcher installs its read subscription.
-        tasks_->Spawn(RunRequest(std::move(stream), std::move(metadata)), &source);
     }
 
     // 200 response headers, then the request's own END_STREAM, if any.
     net::awaitable<bool> AcceptStream(uint32_t stream_id,
                                       bool end_stream,
                                       Http2ServerSubStreamState& sub) {
+        if (!ready_) {
+            if (stream_handler_) stream_handler_->OnInboundTransportReady(*stream_);
+            ready_ = true;
+        }
         if (!co_await WriteFrameSerialized(
                 H2FrameType::HEADERS, kFlagEndHeaders, stream_id, response_header_block_)) {
             co_return false;
@@ -2269,6 +2622,7 @@ private:
             try {
                 co_return co_await ReceiveHeaders(std::move(frame));
             } catch (const std::bad_alloc&) {
+                if (cancelled_) throw;
                 exhausted = true;
             }
             if (exhausted) co_return co_await ResetStream(id, H2Error::RefusedStream);
@@ -2279,6 +2633,10 @@ private:
                 co_return co_await FailConnection(H2Error::Protocol);
             }
             co_await ReceiveData(std::move(frame));
+            break;
+        case H2FrameType::PRIORITY:
+            if (frame.stream_id == 0) co_return co_await FailConnection(H2Error::Protocol);
+            if (frame.payload.size() != 5) co_return co_await FailConnection(H2Error::FrameSize);
             break;
         case H2FrameType::RST_STREAM:
             if (frame.payload.size() != 4) co_return co_await FailConnection(H2Error::FrameSize);
@@ -2362,17 +2720,34 @@ private:
         const bool trailers = streams_.contains(stream_id);
         const std::string_view real_ip_header = http_config_
             ? std::string_view(http_config_->real_ip_header) : std::string_view{};
-        auto fields = co_await ReadH2HeaderFields(*stream_, hpack_decoder_, std::move(frame));
+        tl::expected<HpackDecoder::HeaderFields, H2Error> fields;
+        try {
+            fields = co_await ReadH2HeaderFields(*stream_, hpack_decoder_, std::move(frame));
+        } catch (const std::bad_alloc&) {
+            CancelAll();
+            throw;
+        }
         if (!fields) {
             co_return co_await FailConnection(fields.error());
         }
-        auto request = ParseH2RequestHeaders(std::move(*fields), real_ip_header, trailers);
+        const bool closed_client_stream =
+            !trailers && (stream_id & 1u) != 0 && stream_id <= last_remote_stream_id_;
+        auto request = ParseH2RequestHeaders(
+            std::move(*fields), real_ip_header, trailers || closed_client_stream);
+        if (closed_client_stream) {
+            if (end_stream && request.has_value()) {
+                co_return true;
+            }
+            co_return co_await FailConnection(H2Error::Protocol);
+        }
         if (trailers) {
             // RFC 9113 8.1: trailers end this request, not its connection;
             // malformed trailers are a stream error (8.1.1).
+            auto it = streams_.find(stream_id);
+            if (it != streams_.end() && it->second->InputEnded())
+                co_return co_await ResetStream(stream_id, H2Error::StreamClosed);
             if (!request || !end_stream)
                 co_return co_await ResetStream(stream_id, H2Error::Protocol);
-            auto it = streams_.find(stream_id);
             if (it != streams_.end()) it->second->CloseInput();
             co_return true;
         }
@@ -2385,13 +2760,32 @@ private:
             // PROTOCOL_ERROR; the connection and its other streams continue.
             co_return co_await ResetStream(stream_id, H2Error::Protocol);
         }
-        if (!ready_) {
-            if (stream_handler_) stream_handler_->OnInboundTransportReady(*stream_);
-            ready_ = true;
-        }
         if (streams_.size() >= kHttp2MaxConcurrentStreams ||
             active_requests_ >= kHttp2MaxConcurrentStreams) {
             co_return co_await ResetStream(stream_id, H2Error::RefusedStream);
+        }
+        if (payload_codec_ == H2PayloadCodec::RawData && !xhttp_config_ && http_config_) {
+            if (!detail::PathPrefixMatchesSegment(http_config_->path, request->path) ||
+                (!http_config_->method.empty() &&
+                 !EqualsAsciiCI(request->method, http_config_->method))) {
+                co_return co_await ResetStream(stream_id, H2Error::Protocol);
+            }
+            if (const std::string_view expected_host = TrimAscii(ExpectedHttpHost(*http_config_));
+                !expected_host.empty() &&
+                !AuthorityMatchesHost(request->authority, expected_host)) {
+                co_return co_await ResetStream(stream_id, H2Error::Protocol);
+            }
+        }
+        if (payload_codec_ == H2PayloadCodec::GrpcHunk && grpc_config_) {
+            if (!EqualsAsciiCI(request->method, "POST") ||
+                !detail::PathMatchesExactly(grpc_request_path_, request->path)) {
+                co_return co_await ResetStream(stream_id, H2Error::Protocol);
+            }
+            if (const std::string_view expected_authority = TrimAscii(grpc_config_->authority);
+                !expected_authority.empty() &&
+                !AuthorityMatchesHost(request->authority, expected_authority)) {
+                co_return co_await ResetStream(stream_id, H2Error::Protocol);
+            }
         }
         auto sub = memory::AllocateShared<Http2ServerSubStreamState>(
             io_context_, shared_from_this(), stream_id, payload_codec_, peer_initial_window_);
@@ -2422,7 +2816,7 @@ private:
         std::shared_ptr<Http2ServerSubStreamState> sub) {
         if (const std::string_view expected_host = TrimAscii(ExpectedHttpHost(*http_config_));
             !expected_host.empty() &&
-            !EqualsAsciiCI(TrimAscii(request.authority), expected_host)) {
+            !AuthorityMatchesHost(request.authority, expected_host)) {
             LOG_CONN_DEBUG(conn_id_,
                 "XHTTP server H2 host mismatch expected='{}' actual='{}'",
                 PublicHttpTargetForLog(expected_host),
@@ -2455,9 +2849,17 @@ private:
             auto xsession = co_await GetXHttpPacketSession(
                 io_context_, xhttp_config_->session_namespace,
                 meta.session_id, XHttpSessionAccess::Open);
-            if (!xsession) {
+            if (!xsession || !xsession->AttachDownlink()) {
                 co_return co_await ResetStream(stream_id, H2Error::Protocol);
             }
+            bool attached = true;
+            struct DownlinkGuard {
+                XHttpPacketUpSession* session;
+                bool& active;
+                ~DownlinkGuard() {
+                    if (active) session->Close();
+                }
+            } guard{xsession.get(), attached};
             if (!co_await AcceptStream(stream_id, end_stream, *sub)) {
                 co_return false;
             }
@@ -2465,6 +2867,7 @@ private:
                           meta.session_id,
                           stream_id,
                           xhttp_config_->AcceptsStreamUp() ? "stream-up" : "packet-up");
+            attached = false;
             DeliverRequest(std::move(sub), std::move(xsession), std::move(request.metadata));
             co_return true;
         }
@@ -2478,19 +2881,46 @@ private:
             if (!xsession) {
                 co_return co_await ResetStream(stream_id, H2Error::Protocol);
             }
+            if (!xsession->CanAttachStream()) {
+                LOG_CONN_DEBUG(conn_id_,
+                    "XHTTP server rejected concurrent H2 stream-up session={}",
+                    meta.session_id);
+                constexpr std::array<uint8_t, 1> kBadRequestStatus{0x8c}; // :status: 400
+                const bool ok = co_await WriteFrameSerialized(
+                    H2FrameType::HEADERS, kFlagEndHeaders | kFlagEndStream,
+                    stream_id, kBadRequestStatus);
+                RemoveStream(stream_id);
+                co_return ok;
+            }
+            bool accepting = true;
+            struct StreamUpGuard {
+                XHttpPacketUpSession* session;
+                bool& active;
+                ~StreamUpGuard() {
+                    if (active && session->CanAttachStream()) session->Close();
+                }
+            } guard{xsession.get(), accepting};
             if (!co_await AcceptStream(stream_id, end_stream, *sub)) {
                 co_return false;
             }
+            accepting = false;
             LOG_CONN_DEBUG(conn_id_, "XHTTP server H2 stream-up upload ready session={} stream_id={}",
                           meta.session_id,
                           stream_id);
             sub->SetUploadBudget(xsession);
             auto upload = std::make_unique<Http2ServerSubStream>(sub);
-            Spawn(Http2ServerSubStreamState::JoinOwner(std::move(sub)));
             if (!xsession->AttachStream(std::move(upload))) {
                 LOG_CONN_DEBUG(conn_id_,
                     "XHTTP server rejected concurrent H2 stream-up session={}",
                     meta.session_id);
+                co_return co_await ResetStream(stream_id, H2Error::Protocol);
+            }
+            auto* raw_xsession = xsession.get();
+            try {
+                Spawn(Http2ServerSubStreamState::JoinOwner(std::move(sub), std::move(xsession)));
+            } catch (...) {
+                raw_xsession->Close();
+                throw;
             }
             co_return true;
         }
@@ -2500,7 +2930,7 @@ private:
             }
             auto xsession = co_await GetXHttpPacketSession(
                 io_context_, xhttp_config_->session_namespace,
-                meta.session_id, XHttpSessionAccess::Join);
+                meta.session_id, XHttpSessionAccess::Upload);
             if (!xsession) {
                 co_return co_await ResetStream(stream_id, H2Error::Protocol);
             }
@@ -2524,7 +2954,7 @@ private:
             break;
         }
         LOG_CONN_DEBUG(conn_id_, "XHTTP server received unknown H2 request method='{}' path='{}'",
-                      SanitizeForLog(request.method),
+                      PublicHttpMethodForLog(request.method),
                       PublicHttpTargetForLog(request.path));
         co_return co_await ResetStream(stream_id, H2Error::Protocol);
     }
@@ -2551,7 +2981,7 @@ private:
             co_return;
         }
         sub->ReceiveWindow() -= static_cast<int64_t>(flow_size);
-        if (!sub->AcceptsData()) {
+        if (sub->InputEnded()) {
             ReturnReceiveCredit(0, flow_size);
             (void)co_await ResetStream(frame.stream_id, H2Error::StreamClosed);
             co_return;
@@ -2559,6 +2989,11 @@ private:
         if ((frame.flags & kFlagPadded) != 0 &&
             (frame.payload.empty() || frame.payload.front() >= frame.payload.size())) {
             (void)co_await FailConnection(H2Error::Protocol);
+            co_return;
+        }
+        if (!sub->AcceptsData()) {
+            if ((frame.flags & kFlagEndStream) != 0) sub->CloseInput();
+            ReturnReceiveCredit(0, flow_size);
             co_return;
         }
         const auto data = H2DataPayload(frame);
@@ -2598,6 +3033,8 @@ private:
     H2PayloadCodec payload_codec_ = H2PayloadCodec::GrpcHunk;
     const HttpConfig* http_config_ = nullptr;
     const XHttpConfig* xhttp_config_ = nullptr;
+    const GrpcConfig* grpc_config_ = nullptr;
+    std::string grpc_request_path_;
     // HPACK blocks encoded once per connection; neither uses the dynamic table.
     memory::ByteVector response_header_block_;
     memory::ByteVector trailer_block_;
@@ -2619,13 +3056,15 @@ private:
 };
 
 net::awaitable<void> Http2ServerSubStreamState::JoinOwner(
-    std::shared_ptr<Http2ServerSubStreamState> state) {
+    std::shared_ptr<Http2ServerSubStreamState> state,
+    std::shared_ptr<XHttpPacketUpSession> upload_session) {
     bool cancelled = false;
     try {
         if (!state->owner_released_)
             co_await state->owner_signal_.async_receive(net::use_awaitable);
     } catch (...) {
         cancelled = true;
+        if (upload_session) upload_session->Close();
         if (auto session = state->LockSession()) session->CancelAll();
     }
     if (cancelled) {
@@ -2684,7 +3123,8 @@ bool Http2ServerSubStreamState::EnqueueData(
     const auto session = LockSession();
     if (!session || storage > kHttp2MaxQueuedStreamStorage - queued_storage_ ||
         !session->ReserveReceiveMemory(storage)) return false;
-    if (upload_budget_ && !upload_budget_->Reserve(storage)) {
+    const auto upload_budget = upload_budget_.lock();
+    if (upload_budget && !upload_budget->Reserve(storage)) {
         session->ReleaseReceiveMemory(storage);
         return false;
     }
@@ -2696,7 +3136,7 @@ bool Http2ServerSubStreamState::EnqueueData(
         });
     } catch (...) {
         session->ReleaseReceiveMemory(storage);
-        if (upload_budget_) upload_budget_->Release(storage);
+        if (upload_budget) upload_budget->Release(storage);
         throw;
     }
     if (coalesced != 0) {
@@ -2715,7 +3155,7 @@ bool Http2ServerSubStreamState::EnqueueData(
         added.offset = 0;
         added.end = remaining;
     }
-    if (upload_budget_) upload_reserved_ += storage;
+    if (upload_budget) upload_reserved_ += storage;
     queued_storage_ += storage;
     queued_bytes_ += size;
     WakeInputReader();
@@ -2753,7 +3193,7 @@ void Http2ServerSubStreamState::CancelPendingOperations() noexcept {
     if (cancelled_) {
         return;
     }
-    read_cancelled_ = true;
+    ++read_abort_epoch_;
     ++write_abort_epoch_;
     WakeInputReader();
     WakeSendWaiter();
@@ -2781,7 +3221,6 @@ void Http2ServerSubStreamState::CloseLocal() noexcept {
         return;
     }
     closing_local_ = true;
-    input_done_ = true;
     read_closed_ = true;
     DropQueuedData();
     hunk_.Clear();
@@ -2801,6 +3240,7 @@ void Http2ServerSubStreamState::CloseLocal() noexcept {
             session->Spawn(session->FinishStream(stream_id, false));
         } catch (...) {
             session->RemoveStream(stream_id);
+            session->CancelAll();
         }
     } else {
         session->RemoveStream(stream_id);
@@ -2809,7 +3249,6 @@ void Http2ServerSubStreamState::CloseLocal() noexcept {
 
 void Http2ServerSubStreamState::ShutdownRead() noexcept {
     read_closed_ = true;
-    input_done_ = true;
     DropQueuedData();
     hunk_.Clear();
     WakeInputReader();
@@ -2942,13 +3381,13 @@ net::awaitable<void> Http2ServerSubStreamState::AsyncShutdownWrite() {
         co_return;
     }
     write_closed_ = true;
-    trailers_sent_ = true;
     if (auto session = session_.lock()) {
-        if (payload_codec_ == H2PayloadCodec::RawData) {
-            (void)co_await session->WriteFrameSerialized(
-                H2FrameType::DATA, kFlagEndStream, stream_id_);
-        } else {
-            (void)co_await session->WriteTrailersSerialized(stream_id_);
+        const bool sent = payload_codec_ == H2PayloadCodec::RawData
+            ? co_await session->WriteFrameSerialized(
+                  H2FrameType::DATA, kFlagEndStream, stream_id_)
+            : co_await session->WriteTrailersSerialized(stream_id_);
+        if (sent) {
+            trailers_sent_ = true;
         }
     }
 }
@@ -2958,9 +3397,11 @@ void Http2ServerSubStreamState::PopFrontDataFrame() noexcept {
     const size_t storage = front.payload.capacity();
     queued_storage_ -= storage;
     if (auto session = LockSession()) session->ReleaseReceiveMemory(storage);
-    if (upload_budget_) {
-        upload_budget_->Release(front.payload.capacity());
-        upload_reserved_ -= front.payload.capacity();
+    if (upload_reserved_ != 0) {
+        if (auto budget = upload_budget_.lock()) {
+            budget->Release(storage);
+        }
+        upload_reserved_ -= std::min(upload_reserved_, storage);
     }
     data_frames_.pop_front();
     read_offset_ = 0;
@@ -2968,7 +3409,13 @@ void Http2ServerSubStreamState::PopFrontDataFrame() noexcept {
 
 void Http2ServerSubStreamState::DropQueuedData() noexcept {
     const size_t discarded = std::exchange(queued_bytes_, 0);
-    if (upload_budget_) upload_budget_->Release(std::exchange(upload_reserved_, 0));
+    const size_t upload_reserved = std::exchange(upload_reserved_, 0);
+    if (upload_reserved != 0) {
+        if (auto budget = upload_budget_.lock()) {
+            budget->Release(upload_reserved);
+        }
+    }
+    upload_budget_.reset();
     data_frames_.clear();
     read_offset_ = 0;
     ReleaseDecoderStorage();
@@ -2991,11 +3438,6 @@ void Http2ServerSubStreamState::ReleaseDecoderStorage() noexcept {
 
 net::awaitable<bool> Http2ServerSubStreamState::WaitForDataFrame() {
     while (!cancelled_) {
-        if (read_cancelled_) {
-            read_cancelled_ = false;
-            throw IoSystemError(io_error::operation_aborted, "HTTP/2 raw read cancelled");
-        }
-
         while (!data_frames_.empty()) {
             const auto& front = data_frames_.front();
             if (read_offset_ < front.offset) {
@@ -3011,9 +3453,12 @@ net::awaitable<bool> Http2ServerSubStreamState::WaitForDataFrame() {
             co_return false;
         }
 
+        const uint64_t epoch = read_abort_epoch_;
         auto [ec] = co_await input_signal_.async_receive(
             net::as_tuple(net::use_awaitable));
-        if (ec) throw IoSystemError(ec);
+        if (ec || epoch != read_abort_epoch_) {
+            throw IoSystemError(io_error::operation_aborted, "HTTP/2 raw read cancelled");
+        }
     }
     throw IoSystemError(terminal_error_, "HTTP/2 stream terminated");
 }
@@ -3022,12 +3467,18 @@ net::awaitable<bool> Http2ServerSubStreamState::EnsureReadablePayload() {
     if (payload_codec_ == H2PayloadCodec::RawData) co_return co_await WaitForDataFrame();
     while (hunk_.Payload().empty()) {
         if (!co_await WaitForDataFrame()) {
-            if (!hunk_.AtMessageBoundary()) ThrowHttp2StreamError("truncated gRPC message");
+            if (!hunk_.AtMessageBoundary()) {
+                ReleaseDecoderStorage();
+                AbortLocal();
+                ThrowHttp2StreamError("truncated gRPC message");
+            }
             co_return false;
         }
         const auto& front = data_frames_.front();
-        const auto bytes = std::span<const uint8_t>(front.payload).subspan(
+        auto bytes = std::span<const uint8_t>(front.payload).subspan(
             read_offset_, front.end - read_offset_);
+        const size_t limit = std::min(bytes.size(), hunk_.NextFeedLimit());
+        bytes = bytes.subspan(0, limit);
         // The decoder is a bounded internal consumer: fragmented gRPC
         // messages may exceed the peer's stream window, so credit must advance
         // while assembling them. Its vector grows by at most 1.5x, with a
@@ -3042,7 +3493,11 @@ net::awaitable<bool> Http2ServerSubStreamState::EnsureReadablePayload() {
         }
         decoder_reserved_ += reserve;
         const auto consumed = hunk_.Feed(bytes);
-        if (!consumed) ThrowHttp2StreamError(consumed.error().data());
+        if (!consumed) {
+            ReleaseDecoderStorage();
+            AbortLocal();
+            ThrowHttp2StreamError(consumed.error().data());
+        }
         const size_t unused_reservation = 2 * (bytes.size() - *consumed);
         session->ReleaseReceiveMemory(unused_reservation);
         decoder_reserved_ -= unused_reservation;
@@ -3122,13 +3577,14 @@ net::awaitable<TransportBuildResult> StartHttp2ServerSession(
     uint64_t conn_id,
     const HttpConfig* http_config,
     const XHttpConfig* xhttp_config,
+    const GrpcConfig* grpc_config,
     net::any_io_executor executor) {
     // SETTINGS is a receiver-selected limit, not a promise to allocate an
     // arbitrarily large configured window.
     initial_window = std::min<uint32_t>(initial_window, kHttp2MaxQueuedStreamBytes);
     auto session = memory::AllocateShared<Http2ServerSession>(
         io_context, std::move(stream), std::move(stream_handler), payload_codec,
-        conn_id, http_config, xhttp_config, initial_window, std::move(executor));
+        conn_id, http_config, xhttp_config, grpc_config, initial_window, std::move(executor));
     auto settings = EncodeInitialWindowSetting(initial_window);
     settings.resize(12);
     settings[6] = 0;
@@ -3151,19 +3607,31 @@ net::awaitable<TransportBuildResult> StartHttp2ServerSession(
 // Client preface, SETTINGS and the request HEADERS on stream 1.
 net::awaitable<bool> SendHttp2ClientRequest(AsyncStream& stream,
                                             uint32_t initial_window,
+                                            uint32_t conn_window,
                                             std::span<const uint8_t> header_block,
                                             bool end_stream) {
     if (!co_await WriteFullToStream(stream, kHttp2ClientPreface)) {
         co_return false;
     }
     const auto settings = EncodeInitialWindowSetting(initial_window);
-    co_return co_await WriteH2Frame(stream, H2FrameType::SETTINGS, 0, 0, settings) &&
-        co_await WriteH2Frame(
-            stream,
-            H2FrameType::HEADERS,
-            static_cast<uint8_t>(kFlagEndHeaders | (end_stream ? kFlagEndStream : 0)),
-            1,
-            header_block);
+    if (!co_await WriteH2Frame(stream, H2FrameType::SETTINGS, 0, 0, settings)) {
+        co_return false;
+    }
+    if (conn_window > H2SendWindow::kDefault) {
+        std::array<uint8_t, 4> connection_credit{};
+        StoreU32BE(connection_credit.data(),
+                   conn_window - static_cast<uint32_t>(H2SendWindow::kDefault));
+        if (!co_await WriteH2Frame(
+                stream, H2FrameType::WINDOW_UPDATE, 0, 0, connection_credit)) {
+            co_return false;
+        }
+    }
+    co_return co_await WriteH2Frame(
+        stream,
+        H2FrameType::HEADERS,
+        static_cast<uint8_t>(kFlagEndHeaders | (end_stream ? kFlagEndStream : 0)),
+        1,
+        header_block);
 }
 
 }  // namespace
@@ -3192,6 +3660,7 @@ net::awaitable<TransportBuildResult> DoGrpcServerHandshake(
         conn_id,
         nullptr,
         nullptr,
+        &cfg,
         std::move(executor));
 }
 
@@ -3211,6 +3680,7 @@ net::awaitable<TransportBuildResult> RunHttp2ServerSession(
         conn_id,
         &cfg,
         xhttp_cfg,
+        nullptr,
         CaptureHttp2Executor(io_context));
 }
 
@@ -3220,8 +3690,16 @@ net::awaitable<TransportBuildResult> DoGrpcClientHandshake(
     std::string_view authority,
     bool tls,
     uint64_t conn_id) {
-    const std::string_view path = cfg.request_path;
-    const uint32_t initial_window = cfg.initial_window_size.value_or(kDefaultInitialWindow);
+    const std::string fallback_path = cfg.request_path.empty() ? cfg.RequestPath() : std::string{};
+    const std::string_view path = cfg.request_path.empty()
+        ? std::string_view(fallback_path)
+        : std::string_view(cfg.request_path);
+    const uint32_t initial_window = std::min<uint32_t>(
+        cfg.initial_window_size.value_or(kDefaultInitialWindow),
+        kHttp2MaxQueuedStreamBytes);
+    const uint32_t conn_window = std::min<uint32_t>(
+        cfg.initial_window_size.value_or(H2SendWindow::kDefault),
+        kHttp2MaxQueuedStreamBytes);
     const auto headers = EncodeGrpcRequestHeaders(
         authority,
         path,
@@ -3231,6 +3709,7 @@ net::awaitable<TransportBuildResult> DoGrpcClientHandshake(
     if (!co_await SendHttp2ClientRequest(
             *stream,
             initial_window,
+            conn_window,
             headers,
             false)) {
         co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
@@ -3244,7 +3723,8 @@ net::awaitable<TransportBuildResult> DoGrpcClientHandshake(
         std::move(stream),
         1,
         H2PayloadCodec::GrpcHunk,
-        initial_window);
+        initial_window,
+        conn_window);
 }
 
 net::awaitable<TransportBuildResult> DoHttp2ClientHandshake(
@@ -3254,12 +3734,17 @@ net::awaitable<TransportBuildResult> DoHttp2ClientHandshake(
     bool tls,
     uint64_t conn_id) {
     const auto headers = EncodeHttpRequestHeaders(authority, tls, cfg);
-    const uint32_t initial_window = cfg.initial_window_size.value_or(kDefaultInitialWindow);
-    // A GET carries no body, so its HEADERS frame ends the request stream.
+    const uint32_t initial_window = std::min<uint32_t>(
+        cfg.initial_window_size.value_or(kDefaultInitialWindow),
+        kHttp2MaxQueuedStreamBytes);
+    const uint32_t conn_window = std::min<uint32_t>(
+        cfg.initial_window_size.value_or(H2SendWindow::kDefault),
+        kHttp2MaxQueuedStreamBytes);
     const bool request_body_expected = !EqualsAsciiCI(cfg.method, "GET");
     if (!co_await SendHttp2ClientRequest(
             *stream,
             initial_window,
+            conn_window,
             headers,
             !request_body_expected)) {
         co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
@@ -3273,7 +3758,9 @@ net::awaitable<TransportBuildResult> DoHttp2ClientHandshake(
         std::move(stream),
         1,
         H2PayloadCodec::RawData,
-        initial_window);
+        initial_window,
+        conn_window,
+        !request_body_expected);
 }
 
 }  // namespace acpp::transport::internet

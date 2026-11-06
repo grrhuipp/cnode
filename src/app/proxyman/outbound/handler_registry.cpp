@@ -49,6 +49,21 @@ HandlerRegistry::HandlerPtr HandlerRegistry::ReplaceHandler(std::unique_ptr<Outb
     return it->second;
 }
 
+bool HandlerRegistry::RestoreHandler(HandlerPtr handler) {
+    if (!handler) {
+        return false;
+    }
+
+    auto it = handlers_.find(handler->Tag());
+    if (it == handlers_.end()) {
+        memory::ThreadLocalString tag(handler->Tag());
+        return handlers_.try_emplace(std::move(tag), std::move(handler)).second;
+    }
+
+    it->second = std::move(handler);
+    return true;
+}
+
 void HandlerRegistry::RemoveHandler(std::string_view tag) {
     auto it = handlers_.find(tag);
     if (it == handlers_.end()) {

@@ -31,7 +31,6 @@ class DNSWorker;
 }
 namespace app {
 struct UserTrafficSnapshot;
-struct AccountingDomain;
 }
 struct OnlineDevice;
 struct PortBinding;
@@ -129,8 +128,6 @@ public:
     // Snapshot on this Worker; acknowledge only after off-thread durable storage.
     [[nodiscard]] net::awaitable<app::UserTrafficSnapshot> SnapshotTraffic(std::string tag);
     net::awaitable<void> CommitTraffic(std::string tag, const app::UserTrafficSnapshot& snapshot);
-    [[nodiscard]] std::vector<app::AccountingDomain>
-        AccountingDomains() const;
 
     // 协议类型由 inbound handler 的 ReceiverSettings 自动判断，无需外部传入。
     [[nodiscard]] net::awaitable<std::vector<OnlineDevice>> GetOnlineDevices(std::string tag) const;

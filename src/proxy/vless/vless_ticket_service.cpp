@@ -117,8 +117,13 @@ struct DirectoryState final : std::enable_shared_from_this<DirectoryState> {
     }
     bool Publish(DirectoryKey key, DirectoryEntry entry) {
         Prune(Clock::now());
-        if (closed || entry.expires <= Clock::now() || entries.size() >= 65536 ||
-            entries.contains(key)) return false;
+        if (closed || entry.expires <= Clock::now() || entries.contains(key))
+            return false;
+        while (entries.size() >= 65536 && !expiry.empty()) {
+            entries.erase(expiry.begin()->second);
+            expiry.erase(expiry.begin());
+        }
+        if (entries.size() >= 65536) return false;
         auto event = expiry.emplace(entry.expires, key);
         try {
             entries.emplace(std::move(key), std::move(entry));
@@ -224,8 +229,14 @@ net::awaitable<bool> RegisterTicket(
     std::shared_ptr<const VlessEncryptionConfig> config, std::string tag,
     VlessEncryptionIssuedTicket issued, std::array<uint8_t, 16> identity) {
     const auto expires = issued.issued_at + std::chrono::seconds(issued.seconds);
-    if (issued.seconds == 0 || expires <= Clock::now()) co_return false;
+    const auto now = Clock::now();
+    if (issued.seconds == 0 || expires <= now) co_return false;
     auto& directory = Directory(*coordinator);
+    directory.Prune(now);
+    if (directory.closed ||
+        directory.entries.contains(DirectoryKey{config.get(), tag, issued.ticket})) {
+        co_return false;
+    }
     ActorKey actor_key{config.get(), tag, origin->OwnerId()};
     auto actor = directory.FindActor(actor_key);
     if (!actor) {
@@ -234,6 +245,11 @@ net::awaitable<bool> RegisterTicket(
         actor_key.worker = candidate->OwnerId();
         actor = directory.RememberActor(std::move(actor_key), std::move(candidate));
         if (!actor) co_return false;
+        directory.Prune(Clock::now());
+        if (directory.closed ||
+            directory.entries.contains(DirectoryKey{config.get(), tag, issued.ticket})) {
+            co_return false;
+        }
     }
     // Release the physical domain as soon as its narrow actor is resolved.
     origin.reset();

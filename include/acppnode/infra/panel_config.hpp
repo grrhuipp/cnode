@@ -10,12 +10,28 @@
 #include "acppnode/proxy/freedom_domain_strategy.hpp"
 
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
+#include <memory>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace acpp {
 
+struct TlsPemMaterial;
+
+struct PanelApiUrlParts {
+    std::string host;
+    uint16_t port = 0;
+    std::string path_prefix;
+    bool use_ssl = false;
+};
+
+[[nodiscard]] bool IsValidPanelName(std::string_view name) noexcept;
+[[nodiscard]] bool IsValidPanelKey(std::string_view key) noexcept;
+[[nodiscard]] std::optional<PanelApiUrlParts> ParsePanelApiUrl(std::string_view url);
 // ============================================================================
 // 面板配置
 //
@@ -46,7 +62,7 @@ struct PanelConfig {
     bool TLSEnable = false;
     std::string TLSCert;                    // 证书文件路径（空则自签名）
     std::string TLSKey;                     // 私钥文件路径（空则自签名）
-
+    std::shared_ptr<const TlsPemMaterial> TLSPem;
     static PanelConfig FromJson(const json::object& j);
     [[nodiscard]] bool Validate() const;
 };

@@ -41,7 +41,9 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     std::chrono::seconds /*relay_idle_timeout*/,
     std::chrono::seconds /*relay_write_timeout*/) {
     first_payload.clear();
-    if (http_response_ && inbound.writer) {
+    const bool send_http =
+        http_response_ && ctx.content.network == Network::TCP && inbound.writer;
+    if (send_http) {
         net::const_buffer response{kHttp403Response.data(), kHttp403Response.size()};
         try {
             co_await inbound.writer->WriteBuffers(
@@ -51,7 +53,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
             LOG_CONN_DEBUG(ctx, "failed to write HTTP response");
         }
     }
-    LOG_CONN_DEBUG(ctx, "blocked before relay response={}", http_response_ ? "http" : "none");
+    LOG_CONN_DEBUG(ctx, "blocked before relay response={}", send_http ? "http" : "none");
     co_return tl::unexpected(ErrorCode::BLOCKED);
 }
 

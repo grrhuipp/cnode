@@ -3,6 +3,7 @@
 
 #include "http_path_match.hpp"
 #include "acppnode/common/allocator.hpp"
+#include "acppnode/common/buffer_util.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/transport/internet/http_headers.hpp"
 #include "acppnode/transport/internet/tcp_stream.hpp"
@@ -41,7 +42,11 @@ public:
     }
 
     void SetPendingData(std::span<const uint8_t> data) {
-        if (data.empty()) {
+        if (content_remaining_) {
+            data = data.first(
+                static_cast<size_t>(std::min<uint64_t>(data.size(), *content_remaining_)));
+        }
+        if (data.empty() || closed_ || read_closed_) {
             return;
         }
         if (!buf::AppendSpanToMultiBuffer(data, pending_)) {
@@ -60,44 +65,20 @@ public:
     }
 
     net::awaitable<size_t> AsyncWrite(net::const_buffer buffer) override {
-        if (write_closed_) {
+        if (closed_ || write_closed_) {
             throw IoSystemError(io_error::operation_aborted, "http1 body write closed");
         }
-        if (!write_chunked_) {
-            co_return co_await inner_->AsyncWrite(buffer);
-        }
-        const auto* data = static_cast<const uint8_t*>(buffer.data());
-        const size_t len = buffer.size();
-        if (len == 0) {
+        if (buffer.size() == 0) {
             co_return 0;
         }
-        std::array<char, sizeof(size_t) * 2 + 2> prefix{};
-        auto [ptr, ec] = std::to_chars(
-            prefix.data(),
-            prefix.data() + prefix.size() - 2,
-            len,
-            16);
-        if (ec != std::errc{}) {
-            throw IoSystemError(io_error::fault, "http1 chunk size encode failed");
-        }
-        *ptr++ = '\r';
-        *ptr++ = '\n';
-
-        constexpr std::array<char, 2> kChunkTail{'\r', '\n'};
-        const std::array<net::const_buffer, 3> buffers{
-            net::buffer(prefix.data(), static_cast<size_t>(ptr - prefix.data())),
-            net::buffer(data, len),
-            net::buffer(kChunkTail.data(), kChunkTail.size())
-        };
-        try {
-            co_await inner_->WriteBuffers(buffers);
-        } catch (...) {
-            throw IoSystemError(io_error::broken_pipe, "http1 chunk write failed");
-        }
-        co_return len;
+        co_await WriteBuffers({&buffer, 1});
+        co_return buffer.size();
     }
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
+        if (closed_ || read_closed_) {
+            co_return buf::MultiBuffer{};
+        }
         if (content_remaining_) {
             co_return co_await ReadContentLengthMultiBuffer();
         }
@@ -114,6 +95,7 @@ public:
             pending_ = co_await inner_->ReadMultiBuffer();
         }
         if (pending_.byte_size() == 0) {
+            if (closed_ || read_closed_) co_return buf::MultiBuffer{};
             FailBodyRead("truncated HTTP/1 chunk payload");
         }
         const size_t n = std::min(pending_.byte_size(), chunk_remaining_);
@@ -125,49 +107,76 @@ public:
     }
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
-        if (write_closed_) {
+        if (closed_ || write_closed_) {
             mb.clear();
             throw IoSystemError(io_error::operation_aborted, "http1 body write closed");
         }
-        if (!write_chunked_) {
-            co_await inner_->WriteMultiBuffer(std::move(mb));
-            co_return;
-        }
-        for (buf::Buffer*& buffer : mb) {
-            if (buffer && !buffer->IsEmpty()) {
-                const auto bytes = buffer->Bytes();
-                (void)co_await AsyncWrite(net::buffer(bytes.data(), bytes.size()));
-            }
-            mb.FreeSlot(buffer);
-        }
-        mb.clear();
+        co_await AsyncStream::WriteMultiBuffer(std::move(mb));
     }
 
     net::awaitable<void> WriteBuffers(
         std::span<const net::const_buffer> buffers) override {
-        if (write_closed_) {
+        if (closed_ || write_closed_) {
             throw IoSystemError(io_error::operation_aborted, "http1 body write closed");
         }
-        if (!write_chunked_) {
-            co_await inner_->WriteBuffers(buffers);
+        size_t len = 0;
+        for (const auto& buffer : buffers) {
+            if (buffer.size() > std::numeric_limits<size_t>::max() - len) {
+                throw IoSystemError(io_error::message_size, "http1 chunk size overflow");
+            }
+            len += buffer.size();
+        }
+        if (len == 0) {
             co_return;
         }
-        for (const auto& buffer : buffers) {
-            if (buffer.size() == 0) {
-                continue;
+        if (!write_chunked_) {
+            try {
+                co_await inner_->WriteBuffers(buffers);
+            } catch (...) {
+                CloseAbortive();
+                throw;
             }
-            (void)co_await AsyncWrite(buffer);
+            co_return;
+        }
+        std::array<char, sizeof(size_t) * 2 + 2> prefix{};
+        auto [ptr, ec] = std::to_chars(
+            prefix.data(),
+            prefix.data() + prefix.size() - 2,
+            len,
+            16);
+        if (ec != std::errc{}) {
+            throw IoSystemError(io_error::fault, "http1 chunk size encode failed");
+        }
+        *ptr++ = '\r';
+        *ptr++ = '\n';
+
+        constexpr std::array<char, 2> kChunkTail{'\r', '\n'};
+        ConstBufferSpanBuilder<16> chunk_buffers;
+        chunk_buffers.Append(
+            net::buffer(prefix.data(), static_cast<size_t>(ptr - prefix.data())));
+        chunk_buffers.AppendBuffers(buffers);
+        chunk_buffers.Append(net::buffer(kChunkTail.data(), kChunkTail.size()));
+        try {
+            co_await inner_->WriteBuffers(chunk_buffers.Span());
+        } catch (...) {
+            CloseAbortive();
+            throw;
         }
     }
 
     void ShutdownRead() override {
         read_closed_ = true;
         pending_.clear();
+        ResetLine();
         inner_->ShutdownRead();
     }
 
     void ShutdownWrite() override {
-        if (write_closed_) {
+        if (closed_ || write_closed_) {
+            return;
+        }
+        if (write_chunked_) {
+            CloseAbortive();
             return;
         }
         write_closed_ = true;
@@ -175,19 +184,30 @@ public:
     }
 
     net::awaitable<void> AsyncShutdownWrite() override {
-        if (write_closed_) {
+        if (closed_ || write_closed_) {
             co_return;
         }
         write_closed_ = true;
-        if (write_chunked_) {
-            (void)co_await WriteFullToStream(*inner_, "0\r\n\r\n");
+        try {
+            if (write_chunked_) {
+                constexpr std::string_view kTerminator = "0\r\n\r\n";
+                const net::const_buffer buffer{kTerminator.data(), kTerminator.size()};
+                co_await inner_->WriteBuffers({&buffer, 1});
+            }
+            co_await inner_->AsyncShutdownWrite();
+        } catch (...) {
+            CloseAbortive();
+            throw;
         }
-        co_await inner_->AsyncShutdownWrite();
     }
 
     void Cancel() noexcept override {
         NotifyCancellation();
         inner_->Cancel();
+    }
+
+    transport::CancellationSource& Cancellation() noexcept override {
+        return inner_->Cancellation();
     }
 
     void Close() override {
@@ -229,8 +249,13 @@ protected:
 
 private:
     static constexpr size_t kMaxChunkLine = 8192;
+    static constexpr size_t kMaxTrailerLines = 128;
+    static constexpr size_t kMaxTrailerBytes = 64 * 1024;
 
     net::awaitable<size_t> ReadRaw(net::mutable_buffer buffer) {
+        if (closed_ || read_closed_) {
+            co_return 0;
+        }
         auto* out = static_cast<uint8_t*>(buffer.data());
         const size_t capacity = buffer.size();
         if (capacity == 0) {
@@ -246,24 +271,39 @@ private:
     // whatever follows on the connection is not body. EOF before the end is a
     // truncated message, not a clean close.
     net::awaitable<size_t> ReadContentLength(net::mutable_buffer buffer) {
-        if (*content_remaining_ == 0 || buffer.size() == 0) {
+        if (closed_ || read_closed_ || *content_remaining_ == 0 || buffer.size() == 0) {
+            if (content_remaining_ && *content_remaining_ == 0) {
+                pending_.clear();
+            }
             co_return 0;
         }
         const auto want = static_cast<size_t>(
             std::min<uint64_t>(buffer.size(), *content_remaining_));
         const size_t n = co_await ReadRaw(net::buffer(buffer.data(), want));
-        if (n == 0) FailBodyRead("truncated HTTP/1 Content-Length body");
+        if (n == 0) {
+            if (closed_ || read_closed_) co_return 0;
+            FailBodyRead("truncated HTTP/1 Content-Length body");
+        }
         *content_remaining_ -= n;
+        if (*content_remaining_ == 0) {
+            pending_.clear();
+        }
         co_return n;
     }
 
     net::awaitable<buf::MultiBuffer> ReadContentLengthMultiBuffer() {
-        if (*content_remaining_ == 0) {
+        if (closed_ || read_closed_ || *content_remaining_ == 0) {
+            if (content_remaining_ && *content_remaining_ == 0) {
+                pending_.clear();
+            }
             co_return buf::MultiBuffer{};
         }
         if (pending_.byte_size() == 0) {
             pending_ = co_await inner_->ReadMultiBuffer();
-            if (pending_.byte_size() == 0) FailBodyRead("truncated HTTP/1 Content-Length body");
+            if (pending_.byte_size() == 0) {
+                if (closed_ || read_closed_) co_return buf::MultiBuffer{};
+                FailBodyRead("truncated HTTP/1 Content-Length body");
+            }
         }
         if (pending_.byte_size() <= *content_remaining_) {
             *content_remaining_ -= pending_.byte_size();
@@ -274,6 +314,7 @@ private:
             throw std::bad_alloc();
         }
         *content_remaining_ = 0;
+        pending_.clear();
         co_return payload;
     }
 
@@ -309,11 +350,13 @@ private:
 
     [[noreturn]] void FailBodyRead(const char* what) {
         read_closed_ = true;
+        ResetLine();
+        inner_->SetAbortiveClose(true);
         throw IoSystemError(io_error::invalid_argument, what);
     }
 
     net::awaitable<bool> EnsureChunkPayload() {
-        if (read_closed_) {
+        if (closed_ || read_closed_) {
             co_return false;
         }
         while (chunk_remaining_ == 0) {
@@ -322,8 +365,10 @@ private:
                 while (chunk_terminator_bytes_ != terminator.size()) {
                     if (pending_.byte_size() == 0) {
                         pending_ = co_await inner_->ReadMultiBuffer();
-                        if (pending_.byte_size() == 0)
+                        if (pending_.byte_size() == 0) {
+                            if (closed_ || read_closed_) co_return false;
                             FailBodyRead("incomplete HTTP/1 chunk terminator");
+                        }
                     }
                     const auto bytes = pending_.FrontSpan();
                     const size_t count = std::min(bytes.size(),
@@ -338,15 +383,32 @@ private:
                 chunk_terminator_bytes_ = 0;
                 chunk_terminator_pending_ = false;
             }
-            if (!co_await ReadLine())
+            if (!co_await ReadLine()) {
+                if (closed_ || read_closed_) co_return false;
                 FailBodyRead("incomplete HTTP/1 chunk-size or trailer line");
+            }
             if (reading_trailers_) {
-                const bool finished = line_.empty();
-                ResetLine();
-                if (finished) {
+                if (line_.empty()) {
+                    ResetLine();
                     read_closed_ = true;
+                    pending_.clear();
                     co_return false;
                 }
+                const size_t colon = line_.find(':');
+                if (colon == std::string::npos || colon == 0 ||
+                    !IsValidHttpHeaderName(std::string_view(line_).substr(0, colon)) ||
+                    !IsValidHttpHeaderValue(
+                        TrimHttpOws(std::string_view(line_).substr(colon + 1)))) {
+                    FailBodyRead("invalid HTTP/1 chunk trailer line");
+                }
+                const size_t line_bytes = line_.size() + 2;
+                ResetLine();
+                ++trailer_lines_;
+                if (trailer_lines_ > kMaxTrailerLines ||
+                    line_bytes > kMaxTrailerBytes - trailer_bytes_) {
+                    FailBodyRead("HTTP/1 chunk trailers exceed limit");
+                }
+                trailer_bytes_ += line_bytes;
                 continue;
             }
             const auto chunk_size = ParseHttpChunkSize(line_);
@@ -362,7 +424,7 @@ private:
     }
 
     net::awaitable<size_t> ReadChunked(net::mutable_buffer buffer) {
-        if (read_closed_) {
+        if (closed_ || read_closed_) {
             co_return 0;
         }
         auto* out = static_cast<uint8_t*>(buffer.data());
@@ -374,7 +436,10 @@ private:
         if (!co_await EnsureChunkPayload()) co_return 0;
         const size_t want = std::min(capacity, chunk_remaining_);
         const size_t n = co_await ReadRaw(net::buffer(out, want));
-        if (n == 0) FailBodyRead("truncated HTTP/1 chunk payload");
+        if (n == 0) {
+            if (closed_ || read_closed_) co_return 0;
+            FailBodyRead("truncated HTTP/1 chunk payload");
+        }
         chunk_remaining_ -= n;
         if (chunk_remaining_ == 0) chunk_terminator_pending_ = true;
         co_return n;
@@ -387,6 +452,8 @@ private:
     std::optional<uint64_t> content_remaining_;
     memory::ThreadLocalString line_;
     size_t chunk_terminator_bytes_ = 0;
+    size_t trailer_lines_ = 0;
+    size_t trailer_bytes_ = 0;
     bool chunk_terminator_pending_ = false;
     bool reading_trailers_ = false;
     bool read_chunked_ = false;
@@ -456,8 +523,7 @@ net::awaitable<tl::expected<void, ErrorCode>> ReadClientResponse(
     }
     const std::string_view status_line = ExtractStartLine(head->Text());
     if (!HasStatusCode(status_line, status_code)) {
-        LOG_CONN_DEBUG(conn_id, "{} client request rejected > {}",
-                       scope, SanitizeForLog(status_line));
+        LOG_CONN_DEBUG(conn_id, "{} client request rejected", scope);
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
     if (status_code == "101" &&
@@ -522,28 +588,28 @@ std::string_view ExtractStartLine(std::string_view head) {
     return head.substr(0, head.find("\r\n"));
 }
 
-std::string_view ExtractRequestMethod(std::string_view request_line) {
-    const size_t end = request_line.find(' ');
-    if (end == std::string_view::npos) {
-        return {};
-    }
-    return request_line.substr(0, end);
-}
-
-std::string_view ExtractRequestTarget(std::string_view request_line) {
+Http1RequestLine ParseHttp1RequestLine(std::string_view request_line) {
+    Http1RequestLine line;
     const size_t first_space = request_line.find(' ');
     if (first_space == std::string_view::npos) {
-        return {};
+        return line;
     }
-    size_t start = first_space + 1;
-    while (start < request_line.size() && request_line[start] == ' ') {
-        ++start;
+    line.method = request_line.substr(0, first_space);
+    const size_t start = request_line.find_first_not_of(' ', first_space + 1);
+    if (start == std::string_view::npos) {
+        return line;
     }
     const size_t end = request_line.find(' ', start);
-    if (end == std::string_view::npos || end <= start) {
-        return {};
+    if (end == std::string_view::npos) {
+        return line;
     }
-    return request_line.substr(start, end - start);
+    line.target = request_line.substr(start, end - start);
+    const size_t version_start = request_line.find_first_not_of(' ', end + 1);
+    if (version_start != std::string_view::npos) {
+        const size_t version_end = request_line.find(' ', version_start);
+        line.version = request_line.substr(version_start, version_end - version_start);
+    }
+    return line;
 }
 
 namespace {
@@ -676,29 +742,102 @@ std::string SanitizeForLog(std::string_view value, size_t max_len) {
 }
 
 std::string_view PublicHttpTargetForLog(std::string_view value) {
+    constexpr std::string_view invalid = "[invalid HTTP target]";
     value = TrimAscii(value);
     value = value.substr(0, value.find_first_of("?#"));
-    const auto scheme = value.find("://");
-    const size_t authority_start = scheme != std::string_view::npos
-        ? scheme + 3 : value.starts_with("//") ? 2 : 0;
+    if (value.empty()) return "-";
+    for (unsigned char ch : value) {
+        if (ch <= ' ' || ch >= 0x7f || ch == '\\') return invalid;
+    }
+    // A single leading slash is an origin path, not an authority. In
+    // particular, '@' in that path is not URL userinfo.
+    if (value.starts_with('/') && !value.starts_with("//")) return value;
+    if (value == "*") return value;
+
+    size_t authority_start = 0;
+    const auto scheme_end = value.find("://");
+    if (scheme_end != std::string_view::npos) {
+        const auto scheme = value.substr(0, scheme_end);
+        const auto alpha = [](char ch) {
+            return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z');
+        };
+        if (scheme.empty() || !alpha(scheme.front())) return invalid;
+        for (char ch : scheme) {
+            if (!alpha(ch) && !(ch >= '0' && ch <= '9') &&
+                ch != '+' && ch != '-' && ch != '.') return invalid;
+        }
+        authority_start = scheme_end + 3;
+    } else if (value.starts_with("//")) {
+        authority_start = 2;
+    }
     const auto authority_end = value.find('/', authority_start);
-    const auto at = value.substr(0, authority_end).rfind('@');
+    auto authority = value.substr(authority_start, authority_end - authority_start);
+    if (authority.empty()) return invalid;
+    const auto at = authority.find('@');
     if (at != std::string_view::npos) {
-        value.remove_prefix(at + 1);
+        authority.remove_prefix(at + 1);
+        if (authority.find('@') != std::string_view::npos) return invalid;
+    }
+    if (authority.empty()) return invalid;
+    // Validate host/port boundaries before exposing any authority. This is
+    // deliberately log-only: malformed URL spellings retain no raw bytes.
+    std::string_view port;
+    if (authority.starts_with('[')) {
+        const auto close = authority.find(']');
+        if (close == std::string_view::npos || close == 1) return invalid;
+        for (char ch : authority.substr(1, close - 1)) {
+            if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') ||
+                  (ch >= 'A' && ch <= 'F') || ch == ':' || ch == '.')) return invalid;
+        }
+        if (close + 1 < authority.size()) {
+            if (authority[close + 1] != ':') return invalid;
+            port = authority.substr(close + 2);
+            if (port.empty()) return invalid;
+        }
+    } else {
+        const auto colon = authority.find(':');
+        const auto host = authority.substr(0, colon);
+        if (host.empty()) return invalid;
+        for (char ch : host) {
+            if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                  (ch >= '0' && ch <= '9') || ch == '-' || ch == '.' ||
+                  ch == '_')) return invalid;
+        }
+        if (colon != std::string_view::npos) {
+            port = authority.substr(colon + 1);
+            if (port.empty()) return invalid;
+        }
+    }
+    for (char ch : port) {
+        if (ch < '0' || ch > '9') return invalid;
+    }
+    if (at != std::string_view::npos) value.remove_prefix(authority_start + at + 1);
+    return value;
+}
+
+std::string_view PublicHttpMethodForLog(std::string_view value) {
+    if (value.empty()) return "[invalid method]";
+    for (char ch : value) {
+        // RFC 9110 token grammar. Do not echo arbitrary request-line tokens.
+        if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+              (ch >= '0' && ch <= '9') ||
+              std::string_view("!#$%&'*+-.^_`|~").find(ch) != std::string_view::npos)) {
+            return "[invalid method]";
+        }
     }
     return value;
 }
 
-std::string SanitizeHttpRequestLineForLog(std::string_view value) {
-    const auto method_end = value.find(' ');
-    const auto target_end = value.rfind(' ');
-    if (method_end == std::string_view::npos || target_end <= method_end) {
-        return "invalid request line";
-    }
-    const auto method = value.substr(0, method_end);
-    const auto target = PublicHttpTargetForLog(
-        value.substr(method_end + 1, target_end - method_end - 1));
-    const auto version = value.substr(target_end + 1);
+std::string SanitizeHttpRequestLineForLog(const Http1RequestLine& line) {
+    const auto method = PublicHttpMethodForLog(line.method);
+    const auto target = PublicHttpTargetForLog(line.target);
+    // RFC 9112 HTTP-version is HTTP-name "/" DIGIT "." DIGIT. Neither
+    // invalid versions nor ignored trailing tokens are safe diagnostic text.
+    const auto version = line.version.size() == 8 && line.version.starts_with("HTTP/") &&
+                         line.version[5] >= '0' && line.version[5] <= '9' &&
+                         line.version[6] == '.' &&
+                         line.version[7] >= '0' && line.version[7] <= '9'
+        ? line.version : std::string_view("[invalid version]");
     constexpr size_t kLimit = 160;
     const size_t public_size = method.size() + target.size() + version.size() + 2;
     std::string out;
@@ -720,6 +859,14 @@ std::string SanitizeHttpRequestLineForLog(std::string_view value) {
     append(version);
     if (public_size > kLimit) out.append("...");
     return out;
+}
+
+bool IsReservedUpgradeHeader(std::string_view key) noexcept {
+    return EqualsAsciiCI(key, "Host") ||
+           EqualsAsciiCI(key, "Upgrade") ||
+           EqualsAsciiCI(key, "Connection") ||
+           EqualsAsciiCI(key, "Sec-WebSocket-Key") ||
+           EqualsAsciiCI(key, "Sec-WebSocket-Version");
 }
 
 std::string_view ExpectedHttpHost(const HttpConfig& cfg) {
@@ -765,18 +912,17 @@ net::awaitable<TransportBuildResult> DoHttp1ServerHandshake(
 
     const std::string_view request = head->Text();
     const std::string_view request_line = ExtractStartLine(request);
-    const std::string_view method = ExtractRequestMethod(request_line);
-    const std::string_view request_path = ExtractRequestTarget(request_line);
+    const auto parsed_line = ParseHttp1RequestLine(request_line);
+    const auto method = parsed_line.method;
+    const auto request_path = parsed_line.target;
     const std::string_view host = TrimAscii(ExtractHeaderValueCI(request, "Host"));
-    const std::string_view user_agent = ExtractHeaderValueCI(request, "User-Agent");
 
     LOG_CONN_TRACE(conn_id,
-        "HTTP server request line='{}' method='{}' path='{}' host='{}' ua='{}' bytes={}",
-        SanitizeHttpRequestLineForLog(request_line),
-        SanitizeForLog(method),
+        "HTTP server request line='{}' method='{}' path='{}' host='{}' bytes={}",
+        SanitizeHttpRequestLineForLog(parsed_line),
+        PublicHttpMethodForLog(method),
         PublicHttpTargetForLog(request_path),
         PublicHttpTargetForLog(host),
-        SanitizeForLog(user_agent),
         head->size);
 
     if (method.empty() || !detail::PathPrefixMatchesSegment(cfg.path, request_path)) {
@@ -789,8 +935,8 @@ net::awaitable<TransportBuildResult> DoHttp1ServerHandshake(
     if (!cfg.method.empty() && !EqualsAsciiCI(method, cfg.method)) {
         LOG_CONN_DEBUG(conn_id,
             "HTTP server method mismatch expected='{}' actual='{}'",
-            cfg.method,
-            SanitizeForLog(method));
+            PublicHttpMethodForLog(cfg.method),
+            PublicHttpMethodForLog(method));
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
     if (const std::string_view expected_host = TrimAscii(ExpectedHttpHost(cfg));
@@ -838,7 +984,7 @@ net::awaitable<TransportBuildResult> DoHttp1ClientHandshake(
         ? std::string_view("PUT") : std::string_view(cfg.method);
     size_t reserve_size = 192 + method.size() + req_path.size() + host.size();
     for (const auto& [key, value] : cfg.headers) {
-        if (!IsHostHeader(key)) {
+        if (!key.empty() && !IsHostHeader(key)) {
             reserve_size += key.size() + value.size() + 4;
         }
     }
@@ -847,7 +993,7 @@ net::awaitable<TransportBuildResult> DoHttp1ClientHandshake(
     request.reserve(reserve_size);
     AppendRequestStart(request, method, req_path, host);
     for (const auto& [key, value] : cfg.headers) {
-        if (!IsHostHeader(key)) {
+        if (!key.empty() && !IsHostHeader(key)) {
             AppendHeaderLine(request, key, value);
         }
     }
@@ -857,6 +1003,7 @@ net::awaitable<TransportBuildResult> DoHttp1ClientHandshake(
         LOG_CONN_DEBUG(conn_id, "HTTP client failed to send request");
         co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
     }
+    memory::ThreadLocalString{}.swap(request);
     if (auto response = co_await ReadClientResponse(*stream, "HTTP", conn_id, "200");
         !response) {
         co_return tl::unexpected(response.error());
@@ -879,20 +1026,16 @@ net::awaitable<TransportBuildResult> DoHttpUpgradeServerHandshake(
 
     const std::string_view request = head->Text();
     const std::string_view request_line = ExtractStartLine(request);
-    const std::string_view request_path = ExtractRequestTarget(request_line);
+    const auto parsed_line = ParseHttp1RequestLine(request_line);
+    const auto request_path = parsed_line.target;
     const std::string_view host = TrimAscii(ExtractHeaderValueCI(request, "Host"));
     const std::string_view upgrade = TrimAscii(ExtractHeaderValueCI(request, "Upgrade"));
-    const std::string_view connection = ExtractHeaderValueCI(request, "Connection");
-    const std::string_view user_agent = ExtractHeaderValueCI(request, "User-Agent");
 
     LOG_CONN_TRACE(conn_id,
-        "HTTPUpgrade server request line='{}' path='{}' host='{}' upgrade='{}' connection='{}' ua='{}' bytes={}",
-        SanitizeHttpRequestLineForLog(request_line),
+        "HTTPUpgrade server request line='{}' path='{}' host='{}' bytes={}",
+        SanitizeHttpRequestLineForLog(parsed_line),
         PublicHttpTargetForLog(request_path),
         PublicHttpTargetForLog(host),
-        SanitizeForLog(upgrade),
-        SanitizeForLog(connection),
-        SanitizeForLog(user_agent),
         head->size);
 
     if (!request_line.starts_with("GET ") ||
@@ -945,20 +1088,22 @@ net::awaitable<TransportBuildResult> DoHttpUpgradeClientHandshake(
     std::string_view host,
     uint64_t conn_id) {
     const std::string_view req_path = EffectiveHttpPath(cfg.path);
-    size_t reserve_size = 192 + req_path.size() + host.size();
+    const std::string_view configured_host = TrimAscii(ExpectedHttpUpgradeHost(cfg));
+    const std::string_view effective_host = configured_host.empty() ? host : configured_host;
+    size_t reserve_size = 192 + req_path.size() + effective_host.size();
     for (const auto& [key, value] : cfg.headers) {
-        if (!IsHostHeader(key)) {
+        if (!key.empty() && !IsReservedUpgradeHeader(key)) {
             reserve_size += key.size() + value.size() + 4;
         }
     }
 
     memory::ThreadLocalString request;
     request.reserve(reserve_size);
-    AppendRequestStart(request, "GET", req_path, host);
+    AppendRequestStart(request, "GET", req_path, effective_host);
     request.append("Upgrade: websocket\r\n");
     request.append("Connection: Upgrade\r\n");
     for (const auto& [key, value] : cfg.headers) {
-        if (!IsHostHeader(key)) {
+        if (!key.empty() && !IsReservedUpgradeHeader(key)) {
             AppendHeaderLine(request, key, value);
         }
     }
@@ -968,12 +1113,13 @@ net::awaitable<TransportBuildResult> DoHttpUpgradeClientHandshake(
         LOG_CONN_DEBUG(conn_id, "HTTPUpgrade client failed to send request");
         co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
     }
+    memory::ThreadLocalString{}.swap(request);
     if (auto response = co_await ReadClientResponse(*stream, "HTTPUpgrade", conn_id, "101");
         !response) {
         co_return tl::unexpected(response.error());
     }
     LOG_CONN_DEBUG(conn_id, "HTTPUpgrade client handshake completed (host={} path={})",
-                   PublicHttpTargetForLog(host), PublicHttpTargetForLog(req_path));
+                   PublicHttpTargetForLog(effective_host), PublicHttpTargetForLog(req_path));
     co_return std::move(stream);
 }
 
@@ -990,21 +1136,19 @@ net::awaitable<TransportBuildResult> DoWsServerHandshake(
 
     const std::string_view request = head->Text();
     const std::string_view request_line = ExtractStartLine(request);
-    const std::string_view request_path = ExtractRequestTarget(request_line);
+    const auto parsed_line = ParseHttp1RequestLine(request_line);
+    const auto request_path = parsed_line.target;
     const std::string_view host = ExtractHeaderValueCI(request, "Host");
     const std::string_view upgrade = ExtractHeaderValueCI(request, "Upgrade");
-    const std::string_view connection = ExtractHeaderValueCI(request, "Connection");
     const std::string_view version = ExtractHeaderValueCI(request, "Sec-WebSocket-Version");
 
     LOG_CONN_TRACE(conn_id, "WebSocket server received HTTP upgrade bytes={}", head->size);
 
     if (!EqualsAsciiCI(TrimAscii(upgrade), "websocket")) {
         LOG_CONN_DEBUG(conn_id, "WebSocket server missing 'Upgrade: websocket' header");
-        LOG_CONN_TRACE(conn_id, "WebSocket server rejected missing upgrade line='{}' host='{}' upgrade='{}' connection='{}'",
-                      SanitizeHttpRequestLineForLog(request_line),
-                      PublicHttpTargetForLog(host),
-                      SanitizeForLog(upgrade),
-                      SanitizeForLog(connection));
+        LOG_CONN_TRACE(conn_id, "WebSocket server rejected missing upgrade line='{}' host='{}'",
+                      SanitizeHttpRequestLineForLog(parsed_line),
+                      PublicHttpTargetForLog(host));
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
     if (!request_line.starts_with("GET ") || !request_line.ends_with(" HTTP/1.1") ||
@@ -1014,12 +1158,14 @@ net::awaitable<TransportBuildResult> DoWsServerHandshake(
     }
 
     // 仅在配置了非根路径时校验路径
-    if (ws_cfg.path != "/" && !ws_cfg.path.empty() && request_path != ws_cfg.path) {
-        LOG_CONN_DEBUG(conn_id, "WebSocket server path mismatch expected='{}'", PublicHttpTargetForLog(ws_cfg.path));
+    const std::string_view expected_path = EffectiveHttpPath(ws_cfg.path);
+    if (expected_path != "/" && request_path != expected_path) {
+        LOG_CONN_DEBUG(conn_id, "WebSocket server path mismatch expected='{}'",
+                       PublicHttpTargetForLog(expected_path));
         LOG_CONN_TRACE(conn_id, "WebSocket server rejected path mismatch expected='{}' actual='{}' line='{}'",
-                      PublicHttpTargetForLog(ws_cfg.path),
+                      PublicHttpTargetForLog(expected_path),
                       PublicHttpTargetForLog(request_path),
-                      SanitizeHttpRequestLineForLog(request_line));
+                      SanitizeHttpRequestLineForLog(parsed_line));
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
@@ -1032,7 +1178,7 @@ net::awaitable<TransportBuildResult> DoWsServerHandshake(
             reinterpret_cast<const uint8_t*>(ws_key.data()), 24) != 18) {
         LOG_CONN_DEBUG(conn_id, "WebSocket server received invalid Sec-WebSocket-Key header");
         LOG_CONN_TRACE(conn_id, "WebSocket server rejected invalid key line='{}' host='{}' version='{}'",
-                      SanitizeHttpRequestLineForLog(request_line),
+                      SanitizeHttpRequestLineForLog(parsed_line),
                       PublicHttpTargetForLog(host),
                       SanitizeForLog(version));
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
@@ -1061,15 +1207,12 @@ net::awaitable<TransportBuildResult> DoWsServerHandshake(
         ws->SetPendingData(read_ahead.data(), read_ahead.size());
     }
     LOG_CONN_TRACE(conn_id,
-        "WebSocket server handshake accepted path='{}' host='{}' pending={} real_ip_header='{}' real_ip='{}'",
-        PublicHttpTargetForLog(EffectiveHttpPath(ws_cfg.path)),
+        "WebSocket server handshake accepted path='{}' host='{}' pending={}",
+        PublicHttpTargetForLog(expected_path),
         PublicHttpTargetForLog(host),
-        read_ahead.size(),
-        ws_cfg.real_ip_header.empty() ? "-" : ws_cfg.real_ip_header,
-        (transport_metadata && !transport_metadata->real_ip.empty())
-            ? std::string_view(transport_metadata->real_ip)
-            : std::string_view("-"));
-    LOG_CONN_DEBUG(conn_id, "WebSocket server handshake completed (path={})", PublicHttpTargetForLog(ws_cfg.path));
+        read_ahead.size());
+    LOG_CONN_DEBUG(conn_id, "WebSocket server handshake completed (path={})",
+                   PublicHttpTargetForLog(expected_path));
     co_return std::unique_ptr<AsyncStream>(std::move(ws));
 }
 

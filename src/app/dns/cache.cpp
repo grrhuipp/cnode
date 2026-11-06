@@ -7,11 +7,30 @@
 
 namespace acpp::app::dns {
 
-DnsCache::DnsCache(size_t max_size, uint32_t min_ttl, uint32_t max_ttl)
+DnsCache::DnsCache(size_t max_size, uint32_t min_ttl, uint32_t max_ttl,
+                   NegativeEvent negative_event)
     : capacity_(max_size)
     , min_ttl_(std::min(min_ttl, max_ttl))
-    , max_ttl_(std::max(min_ttl, max_ttl)) {
+    , max_ttl_(std::max(min_ttl, max_ttl))
+    , negative_event_(negative_event) {
     if (capacity_ > 0) entries_.reserve(capacity_);
+}
+
+DnsCache::~DnsCache() {
+    for (const auto& node : order_) {
+        if (!node.entry.expired_negative) Report(node, "shutdown");
+    }
+}
+
+void DnsCache::Report(const CacheNode& node, std::string_view event) const noexcept {
+    const auto* reason = std::get_if<memory::ThreadLocalString>(&node.entry.answer);
+    if (!negative_event_ || !reason) return;
+    try {
+        negative_event_(std::string_view(node.domain), std::string_view(*reason),
+                        node.entry.negative_hits, event);
+    } catch (...) {
+        // Optional diagnostics must not invalidate cached answers or cleanup.
+    }
 }
 
 
@@ -24,17 +43,29 @@ std::optional<DnsResult> DnsCache::GetResult(std::string_view domain) {
     const auto node = found->second;
     const auto now = steady_clock::now();
     if (now >= node->entry.expire_time) {
-        entries_.erase(found);
-        order_.erase(node);
+        if (std::holds_alternative<memory::ThreadLocalString>(node->entry.answer)) {
+            // Keep only bounded recovery metadata, never serve an expired
+            // answer. It shares the cache's eviction slots, not a second map.
+            if (!node->entry.expired_negative) {
+                node->entry.expired_negative = true;
+                ++expired_negatives_;
+                Report(*node, "expired");
+            }
+            order_.splice(order_.end(), order_, node);
+        } else {
+            entries_.erase(found);
+            order_.erase(node);
+        }
         ++misses_;
         return std::nullopt;
     }
 
-    const DnsCacheEntry& entry = node->entry;
+    DnsCacheEntry& entry = node->entry;
     DnsResult result;
     if (const auto* reason = std::get_if<memory::ThreadLocalString>(&entry.answer)) {
         result.error = ErrorCode::DNS_NO_RECORD;
         result.error_msg.assign(reason->data(), reason->size());
+        if (entry.negative_hits != UINT64_MAX) ++entry.negative_hits;
     } else {
         const auto& addresses = std::get<memory::ThreadLocalVector<net::ip::address>>(entry.answer);
         result.addresses.assign(addresses.begin(), addresses.end());
@@ -66,6 +97,10 @@ void DnsCache::Store(std::string_view domain, const DnsResult& result) {
     const auto existing = entries_.find(domain);
     if (existing != entries_.end()) {
         const auto node = existing->second;
+        if (result.Ok() || !node->entry.expired_negative) {
+            Report(*node, result.Ok() ? "recovered" : "refreshed");
+        }
+        if (node->entry.expired_negative) --expired_negatives_;
         std::destroy_at(&node->entry);
         std::construct_at(&node->entry, std::move(prepared));
         order_.splice(order_.begin(), order_, node);
@@ -88,6 +123,8 @@ void DnsCache::Store(std::string_view domain, const DnsResult& result) {
     // whole table here would make every insert into a full cache O(capacity).
     if (entries_.size() > capacity_) {
         const auto victim = std::prev(order_.end());
+        if (!victim->entry.expired_negative) Report(*victim, "evicted");
+        if (victim->entry.expired_negative) --expired_negatives_;
         entries_.erase(std::string_view(victim->domain));
         order_.erase(victim);
     }
@@ -97,7 +134,7 @@ DnsCacheStats DnsCache::GetStats() const {
     return DnsCacheStats{
         .hits = hits_,
         .misses = misses_,
-        .entries = entries_.size(),
+        .entries = entries_.size() - expired_negatives_,
         .capacity = capacity_,
     };
 }

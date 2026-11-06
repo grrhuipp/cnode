@@ -55,13 +55,20 @@ public:
     };
 
     [[nodiscard]] bool AttachStream(std::unique_ptr<AsyncStream> stream);
+    [[nodiscard]] bool CanAttachStream() const noexcept {
+        return AcceptingInput() && stream_input_.Empty();
+    }
     net::awaitable<void> JoinAttachedUpload();
     // Called once the split stream joining this session to its downlink exists.
-    void AttachDownlink() noexcept;
+    [[nodiscard]] bool AttachDownlink() noexcept;
     // Keeps a session that an upload reached before its downlink alive until
     // a downlink joins. False when `connection` is cancelled first (its
     // request deadline or close) or the session closes without a downlink.
-    [[nodiscard]] net::awaitable<bool> AwaitDownlink(AsyncStream& connection);
+    [[nodiscard]] net::awaitable<bool> AwaitDownlink(
+        transport::CancellationSource& cancellation);
+    [[nodiscard]] net::awaitable<bool> AwaitDownlink(AsyncStream& connection) {
+        return AwaitDownlink(connection.Cancellation());
+    }
     [[nodiscard]] bool DownlinkAttached() const noexcept { return downlink_attached_; }
     [[nodiscard]] bool Push(uint64_t seq, buf::MultiBuffer payload);
     void CloseInput() noexcept;
@@ -96,7 +103,6 @@ private:
     };
 
     void OnCancellation(transport::Cancellation cancellation) noexcept override;
-    void ThrowIfReadCancelled();
     void ReleaseAttachedUpload(const std::shared_ptr<AsyncStream>& stream) noexcept;
     void Wake() noexcept;
 
@@ -107,12 +113,12 @@ private:
     transport::CancellationSource cancellation_;
     SignalChannel upload_signal_{io_context_, 1};
     // Event that AttachDownlink and Close broadcast to AwaitDownlink waiters.
-    net::steady_timer downlink_event_{io_context_, net::steady_timer::time_point::max()};
+    transport::CancellationSource downlink_ready_;
     size_t upload_reads_ = 0;
     bool downlink_attached_ = false;
     bool input_closed_ = false;
     bool closed_ = false;
-    bool read_cancelled_ = false;
+    uint64_t read_abort_epoch_ = 0;
 };
 
 struct XHttpRequestMeta {

@@ -24,6 +24,17 @@ using HttpHeaders = std::unordered_map<std::string, std::string>;
     return true;
 }
 
+[[nodiscard]] constexpr std::string_view TrimHttpOws(
+    std::string_view value) noexcept {
+    while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) {
+        value.remove_prefix(1);
+    }
+    while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) {
+        value.remove_suffix(1);
+    }
+    return value;
+}
+
 // Strips SP/HTAB and stray CR/LF around a header value or token.
 [[nodiscard]] constexpr std::string_view TrimAscii(std::string_view value) noexcept {
     constexpr auto is_space = [](char ch) noexcept {

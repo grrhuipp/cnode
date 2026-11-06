@@ -83,14 +83,73 @@ void AppendU64Hex(memory::ThreadLocalString& out, uint64_t value) {
 // so the protocol header shares that request; the limit bounds that deferral.
 constexpr size_t kMaxDeferredUploadBytes = 64 * 1024;
 
-class XHttpSplitClientStream final : public AsyncStream {
-public:
-    XHttpSplitClientStream(net::io_context& io_context,
-                           std::unique_ptr<AsyncStream> downlink,
-                           const OutboundTransportTarget& target,
-                           const OutboundDialCandidate& candidate,
-                           memory::ThreadLocalString upload_path,
-                           uint64_t conn_id)
+class XHttpSplitOutboundStreamBase : public AsyncStream {
+protected:
+    struct DownlinkCancellation final : transport::CancellationSubscription {
+        explicit DownlinkCancellation(XHttpSplitOutboundStreamBase& owner) noexcept
+            : owner(owner) {}
+        XHttpSplitOutboundStreamBase& owner;
+
+    private:
+        void OnCancellation(transport::Cancellation event) noexcept override {
+            owner.OnDownlinkCancellation(event);
+        }
+    };
+
+    struct InFlightUploadScope final : transport::CancellationSubscription {
+        XHttpSplitOutboundStreamBase& owner;
+        TcpStream* tcp;
+
+        InFlightUploadScope(XHttpSplitOutboundStreamBase& owner, TcpStream* tcp) noexcept
+            : owner(owner), tcp(tcp) {
+            owner.in_flight_upload_tcp_ = tcp;
+            if (tcp) {
+                Resubscribe(tcp->Cancellation());
+            }
+        }
+
+        ~InFlightUploadScope() noexcept {
+            Unsubscribe();
+            if (tcp) {
+                const bool write_expired = tcp->ConsumeWriteTimeout();
+                const bool idle_expired = tcp->ConsumeIdleTimeout();
+                const bool deadline_expired = tcp->ConsumePhaseDeadline();
+                if (write_expired || idle_expired || deadline_expired) {
+                    owner.upload_write_expired_ = true;
+                }
+            }
+            if (owner.in_flight_upload_tcp_ == tcp) {
+                owner.in_flight_upload_tcp_ = nullptr;
+            }
+        }
+
+    private:
+        void OnCancellation(transport::Cancellation event) noexcept override {
+            if (!tcp) return;
+            const bool write_expired = tcp->ConsumeWriteTimeout();
+            const bool idle_expired = tcp->ConsumeIdleTimeout();
+            const bool deadline_expired = tcp->ConsumePhaseDeadline();
+            if (write_expired || idle_expired || deadline_expired) {
+                owner.upload_write_expired_ = true;
+            }
+            if (event.terminal) {
+                if (owner.in_flight_upload_tcp_ == tcp) {
+                    owner.in_flight_upload_tcp_ = nullptr;
+                }
+                tcp = nullptr;
+            } else {
+                Resubscribe(tcp->Cancellation());
+            }
+        }
+    };
+
+    XHttpSplitOutboundStreamBase(net::io_context& io_context,
+                                 std::unique_ptr<AsyncStream> downlink,
+                                 const OutboundTransportTarget& target,
+                                 const OutboundDialCandidate& candidate,
+                                 memory::ThreadLocalString upload_path,
+                                 uint64_t conn_id,
+                                 const char* missing_settings_error)
         : io_context_(io_context)
         , downlink_(std::move(downlink))
         , target_(target)
@@ -98,97 +157,36 @@ public:
         , upload_path_(std::move(upload_path))
         , conn_id_(conn_id) {
         if (!target_.stream_settings) {
-            ThrowXHttpPacketError("xhttp stream-up missing stream settings");
+            ThrowXHttpPacketError(missing_settings_error);
         }
         target_.single_candidate = candidate_;
         target_.candidates.clear();
     }
 
-    ~XHttpSplitClientStream() noexcept override {
-        Close();
-    }
-
-    net::awaitable<size_t> AsyncRead(net::mutable_buffer buffer) override {
-        if (!downlink_) {
-            co_return 0;
-        }
-        if (ReaderMustSendDeferredUpload()) {
-            co_await WriteUpload({});
-        }
-        co_return co_await downlink_->AsyncRead(buffer);
-    }
-
-    net::awaitable<size_t> AsyncWrite(net::const_buffer buffer) override {
-        if (buffer.size() == 0) {
-            co_return 0;
-        }
-        // upload_failed_ is provisionally set while an open is in flight;
-        // only a finished failed open poisons the stream.
-        if (closed_ || (upload_failed_ && !upload_opening_)) {
-            ThrowXHttpPacketError("xhttp stream-up upload unavailable");
-        }
-        if (!upload_ && !upload_opening_ &&
-            buffer.size() <= kMaxDeferredUploadBytes - pending_initial_.byte_size()) {
-            const auto* data = static_cast<const uint8_t*>(buffer.data());
-            if (!buf::AppendSpanToMultiBuffer(
-                    std::span<const uint8_t>(data, buffer.size()),
-                    pending_initial_)) {
-                throw std::bad_alloc();
-            }
-            co_return buffer.size();
-        }
-        if (upload_) co_return co_await upload_->AsyncWrite(buffer);
-        co_await WriteUpload({&buffer, 1});
-        co_return buffer.size();
-    }
-
-    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
-        if (!downlink_) {
-            co_return buf::MultiBuffer{};
-        }
-        if (ReaderMustSendDeferredUpload()) {
-            co_await WriteUpload({});
-        }
-        co_return co_await downlink_->ReadMultiBuffer();
-    }
-
-    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
-        if (upload_) {
-            co_await upload_->WriteMultiBuffer(std::move(mb));
-            co_return;
-        }
-        ConstBufferSpanBuilder<16> payloads;
-        payloads.AppendMultiBuffer(mb);
-        co_await WriteUpload(payloads.Span());
-    }
-
-    net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
-        if (upload_) {
-            co_await upload_->WriteBuffers(buffers);
-            co_return;
-        }
-        co_await WriteUpload(buffers);
-    }
-
+public:
     void ShutdownRead() override {
         if (downlink_) {
             downlink_->ShutdownRead();
         }
     }
 
-    void ShutdownWrite() override {
-        if (upload_) {
-            upload_->ShutdownWrite();
+    void SetWriteTimeout(std::chrono::seconds timeout) override {
+        write_timeout_ = timeout;
+        upload_write_expired_ = false;
+        if (downlink_) {
+            downlink_->SetWriteTimeout(timeout);
+        }
+        if (in_flight_upload_tcp_) {
+            in_flight_upload_tcp_->SetWriteTimeout(timeout);
         }
     }
 
-    net::awaitable<void> AsyncShutdownWrite() override {
-        if (!upload_ && (upload_opening_ || pending_initial_.byte_size() != 0)) {
-            co_await WriteUpload({});
-        }
-        if (upload_) {
-            co_await upload_->AsyncShutdownWrite();
-        }
+    bool ConsumeWriteTimeout() noexcept override {
+        const bool downlink_expired = downlink_ && downlink_->ConsumeWriteTimeout();
+        const bool in_flight_expired =
+            in_flight_upload_tcp_ && in_flight_upload_tcp_->ConsumeWriteTimeout();
+        const bool prior_upload_expired = std::exchange(upload_write_expired_, false);
+        return downlink_expired || in_flight_expired || prior_upload_expired;
     }
 
     void Cancel() noexcept override {
@@ -196,39 +194,21 @@ public:
         if (downlink_) {
             downlink_->Cancel();
         }
-        if (upload_) {
-            upload_->Cancel();
+        if (in_flight_upload_tcp_) {
+            in_flight_upload_tcp_->Cancel();
         }
+    }
+
+    transport::CancellationSource& Cancellation() noexcept override {
+        return cancellation_;
     }
 
     void Close() override {
-        NotifyClosed();
-        if (closed_) {
-            return;
-        }
-        closed_ = true;
-        upload_gate_.Cancel();
-        if (upload_) {
-            upload_->Close();
-        }
-        if (downlink_) {
-            downlink_->Close();
-        }
+        CloseImpl(false);
     }
 
     void CloseAbortive() override {
-        NotifyClosed();
-        if (closed_) {
-            return;
-        }
-        closed_ = true;
-        upload_gate_.Cancel();
-        if (upload_) {
-            upload_->CloseAbortive();
-        }
-        if (downlink_) {
-            downlink_->CloseAbortive();
-        }
+        CloseImpl(true);
     }
 
     int NativeHandle() const override {
@@ -248,28 +228,385 @@ protected:
         return downlink_ ? BaseTcpStreamOf(*downlink_) : nullptr;
     }
 
+    void SubscribeDownlink() noexcept {
+        if (downlink_) {
+            downlink_cancel_.Resubscribe(downlink_->Cancellation());
+        }
+    }
+
+    void NotifyCancellation(ErrorCode reason = ErrorCode::CANCELLED) noexcept {
+        cancellation_.CancelPending(reason);
+    }
+
+    void NotifyClosed(ErrorCode reason = ErrorCode::CANCELLED) noexcept {
+        cancellation_.Stop(reason);
+    }
+
+    void TouchDownlinkActivity() noexcept {
+        if (downlink_) {
+            if (auto* tcp = BaseTcpStreamOf(*downlink_)) {
+                tcp->TouchActivity();
+            }
+        }
+    }
+
+    virtual void CloseUpload(bool /*abortive*/) {}
+    virtual void CancelUpload() noexcept {}
+
+    void OnDownlinkCancellation(transport::Cancellation event) noexcept {
+        if (event.terminal) {
+            if (downlink_ && (downlink_->ConsumeWriteTimeout() ||
+                              downlink_->ConsumeIdleTimeout() ||
+                              downlink_->ConsumePhaseDeadline())) {
+                upload_write_expired_ = true;
+            }
+            write_closed_ = true;
+            upload_gate_.Cancel();
+            if (in_flight_upload_tcp_) {
+                in_flight_upload_tcp_->CloseAbortive();
+            }
+            CloseUpload(true);
+            this->NotifyClosed(event.reason);
+        } else {
+            if (downlink_ && (downlink_->ConsumeWriteTimeout() ||
+                              downlink_->ConsumeIdleTimeout() ||
+                              downlink_->ConsumePhaseDeadline())) {
+                upload_write_expired_ = true;
+            }
+            if (in_flight_upload_tcp_) {
+                in_flight_upload_tcp_->Cancel();
+            }
+            CancelUpload();
+            if (downlink_) {
+                downlink_cancel_.Resubscribe(downlink_->Cancellation());
+            }
+            this->NotifyCancellation(event.reason);
+        }
+    }
+
+    void CloseImpl(bool abortive) {
+        downlink_cancel_.Unsubscribe();
+        NotifyClosed();
+        if (closed_) {
+            return;
+        }
+        closed_ = true;
+        write_closed_ = true;
+        upload_gate_.Cancel();
+        if (in_flight_upload_tcp_) {
+            in_flight_upload_tcp_->CloseAbortive();
+        }
+        CloseUpload(abortive);
+        if (downlink_) {
+            if (abortive) {
+                downlink_->CloseAbortive();
+            } else {
+                downlink_->Close();
+            }
+        }
+    }
+
+    net::io_context& io_context_;
+    std::unique_ptr<AsyncStream> downlink_;
+    TcpStream* in_flight_upload_tcp_ = nullptr;
+    OutboundTransportTarget target_;
+    OutboundDialCandidate candidate_;
+    memory::ThreadLocalString upload_path_;
+    transport::internet::AsyncWriteGate upload_gate_;
+    transport::CancellationSource cancellation_;
+    DownlinkCancellation downlink_cancel_{*this};
+    std::chrono::seconds write_timeout_{0};
+    uint64_t conn_id_ = 0;
+    bool upload_write_expired_ = false;
+    bool write_closed_ = false;
+    bool closed_ = false;
+};
+
+class XHttpSplitClientStream final : public XHttpSplitOutboundStreamBase {
+    struct UploadCancellation final : transport::CancellationSubscription {
+        explicit UploadCancellation(XHttpSplitClientStream& owner) noexcept : owner(owner) {}
+        XHttpSplitClientStream& owner;
+
+    private:
+        void OnCancellation(transport::Cancellation event) noexcept override {
+            owner.OnUploadCancellation(event);
+        }
+    };
+
+public:
+    XHttpSplitClientStream(net::io_context& io_context,
+                           std::unique_ptr<AsyncStream> downlink,
+                           const OutboundTransportTarget& target,
+                           const OutboundDialCandidate& candidate,
+                           memory::ThreadLocalString upload_path,
+                           uint64_t conn_id)
+        : XHttpSplitOutboundStreamBase(
+              io_context,
+              std::move(downlink),
+              target,
+              candidate,
+              std::move(upload_path),
+              conn_id,
+              "xhttp stream-up missing stream settings") {
+        SubscribeDownlink();
+    }
+
+    ~XHttpSplitClientStream() noexcept override {
+        upload_cancel_.Unsubscribe();
+        downlink_cancel_.Unsubscribe();
+        Close();
+    }
+
+    net::awaitable<size_t> AsyncRead(net::mutable_buffer buffer) override {
+        if (!downlink_) {
+            co_return 0;
+        }
+        if (ReaderMustSendDeferredUpload()) {
+            co_await FlushDeferredUploadForRead();
+        }
+        co_return co_await downlink_->AsyncRead(buffer);
+    }
+
+    net::awaitable<size_t> AsyncWrite(net::const_buffer buffer) override {
+        // upload_failed_ is provisionally set while an open is in flight;
+        // only a finished failed open poisons the stream.
+        if (closed_ || write_closed_ || (upload_failed_ && !upload_opening_)) {
+            ThrowXHttpPacketError("xhttp stream-up upload unavailable");
+        }
+        if (buffer.size() == 0) {
+            co_return 0;
+        }
+        auto lease = co_await AcquireUploadGate();
+        if (!upload_ &&
+            buffer.size() <= kMaxDeferredUploadBytes - pending_initial_.byte_size()) {
+            const auto* data = static_cast<const uint8_t*>(buffer.data());
+            if (!buf::AppendSpanToMultiBuffer(
+                    std::span<const uint8_t>(data, buffer.size()),
+                    pending_initial_)) {
+                throw std::bad_alloc();
+            }
+            co_return buffer.size();
+        }
+        if (upload_) {
+            const size_t n = co_await upload_->AsyncWrite(buffer);
+            TouchDownlinkActivity();
+            co_return n;
+        }
+        co_await OpenUploadLocked({&buffer, 1});
+        TouchDownlinkActivity();
+        co_return buffer.size();
+    }
+
+    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
+        if (!downlink_) {
+            co_return buf::MultiBuffer{};
+        }
+        if (ReaderMustSendDeferredUpload()) {
+            co_await FlushDeferredUploadForRead();
+        }
+        co_return co_await downlink_->ReadMultiBuffer();
+    }
+
+    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
+        if (closed_ || write_closed_ || (upload_failed_ && !upload_opening_)) {
+            mb.clear();
+            ThrowXHttpPacketError("xhttp stream-up upload unavailable");
+        }
+        if (mb.byte_size() == 0) {
+            mb.clear();
+            co_return;
+        }
+        transport::internet::AsyncWriteGate::Lease lease;
+        try {
+            lease = co_await AcquireUploadGate();
+            if (upload_) {
+                co_await upload_->WriteMultiBuffer(std::move(mb));
+                TouchDownlinkActivity();
+                co_return;
+            }
+            ConstBufferSpanBuilder<16> payloads;
+            payloads.AppendMultiBuffer(mb);
+            if (!payloads.empty()) {
+                co_await OpenUploadLocked(payloads.Span());
+                TouchDownlinkActivity();
+            }
+        } catch (...) {
+            mb.clear();
+            throw;
+        }
+        mb.clear();
+    }
+
+    net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
+        if (closed_ || write_closed_ || (upload_failed_ && !upload_opening_)) {
+            ThrowXHttpPacketError("xhttp stream-up upload unavailable");
+        }
+        bool has_data = false;
+        for (const auto& buffer : buffers) {
+            if (buffer.size() > 0) {
+                has_data = true;
+                break;
+            }
+        }
+        if (!has_data) {
+            co_return;
+        }
+        auto lease = co_await AcquireUploadGate();
+        if (upload_) {
+            co_await upload_->WriteBuffers(buffers);
+            TouchDownlinkActivity();
+            co_return;
+        }
+        co_await OpenUploadLocked(buffers);
+        TouchDownlinkActivity();
+    }
+
+    void ShutdownWrite() override {
+        if (write_closed_) {
+            return;
+        }
+        write_closed_ = true;
+        upload_cancel_.Unsubscribe();
+        pending_initial_.clear();
+        if (upload_) {
+            upload_->ShutdownWrite();
+        }
+    }
+
+    net::awaitable<void> AsyncShutdownWrite() override {
+        if (closed_ || write_closed_) {
+            co_return;
+        }
+        auto lease = upload_gate_.TryAcquire();
+        if (!lease) lease = co_await upload_gate_.Acquire();
+        if (!lease || closed_ || write_closed_) {
+            co_return;
+        }
+        if (!upload_ && pending_initial_.byte_size() != 0) {
+            if (upload_failed_) {
+                ThrowXHttpPacketError("xhttp stream-up upload unavailable");
+            }
+            co_await OpenUploadLocked({});
+        }
+        write_closed_ = true;
+        if (upload_) {
+            try {
+                co_await upload_->AsyncShutdownWrite();
+            } catch (...) {
+                upload_cancel_.Unsubscribe();
+                throw;
+            }
+        }
+        upload_cancel_.Unsubscribe();
+    }
+
+    void SetWriteTimeout(std::chrono::seconds timeout) override {
+        XHttpSplitOutboundStreamBase::SetWriteTimeout(timeout);
+        if (upload_) {
+            upload_->SetWriteTimeout(timeout);
+        }
+    }
+
+    bool ConsumeWriteTimeout() noexcept override {
+        const bool base_expired = XHttpSplitOutboundStreamBase::ConsumeWriteTimeout();
+        const bool upload_expired = upload_ && upload_->ConsumeWriteTimeout();
+        return base_expired || upload_expired;
+    }
+
+    void Cancel() noexcept override {
+        XHttpSplitOutboundStreamBase::Cancel();
+        if (upload_) {
+            upload_->Cancel();
+        }
+    }
+
+    void Close() override {
+        upload_cancel_.Unsubscribe();
+        XHttpSplitOutboundStreamBase::Close();
+    }
+
+    void CloseAbortive() override {
+        upload_cancel_.Unsubscribe();
+        XHttpSplitOutboundStreamBase::CloseAbortive();
+    }
+
+protected:
+    void CloseUpload(bool abortive) override {
+        upload_cancel_.Unsubscribe();
+        pending_initial_.clear();
+        if (!upload_) {
+            return;
+        }
+        if (abortive) {
+            upload_->CloseAbortive();
+        } else {
+            upload_->Close();
+        }
+    }
+
+    void CancelUpload() noexcept override {
+        if (upload_) {
+            upload_->Cancel();
+        }
+    }
+
 private:
+    void OnUploadCancellation(transport::Cancellation event) noexcept {
+        if (!upload_) {
+            return;
+        }
+        if (upload_->ConsumeWriteTimeout()) {
+            upload_write_expired_ = true;
+        }
+        if (write_closed_) {
+            upload_cancel_.Unsubscribe();
+            return;
+        }
+        if (event.terminal) {
+            write_closed_ = true;
+            upload_gate_.Cancel();
+            downlink_cancel_.Unsubscribe();
+            if (downlink_) {
+                downlink_->CloseAbortive();
+            }
+            NotifyClosed(event.reason);
+        } else {
+            upload_cancel_.Resubscribe(upload_->Cancellation());
+            this->NotifyCancellation(event.reason);
+        }
+    }
+
     // A reader may wait for the reply to deferred bytes (e.g. a protocol
     // header); it sends them unless a writer is already opening the upload.
     [[nodiscard]] bool ReaderMustSendDeferredUpload() const noexcept {
-        return !upload_ && !upload_opening_ && pending_initial_.byte_size() != 0;
+        return !upload_ && !upload_opening_ && !write_closed_ &&
+               pending_initial_.byte_size() != 0;
     }
 
-    // Single-flight: the first caller opens the upload request carrying the
-    // deferred bytes followed by |payload|; callers queued behind it write
-    // |payload| to the opened upload. A failed open poisons the stream, since
-    // the deferred bytes are gone with it.
-    net::awaitable<void> WriteUpload(std::span<const net::const_buffer> payload) {
+    net::awaitable<transport::internet::AsyncWriteGate::Lease> AcquireUploadGate() {
+        auto lease = upload_gate_.TryAcquire();
+        if (!lease) lease = co_await upload_gate_.Acquire();
+        if (!lease || closed_ || write_closed_ || upload_failed_) {
+            ThrowXHttpPacketError("xhttp stream-up upload unavailable");
+        }
+        co_return lease;
+    }
+
+    net::awaitable<void> FlushDeferredUploadForRead() {
         auto lease = upload_gate_.TryAcquire();
         if (!lease) lease = co_await upload_gate_.Acquire();
         if (!lease || closed_ || upload_failed_) {
             ThrowXHttpPacketError("xhttp stream-up upload unavailable");
         }
-        if (upload_) {
-            if (!payload.empty()) co_await upload_->WriteBuffers(payload);
-            co_return;
+        if (!upload_ && !write_closed_ && pending_initial_.byte_size() != 0) {
+            co_await OpenUploadLocked({});
         }
+    }
 
+    // Single-flight under upload_gate_: the first caller opens the upload
+    // request carrying the deferred bytes followed by |payload|. A failed open
+    // poisons the stream, since the deferred bytes are gone with it.
+    net::awaitable<void> OpenUploadLocked(std::span<const net::const_buffer> payload) {
         const buf::MultiBuffer initial = std::move(pending_initial_);
         ConstBufferSpanBuilder<16> initial_payload;
         initial_payload.AppendMultiBuffer(initial);
@@ -285,49 +622,62 @@ private:
 
         auto tcp_result = co_await DialSingleCandidate(io_context_, target_, candidate_);
         if (!tcp_result.Ok()) {
+            if (tcp_result.error == ErrorCode::DIAL_TIMEOUT) {
+                upload_write_expired_ = true;
+                throw IoSystemError(io_error::timed_out, "xhttp stream-up dial timed out");
+            }
             ThrowXHttpPacketError("xhttp stream-up dial failed");
         }
+        if (closed_ || write_closed_) {
+            tcp_result.stream->CloseAbortive();
+            ThrowXHttpPacketError("xhttp stream-up closed while dialing");
+        }
         tcp_result.stream->SetIdleTimeout(target_.timeout);
+        tcp_result.stream->SetWriteTimeout(write_timeout_);
         (void)tcp_result.stream->StartPhaseDeadline(target_.timeout);
 
-        auto build_result = co_await BuildOutboundXHttpClientRequest(
-            std::move(tcp_result.stream),
-            *target_.stream_settings,
-            target_.security_context,
-            target_.tls_server_name,
-            target_.ws_host,
-            upload_path_,
-            XHttpClientRequestKind::StreamUp,
-            initial_payload.Span(),
-            conn_id_);
+        TransportBuildResult build_result;
+        {
+            InFlightUploadScope in_flight_scope(*this, BaseTcpStreamOf(*tcp_result.stream));
+            build_result = co_await BuildOutboundXHttpClientRequest(
+                std::move(tcp_result.stream),
+                *target_.stream_settings,
+                target_.security_context,
+                target_.tls_server_name,
+                target_.ws_host,
+                upload_path_,
+                XHttpClientRequestKind::StreamUp,
+                initial_payload.Span(),
+                conn_id_);
+        }
         if (!build_result || !*build_result) {
+            if ((!build_result && build_result.error() == ErrorCode::TIMEOUT) ||
+                upload_write_expired_) {
+                upload_write_expired_ = true;
+                throw IoSystemError(io_error::timed_out, "xhttp stream-up request timed out");
+            }
             ThrowXHttpPacketError("xhttp stream-up request failed");
         }
-        if (closed_) {
+        if (closed_ || write_closed_) {
             (*build_result)->CloseAbortive();
             ThrowXHttpPacketError("xhttp stream-up closed while opening");
         }
         upload_ = std::move(*build_result);
         upload_->ClearPhaseDeadline();
         upload_->SetIdleTimeout(std::chrono::seconds(0));
+        upload_->SetWriteTimeout(write_timeout_);
         upload_failed_ = false;
+        upload_cancel_.Resubscribe(upload_->Cancellation());
     }
 
-    net::io_context& io_context_;
-    std::unique_ptr<AsyncStream> downlink_;
     std::unique_ptr<AsyncStream> upload_;
-    OutboundTransportTarget target_;
-    OutboundDialCandidate candidate_;
-    memory::ThreadLocalString upload_path_;
     buf::MultiBuffer pending_initial_;
-    transport::internet::AsyncWriteGate upload_gate_;
-    uint64_t conn_id_ = 0;
+    UploadCancellation upload_cancel_{*this};
     bool upload_opening_ = false;
     bool upload_failed_ = false;
-    bool closed_ = false;
 };
 
-class XHttpPacketUpClientStream final : public AsyncStream {
+class XHttpPacketUpClientStream final : public XHttpSplitOutboundStreamBase {
 public:
     XHttpPacketUpClientStream(net::io_context& io_context,
                               std::unique_ptr<AsyncStream> downlink,
@@ -335,20 +685,19 @@ public:
                               const OutboundDialCandidate& candidate,
                               memory::ThreadLocalString upload_path,
                               uint64_t conn_id)
-        : io_context_(io_context)
-        , downlink_(std::move(downlink))
-        , target_(target)
-        , candidate_(candidate)
-        , upload_path_(std::move(upload_path))
-        , conn_id_(conn_id) {
-        if (!target_.stream_settings) {
-            ThrowXHttpPacketError("xhttp packet-up missing stream settings");
-        }
-        target_.single_candidate = candidate_;
-        target_.candidates.clear();
+        : XHttpSplitOutboundStreamBase(
+              io_context,
+              std::move(downlink),
+              target,
+              candidate,
+              std::move(upload_path),
+              conn_id,
+              "xhttp packet-up missing stream settings") {
+        SubscribeDownlink();
     }
 
     ~XHttpPacketUpClientStream() noexcept override {
+        downlink_cancel_.Unsubscribe();
         Close();
     }
 
@@ -357,7 +706,7 @@ public:
     }
 
     net::awaitable<size_t> AsyncWrite(net::const_buffer buffer) override {
-        if (write_closed_) {
+        if (closed_ || write_closed_) {
             ThrowXHttpPacketError("xhttp packet-up write after shutdown");
         }
         if (buffer.size() == 0) {
@@ -373,27 +722,15 @@ public:
     }
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
-        if (write_closed_) {
+        if (closed_ || write_closed_) {
             mb.clear();
             ThrowXHttpPacketError("xhttp packet-up write after shutdown");
         }
-
-        ConstBufferSpanBuilder<16> payloads;
-        payloads.AppendMultiBuffer(mb);
-
-        try {
-            if (!payloads.empty()) {
-                co_await SendPacket(payloads.Span());
-            }
-        } catch (...) {
-            mb.clear();
-            throw;
-        }
-        mb.clear();
+        co_await AsyncStream::WriteMultiBuffer(std::move(mb));
     }
 
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
-        if (write_closed_) {
+        if (closed_ || write_closed_) {
             ThrowXHttpPacketError("xhttp packet-up write after shutdown");
         }
         bool has_data = false;
@@ -409,12 +746,6 @@ public:
         co_await SendPacket(buffers);
     }
 
-    void ShutdownRead() override {
-        if (downlink_) {
-            downlink_->ShutdownRead();
-        }
-    }
-
     void ShutdownWrite() override {
         write_closed_ = true;
     }
@@ -424,97 +755,65 @@ public:
         co_return;
     }
 
-    void Cancel() noexcept override {
-        NotifyCancellation();
-        if (downlink_) {
-            downlink_->Cancel();
-        }
-    }
-
-    void Close() override {
-        NotifyClosed();
-        if (closed_) {
-            return;
-        }
-        closed_ = true;
-        write_closed_ = true;
-        if (downlink_) {
-            downlink_->Close();
-        }
-    }
-
-    void CloseAbortive() override {
-        NotifyClosed();
-        if (closed_) {
-            return;
-        }
-        closed_ = true;
-        write_closed_ = true;
-        if (downlink_) {
-            downlink_->CloseAbortive();
-        }
-    }
-
-    int NativeHandle() const override {
-        return downlink_ ? downlink_->NativeHandle() : -1;
-    }
-
-    bool IsOpen() const override {
-        return !closed_ && downlink_ && downlink_->IsOpen();
-    }
-
-protected:
-    TcpStream* BaseTcpStream() override {
-        return downlink_ ? BaseTcpStreamOf(*downlink_) : nullptr;
-    }
-
-    const TcpStream* BaseTcpStream() const override {
-        return downlink_ ? BaseTcpStreamOf(*downlink_) : nullptr;
-    }
-
 private:
     net::awaitable<void> SendPacket(std::span<const net::const_buffer> payloads) {
+        auto lease = upload_gate_.TryAcquire();
+        if (!lease) lease = co_await upload_gate_.Acquire();
+        if (!lease || closed_ || write_closed_) {
+            ThrowXHttpPacketError("xhttp packet-up write after shutdown");
+        }
+
+        const uint64_t seq = next_seq_++;
         // Packet-up request target: "<upload path>/<seq>".
         memory::ThreadLocalString path(upload_path_);
         path.push_back('/');
         std::array<char, 20> seq_text{};
         const auto [seq_end, ec] = std::to_chars(
-            seq_text.data(), seq_text.data() + seq_text.size(), next_seq_);
+            seq_text.data(), seq_text.data() + seq_text.size(), seq);
         (void)ec;  // 20 digits always fit a uint64_t.
         path.append(seq_text.data(), static_cast<size_t>(seq_end - seq_text.data()));
 
         auto tcp_result = co_await DialSingleCandidate(io_context_, target_, candidate_);
         if (!tcp_result.Ok()) {
+            if (tcp_result.error == ErrorCode::DIAL_TIMEOUT) {
+                upload_write_expired_ = true;
+                throw IoSystemError(io_error::timed_out, "xhttp packet-up dial timed out");
+            }
             ThrowXHttpPacketError("xhttp packet-up dial failed");
         }
+        if (closed_ || write_closed_) {
+            tcp_result.stream->CloseAbortive();
+            ThrowXHttpPacketError("xhttp packet-up closed while dialing");
+        }
         tcp_result.stream->SetIdleTimeout(target_.timeout);
+        tcp_result.stream->SetWriteTimeout(write_timeout_);
         (void)tcp_result.stream->StartPhaseDeadline(target_.timeout);
 
-        auto build_result = co_await BuildOutboundXHttpClientRequest(
-            std::move(tcp_result.stream),
-            *target_.stream_settings,
-            target_.security_context,
-            target_.tls_server_name,
-            target_.ws_host,
-            path,
-            XHttpClientRequestKind::PacketUp,
-            payloads,
-            conn_id_);
+        TransportBuildResult build_result;
+        {
+            InFlightUploadScope in_flight_scope(*this, BaseTcpStreamOf(*tcp_result.stream));
+            build_result = co_await BuildOutboundXHttpClientRequest(
+                std::move(tcp_result.stream),
+                *target_.stream_settings,
+                target_.security_context,
+                target_.tls_server_name,
+                target_.ws_host,
+                path,
+                XHttpClientRequestKind::PacketUp,
+                payloads,
+                conn_id_);
+        }
         if (!build_result) {
+            if (build_result.error() == ErrorCode::TIMEOUT || upload_write_expired_) {
+                upload_write_expired_ = true;
+                throw IoSystemError(io_error::timed_out, "xhttp packet-up request timed out");
+            }
             ThrowXHttpPacketError("xhttp packet-up request failed");
         }
-        ++next_seq_;
+        TouchDownlinkActivity();
     }
 
-    net::io_context& io_context_;
-    std::unique_ptr<AsyncStream> downlink_;
-    OutboundTransportTarget target_;
-    OutboundDialCandidate candidate_;
-    memory::ThreadLocalString upload_path_;
-    uint64_t conn_id_ = 0;
     uint64_t next_seq_ = 0;
-    bool write_closed_ = false;
-    bool closed_ = false;
 };
 
 net::awaitable<DialResult> DialSingleCandidate(

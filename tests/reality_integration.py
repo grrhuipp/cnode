@@ -35,10 +35,24 @@ MLDSA65_SEED_A = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 MLDSA65_SEED_B = "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 
 
+_USED_PORTS: set[int] = set()
+
+
 def free_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    held = []
+    try:
+        while True:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+            if port not in _USED_PORTS:
+                _USED_PORTS.add(port)
+                s.close()
+                return port
+            held.append(s)
+    finally:
+        for s in held:
+            s.close()
 
 
 def derive_mldsa65_pub(binary: Path, seed: str) -> str:

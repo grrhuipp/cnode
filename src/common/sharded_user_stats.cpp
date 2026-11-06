@@ -104,21 +104,49 @@ net::awaitable<std::optional<UserOnlineSessionGuard>> UserOnlineTracker::TryConn
             auto& node = *reservation->node;
             node.quota = net::use_service<DeviceQuotaService>(
                 node.coordinator->Services()).quota;
-            auto& all_users = node.quota->devices.try_emplace(node.tag).first->second;
-            auto& all_ips = all_users.try_emplace(node.user).first->second;
-            const auto global_ip = all_ips.find(node.ip);
-            if (global_ip == all_ips.end() && device_limit != 0 &&
-                all_ips.size() >= device_limit) return false;
-            ++all_ips.try_emplace(node.ip, 0u).first->second;
+            auto [tag_it, tag_inserted] = node.quota->devices.try_emplace(node.tag);
+            try {
+                auto [user_it, user_inserted] = tag_it->second.try_emplace(node.user);
+                try {
+                    auto& all_ips = user_it->second;
+                    const auto global_ip = all_ips.find(node.ip);
+                    if (global_ip == all_ips.end() && device_limit != 0 &&
+                        all_ips.size() >= device_limit) {
+                        if (user_inserted && all_ips.empty()) tag_it->second.erase(user_it);
+                        if (tag_inserted && tag_it->second.empty()) node.quota->devices.erase(tag_it);
+                        return false;
+                    }
+                    ++all_ips.try_emplace(node.ip, 0u).first->second;
+                } catch (...) {
+                    if (user_inserted && user_it->second.empty()) tag_it->second.erase(user_it);
+                    throw;
+                }
+            } catch (...) {
+                if (tag_inserted && tag_it->second.empty()) node.quota->devices.erase(tag_it);
+                throw;
+            }
             node.admitted = true;
             return true;
         });
     if (!admitted) co_return std::nullopt;
     auto tag_it = impl_->devices.find(tag);
-    if (tag_it == impl_->devices.end())
-        tag_it = impl_->devices.try_emplace(memory::ThreadLocalString(tag)).first;
-    auto& local_ips = tag_it->second.try_emplace(uid).first->second;
-    ++local_ips.try_emplace(memory::ThreadLocalString(client_ip), 0u).first->second;
+    bool tag_inserted = false;
+    if (tag_it == impl_->devices.end()) {
+        std::tie(tag_it, tag_inserted) =
+            impl_->devices.try_emplace(memory::ThreadLocalString(tag));
+    }
+    try {
+        auto [user_it, user_inserted] = tag_it->second.try_emplace(uid);
+        try {
+            ++user_it->second.try_emplace(memory::ThreadLocalString(client_ip), 0u).first->second;
+        } catch (...) {
+            if (user_inserted && user_it->second.empty()) tag_it->second.erase(user_it);
+            throw;
+        }
+    } catch (...) {
+        if (tag_inserted && tag_it->second.empty()) impl_->devices.erase(tag_it);
+        throw;
+    }
     guard->Arm(*this);
     co_return std::move(guard);
 }

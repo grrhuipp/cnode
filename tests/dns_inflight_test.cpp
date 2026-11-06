@@ -41,12 +41,14 @@ static_assert(!std::is_constructible_v<acpp::app::dns::DNS,
     net::io_context&, const acpp::app::dns::Config&>);
 static_assert(!HasSyncCacheStats<acpp::app::dns::DNS>);
 
-enum class Failure { None, Query, ResultCopy };
+enum class Failure { None, Query, IoQuery, CancelledQuery, ResultCopy };
 
 net::awaitable<DnsResult> Query(net::io_context& io, size_t& calls, Failure failure) {
     ++calls;
     co_await net::post(io, net::use_awaitable);
     if (failure == Failure::Query) throw std::runtime_error("query failed");
+    if (failure == Failure::IoQuery) throw acpp::IoSystemError(acpp::io_error::connection_reset);
+    if (failure == Failure::CancelledQuery) throw acpp::IoSystemError(acpp::io_error::operation_aborted);
     DnsResult result;
     result.addresses.assign(400, net::ip::make_address("192.0.2.1"));
     if (failure == Failure::ResultCopy) {
@@ -57,7 +59,7 @@ net::awaitable<DnsResult> Query(net::io_context& io, size_t& calls, Failure fail
 
 void TestCompletion(Failure failure) {
     net::io_context io;
-    InflightResolves inflight(io);
+    InflightResolves inflight(io, 1);
     size_t calls = 0;
     size_t completed = 0;
     constexpr size_t clients = 5;
@@ -70,7 +72,7 @@ void TestCompletion(Failure failure) {
     });
     const auto failures_before = injected_failures;
     for (size_t i = 0; i < clients; ++i) {
-        net::co_spawn(io, inflight.Run("coalesced.example", [&] {
+        net::co_spawn(io, inflight.Run("coalesced.example", [&](std::string_view) {
             return Query(io, calls, failure);
         }), [&, i](std::exception_ptr error, DnsResult result) {
             errors[i] = error;
@@ -86,29 +88,59 @@ void TestCompletion(Failure failure) {
         Require(injected_failures == failures_before + 1,
                 "the result-copy allocation failure must actually be injected");
     }
-    Require(static_cast<bool>(errors[0]) == (failure != Failure::None),
-            "the query owner must retain its own operation or result-copy error");
-    for (size_t i = 1; i < clients; ++i) {
-        Require(!errors[i], "one client's exception must not propagate to other clients");
-        if (failure == Failure::Query) {
-            Require(results[i].error == acpp::ErrorCode::DNS_RESOLVE_FAILED,
-                    "abandoned queries must publish a terminal failure");
+    size_t copy_failures = 0;
+    for (size_t i = 0; i < clients; ++i) {
+        if (failure == Failure::Query || failure == Failure::IoQuery) {
+            Require(static_cast<bool>(errors[i]),
+                    "every uncancelled subscriber must receive the actual query exception");
+            try {
+                std::rethrow_exception(errors[i]);
+            } catch (const acpp::IoSystemError& error) {
+                Require(failure == Failure::IoQuery && error.code() == acpp::io_error::connection_reset,
+                        "non-cancellation I/O failures must preserve their concrete error code");
+            } catch (const std::runtime_error& error) {
+                Require(failure == Failure::Query && std::string_view(error.what()) == "query failed",
+                        "query exceptions must preserve their original type and reason");
+            }
+        } else if (errors[i]) {
+            Require(failure == Failure::ResultCopy,
+                    "successful or cancelled queries must not manufacture exceptions");
+            try {
+                std::rethrow_exception(errors[i]);
+            } catch (const std::bad_alloc&) {
+                ++copy_failures;
+            }
+        } else if (failure == Failure::CancelledQuery) {
+            Require(results[i].error == acpp::ErrorCode::CANCELLED,
+                    "operation_aborted must remain an explicit cancellation result");
         } else {
             Require(results[i].Ok() && results[i].addresses.size() == 400,
-                    "successful answers must survive an owner's result-copy failure");
+                    "successful answers must survive another waiter's copy failure");
         }
     }
+    Require(copy_failures == (failure == Failure::ResultCopy ? 1u : 0u),
+            "only the waiter with a failed result copy may fail");
 
     io.restart();
     bool retried = false;
-    net::co_spawn(io, inflight.Run("coalesced.example", [&] {
+    net::co_spawn(io, inflight.Run("coalesced.example", [&](std::string_view) {
         return Query(io, calls, Failure::None);
     }), [&](std::exception_ptr error, DnsResult result) {
         retried = !error && result.Ok();
     });
     io.run_for(1s);
     Require(retried && calls == 2,
-            "completion must remove the inflight entry so a later request can start");
+            "completion must erase the failed generation and return its only active quota slot");
+    io.restart();
+    bool joined = false;
+    std::exception_ptr join_error;
+    net::co_spawn(io, inflight.AsyncJoin(), [&](std::exception_ptr error) {
+        join_error = error;
+        joined = true;
+    });
+    io.run();
+    if (join_error) std::rethrow_exception(join_error);
+    Require(joined, "subscriber exceptions must not prevent service task-group join");
 }
 
 net::awaitable<DnsResult> GatedQuery(
@@ -122,14 +154,14 @@ net::awaitable<DnsResult> GatedQuery(
 
 void TestSubscriberCancellation() {
     net::io_context io;
-    InflightResolves inflight(io);
+    InflightResolves inflight(io, 8);
     net::experimental::channel<void(acpp::IoErrorCode)> gate(io);
     net::cancellation_signal cancel;
     size_t calls = 0;
     std::array<DnsResult, 3> results;
     std::array<std::exception_ptr, 3> errors;
     size_t completed = 0;
-    auto query = [&] { return GatedQuery(gate, calls); };
+    auto query = [&](std::string_view) { return GatedQuery(gate, calls); };
     auto handler = [&](size_t i) {
         return [&, i](std::exception_ptr error, DnsResult result) {
             errors[i] = error;
@@ -151,6 +183,64 @@ void TestSubscriberCancellation() {
             "cancelling one subscriber must not cancel the owner or another subscriber");
     Require(errors[1] || results[1].error == acpp::ErrorCode::CANCELLED,
             "the cancelled subscriber must observe cancellation");
+}
+
+net::awaitable<DnsResult> DelayedCancellationQuery(
+    net::experimental::channel<void(acpp::IoErrorCode)>& gate, size_t& calls) {
+    // Model an upstream whose cleanup cannot complete until its final callback.
+    co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
+    co_return co_await GatedQuery(gate, calls);
+}
+
+void TestRetiredGenerationCapacity() {
+    net::io_context io;
+    InflightResolves inflight(io, 2);
+    net::experimental::channel<void(acpp::IoErrorCode)> old_gate(io), new_gate(io);
+    net::cancellation_signal cancel;
+    size_t calls = 0, survivors = 0;
+    bool cancelled = false, rejected = false;
+    std::exception_ptr failure;
+    auto old_query = [&](std::string_view) { return DelayedCancellationQuery(old_gate, calls); };
+    auto new_query = [&](std::string_view) { return GatedQuery(new_gate, calls); };
+    net::co_spawn(io, inflight.Run("generation.example", old_query),
+        net::bind_cancellation_slot(cancel.slot(),
+            [&](std::exception_ptr error, DnsResult result) {
+                cancelled = error || result.error == acpp::ErrorCode::CANCELLED;
+            }));
+    io.poll();
+    cancel.emit(net::cancellation_type::terminal);
+    io.poll();
+    Require(cancelled && calls == 1, "last waiter cancellation must retire its generation");
+    auto survivor = [&](std::exception_ptr error, DnsResult result) {
+        if (error) failure = error;
+        else if (result.Ok()) ++survivors;
+    };
+    net::co_spawn(io, inflight.Run("generation.example", new_query), survivor);
+    io.poll();
+    Require(calls == 2, "a new waiter must not attach to a cancelled generation");
+    net::co_spawn(io, inflight.Run("capacity.example", new_query),
+        [&](std::exception_ptr error, DnsResult result) {
+            rejected = !error && result.error == acpp::ErrorCode::RESOURCE_EXHAUSTED;
+        });
+    io.poll();
+    Require(rejected && calls == 2, "retired but unfinished queries must still consume capacity");
+    old_gate.close();
+    io.poll();
+    net::co_spawn(io, inflight.Run("generation.example", new_query), survivor);
+    io.poll();
+    Require(calls == 2, "old completion must not remove the new generation's registry entry");
+    new_gate.close();
+    io.run();
+    if (failure) std::rethrow_exception(failure);
+    Require(survivors == 2, "both new-generation waiters must receive the healthy answer");
+    io.restart();
+    bool joined = false;
+    net::co_spawn(io, inflight.AsyncJoin(), [&](std::exception_ptr error) {
+        failure = error; joined = true;
+    });
+    io.run();
+    if (failure) std::rethrow_exception(failure);
+    Require(joined, "join must settle cancelled generations as well as active subscribers");
 }
 
 void TestDNSWorker() {
@@ -335,40 +425,40 @@ void TestDNSWorkerCapacity(bool stats_request) {
 
 void TestInflightStopBeforeLeaderCompletion() {
     net::io_context io;
-    auto inflight = std::make_unique<InflightResolves>(io);
+    auto inflight = std::make_unique<InflightResolves>(io, 8);
     net::experimental::channel<void(acpp::IoErrorCode)> gate(io);
     size_t calls = 0, completed = 0;
     std::array<DnsResult, 3> results;
     std::array<std::exception_ptr, 3> errors;
-    bool leader_done = false, expired = false;
+    bool expired = false;
     for (size_t i = 0; i < results.size(); ++i) {
-        net::co_spawn(io, inflight->Run("stop-inflight.example", [&] {
+        net::co_spawn(io, inflight->Run("stop-inflight.example", [&](std::string_view) {
             return GatedQuery(gate, calls);
         }), [&, i](std::exception_ptr error, DnsResult result) {
             errors[i] = error;
             results[i] = std::move(result);
-            if (i == 0) leader_done = true;
             ++completed;
         });
     }
-    net::post(io, [&] {
-        inflight->RequestStop();
-        inflight->RequestStop();
-    });
     net::steady_timer watchdog(io, 2s);
     watchdog.async_wait([&](acpp::IoErrorCode error) {
         if (!error) { expired = true; gate.close(); }
     });
-    while (completed < 2 && !expired) io.run_one();
-    Require(!expired && !leader_done,
-            "stopping inflight must release subscribers before a delayed leader completes");
-    gate.close();
-    while (completed < results.size() && !expired) io.run_one();
-    watchdog.cancel();
+    while (calls == 0 && !expired) io.run_one();
+    inflight->RequestStop();
+    inflight->RequestStop();
+    bool joined = false;
+    std::exception_ptr join_error;
+    net::co_spawn(io, inflight->AsyncJoin(), [&](std::exception_ptr error) {
+        join_error = error;
+        joined = true;
+        watchdog.cancel();
+    });
     io.run();
     inflight.reset();
-    Require(!expired && completed == results.size() && calls == 1,
-            "the leader callback must finish before its inflight owner is destroyed");
+    if (join_error) std::rethrow_exception(join_error);
+    Require(!expired && joined && completed == results.size() && calls == 1,
+            "join must finish the service query and every subscriber before destruction");
     for (size_t i = 0; i < results.size(); ++i) {
         Require(!errors[i] && results[i].error == acpp::ErrorCode::CANCELLED,
                 "late successful leader completion must not replace service cancellation");
@@ -491,8 +581,11 @@ int main() {
     try {
         TestCompletion(Failure::None);
         TestCompletion(Failure::Query);
+        TestCompletion(Failure::IoQuery);
+        TestCompletion(Failure::CancelledQuery);
         TestCompletion(Failure::ResultCopy);
         TestSubscriberCancellation();
+        TestRetiredGenerationCapacity();
         TestDNSWorker();
         TestDNSRemoteInputOwnership();
         TestDNSClientLifetime();

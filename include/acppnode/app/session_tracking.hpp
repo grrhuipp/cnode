@@ -58,6 +58,7 @@ public:
 
 private:
     struct AccountBucket {
+        std::string_view key;
         memory::ThreadLocalUnorderedMap<int64_t, Account> traffic;
         ActiveSession* active_head = nullptr;
     };

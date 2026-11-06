@@ -39,14 +39,7 @@ inline std::string HeaderNameLower(std::string_view name) {
 }
 
 inline std::string TrimHeaderValue(std::string_view value) {
-    while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) {
-        value.remove_prefix(1);
-    }
-    while (!value.empty() &&
-           (value.back() == ' ' || value.back() == '\t' || value.back() == '\r')) {
-        value.remove_suffix(1);
-    }
-    return std::string(value);
+    return std::string(transport::internet::TrimHttpOws(value));
 }
 
 
@@ -238,6 +231,7 @@ net::awaitable<Response> ReadResponse(Stream& stream) {
     std::string http_version;
     std::optional<size_t> content_length;
     std::optional<TransferCodings> transfer_codings;
+    bool has_etag = false;
 
     // RFC 9110 §15.2: a client must parse interim 1xx responses that precede
     // the final response, even unsolicited ones.
@@ -258,14 +252,38 @@ net::awaitable<Response> ReadResponse(Stream& stream) {
         http_version.clear();
         content_length.reset();
         transfer_codings.reset();
+        has_etag = false;
 
-        std::istringstream status_parser(*status_line_result);
-        status_parser >> http_version >> result.status;
-        if (result.status <= 0) {
+        const std::string_view status_line = *status_line_result;
+        const size_t version_end = status_line.find(' ');
+        if (version_end == std::string_view::npos) {
             result.status = -1;
             result.body = "invalid HTTP status line";
             co_return result;
         }
+        http_version.assign(status_line.substr(0, version_end));
+        if (http_version != "HTTP/1.1" && http_version != "HTTP/1.0") {
+            result.status = -1;
+            result.body = "invalid HTTP status line";
+            co_return result;
+        }
+        const std::string_view rest = status_line.substr(version_end + 1);
+        const size_t status_end = rest.find(' ');
+        const std::string_view status_token =
+            status_end == std::string_view::npos ? rest : rest.substr(0, status_end);
+        int parsed_status = 0;
+        const auto [ptr, ec] = std::from_chars(
+            status_token.data(),
+            status_token.data() + status_token.size(),
+            parsed_status);
+        if (status_token.size() != 3 || ec != std::errc{} ||
+            ptr != status_token.data() + status_token.size() ||
+            parsed_status < 100 || parsed_status > 599) {
+            result.status = -1;
+            result.body = "invalid HTTP status line";
+            co_return result;
+        }
+        result.status = parsed_status;
 
         for (;;) {
             auto line_result = co_await ReadCrlfLine(stream, buffer);
@@ -284,12 +302,32 @@ net::awaitable<Response> ReadResponse(Stream& stream) {
             const std::string& line = *line_result;
 
             const size_t colon = line.find(':');
-            if (colon == std::string::npos) continue;
+            if (colon == std::string::npos || colon == 0) {
+                result.status = -1;
+                result.body = "invalid HTTP header line";
+                co_return result;
+            }
 
             const auto name = HeaderNameLower(std::string_view(line).substr(0, colon));
+            if (!transport::internet::IsValidHttpHeaderName(name)) {
+                result.status = -1;
+                result.body = "invalid HTTP header name";
+                co_return result;
+            }
             const auto value = TrimHeaderValue(std::string_view(line).substr(colon + 1));
+            if (!transport::internet::IsValidHttpHeaderValue(value)) {
+                result.status = -1;
+                result.body = "invalid HTTP header value";
+                co_return result;
+            }
 
             if (name == "etag") {
+                if (has_etag) {
+                    result.status = -1;
+                    result.body = "duplicate ETag";
+                    co_return result;
+                }
+                has_etag = true;
                 result.etag = value;
                 if (result.etag.size() >= 2 && result.etag.front() == '"' &&
                     result.etag.back() == '"') {
@@ -387,11 +425,17 @@ net::awaitable<Response> ReadResponse(Stream& stream) {
 
     if (content_length) {
         if (result.body.size() < *content_length) {
-            co_await net::async_read(
+            auto [read_ec, bytes] = co_await net::async_read(
                 stream,
                 buffer,
                 net::transfer_exactly(*content_length - result.body.size()),
-                net::use_awaitable);
+                net::as_tuple(net::use_awaitable));
+            (void)bytes;
+            if (read_ec) {
+                result.status = -1;
+                result.body = "invalid HTTP response body: " + read_ec.message();
+                co_return result;
+            }
             if (!AppendStreambuf(buffer, result.body)) {
                 result.status = -1;
                 result.body = "HTTP body too large";

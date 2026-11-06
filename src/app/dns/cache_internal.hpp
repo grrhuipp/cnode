@@ -15,7 +15,11 @@ namespace acpp::app::dns {
 // One bounded cache owned by the main/control DNS executor.
 class DnsCache {
 public:
-    explicit DnsCache(size_t max_size, uint32_t min_ttl, uint32_t max_ttl);
+    using NegativeEvent = void (*)(std::string_view domain, std::string_view reason,
+                                  uint64_t hits, std::string_view event);
+    explicit DnsCache(size_t max_size, uint32_t min_ttl, uint32_t max_ttl,
+                      NegativeEvent negative_event = nullptr);
+    ~DnsCache();
     DnsCache(const DnsCache&) = delete;
     DnsCache& operator=(const DnsCache&) = delete;
 
@@ -28,6 +32,8 @@ private:
         std::variant<memory::ThreadLocalVector<net::ip::address>,
                      memory::ThreadLocalString> answer;
         time_point expire_time;
+        uint64_t negative_hits = 0;
+        bool expired_negative = false;
     };
     struct CacheNode {
         memory::ThreadLocalString domain;
@@ -37,6 +43,7 @@ private:
             : domain(name), entry(std::move(value)) {}
     };
     using NodeList = memory::ThreadLocalList<CacheNode>;
+    void Report(const CacheNode& node, std::string_view event) const noexcept;
 
     // New and replaced entries move to the front. Read hits do not reorder.
     NodeList order_;
@@ -44,6 +51,8 @@ private:
     size_t capacity_;
     uint32_t min_ttl_;
     uint32_t max_ttl_;
+    NegativeEvent negative_event_;
+    size_t expired_negatives_ = 0;
     uint64_t hits_ = 0;
     uint64_t misses_ = 0;
 };

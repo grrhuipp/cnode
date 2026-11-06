@@ -1,6 +1,7 @@
 #include "vless_encryption_xor.hpp"
 
 #include <blake3.h>
+#include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/mem.h>
 
@@ -42,6 +43,9 @@ using CtrKey = std::array<uint8_t, kVlessEncryptionCtrKeySize>;
                         derived.data(),
                         iv.data()) == 1;
     OPENSSL_cleanse(derived.data(), derived.size());
+    if (!ok) {
+        ERR_clear_error();
+    }
     return ok;
 }
 
@@ -54,13 +58,17 @@ using CtrKey = std::array<uint8_t, kVlessEncryptionCtrKeySize>;
         return true;
     }
     int out_len = 0;
-    return EVP_EncryptUpdate(
-               ctx,
-               data.data(),
-               &out_len,
-               data.data(),
-               static_cast<int>(data.size())) == 1 &&
-           out_len == static_cast<int>(data.size());
+    if (EVP_EncryptUpdate(
+            ctx,
+            data.data(),
+            &out_len,
+            data.data(),
+            static_cast<int>(data.size())) != 1 ||
+        out_len != static_cast<int>(data.size())) {
+        ERR_clear_error();
+        return false;
+    }
+    return true;
 }
 
 }  // namespace
@@ -69,7 +77,11 @@ std::optional<VlessEncryptionCtr> VlessEncryptionCtr::Create(
     std::span<const uint8_t> key,
     std::span<const uint8_t, kVlessEncryptionCtrIvSize> iv) noexcept {
     bssl::UniquePtr<EVP_CIPHER_CTX> ctx(EVP_CIPHER_CTX_new());
-    if (!ctx || !InitCtr(ctx.get(), key, iv)) {
+    if (!ctx) {
+        ERR_clear_error();
+        return std::nullopt;
+    }
+    if (!InitCtr(ctx.get(), key, iv)) {
         return std::nullopt;
     }
     return VlessEncryptionCtr(std::move(ctx));
@@ -90,6 +102,7 @@ bool XorVlessEncryptionInPlace(
     if (!tls_ctx) {
         tls_ctx.reset(EVP_CIPHER_CTX_new());
         if (!tls_ctx) {
+            ERR_clear_error();
             return false;
         }
     }

@@ -26,6 +26,11 @@ public:
     void Consume(size_t size) noexcept;
     void Clear() noexcept;
     [[nodiscard]] bool AtMessageBoundary() const noexcept { return prefix_size_ == 0; }
+    [[nodiscard]] size_t NextFeedLimit() const noexcept {
+        return prefix_size_ < prefix_.size()
+            ? (prefix_.size() - prefix_size_)
+            : (message_size_ - message_.size());
+    }
 
 private:
     std::array<uint8_t, 5> prefix_{};

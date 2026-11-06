@@ -162,6 +162,12 @@ struct BufferGuard {
         ptr = nullptr;
         return out;
     }
+    void reset(Buffer* b = nullptr) noexcept {
+        if (ptr != b) {
+            Buffer::Free(ptr);
+            ptr = b;
+        }
+    }
     [[nodiscard]] explicit operator bool() const noexcept { return ptr != nullptr; }
     [[nodiscard]] Buffer* operator->() const noexcept { return ptr; }
     [[nodiscard]] Buffer& operator*() const noexcept { return *ptr; }
@@ -194,17 +200,19 @@ public:
     MultiBuffer(const MultiBuffer&) = delete;
     MultiBuffer& operator=(const MultiBuffer&) = delete;
 
-    MultiBuffer(MultiBuffer&& other) noexcept {
+    MultiBuffer(MultiBuffer&& other) noexcept
+        : spill_(std::move(other.spill_)) {
         MoveFrom(std::move(other));
     }
 
     MultiBuffer& operator=(MultiBuffer&& other) noexcept {
         if (this != &other) {
             ReleaseOwnedBuffers();
-            spill_.clear();
+            spill_ = std::move(other.spill_);
             inline_start_ = 0;
             size_ = 0;
             using_spill_ = false;
+            spill_start_ = 0;
             total_bytes_ = 0;
             MoveFrom(std::move(other));
         }
@@ -371,6 +379,7 @@ public:
         }
 
         drop_front(drained);
+        ReleaseIfIdle();
         return dropped;
     }
 
@@ -401,15 +410,19 @@ public:
         }
 
         drop_front(drained);
+        ReleaseIfIdle();
         return copied;
     }
 
     [[nodiscard]] bool MovePrefixTo(MultiBuffer& dst, size_t bytes) {
-        if (std::addressof(dst) == this || bytes > total_bytes_) {
+        if (std::addressof(dst) == this || bytes > total_bytes_ ||
+            bytes > std::numeric_limits<size_t>::max() - dst.total_bytes_) {
             return false;
         }
-        if (bytes == 0) return true;
-
+        if (bytes == 0) {
+            ReleaseIfIdle();
+            return true;
+        }
         // Prepare the only possible split and all destination pointer slots
         // before releasing a source slot or changing either buffer's cursors.
         size_t remaining = bytes;
@@ -440,12 +453,14 @@ public:
             dst.ReserveAdditional(whole_buffers + (split ? 1 : 0), bytes);
         } catch (const std::bad_alloc&) {
             return false;
+        } catch (const std::length_error&) {
+            return false;
         }
 
         size_t drained = 0;
         size_t transferred = 0;
         for (Buffer*& buffer : *this) {
-            if (transferred == whole_buffers) break;
+            if (split_source ? buffer == split_source : transferred == whole_buffers) break;
             if (buffer && !buffer->IsEmpty()) {
                 dst.push_back(ReleaseSlot(buffer));
                 ++transferred;
@@ -465,6 +480,7 @@ public:
             total_bytes_ -= remaining;
         }
         drop_front(drained);
+        ReleaseIfIdle();
         return true;
     }
 
@@ -549,7 +565,10 @@ public:
         if (total_bytes_ == 0) clear();
     }
 
-    void RecordTailProduced(size_t bytes) noexcept {
+    void RecordTailProduced(size_t bytes) {
+        if (bytes > std::numeric_limits<size_t>::max() - total_bytes_) {
+            throw std::length_error("MultiBuffer byte size overflow");
+        }
         total_bytes_ += bytes;
     }
 
@@ -584,6 +603,34 @@ public:
             dst.push_back(ReleaseSlot(buffer));
         }
         clear();
+    }
+
+    void AppendAndCoalesce(MultiBuffer&& next) {
+        if (std::addressof(next) == this) {
+            return;
+        }
+        ReserveAdditional(next.size(), next.total_bytes_);
+        for (Buffer*& buffer : next) {
+            if (!buffer || buffer->IsEmpty()) {
+                next.FreeSlot(buffer);
+                continue;
+            }
+            Buffer* tail = back();
+            const uint32_t len = buffer->Len();
+            if (!buffer->HasUDP() && tail && !tail->HasUDP() &&
+                tail->Available() + tail->start >= len) {
+                if (tail->Available() < len) {
+                    tail->CompactToFront();
+                }
+                std::memcpy(tail->Tail().data(), buffer->Bytes().data(), len);
+                tail->Produce(len);
+                RecordTailProduced(len);
+                next.FreeSlot(buffer);
+            } else {
+                push_back(next.ReleaseSlot(buffer));
+            }
+        }
+        next.clear();
     }
 
     Buffer** begin() noexcept {
@@ -676,7 +723,6 @@ private:
     void MoveFrom(MultiBuffer&& other) noexcept {
         using_spill_ = other.using_spill_;
         if (using_spill_) {
-            spill_ = std::move(other.spill_);
             spill_start_ = other.spill_start_;
         } else {
             inline_start_ = 0;
@@ -795,5 +841,81 @@ struct UdpDatagramInfo {
     suffix.MoveTo(out_mb);
     return true;
 }
+
+class ContiguousWriteBuffer {
+public:
+    [[nodiscard]] uint8_t* Prepare(size_t capacity) {
+        Reset();
+        if (capacity <= Buffer::kSize) {
+            pooled_ = BufferGuard{Buffer::New()};
+            if (!pooled_) {
+                throw std::bad_alloc();
+            }
+            return pooled_->Tail().data();
+        }
+        heap_.resize(capacity);
+        return heap_.data();
+    }
+
+    [[nodiscard]] uint8_t* TryPrepare(size_t capacity) noexcept {
+        try {
+            return Prepare(capacity);
+        } catch (const std::bad_alloc&) {
+            return nullptr;
+        }
+    }
+
+    [[nodiscard]] uint8_t* Data() noexcept {
+        if (pooled_) {
+            return pooled_->Tail().data();
+        }
+        return heap_.empty() ? nullptr : heap_.data();
+    }
+
+    [[nodiscard]] bool Empty() const noexcept {
+        return !pooled_ && heap_.empty();
+    }
+
+    void Reset() noexcept {
+        pooled_.reset();
+        memory::ByteVector{heap_.get_allocator()}.swap(heap_);
+    }
+
+    [[nodiscard]] bool TryAppendTo(size_t size, MultiBuffer& out) noexcept {
+        try {
+            if (pooled_) {
+                if (size > pooled_->Available()) {
+                    Reset();
+                    return false;
+                }
+                pooled_->Produce(static_cast<uint32_t>(size));
+                out.push_back(std::move(pooled_));
+                Reset();
+                return true;
+            }
+            if (size > heap_.size()) {
+                Reset();
+                return false;
+            }
+            const bool appended = AppendSpanToMultiBuffer(
+                std::span<const uint8_t>(heap_.data(), size), out);
+            Reset();
+            return appended;
+        } catch (...) {
+            Reset();
+            return false;
+        }
+    }
+
+    void AppendTo(size_t size, MultiBuffer& out) {
+        if (!TryAppendTo(size, out)) {
+            throw std::bad_alloc();
+        }
+    }
+
+private:
+    BufferGuard pooled_;
+    memory::ByteVector heap_;
+};
 
 }  // namespace acpp::buf

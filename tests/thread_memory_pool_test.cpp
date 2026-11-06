@@ -595,6 +595,18 @@ bool RunJoinedDomainBorrow() {
         delete empty;
         empty_queue->push_back(42);
         delete empty_queue;
+        ThreadLocalDeque<ThreadLocalString> nested_deque(resource);
+        nested_deque.emplace_back(64, 'q');
+        nested_deque = nested_deque;
+        intact = intact && nested_deque.size() == 1 &&
+            nested_deque.front().get_allocator().resource() == resource;
+        nested_deque.clear();
+        for (int i = 0; i < 8; ++i) {
+            nested_deque.emplace_back(32, static_cast<char>('a' + i));
+            nested_deque.push_back(nested_deque.front());
+            nested_deque.push_front(nested_deque.back());
+        }
+        nested_deque.clear();
         intact = intact && arena.expired();
     });
     migrated.join();

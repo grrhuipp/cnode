@@ -18,13 +18,15 @@
 
 namespace acpp::vless {
 
+struct VlessEncryptionClientTicketCache;
+
 // 0-RTT client read side: it is keyed by the server random that prefixes the
 // first response bytes, which also seeds the header XOR when enabled.
 struct VlessEncryptionDeferredRead {
     VlessEncryptionAeadCipher cipher = VlessEncryptionAeadCipher::Aes256Gcm;
     bool header_xor = false;
+    VlessEncryptionClientTicketCache* ticket_cache = nullptr;
 };
-
 using VlessEncryptionReadKeys =
     std::variant<VlessEncryptionAead, VlessEncryptionDeferredRead>;
 
@@ -42,6 +44,7 @@ public:
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override;
     [[nodiscard]] bool EnableRawRead() noexcept override;
+    void ClearDeferredTicket() noexcept;
 
 private:
     [[nodiscard]] VlessEncryptionAead& KeyDeferredRead(
@@ -56,11 +59,12 @@ private:
     // `bytes_read_` tracks the server random until the read side is keyed.
     std::array<uint8_t, kVlessEncryptionCtrIvSize> server_random_{};
     std::array<uint8_t, kVlessEncryptionRecordHeaderSize> read_header_{};
-    memory::ByteVector read_bytes_;
+    buf::ContiguousWriteBuffer read_record_;
     size_t header_read_ = 0;
     size_t bytes_read_ = 0;
     size_t encrypted_size_ = 0;
     bool raw_read_ = false;
+    VlessEncryptionClientTicketCache* unverified_ticket_cache_ = nullptr;
 };
 
 class VlessEncryptionWriter final : public transport::MultiBufferWriter {

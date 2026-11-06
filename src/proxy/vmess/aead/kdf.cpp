@@ -3,6 +3,7 @@
 #include "acppnode/common/unsafe.hpp"
 
 #include <openssl/hmac.h>
+#include <openssl/mem.h>
 
 #include <algorithm>
 #include <cstring>
@@ -41,7 +42,9 @@ void VmessKdfRecursive(
     alignas(16) uint8_t k_padded[64] = {0};
 
     if (key.size() <= 64) {
-        memcpy(k_padded, key.data(), key.size());
+        if (!key.empty()) {
+            memcpy(k_padded, key.data(), key.size());
+        }
     } else {
         VmessKdfRecursive(unsafe::ptr_cast<const uint8_t>(key.data()),
                           key.size(), path, depth - 1, k_padded);
@@ -61,7 +64,9 @@ void VmessKdfRecursive(
         inner_input = inner_heap.data();
     }
     memcpy(inner_input, ipad, 64);
-    memcpy(inner_input + 64, data, data_len);
+    if (data_len > 0) {
+        memcpy(inner_input + 64, data, data_len);
+    }
 
     uint8_t inner_hash[32];
     VmessKdfRecursive(inner_input, 64 + data_len, path, depth - 1, inner_hash);
@@ -70,6 +75,13 @@ void VmessKdfRecursive(
     memcpy(outer_input, opad, 64);
     memcpy(outer_input + 64, inner_hash, 32);
     VmessKdfRecursive(outer_input, 96, path, depth - 1, out);
+
+    OPENSSL_cleanse(k_padded, sizeof(k_padded));
+    OPENSSL_cleanse(ipad, sizeof(ipad));
+    OPENSSL_cleanse(opad, sizeof(opad));
+    OPENSSL_cleanse(inner_input, 64 + data_len);
+    OPENSSL_cleanse(inner_hash, sizeof(inner_hash));
+    OPENSSL_cleanse(outer_input, sizeof(outer_input));
 }
 
 std::string_view AsText(std::span<const uint8_t> bytes) noexcept {
@@ -94,7 +106,10 @@ void KDF(const uint8_t* key, size_t key_len,
          uint8_t* out, size_t out_len) {
     uint8_t result[32];
     VmessKdfRecursive(key, key_len, path, path.size(), result);
-    memcpy(out, result, std::min(out_len, size_t(32)));
+    if (out_len > 0) {
+        memcpy(out, result, std::min(out_len, size_t(32)));
+    }
+    OPENSSL_cleanse(result, sizeof(result));
 }
 
 std::array<uint8_t, 16> KDF16(const uint8_t* key, size_t key_len,

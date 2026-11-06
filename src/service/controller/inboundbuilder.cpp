@@ -18,7 +18,7 @@ InboundBuild InboundBuilder(const PanelConfig& panel_config,
     build.protocol = node_config.NodeType;
     build.tag = naming::BuildPanelNodeTag(
         panel_config.Name, panel_config.NodeIDs.Front(), build.protocol, node_config.Port);
-    build.accounting_key = std::format("panel/{}/{}/",
+    build.accounting_key = naming::BuildPanelNodeAccountingKey(
         panel_config.Name, panel_config.NodeIDs.Front());
 
     build.stream_settings.network = node_config.TransportProtocol.empty()
@@ -39,7 +39,10 @@ InboundBuild InboundBuilder(const PanelConfig& panel_config,
         build.stream_settings.tls.cert_file = panel_config.TLSCert;
         build.stream_settings.tls.key_file = panel_config.TLSKey;
         build.stream_settings.tls.server_name = node_config.TLSServerName;
-        LoadTlsPemMaterial(build.stream_settings.tls);
+        build.stream_settings.tls.pem = panel_config.TLSPem;
+        if (!build.stream_settings.tls.pem) {
+            LoadTlsPemMaterial(build.stream_settings.tls);
+        }
     }
 
     // Fill the transport sub-config first: normalization derives cached
@@ -59,6 +62,14 @@ InboundBuild InboundBuilder(const PanelConfig& panel_config,
             : node_config.Path;
         if (!node_config.Host.empty()) {
             build.stream_settings.http_upgrade.host = node_config.Host;
+        }
+        break;
+    case NetworkMode::Http:
+        build.stream_settings.http.path = node_config.Path.empty()
+            ? std::string(constants::binding::kRootPath)
+            : node_config.Path;
+        if (!node_config.Host.empty()) {
+            build.stream_settings.http.host = node_config.Host;
         }
         break;
     case NetworkMode::Grpc:
@@ -90,7 +101,8 @@ InboundBuild InboundBuilder(const PanelConfig& panel_config,
     build.sniff.enabled = node_config.SniffEnabled;
     build.sniff.dest_override = 0;
     for (const auto& protocol : node_config.DestOverride) {
-        const uint8_t bit = SniffConfig::DestOverrideBit(protocol);
+        const uint8_t bit =
+            SniffConfig::DestOverrideBit(naming::LowerAscii(protocol));
         if (bit == 0) {
             throw std::invalid_argument(std::format(
                 "panel inbound '{}' has unsupported sniffing destOverride '{}'",

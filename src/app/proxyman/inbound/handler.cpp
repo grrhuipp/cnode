@@ -35,12 +35,19 @@ void ApplyHttpRealIp(
     const auto literal = iputil::ParseLiteral(real_ip);
     if (!literal) return;
     const auto address = iputil::NormalizeAddress(*literal);
+    const auto normalized_ip = iputil::AddressText(address);
+    const auto previous_ip = std::move(ctx.inbound.source_ip);
     ctx.inbound.source_addr = address;
-    ctx.inbound.source_ip = iputil::AddressText(address).View();
+    ctx.inbound.source_ip = normalized_ip.View();
     // Forwarded address headers do not reliably carry the original client
     // port. Zero is explicit unknown; retaining the CDN port is a false tuple.
     ctx.inbound.source_port = 0;
     ctx.inbound.client_ip_source = "http_header";
+    LOG_CONN_DEBUG(
+        ctx,
+        "HTTP transport client address overridden by header: {} -> {}",
+        previous_ip,
+        normalized_ip.View());
 }
 
 void ApplyProxyProtocolResult(
@@ -50,10 +57,11 @@ void ApplyProxyProtocolResult(
         return;
     }
 
+    const auto normalized_addr = iputil::NormalizeAddress(*result.src_addr);
+    const auto normalized_ip = iputil::AddressText(normalized_addr);
     const auto proxy_ip = std::move(ctx.inbound.source_ip);
-    ctx.inbound.source_addr = *result.src_addr;
-    ctx.inbound.source_ip = iputil::AddressText(*result.src_addr).View();
-
+    ctx.inbound.source_addr = normalized_addr;
+    ctx.inbound.source_ip = normalized_ip.View();
     ctx.inbound.source_port = result.src_port;
     ctx.inbound.client_ip_source = "proxy_protocol";
     LOG_CONN_DEBUG(
@@ -197,15 +205,29 @@ private:
 
 Handler::Handler(inbound::ReceiverSettings receiver, std::unique_ptr<Inbound> proxy,
                  ConnectionLimiter& limiter)
-    : receiver_(std::move(receiver))
-    , security_(receiver_.stream_settings, StreamEndpointRole::Inbound)
+    : Handler(std::make_shared<const inbound::ReceiverSettings>(std::move(receiver)),
+              std::move(proxy), limiter) {}
+
+Handler::Handler(std::shared_ptr<const inbound::ReceiverSettings> receiver,
+                 std::unique_ptr<Inbound> proxy,
+                 ConnectionLimiter& limiter)
+    : receiver_(receiver ? std::move(receiver)
+                         : throw std::invalid_argument("missing receiver settings"))
+    , security_(receiver_->stream_settings, StreamEndpointRole::Inbound)
     , proxy_(std::move(proxy))
     , limiter_(limiter) {}
 
 Handler::Handler(inbound::ReceiverSettings receiver, ProtocolProvider& provider,
                  ConnectionLimiter& limiter)
-    : receiver_(std::move(receiver))
-    , security_(receiver_.stream_settings, StreamEndpointRole::Inbound)
+    : Handler(std::make_shared<const inbound::ReceiverSettings>(std::move(receiver)),
+              provider, limiter) {}
+
+Handler::Handler(std::shared_ptr<const inbound::ReceiverSettings> receiver,
+                 ProtocolProvider& provider,
+                 ConnectionLimiter& limiter)
+    : receiver_(receiver ? std::move(receiver)
+                         : throw std::invalid_argument("missing receiver settings"))
+    , security_(receiver_->stream_settings, StreamEndpointRole::Inbound)
     , provider_(&provider)
     , limiter_(limiter) {}
 
@@ -218,7 +240,7 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
     std::unique_ptr<AsyncStream> stream,
     session::Context& ctx,
     const std::shared_ptr<ConnectionLimiter::Family>& family) {
-    const inbound::ReceiverSettings& listener = receiver_;
+    const inbound::ReceiverSettings& listener = *receiver_;
     ConnectionStatsScope connection_stats(stats);
 
     ctx.inbound.accounting_key.assign(listener.accounting_key);
@@ -268,7 +290,7 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
     std::unique_ptr<AsyncStream> raw_conn,
     session::Context& ctx,
     app::dns::DNS* dns_service) {
-    const inbound::ReceiverSettings& listener = receiver_;
+    const inbound::ReceiverSettings& listener = *receiver_;
     ConnectionStatsScope connection_stats(stats);
 
     ctx.inbound.accounting_key.assign(listener.accounting_key);
@@ -330,21 +352,19 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
         ApplyProxyProtocolResult(ctx, proxy_read.result);
     }
 
-    if (ctx.inbound.HasProxyProtocolClientIP() &&
-        co_await limiter_.IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {
-        LOG_CONN_DEBUG(ctx, "connection rejected source={}:{} > IP banned before transport handshake",
-                       ctx.inbound.source_ip, ctx.inbound.source_port);
-        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "IP banned"));
-        stats.OnError();
-        co_return;
-    }
-
-    auto physical_admission = co_await limiter_.ReservePhysical();
+    auto physical_admission = co_await limiter_.ReservePhysical(
+        ctx.inbound.tag, ctx.inbound.source_ip,
+        ctx.inbound.HasProxyProtocolClientIP());
     auto reject = physical_admission.reason;
     if (reject != ConnectionLimiter::RejectReason::NONE) {
-        LOG_CONN_DEBUG(ctx, "connection rejected from {}:{} > {}",
-                       ctx.inbound.source_ip, ctx.inbound.source_port,
-                       ConnectionLimiter::RejectReasonToString(reject));
+        if (reject == ConnectionLimiter::RejectReason::IP_BANNED) {
+            LOG_CONN_DEBUG(ctx, "connection rejected source={}:{} > IP banned before transport handshake",
+                           ctx.inbound.source_ip, ctx.inbound.source_port);
+        } else {
+            LOG_CONN_DEBUG(ctx, "connection rejected from {}:{} > {}",
+                           ctx.inbound.source_ip, ctx.inbound.source_port,
+                           ConnectionLimiter::RejectReasonToString(reject));
+        }
         LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected,
                                   ConnectionLimiter::RejectReasonToString(reject)));
         stats.OnError();
@@ -405,11 +425,7 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
         co_return;
     }
 
-    if (!transport_metadata->real_ip.empty()) {
-        LOG_CONN_DEBUG(ctx, "HTTP transport client address overridden by header: {} -> {}",
-                       ctx.inbound.source_ip, transport_metadata->real_ip);
-        ApplyHttpRealIp(ctx, transport_metadata->real_ip);
-    }
+    ApplyHttpRealIp(ctx, transport_metadata->real_ip);
 
     metadata_owner.reset();
     local_metadata = {};

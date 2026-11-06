@@ -117,8 +117,11 @@ struct Parsed2022Body {
     }
     pos += padding_len;
 
-    auto addr = DecodeAddress(std::span<const uint8_t>(plaintext.data() + pos, plaintext.size() - pos), AddressWireFormat::Socks5);
-    if (addr.status != AddressDecodeStatus::Complete) {
+    auto addr = DecodeAddress(
+        std::span<const uint8_t>(plaintext.data() + pos, plaintext.size() - pos),
+        AddressWireFormat::Socks5,
+        {255, true});
+    if (addr.status != AddressDecodeStatus::Complete || !addr.target.IsValid()) {
         return std::nullopt;
     }
     pos += addr.consumed;
@@ -153,8 +156,11 @@ struct Parsed2022Body {
     }
     pos += padding_len;
 
-    auto addr = DecodeAddress(std::span<const uint8_t>(plaintext.data() + pos, plaintext.size() - pos), AddressWireFormat::Socks5);
-    if (addr.status != AddressDecodeStatus::Complete) {
+    auto addr = DecodeAddress(
+        std::span<const uint8_t>(plaintext.data() + pos, plaintext.size() - pos),
+        AddressWireFormat::Socks5,
+        {255, true});
+    if (addr.status != AddressDecodeStatus::Complete || !addr.target.IsValid()) {
         return std::nullopt;
     }
     pos += addr.consumed;
@@ -431,7 +437,7 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
         std::memcpy(client_session_id.data(), separate.data(), client_session_id.size());
         auto parsed = Parse2022ClientBodyPlaintext(plaintext, client_session_id);
         if (!parsed) {
-            continue;
+            return std::nullopt;
         }
         const uint64_t packet_id = LoadU64BE(
             separate.data() + kSs2022UdpSessionIdSize);
@@ -483,7 +489,7 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
             kSs2022UdpSessionIdSize + kSs2022UdpPacketIdSize);
         auto parsed = Parse2022ClientBodyPlaintext(body, client_session_id);
         if (!parsed) {
-            continue;
+            return std::nullopt;
         }
         if (!replay_cache.Accept(user.derived_key.span(), client_session_id, packet_id)) {
             return std::nullopt;
@@ -874,9 +880,12 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacket(
             continue;
         }
 
-        auto addr = DecodeAddress(std::span<const uint8_t>(plaintext.data(), plaintext_len), AddressWireFormat::Socks5);
-        if (addr.status != AddressDecodeStatus::Complete) {
-            continue;
+        auto addr = DecodeAddress(
+            std::span<const uint8_t>(plaintext.data(), plaintext_len),
+            AddressWireFormat::Socks5,
+            {255, true});
+        if (addr.status != AddressDecodeStatus::Complete || !addr.target.IsValid()) {
+            return std::nullopt;
         }
 
         SsUdpDecodeResult result;
@@ -963,8 +972,11 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacketWithKey(
         return std::nullopt;
     }
 
-    auto addr = DecodeAddress(std::span<const uint8_t>(plaintext.data(), plaintext_len), AddressWireFormat::Socks5);
-    if (addr.status != AddressDecodeStatus::Complete) {
+    auto addr = DecodeAddress(
+        std::span<const uint8_t>(plaintext.data(), plaintext_len),
+        AddressWireFormat::Socks5,
+        {255, true});
+    if (addr.status != AddressDecodeStatus::Complete || !addr.target.IsValid()) {
         return std::nullopt;
     }
 

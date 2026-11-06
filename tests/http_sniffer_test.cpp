@@ -39,9 +39,10 @@ int main() {
     if (!Require(!SniffHttp(
             "GET / HTTP/1.1\r\nHost: first.example\r\nHost: second.example\r\n\r\n").success,
         "duplicate Host headers must be rejected")) return 5;
-    if (!Require(!SniffHttp(
-            "GET / HTTP/1.1\r\nHost: example.com").success,
-        "an incomplete HTTP header block must be rejected")) return 6;
+    const auto partial_http = SniffHttp("GET / HTTP/1.1\r\nHost: example.com");
+    if (!Require(!partial_http.success && partial_http.need_more &&
+                     partial_http.protocol == "http",
+        "an incomplete HTTP header block must request more bytes")) return 6;
     if (!Require(!SniffHttp(
             "GET / HTTP/1.1\nHost: example.com\n\n").success,
         "LF-only HTTP headers must be rejected")) return 7;

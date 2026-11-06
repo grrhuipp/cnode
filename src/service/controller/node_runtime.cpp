@@ -93,20 +93,20 @@ net::awaitable<bool> NodeRuntime::AddInbound(const InboundBuild& inbound) {
 
     std::exception_ptr publish_failure;
     try {
+        const auto receiver = proxyman::inbound::MakeReceiverSettings(
+            inbound.tag,
+            std::vector<std::string>{
+                inbound.tag, std::string(constants::protocol::kNode)},
+            inbound.protocol,
+            inbound.stream_settings,
+            inbound.sniff,
+            inbound.proxy_protocol,
+            routing::RouteWithFallback(inbound.tag),
+            inbound.accounting_key);
         std::vector<uint8_t> registered(workers_.size(), 0);
         co_await RunWorkerMutationBatch(
             io_context_.get_executor(), workers_,
             [&](Worker& worker, size_t index) {
-                auto receiver = proxyman::inbound::MakeReceiverSettings(
-                    inbound.tag,
-                    std::vector<std::string>{
-                        inbound.tag, std::string(constants::protocol::kNode)},
-                    inbound.protocol,
-                    inbound.stream_settings,
-                    inbound.sniff,
-                    inbound.proxy_protocol,
-                    routing::RouteWithFallback(inbound.tag),
-                    inbound.accounting_key);
                 return [](NodeRuntime* runtime, Worker* current,
                           proxyman::inbound::BuildRequest request,
                           proxyman::inbound::ReceiverSettings current_receiver,
@@ -120,7 +120,7 @@ net::awaitable<bool> NodeRuntime::AddInbound(const InboundBuild& inbound) {
                         });
                 }(this, &worker,
                   inbound.handler_request,
-                  std::move(receiver),
+                  receiver,
                   &registered[index]);
             });
 
@@ -195,22 +195,19 @@ net::awaitable<void> NodeRuntime::UpdateRules(
     const std::string& tag,
     const std::vector<rule::DetectRule>& new_rule_list) {
     ThrowIfStopping();
-    std::vector<net::awaitable<void>> tasks;
-    tasks.reserve(workers_.size());
-    for (const auto& worker : workers_) {
-        tasks.push_back(
-            [](NodeRuntime* runtime, Worker* current,
-               std::string current_tag,
-               std::vector<rule::DetectRule> rules) -> net::awaitable<void> {
+    co_await RunWorkerMutationBatch(
+        io_context_.get_executor(), workers_,
+        [this, &tag, &new_rule_list](Worker& worker, size_t) {
+            return [](NodeRuntime* runtime, Worker* current,
+                      std::string current_tag,
+                      std::vector<rule::DetectRule> rules) -> net::awaitable<void> {
                 runtime->ThrowIfStopping();
                 co_await current->PostCall(
                     [current, tag = std::move(current_tag), rules = std::move(rules)] {
                         current->UpdateRule(tag, rules);
                     });
-            }(this, worker.get(), tag, new_rule_list));
-    }
-    co_await RunAwaitableBatch(
-        io_context_.get_executor(), std::move(tasks));
+            }(this, &worker, tag, new_rule_list);
+        });
 }
 
 net::awaitable<void> NodeRuntime::RecoverUsers() {

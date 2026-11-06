@@ -3,6 +3,7 @@
 
 #include <openssl/aead.h>
 #include <openssl/err.h>
+#include <openssl/mem.h>
 
 #include <algorithm>
 #include <cstring>
@@ -14,7 +15,10 @@ namespace {
 struct ScopedAeadCtx {
     EVP_AEAD_CTX ctx;
     ScopedAeadCtx() noexcept { EVP_AEAD_CTX_zero(&ctx); }
-    ~ScopedAeadCtx() noexcept { EVP_AEAD_CTX_cleanup(&ctx); }
+    ~ScopedAeadCtx() noexcept {
+        EVP_AEAD_CTX_cleanup(&ctx);
+        OPENSSL_cleanse(&ctx, sizeof(ctx));
+    }
 };
 }  // namespace
 

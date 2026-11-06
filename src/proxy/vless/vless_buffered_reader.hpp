@@ -30,6 +30,9 @@ public:
             if (pending_.byte_size() != 0) {
                 const size_t n = pending_.ConsumePrefixTo(
                     std::span<uint8_t>(data + done, len - done));
+                if (pending_.empty()) {
+                    pending_.ReleaseIfIdle();
+                }
                 done += n;
                 if (n > 0) {
                     continue;

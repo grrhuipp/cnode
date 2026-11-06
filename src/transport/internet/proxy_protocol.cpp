@@ -113,15 +113,25 @@ ProxyProtocolResult ParseV1(const uint8_t* data, size_t len) {
     }
     line.remove_prefix(sp2 + 1);
 
-    // The destination address is not used.
     auto sp3 = line.find(' ');
     if (sp3 == std::string_view::npos) return MakeInvalid();
+    std::string_view dst_ip = line.substr(0, sp3);
+    const auto dst_addr = iputil::ParseLiteral(dst_ip);
+    if (!dst_addr ||
+        (family == "TCP4" && !dst_addr->is_v4()) ||
+        (family == "TCP6" && !dst_addr->is_v6())) {
+        return MakeInvalid();
+    }
     line.remove_prefix(sp3 + 1);
 
     auto sp4 = line.find(' ');
     if (sp4 == std::string_view::npos) return MakeInvalid();
     uint16_t src_port = 0;
     if (!ParsePort(line.substr(0, sp4), src_port)) return MakeInvalid();
+    line.remove_prefix(sp4 + 1);
+
+    uint16_t dst_port = 0;
+    if (!ParsePort(line, dst_port)) return MakeInvalid();
 
     ProxyProtocolResult r;
     r.status   = ProxyProtocolParseStatus::Success;
@@ -166,8 +176,8 @@ ProxyProtocolResult ParseV2(const uint8_t* data, size_t len) {
     const uint16_t extra_len =
         static_cast<uint16_t>((data[14] << 8) | data[15]);
     const size_t total = kHeaderSize + extra_len;
+    if (total > kProxyHeaderMaxBytes) return MakeInvalid();
     if (len < total) return MakeIncomplete();
-
     ProxyProtocolResult r;
     r.consumed = total;
     r.status   = ProxyProtocolParseStatus::Success;

@@ -30,8 +30,8 @@ struct UserTrafficCounters {
 };
 
 struct AccountingDomain {
-    std::shared_ptr<PhysicalSessionCapabilities> capabilities;
-    std::shared_ptr<ExecutionDomain> domain;
+    std::weak_ptr<PhysicalSessionCapabilities> capabilities;
+    std::weak_ptr<ExecutionDomain> domain;
 };
 
 struct DomainTrafficSnapshot {

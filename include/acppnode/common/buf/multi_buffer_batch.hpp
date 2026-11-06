@@ -15,16 +15,14 @@ public:
 
     MultiBufferBatch(MultiBufferBatch&& other) noexcept
         : first_(std::move(other.first_)), overflow_(std::move(other.overflow_)),
-          cursor_(std::exchange(other.cursor_, 0)),
           bytes_(std::exchange(other.bytes_, 0)),
           occupied_(std::exchange(other.occupied_, false)) {}
 
-    MultiBufferBatch& operator=(MultiBufferBatch&& other) {
+    MultiBufferBatch& operator=(MultiBufferBatch&& other) noexcept {
         if (this != &other) {
             clear();
             overflow_ = std::move(other.overflow_);
             first_ = std::move(other.first_);
-            cursor_ = std::exchange(other.cursor_, 0);
             bytes_ = std::exchange(other.bytes_, 0);
             occupied_ = std::exchange(other.occupied_, false);
         }
@@ -32,8 +30,14 @@ public:
     }
 
     void Push(MultiBuffer payload) {
-        if (payload.empty()) return;
         const size_t bytes = payload.byte_size();
+        if (bytes == 0) {
+            payload.clear();
+            return;
+        }
+        if (bytes > std::numeric_limits<size_t>::max() - bytes_) {
+            throw std::length_error("MultiBufferBatch byte size overflow");
+        }
         if (!occupied_) {
             first_ = std::move(payload);
             occupied_ = true;
@@ -47,9 +51,9 @@ public:
         if (!occupied_) return {};
         MultiBuffer result = std::move(first_);
         bytes_ -= result.byte_size();
-        if (cursor_ < overflow_.size()) {
-            first_ = std::move(overflow_[cursor_++]);
-            if (cursor_ == overflow_.size()) ReleaseOverflow();
+        if (!overflow_.empty()) {
+            first_ = std::move(overflow_.front());
+            overflow_.pop_front();
         } else {
             occupied_ = false;
         }
@@ -61,21 +65,14 @@ public:
 
     void clear() noexcept {
         first_.clear();
-        ReleaseOverflow();
+        overflow_.clear();
         bytes_ = 0;
         occupied_ = false;
     }
 
 private:
-    void ReleaseOverflow() noexcept {
-        memory::ThreadLocalVector<MultiBuffer> empty(overflow_.get_allocator());
-        overflow_.swap(empty);
-        cursor_ = 0;
-    }
-
     MultiBuffer first_;
-    memory::ThreadLocalVector<MultiBuffer> overflow_;
-    size_t cursor_ = 0;
+    memory::ThreadLocalDeque<MultiBuffer> overflow_;
     size_t bytes_ = 0;
     bool occupied_ = false;
 };

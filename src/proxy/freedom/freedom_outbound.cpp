@@ -7,6 +7,7 @@
 #include "acppnode/app/proxyman/outbound/factory.hpp"
 #include "../../app/proxyman/outbound/registration.hpp"
 #include "outbound/udp_request.hpp"
+#include "acppnode/transport/internet/outbound_target_builder.hpp"
 #include "acppnode/transport/internet/transport_dialer.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/infra/outbound_bind_config.hpp"
@@ -68,8 +69,22 @@ bool PreservesDnsOrder(DomainStrategy strategy) {
     }
 }
 
+bool StrategyPrefersIPv6(DomainStrategy strategy) {
+    switch (strategy) {
+        case DomainStrategy::UseIPv6:
+        case DomainStrategy::ForceIPv6:
+        case DomainStrategy::UseIPv6v4:
+        case DomainStrategy::ForceIPv6v4:
+            return true;
+        default:
+            return false;
+    }
+}
+
 net::ip::address SelectUdpBindAddress(
     const OutboundBind& send_through,
+    DomainStrategy domain_strategy,
+    const tcp::endpoint* inbound_local_addr,
     const session::Context& ctx) {
     const bool auto_bind = send_through.GetMode() == OutboundBind::Mode::Auto;
     if (send_through.GetMode() == OutboundBind::Mode::Explicit) {
@@ -77,28 +92,54 @@ net::ip::address SelectUdpBindAddress(
     }
 
     const auto& target = ctx.outbound.target;
-    if (auto_bind && ctx.inbound.local_endpoint) {
+    const tcp::endpoint* local_ep = inbound_local_addr
+        ? inbound_local_addr
+        : (ctx.inbound.local_endpoint ? &*ctx.inbound.local_endpoint : nullptr);
+    const bool target_is_v6 =
+        target.type == AddressType::IPv6 ||
+        (target.type != AddressType::Domain &&
+         target.resolved_addr && target.resolved_addr->is_v6());
+    const bool target_is_v4 =
+        target.type == AddressType::IPv4 ||
+        (target.type != AddressType::Domain &&
+         target.resolved_addr && target.resolved_addr->is_v4());
+
+    if (auto_bind && local_ep) {
         const auto inbound_local =
-            iputil::NormalizeAddress(ctx.inbound.local_endpoint->address());
-        const bool target_is_v6 =
-            (target.resolved_addr && target.resolved_addr->is_v6()) ||
-            target.type == AddressType::IPv6;
-        const bool target_is_v4 =
-            (target.resolved_addr && target.resolved_addr->is_v4()) ||
-            target.type == AddressType::IPv4;
+            iputil::NormalizeAddress(local_ep->address());
+        const bool strategy_allows_local =
+            (target_is_v4 || target_is_v6) ||
+            (inbound_local.is_v6() ? AcceptsIPv6(domain_strategy)
+                                   : AcceptsIPv4(domain_strategy));
         if (!inbound_local.is_unspecified() && !inbound_local.is_loopback() &&
+            strategy_allows_local &&
             ((target_is_v4 && inbound_local.is_v4()) ||
              (target_is_v6 && inbound_local.is_v6()) ||
-             target.type == AddressType::Domain)) {
+             (!target_is_v4 && !target_is_v6))) {
             return inbound_local;
         }
     }
 
-    if ((target.resolved_addr && target.resolved_addr->is_v6()) ||
-        target.type == AddressType::IPv6) {
+    if (target_is_v6) {
         return net::ip::address_v6::any();
     }
-
+    if (target_is_v4) {
+        return net::ip::address_v4::any();
+    }
+    if (StrategyPrefersIPv6(domain_strategy)) {
+        return net::ip::address_v6::any();
+    }
+    if (!AcceptsIPv6(domain_strategy)) {
+        return net::ip::address_v4::any();
+    }
+    if (target.resolved_addr) {
+        return target.resolved_addr->is_v6()
+            ? net::ip::address(net::ip::address_v6::any())
+            : net::ip::address(net::ip::address_v4::any());
+    }
+    if (send_through.PrefersIPv6()) {
+        return net::ip::address_v6::any();
+    }
     return net::ip::address_v4::any();
 }
 
@@ -134,11 +175,22 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     // UDP 数据面：dispatcher.Dispatch -> outbound.Process -> DoRelayLink。
     // 不做 redirect（保持 UDP 逐包目标语义）；嗅探首包作为普通上行交给转发。
     if (ctx.content.network == Network::UDP) {
-        auto bind_address = SelectUdpBindAddress(send_through_, ctx);
+        auto bind_address = SelectUdpBindAddress(
+            send_through_, domain_strategy_, inbound_local_addr, ctx);
         if (send_through_.GetMode() == OutboundBind::Mode::Ordered) {
-            const auto selected = send_through_.Select(
+            auto selected = send_through_.Select(
                 bind_address, ctx.inbound.source_ip, ctx.inbound.source_port);
-            if (selected.address) bind_address = *selected.address;
+            if (!selected.address && ctx.outbound.target.IsDomain()) {
+                const net::ip::address alt_family = bind_address.is_v6()
+                    ? net::ip::address(net::ip::address_v4::any())
+                    : net::ip::address(net::ip::address_v6::any());
+                selected = send_through_.Select(
+                    alt_family, ctx.inbound.source_ip, ctx.inbound.source_port);
+            }
+            if (!selected.address) {
+                co_return tl::unexpected(ErrorCode::SOCKET_BIND_FAILED);
+            }
+            bind_address = *selected.address;
         }
         std::optional<UdpRequest> target;
         try {
@@ -152,6 +204,12 @@ net::awaitable<OutboundProcessResult> Handler::Process(
                            ctx.outbound.target, iputil::AddressText(bind_address).View(), e.what());
             co_return tl::unexpected(MapAsioError(e.code()));
         }
+        ctx.outbound.connected_local_addr.reset();
+        const auto local_ip = iputil::NormalizeAddress(bind_address);
+        if (!local_ip.is_unspecified()) {
+            ctx.outbound.connected_local_addr = local_ip;
+        }
+        LOG_ACCESS(FormatAccessLog(ctx));
         target->SetIdleTimeout(relay_idle_timeout);
         target->SetWriteTimeout(relay_write_timeout);
         co_return co_await DoRelayLink(io_context, *inbound.reader, *inbound.writer,
@@ -217,7 +275,9 @@ Handler::DialOutboundStream(
         transport_target.single_candidate = std::move(candidate);
     };
 
-    if (target.IsIP() && target.resolved_addr) {
+    if (target.IsIP() && target.resolved_addr &&
+        domain_strategy_ != DomainStrategy::ForceIPv4 &&
+        domain_strategy_ != DomainStrategy::ForceIPv6) {
         set_single_candidate(*target.resolved_addr);
     } else {
         auto remote_addrs = co_await ResolveTargets(ctx);
@@ -269,13 +329,7 @@ Handler::DialOutboundStream(
 
     auto stream = std::move(dial_result.stream);
     LOG_CONN_DEBUG(ctx, "TCP dial succeeded -> {}", ctx.outbound.target);
-    if (auto local_ep = stream->LocalEndpoint()) {
-        const auto local_ip = iputil::NormalizeAddress(local_ep->address());
-        if (!local_ip.is_unspecified()) {
-            ctx.outbound.connected_local_addr = local_ip;
-        }
-    }
-    LOG_ACCESS(FormatAccessLog(ctx));
+    RecordOutboundStreamConnected(ctx, *stream);
     co_return std::move(stream);
 }
 
@@ -283,15 +337,21 @@ net::awaitable<tl::expected<memory::ThreadLocalVector<net::ip::address>, ErrorCo
 Handler::ResolveTargets(session::Context& ctx) {
     const auto& target = ctx.outbound.target;
 
-    // 如果目标已经有解析结果，直接复用 dispatcher/router 阶段的 DNS 结果。
-    if (target.resolved_addr) {
+    if (!target.IsDomain()) {
+        if (!target.resolved_addr) {
+            co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+        }
+        if ((domain_strategy_ == DomainStrategy::ForceIPv4 ||
+             domain_strategy_ == DomainStrategy::ForceIPv6) &&
+            !(target.resolved_addr->is_v6()
+                ? AcceptsIPv6(domain_strategy_)
+                : AcceptsIPv4(domain_strategy_))) {
+            co_return tl::unexpected(ErrorCode::DNS_NO_RECORD);
+        }
         memory::ThreadLocalVector<net::ip::address> addresses;
         addresses.reserve(1);
         addresses.push_back(*target.resolved_addr);
         co_return addresses;
-    }
-    if (!target.IsDomain()) {
-        co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
     }
 
     // 需要 DNS 解析

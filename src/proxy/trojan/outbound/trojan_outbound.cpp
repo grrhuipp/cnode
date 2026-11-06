@@ -1,8 +1,11 @@
 #include "trojan_outbound.hpp"
 #include "acppnode/common/domain_name.hpp"
 #include "acppnode/common/ip_address.hpp"
+#include "acppnode/common/ip_utils.hpp"
 #include "../trojan_codec.hpp"
 #include "../udp_framing.hpp"
+#include "../../handshake_timeout.hpp"
+#include "../../outbound_stream_endpoint.hpp"
 #include "acppnode/app/relay.hpp"
 #include "acppnode/app/proxyman/outbound/factory.hpp"
 #include "../../../app/proxyman/outbound/registration.hpp"
@@ -14,7 +17,6 @@
 #include "acppnode/infra/config_types.hpp"
 #include "acppnode/transport/link.hpp"
 #include "acppnode/transport/link_error.hpp"
-#include "acppnode/transport/internet/transport_dialer.hpp"
 #include "acppnode/transport/internet/outbound_target_builder.hpp"
 
 #include <algorithm>
@@ -29,133 +31,37 @@ namespace acpp {
 
 namespace {
 
-class TrojanUdpOutboundEndpoint final
-    : public transport::MultiBufferReader
-    , public transport::MultiBufferWriter {
+class TrojanUdpOutboundEndpoint final : public proxy::OutboundStreamEndpointBase {
 public:
     TrojanUdpOutboundEndpoint(AsyncStream& stream, TargetAddress fallback_target)
-        : stream_(stream)
+        : OutboundStreamEndpointBase(stream)
         , fallback_target_(std::move(fallback_target)) {}
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
-        while (true) {
-            trojan::FramedUdpPacket packet;
-            if (framer_.Next(packet)) {
-                for (buf::Buffer* buffer : packet.payload) {
-                    if (buffer && !buffer->IsEmpty()) {
-                        buffer->SetUDP(packet.target);
-                    }
-                }
-                co_return std::move(packet.payload);
-            }
-
-            buf::MultiBuffer raw = co_await stream_.ReadMultiBuffer();
-            if (raw.byte_size() == 0) {
-                framer_.Finish();
-                co_return buf::MultiBuffer{};
-            }
-            framer_.Feed(std::move(raw));
-        }
+        return trojan::ReadUdpDatagram(stream_, framer_);
     }
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
-        co_await trojan::WriteUdpDatagram(stream_, std::move(mb));
+        return trojan::WriteUdpDatagram(stream_, std::move(mb));
     }
 
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
-        co_await trojan::WriteUdpDatagram(
+        return trojan::WriteUdpDatagram(
             stream_, fallback_target_, buffers);
     }
 
     net::awaitable<void> AsyncShutdownWrite() override {
-        co_await stream_.AsyncShutdownWrite();
+        return stream_.AsyncShutdownWrite();
     }
 
-    bool ConsumeIdleTimeout() noexcept {
-        return stream_.ConsumeIdleTimeout();
+    transport::EofAction ReadEofAction() const noexcept override {
+        return transport::EofAction::WaitForPeer;
     }
-
-    bool ConsumeReadTimeout() noexcept {
-        return stream_.ConsumeReadTimeout();
-    }
-
-    bool ConsumeWriteTimeout() noexcept {
-        return stream_.ConsumeWriteTimeout();
-    }
-
-    PhaseDeadlineHandle StartPhaseDeadline(std::chrono::seconds timeout) {
-        return stream_.StartPhaseDeadline(timeout);
-    }
-
-    void ClearPhaseDeadline() {
-        stream_.ClearPhaseDeadline();
-    }
-
-    bool ConsumePhaseDeadline() noexcept {
-        return stream_.ConsumePhaseDeadline();
-    }
-
-    void Cancel() noexcept {
-        stream_.Cancel();
-    }
-
-    transport::CancellationSource& Cancellation() noexcept override { return stream_.Cancellation(); }
 
 private:
-    AsyncStream& stream_;
     TargetAddress fallback_target_;
     trojan::UdpFramer framer_;
 };
-
-net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, ErrorCode>>
-DialOutboundStream(
-    net::io_context& io_context,
-    app::dns::DNS& dns_service,
-    const TrojanOutboundConfig& config,
-    const TransportSecurity& security,
-    std::chrono::seconds dial_timeout,
-    const tcp::endpoint* inbound_local_addr,
-    session::Context& ctx) {
-    auto transport_target = co_await BuildOutboundTransportTarget(OutboundTargetOptions{
-        .dns_service = &dns_service,
-        .address = config.address,
-        .literal_address = config.literal_address,
-        .port = config.port,
-        .stream_settings = &config.stream_settings,
-        .security = &security,
-        .timeout = dial_timeout,
-        .send_through = &config.send_through,
-        .inbound_local_addr = inbound_local_addr,
-        .inbound_source_ip = ctx.inbound.source_ip,
-        .inbound_source_port = ctx.inbound.source_port,
-        .tls_server_name = ResolveOutboundTlsServerName(
-            config.stream_settings, config.address),
-        .ws_host = config.address,
-    });
-    if (!transport_target) {
-        if (transport_target.error() == ErrorCode::DNS_RESOLVE_FAILED) {
-            LOG_CONN_DEBUG(ctx, "DNS resolve failed for {}", config.address);
-        }
-        co_return tl::unexpected(transport_target.error());
-    }
-    auto dial_result = co_await DialOutboundTransport(io_context, ctx, *transport_target);
-    if (!dial_result.Ok()) {
-        if (dial_result.error != ErrorCode::CANCELLED &&
-            dial_result.error != ErrorCode::CONNECTION_CLOSED &&
-            dial_result.error != ErrorCode::SOCKET_EOF) {
-            LOG_CONN_WARN(ctx, "dial failed {} -> {} > {}",
-                          ctx.inbound.source_ip, ctx.outbound.target, dial_result.error_msg);
-        }
-        co_return tl::unexpected(dial_result.error);
-    }
-    auto stream = std::move(dial_result.stream);
-    if (auto local_ep = stream->LocalEndpoint();
-        local_ep && !local_ep->address().is_unspecified()) {
-        ctx.outbound.connected_local_addr = local_ep->address();
-    }
-    LOG_ACCESS(FormatAccessLog(ctx));
-    co_return std::move(stream);
-}
 
 net::awaitable<tl::expected<void, ErrorCode>>
 SendTrojanHandshake(
@@ -188,14 +94,10 @@ SendTrojanHandshake(
         co_await stream.WriteBuffers(header_buffers.Span());
         LOG_CONN_DEBUG(ctx, "handshake sent {} bytes", header_len);
         co_return tl::expected<void, ErrorCode>{};
-    } catch (const IoSystemError& e) {
-        co_return tl::unexpected(outbound_protocol_deadline.Expired()
-            ? ErrorCode::TIMEOUT
-            : MapAsioError(e.code()));
     } catch (...) {
-        co_return tl::unexpected(outbound_protocol_deadline.Expired()
-            ? ErrorCode::TIMEOUT
-            : ErrorCode::SOCKET_WRITE_FAILED);
+        co_return tl::unexpected(
+            proxy::ClassifyOutboundHandshakeException(
+                stream, outbound_protocol_deadline));
     }
 }
 
@@ -232,9 +134,20 @@ proxy::trojan::outbound::Handler::Process(
 
     const auto& target = ctx.outbound.target;
 
-    auto dialed = co_await DialOutboundStream(
-        io_context, dns_service_, *config_, security_, dial_timeout_,
-        inbound_local_addr, ctx);
+    auto dialed = co_await acpp::DialOutboundStream(
+        io_context,
+        ctx,
+        OutboundTargetOptions{
+            .dns_service = &dns_service_,
+            .address = config_->address,
+            .literal_address = config_->literal_address,
+            .port = config_->port,
+            .stream_settings = &config_->stream_settings,
+            .security = &security_,
+            .timeout = dial_timeout_,
+            .send_through = &config_->send_through,
+            .inbound_local_addr = inbound_local_addr,
+        });
     if (!dialed) {
         co_return tl::unexpected(dialed.error());
     }
@@ -329,20 +242,19 @@ const bool kTrojanRegistered = (acpp::proxyman::outbound::RegisterProxy(
 
         acpp::TrojanOutboundConfig trojan_config;
 
-        bool parsed_xray = false;
-        if (const auto* servers_p = s.if_contains("servers");
-                servers_p && servers_p->is_array() && !servers_p->as_array().empty() &&
-                servers_p->as_array()[0].is_object()) {
+        if (const auto* servers_p = s.if_contains("servers")) {
+            if (!servers_p->is_array() ||
+                servers_p->as_array().size() != 1 ||
+                !servers_p->as_array()[0].is_object()) {
+                LOG_ERROR("trojan outbound '{}': servers must be a single-element object array", cfg.tag);
+                return std::nullopt;
+            }
             if (!read_trojan_server(
                     servers_p->as_array()[0].as_object(), trojan_config)) {
                 return std::nullopt;
             }
-            parsed_xray = true;
-        }
-        if (!parsed_xray) {
-            if (!read_trojan_server(s, trojan_config)) {
-                return std::nullopt;
-            }
+        } else if (!read_trojan_server(s, trojan_config)) {
+            return std::nullopt;
         }
         trojan_config.send_through = cfg.send_through.value_or(acpp::OutboundBind{});
         trojan_config.stream_settings = acpp::NormalizeOutboundStreamSettings(

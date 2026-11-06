@@ -1,6 +1,7 @@
 #include "vless_inbound.hpp"
 #include "../credentials.hpp"
 #include "../../mux/inbound/mux_inbound.hpp"
+#include "../../inbound_admission.hpp"
 
 #include "../vless_codec.hpp"
 #include "../vless_encryption.hpp"
@@ -158,22 +159,29 @@ ReadVlessRequestHeader(VlessBufferedReader& active_reader,
     size_t required = 1;
     for (;;) {
         bool read_ok = false;
+        size_t step_read = 0;
         try {
             read_ok = co_await active_reader.ReadExact(
-                handshake.data() + total_read, required - total_read);
-        } catch (const IoSystemError&) {
-            if (stream.ConsumePhaseDeadline()) {
+                handshake.data() + total_read,
+                required - total_read,
+                false,
+                &step_read);
+        } catch (const IoSystemError& error) {
+            const ErrorCode classified =
+                proxy::ClassifyHandshakeReadException(stream, error);
+            if (classified == ErrorCode::TIMEOUT) {
                 LOG_CONN_WARN(ctx, "handshake phase deadline from {}:{}",
                               client_ip, ctx.inbound.source_port);
-                co_return tl::unexpected(ErrorCode::TIMEOUT);
             }
-            co_return tl::unexpected(ErrorCode::SOCKET_READ_FAILED);
+            co_return tl::unexpected(classified);
         }
         if (!read_ok) {
-            if (stream.ConsumePhaseDeadline() || stream.ConsumeIdleTimeout()) {
-                co_return tl::unexpected(ErrorCode::TIMEOUT);
-            }
-            co_return tl::unexpected(ErrorCode::SOCKET_EOF);
+            co_return tl::unexpected(
+                proxy::ResolveHandshakeReadFailure(
+                    stream,
+                    total_read == 0 && step_read == 0
+                        ? ErrorCode::SOCKET_EOF
+                        : ErrorCode::PROTOCOL_DECODE_FAILED));
         }
         total_read = required;
 
@@ -239,9 +247,22 @@ CompleteVlessInboundHandshake(
                     decryption,
                     std::string(tag));
             if (!runtime) {
-                LOG_CONN_WARN(ctx, "encryption handshake failed from {}:{} > handshake rejected",
-                              client_ip, ctx.inbound.source_port);
-                LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "encryption handshake rejected"));
+                if (proxy::ConsumeStreamReadTimeout(stream)) {
+                    LOG_CONN_WARN(ctx, "encryption handshake timed out from {}:{}",
+                                  client_ip, ctx.inbound.source_port);
+                    co_return tl::unexpected(ErrorCode::TIMEOUT);
+                }
+                if (runtime.error() == ::acpp::vless::VlessEncryptionHandshakeFailure::Closed) {
+                    co_return tl::unexpected(ErrorCode::SOCKET_EOF);
+                }
+                const bool truncated =
+                    runtime.error() == ::acpp::vless::VlessEncryptionHandshakeFailure::Truncated;
+                const auto reason = truncated
+                    ? "encryption handshake truncated" : "encryption handshake rejected";
+                LOG_CONN_WARN(ctx, "{} from {}:{}", reason, client_ip, ctx.inbound.source_port);
+                if (!truncated) {
+                    LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, reason));
+                }
                 co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
             }
             issued_ticket = std::move(runtime->issued_ticket);
@@ -250,10 +271,18 @@ CompleteVlessInboundHandshake(
                 protocol_reader, protocol_writer, std::move(*runtime));
             active_reader = &encrypted_io->plain_reader;
             active_writer = &encrypted_io->writer;
-        } catch (const IoSystemError&) {
-            co_return tl::unexpected(stream.ConsumePhaseDeadline()
-                ? ErrorCode::TIMEOUT
-                : ErrorCode::SOCKET_READ_FAILED);
+        } catch (const IoSystemError& error) {
+            const ErrorCode classified =
+                proxy::ClassifyHandshakeReadException(stream, error);
+            if (classified == ErrorCode::CANCELLED) {
+                LOG_CONN_DEBUG(ctx, "encryption handshake cancelled from {}:{}",
+                               client_ip, ctx.inbound.source_port);
+            } else {
+                LOG_CONN_WARN(ctx, "encryption handshake failed from {}:{} > {}",
+                              client_ip, ctx.inbound.source_port,
+                              classified == ErrorCode::TIMEOUT ? "timeout" : "transport error");
+            }
+            co_return tl::unexpected(classified);
         } catch (const WorkerMailboxFull&) {
             co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
         } catch (...) {
@@ -289,6 +318,18 @@ CompleteVlessInboundHandshake(
     }
     ctx.inbound.user_id = user_info->profile.user_id;
     ctx.inbound.user_email = user_info->profile.email;
+    Network net = Network::TCP;
+    if (request.command == ::acpp::vless::Command::UDP) {
+        net = Network::UDP;
+    } else if (request.command == ::acpp::vless::Command::MUX) {
+        net = Network::MUX;
+    }
+    const bool packet_addr_udp =
+        request.command == ::acpp::vless::Command::UDP &&
+        ::acpp::vless::IsPacketAddrMagic(request.target);
+    ctx.outbound.original_target = request.target;
+    ctx.outbound.target = std::move(request.target);
+    ctx.content.network = net;
     if (request.addons_len != 0 && request.flow.empty()) {
         LOG_CONN_WARN(ctx, "request rejected from {}:{} > unsupported addons", client_ip, ctx.inbound.source_port);
         LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "unsupported request addons"));
@@ -328,7 +369,7 @@ CompleteVlessInboundHandshake(
         co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
     }
     if (use_vision &&
-        (!receiver.stream_settings.IsTlsLike() ||
+        (!(receiver.stream_settings.IsTlsLike() || decryption != nullptr) ||
          receiver.stream_settings.network_mode != NetworkMode::Tcp)) {
         LOG_CONN_WARN(ctx, "request rejected from {}:{} > flow '{}' requires raw TCP TLS-like transport",
                       client_ip, ctx.inbound.source_port, request.flow);
@@ -338,13 +379,9 @@ CompleteVlessInboundHandshake(
 
     const auto& profile = user_info->profile;
     ctx.content.speed_limit = profile.speed_limit;
-    auto user_session = co_await validator.TryConnectSession(
-        tag, profile.user_id, ctx.inbound.source_ip, profile.device_limit);
+    auto user_session = co_await proxy::TryAcquireInboundUserSession(
+        validator, tag, profile.user_id, profile.device_limit, ctx);
     if (!user_session) {
-        LOG_CONN_DEBUG(ctx, "connection rejected from {}:{} > device limit={} domain_online_devices={}",
-            ctx.inbound.source_ip, ctx.inbound.source_port, profile.device_limit,
-            validator.OnlineDeviceCount(tag, static_cast<uint64_t>(profile.user_id)));
-        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "device limit"));
         co_return tl::unexpected(ErrorCode::PERMISSION_DENIED);
     }
 
@@ -352,24 +389,10 @@ CompleteVlessInboundHandshake(
     // by the request body or Vision's per-session UUID state.
     user_info.reset();
 
-    Network net = Network::TCP;
-    if (request.command == ::acpp::vless::Command::UDP) {
-        net = Network::UDP;
-    } else if (request.command == ::acpp::vless::Command::MUX) {
-        net = Network::MUX;
-    }
-    const bool packet_addr_udp =
-        request.command == ::acpp::vless::Command::UDP &&
-        ::acpp::vless::IsPacketAddrMagic(request.target);
-    ctx.outbound.original_target = request.target;
-    ctx.outbound.target = std::move(request.target);
-    ctx.content.network = net;
     if (issued_ticket) {
         try {
-            if (!co_await ::acpp::vless::AuthenticateVlessTicket(
-                    decryption, std::string(tag), std::move(*issued_ticket), request.uuid)) {
-                co_return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
-            }
+            (void)co_await ::acpp::vless::AuthenticateVlessTicket(
+                decryption, std::string(tag), std::move(*issued_ticket), request.uuid);
         } catch (const WorkerMailboxFull&) {
             co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
         } catch (const IoSystemError&) {
@@ -410,11 +433,10 @@ proxy::vless::inbound::Handler::Process(
     uint32_t pressure_idle_timeout) {
     const std::string_view tag = ctx.inbound.tag;
     const std::string_view client_ip = ctx.inbound.source_ip;
-    ctx.inbound.user_id = 0;
-    ctx.inbound.user_email.clear();
-
     auto fail = [&](ErrorCode error) {
-        stats_->OnError();
+        if (error != ErrorCode::CANCELLED && error != ErrorCode::SOCKET_EOF) {
+            stats_->OnError();
+        }
         RelayResult result;
         result.error = error;
         return result;
@@ -426,11 +448,7 @@ proxy::vless::inbound::Handler::Process(
         return fail(error);
     };
 
-    if (limiter_ && ctx.inbound.HasProxyProtocolClientIP() &&
-        co_await limiter_->IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {
-        LOG_CONN_DEBUG(ctx, "connection rejected from {}:{} > IP banned",
-                       ctx.inbound.source_ip, ctx.inbound.source_port);
-        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "IP banned"));
+    if (co_await proxy::CheckInboundIpBanned(limiter_, ctx)) {
         co_return fail_abortive(ErrorCode::BLOCKED);
     }
 
@@ -532,16 +550,6 @@ proxy::vless::inbound::Handler::Process(
 }  // namespace acpp
 
 namespace {
-class VlessRuntime final : public acpp::proxyman::inbound::ProtocolRuntime {
-public:
-    [[nodiscard]] std::vector<acpp::OnlineDevice>
-    GetOnlineDevices(std::string_view tag) const override {
-        return validator.GetOnlineDevices(tag);
-    }
-
-    acpp::UserOnlineTracker validator;
-};
-
 class VlessSettings final
     : public acpp::proxyman::inbound::ProtocolSettings {
 public:
@@ -553,13 +561,35 @@ public:
     return dynamic_cast<const VlessSettings*>(req.settings.get());
 }
 
+[[nodiscard]] std::optional<acpp::proxyman::inbound::PreparedVlessUser>
+BuildPreparedVlessUser(
+    std::string_view uuid,
+    std::string_view flow,
+    const std::string& email,
+    int64_t user_id = 0,
+    uint64_t speed_limit = 0,
+    uint32_t device_limit = 0) {
+    auto uuid_bytes = acpp::vless::ParseUuidBytes(uuid);
+    if (!uuid_bytes) {
+        return std::nullopt;
+    }
+    acpp::proxyman::inbound::PreparedVlessUser info;
+    info.uuid_bytes = *uuid_bytes;
+    info.flow = acpp::vless::NormalizeFlow(flow);
+    info.profile.email = email;
+    info.profile.user_id = user_id;
+    info.profile.speed_limit = speed_limit;
+    info.profile.device_limit = device_limit;
+    return info;
+}
+
 const bool kVlessInboundRegistered = [] {
     acpp::proxyman::inbound::ProxyRegistration reg;
     reg.user_protocol = acpp::proxyman::inbound::UserProtocol::Vless;
 
     reg.create_runtime = []() -> std::unique_ptr<
         acpp::proxyman::inbound::ProtocolRuntime> {
-        return std::make_unique<VlessRuntime>();
+        return std::make_unique<acpp::proxy::UserOnlineProtocolRuntime>();
     };
 
     reg.create_tcp_handler =
@@ -568,7 +598,7 @@ const bool kVlessInboundRegistered = [] {
            acpp::ConnectionLimiter* limiter,
            const acpp::proxyman::inbound::BuildRequest& req)
             -> std::unique_ptr<acpp::Inbound> {
-            auto* vless_runtime = dynamic_cast<VlessRuntime*>(&runtime);
+            auto* vless_runtime = dynamic_cast<acpp::proxy::UserOnlineProtocolRuntime*>(&runtime);
             const auto* settings = GetVlessSettings(req);
             if (!vless_runtime || !settings) {
                 return nullptr;
@@ -610,17 +640,16 @@ const bool kVlessInboundRegistered = [] {
             std::vector<acpp::proxyman::inbound::PreparedVlessUser> users;
             users.reserve(config.clients.size());
             for (const auto& client : config.clients) {
-                std::string uuid = client.id.empty() ? client.password : client.id;
-                auto uuid_bytes = acpp::vless::ParseUuidBytes(uuid);
-                if (!uuid_bytes) {
+                const std::string_view uuid =
+                    client.id.empty() ? std::string_view(client.password)
+                                      : std::string_view(client.id);
+                auto user = BuildPreparedVlessUser(
+                    uuid, client.flow, client.email);
+                if (!user) {
                     LOG_WARN("VLESS inbound '{}': invalid static user UUID", tag);
                     return std::nullopt;
                 }
-                acpp::proxyman::inbound::PreparedVlessUser info;
-                info.uuid_bytes = *uuid_bytes;
-                info.flow = acpp::vless::NormalizeFlow(client.flow);
-                info.profile.email = client.email;
-                users.push_back(std::move(info));
+                users.push_back(std::move(*user));
             }
             return acpp::proxyman::inbound::UserSet{std::move(users)};
         };
@@ -632,19 +661,17 @@ const bool kVlessInboundRegistered = [] {
             std::vector<acpp::proxyman::inbound::PreparedVlessUser> users;
             users.reserve(runtime_users.size());
             for (const auto& runtime_user : runtime_users) {
-                const std::string& uuid = runtime_user.credential;
-                auto uuid_bytes = acpp::vless::ParseUuidBytes(uuid);
-                if (!uuid_bytes) {
+                auto user = BuildPreparedVlessUser(
+                    runtime_user.credential,
+                    runtime_user.flow,
+                    runtime_user.email,
+                    runtime_user.user_id,
+                    runtime_user.speed_limit,
+                    runtime_user.device_limit);
+                if (!user) {
                     return std::nullopt;
                 }
-                acpp::proxyman::inbound::PreparedVlessUser info;
-                info.uuid_bytes = *uuid_bytes;
-                info.flow = acpp::vless::NormalizeFlow(runtime_user.flow);
-                info.profile.email = runtime_user.email;
-                info.profile.user_id = runtime_user.user_id;
-                info.profile.speed_limit = runtime_user.speed_limit;
-                info.profile.device_limit = runtime_user.device_limit;
-                users.push_back(std::move(info));
+                users.push_back(std::move(*user));
             }
             return acpp::proxyman::inbound::UserSet{std::move(users)};
         };

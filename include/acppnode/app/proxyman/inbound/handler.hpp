@@ -40,7 +40,13 @@ public:
     // each short HTTP packet upload.
     Handler(inbound::ReceiverSettings receiver, std::unique_ptr<Inbound> proxy,
             ConnectionLimiter& limiter);
+    Handler(std::shared_ptr<const inbound::ReceiverSettings> receiver,
+            std::unique_ptr<Inbound> proxy,
+            ConnectionLimiter& limiter);
     Handler(inbound::ReceiverSettings receiver, ProtocolProvider& provider,
+            ConnectionLimiter& limiter);
+    Handler(std::shared_ptr<const inbound::ReceiverSettings> receiver,
+            ProtocolProvider& provider,
             ConnectionLimiter& limiter);
 
     Handler(const Handler&) = delete;
@@ -49,10 +55,15 @@ public:
     Handler& operator=(Handler&&) = delete;
 
     [[nodiscard]] std::string_view Tag() const noexcept {
-        return receiver_.inbound_tag;
+        return receiver_->inbound_tag;
     }
 
     [[nodiscard]] const inbound::ReceiverSettings& ReceiverSettings() const noexcept {
+        return *receiver_;
+    }
+
+    [[nodiscard]] const std::shared_ptr<const inbound::ReceiverSettings>&
+    SharedReceiverSettings() const noexcept {
         return receiver_;
     }
 
@@ -79,7 +90,7 @@ private:
         session::Context& ctx,
         const std::shared_ptr<ConnectionLimiter::Family>& family);
 
-    inbound::ReceiverSettings receiver_;
+    std::shared_ptr<const inbound::ReceiverSettings> receiver_;
     TransportSecurity security_;
     std::unique_ptr<Inbound> proxy_;
     ProtocolProvider* provider_ = nullptr;

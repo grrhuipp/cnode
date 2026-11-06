@@ -1,10 +1,12 @@
 #include "acppnode/transport/internet/tls_config.hpp"
 
 #include <openssl/mem.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
-#include <cstdio>
+#include <cerrno>
 #include <format>
-#include <memory>
 #include <stdexcept>
 #include <string_view>
 
@@ -16,6 +18,17 @@ namespace {
 // to a device or an unrelated large file from stalling configuration load.
 constexpr std::size_t kMaxTlsPemFileBytes = 1024 * 1024;
 
+struct FileDescriptor {
+    int fd = -1;
+    FileDescriptor() = default;
+    explicit FileDescriptor(int value) noexcept : fd(value) {}
+    FileDescriptor(const FileDescriptor&) = delete;
+    FileDescriptor& operator=(const FileDescriptor&) = delete;
+    ~FileDescriptor() {
+        if (fd >= 0) ::close(fd);
+    }
+};
+
 // The private key passes through here, so the file is read unbuffered into one
 // allocation sized up front: no stdio/stream buffer and no growth copy keeps
 // key bytes outside the returned string, and every error path wipes it.
@@ -24,31 +37,51 @@ std::string ReadTlsPemFile(const std::string& path, std::string_view kind) {
         return std::invalid_argument(
             std::format("cannot read TLS {} file '{}': {}", kind, path, reason));
     };
-    std::unique_ptr<std::FILE, int (*)(std::FILE*)> file(
-        std::fopen(path.c_str(), "rb"), &std::fclose);
-    if (!file) {
+    if (path.find('\0') != std::string::npos) {
         throw std::invalid_argument(
             std::format("cannot open TLS {} file '{}'", kind, path));
     }
-    if (std::setvbuf(file.get(), nullptr, _IONBF, 0) != 0 ||
-        std::fseek(file.get(), 0, SEEK_END) != 0) {
-        throw fail("read error");
+    FileDescriptor file(::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC));
+    if (file.fd < 0) {
+        throw std::invalid_argument(
+            std::format("cannot open TLS {} file '{}'", kind, path));
     }
-    const long size = std::ftell(file.get());
-    if (size < 0 || std::fseek(file.get(), 0, SEEK_SET) != 0) throw fail("read error");
-    if (size == 0) throw fail("empty");
-    if (static_cast<unsigned long>(size) > kMaxTlsPemFileBytes) throw fail("larger than 1 MiB");
+    struct stat st{};
+    if (::fstat(file.fd, &st) != 0) throw fail("read error");
+    if (!S_ISREG(st.st_mode)) throw fail("not a regular file");
+    if (st.st_size < 0) throw fail("read error");
+    if (st.st_size == 0) throw fail("empty");
+    if (static_cast<unsigned long long>(st.st_size) > kMaxTlsPemFileBytes) {
+        throw fail("larger than 1 MiB");
+    }
 
-    std::string contents(static_cast<std::size_t>(size), '\0');
-    const std::size_t read = std::fread(contents.data(), 1, contents.size(), file.get());
+    std::string contents(static_cast<std::size_t>(st.st_size), '\0');
+    std::size_t offset = 0;
+    bool read_error = false;
+    while (offset < contents.size()) {
+        const ssize_t count = ::read(
+            file.fd, contents.data() + offset, contents.size() - offset);
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            read_error = true;
+            break;
+        }
+        if (count == 0) break;
+        offset += static_cast<std::size_t>(count);
+    }
     // One byte more than announced means the file changed while being read.
     char probe = 0;
-    const bool complete = read == contents.size() &&
-        std::fread(&probe, 1, 1, file.get()) == 0 && !std::ferror(file.get());
+    ssize_t extra = 0;
+    if (!read_error && offset == contents.size()) {
+        do {
+            extra = ::read(file.fd, &probe, 1);
+        } while (extra < 0 && errno == EINTR);
+        if (extra < 0) read_error = true;
+    }
     OPENSSL_cleanse(&probe, sizeof(probe));
-    if (!complete) {
+    if (read_error || offset != contents.size() || extra != 0) {
         OPENSSL_cleanse(contents.data(), contents.size());
-        throw fail(std::ferror(file.get()) ? "read error" : "changed while reading");
+        throw fail(read_error ? "read error" : "changed while reading");
     }
     return contents;
 }

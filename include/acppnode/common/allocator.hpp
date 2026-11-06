@@ -380,16 +380,18 @@ public:
                 } else {
                     const bool first_idle = idle_head_ == nullptr;
                     MarkLargeIdle(*chunk);
-                    Purge();
+                    if (!first_idle) Purge();
                     if (first_idle && wakeup_) wakeup_->OnPoolIdle();
                 }
             } else {
+                auto& cls = classes_[chunk->class_index];
+                if (cls.current == chunk) cls.current = nullptr;
                 UnlinkRecyclable(*chunk);
                 chunk->free_head = nullptr;
                 chunk->bump = reinterpret_cast<std::byte*>(chunk) + ChunkLead();
                 const bool first_idle = idle_head_ == nullptr;
                 MarkIdle(*chunk);
-                Purge();
+                if (!first_idle) Purge();
                 if (first_idle && wakeup_) wakeup_->OnPoolIdle();
             }
             return;
@@ -938,13 +940,20 @@ public:
     ThreadLocalAllocator(const ThreadLocalAllocator&) noexcept = default;
     ThreadLocalAllocator& operator=(const ThreadLocalAllocator&) noexcept = default;
     ThreadLocalAllocator(ThreadLocalAllocator&& other) noexcept
-        : ThreadLocalAllocator(static_cast<const ThreadLocalAllocator&>(other)) {}
+        : resource_(other.resource_), lifetime_(std::move(other.lifetime_)) {}
     ThreadLocalAllocator& operator=(ThreadLocalAllocator&& other) noexcept {
-        return *this = static_cast<const ThreadLocalAllocator&>(other);
+        if (this != &other) {
+            resource_ = other.resource_;
+            lifetime_ = std::move(other.lifetime_);
+        }
+        return *this;
     }
     template <class U>
     ThreadLocalAllocator(const ThreadLocalAllocator<U>& other) noexcept
         : resource_(other.resource()), lifetime_(other.lifetime_) {}
+    template <class U>
+    ThreadLocalAllocator(ThreadLocalAllocator<U>&& other) noexcept
+        : resource_(other.resource()), lifetime_(std::move(other.lifetime_)) {}
     template <class U>
     ThreadLocalAllocator(const std::pmr::polymorphic_allocator<U>& other) noexcept
         : ThreadLocalAllocator(other.resource()) {}
@@ -998,21 +1007,27 @@ public:
     explicit RingDeque(std::pmr::memory_resource* resource) noexcept
         : resource_(resource ? resource : CurrentResource()) {}
     explicit RingDeque(const allocator_type& alloc) noexcept
-        : resource_(alloc.resource()) {}
+        : resource_(alloc.resource() ? alloc.resource() : CurrentResource()) {}
 
     RingDeque(const RingDeque& other)
         : resource_(CurrentResource()) {
         if (!other.empty()) {
             Reserve(other.size_);
-            for (std::size_t i = 0; i < other.size_; ++i) {
-                std::construct_at(data_ + size_, other[i]);
-                ++size_;
+            try {
+                for (std::size_t i = 0; i < other.size_; ++i) {
+                    ConstructAt(data_ + size_, other[i]);
+                    ++size_;
+                }
+            } catch (...) {
+                clear();
+                throw;
             }
         }
     }
 
     RingDeque(RingDeque&& other) noexcept
         : resource_(other.resource_)
+        , resource_lifetime_(std::move(other.resource_lifetime_))
         , data_(std::exchange(other.data_, nullptr))
         , head_(std::exchange(other.head_, 0))
         , size_(std::exchange(other.size_, 0))
@@ -1020,14 +1035,19 @@ public:
 
     RingDeque& operator=(const RingDeque& other) {
         if (this != &other) {
-            clear();
+            RingDeque tmp(resource_);
             if (!other.empty()) {
-                Reserve(other.size_);
+                tmp.Reserve(other.size_);
                 for (std::size_t i = 0; i < other.size_; ++i) {
-                    std::construct_at(data_ + size_, other[i]);
-                    ++size_;
+                    tmp.ConstructAt(tmp.data_ + tmp.size_, other[i]);
+                    ++tmp.size_;
                 }
             }
+            clear();
+            data_ = std::exchange(tmp.data_, nullptr);
+            head_ = std::exchange(tmp.head_, 0);
+            size_ = std::exchange(tmp.size_, 0);
+            capacity_ = std::exchange(tmp.capacity_, 0);
         }
         return *this;
     }
@@ -1036,7 +1056,7 @@ public:
         if (this != &other) {
             clear();
             resource_ = other.resource_;
-            resource_lifetime_ = other.resource_lifetime_;
+            resource_lifetime_ = std::move(other.resource_lifetime_);
             data_ = std::exchange(other.data_, nullptr);
             head_ = std::exchange(other.head_, 0);
             size_ = std::exchange(other.size_, 0);
@@ -1077,10 +1097,11 @@ public:
     template <typename... Args>
     T& emplace_back(Args&&... args) {
         if (size_ == capacity_) {
-            Grow();
+            return GrowEmplace(true, std::forward<Args>(args)...);
         }
         const std::size_t idx = (head_ + size_) & (capacity_ - 1);
-        T* ptr = std::construct_at(data_ + idx, std::forward<Args>(args)...);
+        T* ptr = data_ + idx;
+        ConstructAt(ptr, std::forward<Args>(args)...);
         ++size_;
         return *ptr;
     }
@@ -1091,10 +1112,11 @@ public:
     template <typename... Args>
     T& emplace_front(Args&&... args) {
         if (size_ == capacity_) {
-            Grow();
+            return GrowEmplace(false, std::forward<Args>(args)...);
         }
         const std::size_t next_head = (head_ + capacity_ - 1) & (capacity_ - 1);
-        T* ptr = std::construct_at(data_ + next_head, std::forward<Args>(args)...);
+        T* ptr = data_ + next_head;
+        ConstructAt(ptr, std::forward<Args>(args)...);
         head_ = next_head;
         ++size_;
         return *ptr;
@@ -1144,6 +1166,11 @@ public:
     }
 
 private:
+    template <class... Args>
+    void ConstructAt(T* ptr, Args&&... args) {
+        allocator_type(resource_).construct(ptr, std::forward<Args>(args)...);
+    }
+
     void ReleaseStorage() noexcept {
         if (data_) {
             resource_->deallocate(data_, capacity_ * sizeof(T), alignof(T));
@@ -1154,8 +1181,14 @@ private:
     }
 
     void Reserve(std::size_t min_cap) {
+        if (min_cap > std::numeric_limits<std::size_t>::max() / sizeof(T)) {
+            throw std::bad_alloc();
+        }
         std::size_t next_cap = capacity_ ? capacity_ : 4;
         while (next_cap < min_cap) {
+            if (next_cap > (std::numeric_limits<std::size_t>::max() / sizeof(T)) / 2) {
+                throw std::bad_alloc();
+            }
             next_cap *= 2;
         }
         if (next_cap <= capacity_) return;
@@ -1164,7 +1197,7 @@ private:
         std::size_t constructed = 0;
         try {
             for (; constructed < size_; ++constructed) {
-                std::construct_at(
+                ConstructAt(
                     next_data + constructed,
                     std::move_if_noexcept(data_[(head_ + constructed) & (capacity_ - 1)]));
             }
@@ -1186,8 +1219,50 @@ private:
         capacity_ = next_cap;
     }
 
-    void Grow() {
-        Reserve(capacity_ ? capacity_ * 2 : 4);
+    template <typename... Args>
+    T& GrowEmplace(bool at_back, Args&&... args) {
+        if (capacity_ > (std::numeric_limits<std::size_t>::max() / sizeof(T)) / 2) {
+            throw std::bad_alloc();
+        }
+        const std::size_t next_cap = capacity_ ? capacity_ * 2 : 4;
+        if (next_cap > std::numeric_limits<std::size_t>::max() / sizeof(T)) {
+            throw std::bad_alloc();
+        }
+        T* next_data = static_cast<T*>(
+            resource_->allocate(next_cap * sizeof(T), alignof(T)));
+        T* new_elem = next_data + (at_back ? size_ : 0);
+        const std::size_t old_offset = at_back ? 0 : 1;
+        bool new_constructed = false;
+        std::size_t constructed = 0;
+        try {
+            ConstructAt(new_elem, std::forward<Args>(args)...);
+            new_constructed = true;
+            for (; constructed < size_; ++constructed) {
+                ConstructAt(
+                    next_data + old_offset + constructed,
+                    std::move_if_noexcept(data_[(head_ + constructed) & (capacity_ - 1)]));
+            }
+        } catch (...) {
+            for (std::size_t i = 0; i < constructed; ++i) {
+                std::destroy_at(next_data + old_offset + i);
+            }
+            if (new_constructed) {
+                std::destroy_at(new_elem);
+            }
+            resource_->deallocate(next_data, next_cap * sizeof(T), alignof(T));
+            throw;
+        }
+        for (std::size_t i = 0; i < size_; ++i) {
+            std::destroy_at(data_ + ((head_ + i) & (capacity_ - 1)));
+        }
+        if (data_) {
+            resource_->deallocate(data_, capacity_ * sizeof(T), alignof(T));
+        }
+        data_ = next_data;
+        capacity_ = next_cap;
+        head_ = 0;
+        ++size_;
+        return *new_elem;
     }
 
     std::pmr::memory_resource* resource_;

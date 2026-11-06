@@ -9,6 +9,24 @@
 
 namespace acpp {
 
+namespace {
+
+std::vector<std::string> GetUsedRouteRuleTags(
+    const RoutingConfig& routing,
+    const std::vector<std::string> RouteRuleConfig::* field) {
+    std::vector<std::string> tags;
+    for (const auto& rule : routing.rules) {
+        for (const auto& tag : rule.*field) {
+            if (std::ranges::find(tags, tag) == tags.end()) {
+                tags.push_back(tag);
+            }
+        }
+    }
+    return tags;
+}
+
+}  // namespace
+
 bool ValidateConfig(const Config& config) {
     if (config.workers == 0 || config.workers > defaults::kMaxWorkers) {
         LOG_CONSOLE_ERROR("Worker count must be between 1 and {}", defaults::kMaxWorkers);
@@ -20,7 +38,14 @@ bool ValidateConfig(const Config& config) {
         return false;
     }
 
-    if (config.timeouts.handshake == 0 || config.timeouts.dial == 0) {
+    if (config.timeouts.handshake == 0 ||
+        config.timeouts.dial == 0 ||
+        config.timeouts.read == 0 ||
+        config.timeouts.write == 0 ||
+        config.timeouts.idle == 0 ||
+        config.timeouts.uplink_only == 0 ||
+        config.timeouts.downlink_only == 0 ||
+        config.dns.timeout == 0) {
         LOG_CONSOLE_ERROR("Timeout values must be positive");
         return false;
     }
@@ -36,7 +61,7 @@ bool ValidateConfig(const Config& config) {
             return false;
         }
         for (const int node_id : panel.NodeIDs.Values()) {
-            auto key = naming::BuildPanelNodeStatsKey(panel.Name, node_id);
+            auto key = naming::BuildPanelNodeAccountingKey(panel.Name, node_id);
             if (!panel_nodes.insert(key).second) {
                 const PanelLogContext log_context{panel.Name, panel.APIHost, node_id, panel.NodeType};
                 LOG_PANEL_ERROR(log_context, "Duplicate panel node identity");
@@ -90,27 +115,11 @@ bool ValidateConfig(const Config& config) {
 }
 
 std::vector<std::string> GetUsedGeoIPTags(const RoutingConfig& routing) {
-    std::vector<std::string> tags;
-    for (const auto& rule : routing.rules) {
-        for (const auto& tag : rule.geoip) {
-            if (std::ranges::find(tags, tag) == tags.end()) {
-                tags.push_back(tag);
-            }
-        }
-    }
-    return tags;
+    return GetUsedRouteRuleTags(routing, &RouteRuleConfig::geoip);
 }
 
 std::vector<std::string> GetUsedGeoSiteTags(const RoutingConfig& routing) {
-    std::vector<std::string> tags;
-    for (const auto& rule : routing.rules) {
-        for (const auto& tag : rule.geosite) {
-            if (std::ranges::find(tags, tag) == tags.end()) {
-                tags.push_back(tag);
-            }
-        }
-    }
-    return tags;
+    return GetUsedRouteRuleTags(routing, &RouteRuleConfig::geosite);
 }
 
 }  // namespace acpp

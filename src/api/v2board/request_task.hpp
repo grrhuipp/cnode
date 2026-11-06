@@ -6,8 +6,11 @@
 #include <asio/co_spawn.hpp>
 
 #include <chrono>
+#include <exception>
 #include <format>
+#include <optional>
 #include <system_error>
+#include <utility>
 
 namespace acpp::api::v2board::http {
 
@@ -36,21 +39,34 @@ inline net::awaitable<Response> RunRequest(
             throw;
         }
     };
+    const bool throw_if_cancelled = co_await net::this_coro::throw_if_cancelled();
+    co_await net::this_coro::throw_if_cancelled(false);
+    std::optional<Response> result;
+    std::exception_ptr failure;
     try {
-        co_return co_await net::co_spawn(executor, execute(std::move(exchange)),
-            net::cancel_after(timeout, net::use_awaitable));
+        result.emplace(co_await net::co_spawn(executor, execute(std::move(exchange)),
+            net::cancel_after(timeout, net::use_awaitable)));
     } catch (const RequestCancelled&) {
         if (caller_cancellation.cancelled() != net::cancellation_type::none) {
-            throw std::system_error(net::error::operation_aborted);
+            failure = std::make_exception_ptr(std::system_error(net::error::operation_aborted));
+        } else {
+            result.emplace(Response{-1, std::format("HTTP request timed out after {} ms",
+                std::chrono::duration_cast<std::chrono::milliseconds>(timeout).count()), {}, false});
         }
-        co_return Response{-1, std::format("HTTP request timed out after {} ms",
-            std::chrono::duration_cast<std::chrono::milliseconds>(timeout).count()), {}, false};
     } catch (const std::system_error& error) {
-        if (caller_cancellation.cancelled() != net::cancellation_type::none) throw;
-        co_return Response{-1, error.what(), {}, false};
+        if (caller_cancellation.cancelled() != net::cancellation_type::none) {
+            failure = std::current_exception();
+        } else {
+            result.emplace(Response{-1, error.what(), {}, false});
+        }
     } catch (const std::exception& error) {
-        co_return Response{-1, error.what(), {}, false};
+        result.emplace(Response{-1, error.what(), {}, false});
+    } catch (...) {
+        failure = std::current_exception();
     }
+    co_await net::this_coro::throw_if_cancelled(throw_if_cancelled);
+    if (failure) std::rethrow_exception(failure);
+    co_return std::move(*result);
 }
 
 }  // namespace acpp::api::v2board::http

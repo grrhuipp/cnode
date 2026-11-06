@@ -288,7 +288,7 @@ AnyTLS FIN 关闭整个逻辑流：远端 FIN 之前的已接收数据按有界�
 time="2026-11-05T12:30:00+08:00" level=info msg="Panel status: state=ready inbound=ready protocol=vless port=443 network=tcp users=128 rules=12 pull=60s push=60s" Host="https://panel.example.com" ID=1041 Name=main Type=vless
 ```
 
-**访问文件**：只记录访问事实，不带日志级别。`accepted` 的记录时机不变；认证、配额和策略拒绝使用 `rejected` 并说明实际原因。`user:` 是已确认的数字 UID，`email:` 是已有用户标识，不用其冒充 UID；与 UID 完全相同的标识不重复输出。`sendThrough:` 只记录实际连接的本地地址。认证前不记录候选用户，尚无有效目标或出口时不填写虚构值。
+**访问文件**：只记录访问事实，不带日志级别。`accepted` 的记录时机不变；认证、配额和策略拒绝使用 `rejected` 并说明实际原因。认证成功后，flow、设备限制与重放等拒绝保留已确认身份、已解析目标及 network；Mux 子流拒绝使用子流目标，不冒用父连接目标。`user:` 是已确认的数字 UID，`email:` 是已有用户标识，不用其冒充 UID；与 UID 完全相同的标识不重复输出。`sendThrough:` 只记录实际连接的本地地址。认证前不记录候选用户，尚无有效目标或出口时不填写虚构值。
 
 ```text
 2026/11/05 12:30:01.123456 from 192.0.2.10:52000 accepted tcp:example.com:443 [vless-in -> direct] user:123 email:user@example.com sendThrough:198.51.100.2
@@ -301,9 +301,11 @@ time="2026-11-05T12:30:00+08:00" level=info msg="Panel status: state=ready inbou
 2026/11/05 12:30:02.123456 [Warning] [4294967303] proxy/vless/inbound: [vless-in] authentication failed from 192.0.2.10:52001 > no matching user
 ```
 
-控制台普通诊断同样遵守 `loglevel`，连接认证失败不刷控制台；面板警告与错误同时进入控制台和错误文件。控制台 Error 使用 stderr，其余控制台级别使用 stdout。`none` 不隐藏访问事实或致命启动失败。正常 EOF、取消和停机不输出对应 Warning/Error；已到达但未完成的 PROXY 头仍按截断诊断。内存耗尽等 allocation-free 紧急退出保留最小 stderr 文本，避免错误路径再次分配。
+控制台普通诊断同样遵守 `loglevel`，连接认证失败不刷控制台；面板警告与错误同时进入控制台和错误文件。常规控制台 Error 使用 stderr，其余级别使用 stdout；日志后端自身的故障、丢弃与恢复诊断走 stderr。`none` 不隐藏访问事实或致命启动失败。正常 EOF、取消和停机不输出对应 Warning/Error；已到达但未完成的 PROXY 头或加密握手仍按截断诊断，真正的密码学拒绝与超时分别记录。内存耗尽等 allocation-free 紧急退出保留最小 stderr 文本，避免错误路径再次分配。
 
-日志统一转义换行、NUL、ESC 等控制字符，控制台消息同时转义引号与反斜杠；不记录认证 UUID、密码、认证摘要、密钥或原始认证包。HTTP 请求诊断去除 URL 用户信息、query 和 fragment，面板 HTTP 失败不回显响应正文。依赖旧 `[Info]` 控制台前缀、秒级时间或低 32 位连接 ID 的采集规则需迁移，不保留旧格式旁路。
+控制台与文件日志使用独立有界异步输出；慢控制台读者不阻塞 DNS 或 Worker，停机不等待读者排空管道。访问／错误文件分别检测写入、刷新与关闭故障，失败和恢复经控制台报告，不连带停用另一通道；恢复由后续真实日志触发，不空闲轮询或伪造访问记录。队列容量、丢弃与恢复边界见[本地日志规范](docs/local_logging.md#4-文件和后端)。
+
+日志统一转义换行、NUL、ESC 等控制字符，控制台消息同时转义引号与反斜杠；不记录认证 UUID、密码、认证摘要、密钥或原始认证包。HTTP 请求诊断只使用解析后的安全字段，去除 URL 用户信息、query 和 fragment；非法或歧义 URL 使用固定占位，不回显请求行的额外尾部、未经验证的版本或响应 reason phrase。面板 HTTP 失败不回显响应正文。依赖旧 `[Info]` 控制台前缀、秒级时间或低 32 位连接 ID 的采集规则需迁移，不保留旧格式旁路。
 
 ## 运行时状态
 
@@ -329,11 +331,11 @@ IP 字段必须是完整地址：IPv4 使用四段无前导零的十进制格式
 
 连接超时和会话池空闲检查由所属执行域的 TimeoutScheduler 汇聚；原生等待结束后才释放调度器与域。事件嵌入宿主，取消不保留失效节点。限速、Mux 背压和 accept 退避使用可取消等待；协议协程继承当前域 executor，native reactor 不能直接执行用户回调或访问域私有池。
 
-DNSWorker 将多个调用者的并发同域查询合并为一次解析，每个调用者独立取得结果。每个上游复用一个 UDP socket，三次 A 地址采样与 AAAA 查询并发执行，仍保留多地址合并与按顺序切换上游的语义。主控线程只有一层 DNS 缓存；缓存写入分配失败不会丢失已经取得的答案，缓存在完整构建新条目后才淘汰旧条目。
+DNSWorker 将多个调用者的并发同域查询合并为一次服务级解析，每个调用者独立等待、独立取消；首个调用者取消不会终止其他等待者的查询。最后一个等待者退出后取消无用查询，已取消但尚未收束的查询仍占准入容量；停机等待全部查询完成清理。每个上游复用一个 UDP socket，三次 A 地址采样与 AAAA 查询并发执行，仍保留多地址合并与按顺序切换上游的语义。主控线程只有一层 DNS 缓存；缓存写入分配失败不会丢失已经取得的答案，缓存在完整构建新条目后才淘汰旧条目。
 
-DNS 缓存默认容量为 `dns.cacheSize: 10240`，设置为 `0` 可禁用；`minTTL` / `maxTTL` 默认分别为 60 / 3600 秒。仅成功地址结果与无记录结果进入缓存，超时、SERVFAIL、REFUSED 等临时失败不缓存。
+DNS 缓存默认容量为 `dns.cacheSize: 10240`，设置为 `0` 可禁用；`minTTL` / `maxTTL` 默认分别为 60 / 3600 秒。仅成功地址结果与无记录结果进入缓存，超时、SERVFAIL、REFUSED 等临时失败不缓存。A / AAAA 数据长度错误属于 `DNS_FORMAT_ERROR`，不伪装成无记录结果，按既有上游失败策略尝试备用服务器。
 
-DNS 最终解析失败在 `warning` 级别写入 error 日志，记录域名、错误码、`source=upstream` 或 `source=negative cache`，以及最后使用的上游地址／端口和 A、AAAA 查询原因。`NXDOMAIN` 表示域名不存在，`NODATA` 表示响应没有所需地址记录；仅含不支持的记录、服务失败、拒绝、超时与畸形响应分别保留具体原因。负缓存命中保留原始原因，不将所有无记录结果改写成 NXDOMAIN。只要 A 或 AAAA 提供可用地址，解析仍成功；正常取消不记录成解析故障。
+共享上游查询最终失败时，在 `warning` 级别向 error 日志记录一次域名、错误码、`source=upstream`、最后使用的上游地址／端口及 A、AAAA 查询原因。`NXDOMAIN` 表示域名不存在，`NODATA` 表示响应没有所需地址记录；仅含不支持的记录、服务失败、拒绝、超时与畸形响应分别保留具体原因。负缓存命中保留原始原因而不逐连接刷 Warning；在到期、刷新、恢复、淘汰或停机时以 `info` 汇总 `event`、`hits`、`suppressed` 和原始原因，计数只包含负缓存命中，不包含共享查询等待者。过期条目不再提供答案，仅保留受缓存容量约束的恢复元数据；`cacheSize: 0` 不保留该状态。每条连接的访问拒绝记录仍保留。只要 A 或 AAAA 提供可用地址，解析仍成功；正常取消不记录成解析故障，真实系统异常不伪装成 DNS 无记录错误。
 
 无锁设计的前提是唯一执行租约，而非连接终身固定在接入线程。listener slot 与原生 UDP 监听仍由原 Worker 独占；可迁移宿主、stats shard、allocator 与 buffer provider 只能在所属会话组的租约内访问。跨线程只投递有界元数据／就绪通知或发布只读快照，不共享可并发修改的 live handler。
 

@@ -67,8 +67,14 @@ std::optional<net::ip::address> OutboundBind::BindAddressFor(
     // Same-in-same-out: reuse the inbound local address when it can source
     // a connection to `remote`.
     const auto local = iputil::NormalizeAddress(inbound_local->address());
+    const auto normalized_remote = iputil::NormalizeAddress(remote);
     if (local.is_unspecified() || local.is_loopback() ||
-        local.is_v4() != remote.is_v4()) {
+        normalized_remote.is_unspecified() || normalized_remote.is_loopback() ||
+        local.is_v4() != normalized_remote.is_v4()) {
+        return std::nullopt;
+    }
+    if (local.is_v6() &&
+        (local.to_v6().is_link_local() || normalized_remote.to_v6().is_link_local())) {
         return std::nullopt;
     }
     return local;
@@ -102,14 +108,19 @@ std::optional<OutboundBind> OutboundBind::ParseCandidates(
         const auto slash = text.find('/');
         auto address = iputil::ParseLiteral(text.substr(0, slash));
         if (!address) return std::nullopt;
-        *address = iputil::NormalizeAddress(*address);
-        if (address->is_unspecified() && slash == std::string_view::npos) return std::nullopt;
+        const auto normalized = iputil::NormalizeAddress(*address);
+        if (slash != std::string_view::npos && address->is_v6() != normalized.is_v6()) {
+            return std::nullopt;
+        }
+        *address = normalized;
         entry.is_v6 = address->is_v6();
         const unsigned int max_prefix = entry.is_v6 ? 128 : 32;
         unsigned int prefix = max_prefix;
         if (slash != std::string_view::npos) {
             const auto length = text.substr(slash + 1);
-            if (length.empty()) return std::nullopt;
+            if (length.empty() || (length.size() > 1 && length.front() == '0')) {
+                return std::nullopt;
+            }
             const auto [end, error] = std::from_chars(
                 length.data(), length.data() + length.size(), prefix);
             if (error != std::errc{} || end != length.data() + length.size() ||
@@ -122,6 +133,7 @@ std::optional<OutboundBind> OutboundBind::ParseCandidates(
                     address->to_v6(), static_cast<unsigned short>(prefix)).network())
                 : net::ip::address(net::ip::network_v4(
                     address->to_v4(), static_cast<unsigned short>(prefix)).network());
+        if (entry.network_or_ip.is_unspecified()) return std::nullopt;
         prepared.push_back(std::move(entry));
     }
     bind.entries_ = std::make_shared<const std::vector<Entry>>(std::move(prepared));
@@ -135,8 +147,9 @@ OutboundBind::Selection OutboundBind::Select(
     if (mode_ == Mode::Explicit) return {.address = explicit_address_};
     if (mode_ != Mode::Ordered) return {};
 
+    const auto normalized_remote = iputil::NormalizeAddress(remote);
     for (const auto& entry : *entries_) {
-        if (entry.is_v6 != remote.is_v6()) continue;
+        if (entry.is_v6 != normalized_remote.is_v6()) continue;
         if (entry.prefix_length == (entry.is_v6 ? 128 : 32)) {
             return {.address = entry.network_or_ip};
         }
@@ -149,7 +162,8 @@ OutboundBind::Selection OutboundBind::Select(
                 (static_cast<uint32_t>(key) & ~mask);
             return {.address = net::ip::address_v4(ip)};
         }
-        auto bytes = entry.network_or_ip.to_v6().to_bytes();
+        const auto v6 = entry.network_or_ip.to_v6();
+        auto bytes = v6.to_bytes();
         const uint64_t high = key;
         const uint64_t low = policy_ == ChoicePolicy::Random ? RandomIndex() : MixHash(key);
         for (size_t i = 0; i < bytes.size(); ++i) {
@@ -162,7 +176,7 @@ OutboundBind::Selection OutboundBind::Select(
             const auto suffix = static_cast<uint8_t>(word >> shift);
             bytes[i] = (bytes[i] & mask) | (suffix & static_cast<uint8_t>(~mask));
         }
-        return {.address = net::ip::address_v6(bytes)};
+        return {.address = net::ip::address_v6(bytes, v6.scope_id())};
     }
     return {};
 }

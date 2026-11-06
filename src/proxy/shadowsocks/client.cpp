@@ -2,6 +2,7 @@
 #include "acppnode/common/byte_reader.hpp"
 #include "stream_crypto.hpp"
 #include "client.hpp"
+#include "../handshake_timeout.hpp"
 #include "acppnode/common/address_codec.hpp"
 #include "acppnode/common/allocator.hpp"
 
@@ -90,6 +91,10 @@ public:
         if (out_mb.byte_size() != 0) {
             co_await stream_->WriteMultiBuffer(std::move(out_mb));
         }
+    }
+
+    net::awaitable<void> AsyncShutdownWrite() override {
+        return stream_->AsyncShutdownWrite();
     }
 
 private:
@@ -382,7 +387,8 @@ ReadTCPResponse(const SsCipherInfo& cipher_info,
 
             std::array<uint8_t, 64> server_salt{};
             if (!co_await ReadFull(stream, server_salt.data(), cipher_info.salt_size)) {
-                co_return tl::unexpected(ErrorCode::SOCKET_READ_FAILED);
+                co_return tl::unexpected(
+                    proxy::ResolveHandshakeReadFailure(stream));
             }
 
             std::array<uint8_t, 32> read_subkey{};
@@ -404,7 +410,8 @@ ReadTCPResponse(const SsCipherInfo& cipher_info,
             std::array<uint8_t, kFixedCipherMaxSize> fixed_cipher{};
             const size_t fixed_cipher_size = fixed_plain_size + SsAeadCipher::kTagSize;
             if (!co_await ReadFull(stream, fixed_cipher.data(), fixed_cipher_size)) {
-                co_return tl::unexpected(ErrorCode::SOCKET_READ_FAILED);
+                co_return tl::unexpected(
+                    proxy::ResolveHandshakeReadFailure(stream));
             }
 
             std::array<uint8_t, kFixedPlainMaxSize> fixed_plain{};
@@ -426,40 +433,10 @@ ReadTCPResponse(const SsCipherInfo& cipher_info,
             buf::MultiBuffer pending;
             uint64_t next_nonce = 1;
             if (payload_len > 0) {
-                const size_t payload_cipher_len = payload_len + SsAeadCipher::kTagSize;
-                auto nonce1 = MakeNonce(1);
-                if (payload_cipher_len <= buf::Buffer::kSize &&
-                    payload_len <= buf::Buffer::kSize) {
-                    buf::BufferGuard payload_cipher{buf::Buffer::New()};
-                    buf::BufferGuard payload_plain{buf::Buffer::New()};
-                    if (!payload_cipher || !payload_plain) {
-                        co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
-                    }
-                    if (!co_await ReadFull(
-                            stream,
-                            payload_cipher->Tail().data(),
-                            payload_cipher_len)) {
-                        co_return tl::unexpected(ErrorCode::SOCKET_READ_FAILED);
-                    }
-                    if (!read_cipher.Decrypt(
-                            nonce1.data(),
-                            payload_cipher->Tail().data(),
-                            payload_cipher_len,
-                            payload_plain->Tail().data())) {
-                        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
-                    }
-                    payload_plain->Produce(payload_len);
-                    pending.push_back(std::move(payload_plain));
-                } else {
-                    memory::ByteVector payload_cipher(payload_cipher_len);
-                    if (!co_await ReadFull(stream, payload_cipher.data(), payload_cipher.size())) {
-                        co_return tl::unexpected(ErrorCode::SOCKET_READ_FAILED);
-                    }
-                    if (!read_cipher.BeginDecrypt(nonce1.data()) ||
-                        !detail::DecryptStreamPayload(read_cipher, payload_cipher.data(), payload_len,
-                            payload_cipher.data() + payload_len, pending)) {
-                        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
-                    }
+                if (auto decrypt_res = co_await detail::ReadAndDecryptStreamPayload(
+                        stream, read_cipher, MakeNonce(1), payload_len, pending);
+                    !decrypt_res) {
+                    co_return tl::unexpected(decrypt_res.error());
                 }
                 next_nonce = 2;
             }
@@ -471,7 +448,8 @@ ReadTCPResponse(const SsCipherInfo& cipher_info,
 
         std::array<uint8_t, 64> server_salt{};
         if (!co_await ReadFull(stream, server_salt.data(), cipher_info.salt_size)) {
-            co_return tl::unexpected(ErrorCode::SOCKET_READ_FAILED);
+            co_return tl::unexpected(
+                proxy::ResolveHandshakeReadFailure(stream));
         }
 
         std::array<uint8_t, 64> read_subkey{};
@@ -487,10 +465,12 @@ ReadTCPResponse(const SsCipherInfo& cipher_info,
             std::move(read_cipher), 0, stream);
     } catch (const std::bad_alloc&) {
         co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
-    } catch (const IoSystemError&) {
-        co_return tl::unexpected(ErrorCode::SOCKET_READ_FAILED);
+    } catch (const IoSystemError& e) {
+        co_return tl::unexpected(
+            proxy::ResolveHandshakeReadFailure(
+                stream, MapAsioError(e.code())));
     } catch (...) {
-        co_return tl::unexpected(ErrorCode::SOCKET_READ_FAILED);
+        co_return tl::unexpected(proxy::ResolveHandshakeReadFailure(stream));
     }
 }
 

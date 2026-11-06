@@ -2,6 +2,7 @@
 
 #include "acppnode/common/asio_types.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
+#include "acppnode/common/buffer_util.hpp"
 #include "acppnode/common/error.hpp"
 #include "acppnode/common/target_address.hpp"
 
@@ -182,10 +183,11 @@ template <typename Reader>
             co_return DecodedAddress{std::move(decoded.target), decoded.consumed};
         if (decoded.status == AddressDecodeStatus::Invalid)
             co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
-        auto next = co_await reader.ReadMultiBuffer();
-        if (next.byte_size() == 0)
+        auto next = co_await ReadMultiBufferOrThrowOnCancel(reader);
+        if (next.byte_size() == 0) {
             co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
-        next.MoveTo(pending, true);
+        }
+        pending.AppendAndCoalesce(std::move(next));
     }
 }
 

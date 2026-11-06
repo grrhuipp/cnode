@@ -79,6 +79,24 @@ void UdpFramer::Finish() const {
     }
 }
 
+net::awaitable<buf::MultiBuffer> ReadUdpDatagram(
+    AsyncStream& stream,
+    UdpFramer& framer) {
+    while (true) {
+        FramedUdpPacket packet;
+        if (framer.Next(packet)) {
+            buf::SetUdpDatagramTarget(packet.payload, packet.target);
+            co_return std::move(packet.payload);
+        }
+        buf::MultiBuffer raw = co_await ReadMultiBufferOrThrowOnCancel(stream);
+        if (raw.byte_size() == 0) {
+            framer.Finish();
+            co_return buf::MultiBuffer{};
+        }
+        framer.Feed(std::move(raw));
+    }
+}
+
 net::awaitable<void> WriteUdpDatagram(
     transport::MultiBufferWriter& writer,
     buf::MultiBuffer payload) {
@@ -105,13 +123,7 @@ net::awaitable<void> WriteUdpDatagram(
 
     ConstBufferSpanBuilder<1 + buf::MultiBuffer::kInlineCapacity> framed;
     framed.Append(net::buffer(header.data(), header_size));
-    for (const buf::Buffer* buffer : payload) {
-        if (!buffer || buffer->IsEmpty()) {
-            continue;
-        }
-        const auto bytes = buffer->Bytes();
-        framed.Append(net::buffer(bytes.data(), bytes.size()));
-    }
+    framed.AppendMultiBuffer(payload);
     co_await writer.WriteBuffers(framed.Span());
 }
 
@@ -119,23 +131,20 @@ net::awaitable<void> WriteUdpDatagram(
     transport::MultiBufferWriter& writer,
     const TargetAddress& target,
     std::span<const net::const_buffer> payload) {
-    size_t payload_size = 0;
-    for (const auto& buffer : payload) {
-        if (buffer.size() >
-            std::numeric_limits<uint16_t>::max() - payload_size) {
-            throw IoSystemError(
-                io_error::message_size, "Trojan UDP datagram is too large");
-        }
-        payload_size += buffer.size();
+    const auto payload_size = buf::TrySumBufferSizes(
+        payload, std::numeric_limits<uint16_t>::max());
+    if (!payload_size) {
+        throw IoSystemError(
+            io_error::message_size, "Trojan UDP datagram is too large");
     }
-    if (payload_size == 0) {
+    if (*payload_size == 0) {
         co_return;
     }
 
     std::array<uint8_t, 272> header{};
     const size_t header_size = EncodeUdpPacketHeaderTo(
         target,
-        payload_size,
+        *payload_size,
         header.data(),
         header.size());
     if (header_size == 0) {

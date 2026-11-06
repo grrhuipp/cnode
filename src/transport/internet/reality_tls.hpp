@@ -1,5 +1,6 @@
 #pragma once
 
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/transport/internet/reality_key.hpp"
 #include "acppnode/transport/internet/reality_short_id.hpp"
 #include "acppnode/transport/internet/stream_settings.hpp"
@@ -8,7 +9,6 @@
 #include <memory>
 #include <span>
 #include <string>
-#include <vector>
 #include <openssl/ssl.h>
 #include <openssl/mem.h>
 
@@ -16,7 +16,7 @@ namespace acpp {
 
 class SslContext;
 
-struct RealityClientState {
+struct RealityClientState : memory::ThreadAllocated {
     ~RealityClientState() {
         OPENSSL_cleanse(auth_key.data(), auth_key.size());
         OPENSSL_cleanse(short_id.data(), short_id.size());
@@ -27,17 +27,17 @@ struct RealityClientState {
     std::string server_name;
     std::string spider_x;
     EVP_PKEY* mldsa65_verify_key = nullptr;
-    std::vector<uint8_t> client_hello_raw;
-    std::vector<uint8_t> server_hello_raw;
+    memory::ByteVector client_hello_raw;
+    memory::ByteVector server_hello_raw;
     bool auth_key_ready = false;
 };
 
-struct RealityServerConnState {
+struct RealityServerConnState : memory::ThreadAllocated {
     ~RealityServerConnState() {
         OPENSSL_cleanse(auth_key.data(), auth_key.size());
     }
     std::array<uint8_t, 32> auth_key{};
-    std::vector<uint8_t> client_hello_raw;
+    memory::ByteVector client_hello_raw;
     bool authenticated = false;
 };
 
@@ -54,6 +54,5 @@ void ClearRealityServerConnState(SSL* ssl) noexcept;
 [[nodiscard]] std::unique_ptr<RealityServerConnState>
 VerifyRealityClientHello(
     std::span<const uint8_t> handshake,
-    const SslContext& ctx,
-    std::string* out_sni = nullptr);
+    const SslContext& ctx);
 }  // namespace acpp

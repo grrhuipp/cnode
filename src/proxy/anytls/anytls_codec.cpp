@@ -81,18 +81,23 @@ tl::expected<void, ErrorCode> FrameBatch::Encode(
 
 tl::expected<void, ErrorCode> FrameBatch::Encode(
     uint8_t cmd, uint32_t sid, std::span<const net::const_buffer> input) {
-    size_t non_empty_count = 0;
+    size_t frame_count = 0;
     for (const net::const_buffer& buffer : input) {
         if (buffer.data() && buffer.size() > 0) {
-            ++non_empty_count;
+            frame_count += 1 + (buffer.size() - 1) / kMaxFramePayload;
         }
     }
-    Begin(non_empty_count);
+    Begin(frame_count);
     for (const net::const_buffer& buffer : input) {
         const auto* data = static_cast<const uint8_t*>(buffer.data());
         if (!data || buffer.size() == 0) continue;
-        if (!Append(cmd, sid, std::span<const uint8_t>(data, buffer.size()))) {
-            return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+        std::span<const uint8_t> remaining(data, buffer.size());
+        while (!remaining.empty()) {
+            const size_t chunk_size = std::min(remaining.size(), kMaxFramePayload);
+            if (!Append(cmd, sid, remaining.first(chunk_size))) {
+                return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+            }
+            remaining = remaining.subspan(chunk_size);
         }
     }
     return {};
@@ -347,31 +352,33 @@ WritePaddedBufferFrames(AsyncStream& stream,
                        std::span<const net::const_buffer> buffers) {
 
     size_t payload_bytes = 0;
-    size_t non_empty_count = 0;
+    size_t frame_count = 0;
     for (const net::const_buffer& buffer : buffers) {
         if (buffer.data() && buffer.size() > 0) {
-            if (buffer.size() > kMaxFramePayload) {
-                co_return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
-            }
             payload_bytes += buffer.size();
-            ++non_empty_count;
+            frame_count += 1 + (buffer.size() - 1) / kMaxFramePayload;
         }
     }
 
     memory::ByteVector packet;
-    packet.reserve(payload_bytes + (non_empty_count * kFrameHeaderSize));
+    packet.reserve(payload_bytes + (frame_count * kFrameHeaderSize));
     for (const net::const_buffer& buffer : buffers) {
         const auto* data = static_cast<const uint8_t*>(buffer.data());
         if (!data || buffer.size() == 0) {
             continue;
         }
-        auto ok = AppendFrameBytesTo(
-            packet,
-            cmd,
-            sid,
-            std::span<const uint8_t>(data, buffer.size()));
-        if (!ok) {
-            co_return tl::unexpected(ok.error());
+        std::span<const uint8_t> remaining(data, buffer.size());
+        while (!remaining.empty()) {
+            const size_t chunk_size = std::min(remaining.size(), kMaxFramePayload);
+            auto ok = AppendFrameBytesTo(
+                packet,
+                cmd,
+                sid,
+                remaining.first(chunk_size));
+            if (!ok) {
+                co_return tl::unexpected(ok.error());
+            }
+            remaining = remaining.subspan(chunk_size);
         }
     }
     co_return co_await WritePacketWithPadding(stream, scheme, packet_index, std::move(packet));

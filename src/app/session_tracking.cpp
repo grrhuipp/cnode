@@ -18,6 +18,7 @@ void SessionTrackingState::RegisterActiveSession(
     const bool inserted = entry == accounts_.end();
     if (inserted) {
         entry = accounts_.try_emplace(memory::ThreadLocalString{accounting_key}).first;
+        entry->second.key = entry->first;
     }
     AccountBucket& bucket = entry->second;
     try {
@@ -42,13 +43,23 @@ void SessionTrackingState::RegisterActiveSession(
 
 void SessionTrackingState::UnregisterActiveSession(ActiveSession& node) noexcept {
     if (!node.linked) return;
+    auto* bucket = node.bucket;
     if (node.prev) node.prev->next = node.next;
-    else node.bucket->active_head = node.next;
+    else bucket->active_head = node.next;
     if (node.next) node.next->prev = node.prev;
     auto& account = *node.account;
     account.completed.upload += node.traffic->bytes_up - node.last_reported_up;
     account.completed.download += node.traffic->bytes_down - node.last_reported_down;
     --account.active;
+    if (account.active == 0 && account.completed.upload == 0 &&
+        account.completed.download == 0) {
+        bucket->traffic.erase(node.user_id);
+        if (bucket->traffic.empty()) {
+            if (const auto entry = accounts_.find(bucket->key); entry != accounts_.end()) {
+                accounts_.erase(entry);
+            }
+        }
+    }
     node = {};
 }
 

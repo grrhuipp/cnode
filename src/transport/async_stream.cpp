@@ -1,5 +1,6 @@
 #include "acppnode/transport/async_stream.hpp"
 #include "acppnode/common/allocator.hpp"
+#include "acppnode/common/buffer_util.hpp"
 #include "acppnode/common/memory_stats.hpp"
 #include "acppnode/transport/internet/tcp_stream.hpp"
 
@@ -15,14 +16,21 @@ StreamPhaseDeadline::~StreamPhaseDeadline() noexcept {
 }
 
 PhaseDeadlineHandle StreamPhaseDeadline::Start(std::chrono::seconds timeout) {
-    Clear();
-    if (timeout <= std::chrono::seconds::zero() || !owner_.IsOpen()) return {};
+    ++generation_;
+    expired_ = 0;
+    if (timeout <= std::chrono::seconds::zero() || !owner_.IsOpen()) {
+        scheduler_.Cancel(*this);
+        return {};
+    }
     constexpr auto maximum =
         std::chrono::duration_cast<std::chrono::seconds>(std::chrono::milliseconds::max());
     const auto delay = timeout >= maximum
         ? std::chrono::milliseconds::max()
         : std::chrono::duration_cast<std::chrono::milliseconds>(timeout);
-    if (!scheduler_.ScheduleAfter(delay, *this)) return {};
+    if (!scheduler_.ScheduleAfter(delay, *this)) {
+        scheduler_.Cancel(*this);
+        return {};
+    }
     return {&expired_, 1, &generation_, generation_};
 }
 
@@ -45,18 +53,22 @@ void StreamPhaseDeadline::OnTimeout() noexcept {
 // ============================================================================
 // AsyncStream::WriteMultiBuffer - 默认实现
 //
-// 逐个 Buffer 调用 AsyncWrite，写完后释放。
-// TcpStream override 使用 scatter-write (writev) 将多个 Buffer 合并为单次系统调用。
+// 将 MultiBuffer 展开为 const_buffer 视图序列转发至 WriteBuffers，完成后释放。
 // ============================================================================
 net::awaitable<void> AsyncStream::WriteMultiBuffer(buf::MultiBuffer mb) {
-
-    for (auto* b : mb) {
-        auto bytes = b->Bytes();
-        if (bytes.empty()) continue;
-
-        // AsyncWrite 保证写完整个 buffer（内部循环）
-        co_await AsyncWrite(net::const_buffer(bytes.data(), bytes.size()));
+    if (mb.byte_size() == 0) {
+        mb.clear();
+        co_return;
     }
+    ConstBufferSpanBuilder<buf::MultiBuffer::kInlineCapacity> buffers;
+    buffers.AppendMultiBuffer(mb);
+    try {
+        co_await WriteBuffers(buffers.Span());
+    } catch (...) {
+        mb.clear();
+        throw;
+    }
+    mb.clear();
 }
 
 net::awaitable<void> AsyncStream::WriteBuffers(
@@ -90,6 +102,7 @@ void AsyncStream::SetWriteTimeout(std::chrono::seconds timeout) {
 
 
 void AsyncStream::SetAbortiveClose(bool enable) noexcept {
+    if (LogicalPhaseDeadline()) return;
     if (auto* tcp = BaseTcpStream()) {
         tcp->SetAbortiveClose(enable);
     }

@@ -271,13 +271,7 @@ void parse_http_headers(const json::object& j,
 }
 
 std::string_view TrimRoutingListItem(std::string_view value) noexcept {
-    while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) {
-        value.remove_prefix(1);
-    }
-    while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) {
-        value.remove_suffix(1);
-    }
-    return value;
+    return transport::internet::TrimHttpOws(value);
 }
 
 uint16_t ParseRoutingPortNumber(std::string_view value,
@@ -368,6 +362,10 @@ void AppendRoutingPortField(const json::object& object,
         return;
     }
     if (value->is_array()) {
+        if (value->as_array().empty()) {
+            throw std::invalid_argument(std::format(
+                "routing {} must not be empty", key));
+        }
         for (const auto& item : value->as_array()) {
             AppendRoutingPortValue(out, item, key);
         }
@@ -412,6 +410,11 @@ LogConfig LogConfig::FromJson(const json::object& j) {
 
     cfg.rotate_daily = JsonBoolOr(j, "rotateDaily", cfg.rotate_daily);
     cfg.gzip = JsonBoolOr(j, "gzip", cfg.gzip);
+
+    if (Log::ResolveTargetPath(cfg.log_dir, cfg.error_path, "error", cfg.rotate_daily) ==
+        Log::ResolveTargetPath(cfg.log_dir, cfg.access_path, "access", cfg.rotate_daily)) {
+        throw std::invalid_argument("log access and error paths must be distinct");
+    }
     return cfg;
 }
 
@@ -511,8 +514,11 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
 
     // 域名匹配 - 处理 xray 格式 (domain 数组可能包含 geosite:xxx, full:xxx 等)
     if (j.contains("domain")) {
-        for (std::string val : JsonStringArrayOrEmpty(j, "domain")) {
-
+        auto arr = JsonStringArrayOrEmpty(j, "domain");
+        if (arr.empty()) {
+            throw std::invalid_argument("routing domain must not be empty");
+        }
+        for (std::string& val : arr) {
             // 解析前缀
             if (val.substr(0, 8) == "geosite:") {
                 rule.geosite.push_back(RequireRoutingSelector(
@@ -540,6 +546,10 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
     // 独立的域名字段
     if (j.contains("domainSuffix")) {
         auto arr = JsonStringArrayOrEmpty(j, "domainSuffix");
+        if (arr.empty()) {
+            throw std::invalid_argument(
+                "routing domainSuffix must not be empty");
+        }
         for (auto& value : arr) {
             rule.domain_suffix.push_back(RequireRoutingDomainName(
                 std::move(value), "suffix"));
@@ -547,6 +557,10 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
     }
     if (j.contains("domainKeyword")) {
         auto arr = JsonStringArrayOrEmpty(j, "domainKeyword");
+        if (arr.empty()) {
+            throw std::invalid_argument(
+                "routing domainKeyword must not be empty");
+        }
         for (auto& value : arr) {
             rule.domain_keyword.push_back(RequireRoutingDomainKeyword(
                 std::move(value)));
@@ -554,6 +568,10 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
     }
     if (j.contains("domainFull")) {
         auto arr = JsonStringArrayOrEmpty(j, "domainFull");
+        if (arr.empty()) {
+            throw std::invalid_argument(
+                "routing domainFull must not be empty");
+        }
         for (auto& value : arr) {
             rule.domain_full.push_back(RequireRoutingDomainName(
                 std::move(value), "full"));
@@ -564,6 +582,10 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
     }
     if (j.contains("domainRegex")) {
         auto arr = JsonStringArrayOrEmpty(j, "domainRegex");
+        if (arr.empty()) {
+            throw std::invalid_argument(
+                "routing domainRegex must not be empty");
+        }
         for (auto& value : arr) {
             rule.domain_regex.push_back(RequireRoutingDomainRegexp(
                 std::move(value)));
@@ -583,8 +605,11 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
 
     // IP 匹配 - 处理 xray 格式 (ip 数组可能包含 geoip:xxx)
     if (j.contains("ip")) {
-        for (std::string val : JsonStringArrayOrEmpty(j, "ip")) {
-
+        auto arr = JsonStringArrayOrEmpty(j, "ip");
+        if (arr.empty()) {
+            throw std::invalid_argument("routing ip must not be empty");
+        }
+        for (std::string& val : arr) {
             if (val.substr(0, 6) == "geoip:") {
                 rule.geoip.push_back(RequireRoutingSelector(
                     val.substr(6), "geoip tag", true));
@@ -921,7 +946,18 @@ RealityConfig RealityConfig::FromJson(const json::object& j) {
         throw std::invalid_argument(
             "REALITY xver 1 and 2 require dest for PROXY protocol forwarding");
     }
+    const auto is_valid_reality_server_name = [](std::string_view name) noexcept {
+        return !name.empty() && !iputil::ParseLiteral(name) &&
+               domain::IsValidDnsHostname(
+                   name, domain::TrailingDotPolicy::Forbid);
+    };
     cfg.server_names = JsonStringArrayOrEmpty(j, "serverNames");
+    for (const auto& name : cfg.server_names) {
+        if (!name.empty() && !is_valid_reality_server_name(name)) {
+            throw std::invalid_argument(
+                "REALITY serverNames contains an invalid hostname");
+        }
+    }
     const std::string private_key =
         JsonStringOr(j, "privateKey", "");
     if (!private_key.empty()) {
@@ -930,6 +966,8 @@ RealityConfig RealityConfig::FromJson(const json::object& j) {
             throw std::invalid_argument("REALITY privateKey is invalid");
         }
         cfg.private_key = *parsed;
+    } else if (j.contains("privateKey")) {
+        throw std::invalid_argument("realitySettings.privateKey must not be empty");
     }
     const auto short_ids = JsonStringArrayOrEmpty(j, "shortIds");
     cfg.short_ids.reserve(short_ids.size());
@@ -1003,8 +1041,14 @@ RealityConfig RealityConfig::FromJson(const json::object& j) {
             throw std::invalid_argument("REALITY fingerprint is invalid");
         }
         cfg.fingerprint = std::move(*normalized);
+    } else if (j.contains("fingerprint")) {
+        throw std::invalid_argument("realitySettings.fingerprint must not be empty");
     }
     cfg.server_name = JsonStringOr(j, "serverName", "");
+    if (j.contains("serverName") &&
+        !is_valid_reality_server_name(cfg.server_name)) {
+        throw std::invalid_argument("REALITY serverName is invalid");
+    }
     const std::string public_key = JsonStringOr(j, "publicKey", "");
     if (!public_key.empty()) {
         auto parsed = transport::internet::ParseRealityKey(public_key);
@@ -1012,6 +1056,8 @@ RealityConfig RealityConfig::FromJson(const json::object& j) {
             throw std::invalid_argument("REALITY publicKey is invalid");
         }
         cfg.public_key = *parsed;
+    } else if (j.contains("publicKey")) {
+        throw std::invalid_argument("realitySettings.publicKey must not be empty");
     }
     auto short_id = transport::internet::ParseRealityShortId(
         JsonStringOr(j, "shortId", ""));
@@ -1090,11 +1136,15 @@ StreamSettings StreamSettings::FromJson(
                 throw std::invalid_argument(
                     "tls certificates must be an array");
             }
+            if (certificates->as_array().empty()) {
+                throw std::invalid_argument(
+                    "tls certificates must not be empty");
+            }
             if (certificates->as_array().size() > 1) {
                 throw std::invalid_argument(
                     "multiple TLS certificates are not supported");
             }
-            if (!certificates->as_array().empty()) {
+            {
                 const auto& entry = certificates->as_array()[0];
                 if (!entry.is_object()) {
                     throw std::invalid_argument(
@@ -1299,6 +1349,9 @@ StaticInboundConfig StaticInboundConfig::FromJson(const json::object& j) {
         if (p->is_string()) {
             cfg.tags.push_back(std::string(p->as_string()));
         } else if (p->is_array()) {
+            if (p->as_array().empty()) {
+                throw std::invalid_argument("static inbound tag array must not be empty");
+            }
             for (const auto& item : p->as_array()) {
                 if (!item.is_string()) {
                     throw std::invalid_argument("static inbound tag array must contain only strings");
@@ -1349,6 +1402,15 @@ StaticInboundConfig StaticInboundConfig::FromJson(const json::object& j) {
         cfg.sniffing.route_only = JsonBoolOr(*sniffing, "routeOnly", true);
         cfg.sniffing.domains_excluded =
             JsonStringArrayOrEmpty(*sniffing, "domainsExcluded");
+        for (auto& excluded : cfg.sniffing.domains_excluded) {
+            if (!domain::IsValidDnsHostname(
+                    excluded, domain::TrailingDotPolicy::Allow)) {
+                throw std::invalid_argument(std::format(
+                    "sniffing domainsExcluded contains invalid DNS hostname '{}'",
+                    excluded));
+            }
+            domain::NormalizeDnsHostnameInPlace(excluded);
+        }
         cfg.sniffing.dest_override = 0;
         for (auto& protocol : JsonStringArrayOrEmpty(*sniffing, "destOverride")) {
             protocol = naming::LowerAscii(std::move(protocol));
@@ -1439,7 +1501,7 @@ std::optional<Config> ParseConfig(const json::object& j) {
         return cfg;
 
     } catch (const std::exception& e) {
-        LOG_CONSOLE_ERROR("Failed to parse config: {}", e.what());
+        Log::WriteConsole(LogLevel::ERROR, std::format("Failed to parse config: {}", e.what()));
         return std::nullopt;
     }
 }

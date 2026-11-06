@@ -20,15 +20,7 @@ struct HostPortView {
 };
 
 [[nodiscard]] std::string_view TrimOws(std::string_view value) noexcept {
-    while (!value.empty() &&
-           (value.front() == ' ' || value.front() == '\t')) {
-        value.remove_prefix(1);
-    }
-    while (!value.empty() &&
-           (value.back() == ' ' || value.back() == '\t')) {
-        value.remove_suffix(1);
-    }
-    return value;
+    return transport::internet::TrimHttpOws(value);
 }
 
 [[nodiscard]] bool ParsePort(std::string_view text, uint16_t& port) noexcept {
@@ -43,6 +35,10 @@ struct HostPortView {
     return true;
 }
 
+static constexpr std::array<std::string_view, 9> kHttpMethods{
+    "GET", "POST", "PUT", "DELETE", "HEAD",
+    "OPTIONS", "PATCH", "CONNECT", "TRACE"};
+
 [[nodiscard]] bool IsSupportedRequestLine(std::string_view line) noexcept {
     const size_t first_space = line.find(' ');
     if (first_space == std::string_view::npos || first_space == 0) return false;
@@ -53,11 +49,8 @@ struct HostPortView {
         return false;
     }
 
-    static constexpr std::array<std::string_view, 9> kMethods{
-        "GET", "POST", "PUT", "DELETE", "HEAD",
-        "OPTIONS", "PATCH", "CONNECT", "TRACE"};
     const std::string_view method = line.substr(0, first_space);
-    if (std::ranges::find(kMethods, method) == kMethods.end()) return false;
+    if (std::ranges::find(kHttpMethods, method) == kHttpMethods.end()) return false;
 
     const std::string_view target =
         line.substr(first_space + 1, second_space - first_space - 1);
@@ -67,6 +60,60 @@ struct HostPortView {
 
     const std::string_view version = line.substr(second_space + 1);
     return version == "HTTP/1.0" || version == "HTTP/1.1";
+}
+
+[[nodiscard]] bool IsValidRequestLinePrefix(std::string_view prefix) noexcept {
+    if (prefix.empty()) return false;
+    const bool trailing_cr = prefix.back() == '\r';
+    if (trailing_cr) prefix.remove_suffix(1);
+    if (prefix.empty()) return false;
+    for (const unsigned char character : prefix) {
+        if (character < 0x20 || character == 0x7f) return false;
+    }
+    if (trailing_cr) {
+        return IsSupportedRequestLine(prefix);
+    }
+
+    const size_t first_space = prefix.find(' ');
+    if (first_space == std::string_view::npos) {
+        return std::ranges::any_of(kHttpMethods, [&](std::string_view method) {
+            return method.starts_with(prefix);
+        });
+    }
+    if (first_space == 0) return false;
+    const std::string_view method = prefix.substr(0, first_space);
+    if (std::ranges::find(kHttpMethods, method) == kHttpMethods.end()) return false;
+
+    const size_t second_space = prefix.find(' ', first_space + 1);
+    if (second_space == std::string_view::npos) {
+        return true;
+    }
+    if (second_space == first_space + 1 ||
+        prefix.find(' ', second_space + 1) != std::string_view::npos) {
+        return false;
+    }
+    const std::string_view version_prefix = prefix.substr(second_space + 1);
+    return std::string_view("HTTP/1.0").starts_with(version_prefix) ||
+           std::string_view("HTTP/1.1").starts_with(version_prefix);
+}
+
+[[nodiscard]] bool IsValidHeaderLinePrefix(std::string_view prefix) noexcept {
+    if (prefix.empty()) return true;
+    const bool trailing_cr = prefix.back() == '\r';
+    if (trailing_cr) prefix.remove_suffix(1);
+    if (prefix.empty()) return true;
+    if (prefix.front() == ' ' || prefix.front() == '\t') return false;
+
+    const size_t colon = prefix.find(':');
+    if (colon == std::string_view::npos) {
+        if (trailing_cr) return false;
+        return transport::internet::IsValidHttpHeaderName(prefix);
+    }
+    if (colon == 0) return false;
+    const std::string_view name = prefix.substr(0, colon);
+    const std::string_view value = TrimOws(prefix.substr(colon + 1));
+    return transport::internet::IsValidHttpHeaderName(name) &&
+           transport::internet::IsValidHttpHeaderValue(value);
 }
 
 [[nodiscard]] std::optional<HostPortView> ParseHostValue(
@@ -115,57 +162,66 @@ struct HostPortView {
     return parsed;
 }
 
+}  // namespace
+
 // Single pass over CRLF-terminated lines: the request line, then header fields
-// until the empty line. An unterminated header block yields no result.
-[[nodiscard]] std::optional<HostPortView> ParseHttpHost(
-    std::string_view request) {
+// until the empty line. An unterminated but valid prefix requests more bytes.
+SniffResult SniffHttp(std::span<const uint8_t> data) {
+    SniffResult result;
+    const std::string_view request(
+        unsafe::ptr_cast<const char>(data.data()), data.size());
     size_t line_end = request.find("\r\n");
-    if (line_end == std::string_view::npos ||
-        !IsSupportedRequestLine(request.substr(0, line_end))) {
-        return std::nullopt;
+    if (line_end == std::string_view::npos) {
+        if (IsValidRequestLinePrefix(request)) {
+            result.need_more = true;
+            result.protocol = constants::protocol::kHttp;
+        }
+        return result;
+    }
+    if (!IsSupportedRequestLine(request.substr(0, line_end))) {
+        return result;
     }
 
     std::optional<HostPortView> host;
     for (size_t position = line_end + 2;; position = line_end + 2) {
         line_end = request.find("\r\n", position);
-        if (line_end == std::string_view::npos) return std::nullopt;
+        if (line_end == std::string_view::npos) {
+            if (IsValidHeaderLinePrefix(request.substr(position))) {
+                result.need_more = true;
+                result.protocol = constants::protocol::kHttp;
+            }
+            return result;
+        }
         const std::string_view line =
             request.substr(position, line_end - position);
-        if (line.empty()) return host;
+        if (line.empty()) {
+            if (host) {
+                result.success = true;
+                result.protocol = constants::protocol::kHttp;
+                result.domain.assign(host->host);
+                result.port = host->port;
+            }
+            return result;
+        }
         // obs-fold is rejected (RFC 9112 §5.2).
-        if (line.front() == ' ' || line.front() == '\t') return std::nullopt;
+        if (line.front() == ' ' || line.front() == '\t') return result;
 
         const size_t colon = line.find(':');
         if (colon == std::string_view::npos || colon == 0) {
-            return std::nullopt;
+            return result;
         }
         const std::string_view name = line.substr(0, colon);
         const std::string_view value = TrimOws(line.substr(colon + 1));
         if (!transport::internet::IsValidHttpHeaderName(name) ||
             !transport::internet::IsValidHttpHeaderValue(value)) {
-            return std::nullopt;
+            return result;
         }
         if (!transport::internet::EqualsAsciiCI(name, "host")) continue;
         // RFC 9112 §3.2: more than one Host field is a bad request.
-        if (host) return std::nullopt;
+        if (host) return result;
         host = ParseHostValue(value);
-        if (!host) return std::nullopt;
+        if (!host) return result;
     }
-}
-
-}  // namespace
-
-SniffResult SniffHttp(std::span<const uint8_t> data) {
-    SniffResult result;
-    const auto host_port = ParseHttpHost(std::string_view(
-        unsafe::ptr_cast<const char>(data.data()), data.size()));
-    if (host_port) {
-        result.success = true;
-        result.protocol = constants::protocol::kHttp;
-        result.domain.assign(host_port->host);
-        result.port = host_port->port;
-    }
-    return result;
 }
 
 }  // namespace acpp

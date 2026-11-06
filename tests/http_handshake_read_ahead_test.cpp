@@ -1,4 +1,5 @@
 #include "acppnode/common/allocator.hpp"
+#include "acppnode/infra/log.hpp"
 #include "acppnode/transport/internet/tcp_stream.hpp"
 #include "acppnode/transport/internet/tls_stream.hpp"
 #include "acppnode/transport/internet/tls_config.hpp"
@@ -14,7 +15,9 @@
 #include <asio/steady_timer.hpp>
 #include <asio/write.hpp>
 #include <array>
+#include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -949,6 +952,187 @@ void HttpBoundaryCases() {
             ChunkExtensionBody(body, false, multi_buffer);
     }
 }
+
+class CloseHttpLogStream final : public acpp::InboundTransportStreamHandler {
+public:
+    net::awaitable<void> OnInboundTransportStream(
+        std::unique_ptr<acpp::AsyncStream> stream, acpp::InboundTransportMetadata) override {
+        stream->Close();
+        co_return;
+    }
+};
+
+// Observe actual transport responses and emitted diagnostics together. The
+// logger must not silently "fix" protocol input to achieve redaction.
+void HttpLogHandshake(std::string_view network, bool outbound,
+                      std::string_view line, bool accepted,
+                      std::string_view path = "/up",
+                      std::string_view host = "localhost") {
+    net::io_context io;
+    acpp::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
+    acpp::tcp::socket socket(io), peer(io);
+    socket.connect(acceptor.local_endpoint());
+    acceptor.accept(peer);
+    auto raw = std::make_unique<acpp::TcpStream>(std::move(socket));
+    raw->SetIdleTimeout(2s);
+    acpp::StreamSettings settings;
+    settings.network = network;
+    settings.http.path = settings.http_upgrade.path = settings.ws.path =
+        settings.xhttp.path = path;
+    settings.http.method = "GET";
+    settings.xhttp.mode = acpp::XHttpMode::Auto;
+    if (outbound) {
+        settings.http.host = settings.http_upgrade.host = host;
+        settings.ws.headers.emplace("Host", host);
+    }
+    settings = acpp::NormalizeStreamSettings(settings);
+    std::exception_ptr error;
+    size_t completed = 0;
+    auto finish = [&](std::exception_ptr failure) {
+        if (failure && !error) { error = failure; io.stop(); }
+        ++completed;
+    };
+    auto wire = [&]() -> net::awaitable<void> {
+        std::string request;
+        if (outbound) {
+            char byte;
+            do {
+                co_await net::async_read(peer, net::buffer(&byte, 1), net::use_awaitable);
+                request += byte;
+            } while (!request.ends_with("\r\n\r\n"));
+            Require(request.find(path) != std::string::npos,
+                    "HTTP log redaction changed the outbound request target");
+        }
+        std::string message(line);
+        message += "\r\nHost: ";
+        message += host;
+        message += "\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n"
+                   "Sec-WebSocket-Version: 13\r\n"
+                   "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                   "User-Agent: http://user:review_password@example.com/?token=review_token#review_fragment\r\n"
+                   "Content-Length: 0\r\n";
+        if (outbound && network == "ws") {
+            const auto key = acpp::transport::internet::TrimAscii(
+                acpp::transport::internet::ExtractHeaderValueCI(request, "Sec-WebSocket-Key"));
+            message += "Sec-WebSocket-Accept: " + acpp::ws::ComputeWsAccept(key) + "\r\n";
+        }
+        message += "\r\n";
+        co_await net::async_write(peer, net::buffer(message), net::use_awaitable);
+        peer.shutdown(acpp::tcp::socket::shutdown_send);
+        if (!outbound && accepted) {
+            std::string response;
+            char byte;
+            do {
+                co_await net::async_read(peer, net::buffer(&byte, 1), net::use_awaitable);
+                response += byte;
+            } while (!response.ends_with("\r\n\r\n"));
+            Require(response.starts_with(network == "ws" || network == "httpupgrade"
+                        ? "HTTP/1.1 101 " : "HTTP/1.1 200 "),
+                    "HTTP log redaction changed handshake response");
+        }
+    };
+    auto product = [&]() -> net::awaitable<void> {
+        acpp::TransportBuildResult built;
+        if (outbound) {
+            built = co_await acpp::BuildOutboundTransport(std::move(raw), settings, nullptr);
+        } else {
+            const std::shared_ptr<acpp::InboundTransportStreamHandler> sink =
+                network == "xhttp" ? std::make_shared<CloseHttpLogStream>() : nullptr;
+            built = co_await acpp::BuildInboundTransport(io, std::move(raw), settings, nullptr, 0, sink);
+        }
+        Require(built.has_value() == accepted, "HTTP log redaction changed request acceptance");
+        if (built && *built) (*built)->Close();
+    };
+    net::co_spawn(io, wire(), finish);
+    net::co_spawn(io, product(), finish);
+    io.run();
+    if (error) std::rethrow_exception(error);
+    Require(completed == 2, "HTTP log redaction handshake stalled");
+}
+
+void HttpLogRedaction() {
+    auto name = (std::filesystem::temp_directory_path() / "cnode-http-logs-XXXXXX").string();
+    Require(::mkdtemp(name.data()) != nullptr, "HTTP log test directory creation failed");
+    const std::filesystem::path directory(name);
+    try {
+        Require(acpp::Log::Init("trace", directory, 1, {}, "error.log", false, false),
+                "HTTP log test initialization failed");
+        constexpr std::string_view secret_url =
+            "http://user:review_password@example.com/?token=review_token#review_fragment";
+        for (const std::string_view network : {"http", "httpupgrade", "ws", "xhttp"}) {
+            const std::string method = network == "xhttp" ? "POST" : "GET";
+            const std::string target = network == "xhttp" ? "/up/" : "/up";
+            const std::string start = method + " " + target;
+            HttpLogHandshake(network, false, start + " HTTP/1.1", true);
+            HttpLogHandshake(network, false, method + "   " + target + "   HTTP/1.1", true);
+            HttpLogHandshake(network, false,
+                start + " HTTP/1.1 " + std::string(secret_url), network != "ws");
+            // WS tolerates extra tokens when the final version is HTTP/1.1.
+            HttpLogHandshake(network, false,
+                start + " HTTP/1.1 " + std::string(secret_url) + " HTTP/1.1", true);
+            HttpLogHandshake(network, false, start, false);
+            HttpLogHandshake(network, false, start + " ", network != "ws");
+            HttpLogHandshake(network, false,
+                start + " " + std::string(secret_url), network != "ws");
+            HttpLogHandshake(network, false,
+                start + " HTTP/1.review_password?review_token#review_fragment", network != "ws");
+            HttpLogHandshake(network, false,
+                start + "?token=review_token#review_fragment HTTP/1.1", network != "ws");
+            HttpLogHandshake(network, false,
+                start + " HTTP/1.1", true, "/up", secret_url);
+            for (const std::string_view invalid_target : {
+                    "http://user:review_password@example.com/up?token=review_token#review_fragment",
+                    "//user:review_password@example.com/up?token=review_token#review_fragment",
+                    "///user:review_password@example.com/up?token=review_token#review_fragment",
+                    "http:///user:review_password@example.com/up?token=review_token#review_fragment",
+                    "http://user:review_password@/up?token=review_token#review_fragment",
+                    "http:/user:review_password@example.com/up?token=review_token#review_fragment",
+                    "/up\nforged_log_line?token=review_token#review_fragment"}) {
+                HttpLogHandshake(network, false, method + " " + std::string(invalid_target) + " HTTP/1.1", false);
+            }
+            HttpLogHandshake(network, false,
+                std::string(secret_url) + " " + target + " HTTP/1.1", false);
+        }
+        HttpLogHandshake("xhttp", false,
+            "GET /up/session#review_fragment HTTP/1.1", true);
+        for (const std::string_view network : {"http", "httpupgrade", "ws"}) {
+            HttpLogHandshake(network, true, std::string("HTTP/1.1 400 ") + std::string(secret_url), false);
+            const std::string response = network == "http" ? "HTTP/1.1 200 OK" : "HTTP/1.1 101 Switching Protocols";
+            HttpLogHandshake(network, true, response, true,
+                "http://user:review_password@example.com/up?token=review_token#review_fragment",
+                secret_url);
+            HttpLogHandshake(network, true, response, true,
+                "http:///user:review_password@example.com/up?token=review_token#review_fragment");
+            HttpLogHandshake(network, true, response, true, "/public/@name?token=review_token#review_fragment");
+        }
+        acpp::Log::Shutdown();
+        std::ifstream input(directory / "error.log");
+        Require(input.is_open(), "HTTP diagnostics were not written");
+        std::string diagnostics;
+        for (std::string line; std::getline(input, line);) {
+            for (unsigned char ch : line)
+                Require(ch >= 0x20 && ch != 0x7f, "HTTP diagnostic contains a raw control character");
+            diagnostics += line + '\n';
+        }
+        for (const std::string_view secret : {
+                "review_password", "review_token", "review_fragment", "forged_log_line"})
+            Require(diagnostics.find(secret) == std::string::npos, "HTTP diagnostics leaked untrusted input");
+        for (const std::string_view marker : {
+                "HTTPUpgrade server request line='GET /up HTTP/1.1'",
+                "WebSocket server rejected path mismatch",
+                "XHTTP server H1 request line='POST /up/ HTTP/1.1'",
+                "XHTTP server split downlink ready session=session ",
+                "client request rejected", "WebSocket client upgrade rejected",
+                "[invalid HTTP target]", "[invalid version]", "[invalid method]",
+                "example.com/up", "/public/@name"})
+            Require(diagnostics.find(marker) != std::string::npos, "HTTP diagnostic coverage missing");
+    } catch (...) {
+        acpp::Log::Shutdown();
+        std::filesystem::remove_all(directory);
+        throw;
+    }
+    std::filesystem::remove_all(directory);
+}
 }  // namespace
 
 int main() {
@@ -965,6 +1149,7 @@ int main() {
                 TlsReadTermination(multi_buffer, clean);
         WsProtocolBoundaries();
         HttpBoundaryCases();
+        HttpLogRedaction();
         for (bool outbound : {false, true})
             for (bool tls : {false, true})
                 for (bool upgrade : {false, true})

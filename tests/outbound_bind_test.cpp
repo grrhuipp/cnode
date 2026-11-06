@@ -79,11 +79,17 @@ int main() {
         make_address("2602:2b5:20:111::1234") ||
         exact->Select(remote_v4, "client", 80).address) return 13;
 
-    for (const std::string_view bad : {"", "auto", "0.0.0.0", "192.0.2.0/33",
+    for (const std::string_view bad : {"", "auto", "0.0.0.0", "0.0.0.0/32", "::/128",
+                                       "0.0.0.0/24", "192.0.2.1/0", "::ffff:192.0.2.0/24",
+                                       "127.0.0.0/024", "192.0.2.0/33",
                                        "2001:db8::/129", "127.0.0.1/24x", "not-ip/24"}) {
         const std::array<std::string_view, 1> candidate{bad};
         if (acpp::OutboundBind::ParseCandidates(candidate, Policy::SourceHash)) return 14;
     }
+    const acpp::tcp::endpoint public_inbound(make_address("192.0.2.10"), 443);
+    if (automatic->BindAddressFor(&public_inbound, make_address("127.0.0.1"))) return 18;
+    const acpp::tcp::endpoint link_local_inbound(make_address("fe80::1"), 443);
+    if (automatic->BindAddressFor(&link_local_inbound, remote_v6)) return 19;
     if (acpp::OutboundBind::ParseCandidates(
             std::span<const std::string_view>{}, Policy::SourceHash)) return 15;
 

@@ -2,21 +2,21 @@
 
 #include "acppnode/app/dns/dns.hpp"
 #include "acppnode/common/allocator.hpp"
+#include "../../common/awaitable_task_group.hpp"
 
 #include <asio/as_tuple.hpp>
 #include <asio/experimental/channel.hpp>
 #include <asio/use_awaitable.hpp>
 
+#include <exception>
 #include <memory>
 #include <optional>
 #include <string_view>
-#include <type_traits>
 
 namespace acpp::app::dns {
 
-// All access, coroutine resumes and destruction belong to one Worker. A shared
-// pending result owns the completion channel; no waiter pointers escape into
-// the registry and cancellation removes only the cancelling receive operation.
+// Executor-local service ownership: callers subscribe, never own the query.
+// Retired generations remain counted until their query has actually unwound.
 class InflightResolves {
     struct Pending {
         Pending(net::io_context& io_context, std::string_view name)
@@ -25,29 +25,58 @@ class InflightResolves {
         memory::ThreadLocalString domain;
         SignalChannel completion;
         std::optional<DnsResult> result;
+        std::exception_ptr failure;
+        transport::CancellationSource cancellation;
+        size_t waiters = 0;
     };
     using PendingPtr = std::shared_ptr<Pending>;
     using Table = memory::ThreadLocalUnorderedMap<std::string_view, PendingPtr>;
 
-    struct Completion {
-        Table& table;
-        Pending& pending;
+    void Remove(Pending& pending) noexcept {
+        const auto found = table_.find(std::string_view(pending.domain));
+        if (found != table_.end() && found->second.get() == &pending) table_.erase(found);
+    }
 
-        ~Completion() noexcept {
-            table.erase(std::string_view(pending.domain));
-            if (!pending.result) {
-                static_assert(std::is_nothrow_default_constructible_v<DnsResult>);
-                pending.result.emplace();
-                pending.result->error = ErrorCode::DNS_RESOLVE_FAILED;
+    struct Subscription {
+        InflightResolves& owner;
+        Pending& pending;
+        ~Subscription() noexcept {
+            if (--pending.waiters == 0 && !pending.result && !pending.failure) {
+                // Unlink before cancellation: a new caller must start a fresh
+                // generation, and late completion may not erase that entry.
+                owner.Remove(pending);
+                pending.cancellation.Stop();
             }
-            // Closing broadcasts to every outstanding receive. No result
-            // copies or per-waiter allocations occur on the completion path.
-            pending.completion.close();
         }
     };
 
+    template <typename Query>
+    net::awaitable<void> Execute(PendingPtr pending, Query query) {
+        DnsResult result;
+        std::exception_ptr failure;
+        try {
+            result = co_await query(std::string_view(pending->domain));
+        } catch (const IoSystemError& error) {
+            if (error.code() == io_error::operation_aborted) {
+                result.error = ErrorCode::CANCELLED;
+            } else {
+                failure = std::current_exception();
+            }
+        } catch (...) {
+            failure = std::current_exception();
+        }
+        if (!pending->result) {
+            if (failure) pending->failure = std::move(failure);
+            else pending->result.emplace(std::move(result));
+        }
+        Remove(*pending);
+        --active_;
+        pending->completion.close();
+    }
+
 public:
-    explicit InflightResolves(net::io_context& io_context) : io_context_(io_context) {}
+    explicit InflightResolves(net::io_context& io_context, size_t capacity)
+        : io_context_(io_context), capacity_(capacity), tasks_(io_context.get_executor()) {}
     InflightResolves(const InflightResolves&) = delete;
     InflightResolves& operator=(const InflightResolves&) = delete;
 
@@ -59,6 +88,12 @@ public:
             pending->result->error = ErrorCode::CANCELLED;
             pending->completion.close();
         }
+        tasks_.Tasks().Cancel();
+    }
+
+    net::awaitable<void> AsyncJoin() {
+        RequestStop();
+        co_await tasks_.AsyncJoin();
     }
 
     template <typename Query>
@@ -68,42 +103,49 @@ public:
             cancelled.error = ErrorCode::CANCELLED;
             co_return cancelled;
         }
+        PendingPtr pending;
         if (const auto found = table_.find(domain); found != table_.end()) {
-            auto pending = found->second;
-            (void)co_await pending->completion.async_receive(
-                net::as_tuple(net::use_awaitable));
-            if (pending->result) co_return *pending->result;
-
-            DnsResult cancelled;
-            cancelled.error = ErrorCode::CANCELLED;
-            co_return cancelled;
-        }
-
-        auto pending = std::allocate_shared<Pending>(
-            memory::ThreadLocalAllocator<Pending>{}, io_context_, domain);
-        table_.emplace(std::string_view(pending->domain), pending);
-        Completion completion{table_, *pending};
-
-        // Move the authoritative result once. Any failure before this point
-        // still removes the entry and signals subscribers through Completion.
-        static_assert(std::is_nothrow_move_constructible_v<DnsResult>);
-        try {
-            auto result = co_await query();
-            if (!stopping_) pending->result.emplace(std::move(result));
-        } catch (const IoSystemError& error) {
-            if (error.code() == io_error::operation_aborted) {
-                pending->result.emplace();
-                pending->result->error = ErrorCode::CANCELLED;
+            pending = found->second;
+        } else {
+            if (active_ >= capacity_) {
+                DnsResult rejected;
+                rejected.error = ErrorCode::RESOURCE_EXHAUSTED;
+                co_return rejected;
             }
-            throw;
+            pending = std::allocate_shared<Pending>(
+                memory::ThreadLocalAllocator<Pending>{}, io_context_, domain);
+            table_.emplace(std::string_view(pending->domain), pending);
+            ++active_;
+            try {
+                tasks_.Tasks().Spawn(Execute(pending, std::move(query)), &pending->cancellation);
+            } catch (...) {
+                --active_;
+                Remove(*pending);
+                throw;
+            }
         }
-        co_return *pending->result;
+        ++pending->waiters;
+        Subscription subscription{*this, *pending};
+        if (!pending->result && !pending->failure) {
+            (void)co_await pending->completion.async_receive(net::as_tuple(net::use_awaitable));
+        }
+        const auto cancellation = co_await net::this_coro::cancellation_state;
+        if (cancellation.cancelled() == net::cancellation_type::none) {
+            if (pending->failure) std::rethrow_exception(pending->failure);
+            if (pending->result) co_return *pending->result;
+        }
+        DnsResult cancelled;
+        cancelled.error = ErrorCode::CANCELLED;
+        co_return cancelled;
     }
 
 private:
     net::io_context& io_context_;
     Table table_;
+    size_t capacity_;
+    size_t active_ = 0;
     bool stopping_ = false;
+    ResidentTaskGroup tasks_;
 };
 
 }  // namespace acpp::app::dns

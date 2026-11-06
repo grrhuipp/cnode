@@ -4,6 +4,7 @@
 #include "vmess_cipher.hpp"
 #include "vmess_crypto.hpp"
 #include "acppnode/transport/internet/tcp_stream.hpp"
+#include "acppnode/app/proxyman/inbound/prepared_config.hpp"
 
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/cancellation_signal.hpp>
@@ -411,8 +412,25 @@ void TestAuthenticationFailure(vmess::Security security, uint8_t options,
     }
     Check(reset, "resumed VMess read suppressed an authentication failure");
     Check(ReadReady(connection, *reader).empty(), "VMess authentication failure was not permanent");
+    // Corrupted EOF chunk authentication tag must be rejected as connection_reset.
+    {
+        Connection eof_connection;
+        vmess::TimedUserValidator eof_validator;
+        vmess::encoding::ServerSession eof_session(eof_validator, "eof-auth-failure-test");
+        eof_session.SetRequest(request);
+        auto eof_reader = eof_session.DecodeRequestBody(eof_connection.stream);
+        auto eof_wire = encoder.Encode({});
+        eof_wire[encoder.HeaderSize()] ^= 0x80;
+        eof_connection.stream.PrependReadData(eof_wire);
+        bool eof_reset = false;
+        try {
+            static_cast<void>(ReadReady(eof_connection, *eof_reader));
+        } catch (const IoSystemError& error) {
+            eof_reset = error.code() == io_error::connection_reset;
+        }
+        Check(eof_reset, "corrupted VMess EOF chunk authentication tag was accepted");
+    }
 }
-
 void TestEncryptedCancellation() {
     const std::array<vmess::Security, 2> securities{
         vmess::Security::AES_128_GCM, vmess::Security::CHACHA20_POLY1305};
@@ -497,6 +515,68 @@ void TestResponseAuthenticatedLength(vmess::Security security) {
     Check(offset == wire.size(), "VMess response carried unexpected trailing bytes");
 }
 
+void TestAuthenticatedHeaderFailure() {
+    using namespace proxyman::inbound;
+    constexpr auto tag = "vmess-header-classification";
+    PreparedVmessUser user;
+    user.uuid = "11111111-1111-4111-8111-111111111111";
+    user.auth_key.fill(0x19);
+    user.cmd_key.fill(0x27);
+    user.profile.user_id = 73;
+    user.profile.email = "header@example.test";
+    auto snapshot = UserStore::PrepareUsers(tag, UserSet{PreparedVmessUsers{user}});
+    auto view = UserStore::PrepareWorkerView(snapshot);
+    UserStore::CommitSnapshot(std::move(snapshot));
+    UserStore::InstallWorkerView(std::move(view));
+    vmess::TimedUserValidator validator;
+
+    for (int fault = 0; fault != 3; ++fault) {
+        std::array<uint8_t, 49> plain{};
+        plain[0] = 1;
+        plain[35] = static_cast<uint8_t>(vmess::Security::NONE);
+        plain[37] = static_cast<uint8_t>(vmess::Command::UDP);
+        plain[38] = 0;
+        plain[39] = 53;
+        plain[40] = 1;
+        plain[41] = 1; plain[42] = 1; plain[43] = 1; plain[44] = 1;
+        const uint32_t checksum = vmess::FNV1a32(plain.data(), 45) ^ (fault == 1 ? 1u : 0u);
+        for (size_t i = 0; i != 4; ++i) {
+            plain[45 + i] = static_cast<uint8_t>(checksum >> (24 - i * 8));
+        }
+        std::array<uint8_t, 42 + 49 + 16> wire{};
+        const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        vmess::GenerateAuthID(vmess::ExpandAuthIDEncryptKey(user.auth_key), now, wire.data());
+        const std::span<const uint8_t, 16> auth_id(wire.data(), 16);
+        const std::span<const uint8_t, 8> nonce(wire.data() + 34, 8);
+        const auto length_key = vmess::RequestHeaderLengthKey(user.cmd_key, auth_id, nonce);
+        const auto payload_key = vmess::RequestHeaderPayloadKey(user.cmd_key, auth_id, nonce);
+        const std::array<uint8_t, 2> length{0, static_cast<uint8_t>(plain.size())};
+        Check(vmess::AES128GCMEncrypt(length_key.key.data(), length_key.nonce.data(),
+                  auth_id.data(), auth_id.size(), length.data(), length.size(),
+                  wire.data() + 16, wire.data() + 18), "failed to seal header length");
+        Check(vmess::AES128GCMEncrypt(payload_key.key.data(), payload_key.nonce.data(),
+                  auth_id.data(), auth_id.size(), plain.data(), plain.size(),
+                  wire.data() + 42, wire.data() + 42 + plain.size()), "failed to seal header");
+        if (fault == 2) wire.back() ^= 1;
+        vmess::encoding::ServerSession session(validator, tag);
+        auto [request, consumed] = session.DecodeRequestHeader(wire.data(), wire.size());
+        const auto* rejected = session.AuthenticatedRejectedHeader();
+        if (fault == 0) {
+            Check(request && request->user && request->user->profile.user_id == 73 &&
+                  consumed == wire.size() && !rejected, "valid header lost authenticated identity");
+        } else if (fault == 1) {
+            Check(!request && rejected && rejected->user->profile.user_id == 73 &&
+                  rejected->target.SameEndpoint(TargetAddress("1.1.1.1", 53)) &&
+                  rejected->command == vmess::Command::UDP,
+                  "authenticated malformed header lost verified identity or parsed target");
+        } else {
+            Check(!request && !rejected, "unauthenticated header exposed trusted identity");
+        }
+    }
+    UserStore::ClearWorkerView();
+}
+
 }  // namespace
 
 int main() {
@@ -548,6 +628,7 @@ int main() {
         [&] { vmess::ValidateFixedUdpDatagram(wrong, target); },
         "wrong fixed VMess UDP endpoint was accepted");
 
+    TestAuthenticatedHeaderFailure();
     TestEncryptedCancellation();
     TestResponseAuthenticatedLength(vmess::Security::AES_128_GCM);
     TestResponseAuthenticatedLength(vmess::Security::CHACHA20_POLY1305);

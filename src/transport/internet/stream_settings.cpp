@@ -51,6 +51,9 @@ namespace {
     case NetworkMode::HttpUpgrade:
         return settings.http_upgrade.host.empty()
             ? header_host(settings.http_upgrade.headers) : settings.http_upgrade.host;
+    case NetworkMode::Http:
+        return settings.http.host.empty()
+            ? header_host(settings.http.headers) : settings.http.host;
     case NetworkMode::Grpc:
         return settings.grpc.authority;
     case NetworkMode::XHttp:
@@ -80,6 +83,9 @@ void NormalizeInPlace(StreamSettings& settings) {
         settings.security_mode = SecurityMode::Reality;
         settings.tls.min_version = TlsVersion::V1_3;
         settings.tls.max_version = TlsVersion::V1_3;
+        if (settings.tls.server_name.empty() && !settings.reality.server_name.empty()) {
+            settings.tls.server_name = settings.reality.server_name;
+        }
     } else {
         settings.security_mode = SecurityMode::Unsupported;
     }

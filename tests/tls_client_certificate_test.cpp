@@ -288,6 +288,27 @@ int main() {
                  "DNS SAN certificate must verify for its configured identity")) {
         return 19;
     }
+    // FQDN with trailing root dot must strip the dot for SNI (RFC 6066) and X.509 SAN host verification.
+    SSL* fqdn_client = SSL_new(context->Native());
+    if (!Require(fqdn_client != nullptr &&
+                     acpp::ConfigureTlsServerIdentity(fqdn_client, "client.example."),
+                 "FQDN server identity with trailing dot must be configured")) {
+        if (fqdn_client) SSL_free(fqdn_client);
+        return 34;
+    }
+    const char* fqdn_sni = SSL_get_servername(fqdn_client, TLSEXT_NAMETYPE_host_name);
+    const bool fqdn_verified = VerifyCertificate(
+        material->Certificate(), SSL_get0_param(fqdn_client));
+    if (!Require(fqdn_sni != nullptr && std::string_view(fqdn_sni) == "client.example",
+                 "FQDN trailing root dot must be stripped from SNI")) {
+        SSL_free(fqdn_client);
+        return 35;
+    }
+    SSL_free(fqdn_client);
+    if (!Require(fqdn_verified,
+                 "FQDN with trailing root dot must verify against certificate SAN")) {
+        return 36;
+    }
 
     std::vector<unsigned char> alpn_wire;
     const std::vector<std::string> valid_alpn = {"h2", "http/1.1"};

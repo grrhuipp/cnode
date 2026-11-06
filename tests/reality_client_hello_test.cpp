@@ -63,5 +63,10 @@ int main() {
         if (!Require(invalid.State() == Reader::Status::Invalid && invalid.Hello().empty(),
                      "invalid record header rejects without reading/allocating payload")) return 1;
     }
+    Reader probe;
+    const std::array<uint8_t, 1> http_get{'G'};
+    probe.Append(http_get);
+    if (!Require(probe.State() == Reader::Status::Invalid,
+                 "1-byte non-TLS probe must fail immediately without waiting for 5 bytes")) return 1;
     return 0;
 }

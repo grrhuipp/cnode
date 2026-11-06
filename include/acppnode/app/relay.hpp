@@ -65,12 +65,15 @@ void CancelIfSupported(Endpoint& endpoint) noexcept {
 }
 
 template <typename Writer, typename Control>
-net::awaitable<void> ShutdownWriteForClose(Writer& writer, Control& control) {
+net::awaitable<void> ShutdownWriteForClose(
+    Writer& writer, Control& control, bool preserve_phase_deadline = false) {
     if constexpr (requires { control.SetWriteTimeout(kRelayCloseGraceTimeout); }) {
         control.SetWriteTimeout(kRelayCloseGraceTimeout);
     }
-    if constexpr (requires { control.StartPhaseDeadline(kRelayCloseGraceTimeout); }) {
-        (void)control.StartPhaseDeadline(kRelayCloseGraceTimeout);
+    if (!preserve_phase_deadline) {
+        if constexpr (requires { control.StartPhaseDeadline(kRelayCloseGraceTimeout); }) {
+            (void)control.StartPhaseDeadline(kRelayCloseGraceTimeout);
+        }
     }
     try {
         if constexpr (requires { writer.AsyncShutdownWrite(); }) {
@@ -81,10 +84,14 @@ net::awaitable<void> ShutdownWriteForClose(Writer& writer, Control& control) {
             control.ShutdownWrite();
         }
     } catch (...) {
-        if constexpr (requires { control.ClearPhaseDeadline(); }) control.ClearPhaseDeadline();
+        if (!preserve_phase_deadline) {
+            if constexpr (requires { control.ClearPhaseDeadline(); }) control.ClearPhaseDeadline();
+        }
         throw;
     }
-    if constexpr (requires { control.ClearPhaseDeadline(); }) control.ClearPhaseDeadline();
+    if (!preserve_phase_deadline) {
+        if constexpr (requires { control.ClearPhaseDeadline(); }) control.ClearPhaseDeadline();
+    }
 }
 
 inline ErrorCode CaptureFailure(ErrorCode unknown = ErrorCode::INTERNAL) noexcept {
@@ -275,14 +282,24 @@ net::awaitable<RelayResult> DoRelayLink(
                         state.Complete();
                         break;
                     }
+                    if (!peer.eof) {
+                        arm_half_close(upload ? config.downlink_only : config.uplink_only);
+                        if (state.Ending()) break;
+                    }
                     if (action == transport::EofAction::ShutdownPeerWrite) {
                         operation_side_is_client = !upload;
                         writing = true;
-                        if (control) co_await relay_detail::ShutdownWriteForClose(writer, *control);
-                        else co_await relay_detail::ShutdownWriteForClose(writer, writer);
+                        const bool preserve_phase_deadline =
+                            upload && !peer.eof && state.phase == RelayPhase::HalfClosed;
+                        if (control) {
+                            co_await relay_detail::ShutdownWriteForClose(
+                                writer, *control, preserve_phase_deadline);
+                        } else {
+                            co_await relay_detail::ShutdownWriteForClose(
+                                writer, writer, preserve_phase_deadline);
+                        }
                         current.write_shutdown = true;
                     }
-                    if (!peer.eof) arm_half_close(upload ? config.downlink_only : config.uplink_only);
                     break;
                 }
                 const auto count = payload.byte_size();
@@ -348,24 +365,50 @@ net::awaitable<RelayResult> DoRelayLink(
     target.ClearPhaseDeadline();
 
     if (state.reason == ErrorCode::OK) {
+        bool client_shutdown_timed_out = false;
         auto shutdown = [&](auto& writer, auto* control, bool already_shutdown) -> net::awaitable<void> {
             if (already_shutdown) co_return;
             try {
                 if (control) co_await relay_detail::ShutdownWriteForClose(writer, *control);
                 else co_await relay_detail::ShutdownWriteForClose(writer, writer);
+            } catch (const transport::WriteClosed&) {
             } catch (...) {
                 // Capture each child's original cause before the join can wrap
                 // simultaneous failures in asio::multiple_exceptions.
                 const auto error = relay_detail::CaptureFailure(ErrorCode::RELAY_WRITE_FAILED);
-                state.Stop(cancellation.ConsumeTimeout() ? ErrorCode::RELAY_TIMEOUT : error);
+                state.Stop((client_shutdown_timed_out || cancellation.ConsumeTimeout())
+                               ? ErrorCode::RELAY_TIMEOUT
+                               : error);
             }
         };
+        auto shutdown_client = [&]() -> net::awaitable<void> {
+            if (!client_control && !state.down.write_shutdown) {
+                AsyncDelay delay(io_context);
+                auto wait_grace = [&]() -> net::awaitable<void> {
+                    co_await delay.WaitFor(relay_detail::kRelayCloseGraceTimeout);
+                    const auto cancellation = co_await net::this_coro::cancellation_state;
+                    if (cancellation.cancelled() == net::cancellation_type::none) {
+                        client_shutdown_timed_out = true;
+                    }
+                };
+                (void)co_await (
+                    shutdown(client_writer, client_control, state.down.write_shutdown) ||
+                    wait_grace());
+                if (client_shutdown_timed_out) {
+                    state.Stop(ErrorCode::RELAY_TIMEOUT);
+                }
+                co_return;
+            }
+            co_await shutdown(client_writer, client_control, state.down.write_shutdown);
+        };
         try {
-            co_await (shutdown(client_writer, client_control, state.down.write_shutdown) &&
+            co_await (shutdown_client() &&
                       shutdown(target, &target, state.up.write_shutdown));
         } catch (...) {
             const auto error = relay_detail::CaptureFailure();
-            state.Stop(cancellation.ConsumeTimeout() ? ErrorCode::RELAY_TIMEOUT : error);
+            state.Stop((client_shutdown_timed_out || cancellation.ConsumeTimeout())
+                           ? ErrorCode::RELAY_TIMEOUT
+                           : error);
         }
     }
     // Our own final Cancel/Close notifications are not an external failure.

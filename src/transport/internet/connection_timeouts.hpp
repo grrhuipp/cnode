@@ -53,11 +53,23 @@ public:
     }
 
     [[nodiscard]] PhaseDeadlineHandle StartPhaseDeadline(std::chrono::seconds timeout) {
-        ClearPhaseDeadline();
-        if (stopped_ || timeout <= std::chrono::seconds::zero()) return {};
-        phase_deadline_ = Deadline(timeout);
+        ++phase_generation_;
         phase_expired_ = false;
-        Reconcile();
+        UpdateFlags();
+        if (stopped_ || timeout <= std::chrono::seconds::zero()) {
+            phase_deadline_.reset();
+            ReconcileNoThrow();
+            return {};
+        }
+        phase_deadline_ = Deadline(timeout);
+        armed_deadline_.reset();
+        try {
+            Reconcile();
+        } catch (...) {
+            phase_deadline_.reset();
+            ReconcileNoThrow();
+            throw;
+        }
         return {&flags_, kPhaseMask, &phase_generation_, phase_generation_};
     }
 
@@ -74,6 +86,9 @@ public:
     [[nodiscard]] bool ConsumeWriteTimeout() noexcept { return Consume(write_expired_); }
     [[nodiscard]] bool ConsumePhaseDeadline() noexcept { return Consume(phase_expired_); }
 
+    [[nodiscard]] bool IsPending(bool is_read) const noexcept {
+        return is_read ? read_pending_ : write_pending_;
+    }
     void BeginRead() {
         CheckCanBegin(read_pending_);
         read_pending_ = true;
@@ -168,9 +183,11 @@ private:
         // Earlier waits can safely wake later deadlines; avoid churn when idle
         // activity moves its deadline forward.
         if (Valid() && armed_deadline_ && *armed_deadline_ <= first) return;
-        scheduler_.Cancel(*this);
         armed_deadline_.reset();
-        if (!scheduler_.ScheduleAfter(DelayUntil(first), *this)) return;
+        if (!scheduler_.ScheduleAfter(DelayUntil(first), *this)) {
+            scheduler_.Cancel(*this);
+            return;
+        }
         armed_deadline_ = first;
     }
     void ReconcileNoThrow() noexcept {

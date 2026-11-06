@@ -44,6 +44,11 @@ struct PanelLogContext {
 // Xray text records. Diagnostic macros obey the configured severity.
 // Direct WriteConsole(ERROR) keeps fatal startup failures visible even at none.
 // Access facts are independent of severity and never contain credentials.
+// Console uses an independent bounded mailbox (256 records, at most 4096
+// encoded bytes each); full/oversized/unwritable records are counted and
+// reported on stderr. Pipe output is atomic and never waits for a reader.
+// Shutdown joins both writers; Flush asynchronously requests file flushing.
+// Failed file channels recover on later records with 1–30s bounded backoff.
 class Log {
 public:
     [[nodiscard]] static bool Init(const std::string& level,
@@ -53,6 +58,13 @@ public:
                                    const std::filesystem::path& error_path = {},
                                    bool rotate_daily = true,
                                    bool gzip = true);
+
+    [[nodiscard]] static std::filesystem::path ResolveTargetPath(
+        const std::filesystem::path& log_dir,
+        const std::filesystem::path& configured_path,
+        std::string_view fallback_prefix,
+        bool rotate_daily,
+        std::string_view date = "0000-00-00");
 
     static void Shutdown();
     static void Flush();

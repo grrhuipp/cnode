@@ -6,6 +6,7 @@
 #include <optional>
 #include <span>
 #include <openssl/aead.h>
+#include <openssl/mem.h>
 
 namespace acpp::vless {
 
@@ -53,6 +54,7 @@ public:
         if (initialized_) {
             EVP_AEAD_CTX_cleanup(&aead_ctx_);
         }
+        OPENSSL_cleanse(&aead_ctx_, sizeof(aead_ctx_));
     }
 
     VlessEncryptionAead(const VlessEncryptionAead&) = delete;
@@ -65,6 +67,7 @@ public:
         if (other.initialized_ && EVP_AEAD_CTX_copy(&aead_ctx_, &other.aead_ctx_) == 1) {
             initialized_ = true;
             EVP_AEAD_CTX_cleanup(&other.aead_ctx_);
+            OPENSSL_cleanse(&other.aead_ctx_, sizeof(other.aead_ctx_));
             other.initialized_ = false;
         }
     }
@@ -72,6 +75,7 @@ public:
         if (this != &other) {
             if (initialized_) {
                 EVP_AEAD_CTX_cleanup(&aead_ctx_);
+                OPENSSL_cleanse(&aead_ctx_, sizeof(aead_ctx_));
                 initialized_ = false;
             }
             EVP_AEAD_CTX_zero(&aead_ctx_);
@@ -80,6 +84,7 @@ public:
             if (other.initialized_ && EVP_AEAD_CTX_copy(&aead_ctx_, &other.aead_ctx_) == 1) {
                 initialized_ = true;
                 EVP_AEAD_CTX_cleanup(&other.aead_ctx_);
+                OPENSSL_cleanse(&other.aead_ctx_, sizeof(other.aead_ctx_));
                 other.initialized_ = false;
             }
         }

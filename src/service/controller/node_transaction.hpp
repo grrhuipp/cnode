@@ -203,7 +203,7 @@ net::awaitable<void> ApplyNodeChange(
 
     // These shared snapshots are already allocated. Recording cleanup and
     // publishing success cannot introduce an allocation failure after effects.
-    state.pending_cleanup = {old, next};
+    state.pending_cleanup = {recovering_old ? nullptr : old, next};
     state.phase = NodeRuntimePhase::Updating;
     struct IncompleteOnExit {
         NodeState& state;
@@ -218,10 +218,10 @@ net::awaitable<void> ApplyNodeChange(
     bool rules_attempted = false;
     bool outbound_attempted = false;
     bool inbound_attempted = false;
-    bool old_inbound_retired = recovering_old;
-    bool old_outbound_retired = recovering_old;
-    bool old_users_cleared = recovering_old;
-    bool old_rules_retired = recovering_old;
+    bool old_inbound_retired = false;
+    bool old_outbound_retired = false;
+    bool old_users_cleared = false;
+    bool old_rules_retired = false;
     std::exception_ptr failure;
     try {
         if (!plan.Transitioning()) {
@@ -242,11 +242,15 @@ net::awaitable<void> ApplyNodeChange(
             co_await runtime.ApplyUsers(tag, *next->prepared_users);
             outbound_attempted = true;
             co_await runtime.AddOutbound(*next->outbound);
+            if (different_tag || recovering_old) {
+                rules_attempted = true;
+                co_await runtime.UpdateRules(tag, next->rules);
+            }
             inbound_attempted = true;
             if (!co_await runtime.AddInbound(*next->inbound)) {
                 throw std::runtime_error("candidate inbound creation failed");
             }
-            if (old && different_tag) {
+            if (old && !recovering_old && different_tag) {
                 if (plan.RetireOldInboundBeforeCommit()) {
                     old_inbound_retired = true;
                     co_await runtime.RemoveInbound(old_tag);
@@ -258,8 +262,10 @@ net::awaitable<void> ApplyNodeChange(
                 old_rules_retired = true;
                 co_await runtime.UpdateRules(old_tag, {});
             }
-            rules_attempted = true;
-            co_await runtime.UpdateRules(tag, next->rules);
+            if (!different_tag && !recovering_old) {
+                rules_attempted = true;
+                co_await runtime.UpdateRules(tag, next->rules);
+            }
         }
         if (runtime.IsStopping()) throw IoSystemError(net::error::operation_aborted);
         state.committed = next;
@@ -286,20 +292,20 @@ net::awaitable<void> ApplyNodeChange(
             try { co_await runtime.RemoveInbound(tag); }
             catch (...) { restored = false; }
         }
-        if (rules_attempted && different_tag) {
+        if (rules_attempted && (different_tag || recovering_old)) {
             try { co_await runtime.UpdateRules(tag, {}); }
             catch (...) { restored = false; }
         }
-        if (outbound_attempted && different_tag) {
+        if (outbound_attempted && (different_tag || recovering_old)) {
             try { co_await runtime.RemoveOutbound(tag); }
             catch (...) { restored = false; }
         }
-        if (users_attempted && different_tag) {
+        if (users_attempted && (different_tag || recovering_old)) {
             try { co_await runtime.ClearUsers(tag, next->protocol); }
             catch (...) { restored = false; }
         }
     }
-    if (old) {
+    if (old && !recovering_old) {
         if ((!different_tag && users_attempted) || old_users_cleared) {
             try { co_await runtime.ApplyUsers(old_tag, *old->prepared_users); }
             catch (...) { restored = false; }
@@ -320,7 +326,9 @@ net::awaitable<void> ApplyNodeChange(
     }
     if (restored) {
         state.pending_cleanup = {};
-        state.phase = old ? NodeRuntimePhase::Ready : NodeRuntimePhase::Stopped;
+        state.phase = (old && !recovering_old)
+            ? NodeRuntimePhase::Ready
+            : NodeRuntimePhase::Stopped;
     }
     // The controller may recover from an ordinary mutation failure and keep
     // serving pulls. Only rollback, not the remaining loop, shields cancellation.

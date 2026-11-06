@@ -1,11 +1,9 @@
 #pragma once
 
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/common/network.hpp"
 
 #include <array>
-#include <memory_resource>
-#include <vector>
-
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -44,8 +42,8 @@ public:
 
 private:
     // Stage-local, demand-grown storage; holes are tracked independently of bytes.
-    std::pmr::vector<uint8_t> crypto_;
-    std::pmr::vector<uint8_t> coverage_;
+    memory::ByteVector crypto_;
+    memory::ByteVector coverage_;
     std::array<uint8_t, 20> dcid_{};
     std::array<uint8_t, 16> hp_key_{};
     std::array<uint8_t, 16> key_{};

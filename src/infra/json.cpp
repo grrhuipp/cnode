@@ -5,6 +5,7 @@
 #include <cmath>
 #include <format>
 #include <limits>
+#include <stdexcept>
 
 namespace acpp::json {
 
@@ -140,7 +141,13 @@ value& value::operator=(const value& other) {
     }
     return *this;
 }
-value& value::operator=(value&& other) noexcept = default;
+value& value::operator=(value&& other) noexcept {
+    if (this != &other) {
+        value temp(std::move(other));
+        data_.swap(temp.data_);
+    }
+    return *this;
+}
 value::~value() = default;
 value::value(double v) noexcept : data_(v) {}
 
@@ -466,6 +473,9 @@ void SerializeValue(const value& v, std::string& out) {
     } else if (v.is_uint64()) {
         out += std::to_string(v.as_uint64());
     } else if (v.is_double()) {
+        if (!std::isfinite(v.as_double())) {
+            throw std::invalid_argument("json number must be finite");
+        }
         out += std::format("{}", v.as_double());
     } else if (v.is_string()) {
         SerializeString(v.as_string(), out);

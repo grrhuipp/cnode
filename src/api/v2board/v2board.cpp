@@ -1,11 +1,11 @@
 #include "acppnode/api/panel_factory.hpp"
-#include "acppnode/common/domain_name.hpp"
 #include "acppnode/common/ip_address.hpp"
 #include "acppnode/common/ip_utils.hpp"
 #include "acppnode/core/naming.hpp"
 #include "acppnode/app/dns/dns.hpp"
 #include "acppnode/infra/json.hpp"
 #include "acppnode/infra/log.hpp"
+#include "acppnode/infra/panel_config.hpp"
 #include "http_response.hpp"
 #include "request_task.hpp"
 #include "node_info_json.hpp"
@@ -19,10 +19,11 @@
 #include <asio/read_until.hpp>
 #include <asio/write.hpp>
 #include <asio/cancel_after.hpp>
+#include <algorithm>
 #include <cctype>
-#include <charconv>
+#include <cstdint>
 #include <format>
-#include <limits>
+#include <map>
 #include <regex>
 #include <stdexcept>
 #include <vector>
@@ -66,13 +67,6 @@ enum class HttpMethod : uint8_t {
     Post,
 };
 
-struct UrlParts {
-    bool use_ssl = false;
-    std::string host;
-    uint16_t port = 0;
-    std::string path_prefix;
-    std::optional<net::ip::address> literal_address;
-};
 
 std::string CompactLogText(std::string_view text) {
     std::string result;
@@ -140,16 +134,26 @@ std::string MethodName(HttpMethod method) {
     return "GET";
 }
 
-std::optional<uint16_t> ParseHttpPort(std::string_view value) noexcept {
-    uint32_t parsed = 0;
-    const auto [end, ec] = std::from_chars(
-        value.data(), value.data() + value.size(), parsed);
-    if (value.empty() || ec != std::errc{} ||
-        end != value.data() + value.size() || parsed == 0 ||
-        parsed > std::numeric_limits<uint16_t>::max()) {
-        return std::nullopt;
+template <typename Stream>
+net::awaitable<HttpResponse>
+WriteRequestAndReadResponse(Stream& stream, std::string_view request) {
+    const auto cancellation = co_await net::this_coro::cancellation_state;
+    IoErrorCode write_ec;
+    co_await net::async_write(
+        stream, net::buffer(request),
+        net::redirect_error(net::use_awaitable, write_ec));
+    if (cancellation.cancelled() != net::cancellation_type::none) {
+        throw IoSystemError(
+            write_ec ? write_ec : net::error::operation_aborted,
+            "HTTP write cancelled");
     }
-    return static_cast<uint16_t>(parsed);
+    if (write_ec) {
+        HttpResponse result;
+        result.status = -1;
+        result.body = write_ec.message();
+        co_return result;
+    }
+    co_return co_await http::ReadResponse(stream);
 }
 
 std::string JoinRouteMatches(const json::array& matches) {
@@ -158,10 +162,31 @@ std::string JoinRouteMatches(const json::array& matches) {
         if (!match.is_string()) {
             throw std::invalid_argument("block route match entries must be strings");
         }
+        const std::string_view entry = match.as_string();
+        if (entry.empty()) {
+            throw std::invalid_argument("block route match entries must not be empty");
+        }
+        for (const unsigned char ch : entry) {
+            if (ch < 0x20 || ch == 0x7f) {
+                throw std::invalid_argument(
+                    "block route match entries must not contain control characters");
+            }
+        }
+        size_t trailing_backslashes = 0;
+        for (size_t i = entry.size(); i > 0 && entry[i - 1] == '\\'; --i) {
+            ++trailing_backslashes;
+        }
+        if ((trailing_backslashes % 2) != 0) {
+            throw std::invalid_argument(
+                "block route match entries must not end with an unescaped backslash");
+        }
+        (void)std::regex(std::string(entry));
         if (!pattern.empty()) {
             pattern.push_back('|');
         }
-        pattern += match.as_string();
+        pattern.append("(?:");
+        pattern.append(entry);
+        pattern.push_back(')');
     }
     return pattern;
 }
@@ -187,6 +212,9 @@ ExtractBlockDetectRules(const json::object& config) {
 
         const auto& route = route_value.as_object();
         const auto* action = route.if_contains("action");
+        if (action && !action->is_null() && !action->is_string()) {
+            throw std::invalid_argument("route action must be a string");
+        }
         if (!action || !action->is_string() || action->as_string() != "block") {
             continue;
         }
@@ -196,12 +224,11 @@ ExtractBlockDetectRules(const json::object& config) {
             throw std::invalid_argument("block route match must be an array");
         }
 
-        const std::string pattern = JoinRouteMatches(match_value->as_array());
-        if (pattern.empty()) {
-            continue;
-        }
-
         try {
+            const std::string pattern = JoinRouteMatches(match_value->as_array());
+            if (pattern.empty()) {
+                continue;
+            }
             rule::DetectRule rule;
             rule.Pattern = std::regex(pattern);
             rules.push_back(std::move(rule));
@@ -219,14 +246,12 @@ ExtractBlockDetectRules(const json::object& config) {
 // APIClient 实现
 // ============================================================================
 
-static std::optional<UrlParts> ParseUrl(const std::string& url);
-
 struct APIClient::Impl {
     Impl(net::io_context& io_context,
          const ::acpp::api::Config& config,
          ::acpp::app::dns::DNS& dns_service);
 
-    [[nodiscard]] std::string ApiNodeType() const;
+    [[nodiscard]] const std::string& ApiNodeType() const noexcept;
 
     // Parameters are owned by the coroutine frame: RunRequest starts the
     // exchange lazily and may cancel it after the caller's arguments are gone.
@@ -249,7 +274,10 @@ struct APIClient::Impl {
 
     net::io_context& io_context_;
     ::acpp::api::Config config_;
-    UrlParts url_parts_;
+    PanelApiUrlParts url_parts_;
+    std::optional<net::ip::address> literal_address_;
+    std::string api_node_type_;
+    std::string host_header_;
     ::acpp::app::dns::DNS& dns_service_;
 
     std::unique_ptr<net::ssl::context> https_context_;
@@ -266,12 +294,22 @@ APIClient::Impl::Impl(net::io_context& io_context,
         config_.RequestTimeout > std::chrono::seconds(defaults::kMaxPanelRequestTimeout)) {
         throw std::invalid_argument("API RequestTimeout is outside the supported range");
     }
+    if (!IsValidPanelName(config_.Name)) {
+        throw std::invalid_argument("Invalid panel name");
+    }
+    if (!IsValidPanelKey(config_.Key)) {
+        throw std::invalid_argument("Invalid panel API key");
+    }
 
-    auto parts = ParseUrl(config.APIHost);
+    auto parts = ParsePanelApiUrl(config.APIHost);
     if (!parts) {
         throw std::invalid_argument("Invalid panel API host");
     }
     url_parts_ = std::move(*parts);
+    literal_address_ = iputil::ParseLiteral(url_parts_.host);
+    api_node_type_ = naming::NormalizeV2BoardApiNodeType(config_.NodeType);
+    host_header_ = iputil::FormatHttpHostHeader(
+        url_parts_.host, url_parts_.port, url_parts_.use_ssl);
 
     if (url_parts_.use_ssl) {
         // Negotiate TLS 1.3 when the panel offers it; TLS 1.2 stays the floor
@@ -285,95 +323,10 @@ APIClient::Impl::Impl(net::io_context& io_context,
     }
 }
 
-std::string APIClient::Impl::ApiNodeType() const {
-    return naming::NormalizeV2BoardApiNodeType(config_.NodeType);
+const std::string& APIClient::Impl::ApiNodeType() const noexcept {
+    return api_node_type_;
 }
 
-static std::optional<UrlParts> ParseUrl(const std::string& url) {
-    UrlParts parts;
-
-    const std::string_view url_view(url);
-    const size_t scheme_pos = url_view.find("://");
-    if (scheme_pos == std::string_view::npos) {
-        return std::nullopt;
-    }
-
-    const std::string_view scheme = url_view.substr(0, scheme_pos);
-    if (scheme != constants::protocol::kHttp && scheme != constants::protocol::kHttps) {
-        return std::nullopt;
-    }
-    parts.use_ssl = (scheme == constants::protocol::kHttps);
-
-    std::string_view rest = url_view.substr(scheme_pos + 3);
-    const size_t path_pos = rest.find('/');
-    const std::string_view authority = path_pos == std::string_view::npos
-        ? rest
-        : rest.substr(0, path_pos);
-    parts.path_prefix = path_pos == std::string_view::npos
-        ? ""
-        : std::string(rest.substr(path_pos));
-
-    if (authority.empty()) {
-        return std::nullopt;
-    }
-
-    std::string_view explicit_port;
-    bool has_explicit_port = false;
-    if (authority.front() == '[') {
-        const size_t close_bracket = authority.find(']');
-        if (close_bracket == std::string_view::npos) {
-            return std::nullopt;
-        }
-
-        parts.host = std::string(authority.substr(1, close_bracket - 1));
-        if (close_bracket + 1 < authority.size()) {
-            if (authority[close_bracket + 1] != ':') {
-                return std::nullopt;
-            }
-            has_explicit_port = true;
-            explicit_port = authority.substr(close_bracket + 2);
-        }
-    } else {
-        const size_t first_colon = authority.find(':');
-        const size_t last_colon = authority.rfind(':');
-        if (first_colon != std::string_view::npos && first_colon == last_colon) {
-            parts.host = std::string(authority.substr(0, first_colon));
-            has_explicit_port = true;
-            explicit_port = authority.substr(last_colon + 1);
-        } else {
-            parts.host = std::string(authority);
-        }
-    }
-
-    if (parts.host.empty()) {
-        return std::nullopt;
-    }
-    if (has_explicit_port) {
-        const auto parsed_port = ParseHttpPort(explicit_port);
-        if (!parsed_port) {
-            return std::nullopt;
-        }
-        parts.port = *parsed_port;
-    } else {
-        parts.port = parts.use_ssl ? 443 : 80;
-    }
-
-    parts.literal_address = iputil::ParseLiteral(parts.host);
-    if (authority.front() == '[') {
-        if (!parts.literal_address || !parts.literal_address->is_v6()) return std::nullopt;
-    } else if (parts.host.find(':') != std::string::npos ||
-               (!parts.literal_address && !domain::IsValidDnsHostname(
-                   parts.host, domain::TrailingDotPolicy::Allow))) {
-        return std::nullopt;
-    }
-
-    // 移除末尾斜杠
-    while (!parts.path_prefix.empty() && parts.path_prefix.back() == '/') {
-        parts.path_prefix.pop_back();
-    }
-
-    return parts;
-}
 
 net::awaitable<HttpResponse>
 APIClient::Impl::HttpRequest(HttpMethod method,
@@ -398,8 +351,8 @@ APIClient::Impl::HttpExchange(HttpMethod method,
     std::vector<tcp::endpoint> endpoints;
     const uint16_t port = url_parts_.port;
 
-    if (url_parts_.literal_address) {
-        endpoints.emplace_back(*url_parts_.literal_address, port);
+    if (literal_address_) {
+        endpoints.emplace_back(*literal_address_, port);
     } else {
         auto dns_result = co_await dns_service_.Resolve(url_parts_.host);
         if (!dns_result.Ok() || dns_result.addresses.empty()) {
@@ -427,7 +380,7 @@ APIClient::Impl::HttpExchange(HttpMethod method,
     request += ' ';
     request += full_path.empty() ? "/" : full_path;
     request += " HTTP/1.1\r\nHost: ";
-    request += iputil::FormatHttpHostHeader(url_parts_.host, port, url_parts_.use_ssl);
+    request += host_header_;
     request += "\r\nUser-Agent: acppnode/1.0\r\nAuthorization: Bearer ";
     request += config_.Key;
     request += "\r\nX-API-Key: ";
@@ -446,12 +399,13 @@ APIClient::Impl::HttpExchange(HttpMethod method,
     request += "\r\n";
     request += body_text;
 
+    const auto cancellation = co_await net::this_coro::cancellation_state;
     if (url_parts_.use_ssl) {
         std::string last_error;
         for (const auto& endpoint : endpoints) {
             ssl::stream<tcp::socket> stream(io_context_, *https_context_);
             try {
-                if (url_parts_.literal_address) {
+                if (literal_address_) {
                     auto* verify_param = SSL_get0_param(stream.native_handle());
                     if (!verify_param ||
                         X509_VERIFY_PARAM_set1_ip_asc(verify_param, url_parts_.host.c_str()) != 1) {
@@ -472,6 +426,9 @@ APIClient::Impl::HttpExchange(HttpMethod method,
                 co_await stream.lowest_layer().async_connect(endpoint, net::use_awaitable);
                 co_await stream.async_handshake(ssl::stream_base::client, net::use_awaitable);
             } catch (const std::exception& e) {
+                if (cancellation.cancelled() != net::cancellation_type::none) {
+                    throw;
+                }
                 last_error = e.what();
                 LOG_PANEL_DEBUG(log_context, "HTTPS endpoint connection failed: endpoint={} reason={}",
                           iputil::FormatEndpointForLog(iputil::AddressText(endpoint.address()).View(), endpoint.port()),
@@ -482,17 +439,20 @@ APIClient::Impl::HttpExchange(HttpMethod method,
             // Only connection setup may try another address. Once HTTP
             // transmission starts, a failure cannot prove the peer did not
             // apply the request (in particular, an additive traffic POST).
-            co_await net::async_write(stream, net::buffer(request), net::use_awaitable);
-            result = co_await http::ReadResponse(stream);
+            result = co_await WriteRequestAndReadResponse(stream, request);
 
             // The HTTP response is complete. TLS close_notify is best effort
             // and must neither stall indefinitely nor invalidate that response.
-            try {
-                IoErrorCode ec;
-                co_await stream.async_shutdown(net::cancel_after(std::chrono::seconds(1),
-                    net::redirect_error(net::use_awaitable, ec)));
-            } catch (const std::exception&) {
+            if (result.status > 0 && cancellation.cancelled() == net::cancellation_type::none) {
+                try {
+                    IoErrorCode ec;
+                    co_await stream.async_shutdown(net::cancel_after(std::chrono::seconds(1),
+                        net::redirect_error(net::use_awaitable, ec)));
+                } catch (const std::exception&) {
+                }
             }
+            IoErrorCode close_ec;
+            stream.lowest_layer().close(close_ec);
             co_return result;
         }
         result.status = -1;
@@ -506,6 +466,9 @@ APIClient::Impl::HttpExchange(HttpMethod method,
             try {
                 co_await stream.async_connect(endpoint, net::use_awaitable);
             } catch (const std::exception& e) {
+                if (cancellation.cancelled() != net::cancellation_type::none) {
+                    throw;
+                }
                 last_error = e.what();
                 LOG_PANEL_DEBUG(log_context, "HTTP endpoint connection failed: endpoint={} reason={}",
                           iputil::FormatEndpointForLog(iputil::AddressText(endpoint.address()).View(), endpoint.port()),
@@ -513,11 +476,12 @@ APIClient::Impl::HttpExchange(HttpMethod method,
                 continue;
             }
 
-            co_await net::async_write(stream, net::buffer(request), net::use_awaitable);
-            result = co_await http::ReadResponse(stream);
+            result = co_await WriteRequestAndReadResponse(stream, request);
 
             IoErrorCode ec;
-            stream.shutdown(tcp::socket::shutdown_both, ec);
+            if (result.status > 0) {
+                stream.shutdown(tcp::socket::shutdown_both, ec);
+            }
             stream.close(ec);
             co_return result;
         }
@@ -558,6 +522,12 @@ APIClient::Impl::GetNodeInfo(std::string committed_etag) {
 
     try {
         auto jv = json::parse(resp.body);
+        if (!jv.is_object()) {
+            LOG_PANEL_ERROR(log_context, "Invalid node configuration: root JSON value must be an object");
+            co_return NodeInfoFetchResult::Fail(
+                ErrorCode::PANEL_INVALID_RESPONSE,
+                "root JSON value must be an object");
+        }
         auto& j = jv.as_object();
 
         auto parsed_config = ParseNodeInfo(j, config_.NodeType);
@@ -617,6 +587,12 @@ APIClient::Impl::GetUserList(std::string committed_etag) {
 
     try {
         auto jv = json::parse(resp.body);
+        if (!jv.is_object()) {
+            LOG_PANEL_ERROR(log_context, "User list parsing failed: root JSON value must be an object");
+            co_return UserListFetchResult::Fail(
+                ErrorCode::PANEL_INVALID_RESPONSE,
+                "root JSON value must be an object");
+        }
         auto& j = jv.as_object();
 
         auto users = ParseUserList(j);
@@ -642,10 +618,21 @@ APIClient::Impl::ReportUserTraffic(const std::vector<::acpp::api::UserTraffic>& 
     const PanelLogContext log_context{config_.Name, config_.APIHost, node_id, config_.NodeType};
 
     // V2Board UniProxy push 格式: {user_id: [upload, download], ...}
-    json::object body;
+    std::map<int64_t, ::acpp::api::UserTraffic> aggregated;
     for (const auto& t : data) {
-        body[std::to_string(t.UID)] = json::array{
-            static_cast<int64_t>(t.Upload), static_cast<int64_t>(t.Download)};
+        if (t.UID <= 0 || (t.Upload <= 0 && t.Download <= 0)) {
+            continue;
+        }
+        const int64_t up = std::max<int64_t>(0, t.Upload);
+        const int64_t down = std::max<int64_t>(0, t.Download);
+        auto& entry = aggregated[t.UID];
+        entry.UID = t.UID;
+        entry.Upload = (up > INT64_MAX - entry.Upload) ? INT64_MAX : (entry.Upload + up);
+        entry.Download = (down > INT64_MAX - entry.Download) ? INT64_MAX : (entry.Download + down);
+    }
+    json::object body;
+    for (const auto& [uid, t] : aggregated) {
+        body[std::to_string(uid)] = json::array{t.Upload, t.Download};
     }
 
     // 路径包含 node_id 和 node_type
@@ -656,11 +643,11 @@ APIClient::Impl::ReportUserTraffic(const std::vector<::acpp::api::UserTraffic>& 
         HttpMethod::Post, std::move(path), json::serialize(json::value(std::move(body))), {});
 
     if (resp.status != 200) {
-        LOG_PANEL_WARN(log_context, "Traffic API acceptance unknown: HTTP status={}", resp.status);
+        LOG_PANEL_WARN(log_context, "Traffic API acceptance unknown: {}", FormatHttpFailure(resp));
         co_return false;
     }
 
-    LOG_PANEL_DEBUG(log_context, "Traffic API accepted: users={} (not a billing commit acknowledgement)", data.size());
+    LOG_PANEL_DEBUG(log_context, "Traffic API accepted: users={} (not a billing commit acknowledgement)", aggregated.size());
     co_return true;
 }
 

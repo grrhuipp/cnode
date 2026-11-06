@@ -27,7 +27,9 @@ void Context::InitSubstreamFrom(const Context& parent, uint16_t sub_source_port)
     if (sub_source_port != 0) {
         inbound.source_port = sub_source_port;
     }
+    outbound = {};
     outbound.tag = parent.outbound.tag;
+    content = {};
     content.speed_limit = parent.content.speed_limit;
     traffic = {};
 }
@@ -49,10 +51,11 @@ std::string FormatAccessLog(const session::Context& ctx,
     const char* net_str = NetworkToString(ctx.content.network);
 
     const TargetAddress& t = ctx.outbound.target;
+    const bool target_valid = t.IsValid();
     std::optional<iputil::AddressText> target_host_storage;
     std::string_view target_host = t.host;
     if (target_host.empty()) {
-        if (t.resolved_addr) {
+        if (target_valid && t.resolved_addr) {
             target_host_storage.emplace(iputil::NormalizeAddress(*t.resolved_addr));
             target_host = target_host_storage->View();
         } else {
@@ -63,8 +66,7 @@ std::string FormatAccessLog(const session::Context& ctx,
     const std::string_view in_tag = ctx.inbound.tag;
     const std::string_view out_tag = ctx.outbound.tag;
     const bool accepted = status == AccessStatus::Accepted;
-    const bool has_target = accepted || t.IsValid();
-
+    const bool has_target = accepted || target_valid;
     // Only the final owning string crosses the logging queue. Do not use the
     // Worker PMR for it or retain connection-local formatting scratch.
     std::string access;

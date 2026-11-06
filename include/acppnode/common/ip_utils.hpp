@@ -9,9 +9,9 @@
 #include <cerrno>
 #include <charconv>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <string_view>
-
 #include <system_error>
 
 #include <arpa/inet.h>
@@ -19,7 +19,7 @@
 namespace acpp::iputil {
 
 inline net::ip::address NormalizeAddress(
-    const net::ip::address& addr) {
+    const net::ip::address& addr) noexcept {
     if (addr.is_v6()) {
         const auto bytes = addr.to_v6().to_bytes();
         const bool is_v4_mapped =
@@ -68,6 +68,7 @@ public:
         if (v6.scope_id() == 0) return;
         text_[size_++] = '%';
         if ((v6.is_link_local() || v6.is_multicast_link_local()) &&
+            v6.scope_id() <= std::numeric_limits<unsigned>::max() &&
             ::if_indextoname(static_cast<unsigned>(v6.scope_id()), text_.data() + size_)) {
             size_ += std::char_traits<char>::length(text_.data() + size_);
             return;

@@ -1,4 +1,5 @@
 #include "vless_codec.hpp"
+#include "udp_framing.hpp"
 #include "acppnode/common/address_codec.hpp"
 
 #include "acppnode/common/byte_reader.hpp"
@@ -12,10 +13,7 @@ namespace acpp::vless {
 
 namespace {
 
-constexpr uint64_t kProtoWireVarint = 0;
-constexpr uint64_t kProtoWireFixed64 = 1;
 constexpr uint64_t kProtoWireLengthDelimited = 2;
-constexpr uint64_t kProtoWireFixed32 = 5;
 constexpr uint64_t kProtoAddonsFlowField = 1;
 
 std::optional<uint64_t> ReadProtoVarint(ByteReader& reader) noexcept {
@@ -57,29 +55,10 @@ size_t ProtoVarintSize(size_t value) noexcept {
     return size;
 }
 
-bool SkipProtoField(ByteReader& reader, uint64_t wire_type) noexcept {
-    switch (wire_type) {
-    case kProtoWireVarint:
-        return ReadProtoVarint(reader).has_value();
-    case kProtoWireFixed64:
-        return reader.Skip(8);
-    case kProtoWireLengthDelimited: {
-        auto len = ReadProtoVarint(reader);
-        if (!len || *len > reader.Remaining()) {
-            return false;
-        }
-        return reader.Skip(static_cast<size_t>(*len));
-    }
-    case kProtoWireFixed32:
-        return reader.Skip(4);
-    default:
-        return false;
-    }
-}
-
 bool ParseHeaderAddons(std::span<const uint8_t> data,
                        RequestHeader& request) {
     ByteReader reader(data);
+    bool seen_flow = false;
     while (!reader.Empty()) {
         auto tag = ReadProtoVarint(reader);
         if (!tag || *tag == 0) {
@@ -87,22 +66,21 @@ bool ParseHeaderAddons(std::span<const uint8_t> data,
         }
         const uint64_t field_number = *tag >> 3;
         const uint64_t wire_type = *tag & 0x07;
-        if (field_number == kProtoAddonsFlowField &&
-            wire_type == kProtoWireLengthDelimited) {
-            auto flow_len = ReadProtoVarint(reader);
-            if (!flow_len || *flow_len > reader.Remaining()) {
-                return false;
-            }
-            const auto flow = reader.ReadStringView(static_cast<size_t>(*flow_len));
-            if (!reader.Ok()) {
-                return false;
-            }
-            request.flow.assign(flow.data(), flow.size());
-            continue;
-        }
-        if (!SkipProtoField(reader, wire_type)) {
+        if (field_number != kProtoAddonsFlowField ||
+            wire_type != kProtoWireLengthDelimited ||
+            seen_flow) {
             return false;
         }
+        auto flow_len = ReadProtoVarint(reader);
+        if (!flow_len || *flow_len > reader.Remaining()) {
+            return false;
+        }
+        const auto flow = reader.ReadStringView(static_cast<size_t>(*flow_len));
+        if (!reader.Ok()) {
+            return false;
+        }
+        request.flow.assign(flow.data(), flow.size());
+        seen_flow = true;
     }
     return reader.Ok();
 }
@@ -175,6 +153,12 @@ RequestHeaderDecodeResult DecodeRequestHeader(std::span<const uint8_t> data) {
             return result;
         }
         header.target = std::move(address.target);
+        if (!header.target.IsValid() &&
+            !(command == static_cast<uint8_t>(Command::UDP) &&
+              IsPacketAddrMagic(header.target))) {
+            result.status = RequestHeaderDecodeStatus::InvalidAddress;
+            return result;
+        }
         consumed += address.consumed;
     } else {
         result.status = RequestHeaderDecodeStatus::InvalidCommand;

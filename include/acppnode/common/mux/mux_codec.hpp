@@ -1,6 +1,5 @@
 #pragma once
 
-#include "acppnode/common/allocator.hpp"
 #include "acppnode/common/target_address.hpp"
 
 #include <array>
@@ -98,17 +97,10 @@ struct FrameHeader {
                                        NetworkType network,
                                        const TargetAddress& target,
                                        size_t payload_len) noexcept;
-[[nodiscard]] bool EncodeNewHeaderTo(memory::ByteVector& out,
-                                     uint16_t session_id,
-                                     NetworkType network,
-                                     const TargetAddress& target,
-                                     size_t payload_len);
 
 [[nodiscard]] size_t EncodeEndTo(std::span<uint8_t> out,
                                  uint16_t session_id,
                                  bool error = false) noexcept;
-void EncodeEndTo(memory::ByteVector& out,
-                 uint16_t session_id, bool error = false);
 
 [[nodiscard]] size_t EncodeKeepDataHeaderTo(std::span<uint8_t> out,
                                             uint16_t session_id,
@@ -118,8 +110,4 @@ void EncodeEndTo(memory::ByteVector& out,
                                            uint16_t session_id,
                                            const TargetAddress& src,
                                            size_t payload_len) noexcept;
-[[nodiscard]] bool EncodeKeepUDPHeaderTo(memory::ByteVector& out,
-                                         uint16_t session_id,
-                                         const TargetAddress& src,
-                                         size_t payload_len);
 }  // namespace acpp::mux

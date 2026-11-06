@@ -15,10 +15,24 @@ USER = uuid.UUID("11111111-1111-4111-8111-111111111111")
 PAYLOAD = b"static-inbound-forced-outbound"
 
 
+_USED_PORTS: set[int] = set()
+
+
 def free_port():
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
+    held = []
+    try:
+        while True:
+            sock = socket.socket()
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+            if port not in _USED_PORTS:
+                _USED_PORTS.add(port)
+                sock.close()
+                return port
+            held.append(sock)
+    finally:
+        for sock in held:
+            sock.close()
 
 
 def configs(default_port, forced_port, routed_port, inbound_overrides=None):

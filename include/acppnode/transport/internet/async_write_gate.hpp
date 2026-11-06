@@ -65,33 +65,61 @@ public:
     // Owner-thread synchronous fast path. Only contended callers need to
     // construct an acquisition coroutine; leases retain identical ownership.
     [[nodiscard]] Lease TryAcquire() noexcept {
-        if (busy_ || cancelled_) return {};
+        if (busy_ || cancelled_ || waiters_ != 0) return {};
         busy_ = true;
         return Lease{this};
     }
 
     [[nodiscard]] net::awaitable<Lease> Acquire() {
+        const auto cancellation = co_await net::this_coro::cancellation_state;
+        if (cancelled_ || cancellation.cancelled() != net::cancellation_type::none) {
+            co_return Lease{};
+        }
         while (busy_ && !cancelled_) {
             if (!signal_) {
                 signal_.emplace(co_await net::this_coro::executor, 1);
             }
             ++waiters_;
             struct WaiterScope {
-                std::size_t& waiters;
-                ~WaiterScope() noexcept { --waiters; }
-            } scope{waiters_};
+                AsyncWriteGate& gate;
+                bool woke = false;
+                ~WaiterScope() noexcept {
+                    --gate.waiters_;
+                    if (woke) gate.notified_ = false;
+                    if (gate.waiters_ == 0 && gate.notified_ && gate.signal_) {
+                        gate.notified_ = false;
+                        gate.signal_->reset();
+                    }
+                    if (!gate.busy_ && !gate.cancelled_ && !gate.notified_ &&
+                        gate.waiters_ != 0 && gate.signal_) {
+                        gate.notified_ = true;
+                        (void)gate.signal_->try_send(IoErrorCode{});
+                    }
+                }
+            } scope{*this};
             auto [ec] = co_await signal_->async_receive(
                 net::as_tuple(net::use_awaitable));
-            if (ec) {
+            if (!ec) {
+                scope.woke = true;
+            }
+            if (ec || (co_await net::this_coro::cancellation_state).cancelled() !=
+                          net::cancellation_type::none) {
                 co_return Lease{};
             }
+            if (!busy_ && !cancelled_) {
+                busy_ = true;
+                co_return Lease{this};
+            }
         }
-        co_return TryAcquire();
+        if (busy_ || cancelled_) co_return Lease{};
+        busy_ = true;
+        co_return Lease{this};
     }
 
     void Cancel() noexcept {
         if (cancelled_) return;
         cancelled_ = true;
+        notified_ = false;
         if (signal_) {
             signal_->close();
         }
@@ -100,7 +128,8 @@ public:
 private:
     void Release() noexcept {
         busy_ = false;
-        if (!cancelled_ && waiters_ != 0 && signal_) {
+        if (!cancelled_ && !notified_ && waiters_ != 0 && signal_) {
+            notified_ = true;
             (void)signal_->try_send(IoErrorCode{});
         }
     }
@@ -109,6 +138,7 @@ private:
     std::size_t waiters_ = 0;
     bool busy_ = false;
     bool cancelled_ = false;
+    bool notified_ = false;
 };
 
 }  // namespace acpp::transport::internet

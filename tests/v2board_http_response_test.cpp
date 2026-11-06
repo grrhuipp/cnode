@@ -389,6 +389,10 @@ void TestInterimResponsesSkipped() {
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n",
         "unexpected HTTP 101",
         "unsolicited protocol switch was accepted");
+    Check(ReadResponse({"GARBAGE 99999 OK\r\nContent-Length: 0\r\n\r\n"}).status == -1,
+          "non-HTTP status line was accepted");
+    Check(ReadResponse({"HTTP/1.1 200 OK\r\nBad Header : value\r\nContent-Length: 0\r\n\r\n"}).status == -1,
+          "header name with trailing whitespace was accepted");
 }
 
 }  // namespace

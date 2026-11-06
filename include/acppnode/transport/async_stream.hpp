@@ -71,8 +71,8 @@ public:
     // buf::MultiBuffer 流式接口（对应 Xray buf.Reader / buf.Writer）
     //
     // 读路径由每个具体 stream 实现，以便先等待可读数据，再申请
-    // 唯一的 8KB payload Buffer；写路径保留通用默认实现。
-    //   - TcpStream: scatter-write (writev)
+    // 唯一的 8KB payload Buffer；WriteMultiBuffer 默认将 MultiBuffer 展开为
+    // const_buffer 序列转发至 WriteBuffers（TcpStream scatter-write / TlsStream 聚帧）。
     //   - VMessStream: 解密直写 pool Buffer，省去一次 memcpy
     //
     // 所有权规则：
@@ -197,7 +197,7 @@ public:
 
     void SetIdleTimeout(std::chrono::seconds timeout);
     void SetReadTimeout(std::chrono::seconds timeout);
-    void SetWriteTimeout(std::chrono::seconds timeout);
+    virtual void SetWriteTimeout(std::chrono::seconds timeout);
     void SetAbortiveClose(bool enable = true) noexcept;
     // Shared byte transports can finish a started write when a logical caller
     // is cancelled. Explicit socket cancellation, closure and timeouts still act.
@@ -205,7 +205,7 @@ public:
 
     [[nodiscard]] bool ConsumeIdleTimeout() noexcept;
     [[nodiscard]] bool ConsumeReadTimeout() noexcept;
-    [[nodiscard]] bool ConsumeWriteTimeout() noexcept;
+    [[nodiscard]] virtual bool ConsumeWriteTimeout() noexcept;
 
     // Logical streams select their inline deadline owner below; ordinary byte
     // streams continue to use the physical connection's aggregate deadlines.

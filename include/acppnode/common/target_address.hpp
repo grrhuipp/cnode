@@ -44,7 +44,7 @@ struct TargetAddress {
         }
     }
 
-    bool IsValid() const {
+    bool IsValid() const noexcept {
         if (port == 0) return false;
         switch (type) {
             case AddressType::Domain:
@@ -61,32 +61,32 @@ struct TargetAddress {
     }
 
     [[nodiscard]] bool SameEndpoint(const TargetAddress& other) const noexcept {
-        if (port != other.port) {
+        if (!IsValid() || !other.IsValid() || port != other.port) {
             return false;
         }
         if (IsDomain() || other.IsDomain()) {
-            return IsDomain() && other.IsDomain() && host == other.host;
+            return IsDomain() && other.IsDomain() &&
+                   domain::DnsHostnamesEqual(host, other.host);
         }
-        return resolved_addr && other.resolved_addr &&
-               *resolved_addr == *other.resolved_addr;
+        return iputil::NormalizeAddress(*resolved_addr) ==
+               iputil::NormalizeAddress(*other.resolved_addr);
     }
 
-    bool IsDomain() const {
+    bool IsDomain() const noexcept {
         return type == AddressType::Domain;
     }
 
-    bool IsIP() const {
+    bool IsIP() const noexcept {
         return type == AddressType::IPv4 || type == AddressType::IPv6;
     }
 
-    bool IsIPv4() const {
+    bool IsIPv4() const noexcept {
         return type == AddressType::IPv4;
     }
 
-    bool IsIPv6() const {
+    bool IsIPv6() const noexcept {
         return type == AddressType::IPv6;
     }
-
     [[nodiscard]]
     static std::optional<TargetAddress> Parse(std::string_view addr);
 
@@ -193,10 +193,12 @@ struct std::formatter<acpp::TargetAddress> {
     template <class FormatContext>
     auto format(const acpp::TargetAddress& target, FormatContext& ctx) const {
         std::optional<acpp::iputil::AddressText> ip_storage;
+        std::optional<acpp::net::ip::address> normalized_resolved;
         std::string_view host(target.host.data(), target.host.size());
         const bool use_resolved = host.empty() && target.resolved_addr.has_value();
         if (use_resolved) {
-            ip_storage.emplace(*target.resolved_addr);
+            normalized_resolved = acpp::iputil::NormalizeAddress(*target.resolved_addr);
+            ip_storage.emplace(*normalized_resolved);
             host = ip_storage->View();
         }
         if (host.empty()) {
@@ -204,7 +206,7 @@ struct std::formatter<acpp::TargetAddress> {
         }
 
         const bool needs_brackets = use_resolved
-            ? target.resolved_addr->is_v6()
+            ? normalized_resolved->is_v6()
             : host.find(':') != std::string_view::npos;
         if (needs_brackets) {
             return std::format_to(ctx.out(), "[{}]:{}", host, target.port);

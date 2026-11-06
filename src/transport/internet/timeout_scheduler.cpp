@@ -19,7 +19,7 @@ namespace acpp {
 struct TimeoutScheduler::Impl : memory::ThreadAllocated {
     explicit Impl(net::io_context& io_context, std::weak_ptr<ExecutionDomain> owner)
         : timer(io_context), domain(std::move(owner)) {
-        heap.reserve(1024);
+        if (domain.expired()) heap.reserve(1024);
     }
 
     net::steady_timer timer;
@@ -151,7 +151,7 @@ struct TimeoutScheduler::Impl : memory::ThreadAllocated {
         maintenance = nullptr;
         RequestWakeup();
         for (auto* event : heap) event->owner_ = nullptr;
-        heap.clear();
+        memory::ThreadLocalVector<TimeoutEvent*>{}.swap(heap);
     }
 };
 
@@ -281,10 +281,14 @@ bool TimeoutScheduler::SetMaintenanceDeadline(
 void TimeoutScheduler::CancelMaintenance(TimeoutMaintenance& owner) noexcept {
     memory::RequireAllocationLease(impl_.get());
     if (impl_->maintenance != &owner) return;
-    impl_->maintenance_deadline = std::chrono::steady_clock::time_point::max();
+    const auto old_deadline = std::exchange(
+        impl_->maintenance_deadline,
+        std::chrono::steady_clock::time_point::max());
     impl_->maintenance = nullptr;
     // No heap inspection: this call may originate from a PMR mutation.
-    impl_->RequestWakeup();
+    if (impl_->armed_deadline >= old_deadline) {
+        impl_->RequestWakeup();
+    }
 }
 TimeoutScheduler::ResourceStats TimeoutScheduler::GetResourceStats() const noexcept {
     memory::RequireAllocationLease(impl_.get());

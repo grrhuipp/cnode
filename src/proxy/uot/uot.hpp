@@ -156,6 +156,18 @@ public:
         }
     }
 
+    void Close() {
+        if constexpr (requires(Underlying& endpoint) { endpoint.Close(); }) {
+            underlying_.Close();
+        }
+    }
+
+    void CloseAbortive() {
+        if constexpr (requires(Underlying& endpoint) { endpoint.CloseAbortive(); }) {
+            underlying_.CloseAbortive();
+        }
+    }
+
     void SetIdleTimeout(std::chrono::seconds timeout) {
         if constexpr (requires(Underlying& endpoint) { endpoint.SetIdleTimeout(timeout); }) {
             underlying_.SetIdleTimeout(timeout);

@@ -39,6 +39,7 @@
 #include "acppnode/transport/internet/datagram_socket.hpp"
 #include "acppnode/transport/internet/tcp_stream.hpp"
 #include "acppnode/transport/internet/async_delay.hpp"
+#include "../transport/internet/xhttp_session.hpp"
 #include "acppnode/app/router/router.hpp"
 #include "acppnode/common/defaults.hpp"
 #include "acppnode/common/error.hpp"
@@ -72,9 +73,11 @@ namespace acpp {
 struct Worker::ConnectionRecord {
     std::shared_ptr<ExecutionDomain> domain;
     std::shared_ptr<app::PhysicalSessionCapabilities> capabilities;
+    std::string inbound_tag;
+    std::string accounting_key;
     uint64_t conn_id = 0;
     std::atomic<bool> initialized{false};
-    bool finished = false;
+    std::atomic<bool> finished{false};
     bool pending_accounting = false;
     StatsSnapshot final_stats;
 };
@@ -200,7 +203,7 @@ struct Worker::ListenerState : worker_detail::UdpReplySink {
     static net::awaitable<void> ProcessReceivedConnection(
         std::shared_ptr<ConnectionRecord> record,
         tcp::socket socket, tcp::endpoint remote_ep,
-        proxyman::inbound::ReceiverSettings listener, uint32_t accepted_worker);
+        uint32_t accepted_worker);
 
     net::awaitable<void> UdpReceiveLoop(
         Worker& worker,
@@ -243,8 +246,6 @@ struct Worker::RuntimeState {
               proxyman::inbound::UserStore::CaptureSnapshot()))
         , stats(stats_ref)
         , geo_database(geo_database_ref)
-        , request_load(app::RequestLoadState::Acquire(
-              runtime_config.pressure_threshold, runtime_config.pressure_idle_timeout))
         , dns_worker(dns_worker)
         , listener_state(std::make_unique<ListenerState>(io_context))
         , dns_service(std::make_unique<app::dns::DNS>(dns_worker))
@@ -268,6 +269,18 @@ struct Worker::RuntimeState {
     app::dns::DNSWorker& dns_worker;
     std::shared_ptr<const app::SessionConfiguration> session_configuration;
     std::unordered_map<ConnectionRecord*, std::shared_ptr<ConnectionRecord>> connections;
+
+    void EraseConnection(uint32_t worker_id, const std::shared_ptr<ConnectionRecord>& record) {
+        if (connections.erase(record.get()) == 0) return;
+        if (record->domain && !record->domain->CanDestroyDirectlyOn(worker_id)) {
+            auto* domain = record->domain.get();
+            domain->Execute([cap = std::move(record->capabilities),
+                             domain = std::move(record->domain)]() mutable {
+                cap.reset();
+                domain.reset();
+            });
+        }
+    }
 
     // Constructed on this Worker's executor; outlives managers, retired
     // listeners and their request guards. Runtime teardown stays on that thread.
@@ -299,9 +312,12 @@ namespace {
 constexpr auto kAcceptErrorBackoff = std::chrono::milliseconds(5);
 constexpr auto kAcceptResourceBackoff = std::chrono::milliseconds(100);
 
+template <typename State = void>
 class ColdMutationGuard {
 public:
-    explicit ColdMutationGuard(bool& active) : active_(active) {
+    explicit ColdMutationGuard(bool& active, State* listener_state = nullptr)
+        : active_(active)
+        , listener_state_(listener_state) {
         if (active_) {
             throw std::system_error(
                 std::make_error_code(std::errc::device_or_resource_busy),
@@ -309,12 +325,18 @@ public:
         }
         active_ = true;
     }
-    ~ColdMutationGuard() { active_ = false; }
+    ~ColdMutationGuard() {
+        active_ = false;
+        if constexpr (!std::is_void_v<State>) {
+            if (listener_state_) listener_state_->NotifyCompletion();
+        }
+    }
     ColdMutationGuard(const ColdMutationGuard&) = delete;
     ColdMutationGuard& operator=(const ColdMutationGuard&) = delete;
 
 private:
     bool& active_;
+    State* listener_state_ = nullptr;
 };
 
 memory::ThreadLocalString BuildListenerKey(std::string_view tag, std::string_view listen, uint16_t port) {
@@ -368,18 +390,6 @@ void Worker::SetGroupCoordinator(std::shared_ptr<GroupCoordinator> coordinator) 
     if (!coordinator || runtime_->started)
         throw std::logic_error("group coordinator must be installed before startup");
     group_coordinator_ = std::move(coordinator);
-}
-
-std::vector<app::AccountingDomain> Worker::AccountingDomains() const {
-    std::vector<app::AccountingDomain> result;
-    if (!runtime_) return result;
-    result.reserve(runtime_->connections.size());
-    for (const auto& [key, record] : runtime_->connections) {
-        (void)key;
-        if (record->initialized.load(std::memory_order_acquire))
-            result.push_back({record->capabilities, record->domain});
-    }
-    return result;
 }
 
 void Worker::StartRuntime() {
@@ -441,8 +451,17 @@ net::awaitable<void> Worker::DrainRuntimeTask() {
     if (!runtime_) co_return;
     BeginStopOnWorker();
     auto& listeners = *runtime_->listener_state;
+    while (runtime_->cold_mutation_active) {
+        IoErrorCode ec;
+        co_await listeners.changed.async_wait(net::redirect_error(net::use_awaitable, ec));
+    }
+    memory::ThreadLocalVector<ListenerState::SlotPtr> slots;
+    slots.reserve(listeners.listener_slots.size());
     for (auto& [tag, slot] : listeners.listener_slots) {
         (void)tag;
+        if (slot) slots.push_back(slot);
+    }
+    for (const auto& slot : slots) {
         if (slot->udp_ingress) co_await slot->udp_ingress->AsyncJoin();
         if (slot->retiring_udp_ingress) co_await slot->retiring_udp_ingress->AsyncJoin();
     }
@@ -513,7 +532,20 @@ net::awaitable<void> Worker::StopRuntimeTask() {
     // No request can start outbound work any more; retiring handlers have only
     // cancelled theirs. Join before destroying the components they borrow.
     if (runtime_->outbound_tasks) co_await runtime_->outbound_tasks->AsyncJoin();
+    co_await transport::internet::JoinXHttpClientTasks(io_context_);
     runtime_->memory_reclaimer.Stop();
+    co_await TimeoutScheduler::AsyncReleaseForIoContext(io_context_);
+    for (auto& [key, record] : runtime_->connections) {
+        (void)key;
+        if (record->domain && !record->domain->CanDestroyDirectlyOn(id_)) {
+            auto* domain = record->domain.get();
+            domain->Execute([cap = std::move(record->capabilities),
+                             domain = std::move(record->domain)]() mutable {
+                cap.reset();
+                domain.reset();
+            });
+        }
+    }
     runtime_->connections.clear();
     runtime_.reset();
     proxyman::inbound::UserStore::ClearWorkerView();
@@ -528,6 +560,7 @@ net::awaitable<void> Worker::StopRuntimeTask() {
 
 net::awaitable<void> Worker::AsyncJoin() {
     if (joined_.load(std::memory_order_acquire)) co_return;
+    RequestStop();
     co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
     co_await net::co_spawn(io_context_, StopRuntimeTask(), net::use_awaitable);
     joined_.store(true, std::memory_order_release);
@@ -561,6 +594,11 @@ void Worker::RuntimeState::Start(Worker& worker) {
             .max_connections = config->limits.max_connections,
             .max_conn_per_ip = config->limits.max_connections_per_ip,
         }, worker.group_coordinator_);
+    }
+    if (!request_load) {
+        request_load = app::RequestLoadState::Acquire(
+            config->pressure_threshold, config->pressure_idle_timeout,
+            *worker.group_coordinator_);
     }
     const auto dial_timeout = timeouts.DialTimeout();
     for (const auto& prepared_outbound : config->outbounds) {
@@ -931,11 +969,14 @@ net::awaitable<void> Worker::ListenerState::AcceptLoop(
             continue;
         }
 
+        const auto& receiver = inbound_handler->ReceiverSettings();
         auto record = std::make_shared<ConnectionRecord>();
+        record->inbound_tag = receiver.inbound_tag;
+        record->accounting_key = receiver.accounting_key;
         record->capabilities = app::PhysicalSessionCapabilities::Create(
             worker.runtime_->session_configuration, worker.runtime_->connection_limiter,
             worker.runtime_->request_load, worker.runtime_->dns_worker,
-            slot->prepared, inbound_handler->ReceiverSettings());
+            slot->prepared, inbound_handler->SharedReceiverSettings());
         record->domain = ExecutionDomain::Create(worker.io_context_, worker.id_,
             worker.io_context_.get_executor(), record->capabilities, worker.group_coordinator_);
         record->capabilities->BindDomain(record->domain);
@@ -943,11 +984,10 @@ net::awaitable<void> Worker::ListenerState::AcceptLoop(
         ++tcp_tasks;
         try {
             net::co_spawn(record->domain->Executor(),
-                ProcessReceivedConnection(record, std::move(socket), remote_ep,
-                    inbound_handler->ReceiverSettings(), worker.id_),
+                ProcessReceivedConnection(record, std::move(socket), remote_ep, worker.id_),
                 net::bind_executor(worker.io_context_.get_executor(),
                     [this, &worker, record](std::exception_ptr error) {
-                        record->finished = true;
+                        record->finished.store(true, std::memory_order_release);
                         auto& stats = worker.runtime_->stats;
                         stats.hot.bytes_in += record->final_stats.bytes_in;
                         stats.hot.bytes_out += record->final_stats.bytes_out;
@@ -955,8 +995,9 @@ net::awaitable<void> Worker::ListenerState::AcceptLoop(
                         stats.cold.errors += record->final_stats.errors;
                         --tcp_tasks;
                         NotifyCompletion();
-                        if (!record->pending_accounting)
-                            worker.runtime_->connections.erase(record.get());
+                        if (!record->pending_accounting ||
+                            !record->capabilities->HasPendingTraffic())
+                            worker.runtime_->EraseConnection(worker.id_, record);
                         if (error) {
                             try {
                                 try { std::rethrow_exception(error); }
@@ -986,13 +1027,13 @@ net::awaitable<void> Worker::ListenerState::AcceptLoop(
 
 net::awaitable<void> Worker::ListenerState::ProcessReceivedConnection(
     std::shared_ptr<ConnectionRecord> record, tcp::socket socket,
-    tcp::endpoint remote_ep, proxyman::inbound::ReceiverSettings listener,
-    uint32_t accepted_worker) {
+    tcp::endpoint remote_ep, uint32_t accepted_worker) {
     std::exception_ptr failure;
     record->conn_id = session::NewID(accepted_worker);
     try {
         record->capabilities->Initialize(record->domain->Reactor());
         record->initialized.store(true, std::memory_order_release);
+        const auto& listener = record->capabilities->Receiver();
         auto tcp_stream = std::make_unique<TcpStream>(std::move(socket));
         session::Context ctx;
         ctx.conn_id = record->conn_id;
@@ -1028,18 +1069,22 @@ net::awaitable<void> Worker::ListenerState::ProcessReceivedConnection(
 // ============================================================================
 
 bool Worker::AddListener(PortBinding binding) {
-    if (stop_requested_.load(std::memory_order_acquire))
+    if (stop_requested_.load(std::memory_order_acquire) ||
+        drain_requested_.load(std::memory_order_relaxed) ||
+        !runtime_ || runtime_->listener_state->stopping)
         throw IoSystemError(net::error::operation_aborted);
-    ColdMutationGuard mutation(runtime_->cold_mutation_active);
+    ColdMutationGuard mutation(runtime_->cold_mutation_active, runtime_->listener_state.get());
     return runtime_->listener_state->StartListening(*this, binding);
 }
 
 bool Worker::RegisterInbound(
     proxyman::inbound::BuildRequest req,
     proxyman::inbound::ReceiverSettings receiver) {
-    if (stop_requested_.load(std::memory_order_acquire))
+    if (stop_requested_.load(std::memory_order_acquire) ||
+        drain_requested_.load(std::memory_order_relaxed) ||
+        !runtime_ || runtime_->listener_state->stopping)
         throw IoSystemError(net::error::operation_aborted);
-    ColdMutationGuard mutation(runtime_->cold_mutation_active);
+    ColdMutationGuard mutation(runtime_->cold_mutation_active, runtime_->listener_state.get());
     if (receiver.stream_settings.IsXHttp()) {
         auto& key = receiver.stream_settings.xhttp.session_namespace;
         key.insert(0, receiver.inbound_tag + std::string(1, '\0'));
@@ -1082,43 +1127,70 @@ bool Worker::RegisterInbound(
 }
 
 void Worker::AddOutbound(proxyman::outbound::PreparedOutboundConfig config) {
-    ColdMutationGuard mutation(runtime_->cold_mutation_active);
+    if (stop_requested_.load(std::memory_order_acquire) ||
+        drain_requested_.load(std::memory_order_relaxed) ||
+        !runtime_ || runtime_->listener_state->stopping)
+        throw IoSystemError(net::error::operation_aborted);
+    ColdMutationGuard mutation(runtime_->cold_mutation_active, runtime_->listener_state.get());
     auto handler = proxyman::outbound::NewHandler(
         config, runtime_->io_context,
         *runtime_->dns_service,
         runtime_->timeouts.DialTimeout(),
         runtime_->outbound_tasks->Tasks());
 
+    if (!handler) {
+        throw std::logic_error(
+            "failed to install dynamic outbound '" + config.tag + "'");
+    }
+    auto previous = runtime_->outbound_handlers->GetHandler(config.tag);
     if (!runtime_->outbound_handlers->ReplaceHandler(std::move(handler))) {
         throw std::logic_error(
             "failed to install dynamic outbound '" + config.tag + "'");
     }
-    runtime_->session_configuration->outbounds->Replace(config);
+    try {
+        runtime_->session_configuration->outbounds->Replace(config);
+    } catch (...) {
+        if (previous) {
+            runtime_->outbound_handlers->RestoreHandler(std::move(previous));
+        } else {
+            runtime_->outbound_handlers->RemoveHandler(config.tag);
+        }
+        throw;
+    }
 
     LOG_DEBUG("registered dynamic outbound worker={} protocol={} tag={}",
               id_, config.protocol, config.tag);
 }
 
 void Worker::RemoveOutbound(std::string_view tag) {
-    ColdMutationGuard mutation(runtime_->cold_mutation_active);
-    runtime_->outbound_handlers->RemoveHandler(tag);
+    if (stop_requested_.load(std::memory_order_acquire) ||
+        drain_requested_.load(std::memory_order_relaxed) ||
+        !runtime_ || runtime_->listener_state->stopping)
+        throw IoSystemError(net::error::operation_aborted);
+    ColdMutationGuard mutation(runtime_->cold_mutation_active, runtime_->listener_state.get());
     runtime_->session_configuration->outbounds->Remove(tag);
+    runtime_->outbound_handlers->RemoveHandler(tag);
 }
 
 void Worker::InstallUserView(proxyman::inbound::UserStore::WorkerView view) {
-    if (!runtime_ || runtime_->listener_state->stopping)
-        throw IoSystemError(net::error::operation_aborted);
+    if (stop_requested_.load(std::memory_order_relaxed) || !runtime_) return;
+    proxyman::inbound::UserStore::InstallWorkerView(view);
     for (const auto& [key, record] : runtime_->connections) {
         (void)key;
+        if (record->finished.load(std::memory_order_acquire) ||
+            !record->domain || !record->capabilities) continue;
         record->domain->Execute([cap = record->capabilities, view] {
             cap->UpdateUserView(view);
         });
     }
-    proxyman::inbound::UserStore::InstallWorkerView(std::move(view));
 }
 
 net::awaitable<void> Worker::UnregisterListenerTask(std::string tag) {
-    ColdMutationGuard mutation(runtime_->cold_mutation_active);
+    if (stop_requested_.load(std::memory_order_acquire) ||
+        drain_requested_.load(std::memory_order_relaxed) ||
+        !runtime_ || runtime_->listener_state->stopping)
+        throw IoSystemError(net::error::operation_aborted);
+    ColdMutationGuard mutation(runtime_->cold_mutation_active, runtime_->listener_state.get());
     const auto cancel_throwing = co_await net::this_coro::throw_if_cancelled();
     auto cancellation = co_await net::this_coro::cancellation_state;
     if (cancellation.cancelled() != net::cancellation_type::none) {
@@ -1134,12 +1206,11 @@ net::awaitable<void> Worker::UnregisterListenerTask(std::string tag) {
         FailRuntime("udp-retirement", "unknown UDP retirement failure");
     }
 
-    auto retiring = runtime_->inbound_handlers->GetHandler(tag);
     runtime_->inbound_handlers->RemoveHandler(tag);
     if (auto slot_it = runtime_->listener_state->listener_slots.find(tag);
-            slot_it != runtime_->listener_state->listener_slots.end() &&
-            slot_it->second->handler == retiring) {
+            slot_it != runtime_->listener_state->listener_slots.end()) {
         slot_it->second->handler.reset();
+        slot_it->second->prepared.reset();
         if (!slot_it->second->tcp_binding && !slot_it->second->udp_binding &&
             !slot_it->second->udp_ingress && !slot_it->second->retiring_udp_ingress) {
             runtime_->listener_state->listener_slots.erase(slot_it);
@@ -1154,6 +1225,10 @@ net::awaitable<void> Worker::UnregisterListenerTask(std::string tag) {
 }
 
 void Worker::UpdateRule(std::string_view tag, const std::vector<rule::DetectRule>& rules) {
+    if (stop_requested_.load(std::memory_order_acquire) ||
+        drain_requested_.load(std::memory_order_relaxed) ||
+        !runtime_ || runtime_->listener_state->stopping)
+        throw IoSystemError(net::error::operation_aborted);
     runtime_->detect_rule_policy->UpdateRule(tag, rules);
 }
 
@@ -1162,16 +1237,40 @@ void Worker::UpdateRule(std::string_view tag, const std::vector<rule::DetectRule
 // ============================================================================
 
 net::awaitable<app::UserTrafficSnapshot> Worker::SnapshotTraffic(std::string tag) {
+    co_await ReapAccountingDomains();
     auto result = runtime_->session_tracking->SnapshotTraffic(tag);
     // Source registry membership never changes when a group migrates. Each
     // logical domain is therefore sampled exactly once across all Workers.
-    for (const auto& owner : AccountingDomains()) {
-        auto counters = co_await net::co_spawn(owner.domain->Executor(),
-            [capabilities = owner.capabilities, tag]() -> net::awaitable<app::UserTrafficSnapshot> {
-                co_return capabilities->Tracking().SnapshotTraffic(tag);
+    std::vector<std::shared_ptr<ConnectionRecord>> records;
+    records.reserve(runtime_->connections.size());
+    for (const auto& [key, record] : runtime_->connections) {
+        (void)key;
+        if (record->initialized.load(std::memory_order_acquire) &&
+            (tag.empty() || record->accounting_key == tag)) {
+            records.push_back(record);
+        }
+    }
+    for (const auto& record : records) {
+        if (!runtime_->connections.contains(record.get()) ||
+            !record->domain || !record->capabilities)
+            continue;
+        const std::weak_ptr<app::PhysicalSessionCapabilities> weak_cap = record->capabilities;
+        const std::weak_ptr<ExecutionDomain> weak_domain = record->domain;
+        auto counters = co_await net::co_spawn(record->domain->Executor(),
+            [capabilities = record->capabilities, tag]() mutable -> net::awaitable<app::UserTrafficSnapshot> {
+                if (!capabilities->HasPendingTraffic()) {
+                    capabilities.reset();
+                    co_return app::UserTrafficSnapshot{};
+                }
+                auto snapshot = capabilities->Tracking().SnapshotTraffic(tag);
+                capabilities.reset();
+                co_return snapshot;
             }, net::use_awaitable);
         if (counters.empty()) continue;
-        result.domains.push_back({owner, app::UserTrafficCounters{std::move(counters.users)}});
+        result.domains.push_back({
+            {weak_cap, weak_domain},
+            app::UserTrafficCounters{std::move(counters.users)},
+        });
     }
     co_return result;
 }
@@ -1181,9 +1280,16 @@ net::awaitable<void> Worker::CommitTraffic(
     co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
     runtime_->session_tracking->CommitTraffic(tag, snapshot);
     for (const auto& token : snapshot.domains) {
-        co_await net::co_spawn(token.owner.domain->Executor(),
-            [capabilities = token.owner.capabilities, tag, counters = &token.counters]() -> net::awaitable<void> {
-                capabilities->Tracking().CommitTraffic(tag, *counters);
+        auto domain = token.owner.domain.lock();
+        auto capabilities = token.owner.capabilities.lock();
+        if (!domain || !capabilities) continue;
+        co_await net::co_spawn(domain->Executor(),
+            [capabilities = std::move(capabilities), tag, counters = &token.counters]() mutable -> net::awaitable<void> {
+                if (capabilities->HasPendingTraffic()) {
+                    capabilities->Tracking().CommitTraffic(tag, *counters);
+                    capabilities->ReleaseIdleAccounting();
+                }
+                capabilities.reset();
                 co_return;
             }, net::use_awaitable);
     }
@@ -1194,14 +1300,19 @@ net::awaitable<void> Worker::ReapAccountingDomains() {
     std::vector<std::shared_ptr<ConnectionRecord>> retired;
     for (const auto& [key, record] : runtime_->connections) {
         (void)key;
-        if (record->finished) retired.push_back(record);
+        if (record->finished.load(std::memory_order_acquire)) retired.push_back(record);
     }
     for (const auto& record : retired) {
+        if (!runtime_->connections.contains(record.get()) ||
+            !record->domain || !record->capabilities)
+            continue;
         const bool pending = co_await net::co_spawn(record->domain->Executor(),
-            [cap = record->capabilities]() -> net::awaitable<bool> {
-                co_return cap->HasPendingTraffic();
+            [cap = record->capabilities]() mutable -> net::awaitable<bool> {
+                const bool has_pending = cap->HasPendingTraffic();
+                cap.reset();
+                co_return has_pending;
             }, net::use_awaitable);
-        if (!pending) runtime_->connections.erase(record.get());
+        if (!pending) runtime_->EraseConnection(id_, record);
     }
 }
 
@@ -1211,10 +1322,25 @@ net::awaitable<std::vector<OnlineDevice>> Worker::GetOnlineDevices(std::string t
     if (handler) {
         result = runtime_->inbound_handlers->GetOnlineDevices(handler->ReceiverSettings().protocol, tag);
     }
-    for (const auto& owner : AccountingDomains()) {
-        auto devices = co_await net::co_spawn(owner.domain->Executor(),
-            [capabilities = owner.capabilities, tag]() -> net::awaitable<std::vector<OnlineDevice>> {
-                co_return capabilities->GetOnlineDevices(tag);
+    std::vector<std::shared_ptr<ConnectionRecord>> records;
+    records.reserve(runtime_->connections.size());
+    for (const auto& [key, record] : runtime_->connections) {
+        (void)key;
+        if (!record->finished.load(std::memory_order_acquire) &&
+            record->initialized.load(std::memory_order_acquire) &&
+            record->inbound_tag == tag) {
+            records.push_back(record);
+        }
+    }
+    for (const auto& record : records) {
+        if (!runtime_->connections.contains(record.get()) ||
+            !record->domain || !record->capabilities)
+            continue;
+        auto devices = co_await net::co_spawn(record->domain->Executor(),
+            [capabilities = record->capabilities, tag]() mutable -> net::awaitable<std::vector<OnlineDevice>> {
+                auto online = capabilities->GetOnlineDevices(tag);
+                capabilities.reset();
+                co_return online;
             }, net::use_awaitable);
         result.insert(result.end(), std::make_move_iterator(devices.begin()),
                       std::make_move_iterator(devices.end()));
@@ -1240,7 +1366,7 @@ WorkerRuntimeStatsSnapshot Worker::CollectNativeRuntimeStats(bool include_resour
     snapshot.active_connections = 0;
     for (const auto& [key, record] : runtime_->connections) {
         (void)key;
-        if (!record->finished) ++snapshot.active_connections;
+        if (!record->finished.load(std::memory_order_acquire)) ++snapshot.active_connections;
     }
     if (!include_resources) return snapshot;
     auto& resources = snapshot.resources.emplace();
@@ -1276,20 +1402,41 @@ WorkerRuntimeStatsSnapshot Worker::CollectNativeRuntimeStats(bool include_resour
 
 net::awaitable<WorkerRuntimeStatsSnapshot> Worker::CollectRuntimeStats(bool include_resources) const {
     auto result = CollectNativeRuntimeStats(include_resources);
-    struct Sample { app::AccountingDomain owner; bool include_stats; };
+    struct Sample {
+        std::shared_ptr<ConnectionRecord> record;
+        bool was_active = false;
+    };
     std::vector<Sample> samples;
     samples.reserve(runtime_->connections.size());
     for (const auto& [key, record] : runtime_->connections) {
         (void)key;
-        if (record->initialized.load(std::memory_order_acquire))
-            samples.push_back({{record->capabilities, record->domain}, !record->finished});
+        if (record->initialized.load(std::memory_order_acquire)) {
+            samples.push_back(Sample{
+                .record = record,
+                .was_active = !record->finished.load(std::memory_order_acquire),
+            });
+        }
     }
-    for (const auto& sample : samples) {
-        const auto values = co_await net::co_spawn(sample.owner.domain->Executor(),
-            [owner = sample.owner, include_stats = sample.include_stats,
-             include_resources]() -> net::awaitable<WorkerRuntimeStatsSnapshot> {
+    for (const auto& [record, was_active] : samples) {
+        if (was_active && record->finished.load(std::memory_order_acquire)) {
+            result.stats.connections_total += record->final_stats.connections_total;
+            result.stats.bytes_in += record->final_stats.bytes_in;
+            result.stats.bytes_out += record->final_stats.bytes_out;
+            result.stats.errors += record->final_stats.errors;
+            if (result.active_connections > 0) {
+                --result.active_connections;
+            }
+            continue;
+        }
+        if (!runtime_->connections.contains(record.get()) ||
+            !record->domain || !record->capabilities)
+            continue;
+        const bool include_stats = !record->finished.load(std::memory_order_acquire);
+        const auto values = co_await net::co_spawn(record->domain->Executor(),
+            [cap = record->capabilities, domain = record->domain, include_stats,
+             include_resources]() mutable -> net::awaitable<WorkerRuntimeStatsSnapshot> {
                 WorkerRuntimeStatsSnapshot snapshot;
-                if (include_stats) snapshot.stats = owner.capabilities->Stats().Snapshot();
+                if (include_stats) snapshot.stats = cap->Stats().Snapshot();
                 const auto footprint = memory::ThreadMemoryPool().GetFootprint();
                 snapshot.memory.pool_mapped_bytes = footprint.mapped_bytes;
                 snapshot.memory.pool_direct_bytes = footprint.direct_bytes;
@@ -1297,28 +1444,41 @@ net::awaitable<WorkerRuntimeStatsSnapshot> Worker::CollectRuntimeStats(bool incl
                 snapshot.memory.pool_chunks = footprint.chunks;
                 if (include_resources && include_stats) {
                     const auto timers = TimeoutScheduler::ForIoContext(
-                        owner.domain->Reactor()).GetResourceStats();
+                        domain->Reactor()).GetResourceStats();
                     auto& resources = snapshot.resources.emplace();
                     resources.timeout_events = timers.active_events;
                     resources.timeout_heap_capacity = timers.heap_capacity;
                     resources.timeout_waiters = timers.wait_pending ? 1 : 0;
                 }
+                cap.reset();
+                domain.reset();
                 co_return snapshot;
             }, net::use_awaitable);
-        result.stats.connections_total += values.stats.connections_total;
-        result.stats.connections_active += values.stats.connections_active;
-        result.stats.bytes_in += values.stats.bytes_in;
-        result.stats.bytes_out += values.stats.bytes_out;
-        result.stats.errors += values.stats.errors;
+        const bool still_active = !record->finished.load(std::memory_order_acquire);
+        if (still_active) {
+            result.stats.connections_total += values.stats.connections_total;
+            result.stats.connections_active += values.stats.connections_active;
+            result.stats.bytes_in += values.stats.bytes_in;
+            result.stats.bytes_out += values.stats.bytes_out;
+            result.stats.errors += values.stats.errors;
+            if (values.resources) {
+                result.resources->timeout_events += values.resources->timeout_events;
+                result.resources->timeout_heap_capacity += values.resources->timeout_heap_capacity;
+                result.resources->timeout_waiters += values.resources->timeout_waiters;
+            }
+        } else if (include_stats) {
+            result.stats.connections_total += record->final_stats.connections_total;
+            result.stats.bytes_in += record->final_stats.bytes_in;
+            result.stats.bytes_out += record->final_stats.bytes_out;
+            result.stats.errors += record->final_stats.errors;
+            if (result.active_connections > 0) {
+                --result.active_connections;
+            }
+        }
         result.memory.pool_mapped_bytes += values.memory.pool_mapped_bytes;
         result.memory.pool_direct_bytes += values.memory.pool_direct_bytes;
         result.memory.pool_idle_bytes += values.memory.pool_idle_bytes;
         result.memory.pool_chunks += values.memory.pool_chunks;
-        if (values.resources) {
-            result.resources->timeout_events += values.resources->timeout_events;
-            result.resources->timeout_heap_capacity += values.resources->timeout_heap_capacity;
-            result.resources->timeout_waiters += values.resources->timeout_waiters;
-        }
     }
     co_return result;
 }
@@ -1337,9 +1497,11 @@ void Worker::CollectHeap() {
 net::awaitable<bool> Worker::AddUdpListenerTask(
     PortBinding binding,
     proxyman::inbound::BuildRequest req) {
-    if (stop_requested_.load(std::memory_order_acquire))
+    if (stop_requested_.load(std::memory_order_acquire) ||
+        drain_requested_.load(std::memory_order_relaxed) ||
+        !runtime_ || runtime_->listener_state->stopping)
         throw IoSystemError(net::error::operation_aborted);
-    ColdMutationGuard mutation(runtime_->cold_mutation_active);
+    ColdMutationGuard mutation(runtime_->cold_mutation_active, runtime_->listener_state.get());
     auto result =
         runtime_->inbound_handlers->NewDatagramHandler(
             runtime_->connection_limiter.get(), req);
@@ -1380,10 +1542,16 @@ net::awaitable<bool> Worker::ListenerState::StartUdpListening(
     if (replacing &&
         existing_slot->second->udp_binding->UsesSameSocket(binding)) {
         auto cancellation = co_await net::this_coro::cancellation_state;
-        if (cancellation.cancelled() != net::cancellation_type::none)
+        if (stopping ||
+            worker.stop_requested_.load(std::memory_order_acquire) ||
+            worker.drain_requested_.load(std::memory_order_relaxed) ||
+            cancellation.cancelled() != net::cancellation_type::none)
             throw IoSystemError(net::error::operation_aborted);
         const bool replaced = existing_slot->second->udp_ingress->ReplaceHandler(std::move(handler));
-        if (cancellation.cancelled() != net::cancellation_type::none)
+        if (stopping ||
+            worker.stop_requested_.load(std::memory_order_acquire) ||
+            worker.drain_requested_.load(std::memory_order_relaxed) ||
+            cancellation.cancelled() != net::cancellation_type::none)
             throw IoSystemError(net::error::operation_aborted);
         co_return replaced;
     }
@@ -1536,7 +1704,10 @@ net::awaitable<bool> Worker::ListenerState::StartUdpListening(
             FailRuntime("udp-retirement", "unknown UDP retirement failure");
         }
     }
-    if (stopping) throw IoSystemError(net::error::operation_aborted);
+    if (stopping ||
+        worker.stop_requested_.load(std::memory_order_acquire) ||
+        worker.drain_requested_.load(std::memory_order_relaxed))
+        throw IoSystemError(net::error::operation_aborted);
     try {
         auto& listener_slot = *slot_it->second;
         auto* committed_ingress = replacement_ingress.get();

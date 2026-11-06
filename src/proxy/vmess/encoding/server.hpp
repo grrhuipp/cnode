@@ -25,6 +25,9 @@ public:
         uint64_t trace_conn_id = 0);
     [[nodiscard]] size_t RequiredHeaderBytes() const noexcept { return required_header_bytes_; }
     [[nodiscard]] std::string_view HeaderFailureReason() const noexcept { return header_failure_reason_; }
+    [[nodiscard]] const VMessRequest* AuthenticatedRejectedHeader() const noexcept {
+        return !request_set_ && request_.user ? &request_ : nullptr;
+    }
 
     void SetRequest(VMessRequest request);
 

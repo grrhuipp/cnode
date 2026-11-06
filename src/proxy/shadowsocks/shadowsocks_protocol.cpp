@@ -8,12 +8,12 @@
 #include <openssl/hkdf.h>
 
 #include <algorithm>
+#include <array>
+#include <climits>
 #include <cstring>
 #include <limits>
-#include <utility>
-#include <climits>
 #include <stdexcept>
-#include <vector>
+#include <utility>
 
 namespace acpp::ss {
 
@@ -120,10 +120,13 @@ KeyBytes Decode2022Psk(std::string_view password, size_t key_size) {
     }
 
     std::string encoded;
-    encoded.reserve(password.size() + 3);
+    encoded.reserve(44);
     for (const char ch : password) {
         if (ch == '\r' || ch == '\n' || ch == '\t' || ch == ' ') {
             continue;
+        }
+        if (encoded.size() >= 44) {
+            return key;
         }
         if (ch == '-') {
             encoded.push_back('+');
@@ -137,22 +140,55 @@ KeyBytes Decode2022Psk(std::string_view password, size_t key_size) {
         return key;
     }
     while (encoded.size() % 4 != 0) {
+        if (encoded.size() >= 44) {
+            return key;
+        }
         encoded.push_back('=');
     }
 
-    std::vector<uint8_t> decoded((encoded.size() / 4) * 3);
+    size_t pad_count = 0;
+    const size_t first_pad = encoded.find('=');
+    if (first_pad != std::string::npos) {
+        pad_count = encoded.size() - first_pad;
+        if (pad_count > 2) {
+            return key;
+        }
+        for (size_t i = first_pad; i < encoded.size(); ++i) {
+            if (encoded[i] != '=') {
+                return key;
+            }
+        }
+    }
+
+    auto sextet_value = [](char c) noexcept -> int {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '+') return 62;
+        if (c == '/') return 63;
+        return -1;
+    };
+    if (pad_count == 1) {
+        const int last_sextet = sextet_value(encoded[encoded.size() - 2]);
+        if (last_sextet < 0 || (last_sextet & 0x03) != 0) {
+            return key;
+        }
+    } else if (pad_count == 2) {
+        const int last_sextet = sextet_value(encoded[encoded.size() - 3]);
+        if (last_sextet < 0 || (last_sextet & 0x0F) != 0) {
+            return key;
+        }
+    }
+
+    std::array<uint8_t, 36> decoded{};
     const int decoded_len = EVP_DecodeBlock(
         decoded.data(),
         reinterpret_cast<const uint8_t*>(encoded.data()),
         static_cast<int>(encoded.size()));
-    if (decoded_len < 0) {
+    if (decoded_len < 0 || static_cast<size_t>(decoded_len) < pad_count) {
         return key;
     }
-    size_t plain_len = static_cast<size_t>(decoded_len);
-    while (!encoded.empty() && encoded.back() == '=') {
-        --plain_len;
-        encoded.pop_back();
-    }
+    const size_t plain_len = static_cast<size_t>(decoded_len) - pad_count;
     if (plain_len != key_size) {
         return key;
     }

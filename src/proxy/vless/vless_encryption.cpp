@@ -82,7 +82,7 @@ constexpr int kMaxPaddingLength = 18 + 65535;
     int64_t max_len = 0;
     for (size_t i = 0; i < parts.size(); ++i) {
         const auto fields = Split(parts[i], '-');
-        if (fields.size() < 3 || fields[0].empty() ||
+        if (fields.size() != 3 || fields[0].empty() ||
             fields[1].empty() || fields[2].empty()) {
             return VlessEncryptionParseError::InvalidPadding;
         }
@@ -90,7 +90,8 @@ constexpr int kMaxPaddingLength = 18 + 65535;
         VlessEncryptionPadding padding;
         if (!ParseInt(fields[0], padding.probability) ||
             !ParseInt(fields[1], padding.from) ||
-            !ParseInt(fields[2], padding.to)) {
+            !ParseInt(fields[2], padding.to) ||
+            padding.probability > 100) {
             return VlessEncryptionParseError::InvalidPadding;
         }
 
@@ -162,6 +163,9 @@ VlessEncryptionParseResult ParseErrorResult(VlessEncryptionParseError error) {
                 !ParseInt(seconds.substr(hyphen + 1), config.seconds_to)) {
                 return ParseErrorResult(VlessEncryptionParseError::InvalidSeconds);
             }
+        }
+        if (config.seconds_from > 65535 || config.seconds_to > 65535) {
+            return ParseErrorResult(VlessEncryptionParseError::InvalidSeconds);
         }
     }
 

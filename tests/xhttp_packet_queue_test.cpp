@@ -98,5 +98,17 @@ int main() {
         shared_budget.ReleaseUpload();
     if (!shared_budget.AcquireUpload()) return 17;
     shared_budget.ReleaseUpload();
+    // Out-of-order packets (seq > next_seq_) must leave headroom so seq == next_seq_ can still be admitted.
+    acpp::detail::XHttpPacketQueue ooo_headroom;
+    constexpr size_t ooo_blocks =
+        (acpp::detail::XHttpPacketQueue::kMaxQueuedBytes -
+         acpp::detail::XHttpPacketQueue::kInOrderHeadroomBytes) /
+        acpp::buf::Buffer::kSize;
+    for (size_t i = 0; i < ooo_blocks; ++i) {
+        if (!ooo_headroom.Push(i + 1, MakePayload(0x33, acpp::buf::Buffer::kSize))) return 18;
+    }
+    if (ooo_headroom.Push(ooo_blocks + 1, MakePayload(0x33, acpp::buf::Buffer::kSize))) return 19;
+    if (!ooo_headroom.Push(0, MakePayload(0x44, acpp::buf::Buffer::kSize))) return 20;
+    if (!ooo_headroom.HasReady()) return 21;
     return EXIT_SUCCESS;
 }

@@ -149,10 +149,12 @@ std::unique_ptr<SslContext> SslContext::CreateServerAutoSign(const TlsConfig& co
     auto context = CreateAutoSignSnapshot(config);
     if (!context) return {};
     context->renewal_ = AutoSignContextRenewal::Start(
-        context->native_owner_, [config] {
+        std::move(context->native_owner_), [config] {
             auto replacement = CreateAutoSignSnapshot(config);
-            return replacement ? replacement->native_owner_ : std::shared_ptr<SSL_CTX>{};
+            return replacement ? std::move(replacement->native_owner_) : std::shared_ptr<SSL_CTX>{};
         });
+    context->ctx_ = nullptr;
+    context->shared_state_ = nullptr;
     return context;
 }
 
@@ -541,12 +543,14 @@ struct TlsStream::Impl : memory::ThreadAllocated, private transport::Cancellatio
                 // consumed only a partial record or a post-handshake message.
                 if (allocated && result <= 0 && error == SSL_ERROR_WANT_READ)
                     *allocated = {};
+                const bool shutdown_sent = kind == Kind::Shutdown &&
+                    (SSL_get_shutdown(ssl.get()) & SSL_SENT_SHUTDOWN) != 0;
                 if (!call.output.empty()) {
                     try {
                         // Reserve the physical turn before the first suspension
                         // or another SSL call can generate a subsequent record.
                         OutputTurn turn(*this);
-                        if (result > 0 || error == SSL_ERROR_WANT_READ)
+                        if (result > 0 || shutdown_sent || error == SSL_ERROR_WANT_READ)
                             lease.Reset();
                         if (turn.previous) {
                             auto [ec] = co_await turn.wake->async_receive(
@@ -567,9 +571,7 @@ struct TlsStream::Impl : memory::ThreadAllocated, private transport::Cancellatio
                 if (result > 0) co_return result;
                 // TLS close_notify sends our half-close without waiting for the
                 // peer's half. Its later data must remain available to SSL_read.
-                if (kind == Kind::Shutdown &&
-                    (SSL_get_shutdown(ssl.get()) & SSL_SENT_SHUTDOWN) != 0)
-                    co_return 0;
+                if (shutdown_sent) co_return 0;
                 if (kind == Kind::Read && error == SSL_ERROR_ZERO_RETURN) co_return 0;
                 if (error != SSL_ERROR_WANT_READ && error != SSL_ERROR_WANT_WRITE)
                     Fail(call);
@@ -748,10 +750,20 @@ net::awaitable<bool> TlsStream::Handshake() {
 
     if (reality_client_state_ &&
         !VerifyRealityClientHandshake(NativeSsl(), *reality_client_state_)) {
-        if (!reality_client_state_->spider_x.empty()) {
-            const std::string_view host = reality_client_state_->server_name.empty()
+        std::string spider_x = std::move(reality_client_state_->spider_x);
+        std::string server_name = std::move(reality_client_state_->server_name);
+        if (server_name.empty()) {
+            if (const char* sni = SSL_get_servername(
+                    NativeSsl(), TLSEXT_NAMETYPE_host_name);
+                sni && *sni != '\0') {
+                server_name.assign(sni);
+            }
+        }
+        ClearRealityClientState(NativeSsl(), reality_client_state_);
+        if (!spider_x.empty()) {
+            const std::string_view host = server_name.empty()
                 ? std::string_view("localhost")
-                : std::string_view(reality_client_state_->server_name);
+                : std::string_view(server_name);
             static constexpr std::string_view kReqPrefix = "GET ";
             static constexpr std::string_view kReqMid = " HTTP/1.1\r\nHost: ";
             static constexpr std::string_view kReqSuffix =
@@ -761,17 +773,18 @@ net::awaitable<bool> TlsStream::Handshake() {
                 "Connection: close\r\n\r\n";
             const std::array<net::const_buffer, 5> request_buffers{
                 net::buffer(kReqPrefix.data(), kReqPrefix.size()),
-                net::buffer(reality_client_state_->spider_x.data(),
-                            reality_client_state_->spider_x.size()),
+                net::buffer(spider_x.data(), spider_x.size()),
                 net::buffer(kReqMid.data(), kReqMid.size()),
                 net::buffer(host.data(), host.size()),
                 net::buffer(kReqSuffix.data(), kReqSuffix.size()),
             };
             try {
                 co_await impl_->Write(request_buffers);
+                std::string{}.swap(spider_x);
+                std::string{}.swap(server_name);
                 buf::BufferGuard drain;
                 (void)co_await impl_->Read({}, &drain);
-            } catch (const IoSystemError&) {
+            } catch (const std::exception&) {
                 // The camouflage exchange is best-effort; authentication still
                 // fails regardless of the origin's response or close behavior.
             }
@@ -885,24 +898,27 @@ net::awaitable<void> TlsStream::WriteBuffers(
         throw IoSystemError(io_error::broken_pipe);
     if (!handshake_done_ && !co_await Handshake())
         ThrowTlsHandshakeFailure("TLS handshake failed during write");
+    while (!buffers.empty() && buffers.front().size() == 0) buffers = buffers.subspan(1);
     if (buffers.empty()) co_return;
     if (impl_->tcp->IsWriteCancellationDeferred()) {
         // Isolate the whole physical frame, not just individual socket writes:
         // coroutine cancellation must not abandon later TLS records mid-frame.
-        co_await net::co_spawn(impl_->tcp->GetExecutor(), impl_->Write(buffers),
-            net::bind_cancellation_slot(net::cancellation_slot{},
-                net::bind_allocator(memory::ProcessAllocator<std::byte>{},
-                    net::use_awaitable)));
+        const bool previous_throw = co_await net::this_coro::throw_if_cancelled();
+        co_await net::this_coro::throw_if_cancelled(false);
+        std::exception_ptr failure;
+        try {
+            co_await net::co_spawn(impl_->tcp->GetExecutor(), impl_->Write(buffers),
+                net::bind_cancellation_slot(net::cancellation_slot{},
+                    net::bind_allocator(memory::ProcessAllocator<std::byte>{},
+                        net::use_awaitable)));
+        } catch (...) {
+            failure = std::current_exception();
+        }
+        co_await net::this_coro::throw_if_cancelled(previous_throw);
+        if (failure) std::rethrow_exception(failure);
     } else {
         co_await impl_->Write(buffers);
     }
-}
-
-net::awaitable<void> TlsStream::WriteMultiBuffer(buf::MultiBuffer mb) {
-    if (mb.byte_size() == 0) co_return;
-    ConstBufferSpanBuilder<8> buffers;
-    buffers.AppendMultiBuffer(mb);
-    co_await WriteBuffers(buffers.Span());
 }
 
 void TlsStream::ShutdownRead() {
@@ -1007,7 +1023,9 @@ net::awaitable<std::unique_ptr<TlsStream>> WrapRealityClient(
 
     auto stream = std::make_unique<TlsStream>(std::move(inner), ctx, false);
 
-    if (!server_name.empty() && !stream->SetServerIdentity(server_name)) {
+    const std::string_view effective_sni =
+        server_name.empty() ? std::string_view(reality.server_name) : server_name;
+    if (!effective_sni.empty() && !stream->SetServerIdentity(effective_sni)) {
         co_return nullptr;
     }
     if (!stream->SetRealityClient(reality)) {

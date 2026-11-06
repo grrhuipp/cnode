@@ -111,5 +111,14 @@ int main() {
     if (independent->TryAcceptGlobal() !=
         acpp::ConnectionLimiterCore::RejectReason::NONE) return 20;
     independent->ReleaseGlobal();
+    // Multiple auth failures within the same second must accumulate and reach ban limit.
+    auto multi_fail = std::make_unique<acpp::ConnectionLimiterCore>(
+        acpp::RateLimitConfig{.auth_fail_limit = 3, .auth_fail_window = 60, .auth_ban_seconds = 60});
+    multi_fail->OnAuthFailTracked(tag, "192.0.2.55");
+    if (multi_fail->IsBanned(tag, "192.0.2.55")) return 22;
+    multi_fail->OnAuthFailTracked(tag, "192.0.2.55");
+    if (multi_fail->IsBanned(tag, "192.0.2.55")) return 23;
+    multi_fail->OnAuthFailTracked(tag, "192.0.2.55");
+    if (!multi_fail->IsBanned(tag, "192.0.2.55")) return 24;
     return 0;
 }

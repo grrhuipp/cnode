@@ -22,6 +22,7 @@ async def run_case(args, mode, output):
     resources = Resources()
     flights = []
     target_requests = []
+    boundary_peers = {}
     request = b'vless-0rtt-real-xray'
     response = b'accepted-once-per-nfs-key'
     result = {'mode': mode, 'passed': False}
@@ -73,12 +74,13 @@ async def run_case(args, mode, output):
 
         bridge_port = await resources.listen(bridge)
         configure(output,
-            {'protocol': 'vless', 'listen': '127.0.0.1', 'port': server_port,
+            {'protocol': 'vless', 'listen': '127.0.0.1', 'port': server_port, 'proxyProtocol': 'off',
              'settings': {'decryption': decryption, 'clients': [{'id': str(USER)}]}},
             {'protocol': 'freedom', 'settings': {}})
         config_path = output / 'config.json'
         config = json.loads(config_path.read_text())
         config['workers'] = 4
+        config['timeouts']['handshake'] = 2
         config['log'].update(enable=True, loglevel='debug')
         config_path.write_text(json.dumps(config))
         reference = {'log': {'loglevel': 'debug'},
@@ -111,6 +113,28 @@ async def run_case(args, mode, output):
         assert flights[0]['before_first_response'] >= 1298, 'initial PFS flight not observed'
         assert all(98 <= item['before_first_response'] < 1000 for item in flights[1:]), \
             'resumption silently fell back to a fresh PFS handshake'
+
+        # Bypass PROXY autodetection: these connections must reach the encryption
+        # runtime itself, including a truly empty FIN and a nonempty short flight.
+        for kind, payload in (
+                ('empty', b''), ('truncated', b'\0'),
+                ('rejected', b'\0' * len(flights[0]['sent'])), ('timeout', None)):
+            reader, writer = await resources.connect(server_port)
+            boundary_peers[kind] = writer.get_extra_info('sockname')[1]
+            if payload is not None:
+                writer.write(payload)
+                await writer.drain()
+                writer.write_eof()
+            try:
+                await asyncio.wait_for(reader.read(), 4)
+            except ConnectionError:
+                pass
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except ConnectionError:
+                pass
+        assert len(target_requests) == 17, 'invalid handshake reached target'
         replay = bytes(flights[1]['sent'])
         (output / 'captured-zero-rtt.bin').write_bytes(replay)
         for _ in range(64):
@@ -134,6 +158,17 @@ async def run_case(args, mode, output):
     result['peer_errors'] = resources.errors
     result['passed'] &= not resources.errors and result['children_alive']
     logs = '\n'.join(path.read_text(errors='replace') for path in output.rglob('*.log'))
+    for kind, port in boundary_peers.items():
+        peer_logs = '\n'.join(line for line in logs.splitlines() if f'127.0.0.1:{port}' in line)
+        expected = {'truncated': 'encryption handshake truncated',
+                    'rejected': 'encryption handshake rejected', 'timeout': 'timeout'}
+        valid = ('encryption handshake' not in peer_logs and 'authentication failed' not in peer_logs
+                 if kind == 'empty' else
+                 (expected[kind] in peer_logs or
+                  (kind == 'timeout' and 'encryption handshake timed out' in peer_logs)))
+        if not valid:
+            result['passed'] = False
+            result.setdefault('error', f'{kind} encryption boundary misclassified: {peer_logs}')
     lookups = [(int(owner), int(receiver), accepted == 'true')
                for owner, receiver, accepted in re.findall(
                    r'ticket lookup owner=(\d+) receiver=(\d+) accepted=(true|false)', logs)]

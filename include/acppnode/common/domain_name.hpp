@@ -28,9 +28,13 @@ enum class TrailingDotPolicy {
 [[nodiscard]] inline bool DnsHostnamesEqual(
     std::string_view lhs,
     std::string_view rhs) noexcept {
+    if (lhs.empty() && rhs.empty()) return true;
     lhs = WithoutTrailingRootDot(lhs);
     rhs = WithoutTrailingRootDot(rhs);
-    if (lhs.size() != rhs.size()) return false;
+    if (lhs.empty() || rhs.empty() || lhs.back() == '.' || rhs.back() == '.' ||
+        lhs.size() != rhs.size()) {
+        return false;
+    }
     for (std::size_t i = 0; i < lhs.size(); ++i) {
         if (ToLowerAscii(static_cast<unsigned char>(lhs[i])) !=
             ToLowerAscii(static_cast<unsigned char>(rhs[i]))) {

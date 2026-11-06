@@ -24,8 +24,9 @@ inline constexpr std::string_view kPanelNodeTagPrefix = "panel/";
                        panel_name, node_id, protocol, port);
 }
 
-[[nodiscard]] inline std::string BuildPanelNodeStatsKey(std::string_view panel_name, int node_id) {
-    return std::format("{}-{}", panel_name, node_id);
+[[nodiscard]] inline std::string BuildPanelNodeAccountingKey(std::string_view panel_name,
+                                                             int node_id) {
+    return std::format("{}{}/{}/", kPanelNodeTagPrefix, panel_name, node_id);
 }
 
 [[nodiscard]] inline std::string LowerAscii(std::string value) {

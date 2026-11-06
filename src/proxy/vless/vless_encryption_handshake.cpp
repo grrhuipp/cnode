@@ -42,11 +42,12 @@ constexpr VlessEncryptionPadding kDefaultPaddingLens[] = {
     if (from > to) {
         std::swap(from, to);
     }
-    const uint64_t width = static_cast<uint64_t>(to - from);
-    if (width == 0) {
-        return from;
+    const uint64_t diff =
+        static_cast<uint64_t>(to) - static_cast<uint64_t>(from);
+    if (diff == std::numeric_limits<uint64_t>::max()) {
+        return static_cast<int64_t>(RandomU64());
     }
-    return from + static_cast<int64_t>(RandomU64() % width);
+    return from + static_cast<int64_t>(RandomU64() % (diff + 1));
 }
 
 [[nodiscard]] std::optional<uint32_t> PickPaddingValue(
@@ -54,7 +55,7 @@ constexpr VlessEncryptionPadding kDefaultPaddingLens[] = {
     if (padding.probability < 0 || padding.from < 0 || padding.to < 0) {
         return std::nullopt;
     }
-    if (padding.probability < RandomBetween(0, 100)) {
+    if (padding.probability == 0 || padding.probability <= RandomBetween(0, 99)) {
         return 0;
     }
     const int64_t value = RandomBetween(padding.from, padding.to);
@@ -119,13 +120,16 @@ IvSpan(const std::array<uint8_t, kVlessEncryptionIvSize>& iv) noexcept {
 
 [[nodiscard]] uint16_t TicketSeconds(
     const VlessEncryptionConfig& config) noexcept {
+    if (config.seconds_from <= 0 && config.seconds_to <= 0) {
+        return 0;
+    }
     int64_t seconds = 0;
     if (config.seconds_to == 0) {
         seconds = config.seconds_from * RandomBetween(50, 100) / 100;
     } else {
         seconds = RandomBetween(config.seconds_from, config.seconds_to);
     }
-    return static_cast<uint16_t>(seconds & 0xffff);
+    return static_cast<uint16_t>(std::clamp<int64_t>(seconds, 1, 65535));
 }
 
 // PFS key layout: ML-KEM-768 shared secret followed by X25519 shared secret.

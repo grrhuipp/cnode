@@ -41,6 +41,7 @@ void CidrSet::InsertBits(Trie& trie, std::span<const uint8_t> network, uint8_t p
     }
     int32_t node = 0;
     for (uint8_t i = 0; i < prefix; ++i) {
+        if (trie[node].terminal) return;
         const int bit = (network[i / 8] >> (7 - i % 8)) & 1;
         int32_t next = trie[node].children[bit];
         if (next < 0) {
@@ -83,13 +84,21 @@ DomainRuleSet::DomainRuleSet(std::pmr::memory_resource* resource)
 void DomainRuleSet::AddFull(std::string_view domain) {
     std::pmr::string lower(domain, full_.get_allocator());
     domain::NormalizeDnsHostnameInPlace(lower);
+    if (lower.empty()) {
+        return;
+    }
     full_.insert(std::move(lower));
 }
 
 void DomainRuleSet::AddSuffix(std::string_view suffix) {
-    std::string lower(suffix);
+    while (!suffix.empty() && suffix.front() == '.') {
+        suffix.remove_prefix(1);
+    }
+    std::pmr::string lower(suffix, suffix_nodes_.get_allocator());
     domain::NormalizeDnsHostnameInPlace(lower);
-
+    if (lower.empty()) {
+        return;
+    }
     // 子节点向量必须与节点表同属一个 memory_resource。
     const auto new_node = [this] {
         suffix_nodes_.push_back(SuffixNode{
@@ -119,6 +128,9 @@ void DomainRuleSet::AddSuffix(std::string_view suffix) {
 }
 
 void DomainRuleSet::AddKeyword(std::string_view keyword) {
+    if (keyword.empty()) {
+        return;
+    }
     auto& lower = keywords_.emplace_back(keyword);
     std::ranges::transform(lower, lower.begin(), [](char ch) {
         return domain::ToLowerAscii(static_cast<unsigned char>(ch));
@@ -136,11 +148,10 @@ bool DomainRuleSet::Match(std::string_view domain) const {
     }
 
     char stack_buf[256];
-    std::pmr::string heap_buf;
+    std::optional<memory::ThreadLocalString> heap_buf;
     char* lower = stack_buf;
     if (domain.size() > sizeof(stack_buf)) {
-        heap_buf.resize(domain.size());
-        lower = heap_buf.data();
+        lower = heap_buf.emplace(domain.size(), '\0').data();
     }
     std::ranges::transform(domain, lower, [](char ch) {
         return domain::ToLowerAscii(static_cast<unsigned char>(ch));
@@ -239,6 +250,9 @@ public:
                 ThrowCorrupt(path_, "truncated varint");
             }
             const uint8_t byte = *cur_++;
+            if (shift == 63 && byte > 1) {
+                ThrowCorrupt(path_, "varint overflows 64-bit integer");
+            }
             value |= static_cast<uint64_t>(byte & 0x7F) << shift;
             if ((byte & 0x80) == 0) {
                 return value;
@@ -315,7 +329,10 @@ private:
     std::string_view code;
     while (!reader.AtEnd()) {
         const auto field = reader.NextField();
-        if (field.number == 1 && field.wire_type == kWireBytes) {
+        if (field.number == 1) {
+            if (field.wire_type != kWireBytes) {
+                ThrowCorrupt(path, "invalid country_code wire type");
+            }
             code = AsText(reader.Bytes());
         } else {
             reader.Skip(field.wire_type);
@@ -331,9 +348,15 @@ void AddGeoIPCidr(std::span<const uint8_t> message, const std::filesystem::path&
     uint64_t prefix = 0;
     while (!reader.AtEnd()) {
         const auto field = reader.NextField();
-        if (field.number == 1 && field.wire_type == kWireBytes) {
+        if (field.number == 1) {
+            if (field.wire_type != kWireBytes) {
+                ThrowCorrupt(path, "invalid CIDR ip wire type");
+            }
             ip = reader.Bytes();
-        } else if (field.number == 2 && field.wire_type == kWireVarint) {
+        } else if (field.number == 2) {
+            if (field.wire_type != kWireVarint) {
+                ThrowCorrupt(path, "invalid CIDR prefix wire type");
+            }
             prefix = reader.Varint();
         } else {
             reader.Skip(field.wire_type);
@@ -353,9 +376,20 @@ void FillGeoIP(std::span<const uint8_t> entry, const std::filesystem::path& path
     ProtoReader reader(entry, path);
     while (!reader.AtEnd()) {
         const auto field = reader.NextField();
-        if (field.number == 2 && field.wire_type == kWireBytes) {
+        if (field.number == 1) {
+            if (field.wire_type != kWireBytes) {
+                ThrowCorrupt(path, "invalid GeoIP country_code wire type");
+            }
+            (void)reader.Bytes();
+        } else if (field.number == 2) {
+            if (field.wire_type != kWireBytes) {
+                ThrowCorrupt(path, "invalid GeoIP cidr wire type");
+            }
             AddGeoIPCidr(reader.Bytes(), path, set);
-        } else if (field.number == 3 && field.wire_type == kWireVarint) {
+        } else if (field.number == 3) {
+            if (field.wire_type != kWireVarint) {
+                ThrowCorrupt(path, "invalid GeoIP reverse_match wire type");
+            }
             if (reader.Varint() != 0) {
                 throw std::runtime_error(std::format(
                     "geodata '{}' uses unsupported reverse_match", path.string()));
@@ -373,10 +407,21 @@ void AddGeoSiteDomain(std::span<const uint8_t> message, const std::filesystem::p
     std::string_view value;
     while (!reader.AtEnd()) {
         const auto field = reader.NextField();
-        if (field.number == 1 && field.wire_type == kWireVarint) {
+        if (field.number == 1) {
+            if (field.wire_type != kWireVarint) {
+                ThrowCorrupt(path, "invalid Domain type wire type");
+            }
             type = reader.Varint();
-        } else if (field.number == 2 && field.wire_type == kWireBytes) {
+        } else if (field.number == 2) {
+            if (field.wire_type != kWireBytes) {
+                ThrowCorrupt(path, "invalid Domain value wire type");
+            }
             value = AsText(reader.Bytes());
+        } else if (field.number == 3) {
+            if (field.wire_type != kWireBytes) {
+                ThrowCorrupt(path, "invalid Domain attribute wire type");
+            }
+            (void)reader.Bytes();
         } else {
             reader.Skip(field.wire_type);
         }
@@ -400,7 +445,15 @@ void FillGeoSite(std::span<const uint8_t> entry, const std::filesystem::path& pa
     ProtoReader reader(entry, path);
     while (!reader.AtEnd()) {
         const auto field = reader.NextField();
-        if (field.number == 2 && field.wire_type == kWireBytes) {
+        if (field.number == 1) {
+            if (field.wire_type != kWireBytes) {
+                ThrowCorrupt(path, "invalid GeoSite country_code wire type");
+            }
+            (void)reader.Bytes();
+        } else if (field.number == 2) {
+            if (field.wire_type != kWireBytes) {
+                ThrowCorrupt(path, "invalid GeoSite domain wire type");
+            }
             AddGeoSiteDomain(reader.Bytes(), path, set);
         } else {
             reader.Skip(field.wire_type);
@@ -433,9 +486,12 @@ void LoadCategories(
     ProtoReader list(bytes, path);
     while (!list.AtEnd()) {
         const auto field = list.NextField();
-        if (field.number != 1 || field.wire_type != kWireBytes) {
+        if (field.number != 1) {
             list.Skip(field.wire_type);
             continue;
+        }
+        if (field.wire_type != kWireBytes) {
+            ThrowCorrupt(path, "invalid geodata entry wire type");
         }
         const auto entry = list.Bytes();
         auto code = LowerTag(EntryCountryCode(entry, path));

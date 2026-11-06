@@ -1,5 +1,6 @@
 #include "vless_vision.hpp"
 #include "acppnode/common/byte_reader.hpp"
+#include "acppnode/common/buffer_util.hpp"
 
 #include "acppnode/common/error.hpp"
 #include <algorithm>
@@ -104,6 +105,159 @@ struct CompleteRecords {
     }
 };
 
+
+using VisionFrameBufferBuilder =
+    ConstBufferSpanBuilder<buf::MultiBuffer::kInlineCapacity * 3>;
+
+void AppendVisionFrameBuffers(
+    buf::MultiBuffer& header_owner,
+    VisionFrameBufferBuilder& out,
+    std::span<const uint8_t, 16> user_uuid,
+    bool& send_uuid,
+    std::span<const uint8_t> content,
+    uint8_t command,
+    bool long_padding) {
+    const uint16_t padding_len = PaddingLen(content.size(), long_padding);
+    const size_t header_len = send_uuid
+        ? kVisionUuidHeaderLen
+        : kVisionBaseHeaderLen;
+
+    buf::Buffer* header_buf = header_owner.back();
+    if (!header_buf || header_buf->Available() < header_len) {
+        buf::BufferGuard header{buf::Buffer::New()};
+        if (!header || header->Available() < header_len) {
+            ThrowVisionAllocationFailure();
+        }
+        header_buf = header.get();
+        header_owner.push_back(std::move(header));
+    }
+
+    uint8_t* tail = header_buf->Tail().data();
+    size_t pos = 0;
+    if (send_uuid) {
+        std::memcpy(tail, user_uuid.data(), user_uuid.size());
+        pos += user_uuid.size();
+        send_uuid = false;
+    }
+    tail[pos++] = command;
+    StoreU16BE(tail + pos, static_cast<uint16_t>(content.size()));
+    pos += 2;
+    StoreU16BE(tail + pos, padding_len);
+    pos += 2;
+    header_buf->Produce(static_cast<uint32_t>(pos));
+    header_owner.RecordTailProduced(pos);
+    out.Append(net::const_buffer(tail, pos));
+    if (!content.empty()) {
+        out.Append(net::const_buffer(content.data(), content.size()));
+    }
+
+    size_t remaining_padding = padding_len;
+    while (remaining_padding > 0) {
+        const size_t n = std::min(remaining_padding, kZeroPadding.size());
+        out.Append(net::const_buffer(kZeroPadding.data(), n));
+        remaining_padding -= n;
+    }
+}
+
+void AppendVisionFramed(
+    buf::MultiBuffer& header_owner,
+    VisionFrameBufferBuilder& out,
+    std::span<const uint8_t, 16> user_uuid,
+    bool& send_uuid,
+    bool& write_process,
+    const VisionTrafficState& traffic,
+    std::span<const uint8_t> bytes,
+    bool complete_records,
+    bool last_buffer,
+    bool& ending,
+    bool& long_padding) {
+    while (!bytes.empty()) {
+        if (!write_process) {
+            out.Append(net::const_buffer(bytes.data(), bytes.size()));
+            return;
+        }
+
+        // Match Xray ReshapeMultiBuffer: prefer the last application record
+        // boundary when it leaves room for the Vision header.
+        size_t n = bytes.size();
+        if (n >= kVisionFrameContentLimit) {
+            const auto window = bytes.first(kVisionFrameContentLimit);
+            const auto it = std::find_end(window.begin(), window.end(),
+                kTlsApplicationDataStart.begin(), kTlsApplicationDataStart.end());
+            const size_t index = static_cast<size_t>(it - window.begin());
+            n = (it != window.end() && index >= kVisionUuidHeaderLen)
+                ? index : std::min<size_t>(n, 4096);
+        }
+        const auto chunk = bytes.first(n);
+        const bool application = traffic.is_tls && chunk.size() >= 6 &&
+            StartsWith(chunk, kTlsApplicationDataStart) && complete_records;
+        uint8_t command = kCommandPaddingContinue;
+        bool frame_long_padding = long_padding;
+        if (application) {
+            ending = true;
+            frame_long_padding = true;
+            long_padding = false;
+        } else if (!traffic.is_tls12_or_above && traffic.packets_to_filter <= 1) {
+            command = kCommandPaddingEnd;
+            write_process = false;
+        }
+        if (ending && last_buffer && n == bytes.size()) {
+            command = kCommandPaddingEnd;
+            write_process = false;
+        }
+        AppendVisionFrameBuffers(
+            header_owner, out, user_uuid, send_uuid, chunk, command, frame_long_padding);
+        bytes = bytes.subspan(n);
+    }
+}
+
+[[nodiscard]] std::span<const uint8_t> VisionChunkBytes(const buf::Buffer* buffer) noexcept {
+    return buffer ? buffer->Bytes() : std::span<const uint8_t>{};
+}
+
+[[nodiscard]] std::span<const uint8_t> VisionChunkBytes(const net::const_buffer& buffer) noexcept {
+    const auto* data = static_cast<const uint8_t*>(buffer.data());
+    return data ? std::span<const uint8_t>(data, buffer.size()) : std::span<const uint8_t>{};
+}
+
+template <typename BufferRange>
+net::awaitable<void> WriteVisionFramed(
+    transport::MultiBufferWriter& dst,
+    std::span<const uint8_t, 16> user_uuid,
+    bool& send_uuid,
+    bool& write_process,
+    VisionTrafficState& traffic,
+    const BufferRange& buffers) {
+    CompleteRecords records;
+    const bool filter = traffic.packets_to_filter > 0;
+    size_t remaining_bytes = 0;
+    for (const auto& buffer : buffers) {
+        const auto bytes = VisionChunkBytes(buffer);
+        if (!bytes.empty()) {
+            if (filter) {
+                traffic.FilterTLS(bytes);
+            }
+            records.Add(bytes);
+            remaining_bytes += bytes.size();
+        }
+    }
+    bool ending = false;
+    bool long_padding = traffic.is_tls;
+    buf::MultiBuffer header_owner;
+    VisionFrameBufferBuilder out;
+    for (const auto& buffer : buffers) {
+        const auto bytes = VisionChunkBytes(buffer);
+        if (!bytes.empty()) {
+            remaining_bytes -= bytes.size();
+            AppendVisionFramed(
+                header_owner, out, user_uuid, send_uuid, write_process, traffic,
+                bytes, records.Complete(), remaining_bytes == 0, ending, long_padding);
+        }
+    }
+    if (!out.empty()) {
+        co_await dst.WriteBuffers(out.Span());
+    }
+}
 }  // namespace
 
 bool IsVisionFlow(std::string_view flow) noexcept {
@@ -128,6 +282,9 @@ void VisionReader::Decode(buf::MultiBuffer& out) {
             if (content_remaining_ > 0) {
                 const size_t n = std::min(content_remaining_, pending_.byte_size());
                 if (n == 0) {
+                    if (pending_.empty()) {
+                        pending_.ReleaseIfIdle();
+                    }
                     return;
                 }
                 if (!pending_.MovePrefixTo(out, n)) {
@@ -140,6 +297,9 @@ void VisionReader::Decode(buf::MultiBuffer& out) {
                 padding_remaining_ -= pending_.DropPrefixBytes(
                     std::min(padding_remaining_, pending_.byte_size()));
                 if (padding_remaining_ > 0) {
+                    if (pending_.empty()) {
+                        pending_.ReleaseIfIdle();
+                    }
                     return;
                 }
             }
@@ -160,6 +320,9 @@ void VisionReader::Decode(buf::MultiBuffer& out) {
         header_read_ += pending_.ConsumePrefixTo(
             std::span<uint8_t>(header_).subspan(header_read_, header_len - header_read_));
         if (header_read_ < header_len) {
+            if (pending_.empty()) {
+                pending_.ReleaseIfIdle();
+            }
             return;
         }
         header_read_ = 0;
@@ -184,6 +347,7 @@ void VisionReader::Decode(buf::MultiBuffer& out) {
     }
     // After the final padded frame the rest of the stream is raw.
     pending_.MoveTo(out);
+    pending_.ReleaseIfIdle();
 }
 
 net::awaitable<buf::MultiBuffer> VisionReader::ReadMultiBuffer() {
@@ -200,11 +364,14 @@ net::awaitable<buf::MultiBuffer> VisionReader::ReadMultiBuffer() {
         }
 
         if (!read_process_) {
-            co_return co_await src_.ReadMultiBuffer();
+            co_return co_await ReadMultiBufferOrThrowOnCancel(src_);
         }
 
-        buf::MultiBuffer raw = co_await src_.ReadMultiBuffer();
+        buf::MultiBuffer raw = co_await ReadMultiBufferOrThrowOnCancel(src_);
         if (raw.byte_size() == 0) {
+            if (read_process_ && (header_read_ != 0 || frame_active_ || expect_uuid_)) {
+                throw IoSystemError(io_error::connection_reset, "VLESS Vision frame truncated");
+            }
             co_return buf::MultiBuffer{};
         }
         raw.MoveTo(pending_);
@@ -219,7 +386,7 @@ VisionWriter::VisionWriter(transport::MultiBufferWriter& dst,
     , traffic_(traffic) {}
 
 void VisionTrafficState::FilterTLS(std::span<const uint8_t> data) noexcept {
-    if (data.empty() || tls_classified) {
+    if (data.empty() || tls_classified || packets_to_filter <= 0) {
         return;
     }
     --packets_to_filter;
@@ -243,130 +410,14 @@ void VisionTrafficState::FilterTLS(std::span<const uint8_t> data) noexcept {
     }
 }
 
-void VisionWriter::AppendVisionFrameBuffers(
-    buf::MultiBuffer& header_owner,
-    memory::ThreadLocalVector<net::const_buffer>& out,
-    std::span<const uint8_t> content,
-    uint8_t command,
-    bool long_padding) {
-    const uint16_t padding_len = PaddingLen(content.size(), long_padding);
-    const size_t header_len = send_uuid_
-        ? kVisionUuidHeaderLen
-        : kVisionBaseHeaderLen;
-
-    buf::Buffer* header_buf = header_owner.back();
-    if (!header_buf || header_buf->Available() < header_len) {
-        buf::BufferGuard header{buf::Buffer::New()};
-        if (!header || header->Available() < header_len) {
-            ThrowVisionAllocationFailure();
-        }
-        header_buf = header.get();
-        header_owner.push_back(std::move(header));
-    }
-
-    uint8_t* tail = header_buf->Tail().data();
-    size_t pos = 0;
-    if (send_uuid_) {
-        std::memcpy(tail, user_uuid_.data(), user_uuid_.size());
-        pos += user_uuid_.size();
-        send_uuid_ = false;
-    }
-    tail[pos++] = command;
-    StoreU16BE(tail + pos, static_cast<uint16_t>(content.size()));
-    pos += 2;
-    StoreU16BE(tail + pos, padding_len);
-    pos += 2;
-    header_buf->Produce(static_cast<uint32_t>(pos));
-    header_owner.RecordTailProduced(pos);
-    out.emplace_back(tail, pos);
-    if (!content.empty()) {
-        out.emplace_back(content.data(), content.size());
-    }
-
-    size_t remaining_padding = padding_len;
-    while (remaining_padding > 0) {
-        const size_t n = std::min(remaining_padding, kZeroPadding.size());
-        out.emplace_back(kZeroPadding.data(), n);
-        remaining_padding -= n;
-    }
-}
-
-void VisionWriter::AppendFramed(
-    buf::MultiBuffer& header_owner,
-    memory::ThreadLocalVector<net::const_buffer>& out,
-    std::span<const uint8_t> bytes,
-    bool complete_records,
-    bool last_buffer,
-    bool& ending,
-    bool& long_padding) {
-    while (!bytes.empty()) {
-        if (!write_process_) {
-            out.emplace_back(bytes.data(), bytes.size());
-            return;
-        }
-
-        // Match Xray ReshapeMultiBuffer: prefer the last application record
-        // boundary when it leaves room for the Vision header.
-        size_t n = bytes.size();
-        if (n >= kVisionFrameContentLimit) {
-            const auto it = std::find_end(bytes.begin(), bytes.end(),
-                kTlsApplicationDataStart.begin(), kTlsApplicationDataStart.end());
-            const size_t index = static_cast<size_t>(it - bytes.begin());
-            n = index >= kVisionUuidHeaderLen && index <= kVisionFrameContentLimit
-                ? index : std::min<size_t>(n, 4096);
-        }
-        const auto chunk = bytes.first(n);
-        const bool application = traffic_.is_tls && chunk.size() >= 6 &&
-            StartsWith(chunk, kTlsApplicationDataStart) && complete_records;
-        uint8_t command = kCommandPaddingContinue;
-        bool frame_long_padding = long_padding;
-        if (application) {
-            ending = true;
-            frame_long_padding = true;
-            long_padding = false;
-        } else if (!traffic_.is_tls12_or_above && traffic_.packets_to_filter <= 1) {
-            command = kCommandPaddingEnd;
-            write_process_ = false;
-        }
-        if (ending && last_buffer && n == bytes.size()) {
-            command = kCommandPaddingEnd;
-            write_process_ = false;
-        }
-        AppendVisionFrameBuffers(header_owner, out, chunk, command, frame_long_padding);
-        bytes = bytes.subspan(n);
-    }
-}
 
 net::awaitable<void> VisionWriter::WriteMultiBuffer(buf::MultiBuffer mb) {
     if (!write_process_) {
         co_await dst_.WriteMultiBuffer(std::move(mb));
         co_return;
     }
-
-    CompleteRecords records;
-    const bool filter = traffic_.packets_to_filter > 0;
-    for (const auto* buffer : mb) {
-        if (buffer && !buffer->IsEmpty()) {
-            if (filter) traffic_.FilterTLS(buffer->Bytes());
-            records.Add(buffer->Bytes());
-        }
-    }
-    bool ending = false;
-    bool long_padding = traffic_.is_tls;
-    size_t remaining_bytes = mb.byte_size();
-    buf::MultiBuffer header_owner;
-    memory::ThreadLocalVector<net::const_buffer> out;
-    out.reserve(mb.size() * 3);
-    for (buf::Buffer* buffer : mb) {
-        if (buffer && !buffer->IsEmpty()) {
-            remaining_bytes -= buffer->Bytes().size();
-            AppendFramed(header_owner, out, buffer->Bytes(), records.Complete(),
-                         remaining_bytes == 0, ending, long_padding);
-        }
-    }
-    if (!out.empty()) {
-        co_await dst_.WriteBuffers(out);
-    }
+    co_await WriteVisionFramed(
+        dst_, user_uuid_, send_uuid_, write_process_, traffic_, mb);
     mb.clear();
 }
 
@@ -375,32 +426,8 @@ net::awaitable<void> VisionWriter::WriteBuffers(std::span<const net::const_buffe
         co_await dst_.WriteBuffers(buffers);
         co_return;
     }
-    CompleteRecords records;
-    const bool filter = traffic_.packets_to_filter > 0;
-    size_t remaining_bytes = 0;
-    for (const auto& buffer : buffers) {
-        const auto bytes = std::span(static_cast<const uint8_t*>(buffer.data()), buffer.size());
-        if (filter) traffic_.FilterTLS(bytes);
-        records.Add(bytes);
-        remaining_bytes += buffer.size();
-    }
-    bool ending = false;
-    bool long_padding = traffic_.is_tls;
-
-    buf::MultiBuffer header_owner;
-    memory::ThreadLocalVector<net::const_buffer> out;
-    out.reserve(buffers.size() * 3);
-    for (const net::const_buffer& buffer : buffers) {
-        const auto* data = static_cast<const uint8_t*>(buffer.data());
-        if (data && buffer.size() > 0) {
-            remaining_bytes -= buffer.size();
-            AppendFramed(header_owner, out, std::span<const uint8_t>(data, buffer.size()),
-                         records.Complete(), remaining_bytes == 0, ending, long_padding);
-        }
-    }
-    if (!out.empty()) {
-        co_await dst_.WriteBuffers(out);
-    }
+    co_await WriteVisionFramed(
+        dst_, user_uuid_, send_uuid_, write_process_, traffic_, buffers);
 }
 
 net::awaitable<void> VisionWriter::AsyncShutdownWrite() {

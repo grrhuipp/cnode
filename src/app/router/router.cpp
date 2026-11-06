@@ -47,6 +47,16 @@ void SortUniqueStrings(StringVector& values) {
     return {};
 }
 
+[[nodiscard]] const net::ip::address* RoutingAddress(const session::Context& ctx) noexcept {
+    if (ctx.outbound.route_target.IsValid() && ctx.outbound.route_target.resolved_addr) {
+        return &*ctx.outbound.route_target.resolved_addr;
+    }
+    if (ctx.outbound.target.resolved_addr) {
+        return &*ctx.outbound.target.resolved_addr;
+    }
+    return nullptr;
+}
+
 [[nodiscard]] std::span<const uint8_t> NetworkBytes(const RoutingIpNetwork& network) noexcept {
     return std::span<const uint8_t>(network.Network()).first(network.IsV6() ? 16 : 4);
 }
@@ -97,10 +107,12 @@ struct CompoundRoutingRule {
         has_protocol_condition = true;
         protocol_mask = 0;
         protocol_values.clear();
-        protocol_values.reserve(protocols.size());
         for (const auto& protocol : protocols) {
-            protocol_mask |= ProtocolBit(protocol);
-            protocol_values.emplace_back(protocol);
+            if (const uint8_t bit = ProtocolBit(protocol); bit != 0) {
+                protocol_mask |= bit;
+            } else {
+                protocol_values.emplace_back(protocol);
+            }
         }
         SortUniqueStrings(protocol_values);
     }
@@ -173,7 +185,10 @@ struct CompoundRoutingRule {
         if (has_source_port_condition && !MatchPortRanges(source_port_ranges, ctx.inbound.source_port)) {
             return false;
         }
-        if (has_port_condition && !MatchPortRanges(port_ranges, ctx.outbound.target.port)) {
+        const uint16_t target_port = ctx.outbound.route_target.IsValid()
+            ? ctx.outbound.route_target.port
+            : ctx.outbound.target.port;
+        if (has_port_condition && !MatchPortRanges(port_ranges, target_port)) {
             return false;
         }
         if (source_ip_matcher) {
@@ -183,8 +198,8 @@ struct CompoundRoutingRule {
             }
         }
         if (ip_matcher) {
-            const auto& target = ctx.outbound.target;
-            if (!target.resolved_addr || !ip_matcher->Match(*target.resolved_addr)) {
+            const auto* addr = RoutingAddress(ctx);
+            if (!addr || !ip_matcher->Match(*addr)) {
                 return false;
             }
         }
@@ -346,7 +361,7 @@ Router::Impl::Impl(
             compound.SetProtocolCondition(rc.protocol);
         }
 
-        ::acpp::geo::CidrSet source_ip_matcher;
+        ::acpp::geo::CidrSet source_ip_matcher(memory::process_resource());
         for (const auto& value : rc.source) {
             source_ip_matcher.Insert(NetworkBytes(value), value.Prefix());
         }
@@ -354,7 +369,7 @@ Router::Impl::Impl(
             compound.source_ip_matcher.emplace(std::move(source_ip_matcher));
         }
 
-        ::acpp::geo::CidrSet ip_matcher;
+        ::acpp::geo::CidrSet ip_matcher(memory::process_resource());
         for (const auto& value : rc.ip) {
             ip_matcher.Insert(NetworkBytes(value), value.Prefix());
         }
@@ -362,7 +377,7 @@ Router::Impl::Impl(
             compound.ip_matcher.emplace(std::move(ip_matcher));
         }
 
-        ::acpp::geo::DomainRuleSet domain_matcher;
+        ::acpp::geo::DomainRuleSet domain_matcher(memory::process_resource());
         for (const auto& value : rc.domain_suffix) {
             domain_matcher.AddSuffix(value);
         }
@@ -427,10 +442,10 @@ GeoSiteCondition::GeoSiteCondition(
 }
 
 bool GeoIPCondition::Match(const session::Context& ctx) const {
-    const auto& target = ctx.outbound.target;
-    if (!target.resolved_addr) return false;
+    const auto* addr = RoutingAddress(ctx);
+    if (!addr) return false;
     for (const auto* set : sets_) {
-        if (set->Match(*target.resolved_addr)) return true;
+        if (set->Match(*addr)) return true;
     }
     return false;
 }

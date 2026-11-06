@@ -81,7 +81,6 @@ public:
         net::io_context& reactor, uint32_t worker_id,
         net::any_io_executor worker_executor, std::shared_ptr<Hooks> hooks,
         std::shared_ptr<GroupCoordinator> coordinator);
-    [[nodiscard]] std::shared_ptr<ExecutionDomain> CreateSibling(std::shared_ptr<Hooks> hooks);
     ~ExecutionDomain();
     ExecutionDomain(const ExecutionDomain&) = delete;
     ExecutionDomain& operator=(const ExecutionDomain&) = delete;
@@ -94,6 +93,7 @@ public:
     [[nodiscard]] std::shared_ptr<const void> LeaseIdentity() const noexcept;
     [[nodiscard]] static bool SharesLeaseIdentity(const void* a, const void* b) noexcept;
     [[nodiscard]] uint32_t OwnerId() const noexcept;
+    [[nodiscard]] bool CanDestroyDirectlyOn(uint32_t worker_id) const noexcept;
     [[nodiscard]] static std::shared_ptr<ExecutionDomain> Current() noexcept;
     // Suspends the caller before freezing both execution groups. Completion
     // resumes only after both run tokens have drained and ownership is unified.
@@ -117,6 +117,8 @@ public:
         Enqueue(std::move(call));
     }
 
+    [[nodiscard]] std::shared_ptr<ExecutionDomain> CreateSibling(
+        std::shared_ptr<Hooks> hooks) const;
 private:
     struct State;
     struct Group;

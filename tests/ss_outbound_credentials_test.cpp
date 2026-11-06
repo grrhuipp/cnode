@@ -97,6 +97,10 @@ void TestInvalidCredentials() {
     Check(!Credentials::Prepare("2022-blake3-aes-256-gcm", kKey16), "16-byte key accepted for AES256");
     Check(!Credentials::Prepare("2022-blake3-chacha20-poly1305",
         std::string(kKey32) + ':' + std::string(kKey32)), "unsupported ChaCha identity chain accepted");
+    Check(!Credentials::Prepare("2022-blake3-aes-128-gcm", "===="),
+          "all-padding base64 string accepted as PSK");
+    Check(!Credentials::Prepare("2022-blake3-aes-128-gcm", "AAAAAAAAAAAAAAAAAAAAAAA==="),
+          "3-equals base64 padding accepted as PSK");
 }
 }  // namespace
 

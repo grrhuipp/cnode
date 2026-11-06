@@ -120,8 +120,9 @@ net::awaitable<void> RunRealityFallbackProxy(
         }
     }
 
-    if (!dest_stream) {
-        client_tcp->Close();
+    if (!dest_stream || !client_tcp->IsOpen()) {
+        if (dest_stream) dest_stream->CloseAbortive();
+        client_tcp->CloseAbortive();
         co_return;
     }
 
@@ -153,8 +154,8 @@ net::awaitable<void> RunRealityFallbackProxy(
     }
     memory::ByteVector{}.swap(initial_bytes);
     if (!initial_write_ok) {
-        dest_stream->Close();
-        client_tcp->Close();
+        dest_stream->CloseAbortive();
+        client_tcp->CloseAbortive();
         co_return;
     }
 
@@ -169,7 +170,8 @@ net::awaitable<void> RunRealityFallbackProxy(
                 co_await to.WriteMultiBuffer(std::move(mb));
             }
         } catch (...) {
-            to.Cancel();
+            from.CloseAbortive();
+            to.CloseAbortive();
         }
     };
     using net::experimental::awaitable_operators::operator&&;
@@ -201,24 +203,27 @@ net::awaitable<TransportBuildResult> AcceptInboundSecurity(
     }
     std::unique_ptr<RealityServerConnState> reality_conn_state;
     if (s.IsReality() && s.reality.HasDest()) {
-        // The caller's absolute phase deadline covers sniffing and SSL_accept;
-        // never restart it when another record/fragment arrives.
-        RealityClientHelloReader reader;
-        std::array<uint8_t, 1024> chunk{};
-        try {
-            while (reader.State() == RealityClientHelloReader::Status::Reading) {
-                const size_t count = co_await tcp->AsyncRead(
-                    net::buffer(chunk.data(), reader.ReadSize()));
-                if (count == 0) co_return tl::unexpected(ErrorCode::SOCKET_EOF);
-                reader.Append(std::span<const uint8_t>(chunk.data(), count));
+        memory::ByteVector initial_bytes;
+        {
+            // The caller's absolute phase deadline covers sniffing and SSL_accept;
+            // never restart it when another record/fragment arrives.
+            RealityClientHelloReader reader;
+            std::array<uint8_t, 1024> chunk{};
+            try {
+                while (reader.State() == RealityClientHelloReader::Status::Reading) {
+                    const size_t count = co_await tcp->AsyncRead(
+                        net::buffer(chunk, reader.ReadSize()));
+                    if (count == 0) co_return tl::unexpected(ErrorCode::SOCKET_EOF);
+                    reader.Append(std::span<const uint8_t>(chunk.data(), count));
+                }
+            } catch (...) {
+                co_return tl::unexpected(ErrorCode::TLS_HANDSHAKE_FAILED);
             }
-        } catch (...) {
-            co_return tl::unexpected(ErrorCode::TLS_HANDSHAKE_FAILED);
+            if (reader.State() == RealityClientHelloReader::Status::Complete) {
+                reality_conn_state = VerifyRealityClientHello(reader.Hello(), *ctx);
+            }
+            initial_bytes = reader.TakeWire();
         }
-        if (reader.State() == RealityClientHelloReader::Status::Complete) {
-            reality_conn_state = VerifyRealityClientHello(reader.Hello(), *ctx);
-        }
-        auto initial_bytes = reader.TakeWire();
         if (!reality_conn_state) {
             LOG_CONN_DEBUG(conn_id,
                 "REALITY server handshake unauthenticated; falling back to {}:{}",
@@ -364,6 +369,7 @@ net::awaitable<TransportBuildResult> DoXHttp2PacketUpClientRequest(
         std::array<uint8_t, 1> scratch{};
         (void)co_await body->AsyncRead(net::buffer(scratch));
     } catch (...) {
+        body->CloseAbortive();
         co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
     }
     body->Close();
@@ -502,7 +508,9 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
     }
 
     const std::string_view sni = tls_server_name.empty()
-        ? std::string_view(s.tls.server_name)
+        ? (s.IsReality() && !s.reality.server_name.empty()
+               ? std::string_view(s.reality.server_name)
+               : std::string_view(s.tls.server_name))
         : tls_server_name;
     // Host for HTTP-based layers unless the transport config names one.
     const std::string_view dial_host = ws_host.empty() ? sni : ws_host;
@@ -614,7 +622,9 @@ net::awaitable<TransportBuildResult> BuildOutboundXHttpClientRequest(
     }
 
     const std::string_view sni = tls_server_name.empty()
-        ? std::string_view(s.tls.server_name)
+        ? (s.IsReality() && !s.reality.server_name.empty()
+               ? std::string_view(s.reality.server_name)
+               : std::string_view(s.tls.server_name))
         : tls_server_name;
     std::unique_ptr<AsyncStream> stream = std::move(raw);
     if (s.IsTlsLike()) {
@@ -655,6 +665,7 @@ net::awaitable<TransportBuildResult> BuildOutboundXHttpClientRequest(
         try {
             co_await (*http2_result)->WriteBuffers(packet_payload);
         } catch (...) {
+            (*http2_result)->CloseAbortive();
             co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
         }
     }

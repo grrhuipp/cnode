@@ -5,6 +5,7 @@
 #include "acppnode/api/api.hpp"
 #include "acppnode/app/proxyman/inbound/prepared_config.hpp"
 #include "acppnode/infra/panel_config.hpp"
+#include "acppnode/core/naming.hpp"
 #include "online_snapshot.hpp"
 #include "node_state.hpp"
 #include "node_transaction.hpp"
@@ -41,9 +42,10 @@ struct Controller::Impl : std::enable_shared_from_this<Controller::Impl> {
     net::awaitable<void> nodeInfoMonitor(PanelRuntime& panel);
     void logPanelStatus(const PanelRuntime& panel) const;
     net::awaitable<void> userInfoMonitor(PanelRuntime& panel,
-                                         const std::string& tag);
+                                         std::string tag);
 
-    net::awaitable<void> collectTraffic(PanelRuntime& panel, const std::string& tag);
+    net::awaitable<bool> collectTraffic(PanelRuntime& panel,
+                                        bool* appended_out = nullptr);
     net::awaitable<controller::OnlineSnapshot>
     GetOnlineSnapshot(const std::string& tag);
 
@@ -77,6 +79,7 @@ struct Controller::Impl : std::enable_shared_from_this<Controller::Impl> {
 
         const std::unique_ptr<api::API> client;
         const PanelConfig config;
+        const std::string accounting_key;
         PanelState state = PanelState::Connecting;
         controller::NodeState node;
         controller::NodeMutationGate::Participant mutation;

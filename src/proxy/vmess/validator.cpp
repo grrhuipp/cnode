@@ -8,6 +8,10 @@
 #include "acppnode/app/session_group_executor.hpp"
 
 #include <algorithm>
+#include <openssl/mem.h>
+#include <openssl/rand.h>
+#include <openssl/siphash.h>
+#include <cstdlib>
 #include <array>
 #include <chrono>
 #include <cstring>
@@ -25,22 +29,21 @@ struct TimedUserValidator::Impl : memory::ThreadAllocated {
         std::array<uint8_t, 16> iv{};
 
         [[nodiscard]] bool operator==(const SessionKey& other) const noexcept {
-            return user == other.user && key == other.key && iv == other.iv;
+            return CRYPTO_memcmp(user.data(), other.user.data(), user.size()) == 0 &&
+                   CRYPTO_memcmp(key.data(), other.key.data(), key.size()) == 0 &&
+                   CRYPTO_memcmp(iv.data(), other.iv.data(), iv.size()) == 0;
         }
     };
 
     struct SessionKeyHash {
+        std::array<uint64_t, 2> key{};
+
         [[nodiscard]] size_t operator()(const SessionKey& value) const noexcept {
-            uint64_t words[6]{};
-            std::memcpy(&words[0], value.user.data(), 16);
-            std::memcpy(&words[2], value.key.data(), 16);
-            std::memcpy(&words[4], value.iv.data(), 16);
-            uint64_t h = 1469598103934665603ull;
-            for (uint64_t word : words) {
-                h ^= word;
-                h *= 1099511628211ull;
-            }
-            return static_cast<size_t>(h);
+            std::array<uint8_t, 48> bytes{};
+            std::memcpy(bytes.data(), value.user.data(), 16);
+            std::memcpy(bytes.data() + 16, value.key.data(), 16);
+            std::memcpy(bytes.data() + 32, value.iv.data(), 16);
+            return static_cast<size_t>(SIPHASH_24(key.data(), bytes.data(), bytes.size()));
         }
     };
 
@@ -53,6 +56,15 @@ struct TimedUserValidator::Impl : memory::ThreadAllocated {
         std::deque<std::pair<SessionKey, int64_t>> order;
         int64_t last_cleanup = 0;
 
+        SessionHistory()
+            : entries(0, [] {
+                  SessionKeyHash hash;
+                  if (RAND_bytes(reinterpret_cast<uint8_t*>(hash.key.data()),
+                                 sizeof(hash.key)) != 1) {
+                      std::abort();
+                  }
+                  return hash;
+              }()) {}
         void Cleanup(int64_t now) {
             if (now - last_cleanup < kCleanupIntervalSeconds &&
                 entries.size() < kMaxEntries) {
@@ -80,7 +92,19 @@ struct TimedUserValidator::Impl : memory::ThreadAllocated {
             if (it != entries.end() && it->second > now) {
                 return false;
             }
-            if (entries.size() >= kMaxEntries && it == entries.end()) return false;
+            if (it == entries.end()) {
+                while (entries.size() >= kMaxEntries && !order.empty()) {
+                    const auto& [oldest_key, oldest_expires] = order.front();
+                    if (auto oldest_it = entries.find(oldest_key);
+                        oldest_it != entries.end() && oldest_it->second == oldest_expires) {
+                        entries.erase(oldest_it);
+                    }
+                    order.pop_front();
+                }
+                if (entries.size() >= kMaxEntries) {
+                    entries.erase(entries.begin());
+                }
+            }
             const int64_t expires_at = now + kTtlSeconds;
             order.emplace_back(key, expires_at);
             try { entries.insert_or_assign(std::move(key), expires_at); }
@@ -102,22 +126,23 @@ struct TimedUserValidator::Impl : memory::ThreadAllocated {
             int64_t last_seen = 0;
         };
 
-        memory::ThreadLocalVector<HotEntry> entries;
-
-        HotUserCache() {
-            entries.reserve(kMaxHotUsers);
-        }
+        std::array<HotEntry, kMaxHotUsers> entries{};
+        size_t size = 0;
+        uint64_t view_revision = 0;
+        int64_t last_cleanup = 0;
 
         void Touch(const Credential* user,
                    const AuthIDLookupTable* table,
-                   int64_t now) {
-            for (auto it = entries.begin(); it != entries.end(); ++it) {
+                   int64_t now) noexcept {
+            const auto begin = entries.begin();
+            const auto end = begin + size;
+            for (auto it = begin; it != end; ++it) {
                 if (it->user == user) {
                     HotEntry entry = *it;
                     entry.table = table;
                     entry.last_seen = now;
-                    if (it != entries.begin()) {
-                        std::move_backward(entries.begin(), it, it + 1);
+                    if (it != begin) {
+                        std::move_backward(begin, it, it + 1);
                         entries.front() = entry;
                     } else {
                         *it = entry;
@@ -126,31 +151,38 @@ struct TimedUserValidator::Impl : memory::ThreadAllocated {
                 }
             }
 
-            if (entries.size() < kMaxHotUsers) {
-                entries.reserve(kMaxHotUsers);
-                entries.insert(entries.begin(), HotEntry{user, table, now});
-            } else if (!entries.empty()) {
-                std::move_backward(entries.begin(), entries.end() - 1, entries.end());
-                entries.front() = HotEntry{user, table, now};
+            const size_t shift = std::min(size, kMaxHotUsers - 1);
+            if (shift > 0) {
+                std::move_backward(begin, begin + shift, begin + shift + 1);
+            }
+            entries.front() = HotEntry{user, table, now};
+            if (size < kMaxHotUsers) {
+                ++size;
             }
         }
 
-        void Cleanup(int64_t now) {
-            std::erase_if(entries, [now](const HotEntry& entry) {
-                return entry.last_seen + kWindowSeconds < now;
-            });
+        void Cleanup(int64_t now) noexcept {
+            size_t write = 0;
+            for (size_t read = 0; read < size; ++read) {
+                if (entries[read].last_seen + kWindowSeconds >= now) {
+                    if (write != read) {
+                        entries[write] = entries[read];
+                    }
+                    ++write;
+                }
+            }
+            size = write;
         }
 
-        void Clear() {
-            entries.clear();
+        void Clear() noexcept {
+            size = 0;
         }
     };
+    static HotUserCache& ThreadHotCache() noexcept {
+        thread_local HotUserCache cache;
+        return cache;
+    }
 
-    mutable HotUserCache hot_cache;
-    // Borrowed entries are invalidated on cold Worker publication, not when
-    // requests alternate between tags sharing this validator.
-    mutable uint64_t view_revision = 0;
-    mutable int64_t last_hot_cache_cleanup = 0;
     struct HistoryService final : net::execution_context::service {
         inline static net::execution_context::id id;
         explicit HistoryService(net::execution_context& context) : service(context) {}
@@ -159,8 +191,7 @@ struct TimedUserValidator::Impl : memory::ThreadAllocated {
     };
 };
 
-TimedUserValidator::TimedUserValidator()
-    : impl_(std::make_unique<Impl>()) {}
+TimedUserValidator::TimedUserValidator() = default;
 
 TimedUserValidator::~TimedUserValidator() = default;
 
@@ -201,36 +232,41 @@ TimedUserValidator::FindByAuthIDForTag(
 
     auto view = proxyman::inbound::UserStore::VmessUsers(tag);
     const uint64_t revision = proxyman::inbound::UserStore::WorkerViewRevision();
-    if (impl_->view_revision != revision) {
-        impl_->hot_cache.Clear();
-        impl_->view_revision = revision;
+    auto& tls_hot_cache = Impl::ThreadHotCache();
+    if (revision == 0 || tls_hot_cache.view_revision != revision) {
+        tls_hot_cache.Clear();
+        tls_hot_cache.view_revision = revision;
     }
 
-    if (now - impl_->last_hot_cache_cleanup > 60) {
-        impl_->last_hot_cache_cleanup = now;
-        impl_->hot_cache.Cleanup(now);
+    if (revision != 0 && now - tls_hot_cache.last_cleanup > 60) {
+        tls_hot_cache.last_cleanup = now;
+        tls_hot_cache.Cleanup(now);
     }
 
     if (!view.users) {
         return {};
     }
 
-    for (auto it = impl_->hot_cache.entries.begin();
-         it != impl_->hot_cache.entries.end();
-         ++it) {
-        if (it->table == view.users.get() &&
-            it->last_seen + Impl::HotUserCache::kWindowSeconds >= now) {
-            const auto* user = it->user;
-            if (tryUser(*user)) {
-                impl_->hot_cache.Touch(user, view.users.get(), now);
-                return view.Share(*user);
+    if (revision != 0) {
+        for (auto it = tls_hot_cache.entries.begin();
+             it != tls_hot_cache.entries.begin() + tls_hot_cache.size;
+             ++it) {
+            if (it->table == view.users.get() &&
+                it->last_seen + Impl::HotUserCache::kWindowSeconds >= now) {
+                const auto* user = it->user;
+                if (tryUser(*user)) {
+                    tls_hot_cache.Touch(user, view.users.get(), now);
+                    return view.Share(*user);
+                }
             }
         }
     }
 
     for (const auto& user : *view.users) {
         if (tryUser(user)) {
-            impl_->hot_cache.Touch(&user, view.users.get(), now);
+            if (revision != 0) {
+                tls_hot_cache.Touch(&user, view.users.get(), now);
+            }
             return view.Share(user);
         }
     }

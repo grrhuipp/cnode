@@ -19,11 +19,14 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <chrono>
+#include <cmath>
 #include <exception>
 #include <fstream>
+#include <limits>
+#include <string_view>
 #include <vector>
-
 
 namespace acpp {
 
@@ -42,19 +45,40 @@ struct MonitorContext {
     }
 };
 
-size_t ReadResidentMemoryBytes() {
-    std::ifstream status("/proc/self/status");
-    std::string line;
-    while (std::getline(status, line)) {
-        if (line.starts_with("VmRSS:")) {
-            return std::stoull(line.substr(6)) * 1024;
+size_t ReadResidentMemoryBytes() noexcept {
+    try {
+        std::ifstream status("/proc/self/status");
+        std::string line;
+        while (std::getline(status, line)) {
+            if (!line.starts_with("VmRSS:")) continue;
+            std::string_view text(line.data() + 6, line.size() - 6);
+            while (!text.empty() && (text.front() == ' ' || text.front() == '\t')) {
+                text.remove_prefix(1);
+            }
+            size_t kb = 0;
+            const auto [ptr, ec] = std::from_chars(
+                text.data(), text.data() + text.size(), kb);
+            if (ec != std::errc{} || ptr == text.data() ||
+                kb > std::numeric_limits<size_t>::max() / 1024) {
+                return 0;
+            }
+            return kb * 1024;
         }
+    } catch (...) {
     }
     return 0;
 }
 
 std::string FormatRate(double bytes_per_sec) {
-    return acpp::FormatBytes(static_cast<uint64_t>(bytes_per_sec)) + "/s";
+    if (!std::isfinite(bytes_per_sec) || bytes_per_sec <= 0.0) {
+        return acpp::FormatBytes(0) + "/s";
+    }
+    constexpr double kMaxBytes =
+        static_cast<double>(std::numeric_limits<uint64_t>::max());
+    const uint64_t rate = bytes_per_sec >= kMaxBytes
+        ? std::numeric_limits<uint64_t>::max()
+        : static_cast<uint64_t>(bytes_per_sec);
+    return acpp::FormatBytes(rate) + "/s";
 }
 
 net::awaitable<std::vector<WorkerRuntimeStatsSnapshot>>
@@ -339,7 +363,12 @@ RuntimeMonitor::RuntimeMonitor(const RuntimeContext& ctx)
 RuntimeMonitor::~RuntimeMonitor() = default;
 
 void RuntimeMonitor::Start() {
-    for (const auto& loop : impl_->loops) loop->Start();
+    try {
+        for (const auto& loop : impl_->loops) loop->Start();
+    } catch (...) {
+        RequestStop();
+        throw;
+    }
 }
 
 void RuntimeMonitor::RequestStop() noexcept {

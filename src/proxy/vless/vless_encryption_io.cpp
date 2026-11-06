@@ -1,6 +1,8 @@
 #include "vless_encryption_io.hpp"
+#include "vless_encryption_runtime.hpp"
 
 #include "acppnode/common/error.hpp"
+#include "acppnode/common/buffer_util.hpp"
 
 #include <algorithm>
 #include <array>
@@ -29,6 +31,13 @@ namespace {
     return true;
 }
 
+[[nodiscard]] bool WillReachVlessEncryptionMaxNonce(
+    const VlessEncryptionNonce& nonce) noexcept {
+    auto next = nonce;
+    IncreaseVlessEncryptionNonce(next);
+    return IsVlessEncryptionMaxNonce(next);
+}
+
 }  // namespace
 
 VlessEncryptionReader::VlessEncryptionReader(
@@ -39,7 +48,18 @@ VlessEncryptionReader::VlessEncryptionReader(
     : src_(src)
     , keys_(std::move(keys))
     , united_key_(united_key)
-    , header_xor_(std::move(header_xor)) {}
+    , header_xor_(std::move(header_xor)) {
+    if (const auto* deferred = std::get_if<VlessEncryptionDeferredRead>(&keys_)) {
+        unverified_ticket_cache_ = deferred->ticket_cache;
+    }
+}
+
+void VlessEncryptionReader::ClearDeferredTicket() noexcept {
+    if (unverified_ticket_cache_) {
+        unverified_ticket_cache_->Clear();
+        unverified_ticket_cache_ = nullptr;
+    }
+}
 
 VlessEncryptionAead& VlessEncryptionReader::KeyDeferredRead(
     const VlessEncryptionDeferredRead& deferred) {
@@ -72,7 +92,8 @@ bool VlessEncryptionReader::EnableRawRead() noexcept {
 
 net::awaitable<buf::MultiBuffer> VlessEncryptionReader::ReadMultiBuffer() {
     if (raw_read_) {
-        auto out = co_await src_.ReadMultiBuffer();
+        auto out = co_await ReadMultiBufferOrThrowOnCancel(
+            src_, "VLESS Encryption read cancelled");
         if (header_xor_) {
             for (auto* buffer : out) {
                 if (!header_xor_->XorInboundInPlace(buffer->Bytes())) {
@@ -82,98 +103,115 @@ net::awaitable<buf::MultiBuffer> VlessEncryptionReader::ReadMultiBuffer() {
         }
         co_return out;
     }
-    auto* aead = std::get_if<VlessEncryptionAead>(&keys_);
-    if (!aead) {
-        if (!co_await src_.ReadExact(server_random_.data(),
-                                     server_random_.size(),
-                                     false, &bytes_read_)) {
-            ThrowVlessEncryptionIoError("VLESS Encryption server random missing");
+    try {
+        auto* aead = std::get_if<VlessEncryptionAead>(&keys_);
+        if (!aead) {
+            if (!co_await src_.ReadExact(server_random_.data(),
+                                         server_random_.size(),
+                                         false, &bytes_read_)) {
+                ThrowVlessEncryptionIoError("VLESS Encryption server random missing");
+            }
+            aead = &KeyDeferredRead(std::get<VlessEncryptionDeferredRead>(keys_));
         }
-        aead = &KeyDeferredRead(std::get<VlessEncryptionDeferredRead>(keys_));
-    }
 
-    auto& header = read_header_;
-    if (encrypted_size_ == 0) {
-        const bool have_header = co_await src_.ReadExact(
-            header.data(), header.size(), true, &header_read_);
-        if (!have_header) {
-            co_return buf::MultiBuffer{};
-        }
-        if (header_xor_ && !header_xor_->XorInboundInPlace(header)) {
-            ThrowVlessEncryptionIoError("VLESS Encryption header xor failed");
-        }
-        const auto encrypted_len = DecodeVlessEncryptionRecordHeader(header);
-        if (!encrypted_len) {
-            ThrowVlessEncryptionIoError("VLESS Encryption record header invalid");
-        }
-        encrypted_size_ = *encrypted_len;
-    }
+        for (;;) {
+            auto& header = read_header_;
+            if (encrypted_size_ == 0) {
+                const bool have_header = co_await src_.ReadExact(
+                    header.data(), header.size(), true, &header_read_);
+                if (!have_header) {
+                    if (header_read_ != 0) {
+                        ThrowVlessEncryptionIoError("VLESS Encryption record header truncated");
+                    }
+                    const auto cancellation =
+                        co_await net::this_coro::cancellation_state;
+                    if (cancellation.cancelled() !=
+                        net::cancellation_type::none) {
+                        throw IoSystemError(
+                            io_error::operation_aborted,
+                            "VLESS Encryption read cancelled");
+                    }
+                    ClearDeferredTicket();
+                    read_record_.Reset();
+                    co_return buf::MultiBuffer{};
+                }
+                if (header_xor_ && !header_xor_->XorInboundInPlace(header)) {
+                    ThrowVlessEncryptionIoError("VLESS Encryption header xor failed");
+                }
+                const auto encrypted_len = DecodeVlessEncryptionRecordHeader(header);
+                if (!encrypted_len) {
+                    ThrowVlessEncryptionIoError("VLESS Encryption record header invalid");
+                }
+                encrypted_size_ = *encrypted_len;
+            }
 
-    // `encrypted_size_` is bounded by kVlessEncryptionMaxRecordCiphertextSize.
-    if (read_bytes_.size() < encrypted_size_) {
-        read_bytes_.resize(encrypted_size_);
-    }
-    if (!co_await src_.ReadExact(read_bytes_.data(), encrypted_size_,
-                                 false, &bytes_read_)) {
-        ThrowVlessEncryptionIoError("VLESS Encryption record truncated");
-    }
-    auto encrypted_span = std::span<uint8_t>(read_bytes_.data(), encrypted_size_);
-    if (header_xor_ && !header_xor_->XorInboundInPlace(encrypted_span)) {
-        ThrowVlessEncryptionIoError("VLESS Encryption body xor state failed");
-    }
+            // `encrypted_size_` is bounded by kVlessEncryptionMaxRecordCiphertextSize.
+            if (bytes_read_ == 0 && read_record_.Empty()) {
+                (void)read_record_.Prepare(encrypted_size_);
+            }
+            uint8_t* record_bytes = read_record_.Data();
+            if (!co_await src_.ReadExact(record_bytes, encrypted_size_,
+                                         false, &bytes_read_)) {
+                ThrowVlessEncryptionIoError("VLESS Encryption record truncated");
+            }
+            auto encrypted_span = std::span<uint8_t>(record_bytes, encrypted_size_);
+            if (header_xor_ && !header_xor_->XorInboundInPlace(encrypted_span)) {
+                ThrowVlessEncryptionIoError("VLESS Encryption body xor state failed");
+            }
 
-    const size_t plain_capacity = encrypted_span.size() - kVlessEncryptionTagSize;
-    const bool rekey = IsVlessEncryptionMaxNonce(aead->Nonce());
-    buf::MultiBuffer out;
-    buf::BufferGuard plain_buffer;
-    memory::ByteVector plain_scratch;
-    std::span<uint8_t> plain;
-    if (plain_capacity <= buf::Buffer::kSize) {
-        plain_buffer = buf::BufferGuard{buf::Buffer::New()};
-        if (!plain_buffer) {
-            throw IoSystemError(io_error::fault,
-                                "VLESS Encryption buffer allocation failed");
+            memory::ByteVector rekey_context;
+            if (WillReachVlessEncryptionMaxNonce(aead->Nonce())) {
+                rekey_context.resize(header.size() + encrypted_span.size());
+                auto next = std::copy(header.begin(), header.end(), rekey_context.begin());
+                std::copy(encrypted_span.begin(), encrypted_span.end(), next);
+            }
+
+            const auto opened = OpenVlessEncryptionRecord(
+                *aead,
+                header,
+                encrypted_span,
+                encrypted_span);
+            if (!opened) {
+                ThrowVlessEncryptionIoError("VLESS Encryption record decrypt failed");
+            }
+            unverified_ticket_cache_ = nullptr;
+
+            if (!rekey_context.empty() &&
+                !RekeyAead(*aead, rekey_context, united_key_)) {
+                ThrowVlessEncryptionIoError("VLESS Encryption read rekey failed");
+            }
+
+            header_read_ = 0;
+            bytes_read_ = 0;
+            encrypted_size_ = 0;
+            if (*opened == 0) {
+                read_record_.Reset();
+                continue;
+            }
+            buf::MultiBuffer out;
+            if (!read_record_.TryAppendTo(*opened, out)) {
+                throw IoSystemError(io_error::fault,
+                                    "VLESS Encryption buffer allocation failed");
+            }
+            co_return out;
         }
-        plain = plain_buffer->Tail().first(plain_capacity);
-    } else {
-        plain_scratch.resize(plain_capacity);
-        plain = std::span<uint8_t>(plain_scratch.data(), plain_capacity);
-    }
-
-    const auto opened = OpenVlessEncryptionRecord(
-        *aead,
-        header,
-        encrypted_span,
-        plain);
-    if (!opened) {
-        ThrowVlessEncryptionIoError("VLESS Encryption record decrypt failed");
-    }
-
-    if (rekey) {
-        memory::ByteVector rekey_context(header.size() + encrypted_span.size());
-        auto next = std::copy(header.begin(), header.end(), rekey_context.begin());
-        std::copy(encrypted_span.begin(), encrypted_span.end(), next);
-        if (!RekeyAead(*aead, rekey_context, united_key_)) {
-            ThrowVlessEncryptionIoError("VLESS Encryption read rekey failed");
+    } catch (const IoSystemError& error) {
+        if (error.code() != io_error::operation_aborted) {
+            ClearDeferredTicket();
+            header_read_ = 0;
+            bytes_read_ = 0;
+            encrypted_size_ = 0;
+            read_record_.Reset();
         }
+        throw;
+    } catch (...) {
+        ClearDeferredTicket();
+        header_read_ = 0;
+        bytes_read_ = 0;
+        encrypted_size_ = 0;
+        read_record_.Reset();
+        throw;
     }
-
-    if (*opened > 0) {
-        if (plain_buffer) {
-            plain_buffer->Produce(static_cast<uint32_t>(*opened));
-            out.push_back(std::move(plain_buffer));
-        } else if (!buf::AppendSpanToMultiBuffer(
-                       plain.first(*opened),
-                       out)) {
-            throw IoSystemError(io_error::fault,
-                                "VLESS Encryption buffer allocation failed");
-        }
-    }
-    header_read_ = 0;
-    bytes_read_ = 0;
-    encrypted_size_ = 0;
-    memory::ByteVector{read_bytes_.get_allocator()}.swap(read_bytes_);
-    co_return out;
 }
 
 VlessEncryptionWriter::VlessEncryptionWriter(
@@ -188,24 +226,76 @@ VlessEncryptionWriter::VlessEncryptionWriter(
 
 net::awaitable<void> VlessEncryptionWriter::WriteMultiBuffer(
     buf::MultiBuffer mb) {
-    for (buf::Buffer* buffer : mb) {
-        if (!buffer || buffer->IsEmpty()) {
-            continue;
-        }
-        co_await WritePlaintext(buffer->Bytes());
+    if (mb.empty()) {
+        co_return;
+    }
+    ConstBufferSpanBuilder<buf::MultiBuffer::kInlineCapacity> buffers;
+    buffers.AppendMultiBuffer(mb);
+    if (!buffers.empty()) {
+        co_await WriteBuffers(buffers.Span());
     }
     mb.clear();
 }
 
 net::awaitable<void> VlessEncryptionWriter::WriteBuffers(
     std::span<const net::const_buffer> buffers) {
-    for (const net::const_buffer& buffer : buffers) {
-        const auto* data = static_cast<const uint8_t*>(buffer.data());
-        const size_t size = buffer.size();
-        if (!data || size == 0) {
+    size_t idx = 0;
+    size_t offset = 0;
+    auto skip_empty = [&]() noexcept {
+        while (idx < buffers.size()) {
+            const auto* data = static_cast<const uint8_t*>(buffers[idx].data());
+            if (data && offset < buffers[idx].size()) {
+                return;
+            }
+            ++idx;
+            offset = 0;
+        }
+    };
+
+    skip_empty();
+    while (idx < buffers.size()) {
+        const auto* first_data =
+            static_cast<const uint8_t*>(buffers[idx].data()) + offset;
+        const size_t first_rem = buffers[idx].size() - offset;
+
+        bool has_more = false;
+        if (first_rem < kVlessEncryptionMaxPlaintextSize) {
+            for (size_t j = idx + 1; j < buffers.size(); ++j) {
+                if (buffers[j].data() && buffers[j].size() > 0) {
+                    has_more = true;
+                    break;
+                }
+            }
+        }
+
+        if (!has_more) {
+            const size_t n = std::min(first_rem, kVlessEncryptionMaxPlaintextSize);
+            offset += n;
+            skip_empty();
+            co_await WritePlaintext(std::span<const uint8_t>{first_data, n});
             continue;
         }
-        co_await WritePlaintext(std::span<const uint8_t>{data, size});
+
+        static_assert(kVlessEncryptionMaxPlaintextSize <= buf::Buffer::kSize);
+        buf::BufferGuard chunk{buf::Buffer::New()};
+        if (!chunk) {
+            ThrowVlessEncryptionIoError("VLESS Encryption buffer allocation failed");
+        }
+        uint8_t* dst = chunk->Tail().data();
+        size_t filled = 0;
+        while (idx < buffers.size() && filled < kVlessEncryptionMaxPlaintextSize) {
+            const auto* data =
+                static_cast<const uint8_t*>(buffers[idx].data()) + offset;
+            const size_t rem = buffers[idx].size() - offset;
+            const size_t copy_len =
+                std::min(rem, kVlessEncryptionMaxPlaintextSize - filled);
+            std::memcpy(dst + filled, data, copy_len);
+            filled += copy_len;
+            offset += copy_len;
+            skip_empty();
+        }
+        chunk->Produce(static_cast<uint32_t>(filled));
+        co_await WritePlaintext(chunk->Bytes());
     }
 }
 
@@ -221,21 +311,13 @@ net::awaitable<void> VlessEncryptionWriter::WritePlaintext(
             kVlessEncryptionMaxPlaintextSize);
         const size_t frame_capacity =
             kVlessEncryptionRecordHeaderSize + n + kVlessEncryptionTagSize;
-        buf::BufferGuard frame_buffer;
-        memory::ByteVector large_frame;
-        std::span<uint8_t> frame;
-        if (frame_capacity <= buf::Buffer::kSize) {
-            frame_buffer = buf::BufferGuard{buf::Buffer::New()};
-            if (!frame_buffer) {
-                ThrowVlessEncryptionIoError("VLESS Encryption buffer allocation failed");
-            }
-            frame = frame_buffer->Tail().first(frame_capacity);
-        } else {
-            large_frame.resize(frame_capacity);
-            frame = std::span<uint8_t>(large_frame.data(), frame_capacity);
+        buf::ContiguousWriteBuffer frame_buffer;
+        uint8_t* frame_ptr = frame_buffer.TryPrepare(frame_capacity);
+        if (!frame_ptr) {
+            ThrowVlessEncryptionIoError("VLESS Encryption buffer allocation failed");
         }
+        std::span<uint8_t> frame{frame_ptr, frame_capacity};
 
-        const bool rekey = IsVlessEncryptionMaxNonce(aead_.Nonce());
         const auto written = SealVlessEncryptionRecord(
             aead_,
             data.first(n),
@@ -244,7 +326,8 @@ net::awaitable<void> VlessEncryptionWriter::WritePlaintext(
             ThrowVlessEncryptionIoError("VLESS Encryption record encrypt failed");
         }
         auto frame_view = frame.first(*written);
-        if (rekey && !RekeyAead(aead_, frame_view, united_key_)) {
+        if (IsVlessEncryptionMaxNonce(aead_.Nonce()) &&
+            !RekeyAead(aead_, frame_view, united_key_)) {
             ThrowVlessEncryptionIoError("VLESS Encryption write rekey failed");
         }
         if (header_xor_ &&

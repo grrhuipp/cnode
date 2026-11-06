@@ -165,7 +165,7 @@ struct ExecutionDomain::State {
     std::unique_ptr<net::execution_context> services = std::make_unique<net::execution_context>();
     struct Retirement final : GroupCoordinator::ReservedOperation {
         std::shared_ptr<Group> group;
-        GroupCoordinator* coordinator = nullptr;
+        std::shared_ptr<GroupCoordinator> coordinator;
         Group::Members::iterator position;
         void Invoke() noexcept override {
             auto* root = group.get();
@@ -194,9 +194,18 @@ ExecutionDomain::~ExecutionDomain() {
     state_->hooks->Leave();
     state_->hooks.reset();
     if (state_->retirement) {
-        state_->retirement->group = state_->group;
-        state_->coordinator->PostReserved(std::move(state_->retirement));
+        state_->retirement->group = std::move(state_->group);
+        state_->retirement->coordinator = std::move(state_->coordinator);
+        auto* coordinator = state_->retirement->coordinator.get();
+        coordinator->PostReserved(std::move(state_->retirement));
     }
+}
+
+std::shared_ptr<ExecutionDomain> ExecutionDomain::CreateSibling(
+    std::shared_ptr<Hooks> hooks) const {
+    auto* root = Root();
+    return Create(state_->reactor, root->owner,
+                  root->scheduler, std::move(hooks), state_->coordinator);
 }
 
 std::shared_ptr<ExecutionDomain> ExecutionDomain::Create(
@@ -212,17 +221,10 @@ std::shared_ptr<ExecutionDomain> ExecutionDomain::Create(
     group->members.emplace_back(domain);
     domain->state_->retirement = std::make_unique<State::Retirement>();
     domain->state_->retirement->position = std::prev(group->members.end());
-    domain->state_->retirement->coordinator = domain->state_->coordinator.get();
     domain->state_->coordinator->reserved_->live_domains.fetch_add(1, std::memory_order_relaxed);
     return domain;
 }
 
-std::shared_ptr<ExecutionDomain> ExecutionDomain::CreateSibling(std::shared_ptr<Hooks> hooks) {
-    if (Current().get() != this) throw std::logic_error("sibling creation requires domain lease");
-    auto* root = Root();
-    return Create(state_->reactor, root->owner, root->scheduler,
-                  std::move(hooks), state_->coordinator);
-}
 
 ExecutionDomain::Group* ExecutionDomain::Root() const noexcept {
     auto* group = state_->group.get();
@@ -245,6 +247,10 @@ net::io_context& ExecutionDomain::Reactor() noexcept { return state_->reactor; }
 net::execution_context& ExecutionDomain::Services() noexcept { return *state_->services; }
 GroupCoordinator& ExecutionDomain::Coordinator() noexcept { return *state_->coordinator; }
 uint32_t ExecutionDomain::OwnerId() const noexcept { return Root()->owner; }
+bool ExecutionDomain::CanDestroyDirectlyOn(uint32_t worker_id) const noexcept {
+    auto* root = Root();
+    return root->owner == worker_id && !root->frozen.load(std::memory_order_acquire);
+}
 bool ExecutionDomain::SharesGroup(const ExecutionDomain& other) const noexcept {
     return Root() == other.Root();
 }
@@ -257,11 +263,12 @@ void ExecutionDomain::Enqueue(std::unique_ptr<Operation> operation) {
     auto* previous = state_->incoming.load(std::memory_order_relaxed);
     do { node->next = previous; }
     while (!state_->incoming.compare_exchange_weak(previous, node,
-        std::memory_order_release, std::memory_order_relaxed));
+        std::memory_order_seq_cst, std::memory_order_relaxed));
     Notify();
 }
 void ExecutionDomain::Notify(bool force) noexcept {
-    if (!force && state_->notified.exchange(true, std::memory_order_acq_rel)) return;
+    const bool was_notified = state_->notified.exchange(true, std::memory_order_seq_cst);
+    if (!force && was_notified) return;
     auto* root = Root();
     try {
         net::post(root->scheduler, [self = shared_from_this(), owner = root->owner] {
@@ -301,8 +308,8 @@ void ExecutionDomain::Run(uint32_t scheduled_owner) noexcept {
     }
     hooks->Leave();
     current_domain = previous_domain;
-    state_->notified.store(false, std::memory_order_release);
-    if (state_->ready || state_->incoming.load(std::memory_order_acquire)) Notify();
+    state_->notified.store(false, std::memory_order_seq_cst);
+    if (state_->ready || state_->incoming.load(std::memory_order_seq_cst)) Notify();
 }
 
 net::awaitable<void> ExecutionDomain::MergeGroups(
@@ -346,13 +353,19 @@ net::awaitable<void> ExecutionDomain::MergeGroups(
         co_await freeze(*a);
         co_await freeze(*b);
     } catch (...) { failure = std::current_exception(); }
+    auto notify_if_pending = [](const std::shared_ptr<ExecutionDomain>& domain) {
+        if (domain &&
+            (domain->state_->notified.load(std::memory_order_acquire) ||
+             domain->state_->ready ||
+             domain->state_->incoming.load(std::memory_order_acquire))) {
+            domain->Notify(true);
+        }
+    };
     if (failure) {
         a->frozen.store(false, std::memory_order_release);
         b->frozen.store(false, std::memory_order_release);
-        for (const auto& member : a->members)
-            if (auto domain = member.lock()) domain->Notify(true);
-        for (const auto& member : b->members)
-            if (auto domain = member.lock()) domain->Notify(true);
+        for (const auto& member : a->members) notify_if_pending(member.lock());
+        for (const auto& member : b->members) notify_if_pending(member.lock());
         std::rethrow_exception(failure);
     }
     // Both owners acknowledged quiescence. Already admitted native events only
@@ -366,15 +379,18 @@ net::awaitable<void> ExecutionDomain::MergeGroups(
     if (destination->rank == source->rank) ++destination->rank;
     source->parent.store(destination, std::memory_order_release);
     destination->frozen.store(false, std::memory_order_release);
-    LOG_DEBUG("session group migrated owner={} -> {} domains={}",
-              source->owner, destination->owner, destination->members.size());
     for (const auto& member : destination->members)
-        if (auto domain = member.lock()) domain->Notify(true);
+        notify_if_pending(member.lock());
+    try {
+        LOG_DEBUG("session group migrated owner={} -> {} domains={}",
+                  source->owner, destination->owner, destination->members.size());
+    } catch (...) {}
 }
 
 net::awaitable<void> ExecutionDomain::Join(std::shared_ptr<ExecutionDomain> other) {
     if (!other || Current().get() != this || state_->coordinator != other->state_->coordinator)
         throw std::logic_error("group join requires compatible execution domains");
+    if (other.get() == this) co_return;
     co_await state_->coordinator->Post(
         MergeGroups(shared_from_this(), std::move(other)));
 }

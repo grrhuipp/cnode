@@ -137,6 +137,7 @@ bool UdpFramer::Next(FramedUdpPacket& out) {
         }
         if (result == buf::LengthPrefixedPacketBuffer::PopResult::Invalid) {
             failed_ = true;
+            pending_.Clear();
             throw IoSystemError(io_error::invalid_argument, "invalid VLESS UDP frame");
         }
         // Empty frames still consume their two-byte length prefix.
@@ -177,15 +178,11 @@ net::awaitable<buf::MultiBuffer> UdpFramer::ReadDatagram(
             const TargetAddress& target = packet.target
                 ? *packet.target
                 : session_target;
-            for (buf::Buffer* buffer : packet.payload) {
-                if (buffer && !buffer->IsEmpty()) {
-                    buffer->SetUDP(target);
-                }
-            }
+            buf::SetUdpDatagramTarget(packet.payload, target);
             co_return std::move(packet.payload);
         }
 
-        buf::MultiBuffer raw = co_await src.ReadMultiBuffer();
+        buf::MultiBuffer raw = co_await ReadMultiBufferOrThrowOnCancel(src);
         if (raw.byte_size() == 0) {
             Finish();
             co_return buf::MultiBuffer{};
@@ -234,22 +231,19 @@ net::awaitable<void> WriteUdpDatagram(
     const TargetAddress& target,
     bool packet_addr,
     std::span<const net::const_buffer> payload) {
-    size_t payload_size = 0;
-    for (const auto& buffer : payload) {
-        if (buffer.size() >
-            std::numeric_limits<uint16_t>::max() - payload_size) {
-            throw IoSystemError(
-                io_error::message_size, "VLESS UDP datagram is too large");
-        }
-        payload_size += buffer.size();
+    const auto payload_size = buf::TrySumBufferSizes(
+        payload, std::numeric_limits<uint16_t>::max());
+    if (!payload_size) {
+        throw IoSystemError(
+            io_error::message_size, "VLESS UDP datagram is too large");
     }
-    if (payload_size == 0) {
+    if (*payload_size == 0) {
         co_return;
     }
 
     std::array<uint8_t, 32> header{};
     const size_t header_size = EncodeUdpHeaderTo(
-        target, packet_addr, payload_size, header);
+        target, packet_addr, *payload_size, header);
     if (header_size == 0) {
         throw IoSystemError(
             io_error::message_size, "invalid VLESS UDP datagram size or target");

@@ -85,18 +85,23 @@ public:
             co_return failure;
         }
         while (used_ids_.test(id)) ++id;
-        used_ids_.set(id);
-        ++issued_;
         query[0] = static_cast<uint8_t>(id >> 8);
         query[1] = static_cast<uint8_t>(id);
         Pending request(*this, id, query);
         pending_.emplace(id, &request);
         if (!scheduler_.ScheduleAfter(timeout, request)) {
+            pending_.erase(id);
             failure.error = io_error::operation_aborted;
             co_return failure;
         }
+        used_ids_.set(id);
+        ++issued_;
         socket_.send(net::buffer(query.data(), query.size()), 0, failure.error);
-        if (failure.error) co_return failure;
+        if (failure.error) {
+            used_ids_.reset(id);
+            --issued_;
+            co_return failure;
+        }
         Receive();
         (void)co_await request.completion.async_receive(net::as_tuple(net::use_awaitable));
         if (!request.reply.size && !request.reply.error) request.reply.error = io_error::operation_aborted;
@@ -147,8 +152,11 @@ private:
             const auto length = packet[pos++];
             if ((length & 0xc0) == 0xc0) {
                 if (pos >= packet.size()) return false;
-                if (!after_name) after_name = pos + 1;
-                pos = ((length & 0x3f) << 8) | packet[pos];
+                const size_t ptr = ((static_cast<size_t>(length) & 0x3f) << 8) | packet[pos];
+                ++pos;
+                if (ptr < 12 || ptr >= pos - 2) return false;
+                if (!after_name) after_name = pos;
+                pos = ptr;
                 continue;
             }
             if (length > 63 || length != query[expected++] ||

@@ -11,6 +11,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <limits>
+#include <map>
 #include <stdexcept>
 #include <system_error>
 #include <unordered_map>
@@ -32,6 +33,9 @@ struct File {
     ~File() { if (fd >= 0) ::close(fd); }
 };
 std::string Identity(const PanelConfig& config) {
+    if (config.TrafficJournalDir.empty()) {
+        throw std::invalid_argument("traffic journal directory is required");
+    }
     if (config.Name.empty() || config.NodeIDs.Values().size() != 1) {
         throw std::invalid_argument("traffic journal requires a panel name and one node identity");
     }
@@ -73,8 +77,11 @@ TrafficJournal::TrafficJournal(const PanelConfig& config)
     directory_fd_ = ::open(directory_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     if (directory_fd_ < 0) SystemFailure("open traffic journal directory");
     try {
-        std::filesystem::permissions(config.TrafficJournalDir, std::filesystem::perms::owner_all);
-        std::filesystem::permissions(directory_, std::filesystem::perms::owner_all);
+        const auto parent_path = directory_.parent_path();
+        File parent{::open(parent_path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)};
+        if (parent.fd < 0) SystemFailure("open traffic journal parent");
+        if (::fchmod(parent.fd, 0700) != 0) SystemFailure("protect traffic journal parent");
+        if (::fchmod(directory_fd_, 0700) != 0) SystemFailure("protect traffic journal directory");
         lock_fd_ = ::openat(directory_fd_, ".lock", O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
         if (lock_fd_ < 0) SystemFailure("open traffic journal lock");
         if (::flock(lock_fd_, LOCK_EX | LOCK_NB) != 0) SystemFailure("lock traffic journal");
@@ -85,9 +92,8 @@ TrafficJournal::TrafficJournal(const PanelConfig& config)
             if (entry.path().extension() == ".tmp") std::filesystem::remove(entry.path());
         }
         SyncDirectory();
-        File parent{::open(config.TrafficJournalDir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC)};
-        if (parent.fd < 0 || ::fsync(parent.fd) != 0) SystemFailure("sync traffic journal parent");
-        auto ancestor_path = config.TrafficJournalDir.parent_path();
+        if (::fsync(parent.fd) != 0) SystemFailure("sync traffic journal parent");
+        auto ancestor_path = parent_path.parent_path();
         if (ancestor_path.empty()) ancestor_path = ".";
         File ancestor{::open(ancestor_path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC)};
         if (ancestor.fd < 0 || ::fsync(ancestor.fd) != 0) SystemFailure("sync traffic journal root");
@@ -115,21 +121,38 @@ void TrafficJournal::Append(const app::UserTrafficSnapshot& traffic) {
     if (traffic.empty()) return;
     std::lock_guard lock(mutex_);
     CheckHealthy();
-    json::array rows;
-    const auto append_rows = [&](const app::UserTrafficCounters& counters) {
+    constexpr uint64_t max_value = static_cast<uint64_t>(INT64_MAX);
+    std::map<int64_t, app::UserTraffic> merged;
+    const auto merge_rows = [&](const app::UserTrafficCounters& counters) {
         for (const auto& [uid, value] : counters) {
-            if (uid <= 0 || value.upload > INT64_MAX || value.download > INT64_MAX) {
+            if (uid <= 0 || value.upload > max_value || value.download > max_value) {
                 throw std::runtime_error("traffic exceeds UniProxy signed integer range");
             }
-            rows.push_back(json::array{uid, value.upload, value.download});
+            if (value.upload == 0 && value.download == 0) continue;
+            auto& merged_entry = merged[uid];
+            if (merged_entry.upload > max_value - value.upload ||
+                merged_entry.download > max_value - value.download) {
+                throw std::runtime_error("traffic exceeds UniProxy signed integer range");
+            }
+            merged_entry.upload += value.upload;
+            merged_entry.download += value.download;
         }
     };
-    append_rows(traffic);
-    for (const auto& token : traffic.domains) append_rows(token.counters);
+    merge_rows(traffic);
+    for (const auto& token : traffic.domains) merge_rows(token.counters);
+    if (merged.empty()) return;
+    json::array rows;
+    for (const auto& [uid, value] : merged) {
+        rows.push_back(json::array{uid, value.upload, value.download});
+    }
     const auto text = json::serialize(json::value(std::move(rows)));
     size_t bytes = 0, records = 0;
     for (const auto& entry : std::filesystem::directory_iterator(directory_)) {
         if (entry.path().extension() != ".ready" && entry.path().extension() != ".unknown") continue;
+        const auto status = entry.symlink_status();
+        if (!std::filesystem::is_regular_file(status)) {
+            throw std::runtime_error("invalid traffic journal record type");
+        }
         const auto size = entry.file_size();
         if (size > kMaxBytes || bytes > kMaxBytes - size) {
             throw std::runtime_error("traffic journal byte limit reached; reconcile unknown records");
@@ -143,6 +166,7 @@ void TrafficJournal::Append(const app::UserTrafficSnapshot& traffic) {
     auto temporary = (directory_ / "batch-XXXXXX.tmp").string();
     File file{::mkostemps(temporary.data(), 4, O_CLOEXEC)};
     if (file.fd < 0) SystemFailure("create traffic journal record");
+    bool published = false;
     try {
         size_t offset = 0;
         while (offset != text.size()) {
@@ -156,15 +180,22 @@ void TrafficJournal::Append(const app::UserTrafficSnapshot& traffic) {
         ready.replace_extension(".ready");
         auto unknown = ready;
         unknown.replace_extension(".unknown");
-        if (std::filesystem::exists(ready) || std::filesystem::exists(unknown)) {
+        if (std::filesystem::symlink_status(ready).type() != std::filesystem::file_type::not_found ||
+            std::filesystem::symlink_status(unknown).type() != std::filesystem::file_type::not_found) {
             throw std::runtime_error("traffic journal record identity collision");
         }
         std::filesystem::rename(temporary, ready);
+        published = true;
         SyncDirectory();
     } catch (...) {
-        // Publication may already have happened. Do not collect/send again in
-        // this process: the worker deliberately retains its original counters.
-        failed_ = true;
+        if (!published) {
+            std::error_code ec;
+            std::filesystem::remove(temporary, ec);
+        } else {
+            // Publication already happened. Do not collect/send again in this
+            // process: the worker deliberately retains its original counters.
+            failed_ = true;
+        }
         throw;
     }
 }
@@ -182,7 +213,9 @@ TrafficJournal::Batch TrafficJournal::Prepare() {
         }
         bytes += text.size();
         const auto parsed = json::parse(text);
+        if (!parsed.is_array()) throw std::runtime_error("invalid traffic journal record");
         for (const auto& item : parsed.as_array()) {
+            if (!item.is_array()) throw std::runtime_error("invalid traffic journal row");
             const auto& row = item.as_array();
             if (row.size() != 3) throw std::runtime_error("invalid traffic journal row");
             const auto uid = ReadCounter(row[0]);
@@ -211,6 +244,10 @@ void TrafficJournal::Begin(Batch& batch) {
         for (auto& path : batch.records) {
             auto unknown = path;
             unknown.replace_extension(".unknown");
+            if (std::filesystem::symlink_status(unknown).type() != std::filesystem::file_type::not_found) {
+                failed_ = true;
+                throw std::runtime_error("traffic journal unknown record collision");
+            }
             std::filesystem::rename(path, unknown);
             path = std::move(unknown);
         }

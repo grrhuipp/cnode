@@ -32,10 +32,9 @@ public:
 
     // buf::MultiBuffer 优化路径
     // ReadMultiBuffer : 可读后才申请每方向唯一的 8KB Buffer
-    // WriteMultiBuffer: scatter-write (WSASend / writev)，多 Buffer 合并为单次系统调用
+    // WriteBuffers   : scatter-write (WSASend / writev)，多 Buffer 合并为单次系统调用
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override;
     bool EnableRawRead() noexcept override { return true; }
-    net::awaitable<void>        WriteMultiBuffer(buf::MultiBuffer mb) override;
     net::awaitable<void>        WriteBuffers(std::span<const net::const_buffer> buffers) override;
     void ShutdownRead() override;
     void ShutdownWrite() override;
@@ -58,12 +57,13 @@ public:
     void SetIdleTimeout(std::chrono::seconds timeout);
     bool ConsumeIdleTimeout() noexcept;
     void SetReadTimeout(std::chrono::seconds timeout);
-    void SetWriteTimeout(std::chrono::seconds timeout);
+    void SetWriteTimeout(std::chrono::seconds timeout) override;
     bool ConsumeReadTimeout() noexcept;
-    bool ConsumeWriteTimeout() noexcept;
+    bool ConsumeWriteTimeout() noexcept override;
     PhaseDeadlineHandle StartPhaseDeadline(std::chrono::seconds timeout);
     void ClearPhaseDeadline();
     bool ConsumePhaseDeadline() noexcept;
+    void TouchActivity() noexcept;
 
     void SetAbortiveClose(bool enable = true) noexcept;
     void SetWriteCancellationDeferred() noexcept;
@@ -103,7 +103,6 @@ private:
         net::mutable_buffer buffer,
         bool peek = false);
 
-    void TouchActivity() noexcept;
     [[nodiscard]] size_t ConsumePendingData(net::mutable_buffer target) noexcept;
     void ReleasePendingData() noexcept;
 

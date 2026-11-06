@@ -27,17 +27,24 @@ namespace {
 constexpr size_t kProxyProbeBytes = 256;
 template<class Timeouts, bool IsRead>
 struct OperationTimeoutScope {
-    explicit OperationTimeoutScope(Timeouts& timeouts) : timeouts(timeouts) {
-        if constexpr (IsRead) timeouts.BeginRead();
-        else timeouts.BeginWrite();
+    explicit OperationTimeoutScope(Timeouts& timeouts, bool adopt_existing = false)
+        : timeouts(timeouts)
+        , owns(!adopt_existing || !timeouts.IsPending(IsRead)) {
+        if (owns) {
+            if constexpr (IsRead) timeouts.BeginRead();
+            else timeouts.BeginWrite();
+        }
     }
     OperationTimeoutScope(const OperationTimeoutScope&) = delete;
     OperationTimeoutScope& operator=(const OperationTimeoutScope&) = delete;
     ~OperationTimeoutScope() noexcept {
-        if constexpr (IsRead) timeouts.EndRead();
-        else timeouts.EndWrite();
+        if (owns) {
+            if constexpr (IsRead) timeouts.EndRead();
+            else timeouts.EndWrite();
+        }
     }
     Timeouts& timeouts;
+    bool owns = true;
 };
 
 // Explicit cancellation also covers a successful readiness notification that
@@ -190,30 +197,44 @@ net::awaitable<buf::MultiBuffer> TcpStream::ReadMultiBuffer() {
         co_return pending;
     }
 
-    const IoErrorCode wait_ec = co_await WaitReadable();
-    if (wait_ec) {
-        if (wait_ec == io_error::eof) {
+    OperationTimeoutScope<decltype(impl_->timeouts), true> timeout_scope{impl_->timeouts};
+    for (;;) {
+        const IoErrorCode wait_ec = co_await WaitReadable();
+        if (wait_ec) {
+            if (wait_ec == io_error::eof) {
+                co_return buf::MultiBuffer{};
+            }
+            throw IoSystemError(wait_ec);
+        }
+
+        if (!impl_->pending_data.empty()) {
+            buf::MultiBuffer pending = std::move(impl_->pending_data);
+            TouchActivity();
+            co_return pending;
+        }
+
+        buf::BufferGuard buffer{buf::Buffer::New()};
+        if (!buffer) {
+            throw std::bad_alloc();
+        }
+        const auto received = ::recv(
+            impl_->socket.native_handle(),
+            buffer->Tail().data(),
+            buffer->Available(),
+            MSG_DONTWAIT);
+        if (received > 0) {
+            buffer->Produce(static_cast<uint32_t>(received));
+            TouchActivity();
+            co_return buf::MultiBuffer{std::move(buffer)};
+        }
+        if (received == 0) {
             co_return buf::MultiBuffer{};
         }
-        throw IoSystemError(wait_ec);
+        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+            continue;
+        }
+        throw IoSystemError(IoErrorCode(errno, std::system_category()));
     }
-
-    buf::BufferGuard buffer{buf::Buffer::New()};
-    if (!buffer) {
-        throw std::bad_alloc();
-    }
-    auto [ec, n] = co_await AsyncReceiveSome(
-        net::mutable_buffer(buffer->Tail().data(), buffer->Available()));
-
-    if (ec || n == 0) {
-        if (!ec || ec == io_error::eof)
-            co_return buf::MultiBuffer{};
-        throw IoSystemError(ec);
-    }
-
-    buffer->Produce(static_cast<uint32_t>(n));
-    TouchActivity();
-    co_return buf::MultiBuffer{std::move(buffer)};
 }
 
 // ============================================================================
@@ -222,13 +243,6 @@ net::awaitable<buf::MultiBuffer> TcpStream::ReadMultiBuffer() {
 // Scatter-send executes only on the domain owner; native asynchronous work
 // consists solely of readiness notifications and never retains payload spans.
 // ============================================================================
-net::awaitable<void> TcpStream::WriteMultiBuffer(buf::MultiBuffer mb) {
-    if (mb.byte_size() == 0) co_return;
-    ConstBufferSpanBuilder<8> out;
-    out.AppendMultiBuffer(mb);
-    co_await WriteBuffers(out.Span());
-}
-
 net::awaitable<void> TcpStream::WriteBuffers(
     std::span<const net::const_buffer> buffers) {
     if (!impl_->socket.is_open() || impl_->HasFlag(kWriteShutdown)) {
@@ -364,7 +378,7 @@ net::awaitable<std::pair<IoErrorCode, std::size_t>> TcpStream::AsyncReceiveSome(
     if (buffer.size() == 0) co_return std::make_pair(IoErrorCode{}, size_t{0});
     WriteCompletion completion(Cancellation());
     const auto cancellation = co_await net::this_coro::cancellation_state;
-    OperationTimeoutScope<decltype(impl_->timeouts), true> timeout_scope{impl_->timeouts};
+    OperationTimeoutScope<decltype(impl_->timeouts), true> timeout_scope{impl_->timeouts, true};
     for (;;) {
         if (completion.Cancelled() || cancellation.cancelled() != net::cancellation_type::none)
             co_return std::make_pair(IoErrorCode(io_error::operation_aborted), size_t{0});
@@ -391,9 +405,10 @@ net::awaitable<ProxyProtocolReadResult> TcpStream::ReadProxyProtocolHeader(
     auto deadline = StartPhaseDeadline(timeout);
 
     auto timed_out = [&]() noexcept {
-        return deadline.Expired() ||
-               ConsumePhaseDeadline() ||
-               ConsumeIdleTimeout();
+        const bool expired = deadline.Expired();
+        const bool phase = ConsumePhaseDeadline();
+        const bool idle = ConsumeIdleTimeout();
+        return expired || phase || idle;
     };
 
     std::array<uint8_t, kProxyProbeBytes> probe;
@@ -524,13 +539,21 @@ net::awaitable<IoErrorCode> TcpStream::WaitReadable(net::cancellation_slot cance
         co_return IoErrorCode{};
     }
 
-    OperationTimeoutScope<decltype(impl_->timeouts), true> timeout_scope{impl_->timeouts};
+    WriteCompletion completion(Cancellation());
+    OperationTimeoutScope<decltype(impl_->timeouts), true> timeout_scope{impl_->timeouts, true};
     if (!cancellation.is_connected())
         cancellation = (co_await net::this_coro::cancellation_state).slot();
+    if (completion.Cancelled() ||
+        (co_await net::this_coro::cancellation_state).cancelled() != net::cancellation_type::none) {
+        co_return IoErrorCode(io_error::operation_aborted);
+    }
     auto [ec] = co_await impl_->socket.async_wait(
         tcp::socket::wait_read,
         net::bind_cancellation_slot(cancellation, net::bind_allocator(
             memory::ProcessAllocator<std::byte>{}, net::as_tuple(net::use_awaitable))));
+    if (completion.Cancelled() && !ec) {
+        co_return IoErrorCode(io_error::operation_aborted);
+    }
     co_return ec;
 }
 

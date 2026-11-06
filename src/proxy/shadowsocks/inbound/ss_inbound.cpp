@@ -1,5 +1,7 @@
 #include "ss_inbound.hpp"
+#include "../../inbound_admission.hpp"
 #include "acppnode/transport/async_stream.hpp"
+#include "acppnode/transport/link_error.hpp"
 #include "../server.hpp"
 #include "../ss_udp.hpp"
 #include "../../uot/uot.hpp"
@@ -41,6 +43,12 @@ public:
     [[nodiscard]] buf::MultiBuffer Encode(UDPPacketView packet) override;
 
 private:
+    [[nodiscard]] size_t EncodePacketTo(
+        const TargetAddress& target,
+        std::span<const uint8_t> payload,
+        uint8_t* out,
+        size_t out_capacity);
+
     ss::KeyBytes reply_key_;
     ss::SsCipherInfo cipher_info_;
     std::optional<ss::Ss2022UdpSessionState> ss2022_session_;
@@ -61,7 +69,6 @@ PrepareSsTcpSession(
     size_t& last_matched_index,
     UserOnlineTracker& validator,
     ConnectionLimiter* limiter,
-    StatsShard& stats,
     session::Context& ctx,
     std::string_view tag,
     std::string_view client_ip) {
@@ -79,7 +86,6 @@ PrepareSsTcpSession(
             if (limiter && ctx.inbound.HasProxyProtocolClientIP()) {
                 co_await limiter->OnAuthFailTracked(tag, client_ip);
             }
-            stats.OnError();
         } else if (error == ErrorCode::SOCKET_READ_FAILED) {
             // ReadTCPSession returns this code when ReadFull reaches EOF;
             // transport errors throw instead.
@@ -102,7 +108,6 @@ PrepareSsTcpSession(
         if (limiter && ctx.inbound.HasProxyProtocolClientIP()) {
             co_await limiter->OnAuthFailTracked(tag, client_ip);
         }
-        stats.OnError();
         co_return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
     }
 
@@ -110,23 +115,19 @@ PrepareSsTcpSession(
     ctx.inbound.user_id = profile.user_id;
     ctx.inbound.user_email = profile.email;
     ctx.content.speed_limit = profile.speed_limit;
-
-    auto user_session = co_await validator.TryConnectSession(
-        tag, profile.user_id, ctx.inbound.source_ip, profile.device_limit);
-    if (!user_session) {
-        LOG_CONN_DEBUG(ctx, "connection rejected from {}:{} > device limit={} domain_online_devices={}",
-            ctx.inbound.source_ip, ctx.inbound.source_port, profile.device_limit,
-            validator.OnlineDeviceCount(tag, static_cast<uint64_t>(profile.user_id)));
-        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "device limit"));
-        co_return tl::unexpected(ErrorCode::PERMISSION_DENIED);
-    }
-
-    LOG_CONN_DEBUG(ctx, "authentication succeeded from {}:{} -> {}",
-                   client_ip, ctx.inbound.source_port, session_result->target);
     const auto uot_version = proxy::uot::VersionFromMagicAddress(session_result->target);
     ctx.outbound.original_target = session_result->target;
     ctx.outbound.target = std::move(session_result->target);
     ctx.content.network = Network::TCP;
+
+    auto user_session = co_await proxy::TryAcquireInboundUserSession(
+        validator, tag, profile.user_id, profile.device_limit, ctx);
+    if (!user_session) {
+        co_return tl::unexpected(ErrorCode::PERMISSION_DENIED);
+    }
+
+    LOG_CONN_DEBUG(ctx, "authentication succeeded from {}:{} -> {}",
+                   client_ip, ctx.inbound.source_port, ctx.outbound.target);
 
     auto response_writer_result = ss::WriteTCPResponse(
         *matched, cipher_info, session_result->request_salt, stream);
@@ -161,10 +162,26 @@ net::awaitable<RelayResult> DispatchSsUotSession(
     session::Context& ctx,
     StatsShard& stats,
     const TimeoutsConfig& timeouts) {
-    auto prepared = co_await proxy::uot::ReadUotRequestHeader(
-        uot_version, request_reader, std::move(pending));
+    tl::expected<proxy::uot::PreparedRequest, ErrorCode> prepared =
+        tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+    try {
+        prepared = co_await proxy::uot::ReadUotRequestHeader(
+            uot_version, request_reader, std::move(pending));
+    } catch (const transport::LinkError& e) {
+        prepared = tl::unexpected(e.code());
+    } catch (const IoSystemError& e) {
+        prepared = tl::unexpected(
+            stream ? proxy::ClassifyHandshakeReadException(*stream, e)
+                   : MapAsioError(e.code()));
+    }
     if (!prepared) {
-        stats.OnError();
+        if (stream) {
+            stream->CloseAbortive();
+        }
+        if (prepared.error() != ErrorCode::CANCELLED &&
+            prepared.error() != ErrorCode::SOCKET_EOF) {
+            stats.OnError();
+        }
         RelayResult result;
         result.error = prepared.error();
         co_return result;
@@ -239,10 +256,13 @@ proxy::shadowsocks::inbound::Handler::Process(
 
     const std::string_view tag   = ctx.inbound.tag;
     const std::string_view client_ip = ctx.inbound.source_ip;
-    ctx.inbound.user_id = 0;
-    ctx.inbound.user_email.clear();
     auto fail = [&](ErrorCode error) {
-        stats_->OnError();
+        if (stream) {
+            stream->CloseAbortive();
+        }
+        if (error != ErrorCode::CANCELLED && error != ErrorCode::SOCKET_EOF) {
+            stats_->OnError();
+        }
         RelayResult result;
         result.error = error;
         return result;
@@ -250,11 +270,7 @@ proxy::shadowsocks::inbound::Handler::Process(
 
     LOG_CONN_DEBUG(ctx, "processing connection from {}:{}", client_ip, ctx.inbound.source_port);
 
-    if (limiter_ && ctx.inbound.HasProxyProtocolClientIP() &&
-        co_await limiter_->IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {
-        LOG_CONN_DEBUG(ctx, "connection rejected from {}:{} > IP banned",
-                       ctx.inbound.source_ip, ctx.inbound.source_port);
-        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "IP banned"));
+    if (co_await proxy::CheckInboundIpBanned(limiter_, ctx)) {
         co_return fail(ErrorCode::BLOCKED);
     }
     std::unique_ptr<transport::MultiBufferReader> request_reader;
@@ -269,7 +285,6 @@ proxy::shadowsocks::inbound::Handler::Process(
             last_matched_index_,
             validator_,
             limiter_,
-            *stats_,
             ctx,
             tag,
             client_ip);
@@ -368,117 +383,55 @@ proxy::shadowsocks::inbound::Handler::CreateDatagramResponse(
     return memory::AllocateShared<ShadowsocksUdpResponseContext>(std::move(state));
 }
 
-buf::MultiBuffer ShadowsocksUdpResponseContext::Encode(UDPPacketView packet) {
+size_t ShadowsocksUdpResponseContext::EncodePacketTo(
+    const TargetAddress& target,
+    std::span<const uint8_t> payload,
+    uint8_t* out,
+    size_t out_capacity) {
     if (ss2022_session_) {
-        auto& session = *ss2022_session_;
-        const size_t encoded_len = ss::Encode2022UdpResponsePacketTo(
-            packet.target,
-            packet.data.data(),
-            packet.data.size(),
-            session,
-            nullptr,
-            0);
-        if (encoded_len == 0) {
-            return {};
-        }
-
-        if (encoded_len <= buf::Buffer::kSize) {
-            buf::BufferGuard payload{buf::Buffer::New()};
-            if (!payload) {
-                return {};
-            }
-            const size_t written = ss::Encode2022UdpResponsePacketTo(
-                packet.target,
-                packet.data.data(),
-                packet.data.size(),
-                session,
-                payload->Tail().data(),
-                payload->Available());
-            if (written != encoded_len) {
-                return {};
-            }
-            payload->Produce(static_cast<uint32_t>(written));
-            return buf::MultiBuffer{std::move(payload)};
-        }
-
-        memory::ByteVector scratch(encoded_len);
-        const size_t written = ss::Encode2022UdpResponsePacketTo(
-            packet.target,
-            packet.data.data(),
-            packet.data.size(),
-            session,
-            scratch.data(),
-            scratch.size());
-        if (written != encoded_len) {
-            return {};
-        }
-
-        buf::MultiBuffer payload;
-        payload.reserve((encoded_len + buf::Buffer::kSize - 1) / buf::Buffer::kSize);
-        if (!buf::AppendSpanToMultiBuffer(
-                std::span<const uint8_t>(scratch.data(), scratch.size()),
-                payload)) {
-            return {};
-        }
-        return payload;
+        return ss::Encode2022UdpResponsePacketTo(
+            target,
+            payload.data(),
+            payload.size(),
+            *ss2022_session_,
+            out,
+            out_capacity);
     }
-
-    const size_t encoded_len = ss::EncodeUdpPacketTo(
-        packet.target,
-        packet.data.data(),
-        packet.data.size(),
+    return ss::EncodeUdpPacketTo(
+        target,
+        payload.data(),
+        payload.size(),
         reply_key_.span(),
         cipher_info_.type,
         cipher_info_.key_size,
         cipher_info_.salt_size,
-        nullptr,
-        0);
+        out,
+        out_capacity);
+}
+
+buf::MultiBuffer ShadowsocksUdpResponseContext::Encode(UDPPacketView packet) {
+    const size_t encoded_len = EncodePacketTo(
+        packet.target, packet.data, nullptr, 0);
     if (encoded_len == 0) {
         return {};
     }
 
-    if (encoded_len <= buf::Buffer::kSize) {
-        buf::BufferGuard payload{buf::Buffer::New()};
-        if (!payload) {
-            return {};
-        }
-        const size_t written = ss::EncodeUdpPacketTo(
-            packet.target,
-            packet.data.data(),
-            packet.data.size(),
-            reply_key_.span(),
-            cipher_info_.type,
-            cipher_info_.key_size,
-            cipher_info_.salt_size,
-            payload->Tail().data(),
-            payload->Available());
-        if (written != encoded_len) {
-            return {};
-        }
-        payload->Produce(static_cast<uint32_t>(written));
-        return buf::MultiBuffer{std::move(payload)};
+    buf::ContiguousWriteBuffer encoded;
+    uint8_t* dst = encoded.TryPrepare(encoded_len);
+    if (!dst) {
+        return {};
     }
-
-    memory::ByteVector scratch(encoded_len);
-    const size_t written = ss::EncodeUdpPacketTo(
+    const size_t written = EncodePacketTo(
         packet.target,
-        packet.data.data(),
-        packet.data.size(),
-        reply_key_.span(),
-        cipher_info_.type,
-        cipher_info_.key_size,
-        cipher_info_.salt_size,
-        scratch.data(),
-        scratch.size());
+        packet.data,
+        dst,
+        encoded_len);
     if (written != encoded_len) {
         return {};
     }
 
     buf::MultiBuffer payload;
-    payload.reserve((encoded_len + buf::Buffer::kSize - 1) / buf::Buffer::kSize);
-    if (!buf::AppendSpanToMultiBuffer(
-            std::span<const uint8_t>(scratch.data(), scratch.size()),
-            payload)) {
+    if (!encoded.TryAppendTo(written, payload)) {
         return {};
     }
     return payload;
@@ -495,17 +448,6 @@ acpp::proxyman::inbound::PreparedKeyBytes ToPreparedKey(acpp::ss::KeyBytes key) 
     prepared.assign(key.span());
     return prepared;
 }
-
-class ShadowsocksRuntime final
-    : public acpp::proxyman::inbound::ProtocolRuntime {
-public:
-    [[nodiscard]] std::vector<acpp::OnlineDevice>
-    GetOnlineDevices(std::string_view tag) const override {
-        return validator.GetOnlineDevices(tag);
-    }
-
-    acpp::UserOnlineTracker validator;
-};
 
 class ShadowsocksSettings final
     : public acpp::proxyman::inbound::ProtocolSettings {
@@ -525,7 +467,7 @@ const bool kSsInboundRegistered = [] {
 
     reg.create_runtime = []() -> std::unique_ptr<
         acpp::proxyman::inbound::ProtocolRuntime> {
-        return std::make_unique<ShadowsocksRuntime>();
+        return std::make_unique<acpp::proxy::UserOnlineProtocolRuntime>();
     };
 
     reg.create_tcp_handler =
@@ -533,7 +475,7 @@ const bool kSsInboundRegistered = [] {
            acpp::StatsShard& stats,
            acpp::ConnectionLimiter* limiter,
            const acpp::proxyman::inbound::BuildRequest& req) -> std::unique_ptr<acpp::Inbound> {
-            auto* ss_runtime = dynamic_cast<ShadowsocksRuntime*>(&runtime);
+            auto* ss_runtime = dynamic_cast<acpp::proxy::UserOnlineProtocolRuntime*>(&runtime);
             const auto* settings = GetSettings(req);
             if (!ss_runtime || !settings) {
                 return nullptr;
@@ -551,7 +493,7 @@ const bool kSsInboundRegistered = [] {
            acpp::ConnectionLimiter* limiter,
            const acpp::proxyman::inbound::BuildRequest& req)
             -> std::unique_ptr<acpp::Inbound> {
-            auto* ss_runtime = dynamic_cast<ShadowsocksRuntime*>(&runtime);
+            auto* ss_runtime = dynamic_cast<acpp::proxy::UserOnlineProtocolRuntime*>(&runtime);
             const auto* settings = GetSettings(req);
             if (!ss_runtime || !settings) {
                 return nullptr;
@@ -588,10 +530,9 @@ const bool kSsInboundRegistered = [] {
             }
 
             std::vector<acpp::proxyman::inbound::PreparedShadowsocksUser> users;
-            int64_t synthetic_uid = -1;
             acpp::proxyman::inbound::PreparedKeyBytes identity_key;
             const bool use_identity =
-                acpp::ss::Is2022Cipher(cipher_info->type) &&
+                acpp::ss::Is2022AesCipher(cipher_info->type) &&
                 !config.identity_password.empty() &&
                 (config.clients.size() > 1 ||
                  (config.clients.size() == 1 &&
@@ -612,7 +553,6 @@ const bool kSsInboundRegistered = [] {
                 }
                 acpp::proxyman::inbound::PreparedShadowsocksUser info;
                 info.password    = client.password;
-                info.profile.user_id = synthetic_uid--;
                 info.key_size    = cipher_info->key_size;
                 info.salt_size   = cipher_info->salt_size;
                 info.derived_key = ToPreparedKey(
@@ -648,14 +588,12 @@ const bool kSsInboundRegistered = [] {
             std::vector<acpp::proxyman::inbound::PreparedShadowsocksUser> users;
             users.reserve(runtime_users.size());
             acpp::proxyman::inbound::PreparedKeyBytes identity_key;
-            if (acpp::ss::Is2022AesCipher(cipher_info.type) &&
-                settings->identity_password.empty()) {
-                LOG_WARN("Inbound '{}': SS2022 UUID users require server identity key",
-                         req.tag);
-                return std::nullopt;
-            }
-            if (acpp::ss::Is2022Cipher(cipher_info.type) &&
-                !settings->identity_password.empty()) {
+            if (acpp::ss::Is2022AesCipher(cipher_info.type)) {
+                if (settings->identity_password.empty()) {
+                    LOG_WARN("Inbound '{}': SS2022 UUID users require server identity key",
+                             req.tag);
+                    return std::nullopt;
+                }
                 identity_key = ToPreparedKey(
                     acpp::ss::BuildMasterKey(
                         settings->identity_password, cipher_info));

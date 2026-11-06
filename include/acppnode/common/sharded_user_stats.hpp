@@ -94,11 +94,13 @@ private:
     friend class UserOnlineTracker;
     void Arm(UserOnlineTracker& tracker) noexcept { tracker_ = &tracker; }
     void Reset() noexcept {
-        if (!tracker_ || user_id_ == 0) {
-            return;
+        if (tracker_ && user_id_ != 0) {
+            auto* tracker = std::exchange(tracker_, nullptr);
+            tracker->OnUserDisconnected(tag_, std::exchange(user_id_, 0), client_ip_);
+        } else {
+            tracker_ = nullptr;
+            user_id_ = 0;
         }
-        auto* tracker = std::exchange(tracker_, nullptr);
-        tracker->OnUserDisconnected(tag_, std::exchange(user_id_, 0), client_ip_);
         quota_reservation_.reset();
     }
 

@@ -225,22 +225,6 @@ size_t EncodeNewHeaderTo(std::span<uint8_t> out,
     return FinalizeFrameHeaderSpan(out, pos, payload_len, payload_len > 0);
 }
 
-bool EncodeNewHeaderTo(memory::ByteVector& out,
-                       uint16_t session_id,
-                       NetworkType network,
-                       const TargetAddress& target,
-                       size_t payload_len) {
-    std::array<uint8_t, kMaxFrameHeaderBytes> header{};
-    const size_t n = EncodeNewHeaderTo(
-        header, session_id, network, target, payload_len);
-    if (n == 0) {
-        out.clear();
-        return false;
-    }
-    out.assign(header.data(), header.data() + n);
-    return true;
-}
-
 // ============================================================================
 // EncodeEnd
 // ============================================================================
@@ -253,12 +237,6 @@ size_t EncodeEndTo(std::span<uint8_t> out,
         return 0;
     }
     return FinalizeFrameHeaderSpan(out, pos, 0, false);
-}
-
-void EncodeEndTo(memory::ByteVector& out, uint16_t session_id, bool error) {
-    std::array<uint8_t, 6> header{};
-    const size_t n = EncodeEndTo(header, session_id, error);
-    out.assign(header.data(), header.data() + n);
 }
 
 // ============================================================================
@@ -307,19 +285,4 @@ size_t EncodeKeepUDPHeaderTo(std::span<uint8_t> out,
     return FinalizeFrameHeaderSpan(out, pos, payload_len, true);
 }
 
-bool EncodeKeepUDPHeaderTo(
-    memory::ByteVector& out,
-    uint16_t session_id,
-    const TargetAddress& src,
-    size_t payload_len) {
-    std::array<uint8_t, kMaxFrameHeaderBytes> header{};
-    const size_t n = EncodeKeepUDPHeaderTo(
-        header, session_id, src, payload_len);
-    if (n == 0) {
-        out.clear();
-        return false;
-    }
-    out.assign(header.data(), header.data() + n);
-    return true;
-}
 }  // namespace acpp::mux

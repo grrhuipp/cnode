@@ -86,7 +86,7 @@ public:
 
     // Empty span and latched error when fewer than len bytes remain.
     [[nodiscard]] std::span<const uint8_t> ReadBytes(size_t len) noexcept {
-        if (!CanRead(len)) return {};
+        if (!CanRead(len) || len == 0) return {};
         std::span<const uint8_t> result(data_ + pos_, len);
         pos_ += len;
         return result;
@@ -106,14 +106,14 @@ public:
     }
 
     [[nodiscard]] std::optional<uint8_t> Peek() const noexcept {
-        if (error_ || pos_ >= size_) return std::nullopt;
+        if (error_ || !data_ || pos_ >= size_) return std::nullopt;
         return data_[pos_];
     }
 
 private:
     // Subtractive comparison: count may be an untrusted wire length.
     [[nodiscard]] bool CanRead(size_t count) noexcept {
-        if (error_ || count > size_ - pos_) {
+        if (error_ || (count != 0 && !data_) || count > size_ - pos_) {
             error_ = true;
             return false;
         }
@@ -148,9 +148,15 @@ public:
     }
 
     bool WriteBytes(const uint8_t* src, size_t len) noexcept {
+        if (len != 0 && !src) {
+            error_ = true;
+            return false;
+        }
         if (!CanWrite(len)) return false;
-        std::memcpy(data_ + pos_, src, len);
-        pos_ += len;
+        if (len != 0) {
+            std::memcpy(data_ + pos_, src, len);
+            pos_ += len;
+        }
         return true;
     }
 
@@ -160,13 +166,12 @@ public:
 
 private:
     [[nodiscard]] bool CanWrite(size_t count) noexcept {
-        if (error_ || count > capacity_ - pos_) {
+        if (error_ || (count != 0 && !data_) || count > capacity_ - pos_) {
             error_ = true;
             return false;
         }
         return true;
     }
-
     uint8_t* data_;
     size_t capacity_;
     size_t pos_;

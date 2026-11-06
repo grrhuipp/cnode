@@ -3,6 +3,7 @@
 
 #include "acppnode/app/traffic_types.hpp"
 #include "acppnode/app/worker.hpp"
+#include "acppnode/core/naming.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/common/online_device.hpp"
 
@@ -16,30 +17,34 @@
 
 namespace acpp {
 
-net::awaitable<void>
-Controller::Impl::collectTraffic(PanelRuntime& panel, const std::string& tag) {
+net::awaitable<bool>
+Controller::Impl::collectTraffic(PanelRuntime& panel, bool* appended_out) {
     // Do not abandon a durable append before its matching Worker commit.
     // Shutdown joins this critical section before taking its final snapshot.
     co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
     // Only this panel loop may snapshot/commit its accounting key. The disk
     // executor never touches Worker-owned state and has bounded admission.
+    bool appended = false;
     for (const auto& worker : workers_) {
         auto* w = worker.get();
-        auto snapshot = co_await w->PostTask(w->SnapshotTraffic(tag));
+        auto snapshot = co_await w->PostTask(w->SnapshotTraffic(panel.accounting_key));
         if (snapshot.empty()) continue;
         co_await journal_executor_->Run([&panel, &snapshot] {
             panel.traffic_journal->Append(snapshot);
             return true;
         });
+        appended = true;
+        if (appended_out) *appended_out = true;
         // A successful append is durable. A failed commit must suspend further
         // collection, otherwise the same in-memory delta could be persisted twice.
         try {
-            co_await w->PostTask(w->CommitTraffic(tag, snapshot));
+            co_await w->PostTask(w->CommitTraffic(panel.accounting_key, snapshot));
         } catch (...) {
             panel.traffic_journal->Suspend();
             throw;
         }
     }
+    co_return appended;
 }
 
 net::awaitable<void> Controller::Impl::FlushTraffic() {
@@ -47,14 +52,17 @@ net::awaitable<void> Controller::Impl::FlushTraffic() {
     std::exception_ptr failure;
     for (const auto& panel : panels_) {
         try {
-            const auto key = std::format("panel/{}/{}/",
-                panel->config.Name, panel->config.NodeIDs.Front());
-            co_await collectTraffic(*panel, key);
+            co_await collectTraffic(*panel);
         } catch (const std::exception& error) {
             if (!failure) failure = std::current_exception();
             const PanelLogContext log_context{panel->config.Name, panel->config.APIHost,
                 panel->config.NodeIDs.Front(), panel->config.NodeType};
             LOG_PANEL_ERROR(log_context, "Final traffic persistence failed: {}", error.what());
+        } catch (...) {
+            if (!failure) failure = std::current_exception();
+            const PanelLogContext log_context{panel->config.Name, panel->config.APIHost,
+                panel->config.NodeIDs.Front(), panel->config.NodeType};
+            LOG_PANEL_ERROR(log_context, "Final traffic persistence failed: unknown error");
         }
     }
     if (failure) std::rethrow_exception(failure);
@@ -94,53 +102,87 @@ Controller::Impl::GetOnlineSnapshot(const std::string& tag) {
 }
 
 net::awaitable<void> Controller::Impl::userInfoMonitor(PanelRuntime& panel,
-                                                 const std::string& tag) {
+                                                       std::string tag) {
     const PanelLogContext log_context{panel.config.Name, panel.config.APIHost,
         panel.config.NodeIDs.Front(), panel.config.NodeType};
 
     ThrowIfStopping();
     // Drain never-attempted crash/backpressure records before collecting more;
     // otherwise a full journal of ready records could never free its capacity.
-    auto batch = co_await journal_executor_->Run([&panel] {
-        return panel.traffic_journal->Prepare();
-    });
-    if (batch.records.empty()) {
-        // reset_cancellation_state in collectTraffic applies to its entire
-        // coroutine thread, not just that function. Join a shielded child so a
-        // durable append always reaches CommitTraffic without disabling stop
-        // cancellation for this loop's subsequent panel requests.
-        co_await net::co_spawn(io_context_,
-            collectTraffic(panel, panel.node.committed->inbound->accounting_key),
-            net::bind_cancellation_slot(net::cancellation_slot{}, net::use_awaitable));
-        ThrowIfStopping();
+    auto& ns = panel.stats;
+    controller::TrafficJournal::Batch batch;
+    bool traffic_ok = false;
+    bool journal_ok = true;
+    try {
         batch = co_await journal_executor_->Run([&panel] {
             return panel.traffic_journal->Prepare();
         });
-    }
-    auto online = co_await GetOnlineSnapshot(tag);
-    ThrowIfStopping();
-    co_await journal_executor_->Run([&panel, &batch] {
-        panel.traffic_journal->Begin(batch);
-        return true;
-    });
-    const auto& traffic_data = batch.traffic;
-    auto& ns = panel.stats;
-    ns.online_count = traffic_data.size();
-    for (const auto& td : traffic_data) {
-        ns.bytes_up += td.Upload;
-        ns.bytes_down += td.Download;
-    }
-    bool traffic_ok = false;
-    try {
-        // Marked unknown durably BEFORE any network transmission. Even non-2xx
-        // may follow partial server-side accounting; never retry these deltas.
-        // An empty push still clears the panel's previous online-user count.
-        traffic_ok = co_await panel.client->ReportUserTraffic(traffic_data);
-        if (traffic_ok) {
+        if (batch.records.empty()) {
+            // reset_cancellation_state in collectTraffic applies to its entire
+            // coroutine thread, not just that function. Join a shielded child so a
+            // durable append always reaches CommitTraffic without disabling stop
+            // cancellation for this loop's subsequent panel requests.
+            bool appended = false;
+            try {
+                co_await net::co_spawn(io_context_,
+                    collectTraffic(panel, &appended),
+                    net::bind_cancellation_slot(net::cancellation_slot{}, net::use_awaitable));
+            } catch (const std::exception& e) {
+                if (stopping_) throw;
+                journal_ok = false;
+                LOG_PANEL_WARN(log_context, "Traffic collection failed: operation=push reason={}", e.what());
+            }
+            ThrowIfStopping();
+            if (appended) {
+                batch = co_await journal_executor_->Run([&panel] {
+                    return panel.traffic_journal->Prepare();
+                });
+            }
+        }
+        ThrowIfStopping();
+        if (!batch.records.empty()) {
             co_await journal_executor_->Run([&panel, &batch] {
-                panel.traffic_journal->Acknowledge(batch);
+                panel.traffic_journal->Begin(batch);
                 return true;
             });
+        }
+        const auto& traffic_data = batch.traffic;
+        uint64_t batch_up = 0;
+        uint64_t batch_down = 0;
+        for (const auto& td : traffic_data) {
+            batch_up += td.Upload;
+            batch_down += td.Download;
+        }
+        if (!batch.records.empty() || journal_ok) {
+            try {
+                // Marked unknown durably BEFORE any network transmission. Even non-2xx
+                // may follow partial server-side accounting; never retry these deltas.
+                // An empty push still clears the panel's previous online-user count.
+                traffic_ok = co_await panel.client->ReportUserTraffic(traffic_data);
+            } catch (const std::exception& e) {
+                if (stopping_) {
+                    if (!traffic_ok && !batch.records.empty()) {
+                        LOG_PANEL_ERROR(log_context, "Traffic accounting API acceptance unknown: records={} retained without retry; directory={}",
+                                        batch.records.size(), panel.traffic_journal->Directory().string());
+                    }
+                    throw;
+                }
+                LOG_PANEL_WARN(log_context, "Traffic report failed: operation=push reason={}", e.what());
+            }
+        }
+        if (!traffic_ok && !batch.records.empty()) {
+            LOG_PANEL_ERROR(log_context, "Traffic accounting API acceptance unknown: records={} retained without retry; directory={}",
+                            batch.records.size(), panel.traffic_journal->Directory().string());
+        }
+        if (traffic_ok) {
+            ns.bytes_up += batch_up;
+            ns.bytes_down += batch_down;
+            if (!batch.records.empty()) {
+                co_await journal_executor_->Run([&panel, &batch] {
+                    panel.traffic_journal->Acknowledge(batch);
+                    return true;
+                });
+            }
         }
         ThrowIfStopping();
         if (traffic_ok) {
@@ -148,12 +190,13 @@ net::awaitable<void> Controller::Impl::userInfoMonitor(PanelRuntime& panel,
         }
     } catch (const std::exception& e) {
         if (stopping_) throw;
-        LOG_PANEL_WARN(log_context, "Traffic report failed: operation=push reason={}", e.what());
+        journal_ok = false;
+        LOG_PANEL_ERROR(log_context, "Traffic journal failed: operation=push reason={}", e.what());
     }
-    if (!traffic_ok && !batch.records.empty()) {
-        LOG_PANEL_ERROR(log_context, "Traffic accounting API acceptance unknown: records={} retained without retry; directory={}",
-                        batch.records.size(), panel.traffic_journal->Directory().string());
-    }
+
+    auto online = co_await GetOnlineSnapshot(tag);
+    ns.online_count = online.user_count;
+    const auto& traffic_data = batch.traffic;
 
     ThrowIfStopping();
     bool online_ok = false;
@@ -165,11 +208,11 @@ net::awaitable<void> Controller::Impl::userInfoMonitor(PanelRuntime& panel,
         LOG_PANEL_WARN(log_context, "Online report failed: operation=push reason={}", e.what());
     }
 
-    const bool report_ok = traffic_ok && online_ok;
+    const bool report_ok = traffic_ok && journal_ok && online_ok;
     LOG_PANEL_INFO(log_context,
         "Panel report: state={} operation=push traffic={} traffic_users={} online={} online_users={} devices={}",
         report_ok ? "ok" : "degraded",
-        traffic_ok ? "ok" : "failed",
+        (traffic_ok && journal_ok) ? "ok" : "failed",
         traffic_data.size(),
         online_ok ? "ok" : "failed",
         online.user_count,

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../../outbound_stream_endpoint.hpp"
 #include "../../udp_target.hpp"
 #include "acppnode/common/ip_utils.hpp"
 
@@ -7,27 +8,28 @@ namespace acpp::proxy::freedom::outbound {
 
 // One direct UDP association. Target resolution belongs to this outbound;
 // its concrete transport owns the socket, byte I/O and aggregate deadlines.
-class UdpRequest final {
+class UdpRequest final : public acpp::proxy::OutboundDatagramEndpointBase {
 public:
     UdpRequest(net::io_context& io, app::dns::DNS& dns,
                const net::ip::address& bind_address)
-        : io_(io), dns_(dns), socket_(io, bind_address) {}
+        : OutboundDatagramEndpointBase(io, bind_address), io_(io), dns_(dns) {}
 
-    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() {
+    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
         auto read = socket_.StartRead();
-        auto packet = co_await read.Receive();
-        // MultiBuffer links cannot represent an empty datagram independently
-        // of EOF. Reject it explicitly instead of pretending the socket closed.
-        if (packet.payload.byte_size() == 0)
-            throw transport::LinkError(ErrorCode::INVALID_ARGUMENT);
-        const TargetAddress source(iputil::NormalizeAddress(packet.source.address()),
-                                   packet.source.port());
-        for (auto* buffer : packet.payload) buffer->SetUDP(source);
-        socket_.TouchActivity();
-        co_return std::move(packet.payload);
+        for (;;) {
+            auto packet = co_await read.Receive();
+            if (packet.payload.byte_size() == 0 || packet.source.port() == 0) {
+                continue;
+            }
+            const TargetAddress source(iputil::NormalizeAddress(packet.source.address()),
+                                       packet.source.port());
+            for (auto* buffer : packet.payload) buffer->SetUDP(source);
+            socket_.TouchActivity();
+            co_return std::move(packet.payload);
+        }
     }
 
-    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer payload) {
+    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer payload) override {
         const auto datagram = buf::InspectUdpDatagram(payload);
         if (datagram.status == buf::UdpDatagramStatus::Empty) co_return;
         if (!datagram.Valid() || !datagram.target || !datagram.target->IsValid())
@@ -35,6 +37,8 @@ public:
         if (write_closed_) throw transport::WriteClosed{};
         auto write = socket_.StartWrite();
         if (datagram.target->resolved_addr) {
+            if (datagram.target->resolved_addr->is_v6() != socket_.IsIPv6())
+                throw transport::LinkError(ErrorCode::INVALID_ARGUMENT);
             co_await write.SendTo(udp::endpoint(*datagram.target->resolved_addr, datagram.target->port),
                                  std::move(payload));
         } else {
@@ -43,26 +47,9 @@ public:
             co_await write.SendTo(*target, std::move(payload));
         }
     }
-
-    net::awaitable<void> AsyncShutdownWrite() { write_closed_ = true; co_return; }
-    void Cancel() noexcept { socket_.Cancel(); }
-    void Close() noexcept { socket_.Close(); }
-    transport::CancellationSource& Cancellation() noexcept { return socket_.Cancellation(); }
-    void SetIdleTimeout(std::chrono::seconds value) { socket_.SetIdleTimeout(value); }
-    void SetReadTimeout(std::chrono::seconds value) { socket_.SetReadTimeout(value); }
-    void SetWriteTimeout(std::chrono::seconds value) { socket_.SetWriteTimeout(value); }
-    PhaseDeadlineHandle StartPhaseDeadline(std::chrono::seconds value) { return socket_.StartPhaseDeadline(value); }
-    void ClearPhaseDeadline() noexcept { socket_.ClearPhaseDeadline(); }
-    bool ConsumeIdleTimeout() noexcept { return socket_.ConsumeIdleTimeout(); }
-    bool ConsumeReadTimeout() noexcept { return socket_.ConsumeReadTimeout(); }
-    bool ConsumeWriteTimeout() noexcept { return socket_.ConsumeWriteTimeout(); }
-    bool ConsumePhaseDeadline() noexcept { return socket_.ConsumePhaseDeadline(); }
-
 private:
     net::io_context& io_;
     app::dns::DNS& dns_;
-    transport::internet::DatagramSocket socket_;
-    bool write_closed_ = false;
 };
 
 }  // namespace acpp::proxy::freedom::outbound

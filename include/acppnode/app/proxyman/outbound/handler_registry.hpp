@@ -35,6 +35,7 @@ public:
     // Mutations allocate tag/map/shared ownership and propagate failures.
     [[nodiscard]] HandlerPtr AddHandler(std::unique_ptr<Outbound> handler);
     [[nodiscard]] HandlerPtr ReplaceHandler(std::unique_ptr<Outbound> handler);
+    bool RestoreHandler(HandlerPtr handler);
     void RemoveHandler(std::string_view tag);
 
 private:

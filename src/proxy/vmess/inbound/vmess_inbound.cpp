@@ -1,5 +1,6 @@
 #include "vmess_inbound.hpp"
 #include "../../mux/inbound/mux_inbound.hpp"
+#include "../../inbound_admission.hpp"
 #include "acppnode/transport/async_stream.hpp"
 #include "acppnode/app/rate_limiter.hpp"
 #include "acppnode/app/stats.hpp"
@@ -45,16 +46,15 @@ ParseHandshake(AsyncStream& stream,
             try {
                 n = co_await stream.AsyncRead(net::buffer(
                     header_buf.data() + total_read, required - total_read));
-            } catch (const IoSystemError&) {
-                co_return tl::unexpected(stream.ConsumePhaseDeadline()
-                    ? ErrorCode::TIMEOUT : ErrorCode::SOCKET_READ_FAILED);
+            } catch (const IoSystemError& error) {
+                co_return tl::unexpected(
+                    proxy::ClassifyHandshakeReadException(stream, error));
             }
             if (n == 0) {
-                if (stream.ConsumePhaseDeadline() || stream.ConsumeIdleTimeout()) {
-                    co_return tl::unexpected(ErrorCode::TIMEOUT);
-                }
                 // EOF in a structured header is truncation, never an auth miss.
-                co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+                co_return tl::unexpected(
+                    proxy::ResolveHandshakeReadFailure(
+                        stream, ErrorCode::PROTOCOL_DECODE_FAILED));
             }
             total_read += n;
         }
@@ -64,18 +64,38 @@ ParseHandshake(AsyncStream& stream,
         consumed = decoded.second;
         if (!request && vmess_session.RequiredHeaderBytes() == 0) {
             const auto reason = vmess_session.HeaderFailureReason();
+            const auto* authenticated = vmess_session.AuthenticatedRejectedHeader();
+            if (authenticated) {
+                ctx.inbound.user_id = authenticated->user->profile.user_id;
+                ctx.inbound.user_email = authenticated->user->profile.email;
+                ctx.outbound.original_target = authenticated->target;
+                ctx.outbound.target = authenticated->target;
+                ctx.content.network = authenticated->command == ::acpp::vmess::Command::UDP
+                    ? Network::UDP : authenticated->command == ::acpp::vmess::Command::Mux
+                    ? Network::MUX : Network::TCP;
+            }
             LOG_CONN_WARN(ctx, "request rejected from {}:{} > {}",
                           client_ip, ctx.inbound.source_port, reason);
             LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, reason));
-            if (limiter && ctx.inbound.HasProxyProtocolClientIP()) {
+            if (!authenticated && limiter && ctx.inbound.HasProxyProtocolClientIP()) {
                 co_await limiter->OnAuthFailTracked(tag, client_ip);
             }
-            co_return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
+            co_return tl::unexpected(authenticated
+                ? ErrorCode::PROTOCOL_DECODE_FAILED : ErrorCode::PROTOCOL_AUTH_FAILED);
         }
     }
 
     memory::ByteVector{}.swap(header_buf);
 
+    if (request->user) {
+        ctx.inbound.user_id = request->user->profile.user_id;
+        ctx.inbound.user_email = request->user->profile.email;
+        ctx.outbound.original_target = request->target;
+        ctx.outbound.target = request->target;
+        ctx.content.network = request->command == ::acpp::vmess::Command::UDP
+            ? Network::UDP : request->command == ::acpp::vmess::Command::Mux
+            ? Network::MUX : Network::TCP;
+    }
     if (!request->user || !co_await validator.RegisterSessionIfNew(
             *request->user, request->body_key, request->body_iv)) {
         const auto reason = request->user
@@ -84,9 +104,10 @@ ParseHandshake(AsyncStream& stream,
         LOG_CONN_WARN(ctx, "request rejected from {}:{} > {}",
                       client_ip, ctx.inbound.source_port, reason);
         LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, reason));
-        if (limiter && ctx.inbound.HasProxyProtocolClientIP())
+        if (!request->user && limiter && ctx.inbound.HasProxyProtocolClientIP())
             co_await limiter->OnAuthFailTracked(tag, client_ip);
-        co_return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
+        co_return tl::unexpected(request->user
+            ? ErrorCode::PERMISSION_DENIED : ErrorCode::PROTOCOL_AUTH_FAILED);
     }
 
     LOG_CONN_TRACE(ctx,
@@ -100,17 +121,11 @@ ParseHandshake(AsyncStream& stream,
     std::optional<UserOnlineSessionGuard> user_session;
     if (request->user) {
         const auto& profile = request->user->profile;
-        ctx.inbound.user_id = profile.user_id;
-        ctx.inbound.user_email = profile.email;
         ctx.content.speed_limit = profile.speed_limit;
 
-        user_session = co_await validator.TryConnectSession(
-            tag, profile.user_id, ctx.inbound.source_ip, profile.device_limit);
+        user_session = co_await proxy::TryAcquireInboundUserSession(
+            validator, tag, profile.user_id, profile.device_limit, ctx);
         if (!user_session) {
-            LOG_CONN_DEBUG(ctx, "connection rejected from {}:{} > device limit={} domain_online_devices={}",
-                ctx.inbound.source_ip, ctx.inbound.source_port, profile.device_limit,
-                validator.OnlineDeviceCount(tag, static_cast<uint64_t>(profile.user_id)));
-            LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "device limit"));
             co_return tl::unexpected(ErrorCode::PERMISSION_DENIED);
         }
     }
@@ -122,18 +137,7 @@ ParseHandshake(AsyncStream& stream,
     // are already owned by request; do not move a user-table owner into Session.
     request->user.reset();
 
-    TargetAddress target = request->target;
-    Network net = Network::TCP;
-    if (request->command == ::acpp::vmess::Command::UDP) {
-        net = Network::UDP;
-    } else if (request->command == ::acpp::vmess::Command::Mux) {
-        net = Network::MUX;
-    }
-
     vmess_session.SetRequest(std::move(*request));
-    ctx.outbound.original_target = target;
-    ctx.outbound.target = std::move(target);
-    ctx.content.network = net;
 
     co_return std::move(user_session);
 }
@@ -165,10 +169,13 @@ proxy::vmess::inbound::Handler::Process(
 {
     const std::string_view tag   = ctx.inbound.tag;
     const std::string_view client_ip = ctx.inbound.source_ip;
-    ctx.inbound.user_id = 0;
-    ctx.inbound.user_email.clear();
     auto fail = [&](ErrorCode error) {
-        stats_->OnError();
+        if (stream) {
+            stream->CloseAbortive();
+        }
+        if (error != ErrorCode::CANCELLED && error != ErrorCode::SOCKET_EOF) {
+            stats_->OnError();
+        }
         RelayResult result;
         result.error = error;
         return result;
@@ -176,11 +183,7 @@ proxy::vmess::inbound::Handler::Process(
 
     LOG_CONN_DEBUG(ctx, "processing connection from {}:{}", client_ip, ctx.inbound.source_port);
 
-    if (limiter_ && ctx.inbound.HasProxyProtocolClientIP() &&
-        co_await limiter_->IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {
-        LOG_CONN_DEBUG(ctx, "connection rejected from {}:{} > IP banned",
-                       ctx.inbound.source_ip, ctx.inbound.source_port);
-        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "IP banned"));
+    if (co_await proxy::CheckInboundIpBanned(limiter_, ctx)) {
         co_return fail(ErrorCode::BLOCKED);
     }
     ::acpp::vmess::encoding::ServerSession vmess_session(validator_, tag);
@@ -231,15 +234,26 @@ proxy::vmess::inbound::Handler::Process(
 // 自注册（静态初始化）
 // ============================================================================
 namespace {
-class VmessRuntime final : public acpp::proxyman::inbound::ProtocolRuntime {
-public:
-    [[nodiscard]] std::vector<acpp::OnlineDevice>
-    GetOnlineDevices(std::string_view tag) const override {
-        return validator.GetOnlineDevices(tag);
+[[nodiscard]] std::optional<acpp::proxyman::inbound::PreparedVmessUser>
+BuildPreparedVmessUser(
+    const std::string& uuid,
+    int64_t user_id,
+    const std::string& email,
+    uint64_t speed_limit = 0,
+    uint32_t device_limit = 0) {
+    auto user = acpp::vmess::MemoryAccount::FromUUID(
+        uuid, user_id, email, speed_limit, device_limit);
+    if (!user) {
+        return std::nullopt;
     }
-
-    acpp::vmess::TimedUserValidator validator;
-};
+    return acpp::proxyman::inbound::PreparedVmessUser{
+        .uuid = std::move(user->uuid),
+        .uuid_bytes = user->uuid_bytes,
+        .cmd_key = user->cmd_key,
+        .auth_key = user->auth_key,
+        .profile = std::move(user->profile),
+    };
+}
 
 const bool kVmessInboundRegistered = [] {
     acpp::proxyman::inbound::ProxyRegistration reg;
@@ -247,7 +261,8 @@ const bool kVmessInboundRegistered = [] {
 
     reg.create_runtime = []() -> std::unique_ptr<
         acpp::proxyman::inbound::ProtocolRuntime> {
-        return std::make_unique<VmessRuntime>();
+        return std::make_unique<
+            acpp::proxy::InboundTrackerRuntime<acpp::vmess::TimedUserValidator>>();
     };
 
     reg.create_tcp_handler =
@@ -255,7 +270,8 @@ const bool kVmessInboundRegistered = [] {
            acpp::StatsShard& stats,
            acpp::ConnectionLimiter* limiter,
            const acpp::proxyman::inbound::BuildRequest&) -> std::unique_ptr<acpp::Inbound> {
-            auto* vmess_runtime = dynamic_cast<VmessRuntime*>(&runtime);
+            auto* vmess_runtime = dynamic_cast<
+                acpp::proxy::InboundTrackerRuntime<acpp::vmess::TimedUserValidator>*>(&runtime);
             if (!vmess_runtime) {
                 return nullptr;
             }
@@ -269,25 +285,19 @@ const bool kVmessInboundRegistered = [] {
         [](std::string_view tag, const acpp::StaticUserConfig& config)
             -> std::optional<acpp::proxyman::inbound::UserSet> {
             std::vector<acpp::proxyman::inbound::PreparedVmessUser> users;
+            users.reserve(config.clients.size());
 
             for (const auto& client : config.clients) {
                 if (client.id.empty()) {
                     LOG_WARN("VMess inbound '{}': static user UUID is empty", tag);
                     return std::nullopt;
                 }
-                auto user = acpp::vmess::MemoryAccount::FromUUID(
-                    client.id, 0, client.email, 0);
+                auto user = BuildPreparedVmessUser(client.id, 0, client.email);
                 if (!user) {
                     LOG_WARN("VMess inbound '{}': invalid static user UUID", tag);
                     return std::nullopt;
                 }
-                users.push_back(acpp::proxyman::inbound::PreparedVmessUser{
-                    .uuid = user->uuid,
-                    .uuid_bytes = user->uuid_bytes,
-                    .cmd_key = user->cmd_key,
-                    .auth_key = user->auth_key,
-                    .profile = user->profile,
-                });
+                users.push_back(std::move(*user));
             }
 
             return acpp::proxyman::inbound::UserSet{std::move(users)};
@@ -301,24 +311,17 @@ const bool kVmessInboundRegistered = [] {
             users.reserve(runtime_users.size());
 
             for (const auto& runtime_user : runtime_users) {
-                if (auto user = acpp::vmess::MemoryAccount::FromUUID(
-                        runtime_user.credential,
-                        runtime_user.user_id,
-                        runtime_user.email,
-                        runtime_user.speed_limit,
-                        runtime_user.device_limit)) {
-                    users.push_back(acpp::proxyman::inbound::PreparedVmessUser{
-                        .uuid = user->uuid,
-                        .uuid_bytes = user->uuid_bytes,
-                        .cmd_key = user->cmd_key,
-                        .auth_key = user->auth_key,
-                        .profile = user->profile,
-                    });
-                } else {
+                auto user = BuildPreparedVmessUser(
+                    runtime_user.credential,
+                    runtime_user.user_id,
+                    runtime_user.email,
+                    runtime_user.speed_limit,
+                    runtime_user.device_limit);
+                if (!user) {
                     return std::nullopt;
                 }
+                users.push_back(std::move(*user));
             }
-
             return acpp::proxyman::inbound::UserSet{std::move(users)};
         };
 

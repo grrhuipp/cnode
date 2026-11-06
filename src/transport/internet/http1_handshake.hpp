@@ -40,8 +40,14 @@ struct Http1MessageHead {
 ReadHttp1MessageHead(AsyncStream& stream, std::span<const uint8_t> initial = {});
 
 [[nodiscard]] std::string_view ExtractStartLine(std::string_view head);
-[[nodiscard]] std::string_view ExtractRequestMethod(std::string_view request_line);
-[[nodiscard]] std::string_view ExtractRequestTarget(std::string_view request_line);
+struct Http1RequestLine {
+    std::string_view method;
+    std::string_view target;
+    std::string_view version;
+};
+// Preserves the transport's space-delimited target semantics; ignores trailing
+// tokens. Log validation does not change which requests the protocol accepts.
+[[nodiscard]] Http1RequestLine ParseHttp1RequestLine(std::string_view request_line);
 [[nodiscard]] std::string_view ExtractHeaderValueCI(std::string_view head,
                                                     std::string_view name);
 [[nodiscard]] size_t CountHeadersCI(std::string_view head, std::string_view name);
@@ -57,10 +63,14 @@ void RecordExtractedRealIp(std::string_view head,
                            InboundTransportMetadata* metadata);
 
 [[nodiscard]] std::string SanitizeForLog(std::string_view value, size_t max_len = 160);
-// Removes URL credentials, query and fragment without changing protocol input.
+// Origin paths, absolute URLs and authorities share this log-only projection.
+// Removes URL credentials/query/fragment; ambiguous URLs and control bytes are
+// replaced with a fixed marker, never repaired into a plausible authority.
 [[nodiscard]] std::string_view PublicHttpTargetForLog(std::string_view value);
-[[nodiscard]] std::string SanitizeHttpRequestLineForLog(std::string_view value);
+[[nodiscard]] std::string_view PublicHttpMethodForLog(std::string_view value);
+[[nodiscard]] std::string SanitizeHttpRequestLineForLog(const Http1RequestLine& line);
 [[nodiscard]] std::string_view ExpectedHttpHost(const HttpConfig& cfg);
+[[nodiscard]] bool IsReservedUpgradeHeader(std::string_view key) noexcept;
 
 // Returns false instead of throwing; the caller maps it to SOCKET_WRITE_FAILED.
 [[nodiscard]] net::awaitable<bool> WriteFullToStream(AsyncStream& stream,

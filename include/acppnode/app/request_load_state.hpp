@@ -1,5 +1,7 @@
 #pragma once
 
+#include "acppnode/app/session_group_executor.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <memory>
@@ -18,14 +20,9 @@ public:
           pressure_idle_timeout_(pressure_idle_timeout) {}
 
     [[nodiscard]] static std::shared_ptr<RequestLoadState> Acquire(
-        uint32_t threshold, uint32_t idle_timeout) {
-        static std::mutex mutex;
-        static std::weak_ptr<RequestLoadState> published;
-        const std::lock_guard lock(mutex);
-        if (auto existing = published.lock()) return existing;
-        auto state = std::make_shared<RequestLoadState>(threshold, idle_timeout);
-        published = state;
-        return state;
+        uint32_t threshold, uint32_t idle_timeout, GroupCoordinator& coordinator) {
+        return net::use_service<Service>(coordinator.Services()).Acquire(
+            threshold, idle_timeout);
     }
 
     [[nodiscard]] uint32_t ActiveConnections() const noexcept {
@@ -80,6 +77,27 @@ public:
     };
 
 private:
+    class Service final : public net::execution_context::service {
+    public:
+        inline static net::execution_context::id id;
+        explicit Service(net::execution_context& context) : service(context) {}
+        std::shared_ptr<RequestLoadState> Acquire(
+            uint32_t threshold, uint32_t idle_timeout) {
+            const std::lock_guard lock(mutex_);
+            if (auto existing = published_.lock()) return existing;
+            auto state = std::make_shared<RequestLoadState>(threshold, idle_timeout);
+            published_ = state;
+            return state;
+        }
+    private:
+        void shutdown() override {
+            const std::lock_guard lock(mutex_);
+            published_.reset();
+        }
+        std::mutex mutex_;
+        std::weak_ptr<RequestLoadState> published_;
+    };
+
     std::atomic<uint32_t> physical_connections_{0};
     std::atomic<uint32_t> active_dispatches_{0};
     const uint32_t pressure_threshold_;

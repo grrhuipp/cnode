@@ -62,7 +62,8 @@ struct Peer {
             const bool v6 = packet[packet.size() - 3] == 28;
             packet[2] = 0x81;
             packet[3] = refuse ? 0x82 : negative ? 0x83 : 0x80;
-            if (!refuse && !negative && !nodata) {
+            if (!refuse && !negative && !nodata &&
+                (malformed_type == 0 || malformed_type == (v6 ? 28 : 1))) {
                 packet[7] = 1;
                 const uint8_t size = v6 ? 16 : 4;
                 packet.insert(packet.end(), {0xc0, 0x0c, 0, static_cast<uint8_t>(v6 ? 28 : 1),
@@ -71,6 +72,10 @@ struct Peer {
                     const auto bytes = net::ip::make_address_v6("2001:db8::1").to_bytes();
                     packet.insert(packet.end(), bytes.begin(), bytes.end());
                 } else packet.insert(packet.end(), {192, 0, 2, static_cast<uint8_t>(ordinal)});
+                if (malformed_type == (v6 ? 28 : 1)) {
+                    packet[it->bytes.size() + 11] = static_cast<uint8_t>(size - 1);
+                    packet.pop_back();
+                }
             }
             --ordinal;
             if (noise) {
@@ -107,6 +112,7 @@ struct Peer {
     size_t packets = 0, batch_size = 4;
     bool hold = false, refuse = false, negative = false, nodata = false;
     bool noise = false, duplicate_id = false;
+    int malformed_type = 0;
 };
 
 acpp::app::dns::Config Config(Peer& peer) {
@@ -185,6 +191,95 @@ void TestIsolation(bool cancel) {
     Require(cancel ? (errors[0] || !answers[0].Ok()) : answers[0].error == acpp::ErrorCode::DNS_TIMEOUT,
             "cancelled or expired requests must return promptly");
     Require(peer.ports.size() == 1, "concurrent requests must multiplex one socket");
+}
+
+void TestSameDomainCancellation(size_t cancelled) {
+    net::io_context io;
+    Peer peer(io);
+    peer.hold = true;
+    acpp::app::dns::DNSWorker worker(io, Config(peer), 8);
+    std::array<net::cancellation_signal, 2> signals;
+    std::array<DnsResult, 2> answers;
+    std::array<std::exception_ptr, 2> errors;
+    std::array<bool, 2> completed{};
+    bool expired = false;
+    net::steady_timer watchdog(io, 2s);
+    watchdog.async_wait([&](acpp::IoErrorCode ec) {
+        if (!ec) { expired = true; io.stop(); }
+    });
+    auto start = [&](size_t i) {
+        net::co_spawn(io, worker.Resolve("same.example"),
+            net::bind_cancellation_slot(signals[i].slot(),
+                [&, i](std::exception_ptr error, DnsResult result) {
+                    errors[i] = error;
+                    answers[i] = std::move(result);
+                    completed[i] = true;
+                }));
+    };
+    start(0);
+    while (peer.packets != 4 && !expired) io.run_one();
+    Require(!expired, "leader must send all four real UDP questions");
+    start(1);
+    io.poll(); // Drain ready admission work while upstream replies remain held.
+    signals[cancelled].emit(net::cancellation_type::terminal);
+    io.poll();
+    Require(completed[cancelled] && !completed[1 - cancelled],
+            "only the cancelled same-domain waiter may finish before the UDP reply");
+    Require(errors[cancelled] || answers[cancelled].error == acpp::ErrorCode::CANCELLED,
+            "cancelled same-domain waiter must observe cancellation");
+    peer.Flush("same.example");
+    while (!completed[1 - cancelled] && !expired) io.run_one();
+    Require(!expired && !errors[1 - cancelled] && answers[1 - cancelled].Ok() &&
+                answers[1 - cancelled].addresses.size() == 4 && peer.packets == 4,
+            "surviving same-domain waiter must receive the original real UDP answer");
+    bool joined = false;
+    std::exception_ptr join_error;
+    net::co_spawn(io, worker.AsyncJoin(), [&](std::exception_ptr error) {
+        join_error = error;
+        joined = true;
+        watchdog.cancel();
+        peer.Stop();
+    });
+    io.run();
+    if (join_error) std::rethrow_exception(join_error);
+    Require(joined && !expired, "same-domain cancellation must leave join quiescent");
+}
+
+void TestMalformedFallback(int type, bool fallback) {
+    net::io_context io;
+    Peer first(io), second(io);
+    first.malformed_type = type;
+    auto config = Config(first);
+    if (fallback) config.servers.push_back(second.socket.local_endpoint());
+    acpp::app::dns::DNSWorker worker(io, config, 8);
+    std::exception_ptr failure;
+    bool done = false;
+    auto run = [&]() -> net::awaitable<void> {
+        auto result = co_await worker.Resolve("malformed.example");
+        if (fallback) {
+            Require(result.Ok() && !result.from_cache && first.packets == 4 && second.packets == 4,
+                    "malformed address length must try the healthy fallback");
+            result = co_await worker.Resolve("malformed.example");
+            Require(result.Ok() && result.from_cache && first.packets == 4 && second.packets == 4,
+                    "fallback success must enter the positive cache, never a negative cache");
+        } else {
+            Require(result.error == acpp::ErrorCode::DNS_FORMAT_ERROR &&
+                        result.error_msg.find(type == 1 ? "A record has invalid RDLENGTH 3" :
+                                                        "AAAA record has invalid RDLENGTH 15") != std::string::npos,
+                    "malformed address length must retain a precise format-error reason");
+            result = co_await worker.Resolve("malformed.example");
+            Require(result.error == acpp::ErrorCode::DNS_FORMAT_ERROR && !result.from_cache &&
+                        first.packets == 8 && second.packets == 0,
+                    "malformed answers must never poison the negative cache");
+        }
+        co_await worker.AsyncJoin();
+    };
+    net::co_spawn(io, run(), [&](std::exception_ptr error) {
+        failure = error; done = true; first.Stop(); second.Stop();
+    });
+    io.run_for(3s);
+    if (failure) std::rethrow_exception(failure);
+    Require(done, "malformed fallback test timed out");
 }
 
 void TestFallback() {
@@ -441,6 +536,9 @@ int main() {
     acpp::memory::ConfigureProcessAllocator();
     try {
         TestQueries(false); TestQueries(true); TestIsolation(true); TestIsolation(false);
+        TestSameDomainCancellation(0); TestSameDomainCancellation(1);
+        TestMalformedFallback(1, true); TestMalformedFallback(28, true);
+        TestMalformedFallback(1, false); TestMalformedFallback(28, false);
         TestFallback(); TestCacheFailure(); TestIdRotation();
         TestServiceStopJoin(); TestDatagramStopJoin(false); TestDatagramStopJoin(true);
         TestDatagramAllocationFailureJoin();

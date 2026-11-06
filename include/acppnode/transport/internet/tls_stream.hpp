@@ -107,7 +107,6 @@ public:
     net::awaitable<std::size_t> AsyncRead(net::mutable_buffer buf) override;
     net::awaitable<std::size_t> AsyncWrite(net::const_buffer buf) override;
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override;
-    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override;
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override;
     void ShutdownRead() override;
     void ShutdownWrite() override;

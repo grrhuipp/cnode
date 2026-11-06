@@ -55,6 +55,31 @@ bool EncodeKeepDataHeader(
     return n != 0;
 }
 
+bool EncodeNewHeaderTo(
+    acpp::memory::ByteVector& out,
+    uint16_t session_id,
+    acpp::mux::NetworkType network,
+    const acpp::TargetAddress& target,
+    size_t payload_len) {
+    std::array<uint8_t, acpp::mux::kMaxFrameHeaderBytes> header{};
+    const size_t n = acpp::mux::EncodeNewHeaderTo(
+        header, session_id, network, target, payload_len);
+    out.assign(header.data(), header.data() + n);
+    return n != 0;
+}
+
+bool EncodeKeepUDPHeaderTo(
+    acpp::memory::ByteVector& out,
+    uint16_t session_id,
+    const acpp::TargetAddress& src,
+    size_t payload_len) {
+    std::array<uint8_t, acpp::mux::kMaxFrameHeaderBytes> header{};
+    const size_t n = acpp::mux::EncodeKeepUDPHeaderTo(
+        header, session_id, src, payload_len);
+    out.assign(header.data(), header.data() + n);
+    return n != 0;
+}
+
 void CheckInvalidAcrossLayouts(
     std::span<const uint8_t> frame,
     std::string_view message) {
@@ -131,7 +156,7 @@ int main() {
         xudp_decoder.Clear();
     }
 
-    Check(mux::EncodeNewHeaderTo(
+    Check(EncodeNewHeaderTo(
               encoded,
               9,
               mux::NetworkType::UDP,
@@ -171,7 +196,7 @@ int main() {
     oversized_domain_target.type = AddressType::Domain;
     oversized_domain_target.host.assign(256, 'a');
     oversized_domain_target.port = 53;
-    Check(!mux::EncodeNewHeaderTo(
+    Check(!EncodeNewHeaderTo(
               encoded,
               7,
               mux::NetworkType::TCP,
@@ -179,10 +204,10 @@ int main() {
               0) &&
               encoded.empty(),
           "Mux NEW encoded a zero-port target");
-    Check(!mux::EncodeKeepUDPHeaderTo(
+    Check(!EncodeKeepUDPHeaderTo(
               encoded, 7, zero_port_target, 0) && encoded.empty(),
           "Mux UDP encoded a zero-port target");
-    Check(!mux::EncodeNewHeaderTo(
+    Check(!EncodeNewHeaderTo(
               encoded,
               7,
               mux::NetworkType::TCP,
@@ -190,7 +215,7 @@ int main() {
               0) &&
               encoded.empty(),
           "Mux NEW truncated an oversized domain target");
-    Check(!mux::EncodeNewHeaderTo(
+    Check(!EncodeNewHeaderTo(
               encoded,
               7,
               static_cast<mux::NetworkType>(0xff),
@@ -199,7 +224,7 @@ int main() {
               encoded.empty(),
           "Mux NEW encoded an unknown network type");
 
-    Check(!mux::EncodeNewHeaderTo(
+    Check(!EncodeNewHeaderTo(
               encoded,
               7,
               mux::NetworkType::UDP,
@@ -207,7 +232,7 @@ int main() {
               oversized.size()) &&
               encoded.empty(),
           "oversized Mux NEW payload was truncated instead of rejected");
-    Check(!mux::EncodeKeepUDPHeaderTo(
+    Check(!EncodeKeepUDPHeaderTo(
               encoded, 7, target, oversized.size()) &&
               encoded.empty(),
           "oversized Mux UDP header was truncated instead of rejected");
@@ -253,7 +278,7 @@ int main() {
         oversized_metadata_prefix,
         "Mux MetaLen beyond the largest valid metadata waited for more data");
 
-    Check(mux::EncodeNewHeaderTo(
+    Check(EncodeNewHeaderTo(
               encoded,
               7,
               mux::NetworkType::UDP,

@@ -50,8 +50,9 @@ class ConnectionLimiterCore {
 
         [[nodiscard]] bool Match(uint64_t h) const noexcept { return hash == h; }
         [[nodiscard]] bool Empty() const noexcept { return hash == 0; }
-        [[nodiscard]] bool Idle(uint32_t now) const noexcept {
-            return conns == 0 && ban_until <= now;
+        [[nodiscard]] bool Idle(uint32_t now, uint32_t auth_fail_window) const noexcept {
+            return conns == 0 && ban_until <= now &&
+                   (auth_fails == 0 || now - auth_ts > auth_fail_window);
         }
         void Reset(uint64_t h) noexcept {
             hash = h;
@@ -89,6 +90,17 @@ public:
 
     explicit ConnectionLimiterCore(const RateLimitConfig& cfg) noexcept
         : cfg_(cfg) {}
+    [[nodiscard]] bool TracksGlobalConnections() const noexcept {
+        return cfg_.max_connections > 0;
+    }
+
+    [[nodiscard]] bool TracksIpConnections() const noexcept {
+        return cfg_.max_conn_per_ip > 0;
+    }
+
+    [[nodiscard]] bool TracksAuthBan() const noexcept {
+        return cfg_.auth_fail_limit > 0;
+    }
 
 
     [[nodiscard]] RejectReason TryAcceptGlobal() noexcept {
@@ -158,8 +170,6 @@ public:
         if (!s || s->ban_until > now) return;
 
         const uint32_t last = s->auth_ts;
-        if (last == now) return;
-
         if (last > 0 && now - last > cfg_.auth_fail_window) {
             s->auth_fails = 0;
         }
@@ -244,10 +254,14 @@ private:
             Slot& s = slots_[(idx + i) & kMask];
             if (s.Match(h)) return &s;
             if (s.Empty()) {
-                s.hash = h;
+                if (idle) {
+                    idle->Reset(h);
+                    return idle;
+                }
+                s.Reset(h);
                 return &s;
             }
-            if (!idle && s.Idle(now)) {
+            if (!idle && s.Idle(now, cfg_.auth_fail_window)) {
                 idle = &s;
             }
         }
@@ -310,7 +324,8 @@ public:
         Reservation& operator=(const Reservation&) = delete;
         ~Reservation() { Reset(); }
         [[nodiscard]] const std::shared_ptr<Family>& FamilyLease() const noexcept {
-            return node_->family;
+            static const std::shared_ptr<Family> kEmpty{};
+            return node_ ? node_->family : kEmpty;
         }
     private:
         friend class ConnectionLimiter;
@@ -330,30 +345,28 @@ public:
 
     static std::shared_ptr<ConnectionLimiter> Acquire(
         const RateLimitConfig& config, std::shared_ptr<GroupCoordinator> coordinator) {
-        // Cold bootstrap publication only; no request acquires this mutex.
-        static std::mutex publication_mutex;
-        static std::weak_ptr<ConnectionLimiter> published;
-        const std::lock_guard lock(publication_mutex);
-        if (auto existing = published.lock()) {
-            if (existing->coordinator_ != coordinator)
-                throw std::logic_error("connection limiter coordinator mismatch");
-            return existing;
-        }
-        auto limiter = std::shared_ptr<ConnectionLimiter>(
-            new ConnectionLimiter(config, std::move(coordinator)));
-        published = limiter;
-        return limiter;
+        if (!coordinator) throw std::invalid_argument("missing admission coordinator");
+        auto& services = coordinator->Services();
+        return net::use_service<Service>(services).Acquire(config, std::move(coordinator));
     }
 
-    net::awaitable<Admission> ReservePhysical() {
+    net::awaitable<Admission> ReservePhysical(
+        std::string_view tag = {}, std::string_view ip = {},
+        bool check_ban = false) {
         auto node = std::make_unique<Return>();
         node->owner = shared_from_this();
         node->family = std::make_shared<Family>();
         node->physical = true;
         auto reservation = Reservation(std::move(node));
-        co_return co_await coordinator_->PostCall(
-            [reservation = std::move(reservation)]() mutable {
+        return coordinator_->PostCall(
+            [reservation = std::move(reservation),
+             tag = std::string(check_ban ? tag : std::string_view{}),
+             ip = std::string(check_ban ? ip : std::string_view{}),
+             check_ban]() mutable {
                 auto& node = *reservation.node_;
+                if (check_ban && node.owner->core_.IsBanned(tag, ip)) {
+                    return Admission{RejectReason::IP_BANNED, std::move(reservation)};
+                }
                 const auto reason = node.owner->core_.TryAcceptGlobal();
                 node.admitted = reason == RejectReason::NONE;
                 return Admission{reason, std::move(reservation)};
@@ -381,6 +394,31 @@ public:
         });
     }
 private:
+    class Service final : public net::execution_context::service {
+    public:
+        inline static net::execution_context::id id;
+        explicit Service(net::execution_context& context) : service(context) {}
+        std::shared_ptr<ConnectionLimiter> Acquire(
+            const RateLimitConfig& config, std::shared_ptr<GroupCoordinator> coordinator) {
+            const std::lock_guard lock(mutex_);
+            if (auto existing = published_.lock()) {
+                if (existing->coordinator_ != coordinator)
+                    throw std::logic_error("connection limiter coordinator mismatch");
+                return existing;
+            }
+            auto limiter = std::shared_ptr<ConnectionLimiter>(
+                new ConnectionLimiter(config, std::move(coordinator)));
+            published_ = limiter;
+            return limiter;
+        }
+    private:
+        void shutdown() override {
+            const std::lock_guard lock(mutex_);
+            published_.reset();
+        }
+        std::mutex mutex_;
+        std::weak_ptr<ConnectionLimiter> published_;
+    };
     ConnectionLimiter(const RateLimitConfig& config, std::shared_ptr<GroupCoordinator> coordinator)
         : core_(config), coordinator_(std::move(coordinator)) {
         if (!coordinator_) throw std::invalid_argument("missing admission coordinator");
@@ -393,7 +431,8 @@ private:
         node->child = bool(node->family);
         auto reservation = Reservation(std::move(node));
         return coordinator_->PostCall([reservation = std::move(reservation),
-            tag = std::string(tag), ip = std::string(ip), check_ban]() mutable {
+            tag = std::string(check_ban && core_.TracksAuthBan() ? tag : std::string_view{}),
+            ip = std::string(ip), check_ban]() mutable {
             auto& node = *reservation.node_;
             auto& core = node.owner->core_;
             const bool extra_global = node.child &&
@@ -404,9 +443,16 @@ private:
                 if (reason != RejectReason::NONE && extra_global) core.ReleaseGlobal();
             }
             if (reason == RejectReason::NONE) {
-                node.admitted = true;
-                node.ip_hash = ConnectionLimiterCore::IpHash(ip);
-                if (node.child) ++node.family->children;
+                const bool tracked_ip = core.TracksIpConnections();
+                if (tracked_ip) {
+                    node.ip_hash = ConnectionLimiterCore::IpHash(ip);
+                }
+                if (node.child) {
+                    ++node.family->children;
+                }
+                node.admitted =
+                    (extra_global && core.TracksGlobalConnections()) ||
+                    node.child || tracked_ip;
             }
             return Admission{reason, std::move(reservation)};
         });

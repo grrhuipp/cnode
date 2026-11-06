@@ -14,6 +14,7 @@ namespace acpp::detail {
 class XHttpPacketQueue final {
 public:
     static constexpr size_t kMaxQueuedBytes = 4 * 1024 * 1024;
+    static constexpr size_t kInOrderHeadroomBytes = 64 * 1024;
     static constexpr size_t kMaxQueuedPackets = 1024;
 
     static constexpr size_t kMaxUploads = 64;
@@ -45,7 +46,19 @@ public:
 
         const size_t bytes = payload.byte_size();
         const size_t capacity = payload.size() * buf::Buffer::kSize;
-        if (queued_packets_ >= kMaxQueuedPackets ||
+        if (seq > next_seq_) {
+            const size_t out_of_order_budget = kMaxQueuedBytes - kInOrderHeadroomBytes;
+            if (seq - next_seq_ > kMaxQueuedPackets ||
+                (bytes != 0 && pending_.size() >= kMaxQueuedPackets / 2) ||
+                queued_bytes_ + bytes > out_of_order_budget ||
+                queued_capacity_ + reserved_ + capacity > out_of_order_budget) {
+                payload.clear();
+                return false;
+            }
+        }
+        const size_t packet_limit =
+            (seq == next_seq_ && ready_.empty()) ? kMaxQueuedPackets + 1 : kMaxQueuedPackets;
+        if (queued_packets_ >= packet_limit ||
             capacity > kMaxQueuedBytes - queued_capacity_ - reserved_) {
             payload.clear();
             return false;

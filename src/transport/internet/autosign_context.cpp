@@ -74,6 +74,7 @@ private:
         // EAGAIN means the event counter is already readable.
     }
     void Wait(AutoSignContextRenewal::Clock::time_point next) {
+        if (next <= AutoSignContextRenewal::Clock::now()) return;
         itimerspec timeout{};
         if (next != AutoSignContextRenewal::Clock::time_point::max()) {
             const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(next.time_since_epoch());
@@ -136,11 +137,14 @@ private:
             } catch (...) {
                 LOG_ERROR("TLS auto-sign renewal failed > unknown exception");
             }
+            const auto minimum_retry = Clock::now() + std::chrono::minutes(1);
             if (!renewed) {
                 // Existing connections retain their own SSL_CTX. New handshakes
                 // fail closed after notAfter if renewal cannot recover.
-                due->next_attempt_ = Clock::now() + std::chrono::minutes(1);
+                due->next_attempt_ = minimum_retry;
                 LOG_ERROR("TLS auto-sign renewal unavailable; retrying in one minute");
+            } else if (due->next_attempt_ < minimum_retry) {
+                due->next_attempt_ = minimum_retry;
             }
         }
     }

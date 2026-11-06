@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <format>
+#include <limits>
 #include <stdexcept>
 
 namespace acpp {
@@ -71,17 +72,18 @@ std::unique_ptr<geo::GeoDatabase> LoadGeoDatabase(const Config& config) {
 
 
 uint32_t ComputePressureThreshold(const WorkerRuntimeConfig& config) {
-    uint32_t budget = defaults::kMaxConnectionsPerWorker;
     const uint32_t configured_max = config.limits.max_connections;
     const uint32_t workers = std::max<uint32_t>(1, config.workers);
+    const uint64_t scaled_default = std::min<uint64_t>(
+        static_cast<uint64_t>(defaults::kMaxConnectionsPerWorker) * workers,
+        std::numeric_limits<uint32_t>::max());
+    uint32_t effective_max = static_cast<uint32_t>(scaled_default);
     if (configured_max > 0) {
-        const uint32_t per_worker_budget = configured_max / workers +
-            static_cast<uint32_t>(configured_max % workers != 0);
-        // Clamp before applying the percentage: both ceil division and the
-        // multiplication remain safe for the full uint32_t configuration range.
-        budget = std::min(budget, per_worker_budget);
+        effective_max = std::min(effective_max, configured_max);
     }
-    return std::max<uint32_t>(1, budget * defaults::kPressurePercent / 100);
+    return std::max<uint32_t>(
+        1, static_cast<uint32_t>(
+               static_cast<uint64_t>(effective_max) * defaults::kPressurePercent / 100));
 }
 
 uint32_t ComputePressureIdleTimeout(const WorkerRuntimeConfig& config) {
@@ -173,23 +175,29 @@ BootstrapEnvironment CreateBootstrapEnvironment(
     for (const auto& inbound : inbounds) {
         user_updates.push_back({inbound.runtime.tag, inbound.users});
     }
-    proxyman::inbound::UserStore::CommitSnapshot(
-        proxyman::inbound::UserStore::PrepareUsers(user_updates));
-    env.worker_pool = CreateWorkerPool(
-        worker_runtime_config, *env.stats, env.geo_database.get(), *env.dns_worker);
-    env.controller = std::make_unique<Controller>(
-        *env.main_ctx, env.worker_pool.workers);
+    auto prepared_users = proxyman::inbound::UserStore::PrepareUsers(user_updates);
+    const auto previous_users = proxyman::inbound::UserStore::CaptureSnapshot();
+    proxyman::inbound::UserStore::CommitSnapshot(std::move(prepared_users));
+    try {
+        env.worker_pool = CreateWorkerPool(
+            worker_runtime_config, *env.stats, env.geo_database.get(), *env.dns_worker);
+        env.controller = std::make_unique<Controller>(
+            *env.main_ctx, env.worker_pool.workers);
 
-    SetupPanels(*env.main_ctx, *env.controller, config, *env.panel_dns_service);
-    if (enable_test_mode) {
-        LOG_CONSOLE("Test mode enabled: port={}", constants::test::kTestPort);
+        SetupPanels(*env.main_ctx, *env.controller, config, *env.panel_dns_service);
+        if (enable_test_mode) {
+            LOG_CONSOLE("Test mode enabled: port={}", constants::test::kTestPort);
+        }
+        env.inbound_startup.entries.reserve(inbounds.size());
+        for (const auto& inbound : inbounds)
+            env.inbound_startup.entries.push_back(inbound.runtime);
+
+        env.enable_controller = !config.panels.empty();
+        return env;
+    } catch (...) {
+        proxyman::inbound::UserStore::CommitSnapshot(previous_users);
+        throw;
     }
-    env.inbound_startup.entries.reserve(inbounds.size());
-    for (const auto& inbound : inbounds)
-        env.inbound_startup.entries.push_back(inbound.runtime);
-
-    env.enable_controller = !config.panels.empty();
-    return env;
 }
 
 RuntimeContext MakeRuntimeContext(BootstrapEnvironment& env) {

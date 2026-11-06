@@ -28,8 +28,12 @@ void ShardedStats::SampleNow(const StatsSnapshot& snapshot) {
         now - last_sample_time_).count();
     if (elapsed_ms <= 0) return;
 
-    uint64_t delta_in   = snapshot.bytes_in         - last_bytes_in_;
-    uint64_t delta_out  = snapshot.bytes_out        - last_bytes_out_;
+    const uint64_t delta_in = snapshot.bytes_in >= last_bytes_in_
+        ? snapshot.bytes_in - last_bytes_in_
+        : 0;
+    const uint64_t delta_out = snapshot.bytes_out >= last_bytes_out_
+        ? snapshot.bytes_out - last_bytes_out_
+        : 0;
 
     // 写入环形缓冲区：start_time = 本周期起始（上次采样时间）
     samples_[sample_index_] = {delta_in, delta_out, last_sample_time_, true};

@@ -2,6 +2,7 @@
 #include "acppnode/core/naming.hpp"
 #include "acppnode/common/binary_text_codec.hpp"
 
+#include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/nid.h>
 
@@ -50,6 +51,7 @@ ParseRealityMldsa65Seed(std::string_view value) noexcept {
     UniquePkey pkey(EVP_PKEY_pqdsa_new_raw_private_key(
         NID_MLDSA65, seed->data(), seed->size()));
     if (!pkey) {
+        ERR_clear_error();
         return tl::unexpected(RealityKeyError::InvalidFormat);
     }
     return *seed;
@@ -64,6 +66,7 @@ ParseRealityMldsa65PublicKey(std::string_view value) noexcept {
     UniquePkey pkey(EVP_PKEY_pqdsa_new_raw_public_key(
         NID_MLDSA65, pub->data(), pub->size()));
     if (!pkey) {
+        ERR_clear_error();
         return tl::unexpected(RealityKeyError::InvalidFormat);
     }
     return *pub;

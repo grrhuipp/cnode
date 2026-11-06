@@ -14,7 +14,7 @@ PAYLOAD = b'vmess-inbound-handshake-regression'
 
 
 def inbound_settings():
-    return {'clients': [{'id': str(USER)}]}
+    return {'clients': [{'id': str(USER), 'email': 'handshake@example.test'}]}
 
 
 def vmess_outbound(port):
@@ -24,7 +24,7 @@ def vmess_outbound(port):
 
 def vless_inbound(port):
     return {'protocol': 'vless', 'listen': '127.0.0.1', 'port': port,
-            'settings': {'clients': [{'id': str(USER)}]}}
+            'settings': inbound_settings()}
 
 
 def vmess_inbound(port):
@@ -57,6 +57,8 @@ async def main(binary, output):
     resources = Resources()
     try:
         received = []
+        captured_vmess = bytearray()
+        rejected_flow_port = None
 
         async def echo(reader, writer):
             data = await reader.readexactly(len(PAYLOAD))
@@ -75,6 +77,7 @@ async def main(binary, output):
         server_config = server_dir / 'config.json'
         settings = json.loads(server_config.read_text(encoding='utf-8'))
         settings['timeouts']['handshake'] = 2
+        settings['log'].update(enable=True, loglevel='debug')
         server_config.write_text(json.dumps(settings), encoding='utf-8')
         server = resources.spawn([binary, '--config-dir', server_dir], server_dir / 'child.log')
         await wait_started(server_dir / 'child.log', server)
@@ -85,6 +88,7 @@ async def main(binary, output):
             async def forward(source, destination, fragment):
                 while data := await source.read(65536):
                     if fragment:
+                        captured_vmess.extend(data)
                         for byte in data:
                             destination.write(bytes([byte]))
                             await destination.drain()
@@ -108,10 +112,37 @@ async def main(binary, output):
         client_dir = output / 'vmess-client'
         client_dir.mkdir(parents=True, exist_ok=True)
         configure(client_dir, vless_inbound(front_port), vmess_outbound(split_port))
+        client_config = client_dir / 'config.json'
+        settings = json.loads(client_config.read_text(encoding='utf-8'))
+        settings['log'].update(enable=True, loglevel='debug')
+        client_config.write_text(json.dumps(settings), encoding='utf-8')
         client = resources.spawn([binary, '--config-dir', client_dir], client_dir / 'child.log')
         await wait_started(client_dir / 'child.log', client)
         await probe_vless(front_port, target_port)
         assert received == [PAYLOAD], 'VMess inbound did not complete handshake and forward request'
+
+        replay_reader, replay_writer = await resources.connect(server_port)
+        replay_writer.write(captured_vmess)
+        await replay_writer.drain()
+        try:
+            assert await asyncio.wait_for(replay_reader.read(), 3) == b''
+        except ConnectionError:
+            pass
+        replay_writer.close()
+        assert received == [PAYLOAD], 'VMess replay reached the backend'
+
+        flow_reader, flow_writer = await resources.connect(front_port)
+        rejected_flow_port = flow_writer.get_extra_info('sockname')[1]
+        flow = b'xtls-rprx-vision'
+        addons = b'\x0a' + bytes([len(flow)]) + flow
+        flow_writer.write(b'\0' + USER.bytes + bytes([len(addons)]) + addons +
+                          b'\2' + struct.pack('!H', target_port) + b'\1\x7f\0\0\1')
+        await flow_writer.drain()
+        try:
+            assert await asyncio.wait_for(flow_reader.read(), 3) == b''
+        except ConnectionError:
+            pass
+        flow_writer.close()
 
         # An EOF on the first inbound handshake read must tear down the connection.
         eof_reader, eof_writer = await resources.connect(server_port)
@@ -163,6 +194,18 @@ async def main(binary, output):
     finally:
         await resources.close()
         assert not resources.errors, '; '.join(resources.errors)
+    server_logs = '\n'.join(path.read_text(errors='replace') for path in server_dir.rglob('*.log'))
+    replay_lines = [line for line in server_logs.splitlines()
+                    if 'rejected ' in line and 'session replay admission rejected' in line]
+    assert any(f'tcp:127.0.0.1:{target_port}' in line and
+               'email:handshake@example.test' in line for line in replay_lines), \
+        'authenticated VMess replay lost target or identity'
+    client_logs = '\n'.join(path.read_text(errors='replace') for path in client_dir.rglob('*.log'))
+    flow_lines = [line for line in client_logs.splitlines()
+                  if f'127.0.0.1:{rejected_flow_port}' in line and 'request flow not allowed' in line]
+    assert any(f'udp:127.0.0.1:{target_port}' in line and
+               'email:handshake@example.test' in line for line in flow_lines), \
+        'authenticated VLESS flow rejection lost UDP target or identity'
 
 
 if __name__ == '__main__':

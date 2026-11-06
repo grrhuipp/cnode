@@ -2,7 +2,6 @@
 #include "../../../common/awaitable_task_group.hpp"
 #include "acppnode/features/routing/dispatcher.hpp"
 #include "acppnode/common/mux/mux_codec.hpp"
-#include "acppnode/common/buf/length_prefixed_packet_buffer.hpp"
 #include "acppnode/common/session.hpp"
 #include "acppnode/infra/config_types.hpp"
 #include "acppnode/app/stats.hpp"
@@ -90,6 +89,8 @@ struct ReplyQueueState {
     TcpSubState* waiting_writers_head = nullptr;
     bool running = true;
     bool tcp_overflowed = false;
+    bool tcp_backpressured = false;
+    bool client_frames_backpressured = false;
     uint64_t udp_dropped = 0;
     // Client input queued in all sub-sessions and not yet taken by their
     // dispatchers. The frame loop stops parsing client frames at the high
@@ -137,8 +138,16 @@ struct ReplyQueueState {
         }
         queue.push_back(std::move(reply));
         tcp_queued_bytes += reply_bytes;
+        if (tcp_queued_bytes >= kMuxQueueHighWaterBytes) {
+            tcp_backpressured = true;
+        }
         WakeReplyWriter();
         return true;
+    }
+
+    void PushControl(MuxReply&& reply) {
+        queue.push_back(std::move(reply));
+        WakeReplyWriter();
     }
 
     void PushUdpPrepared(MuxReply&& reply, size_t reply_bytes) {
@@ -149,16 +158,19 @@ struct ReplyQueueState {
 
     bool Pop(MuxReply& reply) {
         if (queue.empty()) return false;
-        const size_t reply_bytes = queue.front().PayloadSize() + kMuxReplyOverhead;
-        const bool was_tcp = !queue.front().is_udp;
-        if (!was_tcp) {
-            udp_queued_bytes -= std::min(udp_queued_bytes, reply_bytes);
-        } else {
-            tcp_queued_bytes -= std::min(tcp_queued_bytes, reply_bytes);
-        }
         reply = std::move(queue.front());
         queue.pop_front();
-        if (was_tcp && TcpReadWindowOpen()) {
+        const bool was_tcp = !reply.is_udp;
+        if (!reply.is_end && !reply.dispatch_done) {
+            const size_t reply_bytes = reply.PayloadSize() + kMuxReplyOverhead;
+            if (!was_tcp) {
+                udp_queued_bytes -= std::min(udp_queued_bytes, reply_bytes);
+            } else {
+                tcp_queued_bytes -= std::min(tcp_queued_bytes, reply_bytes);
+            }
+        }
+        if (was_tcp && tcp_backpressured && TcpReadWindowOpen()) {
+            tcp_backpressured = false;
             WakeWaitingWriters();
         }
         return true;
@@ -166,7 +178,7 @@ struct ReplyQueueState {
 
     // TCP 背压：仅看 TCP 自身的积压量
     bool ShouldBackpressureTcpReads() const noexcept {
-        return tcp_queued_bytes >= kMuxQueueHighWaterBytes;
+        return tcp_backpressured;
     }
 
     bool TcpReadWindowOpen() const noexcept {
@@ -182,6 +194,11 @@ struct ReplyQueueState {
             return;
         }
         (void)main_signal_.try_send(IoErrorCode{});
+    }
+
+    void MarkTcpOverflow() noexcept {
+        tcp_overflowed = true;
+        WakeReplyWriter();
     }
 
     void AddSubLoop() noexcept {
@@ -200,18 +217,21 @@ struct ReplyQueueState {
 
     void AddSubInput(size_t bytes) noexcept {
         sub_input_bytes += bytes;
+        if (sub_input_bytes >= kMuxQueueHighWaterBytes) {
+            client_frames_backpressured = true;
+        }
     }
 
     void ReleaseSubInput(size_t bytes) noexcept {
-        const bool was_backpressured = sub_input_bytes > kMuxQueueLowWaterBytes;
         sub_input_bytes -= std::min(sub_input_bytes, bytes);
-        if (was_backpressured && sub_input_bytes <= kMuxQueueLowWaterBytes) {
+        if (client_frames_backpressured && sub_input_bytes <= kMuxQueueLowWaterBytes) {
+            client_frames_backpressured = false;
             WakeReplyWriter();
         }
     }
 
     [[nodiscard]] bool ShouldBackpressureClientFrames() const noexcept {
-        return sub_input_bytes >= kMuxQueueHighWaterBytes;
+        return client_frames_backpressured;
     }
 };
 
@@ -252,6 +272,7 @@ struct ClientReadQueueState {
     memory::ThreadLocalDeque<QueuedInput> queue;
     size_t queued_bytes = 0;
     bool running = true;
+    bool read_backpressured = false;
     bool done = false;
     ErrorCode error = ErrorCode::OK;
 
@@ -277,6 +298,9 @@ struct ClientReadQueueState {
         }
         queue.emplace_back(std::move(mb), bytes);
         queued_bytes += bytes;
+        if (queued_bytes >= kMuxQueueHighWaterBytes) {
+            read_backpressured = true;
+        }
         WakeMain();
         return true;
     }
@@ -289,14 +313,15 @@ struct ClientReadQueueState {
         queued_bytes -= std::min(queued_bytes, input.bytes);
         mb = std::move(input.payload);
         queue.pop_front();
-        if (ReadWindowOpen()) {
+        if (read_backpressured && ReadWindowOpen()) {
+            read_backpressured = false;
             WakeSpace();
         }
         return true;
     }
 
     [[nodiscard]] bool ShouldBackpressureReads() const noexcept {
-        return queued_bytes >= kMuxQueueHighWaterBytes;
+        return read_backpressured;
     }
 
     [[nodiscard]] bool ReadWindowOpen() const noexcept {
@@ -332,7 +357,7 @@ public:
         try {
             PushEnd();
         } catch (...) {
-            reply_queue_.tcp_overflowed = true;
+            reply_queue_.MarkTcpOverflow();
             Cancel();
         }
     }
@@ -375,6 +400,14 @@ public:
         co_return;
     }
 
+    void CloseClientInput() noexcept {
+        if (input_done_) {
+            return;
+        }
+        input_done_ = true;
+        WakeInputReader();
+    }
+
     void Cancel(ErrorCode error = ErrorCode::CANCELLED) noexcept {
         if (cancelled_) {
             return;
@@ -407,17 +440,16 @@ protected:
         return cancelled_ || input_done_;
     }
 
+    [[nodiscard]] bool EndSent() const noexcept {
+        return end_sent_;
+    }
+
     // Per-sub backlog needs no own cap: the frame loop stops parsing client
     // frames once all sub-sessions together hold kMuxQueueHighWaterBytes.
     void QueueInput(buf::MultiBuffer mb, size_t bytes) {
         input_queue_.emplace_back(std::move(mb), bytes);
         queued_bytes_ += bytes;
         reply_queue_.AddSubInput(bytes);
-        WakeInputReader();
-    }
-
-    void FinishInput() noexcept {
-        input_done_ = true;
         WakeInputReader();
     }
 
@@ -435,13 +467,10 @@ protected:
         reply.session_id = session_id_;
         reply.is_end = send_end;
         reply.dispatch_done = notify_dispatch_done;
+        reply_queue_.PushControl(std::move(reply));
         end_sent_ = end_sent_ || send_end;
         dispatch_done_notified_ =
             dispatch_done_notified_ || notify_dispatch_done;
-        if (!reply_queue_.PushTcp(std::move(reply))) {
-            reply_queue_.tcp_overflowed = true;
-            Cancel();
-        }
     }
 
     net::io_context& io_context_;
@@ -489,13 +518,6 @@ public:
         QueueInput(std::move(mb), bytes);
     }
 
-    void CloseClientInput() {
-        if (input_done_) {
-            return;
-        }
-        FinishInput();
-    }
-
     transport::EofAction ReadEofAction() const noexcept override {
         return transport::EofAction::ShutdownPeerWrite;
     }
@@ -508,17 +530,27 @@ public:
                 io_error::operation_aborted,
                 "Mux TCP reply path closed");
         }
+        if (EndSent()) {
+            mb.clear();
+            throw transport::WriteClosed{};
+        }
 
-        size_t payload_bytes = 0;
-        size_t reply_count = 0;
-        for (const buf::Buffer* buffer : mb) {
-            if (buffer && !buffer->IsEmpty()) {
-                payload_bytes += buffer->Len();
-                ++reply_count;
+        for (buf::Buffer*& buffer : mb) {
+            if (!buffer || buffer->IsEmpty()) {
+                mb.FreeSlot(buffer);
             }
         }
+        const size_t payload_bytes = mb.byte_size();
+        if (payload_bytes == 0) {
+            mb.clear();
+            co_return;
+        }
+
+        constexpr size_t kMaxFramePayload = std::numeric_limits<uint16_t>::max();
+        const size_t reply_count =
+            (payload_bytes + kMaxFramePayload - 1) / kMaxFramePayload;
         if (!reply_queue_.CanPushTcp(payload_bytes, reply_count)) {
-            reply_queue_.tcp_overflowed = true;
+            reply_queue_.MarkTcpOverflow();
             mb.clear();
             Cancel();
             throw IoSystemError(
@@ -526,20 +558,22 @@ public:
                 "Mux TCP reply queue full");
         }
 
-        for (buf::Buffer*& buffer : mb) {
-            if (!buffer || buffer->IsEmpty()) {
-                mb.FreeSlot(buffer);
-                continue;
-            }
-
+        while (mb.byte_size() != 0) {
+            const size_t chunk_size = std::min(mb.byte_size(), kMaxFramePayload);
             MuxReply reply;
             reply.session_id = session_id_;
             reply.is_end = false;
             reply.is_udp = false;
-            reply.payload_size = buffer->Len();
-            reply.payload.push_back(mb.ReleaseSlot(buffer));
+            reply.payload_size = chunk_size;
+            if (mb.byte_size() == chunk_size) {
+                reply.payload = std::move(mb);
+            } else if (!mb.MovePrefixTo(reply.payload, chunk_size)) {
+                mb.clear();
+                Cancel();
+                throw std::bad_alloc();
+            }
             if (!reply_queue_.PushTcp(std::move(reply))) {
-                reply_queue_.tcp_overflowed = true;
+                reply_queue_.MarkTcpOverflow();
                 Cancel();
                 mb.clear();
                 throw IoSystemError(
@@ -557,6 +591,9 @@ public:
                 io_error::operation_aborted,
                 "Mux TCP reply path closed");
         }
+        if (EndSent()) {
+            throw transport::WriteClosed{};
+        }
 
         size_t payload_bytes = 0;
         size_t reply_count = 0;
@@ -570,7 +607,7 @@ public:
                 std::numeric_limits<uint16_t>::max();
         }
         if (!reply_queue_.CanPushTcp(payload_bytes, reply_count)) {
-            reply_queue_.tcp_overflowed = true;
+            reply_queue_.MarkTcpOverflow();
             Cancel();
             throw IoSystemError(
                 io_error::no_buffer_space,
@@ -602,7 +639,7 @@ public:
                 reply.payload_size = chunk_size;
                 reply.payload = std::move(payload);
                 if (!reply_queue_.PushTcp(std::move(reply))) {
-                    reply_queue_.tcp_overflowed = true;
+                    reply_queue_.MarkTcpOverflow();
                     Cancel();
                     throw IoSystemError(
                         io_error::no_buffer_space,
@@ -627,12 +664,22 @@ private:
     }
 
     net::awaitable<void> WaitForOutputWindow() {
-        while (!cancelled_ && reply_queue_.running &&
+        struct WaitingWriterGuard {
+            ReplyQueueState& queue;
+            TcpSubState* writer;
+            WaitingWriterGuard(ReplyQueueState& q, TcpSubState* w) noexcept
+                : queue(q), writer(w) {
+                queue.AddWaitingWriter(writer);
+            }
+            ~WaitingWriterGuard() noexcept {
+                queue.RemoveWaitingWriter(writer);
+            }
+        };
+        while (!cancelled_ && !EndSent() && reply_queue_.running &&
                reply_queue_.ShouldBackpressureTcpReads()) {
-            reply_queue_.AddWaitingWriter(this);
+            WaitingWriterGuard guard(reply_queue_, this);
             auto [ec] = co_await output_signal_.async_receive(
                 net::as_tuple(net::use_awaitable));
-            reply_queue_.RemoveWaitingWriter(this);
             if (ec) {
                 break;
             }
@@ -692,12 +739,10 @@ public:
         uint16_t session_id,
         ReplyQueueState& reply_queue,
         uint64_t parent_conn_id,
-        TargetAddress default_target,
-        bool xudp_packet_mode)
+        TargetAddress default_target)
         : MuxSubSession(io_context, session_id, reply_queue)
         , parent_conn_id_(parent_conn_id)
-        , default_target_(std::move(default_target))
-        , xudp_packet_mode_(xudp_packet_mode) {}
+        , default_target_(std::move(default_target)) {}
 
     ~UdpSubState() noexcept override {
         Cancel();
@@ -708,33 +753,8 @@ public:
             mb.clear();
             return;
         }
-        if (xudp_packet_mode_) {
-            try {
-                FeedXudpPackets(std::move(mb));
-            } catch (const IoSystemError&) {
-                Cancel(ErrorCode::PROTOCOL_DECODE_FAILED);
-            } catch (const std::bad_alloc&) {
-                Cancel(ErrorCode::RESOURCE_EXHAUSTED);
-            }
-            return;
-        }
         StampDefaultTarget(mb);
         QueueInput(std::move(mb), bytes);
-    }
-
-    void CloseClientInput() {
-        if (input_done_) {
-            return;
-        }
-        if (xudp_packet_mode_) {
-            try {
-                xudp_packets_.Finish();
-            } catch (const IoSystemError&) {
-                Cancel(ErrorCode::PROTOCOL_DECODE_FAILED);
-                return;
-            }
-        }
-        FinishInput();
     }
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
@@ -743,6 +763,10 @@ public:
             throw IoSystemError(
                 io_error::operation_aborted,
                 "Mux UDP reply path closed");
+        }
+        if (EndSent()) {
+            mb.clear();
+            throw transport::WriteClosed{};
         }
 
         const auto datagram = buf::InspectUdpDatagram(mb);
@@ -755,6 +779,11 @@ public:
             throw IoSystemError(
                 io_error::invalid_argument,
                 "Mux UDP reply contains missing or mixed endpoints");
+        }
+        if (!datagram.target->IsValid() ||
+            datagram.payload_size > std::numeric_limits<uint16_t>::max()) {
+            mb.clear();
+            throw transport::LinkError(ErrorCode::INVALID_ARGUMENT);
         }
         if (!reply_queue_.CanPushUdp(datagram.payload_size)) {
             const uint64_t dropped = ++reply_queue_.udp_dropped;
@@ -782,10 +811,6 @@ public:
     }
 
 private:
-    void OnCancel() noexcept override {
-        xudp_packets_.Clear();
-    }
-
     void StampDefaultTarget(buf::MultiBuffer& mb) {
         for (auto* buffer : mb) {
             if (buffer && !buffer->IsEmpty() && !buffer->HasUDP()) {
@@ -794,36 +819,8 @@ private:
         }
     }
 
-    void FeedXudpPackets(buf::MultiBuffer mb) {
-        if (mb.byte_size() == 0) {
-            return;
-        }
-        xudp_packets_.Append(std::move(mb));
-
-        while (!cancelled_) {
-            buf::MultiBuffer payload;
-            const auto result = xudp_packets_.Pop(payload);
-            if (result == buf::LengthPrefixedPacketBuffer::PopResult::NeedMore) {
-                return;
-            }
-            if (result == buf::LengthPrefixedPacketBuffer::PopResult::Invalid) {
-                Cancel();
-                return;
-            }
-            const size_t packet_len = payload.byte_size();
-            if (packet_len == 0) {
-                continue;
-            }
-            StampDefaultTarget(payload);
-            QueueInput(std::move(payload), packet_len);
-        }
-        xudp_packets_.Clear();
-    }
-
     uint64_t parent_conn_id_ = 0;
     TargetAddress default_target_;
-    bool xudp_packet_mode_ = false;
-    buf::LengthPrefixedPacketBuffer xudp_packets_;
 };
 
 using UdpSubInfo = std::unique_ptr<UdpSubState>;
@@ -884,6 +881,7 @@ net::awaitable<RelayResult> ProcessInboundImpl(
     uint32_t pressure_idle_timeout)
 {
     if (!client_link.Valid()) {
+        client_control.CloseAbortive();
         RelayResult error;
         error.error = ErrorCode::PROTOCOL_DECODE_FAILED;
         co_return error;
@@ -945,12 +943,23 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                         co_return;
                     }
                 }
-            } catch (const IoSystemError&) {
-                ErrorCode ec = ErrorCode::OK;
+            } catch (const transport::LinkError& e) {
+                ErrorCode ec = client_reads.running ? e.code() : ErrorCode::OK;
                 if (ConsumeReadSideTimeout(client_control)) {
                     ec = ErrorCode::RELAY_TIMEOUT;
                 }
                 client_reads.MarkDone(ec);
+                co_return;
+            } catch (const IoSystemError& e) {
+                ErrorCode ec =
+                    client_reads.running ? MapAsioError(e.code()) : ErrorCode::OK;
+                if (ConsumeReadSideTimeout(client_control)) {
+                    ec = ErrorCode::RELAY_TIMEOUT;
+                }
+                client_reads.MarkDone(ec);
+                co_return;
+            } catch (const std::bad_alloc&) {
+                client_reads.MarkDone(ErrorCode::RESOURCE_EXHAUSTED);
                 co_return;
             } catch (...) {
                 client_reads.MarkDone(ErrorCode::INTERNAL);
@@ -975,12 +984,16 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                     parent_ctx.traffic.bytes_down += frame_size;
                     result.bytes_down += frame_size;
                     co_return true;
-                } catch (const IoSystemError&) {
+                } catch (const IoSystemError& e) {
                     if (ConsumeWriteSideTimeout(client_control)) {
                         result.error = ErrorCode::RELAY_TIMEOUT;
+                    } else if (e.code() != io_error::operation_aborted) {
+                        result.error = MapAsioError(e.code());
                     }
-                } catch (const transport::LinkError&) {
-                    // Logical carrier close ends the session like a socket error.
+                } catch (const transport::LinkError& e) {
+                    result.error = ConsumeWriteSideTimeout(client_control)
+                        ? ErrorCode::RELAY_TIMEOUT
+                        : e.code();
                 } catch (const std::bad_alloc&) {
                     result.error = ErrorCode::RESOURCE_EXHAUSTED;
                 } catch (...) {
@@ -997,57 +1010,26 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                     co_return true;
                 }
 
-                std::array<net::const_buffer, 1 + buf::MultiBuffer::kInlineCapacity>
-                    inline_buffers{};
-                memory::ThreadLocalVector<net::const_buffer> spill_buffers;
-                size_t buffer_count = 0;
-                auto append_buffer = [&](net::const_buffer send_buffer) {
-                    if (buffer_count < inline_buffers.size()) {
-                        inline_buffers[buffer_count++] = send_buffer;
-                        return;
-                    }
-                    if (spill_buffers.empty()) {
-                        spill_buffers.reserve(1 + reply.payload.size());
-                        spill_buffers.insert(
-                            spill_buffers.end(),
-                            inline_buffers.begin(),
-                            inline_buffers.begin() + buffer_count);
-                    }
-                    spill_buffers.emplace_back(send_buffer);
-                    ++buffer_count;
-                };
-
-                if (!frame.empty()) {
-                    append_buffer(net::const_buffer(frame.data(), frame.size()));
-                }
-                for (const auto* buffer : reply.payload) {
-                    if (!buffer || buffer->IsEmpty()) {
-                        continue;
-                    }
-                    const auto bytes = buffer->Bytes();
-                    append_buffer(net::const_buffer(bytes.data(), bytes.size()));
-                }
-
-                const auto buffers = spill_buffers.empty()
-                    ? std::span<const net::const_buffer>(
-                        inline_buffers.data(),
-                        buffer_count)
-                    : std::span<const net::const_buffer>(
-                        spill_buffers.data(),
-                        spill_buffers.size());
+                ConstBufferSpanBuilder<1 + buf::MultiBuffer::kInlineCapacity> framed;
+                framed.Append(net::const_buffer(frame.data(), frame.size()));
+                framed.AppendMultiBuffer(reply.payload);
 
                 try {
-                    co_await client_link.writer->WriteBuffers(buffers);
+                    co_await client_link.writer->WriteBuffers(framed.Span());
                     reply.payload.clear();
                     parent_ctx.traffic.bytes_down += frame_size;
                     result.bytes_down += frame_size;
                     co_return true;
-                } catch (const IoSystemError&) {
+                } catch (const IoSystemError& e) {
                     if (ConsumeWriteSideTimeout(client_control)) {
                         result.error = ErrorCode::RELAY_TIMEOUT;
+                    } else if (e.code() != io_error::operation_aborted) {
+                        result.error = MapAsioError(e.code());
                     }
-                } catch (const transport::LinkError&) {
-                    // Logical carrier close ends the session like a socket error.
+                } catch (const transport::LinkError& e) {
+                    result.error = ConsumeWriteSideTimeout(client_control)
+                        ? ErrorCode::RELAY_TIMEOUT
+                        : e.code();
                 } catch (const std::bad_alloc&) {
                     result.error = ErrorCode::RESOURCE_EXHAUSTED;
                 } catch (...) {
@@ -1092,6 +1074,7 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                         LOG_CONN_DEBUG(parent_ctx,
                             "UDP reply header encode failed sid={} src={} payload={}B",
                             reply.session_id, reply.udp_src, payload_size);
+                        reply.payload.clear();
                         continue;
                     }
                     if (!co_await write_payload_frame_to_client(
@@ -1163,56 +1146,29 @@ net::awaitable<RelayResult> ProcessInboundImpl(
             //    Cancel 底层协议 reader，导致 VMess/VLESS 流被提前关闭。
             // --------------------------------------------------------------------
             buf::MultiBuffer read_mb;
-            if (!client_reads.Pop(read_mb)) {
-                if (!reply_queue.Empty()) {
-                    continue;
+            const bool popped_read = client_reads.Pop(read_mb);
+            if (popped_read) {
+                const size_t read_bytes = read_mb.byte_size();
+                if (read_bytes > 0) {
+                    parent_ctx.traffic.bytes_up += read_bytes;
+                    result.bytes_up += read_bytes;
+                    read_mb.MoveTo(frame_buf);
+                    frame_buf_bytes += read_bytes;
+                } else {
+                    read_mb.clear();
                 }
-                if (client_reads.done) {
-                    if (client_reads.error != ErrorCode::OK) {
-                        if (client_reads.error == ErrorCode::RELAY_TIMEOUT) {
-                            LOG_CONN_DEBUG(parent_ctx, "read-side timeout");
-                        }
-                        result.error = client_reads.error;
-                        running = false;
-                        break;
-                    }
-                    client_input_done = true;
-                    continue;
-                }
-
-                auto [ec] = co_await main_signal.async_receive(
-                    net::as_tuple(net::use_awaitable));
-                (void)ec;
-                continue;
             }
-
-            const size_t read_bytes = read_mb.byte_size();
-            if (read_bytes == 0) {
-                if (client_reads.done && client_reads.error == ErrorCode::RELAY_TIMEOUT) {
-                    LOG_CONN_DEBUG(parent_ctx, "read-side timeout");
-                    result.error = ErrorCode::RELAY_TIMEOUT;
-                    running = false;
-                    break;
-                }
-                if (client_reads.done && client_reads.error != ErrorCode::OK) {
-                    result.error = client_reads.error;
-                    running = false;
-                    break;
-                }
-                continue;
-            }
-            parent_ctx.traffic.bytes_up += read_bytes;
-            result.bytes_up += read_bytes;
-
-            read_mb.MoveTo(frame_buf);
-            frame_buf_bytes += read_bytes;
 
             // --------------------------------------------------------------------
             // 3. 循环解析并分发 Mux 帧
             // --------------------------------------------------------------------
-            while (running && frame_buf_bytes > 0) {
+            bool decoded_any_frame = false;
+            while (running && frame_buf_bytes > 0 &&
+                   !reply_queue.ShouldBackpressureClientFrames() &&
+                   !reply_queue.tcp_overflowed) {
                 const auto opt_hdr = mux::DecodeFrame(frame_buf);
                 if (!opt_hdr) break;  // 数据不足，等待下次读取
+                decoded_any_frame = true;
 
                 const mux::FrameHeader& hdr = *opt_hdr;
                 if (hdr.frame_size == 0) {
@@ -1223,7 +1179,12 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                 }
 
                 buf::MultiBuffer frame_payload;
-                if (hdr.has_data && hdr.data_len > 0) {
+                const bool should_extract_payload =
+                    hdr.has_data && hdr.data_len > 0 &&
+                    hdr.status != mux::SessionStatus::KEEPALIVE &&
+                    (hdr.status == mux::SessionStatus::NEW ||
+                     (hdr.option & mux::kOptionError) == 0);
+                if (should_extract_payload) {
                     if (frame_buf.DropPrefixBytes(hdr.data_offset) != hdr.data_offset ||
                         !frame_buf.MovePrefixTo(frame_payload, hdr.data_len)) {
                         LOG_CONN_DEBUG(parent_ctx, "payload extraction failed");
@@ -1257,10 +1218,16 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                     // with an error END; the refused frame's payload is dropped.
                     if (sub_sessions.contains(hdr.session_id) ||
                         sub_sessions.size() >= kMaxConcurrentSubSessions) {
-                        LOG_CONN_DEBUG(parent_ctx,
+                        session::Context rejected_ctx;
+                        rejected_ctx.InitSubstreamFrom(parent_ctx);
+                        rejected_ctx.content.network = hdr.network == mux::NetworkType::UDP
+                            ? Network::UDP : Network::TCP;
+                        rejected_ctx.outbound.original_target = hdr.target;
+                        rejected_ctx.outbound.target = hdr.target;
+                        LOG_CONN_DEBUG(rejected_ctx,
                             "refused NEW sid={} active={}",
                             hdr.session_id, sub_sessions.size());
-                        LOG_ACCESS(FormatAccessLog(parent_ctx, AccessStatus::Rejected,
+                        LOG_ACCESS(FormatAccessLog(rejected_ctx, AccessStatus::Rejected,
                             sub_sessions.contains(hdr.session_id)
                                 ? "duplicate stream ID" : "concurrent stream limit"));
                         const size_t header_len =
@@ -1283,8 +1250,7 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                             sid,
                             reply_queue,
                             parent_conn_id,
-                            hdr.target,
-                            hdr.has_global_id);
+                            hdr.target);
                         auto& sub_ctx = sub_state->ctx;
                         sub_ctx.InitSubstreamFrom(parent_ctx);
                         sub_ctx.content.network          = Network::UDP;
@@ -1292,11 +1258,6 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                         sub_ctx.outbound.target          = hdr.target;
 
                         if (frame_payload.byte_size() != 0) {
-                            for (auto* buffer : frame_payload) {
-                                if (buffer && !buffer->IsEmpty()) {
-                                    buffer->SetUDP(hdr.target);
-                                }
-                            }
                             sub_state->PushClientPayload(std::move(frame_payload), hdr.data_len);
                         }
 
@@ -1325,23 +1286,16 @@ net::awaitable<RelayResult> ProcessInboundImpl(
 
                     } else {
                         // ---- 新建 TCP 子会话 ----
-                        if (hdr.has_target) {
-                            LOG_CONN_DEBUG(parent_ctx, "new TCP sid={} -> {}",
-                                hdr.session_id, hdr.target);
-                        } else {
-                            LOG_CONN_DEBUG(parent_ctx, "new TCP sid={} without target",
-                                hdr.session_id);
-                        }
+                        LOG_CONN_DEBUG(parent_ctx, "new TCP sid={} -> {}",
+                            hdr.session_id, hdr.target);
 
                         auto sub_state = std::make_unique<TcpSubState>(
                             io_context, sid, reply_queue);
                         auto& sub_ctx = sub_state->ctx;
                         sub_ctx.InitSubstreamFrom(parent_ctx);
                         sub_ctx.content.network          = Network::TCP;
-                        if (hdr.has_target) {
-                            sub_ctx.outbound.original_target = hdr.target;
-                            sub_ctx.outbound.target          = hdr.target;
-                        }
+                        sub_ctx.outbound.original_target = hdr.target;
+                        sub_ctx.outbound.target          = hdr.target;
 
                         if (frame_payload.byte_size() != 0) {
                             sub_state->PushClientPayload(std::move(frame_payload));
@@ -1380,6 +1334,16 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                     auto* udp_sub = session_it == sub_sessions.end()
                         ? nullptr
                         : std::get_if<UdpSubInfo>(&session_it->second);
+                    if (!udp_sub && hdr.has_target) {
+                        result.error = ErrorCode::PROTOCOL_DECODE_FAILED;
+                        running = false;
+                        break;
+                    }
+                    if (session_it != sub_sessions.end() &&
+                        (hdr.option & mux::kOptionError) != 0) {
+                        std::visit([](auto& state) { state->Cancel(); }, session_it->second);
+                        break;
+                    }
                     if (udp_sub) {
                         if (hdr.has_target && frame_payload.byte_size() != 0) {
                             for (auto* buffer : frame_payload) {
@@ -1410,14 +1374,9 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                     const bool known_session = session_it != sub_sessions.end();
 
                     if (known_session) {
-                        if (auto* udp_sub = std::get_if<UdpSubInfo>(&session_it->second)) {
-                            if (hdr.has_target && frame_payload.byte_size() != 0) {
-                                for (auto* buffer : frame_payload) {
-                                    if (buffer && !buffer->IsEmpty()) {
-                                        buffer->SetUDP(hdr.target);
-                                    }
-                                }
-                            }
+                        if ((hdr.option & mux::kOptionError) != 0) {
+                            std::visit([](auto& state) { state->Cancel(); }, session_it->second);
+                        } else if (auto* udp_sub = std::get_if<UdpSubInfo>(&session_it->second)) {
                             if (frame_payload.byte_size() != 0) {
                                 (*udp_sub)->PushClientPayload(
                                     std::move(frame_payload), hdr.data_len);
@@ -1447,6 +1406,39 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                 }
 
                 }  // switch (hdr.status)
+            }
+            if (!running) break;
+            if (popped_read || decoded_any_frame ||
+                !reply_queue.Empty() || reply_queue.tcp_overflowed ||
+                reply_queue.ShouldBackpressureClientFrames()) {
+                continue;
+            }
+            if (client_reads.done) {
+                if (client_reads.error != ErrorCode::OK) {
+                    if (client_reads.error == ErrorCode::RELAY_TIMEOUT) {
+                        LOG_CONN_DEBUG(parent_ctx, "read-side timeout");
+                    }
+                    result.error = client_reads.error;
+                    running = false;
+                    break;
+                }
+                if (frame_buf_bytes != 0) {
+                    result.error = ErrorCode::PROTOCOL_DECODE_FAILED;
+                    running = false;
+                    break;
+                }
+                client_input_done = true;
+                for (auto& [sid, sub] : sub_sessions) {
+                    std::visit([](auto& state) { state->CloseClientInput(); }, sub);
+                }
+                continue;
+            }
+
+            auto [ec] = co_await main_signal.async_receive(
+                net::as_tuple(net::use_awaitable));
+            if (ec) {
+                running = false;
+                break;
             }
             }
         } catch (const std::bad_alloc&) {
@@ -1489,6 +1481,9 @@ net::awaitable<RelayResult> ProcessInboundImpl(
     }
 #endif
 
+    if (result.error != ErrorCode::OK) {
+        client_control.CloseAbortive();
+    }
     co_return result;
 }
 
@@ -1504,9 +1499,10 @@ net::awaitable<RelayResult> ProcessInbound(
     StatsShard& stats,
     const TimeoutsConfig& timeouts,
     uint32_t pressure_idle_timeout) {
+    RelayResult result;
     try {
         LOG_ACCESS(FormatAccessLog(parent_ctx));
-        co_return co_await ProcessInboundImpl(
+        result = co_await ProcessInboundImpl(
             io_context,
             client_link,
             client_control,
@@ -1518,20 +1514,18 @@ net::awaitable<RelayResult> ProcessInbound(
             pressure_idle_timeout);
     } catch (const std::bad_alloc&) {
         stats.OnError();
-        RelayResult result;
         result.error = ErrorCode::RESOURCE_EXHAUSTED;
-        co_return result;
     } catch (const IoSystemError& error) {
         stats.OnError();
-        RelayResult result;
         result.error = MapAsioError(error.code());
-        co_return result;
     } catch (...) {
         stats.OnError();
-        RelayResult result;
         result.error = ErrorCode::INTERNAL;
-        co_return result;
     }
+    if (result.error != ErrorCode::OK) {
+        client_control.CloseAbortive();
+    }
+    co_return result;
 }
 
 }  // namespace acpp::mux

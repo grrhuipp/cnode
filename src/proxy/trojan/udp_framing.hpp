@@ -3,6 +3,7 @@
 #include "acppnode/common/asio_types.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
 #include "acppnode/common/target_address.hpp"
+#include "acppnode/transport/async_stream.hpp"
 #include "acppnode/transport/link.hpp"
 
 #include <cstddef>
@@ -30,6 +31,10 @@ private:
     size_t payload_size_ = 0;
     bool failed_ = false;
 };
+
+net::awaitable<buf::MultiBuffer> ReadUdpDatagram(
+    AsyncStream& stream,
+    UdpFramer& framer);
 
 net::awaitable<void> WriteUdpDatagram(
     transport::MultiBufferWriter& writer,

@@ -3,6 +3,7 @@
 #include "acppnode/common/address_codec.hpp"
 
 #include "acppnode/common/buffer_util.hpp"
+#include "acppnode/common/buf/length_prefixed_packet_buffer.hpp"
 
 #include <algorithm>
 #include <array>
@@ -26,11 +27,11 @@ net::awaitable<PendingStatus> EnsurePending(
     buf::MultiBuffer& pending,
     size_t required) {
     while (pending.byte_size() < required) {
-        auto next = co_await reader.ReadMultiBuffer();
+        auto next = co_await ReadMultiBufferOrThrowOnCancel(reader);
         if (next.byte_size() == 0) {
             co_return PendingStatus::Eof;
         }
-        next.MoveTo(pending, true);
+        buf::AppendPacketStreamInput(pending, std::move(next));
     }
     co_return PendingStatus::Ready;
 }
@@ -172,15 +173,10 @@ net::awaitable<buf::MultiBuffer> PacketReader::ReadMultiBuffer() {
         if (co_await EnsurePending(reader_, pending_, 1) != PendingStatus::Ready)
             co_return buf::MultiBuffer{};
         TargetAddress packet_target = destination_;
-        size_t header_size = 0;
         if (is_connect_) {
             if (co_await EnsurePending(reader_, pending_, 2) != PendingStatus::Ready) {
-                if (pending_.byte_size() == 0) {
-                    co_return buf::MultiBuffer{};
-                }
                 ThrowDecodeFailure();
             }
-            header_size = 2;
         } else {
             auto address = co_await acpp::ReadAddress(
                 reader_, pending_, AddressWireFormat::Uot, 0, {255, true});
@@ -188,25 +184,24 @@ net::awaitable<buf::MultiBuffer> PacketReader::ReadMultiBuffer() {
                 ThrowDecodeFailure();
             }
             packet_target = std::move(address->target);
-            header_size = address->consumed + 2;
+            const size_t header_size = address->consumed + 2;
             if (co_await EnsurePending(reader_, pending_, header_size) != PendingStatus::Ready) {
                 ThrowDecodeFailure();
             }
+            (void)pending_.DropPrefixBytes(address->consumed);
         }
 
-        std::array<uint8_t, kMaxAddressSize + 2> header{};
-        if (pending_.CopyPrefixTo(
-                std::span<uint8_t>(header.data(), header_size)) != header_size) {
+        std::array<uint8_t, 2> length_bytes{};
+        if (pending_.CopyPrefixTo(length_bytes) != length_bytes.size()) {
             ThrowDecodeFailure();
         }
-        const size_t length_offset = header_size - 2;
-        const size_t payload_size = LoadU16BE(header.data() + length_offset);
-        if (co_await EnsurePending(reader_, pending_, header_size + payload_size) !=
+        (void)pending_.DropPrefixBytes(2);
+        const size_t payload_size = LoadU16BE(length_bytes.data());
+        if (co_await EnsurePending(reader_, pending_, payload_size) !=
             PendingStatus::Ready) {
             ThrowDecodeFailure();
         }
 
-        pending_.DropPrefixBytes(header_size);
         if (payload_size == 0) {
             pending_.ReleaseIfIdle();
             continue;

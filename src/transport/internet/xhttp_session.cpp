@@ -10,6 +10,7 @@
 #include "acppnode/transport/internet/http_headers.hpp"
 #include "acppnode/transport/internet/tcp_stream.hpp"
 #include "acppnode/transport/phase_deadline.hpp"
+#include "acppnode/transport/internet/async_delay.hpp"
 
 #include <array>
 #include <charconv>
@@ -105,6 +106,10 @@ class XHttpPacketUpServerStream final : public AsyncStream {
     };
 
 public:
+    transport::EofAction ReadEofAction() const noexcept override {
+        return downlink_ ? downlink_->ReadEofAction() : AsyncStream::ReadEofAction();
+    }
+
     XHttpPacketUpServerStream(std::shared_ptr<XHttpPacketUpSession> session,
                               std::unique_ptr<AsyncStream> downlink)
         : session_(std::move(session))
@@ -112,7 +117,7 @@ public:
         , deadline_(session_->IoContext(), *this) {
         session_cancel_.Resubscribe(session_->Cancellation());
         downlink_cancel_.Resubscribe(downlink_->Cancellation());
-        session_->AttachDownlink();
+        (void)session_->AttachDownlink();
     }
 
     transport::CancellationSource& Cancellation() noexcept override { return cancellation_; }
@@ -122,7 +127,13 @@ public:
     }
 
     net::awaitable<size_t> AsyncRead(net::mutable_buffer buffer) override {
-        return session_->AsyncRead(buffer);
+        const size_t n = co_await session_->AsyncRead(buffer);
+        if (n != 0 && downlink_) {
+            if (auto* tcp = BaseTcpStreamOf(*downlink_)) {
+                tcp->TouchActivity();
+            }
+        }
+        co_return n;
     }
 
     net::awaitable<size_t> AsyncWrite(net::const_buffer buffer) override {
@@ -133,7 +144,13 @@ public:
     }
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
-        return session_->ReadMultiBuffer();
+        auto mb = co_await session_->ReadMultiBuffer();
+        if (!mb.empty() && downlink_) {
+            if (auto* tcp = BaseTcpStreamOf(*downlink_)) {
+                tcp->TouchActivity();
+            }
+        }
+        co_return mb;
     }
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
@@ -153,6 +170,7 @@ public:
     }
 
     void ShutdownRead() override {
+        session_cancel_.Unsubscribe();
         if (session_) {
             session_->Close();
         }
@@ -165,7 +183,10 @@ public:
     }
 
     net::awaitable<void> AsyncShutdownWrite() override {
-        return downlink_->AsyncShutdownWrite();
+        if (!downlink_) {
+            co_return;
+        }
+        co_await downlink_->AsyncShutdownWrite();
     }
 
     void Cancel() noexcept override {
@@ -185,6 +206,8 @@ public:
             return;
         }
         closed_ = true;
+        session_cancel_.Unsubscribe();
+        downlink_cancel_.Unsubscribe();
         if (session_) {
             session_->Close();
         }
@@ -200,6 +223,8 @@ public:
             return;
         }
         closed_ = true;
+        session_cancel_.Unsubscribe();
+        downlink_cancel_.Unsubscribe();
         if (session_) {
             session_->Close();
         }
@@ -276,7 +301,7 @@ public:
                            std::unique_ptr<AsyncStream> stream)
         : stream_(std::move(stream)) {
         net::use_service<XHttpClientTaskOwner>(services).Spawn(
-            std::move(executor), DrainOwned(stream_), stream_->Cancellation());
+            std::move(executor), DrainOwned(stream_, closed_flag_), drain_cancellation_);
     }
     ~XHttpUploadClientStream() noexcept override { Close(); }
 
@@ -298,8 +323,16 @@ public:
         return stream_->AsyncShutdownWrite();
     }
     void Cancel() noexcept override { stream_->Cancel(); }
-    void Close() override { stream_->Close(); }
-    void CloseAbortive() override { stream_->CloseAbortive(); }
+    void Close() override {
+        closed_flag_->store(true, std::memory_order_release);
+        drain_cancellation_.Stop();
+        stream_->Close();
+    }
+    void CloseAbortive() override {
+        closed_flag_->store(true, std::memory_order_release);
+        drain_cancellation_.Stop();
+        stream_->CloseAbortive();
+    }
     int NativeHandle() const override { return stream_->NativeHandle(); }
     bool IsOpen() const override { return stream_->IsOpen(); }
     transport::CancellationSource& Cancellation() noexcept override {
@@ -311,33 +344,94 @@ protected:
     const TcpStream* BaseTcpStream() const override { return BaseTcpStreamOf(*stream_); }
 
 private:
-    static net::awaitable<void> DrainOwned(std::shared_ptr<AsyncStream> stream) {
+    static net::awaitable<void> DrainOwned(
+        std::shared_ptr<AsyncStream> stream,
+        std::shared_ptr<std::atomic<bool>> closed_flag) {
+        bool ok = false;
         try {
-            co_await DrainResponse(*stream);
+            ok = co_await DrainResponse(*stream, *closed_flag);
         } catch (...) {
             // This upload failure closes only its transport, not unrelated
             // resident tasks. The physical session still joins this callback.
         }
-        stream->CloseAbortive();
+        if (ok) {
+            stream->ShutdownRead();
+        } else {
+            stream->CloseAbortive();
+        }
     }
-    static net::awaitable<void> DrainResponse(AsyncStream& stream) {
-        auto head = co_await ReadHttp1MessageHead(stream);
+    static net::awaitable<bool> DrainResponse(
+        AsyncStream& stream,
+        const std::atomic<bool>& closed_flag) {
+        const auto should_retry = [&](const IoSystemError& e) noexcept {
+            return e.code() == io_error::operation_aborted &&
+                   !closed_flag.load(std::memory_order_acquire) &&
+                   stream.IsOpen();
+        };
+        tl::expected<Http1MessageHead, ErrorCode> head =
+            tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        while (true) {
+            try {
+                head = co_await ReadHttp1MessageHead(stream);
+                break;
+            } catch (const IoSystemError& e) {
+                if (!should_retry(e)) {
+                    throw;
+                }
+            }
+            if ((co_await net::this_coro::cancellation_state).cancelled() !=
+                net::cancellation_type::none) {
+                co_await net::this_coro::reset_cancellation_state();
+            }
+        }
         while (head && (HasStatusCode(ExtractStartLine(head->Text()), "100") ||
                         HasStatusCode(ExtractStartLine(head->Text()), "103"))) {
-            head = co_await ReadHttp1MessageHead(stream, head->ReadAhead());
+            std::span<const uint8_t> initial = head->ReadAhead();
+            while (true) {
+                try {
+                    head = co_await ReadHttp1MessageHead(stream, initial);
+                    break;
+                } catch (const IoSystemError& e) {
+                    if (!should_retry(e)) {
+                        throw;
+                    }
+                    initial = {};
+                }
+                if ((co_await net::this_coro::cancellation_state).cancelled() !=
+                    net::cancellation_type::none) {
+                    co_await net::this_coro::reset_cancellation_state();
+                }
+            }
         }
         if (!head || !HasStatusCode(ExtractStartLine(head->Text()), "200"))
-            co_return;
+            co_return false;
         // Connection: close forbids a following response. Discard read-ahead
         // and subsequent wire bytes, including optional chunk framing.
         head->storage = buf::BufferGuard{};
-        std::array<uint8_t, 4096> discard;
-        while (co_await stream.AsyncRead(net::buffer(discard)) != 0) {}
+        while (true) {
+            try {
+                if ((co_await stream.ReadMultiBuffer()).empty()) {
+                    break;
+                }
+            } catch (const IoSystemError& e) {
+                if (!should_retry(e)) {
+                    throw;
+                }
+            }
+            if ((co_await net::this_coro::cancellation_state).cancelled() !=
+                net::cancellation_type::none) {
+                co_await net::this_coro::reset_cancellation_state();
+            }
+        }
+        co_return true;
     }
 
     // Close cancels the reader; the registered task retains the transport
     // until the physical session's explicit resident-task join completes.
     std::shared_ptr<AsyncStream> stream_;
+    std::shared_ptr<std::atomic<bool>> closed_flag_ =
+        std::make_shared<std::atomic<bool>>(false);
+    transport::CancellationSource drain_cancellation_;
 };
 
 // `close_connection` announces that the server ends the connection after this
@@ -592,6 +686,7 @@ public:
         Record* previous = nullptr;
         Record* next = nullptr;
         bool processed = false;
+        bool activated = false;
 
         Record(XHttpSessionDirectory& directory, const std::shared_ptr<ExecutionDomain>& owner)
             : directory(&directory), owner(owner) {}
@@ -686,6 +781,13 @@ private:
             record->processed = true;
             record->owner.reset();
             --active_;
+            if (!record->activated) {
+                if (auto it = entries_.find(*record->key);
+                    it != entries_.end() && it->second.get() == record) {
+                    entries_.erase(it);
+                }
+                continue;
+            }
             record->previous = last_;
             if (last_) last_->next = record;
             else first_ = record;
@@ -734,6 +836,7 @@ void XHttpSessionDirectory::Record::Retire(bool only_reserved) noexcept {
             return;
     } while (!state.compare_exchange_weak(current, State::Retired,
                  std::memory_order_acq_rel, std::memory_order_acquire));
+    activated = (current == State::Live);
     directory->Enqueue(*this);
 }
 
@@ -979,43 +1082,66 @@ void XHttpPacketUpSession::Close() noexcept {
         stream->Close();
     }
     (void)upload_signal_.try_send(IoErrorCode{});
-    downlink_event_.cancel();
+    downlink_ready_.Stop();
     Wake();
 }
 
-void XHttpPacketUpSession::AttachDownlink() noexcept {
+bool XHttpPacketUpSession::AttachDownlink() noexcept {
+    if (closed_ || downlink_attached_) {
+        return false;
+    }
     downlink_attached_ = true;
-    downlink_event_.cancel();
+    downlink_ready_.Stop();
+    return true;
 }
 
-// downlink_event_ never expires; cancel() completes every pending wait, so
-// each waiter re-checks its own condition and none can take another's
-// wakeup. Waiters stay bounded: each holds a packet committed to this
-// session's bounded queue.
-net::awaitable<bool> XHttpPacketUpSession::AwaitDownlink(AsyncStream& connection) {
+net::awaitable<bool> XHttpPacketUpSession::AwaitDownlink(
+    transport::CancellationSource& cancellation) {
+    auto domain = ExecutionDomain::Current();
+    AsyncDelay wait(domain ? domain->Reactor() : io_context_);
+    struct ReadyWatch final : transport::CancellationSubscription {
+        explicit ReadyWatch(AsyncDelay& wait) noexcept : wait(wait) {}
+        AsyncDelay& wait;
+
+    private:
+        void OnCancellation(transport::Cancellation) noexcept override {
+            wait.Cancel();
+        }
+    } ready{wait};
     struct ConnectionCancellation final : transport::CancellationSubscription {
-        explicit ConnectionCancellation(net::steady_timer& event) noexcept : event(event) {}
-        net::steady_timer& event;
+        explicit ConnectionCancellation(AsyncDelay& wait) noexcept : wait(wait) {}
+        AsyncDelay& wait;
         bool cancelled = false;
 
     private:
         void OnCancellation(transport::Cancellation) noexcept override {
             cancelled = true;
-            event.cancel();
+            wait.Cancel();
         }
-    } watch{downlink_event_};
-    watch.Resubscribe(connection.Cancellation());
+    } watch{wait};
+    ready.Resubscribe(downlink_ready_);
+    watch.Resubscribe(cancellation);
     while (!downlink_attached_ && !closed_ && !watch.cancelled) {
-        (void)co_await downlink_event_.async_wait(net::as_tuple(net::use_awaitable));
+        co_await wait.WaitFor(std::chrono::milliseconds::max());
+        if ((co_await net::this_coro::cancellation_state).cancelled() !=
+            net::cancellation_type::none) {
+            co_return false;
+        }
+        if (!downlink_attached_ && !closed_) {
+            ready.Resubscribe(downlink_ready_);
+        }
+        if (!watch.cancelled) {
+            watch.Resubscribe(cancellation);
+        }
     }
-    co_return downlink_attached_;
+    co_return downlink_attached_ && !closed_ && !watch.cancelled;
 }
 
 void XHttpPacketUpSession::CancelPendingOperations() noexcept {
     if (closed_) {
         return;
     }
-    read_cancelled_ = true;
+    ++read_abort_epoch_;
     cancellation_.CancelPending();
     if (auto stream = stream_input_.Snapshot()) {
         stream->Cancel();
@@ -1031,22 +1157,18 @@ net::awaitable<size_t> XHttpPacketUpSession::AsyncRead(net::mutable_buffer buffe
     }
 
     while (true) {
-        ThrowIfReadCancelled();
         if (packet_queue_.HasReady()) {
             co_return packet_queue_.ConsumePrefixTo(std::span<uint8_t>(out, capacity));
         }
         if (auto stream = stream_input_.Snapshot()) {
             UploadRead pending(*this, stream);
-            size_t n = 0;
-            try {
-                n = co_await stream->AsyncRead(buffer);
-            } catch (...) {
-                ThrowIfReadCancelled();
-                throw;
-            }
-            ThrowIfReadCancelled();
+            const uint64_t epoch = read_abort_epoch_;
+            const size_t n = co_await stream->AsyncRead(buffer);
             if (n > 0) {
                 co_return n;
+            }
+            if (epoch != read_abort_epoch_) {
+                throw IoSystemError(io_error::operation_aborted, "xhttp packet-up read cancelled");
             }
             ReleaseAttachedUpload(stream);
             co_return 0;
@@ -1054,32 +1176,28 @@ net::awaitable<size_t> XHttpPacketUpSession::AsyncRead(net::mutable_buffer buffe
         if (closed_ || input_closed_) {
             co_return 0;
         }
-        IoErrorCode ec;
-        co_await input_signal_.async_receive(net::redirect_error(net::use_awaitable, ec));
-        if (ec && ec != io_error::operation_aborted) {
-            co_return 0;
+        const uint64_t epoch = read_abort_epoch_;
+        auto [ec] = co_await input_signal_.async_receive(net::as_tuple(net::use_awaitable));
+        if (ec || epoch != read_abort_epoch_) {
+            throw IoSystemError(io_error::operation_aborted, "xhttp packet-up read cancelled");
         }
     }
 }
 
 net::awaitable<buf::MultiBuffer> XHttpPacketUpSession::ReadMultiBuffer() {
     while (true) {
-        ThrowIfReadCancelled();
         if (packet_queue_.HasReady()) {
             co_return packet_queue_.Pop();
         }
         if (auto stream = stream_input_.Snapshot()) {
             UploadRead pending(*this, stream);
-            buf::MultiBuffer mb;
-            try {
-                mb = co_await stream->ReadMultiBuffer();
-            } catch (...) {
-                ThrowIfReadCancelled();
-                throw;
-            }
-            ThrowIfReadCancelled();
+            const uint64_t epoch = read_abort_epoch_;
+            buf::MultiBuffer mb = co_await stream->ReadMultiBuffer();
             if (mb.byte_size() != 0) {
                 co_return mb;
+            }
+            if (epoch != read_abort_epoch_) {
+                throw IoSystemError(io_error::operation_aborted, "xhttp packet-up read cancelled");
             }
             ReleaseAttachedUpload(stream);
             co_return buf::MultiBuffer{};
@@ -1087,10 +1205,10 @@ net::awaitable<buf::MultiBuffer> XHttpPacketUpSession::ReadMultiBuffer() {
         if (closed_ || input_closed_) {
             co_return buf::MultiBuffer{};
         }
-        IoErrorCode ec;
-        co_await input_signal_.async_receive(net::redirect_error(net::use_awaitable, ec));
-        if (ec && ec != io_error::operation_aborted) {
-            co_return buf::MultiBuffer{};
+        const uint64_t epoch = read_abort_epoch_;
+        auto [ec] = co_await input_signal_.async_receive(net::as_tuple(net::use_awaitable));
+        if (ec || epoch != read_abort_epoch_) {
+            throw IoSystemError(io_error::operation_aborted, "xhttp packet-up read cancelled");
         }
     }
 }
@@ -1103,14 +1221,6 @@ void XHttpPacketUpSession::OnCancellation(transport::Cancellation cancellation) 
             Resubscribe(current->Cancellation());
         cancellation_.CancelPending(cancellation.reason);
     }
-}
-
-void XHttpPacketUpSession::ThrowIfReadCancelled() {
-    if (!read_cancelled_) {
-        return;
-    }
-    read_cancelled_ = false;
-    throw IoSystemError(io_error::operation_aborted, "xhttp packet-up read cancelled");
 }
 
 // Stream-up EOF ends the logical upload direction.
@@ -1268,6 +1378,7 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
     // turns the connection into a long-lived stream and ends the loop.
     std::array<uint8_t, 1> request_start{};
     for (bool persistent = false;; persistent = true) {
+        if (transport_metadata) transport_metadata->real_ip.clear();
         std::span<const uint8_t> received = initial;
         if (persistent) {
             // Idle between requests until the next one begins; that request
@@ -1296,16 +1407,16 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
 
         const std::string_view request = head->Text();
         const std::string_view request_line = ExtractStartLine(request);
-        const std::string_view method = ExtractRequestMethod(request_line);
-        const std::string_view request_path = ExtractRequestTarget(request_line);
+        const auto parsed_line = ParseHttp1RequestLine(request_line);
+        const auto method = parsed_line.method;
+        const auto request_path = parsed_line.target;
         const std::string_view host = TrimAscii(ExtractHeaderValueCI(request, "Host"));
-        const std::string_view expect_header = ExtractHeaderValueCI(request, "Expect");
         const auto meta = ParseXHttpRequestMeta(cfg.path, request_path, method);
 
         LOG_CONN_TRACE(conn_id,
             "XHTTP server H1 request line='{}' method='{}' path='{}' host='{}' bytes={}",
-            SanitizeHttpRequestLineForLog(request_line),
-            SanitizeForLog(method),
+            SanitizeHttpRequestLineForLog(parsed_line),
+            PublicHttpMethodForLog(method),
             PublicHttpTargetForLog(request_path),
             PublicHttpTargetForLog(host),
             head->size);
@@ -1336,6 +1447,17 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
             if (!session) {
                 co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
             }
+            if (!session->AttachDownlink()) {
+                co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+            }
+            bool attached = true;
+            struct DownlinkGuard {
+                XHttpPacketUpSession* session;
+                bool& active;
+                ~DownlinkGuard() {
+                    if (active) session->Close();
+                }
+            } guard{session.get(), attached};
             if (!co_await WriteFullToStream(
                     *stream, BuildXHttpResponseHeaders(cfg, true, false))) {
                 co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
@@ -1349,9 +1471,10 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
             auto downlink = MakeHttp1BodyStream(
                 std::move(stream), Http1BodyUntilClose{}, true, head->ReadAhead());
             LOG_CONN_DEBUG(conn_id, "XHTTP server split downlink ready session={} mode={}",
-                          meta.session_id,
+                          PublicHttpTargetForLog(meta.session_id),
                           xhttp_cfg.AcceptsStreamUp() ? "stream-up" : "packet-up");
             auto logical = MakeXHttpSplitStream(std::move(session), std::move(downlink));
+            attached = false;
             auto metadata = transport_metadata
                 ? std::move(*transport_metadata) : InboundTransportMetadata{};
             head->storage = buf::BufferGuard{};
@@ -1380,15 +1503,32 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
                 if (!session) {
                     co_return tl::unexpected(ErrorCode::NOT_FOUND);
                 }
+            }
+            if (HeaderListContainsTokenCI(request, "Expect", "100-continue") &&
+                (!content_length ||
+                 (session && session->AcceptingInput() &&
+                  content_length->bytes <= ::acpp::detail::XHttpPacketQueue::kMaxQueuedBytes)) &&
+                !co_await WriteFullToStream(*stream, "HTTP/1.1 100 Continue\r\n\r\n")) {
+                co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+            }
+            if (!content_length) {
                 auto body = MakeHttp1BodyStream(
                     std::move(stream), Http1BodyChunked{}, false, head->ReadAhead());
-                XHttpPacketUpSession::Upload upload(*session, *body);
-                auto payload = co_await ReadXHttpPacketBody(std::nullopt, upload);
-                if (!payload) {
-                    co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
-                }
-                if (!upload.Commit(meta.seq, std::move(*payload))) {
-                    co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+                head->storage = buf::BufferGuard{};
+                try {
+                    XHttpPacketUpSession::Upload upload(*session, *body);
+                    auto payload = co_await ReadXHttpPacketBody(std::nullopt, upload);
+                    if (!payload) {
+                        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+                    }
+                    if (!upload.Commit(meta.seq, std::move(*payload))) {
+                        co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+                    }
+                } catch (const IoSystemError& e) {
+                    co_return tl::unexpected(
+                        e.code() == io_error::no_buffer_space
+                            ? ErrorCode::RESOURCE_EXHAUSTED
+                            : ErrorCode::PROTOCOL_DECODE_FAILED);
                 }
                 if (!session->DownlinkAttached() && !co_await session->AwaitDownlink(*body)) {
                     co_return tl::unexpected(ErrorCode::TIMEOUT);
@@ -1397,8 +1537,7 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
                         *body, BuildXHttpResponseHeaders(cfg, false, true))) {
                     co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
                 }
-                LOG_CONN_TRACE(conn_id, "XHTTP server packet-up payload accepted session={} seq={}",
-                              meta.session_id,
+                LOG_CONN_TRACE(conn_id, "XHTTP server packet-up payload accepted seq={}",
                               meta.seq);
                 co_return std::unique_ptr<AsyncStream>{};
             }
@@ -1407,22 +1546,45 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
             // bytes after it stay queued in order for the next request head.
             stream->PrependReadData(head->ReadAhead());
             const bool keep_alive = RequestKeepsConnection(request_line, request);
+            const size_t body_bytes = content_length->bytes;
+            head->storage = buf::BufferGuard{};
             // A packet this server cannot take is answered and dropped without
             // closing: pipelined requests behind it may belong to other sessions.
             std::string_view rejection;
-            if (!session) {
-                if (!co_await DiscardHttp1Body(*stream, content_length->bytes)) {
+            if (!session || !session->AcceptingInput()) {
+                if (!co_await DiscardHttp1Body(*stream, body_bytes)) {
                     co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
                 }
                 rejection = "404 Not Found";
             } else {
-                XHttpPacketUpSession::Upload upload(*session, *stream);
-                auto payload = co_await ReadXHttpPacketBody(content_length->bytes, upload);
-                if (!payload) {
-                    co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
-                }
-                if (!upload.Commit(meta.seq, std::move(*payload))) {
+                bool reading_body = false;
+                bool discard_after_rejection = false;
+                try {
+                    XHttpPacketUpSession::Upload upload(*session, *stream);
+                    reading_body = true;
+                    auto payload = co_await ReadXHttpPacketBody(body_bytes, upload);
+                    if (!payload) {
+                        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+                    }
+                    if (!upload.Commit(meta.seq, std::move(*payload))) {
+                        rejection = "503 Service Unavailable";
+                    }
+                } catch (const IoSystemError& e) {
+                    if (e.code() != io_error::no_buffer_space || !stream->IsOpen()) {
+                        co_return tl::unexpected(
+                            e.code() == io_error::no_buffer_space
+                                ? ErrorCode::RESOURCE_EXHAUSTED
+                                : ErrorCode::PROTOCOL_DECODE_FAILED);
+                    }
+                    if (reading_body) {
+                        co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+                    }
+                    discard_after_rejection = true;
                     rejection = "503 Service Unavailable";
+                }
+                if (discard_after_rejection &&
+                    !co_await DiscardHttp1Body(*stream, body_bytes)) {
+                    co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
                 }
             }
             // An upload may reach the session before its downlink GET: hold
@@ -1438,8 +1600,7 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
             if (!co_await WriteFullToStream(*stream, response)) {
                 co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
             }
-            LOG_CONN_TRACE(conn_id, "XHTTP server packet-up response session={} seq={} status={}",
-                          meta.session_id,
+            LOG_CONN_TRACE(conn_id, "XHTTP server packet-up response seq={} status={}",
                           meta.seq,
                           rejection.empty() ? std::string_view("200 OK") : rejection);
             if (!keep_alive) {
@@ -1459,10 +1620,18 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
             }
             auto session = co_await GetXHttpPacketSession(
                 io_context, xhttp_cfg.session_namespace, meta.session_id, XHttpSessionAccess::Open);
-            if (!session) {
+            if (!session || !session->CanAttachStream()) {
                 co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
             }
-            if (HeaderContainsTokenCI(expect_header, "100-continue") &&
+            bool accepting = true;
+            struct StreamUpGuard {
+                XHttpPacketUpSession* session;
+                bool& active;
+                ~StreamUpGuard() {
+                    if (active && session->CanAttachStream()) session->Close();
+                }
+            } guard{session.get(), accepting};
+            if (HeaderListContainsTokenCI(request, "Expect", "100-continue") &&
                 !co_await WriteFullToStream(*stream, "HTTP/1.1 100 Continue\r\n\r\n")) {
                 co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
             }
@@ -1479,8 +1648,9 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
             auto body = MakeHttp1BodyStream(
                 std::move(stream), *body_framing, false, head->ReadAhead());
             if (stream_handler) stream_handler->OnInboundTransportReady(*body);
+            accepting = false;
             LOG_CONN_DEBUG(conn_id, "XHTTP server stream-up upload ready session={}",
-                          meta.session_id);
+                          PublicHttpTargetForLog(meta.session_id));
             if (!session->AttachStream(std::move(body))) {
                 co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
             }
@@ -1494,7 +1664,7 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
         if (!xhttp_cfg.AcceptsStreamOne()) {
             co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
         }
-        if (HeaderContainsTokenCI(expect_header, "100-continue") &&
+        if (HeaderListContainsTokenCI(request, "Expect", "100-continue") &&
             !co_await WriteFullToStream(*stream, "HTTP/1.1 100 Continue\r\n\r\n")) {
             co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
         }

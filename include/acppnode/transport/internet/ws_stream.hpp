@@ -129,6 +129,9 @@ public:
     void ShutdownRead() override;
     net::awaitable<void> AsyncShutdownWrite() override;
     void Cancel() noexcept override;
+    transport::CancellationSource& Cancellation() noexcept override {
+        return inner_->Cancellation();
+    }
     bool IsOpen() const override;
     int NativeHandle() const override;
 

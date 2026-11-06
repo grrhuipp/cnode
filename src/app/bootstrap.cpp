@@ -109,11 +109,15 @@ int RunFromCommandLine(int argc, char* argv[]) {
         Log::WriteConsole(LogLevel::ERROR, "Failed to initialize logging");
         return 1;
     }
-
+    LOG_CONSOLE("Configuration loaded: workers={} inbounds={} outbounds={} rules={} panels={}",
+                config.workers,
+                config.static_inbounds.size(),
+                config.outbounds.size(),
+                config.routing.rules.size(),
+                config.panels.size());
     LOG_CONSOLE("Starting cnode v1.0.0: channel={} build={}", BUILD_CHANNEL, BUILD_ID);
     LOG_CONSOLE("Runtime configured: workers={} io={} accept=SO_REUSEPORT allocator=thread-local",
                 config.workers, IoBackendName());
-
     if (!ValidateConfig(config)) {
         Log::WriteConsole(LogLevel::ERROR, "Invalid configuration");
         Log::Shutdown();

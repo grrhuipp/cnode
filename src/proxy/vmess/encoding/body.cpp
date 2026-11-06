@@ -1,6 +1,7 @@
 #include "body.hpp"
 
 #include "acppnode/common/buf/contiguous_buffer_view.hpp"
+#include "acppnode/common/buffer_util.hpp"
 #include "acppnode/common/error.hpp"
 #include "acppnode/infra/log.hpp"
 
@@ -44,7 +45,9 @@ BodyChunkCipher::BodyChunkCipher(const BodyOptions& options,
                                  proxy::AeadDirection direction)
     : payload_(options.security, direction_key.key.data(), direction_key.iv.data(), direction)
     , global_padding_((options.options & Option::GLOBAL_PADDING) != 0 &&
-                      !(options.security == Security::NONE && options.command != Command::UDP))
+                      !((options.security == Security::NONE ||
+                         options.security == Security::ZERO) &&
+                        options.command != Command::UDP))
     , packet_mode_(options.command == Command::UDP) {
     if ((options.options & Option::AUTHENTICATED_LENGTH) != 0 &&
         (options.security == Security::AES_128_GCM ||
@@ -178,19 +181,8 @@ void BodyEncoder::EncodeChunk(std::span<const uint8_t> bytes, buf::MultiBuffer& 
     const size_t length_size = cipher_.LengthSize();
     const size_t capacity = length_size + bytes.size() + cipher_.Overhead() + padding;
 
-    buf::BufferGuard pooled;
-    memory::ByteVector heap;
-    uint8_t* dst = nullptr;
-    if (capacity <= buf::Buffer::kSize) {
-        pooled = buf::BufferGuard{buf::Buffer::New()};
-        if (!pooled) {
-            throw std::bad_alloc();
-        }
-        dst = pooled->Tail().data();
-    } else {
-        heap.resize(capacity);
-        dst = heap.data();
-    }
+    buf::ContiguousWriteBuffer encoded;
+    uint8_t* dst = encoded.Prepare(capacity);
 
     const ssize_t sealed = cipher_.Payload().Encrypt(
         bytes.data(), bytes.size(), dst + length_size);
@@ -207,15 +199,7 @@ void BodyEncoder::EncodeChunk(std::span<const uint8_t> bytes, buf::MultiBuffer& 
         ThrowWriteError("VMess body padding generation failed");
     }
 
-    const size_t size = length_size + chunk_size;
-    if (pooled) {
-        pooled->Produce(static_cast<uint32_t>(size));
-        out.push_back(std::move(pooled));
-        return;
-    }
-    if (!buf::AppendSpanToMultiBuffer(std::span<const uint8_t>(dst, size), out)) {
-        throw std::bad_alloc();
-    }
+    encoded.AppendTo(length_size + chunk_size, out);
 }
 
 // ============================================================================
@@ -232,12 +216,10 @@ net::awaitable<bool> BodyDecoder::ReadExact(transport::MultiBufferReader& src,
                                             size_t& filled) {
     while (filled < out.size()) {
         if (pending_read_.byte_size() == 0) {
-            pending_read_ = co_await src.ReadMultiBuffer();
+            pending_read_.ReleaseIfIdle();
+            pending_read_ = co_await ReadMultiBufferOrThrowOnCancel(
+                src, "VMess read cancelled");
             if (pending_read_.byte_size() == 0) {
-                const auto cancellation = co_await net::this_coro::cancellation_state;
-                if (cancellation.cancelled() != net::cancellation_type::none) {
-                    throw IoSystemError(io_error::operation_aborted, "VMess read cancelled");
-                }
                 co_return false;
             }
         }
@@ -321,13 +303,17 @@ net::awaitable<buf::MultiBuffer> BodyDecoder::ReadChunk(transport::MultiBufferRe
                                 body_read_)) {
             Fail("VMess body EOF chunk truncated");
         }
+        if (overhead > 0 &&
+            cipher_.Payload().Decrypt(header_.data(), overhead, header_.data()) != 0) {
+            Fail("VMess body EOF authentication failed");
+        }
         eof_ = true;
         FinishRecord();
         co_return buf::MultiBuffer{};
     }
 
     const size_t data_len = chunk_len - padding_len_;
-    if (body_read_ == 0 && !read_pool_ && read_heap_.empty()) {
+    if (body_read_ == 0 && read_buffer_.Empty()) {
         if (auto sealed = pending_read_.TakeFrontIfLen(chunk_len)) {
             const ssize_t opened = cipher_.Payload().Decrypt(
                 sealed->Bytes().data(), data_len, sealed->Bytes().data());
@@ -338,17 +324,10 @@ net::awaitable<buf::MultiBuffer> BodyDecoder::ReadChunk(transport::MultiBufferRe
             FinishRecord();
             co_return buf::MultiBuffer{std::move(sealed)};
         }
-        if (chunk_len <= buf::Buffer::kSize) {
-            read_pool_ = buf::BufferGuard{buf::Buffer::New()};
-            if (!read_pool_) {
-                throw std::bad_alloc();
-            }
-        } else {
-            read_heap_.resize(chunk_len);
-        }
+        (void)read_buffer_.Prepare(chunk_len);
     }
 
-    uint8_t* sealed = read_pool_ ? read_pool_->Tail().data() : read_heap_.data();
+    uint8_t* sealed = read_buffer_.Data();
     if (!co_await ReadExact(src, std::span<uint8_t>(sealed, chunk_len), body_read_)) {
         Fail("VMess body chunk truncated");
     }
@@ -356,16 +335,8 @@ net::awaitable<buf::MultiBuffer> BodyDecoder::ReadChunk(transport::MultiBufferRe
     if (opened < 0) {
         Fail("VMess body authentication failed");
     }
-    if (read_pool_) {
-        read_pool_->Produce(static_cast<uint32_t>(opened));
-        buf::MultiBuffer out{std::move(read_pool_)};
-        FinishRecord();
-        co_return out;
-    }
-
     buf::MultiBuffer out;
-    const bool appended = buf::AppendSpanToMultiBuffer(
-        std::span<const uint8_t>(sealed, static_cast<size_t>(opened)), out);
+    const bool appended = read_buffer_.TryAppendTo(static_cast<size_t>(opened), out);
     FinishRecord();
     if (!appended) {
         throw std::bad_alloc();
@@ -385,8 +356,8 @@ void BodyDecoder::FinishRecord() noexcept {
     chunk_len_ = 0;
     padding_len_ = 0;
     header_decoded_ = false;
-    read_pool_ = {};
-    memory::ByteVector{}.swap(read_heap_);
+    read_buffer_.Reset();
+    pending_read_.ReleaseIfIdle();
 }
 
 }  // namespace acpp::vmess::encoding

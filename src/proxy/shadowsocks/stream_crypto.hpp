@@ -1,9 +1,12 @@
 #pragma once
 
 #include "shadowsocks_crypto.hpp"
+#include "../handshake_timeout.hpp"
 
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
+#include "acppnode/common/buf/length_prefixed_packet_buffer.hpp"
+#include "acppnode/common/buffer_util.hpp"
 #include "acppnode/transport/async_stream.hpp"
 #include "acppnode/transport/link.hpp"
 
@@ -13,6 +16,7 @@
 #include <new>
 #include <optional>
 #include <span>
+#include <tl/expected.hpp>
 
 namespace acpp::ss::detail {
 
@@ -128,6 +132,63 @@ inline void EncryptToMultiBuffer(SsAeadCipher& cipher,
     return true;
 }
 
+[[nodiscard]] inline net::awaitable<tl::expected<void, ErrorCode>>
+ReadAndDecryptStreamPayload(
+    AsyncStream& stream,
+    SsAeadCipher& cipher,
+    std::span<const uint8_t, 12> nonce,
+    size_t payload_len,
+    buf::MultiBuffer& output) {
+    if (!cipher.BeginDecrypt(nonce.data())) {
+        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+    }
+
+    buf::MultiBuffer decoded;
+    decoded.reserve((payload_len + buf::Buffer::kSize - 1) / buf::Buffer::kSize);
+
+    if (payload_len > 0) {
+        buf::BufferGuard cipher_buf{buf::Buffer::New()};
+        if (!cipher_buf) {
+            co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+        }
+
+        size_t remaining = payload_len;
+        while (remaining > 0) {
+            buf::BufferGuard plain{buf::Buffer::New()};
+            if (!plain) {
+                co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+            }
+
+            const size_t to_process =
+                std::min(remaining, static_cast<size_t>(plain->Available()));
+            cipher_buf->Reset();
+            if (!co_await ReadFull(stream, cipher_buf->Tail().data(), to_process)) {
+                co_return tl::unexpected(
+                    proxy::ResolveHandshakeReadFailure(stream));
+            }
+            cipher_buf->Produce(static_cast<uint32_t>(to_process));
+
+            if (!cipher.DecryptUpdate(cipher_buf->Bytes(), plain->Tail().first(to_process))) {
+                co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+            }
+            plain->Produce(static_cast<uint32_t>(to_process));
+            decoded.push_back(std::move(plain));
+            remaining -= to_process;
+        }
+    }
+
+    std::array<uint8_t, SsAeadCipher::kTagSize> payload_tag{};
+    if (!co_await ReadFull(stream, payload_tag.data(), payload_tag.size())) {
+        co_return tl::unexpected(
+            proxy::ResolveHandshakeReadFailure(stream));
+    }
+    if (!cipher.FinishDecrypt(payload_tag.data())) {
+        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+    }
+    decoded.MoveTo(output);
+    co_return tl::expected<void, ErrorCode>{};
+}
+
 // Both TCP directions use this state machine. A length is authenticated and
 // consumed once; partial ciphertext remains owned across cancellation. Return
 // one record at a time, leaving a subsequent corrupt record for the next read
@@ -151,41 +212,38 @@ public:
                 auto record = DecodePending();
                 if (record.byte_size() != 0) co_return record;
             } catch (...) {
+                ciphertext_.clear();
+                plaintext_.clear();
                 failure_ = std::current_exception();
                 throw;
             }
-            auto raw = co_await stream_.ReadMultiBuffer();
+            ciphertext_.ReleaseIfIdle();
+            auto raw = co_await ReadMultiBufferOrThrowOnCancel(stream_);
             if (raw.byte_size() == 0) {
-                const auto cancellation = co_await net::this_coro::cancellation_state;
-                if (cancellation.cancelled() != net::cancellation_type::none)
-                    throw IoSystemError(io_error::operation_aborted);
                 if (length_ || ciphertext_.byte_size() != 0) {
                     try { throw transport::LinkError(ErrorCode::PROTOCOL_DECODE_FAILED); }
-                    catch (...) { failure_ = std::current_exception(); throw; }
+                    catch (...) {
+                        ciphertext_.clear();
+                        plaintext_.clear();
+                        failure_ = std::current_exception();
+                        throw;
+                    }
                 }
                 co_return buf::MultiBuffer{};
             }
             try { AppendRaw(std::move(raw)); }
-            catch (...) { failure_ = std::current_exception(); throw; }
+            catch (...) {
+                ciphertext_.clear();
+                plaintext_.clear();
+                failure_ = std::current_exception();
+                throw;
+            }
         }
     }
 
 private:
     void AppendRaw(buf::MultiBuffer raw) {
-        while (!raw.empty()) {
-            auto block = raw.pop_front();
-            if (!block || block->IsEmpty()) continue;
-            auto* tail = ciphertext_.back();
-            if (tail && tail->Available()) {
-                // Without coalescing, one-byte TCP fragments could retain one
-                // entire relay block per byte of a 64 KiB SS2022 record.
-                const auto count = std::min(size_t(tail->Available()), size_t(block->Len()));
-                if (!buf::AppendSpanToMultiBuffer(block->Bytes().first(count), ciphertext_))
-                    throw std::bad_alloc();
-                block->Advance(static_cast<uint32_t>(count));
-            }
-            if (!block->IsEmpty()) ciphertext_.push_back(std::move(block));
-        }
+        buf::AppendCoalescedStreamInput(ciphertext_, std::move(raw));
     }
 
     buf::MultiBuffer DecodePending() {

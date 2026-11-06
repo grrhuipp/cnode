@@ -83,6 +83,13 @@ struct UdpReplyQueueState {
     size_t active_payload_size = 0;
 };
 
+[[nodiscard]] bool WouldOverflowUdpQueue(
+    const UdpReplyQueueState& queue,
+    size_t payload_size) noexcept {
+    return WouldOverflowUdpQueue(
+        queue.pending.size(), queue.queued_bytes, payload_size);
+}
+
 struct UdpClientSession {
     UdpIngress::ClientSessionPtr link;
     // Valid uplink activity only; the reclaimer re-checks it lazily when the
@@ -275,6 +282,9 @@ UdpIngress::ClientSession::ReadMultiBuffer() {
                 throw IoSystemError(
                     io_error::no_buffer_space,
                     "UDP client input queue full");
+            }
+            if (impl_->terminal_error != ErrorCode::OK) {
+                throw transport::LinkError(impl_->terminal_error);
             }
             co_return buf::MultiBuffer{};
         }
@@ -763,6 +773,11 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
         request.stats = &datagram.stats;
         request.timeouts = datagram.timeouts;
         request.worker_id = worker_id;
+        if (!packet_session->Push(decoded->target, std::move(decoded->payload))) {
+            LOG_NET_DEBUG("UDP link enqueue failed worker={} client={}",
+                          datagram.worker_id, client_key_log());
+            return;
+        }
         session_impl.job_registered = true;
         session_impl.job_pin = client_session;
         session_impl.job_previous = nullptr;
@@ -803,6 +818,9 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
             client_session->Close();
             throw;
         }
+        preparation_session.reset();
+        preparation_guard.Release();
+        return;
     }
 
     if (!packet_session || packet_session->Closed() ||
@@ -810,15 +828,11 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
         decoded->payload.clear();
         return;
     }
-    // `last_active` was already updated during the initial lookup (or set on
-    // insertion inside `CreateClientSession`).
+    // `last_active` was already updated during the initial lookup.
     packet_session->UpdateReplyEndpoint(datagram.client_endpoint);
     if (!packet_session->Push(decoded->target, std::move(decoded->payload))) {
         LOG_NET_DEBUG("UDP link enqueue failed worker={} client={}",
                          datagram.worker_id, client_key_log());
-    } else if (preparation_session) {
-        preparation_session.reset();
-        preparation_guard.Release();
     }
 }
 
@@ -827,20 +841,21 @@ UdpIngress::ReplyEnqueueResult UdpIngress::EnqueueReply(
     udp::endpoint endpoint,
     buf::MultiBuffer payload) {
     const size_t payload_size = payload.byte_size();
-    if (payload_size == 0) {
+    if (payload_size == 0 || payload_size > kMaxQueuedUdpBytes) {
         return ReplyEnqueueResult::Rejected;
     }
+    if (auto it = impl_->reply_queues.find(socket_key);
+        it != impl_->reply_queues.end() &&
+        WouldOverflowUdpQueue(it->second, payload_size)) {
+        return ReplyEnqueueResult::Rejected;
+    }
+    auto reservation = impl_->budget.ReservePayload(payload);
+    if (!reservation) return ReplyEnqueueResult::Rejected;
 
     auto [queue_it, inserted] = FindOrEmplaceStringKey(
         impl_->reply_queues, socket_key);
     (void)inserted;
     auto& queue = queue_it->second;
-    if (WouldOverflowUdpQueue(
-            queue.pending.size(), queue.queued_bytes, payload_size)) {
-        return ReplyEnqueueResult::Rejected;
-    }
-    auto reservation = impl_->budget.ReservePayload(payload);
-    if (!reservation) return ReplyEnqueueResult::Rejected;
     const bool should_start_send = queue.active_id == 0;
 
     PendingUdpReply reply;
@@ -909,16 +924,20 @@ UdpIngress::ClientSessionPtr UdpIngress::CreateClientSession(
     impl_->reclaimer.ReserveRow();
     auto [sessions_it, group_inserted] = FindOrEmplaceStringKey(
         impl_->client_sessions, socket_key);
-    (void)group_inserted;
     auto& sessions = sessions_it->second;
     auto session_it = sessions.find(client_key);
     if (session_it == sessions.end()) {
-        auto [inserted_it, inserted] = sessions.try_emplace(
-            client_key,
-            UdpClientSession{.link = session, .last_active = last_active, .reclaim_hook = {}});
-        if (inserted) {
-            impl_->Link(*this, inserted_it->second, sessions_it->first, inserted_it->first,
-                        idle_timeout);
+        try {
+            auto [inserted_it, inserted] = sessions.try_emplace(
+                client_key,
+                UdpClientSession{.link = session, .last_active = last_active, .reclaim_hook = {}});
+            if (inserted) {
+                impl_->Link(*this, inserted_it->second, sessions_it->first, inserted_it->first,
+                            idle_timeout);
+            }
+        } catch (...) {
+            if (group_inserted) impl_->client_sessions.erase(sessions_it);
+            throw;
         }
     } else {
         auto& row = session_it->second;

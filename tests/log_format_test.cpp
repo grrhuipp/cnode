@@ -1,12 +1,20 @@
 #include "acppnode/infra/log.hpp"
 
+#include <array>
+#include <cstdio>
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/socket.h>
+#include <sys/ioctl.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
-#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -53,14 +61,165 @@ void CheckTimestamp(std::string_view line) {
 }
 
 struct StreamCapture {
-    std::ostringstream text;
-    std::ostream& stream;
-    std::streambuf* previous;
+    FILE* file{std::tmpfile()};
+    int target;
+    int previous;
 
-    explicit StreamCapture(std::ostream& target)
-        : stream(target), previous(stream.rdbuf(text.rdbuf())) {}
-    ~StreamCapture() { stream.rdbuf(previous); }
+    explicit StreamCapture(int descriptor)
+        : target(descriptor), previous(::dup(descriptor)) {
+        if (!file || previous < 0 || ::dup2(::fileno(file), target) < 0)
+            throw std::runtime_error("cannot capture console descriptor");
+    }
+    ~StreamCapture() {
+        acpp::Log::Shutdown();
+        ::dup2(previous, target);
+        ::close(previous);
+        std::fclose(file);
+    }
+    std::string Text() const {
+        std::string text;
+        std::array<char, 4096> buffer;
+        off_t offset = 0;
+        for (;;) {
+            const auto count = ::pread(::fileno(file), buffer.data(), buffer.size(), offset);
+            if (count == 0) return text;
+            Expect(count > 0, "cannot read captured console");
+            text.append(buffer.data(), static_cast<size_t>(count));
+            offset += count;
+        }
+    }
 };
+
+void CheckConsoleFileOffset(const std::filesystem::path& directory) {
+    StreamCapture capture(STDOUT_FILENO);
+    Expect(acpp::Log::Init("info", directory, 1, "access.log", "error.log", false, false),
+           "cannot initialize redirected console");
+    acpp::Log::WriteConsole(acpp::LogLevel::INFO, "async console offset");
+    acpp::Log::Shutdown();
+    const auto before_direct = capture.Text();
+    Expect(before_direct.find("async console offset") != std::string::npos,
+           "redirected console record missing");
+    constexpr std::string_view marker = "direct emergency output\n";
+    Expect(::write(STDOUT_FILENO, marker.data(), marker.size()) ==
+               static_cast<ssize_t>(marker.size()), "direct console write failed");
+    Expect(capture.Text() == before_direct + std::string(marker),
+           "direct output overwrote asynchronous console records");
+    acpp::Log::WriteConsole(acpp::LogLevel::INFO, "after-shutdown console offset");
+    const auto before_second_direct = capture.Text();
+    Expect(before_second_direct.starts_with(before_direct + std::string(marker)) &&
+               before_second_direct.find("after-shutdown console offset") != std::string::npos,
+           "after-shutdown console output overwrote existing records");
+    Expect(::write(STDOUT_FILENO, marker.data(), marker.size()) ==
+               static_cast<ssize_t>(marker.size()), "second direct console write failed");
+    Expect(capture.Text() == before_second_direct + std::string(marker),
+           "direct output overwrote after-shutdown console records");
+}
+
+void CheckBlockedConsole(const std::filesystem::path& directory) {
+    int pipe[2];
+    Expect(::pipe(pipe) == 0, "cannot create stdout pipe");
+    Expect(::fcntl(pipe[1], F_SETPIPE_SZ, 4096) == 4096, "cannot size stdout pipe");
+    const auto child = ::fork();
+    Expect(child >= 0, "cannot fork console regression");
+    if (child == 0) {
+        ::alarm(4);
+        ::dup2(pipe[1], STDOUT_FILENO);
+        ::close(pipe[1]);
+        // Retain the read descriptor without consuming bytes: EAGAIN, not EPIPE.
+        if (!acpp::Log::Init("info", directory, 1, "access.log", "error.log", false, false))
+            ::_exit(2);
+        const std::string message(512, 'x');
+        for (int i = 0; i < 20000; ++i)
+            acpp::Log::WriteConsole(acpp::LogLevel::INFO, message);
+        acpp::Log::WriteAccess("access survives blocked stdout");
+        acpp::Log::Shutdown();
+        ::_exit(0);
+    }
+    ::close(pipe[1]);
+    int status = 0;
+    Expect(::waitpid(child, &status, 0) == child, "cannot join console regression");
+    ::close(pipe[0]);
+    Expect(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+           "blocked stdout stalled producer or shutdown");
+    Expect(Contains(ReadLines(directory / "access.log"), "access survives"),
+           "blocked stdout affected file writer");
+}
+
+void CheckSocketConsole(const std::filesystem::path& directory) {
+    int sockets[2];
+    Expect(::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0,
+           "cannot create journald-style socket");
+    const int saved = ::dup(STDOUT_FILENO);
+    Expect(saved >= 0 && ::dup2(sockets[0], STDOUT_FILENO) >= 0, "cannot redirect socket stdout");
+    const int flags = ::fcntl(sockets[0], F_GETFL);
+    const bool initialized = acpp::Log::Init(
+        "info", directory, 1, "access.log", "error.log", false, false);
+    acpp::Log::WriteConsole(acpp::LogLevel::INFO, "journald console record");
+    acpp::Log::Shutdown();
+    const bool unchanged = ::fcntl(sockets[0], F_GETFL) == flags;
+    ::dup2(saved, STDOUT_FILENO);
+    ::close(saved);
+    ::close(sockets[0]);
+    std::string received;
+    std::array<char, 4096> bytes;
+    ssize_t count;
+    while ((count = ::read(sockets[1], bytes.data(), bytes.size())) > 0)
+        received.append(bytes.data(), static_cast<size_t>(count));
+    ::close(sockets[1]);
+    Expect(initialized && unchanged && received.find("journald console record") != std::string::npos,
+           "journald console lost record or changed caller descriptor flags");
+}
+
+void CheckAliasedSocketPartialRecord(const std::filesystem::path& directory) {
+    int sockets[2];
+    Expect(::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0,
+           "cannot create aliased console socket");
+    const int send_buffer = 512;
+    Expect(::setsockopt(sockets[0], SOL_SOCKET, SO_SNDBUF,
+                       &send_buffer, sizeof(send_buffer)) == 0,
+           "cannot constrain aliased console socket");
+    const std::string prefix(128, 'p');
+    Expect(::send(sockets[0], prefix.data(), prefix.size(), MSG_NOSIGNAL) == 128,
+           "cannot prefill aliased console socket");
+    const int saved_stdout = ::dup(STDOUT_FILENO);
+    const int saved_stderr = ::dup(STDERR_FILENO);
+    Expect(saved_stdout >= 0 && saved_stderr >= 0 &&
+           ::dup2(sockets[0], STDOUT_FILENO) >= 0 &&
+           ::dup2(sockets[0], STDERR_FILENO) >= 0, "cannot alias console descriptors");
+    // Warning suppresses the initialization info record, leaving the socket's
+    // controlled free space for this single large, valid logfmt record.
+    const bool initialized = acpp::Log::Init(
+        "warning", directory, 1, "access.log", "error.log", false, false);
+    acpp::Log::WriteConsole(acpp::LogLevel::WARN, std::string(4000, 'x'));
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    int available = 0;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (::ioctl(sockets[1], FIONREAD, &available) != 0 || available > 128) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    std::array<char, 8192> bytes;
+    const auto first_count = ::recv(sockets[1], bytes.data(), bytes.size(), MSG_DONTWAIT);
+    const bool partial = first_count > 128 &&
+        bytes[static_cast<size_t>(first_count - 1)] != '\n';
+    // Draining restores writability. The stderr alias must nevertheless stay
+    // retired: neither this event nor the drop warning may follow the prefix.
+    acpp::Log::WriteConsole(acpp::LogLevel::ERROR, "must-not-follow-partial-record");
+    acpp::Log::Shutdown();
+    ::dup2(saved_stdout, STDOUT_FILENO);
+    ::dup2(saved_stderr, STDERR_FILENO);
+    ::close(saved_stdout);
+    ::close(saved_stderr);
+    ::close(sockets[0]);
+    std::string after_partial;
+    ssize_t count;
+    while ((count = ::read(sockets[1], bytes.data(), bytes.size())) > 0)
+        after_partial.append(bytes.data(), static_cast<size_t>(count));
+    ::close(sockets[1]);
+    Expect(initialized && partial, "aliased socket did not exercise a partial console record");
+    Expect(after_partial.empty(), "stderr alias appended output to a partial stdout record");
+    Expect(Contains(ReadLines(directory / "error.log"), "must-not-follow-partial-record"),
+           "retiring aliased console sink affected the independent error file");
+}
 
 struct SessionLogContext {
     struct {
@@ -80,8 +239,8 @@ int main() {
         ("cnode-log-format-" + std::to_string(
             std::chrono::steady_clock::now().time_since_epoch().count()));
     try {
-        StreamCapture console(std::cout);
-        StreamCapture errors(std::cerr);
+        StreamCapture console(STDOUT_FILENO);
+        StreamCapture errors(STDERR_FILENO);
         Expect(acpp::Log::Init("trace", directory, 1,
                               "access.log", "error.log", false, false),
                "logger initialization failed");
@@ -138,7 +297,7 @@ int main() {
         Expect(access.size() == 2 && !Contains(access, "[Warning]") &&
                FindLine(access, "invalid input").find("\\nforged-access\\x1b") != std::string::npos,
                "access facts must stay separate and resist record injection");
-        const auto console_text = console.text.str();
+        const auto console_text = console.Text();
         Expect(console_text.find("time=\"") != std::string::npos &&
                console_text.find("level=info msg=\"node ready\"") != std::string::npos &&
                console_text.find("Host=\"https://panel.example.com:8443\" ID=1041 Name=\"main panel\" Type=Vless") != std::string::npos,
@@ -147,11 +306,11 @@ int main() {
                "console quoted values must be escaped");
         Expect(console_text.find("authentication failed") == std::string::npos &&
                console_text.find("panel request failed") != std::string::npos &&
-               errors.text.str().find("level=error msg=\"fatal startup failure\"") != std::string::npos,
+               errors.Text().find("level=error msg=\"fatal startup failure\"") != std::string::npos,
                "console lifecycle/error routing changed");
         for (const auto secret : {"login", "password", "/api", "secret", "private"}) {
             Expect(console_text.find(secret) == std::string::npos &&
-                   errors.text.str().find(secret) == std::string::npos &&
+                   errors.Text().find(secret) == std::string::npos &&
                    !Contains(diagnostics, secret), "panel URL credentials leaked");
         }
 
@@ -165,7 +324,7 @@ int main() {
         acpp::Log::Shutdown();
         const auto filtered = ReadLines(directory / "filtered/error.log");
         Expect(filtered.size() == 1 && Contains(filtered, "visible warning") &&
-               console.text.str().find("hidden console event") == std::string::npos,
+               console.Text().find("hidden console event") == std::string::npos,
                "configured severity must filter console and diagnostic records");
         Expect(Contains(ReadLines(directory / "filtered/access.log"), "accepted despite"),
                "diagnostic filtering must not discard access facts");
@@ -178,11 +337,37 @@ int main() {
         acpp::Log::WriteAccess("rejected despite disabled diagnostics");
         acpp::Log::Shutdown();
         Expect(ReadLines(directory / "disabled/error.log").empty() &&
-               errors.text.str().find("hidden ordinary error") == std::string::npos &&
-               errors.text.str().find("unconditional fatal startup failure") != std::string::npos,
+               errors.Text().find("hidden ordinary error") == std::string::npos &&
+               errors.Text().find("unconditional fatal startup failure") != std::string::npos,
                "fatal startup failures must remain visible without enabling ordinary diagnostics");
         Expect(Contains(ReadLines(directory / "disabled/access.log"), "rejected despite"),
                "disabled diagnostics must preserve access facts");
+
+        Expect(acpp::Log::Init("info", directory / "failed-error", 1,
+                              "access.log", "/dev/full", false, false),
+               "cannot initialize failing error sink");
+        for (int i = 0; i < 100; ++i)
+            acpp::Log::WriteSystem(acpp::LogLevel::WARN, "unwritable error record");
+        acpp::Log::WriteAccess("healthy access channel");
+        acpp::Log::Shutdown();
+        Expect(errors.Text().find("channel=error write-failure") != std::string::npos &&
+               Contains(ReadLines(directory / "failed-error/access.log"), "healthy access"),
+               "error sink failure was silent or affected access channel");
+
+        Expect(acpp::Log::Init("info", directory / "failed-access", 1,
+                              "/dev/full", "error.log", false, false),
+               "cannot initialize failing access sink");
+        acpp::Log::WriteAccess("unwritable access record");
+        acpp::Log::WriteSystem(acpp::LogLevel::WARN, "healthy error channel");
+        acpp::Log::Shutdown();
+        Expect(errors.Text().find("channel=access write-failure") != std::string::npos &&
+               Contains(ReadLines(directory / "failed-access/error.log"), "healthy error"),
+               "access sink flush failure was silent or affected error channel");
+
+        CheckBlockedConsole(directory / "blocked-console");
+        CheckSocketConsole(directory / "socket-console");
+        CheckAliasedSocketPartialRecord(directory / "aliased-socket-console");
+        CheckConsoleFileOffset(directory / "console-file-offset");
     } catch (const std::exception& error) {
         acpp::Log::Shutdown();
         std::filesystem::remove_all(directory);

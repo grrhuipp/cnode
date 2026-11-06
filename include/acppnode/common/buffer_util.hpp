@@ -3,6 +3,7 @@
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/asio_types.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
+#include <asio/this_coro.hpp>
 
 #include <array>
 #include <cstddef>
@@ -31,11 +32,17 @@ public:
     }
 
     void AppendBuffers(std::span<const net::const_buffer> buffers) {
-        if (buffers.empty()) {
+        size_t non_empty = 0;
+        for (const auto& buffer : buffers) {
+            if (buffer.size() != 0) {
+                ++non_empty;
+            }
+        }
+        if (non_empty == 0) {
             return;
         }
-        if (spill_.empty() && count_ + buffers.size() > StackCapacity) {
-            EnsureSpillCapacity(buffers.size());
+        if (!spill_.empty() || count_ + non_empty > StackCapacity) {
+            EnsureSpillCapacity(non_empty);
         }
         for (const auto& buffer : buffers) {
             Append(buffer);
@@ -43,11 +50,17 @@ public:
     }
 
     void AppendMultiBuffer(const buf::MultiBuffer& mb) {
-        if (mb.empty()) {
+        size_t non_empty = 0;
+        for (const auto* buffer : mb) {
+            if (buffer && !buffer->IsEmpty()) {
+                ++non_empty;
+            }
+        }
+        if (non_empty == 0) {
             return;
         }
-        if (spill_.empty() && count_ + mb.size() > StackCapacity) {
-            EnsureSpillCapacity(mb.size());
+        if (!spill_.empty() || count_ + non_empty > StackCapacity) {
+            EnsureSpillCapacity(non_empty);
         }
         for (const auto* buffer : mb) {
             if (!buffer || buffer->IsEmpty()) {
@@ -76,6 +89,7 @@ public:
 private:
     void EnsureSpillCapacity(size_t additional) {
         if (!spill_.empty()) {
+            spill_.reserve(spill_.size() + additional);
             return;
         }
         spill_.reserve(count_ + additional);
@@ -89,5 +103,21 @@ private:
     memory::ThreadLocalVector<net::const_buffer> spill_;
     size_t count_ = 0;
 };
+
+template <typename Reader>
+[[nodiscard]] net::awaitable<buf::MultiBuffer> ReadMultiBufferOrThrowOnCancel(
+    Reader& reader, const char* cancel_what = nullptr) {
+    buf::MultiBuffer raw = co_await reader.ReadMultiBuffer();
+    if (raw.byte_size() == 0) {
+        const auto cancellation = co_await net::this_coro::cancellation_state;
+        if (cancellation.cancelled() != net::cancellation_type::none) {
+            if (cancel_what) {
+                throw IoSystemError(io_error::operation_aborted, cancel_what);
+            }
+            throw IoSystemError(io_error::operation_aborted);
+        }
+    }
+    co_return raw;
+}
 
 }  // namespace acpp

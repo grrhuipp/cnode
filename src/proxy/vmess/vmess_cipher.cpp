@@ -1,6 +1,7 @@
 #include "vmess_cipher.hpp"
 
 #include <openssl/evp.h>
+#include <openssl/mem.h>
 
 #include <cstring>
 #include <new>
@@ -29,16 +30,19 @@ VMessCipher::VMessCipher(Security security, const uint8_t* key, const uint8_t* i
     std::span<const uint8_t> actual_key(key, 16);
     const EVP_CIPHER* algorithm = EVP_aes_128_gcm();
     if (security == Security::CHACHA20_POLY1305) {
-        const auto first = MD5Hash(key, 16);
-        const auto second = MD5Hash(first.data(), first.size());
+        auto first = MD5Hash(key, 16);
+        auto second = MD5Hash(first.data(), first.size());
         std::memcpy(expanded.data(), first.data(), first.size());
         std::memcpy(expanded.data() + first.size(), second.data(), second.size());
+        OPENSSL_cleanse(first.data(), first.size());
+        OPENSSL_cleanse(second.data(), second.size());
         actual_key = expanded;
         algorithm = EVP_chacha20_poly1305();
     }
     const bool ok = direction == proxy::AeadDirection::Encrypt
         ? encryptor_.Configure(algorithm, actual_key)
         : decryptor_.Configure(algorithm, actual_key);
+    OPENSSL_cleanse(expanded.data(), expanded.size());
     if (!ok) {
         throw std::runtime_error("VMess AEAD initialization failed");
     }

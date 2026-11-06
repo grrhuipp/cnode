@@ -22,8 +22,9 @@ namespace wire {
 constexpr uint16_t FLAG_QR    = 0x8000;
 constexpr uint16_t FLAG_RCODE = 0x000F;
 
-constexpr uint16_t TYPE_A    = 1;
-constexpr uint16_t TYPE_AAAA = 28;
+constexpr uint16_t TYPE_A     = 1;
+constexpr uint16_t TYPE_CNAME = 5;
+constexpr uint16_t TYPE_AAAA  = 28;
 constexpr uint8_t RCODE_OK         = 0;
 constexpr uint8_t RCODE_NAME_ERROR = 3;
 
@@ -60,7 +61,9 @@ struct DNSWorker::Impl {
     static size_t BuildQueryTo(std::span<uint8_t, 280> query,
                                std::string_view domain,
                                bool query_aaaa) noexcept;
-    DnsResult ParseResponse(std::span<const uint8_t> response, uint16_t expected_txid);
+    DnsResult ParseResponse(std::span<const uint8_t> response,
+                            uint16_t expected_txid,
+                            bool query_aaaa);
 
     net::io_context& io_context;
     const Config config;
@@ -75,8 +78,13 @@ DNSWorker::Impl::Impl(net::io_context& io_context, const Config& config,
                       size_t mailbox_capacity)
     : io_context(io_context)
     , config(config)
-    , cache(config.cache_size, config.min_ttl, config.max_ttl)
-    , inflight_resolves(io_context)
+    , cache(config.cache_size, config.min_ttl, config.max_ttl,
+        [](std::string_view domain, std::string_view reason, uint64_t hits,
+           std::string_view event) {
+            LOG_INFO("DNS negative cache {} event={} hits={} suppressed={} > {}",
+                     domain, event, hits, hits, reason);
+        })
+    , inflight_resolves(io_context, mailbox_capacity)
     , mailbox(io_context, mailbox_capacity) {
     if (config.servers.empty()) {
         throw std::invalid_argument("DNS requires at least one server endpoint");
@@ -115,14 +123,9 @@ net::awaitable<DnsResult> DNSWorker::Impl::ResolveOwned(std::string owned_domain
     domain = owned_domain;
     auto cached = cache.GetResult(domain);
     auto result = cached ? std::move(*cached) :
-        co_await inflight_resolves.Run(domain, [this, domain] {
-            return ResolveUncached(domain);
+        co_await inflight_resolves.Run(domain, [this](std::string_view query_domain) {
+            return ResolveUncached(query_domain);
         });
-    if (!result.Ok() && result.error != ErrorCode::CANCELLED) {
-        LOG_WARN("failed to resolve {} (error={} source={}) > {}",
-                 domain, ErrorCodeToString(result.error),
-                 result.from_cache ? "negative cache" : "upstream", result.error_msg);
-    }
     co_return result;
 }
 
@@ -147,6 +150,12 @@ net::awaitable<DnsResult> DNSWorker::Impl::ResolveUncached(std::string_view doma
         result.error = ErrorCode::CANCELLED;
     }
     if (result.error == ErrorCode::CANCELLED) co_return result;
+    // One upstream event per shared query; negative cache hits are counted and
+    // summarized by the cache instead of warning once per connection.
+    if (!result.Ok()) {
+        LOG_WARN("failed to resolve {} (error={} source=upstream) > {}",
+                 domain, ErrorCodeToString(result.error), result.error_msg);
+    }
 
     try {
         cache.Store(domain, result);
@@ -200,7 +209,7 @@ net::awaitable<DnsResult> DNSWorker::Impl::DoResolve(
                 }
                 continue;
             }
-            if (!a_result.Ok()) {
+            if (!a_result.Ok() && a_result.error != ErrorCode::DNS_NO_RECORD) {
                 a_result = std::move(attempt_result);
             }
         }
@@ -266,7 +275,10 @@ net::awaitable<DnsResult> DNSWorker::Impl::QueryServer(
         co_return result;
     }
     const uint16_t txid = (static_cast<uint16_t>(query[0]) << 8) | query[1];
-    co_return ParseResponse(std::span<const uint8_t>(response.bytes.data(), response.size), txid);
+    co_return ParseResponse(
+        std::span<const uint8_t>(response.bytes.data(), response.size),
+        txid,
+        query_aaaa);
 }
 
 size_t DNSWorker::Impl::BuildQueryTo(
@@ -303,7 +315,7 @@ size_t DNSWorker::Impl::BuildQueryTo(
 }
 
 DnsResult DNSWorker::Impl::ParseResponse(
-    std::span<const uint8_t> response, uint16_t expected_txid) {
+    std::span<const uint8_t> response, uint16_t expected_txid, bool query_aaaa) {
     DnsResult result;
 
     if (response.size() < 12) {
@@ -329,12 +341,7 @@ DnsResult DNSWorker::Impl::ParseResponse(
     }
 
     const uint8_t rcode = flags & wire::FLAG_RCODE;
-    if (rcode == wire::RCODE_NAME_ERROR) {
-        result.error = ErrorCode::DNS_NO_RECORD;
-        result.error_msg = "NXDOMAIN";
-        return result;
-    }
-    if (rcode != wire::RCODE_OK) {
+    if (rcode != wire::RCODE_OK && rcode != wire::RCODE_NAME_ERROR) {
         switch (rcode) {
             case 2:
                 result.error = ErrorCode::DNS_SERVER_FAILED;
@@ -355,34 +362,86 @@ DnsResult DNSWorker::Impl::ParseResponse(
 
     const uint16_t qdcount =
         (static_cast<uint16_t>(response[4]) << 8) | response[5];
+    if (qdcount != 1) {
+        result.error = ErrorCode::DNS_FORMAT_ERROR;
+        result.error_msg = "DNS question count is not 1";
+        return result;
+    }
+
+    auto skip_dns_name = [&](size_t& offset) noexcept {
+        size_t current_offset = offset;
+        size_t next_offset = 0;
+        size_t wire_len = 0;
+        bool jumped = false;
+        while (current_offset < response.size()) {
+            const uint8_t len = response[current_offset];
+            if (len == 0) {
+                if (wire_len + 1 > 255) {
+                    return false;
+                }
+                offset = jumped ? next_offset : current_offset + 1;
+                return true;
+            }
+            if ((len & 0xC0) == 0xC0) {
+                if (current_offset + 1 >= response.size()) {
+                    return false;
+                }
+                const size_t ptr =
+                    (static_cast<size_t>(len & 0x3F) << 8) | response[current_offset + 1];
+                if (ptr < 12 || ptr >= current_offset) {
+                    return false;
+                }
+                if (!jumped) {
+                    next_offset = current_offset + 2;
+                    jumped = true;
+                }
+                current_offset = ptr;
+                continue;
+            }
+            if ((len & 0xC0) != 0) {
+                return false;
+            }
+            if (response.size() - current_offset <= static_cast<size_t>(len) + 1) {
+                return false;
+            }
+            wire_len += static_cast<size_t>(len) + 1;
+            if (wire_len >= 255) {
+                return false;
+            }
+            current_offset += static_cast<size_t>(len) + 1;
+        }
+        return false;
+    };
+
+    size_t pos = 12;
+    if (!skip_dns_name(pos) || pos + 4 > response.size()) {
+        result.error = ErrorCode::DNS_FORMAT_ERROR;
+        result.error_msg = "DNS question section truncated";
+        return result;
+    }
+    const uint16_t qtype =
+        (static_cast<uint16_t>(response[pos]) << 8) | response[pos + 1];
+    const uint16_t qclass =
+        (static_cast<uint16_t>(response[pos + 2]) << 8) | response[pos + 3];
+    if (qtype != (query_aaaa ? wire::TYPE_AAAA : wire::TYPE_A) || qclass != 1) {
+        result.error = ErrorCode::DNS_FORMAT_ERROR;
+        result.error_msg = "DNS question section invalid";
+        return result;
+    }
+    pos += 4;
+
+    if (rcode == wire::RCODE_NAME_ERROR) {
+        result.error = ErrorCode::DNS_NO_RECORD;
+        result.error_msg = "NXDOMAIN";
+        return result;
+    }
+
     const uint16_t ancount =
         (static_cast<uint16_t>(response[6]) << 8) | response[7];
     if (ancount == 0) {
         result.error = ErrorCode::DNS_NO_RECORD;
         result.error_msg = "NODATA";
         return result;
-    }
-
-    size_t pos = 12;
-    for (uint16_t i = 0; i < qdcount; ++i) {
-        while (pos < response.size()) {
-            const uint8_t len = response[pos];
-            if (len == 0) {
-                ++pos;
-                break;
-            }
-            if ((len & 0xC0) == 0xC0) {
-                pos += 2;
-                break;
-            }
-            pos += len + 1;
-        }
-        if (pos + 4 > response.size()) {
-            result.error = ErrorCode::DNS_FORMAT_ERROR;
-            result.error_msg = "DNS question section truncated";
-            return result;
-        }
-        pos += 4;
     }
 
     if (ancount > (response.size() - pos) / 11) {
@@ -395,20 +454,7 @@ DnsResult DNSWorker::Impl::ParseResponse(
     uint32_t min_ttl = UINT32_MAX;
 
     for (uint16_t i = 0; i < ancount; ++i) {
-        while (pos < response.size()) {
-            const uint8_t len = response[pos];
-            if (len == 0) {
-                ++pos;
-                break;
-            }
-            if ((len & 0xC0) == 0xC0) {
-                pos += 2;
-                break;
-            }
-            pos += len + 1;
-        }
-
-        if (pos + 10 > response.size()) {
+        if (!skip_dns_name(pos) || pos + 10 > response.size()) {
             result.error = ErrorCode::DNS_FORMAT_ERROR;
             result.error_msg = "DNS answer header truncated";
             return result;
@@ -436,18 +482,28 @@ DnsResult DNSWorker::Impl::ParseResponse(
             return result;
         }
 
-        min_ttl = std::min(min_ttl, ttl);
+        if ((type == wire::TYPE_A && rdlength != 4) ||
+            (type == wire::TYPE_AAAA && rdlength != 16)) {
+            result.error = ErrorCode::DNS_FORMAT_ERROR;
+            result.error_msg = std::format("DNS {} record has invalid RDLENGTH {} (expected {})",
+                type == wire::TYPE_A ? "A" : "AAAA", rdlength,
+                type == wire::TYPE_A ? 4 : 16);
+            return result;
+        }
 
-        if (type == wire::TYPE_A && rdlength == 4) {
+        if (!query_aaaa && type == wire::TYPE_A) {
+            min_ttl = std::min(min_ttl, ttl);
             net::ip::address_v4::bytes_type bytes;
             std::memcpy(bytes.data(), &response[pos], 4);
             addresses.emplace_back(net::ip::address_v4(bytes));
-        } else if (type == wire::TYPE_AAAA && rdlength == 16) {
+        } else if (query_aaaa && type == wire::TYPE_AAAA) {
+            min_ttl = std::min(min_ttl, ttl);
             net::ip::address_v6::bytes_type bytes;
             std::memcpy(bytes.data(), &response[pos], 16);
             addresses.emplace_back(net::ip::address_v6(bytes));
+        } else if (type == wire::TYPE_CNAME) {
+            min_ttl = std::min(min_ttl, ttl);
         }
-
         pos += rdlength;
     }
 
@@ -480,6 +536,7 @@ net::awaitable<void> DNSWorker::AsyncJoin() {
     co_await net::this_coro::throw_if_cancelled(false);
     RequestStop();
     co_await impl_->mailbox.AsyncJoinAccepted();
+    co_await impl_->inflight_resolves.AsyncJoin();
     // A query can finish before its shared socket's cancelled receive callback.
     // Both boundaries must pass while the DNS executor and scheduler still live.
     for (const auto& upstream : impl_->upstreams) co_await upstream->AsyncJoin();

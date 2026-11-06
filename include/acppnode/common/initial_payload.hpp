@@ -21,7 +21,9 @@ public:
     static constexpr size_t kInlineSize = 256;
 
     InitialPayload() = default;
-    explicit InitialPayload(buf::MultiBuffer data) noexcept : overflow_(std::move(data)) {}
+    explicit InitialPayload(buf::MultiBuffer data) noexcept : overflow_(std::move(data)) {
+        overflow_.ReleaseIfIdle();
+    }
     ~InitialPayload() noexcept = default;
 
     InitialPayload(const InitialPayload&) = delete;

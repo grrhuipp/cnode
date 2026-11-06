@@ -122,6 +122,13 @@ void TestRealityNodeResponseIsNormalized() {
     CheckInvalid(R"({"server_port":443,"tls":2,"tls_settings":{}})");
     CheckInvalid(R"({"server_port":443,"tls":2,"server_name":"www.apple.com","tls_settings":{"private_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","min_client_ver":"2.0.0","max_client_ver":"1.0.0"}})");
     CheckInvalid(R"({"server_port":443,"tls":2,"server_name":"www.apple.com","tls_settings":{"private_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","max_time_diff":-1}})");
+    CheckInvalid(R"({"server_port":443,"tls":2,"server_name":"","tls_settings":{"private_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","dest":"www.apple.com:443"}})");
+    auto null_subfields = acpp::json::parse(
+        R"({"server_port":8443,"network":"ws","networkSettings":{"path":"/ws","headers":null,"serviceName":null},"tls":2,"server_name":"www.apple.com","tls_settings":{"private_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","server_names":null,"short_ids":null,"dest":"www.apple.com:443"}})");
+    Check(ParseNodeInfo(null_subfields.as_object(), "vless").has_value(),
+          "valid REALITY node with null optional subfields was rejected");
+    CheckInvalid(R"({"server_port":8443,"network":"grpc","networkSettings":{"serviceName":"bad service"},"tls":0})");
+    CheckInvalid(R"({"server_port":443,"tls":2,"server_name":"www.apple.com","tls_settings":{"private_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","privateKey":"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB","dest":"www.apple.com:443"}})");
 }
 
 void TestOptionalCipherNullValues() {

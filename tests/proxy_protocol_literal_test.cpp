@@ -32,6 +32,12 @@ bool V1BoundaryCasesPass() {
     if (!Parse(std::string_view(no_crlf).substr(0, 106)).incomplete()) return false;
     // A CRLF that only ends past byte 107 is still too late.
     if (Parse(no_crlf + "\r\n").status != acpp::ProxyProtocolParseStatus::Invalid) return false;
+    if (Parse("PROXY TCP4 192.0.2.1 GARBAGE 32100 443\r\n").status !=
+        acpp::ProxyProtocolParseStatus::Invalid) return false;
+    if (Parse("PROXY TCP4 192.0.2.1 198.51.100.1 32100 70000\r\n").status !=
+        acpp::ProxyProtocolParseStatus::Invalid) return false;
+    if (Parse("PROXY TCP4 192.0.2.1 198.51.100.1 32100 443 EXTRA\r\n").status !=
+        acpp::ProxyProtocolParseStatus::Invalid) return false;
     return true;
 }
 
@@ -60,6 +66,11 @@ bool V2BoundaryCasesPass() {
             return false;
         }
     }
+    // Oversized v2 length (> kProxyHeaderMaxBytes) must fail immediately on 16-byte peek.
+    auto oversized = V2Header(0x21, 0x11);
+    oversized[14] = 0x10;
+    oversized[15] = 0x00;
+    if (Parse(std::span(oversized).first(16)).status != Status::Invalid) return false;
     for (const uint8_t family_transport : {uint8_t{0x11}, uint8_t{0x41}, uint8_t{0x13}, uint8_t{0xFF}}) {
         const auto header = V2Header(0x20, family_transport);
         const auto local = Parse(header);

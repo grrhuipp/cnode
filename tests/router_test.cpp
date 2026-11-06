@@ -65,6 +65,22 @@ void TestRulesAndOwnership() {
     ctx.outbound.target = acpp::TargetAddress("2001:db8::7", 53);
     Require(query.Route(ctx).outbound_tag == "ip-proxy", "IPv6 routing must match");
 
+    // route_only (route_target) must participate in port and IP matching.
+    acpp::RouteRuleConfig port_rule;
+    port_rule.port = {acpp::RoutingPortRange{8443, 8443}};
+    port_rule.outbound_tag = "port-proxy";
+    acpp::RoutingConfig port_cfg;
+    port_cfg.rules = {port_rule, network};
+    const Router port_router(port_cfg, nullptr);
+    ctx.outbound.target = acpp::TargetAddress("example.org", 80);
+    ctx.outbound.route_target = acpp::TargetAddress("sniffed.example.org", 8443);
+    Require(port_router.Route(ctx).outbound_tag == "port-proxy",
+            "route_target port must match port routing rule when route_only is enabled");
+    ctx.outbound.route_target = acpp::TargetAddress("sniffed.example.org", 443);
+    ctx.outbound.route_target.resolved_addr = acpp::net::ip::make_address("192.0.2.99");
+    Require(port_router.Route(ctx).outbound_tag == "ip-proxy",
+            "route_target resolved_addr must match IP routing rule when route_only is enabled");
+    ctx.outbound.route_target = {};
     ctx.outbound.target = acpp::TargetAddress("notexample.com", 443);
     ctx.content.network = acpp::Network::TCP;
     match = query.Route(ctx);
@@ -145,6 +161,19 @@ void TestInboundMetadataOwnershipAndRouting() {
                 Require(counted_worker_pool.OutstandingAllocations() == baseline_allocations &&
                             counted_worker_pool.OutstandingBytes() == baseline_bytes,
                         "default-constructed Context must not pre-allocate an arena block");
+                {
+                    acpp::RoutingConfig rcfg;
+                    acpp::RouteRuleConfig rrule;
+                    rrule.domain_suffix = {"example.com"};
+                    rrule.ip = {*acpp::RoutingIpNetwork::Parse("192.0.2.0/24")};
+                    rrule.source = {*acpp::RoutingIpNetwork::Parse("10.0.0.0/8")};
+                    rrule.outbound_tag = "direct";
+                    rcfg.rules = {rrule};
+                    const size_t before_router = counted_worker_pool.TotalAllocations();
+                    const Router process_owned_router(rcfg, nullptr);
+                    Require(counted_worker_pool.TotalAllocations() == before_router,
+                            "Router must allocate its rule sets from process_resource, not the default PMR pool");
+                }
                 {
                     acpp::proxyman::inbound::ReceiverSettings receiver{
                         .inbound_tag = {}, .inbound_tags = {}, .protocol = {},

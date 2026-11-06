@@ -16,8 +16,13 @@ constexpr size_t kRequestHeaderMax = 1 + 16 + 16 + 1 + 1 + 1 + 1 + 1 + kMaxEncod
 // AuthID, sealed length, connection nonce, sealed header.
 constexpr size_t kRequestPacketMax = 16 + 18 + 8 + kRequestHeaderMax + 16;
 constexpr size_t kResponseHeaderMax = 1024;
-constexpr uint8_t kClientOptions =
-    Option::CHUNK_STREAM | Option::CHUNK_MASKING | Option::GLOBAL_PADDING;
+[[nodiscard]] constexpr uint8_t ClientOptions(Security security) noexcept {
+    uint8_t options = Option::CHUNK_STREAM | Option::CHUNK_MASKING;
+    if (security != Security::NONE && security != Security::ZERO) {
+        options |= Option::GLOBAL_PADDING;
+    }
+    return options;
+}
 
 tl::expected<size_t, ErrorCode> BuildRequestHeaderPacket(
     const MemoryAccount& user,
@@ -34,7 +39,7 @@ tl::expected<size_t, ErrorCode> BuildRequestHeaderPacket(
     writer.WriteBytes(request_body.iv.data(), request_body.iv.size());
     writer.WriteBytes(request_body.key.data(), request_body.key.size());
     writer.WriteU8(response_header);
-    writer.WriteU8(kClientOptions);
+    writer.WriteU8(ClientOptions(security));
     // High nibble: header padding length, always zero here.
     writer.WriteU8(static_cast<uint8_t>(security));
     writer.WriteU8(0);
@@ -43,13 +48,20 @@ tl::expected<size_t, ErrorCode> BuildRequestHeaderPacket(
         return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
     size_t header_len = writer.Position();
-    const size_t address_size = EncodeAddressTo(
-        target, header.data() + header_len, header.size() - header_len,
-        AddressWireFormat::PortFirst);
-    if (address_size == 0) {
-        return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+    if (command == Command::TCP || command == Command::UDP) {
+        if (!target.IsValid() || (target.IsDomain() && target.host.size() > 253)) {
+            return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+        }
+        const size_t address_size = EncodeAddressTo(
+            target, header.data() + header_len, header.size() - header_len,
+            AddressWireFormat::PortFirst);
+        if (address_size == 0) {
+            return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+        }
+        header_len += address_size;
+    } else if (command != Command::Mux) {
+        return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
-    header_len += address_size;
     const uint32_t checksum = FNV1a32(header.data(), header_len);
     header[header_len++] = static_cast<uint8_t>(checksum >> 24);
     header[header_len++] = static_cast<uint8_t>(checksum >> 16);
@@ -121,9 +133,9 @@ ClientSession::ClientSession(const MemoryAccount& user,
     , security_(security)
     , command_(command)
     , keys_(GenerateKeys())
-    , request_encoder_(BodyOptions{security, kClientOptions, command},
+    , request_encoder_(BodyOptions{security, ClientOptions(security), command},
                        keys_.request, keys_.request)
-    , response_decoder_(BodyOptions{security, kClientOptions, command},
+    , response_decoder_(BodyOptions{security, ClientOptions(security), command},
                         keys_.request, keys_.response) {}
 
 net::awaitable<VMessHandshakeResult> ClientSession::EncodeRequestHeader(AsyncStream& stream) {
@@ -140,7 +152,13 @@ net::awaitable<VMessHandshakeResult> ClientSession::EncodeRequestHeader(AsyncStr
     try {
         const std::array<net::const_buffer, 1> buffers{net::buffer(packet.data(), *built)};
         co_await stream.WriteBuffers(buffers);
-    } catch (const IoSystemError&) {
+    } catch (const transport::LinkError& e) {
+        co_return tl::unexpected(e.code());
+    } catch (const std::bad_alloc&) {
+        co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+    } catch (const IoSystemError& e) {
+        co_return tl::unexpected(MapAsioError(e.code()));
+    } catch (...) {
         co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
     }
     request_header_sent_ = true;
@@ -182,47 +200,66 @@ net::awaitable<void> ClientSession::EncodeRequestBodyEOF(AsyncStream& stream) {
 }
 
 net::awaitable<void> ClientSession::DecodeResponseHeader(AsyncStream& stream) {
-    if (response_header_sealed_.empty()) {
-        if (!co_await response_decoder_.ReadExact(
-                stream, response_length_, response_length_read_)) {
-            ThrowResponseHeaderError();
+    auto reset_header_state = [this]() noexcept {
+        memory::ByteVector{}.swap(response_header_sealed_);
+        response_length_read_ = 0;
+        response_header_read_ = 0;
+    };
+    auto fail = [&]() {
+        reset_header_state();
+        ThrowResponseHeaderError();
+    };
+    try {
+        if (response_header_sealed_.empty()) {
+            if (!co_await response_decoder_.ReadExact(
+                    stream, response_length_, response_length_read_)) {
+                fail();
+            }
+            const auto length_key = ResponseHeaderLengthKey(keys_.response.key, keys_.response.iv);
+            std::array<uint8_t, 2> length{};
+            size_t length_size = 0;
+            if (!AES128GCMDecryptTo(length_key.key.data(), length_key.nonce.data(),
+                                    length_key.nonce.size(),
+                                    response_length_.data(), response_length_.size(),
+                                    nullptr, 0,
+                                    length.data(), length.size(), length_size) ||
+                length_size != length.size()) {
+                fail();
+            }
+            const size_t header_len = (static_cast<size_t>(length[0]) << 8) | length[1];
+            if (header_len < 4 || header_len > kResponseHeaderMax) {
+                fail();
+            }
+            response_header_sealed_.resize(header_len + 16);
         }
-        const auto length_key = ResponseHeaderLengthKey(keys_.response.key, keys_.response.iv);
-        std::array<uint8_t, 2> length{};
-        size_t length_size = 0;
-        if (!AES128GCMDecryptTo(length_key.key.data(), length_key.nonce.data(),
-                                length_key.nonce.size(),
-                                response_length_.data(), response_length_.size(),
-                                nullptr, 0,
-                                length.data(), length.size(), length_size) ||
-            length_size != length.size()) {
-            ThrowResponseHeaderError();
-        }
-        const size_t header_len = (static_cast<size_t>(length[0]) << 8) | length[1];
-        if (header_len < 4 || header_len > kResponseHeaderMax) {
-            ThrowResponseHeaderError();
-        }
-        response_header_sealed_.resize(header_len + 16);
-    }
 
-    if (!co_await response_decoder_.ReadExact(
-            stream, response_header_sealed_, response_header_read_)) {
-        ThrowResponseHeaderError();
+        if (!co_await response_decoder_.ReadExact(
+                stream, response_header_sealed_, response_header_read_)) {
+            fail();
+        }
+        const auto payload_key = ResponseHeaderPayloadKey(keys_.response.key, keys_.response.iv);
+        const size_t header_len = response_header_sealed_.size() - 16;
+        size_t opened = 0;
+        if (!AES128GCMDecryptTo(payload_key.key.data(), payload_key.nonce.data(),
+                                payload_key.nonce.size(),
+                                response_header_sealed_.data(), response_header_sealed_.size(),
+                                nullptr, 0,
+                                response_header_sealed_.data(), header_len, opened) ||
+            opened != header_len ||
+            response_header_sealed_[0] != keys_.response_header) {
+            fail();
+        }
+        response_header_received_ = true;
+        reset_header_state();
+    } catch (const IoSystemError& error) {
+        if (error.code() != io_error::operation_aborted) {
+            reset_header_state();
+        }
+        throw;
+    } catch (...) {
+        reset_header_state();
+        throw;
     }
-    const auto payload_key = ResponseHeaderPayloadKey(keys_.response.key, keys_.response.iv);
-    const size_t header_len = response_header_sealed_.size() - 16;
-    size_t opened = 0;
-    if (!AES128GCMDecryptTo(payload_key.key.data(), payload_key.nonce.data(),
-                            payload_key.nonce.size(),
-                            response_header_sealed_.data(), response_header_sealed_.size(),
-                            nullptr, 0,
-                            response_header_sealed_.data(), header_len, opened) ||
-        opened != header_len ||
-        response_header_sealed_[0] != keys_.response_header) {
-        ThrowResponseHeaderError();
-    }
-    response_header_received_ = true;
-    memory::ByteVector{}.swap(response_header_sealed_);
 }
 
 net::awaitable<buf::MultiBuffer> ClientSession::DecodeResponse(AsyncStream& stream) {

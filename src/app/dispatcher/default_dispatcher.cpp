@@ -59,7 +59,7 @@ void ApplySniffOverride(
         ? result.port
         : ctx.outbound.original_target.port;
     TargetAddress sniffed(sniff_domain, final_port);
-    if (!sniffed.IsValid()) {
+    if (!sniffed.IsValid() || !sniffed.IsDomain()) {
         return;
     }
     ctx.outbound.route_target = sniffed;
@@ -87,8 +87,8 @@ std::chrono::seconds ResolveRelayIdleTimeout(
 
 net::awaitable<std::vector<net::ip::address>> ResolveRoutingAddresses(
     app::dns::DNS& dns_service,
-    session::Context& ctx) {
-    const auto& target = ctx.outbound.target;
+    session::Context& ctx,
+    const TargetAddress& target) {
     auto dns_result = co_await dns_service.Resolve(target.host);
     // DNS may return a failed result after cancellation. Do not publish that
     // result into the request or continue to route/outbound lookup.
@@ -167,8 +167,10 @@ net::awaitable<RelayResult> DefaultDispatcher::Dispatch(
         try { LOG_CONN_WARN(ctx, "failed to process outbound traffic > out of memory"); }
         catch (...) {} // Logging must not escape the allocation-failure boundary.
     } catch (const IoSystemError& e) {
-        stats.OnError();
-        result = MakeRelayError(MapAsioError(e.code()));
+        if (e.code() != net::error::operation_aborted || result.error == ErrorCode::OK) {
+            stats.OnError();
+            result = MakeRelayError(MapAsioError(e.code()));
+        }
         if (e.code() != net::error::operation_aborted && e.code() != net::error::eof)
             LOG_CONN_WARN(ctx, "failed to process outbound traffic > {}", e.what());
     } catch (const std::exception& e) {
@@ -251,6 +253,7 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
                    ctx.outbound.original_target, ctx.inbound.user_email);
 
     buf::MultiBufferBatch outbound_first_payload;
+    const auto sniff_cancellation = co_await net::this_coro::cancellation_state;
     if (policy.sniffing.enabled && !policy.sniffing.metadata_only) {
         using net::experimental::awaitable_operators::operator||;
         const bool datagram = ctx.content.network == Network::UDP;
@@ -288,36 +291,50 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
             return sniffer.Sniff(sniff_data, ctx.content.network);
         };
 
+        bool read_timed_out = false;
+        auto consume_inbound_timeout = [&]() noexcept {
+            if (!inbound_control) return false;
+            const bool read_to = inbound_control->ConsumeReadTimeout();
+            const bool idle_to = inbound_control->ConsumeIdleTimeout();
+            return read_to || idle_to;
+        };
         try {
-            if (inbound_reader) {
-                auto cache_more = [&]() -> net::awaitable<bool> {
-                    auto payload = co_await inbound_reader->ReadMultiBuffer();
-                    if (payload.empty()) {
+            auto cache_more = [&]() -> net::awaitable<bool> {
+                buf::MultiBuffer payload;
+                try {
+                    payload = co_await inbound_reader->ReadMultiBuffer();
+                } catch (const IoSystemError& e) {
+                    if (e.code() == net::error::eof && cached_bytes > 0) {
                         co_return false;
                     }
-                    cached_bytes += payload.byte_size();
-                    ++cached_datagrams;
-                    if (datagram) {
-                        sniff_payload = std::move(payload);
-                    } else {
-                        payload.MoveTo(sniff_payload);
-                    }
-                    co_return true;
-                };
-                if (!first_packet.empty()) {
-                    sniff_payload = first_packet.MoveToMultiBuffer();
-                    cached_bytes = sniff_payload.byte_size();
-                    cached_datagrams = 1;
-                } else {
-                    if (inbound_control) {
-                        inbound_control->SetReadTimeout(timeouts.ReadTimeout());
-                    }
-                    (void)co_await cache_more();
+                    throw;
                 }
+                if (payload.empty()) {
+                    if (consume_inbound_timeout()) {
+                        read_timed_out = true;
+                        throw IoSystemError(net::error::timed_out);
+                    }
+                    co_return false;
+                }
+                cached_bytes += payload.byte_size();
+                ++cached_datagrams;
+                if (datagram) {
+                    sniff_payload = std::move(payload);
+                } else {
+                    payload.MoveTo(sniff_payload);
+                }
+                co_return true;
+            };
+            const auto sniff_started = std::chrono::steady_clock::now();
+            if (!first_packet.empty()) {
+                sniff_payload = first_packet.MoveToMultiBuffer();
+                cached_bytes = sniff_payload.byte_size();
+                cached_datagrams = 1;
+            }
 
-                const auto sniff_started = std::chrono::steady_clock::now();
-                int no_clue_attempts = 0;
-                for (;;) {
+            int no_clue_attempts = 0;
+            for (;;) {
+                if (cached_bytes > 0) {
                     const auto sniffed = sniff_cached();
                     if (datagram) {
                         // Keep each original read result intact. Only decrypted
@@ -344,60 +361,45 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
                         (datagram && cached_datagrams >= kSniffMaxDatagrams)) {
                         break;
                     }
-                    const auto remaining = kSniffWindow -
-                        std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::steady_clock::now() - sniff_started);
-                    if (remaining <= std::chrono::milliseconds::zero()) {
-                        break;
+                }
+                const auto remaining = kSniffWindow -
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - sniff_started);
+                if (remaining <= std::chrono::milliseconds::zero()) {
+                    break;
+                }
+                struct ReadResult {
+                    bool received = false;
+                    std::exception_ptr error;
+                } read;
+                auto read_more = [&]() -> net::awaitable<void> {
+                    try {
+                        read.received = co_await cache_more();
+                    } catch (...) {
+                        read.error = std::current_exception();
                     }
-                    struct ReadResult {
-                        bool received = false;
-                        std::exception_ptr error;
-                    };
-                    auto read_more = [&]() -> net::awaitable<ReadResult> {
-                        try {
-                            co_return ReadResult{co_await cache_more(), {}};
-                        } catch (...) {
-                            co_return ReadResult{false, std::current_exception()};
+                };
+                AsyncDelay delay(io_context);
+                auto next = co_await (read_more() || delay.WaitFor(remaining));
+                if (sniff_cancellation.cancelled() != net::cancellation_type::none) {
+                    throw IoSystemError(net::error::operation_aborted);
+                }
+                if (read.error) {
+                    if (next.index() == 0) std::rethrow_exception(read.error);
+                    try {
+                        std::rethrow_exception(read.error);
+                    } catch (const IoSystemError& e) {
+                        if (consume_inbound_timeout()) {
+                            read_timed_out = true;
+                            throw;
                         }
-                    };
-                    AsyncDelay delay(io_context);
-                    auto next = co_await (read_more() || delay.WaitFor(remaining));
-                    const auto cancellation_state =
-                        co_await net::this_coro::cancellation_state;
-                    if (cancellation_state.cancelled() != net::cancellation_type::none) {
-                        throw IoSystemError(net::error::operation_aborted);
+                        if (e.code() != net::error::operation_aborted) throw;
                     }
-                    if (next.index() != 0) break;
-                    const auto& read = std::get<0>(next);
-                    if (read.error) std::rethrow_exception(read.error);
-                    if (!read.received) break;
                 }
-                if (!sniff_payload.empty()) {
-                    outbound_first_payload.Push(std::move(sniff_payload));
-                }
-            } else if (!first_packet.empty()) {
-                const auto sniff_data = first_packet.IsContiguous()
-                    ? first_packet.span()
-                    : std::span<const uint8_t>{};
-                memory::ByteVector leftover;
-                std::span<const uint8_t> view = sniff_data;
-                if (view.empty()) {
-                    const size_t want =
-                        std::min(first_packet.size(), sniff_byte_limit);
-                    leftover.resize(want);
-                    const size_t got = first_packet.CopyPrefixTo(
-                        leftover.data(), leftover.size());
-                    if (got > 0) {
-                        view = std::span<const uint8_t>(leftover.data(), got);
-                    }
-                } else if (view.size() > sniff_byte_limit) {
-                    view = view.first(sniff_byte_limit);
-                }
-                if (!view.empty()) {
-                    ApplySniffOverride(
-                        ctx, policy.sniffing, sniffer.Sniff(view, ctx.content.network));
-                }
+                if (!read.received) break;
+            }
+            if (!sniff_payload.empty()) {
+                outbound_first_payload.Push(std::move(sniff_payload));
             }
         } catch (const std::bad_alloc&) {
             throw;
@@ -406,10 +408,18 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
             result = MakeRelayError(e.code());
             co_return;
         } catch (const IoSystemError& e) {
+            if (read_timed_out || consume_inbound_timeout()) {
+                stats.OnError();
+                result = MakeRelayError(ErrorCode::TIMEOUT);
+                co_return;
+            }
+            if (e.code() == net::error::operation_aborted &&
+                (cancellation_reason != ErrorCode::OK ||
+                 sniff_cancellation.cancelled() != net::cancellation_type::none)) {
+                throw;
+            }
             stats.OnError();
-            result = MakeRelayError(inbound_control && inbound_control->ConsumeReadTimeout()
-                ? ErrorCode::TIMEOUT
-                : MapAsioError(e.code()));
+            result = MakeRelayError(MapAsioError(e.code()));
             co_return;
         } catch (...) {
             stats.OnError();
@@ -419,7 +429,6 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
         sniff_payload.clear();
         memory::ByteVector{}.swap(sniff_scratch);
     }
-    const auto sniff_cancellation = co_await net::this_coro::cancellation_state;
     if (sniff_cancellation.cancelled() != net::cancellation_type::none ||
         cancellation_reason != ErrorCode::OK) {
         throw IoSystemError(net::error::operation_aborted);
@@ -451,7 +460,7 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
     // 通用路径设置入站 idle/write timeout 并调用 outbound.Process。
 
     std::optional<tcp::endpoint> inbound_local_addr =
-        inbound_endpoint ? inbound_endpoint->LocalEndpoint() : std::nullopt;
+        inbound_control ? inbound_control->LocalEndpoint() : std::nullopt;
     if (!inbound_local_addr && ctx.inbound.local_endpoint) {
         inbound_local_addr = ctx.inbound.local_endpoint;
     }
@@ -466,10 +475,10 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
     }
     const auto relay_write_timeout =
         std::min(timeouts.WriteTimeout(), relay_idle_timeout);
-    if (inbound_endpoint) {
-        inbound_endpoint->SetIdleTimeout(relay_idle_timeout);
-        inbound_endpoint->SetReadTimeout(std::chrono::seconds(0));
-        inbound_endpoint->SetWriteTimeout(relay_write_timeout);
+    if (inbound_control) {
+        inbound_control->SetIdleTimeout(relay_idle_timeout);
+        inbound_control->SetReadTimeout(std::chrono::seconds(0));
+        inbound_control->SetWriteTimeout(relay_write_timeout);
     }
 
     RelayConfig relay_cfg;
@@ -576,9 +585,12 @@ detail::OutboundSelection DefaultDispatcher::SelectRoute(
 net::awaitable<DefaultDispatcher::RouteResult> DefaultDispatcher::RouteAsync(
     session::Context& ctx,
     const routing::DispatchPolicy& policy) {
+    TargetAddress& route_target = ctx.outbound.route_target.IsValid()
+        ? ctx.outbound.route_target
+        : ctx.outbound.target;
     if (!detail::RequiresRouting(policy.outbound) ||
-        !ctx.outbound.target.IsDomain() ||
-        ctx.outbound.target.resolved_addr) {
+        !route_target.IsDomain() ||
+        route_target.resolved_addr) {
         co_return FinishRoute(ctx, SelectRoute(ctx, policy));
     }
 
@@ -587,10 +599,22 @@ net::awaitable<DefaultDispatcher::RouteResult> DefaultDispatcher::RouteAsync(
         co_return FinishRoute(ctx, SelectRoute(ctx, policy));
     }
 
+    const bool sync_dial_target =
+        &route_target == &ctx.outbound.target ||
+        (ctx.outbound.target.IsDomain() &&
+         domain::DnsHostnamesEqual(ctx.outbound.target.host, route_target.host));
+
+    auto set_resolved_address = [&](const net::ip::address& addr) {
+        route_target.resolved_addr = addr;
+        if (sync_dial_target) {
+            ctx.outbound.target.resolved_addr = addr;
+        }
+    };
+
     auto select_with_addresses =
         [&](const std::vector<net::ip::address>& addresses) -> detail::OutboundSelection {
             auto select_address = [&](const net::ip::address& addr) {
-                ctx.outbound.target.resolved_addr = addr;
+                set_resolved_address(addr);
                 return SelectRoute(ctx, policy);
             };
 
@@ -606,7 +630,7 @@ net::awaitable<DefaultDispatcher::RouteResult> DefaultDispatcher::RouteAsync(
                     return selection;
                 }
             }
-            ctx.outbound.target.resolved_addr = addresses.front();
+            set_resolved_address(addresses.front());
             return last;
         };
 
@@ -618,7 +642,7 @@ net::awaitable<DefaultDispatcher::RouteResult> DefaultDispatcher::RouteAsync(
         }
     }
 
-    auto addresses = co_await ResolveRoutingAddresses(dns_service_, ctx);
+    auto addresses = co_await ResolveRoutingAddresses(dns_service_, ctx, route_target);
     if (!addresses.empty()) {
         co_return FinishRoute(ctx, select_with_addresses(addresses));
     }

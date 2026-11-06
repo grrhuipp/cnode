@@ -1,6 +1,7 @@
 #include "autosign_cert.hpp"
 
 #include <openssl/ec.h>
+#include <openssl/err.h>
 #include <openssl/x509v3.h>
 
 #include <limits>
@@ -40,8 +41,12 @@ bool PushGeneralName(GENERAL_NAMES* names, int type, ASN1_STRING* value) {
 }
 
 bool PushDnsName(GENERAL_NAMES* names, std::string_view value) {
-    if (value.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    if (value.empty() ||
+        value.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
         return false;
+    }
+    for (const unsigned char ch : value) {
+        if (ch <= 0x20 || ch > 0x7e) return false;
     }
     ASN1_IA5STRING* dns_name = ASN1_IA5STRING_new();
     if (!dns_name ||
@@ -89,14 +94,17 @@ std::unique_ptr<AutoSignCertificate> AutoSignCertificate::Create(std::string_vie
     // DNS identities belong in SAN; a descriptive CN covers longer names.
     if (identity.empty() || identity.find('\0') != std::string_view::npos) return {};
     if (identity.ends_with('.')) identity.remove_suffix(1);
-    if (identity.empty()) return {};
+    if (identity.empty() || identity.ends_with('.')) return {};
     const std::string name_text(identity);
     const std::string_view cn = identity.size() <= 64
         ? identity : std::string_view("acppnode self-signed certificate");
     auto material = std::unique_ptr<AutoSignCertificate>(new AutoSignCertificate);
     material->key_ = GenerateEcP256Key();
     material->certificate_ = X509_new();
-    if (!material->key_ || !material->certificate_) return {};
+    if (!material->key_ || !material->certificate_) {
+        ERR_clear_error();
+        return {};
+    }
     X509* x509 = material->certificate_;
     X509_NAME* name = X509_get_subject_name(x509);
     // These credentials are regenerated on configuration reload/restart,
@@ -115,6 +123,7 @@ std::unique_ptr<AutoSignCertificate> AutoSignCertificate::Create(std::string_vie
         X509_set_issuer_name(x509, name) != 1 ||
         !AddSubjectAlternativeNames(x509, name_text) ||
         X509_sign(x509, material->key_, EVP_sha256()) <= 0) {
+        ERR_clear_error();
         return {};
     }
     return material;

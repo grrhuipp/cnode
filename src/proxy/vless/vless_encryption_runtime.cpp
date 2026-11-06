@@ -67,14 +67,14 @@ OpenEncryptedClientPfsPublic(
     return client_public;
 }
 
-net::awaitable<bool> ReadAndOpenPadding(VlessBufferedReader& reader,
+net::awaitable<tl::expected<void, VlessEncryptionHandshakeFailure>> ReadAndOpenPadding(VlessBufferedReader& reader,
                                         VlessEncryptionAead& aead) {
     std::array<uint8_t, kVlessEncryptionEncryptedLengthSize>
         encrypted_length{};
     if (!co_await reader.ReadExact(
             encrypted_length.data(),
             encrypted_length.size())) {
-        co_return false;
+        co_return tl::unexpected(VlessEncryptionHandshakeFailure::Truncated);
     }
 
     // The length is authenticated and capped below 64 KiB before allocation.
@@ -85,17 +85,20 @@ net::awaitable<bool> ReadAndOpenPadding(VlessBufferedReader& reader,
         *encrypted_body_length >
             kVlessEncryptionMaxPaddingLength -
                 kVlessEncryptionEncryptedLengthSize) {
-        co_return false;
+        co_return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
     }
 
     memory::ByteVector padding(*encrypted_body_length);
     if (!co_await reader.ReadExact(padding.data(), padding.size())) {
-        co_return false;
+        co_return tl::unexpected(VlessEncryptionHandshakeFailure::Truncated);
     }
     const size_t plain_size = padding.size() - kVlessEncryptionTagSize;
     const auto opened = aead.Open(
         padding, {}, std::span<uint8_t>(padding).first(plain_size));
-    co_return opened.has_value() && *opened == plain_size;
+    if (!opened || *opened != plain_size) {
+        co_return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
+    }
+    co_return tl::expected<void, VlessEncryptionHandshakeFailure>{};
 }
 
 [[nodiscard]] std::optional<VlessEncryptionHeaderXor> MakeHeaderXor(
@@ -119,7 +122,7 @@ net::awaitable<bool> ReadAndOpenPadding(VlessBufferedReader& reader,
             std::holds_alternative<VlessEncryptionDeferredRead>(runtime.read_keys));
 }
 
-[[nodiscard]] std::optional<VlessEncryptionRuntime> BuildClientRuntime(
+[[nodiscard]] VlessEncryptionHandshakeResult BuildClientRuntime(
     const VlessEncryptionConfig& config,
     const VlessEncryptionClientPfsHello& client_pfs,
     VlessEncryptionClientPfsOpenResult server_open,
@@ -130,7 +133,7 @@ net::awaitable<bool> ReadAndOpenPadding(VlessBufferedReader& reader,
         server_open.united_key.bytes,
         cipher);
     if (!write_aead) {
-        return std::nullopt;
+        return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
     }
 
     VlessEncryptionRuntime runtime;
@@ -141,12 +144,12 @@ net::awaitable<bool> ReadAndOpenPadding(VlessBufferedReader& reader,
     runtime.read_xor = MakeHeaderXor(config, runtime.united_key,
                                      server_open.ticket);
     if (!HeaderXorComplete(config, runtime)) {
-        return std::nullopt;
+        return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
     }
     return runtime;
 }
 
-[[nodiscard]] std::optional<VlessEncryptionRuntime> BuildServerRuntime(
+[[nodiscard]] VlessEncryptionHandshakeResult BuildServerRuntime(
     const VlessEncryptionConfig& config,
     std::span<const uint8_t, kVlessEncryptionClientPfsPublicSize>
         client_public_key,
@@ -158,7 +161,7 @@ net::awaitable<bool> ReadAndOpenPadding(VlessBufferedReader& reader,
         response.united_key.bytes,
         cipher);
     if (!read_aead) {
-        return std::nullopt;
+        return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
     }
 
     VlessEncryptionRuntime runtime;
@@ -174,22 +177,23 @@ net::awaitable<bool> ReadAndOpenPadding(VlessBufferedReader& reader,
             std::chrono::steady_clock::now()};
     }
     if (!HeaderXorComplete(config, runtime)) {
-        return std::nullopt;
+        return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
     }
     return runtime;
 }
 
-[[nodiscard]] std::optional<VlessEncryptionRuntime> BuildClientZeroRttRuntime(
+[[nodiscard]] VlessEncryptionHandshakeResult BuildClientZeroRttRuntime(
     const VlessEncryptionConfig& config,
     const VlessEncryptionClientZeroRttRequest& request,
     std::span<const uint8_t, kVlessEncryptionIvSize> client_iv,
-    VlessEncryptionAeadCipher cipher) noexcept {
+    VlessEncryptionAeadCipher cipher,
+    VlessEncryptionClientTicketCache* ticket_cache) noexcept {
     auto write_aead = VlessEncryptionAead::Create(
         request.EncryptedTicket(),
         request.united_key.bytes,
         cipher);
     if (!write_aead) {
-        return std::nullopt;
+        return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
     }
 
     VlessEncryptionRuntime runtime;
@@ -197,16 +201,17 @@ net::awaitable<bool> ReadAndOpenPadding(VlessBufferedReader& reader,
     runtime.read_keys = VlessEncryptionDeferredRead{
         .cipher = cipher,
         .header_xor = config.mode == VlessEncryptionMode::Random,
+        .ticket_cache = ticket_cache,
     };
     runtime.write_aead = std::move(*write_aead);
     runtime.write_xor = MakeHeaderXor(config, runtime.united_key, client_iv);
     if (!HeaderXorComplete(config, runtime)) {
-        return std::nullopt;
+        return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
     }
     return runtime;
 }
 
-[[nodiscard]] std::optional<VlessEncryptionRuntime> BuildServerZeroRttRuntime(
+[[nodiscard]] VlessEncryptionHandshakeResult BuildServerZeroRttRuntime(
     const VlessEncryptionConfig& config,
     const VlessEncryptionServerZeroRttAccept& accept,
     std::span<const uint8_t, kVlessEncryptionIvSize> client_iv,
@@ -222,7 +227,7 @@ net::awaitable<bool> ReadAndOpenPadding(VlessBufferedReader& reader,
         accept.united_key.bytes,
         cipher);
     if (!read_aead || !write_aead) {
-        return std::nullopt;
+        return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
     }
 
     VlessEncryptionRuntime runtime;
@@ -233,7 +238,7 @@ net::awaitable<bool> ReadAndOpenPadding(VlessBufferedReader& reader,
     runtime.write_xor = MakeHeaderXor(config, runtime.united_key,
                                       accept.server_random);
     if (!HeaderXorComplete(config, runtime)) {
-        return std::nullopt;
+        return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
     }
     return runtime;
 }
@@ -266,12 +271,6 @@ void VlessEncryptionClientTicketCache::Store(
     pfs_key = open.pfs_key;
     ticket = open.ticket;
     expires_at = now + std::chrono::seconds(open.ticket_seconds);
-}
-
-void VlessEncryptionClientTicketCache::Clear() noexcept {
-    pfs_key = {};
-    ticket = {};
-    expires_at = {};
 }
 
 VlessEncryptionServerTicketStore::VlessEncryptionServerTicketStore()
@@ -324,7 +323,8 @@ VlessEncryptionServerTicketStore::Lookup(
     std::copy(ticket.begin(), ticket.end(), ticket_array.begin());
     auto it = sessions_.find(ticket_array);
     if (it == sessions_.end() || it->second.expires_at <= now ||
-        !it->second.identity) {
+        !it->second.identity ||
+        it->second.seen_nfs_keys.size() >= kMaxSeenNfsKeysPerSession) {
         return std::nullopt;
     }
 
@@ -385,7 +385,7 @@ void VlessEncryptionServerTicketStore::Store(
     order_.emplace_back(ticket_array, expires_at);
 }
 
-net::awaitable<std::optional<VlessEncryptionRuntime>>
+net::awaitable<VlessEncryptionHandshakeResult>
 RunVlessEncryptionClientHandshake(
     VlessBufferedReader& raw_reader,
     transport::MultiBufferWriter& raw_writer,
@@ -393,13 +393,13 @@ RunVlessEncryptionClientHandshake(
     VlessEncryptionClientTicketCache* ticket_cache) {
     auto nfs = BuildVlessEncryptionClientNfsHello(config);
     if (!nfs) {
-        co_return std::nullopt;
+        co_return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
     }
 
     const auto cipher = kPreferredCipher;
     auto nfs_aead = CreateNfsAead(nfs->iv, nfs->nfs_key, cipher);
     if (!nfs_aead) {
-        co_return std::nullopt;
+        co_return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
     }
 
     const auto now = std::chrono::steady_clock::now();
@@ -411,20 +411,30 @@ RunVlessEncryptionClientHandshake(
             ticket_cache->ticket,
             cipher);
         if (zero) {
-            co_await WriteVlessBytes(raw_writer, nfs->bytes);
-            co_await WriteVlessBytes(raw_writer, zero->bytes);
-            co_return BuildClientZeroRttRuntime(config, *zero, nfs->iv, cipher);
+            try {
+                co_await WriteVlessBytes(raw_writer, nfs->bytes);
+                co_await WriteVlessBytes(raw_writer, zero->bytes);
+            } catch (...) {
+                ticket_cache->Clear();
+                throw;
+            }
+            auto runtime = BuildClientZeroRttRuntime(
+                config, *zero, nfs->iv, cipher, ticket_cache);
+            if (!runtime) {
+                ticket_cache->Clear();
+            }
+            co_return runtime;
         }
         ticket_cache->Clear();
     }
 
     auto pfs = BuildVlessEncryptionClientPfsHello(*nfs_aead);
     if (!pfs) {
-        co_return std::nullopt;
+        co_return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
     }
     auto padding = BuildVlessEncryptionPadding(config, *nfs_aead);
     if (!padding) {
-        co_return std::nullopt;
+        co_return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
     }
 
     co_await WriteVlessBytes(raw_writer, nfs->bytes);
@@ -436,14 +446,14 @@ RunVlessEncryptionClientHandshake(
     if (!co_await raw_reader.ReadExact(
             encrypted_server_public.data(),
             encrypted_server_public.size())) {
-        co_return std::nullopt;
+        co_return tl::unexpected(VlessEncryptionHandshakeFailure::Truncated);
     }
     std::array<uint8_t, kVlessEncryptionEncryptedTicketSize>
         encrypted_ticket{};
     if (!co_await raw_reader.ReadExact(
             encrypted_ticket.data(),
             encrypted_ticket.size())) {
-        co_return std::nullopt;
+        co_return tl::unexpected(VlessEncryptionHandshakeFailure::Truncated);
     }
 
     auto server_open = OpenVlessEncryptionServerPfsResponse(
@@ -454,11 +464,12 @@ RunVlessEncryptionClientHandshake(
         encrypted_ticket,
         cipher);
     if (!server_open) {
-        co_return std::nullopt;
+        co_return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
     }
 
-    if (!co_await ReadAndOpenPadding(raw_reader, server_open->read_aead)) {
-        co_return std::nullopt;
+    if (auto padding_result = co_await ReadAndOpenPadding(raw_reader, server_open->read_aead);
+        !padding_result) {
+        co_return tl::unexpected(padding_result.error());
     }
 
     if (ticket_cache) {
@@ -473,28 +484,31 @@ RunVlessEncryptionClientHandshake(
         nfs->iv);
 }
 
-net::awaitable<std::optional<VlessEncryptionRuntime>>
+net::awaitable<VlessEncryptionHandshakeResult>
 RunVlessEncryptionServerHandshake(
     VlessBufferedReader& raw_reader,
     transport::MultiBufferWriter& raw_writer,
     std::shared_ptr<const VlessEncryptionConfig> namespace_config,
     std::string inbound_tag) {
-    if (!namespace_config) co_return std::nullopt;
+    if (!namespace_config) co_return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
     const auto& config = *namespace_config;
     const auto relays_len = VlessEncryptionRelaysLength(config);
     if (!relays_len) {
-        co_return std::nullopt;
+        co_return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
     }
 
     memory::ByteVector iv_and_relays(kVlessEncryptionIvSize + *relays_len);
+    size_t progress = 0;
     if (!co_await raw_reader.ReadExact(
             iv_and_relays.data(),
-            iv_and_relays.size())) {
-        co_return std::nullopt;
+            iv_and_relays.size(), true, &progress)) {
+        co_return tl::unexpected(progress == 0
+            ? VlessEncryptionHandshakeFailure::Closed
+            : VlessEncryptionHandshakeFailure::Truncated);
     }
     auto nfs = OpenVlessEncryptionClientNfsHello(config, iv_and_relays);
     if (!nfs) {
-        co_return std::nullopt;
+        co_return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
     }
 
     std::array<uint8_t, kVlessEncryptionEncryptedLengthSize>
@@ -502,7 +516,7 @@ RunVlessEncryptionServerHandshake(
     if (!co_await raw_reader.ReadExact(
             encrypted_length.data(),
             encrypted_length.size())) {
-        co_return std::nullopt;
+        co_return tl::unexpected(VlessEncryptionHandshakeFailure::Truncated);
     }
 
     auto cipher = kPreferredCipher;
@@ -520,7 +534,7 @@ RunVlessEncryptionServerHandshake(
     if (!nfs_aead || !client_pfs_length ||
         (*client_pfs_length != kVlessEncryptionEncryptedClientPfsPublicSize &&
          *client_pfs_length != kVlessEncryptionEncryptedTicketSize)) {
-        co_return std::nullopt;
+        co_return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
     }
 
     if (*client_pfs_length == kVlessEncryptionEncryptedTicketSize) {
@@ -529,26 +543,26 @@ RunVlessEncryptionServerHandshake(
         if (!co_await raw_reader.ReadExact(
                 encrypted_ticket.data(),
                 encrypted_ticket.size())) {
-            co_return std::nullopt;
+            co_return tl::unexpected(VlessEncryptionHandshakeFailure::Truncated);
         }
         auto ticket = OpenEncryptedTicketAfterLength(
             *nfs_aead,
             encrypted_ticket);
         if (!ticket ||
             (config.seconds_from == 0 && config.seconds_to == 0)) {
-            co_return std::nullopt;
+            co_return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
         }
 
         auto pfs_key = co_await LookupVlessTicket(
             namespace_config, inbound_tag, *ticket, nfs->nfs_key);
         if (!pfs_key) {
-            co_return std::nullopt;
+            co_return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
         }
         const auto identity = pfs_key->identity;
         auto accept = AcceptVlessEncryptionClientZeroRtt(nfs->nfs_key, pfs_key->pfs_key);
         pfs_key.reset();  // The returned PFS copy is cleansed before any socket write.
         if (!accept) {
-            co_return std::nullopt;
+            co_return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
         }
         auto runtime = BuildServerZeroRttRuntime(
             config,
@@ -557,7 +571,7 @@ RunVlessEncryptionServerHandshake(
             encrypted_ticket,
             cipher);
         if (!runtime) {
-            co_return std::nullopt;
+            co_return tl::unexpected(runtime.error());
         }
         runtime->resumed_identity = identity;
         co_await WriteVlessBytes(raw_writer, accept->server_random);
@@ -569,14 +583,14 @@ RunVlessEncryptionServerHandshake(
     if (!co_await raw_reader.ReadExact(
             encrypted_client_public.data(),
             encrypted_client_public.size())) {
-        co_return std::nullopt;
+        co_return tl::unexpected(VlessEncryptionHandshakeFailure::Truncated);
     }
 
     auto client_public = OpenEncryptedClientPfsPublic(
         *nfs_aead,
         encrypted_client_public);
     if (!client_public) {
-        co_return std::nullopt;
+        co_return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
     }
 
     auto response = BuildVlessEncryptionServerPfsResponse(
@@ -586,21 +600,22 @@ RunVlessEncryptionServerHandshake(
         *client_public,
         cipher);
     if (!response) {
-        co_return std::nullopt;
+        co_return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
     }
     auto padding = BuildVlessEncryptionPadding(
         config,
         response->write_aead);
     if (!padding) {
-        co_return std::nullopt;
+        co_return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
     }
 
     co_await WriteVlessBytes(raw_writer, response->encrypted_public_key);
     co_await WriteVlessBytes(raw_writer, response->encrypted_ticket);
     co_await WriteVlessBytes(raw_writer, *padding);
 
-    if (!co_await ReadAndOpenPadding(raw_reader, *nfs_aead)) {
-        co_return std::nullopt;
+    if (auto padding_result = co_await ReadAndOpenPadding(raw_reader, *nfs_aead);
+        !padding_result) {
+        co_return tl::unexpected(padding_result.error());
     }
 
 

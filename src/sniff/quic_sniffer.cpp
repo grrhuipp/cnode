@@ -148,7 +148,7 @@ constexpr size_t kMaxCrypto = 64 * 1024;
 constexpr size_t kMaxInputs = 64;
 
 // Explicit reservation prevents vector's geometric growth from exceeding the cap.
-void Grow(std::pmr::vector<uint8_t>& bytes, size_t size) {
+void Grow(memory::ByteVector& bytes, size_t size) {
     if (size > bytes.capacity()) {
         bytes.reserve(std::bit_ceil(std::max(size, size_t{256})));
     }
@@ -199,6 +199,10 @@ bool AesGcmDecrypt(std::span<const uint8_t, 16> key,
 SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
     auto fail = [&]() {
         stopped_ = true;
+        crypto_.clear();
+        crypto_.shrink_to_fit();
+        coverage_.clear();
+        coverage_.shrink_to_fit();
         return SniffResult{};
     };
     if (stopped_) return {};
@@ -215,12 +219,15 @@ SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
     memory::ByteVector decrypted;
     size_t offset = 0;
     bool decrypted_initial = false;
+    bool valid_long_packet = false;
+    uint32_t datagram_version = version_;
+    std::span<const uint8_t> datagram_dcid(dcid_.data(), dcid_size_);
     while (offset < data.size()) {
         const auto remaining = data.subspan(offset);
         // A coalesced short-header packet or datagram padding has no Initial
         // length to follow. Do not discard CRYPTO already authenticated here.
         if ((remaining[0] & 0xc0) != 0xc0) {
-            if (decrypted_initial) break;
+            if (decrypted_initial || valid_long_packet) break;
             return fail();
         }
         if (remaining.size() < 7) return fail();
@@ -231,7 +238,7 @@ SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
         const bool is_initial = packet_type == spec->type_initial;
         // Retry has no Length field and cannot contribute to this Initial.
         if (packet_type == (version == kV2.ver ? 0 : 3)) {
-            if (decrypted_initial) break;
+            if (decrypted_initial || valid_long_packet) break;
             return fail();
         }
 
@@ -259,10 +266,13 @@ SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
         // Protected packet numbers and tags require at least this much space
         // for a header-protection sample, even when the payload is opaque.
         if (packet_len < 20) return fail();
-        if (version_ != 0 &&
-            (version != version_ || dcid_len != dcid_size_ ||
-             !std::equal(dcid.begin(), dcid.end(), dcid_.begin()))) return fail();
+        if (datagram_version != 0 &&
+            (version != datagram_version || dcid.size() != datagram_dcid.size() ||
+             !std::equal(dcid.begin(), dcid.end(), datagram_dcid.begin()))) return fail();
+        datagram_version = version;
+        datagram_dcid = dcid;
         if (!is_initial) {
+            valid_long_packet = true;
             offset = next_offset;
             continue;
         }
@@ -350,6 +360,11 @@ SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
                         length > plaintext.size() - frame) return fail();
                     if (length == 0) break;
                     const size_t end = static_cast<size_t>(start + length);
+                    if (contiguous_ >= 4 &&
+                        end > 4 + ((static_cast<size_t>(crypto_[1]) << 16) |
+                                   (static_cast<size_t>(crypto_[2]) << 8) | crypto_[3])) {
+                        return fail();
+                    }
                     if (crypto_.size() < end) {
                         Grow(crypto_, end);
                         Grow(coverage_, (end + 7) / 8);
@@ -380,7 +395,8 @@ SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
             const size_t handshake_size =
                 (static_cast<size_t>(crypto_[1]) << 16) |
                 (static_cast<size_t>(crypto_[2]) << 8) | crypto_[3];
-            if (handshake_size > kMaxCrypto - 4) return fail();
+            if (handshake_size > kMaxCrypto - 4 ||
+                crypto_.size() > handshake_size + 4) return fail();
             if (contiguous_ >= handshake_size + 4) {
                 auto sni = ParseClientHelloServerName(
                     std::span<const uint8_t>(crypto_).first(handshake_size + 4));
@@ -390,6 +406,10 @@ SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
                 result.protocol = constants::protocol::kQuic;
                 result.domain.assign(*sni);
                 stopped_ = true;
+                crypto_.clear();
+                crypto_.shrink_to_fit();
+                coverage_.clear();
+                coverage_.shrink_to_fit();
                 return result;
             }
         }

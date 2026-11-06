@@ -43,6 +43,30 @@ int main() {
     ctx.outbound.target = acpp::TargetAddress("replacement.example", 443);
     if (!policy.Blocked(ctx)) return 8;
     detect_rule_policy.UpdateRule(tag, {});
+    // Verify route_only (route_target) and original_target cannot bypass block rules.
+    detect_rule_policy.UpdateRule(tag, {
+        acpp::rule::DetectRule{
+            .Pattern = std::regex("sniffed\\.blocked\\.example"),
+        },
+    });
+    ctx.outbound.target = acpp::TargetAddress("1.1.1.1", 443);
+    ctx.outbound.route_target = acpp::TargetAddress("sniffed.blocked.example", 443);
+    if (!policy.Blocked(ctx)) return 11;
+    ctx.outbound.route_target = acpp::TargetAddress("allowed.example", 443);
+    ctx.outbound.original_target = acpp::TargetAddress("sniffed.blocked.example", 443);
+    if (!policy.Blocked(ctx)) return 12;
+    ctx.outbound.original_target = {};
+    // A domain target whose resolved_addr matches an IP block rule must also be blocked.
+    detect_rule_policy.UpdateRule(tag, {
+        acpp::rule::DetectRule{
+            .Pattern = std::regex("192\\.0\\.2\\.99"),
+        },
+    });
+    ctx.outbound.target = acpp::TargetAddress("allowed.example", 443);
+    ctx.outbound.target.resolved_addr = acpp::net::ip::make_address("192.0.2.99");
+    if (!policy.Blocked(ctx)) return 13;
+    ctx.outbound.target.resolved_addr = std::nullopt;
+    detect_rule_policy.UpdateRule(tag, {});
     if (policy.Blocked(ctx)) return 10;
     return 0;
 }

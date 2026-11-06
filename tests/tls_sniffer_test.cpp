@@ -105,8 +105,10 @@ int main() {
 
     auto long_record = BuildClientHello();
     SetU16(long_record.bytes, 3, long_record.bytes.size() - 4);
-    if (!Require(!acpp::SniffTls(long_record.bytes).success,
-                 "a truncated TLS record must be rejected")) return 4;
+    const auto partial_record_res = acpp::SniffTls(long_record.bytes);
+    if (!Require(!partial_record_res.success && partial_record_res.need_more &&
+                     partial_record_res.protocol == "tls",
+                 "an incomplete TLS ClientHello record must request more bytes")) return 4;
 
     auto short_handshake = BuildClientHello();
     SetU24(short_handshake.bytes, 6, short_handshake.bytes.size() - 10);
@@ -134,5 +136,21 @@ int main() {
     const auto invalid_label_sni = BuildClientHello(false, "bad_name.example");
     if (!Require(!acpp::SniffTls(invalid_label_sni.bytes).success,
                  "TLS host_name must use DNS hostname labels")) return 10;
+
+    // A ClientHello split across two TLS Handshake records must be reassembled and sniffed.
+    const std::vector<uint8_t> handshake(valid.bytes.begin() + 5, valid.bytes.end());
+    const std::size_t split = 20;
+    std::vector<uint8_t> two_records;
+    two_records.push_back(0x16);
+    AppendU16(two_records, 0x0301);
+    AppendU16(two_records, split);
+    two_records.insert(two_records.end(), handshake.begin(), handshake.begin() + split);
+    two_records.push_back(0x16);
+    AppendU16(two_records, 0x0303);
+    AppendU16(two_records, handshake.size() - split);
+    two_records.insert(two_records.end(), handshake.begin() + split, handshake.end());
+    const auto multi_record_res = acpp::SniffTls(two_records);
+    if (!Require(multi_record_res.success && multi_record_res.domain == "example.com",
+                 "a ClientHello spanning two TLS records must be sniffed")) return 11;
     return 0;
 }

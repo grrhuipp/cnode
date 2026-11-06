@@ -100,10 +100,24 @@ def wait_for(predicate, child=None, timeout=12):
         time.sleep(0.03)
 
 
+_USED_PORTS: set[int] = set()
+
+
 def free_port():
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
+    held = []
+    try:
+        while True:
+            sock = socket.socket()
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+            if port not in _USED_PORTS:
+                _USED_PORTS.add(port)
+                sock.close()
+                return port
+            held.append(sock)
+    finally:
+        for sock in held:
+            sock.close()
 
 
 def echo(node_port, target_port, target="127.0.0.1"):

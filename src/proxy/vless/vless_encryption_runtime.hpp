@@ -10,6 +10,7 @@
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/asio_types.hpp"
 
+#include <tl/expected.hpp>
 #include <openssl/mem.h>
 #include <openssl/siphash.h>
 
@@ -43,6 +44,17 @@ struct VlessEncryptionRuntime {
     std::optional<std::array<uint8_t, 16>> resumed_identity;
 };
 
+enum class VlessEncryptionHandshakeFailure {
+    Closed,
+    Truncated,
+    Rejected,
+};
+
+// Transport failures (including cancellation) propagate as IoSystemError; only
+// a server receiving no handshake bytes can report a normal Closed result.
+using VlessEncryptionHandshakeResult =
+    tl::expected<VlessEncryptionRuntime, VlessEncryptionHandshakeFailure>;
+
 // Record layer installed over the raw connection after a completed handshake.
 // `plain_reader` borrows `reader` and both borrow the raw endpoints, so the
 // owner is address-stable and must outlive every borrowed raw endpoint use.
@@ -69,7 +81,11 @@ struct VlessEncryptionClientTicketCache : memory::ThreadAllocated {
     [[nodiscard]] bool Valid(std::chrono::steady_clock::time_point now) const noexcept;
     void Store(const VlessEncryptionClientPfsOpenResult& open,
                std::chrono::steady_clock::time_point now) noexcept;
-    void Clear() noexcept;
+    void Clear() noexcept {
+        pfs_key = {};
+        ticket = {};
+        expires_at = {};
+    }
 };
 
 // Executor-local 0-RTT ticket table. Tickets are server-chosen, but lookups and
@@ -103,6 +119,7 @@ private:
     // Upper bound of replay keys held across all sessions; reaching it evicts
     // the oldest sessions, the same policy as the session bound.
     static constexpr size_t kMaxSeenNfsKeys = 65536;
+    static constexpr size_t kMaxSeenNfsKeysPerSession = 256;
 
     using TicketArray = std::array<uint8_t, kVlessEncryptionTicketSize>;
     // Replay keys are BLAKE3 digests so no NFS secret outlives its handshake.
@@ -145,14 +162,14 @@ private:
     size_t seen_nfs_keys_ = 0;
 };
 
-[[nodiscard]] net::awaitable<std::optional<VlessEncryptionRuntime>>
+[[nodiscard]] net::awaitable<VlessEncryptionHandshakeResult>
 RunVlessEncryptionClientHandshake(
     VlessBufferedReader& raw_reader,
     transport::MultiBufferWriter& raw_writer,
     const VlessEncryptionConfig& config,
     VlessEncryptionClientTicketCache* ticket_cache = nullptr);
 
-[[nodiscard]] net::awaitable<std::optional<VlessEncryptionRuntime>>
+[[nodiscard]] net::awaitable<VlessEncryptionHandshakeResult>
 RunVlessEncryptionServerHandshake(
     VlessBufferedReader& raw_reader,
     transport::MultiBufferWriter& raw_writer,

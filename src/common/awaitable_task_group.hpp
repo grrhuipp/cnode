@@ -105,6 +105,7 @@ public:
                         self->Finish(child->Complete(std::move(error)));
                     }));
         } catch (...) {
+            child->Unsubscribe();
             child->Unlink();
             --remaining_;
             throw;
@@ -120,6 +121,7 @@ public:
         while (head_) {
             Child* child = head_;
             child->Unlink();
+            child->Unsubscribe();
             child->cancellation.emit(type);
         }
     }
@@ -151,6 +153,10 @@ private:
 
 template <typename Start>
 net::awaitable<void> RunOnExecutor(Start start) {
+    const auto cancellation = co_await net::this_coro::cancellation_state;
+    if (cancellation.cancelled() != net::cancellation_type::none) {
+        throw IoSystemError(net::error::operation_aborted);
+    }
     const auto executor = co_await net::this_coro::executor;
     auto token = net::use_awaitable;
     co_await net::async_initiate<decltype(token), void(std::exception_ptr)>(

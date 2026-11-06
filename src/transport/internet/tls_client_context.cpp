@@ -37,6 +37,10 @@ uint16_t ToOpenSslVersion(TlsVersion version) noexcept {
         pem.data(), static_cast<ossl_ssize_t>(pem.size())));
 }
 
+int RejectEncryptedPemPassword(char*, int, int, void*) noexcept {
+    return -1;
+}
+
 // PEM readers report the end of input as PEM_R_NO_START_LINE; anything else
 // is a malformed block. Clears the queue so no stale error reaches later
 // SSL_get_error calls on this thread.
@@ -51,16 +55,20 @@ uint16_t ToOpenSslVersion(TlsVersion version) noexcept {
 // reads every PEM_X509_INFO block (including TRUSTED CERTIFICATE and CRLs);
 // a bundle without any certificate or CRL is rejected.
 [[nodiscard]] bool ConfigureTlsTrustedCaPem(SSL_CTX* context, const std::string& pem) {
+    ERR_clear_error();
     auto reader = PemReader(pem);
     X509_STORE* store = SSL_CTX_get_cert_store(context);
-    if (!reader || !store) return false;
+    if (!reader || !store) {
+        ERR_clear_error();
+        return false;
+    }
     struct InfoStackFree {
         void operator()(STACK_OF(X509_INFO)* infos) const noexcept {
             sk_X509_INFO_pop_free(infos, X509_INFO_free);
         }
     };
     std::unique_ptr<STACK_OF(X509_INFO), InfoStackFree> infos(
-        PEM_X509_INFO_read_bio(reader.get(), nullptr, nullptr, nullptr));
+        PEM_X509_INFO_read_bio(reader.get(), nullptr, &RejectEncryptedPemPassword, nullptr));
     if (!infos) {
         ERR_clear_error();
         return false;
@@ -70,10 +78,18 @@ uint16_t ToOpenSslVersion(TlsVersion version) noexcept {
         const X509_INFO* info = sk_X509_INFO_value(infos.get(), i);
         if (info->x509) {
             if (X509_STORE_add_cert(store, info->x509) != 1) {
-                ERR_clear_error();
-                return false;
+                const uint32_t err = ERR_peek_last_error();
+                if (ERR_GET_LIB(err) == ERR_LIB_X509 &&
+                    ERR_GET_REASON(err) == X509_R_CERT_ALREADY_IN_HASH_TABLE) {
+                    ERR_clear_error();
+                    ++loaded;
+                } else {
+                    ERR_clear_error();
+                    return false;
+                }
+            } else {
+                ++loaded;
             }
-            ++loaded;
         }
         if (info->crl) {
             if (X509_STORE_add_crl(store, info->crl) != 1) {
@@ -90,17 +106,21 @@ uint16_t ToOpenSslVersion(TlsVersion version) noexcept {
 }  // namespace
 
 bool ConfigureTlsCertificatePem(SSL_CTX* context, const TlsPemMaterial& pem) {
+    ERR_clear_error();
     auto chain = PemReader(pem.certificate_chain);
-    if (!chain) return false;
+    if (!chain) {
+        ERR_clear_error();
+        return false;
+    }
     bssl::UniquePtr<X509> leaf(
-        PEM_read_bio_X509_AUX(chain.get(), nullptr, nullptr, nullptr));
+        PEM_read_bio_X509_AUX(chain.get(), nullptr, &RejectEncryptedPemPassword, nullptr));
     if (!leaf || SSL_CTX_use_certificate(context, leaf.get()) != 1) {
         ERR_clear_error();
         LOG_ERROR("TLS certificate file does not start with a valid PEM certificate");
         return false;
     }
     while (bssl::UniquePtr<X509> intermediate{
-               PEM_read_bio_X509(chain.get(), nullptr, nullptr, nullptr)}) {
+               PEM_read_bio_X509(chain.get(), nullptr, &RejectEncryptedPemPassword, nullptr)}) {
         if (SSL_CTX_add1_chain_cert(context, intermediate.get()) != 1) {
             ERR_clear_error();
             LOG_ERROR("failed to install TLS certificate chain");
@@ -114,7 +134,7 @@ bool ConfigureTlsCertificatePem(SSL_CTX* context, const TlsPemMaterial& pem) {
 
     auto key_reader = PemReader(pem.private_key);
     bssl::UniquePtr<EVP_PKEY> key(key_reader
-        ? PEM_read_bio_PrivateKey(key_reader.get(), nullptr, nullptr, nullptr)
+        ? PEM_read_bio_PrivateKey(key_reader.get(), nullptr, &RejectEncryptedPemPassword, nullptr)
         : nullptr);
     if (!key || SSL_CTX_use_PrivateKey(context, key.get()) != 1) {
         ERR_clear_error();
@@ -126,6 +146,7 @@ bool ConfigureTlsCertificatePem(SSL_CTX* context, const TlsPemMaterial& pem) {
         LOG_ERROR("TLS private key does not match certificate");
         return false;
     }
+    ERR_clear_error();
     return true;
 }
 
@@ -183,6 +204,7 @@ bool ConfigureTlsServerIdentity(
         return X509_VERIFY_PARAM_set1_ip(parameters, bytes.data(), bytes.size()) == 1;
     }
     if (!domain::IsValidDnsHostname(identity, domain::TrailingDotPolicy::Allow)) return false;
+    identity = domain::WithoutTrailingRootDot(identity);
     std::array<char, 256> identity_text{};
     if (identity.size() >= identity_text.size()) return false;
     std::memcpy(identity_text.data(), identity.data(), identity.size());

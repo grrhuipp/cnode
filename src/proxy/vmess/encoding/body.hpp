@@ -134,8 +134,7 @@ private:
     size_t chunk_len_ = 0;
     size_t padding_len_ = 0;
     bool header_decoded_ = false;
-    buf::BufferGuard read_pool_;
-    memory::ByteVector read_heap_;
+    buf::ContiguousWriteBuffer read_buffer_;
     bool eof_ = false;
 };
 

@@ -1,5 +1,6 @@
 #include "acppnode/transport/internet/ws_stream.hpp"
 #include "http1_handshake.hpp"
+#include "http_path_match.hpp"
 #include "acppnode/common/binary_text_codec.hpp"
 #include "acppnode/common/unsafe.hpp"
 #include "acppnode/common/buffer_util.hpp"
@@ -34,6 +35,7 @@ std::string ComputeWsAccept(std::string_view ws_key) {
 namespace {
 using transport::internet::EqualsAsciiCI;
 using transport::internet::TrimAscii;
+using transport::internet::detail::EffectiveHttpPath;
 
 class WriteGateWait final : private transport::CancellationSubscription {
 public:
@@ -66,11 +68,10 @@ private:
     bool cancelled_ = false;
 };
 
-void AddPayloadSize(size_t& total, size_t additional) {
-    // RFC 6455 §5.2: the most significant bit of a 64-bit length is zero.
-    constexpr uint64_t maximum = std::numeric_limits<uint64_t>::max() >> 1;
-    if (additional > maximum - total) throw std::length_error("WebSocket payload too large");
-    total += additional;
+void AddPayloadSize(size_t& total, size_t size) {
+    if (size > BaseWsStream::kMaxFrameSize - total)
+        throw IoSystemError(io_error::message_size, "WebSocket frame exceeds payload budget");
+    total += size;
 }
 
 }  // namespace
@@ -271,8 +272,15 @@ net::awaitable<bool> BaseWsStream::PrepareNextDataFrame() {
                     control_payload_.data(), control_used_);
                 if (frame_opcode_ == ws::Opcode::CLOSE) {
                     ValidateClose();
-                    co_await WriteControlFrame(ws::Opcode::CLOSE, payload);
+                    if (fragmented_)
+                        ProtocolFailure("WebSocket Close during fragmented message");
                     peer_closed_cleanly_ = true;
+                    try {
+                        co_await WriteControlFrame(ws::Opcode::CLOSE, payload);
+                    } catch (const IoSystemError& e) {
+                        if (e.code() == io_error::operation_aborted) throw;
+                        Close();
+                    }
                     co_return false;
                 }
                 if (frame_opcode_ == ws::Opcode::PING)
@@ -414,6 +422,10 @@ net::awaitable<size_t> BaseWsStream::AsyncWrite(net::const_buffer buffer) {
 }
 
 net::awaitable<void> BaseWsStream::WriteMultiBuffer(buf::MultiBuffer buffers) {
+    struct ClearOnExit {
+        buf::MultiBuffer& mb;
+        ~ClearOnExit() { mb.clear(); }
+    } clear_guard{buffers};
     CheckWritable();
     size_t size = 0;
     for (const auto* buffer : buffers) {
@@ -453,13 +465,13 @@ net::awaitable<void> BaseWsStream::WriteMultiBuffer(buf::MultiBuffer buffers) {
 net::awaitable<void> BaseWsStream::WriteControlFrame(
     ws::Opcode opcode, std::span<const uint8_t> payload) {
     const bool closing = opcode == ws::Opcode::CLOSE;
-    if (closing) close_requested_ = true;
     const auto state = co_await net::this_coro::cancellation_state;
     if (closed_ || state.cancelled() != net::cancellation_type::none)
         throw IoSystemError(io_error::operation_aborted);
     WriteGate::Lease lease = write_gate_.TryAcquire();
     if (!lease) lease = co_await AcquireWrite(state.slot());
     if (write_closed_ || (!closing && close_requested_)) co_return;
+    if (closing) close_requested_ = true;
     uint8_t mask[4]{};
     if (is_client_ && RAND_bytes(mask, sizeof(mask)) != 1)
         throw IoSystemError(io_error::fault, "WebSocket mask generation failed");
@@ -545,21 +557,27 @@ net::awaitable<WsHandshakeResult> WsClientStream::Handshake(
     }
     std::string ws_key = Base64Encode(raw_key, sizeof(raw_key));
 
-    const std::string_view req_path = path.empty() ? "/" : std::string_view(path);
-    auto is_host_header = [](std::string_view key) { return EqualsAsciiCI(key, "host"); };
+    const std::string_view req_path = EffectiveHttpPath(path);
+    if (headers) {
+        if (const std::string* configured_host =
+                transport::internet::FindHttpHeader(*headers, "Host")) {
+            const std::string_view trimmed_host = TrimAscii(*configured_host);
+            if (!trimmed_host.empty()) {
+                host = trimmed_host;
+            }
+        }
+    }
 
     size_t reserve_size = 256 + req_path.size() + host.size() + ws_key.size();
     if (headers) {
         for (const auto& [k, v] : *headers) {
-            if (!is_host_header(k)) {
+            if (!k.empty() && !transport::internet::IsReservedUpgradeHeader(k)) {
                 reserve_size += k.size() + v.size() + 4; // ": " + "\r\n"
             }
         }
     }
 
-    std::array<std::byte, 512> arena_buf{};
-    memory::request_memory arena(memory::ThreadMemoryPool(), arena_buf);
-    memory::ThreadLocalString request(arena.resource());
+    memory::ThreadLocalString request;
     request.reserve(reserve_size);
     request.append("GET ");
     request.append(req_path);
@@ -575,7 +593,7 @@ net::awaitable<WsHandshakeResult> WsClientStream::Handshake(
     request.append("Sec-WebSocket-Version: 13\r\n");
     if (headers) {
         for (const auto& [k, v] : *headers) {
-            if (is_host_header(k)) continue;
+            if (k.empty() || transport::internet::IsReservedUpgradeHeader(k)) continue;
             request.append(k);
             request.append(": ");
             request.append(v);
@@ -584,9 +602,12 @@ net::awaitable<WsHandshakeResult> WsClientStream::Handshake(
     }
     request.append("\r\n");
 
-    const net::const_buffer request_buffer(request.data(), request.size());
-    co_await inner_->WriteBuffers({&request_buffer, 1});
-
+    const bool write_ok = co_await transport::internet::WriteFullToStream(*inner_, request);
+    memory::ThreadLocalString{}.swap(request);
+    if (!write_ok) {
+        LOG_CONN_DEBUG(conn_id_, "WebSocket client failed to send upgrade request");
+        co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+    }
     auto head = co_await transport::internet::ReadHttp1MessageHead(*inner_);
     if (!head) {
         LOG_CONN_DEBUG(conn_id_, "WebSocket client failed to read upgrade response > {}", ErrorCodeToString(head.error()));
@@ -596,8 +617,7 @@ net::awaitable<WsHandshakeResult> WsClientStream::Handshake(
     const std::string_view response = head->Text();
     const std::string_view first_line = transport::internet::ExtractStartLine(response);
     if (!transport::internet::HasStatusCode(first_line, "101")) {
-        LOG_CONN_DEBUG(conn_id_, "WebSocket client upgrade rejected > {}",
-                       transport::internet::SanitizeForLog(first_line));
+        LOG_CONN_DEBUG(conn_id_, "WebSocket client upgrade rejected");
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
     // RFC 6455 4.1: both Upgrade and Connection are mandatory. Connection
@@ -627,7 +647,7 @@ net::awaitable<WsHandshakeResult> WsClientStream::Handshake(
 
     LOG_CONN_DEBUG(conn_id_, "WebSocket client handshake completed (host={} path={})",
                    transport::internet::PublicHttpTargetForLog(host),
-                   transport::internet::PublicHttpTargetForLog(path));
+                   transport::internet::PublicHttpTargetForLog(req_path));
     co_return WsHandshakeResult{};
 }
 

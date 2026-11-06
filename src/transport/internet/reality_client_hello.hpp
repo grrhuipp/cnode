@@ -35,9 +35,14 @@ public:
         if (header_size_ < header_.size()) {
             std::copy(bytes.begin(), bytes.end(), header_.begin() + header_size_);
             header_size_ += bytes.size();
+            if ((header_size_ >= 1 && header_[0] != 22) ||
+                (header_size_ >= 2 && header_[1] != 3)) {
+                status_ = Status::Invalid;
+                return;
+            }
             if (header_size_ != header_.size()) return;
             remaining_ = (size_t{header_[3]} << 8) | header_[4];
-            if (header_[0] != 22 || header_[1] != 3 || remaining_ == 0 || remaining_ > 16384) {
+            if (remaining_ == 0 || remaining_ > 16384) {
                 status_ = Status::Invalid;
             }
             return;
@@ -60,8 +65,11 @@ public:
             }
         }
         if (hello_size_) {
-            const size_t count = std::min(bytes.size(), hello_size_ - hello_.size());
-            hello_.insert(hello_.end(), bytes.begin(), bytes.begin() + count);
+            if (bytes.size() + remaining_ > hello_size_ - hello_.size()) {
+                status_ = Status::Invalid;
+                return;
+            }
+            hello_.insert(hello_.end(), bytes.begin(), bytes.end());
         }
         if (remaining_ == 0) {
             if (hello_size_ && hello_.size() == hello_size_) status_ = Status::Complete;

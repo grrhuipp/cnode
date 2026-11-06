@@ -32,6 +32,15 @@ tl::expected<uint64_t, std::string> ParseOptionalLimit(
     return *limit;
 }
 
+bool ContainsControlCharacter(std::string_view value) noexcept {
+    for (const unsigned char ch : value) {
+        if (ch < 0x20 || ch == 0x7f) {
+            return true;
+        }
+    }
+    return false;
+}
+
 tl::expected<std::string, std::string> ParseOptionalString(
     const json::object& source,
     std::string_view field,
@@ -41,6 +50,10 @@ tl::expected<std::string, std::string> ParseOptionalString(
     if (!value->is_string()) {
         return tl::unexpected(std::format(
             "users[{}].{} must be a string or null", user_index, field));
+    }
+    if (ContainsControlCharacter(value->as_string())) {
+        return tl::unexpected(std::format(
+            "users[{}].{} contains control characters", user_index, field));
     }
     return std::string(value->as_string());
 }
@@ -73,11 +86,13 @@ ParseUserList(const json::object& source) {
         ::acpp::api::UserInfo user;
 
         const auto* id = source_user.if_contains("id");
-        if (!id || !id->is_int64() || id->as_int64() <= 0) {
+        const auto parsed_id = id ? JsonUnsignedInteger(*id) : std::nullopt;
+        if (!parsed_id || *parsed_id == 0 ||
+            *parsed_id > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
             return tl::unexpected(std::format(
                 "users[{}].id must be a positive int64", i));
         }
-        user.UID = id->as_int64();
+        user.UID = static_cast<int64_t>(*parsed_id);
         if (!seen_ids.insert(user.UID).second) {
             return tl::unexpected(std::format("users[{}].id duplicates another user", i));
         }
@@ -86,6 +101,10 @@ ParseUserList(const json::object& source) {
         if (!uuid || !uuid->is_string() || uuid->as_string().empty()) {
             return tl::unexpected(std::format(
                 "users[{}].uuid must be a non-empty string", i));
+        }
+        if (ContainsControlCharacter(uuid->as_string())) {
+            return tl::unexpected(std::format(
+                "users[{}].uuid contains control characters", i));
         }
         user.UUID = std::string(uuid->as_string());
 

@@ -116,28 +116,42 @@ StaticInboundSemanticValidation ValidateStaticInboundSemantics(
             };
         }
 
-        std::string tag = inbound.tags.empty()
-            ? naming::BuildProtocolPortTag(inbound.protocol, inbound.port)
-            : inbound.tags.front();
-        if (tag.empty()) {
-            return {
-                .error = StaticInboundSemanticError::EmptyTag,
-                .index = i,
-                .conflicting_index = 0,
-                .detail = {},
-            };
-        }
-        if (tag.starts_with(naming::kPanelNodeTagPrefix)) {
-            return {.error = StaticInboundSemanticError::ReservedTag,
-                    .index = i, .conflicting_index = 0, .detail = std::move(tag)};
-        }
-        if (const auto [it, inserted] = tags.emplace(tag, i); !inserted) {
-            return {
-                .error = StaticInboundSemanticError::DuplicateTag,
-                .index = i,
-                .conflicting_index = it->second,
-                .detail = std::move(tag),
-            };
+        auto validate_tag = [&](std::string tag) -> StaticInboundSemanticValidation {
+            if (tag.empty()) {
+                return {
+                    .error = StaticInboundSemanticError::EmptyTag,
+                    .index = i,
+                    .conflicting_index = 0,
+                    .detail = {},
+                };
+            }
+            if (tag.starts_with(naming::kPanelNodeTagPrefix)) {
+                return {.error = StaticInboundSemanticError::ReservedTag,
+                        .index = i, .conflicting_index = 0, .detail = std::move(tag)};
+            }
+            if (const auto [it, inserted] = tags.emplace(std::move(tag), i); !inserted) {
+                return {
+                    .error = StaticInboundSemanticError::DuplicateTag,
+                    .index = i,
+                    .conflicting_index = it->second,
+                    .detail = it->first,
+                };
+            }
+            return {};
+        };
+
+        if (inbound.tags.empty()) {
+            if (auto err = validate_tag(
+                    naming::BuildProtocolPortTag(inbound.protocol, inbound.port));
+                !err.Ok()) {
+                return err;
+            }
+        } else {
+            for (const auto& tag : inbound.tags) {
+                if (auto err = validate_tag(tag); !err.Ok()) {
+                    return err;
+                }
+            }
         }
 
         for (size_t previous = 0; previous < i; ++previous) {

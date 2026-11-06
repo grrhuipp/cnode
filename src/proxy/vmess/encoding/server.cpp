@@ -1,6 +1,7 @@
 #include "server.hpp"
 #include "body.hpp"
 #include "acppnode/common/buffer_util.hpp"
+#include "acppnode/common/buf/length_prefixed_packet_buffer.hpp"
 #include "acppnode/common/byte_reader.hpp"
 #include "acppnode/common/address_codec.hpp"
 #include "acppnode/infra/log.hpp"
@@ -77,10 +78,12 @@ bool ParseDecryptedHeader(const uint8_t* data, size_t len,
     } else if (request.command == Command::TCP || request.command == Command::UDP) {
         auto address = DecodeAddress(
             std::span(data + reader.Position(), reader.Remaining()),
-            AddressWireFormat::PortFirst);
+            AddressWireFormat::PortFirst,
+            {253, true});
         if (address.status != AddressDecodeStatus::Complete) return false;
         reader.Skip(address.consumed);
         request.target = std::move(address.target);
+        if (!request.target.IsValid()) return false;
     } else {
         LOG_CONN_DEBUG(trace_conn_id, "unsupported command {}", static_cast<int>(request.command));
         return false;
@@ -90,7 +93,7 @@ bool ParseDecryptedHeader(const uint8_t* data, size_t len,
     if (!reader.Ok()) return false;
 
     size_t pos = reader.Position();
-    if (pos + 4 > len) return false;
+    if (pos + 4 != len) return false;
 
     uint32_t expected_fnv = FNV1a32(data, pos);
     uint32_t actual_fnv = reader.ReadU32BE();
@@ -112,13 +115,13 @@ bool ParseDecryptedHeader(const uint8_t* data, size_t len,
 
 // `packet` starts at the AuthID and holds the whole sealed header.
 bool OpenRequestHeader(const uint8_t* packet,
-                       const proxyman::inbound::UserStore::VmessCredential& user,
+                       std::shared_ptr<const proxyman::inbound::UserStore::VmessCredential>& user,
                        size_t header_len,
                        uint64_t trace_conn_id,
                        VMessRequest& request,
                        std::string_view& failure_reason) {
     const auto key = RequestHeaderPayloadKey(
-        user.cmd_key,
+        user->cmd_key,
         std::span<const uint8_t, 16>(packet, 16),
         std::span<const uint8_t, 8>(packet + 34, 8));
     memory::ByteVector plain(header_len);
@@ -130,6 +133,7 @@ bool OpenRequestHeader(const uint8_t* packet,
         LOG_CONN_DEBUG(trace_conn_id, "request header authentication failed");
         return false;
     }
+    request.user = std::move(user);
     if (!ParseDecryptedHeader(plain.data(), written, trace_conn_id, request)) {
         failure_reason = "invalid authenticated request header";
         return false;
@@ -183,11 +187,7 @@ public:
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
         auto mb = co_await decoder_.Read(stream_);
         if (is_udp_) {
-            for (buf::Buffer* buffer : mb) {
-                if (buffer && !buffer->IsEmpty()) {
-                    buffer->SetUDP(udp_target_);
-                }
-            }
+            buf::SetUdpDatagramTarget(mb, udp_target_);
         }
         co_return mb;
     }
@@ -248,13 +248,13 @@ private:
             co_return;
         }
         if (!header_sent_) {
-            buf::MultiBuffer framed;
-            if (!buf::AppendSpanToMultiBuffer(response_header_, framed)) {
-                throw std::bad_alloc();
-            }
-            chunks.MoveTo(framed);
-            chunks = std::move(framed);
             header_sent_ = true;
+            ConstBufferSpanBuilder<1 + buf::MultiBuffer::kInlineCapacity> framed;
+            framed.Append(net::buffer(response_header_));
+            framed.AppendMultiBuffer(chunks);
+            co_await stream_.WriteBuffers(framed.Span());
+            chunks.clear();
+            co_return;
         }
         co_await stream_.WriteMultiBuffer(std::move(chunks));
     }
@@ -310,13 +310,13 @@ std::pair<std::optional<VMessRequest>, size_t> ServerSession::DecodeRequestHeade
     VMessRequest request;
     const size_t consumed = required_header_bytes_;
     required_header_bytes_ = 0;
-    if (!OpenRequestHeader(data, *header_user_, header_length_, trace_conn_id, request,
+    if (!OpenRequestHeader(data, header_user_, header_length_, trace_conn_id, request,
                            header_failure_reason_)) {
+        if (request.user) request_ = std::move(request);
         header_user_.reset();
         LOG_CONN_DEBUG(trace_conn_id, "request rejected > {}", header_failure_reason_);
         return {std::nullopt, 0};
     }
-    request.user = std::move(header_user_);
     return {std::move(request), consumed};
 }
 

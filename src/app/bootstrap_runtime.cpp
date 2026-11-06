@@ -133,12 +133,19 @@ public:
         }
         if (coordinator) {
             auto executor = coordinator->Reactor().get_executor();
-            co_await net::co_spawn(executor,
-                [coordinator = std::move(coordinator)]() mutable -> net::awaitable<void> {
-                    co_await coordinator->Finalize();
-                    coordinator.reset();
-                    co_return;
-                }, net::use_awaitable);
+            try {
+                co_await net::co_spawn(executor,
+                    [coordinator = std::move(coordinator)]() mutable -> net::awaitable<void> {
+                        try {
+                            co_await coordinator->Finalize();
+                        } catch (...) {
+                            coordinator.reset();
+                            throw;
+                        }
+                        coordinator.reset();
+                        co_return;
+                    }, net::use_awaitable);
+            } catch (...) { RecordFailure(std::current_exception()); }
         }
         // A migrated domain can retain a different Worker's native reactor.
         // No reactor work guard is released until every Worker has joined.

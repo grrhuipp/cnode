@@ -1,4 +1,5 @@
 #include "trojan_inbound.hpp"
+#include "../../inbound_admission.hpp"
 #include "acppnode/transport/async_stream.hpp"
 #include "../trojan_codec.hpp"
 #include "../credentials.hpp"
@@ -43,23 +44,7 @@ public:
     explicit TrojanUdpReader(AsyncStream& src) : src_(src) {}
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
-        while (true) {
-            trojan::FramedUdpPacket packet;
-            if (framer_.Next(packet)) {
-                for (buf::Buffer* buffer : packet.payload) {
-                    if (buffer && !buffer->IsEmpty()) {
-                        buffer->SetUDP(packet.target);
-                    }
-                }
-                co_return std::move(packet.payload);
-            }
-            buf::MultiBuffer raw = co_await src_.ReadMultiBuffer();
-            if (raw.byte_size() == 0) {
-                framer_.Finish();
-                co_return buf::MultiBuffer{};
-            }
-            framer_.Feed(std::move(raw));
-        }
+        return trojan::ReadUdpDatagram(src_, framer_);
     }
 
 private:
@@ -75,6 +60,10 @@ public:
         return trojan::WriteUdpDatagram(dst_, std::move(mb));
     }
 
+    net::awaitable<void> AsyncShutdownWrite() override {
+        return dst_.AsyncShutdownWrite();
+    }
+
 private:
     AsyncStream& dst_;
 };
@@ -85,7 +74,6 @@ struct TrojanHandshakeResult {
     std::shared_ptr<const proxyman::inbound::UserStore::TrojanCredential> user;
     ::acpp::trojan::TrojanCommand command = ::acpp::trojan::TrojanCommand::CONNECT;
     TargetAddress target;
-    buf::MultiBuffer initial_payload;
 };
 
 net::awaitable<tl::expected<TrojanHandshakeResult, ErrorCode>>
@@ -107,15 +95,14 @@ ParseTrojanRequest(AsyncStream& stream,
             try {
                 n = co_await stream.AsyncRead(net::buffer(
                     handshake_buf.data() + total_read, required - total_read));
-            } catch (const IoSystemError&) {
-                co_return tl::unexpected(stream.ConsumePhaseDeadline()
-                    ? ErrorCode::TIMEOUT : ErrorCode::SOCKET_READ_FAILED);
+            } catch (const IoSystemError& error) {
+                co_return tl::unexpected(
+                    proxy::ClassifyHandshakeReadException(stream, error));
             }
             if (n == 0) {
                 co_return tl::unexpected(
-                    (stream.ConsumePhaseDeadline() || stream.ConsumeIdleTimeout())
-                        ? ErrorCode::TIMEOUT
-                        : ErrorCode::PROTOCOL_DECODE_FAILED);
+                    proxy::ResolveHandshakeReadFailure(
+                        stream, ErrorCode::PROTOCOL_DECODE_FAILED));
             }
             total_read += n;
         }
@@ -139,7 +126,6 @@ ParseTrojanRequest(AsyncStream& stream,
     }
 
     auto& request = decoded.request;
-    const size_t consumed = decoded.consumed;
     auto user_info = proxyman::inbound::UserStore::FindTrojanUser(
         tag, request.PasswordHashView());
     if (!user_info) {
@@ -152,22 +138,11 @@ ParseTrojanRequest(AsyncStream& stream,
         co_return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
     }
 
-    TrojanHandshakeResult result{
+    co_return TrojanHandshakeResult{
         .user = std::move(user_info),
         .command = request.command,
         .target = std::move(request.target),
-        .initial_payload = {},
     };
-    if (total_read > consumed) {
-        if (!buf::AppendSpanToMultiBuffer(
-                std::span<const uint8_t>(
-                    handshake_buf.data() + consumed,
-                    total_read - consumed),
-                result.initial_payload)) {
-            co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
-        }
-    }
-    co_return result;
 }
 
 }  // namespace
@@ -197,10 +172,10 @@ proxy::trojan::inbound::Handler::Process(
 {
     const std::string_view tag   = ctx.inbound.tag;
     const std::string_view client_ip = ctx.inbound.source_ip;
-    ctx.inbound.user_id = 0;
-    ctx.inbound.user_email.clear();
     auto fail = [&](ErrorCode error) {
-        stats_->OnError();
+        if (error != ErrorCode::CANCELLED && error != ErrorCode::SOCKET_EOF) {
+            stats_->OnError();
+        }
         RelayResult result;
         result.error = error;
         return result;
@@ -214,16 +189,11 @@ proxy::trojan::inbound::Handler::Process(
 
     LOG_CONN_DEBUG(ctx, "processing connection from {}:{}", client_ip, ctx.inbound.source_port);
 
-    if (limiter_ && ctx.inbound.HasProxyProtocolClientIP() &&
-        co_await limiter_->IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {
-        LOG_CONN_DEBUG(ctx, "connection rejected from {}:{} > IP banned",
-                       ctx.inbound.source_ip, ctx.inbound.source_port);
-        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "IP banned"));
+    if (co_await proxy::CheckInboundIpBanned(limiter_, ctx)) {
         co_return fail_abortive(ErrorCode::BLOCKED);
     }
     std::optional<UserOnlineSessionGuard> user_session;
     Network net = Network::TCP;
-    InitialPayload initial_payload;
     {
         auto handshake = co_await ParseTrojanRequest(
             *stream, ctx, limiter_, tag, client_ip);
@@ -235,29 +205,21 @@ proxy::trojan::inbound::Handler::Process(
         ctx.inbound.user_id = profile.user_id;
         ctx.inbound.user_email = profile.email;
         ctx.content.speed_limit = profile.speed_limit;
-        user_session = co_await validator_.TryConnectSession(
-            tag, profile.user_id, ctx.inbound.source_ip, profile.device_limit);
+        net = (handshake->command == ::acpp::trojan::TrojanCommand::UDP_ASSOCIATE)
+              ? Network::UDP : Network::TCP;
+        ctx.outbound.original_target = handshake->target;
+        ctx.outbound.target = std::move(handshake->target);
+        ctx.content.network = net;
+        user_session = co_await proxy::TryAcquireInboundUserSession(
+            validator_, tag, profile.user_id, profile.device_limit, ctx);
         if (!user_session) {
-            LOG_CONN_DEBUG(ctx, "connection rejected from {}:{} > device limit={} domain_online_devices={}",
-                ctx.inbound.source_ip, ctx.inbound.source_port, profile.device_limit,
-                validator_.OnlineDeviceCount(tag, static_cast<uint64_t>(profile.user_id)));
-            LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "device limit"));
             co_return fail_abortive(ErrorCode::PERMISSION_DENIED);
         }
         // Session metadata is owned; release the authentication snapshot before I/O.
         handshake->user.reset();
 
         LOG_CONN_DEBUG(ctx, "authentication succeeded from {}:{} -> {}",
-                       client_ip, ctx.inbound.source_port, handshake->target);
-
-        net = (handshake->command == ::acpp::trojan::TrojanCommand::UDP_ASSOCIATE)
-              ? Network::UDP : Network::TCP;
-        ctx.outbound.original_target = handshake->target;
-        ctx.outbound.target = std::move(handshake->target);
-        ctx.content.network = net;
-        if (handshake->initial_payload.byte_size() != 0) {
-            initial_payload = InitialPayload(std::move(handshake->initial_payload));
-        }
+                       client_ip, ctx.inbound.source_port, ctx.outbound.target);
     }
 
     if (net == Network::UDP) {
@@ -268,7 +230,7 @@ proxy::trojan::inbound::Handler::Process(
             receiver.dispatch_policy,
             std::move(stream),
             transport::Link{&udp_reader, &udp_writer},
-            std::move(initial_payload),
+            InitialPayload{},
             ctx,
             *stats_,
             timeouts);
@@ -280,7 +242,7 @@ proxy::trojan::inbound::Handler::Process(
         receiver.dispatch_policy,
         std::move(stream),
         transport::Link{tcp_stream, tcp_stream},
-        std::move(initial_payload),
+        InitialPayload{},
         ctx,
         *stats_,
         timeouts);
@@ -292,23 +254,13 @@ proxy::trojan::inbound::Handler::Process(
 // 自注册（静态初始化）
 // ============================================================================
 namespace {
-class TrojanRuntime final : public acpp::proxyman::inbound::ProtocolRuntime {
-public:
-    [[nodiscard]] std::vector<acpp::OnlineDevice>
-    GetOnlineDevices(std::string_view tag) const override {
-        return validator.GetOnlineDevices(tag);
-    }
-
-    acpp::UserOnlineTracker validator;
-};
-
 const bool kTrojanInboundRegistered = [] {
     acpp::proxyman::inbound::ProxyRegistration reg;
     reg.user_protocol = acpp::proxyman::inbound::UserProtocol::Trojan;
 
     reg.create_runtime = []() -> std::unique_ptr<
         acpp::proxyman::inbound::ProtocolRuntime> {
-        return std::make_unique<TrojanRuntime>();
+        return std::make_unique<acpp::proxy::UserOnlineProtocolRuntime>();
     };
 
     reg.create_tcp_handler =
@@ -316,7 +268,7 @@ const bool kTrojanInboundRegistered = [] {
            acpp::StatsShard& stats,
            acpp::ConnectionLimiter* limiter,
            const acpp::proxyman::inbound::BuildRequest&) -> std::unique_ptr<acpp::Inbound> {
-            auto* trojan_runtime = dynamic_cast<TrojanRuntime*>(&runtime);
+            auto* trojan_runtime = dynamic_cast<acpp::proxy::UserOnlineProtocolRuntime*>(&runtime);
             if (!trojan_runtime) {
                 return nullptr;
             }
