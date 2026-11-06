@@ -82,6 +82,9 @@ public:
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override;
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override;
     net::awaitable<void> AsyncShutdownWrite() override;
+    bool WriteShutdownClosesLink() const noexcept override {
+        return dst_.WriteShutdownClosesLink();
+    }
 
 private:
     transport::MultiBufferWriter& dst_;

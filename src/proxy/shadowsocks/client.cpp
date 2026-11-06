@@ -96,6 +96,10 @@ public:
         return stream_->AsyncShutdownWrite();
     }
 
+    bool WriteShutdownClosesLink() const noexcept override {
+        return stream_ && stream_->WriteShutdownClosesLink();
+    }
+
 private:
     std::optional<SsAeadCipher> write_cipher_;
     uint64_t write_nonce_ = 0;

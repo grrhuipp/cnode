@@ -92,6 +92,10 @@ public:
         return dst_.AsyncShutdownWrite();
     }
 
+    bool WriteShutdownClosesLink() const noexcept override {
+        return dst_.WriteShutdownClosesLink();
+    }
+
 private:
     transport::MultiBufferWriter& dst_;
     bool packet_addr_ = false;
@@ -104,6 +108,10 @@ public:
         : dst_(dst) {}
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
+        if (mb.byte_size() == 0) {
+            mb.clear();
+            co_return;
+        }
         if (header_sent_) {
             co_await dst_.WriteMultiBuffer(std::move(mb));
             co_return;
@@ -117,6 +125,9 @@ public:
     }
 
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
+        if (std::ranges::all_of(buffers, [](const net::const_buffer& b) { return b.size() == 0; })) {
+            co_return;
+        }
         if (header_sent_) {
             co_await dst_.WriteBuffers(buffers);
             co_return;
@@ -135,6 +146,10 @@ public:
             co_await dst_.WriteBuffers(out);
         }
         co_await dst_.AsyncShutdownWrite();
+    }
+
+    bool WriteShutdownClosesLink() const noexcept override {
+        return dst_.WriteShutdownClosesLink();
     }
 
 private:

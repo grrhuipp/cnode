@@ -1283,13 +1283,16 @@ net::awaitable<void> Worker::CommitTraffic(
         auto domain = token.owner.domain.lock();
         auto capabilities = token.owner.capabilities.lock();
         if (!domain || !capabilities) continue;
-        co_await net::co_spawn(domain->Executor(),
-            [capabilities = std::move(capabilities), tag, counters = &token.counters]() mutable -> net::awaitable<void> {
+        auto executor = domain->Executor();
+        co_await net::co_spawn(std::move(executor),
+            [capabilities = std::move(capabilities), domain = std::move(domain),
+             tag, counters = &token.counters]() mutable -> net::awaitable<void> {
                 if (capabilities->HasPendingTraffic()) {
                     capabilities->Tracking().CommitTraffic(tag, *counters);
                     capabilities->ReleaseIdleAccounting();
                 }
                 capabilities.reset();
+                domain.reset();
                 co_return;
             }, net::use_awaitable);
     }
@@ -1410,12 +1413,10 @@ net::awaitable<WorkerRuntimeStatsSnapshot> Worker::CollectRuntimeStats(bool incl
     samples.reserve(runtime_->connections.size());
     for (const auto& [key, record] : runtime_->connections) {
         (void)key;
-        if (record->initialized.load(std::memory_order_acquire)) {
-            samples.push_back(Sample{
-                .record = record,
-                .was_active = !record->finished.load(std::memory_order_acquire),
-            });
-        }
+        samples.push_back(Sample{
+            .record = record,
+            .was_active = !record->finished.load(std::memory_order_acquire),
+        });
     }
     for (const auto& [record, was_active] : samples) {
         if (was_active && record->finished.load(std::memory_order_acquire)) {
@@ -1428,7 +1429,8 @@ net::awaitable<WorkerRuntimeStatsSnapshot> Worker::CollectRuntimeStats(bool incl
             }
             continue;
         }
-        if (!runtime_->connections.contains(record.get()) ||
+        if (!record->initialized.load(std::memory_order_acquire) ||
+            !runtime_->connections.contains(record.get()) ||
             !record->domain || !record->capabilities)
             continue;
         const bool include_stats = !record->finished.load(std::memory_order_acquire);
@@ -1442,7 +1444,7 @@ net::awaitable<WorkerRuntimeStatsSnapshot> Worker::CollectRuntimeStats(bool incl
                 snapshot.memory.pool_direct_bytes = footprint.direct_bytes;
                 snapshot.memory.pool_idle_bytes = footprint.idle_bytes;
                 snapshot.memory.pool_chunks = footprint.chunks;
-                if (include_resources && include_stats) {
+                if (include_resources && include_stats && !cap->IsJoined()) {
                     const auto timers = TimeoutScheduler::ForIoContext(
                         domain->Reactor()).GetResourceStats();
                     auto& resources = snapshot.resources.emplace();

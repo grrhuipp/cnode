@@ -33,32 +33,13 @@ void OnNativeDispatchStage() noexcept;
 namespace acpp::worker_detail {
 
 void UdpIngress::PendingUdpReply::PrepareSendBuffers() {
-    spill_send_buffers.clear();
-    send_buffer_count = 0;
-    for (const auto* buffer : payload) {
-        if (buffer && !buffer->IsEmpty()) {
-            const auto bytes = buffer->Bytes();
-            net::const_buffer send_buffer{bytes.data(), bytes.size()};
-            if (send_buffer_count < inline_send_buffers.size()) {
-                inline_send_buffers[send_buffer_count++] = send_buffer;
-                continue;
-            }
-            if (spill_send_buffers.empty()) {
-                spill_send_buffers.reserve(payload.size());
-                spill_send_buffers.insert(spill_send_buffers.end(),
-                    inline_send_buffers.begin(),
-                    inline_send_buffers.begin() + send_buffer_count);
-            }
-            spill_send_buffers.emplace_back(send_buffer);
-            ++send_buffer_count;
-        }
-    }
+    send_buffers.Clear();
+    send_buffers.AppendMultiBuffer(payload);
 }
 
 std::span<const net::const_buffer>
 UdpIngress::PendingUdpReply::SendBuffers() const noexcept {
-    if (!spill_send_buffers.empty()) return spill_send_buffers;
-    return {inline_send_buffers.data(), send_buffer_count};
+    return send_buffers.Span();
 }
 
 namespace {

@@ -284,7 +284,7 @@ void ExecutionDomain::Run(uint32_t scheduled_owner) noexcept {
     if (root->owner != scheduled_owner) { Notify(true); return; }
     // Freeze keeps the outstanding wake token. Commit force-notifies every
     // member, including arrivals racing this branch, so no wake can be lost.
-    if (root->frozen.load(std::memory_order_acquire)) return;
+    if (root->frozen.load(std::memory_order_seq_cst)) return;
     auto hooks = state_->hooks;
     auto* previous_domain = std::exchange(current_domain, this);
     hooks->Enter();
@@ -343,7 +343,7 @@ net::awaitable<void> ExecutionDomain::MergeGroups(
                     [&group, &coordinator, acknowledgement = std::move(acknowledgement)]() mutable {
                         // All earlier user callbacks have retired on this
                         // owner. The reserved return cannot fail admission.
-                        group.frozen.store(true, std::memory_order_release);
+                        group.frozen.store(true, std::memory_order_seq_cst);
                         coordinator.PostReserved(std::move(acknowledgement));
                     });
             }, token);
@@ -355,15 +355,15 @@ net::awaitable<void> ExecutionDomain::MergeGroups(
     } catch (...) { failure = std::current_exception(); }
     auto notify_if_pending = [](const std::shared_ptr<ExecutionDomain>& domain) {
         if (domain &&
-            (domain->state_->notified.load(std::memory_order_acquire) ||
+            (domain->state_->notified.load(std::memory_order_seq_cst) ||
              domain->state_->ready ||
-             domain->state_->incoming.load(std::memory_order_acquire))) {
+             domain->state_->incoming.load(std::memory_order_seq_cst))) {
             domain->Notify(true);
         }
     };
     if (failure) {
-        a->frozen.store(false, std::memory_order_release);
-        b->frozen.store(false, std::memory_order_release);
+        a->frozen.store(false, std::memory_order_seq_cst);
+        b->frozen.store(false, std::memory_order_seq_cst);
         for (const auto& member : a->members) notify_if_pending(member.lock());
         for (const auto& member : b->members) notify_if_pending(member.lock());
         std::rethrow_exception(failure);
@@ -377,8 +377,8 @@ net::awaitable<void> ExecutionDomain::MergeGroups(
     source->parent_keepalive = std::move(destination_keepalive);
     destination->members.splice(destination->members.end(), source->members);
     if (destination->rank == source->rank) ++destination->rank;
-    source->parent.store(destination, std::memory_order_release);
-    destination->frozen.store(false, std::memory_order_release);
+    source->parent.store(destination, std::memory_order_seq_cst);
+    destination->frozen.store(false, std::memory_order_seq_cst);
     for (const auto& member : destination->members)
         notify_if_pending(member.lock());
     try {

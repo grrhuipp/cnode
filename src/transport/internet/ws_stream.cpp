@@ -33,7 +33,6 @@ std::string ComputeWsAccept(std::string_view ws_key) {
 }  // namespace ws
 
 namespace {
-using transport::internet::EqualsAsciiCI;
 using transport::internet::TrimAscii;
 using transport::internet::detail::EffectiveHttpPath;
 
@@ -555,81 +554,18 @@ net::awaitable<WsHandshakeResult> WsClientStream::Handshake(
         LOG_CONN_DEBUG(conn_id_, "WebSocket client failed to generate handshake nonce");
         co_return tl::unexpected(ErrorCode::INTERNAL);
     }
-    std::string ws_key = Base64Encode(raw_key, sizeof(raw_key));
+    const std::string ws_key = Base64Encode(raw_key, sizeof(raw_key));
 
     const std::string_view req_path = EffectiveHttpPath(path);
-    if (headers) {
-        if (const std::string* configured_host =
-                transport::internet::FindHttpHeader(*headers, "Host")) {
-            const std::string_view trimmed_host = TrimAscii(*configured_host);
-            if (!trimmed_host.empty()) {
-                host = trimmed_host;
-            }
-        }
-    }
-
-    size_t reserve_size = 256 + req_path.size() + host.size() + ws_key.size();
-    if (headers) {
-        for (const auto& [k, v] : *headers) {
-            if (!k.empty() && !transport::internet::IsReservedUpgradeHeader(k)) {
-                reserve_size += k.size() + v.size() + 4; // ": " + "\r\n"
-            }
-        }
-    }
-
-    memory::ThreadLocalString request;
-    request.reserve(reserve_size);
-    request.append("GET ");
-    request.append(req_path);
-    request.append(" HTTP/1.1\r\n");
-    request.append("Host: ");
-    request.append(host);
-    request.append("\r\n");
-    request.append("Upgrade: websocket\r\n");
-    request.append("Connection: Upgrade\r\n");
-    request.append("Sec-WebSocket-Key: ");
-    request.append(ws_key);
-    request.append("\r\n");
-    request.append("Sec-WebSocket-Version: 13\r\n");
-    if (headers) {
-        for (const auto& [k, v] : *headers) {
-            if (k.empty() || transport::internet::IsReservedUpgradeHeader(k)) continue;
-            request.append(k);
-            request.append(": ");
-            request.append(v);
-            request.append("\r\n");
-        }
-    }
-    request.append("\r\n");
-
-    const bool write_ok = co_await transport::internet::WriteFullToStream(*inner_, request);
-    memory::ThreadLocalString{}.swap(request);
-    if (!write_ok) {
-        LOG_CONN_DEBUG(conn_id_, "WebSocket client failed to send upgrade request");
-        co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
-    }
-    auto head = co_await transport::internet::ReadHttp1MessageHead(*inner_);
+    host = transport::internet::ResolveHttpUpgradeHost(host, {}, headers);
+    auto head = co_await transport::internet::ExecuteHttp1UpgradeClientHandshake(
+        *inner_, "WebSocket", conn_id_, host, req_path, headers, ws_key);
     if (!head) {
-        LOG_CONN_DEBUG(conn_id_, "WebSocket client failed to read upgrade response > {}", ErrorCodeToString(head.error()));
         co_return tl::unexpected(head.error());
     }
 
-    const std::string_view response = head->Text();
-    const std::string_view first_line = transport::internet::ExtractStartLine(response);
-    if (!transport::internet::HasStatusCode(first_line, "101")) {
-        LOG_CONN_DEBUG(conn_id_, "WebSocket client upgrade rejected");
-        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
-    }
-    // RFC 6455 4.1: both Upgrade and Connection are mandatory. Connection
-    // is a case-insensitive token list combined across all same-name lines.
-    if (!transport::internet::EqualsAsciiCI(TrimAscii(
-            transport::internet::ExtractHeaderValueCI(response, "Upgrade")), "websocket") ||
-        !transport::internet::HeaderListContainsTokenCI(response, "Connection", "upgrade")) {
-        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
-    }
-
     const std::string_view accept = TrimAscii(
-        transport::internet::ExtractHeaderValueCI(response, "Sec-WebSocket-Accept"));
+        transport::internet::ExtractHeaderValueCI(head->Text(), "Sec-WebSocket-Accept"));
     if (accept.empty()) {
         LOG_CONN_DEBUG(conn_id_, "WebSocket client missing Sec-WebSocket-Accept");
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);

@@ -467,14 +467,22 @@ private:
     return EqualsAsciiCI(key, "Host");
 }
 
-[[nodiscard]] std::string_view ConfiguredHostHeader(const HttpHeaders& headers) {
+[[nodiscard]] std::string_view ConfiguredHostHeader(const HttpHeaders& headers) noexcept {
     const std::string* host = FindHttpHeader(headers, "Host");
     return host ? std::string_view(*host) : std::string_view{};
 }
 
-[[nodiscard]] std::string_view ExpectedHttpUpgradeHost(const HttpUpgradeConfig& cfg) {
-    return cfg.host.empty() ? ConfiguredHostHeader(cfg.headers)
-                            : std::string_view(cfg.host);
+[[nodiscard]] bool IsReservedUpgradeHeader(std::string_view key) noexcept {
+    return EqualsAsciiCI(key, "Host") ||
+           EqualsAsciiCI(key, "Upgrade") ||
+           EqualsAsciiCI(key, "Connection") ||
+           EqualsAsciiCI(key, "Sec-WebSocket-Key") ||
+           EqualsAsciiCI(key, "Sec-WebSocket-Version");
+}
+
+[[nodiscard]] bool HasWebSocketUpgradeHeaders(std::string_view head) {
+    return EqualsAsciiCI(TrimAscii(ExtractHeaderValueCI(head, "Upgrade")), "websocket") &&
+           HeaderListContainsTokenCI(head, "Connection", "upgrade");
 }
 
 void LogHeadReadFailure(std::string_view scope, uint64_t conn_id, ErrorCode error) {
@@ -524,11 +532,6 @@ net::awaitable<tl::expected<void, ErrorCode>> ReadClientResponse(
     const std::string_view status_line = ExtractStartLine(head->Text());
     if (!HasStatusCode(status_line, status_code)) {
         LOG_CONN_DEBUG(conn_id, "{} client request rejected", scope);
-        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
-    }
-    if (status_code == "101" &&
-        (!EqualsAsciiCI(TrimAscii(ExtractHeaderValueCI(head->Text(), "Upgrade")), "websocket") ||
-         !HeaderListContainsTokenCI(head->Text(), "Connection", "upgrade"))) {
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
     // HTTP handshakes run directly on TCP or TLS. Read-ahead returns to that
@@ -882,17 +885,81 @@ std::string SanitizeHttpRequestLineForLog(const Http1RequestLine& line) {
     return out;
 }
 
-bool IsReservedUpgradeHeader(std::string_view key) noexcept {
-    return EqualsAsciiCI(key, "Host") ||
-           EqualsAsciiCI(key, "Upgrade") ||
-           EqualsAsciiCI(key, "Connection") ||
-           EqualsAsciiCI(key, "Sec-WebSocket-Key") ||
-           EqualsAsciiCI(key, "Sec-WebSocket-Version");
-}
-
 std::string_view ExpectedHttpHost(const HttpConfig& cfg) {
     return cfg.host.empty() ? ConfiguredHostHeader(cfg.headers)
                             : std::string_view(cfg.host);
+}
+
+std::string_view ResolveHttpUpgradeHost(std::string_view fallback_host,
+                                        std::string_view configured_host,
+                                        const HttpHeaders* headers) noexcept {
+    const std::string_view raw_host = !configured_host.empty()
+        ? configured_host
+        : (headers ? ConfiguredHostHeader(*headers) : std::string_view{});
+    const std::string_view trimmed = TrimAscii(raw_host);
+    return trimmed.empty() ? fallback_host : trimmed;
+}
+
+net::awaitable<tl::expected<Http1MessageHead, ErrorCode>>
+ExecuteHttp1UpgradeClientHandshake(
+    AsyncStream& stream,
+    std::string_view scope,
+    uint64_t conn_id,
+    std::string_view host,
+    std::string_view path,
+    const HttpHeaders* headers,
+    std::string_view ws_key) {
+    const std::string_view req_path = EffectiveHttpPath(path);
+    size_t reserve_size =
+        (ws_key.empty() ? 192 : 256) + req_path.size() + host.size() + ws_key.size();
+    if (headers) {
+        for (const auto& [key, value] : *headers) {
+            if (!key.empty() && !IsReservedUpgradeHeader(key)) {
+                reserve_size += key.size() + value.size() + 4;
+            }
+        }
+    }
+
+    memory::ThreadLocalString request;
+    request.reserve(reserve_size);
+    AppendRequestStart(request, "GET", req_path, host);
+    request.append("Upgrade: websocket\r\n");
+    request.append("Connection: Upgrade\r\n");
+    if (!ws_key.empty()) {
+        AppendHeaderLine(request, "Sec-WebSocket-Key", ws_key);
+        request.append("Sec-WebSocket-Version: 13\r\n");
+    }
+    if (headers) {
+        for (const auto& [key, value] : *headers) {
+            if (!key.empty() && !IsReservedUpgradeHeader(key)) {
+                AppendHeaderLine(request, key, value);
+            }
+        }
+    }
+    request.append("\r\n");
+
+    const bool write_ok = co_await WriteFullToStream(stream, request);
+    memory::ThreadLocalString{}.swap(request);
+    if (!write_ok) {
+        LOG_CONN_DEBUG(conn_id, "{} client failed to send upgrade request", scope);
+        co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+    }
+
+    auto head = co_await ReadHttp1MessageHead(stream);
+    if (!head) {
+        LogHeadReadFailure(scope, conn_id, head.error());
+        co_return tl::unexpected(head.error());
+    }
+    const std::string_view response = head->Text();
+    const std::string_view status_line = ExtractStartLine(response);
+    if (!HasStatusCode(status_line, "101")) {
+        LOG_CONN_DEBUG(conn_id, "{} client upgrade rejected", scope);
+        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+    }
+    if (!HasWebSocketUpgradeHeaders(response)) {
+        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+    }
+    co_return std::move(*head);
 }
 
 net::awaitable<bool> WriteFullToStream(AsyncStream& stream, std::string_view bytes) {
@@ -1050,7 +1117,6 @@ net::awaitable<TransportBuildResult> DoHttpUpgradeServerHandshake(
     const auto parsed_line = ParseHttp1RequestLine(request_line);
     const auto request_path = parsed_line.target;
     const std::string_view host = TrimAscii(ExtractHeaderValueCI(request, "Host"));
-    const std::string_view upgrade = TrimAscii(ExtractHeaderValueCI(request, "Upgrade"));
 
     LOG_CONN_TRACE(conn_id,
         "HTTPUpgrade server request line='{}' path='{}' host='{}' bytes={}",
@@ -1068,13 +1134,13 @@ net::awaitable<TransportBuildResult> DoHttpUpgradeServerHandshake(
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
-    if (!EqualsAsciiCI(upgrade, "websocket") ||
-        !HeaderListContainsTokenCI(request, "Connection", "upgrade")) {
+    if (!HasWebSocketUpgradeHeaders(request)) {
         LOG_CONN_DEBUG(conn_id, "HTTPUpgrade server received invalid upgrade headers");
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
-    if (const std::string_view expected_host = TrimAscii(ExpectedHttpUpgradeHost(cfg));
+    if (const std::string_view expected_host =
+            ResolveHttpUpgradeHost({}, cfg.host, &cfg.headers);
         !expected_host.empty() && !EqualsAsciiCI(host, expected_host)) {
         LOG_CONN_DEBUG(conn_id,
             "HTTPUpgrade server host mismatch expected='{}' actual='{}'",
@@ -1109,35 +1175,15 @@ net::awaitable<TransportBuildResult> DoHttpUpgradeClientHandshake(
     std::string_view host,
     uint64_t conn_id) {
     const std::string_view req_path = EffectiveHttpPath(cfg.path);
-    const std::string_view configured_host = TrimAscii(ExpectedHttpUpgradeHost(cfg));
-    const std::string_view effective_host = configured_host.empty() ? host : configured_host;
-    size_t reserve_size = 192 + req_path.size() + effective_host.size();
-    for (const auto& [key, value] : cfg.headers) {
-        if (!key.empty() && !IsReservedUpgradeHeader(key)) {
-            reserve_size += key.size() + value.size() + 4;
-        }
+    const std::string_view effective_host =
+        ResolveHttpUpgradeHost(host, cfg.host, &cfg.headers);
+    auto head = co_await ExecuteHttp1UpgradeClientHandshake(
+        *stream, "HTTPUpgrade", conn_id, effective_host, req_path, &cfg.headers);
+    if (!head) {
+        co_return tl::unexpected(head.error());
     }
-
-    memory::ThreadLocalString request;
-    request.reserve(reserve_size);
-    AppendRequestStart(request, "GET", req_path, effective_host);
-    request.append("Upgrade: websocket\r\n");
-    request.append("Connection: Upgrade\r\n");
-    for (const auto& [key, value] : cfg.headers) {
-        if (!key.empty() && !IsReservedUpgradeHeader(key)) {
-            AppendHeaderLine(request, key, value);
-        }
-    }
-    request.append("\r\n");
-
-    if (!co_await WriteFullToStream(*stream, request)) {
-        LOG_CONN_DEBUG(conn_id, "HTTPUpgrade client failed to send request");
-        co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
-    }
-    memory::ThreadLocalString{}.swap(request);
-    if (auto response = co_await ReadClientResponse(*stream, "HTTPUpgrade", conn_id, "101");
-        !response) {
-        co_return tl::unexpected(response.error());
+    if (const auto read_ahead = head->ReadAhead(); !read_ahead.empty()) {
+        stream->PrependReadData(read_ahead);
     }
     LOG_CONN_DEBUG(conn_id, "HTTPUpgrade client handshake completed (host={} path={})",
                    PublicHttpTargetForLog(effective_host), PublicHttpTargetForLog(req_path));
@@ -1160,12 +1206,11 @@ net::awaitable<TransportBuildResult> DoWsServerHandshake(
     const auto parsed_line = ParseHttp1RequestLine(request_line);
     const auto request_path = parsed_line.target;
     const std::string_view host = ExtractHeaderValueCI(request, "Host");
-    const std::string_view upgrade = ExtractHeaderValueCI(request, "Upgrade");
     const std::string_view version = ExtractHeaderValueCI(request, "Sec-WebSocket-Version");
 
     LOG_CONN_TRACE(conn_id, "WebSocket server received HTTP upgrade bytes={}", head->size);
 
-    if (!EqualsAsciiCI(TrimAscii(upgrade), "websocket")) {
+    if (!HasWebSocketUpgradeHeaders(request)) {
         LOG_CONN_DEBUG(conn_id, "WebSocket server missing 'Upgrade: websocket' header");
         LOG_CONN_TRACE(conn_id, "WebSocket server rejected missing upgrade line='{}' host='{}'",
                       SanitizeHttpRequestLineForLog(parsed_line),
@@ -1173,7 +1218,7 @@ net::awaitable<TransportBuildResult> DoWsServerHandshake(
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
     if (!request_line.starts_with("GET ") || !request_line.ends_with(" HTTP/1.1") ||
-        !HeaderListContainsTokenCI(request, "Connection", "upgrade") || TrimAscii(version) != "13") {
+        TrimAscii(version) != "13") {
         LOG_CONN_DEBUG(conn_id, "WebSocket server received invalid upgrade request");
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }

@@ -63,6 +63,10 @@ public:
         return stream_.ReadEofAction();
     }
 
+    bool WriteShutdownClosesLink() const noexcept override {
+        return stream_.WriteShutdownClosesLink();
+    }
+
 protected:
     AsyncStream& stream_;
 };

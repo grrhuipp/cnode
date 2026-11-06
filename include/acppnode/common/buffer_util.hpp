@@ -71,6 +71,11 @@ public:
         }
     }
 
+    void Clear() noexcept {
+        spill_.clear();
+        count_ = 0;
+    }
+
     [[nodiscard]] bool empty() const noexcept {
         return size() == 0;
     }

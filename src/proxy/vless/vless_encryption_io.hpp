@@ -78,6 +78,9 @@ public:
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override;
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override;
     net::awaitable<void> AsyncShutdownWrite() override;
+    bool WriteShutdownClosesLink() const noexcept override {
+        return dst_.WriteShutdownClosesLink();
+    }
 
 private:
     net::awaitable<void> WritePlaintext(std::span<const uint8_t> data);

@@ -96,6 +96,7 @@ public:
     [[nodiscard]] std::shared_ptr<ExecutionDomain> Domain() const noexcept;
     [[nodiscard]] const proxyman::inbound::ReceiverSettings& Receiver() const noexcept { return *receiver_; }
     [[nodiscard]] bool Initialized() const noexcept { return initialized_; }
+    [[nodiscard]] bool IsJoined() const noexcept { return joined_; }
     [[nodiscard]] bool HasPendingTraffic() const noexcept;
     void ReleaseIdleAccounting() noexcept;
     // Must run in the domain before constructing its socket/Context payload.
@@ -137,6 +138,7 @@ private:
     StatsShard stats_;
     bool initialized_ = false;
     bool stopping_ = false;
+    bool joined_ = false;
     std::atomic<bool> pending_traffic_{false};
 };
 } // namespace app

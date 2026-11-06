@@ -73,7 +73,7 @@ int main() {
     domain0.reset();
     std::promise<void> drained;
     auto drained_future = drained.get_future();
-    net::post(io0, [&] { drained.set_value(); });
+    net::post(control, [&] { net::post(io0, [&] { drained.set_value(); }); });
     drained_future.get();
     Check(physical_hosts.load() == 1, "ticket retained physical connection capabilities");
     VlessEncryptionNfsKey nfs;

@@ -64,6 +64,10 @@ public:
         co_await session_.EncodeRequestBodyEOF(stream_);
     }
 
+    bool WriteShutdownClosesLink() const noexcept override {
+        return false;
+    }
+
     transport::EofAction ReadEofAction() const noexcept override {
         return is_udp_ ? transport::EofAction::WaitForPeer : stream_.ReadEofAction();
     }

@@ -212,7 +212,9 @@ net::awaitable<std::shared_ptr<ExecutionDomain>> CreateTicketActor(
     // No PhysicalSessionCapabilities, transport, user view, dispatcher, or
     // outbound pool is retained by this actor. Its storage uses process malloc.
     static const auto hooks = std::make_shared<TicketActorHooks>();
-    co_return origin->CreateSibling(hooks);
+    auto sibling = origin->CreateSibling(hooks);
+    origin.reset();
+    co_return sibling;
 }
 net::awaitable<bool> StoreOnActor(
     std::shared_ptr<ExecutionDomain> actor,

@@ -74,7 +74,19 @@ void RecordExtractedRealIp(std::string_view head,
 [[nodiscard]] std::string_view PublicHttpMethodForLog(std::string_view value);
 [[nodiscard]] std::string SanitizeHttpRequestLineForLog(const Http1RequestLine& line);
 [[nodiscard]] std::string_view ExpectedHttpHost(const HttpConfig& cfg);
-[[nodiscard]] bool IsReservedUpgradeHeader(std::string_view key) noexcept;
+[[nodiscard]] std::string_view ResolveHttpUpgradeHost(
+    std::string_view fallback_host,
+    std::string_view configured_host,
+    const HttpHeaders* headers) noexcept;
+[[nodiscard]] net::awaitable<tl::expected<Http1MessageHead, ErrorCode>>
+ExecuteHttp1UpgradeClientHandshake(
+    AsyncStream& stream,
+    std::string_view scope,
+    uint64_t conn_id,
+    std::string_view host,
+    std::string_view path,
+    const HttpHeaders* headers = nullptr,
+    std::string_view ws_key = {});
 
 // Returns false instead of throwing; the caller maps it to SOCKET_WRITE_FAILED.
 [[nodiscard]] net::awaitable<bool> WriteFullToStream(AsyncStream& stream,

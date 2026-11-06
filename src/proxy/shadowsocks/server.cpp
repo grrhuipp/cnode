@@ -193,6 +193,10 @@ public:
         co_await stream_->AsyncShutdownWrite();
     }
 
+    bool WriteShutdownClosesLink() const noexcept override {
+        return stream_ && stream_->WriteShutdownClosesLink();
+    }
+
 private:
     static constexpr size_t kLenHeaderSize = 2 + SsAeadCipher::kTagSize;
 

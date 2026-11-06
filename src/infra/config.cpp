@@ -953,6 +953,7 @@ RealityConfig RealityConfig::FromJson(const json::object& j) {
     };
     cfg.server_names = JsonStringArrayOrEmpty(j, "serverNames");
     for (const auto& name : cfg.server_names) {
+        // An empty entry in serverNames explicitly permits a REALITY ClientHello without SNI.
         if (!name.empty() && !is_valid_reality_server_name(name)) {
             throw std::invalid_argument(
                 "REALITY serverNames contains an invalid hostname");

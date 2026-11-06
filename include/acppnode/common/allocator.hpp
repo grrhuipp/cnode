@@ -940,11 +940,11 @@ public:
     ThreadLocalAllocator(const ThreadLocalAllocator&) noexcept = default;
     ThreadLocalAllocator& operator=(const ThreadLocalAllocator&) noexcept = default;
     ThreadLocalAllocator(ThreadLocalAllocator&& other) noexcept
-        : resource_(other.resource_), lifetime_(std::move(other.lifetime_)) {}
+        : resource_(other.resource_), lifetime_(other.lifetime_) {}
     ThreadLocalAllocator& operator=(ThreadLocalAllocator&& other) noexcept {
         if (this != &other) {
             resource_ = other.resource_;
-            lifetime_ = std::move(other.lifetime_);
+            lifetime_ = other.lifetime_;
         }
         return *this;
     }
@@ -953,7 +953,7 @@ public:
         : resource_(other.resource()), lifetime_(other.lifetime_) {}
     template <class U>
     ThreadLocalAllocator(ThreadLocalAllocator<U>&& other) noexcept
-        : resource_(other.resource()), lifetime_(std::move(other.lifetime_)) {}
+        : resource_(other.resource()), lifetime_(other.lifetime_) {}
     template <class U>
     ThreadLocalAllocator(const std::pmr::polymorphic_allocator<U>& other) noexcept
         : ThreadLocalAllocator(other.resource()) {}
@@ -1027,7 +1027,7 @@ public:
 
     RingDeque(RingDeque&& other) noexcept
         : resource_(other.resource_)
-        , resource_lifetime_(std::move(other.resource_lifetime_))
+        , resource_lifetime_(other.resource_lifetime_)
         , data_(std::exchange(other.data_, nullptr))
         , head_(std::exchange(other.head_, 0))
         , size_(std::exchange(other.size_, 0))
@@ -1056,7 +1056,7 @@ public:
         if (this != &other) {
             clear();
             resource_ = other.resource_;
-            resource_lifetime_ = std::move(other.resource_lifetime_);
+            resource_lifetime_ = other.resource_lifetime_;
             data_ = std::exchange(other.data_, nullptr);
             head_ = std::exchange(other.head_, 0);
             size_ = std::exchange(other.size_, 0);

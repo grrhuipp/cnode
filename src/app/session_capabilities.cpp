@@ -376,8 +376,9 @@ net::awaitable<void> OutboundConfiguration::CollectRuntimeStats(
     for (const auto& sample : samples) {
         auto domain = sample.domain.lock();
         if (!domain) continue;
-        const auto values = co_await net::co_spawn(domain->Executor(),
-            [weak_host = sample.host, domain, include_resources]() mutable
+        auto executor = domain->Executor();
+        const auto values = co_await net::co_spawn(std::move(executor),
+            [weak_host = sample.host, domain = std::move(domain), include_resources]() mutable
                 -> net::awaitable<WorkerRuntimeStatsSnapshot> {
                 WorkerRuntimeStatsSnapshot snapshot;
                 auto host = weak_host.lock();
@@ -650,6 +651,7 @@ net::awaitable<void> PhysicalSessionCapabilities::AsyncJoin() {
     auto& reactor = impl_->reactor;
     try { co_await TimeoutScheduler::AsyncReleaseForIoContext(reactor); }
     catch (...) { if (!failure) failure = std::current_exception(); }
+    joined_ = true;
     user_view_.reset();
     const bool pending = impl_ && impl_->tracking.HasPendingTraffic();
     pending_traffic_.store(pending, std::memory_order_release);
@@ -669,7 +671,7 @@ bool PhysicalSessionCapabilities::HasPendingTraffic() const noexcept {
     return impl_ && impl_->tracking.HasPendingTraffic();
 }
 void PhysicalSessionCapabilities::ReleaseIdleAccounting() noexcept {
-    if (stopping_ && impl_ && !impl_->dispatcher && !impl_->tracking.HasPendingTraffic()) {
+    if (joined_ && impl_ && !impl_->tracking.HasPendingTraffic()) {
         pending_traffic_.store(false, std::memory_order_release);
         impl_.reset();
         allocation_.pool().PurgeIdle();

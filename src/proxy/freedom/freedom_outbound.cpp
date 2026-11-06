@@ -181,11 +181,16 @@ net::awaitable<OutboundProcessResult> Handler::Process(
             auto selected = send_through_.Select(
                 bind_address, ctx.inbound.source_ip, ctx.inbound.source_port);
             if (!selected.address && ctx.outbound.target.IsDomain()) {
-                const net::ip::address alt_family = bind_address.is_v6()
-                    ? net::ip::address(net::ip::address_v4::any())
-                    : net::ip::address(net::ip::address_v6::any());
-                selected = send_through_.Select(
-                    alt_family, ctx.inbound.source_ip, ctx.inbound.source_port);
+                const bool allow_alt = bind_address.is_v6()
+                    ? AcceptsIPv4(domain_strategy_)
+                    : AcceptsIPv6(domain_strategy_);
+                if (allow_alt) {
+                    const net::ip::address alt_family = bind_address.is_v6()
+                        ? net::ip::address(net::ip::address_v4::any())
+                        : net::ip::address(net::ip::address_v6::any());
+                    selected = send_through_.Select(
+                        alt_family, ctx.inbound.source_ip, ctx.inbound.source_port);
+                }
             }
             if (!selected.address) {
                 co_return tl::unexpected(ErrorCode::SOCKET_BIND_FAILED);

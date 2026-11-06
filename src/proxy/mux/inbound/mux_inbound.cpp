@@ -606,6 +606,9 @@ public:
                 (buffer.size() + std::numeric_limits<uint16_t>::max() - 1) /
                 std::numeric_limits<uint16_t>::max();
         }
+        if (payload_bytes == 0) {
+            co_return;
+        }
         if (!reply_queue_.CanPushTcp(payload_bytes, reply_count)) {
             reply_queue_.MarkTcpOverflow();
             Cancel();
@@ -629,6 +632,7 @@ public:
 
                 buf::MultiBuffer payload;
                 if (!buf::AppendSpanToMultiBuffer(chunk, payload)) {
+                    Cancel();
                     throw std::bad_alloc();
                 }
 
@@ -1127,6 +1131,13 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                     break;
                 }
                 continue;
+            }
+
+            if (client_reads.done && client_reads.error != ErrorCode::OK &&
+                client_reads.queue.empty()) {
+                result.error = client_reads.error;
+                running = false;
+                break;
             }
 
             // Sub-session input shares one budget. Parsing more client frames

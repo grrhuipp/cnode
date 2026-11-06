@@ -64,6 +64,10 @@ public:
         return dst_.AsyncShutdownWrite();
     }
 
+    bool WriteShutdownClosesLink() const noexcept override {
+        return dst_.WriteShutdownClosesLink();
+    }
+
 private:
     AsyncStream& dst_;
 };

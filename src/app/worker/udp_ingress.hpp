@@ -2,13 +2,13 @@
 
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
+#include "acppnode/common/buffer_util.hpp"
 #include "acppnode/common/error.hpp"
 #include "acppnode/proxy/inbound.hpp"
 #include "acppnode/transport/link.hpp"
 #include "udp_client_session_key.hpp"
 #include "udp_resource_budget.hpp"
 
-#include <array>
 #include <cstdint>
 #include <chrono>
 #include <memory>
@@ -75,9 +75,7 @@ public:
         buf::MultiBuffer payload;
         size_t payload_size = 0;
         UdpResourceBudget::PayloadReservation reservation;
-        std::array<net::const_buffer, buf::MultiBuffer::kInlineCapacity> inline_send_buffers{};
-        memory::ThreadLocalVector<net::const_buffer> spill_send_buffers;
-        size_t send_buffer_count = 0;
+        ConstBufferSpanBuilder<buf::MultiBuffer::kInlineCapacity> send_buffers;
 
         void PrepareSendBuffers();
         [[nodiscard]] std::span<const net::const_buffer> SendBuffers() const noexcept;
