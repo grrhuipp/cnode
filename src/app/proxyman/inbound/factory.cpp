@@ -1,5 +1,6 @@
 #include "acppnode/app/proxyman/inbound/factory.hpp"
 
+#include "acppnode/infra/config_types.hpp"
 #include "acppnode/proxy/inbound.hpp"
 
 #include <map>
@@ -21,8 +22,7 @@ RegistrationMap& Registrations() noexcept {
 void RegisterProxy(
     std::string_view protocol,
     ProxyRegistration registration) {
-    const bool has_user_builders = registration.build_static_users ||
-                                   registration.build_users;
+    const bool has_user_builders = registration.build_users != nullptr;
     const bool has_tcp = registration.create_tcp_handler != nullptr;
     const bool has_packet_datagrams =
         registration.create_datagram_handler != nullptr;
@@ -115,7 +115,7 @@ DatagramHandlerBuildResult NewDatagramHandler(
 std::optional<BuildRequest> PrepareBuildRequest(
     std::string_view protocol,
     std::string_view tag,
-    const ::acpp::StaticUserConfig& config) {
+    const ::acpp::InboundProtocolSettings& settings) {
     auto& registrations = Registrations();
     auto it = registrations.find(protocol);
     if (it == registrations.end()) {
@@ -128,37 +128,20 @@ std::optional<BuildRequest> PrepareBuildRequest(
         .settings = {},
     };
     if (it->second.prepare_settings) {
-        auto settings = it->second.prepare_settings(tag, config);
-        if (!settings) {
+        auto prepared = it->second.prepare_settings(tag, settings);
+        if (!prepared) {
             return std::nullopt;
         }
-        request.settings = std::move(*settings);
+        request.settings = std::move(*prepared);
     }
     return request;
 }
 
-std::optional<UserSet> BuildStaticUsers(
-    std::string_view protocol,
-    std::string_view tag,
-    const ::acpp::StaticUserConfig& config) {
-    auto& registrations = Registrations();
-    auto it = registrations.find(protocol);
-    if (it == registrations.end() || !it->second.build_static_users) {
-        return std::nullopt;
-    }
-    auto result = it->second.build_static_users(tag, config);
-    if (result && UserProtocolOf(*result) != *it->second.user_protocol) {
-        return std::nullopt;
-    }
-    return result;
-}
-
 std::optional<UserSet> BuildUsers(
-    std::string_view protocol,
     const BuildRequest& req,
-    std::span<const RuntimeUser> users) {
+    std::span<const ::acpp::InboundUserSpec> users) {
     auto& registrations = Registrations();
-    auto it = registrations.find(protocol);
+    auto it = registrations.find(req.protocol);
     if (it == registrations.end() || !it->second.build_users) {
         return std::nullopt;
     }

@@ -1,6 +1,7 @@
 #include "quic_stream.hpp"
 
 #include "hysteria_protocol.hpp"
+#include "quic_connection.hpp"
 
 #include "acppnode/common/buf/multi_buffer.hpp"
 #include "acppnode/transport/link_error.hpp"
@@ -14,7 +15,7 @@ namespace acpp::transport::internet::hysteria {
 
 QuicStreamState::QuicStreamState(
     net::io_context& io_context, int64_t stream_id,
-    std::weak_ptr<QuicStreamOwner> owner)
+    std::weak_ptr<Connection> owner)
     : io_context_(io_context)
     , stream_id_(stream_id)
     , owner_(std::move(owner))
@@ -188,7 +189,7 @@ bool QuicStream::IsOpen() const {
 
 UdpSessionStream::UdpSessionStream(
     net::io_context& io_context, uint32_t session_id,
-    TargetAddress first_target, std::weak_ptr<QuicStreamOwner> owner)
+    TargetAddress first_target, std::weak_ptr<Connection> owner)
     : io_context_(io_context)
     , session_id_(session_id)
     , first_target_(std::move(first_target))

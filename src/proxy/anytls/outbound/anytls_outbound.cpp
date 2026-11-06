@@ -6,6 +6,7 @@
 #include "../anytls_codec.hpp"
 #include "../padding.hpp"
 #include "acppnode/common/buf/length_prefixed_packet_buffer.hpp"
+#include "../../outbound_server.hpp"
 #include "../../handshake_timeout.hpp"
 #include "../../uot/uot.hpp"
 #include "acppnode/transport/internet/async_write_gate.hpp"
@@ -32,7 +33,10 @@
 #include <stdexcept>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace {
 
@@ -904,37 +908,14 @@ private:
 namespace {
 
 net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, ErrorCode>>
-DialOutboundStream(
-    net::io_context& io_context,
-    app::dns::DNS& dns_service,
-    const PreparedSettings& prepared,
-    const TransportSecurity& security,
-    std::chrono::seconds dial_timeout,
-    const tcp::endpoint* inbound_local_addr,
-    bool ordered_bind,
-    const OutboundBind::Selection& selected_v4,
-    const OutboundBind::Selection& selected_v6,
+DialPhysicalSession(
+    OutboundDialer& dialer,
+    const Settings& settings,
+    const OutboundDialer::OrderedBind* ordered_bind,
     std::chrono::seconds handshake_timeout,
     const PaddingScheme& opening_scheme,
     session::Context& ctx) {
-    auto dialed = co_await acpp::DialOutboundStream(
-        io_context,
-        ctx,
-        OutboundTargetOptions{
-            .dns_service = &dns_service,
-            .address = prepared.settings.address,
-            .literal_address = prepared.settings.literal_address,
-            .port = prepared.settings.port,
-            .stream_settings = &prepared.stream_settings,
-            .security = &security,
-            .timeout = dial_timeout,
-            .send_through = &prepared.settings.send_through,
-            .inbound_local_addr = inbound_local_addr,
-            .ordered_bind_v4 = ordered_bind
-                ? std::optional{selected_v4} : std::nullopt,
-            .ordered_bind_v6 = ordered_bind
-                ? std::optional{selected_v6} : std::nullopt,
-        });
+    auto dialed = co_await dialer.Dial(ctx, settings.server, ordered_bind);
     if (!dialed) {
         co_return tl::unexpected(dialed.error());
     }
@@ -946,7 +927,7 @@ DialOutboundStream(
 
     const uint16_t auth_padding_size = opening_scheme.SampleAuthPaddingSize();
     memory::ByteVector auth_packet(34 + auth_padding_size, uint8_t{0});
-    std::copy(prepared.settings.password_hash.begin(), prepared.settings.password_hash.end(), auth_packet.begin());
+    std::copy(settings.password_hash.begin(), settings.password_hash.end(), auth_packet.begin());
     auth_packet[32] = static_cast<uint8_t>(auth_padding_size >> 8);
     auth_packet[33] = static_cast<uint8_t>(auth_padding_size);
 
@@ -1019,28 +1000,22 @@ tl::expected<memory::ByteVector, ErrorCode> BuildOpenPacket(
 
 Handler::Handler(std::string_view tag,
                  net::io_context& io_context,
-                 std::shared_ptr<const PreparedSettings> prepared,
-                 std::chrono::seconds dial_timeout,
-                 app::dns::DNS& dns_service,
+                 std::shared_ptr<const Settings> settings,
                  AwaitableTaskGroup& tasks)
     : tag_(tag)
-    , prepared_(std::move(prepared))
-    , security_(prepared_->stream_settings, StreamEndpointRole::Outbound)
-    , dial_timeout_(dial_timeout)
-    , dns_service_(dns_service)
+    , settings_(std::move(settings))
     , padding_(memory::AllocateShared<PaddingState>())
     , pool_(std::make_unique<SessionPool>(
-          io_context, tasks, prepared_->settings.idle_session_check_interval,
-          prepared_->settings.idle_session_timeout, prepared_->settings.min_idle_sessions, tag_)) {}
+          io_context, tasks, settings_->idle_session_check_interval,
+          settings_->idle_session_timeout, settings_->min_idle_sessions, tag_)) {}
 
 Handler::~Handler() noexcept = default;
 
 net::awaitable<OutboundProcessResult> Handler::Process(
-    net::io_context& io_context,
-    const tcp::endpoint* inbound_local_addr,
     session::Context& ctx,
-    const TimeoutsConfig& timeouts,
     transport::Link inbound,
+    OutboundDialer& dialer,
+    const TimeoutsConfig& timeouts,
     StatsShard& stats,
     const RelayConfig& relay_config,
     buf::MultiBufferBatch first_payload,
@@ -1049,26 +1024,22 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     if (!inbound.Valid()) {
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
+    auto& io_context = dialer.IoContext();
 
     SessionPool::Lease transport_lease;
     std::shared_ptr<ClientSession> session;
     {
-        const bool ordered_bind = prepared_->settings.send_through.GetMode() == OutboundBind::Mode::Ordered;
-        const auto selected_v4 = ordered_bind
-            ? prepared_->settings.send_through.Select(net::ip::address_v4::any(),
-                ctx.inbound.source_ip, ctx.inbound.source_port)
-            : OutboundBind::Selection{};
-        const auto selected_v6 = ordered_bind
-            ? prepared_->settings.send_through.Select(net::ip::address_v6::any(),
-                ctx.inbound.source_ip, ctx.inbound.source_port)
-            : OutboundBind::Selection{};
+        // One Ordered selection per request: the pooled-session match and a
+        // new dial must agree even under a random choice policy.
+        const auto ordered_bind = dialer.SelectOrderedBind(ctx);
         transport_lease = ordered_bind
             ? pool_->AcquireIf([&](const ClientSession& physical) {
                 if (!physical.stream) return false;
                 const auto remote = physical.stream->RemoteEndpoint();
                 const auto local = physical.stream->LocalEndpoint();
                 if (!remote || !local) return false;
-                const auto& selected = remote->address().is_v6() ? selected_v6 : selected_v4;
+                const auto& selected = remote->address().is_v6()
+                    ? ordered_bind->v6 : ordered_bind->v4;
                 return !selected.address ||
                     iputil::NormalizeAddress(local->address()) == *selected.address;
             })
@@ -1077,16 +1048,10 @@ net::awaitable<OutboundProcessResult> Handler::Process(
 
         if (!session) {
             auto opening_scheme = padding_->scheme;
-            auto dialed = co_await DialOutboundStream(
-                io_context,
-                dns_service_,
-                *prepared_,
-                security_,
-                dial_timeout_,
-                inbound_local_addr,
-                ordered_bind,
-                selected_v4,
-                selected_v6,
+            auto dialed = co_await DialPhysicalSession(
+                dialer,
+                *settings_,
+                ordered_bind ? &*ordered_bind : nullptr,
                 timeouts.HandshakeTimeout(),
                 *opening_scheme,
                 ctx);
@@ -1098,7 +1063,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
             transport_lease = pool_->Adopt(session);
         } else if (session->stream) {
             LOG_CONN_DEBUG(ctx, "reusing idle session sid={}", session->next_sid);
-            RecordOutboundStreamConnected(ctx, *session->stream);
+            dialer.RecordConnected(ctx, *session->stream);
         }
     }
 
@@ -1311,40 +1276,30 @@ namespace {
 const bool kOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
     acpp::constants::protocol::kAnyTLS,
     [](const acpp::infra::OutboundSourceConfig& cfg)
-        -> std::optional<acpp::proxyman::outbound::PreparedOutboundCreator> {
+        -> std::optional<acpp::proxyman::outbound::PreparedOutboundProxy> {
         auto settings = acpp::proxy::anytls::outbound::ParseSettings(cfg.settings);
         if (!settings) {
             LOG_ERROR("AnyTLS outbound '{}': invalid settings: {}",
                       cfg.tag, settings.error());
             return std::nullopt;
         }
-        settings->send_through = cfg.send_through.value_or(acpp::OutboundBind{});
-        auto prepared_stream_settings = acpp::NormalizeOutboundStreamSettings(
-            cfg.stream_settings,
-            acpp::OutboundStreamDefaults{
-                .require_tls = true,
-                .fallback_server_name = settings->address,
-                .allow_insecure = false,
-                .alpn = {},
-            });
-        acpp::TransportSecurity::Prepare(
-            prepared_stream_settings, acpp::StreamEndpointRole::Outbound);
-        using PreparedSettings = acpp::proxy::anytls::outbound::PreparedSettings;
-        return acpp::proxyman::outbound::MakePreparedOutboundCreator<
-            PreparedSettings,
-            +[](std::string_view tag,
-                std::shared_ptr<const PreparedSettings> state,
-                acpp::net::io_context& io_context,
-                acpp::app::dns::DNS& dns,
-                std::chrono::seconds dial_timeout,
-                acpp::AwaitableTaskGroup& tasks) -> std::unique_ptr<acpp::Outbound> {
-                return std::make_unique<acpp::proxy::anytls::outbound::Handler>(
-                    tag,
-                    io_context,
-                    std::move(state),
-                    dial_timeout,
-                    dns,
-                    tasks);
-            }>(PreparedSettings{std::move(*settings), std::move(prepared_stream_settings)}, true);
+        auto stream_settings = acpp::proxy::PrepareOutboundStream(
+            cfg, settings->server, acpp::OutboundStreamDefaults{.require_tls = true});
+        using Settings = acpp::proxy::anytls::outbound::Settings;
+        return acpp::proxyman::outbound::PreparedOutboundProxy{
+            .create = acpp::proxyman::outbound::MakePreparedOutboundCreator<
+                Settings,
+                +[](std::string_view tag,
+                    std::shared_ptr<const Settings> state,
+                    acpp::net::io_context& io_context,
+                    acpp::AwaitableTaskGroup& tasks) -> std::unique_ptr<acpp::Outbound> {
+                    return std::make_unique<acpp::proxy::anytls::outbound::Handler>(
+                        tag, io_context, std::move(state), tasks);
+                }>(std::move(*settings), true),
+            .sender = acpp::OutboundSenderSettings{
+                .stream_settings = std::move(stream_settings),
+                .send_through = {},
+            },
+        };
     }), true);
 }  // namespace

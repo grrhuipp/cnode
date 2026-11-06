@@ -8,6 +8,7 @@
 #include "acppnode/transport/internet/transport_security.hpp"
 
 #include <iostream>
+#include <span>
 #include <stdexcept>
 
 namespace acpp {
@@ -21,12 +22,12 @@ using namespace acpp;
 using namespace acpp::proxyman::inbound;
 size_t user_builds = 0;
 
-std::optional<UserSet> BuildUsers(std::string_view, const StaticUserConfig& source) {
+std::optional<UserSet> FakeBuildUsers(const BuildRequest&, std::span<const InboundUserSpec> specs) {
     ++user_builds;
     PreparedVmessUsers users;
-    for (const auto& client : source.clients) {
-        if (client.id == "reject") return std::nullopt;
-        users.push_back(PreparedVmessUser{.uuid = client.id, .profile = {}});
+    for (const auto& spec : specs) {
+        if (spec.credential == "reject") return std::nullopt;
+        users.push_back(PreparedVmessUser{.uuid = spec.credential, .profile = {}});
     }
     return users;
 }
@@ -37,7 +38,7 @@ StaticInboundConfig Source(std::string tag, uint16_t port, std::string user = "s
     source.tags.push_back(std::move(tag));
     source.port = port;
     source.listen = *InboundListen::Parse("127.0.0.1");
-    source.static_users.clients.push_back(StaticUser{.id = std::move(user), .password = {}, .email = {}, .flow = {}});
+    source.users.push_back(InboundUserSpec{.user_id = 0, .email = {}, .credential = std::move(user), .flow = {}, .speed_limit = 0, .device_limit = 0});
     return source;
 }
 
@@ -56,7 +57,7 @@ int main() {
     registration.create_runtime = []() -> std::unique_ptr<ProtocolRuntime> { return {}; };
     registration.create_tcp_handler = [](ProtocolRuntime&, StatsShard&, ConnectionLimiter*,
                                           const BuildRequest&) -> std::unique_ptr<Inbound> { return {}; };
-    registration.build_static_users = &BuildUsers;
+    registration.build_users = &FakeBuildUsers;
     RegisterProxy("vmess", registration);
 
     {
@@ -72,19 +73,19 @@ int main() {
         !Rejected({Source("static-owner", constants::test::kTestPort)}, true) || user_builds != 0) return 1;
 
     const auto prepared = PrepareStartupInbounds({Source("static-owner", 12000)}, true);
-    if (prepared.size() != 2 || prepared[0].runtime.proxy_protocol != ProxyProtocolMode::Auto ||
-        prepared[1].runtime.proxy_protocol != ProxyProtocolMode::Auto) return 6;
+    if (prepared.size() != 2 || prepared[0].receiver.proxy_protocol != ProxyProtocolMode::Auto ||
+        prepared[1].receiver.proxy_protocol != ProxyProtocolMode::Auto) return 6;
     if (user_builds != 2 || prepared.size() != 2 ||
-        prepared[0].runtime.tag != "static-owner" || prepared[0].runtime.build_request.tag != "static-owner" ||
-        prepared[1].runtime.tag != constants::test::kTestInboundTag ||
-        prepared[1].runtime.build_request.tag != constants::test::kTestInboundTag ||
-        prepared[1].runtime.port != constants::test::kTestPort ||
-        prepared[1].runtime.stream_settings.network != "tcp" ||
-        prepared[1].runtime.stream_settings.security != "none" ||
-        prepared[1].runtime.stream_settings.network_mode != NetworkMode::Tcp ||
-        prepared[1].runtime.stream_settings.security_mode != SecurityMode::None ||
-        !prepared[1].runtime.sniffing.enabled || !prepared[1].runtime.listen.IsAuto() ||
-        std::get<PreparedVmessUsers>(prepared[1].users).front().uuid != constants::test::kTestVmessUuid ||
+        prepared[0].binding.tag != "static-owner" || prepared[0].build_request.tag != "static-owner" ||
+        prepared[1].binding.tag != constants::test::kTestInboundTag ||
+        prepared[1].build_request.tag != constants::test::kTestInboundTag ||
+        prepared[1].binding.port != constants::test::kTestPort ||
+        prepared[1].receiver.stream_settings.network != "tcp" ||
+        prepared[1].receiver.stream_settings.security != "none" ||
+        prepared[1].receiver.stream_settings.network_mode != NetworkMode::Tcp ||
+        prepared[1].receiver.stream_settings.security_mode != SecurityMode::None ||
+        !prepared[1].receiver.dispatch_policy.sniffing.enabled || !prepared[1].binding.listen.IsAuto() ||
+        std::get<PreparedVmessUsers>(*prepared[1].users).front().uuid != constants::test::kTestVmessUuid ||
         UserStore::VmessUsers("static-owner").users != old ||
         !UserStore::VmessUsers(constants::test::kTestInboundTag).empty()) return 2;
 
@@ -103,16 +104,16 @@ int main() {
     forced_override.outbound_tag = "custom-out";
     const auto policies = PrepareStartupInbounds(
         {Source("default-direct", 12000), routed, forced, forced_override}, false);
-    if (policies.size() != 4 || policies[1].runtime.proxy_protocol != ProxyProtocolMode::On ||
-        policies[0].runtime.proxy_protocol != ProxyProtocolMode::Auto) return 7;
+    if (policies.size() != 4 || policies[1].receiver.proxy_protocol != ProxyProtocolMode::On ||
+        policies[0].receiver.proxy_protocol != ProxyProtocolMode::Auto) return 7;
     if (policies.size() != 4 ||
-        !std::holds_alternative<routing::ForceOutbound>(policies[0].runtime.outbound_policy) ||
-        std::get<routing::ForceOutbound>(policies[0].runtime.outbound_policy).outbound_tag != "direct" ||
-        !std::holds_alternative<routing::RouteWithFallback>(policies[1].runtime.outbound_policy) ||
-        std::get<routing::RouteWithFallback>(policies[1].runtime.outbound_policy).outbound_tag != "direct" ||
-        !std::holds_alternative<routing::ForceOutbound>(policies[2].runtime.outbound_policy) ||
-        std::get<routing::ForceOutbound>(policies[2].runtime.outbound_policy).outbound_tag != "custom-out" ||
-        !std::holds_alternative<routing::ForceOutbound>(policies[3].runtime.outbound_policy) ||
-        std::get<routing::ForceOutbound>(policies[3].runtime.outbound_policy).outbound_tag != "custom-out") return 5;
+        !std::holds_alternative<routing::ForceOutbound>(policies[0].receiver.dispatch_policy.outbound) ||
+        std::get<routing::ForceOutbound>(policies[0].receiver.dispatch_policy.outbound).outbound_tag != "direct" ||
+        !std::holds_alternative<routing::RouteWithFallback>(policies[1].receiver.dispatch_policy.outbound) ||
+        std::get<routing::RouteWithFallback>(policies[1].receiver.dispatch_policy.outbound).outbound_tag != "direct" ||
+        !std::holds_alternative<routing::ForceOutbound>(policies[2].receiver.dispatch_policy.outbound) ||
+        std::get<routing::ForceOutbound>(policies[2].receiver.dispatch_policy.outbound).outbound_tag != "custom-out" ||
+        !std::holds_alternative<routing::ForceOutbound>(policies[3].receiver.dispatch_policy.outbound) ||
+        std::get<routing::ForceOutbound>(policies[3].receiver.dispatch_policy.outbound).outbound_tag != "custom-out") return 5;
     std::cout << "startup sources share validation and preparation without user publication\n";
 }

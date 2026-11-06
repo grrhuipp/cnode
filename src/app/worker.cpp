@@ -31,13 +31,11 @@
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
 #include "worker/tcp_listener.hpp"
 #include "worker/udp_ingress.hpp"
-#include "acppnode/app/proxyman/outbound/handler_registry.hpp"
 #include "acppnode/app/session_tracking.hpp"
 #include "acppnode/app/session_capabilities.hpp"
 #include "acppnode/app/session_group_executor.hpp"
 #include "acppnode/app/dns/dns.hpp"
 #include "acppnode/app/dns/dns_worker.hpp"
-#include "acppnode/app/proxyman/outbound/factory.hpp"
 #include "acppnode/transport/internet/datagram_socket.hpp"
 #include "acppnode/transport/internet/tcp_stream.hpp"
 #include "acppnode/transport/internet/async_delay.hpp"
@@ -301,11 +299,12 @@ struct Worker::RuntimeState {
     std::unique_ptr<proxyman::inbound::HandlerRegistry> inbound_handlers;
     std::unique_ptr<app::SessionTrackingState> session_tracking;
     std::unique_ptr<app::dns::DNS> dns_service;
-    // Work that outlives one request (pooled AnyTLS physical sessions). It is
-    // built on this Worker's executor, outlives every handler and is joined
-    // after all request owners finish.
+    // Worker-level dispatch (QUIC, native UDP) reads the same outbound
+    // publication as physical sessions. Its handlers' resident work (pooled
+    // AnyTLS sessions) runs here; built on this Worker's executor, it outlives
+    // every handler and is joined after all request owners finish.
     std::unique_ptr<ResidentTaskGroup> outbound_tasks;
-    std::unique_ptr<proxyman::outbound::HandlerRegistry> outbound_handlers;
+    std::unique_ptr<proxyman::outbound::HandlerLookup> outbound_handlers;
     std::shared_ptr<app::router::Router> router;
     std::shared_ptr<rule::DetectRulePolicy> detect_rule_policy;
     std::unique_ptr<app::dispatcher::DefaultDispatcher> dispatcher;
@@ -599,7 +598,6 @@ void Worker::RuntimeState::Start(Worker& worker) {
     session_tracking = std::make_unique<app::SessionTrackingState>();
     inbound_handlers = std::make_unique<proxyman::inbound::HandlerRegistry>(stats);
     outbound_tasks = std::make_unique<ResidentTaskGroup>(io_context.get_executor());
-    outbound_handlers = std::make_unique<proxyman::outbound::HandlerRegistry>();
     detect_rule_policy = std::make_shared<rule::DetectRulePolicy>();
     const auto* config = startup_config.get();
     if (!connection_limiter) {
@@ -613,29 +611,20 @@ void Worker::RuntimeState::Start(Worker& worker) {
             config->pressure_threshold, config->pressure_idle_timeout,
             *worker.group_coordinator_);
     }
-    const auto dial_timeout = timeouts.DialTimeout();
-    for (const auto& prepared_outbound : config->outbounds) {
-        auto handler = proxyman::outbound::NewHandler(
-            prepared_outbound, io_context, *dns_service, dial_timeout,
-            outbound_tasks->Tasks());
-        if (!outbound_handlers->AddHandler(std::move(handler))) {
-            throw std::logic_error(
-                "failed to install prepared outbound '" +
-                prepared_outbound.tag + "'");
-        }
-        LOG_DEBUG("registered outbound worker={} protocol={} tag={}",
-                  worker.id_, prepared_outbound.protocol, prepared_outbound.tag);
-    }
     router = std::make_shared<app::router::Router>(config->routing, geo_database);
     LOG_DEBUG("router initialized worker={} rules={}",
               worker.id_, config->routing.rules.size());
-    dispatcher = std::make_unique<app::dispatcher::DefaultDispatcher>(
-        *router, *outbound_handlers, *detect_rule_policy, *session_tracking,
-        *dns_service, *request_load);
     session_configuration = std::make_shared<const app::SessionConfiguration>(
         *config, router, detect_rule_policy);
     session_configuration->outbounds->BindHosts(io_context, worker.id_,
         worker.group_coordinator_, dns_worker, timeouts.DialTimeout());
+    outbound_handlers = std::make_unique<proxyman::outbound::HandlerLookup>(
+        *session_configuration->outbounds, io_context, *dns_service,
+        timeouts.DialTimeout(), outbound_tasks->Tasks(),
+        proxyman::outbound::HandlerLookup::StatefulTags::InstantiateLocally);
+    dispatcher = std::make_unique<app::dispatcher::DefaultDispatcher>(
+        *router, *outbound_handlers, *detect_rule_policy, *session_tracking,
+        *dns_service, *request_load);
     started = true;
     startup_config.reset();
 }
@@ -1178,31 +1167,9 @@ void Worker::AddOutbound(proxyman::outbound::PreparedOutboundConfig config) {
         !runtime_ || runtime_->listener_state->stopping)
         throw IoSystemError(net::error::operation_aborted);
     ColdMutationGuard mutation(runtime_->cold_mutation_active, runtime_->listener_state.get());
-    auto handler = proxyman::outbound::NewHandler(
-        config, runtime_->io_context,
-        *runtime_->dns_service,
-        runtime_->timeouts.DialTimeout(),
-        runtime_->outbound_tasks->Tasks());
-
-    if (!handler) {
-        throw std::logic_error(
-            "failed to install dynamic outbound '" + config.tag + "'");
-    }
-    auto previous = runtime_->outbound_handlers->GetHandler(config.tag);
-    if (!runtime_->outbound_handlers->ReplaceHandler(std::move(handler))) {
-        throw std::logic_error(
-            "failed to install dynamic outbound '" + config.tag + "'");
-    }
-    try {
-        runtime_->session_configuration->outbounds->Replace(config);
-    } catch (...) {
-        if (previous) {
-            runtime_->outbound_handlers->RestoreHandler(std::move(previous));
-        } else {
-            runtime_->outbound_handlers->RemoveHandler(config.tag);
-        }
-        throw;
-    }
+    // The one publication; the Worker-level lookup drops retired handlers now.
+    runtime_->session_configuration->outbounds->Replace(config);
+    runtime_->outbound_handlers->Refresh();
 
     LOG_DEBUG("registered dynamic outbound worker={} protocol={} tag={}",
               id_, config.protocol, config.tag);
@@ -1215,7 +1182,7 @@ void Worker::RemoveOutbound(std::string_view tag) {
         throw IoSystemError(net::error::operation_aborted);
     ColdMutationGuard mutation(runtime_->cold_mutation_active, runtime_->listener_state.get());
     runtime_->session_configuration->outbounds->Remove(tag);
-    runtime_->outbound_handlers->RemoveHandler(tag);
+    runtime_->outbound_handlers->Refresh();
 }
 
 void Worker::InstallUserView(proxyman::inbound::UserStore::WorkerView view) {

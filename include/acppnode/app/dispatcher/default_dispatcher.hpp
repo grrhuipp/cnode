@@ -8,15 +8,14 @@
 
 namespace acpp {
 
-class Outbound;
-
 namespace routing {
 class Router;
 }  // namespace routing
 
-namespace features::outbound {
+namespace proxyman::outbound {
+class Handler;
 class HandlerLookup;
-}  // namespace features::outbound
+}  // namespace proxyman::outbound
 
 namespace features::policy {
 class RequestPolicy;
@@ -48,7 +47,7 @@ class DefaultDispatcher final : public routing::Dispatcher, public memory::Threa
 public:
     DefaultDispatcher(
         const routing::Router& router,
-        features::outbound::HandlerLookup& outbound_handlers,
+        proxyman::outbound::HandlerLookup& outbound_handlers,
         features::policy::RequestPolicy& request_policy,
         app::SessionTrackingState& session_tracking,
         app::dns::DNS& dns_service,
@@ -66,7 +65,7 @@ public:
 
 private:
     struct RouteResult {
-        std::shared_ptr<Outbound> handler;
+        std::shared_ptr<proxyman::outbound::Handler> handler;
         ErrorCode error;
     };
 
@@ -94,7 +93,7 @@ private:
         const routing::DispatchPolicy& policy);
 
     const routing::Router& router_;
-    features::outbound::HandlerLookup& outbound_handlers_;
+    proxyman::outbound::HandlerLookup& outbound_handlers_;
     features::policy::RequestPolicy& request_policy_;
     app::SessionTrackingState& session_tracking_;
     app::dns::DNS& dns_service_;

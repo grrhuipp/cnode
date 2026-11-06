@@ -9,8 +9,7 @@
 #include "acppnode/app/dns/dns.hpp"
 #include "acppnode/common/session.hpp"
 #include "acppnode/features/policy/request_policy.hpp"
-#include "acppnode/features/outbound/outbound.hpp"
-#include "acppnode/proxy/outbound.hpp"
+#include "acppnode/app/proxyman/outbound/handler.hpp"
 #include "acppnode/infra/runtime_config_types.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/features/routing/router.hpp"
@@ -129,7 +128,7 @@ struct ActiveSessionScope {
 
 DefaultDispatcher::DefaultDispatcher(
     const routing::Router& router,
-    features::outbound::HandlerLookup& outbound_handlers,
+    proxyman::outbound::HandlerLookup& outbound_handlers,
     features::policy::RequestPolicy& request_policy,
     app::SessionTrackingState& session_tracking,
     app::dns::DNS& dns_service,
@@ -455,14 +454,14 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
         co_return;
     }
 
-    // UDP 与 TCP 共用主链路：dispatcher.Dispatch -> outbound.Process -> relay。
-    // UDP 数据面（Full Cone + framer）下沉到 UDP-capable 出站的 Process，由下方
-    // 通用路径设置入站 idle/write timeout 并调用 outbound.Process。
+    // UDP 与 TCP 共用主链路：dispatcher.Dispatch -> Handler.Dispatch ->
+    // proxy::Outbound::Process（唯一一次动态分派）-> relay。
 
-    std::optional<tcp::endpoint> inbound_local_addr =
-        inbound_control ? inbound_control->LocalEndpoint() : std::nullopt;
-    if (!inbound_local_addr && ctx.inbound.local_endpoint) {
-        inbound_local_addr = ctx.inbound.local_endpoint;
+    // The handler's dialer reads the inbound local address from the session
+    // (Xray: inbound connection local address); fill it from the control
+    // stream when the ingress did not record one.
+    if (!ctx.inbound.local_endpoint && inbound_control) {
+        ctx.inbound.local_endpoint = inbound_control->LocalEndpoint();
     }
     const auto relay_idle_timeout = ResolveRelayIdleTimeout(
         timeouts, pressure_idle_timeout);
@@ -497,12 +496,10 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
                    ctx.outbound.target, relay_payload_size);
 
     ActiveSessionScope relay_scope{ctx, session_tracking_};
-    auto outbound_process = co_await outbound_handler->Process(
-        io_context,
-        inbound_local_addr ? &*inbound_local_addr : nullptr,
+    auto outbound_process = co_await outbound_handler->Dispatch(
         ctx,
-        timeouts,
         transport::Link{inbound_reader, inbound_writer, inbound_control},
+        timeouts,
         stats,
         relay_cfg,
         std::move(outbound_first_payload),

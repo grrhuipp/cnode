@@ -8,6 +8,7 @@
 
 namespace acpp {
 class AsyncStream;
+class ConnectionLimiter;
 struct StatsShard;
 struct TimeoutsConfig;
 }  // namespace acpp
@@ -30,6 +31,8 @@ namespace acpp::mux {
 //
 // client_link: 已完成外层协议解密的 inbound Link。
 // dispatcher: 子会话回到主请求链路重新路由和出站处理。
+// limiter: 每个子会话按物理连接 family 取逻辑准入（与 HTTP/2 逻辑流一致），
+//          被拒子会话仅以带 OptionError 的 END 关闭，不影响父连接。
 // ============================================================================
 net::awaitable<RelayResult> ProcessInbound(
     net::io_context& io_context,
@@ -37,6 +40,7 @@ net::awaitable<RelayResult> ProcessInbound(
     AsyncStream& client_control,
     routing::Dispatcher& dispatcher,
     const routing::DispatchPolicy& policy,
+    ConnectionLimiter* limiter,
     session::Context& parent_ctx,
     StatsShard& stats,
     const TimeoutsConfig& timeouts,

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "acppnode/app/static_inbound_prepared_config.hpp"
+#include "acppnode/app/prepared_inbound.hpp"
 
 #include "acppnode/common/asio_types.hpp"
 #include <memory>
@@ -10,10 +10,10 @@ namespace acpp {
 
 class Worker;
 struct InboundStartup {
-    std::vector<StaticInboundRuntimeEntry> entries;
+    std::vector<PreparedInbound> entries;
 };
 
 net::awaitable<void> StartWorkerInbounds(
-    Worker& worker, std::vector<StaticInboundRuntimeEntry> inbounds);
+    Worker& worker, std::vector<PreparedInbound> inbounds);
 
 }  // namespace acpp

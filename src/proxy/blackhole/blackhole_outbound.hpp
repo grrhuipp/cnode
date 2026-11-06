@@ -22,24 +22,20 @@ struct BlackholeSettings {
 // ============================================================================
 class Handler final : public Outbound {
 public:
-    Handler(std::string_view tag, const BlackholeSettings& settings);
+    explicit Handler(const BlackholeSettings& settings);
 
     net::awaitable<OutboundProcessResult> Process(
-        net::io_context& io_context,
-        const tcp::endpoint* inbound_local_addr,
         session::Context& ctx,
-        const TimeoutsConfig& timeouts,
         transport::Link inbound,
+        OutboundDialer& dialer,
+        const TimeoutsConfig& timeouts,
         StatsShard& stats,
         const RelayConfig& relay_config,
         buf::MultiBufferBatch first_payload,
         std::chrono::seconds relay_idle_timeout,
         std::chrono::seconds relay_write_timeout) override;
 
-    std::string_view Tag() const noexcept override { return tag_; }
-
 private:
-    memory::ThreadLocalString tag_;
     bool http_response_;
 };
 

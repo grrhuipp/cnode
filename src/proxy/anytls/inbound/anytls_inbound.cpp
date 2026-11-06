@@ -208,6 +208,7 @@ public:
     AnyTLSDemuxSession(std::unique_ptr<AsyncStream> stream,
                        routing::Dispatcher& dispatcher,
                        const routing::DispatchPolicy& policy,
+                       ConnectionLimiter* limiter,
                        net::io_context& io_context,
                        const session::Context& session_ctx,
                        StatsShard& stats,
@@ -217,6 +218,7 @@ public:
         : stream_(std::move(stream))
         , dispatcher_(dispatcher)
         , policy_(policy)
+        , limiter_(limiter)
         , io_context_(io_context)
         , session_ctx_(session_ctx)
         , stats_(stats)
@@ -417,6 +419,7 @@ private:
     std::unique_ptr<AsyncStream> stream_;
     routing::Dispatcher& dispatcher_;
     const routing::DispatchPolicy& policy_;
+    ConnectionLimiter* limiter_;
     net::io_context& io_context_;
     const session::Context& session_ctx_;
     StatsShard& stats_;
@@ -489,9 +492,19 @@ net::awaitable<ErrorCode> AnyTLSDemuxSession::ProcessUdpSubstream(
 
 net::awaitable<ErrorCode> AnyTLSDemuxSession::ProcessStream(
     AnyTLSSubStream& sub, std::chrono::steady_clock::time_point opened_at) {
+    session::Context& ctx = sub.ctx;
+    // Held for the stream's lifetime; a refusal ends only this stream.
+    const auto admission = co_await proxy::AdmitInboundSubstream(limiter_, stats_, ctx);
+    if (!admission) {
+        if (session_version_ == anytls::SessionVersion::V2) {
+            constexpr std::string_view message = "connection rejected";
+            (void)co_await WriteFrameSerialized(anytls::kCmdSYNACK, sub.Sid(),
+                std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(message.data()), message.size()));
+        }
+        co_return ErrorCode::BLOCKED;
+    }
     buf::MultiBuffer pending;
     std::optional<proxy::uot::Version> uot_version;
-    session::Context& ctx = sub.ctx;
     auto prepare = [&]() -> net::awaitable<ErrorCode> {
         auto parsed = co_await ReadAddress(sub, pending, AddressWireFormat::Socks5,
                                            0, {255, true});
@@ -847,6 +860,7 @@ Handler::Process(
         std::move(stream),
         dispatcher,
         receiver.dispatch_policy,
+        limiter_,
         io_context,
         ctx,
         *stats_,
@@ -897,7 +911,7 @@ const bool kInboundRegistered = [] {
         };
 
     reg.prepare_settings =
-        [](std::string_view tag, const acpp::StaticUserConfig& config)
+        [](std::string_view tag, const acpp::InboundProtocolSettings& config)
             -> std::optional<std::shared_ptr<
                 const acpp::proxyman::inbound::ProtocolSettings>> {
             // Text was validated (size and grammar) by infra::ParseAnyTlsPaddingScheme;
@@ -917,42 +931,23 @@ const bool kInboundRegistered = [] {
             return settings;
         };
 
-    reg.build_static_users =
-        [](std::string_view tag, const acpp::StaticUserConfig& config)
-            -> std::optional<acpp::proxyman::inbound::UserSet> {
-            std::vector<acpp::proxyman::inbound::PreparedAnyTlsUser> users;
-            users.reserve(config.clients.size());
-            for (const auto& client : config.clients) {
-                const std::string& password =
-                    client.password.empty() ? client.id : client.password;
-                if (password.empty()) {
-                    LOG_WARN("AnyTLS inbound '{}': static user password is empty", tag);
-                    return std::nullopt;
-                }
-                acpp::proxyman::inbound::PreparedAnyTlsUser info;
-                info.password_hash = acpp::anytls::PasswordHash(password);
-                info.profile.email = client.email.empty() ? std::string(tag) : client.email;
-                users.push_back(std::move(info));
-            }
-            return acpp::proxyman::inbound::UserSet{std::move(users)};
-        };
-
     reg.build_users =
-        [](const acpp::proxyman::inbound::BuildRequest& /*req*/,
-           std::span<const acpp::proxyman::inbound::RuntimeUser> runtime_users)
+        [](const acpp::proxyman::inbound::BuildRequest& req,
+           std::span<const acpp::InboundUserSpec> specs)
             -> std::optional<acpp::proxyman::inbound::UserSet> {
             std::vector<acpp::proxyman::inbound::PreparedAnyTlsUser> users;
-            users.reserve(runtime_users.size());
-            for (const auto& runtime_user : runtime_users) {
-                if (runtime_user.credential.empty()) {
+            users.reserve(specs.size());
+            for (const auto& spec : specs) {
+                if (spec.credential.empty()) {
+                    LOG_WARN("AnyTLS inbound '{}': user password is empty", req.tag);
                     return std::nullopt;
                 }
                 acpp::proxyman::inbound::PreparedAnyTlsUser info;
-                info.password_hash = acpp::anytls::PasswordHash(runtime_user.credential);
-                info.profile.email = runtime_user.email;
-                info.profile.user_id = runtime_user.user_id;
-                info.profile.speed_limit = runtime_user.speed_limit;
-                info.profile.device_limit = runtime_user.device_limit;
+                info.password_hash = acpp::anytls::PasswordHash(spec.credential);
+                info.profile.email = spec.email;
+                info.profile.user_id = spec.user_id;
+                info.profile.speed_limit = spec.speed_limit;
+                info.profile.device_limit = spec.device_limit;
                 users.push_back(std::move(info));
             }
             return acpp::proxyman::inbound::UserSet{std::move(users)};

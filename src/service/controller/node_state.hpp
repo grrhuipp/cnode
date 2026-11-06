@@ -1,10 +1,9 @@
 #pragma once
 
 #include "acppnode/api/api.hpp"
-#include "acppnode/app/proxyman/inbound/prepared_config.hpp"
-#include "acppnode/app/proxyman/inbound/user_store.hpp"
+#include "acppnode/app/prepared_inbound.hpp"
+#include "acppnode/app/runtime_publication.hpp"
 #include "acppnode/app/proxyman/outbound/prepared_config.hpp"
-#include "inboundbuilder.hpp"
 
 #include <array>
 #include <cstdint>
@@ -24,17 +23,12 @@ struct NodeSnapshot {
     std::vector<rule::DetectRule> rules;
     std::string protocol;
     std::string tag;
-    std::shared_ptr<const InboundBuild> inbound;
+    // Prepared by the shared inbound builder; carries the prepared users.
+    std::shared_ptr<const PreparedInbound> inbound;
     std::shared_ptr<const proxyman::outbound::PreparedOutboundConfig> outbound;
-    std::shared_ptr<const proxyman::inbound::UserSet> prepared_users;
 };
 
 enum class NodeRuntimePhase { Stopped, Ready, Updating, RecoveryRequired };
-
-struct UserPublicationRecovery {
-    proxyman::inbound::UserStore::PublishedSnapshot previous;
-    std::vector<proxyman::inbound::UserStore::WorkerView> worker_views;
-};
 
 struct NodeState {
     std::shared_ptr<const NodeSnapshot> committed;
@@ -42,7 +36,7 @@ struct NodeState {
     // A failed transition can leave only its old and candidate tags behind.
     // No new transition starts until both have been cleaned successfully.
     std::array<std::shared_ptr<const NodeSnapshot>, 2> pending_cleanup;
-    std::optional<UserPublicationRecovery> user_recovery;
+    std::optional<UserPublicationRollback> user_recovery;
 
     [[nodiscard]] bool HasPendingCleanup() const noexcept {
         return pending_cleanup[0] || pending_cleanup[1] || user_recovery.has_value();

@@ -2,8 +2,8 @@
 
 #include "acppnode/common/asio_types.hpp"
 #include "acppnode/proxy/outbound.hpp"
+#include "acppnode/transport/internet/outbound_sender.hpp"
 
-#include <chrono>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -12,9 +12,6 @@
 
 namespace acpp {
 class AwaitableTaskGroup;
-namespace app::dns {
-class DNS;
-}
 }  // namespace acpp
 
 namespace acpp::proxyman::outbound {
@@ -30,21 +27,18 @@ struct TypedOutboundProtocolSettings final : OutboundProtocolSettings {
     T value;
 };
 
-// Session-domain runtime handed to a handler: native reactor, DNS control client,
-// dial timeout and resident task group. The latter joins before host teardown.
+// Constructs the protocol instance for one executing domain: its native reactor
+// and resident task group (joined before the domain's teardown). Dialing goes
+// through the owning Handler's OutboundDialer, never through creator state.
 struct PreparedOutboundCreator {
     using CreateFn = std::unique_ptr<::acpp::Outbound> (*)(
         std::string_view tag,
         const std::shared_ptr<const OutboundProtocolSettings>& settings,
         ::acpp::net::io_context& io_context,
-        ::acpp::app::dns::DNS& dns,
-        std::chrono::seconds dial_timeout,
         ::acpp::AwaitableTaskGroup& tasks);
     using StatelessCreateFn = std::unique_ptr<::acpp::Outbound> (*)(
         std::string_view tag,
         ::acpp::net::io_context& io_context,
-        ::acpp::app::dns::DNS& dns,
-        std::chrono::seconds dial_timeout,
         ::acpp::AwaitableTaskGroup& tasks);
 
     std::shared_ptr<const OutboundProtocolSettings> settings;
@@ -72,13 +66,11 @@ struct PreparedOutboundCreator {
     [[nodiscard]] std::unique_ptr<::acpp::Outbound> operator()(
         std::string_view tag,
         ::acpp::net::io_context& io_context,
-        ::acpp::app::dns::DNS& dns,
-        std::chrono::seconds dial_timeout,
         ::acpp::AwaitableTaskGroup& tasks) const {
         if (create_fn) {
-            return create_fn(tag, settings, io_context, dns, dial_timeout, tasks);
+            return create_fn(tag, settings, io_context, tasks);
         }
-        return stateless_fn(tag, io_context, dns, dial_timeout, tasks);
+        return stateless_fn(tag, io_context, tasks);
     }
 };
 
@@ -92,20 +84,21 @@ template <typename State, auto Fn>
         +[](std::string_view tag,
             const std::shared_ptr<const OutboundProtocolSettings>& base,
             ::acpp::net::io_context& io_context,
-            ::acpp::app::dns::DNS& dns,
-            std::chrono::seconds dial_timeout,
             ::acpp::AwaitableTaskGroup& tasks) -> std::unique_ptr<::acpp::Outbound> {
             const auto* holder = static_cast<const Holder*>(base.get());
             return Fn(tag, std::shared_ptr<const Decayed>(base, &holder->value),
-                      io_context, dns, dial_timeout, tasks);
+                      io_context, tasks);
         }};
     creator.persistent_state = persistent_state;
     return creator;
 }
 
+// Xray core.OutboundHandlerConfig after preparation: tag, sender settings and
+// the protocol constructor. Immutable once published.
 struct PreparedOutboundConfig {
     std::string tag;
     std::string protocol;
+    OutboundSenderSettings sender;
     PreparedOutboundCreator create;
 };
 }  // namespace acpp::proxyman::outbound

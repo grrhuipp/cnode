@@ -31,15 +31,6 @@ struct BuildRequest {
     std::shared_ptr<const ProtocolSettings> settings;
 };
 
-struct RuntimeUser {
-    int64_t user_id = 0;
-    std::string email;
-    std::string credential;
-    std::string flow;
-    uint64_t speed_limit = 0;
-    uint32_t device_limit = 0;
-};
-
 struct PreparedKeyBytes {
     static constexpr size_t kMaxSize = 32;
 

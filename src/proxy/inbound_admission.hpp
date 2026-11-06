@@ -19,6 +19,7 @@
 #include <optional>
 #include <string_view>
 #include <vector>
+#include <utility>
 
 namespace acpp::proxy {
 
@@ -124,6 +125,50 @@ AdmitAuthenticatedInbound(
         tracker, ctx, profile,
         tracker.TryConnectSession(ctx.inbound.tag, profile.user_id,
                                   ctx.inbound.source_ip, profile.device_limit));
+}
+
+// Admission of one protocol-level substream (Mux.Cool child, AnyTLS SYN
+// stream), held for the child's lifetime: the same logical connection-limit
+// reservation against the physical family as HTTP/2-family logical streams,
+// plus accepted/closed connection statistics. Device admission stays with the
+// authenticated session; children inherit it through their context.
+class InboundSubstreamAdmission {
+public:
+    InboundSubstreamAdmission(ConnectionStatsScope connection_stats,
+                              ConnectionLimiter::Reservation reservation) noexcept
+        : connection_stats_(std::move(connection_stats))
+        , reservation_(std::move(reservation)) {}
+
+private:
+    ConnectionStatsScope connection_stats_;
+    ConnectionLimiter::Reservation reservation_;
+};
+
+// The single substream admission entry. `ctx` is the child context inherited
+// from the session (InitSubstreamFrom), carrying the physical family lease.
+// A rejection is logged and counted here; the caller closes only that child.
+[[nodiscard]] inline net::awaitable<std::optional<InboundSubstreamAdmission>>
+AdmitInboundSubstream(
+    ConnectionLimiter* limiter,
+    StatsShard& stats,
+    const session::Context& ctx) {
+    ConnectionStatsScope connection_stats(stats);
+    ConnectionLimiter::Reservation reservation;
+    if (limiter) {
+        auto admission = co_await limiter->ReserveLogical(
+            ctx.inbound.connection_family, ctx.inbound.tag, ctx.inbound.source_ip,
+            ctx.inbound.HasProxyProtocolClientIP());
+        if (admission.reason != ConnectionLimiter::RejectReason::NONE) {
+            const char* reason = ConnectionLimiter::RejectReasonToString(admission.reason);
+            LOG_CONN_DEBUG(ctx, "substream rejected from {}:{} > {}",
+                           ctx.inbound.source_ip, ctx.inbound.source_port, reason);
+            LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, reason));
+            stats.OnError();
+            co_return std::nullopt;
+        }
+        reservation = std::move(admission.reservation);
+    }
+    co_return InboundSubstreamAdmission(std::move(connection_stats), std::move(reservation));
 }
 
 // The single credential-failure log shape for every protocol.

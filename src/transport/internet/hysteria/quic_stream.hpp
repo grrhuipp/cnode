@@ -10,28 +10,17 @@
 
 namespace acpp::transport::internet::hysteria {
 
-// The QUIC connection behind every request stream and UDP session. Streams
-// hold it weakly: a dispatched request may outlive the connection.
-class QuicStreamOwner {
-public:
-    virtual ~QuicStreamOwner() noexcept = default;
-    virtual net::awaitable<void> WriteStream(
-        int64_t stream_id, buf::MultiBuffer payload) = 0;
-    virtual void ConsumeStream(int64_t stream_id, size_t bytes) noexcept = 0;
-    virtual void ShutdownStreamWrite(int64_t stream_id) noexcept = 0;
-    virtual void CancelStream(int64_t stream_id) noexcept = 0;
-    [[nodiscard]] virtual bool SendUdpMessage(
-        uint32_t session_id, const TargetAddress& target,
-        std::span<const uint8_t> payload) = 0;
-    virtual void CloseUdpSession(uint32_t session_id) noexcept = 0;
-};
+// The QUIC connection behind every request stream and UDP session
+// (quic_connection.hpp). Streams hold it weakly: a dispatched request may
+// outlive the connection.
+class Connection;
 
 class QuicStreamState final : public memory::ThreadAllocated {
 public:
     static constexpr size_t kMaxQueuedInputBytes = 512 * 1024;
 
     QuicStreamState(net::io_context& io_context, int64_t stream_id,
-                    std::weak_ptr<QuicStreamOwner> owner);
+                    std::weak_ptr<Connection> owner);
 
     [[nodiscard]] int64_t Id() const noexcept { return stream_id_; }
     [[nodiscard]] net::io_context& IoContext() const noexcept { return io_context_; }
@@ -56,7 +45,7 @@ private:
 
     net::io_context& io_context_;
     int64_t stream_id_;
-    std::weak_ptr<QuicStreamOwner> owner_;
+    std::weak_ptr<Connection> owner_;
     SignalChannel input_signal_;
     buf::MultiBuffer input_;
     bool input_done_ = false;
@@ -102,7 +91,7 @@ public:
 
     UdpSessionStream(net::io_context& io_context, uint32_t session_id,
                      TargetAddress first_target,
-                     std::weak_ptr<QuicStreamOwner> owner);
+                     std::weak_ptr<Connection> owner);
     ~UdpSessionStream() noexcept override;
 
     [[nodiscard]] uint32_t SessionId() const noexcept { return session_id_; }
@@ -135,7 +124,7 @@ private:
     net::io_context& io_context_;
     uint32_t session_id_;
     TargetAddress first_target_;
-    std::weak_ptr<QuicStreamOwner> owner_;
+    std::weak_ptr<Connection> owner_;
     SignalChannel signal_;
     memory::ThreadLocalDeque<buf::MultiBuffer> input_;
     size_t queued_bytes_ = 0;

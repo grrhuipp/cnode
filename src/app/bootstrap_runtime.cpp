@@ -85,7 +85,8 @@ public:
                     monitor.Start();
                     for (const auto& inbound : ctx.inbound_startup.entries) {
                         LOG_CONSOLE("Static inbound ready: tag={} port={} protocol={} network={}",
-                            inbound.tag, inbound.port, inbound.protocol, inbound.stream_settings.network);
+                            inbound.binding.tag, inbound.binding.port, inbound.binding.protocol,
+                            inbound.receiver.stream_settings.network);
                     }
                     LOG_CONSOLE("Server ready; server started workers={} accept=SO_REUSEPORT", ctx.workers.size());
                 }

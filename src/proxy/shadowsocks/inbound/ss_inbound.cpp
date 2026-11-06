@@ -417,7 +417,9 @@ class ShadowsocksSettings final
     : public acpp::proxyman::inbound::ProtocolSettings {
 public:
     acpp::ss::SsCipherInfo cipher;
-    std::string identity_password;
+    // SS2022-AES identity header key; empty when EIH is disabled.
+    acpp::proxyman::inbound::PreparedKeyBytes identity_key;
+    acpp::Ss2022UserKey user_key = acpp::Ss2022UserKey::Base64Psk;
 };
 
 [[nodiscard]] const ShadowsocksSettings* GetSettings(
@@ -469,7 +471,7 @@ const bool kSsInboundRegistered = [] {
         };
 
     reg.prepare_settings =
-        [](std::string_view tag, const acpp::StaticUserConfig& config)
+        [](std::string_view tag, const acpp::InboundProtocolSettings& config)
             -> std::optional<std::shared_ptr<
                 const acpp::proxyman::inbound::ProtocolSettings>> {
             const std::string method = config.method.empty()
@@ -482,67 +484,26 @@ const bool kSsInboundRegistered = [] {
             }
             auto settings = std::make_shared<ShadowsocksSettings>();
             settings->cipher = *cipher;
-            settings->identity_password = config.identity_password;
+            settings->user_key = config.ss2022_user_key;
+            if (acpp::ss::Is2022AesCipher(cipher->type)) {
+                if (!config.identity_password.empty()) {
+                    settings->identity_key = ToPreparedKey(
+                        acpp::ss::BuildMasterKey(config.identity_password, *cipher));
+                    if (settings->identity_key.empty()) {
+                        LOG_WARN("Inbound '{}': invalid SS2022 identity password", tag);
+                        return std::nullopt;
+                    }
+                } else if (config.ss2022_user_key == acpp::Ss2022UserKey::UuidDerived) {
+                    LOG_WARN("Inbound '{}': SS2022 UUID users require server identity key", tag);
+                    return std::nullopt;
+                }
+            }
             return settings;
-        };
-
-    reg.build_static_users =
-        [](std::string_view tag, const acpp::StaticUserConfig& config)
-            -> std::optional<acpp::proxyman::inbound::UserSet> {
-            auto cipher_info = acpp::ss::ParseCipherMethod(config.method);
-            if (!cipher_info) {
-                LOG_WARN("Static inbound '{}': unknown SS cipher '{}'", tag, config.method);
-                return std::nullopt;
-            }
-
-            std::vector<acpp::proxyman::inbound::PreparedShadowsocksUser> users;
-            acpp::proxyman::inbound::PreparedKeyBytes identity_key;
-            const bool use_identity =
-                acpp::ss::Is2022AesCipher(cipher_info->type) &&
-                !config.identity_password.empty() &&
-                (config.clients.size() > 1 ||
-                 (config.clients.size() == 1 &&
-                  config.clients.front().password != config.identity_password));
-            if (use_identity) {
-                identity_key = ToPreparedKey(
-                    acpp::ss::BuildMasterKey(config.identity_password, *cipher_info));
-                if (identity_key.empty()) {
-                    LOG_WARN("Static inbound '{}': invalid SS2022 identity password", tag);
-                    return std::nullopt;
-                }
-            }
-
-            for (const auto& client : config.clients) {
-                if (client.password.empty()) {
-                    LOG_WARN("Static inbound '{}': SS password is empty", tag);
-                    return std::nullopt;
-                }
-                acpp::proxyman::inbound::PreparedShadowsocksUser info;
-                info.password    = client.password;
-                info.key_size    = cipher_info->key_size;
-                info.salt_size   = cipher_info->salt_size;
-                info.derived_key = ToPreparedKey(
-                    acpp::ss::BuildMasterKey(client.password, *cipher_info));
-                info.identity_key = identity_key;
-                if (info.derived_key.empty()) {
-                    LOG_WARN("Static inbound '{}': invalid SS password for user '{}'",
-                             tag, client.email);
-                    return std::nullopt;
-                }
-                if (!info.identity_key.empty() &&
-                    !acpp::ss::Hash2022Psk(info.derived_key.span(), info.psk_hash)) {
-                    return std::nullopt;
-                }
-                info.profile.email = client.email;
-                users.push_back(std::move(info));
-            }
-
-            return acpp::proxyman::inbound::UserSet{std::move(users)};
         };
 
     reg.build_users =
         [](const acpp::proxyman::inbound::BuildRequest& req,
-           std::span<const acpp::proxyman::inbound::RuntimeUser> runtime_users)
+           std::span<const acpp::InboundUserSpec> specs)
             -> std::optional<acpp::proxyman::inbound::UserSet> {
             const auto* settings = GetSettings(req);
             if (!settings) {
@@ -550,44 +511,32 @@ const bool kSsInboundRegistered = [] {
                 return std::nullopt;
             }
             const auto& cipher_info = settings->cipher;
+            const bool uuid_derived =
+                acpp::ss::Is2022Cipher(cipher_info.type) &&
+                settings->user_key == acpp::Ss2022UserKey::UuidDerived;
 
             std::vector<acpp::proxyman::inbound::PreparedShadowsocksUser> users;
-            users.reserve(runtime_users.size());
-            acpp::proxyman::inbound::PreparedKeyBytes identity_key;
-            if (acpp::ss::Is2022AesCipher(cipher_info.type)) {
-                if (settings->identity_password.empty()) {
-                    LOG_WARN("Inbound '{}': SS2022 UUID users require server identity key",
-                             req.tag);
-                    return std::nullopt;
-                }
-                identity_key = ToPreparedKey(
-                    acpp::ss::BuildMasterKey(
-                        settings->identity_password, cipher_info));
-                if (identity_key.empty()) {
-                    LOG_WARN("Inbound '{}': invalid SS2022 identity password", req.tag);
-                    return std::nullopt;
-                }
-            }
-
-            for (const auto& runtime_user : runtime_users) {
-                if (runtime_user.credential.empty()) {
+            users.reserve(specs.size());
+            for (const auto& spec : specs) {
+                if (spec.credential.empty()) {
+                    LOG_WARN("Inbound '{}': SS password is empty", req.tag);
                     return std::nullopt;
                 }
                 acpp::proxyman::inbound::PreparedShadowsocksUser info;
-                info.password = runtime_user.credential;
-                info.profile.email = runtime_user.email;
-                info.profile.user_id = runtime_user.user_id;
-                info.profile.speed_limit = runtime_user.speed_limit;
-                info.profile.device_limit = runtime_user.device_limit;
+                info.password = spec.credential;
+                info.profile.email = spec.email;
+                info.profile.user_id = spec.user_id;
+                info.profile.speed_limit = spec.speed_limit;
+                info.profile.device_limit = spec.device_limit;
                 info.key_size = cipher_info.key_size;
                 info.salt_size = cipher_info.salt_size;
-                info.derived_key = ToPreparedKey(acpp::ss::Is2022Cipher(cipher_info.type)
-                    ? acpp::ss::Build2022UserKeyFromUuid(runtime_user.credential, cipher_info)
-                    : acpp::ss::BuildMasterKey(runtime_user.credential, cipher_info));
-                info.identity_key = identity_key;
+                info.derived_key = ToPreparedKey(uuid_derived
+                    ? acpp::ss::Build2022UserKeyFromUuid(spec.credential, cipher_info)
+                    : acpp::ss::BuildMasterKey(spec.credential, cipher_info));
+                info.identity_key = settings->identity_key;
                 if (info.derived_key.empty()) {
                     LOG_WARN("Inbound '{}': invalid SS password for user '{}'",
-                             req.tag, runtime_user.email);
+                             req.tag, spec.email);
                     return std::nullopt;
                 }
                 if (!info.identity_key.empty() &&

@@ -6,6 +6,7 @@
 #include "acppnode/common/memory_stats.hpp"
 #include "acppnode/infra/runtime_config_types.hpp"
 #include "acppnode/transport/internet/tls_stream.hpp"
+#include "acppnode/transport/internet/outbound_target_builder.hpp"
 #include "acppnode/transport/internet/transport_dialer.hpp"
 #include "acppnode/transport/internet/timeout_scheduler.hpp"
 #include "acppnode/transport/link_error.hpp"
@@ -518,25 +519,39 @@ bool JoinResidentTasks(net::io_context& io, ResidentTaskGroup& tasks) {
     return done && !failure;
 }
 
+// The Handler's production dialer over the default raw TCP sender settings;
+// only DialOutboundTransport above is replaced.
+struct TestDialer {
+    TestDialer(net::io_context& io, app::dns::DNS& dns) : dialer(io, dns, sender, 1s) {}
+    OutboundSenderSettings sender;
+    OutboundDialer dialer;
+};
+
+OutboundServer LoopbackServer() {
+    return OutboundServer{
+        .address = "127.0.0.1",
+        .literal_address = net::ip::address_v4::loopback(),
+        .port = 443,
+    };
+}
+
 bool RunClientPadding() {
     net::io_context io;
     app::dns::Config dns_config;
     dns_config.servers = {{net::ip::address_v4::loopback(), 1}};
     app::dns::DNSWorker dns_worker(io, dns_config, 8);
     app::dns::DNS dns(dns_worker);
+    TestDialer outbound(io, dns);
     ResidentTaskGroup tasks(io.get_executor());
     proxy::anytls::outbound::Settings settings;
-    settings.address = "127.0.0.1";
-    settings.literal_address = net::ip::address_v4::loopback();
-    settings.port = 443;
+    settings.server = LoopbackServer();
     settings.idle_session_check_interval = 60s;
     settings.idle_session_timeout = 60s;
     settings.min_idle_sessions = 1;
     auto make_handler = [&] {
         return std::make_unique<proxy::anytls::outbound::Handler>(
             "same-client-tag", io,
-            std::make_shared<const proxy::anytls::outbound::PreparedSettings>(
-                proxy::anytls::outbound::PreparedSettings{settings, StreamSettings{}}), 1s, dns,
+            std::make_shared<const proxy::anytls::outbound::Settings>(settings),
             tasks.Tasks());
     };
     auto handler = make_handler();
@@ -557,8 +572,9 @@ bool RunClientPadding() {
         TimeoutsConfig timeouts;
         RelayConfig config;
         config.uplink_only = config.downlink_only = 5s;
-        co_return co_await active.Process(io, nullptr, ctx, timeouts,
-            {&clients[index], &clients[index], nullptr}, stats, config, {}, 10s, 10s);
+        co_return co_await active.Process(ctx,
+            {&clients[index], &clients[index], nullptr}, outbound.dialer, timeouts,
+            stats, config, {}, 10s, 10s);
     };
     auto start = [&](proxy::anytls::outbound::Handler& active, size_t index) {
         net::co_spawn(io, request(active, index), net::bind_cancellation_slot(cancellations[index].slot(),
@@ -625,11 +641,10 @@ bool RunOpenOrder(int mode, bool before) {
     dns_config.servers = {{net::ip::address_v4::loopback(), 1}};
     app::dns::DNSWorker dns_worker(io, dns_config, 8);
     app::dns::DNS dns(dns_worker);
+    TestDialer outbound(io, dns);
     ResidentTaskGroup tasks(io.get_executor());
     proxy::anytls::outbound::Settings settings;
-    settings.address = "127.0.0.1";
-    settings.literal_address = net::ip::address_v4::loopback();
-    settings.port = 443;
+    settings.server = LoopbackServer();
     settings.idle_session_check_interval = 60s;
     settings.idle_session_timeout = 60s;
     settings.min_idle_sessions = 1;
@@ -637,8 +652,7 @@ bool RunOpenOrder(int mode, bool before) {
     open_order_scenario = &scenario;
     dialed.clear();
     auto handler = std::make_unique<proxy::anytls::outbound::Handler>("open-order", io,
-        std::make_shared<const proxy::anytls::outbound::PreparedSettings>(
-            proxy::anytls::outbound::PreparedSettings{settings, StreamSettings{}}), 1s, dns,
+        std::make_shared<const proxy::anytls::outbound::Settings>(settings),
         tasks.Tasks());
     auto request = [&](Client& client, session::Context& ctx) -> net::awaitable<OutboundProcessResult> {
         ctx.outbound.target = TargetAddress("192.0.2.1", 443);
@@ -647,8 +661,8 @@ bool RunOpenOrder(int mode, bool before) {
         TimeoutsConfig timeouts;
         RelayConfig config;
         config.uplink_only = config.downlink_only = 5s;
-        co_return co_await handler->Process(io, nullptr, ctx, timeouts,
-            {&client, &client, nullptr}, stats, config, {}, 10s, 10s);
+        co_return co_await handler->Process(ctx,
+            {&client, &client, nullptr}, outbound.dialer, timeouts, stats, config, {}, 10s, 10s);
     };
     Client warm, tested, recovery;
     session::Context warm_ctx, tested_ctx, recovery_ctx;
@@ -753,17 +767,15 @@ bool RunQueue(int mode, unsigned seed = 1, bool baseline = false) {
     dns_config.servers = {{net::ip::make_address("127.0.0.1"), 53}};
     app::dns::DNSWorker dns_worker(io, dns_config, 8);
     app::dns::DNS dns(dns_worker);
+    TestDialer outbound(io, dns);
     ResidentTaskGroup tasks(io.get_executor());
     proxy::anytls::outbound::Settings settings;
-    settings.address = "127.0.0.1";
-    settings.literal_address = net::ip::make_address("127.0.0.1");
-    settings.port = 443;
+    settings.server = LoopbackServer();
     settings.idle_session_check_interval = 1s;
     settings.idle_session_timeout = 60s;
     settings.min_idle_sessions = 1;
     auto handler = std::make_unique<proxy::anytls::outbound::Handler>("queue", io,
-        std::make_shared<const proxy::anytls::outbound::PreparedSettings>(
-            proxy::anytls::outbound::PreparedSettings{settings, StreamSettings{}}), 1s, dns,
+        std::make_shared<const proxy::anytls::outbound::Settings>(settings),
         tasks.Tasks());
     queue_scenario = &queue;
     dialed.clear();
@@ -796,8 +808,9 @@ bool RunQueue(int mode, unsigned seed = 1, bool baseline = false) {
     ErrorCode observed = ErrorCode::OK;
     std::exception_ptr exception;
     net::cancellation_signal cancellation;
-    net::co_spawn(io, handler->Process(io, nullptr, ctx, timeouts,
-        {&client, &client, use_control ? &control : nullptr}, stats, config, {}, 10s, 10s),
+    net::co_spawn(io, handler->Process(ctx,
+        {&client, &client, use_control ? &control : nullptr}, outbound.dialer, timeouts,
+        stats, config, {}, 10s, 10s),
         net::bind_cancellation_slot(cancellation.slot(), [&](std::exception_ptr failure, OutboundProcessResult result) {
             done = true; exception = failure;
             completed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -860,17 +873,15 @@ bool RunIoFault(int mode, int kind) {
     dns_config.servers = {{net::ip::make_address("127.0.0.1"), 53}};
     app::dns::DNSWorker dns_worker(io, dns_config, 8);
     app::dns::DNS dns(dns_worker);
+    TestDialer outbound(io, dns);
     ResidentTaskGroup tasks(io.get_executor());
     proxy::anytls::outbound::Settings settings;
-    settings.address = "127.0.0.1";
-    settings.literal_address = net::ip::make_address("127.0.0.1");
-    settings.port = 443;
+    settings.server = LoopbackServer();
     settings.idle_session_check_interval = 1s;
     settings.idle_session_timeout = 60s;
     settings.min_idle_sessions = 1;
     auto handler = std::make_unique<proxy::anytls::outbound::Handler>("io-fault", io,
-        std::make_shared<const proxy::anytls::outbound::PreparedSettings>(
-            proxy::anytls::outbound::PreparedSettings{settings, StreamSettings{}}), 1s, dns,
+        std::make_shared<const proxy::anytls::outbound::Settings>(settings),
         tasks.Tasks());
     dialed.clear();
     fail_first_session = false;
@@ -895,9 +906,9 @@ bool RunIoFault(int mode, int kind) {
             if (mode == 4) block->SetUDP(ctx.outbound.target);
             payload.push_back(std::move(block));
         }
-        co_return co_await handler->Process(io, nullptr, ctx, timeouts,
-            {&client, &client, first && mode == 4 ? &control : nullptr},
-            stats, config, buf::MultiBufferBatch(std::move(payload)), 10s, 10s);
+        co_return co_await handler->Process(ctx,
+            {&client, &client, first && mode == 4 ? &control : nullptr}, outbound.dialer,
+            timeouts, stats, config, buf::MultiBufferBatch(std::move(payload)), 10s, 10s);
     };
     // Relay payload and FIN failures retain the write-phase category. An open
     // exception escapes Process unchanged; unknown physical reads are INTERNAL.
@@ -958,18 +969,16 @@ bool Run(int mode) {
     dns_config.servers = {{net::ip::make_address("127.0.0.1"), 53}};
     app::dns::DNSWorker dns_worker(io, dns_config, 8);
     app::dns::DNS dns(dns_worker);
+    TestDialer outbound(io, dns);
     ResidentTaskGroup tasks(io.get_executor());
     proxy::anytls::outbound::Settings settings;
-    settings.address = "127.0.0.1";
-    settings.literal_address = net::ip::make_address("127.0.0.1");
-    settings.port = 443;
+    settings.server = LoopbackServer();
     settings.idle_session_check_interval = 1s;
     settings.idle_session_timeout = 60s;
     settings.min_idle_sessions = 1;
     auto handler = std::make_unique<proxy::anytls::outbound::Handler>(
         "test", io,
-        std::make_shared<const proxy::anytls::outbound::PreparedSettings>(
-            proxy::anytls::outbound::PreparedSettings{settings, StreamSettings{}}), 1s, dns,
+        std::make_shared<const proxy::anytls::outbound::Settings>(settings),
         tasks.Tasks());
     dialed.clear();
     fail_first_session = mode == 0 || mode == 3;
@@ -982,8 +991,8 @@ bool Run(int mode) {
         TimeoutsConfig timeouts;
         RelayConfig config;
         config.uplink_only = config.downlink_only = 5s;
-        co_return co_await handler->Process(io, nullptr, ctx, timeouts,
-            {&client, &client, nullptr}, stats, config, {}, 10s, 10s);
+        co_return co_await handler->Process(ctx,
+            {&client, &client, nullptr}, outbound.dialer, timeouts, stats, config, {}, 10s, 10s);
     };
     Client first, second;
     session::Context ctx_first, ctx_second;
@@ -1054,17 +1063,15 @@ bool RunPoolLifecycle(bool join_before_retirement) {
     dns_config.servers = {{net::ip::make_address("127.0.0.1"), 53}};
     app::dns::DNSWorker dns_worker(io, dns_config, 8);
     app::dns::DNS dns(dns_worker);
+    TestDialer outbound(io, dns);
     ResidentTaskGroup tasks(io.get_executor());
     proxy::anytls::outbound::Settings settings;
-    settings.address = "127.0.0.1";
-    settings.literal_address = net::ip::make_address("127.0.0.1");
-    settings.port = 443;
+    settings.server = LoopbackServer();
     settings.idle_session_check_interval = 1s;
     settings.idle_session_timeout = 1s;
     settings.min_idle_sessions = 1;
     auto handler = std::make_unique<proxy::anytls::outbound::Handler>("pool", io,
-        std::make_shared<const proxy::anytls::outbound::PreparedSettings>(
-            proxy::anytls::outbound::PreparedSettings{settings, StreamSettings{}}), 1s, dns,
+        std::make_shared<const proxy::anytls::outbound::Settings>(settings),
         tasks.Tasks());
     dialed.clear();
     fail_first_session = respond_on_auth = false;
@@ -1076,8 +1083,8 @@ bool RunPoolLifecycle(bool join_before_retirement) {
         TimeoutsConfig timeouts;
         RelayConfig config;
         config.uplink_only = config.downlink_only = 5s;
-        co_return co_await handler->Process(io, nullptr, ctx, timeouts,
-            {&client, &client, nullptr}, stats, config, {}, 10s, 10s);
+        co_return co_await handler->Process(ctx,
+            {&client, &client, nullptr}, outbound.dialer, timeouts, stats, config, {}, 10s, 10s);
     };
     std::array<Client, 3> clients;
     std::array<session::Context, 3> contexts;

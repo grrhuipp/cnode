@@ -9,14 +9,12 @@
 
 #include <chrono>
 #include <tl/expected.hpp>
-#include <string>
-#include <string_view>
 
 namespace acpp {
 
 struct StatsShard;
 struct TimeoutsConfig;
-
+class OutboundDialer;
 
 namespace session {
 struct Context;
@@ -25,24 +23,23 @@ struct Context;
 using OutboundProcessResult = tl::expected<RelayResult, ErrorCode>;
 
 // ============================================================================
-// Outbound - 出站接口
+// Outbound - Xray proxy.Outbound
+//
+// One protocol instance owned by its proxyman outbound Handler, which calls
+// Process exactly once per request: the only dynamic dispatch between the
+// dispatcher and the protocol. Every connection leaves through |dialer| (the
+// Handler's internet.Dialer); first_payload transfers ownership and all
+// application bytes enter relay.
 // ============================================================================
 class Outbound : public memory::ThreadAllocated {
 public:
     virtual ~Outbound() noexcept = default;
 
-    // 获取出站标识
-    [[nodiscard]] virtual std::string_view Tag() const noexcept = 0;
-
-    // xray-core style outbound entry. The outbound implementation owns
-    // transport target resolution, dialing, protocol setup, and relay.
-    // first_payload transfers ownership; all application bytes enter relay.
     virtual net::awaitable<OutboundProcessResult> Process(
-        net::io_context& io_context,
-        const tcp::endpoint* inbound_local_addr,
         session::Context& ctx,
-        const TimeoutsConfig& timeouts,
         transport::Link inbound,
+        OutboundDialer& dialer,
+        const TimeoutsConfig& timeouts,
         StatsShard& stats,
         const RelayConfig& relay_config,
         buf::MultiBufferBatch first_payload,

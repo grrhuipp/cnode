@@ -1,9 +1,9 @@
 #pragma once
 
 #include "acppnode/api/api.hpp"
+#include "acppnode/app/prepared_inbound.hpp"
 #include "acppnode/app/proxyman/inbound/prepared_config.hpp"
 #include "acppnode/app/proxyman/outbound/prepared_config.hpp"
-#include "inboundbuilder.hpp"
 #include "node_state.hpp"
 #include "acppnode/infra/panel_config.hpp"
 
@@ -30,7 +30,7 @@ public:
 
     net::awaitable<void> RemoveInbound(const std::string& tag);
     net::awaitable<void> RemoveOutbound(const std::string& tag);
-    net::awaitable<bool> AddInbound(const InboundBuild& inbound);
+    net::awaitable<bool> AddInbound(const PreparedInbound& inbound);
     net::awaitable<void> AddOutbound(const proxyman::outbound::PreparedOutboundConfig& prepared);
     net::awaitable<void> UpdateRules(const std::string& tag, const std::vector<rule::DetectRule>& rules);
     net::awaitable<void> ApplyUsers(const std::string& tag, const proxyman::inbound::UserSet& users);
@@ -40,7 +40,6 @@ public:
 
 private:
     void ThrowIfStopping() const;
-    net::awaitable<void> PublishUsers(proxyman::inbound::UserStore::PublishedSnapshot snapshot);
     net::io_context& io_context_;
     const std::vector<std::unique_ptr<Worker>>& workers_;
     const PanelConfig& config_;

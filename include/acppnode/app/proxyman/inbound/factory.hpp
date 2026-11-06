@@ -15,7 +15,8 @@
 namespace acpp {
 
 class Inbound;
-struct StaticUserConfig;
+struct InboundProtocolSettings;
+struct InboundUserSpec;
 struct StatsShard;
 
 }  // namespace acpp
@@ -82,16 +83,13 @@ struct ProxyRegistration {
     std::optional<std::shared_ptr<const ProtocolSettings>>
     (*prepare_settings)(
         std::string_view tag,
-        const ::acpp::StaticUserConfig& config) = nullptr;
+        const ::acpp::InboundProtocolSettings& settings) = nullptr;
 
-    // 用户构建属于冷路径，结果发布到进程级只读 UserStore 快照。
-    std::optional<UserSet> (*build_static_users)(
-        std::string_view tag,
-        const ::acpp::StaticUserConfig& config) = nullptr;
-
+    // 用户构建属于冷路径，结果发布到进程级只读 UserStore 快照。所有来源共用；
+    // 来源间的凭据差异只存在于 InboundProtocolSettings / InboundUserSpec 数据中。
     std::optional<UserSet> (*build_users)(
         const BuildRequest& req,
-        std::span<const RuntimeUser> users) = nullptr;
+        std::span<const ::acpp::InboundUserSpec> users) = nullptr;
 };
 
 // Registration errors are programming errors during static initialization and
@@ -126,16 +124,10 @@ void RegisterProxy(std::string_view protocol, ProxyRegistration registration);
 [[nodiscard]] std::optional<BuildRequest> PrepareBuildRequest(
     std::string_view protocol,
     std::string_view tag,
-    const ::acpp::StaticUserConfig& config);
-
-[[nodiscard]] std::optional<UserSet> BuildStaticUsers(
-    std::string_view protocol,
-    std::string_view tag,
-    const ::acpp::StaticUserConfig& config);
+    const ::acpp::InboundProtocolSettings& settings);
 
 [[nodiscard]] std::optional<UserSet> BuildUsers(
-    std::string_view protocol,
     const BuildRequest& req,
-    std::span<const RuntimeUser> users);
+    std::span<const ::acpp::InboundUserSpec> users);
 
 }  // namespace acpp::proxyman::inbound

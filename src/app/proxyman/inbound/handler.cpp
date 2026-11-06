@@ -4,6 +4,7 @@
 #include "acppnode/app/request_load_state.hpp"
 
 #include "acppnode/app/rate_limiter.hpp"
+#include "acppnode/app/stats.hpp"
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/ip_utils.hpp"
 #include "acppnode/common/session.hpp"
@@ -71,29 +72,6 @@ void ApplyProxyProtocolResult(
         ctx.inbound.source_ip,
         ctx.inbound.source_port);
 }
-
-
-class ConnectionStatsScope {
-public:
-    explicit ConnectionStatsScope(StatsShard& stats) noexcept
-        : stats_(&stats) {
-        stats_->OnConnectionAccepted();
-    }
-
-    ~ConnectionStatsScope() noexcept {
-        if (stats_) {
-            stats_->OnConnectionClosed();
-        }
-    }
-
-    ConnectionStatsScope(const ConnectionStatsScope&) = delete;
-    ConnectionStatsScope& operator=(const ConnectionStatsScope&) = delete;
-    ConnectionStatsScope(ConnectionStatsScope&&) = delete;
-    ConnectionStatsScope& operator=(ConnectionStatsScope&&) = delete;
-
-private:
-    StatsShard* stats_;
-};
 
 // 物理连接与逻辑子流共用的协议处理收尾：Process 自身已分类上报结果，
 // 这里只把逃逸的异常收敛为一次错误统计，非预期异常额外记录。
@@ -282,6 +260,9 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
     ConnectionStatsScope connection_stats(stats);
 
     ctx.inbound.accounting_key.assign(listener.accounting_key);
+    // Protocol substreams (Mux.Cool, AnyTLS) inside this logical stream
+    // reserve against the same physical family.
+    ctx.inbound.connection_family = family;
 
     if (!stream) {
         stats.OnError();
@@ -404,6 +385,7 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
         co_return;
     }
     auto connection_limit = std::move(physical_admission.reservation);
+    ctx.inbound.connection_family = connection_limit.FamilyLease();
 
     raw_conn->SetIdleTimeout(timeouts.HandshakeTimeout());
     (void)raw_conn->StartPhaseDeadline(timeouts.HandshakeTimeout());

@@ -5,6 +5,7 @@
 #include "../vmess_crypto.hpp"
 #include "../udp_datagram.hpp"
 #include "../../handshake_timeout.hpp"
+#include "../../outbound_server.hpp"
 #include "../../outbound_stream_endpoint.hpp"
 #include "acppnode/app/relay.hpp"
 #include "acppnode/app/dns/dns.hpp"
@@ -109,25 +110,15 @@ SendVMessHandshake(
 // proxy/vmess/outbound.Handler 实现
 // ============================================================================
 
-proxy::vmess::outbound::Handler::Handler(
-    std::string_view tag, std::shared_ptr<const PreparedSettings> prepared,
-    ::acpp::app::dns::DNS& dns_service, std::chrono::seconds dial_timeout)
-    : tag_(tag), prepared_(std::move(prepared)),
-      security_(prepared_->config.stream_settings, StreamEndpointRole::Outbound),
-      dial_timeout_(dial_timeout), dns_service_(dns_service) {
-    LOG_DEBUG("VMess outbound '{}' created: {}:{}, network={}, security={}",
-              tag_, prepared_->config.address, prepared_->config.port,
-              prepared_->config.stream_settings.network,
-              prepared_->config.stream_settings.security);
-}
+proxy::vmess::outbound::Handler::Handler(std::shared_ptr<const PreparedSettings> prepared)
+    : prepared_(std::move(prepared)) {}
 
 net::awaitable<OutboundProcessResult>
 proxy::vmess::outbound::Handler::Process(
-    net::io_context& io_context,
-    const tcp::endpoint* inbound_local_addr,
     session::Context& ctx,
-    const TimeoutsConfig& timeouts,
     transport::Link inbound,
+    OutboundDialer& dialer,
+    const TimeoutsConfig& timeouts,
     StatsShard& stats,
     const RelayConfig& relay_config,
     buf::MultiBufferBatch first_payload,
@@ -138,20 +129,7 @@ proxy::vmess::outbound::Handler::Process(
     }
     const auto& target = ctx.outbound.target;
 
-    auto dialed = co_await acpp::DialOutboundStream(
-        io_context,
-        ctx,
-        OutboundTargetOptions{
-            .dns_service = &dns_service_,
-            .address = prepared_->config.address,
-            .literal_address = prepared_->config.literal_address,
-            .port = prepared_->config.port,
-            .stream_settings = &prepared_->config.stream_settings,
-            .security = &security_,
-            .timeout = dial_timeout_,
-            .send_through = &prepared_->config.send_through,
-            .inbound_local_addr = inbound_local_addr,
-        });
+    auto dialed = co_await dialer.Dial(ctx, prepared_->config.server);
     if (!dialed) {
         co_return tl::unexpected(dialed.error());
     }
@@ -177,7 +155,7 @@ proxy::vmess::outbound::Handler::Process(
 
     VMessOutboundEndpoint target_endpoint(vmess_session, *stream, is_udp, target);
     co_return co_await DoRelayLink(
-        io_context, *inbound.reader, *inbound.writer, inbound.control,
+        dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
         target_endpoint, ctx, stats, relay_config, std::move(first_payload));
 }
 
@@ -190,7 +168,7 @@ namespace {
 const bool kVMessRegistered = (acpp::proxyman::outbound::RegisterProxy(
     acpp::constants::protocol::kVmess,
     [](const acpp::infra::OutboundSourceConfig& cfg)
-        -> std::optional<acpp::proxyman::outbound::PreparedOutboundCreator> {
+        -> std::optional<acpp::proxyman::outbound::PreparedOutboundProxy> {
         const auto& s = cfg.settings;
 
         // A present field of the wrong type is a configuration error, never
@@ -233,7 +211,9 @@ const bool kVMessRegistered = (acpp::proxyman::outbound::RegisterProxy(
             return std::nullopt;
         };
 
-        acpp::VMessOutboundConfig vmess_config;
+        std::string address;
+        uint16_t port = 443;
+        auto security = acpp::vmess::Security::AES_128_GCM;
         std::string uuid;
 
         bool parsed_xray = false;
@@ -245,13 +225,13 @@ const bool kVMessRegistered = (acpp::proxyman::outbound::RegisterProxy(
                     users_p && users_p->is_array() && !users_p->as_array().empty() &&
                     users_p->as_array()[0].is_object()) {
                 const auto& user = users_p->as_array()[0].as_object();
-                vmess_config.address = json_string(server, "address");
-                const auto port = acpp::ReadJsonPort(server, "port");
-                if (port.Invalid()) {
+                address = json_string(server, "address");
+                const auto source_port = acpp::ReadJsonPort(server, "port");
+                if (source_port.Invalid()) {
                     return std::nullopt;
                 }
-                if (port.Valid()) {
-                    vmess_config.port = port.value;
+                if (source_port.Valid()) {
+                    port = source_port.value;
                 }
                 uuid = json_string(user, "id");
                 if (!has_supported_alter_id(user)) {
@@ -261,19 +241,19 @@ const bool kVMessRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 if (!parsed_security) {
                     return std::nullopt;
                 }
-                vmess_config.security = *parsed_security;
+                security = *parsed_security;
                 parsed_xray = true;
             }
         }
 
         if (!parsed_xray) {
-            vmess_config.address = json_string(s, "address");
-            const auto port = acpp::ReadJsonPort(s, "port");
-            if (port.Invalid()) {
+            address = json_string(s, "address");
+            const auto source_port = acpp::ReadJsonPort(s, "port");
+            if (source_port.Invalid()) {
                 return std::nullopt;
             }
-            if (port.Valid()) {
-                vmess_config.port = port.value;
+            if (source_port.Valid()) {
+                port = source_port.value;
             }
             uuid = json_string(s, "id");
             if (!has_supported_alter_id(s)) {
@@ -283,51 +263,41 @@ const bool kVMessRegistered = (acpp::proxyman::outbound::RegisterProxy(
             if (!parsed_security) {
                 return std::nullopt;
             }
-            vmess_config.security = *parsed_security;
+            security = *parsed_security;
         }
         if (invalid_field) {
             return std::nullopt;
         }
 
-        vmess_config.send_through = cfg.send_through.value_or(acpp::OutboundBind{});
-        vmess_config.stream_settings = acpp::NormalizeOutboundStreamSettings(
-            cfg.stream_settings,
-            acpp::OutboundStreamDefaults{
-                .require_tls = false,
-                .fallback_server_name = vmess_config.address,
-                .allow_insecure = false,
-                .alpn = {},
-            });
-
-        if (vmess_config.address.empty() || vmess_config.port == 0) {
-            return std::nullopt;  // 配置不完整
-        }
         auto user = acpp::vmess::MemoryAccount::FromUUID(uuid);
         if (!user) {
             LOG_ERROR("VMess outbound '{}': invalid UUID", cfg.tag);
             return std::nullopt;
         }
-        vmess_config.literal_address = acpp::iputil::ParseLiteral(vmess_config.address);
-        if (!vmess_config.literal_address && !acpp::domain::IsValidDnsHostname(
-                vmess_config.address, acpp::domain::TrailingDotPolicy::Allow)) {
-            LOG_ERROR("vmess outbound '{}': address must be an IP literal or DNS hostname", cfg.tag);
+        auto next_hop = acpp::proxy::PrepareNextHop(
+            cfg, std::move(address), port, acpp::OutboundStreamDefaults{});
+        if (!next_hop) {
             return std::nullopt;
         }
-        acpp::TransportSecurity::Prepare(
-            vmess_config.stream_settings, acpp::StreamEndpointRole::Outbound);
 
         using PreparedSettings = acpp::proxy::vmess::outbound::PreparedSettings;
-        return acpp::proxyman::outbound::MakePreparedOutboundCreator<
-            PreparedSettings,
-            +[](std::string_view tag,
-                std::shared_ptr<const PreparedSettings> state,
-                acpp::net::io_context& /*io_context*/,
-                acpp::app::dns::DNS& dns,
-                std::chrono::seconds timeout,
-                acpp::AwaitableTaskGroup& /*tasks*/) -> std::unique_ptr<acpp::Outbound> {
-                return std::make_unique<acpp::proxy::vmess::outbound::Handler>(
-                    tag, std::move(state), dns, timeout);
-            }>(PreparedSettings{std::move(vmess_config), *user,
-                                acpp::vmess::ExpandAuthIDEncryptKey(user->auth_key)});
+        return acpp::proxyman::outbound::PreparedOutboundProxy{
+            .create = acpp::proxyman::outbound::MakePreparedOutboundCreator<
+                PreparedSettings,
+                +[](std::string_view,
+                    std::shared_ptr<const PreparedSettings> state,
+                    acpp::net::io_context& /*io_context*/,
+                    acpp::AwaitableTaskGroup& /*tasks*/) -> std::unique_ptr<acpp::Outbound> {
+                    return std::make_unique<acpp::proxy::vmess::outbound::Handler>(
+                        std::move(state));
+                }>(PreparedSettings{
+                    acpp::VMessOutboundConfig{
+                        .server = std::move(next_hop->server),
+                        .security = security,
+                    },
+                    *user,
+                    acpp::vmess::ExpandAuthIDEncryptKey(user->auth_key)}),
+            .sender = std::move(next_hop->sender),
+        };
     }), true);
 }  // namespace

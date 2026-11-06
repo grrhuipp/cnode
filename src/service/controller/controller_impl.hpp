@@ -3,7 +3,7 @@
 #include "acppnode/service/controller/controller.hpp"
 
 #include "acppnode/api/api.hpp"
-#include "acppnode/app/proxyman/inbound/prepared_config.hpp"
+#include "acppnode/app/prepared_inbound.hpp"
 #include "acppnode/infra/panel_config.hpp"
 #include "acppnode/core/naming.hpp"
 #include "online_snapshot.hpp"
@@ -48,12 +48,6 @@ struct Controller::Impl : std::enable_shared_from_this<Controller::Impl> {
                                         bool* appended_out = nullptr);
     net::awaitable<controller::OnlineSnapshot>
     GetOnlineSnapshot(const std::string& tag);
-
-    [[nodiscard]] std::optional<proxyman::inbound::UserSet> BuildUsersForInbound(
-        const PanelConfig& panel_config,
-        const controller::InboundBuild& inbound,
-        const api::NodeInfo& node_config,
-        const std::vector<api::UserInfo>& api_users) const;
 
     net::io_context&                       io_context_;
     const std::vector<std::unique_ptr<Worker>>&  workers_;

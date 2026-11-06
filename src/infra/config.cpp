@@ -1182,10 +1182,34 @@ StreamSettings StreamSettings::FromJson(
 // ============================================================================
 namespace {
 
-StaticUserConfig ParseStaticUserConfig(
+struct StaticClient {
+    std::string id;
+    std::string password;
+    std::string email;
+    std::string flow;
+};
+
+// Static clients name their credential `id` or `password` depending on the
+// protocol; resolve that alias here so every source yields one credential.
+[[nodiscard]] std::string StaticCredential(std::string_view protocol, StaticClient& client) {
+    if (protocol == constants::protocol::kVmess) return std::move(client.id);
+    if (protocol == constants::protocol::kTrojan ||
+        protocol == constants::protocol::kShadowsocks) {
+        return std::move(client.password);
+    }
+    if (protocol == constants::protocol::kAnyTLS ||
+        protocol == constants::protocol::kHysteria ||
+        protocol == constants::protocol::kHysteria2) {
+        return std::move(client.password.empty() ? client.id : client.password);
+    }
+    return std::move(client.id.empty() ? client.password : client.id);
+}
+
+void ParseStaticSettings(
     std::string_view protocol,
-    const json::object& settings) {
-    StaticUserConfig config;
+    const json::object& settings,
+    StaticInboundConfig& cfg) {
+    auto& config = cfg.settings;
     config.method = naming::LowerAscii(JsonStringOr(settings, "method", config.method));
     if (protocol == constants::protocol::kVless) {
         config.vless_decryption = JsonStringOr(settings, "decryption", std::string(constants::protocol::kNone));
@@ -1208,7 +1232,7 @@ StaticUserConfig ParseStaticUserConfig(
     }
 
     const bool ss2022_method = config.method.rfind("2022-", 0) == 0;
-    StaticUser top_level_user;
+    StaticClient top_level_user;
     if (protocol == constants::protocol::kShadowsocks ||
         protocol == constants::protocol::kTrojan ||
         protocol == constants::protocol::kAnyTLS ||
@@ -1226,41 +1250,60 @@ StaticUserConfig ParseStaticUserConfig(
             "static inbound settings.users is not supported; use settings.clients");
     }
 
+    std::vector<StaticClient> clients;
     bool saw_user_array = false;
-    if (const auto* clients = settings.if_contains("clients")) {
-        if (!clients->is_array()) {
+    if (const auto* client_values = settings.if_contains("clients")) {
+        if (!client_values->is_array()) {
             throw std::invalid_argument("clients must be an array");
         }
-        config.clients.reserve(clients->as_array().size());
-        for (const auto& client : clients->as_array()) {
+        clients.reserve(client_values->as_array().size() + 1);
+        for (const auto& client : client_values->as_array()) {
             if (!client.is_object()) {
                 throw std::invalid_argument("clients entries must be objects");
             }
             const auto& client_obj = client.as_object();
-            StaticUser user;
-            user.id = JsonStringOr(client_obj, "id", "");
-            user.password = JsonStringOr(client_obj, "password", "");
-            user.email = JsonStringOr(client_obj, "email", "");
-            user.flow = naming::LowerAscii(JsonStringOr(client_obj, "flow", ""));
-            config.clients.push_back(std::move(user));
+            clients.push_back(StaticClient{
+                .id = JsonStringOr(client_obj, "id", ""),
+                .password = JsonStringOr(client_obj, "password", ""),
+                .email = JsonStringOr(client_obj, "email", ""),
+                .flow = naming::LowerAscii(JsonStringOr(client_obj, "flow", "")),
+            });
         }
-        saw_user_array = !config.clients.empty();
+        saw_user_array = !clients.empty();
     }
 
     if (protocol == constants::protocol::kShadowsocks &&
         !top_level_user.password.empty() &&
         (!ss2022_method || !saw_user_array)) {
-        config.clients.insert(config.clients.begin(), std::move(top_level_user));
+        clients.insert(clients.begin(), std::move(top_level_user));
     } else if ((protocol == constants::protocol::kTrojan ||
                 protocol == constants::protocol::kAnyTLS ||
                 protocol == constants::protocol::kHysteria ||
                 protocol == constants::protocol::kHysteria2) &&
                !top_level_user.password.empty() &&
                !saw_user_array) {
-        config.clients.insert(config.clients.begin(), std::move(top_level_user));
+        clients.insert(clients.begin(), std::move(top_level_user));
     }
 
-    return config;
+    cfg.users.reserve(clients.size());
+    for (auto& client : clients) {
+        cfg.users.push_back(InboundUserSpec{
+            .user_id = 0,
+            .email = std::move(client.email),
+            .credential = StaticCredential(protocol, client),
+            .flow = std::move(client.flow),
+            .speed_limit = 0,
+            .device_limit = 0,
+        });
+    }
+
+    // A single static SS2022 user whose PSK is the server PSK is the
+    // single-user form without an identity header.
+    if (protocol == constants::protocol::kShadowsocks &&
+        cfg.users.size() == 1 &&
+        cfg.users.front().credential == config.identity_password) {
+        config.identity_password.clear();
+    }
 }
 
 }  // namespace
@@ -1311,7 +1354,7 @@ StaticInboundConfig StaticInboundConfig::FromJson(const json::object& j) {
     cfg.proxy_protocol = ParseProxyProtocolMode(j, "proxyProtocol");
 
     if (const auto* settings = OptionalJsonObject(j, "settings")) {
-        cfg.static_users = ParseStaticUserConfig(cfg.protocol, *settings);
+        ParseStaticSettings(cfg.protocol, *settings, cfg);
     }
 
     if (const auto* stream_settings = OptionalJsonObject(j, "streamSettings")) {

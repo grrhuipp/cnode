@@ -152,7 +152,7 @@ constexpr uint64_t kBytesPerSecondPerMbps = 125000;
 }
 
 std::optional<std::shared_ptr<const proxyman::inbound::ProtocolSettings>>
-PrepareSettings(wire::Version version, const StaticUserConfig& config) {
+PrepareSettings(wire::Version version, const InboundProtocolSettings& config) {
     auto settings = std::make_shared<wire::Settings>();
     settings->version = version;
     settings->upload_bytes_per_second =
@@ -172,38 +172,22 @@ std::unique_ptr<::acpp::Inbound> CreateInbound(
     return std::make_unique<HysteriaInbound>(stats, settings->version);
 }
 
-std::optional<proxyman::inbound::UserSet> BuildStaticUsers(
-    std::string_view tag,
-    const StaticUserConfig& config) {
+std::optional<proxyman::inbound::UserSet> BuildUsers(
+    const proxyman::inbound::BuildRequest& request,
+    std::span<const InboundUserSpec> specs) {
     std::vector<proxyman::inbound::PreparedHysteriaUser> users;
-    users.reserve(config.clients.size());
-    for (const auto& client : config.clients) {
-        const auto& credential = client.password.empty() ? client.id : client.password;
-        if (credential.empty()) {
-            LOG_WARN("Hysteria inbound '{}': static user credential is empty", tag);
+    users.reserve(specs.size());
+    for (const auto& spec : specs) {
+        if (spec.credential.empty()) {
+            LOG_WARN("Hysteria inbound '{}': user credential is empty", request.tag);
             return std::nullopt;
         }
         proxyman::inbound::PreparedHysteriaUser user;
-        user.credential_hash = wire::HashCredential(credential);
-        user.profile.email = client.email.empty() ? std::string(tag) : client.email;
-        users.push_back(std::move(user));
-    }
-    return proxyman::inbound::UserSet{std::move(users)};
-}
-
-std::optional<proxyman::inbound::UserSet> BuildRuntimeUsers(
-    const proxyman::inbound::BuildRequest&,
-    std::span<const proxyman::inbound::RuntimeUser> runtime_users) {
-    std::vector<proxyman::inbound::PreparedHysteriaUser> users;
-    users.reserve(runtime_users.size());
-    for (const auto& runtime_user : runtime_users) {
-        if (runtime_user.credential.empty()) return std::nullopt;
-        proxyman::inbound::PreparedHysteriaUser user;
-        user.credential_hash = wire::HashCredential(runtime_user.credential);
-        user.profile.email = runtime_user.email;
-        user.profile.user_id = runtime_user.user_id;
-        user.profile.speed_limit = runtime_user.speed_limit;
-        user.profile.device_limit = runtime_user.device_limit;
+        user.credential_hash = wire::HashCredential(spec.credential);
+        user.profile.email = spec.email;
+        user.profile.user_id = spec.user_id;
+        user.profile.speed_limit = spec.speed_limit;
+        user.profile.device_limit = spec.device_limit;
         users.push_back(std::move(user));
     }
     return proxyman::inbound::UserSet{std::move(users)};
@@ -218,21 +202,20 @@ proxyman::inbound::ProxyRegistration Registration() {
         return std::make_unique<UserOnlineProtocolRuntime>();
     };
     registration.create_tcp_handler = &CreateInbound;
-    registration.build_static_users = &BuildStaticUsers;
-    registration.build_users = &BuildRuntimeUsers;
+    registration.build_users = &BuildUsers;
     return registration;
 }
 
 const bool kHysteriaRegistered = [] {
     auto v1 = Registration();
-    v1.prepare_settings = [](std::string_view, const StaticUserConfig& config)
+    v1.prepare_settings = [](std::string_view, const InboundProtocolSettings& config)
         -> std::optional<std::shared_ptr<const proxyman::inbound::ProtocolSettings>> {
         return PrepareSettings(wire::Version::V1, config);
     };
     proxyman::inbound::RegisterProxy(constants::protocol::kHysteria, std::move(v1));
 
     auto v2 = Registration();
-    v2.prepare_settings = [](std::string_view, const StaticUserConfig& config)
+    v2.prepare_settings = [](std::string_view, const InboundProtocolSettings& config)
         -> std::optional<std::shared_ptr<const proxyman::inbound::ProtocolSettings>> {
         return PrepareSettings(wire::Version::V2, config);
     };

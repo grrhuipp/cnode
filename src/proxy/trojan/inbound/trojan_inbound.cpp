@@ -256,44 +256,25 @@ const bool kTrojanInboundRegistered = [] {
                 limiter);
         };
 
-    reg.build_static_users =
-        [](std::string_view tag, const acpp::StaticUserConfig& config)
-            -> std::optional<acpp::proxyman::inbound::UserSet> {
-            std::vector<acpp::proxyman::inbound::PreparedTrojanUser> users;
-
-            for (const auto& client : config.clients) {
-                if (client.password.empty()) {
-                    LOG_WARN("Trojan inbound '{}': static user password is empty", tag);
-                    return std::nullopt;
-                }
-                acpp::proxyman::inbound::PreparedTrojanUser info;
-                const auto hash = acpp::trojan::HashPassword(client.password);
-                info.password_hash.assign(hash.data(), hash.size());
-                info.profile.email = client.email;
-                users.push_back(std::move(info));
-            }
-
-            return acpp::proxyman::inbound::UserSet{std::move(users)};
-        };
-
     reg.build_users =
-        [](const acpp::proxyman::inbound::BuildRequest& /*req*/,
-           std::span<const acpp::proxyman::inbound::RuntimeUser> runtime_users)
+        [](const acpp::proxyman::inbound::BuildRequest& req,
+           std::span<const acpp::InboundUserSpec> specs)
             -> std::optional<acpp::proxyman::inbound::UserSet> {
             std::vector<acpp::proxyman::inbound::PreparedTrojanUser> users;
-            users.reserve(runtime_users.size());
+            users.reserve(specs.size());
 
-            for (const auto& runtime_user : runtime_users) {
-                if (runtime_user.credential.empty()) {
+            for (const auto& spec : specs) {
+                if (spec.credential.empty()) {
+                    LOG_WARN("Trojan inbound '{}': user password is empty", req.tag);
                     return std::nullopt;
                 }
                 acpp::proxyman::inbound::PreparedTrojanUser info;
-                const auto hash = acpp::trojan::HashPassword(runtime_user.credential);
+                const auto hash = acpp::trojan::HashPassword(spec.credential);
                 info.password_hash.assign(hash.data(), hash.size());
-                info.profile.email = runtime_user.email;
-                info.profile.user_id = runtime_user.user_id;
-                info.profile.speed_limit = runtime_user.speed_limit;
-                info.profile.device_limit = runtime_user.device_limit;
+                info.profile.email = spec.email;
+                info.profile.user_id = spec.user_id;
+                info.profile.speed_limit = spec.speed_limit;
+                info.profile.device_limit = spec.device_limit;
                 users.push_back(std::move(info));
             }
 

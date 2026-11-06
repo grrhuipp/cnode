@@ -10,6 +10,7 @@
 #include "../udp_framing.hpp"
 #include "../vless_vision.hpp"
 #include "../../handshake_timeout.hpp"
+#include "../../outbound_server.hpp"
 #include "../../outbound_stream_endpoint.hpp"
 #include "acppnode/app/dns/dns.hpp"
 #include "acppnode/app/proxyman/outbound/factory.hpp"
@@ -440,11 +441,8 @@ SendVlessHandshake(
 }  // namespace
 
 proxy::vless::outbound::Handler::Handler(
-    std::string_view tag, std::shared_ptr<const VlessOutboundConfig> config,
-    ::acpp::app::dns::DNS& dns_service, std::chrono::seconds dial_timeout)
-    : tag_(tag), config_(std::move(config)),
-      security_(config_->stream_settings, StreamEndpointRole::Outbound),
-      dial_timeout_(dial_timeout), dns_service_(dns_service)
+    std::shared_ptr<const VlessOutboundConfig> config)
+    : config_(std::move(config))
     , encryption_tickets_(config_->encryption
           ? std::make_unique<::acpp::vless::VlessEncryptionClientTicketCache>()
           : nullptr) {}
@@ -453,11 +451,10 @@ proxy::vless::outbound::Handler::~Handler() = default;
 
 net::awaitable<OutboundProcessResult>
 proxy::vless::outbound::Handler::Process(
-    net::io_context& io_context,
-    const tcp::endpoint* inbound_local_addr,
     session::Context& ctx,
-    const TimeoutsConfig& timeouts,
     transport::Link inbound,
+    OutboundDialer& dialer,
+    const TimeoutsConfig& timeouts,
     StatsShard& stats,
     const RelayConfig& relay_config,
     buf::MultiBufferBatch first_payload,
@@ -471,20 +468,7 @@ proxy::vless::outbound::Handler::Process(
     }
 
     const auto& target = ctx.outbound.target;
-    auto dialed = co_await acpp::DialOutboundStream(
-        io_context,
-        ctx,
-        OutboundTargetOptions{
-            .dns_service = &dns_service_,
-            .address = config_->address,
-            .literal_address = config_->literal_address,
-            .port = config_->port,
-            .stream_settings = &config_->stream_settings,
-            .security = &security_,
-            .timeout = dial_timeout_,
-            .send_through = &config_->send_through,
-            .inbound_local_addr = inbound_local_addr,
-        });
+    auto dialed = co_await dialer.Dial(ctx, config_->server);
     if (!dialed) {
         co_return tl::unexpected(dialed.error());
     }
@@ -526,7 +510,7 @@ proxy::vless::outbound::Handler::Process(
             *active_writer,
             target);
         auto res = co_await DoRelayLink(
-            io_context, *inbound.reader, *inbound.writer, inbound.control,
+            dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
             target_endpoint, ctx, stats, relay_config, std::move(first_payload));
         if (encrypted_io && !res) {
             encrypted_io->reader.ClearDeferredTicket();
@@ -544,7 +528,7 @@ proxy::vless::outbound::Handler::Process(
         use_vision,
         config_->uuid_bytes);
     auto res = co_await DoRelayLink(
-        io_context, *inbound.reader, *inbound.writer, inbound.control,
+        dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
         target_endpoint, ctx, stats, relay_config, std::move(first_payload));
     if (encrypted_io && !res) {
         encrypted_io->reader.ClearDeferredTicket();
@@ -558,7 +542,7 @@ namespace {
 const bool kVlessRegistered = (acpp::proxyman::outbound::RegisterProxy(
     acpp::constants::protocol::kVless,
     [](const acpp::infra::OutboundSourceConfig& cfg)
-        -> std::optional<acpp::proxyman::outbound::PreparedOutboundCreator> {
+        -> std::optional<acpp::proxyman::outbound::PreparedOutboundProxy> {
         // A present field of the wrong type is a configuration error, never
         // an implicit default.
         bool invalid_field = false;
@@ -574,6 +558,8 @@ const bool kVlessRegistered = (acpp::proxyman::outbound::RegisterProxy(
         };
 
         acpp::VlessOutboundConfig vless_config;
+        std::string address;
+        uint16_t port = 443;
         std::string uuid;
         std::string encryption;
 
@@ -583,13 +569,13 @@ const bool kVlessRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 vnext_p && vnext_p->is_array() && !vnext_p->as_array().empty() &&
                 vnext_p->as_array()[0].is_object()) {
             const auto& server = vnext_p->as_array()[0].as_object();
-            vless_config.address = json_string(server, "address");
-            const auto port = acpp::ReadJsonPort(server, "port");
-            if (port.Invalid()) {
+            address = json_string(server, "address");
+            const auto source_port = acpp::ReadJsonPort(server, "port");
+            if (source_port.Invalid()) {
                 return std::nullopt;
             }
-            if (port.Valid()) {
-                vless_config.port = port.value;
+            if (source_port.Valid()) {
+                port = source_port.value;
             }
 
             if (const auto* users_p = server.if_contains("users");
@@ -611,13 +597,13 @@ const bool kVlessRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 encryption = json_string(s, "encryption");
             }
         } else {
-            vless_config.address = json_string(s, "address");
-            const auto port = acpp::ReadJsonPort(s, "port");
-            if (port.Invalid()) {
+            address = json_string(s, "address");
+            const auto source_port = acpp::ReadJsonPort(s, "port");
+            if (source_port.Invalid()) {
                 return std::nullopt;
             }
-            if (port.Valid()) {
-                vless_config.port = port.value;
+            if (source_port.Valid()) {
+                port = source_port.value;
             }
             uuid = json_string(s, "id");
             encryption = json_string(s, "encryption");
@@ -671,47 +657,38 @@ const bool kVlessRegistered = (acpp::proxyman::outbound::RegisterProxy(
             return std::nullopt;
         }
 
-        vless_config.send_through = cfg.send_through.value_or(acpp::OutboundBind{});
-        vless_config.stream_settings = acpp::NormalizeOutboundStreamSettings(
-            cfg.stream_settings,
-            acpp::OutboundStreamDefaults{
-                .require_tls = false,
-                .fallback_server_name = vless_config.address,
-                .allow_insecure = false,
-                .alpn = {},
-            });
-
         const auto uuid_bytes = acpp::vless::ParseUuidBytes(uuid);
-        if (vless_config.address.empty() || vless_config.port == 0 || !uuid_bytes) {
+        if (!uuid_bytes) {
+            LOG_ERROR("VLESS outbound '{}': invalid UUID", cfg.tag);
             return std::nullopt;
         }
         vless_config.uuid_bytes = *uuid_bytes;
-        vless_config.literal_address = acpp::iputil::ParseLiteral(vless_config.address);
-        if (!vless_config.literal_address && !acpp::domain::IsValidDnsHostname(
-                vless_config.address, acpp::domain::TrailingDotPolicy::Allow)) {
-            LOG_ERROR("vless outbound '{}': address must be an IP literal or DNS hostname", cfg.tag);
+        auto next_hop = acpp::proxy::PrepareNextHop(
+            cfg, std::move(address), port, acpp::OutboundStreamDefaults{});
+        if (!next_hop) {
             return std::nullopt;
         }
+        const auto& stream_settings = next_hop->sender.stream_settings;
         if (!vless_config.flow.empty() &&
-            (!(vless_config.stream_settings.IsTlsLike() || vless_config.encryption != nullptr) ||
-             vless_config.stream_settings.network_mode != acpp::NetworkMode::Tcp)) {
+            (!(stream_settings.IsTlsLike() || vless_config.encryption != nullptr) ||
+             stream_settings.network_mode != acpp::NetworkMode::Tcp)) {
             LOG_ERROR("VLESS outbound '{}': Vision requires TCP with TLS, Reality, or VLESS Encryption", cfg.tag);
             return std::nullopt;
         }
-        acpp::TransportSecurity::Prepare(
-            vless_config.stream_settings, acpp::StreamEndpointRole::Outbound);
+        vless_config.server = std::move(next_hop->server);
         const bool persistent_state = bool(vless_config.encryption);
 
-        return acpp::proxyman::outbound::MakePreparedOutboundCreator<
-            acpp::VlessOutboundConfig,
-            +[](std::string_view tag,
-                std::shared_ptr<const acpp::VlessOutboundConfig> cfg_state,
-                acpp::net::io_context& /*io_context*/,
-                acpp::app::dns::DNS& dns,
-                std::chrono::seconds timeout,
-                acpp::AwaitableTaskGroup& /*tasks*/) -> std::unique_ptr<acpp::Outbound> {
-                return std::make_unique<acpp::proxy::vless::outbound::Handler>(
-                    tag, std::move(cfg_state), dns, timeout);
-            }>(std::move(vless_config), persistent_state);
+        return acpp::proxyman::outbound::PreparedOutboundProxy{
+            .create = acpp::proxyman::outbound::MakePreparedOutboundCreator<
+                acpp::VlessOutboundConfig,
+                +[](std::string_view,
+                    std::shared_ptr<const acpp::VlessOutboundConfig> cfg_state,
+                    acpp::net::io_context& /*io_context*/,
+                    acpp::AwaitableTaskGroup& /*tasks*/) -> std::unique_ptr<acpp::Outbound> {
+                    return std::make_unique<acpp::proxy::vless::outbound::Handler>(
+                        std::move(cfg_state));
+                }>(std::move(vless_config), persistent_state),
+            .sender = std::move(next_hop->sender),
+        };
     }), true);
 }  // namespace

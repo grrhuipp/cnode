@@ -492,6 +492,7 @@ proxy::vless::inbound::Handler::Process(
             *stream,
             dispatcher,
             receiver.dispatch_policy,
+            limiter_,
             ctx,
             *stats_,
             timeouts,
@@ -557,24 +558,18 @@ public:
 }
 
 [[nodiscard]] std::optional<acpp::proxyman::inbound::PreparedVlessUser>
-BuildPreparedVlessUser(
-    std::string_view uuid,
-    std::string_view flow,
-    const std::string& email,
-    int64_t user_id = 0,
-    uint64_t speed_limit = 0,
-    uint32_t device_limit = 0) {
-    auto uuid_bytes = acpp::vless::ParseUuidBytes(uuid);
+BuildPreparedVlessUser(const acpp::InboundUserSpec& spec) {
+    auto uuid_bytes = acpp::vless::ParseUuidBytes(spec.credential);
     if (!uuid_bytes) {
         return std::nullopt;
     }
     acpp::proxyman::inbound::PreparedVlessUser info;
     info.uuid_bytes = *uuid_bytes;
-    info.flow = acpp::vless::NormalizeFlow(flow);
-    info.profile.email = email;
-    info.profile.user_id = user_id;
-    info.profile.speed_limit = speed_limit;
-    info.profile.device_limit = device_limit;
+    info.flow = acpp::vless::NormalizeFlow(spec.flow);
+    info.profile.email = spec.email;
+    info.profile.user_id = spec.user_id;
+    info.profile.speed_limit = spec.speed_limit;
+    info.profile.device_limit = spec.device_limit;
     return info;
 }
 
@@ -606,7 +601,7 @@ const bool kVlessInboundRegistered = [] {
         };
 
     reg.prepare_settings =
-        [](std::string_view tag, const acpp::StaticUserConfig& config)
+        [](std::string_view tag, const acpp::InboundProtocolSettings& config)
             -> std::optional<std::shared_ptr<
                 const acpp::proxyman::inbound::ProtocolSettings>> {
             auto settings = std::make_shared<VlessSettings>();
@@ -627,43 +622,18 @@ const bool kVlessInboundRegistered = [] {
             return settings;
         };
 
-    // Decryption settings are validated once by prepare_settings; static
-    // inbound preparation runs it before building users.
-    reg.build_static_users =
-        [](std::string_view tag, const acpp::StaticUserConfig& config)
-            -> std::optional<acpp::proxyman::inbound::UserSet> {
-            std::vector<acpp::proxyman::inbound::PreparedVlessUser> users;
-            users.reserve(config.clients.size());
-            for (const auto& client : config.clients) {
-                const std::string_view uuid =
-                    client.id.empty() ? std::string_view(client.password)
-                                      : std::string_view(client.id);
-                auto user = BuildPreparedVlessUser(
-                    uuid, client.flow, client.email);
-                if (!user) {
-                    LOG_WARN("VLESS inbound '{}': invalid static user UUID", tag);
-                    return std::nullopt;
-                }
-                users.push_back(std::move(*user));
-            }
-            return acpp::proxyman::inbound::UserSet{std::move(users)};
-        };
-
+    // Decryption settings are validated once by prepare_settings; inbound
+    // preparation runs it before building users.
     reg.build_users =
-        [](const acpp::proxyman::inbound::BuildRequest& /*req*/,
-           std::span<const acpp::proxyman::inbound::RuntimeUser> runtime_users)
+        [](const acpp::proxyman::inbound::BuildRequest& req,
+           std::span<const acpp::InboundUserSpec> specs)
             -> std::optional<acpp::proxyman::inbound::UserSet> {
             std::vector<acpp::proxyman::inbound::PreparedVlessUser> users;
-            users.reserve(runtime_users.size());
-            for (const auto& runtime_user : runtime_users) {
-                auto user = BuildPreparedVlessUser(
-                    runtime_user.credential,
-                    runtime_user.flow,
-                    runtime_user.email,
-                    runtime_user.user_id,
-                    runtime_user.speed_limit,
-                    runtime_user.device_limit);
+            users.reserve(specs.size());
+            for (const auto& spec : specs) {
+                auto user = BuildPreparedVlessUser(spec);
                 if (!user) {
+                    LOG_WARN("VLESS inbound '{}': invalid user UUID", req.tag);
                     return std::nullopt;
                 }
                 users.push_back(std::move(*user));

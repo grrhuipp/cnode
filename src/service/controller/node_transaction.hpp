@@ -187,8 +187,8 @@ net::awaitable<void> ApplyNodeChange(
     if (!next) throw std::logic_error("node change requires a prepared snapshot");
     const auto plan = PlanNodeTransition(old ? &old->config : nullptr,
         state.phase == NodeRuntimePhase::Ready, next->config);
-    if (!next->inbound || !next->outbound || !next->prepared_users ||
-        (old && (!old->inbound || !old->outbound || !old->prepared_users)) ||
+    if (!next->inbound || !next->outbound || !next->inbound->users ||
+        (old && (!old->inbound || !old->outbound || !old->inbound->users)) ||
         (plan.Transitioning() && (!change.replace_users || !change.replace_rules))) {
         throw std::logic_error("node change requires complete prepared runtime snapshots");
     }
@@ -231,7 +231,7 @@ net::awaitable<void> ApplyNodeChange(
             }
             if (change.replace_users) {
                 users_attempted = true;
-                co_await runtime.ApplyUsers(tag, *next->prepared_users);
+                co_await runtime.ApplyUsers(tag, *next->inbound->users);
             }
         } else {
             if (plan.DestructiveSwap()) {
@@ -239,7 +239,7 @@ net::awaitable<void> ApplyNodeChange(
                 co_await runtime.RemoveInbound(old_tag);
             }
             users_attempted = true;
-            co_await runtime.ApplyUsers(tag, *next->prepared_users);
+            co_await runtime.ApplyUsers(tag, *next->inbound->users);
             outbound_attempted = true;
             co_await runtime.AddOutbound(*next->outbound);
             if (different_tag || recovering_old) {
@@ -307,7 +307,7 @@ net::awaitable<void> ApplyNodeChange(
     }
     if (old && !recovering_old) {
         if ((!different_tag && users_attempted) || old_users_cleared) {
-            try { co_await runtime.ApplyUsers(old_tag, *old->prepared_users); }
+            try { co_await runtime.ApplyUsers(old_tag, *old->inbound->users); }
             catch (...) { restored = false; }
         }
         if ((!different_tag && outbound_attempted) || old_outbound_retired) {

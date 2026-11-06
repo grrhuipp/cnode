@@ -387,7 +387,7 @@ set(CNODE_SOURCES
     src/app/worker/udp_association_reclaimer.cpp
     src/app/proxyman/inbound/user_store.cpp
     src/app/proxyman/outbound/factory.cpp
-    src/app/proxyman/outbound/handler_registry.cpp
+    src/app/proxyman/outbound/handler.cpp
     src/app/worker.cpp
     src/app/session_group_executor.cpp
     src/app/session_capabilities.cpp
@@ -399,7 +399,7 @@ set(CNODE_SOURCES
     src/service/controller/online_snapshot.cpp
     src/infra/panel_config.cpp
     src/infra/panel_node_ids.cpp
-    src/service/controller/inboundbuilder.cpp
+    src/service/controller/panel_inbound.cpp
     src/service/controller/control.cpp
     src/app/bootstrap_inbounds.cpp
     src/app/bootstrap_panels.cpp
@@ -409,6 +409,8 @@ set(CNODE_SOURCES
     src/app/bootstrap_shutdown.cpp
     src/app/bootstrap_setup.cpp
     src/app/startup_inbounds.cpp
+    src/app/prepared_inbound.cpp
+    src/app/runtime_publication.cpp
     src/app/session_tracking.cpp
     src/proxy/mux/inbound/mux_inbound.cpp
     src/common/rule.cpp
@@ -1552,24 +1554,6 @@ if(CNODE_BUILD_TESTS)
         NAME cnode_inbound_tls_policy_test
         COMMAND cnode_inbound_tls_policy_test)
 
-    add_executable(cnode_handler_registry_test
-        tests/handler_registry_test.cpp
-        src/app/proxyman/outbound/handler_registry.cpp
-    )
-    target_include_directories(cnode_handler_registry_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-    target_link_libraries(cnode_handler_registry_test PRIVATE
-        asio::asio
-        Threads::Threads
-    )
-    target_compile_options(cnode_handler_registry_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_handler_registry_test
-        COMMAND cnode_handler_registry_test)
-
     add_executable(cnode_config_semantics_test
         tests/config_semantics_test.cpp
         src/infra/config_semantics.cpp
@@ -1871,6 +1855,13 @@ if(CNODE_BUILD_TESTS)
     add_executable(cnode_worker_connection_limit_runtime_test
         ${CNODE_UDP_LISTENER_RUNTIME_SOURCES}
         tests/worker_connection_limit_runtime_test.cpp)
+    # The concrete outbound Handler/lookup bring the dialer and every transport.
+    add_executable(cnode_handler_registry_test
+        ${CNODE_UDP_LISTENER_RUNTIME_SOURCES}
+        tests/handler_registry_test.cpp)
+    add_executable(cnode_dispatcher_cancellation_test
+        ${CNODE_UDP_LISTENER_RUNTIME_SOURCES}
+        tests/dispatcher_cancellation_test.cpp)
     set(CNODE_HTTP_HANDSHAKE_TEST_SOURCES ${CNODE_SOURCES})
     list(FILTER CNODE_HTTP_HANDSHAKE_TEST_SOURCES INCLUDE REGEX
         "^src/(transport/|common/(error|session)\\.cpp$|infra/(json[^/]*|http2_initial_window|log)\\.cpp$)")
@@ -1908,6 +1899,8 @@ if(CNODE_BUILD_TESTS)
     foreach(runtime_test IN ITEMS cnode_worker_udp_listener_runtime_test
             cnode_worker_udp_retirement_runtime_test
             cnode_worker_connection_limit_runtime_test
+            cnode_handler_registry_test
+            cnode_dispatcher_cancellation_test
             cnode_http_handshake_read_ahead_test
             cnode_http2_server_errors_test
             cnode_http2_flow_control_test
@@ -1926,6 +1919,10 @@ if(CNODE_BUILD_TESTS)
             add_dependencies(${runtime_test} cnode_liburing_static)
         endif()
     endforeach()
+    add_test(NAME cnode_handler_registry_test COMMAND cnode_handler_registry_test)
+    set_tests_properties(cnode_handler_registry_test PROPERTIES TIMEOUT 20)
+    add_test(NAME cnode_dispatcher_cancellation_test COMMAND cnode_dispatcher_cancellation_test)
+    set_tests_properties(cnode_dispatcher_cancellation_test PROPERTIES TIMEOUT 20)
     target_compile_definitions(cnode_tls_record_buffer_test PRIVATE
         ACPP_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
         CNODE_TEST_ALLOCATOR_FAULT CNODE_TEST_BUFFER_STATS)
@@ -2257,34 +2254,6 @@ if(CNODE_BUILD_TESTS)
     add_test(NAME cnode_relay_half_close_backpressure_test
         COMMAND cnode_relay_initial_payload_test --half-close-backpressure)
     set_tests_properties(cnode_relay_half_close_backpressure_test PROPERTIES TIMEOUT 15)
-
-    add_executable(cnode_dispatcher_cancellation_test
-        tests/dispatcher_cancellation_test.cpp
-        src/transport/internet/tls_server_name.cpp
-        src/app/dispatcher/default_dispatcher.cpp
-        src/app/session_tracking.cpp
-        src/app/dns/dns.cpp
-        src/app/dns/cache.cpp
-        src/infra/runtime_failure.cpp
-        src/transport/async_stream.cpp
-        src/transport/internet/tcp_stream.cpp
-        src/transport/internet/proxy_protocol.cpp
-        src/transport/internet/timeout_scheduler.cpp
-        src/sniff/sniffer.cpp
-        src/sniff/tls_sniffer.cpp
-        src/sniff/http_sniffer.cpp
-        src/sniff/quic_sniffer.cpp
-        src/common/error.cpp
-        src/common/session.cpp
-        src/common/rule.cpp
-        src/infra/log.cpp)
-    target_include_directories(cnode_dispatcher_cancellation_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include ${concurrentqueue_SOURCE_DIR})
-    target_link_libraries(cnode_dispatcher_cancellation_test PRIVATE asio::asio Threads::Threads cnode_zlib crypto)
-    target_compile_options(cnode_dispatcher_cancellation_test PRIVATE
-        -Wall -Wextra -Wpedantic)
-    add_test(NAME cnode_dispatcher_cancellation_test COMMAND cnode_dispatcher_cancellation_test)
-    set_tests_properties(cnode_dispatcher_cancellation_test PROPERTIES TIMEOUT 20)
 
     add_executable(cnode_xhttp_packet_session_key_test
         tests/xhttp_packet_session_key_test.cpp
@@ -2646,6 +2615,7 @@ if(CNODE_BUILD_TESTS)
         src/app/proxyman/inbound/factory.cpp
         src/app/proxyman/inbound/user_store.cpp
         src/app/proxyman/outbound/factory.cpp
+        src/transport/internet/outbound_bind.cpp
         src/infra/json.cpp
     )
     target_include_directories(cnode_protocol_registration_test PRIVATE
@@ -2694,6 +2664,7 @@ if(CNODE_BUILD_TESTS)
     add_executable(cnode_startup_inbounds_test
         tests/startup_inbounds_test.cpp
         src/app/startup_inbounds.cpp
+        src/app/prepared_inbound.cpp
         src/app/proxyman/inbound/factory.cpp
         src/app/proxyman/inbound/user_store.cpp
         src/infra/config_semantics.cpp

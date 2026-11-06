@@ -285,7 +285,7 @@ net::awaitable<RelayResult> RunMux(std::unique_ptr<AsyncStream> stream,
     routing::Dispatcher& dispatcher, const proxyman::inbound::ReceiverSettings& receiver,
     net::io_context& io, session::Context& context, StatsShard& stats, const TimeoutsConfig& timeouts) {
     co_return co_await mux::ProcessInbound(io, {stream.get(), stream.get(), stream.get()},
-        *stream, dispatcher, receiver.dispatch_policy, context, stats, timeouts, 0);
+        *stream, dispatcher, receiver.dispatch_policy, nullptr, context, stats, timeouts, 0);
 }
 
 bool RunCase(int mode, bool baseline, bool blocked_writes = false, bool mux = false) {

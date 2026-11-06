@@ -158,13 +158,10 @@ BuildOutboundTransportTarget(OutboundTargetOptions options) {
     target.timeout = options.timeout;
     target.stream_settings = options.stream_settings;
     target.security_context = options.security ? options.security->Context() : nullptr;
-    target.tls_server_name = options.tls_server_name.empty()
-        ? ResolveOutboundTlsServerName(*options.stream_settings, options.address)
-        : options.tls_server_name;
+    target.tls_server_name = ResolveOutboundTlsServerName(
+        *options.stream_settings, options.address);
     target.ws_host = BuildHttpHostHeader(
-        *options.stream_settings,
-        options.ws_host.empty() ? options.address : options.ws_host,
-        options.port);
+        *options.stream_settings, options.address, options.port);
 
     auto append_single = [&](const net::ip::address& remote_addr) {
         OutboundDialCandidate candidate;
@@ -280,50 +277,170 @@ BuildOutboundTransportTarget(OutboundTargetOptions options) {
     co_return co_await finalize_candidates();
 }
 
-void RecordOutboundStreamConnected(session::Context& ctx,
-                                   const AsyncStream& stream) {
+OutboundDialer::OutboundDialer(net::io_context& io_context,
+                               app::dns::DNS& dns,
+                               const OutboundSenderSettings& sender,
+                               std::chrono::seconds timeout)
+    : io_context_(io_context)
+    , dns_(dns)
+    , sender_(sender)
+    , security_(sender.stream_settings, StreamEndpointRole::Outbound)
+    , timeout_(timeout) {}
+
+std::optional<OutboundDialer::OrderedBind> OutboundDialer::SelectOrderedBind(
+    const session::Context& ctx) const {
+    const auto& bind = sender_.send_through;
+    if (bind.GetMode() != OutboundBind::Mode::Ordered) return std::nullopt;
+    return OrderedBind{
+        .v4 = bind.Select(net::ip::address_v4::any(),
+                          ctx.inbound.source_ip, ctx.inbound.source_port),
+        .v6 = bind.Select(net::ip::address_v6::any(),
+                          ctx.inbound.source_ip, ctx.inbound.source_port),
+    };
+}
+
+net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, ErrorCode>>
+OutboundDialer::Dial(session::Context& ctx, const OutboundServer& server,
+                     const OrderedBind* ordered) {
+    auto target = co_await BuildOutboundTransportTarget(OutboundTargetOptions{
+        .dns_service = &dns_,
+        .address = server.address,
+        .literal_address = server.literal_address,
+        .port = server.port,
+        .stream_settings = &sender_.stream_settings,
+        .security = &security_,
+        .timeout = timeout_,
+        .send_through = &sender_.send_through,
+        .inbound_local_addr = ctx.inbound.local_endpoint
+            ? &*ctx.inbound.local_endpoint : nullptr,
+        .inbound_source_ip = ctx.inbound.source_ip,
+        .inbound_source_port = ctx.inbound.source_port,
+        .ordered_bind_v4 = ordered ? std::optional{ordered->v4} : std::nullopt,
+        .ordered_bind_v6 = ordered ? std::optional{ordered->v6} : std::nullopt,
+    });
+    if (!target) {
+        if (target.error() == ErrorCode::DNS_RESOLVE_FAILED) {
+            LOG_CONN_WARN(ctx, "DNS resolve failed for {}", server.address);
+        }
+        co_return tl::unexpected(target.error());
+    }
+    co_return co_await DialTarget(ctx, *target);
+}
+
+net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, ErrorCode>>
+OutboundDialer::Dial(session::Context& ctx,
+                     std::span<const net::ip::address> addresses,
+                     uint16_t port) {
+    if (addresses.empty() || port == 0) {
+        co_return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
+    }
+    const auto& bind = sender_.send_through;
+    const auto ordered = SelectOrderedBind(ctx);
+    const tcp::endpoint* inbound_local =
+        ctx.inbound.local_endpoint ? &*ctx.inbound.local_endpoint : nullptr;
+    auto candidate_for = [&](const net::ip::address& remote) {
+        return OutboundDialCandidate{
+            .endpoint = tcp::endpoint(remote, port),
+            .bind_local = ordered
+                ? (remote.is_v6() ? ordered->v6.address : ordered->v4.address)
+                : bind.BindAddressFor(inbound_local, remote),
+        };
+    };
+
+    OutboundTransportTarget target;
+    target.timeout = timeout_;
+    target.stream_settings = &sender_.stream_settings;
+    target.security_context = security_.Context();
+    if (addresses.size() == 1) {
+        target.single_candidate = candidate_for(addresses.front());
+    } else {
+        target.candidates.reserve(addresses.size());
+        for (const auto& remote : addresses) {
+            target.candidates.push_back(candidate_for(remote));
+        }
+    }
+    LOG_CONN_DEBUG(ctx, "dialing {} resolved candidates port={}", addresses.size(), port);
+    co_return co_await DialTarget(ctx, target);
+}
+
+net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, ErrorCode>>
+OutboundDialer::DialTarget(session::Context& ctx, const OutboundTransportTarget& target) {
+    auto dialed = co_await DialOutboundTransport(io_context_, ctx, target);
+    if (!dialed.Ok()) {
+        ctx.outbound.connected_local_addr.reset();
+        // The dispatcher reports every non-cancellation failure once.
+        LOG_CONN_DEBUG(ctx, "dial failed {} -> {} > {}",
+                       ctx.inbound.source_ip, ctx.outbound.target, dialed.error_msg);
+        co_return tl::unexpected(dialed.error);
+    }
+    RecordConnected(ctx, *dialed.stream);
+    co_return std::move(dialed.stream);
+}
+
+tl::expected<net::ip::address, ErrorCode> OutboundDialer::SelectDatagramBind(
+    const session::Context& ctx, const DatagramRemote& remote) const {
+    const auto& bind = sender_.send_through;
+    if (bind.GetMode() == OutboundBind::Mode::Explicit) {
+        return *bind.ExplicitAddress();
+    }
+    // Same-in-same-out: reuse the inbound local address when it can source
+    // the association (OutboundBind owns the family/scope rules).
+    if (bind.GetMode() == OutboundBind::Mode::Auto && ctx.inbound.local_endpoint) {
+        const auto* local = &*ctx.inbound.local_endpoint;
+        if (remote.address) {
+            if (auto bound = bind.BindAddressFor(local, *remote.address)) return *bound;
+        } else {
+            const auto local_ip = iputil::NormalizeAddress(local->address());
+            if (local_ip.is_v6() ? remote.accepts_v6 : remote.accepts_v4) {
+                if (auto bound = bind.BindAddressFor(local, local_ip)) return *bound;
+            }
+        }
+    }
+    const bool v6 = remote.address ? remote.address->is_v6()
+        : (remote.prefers_v6 && remote.accepts_v6) ? true
+        : !remote.accepts_v6 ? false
+        : remote.family_hint ? remote.family_hint->is_v6()
+        : bind.PrefersIPv6();
+    const net::ip::address any = v6
+        ? net::ip::address(net::ip::address_v6::any())
+        : net::ip::address(net::ip::address_v4::any());
+    if (bind.GetMode() != OutboundBind::Mode::Ordered) return any;
+
+    auto selected = bind.Select(remote.address.value_or(any),
+                                ctx.inbound.source_ip, ctx.inbound.source_port);
+    // A hostname may still be reached over the other accepted family.
+    if (!selected.address && !remote.address && (v6 ? remote.accepts_v4 : remote.accepts_v6)) {
+        const net::ip::address other = v6
+            ? net::ip::address(net::ip::address_v4::any())
+            : net::ip::address(net::ip::address_v6::any());
+        selected = bind.Select(other, ctx.inbound.source_ip, ctx.inbound.source_port);
+    }
+    if (!selected.address) return tl::unexpected(ErrorCode::SOCKET_BIND_FAILED);
+    return *selected.address;
+}
+
+void OutboundDialer::ReportDatagramFailure(const session::Context& ctx,
+                                           const net::ip::address& bind,
+                                           std::string_view reason) const {
+    LOG_CONN_DEBUG(ctx, "failed to open UDP {} via {} > {}",
+                   ctx.outbound.target, iputil::AddressText(bind).View(), reason);
+}
+
+void OutboundDialer::RecordConnected(session::Context& ctx, const AsyncStream& stream) const {
+    const auto local = stream.LocalEndpoint();
+    RecordEgress(ctx, local ? std::optional{local->address()} : std::nullopt);
+}
+
+void OutboundDialer::RecordEgress(session::Context& ctx,
+                                  const std::optional<net::ip::address>& local) const {
     ctx.outbound.connected_local_addr.reset();
-    if (auto local_ep = stream.LocalEndpoint()) {
-        const auto local_ip = iputil::NormalizeAddress(local_ep->address());
+    if (local) {
+        const auto local_ip = iputil::NormalizeAddress(*local);
         if (!local_ip.is_unspecified()) {
             ctx.outbound.connected_local_addr = local_ip;
         }
     }
     LOG_ACCESS(FormatAccessLog(ctx));
-}
-
-net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, ErrorCode>>
-DialOutboundStream(net::io_context& io_context,
-                   session::Context& ctx,
-                   OutboundTargetOptions options) {
-    if (options.inbound_source_ip.empty()) {
-        options.inbound_source_ip = ctx.inbound.source_ip;
-    }
-    if (options.inbound_source_port == 0) {
-        options.inbound_source_port = ctx.inbound.source_port;
-    }
-    const std::string_view address = options.address;
-    auto transport_target = co_await BuildOutboundTransportTarget(std::move(options));
-    if (!transport_target) {
-        if (transport_target.error() == ErrorCode::DNS_RESOLVE_FAILED) {
-            LOG_CONN_WARN(ctx, "DNS resolve failed for {}", address);
-        }
-        co_return tl::unexpected(transport_target.error());
-    }
-
-    auto dial_result = co_await DialOutboundTransport(io_context, ctx, *transport_target);
-    if (!dial_result.Ok()) {
-        if (dial_result.error != ErrorCode::CANCELLED &&
-            dial_result.error != ErrorCode::CONNECTION_CLOSED &&
-            dial_result.error != ErrorCode::SOCKET_EOF) {
-            LOG_CONN_WARN(ctx, "dial failed {} -> {} > {}",
-                          ctx.inbound.source_ip, ctx.outbound.target, dial_result.error_msg);
-        }
-        co_return tl::unexpected(dial_result.error);
-    }
-
-    RecordOutboundStreamConnected(ctx, *dial_result.stream);
-    co_return std::move(dial_result.stream);
 }
 
 }  // namespace acpp

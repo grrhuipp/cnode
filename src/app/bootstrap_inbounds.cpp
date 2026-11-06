@@ -1,58 +1,27 @@
 #include "acppnode/app/bootstrap_inbounds.hpp"
 
-#include "acppnode/app/port_binding.hpp"
-#include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
-#include "acppnode/app/proxyman/inbound/factory.hpp"
+#include "acppnode/app/runtime_publication.hpp"
 #include "acppnode/app/worker.hpp"
 
 #include <format>
 #include <stdexcept>
-#include <utility>
 
 namespace acpp {
 
 net::awaitable<void> StartWorkerInbounds(
     Worker& worker,
-    std::vector<StaticInboundRuntimeEntry> inbounds) {
+    std::vector<PreparedInbound> inbounds) {
     worker.StartRuntime();
 
     for (const auto& inbound : inbounds) {
-        const auto fail = [&](const char* stage) {
+        const auto failure = co_await InstallInbound(worker, inbound);
+        if (failure != InboundInstallFailure::None) {
             throw std::runtime_error(std::format(
                 "static inbound startup failed worker={} tag={} port={} stage={}",
-                worker.Id(), inbound.tag, inbound.port, stage));
-        };
-        auto receiver = proxyman::inbound::MakeReceiverSettings(
-            inbound.tag,
-            inbound.all_tags,
-            inbound.protocol,
-            inbound.stream_settings,
-            inbound.sniffing,
-            inbound.proxy_protocol,
-            inbound.outbound_policy,
-            {});
-
-        if (!worker.RegisterInbound(
-                inbound.build_request,
-                std::move(receiver))) {
-            fail("register");
-        }
-
-        auto binding = PortBinding{.port = inbound.port, .protocol = inbound.protocol, .tag = inbound.tag, .listen = inbound.listen};
-        const bool quic_only =
-            proxyman::inbound::RegisteredDatagramTransport(inbound.protocol) ==
-            proxyman::inbound::DatagramTransport::Quic;
-        if (!quic_only && !worker.AddListener(binding)) {
-            fail("tcp-listen");
-        }
-
-        if (!co_await worker.AddUdpListenerTask(
-                binding,
-                inbound.build_request)) {
-            fail("udp-listen");
+                worker.Id(), inbound.binding.tag, inbound.binding.port,
+                InboundInstallFailureName(failure)));
         }
     }
 }
-
 
 }  // namespace acpp

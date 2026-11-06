@@ -41,16 +41,29 @@ std::shared_ptr<const NodeSnapshot> Snapshot(uint16_t port, size_t version = 1) 
     snapshot->users_etag = "users-" + std::to_string(version);
     snapshot->config_etag = "config-" + std::to_string(version);
     snapshot->rules.resize(version);
-    auto inbound = std::make_shared<InboundBuild>();
-    inbound->tag = snapshot->tag;
-    inbound->stream_settings.ws.path = snapshot->config.Path;
-    snapshot->inbound = std::move(inbound);
+    acpp::StreamSettings stream;
+    stream.ws.path = snapshot->config.Path;
+    snapshot->inbound = std::make_shared<const acpp::PreparedInbound>(acpp::PreparedInbound{
+        .binding = {.port = port, .protocol = snapshot->protocol, .tag = snapshot->tag, .listen = {}},
+        .receiver = acpp::proxyman::inbound::MakeReceiverSettings(
+            snapshot->tag, {}, snapshot->protocol, std::move(stream), {},
+            acpp::ProxyProtocolMode::Auto, acpp::routing::RouteWithFallback(snapshot->tag), {}),
+        .build_request = {},
+        .users = std::make_shared<const UserSet>(
+            acpp::proxyman::inbound::PreparedVmessUsers(version)),
+    });
     auto outbound = std::make_shared<acpp::proxyman::outbound::PreparedOutboundConfig>();
     outbound->tag = snapshot->tag;
     snapshot->outbound = std::move(outbound);
-    snapshot->prepared_users = std::make_shared<const UserSet>(
-        acpp::proxyman::inbound::PreparedVmessUsers(version));
     return snapshot;
+}
+
+// A users-only change keeps every prepared setting and replaces the users.
+void ReplaceUsers(NodeSnapshot& snapshot, size_t count) {
+    auto inbound = std::make_shared<acpp::PreparedInbound>(*snapshot.inbound);
+    inbound->users = std::make_shared<const UserSet>(
+        acpp::proxyman::inbound::PreparedVmessUsers(count));
+    snapshot.inbound = std::move(inbound);
 }
 
 PreparedNodeChange Change(std::shared_ptr<const NodeSnapshot> next, const NodeState&) {
@@ -125,7 +138,7 @@ struct Runtime {
         co_await net::post(net::use_awaitable);
         Step("remove-out:" + tag, [&] { resources[tag].outbound = false; });
     }
-    net::awaitable<bool> AddInbound(const InboundBuild& inbound) {
+    net::awaitable<bool> AddInbound(const acpp::PreparedInbound& inbound) {
         ++operations_started;
         co_await net::post(net::use_awaitable);
         if (inbound_gate) {
@@ -136,10 +149,10 @@ struct Runtime {
             gate_entered = true;
             co_await inbound_gate->async_wait(net::use_awaitable);
         }
-        const auto& tag = inbound.tag;
+        const auto& tag = inbound.binding.tag;
         co_return Step("add-in:" + tag, [&] {
             resources[tag].inbound = true;
-            resources[tag].version = inbound.stream_settings.ws.path;
+            resources[tag].version = inbound.receiver.stream_settings.ws.path;
         });
     }
     net::awaitable<void> AddOutbound(const acpp::proxyman::outbound::PreparedOutboundConfig& outbound) {
@@ -206,8 +219,7 @@ void TestSuccessAndRefresh() {
     Require(!Run(ApplyNodeChange(runtime, state, Change(first, state))), "create failed");
     auto refresh = std::make_shared<NodeSnapshot>(*first);
     refresh->users.resize(2);
-    refresh->prepared_users = std::make_shared<const UserSet>(
-        acpp::proxyman::inbound::PreparedVmessUsers(2));
+    ReplaceUsers(*refresh, 2);
     refresh->users_etag = "users-2";
     refresh->rules.resize(2);
     Require(!Run(ApplyNodeChange(runtime, state, Change(refresh, state))), "refresh failed");
@@ -266,8 +278,7 @@ void TestRefreshRollbackFailure() {
     const auto old = Snapshot(1000);
     auto next = std::make_shared<NodeSnapshot>(*old);
     next->users.resize(2);
-    next->prepared_users = std::make_shared<const UserSet>(
-        acpp::proxyman::inbound::PreparedVmessUsers(2));
+    ReplaceUsers(*next, 2);
     next->rules.resize(2);
     Seed(runtime, state, old);
     runtime.faults = {{"users:" + old->tag, 1, true}, {"rules:" + old->tag, 2, false}};

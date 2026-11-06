@@ -11,7 +11,7 @@ namespace {
 
 using CreatorMap = std::map<
     std::string,
-    std::optional<PreparedOutboundCreator> (*)(
+    std::optional<PreparedOutboundProxy> (*)(
         const infra::OutboundSourceConfig& config),
     std::less<>>;
 
@@ -24,7 +24,7 @@ CreatorMap& Proxies() noexcept {
 
 void RegisterProxy(
     std::string_view protocol,
-    std::optional<PreparedOutboundCreator> (*creator)(
+    std::optional<PreparedOutboundProxy> (*creator)(
         const infra::OutboundSourceConfig& config)) {
     if (protocol.empty() || !creator) {
         throw std::invalid_argument(
@@ -45,38 +45,34 @@ std::optional<PreparedOutboundConfig> PrepareOutboundConfig(
     if (it == proxies.end()) {
         return std::nullopt;
     }
-    auto creator = it->second(config);
-    if (!creator || !*creator) {
+    auto prepared = it->second(config);
+    if (!prepared || !prepared->create) {
         return std::nullopt;
+    }
+    // Xray: the handler-level sendThrough wins over any protocol default.
+    if (config.send_through) {
+        prepared->sender.send_through = *config.send_through;
     }
     return PreparedOutboundConfig{
         .tag = config.tag,
         .protocol = config.protocol,
-        .create = std::move(*creator),
+        .sender = std::move(prepared->sender),
+        .create = std::move(prepared->create),
     };
 }
 
-std::unique_ptr<::acpp::Outbound> NewHandler(
+std::unique_ptr<::acpp::Outbound> NewProxy(
     const PreparedOutboundConfig& config,
     ::acpp::net::io_context& io_context,
-    ::acpp::app::dns::DNS& dns,
-    std::chrono::seconds dial_timeout,
     ::acpp::AwaitableTaskGroup& tasks) {
-
     if (!config.create) {
         throw std::logic_error(
             "prepared outbound '" + config.tag + "' has no creator");
     }
-    auto proxy = config.create(
-        config.tag, io_context, dns, dial_timeout, tasks);
+    auto proxy = config.create(config.tag, io_context, tasks);
     if (!proxy) {
         throw std::logic_error(
             "prepared outbound '" + config.tag + "' creator returned null");
-    }
-    if (proxy->Tag() != config.tag) {
-        throw std::logic_error(
-            "prepared outbound '" + config.tag +
-            "' created handler with tag '" + std::string(proxy->Tag()) + "'");
     }
     return proxy;
 }
@@ -84,6 +80,5 @@ std::unique_ptr<::acpp::Outbound> NewHandler(
 bool HasProxy(std::string_view protocol) {
     return Proxies().contains(protocol);
 }
-
 
 }  // namespace acpp::proxyman::outbound

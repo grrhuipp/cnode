@@ -186,6 +186,7 @@ proxy::vmess::inbound::Handler::Process(
             *stream,
             dispatcher,
             receiver.dispatch_policy,
+            limiter_,
             ctx,
             *stats_,
             timeouts,
@@ -210,14 +211,9 @@ proxy::vmess::inbound::Handler::Process(
 // ============================================================================
 namespace {
 [[nodiscard]] std::optional<acpp::proxyman::inbound::PreparedVmessUser>
-BuildPreparedVmessUser(
-    const std::string& uuid,
-    int64_t user_id,
-    const std::string& email,
-    uint64_t speed_limit = 0,
-    uint32_t device_limit = 0) {
+BuildPreparedVmessUser(const acpp::InboundUserSpec& spec) {
     auto user = acpp::vmess::MemoryAccount::FromUUID(
-        uuid, user_id, email, speed_limit, device_limit);
+        spec.credential, spec.user_id, spec.email, spec.speed_limit, spec.device_limit);
     if (!user) {
         return std::nullopt;
     }
@@ -256,43 +252,17 @@ const bool kVmessInboundRegistered = [] {
                 limiter);
         };
 
-    reg.build_static_users =
-        [](std::string_view tag, const acpp::StaticUserConfig& config)
-            -> std::optional<acpp::proxyman::inbound::UserSet> {
-            std::vector<acpp::proxyman::inbound::PreparedVmessUser> users;
-            users.reserve(config.clients.size());
-
-            for (const auto& client : config.clients) {
-                if (client.id.empty()) {
-                    LOG_WARN("VMess inbound '{}': static user UUID is empty", tag);
-                    return std::nullopt;
-                }
-                auto user = BuildPreparedVmessUser(client.id, 0, client.email);
-                if (!user) {
-                    LOG_WARN("VMess inbound '{}': invalid static user UUID", tag);
-                    return std::nullopt;
-                }
-                users.push_back(std::move(*user));
-            }
-
-            return acpp::proxyman::inbound::UserSet{std::move(users)};
-        };
-
     reg.build_users =
-        [](const acpp::proxyman::inbound::BuildRequest& /*req*/,
-           std::span<const acpp::proxyman::inbound::RuntimeUser> runtime_users)
+        [](const acpp::proxyman::inbound::BuildRequest& req,
+           std::span<const acpp::InboundUserSpec> specs)
             -> std::optional<acpp::proxyman::inbound::UserSet> {
             std::vector<acpp::proxyman::inbound::PreparedVmessUser> users;
-            users.reserve(runtime_users.size());
+            users.reserve(specs.size());
 
-            for (const auto& runtime_user : runtime_users) {
-                auto user = BuildPreparedVmessUser(
-                    runtime_user.credential,
-                    runtime_user.user_id,
-                    runtime_user.email,
-                    runtime_user.speed_limit,
-                    runtime_user.device_limit);
+            for (const auto& spec : specs) {
+                auto user = BuildPreparedVmessUser(spec);
                 if (!user) {
+                    LOG_WARN("VMess inbound '{}': invalid user UUID", req.tag);
                     return std::nullopt;
                 }
                 users.push_back(std::move(*user));

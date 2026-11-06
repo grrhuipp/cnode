@@ -2,10 +2,11 @@
 #include "../../common/monitor_loop.hpp"
 #include "node_transaction.hpp"
 #include "node_runtime.hpp"
+#include "panel_inbound.hpp"
 #include "panel_schedule.hpp"
 #include "../../proxy/freedom/freedom_outbound.hpp"
 
-#include "acppnode/app/proxyman/inbound/factory.hpp"
+#include "acppnode/app/prepared_inbound.hpp"
 #include "acppnode/core/constants.hpp"
 #include "acppnode/core/naming.hpp"
 #include "acppnode/infra/log.hpp"
@@ -26,12 +27,16 @@ namespace {
     const std::string& tag,
     const PanelConfig& panel_config) {
     proxy::freedom::outbound::FreedomSettings settings;
-    settings.send_through = panel_config.SendIP;
     settings.domain_strategy = panel_config.EnableDNS
         ? panel_config.DNSType : proxy::freedom::outbound::DomainStrategy::AsIs;
     return proxyman::outbound::PreparedOutboundConfig{
         .tag = tag,
         .protocol = std::string(constants::protocol::kFreedom),
+        // The panel sendIP is the auto outbound Handler's sendThrough.
+        .sender = OutboundSenderSettings{
+            .stream_settings = {},
+            .send_through = panel_config.SendIP,
+        },
         .create = proxy::freedom::outbound::PrepareOutbound(std::move(settings)),
     };
 }
@@ -47,7 +52,7 @@ std::unique_ptr<api::API> ValidatePanelRuntimeArgs(
 [[nodiscard]] std::string_view ResolvedNodeNetwork(
     const controller::NodeSnapshot& state) noexcept {
     if (state.inbound) {
-        return state.inbound->stream_settings.network;
+        return state.inbound->receiver.stream_settings.network;
     }
     return state.config.TransportProtocol.empty()
         ? constants::protocol::kTcp
@@ -405,11 +410,20 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(PanelRuntime& panel) {
     const bool rebuild_settings = !old_state ||
         controller::NodeConfigChanged(old_state->config, candidate->config);
     if (rebuild_settings) {
-        candidate->inbound = std::make_shared<const controller::InboundBuild>(
-            controller::InboundBuilder(panel.config, candidate->config));
+        candidate->inbound = std::make_shared<const PreparedInbound>(PrepareInbound(
+            controller::MapPanelInbound(panel.config, candidate->config, candidate->users)));
         candidate->outbound =
             std::make_shared<const proxyman::outbound::PreparedOutboundConfig>(
                 BuildPanelAutoOutbound(tag, panel.config));
+    } else if (next_users) {
+        // Only the users changed: keep every prepared setting and rebuild the
+        // authentication payload through the same per-protocol builder.
+        auto inbound = std::make_shared<PreparedInbound>(*old_state->inbound);
+        inbound->users = PrepareInboundUsers(
+            inbound->build_request,
+            controller::MapPanelUsers(candidate->config, candidate->users));
+        candidate->inbound = std::move(inbound);
+        candidate->outbound = old_state->outbound;
     } else {
         candidate->inbound = old_state->inbound;
         candidate->outbound = old_state->outbound;
@@ -417,16 +431,6 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(PanelRuntime& panel) {
     controller::PreparedNodeChange change;
     change.replace_users = next_users.has_value() || transitioning;
     change.replace_rules = replace_rules;
-    const bool rebuild_users = rebuild_settings || next_users.has_value();
-    if (rebuild_users) {
-        auto users = BuildUsersForInbound(
-            panel.config, *candidate->inbound, candidate->config, candidate->users);
-        if (!users) throw std::runtime_error("failed to build candidate user snapshot");
-        candidate->prepared_users =
-            std::make_shared<const proxyman::inbound::UserSet>(std::move(*users));
-    } else {
-        candidate->prepared_users = old_state->prepared_users;
-    }
     change.next = std::move(candidate);
     // Candidate data and authentication payloads are complete before
     // entering the transaction's first runtime mutation.
@@ -501,40 +505,6 @@ void Controller::Impl::logPanelStatus(const PanelRuntime& panel) const {
         committed_state.rules.size(),
         pull_interval.count(),
         push_interval.count());
-}
-
-std::optional<proxyman::inbound::UserSet> Controller::Impl::BuildUsersForInbound(
-    const PanelConfig& panel_config,
-    const controller::InboundBuild& inbound,
-    const api::NodeInfo& node_config,
-    const std::vector<api::UserInfo>& api_users) const {
-    const PanelLogContext log_context{panel_config.Name, panel_config.APIHost,
-        panel_config.NodeIDs.Front(), panel_config.NodeType};
-
-    std::vector<proxyman::inbound::RuntimeUser> users;
-    users.reserve(api_users.size());
-    for (const auto& api_user : api_users) {
-        proxyman::inbound::RuntimeUser user;
-        user.user_id = api_user.UID;
-        user.email = api_user.Email;
-        user.credential = api_user.UUID;
-        user.flow = api_user.Flow.empty() ? node_config.Flow : api_user.Flow;
-        user.speed_limit = api_user.SpeedLimit;
-        user.device_limit = api_user.DeviceLimit;
-        users.push_back(std::move(user));
-    }
-
-    auto result = proxyman::inbound::BuildUsers(
-        inbound.protocol, inbound.handler_request, users);
-    if (!result) {
-        LOG_PANEL_WARN(log_context, "Cannot build inbound users: unsupported protocol={}", inbound.protocol);
-    } else if (std::visit([](const auto& prepared) { return prepared.size(); }, *result) != api_users.size()) {
-        // Invalid credentials must not turn a non-empty panel response into a
-        // partial or empty authentication snapshot.
-        LOG_PANEL_WARN(log_context, "Cannot build inbound users: incomplete snapshot protocol={}", inbound.protocol);
-        return std::nullopt;
-    }
-    return result;
 }
 
 }  // namespace acpp

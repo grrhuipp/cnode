@@ -4,11 +4,13 @@
 #include "acppnode/app/request_load_state.hpp"
 #include "acppnode/app/session_tracking.hpp"
 #include "acppnode/common/rule.hpp"
-#include "acppnode/features/outbound/outbound.hpp"
+#include "acppnode/app/proxyman/outbound/handler.hpp"
+#include "acppnode/app/stats.hpp"
 #include "acppnode/features/routing/router.hpp"
 #include "acppnode/infra/runtime_config_types.hpp"
 #include "acppnode/proxy/outbound.hpp"
 #include "acppnode/transport/internet/tcp_stream.hpp"
+#include "../src/common/awaitable_task_group.hpp"
 
 #include <asio/as_tuple.hpp>
 #include <asio/bind_cancellation_slot.hpp>
@@ -97,17 +99,22 @@ private:
     State& state_;
 };
 
-class Handler final : public Outbound {
-public:
+// Protocol instance behind one outbound tag; the probe outlives every handler.
+struct OutboundProbe {
     State state;
     State target_state;
     bool relay = false;
-    std::string_view Tag() const noexcept override { return "direct"; }
+    int instantiated = 0;
+};
+
+class TestOutbound final : public Outbound {
+public:
+    explicit TestOutbound(OutboundProbe& probe) : probe_(probe) { ++probe_.instantiated; }
     net::awaitable<OutboundProcessResult> Process(
-        net::io_context& io, const tcp::endpoint*, session::Context& ctx,
-        const TimeoutsConfig&, transport::Link inbound, StatsShard& stats,
-        const RelayConfig& config, buf::MultiBufferBatch first,
-        std::chrono::seconds, std::chrono::seconds) override {
+        session::Context& ctx, transport::Link inbound, OutboundDialer& dialer,
+        const TimeoutsConfig&, StatsShard& stats, const RelayConfig& config,
+        buf::MultiBufferBatch first, std::chrono::seconds, std::chrono::seconds) override {
+        auto& state = probe_.state;
         ++state.entered;
         if (state.block) co_await Wait(state);
         ++state.committed;
@@ -116,24 +123,48 @@ public:
             result.error = ErrorCode::CANCELLED;
             co_return result;
         }
-        if (!relay) co_return RelayResult{};
-        Stream target(target_state);
-        co_return co_await DoRelayLink(io, *inbound.reader, *inbound.writer,
+        if (!probe_.relay) co_return RelayResult{};
+        Stream target(probe_.target_state);
+        co_return co_await DoRelayLink(dialer.IoContext(), *inbound.reader, *inbound.writer,
             inbound.control, target, ctx, stats, config, std::move(first));
+    }
+private:
+    OutboundProbe& probe_;
+};
+
+proxyman::outbound::PreparedOutboundConfig ProbeConfig(std::string tag, OutboundProbe& probe) {
+    return proxyman::outbound::PreparedOutboundConfig{
+        .tag = std::move(tag),
+        .protocol = "test-probe",
+        .sender = {},
+        .create = proxyman::outbound::MakePreparedOutboundCreator<
+            OutboundProbe*,
+            +[](std::string_view, std::shared_ptr<OutboundProbe* const> probe,
+                net::io_context&, AwaitableTaskGroup&) -> std::unique_ptr<Outbound> {
+                return std::make_unique<TestOutbound>(**probe);
+            }>(&probe),
+    };
+}
+
+// "direct" and "second" published through the real configuration/lookup pair.
+struct OutboundProbes {
+    OutboundProbe direct;
+    OutboundProbe second;
+    [[nodiscard]] int Instantiated() const noexcept {
+        return direct.instantiated + second.instantiated;
     }
 };
 
-class FakeHandlerLookup final : public features::outbound::HandlerLookup {
-public:
-    std::shared_ptr<Handler> handler = std::make_shared<Handler>();
-    std::shared_ptr<Handler> second;
-    int lookups = 0;
-    HandlerPtr GetHandler(std::string_view tag) noexcept override {
-        ++lookups;
-        if (tag == "direct") return handler;
-        if (tag == "second") return second;
-        return {};
-    }
+struct Outbounds {
+    Outbounds(OutboundProbes& probes, net::io_context& io, app::dns::DNS& dns)
+        : configuration({ProbeConfig("direct", probes.direct),
+                         ProbeConfig("second", probes.second)}),
+          tasks(io.get_executor()),
+          lookup(configuration, io, dns, std::chrono::seconds(1), tasks.Tasks(),
+                 proxyman::outbound::HandlerLookup::StatefulTags::InstantiateLocally) {}
+    proxyman::outbound::OutboundConfiguration configuration;
+    ResidentTaskGroup tasks;
+    proxyman::outbound::HandlerLookup lookup;
 };
 
 class Router final : public routing::Router {
@@ -168,13 +199,12 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
         (which == Case::RelayFailure || which == Case::RelayCancelled);
     auto stream = std::make_unique<Stream>(source_state);
     auto* reader = stream.get();
-    FakeHandlerLookup outbound_handlers;
+    OutboundProbes outbounds;
     Router router;
     if (which == Case::RuleMatch) {
-        outbound_handlers.second = std::make_shared<Handler>();
         router.decision = {.outbound_tag = "second", .matched = true};
     }
-    auto& outbound = which == Case::RuleMatch ? *outbound_handlers.second : *outbound_handlers.handler;
+    auto& outbound = which == Case::RuleMatch ? outbounds.second : outbounds.direct;
     outbound.state.load = &load;
     outbound.target_state.phase_stream = &phase_stream;
     outbound.state.block = which == Case::Handshake || which == Case::Parent || which == Case::Pending;
@@ -220,8 +250,9 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
                 ? "198\\.51\\.100\\.1" : "192\\.0\\.2\\.1"),
         }});
     }
+    Outbounds outbound_handlers(outbounds, io, dns);
     app::dispatcher::DefaultDispatcher dispatcher(
-        router, outbound_handlers, request_policy, session_tracking, dns, load);
+        router, outbound_handlers.lookup, request_policy, session_tracking, dns, load);
     if (which == Case::PreStopped) reader->Cancellation().Stop(reason);
     bool done = false;
     bool triggered = false;
@@ -267,7 +298,7 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
         expected = ErrorCode::BLOCKED;
     passed &= result.error == expected;
     if (which == Case::PreStopped || which == Case::Sniff || which == Case::RoutingDns ||
-        which == Case::SniffMemory || which == Case::SniffLinkError) passed &= outbound_handlers.lookups == 0 && outbound.state.entered == 0;
+        which == Case::SniffMemory || which == Case::SniffLinkError) passed &= outbounds.Instantiated() == 0 && outbound.state.entered == 0;
     if (source_state.block || outbound.state.block) {
         const auto& waiting = source_state.block ? source_state : outbound.state;
         passed &= triggered && waiting.cancelled == 1 && waiting.cleanup_has_owner && outbound.state.committed == 0;
@@ -281,10 +312,10 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
     }
     if (which == Case::RuleMatch) {
         passed &= ctx.outbound.tag == "second" &&
-            outbound_handlers.handler->state.entered == 0 && outbound.state.committed == 1;
+            outbounds.direct.state.entered == 0 && outbound.state.committed == 1;
     }
     if (which == Case::PolicyBlockedForce || which == Case::PolicyBlockedRoute) {
-        passed &= outbound_handlers.lookups == 0 && outbound.state.entered == 0 &&
+        passed &= outbounds.Instantiated() == 0 && outbound.state.entered == 0 &&
             outbound.state.committed == 0;
     }
     if (which == Case::PolicyAllowed) {
@@ -312,7 +343,7 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
     }
     std::printf("case=%d controlled=%d reason=%s result=%s timely=%d triggered=%d lookups=%d committed=%d joined=%d: %s\n",
         int(which), controlled, ErrorCodeToString(reason).data(), ErrorCodeToString(result.error).data(),
-        completed_in_budget, triggered, outbound_handlers.lookups, outbound.state.committed,
+        completed_in_budget, triggered, outbounds.Instantiated(), outbound.state.committed,
         source_state.active + outbound.state.active == 0, passed ? "PASS" : "FAIL");
     return passed;
 }
@@ -324,11 +355,10 @@ bool SiblingIsolation(bool controlled) {
     auto first = std::make_unique<Stream>(a);
     auto second = std::make_unique<Stream>(b);
     auto* source = first.get();
-    FakeHandlerLookup outbound_handlers;
-    outbound_handlers.second = std::make_shared<Handler>();
-    for (const auto& handler : {outbound_handlers.handler, outbound_handlers.second}) {
-        handler->state.block = true;
-        handler->state.load = &load;
+    OutboundProbes outbounds;
+    for (auto* probe : {&outbounds.direct, &outbounds.second}) {
+        probe->state.block = true;
+        probe->state.load = &load;
     }
     Router router;
     rule::DetectRulePolicy request_policy;
@@ -337,8 +367,9 @@ bool SiblingIsolation(bool controlled) {
     app::dns::Config dns_config{.servers = {dns_peer.local_endpoint()}};
     app::dns::DNSWorker dns_worker(io, dns_config, 8);
     app::dns::DNS dns(dns_worker);
+    Outbounds outbound_handlers(outbounds, io, dns);
     app::dispatcher::DefaultDispatcher dispatcher(
-        router, outbound_handlers, request_policy, session_tracking, dns, load);
+        router, outbound_handlers.lookup, request_policy, session_tracking, dns, load);
     routing::DispatchPolicy policy_a{SniffConfig{.enabled = false, .domains_excluded = {}}, routing::ForceOutbound{"direct"}};
     routing::DispatchPolicy policy_b{SniffConfig{.enabled = false, .domains_excluded = {}}, routing::ForceOutbound{"second"}};
     session::Context ctx_a, ctx_b;
@@ -354,7 +385,7 @@ bool SiblingIsolation(bool controlled) {
             failed |= bool(error);
             first_done = true;
             result_a = result;
-            first_joined = outbound_handlers.handler->state.active == 0 && load.ActiveConnections() == 1;
+            first_joined = outbounds.direct.state.active == 0 && load.ActiveConnections() == 1;
         });
     net::co_spawn(io, dispatcher.Dispatch(io, policy_b, controlled ? std::move(second) : nullptr,
         link_b, InitialPayload{}, ctx_b, stats, timeouts), [&](std::exception_ptr error, RelayResult result) {
@@ -366,15 +397,15 @@ bool SiblingIsolation(bool controlled) {
     net::steady_timer stop(io, 30ms);
     stop.async_wait([&](IoErrorCode error) {
         if (error) return;
-        both_waiting = outbound_handlers.handler->state.active == 1 && outbound_handlers.second->state.active == 1;
+        both_waiting = outbounds.direct.state.active == 1 && outbounds.second.state.active == 1;
         source->Cancellation().Stop(ErrorCode::RESOURCE_EXHAUSTED);
     });
     io.run_for(1s);
     const bool passed = !failed && first_done && second_done && both_waiting && first_joined &&
         result_a.error == ErrorCode::RESOURCE_EXHAUSTED && result_b.error == ErrorCode::OK &&
-        outbound_handlers.handler->state.cancelled == 1 && outbound_handlers.handler->state.committed == 0 &&
-        outbound_handlers.second->state.cancelled == 0 && outbound_handlers.second->state.committed == 1 &&
-        outbound_handlers.second->state.active == 0 && load.ActiveConnections() == 0;
+        outbounds.direct.state.cancelled == 1 && outbounds.direct.state.committed == 0 &&
+        outbounds.second.state.cancelled == 0 && outbounds.second.state.committed == 1 &&
+        outbounds.second.state.active == 0 && load.ActiveConnections() == 0;
     std::printf("sibling isolation controlled=%d first=%s second=%s joined=%d: %s\n", controlled,
         ErrorCodeToString(result_a.error).data(), ErrorCodeToString(result_b.error).data(), first_joined,
         passed ? "PASS" : "FAIL");

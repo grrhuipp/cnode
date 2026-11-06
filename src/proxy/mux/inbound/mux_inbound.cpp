@@ -1,4 +1,5 @@
 #include "mux_inbound.hpp"
+#include "../../inbound_admission.hpp"
 #include "../../../common/awaitable_task_group.hpp"
 #include "acppnode/features/routing/dispatcher.hpp"
 #include "acppnode/common/mux/mux_codec.hpp"
@@ -62,6 +63,7 @@ struct QueuedInput {
 struct MuxReply {
     uint16_t session_id = 0;
     bool is_end = false;
+    bool is_error = false;   // END carries OptionError (child refused)
     bool dispatch_done = false;
     bool is_udp = false;     // true → EncodeKeepUDP（带源地址）
     TargetAddress udp_src;   // UDP 源地址（is_udp == true 时有效）
@@ -408,6 +410,12 @@ public:
         WakeInputReader();
     }
 
+    // Refuses the child before dispatch; its END carries OptionError.
+    void Reject() noexcept {
+        end_error_ = true;
+        Cancel();
+    }
+
     void Cancel(ErrorCode error = ErrorCode::CANCELLED) noexcept {
         if (cancelled_) {
             return;
@@ -466,6 +474,7 @@ protected:
         MuxReply reply;
         reply.session_id = session_id_;
         reply.is_end = send_end;
+        reply.is_error = send_end && end_error_;
         reply.dispatch_done = notify_dispatch_done;
         reply_queue_.PushControl(std::move(reply));
         end_sent_ = end_sent_ || send_end;
@@ -493,6 +502,7 @@ private:
     size_t queued_bytes_ = 0;
     ErrorCode terminal_error_ = ErrorCode::CANCELLED;
     bool end_sent_ = false;
+    bool end_error_ = false;
     bool dispatch_done_ = false;
     bool dispatch_done_notified_ = false;
 };
@@ -834,6 +844,7 @@ net::awaitable<void> RunSubDispatch(
     net::io_context& io_context,
     routing::Dispatcher& dispatcher,
     const routing::DispatchPolicy& policy,
+    ConnectionLimiter* limiter,
     MuxSubSession* sub,
     StatsShard& stats,
     const TimeoutsConfig& timeouts,
@@ -846,15 +857,22 @@ net::awaitable<void> RunSubDispatch(
     };
 
     try {
-        (void)co_await dispatcher.Dispatch(
-            io_context,
-            policy,
-            nullptr,
-            link,
-            InitialPayload{},
-            sub->ctx,
-            stats,
-            timeouts);
+        // Held for the child's lifetime; a refusal ends only this child.
+        const auto admission =
+            co_await proxy::AdmitInboundSubstream(limiter, stats, sub->ctx);
+        if (!admission) {
+            sub->Reject();
+        } else {
+            (void)co_await dispatcher.Dispatch(
+                io_context,
+                policy,
+                nullptr,
+                link,
+                InitialPayload{},
+                sub->ctx,
+                stats,
+                timeouts);
+        }
     } catch (...) {
         LOG_CONN_DEBUG(sub->ctx, "sub-session dispatch failed with an exception");
         sub->Cancel();
@@ -879,6 +897,7 @@ net::awaitable<RelayResult> ProcessInboundImpl(
     AsyncStream& client_control,
     routing::Dispatcher& dispatcher,
     const routing::DispatchPolicy& policy,
+    ConnectionLimiter* limiter,
     session::Context& parent_ctx,
     StatsShard& stats,
     const TimeoutsConfig& timeouts,
@@ -1054,7 +1073,8 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                 if (reply.is_end || reply.dispatch_done) {
                     size_t header_len = 0;
                     if (reply.is_end) {
-                        header_len = mux::EncodeEndTo(write_frame, reply.session_id);
+                        header_len = mux::EncodeEndTo(
+                            write_frame, reply.session_id, reply.is_error);
                     }
                     if (reply.dispatch_done) {
                         sub_sessions.erase(reply.session_id);
@@ -1284,6 +1304,7 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                                     io_context,
                                     dispatcher,
                                     policy,
+                                    limiter,
                                     sub_ptr,
                                     stats,
                                     timeouts,
@@ -1325,6 +1346,7 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                                     io_context,
                                     dispatcher,
                                     policy,
+                                    limiter,
                                     sub_ptr,
                                     stats,
                                     timeouts,
@@ -1506,6 +1528,7 @@ net::awaitable<RelayResult> ProcessInbound(
     AsyncStream& client_control,
     routing::Dispatcher& dispatcher,
     const routing::DispatchPolicy& policy,
+    ConnectionLimiter* limiter,
     session::Context& parent_ctx,
     StatsShard& stats,
     const TimeoutsConfig& timeouts,
@@ -1519,6 +1542,7 @@ net::awaitable<RelayResult> ProcessInbound(
             client_control,
             dispatcher,
             policy,
+            limiter,
             parent_ctx,
             stats,
             timeouts,

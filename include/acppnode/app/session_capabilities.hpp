@@ -3,15 +3,13 @@
 #include "acppnode/app/session_group_executor.hpp"
 #include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
-#include "acppnode/app/proxyman/outbound/prepared_config.hpp"
+#include "acppnode/app/proxyman/outbound/handler.hpp"
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/online_device.hpp"
 #include "acppnode/infra/runtime_config_types.hpp"
 #include "acppnode/app/session_tracking.hpp"
 #include "acppnode/app/stats.hpp"
 
-#include <atomic>
-#include <mutex>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -21,53 +19,21 @@ class AsyncStream;
 class ConnectionLimiter;
 namespace session { struct Context; }
 struct WorkerRuntimeConfig;
-struct WorkerRuntimeStatsSnapshot;
 namespace rule { class DetectRulePolicy; }
 namespace app {
 class RequestLoadState;
 namespace router { class Router; }
 namespace dns { class DNSWorker; }
 
-class OutboundPoolHost;
-class OutboundConfiguration final {
-public:
-    struct Configuration final : proxyman::outbound::PreparedOutboundConfig {
-        explicit Configuration(const proxyman::outbound::PreparedOutboundConfig& config)
-            : PreparedOutboundConfig(config) {}
-        std::shared_ptr<OutboundPoolHost> host;
-    };
-    using Entry = std::shared_ptr<const Configuration>;
-    using Snapshot = std::vector<Entry>;
-    explicit OutboundConfiguration(
-        const std::vector<proxyman::outbound::PreparedOutboundConfig>& configurations);
-    ~OutboundConfiguration();
-    // Cold Worker setup/publication only; no Worker state is captured by hosts.
-    void BindHosts(net::io_context& reactor, uint32_t worker_id,
-                   std::shared_ptr<GroupCoordinator> coordinator,
-                   dns::DNSWorker& dns_worker, std::chrono::seconds dial_timeout);
-    // Called only after the Worker's requests have drained.
-    net::awaitable<void> AsyncJoinHosts();
-    net::awaitable<void> CollectRuntimeStats(WorkerRuntimeStatsSnapshot& result,
-                                             bool include_resources);
-    [[nodiscard]] std::shared_ptr<const Snapshot> Capture() const noexcept;
-    void Replace(const proxyman::outbound::PreparedOutboundConfig& configuration);
-    void Remove(std::string_view tag);
-private:
-    struct Hosts;
-    std::unique_ptr<Hosts> hosts_;
-    Entry Prepare(const proxyman::outbound::PreparedOutboundConfig& configuration);
-    std::mutex publication_mutex_;
-    std::atomic<std::shared_ptr<const Snapshot>> snapshot_;
-};
-
-// Cold routing/outbound configuration. Stateful tags own independent stable
-// hosts; stateless handlers remain local to their requesting physical domain.
+// Cold routing/outbound configuration. The outbound publication is shared with
+// Worker-level dispatch; stateful tags own independent stable hosts while
+// stateless handlers remain local to their requesting physical domain.
 struct SessionConfiguration final {
     SessionConfiguration(const WorkerRuntimeConfig& config,
                          std::shared_ptr<const router::Router> router,
                          std::shared_ptr<rule::DetectRulePolicy> policy);
     const TimeoutsConfig timeouts;
-    const std::shared_ptr<OutboundConfiguration> outbounds;
+    const std::shared_ptr<proxyman::outbound::OutboundConfiguration> outbounds;
     const std::shared_ptr<const router::Router> router;
     const std::shared_ptr<rule::DetectRulePolicy> policy;
 };

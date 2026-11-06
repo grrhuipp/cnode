@@ -8,6 +8,7 @@
 #include "acppnode/app/dns/dns_worker.hpp"
 #include "acppnode/infra/config.hpp"
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
+#include "acppnode/app/runtime_publication.hpp"
 #include "proxyman/outbound/registration.hpp"
 #include "acppnode/app/worker.hpp"
 #include "acppnode/app/session_group_executor.hpp"
@@ -18,10 +19,14 @@
 #include "acppnode/geo/geodata.hpp"
 #include "acppnode/transport/internet/tls_stream.hpp"
 
+#include <asio/co_spawn.hpp>
+#include <asio/use_future.hpp>
+
 #include <algorithm>
 #include <filesystem>
 #include <format>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 
 namespace acpp {
@@ -157,7 +162,7 @@ BootstrapEnvironment CreateBootstrapEnvironment(
     const bool enable_test_mode =
         test_mode || (config.panels.empty() && config.static_inbounds.empty());
     auto outbounds = PrepareStartupOutbounds(config.outbounds);
-    const auto inbounds = PrepareStartupInbounds(config.static_inbounds, enable_test_mode);
+    auto inbounds = PrepareStartupInbounds(config.static_inbounds, enable_test_mode);
     constexpr int kMainIoConcurrencyHint =
         static_cast<int>(ASIO_CONCURRENCY_HINT_ID | ASIO_CONCURRENCY_HINT_LOCKING_SCHEDULER);
     env.main_ctx = std::make_unique<net::io_context>(kMainIoConcurrencyHint);
@@ -169,15 +174,26 @@ BootstrapEnvironment CreateBootstrapEnvironment(
     const WorkerRuntimeConfig worker_runtime_config =
         MakeWorkerRuntimeConfig(config, std::move(outbounds));
     // Every source and protocol payload is prepared before one RCU publication.
-    // These borrowed references stay in this synchronous cold-path call.
+    // Workers do not exist yet: each captures the committed snapshot when it is
+    // constructed below. These borrowed references stay in this call.
     std::vector<proxyman::inbound::UserStore::UserUpdate> user_updates;
     user_updates.reserve(inbounds.size());
     for (const auto& inbound : inbounds) {
-        user_updates.push_back({inbound.runtime.tag, inbound.users});
+        user_updates.push_back({inbound.binding.tag, *inbound.users});
     }
-    auto prepared_users = proxyman::inbound::UserStore::PrepareUsers(user_updates);
     const auto previous_users = proxyman::inbound::UserStore::CaptureSnapshot();
-    proxyman::inbound::UserStore::CommitSnapshot(std::move(prepared_users));
+    {
+        constexpr bool kNotStopping = false;
+        std::optional<UserPublicationRollback> rollback;
+        net::io_context publication_ctx;
+        auto published = net::co_spawn(publication_ctx,
+            PublishUsers(publication_ctx.get_executor(), {},
+                proxyman::inbound::UserStore::PrepareUsers(user_updates),
+                rollback, kNotStopping),
+            net::use_future);
+        publication_ctx.run();
+        published.get();
+    }
     try {
         env.worker_pool = CreateWorkerPool(
             worker_runtime_config, *env.stats, env.geo_database.get(), *env.dns_worker);
@@ -188,9 +204,7 @@ BootstrapEnvironment CreateBootstrapEnvironment(
         if (enable_test_mode) {
             LOG_CONSOLE("Test mode enabled: port={}", constants::test::kTestPort);
         }
-        env.inbound_startup.entries.reserve(inbounds.size());
-        for (const auto& inbound : inbounds)
-            env.inbound_startup.entries.push_back(inbound.runtime);
+        env.inbound_startup.entries = std::move(inbounds);
 
         env.enable_controller = !config.panels.empty();
         return env;

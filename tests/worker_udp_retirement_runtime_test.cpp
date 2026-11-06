@@ -224,12 +224,9 @@ public:
     DelayedOutbound(std::string tag, FixtureState& state)
         : tag_(std::move(tag)), state_(state) {}
 
-    std::string_view Tag() const noexcept override { return tag_; }
-
     acpp::net::awaitable<acpp::OutboundProcessResult> Process(
-        acpp::net::io_context&, const acpp::tcp::endpoint*,
-        acpp::session::Context& ctx, const acpp::TimeoutsConfig&,
-        acpp::transport::Link inbound, acpp::StatsShard&,
+        acpp::session::Context& ctx, acpp::transport::Link inbound,
+        acpp::OutboundDialer&, const acpp::TimeoutsConfig&, acpp::StatsShard&,
         const acpp::RelayConfig&, acpp::buf::MultiBufferBatch first_payload,
         std::chrono::seconds, std::chrono::seconds) override {
         if (!inbound.reader || !state_.cleanup_gate)
@@ -243,7 +240,7 @@ public:
             .first_payload_ok = payload_ok,
             .inbound_tag = std::string(ctx.inbound.tag),
             .outbound_tag = std::string(ctx.outbound.tag),
-            .outbound_handler_tag = std::string(Tag()),
+            .outbound_handler_tag = tag_,
             .user_id = ctx.inbound.user_id,
             .user_email = std::string(ctx.inbound.user_email),
         };
@@ -292,13 +289,12 @@ acpp::proxyman::outbound::PreparedOutboundConfig MakeDelayedOutbound(
     return {
         .tag = std::move(tag),
         .protocol = "test-delayed-completion",
+        .sender = {},
         .create = acpp::proxyman::outbound::MakePreparedOutboundCreator<
             DelayedState,
             +[](std::string_view requested_tag,
                 std::shared_ptr<const DelayedState> s,
                 acpp::net::io_context&,
-                acpp::app::dns::DNS&,
-                std::chrono::seconds,
                 acpp::AwaitableTaskGroup&) -> std::unique_ptr<acpp::Outbound> {
                 if (requested_tag != s->prepared_tag)
                     throw std::logic_error("prepared delayed outbound tag mismatch");

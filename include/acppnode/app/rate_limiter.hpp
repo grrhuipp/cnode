@@ -277,6 +277,13 @@ private:
     std::array<Slot, kSlotCount> slots_{};
 };
 
+// Lease shared by one physical connection and its logical children; carried in
+// session::Inbound so protocol substreams reserve against the same family.
+struct ConnectionFamily {
+    size_t children = 0; // control-executor only
+    bool physical = true;
+};
+
 // The control actor owns the only table. Reservations preallocate their return
 // node before admission; destruction publishes metadata without allocation,
 // waiting, or competing for bounded business-call capacity.
@@ -286,10 +293,7 @@ public:
     static const char* RejectReasonToString(RejectReason reason) noexcept {
         return ConnectionLimiterCore::RejectReasonToString(reason);
     }
-    struct Family {
-        size_t children = 0; // control-executor only
-        bool physical = true;
-    };
+    using Family = ConnectionFamily;
 private:
     struct Return final : GroupCoordinator::ReservedOperation {
         std::shared_ptr<ConnectionLimiter> owner;

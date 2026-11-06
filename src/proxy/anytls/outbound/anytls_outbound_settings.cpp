@@ -1,6 +1,4 @@
 #include "anytls_outbound_settings.hpp"
-#include "acppnode/common/domain_name.hpp"
-#include "acppnode/common/ip_address.hpp"
 #include "../credentials.hpp"
 
 #include "acppnode/infra/json_field.hpp"
@@ -48,15 +46,15 @@ tl::expected<Settings, std::string> ParseSettings(const json::object& source) {
 
     // A present field of the wrong type is a configuration error, never an
     // implicit default.
-    auto address = ParseJsonString(source, "address");
-    if (!address) return tl::unexpected(std::move(address.error()));
-    result.address = std::move(*address).value_or(std::string{});
+    auto source_address = ParseJsonString(source, "address");
+    if (!source_address) return tl::unexpected(std::move(source_address.error()));
+    auto address = std::move(*source_address).value_or(std::string{});
 
-    const auto port = ReadJsonPort(source, "port");
-    if (port.Invalid()) {
+    const auto source_port = ReadJsonPort(source, "port");
+    if (source_port.Invalid()) {
         return tl::unexpected("AnyTLS server port must be between 1 and 65535");
     }
-    if (port.Valid()) result.port = port.value;
+    const uint16_t port = source_port.Valid() ? source_port.value : 0;
 
     auto source_password = ParseJsonString(source, "password");
     if (!source_password) return tl::unexpected(std::move(source_password.error()));
@@ -86,14 +84,10 @@ tl::expected<Settings, std::string> ParseSettings(const json::object& source) {
     if (!min_idle) return tl::unexpected(std::move(min_idle.error()));
     if (*min_idle) result.min_idle_sessions = static_cast<size_t>(**min_idle);
 
-    if (result.address.empty()) return tl::unexpected("AnyTLS address is required");
-    result.literal_address = iputil::ParseLiteral(result.address);
-    if (!result.literal_address && !domain::IsValidDnsHostname(
-            result.address, domain::TrailingDotPolicy::Allow)) {
-        return tl::unexpected("AnyTLS address must be an IP literal or DNS hostname");
-    }
+    auto server = MakeOutboundServer(std::move(address), port);
+    if (!server) return tl::unexpected(std::string(server.error()));
+    result.server = std::move(*server);
     if (password.empty()) return tl::unexpected("AnyTLS password is required");
-    if (result.port == 0) return tl::unexpected("AnyTLS port is required");
     result.password_hash = acpp::anytls::PasswordHash(password);
     return result;
 }

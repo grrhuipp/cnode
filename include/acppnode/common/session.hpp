@@ -16,6 +16,8 @@
 
 namespace acpp {
 
+struct ConnectionFamily;
+
 namespace session {
 
 struct Context;
@@ -58,6 +60,10 @@ struct Inbound {
     memory::ThreadLocalVector<memory::ThreadLocalString> tags;
     int64_t user_id = 0;
     memory::ThreadLocalString user_email;
+    // Connection-limit family lease of the physical connection this request
+    // arrived on. Set by the inbound handler; substreams inherit it and take
+    // their logical admission against it.
+    std::shared_ptr<ConnectionFamily> connection_family;
 };
 
 // xray-core common/session.Outbound 对应的出站目标/路由元数据。

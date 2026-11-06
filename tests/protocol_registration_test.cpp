@@ -2,6 +2,7 @@
 #include "acppnode/app/stats.hpp"
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
 #include "acppnode/app/proxyman/outbound/factory.hpp"
+#include "acppnode/infra/config_types.hpp"
 #include "acppnode/proxy/inbound.hpp"
 #include "acppnode/transport/async_stream.hpp"
 #include "registration.hpp"
@@ -9,10 +10,6 @@
 
 #include <iostream>
 #include <stdexcept>
-
-namespace acpp::app::dns {
-class DNS {};
-}  // namespace acpp::app::dns
 
 namespace {
 
@@ -59,16 +56,13 @@ public:
 
 class DummyOutbound final : public acpp::Outbound {
 public:
-    explicit DummyOutbound(std::string tag) : tag_(std::move(tag)) {}
-
-    std::string_view Tag() const noexcept override { return tag_; }
+    explicit DummyOutbound(std::string created_tag) : tag(std::move(created_tag)) {}
 
     acpp::net::awaitable<acpp::OutboundProcessResult> Process(
-        acpp::net::io_context&,
-        const acpp::tcp::endpoint*,
         acpp::session::Context&,
-        const acpp::TimeoutsConfig&,
         acpp::transport::Link,
+        acpp::OutboundDialer&,
+        const acpp::TimeoutsConfig&,
         acpp::StatsShard&,
         const acpp::RelayConfig&,
         acpp::buf::MultiBufferBatch,
@@ -77,8 +71,7 @@ public:
         co_return acpp::RelayResult{};
     }
 
-private:
-    std::string tag_;
+    const std::string tag;
 };
 
 std::unique_ptr<acpp::proxyman::inbound::ProtocolRuntime>
@@ -112,7 +105,7 @@ std::unique_ptr<acpp::Inbound> CreateDatagramHandler(
 
 std::optional<acpp::proxyman::inbound::UserSet> BuildVmessUsers(
     const acpp::proxyman::inbound::BuildRequest&,
-    std::span<const acpp::proxyman::inbound::RuntimeUser>) {
+    std::span<const acpp::InboundUserSpec>) {
     return acpp::proxyman::inbound::UserSet{
         acpp::proxyman::inbound::PreparedVmessUsers{
             acpp::proxyman::inbound::PreparedVmessUser{.uuid = "alias-user", .profile = {}}}};
@@ -120,54 +113,43 @@ std::optional<acpp::proxyman::inbound::UserSet> BuildVmessUsers(
 
 std::optional<acpp::proxyman::inbound::UserSet> BuildTrojanUsers(
     const acpp::proxyman::inbound::BuildRequest&,
-    std::span<const acpp::proxyman::inbound::RuntimeUser>) {
+    std::span<const acpp::InboundUserSpec>) {
     return acpp::proxyman::inbound::UserSet{
         acpp::proxyman::inbound::PreparedTrojanUsers{}};
 }
 
-std::optional<acpp::proxyman::outbound::PreparedOutboundCreator>
+std::optional<acpp::proxyman::outbound::PreparedOutboundProxy>
 CreateOutboundConfig(
     const acpp::infra::OutboundSourceConfig&) {
-    return acpp::proxyman::outbound::PreparedOutboundCreator{
-        [](std::string_view tag,
-           acpp::net::io_context&,
-           acpp::app::dns::DNS&,
-           std::chrono::seconds,
-           acpp::AwaitableTaskGroup&) -> std::unique_ptr<acpp::Outbound> {
-            return std::make_unique<DummyOutbound>(std::string(tag));
-        }};
+    return acpp::proxyman::outbound::PreparedOutboundProxy{
+        .create = acpp::proxyman::outbound::PreparedOutboundCreator{
+            [](std::string_view tag,
+               acpp::net::io_context&,
+               acpp::AwaitableTaskGroup&) -> std::unique_ptr<acpp::Outbound> {
+                return std::make_unique<DummyOutbound>(std::string(tag));
+            }},
+        .sender = {.stream_settings = {}, .send_through = acpp::OutboundBind::Auto()},
+    };
 }
 
-std::optional<acpp::proxyman::outbound::PreparedOutboundCreator>
-CreateMismatchedOutboundConfig(
-    const acpp::infra::OutboundSourceConfig&) {
-    return acpp::proxyman::outbound::PreparedOutboundCreator{
-        [](std::string_view,
-           acpp::net::io_context&,
-           acpp::app::dns::DNS&,
-           std::chrono::seconds,
-           acpp::AwaitableTaskGroup&) -> std::unique_ptr<acpp::Outbound> {
-            return std::make_unique<DummyOutbound>("wrong-tag");
-        }};
-}
-
-std::optional<acpp::proxyman::outbound::PreparedOutboundCreator>
+std::optional<acpp::proxyman::outbound::PreparedOutboundProxy>
 CreateNullOutboundConfig(
     const acpp::infra::OutboundSourceConfig&) {
-    return acpp::proxyman::outbound::PreparedOutboundCreator{
-        [](std::string_view,
-           acpp::net::io_context&,
-           acpp::app::dns::DNS&,
-           std::chrono::seconds,
-           acpp::AwaitableTaskGroup&) -> std::unique_ptr<acpp::Outbound> {
-            return nullptr;
-        }};
+    return acpp::proxyman::outbound::PreparedOutboundProxy{
+        .create = acpp::proxyman::outbound::PreparedOutboundCreator{
+            [](std::string_view,
+               acpp::net::io_context&,
+               acpp::AwaitableTaskGroup&) -> std::unique_ptr<acpp::Outbound> {
+                return nullptr;
+            }},
+        .sender = {},
+    };
 }
 
-std::optional<acpp::proxyman::outbound::PreparedOutboundCreator>
+std::optional<acpp::proxyman::outbound::PreparedOutboundProxy>
 CreateEmptyOutboundConfig(
     const acpp::infra::OutboundSourceConfig&) {
-    return acpp::proxyman::outbound::PreparedOutboundCreator{};
+    return acpp::proxyman::outbound::PreparedOutboundProxy{};
 }
 
 bool TestInboundRegistration() {
@@ -285,7 +267,9 @@ bool TestInboundRegistration() {
         acpp::proxyman::inbound::UserProtocol::Vmess) {
         return false;
     }
-    auto users = acpp::proxyman::inbound::BuildUsers("vmess-alias", request, {});
+    const acpp::proxyman::inbound::BuildRequest alias_request{
+        .tag = "alias-tag", .protocol = "vmess-alias", .settings = {}};
+    auto users = acpp::proxyman::inbound::BuildUsers(alias_request, {});
     if (!users || acpp::proxyman::inbound::UserProtocolOf(*users) !=
                       acpp::proxyman::inbound::UserProtocol::Vmess) {
         return false;
@@ -309,8 +293,9 @@ bool TestInboundRegistration() {
     mismatched_users.build_users = &BuildTrojanUsers;
     acpp::proxyman::inbound::RegisterProxy(
         "mismatched-users", mismatched_users);
-    return !acpp::proxyman::inbound::BuildUsers(
-        "mismatched-users", request, {});
+    const acpp::proxyman::inbound::BuildRequest mismatched_request{
+        .tag = "mismatched-tag", .protocol = "mismatched-users", .settings = {}};
+    return !acpp::proxyman::inbound::BuildUsers(mismatched_request, {});
 }
 
 bool TestOutboundRegistration() {
@@ -346,35 +331,33 @@ bool TestOutboundRegistration() {
         prepared->protocol != source.protocol || !prepared->create) {
         return false;
     }
+    // Without a handler-level sendThrough the protocol default stands.
+    if (prepared->sender.send_through.GetMode() != acpp::OutboundBind::Mode::Auto) {
+        return false;
+    }
     acpp::net::io_context io_context;
-    acpp::app::dns::DNS dns;
     acpp::ResidentTaskGroup tasks(io_context.get_executor());
-    auto handler = acpp::proxyman::outbound::NewHandler(
-        *prepared, io_context, dns, std::chrono::seconds(1), tasks.Tasks());
-    if (!handler || handler->Tag() != source.tag) {
+    auto proxy = acpp::proxyman::outbound::NewProxy(
+        *prepared, io_context, tasks.Tasks());
+    if (!proxy || static_cast<DummyOutbound&>(*proxy).tag != source.tag) {
         return false;
     }
-
-    acpp::proxyman::outbound::RegisterProxy(
-        "mismatched-outbound", &CreateMismatchedOutboundConfig);
-    source.protocol = "mismatched-outbound";
+    // The handler-level sendThrough overrides the protocol default.
+    source.send_through = acpp::OutboundBind{};
     prepared = acpp::proxyman::outbound::PrepareOutboundConfig(source);
-    if (!prepared || !Throws<std::logic_error>([&] {
-            (void)acpp::proxyman::outbound::NewHandler(
-                *prepared, io_context, dns,
-                std::chrono::seconds(1), tasks.Tasks());
-        })) {
+    if (!prepared ||
+        prepared->sender.send_through.GetMode() != acpp::OutboundBind::Mode::None) {
         return false;
     }
+    source.send_through.reset();
 
     acpp::proxyman::outbound::RegisterProxy(
         "null-outbound", &CreateNullOutboundConfig);
     source.protocol = "null-outbound";
     prepared = acpp::proxyman::outbound::PrepareOutboundConfig(source);
     if (!prepared || !Throws<std::logic_error>([&] {
-            (void)acpp::proxyman::outbound::NewHandler(
-                *prepared, io_context, dns,
-                std::chrono::seconds(1), tasks.Tasks());
+            (void)acpp::proxyman::outbound::NewProxy(
+                *prepared, io_context, tasks.Tasks());
         })) {
         return false;
     }
@@ -382,9 +365,8 @@ bool TestOutboundRegistration() {
     acpp::proxyman::outbound::PreparedOutboundConfig missing_creator;
     missing_creator.tag = "missing-runtime-creator";
     if (!Throws<std::logic_error>([&] {
-            (void)acpp::proxyman::outbound::NewHandler(
-                missing_creator, io_context, dns,
-                std::chrono::seconds(1), tasks.Tasks());
+            (void)acpp::proxyman::outbound::NewProxy(
+                missing_creator, io_context, tasks.Tasks());
         })) {
         return false;
     }

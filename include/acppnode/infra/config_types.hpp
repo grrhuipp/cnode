@@ -3,6 +3,7 @@
 #include "acppnode/common/asio_types.hpp"
 #include "acppnode/common/defaults.hpp"
 #include "acppnode/core/constants.hpp"
+#include "acppnode/features/routing/dispatch_policy.hpp"
 #include "acppnode/infra/json.hpp"
 #include "acppnode/infra/runtime_config_types.hpp"
 #include "acppnode/proxy/sniff_config.hpp"
@@ -52,29 +53,67 @@ struct DnsConfig {
 // ============================================================================
 // 入站配置
 // ============================================================================
-struct StaticUser {
-    std::string id;
-    std::string password;
-    std::string email;
-    std::string flow;
+
+// How a Shadowsocks 2022 user credential becomes its user key. Static sources
+// carry base64 PSKs; panels carry user UUIDs from which SS2022 keys derive.
+enum class Ss2022UserKey : uint8_t {
+    Base64Psk,
+    UuidDerived,
 };
 
-struct StaticUserConfig {
+// Protocol-specific inbound source fields. Every source maps its own field
+// names into this one shape; protocols parse it once on the cold path.
+struct InboundProtocolSettings {
     std::string method = std::string(constants::protocol::kAes256Gcm);
+    // SS2022 server identity PSK (EIH). Empty disables the identity header.
     std::string identity_password;
+    Ss2022UserKey ss2022_user_key = Ss2022UserKey::Base64Psk;
     std::string padding_scheme;
     std::string vless_decryption = std::string(constants::protocol::kNone);
     uint32_t hysteria_up_mbps = 0;
     uint32_t hysteria_down_mbps = 0;
-    std::vector<StaticUser> clients;
 };
 
+// One authenticated user. `credential` is already the protocol credential
+// (UUID, password or PSK); sources resolve their own field aliases.
+struct InboundUserSpec {
+    int64_t user_id = 0;
+    std::string email;
+    std::string credential;
+    std::string flow;
+    uint64_t speed_limit = 0;
+    uint32_t device_limit = 0;
+};
+
+// The source-neutral inbound aggregate. Panel and static sources both map to
+// it; the shared builder prepares runtime state only from this value.
+struct InboundSpec {
+    std::string tag;
+    std::vector<std::string> all_tags;
+    // Opaque reporting identity; empty disables per-user reporting.
+    std::string accounting_key;
+    std::string protocol;
+    InboundListen listen;
+    uint16_t port = 0;
+    ProxyProtocolMode proxy_protocol = ProxyProtocolMode::Auto;
+    InboundProtocolSettings settings;
+    std::vector<InboundUserSpec> users;
+    // Normalized and validated by the source's shared field parsers.
+    StreamSettings stream_settings;
+    SniffConfig sniffing;
+    routing::OutboundSelectionPolicy outbound_policy{
+        routing::ForceOutbound(std::string(constants::protocol::kDirect))};
+};
+
+// Static inbound source as written in inbounds.json. Only tag fallback and
+// outbound selection remain static-specific; the rest maps 1:1 to InboundSpec.
 struct StaticInboundConfig {
     std::vector<std::string> tags;
     std::string protocol;
     InboundListen listen;
     uint16_t port = 0;
-    StaticUserConfig static_users;
+    InboundProtocolSettings settings;
+    std::vector<InboundUserSpec> users;
     StreamSettings stream_settings;
     SniffConfig sniffing;
     ProxyProtocolMode proxy_protocol = ProxyProtocolMode::Auto;

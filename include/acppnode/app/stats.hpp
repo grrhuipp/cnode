@@ -5,6 +5,7 @@
 #include <array>
 #include <cstdint>
 #include <vector>
+#include <utility>
 
 namespace acpp {
 
@@ -125,6 +126,32 @@ struct alignas(64) StatsShard {
     void CommitAccumulator(const LocalStatsAccumulator& acc) {
         hot.CommitAccumulator(acc);
     }
+};
+
+// The single accepted/closed accounting of one connection or logical
+// substream: accepted on construction, closed once on destruction. Moving
+// transfers the pending close.
+class ConnectionStatsScope {
+public:
+    explicit ConnectionStatsScope(StatsShard& stats) noexcept
+        : stats_(&stats) {
+        stats_->OnConnectionAccepted();
+    }
+
+    ~ConnectionStatsScope() noexcept {
+        if (stats_) {
+            stats_->OnConnectionClosed();
+        }
+    }
+
+    ConnectionStatsScope(ConnectionStatsScope&& other) noexcept
+        : stats_(std::exchange(other.stats_, nullptr)) {}
+    ConnectionStatsScope(const ConnectionStatsScope&) = delete;
+    ConnectionStatsScope& operator=(const ConnectionStatsScope&) = delete;
+    ConnectionStatsScope& operator=(ConnectionStatsScope&&) = delete;
+
+private:
+    StatsShard* stats_;
 };
 
 // ============================================================================
