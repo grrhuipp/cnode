@@ -207,6 +207,18 @@ set(ENABLE_WOLFSSL OFF CACHE BOOL "" FORCE)
 set(ENABLE_JEMALLOC OFF CACHE BOOL "" FORCE)
 set(BORINGSSL_INCLUDE_DIR "${aws_lc_SOURCE_DIR}/include" CACHE PATH "" FORCE)
 set(BORINGSSL_LIBRARIES ssl crypto CACHE STRING "" FORCE)
+# ngtcp2 probes OPENSSL_IS_BORINGSSL/OPENSSL_IS_AWSLC with check_symbol_exists,
+# which links the probe against BORINGSSL_LIBRARIES. Here those are the AWS-LC
+# targets, which do not exist yet at configure time, so the probe falls back to
+# -lssl -lcrypto: it fails without a system OpenSSL and is wrong with one.
+# The backend is the vendored AWS-LC, so read its identity from the header.
+file(STRINGS "${aws_lc_SOURCE_DIR}/include/openssl/base.h" CNODE_AWSLC_IDENTITY
+    REGEX "^#define OPENSSL_IS_AWSLC$")
+if(NOT CNODE_AWSLC_IDENTITY)
+    message(FATAL_ERROR "Vendored AWS-LC does not define OPENSSL_IS_AWSLC")
+endif()
+set(HAVE_BORINGSSL "" CACHE INTERNAL "Have symbol OPENSSL_IS_BORINGSSL")
+set(HAVE_AWSLC 1 CACHE INTERNAL "Have symbol OPENSSL_IS_AWSLC")
 FetchContent_Declare(
     ngtcp2
     GIT_REPOSITORY https://github.com/ngtcp2/ngtcp2.git
