@@ -380,6 +380,17 @@ void TestExecutor() {
     Check(child && parent, "executor ownership must be preserved");
 }
 
+void TestIdleResidentGroup(GroupResource& resource) {
+    net::io_context io;
+    const auto before = resource.live.load(std::memory_order_relaxed);
+    for (int i = 0; i != 1000; ++i) {
+        acpp::ResidentTaskGroup resident(io.get_executor());
+        resident.Tasks().Cancel();
+    }
+    Check(resource.live.load(std::memory_order_relaxed) == before,
+          "resident groups without children must not allocate task state");
+}
+
 // Children started by coroutines outside the group stay owned until
 // AsyncJoin, which cancels them, waits for their cleanup and closes admission;
 // a per-child source cancels only its own child.
@@ -444,6 +455,7 @@ int main() {
         TestAllocationFailures();
         TestMoveOnlyStart();
         TestExecutor();
+        TestIdleResidentGroup(resource);
         TestResidentGroup();
         Check(resource.live.load() == 0, "all PMR task bookkeeping must be released");
         Check(acpp::memory::RemoteFreeCount() == 0,

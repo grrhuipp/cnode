@@ -209,11 +209,13 @@ net::awaitable<void> RunAwaitableTaskGroup(net::any_io_executor executor, Start 
 }
 
 // Owner for tasks that outlive the coroutine starting them, such as pooled
-// physical sessions held for a Worker's lifetime. Spawn through Tasks() is
-// valid on the executor until AsyncJoin, which cancels every child and resumes
-// after each actual completion. As in any group, an uncaught child failure
-// stops all siblings: resident children must contain their own failures.
-class ResidentTaskGroup final {
+// physical sessions held for a Worker's lifetime. The common no-child case
+// stores only the executor; join state and the self-retaining group are created
+// by the first Spawn. Spawn through Tasks() is valid on the executor until
+// AsyncJoin, which cancels every child and resumes after each actual completion.
+// As in any group, an uncaught child failure stops all siblings: resident
+// children must contain their own failures.
+class ResidentTaskGroup final : public AwaitableTaskGroup {
     struct JoinState {
         explicit JoinState(const net::any_io_executor& executor)
             : wake(executor, std::chrono::steady_clock::time_point::max()) {}
@@ -236,18 +238,30 @@ class ResidentTaskGroup final {
 
 public:
     explicit ResidentTaskGroup(net::any_io_executor executor)
-        : join_(memory::AllocateShared<JoinState>(executor))
-        , group_(memory::AllocateShared<Group>(std::move(executor), Completion{join_})) {}
+        : executor_(std::move(executor)) {}
     ResidentTaskGroup(const ResidentTaskGroup&) = delete;
     ResidentTaskGroup& operator=(const ResidentTaskGroup&) = delete;
     ~ResidentTaskGroup() { Close(); }
 
-    [[nodiscard]] AwaitableTaskGroup& Tasks() noexcept { return *group_; }
+    [[nodiscard]] AwaitableTaskGroup& Tasks() noexcept { return *this; }
+
+    void Spawn(net::awaitable<void> task,
+               transport::CancellationSource* source = nullptr) override {
+        if (stopping_) throw IoSystemError(net::error::operation_aborted);
+        EnsureStarted();
+        group_->Spawn(std::move(task), source);
+    }
+
+    void Cancel() override {
+        stopping_ = true;
+        if (group_) group_->Cancel();
+    }
 
     // A join is never abandoned halfway: caller cancellation is ignored.
     net::awaitable<void> AsyncJoin() {
         co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
         Close();
+        if (!join_) co_return;
         while (!join_->done) {
             IoErrorCode ignored;
             co_await join_->wake.async_wait(net::redirect_error(net::use_awaitable, ignored));
@@ -258,15 +272,27 @@ public:
     }
 
 private:
+    void EnsureStarted() {
+        if (group_) return;
+        auto join = memory::AllocateShared<JoinState>(executor_);
+        auto group = memory::AllocateShared<Group>(executor_, Completion{join});
+        join_ = std::move(join);
+        group_ = std::move(group);
+    }
+
     void Close() {
         if (closed_) return;
         closed_ = true;
+        stopping_ = true;
+        if (!group_) return;
         group_->Cancel();
         group_->Finish();  // releases the launch sentinel
     }
 
+    net::any_io_executor executor_;
     std::shared_ptr<JoinState> join_;
     std::shared_ptr<Group> group_;
+    bool stopping_ = false;
     bool closed_ = false;
 };
 

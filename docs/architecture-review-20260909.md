@@ -9,9 +9,10 @@
 - `ThreadLocalAllocator` / `RingDeque` 只弱引用已空的轻量域；只要容器仍有 live block，块本身保持域资源寿命。空容器跨到同组新域后若再次分配，会先绑定当前域，不会让已退役物理连接常驻。阶段级 `request_memory` 是借用域资源的 monotonic arena，只用于握手、认证、探测、路由和建连临时值，不承载长连接持续流量。
 - 容器移动/交换转移块所有权。Buffer 访问、域分配/释放及 request arena 的内联分配均检查租约；无租约或未合并异域访问立即拒绝。已合并子域仅在共同 Group 独占执行时互借。迁移后的新分配使用当前 Worker，旧块仍归还来源 Worker。
 - Asio native operation 内存使用 `ProcessAllocator`，允许原 reactor 交付或销毁完成；它不接触连接域或 Worker slab。UDP 接收和发送均由 reactor 等待 readiness，再由当前 owner 执行非阻塞 payload 系统调用；重等不重置整次操作预算，空 payload 仍发送实际零长 datagram。
-- `TimeoutScheduler::ForIoContext` 在会话内选 `ExecutionDomain::Services()`，域外保留 Worker 服务与缓存；定时器完成绑定当前域 executor，定时器操作内存使用 process resource。Scheduler 仅弱持 domain，避免 service/executor 自循环；能力对象收束任务后调用 `AsyncReleaseForIoContext`，取消事件并等到唯一 native timer 完成交付，不能用一次 post 代替 join。每连接任务组改为 `Impl` 内嵌 owner，取消和 join 仍按连接隔离；其小对象由 Worker slab 跨连接紧凑装填，不再各占至少一页。
+- `TimeoutScheduler::ForIoContext` 在会话内选 `ExecutionDomain::Services()`，域外保留 Worker 服务与缓存；定时器完成绑定当前域 executor，定时器操作内存使用 process resource。Scheduler 仅弱持 domain，避免 service/executor 自循环；能力对象收束任务后调用 `AsyncReleaseForIoContext`，取消事件并等到唯一 native timer 完成交付，不能用一次 post 代替 join。每连接任务组保留 `Impl` 内嵌 owner 和独立取消/join 语义，但无子任务时只保存 executor，首次 `Spawn` 才构造 join 状态与自持有组；已启动子任务的小对象仍由 Worker slab 跨连接紧凑装填。
 
 - 验证：全量并行构建与 CTest 178/178 通过。单 Worker、真实 VLESS TCP 持有 2000 条活跃连接 10.5 秒，RSS 从旧版 187248 KiB 降至 94740 KiB，`pool_mapped` 从 85 MB 降至 9 MB；持有窗口 RSS 仅增加 120 KiB，关闭后回落至 19692 KiB。1000 个连接域跨 13 个尺寸类的定向回归中，live stride 4544000 字节、mapped 5033984 字节，未再出现每域每尺寸类至少占一页。
+- 后续反碎片验证保留 64 KiB Worker slab 上限和 64 字节最小槽：16/32 KiB slab 将 2000 连接下的 chunk 数从 226 分别增加到 673/462，32 字节最小槽的重复测试只有噪声量级收益且增加尺寸类和 chunk，因此均未采用。惰性驻留任务组在三轮交错测试中将 2000 条活跃连接的最终 RSS 中位数从 94516 KiB 降至 93828 KiB，扣除各轮基线后的连接增量中位数从 81708 KiB 降至 80788 KiB，约减少 471 字节/连接；Worker chunk 从 221 降至 207。
 
 
 ## 工作区与验证环境
