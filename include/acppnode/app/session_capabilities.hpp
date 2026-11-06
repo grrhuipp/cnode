@@ -97,17 +97,16 @@ public:
     [[nodiscard]] const proxyman::inbound::ReceiverSettings& Receiver() const noexcept { return *receiver_; }
     [[nodiscard]] bool Initialized() const noexcept { return initialized_; }
     [[nodiscard]] bool IsJoined() const noexcept { return joined_; }
-    [[nodiscard]] bool HasPendingTraffic() const noexcept;
-    void ReleaseIdleAccounting() noexcept;
     // Must run in the domain before constructing its socket/Context payload.
     void Initialize(net::io_context& native_reactor);
     net::awaitable<void> ProcessTCP(std::unique_ptr<AsyncStream> stream,
                                   session::Context& context);
     void RequestStop() noexcept;
-    // Called after ProcessTCP has finished; releases its cancellation executor,
-    // joins resident work and releases transport hosts, retaining only accounting.
+    // Called after ProcessTCP has finished; releases every physical-domain
+    // resource. Accounting snapshots retain only their independent ledger.
     net::awaitable<void> AsyncJoin();
     [[nodiscard]] SessionTrackingState& Tracking() noexcept;
+    [[nodiscard]] std::shared_ptr<SessionTrackingState> TrackingOwner() const noexcept;
     [[nodiscard]] StatsShard& Stats() noexcept;
     [[nodiscard]] std::vector<OnlineDevice> GetOnlineDevices(std::string_view tag) const;
     void UpdateUserView(proxyman::inbound::UserStore::WorkerView view) noexcept;
@@ -135,11 +134,11 @@ private:
     proxyman::inbound::UserStore::WorkerView user_view_;
     proxyman::inbound::UserStore::WorkerView previous_user_view_;
     std::unique_ptr<Impl> impl_;
+    std::shared_ptr<SessionTrackingState> tracking_;
     StatsShard stats_;
     bool initialized_ = false;
     bool stopping_ = false;
     bool joined_ = false;
-    std::atomic<bool> pending_traffic_{false};
 };
 } // namespace app
 } // namespace acpp

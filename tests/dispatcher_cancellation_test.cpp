@@ -441,6 +441,35 @@ bool StableAccounting() {
     const auto reused = tracking.SnapshotTraffic(key);
     tracking.CommitTraffic(key, reused);
     passed &= reused.users.at(42).upload == 3 && reused.users.at(42).download == 5;
+    // A closed physical connection transfers only counters outside the current
+    // durable snapshot. The snapshot token keeps the small ledger alive, not
+    // the connection domain; rollback makes its counters transferable again.
+    app::SessionTrackingState retired;
+    app::SessionTrackingState aggregate;
+    app::SessionTrackingState::ActiveSession retired_session;
+    session::Traffic retired_traffic;
+    retired.RegisterActiveSession(retired_session, key, 77, retired_traffic);
+    retired_traffic.bytes_up = 29;
+    retired_traffic.bytes_down = 31;
+    const auto in_flight = retired.SnapshotTraffic(key);
+    retired_traffic.bytes_up += 37;
+    retired_traffic.bytes_down += 41;
+    retired.UnregisterActiveSession(retired_session);
+    auto after_snapshot = retired.ExtractAvailableTraffic(key);
+    passed &= after_snapshot.users.at(77).upload == 37 &&
+        after_snapshot.users.at(77).download == 41;
+    aggregate.MergeCompletedTraffic(key, after_snapshot);
+    passed &= after_snapshot.empty();
+    retired.RollbackTraffic(key, in_flight);
+    auto restored = retired.ExtractAvailableTraffic(key);
+    passed &= restored.users.at(77).upload == 29 &&
+        restored.users.at(77).download == 31;
+    aggregate.MergeCompletedTraffic(key, restored);
+    const auto consolidated = aggregate.SnapshotTraffic(key);
+    passed &= consolidated.users.at(77).upload == 66 &&
+        consolidated.users.at(77).download == 72 &&
+        retired.SnapshotTraffic(key).empty();
+    aggregate.CommitTraffic(key, consolidated);
     std::printf("stable accounting with retired sessions and teardown OOM: %s\n",
                 passed ? "PASS" : "FAIL");
     return passed;

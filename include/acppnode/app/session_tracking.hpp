@@ -1,11 +1,13 @@
 #pragma once
 
 #include "acppnode/app/traffic_types.hpp"
-#include "acppnode/common/allocator.hpp"
 #include "acppnode/common/string_hash.hpp"
 
 #include <cstdint>
+#include <mutex>
+#include <string>
 #include <string_view>
+#include <unordered_map>
 
 namespace acpp {
 
@@ -15,9 +17,10 @@ struct Traffic;
 
 namespace app {
 
-class SessionTrackingState : public memory::ThreadAllocated {
+class SessionTrackingState {
     struct Account {
         UserTraffic completed;
+        UserTraffic snapshotted;
         size_t active = 0;
     };
     struct AccountBucket;
@@ -51,22 +54,27 @@ public:
 
     void UnregisterActiveSession(ActiveSession& node) noexcept;
 
-    [[nodiscard]] UserTrafficSnapshot SnapshotTraffic(std::string_view tag);
+    [[nodiscard]] UserTrafficCounters SnapshotTraffic(std::string_view tag);
     // Deduct only an already-durable snapshot. Later traffic remains pending.
     void CommitTraffic(std::string_view tag, const UserTrafficCounters& snapshot);
-    [[nodiscard]] bool HasPendingTraffic() const noexcept;
+    // Re-expose a failed durable snapshot without touching later traffic.
+    void RollbackTraffic(std::string_view tag, const UserTrafficCounters& snapshot);
+    // Move counters not covered by an in-flight snapshot into another ledger.
+    [[nodiscard]] UserTrafficCounters ExtractAvailableTraffic(std::string_view tag);
+    void MergeCompletedTraffic(std::string_view tag, UserTrafficCounters& source);
 
 private:
     struct AccountBucket {
         std::string_view key;
-        memory::ThreadLocalUnorderedMap<int64_t, Account> traffic;
+        std::unordered_map<int64_t, Account> traffic;
         ActiveSession* active_head = nullptr;
     };
 
-    memory::ThreadLocalUnorderedMap<memory::ThreadLocalString,
-                                    AccountBucket,
-                                    TransparentStringHash,
-                                    TransparentStringEq> accounts_;
+    mutable std::mutex mutex_;
+    std::unordered_map<std::string,
+                       AccountBucket,
+                       TransparentStringHash,
+                       TransparentStringEq> accounts_;
 };
 
 }  // namespace app

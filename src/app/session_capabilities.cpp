@@ -515,7 +515,7 @@ struct PhysicalSessionCapabilities::Impl final : memory::ThreadAllocated,
         outbounds = std::make_unique<Outbounds>(*owner.configuration_, io, dns, tasks->Tasks());
         dispatcher = std::make_unique<dispatcher::DefaultDispatcher>(
             *owner.configuration_->router, *outbounds, *owner.configuration_->policy,
-            tracking, dns, *owner.request_load_);
+            *owner.tracking_, dns, *owner.request_load_);
     }
 
     Inbound& GetProxy() override {
@@ -532,7 +532,6 @@ struct PhysicalSessionCapabilities::Impl final : memory::ThreadAllocated,
 
     PhysicalSessionCapabilities& owner;
     net::io_context& reactor;
-    SessionTrackingState tracking;
     dns::DNS dns;
     std::unique_ptr<ResidentTaskGroup> tasks;
     std::unique_ptr<proxyman::inbound::ProtocolRuntime> protocol;
@@ -576,7 +575,8 @@ PhysicalSessionCapabilities::PhysicalSessionCapabilities(
     : configuration_(std::move(configuration)), limiter_(std::move(limiter)),
       request_load_(std::move(request_load)), dns_worker_(dns_worker),
       prepared_(std::move(prepared)), receiver_(std::move(receiver)),
-      user_view_(proxyman::inbound::UserStore::CaptureWorkerView()) {
+      user_view_(proxyman::inbound::UserStore::CaptureWorkerView()),
+      tracking_(std::make_shared<SessionTrackingState>()) {
     if (!configuration_ || !limiter_ || !request_load_ || !prepared_ || !receiver_)
         throw std::invalid_argument("missing domain capability");
 }
@@ -625,7 +625,7 @@ void PhysicalSessionCapabilities::RequestStop() noexcept {
 net::awaitable<void> PhysicalSessionCapabilities::AsyncJoin() {
     co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
     if (!impl_) {
-        pending_traffic_.store(false, std::memory_order_release);
+        joined_ = true;
         co_return;
     }
     RequestStop();
@@ -653,30 +653,19 @@ net::awaitable<void> PhysicalSessionCapabilities::AsyncJoin() {
     catch (...) { if (!failure) failure = std::current_exception(); }
     joined_ = true;
     user_view_.reset();
-    const bool pending = impl_ && impl_->tracking.HasPendingTraffic();
-    pending_traffic_.store(pending, std::memory_order_release);
-    if (!pending) {
-        impl_.reset();
-    }
+    impl_.reset();
     allocation_.pool().PurgeIdle();
     if (failure) std::rethrow_exception(failure);
 }
 
-SessionTrackingState& PhysicalSessionCapabilities::Tracking() noexcept { return impl_->tracking; }
+SessionTrackingState& PhysicalSessionCapabilities::Tracking() noexcept {
+    return *tracking_;
+}
+std::shared_ptr<SessionTrackingState>
+PhysicalSessionCapabilities::TrackingOwner() const noexcept {
+    return tracking_;
+}
 StatsShard& PhysicalSessionCapabilities::Stats() noexcept { return stats_; }
-bool PhysicalSessionCapabilities::HasPendingTraffic() const noexcept {
-    if (ExecutionDomain::Current() != Domain()) {
-        return pending_traffic_.load(std::memory_order_acquire);
-    }
-    return impl_ && impl_->tracking.HasPendingTraffic();
-}
-void PhysicalSessionCapabilities::ReleaseIdleAccounting() noexcept {
-    if (joined_ && impl_ && !impl_->tracking.HasPendingTraffic()) {
-        pending_traffic_.store(false, std::memory_order_release);
-        impl_.reset();
-        allocation_.pool().PurgeIdle();
-    }
-}
 std::vector<OnlineDevice> PhysicalSessionCapabilities::GetOnlineDevices(std::string_view tag) const {
     return impl_ && impl_->protocol ? impl_->protocol->GetOnlineDevices(tag)
                                    : std::vector<OnlineDevice>{};

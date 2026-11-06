@@ -78,7 +78,7 @@ struct Worker::ConnectionRecord {
     uint64_t conn_id = 0;
     std::atomic<bool> initialized{false};
     std::atomic<bool> finished{false};
-    bool pending_accounting = false;
+    app::UserTrafficCounters completed_traffic;
     StatsSnapshot final_stats;
 };
 
@@ -995,8 +995,15 @@ net::awaitable<void> Worker::ListenerState::AcceptLoop(
                         stats.cold.errors += record->final_stats.errors;
                         --tcp_tasks;
                         NotifyCompletion();
-                        if (!record->pending_accounting ||
-                            !record->capabilities->HasPendingTraffic())
+                        bool accounting_merged = false;
+                        try {
+                            worker.runtime_->session_tracking->MergeCompletedTraffic(
+                                record->accounting_key, record->completed_traffic);
+                            accounting_merged = true;
+                        } catch (...) {
+                            worker.ReportFailure(std::current_exception());
+                        }
+                        if (accounting_merged)
                             worker.runtime_->EraseConnection(worker.id_, record);
                         if (error) {
                             try {
@@ -1058,7 +1065,13 @@ net::awaitable<void> Worker::ListenerState::ProcessReceivedConnection(
     } catch (...) { failure = std::current_exception(); }
     try { co_await record->capabilities->AsyncJoin(); }
     catch (...) { if (!failure) failure = std::current_exception(); }
-    record->pending_accounting = record->capabilities->HasPendingTraffic();
+    try {
+        record->completed_traffic =
+            record->capabilities->Tracking().ExtractAvailableTraffic(
+                record->accounting_key);
+    } catch (...) {
+        if (!failure) failure = std::current_exception();
+    }
     if (record->capabilities->Initialized())
         record->final_stats = record->capabilities->Stats().Snapshot();
     if (failure) std::rethrow_exception(failure);
@@ -1237,8 +1250,9 @@ void Worker::UpdateRule(std::string_view tag, const std::vector<rule::DetectRule
 // ============================================================================
 
 net::awaitable<app::UserTrafficSnapshot> Worker::SnapshotTraffic(std::string tag) {
-    co_await ReapAccountingDomains();
-    auto result = runtime_->session_tracking->SnapshotTraffic(tag);
+    app::UserTrafficSnapshot result;
+    auto worker_counters = runtime_->session_tracking->SnapshotTraffic(tag);
+    result.users = std::move(worker_counters.users);
     // Source registry membership never changes when a group migrates. Each
     // logical domain is therefore sampled exactly once across all Workers.
     std::vector<std::shared_ptr<ConnectionRecord>> records;
@@ -1246,6 +1260,7 @@ net::awaitable<app::UserTrafficSnapshot> Worker::SnapshotTraffic(std::string tag
     for (const auto& [key, record] : runtime_->connections) {
         (void)key;
         if (record->initialized.load(std::memory_order_acquire) &&
+            !record->finished.load(std::memory_order_acquire) &&
             (tag.empty() || record->accounting_key == tag)) {
             records.push_back(record);
         }
@@ -1254,22 +1269,15 @@ net::awaitable<app::UserTrafficSnapshot> Worker::SnapshotTraffic(std::string tag
         if (!runtime_->connections.contains(record.get()) ||
             !record->domain || !record->capabilities)
             continue;
-        const std::weak_ptr<app::PhysicalSessionCapabilities> weak_cap = record->capabilities;
-        const std::weak_ptr<ExecutionDomain> weak_domain = record->domain;
+        auto owner = record->capabilities->TrackingOwner();
         auto counters = co_await net::co_spawn(record->domain->Executor(),
-            [capabilities = record->capabilities, tag]() mutable -> net::awaitable<app::UserTrafficSnapshot> {
-                if (!capabilities->HasPendingTraffic()) {
-                    capabilities.reset();
-                    co_return app::UserTrafficSnapshot{};
-                }
-                auto snapshot = capabilities->Tracking().SnapshotTraffic(tag);
-                capabilities.reset();
-                co_return snapshot;
+            [owner, tag]() -> net::awaitable<app::UserTrafficCounters> {
+                co_return owner->SnapshotTraffic(tag);
             }, net::use_awaitable);
         if (counters.empty()) continue;
         result.domains.push_back({
-            {weak_cap, weak_domain},
-            app::UserTrafficCounters{std::move(counters.users)},
+            std::move(owner),
+            std::move(counters),
         });
     }
     co_return result;
@@ -1280,42 +1288,18 @@ net::awaitable<void> Worker::CommitTraffic(
     co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
     runtime_->session_tracking->CommitTraffic(tag, snapshot);
     for (const auto& token : snapshot.domains) {
-        auto domain = token.owner.domain.lock();
-        auto capabilities = token.owner.capabilities.lock();
-        if (!domain || !capabilities) continue;
-        auto executor = domain->Executor();
-        co_await net::co_spawn(std::move(executor),
-            [capabilities = std::move(capabilities), domain = std::move(domain),
-             tag, counters = &token.counters]() mutable -> net::awaitable<void> {
-                if (capabilities->HasPendingTraffic()) {
-                    capabilities->Tracking().CommitTraffic(tag, *counters);
-                    capabilities->ReleaseIdleAccounting();
-                }
-                capabilities.reset();
-                domain.reset();
-                co_return;
-            }, net::use_awaitable);
+        token.owner->CommitTraffic(tag, token.counters);
     }
-    co_await ReapAccountingDomains();
 }
 
-net::awaitable<void> Worker::ReapAccountingDomains() {
-    std::vector<std::shared_ptr<ConnectionRecord>> retired;
-    for (const auto& [key, record] : runtime_->connections) {
-        (void)key;
-        if (record->finished.load(std::memory_order_acquire)) retired.push_back(record);
-    }
-    for (const auto& record : retired) {
-        if (!runtime_->connections.contains(record.get()) ||
-            !record->domain || !record->capabilities)
-            continue;
-        const bool pending = co_await net::co_spawn(record->domain->Executor(),
-            [cap = record->capabilities]() mutable -> net::awaitable<bool> {
-                const bool has_pending = cap->HasPendingTraffic();
-                cap.reset();
-                co_return has_pending;
-            }, net::use_awaitable);
-        if (!pending) runtime_->EraseConnection(id_, record);
+net::awaitable<void> Worker::RollbackTraffic(
+    std::string tag, const app::UserTrafficSnapshot& snapshot) {
+    co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
+    runtime_->session_tracking->RollbackTraffic(tag, snapshot);
+    for (const auto& token : snapshot.domains) {
+        token.owner->RollbackTraffic(tag, token.counters);
+        auto available = token.owner->ExtractAvailableTraffic(tag);
+        runtime_->session_tracking->MergeCompletedTraffic(tag, available);
     }
 }
 

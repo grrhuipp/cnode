@@ -6,11 +6,9 @@
 #include <vector>
 #include <unordered_map>
 
-namespace acpp { class ExecutionDomain; }
-
 namespace acpp::app {
 
-class PhysicalSessionCapabilities;
+class SessionTrackingState;
 
 struct UserTraffic {
     uint64_t upload = 0;
@@ -29,18 +27,14 @@ struct UserTrafficCounters {
     auto end() const noexcept { return users.end(); }
 };
 
-struct AccountingDomain {
-    std::weak_ptr<PhysicalSessionCapabilities> capabilities;
-    std::weak_ptr<ExecutionDomain> domain;
-};
-
 struct DomainTrafficSnapshot {
-    AccountingDomain owner;
+    std::shared_ptr<SessionTrackingState> owner;
     UserTrafficCounters counters;
 };
 
 struct UserTrafficSnapshot : UserTrafficCounters {
-    // Stable per-domain commit tokens survive execution-group migration.
+    // Commit tokens retain only the small accounting ledger. Closed physical
+    // connection domains are never kept alive until the reporting interval.
     std::vector<DomainTrafficSnapshot> domains;
     [[nodiscard]] bool empty() const noexcept {
         if (!users.empty()) return false;

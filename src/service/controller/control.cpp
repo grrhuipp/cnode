@@ -29,10 +29,27 @@ Controller::Impl::collectTraffic(PanelRuntime& panel, bool* appended_out) {
         auto* w = worker.get();
         auto snapshot = co_await w->PostTask(w->SnapshotTraffic(panel.accounting_key));
         if (snapshot.empty()) continue;
-        co_await journal_executor_->Run([&panel, &snapshot] {
-            panel.traffic_journal->Append(snapshot);
-            return true;
-        });
+        std::exception_ptr append_failure;
+        try {
+            co_await journal_executor_->Run([&panel, &snapshot] {
+                panel.traffic_journal->Append(snapshot);
+                return true;
+            });
+        } catch (...) {
+            append_failure = std::current_exception();
+        }
+        if (append_failure) {
+            // The snapshot token may be the last owner after a connection has
+            // closed. Return it to the Worker ledger before unwinding.
+            try {
+                co_await w->PostTask(
+                    w->RollbackTraffic(panel.accounting_key, snapshot));
+            } catch (...) {
+                panel.traffic_journal->Suspend();
+                throw;
+            }
+            std::rethrow_exception(append_failure);
+        }
         appended = true;
         if (appended_out) *appended_out = true;
         // A successful append is durable. A failed commit must suspend further
