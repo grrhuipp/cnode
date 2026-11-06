@@ -126,6 +126,69 @@ AdmitAuthenticatedInbound(
         tracker.TryConnectSession(ctx.inbound.tag, profile.user_id,
                                   ctx.inbound.source_ip, profile.device_limit));
 }
+// Ownership of every admission an association holds until it ends.
+struct NativeAssociationAdmission {
+    ConnectionLimiter::Reservation connection;
+    ConnectionLimiter::Reservation ip;
+    UserOnlineSessionGuard user_session;
+};
+
+inline void RejectNativeAssociation(const session::Context& ctx, StatsShard& stats,
+                             std::string_view reason) {
+    LOG_CONN_DEBUG(ctx, "UDP association rejected from {}:{} > {}",
+                   ctx.inbound.source_ip, ctx.inbound.source_port, reason);
+    LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, reason));
+    stats.OnError();
+}
+
+// The unified admission contract for one native association, in TCP order:
+// global and per-IP connection reservations, then session-level devices.
+inline net::awaitable<std::optional<NativeAssociationAdmission>> AdmitNativeAssociation(
+    session::Context& ctx,
+    const UserProfile& profile,
+    UserOnlineTracker* tracker,
+    ConnectionLimiter* limiter,
+    StatsShard& stats) {
+    NativeAssociationAdmission admitted;
+    if (limiter) {
+        const bool check_ban = ctx.inbound.HasProxyProtocolClientIP();
+        auto physical = co_await limiter->ReservePhysical(
+            ctx.inbound.tag, ctx.inbound.source_ip, check_ban);
+        if (physical.reason != ConnectionLimiter::RejectReason::NONE) {
+            RejectNativeAssociation(
+                ctx, stats, ConnectionLimiter::RejectReasonToString(physical.reason));
+            co_return std::nullopt;
+        }
+        admitted.connection = std::move(physical.reservation);
+        auto ip = co_await limiter->ReserveIP(
+            ctx.inbound.tag, ctx.inbound.source_ip, check_ban);
+        if (ip.reason != ConnectionLimiter::RejectReason::NONE) {
+            RejectNativeAssociation(
+                ctx, stats, ConnectionLimiter::RejectReasonToString(ip.reason));
+            co_return std::nullopt;
+        }
+        admitted.ip = std::move(ip.reservation);
+    }
+    if (!tracker) {
+        RejectNativeAssociation(ctx, stats, "missing user admission");
+        co_return std::nullopt;
+    }
+    // The credential's stable session capability owns the tracker; quota
+    // reservations remain tied to their original coordinator across handoff.
+    std::optional<UserOnlineSessionGuard> user_session;
+    if (limiter) {
+        user_session = co_await proxy::AdmitAuthenticatedInbound(
+            *tracker, limiter->Coordinator(), ctx, profile);
+    } else {
+        user_session = co_await proxy::AdmitAuthenticatedInbound(*tracker, ctx, profile);
+    }
+    if (!user_session) {
+        stats.OnError();
+        co_return std::nullopt;
+    }
+    admitted.user_session = std::move(*user_session);
+    co_return std::move(admitted);
+}
 
 // Admission of one protocol-level substream (Mux.Cool child, AnyTLS SYN
 // stream), held for the child's lifetime: the same logical connection-limit

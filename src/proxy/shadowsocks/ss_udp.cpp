@@ -327,6 +327,8 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
 [[nodiscard]] std::optional<SsUdpDecodeResult> Make2022DecodeResult(
     size_t user_index,
     std::span<const uint8_t, 8> client_session_id,
+    std::span<const uint8_t> authenticated_key,
+    uint64_t packet_id,
     Parsed2022Body parsed) {
 
     SsUdpDecodeResult result;
@@ -334,6 +336,10 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
     uint64_t session_id = 0;
     for (uint8_t byte : client_session_id) session_id = (session_id << 8) | byte;
     result.session_id = session_id;
+    result.packet_id = packet_id;
+    if (!result.session_owner.assign(authenticated_key)) {
+        return std::nullopt;
+    }
     result.user_index = user_index;
     if (!buf::AppendSpanToMultiBuffer(parsed.payload, result.payload)) {
         return std::nullopt;
@@ -346,7 +352,8 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
     size_t datagram_len,
     const proxyman::inbound::UserStore::ShadowsocksUsersView& users,
     const SsCipherInfo& cipher_info,
-    Ss2022UdpReplayCache& replay_cache) {
+    Ss2022UdpReplayCache& replay_cache,
+    bool deferred_replay) {
 
     constexpr size_t kMinBodyPlain = 1 + 8 + 2 + 1 + 4 + 2;
     if (datagram_len < kSs2022UdpSeparateHeaderSize +
@@ -441,11 +448,12 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
         }
         const uint64_t packet_id = LoadU64BE(
             separate.data() + kSs2022UdpSessionIdSize);
-        if (!replay_cache.Accept(user.derived_key.span(), client_session_id, packet_id)) {
+        if (!deferred_replay &&
+            !replay_cache.Accept(user.derived_key.span(), client_session_id, packet_id)) {
             return std::nullopt;
         }
         return Make2022DecodeResult(
-            i, client_session_id, std::move(*parsed));
+            i, client_session_id, user.derived_key.span(), packet_id, std::move(*parsed));
     }
 
     return std::nullopt;
@@ -455,7 +463,8 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
     const uint8_t* datagram,
     size_t datagram_len,
     const proxyman::inbound::UserStore::ShadowsocksUsersView& users,
-    Ss2022UdpReplayCache& replay_cache) {
+    Ss2022UdpReplayCache& replay_cache,
+    bool deferred_replay) {
 
     constexpr size_t kMinPlain =
         kSs2022UdpSessionIdSize + kSs2022UdpPacketIdSize + 1 + 8 + 2 + 1 + 4 + 2;
@@ -491,11 +500,12 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
         if (!parsed) {
             return std::nullopt;
         }
-        if (!replay_cache.Accept(user.derived_key.span(), client_session_id, packet_id)) {
+        if (!deferred_replay &&
+            !replay_cache.Accept(user.derived_key.span(), client_session_id, packet_id)) {
             return std::nullopt;
         }
         return Make2022DecodeResult(
-            i, client_session_id, std::move(*parsed));
+            i, client_session_id, user.derived_key.span(), packet_id, std::move(*parsed));
     }
 
     return std::nullopt;
@@ -832,7 +842,8 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacket(
     SsCipherType cipher_type,
     size_t key_size,
     size_t salt_size,
-    Ss2022UdpReplayCache& replay_cache) {
+    Ss2022UdpReplayCache& replay_cache,
+    bool deferred_replay) {
 
     if (users.empty()) {
         return std::nullopt;
@@ -841,11 +852,11 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacket(
     const SsCipherInfo cipher_info{cipher_type, key_size, salt_size};
     if (Is2022AesCipher(cipher_type)) {
         return Decode2022UdpAesRequest(
-            datagram, datagram_len, users, cipher_info, replay_cache);
+            datagram, datagram_len, users, cipher_info, replay_cache, deferred_replay);
     }
     if (cipher_type == SsCipherType::CHACHA20_POLY1305_2022) {
         return Decode2022UdpChachaRequest(
-            datagram, datagram_len, users, replay_cache);
+            datagram, datagram_len, users, replay_cache, deferred_replay);
     }
 
     if (key_size > 64 || salt_size > 64) {

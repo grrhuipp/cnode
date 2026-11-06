@@ -5,6 +5,7 @@
 #include "acppnode/common/buffer_util.hpp"
 #include "acppnode/common/error.hpp"
 #include "acppnode/proxy/inbound.hpp"
+#include "acppnode/app/session_group_executor.hpp"
 #include "acppnode/transport/link.hpp"
 #include "udp_client_session_key.hpp"
 #include "udp_resource_budget.hpp"
@@ -22,6 +23,7 @@ struct TargetAddress;
 struct StatsShard;
 struct TimeoutsConfig;
 
+namespace app { struct DatagramSessionEnvironment; }
 namespace routing {
 class Dispatcher;
 }
@@ -35,6 +37,35 @@ namespace acpp::worker_detail {
 
 class UdpAssociationReclaimer;
 struct UdpAssociationHook;
+struct UdpHandoffRecord;
+
+// Each encoded reply retains a lease until its actual listener send completes.
+class UdpReplyFence final {
+public:
+    explicit UdpReplyFence(net::io_context& io) : drained_(io, 1) {}
+    class Lease final {
+    public:
+        Lease() = default;
+        explicit Lease(std::shared_ptr<UdpReplyFence> fence) : fence_(std::move(fence)) {
+            if (fence_) ++fence_->pending_;
+        }
+        Lease(Lease&& other) noexcept : fence_(std::move(other.fence_)) {}
+        Lease& operator=(Lease&& other) noexcept {
+            if (this != &other) { Reset(); fence_ = std::move(other.fence_); }
+            return *this;
+        }
+        ~Lease() { Reset(); }
+        Lease(const Lease&) = delete;
+        Lease& operator=(const Lease&) = delete;
+    private:
+        void Reset() noexcept;
+        std::shared_ptr<UdpReplyFence> fence_;
+    };
+    net::awaitable<void> AsyncDrain();
+private:
+    size_t pending_ = 0;
+    SignalChannel drained_;
+};
 
 class UdpReplySink {
 public:
@@ -45,7 +76,8 @@ public:
         udp::socket* sock,
         udp::endpoint endpoint,
         buf::MultiBuffer payload,
-        uint32_t worker_id) = 0;
+        uint32_t worker_id,
+        std::shared_ptr<UdpReplyFence> fence = {}) = 0;
 };
 
 struct UdpDatagramContext {
@@ -55,11 +87,12 @@ struct UdpDatagramContext {
     std::span<const uint8_t> payload;
     const proxyman::inbound::ReceiverSettings* receiver = nullptr;
     net::io_context& io_context;
-    routing::Dispatcher& dispatcher;
+    routing::Dispatcher* dispatcher = nullptr;
     StatsShard& stats;
     const TimeoutsConfig& timeouts;
     uint32_t worker_id = 0;
     UdpReplySink& reply_sink;
+    const app::DatagramSessionEnvironment* environment = nullptr;
 };
 
 // Worker-private owner for native UDP sockets, client sessions and reply queues.
@@ -75,6 +108,7 @@ public:
         buf::MultiBuffer payload;
         size_t payload_size = 0;
         UdpResourceBudget::PayloadReservation reservation;
+        UdpReplyFence::Lease fence;
         ConstBufferSpanBuilder<buf::MultiBuffer::kInlineCapacity> send_buffers;
 
         void PrepareSendBuffers();
@@ -90,6 +124,7 @@ public:
         std::shared_ptr<::acpp::InboundDatagramResponse> response;
         UdpReplySink* sink = nullptr;
         uint32_t worker_id = 0;
+        std::shared_ptr<UdpReplyFence> fence;
 
         [[nodiscard]] bool Valid() const noexcept { return response && sink; }
         [[nodiscard]] bool Send(UDPPacketView packet, const udp::endpoint& endpoint);
@@ -135,7 +170,8 @@ public:
     [[nodiscard]] ReplyEnqueueResult EnqueueReply(
         std::string_view socket_key,
         udp::endpoint endpoint,
-        buf::MultiBuffer payload);
+        buf::MultiBuffer payload,
+        std::shared_ptr<UdpReplyFence> fence = {});
     // Hands the oldest queued datagram to the sender admitted by StartSend.
     [[nodiscard]] std::optional<PendingUdpReply> BeginReplySend(std::string_view socket_key);
     // Completes the active send and hands the next queued datagram to the same
@@ -179,13 +215,24 @@ private:
                             std::chrono::steady_clock::time_point now) noexcept;
     void RetireNativeJob(ClientSession& session) noexcept;
     static net::awaitable<void> RunNativeDispatch(ClientSessionPtr session);
+    static net::awaitable<void> RunNativeFlow(ClientSessionPtr session);
+    struct AuthenticatedPacket;
+    net::awaitable<void> ProcessAuthenticated(std::shared_ptr<AuthenticatedPacket> packet);
+    void ProcessDecoded(const UdpDatagramContext& datagram,
+        InboundDatagramResult decoded,
+        std::shared_ptr<UdpHandoffRecord> record = {},
+        std::shared_ptr<InboundDatagramResponse> response = {});
+    void RegisterNativeJob(const ClientSessionPtr& session);
+    void DetachNativeJob(ClientSession& session) noexcept;
+    void ReleaseControl() noexcept;
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
 
 class UdpIngress::ClientSession final
     : public transport::MultiBufferReader,
-      public transport::MultiBufferWriter {
+      public transport::MultiBufferWriter,
+      public ExecutionDomain::NativeResource {
 public:
     transport::CancellationSource& Cancellation() noexcept override;
 
@@ -216,6 +263,9 @@ public:
 private:
     friend class UdpIngress;
     void CloseWithError(ErrorCode error) noexcept;
+    net::awaitable<void> PrepareHandoff(const ExecutionDomain::HandoffTarget&) override;
+    void CommitHandoff(const ExecutionDomain::HandoffTarget&) noexcept override;
+    net::awaitable<void> CancelHandoff(const ExecutionDomain::HandoffTarget&) override;
 
     struct Impl;
     std::unique_ptr<Impl> impl_;

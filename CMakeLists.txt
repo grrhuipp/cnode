@@ -2096,7 +2096,27 @@ if(CNODE_BUILD_TESTS)
         NAME cnode_udp_socket_owner_test
         COMMAND cnode_udp_socket_owner_test)
 
-    foreach(test IN ITEMS udp_request ss_udp_request)
+    # Native associations now own the same session capabilities as TCP and
+    # QUIC. Instrument that real runtime under each fixture's allocator flags.
+    foreach(udp_domain_test IN ITEMS cnode_worker_udp_listener_oom_test
+            cnode_udp_association_reclaimer_test
+            cnode_udp_native_lifecycle_test cnode_udp_socket_owner_test)
+        get_target_property(udp_domain_sources ${udp_domain_test} SOURCES)
+        foreach(source IN LISTS CNODE_UDP_LISTENER_RUNTIME_SOURCES)
+            if(NOT source IN_LIST udp_domain_sources)
+                target_sources(${udp_domain_test} PRIVATE ${source})
+            endif()
+        endforeach()
+        foreach(property IN ITEMS INCLUDE_DIRECTORIES COMPILE_DEFINITIONS
+                LINK_LIBRARIES LINK_OPTIONS PRECOMPILE_HEADERS)
+            get_target_property(value cnode ${property})
+            if(value AND NOT value MATCHES "-NOTFOUND$")
+                set_property(TARGET ${udp_domain_test} APPEND PROPERTY ${property} "${value}")
+            endif()
+        endforeach()
+    endforeach()
+
+    foreach(test IN ITEMS udp_request ss_udp_request native_socket_handoff)
         add_executable(cnode_${test}_test
             tests/${test}_test.cpp
             src/transport/async_stream.cpp

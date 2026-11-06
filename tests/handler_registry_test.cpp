@@ -87,8 +87,7 @@ int Run() {
     Probe first_probe;
     Probe second_probe;
     OutboundConfiguration configuration({MakeConfig("direct", first_probe)});
-    HandlerLookup lookup(configuration, io, dns, std::chrono::seconds(1), tasks.Tasks(),
-                         HandlerLookup::StatefulTags::InstantiateLocally);
+    HandlerLookup lookup(configuration, io, dns, std::chrono::seconds(1), tasks.Tasks());
 
     // Lazy per-domain instantiation, memoized until the tag is republished.
     if (first_probe.created != 0) return 1;

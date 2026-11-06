@@ -2,6 +2,7 @@
 #include "../anytls_codec.hpp"
 #include "acppnode/app/dns/dns_worker.hpp"
 #include "acppnode/app/stats.hpp"
+#include "acppnode/app/session_group_executor.hpp"
 #include "acppnode/common/session.hpp"
 #include "acppnode/common/memory_stats.hpp"
 #include "acppnode/infra/runtime_config_types.hpp"
@@ -121,6 +122,7 @@ constexpr std::string_view kPaddingB = "stop=8\n0=91-91\n1=320-320\n2=80-80\n";
 
 struct Wire {
     explicit Wire(net::io_context& io) : wake(io), open_gate(io) {}
+    std::shared_ptr<ExecutionDomain> domain = ExecutionDomain::Current();
     net::steady_timer wake;
     net::steady_timer open_gate;
     std::vector<uint8_t> input;
@@ -1145,6 +1147,115 @@ bool RunPoolLifecycle(bool join_before_retirement) {
     dialed.clear();
     return passed;
 }
+
+bool RunDomainPoolIsolation() {
+    struct Hooks final : ExecutionDomain::Hooks {
+        void Enter() noexcept override {}
+        void Leave() noexcept override {}
+        void OnFailure(std::exception_ptr) noexcept override { std::terminate(); }
+    };
+    net::io_context io;
+    auto coordinator = std::make_shared<GroupCoordinator>(io, 2);
+    auto make_domain = [&] {
+        return ExecutionDomain::Create(io, 0, io.get_executor(),
+            std::make_shared<Hooks>(), coordinator);
+    };
+    auto host = make_domain(), first = make_domain(), second = make_domain();
+    app::dns::Config dns_config;
+    dns_config.servers = {{net::ip::address_v4::loopback(), 1}};
+    app::dns::DNSWorker dns_worker(io, dns_config, 8);
+    app::dns::DNS dns(dns_worker);
+    TestDialer outbound(io, dns);
+    auto tasks = std::make_unique<ResidentTaskGroup>(host->Executor());
+    std::unique_ptr<proxy::anytls::outbound::Handler> handler;
+    host->Execute([&] {
+        proxy::anytls::outbound::Settings settings;
+        settings.server = LoopbackServer();
+        settings.idle_session_check_interval = 60s;
+        settings.idle_session_timeout = 60s;
+        handler = std::make_unique<proxy::anytls::outbound::Handler>("isolation", io,
+            std::make_shared<const proxy::anytls::outbound::Settings>(settings), tasks->Tasks());
+    });
+    io.run_for(30ms);
+    OpenOrderScenario scenario{.mode = 0, .before_write_completion = false};
+    open_order_scenario = &scenario;
+    fail_first_session = respond_on_auth = client_padding_probe = false;
+    io_fault_mode = io_fault_kind = 0;
+    dialed.clear();
+    std::array<Client, 4> clients;
+    std::array<session::Context, 4> contexts;
+    std::array<bool, 4> done{};
+    auto request = [&](size_t index) -> net::awaitable<OutboundProcessResult> {
+        contexts[index].outbound.target = TargetAddress("192.0.2.1", 443);
+        contexts[index].content.network = Network::TCP;
+        StatsShard stats;
+        TimeoutsConfig timeouts;
+        RelayConfig relay;
+        relay.uplink_only = relay.downlink_only = 5s;
+        co_return co_await handler->Process(contexts[index],
+            {&clients[index], &clients[index], nullptr}, outbound.dialer,
+            timeouts, stats, relay, {}, 10s, 10s);
+    };
+    auto start = [&](const std::shared_ptr<ExecutionDomain>& owner, size_t index) {
+        net::co_spawn(owner->Executor(), request(index),
+            [&, index](std::exception_ptr error, OutboundProcessResult result) {
+                done[index] = !error && result && result->error == ErrorCode::OK &&
+                    clients[index].received == 5;
+            });
+        io.restart();
+        io.run_for(100ms);
+    };
+    start(first, 0);
+    if (!done[0] || dialed.size() != 1 || !dialed[0]->domain)
+        throw std::runtime_error("domain pool warmup did not create one independent session");
+    bool passed = done[0] && dialed.size() == 1 && dialed[0]->domain &&
+        !dialed[0]->domain->SharesGroup(*first);
+    start(second, 1);
+    passed &= !done[1] && dialed.size() == 1 &&
+        dialed[0]->domain->SharesGroup(*second) &&
+        !host->SharesGroup(*second) && !first->SharesGroup(*second);
+    start(first, 2);
+    passed &= done[2] && dialed.size() == 2 &&
+        !dialed[1]->domain->SharesGroup(*second) &&
+        dialed[0]->domain->SharesGroup(*second);
+    if (!dialed.empty()) {
+        auto wire = dialed.front();
+        wire->domain->Execute([wire] { wire->DeliverOpenResult(); });
+    }
+    io.restart();
+    io.run_for(100ms);
+    passed &= done[1] && !dialed[0]->domain->SharesGroup(*second);
+    start(first, 3);
+    passed &= done[3] && dialed.size() == 2 &&
+        !host->SharesGroup(*first) && !first->SharesGroup(*second);
+    bool joined = false;
+    net::co_spawn(host->Executor(), [&]() -> net::awaitable<void> {
+        handler.reset();
+        co_await tasks->AsyncJoin();
+    }, [&](std::exception_ptr error) { joined = !error; });
+    io.restart();
+    io.run_for(250ms);
+    passed &= joined;
+    for (const auto& wire : dialed)
+        passed &= wire->closed && wire->destroyed && wire->active_reads == 0;
+    dialed.clear();
+    open_order_scenario = nullptr;
+    tasks.reset();
+    first.reset(); second.reset(); host.reset();
+    coordinator->CloseAdmission();
+    bool finalized = false;
+    net::co_spawn(io, [&]() -> net::awaitable<void> {
+        co_await coordinator->AsyncJoin();
+        coordinator->ReleaseServices();
+        co_await coordinator->Finalize();
+    }, [&](std::exception_ptr error) { finalized = !error; });
+    io.restart();
+    io.run_for(250ms);
+    passed &= finalized;
+    std::printf("domain-pool-isolation reusable=%d finalized=%d: %s\n",
+        done[3], finalized, passed ? "PASS" : "FAIL");
+    return passed;
+}
 }
 
 int main(int argc, char** argv) {
@@ -1176,6 +1287,7 @@ int main(int argc, char** argv) {
         for (int mode = 0; mode < 4; ++mode) passed &= Run(mode);
         passed &= RunPoolLifecycle(false);
         passed &= RunPoolLifecycle(true);
+        passed &= RunDomainPoolIsolation();
         for (int mode = 1; mode <= 5; ++mode)
             for (int kind = 1; kind <= 3; ++kind) passed &= RunIoFault(mode, kind);
         for (int mode = 0; mode <= 7; ++mode) passed &= RunQueue(mode);

@@ -2,6 +2,7 @@
 #include "acppnode/common/ip_address.hpp"
 
 #include "acppnode/app/request_load_state.hpp"
+#include "acppnode/app/session_group_executor.hpp"
 
 #include "acppnode/app/rate_limiter.hpp"
 #include "acppnode/app/stats.hpp"
@@ -172,8 +173,10 @@ public:
         session::Context ctx;
         ctx.InitSubstreamFrom(base_ctx_);
         ApplyHttpRealIp(ctx, metadata.real_ip);
+        const auto domain = ExecutionDomain::Current();
+        auto& reactor = domain ? domain->Reactor() : io_context_;
         co_await handler_->ProcessPreparedTransportStream(
-            io_context_, dispatcher_, stats_, request_load_, timeouts_,
+            reactor, dispatcher_, stats_, request_load_, timeouts_,
             std::move(stream), ctx, family_);
     }
 

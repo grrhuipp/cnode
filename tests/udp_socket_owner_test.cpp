@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <array>
+#include <barrier>
 #include <chrono>
 #include <cstring>
 #include <cstdlib>
@@ -22,6 +23,7 @@
 #include <memory>
 #include <memory_resource>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -73,7 +75,7 @@ public:
         if (!script_) return tl::unexpected(acpp::ErrorCode::PROTOCOL_AUTH_FAILED);
         acpp::InboundDatagramResult result;
         result.user = &profile_;
-        result.tracker = &tracker_;
+        result.tracker = tracker_;
         result.session_owner = script_->owner;
         result.session_id = script_->session_id;
         result.target = script_->target;
@@ -92,7 +94,7 @@ private:
     std::shared_ptr<int> adopted_state_;
     DatagramScript* script_ = nullptr;
     int worker_state_ = 73;
-    acpp::UserOnlineTracker tracker_;
+    std::shared_ptr<acpp::UserOnlineTracker> tracker_ = std::make_shared<acpp::UserOnlineTracker>();
     acpp::UserProfile profile_;
 };
 
@@ -156,7 +158,8 @@ public:
 
 struct RecordingReplySink final : acpp::worker_detail::UdpReplySink {
     bool EnqueueUdpReply(std::string_view, acpp::udp::socket*, acpp::udp::endpoint peer,
-                         acpp::buf::MultiBuffer payload, uint32_t) override {
+                         acpp::buf::MultiBuffer payload, uint32_t,
+                         std::shared_ptr<acpp::worker_detail::UdpReplyFence> = {}) override {
         ++calls;
         endpoint = peer;
         bytes.clear();
@@ -201,6 +204,82 @@ static_assert(noexcept(
 [[noreturn]] void Fail(std::string_view message) {
     std::cerr << message << '\n';
     std::exit(1);
+}
+
+void VerifyMigratedBudgetReservations() {
+    using Budget = acpp::worker_detail::UdpResourceBudget;
+    constexpr size_t kMigrating = 128;
+    Budget source({
+        .associations = kMigrating + 1, .datagrams = kMigrating + 1,
+        .payload_capacity = (kMigrating + 1) * acpp::buf::Buffer::kSize});
+    Budget target({
+        .associations = 1, .datagrams = 1,
+        .payload_capacity = acpp::buf::Buffer::kSize});
+    acpp::buf::MultiBuffer payload;
+    const std::array<uint8_t, 1> bytes{0x73};
+    if (!acpp::buf::AppendSpanToMultiBuffer(bytes, payload))
+        Fail("failed to prepare migrated reservation payload");
+    std::array<Budget::AssociationLease, kMigrating> associations;
+    std::array<Budget::PayloadReservation, kMigrating> reservations;
+    for (size_t i = 0; i < kMigrating; ++i) {
+        associations[i] = source.AcquireAssociation();
+        reservations[i] = source.ReservePayload(payload);
+        if (!associations[i] || !reservations[i])
+            Fail("failed to reserve migration source resources");
+    }
+    {
+        auto last_association = source.AcquireAssociation();
+        auto last_payload = source.ReservePayload(payload);
+        if (!last_association || !last_payload ||
+            source.AcquireAssociation() || source.ReservePayload(payload))
+            Fail("migration source budget did not enforce its exact limits");
+    }
+    std::barrier start(2);
+    std::thread receiver(
+        [&, associations = std::move(associations),
+         reservations = std::move(reservations)]() mutable {
+            auto target_association = target.AcquireAssociation();
+            auto target_payload = target.ReservePayload(payload);
+            if (!target_association || !target_payload)
+                Fail("failed to reserve receiving Worker resources");
+            start.arrive_and_wait();
+            // Only leases cross threads; the payload remains owned by this test.
+            // Concurrent source admission must not race these migrated releases.
+            for (size_t i = 0; i < kMigrating; ++i) {
+                associations[i] = {};
+                reservations[i] = {};
+            }
+            const auto usage = target.GetUsage();
+            if (usage.associations != 1 || usage.datagrams != 1 ||
+                usage.payload_capacity != acpp::buf::Buffer::kSize)
+                Fail("migrated release was charged to the receiving Worker");
+        });
+    start.arrive_and_wait();
+    for (size_t i = 0; i < 4096; ++i) {
+        auto association = source.AcquireAssociation();
+        auto reservation = source.ReservePayload(payload);
+        if (!association || !reservation)
+            Fail("migrated release lost source Worker admission capacity");
+        const auto usage = source.GetUsage();
+        if (usage.associations > kMigrating + 1 ||
+            usage.datagrams > kMigrating + 1 ||
+            usage.payload_capacity > (kMigrating + 1) * acpp::buf::Buffer::kSize)
+            Fail("concurrent migrated release underflowed the source budget");
+    }
+    receiver.join();
+    for (size_t i = 0; i < kMigrating; ++i) {
+        if (associations[i] || reservations[i])
+            Fail("moved migration reservation retained source ownership");
+    }
+    for (auto* budget : {&source, &target}) {
+        const auto usage = budget->GetUsage();
+        if (usage.associations || usage.datagrams || usage.payload_capacity)
+            Fail("cross-Worker reservation destruction leaked resource accounting");
+        auto association = budget->AcquireAssociation();
+        auto reservation = budget->ReservePayload(payload);
+        if (!association || !reservation)
+            Fail("cross-Worker release did not restore admission");
+    }
 }
 
 void VerifyWorkerBudget() {
@@ -343,6 +422,7 @@ void VerifyWorkerBudget() {
 int main() {
     ThreadResourceScope thread_resource;
     VerifyWorkerBudget();
+    VerifyMigratedBudgetReservations();
     if (std::pmr::get_default_resource() != &thread_resource.resource) {
         Fail("UDP PMR test resource was not installed");
     }
@@ -605,7 +685,7 @@ int main() {
             .payload = datagram,
             .receiver = &uplink_receiver,
             .io_context = io_context,
-            .dispatcher = uplink_dispatcher,
+            .dispatcher = &uplink_dispatcher,
             .stats = uplink_stats,
             .timeouts = uplink_timeouts,
             .worker_id = 0,

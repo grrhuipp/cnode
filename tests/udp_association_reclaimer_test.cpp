@@ -126,7 +126,11 @@ public:
 class AcceptedReplySink final : public acpp::worker_detail::UdpReplySink {
 public:
     bool EnqueueUdpReply(std::string_view, acpp::udp::socket*, acpp::udp::endpoint,
-                         acpp::buf::MultiBuffer, uint32_t) override { ++packets; return true; }
+                         acpp::buf::MultiBuffer, uint32_t,
+                         std::shared_ptr<acpp::worker_detail::UdpReplyFence> = {}) override {
+        ++packets;
+        return true;
+    }
     size_t packets = 0;
 };
 
@@ -138,7 +142,7 @@ public:
         const acpp::InboundDatagramRequest& request) override {
         acpp::InboundDatagramResult result;
         result.user = &profile_;
-        result.tracker = &tracker_;
+        result.tracker = tracker_;
         const std::array<uint8_t, 1> owner{0x71};
         if (!result.session_owner.Assign(owner)) {
             return tl::unexpected(acpp::ErrorCode::RESOURCE_EXHAUSTED);
@@ -158,7 +162,7 @@ public:
         return std::make_shared<DatagramResponse>();
     }
 private:
-    acpp::UserOnlineTracker tracker_;
+    std::shared_ptr<acpp::UserOnlineTracker> tracker_ = std::make_shared<acpp::UserOnlineTracker>();
     acpp::UserProfile profile_;
 };
 
@@ -195,7 +199,8 @@ class DiscardReplySink final : public acpp::worker_detail::UdpReplySink {
 public:
     bool EnqueueUdpReply(std::string_view, acpp::udp::socket*,
                          acpp::udp::endpoint, acpp::buf::MultiBuffer,
-                         uint32_t) override {
+                         uint32_t,
+                         std::shared_ptr<acpp::worker_detail::UdpReplyFence> = {}) override {
         return false;
     }
 };
@@ -220,7 +225,7 @@ struct DatagramSource {
             .payload = packet,
             .receiver = &receiver,
             .io_context = io,
-            .dispatcher = dispatcher,
+            .dispatcher = &dispatcher,
             .stats = stats,
             .timeouts = timeouts,
             .reply_sink = reply_sink,

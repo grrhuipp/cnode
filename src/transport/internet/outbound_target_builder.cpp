@@ -4,6 +4,7 @@
 #include "acppnode/transport/internet/http_headers.hpp"
 
 #include "acppnode/app/dns/dns.hpp"
+#include "acppnode/app/session_group_executor.hpp"
 #include "acppnode/common/ip_utils.hpp"
 #include "acppnode/core/constants.hpp"
 #include "acppnode/common/session.hpp"
@@ -287,6 +288,11 @@ OutboundDialer::OutboundDialer(net::io_context& io_context,
     , security_(sender.stream_settings, StreamEndpointRole::Outbound)
     , timeout_(timeout) {}
 
+net::io_context& OutboundDialer::IoContext() const noexcept {
+    const auto domain = ExecutionDomain::Current();
+    return domain ? domain->Reactor() : io_context_;
+}
+
 std::optional<OutboundDialer::OrderedBind> OutboundDialer::SelectOrderedBind(
     const session::Context& ctx) const {
     const auto& bind = sender_.send_through;
@@ -365,7 +371,7 @@ OutboundDialer::Dial(session::Context& ctx,
 
 net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, ErrorCode>>
 OutboundDialer::DialTarget(session::Context& ctx, const OutboundTransportTarget& target) {
-    auto dialed = co_await DialOutboundTransport(io_context_, ctx, target);
+    auto dialed = co_await DialOutboundTransport(IoContext(), ctx, target);
     if (!dialed.Ok()) {
         ctx.outbound.connected_local_addr.reset();
         // The dispatcher reports every non-cancellation failure once.

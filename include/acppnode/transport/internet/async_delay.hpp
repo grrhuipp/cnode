@@ -1,6 +1,7 @@
 #pragma once
 
 #include "acppnode/common/asio_types.hpp"
+#include "acppnode/app/session_group_executor.hpp"
 #include "acppnode/transport/internet/timeout_scheduler.hpp"
 
 #include <asio/as_tuple.hpp>
@@ -9,7 +10,6 @@
 #include <asio/this_coro.hpp>
 #include <asio/use_awaitable.hpp>
 
-#include <algorithm>
 #include <chrono>
 #include <stdexcept>
 
@@ -20,7 +20,9 @@ namespace acpp {
 class AsyncDelay final : private TimeoutEvent {
 public:
     explicit AsyncDelay(net::io_context& io_context)
-        : scheduler_(TimeoutScheduler::ForIoContext(io_context)), wake_(io_context, 0) {}
+        : TimeoutEvent(io_context),
+          wake_(ExecutionDomain::Current() ? ExecutionDomain::Current()->Executor()
+              : net::any_io_executor(io_context.get_executor()), 0) {}
     AsyncDelay(const AsyncDelay&) = delete;
     AsyncDelay& operator=(const AsyncDelay&) = delete;
 
@@ -34,13 +36,9 @@ public:
         auto slot = cancellation.slot();
         waiting_ = true;
         try {
-            // A finite far-future deadline reserves the scheduler's physical
-            // wait even for an effectively infinite delay. Cancel then only
-            // changes an existing heap entry and cancels that physical wait.
-            using Clock = std::chrono::steady_clock;
-            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-                Clock::time_point::max() - Clock::now()) - std::chrono::milliseconds(1);
-            if (!scheduler_.ScheduleAfter(std::min(delay, remaining), *this))
+            // The scheduler keeps a cancellable native wait even when this
+            // duration saturates to the clock's maximum time point.
+            if (!ScheduleAfter(delay))
                 throw IoSystemError(io_error::operation_aborted);
             if (slot.is_connected()) slot.assign([this](net::cancellation_type_t) { Cancel(); });
             const auto [ec] = co_await wake_.async_receive(net::bind_cancellation_slot(
@@ -58,15 +56,22 @@ public:
     }
 
     void Cancel() noexcept {
-        if (waiting_ && Valid())
-            (void)scheduler_.ScheduleAfter(std::chrono::milliseconds::zero(), *this);
+        if (!waiting_) return;
+        try {
+            if (Valid() && ScheduleAfter(std::chrono::milliseconds::zero())) return;
+        } catch (...) {
+            TimeoutEvent::Cancel();
+        }
+        // Domain failure/release can already have detached the event. The
+        // waiter still needs its cancellation wakeup; its receive deliberately
+        // does not use the parent's cancellation slot.
+        (void)wake_.try_send_via_dispatch(IoErrorCode{});
     }
 
 private:
-    // Runs on the scheduler's executor. Dispatch completes the existing waiter
-    // directly; channel.cancel/post would allocate another completion node.
+    // Runs under the event's domain lease (or its fixed Worker for a control
+    // delay). Dispatch completes the existing waiter without a completion node.
     void OnTimeout() override { (void)wake_.try_send_via_dispatch(IoErrorCode{}); }
-    TimeoutScheduler& scheduler_;
     SignalChannel wake_;
     bool waiting_ = false;
 };

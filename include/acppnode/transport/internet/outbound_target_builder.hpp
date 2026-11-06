@@ -91,7 +91,8 @@ public:
     OutboundDialer(const OutboundDialer&) = delete;
     OutboundDialer& operator=(const OutboundDialer&) = delete;
 
-    [[nodiscard]] net::io_context& IoContext() const noexcept { return io_context_; }
+    // Resolve at use time: io_context_ is only the non-domain fallback.
+    [[nodiscard]] net::io_context& IoContext() const noexcept;
     [[nodiscard]] app::dns::DNS& Dns() const noexcept { return dns_; }
 
     // Empty unless sendThrough is Ordered.
@@ -117,7 +118,7 @@ public:
         auto bind = SelectDatagramBind(ctx, remote);
         if (!bind) return tl::unexpected(bind.error());
         try {
-            endpoint.emplace(io_context_, dns_, *bind, std::forward<Args>(args)...);
+            endpoint.emplace(IoContext(), dns_, *bind, std::forward<Args>(args)...);
         } catch (const transport::LinkError& error) {
             ReportDatagramFailure(ctx, *bind, error.what());
             return tl::unexpected(error.code());

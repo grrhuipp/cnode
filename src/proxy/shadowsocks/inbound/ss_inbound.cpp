@@ -301,7 +301,7 @@ proxy::shadowsocks::inbound::Handler::Process(
     auto decoded = ss::DecodeUdpPacket(
         request.payload.data(), request.payload.size(), users,
         cipher_info_.type, cipher_info_.key_size, cipher_info_.salt_size,
-        udp_replay_cache_);
+        udp_replay_cache_, request.deferred_replay);
     if (!decoded) {
         // UDP datagrams use the socket peer address, never a PROXY protocol source.
         return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
@@ -316,9 +316,9 @@ proxy::shadowsocks::inbound::Handler::Process(
     result.target = std::move(decoded->target);
     result.payload = std::move(decoded->payload);
     result.session_id = decoded->session_id;
-    // The Worker's user view keeps the profile alive through the handoff.
-    result.user = &user.profile;
-    result.tracker = &validator_;
+    result.packet_id = decoded->packet_id;
+    result.user_owner = std::shared_ptr<const UserProfile>(users.users, &user.profile);
+    result.user = result.user_owner.get();
     result.limiter = limiter_;
     return result;
 }

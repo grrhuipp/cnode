@@ -127,12 +127,12 @@ struct Runtime final : acpp::proxyman::inbound::ProtocolRuntime {
     std::vector<acpp::OnlineDevice> GetOnlineDevices(std::string_view) const override {
         return {};
     }
-    acpp::UserOnlineTracker tracker;
+    std::shared_ptr<acpp::UserOnlineTracker> tracker = std::make_shared<acpp::UserOnlineTracker>();
 };
 
 class NativeDecoder final : public acpp::Inbound {
 public:
-    NativeDecoder(FixtureState& state, acpp::UserOnlineTracker& tracker,
+    NativeDecoder(FixtureState& state, std::shared_ptr<acpp::UserOnlineTracker> tracker,
                   acpp::ConnectionLimiter* limiter)
         : state_(state), tracker_(tracker), limiter_(limiter) {
         ++state_.handlers_created;
@@ -162,7 +162,7 @@ public:
         const std::array<uint8_t, 8> owner{0x44, 0x4e, 0x53, 0x2d, 0x6f, 0x77, 0x6e, 0x72};
         if (!decoded.session_owner.Assign(owner)) throw std::bad_alloc();
         decoded.user = &profile_;
-        decoded.tracker = &tracker_;
+        decoded.tracker = tracker_;
         decoded.limiter = limiter_;
         auto* first = acpp::buf::Buffer::New();
         if (!first) throw std::bad_alloc();
@@ -178,7 +178,7 @@ public:
     }
 private:
     FixtureState& state_;
-    acpp::UserOnlineTracker& tracker_;
+    std::shared_ptr<acpp::UserOnlineTracker> tracker_;
     acpp::ConnectionLimiter* limiter_;
     acpp::UserProfile profile_;
 };

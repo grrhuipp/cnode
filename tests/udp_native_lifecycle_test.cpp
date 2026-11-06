@@ -2,6 +2,7 @@
 #include "udp_native_lifecycle_allocation.hpp"
 #include "worker/udp_association_reclaimer.hpp"
 #include "worker/udp_ingress.hpp"
+#include "worker/udp_handoff_directory.hpp"
 
 #include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
 #include "acppnode/app/stats.hpp"
@@ -87,7 +88,7 @@ public:
         const acpp::InboundDatagramRequest& request) override {
         acpp::InboundDatagramResult result;
         result.user = &profile_;
-        result.tracker = &tracker_;
+        result.tracker = tracker_;
         constexpr std::array<uint8_t, 1> owner{0x47};
         if (!result.session_owner.Assign(owner))
             return tl::unexpected(acpp::ErrorCode::RESOURCE_EXHAUSTED);
@@ -113,7 +114,7 @@ public:
 private:
     LongMetadataFaultResource* fault_ = nullptr;
     bool fault_injected_ = false;
-    acpp::UserOnlineTracker tracker_;
+    std::shared_ptr<acpp::UserOnlineTracker> tracker_ = std::make_shared<acpp::UserOnlineTracker>();
     acpp::UserProfile profile_;
 };
 
@@ -189,7 +190,10 @@ class ReplySink final : public acpp::worker_detail::UdpReplySink {
 public:
     bool EnqueueUdpReply(std::string_view, acpp::udp::socket*,
                          acpp::udp::endpoint, acpp::buf::MultiBuffer,
-                         uint32_t) override { return true; }
+                         uint32_t,
+                         std::shared_ptr<acpp::worker_detail::UdpReplyFence> = {}) override {
+        return true;
+    }
 };
 
 acpp::net::awaitable<void> ObserveJoin(Ingress& ingress, bool& returned) {
@@ -284,7 +288,7 @@ void VerifyPreparationOom(acpp::net::io_context& io, Reclaimer& reclaimer) {
             .payload = packet,
             .receiver = &receiver,
             .io_context = io,
-            .dispatcher = dispatcher,
+            .dispatcher = &dispatcher,
             .stats = stats,
             .timeouts = timeouts,
             .worker_id = 5,
@@ -333,7 +337,7 @@ void VerifyPreparationOom(acpp::net::io_context& io, Reclaimer& reclaimer) {
                 .payload = packet,
                 .receiver = &receiver,
                 .io_context = io,
-                .dispatcher = dispatcher,
+                .dispatcher = &dispatcher,
                 .stats = stats,
                 .timeouts = timeouts,
                 .worker_id = 5,
@@ -385,7 +389,7 @@ void VerifyPreparationOom(acpp::net::io_context& io, Reclaimer& reclaimer) {
         .payload = packet,
         .receiver = &receiver,
         .io_context = io,
-        .dispatcher = dispatcher,
+        .dispatcher = &dispatcher,
         .stats = stats,
         .timeouts = timeouts,
         .worker_id = 5,
@@ -433,7 +437,7 @@ void VerifySocketIdentityRecycle(
             .payload = packet,
             .receiver = &receiver,
             .io_context = io,
-            .dispatcher = dispatcher,
+            .dispatcher = &dispatcher,
             .stats = stats,
             .timeouts = timeouts,
             .worker_id = 6,
@@ -528,7 +532,7 @@ void VerifyUplinkRefresh(acpp::net::io_context& io, Reclaimer& reclaimer) {
             .payload = packet,
             .receiver = &receiver,
             .io_context = io,
-            .dispatcher = dispatcher,
+            .dispatcher = &dispatcher,
             .stats = stats,
             .timeouts = timeouts,
             .worker_id = 4,
@@ -567,6 +571,215 @@ void VerifyUplinkRefresh(acpp::net::io_context& io, Reclaimer& reclaimer) {
         Fail("idle-expired native dispatch did not join at actual completion");
 }
 
+void VerifyHandoffDirectoryNamespaces() {
+    using namespace acpp::worker_detail;
+    acpp::net::io_context coordinator;
+    auto& directory = acpp::net::use_service<UdpHandoffDirectory>(coordinator);
+    auto configuration = std::make_shared<int>(1);
+    auto other_configuration = std::make_shared<int>(1);
+    acpp::InboundDatagramOwner owner;
+    std::array<uint8_t, 32> credential{};
+    for (size_t i = 0; i < credential.size(); ++i)
+        credential[i] = static_cast<uint8_t>(i + 1);
+    if (!owner.Assign(credential)) Fail("failed to prepare directory credential");
+    UdpHandoffIdentity key{
+        .listener = "listener", .tag = "inbound", .configuration = configuration.get(),
+        .client = ClientSessionKey{owner, 0x00123456789abcdeULL}};
+    const acpp::udp::endpoint endpoint{acpp::net::ip::address_v4::loopback(), 48234};
+    auto record = directory.Claim(key, configuration);
+    if (!record || !record->claimed.load(std::memory_order_acquire) ||
+        directory.Claim(key, configuration) || !record->Accept(7, 0, endpoint))
+        Fail("directory allowed duplicate ownership claims");
+    record->claimed.store(false, std::memory_order_release);
+    auto reclaimed = directory.Claim(key, configuration);
+    if (reclaimed != record || reclaimed->Accept(7, 0, endpoint) ||
+        directory.Claim(key, configuration))
+        Fail("directory claim lost unique ownership or committed replay");
+    record->claimed.store(false, std::memory_order_release);
+
+    const auto expect_isolated = [&](const UdpHandoffIdentity& identity,
+                                     std::shared_ptr<const void> snapshot) {
+        auto isolated = directory.Claim(identity, snapshot);
+        if (!isolated || isolated == record || !isolated->Accept(7, 1, endpoint) ||
+            directory.Claim(identity, snapshot))
+            Fail("directory merged distinct authenticated namespaces");
+        isolated->claimed.store(false, std::memory_order_release);
+        auto repeated = directory.Claim(identity, snapshot);
+        if (repeated != isolated || repeated->Accept(7, 1, endpoint) ||
+            !repeated->Accept(6, 1, endpoint) || repeated->Accept(5, 0, endpoint))
+            Fail("directory failed to retain isolated namespace replay");
+        repeated->claimed.store(false, std::memory_order_release);
+    };
+    for (size_t i = 0; i < credential.size(); ++i) {
+        auto distinct = key;
+        distinct.client.owner.bytes[i] ^= 0x80;
+        expect_isolated(distinct, configuration);
+    }
+    auto shorter = key;
+    shorter.client.owner.size = 16;
+    expect_isolated(shorter, configuration);
+    auto session = key;
+    session.client.session_id = *key.client.session_id + 1;
+    expect_isolated(session, configuration);
+    auto listener = key;
+    listener.listener += "-other";
+    expect_isolated(listener, configuration);
+    auto tag = key;
+    tag.tag += "-other";
+    expect_isolated(tag, configuration);
+    auto settings = key;
+    settings.configuration = other_configuration.get();
+    expect_isolated(settings, other_configuration);
+}
+
+void VerifyHandoffPathFreshness() {
+    using namespace acpp::worker_detail;
+    const acpp::udp::endpoint first{acpp::net::ip::address_v4::loopback(), 48234};
+    const acpp::udp::endpoint second{acpp::net::ip::address_v4::loopback(), 48235};
+    UdpHandoffRecord record;
+    if (!record.Accept(10, 0, first) || !record.Accept(12, 0, second) ||
+        record.CanAcceptPath(11, 0, first) || record.Accept(11, 0, first) ||
+        !record.Accept(11, 0, second) || record.Accept(11, 0, second))
+        Fail("same-Worker path freshness rejected reordering or admitted a stale endpoint");
+    if (!record.Accept(14, 1, first) || record.CanAcceptPath(13, 0, second) ||
+        record.Accept(13, 0, second) || !record.Accept(13, 1, first) ||
+        record.Accept(13, 1, first))
+        Fail("cross-Worker path freshness lost single replay commit or allowed rollback");
+    // A newer packet on the current path advances the path watermark too.
+    // Receiving an older in-window packet must not lower that watermark.
+    if (!record.Accept(17, 1, first) || !record.Accept(15, 1, first) ||
+        record.CanAcceptPath(16, 1, second) || record.Accept(16, 1, second) ||
+        record.CanAcceptPath(16, 0, first) || record.Accept(16, 0, first) ||
+        !record.Accept(16, 1, first) || !record.Accept(18, 0, second) ||
+        !record.Accept(20, 2, first) || record.Accept(19, 0, second) ||
+        !record.Accept(19, 2, first))
+        Fail("repeated path changes regressed the freshness watermark");
+    UdpHandoffRecord zero;
+    if (!zero.Accept(0, 0, first) || zero.Accept(0, 1, second) ||
+        !zero.Accept(1, 1, second))
+        Fail("zero packet ID bypassed path freshness or replay protection");
+}
+
+void VerifyHandoffDirectoryTombstone(acpp::net::io_context& io, Reclaimer& reclaimer) {
+    using namespace acpp::worker_detail;
+    acpp::net::io_context coordinator;
+    auto& directory = acpp::net::use_service<UdpHandoffDirectory>(coordinator);
+    auto configuration = std::make_shared<int>(1);
+    std::weak_ptr<const void> configuration_lifetime = configuration;
+    acpp::InboundDatagramOwner owner;
+    constexpr std::array<uint8_t, 32> credential{0x71};
+    if (!owner.Assign(credential)) Fail("failed to prepare tombstone credential");
+    UdpHandoffIdentity key{
+        .listener = "closed-listener", .tag = "closed-inbound",
+        .configuration = configuration.get(), .client = ClientSessionKey{owner, 9}};
+    UdpResourceBudget budget;
+    const acpp::udp::endpoint endpoint{acpp::net::ip::address_v4::loopback(), 48234};
+    Ingress ingress("directory-tombstone", std::make_unique<NativeInbound>(),
+                    reclaimer, budget, io);
+    auto session = ingress.CreateClientSession(
+        key.listener, key.client, io, {},
+        {acpp::net::ip::address_v4::loopback(), 48234},
+        owner, std::chrono::steady_clock::now(), 0s);
+    auto record = directory.Claim(key, configuration);
+    if (!session || !record || !record->Accept(31, 0, endpoint))
+        Fail("failed to prepare live directory association");
+    record->session = session;
+    record->claimed.store(false, std::memory_order_release);
+    ingress.CleanupClientSessions(key.listener);
+    if (!session->Closed() || record->session.expired())
+        Fail("closed association did not retain its outstanding session owner");
+    session.reset();
+    if (!record->session.expired() || budget.GetUsage().associations != 0)
+        Fail("directory kept a closed association alive");
+    const std::weak_ptr<UdpHandoffRecord> tombstone = record;
+    record.reset();
+    configuration.reset();
+    if (tombstone.expired() || configuration_lifetime.expired())
+        Fail("directory discarded its replay tombstone or settings snapshot");
+    auto resumed = directory.Claim(key, configuration_lifetime.lock());
+    if (!resumed || resumed != tombstone.lock() || resumed->Accept(31, 0, endpoint) ||
+        resumed->Accept(30, 1, endpoint) || !resumed->Accept(32, 1, endpoint) ||
+        resumed->Accept(30, 0, endpoint) || !resumed->Accept(30, 1, endpoint))
+        Fail("association closure reopened a protected replay window");
+    resumed->claimed.store(false, std::memory_order_release);
+    ingress.RequestStop();
+}
+
+void VerifyHandoffDirectoryCapacity() {
+    using namespace acpp::worker_detail;
+    acpp::net::io_context coordinator;
+    auto& directory = acpp::net::use_service<UdpHandoffDirectory>(coordinator);
+    auto configuration = std::make_shared<int>(1);
+    acpp::InboundDatagramOwner owner;
+    constexpr std::array<uint8_t, 32> credential{0x63};
+    if (!owner.Assign(credential)) Fail("failed to prepare capacity credential");
+    UdpHandoffIdentity key{
+        .listener = "capacity-listener", .tag = "capacity-inbound",
+        .configuration = configuration.get(), .client = ClientSessionKey{owner, 0}};
+    const acpp::udp::endpoint endpoint{acpp::net::ip::address_v4::loopback(), 48234};
+    std::shared_ptr<UdpHandoffRecord> first;
+    for (size_t i = 0; i < acpp::ss::Ss2022UdpReplayCache::kMaxSessions; ++i) {
+        key.client.session_id = i;
+        auto record = directory.Claim(key, configuration);
+        if (!record || !record->Accept(11, 0, endpoint))
+            Fail("directory rejected a session before reaching capacity");
+        record->claimed.store(false, std::memory_order_release);
+        if (i == 0) first = std::move(record);
+    }
+    key.client.session_id = acpp::ss::Ss2022UdpReplayCache::kMaxSessions;
+    if (directory.Claim(key, configuration))
+        Fail("full directory evicted an unexpired closed-session replay tombstone");
+    auto protected_key = key;
+    protected_key.client.session_id = 0;
+    auto protected_record = directory.Claim(protected_key, configuration);
+    if (protected_record != first || protected_record->Accept(11, 0, endpoint))
+        Fail("capacity rejection lost an existing session or its replay history");
+    const auto expired = std::chrono::steady_clock::now() -
+        acpp::ss::Ss2022UdpReplayCache::kRetention - 1s;
+    first->last_seen.store(expired.time_since_epoch().count(), std::memory_order_relaxed);
+    if (directory.Claim(key, configuration))
+        Fail("directory reclaimed a still-claimed expired tombstone");
+    first->claimed.store(false, std::memory_order_release);
+    auto replacement = directory.Claim(key, configuration);
+    if (!replacement || replacement == first || !replacement->Accept(11, 0, endpoint))
+        Fail("directory did not reclaim an expired unclaimed tombstone");
+    replacement->claimed.store(false, std::memory_order_release);
+    if (directory.Claim(protected_key, configuration))
+        Fail("directory exceeded capacity after reclaiming one expired tombstone");
+}
+
+void VerifyAssociationReplyDrain() {
+    acpp::net::io_context io;
+    auto fence = std::make_shared<acpp::worker_detail::UdpReplyFence>(io);
+    auto unrelated = std::make_shared<acpp::worker_detail::UdpReplyFence>(io);
+    acpp::worker_detail::UdpReplyFence::Lease queued(fence);
+    acpp::worker_detail::UdpReplyFence::Lease active(fence);
+    acpp::worker_detail::UdpReplyFence::Lease other_active(unrelated);
+    bool drained = false;
+    acpp::net::co_spawn(io, fence->AsyncDrain(),
+        [&](std::exception_ptr failure) {
+            if (failure) Fail("association reply fence failed");
+            drained = true;
+        });
+    io.poll();
+    io.restart();
+    if (drained) Fail("reply drain ignored queued and active sends");
+    queued = {};
+    io.poll();
+    io.restart();
+    if (drained) Fail("reply drain returned before active sender completion");
+    auto sender_lease = std::move(active);
+    active = {};
+    io.poll();
+    io.restart();
+    if (drained) Fail("moving a reply lease released the active send");
+    sender_lease = {};
+    io.poll();
+    io.restart();
+    if (!drained) Fail("reply drain waited on another association's sender");
+    other_active = {};
+}
+
 } // namespace
 
 int main() {
@@ -586,9 +799,14 @@ int main() {
         std::pmr::memory_resource* previous;
         ~RestoreDefaultResource() { std::pmr::set_default_resource(previous); }
     } resource_scope{std::pmr::set_default_resource(&owner_resource)};
+    VerifyAssociationReplyDrain();
     acpp::net::io_context io;
     auto& scheduler = acpp::TimeoutScheduler::ForIoContext(io);
     Reclaimer reclaimer(scheduler, nullptr, [](void*, std::exception_ptr) { std::terminate(); });
+    VerifyHandoffDirectoryNamespaces();
+    VerifyHandoffPathFreshness();
+    VerifyHandoffDirectoryTombstone(io, reclaimer);
+    VerifyHandoffDirectoryCapacity();
     acpp::worker_detail::UdpResourceBudget budget;
     Ingress ingress("native-test", std::make_unique<NativeInbound>(), reclaimer, budget, io);
     auto socket = Ingress::MakeSocket(io);
@@ -614,7 +832,7 @@ int main() {
         .payload = datagram,
         .receiver = &receiver,
         .io_context = io,
-        .dispatcher = dispatcher,
+        .dispatcher = &dispatcher,
         .stats = stats,
         .timeouts = timeouts,
         .worker_id = 3,
@@ -628,7 +846,7 @@ int main() {
         .payload = second_datagram,
         .receiver = &receiver,
         .io_context = io,
-        .dispatcher = dispatcher,
+        .dispatcher = &dispatcher,
         .stats = stats,
         .timeouts = timeouts,
         .worker_id = 3,
@@ -663,7 +881,7 @@ int main() {
         .payload = datagram,
         .receiver = &receiver,
         .io_context = io,
-        .dispatcher = dispatcher,
+        .dispatcher = &dispatcher,
         .stats = stats,
         .timeouts = timeouts,
         .worker_id = 3,

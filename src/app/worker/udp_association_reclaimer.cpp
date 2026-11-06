@@ -29,7 +29,8 @@ UdpAssociationReclaimer::UdpAssociationReclaimer(
     TimeoutScheduler& scheduler,
     void* failure_context,
     FailureCallback on_failure) noexcept
-    : scheduler_(scheduler)
+    : TimeoutEvent(TimeoutEvent::WorkerLocal{})
+    , scheduler_(scheduler)
     , failure_context_(failure_context)
     , on_failure_(on_failure) {}
 

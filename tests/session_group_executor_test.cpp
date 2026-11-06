@@ -3,6 +3,7 @@
 #include <asio/co_spawn.hpp>
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/cancellation_signal.hpp>
+#include <asio/post.hpp>
 #include <asio/redirect_error.hpp>
 #include <asio/steady_timer.hpp>
 #include <asio/use_future.hpp>
@@ -10,6 +11,7 @@
 #include <cstdlib>
 #include <future>
 #include <iostream>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -23,7 +25,8 @@ void Require(bool condition, const char* message) {
 }
 
 struct Hooks final : ExecutionDomain::Hooks {
-    explicit Hooks(std::atomic<unsigned>& live) : live(live) { ++live; }
+    explicit Hooks(std::atomic<unsigned>& live, std::atomic<unsigned>* failures = nullptr)
+        : live(live), failures(failures) { ++live; }
     ~Hooks() override { --live; }
     void Enter() noexcept override {
         Require(!entered.exchange(true), "domain acquired by concurrent owners");
@@ -31,8 +34,13 @@ struct Hooks final : ExecutionDomain::Hooks {
     void Leave() noexcept override {
         Require(entered.exchange(false), "domain released without an owner");
     }
-    void OnFailure(std::exception_ptr) noexcept override { std::terminate(); }
+    void OnFailure(std::exception_ptr) noexcept override {
+        Require(entered.load(), "failure callback ran without native domain lease");
+        if (!failures) std::terminate();
+        ++*failures;
+    }
     std::atomic<unsigned>& live;
+    std::atomic<unsigned>* failures;
     std::atomic<bool> entered{false};
 };
 
@@ -192,6 +200,214 @@ void StableDomainOwnership() {
     t0.join(); t1.join(); t2.join();
 }
 
+struct NativeProbe final : ExecutionDomain::NativeResource {
+    std::shared_ptr<ExecutionDomain> domain;
+    std::thread::id first_thread, second_thread;
+    unsigned prepares = 0, commits = 0, cancels = 0;
+    bool fail_prepare = false;
+    bool fail_cancel = false;
+    bool staged = false;
+    NativeProbe(std::shared_ptr<ExecutionDomain> owner,
+                std::thread::id first, std::thread::id second)
+        : domain(std::move(owner)), first_thread(first), second_thread(second) {}
+    void Check(uint32_t owner) {
+        Require(ExecutionDomain::Current() == domain, "native control lost domain lease");
+        Require(!domain->CanExecuteInline(), "native control permits business inline dispatch");
+        Require(std::this_thread::get_id() == (owner == 0 ? first_thread : second_thread),
+                "native control ran on wrong reactor");
+    }
+    net::awaitable<void> PrepareHandoff(const ExecutionDomain::HandoffTarget&) override {
+        Check(domain->OwnerId());
+        ++prepares;
+        staged = true;
+        co_await net::post(net::use_awaitable);
+        Check(domain->OwnerId());
+        if (fail_prepare) throw std::runtime_error("prepare failure");
+    }
+    void CommitHandoff(const ExecutionDomain::HandoffTarget& target) noexcept override {
+        Check(target.worker_id);
+        Require(staged, "committing unprepared resource");
+        staged = false;
+        ++commits;
+    }
+    net::awaitable<void> CancelHandoff(const ExecutionDomain::HandoffTarget& old) override {
+        Check(old.worker_id);
+        co_await net::post(net::use_awaitable);
+        Check(old.worker_id);
+        staged = false;
+        ++cancels;
+        if (fail_cancel) throw std::runtime_error("terminal rollback failure");
+    }
+};
+
+void PassiveHandoffAndExclusiveDetach() {
+    net::io_context first, second;
+    auto first_work = net::make_work_guard(first);
+    auto second_work = net::make_work_guard(second);
+    auto coordinator = std::make_shared<GroupCoordinator>(first);
+    std::atomic<unsigned> live{0};
+    std::atomic<unsigned> failures{0};
+    auto make = [&](net::io_context& io, uint32_t id) {
+        return ExecutionDomain::Create(io, id, io.get_executor(),
+            std::make_shared<Hooks>(live, &failures), coordinator);
+    };
+    auto request = make(first, 0);
+    auto physical = make(first, 0);
+    auto unrelated = make(first, 0);
+    auto target_domain = make(second, 1);
+    std::thread t0([&] { first.run(); });
+    std::thread t1([&] { second.run(); });
+    const auto old_thread = net::co_spawn(request->Executor(), ThreadId(), net::use_future).get();
+    const auto new_thread = net::co_spawn(target_domain->Executor(), ThreadId(), net::use_future).get();
+    const ExecutionDomain::HandoffTarget old_target{0, &first, first.get_executor()};
+    const ExecutionDomain::HandoffTarget new_target{1, &second, second.get_executor()};
+    NativeProbe native(physical, old_thread, new_thread);
+    net::co_spawn(physical->Executor(), [&]() -> net::awaitable<void> {
+        physical->RegisterResource(native);
+        co_return;
+    }, net::use_future).get();
+    const auto identity = physical->LeaseIdentity();
+    const auto request_identity = request->LeaseIdentity();
+    net::co_spawn(request->Executor(), request->AttachExclusive(physical), net::use_future).get();
+    Require(ExecutionDomain::SharesLeaseIdentity(identity.get(), request_identity.get()),
+            "attachment did not update retained lease identity");
+    bool rejected = false;
+    try {
+        net::co_spawn(request->Executor(),
+            request->PreparePassiveHandoff(new_target), net::use_future).get();
+    } catch (const std::logic_error&) { rejected = true; }
+    Require(rejected, "handoff admitted a waiter inside the frozen group");
+
+    auto handoff = net::co_spawn(second,
+        request->PreparePassiveHandoff(new_target), net::use_future).get();
+    Require(request->OwnerId() == 0 && physical->OwnerId() == 0,
+            "prepare prematurely published receiving owner");
+    std::atomic<unsigned> delivered{0};
+    std::promise<void> completed;
+    request->Execute([&] { ++delivered; });
+    net::co_spawn(second, handoff->Validate([&] {
+        Require(ExecutionDomain::Current() == request, "validation lacks origin domain lease");
+        Require(delivered.load() == 0, "business callback escaped preparation freeze");
+        GroupExecutor(request).execute([&] {
+            Require(std::this_thread::get_id() == new_thread, "validation completion lost target");
+            ++delivered;
+            completed.set_value();
+        });
+        Require(delivered.load() == 0, "validation executed business dispatch inline");
+    }), net::use_future).get();
+    net::co_spawn(second, handoff->Commit(), net::use_future).get();
+    completed.get_future().get();
+    Require(delivered.load() == 2, "handoff dropped admitted business completions");
+    Require(&request->Reactor() == &second && request->OwnerId() == 1,
+            "handoff did not publish actual receiving reactor");
+    Require(physical->OwnerId() == 1 && unrelated->OwnerId() == 0,
+            "handoff moved unrelated domain or omitted physical attachment");
+    Require(native.prepares == 1 && native.commits == 1 && !native.staged,
+            "native participant did not commit exactly once");
+    handoff.reset();
+    net::co_spawn(request->Executor(), request->DetachExclusive(physical), net::use_future).get();
+    Require(physical->LeaseIdentity().get() == identity.get(), "detachment replaced stable identity");
+    Require(!ExecutionDomain::SharesLeaseIdentity(identity.get(), request_identity.get()),
+            "detachment retained shared allocation lease");
+    handoff = net::co_spawn(first,
+        request->PreparePassiveHandoff(old_target), net::use_future).get();
+    net::co_spawn(first, handoff->Commit(), net::use_future).get();
+    handoff.reset();
+    Require(physical->OwnerId() == 1, "detached physical domain followed former borrower");
+    // Reuse in the original cache namespace rebinds the independent physical
+    // socket to its new borrower, never the borrower to the idle socket.
+    net::co_spawn(request->Executor(), request->AttachExclusive(physical), net::use_future).get();
+    Require(request->OwnerId() == 0 && physical->OwnerId() == 0,
+            "idle physical reuse chose the wrong native owner");
+    Require(native.commits == 2, "cross-owner attachment skipped native resource migration");
+    for (unsigned i = 0; i != 64; ++i) {
+        net::co_spawn(request->Executor(), request->DetachExclusive(physical), net::use_future).get();
+        Require(!request->SharesGroup(*physical), "repeated detach retained ancestry");
+        net::co_spawn(request->Executor(), request->AttachExclusive(physical), net::use_future).get();
+        Require(physical->LeaseIdentity().get() == identity.get(), "repeated attach replaced identity");
+    }
+
+    // Validation may consume protocol state; cancelling must preserve and
+    // resume its admitted callbacks on the old owner, not discard them.
+    handoff = net::co_spawn(second,
+        request->PreparePassiveHandoff(new_target), net::use_future).get();
+    std::promise<void> restored;
+    bool validation_failed = false;
+    try {
+        net::co_spawn(second, handoff->Validate([&] {
+            request->Execute([&] {
+                Require(std::this_thread::get_id() == old_thread, "cancel resumed on candidate owner");
+                restored.set_value();
+            });
+            throw std::runtime_error("authentication failed");
+        }), net::use_future).get();
+    } catch (const std::runtime_error&) { validation_failed = true; }
+    Require(validation_failed, "failed protocol validation was suppressed");
+    net::co_spawn(second, handoff->Cancel(), net::use_future).get();
+    restored.get_future().get();
+    handoff.reset();
+    Require(request->OwnerId() == 0 && native.cancels == 1,
+            "failed validation did not restore original owner");
+
+    native.fail_prepare = true;
+    bool preparation_failed = false;
+    try {
+        net::co_spawn(second, request->PreparePassiveHandoff(new_target), net::use_future).get();
+    } catch (const std::runtime_error&) { preparation_failed = true; }
+    Require(preparation_failed && native.cancels == 2 && !native.staged,
+            "partially prepared native resource was not rolled back");
+    Require(net::co_spawn(request->Executor(), ThreadId(), net::use_future).get() == old_thread,
+            "prepare failure stranded frozen business executor");
+    native.fail_prepare = false;
+
+    handoff = net::co_spawn(second,
+        request->PreparePassiveHandoff(new_target), net::use_future).get();
+    native.fail_cancel = true;
+    bool rollback_failed = false;
+    try { net::co_spawn(second, handoff->Cancel(), net::use_future).get(); }
+    catch (const std::runtime_error&) { rollback_failed = true; }
+    Require(rollback_failed && !native.staged && failures.load() == 2,
+            "terminal rollback failure was not contained to the attached session");
+    handoff.reset();
+    native.fail_cancel = false;
+    Require(net::co_spawn(request->Executor(), ThreadId(), net::use_future).get() == old_thread,
+            "terminal rollback stranded admitted teardown completions");
+
+    auto shared_a = make(first, 0);
+    auto shared_b = make(first, 0);
+    net::co_spawn(shared_a->Executor(), shared_a->Join(shared_b), net::use_future).get();
+    bool shared_rejected = false;
+    try {
+        net::co_spawn(request->Executor(), request->AttachExclusive(shared_a), net::use_future).get();
+    } catch (const std::logic_error&) { shared_rejected = true; }
+    Require(shared_rejected && !request->SharesGroup(*shared_a),
+            "exclusive attachment captured a permanently shared physical domain");
+    shared_a.reset(); shared_b.reset();
+
+    handoff = net::co_spawn(second,
+        request->PreparePassiveHandoff(new_target), net::use_future).get();
+    coordinator->CloseAdmission();
+    // Resolution of an already admitted transaction must survive admission
+    // closure; shutdown cannot strand a native resource or its execution token.
+    net::co_spawn(second, handoff->Cancel(), net::use_future).get();
+    handoff.reset();
+    net::co_spawn(request->Executor(), [&]() -> net::awaitable<void> {
+        physical->UnregisterResource(native);
+        co_return;
+    }, net::use_future).get();
+    native.domain.reset();
+    net::co_spawn(first, coordinator->AsyncJoin(), net::use_future).get();
+    request.reset(); physical.reset(); unrelated.reset(); target_domain.reset();
+    net::co_spawn(first, [coordinator]() -> net::awaitable<void> {
+        coordinator->ReleaseServices();
+        co_await coordinator->Finalize();
+    }, net::use_future).get();
+    Require(live.load() == 0, "handoff retained domain hosts at finalization");
+    coordinator.reset();
+    first_work.reset(); second_work.reset();
+    t0.join(); t1.join();
+}
+
 void FinalizeJoinsDomainRetirement() {
     net::io_context io;
     auto coordinator = std::make_shared<GroupCoordinator>(io);
@@ -225,5 +441,6 @@ void FinalizeJoinsDomainRetirement() {
 int main() {
     StableDomainOwnership();
     FinalizeJoinsDomainRetirement();
+    PassiveHandoffAndExclusiveDetach();
     std::cout << "session_group_executor_test passed\n";
 }

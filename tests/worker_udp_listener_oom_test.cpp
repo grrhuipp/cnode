@@ -117,7 +117,7 @@ public:
             acpp::InboundDatagramResult result;
             SetAuthenticatedResult(result);
             result.user = &profile_;
-            result.tracker = &tracker_;
+            result.tracker = tracker_;
             auto payload = acpp::buf::BufferGuard{acpp::buf::Buffer::New()};
             if (!payload) throw std::bad_alloc();
             payload->data[0] = 0x5a;
@@ -133,7 +133,7 @@ public:
             acpp::InboundDatagramResult result;
             SetAuthenticatedResult(result);
             result.user = &profile_;
-            result.tracker = &tracker_;
+            result.tracker = tracker_;
             acpp::memory::reject_next_pmr_allocation = true;
             return result;
         }
@@ -159,7 +159,7 @@ private:
     }
 
     TestState& state_;
-    acpp::UserOnlineTracker tracker_;
+    std::shared_ptr<acpp::UserOnlineTracker> tracker_ = std::make_shared<acpp::UserOnlineTracker>();
     acpp::UserProfile profile_;
 };
 
@@ -191,7 +191,8 @@ class TestReplySink final : public acpp::worker_detail::UdpReplySink {
 public:
     bool EnqueueUdpReply(std::string_view, acpp::udp::socket*,
                          acpp::udp::endpoint, acpp::buf::MultiBuffer,
-                         uint32_t) override {
+                         uint32_t,
+                         std::shared_ptr<acpp::worker_detail::UdpReplyFence> = {}) override {
         return false;
     }
 };
@@ -257,7 +258,7 @@ struct Fixture {
                         .payload = bytes,
                         .receiver = &receiver_settings,
                         .io_context = io,
-                        .dispatcher = dispatcher,
+                        .dispatcher = &dispatcher,
                         .stats = stats,
                         .timeouts = timeouts,
                         .worker_id = 0,

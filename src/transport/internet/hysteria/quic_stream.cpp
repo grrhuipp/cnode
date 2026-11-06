@@ -16,10 +16,10 @@ namespace acpp::transport::internet::hysteria {
 QuicStreamState::QuicStreamState(
     net::io_context& io_context, int64_t stream_id,
     std::weak_ptr<Connection> owner)
-    : io_context_(io_context)
+    : domain_(ExecutionDomain::Current())
     , stream_id_(stream_id)
     , owner_(std::move(owner))
-    , input_signal_(io_context, 1) {}
+    , input_signal_(domain_->Executor(), 1) { (void)io_context; }
 
 bool QuicStreamState::PushInput(std::span<const uint8_t> data, bool fin) {
     if (cancelled_ || input_done_ ||
@@ -68,6 +68,8 @@ net::awaitable<size_t> QuicStreamState::Read(net::mutable_buffer buffer) {
         if (input_done_) co_return 0;
         auto [error] = co_await input_signal_.async_receive(
             net::as_tuple(net::use_awaitable));
+        if (error == net::experimental::error::channel_cancelled)
+            error = net::error::operation_aborted;
         if (error)
             throw IoSystemError(error, "QUIC stream input cancelled");
     }
@@ -87,6 +89,8 @@ net::awaitable<buf::MultiBuffer> QuicStreamState::ReadMultiBuffer() {
         if (input_done_) co_return buf::MultiBuffer{};
         auto [error] = co_await input_signal_.async_receive(
             net::as_tuple(net::use_awaitable));
+        if (error == net::experimental::error::channel_cancelled)
+            error = net::error::operation_aborted;
         if (error)
             throw IoSystemError(error, "QUIC stream input cancelled");
     }
@@ -116,7 +120,7 @@ void QuicStreamState::ShutdownWrite() noexcept {
 }
 
 void QuicStreamState::WakeReader() noexcept {
-    if (!io_context_.stopped()) (void)input_signal_.try_send(IoErrorCode{});
+    (void)input_signal_.try_send(IoErrorCode{});
 }
 
 QuicStream::QuicStream(std::shared_ptr<QuicStreamState> state)
@@ -190,11 +194,11 @@ bool QuicStream::IsOpen() const {
 UdpSessionStream::UdpSessionStream(
     net::io_context& io_context, uint32_t session_id,
     TargetAddress first_target, std::weak_ptr<Connection> owner)
-    : io_context_(io_context)
+    : domain_(ExecutionDomain::Current())
     , session_id_(session_id)
     , first_target_(std::move(first_target))
     , owner_(std::move(owner))
-    , signal_(io_context, 1)
+    , signal_(domain_->Executor(), 1)
     , deadline_(io_context, *this) {}
 
 UdpSessionStream::~UdpSessionStream() noexcept {
@@ -244,6 +248,8 @@ net::awaitable<buf::MultiBuffer> UdpSessionStream::ReadMultiBuffer() {
         if (closed_) co_return buf::MultiBuffer{};
         auto [error] = co_await signal_.async_receive(
             net::as_tuple(net::use_awaitable));
+        if (error == net::experimental::error::channel_cancelled)
+            error = net::error::operation_aborted;
         if (error)
             throw IoSystemError(error, "Hysteria UDP session input cancelled");
     }
@@ -298,7 +304,7 @@ void UdpSessionStream::Close() {
 }
 
 void UdpSessionStream::WakeReader() noexcept {
-    if (!io_context_.stopped()) (void)signal_.try_send(IoErrorCode{});
+    (void)signal_.try_send(IoErrorCode{});
 }
 
 }  // namespace acpp::transport::internet::hysteria

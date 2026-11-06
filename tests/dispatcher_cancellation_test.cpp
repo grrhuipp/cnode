@@ -160,8 +160,7 @@ struct Outbounds {
         : configuration({ProbeConfig("direct", probes.direct),
                          ProbeConfig("second", probes.second)}),
           tasks(io.get_executor()),
-          lookup(configuration, io, dns, std::chrono::seconds(1), tasks.Tasks(),
-                 proxyman::outbound::HandlerLookup::StatefulTags::InstantiateLocally) {}
+          lookup(configuration, io, dns, std::chrono::seconds(1), tasks.Tasks()) {}
     proxyman::outbound::OutboundConfiguration configuration;
     ResidentTaskGroup tasks;
     proxyman::outbound::HandlerLookup lookup;

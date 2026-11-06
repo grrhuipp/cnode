@@ -12,8 +12,8 @@
 
 namespace acpp::transport::internet::detail {
 
-// Worker-thread-only aggregate deadlines. The sole scheduling event is part of
-// this object; no separately allocated callback or per-connection timer node.
+// Domain-owned aggregate deadlines. The sole embedded event follows the domain's
+// current Worker scheduler without retaining a pre-handoff scheduler reference.
 template<class Owner>
 class ConnectionTimeouts : private TimeoutEvent {
 public:
@@ -21,7 +21,7 @@ public:
     using TimePoint = Clock::time_point;
 
     ConnectionTimeouts(net::io_context& io_context, Owner& owner)
-        : scheduler_(TimeoutScheduler::ForIoContext(io_context)), owner_(owner) {}
+        : TimeoutEvent(io_context), owner_(owner) {}
     ConnectionTimeouts(const ConnectionTimeouts&) = delete;
     ConnectionTimeouts& operator=(const ConnectionTimeouts&) = delete;
     ~ConnectionTimeouts() noexcept { Stop(); }
@@ -125,7 +125,7 @@ public:
         read_deadline_.reset();
         write_deadline_.reset();
         phase_deadline_.reset();
-        scheduler_.Cancel(*this);
+        Cancel();
         armed_deadline_.reset();
     }
 
@@ -176,7 +176,7 @@ private:
         if (stopped_) return;
         const auto first = Earliest();
         if (first == TimePoint::max()) {
-            scheduler_.Cancel(*this);
+            Cancel();
             armed_deadline_.reset();
             return;
         }
@@ -184,8 +184,8 @@ private:
         // activity moves its deadline forward.
         if (Valid() && armed_deadline_ && *armed_deadline_ <= first) return;
         armed_deadline_.reset();
-        if (!scheduler_.ScheduleAfter(DelayUntil(first), *this)) {
-            scheduler_.Cancel(*this);
+        if (!ScheduleAfter(DelayUntil(first))) {
+            Cancel();
             return;
         }
         armed_deadline_ = first;
@@ -216,7 +216,6 @@ private:
         owner_.OnTimeout(reason);
     }
 
-    TimeoutScheduler& scheduler_;
     Owner& owner_;
     std::optional<TimePoint> idle_deadline_, read_deadline_, write_deadline_, phase_deadline_;
     std::optional<TimePoint> armed_deadline_;

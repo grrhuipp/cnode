@@ -80,13 +80,13 @@ struct Runtime final : acpp::proxyman::inbound::ProtocolRuntime {
     std::vector<acpp::OnlineDevice> GetOnlineDevices(std::string_view) const override {
         return {};
     }
-    acpp::UserOnlineTracker tracker;
+    std::shared_ptr<acpp::UserOnlineTracker> tracker = std::make_shared<acpp::UserOnlineTracker>();
 };
 
 class Datagram final : public acpp::Inbound {
 public:
     Datagram(FixtureState& state, unsigned token, bool association,
-             acpp::UserOnlineTracker& tracker, acpp::ConnectionLimiter* limiter)
+             std::shared_ptr<acpp::UserOnlineTracker> tracker, acpp::ConnectionLimiter* limiter)
         : state_(state), token_(token), create_association_(association),
           tracker_(tracker), limiter_(limiter) { ++state_.handlers_created; }
     ~Datagram() override {
@@ -109,7 +109,7 @@ public:
             return tl::unexpected(acpp::ErrorCode::PROTOCOL_AUTH_FAILED);
         acpp::InboundDatagramResult decoded;
         decoded.user = &profile_;
-        decoded.tracker = &tracker_;
+        decoded.tracker = tracker_;
         decoded.limiter = limiter_;
         const std::array<uint8_t, 1> owner{1};
         if (!decoded.session_owner.Assign(owner)) throw std::bad_alloc();
@@ -131,7 +131,7 @@ private:
     FixtureState& state_;
     unsigned token_;
     bool create_association_;
-    acpp::UserOnlineTracker& tracker_;
+    std::shared_ptr<acpp::UserOnlineTracker> tracker_;
     acpp::ConnectionLimiter* limiter_;
     acpp::UserProfile profile_;
 };

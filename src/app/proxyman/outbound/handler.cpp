@@ -5,7 +5,6 @@
 #include "acppnode/app/session_group_executor.hpp"
 #include "acppnode/app/worker_stats.hpp"
 #include "acppnode/infra/log.hpp"
-#include "acppnode/transport/internet/timeout_scheduler.hpp"
 #include "../../../common/awaitable_task_group.hpp"
 #include "../../../transport/internet/xhttp_session.hpp"
 
@@ -20,17 +19,12 @@
 
 namespace acpp::proxyman::outbound {
 
-// A stateful outbound is a resource domain, not an inbound or Worker owner.
-// Requests join it before accessing its mutable state. Resident work always
-// runs with this host's executor and allocation arena, even when the first
-// borrowing physical connection has already finished. The protocol instance
-// and its dialer are built lazily inside the domain on first use.
+// The host serializes cache creation and retirement, never request execution.
+// Protocol pools lease independent physical domains to individual requests.
 class OutboundPoolHost final : public ExecutionDomain::Hooks,
                                public std::enable_shared_from_this<OutboundPoolHost> {
 public:
-    OutboundPoolHost(const PreparedOutboundConfig& config,
-                     app::dns::DNSWorker& dns_worker, std::chrono::seconds dial_timeout)
-        : config_(config), dns_worker_(dns_worker), dial_timeout_(dial_timeout) {}
+    explicit OutboundPoolHost(const PreparedOutboundConfig& config) : config_(config) {}
     ~OutboundPoolHost() override {
         memory::ScopedAllocationDomain scope(allocation_);
         ReleaseInstance();
@@ -43,19 +37,28 @@ public:
     std::shared_ptr<ExecutionDomain> Domain() const { return domain_.lock(); }
 
     net::awaitable<OutboundProcessResult> Process(
-        session::Context& context, transport::Link inbound,
+        session::Context& context, transport::Link inbound, OutboundDialer& dialer,
         const TimeoutsConfig& timeouts, StatsShard& stats, const RelayConfig& relay,
         buf::MultiBufferBatch payload, std::chrono::seconds idle_timeout,
         std::chrono::seconds write_timeout) {
-        auto request = ExecutionDomain::Current();
         auto domain = Domain();
-        if (!request || !domain) throw IoSystemError(net::error::operation_aborted);
-        if (!request->SharesGroup(*domain)) co_await request->Join(domain);
-        // This is a continuation inside the now unified group, not a packet
-        // handoff to an owner. Source Context/accounting and streams stay put.
-        co_return co_await net::co_spawn(domain->Executor(),
-            Run(context, inbound, timeouts, stats, relay,
-                std::move(payload), idle_timeout, write_timeout), net::use_awaitable);
+        if (!ExecutionDomain::Current() || !domain)
+            throw IoSystemError(net::error::operation_aborted);
+        auto* proxy = co_await net::co_spawn(domain->Executor(), Acquire(),
+            net::bind_cancellation_slot(net::cancellation_slot{}, net::use_awaitable));
+        struct Borrow {
+            std::shared_ptr<OutboundPoolHost> host;
+            ~Borrow() {
+                if (auto domain = host->Domain()) {
+                    domain->Execute([host = std::move(host)] {
+                        --host->active_;
+                        host->CancelIfIdle();
+                    });
+                }
+            }
+        } borrow{shared_from_this()};
+        co_return co_await proxy->Process(context, inbound, dialer, timeouts, stats,
+            relay, std::move(payload), idle_timeout, write_timeout);
     }
 
     void Retire() {
@@ -72,19 +75,9 @@ public:
     }
 
     [[nodiscard]] WorkerRuntimeStatsSnapshot CollectRuntimeStats(
-        bool include_resources) const noexcept {
-        WorkerRuntimeStatsSnapshot snapshot;
-        if (include_resources && proxy_) {
-            if (const auto domain = Domain()) {
-                const auto timers = TimeoutScheduler::ForIoContext(
-                    domain->Reactor()).GetResourceStats();
-                auto& resources = snapshot.resources.emplace();
-                resources.timeout_events = timers.active_events;
-                resources.timeout_heap_capacity = timers.heap_capacity;
-                resources.timeout_waiters = timers.wait_pending ? 1 : 0;
-            }
-        }
-        return snapshot;
+        bool /*include_resources*/) const noexcept {
+        // Worker-level collection accounts the shared scheduler exactly once.
+        return {};
     }
 
     net::awaitable<void> AsyncJoin() {
@@ -120,10 +113,6 @@ public:
             catch (...) { if (!failure) failure = std::current_exception(); }
         }
         ReleaseInstance();
-        if (domain) {
-            try { co_await TimeoutScheduler::AsyncReleaseForIoContext(domain->Reactor()); }
-            catch (...) { if (!failure) failure = std::current_exception(); }
-        }
         join_failure_ = failure;
         joined_.store(true, std::memory_order_release);
         for (auto& waiter : join_waiters_) waiter->cancel();
@@ -154,12 +143,9 @@ public:
     }
 
 private:
-    // Protocol before dialer, dialer before the DNS client it borrows.
     void ReleaseInstance() noexcept {
         proxy_.reset();
-        dialer_.reset();
         tasks_.reset();
-        dns_.reset();
     }
 
     void CancelIfIdle() {
@@ -180,42 +166,27 @@ private:
         }
     }
 
-    net::awaitable<OutboundProcessResult> Run(
-        session::Context& context, transport::Link inbound,
-        const TimeoutsConfig& timeouts, StatsShard& stats, const RelayConfig& relay,
-        buf::MultiBufferBatch payload, std::chrono::seconds idle_timeout,
-        std::chrono::seconds write_timeout) {
+    net::awaitable<::acpp::Outbound*> Acquire() {
         if (retired_) throw IoSystemError(net::error::operation_aborted);
         if (!proxy_) {
             try {
                 auto domain = Domain();
-                dns_ = std::make_unique<app::dns::DNS>(dns_worker_);
                 tasks_ = std::make_unique<ResidentTaskGroup>(domain->Executor());
-                dialer_.emplace(domain->Reactor(), *dns_, config_.sender, dial_timeout_);
                 proxy_ = NewProxy(config_, domain->Reactor(), tasks_->Tasks());
             } catch (...) {
                 ReleaseInstance();
                 throw;
             }
         }
-        struct Borrow {
-            OutboundPoolHost& host;
-            explicit Borrow(OutboundPoolHost& host) : host(host) { ++host.active_; }
-            ~Borrow() { --host.active_; host.CancelIfIdle(); }
-        } borrow(*this);
-        co_return co_await proxy_->Process(context, inbound, *dialer_, timeouts, stats,
-            relay, std::move(payload), idle_timeout, write_timeout);
+        ++active_;
+        co_return proxy_.get();
     }
 
     const PreparedOutboundConfig config_;
-    app::dns::DNSWorker& dns_worker_;
-    const std::chrono::seconds dial_timeout_;
     memory::AllocationDomain allocation_;
     std::optional<memory::ScopedAllocationDomain> allocation_scope_;
     std::weak_ptr<ExecutionDomain> domain_;
-    std::unique_ptr<app::dns::DNS> dns_;
     std::unique_ptr<ResidentTaskGroup> tasks_;
-    std::optional<OutboundDialer> dialer_;
     std::unique_ptr<::acpp::Outbound> proxy_;
     size_t active_ = 0;
     bool retired_ = false;
@@ -235,13 +206,10 @@ Handler::Handler(OutboundConfiguration::Entry config, net::io_context& io_contex
                  AwaitableTaskGroup& tasks)
     : config_(std::move(config)) {
     dialer_.emplace(io_context, dns, config_->sender, dial_timeout);
-    proxy_ = NewProxy(*config_, io_context, tasks);
+    if (config_->host) host_ = config_->host;
+    else proxy_ = NewProxy(*config_, io_context, tasks);
 }
 
-Handler::Handler(OutboundConfiguration::Entry config, std::shared_ptr<OutboundPoolHost> host)
-    : config_(std::move(config)), host_(std::move(host)) {
-    if (!host_) throw std::logic_error("stateful outbound '" + config_->tag + "' has no host");
-}
 
 Handler::~Handler() = default;
 
@@ -256,7 +224,7 @@ net::awaitable<OutboundProcessResult> Handler::Dispatch(
     std::chrono::seconds relay_write_timeout) {
     // Not a coroutine: the callee frame is the request's outbound frame.
     if (host_) {
-        return host_->Process(ctx, inbound, timeouts, stats, relay_config,
+        return host_->Process(ctx, inbound, *dialer_, timeouts, stats, relay_config,
                               std::move(first_payload), relay_idle_timeout,
                               relay_write_timeout);
     }
@@ -271,10 +239,9 @@ net::awaitable<OutboundProcessResult> Handler::Dispatch(
 
 HandlerLookup::HandlerLookup(const OutboundConfiguration& configuration,
                              net::io_context& io_context, app::dns::DNS& dns,
-                             std::chrono::seconds dial_timeout, AwaitableTaskGroup& tasks,
-                             StatefulTags stateful_tags)
+                             std::chrono::seconds dial_timeout, AwaitableTaskGroup& tasks)
     : configuration_(configuration), io_context_(io_context), dns_(dns),
-      dial_timeout_(dial_timeout), tasks_(tasks), stateful_tags_(stateful_tags) {}
+      dial_timeout_(dial_timeout), tasks_(tasks) {}
 
 std::shared_ptr<Handler> HandlerLookup::GetHandler(std::string_view tag) {
     if (const auto generation = configuration_.Generation(); generation != generation_) {
@@ -318,9 +285,6 @@ void HandlerLookup::Sync(uint64_t generation) {
 }
 
 std::shared_ptr<Handler> HandlerLookup::Instantiate(const OutboundConfiguration::Entry& config) {
-    if (config->host && stateful_tags_ == StatefulTags::JoinHost) {
-        return memory::AllocateShared<Handler>(config, config->host);
-    }
     return memory::AllocateShared<Handler>(config, io_context_, dns_, dial_timeout_, tasks_);
 }
 
@@ -336,12 +300,10 @@ struct OutboundConfiguration::Hosts {
     net::io_context& reactor;
     uint32_t worker_id;
     std::shared_ptr<GroupCoordinator> coordinator;
-    app::dns::DNSWorker& dns_worker;
-    std::chrono::seconds dial_timeout;
     std::vector<Resident> residents;
 
     std::shared_ptr<OutboundPoolHost> Create(const PreparedOutboundConfig& config) {
-        auto host = std::make_shared<OutboundPoolHost>(config, dns_worker, dial_timeout);
+        auto host = std::make_shared<OutboundPoolHost>(config);
         auto domain = ExecutionDomain::Create(
             reactor, worker_id, reactor.get_executor(), host, coordinator);
         host->Bind(domain);
@@ -405,12 +367,12 @@ OutboundConfiguration::Capture() const noexcept {
 }
 
 void OutboundConfiguration::BindHosts(net::io_context& reactor, uint32_t worker_id,
-    std::shared_ptr<GroupCoordinator> coordinator, app::dns::DNSWorker& dns_worker,
-    std::chrono::seconds dial_timeout) {
+    std::shared_ptr<GroupCoordinator> coordinator, app::dns::DNSWorker& /*dns_worker*/,
+    std::chrono::seconds /*dial_timeout*/) {
     const std::lock_guard lock(publication_mutex_);
     if (hosts_) throw std::logic_error("outbound hosts already bound");
     hosts_ = std::make_unique<Hosts>(Hosts{
-        reactor, worker_id, std::move(coordinator), dns_worker, dial_timeout, {}});
+        reactor, worker_id, std::move(coordinator), {}});
     auto snapshot = std::make_shared<Snapshot>();
     const auto previous = Capture();
     snapshot->reserve(previous->size());

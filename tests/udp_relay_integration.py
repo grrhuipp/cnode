@@ -1,7 +1,11 @@
 """Owned loopback VLESS/native Shadowsocks UDP integration tests.
 
 Requires Python and cryptography for independent AES-GCM peers and authenticated
-QUIC Initial generation; native_ss2022_isolation additionally requires blake3.
+QUIC Initial generation. native_ss2022_isolation runs four Workers with both
+SIP022 AES and XChaCha20-Poly1305 (blake3 and libsodium required), repeatedly
+changes real UDP source ports, and requires logged passive owner changes. It
+checks delayed old-path rejection, current-path reordering, reply endpoint and
+outbound tuple/session continuity, replay, and second-credential isolation.
 DNS timeout cases use an owned silent UDP listener on a dynamically assigned
 loopback port. No external server or credentials are involved.
 """
@@ -14,6 +18,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import struct
 import subprocess
@@ -21,6 +26,7 @@ import time
 import uuid
 
 import ctypes
+import ctypes.util
 import hmac
 
 try:
@@ -317,18 +323,66 @@ class NativeClient:
 
 
 class Native2022Client(NativeClient):
-    """Independent SIP022 AES peer; same session ID deliberately crosses users."""
-    def __init__(self, sock, target_port, password=b'secret'):
+    """Independent SIP022 AES/XChaCha peer; session IDs deliberately cross users."""
+    def __init__(self, sock, target_port, password=b'secret', cipher='aes'):
         super().__init__(sock, target_port, password)
         if HKDF is None:
             raise RuntimeError('SS2022 integration requires Python cryptography and blake3')
         from blake3 import blake3
         self.blake3 = blake3
-        self.key = bytes(range(16)) if password == b'secret' else bytes(range(16, 32))
+        self.cipher = cipher
+        key_size = 16 if cipher == 'aes' else 32
+        start = 0 if password == b'secret' else key_size
+        self.key = bytes(range(start, start + key_size))
+        if cipher == 'chacha':
+            library = ctypes.util.find_library('sodium')
+            if library is None:
+                raise RuntimeError('SS2022 ChaCha integration requires libsodium')
+            self.sodium = ctypes.CDLL(library)
+            self.sodium.sodium_init.restype = ctypes.c_int
+            if self.sodium.sodium_init() < 0:
+                raise RuntimeError('libsodium initialization failed')
+            self.sodium.crypto_aead_xchacha20poly1305_ietf_encrypt.argtypes = [
+                ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulonglong),
+                ctypes.c_char_p, ctypes.c_ulonglong, ctypes.c_char_p,
+                ctypes.c_ulonglong, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
+            self.sodium.crypto_aead_xchacha20poly1305_ietf_decrypt.argtypes = [
+                ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulonglong), ctypes.c_void_p,
+                ctypes.c_char_p, ctypes.c_ulonglong, ctypes.c_char_p,
+                ctypes.c_ulonglong, ctypes.c_char_p, ctypes.c_char_p]
         self.session_id = bytes.fromhex('00123456789abcde')
         self.packet_id = 0
         self.server_session_id = None
         self.server_packet_id = None
+        self.server_packet_ids = []
+
+    @classmethod
+    async def connect(cls, port, target_host, target_port, user=USER, cipher='aes'):
+        assert target_host == '127.0.0.1'
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.setblocking(False)
+            sock.connect(('127.0.0.1', port))
+            return cls(sock, target_port,
+                       b'secret' if user == USER else b'second-secret', cipher)
+        except Exception:
+            sock.close()
+            raise
+
+    def xchacha(self, nonce, data, encrypt):
+        output = ctypes.create_string_buffer(len(data) + 16)
+        size = ctypes.c_ulonglong()
+        if encrypt:
+            status = self.sodium.crypto_aead_xchacha20poly1305_ietf_encrypt(
+                output, ctypes.byref(size), data, len(data), None, 0, None,
+                nonce, self.key)
+        else:
+            status = self.sodium.crypto_aead_xchacha20poly1305_ietf_decrypt(
+                output, ctypes.byref(size), None, data, len(data), None, 0,
+                nonce, self.key)
+        if status != 0:
+            raise ValueError('XChaCha20-Poly1305 authentication failed')
+        return output.raw[:size.value]
 
     def subkey(self, session_id):
         return self.blake3(self.key + session_id,
@@ -339,18 +393,31 @@ class Native2022Client(NativeClient):
         operation = cipher.encryptor() if encrypt else cipher.decryptor()
         return operation.update(header) + operation.finalize()
 
-    async def send(self, payload):
+    def encode(self, payload):
         header = self.session_id + struct.pack('!Q', self.packet_id)
         self.packet_id += 1
         body = b'\0' + struct.pack('!QH', int(time.time()), 0) + self.target + payload
-        packet = self.header(header, True) + AESGCM(self.subkey(self.session_id)).encrypt(
-            header[4:], body, None)
+        if self.cipher == 'aes':
+            packet = self.header(header, True) + AESGCM(self.subkey(self.session_id)).encrypt(
+                header[4:], body, None)
+        else:
+            nonce = os.urandom(24)
+            packet = nonce + self.xchacha(nonce, header + body, True)
+        return packet
+
+    async def send(self, payload):
+        packet = self.encode(payload)
         await asyncio.get_running_loop().sock_sendall(self.sock, packet)
+        return packet
 
     async def receive(self, expected):
         packet = await asyncio.wait_for(asyncio.get_running_loop().sock_recv(self.sock, 65536), 4)
-        header = self.header(packet[:16], False)
-        plain = AESGCM(self.subkey(header[:8])).decrypt(header[4:], packet[16:], None)
+        if self.cipher == 'aes':
+            header = self.header(packet[:16], False)
+            plain = AESGCM(self.subkey(header[:8])).decrypt(header[4:], packet[16:], None)
+        else:
+            decoded = self.xchacha(packet[:24], packet[24:], False)
+            header, plain = decoded[:16], decoded[16:]
         if (len(plain) < 19 or plain[0] != 1 or plain[9:17] != self.session_id or
                 abs(int(time.time()) - int.from_bytes(plain[1:9], 'big')) > 30):
             raise AssertionError('invalid SS2022 response session header')
@@ -366,6 +433,153 @@ class Native2022Client(NativeClient):
                 raise AssertionError('SS2022 response packet ID did not advance')
         self.server_session_id = server_session_id
         self.server_packet_id = server_packet_id
+        self.server_packet_ids.append(server_packet_id)
+
+
+def passive_handoffs(output):
+    """Only committed owner-change records count; never infer workers from IDs."""
+    records = []
+    for path in (output / 'child.log', output / 'handoff.log'):
+        if not path.exists():
+            continue
+        text = path.read_text(encoding='utf-8', errors='replace')
+        path_records = []
+        for worker, previous_worker, session in re.findall(
+                r'UDP passive handoff worker=(\d+) previous_worker=(\d+) session=(\d+)\b', text):
+            path_records.append({'worker': int(worker), 'previous_worker': int(previous_worker),
+                                 'session': int(session)})
+        # Console/file sinks can mirror the same event. Count one complete sink,
+        # not both copies, when requiring repeated owner changes.
+        if len(path_records) > len(records):
+            records = path_records
+    return records
+
+
+async def assert_datagram_rejected(packet, source, sockets, peer, reason):
+    """Rejected ciphertext must reach neither the target nor any client."""
+    loop = asyncio.get_running_loop()
+    await loop.sock_sendall(source, packet)
+    pending = [asyncio.create_task(peer.requests.get())]
+    pending.extend(asyncio.create_task(loop.sock_recv(sock, 65536)) for sock in sockets)
+    try:
+        ready, _ = await asyncio.wait(pending, timeout=0.3,
+                                      return_when=asyncio.FIRST_COMPLETED)
+        if ready:
+            if pending[0] in ready:
+                raise AssertionError(f'{reason} reached direct outbound: {pending[0].result()!r}')
+            raise AssertionError(f'{reason} delivered an unexpected client echo')
+    finally:
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
+async def exercise_native_handoff(inbound_port, peer_port, peer, clients, output,
+                                  result, cipher, rebind_attempts):
+    first = await Native2022Client.connect(inbound_port, '127.0.0.1', peer_port, cipher=cipher)
+    clients.append(first)
+    second = await Native2022Client.connect(inbound_port, '127.0.0.1', peer_port,
+                                            SECOND_USER, cipher=cipher)
+    clients.append(second)
+    # Same source tuple and session ID; only the authenticated key distinguishes users.
+    second.sock.close()
+    second.sock = first.sock
+    first_payload, second_payload = b'client-one-round-one', b'client-two-round-one'
+    retained_packet = await first.send(first_payload)
+    await second.send(second_payload)
+    initial = await peer.next_round((first_payload, second_payload))
+    first_address, second_address = initial[first_payload], initial[second_payload]
+    if first_address[1] == second_address[1]:
+        raise AssertionError('isolated Freedom sessions shared an outbound source port')
+    peer.reply(second_address, second_payload)
+    await second.receive(second_payload)
+    peer.reply(first_address, first_payload)
+    await first.receive(first_payload)
+    sockets = [second.sock]
+    source_ports = [first.sock.getsockname()[1]]
+    result['client_session_id'] = int.from_bytes(first.session_id, 'big')
+    result['workers'] = 4
+    result['peer_source_ports'] = [first_address[1], second_address[1]]
+    result['rebind_source_ports'] = source_ports
+    result['replay_probes'] = 0
+    result['stale_path_probes'] = 0
+    result['reordered_current_path_packets'] = 0
+    expected_lengths = [len(first_payload), len(second_payload)]
+    with ExitStack() as cleanup:
+        for attempt in range(rebind_attempts):
+            old_path = first.sock
+            delayed_payload = f'client-one-delayed-{attempt}'.encode()
+            # Reserve N without sending it. N+1 must establish the new path
+            # before this unseen, authenticated N arrives on the previous path.
+            delayed_packet = first.encode(delayed_payload)
+            # Keep every previous socket bound: retries must use genuinely fresh
+            # source ports, not close/reopen an existing path or simulate a Worker.
+            moved = cleanup.enter_context(socket.socket(socket.AF_INET, socket.SOCK_DGRAM))
+            moved.setblocking(False)
+            moved.connect(('127.0.0.1', inbound_port))
+            first.sock = moved
+            sockets.append(moved)
+            source_port = moved.getsockname()[1]
+            if source_port in source_ports:
+                raise AssertionError('rebinding reused an earlier source port')
+            source_ports.append(source_port)
+            # Probe before admission on the new path, then again after its valid
+            # packet. Replays must neither create an association nor steal ownership.
+            await assert_datagram_rejected(
+                retained_packet, moved, sockets, peer, 'replayed ciphertext')
+            result['replay_probes'] += 1
+            first_payload = f'client-one-rebind-{attempt}'.encode()
+            second_payload = f'client-two-rebind-{attempt}'.encode()
+            await first.send(first_payload)
+            await second.send(second_payload)
+            observed = await peer.next_round((first_payload, second_payload))
+            if observed[first_payload] != first_address or observed[second_payload] != second_address:
+                raise AssertionError('UDP association outbound tuple changed after source rebinding')
+            expected_lengths.extend((len(first_payload), len(second_payload)))
+            # Reverse replies expose cross-credential socket/session contamination.
+            peer.reply(second_address, second_payload)
+            await second.receive(second_payload)
+            peer.reply(first_address, first_payload)
+            await first.receive(first_payload)
+            await assert_datagram_rejected(
+                retained_packet, moved, sockets, peer, 'replayed ciphertext')
+            result['replay_probes'] += 1
+            await assert_datagram_rejected(
+                delayed_packet, old_path, sockets, peer, 'delayed old-path ciphertext')
+            result['stale_path_probes'] += 1
+            # No current-path uplink may repair a stolen reply route before this
+            # reply: it must still reach the last committed source address.
+            reply_payload = f'reply-after-stale-path-{attempt}'.encode()
+            peer.reply(first_address, reply_payload)
+            await first.receive(reply_payload)
+            # Rejecting stale path metadata must not consume the replay slot or
+            # impose global receive ordering: the same unseen N is valid here.
+            await asyncio.get_running_loop().sock_sendall(moved, delayed_packet)
+            reordered = await peer.next_round((delayed_payload,))
+            if reordered[delayed_payload] != first_address:
+                raise AssertionError('current-path reordering changed the outbound tuple')
+            expected_lengths.append(len(delayed_payload))
+            peer.reply(first_address, delayed_payload)
+            await first.receive(delayed_payload)
+            result['reordered_current_path_packets'] += 1
+            await assert_datagram_rejected(
+                delayed_packet, moved, sockets, peer, 'reordered packet replay')
+            result['replay_probes'] += 1
+        # Exercise both credentials once more after the final handoff/replay probe.
+        for client, address, payload in (
+                (first, first_address, b'client-one-after-handoff'),
+                (second, second_address, b'client-two-after-handoff')):
+            await client.send(payload)
+            observed = await peer.next_round((payload,))
+            if observed[payload] != address:
+                raise AssertionError('post-handoff outbound tuple changed')
+            expected_lengths.append(len(payload))
+            peer.reply(address, payload)
+            await client.receive(payload)
+        result['server_session_ids'] = [first.server_session_id.hex(), second.server_session_id.hex()]
+        result['server_packet_ids'] = [first.server_packet_ids, second.server_packet_ids]
+        if peer.received != expected_lengths or not peer.requests.empty():
+            raise AssertionError('unexpected direct outbound packet count or replay delivery')
 
 
 async def exercise_quic(client, mode, result):
@@ -434,9 +648,10 @@ def reserve_inbound_port(native):
     raise RuntimeError('no free TCP/UDP inbound port after 64 candidates')
 
 
-async def run_case(binary, output, protocol, mode):
+async def run_case(binary, output, protocol, mode, ss2022_cipher='aes', rebind_attempts=16):
     output.mkdir(parents=True, exist_ok=True)
     quic_case = mode in QUIC_MODES
+    handoff_case = mode == 'native_ss2022_isolation'
     dns = SilentDns()
     loop = asyncio.get_running_loop()
     dns_transport = None
@@ -495,15 +710,26 @@ async def run_case(binary, output, protocol, mode):
             if isolated:
                 configs['inbounds.json'][0]['settings']['clients'].append(
                     {'password': 'second-secret'})
-            if mode == 'native_ss2022_isolation':
+            if handoff_case:
+                key_size = 16 if ss2022_cipher == 'aes' else 32
                 configs['inbounds.json'][0]['settings'] = {
-                    'method': '2022-blake3-aes-128-gcm',
-                    'clients': [{'password': base64.b64encode(bytes(range(start, start + 16))).decode()}
-                                for start in (0, 16)]}
+                    'method': ('2022-blake3-aes-128-gcm' if ss2022_cipher == 'aes'
+                               else '2022-blake3-chacha20-poly1305'),
+                    'clients': [{'password': base64.b64encode(bytes(range(start, start + key_size))).decode()}
+                                for start in (0, key_size)]}
+                configs['config.json']['workers'] = 4
+                configs['config.json']['log'] = {
+                    'loglevel': 'debug', 'logDir': output.as_posix(),
+                    'error': 'handoff.log', 'access': 'access.log',
+                    'rotateDaily': False, 'gzip': False}
+                # A reused output directory must not satisfy this run's assertion.
+                (output / 'handoff.log').write_text('', encoding='utf-8')
         for name, config in configs.items():
             (output / name).write_text(json.dumps(config), encoding='utf-8')
     clients = []
     result = {'protocol': protocol, 'mode': mode}
+    if handoff_case:
+        result['cipher'] = ss2022_cipher
     with (output / 'child.log').open('w', encoding='utf-8') as logfile:
         child = subprocess.Popen([str(binary), '--config-dir', str(output)], stdout=logfile,
                                  stderr=subprocess.STDOUT)
@@ -535,14 +761,16 @@ async def run_case(binary, output, protocol, mode):
                     await survivor.send(payload)
                     await survivor.receive(payload)
                     result['survivor_after_cancel'] = len(payload)
+            elif handoff_case:
+                await exercise_native_handoff(inbound_port, peer_port, peer, clients,
+                                              output, result, ss2022_cipher, rebind_attempts)
             elif isolated:
-                client_type = (Native2022Client if mode == 'native_ss2022_isolation' else
-                               NativeClient if mode == 'native_isolation' else Client)
+                client_type = NativeClient if mode == 'native_isolation' else Client
                 first = await client_type.connect(inbound_port, '127.0.0.1', peer_port)
                 second = await client_type.connect(inbound_port, '127.0.0.1', peer_port, SECOND_USER)
                 if mode.startswith('native_'):
-                    # Identical endpoint (and SS2022 ID) leaves only authenticated
-                    # owner identity to distinguish the two associations.
+                    # Identical endpoint leaves only authenticated owner identity
+                    # to distinguish the two associations.
                     second.sock.close()
                     second.sock = first.sock
                 clients.extend((first, second))
@@ -562,13 +790,6 @@ async def run_case(binary, output, protocol, mode):
                 # Interleave a second round while both associations are alive;
                 # each must retain its own source port and have no stale packet.
                 next_first = b'client-one-round-two'
-                if mode == 'native_ss2022_isolation':
-                    # SIP022 session identity survives NAT rebinding without
-                    # allocating a new relay association or stealing user two.
-                    moved = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                    moved.setblocking(False)
-                    moved.connect(('127.0.0.1', inbound_port))
-                    first.sock = moved
                 next_second = b'client-two-round-two'
                 await second.send(next_second)
                 await first.send(next_first)
@@ -640,7 +861,7 @@ async def run_case(binary, output, protocol, mode):
                         [20, 20, 20, 20] if isolated else [4] if mode == 'late_reply'
                         else [13, 20480] if mode == 'shared_cancel'
                         else [14, 20480, 14] if sniffing else [14, 20480])
-            result['passed'] = (True if quic_case else
+            result['passed'] = (not peer.errors if handoff_case else True if quic_case else
                                 not peer.errors and peer.received == expected)
         except Exception as error:
             result['error'] = repr(error)
@@ -664,6 +885,19 @@ async def run_case(binary, output, protocol, mode):
             if fallback_transport:
                 fallback_transport.close()
             await asyncio.sleep(0)
+    if handoff_case:
+        # LOG_NET_DEBUG files may buffer until shutdown. Require actual committed
+        # ownership changes, not source-port changes or a guessed SO_REUSEPORT hash.
+        handoffs = passive_handoffs(output)
+        result['passive_handoffs'] = handoffs
+        if result['passed'] and (
+                len(handoffs) < 2 or any(
+                    event['worker'] == event['previous_worker'] or
+                    not (0 <= event['worker'] < 4 and 0 <= event['previous_worker'] < 4) or
+                    event['session'] != result['client_session_id']
+                    for event in handoffs)):
+            result['passed'] = False
+            result['error'] = 'missing repeated valid four-Worker passive owner changes for the live session'
     if fallback_peer is not None:
         result['fallback_packets'] = fallback_peer.received
         result['fallback_errors'] = fallback_peer.errors
@@ -689,7 +923,13 @@ async def main(args):
         assert selected <= {f'{protocol}-{mode}' for protocol, mode in cases}
         cases = [(protocol, mode) for protocol, mode in cases if f'{protocol}-{mode}' in selected]
     for protocol, mode in cases:
-        results.append(await run_case(args.binary.resolve(), args.output.resolve() / f'{protocol}-{mode}', protocol, mode))
+        case_output = args.output.resolve() / f'{protocol}-{mode}'
+        if mode == 'native_ss2022_isolation':
+            for cipher in dict.fromkeys(args.ss2022_cipher or ('aes', 'chacha')):
+                results.append(await run_case(args.binary.resolve(), case_output / cipher,
+                                              protocol, mode, cipher, args.ss2022_rebind_attempts))
+        else:
+            results.append(await run_case(args.binary.resolve(), case_output, protocol, mode))
     (args.output / 'results.json').write_text(json.dumps(results, indent=2), encoding='utf-8')
     return 0 if all(result['passed'] for result in results) else 1
 
@@ -699,4 +939,11 @@ if __name__ == '__main__':
     parser.add_argument('--binary', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--case', action='append')
-    raise SystemExit(asyncio.run(main(parser.parse_args())))
+    parser.add_argument('--ss2022-cipher', action='append', choices=('aes', 'chacha'),
+                        help='SS2022 cipher(s) to exercise; defaults to both')
+    parser.add_argument('--ss2022-rebind-attempts', type=int, default=16,
+                        help='fresh UDP source paths to exercise for repeated owner changes')
+    args = parser.parse_args()
+    if args.ss2022_rebind_attempts < 2:
+        parser.error('--ss2022-rebind-attempts must be at least two')
+    raise SystemExit(asyncio.run(main(args)))

@@ -92,6 +92,9 @@ protected:
     const TcpStream* BaseTcpStream() const override { return this; }
 
 private:
+    // Own/register the same nonblocking fd even while connect is pending.
+    static net::awaitable<DialResult> ConnectSocket(
+        tcp::socket socket, const tcp::endpoint& endpoint, std::chrono::seconds timeout);
     friend class TlsStream;
     void PrepareTlsIo();
     [[nodiscard]] bool CanRead() const noexcept;

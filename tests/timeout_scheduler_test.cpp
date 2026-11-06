@@ -8,11 +8,13 @@
 #include <asio/cancellation_signal.hpp>
 #include <asio/post.hpp>
 #include <asio/use_future.hpp>
+#include <asio/steady_timer.hpp>
 
 #include <chrono>
 #include <cstdio>
 #include <deque>
 #include <future>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -236,12 +238,22 @@ bool TestMaximumDelay() {
     maximum.counter = &far_calls;
     immediate.counter = &immediate_calls;
     (void)scheduler.ScheduleAfter(std::chrono::milliseconds::max(), maximum);
+    io.poll();
+    if (far_calls != 0) return false;
+    const auto ordinary_before = rejected_allocations;
+    const auto asio_before = timeout_allocation_test::rejected_asio_allocations;
+    bool expedited = false;
+    reject_allocations = timeout_allocation_test::reject_asio_allocations = true;
+    try { expedited = scheduler.ScheduleAfter(0ms, maximum); }
+    catch (const std::bad_alloc&) {}
+    timeout_allocation_test::reject_asio_allocations = reject_allocations = false;
+    if (!expedited) return false;
     (void)scheduler.ScheduleAfter(-1ms, immediate);
-    io.run_for(10ms);
-    scheduler.Cancel(maximum);
     io.restart();
     io.run();
-    return far_calls == 0 && immediate_calls == 1;
+    return far_calls == 1 && immediate_calls == 1 &&
+        rejected_allocations == ordinary_before &&
+        timeout_allocation_test::rejected_asio_allocations == asio_before;
 }
 
 bool TestPoolMaintenance() {
@@ -413,6 +425,21 @@ bool TestDelayConcurrentWaitAndMaximum() {
     return rejected && timeout_allocation_test::rejected_asio_allocations == before &&
         rejected_allocations == ordinary_before;
 }
+
+bool TestDelayCancellationAfterRelease() {
+    net::io_context io;
+    AsyncDelay delay(io);
+    auto waiting = net::co_spawn(io, delay.WaitFor(1h), net::use_future);
+    io.poll();
+    TimeoutScheduler::ReleaseForIoContext(io);
+    delay.Cancel();
+    io.restart();
+    io.run_for(100ms);
+    if (waiting.wait_for(0ms) != std::future_status::ready) return false;
+    waiting.get();
+    return true;
+}
+
 bool TestDomainSchedulerIsolationAndJoin() {
     struct Hooks final : ExecutionDomain::Hooks {
         memory::AllocationDomain allocation;
@@ -434,6 +461,11 @@ bool TestDomainSchedulerIsolationAndJoin() {
     TimeoutScheduler* second_scheduler = nullptr;
     bool first_owner = false, second_owner = false;
     bool first_joined = false, second_joined = false;
+    struct WorkerEvent final : TimeoutEvent {
+        WorkerEvent() : TimeoutEvent(WorkerLocal{}) {}
+        bool fired_on_worker = false;
+        void OnTimeout() override { fired_on_worker = !ExecutionDomain::Current(); }
+    } worker_event;
     SignalChannel scheduler_joins(io, 2);
     CounterEvent first_pending, second_pending;
     Event first_event([&] {
@@ -458,6 +490,7 @@ bool TestDomainSchedulerIsolationAndJoin() {
         first_scheduler = &TimeoutScheduler::ForIoContext(io);
         (void)first_scheduler->ScheduleAfter(0ms, first_event);
         (void)first_scheduler->ScheduleAfter(1h, first_pending);
+        (void)first_scheduler->ScheduleAfter(2ms, worker_event);
     });
     second->Execute([&] {
         second_scheduler = &TimeoutScheduler::ForIoContext(io);
@@ -469,7 +502,7 @@ bool TestDomainSchedulerIsolationAndJoin() {
         co_await scheduler_joins.async_receive(net::use_awaitable);
         co_await scheduler_joins.async_receive(net::use_awaitable);
         passed = first_scheduler && second_scheduler &&
-            first_scheduler != second_scheduler && first_owner && second_owner &&
+            first_scheduler == second_scheduler && first_owner && second_owner &&
             first_joined && second_joined && !first_pending.Valid() &&
             !second_pending.Valid() && !first_hooks->failure && !second_hooks->failure;
         first.reset();
@@ -482,7 +515,183 @@ bool TestDomainSchedulerIsolationAndJoin() {
     net::co_spawn(io, finalize(coordinator),
         [&](std::exception_ptr error) { finalized = !error; });
     io.run_for(1s);
-    return passed && finalized;
+    return passed && finalized && worker_event.fired_on_worker;
+}
+
+bool TestDomainTimeoutHandoff() {
+    struct Hooks final : ExecutionDomain::Hooks {
+        memory::AllocationDomain allocation;
+        std::optional<memory::ScopedAllocationDomain> lease;
+        std::exception_ptr failure;
+        void Enter() noexcept override { lease.emplace(allocation); }
+        void Leave() noexcept override { lease.reset(); }
+        void OnFailure(std::exception_ptr error) noexcept override { failure = error; }
+    };
+    // Let the Worker's native timer expire while domain business is frozen,
+    // before the timeout participant removes the remaining active heap slots.
+    struct Pause final : ExecutionDomain::NativeResource {
+        std::function<void()> on_prepare;
+        net::awaitable<void> PrepareHandoff(const ExecutionDomain::HandoffTarget&) override {
+            on_prepare();
+            net::steady_timer timer(co_await net::this_coro::executor);
+            timer.expires_after(40ms);
+            co_await timer.async_wait(net::use_awaitable);
+        }
+        void CommitHandoff(const ExecutionDomain::HandoffTarget&) noexcept override {}
+        net::awaitable<void> CancelHandoff(const ExecutionDomain::HandoffTarget&) override { co_return; }
+    } pause;
+    net::io_context old_io, new_io;
+    auto coordinator = std::make_shared<GroupCoordinator>(old_io);
+    auto hooks = std::make_shared<Hooks>();
+    auto domain = ExecutionDomain::Create(old_io, 0, old_io.get_executor(), hooks, coordinator);
+    hooks->allocation.SetLeaseGroup(domain->LeaseIdentity(), ExecutionDomain::SharesLeaseIdentity);
+    auto pump = [&] {
+        old_io.restart(); old_io.poll();
+        new_io.restart(); new_io.poll();
+    };
+    auto finish = [&](auto& future) {
+        const auto limit = std::chrono::steady_clock::now() + 2s;
+        while (future.wait_for(0ms) != std::future_status::ready &&
+               std::chrono::steady_clock::now() < limit) {
+            pump();
+            std::this_thread::sleep_for(1ms);
+        }
+        if (future.wait_for(0ms) != std::future_status::ready)
+            throw std::runtime_error("timeout handoff test did not complete");
+        return future.get();
+    };
+    auto wait_until = [&](auto predicate) {
+        const auto limit = std::chrono::steady_clock::now() + 2s;
+        while (!predicate() && std::chrono::steady_clock::now() < limit) {
+            pump();
+            std::this_thread::sleep_for(1ms);
+        }
+        if (!predicate()) throw std::runtime_error("timeout handoff notification missing");
+    };
+    std::size_t destroyed_calls = 0, rearmed_calls = 0, ready_calls = 0, active_calls = 0;
+    bool owner_correct = true;
+    auto destroyed = std::make_unique<CounterEvent>();
+    destroyed->counter = &destroyed_calls;
+    std::size_t cleared_calls = 0;
+    CounterEvent cleared;
+    cleared.counter = &cleared_calls;
+    auto check_owner = [&] {
+        owner_correct = owner_correct && ExecutionDomain::Current() == domain &&
+            memory::CurrentAllocationDomain() == &hooks->allocation;
+    };
+    Event rearmed([&] { check_owner(); ++rearmed_calls; });
+    Event ready([&] { check_owner(); ++ready_calls; });
+    Event active([&] { check_owner(); ++active_calls; });
+    std::unique_ptr<AsyncDelay> delay;
+    std::future<void> delayed;
+    bool delay_on_target = false;
+    auto wait_delay = [&]() -> net::awaitable<void> {
+        co_await delay->WaitFor(1h);
+        check_owner();
+        delay_on_target = domain->OwnerId() == 1;
+    };
+    bool first_preparation = true;
+    pause.on_prepare = [&] {
+        if (!first_preparation) {
+            (void)active.ScheduleAfter(0ms);
+            return;
+        }
+        first_preparation = false;
+        // Queue business edits before the native expiry notification, without
+        // depending on how quickly the test's control loop obtains its turn.
+        domain->Execute([&] {
+            destroyed.reset();
+            (void)rearmed.ScheduleAfter(2ms);
+        });
+        (void)destroyed->ScheduleAfter(0ms);
+        (void)rearmed.ScheduleAfter(0ms);
+        (void)ready.ScheduleAfter(0ms);
+        (void)active.ScheduleAfter(90ms);
+    };
+    auto setup = net::co_spawn(domain->Executor(), [&]() -> net::awaitable<void> {
+        auto& scheduler = TimeoutScheduler::ForIoContext(old_io);
+        (void)scheduler.ScheduleAfter(1h, *destroyed);
+        (void)scheduler.ScheduleAfter(1h, rearmed);
+        (void)scheduler.ScheduleAfter(1h, ready);
+        (void)scheduler.ScheduleAfter(1h, active);
+        (void)scheduler.ScheduleAfter(1h, cleared);
+        delay = std::make_unique<AsyncDelay>(old_io);
+        delayed = net::co_spawn(domain->Executor(), wait_delay(), net::use_future);
+        domain->RegisterResource(pause);
+        co_return;
+    }, net::use_future);
+    finish(setup);
+    auto preparation = net::co_spawn(new_io,
+        domain->PreparePassiveHandoff({1, &new_io, new_io.get_executor()}), net::use_future);
+    auto handoff = finish(preparation);
+    bool passed = ready_calls == 0 && rearmed_calls == 0 && active_calls == 0;
+    auto validation = net::co_spawn(new_io, handoff->Validate([&] {
+        cleared.Cancel(); // Target validation must not touch the old heap.
+        passed = passed && !cleared.Valid();
+    }), net::use_future);
+    finish(validation);
+    // The active absolute deadline elapses while prepared. Commit must not
+    // restart its duration or wait for a callback on the retired reactor.
+    const auto deadline = std::chrono::steady_clock::now() + 70ms;
+    while (std::chrono::steady_clock::now() < deadline) {
+        pump();
+        std::this_thread::sleep_for(1ms);
+    }
+    auto commit = net::co_spawn(new_io, handoff->Commit(), net::use_future);
+    finish(commit);
+    handoff.reset();
+    const auto delivery_limit = std::chrono::steady_clock::now() + 30ms;
+    while ((active_calls == 0 || rearmed_calls == 0) &&
+           std::chrono::steady_clock::now() < delivery_limit) {
+        // After commit no old reactor polling is needed for expiry delivery.
+        new_io.restart(); new_io.poll();
+        std::this_thread::sleep_for(1ms);
+    }
+    passed = passed && domain->OwnerId() == 1 && destroyed_calls == 0 &&
+        rearmed_calls == 1 && ready_calls == 1 && active_calls == 1 && owner_correct;
+    domain->Execute([&] { delay->Cancel(); });
+    finish(delayed);
+    passed = passed && delay_on_target;
+
+    // Rollback retains the original absolute deadline and owner. A pending
+    // timer must not need a fresh duration, and stop must remove migrated slots.
+    auto arm = net::co_spawn(domain->Executor(), [&]() -> net::awaitable<void> {
+        (void)active.ScheduleAfter(10ms);
+        (void)rearmed.ScheduleAfter(1h);
+        co_return;
+    }, net::use_future);
+    finish(arm);
+    preparation = net::co_spawn(old_io,
+        domain->PreparePassiveHandoff({0, &old_io, old_io.get_executor()}), net::use_future);
+    handoff = finish(preparation);
+    passed = passed && active_calls == 1;
+    auto rollback = net::co_spawn(old_io, handoff->Cancel(), net::use_future);
+    finish(rollback);
+    handoff.reset();
+    wait_until([&] { return active_calls == 2; });
+    passed = passed && domain->OwnerId() == 1 && owner_correct && rearmed.Valid();
+    auto shutdown = net::co_spawn(domain->Executor(), [&]() -> net::awaitable<void> {
+        domain->UnregisterResource(pause);
+        delay.reset();
+        co_await TimeoutScheduler::AsyncReleaseForIoContext(new_io);
+        passed = passed && !rearmed.Valid() && !active.Valid() &&
+            !rearmed.ScheduleAfter(0ms);
+    }, net::use_future);
+    finish(shutdown);
+    passed = passed && !hooks->failure;
+    domain.reset();
+    auto finalize = net::co_spawn(old_io, [coordinator]() -> net::awaitable<void> {
+        coordinator->CloseAdmission();
+        co_await coordinator->AsyncJoin();
+        coordinator->ReleaseServices();
+        co_await coordinator->Finalize();
+    }, net::use_future);
+    finish(finalize);
+    TimeoutScheduler::ReleaseForIoContext(old_io);
+    TimeoutScheduler::ReleaseForIoContext(new_io);
+    pump();
+    return passed && destroyed_calls == 0 && cleared_calls == 0 &&
+        rearmed_calls == 1 && active_calls == 2;
 }
 
 }  // namespace
@@ -501,7 +710,9 @@ int main() {
         {"owner-thread service destruction", TestOwnerThreadServiceDestruction},
         {"delay cancellation and reuse", TestDelayCancellationAndReuse},
         {"delay concurrent wait and maximum", TestDelayConcurrentWaitAndMaximum},
-        {"domain scheduler isolation and native timer join", TestDomainSchedulerIsolationAndJoin},
+        {"delay cancellation after scheduler release", TestDelayCancellationAfterRelease},
+        {"shared Worker scheduler and domain-only release", TestDomainSchedulerIsolationAndJoin},
+        {"domain pending expiry, cancellation, rearm and handoff rollback", TestDomainTimeoutHandoff},
     };
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     bool passed = true;

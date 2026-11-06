@@ -96,6 +96,8 @@ public:
     void Cancel() noexcept;
     void Close() noexcept;
     [[nodiscard]] bool IsIPv6() const noexcept;
+    // The dedicated association fd is retained across a passive domain handoff.
+    [[nodiscard]] int NativeHandle() const noexcept;
     [[nodiscard]] udp::endpoint LocalEndpoint() const;
     [[nodiscard]] static std::size_t ActiveCount() noexcept;
 

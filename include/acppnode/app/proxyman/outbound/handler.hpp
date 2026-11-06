@@ -26,7 +26,7 @@ class DNSWorker;
 
 namespace acpp::proxyman::outbound {
 
-// Stable, joinable execution domain of one persistent_state tag (see handler.cpp).
+// Stable cache namespace; active physical sessions have independent domains.
 class OutboundPoolHost;
 
 // ============================================================================
@@ -89,9 +89,8 @@ private:
 // One concrete handler per outbound tag per executing domain. It owns the
 // prepared sender settings (through its configuration entry), the tag's
 // OutboundDialer and the protocol instance, or - for persistent_state tags -
-// a lease on the tag's stable host. Dispatch performs the request's only
-// dynamic dispatch: proxy::Outbound::Process, inside the host domain for
-// pooled tags.
+// a lease on the tag's stable cache host. Requests execute in their own domain;
+// only cold cache operations run on the host.
 // ============================================================================
 class Handler final : public memory::ThreadAllocated {
 public:
@@ -100,8 +99,6 @@ public:
     Handler(OutboundConfiguration::Entry config, net::io_context& io_context,
             app::dns::DNS& dns, std::chrono::seconds dial_timeout,
             AwaitableTaskGroup& tasks);
-    // persistent_state tag: requests join the tag's stable host domain.
-    Handler(OutboundConfiguration::Entry config, std::shared_ptr<OutboundPoolHost> host);
     ~Handler();
     Handler(const Handler&) = delete;
     Handler& operator=(const Handler&) = delete;
@@ -137,15 +134,9 @@ private:
 // ============================================================================
 class HandlerLookup final : public memory::ThreadAllocated {
 public:
-    // Physical sessions run in an execution domain and join stateful hosts.
-    // Worker-level requests (QUIC, native UDP) have no domain to join, so a
-    // stateful tag is instantiated with this lookup's Worker-owned runtime.
-    enum class StatefulTags : uint8_t { JoinHost, InstantiateLocally };
-
     HandlerLookup(const OutboundConfiguration& configuration,
                   net::io_context& io_context, app::dns::DNS& dns,
-                  std::chrono::seconds dial_timeout, AwaitableTaskGroup& tasks,
-                  StatefulTags stateful_tags);
+                  std::chrono::seconds dial_timeout, AwaitableTaskGroup& tasks);
     HandlerLookup(const HandlerLookup&) = delete;
     HandlerLookup& operator=(const HandlerLookup&) = delete;
 
@@ -171,7 +162,6 @@ private:
     app::dns::DNS& dns_;
     const std::chrono::seconds dial_timeout_;
     AwaitableTaskGroup& tasks_;
-    const StatefulTags stateful_tags_;
     uint64_t generation_ = 0;  // Publications start at 1.
     memory::ThreadLocalVector<Entry> entries_;
 };

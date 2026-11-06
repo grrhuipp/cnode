@@ -12,19 +12,22 @@ namespace acpp::worker_detail {
 struct ClientSessionKey final {
     ClientSessionKey(InboundDatagramOwner authenticated_owner,
                      std::optional<uint64_t> protocol_session_id,
-                     udp::endpoint client_endpoint = {}) noexcept
+                     udp::endpoint client_endpoint = {},
+                     const void* configuration_identity = nullptr) noexcept
         : owner(authenticated_owner), session_id(protocol_session_id),
           endpoint(protocol_session_id ? udp::endpoint{} :
-              udp::endpoint(iputil::NormalizeAddress(client_endpoint.address()), client_endpoint.port())) {}
+              udp::endpoint(iputil::NormalizeAddress(client_endpoint.address()), client_endpoint.port())),
+          configuration(configuration_identity) {}
 
     [[nodiscard]] bool operator==(const ClientSessionKey& other) const noexcept {
-        return owner.Same(other.owner) && session_id == other.session_id &&
-            (session_id.has_value() || endpoint == other.endpoint);
+        return configuration == other.configuration && owner.Same(other.owner) &&
+            session_id == other.session_id && (session_id.has_value() || endpoint == other.endpoint);
     }
 
     InboundDatagramOwner owner;
     std::optional<uint64_t> session_id;
     udp::endpoint endpoint;
+    const void* configuration = nullptr;
 };
 
 struct ClientSessionKeyHash final {
@@ -33,6 +36,9 @@ struct ClientSessionKeyHash final {
         const auto mix = [&hash](uint8_t byte) noexcept {
             hash = (hash ^ byte) * 16777619u;
         };
+        const auto configuration = reinterpret_cast<uintptr_t>(key.configuration);
+        for (size_t shift = 0; shift < sizeof(configuration) * 8; shift += 8)
+            mix(static_cast<uint8_t>(configuration >> shift));
         mix(key.owner.size);
         for (size_t i = 0; i < key.owner.size; ++i) mix(key.owner.bytes[i]);
         mix(key.session_id.has_value());

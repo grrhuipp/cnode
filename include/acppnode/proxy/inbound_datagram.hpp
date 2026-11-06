@@ -52,6 +52,9 @@ struct InboundDatagramOwner {
 struct InboundDatagramRequest {
     std::string_view tag;
     std::span<const uint8_t> payload;
+    // The ingress directory commits replay only after authenticated ownership
+    // resolution. Standalone protocol callers retain synchronous replay checks.
+    bool deferred_replay = false;
 };
 
 struct InboundDatagramResult {
@@ -61,14 +64,16 @@ struct InboundDatagramResult {
     std::optional<uint64_t> session_id;
     // Protocol session IDs are scoped by the authenticated credential.
     InboundDatagramOwner session_owner;
-    // The authenticated credential's profile. Borrowed only until the
-    // synchronous datagram handoff completes; a new association copies it.
+    // Present only with an authenticated, replay-protected protocol session.
+    std::optional<uint64_t> packet_id;
+    // Production authentication aliases an owned credential snapshot. The raw
+    // view is synchronous-only for protocols without an owning snapshot;
+    // ingress must copy the profile before any asynchronous handoff.
+    std::shared_ptr<const UserProfile> user_owner;
     const UserProfile* user = nullptr;
-    // Admission handles of the authenticating protocol runtime. A new
-    // association copies them and holds its reservations through them; the
-    // runtime's tracker and the Worker's limiter outlive every association.
-    // An authenticated result without a tracker cannot start an association.
-    UserOnlineTracker* tracker = nullptr;
+    // Standalone injected dispatchers must supply an owning admission tracker.
+    // Production datagrams use their stable session capability's tracker instead.
+    std::shared_ptr<UserOnlineTracker> tracker;
     ConnectionLimiter* limiter = nullptr;
 };
 

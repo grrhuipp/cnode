@@ -2,14 +2,15 @@
 
 #include "acppnode/common/buf/multi_buffer.hpp"
 
+#include <atomic>
 #include <cstddef>
 #include <limits>
 #include <utility>
 
 namespace acpp::worker_detail {
 
-// Owner-thread-only product limits, shared by every native UDP ingress in a Worker.
-// The budget must outlive session owners and pending asynchronous reply sends.
+// Limits are Worker-scoped. Reservation release is atomic so a frozen native
+// association can transfer its leases without borrowing the old Worker thread.
 class UdpResourceBudget final {
 public:
     struct Limits {
@@ -43,7 +44,7 @@ public:
         friend class UdpResourceBudget;
         explicit AssociationLease(UdpResourceBudget& budget) noexcept : budget_(&budget) {}
         void Reset() noexcept {
-            if (budget_) --budget_->usage_.associations;
+            if (budget_) budget_->associations_.fetch_sub(1, std::memory_order_relaxed);
             budget_ = nullptr;
         }
         UdpResourceBudget* budget_ = nullptr;
@@ -72,8 +73,8 @@ public:
             : budget_(&budget), capacity_(capacity) {}
         void Reset() noexcept {
             if (budget_) {
-                --budget_->usage_.datagrams;
-                budget_->usage_.payload_capacity -= capacity_;
+                budget_->datagrams_.fetch_sub(1, std::memory_order_relaxed);
+                budget_->payload_capacity_.fetch_sub(capacity_, std::memory_order_relaxed);
             }
             budget_ = nullptr;
         }
@@ -86,10 +87,13 @@ public:
     UdpResourceBudget(const UdpResourceBudget&) = delete;
     UdpResourceBudget& operator=(const UdpResourceBudget&) = delete;
 
-    [[nodiscard]] Usage GetUsage() const noexcept { return usage_; }
+    [[nodiscard]] Usage GetUsage() const noexcept {
+        return {associations_.load(std::memory_order_relaxed),
+                datagrams_.load(std::memory_order_relaxed),
+                payload_capacity_.load(std::memory_order_relaxed)};
+    }
     [[nodiscard]] AssociationLease AcquireAssociation() noexcept {
-        if (usage_.associations >= limits_.associations) return {};
-        ++usage_.associations;
+        if (!Acquire(associations_, 1, limits_.associations)) return {};
         return AssociationLease{*this};
     }
     [[nodiscard]] PayloadReservation ReservePayload(const buf::MultiBuffer& payload) noexcept {
@@ -100,16 +104,27 @@ public:
                 return {};
             capacity += buf::Buffer::kSize;
         }
-        if (usage_.datagrams >= limits_.datagrams || capacity > limits_.payload_capacity ||
-            usage_.payload_capacity > limits_.payload_capacity - capacity) return {};
-        ++usage_.datagrams;
-        usage_.payload_capacity += capacity;
+        if (!Acquire(datagrams_, 1, limits_.datagrams)) return {};
+        if (!Acquire(payload_capacity_, capacity, limits_.payload_capacity)) {
+            datagrams_.fetch_sub(1, std::memory_order_relaxed);
+            return {};
+        }
         return PayloadReservation{*this, capacity};
     }
 
 private:
+    static bool Acquire(std::atomic<size_t>& counter, size_t amount, size_t limit) noexcept {
+        auto value = counter.load(std::memory_order_relaxed);
+        do {
+            if (amount > limit || value > limit - amount) return false;
+        } while (!counter.compare_exchange_weak(value, value + amount,
+                     std::memory_order_relaxed));
+        return true;
+    }
     Limits limits_;
-    Usage usage_;
+    std::atomic<size_t> associations_{0};
+    std::atomic<size_t> datagrams_{0};
+    std::atomic<size_t> payload_capacity_{0};
 };
 
 } // namespace acpp::worker_detail

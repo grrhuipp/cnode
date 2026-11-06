@@ -4,12 +4,9 @@
 #include "acppnode/common/buffer_util.hpp"
 #include "acppnode/transport/internet/timeout_scheduler.hpp"
 #include "connection_timeouts.hpp"
+#include "native_socket_handoff.hpp"
 
-#include <asio/as_tuple.hpp>
-#include <asio/use_awaitable.hpp>
 #include <asio/buffer.hpp>
-#include <asio/bind_allocator.hpp>
-#include <asio/bind_cancellation_slot.hpp>
 
 #include <algorithm>
 #include <array>
@@ -64,15 +61,15 @@ private:
 };
 
 struct ConnectTimeout final : TimeoutEvent {
-    explicit ConnectTimeout(tcp::socket& socket) : socket(socket) {}
+    explicit ConnectTimeout(TcpStream& stream) : stream(stream) {}
 
     void OnTimeout() override {
         timed_out = true;
-        IoErrorCode ignored;
-        socket.close(ignored);
+        stream.Cancel();
+        stream.Close();
     }
 
-    tcp::socket& socket;
+    TcpStream& stream;
     bool timed_out = false;
 };
 
@@ -99,9 +96,10 @@ enum Flag : uint8_t {
     kDeferWriteCancellation = 1u << 4,
 };
 
-struct TcpStream::Impl : memory::ThreadAllocated {
+struct TcpStream::Impl : memory::ThreadAllocated,
+                         transport::internet::detail::NativeSocketHandoff<tcp> {
     explicit Impl(tcp::socket socket, TcpStream& owner)
-        : socket(std::move(socket))
+        : NativeSocketHandoff(std::move(socket))
         , owner(owner)
         , timeouts(SocketIoContext(this->socket), *this)
         , executor(ExecutionDomain::Current() ? ExecutionDomain::Current()->Executor()
@@ -117,6 +115,8 @@ struct TcpStream::Impl : memory::ThreadAllocated {
         owner.Close();
     }
 
+    void HandoffFailed() noexcept override { owner.Cancel(); owner.Close(); }
+
     [[nodiscard]] bool HasFlag(Flag flag) const noexcept {
         return (flags & static_cast<uint8_t>(flag)) != 0;
     }
@@ -129,7 +129,6 @@ struct TcpStream::Impl : memory::ThreadAllocated {
         }
     }
 
-    tcp::socket socket;
     TcpStream& owner;
     transport::internet::detail::ConnectionTimeouts<Impl> timeouts;
     net::any_io_executor executor;
@@ -281,9 +280,7 @@ net::awaitable<void> TcpStream::WriteBuffers(
                 if (errno == EINTR) continue;
                 if (errno != EAGAIN && errno != EWOULDBLOCK)
                     throw IoSystemError(IoErrorCode(errno, std::system_category()));
-                auto [ec] = co_await impl_->socket.async_wait(tcp::socket::wait_write,
-                    net::bind_cancellation_slot(slot, net::bind_allocator(
-                        memory::ProcessAllocator<std::byte>{}, net::as_tuple(net::use_awaitable))));
+                const auto ec = co_await impl_->Wait(tcp::socket::wait_write, slot);
                 if (ec) throw IoSystemError(ec);
                 continue;
             }
@@ -331,6 +328,7 @@ void TcpStream::ShutdownWrite() {
 
 void TcpStream::Close() {
     ReleasePendingData();
+    impl_->MarkCancelled();
     impl_->timeouts.Stop();
     NotifyClosed();
     if (impl_->socket.is_open()) {
@@ -350,6 +348,7 @@ void TcpStream::Close() {
 }
 
 void TcpStream::Cancel() noexcept {
+    impl_->MarkCancelled();
     NotifyCancellation();
     if (impl_->socket.is_open()) {
         IoErrorCode ec;
@@ -392,9 +391,7 @@ net::awaitable<std::pair<IoErrorCode, std::size_t>> TcpStream::AsyncReceiveSome(
         if (errno == EINTR) continue;
         if (errno != EAGAIN && errno != EWOULDBLOCK)
             co_return std::make_pair(IoErrorCode(errno, std::system_category()), size_t{0});
-        auto [ec] = co_await impl_->socket.async_wait(tcp::socket::wait_read,
-            net::bind_allocator(memory::ProcessAllocator<std::byte>{},
-                net::as_tuple(net::use_awaitable)));
+        const auto ec = co_await impl_->Wait(tcp::socket::wait_read, cancellation.slot());
         if (ec) co_return std::make_pair(ec, size_t{0});
     }
 }
@@ -547,10 +544,7 @@ net::awaitable<IoErrorCode> TcpStream::WaitReadable(net::cancellation_slot cance
         (co_await net::this_coro::cancellation_state).cancelled() != net::cancellation_type::none) {
         co_return IoErrorCode(io_error::operation_aborted);
     }
-    auto [ec] = co_await impl_->socket.async_wait(
-        tcp::socket::wait_read,
-        net::bind_cancellation_slot(cancellation, net::bind_allocator(
-            memory::ProcessAllocator<std::byte>{}, net::as_tuple(net::use_awaitable))));
+    const auto ec = co_await impl_->Wait(tcp::socket::wait_read, cancellation);
     if (completion.Cancelled() && !ec) {
         co_return IoErrorCode(io_error::operation_aborted);
     }
@@ -606,40 +600,43 @@ tcp::endpoint TcpStream::RemoteEndpoint() const {
 // 静态连接方法
 // ============================================================================
 
-namespace {
-
-// The caller owns a dedicated, possibly bound socket; the connect deadline is
-// the scheduler event embedded in this frame.
-net::awaitable<DialResult> ConnectSocket(
-    net::io_context& io_context,
+// Register the stable stream before connect suspends. A pending dial then
+// transfers its existing in-progress fd just like an established connection.
+net::awaitable<DialResult> TcpStream::ConnectSocket(
     tcp::socket socket,
     const tcp::endpoint& endpoint,
     std::chrono::seconds timeout) {
-    ConnectTimeout deadline(socket);
-    auto& scheduler = TimeoutScheduler::ForIoContext(io_context);
+    auto stream = std::make_unique<TcpStream>(std::move(socket));
+    ConnectTimeout deadline(*stream);
+    auto& scheduler = TimeoutScheduler::ForIoContext(SocketIoContext(stream->impl_->socket));
     if (!scheduler.ScheduleAfter(
             std::chrono::duration_cast<std::chrono::milliseconds>(timeout), deadline))
         co_return DialResult::Fail(ErrorCode::CANCELLED, "connection cancelled");
 
-    auto [connect_ec] = co_await socket.async_connect(endpoint,
-        net::bind_allocator(memory::ProcessAllocator<std::byte>{},
-            net::as_tuple(net::use_awaitable)));
-
+    IoErrorCode connect_ec;
+    const auto result = ::connect(stream->NativeHandle(), endpoint.data(), endpoint.size());
+    if (result != 0 && errno != EISCONN) {
+        if (errno == EINPROGRESS || errno == EALREADY || errno == EINTR) {
+            const auto cancellation = co_await net::this_coro::cancellation_state;
+            connect_ec = co_await stream->impl_->Wait(tcp::socket::wait_write, cancellation.slot());
+            if (!connect_ec) {
+                int error = 0;
+                socklen_t size = sizeof(error);
+                if (::getsockopt(stream->NativeHandle(), SOL_SOCKET, SO_ERROR, &error, &size) != 0)
+                    error = errno;
+                if (error != 0) connect_ec = IoErrorCode(error, std::system_category());
+            }
+        } else {
+            connect_ec = IoErrorCode(errno, std::system_category());
+        }
+    }
     deadline.Cancel();
-
-    if (deadline.timed_out) {
+    if (deadline.timed_out)
         co_return DialResult::Fail(ErrorCode::DIAL_TIMEOUT, "connection timed out");
-    }
-
-    if (connect_ec) {
-        auto err = MapAsioError(connect_ec);
-        co_return DialResult::Fail(err, connect_ec.message(), connect_ec.value());
-    }
-    co_return DialResult::Success(
-        std::make_unique<TcpStream>(std::move(socket)));
+    if (connect_ec)
+        co_return DialResult::Fail(MapAsioError(connect_ec), connect_ec.message(), connect_ec.value());
+    co_return DialResult::Success(std::move(stream));
 }
-
-}  // namespace
 
 net::awaitable<DialResult> TcpStream::Connect(
     net::io_context& io_context,
@@ -649,8 +646,13 @@ net::awaitable<DialResult> TcpStream::Connect(
     if (timeout.count() <= 0) {
         co_return DialResult::Fail(ErrorCode::DIAL_TIMEOUT, "connection timed out");
     }
-    co_return co_await ConnectSocket(
-        io_context, tcp::socket(io_context), endpoint, timeout);
+    auto& reactor = transport::internet::detail::CurrentSocketReactor(io_context);
+    IoErrorCode ec;
+    tcp::socket socket(reactor);
+    socket.open(endpoint.protocol(), ec);
+    if (ec)
+        co_return DialResult::Fail(ErrorCode::SOCKET_CREATE_FAILED, ec.message(), ec.value());
+    co_return co_await ConnectSocket(std::move(socket), endpoint, timeout);
 }
 
 net::awaitable<DialResult> TcpStream::ConnectWithBind(
@@ -663,7 +665,7 @@ net::awaitable<DialResult> TcpStream::ConnectWithBind(
         co_return DialResult::Fail(ErrorCode::DIAL_TIMEOUT, "connection timed out");
     }
 
-    tcp::socket socket(io_context);
+    tcp::socket socket(transport::internet::detail::CurrentSocketReactor(io_context));
     IoErrorCode ec;
     socket.open(remote_endpoint.protocol(), ec);
     if (ec) {
@@ -677,8 +679,7 @@ net::awaitable<DialResult> TcpStream::ConnectWithBind(
             ErrorCode::SOCKET_BIND_FAILED, ec.message(), ec.value());
     }
 
-    co_return co_await ConnectSocket(
-        io_context, std::move(socket), remote_endpoint, timeout);
+    co_return co_await ConnectSocket(std::move(socket), remote_endpoint, timeout);
 }
 
 // ============================================================================

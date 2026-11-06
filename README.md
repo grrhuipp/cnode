@@ -42,6 +42,8 @@ cmake --build build --target anytls_reference_integration
 
 与官方 Xray 的双向 Vision、VLESS Encryption 跨 Worker 票据及明文 XHTTP stream-up 互通，分别使用 `tests/vless_xray_interop.py`、`tests/vless_encryption_xray_interop.py`、`tests/xhttp_stream_up_xray_integration.py`；三个入口都接受 `--binary build/cnode --xray /path/to/xray --output build/<独立结果目录>`。参考版本要求由脚本维护，结果目录保留协议观察与子进程日志。
 
+被动跨 Worker 接管验证：`python3 tests/udp_relay_integration.py --binary build/cnode --output build/udp-handoff --case freedom-native_ss2022_isolation` 使用四 Worker，覆盖 SS2022 AES/ChaCha、换源后的回包、防重放与出站端口连续性。Hysteria 使用真实 v1/v2 客户端：先启动四 Worker、固定 UDP 端口、debug 日志的 cnode，再运行 `python3 tests/hysteria_passive_migration.py --version 2 --client /path/to/hysteria --server-port 38443 --server-log /path/to/server.log --auth <测试口令> --output build/hy2-handoff`；v1 改为 `--version 1` 和对应客户端。脚本要求实际跨 Worker 提交证据，并保持原 TCP/UDP 会话与第二条独立连接；TCP/AnyTLS 上游的连接不重建验证可通过脚本的 `--upstream-target`、`--upstream-proxy-port` 透明计数入口执行。
+
 发布回归应使用 `Release`：默认启用 LTO，`RelWithDebInfo` 不覆盖这条优化路径，不能替代发布配置的验证。Linux 的密码学故障注入测试单独保留链接器可拦截的调用边界，主程序与依赖仍使用 Release LTO。
 
 集成测试按实际监听范围预留动态端口：同时监听 TCP/UDP 的场景会占有两个协议的同号端口，写完配置后才释放并启动进程，避免把仅 UDP 空闲的端口用于 TCP 监听。
@@ -83,11 +85,15 @@ main
 
 不再使用源地址 CBPF 亲和；同一 XHTTP session 可来自不同客户端／CDN 回源地址，无须设为 `workers: 1`。不共享状态的会话组仍独立调度，整个入站不会被固定到一个 Worker。短上传完成后事件驱动移除目录和域成员，迟到上传由有界 tombstone 拒绝，不在满容量路径逐次扫描整张会话表。面板、DNS 和跨域元数据操作仍通过有界控制入口交互。
 
+QUIC 与具有已认证会话身份的原生 UDP 关联只因同一会话的数据实际落到另一 Worker 而被动接管，不按负载或空闲定时迁移。QUIC 必须完成路径验证；SS2022 按配置、凭据和客户端会话身份隔离并保持唯一防重放状态。交接先冻结业务执行、排空原生 I/O 与回包，再将原 socket、协议状态、未完成读写和超时绑定到实际收包 Worker；失败回滚，不能恢复的会话关闭。仍在使用的出站连接一并接管，不重新拨号或更换本地端口，不移动共享入站监听 socket。TCP 重连是新连接，TCP 承载的 UoT 不单独迁移；无可验证会话身份的 UDP 不跨地址拼接关联。Hysteria2 仍只提供配置的服务端 UDP 端口，不实现端口跳跃。
+
+执行域直接复用 Worker executor，不在协调器路由缓存中保留 `strand` 等依赖 reactor 私有分配器的对象，避免 Worker 退出后的延迟析构访问失效服务。饱和到时钟上限的超时仍保留可取消的原生等待，取消或提前到期不因重新分配等待节点而失败。
+
 监听前完成配置校验、路由编译、不可变策略和 TLS／REALITY 上下文准备；物理执行域只按实际协议与所选出口延迟创建运行态宿主，不复制整套 Worker runtime。控制面发布候选快照失败时保留旧配置。
 
 数据 Worker 的监听标签、端点索引与 socket 控制块使用所属线程的 PMR。注销完成后移除注册项；尚未结束的 accept / receive 循环仅保留收束所需的退役状态，并在原 Worker 上释放，不累计空标签条目，也不把监听所有权带入每个请求。
 
-出站配置与认证凭据在冷路径准备为不可变快照，handler 持有该快照，不在各执行域内重复解析或深拷贝。AnyTLS 池和启用 VLESS Encryption 的跨请求状态具有独立执行域，按原准入 Worker、配置快照与出站 tag 隔离；借用请求先与池合组，物理入站关闭不会销毁健康空闲池或票据缓存。无共享可变状态的出口保持请求域独占。替换配置停止旧池的新借用，已有请求继续使用旧快照，结束后收束旧池任务。空 PMR 容器只弱引用轻量分配域，不延长已退役物理连接寿命；若该容器随后复用，则在首次分配前绑定当前执行域。
+出站配置与认证凭据在冷路径准备为不可变快照，handler 持有该快照，不在各执行域内重复解析或深拷贝。AnyTLS 空闲池与 VLESS Encryption 票据宿主按原准入 Worker、配置快照与出站 tag 隔离，不因请求迁移改变命名空间。AnyTLS 物理连接具有独立执行域，借出时独占附着到请求会话组，使用期间随请求接管；请求结束后分离，健康连接返回原池。不同活跃请求不并发借用同一物理连接。VLESS 请求按值借用票据并在宿主内条件发布，不因共享票据永久合并入站执行域。替换配置停止旧池的新借用，已有请求继续使用旧快照，结束后收束旧池任务。空 PMR 容器只弱引用轻量分配域，不延长已退役物理连接寿命；若该容器随后复用，则在首次分配前绑定当前执行域。
 
 proxyman / ingress 在冷路径准备 receiver 语义，公开 Dispatcher 只接收请求所需的窄契约；强制出口和未命中回退属于 Dispatcher 编排，Router 只回答“哪条路由规则命中”。每个 receiver 必须在构建时明确选择 `ForceOutbound` 或 `RouteWithFallback`，不存在 Worker 全局默认出口，也不存在可进入热路径的空策略。cnode 使用强类型、只读 `DispatchPolicy`，不把完整 `ReceiverSettings` 或可变配置 context 传入 Dispatcher。面板 `DetectRule` 由 Worker-local 实现通过通用 `RequestPolicy` 接口提供 allow / block 结果，不进入 Router，也不让 Dispatcher 依赖面板规则管理器。
 

@@ -21,6 +21,7 @@
 #include "acppnode/transport/internet/transport_stack.hpp"
 #include "../tls_client_context.hpp"
 #include "../../../proxy/inbound_admission.hpp"
+#include "../../../common/awaitable_task_group.hpp"
 
 #include <nghttp3/nghttp3.h>
 #include <ngtcp2/ngtcp2.h>
@@ -42,6 +43,7 @@
 #include <limits>
 #include <optional>
 #include <stdexcept>
+#include <deque>
 #include <utility>
 
 namespace acpp::transport::internet::hysteria {
@@ -144,30 +146,10 @@ int SelectAlpn(SSL*, const uint8_t** out, uint8_t* outlen,
 
 }  // namespace
 
-struct ConnectionId {
-    std::array<uint8_t, NGTCP2_MAX_CIDLEN> bytes{};
-    uint8_t size = 0;
-
-    explicit ConnectionId(const ngtcp2_cid& cid) noexcept
-        : size(static_cast<uint8_t>(cid.datalen)) {
-        std::copy_n(cid.data, cid.datalen, bytes.begin());
-    }
-    ConnectionId(const uint8_t* data, size_t length) noexcept
-        : size(static_cast<uint8_t>(length)) {
-        std::copy_n(data, length, bytes.begin());
-    }
-    bool operator==(const ConnectionId&) const noexcept = default;
-};
-
-struct ConnectionIdHash {
-    size_t operator()(const ConnectionId& id) const noexcept {
-        size_t hash = 1469598103934665603ULL;
-        for (size_t i = 0; i < id.size; ++i) {
-            hash ^= id.bytes[i];
-            hash *= 1099511628211ULL;
-        }
-        return hash ^ id.size;
-    }
+struct PendingPacket {
+    std::shared_ptr<SocketState> socket;
+    udp::endpoint remote;
+    std::vector<uint8_t> bytes;
 };
 
 struct SocketState final : memory::ThreadAllocated {
@@ -180,31 +162,53 @@ struct SocketState final : memory::ThreadAllocated {
     struct Output {
         std::vector<uint8_t> data;
         udp::endpoint remote;
+        std::shared_ptr<QuicOwnership> owner;
     };
     memory::ThreadLocalDeque<Output> output;
     SignalChannel changed;
+    std::shared_ptr<QuicOwnership> sending;
+    net::steady_timer drained{changed.get_executor()};
 };
 
-// The Worker-local listener: sockets, CID routing, the shared expiry timer and
-// the task group of every connection-owned coroutine.
+// Worker-local sockets, receive staging, native send ownership and one expiry
+// timer. Connection business tasks live in their own migratable domains.
 class QuicListener final : public memory::ThreadAllocated {
 public:
     QuicListener(uint32_t worker_id, net::io_context& io,
-                 routing::Dispatcher& dispatcher, StatsShard& stats,
-                 ConnectionLimiter& limiter, UserOnlineTracker& tracker,
-                 app::RequestLoadState& request_load, const TimeoutsConfig& timeouts,
-                 const proxyman::inbound::BuildRequest& request,
-                 std::shared_ptr<proxyman::inbound::Handler> handler);
+                 app::DatagramSessionEnvironment environment);
 
     [[nodiscard]] const proxyman::inbound::ReceiverSettings& Receiver() const noexcept {
-        return handler->ReceiverSettings();
+        return *environment.receiver;
     }
 
     void Spawn(net::awaitable<void> task);
     [[nodiscard]] bool Queue(SocketState& socket, std::vector<uint8_t> data,
-                             udp::endpoint remote);
+                             udp::endpoint remote,
+                             std::shared_ptr<QuicOwnership> owner);
     void Associate(const ngtcp2_cid& cid, std::shared_ptr<Connection> connection);
     void Dissociate(const ngtcp2_cid& cid) noexcept;
+    void DissociateAll(const std::shared_ptr<QuicOwnership>& owner) noexcept;
+    SocketState* Resolve(const udp::endpoint& local) noexcept;
+    net::awaitable<void> Drain(const std::shared_ptr<QuicOwnership>& owner);
+    void Enqueue(std::shared_ptr<Connection> connection, PendingPacket packet);
+    void Pump(const std::shared_ptr<Connection>& connection);
+    net::awaitable<void> Claim(std::shared_ptr<QuicOwnership> owner);
+    struct Inbox {
+        explicit Inbox(net::io_context& io) : wake(io) {}
+        std::deque<PendingPacket> packets;
+        size_t bytes = 0;
+        bool scheduled = false;
+        net::steady_timer wake;
+    };
+    bool Stage(Inbox& inbox, PendingPacket packet);
+    std::unordered_map<QuicOwnership*, std::shared_ptr<Inbox>> inboxes;
+    app::DatagramSessionEnvironment environment;
+    QuicDirectory& directory;
+    std::string directory_space;
+    std::shared_ptr<QuicListenerIdentity> identity = std::make_shared<QuicListenerIdentity>();
+    size_t connection_tasks = 0;
+    size_t pending_claims = 0;
+    std::unordered_map<QuicOwnership*, std::shared_ptr<Connection>> sessions;
     net::awaitable<void> ReceiveLoop(std::shared_ptr<SocketState> socket);
     net::awaitable<void> SendLoop(std::shared_ptr<SocketState> socket);
     void ArmExpiry();
@@ -213,13 +217,6 @@ public:
 
     uint32_t worker_id;
     net::io_context& io;
-    routing::Dispatcher& dispatcher;
-    StatsShard& stats;
-    ConnectionLimiter& limiter;
-    UserOnlineTracker& tracker;
-    app::RequestLoadState& request_load;
-    const TimeoutsConfig& timeouts;
-    std::shared_ptr<proxyman::inbound::Handler> handler;
     Version version = Version::V2;
     uint64_t upload_bytes_per_second = 0;
     uint64_t download_bytes_per_second = 0;
@@ -238,10 +235,24 @@ public:
 
 Connection::Connection(
     QuicListener& listener, SocketState& socket, const udp::endpoint& remote)
-    : listener_(listener)
-    , physical_ready_(listener.io, 1) {
+    : listener_(&listener)
+    , capabilities_(app::PhysicalSessionCapabilities::Create(
+          listener.environment.configuration, listener.environment.limiter,
+          listener.environment.request_load, *listener.environment.dns_worker,
+          listener.environment.prepared, listener.environment.receiver))
+    , ownership_([&] {
+          auto owner = std::make_shared<QuicOwnership>();
+          owner->domain = ExecutionDomain::Create(listener.io, listener.worker_id,
+              listener.io.get_executor(), capabilities_, listener.environment.coordinator);
+          owner->owner.store(listener.worker_id);
+          owner->listener.store(listener.identity.get());
+          return owner;
+      }())
+    , closed_signal_(ownership_->domain->Executor(), 1)
+    , physical_ready_(ownership_->domain->Executor(), 1) {
+    capabilities_->BindDomain(ownership_->domain);
     core_ = std::make_unique<Core>(allocation_);
-    core_->socket = &socket;
+    core_->local = socket.local;
     core_->remote = remote;
     InitializeBaseContext(remote);
 }
@@ -251,11 +262,29 @@ std::shared_ptr<Connection> Connection::Create(
     const udp::endpoint& remote, const ngtcp2_pkt_hd& header) {
     auto connection = std::shared_ptr<Connection>(
         new Connection(listener, socket, remote));
-    if (!connection->Initialize(header)) return {};
-    listener.stats.OnConnectionAccepted();
-    connection->stats_open_ = true;
-    listener.Associate(connection->core_->server_cid, connection);
-    connection->SpawnOwned(connection->ReservePhysicalAdmission());
+    connection->ownership_->connection = connection;
+    connection->registry_ = listener.environment.registry;
+    listener.Associate(header.dcid, connection);
+    listener.sessions.emplace(connection->ownership_.get(), connection);
+    ++listener.connection_tasks;
+    try {
+    net::co_spawn(connection->Executor(), connection->Run(header),
+        [connection](std::exception_ptr error) {
+            auto* owner = connection->listener_;
+            connection->Close();
+            owner->sessions.erase(connection->ownership_.get());
+            owner->inboxes.erase(connection->ownership_.get());
+            --owner->connection_tasks;
+            owner->changed.cancel();
+            if (error && !IsOperationCancelled(error))
+                LOG_ERROR("Hysteria connection task failed worker={}", owner->worker_id);
+        });
+    } catch (...) {
+        connection->Close();
+        listener.sessions.erase(connection->ownership_.get());
+        --listener.connection_tasks;
+        throw;
+    }
     return connection;
 }
 
@@ -270,13 +299,18 @@ int Connection::NewConnectionId(ngtcp2_conn*, ngtcp2_cid* cid, uint8_t* token,
     cid->datalen = length;
     if (RAND_bytes(token, NGTCP2_STATELESS_RESET_TOKENLEN) != 1)
         return NGTCP2_ERR_CALLBACK_FAILURE;
-    self.listener_.Associate(*cid, self.shared_from_this());
+    auto* target = self.validating_ ? self.validation_listener_ : self.listener_;
+    try { target->Associate(*cid, self.shared_from_this()); }
+    catch (...) { return NGTCP2_ERR_CALLBACK_FAILURE; }
     return 0;
 }
 
 int Connection::RemoveConnectionId(ngtcp2_conn*, const ngtcp2_cid* cid,
     void* user_data) {
-    static_cast<Connection*>(user_data)->listener_.Dissociate(*cid);
+    auto& self = *static_cast<Connection*>(user_data);
+    self.listener_->directory.Remove(self.listener_->directory_space,
+        ConnectionId(*cid), self.ownership_);
+    (self.validating_ ? self.validation_listener_ : self.listener_)->Dissociate(*cid);
     return 0;
 }
 
@@ -295,7 +329,7 @@ int Connection::ReceiveTxKey(ngtcp2_conn*, ngtcp2_encryption_level level,
     void* user_data) {
     auto& self = *static_cast<Connection*>(user_data);
     return level == NGTCP2_ENCRYPTION_LEVEL_1RTT &&
-           self.listener_.version == Version::V2 && !self.SetupHttp3()
+           self.listener_->version == Version::V2 && !self.SetupHttp3()
         ? NGTCP2_ERR_CALLBACK_FAILURE : 0;
 }
 
@@ -304,22 +338,22 @@ int Connection::ReceiveDatagram(ngtcp2_conn*, uint32_t flags,
     auto& self = *static_cast<Connection*>(user_data);
     if ((flags & NGTCP2_DATAGRAM_FLAG_0RTT) || !self.authenticated_)
         return 0;
-    auto message = ParseUdpMessage(self.listener_.version, {data, length});
+    auto message = ParseUdpMessage(self.listener_->version, {data, length});
     if (message) self.HandleUdpMessage(*message);
     return 0;
 }
 
 void Connection::InitializeBaseContext(const udp::endpoint& remote) {
-    const auto& receiver = listener_.Receiver();
-    base_context_.conn_id = session::NewID(listener_.worker_id);
-    base_context_.worker_id = listener_.worker_id;
+    const auto& receiver = listener_->Receiver();
+    base_context_.conn_id = session::NewID(listener_->worker_id);
+    base_context_.worker_id = listener_->worker_id;
     base_context_.inbound.tag = receiver.inbound_tag;
     base_context_.inbound.accounting_key = receiver.accounting_key;
     if (const auto* route_tags = receiver.RouteInboundTags()) {
         base_context_.inbound.tags.reserve(route_tags->size());
         for (const auto& tag : *route_tags) base_context_.inbound.tags.emplace_back(tag);
     }
-    const auto& local = core_->socket->local;
+    const auto& local = core_->local;
     if (!local.address().is_unspecified()) {
         base_context_.inbound.local_endpoint =
             tcp::endpoint(iputil::NormalizeAddress(local.address()), local.port());
@@ -359,8 +393,10 @@ bool Connection::Initialize(const ngtcp2_pkt_hd& header) {
     callbacks.version_negotiation = ngtcp2_crypto_version_negotiation_cb;
     callbacks.recv_tx_key = &ReceiveTxKey;
     callbacks.recv_datagram = &ReceiveDatagram;
+    callbacks.path_validation = &PathValidated;
+    callbacks.begin_path_validation = &PathValidationStarted;
 
-    const auto& timeouts = listener_.timeouts;
+    const auto& timeouts = listener_->environment.configuration->timeouts;
     ngtcp2_settings quic_settings;
     ngtcp2_settings_default(&quic_settings);
     quic_settings.initial_ts = Timestamp();
@@ -383,9 +419,9 @@ bool Connection::Initialize(const ngtcp2_pkt_hd& header) {
     parameters.original_dcid_present = 1;
     parameters.original_dcid = header.dcid;
 
-    auto local = MakeAddress(core_->socket->local);
+    auto local = MakeAddress(core_->local);
     auto remote = MakeAddress(core_->remote);
-    ngtcp2_path path{local, remote, core_->socket};
+    ngtcp2_path path{local, remote, &core_->path_binding};
     if (ngtcp2_conn_server_new(
             &core_->quic, &header.scid, &core_->server_cid, &path,
             header.version, &callbacks, &quic_settings, &parameters,
@@ -393,7 +429,7 @@ bool Connection::Initialize(const ngtcp2_pkt_hd& header) {
         return false;
 
     core_->conn_ref = {&GetConn, this};
-    core_->ssl = SSL_new(listener_.ssl_context.get());
+    core_->ssl = SSL_new(listener_->ssl_context.get());
     if (!core_->ssl) return false;
     SSL_set_app_data(core_->ssl, &core_->conn_ref);
     SSL_set_accept_state(core_->ssl);
@@ -402,11 +438,180 @@ bool Connection::Initialize(const ngtcp2_pkt_hd& header) {
 }
 
 void Connection::SpawnOwned(net::awaitable<void> task) {
-    listener_.Spawn([](std::shared_ptr<Connection> owner,
-                       net::awaitable<void> owned_task) -> net::awaitable<void> {
-        co_await std::move(owned_task);
-        (void)owner;
+    tasks_->Spawn([](std::shared_ptr<Connection> owner, net::awaitable<void> request)
+        -> net::awaitable<void> {
+        try { co_await std::move(request); }
+        catch (const std::exception& error) {
+            if (!owner->closed_)
+                LOG_CONN_DEBUG(owner->base_context_, "Hysteria request ended > {}", error.what());
+        } catch (...) {
+            if (!owner->closed_)
+                LOG_CONN_DEBUG(owner->base_context_, "Hysteria request ended > unknown failure");
+        }
     }(shared_from_this(), std::move(task)));
+}
+
+net::awaitable<void> Connection::Run(ngtcp2_pkt_hd header) {
+    std::exception_ptr failure;
+    try {
+        registry_record_ = registry_->Register(capabilities_, ownership_->domain);
+        registry_record_->conn_id = base_context_.conn_id;
+        co_await RunAwaitableTaskGroup(Executor(), [&](AwaitableTaskGroup& tasks) {
+            tasks_ = &tasks;
+            capabilities_->Initialize(Reactor(), tasks);
+            registry_record_->initialized.store(true, std::memory_order_release);
+            ownership_->domain->RegisterResource(*this);
+            resource_registered_ = true;
+            if (!Initialize(header)) {
+                Close();
+                return;
+            }
+            listener_->Associate(core_->server_cid, shared_from_this());
+            capabilities_->Stats().OnConnectionAccepted();
+            stats_open_ = true;
+            tasks.Spawn(WaitClosed());
+            tasks.Spawn(ReservePhysicalAdmission());
+            listener_->Pump(shared_from_this());
+        });
+    } catch (...) { failure = std::current_exception(); }
+    Close();
+    tasks_ = nullptr;
+    co_await listener_->Drain(ownership_);
+    if (resource_registered_) {
+        ownership_->domain->UnregisterResource(*this);
+        resource_registered_ = false;
+    }
+    core_.reset();
+    try { co_await capabilities_->AsyncJoin(); }
+    catch (...) { if (!failure) failure = std::current_exception(); }
+    if (registry_record_) co_await registry_->Retire(std::move(registry_record_));
+    if (failure) std::rethrow_exception(failure);
+}
+
+net::awaitable<void> Connection::WaitClosed() {
+    if (!closed_) {
+        auto [error] = co_await closed_signal_.async_receive(
+            net::as_tuple(net::use_awaitable));
+        (void)error;
+    }
+    capabilities_->RequestStop();
+}
+
+SocketState* Connection::OutputSocket(const ngtcp2_path& path) const noexcept {
+    if (path.user_data != &core_->path_binding) return nullptr;
+    auto local = EndpointFromAddress(path.local);
+    return local ? (validating_ ? validation_listener_ : listener_)->Resolve(*local) : nullptr;
+}
+
+void Connection::PublishExpiry() noexcept {
+    ownership_->expiry.store(Expiry());
+    (validating_ ? validation_listener_ : listener_)->ArmExpiry();
+}
+
+net::awaitable<void> Connection::PrepareHandoff(const ExecutionDomain::HandoffTarget&) {
+    // Runs on the old native Worker after all business callbacks have exited.
+    listener_->DissociateAll(ownership_);
+    listener_->inboxes.erase(ownership_.get());
+    co_await listener_->Drain(ownership_);
+    listener_->ArmExpiry();
+}
+
+void Connection::CommitHandoff(const ExecutionDomain::HandoffTarget& target) noexcept {
+    auto* previous = listener_;
+    const auto previous_worker = previous->worker_id;
+    listener_ = validation_listener_;
+    ++listener_->connection_tasks;
+    ownership_->owner.store(target.worker_id);
+    ownership_->listener.store(listener_->identity.get());
+    net::post(previous->io, [previous, owner = ownership_] {
+        if (owner->listener.load() != previous->identity.get())
+            previous->sessions.erase(owner.get());
+        --previous->connection_tasks;
+        previous->changed.cancel();
+    });
+    base_context_.worker_id = target.worker_id;
+    core_->local = candidate_local_;
+    core_->remote = candidate_remote_;
+    EndValidation(true);
+    try {
+        LOG_CONN_DEBUG(base_context_, "QUIC passive handoff committed old_owner={} receiving_worker={} remote={}:{} path_evidence={}",
+            previous_worker, target.worker_id, candidate_remote_.address().to_string(),
+            candidate_remote_.port(), validation_reused_ ? "reused" : "challenge");
+    } catch (...) {} // A logging allocation must not interrupt native commit.
+}
+
+net::awaitable<void> Connection::CancelHandoff(const ExecutionDomain::HandoffTarget&) {
+    // Server-side ngtcp2 has no public rollback API. A rejected ciphertext
+    // leaves the path untouched, and a failed probe normally restores its
+    // fallback. Never resume an old owner with a different selected path.
+    if (validating_ && !closed_ &&
+        !ngtcp2_path_eq(ngtcp2_conn_get_path(core_->quic),
+                        &validation_original_path_.path)) {
+        Close();
+    }
+    EndValidation(false);
+    if (!closed_) {
+        memory::ScopedWorkerAllocation worker_allocation;
+        for (const auto& cid : listener_->directory.Snapshot(ownership_))
+            listener_->connections.emplace(cid, shared_from_this());
+        PublishExpiry();
+    }
+    co_return;
+}
+
+void Connection::BeginValidation(QuicListener& target, const udp::endpoint& local,
+                                 const udp::endpoint& remote) {
+    validation_listener_ = &target;
+    candidate_local_ = local;
+    candidate_remote_ = remote;
+    validating_ = true;
+    validation_succeeded_ = false;
+    validation_reused_ = false;
+    validation_authenticated_ = false;
+    validation_pending_ = false;
+    ngtcp2_path_storage_zero(&validation_original_path_);
+    ngtcp2_path_copy(&validation_original_path_.path, ngtcp2_conn_get_path(core_->quic));
+}
+
+bool Connection::CandidateSelected() const noexcept {
+    const auto* path = ngtcp2_conn_get_path(core_->quic);
+    auto local = EndpointFromAddress(path->local);
+    auto remote = EndpointFromAddress(path->remote);
+    return local && remote && *local == candidate_local_ && *remote == candidate_remote_;
+}
+
+int Connection::PathValidationStarted(ngtcp2_conn*, uint32_t,
+    const ngtcp2_path* path, const ngtcp2_path*, void* user_data) {
+    auto& self = *static_cast<Connection*>(user_data);
+    if (!self.validating_) return 0;
+    auto local = EndpointFromAddress(path->local);
+    auto remote = EndpointFromAddress(path->remote);
+    // Only a probe started for this claim is evidence. ngtcp2's background
+    // fallback probes can finish silently, without a path_validation callback.
+    if (local && remote && *local == self.candidate_local_ &&
+        *remote == self.candidate_remote_) self.validation_pending_ = true;
+    return 0;
+}
+
+int Connection::PathValidated(ngtcp2_conn*, uint32_t,
+    const ngtcp2_path* path, const ngtcp2_path*,
+    ngtcp2_path_validation_result result, void* user_data) {
+    auto& self = *static_cast<Connection*>(user_data);
+    if (!self.validating_) return 0;
+    auto local = EndpointFromAddress(path->local);
+    auto remote = EndpointFromAddress(path->remote);
+    if (local && remote && *local == self.candidate_local_ &&
+        *remote == self.candidate_remote_) {
+        self.validation_pending_ = false;
+        if (result == NGTCP2_PATH_VALIDATION_RESULT_SUCCESS)
+            self.validation_succeeded_ = true;
+    }
+    return 0;
+}
+
+void Connection::EndValidation(bool committed) noexcept {
+    validating_ = false;
+    if (!committed) validation_listener_ = nullptr;
 }
 
 bool Connection::Feed(SocketState& socket, const udp::endpoint& remote,
@@ -414,17 +619,43 @@ bool Connection::Feed(SocketState& socket, const udp::endpoint& remote,
     if (!core_ || closed_) return false;
     auto local_addr = MakeAddress(socket.local);
     auto remote_addr = MakeAddress(remote);
-    ngtcp2_path path{local_addr, remote_addr, &socket};
+    ngtcp2_path path{local_addr, remote_addr, &core_->path_binding};
     ngtcp2_pkt_info packet_info{};
+    const bool candidate_was_selected = validating_ && CandidateSelected();
+    uint64_t packets_received = 0;
+    if (validating_) {
+        ngtcp2_conn_info info{};
+        ngtcp2_conn_get_conn_info(core_->quic, &info);
+        packets_received = info.pkt_recv;
+    }
     in_ngtcp2_callback_ = true;
     const int result = ngtcp2_conn_read_pkt(
         core_->quic, &path, &packet_info, packet.data(), packet.size(), Timestamp());
     in_ngtcp2_callback_ = false;
     if (result != 0) {
         if (result != NGTCP2_ERR_DRAINING && result != NGTCP2_ERR_IDLE_CLOSE)
-            listener_.stats.OnError();
+            capabilities_->Stats().OnError();
         Close();
         return false;
+    }
+    if (validating_) {
+        ngtcp2_conn_info info{};
+        ngtcp2_conn_get_conn_info(core_->quic, &info);
+        // pkt_recv excludes AEAD failures and replay-discarded packets.
+        // read_pkt returning zero alone is not evidence of accepted input.
+        if (info.pkt_recv == packets_received) return !closed_;
+        if (!packet.empty() && !(packet.front() & 0x80))
+            validation_authenticated_ = true;
+    }
+    if (validating_ && validation_authenticated_ && !candidate_was_selected &&
+        CandidateSelected() && !CandidateValidationPending() && !validation_succeeded_) {
+        // ngtcp2 selects a different server path only after authenticated,
+        // fresh non-probing 1-RTT input (or a verified PATH_RESPONSE). When
+        // no validation is pending and no SUCCESS fired, it reused a
+        // validated history/fallback path. Merely decrypting a replay or
+        // returning zero from read_pkt cannot satisfy this transition.
+        validation_succeeded_ = true;
+        validation_reused_ = true;
     }
     Flush();
     return !closed_;
@@ -533,12 +764,12 @@ int Connection::OpenStream(ngtcp2_conn*, int64_t stream_id, void* user_data) {
     auto& self = *static_cast<Connection*>(user_data);
     if (!ngtcp2_is_bidi_stream(stream_id)) return 0;
     auto state = memory::AllocateShared<QuicStreamState>(
-        self.listener_.io, stream_id,
+        self.Reactor(), stream_id,
         self.weak_from_this());
     auto [it, inserted] = self.core_->streams.try_emplace(
         stream_id, std::move(state));
     if (!inserted) return NGTCP2_ERR_CALLBACK_FAILURE;
-    const auto version = self.listener_.version;
+    const auto version = self.listener_->version;
     if (version == Version::V1 && stream_id == 0) {
         self.SpawnOwned(self.RunV1Control(stream_id));
     } else if (version == Version::V2 && !self.authenticated_) {
@@ -566,7 +797,11 @@ int Connection::CloseStream(ngtcp2_conn* conn, uint32_t, int64_t stream_id,
 }
 
 void Connection::Flush() {
-    if (!core_ || closed_ || !core_->socket || in_ngtcp2_callback_) return;
+    if (!core_ || closed_ || in_ngtcp2_callback_) return;
+    struct RefreshExpiry {
+        Connection& connection;
+        ~RefreshExpiry() { connection.PublishExpiry(); }
+    } refresh{*this};
     std::array<uint8_t, 64 * 1024> packet{};
     for (size_t attempt = 0; attempt < 64; ++attempt) {
         int64_t stream_id = -1;
@@ -575,7 +810,7 @@ void Connection::Flush() {
         size_t vector_count = 0;
         bool http_data = false;
         std::array<nghttp3_vec, 16> http_vectors{};
-        if (core_->http) {
+        if (!validating_ && core_->http) {
             const auto count = nghttp3_conn_writev_stream(
                 core_->http, &stream_id, &fin,
                 http_vectors.data(), http_vectors.size());
@@ -588,7 +823,7 @@ void Connection::Flush() {
                 vectors[i] = {http_vectors[i].base, http_vectors[i].len};
             http_data = vector_count != 0 || stream_id >= 0;
         }
-        if (!http_data) {
+        if (!validating_ && !http_data) {
             for (auto& [id, stream] : core_->streams) {
                 const bool has_unsent =
                     stream.output_offset < stream.queued_bytes;
@@ -616,11 +851,11 @@ void Connection::Flush() {
                 break;
             }
         }
-        auto local = MakeAddress(core_->socket->local);
+        auto local = MakeAddress(core_->local);
         auto remote = MakeAddress(core_->remote);
-        ngtcp2_path path{local, remote, core_->socket};
+        ngtcp2_path path{local, remote, &core_->path_binding};
         ngtcp2_pkt_info packet_info{};
-        if (!core_->datagrams.empty()) {
+        if (!validating_ && !core_->datagrams.empty()) {
             auto& datagram = core_->datagrams.front();
             ngtcp2_vec vector{datagram.data(), datagram.size()};
             int accepted_datagram = 0;
@@ -635,13 +870,13 @@ void Connection::Flush() {
             }
             if (accepted_datagram) core_->datagrams.pop_front();
             if (written == 0) return;
-            auto* output_socket = static_cast<SocketState*>(path.user_data);
+            auto* output_socket = OutputSocket(path);
             auto output_remote = EndpointFromAddress(path.remote);
             if (!output_socket || !output_remote ||
-                !listener_.Queue(*output_socket,
+                !listener_->Queue(*output_socket,
                     std::vector<uint8_t>(
                         packet.begin(), packet.begin() + written),
-                    *output_remote)) {
+                    *output_remote, ownership_)) {
                 Close();
                 return;
             }
@@ -679,12 +914,13 @@ void Connection::Flush() {
                 it->second.fin_pending = false;
             }
         }
-        auto* output_socket = static_cast<SocketState*>(path.user_data);
+        auto* output_socket = OutputSocket(path);
         auto output_remote = EndpointFromAddress(path.remote);
+        auto* sender = validating_ ? validation_listener_ : listener_;
         if (!output_socket || !output_remote ||
-            !listener_.Queue(*output_socket,
+            !sender->Queue(*output_socket,
                 std::vector<uint8_t>(packet.begin(), packet.begin() + written),
-                *output_remote)) {
+                *output_remote, ownership_)) {
             Close();
             return;
         }
@@ -704,20 +940,22 @@ void Connection::Close() noexcept {
             session->Detach();
         }
         core_->udp_sessions.clear();
-        if (core_->quic) listener_.Dissociate(core_->server_cid);
+        listener_->directory.Retire(listener_->directory_space, ownership_);
+        (validating_ ? validation_listener_ : listener_)->DissociateAll(ownership_);
     }
     if (physical_ == PhysicalAdmission::Pending) (void)physical_ready_.try_send(IoErrorCode{});
     if (stats_open_) {
-        listener_.stats.OnConnectionClosed();
+        capabilities_->Stats().OnConnectionClosed();
         stats_open_ = false;
     }
     stream_sink_.reset();
     online_session_.reset();
     physical_reservation_ = {};
+    (void)closed_signal_.try_send(IoErrorCode{});
 }
 
 net::awaitable<void> Connection::ReservePhysicalAdmission() {
-    auto admission = co_await listener_.limiter.ReservePhysical(
+    auto admission = co_await listener_->environment.limiter->ReservePhysical(
         base_context_.inbound.tag, base_context_.inbound.source_ip,
         base_context_.inbound.HasProxyProtocolClientIP());
     const auto reject = admission.reason;
@@ -728,7 +966,7 @@ net::awaitable<void> Connection::ReservePhysicalAdmission() {
                        ConnectionLimiter::RejectReasonToString(reject));
         LOG_ACCESS(FormatAccessLog(base_context_, AccessStatus::Rejected,
                                   ConnectionLimiter::RejectReasonToString(reject)));
-        listener_.stats.OnError();
+        capabilities_->Stats().OnError();
         physical_ = PhysicalAdmission::Rejected;
         (void)physical_ready_.try_send(IoErrorCode{});
         Refuse();
@@ -746,25 +984,26 @@ net::awaitable<void> Connection::ReservePhysicalAdmission() {
 // No closing period is kept: a retransmission finds no connection.
 void Connection::Refuse() noexcept {
     if (closed_) return;
-    if (core_ && core_->quic && core_->socket &&
+    if (core_ && core_->quic &&
         !ngtcp2_conn_in_closing_period(core_->quic) &&
         !ngtcp2_conn_in_draining_period(core_->quic)) {
         ngtcp2_ccerr error;
         ngtcp2_ccerr_default(&error);
         ngtcp2_ccerr_set_transport_error(&error, NGTCP2_CONNECTION_REFUSED, nullptr, 0);
         std::array<uint8_t, NGTCP2_MAX_UDP_PAYLOAD_SIZE> packet{};
-        auto local = MakeAddress(core_->socket->local);
+        auto local = MakeAddress(core_->local);
         auto remote = MakeAddress(core_->remote);
-        ngtcp2_path path{local, remote, core_->socket};
+        ngtcp2_path path{local, remote, &core_->path_binding};
         ngtcp2_pkt_info packet_info{};
         const auto written = ngtcp2_conn_write_connection_close(
             core_->quic, &path, &packet_info, packet.data(), packet.size(),
             &error, Timestamp());
         if (written > 0) {
             try {
-                (void)listener_.Queue(*core_->socket,
-                    std::vector<uint8_t>(packet.begin(), packet.begin() + written),
-                    core_->remote);
+                if (auto* socket = OutputSocket(path))
+                    (void)listener_->Queue(*socket,
+                        std::vector<uint8_t>(packet.begin(), packet.begin() + written),
+                        core_->remote, ownership_);
             } catch (const std::bad_alloc&) {
                 // The close frame is advisory; state is dropped regardless.
             }
@@ -782,26 +1021,24 @@ net::awaitable<Connection::AdmitResult> Connection::AdmitConnection(
     }
     if (closed_ || physical_ != PhysicalAdmission::Admitted)
         co_return AdmitResult::Limited;
-    const auto& receiver = listener_.Receiver();
+    const auto& receiver = listener_->Receiver();
     auto user = proxyman::inbound::UserStore::FindHysteriaUser(
         receiver.inbound_tag, HashCredential(credential));
     if (!user) {
         co_await proxy::RecordInboundAuthFailure(
-            &listener_.limiter, base_context_, "no matching credential");
-        listener_.stats.OnError();
+            listener_->environment.limiter.get(), base_context_, "no matching credential");
+        capabilities_->Stats().OnError();
         co_return AdmitResult::AuthFailed;
     }
     const auto profile = user->profile;
     user.reset();
     proxy::BindAuthenticatedInbound(base_context_, profile, std::nullopt);
     auto session = co_await proxy::AdmitAuthenticatedInbound(
-        listener_.tracker, listener_.limiter.Coordinator(), base_context_, profile);
+        capabilities_->Tracker(), listener_->environment.limiter->Coordinator(), base_context_, profile);
     if (!session) co_return AdmitResult::DeviceLimited;
     if (closed_) co_return AdmitResult::Limited;
     online_session_.emplace(std::move(*session));
-    stream_sink_ = listener_.handler->NewAuthenticatedStreamSink(
-        listener_.io, listener_.dispatcher, listener_.stats,
-        listener_.request_load, listener_.timeouts, base_context_,
+    stream_sink_ = capabilities_->MakeAuthenticatedStreamSink(base_context_,
         physical_reservation_.FamilyLease());
     authenticated_ = true;
     co_return AdmitResult::Admitted;
@@ -811,7 +1048,7 @@ void Connection::OnStreamData(
     uint32_t flags, int64_t stream_id, std::span<const uint8_t> data) {
     const bool fin = (flags & NGTCP2_STREAM_DATA_FLAG_FIN) != 0;
     auto it = core_->streams.find(stream_id);
-    if (listener_.version == Version::V2 &&
+    if (listener_->version == Version::V2 &&
         (it == core_->streams.end() || !it->second.raw)) {
         const auto consumed = nghttp3_conn_read_stream2(
             core_->http, stream_id, data.data(), data.size(), fin, Timestamp());
@@ -838,7 +1075,7 @@ void Connection::OnStreamData(
 // inbound handler; otherwise it opens a UDP session, a transport concern.
 void Connection::StartRawStream(int64_t stream_id, StreamRecord& stream) {
     if (stream.delivered) return;
-    if (listener_.version == Version::V1) {
+    if (listener_->version == Version::V1) {
         const auto& input = stream.state->PendingInput();
         if (input.empty()) return;
         std::array<uint8_t, 1> kind{};
@@ -910,8 +1147,8 @@ net::awaitable<void> Connection::RunV1Control(int64_t stream_id) {
     }
     if (result != AdmitResult::Admitted) co_return;
     auto response = EncodeV1ServerHello(
-        true, listener_.download_bytes_per_second,
-        listener_.upload_bytes_per_second, "");
+        true, listener_->download_bytes_per_second,
+        listener_->upload_bytes_per_second, "");
     co_await state->WriteMultiBuffer(CopyPacket(response));
     if (closed_) co_return;
     memory::ThreadLocalVector<int64_t> waiting;
@@ -1091,7 +1328,7 @@ void Connection::DeliverUdpPacket(
     }
     if (core_->udp_sessions.size() >= kMaxUdpSessions) return;
     auto session = std::make_unique<UdpSessionStream>(
-        listener_.io, session_id, target,
+        Reactor(), session_id, target,
         weak_from_this());
     if (!session->Push(target, payload)) return;
     core_->udp_sessions.emplace(session_id, session.get());
@@ -1107,7 +1344,7 @@ bool Connection::SendUdpMessage(
     const size_t fragments =
         (payload.size() + kUdpFragmentPayload - 1) / kUdpFragmentPayload;
     const uint16_t packet_id = next_udp_packet_id_++;
-    const auto version = listener_.version;
+    const auto version = listener_->version;
     for (size_t index = 0; index < fragments; ++index) {
         const size_t offset = index * kUdpFragmentPayload;
         UdpMessage message;
@@ -1133,18 +1370,14 @@ void Connection::CloseUdpSession(uint32_t session_id) noexcept {
 
 QuicListener::QuicListener(
     uint32_t worker_id_value, net::io_context& io_value,
-    routing::Dispatcher& dispatcher_value, StatsShard& stats_value,
-    ConnectionLimiter& limiter_value, UserOnlineTracker& tracker_value,
-    app::RequestLoadState& request_load_value, const TimeoutsConfig& timeouts_value,
-    const proxyman::inbound::BuildRequest& request,
-    std::shared_ptr<proxyman::inbound::Handler> handler_value)
-    : worker_id(worker_id_value), io(io_value), dispatcher(dispatcher_value),
-      stats(stats_value), limiter(limiter_value), tracker(tracker_value),
-      request_load(request_load_value), timeouts(timeouts_value),
-      handler(handler_value ? std::move(handler_value)
-                            : throw std::invalid_argument("missing Hysteria inbound handler")),
+    app::DatagramSessionEnvironment environment_value)
+    : environment(std::move(environment_value)),
+      directory(net::use_service<QuicDirectory>(environment.coordinator->Services())),
+      directory_space(std::string(environment.receiver->inbound_tag) + ":" +
+          std::to_string(reinterpret_cast<uintptr_t>(environment.prepared->settings.get()))),
+      worker_id(worker_id_value), io(io_value),
       changed(io), expiry(io) {
-    const auto* settings = GetSettings(request);
+    const auto* settings = GetSettings(*environment.prepared);
     if (!settings) throw std::invalid_argument("missing Hysteria settings");
     version = settings->version;
     upload_bytes_per_second = settings->upload_bytes_per_second;
@@ -1155,6 +1388,7 @@ QuicListener::QuicListener(
 
 void QuicListener::Spawn(net::awaitable<void> task) {
     ++tasks;
+    try {
     net::co_spawn(io, std::move(task), [this](std::exception_ptr error) {
         --tasks;
         changed.cancel();
@@ -1166,23 +1400,215 @@ void QuicListener::Spawn(net::awaitable<void> task) {
             LOG_ERROR("Hysteria task failed worker={} > unknown error", worker_id);
         }
     });
+    } catch (...) {
+        --tasks;
+        throw;
+    }
 }
 
 bool QuicListener::Queue(SocketState& socket, std::vector<uint8_t> data,
-                         udp::endpoint remote) {
+                         udp::endpoint remote, std::shared_ptr<QuicOwnership> owner) {
+    memory::ScopedWorkerAllocation worker_allocation;
     if (stopping || socket.output.size() >= kMaxQueuedSocketPackets) return false;
-    socket.output.push_back({std::move(data), std::move(remote)});
+    socket.output.push_back({std::move(data), std::move(remote), std::move(owner)});
     (void)socket.changed.try_send(IoErrorCode{});
     return true;
 }
 
 void QuicListener::Associate(
     const ngtcp2_cid& cid, std::shared_ptr<Connection> connection) {
-    connections.insert_or_assign(ConnectionId(cid), std::move(connection));
+    memory::ScopedWorkerAllocation worker_allocation;
+    const auto id = ConnectionId(cid);
+    if (!directory.Publish(directory_space, id, connection->Ownership()))
+        throw std::runtime_error("QUIC CID publication collision");
+    auto [it, inserted] = connections.emplace(id, connection);
+    if (!inserted && it->second != connection) {
+        directory.Remove(directory_space, id, connection->Ownership());
+        throw std::runtime_error("QUIC local CID collision");
+    }
 }
 
 void QuicListener::Dissociate(const ngtcp2_cid& cid) noexcept {
     connections.erase(ConnectionId(cid));
+}
+
+void QuicListener::DissociateAll(const std::shared_ptr<QuicOwnership>& owner) noexcept {
+    std::erase_if(connections, [&](const auto& entry) {
+        return entry.second->Ownership() == owner;
+    });
+}
+
+SocketState* QuicListener::Resolve(const udp::endpoint& local) noexcept {
+    for (auto& [key, socket] : sockets) {
+        (void)key;
+        if (socket->local == local && socket->socket && socket->socket->is_open())
+            return socket.get();
+    }
+    return nullptr;
+}
+
+net::awaitable<void> QuicListener::Drain(const std::shared_ptr<QuicOwnership>& owner) {
+    for (auto& [key, socket] : sockets) {
+        (void)key;
+        size_t kept = 0;
+        for (size_t index = 0; index < socket->output.size(); ++index) {
+            if (socket->output[index].owner == owner) continue;
+            if (kept != index)
+                socket->output[kept] = std::move(socket->output[index]);
+            ++kept;
+        }
+        while (socket->output.size() > kept) socket->output.pop_back();
+        while (socket->sending == owner) {
+            socket->drained.expires_at(std::chrono::steady_clock::time_point::max());
+            auto [error] = co_await socket->drained.async_wait(net::as_tuple(net::use_awaitable));
+            (void)error;
+        }
+    }
+}
+
+bool QuicListener::Stage(Inbox& inbox, PendingPacket packet) {
+    if (inbox.packets.size() >= 64 || packet.bytes.size() > 256 * 1024 - inbox.bytes)
+        return false;
+    inbox.bytes += packet.bytes.size();
+    inbox.packets.push_back(std::move(packet));
+    inbox.wake.cancel();
+    return true;
+}
+
+void QuicListener::Enqueue(std::shared_ptr<Connection> connection, PendingPacket packet) {
+    auto owner = connection->Ownership();
+    if (owner->retired.load() || owner->claiming.load() || owner->owner.load() != worker_id) return;
+    auto& slot = inboxes[owner.get()];
+    if (!slot) slot = std::make_shared<Inbox>(io);
+    if (!Stage(*slot, std::move(packet)) || slot->scheduled) return;
+    slot->scheduled = true;
+    // Only metadata enters the migratable queue. A stale operation cannot
+    // access its old listener, nor carry a packet to the new Worker.
+    owner->domain->Execute([this, connection, owner, binding = identity] {
+        if (owner->listener.load() != binding.get() ||
+            owner->claiming.load() || owner->retired.load()) return;
+        Pump(connection);
+    });
+}
+
+void QuicListener::Pump(const std::shared_ptr<Connection>& connection) {
+    if (!connection->core_->quic || !connection->tasks_) return;
+    const auto& owner = connection->Ownership();
+    if (owner->claiming.load() || owner->retired.load()) return;
+    auto found = inboxes.find(owner.get());
+    if (found == inboxes.end()) return;
+    auto inbox = found->second;
+    inbox->scheduled = false;
+    while (!inbox->packets.empty() && !connection->Closed()) {
+        auto packet = std::move(inbox->packets.front());
+        inbox->packets.pop_front();
+        inbox->bytes -= packet.bytes.size();
+        connection->Feed(*packet.socket, packet.remote, packet.bytes);
+    }
+    if (connection->Closed()) inboxes.erase(owner.get());
+}
+
+net::awaitable<void> QuicListener::Claim(std::shared_ptr<QuicOwnership> owner) {
+    co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
+    auto connection = owner->connection.lock();
+    auto inbox = inboxes.at(owner.get());
+    std::shared_ptr<ExecutionDomain::Handoff> ticket;
+    bool committed = false;
+    try {
+        if (!connection || stopping || owner->retired.load()) throw std::runtime_error("retired QUIC claim");
+        ticket = co_await owner->domain->PreparePassiveHandoff(
+            {worker_id, &io, io.get_executor()});
+        bool eligible = false;
+        co_await ticket->Validate([&] {
+            if (!connection->Authenticated() || connection->Closed() || inbox->packets.empty()) return;
+            const auto* current = ngtcp2_conn_get_path(connection->core_->quic);
+            auto remote = EndpointFromAddress(current->remote);
+            auto local = EndpointFromAddress(current->local);
+            const auto& first = inbox->packets.front();
+            if (!local || !remote || *local != first.socket->local || *remote == first.remote) return;
+            connection->BeginValidation(*this, first.socket->local, first.remote);
+            eligible = true;
+        });
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (eligible && !stopping && std::chrono::steady_clock::now() < deadline) {
+            bool done = false;
+            co_await ticket->Validate([&] {
+                while (!inbox->packets.empty() && !connection->Closed()) {
+                    auto packet = std::move(inbox->packets.front());
+                    inbox->packets.pop_front();
+                    inbox->bytes -= packet.bytes.size();
+                    if (packet.socket->local != connection->candidate_local_ ||
+                        packet.remote != connection->candidate_remote_) continue;
+                    connection->Feed(*packet.socket, packet.remote, packet.bytes);
+                    if (connection->ValidationSucceeded()) break;
+                }
+                const bool pending = connection->validation_authenticated_ &&
+                    connection->CandidateValidationPending();
+                if (pending && !connection->Closed() && connection->Expiry() <= Timestamp())
+                    connection->OnExpiry();
+                done = connection->Closed() || connection->ValidationSucceeded() ||
+                    !connection->validation_authenticated_ ||
+                    !connection->CandidateValidationPending();
+                if (done && !connection->Closed() && !connection->ValidationSucceeded())
+                    LOG_DEBUG("QUIC passive claim rejected receiving_worker={} remote={}:{} reason=no-path-evidence",
+                        worker_id, connection->candidate_remote_.address().to_string(),
+                        connection->candidate_remote_.port());
+            });
+            if (done) break;
+            inbox->wake.expires_at(std::min(deadline, std::chrono::steady_clock::time_point(
+                std::chrono::nanoseconds(owner->expiry.load()))));
+            if (!inbox->packets.empty()) continue;
+            auto [error] = co_await inbox->wake.async_wait(net::as_tuple(net::use_awaitable));
+            (void)error;
+        }
+        bool valid = false;
+        co_await ticket->Validate([&] {
+            valid = eligible && !stopping && !connection->Closed() && connection->ValidationSucceeded();
+            if (!valid) return;
+            const auto* selected = ngtcp2_conn_get_path(connection->core_->quic);
+            auto local = EndpointFromAddress(selected->local);
+            auto remote = EndpointFromAddress(selected->remote);
+            valid = local && remote && *local == connection->candidate_local_ &&
+                *remote == connection->candidate_remote_;
+            if (!valid) return;
+            memory::ScopedWorkerAllocation worker_allocation;
+            for (const auto& cid : directory.Snapshot(owner)) connections.emplace(cid, connection);
+            sessions.emplace(owner.get(), connection);
+        });
+        if (valid) {
+            co_await ticket->Commit();
+            committed = true;
+        }
+    } catch (const std::exception& error) {
+        LOG_DEBUG("QUIC passive claim cancelled receiving_worker={} reason={}", worker_id, error.what());
+    } catch (...) {
+        LOG_DEBUG("QUIC passive claim cancelled receiving_worker={}", worker_id);
+    }
+    if (!committed) {
+        DissociateAll(owner);
+        sessions.erase(owner.get());
+        co_await Drain(owner);
+        if (ticket) {
+            try { co_await ticket->Cancel(); }
+            catch (const std::exception& error) {
+                LOG_DEBUG("QUIC passive rollback terminated connection receiving_worker={} reason={}",
+                    worker_id, error.what());
+            }
+        }
+    }
+    owner->claiming.store(false);
+    inboxes.erase(owner.get());
+    --pending_claims;
+    if (connection && !owner->retired.load())
+        owner->domain->Execute([connection] { connection->PublishExpiry(); });
+    if (committed) {
+        while (!inbox->packets.empty()) {
+            auto packet = std::move(inbox->packets.front());
+            inbox->packets.pop_front();
+            Enqueue(connection, std::move(packet));
+        }
+        ArmExpiry();
+    }
 }
 
 net::awaitable<void> QuicListener::ReceiveLoop(std::shared_ptr<SocketState> socket) {
@@ -1198,33 +1624,49 @@ net::awaitable<void> QuicListener::ReceiveLoop(std::shared_ptr<SocketState> sock
                 &version_cid, packet.data(), packet.size(),
                 kServerConnectionIdLength) != 0)
             continue;
-        auto found = connections.find(
-            ConnectionId(version_cid.dcid, version_cid.dcidlen));
+        if (version_cid.dcidlen > NGTCP2_MAX_CIDLEN) continue;
+        const ConnectionId cid(version_cid.dcid, version_cid.dcidlen);
+        auto found = connections.find(cid);
         std::shared_ptr<Connection> connection =
             found == connections.end() ? nullptr : found->second;
+        auto owner = connection ? connection->Ownership() : directory.Find(directory_space, cid);
+        if (owner && !owner->retired.load() && owner->owner.load() != worker_id) {
+            auto pending = inboxes.find(owner.get());
+            if (pending != inboxes.end()) {
+                Stage(*pending->second, {socket, socket->remote,
+                    std::vector<uint8_t>(packet.begin(), packet.end())});
+                continue;
+            }
+            if (pending_claims >= 32) continue;
+            bool expected = false;
+            if (!owner->claiming.compare_exchange_strong(expected, true)) continue;
+            ++pending_claims;
+            try {
+                auto inbox = std::make_shared<Inbox>(io);
+                Stage(*inbox, {socket, socket->remote,
+                    std::vector<uint8_t>(packet.begin(), packet.end())});
+                inboxes.emplace(owner.get(), std::move(inbox));
+                Spawn(Claim(owner));
+            } catch (...) {
+                --pending_claims;
+                inboxes.erase(owner.get());
+                owner->claiming.store(false);
+                throw;
+            }
+            continue;
+        }
         if (!connection) {
-            // Only Initial/0-RTT long headers may create a connection. An
-            // unknown CID in a short header belongs to no connection of this
-            // Worker; RFC 9000 §10.3 lets the endpoint drop it, and packets are
-            // never forwarded to another Worker.
-            if ((packet[0] & 0x80) == 0) continue;
+            if (owner || (packet[0] & 0x80) == 0) continue;
             if (connections.size() >= kMaxConnections) {
-                stats.OnError();
+                LOG_DEBUG("Hysteria listener connection capacity reached worker={}", worker_id);
                 continue;
             }
             ngtcp2_pkt_hd header{};
-            if (ngtcp2_accept(&header, packet.data(), packet.size()) != 0)
-                continue;
+            if (ngtcp2_accept(&header, packet.data(), packet.size()) != 0) continue;
             connection = Connection::Create(*this, *socket, socket->remote, header);
-            if (!connection) continue;
-            Associate(header.dcid, connection);
         }
-        if (!connection->Feed(*socket, socket->remote, packet)) {
-            std::erase_if(connections, [&](const auto& entry) {
-                return entry.second == connection;
-            });
-        }
-        ArmExpiry();
+        Enqueue(std::move(connection), {socket, socket->remote,
+            std::vector<uint8_t>(packet.begin(), packet.end())});
     }
 }
 
@@ -1238,22 +1680,30 @@ net::awaitable<void> QuicListener::SendLoop(std::shared_ptr<SocketState> socket)
         }
         auto packet = std::move(socket->output.front());
         socket->output.pop_front();
+        socket->sending = packet.owner;
         auto [error, bytes] = co_await socket->socket->async_send_to(
             net::buffer(packet.data), packet.remote,
             net::as_tuple(net::use_awaitable));
+        socket->sending.reset();
+        socket->drained.cancel();
         (void)bytes;
         if (error == net::error::operation_aborted) co_return;
     }
 }
 
 void QuicListener::ArmExpiry() {
+    memory::ScopedWorkerAllocation worker_allocation;
     ngtcp2_tstamp nearest = std::numeric_limits<ngtcp2_tstamp>::max();
     for (const auto& [id, connection] : connections) {
         (void)id;
-        if (connection && !connection->Closed())
-            nearest = std::min(nearest, connection->Expiry());
+        const auto& owner = connection->Ownership();
+        if (!owner->retired.load() && !owner->claiming.load())
+            nearest = std::min(nearest, owner->expiry.load());
     }
-    if (nearest == std::numeric_limits<ngtcp2_tstamp>::max()) return;
+    if (nearest == std::numeric_limits<ngtcp2_tstamp>::max()) {
+        expiry.expires_at(std::chrono::steady_clock::time_point::max());
+        return;
+    }
     expiry.expires_at(std::chrono::steady_clock::time_point(
         std::chrono::nanoseconds(nearest)));
     if (!expiry_running) {
@@ -1274,22 +1724,27 @@ net::awaitable<void> QuicListener::ExpiryLoop() {
         memory::ThreadLocalVector<std::shared_ptr<Connection>> unique;
         for (const auto& [id, connection] : connections) {
             (void)id;
-            if (connection && connection->Expiry() <= now &&
+            if (!connection->Ownership()->claiming.load() &&
+                connection->Ownership()->expiry.load() <= now &&
                 std::find(unique.begin(), unique.end(), connection) ==
                     unique.end())
                 unique.push_back(connection);
         }
-        for (auto& connection : unique) connection->OnExpiry();
+        for (auto& connection : unique) {
+            connection->Ownership()->expiry.store(std::numeric_limits<ngtcp2_tstamp>::max());
+            connection->Ownership()->domain->Execute([connection] { connection->OnExpiry(); });
+        }
         std::erase_if(connections, [](const auto& entry) {
-            return !entry.second || entry.second->Closed();
+            return !entry.second || entry.second->Ownership()->retired.load();
         });
 
         ngtcp2_tstamp nearest =
             std::numeric_limits<ngtcp2_tstamp>::max();
         for (const auto& [id, connection] : connections) {
             (void)id;
-            if (connection && !connection->Closed())
-                nearest = std::min(nearest, connection->Expiry());
+            const auto& owner = connection->Ownership();
+            if (!owner->retired.load() && !owner->claiming.load())
+                nearest = std::min(nearest, owner->expiry.load());
         }
         if (nearest == std::numeric_limits<ngtcp2_tstamp>::max()) break;
         expiry.expires_at(std::chrono::steady_clock::time_point(
@@ -1309,25 +1764,23 @@ void QuicListener::Stop() noexcept {
         socket->changed.cancel();
         if (socket->socket) socket->socket->close(ignored);
     }
-    // Closing ends every delivered stream and session so their tasks drain.
-    auto retired = std::move(connections);
-    connections.clear();
-    for (auto& [id, connection] : retired) {
-        (void)id;
-        if (connection) connection->Close();
+    for (auto& [owner, inbox] : inboxes) {
+        (void)owner;
+        inbox->wake.cancel();
+    }
+    for (auto& [owner, connection] : sessions) {
+        (void)owner;
+        connection->Ownership()->domain->Execute([connection, binding = identity] {
+            if (connection->Ownership()->listener.load() == binding.get()) connection->Close();
+        });
     }
 }
 
 HysteriaIngress::HysteriaIngress(
     uint32_t worker_id, net::io_context& io_context,
-    routing::Dispatcher& dispatcher, StatsShard& stats,
-    ConnectionLimiter& limiter, UserOnlineTracker& online_tracker,
-    app::RequestLoadState& request_load, const TimeoutsConfig& timeouts,
-    const proxyman::inbound::BuildRequest& request,
-    std::shared_ptr<proxyman::inbound::Handler> handler)
+    app::DatagramSessionEnvironment environment)
     : listener_(std::make_unique<QuicListener>(
-          worker_id, io_context, dispatcher, stats, limiter, online_tracker,
-          request_load, timeouts, request, std::move(handler))) {}
+          worker_id, io_context, std::move(environment))) {}
 
 HysteriaIngress::~HysteriaIngress() noexcept { RequestStop(); }
 
@@ -1365,7 +1818,7 @@ void HysteriaIngress::RequestStop() noexcept {
 
 net::awaitable<void> HysteriaIngress::AsyncJoin() {
     RequestStop();
-    while (listener_->tasks != 0) {
+    while (listener_->tasks != 0 || listener_->connection_tasks != 0) {
         listener_->changed.expires_at(std::chrono::steady_clock::time_point::max());
         auto [error] = co_await listener_->changed.async_wait(
             net::as_tuple(net::use_awaitable));

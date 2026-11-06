@@ -73,7 +73,7 @@ struct VlessEncryptedIo : memory::ThreadAllocated {
     VlessBufferedReader plain_reader;
 };
 
-struct VlessEncryptionClientTicketCache : memory::ThreadAllocated {
+struct VlessEncryptionClientTicketCache {
     VlessEncryptionPfsKey pfs_key;
     std::array<uint8_t, kVlessEncryptionTicketSize> ticket{};
     std::chrono::steady_clock::time_point expires_at{};

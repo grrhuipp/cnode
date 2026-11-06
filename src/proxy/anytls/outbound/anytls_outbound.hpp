@@ -37,8 +37,8 @@ struct Settings {
 // ============================================================================
 class Handler final : public Outbound {
 public:
-    // Physical session read loops outlive requests and this Handler; `tasks`
-    // owns and joins them, and must outlive the Handler.
+    // `tasks` accounts and joins physical readers, but each reader executes in
+    // its own leaseable domain. The host task owner must outlive this Handler.
     Handler(std::string_view tag,
             net::io_context& io_context,
             std::shared_ptr<const Settings> settings,
@@ -62,6 +62,12 @@ private:
     class SessionPool;
     struct LogicalStreamLease;
 
+    net::awaitable<OutboundProcessResult> ProcessSession(
+        session::Context& ctx, transport::Link inbound, OutboundDialer& dialer,
+        const TimeoutsConfig& timeouts, StatsShard& stats, const RelayConfig& relay_config,
+        buf::MultiBufferBatch first_payload, std::chrono::seconds relay_idle_timeout,
+        std::chrono::seconds relay_write_timeout,
+        std::shared_ptr<ClientSession> session, bool& reusable);
     memory::ThreadLocalString tag_;
     std::shared_ptr<const Settings> settings_;
     std::shared_ptr<PaddingState> padding_;

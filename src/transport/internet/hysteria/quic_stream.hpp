@@ -4,6 +4,7 @@
 #include "acppnode/common/target_address.hpp"
 #include "acppnode/transport/async_stream.hpp"
 #include "acppnode/transport/phase_deadline.hpp"
+#include "acppnode/app/session_group_executor.hpp"
 
 #include <memory>
 #include <span>
@@ -23,7 +24,7 @@ public:
                     std::weak_ptr<Connection> owner);
 
     [[nodiscard]] int64_t Id() const noexcept { return stream_id_; }
-    [[nodiscard]] net::io_context& IoContext() const noexcept { return io_context_; }
+    [[nodiscard]] net::io_context& IoContext() const noexcept { return domain_->Reactor(); }
     [[nodiscard]] bool PushInput(std::span<const uint8_t> data, bool fin);
     // Bytes received but not yet read; the transport inspects a request
     // prefix here before deciding who reads the stream.
@@ -43,7 +44,7 @@ private:
     void AcknowledgeInput(size_t bytes) noexcept;
     void WakeReader() noexcept;
 
-    net::io_context& io_context_;
+    std::shared_ptr<ExecutionDomain> domain_;
     int64_t stream_id_;
     std::weak_ptr<Connection> owner_;
     SignalChannel input_signal_;
@@ -121,7 +122,7 @@ protected:
 private:
     void WakeReader() noexcept;
 
-    net::io_context& io_context_;
+    std::shared_ptr<ExecutionDomain> domain_;
     uint32_t session_id_;
     TargetAddress first_target_;
     std::weak_ptr<Connection> owner_;

@@ -9,7 +9,11 @@
 #include "acppnode/infra/runtime_config_types.hpp"
 #include "acppnode/app/session_tracking.hpp"
 #include "acppnode/app/stats.hpp"
+#include "acppnode/app/rate_limiter_fwd.hpp"
+#include "acppnode/transport/link.hpp"
 
+#include <atomic>
+#include <unordered_map>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -17,11 +21,16 @@
 namespace acpp {
 class AsyncStream;
 class ConnectionLimiter;
+class AwaitableTaskGroup;
+class UserOnlineTracker;
+class InboundTransportStreamHandler;
+struct UserProfile;
 namespace session { struct Context; }
 struct WorkerRuntimeConfig;
 namespace rule { class DetectRulePolicy; }
 namespace app {
 class RequestLoadState;
+class PhysicalSessionRegistry;
 namespace router { class Router; }
 namespace dns { class DNSWorker; }
 
@@ -37,6 +46,17 @@ struct SessionConfiguration final {
     const std::shared_ptr<const router::Router> router;
     const std::shared_ptr<rule::DetectRulePolicy> policy;
 };
+struct DatagramSessionEnvironment final {
+    std::shared_ptr<const SessionConfiguration> configuration;
+    std::shared_ptr<ConnectionLimiter> limiter;
+    std::shared_ptr<RequestLoadState> request_load;
+    dns::DNSWorker* dns_worker = nullptr;
+    std::shared_ptr<const proxyman::inbound::BuildRequest> prepared;
+    std::shared_ptr<const proxyman::inbound::ReceiverSettings> receiver;
+    std::shared_ptr<GroupCoordinator> coordinator;
+    std::shared_ptr<PhysicalSessionRegistry> registry;
+};
+
 
 class PhysicalSessionCapabilities final : public ExecutionDomain::Hooks {
 public:
@@ -65,6 +85,14 @@ public:
     [[nodiscard]] bool IsJoined() const noexcept { return joined_; }
     // Must run in the domain before constructing its socket/Context payload.
     void Initialize(net::io_context& native_reactor);
+    // The caller owns and joins this structured scope before AsyncJoin().
+    void Initialize(net::io_context& native_reactor, AwaitableTaskGroup& tasks);
+    [[nodiscard]] UserOnlineTracker& Tracker();
+    [[nodiscard]] std::shared_ptr<InboundTransportStreamHandler>
+    MakeAuthenticatedStreamSink(const session::Context& context,
+                                std::shared_ptr<ConnectionFamily> family);
+    net::awaitable<void> ProcessNativeDatagram(
+        transport::Link link, const UserProfile& profile, session::Context& context);
     net::awaitable<void> ProcessTCP(std::unique_ptr<AsyncStream> stream,
                                   session::Context& context);
     void RequestStop() noexcept;
@@ -105,6 +133,43 @@ private:
     bool initialized_ = false;
     bool stopping_ = false;
     bool joined_ = false;
+};
+
+// Registration stays at admission, independently of the current execution
+// owner. Control-plane sampling therefore observes every session exactly once.
+struct PhysicalSessionRecord final {
+    std::shared_ptr<ExecutionDomain> domain;
+    std::shared_ptr<PhysicalSessionCapabilities> capabilities;
+    std::string inbound_tag;
+    std::string accounting_key;
+    uint64_t conn_id = 0;
+    std::atomic<bool> initialized{false};
+    std::atomic<bool> finished{false};
+    UserTrafficCounters completed_traffic;
+    StatsSnapshot final_stats;
+};
+
+class PhysicalSessionRegistry final {
+public:
+    using Records = std::unordered_map<PhysicalSessionRecord*,
+                                      std::shared_ptr<PhysicalSessionRecord>>;
+    PhysicalSessionRegistry(net::io_context& io, uint32_t worker_id,
+        StatsShard& totals, SessionTrackingState& traffic, Records& records);
+    [[nodiscard]] std::shared_ptr<PhysicalSessionRecord> Register(
+        std::shared_ptr<PhysicalSessionCapabilities> capabilities,
+        std::shared_ptr<ExecutionDomain> domain);
+    // Called within the session domain after its business and native I/O join.
+    net::awaitable<void> Retire(std::shared_ptr<PhysicalSessionRecord> record);
+    net::awaitable<void> AsyncJoin();
+private:
+    net::awaitable<void> RetireOnOwner(std::shared_ptr<PhysicalSessionRecord> record);
+    net::io_context& io_;
+    uint32_t worker_id_;
+    StatsShard& totals_;
+    SessionTrackingState& traffic_;
+    Records& records_;
+    SignalChannel changed_;
+    bool closing_ = false;
 };
 } // namespace app
 } // namespace acpp

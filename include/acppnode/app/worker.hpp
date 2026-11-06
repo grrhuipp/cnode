@@ -141,7 +141,6 @@ private:
     struct ListenerSlot;
     struct ListenerState;
     struct RuntimeState;
-    struct ConnectionRecord;
     void BeginStopOnWorker() noexcept;
     net::awaitable<void> StopRuntimeTask();
     net::awaitable<void> DrainRuntimeTask();

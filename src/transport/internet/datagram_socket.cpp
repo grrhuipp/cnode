@@ -2,12 +2,10 @@
 
 #include "acppnode/common/allocator.hpp"
 #include "connection_timeouts.hpp"
+#include "native_socket_handoff.hpp"
 #include "acppnode/transport/link_error.hpp"
 
-#include <asio/as_tuple.hpp>
-#include <asio/bind_allocator.hpp>
 #include <asio/ip/v6_only.hpp>
-#include <asio/use_awaitable.hpp>
 
 #include <algorithm>
 #include <array>
@@ -79,12 +77,13 @@ void ValidateBuffers(
 }
 }  // namespace
 
-struct DatagramSocket::Impl final : memory::ThreadAllocated {
+struct DatagramSocket::Impl final : memory::ThreadAllocated,
+                                    detail::NativeSocketHandoff<udp> {
     using Timeouts = detail::ConnectionTimeouts<Impl>;
 
     Impl(net::io_context& io_context, const net::ip::address& bind_address)
-        : socket(io_context)
-        , timeouts(io_context, *this)
+        : NativeSocketHandoff(udp::socket(detail::CurrentSocketReactor(io_context)))
+        , timeouts(detail::CurrentSocketReactor(io_context), *this)
         , ipv6(bind_address.is_v6())
         , budget(ActiveBudget()) {
         if (budget->load(std::memory_order_relaxed) >= kMaxActiveSockets)
@@ -109,11 +108,13 @@ struct DatagramSocket::Impl final : memory::ThreadAllocated {
     ~Impl() noexcept { Close(ErrorCode::CANCELLED); }
 
     void OnTimeout(ErrorCode reason) noexcept { Close(reason); }
+    void HandoffFailed() noexcept override { Close(ErrorCode::CANCELLED); }
 
     void Close(ErrorCode reason) noexcept {
         if (closed) return;
         closed = true;
         cancellation_reason = reason == ErrorCode::OK ? ErrorCode::CANCELLED : reason;
+        MarkCancelled();
         ++generation;
         cancellation.Stop(cancellation_reason);
         timeouts.Stop();
@@ -128,6 +129,7 @@ struct DatagramSocket::Impl final : memory::ThreadAllocated {
 
     void Cancel() noexcept {
         if (closed) return;
+        MarkCancelled();
         cancellation_reason = ErrorCode::CANCELLED;
         ++generation;
         cancellation.CancelPending(cancellation_reason);
@@ -150,7 +152,6 @@ struct DatagramSocket::Impl final : memory::ThreadAllocated {
     net::awaitable<void> SendMultiBuffer(
         WriteOperation& operation, udp::endpoint destination, buf::MultiBuffer payload);
 
-    udp::socket socket;
     Timeouts timeouts;
     transport::CancellationSource cancellation;
     uint64_t generation = 0;
@@ -174,14 +175,12 @@ struct DatagramSocket::Impl final : memory::ThreadAllocated {
 net::awaitable<ReceivedDatagram> DatagramSocket::Impl::Receive(ReadOperation& operation) {
     if (operation.Cancelled()) ThrowCancelled(operation.CancellationReason());
     if (closed) ThrowCancelled(cancellation_reason);
+    const auto cancellation_state = co_await net::this_coro::cancellation_state;
 
     for (;;) {
         // An idle wait holds no payload buffer; buffers exist only between
         // readiness and the synchronous receive below.
-        auto [wait_ec] = co_await socket.async_wait(
-            udp::socket::wait_read,
-            net::bind_allocator(memory::ProcessAllocator<std::byte>{},
-                net::as_tuple(net::use_awaitable)));
+        const auto wait_ec = co_await Wait(udp::socket::wait_read, cancellation_state.slot());
         if (wait_ec) {
             if (operation.Cancelled()) ThrowCancelled(operation.CancellationReason());
             throw IoSystemError(wait_ec);
@@ -253,11 +252,9 @@ net::awaitable<void> DatagramSocket::Impl::SendBuffers(
         buffers = single;
     }
     if (buffers.empty()) buffers = single; // Preserve an actual zero-length datagram.
+    const auto cancellation_state = co_await net::this_coro::cancellation_state;
     for (;;) {
-        auto [wait_ec] = co_await socket.async_wait(
-            udp::socket::wait_write,
-            net::bind_allocator(memory::ProcessAllocator<std::byte>{},
-                net::as_tuple(net::use_awaitable)));
+        const auto wait_ec = co_await Wait(udp::socket::wait_write, cancellation_state.slot());
         if (operation.Cancelled()) ThrowCancelled(operation.CancellationReason());
         if (wait_ec) throw IoSystemError(wait_ec);
         IoErrorCode send_ec;
@@ -303,11 +300,9 @@ net::awaitable<void> DatagramSocket::Impl::SendMultiBuffer(
         }
         single[0] = net::buffer(merged.data(), merged.size());
     }
+    const auto cancellation_state = co_await net::this_coro::cancellation_state;
     for (;;) {
-        auto [wait_ec] = co_await socket.async_wait(
-            udp::socket::wait_write,
-            net::bind_allocator(memory::ProcessAllocator<std::byte>{},
-                net::as_tuple(net::use_awaitable)));
+        const auto wait_ec = co_await Wait(udp::socket::wait_write, cancellation_state.slot());
         if (operation.Cancelled()) ThrowCancelled(operation.CancellationReason());
         if (wait_ec) throw IoSystemError(wait_ec);
         IoErrorCode send_ec;
@@ -434,6 +429,9 @@ CancellationSource& DatagramSocket::Cancellation() noexcept { return impl_->canc
 void DatagramSocket::Cancel() noexcept { impl_->Cancel(); }
 void DatagramSocket::Close() noexcept { impl_->Close(ErrorCode::CANCELLED); }
 bool DatagramSocket::IsIPv6() const noexcept { return impl_->ipv6; }
+int DatagramSocket::NativeHandle() const noexcept {
+    return impl_->socket.is_open() ? impl_->socket.native_handle() : -1;
+}
 
 udp::endpoint DatagramSocket::LocalEndpoint() const {
     IoErrorCode ec;

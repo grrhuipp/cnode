@@ -24,7 +24,6 @@
 #include "acppnode/common/string_hash.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/infra/runtime_failure.hpp"
-#include "acppnode/app/dispatcher/default_dispatcher.hpp"
 #include "acppnode/app/request_load_state.hpp"
 #include "acppnode/app/proxyman/inbound/handler_registry.hpp"
 #include "acppnode/app/proxyman/inbound/factory.hpp"
@@ -70,17 +69,6 @@
 
 namespace acpp {
 
-struct Worker::ConnectionRecord {
-    std::shared_ptr<ExecutionDomain> domain;
-    std::shared_ptr<app::PhysicalSessionCapabilities> capabilities;
-    std::string inbound_tag;
-    std::string accounting_key;
-    uint64_t conn_id = 0;
-    std::atomic<bool> initialized{false};
-    std::atomic<bool> finished{false};
-    app::UserTrafficCounters completed_traffic;
-    StatsSnapshot final_stats;
-};
 
 struct Worker::ListenerSlot {
     struct SocketBinding {
@@ -96,6 +84,7 @@ struct Worker::ListenerSlot {
     // their native close completions finish. No per-request slot leases.
     std::shared_ptr<proxyman::inbound::Handler> handler;
     std::shared_ptr<const proxyman::inbound::BuildRequest> prepared;
+    app::DatagramSessionEnvironment datagram_environment;
     std::unique_ptr<worker_detail::TcpListenerOwner> tcp_listeners;
     std::unique_ptr<worker_detail::UdpIngress> udp_ingress;
     std::unique_ptr<transport::internet::hysteria::HysteriaIngress> quic_ingress;
@@ -206,7 +195,7 @@ struct Worker::ListenerState : worker_detail::UdpReplySink {
         SlotPtr slot);
 
     static net::awaitable<void> ProcessReceivedConnection(
-        std::shared_ptr<ConnectionRecord> record,
+        std::shared_ptr<app::PhysicalSessionRecord> record,
         tcp::socket socket, tcp::endpoint remote_ep,
         uint32_t accepted_worker);
 
@@ -224,7 +213,8 @@ struct Worker::ListenerState : worker_detail::UdpReplySink {
         udp::socket* sock,
         udp::endpoint endpoint,
         buf::MultiBuffer payload,
-        uint32_t worker_id) override;
+        uint32_t worker_id,
+        std::shared_ptr<worker_detail::UdpReplyFence> fence) override;
     void StartUdpReplySend(worker_detail::UdpIngress& ingress,
                            std::string_view socket_key,
                            worker_detail::UdpIngress::SocketPtr sock,
@@ -236,8 +226,8 @@ struct Worker::ListenerState : worker_detail::UdpReplySink {
         uint32_t worker_id);
 };
 
-// Worker-local capability owner. Constructs, starts and holds every live
-// inbound/outbound/dns/udp/router/dispatcher instance for this Worker.
+// Worker-owned listeners, configuration publication and admission ledgers.
+// Every TCP, QUIC and native UDP request dispatches within its session domain.
 struct Worker::RuntimeState {
     RuntimeState(net::io_context& io_context,
                  const WorkerRuntimeConfig& runtime_config,
@@ -253,7 +243,6 @@ struct Worker::RuntimeState {
         , geo_database(geo_database_ref)
         , dns_worker(dns_worker)
         , listener_state(std::make_unique<ListenerState>(io_context))
-        , dns_service(std::make_unique<app::dns::DNS>(dns_worker))
         {}
 
     ~RuntimeState() {
@@ -273,9 +262,11 @@ struct Worker::RuntimeState {
     std::shared_ptr<app::RequestLoadState> request_load;
     app::dns::DNSWorker& dns_worker;
     std::shared_ptr<const app::SessionConfiguration> session_configuration;
-    std::unordered_map<ConnectionRecord*, std::shared_ptr<ConnectionRecord>> connections;
+    app::PhysicalSessionRegistry::Records connections;
+    std::shared_ptr<app::PhysicalSessionRegistry> session_registry;
 
-    void EraseConnection(uint32_t worker_id, const std::shared_ptr<ConnectionRecord>& record) {
+    void EraseConnection(uint32_t worker_id,
+                         const std::shared_ptr<app::PhysicalSessionRecord>& record) {
         if (connections.erase(record.get()) == 0) return;
         if (record->domain && !record->domain->CanDestroyDirectlyOn(worker_id)) {
             auto* domain = record->domain.get();
@@ -298,16 +289,8 @@ struct Worker::RuntimeState {
     std::unique_ptr<ListenerState> listener_state;
     std::unique_ptr<proxyman::inbound::HandlerRegistry> inbound_handlers;
     std::unique_ptr<app::SessionTrackingState> session_tracking;
-    std::unique_ptr<app::dns::DNS> dns_service;
-    // Worker-level dispatch (QUIC, native UDP) reads the same outbound
-    // publication as physical sessions. Its handlers' resident work (pooled
-    // AnyTLS sessions) runs here; built on this Worker's executor, it outlives
-    // every handler and is joined after all request owners finish.
-    std::unique_ptr<ResidentTaskGroup> outbound_tasks;
-    std::unique_ptr<proxyman::outbound::HandlerLookup> outbound_handlers;
     std::shared_ptr<app::router::Router> router;
     std::shared_ptr<rule::DetectRulePolicy> detect_rule_policy;
-    std::unique_ptr<app::dispatcher::DefaultDispatcher> dispatcher;
     bool started = false;
     bool cold_mutation_active = false;
     WorkerMemoryReclaimer memory_reclaimer;
@@ -478,6 +461,7 @@ net::awaitable<void> Worker::DrainRuntimeTask() {
         IoErrorCode ec;
         co_await listeners.changed.async_wait(net::redirect_error(net::use_awaitable, ec));
     }
+    if (runtime_->session_registry) co_await runtime_->session_registry->AsyncJoin();
 }
 
 net::awaitable<void> Worker::AsyncDrain() {
@@ -541,9 +525,6 @@ net::awaitable<void> Worker::StopRuntimeTask() {
     co_await DrainRuntimeTask();
     if (runtime_->session_configuration)
         co_await runtime_->session_configuration->outbounds->AsyncJoinHosts();
-    // No request can start outbound work any more; retiring handlers have only
-    // cancelled theirs. Join before destroying the components they borrow.
-    if (runtime_->outbound_tasks) co_await runtime_->outbound_tasks->AsyncJoin();
     co_await transport::internet::JoinXHttpClientTasks(io_context_);
     runtime_->memory_reclaimer.Stop();
     co_await TimeoutScheduler::AsyncReleaseForIoContext(io_context_);
@@ -597,7 +578,6 @@ void Worker::RuntimeState::Start(Worker& worker) {
             });
     session_tracking = std::make_unique<app::SessionTrackingState>();
     inbound_handlers = std::make_unique<proxyman::inbound::HandlerRegistry>(stats);
-    outbound_tasks = std::make_unique<ResidentTaskGroup>(io_context.get_executor());
     detect_rule_policy = std::make_shared<rule::DetectRulePolicy>();
     const auto* config = startup_config.get();
     if (!connection_limiter) {
@@ -618,13 +598,8 @@ void Worker::RuntimeState::Start(Worker& worker) {
         *config, router, detect_rule_policy);
     session_configuration->outbounds->BindHosts(io_context, worker.id_,
         worker.group_coordinator_, dns_worker, timeouts.DialTimeout());
-    outbound_handlers = std::make_unique<proxyman::outbound::HandlerLookup>(
-        *session_configuration->outbounds, io_context, *dns_service,
-        timeouts.DialTimeout(), outbound_tasks->Tasks(),
-        proxyman::outbound::HandlerLookup::StatefulTags::InstantiateLocally);
-    dispatcher = std::make_unique<app::dispatcher::DefaultDispatcher>(
-        *router, *outbound_handlers, *detect_rule_policy, *session_tracking,
-        *dns_service, *request_load);
+    session_registry = std::make_shared<app::PhysicalSessionRegistry>(
+        io_context, worker.id_, stats, *session_tracking, connections);
     started = true;
     startup_config.reset();
 }
@@ -852,7 +827,7 @@ bool Worker::ListenerState::EnqueueUdpReply(
     udp::socket* sock,
     udp::endpoint endpoint,
     buf::MultiBuffer payload,
-    uint32_t worker_id) {
+    uint32_t worker_id, std::shared_ptr<worker_detail::UdpReplyFence> fence) {
     auto* ingress = FindUdpIngress(socket_key);
     if (!ingress || !sock || !sock->is_open() || payload.empty()) {
         return false;
@@ -863,7 +838,7 @@ bool Worker::ListenerState::EnqueueUdpReply(
     }
 
     const auto admitted = ingress->EnqueueReply(
-        socket_key, std::move(endpoint), std::move(payload));
+        socket_key, std::move(endpoint), std::move(payload), std::move(fence));
     if (admitted == worker_detail::UdpIngress::ReplyEnqueueResult::Rejected) {
         return false;
     }
@@ -992,7 +967,7 @@ net::awaitable<void> Worker::ListenerState::AcceptLoop(
         }
 
         const auto& receiver = inbound_handler->ReceiverSettings();
-        auto record = std::make_shared<ConnectionRecord>();
+        auto record = std::make_shared<app::PhysicalSessionRecord>();
         record->inbound_tag = receiver.inbound_tag;
         record->accounting_key = receiver.accounting_key;
         record->capabilities = app::PhysicalSessionCapabilities::Create(
@@ -1055,7 +1030,7 @@ net::awaitable<void> Worker::ListenerState::AcceptLoop(
 // ============================================================================
 
 net::awaitable<void> Worker::ListenerState::ProcessReceivedConnection(
-    std::shared_ptr<ConnectionRecord> record, tcp::socket socket,
+    std::shared_ptr<app::PhysicalSessionRecord> record, tcp::socket socket,
     tcp::endpoint remote_ep, uint32_t accepted_worker) {
     std::exception_ptr failure;
     record->conn_id = session::NewID(accepted_worker);
@@ -1158,6 +1133,16 @@ bool Worker::RegisterInbound(
     }
     slot_it->second->handler = registered;
     slot_it->second->prepared = std::move(prepared);
+    slot_it->second->datagram_environment = app::DatagramSessionEnvironment{
+        .configuration = runtime_->session_configuration,
+        .limiter = runtime_->connection_limiter,
+        .request_load = runtime_->request_load,
+        .dns_worker = &runtime_->dns_worker,
+        .prepared = slot_it->second->prepared,
+        .receiver = registered->SharedReceiverSettings(),
+        .coordinator = group_coordinator_,
+        .registry = runtime_->session_registry,
+    };
     return true;
 }
 
@@ -1167,9 +1152,7 @@ void Worker::AddOutbound(proxyman::outbound::PreparedOutboundConfig config) {
         !runtime_ || runtime_->listener_state->stopping)
         throw IoSystemError(net::error::operation_aborted);
     ColdMutationGuard mutation(runtime_->cold_mutation_active, runtime_->listener_state.get());
-    // The one publication; the Worker-level lookup drops retired handlers now.
     runtime_->session_configuration->outbounds->Replace(config);
-    runtime_->outbound_handlers->Refresh();
 
     LOG_DEBUG("registered dynamic outbound worker={} protocol={} tag={}",
               id_, config.protocol, config.tag);
@@ -1182,7 +1165,6 @@ void Worker::RemoveOutbound(std::string_view tag) {
         throw IoSystemError(net::error::operation_aborted);
     ColdMutationGuard mutation(runtime_->cold_mutation_active, runtime_->listener_state.get());
     runtime_->session_configuration->outbounds->Remove(tag);
-    runtime_->outbound_handlers->Refresh();
 }
 
 void Worker::InstallUserView(proxyman::inbound::UserStore::WorkerView view) {
@@ -1258,7 +1240,7 @@ net::awaitable<app::UserTrafficSnapshot> Worker::SnapshotTraffic(std::string tag
     result.users = std::move(worker_counters.users);
     // Source registry membership never changes when a group migrates. Each
     // logical domain is therefore sampled exactly once across all Workers.
-    std::vector<std::shared_ptr<ConnectionRecord>> records;
+    std::vector<std::shared_ptr<app::PhysicalSessionRecord>> records;
     records.reserve(runtime_->connections.size());
     for (const auto& [key, record] : runtime_->connections) {
         (void)key;
@@ -1312,7 +1294,7 @@ net::awaitable<std::vector<OnlineDevice>> Worker::GetOnlineDevices(std::string t
     if (handler) {
         result = runtime_->inbound_handlers->GetOnlineDevices(handler->ReceiverSettings().protocol, tag);
     }
-    std::vector<std::shared_ptr<ConnectionRecord>> records;
+    std::vector<std::shared_ptr<app::PhysicalSessionRecord>> records;
     records.reserve(runtime_->connections.size());
     for (const auto& [key, record] : runtime_->connections) {
         (void)key;
@@ -1393,7 +1375,7 @@ WorkerRuntimeStatsSnapshot Worker::CollectNativeRuntimeStats(bool include_resour
 net::awaitable<WorkerRuntimeStatsSnapshot> Worker::CollectRuntimeStats(bool include_resources) const {
     auto result = CollectNativeRuntimeStats(include_resources);
     struct Sample {
-        std::shared_ptr<ConnectionRecord> record;
+        std::shared_ptr<app::PhysicalSessionRecord> record;
         bool was_active = false;
     };
     std::vector<Sample> samples;
@@ -1426,14 +1408,6 @@ net::awaitable<WorkerRuntimeStatsSnapshot> Worker::CollectRuntimeStats(bool incl
              include_resources]() mutable -> net::awaitable<WorkerRuntimeStatsSnapshot> {
                 WorkerRuntimeStatsSnapshot snapshot;
                 if (include_stats) snapshot.stats = cap->Stats().Snapshot();
-                if (include_resources && include_stats && !cap->IsJoined()) {
-                    const auto timers = TimeoutScheduler::ForIoContext(
-                        domain->Reactor()).GetResourceStats();
-                    auto& resources = snapshot.resources.emplace();
-                    resources.timeout_events = timers.active_events;
-                    resources.timeout_heap_capacity = timers.heap_capacity;
-                    resources.timeout_waiters = timers.wait_pending ? 1 : 0;
-                }
                 cap.reset();
                 domain.reset();
                 co_return snapshot;
@@ -1523,19 +1497,8 @@ net::awaitable<bool> Worker::ListenerState::StartQuicListening(
                   worker.id_, binding.tag);
         co_return false;
     }
-    auto* runtime = dynamic_cast<proxy::UserOnlineProtocolRuntime*>(
-        worker.runtime_->inbound_handlers->GetOrCreateRuntime(binding.protocol));
-    if (!runtime) {
-        LOG_ERROR("QUIC listener unavailable worker={} tag={} > invalid protocol runtime",
-                  worker.id_, binding.tag);
-        co_return false;
-    }
     auto replacement = std::make_unique<transport::internet::hysteria::HysteriaIngress>(
-        worker.id_, worker.runtime_->io_context, *worker.runtime_->dispatcher,
-        worker.runtime_->stats, *worker.runtime_->connection_limiter,
-        runtime->validator, *worker.runtime_->request_load,
-        worker.runtime_->timeouts, *slot_it->second->prepared,
-        slot_it->second->handler);
+        worker.id_, worker.runtime_->io_context, slot_it->second->datagram_environment);
 
     size_t bound = 0;
     const auto candidates = binding.listen.Candidates();
@@ -1895,11 +1858,11 @@ net::awaitable<void> Worker::ListenerState::UdpReceiveLoop(
             .payload = received,
             .receiver = receiver,
             .io_context = worker.runtime_->io_context,
-            .dispatcher = *worker.runtime_->dispatcher,
             .stats = worker.runtime_->stats,
             .timeouts = worker.runtime_->timeouts,
             .worker_id = worker.id_,
             .reply_sink = *this,
+            .environment = &listener_slot->datagram_environment,
         });
     };
     return worker_detail::RunUdpReceiveLoop(

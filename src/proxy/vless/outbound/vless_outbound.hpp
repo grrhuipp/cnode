@@ -10,6 +10,7 @@
 #include <string>
 
 namespace acpp {
+class ExecutionDomain;
 
 namespace vless {
 struct VlessEncryptionConfig;
@@ -47,8 +48,8 @@ public:
 
 private:
     std::shared_ptr<const ::acpp::VlessOutboundConfig> config_;
-    std::unique_ptr<::acpp::vless::VlessEncryptionClientTicketCache>
-        encryption_tickets_;
+    std::shared_ptr<::acpp::vless::VlessEncryptionClientTicketCache> encryption_tickets_;
+    std::weak_ptr<ExecutionDomain> ticket_domain_;
 };
 
 }  // namespace proxy::vless::outbound

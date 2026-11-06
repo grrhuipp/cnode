@@ -116,6 +116,9 @@ struct SsUdpDecodeResult {
     TargetAddress        target;       // 解析出的 SOCKS5 目标地址
     buf::MultiBuffer     payload;      // 解密后的 payload Buffer 所有权
     std::optional<uint64_t> session_id;
+    // SS2022 authenticated metadata, available before replay acceptance.
+    std::optional<uint64_t> packet_id;
+    KeyBytes             session_owner;
     size_t               user_index = 0;   // 匹配用户在 users 列表中的下标
 };
 
@@ -127,6 +130,9 @@ struct SsUdpDecodeResult {
 //
 // 最小包长: salt_size + 1(ATYP) + 1(域名长度或4字节IP) + 2(port) + kTagSize
 // 返回 nullopt: 包过短 / 所有用户均不匹配
+// deferred_replay authenticates SS2022 without reading or mutating replay_cache;
+// the caller must commit packet_id in the full session_owner/session_id namespace.
+// Classic AEAD behavior is unchanged.
 // ============================================================================
 [[nodiscard]] std::optional<SsUdpDecodeResult> DecodeUdpPacket(
     const uint8_t*               datagram,
@@ -135,7 +141,8 @@ struct SsUdpDecodeResult {
     SsCipherType                 cipher_type,
     size_t                       key_size,
     size_t                       salt_size,
-    Ss2022UdpReplayCache&        replay_cache);
+    Ss2022UdpReplayCache&        replay_cache,
+    bool                        deferred_replay = false);
 
 // ============================================================================
 // EncodeUdpPacket — 编码 SS AEAD UDP 回包

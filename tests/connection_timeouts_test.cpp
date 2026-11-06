@@ -69,6 +69,21 @@ bool TestDestroyOwnerAndMaximumTimeout() {
     io.run_for(10ms);
     return true;
 }
+
+bool TestActivityDoesNotExtendPhase() {
+    acpp::net::io_context io;
+    Owner owner;
+    Timeouts timeouts(io, owner);
+    timeouts.SetIdleTimeout(1s);
+    auto phase = timeouts.StartPhaseDeadline(1s);
+    io.run_for(600ms);
+    if (owner.calls) return false;
+    timeouts.TouchActivity();
+    io.restart();
+    io.run_for(600ms);
+    return owner.calls == 1 && phase.Expired() && timeouts.ConsumePhaseDeadline() &&
+        !timeouts.ConsumeIdleTimeout();
+}
 }  // namespace
 
 int main() {
@@ -76,7 +91,8 @@ int main() {
     const bool phase = TestPhaseReplacementAndClear();
     const bool expired = TestExpiredPhaseAndStopFlag();
     const bool destruction = TestDestroyOwnerAndMaximumTimeout();
-    std::printf("connection timeouts: idle=%d phase=%d expired=%d destruction=%d\n",
-                idle, phase, expired, destruction);
-    return idle && phase && expired && destruction ? 0 : 1;
+    const bool dual = TestActivityDoesNotExtendPhase();
+    std::printf("connection timeouts: idle=%d phase=%d expired=%d destruction=%d dual=%d\n",
+                idle, phase, expired, destruction, dual);
+    return idle && phase && expired && destruction && dual ? 0 : 1;
 }

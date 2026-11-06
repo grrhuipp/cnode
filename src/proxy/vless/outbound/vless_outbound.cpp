@@ -14,6 +14,7 @@
 #include "../../outbound_stream_endpoint.hpp"
 #include "acppnode/app/dns/dns.hpp"
 #include "acppnode/app/proxyman/outbound/factory.hpp"
+#include "acppnode/app/session_group_executor.hpp"
 #include "../../../app/proxyman/outbound/registration.hpp"
 #include "acppnode/infra/json_field.hpp"
 #include "acppnode/app/relay.hpp"
@@ -33,6 +34,8 @@
 #include "acppnode/transport/internet/outbound_target_builder.hpp"
 #include "acppnode/transport/link.hpp"
 
+#include <asio/bind_cancellation_slot.hpp>
+#include <asio/co_spawn.hpp>
 #include <array>
 #include <cctype>
 #include <limits>
@@ -444,8 +447,9 @@ proxy::vless::outbound::Handler::Handler(
     std::shared_ptr<const VlessOutboundConfig> config)
     : config_(std::move(config))
     , encryption_tickets_(config_->encryption
-          ? std::make_unique<::acpp::vless::VlessEncryptionClientTicketCache>()
-          : nullptr) {}
+          ? std::make_shared<::acpp::vless::VlessEncryptionClientTicketCache>()
+          : nullptr)
+    , ticket_domain_(ExecutionDomain::Current()) {}
 
 proxy::vless::outbound::Handler::~Handler() = default;
 
@@ -485,6 +489,53 @@ proxy::vless::outbound::Handler::Process(
     const bool use_vision = !config_->flow.empty();
     const bool use_xudp = is_udp && config_->packet_xudp;
     const bool use_packet_addr = is_udp && config_->packet_addr;
+    // Only the stable host reads/writes the cache. The deferred 0-RTT reader
+    // holds a private snapshot; rejection clears only that exact ticket identity,
+    // never a ticket published by a concurrent successful handshake.
+    struct TicketLease {
+        std::shared_ptr<::acpp::vless::VlessEncryptionClientTicketCache> cache;
+        std::shared_ptr<ExecutionDomain> domain;
+        ::acpp::vless::VlessEncryptionClientTicketCache local;
+        std::array<uint8_t, ::acpp::vless::kVlessEncryptionTicketSize> identity{};
+        std::chrono::steady_clock::time_point original_expiry{};
+
+        net::awaitable<void> Acquire() {
+            if (!cache) co_return;
+            auto read = [&]() -> net::awaitable<::acpp::vless::VlessEncryptionClientTicketCache> {
+                co_return *cache;
+            };
+            local = domain
+                ? co_await net::co_spawn(domain->Executor(), read(),
+                    net::bind_cancellation_slot(net::cancellation_slot{}, net::use_awaitable))
+                : co_await read();
+            identity = local.ticket;
+            original_expiry = local.expires_at;
+        }
+        net::awaitable<void> Publish() {
+            if (!cache || (local.ticket == identity && local.expires_at == original_expiry))
+                co_return;
+            auto publish = [&]() -> net::awaitable<void> {
+                if (cache->ticket == identity) *cache = local;
+                co_return;
+            };
+            if (domain) {
+                co_await net::co_spawn(domain->Executor(), publish(),
+                    net::bind_cancellation_slot(net::cancellation_slot{}, net::use_awaitable));
+            } else {
+                co_await publish();
+            }
+            identity = local.ticket;
+        }
+        ~TicketLease() {
+            if (!cache || local.expires_at != std::chrono::steady_clock::time_point{}) return;
+            auto invalidate = [cache = std::move(cache), identity = identity] {
+                if (cache->ticket == identity) cache->Clear();
+            };
+            if (domain) domain->Execute(std::move(invalidate));
+            else invalidate();
+        }
+    } tickets{encryption_tickets_, ticket_domain_.lock()};
+    co_await tickets.Acquire();
     VlessBufferedReader protocol_reader(*stream);
     transport::MultiBufferWriter& protocol_writer = *stream;
     VlessBufferedReader* active_reader = &protocol_reader;
@@ -492,12 +543,13 @@ proxy::vless::outbound::Handler::Process(
     std::unique_ptr<::acpp::vless::VlessEncryptedIo> encrypted_io;
 
     if (auto ok = co_await SendVlessHandshake(
-            *stream, *config_, encryption_tickets_.get(), target,
+            *stream, *config_, encryption_tickets_ ? &tickets.local : nullptr, target,
             is_udp, use_vision, use_xudp, use_packet_addr,
             timeouts.HandshakeTimeout(), protocol_reader, protocol_writer,
             encrypted_io, active_reader, active_writer); !ok) {
         co_return fail_abortive(ok.error());
     }
+    co_await tickets.Publish();
     stream->SetIdleTimeout(relay_idle_timeout);
     stream->SetReadTimeout(std::chrono::seconds(0));
     stream->SetWriteTimeout(relay_write_timeout);

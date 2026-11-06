@@ -75,6 +75,7 @@ inline thread_local size_t rejected_process_allocations = 0;
 
 namespace detail {
 inline thread_local AllocationDomain* current_allocation_domain = nullptr;
+inline thread_local bool allocate_for_worker = false;
 
 [[nodiscard]] inline std::uintptr_t CurrentThreadToken() noexcept {
     thread_local std::uint8_t anchor = 0;
@@ -862,11 +863,26 @@ private:
     bool acquired_ = false;
 };
 
+// Shared listener output remains on this Worker after the producing session
+// releases its lease. Only new allocations change owner; existing borrowed
+// session memory still requires the active domain lease. Never span a suspend.
+class ScopedWorkerAllocation final {
+public:
+    ScopedWorkerAllocation() noexcept
+        : previous_(std::exchange(detail::allocate_for_worker, true)) {}
+    ~ScopedWorkerAllocation() { detail::allocate_for_worker = previous_; }
+    ScopedWorkerAllocation(const ScopedWorkerAllocation&) = delete;
+    ScopedWorkerAllocation& operator=(const ScopedWorkerAllocation&) = delete;
+private:
+    bool previous_;
+};
+
 [[nodiscard]] inline AllocationDomain* CurrentAllocationDomain() noexcept {
     return detail::current_allocation_domain;
 }
 
 [[nodiscard]] inline std::pmr::memory_resource* CurrentResource() noexcept {
+    if (detail::allocate_for_worker) return ThreadMemoryPool().resource();
     if (auto* domain = CurrentAllocationDomain()) return domain->resource();
     return std::pmr::get_default_resource();
 }
@@ -952,6 +968,8 @@ inline thread_local size_t rejected_pmr_allocations = 0;
         return nullptr;
     }
 #endif
+    if (detail::allocate_for_worker)
+        return ThreadMemoryPool().Allocate(size, alignment);
     if (auto* domain = CurrentAllocationDomain()) {
         try {
             return domain->resource()->allocate(size, alignment);

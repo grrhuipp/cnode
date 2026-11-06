@@ -9,7 +9,7 @@
 namespace acpp {
 
 StreamPhaseDeadline::StreamPhaseDeadline(net::io_context& io_context, AsyncStream& owner)
-    : scheduler_(TimeoutScheduler::ForIoContext(io_context)), owner_(owner) {}
+    : TimeoutEvent(io_context), owner_(owner) {}
 
 StreamPhaseDeadline::~StreamPhaseDeadline() noexcept {
     Clear();
@@ -19,7 +19,7 @@ PhaseDeadlineHandle StreamPhaseDeadline::Start(std::chrono::seconds timeout) {
     ++generation_;
     expired_ = 0;
     if (timeout <= std::chrono::seconds::zero() || !owner_.IsOpen()) {
-        scheduler_.Cancel(*this);
+        TimeoutEvent::Cancel();
         return {};
     }
     constexpr auto maximum =
@@ -27,15 +27,15 @@ PhaseDeadlineHandle StreamPhaseDeadline::Start(std::chrono::seconds timeout) {
     const auto delay = timeout >= maximum
         ? std::chrono::milliseconds::max()
         : std::chrono::duration_cast<std::chrono::milliseconds>(timeout);
-    if (!scheduler_.ScheduleAfter(delay, *this)) {
-        scheduler_.Cancel(*this);
+    if (!ScheduleAfter(delay)) {
+        TimeoutEvent::Cancel();
         return {};
     }
     return {&expired_, 1, &generation_, generation_};
 }
 
 void StreamPhaseDeadline::Clear() noexcept {
-    scheduler_.Cancel(*this);
+    TimeoutEvent::Cancel();
     ++generation_;
     expired_ = 0;
 }

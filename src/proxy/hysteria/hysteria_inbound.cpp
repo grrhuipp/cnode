@@ -31,6 +31,10 @@ namespace wire = ::acpp::transport::internet::hysteria;
 
 constexpr size_t kMaxRequestHeaderBytes = 8192;
 
+net::io_context& SessionReactor() noexcept {
+    return ExecutionDomain::Current()->Reactor();
+}
+
 struct TcpRequest {
     TargetAddress target;
     // Request-stream bytes that followed the header in the same read.
@@ -107,7 +111,7 @@ public:
         std::unique_ptr<AsyncStream> stream,
         routing::Dispatcher& dispatcher,
         const proxyman::inbound::ReceiverSettings& receiver,
-        net::io_context& io_context,
+        net::io_context& /*io_context*/,
         session::Context& ctx,
         const TimeoutsConfig& timeouts,
         uint32_t /*pressure_idle_timeout*/) override {
@@ -115,7 +119,7 @@ public:
             BindInboundRequestTarget(
                 ctx, InboundRequestTarget{Network::UDP, session->FirstTarget()});
             co_return co_await dispatcher.Dispatch(
-                io_context, receiver.dispatch_policy, std::move(stream),
+                SessionReactor(), receiver.dispatch_policy, std::move(stream),
                 transport::Link{session, session}, InitialPayload{},
                 ctx, stats_, timeouts);
         }
@@ -134,7 +138,7 @@ public:
 
         auto* tcp_stream = stream.get();
         co_return co_await dispatcher.Dispatch(
-            io_context, receiver.dispatch_policy, std::move(stream),
+            SessionReactor(), receiver.dispatch_policy, std::move(stream),
             transport::Link{tcp_stream, tcp_stream},
             InitialPayload(std::move(request->early_data)),
             ctx, stats_, timeouts);

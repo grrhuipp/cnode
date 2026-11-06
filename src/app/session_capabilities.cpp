@@ -18,6 +18,7 @@
 #include "acppnode/transport/internet/timeout_scheduler.hpp"
 #include "../common/awaitable_task_group.hpp"
 #include "../transport/internet/xhttp_session.hpp"
+#include "../proxy/inbound_admission.hpp"
 
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/cancellation_signal.hpp>
@@ -28,6 +29,69 @@
 #include <algorithm>
 #include <vector>
 namespace acpp::app {
+
+PhysicalSessionRegistry::PhysicalSessionRegistry(
+    net::io_context& io, uint32_t worker_id, StatsShard& totals,
+    SessionTrackingState& traffic, Records& records)
+    : io_(io), worker_id_(worker_id), totals_(totals),
+      traffic_(traffic), records_(records), changed_(io, 1) {}
+
+std::shared_ptr<PhysicalSessionRecord> PhysicalSessionRegistry::Register(
+    std::shared_ptr<PhysicalSessionCapabilities> capabilities,
+    std::shared_ptr<ExecutionDomain> domain) {
+    if (!capabilities || !domain || !io_.get_executor().running_in_this_thread())
+        throw std::logic_error("session registration requires admission owner");
+    if (closing_) throw IoSystemError(net::error::operation_aborted);
+    auto record = std::make_shared<PhysicalSessionRecord>();
+    record->inbound_tag = capabilities->Receiver().inbound_tag;
+    record->accounting_key = capabilities->Receiver().accounting_key;
+    record->capabilities = std::move(capabilities);
+    record->domain = std::move(domain);
+    records_.emplace(record.get(), record);
+    return record;
+}
+
+net::awaitable<void> PhysicalSessionRegistry::Retire(
+    std::shared_ptr<PhysicalSessionRecord> record) {
+    co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
+    if (!record || ExecutionDomain::Current() != record->domain)
+        throw std::logic_error("session retirement requires its execution domain");
+    record->final_stats = record->capabilities->Stats().Snapshot();
+    record->completed_traffic =
+        record->capabilities->Tracking().ExtractAvailableTraffic(record->accounting_key);
+    co_await net::co_spawn(io_, RetireOnOwner(std::move(record)), net::use_awaitable);
+}
+
+net::awaitable<void> PhysicalSessionRegistry::RetireOnOwner(
+    std::shared_ptr<PhysicalSessionRecord> record) {
+    if (record->finished.load(std::memory_order_acquire)) co_return;
+    traffic_.MergeCompletedTraffic(record->accounting_key, record->completed_traffic);
+    totals_.hot.bytes_in += record->final_stats.bytes_in;
+    totals_.hot.bytes_out += record->final_stats.bytes_out;
+    totals_.cold.connections_total += record->final_stats.connections_total;
+    totals_.cold.errors += record->final_stats.errors;
+    record->finished.store(true, std::memory_order_release);
+    records_.erase(record.get());
+    if (!record->domain->CanDestroyDirectlyOn(worker_id_)) {
+        auto* domain = record->domain.get();
+        domain->Execute([cap = std::move(record->capabilities),
+                         domain = std::move(record->domain)]() mutable {
+            cap.reset();
+            domain.reset();
+        });
+    }
+    (void)changed_.try_send(IoErrorCode{});
+}
+
+net::awaitable<void> PhysicalSessionRegistry::AsyncJoin() {
+    co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
+    closing_ = true;
+    while (std::any_of(records_.begin(), records_.end(), [](const auto& entry) {
+        return !entry.second->finished.load(std::memory_order_acquire);
+    })) {
+        co_await changed_.async_receive(net::use_awaitable);
+    }
+}
 
 SessionConfiguration::SessionConfiguration(const WorkerRuntimeConfig& config,
     std::shared_ptr<const router::Router> router_value,
@@ -41,19 +105,20 @@ SessionConfiguration::SessionConfiguration(const WorkerRuntimeConfig& config,
 struct PhysicalSessionCapabilities::Impl final : memory::ThreadAllocated {
     using HandlerLookup = proxyman::outbound::HandlerLookup;
 
-    Impl(PhysicalSessionCapabilities& owner_value, net::io_context& io)
+    Impl(PhysicalSessionCapabilities& owner_value, net::io_context& io,
+         AwaitableTaskGroup* external_tasks = nullptr)
         : owner(owner_value), reactor(io), dns(owner.dns_worker_),
-          tasks(owner.Domain()->Executor()) {
+          resident_tasks(external_tasks ? nullptr :
+              std::make_unique<ResidentTaskGroup>(owner.Domain()->Executor())),
+          tasks(external_tasks ? *external_tasks : resident_tasks->Tasks()) {
         handler = memory::AllocateShared<proxyman::inbound::Handler>(
             owner.receiver_,
             proxyman::inbound::Handler::LazyProtocol{
                 owner.prepared_, &owner.stats_, owner.limiter_.get()},
             *owner.limiter_);
-        // Stateless tags stay physical-local; stateful tags join their host.
         outbounds = std::make_unique<HandlerLookup>(
             *owner.configuration_->outbounds, io, dns,
-            owner.configuration_->timeouts.DialTimeout(), tasks.Tasks(),
-            HandlerLookup::StatefulTags::JoinHost);
+            owner.configuration_->timeouts.DialTimeout(), tasks);
         dispatcher = std::make_unique<dispatcher::DefaultDispatcher>(
             *owner.configuration_->router, *outbounds, *owner.configuration_->policy,
             *owner.tracking_, dns, *owner.request_load_);
@@ -62,7 +127,9 @@ struct PhysicalSessionCapabilities::Impl final : memory::ThreadAllocated {
     PhysicalSessionCapabilities& owner;
     net::io_context& reactor;
     dns::DNS dns;
-    ResidentTaskGroup tasks;
+    std::unique_ptr<ResidentTaskGroup> resident_tasks;
+    AwaitableTaskGroup& tasks;
+    std::unique_ptr<UserOnlineTracker> tracker;
     std::shared_ptr<proxyman::inbound::Handler> handler;
     std::unique_ptr<HandlerLookup> outbounds;
     std::unique_ptr<dispatcher::DefaultDispatcher> dispatcher;
@@ -128,6 +195,47 @@ void PhysicalSessionCapabilities::Initialize(net::io_context& reactor) {
     initialized_ = true;
 }
 
+void PhysicalSessionCapabilities::Initialize(net::io_context& reactor,
+                                             AwaitableTaskGroup& tasks) {
+    if (stopping_) throw IoSystemError(net::error::operation_aborted);
+    if (!impl_) impl_ = std::make_unique<Impl>(*this, reactor, &tasks);
+    initialized_ = true;
+}
+
+UserOnlineTracker& PhysicalSessionCapabilities::Tracker() {
+    if (!impl_) throw std::logic_error("domain not initialized");
+    if (!impl_->tracker) impl_->tracker = std::make_unique<UserOnlineTracker>();
+    return *impl_->tracker;
+}
+
+std::shared_ptr<InboundTransportStreamHandler>
+PhysicalSessionCapabilities::MakeAuthenticatedStreamSink(
+    const session::Context& context, std::shared_ptr<ConnectionFamily> family) {
+    if (stopping_) throw IoSystemError(net::error::operation_aborted);
+    if (!impl_) throw std::logic_error("domain not initialized");
+    return impl_->handler->NewAuthenticatedStreamSink(
+        Domain()->Reactor(), *impl_->dispatcher, stats_, *request_load_,
+        configuration_->timeouts, context, std::move(family));
+}
+
+net::awaitable<void> PhysicalSessionCapabilities::ProcessNativeDatagram(
+    transport::Link link, const UserProfile& profile, session::Context& context) {
+    if (stopping_) throw IoSystemError(net::error::operation_aborted);
+    if (!impl_) throw std::logic_error("domain not initialized");
+    ConnectionStatsScope connection_stats(stats_);
+    auto admission = co_await proxy::AdmitNativeAssociation(
+        context, profile, &Tracker(), limiter_.get(), stats_);
+    if (!admission || stopping_) co_return;
+    auto result = co_await impl_->dispatcher->Dispatch(
+        Domain()->Reactor(), receiver_->dispatch_policy, nullptr, link,
+        InitialPayload{}, context, stats_, configuration_->timeouts);
+    if (result.error != ErrorCode::OK) {
+        LOG_CONN_DEBUG(context, "UDP dispatcher ended > {} up={}B down={}B",
+                       ErrorCodeToString(result.error), result.bytes_up,
+                       result.bytes_down);
+    }
+}
+
 net::awaitable<void> PhysicalSessionCapabilities::ProcessTCP(
     std::unique_ptr<AsyncStream> stream, session::Context& context) {
     if (stopping_) throw IoSystemError(net::error::operation_aborted);
@@ -144,7 +252,7 @@ void PhysicalSessionCapabilities::RequestStop() noexcept {
     stopping_ = true;
     if (impl_) {
         impl_->stop.emit(net::cancellation_type::all);
-        impl_->tasks.Tasks().Cancel();
+        impl_->tasks.Cancel();
     }
 }
 
@@ -154,13 +262,16 @@ net::awaitable<void> PhysicalSessionCapabilities::AsyncJoin() {
         joined_ = true;
         co_return;
     }
-    RequestStop();
+    if (impl_->resident_tasks) RequestStop();
+    else stopping_ = true; // The caller already joined the borrowed scope.
     // ProcessTCP has joined its co_spawn. The installed cancellation handler
     // still owns a GroupExecutor until cleared: retaining it cycles the domain
     // through this host and keeps the admission actor alive after pool shutdown.
     impl_->stop.slot().clear();
     std::exception_ptr failure;
-    try { co_await impl_->tasks.AsyncJoin(); }
+    try {
+        if (impl_->resident_tasks) co_await impl_->resident_tasks->AsyncJoin();
+    }
     catch (...) { failure = std::current_exception(); }
     try { co_await transport::internet::JoinXHttpClientTasks(Domain()->Services()); }
     catch (...) { if (!failure) failure = std::current_exception(); }
@@ -191,7 +302,14 @@ PhysicalSessionCapabilities::TrackingOwner() const noexcept {
 StatsShard& PhysicalSessionCapabilities::Stats() noexcept { return stats_; }
 std::vector<OnlineDevice> PhysicalSessionCapabilities::GetOnlineDevices(std::string_view tag) const {
     const auto* runtime = impl_ && impl_->handler ? impl_->handler->Runtime() : nullptr;
-    return runtime ? runtime->GetOnlineDevices(tag) : std::vector<OnlineDevice>{};
+    auto devices = runtime ? runtime->GetOnlineDevices(tag) : std::vector<OnlineDevice>{};
+    if (impl_ && impl_->tracker) {
+        auto native_devices = impl_->tracker->GetOnlineDevices(tag);
+        devices.insert(devices.end(),
+            std::make_move_iterator(native_devices.begin()),
+            std::make_move_iterator(native_devices.end()));
+    }
+    return devices;
 }
 void PhysicalSessionCapabilities::UpdateUserView(
     proxyman::inbound::UserStore::WorkerView view) noexcept {

@@ -8,6 +8,7 @@
 #include <exception>
 #include <memory>
 #include <type_traits>
+#include <functional>
 #include <utility>
 
 namespace acpp {
@@ -95,9 +96,66 @@ public:
     [[nodiscard]] uint32_t OwnerId() const noexcept;
     [[nodiscard]] bool CanDestroyDirectlyOn(uint32_t worker_id) const noexcept;
     [[nodiscard]] static std::shared_ptr<ExecutionDomain> Current() noexcept;
+    [[nodiscard]] bool CanExecuteInline() const noexcept;
     // Suspends the caller before freezing both execution groups. Completion
     // resumes only after both run tokens have drained and ownership is unified.
     net::awaitable<void> Join(std::shared_ptr<ExecutionDomain> other);
+
+    // Only an actual receive-path observation may request a handoff. This is
+    // not a load-balancing API. The target executor must belong to reactor.
+    struct HandoffTarget {
+        uint32_t worker_id;
+        net::io_context* reactor;
+        net::any_io_executor executor;
+    };
+    [[nodiscard]] HandoffTarget CurrentTarget() const;
+    struct NativeResource {
+        NativeResource() = default;
+        NativeResource(const NativeResource&) = delete;
+        NativeResource& operator=(const NativeResource&) = delete;
+        virtual ~NativeResource();
+        // Run on the old native owner, outside the frozen business domain.
+        // Drain native backend callbacks, not queued business completions.
+        virtual net::awaitable<void> PrepareHandoff(const HandoffTarget& target) = 0;
+        virtual void CommitHandoff(const HandoffTarget& target) noexcept = 0;
+        // A throwing rollback must first leave this resource terminal/closed.
+        // The domain cancels its session, drains on the old owner, and reports
+        // the failure; it never resumes a half-rebound live resource.
+        virtual net::awaitable<void> CancelHandoff(const HandoffTarget& old_target) = 0;
+    private:
+        friend class ExecutionDomain;
+        NativeResource* previous_ = nullptr;
+        NativeResource* next_ = nullptr;
+        ExecutionDomain* domain_ = nullptr;
+    };
+    // Borrowed registration: resource destruction/unregistration is serialized
+    // by this domain. No resource may be destroyed while a handoff is prepared.
+    void RegisterResource(NativeResource& resource);
+    void UnregisterResource(NativeResource& resource) noexcept;
+
+    class Handoff final {
+    public:
+        ~Handoff();
+        Handoff(const Handoff&) = delete;
+        Handoff& operator=(const Handoff&) = delete;
+        // Restricted protocol validation only. Business callbacks remain queued;
+        // validation may retain protocol changes, so Cancel never rewinds them.
+        net::awaitable<void> Validate(std::function<void()> validation);
+        net::awaitable<void> Commit();
+        net::awaitable<void> Cancel();
+    private:
+        friend class ExecutionDomain;
+        struct Transaction;
+        explicit Handoff(std::shared_ptr<Transaction> transaction);
+        std::shared_ptr<Transaction> transaction_;
+    };
+    // Must be awaited outside every domain in the affected group. The returned
+    // transaction MUST explicitly Commit or Cancel, including exception paths.
+    net::awaitable<std::shared_ptr<Handoff>> PreparePassiveHandoff(HandoffTarget target);
+    // Attach an independent, exclusively leased physical domain. Detach moves
+    // only that domain out, preserving its current native owner and identity.
+    net::awaitable<void> AttachExclusive(std::shared_ptr<ExecutionDomain> other);
+    net::awaitable<void> DetachExclusive(std::shared_ptr<ExecutionDomain> other);
 
     struct Operation {
         Operation* next = nullptr;
@@ -122,13 +180,22 @@ public:
 private:
     struct State;
     struct Group;
+    struct NativeExecutor;
     void Notify(bool force = false) noexcept;
-    void Run(uint32_t scheduled_owner) noexcept;
+    void Run(const void* scheduled_route) noexcept;
     static net::awaitable<void> MergeGroups(std::shared_ptr<ExecutionDomain> first,
-                                           std::shared_ptr<ExecutionDomain> second);
+                                           std::shared_ptr<ExecutionDomain> second,
+                                           bool exclusive = false);
+    static net::awaitable<void> SplitGroup(std::shared_ptr<ExecutionDomain> first,
+                                         std::shared_ptr<ExecutionDomain> second);
+    static net::awaitable<void> Freeze(std::shared_ptr<ExecutionDomain> domain);
+    static void Thaw(const std::shared_ptr<Group>& group) noexcept;
+    static net::awaitable<void> RebindFrozen(
+        std::shared_ptr<ExecutionDomain> domain, HandoffTarget target);
+    static net::awaitable<std::shared_ptr<Handoff>> Prepare(
+        std::shared_ptr<ExecutionDomain> domain, HandoffTarget target);
     explicit ExecutionDomain(std::unique_ptr<State> state);
     void Enqueue(std::unique_ptr<Operation> operation);
-    [[nodiscard]] Group* Root() const noexcept;
     std::unique_ptr<State> state_;
 };
 
@@ -174,7 +241,7 @@ public:
         return copy;
     }
     template<class Function> void execute(Function&& function) const {
-        if (!never_inline_ && ExecutionDomain::Current().get() == domain_.get()) {
+        if (!never_inline_ && domain_->CanExecuteInline()) {
             std::forward<Function>(function)();
             return;
         }
