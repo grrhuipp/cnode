@@ -11,6 +11,7 @@
 #include "acppnode/app/session_tracking.hpp"
 #include "acppnode/app/stats.hpp"
 #include "acppnode/app/worker_runtime_config.hpp"
+#include "acppnode/app/worker_stats.hpp"
 #include "acppnode/common/rule.hpp"
 #include "acppnode/common/session.hpp"
 #include "acppnode/infra/log.hpp"
@@ -84,6 +85,27 @@ public:
 
     [[nodiscard]] bool IsJoined() const noexcept {
         return joined_.load(std::memory_order_acquire);
+    }
+
+    [[nodiscard]] WorkerRuntimeStatsSnapshot CollectRuntimeStats(
+        bool include_resources) const noexcept {
+        WorkerRuntimeStatsSnapshot snapshot;
+        const auto footprint = memory::ThreadMemoryPool().GetFootprint();
+        snapshot.memory.pool_mapped_bytes = footprint.mapped_bytes;
+        snapshot.memory.pool_direct_bytes = footprint.direct_bytes;
+        snapshot.memory.pool_idle_bytes = footprint.idle_bytes;
+        snapshot.memory.pool_chunks = footprint.chunks;
+        if (include_resources && handler_) {
+            if (const auto domain = Domain()) {
+                const auto timers = TimeoutScheduler::ForIoContext(
+                    domain->Reactor()).GetResourceStats();
+                auto& resources = snapshot.resources.emplace();
+                resources.timeout_events = timers.active_events;
+                resources.timeout_heap_capacity = timers.heap_capacity;
+                resources.timeout_waiters = timers.wait_pending ? 1 : 0;
+            }
+        }
+        return snapshot;
     }
 
     net::awaitable<void> AsyncJoin() {
@@ -328,6 +350,54 @@ net::awaitable<void> OutboundConfiguration::AsyncJoinHosts() {
     // Release all domain roots before the coordinator's Finalize barrier.
     hosts_.reset();
     if (failure) std::rethrow_exception(failure);
+}
+
+net::awaitable<void> OutboundConfiguration::CollectRuntimeStats(
+    WorkerRuntimeStatsSnapshot& result, bool include_resources) {
+    struct Sample {
+        std::weak_ptr<OutboundPoolHost> host;
+        std::weak_ptr<ExecutionDomain> domain;
+    };
+    std::vector<Sample> samples;
+    {
+        const std::lock_guard lock(publication_mutex_);
+        if (!hosts_) co_return;
+        hosts_->Prune();
+        samples.reserve(hosts_->residents.size());
+        for (const auto& resident : hosts_->residents) {
+            if (resident.host && !resident.host->IsJoined() && resident.domain) {
+                samples.push_back(Sample{
+                    .host = resident.host,
+                    .domain = resident.domain,
+                });
+            }
+        }
+    }
+    for (const auto& sample : samples) {
+        auto domain = sample.domain.lock();
+        if (!domain) continue;
+        const auto values = co_await net::co_spawn(domain->Executor(),
+            [weak_host = sample.host, domain, include_resources]() mutable
+                -> net::awaitable<WorkerRuntimeStatsSnapshot> {
+                WorkerRuntimeStatsSnapshot snapshot;
+                auto host = weak_host.lock();
+                if (host && !host->IsJoined()) {
+                    snapshot = host->CollectRuntimeStats(include_resources);
+                }
+                host.reset();
+                domain.reset();
+                co_return snapshot;
+            }, net::use_awaitable);
+        result.memory.pool_mapped_bytes += values.memory.pool_mapped_bytes;
+        result.memory.pool_direct_bytes += values.memory.pool_direct_bytes;
+        result.memory.pool_idle_bytes += values.memory.pool_idle_bytes;
+        result.memory.pool_chunks += values.memory.pool_chunks;
+        if (values.resources && result.resources) {
+            result.resources->timeout_events += values.resources->timeout_events;
+            result.resources->timeout_heap_capacity += values.resources->timeout_heap_capacity;
+            result.resources->timeout_waiters += values.resources->timeout_waiters;
+        }
+    }
 }
 
 OutboundConfiguration::OutboundConfiguration(

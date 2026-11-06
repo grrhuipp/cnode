@@ -202,39 +202,46 @@ void TrafficJournal::Append(const app::UserTrafficSnapshot& traffic) {
 TrafficJournal::Batch TrafficJournal::Prepare() {
     std::lock_guard lock(mutex_);
     CheckHealthy();
-    Batch result;
-    std::unordered_map<int64_t, api::UserTraffic> merged;
-    size_t bytes = 0;
-    for (const auto& entry : std::filesystem::directory_iterator(directory_)) {
-        if (entry.path().extension() != ".ready") continue;
-        const auto text = ReadRecord(entry.path());
-        if (result.records.size() >= kMaxRecords || text.size() > kMaxBytes - bytes) {
-            throw std::runtime_error("traffic journal exceeds replay bounds");
-        }
-        bytes += text.size();
-        const auto parsed = json::parse(text);
-        if (!parsed.is_array()) throw std::runtime_error("invalid traffic journal record");
-        for (const auto& item : parsed.as_array()) {
-            if (!item.is_array()) throw std::runtime_error("invalid traffic journal row");
-            const auto& row = item.as_array();
-            if (row.size() != 3) throw std::runtime_error("invalid traffic journal row");
-            const auto uid = ReadCounter(row[0]);
-            const auto up = ReadCounter(row[1]);
-            const auto down = ReadCounter(row[2]);
-            if (uid <= 0 || up < 0 || down < 0) throw std::runtime_error("invalid traffic journal counters");
-            auto& value = merged[uid];
-            value.UID = uid;
-            if (up > INT64_MAX - value.Upload || down > INT64_MAX - value.Download) {
-                throw std::runtime_error("traffic batch exceeds UniProxy signed integer range");
+    try {
+        Batch result;
+        std::unordered_map<int64_t, api::UserTraffic> merged;
+        size_t bytes = 0;
+        for (const auto& entry : std::filesystem::directory_iterator(directory_)) {
+            if (entry.path().extension() != ".ready") continue;
+            const auto text = ReadRecord(entry.path());
+            if (result.records.size() >= kMaxRecords || text.size() > kMaxBytes - bytes) {
+                throw std::runtime_error("traffic journal exceeds replay bounds");
             }
-            value.Upload += up;
-            value.Download += down;
+            bytes += text.size();
+            const auto parsed = json::parse(text);
+            if (!parsed.is_array()) throw std::runtime_error("invalid traffic journal record");
+            for (const auto& item : parsed.as_array()) {
+                if (!item.is_array()) throw std::runtime_error("invalid traffic journal row");
+                const auto& row = item.as_array();
+                if (row.size() != 3) throw std::runtime_error("invalid traffic journal row");
+                const auto uid = ReadCounter(row[0]);
+                const auto up = ReadCounter(row[1]);
+                const auto down = ReadCounter(row[2]);
+                if (uid <= 0 || up < 0 || down < 0 || (up == 0 && down == 0)) {
+                    throw std::runtime_error("invalid traffic journal counters");
+                }
+                auto& value = merged[uid];
+                value.UID = uid;
+                if (up > INT64_MAX - value.Upload || down > INT64_MAX - value.Download) {
+                    throw std::runtime_error("traffic batch exceeds UniProxy signed integer range");
+                }
+                value.Upload += up;
+                value.Download += down;
+            }
+            result.records.push_back(entry.path());
         }
-        result.records.push_back(entry.path());
+        result.traffic.reserve(merged.size());
+        for (const auto& [uid, value] : merged) result.traffic.push_back(value);
+        return result;
+    } catch (...) {
+        failed_ = true;
+        throw;
     }
-    result.traffic.reserve(merged.size());
-    for (const auto& [uid, value] : merged) result.traffic.push_back(value);
-    return result;
 }
 void TrafficJournal::Begin(Batch& batch) {
     std::lock_guard lock(mutex_);

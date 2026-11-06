@@ -368,11 +368,21 @@ private:
                    !closed_flag.load(std::memory_order_acquire) &&
                    stream.IsOpen();
         };
-        tl::expected<Http1MessageHead, ErrorCode> head =
-            tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        Http1MessageHead head;
         while (true) {
             try {
-                head = co_await ReadHttp1MessageHead(stream);
+                const auto res = co_await ReadHttp1MessageHead(stream, head);
+                if (!res) {
+                    co_return false;
+                }
+                const std::string_view status_line = ExtractStartLine(head.Text());
+                if (HasStatusCode(status_line, "100") ||
+                    HasStatusCode(status_line, "103")) {
+                    continue;
+                }
+                if (!HasStatusCode(status_line, "200")) {
+                    co_return false;
+                }
                 break;
             } catch (const IoSystemError& e) {
                 if (!should_retry(e)) {
@@ -384,30 +394,9 @@ private:
                 co_await net::this_coro::reset_cancellation_state();
             }
         }
-        while (head && (HasStatusCode(ExtractStartLine(head->Text()), "100") ||
-                        HasStatusCode(ExtractStartLine(head->Text()), "103"))) {
-            std::span<const uint8_t> initial = head->ReadAhead();
-            while (true) {
-                try {
-                    head = co_await ReadHttp1MessageHead(stream, initial);
-                    break;
-                } catch (const IoSystemError& e) {
-                    if (!should_retry(e)) {
-                        throw;
-                    }
-                    initial = {};
-                }
-                if ((co_await net::this_coro::cancellation_state).cancelled() !=
-                    net::cancellation_type::none) {
-                    co_await net::this_coro::reset_cancellation_state();
-                }
-            }
-        }
-        if (!head || !HasStatusCode(ExtractStartLine(head->Text()), "200"))
-            co_return false;
         // Connection: close forbids a following response. Discard read-ahead
         // and subsequent wire bytes, including optional chunk framing.
-        head->storage = buf::BufferGuard{};
+        head.storage = buf::BufferGuard{};
         while (true) {
             try {
                 if ((co_await stream.ReadMultiBuffer()).empty()) {

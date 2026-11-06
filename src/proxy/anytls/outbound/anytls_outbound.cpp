@@ -5,7 +5,7 @@
 
 #include "../anytls_codec.hpp"
 #include "../padding.hpp"
-#include "../payload_queue.hpp"
+#include "acppnode/common/buf/length_prefixed_packet_buffer.hpp"
 #include "../../handshake_timeout.hpp"
 #include "../../uot/uot.hpp"
 #include "acppnode/transport/internet/async_write_gate.hpp"
@@ -96,7 +96,7 @@ struct Handler::ClientSession {
                 if (ec) co_return;
             }
             if (closed_) co_return;
-            AppendQueuedPayload(queued_payload_, std::move(mb));
+            buf::AppendCoalescedStreamInput(queued_payload_, std::move(mb));
             WakePayloadReader();
         }
 

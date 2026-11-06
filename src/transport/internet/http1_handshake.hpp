@@ -36,6 +36,10 @@ struct Http1MessageHead {
 // `initial` holds bytes already consumed while sniffing the protocol. Fails
 // with SOCKET_EOF on peer close and PROTOCOL_DECODE_FAILED when the head does
 // not fit one Buffer.
+[[nodiscard]] net::awaitable<tl::expected<void, ErrorCode>>
+ReadHttp1MessageHead(AsyncStream& stream,
+                     Http1MessageHead& head,
+                     std::span<const uint8_t> initial = {});
 [[nodiscard]] net::awaitable<tl::expected<Http1MessageHead, ErrorCode>>
 ReadHttp1MessageHead(AsyncStream& stream, std::span<const uint8_t> initial = {});
 

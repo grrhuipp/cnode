@@ -1,7 +1,6 @@
 #pragma once
 
 #include "shadowsocks_crypto.hpp"
-#include "../handshake_timeout.hpp"
 
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
@@ -163,8 +162,7 @@ ReadAndDecryptStreamPayload(
                 std::min(remaining, static_cast<size_t>(plain->Available()));
             cipher_buf->Reset();
             if (!co_await ReadFull(stream, cipher_buf->Tail().data(), to_process)) {
-                co_return tl::unexpected(
-                    proxy::ResolveHandshakeReadFailure(stream));
+                co_return tl::unexpected(ErrorCode::SOCKET_READ_FAILED);
             }
             cipher_buf->Produce(static_cast<uint32_t>(to_process));
 
@@ -179,8 +177,7 @@ ReadAndDecryptStreamPayload(
 
     std::array<uint8_t, SsAeadCipher::kTagSize> payload_tag{};
     if (!co_await ReadFull(stream, payload_tag.data(), payload_tag.size())) {
-        co_return tl::unexpected(
-            proxy::ResolveHandshakeReadFailure(stream));
+        co_return tl::unexpected(ErrorCode::SOCKET_READ_FAILED);
     }
     if (!cipher.FinishDecrypt(payload_tag.data())) {
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);

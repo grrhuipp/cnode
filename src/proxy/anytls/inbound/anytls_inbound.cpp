@@ -4,7 +4,7 @@
 
 #include "../anytls_codec.hpp"
 #include "../padding.hpp"
-#include "../payload_queue.hpp"
+#include "acppnode/common/buf/length_prefixed_packet_buffer.hpp"
 #include "../credentials.hpp"
 #include "../../uot/uot.hpp"
 #include "acppnode/transport/internet/async_write_gate.hpp"
@@ -121,7 +121,7 @@ public:
             mb.clear();
             co_return;
         }
-        AppendQueuedPayload(queued_input_, std::move(mb));
+        buf::AppendCoalescedStreamInput(queued_input_, std::move(mb));
         WakeInputReader();
     }
 

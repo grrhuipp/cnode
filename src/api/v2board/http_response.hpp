@@ -112,16 +112,28 @@ net::awaitable<tl::expected<std::string, std::string>> ReadCrlfLine(
         if (bytes > 0) {
             buffer.commit(bytes);
         }
-        if (read_ec && bytes == 0) {
+        if (read_ec && !FindCrlf(buffer).has_value()) {
             co_return tl::unexpected(read_ec.message());
         }
     }
 }
 
+// Charges one CRLF-terminated line against the cumulative response-head budget,
+// which also bounds how many interim 1xx heads and chunked trailer lines a peer
+// can send.
+inline bool ChargeHeaderLine(size_t& used, size_t line_size) noexcept {
+    if (used > kMaxHttpHeaderSize - 2 || line_size > kMaxHttpHeaderSize - used - 2) {
+        return false;
+    }
+    used += line_size + 2;
+    return true;
+}
+
 template <typename Stream>
 net::awaitable<tl::expected<std::string, std::string>> ReadChunkedBody(
     Stream& stream,
-    net::streambuf& buffer) {
+    net::streambuf& buffer,
+    size_t& header_size) {
     std::string decoded;
 
     for (;;) {
@@ -145,6 +157,10 @@ net::awaitable<tl::expected<std::string, std::string>> ReadChunkedBody(
                 if (!trailer) {
                     co_return tl::unexpected(
                         "invalid chunked HTTP response: " + trailer.error());
+                }
+                if (!ChargeHeaderLine(header_size, trailer->size())) {
+                    co_return tl::unexpected(
+                        "invalid chunked HTTP response: HTTP response headers too large");
                 }
                 if (trailer->empty()) {
                     co_return decoded;
@@ -211,16 +227,6 @@ inline void AppendTransferCodings(std::string_view value, TransferCodings& codin
             codings.only_chunked = false;
         }
     }
-}
-
-// Charges one CRLF-terminated line against the cumulative response-head budget,
-// which also bounds how many interim 1xx heads a peer can send.
-inline bool ChargeHeaderLine(size_t& used, size_t line_size) noexcept {
-    if (used > kMaxHttpHeaderSize - 2 || line_size > kMaxHttpHeaderSize - used - 2) {
-        return false;
-    }
-    used += line_size + 2;
-    return true;
 }
 
 template <typename Stream>
@@ -407,7 +413,7 @@ net::awaitable<Response> ReadResponse(Stream& stream) {
             result.body = "unsupported HTTP Transfer-Encoding";
             co_return result;
         }
-        auto decoded = co_await ReadChunkedBody(stream, buffer);
+        auto decoded = co_await ReadChunkedBody(stream, buffer, header_size);
         if (!decoded) {
             result.status = -1;
             result.body = std::move(decoded.error());

@@ -21,6 +21,7 @@ class AsyncStream;
 class ConnectionLimiter;
 namespace session { struct Context; }
 struct WorkerRuntimeConfig;
+struct WorkerRuntimeStatsSnapshot;
 namespace rule { class DetectRulePolicy; }
 namespace app {
 class RequestLoadState;
@@ -46,6 +47,8 @@ public:
                    dns::DNSWorker& dns_worker, std::chrono::seconds dial_timeout);
     // Called only after the Worker's requests have drained.
     net::awaitable<void> AsyncJoinHosts();
+    net::awaitable<void> CollectRuntimeStats(WorkerRuntimeStatsSnapshot& result,
+                                             bool include_resources);
     [[nodiscard]] std::shared_ptr<const Snapshot> Capture() const noexcept;
     void Replace(const proxyman::outbound::PreparedOutboundConfig& configuration);
     void Remove(std::string_view tag);

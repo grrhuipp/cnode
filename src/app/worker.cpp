@@ -1480,6 +1480,10 @@ net::awaitable<WorkerRuntimeStatsSnapshot> Worker::CollectRuntimeStats(bool incl
         result.memory.pool_idle_bytes += values.memory.pool_idle_bytes;
         result.memory.pool_chunks += values.memory.pool_chunks;
     }
+    if (runtime_->session_configuration && runtime_->session_configuration->outbounds) {
+        co_await runtime_->session_configuration->outbounds->CollectRuntimeStats(
+            result, include_resources);
+    }
     co_return result;
 }
 

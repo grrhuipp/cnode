@@ -143,6 +143,9 @@ std::optional<PanelApiUrlParts> ParsePanelApiUrl(std::string_view url) {
     }
     if (!literal_address) {
         host = domain::WithoutTrailingRootDot(host);
+        if (iputil::ParseLiteral(host).has_value()) {
+            return std::nullopt;
+        }
     }
 
     while (!path_prefix.empty() && path_prefix.back() == '/') {

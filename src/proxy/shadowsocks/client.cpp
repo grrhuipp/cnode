@@ -2,7 +2,6 @@
 #include "acppnode/common/byte_reader.hpp"
 #include "stream_crypto.hpp"
 #include "client.hpp"
-#include "../handshake_timeout.hpp"
 #include "acppnode/common/address_codec.hpp"
 #include "acppnode/common/allocator.hpp"
 
@@ -387,8 +386,7 @@ ReadTCPResponse(const SsCipherInfo& cipher_info,
 
             std::array<uint8_t, 64> server_salt{};
             if (!co_await ReadFull(stream, server_salt.data(), cipher_info.salt_size)) {
-                co_return tl::unexpected(
-                    proxy::ResolveHandshakeReadFailure(stream));
+                co_return tl::unexpected(ErrorCode::SOCKET_READ_FAILED);
             }
 
             std::array<uint8_t, 32> read_subkey{};
@@ -410,8 +408,7 @@ ReadTCPResponse(const SsCipherInfo& cipher_info,
             std::array<uint8_t, kFixedCipherMaxSize> fixed_cipher{};
             const size_t fixed_cipher_size = fixed_plain_size + SsAeadCipher::kTagSize;
             if (!co_await ReadFull(stream, fixed_cipher.data(), fixed_cipher_size)) {
-                co_return tl::unexpected(
-                    proxy::ResolveHandshakeReadFailure(stream));
+                co_return tl::unexpected(ErrorCode::SOCKET_READ_FAILED);
             }
 
             std::array<uint8_t, kFixedPlainMaxSize> fixed_plain{};
@@ -448,8 +445,7 @@ ReadTCPResponse(const SsCipherInfo& cipher_info,
 
         std::array<uint8_t, 64> server_salt{};
         if (!co_await ReadFull(stream, server_salt.data(), cipher_info.salt_size)) {
-            co_return tl::unexpected(
-                proxy::ResolveHandshakeReadFailure(stream));
+            co_return tl::unexpected(ErrorCode::SOCKET_READ_FAILED);
         }
 
         std::array<uint8_t, 64> read_subkey{};
@@ -466,11 +462,9 @@ ReadTCPResponse(const SsCipherInfo& cipher_info,
     } catch (const std::bad_alloc&) {
         co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
     } catch (const IoSystemError& e) {
-        co_return tl::unexpected(
-            proxy::ResolveHandshakeReadFailure(
-                stream, MapAsioError(e.code())));
+        co_return tl::unexpected(MapAsioError(e.code()));
     } catch (...) {
-        co_return tl::unexpected(proxy::ResolveHandshakeReadFailure(stream));
+        co_return tl::unexpected(ErrorCode::SOCKET_READ_FAILED);
     }
 }
 

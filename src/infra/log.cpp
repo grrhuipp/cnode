@@ -639,35 +639,37 @@ public:
     }
 
     void Enqueue(std::string line, bool error) {
-        producers_.fetch_add(1, std::memory_order_acq_rel);
-        struct ReleaseProducer {
-            std::atomic<size_t>& count;
-            ~ReleaseProducer() {
-                if (count.fetch_sub(1, std::memory_order_acq_rel) == 1) count.notify_all();
-            }
-        } release{producers_};
         line.push_back('\n');
-        if (!accepting_.load(std::memory_order_acquire)) {
-            // Startup/after-shutdown failures still have a bounded diagnostic
-            // path even when the logging threads were never started.
-            Output output;
-            Open(output, error ? STDERR_FILENO : STDOUT_FILENO);
-            const auto written = Send(output, line);
-            if (!written) Emergency("console startup write-failure: record dropped", output);
-            if (output.fd >= 0) ::close(output.fd);
-            return;
+        {
+            producers_.fetch_add(1, std::memory_order_acq_rel);
+            struct ReleaseProducer {
+                std::atomic<size_t>& count;
+                ~ReleaseProducer() {
+                    if (count.fetch_sub(1, std::memory_order_acq_rel) == 1) count.notify_all();
+                }
+            } release{producers_};
+            if (accepting_.load(std::memory_order_acquire)) {
+                if (line.size() > kMaxRecordBytes) {
+                    dropped_.fetch_add(1, std::memory_order_relaxed);
+                    wakeup_.signal();
+                    return;
+                }
+                const auto previous = pending_.fetch_add(1, std::memory_order_acq_rel);
+                if (previous >= kCapacity || !queue_.enqueue(Record{std::move(line), error})) {
+                    pending_.fetch_sub(1, std::memory_order_acq_rel);
+                    dropped_.fetch_add(1, std::memory_order_relaxed);
+                }
+                wakeup_.signal();
+                return;
+            }
         }
-        if (line.size() > kMaxRecordBytes) {
-            dropped_.fetch_add(1, std::memory_order_relaxed);
-            wakeup_.signal();
-            return;
-        }
-        const auto previous = pending_.fetch_add(1, std::memory_order_acq_rel);
-        if (previous >= kCapacity || !queue_.enqueue(Record{std::move(line), error})) {
-            pending_.fetch_sub(1, std::memory_order_acq_rel);
-            dropped_.fetch_add(1, std::memory_order_relaxed);
-        }
-        wakeup_.signal();
+        // Startup/after-shutdown failures still have a bounded diagnostic
+        // path even when the logging threads were never started.
+        Output output;
+        Open(output, error ? STDERR_FILENO : STDOUT_FILENO);
+        const auto written = Send(output, line);
+        if (!written) Emergency("console startup write-failure: record dropped", output);
+        if (output.fd >= 0) ::close(output.fd);
     }
 
 private:

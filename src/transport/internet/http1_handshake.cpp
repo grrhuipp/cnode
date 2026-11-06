@@ -541,23 +541,35 @@ net::awaitable<tl::expected<void, ErrorCode>> ReadClientResponse(
 
 }  // namespace
 
-net::awaitable<tl::expected<Http1MessageHead, ErrorCode>> ReadHttp1MessageHead(
-    AsyncStream& stream, std::span<const uint8_t> initial) {
-    Http1MessageHead head;
-    head.storage = buf::BufferGuard{buf::Buffer::New()};
+net::awaitable<tl::expected<void, ErrorCode>> ReadHttp1MessageHead(
+    AsyncStream& stream, Http1MessageHead& head, std::span<const uint8_t> initial) {
     if (!head.storage) {
-        co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+        head.storage = buf::BufferGuard{buf::Buffer::New()};
+        if (!head.storage) {
+            co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+        }
+        head.bytes = head.storage->Tail().data();
+        head.header_end = 0;
+        head.size = 0;
     }
     uint8_t* data = head.storage->Tail().data();
     const size_t capacity = head.storage->Available();
-    if (initial.size() > capacity) {
-        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+    head.bytes = data;
+    if (head.header_end != 0) {
+        const size_t remaining = head.size - head.header_end;
+        if (remaining != 0) {
+            std::memmove(data, data + head.header_end, remaining);
+        }
+        head.size = remaining;
+        head.header_end = 0;
     }
     if (!initial.empty()) {
-        std::memcpy(data, initial.data(), initial.size());
+        if (initial.size() > capacity - head.size) {
+            co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        }
+        std::memcpy(data + head.size, initial.data(), initial.size());
+        head.size += initial.size();
     }
-    head.bytes = data;
-    head.size = initial.size();
 
     constexpr std::string_view kTerminator = "\r\n\r\n";
     size_t scanned = 0;
@@ -569,7 +581,7 @@ net::awaitable<tl::expected<Http1MessageHead, ErrorCode>> ReadHttp1MessageHead(
         if (const size_t end = received.find(kTerminator, from);
             end != std::string_view::npos) {
             head.header_end = end + kTerminator.size();
-            co_return std::move(head);
+            co_return tl::expected<void, ErrorCode>{};
         }
         scanned = head.size;
         if (head.size == capacity) {
@@ -582,6 +594,15 @@ net::awaitable<tl::expected<Http1MessageHead, ErrorCode>> ReadHttp1MessageHead(
         }
         head.size += n;
     }
+}
+
+net::awaitable<tl::expected<Http1MessageHead, ErrorCode>> ReadHttp1MessageHead(
+    AsyncStream& stream, std::span<const uint8_t> initial) {
+    Http1MessageHead head;
+    if (auto res = co_await ReadHttp1MessageHead(stream, head, initial); !res) {
+        co_return tl::unexpected(res.error());
+    }
+    co_return std::move(head);
 }
 
 std::string_view ExtractStartLine(std::string_view head) {

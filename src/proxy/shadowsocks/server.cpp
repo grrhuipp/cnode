@@ -46,8 +46,13 @@ net::awaitable<tl::expected<void, ErrorCode>> ReadStreamPayload(
     size_t payload_len,
     buf::MultiBuffer& output) {
     try {
-        co_return co_await detail::ReadAndDecryptStreamPayload(
+        auto res = co_await detail::ReadAndDecryptStreamPayload(
             stream, cipher, nonce, payload_len, output);
+        if (!res) {
+            co_return tl::unexpected(
+                proxy::ResolveHandshakeReadFailure(stream, res.error()));
+        }
+        co_return res;
     } catch (const std::bad_alloc&) {
         co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
     } catch (const IoSystemError& error) {

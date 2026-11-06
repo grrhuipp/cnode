@@ -106,7 +106,7 @@ SniffResult SniffTls(std::span<const uint8_t> data) {
         record_version != kSsl30) {
         return result;
     }
-    const bool version_supports_need_more =
+    bool version_supports_need_more =
         record_version >= kTls10 && record_version <= kTls13;
     if (reader.Remaining() < 2) {
         if (version_supports_need_more) {
@@ -169,11 +169,11 @@ SniffResult SniffTls(std::span<const uint8_t> data) {
             next_version != kSsl30) {
             return result;
         }
-        const bool next_supports_need_more =
+        version_supports_need_more =
             version_supports_need_more &&
             next_version >= kTls10 && next_version <= kTls13;
         if (reader.Remaining() < 2) {
-            if (next_supports_need_more) {
+            if (version_supports_need_more) {
                 result.need_more = true;
                 result.protocol = constants::protocol::kTls;
             }
@@ -189,12 +189,14 @@ SniffResult SniffTls(std::span<const uint8_t> data) {
             const auto partial = reader.ReadBytes(avail);
             std::copy_n(partial.data(), avail, reassembled.data() + reassembled_size);
             reassembled_size += avail;
-            if (TryFinishClientHelloSniff(
-                    std::span<const uint8_t>(reassembled.data(), reassembled_size),
-                    result)) {
-                return result;
+            if (reassembled_size >= 4) {
+                const size_t hello_size =
+                    4 + ((static_cast<size_t>(reassembled[1]) << 16) |
+                         (static_cast<size_t>(reassembled[2]) << 8) |
+                         reassembled[3]);
+                if (hello_size > kMaxTlsSniffHandshakeBytes) return result;
             }
-            if (next_supports_need_more) {
+            if (version_supports_need_more) {
                 result.need_more = true;
                 result.protocol = constants::protocol::kTls;
             }
