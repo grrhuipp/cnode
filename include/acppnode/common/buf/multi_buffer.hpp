@@ -37,11 +37,10 @@ struct Buffer {
     // 回包=来源。TCP relay 路径通常不携带 endpoint，因此懒构造 TargetAddress。
     std::optional<TargetAddress> udp_;
 
-    // Payload storage stays in its original domain when a group migrates.
-    // Joined domains may borrow it only while their common group is leased.
-    memory::worker_memory* allocation_pool_ = &memory::ThreadMemoryPool();
+    // The slot records its connection domain while live. Joined domains may
+    // borrow it only while their common execution group is leased.
     void RequireLease() const noexcept {
-        allocation_pool_->RequireLease();
+        memory::RequireAllocationLease(this);
     }
 
     // 有效数据视图 [start, end)

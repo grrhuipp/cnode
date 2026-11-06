@@ -20,7 +20,6 @@
 #include "acppnode/features/outbound/outbound.hpp"
 #include "../common/awaitable_task_group.hpp"
 #include "../transport/internet/xhttp_session.hpp"
-#include "worker_memory_reclaimer.hpp"
 
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/cancellation_signal.hpp>
@@ -48,7 +47,6 @@ public:
         handler_.reset();
         tasks_.reset();
         dns_.reset();
-        memory_reclaimer_.Stop();
     }
 
     void Bind(const std::shared_ptr<ExecutionDomain>& domain) {
@@ -90,11 +88,6 @@ public:
     [[nodiscard]] WorkerRuntimeStatsSnapshot CollectRuntimeStats(
         bool include_resources) const noexcept {
         WorkerRuntimeStatsSnapshot snapshot;
-        const auto footprint = memory::ThreadMemoryPool().GetFootprint();
-        snapshot.memory.pool_mapped_bytes = footprint.mapped_bytes;
-        snapshot.memory.pool_direct_bytes = footprint.direct_bytes;
-        snapshot.memory.pool_idle_bytes = footprint.idle_bytes;
-        snapshot.memory.pool_chunks = footprint.chunks;
         if (include_resources && handler_) {
             if (const auto domain = Domain()) {
                 const auto timers = TimeoutScheduler::ForIoContext(
@@ -143,12 +136,10 @@ public:
         handler_.reset();
         tasks_.reset();
         dns_.reset();
-        memory_reclaimer_.Stop();
         if (domain) {
             try { co_await TimeoutScheduler::AsyncReleaseForIoContext(domain->Reactor()); }
             catch (...) { if (!failure) failure = std::current_exception(); }
         }
-        allocation_.pool().PurgeIdle();
         join_failure_ = failure;
         joined_.store(true, std::memory_order_release);
         for (auto& waiter : join_waiters_) waiter->cancel();
@@ -205,7 +196,6 @@ private:
         if (!handler_) {
             try {
                 auto domain = Domain();
-                memory_reclaimer_.Start(TimeoutScheduler::ForIoContext(domain->Reactor()));
                 dns_ = std::make_unique<dns::DNS>(dns_worker_);
                 tasks_ = std::make_unique<ResidentTaskGroup>(domain->Executor());
                 handler_ = proxyman::outbound::NewHandler(
@@ -215,7 +205,6 @@ private:
                 handler_.reset();
                 tasks_.reset();
                 dns_.reset();
-                memory_reclaimer_.Stop();
                 throw;
             }
         }
@@ -237,7 +226,6 @@ private:
     std::unique_ptr<dns::DNS> dns_;
     std::unique_ptr<ResidentTaskGroup> tasks_;
     std::unique_ptr<Outbound> handler_;
-    WorkerMemoryReclaimer memory_reclaimer_;
     size_t active_ = 0;
     bool retired_ = false;
     bool cancel_join_spawned_ = false;
@@ -508,11 +496,10 @@ struct PhysicalSessionCapabilities::Impl final : memory::ThreadAllocated,
 
     Impl(PhysicalSessionCapabilities& owner_value, net::io_context& io)
         : owner(owner_value), reactor(io), dns(owner.dns_worker_),
-          tasks(std::make_unique<ResidentTaskGroup>(owner.Domain()->Executor())) {
-        memory_reclaimer.Start(TimeoutScheduler::ForIoContext(io));
+          tasks(owner.Domain()->Executor()) {
         handler = memory::AllocateShared<proxyman::inbound::Handler>(
             owner.receiver_, *this, *owner.limiter_);
-        outbounds = std::make_unique<Outbounds>(*owner.configuration_, io, dns, tasks->Tasks());
+        outbounds = std::make_unique<Outbounds>(*owner.configuration_, io, dns, tasks.Tasks());
         dispatcher = std::make_unique<dispatcher::DefaultDispatcher>(
             *owner.configuration_->router, *outbounds, *owner.configuration_->policy,
             *owner.tracking_, dns, *owner.request_load_);
@@ -533,14 +520,13 @@ struct PhysicalSessionCapabilities::Impl final : memory::ThreadAllocated,
     PhysicalSessionCapabilities& owner;
     net::io_context& reactor;
     dns::DNS dns;
-    std::unique_ptr<ResidentTaskGroup> tasks;
+    ResidentTaskGroup tasks;
     std::unique_ptr<proxyman::inbound::ProtocolRuntime> protocol;
     std::unique_ptr<Inbound> proxy;
     std::shared_ptr<proxyman::inbound::Handler> handler;
     std::unique_ptr<Outbounds> outbounds;
     std::unique_ptr<dispatcher::DefaultDispatcher> dispatcher;
     net::cancellation_signal stop;
-    WorkerMemoryReclaimer memory_reclaimer;
 };
 
 std::shared_ptr<PhysicalSessionCapabilities> PhysicalSessionCapabilities::Create(
@@ -618,7 +604,7 @@ void PhysicalSessionCapabilities::RequestStop() noexcept {
     stopping_ = true;
     if (impl_) {
         impl_->stop.emit(net::cancellation_type::all);
-        if (impl_->tasks) impl_->tasks->Tasks().Cancel();
+        impl_->tasks.Tasks().Cancel();
     }
 }
 
@@ -634,10 +620,8 @@ net::awaitable<void> PhysicalSessionCapabilities::AsyncJoin() {
     // through this host and keeps the admission actor alive after pool shutdown.
     impl_->stop.slot().clear();
     std::exception_ptr failure;
-    if (impl_->tasks) {
-        try { co_await impl_->tasks->AsyncJoin(); }
-        catch (...) { failure = std::current_exception(); }
-    }
+    try { co_await impl_->tasks.AsyncJoin(); }
+    catch (...) { failure = std::current_exception(); }
     try { co_await transport::internet::JoinXHttpClientTasks(Domain()->Services()); }
     catch (...) { if (!failure) failure = std::current_exception(); }
     // Break transport/executor leases only after real completion callbacks.
@@ -646,15 +630,12 @@ net::awaitable<void> PhysicalSessionCapabilities::AsyncJoin() {
     impl_->outbounds.reset();
     impl_->proxy.reset();
     impl_->protocol.reset();
-    impl_->tasks.reset();
-    impl_->memory_reclaimer.Stop();
     auto& reactor = impl_->reactor;
     try { co_await TimeoutScheduler::AsyncReleaseForIoContext(reactor); }
     catch (...) { if (!failure) failure = std::current_exception(); }
     joined_ = true;
     user_view_.reset();
     impl_.reset();
-    allocation_.pool().PurgeIdle();
     if (failure) std::rethrow_exception(failure);
 }
 

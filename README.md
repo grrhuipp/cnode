@@ -79,7 +79,7 @@ main
   -> Relay(TCP / UDP / Mux)
 ```
 
-每个数据 Worker 独立绑定同一组 `SO_REUSEPORT` 端口。物理连接的协程、TLS 状态和私有内存池保持地址稳定；执行域在任一时刻只有一个 Worker 执行租约。XHTTP 请求按配置命名空间与 session id 在有界控制目录会合；跨 Worker 相遇时冻结相关会话组的用户回调、合并执行归属，再恢复运行。H2 物理连接上的多个 session 及桥接它们的连接一起合组，不拆分仍共享状态的宿主。原 reactor 只提交就绪通知，实际 socket 读写和协议处理在当前 owner 上执行，不把数据包持续转发到另一个 Worker。
+每个数据 Worker 独立绑定同一组 `SO_REUSEPORT` 端口，并且各自持有唯一完整的 Worker-local 多级 PMR 池。物理连接只持有轻量分配域和按阶段借用的 arena，不复制尺寸类表、large-bin、空闲队列或 reclaimer；小对象由同一 Worker 上的连接共用 slab，运行期 payload、Buffer、子流及可扩缩容器逐块借还。会话迁移后新分配使用当前 Worker 池，旧块按槽头记录的来源进入原 Worker 的 remote-free 队列，由原 Worker 回收，绝不跨线程直接操作 `unsynchronized` pool。执行域在任一时刻只有一个 Worker 执行租约。XHTTP 请求按配置命名空间与 session id 在有界控制目录会合；跨 Worker 相遇时冻结相关会话组的用户回调、合并执行归属，再恢复运行。H2 物理连接上的多个 session 及桥接它们的连接一起合组，不拆分仍共享状态的宿主。原 reactor 只提交就绪通知，实际 socket 读写和协议处理在当前 owner 上执行，不把数据包持续转发到另一个 Worker。
 
 不再使用源地址 CBPF 亲和；同一 XHTTP session 可来自不同客户端／CDN 回源地址，无须设为 `workers: 1`。不共享状态的会话组仍独立调度，整个入站不会被固定到一个 Worker。短上传完成后事件驱动移除目录和域成员，迟到上传由有界 tombstone 拒绝，不在满容量路径逐次扫描整张会话表。面板、DNS 和跨域元数据操作仍通过有界控制入口交互。
 
@@ -87,7 +87,7 @@ main
 
 数据 Worker 的监听标签、端点索引与 socket 控制块使用所属线程的 PMR。注销完成后移除注册项；尚未结束的 accept / receive 循环仅保留收束所需的退役状态，并在原 Worker 上释放，不累计空标签条目，也不把监听所有权带入每个请求。
 
-出站配置与认证凭据在冷路径准备为不可变快照，handler 持有该快照，不在各执行域内重复解析或深拷贝。AnyTLS 池和启用 VLESS Encryption 的跨请求状态具有独立池执行域，按原准入 Worker、配置快照与出站 tag 隔离；借用请求先与池合组，物理入站关闭不会销毁健康空闲池或票据缓存。无共享可变状态的出口保持请求域独占。替换配置停止旧池的新借用，已有请求继续使用旧快照，结束后收束旧池任务。
+出站配置与认证凭据在冷路径准备为不可变快照，handler 持有该快照，不在各执行域内重复解析或深拷贝。AnyTLS 池和启用 VLESS Encryption 的跨请求状态具有独立执行域，按原准入 Worker、配置快照与出站 tag 隔离；借用请求先与池合组，物理入站关闭不会销毁健康空闲池或票据缓存。无共享可变状态的出口保持请求域独占。替换配置停止旧池的新借用，已有请求继续使用旧快照，结束后收束旧池任务。空 PMR 容器只弱引用轻量分配域，不延长已退役物理连接寿命；若该容器随后复用，则在首次分配前绑定当前执行域。
 
 proxyman / ingress 在冷路径准备 receiver 语义，公开 Dispatcher 只接收请求所需的窄契约；强制出口和未命中回退属于 Dispatcher 编排，Router 只回答“哪条路由规则命中”。每个 receiver 必须在构建时明确选择 `ForceOutbound` 或 `RouteWithFallback`，不存在 Worker 全局默认出口，也不存在可进入热路径的空策略。cnode 使用强类型、只读 `DispatchPolicy`，不把完整 `ReceiverSettings` 或可变配置 context 传入 Dispatcher。面板 `DetectRule` 由 Worker-local 实现通过通用 `RequestPolicy` 接口提供 allow / block 结果，不进入 Router，也不让 Dispatcher 依赖面板规则管理器。
 

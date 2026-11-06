@@ -2,14 +2,16 @@
 
 目标：持续审查并重构，明确职责边界与抽象层次；每轮验证后继续，直到用户要求停止。本记录是阶段检查点，不表示全项目审查完成。
 
-## 2026-11-05 会话域分配与原生完成边界（待统一验证）
+## 2026-11-05 会话域分配与原生完成边界
 
-- `memory::AllocationDomain` 是不可移动的执行租约根；`ScopedAllocationDomain` 在每个 callback 及其销毁期间取得独占租约并恢复上一域。Worker 控制面仍使用原线程池，同一会话迁移不搬移池、挂起帧或 payload。
-- 池是独立地址稳定宿主。活跃分配和 `ThreadLocalAllocator` / `RingDeque` 的资源句柄保留池，不保留整个会话能力对象；原物理域结束后，同组借出的 Buffer 和空容器仍可使用原资源，最后一个资源持有者退出才销毁池。`SetLeaseGroup` 持有调度器稳定组身份，禁止借用已销毁的 ExecutionDomain 裸指针。
-- 容器默认捕获创建时所属资源；移动/交换转移资源所有权，不因 TLS 变化重新选择释放池。Buffer 访问、池分配/释放及 request arena 的内联分配均检查租约；无租约或未合并异域访问立即拒绝。已合并子域仅在共同 Group 独占执行时互借。
-- Asio native operation 内存使用 `ProcessAllocator`，允许原 reactor 交付或销毁完成；它不接触私有池。UDP 接收和发送均由 reactor 等待 readiness，再由当前 owner 执行非阻塞 payload 系统调用；重等不重置整次操作预算，空 payload 仍发送实际零长 datagram。
-- `TimeoutScheduler::ForIoContext` 在会话内选 `ExecutionDomain::Services()`，域外保留 Worker 服务与缓存；定时器完成绑定当前域 executor，定时器操作内存使用 process resource。Scheduler 仅弱持 domain，避免 service/executor 自循环；能力对象收束任务后调用 `AsyncReleaseForIoContext`，取消事件并等到唯一 native timer 完成交付，不能用一次 post 代替 join。
-- 行为入口：`thread_memory_pool_test.cpp` 覆盖租约拒绝、同域跨线程、原物理域销毁后合并域继续借用原池及完整 RAII 销毁；`asio_operation_allocator_test.cpp` 覆盖真实 TCP、取消、private allocator 隔离、排队 readiness 后迁移和异线程销毁未完成 timer；`timeout_scheduler_test.cpp` 覆盖同 reactor 不同域服务隔离与取消 join；`datagram_socket_test.cpp` 覆盖两种零长发送和迁移后归还原接纳计数。本轮工作代理未执行构建或测试，不能将这些新增场景表述为已验证结果。
+- `memory::AllocationDomain` 是不可移动的执行租约根；`ScopedAllocationDomain` 在每个 callback 及其销毁期间取得独占租约并恢复上一域。连接域只拥有 24 字节根和 72 字节轻量路由资源，不含尺寸类表、slab、large-bin、空闲队列或 reclaimer。
+- 完整多级 PMR 池只存在于 Worker。域分配经轻量资源进入当前 Worker 池，同一 Worker 的连接按尺寸类共用 slab；每个 live slot 同时记录连接域和来源 Worker chunk，因组迁移在异 Worker 释放时进入来源池的侵入式 remote-free 队列，并由来源 Worker drain，不跨线程修改池元数据。
+- `ThreadLocalAllocator` / `RingDeque` 只弱引用已空的轻量域；只要容器仍有 live block，块本身保持域资源寿命。空容器跨到同组新域后若再次分配，会先绑定当前域，不会让已退役物理连接常驻。阶段级 `request_memory` 是借用域资源的 monotonic arena，只用于握手、认证、探测、路由和建连临时值，不承载长连接持续流量。
+- 容器移动/交换转移块所有权。Buffer 访问、域分配/释放及 request arena 的内联分配均检查租约；无租约或未合并异域访问立即拒绝。已合并子域仅在共同 Group 独占执行时互借。迁移后的新分配使用当前 Worker，旧块仍归还来源 Worker。
+- Asio native operation 内存使用 `ProcessAllocator`，允许原 reactor 交付或销毁完成；它不接触连接域或 Worker slab。UDP 接收和发送均由 reactor 等待 readiness，再由当前 owner 执行非阻塞 payload 系统调用；重等不重置整次操作预算，空 payload 仍发送实际零长 datagram。
+- `TimeoutScheduler::ForIoContext` 在会话内选 `ExecutionDomain::Services()`，域外保留 Worker 服务与缓存；定时器完成绑定当前域 executor，定时器操作内存使用 process resource。Scheduler 仅弱持 domain，避免 service/executor 自循环；能力对象收束任务后调用 `AsyncReleaseForIoContext`，取消事件并等到唯一 native timer 完成交付，不能用一次 post 代替 join。每连接任务组改为 `Impl` 内嵌 owner，取消和 join 仍按连接隔离；其小对象由 Worker slab 跨连接紧凑装填，不再各占至少一页。
+
+- 验证：全量并行构建与 CTest 178/178 通过。单 Worker、真实 VLESS TCP 持有 2000 条活跃连接 10.5 秒，RSS 从旧版 187248 KiB 降至 94740 KiB，`pool_mapped` 从 85 MB 降至 9 MB；持有窗口 RSS 仅增加 120 KiB，关闭后回落至 19692 KiB。1000 个连接域跨 13 个尺寸类的定向回归中，live stride 4544000 字节、mapped 5033984 字节，未再出现每域每尺寸类至少占一页。
 
 
 ## 工作区与验证环境
@@ -640,7 +642,7 @@ MSVC Release 全量构建成功；**CTest 145/145，84.79 秒，无跳过**。�
 
 采用地址稳定的 `ExecutionDomain`、单一执行租约与会话组整体迁移，不采用跨 Worker 包转发，也不把整个入站固定到单个 Worker。跨 Worker 的 XHTTP 请求和共享 H2 物理连接先冻结用户回调、合并组归属，再恢复执行。原 reactor 仅投递就绪通知，实际 socket 读写由当前组 owner 执行。移除源地址 CBPF 亲和；独立会话组仍独立调度。
 
-物理连接 capabilities 按需持有协议运行态和私有分配域；进程级连接／设备配额及认证重放状态通过有界控制入口协作。AnyTLS 池与启用 VLESS Encryption 的跨请求状态拥有独立池执行域，按原准入 Worker、配置快照及 tag 隔离，借用请求先合组，避免短连接销毁健康池或票据缓存。停机关闭准入、收束请求与池任务、释放服务及域根，最后等待域退休；reactor 与保留完成通道在此之前保持存活。
+物理连接 capabilities 按需持有协议运行态和轻量分配域；完整 PMR pool 只由 Worker 持有，同 Worker 连接共享尺寸类 slab，迁移前的块通过来源 Worker remote-free 队列归还。进程级连接／设备配额及认证重放状态通过有界控制入口协作。AnyTLS 池与启用 VLESS Encryption 的跨请求状态拥有独立执行域，按原准入 Worker、配置快照及 tag 隔离，借用请求先合组，避免短连接销毁健康池或票据缓存。停机关闭准入、收束请求与池任务、释放服务及域根，排空跨 Worker 归还后再销毁 Worker 池；reactor 与保留完成通道在此之前保持存活。
 
 按用户要求恢复 `PROXY auto` 及默认 `auto`，保留 `off/on`。协议验证覆盖 v1/v2 分片、普通流量保留及畸形输入；部署信任边界见 README。HTTP chunk 与 Connection token 解析、H2/gRPC 消费后返还 credit、padding／reset credit 回收、REALITY 跨记录 ClientHello、共享 TLS 上下文、AnyTLS 超时取消和持久流量账本一并接入现有主链路，不保留旧兼容旁路。
 

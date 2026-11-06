@@ -169,7 +169,7 @@ void TestQueuedReadinessAcrossMigration() {
         ScopedAllocationDomain lease(domain);
         payload = acpp::buf::Buffer::New();
         Require(payload != nullptr, "payload allocation failed");
-        const auto footprint = domain.pool().GetFootprint().mapped_bytes;
+        const auto outstanding = domain.OutstandingAllocations();
         socket.async_wait(acpp::tcp::socket::wait_read,
             net::bind_allocator(ProcessAllocator<std::byte>{},
                 [&](acpp::IoErrorCode ec) {
@@ -186,8 +186,8 @@ void TestQueuedReadinessAcrossMigration() {
                         payload = nullptr;
                     }));
                 }));
-        Require(domain.pool().GetFootprint().mapped_bytes == footprint,
-                "queued operation must not borrow domain slabs");
+        Require(domain.OutstandingAllocations() == outstanding,
+                "queued operation must not borrow the connection domain");
     }
     const char value = 'q';
     peer.write_some(net::buffer(&value, 1));
@@ -208,7 +208,7 @@ void TestPendingOperationDestruction() {
         ScopedAllocationDomain lease(domain);
         timer->async_wait(net::bind_allocator(ProcessAllocator<std::byte>{},
             [](acpp::IoErrorCode) {}));
-        Require(domain.pool().GetFootprint().mapped_bytes == 0,
+        Require(domain.OutstandingAllocations() == 0,
                 "pending operation storage must belong to process allocator");
     }
     // Asio destroys the still-pending handler without calling it and without

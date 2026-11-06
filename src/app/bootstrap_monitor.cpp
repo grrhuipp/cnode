@@ -255,10 +255,10 @@ net::awaitable<void> RuntimeStatsOutputLoop(
         const auto total_users = proxyman::inbound::UserStore::TotalUsers();
         LOG_CONSOLE("Runtime activity: conn={} users={} udp_sockets={}",
                     total_conns, total_users, total_udp_sockets);
-        LOG_CONSOLE("Runtime memory: resident={:.1f}MB pool_mapped={}MB pool_direct={}MB pool_idle={}KB pool_chunks={} pmr_wrong_thread={}",
+        LOG_CONSOLE("Runtime memory: resident={:.1f}MB pool_mapped={}MB pool_direct={}MB pool_idle={}KB pool_chunks={} pmr_remote_frees={}",
                     mem_mb, pool_mapped_bytes / (1024 * 1024),
                     pool_direct_bytes / (1024 * 1024), pool_idle_bytes / 1024,
-                    pool_chunks, memory::CrossThreadFreeCount());
+                    pool_chunks, memory::RemoteFreeCount());
         LOG_CONSOLE("Runtime traffic: traffic_in={} traffic_out={} rate_down={} rate_up={}",
                     acpp::FormatBytes(snapshot.bytes_in), acpp::FormatBytes(snapshot.bytes_out),
                     FormatRate(snapshot.bytes_in_rate), FormatRate(snapshot.bytes_out_rate));

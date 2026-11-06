@@ -1423,11 +1423,6 @@ net::awaitable<WorkerRuntimeStatsSnapshot> Worker::CollectRuntimeStats(bool incl
              include_resources]() mutable -> net::awaitable<WorkerRuntimeStatsSnapshot> {
                 WorkerRuntimeStatsSnapshot snapshot;
                 if (include_stats) snapshot.stats = cap->Stats().Snapshot();
-                const auto footprint = memory::ThreadMemoryPool().GetFootprint();
-                snapshot.memory.pool_mapped_bytes = footprint.mapped_bytes;
-                snapshot.memory.pool_direct_bytes = footprint.direct_bytes;
-                snapshot.memory.pool_idle_bytes = footprint.idle_bytes;
-                snapshot.memory.pool_chunks = footprint.chunks;
                 if (include_resources && include_stats && !cap->IsJoined()) {
                     const auto timers = TimeoutScheduler::ForIoContext(
                         domain->Reactor()).GetResourceStats();
@@ -1461,10 +1456,6 @@ net::awaitable<WorkerRuntimeStatsSnapshot> Worker::CollectRuntimeStats(bool incl
                 --result.active_connections;
             }
         }
-        result.memory.pool_mapped_bytes += values.memory.pool_mapped_bytes;
-        result.memory.pool_direct_bytes += values.memory.pool_direct_bytes;
-        result.memory.pool_idle_bytes += values.memory.pool_idle_bytes;
-        result.memory.pool_chunks += values.memory.pool_chunks;
     }
     if (runtime_->session_configuration && runtime_->session_configuration->outbounds) {
         co_await runtime_->session_configuration->outbounds->CollectRuntimeStats(

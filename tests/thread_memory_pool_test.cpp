@@ -251,16 +251,13 @@ bool RunOwnershipAndPmr() {
     void* p = AllocatePmr(8192, 16);
     if (!p) return false;
     std::memset(p, 0xa5, 8192);
-    const auto before = pool.GetFootprint().mapped_bytes;
-    const auto rejects = CrossThreadFreeCount();
+    const auto remote_frees = RemoteFreeCount();
     std::thread wrong([p] { DeallocatePmr(p); });
     wrong.join();
-    if (CrossThreadFreeCount() != rejects + 1 || pool.GetFootprint().mapped_bytes != before ||
-        !Intact(p, 8192, 0xa5)) return false;
-    Pool foreign;
-    foreign.Deallocate(p);
-    if (pool.GetFootprint().mapped_bytes != before) return false;
-    DeallocatePmr(p);
+    if (RemoteFreeCount() != remote_frees + 1 ||
+        pool.GetFootprint().mapped_bytes == 0) return false;
+    pool.PurgeIdle();
+    if (pool.GetFootprint().mapped_bytes != 0) return false;
     reject_next_pmr_allocation = true;
     if (AllocatePmr(17) || reject_next_pmr_allocation) return false;
     for (size_t alignment : {8u, 16u, 64u, 4096u}) {
@@ -467,21 +464,22 @@ bool RejectsLeaseViolation(Action action) {
 
 bool RunDomainMigration() {
     struct Payload : ThreadAllocated {
+        explicit Payload(domain_memory_resource& memory) : arena(memory) {}
         ThreadLocalVector<int> vector{1, 2, 3};
         ThreadLocalString string = ThreadLocalString(80, 's');
         ThreadLocalDeque<int> queue;
         ThreadLocalUnorderedMap<int, ThreadLocalString> map;
         acpp::buf::MultiBuffer buffers;
         std::shared_ptr<int> shared = AllocateShared<int>(42);
-        request_memory arena{ThreadMemoryPool()};
+        request_memory arena;
     };
     AllocationDomain domain;
     Payload* payload = nullptr;
     std::pmr::memory_resource* original = nullptr;
     {
         ScopedAllocationDomain lease(domain);
-        original = ThreadMemoryPool().resource();
-        payload = new Payload;
+        original = domain.resource();
+        payload = new Payload(domain.memory());
         payload->queue.push_back(9);
         payload->map.try_emplace(1, 80, 'm');
         for (int i = 0; i != 12; ++i) {
@@ -505,7 +503,7 @@ bool RunDomainMigration() {
     bool intact = false;
     std::thread migrated([&] {
         ScopedAllocationDomain lease(domain);
-        intact = ThreadMemoryPool().resource() == original &&
+        intact = ThreadMemoryPool().resource() != original &&
             payload->vector.back() == 3 && payload->string.size() == 80 &&
             payload->queue.front() == 9 && *payload->shared == 42 &&
             payload->buffers.byte_size() == 12;
@@ -513,11 +511,12 @@ bool RunDomainMigration() {
         payload->string.append(120, 't');
         (void)payload->arena.resource()->allocate(12000, 16);
         delete payload;
-        domain.pool().PurgeIdle();
-        intact = intact && domain.pool().GetFootprint().mapped_bytes == 0;
+        intact = intact && domain.OutstandingAllocations() == 0;
     });
     migrated.join();
-    return intact && CurrentAllocationDomain() == nullptr;
+    ThreadMemoryPool().PurgeIdle();
+    return intact && ThreadMemoryPool().GetFootprint().mapped_bytes == 0 &&
+        CurrentAllocationDomain() == nullptr;
 }
 
 bool RunLeaseRejection() {
@@ -542,7 +541,7 @@ bool RunLeaseRejection() {
         AllocationDomain first, second;
         ScopedAllocationDomain lease(first);
         std::array<std::byte, 512> initial;
-        request_memory arena(first.pool(), initial);
+        request_memory arena(first.memory(), initial);
         ScopedAllocationDomain wrong(second);
         (void)arena.resource()->allocate(16, 8);
     });
@@ -557,7 +556,7 @@ bool RunJoinedDomainBorrow() {
     first->SetLeaseGroup(group, shares);
     second.SetLeaseGroup(group, shares);
     auto* resource = first->resource();
-    std::weak_ptr<worker_memory> arena = first->pool().Lifetime();
+    std::weak_ptr<void> arena = first->memory().Lifetime();
     struct Raw : ThreadAllocated { int value = 17; };
     Raw* raw;
     acpp::buf::Buffer* buffer;
@@ -586,17 +585,20 @@ bool RunJoinedDomainBorrow() {
                 raw->value == 17;
             moved.resize(10000, 8);
             acpp::buf::Buffer::Free(buffer);
-            delete vector;
             delete raw;
         }
-        // Empty containers retain the arena even after its last live block.
-        intact = intact && !arena.expired();
+        // Empty containers do not pin a retired physical connection arena.
+        intact = intact && arena.expired();
+        vector->push_back(31);
+        intact = intact && vector->get_allocator().resource() == second.resource() &&
+            vector->front() == 31;
+        delete vector;
         {
-            ThreadLocalDeque<ThreadLocalString> nested_deque(resource);
+            ThreadLocalDeque<ThreadLocalString> nested_deque;
             nested_deque.emplace_back(64, 'q');
             nested_deque = nested_deque;
             intact = intact && nested_deque.size() == 1 &&
-                nested_deque.front().get_allocator().resource() == resource;
+                nested_deque.front().get_allocator().resource() == second.resource();
             nested_deque.clear();
             for (int i = 0; i < 8; ++i) {
                 nested_deque.emplace_back(32, static_cast<char>('a' + i));
@@ -606,13 +608,61 @@ bool RunJoinedDomainBorrow() {
             nested_deque.clear();
         }
         empty->push_back(31);
+        intact = intact && empty->get_allocator().resource() == second.resource();
         delete empty;
         empty_queue->push_back(42);
+        intact = intact && empty_queue->get_allocator().resource() == second.resource();
         delete empty_queue;
-        intact = intact && arena.expired();
     });
     migrated.join();
     return intact;
+}
+
+bool RunWorkerSharedDomainPacking() {
+    constexpr std::array<std::size_t, 13> strides{
+        64, 80, 96, 112, 128, 144, 160, 176, 192, 448, 512, 640, 1792};
+    constexpr std::size_t domains_count = 1000;
+    std::vector<std::unique_ptr<AllocationDomain>> domains;
+    std::vector<std::array<void*, strides.size()>> blocks(domains_count);
+    domains.reserve(domains_count);
+    ThreadMemoryPool().PurgeIdle();
+    const auto before = ThreadMemoryPool().GetFootprint().mapped_bytes;
+    std::size_t live_stride_bytes = 0;
+    for (const auto stride : strides) live_stride_bytes += stride * domains_count;
+
+    for (std::size_t index = 0; index < domains_count; ++index) {
+        auto domain = std::make_unique<AllocationDomain>();
+        {
+            ScopedAllocationDomain lease(*domain);
+            for (std::size_t slot = 0; slot < strides.size(); ++slot) {
+                blocks[index][slot] =
+                    domain->resource()->allocate(strides[slot] - 16, 16);
+            }
+        }
+        domains.push_back(std::move(domain));
+    }
+    const auto mapped =
+        ThreadMemoryPool().GetFootprint().mapped_bytes - before;
+    if (sizeof(AllocationDomain) > 64 ||
+        sizeof(domain_memory_resource) > 128 ||
+        mapped > live_stride_bytes * 2) return false;
+
+    std::printf(
+        "worker-shared domain packing: domains=%zu live-stride=%zu mapped=%zu "
+        "domain=%zu resource=%zu\n",
+        domains_count, live_stride_bytes, mapped, sizeof(AllocationDomain),
+        sizeof(domain_memory_resource));
+    for (std::size_t index = 0; index < domains_count; ++index) {
+        ScopedAllocationDomain lease(*domains[index]);
+        for (std::size_t slot = 0; slot < strides.size(); ++slot) {
+            domains[index]->resource()->deallocate(
+                blocks[index][slot], strides[slot] - 16, 16);
+        }
+        if (domains[index]->OutstandingAllocations() != 0) return false;
+    }
+    domains.clear();
+    ThreadMemoryPool().PurgeIdle();
+    return ThreadMemoryPool().GetFootprint().mapped_bytes == before;
 }
 
 bool RunAll() {
@@ -627,7 +677,8 @@ bool RunAll() {
         Case{"request arena and session context", RunRequestArenaAndContext},
         Case{"domain migration/RAII", RunDomainMigration},
         Case{"lease violations", RunLeaseRejection},
-        Case{"joined domains retain resource ownership", RunJoinedDomainBorrow}}) {
+        Case{"joined domains release empty resource ownership", RunJoinedDomainBorrow},
+        Case{"Worker-shared domains compact sparse objects", RunWorkerSharedDomainPacking}}) {
         if (!test.run()) {
             std::fprintf(stderr, "pool case failed: %s\n", test.name);
             return false;
