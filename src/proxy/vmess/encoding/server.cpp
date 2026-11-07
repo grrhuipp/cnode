@@ -246,9 +246,21 @@ public:
         if (eof_sent_) {
             co_return;
         }
-        buf::MultiBuffer chunks;
-        encoder_.EncodeEnd(chunks);
-        co_await Flush(std::move(chunks));
+        std::array<uint8_t, 128> eof_chunk{};
+        const size_t eof_len = encoder_.EncodeEndTo(eof_chunk);
+        if (!header_sent_) {
+            header_sent_ = true;
+            const std::array<net::const_buffer, 2> buffers{
+                net::buffer(response_header_),
+                net::buffer(eof_chunk.data(), eof_len),
+            };
+            co_await stream_.WriteBuffers(buffers);
+        } else {
+            const std::array<net::const_buffer, 1> buffers{
+                net::buffer(eof_chunk.data(), eof_len),
+            };
+            co_await stream_.WriteBuffers(buffers);
+        }
         eof_sent_ = true;
     }
 

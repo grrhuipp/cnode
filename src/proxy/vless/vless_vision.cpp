@@ -109,8 +109,34 @@ struct CompleteRecords {
 using VisionFrameBufferBuilder =
     ConstBufferSpanBuilder<buf::MultiBuffer::kInlineCapacity * 3>;
 
+class VisionHeaderArena {
+public:
+    uint8_t* Allocate(size_t len) {
+        if (inline_used_ + len <= inline_.size()) {
+            uint8_t* ptr = inline_.data() + inline_used_;
+            inline_used_ += len;
+            return ptr;
+        }
+        if (overflow_.empty() || overflow_used_ + len > kBlockSize) {
+            overflow_.emplace_back();
+            overflow_used_ = 0;
+        }
+        uint8_t* ptr = overflow_.back().data() + overflow_used_;
+        overflow_used_ += len;
+        return ptr;
+    }
+
+private:
+    static constexpr size_t kBlockSize = 128;
+    std::array<uint8_t, kBlockSize> inline_{};
+    size_t inline_used_ = 0;
+    std::deque<std::array<uint8_t, kBlockSize>,
+               memory::ThreadLocalAllocator<std::array<uint8_t, kBlockSize>>> overflow_;
+    size_t overflow_used_ = 0;
+};
+
 void AppendVisionFrameBuffers(
-    buf::MultiBuffer& header_owner,
+    VisionHeaderArena& header_owner,
     VisionFrameBufferBuilder& out,
     std::span<const uint8_t, 16> user_uuid,
     bool& send_uuid,
@@ -122,17 +148,7 @@ void AppendVisionFrameBuffers(
         ? kVisionUuidHeaderLen
         : kVisionBaseHeaderLen;
 
-    buf::Buffer* header_buf = header_owner.back();
-    if (!header_buf || header_buf->Available() < header_len) {
-        buf::BufferGuard header{buf::Buffer::New()};
-        if (!header || header->Available() < header_len) {
-            ThrowVisionAllocationFailure();
-        }
-        header_buf = header.get();
-        header_owner.push_back(std::move(header));
-    }
-
-    uint8_t* tail = header_buf->Tail().data();
+    uint8_t* tail = header_owner.Allocate(header_len);
     size_t pos = 0;
     if (send_uuid) {
         std::memcpy(tail, user_uuid.data(), user_uuid.size());
@@ -144,8 +160,6 @@ void AppendVisionFrameBuffers(
     pos += 2;
     StoreU16BE(tail + pos, padding_len);
     pos += 2;
-    header_buf->Produce(static_cast<uint32_t>(pos));
-    header_owner.RecordTailProduced(pos);
     out.Append(net::const_buffer(tail, pos));
     if (!content.empty()) {
         out.Append(net::const_buffer(content.data(), content.size()));
@@ -160,7 +174,7 @@ void AppendVisionFrameBuffers(
 }
 
 void AppendVisionFramed(
-    buf::MultiBuffer& header_owner,
+    VisionHeaderArena& header_owner,
     VisionFrameBufferBuilder& out,
     std::span<const uint8_t, 16> user_uuid,
     bool& send_uuid,
@@ -243,7 +257,7 @@ net::awaitable<void> WriteVisionFramed(
     }
     bool ending = false;
     bool long_padding = traffic.is_tls;
-    buf::MultiBuffer header_owner;
+    VisionHeaderArena header_owner;
     VisionFrameBufferBuilder out;
     for (const auto& buffer : buffers) {
         const auto bytes = VisionChunkBytes(buffer);

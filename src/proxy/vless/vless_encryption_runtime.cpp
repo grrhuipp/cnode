@@ -352,6 +352,15 @@ bool VlessEncryptionServerTicketStore::BindIdentity(
     return true;
 }
 
+void VlessEncryptionServerTicketStore::Erase(
+    std::span<const uint8_t, kVlessEncryptionTicketSize> ticket) noexcept {
+    TicketArray ticket_array{};
+    std::copy(ticket.begin(), ticket.end(), ticket_array.begin());
+    if (auto it = sessions_.find(ticket_array); it != sessions_.end()) {
+        Erase(it);
+    }
+}
+
 void VlessEncryptionServerTicketStore::Store(
     std::span<const uint8_t, kVlessEncryptionTicketSize> ticket,
     const VlessEncryptionPfsKey& pfs_key,

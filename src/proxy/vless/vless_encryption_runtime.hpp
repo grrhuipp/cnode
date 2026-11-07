@@ -110,6 +110,7 @@ public:
         std::span<const uint8_t, kVlessEncryptionTicketSize> ticket,
         const std::array<uint8_t, 16>& identity,
         std::chrono::steady_clock::time_point now);
+    void Erase(std::span<const uint8_t, kVlessEncryptionTicketSize> ticket) noexcept;
 
 private:
     static constexpr size_t kMaxSessions = 1024;

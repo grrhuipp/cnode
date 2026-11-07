@@ -1488,6 +1488,15 @@ net::awaitable<bool> Worker::ListenerState::StartQuicListening(
     // Every Worker binds its own SO_REUSEPORT socket; the kernel spreads new
     // QUIC connections by 4-tuple and each Worker serves only the connections
     // it accepted (no packet forwarding between Workers).
+    for (const auto& [tag, slot] : listener_slots) {
+        if (tag != std::string_view(binding.tag) && slot->udp_binding &&
+            slot->udp_binding->port == binding.port &&
+            slot->udp_binding->listen.Overlaps(binding.listen)) {
+            LOG_ERROR("UDP listener conflict worker={} tag={} owner={} port={}",
+                      worker.id_, binding.tag, tag, binding.port);
+            co_return false;
+        }
+    }
     auto slot_it = listener_slots.find(binding.tag);
     if (slot_it == listener_slots.end() || !slot_it->second->handler ||
         !slot_it->second->prepared) {

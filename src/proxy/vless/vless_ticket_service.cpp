@@ -89,9 +89,19 @@ struct DirectoryState final : std::enable_shared_from_this<DirectoryState> {
             throw IoSystemError(io_error::fault, "VLESS ticket directory randomness failed");
         return hash;
     }
+    static void ReleaseActor(std::shared_ptr<ExecutionDomain> actor) noexcept {
+        if (!actor || actor->CanExecuteInline()) return;
+        auto* raw = actor.get();
+        try {
+            raw->Execute([actor = std::move(actor)]() mutable { actor.reset(); });
+        } catch (...) {}
+    }
     void Prune(Clock::time_point now) {
         while (!expiry.empty() && expiry.begin()->first <= now) {
-            entries.erase(expiry.begin()->second);
+            if (auto it = entries.find(expiry.begin()->second); it != entries.end()) {
+                ReleaseActor(std::move(it->second.owner));
+                entries.erase(it);
+            }
             expiry.erase(expiry.begin());
         }
     }
@@ -112,18 +122,30 @@ struct DirectoryState final : std::enable_shared_from_this<DirectoryState> {
         closed = true;
         timer.cancel();
         expiry.clear();
+        for (auto& [key, entry] : entries) {
+            (void)key;
+            ReleaseActor(std::move(entry.owner));
+        }
         entries.clear();
         actors.clear();
     }
     bool Publish(DirectoryKey key, DirectoryEntry entry) {
         Prune(Clock::now());
-        if (closed || entry.expires <= Clock::now() || entries.contains(key))
+        if (closed || entry.expires <= Clock::now() || entries.contains(key)) {
+            ReleaseActor(std::move(entry.owner));
             return false;
+        }
         while (entries.size() >= 65536 && !expiry.empty()) {
-            entries.erase(expiry.begin()->second);
+            if (auto it = entries.find(expiry.begin()->second); it != entries.end()) {
+                ReleaseActor(std::move(it->second.owner));
+                entries.erase(it);
+            }
             expiry.erase(expiry.begin());
         }
-        if (entries.size() >= 65536) return false;
+        if (entries.size() >= 65536) {
+            ReleaseActor(std::move(entry.owner));
+            return false;
+        }
         auto event = expiry.emplace(entry.expires, key);
         try {
             entries.emplace(std::move(key), std::move(entry));
@@ -149,11 +171,20 @@ struct DirectoryState final : std::enable_shared_from_this<DirectoryState> {
     }
     std::shared_ptr<ExecutionDomain> RememberActor(
         ActorKey key, std::shared_ptr<ExecutionDomain> candidate) {
-        if (auto actor = FindActor(key)) return actor;
-        if (closed) return {};
+        if (auto actor = FindActor(key)) {
+            ReleaseActor(std::move(candidate));
+            return actor;
+        }
+        if (closed) {
+            ReleaseActor(std::move(candidate));
+            return {};
+        }
         if (actors.size() >= 65536) {
             std::erase_if(actors, [](const auto& entry) { return entry.second.expired(); });
-            if (actors.size() >= 65536) return {};
+            if (actors.size() >= 65536) {
+                ReleaseActor(std::move(candidate));
+                return {};
+            }
         }
         actors.insert_or_assign(std::move(key), candidate);
         return candidate;
@@ -258,11 +289,30 @@ net::awaitable<bool> RegisterTicket(
     const auto ticket = issued.ticket;
     if (!co_await net::co_spawn(actor->Executor(),
             StoreOnActor(actor, config, tag, std::move(issued), identity), net::use_awaitable)) {
+        DirectoryState::ReleaseActor(std::move(actor));
         co_return false;
     }
+    auto rollback_actor = actor;
+    auto rollback_config = config;
+    auto rollback_tag = tag;
     auto key = DirectoryKey{config.get(), std::move(tag), ticket};
-    co_return directory.Publish(std::move(key),
-        DirectoryEntry{std::move(config), std::move(actor), expires});
+    if (!directory.Publish(std::move(key),
+            DirectoryEntry{std::move(config), std::move(actor), expires})) {
+        auto* raw = rollback_actor.get();
+        try {
+            raw->Execute([actor = std::move(rollback_actor),
+                          cfg = std::move(rollback_config),
+                          t = std::move(rollback_tag),
+                          ticket]() mutable {
+                if (auto* store = net::use_service<LocalTicketService>(actor->Services()).Get(cfg, t)) {
+                    store->Erase(ticket);
+                }
+            });
+        } catch (...) {}
+        co_return false;
+    }
+    DirectoryState::ReleaseActor(std::move(rollback_actor));
+    co_return true;
 }
 } // namespace
 

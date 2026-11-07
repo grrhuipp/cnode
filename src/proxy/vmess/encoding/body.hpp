@@ -85,7 +85,7 @@ public:
     void Encode(std::span<const net::const_buffer> payload, buf::MultiBuffer& out);
     // Zero-length chunk ending this direction.
     void EncodeEnd(buf::MultiBuffer& out);
-
+    [[nodiscard]] size_t EncodeEndTo(std::span<uint8_t, 128> out);
     [[nodiscard]] bool PacketMode() const noexcept { return cipher_.PacketMode(); }
 
 private:

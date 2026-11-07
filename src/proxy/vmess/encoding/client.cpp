@@ -207,9 +207,12 @@ net::awaitable<void> ClientSession::EncodeRequestBodyEOF(AsyncStream& stream) {
     if (request_eof_sent_) {
         co_return;
     }
-    buf::MultiBuffer chunks;
-    request_encoder_.EncodeEnd(chunks);
-    co_await stream.WriteMultiBuffer(std::move(chunks));
+    std::array<uint8_t, 128> eof_chunk{};
+    const size_t eof_len = request_encoder_.EncodeEndTo(eof_chunk);
+    const std::array<net::const_buffer, 1> buffers{
+        net::buffer(eof_chunk.data(), eof_len),
+    };
+    co_await stream.WriteBuffers(buffers);
     request_eof_sent_ = true;
 }
 

@@ -167,6 +167,29 @@ void BodyEncoder::EncodeStream(std::span<const uint8_t> bytes, buf::MultiBuffer&
     }
 }
 
+size_t BodyEncoder::EncodeEndTo(std::span<uint8_t, 128> out) {
+    const size_t padding = cipher_.NextPaddingSize();
+    const size_t length_size = cipher_.LengthSize();
+    const size_t capacity = length_size + cipher_.Overhead() + padding;
+    if (capacity > out.size()) {
+        ThrowWriteError("VMess EOF chunk exceeds inline buffer");
+    }
+    uint8_t* dst = out.data();
+    const ssize_t sealed = cipher_.Payload().Encrypt(nullptr, 0, dst + length_size);
+    if (sealed < 0) {
+        ThrowWriteError("VMess body encrypt failed");
+    }
+    const size_t chunk_size = static_cast<size_t>(sealed) + padding;
+    if (!cipher_.EncodeLength(chunk_size, dst)) {
+        ThrowWriteError("VMess body length encode failed");
+    }
+    if (padding > 0 &&
+        RAND_bytes(dst + length_size + sealed, static_cast<int>(padding)) != 1) {
+        ThrowWriteError("VMess body padding generation failed");
+    }
+    return length_size + chunk_size;
+}
+
 void BodyEncoder::EncodePacket(std::span<const uint8_t> bytes, buf::MultiBuffer& out) {
     if (bytes.size() > MAX_CHUNK_SIZE - cipher_.Overhead()) {
         throw IoSystemError(

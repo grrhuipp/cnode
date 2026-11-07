@@ -117,11 +117,12 @@ private:
             const auto now = Clock::now();
             for (const auto& weak : states_) {
                 if (auto state = weak.lock()) {
-                    if (state->next_attempt_ <= now) {
+                    const auto attempt_at = state->next_attempt_.load(std::memory_order_acquire);
+                    if (attempt_at <= now) {
                         due = std::move(state);
                         break;
                     }
-                    next = std::min(next, state->next_attempt_);
+                    next = std::min(next, attempt_at);
                 }
             }
             lock.unlock();
@@ -141,10 +142,10 @@ private:
             if (!renewed) {
                 // Existing connections retain their own SSL_CTX. New handshakes
                 // fail closed after notAfter if renewal cannot recover.
-                due->next_attempt_ = minimum_retry;
+                due->next_attempt_.store(minimum_retry, std::memory_order_release);
                 LOG_ERROR("TLS auto-sign renewal unavailable; retrying in one minute");
-            } else if (due->next_attempt_ < minimum_retry) {
-                due->next_attempt_ = minimum_retry;
+            } else if (due->next_attempt_.load(std::memory_order_acquire) < minimum_retry) {
+                due->next_attempt_.store(minimum_retry, std::memory_order_release);
             }
         }
     }
@@ -175,7 +176,7 @@ bool AutoSignContextRenewal::Publish(std::shared_ptr<SSL_CTX> context) {
     if (previous && expires <= previous->expires) return false;
     current_.store(std::make_shared<const Snapshot>(Snapshot{std::move(context), expires}),
                    std::memory_order_release);
-    next_attempt_ = expires - std::chrono::hours(24 * 30);
+    next_attempt_.store(expires - std::chrono::hours(24 * 30), std::memory_order_release);
     return true;
 }
 

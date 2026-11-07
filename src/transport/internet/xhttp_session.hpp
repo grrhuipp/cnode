@@ -25,13 +25,12 @@ struct XHttpSessionTableEntry;
 class XHttpPacketUpSession final : public memory::ThreadAllocated,
                                    private transport::CancellationSubscription {
 public:
-    explicit XHttpPacketUpSession(net::io_context& io_context)
-        : io_context_(io_context)
-        , input_signal_(io_context) {}
+    explicit XHttpPacketUpSession(net::io_context& io_context,
+                                  std::shared_ptr<ExecutionDomain> owner = {});
     ~XHttpPacketUpSession() noexcept;
 
     transport::CancellationSource& Cancellation() noexcept { return cancellation_; }
-    [[nodiscard]] net::io_context& IoContext() noexcept { return io_context_; }
+    [[nodiscard]] net::io_context& IoContext() const noexcept;
     [[nodiscard]] bool Reserve(size_t bytes) noexcept {
         return !closed_ && packet_queue_.Reserve(bytes);
     }
@@ -111,7 +110,7 @@ private:
     ::acpp::detail::XHttpPacketQueue packet_queue_;
     ::acpp::detail::XHttpUploadStreamSlot stream_input_;
     transport::CancellationSource cancellation_;
-    SignalChannel upload_signal_{io_context_, 1};
+    SignalChannel upload_signal_;
     // Event that AttachDownlink and Close broadcast to AwaitDownlink waiters.
     transport::CancellationSource downlink_ready_;
     size_t upload_reads_ = 0;

@@ -156,68 +156,6 @@ WriteRequestAndReadResponse(Stream& stream, std::string_view request) {
     co_return co_await http::ReadResponse(stream);
 }
 
-std::string JoinRouteMatches(const json::array& matches) {
-    std::string pattern;
-    for (const auto& match : matches) {
-        if (!match.is_string()) {
-            throw std::invalid_argument("block route match entries must be strings");
-        }
-        const std::string_view entry = match.as_string();
-        if (entry.empty()) {
-            throw std::invalid_argument("block route match entries must not be empty");
-        }
-        bool escaped = false;
-        bool in_char_class = false;
-        size_t paren_depth = 0;
-        for (const unsigned char ch : entry) {
-            if (ch < 0x20 || ch == 0x7f) {
-                throw std::invalid_argument(
-                    "block route match entries must not contain control characters");
-            }
-            if (escaped) {
-                escaped = false;
-                continue;
-            }
-            if (ch == '\\') {
-                escaped = true;
-                continue;
-            }
-            if (in_char_class) {
-                if (ch == ']') {
-                    in_char_class = false;
-                }
-                continue;
-            }
-            if (ch == '[') {
-                in_char_class = true;
-            } else if (ch == '(') {
-                ++paren_depth;
-            } else if (ch == ')') {
-                if (paren_depth == 0) {
-                    throw std::invalid_argument(
-                        "block route match entries must not contain unmatched ')'");
-                }
-                --paren_depth;
-            }
-        }
-        if (escaped) {
-            throw std::invalid_argument(
-                "block route match entries must not end with an unescaped backslash");
-        }
-        if (in_char_class || paren_depth != 0) {
-            throw std::invalid_argument(
-                "block route match entries must not contain unclosed group or character class");
-        }
-        if (!pattern.empty()) {
-            pattern.push_back('|');
-        }
-        pattern.append("(?:");
-        pattern.append(entry);
-        pattern.push_back(')');
-    }
-    return pattern;
-}
-
 std::vector<rule::DetectRule>
 ExtractBlockDetectRules(const json::object& config) {
     std::vector<rule::DetectRule> rules;
@@ -255,23 +193,30 @@ ExtractBlockDetectRules(const json::object& config) {
         if (matches.empty()) {
             throw std::invalid_argument("block route match must not be empty");
         }
-        const std::string pattern = JoinRouteMatches(matches);
-        try {
-            rule::DetectRule rule;
-            rule.Pattern = std::regex(pattern);
-            rules.push_back(std::move(rule));
-        } catch (const std::regex_error& e) {
-            for (size_t j = 0; j < matches.size(); ++j) {
-                try {
-                    (void)std::regex(std::string(matches[j].as_string()));
-                } catch (const std::regex_error& entry_error) {
-                    throw std::invalid_argument(std::format(
-                        "Invalid block route detect rule {} (match {}): {}",
-                        i, j, entry_error.what()));
+        for (size_t j = 0; j < matches.size(); ++j) {
+            const auto& match = matches[j];
+            if (!match.is_string()) {
+                throw std::invalid_argument("block route match entries must be strings");
+            }
+            const std::string_view entry = match.as_string();
+            if (entry.empty()) {
+                throw std::invalid_argument("block route match entries must not be empty");
+            }
+            for (const unsigned char ch : entry) {
+                if (ch < 0x20 || ch == 0x7f) {
+                    throw std::invalid_argument(
+                        "block route match entries must not contain control characters");
                 }
             }
-            throw std::invalid_argument(std::format(
-                "Invalid block route detect rule {}: {}", i, e.what()));
+            try {
+                rules.push_back(rule::DetectRule{
+                    .Pattern = std::regex(std::string(entry)),
+                });
+            } catch (const std::regex_error& entry_error) {
+                throw std::invalid_argument(std::format(
+                    "Invalid block route detect rule {} (match {}): {}",
+                    i, j, entry_error.what()));
+            }
         }
     }
     return rules;

@@ -888,7 +888,7 @@ public:
             active_ == kXHttpMaxPacketSessions)
             return nullptr;
 
-        auto session = memory::AllocateShared<XHttpPacketUpSession>(io);
+        auto session = memory::AllocateShared<XHttpPacketUpSession>(io, owner);
         const bool inserting = found == sessions_.end();
         if (found == sessions_.end()) {
             ::acpp::detail::XHttpPacketSessionKey key{
@@ -911,7 +911,7 @@ public:
         entry.session = session;
         entry.live = session.get();
         entry.directory_record = std::move(record);
-        session->owner_domain_ = std::move(owner);
+        (void)owner;
         session->table_entry_ = &entry;
         ++active_;
         return session;
@@ -971,9 +971,23 @@ private:
 
 net::execution_context::id XHttpSessionTable::id;
 
+XHttpPacketUpSession::XHttpPacketUpSession(
+    net::io_context& io_context,
+    std::shared_ptr<ExecutionDomain> owner)
+    : owner_domain_(std::move(owner))
+    , io_context_(io_context)
+    , input_signal_(owner_domain_ ? owner_domain_->Executor()
+                                  : net::any_io_executor(io_context.get_executor()), 1)
+    , upload_signal_(owner_domain_ ? owner_domain_->Executor()
+                                   : net::any_io_executor(io_context.get_executor()), 1) {}
+
 XHttpPacketUpSession::~XHttpPacketUpSession() noexcept {
     Unsubscribe();
     Retire();
+}
+
+net::io_context& XHttpPacketUpSession::IoContext() const noexcept {
+    return owner_domain_ ? owner_domain_->Reactor() : io_context_;
 }
 
 void XHttpPacketUpSession::Retire() noexcept {
@@ -1259,7 +1273,7 @@ void XHttpPacketUpSession::ReleaseAttachedUpload(
 }
 
 void XHttpPacketUpSession::Wake() noexcept {
-    if (io_context_.stopped()) {
+    if (IoContext().stopped()) {
         return;
     }
     (void)input_signal_.try_send(IoErrorCode{});

@@ -27,7 +27,7 @@ private:
     bool Publish(std::shared_ptr<SSL_CTX> context);
     std::atomic<std::shared_ptr<const Snapshot>> current_;
     Builder builder_;
-    Clock::time_point next_attempt_;
+    std::atomic<Clock::time_point> next_attempt_{Clock::time_point::min()};
 };
 
 } // namespace acpp

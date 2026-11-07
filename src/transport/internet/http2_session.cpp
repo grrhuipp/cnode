@@ -1953,7 +1953,10 @@ public:
     [[nodiscard]] std::shared_ptr<Http2ServerSession> LockSession() const noexcept {
         return session_.lock();
     }
-    [[nodiscard]] net::io_context& IoContext() noexcept { return io_context_; }
+    [[nodiscard]] net::io_context& IoContext() const noexcept {
+        if (auto domain = ExecutionDomain::Current()) return domain->Reactor();
+        return io_context_;
+    }
     void SetUploadBudget(const std::shared_ptr<XHttpPacketUpSession>& budget) noexcept {
         upload_budget_ = budget;
     }
@@ -1981,7 +1984,7 @@ public:
     // Cancel() aborts the wait; stream teardown wakes it for a re-check.
     net::awaitable<void> WaitSendCredit();
     void WakeSendWaiter() noexcept {
-        if (!io_context_.stopped()) (void)credit_signal_.try_send(IoErrorCode{});
+        if (!IoContext().stopped()) (void)credit_signal_.try_send(IoErrorCode{});
     }
 
     net::awaitable<size_t> AsyncRead(net::mutable_buffer buffer);
@@ -2007,7 +2010,7 @@ private:
     };
 
     void WakeInputReader() noexcept {
-        if (io_context_.stopped()) {
+        if (IoContext().stopped()) {
             return;
         }
         (void)input_signal_.try_send(IoErrorCode{});
@@ -2024,8 +2027,8 @@ private:
 
     net::io_context& io_context_;
     SignalChannel input_signal_;
-    SignalChannel owner_signal_{io_context_, 1};
-    SignalChannel credit_signal_{io_context_, 1};
+    SignalChannel owner_signal_;
+    SignalChannel credit_signal_;
     H2SendWindow send_window_;
     int64_t receive_window_ = H2SendWindow::kDefault;
     uint32_t consumed_credit_ = 0;
@@ -3104,7 +3107,15 @@ Http2ServerSubStreamState::Http2ServerSubStreamState(
     H2PayloadCodec payload_codec,
     int64_t initial_send_window)
     : io_context_(io_context)
-    , input_signal_(io_context, 1)
+    , input_signal_(ExecutionDomain::Current()
+          ? ExecutionDomain::Current()->Executor()
+          : net::any_io_executor(io_context.get_executor()), 1)
+    , owner_signal_(ExecutionDomain::Current()
+          ? ExecutionDomain::Current()->Executor()
+          : net::any_io_executor(io_context.get_executor()), 1)
+    , credit_signal_(ExecutionDomain::Current()
+          ? ExecutionDomain::Current()->Executor()
+          : net::any_io_executor(io_context.get_executor()), 1)
     , send_window_(initial_send_window)
     , session_(std::move(session))
     , stream_id_(stream_id)
