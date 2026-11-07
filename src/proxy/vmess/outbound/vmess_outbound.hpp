@@ -6,7 +6,7 @@
 #include "acppnode/transport/internet/outbound_sender.hpp"
 
 #include <openssl/aes.h>
-
+#include <openssl/crypto.h>
 #include <chrono>
 #include <memory>
 
@@ -29,6 +29,10 @@ struct PreparedSettings {
     VMessOutboundConfig config;
     ::acpp::vmess::MemoryAccount user;
     AES_KEY auth_id_key{};  // Encrypt schedule of user.auth_key, built on prepare.
+
+    ~PreparedSettings() noexcept {
+        OPENSSL_cleanse(&auth_id_key, sizeof(auth_id_key));
+    }
 };
 
 class Handler final : public ::acpp::Outbound {

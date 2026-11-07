@@ -41,6 +41,12 @@ public:
         // snapshot is built; handshakes never rebuild it per candidate user.
         AES_KEY auth_id_key{};
         Profile profile;
+
+        ~VmessCredential() noexcept {
+            OPENSSL_cleanse(uuid_bytes.data(), uuid_bytes.size());
+            OPENSSL_cleanse(cmd_key.data(), cmd_key.size());
+            OPENSSL_cleanse(&auth_id_key, sizeof(auth_id_key));
+        }
     };
 
     struct TrojanCredential {

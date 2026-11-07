@@ -9,7 +9,7 @@
 // ============================================================================
 
 #include "acppnode/common/user_profile.hpp"
-
+#include <openssl/crypto.h>
 #include <array>
 #include <cstdint>
 #include <optional>
@@ -19,11 +19,16 @@ namespace acpp::vmess {
 
 struct MemoryAccount {
     std::string             uuid;
-    std::array<uint8_t, 16> uuid_bytes;
-    std::array<uint8_t, 16> cmd_key;
-    std::array<uint8_t, 16> auth_key;
+    std::array<uint8_t, 16> uuid_bytes{};
+    std::array<uint8_t, 16> cmd_key{};
+    std::array<uint8_t, 16> auth_key{};
     ::acpp::UserProfile profile;
 
+    ~MemoryAccount() noexcept {
+        OPENSSL_cleanse(uuid_bytes.data(), uuid_bytes.size());
+        OPENSSL_cleanse(cmd_key.data(), cmd_key.size());
+        OPENSSL_cleanse(auth_key.data(), auth_key.size());
+    }
     static std::optional<MemoryAccount> FromUUID(
         const std::string& uuid_str,
         int64_t user_id = 0,

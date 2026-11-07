@@ -2,6 +2,7 @@
 
 #include "acppnode/common/user_profile.hpp"
 
+#include <openssl/crypto.h>
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -37,6 +38,10 @@ struct PreparedKeyBytes {
     std::array<uint8_t, kMaxSize> bytes{};
     size_t size = 0;
 
+    ~PreparedKeyBytes() noexcept {
+        OPENSSL_cleanse(bytes.data(), bytes.size());
+    }
+
     [[nodiscard]] const uint8_t* data() const noexcept { return bytes.data(); }
     [[nodiscard]] uint8_t* data() noexcept { return bytes.data(); }
     [[nodiscard]] bool empty() const noexcept { return size == 0; }
@@ -61,6 +66,12 @@ struct PreparedVmessUser {
     std::array<uint8_t, 16> cmd_key{};
     std::array<uint8_t, 16> auth_key{};
     ::acpp::UserProfile profile;
+
+    ~PreparedVmessUser() noexcept {
+        OPENSSL_cleanse(uuid_bytes.data(), uuid_bytes.size());
+        OPENSSL_cleanse(cmd_key.data(), cmd_key.size());
+        OPENSSL_cleanse(auth_key.data(), auth_key.size());
+    }
 };
 
 struct PreparedVlessUser {

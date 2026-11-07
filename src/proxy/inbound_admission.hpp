@@ -255,7 +255,11 @@ inline net::awaitable<void> RecordInboundAuthFailure(
     std::string_view reason) {
     LogInboundAuthFailure(ctx, reason);
     if (limiter && ctx.inbound.HasProxyProtocolClientIP()) {
-        co_await limiter->OnAuthFailTracked(ctx.inbound.tag, ctx.inbound.source_ip);
+        try {
+            co_await limiter->OnAuthFailTracked(ctx.inbound.tag, ctx.inbound.source_ip);
+        } catch (const WorkerMailboxFull&) {
+        } catch (const IoSystemError&) {
+        }
     }
 }
 
