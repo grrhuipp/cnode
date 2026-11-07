@@ -71,14 +71,7 @@ private:
         }
     };
     struct SessionKeyHash {
-        [[nodiscard]] size_t operator()(const SessionKey& key) const noexcept {
-            size_t hash = 2166136261u;
-            for (uint8_t byte : key.credential.span()) hash = (hash ^ byte) * 16777619u;
-            hash = (hash ^ key.credential.size) * 16777619u;
-            for (unsigned shift = 0; shift < 64; shift += 8)
-                hash = (hash ^ static_cast<uint8_t>(key.session_id >> shift)) * 16777619u;
-            return hash;
-        }
+        [[nodiscard]] size_t operator()(const SessionKey& key) const noexcept;
     };
 
     struct Session {

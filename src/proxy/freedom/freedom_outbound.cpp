@@ -149,9 +149,17 @@ Handler::DialTarget(OutboundDialer& dialer, session::Context& ctx) {
         co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
     }
 
-    if (target.IsIP() && target.resolved_addr &&
-        domain_strategy_ != DomainStrategy::ForceIPv4 &&
-        domain_strategy_ != DomainStrategy::ForceIPv6) {
+    if (!target.IsDomain()) {
+        if (!target.resolved_addr) {
+            co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+        }
+        if ((domain_strategy_ == DomainStrategy::ForceIPv4 ||
+             domain_strategy_ == DomainStrategy::ForceIPv6) &&
+            !(target.resolved_addr->is_v6()
+                ? AcceptsIPv6(domain_strategy_)
+                : AcceptsIPv4(domain_strategy_))) {
+            co_return tl::unexpected(ErrorCode::DNS_NO_RECORD);
+        }
         const net::ip::address address = *target.resolved_addr;
         co_return co_await dialer.Dial(
             ctx, std::span<const net::ip::address>(&address, 1), target.port);

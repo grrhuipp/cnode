@@ -1,5 +1,6 @@
 #pragma once
 
+#include <openssl/crypto.h>
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -46,6 +47,15 @@ struct KeyBytes {
     std::array<uint8_t, kMaxSize> bytes{};
     size_t size = 0;
 
+
+    KeyBytes() = default;
+    KeyBytes(const KeyBytes&) = default;
+    KeyBytes& operator=(const KeyBytes&) = default;
+    KeyBytes(KeyBytes&&) noexcept = default;
+    KeyBytes& operator=(KeyBytes&&) noexcept = default;
+    ~KeyBytes() noexcept {
+        OPENSSL_cleanse(bytes.data(), bytes.size());
+    }
     [[nodiscard]] const uint8_t* data() const noexcept { return bytes.data(); }
     [[nodiscard]] uint8_t* data() noexcept { return bytes.data(); }
     [[nodiscard]] bool empty() const noexcept { return size == 0; }

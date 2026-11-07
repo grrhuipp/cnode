@@ -320,6 +320,14 @@ private:
         }
 
         std::array<uint8_t, 64> write_subkey{};
+        struct CleanseInitLegacy {
+            std::array<uint8_t, 64>& salt;
+            std::array<uint8_t, 64>& subkey;
+            ~CleanseInitLegacy() noexcept {
+                OPENSSL_cleanse(salt.data(), salt.size());
+                OPENSSL_cleanse(subkey.data(), subkey.size());
+            }
+        } cleanse_init_legacy{server_salt, write_subkey};
         if (!DeriveSubkey(state.master_key_.data(), state.key_size_,
                           server_salt.data(), state.salt_size_,
                           write_subkey.data())) {
@@ -336,7 +344,6 @@ private:
                 state.pending_prefix_)) {
             return false;
         }
-
         OPENSSL_cleanse(state.master_key_.data(), state.master_key_.size());
         OPENSSL_cleanse(state.request_salt_.bytes.data(), state.request_salt_.bytes.size());
         state.request_salt_.size = 0;
@@ -360,6 +367,20 @@ private:
         }
 
         std::array<uint8_t, 32> write_subkey{};
+        constexpr size_t kFixedPlainMaxSize = 1 + 8 + KeyBytes::kMaxSize + 2;
+        constexpr size_t kFixedCipherMaxSize =
+            kFixedPlainMaxSize + SsAeadCipher::kTagSize;
+        std::array<uint8_t, kFixedPlainMaxSize> fixed_plain{};
+        struct CleanseInit2022 {
+            std::array<uint8_t, 32>& salt;
+            std::array<uint8_t, 32>& subkey;
+            std::array<uint8_t, kFixedPlainMaxSize>& plain;
+            ~CleanseInit2022() noexcept {
+                OPENSSL_cleanse(salt.data(), salt.size());
+                OPENSSL_cleanse(subkey.data(), subkey.size());
+                OPENSSL_cleanse(plain.data(), plain.size());
+            }
+        } cleanse_init_2022{server_salt, write_subkey, fixed_plain};
         if (!Derive2022Subkey(state.master_key_.data(), state.key_size_,
                               server_salt.data(), state.salt_size_,
                               write_subkey.data())) {
@@ -370,12 +391,7 @@ private:
                                      proxy::AeadDirection::Encrypt);
         OPENSSL_cleanse(write_subkey.data(), write_subkey.size());
 
-        constexpr size_t kFixedPlainMaxSize = 1 + 8 + KeyBytes::kMaxSize + 2;
-        constexpr size_t kFixedCipherMaxSize =
-            kFixedPlainMaxSize + SsAeadCipher::kTagSize;
-
         const size_t fixed_plain_size = 1 + 8 + state.salt_size_ + 2;
-        std::array<uint8_t, kFixedPlainMaxSize> fixed_plain{};
         fixed_plain[0] = 1;
         StoreU64BE(fixed_plain.data() + 1, UnixSecondsNow());
         std::memcpy(fixed_plain.data() + 9, state.request_salt_.data(), state.salt_size_);
@@ -476,10 +492,14 @@ bool MatchIdentityHeader(const proxyman::inbound::UserStore::ShadowsocksCredenti
         false);
     OPENSSL_cleanse(block_key.data(), block_key.size());
     if (!ok) {
+        OPENSSL_cleanse(identity_hash.data(), identity_hash.size());
         return false;
     }
 
-    return CRYPTO_memcmp(identity_hash.data(), user.psk_hash.data(), identity_hash.size()) == 0;
+    const bool matched =
+        CRYPTO_memcmp(identity_hash.data(), user.psk_hash.data(), identity_hash.size()) == 0;
+    OPENSSL_cleanse(identity_hash.data(), identity_hash.size());
+    return matched;
 }
 
 bool DecryptSs2022FixedHeader(const proxyman::inbound::UserStore::ShadowsocksCredential& user,
@@ -541,6 +561,10 @@ net::awaitable<tl::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession2022
 
     SsAeadCipher read_cipher(cipher_info.type, proxy::AeadDirection::Decrypt);
     std::array<uint8_t, kSs2022RequestFixedHeaderSize> fixed_plain{};
+    struct CleanseRequestFixedPlain {
+        std::array<uint8_t, kSs2022RequestFixedHeaderSize>& buf;
+        ~CleanseRequestFixedPlain() noexcept { OPENSSL_cleanse(buf.data(), buf.size()); }
+    } cleanse_req_fixed{fixed_plain};
     const size_t hint = last_matched_index;
 
     auto try_user = [&](size_t index) -> bool {
@@ -657,12 +681,15 @@ net::awaitable<tl::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession(
     ReadTCPSessionResult result;
 
     std::array<uint8_t, KeyBytes::kMaxSize> salt{};
+    struct CleanseLegacySalt {
+        std::array<uint8_t, KeyBytes::kMaxSize>& buf;
+        ~CleanseLegacySalt() noexcept { OPENSSL_cleanse(buf.data(), buf.size()); }
+    } cleanse_legacy_salt{salt};
     if (auto read_res = co_await ReadFull(stream, salt.data(), salt_size);
         !read_res) {
         co_return tl::unexpected(read_res.error());
     }
     result.request_salt.assign(std::span<const uint8_t>(salt.data(), salt_size));
-
     std::array<uint8_t, 2 + SsAeadCipher::kTagSize> enc_len{};
     if (auto read_res = co_await ReadFull(stream, enc_len.data(), enc_len.size());
         !read_res) {

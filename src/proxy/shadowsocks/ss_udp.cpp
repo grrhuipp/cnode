@@ -7,6 +7,7 @@
 #include <openssl/evp.h>
 #include <openssl/aead.h>
 #include <openssl/rand.h>
+#include <openssl/siphash.h>
 
 #include <algorithm>
 #include <array>
@@ -391,8 +392,9 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
         }
 
         const bool reuse_identity = has_identity &&
-            std::equal(header_key.begin(), header_key.end(),
-                       previous_identity_key.begin(), previous_identity_key.end());
+            header_key.size() == previous_identity_key.size() &&
+            CRYPTO_memcmp(header_key.data(), previous_identity_key.data(),
+                          header_key.size()) == 0;
         std::array<uint8_t, 16> separate = reuse_identity
             ? previous_separate : std::array<uint8_t, 16>{};
         if (!reuse_identity &&
@@ -421,6 +423,7 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
                 previous_identity_key = header_key;
                 previous_separate = separate;
                 previous_identity = identity_plain;
+                OPENSSL_cleanse(identity_plain.data(), identity_plain.size());
             }
 
             if (CRYPTO_memcmp(previous_identity.data(), user.psk_hash.data(),
@@ -659,10 +662,13 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
             for (size_t j = 0; j < identity_plain.size(); ++j) {
                 identity_plain[j] ^= separate[j];
             }
-            if (!AesBlockCrypt(psk_chain[i].span(),
-                               identity_plain,
-                               std::span<uint8_t, 16>(output + pos, 16),
-                               true)) {
+            const bool encrypted_identity = AesBlockCrypt(
+                psk_chain[i].span(),
+                identity_plain,
+                std::span<uint8_t, 16>(output + pos, 16),
+                true);
+            OPENSSL_cleanse(identity_plain.data(), identity_plain.size());
+            if (!encrypted_identity) {
                 return 0;
             }
             pos += kSs2022UdpSeparateHeaderSize;
@@ -813,18 +819,30 @@ void Ss2022UdpReplayWindow::Advance(size_t distance) noexcept {
     }
 }
 
+size_t Ss2022UdpReplayCache::SessionKeyHash::operator()(
+    const SessionKey& key) const noexcept {
+    static const std::array<uint64_t, 2> kSeed = [] {
+        std::array<uint64_t, 2> seed{};
+        (void)RAND_bytes(reinterpret_cast<uint8_t*>(seed.data()), sizeof(seed));
+        return seed;
+    }();
+    std::array<uint8_t, KeyBytes::kMaxSize + 1 + sizeof(uint64_t)> buf{};
+    const size_t cred_len = std::min(key.credential.size, KeyBytes::kMaxSize);
+    std::memcpy(buf.data(), key.credential.bytes.data(), cred_len);
+    buf[cred_len] = static_cast<uint8_t>(cred_len);
+    StoreU64BE(buf.data() + cred_len + 1, key.session_id);
+    const size_t hash = static_cast<size_t>(
+        SIPHASH_24(kSeed.data(), buf.data(), cred_len + 1 + sizeof(uint64_t)));
+    OPENSSL_cleanse(buf.data(), cred_len);
+    return hash;
+}
+
 bool Ss2022UdpReplayCache::Accept(
     std::span<const uint8_t> authenticated_key,
     std::span<const uint8_t, 8> session_id,
     uint64_t packet_id,
     std::chrono::steady_clock::time_point now) {
     SessionKey key;
-    struct CleanseSessionKey {
-        KeyBytes& cred;
-        ~CleanseSessionKey() noexcept {
-            OPENSSL_cleanse(cred.bytes.data(), cred.bytes.size());
-        }
-    } cleanse_key{key.credential};
     if (authenticated_key.empty() || !key.credential.assign(authenticated_key)) return false;
     key.session_id = LoadU64BE(session_id.data());
     auto it = sessions_.find(key);
