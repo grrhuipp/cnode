@@ -27,10 +27,13 @@ std::array<char, 28> EncodeWsAccept(std::string_view ws_key) noexcept {
     SHA1_Update(&context, ws_key.data(), ws_key.size());
     SHA1_Update(&context, kWsGuid.data(), kWsGuid.size());
     SHA1_Final(sha1, &context);
+    OPENSSL_cleanse(&context, sizeof(context));
     std::array<uint8_t, 29> encoded{};
     EVP_EncodeBlock(encoded.data(), sha1, sizeof(sha1));
+    OPENSSL_cleanse(sha1, sizeof(sha1));
     std::array<char, 28> out{};
     std::memcpy(out.data(), encoded.data(), out.size());
+    OPENSSL_cleanse(encoded.data(), encoded.size());
     return out;
 }
 
@@ -151,13 +154,15 @@ net::awaitable<bool> BaseWsStream::EnsurePendingData() {
             ProtocolFailure("WebSocket truncated without Close");
         co_return false;
     }
-    next.MoveTo(pending_data_);
+    pending_data_.AppendAndCoalesce(std::move(next));
     co_return !pending_data_.empty();
 }
 
 net::awaitable<size_t> BaseWsStream::ReadSome(uint8_t* data, size_t size) {
     if (!co_await EnsurePendingData()) co_return 0;
-    co_return pending_data_.ConsumePrefixTo(std::span<uint8_t>(data, size));
+    const size_t n = pending_data_.ConsumePrefixTo(std::span<uint8_t>(data, size));
+    pending_data_.ReleaseIfIdle();
+    co_return n;
 }
 
 net::awaitable<bool> BaseWsStream::FillHeader() {
@@ -594,8 +599,12 @@ net::awaitable<WsHandshakeResult> WsClientStream::Handshake(
     }
     std::array<uint8_t, 25> ws_key_buf{};
     EVP_EncodeBlock(ws_key_buf.data(), raw_key, sizeof(raw_key));
+    OPENSSL_cleanse(raw_key, sizeof(raw_key));
+    struct WsKeyCleanseGuard {
+        std::array<uint8_t, 25>& buf;
+        ~WsKeyCleanseGuard() noexcept { OPENSSL_cleanse(buf.data(), buf.size()); }
+    } cleanse_ws_key{ws_key_buf};
     const std::string_view ws_key(reinterpret_cast<const char*>(ws_key_buf.data()), 24);
-
     const std::string_view req_path = EffectiveHttpPath(path);
     host = transport::internet::ResolveHttpUpgradeHost(host, {}, headers);
     auto head = co_await transport::internet::ExecuteHttp1UpgradeClientHandshake(

@@ -298,7 +298,12 @@ struct ClientReadQueueState {
             mb.clear();
             return false;
         }
-        queue.emplace_back(std::move(mb), bytes);
+        if (!queue.empty()) {
+            queue.back().payload.AppendAndCoalesce(std::move(mb));
+            queue.back().bytes += bytes;
+        } else {
+            queue.emplace_back(std::move(mb), bytes);
+        }
         queued_bytes += bytes;
         if (queued_bytes >= kMuxQueueHighWaterBytes) {
             read_backpressured = true;
@@ -454,8 +459,13 @@ protected:
 
     // Per-sub backlog needs no own cap: the frame loop stops parsing client
     // frames once all sub-sessions together hold kMuxQueueHighWaterBytes.
-    void QueueInput(buf::MultiBuffer mb, size_t bytes) {
-        input_queue_.emplace_back(std::move(mb), bytes);
+    void QueueInput(buf::MultiBuffer mb, size_t bytes, bool coalesce = false) {
+        if (coalesce && !input_queue_.empty()) {
+            input_queue_.back().payload.AppendAndCoalesce(std::move(mb));
+            input_queue_.back().bytes += bytes;
+        } else {
+            input_queue_.emplace_back(std::move(mb), bytes);
+        }
         queued_bytes_ += bytes;
         reply_queue_.AddSubInput(bytes);
         WakeInputReader();
@@ -525,7 +535,7 @@ public:
             mb.clear();
             return;
         }
-        QueueInput(std::move(mb), bytes);
+        QueueInput(std::move(mb), bytes, true);
     }
 
     transport::EofAction ReadEofAction() const noexcept override {

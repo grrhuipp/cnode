@@ -125,7 +125,7 @@ RequestHeaderDecodeResult DecodeRequestHeader(std::span<const uint8_t> data) {
         return result;
     }
     if (data.size() <= kAddonsLenOffset) {
-        result.required = kAddonsLenOffset + 1;
+        result.required = kAddonsLenOffset + 2;
         return result;
     }
     const uint8_t addons_len = data[kAddonsLenOffset];

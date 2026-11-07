@@ -262,7 +262,9 @@ private:
             co_return 0;
         }
         if (pending_.byte_size() != 0) {
-            co_return pending_.ConsumePrefixTo(std::span<uint8_t>(out, capacity));
+            const size_t n = pending_.ConsumePrefixTo(std::span<uint8_t>(out, capacity));
+            pending_.ReleaseIfIdle();
+            co_return n;
         }
         co_return co_await inner_->AsyncRead(buffer);
     }
@@ -334,6 +336,7 @@ private:
             if (count > kMaxChunkLine - line_.size()) co_return false;
             line_.append(reinterpret_cast<const char*>(bytes.data()), count);
             pending_.DropPrefixBytes(count);
+            pending_.ReleaseIfIdle();
             if (finished) {
                 if (line_.size() < 2 || line_[line_.size() - 2] != '\r')
                     co_return false;
@@ -378,6 +381,7 @@ private:
                             FailBodyRead("invalid HTTP/1 chunk terminator");
                     }
                     pending_.DropPrefixBytes(count);
+                    pending_.ReleaseIfIdle();
                     chunk_terminator_bytes_ += count;
                 }
                 chunk_terminator_bytes_ = 0;
