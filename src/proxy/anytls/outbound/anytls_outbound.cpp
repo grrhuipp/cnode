@@ -362,24 +362,6 @@ struct Handler::ClientSession : memory::ThreadAllocated {
 
         try {
             auto scheme_snapshot = opening_scheme_ ? opening_scheme_ : scheme_;
-            if (opening_scheme_) {
-                const auto settings = ClientSettings(*scheme_snapshot);
-                memory::ByteVector with_settings;
-                with_settings.reserve(packet.size() + kFrameHeaderSize + settings.size());
-                auto settings_frame = AppendFrameBytesTo(
-                    with_settings,
-                    kCmdSettings,
-                    0,
-                    std::span<const uint8_t>(
-                        reinterpret_cast<const uint8_t*>(settings.data()), settings.size()));
-                if (!settings_frame) {
-                    CloseAll(settings_frame.error());
-                    co_return tl::unexpected(settings_frame.error());
-                }
-                with_settings.insert(with_settings.end(), packet.begin(), packet.end());
-                packet = std::move(with_settings);
-            }
-
             const uint32_t this_packet = NextPacketIndex();
             auto ok = co_await WritePacketWithPadding(
                 *stream, *scheme_snapshot, this_packet, std::move(packet));
@@ -1047,7 +1029,8 @@ tl::expected<memory::ByteVector, ErrorCode> BuildOpenPacket(
     uint32_t sid,
     bool is_udp,
     const TargetAddress& original_target,
-    ForwardedMetadataView forwarded) {
+    ForwardedMetadataView forwarded,
+    const PaddingScheme* opening_scheme) {
     const TargetAddress stream_target = is_udp
         ? TargetAddress(proxy::uot::kMagicAddress, 0)
         : original_target;
@@ -1061,7 +1044,19 @@ tl::expected<memory::ByteVector, ErrorCode> BuildOpenPacket(
     }
 
     memory::ByteVector packet;
-    packet.reserve((kFrameHeaderSize * 3) + target_size + 128);
+    packet.reserve((kFrameHeaderSize * 4) + 64 + target_size + 128);
+    if (opening_scheme) {
+        const auto settings = ClientSettings(*opening_scheme);
+        auto settings_frame = AppendFrameBytesTo(
+            packet,
+            kCmdSettings,
+            0,
+            std::span<const uint8_t>(
+                reinterpret_cast<const uint8_t*>(settings.data()), settings.size()));
+        if (!settings_frame) {
+            return tl::unexpected(settings_frame.error());
+        }
+    }
     auto syn_frame = AppendFrameBytesTo(packet, kCmdSYN, sid, {});
     auto target_frame = AppendFrameBytesTo(
         packet,
@@ -1262,7 +1257,8 @@ net::awaitable<OutboundProcessResult> Handler::ProcessSession(
         stream.SetIdleTimeout(timeouts.HandshakeTimeout());
         auto deadline = stream.StartPhaseDeadline(timeouts.HandshakeTimeout());
         auto open_packet = BuildOpenPacket(
-            sid, is_udp, original_target, dialer.ForwardedMetadata(ctx));
+            sid, is_udp, original_target, dialer.ForwardedMetadata(ctx),
+            session->opening_scheme_.get());
         if (!open_packet) {
             stream.ClearPhaseDeadline();
             session->CloseAll(open_packet.error());

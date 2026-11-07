@@ -4,7 +4,7 @@
 #include "acppnode/transport/internet/outbound_sender.hpp"
 
 #include <array>
-#include <openssl/crypto.h>
+#include "acppnode/common/unsafe.hpp"
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -33,7 +33,7 @@ struct VlessOutboundConfig {
     VlessOutboundConfig(VlessOutboundConfig&&) noexcept = default;
     VlessOutboundConfig& operator=(VlessOutboundConfig&&) noexcept = default;
     ~VlessOutboundConfig() noexcept {
-        OPENSSL_cleanse(uuid_bytes.data(), uuid_bytes.size());
+        ::acpp::SecureZeroMemory(uuid_bytes.data(), uuid_bytes.size());
     }
 };
 

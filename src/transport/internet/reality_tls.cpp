@@ -230,6 +230,13 @@ OpenRealitySessionId(
     std::span<const uint8_t> aad) noexcept {
     EVP_AEAD_CTX aead;
     EVP_AEAD_CTX_zero(&aead);
+    struct CleanseAead {
+        EVP_AEAD_CTX& ctx;
+        ~CleanseAead() noexcept {
+            EVP_AEAD_CTX_cleanup(&ctx);
+            OPENSSL_cleanse(&ctx, sizeof(ctx));
+        }
+    } cleanse_aead{aead};
     if (EVP_AEAD_CTX_init(&aead,
                           EVP_aead_aes_256_gcm(),
                           auth_key.data(),
@@ -252,7 +259,7 @@ OpenRealitySessionId(
                                      ciphertext.size(),
                                      aad.data(),
                                      aad.size());
-    EVP_AEAD_CTX_cleanup(&aead);
+    // CleanseAead handles cleanup and zeroing.
     if (ok != 1 || plain_len != plain.size()) {
         return std::nullopt;
     }
@@ -267,6 +274,13 @@ SealRealitySessionId(
     std::span<const uint8_t> aad) noexcept {
     EVP_AEAD_CTX aead;
     EVP_AEAD_CTX_zero(&aead);
+    struct CleanseAead {
+        EVP_AEAD_CTX& ctx;
+        ~CleanseAead() noexcept {
+            EVP_AEAD_CTX_cleanup(&ctx);
+            OPENSSL_cleanse(&ctx, sizeof(ctx));
+        }
+    } cleanse_aead{aead};
     if (EVP_AEAD_CTX_init(&aead,
                           EVP_aead_aes_256_gcm(),
                           auth_key.data(),
@@ -288,7 +302,7 @@ SealRealitySessionId(
                                      plain.size(),
                                      aad.data(),
                                      aad.size());
-    EVP_AEAD_CTX_cleanup(&aead);
+    // CleanseAead handles cleanup and zeroing.
     if (ok != 1 || out_len != out.size()) {
         return std::nullopt;
     }
@@ -453,6 +467,7 @@ bool VerifyRealityClientHandshake(
     }
 
     std::array<uint8_t, 64> expected{};
+    const ScopedCleanse wipe_expected{expected.data(), expected.size()};
     unsigned int expected_len = 0;
     if (!HMAC(EVP_sha512(),
               state.auth_key.data(),
@@ -494,6 +509,15 @@ bool VerifyRealityClientHandshake(
         HMAC_CTX hmac_ctx;
         HMAC_CTX_init(&hmac_ctx);
         std::array<uint8_t, 64> mldsa_msg{};
+        struct CleanseHmac {
+            HMAC_CTX& ctx;
+            std::array<uint8_t, 64>& msg;
+            ~CleanseHmac() noexcept {
+                HMAC_CTX_cleanup(&ctx);
+                OPENSSL_cleanse(&ctx, sizeof(ctx));
+                OPENSSL_cleanse(msg.data(), msg.size());
+            }
+        } cleanse_hmac{hmac_ctx, mldsa_msg};
         unsigned int mldsa_msg_len = 0;
         const bool hmac_ok =
             HMAC_Init_ex(&hmac_ctx,
@@ -510,7 +534,7 @@ bool VerifyRealityClientHandshake(
                         state.server_hello_raw.size()) == 1 &&
             HMAC_Final(&hmac_ctx, mldsa_msg.data(), &mldsa_msg_len) == 1 &&
             mldsa_msg_len == mldsa_msg.size();
-        HMAC_CTX_cleanup(&hmac_ctx);
+        // CleanseHmac handles cleanup and zeroing.
         if (!hmac_ok) {
             return false;
         }
@@ -624,6 +648,7 @@ namespace {
     }
 
     std::array<uint8_t, 64> signature{};
+    const ScopedCleanse wipe_signature{signature.data(), signature.size()};
     unsigned int signature_len = 0;
     if (!HMAC(EVP_sha512(),
               auth_key.data(),
@@ -687,6 +712,15 @@ void RealityServerMsgCallback(int is_write,
     HMAC_CTX hmac_ctx;
     HMAC_CTX_init(&hmac_ctx);
     std::array<uint8_t, 64> mldsa_msg{};
+    struct CleanseHmac {
+        HMAC_CTX& ctx;
+        std::array<uint8_t, 64>& msg;
+        ~CleanseHmac() noexcept {
+            HMAC_CTX_cleanup(&ctx);
+            OPENSSL_cleanse(&ctx, sizeof(ctx));
+            OPENSSL_cleanse(msg.data(), msg.size());
+        }
+    } cleanse_hmac{hmac_ctx, mldsa_msg};
     unsigned int mldsa_msg_len = 0;
     const bool hmac_ok =
         HMAC_Init_ex(&hmac_ctx,
@@ -703,7 +737,7 @@ void RealityServerMsgCallback(int is_write,
         HMAC_Update(&hmac_ctx, bytes, len) == 1 &&
         HMAC_Final(&hmac_ctx, mldsa_msg.data(), &mldsa_msg_len) == 1 &&
         mldsa_msg_len == mldsa_msg.size();
-    HMAC_CTX_cleanup(&hmac_ctx);
+    // CleanseHmac handles cleanup and zeroing.
     if (!hmac_ok) {
         SSL_certs_clear(ssl);
         return;

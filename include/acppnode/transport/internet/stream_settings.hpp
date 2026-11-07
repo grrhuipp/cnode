@@ -9,6 +9,7 @@
 #include "acppnode/transport/internet/outbound_bind.hpp"
 #include "acppnode/transport/internet/http_headers.hpp"
 #include "acppnode/transport/internet/tls_config.hpp"
+#include "acppnode/common/unsafe.hpp"
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -199,9 +200,42 @@ struct RealityConfig {
     std::string spider_x;
     std::shared_ptr<const transport::internet::RealityMldsa65PublicKey> mldsa65_verify;
 
+    RealityConfig() = default;
+    RealityConfig(const RealityConfig&) = default;
+    RealityConfig& operator=(const RealityConfig&) = default;
+    RealityConfig(RealityConfig&&) noexcept = default;
+    RealityConfig& operator=(RealityConfig&&) noexcept = default;
+    ~RealityConfig() noexcept {
+        if (private_key) {
+            ::acpp::SecureZeroMemory(private_key->data(), private_key->size());
+        }
+        for (auto& id : short_ids) {
+            ::acpp::SecureZeroMemory(id.data(), id.size());
+        }
+        if (mldsa65_seed) {
+            ::acpp::SecureZeroMemory(mldsa65_seed->data(), mldsa65_seed->size());
+        }
+        ::acpp::SecureZeroMemory(short_id.data(), short_id.size());
+    }
+
     [[nodiscard]] bool IsClient() const noexcept { return public_key.has_value(); }
     [[nodiscard]] bool HasDest() const noexcept { return !dest_host.empty() && dest_port != 0; }
     [[nodiscard]] bool operator==(const RealityConfig& other) const noexcept {
+        const auto opt_key_eq = [](const std::optional<transport::internet::RealityKey>& a,
+                                   const std::optional<transport::internet::RealityKey>& b) noexcept {
+            if (a.has_value() != b.has_value()) return false;
+            return !a || ::acpp::ConstantTimeEqual(a->data(), b->data(), a->size());
+        };
+        const auto short_ids_eq = [](const std::vector<transport::internet::RealityShortId>& a,
+                                     const std::vector<transport::internet::RealityShortId>& b) noexcept {
+            if (a.size() != b.size()) return false;
+            uint8_t diff = 0;
+            for (size_t i = 0; i < a.size(); ++i) {
+                diff |= static_cast<uint8_t>(
+                    !::acpp::ConstantTimeEqual(a[i].data(), b[i].data(), a[i].size()));
+            }
+            return diff == 0;
+        };
         const bool verify_equal =
             (mldsa65_verify == nullptr) == (other.mldsa65_verify == nullptr) &&
             (!mldsa65_verify || *mldsa65_verify == *other.mldsa65_verify);
@@ -209,20 +243,19 @@ struct RealityConfig {
                dest_port == other.dest_port &&
                xver == other.xver &&
                server_names == other.server_names &&
-               private_key == other.private_key &&
-               short_ids == other.short_ids &&
+               opt_key_eq(private_key, other.private_key) &&
+               short_ids_eq(short_ids, other.short_ids) &&
                min_client_version == other.min_client_version &&
                max_client_version == other.max_client_version &&
                max_time_diff == other.max_time_diff &&
-               mldsa65_seed == other.mldsa65_seed &&
+               opt_key_eq(mldsa65_seed, other.mldsa65_seed) &&
                fingerprint == other.fingerprint &&
                server_name == other.server_name &&
                public_key == other.public_key &&
-               short_id == other.short_id &&
+               ::acpp::ConstantTimeEqual(short_id.data(), other.short_id.data(), short_id.size()) &&
                spider_x == other.spider_x &&
                verify_equal;
     }
-
     static RealityConfig FromJson(const json::object& j);
 };
 

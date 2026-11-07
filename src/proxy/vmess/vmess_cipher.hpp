@@ -19,7 +19,7 @@
 #include <memory>
 #include <cstdint>
 #include <variant>
-#include <openssl/crypto.h>
+#include "acppnode/common/unsafe.hpp"
 #include <openssl/ossl_typ.h>
 
 namespace acpp {
@@ -37,7 +37,7 @@ public:
     VMessCipher(Security security, const uint8_t* key, const uint8_t* iv,
                 proxy::AeadDirection direction);
     ~VMessCipher() noexcept {
-        OPENSSL_cleanse(iv_.data(), iv_.size());
+        ::acpp::SecureZeroMemory(iv_.data(), iv_.size());
     }
 
     VMessCipher(const VMessCipher&)            = delete;

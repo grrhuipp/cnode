@@ -25,8 +25,8 @@ struct BodyKey {
     std::array<uint8_t, 16> key{};
     std::array<uint8_t, 16> iv{};
     ~BodyKey() noexcept {
-        OPENSSL_cleanse(key.data(), key.size());
-        OPENSSL_cleanse(iv.data(), iv.size());
+        ::acpp::SecureZeroMemory(key.data(), key.size());
+        ::acpp::SecureZeroMemory(iv.data(), iv.size());
     }
 };
 

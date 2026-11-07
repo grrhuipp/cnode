@@ -6,7 +6,7 @@
 #include "acppnode/transport/internet/outbound_sender.hpp"
 
 #include <openssl/aes.h>
-#include <openssl/crypto.h>
+#include "acppnode/common/unsafe.hpp"
 #include <chrono>
 #include <memory>
 
@@ -31,7 +31,7 @@ struct PreparedSettings {
     AES_KEY auth_id_key{};  // Encrypt schedule of user.auth_key, built on prepare.
 
     ~PreparedSettings() noexcept {
-        OPENSSL_cleanse(&auth_id_key, sizeof(auth_id_key));
+        ::acpp::SecureZeroMemory(&auth_id_key, sizeof(auth_id_key));
     }
 };
 

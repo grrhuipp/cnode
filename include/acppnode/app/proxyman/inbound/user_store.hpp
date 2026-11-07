@@ -43,9 +43,9 @@ public:
         Profile profile;
 
         ~VmessCredential() noexcept {
-            OPENSSL_cleanse(uuid_bytes.data(), uuid_bytes.size());
-            OPENSSL_cleanse(cmd_key.data(), cmd_key.size());
-            OPENSSL_cleanse(&auth_id_key, sizeof(auth_id_key));
+            ::acpp::SecureZeroMemory(uuid_bytes.data(), uuid_bytes.size());
+            ::acpp::SecureZeroMemory(cmd_key.data(), cmd_key.size());
+            ::acpp::SecureZeroMemory(&auth_id_key, sizeof(auth_id_key));
         }
     };
 

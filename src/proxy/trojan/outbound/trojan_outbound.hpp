@@ -6,7 +6,7 @@
 #include "acppnode/transport/internet/outbound_sender.hpp"
 
 #include <chrono>
-#include <openssl/crypto.h>
+#include "acppnode/common/unsafe.hpp"
 #include <memory>
 
 namespace acpp {
@@ -24,7 +24,7 @@ struct TrojanOutboundConfig {
     TrojanOutboundConfig(TrojanOutboundConfig&&) noexcept = default;
     TrojanOutboundConfig& operator=(TrojanOutboundConfig&&) noexcept = default;
     ~TrojanOutboundConfig() noexcept {
-        OPENSSL_cleanse(password_hash.data(), password_hash.size());
+        ::acpp::SecureZeroMemory(password_hash.data(), password_hash.size());
     }
 };
 

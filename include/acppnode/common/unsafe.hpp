@@ -5,6 +5,7 @@
 
 #include <cassert>
 #include <cstdint>
+#include <cstddef>
 #include <type_traits>
 
 namespace acpp::unsafe {
@@ -38,5 +39,38 @@ template<typename To, typename From>
 
     return reinterpret_cast<const To*>(ptr);
 }
-
 }  // namespace acpp::unsafe
+
+namespace acpp {
+
+inline void SecureZeroMemory(void* ptr, std::size_t size) noexcept {
+    if (!ptr || size == 0) {
+        return;
+    }
+    volatile unsigned char* p = static_cast<volatile unsigned char*>(ptr);
+    for (std::size_t i = 0; i < size; ++i) {
+        p[i] = 0;
+    }
+#if defined(__GNUC__) || defined(__clang__)
+    __asm__ __volatile__("" : : "r"(ptr) : "memory");
+#endif
+}
+
+[[nodiscard]] inline bool ConstantTimeEqual(
+    const void* a, const void* b, std::size_t size) noexcept {
+    if (size == 0) {
+        return true;
+    }
+    const auto* pa = static_cast<const unsigned char*>(a);
+    const auto* pb = static_cast<const unsigned char*>(b);
+    unsigned char diff = 0;
+    for (std::size_t i = 0; i < size; ++i) {
+        diff |= static_cast<unsigned char>(pa[i] ^ pb[i]);
+    }
+#if defined(__GNUC__) || defined(__clang__)
+    __asm__ __volatile__("" : "+r"(diff) : : "memory");
+#endif
+    return diff == 0;
+}
+
+}  // namespace acpp

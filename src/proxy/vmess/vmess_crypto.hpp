@@ -11,7 +11,7 @@
 #include "acppnode/common.hpp"
 #include "acppnode/common/allocator.hpp"
 #include <openssl/aes.h>
-#include <openssl/crypto.h>
+#include "acppnode/common/unsafe.hpp"
 #include <array>
 #include <span>
 #include <string_view>
@@ -44,8 +44,8 @@ struct HeaderAeadKey {
     std::array<uint8_t, 16> key{};
     std::array<uint8_t, 12> nonce{};
     ~HeaderAeadKey() noexcept {
-        OPENSSL_cleanse(key.data(), key.size());
-        OPENSSL_cleanse(nonce.data(), nonce.size());
+        ::acpp::SecureZeroMemory(key.data(), key.size());
+        ::acpp::SecureZeroMemory(nonce.data(), nonce.size());
     }
 };
 

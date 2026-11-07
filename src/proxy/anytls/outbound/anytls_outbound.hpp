@@ -5,7 +5,7 @@
 #include "acppnode/transport/internet/outbound_sender.hpp"
 
 #include <array>
-#include <openssl/crypto.h>
+#include "acppnode/common/unsafe.hpp"
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -33,7 +33,7 @@ struct Settings {
     Settings(Settings&&) noexcept = default;
     Settings& operator=(Settings&&) noexcept = default;
     ~Settings() noexcept {
-        OPENSSL_cleanse(password_hash.data(), password_hash.size());
+        ::acpp::SecureZeroMemory(password_hash.data(), password_hash.size());
     }
 };
 

@@ -1,7 +1,7 @@
 #pragma once
 
 #include <openssl/base.h>
-#include <openssl/crypto.h>
+#include "acppnode/common/unsafe.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -66,7 +66,7 @@ struct VlessServerPfsKey {
     VlessServerPfsKey& operator=(VlessServerPfsKey&&) noexcept = default;
     ~VlessServerPfsKey() noexcept {
         if (!private_key.empty()) {
-            OPENSSL_cleanse(private_key.data(), private_key.size());
+            ::acpp::SecureZeroMemory(private_key.data(), private_key.size());
         }
     }
 };
