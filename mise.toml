@@ -42,7 +42,7 @@ cmake -S . -B build/musl -G Ninja \
     -DVCPKG_HOST_TRIPLET=x64-linux-musl \
     -DVCPKG_OVERLAY_TRIPLETS="$PWD/cmake/triplets" \
     -DVCPKG_CHAINLOAD_TOOLCHAIN_FILE="$PWD/cmake/musl.cmake" \
-    -DCNODE_ENABLE_LTO=OFF \
+    -DCNODE_ENABLE_LTO=ON \
     -DBUILD_TESTING=OFF \
     -DBUILD_ID="${BUILD_ID:-}"
 '''

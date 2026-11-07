@@ -77,7 +77,7 @@ jobs:
           set -euo pipefail
           export BUILD_ID="$(date -u +'%Y%m%dT%H%M%SZ')"
           echo "BUILD_ID=$BUILD_ID" >> "$GITHUB_ENV"
-          mise run configure -- -DBUILD_TESTING=ON -DCNODE_ENABLE_LTO=ON
+          mise run test:configure
 
       - name: save vcpkg
         if: steps.dependencies.outputs.cache-hit != 'true'

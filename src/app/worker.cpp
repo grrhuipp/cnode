@@ -1403,8 +1403,8 @@ net::awaitable<WorkerRuntimeStatsSnapshot> Worker::CollectRuntimeStats(bool incl
             continue;
         const bool include_stats = !record->finished.load(std::memory_order_acquire);
         const auto values = co_await net::co_spawn(record->domain->Executor(),
-            [cap = record->capabilities, domain = record->domain, include_stats,
-             include_resources]() mutable -> net::awaitable<WorkerRuntimeStatsSnapshot> {
+            [cap = record->capabilities, domain = record->domain,
+             include_stats]() mutable -> net::awaitable<WorkerRuntimeStatsSnapshot> {
                 WorkerRuntimeStatsSnapshot snapshot;
                 if (include_stats) snapshot.stats = cap->Stats().Snapshot();
                 cap.reset();

@@ -278,7 +278,7 @@ std::unique_ptr<BIO_METHOD, decltype(&BIO_meth_free)> tls_bio_method{nullptr, BI
 
 }  // namespace
 
-struct TlsStream::Impl : memory::ThreadAllocated, private transport::CancellationSubscription {
+struct TlsStream::Impl final : memory::ThreadAllocated, private transport::CancellationSubscription {
     using Gate = transport::internet::AsyncWriteGate;
     enum class Kind { Handshake, Read, Write, Shutdown };
 

@@ -756,7 +756,7 @@ public:
     }
 
 private:
-    struct State : std::enable_shared_from_this<State>, TimeoutEvent {
+    struct State final : std::enable_shared_from_this<State>, TimeoutEvent {
         struct Entry {
             std::shared_ptr<ClientSession> session;
             std::optional<Clock::time_point> idle_since;

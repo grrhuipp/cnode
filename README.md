@@ -33,7 +33,7 @@ mise install
 mise run build
 ```
 
-产物为 `build/musl/cnode`。默认 `BUILD_TESTING=OFF`，仅构建主程序；不安装测试依赖、不构建测试可执行文件。本地关闭 LTO，Ninja 与 vcpkg 使用自动并发；依赖、缓存和临时产物均位于 `build/`。
+产物为 `build/musl/cnode`。默认 `BUILD_TESTING=OFF`，仅构建主程序；不安装测试依赖、不构建测试可执行文件。Ninja 与 vcpkg 使用自动并发；依赖、缓存和临时产物均位于 `build/`。
 
 构建参数统一由 `mise run configure` 传给 CMake，不使用预设文件；额外 CMake 参数通过 `mise run configure -- -D选项=值` 传入。vcpkg 二进制缓存位于 `build/cache/vcpkg`，编译缓存位于 `build/cache/ccache`，CI 会持久化并跨提交恢复；依赖配置变化时仍可恢复旧缓存，由 vcpkg 的 ABI 校验和 ccache 的缓存键决定哪些结果可复用。保留这些目录可避免重复编译。
 
@@ -75,7 +75,7 @@ mise exec -- ctest --test-dir build/musl --output-on-failure --no-tests=error --
 
 Xray 使用 `-DCNODE_REFERENCE_XRAY=/path/to/xray`，要求 `v26.10.31` 对应版本；Hysteria v1/v2 分别使用 `CNODE_REFERENCE_HYSTERIA1`、`CNODE_REFERENCE_HYSTERIA2`，可独立配置。参考测试通过 `CNODE_REFERENCE_GO` 检查来源和构建元数据；AnyTLS 必须同时提供客户端与服务端。不配置参考程序时只注册本地可控对端 E2E，不把缺失参考程序计为测试通过。
 
-本地与 CI 均使用 `Release`，仅 CI 配置时显式启用 `CNODE_ENABLE_LTO=ON`；本地验证不覆盖发布 LTO 路径。密码学故障注入测试单独保留链接器可拦截的调用边界。CTest 使用不指定数量的 `--parallel`，按可用 CPU 自动调度。
+本地与 CI 使用同一份 mise 固定工具链、vcpkg 依赖基线和配置入口，均为 `Release` 并开启 LTO；测试配置统一运行 `mise run test:configure`。宿主发行版无需相同，不要求容器。密码学故障注入测试单独保留链接器可拦截的调用边界。CTest 使用不指定数量的 `--parallel`，按可用 CPU 自动调度。
 
 CI 只对源码、测试、构建配置变更自动运行，纯文档和部署脚本变更不触发编译；也可手动运行。`build` job 复用同一构建树，`verify` 步骤统一执行单元、E2E 与静态 ELF 检查。vcpkg 缓存按依赖配置保存、ccache 按提交增量保存，两者在对应阶段成功后立即保存，不因后续测试失败丢失。仅分支 push 在验证通过后打包，`release` job 的 `publish` 步骤下载并发布产物；PR 和手动运行只验证。
 

@@ -15,7 +15,7 @@ namespace acpp::transport::internet::detail {
 // Domain-owned aggregate deadlines. The sole embedded event follows the domain's
 // current Worker scheduler without retaining a pre-handoff scheduler reference.
 template<class Owner>
-class ConnectionTimeouts : private TimeoutEvent {
+class ConnectionTimeouts final : private TimeoutEvent {
 public:
     using Clock = std::chrono::steady_clock;
     using TimePoint = Clock::time_point;

@@ -598,8 +598,11 @@ bool RunJoinedDomainBorrow() {
         {
             ThreadLocalDeque<ThreadLocalString> nested_deque;
             nested_deque.emplace_back(64, 'q');
-            nested_deque = nested_deque;
+            const auto& self_alias = nested_deque;
+            nested_deque = self_alias;
             intact = intact && nested_deque.size() == 1 &&
+                nested_deque.front().size() == 64 &&
+                nested_deque.front().find_first_not_of('q') == ThreadLocalString::npos &&
                 nested_deque.front().get_allocator().resource() == second.resource();
             nested_deque.clear();
             for (int i = 0; i < 8; ++i) {

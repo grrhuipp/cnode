@@ -66,9 +66,9 @@ TEST(SessionAccessLog, Contract) {
         Expect(Has(access, " origin:203.0.113.88|panel/site-a/10/vless/443|1001|alice@origin.example ") &&
                Has(access, " sendThrough:2602:2b5:20:111::abcd"),
                "passthrough origin IP, tag and user identity must appear in access log");
-        ctx.inbound.ApplyForwardedMetadata(acpp::ForwardedMetadata{
-            .user_email = acpp::memory::ThreadLocalString("bob@origin.example"),
-        });
+        acpp::ForwardedMetadata partial_origin;
+        partial_origin.user_email = "bob@origin.example";
+        ctx.inbound.ApplyForwardedMetadata(partial_origin);
         Expect(ctx.inbound.origin_tag.empty() &&
                ctx.inbound.origin_user_id == 0 &&
                ctx.inbound.origin_user_email == "bob@origin.example" &&
