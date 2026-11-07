@@ -35,6 +35,8 @@ mise run build
 
 产物为 `build/musl/cnode`。默认 `BUILD_TESTING=OFF`，仅构建主程序；不安装测试依赖、不构建测试可执行文件。本地关闭 LTO，Ninja 与 vcpkg 使用自动并发；依赖、缓存和临时产物均位于 `build/`。
 
+构建参数统一由 `mise run configure` 传给 CMake，不使用预设文件；额外 CMake 参数通过 `mise run configure -- -D选项=值` 传入。vcpkg 二进制缓存位于 `build/cache/vcpkg`，编译缓存位于 `build/cache/ccache`，CI 会持久化并跨提交恢复；依赖配置变化时仍可恢复旧缓存，由 vcpkg 的 ABI 校验和 ccache 的缓存键决定哪些结果可复用。保留这些目录可避免重复编译。
+
 单元与 E2E 测试均使用 C++ GoogleTest，由 CTest 调度；不使用 Python/JavaScript 测试脚本。测试必须显式启用：
 
 ```sh
@@ -45,12 +47,12 @@ mise run test
 
 ```sh
 mise run test:configure
-mise exec -- cmake --build --preset musl-tests
-mise exec -- ctest --preset musl-tests --parallel -L '^unit$'
-mise exec -- ctest --preset musl-tests --parallel -L '^e2e$'
+mise exec -- cmake --build build/musl --target cnode_tests
+mise exec -- ctest --test-dir build/musl --output-on-failure --no-tests=error --parallel -L '^unit$'
+mise exec -- ctest --test-dir build/musl --output-on-failure --no-tests=error --parallel -L '^e2e$'
 ```
 
-主程序与测试共用 `build/musl`，不重复建立独立发布构建树。若只需要某个测试，可显式构建其 `cnode_*_test` 目标，再用 `ctest --preset musl-tests -R <名称>` 执行。切回 `mise run build` 会关闭测试注册。可选 io_uring 后端通过 `mise exec -- cmake --preset musl -DCNODE_IO_URING=ON` 配置，再执行 `mise exec -- cmake --build --preset musl`；官方发布仅提供 epoll。
+主程序与测试共用 `build/musl`，不重复建立独立发布构建树。若只需要某个测试，可显式构建其 `cnode_*_test` 目标，再用 `mise exec -- ctest --test-dir build/musl --output-on-failure --no-tests=error -R <名称>` 执行。切回 `mise run build` 会关闭测试注册。可选 io_uring 后端通过 `mise run configure -- -DCNODE_IO_URING=ON` 配置，再执行 `mise exec -- cmake --build build/musl --target cnode`；官方发布仅提供 epoll。
 
 官方参考程序互操作测试按需配置，使用本地可执行文件，不在测试期间下载。AnyTLS 参考程序可先用宿主 Go 准备，默认离线且要求固定提交的干净源码：
 
@@ -63,17 +65,19 @@ CNODE_REFERENCE_DOWNLOAD=ON mise run reference:prepare
 配置参考程序后，仍通过同一 GoogleTest/CTest 入口运行：
 
 ```sh
-mise exec -- cmake --preset musl-tests \
+mise run test:configure -- \
   -DCNODE_REFERENCE_GO="$(command -v go)" \
   -DCNODE_REFERENCE_ANYTLS_CLIENT="$PWD/build/reference/anytls/bin/anytls-client" \
   -DCNODE_REFERENCE_ANYTLS_SERVER="$PWD/build/reference/anytls/bin/anytls-server"
-mise exec -- cmake --build --preset musl-tests
-mise exec -- ctest --preset musl-tests --parallel -L '^e2e$'
+mise exec -- cmake --build build/musl --target cnode_tests
+mise exec -- ctest --test-dir build/musl --output-on-failure --no-tests=error --parallel -L '^e2e$'
 ```
 
 Xray 使用 `-DCNODE_REFERENCE_XRAY=/path/to/xray`，要求 `v26.10.31` 对应版本；Hysteria v1/v2 分别使用 `CNODE_REFERENCE_HYSTERIA1`、`CNODE_REFERENCE_HYSTERIA2`，可独立配置。参考测试通过 `CNODE_REFERENCE_GO` 检查来源和构建元数据；AnyTLS 必须同时提供客户端与服务端。不配置参考程序时只注册本地可控对端 E2E，不把缺失参考程序计为测试通过。
 
 本地与 CI 均使用 `Release`，仅 CI 配置时显式启用 `CNODE_ENABLE_LTO=ON`；本地验证不覆盖发布 LTO 路径。密码学故障注入测试单独保留链接器可拦截的调用边界。CTest 使用不指定数量的 `--parallel`，按可用 CPU 自动调度。
+
+CI 只对源码、测试、构建配置变更自动运行，纯文档和部署脚本变更不触发编译；也可手动运行。`build` job 复用同一构建树，`verify` 步骤统一执行单元、E2E 与静态 ELF 检查。vcpkg 缓存按依赖配置保存、ccache 按提交增量保存，两者在对应阶段成功后立即保存，不因后续测试失败丢失。仅分支 push 在验证通过后打包，`release` job 的 `publish` 步骤下载并发布产物；PR 和手动运行只验证。
 
 集成测试按实际监听范围预留动态端口：同时监听 TCP/UDP 的场景会占有两个协议的同号端口，写完配置后才释放并启动进程，避免把仅 UDP 空闲的端口用于 TCP 监听。
 
@@ -426,7 +430,7 @@ V2Board 上报是无幂等键的增量接口，不能承诺 exactly-once。发�
 停机后根据面板侧账务证据逐批对账；确认已应用则删除未知批次，确认未应用才重新置为可发送。工具使用独占锁并持久化审计记录，不能仅凭超时判断“未应用”：
 
 ```sh
-mise exec -- cmake --build --preset musl --target cnode_traffic_journal
+mise exec -- cmake --build build/musl --target cnode_traffic_journal
 build/musl/cnode_traffic_journal '/path/to/traffic-journal/<身份哈希>' list
 build/musl/cnode_traffic_journal '/path/to/traffic-journal/<身份哈希>' resolve batch-XXXXXX.unknown \
   --decision confirmed-applied --evidence '面板侧对账记录编号'

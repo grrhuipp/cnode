@@ -9,10 +9,7 @@ on:
       - 'mise.toml'
       - 'vcpkg.json'
       - 'CMakeLists.txt'
-      - 'CMakePresets.json'
       - 'cmake/**'
-      - 'README.md'
-      - 'scripts/**'
       - 'src/**'
       - 'include/**'
       - 'tools/**'
@@ -32,59 +29,77 @@ env:
 
 jobs:
   build:
-    name: musl static / unit / E2E
     runs-on: ubuntu-26.04
     defaults:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v7.0.1
+      - name: checkout
+        uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
 
-      - name: Install host utilities
+      - name: setup
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential binutils git curl zip unzip tar xz-utils pkg-config jq file \
             autoconf autoconf-archive automake libtool perl nasm openssl
 
-      - uses: jdx/mise-action@v5.2.1
+      - name: mise
+        uses: jdx/mise-action@v5.2.1
         with:
           cache: true
         env:
           MISE_GITHUB_TOKEN: ${{ github.token }}
 
-      - name: Restore dependency and compiler caches
-        uses: actions/cache@v6.1.0
+      - name: restore vcpkg
+        id: dependencies
+        uses: actions/cache/restore@v6.1.0
         with:
-          path: |
-            build/cache/vcpkg
-            build/cache/ccache
-          key: musl-${{ runner.arch }}-${{ hashFiles('mise.toml', 'vcpkg.json', 'cmake/ports/**', 'cmake/triplets/**', 'cmake/musl.cmake') }}-${{ github.sha }}
+          path: build/cache/vcpkg
+          key: vcpkg-musl-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mise.toml', 'vcpkg.json', 'cmake/ports/**', 'cmake/triplets/**', 'cmake/musl.cmake', 'CMakeLists.txt') }}
           restore-keys: |
-            musl-${{ runner.arch }}-${{ hashFiles('mise.toml', 'vcpkg.json', 'cmake/ports/**', 'cmake/triplets/**', 'cmake/musl.cmake') }}-
+            vcpkg-musl-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: Configure
+      - name: restore ccache
+        id: compiler
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: build/cache/ccache
+          key: ccache-musl-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mise.toml', 'cmake/musl.cmake') }}-${{ github.sha }}
+          restore-keys: |
+            ccache-musl-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mise.toml', 'cmake/musl.cmake') }}-
+            ccache-musl-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: configure
         run: |
           set -euo pipefail
           export BUILD_ID="$(date -u +'%Y%m%dT%H%M%SZ')"
           echo "BUILD_ID=$BUILD_ID" >> "$GITHUB_ENV"
-          mise run bootstrap
-          mise exec -- cmake --preset musl-tests -DBUILD_ID="$BUILD_ID" -DCNODE_ENABLE_LTO=ON
+          mise run configure -- -DBUILD_TESTING=ON -DCNODE_ENABLE_LTO=ON
 
-      - name: Build explicit test targets
-        run: mise exec -- cmake --build --preset musl-tests
+      - name: save vcpkg
+        if: steps.dependencies.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: build/cache/vcpkg
+          key: ${{ steps.dependencies.outputs.cache-primary-key }}
 
-      - name: Unit tests
-        run: mise exec -- ctest --preset musl-tests --parallel -L '^unit$' --output-junit "$PWD/build/unit-results.xml"
+      - name: build
+        run: mise exec -- cmake --build build/musl --target cnode_tests
 
-      - name: E2E tests
-        run: mise exec -- ctest --preset musl-tests --parallel -L '^e2e$' --output-junit "$PWD/build/e2e-results.xml"
+      - name: save ccache
+        if: steps.compiler.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: build/cache/ccache
+          key: ${{ steps.compiler.outputs.cache-primary-key }}
 
-      - name: Verify and package static ELF
+      - name: verify
         run: |
           set -euo pipefail
+          mise exec -- ctest --test-dir build/musl --output-on-failure --no-tests=error --parallel --output-junit "$PWD/build/test-results.xml"
           binary=build/musl/cnode
           file "$binary"
           if readelf -l "$binary" | grep -q INTERP; then
@@ -96,6 +111,12 @@ jobs:
             exit 1
           fi
           "$binary" -v
+
+      - name: package
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          binary=build/musl/cnode
           mkdir -p build/release
           cp "$binary" build/release/cnode-linux-amd64-musl
           objcopy --only-keep-debug build/release/cnode-linux-amd64-musl build/release/cnode-linux-amd64-musl.debug
@@ -105,14 +126,16 @@ jobs:
           cp build/release/cnode-linux-amd64-musl.debug build/release/cnode-linux-amd64.debug
           printf 'build_id: %s\ncommit: %s\nvariant: musl+epoll (static)\n' "$BUILD_ID" "$GITHUB_SHA" > build/release/notes.md
 
-      - uses: actions/upload-artifact@v7.0.2
+      - name: upload
+        uses: actions/upload-artifact@v7.0.2
+        if: github.event_name == 'push'
         with:
           name: cnode-musl-assets
           path: build/release/*
           if-no-files-found: error
           compression-level: 0
 
-      - name: Preserve failed diagnostics
+      - name: diagnostics
         if: failure()
         uses: actions/upload-artifact@v7.0.2
         with:
@@ -125,8 +148,7 @@ jobs:
             build/musl/e2e-artifacts/**
             build/musl/vcpkg-manifest-install.log
 
-  publish-release:
-    name: Publish GitHub Release
+  release:
     runs-on: ubuntu-26.04
     needs: build
     if: github.event_name == 'push'
@@ -136,16 +158,14 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - name: Download release artifacts
+      - name: publish
         run: |
+          set -euo pipefail
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
             --name cnode-musl-assets --dir release-assets
           test -s release-assets/cnode-linux-amd64-musl
           test -s release-assets/cnode-linux-amd64
 
-      - name: Publish release assets
-        run: |
-          set -euo pipefail
           tag_ref="tags/$RELEASE_TAG"
           if gh api "repos/$GITHUB_REPOSITORY/git/ref/$tag_ref" >/dev/null 2>&1; then
             gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/$tag_ref" \

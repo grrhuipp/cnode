@@ -32,31 +32,39 @@ git -C "$VCPKG_ROOT" checkout --detach "$commit"
 [tasks.configure]
 description = "配置 musl Release，默认不启用测试"
 depends = ["bootstrap"]
-run = 'cmake --preset musl -DBUILD_ID="${BUILD_ID:-}"'
+run = '''
+cmake -S . -B build/musl -G Ninja \
+    -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+    -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+    -DVCPKG_TARGET_TRIPLET=x64-linux-musl \
+    -DVCPKG_HOST_TRIPLET=x64-linux-musl \
+    -DVCPKG_OVERLAY_TRIPLETS="$PWD/cmake/triplets" \
+    -DVCPKG_CHAINLOAD_TOOLCHAIN_FILE="$PWD/cmake/musl.cmake" \
+    -DCNODE_ENABLE_LTO=OFF \
+    -DBUILD_TESTING=OFF \
+    -DBUILD_ID="${BUILD_ID:-}"
+'''
 
 [tasks.build]
 description = "仅构建 musl 静态主程序"
 depends = ["configure"]
-run = "cmake --build --preset musl"
+run = "cmake --build build/musl --target cnode"
 
 [tasks."test:configure"]
 description = "显式启用单元与 E2E 测试"
-depends = ["bootstrap"]
-run = '''
-set -eu
-cmake --preset musl-tests \
-    -DBUILD_ID="${BUILD_ID:-}"
-'''
+run = "mise run configure -- -DBUILD_TESTING=ON"
 
 [tasks."test:build"]
 description = "按需构建测试，共用生产库"
 depends = ["test:configure"]
-run = "cmake --build --preset musl-tests"
+run = "cmake --build build/musl --target cnode_tests"
 
 [tasks.test]
 description = "执行单元与 E2E 测试"
 depends = ["test:build"]
-run = "ctest --preset musl-tests --parallel"
+run = "ctest --test-dir build/musl --output-on-failure --no-tests=error --parallel"
 
 [tasks."reference:prepare"]
 description = "显式准备固定版本 AnyTLS 参考程序，默认离线（需要宿主 Go）"
