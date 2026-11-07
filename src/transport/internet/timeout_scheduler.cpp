@@ -208,9 +208,8 @@ public:
         // committed. Thus Commit only links reserved heap slots: even starting
         // the native wait (which can allocate) stays outside noexcept Commit.
         Notify();
-        target_ = co_await net::co_spawn(target.executor,
+        co_await net::co_spawn(target.executor,
             ReserveTarget(*target.reactor, count), net::use_awaitable);
-        target_reserved_ = count;
         old_reserved_ = 0;
         for (auto* event = first_; event; event = event->next_) {
             if (!event->owner_) continue; // Already queued, never resurrect it.
@@ -227,26 +226,28 @@ public:
         DropReservations();
     }
     net::awaitable<void> CancelHandoff(const ExecutionDomain::HandoffTarget&) override {
-        if (!prepared_) co_return;
-        Restore(*old_);
-        DropReservations();
+        if (prepared_) Restore(*old_);
+        if (prepared_ || target_reserved_ != 0 || old_reserved_ != 0 || old_ || target_)
+            DropReservations();
         co_return;
     }
 private:
-    static net::awaitable<TimeoutScheduler*> ReserveTarget(net::io_context& context, std::size_t count) {
+    net::awaitable<void> ReserveTarget(net::io_context& context, std::size_t count) {
         auto& scheduler = TimeoutScheduler::ForWorker(context);
         if (scheduler.impl_->released) throw std::logic_error("target timeout scheduler released");
         scheduler.impl_->Reserve(count);
         scheduler.impl_->reserved.fetch_add(count, std::memory_order_relaxed);
-        co_return &scheduler;
+        target_ = &scheduler;
+        target_reserved_ = count;
+        co_return;
     }
     void Restore(TimeoutScheduler& scheduler) noexcept {
         for (auto* event = first_; event; event = event->next_)
             if (!event->ready_) scheduler.impl_->Insert(scheduler, *event);
     }
     void DropReservations() noexcept {
-        old_->impl_->reserved.fetch_sub(old_reserved_, std::memory_order_relaxed);
-        target_->impl_->reserved.fetch_sub(target_reserved_, std::memory_order_relaxed);
+        if (old_) old_->impl_->reserved.fetch_sub(old_reserved_, std::memory_order_relaxed);
+        if (target_) target_->impl_->reserved.fetch_sub(target_reserved_, std::memory_order_relaxed);
         old_ = target_ = nullptr;
         old_reserved_ = target_reserved_ = 0;
         prepared_ = false;

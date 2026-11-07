@@ -13,7 +13,7 @@ struct ClientSessionKey final {
     ClientSessionKey(InboundDatagramOwner authenticated_owner,
                      std::optional<uint64_t> protocol_session_id,
                      udp::endpoint client_endpoint = {},
-                     const void* configuration_identity = nullptr) noexcept
+                     const proxyman::inbound::ProtocolSettings* configuration_identity = nullptr) noexcept
         : owner(authenticated_owner), session_id(protocol_session_id),
           endpoint(protocol_session_id ? udp::endpoint{} :
               udp::endpoint(iputil::NormalizeAddress(client_endpoint.address()), client_endpoint.port())),
@@ -27,7 +27,7 @@ struct ClientSessionKey final {
     InboundDatagramOwner owner;
     std::optional<uint64_t> session_id;
     udp::endpoint endpoint;
-    const void* configuration = nullptr;
+    const proxyman::inbound::ProtocolSettings* configuration = nullptr;
 };
 
 struct ClientSessionKeyHash final {

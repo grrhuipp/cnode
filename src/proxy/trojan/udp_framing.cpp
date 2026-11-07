@@ -37,7 +37,7 @@ bool UdpFramer::Next(FramedUdpPacket& out) {
             auto address = DecodeAddress(
                 std::span<const uint8_t>(header.data(), copied),
                 AddressWireFormat::Socks5,
-                {.max_domain_len = 253, .require_non_empty_domain = true});
+                {.max_domain_len = 253, .require_non_empty_domain = true, .allow_metadata = false});
             if (address.status == AddressDecodeStatus::Incomplete) return false;
             if (address.status == AddressDecodeStatus::Invalid || !address.target.IsValid()) {
                 failed_ = true;

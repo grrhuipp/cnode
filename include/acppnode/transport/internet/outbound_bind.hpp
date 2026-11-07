@@ -32,9 +32,10 @@ public:
     [[nodiscard]] bool PrefersIPv6() const noexcept {
         return mode_ == Mode::Ordered && entries_ && !entries_->empty() && entries_->front().is_v6;
     }
-    [[nodiscard]] const std::optional<net::ip::address>& ExplicitAddress() const noexcept {
+    [[nodiscard]] const std::optional<net::ip::address>& ExplicitAddress() const& noexcept {
         return explicit_address_;
     }
+    const std::optional<net::ip::address>& ExplicitAddress() const&& = delete;
 
     [[nodiscard]] static OutboundBind Auto() noexcept;
     [[nodiscard]] static std::optional<OutboundBind> Parse(std::string_view value);

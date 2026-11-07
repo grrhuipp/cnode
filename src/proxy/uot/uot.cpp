@@ -87,7 +87,8 @@ net::awaitable<tl::expected<Request, ErrorCode>> ReadRequest(
     }
 
     auto address = co_await acpp::ReadAddress(
-        reader, pending, AddressWireFormat::Socks5, 1, {255, true});
+        reader, pending, AddressWireFormat::Socks5, 1,
+        {.max_domain_len = 255, .require_non_empty_domain = true, .allow_metadata = true});
     if (!address || !address->target.IsValid()) {
         co_return tl::unexpected(address
             ? ErrorCode::PROTOCOL_INVALID_ADDRESS
@@ -183,7 +184,8 @@ net::awaitable<buf::MultiBuffer> PacketReader::ReadMultiBuffer() {
             }
         } else {
             auto address = co_await acpp::ReadAddress(
-                reader_, pending_, AddressWireFormat::Uot, 0, {255, true});
+                reader_, pending_, AddressWireFormat::Uot, 0,
+                {.max_domain_len = 255, .require_non_empty_domain = true, .allow_metadata = false});
             if (!address || !address->target.IsValid()) {
                 ThrowDecodeFailure();
             }
@@ -243,7 +245,7 @@ net::awaitable<void> PacketWriter::WritePacket(
         payload_size += buffer.size();
     }
 
-    std::array<uint8_t, kMaxAddressSize + 2> header{};
+    std::array<uint8_t, kMaxBaseEncodedAddressSize + 2> header{};
     size_t header_size = 0;
     if (!is_connect_) {
         header_size = EncodeAddressTo(

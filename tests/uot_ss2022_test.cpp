@@ -556,10 +556,28 @@ void TestSharedAddressCodec() {
                               "extended address roundtrip metadata mismatch");
                     }
                 }
-                Check(DecodeAddress(std::span<const uint8_t>(encoded.data(), size),
-                                    format, {255, false, false}).status ==
-                          AddressDecodeStatus::Invalid,
-                      "disallowed metadata was accepted");
+                const auto disallowed = DecodeAddress(
+                    std::span<const uint8_t>(encoded.data(), size),
+                    format, {255, false, false});
+                Check(disallowed.status == AddressDecodeStatus::Invalid &&
+                      !disallowed.target.IsValid() &&
+                      disallowed.target.host.empty() &&
+                      !disallowed.forwarded.has_value(),
+                      "disallowed metadata was accepted or polluted target");
+                auto malformed = encoded;
+                malformed[size - 1] = 0;
+                if ((meta.user_email.empty() && meta.inbound_tag.empty())) {
+                    malformed[AddressEncodedSize(target) + 1] = 0xFF;
+                } else {
+                    malformed[AddressEncodedSize(target) + 1] |= 0x80;
+                }
+                const auto rejected_meta = DecodeAddress(
+                    std::span<const uint8_t>(malformed.data(), size), format);
+                Check(rejected_meta.status == AddressDecodeStatus::Invalid &&
+                      !rejected_meta.target.IsValid() &&
+                      rejected_meta.target.host.empty() &&
+                      !rejected_meta.forwarded.has_value(),
+                      "invalid metadata polluted DecodeAddress result.target");
             }
         }
     }

@@ -125,7 +125,7 @@ struct Parsed2022Body {
     auto addr = DecodeAddress(
         std::span<const uint8_t>(plaintext.data() + pos, plaintext.size() - pos),
         AddressWireFormat::Socks5,
-        {255, true});
+        {.max_domain_len = 255, .require_non_empty_domain = true, .allow_metadata = true});
     if (addr.status != AddressDecodeStatus::Complete || !addr.target.IsValid()) {
         return std::nullopt;
     }
@@ -165,7 +165,7 @@ struct Parsed2022Body {
     auto addr = DecodeAddress(
         std::span<const uint8_t>(plaintext.data() + pos, plaintext.size() - pos),
         AddressWireFormat::Socks5,
-        {255, true});
+        {.max_domain_len = 255, .require_non_empty_domain = true, .allow_metadata = false});
     if (addr.status != AddressDecodeStatus::Complete || !addr.target.IsValid()) {
         return std::nullopt;
     }
@@ -934,7 +934,7 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacket(
         auto addr = DecodeAddress(
             std::span<const uint8_t>(plaintext.data(), plaintext_len),
             AddressWireFormat::Socks5,
-            {255, true});
+            {.max_domain_len = 255, .require_non_empty_domain = true, .allow_metadata = true});
         if (addr.status != AddressDecodeStatus::Complete || !addr.target.IsValid()) {
             return std::nullopt;
         }
@@ -1029,7 +1029,7 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacketWithKey(
     auto addr = DecodeAddress(
         std::span<const uint8_t>(plaintext.data(), plaintext_len),
         AddressWireFormat::Socks5,
-        {255, true});
+        {.max_domain_len = 255, .require_non_empty_domain = true, .allow_metadata = false});
     if (addr.status != AddressDecodeStatus::Complete || !addr.target.IsValid()) {
         return std::nullopt;
     }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "acppnode/app/dns/dns.hpp"
+#include "acppnode/app/session_group_executor.hpp"
 #include "acppnode/common/target_address.hpp"
 #include "acppnode/transport/internet/datagram_socket.hpp"
 #include "acppnode/transport/link.hpp"
@@ -37,7 +38,11 @@ inline net::awaitable<tl::expected<udp::endpoint, ErrorCode>> ResolveUdpEndpoint
     if (!target.IsDomain()) co_return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
 
     struct CancellationWait final : transport::CancellationSubscription {
-        explicit CancellationWait(net::io_context& io) : wake(io, 1) {}
+        explicit CancellationWait(net::io_context& io)
+            : wake(ExecutionDomain::Current()
+                       ? ExecutionDomain::Current()->Executor()
+                       : net::any_io_executor(io.get_executor()),
+                   1) {}
         SignalChannel wake;
         ErrorCode reason = ErrorCode::OK;
 

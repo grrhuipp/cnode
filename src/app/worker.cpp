@@ -269,10 +269,9 @@ struct Worker::RuntimeState {
                          const std::shared_ptr<app::PhysicalSessionRecord>& record) {
         if (connections.erase(record.get()) == 0) return;
         if (record->domain && !record->domain->CanDestroyDirectlyOn(worker_id)) {
+            record->capabilities.reset();
             auto* domain = record->domain.get();
-            domain->Execute([cap = std::move(record->capabilities),
-                             domain = std::move(record->domain)]() mutable {
-                cap.reset();
+            domain->Execute([domain = std::move(record->domain)]() mutable {
                 domain.reset();
             });
         }
@@ -533,10 +532,9 @@ net::awaitable<void> Worker::StopRuntimeTask() {
     for (auto& [key, record] : runtime_->connections) {
         (void)key;
         if (record->domain && !record->domain->CanDestroyDirectlyOn(id_)) {
+            record->capabilities.reset();
             auto* domain = record->domain.get();
-            domain->Execute([cap = std::move(record->capabilities),
-                             domain = std::move(record->domain)]() mutable {
-                cap.reset();
+            domain->Execute([domain = std::move(record->domain)]() mutable {
                 domain.reset();
             });
         }
@@ -986,14 +984,6 @@ net::awaitable<void> Worker::ListenerState::AcceptLoop(
                 ProcessReceivedConnection(record, std::move(socket), remote_ep, worker.id_),
                 net::bind_executor(worker.io_context_.get_executor(),
                     [this, &worker, record](std::exception_ptr error) {
-                        record->finished.store(true, std::memory_order_release);
-                        auto& stats = worker.runtime_->stats;
-                        stats.hot.bytes_in += record->final_stats.bytes_in;
-                        stats.hot.bytes_out += record->final_stats.bytes_out;
-                        stats.cold.connections_total += record->final_stats.connections_total;
-                        stats.cold.errors += record->final_stats.errors;
-                        --tcp_tasks;
-                        NotifyCompletion();
                         bool accounting_merged = false;
                         try {
                             worker.runtime_->session_tracking->MergeCompletedTraffic(
@@ -1002,8 +992,17 @@ net::awaitable<void> Worker::ListenerState::AcceptLoop(
                         } catch (...) {
                             worker.ReportFailure(std::current_exception());
                         }
-                        if (accounting_merged)
+                        auto& stats = worker.runtime_->stats;
+                        stats.hot.bytes_in += record->final_stats.bytes_in;
+                        stats.hot.bytes_out += record->final_stats.bytes_out;
+                        stats.cold.connections_total += record->final_stats.connections_total;
+                        stats.cold.errors += record->final_stats.errors;
+                        --tcp_tasks;
+                        NotifyCompletion();
+                        if (accounting_merged) {
+                            record->finished.store(true, std::memory_order_release);
                             worker.runtime_->EraseConnection(worker.id_, record);
+                        }
                         if (error) {
                             try {
                                 try { std::rethrow_exception(error); }

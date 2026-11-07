@@ -325,6 +325,7 @@ private:
 
         state.write_cipher_.emplace(state.cipher_type_, write_subkey.data(), state.key_size_,
                                      proxy::AeadDirection::Encrypt);
+        OPENSSL_cleanse(write_subkey.data(), write_subkey.size());
         state.write_nonce_ = 0;
 
         if (!buf::AppendSpanToMultiBuffer(
@@ -361,6 +362,7 @@ private:
 
         state.write_cipher_.emplace(state.cipher_type_, write_subkey.data(), state.key_size_,
                                      proxy::AeadDirection::Encrypt);
+        OPENSSL_cleanse(write_subkey.data(), write_subkey.size());
 
         constexpr size_t kFixedPlainMaxSize = 1 + 8 + KeyBytes::kMaxSize + 2;
         constexpr size_t kFixedCipherMaxSize =
@@ -458,11 +460,13 @@ bool MatchIdentityHeader(const proxyman::inbound::UserStore::ShadowsocksCredenti
     }
 
     std::array<uint8_t, 16> identity_hash{};
-    if (!AesBlockCrypt(
-            std::span<const uint8_t>(block_key.data(), cipher_info.key_size),
-            encrypted_identity,
-            std::span<uint8_t, 16>(identity_hash),
-            false)) {
+    const bool ok = AesBlockCrypt(
+        std::span<const uint8_t>(block_key.data(), cipher_info.key_size),
+        encrypted_identity,
+        std::span<uint8_t, 16>(identity_hash),
+        false);
+    OPENSSL_cleanse(block_key.data(), block_key.size());
+    if (!ok) {
         return false;
     }
 
@@ -477,9 +481,11 @@ bool DecryptSs2022FixedHeader(const proxyman::inbound::UserStore::ShadowsocksCre
                               std::array<uint8_t, kSs2022RequestFixedHeaderSize>& fixed_plain) {
     if (user.derived_key.size < cipher_info.key_size) return false;
     std::array<uint8_t, 32> subkey{};
-    if (!Derive2022Subkey(user.derived_key.data(), cipher_info.key_size,
-                          salt.data(), salt.size(), subkey.data()) ||
-        !read_cipher.ResetKey(subkey.data(), cipher_info.key_size)) return false;
+    const bool key_ok = Derive2022Subkey(user.derived_key.data(), cipher_info.key_size,
+                                         salt.data(), salt.size(), subkey.data()) &&
+                        read_cipher.ResetKey(subkey.data(), cipher_info.key_size);
+    OPENSSL_cleanse(subkey.data(), subkey.size());
+    if (!key_ok) return false;
     const auto nonce = MakeNonce(0);
     return read_cipher.Decrypt(nonce.data(), encrypted_fixed.data(), encrypted_fixed.size(),
                                fixed_plain.data());
@@ -585,7 +591,8 @@ net::awaitable<tl::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession2022
     }
     const auto first_bytes = first_payload->Bytes();
     auto addr_result = DecodeAddress(
-        first_bytes, AddressWireFormat::Socks5, {255, true});
+        first_bytes, AddressWireFormat::Socks5,
+        {.max_domain_len = 255, .require_non_empty_domain = true, .allow_metadata = true});
     if (addr_result.status != AddressDecodeStatus::Complete) {
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
@@ -668,7 +675,9 @@ net::awaitable<tl::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession(
                           read_subkey.data())) {
             return false;
         }
-        if (!read_cipher.ResetKey(read_subkey.data(), key_size)) return false;
+        const bool key_ok = read_cipher.ResetKey(read_subkey.data(), key_size);
+        OPENSSL_cleanse(read_subkey.data(), read_subkey.size());
+        if (!key_ok) return false;
         auto nonce0 = MakeNonce(0);
         return read_cipher.Decrypt(nonce0.data(), enc_len.data(), enc_len.size(), len_plain);
     };
@@ -719,7 +728,9 @@ net::awaitable<tl::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession(
     }
 
     auto first_bytes = first_payload->Bytes();
-    auto addr_result = DecodeAddress(first_bytes, AddressWireFormat::Socks5, {255, true});
+    auto addr_result = DecodeAddress(
+        first_bytes, AddressWireFormat::Socks5,
+        {.max_domain_len = 255, .require_non_empty_domain = true, .allow_metadata = true});
     if (addr_result.status != AddressDecodeStatus::Complete) {
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }

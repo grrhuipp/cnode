@@ -581,8 +581,8 @@ void VerifyProtocolLocalAssociation() {
     auto previous_view = UserStore::CaptureWorkerView();
     UserOnlineTracker tracker;
     StatsShard stats{};
-    const int configuration = 1;
-    const int other_configuration = 2;
+    const ProtocolSettings configuration{};
+    const ProtocolSettings other_configuration{};
     const udp::endpoint first{net::ip::address_v4::loopback(), 48234};
     const udp::endpoint second{net::ip::address_v4::loopback(), 48235};
     const TargetAddress target("127.0.0.1", 53);
@@ -679,8 +679,8 @@ void VerifyHandoffDirectoryNamespaces() {
     acpp::net::io_context coordinator;
     auto& directory = acpp::net::use_service<UdpHandoffDirectory>(coordinator);
     const auto& policy = acpp::ss::Ss2022UdpAssociation::Policy();
-    auto configuration = std::make_shared<int>(1);
-    auto other_configuration = std::make_shared<int>(1);
+    auto configuration = std::make_shared<const acpp::proxyman::inbound::ProtocolSettings>();
+    auto other_configuration = std::make_shared<const acpp::proxyman::inbound::ProtocolSettings>();
     acpp::InboundDatagramOwner owner;
     std::array<uint8_t, 32> credential{};
     for (size_t i = 0; i < credential.size(); ++i)
@@ -701,8 +701,9 @@ void VerifyHandoffDirectoryNamespaces() {
         Fail("directory claim lost unique ownership or committed replay");
     record->association->claimed.store(false, std::memory_order_release);
 
-    const auto expect_isolated = [&](const UdpHandoffIdentity& identity,
-                                     std::shared_ptr<const void> snapshot) {
+    const auto expect_isolated = [&](
+        const UdpHandoffIdentity& identity,
+        std::shared_ptr<const acpp::proxyman::inbound::ProtocolSettings> snapshot) {
         auto isolated = directory.Claim(identity, snapshot, policy);
         if (!isolated || isolated == record || !isolated->association->Check(7, 1, endpoint, acpp::InboundDatagramCheck::Commit) ||
             directory.Claim(identity, snapshot, policy))
@@ -741,8 +742,8 @@ void VerifyHandoffDirectoryTombstone(acpp::net::io_context& io, Reclaimer& recla
     acpp::net::io_context coordinator;
     auto& directory = acpp::net::use_service<UdpHandoffDirectory>(coordinator);
     const auto& policy = acpp::ss::Ss2022UdpAssociation::Policy();
-    auto configuration = std::make_shared<int>(1);
-    std::weak_ptr<const void> configuration_lifetime = configuration;
+    auto configuration = std::make_shared<const acpp::proxyman::inbound::ProtocolSettings>();
+    std::weak_ptr<const acpp::proxyman::inbound::ProtocolSettings> configuration_lifetime = configuration;
     acpp::InboundDatagramOwner owner;
     constexpr std::array<uint8_t, 32> credential{0x71};
     if (!owner.Assign(credential)) Fail("failed to prepare tombstone credential");
@@ -787,7 +788,7 @@ void VerifyHandoffDirectoryCapacity() {
     acpp::net::io_context coordinator;
     auto& directory = acpp::net::use_service<UdpHandoffDirectory>(coordinator);
     const auto& policy = acpp::ss::Ss2022UdpAssociation::Policy();
-    auto configuration = std::make_shared<int>(1);
+    auto configuration = std::make_shared<const acpp::proxyman::inbound::ProtocolSettings>();
     acpp::InboundDatagramOwner owner;
     constexpr std::array<uint8_t, 32> credential{0x63};
     if (!owner.Assign(credential)) Fail("failed to prepare capacity credential");

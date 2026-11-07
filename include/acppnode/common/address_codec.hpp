@@ -69,12 +69,15 @@ namespace detail {
     return size;
 }
 
-inline size_t WriteAddressMetadataVarint(uint8_t* out, uint64_t value) noexcept {
+[[nodiscard]] inline size_t WriteAddressMetadataVarint(
+    std::span<uint8_t> out, uint64_t value) noexcept {
     size_t pos = 0;
     while (value >= 0x80) {
+        if (pos >= out.size()) return 0;
         out[pos++] = static_cast<uint8_t>((value & 0x7Fu) | 0x80u);
         value >>= 7;
     }
+    if (pos >= out.size()) return 0;
     out[pos++] = static_cast<uint8_t>(value);
     return pos;
 }
@@ -186,7 +189,7 @@ struct NormalizedMetadataView {
     AddressWireFormat format,
     ForwardedMetadataView metadata = {}) noexcept {
     const size_t base_size = detail::BaseAddressEncodedSize(target);
-    if (!output || base_size == 0) return 0;
+    if (!output || base_size < 4) return 0;
     const auto normalized = detail::NormalizeMetadataView(metadata);
     const size_t size = normalized.payload_size == 0
         ? base_size
@@ -212,64 +215,85 @@ struct NormalizedMetadataView {
         if (tag <= out ? out - tag < normalized.inbound_tag.size() : tag - out < size)
             return 0;
     }
+    std::span<uint8_t> out_span(output, size);
     const bool port_first = format == AddressWireFormat::PortFirst;
     const size_t port_pos = port_first ? 0 : base_size - 2;
-    size_t pos = port_first ? 2 : 0;
+    const size_t body_pos = port_first ? 2 : 0;
+    if (base_size > out_span.size() || port_pos + 2 > out_span.size()) return 0;
+    std::span<uint8_t> body = out_span.subspan(body_pos, base_size - 2);
     const uint8_t meta_bit = normalized.payload_size != 0 ? kAddressMetadataFlag : 0;
     if (target.IsDomain()) {
-        output[pos++] = static_cast<uint8_t>(
+        const size_t host_len = target.host.size();
+        if (host_len > 255 || body.size() != 2 + host_len) return 0;
+        body[0] = static_cast<uint8_t>(
             (format == AddressWireFormat::Socks5 ? 3 : 2) | meta_bit);
-        output[pos++] = static_cast<uint8_t>(target.host.size());
-        if (!target.host.empty())
-            std::memcpy(output + pos, target.host.data(), target.host.size());
-    } else if (target.resolved_addr->is_v4()) {
-        output[pos++] = static_cast<uint8_t>(
-            (format == AddressWireFormat::Uot ? 0 : 1) | meta_bit);
+        body[1] = static_cast<uint8_t>(host_len);
+        if (host_len != 0)
+            std::memcpy(body.data() + 2, target.host.data(), host_len);
+    } else if (target.resolved_addr && target.resolved_addr->is_v4()) {
         const auto bytes = target.resolved_addr->to_v4().to_bytes();
-        std::memcpy(output + pos, bytes.data(), bytes.size());
-    } else {
+        if (body.size() != 1 + bytes.size()) return 0;
+        body[0] = static_cast<uint8_t>(
+            (format == AddressWireFormat::Uot ? 0 : 1) | meta_bit);
+        std::memcpy(body.data() + 1, bytes.data(), bytes.size());
+    } else if (target.resolved_addr && target.resolved_addr->is_v6()) {
+        const auto bytes = target.resolved_addr->to_v6().to_bytes();
+        if (body.size() != 1 + bytes.size()) return 0;
         const uint8_t v6_code = format == AddressWireFormat::Socks5 ? 4
             : format == AddressWireFormat::PortFirst ? 3 : 1;
-        output[pos++] = static_cast<uint8_t>(v6_code | meta_bit);
-        const auto bytes = target.resolved_addr->to_v6().to_bytes();
-        std::memcpy(output + pos, bytes.data(), bytes.size());
+        body[0] = static_cast<uint8_t>(v6_code | meta_bit);
+        std::memcpy(body.data() + 1, bytes.data(), bytes.size());
+    } else {
+        return 0;
     }
-    output[port_pos] = static_cast<uint8_t>(target.port >> 8);
-    output[port_pos + 1] = static_cast<uint8_t>(target.port);
+    out_span[port_pos] = static_cast<uint8_t>(target.port >> 8);
+    out_span[port_pos + 1] = static_cast<uint8_t>(target.port);
     if (normalized.payload_size != 0) {
-        size_t meta_pos = base_size;
-        output[meta_pos++] = static_cast<uint8_t>(normalized.payload_size);
-        output[meta_pos++] = normalized.flags;
+        std::span<uint8_t> meta_rem = out_span.subspan(base_size);
+        if (meta_rem.size() < 2) return 0;
+        meta_rem[0] = static_cast<uint8_t>(normalized.payload_size);
+        meta_rem[1] = normalized.flags;
+        meta_rem = meta_rem.subspan(2);
         if ((normalized.flags & kAddressMetaHasUserId) != 0) {
-            meta_pos += detail::WriteAddressMetadataVarint(
-                output + meta_pos, normalized.user_id);
+            const size_t varint_len = detail::WriteAddressMetadataVarint(
+                meta_rem, normalized.user_id);
+            if (varint_len == 0 || varint_len > meta_rem.size()) return 0;
+            meta_rem = meta_rem.subspan(varint_len);
         }
         if ((normalized.flags & kAddressMetaHasUserEmail) != 0) {
-            output[meta_pos++] = static_cast<uint8_t>(normalized.user_email.size());
-            std::memcpy(output + meta_pos,
+            const size_t email_len = normalized.user_email.size();
+            if (meta_rem.size() < 1 + email_len) return 0;
+            meta_rem[0] = static_cast<uint8_t>(email_len);
+            std::memcpy(meta_rem.data() + 1,
                         normalized.user_email.data(),
-                        normalized.user_email.size());
-            meta_pos += normalized.user_email.size();
+                        email_len);
+            meta_rem = meta_rem.subspan(1 + email_len);
         }
         if ((normalized.flags & kAddressMetaHasClientIpv4) != 0) {
             const auto bytes = normalized.client_ip.to_v4().to_bytes();
-            std::memcpy(output + meta_pos, bytes.data(), bytes.size());
-            meta_pos += bytes.size();
+            if (meta_rem.size() < bytes.size()) return 0;
+            std::memcpy(meta_rem.data(), bytes.data(), bytes.size());
+            meta_rem = meta_rem.subspan(bytes.size());
         } else if ((normalized.flags & kAddressMetaHasClientIpv6) != 0) {
             const auto bytes = normalized.client_ip.to_v6().to_bytes();
-            std::memcpy(output + meta_pos, bytes.data(), bytes.size());
-            meta_pos += bytes.size();
+            if (meta_rem.size() < bytes.size()) return 0;
+            std::memcpy(meta_rem.data(), bytes.data(), bytes.size());
+            meta_rem = meta_rem.subspan(bytes.size());
         }
         if ((normalized.flags & kAddressMetaHasInboundTag) != 0) {
-            output[meta_pos++] = static_cast<uint8_t>(normalized.inbound_tag.size());
-            std::memcpy(output + meta_pos,
+            const size_t tag_len = normalized.inbound_tag.size();
+            if (meta_rem.size() < 1 + tag_len) return 0;
+            meta_rem[0] = static_cast<uint8_t>(tag_len);
+            std::memcpy(meta_rem.data() + 1,
                         normalized.inbound_tag.data(),
-                        normalized.inbound_tag.size());
-            meta_pos += normalized.inbound_tag.size();
+                        tag_len);
+            meta_rem = meta_rem.subspan(1 + tag_len);
         }
+        if (!meta_rem.empty()) return 0;
     }
     return size;
 }
+
 [[nodiscard]] inline AddressDecodeResult DecodeAddress(
     std::span<const uint8_t> data, AddressWireFormat format,
     AddressDecodeOptions options = {}) {
@@ -308,6 +332,10 @@ struct NormalizedMetadataView {
     }
     const size_t base_size = body_pos + body_size + (port_first ? 0 : 2);
     size_t total_size = base_size;
+    int64_t meta_user_id = 0;
+    std::string_view meta_email_view{};
+    std::optional<net::ip::address> meta_client_ip{};
+    std::string_view meta_tag_view{};
     if (!has_metadata) {
         result.required = base_size;
         if (data.size() < base_size) return result;
@@ -328,24 +356,7 @@ struct NormalizedMetadataView {
         total_size = base_size + 1 + meta_len;
         result.required = total_size;
         if (data.size() < total_size) return result;
-    }
-    const size_t port_pos = port_first ? 0 : base_size - 2;
-    const uint16_t port = static_cast<uint16_t>(
-        (static_cast<uint16_t>(data[port_pos]) << 8) | data[port_pos + 1]);
-    if (type == v4_type) {
-        net::ip::address_v4::bytes_type bytes{};
-        std::memcpy(bytes.data(), data.data() + body_pos, bytes.size());
-        result.target = TargetAddress(net::ip::make_address_v4(bytes), port);
-    } else if (type == v6_type) {
-        net::ip::address_v6::bytes_type bytes{};
-        std::memcpy(bytes.data(), data.data() + body_pos, bytes.size());
-        result.target = TargetAddress(net::ip::make_address_v6(bytes), port);
-    } else {
-        result.target = TargetAddress(std::string_view(
-            reinterpret_cast<const char*>(data.data() + body_pos), body_size), port);
-    }
-    if (has_metadata) {
-        const uint8_t meta_len = data[base_size];
+
         const std::span<const uint8_t> meta = data.subspan(base_size + 1, meta_len);
         size_t meta_pos = 0;
         const uint8_t flags = meta[meta_pos++];
@@ -356,7 +367,6 @@ struct NormalizedMetadataView {
             result.required = 0;
             return result;
         }
-        ForwardedMetadata forwarded;
         if ((flags & kAddressMetaHasUserId) != 0) {
             uint64_t uid = 0;
             if (!detail::ReadAddressMetadataVarint(meta, meta_pos, uid)) {
@@ -364,7 +374,7 @@ struct NormalizedMetadataView {
                 result.required = 0;
                 return result;
             }
-            forwarded.user_id = static_cast<int64_t>(uid);
+            meta_user_id = static_cast<int64_t>(uid);
         }
         if ((flags & kAddressMetaHasUserEmail) != 0) {
             if (meta_pos >= meta.size()) {
@@ -379,14 +389,13 @@ struct NormalizedMetadataView {
                 result.required = 0;
                 return result;
             }
-            const std::string_view email_view(
+            meta_email_view = std::string_view(
                 reinterpret_cast<const char*>(meta.data() + meta_pos), email_len);
-            if (email_view.find('\0') != std::string_view::npos) {
+            if (meta_email_view.find('\0') != std::string_view::npos) {
                 result.status = AddressDecodeStatus::Invalid;
                 result.required = 0;
                 return result;
             }
-            forwarded.user_email.assign(email_view.data(), email_view.size());
             meta_pos += email_len;
         }
         if ((flags & kAddressMetaHasClientIpv4) != 0) {
@@ -404,7 +413,7 @@ struct NormalizedMetadataView {
                 result.required = 0;
                 return result;
             }
-            forwarded.client_ip = addr;
+            meta_client_ip = addr;
         } else if ((flags & kAddressMetaHasClientIpv6) != 0) {
             if (meta.size() - meta_pos < 16) {
                 result.status = AddressDecodeStatus::Invalid;
@@ -420,7 +429,7 @@ struct NormalizedMetadataView {
                 result.required = 0;
                 return result;
             }
-            forwarded.client_ip = addr;
+            meta_client_ip = addr;
         }
         if ((flags & kAddressMetaHasInboundTag) != 0) {
             if (meta_pos >= meta.size()) {
@@ -435,22 +444,52 @@ struct NormalizedMetadataView {
                 result.required = 0;
                 return result;
             }
-            const std::string_view tag_view(
+            meta_tag_view = std::string_view(
                 reinterpret_cast<const char*>(meta.data() + meta_pos), tag_len);
-            if (tag_view.find('\0') != std::string_view::npos) {
+            if (meta_tag_view.find('\0') != std::string_view::npos) {
                 result.status = AddressDecodeStatus::Invalid;
                 result.required = 0;
                 return result;
             }
-            forwarded.inbound_tag.assign(tag_view.data(), tag_view.size());
             meta_pos += tag_len;
         }
-        if (meta_pos != meta.size() || forwarded.Empty()) {
+        const ForwardedMetadataView validated_view{
+            .user_id = meta_user_id,
+            .user_email = meta_email_view,
+            .client_ip = meta_client_ip,
+            .inbound_tag = meta_tag_view,
+        };
+        if (meta_pos != meta.size() || validated_view.Empty()) {
             result.status = AddressDecodeStatus::Invalid;
             result.required = 0;
             return result;
         }
-        result.forwarded = std::move(forwarded);
+    }
+    const size_t port_pos = port_first ? 0 : base_size - 2;
+    const uint16_t port = static_cast<uint16_t>(
+        (static_cast<uint16_t>(data[port_pos]) << 8) | data[port_pos + 1]);
+    if (type == v4_type) {
+        net::ip::address_v4::bytes_type bytes{};
+        std::memcpy(bytes.data(), data.data() + body_pos, bytes.size());
+        result.target = TargetAddress(net::ip::make_address_v4(bytes), port);
+    } else if (type == v6_type) {
+        net::ip::address_v6::bytes_type bytes{};
+        std::memcpy(bytes.data(), data.data() + body_pos, bytes.size());
+        result.target = TargetAddress(net::ip::make_address_v6(bytes), port);
+    } else {
+        result.target = TargetAddress(std::string_view(
+            reinterpret_cast<const char*>(data.data() + body_pos), body_size), port);
+    }
+    if (has_metadata) {
+        auto& forwarded = result.forwarded.emplace();
+        forwarded.user_id = meta_user_id;
+        if (!meta_email_view.empty()) {
+            forwarded.user_email.assign(meta_email_view.data(), meta_email_view.size());
+        }
+        forwarded.client_ip = meta_client_ip;
+        if (!meta_tag_view.empty()) {
+            forwarded.inbound_tag.assign(meta_tag_view.data(), meta_tag_view.size());
+        }
     }
     result.status = AddressDecodeStatus::Complete;
     result.consumed = total_size;
@@ -467,35 +506,59 @@ template <typename Reader>
     size_t offset = 0, AddressDecodeOptions options = {}) {
     std::array<uint8_t, kMaxEncodedAddressSize> bytes{};
     size_t copied = 0;
+    size_t needed = 1;
     for (;;) {
+        const auto front = pending.FrontSpan();
+        if (front.size() > offset && front.size() - offset >= needed) {
+            auto decoded = DecodeAddress(front.subspan(offset), format, options);
+            if (decoded.status == AddressDecodeStatus::Complete) {
+                co_return DecodedAddress{
+                    std::move(decoded.target),
+                    decoded.consumed,
+                    std::move(decoded.forwarded)};
+            }
+            if (decoded.status == AddressDecodeStatus::Invalid) {
+                co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+            }
+            needed = std::min(decoded.required, bytes.size());
+        }
         const size_t total = pending.byte_size();
         const size_t available = total > offset
             ? std::min(total - offset, bytes.size()) : 0;
-        size_t skip = offset + copied;
-        for (const auto* buffer : pending) {
-            if (!buffer || buffer->IsEmpty()) continue;
-            const auto source = buffer->Bytes();
-            if (skip >= source.size()) {
-                skip -= source.size();
-                continue;
+        while (available >= needed) {
+            const size_t target_copy = std::min(available, needed);
+            if (copied < target_copy) {
+                size_t skip = offset + copied;
+                for (const auto* buffer : pending) {
+                    if (!buffer || buffer->IsEmpty()) continue;
+                    const auto source = buffer->Bytes();
+                    if (skip >= source.size()) {
+                        skip -= source.size();
+                        continue;
+                    }
+                    const size_t count = std::min(source.size() - skip, target_copy - copied);
+                    if (count != 0)
+                        std::memcpy(bytes.data() + copied, source.data() + skip, count);
+                    copied += count;
+                    skip = 0;
+                    if (copied == target_copy) break;
+                }
             }
-            const size_t count = std::min(source.size() - skip, available - copied);
-            if (count != 0)
-                std::memcpy(bytes.data() + copied, source.data() + skip, count);
-            copied += count;
-            skip = 0;
-            if (copied == available) break;
-        }
-        auto decoded = DecodeAddress(std::span<const uint8_t>(bytes.data(), copied),
-                                     format, options);
-        if (decoded.status == AddressDecodeStatus::Complete) {
-            co_return DecodedAddress{
-                std::move(decoded.target),
-                decoded.consumed,
-                std::move(decoded.forwarded)};
-        }
-        if (decoded.status == AddressDecodeStatus::Invalid) {
-            co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+            auto decoded = DecodeAddress(
+                std::span<const uint8_t>(bytes.data(), copied), format, options);
+            if (decoded.status == AddressDecodeStatus::Complete) {
+                co_return DecodedAddress{
+                    std::move(decoded.target),
+                    decoded.consumed,
+                    std::move(decoded.forwarded)};
+            }
+            if (decoded.status == AddressDecodeStatus::Invalid) {
+                co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+            }
+            needed = std::min(decoded.required, bytes.size());
+            if (needed <= copied) {
+                co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+            }
         }
         auto next = co_await ReadMultiBufferOrThrowOnCancel(reader);
         if (next.byte_size() == 0) {

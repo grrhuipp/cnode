@@ -212,7 +212,7 @@ struct ForwardedMetadata {
                inbound_tag.empty();
     }
 
-    [[nodiscard]] ForwardedMetadataView View() const noexcept {
+    [[nodiscard]] ForwardedMetadataView View() const& noexcept {
         return ForwardedMetadataView{
             .user_id = user_id,
             .user_email = user_email,
@@ -220,6 +220,7 @@ struct ForwardedMetadata {
             .inbound_tag = inbound_tag,
         };
     }
+    ForwardedMetadataView View() const&& = delete;
 };
 }  // namespace acpp
 

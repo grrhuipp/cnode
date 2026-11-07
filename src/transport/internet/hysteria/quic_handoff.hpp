@@ -50,6 +50,7 @@ struct QuicOwnership {
     std::atomic<ngtcp2_tstamp> expiry{std::numeric_limits<ngtcp2_tstamp>::max()};
     // Worker-local, never read by the directory. Prepare/Cancel drain the
     // publishing task before transferring this state or its socket send gate.
+    std::vector<ConnectionId> published_ids;
     bool publishing = false;
     bool publication_pending = false;
 };
@@ -68,9 +69,19 @@ public:
         auto& entries = spaces_[space];
         for (const auto& cid : ids) {
             auto found = entries.find(cid);
-            if (found != entries.end() && found->second != owner) return false;
+            if (found != entries.end() && found->second != owner) {
+                if (entries.empty()) spaces_.erase(space);
+                return false;
+            }
         }
-        auto [record, inserted] = records_.try_emplace(owner.get());
+        std::unordered_map<QuicOwnership*, std::vector<ConnectionId>>::iterator record;
+        bool inserted = false;
+        try {
+            std::tie(record, inserted) = records_.try_emplace(owner.get());
+        } catch (...) {
+            if (entries.empty()) spaces_.erase(space);
+            throw;
+        }
         auto& previous = record->second;
         try {
             for (const auto& cid : ids) entries.emplace(cid, owner);
@@ -86,6 +97,7 @@ public:
         for (const auto& cid : previous) {
             if (std::find(ids.begin(), ids.end(), cid) == ids.end()) entries.erase(cid);
         }
+        if (entries.empty()) spaces_.erase(space);
         previous.swap(ids);
         return true;
     }

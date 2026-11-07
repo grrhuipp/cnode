@@ -64,11 +64,37 @@ int main() {
         Expect(Has(access, " origin:203.0.113.88|panel/site-a/10/vless/443|1001|alice@origin.example ") &&
                Has(access, " sendThrough:2602:2b5:20:111::abcd"),
                "passthrough origin IP, tag and user identity must appear in access log");
-        ctx.inbound.origin_tag.clear();
-        ctx.inbound.origin_user_id = 0;
-        ctx.inbound.origin_user_email.clear();
-        ctx.inbound.origin_source_addr = acpp::net::ip::address{};
-        ctx.inbound.origin_source_ip.clear();
+        ctx.inbound.ApplyForwardedMetadata(acpp::ForwardedMetadata{
+            .user_email = acpp::memory::ThreadLocalString("bob@origin.example"),
+        });
+        Expect(ctx.inbound.origin_tag.empty() &&
+               ctx.inbound.origin_user_id == 0 &&
+               ctx.inbound.origin_user_email == "bob@origin.example" &&
+               ctx.inbound.origin_source_addr.is_unspecified() &&
+               ctx.inbound.origin_source_ip.empty(),
+               "partial forwarded metadata must replace rather than merge stale origin fields");
+        ctx.inbound.ApplyForwardedMetadata(acpp::ForwardedMetadata{});
+        Expect(!ctx.inbound.HasOriginIdentity() &&
+               ctx.inbound.origin_source_addr.is_unspecified() &&
+               ctx.inbound.origin_source_ip.empty(),
+               "empty forwarded metadata must clear all origin fields");
+
+        ctx.worker_id = 7;
+        ctx.content.speed_limit = 123456;
+        ctx.content.network = acpp::Network::UDP;
+        ctx.content.protocol = "quic";
+        ctx.InitSubstreamFrom(ctx, 53000);
+        Expect(ctx.worker_id == 7 &&
+               ctx.inbound.source_port == 53000 &&
+               ctx.inbound.tag == "panel/hj-anytls/1041/anytls/55911" &&
+               ctx.outbound.tag == "direct" &&
+               ctx.content.speed_limit == 123456 &&
+               ctx.content.network == acpp::Network::TCP &&
+               ctx.content.protocol.empty(),
+               "self-aliased InitSubstreamFrom must preserve parent fields and reset content");
+        ctx.inbound.source_port = 52000;
+        ctx.outbound.target = acpp::TargetAddress("example.com", 443);
+        ctx.outbound.connected_local_addr = acpp::net::ip::make_address("2602:2b5:20:111::abcd");
 
         ctx.inbound.user_email = "714443";
         access = acpp::FormatAccessLog(ctx);

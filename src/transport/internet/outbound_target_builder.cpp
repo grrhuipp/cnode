@@ -19,17 +19,6 @@ namespace acpp {
 
 namespace {
 
-void AppendCandidate(
-    OutboundTransportTarget& target,
-    const OutboundBind& bind,
-    const tcp::endpoint* inbound_local_addr,
-    const net::ip::address& remote_addr,
-    uint16_t port) {
-    OutboundDialCandidate candidate;
-    candidate.endpoint = tcp::endpoint(remote_addr, port);
-    candidate.bind_local = bind.BindAddressFor(inbound_local_addr, remote_addr);
-    target.candidates.push_back(std::move(candidate));
-}
 
 bool AutoPrefersIPv6(const OutboundBind& bind,
                      const tcp::endpoint* inbound_local_addr) noexcept {
@@ -70,8 +59,12 @@ bool AutoPrefersIPv6(const OutboundBind& bind,
 }
 
 net::awaitable<tl::expected<OutboundTransportTarget, ErrorCode>>
-AttachXHttpDownloadTarget(OutboundTransportTarget target,
-                          const OutboundTargetOptions& options) {
+AttachXHttpDownloadTarget(
+    OutboundTransportTarget target,
+    const OutboundTargetOptions& options,
+    const tcp::endpoint* inbound_local_addr,
+    std::optional<OutboundBind::Selection> download_ordered_v4,
+    std::optional<OutboundBind::Selection> download_ordered_v6) {
     if (!options.stream_settings ||
         !options.stream_settings->IsXHttp() ||
         !options.stream_settings->xhttp.download_settings) {
@@ -106,12 +99,11 @@ AttachXHttpDownloadTarget(OutboundTransportTarget target,
             .security = options.security ? options.security->XHttpDownload() : nullptr,
             .timeout = options.timeout,
             .send_through = &download.send_through,
-            .inbound_local_addr = options.inbound_local_addr,
-            .inbound_source_ip = options.inbound_source_ip,
+            .inbound_local_addr = inbound_local_addr,
             .inbound_source_port = options.inbound_source_port,
             .inbound_user_id = options.inbound_user_id,
-            .inbound_user_email = options.inbound_user_email,
-            .inbound_tag = options.inbound_tag,
+            .ordered_bind_v4 = download_ordered_v4,
+            .ordered_bind_v6 = download_ordered_v6,
         });
     if (!download_target) {
         co_return tl::unexpected(download_target.error());
@@ -145,6 +137,12 @@ BuildOutboundTransportTarget(OutboundTargetOptions options) {
         co_return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
     }
 
+    const std::optional<tcp::endpoint> inbound_local = options.inbound_local_addr
+        ? std::optional<tcp::endpoint>(*options.inbound_local_addr)
+        : std::nullopt;
+    const tcp::endpoint* const inbound_local_ptr =
+        inbound_local ? &*inbound_local : nullptr;
+
     const OutboundBind unbound;
     const auto& bind = options.send_through ? *options.send_through : unbound;
     const auto ordered_v4 = bind.GetMode() == OutboundBind::Mode::Ordered
@@ -164,6 +162,33 @@ BuildOutboundTransportTarget(OutboundTargetOptions options) {
                           options.inbound_tag))
         : OutboundBind::Selection{};
 
+    std::optional<OutboundBind::Selection> download_ordered_v4;
+    std::optional<OutboundBind::Selection> download_ordered_v6;
+    if (options.stream_settings->IsXHttp() &&
+        options.stream_settings->xhttp.download_settings) {
+        const auto& download_bind =
+            options.stream_settings->xhttp.download_settings->send_through;
+        if (download_bind.GetMode() == OutboundBind::Mode::Ordered) {
+            download_ordered_v4 = download_bind.Select(
+                net::ip::address_v4::any(),
+                options.inbound_source_ip,
+                options.inbound_user_id,
+                options.inbound_user_email,
+                options.inbound_tag);
+            download_ordered_v6 = download_bind.Select(
+                net::ip::address_v6::any(),
+                options.inbound_source_ip,
+                options.inbound_user_id,
+                options.inbound_user_email,
+                options.inbound_tag);
+        }
+    }
+
+    options.inbound_local_addr = nullptr;
+    options.inbound_source_ip = {};
+    options.inbound_user_email = {};
+    options.inbound_tag = {};
+
     OutboundTransportTarget target;
     target.timeout = options.timeout;
     target.stream_settings = options.stream_settings;
@@ -173,25 +198,39 @@ BuildOutboundTransportTarget(OutboundTargetOptions options) {
     target.ws_host = BuildHttpHostHeader(
         *options.stream_settings, options.address, options.port);
 
-    auto append_single = [&](const net::ip::address& remote_addr) {
+    auto make_candidate = [&](const net::ip::address& raw_remote_addr) {
+        const net::ip::address remote_addr = iputil::NormalizeAddress(raw_remote_addr);
         OutboundDialCandidate candidate;
         candidate.endpoint = tcp::endpoint(remote_addr, options.port);
         if (bind.GetMode() == OutboundBind::Mode::Ordered) {
             const auto& selected = remote_addr.is_v6() ? ordered_v6 : ordered_v4;
             candidate.bind_local = selected.address;
         } else {
-            candidate.bind_local = bind.BindAddressFor(options.inbound_local_addr, remote_addr);
+            candidate.bind_local = bind.BindAddressFor(inbound_local_ptr, remote_addr);
         }
-        target.single_candidate = std::move(candidate);
+        return candidate;
+    };
+    auto append_single = [&](const net::ip::address& raw_remote_addr) {
+        target.single_candidate = make_candidate(raw_remote_addr);
     };
 
     if (options.literal_address) {
         append_single(*options.literal_address);
-        co_return co_await AttachXHttpDownloadTarget(std::move(target), options);
+        co_return co_await AttachXHttpDownloadTarget(
+            std::move(target),
+            options,
+            inbound_local_ptr,
+            download_ordered_v4,
+            download_ordered_v6);
     }
     if (auto literal = iputil::ParseLiteral(options.address)) {
         append_single(*literal);
-        co_return co_await AttachXHttpDownloadTarget(std::move(target), options);
+        co_return co_await AttachXHttpDownloadTarget(
+            std::move(target),
+            options,
+            inbound_local_ptr,
+            download_ordered_v4,
+            download_ordered_v6);
     }
     if (!options.dns_service) {
         co_return tl::unexpected(ErrorCode::DNS_RESOLVE_FAILED);
@@ -201,88 +240,80 @@ BuildOutboundTransportTarget(OutboundTargetOptions options) {
     if (!dns_result.Ok() || dns_result.addresses.empty()) {
         co_return tl::unexpected(ErrorCode::DNS_RESOLVE_FAILED);
     }
+    const size_t max_candidates = dns_result.addresses.size();
+    auto add_candidate = [&](const net::ip::address& addr) {
+        OutboundDialCandidate candidate = make_candidate(addr);
+        if (!target.single_candidate && target.candidates.empty()) {
+            target.single_candidate = std::move(candidate);
+            return;
+        }
+        if (target.single_candidate) {
+            target.candidates.reserve(max_candidates);
+            target.candidates.push_back(std::move(*target.single_candidate));
+            target.single_candidate.reset();
+        }
+        target.candidates.push_back(std::move(candidate));
+    };
     auto finalize_candidates = [&]()
         -> net::awaitable<tl::expected<OutboundTransportTarget, ErrorCode>> {
         if (target.candidates.empty() && !target.single_candidate) {
             co_return tl::unexpected(ErrorCode::DNS_RESOLVE_FAILED);
         }
-        if (target.candidates.size() == 1) {
-            target.single_candidate = std::move(target.candidates.front());
-            target.candidates.clear();
-        }
-        co_return co_await AttachXHttpDownloadTarget(std::move(target), options);
+        co_return co_await AttachXHttpDownloadTarget(
+            std::move(target),
+            options,
+            inbound_local_ptr,
+            download_ordered_v4,
+            download_ordered_v6);
     };
 
     if (bind.GetMode() == OutboundBind::Mode::Ordered) {
-        target.candidates.reserve(dns_result.addresses.size());
         for (const bool ipv6 : {bind.PrefersIPv6(), !bind.PrefersIPv6()}) {
-            const auto& selected = ipv6 ? ordered_v6 : ordered_v4;
-            for (const auto& addr : dns_result.addresses) {
+            for (const auto& raw_addr : dns_result.addresses) {
+                const auto addr = iputil::NormalizeAddress(raw_addr);
                 if (addr.is_v6() != ipv6) continue;
-                target.candidates.push_back(OutboundDialCandidate{
-                    .endpoint = tcp::endpoint(addr, options.port),
-                    .bind_local = selected.address,
-                });
+                add_candidate(addr);
             }
         }
         co_return co_await finalize_candidates();
     }
 
     if (bind.GetMode() == OutboundBind::Mode::Explicit) {
-        const bool want_v6 = bind.ExplicitAddress() && bind.ExplicitAddress()->is_v6();
-        target.candidates.reserve(dns_result.addresses.size());
-        for (const auto& addr : dns_result.addresses) {
+        const bool want_v6 = bind.ExplicitAddress() &&
+            iputil::NormalizeAddress(*bind.ExplicitAddress()).is_v6();
+        for (const auto& raw_addr : dns_result.addresses) {
+            const auto addr = iputil::NormalizeAddress(raw_addr);
             if (addr.is_v6() == want_v6) {
-                AppendCandidate(target, bind, options.inbound_local_addr, addr, options.port);
+                add_candidate(addr);
             }
         }
         co_return co_await finalize_candidates();
     }
 
-    if (AutoPrefersIPv6(bind, options.inbound_local_addr)) {
-        target.candidates.reserve(dns_result.addresses.size());
+    if (AutoPrefersIPv6(bind, inbound_local_ptr)) {
         for (const bool ipv6 : {true, false}) {
-            for (const auto& addr : dns_result.addresses) {
+            for (const auto& raw_addr : dns_result.addresses) {
+                const auto addr = iputil::NormalizeAddress(raw_addr);
                 if (addr.is_v6() == ipv6) {
-                    AppendCandidate(target, bind, options.inbound_local_addr, addr, options.port);
+                    add_candidate(addr);
                 }
             }
         }
         co_return co_await finalize_candidates();
     }
 
-    const bool has_v4 = std::ranges::any_of(
-        dns_result.addresses,
-        [](const net::ip::address& addr) { return addr.is_v4(); });
-
-    if (has_v4) {
-        size_t v4_count = 0;
-        const net::ip::address* first_v4 = nullptr;
-        for (const auto& addr : dns_result.addresses) {
-            if (!addr.is_v4()) {
-                continue;
-            }
-            ++v4_count;
-            if (!first_v4) {
-                first_v4 = &addr;
-            }
+    for (const auto& raw_addr : dns_result.addresses) {
+        const auto addr = iputil::NormalizeAddress(raw_addr);
+        if (addr.is_v4()) {
+            add_candidate(addr);
         }
-        if (v4_count == 1) {
-            append_single(*first_v4);
-            co_return co_await AttachXHttpDownloadTarget(std::move(target), options);
-        }
-        target.candidates.reserve(v4_count);
-        for (const auto& addr : dns_result.addresses) {
-            if (addr.is_v4()) {
-                AppendCandidate(target, bind, options.inbound_local_addr, addr, options.port);
-            }
-        }
-        co_return co_await AttachXHttpDownloadTarget(std::move(target), options);
+    }
+    if (target.single_candidate || !target.candidates.empty()) {
+        co_return co_await finalize_candidates();
     }
 
-    target.candidates.reserve(dns_result.addresses.size());
-    for (const auto& addr : dns_result.addresses) {
-        AppendCandidate(target, bind, options.inbound_local_addr, addr, options.port);
+    for (const auto& raw_addr : dns_result.addresses) {
+        add_candidate(iputil::NormalizeAddress(raw_addr));
     }
     co_return co_await finalize_candidates();
 }
@@ -364,7 +395,8 @@ OutboundDialer::Dial(session::Context& ctx,
     const auto ordered = SelectOrderedBind(ctx);
     const tcp::endpoint* inbound_local =
         ctx.inbound.local_endpoint ? &*ctx.inbound.local_endpoint : nullptr;
-    auto candidate_for = [&](const net::ip::address& remote) {
+    auto candidate_for = [&](const net::ip::address& raw_remote) {
+        const net::ip::address remote = iputil::NormalizeAddress(raw_remote);
         return OutboundDialCandidate{
             .endpoint = tcp::endpoint(remote, port),
             .bind_local = ordered
@@ -407,14 +439,20 @@ tl::expected<net::ip::address, ErrorCode> OutboundDialer::SelectDatagramBind(
     const session::Context& ctx, const DatagramRemote& remote) const {
     const auto& bind = sender_.send_through;
     if (bind.GetMode() == OutboundBind::Mode::Explicit) {
-        return *bind.ExplicitAddress();
+        return iputil::NormalizeAddress(*bind.ExplicitAddress());
     }
+    const std::optional<net::ip::address> remote_addr = remote.address
+        ? std::optional<net::ip::address>(iputil::NormalizeAddress(*remote.address))
+        : std::nullopt;
+    const std::optional<net::ip::address> family_hint = remote.family_hint
+        ? std::optional<net::ip::address>(iputil::NormalizeAddress(*remote.family_hint))
+        : std::nullopt;
     // Same-in-same-out: reuse the inbound local address when it can source
     // the association (OutboundBind owns the family/scope rules).
     if (bind.GetMode() == OutboundBind::Mode::Auto && ctx.inbound.local_endpoint) {
         const auto* local = &*ctx.inbound.local_endpoint;
-        if (remote.address) {
-            if (auto bound = bind.BindAddressFor(local, *remote.address)) return *bound;
+        if (remote_addr) {
+            if (auto bound = bind.BindAddressFor(local, *remote_addr)) return *bound;
         } else {
             const auto local_ip = iputil::NormalizeAddress(local->address());
             if (local_ip.is_v6() ? remote.accepts_v6 : remote.accepts_v4) {
@@ -422,10 +460,10 @@ tl::expected<net::ip::address, ErrorCode> OutboundDialer::SelectDatagramBind(
             }
         }
     }
-    const bool v6 = remote.address ? remote.address->is_v6()
+    const bool v6 = remote_addr ? remote_addr->is_v6()
         : (remote.prefers_v6 && remote.accepts_v6) ? true
         : !remote.accepts_v6 ? false
-        : remote.family_hint ? remote.family_hint->is_v6()
+        : family_hint ? family_hint->is_v6()
         : bind.PrefersIPv6();
     const net::ip::address any = v6
         ? net::ip::address(net::ip::address_v6::any())
@@ -436,10 +474,10 @@ tl::expected<net::ip::address, ErrorCode> OutboundDialer::SelectDatagramBind(
     const auto user_id = ctx.inbound.EffectiveUserId();
     const auto user_email = ctx.inbound.EffectiveUserEmail();
     const auto inbound_tag = ctx.inbound.EffectiveInboundTag();
-    auto selected = bind.Select(remote.address.value_or(any),
+    auto selected = bind.Select(remote_addr.value_or(any),
                                 client_ip, user_id, user_email, inbound_tag);
     // A hostname may still be reached over the other accepted family.
-    if (!selected.address && !remote.address && (v6 ? remote.accepts_v4 : remote.accepts_v6)) {
+    if (!selected.address && !remote_addr && (v6 ? remote.accepts_v4 : remote.accepts_v6)) {
         const net::ip::address other = v6
             ? net::ip::address(net::ip::address_v4::any())
             : net::ip::address(net::ip::address_v6::any());

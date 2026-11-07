@@ -20,10 +20,14 @@ constexpr size_t kMaxFramePrefixBytes = 2 + kMaxFrameMetadataBytes + 2;
 [[nodiscard]] bool ParsePortThenAddress(
     ByteReader& reader,
     TargetAddress& target,
-    std::optional<ForwardedMetadata>& forwarded) {
+    std::optional<ForwardedMetadata>& forwarded,
+    bool allow_metadata) {
     auto view = reader;
+    AddressDecodeOptions options;
+    options.allow_metadata = allow_metadata;
     auto decoded = DecodeAddress(view.ReadBytes(view.Remaining()),
-                                 AddressWireFormat::PortFirst);
+                                 AddressWireFormat::PortFirst,
+                                 options);
     if (decoded.status != AddressDecodeStatus::Complete ||
         !reader.Skip(decoded.consumed)) return false;
     target = std::move(decoded.target);
@@ -66,7 +70,8 @@ constexpr size_t kMaxFramePrefixBytes = 2 + kMaxFrameMetadataBytes + 2;
         }
         out.network = static_cast<NetworkType>(network_raw);
         out.has_target = true;
-        if (!ParsePortThenAddress(meta, out.target, out.forwarded)) {
+        const bool allow_metadata = out.status == SessionStatus::NEW;
+        if (!ParsePortThenAddress(meta, out.target, out.forwarded, allow_metadata)) {
             return false;
         }
 
@@ -82,7 +87,7 @@ constexpr size_t kMaxFramePrefixBytes = 2 + kMaxFrameMetadataBytes + 2;
     return meta.Ok() && meta.Remaining() == 0;
 }
 
-// prefix 必须是帧首 min(total_len, kMaxFramePrefixBytes) 字节。
+// prefix 必须是帧首至少 min(total_len, size_t{2} + meta_len + 2) 字节。
 [[nodiscard]] std::optional<FrameHeader> DecodeFramePrefix(
     std::span<const uint8_t> prefix,
     size_t total_len) {
@@ -129,12 +134,32 @@ constexpr size_t kMaxFramePrefixBytes = 2 + kMaxFrameMetadataBytes + 2;
 
 std::optional<FrameHeader> DecodeFrame(const buf::MultiBuffer& data) {
     const size_t total_len = data.byte_size();
+    if (total_len < 2) {
+        return std::nullopt;
+    }
     const auto front = data.FrontSpan();
-    if (front.size() >= std::min(total_len, kMaxFramePrefixBytes)) {
+    uint16_t meta_len = 0;
+    if (front.size() >= 2) {
+        meta_len = static_cast<uint16_t>(
+            (static_cast<uint16_t>(front[0]) << 8) | front[1]);
+    } else {
+        std::array<uint8_t, 2> len_bytes{};
+        if (data.CopyPrefixTo(len_bytes) < 2) {
+            return std::nullopt;
+        }
+        meta_len = static_cast<uint16_t>(
+            (static_cast<uint16_t>(len_bytes[0]) << 8) | len_bytes[1]);
+    }
+    if (meta_len < 4 || meta_len > kMaxFrameMetadataBytes) {
+        return FrameHeader{};
+    }
+    const size_t needed_prefix = std::min(total_len, size_t{2} + meta_len + 2);
+    if (front.size() >= needed_prefix) {
         return DecodeFramePrefix(front, total_len);
     }
-    std::array<uint8_t, kMaxFramePrefixBytes> prefix;
-    const size_t copied = data.CopyPrefixTo(prefix);
+    std::array<uint8_t, kMaxFramePrefixBytes> prefix{};
+    const size_t copied = data.CopyPrefixTo(
+        std::span<uint8_t>(prefix.data(), needed_prefix));
     return DecodeFramePrefix(std::span<const uint8_t>(prefix.data(), copied), total_len);
 }
 

@@ -143,7 +143,6 @@ ReadAndDecryptStreamPayload(
     }
 
     buf::MultiBuffer decoded;
-    decoded.reserve((payload_len + buf::Buffer::kSize - 1) / buf::Buffer::kSize);
 
     if (payload_len > 0) {
         buf::BufferGuard cipher_buf{buf::Buffer::New()};

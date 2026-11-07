@@ -80,6 +80,7 @@ public:
 
     void BindDomain(const std::shared_ptr<ExecutionDomain>& domain);
     [[nodiscard]] std::shared_ptr<ExecutionDomain> Domain() const noexcept;
+    [[nodiscard]] memory::AllocationDomain& Allocation() noexcept { return allocation_; }
     [[nodiscard]] const proxyman::inbound::ReceiverSettings& Receiver() const noexcept { return *receiver_; }
     [[nodiscard]] bool Initialized() const noexcept { return initialized_; }
     [[nodiscard]] bool IsJoined() const noexcept { return joined_; }

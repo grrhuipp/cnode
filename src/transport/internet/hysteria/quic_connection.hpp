@@ -47,9 +47,10 @@ public:
         const udp::endpoint& remote, const ngtcp2_pkt_hd& header);
 
     ~Connection() noexcept {
-        memory::ScopedAllocationDomain scope(allocation_);
+        memory::ScopedAllocationDomain scope(capabilities_->Allocation());
         Close();
-        fragments_.clear();
+        fragments_ = {};
+        connection_ids_ = {};
         core_.reset();
     }
 
@@ -65,7 +66,6 @@ public:
     }
     [[nodiscard]] bool Closed() const noexcept { return closed_; }
     void Close() noexcept;
-    void FailPublication() noexcept;
     [[nodiscard]] const std::shared_ptr<QuicOwnership>& Ownership() const noexcept { return ownership_; }
     [[nodiscard]] net::any_io_executor Executor() const { return ownership_->domain->Executor(); }
     [[nodiscard]] net::io_context& Reactor() const noexcept { return ownership_->domain->Reactor(); }
@@ -94,10 +94,10 @@ public:
 private:
     friend class QuicListener;
     struct H3Request {
-        std::string method;
-        std::string path;
-        std::string authority;
-        std::string auth;
+        memory::ThreadLocalString method;
+        memory::ThreadLocalString path;
+        memory::ThreadLocalString authority;
+        memory::ThreadLocalString auth;
     };
     struct StreamRecord {
         explicit StreamRecord(std::shared_ptr<QuicStreamState> state_value)
@@ -134,14 +134,14 @@ private:
         ngtcp2_cid server_cid{};
         memory::ThreadLocalUnorderedMap<int64_t, StreamRecord> streams;
         memory::ThreadLocalUnorderedMap<int64_t, H3Request> h3_requests;
-        memory::ThreadLocalDeque<std::vector<uint8_t>> datagrams;
+        memory::ThreadLocalDeque<memory::ByteVector> datagrams;
         // Registered sessions; each unregisters itself on destruction and is
         // detached here first when the connection closes.
         memory::ThreadLocalUnorderedMap<uint32_t, UdpSessionStream*> udp_sessions;
     };
     struct PendingFragments {
         TargetAddress target;
-        memory::ThreadLocalVector<std::vector<uint8_t>> payloads;
+        memory::ThreadLocalVector<memory::ByteVector> payloads;
         uint8_t count = 0;
         uint8_t received = 0;
         size_t bytes = 0;
@@ -192,16 +192,12 @@ private:
     static int AckStreamData(ngtcp2_conn*, int64_t stream_id, uint64_t offset,
         uint64_t length, void* user_data, void*);
     static int OpenStream(ngtcp2_conn*, int64_t stream_id, void* user_data);
-    static int CloseStream(ngtcp2_conn* conn, uint32_t, int64_t stream_id,
+    static int CloseStream(ngtcp2_conn* conn, uint32_t flags, int64_t stream_id,
         uint64_t, void* user_data, void*);
-    static int ResetStream(ngtcp2_conn*, int64_t stream_id, uint64_t,
-        uint64_t, void* user_data, void*) {
-        return CloseStream(nullptr, 0, stream_id, 0, user_data, nullptr);
-    }
-    static int StopSending(ngtcp2_conn*, int64_t stream_id, uint64_t,
-        void* user_data, void*) {
-        return CloseStream(nullptr, 0, stream_id, 0, user_data, nullptr);
-    }
+    static int ResetStream(ngtcp2_conn* conn, int64_t stream_id, uint64_t,
+        uint64_t, void* user_data, void*);
+    static int StopSending(ngtcp2_conn* conn, int64_t stream_id, uint64_t,
+        void* user_data, void*);
     static void Random(uint8_t* data, size_t length, const ngtcp2_rand_ctx*);
     static int NewConnectionId(ngtcp2_conn*, ngtcp2_cid* cid, uint8_t* token,
         size_t length, void* user_data);
@@ -252,7 +248,6 @@ private:
     bool validation_authenticated_ = false;
     bool validation_pending_ = false;
     bool resource_registered_ = false;
-    memory::AllocationDomain allocation_;
     std::unique_ptr<Core> core_;
     session::Context base_context_;
     SignalChannel physical_ready_;

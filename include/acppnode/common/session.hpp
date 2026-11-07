@@ -25,10 +25,11 @@ struct Context;
 using ID = uint64_t;
 
 [[nodiscard]] inline std::pmr::memory_resource* SessionPoolResource() noexcept {
-    auto* resource = std::pmr::get_default_resource();
+    static memory::ThreadMemoryResource fallback_resource;
+    auto* resource = memory::CurrentResource();
     return resource != std::pmr::new_delete_resource()
         ? resource
-        : memory::ThreadMemoryPool().resource();
+        : &fallback_resource;
 }
 
 // 高 32 位为 worker_id，低 32 位为 Worker 线程本地序号，避免全局原子计数器的跨线程争用。
@@ -78,47 +79,60 @@ struct Inbound {
     void ApplyForwardedMetadata(const ForwardedMetadata& metadata) {
         if (!metadata.inbound_tag.empty()) {
             origin_tag.assign(metadata.inbound_tag.data(), metadata.inbound_tag.size());
+        } else {
+            origin_tag.clear();
         }
-        if (metadata.user_id > 0) {
-            origin_user_id = metadata.user_id;
-        }
+        origin_user_id = metadata.user_id > 0 ? metadata.user_id : 0;
         if (!metadata.user_email.empty()) {
             origin_user_email.assign(metadata.user_email.data(), metadata.user_email.size());
+        } else {
+            origin_user_email.clear();
         }
-        if (metadata.client_ip && !metadata.client_ip->is_unspecified()) {
-            origin_source_addr = iputil::NormalizeAddress(*metadata.client_ip);
-            const auto text = iputil::AddressText(origin_source_addr);
-            origin_source_ip.assign(text.View());
+        if (metadata.client_ip) {
+            const auto normalized = iputil::NormalizeAddress(*metadata.client_ip);
+            if (!normalized.is_unspecified()) {
+                origin_source_addr = normalized;
+                const auto text = iputil::AddressText(origin_source_addr);
+                origin_source_ip.assign(text.View());
+                return;
+            }
         }
+        origin_source_addr = net::ip::address{};
+        origin_source_ip.clear();
     }
 
     [[nodiscard]] bool HasOriginIdentity() const noexcept {
         return origin_user_id > 0 || !origin_user_email.empty() || !origin_tag.empty();
     }
 
-    [[nodiscard]] std::string_view EffectiveInboundTag() const noexcept {
+    [[nodiscard]] std::string_view EffectiveInboundTag() const& noexcept {
         return !origin_tag.empty() ? std::string_view(origin_tag)
                                    : std::string_view(tag);
     }
+    std::string_view EffectiveInboundTag() const&& = delete;
+
     [[nodiscard]] int64_t EffectiveUserId() const noexcept {
         return HasOriginIdentity() ? origin_user_id : user_id;
     }
 
-    [[nodiscard]] std::string_view EffectiveUserEmail() const noexcept {
+    [[nodiscard]] std::string_view EffectiveUserEmail() const& noexcept {
         return HasOriginIdentity() ? std::string_view(origin_user_email)
                                    : std::string_view(user_email);
     }
+    std::string_view EffectiveUserEmail() const&& = delete;
 
-    [[nodiscard]] const net::ip::address& EffectiveClientAddress() const noexcept {
+    [[nodiscard]] const net::ip::address& EffectiveClientAddress() const& noexcept {
         return !origin_source_addr.is_unspecified() ? origin_source_addr : source_addr;
     }
+    const net::ip::address& EffectiveClientAddress() const&& = delete;
 
-    [[nodiscard]] std::string_view EffectiveClientIp() const noexcept {
+    [[nodiscard]] std::string_view EffectiveClientIp() const& noexcept {
         return !origin_source_ip.empty() ? std::string_view(origin_source_ip)
                                          : std::string_view(source_ip);
     }
+    std::string_view EffectiveClientIp() const&& = delete;
 
-    [[nodiscard]] ForwardedMetadataView MakeForwardedMetadata() const noexcept {
+    [[nodiscard]] ForwardedMetadataView MakeForwardedMetadata() const& noexcept {
         std::optional<net::ip::address> client_ip;
         const auto& addr = EffectiveClientAddress();
         if (!addr.is_unspecified()) {
@@ -136,6 +150,7 @@ struct Inbound {
             .inbound_tag = EffectiveInboundTag(),
         };
     }
+    ForwardedMetadataView MakeForwardedMetadata() const&& = delete;
 };
 
 // xray-core common/session.Outbound 对应的出站目标/路由元数据。

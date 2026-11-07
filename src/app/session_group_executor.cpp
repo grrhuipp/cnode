@@ -452,8 +452,17 @@ net::awaitable<bool> ExecutionDomain::MergeGroups(
     } gate{coordinator.merge_gate_};
     auto a = first->state_->group;
     auto b = second->state_->group;
+    const auto has_attached_member = [](const std::shared_ptr<Group>& group) {
+        for (const auto& entry : group->members) {
+            if (auto member = entry.domain.lock();
+                member && !member->state_->attached_to.expired())
+                return true;
+        }
+        return false;
+    };
     if (exclusive) {
-        if (a == b || !second->state_->attached_to.expired() ||
+        if (a == b || !first->state_->attached_to.expired() ||
+            !second->state_->attached_to.expired() || has_attached_member(b) ||
             b->members.size() != 1 || b->permanently_shared)
             throw std::logic_error("physical domain is not exclusively detachable");
         // Pool reuse is not a passive handoff trigger. This gate also excludes
@@ -462,7 +471,8 @@ net::awaitable<bool> ExecutionDomain::MergeGroups(
             second->state_->route.load(std::memory_order_acquire))
             co_return false;
     } else {
-        if (!first->state_->attached_to.expired() || !second->state_->attached_to.expired())
+        if (!first->state_->attached_to.expired() || !second->state_->attached_to.expired() ||
+            has_attached_member(a) || has_attached_member(b))
             throw std::logic_error("permanent join cannot consume an exclusive physical lease");
         if (a == b) co_return true;
     }
@@ -587,6 +597,7 @@ struct ExecutionDomain::NativeExecutor {
 
 struct ExecutionDomain::Handoff::Transaction {
     std::shared_ptr<ExecutionDomain> origin;
+    std::shared_ptr<GroupCoordinator> coordinator;
     std::shared_ptr<Group> group;
     std::vector<std::shared_ptr<ExecutionDomain>> members;
     struct Prepared { ExecutionDomain* domain; NativeResource* resource; };
@@ -596,7 +607,8 @@ struct ExecutionDomain::Handoff::Transaction {
     bool complete = false;
     bool busy = false;
     explicit Transaction(std::shared_ptr<ExecutionDomain> domain, WorkerRoute* destination)
-        : origin(std::move(domain)), group(origin->state_->group),
+        : origin(std::move(domain)), coordinator(origin->state_->coordinator),
+          group(origin->state_->group),
           old_route(origin->state_->route.load(std::memory_order_acquire)), target(destination) {
         for (const auto& entry : group->members)
             if (auto member = entry.domain.lock()) members.push_back(std::move(member));
@@ -669,15 +681,20 @@ struct ExecutionDomain::Handoff::Transaction {
         co_return;
     }
     void Finish() noexcept {
+        auto& coord = *coordinator;
         complete = true;
+        prepared.clear();
+        members.clear();
+        origin.reset();
         Thaw(group);
-        (void)origin->Coordinator().merge_gate_.try_send(IoErrorCode{});
+        (void)coord.merge_gate_.try_send(IoErrorCode{});
     }
     net::awaitable<void> Resolve(bool commit) {
         co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
         if (complete) co_return;
         if (busy) throw std::logic_error("handoff operation already in progress");
         busy = true;
+        const size_t domain_count = members.size();
         std::exception_ptr failure;
         try {
             if (commit) {
@@ -692,7 +709,10 @@ struct ExecutionDomain::Handoff::Transaction {
             // Failure to initiate the target dispatch precedes all commits.
             // Keep the initiating error; rollback failures are separately
             // delivered to the session hooks by CancelResources.
-            try { co_await CancelResources(); } catch (...) {}
+            try {
+                co_await net::co_spawn(
+                    old_route->target.executor, CancelResources(), net::use_awaitable);
+            } catch (...) {}
         }
         Finish();
         busy = false;
@@ -700,7 +720,7 @@ struct ExecutionDomain::Handoff::Transaction {
         if (commit) {
             try {
                 LOG_DEBUG("passive session handoff old_owner={} receiving_owner={} domains={}",
-                    old_route->target.worker_id, target->target.worker_id, members.size());
+                    old_route->target.worker_id, target->target.worker_id, domain_count);
             } catch (...) {}
         }
     }
@@ -736,7 +756,8 @@ net::awaitable<void> ExecutionDomain::RebindFrozen(
     auto transaction = std::make_shared<Handoff::Transaction>(std::move(domain), route);
     std::exception_ptr failure;
     try {
-        co_await transaction->PrepareResources();
+        co_await net::co_spawn(transaction->old_route->target.executor,
+            transaction->PrepareResources(), net::use_awaitable);
     } catch (...) { failure = std::current_exception(); }
     if (!failure) {
         try {
@@ -745,8 +766,10 @@ net::awaitable<void> ExecutionDomain::RebindFrozen(
         } catch (...) { failure = std::current_exception(); }
     }
     if (failure) {
-        try { co_await transaction->CancelResources(); }
-        catch (...) {} // OnFailure already contains and reports rollback failure.
+        try {
+            co_await net::co_spawn(transaction->old_route->target.executor,
+                transaction->CancelResources(), net::use_awaitable);
+        } catch (...) {} // OnFailure already contains and reports rollback failure.
         std::rethrow_exception(failure);
     }
 }
@@ -760,19 +783,19 @@ ExecutionDomain::Handoff::~Handoff() {
 net::awaitable<void> ExecutionDomain::Handoff::Validate(std::function<void()> validation) {
     auto transaction = transaction_;
     co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
-    co_await net::co_spawn(transaction->origin->Coordinator().Reactor(),
+    co_await net::co_spawn(transaction->coordinator->Reactor(),
         transaction->Validate(std::move(validation)), net::use_awaitable);
 }
 net::awaitable<void> ExecutionDomain::Handoff::Commit() {
     auto transaction = transaction_;
     co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
-    co_await net::co_spawn(transaction->origin->Coordinator().Reactor(),
+    co_await net::co_spawn(transaction->coordinator->Reactor(),
         transaction->Resolve(true), net::use_awaitable);
 }
 net::awaitable<void> ExecutionDomain::Handoff::Cancel() {
     auto transaction = transaction_;
     co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
-    co_await net::co_spawn(transaction->origin->Coordinator().Reactor(),
+    co_await net::co_spawn(transaction->coordinator->Reactor(),
         transaction->Resolve(false), net::use_awaitable);
 }
 
@@ -797,7 +820,9 @@ net::awaitable<std::shared_ptr<ExecutionDomain::Handoff>> ExecutionDomain::Prepa
     if (failure) {
         if (transaction) {
             try { co_await transaction->Resolve(false); }
-            catch (...) {} // Preserve preparation error; rollback is reported to session hooks.
+            catch (...) {
+                if (!transaction->complete) transaction->Finish();
+            } // Preserve preparation error; rollback is reported to session hooks.
         } else {
             (void)coordinator.merge_gate_.try_send(IoErrorCode{});
         }

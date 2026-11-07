@@ -137,15 +137,18 @@ bool WriteIdentityHeadersTo(const SsCipherInfo& cipher_info,
 
         std::array<uint8_t, 16> user_hash{};
         if (!Hash2022Psk(next.span(), std::span<uint8_t, 16>(user_hash))) {
+            OPENSSL_cleanse(block_key.data(), block_key.size());
             return false;
         }
 
         std::array<uint8_t, 16> encrypted{};
-        if (!AesBlockCrypt(
-                std::span<const uint8_t>(block_key.data(), cipher_info.key_size),
-                std::span<const uint8_t, 16>(user_hash),
-                std::span<uint8_t, 16>(encrypted),
-                true)) {
+        const bool ok = AesBlockCrypt(
+            std::span<const uint8_t>(block_key.data(), cipher_info.key_size),
+            std::span<const uint8_t, 16>(user_hash),
+            std::span<uint8_t, 16>(encrypted),
+            true);
+        OPENSSL_cleanse(block_key.data(), block_key.size());
+        if (!ok) {
             return false;
         }
         if (written + encrypted.size() > cap) {
@@ -179,6 +182,7 @@ WriteTCPRequest2022(const TargetAddress& target,
     if (addr_size == 0) {
         co_return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
+    forwarded = {};
 
     constexpr size_t kPaddingLen = 1;
     const size_t variable_len = addr_size + 2 + kPaddingLen;
@@ -210,11 +214,13 @@ WriteTCPRequest2022(const TargetAddress& target,
     std::memcpy(variable_plain.data(), addr_bytes.data(), addr_size);
     StoreU16BE(variable_plain.data() + addr_size, static_cast<uint16_t>(kPaddingLen));
     if (RAND_bytes(variable_plain.data() + addr_size + 2, static_cast<int>(kPaddingLen)) != 1) {
+        OPENSSL_cleanse(write_subkey.data(), write_subkey.size());
         co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
     }
 
     SsAeadCipher write_cipher(cipher_info.type, write_subkey.data(), cipher_info.key_size,
                               proxy::AeadDirection::Encrypt);
+    OPENSSL_cleanse(write_subkey.data(), write_subkey.size());
     const size_t handshake_size =
         request_salt.size + (psk_chain.size() > 0 ? (psk_chain.size() - 1) * 16 : 0) +
         fixed_plain.size() + SsAeadCipher::kTagSize +
@@ -308,6 +314,7 @@ WriteTCPRequest(const TargetAddress& target,
         if (addr_size == 0 || addr_size > kMaxChunkPayload) {
             co_return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
         }
+        forwarded = {};
 
         std::array<uint8_t, 64> client_salt{};
         if (RAND_bytes(client_salt.data(), static_cast<int>(cipher_info.salt_size)) != 1) {
@@ -323,6 +330,7 @@ WriteTCPRequest(const TargetAddress& target,
 
         buf::BufferGuard out{buf::Buffer::New()};
         if (!out) {
+            OPENSSL_cleanse(write_subkey.data(), write_subkey.size());
             co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
         }
 
@@ -331,6 +339,7 @@ WriteTCPRequest(const TargetAddress& target,
 
         SsAeadCipher write_cipher(cipher_info.type, write_subkey.data(), cipher_info.key_size,
                                   proxy::AeadDirection::Encrypt);
+        OPENSSL_cleanse(write_subkey.data(), write_subkey.size());
         const size_t payload_size = addr_size;
         const uint8_t len_plain[2] = {
             static_cast<uint8_t>(payload_size >> 8),
@@ -406,6 +415,7 @@ ReadTCPResponse(const SsCipherInfo& cipher_info,
 
             SsAeadCipher read_cipher(cipher_info.type, read_subkey.data(), cipher_info.key_size,
                                      proxy::AeadDirection::Decrypt);
+            OPENSSL_cleanse(read_subkey.data(), read_subkey.size());
             const size_t fixed_plain_size = 1 + 8 + cipher_info.salt_size + 2;
             constexpr size_t kFixedPlainMaxSize = 1 + 8 + KeyBytes::kMaxSize + 2;
             constexpr size_t kFixedCipherMaxSize =
@@ -465,6 +475,7 @@ ReadTCPResponse(const SsCipherInfo& cipher_info,
 
         SsAeadCipher read_cipher(cipher_info.type, read_subkey.data(), cipher_info.key_size,
                                  proxy::AeadDirection::Decrypt);
+        OPENSSL_cleanse(read_subkey.data(), read_subkey.size());
         co_return std::make_unique<detail::BodyReader>(
             std::move(read_cipher), 0, stream);
     } catch (const std::bad_alloc&) {

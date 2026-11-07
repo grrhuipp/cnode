@@ -54,6 +54,9 @@ struct OutboundTargetOptions {
 [[nodiscard]] std::string_view ResolveOutboundTlsServerName(
     const StreamSettings& settings,
     std::string_view fallback_server_name);
+std::string_view ResolveOutboundTlsServerName(
+    const StreamSettings&& settings,
+    std::string_view fallback_server_name) = delete;
 
 [[nodiscard]]
 net::awaitable<tl::expected<OutboundTransportTarget, ErrorCode>>
@@ -102,9 +105,13 @@ public:
     [[nodiscard]] bool Passthrough() const noexcept { return sender_.passthrough; }
     [[nodiscard]] ForwardedMetadataView ForwardedMetadata(
         const session::Context& ctx) const noexcept;
+    ForwardedMetadataView ForwardedMetadata(
+        const session::Context&& ctx) const = delete;
     // Empty unless sendThrough is Ordered.
     [[nodiscard]] std::optional<OrderedBind> SelectOrderedBind(
         const session::Context& ctx) const;
+    std::optional<OrderedBind> SelectOrderedBind(
+        const session::Context&& ctx) const = delete;
 
     // Proxy next hop through the Handler's stream settings.
     [[nodiscard]] net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, ErrorCode>>

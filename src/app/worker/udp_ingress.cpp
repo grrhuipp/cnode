@@ -221,6 +221,7 @@ struct UdpIngress::ClientSession::Impl : memory::ThreadAllocated {
     bool source_detached = false;
     bool target_reserved = false;
     std::optional<ClientSessionKey> transfer_key;
+    std::string transfer_socket_key;
     std::chrono::steady_clock::time_point transfer_activity;
     std::chrono::seconds transfer_idle{0};
     net::any_io_executor source_executor;
@@ -486,6 +487,7 @@ net::awaitable<void> UdpIngress::ClientSession::PrepareHandoff(
     state.source_control = true;
     const auto* hook = state.association_hook;
     state.transfer_key = *hook->client_key;
+    state.transfer_socket_key.assign(hook->socket_key);
     state.transfer_idle = hook->idle_timeout;
     auto source_outer = state.owner->impl_->client_sessions.find(hook->socket_key);
     auto source_row = source_outer->second.find(*hook->client_key);
@@ -494,6 +496,7 @@ net::awaitable<void> UdpIngress::ClientSession::PrepareHandoff(
     if (state.close_pending || !state.association_hook)
         throw IoSystemError(net::error::operation_aborted);
     auto reserve_target = [this]() -> net::awaitable<void> {
+        memory::ScopedWorkerAllocation worker_allocation;
         auto& transfer = *impl_;
         auto& destination = *transfer.destination->impl_;
         if (destination.state != UdpIngress::Impl::State::Running ||
@@ -512,17 +515,29 @@ net::awaitable<void> UdpIngress::ClientSession::PrepareHandoff(
         auto [outer, inserted_outer] = FindOrEmplaceStringKey(
             destination.client_sessions, transfer.next_reply->socket_key);
         (void)inserted_outer;
-        auto [row, inserted] = outer->second.try_emplace(*transfer.transfer_key,
-            UdpClientSession{.link = {}, .last_active = transfer.transfer_activity, .reclaim_hook = {}});
-        if (!inserted) throw IoSystemError(net::error::already_started);
-        destination.reclaimer.Register(row->second.reclaim_hook, *transfer.destination,
-            outer->first, row->first, transfer.transfer_idle,
-            UdpAssociationHook::TimePoint::max());
-        transfer.target_reserved = true;
-        auto socket = destination.udp_sockets.find(transfer.next_reply->socket_key);
-        const auto& key = *transfer.transfer_key;
-        socket->second.associations.try_emplace(
-            InboundDatagramAssociationKey{key.owner, *key.session_id, key.configuration}, nullptr);
+        try {
+            auto [row, inserted] = outer->second.try_emplace(*transfer.transfer_key,
+                UdpClientSession{.link = {}, .last_active = transfer.transfer_activity, .reclaim_hook = {}});
+            if (!inserted) throw IoSystemError(net::error::already_started);
+            const auto& key = *transfer.transfer_key;
+            if (key.session_id.has_value()) {
+                auto socket = destination.udp_sockets.find(transfer.next_reply->socket_key);
+                try {
+                    socket->second.associations.try_emplace(
+                        InboundDatagramAssociationKey{key.owner, *key.session_id, key.configuration}, nullptr);
+                } catch (...) {
+                    outer->second.erase(row);
+                    throw;
+                }
+            }
+            destination.reclaimer.Register(row->second.reclaim_hook, *transfer.destination,
+                outer->first, row->first, transfer.transfer_idle,
+                UdpAssociationHook::TimePoint::max());
+            transfer.target_reserved = true;
+        } catch (...) {
+            if (outer->second.empty()) destination.client_sessions.erase(outer);
+            throw;
+        }
         co_return;
     };
     co_await net::co_spawn(target.executor, reserve_target(), net::use_awaitable);
@@ -543,6 +558,7 @@ net::awaitable<void> UdpIngress::ClientSession::PrepareHandoff(
 
 void UdpIngress::ClientSession::CommitHandoff(
     const ExecutionDomain::HandoffTarget& target) noexcept {
+    memory::ScopedWorkerAllocation worker_allocation;
     auto& state = *impl_;
     auto* source = state.owner;
     auto* destination = state.destination;
@@ -566,7 +582,6 @@ void UdpIngress::ClientSession::CommitHandoff(
         state.input_queue[index].reservation = std::move(state.next_payloads[index]);
     state.next_payloads.clear();
     state.budget = &destination->impl_->budget;
-    auto old_socket_key = std::move(state.reply.socket_key);
     state.reply = std::move(*state.next_reply);
     state.next_reply.reset();
     state.source_detached = false;
@@ -578,18 +593,23 @@ void UdpIngress::ClientSession::CommitHandoff(
     state.destination = nullptr;
     state.transferring = false;
     state.source_control = false;
-    net::post(state.source_executor,
-        [source, socket_key = std::move(old_socket_key), key = *state.transfer_key] {
-            auto outer = source->impl_->client_sessions.find(socket_key);
-            if (outer != source->impl_->client_sessions.end()) {
-                auto row = outer->second.find(key);
-                if (row != outer->second.end() && !row->second.link) {
-                    source->impl_->Unlink(row->second);
-                    outer->second.erase(row);
+    try {
+        net::post(state.source_executor,
+            [source, socket_key = std::move(state.transfer_socket_key), key = *state.transfer_key] {
+                auto outer = source->impl_->client_sessions.find(socket_key);
+                if (outer != source->impl_->client_sessions.end()) {
+                    auto row = outer->second.find(key);
+                    if (row != outer->second.end() && !row->second.link) {
+                        source->impl_->Unlink(row->second);
+                        outer->second.erase(row);
+                    }
+                    if (outer->second.empty()) source->impl_->client_sessions.erase(outer);
                 }
-            }
-            source->ReleaseControl();
-        });
+                source->ReleaseControl();
+            });
+    } catch (...) {
+        FailRuntime("udp-handoff", "failed to post source handoff cleanup");
+    }
     if (state.close_pending || !state.association_hook ||
         destination->impl_->state != UdpIngress::Impl::State::Running)
         CloseWithError(state.terminal_error);
@@ -598,9 +618,14 @@ void UdpIngress::ClientSession::CommitHandoff(
 net::awaitable<void> UdpIngress::ClientSession::CancelHandoff(
     const ExecutionDomain::HandoffTarget&) {
     auto& state = *impl_;
-    if (!state.transferring) co_return;
+    if (!state.transferring) {
+        state.destination = nullptr;
+        state.next_reply.reset();
+        co_return;
+    }
     if (state.destination && state.next_reply && state.transfer_key) {
         auto cleanup_target = [this]() -> net::awaitable<void> {
+            memory::ScopedWorkerAllocation worker_allocation;
             auto& transfer = *impl_;
             auto& destination = *transfer.destination->impl_;
             auto outer = destination.client_sessions.find(transfer.next_reply->socket_key);
@@ -610,6 +635,7 @@ net::awaitable<void> UdpIngress::ClientSession::CancelHandoff(
                     destination.Unlink(row->second);
                     outer->second.erase(row);
                 }
+                if (outer->second.empty()) destination.client_sessions.erase(outer);
             }
             transfer.target_reserved = false;
             transfer.next_payloads.clear();
@@ -620,6 +646,8 @@ net::awaitable<void> UdpIngress::ClientSession::CancelHandoff(
         co_await net::co_spawn(state.destination->impl_->completion_signal.get_executor(),
                               cleanup_target(), net::use_awaitable);
     }
+    state.next_reply.reset();
+    state.transfer_socket_key.clear();
     if (state.source_detached) {
         auto outer = state.owner->impl_->client_sessions.find(state.reply.socket_key);
         if (state.owner->impl_->state == UdpIngress::Impl::State::Running &&
@@ -772,7 +800,7 @@ void UdpIngress::RequestStop() noexcept {
         auto pin = std::move(current->impl_->notification_pin);
         if (pin) pin->Close();
     }
-    if (impl_->outstanding_jobs == 0) impl_->state = Impl::State::Drained;
+    if (impl_->outstanding_jobs == 0 && impl_->controls == 0) impl_->state = Impl::State::Drained;
 }
 
 net::awaitable<void> UdpIngress::AsyncJoin() {
@@ -1008,6 +1036,20 @@ net::awaitable<void> UdpIngress::ProcessAuthenticated(
         !OwnsSocket(packet->socket_key, context.sock)) co_return;
     auto session = record->session.lock();
     auto domain = record->domain.lock();
+    auto release_foreign = MakeScopeExit([&session, &domain, worker_id = context.worker_id]() noexcept {
+        if (domain && !domain->CanDestroyDirectlyOn(worker_id)) {
+            auto* target = domain.get();
+            try {
+                target->Execute([session = std::move(session),
+                                 domain = std::move(domain)]() mutable {
+                    session.reset();
+                    domain.reset();
+                });
+            } catch (...) {
+                FailRuntime("udp-handoff", "failed to return foreign session ownership");
+            }
+        }
+    });
     if (!session) {
         if (!record->association->Check(*decoded.packet_id, context.worker_id,
                 context.client_endpoint, InboundDatagramCheck::Commit))
@@ -1612,7 +1654,10 @@ UdpIngress::SocketPtr UdpIngress::AttachSocket(
     }
     impl_->udp_sockets.try_emplace(
         memory::ThreadLocalString{socket_key},
-        Impl::BoundSocket{.socket = socket, .local_endpoint = std::move(local_endpoint)});
+        Impl::BoundSocket{
+            .socket = socket,
+            .local_endpoint = std::move(local_endpoint),
+            .associations = {}});
     return socket;
 }
 

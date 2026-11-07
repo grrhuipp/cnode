@@ -118,8 +118,6 @@ jobs:
             -DCNODE_BUILD_TESTS=ON \
             -DPython3_EXECUTABLE="$PWD/$BUILD_DIR/test-python/bin/python" \
             -DCNODE_TEST_SANITIZERS=${{ matrix.sanitizers }} \
-            -DCNODE_RELEASE_DEBUG_SYMBOLS=OFF \
-            -DCNODE_RELEASE_FRAME_POINTERS=OFF \
             -DCNODE_MEMORY_STATS=ON \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \

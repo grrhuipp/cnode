@@ -33,7 +33,8 @@ RequestDecodeResult DecodeRequest(std::span<const uint8_t> data) {
     }
 
     auto address = DecodeAddress(
-        data.subspan(kRequestPrefixSize), AddressWireFormat::Socks5, {253, true});
+        data.subspan(kRequestPrefixSize), AddressWireFormat::Socks5,
+        {.max_domain_len = 253, .require_non_empty_domain = true, .allow_metadata = true});
     if (address.status == AddressDecodeStatus::Invalid) {
         result.status = RequestDecodeStatus::InvalidAddress;
         return result;
@@ -85,12 +86,22 @@ size_t EncodeRequestTo(
     if (!output || header_size > output_size - payload_len) {
         return 0;
     }
-    if (target.IsDomain() && !target.host.empty()) {
-        const auto host = reinterpret_cast<uintptr_t>(target.host.data());
-        const auto addr_out = reinterpret_cast<uintptr_t>(output + 56 + 2 + 1);
-        if (host <= addr_out ? addr_out - host < target.host.size() : host - addr_out < addr_size) {
-            return 0;
+    const size_t total_out_size = header_size + payload_len;
+    const auto out_begin = reinterpret_cast<uintptr_t>(output);
+    auto overlaps_output = [out_begin, total_out_size](const void* ptr, size_t len) noexcept {
+        if (!ptr || len == 0) {
+            return false;
         }
+        const auto in_begin = reinterpret_cast<uintptr_t>(ptr);
+        return in_begin <= out_begin
+            ? out_begin - in_begin < len
+            : in_begin - out_begin < total_out_size;
+    };
+    if (overlaps_output(password_hash.data(), password_hash.size()) ||
+        (target.IsDomain() && overlaps_output(target.host.data(), target.host.size())) ||
+        overlaps_output(forwarded.user_email.data(), forwarded.user_email.size()) ||
+        overlaps_output(forwarded.inbound_tag.data(), forwarded.inbound_tag.size())) {
+        return 0;
     }
     if (payload && payload_len > 0) {
         std::memmove(output + header_size, payload, payload_len);

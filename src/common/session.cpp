@@ -20,17 +20,24 @@ ID NewID(uint32_t worker_id) noexcept {
 }
 
 void Context::InitSubstreamFrom(const Context& parent, uint16_t sub_source_port) {
-    worker_id = parent.worker_id;
+    const uint32_t parent_worker_id = parent.worker_id;
+    const std::string_view parent_outbound_tag = parent.outbound.tag;
+    const uint64_t parent_speed_limit = parent.content.speed_limit;
+
+    worker_id = parent_worker_id;
     conn_id = NewID(worker_id);
     accept_time_us = NowMicros();
-    inbound = parent.inbound;
+    if (&parent != this) {
+        inbound = parent.inbound;
+    }
     if (sub_source_port != 0) {
         inbound.source_port = sub_source_port;
     }
     outbound = {};
-    outbound.tag = parent.outbound.tag;
-    content = {};
-    content.speed_limit = parent.content.speed_limit;
+    outbound.tag = parent_outbound_tag;
+    content.network = Network::TCP;
+    content.protocol.clear();
+    content.speed_limit = parent_speed_limit;
     traffic = {};
 }
 }  // namespace session

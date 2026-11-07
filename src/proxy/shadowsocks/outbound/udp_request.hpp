@@ -20,8 +20,14 @@ public:
                std::span<const ss::KeyBytes> psk_chain,
                ForwardedMetadataView forwarded = {})
         : OutboundDatagramEndpointBase(io, bind_address), io_(io), dns_(dns), server_(std::move(server)),
-          cipher_info_(cipher_info), master_key_(master_key), psk_chain_(psk_chain),
-          forwarded_(forwarded) {
+          cipher_info_(cipher_info), master_key_(master_key), psk_chain_(psk_chain) {
+        if (!forwarded.Empty()) {
+            auto& owned = forwarded_.emplace();
+            owned.user_id = forwarded.user_id;
+            owned.user_email.assign(forwarded.user_email.data(), forwarded.user_email.size());
+            owned.client_ip = forwarded.client_ip;
+            owned.inbound_tag.assign(forwarded.inbound_tag.data(), forwarded.inbound_tag.size());
+        }
         if (ss::Is2022Cipher(cipher_info_.type)) {
             ss2022_state_.emplace();
             if (!ss::Init2022UdpSessionState(*ss2022_state_, cipher_info_, master_key_))
@@ -62,7 +68,10 @@ public:
         if (write_closed_) throw transport::WriteClosed{};
         auto write = socket_.StartWrite();
         if (!server_endpoint_) {
-            auto server = co_await ResolveUdpEndpoint(dns_, server_, socket_, write, io_);
+            auto& reactor = ExecutionDomain::Current()
+                ? ExecutionDomain::Current()->Reactor()
+                : io_;
+            auto server = co_await ResolveUdpEndpoint(dns_, server_, socket_, write, reactor);
             if (!server) throw transport::LinkError(server.error());
             server_endpoint_ = *server;
         }
@@ -86,12 +95,14 @@ private:
     }
     size_t EncodePacketTo(const TargetAddress& target, std::span<const uint8_t> payload,
                           uint8_t* output, size_t output_size) {
+        const ForwardedMetadataView forwarded =
+            forwarded_ ? forwarded_->View() : ForwardedMetadataView{};
         if (ss2022_state_)
             return ss::Encode2022UdpRequestPacketTo(target, payload.data(), payload.size(),
-                *ss2022_state_, psk_chain_, output, output_size, forwarded_);
+                *ss2022_state_, psk_chain_, output, output_size, forwarded);
         return ss::EncodeUdpPacketTo(target, payload.data(), payload.size(), master_key_.span(),
             cipher_info_.type, cipher_info_.key_size, cipher_info_.salt_size,
-            output, output_size, forwarded_);
+            output, output_size, forwarded);
     }
 
     net::io_context& io_;
@@ -101,7 +112,7 @@ private:
     const ss::SsCipherInfo cipher_info_;
     const ss::KeyBytes master_key_;
     const std::span<const ss::KeyBytes> psk_chain_;
-    const ForwardedMetadataView forwarded_;
+    std::optional<ForwardedMetadata> forwarded_;
     std::optional<ss::Ss2022UdpSessionState> ss2022_state_;
 };
 

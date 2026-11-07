@@ -413,6 +413,7 @@ RunVlessEncryptionClientHandshake(
         if (zero) {
             try {
                 co_await WriteVlessBytes(raw_writer, nfs->bytes);
+                memory::ByteVector{}.swap(nfs->bytes);
                 co_await WriteVlessBytes(raw_writer, zero->bytes);
             } catch (...) {
                 ticket_cache->Clear();
@@ -438,8 +439,11 @@ RunVlessEncryptionClientHandshake(
     }
 
     co_await WriteVlessBytes(raw_writer, nfs->bytes);
+    memory::ByteVector{}.swap(nfs->bytes);
     co_await WriteVlessBytes(raw_writer, pfs->encrypted);
     co_await WriteVlessBytes(raw_writer, *padding);
+    memory::ByteVector{}.swap(*padding);
+    padding.reset();
 
     std::array<uint8_t, kVlessEncryptionEncryptedServerPfsPublicSize>
         encrypted_server_public{};
@@ -507,6 +511,7 @@ RunVlessEncryptionServerHandshake(
             : VlessEncryptionHandshakeFailure::Truncated);
     }
     auto nfs = OpenVlessEncryptionClientNfsHello(config, iv_and_relays);
+    memory::ByteVector{}.swap(iv_and_relays);
     if (!nfs) {
         co_return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
     }
@@ -612,6 +617,8 @@ RunVlessEncryptionServerHandshake(
     co_await WriteVlessBytes(raw_writer, response->encrypted_public_key);
     co_await WriteVlessBytes(raw_writer, response->encrypted_ticket);
     co_await WriteVlessBytes(raw_writer, *padding);
+    memory::ByteVector{}.swap(*padding);
+    padding.reset();
 
     if (auto padding_result = co_await ReadAndOpenPadding(raw_reader, *nfs_aead);
         !padding_result) {

@@ -510,7 +510,10 @@ net::awaitable<ErrorCode> AnyTLSDemuxSession::ProcessStream(
     std::optional<proxy::uot::Version> uot_version;
     auto prepare = [&]() -> net::awaitable<ErrorCode> {
         auto parsed = co_await ReadAddress(sub, pending, AddressWireFormat::Socks5,
-                                           0, {255, true});
+                                           0,
+                                           {.max_domain_len = 255,
+                                            .require_non_empty_domain = true,
+                                            .allow_metadata = true});
         if (!parsed) co_return parsed.error();
         pending.DropPrefixBytes(parsed->consumed);
         if (parsed->forwarded) {

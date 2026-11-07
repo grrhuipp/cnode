@@ -449,7 +449,7 @@ int main() {
 
     acpp::worker_detail::UdpIngress::ClientSession failing_reply_session(
         io_context,
-        {.socket_key = {}, .socket = {}, .response = failing_response, .sink = &failed_sink},
+        {.socket_key = {}, .socket = {}, .response = failing_response, .sink = &failed_sink, .worker_id = 0, .fence = {}},
         reply_endpoint_a,
         default_owner, udp_budget, udp_budget.AcquireAssociation());
     acpp::buf::BufferGuard reply_buffer{acpp::buf::Buffer::New()};
@@ -474,7 +474,7 @@ int main() {
     acpp::worker_detail::UdpIngress::ClientSession raw_reply_session(
         io_context,
         {.socket_key = {}, .socket = {}, .response = std::make_shared<CountingUdpResponseContext>(),
-         .sink = &raw_sink},
+         .sink = &raw_sink, .worker_id = 0, .fence = {}},
         reply_endpoint_a,
         default_owner, udp_budget, udp_budget.AcquireAssociation());
     std::array<acpp::net::const_buffer, 1> raw_reply_buffers{
@@ -508,7 +508,7 @@ int main() {
     acpp::worker_detail::UdpIngress::ClientSession large_reply_session(
         io_context,
         {.socket_key = {}, .socket = {}, .response = std::make_shared<CountingUdpResponseContext>(),
-         .sink = &large_sink},
+         .sink = &large_sink, .worker_id = 0, .fence = {}},
         reply_endpoint_a,
         default_owner, udp_budget, udp_budget.AcquireAssociation());
     bool large_reply_failed = false;
@@ -661,9 +661,12 @@ int main() {
         .inbound_tag = {},
         .inbound_tags = {},
         .protocol = {},
+        .accounting_key = {},
         .stream_settings = {},
         .dispatch_policy = {
-            .sniffing = {}, .outbound = acpp::routing::ForceOutbound{"direct"}}};
+            .sniffing = {}, .outbound = acpp::routing::ForceOutbound{"direct"}},
+        .proxy_protocol = acpp::ProxyProtocolMode::Auto,
+        .has_route_inbound_tags = false};
     RecordingReplySink uplink_sink;
     const auto attach_uplink_socket = [&](std::string_view socket_key) {
         auto socket = worker.AttachSocket(
@@ -690,6 +693,7 @@ int main() {
             .timeouts = uplink_timeouts,
             .worker_id = 0,
             .reply_sink = uplink_sink,
+            .environment = nullptr,
         });
     };
     const auto read_marker = [&](acpp::worker_detail::UdpIngress::ClientSession& session) {
@@ -1088,7 +1092,7 @@ int main() {
     auto response_context = std::make_shared<CountingUdpResponseContext>();
     acpp::worker_detail::UdpIngress::ClientSession snapshot_reply_session(
         io_context,
-        {.socket_key = {}, .socket = {}, .response = response_context, .sink = &snapshot_sink},
+        {.socket_key = {}, .socket = {}, .response = response_context, .sink = &snapshot_sink, .worker_id = 0, .fence = {}},
         reply_endpoint_a,
         default_owner, udp_budget, udp_budget.AcquireAssociation());
     auto adopted_worker_state = std::make_shared<int>(-1);

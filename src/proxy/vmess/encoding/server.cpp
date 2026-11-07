@@ -79,7 +79,7 @@ bool ParseDecryptedHeader(const uint8_t* data, size_t len,
         auto address = DecodeAddress(
             std::span(data + reader.Position(), reader.Remaining()),
             AddressWireFormat::PortFirst,
-            {253, true});
+            {.max_domain_len = 253, .require_non_empty_domain = true, .allow_metadata = true});
         if (address.status != AddressDecodeStatus::Complete) return false;
         reader.Skip(address.consumed);
         request.target = std::move(address.target);

@@ -42,17 +42,31 @@ void QuicStreamState::AcknowledgeInput(size_t bytes) noexcept {
     if (auto owner = owner_.lock()) owner->ConsumeStream(stream_id_, bytes);
 }
 
+void QuicStreamState::OnStreamClosed() noexcept {
+    owner_.reset();
+    input_done_ = true;
+    write_done_ = true;
+    WakeReader();
+}
+
 void QuicStreamState::RemoteReset() noexcept {
-    Cancel();
+    owner_.reset();
+    cancelled_ = true;
+    input_done_ = true;
+    write_done_ = true;
+    input_.clear();
+    WakeReader();
 }
 
 void QuicStreamState::Cancel() noexcept {
     if (cancelled_) return;
     cancelled_ = true;
     input_done_ = true;
+    write_done_ = true;
     input_.clear();
     WakeReader();
-    if (auto owner = owner_.lock()) owner->CancelStream(stream_id_);
+    if (auto owner = std::exchange(owner_, {}).lock())
+        owner->CancelStream(stream_id_);
 }
 
 net::awaitable<size_t> QuicStreamState::Read(net::mutable_buffer buffer) {

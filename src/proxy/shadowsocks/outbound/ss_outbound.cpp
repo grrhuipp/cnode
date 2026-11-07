@@ -105,7 +105,8 @@ SendShadowsocksHandshake(
     const TargetAddress& target,
     std::chrono::seconds handshake_timeout,
     const PhaseDeadlineHandle& outbound_protocol_deadline,
-    ForwardedMetadataView forwarded) {
+    const OutboundDialer& dialer,
+    const session::Context& ctx) {
     const TargetAddress protocol_target = use_uot
         ? TargetAddress(
             *prepared.config.uot_version == SsUotVersion::V1
@@ -122,7 +123,7 @@ SendShadowsocksHandshake(
         prepared.credentials.MasterKey(),
         prepared.credentials.PskChain(),
         stream,
-        forwarded);
+        dialer.ForwardedMetadata(ctx));
     if (!request_writer_result) {
         const bool timed_out = proxy::ConsumeOutboundHandshakeTimeout(
             stream, outbound_protocol_deadline);
@@ -139,8 +140,10 @@ WriteUotRequest(
     ShadowsocksOutboundEndpoint& target_endpoint,
     const TargetAddress& target,
     const PhaseDeadlineHandle& outbound_protocol_deadline,
-    ForwardedMetadataView forwarded) {
-    auto request = proxy::uot::EncodeRequest(false, target, forwarded);
+    const OutboundDialer& dialer,
+    const session::Context& ctx) {
+    auto request = proxy::uot::EncodeRequest(
+        false, target, dialer.ForwardedMetadata(ctx));
     if (!request) {
         target_endpoint.Cancel();
         co_return tl::unexpected(request.error());
@@ -176,7 +179,6 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
     const auto& server = prepared_->config.server;
     const bool use_uot =
         ctx.content.network == Network::UDP && prepared_->config.uot_version.has_value();
-    const auto forwarded = dialer.ForwardedMetadata(ctx);
 
     if (ctx.content.network == Network::UDP && !use_uot) {
         auto server_target = MakeServerTarget(server);
@@ -185,13 +187,20 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
         }
         std::optional<UdpRequest> target_endpoint;
         if (auto opened = dialer.OpenDatagram(
-                ctx, OutboundDialer::DatagramRemote{.address = server.literal_address},
+                ctx,
+                OutboundDialer::DatagramRemote{
+                    .address = server.literal_address,
+                    .family_hint = {},
+                    .accepts_v4 = true,
+                    .accepts_v6 = true,
+                    .prefers_v6 = false,
+                },
                 target_endpoint,
                 std::move(server_target),
                 prepared_->credentials.Cipher(),
                 prepared_->credentials.MasterKey(),
                 prepared_->credentials.PskChain(),
-                forwarded);
+                dialer.ForwardedMetadata(ctx));
             !opened) {
             co_return tl::unexpected(opened.error());
         }
@@ -217,7 +226,8 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
         ctx.outbound.target,
         timeouts.HandshakeTimeout(),
         outbound_protocol_deadline,
-        forwarded);
+        dialer,
+        ctx);
     if (!request_session) {
         stream->CloseAbortive();
         co_return tl::unexpected(request_session.error());
@@ -236,7 +246,8 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
                 target_endpoint,
                 ctx.outbound.target,
                 outbound_protocol_deadline,
-                forwarded);
+                dialer,
+                ctx);
             !ok) {
             stream->CloseAbortive();
             co_return tl::unexpected(ok.error());

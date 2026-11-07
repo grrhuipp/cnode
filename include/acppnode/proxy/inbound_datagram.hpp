@@ -20,6 +20,9 @@ namespace acpp {
 
 class ConnectionLimiter;
 class UserOnlineTracker;
+namespace proxyman::inbound {
+class ProtocolSettings;
+}
 
 
 class InboundDatagramResponse {
@@ -98,7 +101,7 @@ struct InboundDatagramAssociationPolicy {
 struct InboundDatagramAssociationKey {
     InboundDatagramOwner owner;
     uint64_t session_id;
-    const void* configuration;
+    const proxyman::inbound::ProtocolSettings* configuration;
     [[nodiscard]] bool operator==(const InboundDatagramAssociationKey& other) const noexcept {
         return session_id == other.session_id && configuration == other.configuration &&
             owner.Same(other.owner);
@@ -112,7 +115,7 @@ struct InboundDatagramAssociationKeyHash {
             hash = (hash ^ key.owner.bytes[i]) * 16777619u;
         hash = (hash ^ key.owner.size) * 16777619u;
         hash ^= std::hash<uint64_t>{}(key.session_id) + (hash << 6) + (hash >> 2);
-        return hash ^ std::hash<const void*>{}(key.configuration);
+        return hash ^ std::hash<const proxyman::inbound::ProtocolSettings*>{}(key.configuration);
     }
 };
 
@@ -126,7 +129,7 @@ struct InboundDatagramRequest {
     std::string_view tag;
     std::span<const uint8_t> payload;
     const InboundDatagramAssociationIndex* associations = nullptr;
-    const void* configuration = nullptr;
+    const proxyman::inbound::ProtocolSettings* configuration = nullptr;
     uint32_t worker_id = 0;
     udp::endpoint client_endpoint;
 };

@@ -30,9 +30,9 @@ public:
     // prefix here before deciding who reads the stream.
     [[nodiscard]] const buf::MultiBuffer& PendingInput() const noexcept { return input_; }
     void DiscardInput(size_t bytes) noexcept;
+    void OnStreamClosed() noexcept;
     void RemoteReset() noexcept;
     void Cancel() noexcept;
-
     net::awaitable<size_t> Read(net::mutable_buffer buffer);
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer();
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer payload);

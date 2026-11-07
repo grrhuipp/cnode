@@ -149,6 +149,7 @@ net::awaitable<VMessHandshakeResult> ClientSession::EncodeRequestHeader(AsyncStr
     auto built = BuildRequestHeaderPacket(
         *user_, *auth_id_key_, *target_, security_, command_, keys_.request,
         keys_.response_header, forwarded_, packet);
+    forwarded_ = {};
     if (!built) {
         co_return tl::unexpected(built.error());
     }
@@ -168,6 +169,7 @@ net::awaitable<VMessHandshakeResult> ClientSession::EncodeRequestHeader(AsyncStr
     user_ = nullptr;
     auth_id_key_ = nullptr;
     target_ = nullptr;
+    forwarded_ = {};
     co_return VMessHandshakeResult{};
 }
 

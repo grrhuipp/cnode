@@ -192,8 +192,15 @@ public:
         : OutboundStreamEndpointBase(control)
         , reader_(reader)
         , writer_(writer)
-        , udp_target_(udp_target)
-        , forwarded_(forwarded) {}
+        , udp_target_(udp_target) {
+        if (!forwarded.Empty()) {
+            auto& owned = forwarded_.emplace();
+            owned.user_id = forwarded.user_id;
+            owned.user_email.assign(forwarded.user_email.data(), forwarded.user_email.size());
+            owned.client_ip = forwarded.client_ip;
+            owned.inbound_tag.assign(forwarded.inbound_tag.data(), forwarded.inbound_tag.size());
+        }
+    }
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
         if (peer_ended_) {
@@ -302,7 +309,7 @@ public:
 
     net::awaitable<void> AsyncShutdownWrite() override {
         if (session_started_ && !end_sent_) {
-            std::array<uint8_t, mux::kMaxFrameHeaderBytes> write_frame{};
+            std::array<uint8_t, 6> write_frame{};
             const size_t header_len = mux::EncodeEndTo(write_frame, session_id_);
             co_await WriteVlessBytes(
                 writer_, std::span<const uint8_t>(write_frame.data(), header_len));
@@ -334,7 +341,8 @@ private:
         const size_t header_len = !session_started_
             ? mux::EncodeNewHeaderTo(
                   write_frame, session_id_, mux::NetworkType::UDP,
-                  target, *payload_size, forwarded_)
+                  target, *payload_size,
+                  forwarded_ ? forwarded_->View() : ForwardedMetadataView{})
             : mux::EncodeKeepUDPHeaderTo(
                   write_frame, session_id_, target, *payload_size);
         if (header_len == 0) {
@@ -348,12 +356,13 @@ private:
         frame.AppendBuffers(payload);
         co_await writer_.WriteBuffers(frame.Span());
         session_started_ = true;
+        forwarded_.reset();
     }
 
     VlessBufferedReader& reader_;
     transport::MultiBufferWriter& writer_;
     const TargetAddress& udp_target_;
-    ForwardedMetadataView forwarded_;
+    std::optional<ForwardedMetadata> forwarded_;
     VlessResponseHeaderState response_header_;
     bool session_started_ = false;
     bool end_sent_ = false;
@@ -378,7 +387,8 @@ SendVlessHandshake(
     std::unique_ptr<::acpp::vless::VlessEncryptedIo>& encrypted_io,
     VlessBufferedReader*& active_reader,
     transport::MultiBufferWriter*& active_writer,
-    ForwardedMetadataView forwarded) {
+    const OutboundDialer& dialer,
+    const session::Context& ctx) {
     stream.SetIdleTimeout(handshake_timeout);
     PhaseDeadlineHandle outbound_protocol_deadline =
         stream.StartPhaseDeadline(handshake_timeout);
@@ -428,7 +438,7 @@ SendVlessHandshake(
         header_buf.data(),
         header_buf.size(),
         use_vision ? std::string_view(config.flow) : std::string_view{},
-        forwarded);
+        dialer.ForwardedMetadata(ctx));
     if (header_len == 0) {
         co_return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
@@ -498,9 +508,9 @@ proxy::vless::outbound::Handler::Process(
     // holds a private snapshot; rejection clears only that exact ticket identity,
     // never a ticket published by a concurrent successful handshake.
     struct TicketLease {
-        std::shared_ptr<::acpp::vless::VlessEncryptionClientTicketCache> cache;
-        std::shared_ptr<ExecutionDomain> domain;
-        ::acpp::vless::VlessEncryptionClientTicketCache local;
+        std::shared_ptr<::acpp::vless::VlessEncryptionClientTicketCache> cache{};
+        std::shared_ptr<ExecutionDomain> domain{};
+        ::acpp::vless::VlessEncryptionClientTicketCache local{};
         std::array<uint8_t, ::acpp::vless::kVlessEncryptionTicketSize> identity{};
         std::chrono::steady_clock::time_point original_expiry{};
 
@@ -539,7 +549,13 @@ proxy::vless::outbound::Handler::Process(
             if (domain) domain->Execute(std::move(invalidate));
             else invalidate();
         }
-    } tickets{encryption_tickets_, ticket_domain_.lock()};
+    } tickets{
+        .cache = encryption_tickets_,
+        .domain = ticket_domain_.lock(),
+        .local = {},
+        .identity = {},
+        .original_expiry = {},
+    };
     co_await tickets.Acquire();
     VlessBufferedReader protocol_reader(*stream);
     transport::MultiBufferWriter& protocol_writer = *stream;
@@ -547,12 +563,11 @@ proxy::vless::outbound::Handler::Process(
     transport::MultiBufferWriter* active_writer = &protocol_writer;
     std::unique_ptr<::acpp::vless::VlessEncryptedIo> encrypted_io;
 
-    const auto forwarded = dialer.ForwardedMetadata(ctx);
     if (auto ok = co_await SendVlessHandshake(
             *stream, *config_, encryption_tickets_ ? &tickets.local : nullptr, target,
             is_udp, use_vision, use_xudp, use_packet_addr,
             timeouts.HandshakeTimeout(), protocol_reader, protocol_writer,
-            encrypted_io, active_reader, active_writer, forwarded); !ok) {
+            encrypted_io, active_reader, active_writer, dialer, ctx); !ok) {
         co_return fail_abortive(ok.error());
     }
     co_await tickets.Publish();
@@ -567,7 +582,7 @@ proxy::vless::outbound::Handler::Process(
             *active_reader,
             *active_writer,
             target,
-            forwarded);
+            dialer.ForwardedMetadata(ctx));
         auto res = co_await DoRelayLink(
             dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
             target_endpoint, ctx, stats, relay_config, std::move(first_payload));

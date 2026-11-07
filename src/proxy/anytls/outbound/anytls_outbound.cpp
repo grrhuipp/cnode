@@ -66,7 +66,7 @@ ErrorCode SessionExceptionError(const std::exception_ptr& failure,
     catch (...) { return unknown; }
 }
 
-struct PhysicalHooks final : ExecutionDomain::Hooks {
+struct PhysicalHooks final : memory::ThreadAllocated, ExecutionDomain::Hooks {
     memory::AllocationDomain allocation;
     std::optional<memory::ScopedAllocationDomain> scope;
     void Enter() noexcept override { scope.emplace(allocation); }
@@ -98,7 +98,7 @@ struct Handler::PaddingState {
     std::shared_ptr<const PaddingScheme> scheme{DefaultPaddingScheme()};
 };
 
-struct Handler::ClientSession {
+struct Handler::ClientSession : memory::ThreadAllocated {
     class LogicalStream final {
     public:
         explicit LogicalStream(net::io_context& io_context)
@@ -1127,7 +1127,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
             session = transport_lease.Get();
             physical = session ? session->domain : std::shared_ptr<ExecutionDomain>{};
             if (!session && request) {
-                auto hooks = std::make_shared<PhysicalHooks>();
+                auto hooks = memory::AllocateShared<PhysicalHooks>();
                 physical = request->CreateSibling(hooks);
                 hooks->allocation.SetLeaseGroup(
                     physical->LeaseIdentity(), &ExecutionDomain::SharesLeaseIdentity);
@@ -1429,7 +1429,14 @@ const bool kOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
             return std::nullopt;
         }
         auto stream_settings = acpp::proxy::PrepareOutboundStream(
-            cfg, settings->server, acpp::OutboundStreamDefaults{.require_tls = true});
+            cfg,
+            settings->server,
+            acpp::OutboundStreamDefaults{
+                .require_tls = true,
+                .fallback_server_name = {},
+                .allow_insecure = false,
+                .alpn = {},
+            });
         using Settings = acpp::proxy::anytls::outbound::Settings;
         return acpp::proxyman::outbound::PreparedOutboundProxy{
             .create = acpp::proxyman::outbound::MakePreparedOutboundCreator<

@@ -143,7 +143,8 @@ RequestHeaderDecodeResult DecodeRequestHeader(std::span<const uint8_t> data) {
     } else if (command == static_cast<uint8_t>(Command::TCP) ||
                command == static_cast<uint8_t>(Command::UDP)) {
         auto address = DecodeAddress(
-            data.subspan(consumed), AddressWireFormat::PortFirst, {253, true});
+            data.subspan(consumed), AddressWireFormat::PortFirst,
+            {.max_domain_len = 253, .require_non_empty_domain = true, .allow_metadata = true});
         if (address.status == AddressDecodeStatus::Invalid) {
             result.status = RequestHeaderDecodeStatus::InvalidAddress;
             return result;
