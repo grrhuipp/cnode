@@ -14,7 +14,6 @@ void SessionTrackingState::RegisterActiveSession(
     int64_t user_id,
     session::Traffic& traffic) {
     if (accounting_key.empty() || user_id <= 0 || node.linked) return;
-    const std::lock_guard lock(mutex_);
     auto entry = accounts_.find(accounting_key);
     const bool inserted = entry == accounts_.end();
     if (inserted) {
@@ -44,7 +43,6 @@ void SessionTrackingState::RegisterActiveSession(
 
 void SessionTrackingState::UnregisterActiveSession(ActiveSession& node) noexcept {
     if (!node.linked) return;
-    const std::lock_guard lock(mutex_);
     auto* bucket = node.bucket;
     if (node.prev) node.prev->next = node.next;
     else bucket->active_head = node.next;
@@ -66,7 +64,6 @@ void SessionTrackingState::UnregisterActiveSession(ActiveSession& node) noexcept
 }
 
 UserTrafficCounters SessionTrackingState::SnapshotTraffic(std::string_view accounting_key) {
-    const std::lock_guard lock(mutex_);
     UserTrafficCounters result;
     const auto entry = accounts_.find(accounting_key);
     if (entry == accounts_.end()) return result;
@@ -94,7 +91,6 @@ UserTrafficCounters SessionTrackingState::SnapshotTraffic(std::string_view accou
 void SessionTrackingState::CommitTraffic(
     std::string_view accounting_key, const UserTrafficCounters& snapshot) {
     if (snapshot.empty()) return;
-    const std::lock_guard lock(mutex_);
     const auto entry = accounts_.find(accounting_key);
     if (entry == accounts_.end()) {
         throw std::logic_error("traffic snapshot account disappeared before commit");
@@ -127,7 +123,6 @@ void SessionTrackingState::CommitTraffic(
 void SessionTrackingState::RollbackTraffic(
     std::string_view accounting_key, const UserTrafficCounters& snapshot) {
     if (snapshot.empty()) return;
-    const std::lock_guard lock(mutex_);
     const auto entry = accounts_.find(accounting_key);
     if (entry == accounts_.end()) {
         throw std::logic_error("traffic snapshot account disappeared before rollback");
@@ -150,7 +145,6 @@ void SessionTrackingState::RollbackTraffic(
 
 UserTrafficCounters SessionTrackingState::ExtractAvailableTraffic(
     std::string_view accounting_key) {
-    const std::lock_guard lock(mutex_);
     UserTrafficCounters result;
     const auto entry = accounts_.find(accounting_key);
     if (entry == accounts_.end()) return result;
@@ -181,7 +175,6 @@ UserTrafficCounters SessionTrackingState::ExtractAvailableTraffic(
 void SessionTrackingState::MergeCompletedTraffic(
     std::string_view accounting_key, UserTrafficCounters& source) {
     if (accounting_key.empty() || source.empty()) return;
-    const std::lock_guard lock(mutex_);
     auto entry = accounts_.find(accounting_key);
     const bool inserted = entry == accounts_.end();
     if (inserted) {

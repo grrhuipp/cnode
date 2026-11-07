@@ -20,6 +20,7 @@
 #include "acppnode/transport/link.hpp"
 #include "acppnode/transport/internet/outbound_target_builder.hpp"
 
+#include <openssl/crypto.h>
 #include <memory>
 #include <span>
 #include <utility>
@@ -41,10 +42,19 @@ public:
         , master_key_(master_key)
         , request_salt_(request_salt) {}
 
+    ~ShadowsocksOutboundEndpoint() override {
+        OPENSSL_cleanse(master_key_.bytes.data(), master_key_.bytes.size());
+        OPENSSL_cleanse(request_salt_.bytes.data(), request_salt_.bytes.size());
+    }
+
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
         if (!response_reader_) {
             auto reader_result = co_await ss::ReadTCPResponse(
                 cipher_info_, master_key_, request_salt_, stream_);
+            OPENSSL_cleanse(master_key_.bytes.data(), master_key_.bytes.size());
+            master_key_.size = 0;
+            OPENSSL_cleanse(request_salt_.bytes.data(), request_salt_.bytes.size());
+            request_salt_.size = 0;
             if (!reader_result) {
                 throw transport::LinkError(reader_result.error());
             }
@@ -73,7 +83,12 @@ public:
     }
 
     net::awaitable<void> AsyncShutdownWrite() override {
-        co_await stream_.AsyncShutdownWrite();
+        if (!request_writer_) {
+            throw IoSystemError(
+                io_error::not_connected,
+                "Shadowsocks request writer is not initialized");
+        }
+        co_await request_writer_->AsyncShutdownWrite();
     }
 
     operator AsyncStream&() noexcept {
@@ -239,6 +254,8 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
         prepared_->credentials.MasterKey(),
         request_session->request_salt,
         *stream);
+    OPENSSL_cleanse(request_session->request_salt.bytes.data(),
+                    request_session->request_salt.bytes.size());
 
     if (use_uot &&
         *prepared_->config.uot_version != SsUotVersion::V1) {

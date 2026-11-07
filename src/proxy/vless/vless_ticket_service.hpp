@@ -12,14 +12,14 @@ namespace acpp::vless {
 
 [[nodiscard]] net::awaitable<bool> AuthenticateVlessTicket(
     std::shared_ptr<const VlessEncryptionConfig> config,
-    std::string inbound_tag,
+    std::string_view inbound_tag,
     VlessEncryptionIssuedTicket ticket,
     std::array<uint8_t, 16> identity);
 
 [[nodiscard]] net::awaitable<std::optional<VlessEncryptionServerTicketStore::ResumedSession>>
 LookupVlessTicket(
     std::shared_ptr<const VlessEncryptionConfig> config,
-    std::string inbound_tag,
+    std::string_view inbound_tag,
     std::array<uint8_t, kVlessEncryptionTicketSize> ticket,
     VlessEncryptionNfsKey nfs_key);
 

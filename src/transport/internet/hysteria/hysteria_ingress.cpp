@@ -160,7 +160,6 @@ struct SocketState final : memory::ThreadAllocated {
     HysteriaIngress::SocketPtr socket;
     memory::ThreadLocalString key;
     udp::endpoint local;
-    std::array<uint8_t, kMaxPacketSize> receive_buffer{};
     udp::endpoint remote;
     struct Output {
         memory::ByteVector data;
@@ -1774,15 +1773,32 @@ net::awaitable<void> QuicListener::Claim(std::shared_ptr<QuicOwnership> owner) {
 
 net::awaitable<void> QuicListener::ReceiveLoop(std::shared_ptr<SocketState> socket) {
     while (!stopping && socket->socket && socket->socket->is_open()) {
-        auto [error, bytes] = co_await socket->socket->async_receive_from(
-            net::buffer(socket->receive_buffer), socket->remote,
-            net::as_tuple(net::use_awaitable));
-        if (error == net::error::operation_aborted) co_return;
-        if (error || bytes == 0) continue;
+        auto [wait_error] = co_await socket->socket->async_wait(
+            udp::socket::wait_read, net::as_tuple(net::use_awaitable));
+        if (wait_error == net::error::operation_aborted || stopping ||
+            !socket->socket || !socket->socket->is_open()) {
+            co_return;
+        }
+        if (wait_error) continue;
         try {
+            IoErrorCode error;
+            const size_t available = socket->socket->available(error);
+            if (error || available == 0 || available > kMaxPacketSize) {
+                std::array<uint8_t, 1> discard{};
+                (void)socket->socket->receive_from(
+                    net::buffer(discard), socket->remote, 0, error);
+                if (error == net::error::operation_aborted) co_return;
+                continue;
+            }
+            memory::ThreadLocalVector<uint8_t> payload(available);
+            const size_t bytes = socket->socket->receive_from(
+                net::buffer(payload), socket->remote, MSG_TRUNC, error);
+            if (error == net::error::operation_aborted) co_return;
+            if (error || bytes == 0 || bytes > payload.size()) continue;
+            payload.resize(bytes);
             ngtcp2_version_cid version_cid{};
             if (ngtcp2_pkt_decode_version_cid(
-                    &version_cid, socket->receive_buffer.data(), bytes,
+                    &version_cid, payload.data(), bytes,
                     kServerConnectionIdLength) != 0)
                 continue;
             if (version_cid.dcidlen > NGTCP2_MAX_CIDLEN) continue;
@@ -1790,9 +1806,7 @@ net::awaitable<void> QuicListener::ReceiveLoop(std::shared_ptr<SocketState> sock
             auto found = connections.find(cid);
             std::shared_ptr<Connection> connection =
                 found == connections.end() ? nullptr : found->second;
-            PendingPacket received{socket, socket->remote, cid,
-                memory::ThreadLocalVector<uint8_t>(
-                    socket->receive_buffer.begin(), socket->receive_buffer.begin() + bytes)};
+            PendingPacket received{socket, socket->remote, cid, std::move(payload)};
             auto owner = connection ? connection->Ownership() : nullptr;
             if (!owner) {
                 try {
@@ -2001,6 +2015,8 @@ HysteriaIngress::SocketPtr HysteriaIngress::AttachSocket(
     state->key.assign(socket_key);
     IoErrorCode error;
     state->local = state->socket->local_endpoint(error);
+    if (error) return {};
+    state->socket->non_blocking(true, error);
     if (error) return {};
     auto [it, inserted] = listener_->sockets.try_emplace(state->key, state);
     return inserted ? it->second->socket : SocketPtr{};

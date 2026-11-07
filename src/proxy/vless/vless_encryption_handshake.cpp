@@ -400,8 +400,9 @@ BuildVlessEncryptionClientPfsHello(
 
     const auto encrypted_len = EncodeVlessEncryptionLength(
         kVlessEncryptionEncryptedClientPfsPublicSize);
+    hello.encrypted.resize(kVlessEncryptionClientPfsHelloSize);
     auto encrypted = std::span<uint8_t, kVlessEncryptionClientPfsHelloSize>(
-        hello.encrypted);
+        hello.encrypted.data(), kVlessEncryptionClientPfsHelloSize);
     auto sealed_len = nfs_aead.Seal(
         encrypted_len,
         {},
@@ -452,10 +453,11 @@ BuildVlessEncryptionServerPfsResponse(
               mlkem_enc->shared_secret.bytes.end(),
               PfsMlKemPart(response.pfs_key).begin());
 
+    std::array<uint8_t, kVlessEncryptionServerPfsPublicSize> public_key{};
     std::copy(mlkem_enc->ciphertext.begin(), mlkem_enc->ciphertext.end(),
-              response.public_key.begin());
+              public_key.begin());
     std::copy(x25519.public_key.begin(), x25519.public_key.end(),
-              response.public_key.begin() +
+              public_key.begin() +
                   static_cast<std::ptrdiff_t>(
                       kVlessMlKem768CiphertextSize));
     response.united_key = BuildUnitedKey(response.pfs_key, nfs_key);
@@ -464,9 +466,11 @@ BuildVlessEncryptionServerPfsResponse(
     if (!nfs_aead) {
         return std::nullopt;
     }
+    response.encrypted_public_key.resize(
+        kVlessEncryptionEncryptedServerPfsPublicSize);
     auto sealed_public = nfs_aead->SealWithNonce(
         MaxNonce(),
-        response.public_key,
+        public_key,
         {},
         response.encrypted_public_key);
     if (!sealed_public ||
@@ -484,7 +488,7 @@ BuildVlessEncryptionServerPfsResponse(
               response.ticket.begin());
 
     auto ticket_aead = VlessEncryptionAead::Create(
-        response.public_key,
+        public_key,
         response.united_key.bytes,
         cipher);
     if (!ticket_aead) {

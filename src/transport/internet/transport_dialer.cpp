@@ -865,10 +865,9 @@ net::awaitable<DialResult> DialAndBuildXHttpRequestCandidate(
         ctx.conn_id);
     if (!build_result) {
         const ErrorCode code = build_result.error();
-        auto result = DialResult::Fail(
-            code,
-            std::string("xhttp client request failed: ") +
-                std::string(ErrorCodeToString(code)));
+        memory::ThreadLocalString msg("xhttp client request failed: ");
+        msg.append(ErrorCodeToString(code));
+        auto result = DialResult::Fail(code, msg);
         result.attempted_remote_addr = candidate.endpoint.address();
         co_return result;
     }
@@ -914,10 +913,9 @@ net::awaitable<DialResult> DialAndBuildSingleCandidate(
         ctx.conn_id);
     if (!build_result) {
         const ErrorCode code = build_result.error();
-        auto result = DialResult::Fail(
-            code,
-            std::string("outbound transport build failed: ") +
-                std::string(ErrorCodeToString(code)));
+        memory::ThreadLocalString msg("outbound transport build failed: ");
+        msg.append(ErrorCodeToString(code));
+        auto result = DialResult::Fail(code, msg);
         result.attempted_remote_addr = candidate.endpoint.address();
         co_return result;
     }

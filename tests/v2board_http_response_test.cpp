@@ -305,6 +305,24 @@ void TestAmbiguousFramingRejected() {
         "1 0\r\n0123456789abcdef\r\n0\r\n\r\n",
         "invalid chunk size",
         "chunk size with whitespace between digits was accepted");
+    CheckRejected(
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhelloEXTRA",
+        "trailing bytes after Content-Length body",
+        "Content-Length body with trailing bytes was accepted or silently truncated");
+    CheckRejected(
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\nX",
+        "trailing bytes after Content-Length body",
+        "zero Content-Length response with trailing byte was accepted");
+    CheckRejected(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "2\r\nOK\r\n0\r\n\r\nTRAILING",
+        "trailing bytes after chunked body",
+        "chunked response with trailing bytes after terminal chunk was accepted");
+    CheckRejected(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "2\r\nOK\r\n0\r\nX-Trailer: 1\r\n\r\nTRAILING",
+        "trailing bytes after chunked body",
+        "chunked response with trailing bytes after trailer section was accepted");
 
     auto extension = ReadResponse({
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"

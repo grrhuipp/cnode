@@ -3,6 +3,7 @@
 #include "acppnode/app/worker_mailbox.hpp"
 #include "acppnode/common/domain_name.hpp"
 #include "acppnode/common/ip_address.hpp"
+#include "acppnode/common/ip_utils.hpp"
 #include "acppnode/infra/log.hpp"
 #include "datagram_exchange.hpp"
 #include "../../common/awaitable_task_group.hpp"
@@ -243,7 +244,7 @@ net::awaitable<DnsResult> DNSWorker::Impl::DoResolve(
         const auto& endpoint = config.servers[server_index];
         auto reason = std::format(
             "server {} port {} > A: {} > {}; AAAA: {} > {}",
-            endpoint.address().to_string(), endpoint.port(),
+            iputil::AddressText(endpoint.address()).View(), endpoint.port(),
             ErrorCodeToString(a_result.error), a_result.error_msg,
             ErrorCodeToString(aaaa_result.error), aaaa_result.error_msg);
         last_result = a_result.error == ErrorCode::DNS_NO_RECORD && !no_records

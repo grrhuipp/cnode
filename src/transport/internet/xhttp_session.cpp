@@ -45,14 +45,28 @@ net::awaitable<size_t> ReadToMultiBufferTail(AsyncStream& stream,
         out.RecordTailProduced(n);
         co_return n;
     }
-    buf::BufferGuard buffer{buf::Buffer::New()};
-    if (!buffer) throw std::bad_alloc();
-    const size_t n = co_await stream.AsyncRead(net::buffer(
-        buffer->Tail().data(), std::min(max_read, size_t{buffer->Available()})));
-    if (n != 0) {
-        buffer->Produce(static_cast<uint32_t>(n));
-        out.push_back(std::move(buffer));
+    buf::MultiBuffer chunk = co_await stream.ReadMultiBuffer();
+    buf::BufferGuard first;
+    while (!chunk.empty()) {
+        first = chunk.pop_front();
+        if (first && !first->IsEmpty()) break;
+        first.reset();
     }
+    if (!first) {
+        co_return 0;
+    }
+    for (size_t i = chunk.size(); i > 0; --i) {
+        if (const buf::Buffer* b = *(chunk.begin() + (i - 1)); b && !b->IsEmpty()) {
+            stream.PrependReadData(b->Bytes());
+        }
+    }
+    chunk.clear();
+    const size_t n = std::min<size_t>(max_read, first->Len());
+    if (n < first->Len()) {
+        stream.PrependReadData(first->Bytes().subspan(n));
+        first->end = first->start + static_cast<uint32_t>(n);
+    }
+    out.push_back(std::move(first));
     co_return n;
 }
 
@@ -299,9 +313,9 @@ public:
     XHttpUploadClientStream(net::any_io_executor executor,
                            net::execution_context& services,
                            std::unique_ptr<AsyncStream> stream)
-        : stream_(std::move(stream)) {
+        : state_(memory::AllocateShared<SharedState>(std::move(stream))) {
         net::use_service<XHttpClientTaskOwner>(services).Spawn(
-            std::move(executor), DrainOwned(stream_, closed_flag_), drain_cancellation_);
+            std::move(executor), DrainOwned(state_), drain_cancellation_);
     }
     ~XHttpUploadClientStream() noexcept override { Close(); }
 
@@ -310,62 +324,66 @@ public:
         co_return buf::MultiBuffer{};
     }
     net::awaitable<size_t> AsyncWrite(net::const_buffer buffer) override {
-        return stream_->AsyncWrite(buffer);
+        return state_->stream->AsyncWrite(buffer);
     }
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer payload) override {
-        return stream_->WriteMultiBuffer(std::move(payload));
+        return state_->stream->WriteMultiBuffer(std::move(payload));
     }
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
-        return stream_->WriteBuffers(buffers);
+        return state_->stream->WriteBuffers(buffers);
     }
-    void ShutdownWrite() override { stream_->ShutdownWrite(); }
+    void ShutdownWrite() override { state_->stream->ShutdownWrite(); }
     net::awaitable<void> AsyncShutdownWrite() override {
-        return stream_->AsyncShutdownWrite();
+        return state_->stream->AsyncShutdownWrite();
     }
-    void Cancel() noexcept override { stream_->Cancel(); }
+    void Cancel() noexcept override { state_->stream->Cancel(); }
     void Close() override {
-        closed_flag_->store(true, std::memory_order_release);
+        state_->closed = true;
         drain_cancellation_.Stop();
-        stream_->Close();
+        state_->stream->Close();
     }
     void CloseAbortive() override {
-        closed_flag_->store(true, std::memory_order_release);
+        state_->closed = true;
         drain_cancellation_.Stop();
-        stream_->CloseAbortive();
+        state_->stream->CloseAbortive();
     }
-    int NativeHandle() const override { return stream_->NativeHandle(); }
-    bool IsOpen() const override { return stream_->IsOpen(); }
+    int NativeHandle() const override { return state_->stream->NativeHandle(); }
+    bool IsOpen() const override { return state_->stream->IsOpen(); }
     transport::CancellationSource& Cancellation() noexcept override {
-        return stream_->Cancellation();
+        return state_->stream->Cancellation();
     }
 
 protected:
-    TcpStream* BaseTcpStream() override { return BaseTcpStreamOf(*stream_); }
-    const TcpStream* BaseTcpStream() const override { return BaseTcpStreamOf(*stream_); }
+    TcpStream* BaseTcpStream() override { return BaseTcpStreamOf(*state_->stream); }
+    const TcpStream* BaseTcpStream() const override { return BaseTcpStreamOf(*state_->stream); }
 
 private:
-    static net::awaitable<void> DrainOwned(
-        std::shared_ptr<AsyncStream> stream,
-        std::shared_ptr<std::atomic<bool>> closed_flag) {
+    struct SharedState final : memory::ThreadAllocated {
+        explicit SharedState(std::unique_ptr<AsyncStream> s) noexcept
+            : stream(std::move(s)) {}
+        std::unique_ptr<AsyncStream> stream;
+        bool closed = false;
+    };
+
+    static net::awaitable<void> DrainOwned(std::shared_ptr<SharedState> state) {
         bool ok = false;
         try {
-            ok = co_await DrainResponse(*stream, *closed_flag);
+            ok = co_await DrainResponse(*state);
         } catch (...) {
             // This upload failure closes only its transport, not unrelated
             // resident tasks. The physical session still joins this callback.
         }
         if (ok) {
-            stream->ShutdownRead();
+            state->stream->ShutdownRead();
         } else {
-            stream->CloseAbortive();
+            state->stream->CloseAbortive();
         }
     }
-    static net::awaitable<bool> DrainResponse(
-        AsyncStream& stream,
-        const std::atomic<bool>& closed_flag) {
+    static net::awaitable<bool> DrainResponse(SharedState& state) {
+        AsyncStream& stream = *state.stream;
         const auto should_retry = [&](const IoSystemError& e) noexcept {
             return e.code() == io_error::operation_aborted &&
-                   !closed_flag.load(std::memory_order_acquire) &&
+                   !state.closed &&
                    stream.IsOpen();
         };
         Http1MessageHead head;
@@ -417,9 +435,7 @@ private:
 
     // Close cancels the reader; the registered task retains the transport
     // until the physical session's explicit resident-task join completes.
-    std::shared_ptr<AsyncStream> stream_;
-    std::shared_ptr<std::atomic<bool>> closed_flag_ =
-        std::make_shared<std::atomic<bool>>(false);
+    std::shared_ptr<SharedState> state_;
     transport::CancellationSource drain_cancellation_;
 };
 
@@ -480,19 +496,23 @@ net::awaitable<bool> DiscardHttp1Body(AsyncStream& connection, uint64_t length) 
     if (length > ::acpp::detail::XHttpPacketQueue::kMaxQueuedBytes) {
         co_return false;
     }
-    if (length == 0) {
-        co_return true;
-    }
-    buf::BufferGuard scratch{buf::Buffer::New()};
-    if (!scratch) throw std::bad_alloc();
     while (length > 0) {
-        const size_t n = co_await connection.AsyncRead(net::buffer(
-            scratch->Tail().data(),
-            static_cast<size_t>(std::min<uint64_t>(length, scratch->Available()))));
+        buf::MultiBuffer mb = co_await connection.ReadMultiBuffer();
+        if (mb.empty()) {
+            co_return false;
+        }
+        const size_t n = mb.DropPrefixBytes(
+            static_cast<size_t>(std::min<uint64_t>(length, mb.byte_size())));
         if (n == 0) {
             co_return false;
         }
         length -= n;
+        for (size_t i = mb.size(); i > 0; --i) {
+            if (const buf::Buffer* b = *(mb.begin() + (i - 1)); b && !b->IsEmpty()) {
+                connection.PrependReadData(b->Bytes());
+            }
+        }
+        mb.clear();
     }
     co_return true;
 }

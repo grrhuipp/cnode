@@ -1,6 +1,7 @@
 #pragma once
 
 #include "acppnode/common/asio_types.hpp"
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/app/worker_mailbox.hpp"
 
 #include <asio/execution.hpp>
@@ -173,6 +174,7 @@ public:
             explicit Call(Function&& value) : function(std::forward<Function>(value)) {}
             void Invoke() override { std::move(function)(); }
         };
+        memory::ScopedWorkerAllocation worker_allocation;
         auto call = std::make_unique<Call>(std::forward<Function>(function));
         call->domain = shared_from_this();
         Enqueue(std::move(call));

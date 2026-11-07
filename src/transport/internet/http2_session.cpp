@@ -156,20 +156,36 @@ net::awaitable<std::optional<H2Frame>> ReadH2Frame(AsyncStream& stream) {
     if (frame.length > kHttp2MaxFramePayload) {
         throw IoSystemError(io_error::message_size, "HTTP/2 frame exceeds receive limit");
     }
-    frame.payload.resize(frame.length);
     if (frame.length > 0) {
-        bool ok = false;
+        std::array<uint8_t, 256> chunk{};
         try {
-            ok = co_await ReadFullFromStream(
-                stream, frame.payload.data(), frame.payload.size());
+            while (frame.payload.size() < frame.length) {
+                const size_t want = std::min<size_t>(
+                    frame.length - frame.payload.size(), chunk.size());
+                const size_t n = co_await stream.AsyncRead(
+                    net::buffer(chunk.data(), want));
+                if (n == 0) {
+                    throw IoSystemError(
+                        io_error::connection_reset, "truncated HTTP/2 frame payload");
+                }
+                const size_t required = frame.payload.size() + n;
+                if (required > frame.payload.capacity()) {
+                    const size_t capacity = std::max(
+                        required,
+                        std::min<size_t>(
+                            frame.length,
+                            std::max<size_t>(
+                                256,
+                                frame.payload.capacity() + frame.payload.capacity() / 2)));
+                    frame.payload.reserve(capacity);
+                }
+                frame.payload.insert(frame.payload.end(), chunk.data(), chunk.data() + n);
+            }
         } catch (const IoSystemError& error) {
             if (error.code() == io_error::operation_aborted) {
                 throw IoSystemError(io_error::connection_reset, "cancelled mid-HTTP/2 frame payload");
             }
             throw;
-        }
-        if (!ok) {
-            throw IoSystemError(io_error::connection_reset, "truncated HTTP/2 frame payload");
         }
     }
     co_return frame;
@@ -2147,6 +2163,21 @@ private:
     bool closed_ = false;
 };
 
+[[nodiscard]] memory::ThreadLocalString ResolveGrpcRequestPath(const GrpcConfig& cfg) {
+    if (!cfg.request_path.empty()) {
+        return memory::ThreadLocalString(cfg.request_path);
+    }
+    if (!cfg.service_name.empty() && cfg.service_name.front() == '/') {
+        return memory::ThreadLocalString(cfg.service_name);
+    }
+    memory::ThreadLocalString path;
+    path.reserve(cfg.service_name.size() + 10);
+    path.push_back('/');
+    path.append(cfg.service_name);
+    path.append(cfg.multi_mode ? "/TunMulti" : "/Tun");
+    return path;
+}
+
 class Http2ServerSession final
     : public memory::ThreadAllocated
     , public std::enable_shared_from_this<Http2ServerSession>
@@ -2190,9 +2221,7 @@ public:
             response_header_block_ = EncodeHttpResponseHeaders(http_config_->headers);
         } else {
             if (grpc_config_) {
-                grpc_request_path_ = grpc_config_->request_path.empty()
-                    ? grpc_config_->RequestPath()
-                    : grpc_config_->request_path;
+                grpc_request_path_ = ResolveGrpcRequestPath(*grpc_config_);
             }
             response_header_block_ = EncodeGrpcResponseHeaders();
             trailer_block_ = EncodeGrpcTrailers();
@@ -3034,7 +3063,7 @@ private:
     const HttpConfig* http_config_ = nullptr;
     const XHttpConfig* xhttp_config_ = nullptr;
     const GrpcConfig* grpc_config_ = nullptr;
-    std::string grpc_request_path_;
+    memory::ThreadLocalString grpc_request_path_;
     // HPACK blocks encoded once per connection; neither uses the dynamic table.
     memory::ByteVector response_header_block_;
     memory::ByteVector trailer_block_;
@@ -3690,10 +3719,12 @@ net::awaitable<TransportBuildResult> DoGrpcClientHandshake(
     std::string_view authority,
     bool tls,
     uint64_t conn_id) {
-    const std::string fallback_path = cfg.request_path.empty() ? cfg.RequestPath() : std::string{};
-    const std::string_view path = cfg.request_path.empty()
-        ? std::string_view(fallback_path)
-        : std::string_view(cfg.request_path);
+    memory::ThreadLocalString fallback_path;
+    std::string_view path = cfg.request_path;
+    if (path.empty()) {
+        fallback_path = ResolveGrpcRequestPath(cfg);
+        path = fallback_path;
+    }
     const uint32_t initial_window = std::min<uint32_t>(
         cfg.initial_window_size.value_or(kDefaultInitialWindow),
         kHttp2MaxQueuedStreamBytes);

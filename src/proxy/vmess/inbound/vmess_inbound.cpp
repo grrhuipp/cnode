@@ -92,12 +92,12 @@ ParseHandshake(AsyncStream& stream,
             limiter, ctx, "authentication failed: no authenticated user");
         co_return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
     }
-    if (request->forwarded) {
-        ctx.inbound.ApplyForwardedMetadata(*request->forwarded);
-    }
     proxy::BindAuthenticatedInbound(
         ctx, request->user->profile,
-        proxy::InboundRequestTarget{RequestNetwork(request->command), request->target});
+        proxy::InboundRequestTarget{
+            RequestNetwork(request->command),
+            request->target,
+            std::move(request->forwarded)});
     if (!co_await validator.RegisterSessionIfNew(
             *request->user, request->body_key, request->body_iv)) {
         // Replay is not a credential failure: it never feeds the ban table.
@@ -164,23 +164,24 @@ proxy::vmess::inbound::Handler::Process(
     if (co_await proxy::CheckInboundIpBanned(limiter_, ctx)) {
         co_return proxy::RejectInbound(*stats_, stream.get(), ErrorCode::BLOCKED);
     }
-    ::acpp::vmess::encoding::ServerSession vmess_session(validator_, tag);
     std::optional<UserOnlineSessionGuard> user_session;
+    std::unique_ptr<transport::MultiBufferReader> request_reader;
+    std::unique_ptr<transport::MultiBufferWriter> response_writer;
     {
+        ::acpp::vmess::encoding::ServerSession vmess_session(validator_, tag);
         auto parsed_session = co_await ParseHandshake(
             *stream, vmess_session, validator_, limiter_, ctx, client_ip);
         if (!parsed_session) {
             co_return proxy::RejectInbound(*stats_, stream.get(), parsed_session.error());
         }
         user_session.emplace(std::move(*parsed_session));
+        request_reader = vmess_session.DecodeRequestBody(*stream, ctx.outbound.target);
+        response_writer = vmess_session.EncodeResponseBodyWithHeader(*stream, ctx.outbound.target);
     }
-    const Network net = ctx.content.network;
-
-    auto request_reader = vmess_session.DecodeRequestBody(*stream);
-    auto response_writer = vmess_session.EncodeResponseBodyWithHeader(*stream);
     if (!request_reader || !response_writer) {
         co_return proxy::RejectInbound(*stats_, stream.get(), ErrorCode::RESOURCE_EXHAUSTED);
     }
+    const Network net = ctx.content.network;
 
     if (net == Network::MUX) {
         co_return co_await mux::ProcessInbound(

@@ -190,12 +190,12 @@ proxy::trojan::inbound::Handler::Process(
         }
         net = (handshake->command == ::acpp::trojan::TrojanCommand::UDP_ASSOCIATE)
               ? Network::UDP : Network::TCP;
-        if (handshake->forwarded) {
-            ctx.inbound.ApplyForwardedMetadata(*handshake->forwarded);
-        }
         proxy::BindAuthenticatedInbound(
             ctx, handshake->user->profile,
-            proxy::InboundRequestTarget{net, std::move(handshake->target)});
+            proxy::InboundRequestTarget{
+                net,
+                std::move(handshake->target),
+                std::move(handshake->forwarded)});
         user_session = co_await proxy::AdmitAuthenticatedInbound(
             validator_, ctx, handshake->user->profile);
         if (!user_session) {

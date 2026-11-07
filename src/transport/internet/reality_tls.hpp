@@ -24,8 +24,8 @@ struct RealityClientState : memory::ThreadAllocated {
     std::array<uint8_t, 32> server_public{};
     transport::internet::RealityShortId short_id{};
     std::array<uint8_t, 32> auth_key{};
-    std::string server_name;
-    std::string spider_x;
+    memory::ThreadLocalString server_name;
+    memory::ThreadLocalString spider_x;
     EVP_PKEY* mldsa65_verify_key = nullptr;
     memory::ByteVector client_hello_raw;
     memory::ByteVector server_hello_raw;

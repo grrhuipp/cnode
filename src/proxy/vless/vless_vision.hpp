@@ -92,20 +92,6 @@ private:
     bool write_process_ = true;
     bool send_uuid_ = true;
     VisionTrafficState& traffic_;
-    void AppendVisionFrameBuffers(
-        buf::MultiBuffer& header_owner,
-        memory::ThreadLocalVector<net::const_buffer>& out,
-        std::span<const uint8_t> content,
-        uint8_t command,
-        bool long_padding);
-    void AppendFramed(
-        buf::MultiBuffer& header_owner,
-        memory::ThreadLocalVector<net::const_buffer>& out,
-        std::span<const uint8_t> bytes,
-        bool complete_records,
-        bool last_buffer,
-        bool& ending,
-        bool& long_padding);
 };
 
 }  // namespace acpp::vless

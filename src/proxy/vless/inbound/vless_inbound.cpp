@@ -260,7 +260,7 @@ CompleteVlessInboundHandshake(
                     protocol_reader,
                     protocol_writer,
                     decryption,
-                    std::string(tag));
+                    tag);
             if (!runtime) {
                 if (proxy::ConsumeStreamReadTimeout(stream)) {
                     LOG_CONN_WARN(ctx, "encryption handshake timed out from {}:{}",
@@ -335,12 +335,12 @@ CompleteVlessInboundHandshake(
         ::acpp::vless::IsPacketAddrMagic(request.target);
     // Published before flow/transport validation so those rejections log the
     // authenticated user and the requested target.
-    if (request.forwarded) {
-        ctx.inbound.ApplyForwardedMetadata(*request.forwarded);
-    }
     proxy::BindAuthenticatedInbound(
         ctx, user_info->profile,
-        proxy::InboundRequestTarget{net, std::move(request.target)});
+        proxy::InboundRequestTarget{
+            net,
+            std::move(request.target),
+            std::move(request.forwarded)});
     if (request.addons_len != 0 && request.flow.empty()) {
         LOG_CONN_WARN(ctx, "request rejected from {}:{} > unsupported addons", client_ip, ctx.inbound.source_port);
         LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "unsupported request addons"));
@@ -401,7 +401,7 @@ CompleteVlessInboundHandshake(
     if (issued_ticket) {
         try {
             (void)co_await ::acpp::vless::AuthenticateVlessTicket(
-                decryption, std::string(tag), std::move(*issued_ticket), request.uuid);
+                decryption, tag, std::move(*issued_ticket), request.uuid);
         } catch (const WorkerMailboxFull&) {
             co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
         } catch (const IoSystemError&) {

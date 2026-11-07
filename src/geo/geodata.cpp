@@ -5,6 +5,7 @@
 #include "acppnode/common/unsafe.hpp"
 
 #include <algorithm>
+#include <array>
 #include <format>
 #include <fstream>
 #include <limits>
@@ -233,6 +234,7 @@ public:
         : cur_(bytes.data()), end_(bytes.data() + bytes.size()), path_(path) {}
 
     [[nodiscard]] bool AtEnd() const noexcept { return cur_ == end_; }
+    [[nodiscard]] const uint8_t* Cursor() const noexcept { return cur_; }
 
     [[nodiscard]] ProtoField NextField() {
         const uint64_t key = Varint();
@@ -323,22 +325,36 @@ private:
     return bytes;
 }
 
-[[nodiscard]] std::string_view EntryCountryCode(std::span<const uint8_t> entry,
-                                                const std::filesystem::path& path) {
-    ProtoReader reader(entry, path);
+struct EntryCountryCodeResult {
     std::string_view code;
+    std::span<const uint8_t> prefix;
+    ProtoReader tail;
+};
+
+[[nodiscard]] EntryCountryCodeResult EntryCountryCode(
+    std::span<const uint8_t> entry,
+    const std::filesystem::path& path) {
+    ProtoReader reader(entry, path);
     while (!reader.AtEnd()) {
+        const uint8_t* const field_start = reader.Cursor();
         const auto field = reader.NextField();
         if (field.number == 1) {
             if (field.wire_type != kWireBytes) {
                 ThrowCorrupt(path, "invalid country_code wire type");
             }
-            code = AsText(reader.Bytes());
-        } else {
-            reader.Skip(field.wire_type);
+            const std::string_view code = AsText(reader.Bytes());
+            if (code.empty()) {
+                ThrowCorrupt(path, "empty country_code");
+            }
+            return EntryCountryCodeResult{
+                .code = code,
+                .prefix = entry.first(static_cast<size_t>(field_start - entry.data())),
+                .tail = reader,
+            };
         }
+        reader.Skip(field.wire_type);
     }
-    return code;
+    ThrowCorrupt(path, "missing country_code");
 }
 
 void AddGeoIPCidr(std::span<const uint8_t> message, const std::filesystem::path& path,
@@ -371,16 +387,12 @@ void AddGeoIPCidr(std::span<const uint8_t> message, const std::filesystem::path&
     set.Insert(ip, static_cast<uint8_t>(prefix));
 }
 
-void FillGeoIP(std::span<const uint8_t> entry, const std::filesystem::path& path,
+void FillGeoIP(ProtoReader& reader, const std::filesystem::path& path,
                CidrSet& set) {
-    ProtoReader reader(entry, path);
     while (!reader.AtEnd()) {
         const auto field = reader.NextField();
         if (field.number == 1) {
-            if (field.wire_type != kWireBytes) {
-                ThrowCorrupt(path, "invalid GeoIP country_code wire type");
-            }
-            (void)reader.Bytes();
+            ThrowCorrupt(path, "duplicate GeoIP country_code");
         } else if (field.number == 2) {
             if (field.wire_type != kWireBytes) {
                 ThrowCorrupt(path, "invalid GeoIP cidr wire type");
@@ -440,16 +452,12 @@ void AddGeoSiteDomain(std::span<const uint8_t> message, const std::filesystem::p
     }
 }
 
-void FillGeoSite(std::span<const uint8_t> entry, const std::filesystem::path& path,
+void FillGeoSite(ProtoReader& reader, const std::filesystem::path& path,
                  DomainRuleSet& set) {
-    ProtoReader reader(entry, path);
     while (!reader.AtEnd()) {
         const auto field = reader.NextField();
         if (field.number == 1) {
-            if (field.wire_type != kWireBytes) {
-                ThrowCorrupt(path, "invalid GeoSite country_code wire type");
-            }
-            (void)reader.Bytes();
+            ThrowCorrupt(path, "duplicate GeoSite country_code");
         } else if (field.number == 2) {
             if (field.wire_type != kWireBytes) {
                 ThrowCorrupt(path, "invalid GeoSite domain wire type");
@@ -469,7 +477,7 @@ void LoadCategories(
     std::span<const std::string> tags,
     std::string_view kind,
     std::unordered_map<std::string, Set, TransparentStringHash, TransparentStringEq>& out,
-    void (*fill)(std::span<const uint8_t>, const std::filesystem::path&, Set&)) {
+    void (*fill)(ProtoReader&, const std::filesystem::path&, Set&)) {
     std::vector<std::string> wanted;
     wanted.reserve(tags.size());
     for (const auto& tag : tags) {
@@ -494,7 +502,8 @@ void LoadCategories(
             ThrowCorrupt(path, "invalid geodata entry wire type");
         }
         const auto entry = list.Bytes();
-        auto code = LowerTag(EntryCountryCode(entry, path));
+        auto parsed_code = EntryCountryCode(entry, path);
+        auto code = LowerTag(parsed_code.code);
         if (!std::ranges::binary_search(wanted, code)) {
             continue;
         }
@@ -502,7 +511,11 @@ void LoadCategories(
         if (!inserted) {
             ThrowCorrupt(path, std::format("duplicate {} tag '{}'", kind, it->first));
         }
-        fill(entry, path, it->second);
+        if (!parsed_code.prefix.empty()) {
+            ProtoReader prefix_reader(parsed_code.prefix, path);
+            fill(prefix_reader, path, it->second);
+        }
+        fill(parsed_code.tail, path, it->second);
     }
 
     for (const auto& tag : wanted) {
@@ -511,6 +524,22 @@ void LoadCategories(
                 "{} tag '{}' was not found in '{}'", kind, tag, path.string()));
         }
     }
+}
+
+template <class Map>
+[[nodiscard]] const typename Map::mapped_type* FindCategory(
+    const Map& map, std::string_view tag) {
+    if (tag.size() <= 128) {
+        std::array<char, 128> stack_buf{};
+        std::ranges::transform(tag, stack_buf.begin(), [](char ch) {
+            return domain::ToLowerAscii(static_cast<unsigned char>(ch));
+        });
+        const auto it = map.find(std::string_view(stack_buf.data(), tag.size()));
+        return it == map.end() ? nullptr : &it->second;
+    }
+    const auto lower = LowerTag(tag);
+    const auto it = map.find(std::string_view(lower));
+    return it == map.end() ? nullptr : &it->second;
 }
 
 }  // namespace
@@ -530,13 +559,11 @@ GeoDatabase::GeoDatabase(const std::filesystem::path& geoip_path,
 GeoDatabase::~GeoDatabase() = default;
 
 const CidrSet* GeoDatabase::FindGeoIP(std::string_view tag) const {
-    const auto it = geoip_.find(LowerTag(tag));
-    return it == geoip_.end() ? nullptr : &it->second;
+    return FindCategory(geoip_, tag);
 }
 
 const DomainRuleSet* GeoDatabase::FindGeoSite(std::string_view tag) const {
-    const auto it = geosite_.find(LowerTag(tag));
-    return it == geosite_.end() ? nullptr : &it->second;
+    return FindCategory(geosite_, tag);
 }
 
 GeoDatabase::Stats GeoDatabase::GetStats() const noexcept {

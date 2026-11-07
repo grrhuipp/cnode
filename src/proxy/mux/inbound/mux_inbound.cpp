@@ -933,7 +933,6 @@ net::awaitable<RelayResult> ProcessInboundImpl(
     // 帧累积缓冲区（处理粘包）：持有从流读取的 Buffer，解析前短暂 flatten。
     buf::MultiBuffer frame_buf;
     size_t frame_buf_bytes = 0;
-    std::array<uint8_t, mux::kMaxFrameHeaderBytes> write_frame{};
 
     RelayResult result;
     parent_ctx.traffic.bytes_up = 0;
@@ -1026,17 +1025,42 @@ net::awaitable<RelayResult> ProcessInboundImpl(
             };
 
         auto write_payload_frame_to_client =
-            [&](std::span<const uint8_t> frame, MuxReply& reply) -> net::awaitable<bool> {
+            [&](MuxReply& reply) -> net::awaitable<bool> {
                 const size_t payload_size = reply.PayloadSize();
-                const size_t frame_size = frame.size() + payload_size;
+                std::array<uint8_t, 2 + 4 + 1 + kMaxBaseEncodedAddressSize + 2> write_frame{};
+                size_t header_len = 0;
+                if (reply.is_udp) {
+                    header_len = mux::EncodeKeepUDPHeaderTo(
+                        write_frame,
+                        reply.session_id,
+                        reply.udp_src,
+                        payload_size);
+                    if (header_len == 0) {
+                        LOG_CONN_DEBUG(parent_ctx,
+                            "UDP reply header encode failed sid={} src={} payload={}B",
+                            reply.session_id, reply.udp_src, payload_size);
+                        reply.payload.clear();
+                        co_return true;
+                    }
+                } else {
+                    header_len = mux::EncodeKeepDataHeaderTo(
+                        write_frame,
+                        reply.session_id,
+                        payload_size);
+                    if (header_len == 0) {
+                        reply.payload.clear();
+                        result.error = ErrorCode::PROTOCOL_ENCODE_FAILED;
+                        co_return false;
+                    }
+                }
+                const size_t frame_size = header_len + payload_size;
                 if (frame_size == 0) {
                     co_return true;
                 }
 
                 ConstBufferSpanBuilder<1 + buf::MultiBuffer::kInlineCapacity> framed;
-                framed.Append(net::const_buffer(frame.data(), frame.size()));
+                framed.Append(net::const_buffer(write_frame.data(), header_len));
                 framed.AppendMultiBuffer(reply.payload);
-
                 try {
                     co_await client_link.writer->WriteBuffers(framed.Span());
                     reply.payload.clear();
@@ -1071,61 +1095,25 @@ net::awaitable<RelayResult> ProcessInboundImpl(
             MuxReply reply;
             while (reply_queue.Pop(reply)) {
                 if (reply.is_end || reply.dispatch_done) {
-                    size_t header_len = 0;
-                    if (reply.is_end) {
-                        header_len = mux::EncodeEndTo(
-                            write_frame, reply.session_id, reply.is_error);
-                    }
                     if (reply.dispatch_done) {
                         sub_sessions.erase(reply.session_id);
                     }
                     if (!reply.is_end) {
                         continue;
                     }
+                    std::array<uint8_t, 6> write_frame{};
+                    const size_t header_len = mux::EncodeEndTo(
+                        write_frame, reply.session_id, reply.is_error);
                     if (!co_await write_frame_to_client(
                             std::span<const uint8_t>(write_frame.data(), header_len))) {
                         running = false;
                         break;
                     }
                     continue;
-                } else if (reply.is_udp) {
-                    const size_t payload_size = reply.PayloadSize();
-                    const size_t header_len = mux::EncodeKeepUDPHeaderTo(
-                        write_frame,
-                        reply.session_id, reply.udp_src,
-                        payload_size);
-                    if (header_len == 0) {
-                        LOG_CONN_DEBUG(parent_ctx,
-                            "UDP reply header encode failed sid={} src={} payload={}B",
-                            reply.session_id, reply.udp_src, payload_size);
-                        reply.payload.clear();
-                        continue;
-                    }
-                    if (!co_await write_payload_frame_to_client(
-                            std::span<const uint8_t>(write_frame.data(), header_len),
-                            reply)) {
-                        running = false;
-                        break;
-                    }
-                    continue;
-                } else {
-                    const size_t header_len = mux::EncodeKeepDataHeaderTo(
-                        write_frame,
-                        reply.session_id,
-                        reply.PayloadSize());
-                    if (header_len == 0) {
-                        reply.payload.clear();
-                        result.error = ErrorCode::PROTOCOL_ENCODE_FAILED;
-                        running = false;
-                        break;
-                    }
-                    if (!co_await write_payload_frame_to_client(
-                            std::span<const uint8_t>(write_frame.data(), header_len),
-                            reply)) {
-                        running = false;
-                        break;
-                    }
-                    continue;
+                }
+                if (!co_await write_payload_frame_to_client(reply)) {
+                    running = false;
+                    break;
                 }
             }
             if (!running) break;
@@ -1235,6 +1223,7 @@ net::awaitable<RelayResult> ProcessInboundImpl(
 
                 // ----------------------------------------------------------------
                 case mux::SessionStatus::KEEPALIVE: {
+                    std::array<uint8_t, 6> write_frame{};
                     const size_t header_len = mux::EncodeKeepAliveTo(write_frame);
                     if (!co_await write_frame_to_client(
                             std::span<const uint8_t>(write_frame.data(), header_len))) {
@@ -1251,19 +1240,20 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                         sub_sessions.size() >= kMaxConcurrentSubSessions) {
                         session::Context rejected_ctx;
                         rejected_ctx.InitSubstreamFrom(parent_ctx);
-                        if (hdr.forwarded) {
-                            rejected_ctx.inbound.ApplyForwardedMetadata(*hdr.forwarded);
-                        }
-                        rejected_ctx.content.network = hdr.network == mux::NetworkType::UDP
-                            ? Network::UDP : Network::TCP;
-                        rejected_ctx.outbound.original_target = hdr.target;
-                        rejected_ctx.outbound.target = hdr.target;
+                        proxy::BindInboundRequestTarget(
+                            rejected_ctx,
+                            proxy::InboundRequestTarget{
+                                hdr.network == mux::NetworkType::UDP
+                                    ? Network::UDP : Network::TCP,
+                                hdr.target,
+                                std::move(hdr.forwarded)});
                         LOG_CONN_DEBUG(rejected_ctx,
                             "refused NEW sid={} active={}",
                             hdr.session_id, sub_sessions.size());
                         LOG_ACCESS(FormatAccessLog(rejected_ctx, AccessStatus::Rejected,
                             sub_sessions.contains(hdr.session_id)
                                 ? "duplicate stream ID" : "concurrent stream limit"));
+                        std::array<uint8_t, 6> write_frame{};
                         const size_t header_len =
                             mux::EncodeEndTo(write_frame, hdr.session_id, true);
                         if (!co_await write_frame_to_client(
@@ -1287,12 +1277,12 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                             hdr.target);
                         auto& sub_ctx = sub_state->ctx;
                         sub_ctx.InitSubstreamFrom(parent_ctx);
-                        if (hdr.forwarded) {
-                            sub_ctx.inbound.ApplyForwardedMetadata(*hdr.forwarded);
-                        }
-                        sub_ctx.content.network          = Network::UDP;
-                        sub_ctx.outbound.original_target = hdr.target;
-                        sub_ctx.outbound.target          = hdr.target;
+                        proxy::BindInboundRequestTarget(
+                            sub_ctx,
+                            proxy::InboundRequestTarget{
+                                Network::UDP,
+                                hdr.target,
+                                std::move(hdr.forwarded)});
 
                         if (frame_payload.byte_size() != 0) {
                             sub_state->PushClientPayload(std::move(frame_payload), hdr.data_len);
@@ -1331,12 +1321,12 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                             io_context, sid, reply_queue);
                         auto& sub_ctx = sub_state->ctx;
                         sub_ctx.InitSubstreamFrom(parent_ctx);
-                        if (hdr.forwarded) {
-                            sub_ctx.inbound.ApplyForwardedMetadata(*hdr.forwarded);
-                        }
-                        sub_ctx.content.network          = Network::TCP;
-                        sub_ctx.outbound.original_target = hdr.target;
-                        sub_ctx.outbound.target          = hdr.target;
+                        proxy::BindInboundRequestTarget(
+                            sub_ctx,
+                            proxy::InboundRequestTarget{
+                                Network::TCP,
+                                hdr.target,
+                                std::move(hdr.forwarded)});
 
                         if (frame_payload.byte_size() != 0) {
                             sub_state->PushClientPayload(std::move(frame_payload));
@@ -1438,6 +1428,7 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                     // 映射项只由 dispatch_done 回包移除：此处提前移除会让排队中的
                     // 旧回包在同 sid 的新 NEW 之后误删新子会话。
                     if (!known_session) {
+                        std::array<uint8_t, 6> write_frame{};
                         const size_t header_len = mux::EncodeEndTo(write_frame, sid);
                         if (!co_await write_frame_to_client(
                                 std::span<const uint8_t>(write_frame.data(), header_len))) {

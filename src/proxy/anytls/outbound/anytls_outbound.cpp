@@ -81,6 +81,12 @@ net::any_io_executor SessionExecutor(net::io_context& io) {
     return io.get_executor();
 }
 
+template <class T, class... Args>
+[[nodiscard]] std::shared_ptr<T> AllocateWorkerShared(Args&&... args) {
+    memory::ScopedWorkerAllocation worker_allocation;
+    return memory::AllocateShared<T>(std::forward<Args>(args)...);
+}
+
 }  // namespace
 
 // The cache host alone publishes and reads the next-handshake snapshot. Each
@@ -538,7 +544,7 @@ struct Handler::ClientSession : memory::ThreadAllocated {
                                 co_return;
                             }
                             if (auto parsed = ParsePaddingScheme(*text)) {
-                                scheme_ = std::make_shared<const PaddingScheme>(std::move(*parsed));
+                                scheme_ = AllocateWorkerShared<const PaddingScheme>(std::move(*parsed));
                                 co_await net::co_spawn(padding_state_->executor,
                                     padding_state_->Publish(scheme_), net::use_awaitable);
                             }
@@ -718,8 +724,8 @@ public:
     SessionPool(net::io_context& io_context, AwaitableTaskGroup& tasks,
                 Clock::duration check_interval, Clock::duration idle_timeout,
                 size_t minimum_idle, std::string_view tag)
-        : state_(memory::AllocateShared<State>(io_context, tasks, check_interval,
-                                               idle_timeout, minimum_idle, tag)) {}
+        : state_(AllocateWorkerShared<State>(io_context, tasks, check_interval,
+                                             idle_timeout, minimum_idle, tag)) {}
     SessionPool(const SessionPool&) = delete;
     SessionPool& operator=(const SessionPool&) = delete;
     ~SessionPool() noexcept { state_->Retire(); }
@@ -1072,7 +1078,7 @@ Handler::Handler(std::string_view tag,
                  AwaitableTaskGroup& tasks)
     : tag_(tag)
     , settings_(std::move(settings))
-    , padding_(memory::AllocateShared<PaddingState>(io_context))
+    , padding_(AllocateWorkerShared<PaddingState>(io_context))
     , pool_(std::make_unique<SessionPool>(
           io_context, tasks, settings_->idle_session_check_interval,
           settings_->idle_session_timeout, settings_->min_idle_sessions, tag_)) {}
@@ -1127,7 +1133,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
             session = transport_lease.Get();
             physical = session ? session->domain : std::shared_ptr<ExecutionDomain>{};
             if (!session && request) {
-                auto hooks = memory::AllocateShared<PhysicalHooks>();
+                auto hooks = AllocateWorkerShared<PhysicalHooks>();
                 physical = request->CreateSibling(hooks);
                 hooks->allocation.SetLeaseGroup(
                     physical->LeaseIdentity(), &ExecutionDomain::SharesLeaseIdentity);
@@ -1150,12 +1156,16 @@ net::awaitable<OutboundProcessResult> Handler::Process(
                     *opening_scheme, ctx);
                 if (!dialed) co_return tl::unexpected(dialed.error());
                 auto& io = physical ? physical->Reactor() : dialer.IoContext();
+                auto* raw_session = new ClientSession(
+                    io, std::move(*dialed), padding_, std::move(opening_scheme));
+                memory::ScopedWorkerAllocation worker_allocation;
                 co_return std::shared_ptr<ClientSession>(
-                    new ClientSession(io, std::move(*dialed), padding_, std::move(opening_scheme)),
+                    raw_session,
                     [physical](ClientSession* value) {
                         if (physical) physical->Execute([value] { delete value; });
                         else delete value;
-                    });
+                    },
+                    memory::ThreadLocalAllocator<ClientSession>{});
             };
             tl::expected<std::shared_ptr<ClientSession>, ErrorCode> opened =
                 tl::unexpected(ErrorCode::INTERNAL);

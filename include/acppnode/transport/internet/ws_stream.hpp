@@ -99,6 +99,7 @@ inline EncodedFrameHeader EncodeFrameHeader(
 }
 
 [[nodiscard]] std::string ComputeWsAccept(std::string_view ws_key);
+[[nodiscard]] std::array<char, 28> EncodeWsAccept(std::string_view ws_key) noexcept;
 
 }  // namespace ws
 
@@ -156,6 +157,7 @@ private:
 
     [[noreturn]] void ProtocolFailure(const char* reason);
     void CheckWritable() const;
+    net::awaitable<bool> EnsurePendingData();
     net::awaitable<size_t> ReadSome(uint8_t* data, size_t size);
     net::awaitable<bool> FillHeader();
     net::awaitable<bool> PrepareNextDataFrame();

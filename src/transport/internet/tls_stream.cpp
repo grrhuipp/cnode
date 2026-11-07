@@ -750,8 +750,8 @@ net::awaitable<bool> TlsStream::Handshake() {
 
     if (reality_client_state_ &&
         !VerifyRealityClientHandshake(NativeSsl(), *reality_client_state_)) {
-        std::string spider_x = std::move(reality_client_state_->spider_x);
-        std::string server_name = std::move(reality_client_state_->server_name);
+        memory::ThreadLocalString spider_x = std::move(reality_client_state_->spider_x);
+        memory::ThreadLocalString server_name = std::move(reality_client_state_->server_name);
         if (server_name.empty()) {
             if (const char* sni = SSL_get_servername(
                     NativeSsl(), TLSEXT_NAMETYPE_host_name);
@@ -780,8 +780,8 @@ net::awaitable<bool> TlsStream::Handshake() {
             };
             try {
                 co_await impl_->Write(request_buffers);
-                std::string{}.swap(spider_x);
-                std::string{}.swap(server_name);
+                memory::ThreadLocalString{}.swap(spider_x);
+                memory::ThreadLocalString{}.swap(server_name);
                 buf::BufferGuard drain;
                 (void)co_await impl_->Read({}, &drain);
             } catch (const std::exception&) {
@@ -797,7 +797,7 @@ net::awaitable<bool> TlsStream::Handshake() {
     co_return true;
 }
 
-std::string TlsStream::NegotiatedAlpn() const {
+std::string_view TlsStream::NegotiatedAlpn() const {
     const SSL* ssl = NativeSsl();
 
     const unsigned char* data = nullptr;
@@ -805,9 +805,9 @@ std::string TlsStream::NegotiatedAlpn() const {
     SSL_get0_alpn_selected(ssl, &data, &len);
 
     if (data && len > 0) {
-        return std::string(unsafe::ptr_cast<const char>(data), len);
+        return std::string_view(unsafe::ptr_cast<const char>(data), len);
     }
-    return "";
+    return {};
 }
 
 bool TlsStream::EnableRawRead() noexcept {

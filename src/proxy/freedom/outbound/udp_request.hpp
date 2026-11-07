@@ -42,7 +42,9 @@ public:
             co_await write.SendTo(udp::endpoint(*datagram.target->resolved_addr, datagram.target->port),
                                  std::move(payload));
         } else {
-            auto target = co_await ResolveUdpEndpoint(dns_, *datagram.target, socket_, write, io_);
+            auto& reactor = ExecutionDomain::Current()
+                ? ExecutionDomain::Current()->Reactor() : io_;
+            auto target = co_await ResolveUdpEndpoint(dns_, *datagram.target, socket_, write, reactor);
             if (!target) throw transport::LinkError(target.error());
             co_await write.SendTo(*target, std::move(payload));
         }

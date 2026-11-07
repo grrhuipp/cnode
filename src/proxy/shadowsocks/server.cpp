@@ -80,12 +80,15 @@ public:
         }
         stream_ = &stream;
     }
+    ~ResponseBodyWriter() override {
+        OPENSSL_cleanse(master_key_.data(), master_key_.size());
+        OPENSSL_cleanse(request_salt_.bytes.data(), request_salt_.bytes.size());
+    }
 
     ResponseBodyWriter(const ResponseBodyWriter&) = delete;
     ResponseBodyWriter& operator=(const ResponseBodyWriter&) = delete;
     ResponseBodyWriter(ResponseBodyWriter&&) = delete;
     ResponseBodyWriter& operator=(ResponseBodyWriter&&) = delete;
-
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
         if (!stream_) {
             throw IoSystemError(io_error::not_connected, "Shadowsocks response writer has no stream");
@@ -334,6 +337,9 @@ private:
             return false;
         }
 
+        OPENSSL_cleanse(state.master_key_.data(), state.master_key_.size());
+        OPENSSL_cleanse(state.request_salt_.bytes.data(), state.request_salt_.bytes.size());
+        state.request_salt_.size = 0;
         state.write_init_ = true;
         return true;
     }
@@ -415,6 +421,9 @@ private:
                 first_payload.size() + SsAeadCipher::kTagSize));
             state.pending_prefix_.push_back(std::move(payload_cipher));
         }
+        OPENSSL_cleanse(state.master_key_.data(), state.master_key_.size());
+        OPENSSL_cleanse(state.request_salt_.bytes.data(), state.request_salt_.bytes.size());
+        state.request_salt_.size = 0;
         state.write_init_ = true;
         return true;
     }

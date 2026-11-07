@@ -1497,13 +1497,22 @@ void Log::WriteConsole(LogLevel level,
     // ordinary diagnostic macros perform the configured severity check first.
     if (level != LogLevel::ERROR && !ShouldLog(level)) return;
     if (message.empty()) return;
-    if (level >= LogLevel::WARN && initialized_.load(std::memory_order_acquire)) {
-        WriteSystem(level, message, location);
+    const int64_t timestamp_us = NowMicros();
+    if (level >= LogLevel::WARN && ShouldLog(level) &&
+        initialized_.load(std::memory_order_acquire)) {
+        g_async_log_backend.Enqueue(LogRecord{
+            .channel = LogChannel::Error,
+            .level = level,
+            .timestamp_us = timestamp_us,
+            .message = message,
+            .source_file = location.file_name(),
+            .connection = std::nullopt,
+        });
     }
     LogRecord record{
         .channel = LogChannel::Console,
         .level = level,
-        .timestamp_us = NowMicros(),
+        .timestamp_us = timestamp_us,
         .message = std::move(message),
         .source_file = location.file_name(),
         .connection = std::nullopt,
@@ -1516,7 +1525,10 @@ void Log::WritePanel(LogLevel level,
                      std::string message,
                      std::source_location location) {
     if (!ShouldLog(level)) return;
-    if (level < LogLevel::INFO || level >= LogLevel::WARN) {
+    const bool initialized = initialized_.load(std::memory_order_acquire);
+    if (level < LogLevel::INFO && !initialized) return;
+    const int64_t timestamp_us = NowMicros();
+    if ((level < LogLevel::INFO || level >= LogLevel::WARN) && initialized) {
         auto diagnostic = context.node_id > 0
             ? std::format("[{}/{}] {}", context.name, context.node_id, message)
             : std::format("[{}] {}", context.name, message);
@@ -1526,15 +1538,20 @@ void Log::WritePanel(LogLevel level,
         if (!context.type.empty()) {
             diagnostic.append(" Type=").append(ConsoleField(context.type));
         }
-        if (initialized_.load(std::memory_order_acquire) || level < LogLevel::INFO) {
-            WriteSystem(level, std::move(diagnostic), location);
-        }
+        g_async_log_backend.Enqueue(LogRecord{
+            .channel = LogChannel::Error,
+            .level = level,
+            .timestamp_us = timestamp_us,
+            .message = std::move(diagnostic),
+            .source_file = location.file_name(),
+            .connection = std::nullopt,
+        });
     }
     if (level < LogLevel::INFO) return;
     LogRecord record{
         .channel = LogChannel::Console,
         .level = level,
-        .timestamp_us = NowMicros(),
+        .timestamp_us = timestamp_us,
         .message = std::move(message),
         .source_file = location.file_name(),
         .connection = std::nullopt,

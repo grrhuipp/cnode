@@ -163,6 +163,10 @@ net::awaitable<tl::expected<std::string, std::string>> ReadChunkedBody(
                         "invalid chunked HTTP response: HTTP response headers too large");
                 }
                 if (trailer->empty()) {
+                    if (buffer.size() > 0) {
+                        co_return tl::unexpected(
+                            "invalid chunked HTTP response: trailing bytes after chunked body");
+                    }
                     co_return decoded;
                 }
             }
@@ -447,8 +451,11 @@ net::awaitable<Response> ReadResponse(Stream& stream) {
                 result.body = "HTTP body too large";
                 co_return result;
             }
-        } else if (result.body.size() > *content_length) {
-            result.body.resize(*content_length);
+        }
+        if (result.body.size() > *content_length || buffer.size() > 0) {
+            result.status = -1;
+            result.body = "invalid HTTP response body: trailing bytes after Content-Length body";
+            co_return result;
         }
     } else {
         for (;;) {

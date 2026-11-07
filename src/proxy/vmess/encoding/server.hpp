@@ -32,11 +32,20 @@ public:
     void SetRequest(VMessRequest request);
 
     std::unique_ptr<transport::MultiBufferReader> DecodeRequestBody(
-        AsyncStream& stream);
+        AsyncStream& stream,
+        const TargetAddress& udp_target);
+    std::unique_ptr<transport::MultiBufferReader> DecodeRequestBody(
+        AsyncStream& stream) {
+        return DecodeRequestBody(stream, request_.target);
+    }
 
     std::unique_ptr<transport::MultiBufferWriter> EncodeResponseBodyWithHeader(
-        AsyncStream& stream);
-
+        AsyncStream& stream,
+        const TargetAddress& udp_target);
+    std::unique_ptr<transport::MultiBufferWriter> EncodeResponseBodyWithHeader(
+        AsyncStream& stream) {
+        return EncodeResponseBodyWithHeader(stream, request_.target);
+    }
 private:
     const TimedUserValidator* validator_ = nullptr;
     std::string_view tag_;

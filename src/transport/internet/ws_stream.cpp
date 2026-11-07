@@ -19,7 +19,7 @@ namespace acpp {
 
 namespace ws {
 
-std::string ComputeWsAccept(std::string_view ws_key) {
+std::array<char, 28> EncodeWsAccept(std::string_view ws_key) noexcept {
     constexpr std::string_view kWsGuid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
     uint8_t sha1[SHA_DIGEST_LENGTH];
     SHA_CTX context;
@@ -27,7 +27,16 @@ std::string ComputeWsAccept(std::string_view ws_key) {
     SHA1_Update(&context, ws_key.data(), ws_key.size());
     SHA1_Update(&context, kWsGuid.data(), kWsGuid.size());
     SHA1_Final(sha1, &context);
-    return Base64Encode(sha1, sizeof(sha1));
+    std::array<uint8_t, 29> encoded{};
+    EVP_EncodeBlock(encoded.data(), sha1, sizeof(sha1));
+    std::array<char, 28> out{};
+    std::memcpy(out.data(), encoded.data(), out.size());
+    return out;
+}
+
+std::string ComputeWsAccept(std::string_view ws_key) {
+    const auto accept = EncodeWsAccept(ws_key);
+    return std::string(accept.data(), accept.size());
 }
 
 }  // namespace ws
@@ -120,21 +129,35 @@ bool BaseWsStream::Utf8State::Consume(std::span<const uint8_t> bytes) noexcept {
     throw IoSystemError(io_error::connection_reset, reason);
 }
 
-net::awaitable<size_t> BaseWsStream::ReadSome(uint8_t* data, size_t size) {
-    if (closed_ || read_closed_) co_return 0;
-    const size_t pending = pending_data_.ConsumePrefixTo(std::span<uint8_t>(data, size));
-    if (pending != 0) co_return pending;
-    size_t n = 0;
+net::awaitable<bool> BaseWsStream::EnsurePendingData() {
+    if (closed_ || read_closed_) co_return false;
+    while (!pending_data_.empty()) {
+        if (const buf::Buffer* front = *pending_data_.begin();
+            front && !front->IsEmpty()) {
+            co_return true;
+        }
+        pending_data_.drop_front(1);
+    }
+    buf::MultiBuffer next;
     try {
-        n = co_await inner_->AsyncRead(net::buffer(data, size));
+        next = co_await inner_->ReadMultiBuffer();
     } catch (const IoSystemError& error) {
         if (error.code() != io_error::eof) throw;
         if (!closed_ && !read_closed_) ProtocolFailure("WebSocket truncated without Close");
-        co_return 0;
+        co_return false;
     }
-    if (n == 0 && !closed_ && !read_closed_)
-        ProtocolFailure("WebSocket truncated without Close");
-    co_return n;
+    if (next.empty()) {
+        if (!closed_ && !read_closed_)
+            ProtocolFailure("WebSocket truncated without Close");
+        co_return false;
+    }
+    next.MoveTo(pending_data_);
+    co_return !pending_data_.empty();
+}
+
+net::awaitable<size_t> BaseWsStream::ReadSome(uint8_t* data, size_t size) {
+    if (!co_await EnsurePendingData()) co_return 0;
+    co_return pending_data_.ConsumePrefixTo(std::span<uint8_t>(data, size));
 }
 
 net::awaitable<bool> BaseWsStream::FillHeader() {
@@ -318,6 +341,21 @@ net::awaitable<size_t> BaseWsStream::AsyncRead(net::mutable_buffer buffer) {
 
 net::awaitable<buf::MultiBuffer> BaseWsStream::ReadMultiBuffer() {
     if (!co_await PrepareNextDataFrame()) co_return buf::MultiBuffer{};
+    if (!co_await EnsurePendingData()) co_return buf::MultiBuffer{};
+    if (buf::Buffer* front = *pending_data_.begin();
+        front && front->Len() <= frame_payload_remaining_) {
+        buf::BufferGuard output = pending_data_.pop_front();
+        pending_data_.ReleaseIfIdle();
+        auto bytes = output->Bytes();
+        if (frame_masked_)
+            ws::MaskData(bytes.data(), bytes.size(), frame_mask_key_.data(), frame_mask_offset_);
+        frame_mask_offset_ += bytes.size();
+        frame_payload_remaining_ -= bytes.size();
+        if (text_message_ && !text_utf8_.Consume(bytes))
+            ProtocolFailure("WebSocket invalid UTF-8 text message");
+        if (frame_payload_remaining_ == 0) FinishDataFrame();
+        co_return buf::MultiBuffer{std::move(output)};
+    }
     buf::BufferGuard output{buf::Buffer::New()};
     if (!output) throw std::bad_alloc();
     const size_t n = co_await ReadPayload(net::buffer(output->Tail().data(), output->Available()));
@@ -554,7 +592,9 @@ net::awaitable<WsHandshakeResult> WsClientStream::Handshake(
         LOG_CONN_DEBUG(conn_id_, "WebSocket client failed to generate handshake nonce");
         co_return tl::unexpected(ErrorCode::INTERNAL);
     }
-    const std::string ws_key = Base64Encode(raw_key, sizeof(raw_key));
+    std::array<uint8_t, 25> ws_key_buf{};
+    EVP_EncodeBlock(ws_key_buf.data(), raw_key, sizeof(raw_key));
+    const std::string_view ws_key(reinterpret_cast<const char*>(ws_key_buf.data()), 24);
 
     const std::string_view req_path = EffectiveHttpPath(path);
     host = transport::internet::ResolveHttpUpgradeHost(host, {}, headers);
@@ -571,8 +611,8 @@ net::awaitable<WsHandshakeResult> WsClientStream::Handshake(
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
-    const std::string expected_accept = ws::ComputeWsAccept(ws_key);
-    if (accept != expected_accept) {
+    const auto expected_accept = ws::EncodeWsAccept(ws_key);
+    if (accept != std::string_view(expected_accept.data(), expected_accept.size())) {
         LOG_CONN_DEBUG(conn_id_, "WebSocket client received invalid Sec-WebSocket-Accept");
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }

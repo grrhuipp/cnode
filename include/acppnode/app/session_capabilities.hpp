@@ -161,6 +161,8 @@ public:
         std::shared_ptr<ExecutionDomain> domain);
     // Called within the session domain after its business and native I/O join.
     net::awaitable<void> Retire(std::shared_ptr<PhysicalSessionRecord> record);
+    void CompleteOnOwner(const std::shared_ptr<PhysicalSessionRecord>& record);
+    void CancelRegistration(const std::shared_ptr<PhysicalSessionRecord>& record) noexcept;
     net::awaitable<void> AsyncJoin();
 private:
     net::awaitable<void> RetireOnOwner(std::shared_ptr<PhysicalSessionRecord> record);

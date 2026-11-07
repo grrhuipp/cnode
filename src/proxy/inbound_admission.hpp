@@ -42,17 +42,21 @@ namespace acpp::proxy {
 struct InboundRequestTarget {
     Network network = Network::TCP;
     TargetAddress target;
+    std::optional<ForwardedMetadata> forwarded = std::nullopt;
 };
 
 // The single writer of a request target into the session.
 inline void BindInboundRequestTarget(
     session::Context& ctx,
     InboundRequestTarget request) {
+    if (request.forwarded) {
+        ctx.inbound.ApplyForwardedMetadata(*request.forwarded);
+    }
     ctx.content.network = request.network;
     ctx.outbound.original_target = request.target;
     ctx.outbound.target = std::move(request.target);
+    ctx.outbound.route_target = ctx.outbound.original_target;
 }
-
 // The single writer of an authenticated identity and its request target into
 // the session. Protocols call it as soon as the credential matches, so their
 // own later protocol rejections (flow, replay, transport) log the user and

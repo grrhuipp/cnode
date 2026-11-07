@@ -6,7 +6,11 @@
 #include <vector>
 #include <unordered_map>
 
-namespace acpp::app {
+namespace acpp {
+
+class ExecutionDomain;
+
+namespace app {
 
 class SessionTrackingState;
 
@@ -30,6 +34,7 @@ struct UserTrafficCounters {
 struct DomainTrafficSnapshot {
     std::shared_ptr<SessionTrackingState> owner;
     UserTrafficCounters counters;
+    std::weak_ptr<ExecutionDomain> domain;
 };
 
 struct UserTrafficSnapshot : UserTrafficCounters {
@@ -45,4 +50,5 @@ struct UserTrafficSnapshot : UserTrafficCounters {
     }
 };
 
-}  // namespace acpp::app
+}  // namespace app
+}  // namespace acpp

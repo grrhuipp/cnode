@@ -4,7 +4,6 @@
 #include "acppnode/common/string_hash.hpp"
 
 #include <cstdint>
-#include <mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -70,7 +69,6 @@ private:
         ActiveSession* active_head = nullptr;
     };
 
-    mutable std::mutex mutex_;
     std::unordered_map<std::string,
                        AccountBucket,
                        TransparentStringHash,

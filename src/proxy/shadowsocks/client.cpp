@@ -160,17 +160,22 @@ bool WriteIdentityHeadersTo(const SsCipherInfo& cipher_info,
     return true;
 }
 
-net::awaitable<tl::expected<WriteTCPRequestResult, ErrorCode>>
-WriteTCPRequest2022(const TargetAddress& target,
-                    const SsCipherInfo& cipher_info,
-                    const KeyBytes& master_key,
-                    std::span<const KeyBytes> psk_chain,
-                    AsyncStream& stream,
-                    ForwardedMetadataView forwarded) {
+struct PreparedTCPRequestHandshake {
+    buf::MultiBuffer handshake_mb;
+    std::optional<SsAeadCipher> write_cipher;
+    KeyBytes request_salt;
+};
+
+tl::expected<PreparedTCPRequestHandshake, ErrorCode>
+PrepareTCPRequest2022(const TargetAddress& target,
+                      const SsCipherInfo& cipher_info,
+                      const KeyBytes& master_key,
+                      std::span<const KeyBytes> psk_chain,
+                      ForwardedMetadataView forwarded) {
     if (cipher_info.salt_size > KeyBytes::kMaxSize ||
         cipher_info.key_size > KeyBytes::kMaxSize ||
         master_key.size < cipher_info.key_size) {
-        co_return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
+        return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
     }
     if (psk_chain.empty()) {
         psk_chain = std::span<const KeyBytes>(&master_key, 1);
@@ -180,27 +185,27 @@ WriteTCPRequest2022(const TargetAddress& target,
     const size_t addr_size = EncodeAddressTo(
         target, addr_bytes.data(), addr_bytes.size(), AddressWireFormat::Socks5, forwarded);
     if (addr_size == 0) {
-        co_return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+        return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
-    forwarded = {};
 
     constexpr size_t kPaddingLen = 1;
     const size_t variable_len = addr_size + 2 + kPaddingLen;
     if (variable_len > kSs2022MaxChunkPayload) {
-        co_return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+        return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
 
-    KeyBytes request_salt;
-    request_salt.size = cipher_info.salt_size;
-    if (RAND_bytes(request_salt.data(), static_cast<int>(request_salt.size)) != 1) {
-        co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+    PreparedTCPRequestHandshake prepared;
+    prepared.request_salt.size = cipher_info.salt_size;
+    if (RAND_bytes(prepared.request_salt.data(),
+                   static_cast<int>(prepared.request_salt.size)) != 1) {
+        return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
     }
 
     std::array<uint8_t, 32> write_subkey{};
     if (!Derive2022Subkey(master_key.data(), cipher_info.key_size,
-                          request_salt.data(), request_salt.size,
+                          prepared.request_salt.data(), prepared.request_salt.size,
                           write_subkey.data())) {
-        co_return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+        return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
 
     std::array<uint8_t, kSs2022RequestFixedHeaderSize> fixed_plain{};
@@ -215,64 +220,160 @@ WriteTCPRequest2022(const TargetAddress& target,
     StoreU16BE(variable_plain.data() + addr_size, static_cast<uint16_t>(kPaddingLen));
     if (RAND_bytes(variable_plain.data() + addr_size + 2, static_cast<int>(kPaddingLen)) != 1) {
         OPENSSL_cleanse(write_subkey.data(), write_subkey.size());
-        co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+        return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
     }
 
-    SsAeadCipher write_cipher(cipher_info.type, write_subkey.data(), cipher_info.key_size,
-                              proxy::AeadDirection::Encrypt);
+    prepared.write_cipher.emplace(
+        cipher_info.type, write_subkey.data(), cipher_info.key_size,
+        proxy::AeadDirection::Encrypt);
     OPENSSL_cleanse(write_subkey.data(), write_subkey.size());
     const size_t handshake_size =
-        request_salt.size + (psk_chain.size() > 0 ? (psk_chain.size() - 1) * 16 : 0) +
+        prepared.request_salt.size +
+        (psk_chain.size() > 0 ? (psk_chain.size() - 1) * 16 : 0) +
         fixed_plain.size() + SsAeadCipher::kTagSize +
         variable_len + SsAeadCipher::kTagSize;
     if (handshake_size > buf::Buffer::kSize) {
-        co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+        return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
     }
 
     buf::BufferGuard handshake{buf::Buffer::New()};
     if (!handshake) {
-        co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+        return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
     }
 
-    std::memcpy(handshake->Tail().data(), request_salt.data(), request_salt.size);
-    handshake->Produce(static_cast<uint32_t>(request_salt.size));
+    std::memcpy(handshake->Tail().data(),
+                prepared.request_salt.data(),
+                prepared.request_salt.size);
+    handshake->Produce(static_cast<uint32_t>(prepared.request_salt.size));
 
     size_t identity_len = 0;
     if (!WriteIdentityHeadersTo(
             cipher_info,
             psk_chain,
-            request_salt.span(),
+            prepared.request_salt.span(),
             handshake->Tail().data(),
             handshake->Available(),
             identity_len)) {
-        co_return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
+        return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
     }
     handshake->Produce(static_cast<uint32_t>(identity_len));
 
     if (handshake->Available() < fixed_plain.size() + SsAeadCipher::kTagSize) {
-        co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+        return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
     }
     auto nonce0 = MakeNonce(0);
-    if (!write_cipher.Encrypt(nonce0.data(), fixed_plain.data(), fixed_plain.size(),
-                              handshake->Tail().data())) {
-        co_return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+    if (!prepared.write_cipher->Encrypt(
+            nonce0.data(), fixed_plain.data(), fixed_plain.size(),
+            handshake->Tail().data())) {
+        return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
     handshake->Produce(
         static_cast<uint32_t>(fixed_plain.size() + SsAeadCipher::kTagSize));
 
     if (handshake->Available() < variable_len + SsAeadCipher::kTagSize) {
-        co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+        return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
     }
     auto nonce1 = MakeNonce(1);
-    if (!write_cipher.Encrypt(nonce1.data(), variable_plain.data(), variable_len,
-                              handshake->Tail().data())) {
-        co_return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+    if (!prepared.write_cipher->Encrypt(
+            nonce1.data(), variable_plain.data(), variable_len,
+            handshake->Tail().data())) {
+        return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
     handshake->Produce(static_cast<uint32_t>(variable_len + SsAeadCipher::kTagSize));
 
+    prepared.handshake_mb.reserve(1);
+    prepared.handshake_mb.push_back(std::move(handshake));
+    return prepared;
+}
+
+tl::expected<PreparedTCPRequestHandshake, ErrorCode>
+PrepareTCPRequestLegacy(const TargetAddress& target,
+                        const SsCipherInfo& cipher_info,
+                        const KeyBytes& master_key,
+                        ForwardedMetadataView forwarded) {
+    if (cipher_info.salt_size > 64 || cipher_info.key_size > 64 ||
+        master_key.size < cipher_info.key_size) {
+        return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
+    }
+
+    std::array<uint8_t, kMaxEncodedAddressSize> addr_bytes{};
+    const size_t addr_size = EncodeAddressTo(
+        target, addr_bytes.data(), addr_bytes.size(), AddressWireFormat::Socks5, forwarded);
+    if (addr_size == 0 || addr_size > kMaxChunkPayload) {
+        return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+    }
+
+    std::array<uint8_t, 64> client_salt{};
+    if (RAND_bytes(client_salt.data(), static_cast<int>(cipher_info.salt_size)) != 1) {
+        return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+    }
+
+    std::array<uint8_t, 64> write_subkey{};
+    if (!DeriveSubkey(master_key.data(), cipher_info.key_size,
+                      client_salt.data(), cipher_info.salt_size,
+                      write_subkey.data())) {
+        return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+    }
+
+    buf::BufferGuard out{buf::Buffer::New()};
+    if (!out) {
+        OPENSSL_cleanse(write_subkey.data(), write_subkey.size());
+        return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+    }
+
+    std::memcpy(out->Tail().data(), client_salt.data(), cipher_info.salt_size);
+    out->Produce(static_cast<uint32_t>(cipher_info.salt_size));
+
+    PreparedTCPRequestHandshake prepared;
+    prepared.write_cipher.emplace(
+        cipher_info.type, write_subkey.data(), cipher_info.key_size,
+        proxy::AeadDirection::Encrypt);
+    OPENSSL_cleanse(write_subkey.data(), write_subkey.size());
+    const size_t payload_size = addr_size;
+    const uint8_t len_plain[2] = {
+        static_cast<uint8_t>(payload_size >> 8),
+        static_cast<uint8_t>(payload_size & 0xFF)
+    };
+
+    auto nonce_l = MakeNonce(0);
+    if (!prepared.write_cipher->Encrypt(nonce_l.data(), len_plain, 2, out->Tail().data())) {
+        return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+    }
+    out->Produce(static_cast<uint32_t>(2 + SsAeadCipher::kTagSize));
+
+    auto nonce_p = MakeNonce(1);
+    if (!prepared.write_cipher->Encrypt(
+            nonce_p.data(), addr_bytes.data(), addr_size,
+            out->Tail().data())) {
+        return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+    }
+    out->Produce(static_cast<uint32_t>(addr_size + SsAeadCipher::kTagSize));
+
+    prepared.handshake_mb.reserve(1);
+    prepared.handshake_mb.push_back(std::move(out));
+    return prepared;
+}
+
+net::awaitable<tl::expected<WriteTCPRequestResult, ErrorCode>>
+WriteTCPRequest2022(const TargetAddress& target,
+                    const SsCipherInfo& cipher_info,
+                    const KeyBytes& master_key,
+                    std::span<const KeyBytes> psk_chain,
+                    AsyncStream& stream,
+                    ForwardedMetadataView forwarded) {
     buf::MultiBuffer handshake_mb;
-    handshake_mb.reserve(1);
-    handshake_mb.push_back(std::move(handshake));
+    std::optional<SsAeadCipher> write_cipher;
+    KeyBytes request_salt;
+    {
+        auto prepared = PrepareTCPRequest2022(
+            target, cipher_info, master_key, psk_chain, forwarded);
+        if (!prepared) {
+            co_return tl::unexpected(prepared.error());
+        }
+        handshake_mb = std::move(prepared->handshake_mb);
+        write_cipher = std::move(prepared->write_cipher);
+        request_salt = prepared->request_salt;
+    }
     try {
         co_await stream.WriteMultiBuffer(std::move(handshake_mb));
     } catch (const IoSystemError& e) {
@@ -283,7 +384,7 @@ WriteTCPRequest2022(const TargetAddress& target,
 
     WriteTCPRequestResult result;
     result.request_writer = std::make_unique<RequestBodyWriter>(
-        std::move(write_cipher), 2, stream);
+        std::move(*write_cipher), 2, stream);
     result.request_salt = request_salt;
     co_return result;
 }
@@ -302,67 +403,18 @@ WriteTCPRequest(const TargetAddress& target,
             target, cipher_info, master_key, psk_chain, stream, forwarded);
     }
 
-    if (cipher_info.salt_size > 64 || cipher_info.key_size > 64 ||
-        master_key.size < cipher_info.key_size) {
-        co_return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
-    }
-
     try {
-        std::array<uint8_t, kMaxEncodedAddressSize> addr_bytes{};
-        const size_t addr_size = EncodeAddressTo(
-            target, addr_bytes.data(), addr_bytes.size(), AddressWireFormat::Socks5, forwarded);
-        if (addr_size == 0 || addr_size > kMaxChunkPayload) {
-            co_return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
-        }
-        forwarded = {};
-
-        std::array<uint8_t, 64> client_salt{};
-        if (RAND_bytes(client_salt.data(), static_cast<int>(cipher_info.salt_size)) != 1) {
-            co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
-        }
-
-        std::array<uint8_t, 64> write_subkey{};
-        if (!DeriveSubkey(master_key.data(), cipher_info.key_size,
-                          client_salt.data(), cipher_info.salt_size,
-                          write_subkey.data())) {
-            co_return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
-        }
-
-        buf::BufferGuard out{buf::Buffer::New()};
-        if (!out) {
-            OPENSSL_cleanse(write_subkey.data(), write_subkey.size());
-            co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
-        }
-
-        std::memcpy(out->Tail().data(), client_salt.data(), cipher_info.salt_size);
-        out->Produce(static_cast<uint32_t>(cipher_info.salt_size));
-
-        SsAeadCipher write_cipher(cipher_info.type, write_subkey.data(), cipher_info.key_size,
-                                  proxy::AeadDirection::Encrypt);
-        OPENSSL_cleanse(write_subkey.data(), write_subkey.size());
-        const size_t payload_size = addr_size;
-        const uint8_t len_plain[2] = {
-            static_cast<uint8_t>(payload_size >> 8),
-            static_cast<uint8_t>(payload_size & 0xFF)
-        };
-
-        auto nonce_l = MakeNonce(0);
-        if (!write_cipher.Encrypt(nonce_l.data(), len_plain, 2, out->Tail().data())) {
-            co_return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
-        }
-        out->Produce(static_cast<uint32_t>(2 + SsAeadCipher::kTagSize));
-
-        auto nonce_p = MakeNonce(1);
-        if (!write_cipher.Encrypt(
-                nonce_p.data(), addr_bytes.data(), addr_size,
-                out->Tail().data())) {
-            co_return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
-        }
-        out->Produce(static_cast<uint32_t>(addr_size + SsAeadCipher::kTagSize));
-
         buf::MultiBuffer handshake_mb;
-        handshake_mb.reserve(1);
-        handshake_mb.push_back(std::move(out));
+        std::optional<SsAeadCipher> write_cipher;
+        {
+            auto prepared = PrepareTCPRequestLegacy(
+                target, cipher_info, master_key, forwarded);
+            if (!prepared) {
+                co_return tl::unexpected(prepared.error());
+            }
+            handshake_mb = std::move(prepared->handshake_mb);
+            write_cipher = std::move(prepared->write_cipher);
+        }
 
         try {
             co_await stream.WriteMultiBuffer(std::move(handshake_mb));
@@ -374,7 +426,7 @@ WriteTCPRequest(const TargetAddress& target,
 
         WriteTCPRequestResult result;
         result.request_writer = std::make_unique<RequestBodyWriter>(
-            std::move(write_cipher), 2, stream);
+            std::move(*write_cipher), 2, stream);
         co_return result;
     } catch (const std::bad_alloc&) {
         co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);

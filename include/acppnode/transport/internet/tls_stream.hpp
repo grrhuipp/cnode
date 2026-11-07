@@ -101,7 +101,7 @@ public:
     net::awaitable<bool> Handshake();
 
     // 获取协商的 ALPN 协议
-    std::string NegotiatedAlpn() const;
+    std::string_view NegotiatedAlpn() const;
 
     // AsyncStream 接口实现
     net::awaitable<std::size_t> AsyncRead(net::mutable_buffer buf) override;

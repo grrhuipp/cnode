@@ -1,4 +1,17 @@
 #include "acppnode/app/request_load_state.hpp"
+#include "acppnode/app/session_group_executor.hpp"
+#include "acppnode/app/session_tracking.hpp"
+
+#include <type_traits>
+#include <unordered_map>
+
+static_assert(
+    sizeof(acpp::app::SessionTrackingState) ==
+    sizeof(std::unordered_map<std::string, int>));
+static_assert(
+    std::is_same_v<
+        decltype(acpp::app::DomainTrafficSnapshot::domain),
+        std::weak_ptr<acpp::ExecutionDomain>>);
 
 int main() {
     acpp::app::RequestLoadState load(3, 7);

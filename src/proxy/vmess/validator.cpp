@@ -16,8 +16,6 @@
 #include <chrono>
 #include <cstring>
 #include <utility>
-#include <deque>
-#include <unordered_map>
 
 namespace acpp {
 namespace vmess {
@@ -52,8 +50,8 @@ struct TimedUserValidator::Impl : memory::ThreadAllocated {
         static constexpr int64_t kCleanupIntervalSeconds = 30;
         static constexpr size_t kMaxEntries = 65536;
 
-        std::unordered_map<SessionKey, int64_t, SessionKeyHash> entries;
-        std::deque<std::pair<SessionKey, int64_t>> order;
+        memory::ThreadLocalUnorderedMap<SessionKey, int64_t, SessionKeyHash> entries;
+        memory::ThreadLocalDeque<std::pair<SessionKey, int64_t>> order;
         int64_t last_cleanup = 0;
 
         SessionHistory()

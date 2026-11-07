@@ -62,8 +62,7 @@ tl::expected<const json::value*, std::string> ResolveAlias(
     if (secondary_val && secondary_val->is_null()) {
         secondary_val = nullptr;
     }
-    if (primary_val && secondary_val &&
-        json::serialize(*primary_val) != json::serialize(*secondary_val)) {
+    if (primary_val && secondary_val && *primary_val != *secondary_val) {
         return tl::unexpected(std::format(
             "{} aliases '{}' and '{}' must match", context, primary, secondary));
     }

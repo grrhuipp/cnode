@@ -166,21 +166,48 @@ std::string JoinRouteMatches(const json::array& matches) {
         if (entry.empty()) {
             throw std::invalid_argument("block route match entries must not be empty");
         }
+        bool escaped = false;
+        bool in_char_class = false;
+        size_t paren_depth = 0;
         for (const unsigned char ch : entry) {
             if (ch < 0x20 || ch == 0x7f) {
                 throw std::invalid_argument(
                     "block route match entries must not contain control characters");
             }
+            if (escaped) {
+                escaped = false;
+                continue;
+            }
+            if (ch == '\\') {
+                escaped = true;
+                continue;
+            }
+            if (in_char_class) {
+                if (ch == ']') {
+                    in_char_class = false;
+                }
+                continue;
+            }
+            if (ch == '[') {
+                in_char_class = true;
+            } else if (ch == '(') {
+                ++paren_depth;
+            } else if (ch == ')') {
+                if (paren_depth == 0) {
+                    throw std::invalid_argument(
+                        "block route match entries must not contain unmatched ')'");
+                }
+                --paren_depth;
+            }
         }
-        size_t trailing_backslashes = 0;
-        for (size_t i = entry.size(); i > 0 && entry[i - 1] == '\\'; --i) {
-            ++trailing_backslashes;
-        }
-        if ((trailing_backslashes % 2) != 0) {
+        if (escaped) {
             throw std::invalid_argument(
                 "block route match entries must not end with an unescaped backslash");
         }
-        (void)std::regex(std::string(entry));
+        if (in_char_class || paren_depth != 0) {
+            throw std::invalid_argument(
+                "block route match entries must not contain unclosed group or character class");
+        }
         if (!pattern.empty()) {
             pattern.push_back('|');
         }
@@ -224,15 +251,25 @@ ExtractBlockDetectRules(const json::object& config) {
             throw std::invalid_argument("block route match must be an array");
         }
 
+        const auto& matches = match_value->as_array();
+        const std::string pattern = JoinRouteMatches(matches);
+        if (pattern.empty()) {
+            continue;
+        }
         try {
-            const std::string pattern = JoinRouteMatches(match_value->as_array());
-            if (pattern.empty()) {
-                continue;
-            }
             rule::DetectRule rule;
             rule.Pattern = std::regex(pattern);
             rules.push_back(std::move(rule));
         } catch (const std::regex_error& e) {
+            for (size_t j = 0; j < matches.size(); ++j) {
+                try {
+                    (void)std::regex(std::string(matches[j].as_string()));
+                } catch (const std::regex_error& entry_error) {
+                    throw std::invalid_argument(std::format(
+                        "Invalid block route detect rule {} (match {}): {}",
+                        i, j, entry_error.what()));
+                }
+            }
             throw std::invalid_argument(std::format(
                 "Invalid block route detect rule {}: {}", i, e.what()));
         }

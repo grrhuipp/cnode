@@ -282,7 +282,7 @@ struct DialResult : ResultStatus {
 
     [[nodiscard]] static DialResult Fail(
         ErrorCode code,
-        const std::string& msg = "",
+        std::string_view msg = "",
         int32_t native_error = 0) {
         DialResult r;
         r.SetError(code, msg);

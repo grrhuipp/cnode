@@ -461,34 +461,36 @@ net::awaitable<ErrorCode> AnyTLSDemuxSession::ProcessUdpSubstream(
     proxy::uot::Version uot_version,
     buf::MultiBuffer pending,
     std::chrono::steady_clock::time_point opened_at) {
-    std::optional<proxy::uot::PreparedRequest> prepared;
-    auto read_header = [&]() -> net::awaitable<ErrorCode> {
-        auto uot_header = co_await proxy::uot::ReadUotRequestHeader(
-            uot_version, sub, std::move(pending), ErrorCode::CONNECTION_CLOSED);
-        if (!uot_header) co_return uot_header.error();
-        prepared.emplace(std::move(*uot_header));
-        co_return ErrorCode::OK;
-    };
-    if (const auto error = co_await RunHandshakePhase(sub, opened_at, read_header);
-        error != ErrorCode::OK) {
-        co_return error;
-    }
-    if (sub.IsClosed()) co_return ErrorCode::CONNECTION_CLOSED;
-
+    std::optional<proxy::uot::PacketReader> uot_reader;
+    bool is_connect = false;
     session::Context& ctx = sub.ctx;
-    const bool is_connect = prepared->is_connect;
-    if (prepared->forwarded) {
-        ctx.inbound.ApplyForwardedMetadata(*prepared->forwarded);
+    {
+        std::optional<proxy::uot::PreparedRequest> prepared;
+        auto read_header = [&]() -> net::awaitable<ErrorCode> {
+            auto uot_header = co_await proxy::uot::ReadUotRequestHeader(
+                uot_version, sub, std::move(pending), ErrorCode::CONNECTION_CLOSED);
+            if (!uot_header) co_return uot_header.error();
+            prepared.emplace(std::move(*uot_header));
+            co_return ErrorCode::OK;
+        };
+        if (const auto error = co_await RunHandshakePhase(sub, opened_at, read_header);
+            error != ErrorCode::OK) {
+            co_return error;
+        }
+        if (sub.IsClosed()) co_return ErrorCode::CONNECTION_CLOSED;
+
+        is_connect = prepared->is_connect;
+        proxy::BindInboundRequestTarget(
+            ctx,
+            proxy::InboundRequestTarget{
+                Network::UDP,
+                prepared->destination,
+                std::move(prepared->forwarded)});
+        uot_reader.emplace(sub, std::move(*prepared));
     }
-    ctx.outbound.original_target = prepared->destination;
-    ctx.outbound.target = ctx.outbound.original_target;
-    ctx.outbound.route_target = ctx.outbound.original_target;
-    ctx.content.network = Network::UDP;
-    proxy::uot::PacketReader uot_reader(sub, std::move(*prepared));
-    prepared.reset();
     proxy::uot::PacketWriter uot_writer(sub, is_connect, ctx.outbound.target);
     (void)co_await dispatcher_.Dispatch(io_context_, policy_, nullptr,
-        transport::Link{&uot_reader, &uot_writer},
+        transport::Link{&*uot_reader, &uot_writer},
         InitialPayload{}, ctx, stats_, timeouts_);
     co_return ErrorCode::OK;
 }
@@ -516,17 +518,19 @@ net::awaitable<ErrorCode> AnyTLSDemuxSession::ProcessStream(
                                             .allow_metadata = true});
         if (!parsed) co_return parsed.error();
         pending.DropPrefixBytes(parsed->consumed);
-        if (parsed->forwarded) {
-            ctx.inbound.ApplyForwardedMetadata(*parsed->forwarded);
+        if (pending.empty()) {
+            pending.ReleaseIfIdle();
         }
         uot_version = proxy::uot::VersionFromMagicAddress(parsed->target);
         if (!parsed->target.IsValid() && !uot_version) {
             co_return ErrorCode::PROTOCOL_INVALID_ADDRESS;
         }
-        ctx.outbound.original_target = uot_version ? TargetAddress{} : std::move(parsed->target);
-        ctx.outbound.target = ctx.outbound.original_target;
-        ctx.outbound.route_target = ctx.outbound.original_target;
-        ctx.content.network = uot_version ? Network::UDP : Network::TCP;
+        proxy::BindInboundRequestTarget(
+            ctx,
+            proxy::InboundRequestTarget{
+                uot_version ? Network::UDP : Network::TCP,
+                uot_version ? TargetAddress{} : std::move(parsed->target),
+                std::move(parsed->forwarded)});
         if (session_version_ == anytls::SessionVersion::V2) {
             if (auto ok = co_await WriteFrameSerialized(anytls::kCmdSYNACK, sub.Sid(), {}); !ok)
                 co_return ok.error();

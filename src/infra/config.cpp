@@ -339,12 +339,15 @@ void AppendRoutingPortValue(std::vector<RoutingPortRange>& out,
         AppendRoutingPortText(out, value.as_string(), field);
         return;
     }
-    if (value.is_int64()) {
-        AppendRoutingPortText(out, std::to_string(value.as_int64()), field);
-        return;
-    }
-    if (value.is_uint64()) {
-        AppendRoutingPortText(out, std::to_string(value.as_uint64()), field);
+    if (value.is_int64() || value.is_uint64()) {
+        const auto parsed = JsonUnsignedInteger(value);
+        if (!parsed || *parsed == 0 ||
+            *parsed > std::numeric_limits<uint16_t>::max()) {
+            throw std::invalid_argument(std::format(
+                "routing {} must be an integer between 1 and 65535", field));
+        }
+        const auto port = static_cast<uint16_t>(*parsed);
+        out.push_back(RoutingPortRange{.start = port, .end = port});
         return;
     }
     throw std::invalid_argument(std::format(

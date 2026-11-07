@@ -140,6 +140,7 @@ private:
     template <typename Fn>
     static net::awaitable<std::invoke_result_t<Fn&>> CallHeld(
         [[maybe_unused]] Slot slot, Fn fn) {
+        memory::ScopedWorkerAllocation worker_allocation;
         if constexpr (std::is_void_v<std::invoke_result_t<Fn&>>) { std::invoke(fn); co_return; }
         else co_return std::invoke(fn);
     }

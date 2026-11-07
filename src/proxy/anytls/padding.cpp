@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
-#include <map>
 #include <openssl/evp.h>
 #include <random>
 #include <utility>
@@ -101,7 +100,6 @@ uint16_t PaddingScheme::SampleAuthPaddingSize() const {
 std::optional<PaddingScheme> ParsePaddingScheme(std::string_view raw) {
     if (raw.empty()) return std::nullopt;
     PaddingScheme scheme;
-    std::map<uint32_t, std::vector<PaddingRecord>> records;
     auto text = raw;
     while (const auto line = NextToken(text, '\n')) {
         const auto separator = line->find('=');
@@ -126,7 +124,19 @@ std::optional<PaddingScheme> ParsePaddingScheme(std::string_view raw) {
             auto ranges = ParseRanges(value);
             if (!ranges) return std::nullopt;
             // Preserve the last valid entry, including when a later duplicate is invalid.
-            if (!ranges->empty()) records.insert_or_assign(*index, std::move(*ranges));
+            if (!ranges->empty()) {
+                auto existing = std::find_if(
+                    scheme.records_.begin(),
+                    scheme.records_.end(),
+                    [idx = *index](const PaddingScheme::PacketPadding& entry) {
+                        return entry.index == idx;
+                    });
+                if (existing != scheme.records_.end()) {
+                    existing->ranges = std::move(*ranges);
+                } else {
+                    scheme.records_.push_back({*index, std::move(*ranges)});
+                }
+            }
         }
     }
     if (scheme.stop_ == 0) return std::nullopt;
@@ -141,9 +151,10 @@ std::optional<PaddingScheme> ParsePaddingScheme(std::string_view raw) {
         scheme.md5_.push_back(kHex[digest[index] >> 4]);
         scheme.md5_.push_back(kHex[digest[index] & 0xf]);
     }
-    scheme.records_.reserve(records.size());
-    for (auto& [index, ranges] : records)
-        scheme.records_.push_back({index, std::move(ranges)});
+    std::sort(scheme.records_.begin(), scheme.records_.end(),
+        [](const PaddingScheme::PacketPadding& lhs, const PaddingScheme::PacketPadding& rhs) {
+            return lhs.index < rhs.index;
+        });
     return scheme;
 }
 

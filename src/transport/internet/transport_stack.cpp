@@ -208,14 +208,27 @@ net::awaitable<TransportBuildResult> AcceptInboundSecurity(
             // The caller's absolute phase deadline covers sniffing and SSL_accept;
             // never restart it when another record/fragment arrives.
             RealityClientHelloReader reader;
-            std::array<uint8_t, 1024> chunk{};
+            buf::MultiBuffer pending;
             try {
                 while (reader.State() == RealityClientHelloReader::Status::Reading) {
-                    const size_t count = co_await tcp->AsyncRead(
-                        net::buffer(chunk, reader.ReadSize()));
-                    if (count == 0) co_return tl::unexpected(ErrorCode::SOCKET_EOF);
-                    reader.Append(std::span<const uint8_t>(chunk.data(), count));
+                    if (pending.empty()) {
+                        pending = co_await tcp->ReadMultiBuffer();
+                        if (pending.empty()) {
+                            co_return tl::unexpected(ErrorCode::SOCKET_EOF);
+                        }
+                    }
+                    const auto front = pending.FrontSpan();
+                    const size_t take = std::min(front.size(), reader.ReadSize());
+                    reader.Append(front.first(take));
+                    pending.DropPrefixBytes(take);
                 }
+                for (size_t i = pending.size(); i > 0; --i) {
+                    if (const buf::Buffer* b = *(pending.begin() + (i - 1));
+                        b && !b->IsEmpty()) {
+                        tcp->PrependReadData(b->Bytes());
+                    }
+                }
+                pending.clear();
             } catch (...) {
                 co_return tl::unexpected(ErrorCode::TLS_HANDSHAKE_FAILED);
             }
@@ -289,10 +302,11 @@ net::awaitable<TransportBuildResult> ConnectOutboundSecurity(
                       sni);
         co_return tl::unexpected(ErrorCode::TLS_HANDSHAKE_FAILED);
     }
+    const std::string_view alpn = tls->NegotiatedAlpn();
     LOG_CONN_DEBUG(conn_id, "{} client handshake completed (sni={} alpn={})",
                   s.IsReality() ? "REALITY" : "TLS",
                   sni,
-                  tls->NegotiatedAlpn().empty() ? "-" : tls->NegotiatedAlpn());
+                  alpn.empty() ? std::string_view("-") : alpn);
     co_return std::unique_ptr<AsyncStream>(std::move(tls));
 }
 

@@ -54,6 +54,27 @@ object::object(std::initializer_list<std::pair<std::string, value>> init) {
     }
 }
 
+object::object(const object& other) = default;
+object::object(object&& other) noexcept = default;
+
+object& object::operator=(const object& other) {
+    if (this != &other) {
+        object temp(other);
+        values_.swap(temp.values_);
+    }
+    return *this;
+}
+
+object& object::operator=(object&& other) noexcept {
+    if (this != &other) {
+        object temp(std::move(other));
+        values_.swap(temp.values_);
+    }
+    return *this;
+}
+
+object::~object() = default;
+
 bool object::contains(std::string_view key) const {
     return values_.find(key) != values_.end();
 }
@@ -90,8 +111,32 @@ std::pair<object::iterator, bool> object::insert_or_assign(std::string key, valu
     return values_.insert_or_assign(std::move(key), std::move(item));
 }
 
+bool object::operator==(const object& other) const noexcept {
+    return values_ == other.values_;
+}
+
 array::array() = default;
 array::array(std::initializer_list<value> init) : values_(init) {}
+array::array(const array& other) = default;
+array::array(array&& other) noexcept = default;
+
+array& array::operator=(const array& other) {
+    if (this != &other) {
+        array temp(other);
+        values_.swap(temp.values_);
+    }
+    return *this;
+}
+
+array& array::operator=(array&& other) noexcept {
+    if (this != &other) {
+        array temp(std::move(other));
+        values_.swap(temp.values_);
+    }
+    return *this;
+}
+
+array::~array() = default;
 
 void array::push_back(value v) {
     values_.push_back(std::move(v));
@@ -103,6 +148,10 @@ value& array::operator[](size_t index) {
 
 const value& array::operator[](size_t index) const {
     return values_[index];
+}
+
+bool array::operator==(const array& other) const noexcept {
+    return values_ == other.values_;
 }
 
 value::value() noexcept : data_(nullptr) {}
@@ -175,6 +224,32 @@ object& value::as_object() { return *std::get<object_ptr>(data_); }
 const object& value::as_object() const { return *std::get<object_ptr>(data_); }
 array& value::as_array() { return *std::get<array_ptr>(data_); }
 const array& value::as_array() const { return *std::get<array_ptr>(data_); }
+
+bool value::operator==(const value& other) const noexcept {
+    if (is_null()) return other.is_null();
+    if (is_bool()) return other.is_bool() && as_bool() == other.as_bool();
+    if (is_string()) return other.is_string() && as_string() == other.as_string();
+    if (is_int64()) {
+        if (other.is_int64()) return as_int64() == other.as_int64();
+        if (other.is_uint64()) {
+            return as_int64() >= 0 &&
+                   static_cast<uint64_t>(as_int64()) == other.as_uint64();
+        }
+        return false;
+    }
+    if (is_uint64()) {
+        if (other.is_uint64()) return as_uint64() == other.as_uint64();
+        if (other.is_int64()) {
+            return other.as_int64() >= 0 &&
+                   as_uint64() == static_cast<uint64_t>(other.as_int64());
+        }
+        return false;
+    }
+    if (is_double()) return other.is_double() && as_double() == other.as_double();
+    if (is_object()) return other.is_object() && as_object() == other.as_object();
+    if (is_array()) return other.is_array() && as_array() == other.as_array();
+    return false;
+}
 
 namespace {
 

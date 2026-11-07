@@ -62,9 +62,9 @@ net::awaitable<void> PhysicalSessionRegistry::Retire(
     co_await net::co_spawn(io_, RetireOnOwner(std::move(record)), net::use_awaitable);
 }
 
-net::awaitable<void> PhysicalSessionRegistry::RetireOnOwner(
-    std::shared_ptr<PhysicalSessionRecord> record) {
-    if (record->finished.load(std::memory_order_acquire)) co_return;
+void PhysicalSessionRegistry::CompleteOnOwner(
+    const std::shared_ptr<PhysicalSessionRecord>& record) {
+    if (!record || record->finished.load(std::memory_order_acquire)) return;
     traffic_.MergeCompletedTraffic(record->accounting_key, record->completed_traffic);
     totals_.hot.bytes_in += record->final_stats.bytes_in;
     totals_.hot.bytes_out += record->final_stats.bytes_out;
@@ -72,15 +72,27 @@ net::awaitable<void> PhysicalSessionRegistry::RetireOnOwner(
     totals_.cold.errors += record->final_stats.errors;
     record->finished.store(true, std::memory_order_release);
     records_.erase(record.get());
-    if (!record->domain->CanDestroyDirectlyOn(worker_id_)) {
+    if (record->domain && !record->domain->CanDestroyDirectlyOn(worker_id_)) {
+        record->capabilities.reset();
         auto* domain = record->domain.get();
-        domain->Execute([cap = std::move(record->capabilities),
-                         domain = std::move(record->domain)]() mutable {
-            cap.reset();
+        domain->Execute([domain = std::move(record->domain)]() mutable {
             domain.reset();
         });
     }
     (void)changed_.try_send(IoErrorCode{});
+}
+
+void PhysicalSessionRegistry::CancelRegistration(
+    const std::shared_ptr<PhysicalSessionRecord>& record) noexcept {
+    if (!record) return;
+    records_.erase(record.get());
+    (void)changed_.try_send(IoErrorCode{});
+}
+
+net::awaitable<void> PhysicalSessionRegistry::RetireOnOwner(
+    std::shared_ptr<PhysicalSessionRecord> record) {
+    CompleteOnOwner(record);
+    co_return;
 }
 
 net::awaitable<void> PhysicalSessionRegistry::AsyncJoin() {

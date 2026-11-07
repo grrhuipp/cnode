@@ -84,6 +84,9 @@ ReadTcpRequest(AsyncStream& stream, wire::Version version, session::Context& ctx
         }
         if (target) {
             (void)received.DropPrefixBytes(header_bytes);
+            if (received.empty()) {
+                received.ReleaseIfIdle();
+            }
             co_return TcpRequest{std::move(*target), std::move(received)};
         }
         if (target.error() == wire::ProtocolError::Incomplete &&
@@ -124,23 +127,29 @@ public:
                 ctx, stats_, timeouts);
         }
 
-        auto request = co_await ReadTcpRequest(*stream, version_, ctx);
-        if (!request) {
-            co_return RejectInbound(stats_, stream.get(), request.error());
+        InitialPayload initial_payload;
+        {
+            auto request = co_await ReadTcpRequest(*stream, version_, ctx);
+            if (!request) {
+                co_return RejectInbound(stats_, stream.get(), request.error());
+            }
+            {
+                auto response = version_ == wire::Version::V1
+                    ? wire::EncodeV1Response(true, 0, "")
+                    : wire::EncodeV2TcpResponse(true, "");
+                co_await stream->AsyncWrite(net::buffer(response));
+            }
+            BindInboundRequestTarget(
+                ctx, InboundRequestTarget{Network::TCP, std::move(request->target)});
+            initial_payload = InitialPayload(std::move(request->early_data));
         }
-        const auto response = version_ == wire::Version::V1
-            ? wire::EncodeV1Response(true, 0, "")
-            : wire::EncodeV2TcpResponse(true, "");
-        co_await stream->AsyncWrite(net::buffer(response));
-        BindInboundRequestTarget(
-            ctx, InboundRequestTarget{Network::TCP, std::move(request->target)});
         stream->ClearPhaseDeadline();
 
         auto* tcp_stream = stream.get();
         co_return co_await dispatcher.Dispatch(
             SessionReactor(), receiver.dispatch_policy, std::move(stream),
             transport::Link{tcp_stream, tcp_stream},
-            InitialPayload(std::move(request->early_data)),
+            std::move(initial_payload),
             ctx, stats_, timeouts);
     }
 

@@ -137,6 +137,47 @@ void CheckCopiesAndMoves() {
     moved_object = sensitive;
     Check(moved_object.contains("Mixed") && !moved_object.contains("MIXED"),
           "object copy assignment retained the old comparison mode");
+
+    auto self_object = acpp::json::parse(
+        R"({"child":{"GrandChild":"Kept"},"sibling":1})",
+        KeyComparison::AsciiCaseInsensitive).as_object();
+    self_object = std::move(self_object["child"].as_object());
+    Check(self_object.size() == 1 &&
+              self_object.at("GRANDCHILD").as_string() == "Kept",
+          "self-contained object move assignment corrupted nested storage");
+
+    auto self_copied_object = acpp::json::parse(
+        R"({"child":{"GrandChild":"Copied"},"sibling":2})",
+        KeyComparison::AsciiCaseInsensitive).as_object();
+    self_copied_object = self_copied_object["child"].as_object();
+    Check(self_copied_object.size() == 1 &&
+              self_copied_object.at("GRANDCHILD").as_string() == "Copied",
+          "self-contained object copy assignment corrupted nested storage");
+
+    auto self_array = acpp::json::parse(R"([["KeptElement",42],"Sibling"])").as_array();
+    self_array = std::move(self_array[0].as_array());
+    Check(self_array.size() == 2 &&
+              self_array[0].as_string() == "KeptElement" &&
+              self_array[1].as_int64() == 42,
+          "self-contained array move assignment corrupted nested storage");
+
+    auto self_copied_array = acpp::json::parse(R"([["CopiedElement",7],"Sibling"])").as_array();
+    self_copied_array = self_copied_array[0].as_array();
+    Check(self_copied_array.size() == 2 &&
+              self_copied_array[0].as_string() == "CopiedElement" &&
+              self_copied_array[1].as_int64() == 7,
+          "self-contained array copy assignment corrupted nested storage");
+
+    Check(acpp::json::value(int64_t{42}) == acpp::json::value(uint64_t{42}) &&
+              acpp::json::value(uint64_t{0}) == acpp::json::value(int64_t{0}) &&
+              acpp::json::value(int64_t{-1}) != acpp::json::value(uint64_t{1}) &&
+              acpp::json::value(int64_t{-1}) !=
+                  acpp::json::value(static_cast<uint64_t>(-1)),
+          "signed/unsigned integer value equality was inconsistent");
+    Check(acpp::json::parse(R"({"b":[1,true,"x"],"a":null})") ==
+              acpp::json::parse(R"({"a":null,"b":[1,true,"x"]})") &&
+              acpp::json::parse(R"({"a":1})") != acpp::json::parse(R"({"a":2})"),
+          "structural value equality failed on objects or arrays");
 }
 
 void CheckDuplicateKeys() {

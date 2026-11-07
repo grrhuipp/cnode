@@ -441,12 +441,13 @@ RunVlessEncryptionClientHandshake(
     co_await WriteVlessBytes(raw_writer, nfs->bytes);
     memory::ByteVector{}.swap(nfs->bytes);
     co_await WriteVlessBytes(raw_writer, pfs->encrypted);
+    memory::ByteVector{}.swap(pfs->encrypted);
     co_await WriteVlessBytes(raw_writer, *padding);
     memory::ByteVector{}.swap(*padding);
     padding.reset();
 
-    std::array<uint8_t, kVlessEncryptionEncryptedServerPfsPublicSize>
-        encrypted_server_public{};
+    memory::ByteVector encrypted_server_public(
+        kVlessEncryptionEncryptedServerPfsPublicSize);
     if (!co_await raw_reader.ReadExact(
             encrypted_server_public.data(),
             encrypted_server_public.size())) {
@@ -464,9 +465,12 @@ RunVlessEncryptionClientHandshake(
         *pfs,
         nfs->iv,
         nfs->nfs_key,
-        encrypted_server_public,
+        std::span<const uint8_t, kVlessEncryptionEncryptedServerPfsPublicSize>(
+            encrypted_server_public.data(),
+            kVlessEncryptionEncryptedServerPfsPublicSize),
         encrypted_ticket,
         cipher);
+    memory::ByteVector{}.swap(encrypted_server_public);
     if (!server_open) {
         co_return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
     }
@@ -493,7 +497,7 @@ RunVlessEncryptionServerHandshake(
     VlessBufferedReader& raw_reader,
     transport::MultiBufferWriter& raw_writer,
     std::shared_ptr<const VlessEncryptionConfig> namespace_config,
-    std::string inbound_tag) {
+    std::string_view inbound_tag) {
     if (!namespace_config) co_return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
     const auto& config = *namespace_config;
     const auto relays_len = VlessEncryptionRelaysLength(config);
@@ -583,8 +587,8 @@ RunVlessEncryptionServerHandshake(
         co_return runtime;
     }
 
-    std::array<uint8_t, kVlessEncryptionEncryptedClientPfsPublicSize>
-        encrypted_client_public{};
+    memory::ByteVector encrypted_client_public(
+        kVlessEncryptionEncryptedClientPfsPublicSize);
     if (!co_await raw_reader.ReadExact(
             encrypted_client_public.data(),
             encrypted_client_public.size())) {
@@ -593,7 +597,10 @@ RunVlessEncryptionServerHandshake(
 
     auto client_public = OpenEncryptedClientPfsPublic(
         *nfs_aead,
-        encrypted_client_public);
+        std::span<const uint8_t, kVlessEncryptionEncryptedClientPfsPublicSize>(
+            encrypted_client_public.data(),
+            kVlessEncryptionEncryptedClientPfsPublicSize));
+    memory::ByteVector{}.swap(encrypted_client_public);
     if (!client_public) {
         co_return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
     }
@@ -615,6 +622,7 @@ RunVlessEncryptionServerHandshake(
     }
 
     co_await WriteVlessBytes(raw_writer, response->encrypted_public_key);
+    memory::ByteVector{}.swap(response->encrypted_public_key);
     co_await WriteVlessBytes(raw_writer, response->encrypted_ticket);
     co_await WriteVlessBytes(raw_writer, *padding);
     memory::ByteVector{}.swap(*padding);

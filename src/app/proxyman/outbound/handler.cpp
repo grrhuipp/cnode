@@ -315,10 +315,9 @@ struct OutboundConfiguration::Hosts {
         std::erase_if(residents, [this](Resident& resident) {
             if (!resident.host || !resident.host->IsJoined()) return false;
             if (resident.domain && !resident.domain->CanDestroyDirectlyOn(worker_id)) {
+                resident.host.reset();
                 auto* domain = resident.domain.get();
-                domain->Execute([host = std::move(resident.host),
-                                 domain = std::move(resident.domain)]() mutable {
-                    host.reset();
+                domain->Execute([domain = std::move(resident.domain)]() mutable {
                     domain.reset();
                 });
             }

@@ -18,10 +18,7 @@
 #include <chrono>
 #include <optional>
 #include <memory>
-#include <string>
-#include <deque>
-#include <unordered_map>
-#include <unordered_set>
+#include <string_view>
 #include <utility>
 
 namespace acpp::vless {
@@ -146,19 +143,19 @@ private:
         VlessEncryptionPfsKey pfs_key;
         std::chrono::steady_clock::time_point expires_at{};
         std::optional<std::array<uint8_t, 16>> identity;
-        std::unordered_set<NfsKeyDigest, KeyedHash, ConstantTimeEqual>
+        memory::ThreadLocalUnorderedSet<NfsKeyDigest, KeyedHash, ConstantTimeEqual>
             seen_nfs_keys;
     };
 
     using SessionMap =
-        std::unordered_map<TicketArray, Session, KeyedHash, ConstantTimeEqual>;
+        memory::ThreadLocalUnorderedMap<TicketArray, Session, KeyedHash, ConstantTimeEqual>;
 
     void Prune(std::chrono::steady_clock::time_point now);
     void EraseOldest();
     void Erase(SessionMap::iterator it) noexcept;
 
     SessionMap sessions_;
-    std::deque<std::pair<TicketArray, std::chrono::steady_clock::time_point>> order_;
+    memory::ThreadLocalDeque<std::pair<TicketArray, std::chrono::steady_clock::time_point>> order_;
     size_t seen_nfs_keys_ = 0;
 };
 
@@ -174,6 +171,6 @@ RunVlessEncryptionServerHandshake(
     VlessBufferedReader& raw_reader,
     transport::MultiBufferWriter& raw_writer,
     std::shared_ptr<const VlessEncryptionConfig> config,
-    std::string inbound_tag);
+    std::string_view inbound_tag);
 
 }  // namespace acpp::vless

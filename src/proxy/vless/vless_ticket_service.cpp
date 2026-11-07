@@ -268,22 +268,22 @@ net::awaitable<bool> RegisterTicket(
 
 
 net::awaitable<bool> AuthenticateVlessTicket(
-    std::shared_ptr<const VlessEncryptionConfig> config, std::string tag,
+    std::shared_ptr<const VlessEncryptionConfig> config, std::string_view tag,
     VlessEncryptionIssuedTicket ticket, std::array<uint8_t, 16> identity) {
     auto origin = ExecutionDomain::Current();
     if (!origin) co_return false;
     auto* coordinator = &origin->Coordinator();
     co_return co_await coordinator->Post(RegisterTicket(coordinator, std::move(origin),
-        std::move(config), std::move(tag), std::move(ticket), identity));
+        std::move(config), std::string(tag), std::move(ticket), identity));
 }
 
 net::awaitable<std::optional<Resumed>> LookupVlessTicket(
-    std::shared_ptr<const VlessEncryptionConfig> config, std::string tag,
+    std::shared_ptr<const VlessEncryptionConfig> config, std::string_view tag,
     Ticket ticket, VlessEncryptionNfsKey nfs) {
     const auto receiver = ExecutionDomain::Current();
     if (!receiver) co_return std::nullopt;
     auto* coordinator = &receiver->Coordinator();
     co_return co_await coordinator->Post(ResolveAndLookup(coordinator,
-        std::move(config), std::move(tag), ticket, std::move(nfs), receiver->OwnerId()));
+        std::move(config), std::string(tag), ticket, std::move(nfs), receiver->OwnerId()));
 }
 } // namespace acpp::vless

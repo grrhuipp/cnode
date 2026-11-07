@@ -1392,12 +1392,12 @@ void UdpIngress::ProcessDecoded(const UdpDatagramContext& datagram,
         request.profile = *decoded->user;
         request.tracker = datagram.environment ? nullptr : decoded->tracker;
         request.limiter = datagram.environment ? nullptr : decoded->limiter;
-        if (decoded->forwarded) {
-            ctx.inbound.ApplyForwardedMetadata(*decoded->forwarded);
-        }
         ::acpp::proxy::BindAuthenticatedInbound(
             ctx, request.profile,
-            ::acpp::proxy::InboundRequestTarget{Network::UDP, decoded->target});
+            ::acpp::proxy::InboundRequestTarget{
+                Network::UDP,
+                decoded->target,
+                std::move(decoded->forwarded)});
         request.dispatcher = datagram.dispatcher;
         request.io_context = &datagram.io_context;
         request.stats = datagram.environment ? nullptr : &datagram.stats;

@@ -84,23 +84,192 @@ std::chrono::seconds ResolveRelayIdleTimeout(
     return idle_timeout;
 }
 
-net::awaitable<std::vector<net::ip::address>> ResolveRoutingAddresses(
-    app::dns::DNS& dns_service,
+net::awaitable<bool> SniffInitialPayload(
+    net::io_context& io_context,
+    const SniffConfig& sniffing,
+    transport::MultiBufferReader* inbound_reader,
+    AsyncStream* inbound_control,
+    InitialPayload& first_packet,
     session::Context& ctx,
-    const TargetAddress& target) {
-    auto dns_result = co_await dns_service.Resolve(target.host);
-    // DNS may return a failed result after cancellation. Do not publish that
-    // result into the request or continue to route/outbound lookup.
-    const auto cancellation = co_await net::this_coro::cancellation_state;
-    if (cancellation.cancelled() != net::cancellation_type::none)
-        throw IoSystemError(net::error::operation_aborted);
-    if (!dns_result.Ok()) {
-        LOG_CONN_DEBUG(ctx, "routing DNS lookup failed target={} > {}: {}",
-                       target.host, ErrorCodeToString(dns_result.error), dns_result.error_msg);
-        co_return std::vector<net::ip::address>{};
-    }
+    StatsShard& stats,
+    buf::MultiBufferBatch& outbound_first_payload,
+    RelayResult& result,
+    ErrorCode& cancellation_reason,
+    const net::cancellation_state& sniff_cancellation) {
+    using net::experimental::awaitable_operators::operator||;
+    const bool datagram = ctx.content.network == Network::UDP;
+    const size_t sniff_byte_limit = datagram ? 64 * 1024 : 4096;
+    static constexpr size_t kSniffMaxDatagrams = 64;
+    static constexpr auto kSniffWindow = std::chrono::milliseconds(200);
+    buf::MultiBuffer sniff_payload;
+    memory::ByteVector sniff_scratch;
+    Sniffer sniffer;
+    size_t cached_bytes = 0;
+    size_t cached_datagrams = 0;
 
-    co_return std::move(dns_result.addresses);
+    auto copy_cached_bytes = [&](const buf::MultiBuffer& mb) {
+        const size_t total = mb.byte_size();
+        if (total == 0) {
+            return std::span<const uint8_t>{};
+        }
+        const size_t want = std::min(total, sniff_byte_limit);
+        if (auto direct = mb.PrefixSpan(want); !direct.empty()) {
+            return direct;
+        }
+        sniff_scratch.resize(want);
+        const size_t copied = mb.CopyPrefixTo(
+            std::span<uint8_t>(sniff_scratch.data(), sniff_scratch.size()));
+        return copied == 0
+            ? std::span<const uint8_t>{}
+            : std::span<const uint8_t>(sniff_scratch.data(), copied);
+    };
+
+    auto sniff_cached = [&]() {
+        const auto sniff_data = copy_cached_bytes(sniff_payload);
+        if (sniff_data.empty()) {
+            return SniffResult{};
+        }
+        return sniffer.Sniff(sniff_data, ctx.content.network);
+    };
+
+    bool read_timed_out = false;
+    auto consume_inbound_timeout = [&]() noexcept {
+        if (!inbound_control) return false;
+        const bool read_to = inbound_control->ConsumeReadTimeout();
+        const bool idle_to = inbound_control->ConsumeIdleTimeout();
+        return read_to || idle_to;
+    };
+    try {
+        auto cache_more = [&]() -> net::awaitable<bool> {
+            buf::MultiBuffer payload;
+            try {
+                payload = co_await inbound_reader->ReadMultiBuffer();
+            } catch (const IoSystemError& e) {
+                if (e.code() == net::error::eof && cached_bytes > 0) {
+                    co_return false;
+                }
+                throw;
+            }
+            if (payload.empty()) {
+                if (consume_inbound_timeout()) {
+                    read_timed_out = true;
+                    throw IoSystemError(net::error::timed_out);
+                }
+                co_return false;
+            }
+            cached_bytes += payload.byte_size();
+            ++cached_datagrams;
+            if (datagram) {
+                sniff_payload = std::move(payload);
+            } else {
+                payload.MoveTo(sniff_payload);
+            }
+            co_return true;
+        };
+        const auto sniff_started = std::chrono::steady_clock::now();
+        if (!first_packet.empty()) {
+            sniff_payload = first_packet.MoveToMultiBuffer();
+            cached_bytes = sniff_payload.byte_size();
+            cached_datagrams = 1;
+        }
+
+        int no_clue_attempts = 0;
+        for (;;) {
+            if (cached_bytes > 0) {
+                const auto sniffed = sniff_cached();
+                if (datagram) {
+                    // Keep each original read result intact. Only decrypted
+                    // handshake fragments are combined inside the sniffer.
+                    outbound_first_payload.Push(std::move(sniff_payload));
+                }
+                if (sniffed.success) {
+                    ApplySniffOverride(ctx, sniffing, sniffed);
+                    break;
+                }
+                if (datagram && !sniffed.need_more) {
+                    break;
+                }
+                if (!sniffed.need_more) {
+                    ++no_clue_attempts;
+                    if (no_clue_attempts >= 2) {
+                        break;
+                    }
+                }
+                // Stop before another read once the inspection budget is
+                // exhausted. Preserve an already-read final datagram even
+                // when it crosses the byte limit (at most one UDP packet).
+                if (cached_bytes >= sniff_byte_limit ||
+                    (datagram && cached_datagrams >= kSniffMaxDatagrams)) {
+                    break;
+                }
+            }
+            const auto remaining = kSniffWindow -
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - sniff_started);
+            if (remaining <= std::chrono::milliseconds::zero()) {
+                break;
+            }
+            struct ReadResult {
+                bool received = false;
+                std::exception_ptr error;
+            } read;
+            auto read_more = [&]() -> net::awaitable<void> {
+                try {
+                    read.received = co_await cache_more();
+                } catch (...) {
+                    read.error = std::current_exception();
+                }
+            };
+            AsyncDelay delay(io_context);
+            auto next = co_await (read_more() || delay.WaitFor(remaining));
+            if (sniff_cancellation.cancelled() != net::cancellation_type::none) {
+                throw IoSystemError(net::error::operation_aborted);
+            }
+            if (read.error) {
+                if (next.index() == 0) std::rethrow_exception(read.error);
+                try {
+                    std::rethrow_exception(read.error);
+                } catch (const IoSystemError& e) {
+                    if (consume_inbound_timeout()) {
+                        read_timed_out = true;
+                        throw;
+                    }
+                    if (e.code() != net::error::operation_aborted) throw;
+                }
+            }
+            if (!read.received) break;
+        }
+        if (!sniff_payload.empty()) {
+            outbound_first_payload.Push(std::move(sniff_payload));
+        }
+    } catch (const std::bad_alloc&) {
+        throw;
+    } catch (const transport::LinkError& e) {
+        stats.OnError();
+        result = MakeRelayError(e.code());
+        co_return false;
+    } catch (const IoSystemError& e) {
+        if (read_timed_out || consume_inbound_timeout()) {
+            stats.OnError();
+            result = MakeRelayError(ErrorCode::TIMEOUT);
+            co_return false;
+        }
+        if (e.code() == net::error::operation_aborted &&
+            (cancellation_reason != ErrorCode::OK ||
+             sniff_cancellation.cancelled() != net::cancellation_type::none)) {
+            throw;
+        }
+        stats.OnError();
+        result = MakeRelayError(MapAsioError(e.code()));
+        co_return false;
+    } catch (...) {
+        stats.OnError();
+        result = MakeRelayError(ErrorCode::SOCKET_READ_FAILED);
+        co_return false;
+    }
+    sniff_payload.ReleaseIfIdle();
+    memory::ByteVector{sniff_scratch.get_allocator()}.swap(sniff_scratch);
+    co_return true;
 }
 
 struct ActiveSessionScope {
@@ -254,179 +423,12 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
     buf::MultiBufferBatch outbound_first_payload;
     const auto sniff_cancellation = co_await net::this_coro::cancellation_state;
     if (policy.sniffing.enabled && !policy.sniffing.metadata_only) {
-        using net::experimental::awaitable_operators::operator||;
-        const bool datagram = ctx.content.network == Network::UDP;
-        const size_t sniff_byte_limit = datagram ? 64 * 1024 : 4096;
-        static constexpr size_t kSniffMaxDatagrams = 64;
-        static constexpr auto kSniffWindow = std::chrono::milliseconds(200);
-        buf::MultiBuffer sniff_payload;
-        memory::ByteVector sniff_scratch;
-        Sniffer sniffer;
-        size_t cached_bytes = 0;
-        size_t cached_datagrams = 0;
-
-        auto copy_cached_bytes = [&](const buf::MultiBuffer& mb) {
-            const size_t total = mb.byte_size();
-            if (total == 0) {
-                return std::span<const uint8_t>{};
-            }
-            const size_t want = std::min(total, sniff_byte_limit);
-            if (auto direct = mb.PrefixSpan(want); !direct.empty()) {
-                return direct;
-            }
-            sniff_scratch.resize(want);
-            const size_t copied = mb.CopyPrefixTo(
-                std::span<uint8_t>(sniff_scratch.data(), sniff_scratch.size()));
-            return copied == 0
-                ? std::span<const uint8_t>{}
-                : std::span<const uint8_t>(sniff_scratch.data(), copied);
-        };
-
-        auto sniff_cached = [&]() {
-            const auto sniff_data = copy_cached_bytes(sniff_payload);
-            if (sniff_data.empty()) {
-                return SniffResult{};
-            }
-            return sniffer.Sniff(sniff_data, ctx.content.network);
-        };
-
-        bool read_timed_out = false;
-        auto consume_inbound_timeout = [&]() noexcept {
-            if (!inbound_control) return false;
-            const bool read_to = inbound_control->ConsumeReadTimeout();
-            const bool idle_to = inbound_control->ConsumeIdleTimeout();
-            return read_to || idle_to;
-        };
-        try {
-            auto cache_more = [&]() -> net::awaitable<bool> {
-                buf::MultiBuffer payload;
-                try {
-                    payload = co_await inbound_reader->ReadMultiBuffer();
-                } catch (const IoSystemError& e) {
-                    if (e.code() == net::error::eof && cached_bytes > 0) {
-                        co_return false;
-                    }
-                    throw;
-                }
-                if (payload.empty()) {
-                    if (consume_inbound_timeout()) {
-                        read_timed_out = true;
-                        throw IoSystemError(net::error::timed_out);
-                    }
-                    co_return false;
-                }
-                cached_bytes += payload.byte_size();
-                ++cached_datagrams;
-                if (datagram) {
-                    sniff_payload = std::move(payload);
-                } else {
-                    payload.MoveTo(sniff_payload);
-                }
-                co_return true;
-            };
-            const auto sniff_started = std::chrono::steady_clock::now();
-            if (!first_packet.empty()) {
-                sniff_payload = first_packet.MoveToMultiBuffer();
-                cached_bytes = sniff_payload.byte_size();
-                cached_datagrams = 1;
-            }
-
-            int no_clue_attempts = 0;
-            for (;;) {
-                if (cached_bytes > 0) {
-                    const auto sniffed = sniff_cached();
-                    if (datagram) {
-                        // Keep each original read result intact. Only decrypted
-                        // handshake fragments are combined inside the sniffer.
-                        outbound_first_payload.Push(std::move(sniff_payload));
-                    }
-                    if (sniffed.success) {
-                        ApplySniffOverride(ctx, policy.sniffing, sniffed);
-                        break;
-                    }
-                    if (datagram && !sniffed.need_more) {
-                        break;
-                    }
-                    if (!sniffed.need_more) {
-                        ++no_clue_attempts;
-                        if (no_clue_attempts >= 2) {
-                            break;
-                        }
-                    }
-                    // Stop before another read once the inspection budget is
-                    // exhausted. Preserve an already-read final datagram even
-                    // when it crosses the byte limit (at most one UDP packet).
-                    if (cached_bytes >= sniff_byte_limit ||
-                        (datagram && cached_datagrams >= kSniffMaxDatagrams)) {
-                        break;
-                    }
-                }
-                const auto remaining = kSniffWindow -
-                    std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::steady_clock::now() - sniff_started);
-                if (remaining <= std::chrono::milliseconds::zero()) {
-                    break;
-                }
-                struct ReadResult {
-                    bool received = false;
-                    std::exception_ptr error;
-                } read;
-                auto read_more = [&]() -> net::awaitable<void> {
-                    try {
-                        read.received = co_await cache_more();
-                    } catch (...) {
-                        read.error = std::current_exception();
-                    }
-                };
-                AsyncDelay delay(io_context);
-                auto next = co_await (read_more() || delay.WaitFor(remaining));
-                if (sniff_cancellation.cancelled() != net::cancellation_type::none) {
-                    throw IoSystemError(net::error::operation_aborted);
-                }
-                if (read.error) {
-                    if (next.index() == 0) std::rethrow_exception(read.error);
-                    try {
-                        std::rethrow_exception(read.error);
-                    } catch (const IoSystemError& e) {
-                        if (consume_inbound_timeout()) {
-                            read_timed_out = true;
-                            throw;
-                        }
-                        if (e.code() != net::error::operation_aborted) throw;
-                    }
-                }
-                if (!read.received) break;
-            }
-            if (!sniff_payload.empty()) {
-                outbound_first_payload.Push(std::move(sniff_payload));
-            }
-        } catch (const std::bad_alloc&) {
-            throw;
-        } catch (const transport::LinkError& e) {
-            stats.OnError();
-            result = MakeRelayError(e.code());
-            co_return;
-        } catch (const IoSystemError& e) {
-            if (read_timed_out || consume_inbound_timeout()) {
-                stats.OnError();
-                result = MakeRelayError(ErrorCode::TIMEOUT);
-                co_return;
-            }
-            if (e.code() == net::error::operation_aborted &&
-                (cancellation_reason != ErrorCode::OK ||
-                 sniff_cancellation.cancelled() != net::cancellation_type::none)) {
-                throw;
-            }
-            stats.OnError();
-            result = MakeRelayError(MapAsioError(e.code()));
-            co_return;
-        } catch (...) {
-            stats.OnError();
-            result = MakeRelayError(ErrorCode::SOCKET_READ_FAILED);
+        if (!co_await SniffInitialPayload(
+                io_context, policy.sniffing, inbound_reader, inbound_control,
+                first_packet, ctx, stats, outbound_first_payload, result,
+                cancellation_reason, sniff_cancellation)) {
             co_return;
         }
-        sniff_payload.clear();
-        memory::ByteVector{}.swap(sniff_scratch);
     }
     if (sniff_cancellation.cancelled() != net::cancellation_type::none ||
         cancellation_reason != ErrorCode::OK) {
@@ -639,9 +641,17 @@ net::awaitable<DefaultDispatcher::RouteResult> DefaultDispatcher::RouteAsync(
         }
     }
 
-    auto addresses = co_await ResolveRoutingAddresses(dns_service_, ctx, route_target);
-    if (!addresses.empty()) {
-        co_return FinishRoute(ctx, select_with_addresses(addresses));
+    auto dns_result = co_await dns_service_.Resolve(route_target.host);
+    // DNS may return a failed result after cancellation. Do not publish that
+    // result into the request or continue to route/outbound lookup.
+    const auto cancellation = co_await net::this_coro::cancellation_state;
+    if (cancellation.cancelled() != net::cancellation_type::none)
+        throw IoSystemError(net::error::operation_aborted);
+    if (!dns_result.Ok()) {
+        LOG_CONN_DEBUG(ctx, "routing DNS lookup failed target={} > {}: {}",
+                       route_target.host, ErrorCodeToString(dns_result.error), dns_result.error_msg);
+    } else if (!dns_result.addresses.empty()) {
+        co_return FinishRoute(ctx, select_with_addresses(dns_result.addresses));
     }
     co_return FinishRoute(
         ctx,

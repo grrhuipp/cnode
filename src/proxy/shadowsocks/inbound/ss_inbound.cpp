@@ -104,12 +104,12 @@ PrepareSsTcpSession(
     // UoT resolves its UDP destination only after admission; the magic address
     // is admitted as the TCP request target, as before.
     const auto uot_version = proxy::uot::VersionFromMagicAddress(session_result->target);
-    if (session_result->forwarded) {
-        ctx.inbound.ApplyForwardedMetadata(*session_result->forwarded);
-    }
     proxy::BindAuthenticatedInbound(
         ctx, matched->profile,
-        proxy::InboundRequestTarget{Network::TCP, std::move(session_result->target)});
+        proxy::InboundRequestTarget{
+            Network::TCP,
+            std::move(session_result->target),
+            std::move(session_result->forwarded)});
     auto user_session = co_await proxy::AdmitAuthenticatedInbound(
         validator, ctx, matched->profile);
     if (!user_session) {
@@ -149,38 +149,40 @@ net::awaitable<RelayResult> DispatchSsUotSession(
     session::Context& ctx,
     StatsShard& stats,
     const TimeoutsConfig& timeouts) {
-    tl::expected<proxy::uot::PreparedRequest, ErrorCode> prepared =
-        tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
-    try {
-        prepared = co_await proxy::uot::ReadUotRequestHeader(
-            uot_version, request_reader, std::move(pending));
-    } catch (const transport::LinkError& e) {
-        prepared = tl::unexpected(e.code());
-    } catch (const IoSystemError& e) {
-        prepared = tl::unexpected(
-            stream ? proxy::ClassifyHandshakeReadException(*stream, e)
-                   : MapAsioError(e.code()));
+    std::optional<proxy::uot::PacketReader> uot_reader;
+    bool is_connect = false;
+    {
+        tl::expected<proxy::uot::PreparedRequest, ErrorCode> prepared =
+            tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        try {
+            prepared = co_await proxy::uot::ReadUotRequestHeader(
+                uot_version, request_reader, std::move(pending));
+        } catch (const transport::LinkError& e) {
+            prepared = tl::unexpected(e.code());
+        } catch (const IoSystemError& e) {
+            prepared = tl::unexpected(
+                stream ? proxy::ClassifyHandshakeReadException(*stream, e)
+                       : MapAsioError(e.code()));
+        }
+        if (!prepared) {
+            co_return proxy::RejectInbound(stats, stream.get(), prepared.error());
+        }
+        is_connect = prepared->is_connect;
+        proxy::BindInboundRequestTarget(
+            ctx,
+            proxy::InboundRequestTarget{
+                Network::UDP,
+                prepared->destination,
+                std::move(prepared->forwarded)});
+        uot_reader.emplace(request_reader, std::move(*prepared));
     }
-    if (!prepared) {
-        co_return proxy::RejectInbound(stats, stream.get(), prepared.error());
-    }
-    const bool is_connect = prepared->is_connect;
-    const TargetAddress udp_target = prepared->destination;
-    if (prepared->forwarded) {
-        ctx.inbound.ApplyForwardedMetadata(*prepared->forwarded);
-    }
-    proxy::uot::PacketReader uot_reader(request_reader, std::move(*prepared));
-    proxy::uot::PacketWriter uot_writer(response_writer, is_connect, udp_target);
-    ctx.outbound.original_target = udp_target;
-    ctx.outbound.target = udp_target;
-    ctx.outbound.route_target = udp_target;
-    ctx.content.network = Network::UDP;
+    proxy::uot::PacketWriter uot_writer(response_writer, is_connect, ctx.outbound.target);
 
     co_return co_await dispatcher.Dispatch(
         io_context,
         dispatch_policy,
         std::move(stream),
-        transport::Link{&uot_reader, &uot_writer},
+        transport::Link{&*uot_reader, &uot_writer},
         InitialPayload{},
         ctx,
         stats,

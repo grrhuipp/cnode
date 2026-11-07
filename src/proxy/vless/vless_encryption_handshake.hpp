@@ -56,13 +56,11 @@ struct VlessEncryptionClientPfsHello {
     bssl::UniquePtr<EVP_PKEY> mlkem_private_key;
     VlessSecretBytes<kVlessX25519KeySize> x25519_private_key;
     std::array<uint8_t, kVlessEncryptionClientPfsPublicSize> public_key{};
-    std::array<uint8_t, kVlessEncryptionClientPfsHelloSize> encrypted{};
+    memory::ByteVector encrypted;
 };
 
 struct VlessEncryptionServerPfsResponse {
-    std::array<uint8_t, kVlessEncryptionServerPfsPublicSize> public_key{};
-    std::array<uint8_t, kVlessEncryptionEncryptedServerPfsPublicSize>
-        encrypted_public_key{};
+    memory::ByteVector encrypted_public_key;
     std::array<uint8_t, kVlessEncryptionTicketSize> ticket{};
     std::array<uint8_t, kVlessEncryptionEncryptedTicketSize> encrypted_ticket{};
     VlessEncryptionPfsKey pfs_key;

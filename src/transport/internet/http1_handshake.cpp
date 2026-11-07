@@ -546,26 +546,74 @@ net::awaitable<tl::expected<void, ErrorCode>> ReadClientResponse(
 
 net::awaitable<tl::expected<void, ErrorCode>> ReadHttp1MessageHead(
     AsyncStream& stream, Http1MessageHead& head, std::span<const uint8_t> initial) {
-    if (!head.storage) {
-        head.storage = buf::BufferGuard{buf::Buffer::New()};
-        if (!head.storage) {
-            co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+    if (head.storage) {
+        if (head.header_end != 0) {
+            const size_t remaining = head.size - head.header_end;
+            if (remaining != 0) {
+                uint8_t* data = head.storage->Tail().data();
+                std::memmove(data, data + head.header_end, remaining);
+                head.bytes = data;
+                head.size = remaining;
+                head.header_end = 0;
+            } else if (initial.empty()) {
+                head.storage.reset();
+                head.bytes = nullptr;
+                head.size = 0;
+                head.header_end = 0;
+            } else {
+                head.bytes = head.storage->Tail().data();
+                head.size = 0;
+                head.header_end = 0;
+            }
+        } else if (head.size == 0 && initial.empty()) {
+            head.storage.reset();
+            head.bytes = nullptr;
         }
-        head.bytes = head.storage->Tail().data();
-        head.header_end = 0;
-        head.size = 0;
+    }
+    if (!head.storage) {
+        if (initial.empty()) {
+            buf::MultiBuffer mb = co_await stream.ReadMultiBuffer();
+            buf::BufferGuard first;
+            while (!mb.empty()) {
+                first = mb.pop_front();
+                if (first && !first->IsEmpty()) break;
+                first.reset();
+            }
+            if (!first) {
+                co_return tl::unexpected(ErrorCode::SOCKET_EOF);
+            }
+            first->CompactToFront();
+            const size_t first_len = first->Len();
+            first->Reset();
+            head.storage = std::move(first);
+            uint8_t* data = head.storage->Tail().data();
+            const size_t capacity = head.storage->Available();
+            head.bytes = data;
+            head.header_end = 0;
+            head.size = first_len;
+            if (!mb.empty()) {
+                head.size += mb.ConsumePrefixTo(
+                    std::span<uint8_t>(data + head.size, capacity - head.size));
+                for (size_t i = mb.size(); i > 0; --i) {
+                    if (const buf::Buffer* b = *(mb.begin() + (i - 1)); b && !b->IsEmpty()) {
+                        stream.PrependReadData(b->Bytes());
+                    }
+                }
+                mb.clear();
+            }
+        } else {
+            head.storage = buf::BufferGuard{buf::Buffer::New()};
+            if (!head.storage) {
+                co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+            }
+            head.bytes = head.storage->Tail().data();
+            head.header_end = 0;
+            head.size = 0;
+        }
     }
     uint8_t* data = head.storage->Tail().data();
     const size_t capacity = head.storage->Available();
     head.bytes = data;
-    if (head.header_end != 0) {
-        const size_t remaining = head.size - head.header_end;
-        if (remaining != 0) {
-            std::memmove(data, data + head.header_end, remaining);
-        }
-        head.size = remaining;
-        head.header_end = 0;
-    }
     if (!initial.empty()) {
         if (initial.size() > capacity - head.size) {
             co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
@@ -1259,7 +1307,8 @@ net::awaitable<TransportBuildResult> DoWsServerHandshake(
                     "Upgrade: websocket\r\n"
                     "Connection: Upgrade\r\n"
                     "Sec-WebSocket-Accept: ");
-    response.append(ws::ComputeWsAccept(ws_key));
+    const auto ws_accept = ws::EncodeWsAccept(ws_key);
+    response.append(ws_accept.data(), ws_accept.size());
     response.append("\r\n\r\n");
     if (!co_await WriteFullToStream(*stream, response)) {
         LOG_CONN_DEBUG(conn_id, "WebSocket server failed to send 101 response");

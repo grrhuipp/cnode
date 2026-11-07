@@ -87,6 +87,11 @@ public:
     [[nodiscard]] array& as_array();
     [[nodiscard]] const array& as_array() const;
 
+    [[nodiscard]] bool operator==(const value& other) const noexcept;
+    [[nodiscard]] bool operator!=(const value& other) const noexcept {
+        return !(*this == other);
+    }
+
 private:
     using data_type = std::variant<std::nullptr_t, bool, int64_t, uint64_t, double,
                                    std::string, object_ptr, array_ptr>;
@@ -111,6 +116,11 @@ public:
     object();
     explicit object(KeyComparison comparison);
     object(std::initializer_list<std::pair<std::string, value>> init);
+    object(const object& other);
+    object(object&& other) noexcept;
+    object& operator=(const object& other);
+    object& operator=(object&& other) noexcept;
+    ~object();
 
     [[nodiscard]] bool contains(std::string_view key) const;
     [[nodiscard]] value* if_contains(std::string_view key);
@@ -131,6 +141,11 @@ public:
     [[nodiscard]] bool empty() const noexcept { return values_.empty(); }
     [[nodiscard]] size_t size() const noexcept { return values_.size(); }
 
+    [[nodiscard]] bool operator==(const object& other) const noexcept;
+    [[nodiscard]] bool operator!=(const object& other) const noexcept {
+        return !(*this == other);
+    }
+
 private:
     storage_type values_;
 };
@@ -143,6 +158,11 @@ public:
 
     array();
     array(std::initializer_list<value> init);
+    array(const array& other);
+    array(array&& other) noexcept;
+    array& operator=(const array& other);
+    array& operator=(array&& other) noexcept;
+    ~array();
 
     void push_back(value v);
     [[nodiscard]] value& operator[](size_t index);
@@ -157,6 +177,11 @@ public:
 
     [[nodiscard]] bool empty() const noexcept { return values_.empty(); }
     [[nodiscard]] size_t size() const noexcept { return values_.size(); }
+
+    [[nodiscard]] bool operator==(const array& other) const noexcept;
+    [[nodiscard]] bool operator!=(const array& other) const noexcept {
+        return !(*this == other);
+    }
 
 private:
     storage_type values_;

@@ -431,10 +431,9 @@ net::awaitable<ProxyProtocolReadResult> TcpStream::ReadProxyProtocolHeader(
 
         size_t remaining = result.consumed;
         while (remaining > 0) {
-            std::array<uint8_t, kProxyProbeBytes> discard;
-            const size_t want = std::min(remaining, discard.size());
+            const size_t want = std::min(remaining, probe.size());
             auto [read_ec, n] = co_await AsyncReceiveSome(
-                net::buffer(discard.data(), want));
+                net::buffer(probe.data(), want));
             if (read_ec || n == 0) {
                 auto out = timed_out()
                     ? ProxyReadResult(ProxyProtocolReadStatus::TimedOut, std::move(result))
@@ -450,11 +449,9 @@ net::awaitable<ProxyProtocolReadResult> TcpStream::ReadProxyProtocolHeader(
     }
 
     memory::ByteVector buf;
-    buf.reserve(kProxyProbeBytes * 2);
 
     while (buf.size() < kProxyHeaderMaxBytes) {
-        std::array<uint8_t, kProxyProbeBytes> chunk;
-        auto [read_ec, n] = co_await AsyncReceiveSome(net::buffer(chunk));
+        auto [read_ec, n] = co_await AsyncReceiveSome(net::buffer(probe));
         if (read_ec || n == 0) {
             // Only an incomplete header reaches this loop: whatever arrived
             // so far cannot complete it any more.
@@ -464,8 +461,14 @@ net::awaitable<ProxyProtocolReadResult> TcpStream::ReadProxyProtocolHeader(
             ClearPhaseDeadline();
             co_return out;
         }
-        buf.insert(buf.end(), chunk.begin(),
-                   chunk.begin() + static_cast<ptrdiff_t>(n));
+        const size_t required = buf.size() + n;
+        if (required > buf.capacity()) {
+            buf.reserve(std::min<size_t>(
+                kProxyHeaderMaxBytes + kProxyProbeBytes,
+                std::max(required, std::max<size_t>(kProxyProbeBytes, buf.capacity() * 2))));
+        }
+        buf.insert(buf.end(), probe.begin(),
+                   probe.begin() + static_cast<ptrdiff_t>(n));
         result = ParseProxyProtocolHeader(buf);
         if (result.incomplete()) {
             continue;

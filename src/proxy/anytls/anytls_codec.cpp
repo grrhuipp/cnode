@@ -298,7 +298,7 @@ WritePacketWithPadding(AsyncStream& stream,
             co_return tl::unexpected(ok.error());
         }
     }
-
+    memory::ByteVector{}.swap(record);
     if (offset < packet.size()) {
         co_return co_await WriteAll(
             stream,
