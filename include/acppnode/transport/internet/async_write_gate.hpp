@@ -3,6 +3,7 @@
 #include "acppnode/common/asio_types.hpp"
 
 #include <asio/as_tuple.hpp>
+#include <asio/bind_cancellation_slot.hpp>
 #include <asio/experimental/channel.hpp>
 #include <asio/this_coro.hpp>
 #include <asio/use_awaitable.hpp>
@@ -70,9 +71,11 @@ public:
         return Lease{this};
     }
 
-    [[nodiscard]] net::awaitable<Lease> Acquire() {
+    [[nodiscard]] net::awaitable<Lease> Acquire(bool ignore_caller_cancellation = false) {
         const auto cancellation = co_await net::this_coro::cancellation_state;
-        if (cancelled_ || cancellation.cancelled() != net::cancellation_type::none) {
+        if (cancelled_ ||
+            (!ignore_caller_cancellation &&
+             cancellation.cancelled() != net::cancellation_type::none)) {
             co_return Lease{};
         }
         while (busy_ && !cancelled_) {
@@ -97,13 +100,22 @@ public:
                     }
                 }
             } scope{*this};
-            auto [ec] = co_await signal_->async_receive(
-                net::as_tuple(net::use_awaitable));
+            IoErrorCode ec;
+            if (ignore_caller_cancellation) {
+                std::tie(ec) = co_await signal_->async_receive(
+                    net::bind_cancellation_slot(
+                        net::cancellation_slot{},
+                        net::as_tuple(net::use_awaitable)));
+            } else {
+                std::tie(ec) = co_await signal_->async_receive(
+                    net::as_tuple(net::use_awaitable));
+            }
             if (!ec) {
                 scope.woke = true;
             }
-            if (ec || (co_await net::this_coro::cancellation_state).cancelled() !=
-                          net::cancellation_type::none) {
+            if (ec || (!ignore_caller_cancellation &&
+                       (co_await net::this_coro::cancellation_state).cancelled() !=
+                           net::cancellation_type::none)) {
                 co_return Lease{};
             }
             if (!busy_ && !cancelled_) {

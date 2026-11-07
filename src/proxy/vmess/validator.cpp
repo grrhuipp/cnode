@@ -20,37 +20,30 @@
 namespace acpp {
 namespace vmess {
 
-struct TimedUserValidator::Impl : memory::ThreadAllocated {
-    struct SessionKey {
-        std::array<uint8_t, 16> user{};
-        std::array<uint8_t, 16> key{};
-        std::array<uint8_t, 16> iv{};
+namespace {
 
-        [[nodiscard]] bool operator==(const SessionKey& other) const noexcept {
-            return CRYPTO_memcmp(user.data(), other.user.data(), user.size()) == 0 &&
-                   CRYPTO_memcmp(key.data(), other.key.data(), key.size()) == 0 &&
-                   CRYPTO_memcmp(iv.data(), other.iv.data(), iv.size()) == 0;
-        }
-    };
+using SessionKey = std::array<uint8_t, 32>;
 
-    struct SessionKeyHash {
-        std::array<uint64_t, 2> key{};
+struct SessionKeyEqual {
+    [[nodiscard]] bool operator()(const SessionKey& a, const SessionKey& b) const noexcept {
+        return CRYPTO_memcmp(a.data(), b.data(), a.size()) == 0;
+    }
+};
 
-        [[nodiscard]] size_t operator()(const SessionKey& value) const noexcept {
-            std::array<uint8_t, 48> bytes{};
-            std::memcpy(bytes.data(), value.user.data(), 16);
-            std::memcpy(bytes.data() + 16, value.key.data(), 16);
-            std::memcpy(bytes.data() + 32, value.iv.data(), 16);
-            return static_cast<size_t>(SIPHASH_24(key.data(), bytes.data(), bytes.size()));
-        }
-    };
+struct SessionKeyHash {
+    std::array<uint64_t, 2> key{};
+
+    [[nodiscard]] size_t operator()(const SessionKey& value) const noexcept {
+        return static_cast<size_t>(SIPHASH_24(key.data(), value.data(), value.size()));
+    }
+};
 
     struct SessionHistory {
         static constexpr int64_t kTtlSeconds = 180;
         static constexpr int64_t kCleanupIntervalSeconds = 30;
         static constexpr size_t kMaxEntries = 65536;
 
-        memory::ThreadLocalUnorderedMap<SessionKey, int64_t, SessionKeyHash> entries;
+        memory::ThreadLocalUnorderedMap<SessionKey, int64_t, SessionKeyHash, SessionKeyEqual> entries;
         memory::ThreadLocalDeque<std::pair<SessionKey, int64_t>> order;
         int64_t last_cleanup = 0;
 
@@ -187,7 +180,7 @@ struct TimedUserValidator::Impl : memory::ThreadAllocated {
         void shutdown() override {}
         SessionHistory history;
     };
-};
+}  // namespace
 
 TimedUserValidator::TimedUserValidator() = default;
 
@@ -203,7 +196,7 @@ TimedUserValidator::FindByAuthIDForTag(
         std::chrono::system_clock::now().time_since_epoch()).count();
 
     auto tryUser = [&](const proxyman::inbound::UserStore::VmessCredential& user) -> bool {
-        std::array<uint8_t, 16> plaintext;
+        std::array<uint8_t, 16> plaintext{};
         AES_decrypt(auth_id, plaintext.data(), &user.auth_id_key);
 
         int64_t timestamp = 0;
@@ -212,6 +205,7 @@ TimedUserValidator::FindByAuthIDForTag(
         }
 
         if (timestamp > now + TIMESTAMP_TOLERANCE || timestamp < now - TIMESTAMP_TOLERANCE) {
+            OPENSSL_cleanse(plaintext.data(), plaintext.size());
             return false;
         }
 
@@ -220,6 +214,7 @@ TimedUserValidator::FindByAuthIDForTag(
                                 (static_cast<uint32_t>(plaintext[13]) << 16) |
                                 (static_cast<uint32_t>(plaintext[14]) << 8) |
                                 plaintext[15];
+        OPENSSL_cleanse(plaintext.data(), plaintext.size());
 
         if (crc == expected_crc) {
             out_timestamp = timestamp;
@@ -230,7 +225,7 @@ TimedUserValidator::FindByAuthIDForTag(
 
     auto view = proxyman::inbound::UserStore::VmessUsers(tag);
     const uint64_t revision = proxyman::inbound::UserStore::WorkerViewRevision();
-    auto& tls_hot_cache = Impl::ThreadHotCache();
+    auto& tls_hot_cache = ThreadHotCache();
     if (revision == 0 || tls_hot_cache.view_revision != revision) {
         tls_hot_cache.Clear();
         tls_hot_cache.view_revision = revision;
@@ -250,7 +245,7 @@ TimedUserValidator::FindByAuthIDForTag(
              it != tls_hot_cache.entries.begin() + tls_hot_cache.size;
              ++it) {
             if (it->table == view.users.get() &&
-                it->last_seen + Impl::HotUserCache::kWindowSeconds >= now) {
+                it->last_seen + HotUserCache::kWindowSeconds >= now) {
                 const auto* user = it->user;
                 if (tryUser(*user)) {
                     tls_hot_cache.Touch(user, view.users.get(), now);
@@ -278,15 +273,17 @@ net::awaitable<bool> TimedUserValidator::RegisterSessionIfNew(
     const std::array<uint8_t, 16>& body_iv) const {
     auto domain = ExecutionDomain::Current();
     if (!domain) throw std::logic_error("VMess replay admission requires an execution domain");
-    Impl::SessionKey key;
-    key.user = user.uuid_bytes;
-    key.key = body_key;
-    key.iv = body_iv;
+    std::array<uint8_t, 48> material{};
+    std::memcpy(material.data(), user.uuid_bytes.data(), 16);
+    std::memcpy(material.data() + 16, body_key.data(), 16);
+    std::memcpy(material.data() + 32, body_iv.data(), 16);
+    const SessionKey key = SHA256Hash(material.data(), material.size());
+    OPENSSL_cleanse(material.data(), material.size());
     auto* coordinator = &domain->Coordinator();
     return coordinator->PostCall([coordinator, key] {
         const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
-        return net::use_service<Impl::HistoryService>(
+        return net::use_service<HistoryService>(
             coordinator->Services()).history.AddIfNew(key, now);
     });
 }

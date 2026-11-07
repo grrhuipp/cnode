@@ -497,20 +497,21 @@ struct TlsStream::Impl : memory::ThreadAllocated, private transport::Cancellatio
         throw IoSystemError(net::ssl::error::unexpected_result);
     }
 
-    net::awaitable<void> WaitForInput(std::uint64_t epoch, std::uint64_t generation) {
+    net::awaitable<void> WaitForInput(std::uint64_t epoch, std::uint64_t generation,
+                                      bool deferred = false) {
         // The other direction may advance SSL while this operation waits for
         // the single TCP read deadline. Retry SSL instead of waiting for a new
         // network edge when its state has already changed.
         auto lease = input_gate.TryAcquire();
-        if (!lease) lease = co_await input_gate.Acquire();
+        if (!lease) lease = co_await input_gate.Acquire(deferred);
         CheckCancellation(epoch);
         if (!lease) throw IoSystemError(io_error::operation_aborted);
         if (generation != input_generation) co_return;
         const auto cancellation = co_await net::this_coro::cancellation_state;
-        InputWait waiting(*this, cancellation.slot());
+        InputWait waiting(*this, deferred ? net::cancellation_slot{} : cancellation.slot());
         const auto ec = co_await tcp->WaitReadable(waiting.wake.slot());
         CheckCancellation(epoch);
-        if (cancellation.cancelled() != net::cancellation_type::none)
+        if (!deferred && cancellation.cancelled() != net::cancellation_type::none)
             throw IoSystemError(io_error::operation_aborted);
         if (ec == io_error::operation_aborted && generation != input_generation) co_return;
         if (ec) throw IoSystemError(ec);
@@ -520,8 +521,9 @@ struct TlsStream::Impl : memory::ThreadAllocated, private transport::Cancellatio
         Kind kind, net::mutable_buffer target = {}, net::const_buffer source = {},
         buf::BufferGuard* allocated = nullptr) {
         const auto epoch = cancel_epoch;
+        const bool deferred = (kind == Kind::Write && tcp->IsWriteCancellationDeferred());
         auto lease = engine_gate.TryAcquire();
-        if (!lease) lease = co_await engine_gate.Acquire();
+        if (!lease) lease = co_await engine_gate.Acquire(deferred);
         CheckCancellation(epoch);
         if (!lease) throw IoSystemError(io_error::operation_aborted);
         for (;;) {
@@ -553,9 +555,18 @@ struct TlsStream::Impl : memory::ThreadAllocated, private transport::Cancellatio
                         if (result > 0 || shutdown_sent || error == SSL_ERROR_WANT_READ)
                             lease.Reset();
                         if (turn.previous) {
-                            auto [ec] = co_await turn.wake->async_receive(
-                                net::bind_allocator(memory::ProcessAllocator<std::byte>{},
-                                    net::as_tuple(net::use_awaitable)));
+                            IoErrorCode ec;
+                            if (deferred) {
+                                std::tie(ec) = co_await turn.wake->async_receive(
+                                    net::bind_cancellation_slot(
+                                        net::cancellation_slot{},
+                                        net::bind_allocator(memory::ProcessAllocator<std::byte>{},
+                                            net::as_tuple(net::use_awaitable))));
+                            } else {
+                                std::tie(ec) = co_await turn.wake->async_receive(
+                                    net::bind_allocator(memory::ProcessAllocator<std::byte>{},
+                                        net::as_tuple(net::use_awaitable)));
+                            }
                             if (ec) throw IoSystemError(io_error::operation_aborted);
                             CheckCancellation(epoch);
                         }
@@ -582,10 +593,10 @@ struct TlsStream::Impl : memory::ThreadAllocated, private transport::Cancellatio
                 // direction may consume/advance the handshake while this
                 // operation retains its original SSL_write retry arguments.
                 lease.Reset();
-                co_await WaitForInput(epoch, generation);
+                co_await WaitForInput(epoch, generation, deferred);
                 if (!lease) {
                     lease = engine_gate.TryAcquire();
-                    if (!lease) lease = co_await engine_gate.Acquire();
+                    if (!lease) lease = co_await engine_gate.Acquire(deferred);
                     CheckCancellation(epoch);
                     if (!lease) throw IoSystemError(io_error::operation_aborted);
                 }
@@ -907,10 +918,7 @@ net::awaitable<void> TlsStream::WriteBuffers(
         co_await net::this_coro::throw_if_cancelled(false);
         std::exception_ptr failure;
         try {
-            co_await net::co_spawn(impl_->tcp->GetExecutor(), impl_->Write(buffers),
-                net::bind_cancellation_slot(net::cancellation_slot{},
-                    net::bind_allocator(memory::ProcessAllocator<std::byte>{},
-                        net::use_awaitable)));
+            co_await impl_->Write(buffers);
         } catch (...) {
             failure = std::current_exception();
         }

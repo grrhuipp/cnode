@@ -52,11 +52,6 @@ public:
         const proxyman::inbound::UserStore::VmessCredential& user,
         const std::array<uint8_t, 16>& body_key,
         const std::array<uint8_t, 16>& body_iv) const;
-
-
-private:
-    struct Impl;
-    std::unique_ptr<Impl> impl_;
 };
 
 }  // namespace vmess
