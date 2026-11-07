@@ -39,7 +39,7 @@ usage() {
     echo "  -route_url <url>       远程 routing.json 下载地址（指定则覆盖下载）"
     echo "  -inbound_url <url>     远程 inbounds.json 下载地址（指定则覆盖下载）"
     echo "  -v <version>           指定 release tag（默认 cnode-latest；latest 表示 GitHub latest）"
-    echo "  -variant <name>        二进制变体：default、musl、glibc、musl-io_uring、glibc-io_uring"
+    echo "  -variant <name>        二进制名称：default、musl（均为 musl 静态版）"
     echo "  -debug_file true       额外下载 release 对应的 .debug 符号文件"
     exit 1
 }
@@ -136,11 +136,11 @@ install_cnode() {
         default)
             ASSET_NAME="cnode-linux-amd64"
             ;;
-        musl|glibc|musl-io_uring|glibc-io_uring)
+        musl)
             ASSET_NAME="cnode-linux-amd64-$VARIANT"
             ;;
         *)
-            echo "无效的 variant: $VARIANT（支持 default/musl/glibc/musl-io_uring/glibc-io_uring）"
+            echo "无效的 variant: $VARIANT（支持 default/musl）"
             exit 1
             ;;
     esac

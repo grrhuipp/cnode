@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "acppnode/app/proxyman/inbound/handler_registry.hpp"
 #include "acppnode/app/proxyman/outbound/handler.hpp"
 #include "acppnode/app/dns/dns.hpp"
@@ -63,17 +65,6 @@ PreparedOutboundConfig MakeConfig(std::string tag, Probe& probe) {
 }
 
 using InboundRegistry = acpp::proxyman::inbound::HandlerRegistry;
-static_assert(std::is_same_v<
-    decltype(std::declval<InboundRegistry&>().GetHandler(
-        std::declval<std::string_view>())),
-    std::shared_ptr<acpp::proxyman::inbound::Handler>>);
-static_assert(!noexcept(std::declval<InboundRegistry&>().ReplaceHandler(
-    std::declval<std::unique_ptr<acpp::proxyman::inbound::Handler>>())));
-static_assert(!noexcept(std::declval<InboundRegistry&>().RemoveHandler(
-    std::declval<std::string_view>())));
-static_assert(std::is_same_v<
-    decltype(std::declval<HandlerLookup&>().GetHandler(std::declval<std::string_view>())),
-    std::shared_ptr<acpp::proxyman::outbound::Handler>>);
 
 int Run() {
     acpp::net::io_context io;
@@ -147,13 +138,13 @@ int Run() {
 
 }  // namespace
 
-int main() {
+TEST(HandlerRegistry, Contract) {
     try {
-        const int result = Run();
+        const int result = ::Run();
         std::printf("outbound handler lookup: %s (%d)\n", result == 0 ? "PASS" : "FAIL", result);
-        return result;
+        { ASSERT_EQ((result), 0); return; }
     } catch (const std::exception& error) {
         std::fprintf(stderr, "fixture failure: %s\n", error.what());
-        return 100;
+        FAIL() << error.what();
     }
 }

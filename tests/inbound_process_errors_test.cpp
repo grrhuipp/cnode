@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "acppnode/app/proxyman/inbound/handler.hpp"
 #include "acppnode/app/request_load_state.hpp"
 #include "acppnode/app/rate_limiter.hpp"
@@ -310,10 +312,6 @@ bool TestQuota(uint32_t limit, bool reject_ip, bool reverse) {
 // Replace the external transport builder and reporting sink; execute the
 // production accepted-TCP and logical-transport ownership/error boundaries.
 namespace acpp {
-TransportSecurity::TransportSecurity(const StreamSettings& settings, StreamEndpointRole) {
-    if (settings.IsTlsLike()) throw std::logic_error("unexpected TLS receiver");
-}
-TransportSecurity::~TransportSecurity() = default;
 
 net::awaitable<TransportBuildResult> BuildInboundTransport(net::io_context&,
     std::unique_ptr<AsyncStream> raw, const StreamSettings&, SslContext*, uint64_t,
@@ -336,7 +334,7 @@ net::awaitable<ProxyProtocolReadResult> ReadInboundProxyProtocol(AsyncStream&, s
     throw std::logic_error("unexpected proxy protocol"); co_return ProxyProtocolReadResult{};
 }
 }
-int main() {
+TEST(InboundProcessErrors, Contract) {
     size_t passed = 0, total = 0;
     for (bool logical : {false, true}) for (bool codec : {false, true}) for (int fault = 0; fault < 8; ++fault) {
         State state{.fault = fault};
@@ -384,5 +382,5 @@ int main() {
         }
     }
     std::printf("inbound cases=%zu passed=%zu failed=%zu\n", total, passed, total - passed);
-    return passed == total ? 0 : 1;
+    { ASSERT_TRUE(passed == total); return; }
 }

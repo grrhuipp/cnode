@@ -108,26 +108,27 @@ inline void EncryptToMultiBuffer(SsAeadCipher& cipher,
     }
 }
 
-// Publish only authenticated plaintext. The cipher owns the reusable EVP state;
-// this operation does not copy a key or create a per-record context.
+// BoringSSL authenticates one complete record. Reuse a single input block in
+// place; fragmented records borrow contiguous storage only for this operation.
 [[nodiscard]] inline bool DecryptStreamPayload(
-    SsAeadCipher& cipher, const uint8_t* ciphertext, size_t payload_len,
-    const uint8_t* tag, buf::MultiBuffer& output) {
-    if ((payload_len && !ciphertext) || !tag) return false;
-    buf::MultiBuffer decoded;
-    decoded.reserve((payload_len + buf::Buffer::kSize - 1) / buf::Buffer::kSize);
-    size_t offset = 0;
-    while (offset < payload_len) {
-        buf::BufferGuard plain{buf::Buffer::New()};
-        if (!plain) throw std::bad_alloc();
-        const size_t chunk = std::min(payload_len - offset, size_t(plain->Available()));
-        if (!cipher.DecryptUpdate({ciphertext + offset, chunk}, plain->Tail().first(chunk))) return false;
-        plain->Produce(static_cast<uint32_t>(chunk));
-        decoded.push_back(std::move(plain));
-        offset += chunk;
+    SsAeadCipher& cipher, std::span<const uint8_t, 12> nonce,
+    buf::MultiBuffer ciphertext, buf::MultiBuffer& output) {
+    const size_t wire_size = ciphertext.byte_size();
+    if (wire_size < SsAeadCipher::kTagSize) return false;
+    const size_t payload_len = wire_size - SsAeadCipher::kTagSize;
+    if (auto block = ciphertext.TakeFrontIfLen(wire_size)) {
+        auto bytes = block->Bytes();
+        if (!cipher.Decrypt(nonce.data(), bytes.data(), bytes.size(), bytes.data())) return false;
+        block->end -= SsAeadCipher::kTagSize;
+        if (payload_len != 0) output.push_back(std::move(block));
+        return true;
     }
-    if (!cipher.FinishDecrypt(tag)) return false;
-    decoded.MoveTo(output);
+    buf::ContiguousWriteBuffer plaintext;
+    auto* bytes = plaintext.Prepare(wire_size);
+    ciphertext.CopyPrefixTo({bytes, wire_size});
+    ciphertext.clear();
+    if (!cipher.Decrypt(nonce.data(), bytes, wire_size, bytes)) return false;
+    if (payload_len != 0) plaintext.AppendTo(payload_len, output);
     return true;
 }
 
@@ -138,41 +139,25 @@ ReadAndDecryptStreamPayload(
     std::span<const uint8_t, 12> nonce,
     size_t payload_len,
     buf::MultiBuffer& output) {
-    if (!cipher.BeginDecrypt(nonce.data())) {
-        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
-    }
-
-    buf::MultiBuffer decoded;
-
+    buf::MultiBuffer ciphertext;
     size_t remaining = payload_len;
     while (remaining > 0) {
-        buf::BufferGuard plain{buf::Buffer::New()};
-        if (!plain) {
-            co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
-        }
-
-        const size_t to_process =
-            std::min(remaining, static_cast<size_t>(plain->Available()));
-        if (!co_await ReadFull(stream, plain->Tail().data(), to_process)) {
+        buf::BufferGuard block{buf::Buffer::New()};
+        if (!block) co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+        const size_t count = std::min(remaining, size_t(block->Available()));
+        if (!co_await ReadFull(stream, block->Tail().data(), count))
             co_return tl::unexpected(ErrorCode::SOCKET_READ_FAILED);
-        }
-        plain->Produce(static_cast<uint32_t>(to_process));
-
-        if (!cipher.DecryptUpdate(plain->Bytes(), plain->Bytes())) {
-            co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
-        }
-        decoded.push_back(std::move(plain));
-        remaining -= to_process;
+        block->Produce(static_cast<uint32_t>(count));
+        ciphertext.push_back(std::move(block));
+        remaining -= count;
     }
-
-    std::array<uint8_t, SsAeadCipher::kTagSize> payload_tag{};
-    if (!co_await ReadFull(stream, payload_tag.data(), payload_tag.size())) {
+    std::array<uint8_t, SsAeadCipher::kTagSize> tag{};
+    if (!co_await ReadFull(stream, tag.data(), tag.size()))
         co_return tl::unexpected(ErrorCode::SOCKET_READ_FAILED);
-    }
-    if (!cipher.FinishDecrypt(payload_tag.data())) {
+    if (!buf::AppendSpanToMultiBuffer(tag, ciphertext))
+        co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+    if (!DecryptStreamPayload(cipher, nonce, std::move(ciphertext), output))
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
-    }
-    decoded.MoveTo(output);
     co_return tl::expected<void, ErrorCode>{};
 }
 
@@ -251,20 +236,12 @@ private:
                 ++nonce_;
             }
             if (ciphertext_.byte_size() < *length_ + SsAeadCipher::kTagSize) return {};
+            buf::MultiBuffer record;
+            if (!ciphertext_.MovePrefixTo(record, *length_ + SsAeadCipher::kTagSize))
+                throw std::bad_alloc();
             buf::MultiBuffer decoded;
-            if (!ciphertext_.MovePrefixTo(decoded, *length_)) throw std::bad_alloc();
             const auto nonce = MakeNonce(nonce_);
-            if (!cipher_.BeginDecrypt(nonce.data()))
-                throw transport::LinkError(ErrorCode::PROTOCOL_DECODE_FAILED);
-            for (auto* block : decoded) {
-                if (!block || block->IsEmpty()) continue;
-                auto bytes = block->Bytes();
-                if (!cipher_.DecryptUpdate(bytes, bytes))
-                    throw transport::LinkError(ErrorCode::PROTOCOL_DECODE_FAILED);
-            }
-            std::array<uint8_t, SsAeadCipher::kTagSize> tag{};
-            ciphertext_.ConsumePrefixTo(tag);
-            if (!cipher_.FinishDecrypt(tag.data()))
+            if (!DecryptStreamPayload(cipher_, nonce, std::move(record), decoded))
                 throw transport::LinkError(ErrorCode::PROTOCOL_AUTH_FAILED);
             length_.reset();
             ++nonce_;

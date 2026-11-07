@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "awaitable_task_group.hpp"
 
 #include <asio/as_tuple.hpp>
@@ -439,7 +441,7 @@ void* operator new(std::size_t size) {
 void operator delete(void* p) noexcept { std::free(p); }
 void operator delete(void* p, std::size_t) noexcept { std::free(p); }
 
-int main() {
+TEST(AwaitableTaskGroup, Contract) {
     GroupResource resource;
     auto* previous = std::pmr::set_default_resource(&resource);
     int result = 0;
@@ -466,5 +468,5 @@ int main() {
         result = 1;
     }
     std::pmr::set_default_resource(previous);
-    return result;
+    { ASSERT_EQ((result), 0); return; }
 }

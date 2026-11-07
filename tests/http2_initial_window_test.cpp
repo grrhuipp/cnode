@@ -1,3 +1,6 @@
+#include <stdexcept>
+#include <gtest/gtest.h>
+
 #include "http2_initial_window.hpp"
 #include "http2_settings.hpp"
 
@@ -9,7 +12,7 @@ namespace {
 
 [[noreturn]] void Fail(std::string_view message) {
     std::cerr << message << '\n';
-    std::exit(1);
+    ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed");
 }
 
 void Check(bool condition, std::string_view message) {
@@ -28,7 +31,7 @@ void CheckInvalid(std::string_view body) {
 
 }  // namespace
 
-int main() {
+TEST(Http2InitialWindow, Contract) {
     auto absent = Parse(R"({})");
     Check(absent.has_value() && !*absent, "absent window became configured");
 
@@ -61,5 +64,4 @@ int main() {
               max_setting[5] == 0xff,
           "maximum window SETTINGS payload mismatch");
     std::cout << "http2_initial_window_test: ok\n";
-    return 0;
 }

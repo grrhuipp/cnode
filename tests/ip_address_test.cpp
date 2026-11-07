@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "acppnode/common/ip_address.hpp"
 
 #include <array>
@@ -5,7 +7,7 @@
 #include <string>
 #include <string_view>
 
-int main() {
+TEST(IpAddress, Contract) {
     using acpp::iputil::ParseLiteral;
     using namespace std::string_view_literals;
     const std::array valid{
@@ -17,7 +19,7 @@ int main() {
     for (const auto text : valid) {
         if (!ParseLiteral(text)) {
             std::fprintf(stderr, "valid literal rejected: %.*s\n", static_cast<int>(text.size()), text.data());
-            return 1;
+            FAIL() << "valid literal rejected: %.*s";
         }
     }
     const std::array invalid{
@@ -36,7 +38,7 @@ int main() {
     for (const auto text : invalid) {
         if (ParseLiteral(text)) {
             std::fprintf(stderr, "invalid literal accepted: %.*s\n", static_cast<int>(text.size()), text.data());
-            return 2;
+            FAIL() << "invalid literal accepted: " << text;
         }
     }
     // The parser must consume the view's length, without depending on a NUL
@@ -44,11 +46,11 @@ int main() {
     std::string backing = "192.0.2.1:443";
     const auto prefix = ParseLiteral(std::string_view(backing).substr(0, 9));
     backing.assign(backing.size(), 'x');
-    if (!prefix || prefix->to_v4().to_bytes() != acpp::net::ip::address_v4::bytes_type{192, 0, 2, 1}) return 3;
+    ASSERT_FALSE((!prefix || prefix->to_v4().to_bytes() != acpp::net::ip::address_v4::bytes_type{192, 0, 2, 1}));
     const auto scoped = ParseLiteral("fe80::1%4294967295");
-    if (!scoped || scoped->to_v6().scope_id() != 4294967295ULL) return 4;
+    ASSERT_FALSE((!scoped || scoped->to_v6().scope_id() != 4294967295ULL));
     const auto mapped = ParseLiteral("::ffff:192.0.2.1");
-    if (!mapped || !mapped->is_v6() || !mapped->to_v6().is_v4_mapped()) return 5;
+    ASSERT_FALSE((!mapped || !mapped->is_v6() || !mapped->to_v6().is_v4_mapped()));
 
     // Independent byte -> OS/Asio formatter -> parser round trips exercise all
     // octet values and IPv6 compression positions without another text parser.
@@ -56,13 +58,13 @@ int main() {
         acpp::net::ip::address_v4::bytes_type v4{};
         for (size_t i = 0; i < v4.size(); ++i) v4[i] = static_cast<unsigned char>(value + i * 67);
         const acpp::net::ip::address a4 = acpp::net::ip::address_v4(v4);
-        if (ParseLiteral(a4.to_string()) != a4) return 6;
+        ASSERT_FALSE((ParseLiteral(a4.to_string()) != a4));
         for (size_t zero = 0; zero < 16; zero += 2) {
             acpp::net::ip::address_v6::bytes_type v6{};
             for (size_t i = 0; i < v6.size(); ++i)
                 if (i < zero || i >= zero + 6) v6[i] = static_cast<unsigned char>(value + i * 31);
             const acpp::net::ip::address a6 = acpp::net::ip::address_v6(v6);
-            if (ParseLiteral(a6.to_string()) != a6) return 7;
+            ASSERT_FALSE((ParseLiteral(a6.to_string()) != a6));
         }
     }
     std::printf("IP literals: %zu valid, %zu invalid, 2304 byte round trips passed\n", valid.size(), invalid.size());

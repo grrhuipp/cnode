@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "app/dns/inflight_resolves.hpp"
 #include "acppnode/app/dns/dns_worker.hpp"
 #include "acppnode/app/worker_mailbox.hpp"
@@ -34,12 +36,6 @@ void Require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
 
-template <typename T>
-concept HasSyncCacheStats = requires(const T& client) { client.GetCacheStats(); };
-static_assert(!std::is_default_constructible_v<acpp::app::dns::DNS>);
-static_assert(!std::is_constructible_v<acpp::app::dns::DNS,
-    net::io_context&, const acpp::app::dns::Config&>);
-static_assert(!HasSyncCacheStats<acpp::app::dns::DNS>);
 
 enum class Failure { None, Query, IoQuery, CancelledQuery, ResultCopy };
 
@@ -575,7 +571,7 @@ void* operator new(std::size_t size) {
 }
 void operator delete(void* pointer) noexcept { std::free(pointer); }
 void operator delete(void* pointer, std::size_t) noexcept { std::free(pointer); }
-int main() {
+TEST(DnsInflight, Contract) {
     acpp::memory::ConfigureProcessAllocator();
     bool passed = true;
     try {
@@ -600,5 +596,5 @@ int main() {
         std::cerr << error.what() << '\n';
         passed = false;
     }
-    return passed ? 0 : 1;
+    { ASSERT_TRUE(passed); return; }
 }

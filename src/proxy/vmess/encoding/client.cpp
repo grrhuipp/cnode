@@ -2,6 +2,7 @@
 #include "acppnode/common/error.hpp"
 #include "acppnode/common/address_codec.hpp"
 #include "acppnode/common/byte_reader.hpp"
+#include <openssl/mem.h>
 #include <openssl/rand.h>
 #include <chrono>
 #include <cstring>

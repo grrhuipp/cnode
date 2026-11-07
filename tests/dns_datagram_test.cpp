@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "acppnode/app/dns/dns_worker.hpp"
 #include "acppnode/common/allocator.hpp"
 #include "app/dns/datagram_exchange.hpp"
@@ -532,7 +534,7 @@ void TestDatagramAllocationFailureJoin() {
     std::pmr::set_default_resource(original);
 }
 }
-int main() {
+TEST(DnsDatagram, Contract) {
     acpp::memory::ConfigureProcessAllocator();
     try {
         TestQueries(false); TestQueries(true); TestIsolation(true); TestIsolation(false);
@@ -543,6 +545,6 @@ int main() {
         TestServiceStopJoin(); TestDatagramStopJoin(false); TestDatagramStopJoin(true);
         TestDatagramAllocationFailureJoin();
     }
-    catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
+    catch (const std::exception& e) { std::cerr << e.what() << '\n'; FAIL() << e.what(); }
     std::cout << "DNS parallel sampling / socket reuse / validation / isolation / fallback / cache: PASS\n";
 }

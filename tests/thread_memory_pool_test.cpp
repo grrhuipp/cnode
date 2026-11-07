@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
 #include "acppnode/common/session.hpp"
@@ -688,11 +690,11 @@ bool RunAll() {
 }
 } // namespace
 
-int main() {
+TEST(ThreadMemoryPool, Contract) {
     bool worker = false;
     std::thread thread([&] { worker = RunAll(); });
     thread.join();
     const bool main = RunAll();
     std::printf("unified pool layout/ownership/reuse/purge: %s\n", worker && main ? "PASS" : "FAIL");
-    return worker && main ? 0 : 1;
+    { ASSERT_TRUE(worker && main); return; }
 }

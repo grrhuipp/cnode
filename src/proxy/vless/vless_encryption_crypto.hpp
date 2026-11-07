@@ -3,6 +3,7 @@
 #include <openssl/base.h>
 #include <openssl/evp.h>
 #include <openssl/mem.h>
+#include <openssl/mlkem.h>
 
 #include <array>
 #include <cstddef>
@@ -17,6 +18,10 @@ inline constexpr size_t kVlessMlKem768SeedSize = 64;
 inline constexpr size_t kVlessMlKem768PublicKeySize = 1184;
 inline constexpr size_t kVlessMlKem768CiphertextSize = 1088;
 inline constexpr size_t kVlessMlKem768SharedSecretSize = 32;
+static_assert(kVlessMlKem768SeedSize == MLKEM_SEED_BYTES);
+static_assert(kVlessMlKem768PublicKeySize == MLKEM768_PUBLIC_KEY_BYTES);
+static_assert(kVlessMlKem768CiphertextSize == MLKEM768_CIPHERTEXT_BYTES);
+static_assert(kVlessMlKem768SharedSecretSize == MLKEM_SHARED_SECRET_BYTES);
 
 // The NFS key is a single X25519 or ML-KEM-768 shared secret.
 inline constexpr size_t kVlessEncryptionNfsKeySize = kVlessX25519KeySize;
@@ -63,6 +68,8 @@ struct VlessMlKem768Encapsulation {
     std::span<const uint8_t> peer_public_key,
     std::span<uint8_t, kVlessX25519KeySize> out_shared) noexcept;
 
+// EVP_PKEY owns the expanded ML-KEM key and seed; EVP_PKEY_free wipes both.
+// Configuration keys share ownership, while each PFS hello owns its own key.
 [[nodiscard]] std::shared_ptr<EVP_PKEY>
 CreateVlessMlKem768PrivateKeyFromSeed(std::span<const uint8_t> seed) noexcept;
 
@@ -76,13 +83,13 @@ CreateVlessMlKem768PublicKey(std::span<const uint8_t> public_key) noexcept;
 DeriveVlessMlKem768PublicKey(const EVP_PKEY* key) noexcept;
 
 [[nodiscard]] std::optional<VlessMlKem768Encapsulation>
-EncapsulateVlessMlKem768(EVP_PKEY* public_key) noexcept;
+EncapsulateVlessMlKem768(const EVP_PKEY* public_key) noexcept;
 
 [[nodiscard]] std::optional<VlessMlKem768Encapsulation>
 EncapsulateVlessMlKem768(std::span<const uint8_t> public_key) noexcept;
 
 [[nodiscard]] bool DecapsulateVlessMlKem768(
-    EVP_PKEY* private_key,
+    const EVP_PKEY* private_key,
     std::span<const uint8_t> ciphertext,
     std::span<uint8_t, kVlessMlKem768SharedSecretSize> out_shared) noexcept;
 

@@ -1,3 +1,6 @@
+#include <stdexcept>
+#include <gtest/gtest.h>
+
 #include "worker/udp_association_reclaimer.hpp"
 #include "worker/udp_ingress.hpp"
 
@@ -43,7 +46,7 @@ constexpr size_t kBatchLimit = 64;
 
 [[noreturn]] void Fail(std::string_view message) {
     std::cerr << message << '\n';
-    std::exit(1);
+    ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed");
 }
 
 class DummyInbound : public acpp::Inbound {
@@ -320,7 +323,7 @@ bool StepReclaimBatches(acpp::net::io_context& io, Count count, size_t target,
 }
 } // namespace
 
-int main() {
+TEST(UdpAssociationReclaimer, Contract) {
     struct PmrScope {
         CountingPmrResource resource;
         std::pmr::memory_resource* previous = std::pmr::set_default_resource(&resource);
@@ -750,5 +753,4 @@ int main() {
         Fail("reclaimer kept a maintenance event armed after owner cleanup");
     }
     reclaimer.Stop();
-    return 0;
 }

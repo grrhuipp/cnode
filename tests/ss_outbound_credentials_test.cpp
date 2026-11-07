@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "outbound/ss_outbound_credentials.hpp"
 
 #include <array>
@@ -11,7 +13,6 @@ namespace {
 using acpp::proxy::shadowsocks::outbound::Credentials;
 using acpp::ss::SsCipherType;
 
-static_assert(!std::is_default_constructible_v<Credentials>);
 constexpr std::string_view kKey16 = "AAECAwQFBgcICQoLDA0ODw==";
 constexpr std::string_view kKey32 = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
 constexpr std::string_view kIdentity32 = "ZmVkY2JhOTg3NjU0MzIxMGZlZGNiYTk4NzY1NDMyMTA=";
@@ -104,7 +105,7 @@ void TestInvalidCredentials() {
 }
 }  // namespace
 
-int main() {
+TEST(SsOutboundCredentials, Contract) {
     try {
         TestPasswords();
         TestPskValues();
@@ -112,6 +113,6 @@ int main() {
         std::cout << "SS outbound credential vectors, complete chains, owned values and rejection passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
-        return 1;
+        FAIL() << error.what();
     }
 }

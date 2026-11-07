@@ -1,3 +1,6 @@
+#include <stdexcept>
+#include <gtest/gtest.h>
+
 #include "grpc_hunk.hpp"
 
 #include <algorithm>
@@ -19,7 +22,7 @@ std::array<Allocation, 64> tracked;
 
 void Check(bool condition, const char* message) {
     ++checks;
-    if (!condition) { std::fprintf(stderr, "%s\n", message); std::exit(1); }
+    if (!condition) { std::fprintf(stderr, "%s\n", message); ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed"); }
 }
 
 void Forget(void* pointer) noexcept {
@@ -96,7 +99,7 @@ void Case(const Bytes& bytes, std::string_view expected, bool valid) {
 }
 }  // namespace
 
-int main() {
+TEST(GrpcHunk, Contract) {
     for (uint32_t size : {1024u, 4194304u, 4194305u, UINT32_MAX}) {
         GrpcHunkDecoder decoder;
         largest = allocated = denied = 0; allocation_limit = 1024 * 1024; measuring = true;

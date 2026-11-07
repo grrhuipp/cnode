@@ -4,6 +4,7 @@
 #include "acppnode/core/naming.hpp"
 
 #include <blake3.h>
+#include <openssl/base64.h>
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
 #include <openssl/hkdf.h>
@@ -310,11 +311,11 @@ bool DeriveSubkey(const uint8_t* key, size_t key_size,
 // SsAeadCipher
 // ============================================================================
 namespace {
-const EVP_CIPHER* GetCipher(SsCipherType type) noexcept {
+const EVP_AEAD* GetCipher(SsCipherType type) noexcept {
     switch (BaseCipherType(type)) {
-        case SsCipherType::AES_128_GCM: return EVP_aes_128_gcm();
-        case SsCipherType::AES_256_GCM: return EVP_aes_256_gcm();
-        case SsCipherType::CHACHA20_POLY1305: return EVP_chacha20_poly1305();
+        case SsCipherType::AES_128_GCM: return EVP_aead_aes_128_gcm();
+        case SsCipherType::AES_256_GCM: return EVP_aead_aes_256_gcm();
+        case SsCipherType::CHACHA20_POLY1305: return EVP_aead_chacha20_poly1305();
         default: return nullptr;
     }
 }
@@ -359,24 +360,6 @@ bool SsAeadCipher::Decrypt(const uint8_t* nonce, const uint8_t* ciphertext,
         context->Process(std::span<const uint8_t, 12>(nonce, 12),
                          {ciphertext, ciphertext_len}, {},
                          {output, ciphertext_len - kTagSize}).has_value();
-}
-
-bool SsAeadCipher::BeginDecrypt(const uint8_t* nonce) noexcept {
-    auto* context = std::get_if<proxy::AeadDecryptor>(&context_);
-    return context && nonce &&
-        context->Begin(std::span<const uint8_t, 12>(nonce, 12));
-}
-
-bool SsAeadCipher::DecryptUpdate(std::span<const uint8_t> input,
-                               std::span<uint8_t> output) noexcept {
-    auto* context = std::get_if<proxy::AeadDecryptor>(&context_);
-    return context && context->Update(input, output);
-}
-
-bool SsAeadCipher::FinishDecrypt(const uint8_t* tag) noexcept {
-    auto* context = std::get_if<proxy::AeadDecryptor>(&context_);
-    return context && tag &&
-        context->Finish(std::span<const uint8_t, 16>(tag, 16));
 }
 
 }  // namespace acpp::ss

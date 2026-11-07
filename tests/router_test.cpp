@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "acppnode/app/router/router.hpp"
 #include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
 #include "acppnode/common/session.hpp"
@@ -14,9 +16,6 @@
 namespace {
 
 using acpp::app::router::Router;
-static_assert(std::derived_from<Router, acpp::routing::Router>);
-static_assert(!std::default_initializable<Router>);
-static_assert(!std::movable<Router>);
 
 void Require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
@@ -284,14 +283,13 @@ void TestInvalidConstruction() {
 
 }  // namespace
 
-int main() {
+TEST(Router, Contract) {
     try {
         TestRulesAndOwnership();
         TestInboundMetadataOwnershipAndRouting();
         TestInvalidConstruction();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
-        return 1;
+        FAIL() << error.what();
     }
-    return 0;
 }

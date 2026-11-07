@@ -46,6 +46,7 @@
 #include "acppnode/proxy/inbound.hpp"
 
 #include <asio/bind_executor.hpp>
+#include <asio/ip/v6_only.hpp>
 #include <unordered_map>
 #include <sys/socket.h>
 #include <array>
@@ -1617,9 +1618,6 @@ net::awaitable<bool> Worker::ListenerState::StartUdpListening(
         co_return replaced;
     }
 
-#ifdef CNODE_TEST_UDP_LISTENER_RUNTIME_FAULT
-    worker_udp_listener_runtime_test::OnStage("prepare-listener", 0);
-#endif
     if (!worker.runtime_->udp_association_reclaimer) {
         throw std::logic_error("UDP listener runtime is not started");
     }
@@ -1744,9 +1742,6 @@ net::awaitable<bool> Worker::ListenerState::StartUdpListening(
         if (inserted_slot) listener_slots.erase(slot_it);
         throw;
     }
-#ifdef CNODE_TEST_UDP_LISTENER_RUNTIME_FAULT
-    worker_udp_listener_runtime_test::FinishPreparation();
-#endif
 
     const bool has_retiring_worker = slot_it->second->udp_ingress != nullptr;
     const bool cancel_throwing = co_await net::this_coro::throw_if_cancelled();
@@ -1802,19 +1797,12 @@ net::awaitable<bool> Worker::ListenerState::StartUdpListening(
             };
             ++udp_receive_loops;
             try {
-#ifdef CNODE_TEST_UDP_LISTENER_RUNTIME_FAULT
-                worker_udp_listener_runtime_test::OnStage("spawn", index);
-#endif
                 net::co_spawn(worker.runtime_->io_context.get_executor(),
                               std::move(prepared.receive), std::move(completion));
             } catch (...) {
                 --udp_receive_loops;
                 throw;
             }
-#ifdef CNODE_TEST_UDP_LISTENER_RUNTIME_FAULT
-            worker_udp_listener_runtime_test::ReportSuccessfulSpawn(index);
-            worker_udp_listener_runtime_test::OnStage("ready", index);
-#endif
 
             LOG_DEBUG("UDP listener ready worker={} key={} tag={} protocol={} accept=SO_REUSEPORT",
                       worker.id_, socket_key, binding.tag, binding.protocol);

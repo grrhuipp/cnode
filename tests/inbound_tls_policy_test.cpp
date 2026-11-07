@@ -1,31 +1,32 @@
+#include <gtest/gtest.h>
+
 #include "tls_policy.hpp"
 
-int main() {
+TEST(InboundTlsPolicy, Contract) {
     acpp::api::NodeInfo node;
 
     acpp::PanelConfig panel;
-    if (acpp::controller::ShouldEnableInboundTls(panel, node)) return 1;
+    ASSERT_FALSE((acpp::controller::ShouldEnableInboundTls(panel, node)));
     node.EnableTLS = true;
-    if (acpp::controller::ShouldEnableInboundTls(panel, node)) return 2;
+    ASSERT_FALSE((acpp::controller::ShouldEnableInboundTls(panel, node)));
 
     panel.TLSEnable = true;
-    if (!acpp::controller::ShouldEnableInboundTls(panel, node)) return 3;
+    ASSERT_FALSE((!acpp::controller::ShouldEnableInboundTls(panel, node)));
 
     node.EnableTLS = false;
-    if (acpp::controller::ShouldEnableInboundTls(panel, node)) return 4;
+    ASSERT_FALSE((acpp::controller::ShouldEnableInboundTls(panel, node)));
 
     node.NodeType = "anytls";
-    if (!acpp::controller::ShouldEnableInboundTls(panel, node)) return 5;
+    ASSERT_FALSE((!acpp::controller::ShouldEnableInboundTls(panel, node)));
 
     panel.TLSEnable = false;
-    if (acpp::controller::ShouldEnableInboundTls(panel, node)) return 6;
+    ASSERT_FALSE((acpp::controller::ShouldEnableInboundTls(panel, node)));
 
     node.NodeType = "trojan";
     panel.TLSEnable = true;
-    if (!acpp::controller::ShouldEnableInboundTls(panel, node)) return 7;
+    ASSERT_FALSE((!acpp::controller::ShouldEnableInboundTls(panel, node)));
 
     panel.TLSEnable = false;
-    if (acpp::controller::ShouldEnableInboundTls(panel, node)) return 8;
+    ASSERT_FALSE((acpp::controller::ShouldEnableInboundTls(panel, node)));
 
-    return 0;
 }

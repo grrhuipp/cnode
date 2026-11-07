@@ -1,0 +1,105 @@
+[tools]
+cmake = "4.4.5"
+ninja = "1.13.2"
+ccache = "4.14.2"
+"github:cross-tools/clang-cross" = { version = "20261007", asset_pattern = "x86_64-unknown-linux-musl.tar.xz", strip_components = "0", bin_path = "x86_64-unknown-linux-musl/bin", checksum = "sha256:c2bfe5352c02fa8c4ddf662c9240b6bf270fa83147620368e87301f5e46593c5" }
+
+[env]
+VCPKG_ROOT = "{{config_root}}/build/vcpkg"
+VCPKG_DEFAULT_BINARY_CACHE = "{{config_root}}/build/cache/vcpkg"
+VCPKG_DISABLE_METRICS = "1"
+CCACHE_DIR = "{{config_root}}/build/cache/ccache"
+CCACHE_MAXSIZE = "2G"
+CCACHE_COMPILERCHECK = "content"
+CCACHE_SLOPPINESS = "pch_defines,time_macros"
+
+[tasks.bootstrap]
+description = "准备 manifest 固定版本的 vcpkg（不安装项目依赖）"
+run = '''
+set -eu
+commit="$(jq -er '."builtin-baseline"' vcpkg.json)"
+mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
+if [ ! -d "$VCPKG_ROOT/.git" ]; then
+    git clone --filter=blob:none --no-checkout https://github.com/microsoft/vcpkg.git "$VCPKG_ROOT"
+fi
+if [ "$(git -C "$VCPKG_ROOT" rev-parse HEAD 2>/dev/null || true)" != "$commit" ]; then
+    git -C "$VCPKG_ROOT" fetch origin "$commit"
+fi
+git -C "$VCPKG_ROOT" checkout --detach "$commit"
+"$VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics
+'''
+
+[tasks.configure]
+description = "配置 musl Release，默认不启用测试"
+depends = ["bootstrap"]
+run = 'cmake --preset musl -DBUILD_ID="${BUILD_ID:-}"'
+
+[tasks.build]
+description = "仅构建 musl 静态主程序"
+depends = ["configure"]
+run = "cmake --build --preset musl"
+
+[tasks."test:configure"]
+description = "显式启用单元与 E2E 测试"
+depends = ["bootstrap"]
+run = '''
+set -eu
+cmake --preset musl-tests \
+    -DBUILD_ID="${BUILD_ID:-}"
+'''
+
+[tasks."test:build"]
+description = "按需构建测试，共用生产库"
+depends = ["test:configure"]
+run = "cmake --build --preset musl-tests"
+
+[tasks.test]
+description = "执行单元与 E2E 测试"
+depends = ["test:build"]
+run = "ctest --preset musl-tests --parallel"
+
+[tasks."reference:prepare"]
+description = "显式准备固定版本 AnyTLS 参考程序，默认离线（需要宿主 Go）"
+run = '''
+set -eu
+root="$PWD/build/reference/anytls"
+source="${CNODE_ANYTLS_SOURCE:-$root/source}"
+commit=fd6167acd6d73b9fa3e607659951847fbc9e6c50
+case "${CNODE_REFERENCE_DOWNLOAD:-OFF}" in
+    ON) download=1 ;;
+    OFF) download=0 ;;
+    *) echo "CNODE_REFERENCE_DOWNLOAD must be ON or OFF" >&2; exit 1 ;;
+esac
+if [ ! -e "$source" ]; then
+    if [ "$download" = 0 ]; then
+        echo "Set CNODE_ANYTLS_SOURCE or explicitly enable CNODE_REFERENCE_DOWNLOAD=ON" >&2
+        exit 1
+    fi
+    git clone --no-checkout https://github.com/anytls/anytls-go.git "$source"
+    git -C "$source" checkout --detach "$commit"
+fi
+source="$(realpath "$source")"
+mkdir -p "$root/bin"
+bin="$(realpath "$root/bin")"
+case "$bin/" in
+    "$source/"*) echo "Reference binaries must be outside the source checkout" >&2; exit 1 ;;
+esac
+revision="$(git -C "$source" rev-parse HEAD)"
+changes="$(git -C "$source" status --porcelain)"
+if [ "$revision" != "$commit" ] || [ -n "$changes" ]; then
+    echo "Reference source must be a clean checkout at $commit" >&2
+    exit 1
+fi
+command -v go >/dev/null
+export CGO_ENABLED=0
+if [ "$download" = 0 ]; then
+    export GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local GOPRIVATE= GONOPROXY=none GOVCS='*:off'
+fi
+cd "$source"
+for kind in client server; do
+    if ! go build -buildvcs=true -trimpath -o "$bin/anytls-$kind" "./cmd/$kind" >"$root/build-$kind.log" 2>&1; then
+        echo "AnyTLS $kind build failed; see $root/build-$kind.log" >&2
+        exit 1
+    fi
+done
+'''

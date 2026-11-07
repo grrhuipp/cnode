@@ -11,6 +11,7 @@
 #include <string>
 #include <openssl/ssl.h>
 #include <openssl/mem.h>
+#include <openssl/mldsa.h>
 
 namespace acpp {
 
@@ -26,7 +27,7 @@ struct RealityClientState : memory::ThreadAllocated {
     std::array<uint8_t, 32> auth_key{};
     memory::ThreadLocalString server_name;
     memory::ThreadLocalString spider_x;
-    EVP_PKEY* mldsa65_verify_key = nullptr;
+    const MLDSA65_public_key* mldsa65_verify_key = nullptr;
     memory::ByteVector client_hello_raw;
     memory::ByteVector server_hello_raw;
     bool auth_key_ready = false;

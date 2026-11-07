@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "acppnode/app/session_group_executor.hpp"
 
 #include <asio/co_spawn.hpp>
@@ -552,7 +554,7 @@ void HandoffCompletionWaitsForNativeLease() {
 }
 }
 
-int main() {
+TEST(SessionGroupExecutor, Contract) {
     StableDomainOwnership();
     FinalizeJoinsDomainRetirement();
     PassiveHandoffAndExclusiveDetach();

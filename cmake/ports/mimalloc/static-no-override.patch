@@ -1,0 +1,23 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1337,4 +1337,19 @@ if (MI_OVERRIDE)
+   if (MI_BUILD_OBJECT)
+     target_compile_definitions(mimalloc-obj PRIVATE MI_MALLOC_OVERRIDE)
+   endif()
+ endif()
++
++# Preserve explicit mi_* allocation without overriding test allocation hooks.
++add_library(mimalloc-static-no-override STATIC ${mi_static_sources})
++set_target_properties(mimalloc-static-no-override PROPERTIES
++    OUTPUT_NAME "${mi_libname}-no-override"
++    POSITION_INDEPENDENT_CODE ON
++    INTERPROCEDURAL_OPTIMIZATION OFF
++    INTERPROCEDURAL_OPTIMIZATION_RELEASE OFF)
++target_compile_definitions(mimalloc-static-no-override PRIVATE ${mi_defines} MI_STATIC_LIB)
++target_compile_options(mimalloc-static-no-override PRIVATE ${mi_cflags} ${mi_cflags_static})
++target_link_libraries(mimalloc-static-no-override PRIVATE ${mi_libraries})
++target_include_directories(mimalloc-static-no-override PUBLIC
++    "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
++    "$<INSTALL_INTERFACE:${mi_install_incdir}>")
++install(TARGETS mimalloc-static-no-override EXPORT mimalloc DESTINATION ${mi_install_objdir})

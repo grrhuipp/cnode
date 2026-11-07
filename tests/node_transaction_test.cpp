@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "node_transaction.hpp"
 
 #include <asio/co_spawn.hpp>
@@ -676,7 +678,7 @@ void TestRecoveryOwnershipBlocksCompanions(bool close_gate) {
 
 }  // namespace
 
-int main() {
+TEST(NodeTransaction, Contract) {
     try {
         TestSuccessAndRefresh();
         TestIncompleteCandidatePreservesLiveService();
@@ -696,8 +698,7 @@ int main() {
         TestRecoveryOwnershipBlocksCompanions(true);
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
-        return 1;
+        FAIL() << error.what();
     }
     std::cout << "node transaction fault matrix and recovery passed\n";
-    return 0;
 }

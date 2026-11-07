@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "awaitable_batch.hpp"
 
 #include <asio/as_tuple.hpp>
@@ -281,7 +283,7 @@ void* operator new(std::size_t size) {
 void operator delete(void* pointer) noexcept { std::free(pointer); }
 void operator delete(void* pointer, std::size_t) noexcept { std::free(pointer); }
 
-int main() {
+TEST(AwaitableBatch, Contract) {
     try {
         TestFailureBarrier();
         TestCancellationBarrier();
@@ -291,7 +293,6 @@ int main() {
     } catch (const std::exception& error) {
         fail_after = -1;
         std::cerr << error.what() << '\n';
-        return 1;
+        FAIL() << error.what();
     }
-    return 0;
 }

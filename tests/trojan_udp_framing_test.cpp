@@ -1,3 +1,6 @@
+#include <stdexcept>
+#include <gtest/gtest.h>
+
 #include "udp_framing.hpp"
 #include "acppnode/common/buf/length_prefixed_packet_buffer.hpp"
 
@@ -25,7 +28,7 @@ using namespace acpp;
 
 [[noreturn]] void Fail(std::string_view message) {
     std::cerr << message << '\n';
-    std::exit(1);
+    ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed");
 }
 
 void Check(bool condition, std::string_view message) {
@@ -220,7 +223,7 @@ void CheckCancelledReadPreservesFrame() {
 }
 }  // namespace
 
-int main() {
+TEST(TrojanUdpFraming, Contract) {
     CheckFrameBoundaries();
     CheckCancelledReadPreservesFrame();
     const TargetAddress target("1.1.1.1", 53);
@@ -235,7 +238,7 @@ int main() {
     }
 
     CaptureWriter capture;
-    Run([&]() -> net::awaitable<void> {
+    ::Run([&]() -> net::awaitable<void> {
         co_await trojan::WriteUdpDatagram(capture, std::move(payload));
     });
 
@@ -281,7 +284,7 @@ int main() {
         net::buffer(source.data() + buf::Buffer::kSize,
                     source.size() - buf::Buffer::kSize),
     };
-    Run([&]() -> net::awaitable<void> {
+    ::Run([&]() -> net::awaitable<void> {
         co_await trojan::WriteUdpDatagram(
             scatter_capture, target, scatter);
     });
@@ -292,12 +295,11 @@ int main() {
     const std::array<net::const_buffer, 1> oversized_buffers{net::buffer(oversized)};
     CaptureWriter rejected_capture;
     CheckRejected([&] {
-        Run([&]() -> net::awaitable<void> {
+        ::Run([&]() -> net::awaitable<void> {
             co_await trojan::WriteUdpDatagram(
                 rejected_capture, target, oversized_buffers);
         });
     }, "oversized Trojan datagram accepted");
     Check(rejected_capture.bytes.empty(), "oversized Trojan datagram partially written");
 
-    return 0;
 }

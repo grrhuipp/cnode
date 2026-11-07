@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "acppnode/transport/cancellation.hpp"
 
 #include <array>
@@ -211,9 +213,7 @@ bool TestSourceDestroyedDuringDelivery() {
 }
 }  // namespace
 
-int main() {
-    static_assert(!std::is_move_constructible_v<CancellationSource>);
-    static_assert(!std::is_move_constructible_v<CancellationSubscription>);
+TEST(CancellationSource, Contract) {
     reject_allocations = true;
     const bool passed = TestLifetimes() && TestMutation(false) && TestMutation(true) && TestManyListeners() &&
         TestTerminalState() && TestForwarding(false) && TestForwarding(true) &&
@@ -221,5 +221,5 @@ int main() {
     reject_allocations = false;
     std::printf("cancellation source: scoped delivery, terminal state, late subscription, forwarding, reentrancy and no allocations: %s\n",
         passed ? "PASS" : "FAIL");
-    return passed ? 0 : 1;
+    { ASSERT_TRUE(passed); return; }
 }

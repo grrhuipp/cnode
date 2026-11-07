@@ -1,9 +1,11 @@
+#include <gtest/gtest.h>
+
 #include "xhttp_packet_session_key.hpp"
 
 #include <cstdlib>
 #include <unordered_map>
 
-int main() {
+TEST(XhttpPacketSessionKey, Contract) {
     using Key = acpp::detail::XHttpPacketSessionKey;
     using Map = std::unordered_map<
         Key,
@@ -28,7 +30,7 @@ int main() {
     if (sessions.size() != 3 || first_it == sessions.end() ||
         second_it == sessions.end() || other_it == sessions.end() ||
         first_it->second != 1 || second_it->second != 2 || other_it->second != 3) {
-        return EXIT_FAILURE;
+        { ASSERT_EQ((EXIT_FAILURE), 0); return; }
     }
-    return EXIT_SUCCESS;
+    { ASSERT_EQ((EXIT_SUCCESS), 0); return; }
 }

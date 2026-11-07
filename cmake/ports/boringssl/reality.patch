@@ -1,0 +1,201 @@
+--- a/include/openssl/ssl.h
++++ b/include/openssl/ssl.h
+@@ -1313,6 +1313,27 @@
+                                                    const uint16_t *prefs,
+                                                    size_t num_prefs);
+ 
++// REALITY-only compatibility: allow Ed25519 CertificateVerify even when the
++// peer fingerprint omitted it from signature_algorithms.
++OPENSSL_EXPORT void
++SSL_CTX_set_reality_ignore_peer_signature_algorithm_prefs(SSL_CTX *ctx,
++                                                          int enabled);
++OPENSSL_EXPORT void
++SSL_set_reality_ignore_peer_signature_algorithm_prefs(SSL *ssl, int enabled);
++
++// The callback receives the generated X25519 shared secret and the serialized
++// ClientHello with a zeroed 32-byte session ID. It writes the authenticated
++// session ID and returns one on success. It does not alter other hello bytes.
++typedef int (*SSL_reality_client_hello_cb)(
++    SSL *ssl, const uint8_t *shared_secret, size_t shared_secret_len,
++    const uint8_t *client_random, size_t client_random_len,
++    const uint8_t *client_hello, size_t client_hello_len,
++    uint8_t *out_session_id, size_t out_session_id_len, void *arg);
++OPENSSL_EXPORT void SSL_set_reality_client_hello_cb(
++    SSL *ssl, SSL_reality_client_hello_cb cb, void *arg);
++OPENSSL_EXPORT int SSL_set1_reality_peer_public_key(
++    SSL *ssl, const uint8_t *peer_public_key, size_t peer_public_key_len);
++
+ 
+ // Certificate and private key convenience functions.
+ 
+--- a/ssl/internal.h
++++ b/ssl/internal.h
+@@ -2563,6 +2563,9 @@
+   // the list of credentials.
+   UniquePtr<SSLCredential> legacy_credential;
+ 
++  // REALITY permits only Ed25519 to bypass peer signature preferences.
++  bool reality_ignore_peer_signature_algorithm_prefs = false;
++
+   // available_trust_anchors, if not empty, overrides the default list of
+   // available trust anchors to send in EncryptedExtensions.
+   Array<uint8_t> available_trust_anchors;
+@@ -3504,6 +3507,11 @@
+   // accepted from the peer in decreasing order of preference.
+   Array<uint16_t> verify_sigalgs;
+ 
++  SSL_reality_client_hello_cb reality_client_hello_cb = nullptr;
++  void *reality_client_hello_arg = nullptr;
++  Array<uint8_t> reality_peer_public_key;
++  bool reality_client_hello_done = false;
++
+   // srtp_profiles is the list of configured SRTP protection profiles for
+   // DTLS-SRTP.
+   UniquePtr<STACK_OF(SRTP_PROTECTION_PROFILE)> srtp_profiles;
+--- a/ssl/ssl_cert.cc
++++ b/ssl/ssl_cert.cc
+@@ -69,6 +69,8 @@
+ 
+   ret->cert_cb = cert->cert_cb;
+   ret->cert_cb_arg = cert->cert_cb_arg;
++  ret->reality_ignore_peer_signature_algorithm_prefs =
++      cert->reality_ignore_peer_signature_algorithm_prefs;
+ 
+   ret->x509_method->cert_dup(ret.get(), cert);
+ 
+--- a/ssl/ssl_privkey.cc
++++ b/ssl/ssl_privkey.cc
+@@ -669,6 +669,41 @@
+       ssl_impl->config->cert->legacy_credential.get(), prefs, num_prefs);
+ }
+ 
++void SSL_CTX_set_reality_ignore_peer_signature_algorithm_prefs(SSL_CTX *ctx,
++                                                               int enabled) {
++  FromOpaque(ctx)->cert->reality_ignore_peer_signature_algorithm_prefs =
++      enabled != 0;
++}
++
++void SSL_set_reality_ignore_peer_signature_algorithm_prefs(SSL *ssl,
++                                                           int enabled) {
++  auto *ssl_impl = FromOpaque(ssl);
++  if (ssl_impl->config) {
++    ssl_impl->config->cert->reality_ignore_peer_signature_algorithm_prefs =
++        enabled != 0;
++  }
++}
++
++void SSL_set_reality_client_hello_cb(SSL *ssl, SSL_reality_client_hello_cb cb,
++                                     void *arg) {
++  auto *ssl_impl = FromOpaque(ssl);
++  if (ssl_impl->config) {
++    ssl_impl->config->reality_client_hello_cb = cb;
++    ssl_impl->config->reality_client_hello_arg = arg;
++  }
++}
++
++int SSL_set1_reality_peer_public_key(SSL *ssl, const uint8_t *peer_public_key,
++                                     size_t peer_public_key_len) {
++  auto *ssl_impl = FromOpaque(ssl);
++  if (!ssl_impl->config || peer_public_key == nullptr ||
++      peer_public_key_len != 32) {
++    return 0;
++  }
++  return ssl_impl->config->reality_peer_public_key.CopyFrom(
++      Span(peer_public_key, peer_public_key_len));
++}
++
+ static constexpr struct {
+   int pkey_type;
+   int hash_nid;
+--- a/ssl/extensions.cc
++++ b/ssl/extensions.cc
+@@ -354,7 +354,10 @@
+   // The peer must have selected an algorithm that is consistent with its public
+   // key, the TLS version, and what we advertised.
+   Span<const uint16_t> sigalgs = tls12_get_verify_sigalgs(hs);
+-  if (std::find(sigalgs.begin(), sigalgs.end(), sigalg) == sigalgs.end() ||
++  const bool reality_ed25519 = hs->config->reality_client_hello_cb != nullptr &&
++                               sigalg == SSL_SIGN_ED25519;
++  if ((!reality_ed25519 &&
++       std::find(sigalgs.begin(), sigalgs.end(), sigalg) == sigalgs.end()) ||
+       !ssl_pkey_supports_algorithm(hs->ssl, pkey, sigalg, /*is_verify=*/true)) {
+     OPENSSL_PUT_ERROR(SSL, SSL_R_WRONG_SIGNATURE_TYPE);
+     *out_alert = SSL_AD_ILLEGAL_PARAMETER;
+@@ -5142,6 +5145,12 @@
+       continue;
+     }
+ 
++    if (ssl->server && sigalg == SSL_SIGN_ED25519 &&
++        hs->config->cert->reality_ignore_peer_signature_algorithm_prefs) {
++      *out = sigalg;
++      return true;
++    }
++
+     if (std::find(peer_sigalgs.begin(), peer_sigalgs.end(), sigalg) !=
+         peer_sigalgs.end()) {
+       *out = sigalg;
+--- a/ssl/handshake_client.cc
++++ b/ssl/handshake_client.cc
+@@ -183,6 +183,17 @@
+ 
+ bool ssl_add_client_hello(SSL_HANDSHAKE *hs) {
+   SSLImpl *const ssl = hs->ssl;
++  const bool apply_reality = hs->config->reality_client_hello_cb != nullptr &&
++                             !hs->config->reality_client_hello_done;
++  if (apply_reality) {
++    if (SSL_is_dtls(ssl) || hs->selected_ech_config ||
++        hs->config->reality_peer_public_key.size() != 32) {
++      OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
++      return false;
++    }
++    hs->session_id.ResizeForOverwrite(SSL_MAX_SSL_SESSION_ID_LENGTH);
++    OPENSSL_memset(hs->session_id.data(), 0, hs->session_id.size());
++  }
+   ScopedCBB cbb;
+   CBB body;
+   ssl_client_hello_type_t type = hs->selected_ech_config
+@@ -197,6 +208,44 @@
+     return false;
+   }
+ 
++  if (apply_reality) {
++    SSLKeyShare *key_share = nullptr;
++    for (const auto &candidate : hs->key_shares) {
++      if (candidate && candidate->GroupID() == SSL_GROUP_X25519) {
++        key_share = candidate.get();
++        break;
++      }
++    }
++    if (key_share == nullptr) {
++      OPENSSL_PUT_ERROR(SSL, SSL_R_NO_GROUPS_SPECIFIED);
++      return false;
++    }
++    Array<uint8_t> shared_secret;
++    uint8_t alert = SSL_AD_INTERNAL_ERROR;
++    if (!key_share->Decap(&shared_secret, &alert,
++                          hs->config->reality_peer_public_key)) {
++      return false;
++    }
++    const int ok = hs->config->reality_client_hello_cb(
++        ssl, shared_secret.data(), shared_secret.size(), ssl->s3->client_random,
++        SSL3_RANDOM_SIZE, msg.data(), msg.size(), hs->session_id.data(),
++        hs->session_id.size(), hs->config->reality_client_hello_arg);
++    OPENSSL_cleanse(shared_secret.data(), shared_secret.size());
++    if (ok != 1) {
++      OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
++      return false;
++    }
++    // TLS handshake header, legacy_version, random, session ID length.
++    constexpr size_t kSessionIdOffset = 4 + 2 + SSL3_RANDOM_SIZE + 1;
++    if (msg.size() < kSessionIdOffset + hs->session_id.size()) {
++      OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
++      return false;
++    }
++    OPENSSL_memcpy(msg.data() + kSessionIdOffset, hs->session_id.data(),
++                   hs->session_id.size());
++    hs->config->reality_client_hello_done = true;
++  }
++
+   return ssl->method->add_message(ssl, std::move(msg));
+ }
+ 

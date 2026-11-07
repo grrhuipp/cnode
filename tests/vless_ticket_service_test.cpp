@@ -1,3 +1,6 @@
+#include <stdexcept>
+#include <gtest/gtest.h>
+
 #include "vless_ticket_service.hpp"
 #include "acppnode/app/session_group_executor.hpp"
 #include <asio/co_spawn.hpp>
@@ -18,7 +21,7 @@ using namespace acpp;
 using namespace acpp::vless;
 using Ticket = std::array<uint8_t, 16>;
 void Check(bool value, const char* what) {
-    if (!value) { std::cerr << what << '\n'; std::exit(1); }
+    if (!value) { std::cerr << what << '\n'; ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed"); }
 }
 struct Hooks final : ExecutionDomain::Hooks {
     explicit Hooks(std::atomic<int>& alive) : alive_(alive) { ++alive_; }
@@ -49,7 +52,7 @@ net::awaitable<void> StopCoordinator(std::shared_ptr<GroupCoordinator> coordinat
     coordinator->ReleaseServices();
 }
 }
-int main() {
+TEST(VlessTicketService, Contract) {
     net::io_context io0, io1, control;
     auto work0 = net::make_work_guard(io0);
     auto work1 = net::make_work_guard(io1);

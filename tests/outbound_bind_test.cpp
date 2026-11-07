@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "acppnode/transport/internet/outbound_bind.hpp"
 #include "acppnode/infra/outbound_bind_config.hpp"
 #include "acppnode/common/target_address.hpp"
@@ -9,7 +11,7 @@
 #include <stdexcept>
 #include <string_view>
 
-int main() {
+TEST(OutboundBind, Contract) {
     using Mode = acpp::OutboundBind::Mode;
     using Policy = acpp::OutboundBind::ChoicePolicy;
     using acpp::net::ip::make_address;
@@ -17,25 +19,25 @@ int main() {
     for (const auto value : std::array<std::string_view, 5>{
              "", "0.0.0.0", "::", "0:0::", "::ffff:0.0.0.0"}) {
         auto bind = acpp::OutboundBind::Parse(value);
-        if (!bind || bind->GetMode() != Mode::None || bind->ExplicitAddress()) return 1;
+        ASSERT_FALSE((!bind || bind->GetMode() != Mode::None || bind->ExplicitAddress()));
     }
     auto automatic = acpp::OutboundBind::Parse("auto");
-    if (!automatic || automatic->GetMode() != Mode::Auto || automatic->ExplicitAddress()) return 2;
+    ASSERT_FALSE((!automatic || automatic->GetMode() != Mode::Auto || automatic->ExplicitAddress()));
     auto ipv4 = acpp::OutboundBind::Parse("192.0.2.10");
     auto ipv6 = acpp::OutboundBind::Parse("2001:db8::10");
-    if (!ipv4 || ipv4->ExplicitAddress() != make_address("192.0.2.10") ||
-        !ipv6 || ipv6->ExplicitAddress() != make_address("2001:db8::10")) return 3;
+    ASSERT_FALSE((!ipv4 || ipv4->ExplicitAddress() != make_address("192.0.2.10") ||
+        !ipv6 || ipv6->ExplicitAddress() != make_address("2001:db8::10")));
     for (const auto value : std::array<std::string_view, 3>{
              "not-an-ip", "192.0.2.1junk", "  auto"}) {
-        if (acpp::OutboundBind::Parse(value)) return 4;
+        ASSERT_FALSE((acpp::OutboundBind::Parse(value)));
     }
-    if (auto upper = acpp::OutboundBind::Parse("AUTO");
-        !upper || upper->GetMode() != Mode::Auto) return 4;
+    auto upper = acpp::OutboundBind::Parse("AUTO");
+    ASSERT_FALSE((!upper || upper->GetMode() != Mode::Auto));
     for (const auto value : std::array<std::string_view, 7>{
              "127.0.0.1:9", "[127.0.0.1]", "[::1]", "127.0.0.1 ",
              "fe80::1%invalid", std::string_view("127.0.0.1\0ignored", 17),
              std::string_view("::1\0ignored", 11)}) {
-        if (acpp::OutboundBind::Parse(value)) return 5;
+        ASSERT_FALSE((acpp::OutboundBind::Parse(value)));
     }
 
     const auto remote_v4 = make_address("198.51.100.1");
@@ -43,86 +45,86 @@ int main() {
     const std::array<std::string_view, 3> entries{
         "2602:2b5:20:0111::/64", "192.0.2.4", "127.0.0.0/24"};
     auto ordered = acpp::OutboundBind::ParseCandidates(entries, Policy::IpHash);
-    if (!ordered || ordered->GetMode() != Mode::Ordered || !ordered->PrefersIPv6()) return 6;
+    ASSERT_FALSE((!ordered || ordered->GetMode() != Mode::Ordered || !ordered->PrefersIPv6()));
     const auto first = ordered->Select(remote_v6, "203.0.113.42").address;
-    if (!first || !first->is_v6() || acpp::net::ip::network_v6(first->to_v6(), 64)
-            .network() != acpp::net::ip::make_address_v6("2602:2b5:20:111::")) return 7;
-    if (ordered->Select(remote_v6, "203.0.113.42").address != first ||
-        ordered->Select(remote_v6, "203.0.113.43").address == first) return 8;
+    ASSERT_FALSE((!first || !first->is_v6() || acpp::net::ip::network_v6(first->to_v6(), 64)
+            .network() != acpp::net::ip::make_address_v6("2602:2b5:20:111::")));
+    ASSERT_FALSE((ordered->Select(remote_v6, "203.0.113.42").address != first ||
+        ordered->Select(remote_v6, "203.0.113.43").address == first));
     // An exact address is used as-is, even when it is not assigned locally;
     // later same-family entries must not silently replace it on dial failure.
-    if (ordered->Select(remote_v4, "client").address !=
-        make_address("192.0.2.4")) return 9;
+    ASSERT_FALSE((ordered->Select(remote_v4, "client").address !=
+        make_address("192.0.2.4")));
 
     const std::array<std::string_view, 1> single_v4{"127.0.0.0/24"};
     auto range_v4 = acpp::OutboundBind::ParseCandidates(single_v4, Policy::IpHash);
-    if (!range_v4) return 10;
+    ASSERT_FALSE((!range_v4));
     const auto v4_first = range_v4->Select(remote_v4, "203.0.113.42").address;
-    if (!v4_first || acpp::net::ip::network_v4(v4_first->to_v4(), 24).network() !=
+    ASSERT_FALSE((!v4_first || acpp::net::ip::network_v4(v4_first->to_v4(), 24).network() !=
             acpp::net::ip::make_address_v4("127.0.0.0") ||
         range_v4->Select(remote_v4, "203.0.113.42").address != v4_first ||
         range_v4->Select(remote_v4, "203.0.113.43").address == v4_first ||
-        range_v4->Select(remote_v6, "client").address) return 10;
+        range_v4->Select(remote_v6, "client").address));
 
     auto user_ordered = acpp::OutboundBind::ParseCandidates(entries, Policy::UserHash);
-    if (!user_ordered) return 10;
+    ASSERT_FALSE((!user_ordered));
     const auto user_a_ip1 = user_ordered->Select(remote_v6, "203.0.113.1", 1001, "a@test").address;
     const auto user_a_ip2 = user_ordered->Select(remote_v6, "198.51.100.9", 1001, "a@test").address;
     const auto user_b = user_ordered->Select(remote_v6, "203.0.113.1", 1002, "b@test").address;
-    if (!user_a_ip1 || user_a_ip1 != user_a_ip2 || user_a_ip1 == user_b) return 10;
+    ASSERT_FALSE((!user_a_ip1 || user_a_ip1 != user_a_ip2 || user_a_ip1 == user_b));
     const auto email_a_ip1 = user_ordered->Select(remote_v6, "203.0.113.1", 0, "alice@test").address;
     const auto email_a_ip2 = user_ordered->Select(remote_v6, "198.51.100.9", 0, "alice@test").address;
     const auto email_b = user_ordered->Select(remote_v6, "203.0.113.1", 0, "bob@test").address;
-    if (!email_a_ip1 || email_a_ip1 != email_a_ip2 || email_a_ip1 == email_b) return 10;
+    ASSERT_FALSE((!email_a_ip1 || email_a_ip1 != email_a_ip2 || email_a_ip1 == email_b));
     const auto panel1_repeat = user_ordered->Select(
         remote_v6, "203.0.113.1", 1001, "u@a", "panel/site-a/10/vless/443").address;
     const auto panel1_diff_ip = user_ordered->Select(
         remote_v6, "203.0.113.2", 1001, "u@a", "panel/site-a/10/vless/443").address;
     const auto panel2_same_uid = user_ordered->Select(
         remote_v6, "203.0.113.1", 1001, "u@a", "panel/site-b/10/vless/443").address;
-    if (!panel1_repeat || panel1_repeat != panel1_diff_ip ||
-        panel1_repeat == panel2_same_uid) return 10;
+    ASSERT_FALSE((!panel1_repeat || panel1_repeat != panel1_diff_ip ||
+        panel1_repeat == panel2_same_uid));
     auto random_range = acpp::OutboundBind::ParseCandidates(entries, Policy::Random);
-    if (!random_range) return 11;
+    ASSERT_FALSE((!random_range));
     const auto first_random = random_range->Select(remote_v6, "client", 80).address;
     bool saw_different = false;
     for (int i = 0; i < 64; ++i) {
         const auto next = random_range->Select(remote_v6, "client", 80).address;
-        if (!next || acpp::net::ip::network_v6(next->to_v6(), 64).network() !=
-                acpp::net::ip::make_address_v6("2602:2b5:20:111::")) return 11;
+        ASSERT_FALSE((!next || acpp::net::ip::network_v6(next->to_v6(), 64).network() !=
+                acpp::net::ip::make_address_v6("2602:2b5:20:111::")));
         saw_different |= next != first_random;
     }
-    if (!saw_different) return 12;
+    ASSERT_FALSE((!saw_different));
 
     const std::array<std::string_view, 1> unassigned{"2602:2b5:20:111::1234"};
     auto exact = acpp::OutboundBind::ParseCandidates(unassigned, Policy::IpHash);
-    if (!exact || exact->Select(remote_v6, "client").address !=
+    ASSERT_FALSE((!exact || exact->Select(remote_v6, "client").address !=
         make_address("2602:2b5:20:111::1234") ||
-        exact->Select(remote_v4, "client").address) return 13;
+        exact->Select(remote_v4, "client").address));
 
     for (const std::string_view bad : {"", "auto", "0.0.0.0", "0.0.0.0/32", "::/128",
                                        "0.0.0.0/24", "192.0.2.1/0", "::ffff:192.0.2.0/24",
                                        "127.0.0.0/024", "192.0.2.0/33",
                                        "2001:db8::/129", "127.0.0.1/24x", "not-ip/24"}) {
         const std::array<std::string_view, 1> candidate{bad};
-        if (acpp::OutboundBind::ParseCandidates(candidate, Policy::IpHash)) return 14;
+        ASSERT_FALSE((acpp::OutboundBind::ParseCandidates(candidate, Policy::IpHash)));
     }
     const acpp::tcp::endpoint public_inbound(make_address("192.0.2.10"), 443);
-    if (automatic->BindAddressFor(&public_inbound, make_address("127.0.0.1"))) return 18;
+    ASSERT_FALSE((automatic->BindAddressFor(&public_inbound, make_address("127.0.0.1"))));
     const acpp::tcp::endpoint link_local_inbound(make_address("fe80::1"), 443);
-    if (automatic->BindAddressFor(&link_local_inbound, remote_v6)) return 19;
-    if (acpp::OutboundBind::ParseCandidates(
-            std::span<const std::string_view>{}, Policy::IpHash)) return 15;
+    ASSERT_FALSE((automatic->BindAddressFor(&link_local_inbound, remote_v6)));
+    ASSERT_FALSE((acpp::OutboundBind::ParseCandidates(
+            std::span<const std::string_view>{}, Policy::IpHash)));
 
     const auto parsed = acpp::json::parse(R"(["127.0.0.1/32", "::1"])");
     const auto random = acpp::json::parse(R"("random")");
     const auto ip_hash = acpp::json::parse(R"("ip_hash")");
     const auto user_hash = acpp::json::parse(R"("user_hash")");
     const auto configured = acpp::infra::ParseOutboundBindConfig(parsed, &random);
-    if (configured.GetMode() != Mode::Ordered ||
+    ASSERT_FALSE((configured.GetMode() != Mode::Ordered ||
         acpp::infra::ParseOutboundBindConfig(parsed, &ip_hash).GetMode() != Mode::Ordered ||
         acpp::infra::ParseOutboundBindConfig(parsed, &user_hash).GetMode() != Mode::Ordered ||
-        acpp::infra::ParseOutboundBindConfig(parsed).GetMode() != Mode::Ordered) return 16;
+        acpp::infra::ParseOutboundBindConfig(parsed).GetMode() != Mode::Ordered));
     auto rejected = [](std::string_view value, std::string_view strategy = {}) {
         const auto parsed_value = acpp::json::parse(value);
         std::optional<acpp::json::value> parsed_strategy;
@@ -135,9 +137,8 @@ int main() {
         }
         return false;
     };
-    if (!rejected("[]") || !rejected("[7]") || !rejected(R"(["bad/24"])") ||
+    ASSERT_FALSE((!rejected("[]") || !rejected("[7]") || !rejected(R"(["bad/24"])") ||
         !rejected(R"(["::1"])", R"("round-robin")") ||
         !rejected(R"(["::1"])", R"("hash")") ||
-        !rejected(R"("auto")", R"("ip_hash")")) return 17;
-    return 0;
+        !rejected(R"("auto")", R"("ip_hash")")));
 }

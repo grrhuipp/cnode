@@ -6,6 +6,7 @@
 #include "acppnode/common/address_codec.hpp"
 #include "acppnode/infra/log.hpp"
 #include "../udp_datagram.hpp"
+#include <openssl/mem.h>
 #include <algorithm>
 #include <cstring>
 

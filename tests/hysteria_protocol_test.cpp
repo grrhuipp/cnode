@@ -1,6 +1,7 @@
+#include <gtest/gtest.h>
+
 #include "hysteria_protocol.hpp"
 
-#include <cassert>
 #include <cstdint>
 #include <span>
 #include <string_view>
@@ -16,53 +17,53 @@ using acpp::transport::internet::hysteria::Version;
 
 namespace {
 
-void TestV1HelloAndTcpRequest() {
+TEST(HysteriaProtocol, V1HelloAndTcpRequest) {
     const std::vector<uint8_t> hello{
         3,
         0, 0, 0, 0, 0, 0, 0x03, 0xe8,
         0, 0, 0, 0, 0, 0, 0x07, 0xd0,
         0, 6, 's', 'e', 'c', 'r', 'e', 't'};
     const auto parsed_hello = ParseV1ClientHello(hello);
-    assert(parsed_hello);
-    assert(parsed_hello->send_bps == 1000);
-    assert(parsed_hello->receive_bps == 2000);
-    assert(parsed_hello->auth == "secret");
+    ASSERT_TRUE(parsed_hello);
+    ASSERT_TRUE(parsed_hello->send_bps == 1000);
+    ASSERT_TRUE(parsed_hello->receive_bps == 2000);
+    ASSERT_TRUE(parsed_hello->auth == "secret");
 
     const std::vector<uint8_t> request{
         0, 0, 11, 'e', 'x', 'a', 'm', 'p', 'l', 'e', '.', 'c', 'o', 'm',
         0x01, 0xbb, 'p', 'a', 'y'};
     const auto parsed_request = ParseV1Request(request);
-    assert(parsed_request);
-    assert(!parsed_request->udp);
-    assert(parsed_request->target.IsDomain());
-    assert(parsed_request->target.host == "example.com");
-    assert(parsed_request->target.port == 443);
-    assert(parsed_request->header_bytes == request.size() - 3);
+    ASSERT_TRUE(parsed_request);
+    ASSERT_TRUE(!parsed_request->udp);
+    ASSERT_TRUE(parsed_request->target.IsDomain());
+    ASSERT_TRUE(parsed_request->target.host == "example.com");
+    ASSERT_TRUE(parsed_request->target.port == 443);
+    ASSERT_TRUE(parsed_request->header_bytes == request.size() - 3);
 }
 
-void TestV1UdpSessionRequestHasNoTarget() {
+TEST(HysteriaProtocol, V1UdpSessionRequestHasNoTarget) {
     const std::vector<uint8_t> request{1, 0, 0, 0, 0};
     const auto parsed = ParseV1Request(request);
-    assert(parsed);
-    assert(parsed->udp);
-    assert(!parsed->target.IsValid());
-    assert(parsed->header_bytes == request.size());
+    ASSERT_TRUE(parsed);
+    ASSERT_TRUE(parsed->udp);
+    ASSERT_TRUE(!parsed->target.IsValid());
+    ASSERT_TRUE(parsed->header_bytes == request.size());
 }
 
-void TestV2TcpRequestWithReadAhead() {
+TEST(HysteriaProtocol, V2TcpRequestWithReadAhead) {
     const std::vector<uint8_t> request{
-        0x40, 0x01,  // QUIC varint 0x401
+        0x44, 0x01,  // QUIC varint 0x401
         0x09, '[', ':', ':', '1', ']', ':', '4', '4', '3',
         0x03, 0xaa, 0xbb, 0xcc,
         'x', 'y'};
     const auto parsed = ParseV2TcpRequest(request);
-    assert(parsed);
-    assert(parsed->target.IsIPv6());
-    assert(parsed->target.port == 443);
-    assert(parsed->header_bytes == request.size() - 2);
+    ASSERT_TRUE(parsed);
+    ASSERT_TRUE(parsed->target.IsIPv6());
+    ASSERT_TRUE(parsed->target.port == 443);
+    ASSERT_TRUE(parsed->header_bytes == request.size() - 2);
 }
 
-void TestV1UdpRoundTrip() {
+TEST(HysteriaProtocol, V1UdpRoundTrip) {
     const std::vector<uint8_t> payload{'d', 'a', 't', 'a'};
     UdpMessage message;
     message.session_id = 0x01020304;
@@ -70,16 +71,16 @@ void TestV1UdpRoundTrip() {
     message.target = acpp::TargetAddress("1.2.3.4", 53);
     message.payload = payload;
     const auto encoded = EncodeUdpMessage(Version::V1, message);
-    assert(encoded);
+    ASSERT_TRUE(encoded);
     const auto parsed = ParseUdpMessage(Version::V1, *encoded);
-    assert(parsed);
-    assert(parsed->session_id == message.session_id);
-    assert(parsed->packet_id == message.packet_id);
-    assert(parsed->target.SameEndpoint(message.target));
-    assert(parsed->payload.size() == payload.size());
+    ASSERT_TRUE(parsed);
+    ASSERT_TRUE(parsed->session_id == message.session_id);
+    ASSERT_TRUE(parsed->packet_id == message.packet_id);
+    ASSERT_TRUE(parsed->target.SameEndpoint(message.target));
+    ASSERT_TRUE(parsed->payload.size() == payload.size());
 }
 
-void TestV2UdpRoundTripAndContinuationFragment() {
+TEST(HysteriaProtocol, V2UdpRoundTripAndContinuationFragment) {
     const std::vector<uint8_t> payload{'d', 'n', 's'};
     UdpMessage message;
     message.session_id = 7;
@@ -89,33 +90,25 @@ void TestV2UdpRoundTripAndContinuationFragment() {
     message.target = acpp::TargetAddress("example.com", 53);
     message.payload = payload;
     const auto encoded = EncodeUdpMessage(Version::V2, message);
-    assert(encoded);
+    ASSERT_TRUE(encoded);
     const auto parsed = ParseUdpMessage(Version::V2, *encoded);
-    assert(parsed);
-    assert(parsed->target.SameEndpoint(message.target));
+    ASSERT_TRUE(parsed);
+    ASSERT_TRUE(parsed->target.SameEndpoint(message.target));
 
     message.fragment_id = 1;
     message.target = {};
     const auto continuation = EncodeUdpMessage(Version::V2, message);
-    assert(continuation);
+    ASSERT_TRUE(continuation);
     const auto parsed_continuation = ParseUdpMessage(Version::V2, *continuation);
-    assert(parsed_continuation);
-    assert(!parsed_continuation->target.IsValid());
+    ASSERT_TRUE(parsed_continuation);
+    ASSERT_TRUE(!parsed_continuation->target.IsValid());
 }
 
-void TestRejectsMalformedFragments() {
+TEST(HysteriaProtocol, RejectsMalformedFragments) {
     const std::vector<uint8_t> invalid{
         0, 0, 0, 1, 0, 1, 2, 2, 0, 'x'};
-    assert(!ParseUdpMessage(Version::V2, invalid));
+    ASSERT_TRUE(!ParseUdpMessage(Version::V2, invalid));
 }
 
 }  // namespace
 
-int main() {
-    TestV1HelloAndTcpRequest();
-    TestV1UdpSessionRequestHasNoTarget();
-    TestV2TcpRequestWithReadAhead();
-    TestV1UdpRoundTrip();
-    TestV2UdpRoundTripAndContinuationFragment();
-    TestRejectsMalformedFragments();
-}

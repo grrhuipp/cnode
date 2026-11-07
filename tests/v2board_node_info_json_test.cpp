@@ -1,3 +1,6 @@
+#include <stdexcept>
+#include <gtest/gtest.h>
+
 #include "node_info_json.hpp"
 
 #include <cstdlib>
@@ -12,7 +15,7 @@ using acpp::api::v2board::ParseNodeInfo;
 
 [[noreturn]] void Fail(std::string_view message) {
     std::cerr << message << '\n';
-    std::exit(1);
+    ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed");
 }
 
 void Check(bool condition, std::string_view message) {
@@ -31,7 +34,7 @@ void CheckInvalid(std::string_view body) {
     Check(!result, "invalid node response was accepted");
 }
 
-void TestValidResponseIsNormalized() {
+TEST(V2BoardNodeInfoJson, ValidResponseIsNormalized) {
     auto result = ParseResponse(
         R"({"server_port":65535,"network":"ws","networkSettings":{"path":"/edge","headers":{"Host":"edge.example"}},"tls":1,"server_name":"sni.example","cipher":"aes-128-gcm","server_key":"identity","base_config":{"pull_interval":45,"push_interval":30}})");
     Check(result.has_value(), "valid node response was rejected");
@@ -48,7 +51,7 @@ void TestValidResponseIsNormalized() {
     Check(result->PushInterval == 30, "push interval mismatch");
 }
 
-void TestInvalidPortsAreRejected() {
+TEST(V2BoardNodeInfoJson, InvalidPortsAreRejected) {
     CheckInvalid(R"({})");
     CheckInvalid(R"({"server_port":0})");
     CheckInvalid(R"({"server_port":-1})");
@@ -75,7 +78,7 @@ void TestInvalidPortsAreRejected() {
     Check(!result, "uint64 overflow node port was accepted");
 }
 
-void TestInvalidNetworkHostIsRejected() {
+TEST(V2BoardNodeInfoJson, InvalidNetworkHostIsRejected) {
     CheckInvalid(R"({"server_port":443,"networkSettings":{"headers":{"Host":42}}})");
     CheckInvalid(R"({"server_port":443,"networkSettings":{"headers":{"Host":"edge.example\r\nInjected: yes"}}})");
     CheckInvalid(R"({"server_port":443,"networkSettings":{"headers":{"Host":"one.example","host":"two.example"}}})");
@@ -90,7 +93,7 @@ void TestInvalidNetworkHostIsRejected() {
           "lowercase panel Host header was not normalized");
 }
 
-void TestRealityNodeResponseIsNormalized() {
+TEST(V2BoardNodeInfoJson, RealityNodeResponseIsNormalized) {
     const auto parsed = acpp::json::parse(
         R"({"server_port":8443,"network":"grpc","networkSettings":{"serviceName":"gun"},"tls":2,"flow":"xtls-rprx-vision","server_name":"www.apple.com","tls_settings":{"private_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","short_id":["0123456789abcdef",""],"dest":"www.apple.com:443","xver":1,"mldsa65_seed":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","min_client_ver":"1.8.0","max_client_ver":"26.1.31","max_time_diff":60000}})");
     auto result = ParseNodeInfo(parsed.as_object(), "vless");
@@ -133,7 +136,7 @@ void TestRealityNodeResponseIsNormalized() {
     CheckInvalid(R"({"server_port":443,"tls":2,"server_name":"www.apple.com","tls_settings":{"private_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","privateKey":"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB","dest":"www.apple.com:443"}})");
 }
 
-void TestOptionalCipherNullValues() {
+TEST(V2BoardNodeInfoJson, OptionalCipherNullValues) {
     for (const auto* text : {
              R"({"server_port":443})",
              R"({"server_port":443,"cipher":null,"server_key":null})",
@@ -147,7 +150,7 @@ void TestOptionalCipherNullValues() {
     CheckInvalid(R"({"server_port":443,"server_key":false})");
 }
 
-void TestXv2BoardTypesAreCompatible() {
+TEST(V2BoardNodeInfoJson, Xv2BoardTypesAreCompatible) {
     auto parsed = acpp::json::parse(
         R"({"server_port":"8443","network":"WS","networkSettings":{"path":"/Edge","headers":{"Host":"Edge.Example"}},"tls":"1","flow":"XTLS-RPRX-VISION","server_name":"SNI.Example","cipher":"AES-128-GCM","server_key":"Identity","base_config":{"pull_interval":"45","push_interval":"30"}})");
     auto result = ParseNodeInfo(parsed.as_object(), "VMESS");
@@ -189,7 +192,7 @@ void TestXv2BoardTypesAreCompatible() {
 }
 
 // The panel maps onto the same validators as local configuration.
-void TestSharedFieldContract() {
+TEST(V2BoardNodeInfoJson, SharedFieldContract) {
     constexpr std::string_view kKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
     const auto reality = [&](std::string_view settings) {
         const auto body = std::string(R"({"server_port":443,"tls":2,"tls_settings":{"private_key":")") +
@@ -231,14 +234,3 @@ void TestSharedFieldContract() {
 
 }  // namespace
 
-int main() {
-    TestValidResponseIsNormalized();
-    TestInvalidPortsAreRejected();
-    TestInvalidNetworkHostIsRejected();
-    TestRealityNodeResponseIsNormalized();
-    TestOptionalCipherNullValues();
-    TestXv2BoardTypesAreCompatible();
-    TestSharedFieldContract();
-    std::cout << "v2board_node_info_json_test: ok\n";
-    return 0;
-}

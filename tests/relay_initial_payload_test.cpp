@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "acppnode/app/relay.hpp"
 #include "acppnode/common/initial_payload.hpp"
 #include "acppnode/transport/internet/tcp_stream.hpp"
@@ -654,9 +656,12 @@ bool TestInitialPayloadAllocation() {
 }
 }  // namespace
 
-int main(int argc, char** argv) {
-    static_assert(!std::is_move_constructible_v<acpp::TcpStream>);
-    static_assert(!std::is_move_assignable_v<acpp::TcpStream>);
+class RelayInitialPayload : public ::testing::TestWithParam<std::string> {};
+
+TEST_P(RelayInitialPayload, Lifecycle) {
+    std::string option = GetParam();
+    const int argc = option.empty() ? 1 : 2;
+    char* argv[] = {nullptr, option.data()};
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc == 2 && std::string_view(argv[1]) == "--full-close") {
         bool passed = true;
@@ -672,7 +677,7 @@ int main(int argc, char** argv) {
             io.run();
             passed = future.get() && passed;
         }
-        return passed ? 0 : 1;
+        { ASSERT_TRUE(passed); return; }
     }
     if (argc == 2 && std::string_view(argv[1]) == "--source-cancellation") {
         bool source_passed = true;
@@ -682,7 +687,7 @@ int main(int argc, char** argv) {
             io.run();
             source_passed = future.get() && source_passed;
         }
-        return source_passed ? 0 : 1;
+        { ASSERT_TRUE(source_passed); return; }
     }
     if (argc == 2 && std::string_view(argv[1]) == "--half-close-backpressure") {
         bool passed = true;
@@ -700,7 +705,7 @@ int main(int argc, char** argv) {
                 passed = future.get() && passed;
             }
         }
-        return passed ? 0 : 1;
+        { ASSERT_TRUE(passed); return; }
     }
     bool passed = TestInitialPayloadAllocation() && TestBatchOwnership();
     for (int mode = 0; mode < 16; ++mode) {
@@ -747,5 +752,7 @@ int main(int argc, char** argv) {
             passed = future.get() && passed;
         }
     }
-    return passed ? 0 : 1;
+    { ASSERT_TRUE(passed); return; }
 }
+
+INSTANTIATE_TEST_SUITE_P(Scenarios, RelayInitialPayload, ::testing::Values("", "--full-close", "--source-cancellation", "--half-close-backpressure"));

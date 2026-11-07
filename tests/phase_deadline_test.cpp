@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "acppnode/transport/async_stream.hpp"
 #include "acppnode/transport/internet/tcp_stream.hpp"
 
@@ -155,11 +157,11 @@ bool TestDestructionCancelsOnlyOwnedEvent() {
 }
 }  // namespace
 
-int main() {
+TEST(PhaseDeadline, Contract) {
     const bool isolation = TestClearAndTimeoutIsolation();
     const bool replacement = TestReplacementDisabledAndClosed();
     const bool destruction = TestDestructionCancelsOnlyOwnedEvent();
     std::printf("logical phase deadlines: isolation=%d replacement=%d destruction=%d\n",
                 isolation, replacement, destruction);
-    return isolation && replacement && destruction ? 0 : 1;
+    { ASSERT_TRUE(isolation && replacement && destruction); return; }
 }

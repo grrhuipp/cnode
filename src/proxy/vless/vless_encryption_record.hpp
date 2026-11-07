@@ -6,7 +6,6 @@
 #include <optional>
 #include <span>
 #include <openssl/aead.h>
-#include <openssl/mem.h>
 
 namespace acpp::vless {
 
@@ -49,47 +48,14 @@ void IncreaseVlessEncryptionNonce(
 
 class VlessEncryptionAead {
 public:
-    VlessEncryptionAead() noexcept { EVP_AEAD_CTX_zero(&aead_ctx_); }
-    ~VlessEncryptionAead() noexcept {
-        if (initialized_) {
-            EVP_AEAD_CTX_cleanup(&aead_ctx_);
-        }
-        OPENSSL_cleanse(&aead_ctx_, sizeof(aead_ctx_));
-    }
+    VlessEncryptionAead() noexcept = default;
+    ~VlessEncryptionAead() noexcept = default;
 
     VlessEncryptionAead(const VlessEncryptionAead&) = delete;
     VlessEncryptionAead& operator=(const VlessEncryptionAead&) = delete;
 
-    VlessEncryptionAead(VlessEncryptionAead&& other) noexcept
-        : nonce_(other.nonce_)
-        , cipher_(other.cipher_) {
-        EVP_AEAD_CTX_zero(&aead_ctx_);
-        if (other.initialized_ && EVP_AEAD_CTX_copy(&aead_ctx_, &other.aead_ctx_) == 1) {
-            initialized_ = true;
-            EVP_AEAD_CTX_cleanup(&other.aead_ctx_);
-            OPENSSL_cleanse(&other.aead_ctx_, sizeof(other.aead_ctx_));
-            other.initialized_ = false;
-        }
-    }
-    VlessEncryptionAead& operator=(VlessEncryptionAead&& other) noexcept {
-        if (this != &other) {
-            if (initialized_) {
-                EVP_AEAD_CTX_cleanup(&aead_ctx_);
-                OPENSSL_cleanse(&aead_ctx_, sizeof(aead_ctx_));
-                initialized_ = false;
-            }
-            EVP_AEAD_CTX_zero(&aead_ctx_);
-            nonce_ = other.nonce_;
-            cipher_ = other.cipher_;
-            if (other.initialized_ && EVP_AEAD_CTX_copy(&aead_ctx_, &other.aead_ctx_) == 1) {
-                initialized_ = true;
-                EVP_AEAD_CTX_cleanup(&other.aead_ctx_);
-                OPENSSL_cleanse(&other.aead_ctx_, sizeof(other.aead_ctx_));
-                other.initialized_ = false;
-            }
-        }
-        return *this;
-    }
+    VlessEncryptionAead(VlessEncryptionAead&&) noexcept = default;
+    VlessEncryptionAead& operator=(VlessEncryptionAead&&) noexcept = default;
 
     [[nodiscard]] static std::optional<VlessEncryptionAead> Create(
         std::span<const uint8_t> context,
@@ -129,8 +95,8 @@ public:
 private:
     VlessEncryptionNonce nonce_{};
     VlessEncryptionAeadCipher cipher_ = VlessEncryptionAeadCipher::Aes256Gcm;
-    EVP_AEAD_CTX aead_ctx_{};
-    bool initialized_ = false;
+    // Allocated once on creation; moves transfer ownership without copying keys.
+    bssl::UniquePtr<EVP_AEAD_CTX> aead_ctx_;
 };
 
 [[nodiscard]] std::optional<size_t> SealVlessEncryptionRecord(

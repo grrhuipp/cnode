@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "acppnode/app/session_group_executor.hpp"
 #include "acppnode/transport/internet/tcp_stream.hpp"
 #include "acppnode/transport/internet/datagram_socket.hpp"
@@ -18,6 +20,7 @@
 #include <optional>
 #include <thread>
 #include <vector>
+#include <stdexcept>
 
 namespace {
 using namespace acpp;
@@ -25,7 +28,10 @@ using namespace std::chrono_literals;
 using transport::internet::DatagramSocket;
 
 void Require(bool value, const char* reason) {
-    if (!value) { std::fprintf(stderr, "%s\n", reason); std::abort(); }
+    if (!value) {
+        ADD_FAILURE() << reason;
+        throw std::runtime_error(reason);
+    }
 }
 
 template<class T>
@@ -386,7 +392,7 @@ void DatagramSameFdAndCancellation() {
 }
 }  // namespace
 
-int main() {
+TEST(NativeSocketHandoff, Contract) {
     TcpPendingReadAndScatterWrite();
     TcpCancellationDuringFreeze(false);
     TcpCancellationDuringFreeze(true);

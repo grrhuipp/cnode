@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "padding.hpp"
 
 #include <algorithm>
@@ -41,7 +43,7 @@ void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
 }
 void operator delete(void* value, const std::nothrow_t&) noexcept { ::operator delete(value); }
 
-int main() {
+TEST(AnytlsPadding, Contract) {
     (void)acpp::anytls::DefaultPaddingScheme();
     constexpr std::array cases{
         std::string_view("stop=8\n0=30-30\n1=64-65\n7=96-96\n"),
@@ -176,5 +178,5 @@ int main() {
         Check(dense->RecordFor(UINT32_MAX - 1 - index * 1000000).size() == 1, "all sparse entries retained");
     std::printf("padding-policy checks=%zu failures=%zu scaling_raw=%zu scaling_total=%zu\n",
         checks, failures, many.size(), total_requested);
-    return passed && failures == 0 ? 0 : 1;
+    { ASSERT_TRUE(passed && failures == 0); return; }
 }

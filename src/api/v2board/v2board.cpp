@@ -17,6 +17,7 @@
 #include <asio/connect.hpp>
 #include <asio/read.hpp>
 #include <asio/read_until.hpp>
+#include <asio/redirect_error.hpp>
 #include <asio/write.hpp>
 #include <asio/cancel_after.hpp>
 #include <algorithm>

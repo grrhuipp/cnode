@@ -1,3 +1,6 @@
+#include <stdexcept>
+#include <gtest/gtest.h>
+
 #include "acppnode/infra/json_field.hpp"
 
 #include <cstdlib>
@@ -9,7 +12,7 @@ namespace {
 
 [[noreturn]] void Fail(std::string_view message) {
     std::cerr << message << '\n';
-    std::exit(1);
+    ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed");
 }
 
 void Check(bool condition, std::string_view message) {
@@ -277,7 +280,7 @@ void CheckUnicodeEscapes() {
 
 }  // namespace
 
-int main() {
+TEST(JsonObject, Contract) {
     ParsedObject absent(R"({})");
     Check(absent.result.has_value() && *absent.result == nullptr,
           "absent object became configured");
@@ -303,5 +306,4 @@ int main() {
     CheckUnicodeEscapes();
 
     std::cout << "json_object_test: ok\n";
-    return 0;
 }

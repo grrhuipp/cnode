@@ -3,6 +3,8 @@
 #include "vmess_request.hpp"
 #include "../uuid.hpp"
 
+#include <openssl/mem.h>
+
 #include <cstring>
 #include <string_view>
 

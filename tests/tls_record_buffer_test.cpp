@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
 #include "acppnode/transport/internet/tcp_stream.hpp"
@@ -382,7 +384,7 @@ void ReadDeadline() {
 }
 }  // namespace
 
-int main() {
+TEST(TlsRecordBuffer, Contract) {
     acpp::TlsStream::InitializeIo();
     Resource resource;
     auto* previous = std::pmr::set_default_resource(&resource);
@@ -400,5 +402,5 @@ int main() {
         passed = false;
     }
     std::pmr::set_default_resource(previous);
-    return passed ? 0 : 1;
+    { ASSERT_TRUE(passed); return; }
 }

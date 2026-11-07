@@ -46,10 +46,6 @@ public:
                                uint8_t* output) noexcept;
 
     [[nodiscard]] bool ResetKey(const uint8_t* key, size_t key_size);
-    [[nodiscard]] bool BeginDecrypt(const uint8_t* nonce) noexcept;
-    [[nodiscard]] bool DecryptUpdate(std::span<const uint8_t> input,
-                                     std::span<uint8_t> output) noexcept;
-    [[nodiscard]] bool FinishDecrypt(const uint8_t* tag) noexcept;
 
     static constexpr size_t kTagSize = 16;
 
@@ -88,7 +84,7 @@ inline bool AesBlockCrypt(std::span<const uint8_t> key,
     if (key.size() != 16 && key.size() != 32) return false;
 
     // A single SS2022 header block needs no EVP session or heap allocation.
-    // AWS-LC's public AES APIs retain hardware/software dispatch. The schedule
+    // BoringSSL's public AES APIs retain hardware/software dispatch. The schedule
     // belongs only to this synchronous operation, never to an idle connection.
     AES_KEY schedule;
     const auto bits = static_cast<unsigned>(key.size() * 8);

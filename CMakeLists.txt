@@ -1,330 +1,80 @@
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.24)
 
-# 抑制第三方依赖的 cmake_minimum_required 过旧警告
-set(CMAKE_WARN_DEPRECATED OFF CACHE BOOL "" FORCE)
-set(CMAKE_POLICY_DEFAULT_CMP0069 NEW)
+# Manifest features must be selected before project() loads the vcpkg toolchain.
+option(BUILD_TESTING "Configure unit and E2E tests (build with target cnode_tests)" OFF)
+if(BUILD_TESTING)
+    list(APPEND VCPKG_MANIFEST_FEATURES tests)
+endif()
+option(CNODE_IO_URING "Use Asio io_uring instead of epoll" OFF)
+if(CNODE_IO_URING)
+    list(APPEND VCPKG_MANIFEST_FEATURES io-uring)
+endif()
 
 project(cnode VERSION 1.0.0 LANGUAGES C CXX)
 
-include(FetchContent)
-
-option(CNODE_HEAPTRACK_BUILD "Build a heaptrack-friendly glibc/system-allocator variant" OFF)
-option(CNODE_AWSLC_NO_ASM "Disable AWS-LC assembly for local toolchains without nasm/perl" OFF)
-option(CNODE_IO_URING "Use Asio io_uring backend on Linux" OFF)
-option(CNODE_ENABLE_LTO "Enable Release link-time optimization" ON)
-option(CNODE_RELEASE_DEBUG_SYMBOLS "Emit debug info for Release builds so CI can split .debug symbol files" ON)
-option(CNODE_RELEASE_FRAME_POINTERS "Keep frame pointers in Release builds for perf/heaptrack symbolization" ON)
-option(CNODE_BUILD_TESTS "Build cnode tests" OFF)
-option(CNODE_TEST_SANITIZERS "Include ASan/UBSan regression targets in CTest" OFF)
-# Keep Asio's existing per-io-thread, per-purpose cache large enough for
-# completion batches. This does not replace global allocation or add a pool;
-# buffers and application-owned objects still use the owning Worker's PMR.
-set(CNODE_ASIO_RECYCLING_CACHE_SIZE 64 CACHE STRING "Asio small-block recycling cache size")
-set(CNODE_LIBURING_TAG "liburing-2.15" CACHE STRING "axboe/liburing tag used for the io_uring backend")
-
-if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    message(FATAL_ERROR "cnode only supports Linux")
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT CNODE_TARGET_IS_MUSL)
+    message(FATAL_ERROR "cnode requires the musl toolchain; use the musl CMake preset")
+endif()
+if(NOT VCPKG_TARGET_TRIPLET STREQUAL "x64-linux-musl")
+    message(FATAL_ERROR "cnode requires the x64-linux-musl vcpkg triplet")
 endif()
 
-set(CNODE_COMPILER_MACHINE "")
-set(CNODE_TARGET_IS_MUSL OFF)
-execute_process(
-    COMMAND ${CMAKE_CXX_COMPILER} -dumpmachine
-    OUTPUT_VARIABLE CNODE_COMPILER_MACHINE
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET
-)
-if(CNODE_COMPILER_MACHINE MATCHES "musl" OR
-   CMAKE_CXX_COMPILER MATCHES "musl")
-    set(CNODE_TARGET_IS_MUSL ON)
-endif()
-
-if(CNODE_HEAPTRACK_BUILD)
-    if(CNODE_TARGET_IS_MUSL)
-        message(FATAL_ERROR "CNODE_HEAPTRACK_BUILD requires a glibc toolchain, not musl")
-    endif()
-    message(STATUS "heaptrack variant: glibc/system allocator build")
-endif()
-
-# ============================================================================
-# C++ 标准与编译选项
-# ============================================================================
+option(CNODE_ENABLE_LTO "Enable Release link-time optimization" OFF)
+option(CNODE_RELEASE_DEBUG_SYMBOLS "Emit Release debug information for split symbols" ON)
+option(CNODE_RELEASE_FRAME_POINTERS "Keep Release frame pointers for profiling" ON)
+option(CNODE_MEMORY_STATS "Enable runtime live/peak memory object counters" OFF)
+set(CNODE_ASIO_RECYCLING_CACHE_SIZE 64 CACHE STRING "Asio per-thread small-block recycling cache size")
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-get_property(CNODE_IS_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
-find_program(CNODE_CCACHE_PROGRAM ccache)
-if(CNODE_CCACHE_PROGRAM)
-    if(NOT CMAKE_C_COMPILER_LAUNCHER)
-        set(CMAKE_C_COMPILER_LAUNCHER "${CNODE_CCACHE_PROGRAM}" CACHE STRING "C compiler launcher" FORCE)
-    endif()
-    if(NOT CMAKE_CXX_COMPILER_LAUNCHER)
-        set(CMAKE_CXX_COMPILER_LAUNCHER "${CNODE_CCACHE_PROGRAM}" CACHE STRING "C++ compiler launcher" FORCE)
-    endif()
-endif()
+set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ${CNODE_ENABLE_LTO})
 
-
-# ============================================================================
-# LTO（链接时优化）— Release 模式启用
-# ============================================================================
-if(CNODE_ENABLE_LTO AND NOT CNODE_HEAPTRACK_BUILD)
-    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
-endif()
-
-if(CNODE_RELEASE_DEBUG_SYMBOLS)
-    add_compile_options(
-        $<$<CONFIG:Release>:-g>
-    )
-endif()
-
-if(CNODE_RELEASE_FRAME_POINTERS)
-    add_compile_options(
-        $<$<CONFIG:Release>:-fno-omit-frame-pointer>
-    )
-endif()
-
-if(CNODE_HEAPTRACK_BUILD)
-    add_compile_options(
-        -g
-        -fno-omit-frame-pointer
-    )
-endif()
-
-option(CNODE_MEMORY_STATS "Enable runtime live/peak memory object counters" OFF)
-
-# ============================================================================
-# 依赖（FetchContent）
-# ============================================================================
-set(FETCHCONTENT_UPDATES_DISCONNECTED ON CACHE BOOL "Do not update already-populated FetchContent deps")
-
-set(EXPECTED_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(EXPECTED_BUILD_PACKAGE OFF CACHE BOOL "" FORCE)
-FetchContent_Declare(
-    tl_expected
-    GIT_REPOSITORY https://github.com/TartanLlama/expected.git
-    GIT_TAG v1.3.1
-    GIT_SHALLOW TRUE
-)
-FetchContent_MakeAvailable(tl_expected)
-
-FetchContent_Declare(
-    asio
-    GIT_REPOSITORY https://github.com/chriskohlhoff/asio.git
-    GIT_TAG asio-1-38-2
-)
-FetchContent_MakeAvailable(asio)
-
-add_library(asio_standalone INTERFACE)
-add_library(asio::asio ALIAS asio_standalone)
-target_include_directories(asio_standalone INTERFACE
-    ${asio_SOURCE_DIR}/asio/include
-)
-target_compile_definitions(asio_standalone INTERFACE
-    ASIO_STANDALONE
-    ASIO_NO_DEPRECATED
+add_library(cnode_build_options INTERFACE)
+target_compile_features(cnode_build_options INTERFACE cxx_std_20)
+target_include_directories(cnode_build_options INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_compile_options(cnode_build_options INTERFACE
+    -Wall -Wextra -Wpedantic -Wno-unused-parameter -Wno-mismatched-new-delete
+    "$<$<CXX_COMPILER_ID:GNU>:-Wno-stringop-overread;-Wno-free-nonheap-object>"
+    "$<$<AND:$<CONFIG:Release>,$<BOOL:${CNODE_RELEASE_DEBUG_SYMBOLS}>>:-g>"
+    "$<$<AND:$<CONFIG:Release>,$<BOOL:${CNODE_RELEASE_FRAME_POINTERS}>>:-fno-omit-frame-pointer>")
+target_compile_definitions(cnode_build_options INTERFACE
+    ASIO_STANDALONE ASIO_NO_DEPRECATED
     ASIO_RECYCLING_ALLOCATOR_CACHE_SIZE=${CNODE_ASIO_RECYCLING_CACHE_SIZE}
-)
+    CNODE_USE_MIMALLOC
+    $<$<BOOL:${CNODE_MEMORY_STATS}>:CNODE_MEMORY_STATS>)
+find_package(Threads REQUIRED)
+find_package(asio CONFIG REQUIRED)
+find_package(tl-expected CONFIG REQUIRED)
+find_package(OpenSSL CONFIG REQUIRED)
+find_package(ngtcp2 CONFIG REQUIRED)
+find_package(nghttp3 CONFIG REQUIRED)
+find_package(ZLIB CONFIG REQUIRED COMPONENTS static)
+find_package(concurrentqueue CONFIG REQUIRED)
+find_package(blake3 CONFIG REQUIRED)
+find_package(mimalloc CONFIG REQUIRED)
+
+target_link_libraries(cnode_build_options INTERFACE
+    asio::asio Threads::Threads tl::expected
+    ngtcp2::ngtcp2_static ngtcp2::ngtcp2_crypto_boringssl_static
+    nghttp3::nghttp3_static OpenSSL::SSL OpenSSL::Crypto
+    ZLIB::ZLIBSTATIC concurrentqueue::concurrentqueue BLAKE3::blake3
+    mimalloc-static-no-override)
+
+# Upstream installs these headers in moodycamel/, while cnode uses their bare names.
+get_target_property(cnode_queue_includes concurrentqueue::concurrentqueue INTERFACE_INCLUDE_DIRECTORIES)
+foreach(directory IN LISTS cnode_queue_includes)
+    target_include_directories(cnode_build_options SYSTEM INTERFACE "${directory}/moodycamel")
+endforeach()
 
 if(CNODE_IO_URING)
-    FetchContent_Declare(
-        liburing
-        GIT_REPOSITORY https://github.com/axboe/liburing.git
-        GIT_TAG ${CNODE_LIBURING_TAG}
-        GIT_SHALLOW TRUE
-    )
-    FetchContent_GetProperties(liburing)
-    if(NOT liburing_POPULATED)
-        FetchContent_Populate(liburing)
-    endif()
-
-    find_program(CNODE_MAKE_EXECUTABLE NAMES make gmake REQUIRED)
-    set(CNODE_LIBURING_LIBRARY "${liburing_SOURCE_DIR}/src/liburing.a")
-    set(CNODE_LIBURING_BUILD_STAMP "${liburing_BINARY_DIR}/cnode-liburing.stamp")
-    add_custom_command(
-        OUTPUT "${CNODE_LIBURING_LIBRARY}" "${CNODE_LIBURING_BUILD_STAMP}"
-        COMMAND /bin/sh ./configure
-            --use-libc
-            "--cc=${CMAKE_C_COMPILER}"
-            "--cxx=${CMAKE_CXX_COMPILER}"
-        COMMAND "${CNODE_MAKE_EXECUTABLE}" -C "${liburing_SOURCE_DIR}" library ENABLE_SHARED=0
-        COMMAND "${CMAKE_COMMAND}" -E touch "${CNODE_LIBURING_BUILD_STAMP}"
-        WORKING_DIRECTORY "${liburing_SOURCE_DIR}"
-        COMMENT "Building static liburing (${CNODE_LIBURING_TAG})"
-        VERBATIM
-    )
-    add_custom_target(cnode_liburing_static DEPENDS "${CNODE_LIBURING_BUILD_STAMP}")
-
-    target_include_directories(asio_standalone INTERFACE
-        "${liburing_SOURCE_DIR}/src/include"
-    )
-    target_compile_definitions(asio_standalone INTERFACE
-        ASIO_HAS_IO_URING
-        ASIO_DISABLE_EPOLL
-    )
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
+    target_link_libraries(cnode_build_options INTERFACE PkgConfig::LIBURING)
+    target_compile_definitions(cnode_build_options INTERFACE
+        ASIO_HAS_IO_URING ASIO_DISABLE_EPOLL CNODE_IO_URING_ENABLED)
 endif()
-
-set(BUILD_TESTING OFF CACHE BOOL "Disable third-party tests" FORCE)
-set(BUILD_TOOL OFF CACHE BOOL "Disable AWS-LC bssl tool" FORCE)
-set(DISABLE_GO ON CACHE BOOL "Disable AWS-LC Go helpers" FORCE)
-unset(ENABLE_PRE_SONAME_BUILD CACHE)
-unset(ENABLE_PRE_SONAME_BUILD)
-if(CNODE_AWSLC_NO_ASM)
-    set(OPENSSL_NO_ASM ON CACHE BOOL "Disable AWS-LC assembly" FORCE)
-    set(DISABLE_PERL ON CACHE BOOL "Disable AWS-LC Perl assembly generation" FORCE)
-else()
-    set(DISABLE_PERL OFF CACHE BOOL "Enable AWS-LC Perl assembly generation" FORCE)
-endif()
-
-FetchContent_Declare(
-    aws_lc
-    GIT_REPOSITORY https://github.com/aws/aws-lc.git
-    GIT_TAG v5.13.0
-    PATCH_COMMAND
-        ${CMAKE_COMMAND}
-            -DAWS_LC_SOURCE_DIR=<SOURCE_DIR>
-            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_aws_lc_reality.cmake
-)
-FetchContent_MakeAvailable(aws_lc)
-include(cmake/patch_aws_lc_reality.cmake)
-cnode_patch_aws_lc_reality("${aws_lc_SOURCE_DIR}")
-message(STATUS "Using AWS-LC via FetchContent")
-
-# Hysteria v1/v2 use ngtcp2 for QUIC and nghttp3 only for the mandatory
-# Hysteria 2 HTTP/3 authentication/masquerade exchange. Both are static,
-# library-only builds; TLS stays on the existing AWS-LC instance.
-set(ENABLE_STATIC_LIB ON CACHE BOOL "" FORCE)
-set(ENABLE_SHARED_LIB OFF CACHE BOOL "" FORCE)
-set(ENABLE_LIB_ONLY ON CACHE BOOL "" FORCE)
-set(ENABLE_WERROR OFF CACHE BOOL "" FORCE)
-set(ENABLE_DEBUG OFF CACHE BOOL "" FORCE)
-set(ENABLE_ASAN OFF CACHE BOOL "" FORCE)
-set(ENABLE_POPCNT ON CACHE BOOL "" FORCE)
-FetchContent_Declare(
-    nghttp3
-    GIT_REPOSITORY https://github.com/ngtcp2/nghttp3.git
-    GIT_TAG v1.19.0
-    GIT_SHALLOW TRUE
-)
-FetchContent_MakeAvailable(nghttp3)
-
-set(ENABLE_OPENSSL OFF CACHE BOOL "" FORCE)
-set(ENABLE_BORINGSSL ON CACHE BOOL "" FORCE)
-set(ENABLE_GNUTLS OFF CACHE BOOL "" FORCE)
-set(ENABLE_PICOTLS OFF CACHE BOOL "" FORCE)
-set(ENABLE_WOLFSSL OFF CACHE BOOL "" FORCE)
-set(ENABLE_JEMALLOC OFF CACHE BOOL "" FORCE)
-set(BORINGSSL_INCLUDE_DIR "${aws_lc_SOURCE_DIR}/include" CACHE PATH "" FORCE)
-set(BORINGSSL_LIBRARIES ssl crypto CACHE STRING "" FORCE)
-# ngtcp2 probes OPENSSL_IS_BORINGSSL/OPENSSL_IS_AWSLC with check_symbol_exists,
-# which links the probe against BORINGSSL_LIBRARIES. Here those are the AWS-LC
-# targets, which do not exist yet at configure time, so the probe falls back to
-# -lssl -lcrypto: it fails without a system OpenSSL and is wrong with one.
-# The backend is the vendored AWS-LC, so read its identity from the header.
-file(STRINGS "${aws_lc_SOURCE_DIR}/include/openssl/base.h" CNODE_AWSLC_IDENTITY
-    REGEX "^#define OPENSSL_IS_AWSLC$")
-if(NOT CNODE_AWSLC_IDENTITY)
-    message(FATAL_ERROR "Vendored AWS-LC does not define OPENSSL_IS_AWSLC")
-endif()
-set(HAVE_BORINGSSL "" CACHE INTERNAL "Have symbol OPENSSL_IS_BORINGSSL")
-set(HAVE_AWSLC 1 CACHE INTERNAL "Have symbol OPENSSL_IS_AWSLC")
-FetchContent_Declare(
-    ngtcp2
-    GIT_REPOSITORY https://github.com/ngtcp2/ngtcp2.git
-    GIT_TAG v1.26.0
-    GIT_SHALLOW TRUE
-    PATCH_COMMAND
-        ${CMAKE_COMMAND}
-            -DNGTCP2_SOURCE_DIR=<SOURCE_DIR>
-            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_ngtcp2_check_target.cmake
-)
-FetchContent_MakeAvailable(ngtcp2)
-message(STATUS "Using ngtcp2 v1.26.0 and nghttp3 v1.19.0 via FetchContent")
-
-FetchContent_Declare(
-    zlib
-    GIT_REPOSITORY https://github.com/madler/zlib.git
-    GIT_TAG v1.4
-    SOURCE_SUBDIR cnode-no-upstream-cmake
-)
-FetchContent_MakeAvailable(zlib)
-
-FetchContent_Declare(
-    concurrentqueue
-    GIT_REPOSITORY https://github.com/cameron314/concurrentqueue.git
-    GIT_TAG v1.0.5
-)
-FetchContent_MakeAvailable(concurrentqueue)
-message(STATUS "Using moodycamel ConcurrentQueue via FetchContent")
-
-FetchContent_Declare(
-    blake3
-    GIT_REPOSITORY https://github.com/BLAKE3-team/BLAKE3.git
-    GIT_TAG 1.8.7
-    SOURCE_SUBDIR cnode-no-upstream-cmake
-)
-FetchContent_MakeAvailable(blake3)
-add_library(cnode_blake3 STATIC
-    ${blake3_SOURCE_DIR}/c/blake3.c
-    ${blake3_SOURCE_DIR}/c/blake3_dispatch.c
-    ${blake3_SOURCE_DIR}/c/blake3_portable.c
-)
-target_include_directories(cnode_blake3 PUBLIC ${blake3_SOURCE_DIR}/c)
-include(cmake/blake3_simd.cmake)
-message(STATUS "Using BLAKE3 via FetchContent")
-
-add_library(cnode_zlib STATIC
-    ${zlib_SOURCE_DIR}/adler32.c
-    ${zlib_SOURCE_DIR}/compress.c
-    ${zlib_SOURCE_DIR}/crc32.c
-    ${zlib_SOURCE_DIR}/deflate.c
-    ${zlib_SOURCE_DIR}/gzclose.c
-    ${zlib_SOURCE_DIR}/gzlib.c
-    ${zlib_SOURCE_DIR}/gzread.c
-    ${zlib_SOURCE_DIR}/gzwrite.c
-    ${zlib_SOURCE_DIR}/infback.c
-    ${zlib_SOURCE_DIR}/inffast.c
-    ${zlib_SOURCE_DIR}/inflate.c
-    ${zlib_SOURCE_DIR}/inftrees.c
-    ${zlib_SOURCE_DIR}/trees.c
-    ${zlib_SOURCE_DIR}/uncompr.c
-    ${zlib_SOURCE_DIR}/zutil.c
-)
-target_include_directories(cnode_zlib PUBLIC ${zlib_SOURCE_DIR})
-target_compile_definitions(cnode_zlib PRIVATE Z_HAVE_UNISTD_H)
-
-find_package(Threads REQUIRED)
-
-set(MI_BUILD_SHARED OFF CACHE BOOL "" FORCE)
-set(MI_BUILD_STATIC ON CACHE BOOL "" FORCE)
-set(MI_BUILD_OBJECT OFF CACHE BOOL "" FORCE)
-set(MI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(MI_USE_CXX ON CACHE STRING "" FORCE)
-set(MI_OVERRIDE ON CACHE BOOL "" FORCE)
-if(CNODE_TARGET_IS_MUSL)
-    set(MI_LIBC_MUSL ON CACHE BOOL "" FORCE)
-else()
-    set(MI_LIBC_MUSL OFF CACHE BOOL "" FORCE)
-endif()
-FetchContent_Declare(
-    mimalloc
-    GIT_REPOSITORY https://github.com/microsoft/mimalloc.git
-    GIT_TAG v3.6.1
-    GIT_SHALLOW TRUE
-)
-FetchContent_MakeAvailable(mimalloc)
-set_target_properties(mimalloc-static PROPERTIES
-    INTERPROCEDURAL_OPTIMIZATION OFF
-    INTERPROCEDURAL_OPTIMIZATION_RELEASE OFF
-)
-target_compile_options(mimalloc-static PRIVATE -ffunction-sections -fdata-sections -Wno-attributes)
-
-set(CNODE_ALLOCATOR_SUMMARY "mimalloc (static override), Worker multi-tier PMR pool + request arena")
-message(STATUS "Allocator: ${CNODE_ALLOCATOR_SUMMARY}")
-# ============================================================================
-# 源文件收集
-# ============================================================================
-set(CNODE_SOURCES
+set(CNODE_CORE_SOURCES
     # Common (pure utilities)
     src/common/error.cpp
 
@@ -492,7 +242,7 @@ set(CNODE_SOURCES
 
     # Proxy - AnyTLS
     src/proxy/anytls/anytls_codec.cpp
-        src/proxy/anytls/padding.cpp
+    src/proxy/anytls/padding.cpp
     src/proxy/anytls/credentials.cpp
     src/proxy/anytls/inbound/anytls_inbound.cpp
     src/proxy/anytls/outbound/anytls_outbound_settings.cpp
@@ -512,2392 +262,312 @@ set(CNODE_SOURCES
     src/api/v2board/online_report.cpp
     src/api/v2board/user_list_json.cpp
     src/api/v2board/v2board.cpp
-
-    # Main
-    src/main.cpp
 )
 
-# ============================================================================
-# 可执行文件
-# ============================================================================
-add_executable(cnode ${CNODE_SOURCES})
+# Full runtime consumers retain self-registering protocol translation units.
+add_library(cnode_core STATIC ${CNODE_CORE_SOURCES})
+target_link_libraries(cnode_core PUBLIC cnode_build_options)
+target_precompile_headers(cnode_core PRIVATE src/pch.hpp)
 
-target_include_directories(cnode PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${concurrentqueue_SOURCE_DIR}
-    ${nghttp3_SOURCE_DIR}/lib/includes
-    ${nghttp3_BINARY_DIR}/lib/includes
-)
-
-target_link_libraries(cnode PRIVATE
-    asio::asio
-    Threads::Threads
-    ngtcp2_static
-    ngtcp2_crypto_boringssl_static
-    nghttp3_static
-    ssl
-    crypto
-    cnode_blake3
-    cnode_zlib
-)
-
-if(CNODE_IO_URING)
-    target_compile_definitions(cnode PRIVATE CNODE_IO_URING_ENABLED)
-    add_dependencies(cnode cnode_liburing_static)
-    target_link_libraries(cnode PRIVATE "${CNODE_LIBURING_LIBRARY}")
-endif()
-
-# 构建版本号：优先使用外部传入的 BUILD_ID，否则使用 UTC 时间戳
 if(NOT DEFINED BUILD_ID OR BUILD_ID STREQUAL "")
     string(TIMESTAMP BUILD_ID "%Y%m%dT%H%M%SZ" UTC)
 endif()
-if(NOT DEFINED GIT_COMMIT OR GIT_COMMIT STREQUAL "")
-    execute_process(
-        COMMAND git rev-parse --short=12 HEAD
-        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-        OUTPUT_VARIABLE GIT_COMMIT
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-        ERROR_QUIET)
-endif()
-if(GIT_COMMIT STREQUAL "")
-    set(GIT_COMMIT "unknown")
-endif()
-if(CNODE_HEAPTRACK_BUILD)
-    set(CNODE_BUILD_CHANNEL "heaptrack")
-else()
-    set(CNODE_BUILD_CHANNEL "$<IF:$<CONFIG:Debug>,debug,release>")
-endif()
-target_compile_definitions(cnode PRIVATE
+set_property(SOURCE src/app/bootstrap.cpp src/app/bootstrap_cli.cpp
+    APPEND PROPERTY COMPILE_DEFINITIONS
     BUILD_ID="${BUILD_ID}"
-    BUILD_CHANNEL="${CNODE_BUILD_CHANNEL}"
-    CNODE_VERSION="${PROJECT_VERSION}"
-    GIT_COMMIT="${GIT_COMMIT}"
-)
-message(STATUS "Build ID: ${BUILD_ID}")
+    BUILD_CHANNEL="$<IF:$<CONFIG:Debug>,debug,release>")
 
-if(CNODE_MEMORY_STATS)
-    target_compile_definitions(cnode PRIVATE CNODE_MEMORY_STATS)
+add_executable(cnode src/main.cpp)
+# Only the daemon overrides malloc/new. Tests retain their allocation-failure hooks;
+# their explicit mi_* calls still use the same mimalloc API through build_options.
+target_link_libraries(cnode PRIVATE
+    "$<LINK_LIBRARY:WHOLE_ARCHIVE,cnode_core,mimalloc-static>")
+
+add_executable(cnode_traffic_journal EXCLUDE_FROM_ALL tools/traffic_journal.cpp)
+target_link_libraries(cnode_traffic_journal PRIVATE cnode_core)
+
+if(NOT BUILD_TESTING)
+    return()
 endif()
+enable_testing()
 
-# 预编译头（PCH）- 加速 Asio/AWS-LC/标准库模板的编译
-target_precompile_headers(cnode PRIVATE src/pch.hpp)
+# Tests are opt-in and never part of the default production build.
+find_package(GTest CONFIG REQUIRED)
+include(GoogleTest)
+add_custom_target(cnode_tests DEPENDS cnode)
 
-# 为我们自己的代码添加警告
-target_compile_options(cnode PRIVATE
-    -Wall -Wextra -Wno-unused-parameter -Wpedantic -Wno-mismatched-new-delete
-    $<$<CXX_COMPILER_ID:GNU>:-Wno-stringop-overread -Wno-free-nonheap-object>
-)
-target_link_options(cnode PRIVATE
-    $<$<CXX_COMPILER_ID:GNU>:-Wno-stringop-overread -Wno-free-nonheap-object>
-)
+# These recovery/lifetime fixtures observe buffer ownership and allocator failure.
+# One consistently instrumented archive avoids both ODR violations and a complete
+# production rebuild per fixture. Never link this archive together with cnode_core.
+add_library(cnode_test_core STATIC EXCLUDE_FROM_ALL ${CNODE_CORE_SOURCES})
+target_link_libraries(cnode_test_core PUBLIC cnode_build_options)
+target_compile_definitions(cnode_test_core PUBLIC
+    CNODE_TEST_ALLOCATOR_FAULT CNODE_TEST_BUFFER_STATS)
+target_compile_options(cnode_test_core PRIVATE -UNDEBUG)
 
-
-# 平台链接库
-# glibc 需要显式链接 dl/rt，musl 已内置（find_library 自动区分）
-find_library(LIBDL dl)
-find_library(LIBRT rt)
-if(LIBDL)
-    target_link_libraries(cnode PRIVATE ${LIBDL})
-endif()
-if(LIBRT)
-    target_link_libraries(cnode PRIVATE ${LIBRT})
-endif()
-
-if(CNODE_IS_MULTI_CONFIG)
-    string(REPLACE ";" ", " CNODE_BUILD_TYPE_SUMMARY "${CMAKE_CONFIGURATION_TYPES}")
-    set(CNODE_BUILD_TYPE_SUMMARY "multi-config (${CNODE_BUILD_TYPE_SUMMARY})")
-else()
-    set(CNODE_BUILD_TYPE_SUMMARY "${CMAKE_BUILD_TYPE}")
-endif()
-
-if(CNODE_HEAPTRACK_BUILD)
-    set(CNODE_BUILD_CHANNEL_SUMMARY "heaptrack")
-elseif(CNODE_IS_MULTI_CONFIG)
-    set(CNODE_BUILD_CHANNEL_SUMMARY "per-config (Debug=debug, others=release)")
-elseif(CMAKE_BUILD_TYPE STREQUAL "Debug")
-    set(CNODE_BUILD_CHANNEL_SUMMARY "debug")
-else()
-    set(CNODE_BUILD_CHANNEL_SUMMARY "release")
-endif()
-
-if(CNODE_HEAPTRACK_BUILD OR NOT CNODE_ENABLE_LTO)
-    set(CNODE_LTO_SUMMARY "disabled")
-elseif(CNODE_IS_MULTI_CONFIG)
-    set(CNODE_LTO_SUMMARY "Release config")
-elseif(CMAKE_BUILD_TYPE STREQUAL "Release")
-    set(CNODE_LTO_SUMMARY "enabled")
-else()
-    set(CNODE_LTO_SUMMARY "disabled")
-endif()
-
-if(CNODE_RELEASE_DEBUG_SYMBOLS)
-    set(CNODE_RELEASE_DEBUG_SYMBOLS_SUMMARY "ON")
-else()
-    set(CNODE_RELEASE_DEBUG_SYMBOLS_SUMMARY "OFF")
-endif()
-
-if(CNODE_RELEASE_FRAME_POINTERS)
-    set(CNODE_RELEASE_FRAME_POINTERS_SUMMARY "ON")
-else()
-    set(CNODE_RELEASE_FRAME_POINTERS_SUMMARY "OFF")
-endif()
-
-if(CNODE_IO_URING)
-    set(CNODE_IO_BACKEND_SUMMARY "io_uring")
-else()
-    set(CNODE_IO_BACKEND_SUMMARY "epoll")
-endif()
-
-if(CNODE_BUILD_TESTS)
-    enable_testing()
-    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wno-mismatched-new-delete>)
-    add_executable(cnode_hysteria_protocol_test
-        tests/hysteria_protocol_test.cpp
-        src/transport/internet/hysteria/hysteria_protocol.cpp)
-    target_include_directories(cnode_hysteria_protocol_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/internet/hysteria)
-    target_link_libraries(cnode_hysteria_protocol_test PRIVATE asio::asio crypto)
-    target_compile_options(cnode_hysteria_protocol_test PRIVATE
-        -Wall -Wextra -Wpedantic)
-    add_test(NAME cnode_hysteria_protocol_test COMMAND cnode_hysteria_protocol_test)
-
-    add_executable(cnode_quic_directory_test tests/quic_directory_test.cpp)
-    target_include_directories(cnode_quic_directory_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/internet/hysteria)
-    target_link_libraries(cnode_quic_directory_test PRIVATE
-        asio::asio Threads::Threads ngtcp2_static)
-    target_compile_options(cnode_quic_directory_test PRIVATE -Wall -Wextra -Wpedantic)
-    add_test(NAME cnode_quic_directory_test COMMAND cnode_quic_directory_test)
-
-    add_executable(cnode_autosign_cert_test
-        tests/autosign_cert_test.cpp
-        src/transport/internet/autosign_cert.cpp
-    )
-    target_include_directories(cnode_autosign_cert_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/internet
-    )
-    target_link_libraries(cnode_autosign_cert_test PRIVATE ssl crypto)
-    target_compile_options(cnode_autosign_cert_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(NAME cnode_autosign_cert_test COMMAND cnode_autosign_cert_test)
-
-    add_executable(cnode_autosign_context_test
-        tests/autosign_context_test.cpp
-        src/transport/internet/autosign_context.cpp
-        src/transport/internet/autosign_cert.cpp
-        src/infra/log.cpp)
-    target_include_directories(cnode_autosign_context_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/internet
-        ${concurrentqueue_SOURCE_DIR})
-    target_link_libraries(cnode_autosign_context_test PRIVATE
-        asio::asio Threads::Threads ssl crypto cnode_zlib)
-    target_compile_options(cnode_autosign_context_test PRIVATE -Wall -Wextra -Wpedantic)
-    add_test(NAME cnode_autosign_context_test COMMAND cnode_autosign_context_test)
-    set_tests_properties(cnode_autosign_context_test PROPERTIES TIMEOUT 15)
-
-    add_executable(cnode_reality_client_hello_test tests/reality_client_hello_test.cpp)
-    target_include_directories(cnode_reality_client_hello_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/internet)
-    target_link_libraries(cnode_reality_client_hello_test PRIVATE Threads::Threads)
-    target_compile_options(cnode_reality_client_hello_test PRIVATE -Wall -Wextra -Wpedantic)
-    add_test(NAME cnode_reality_client_hello_test COMMAND cnode_reality_client_hello_test)
-
-    add_executable(cnode_traffic_journal_test
-        tests/traffic_journal_test.cpp
-        src/service/controller/traffic_journal.cpp
-        src/transport/internet/inbound_listen.cpp
-        src/transport/internet/outbound_bind.cpp
-        src/infra/json.cpp
-        src/infra/json_field.cpp
-        src/infra/panel_node_ids.cpp)
-    target_include_directories(cnode_traffic_journal_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    target_link_libraries(cnode_traffic_journal_test PRIVATE asio::asio Threads::Threads crypto)
-    target_compile_options(cnode_traffic_journal_test PRIVATE -Wall -Wextra -Wpedantic)
-    add_test(NAME cnode_traffic_journal_test COMMAND cnode_traffic_journal_test)
-
-    add_executable(cnode_session_group_executor_test
-        tests/session_group_executor_test.cpp src/app/session_group_executor.cpp)
-    target_include_directories(cnode_session_group_executor_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    target_link_libraries(cnode_session_group_executor_test PRIVATE asio::asio Threads::Threads)
-    target_compile_options(cnode_session_group_executor_test PRIVATE -Wall -Wextra -Wpedantic)
-    add_test(NAME cnode_session_group_executor_test COMMAND cnode_session_group_executor_test)
-    set_tests_properties(cnode_session_group_executor_test PROPERTIES TIMEOUT 30)
-
-    add_executable(cnode_tls_client_certificate_test
-        tests/tls_client_certificate_test.cpp
-        src/transport/internet/tls_client_context.cpp
-        src/transport/internet/tls_config.cpp
-        src/transport/internet/autosign_cert.cpp
-        src/infra/log.cpp
-    )
-    target_include_directories(cnode_tls_client_certificate_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/internet
-        ${concurrentqueue_SOURCE_DIR}
-    )
-    target_link_libraries(cnode_tls_client_certificate_test PRIVATE
-        asio::asio
-        Threads::Threads
-        ssl
-        crypto
-        cnode_zlib
-    )
-    target_compile_options(cnode_tls_client_certificate_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_tls_client_certificate_test
-        COMMAND cnode_tls_client_certificate_test)
-
-    add_executable(cnode_tls_sniffer_test
-        tests/tls_sniffer_test.cpp
-        src/sniff/tls_sniffer.cpp
-        src/transport/internet/tls_server_name.cpp
-    )
-    target_include_directories(cnode_tls_sniffer_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-    target_link_libraries(cnode_tls_sniffer_test PRIVATE asio::asio)
-    target_compile_options(cnode_tls_sniffer_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_tls_sniffer_test
-        COMMAND cnode_tls_sniffer_test)
-
-    add_executable(cnode_http_sniffer_test
-        tests/http_sniffer_test.cpp
-        src/sniff/http_sniffer.cpp
-    )
-    target_include_directories(cnode_http_sniffer_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-    target_link_libraries(cnode_http_sniffer_test PRIVATE
-        asio::asio
-    )
-    target_compile_options(cnode_http_sniffer_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_http_sniffer_test
-        COMMAND cnode_http_sniffer_test)
-
-    add_executable(cnode_quic_sniffer_test
-        tests/quic_sniffer_test.cpp
-        src/sniff/quic_sniffer.cpp
-        src/sniff/tls_sniffer.cpp
-        src/sniff/sniffer.cpp
-        src/sniff/http_sniffer.cpp
-        src/transport/internet/tls_server_name.cpp
-    )
-    target_include_directories(cnode_quic_sniffer_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-    target_link_libraries(cnode_quic_sniffer_test PRIVATE asio::asio crypto)
-    target_compile_options(cnode_quic_sniffer_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_quic_sniffer_test
-        COMMAND cnode_quic_sniffer_test)
-
-    add_executable(cnode_sniff_config_test
-        tests/sniff_config_test.cpp
-    )
-    target_include_directories(cnode_sniff_config_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-    target_compile_options(cnode_sniff_config_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_sniff_config_test
-        COMMAND cnode_sniff_config_test)
-
-    add_executable(cnode_domain_name_test
-        tests/domain_name_test.cpp
-    )
-    target_include_directories(cnode_domain_name_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-    target_compile_options(cnode_domain_name_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_domain_name_test
-        COMMAND cnode_domain_name_test)
-
-    add_executable(cnode_ip_address_test tests/ip_address_test.cpp)
-    target_include_directories(cnode_ip_address_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    target_link_libraries(cnode_ip_address_test PRIVATE asio::asio)
-    target_compile_options(cnode_ip_address_test PRIVATE
-        -Wall -Wextra -Wpedantic)
-    add_test(NAME cnode_ip_address_test COMMAND cnode_ip_address_test)
-
-    add_executable(cnode_proxy_protocol_literal_test
-        tests/proxy_protocol_literal_test.cpp
-        src/transport/internet/proxy_protocol.cpp
-        src/infra/log.cpp)
-    target_include_directories(cnode_proxy_protocol_literal_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include ${concurrentqueue_SOURCE_DIR})
-    target_link_libraries(cnode_proxy_protocol_literal_test PRIVATE
-        asio::asio Threads::Threads crypto cnode_zlib)
-    target_compile_options(cnode_proxy_protocol_literal_test PRIVATE
-        -Wall -Wextra -Wpedantic)
-    add_test(NAME cnode_proxy_protocol_literal_test COMMAND cnode_proxy_protocol_literal_test)
-
-    add_executable(cnode_target_address_test
-        tests/target_address_test.cpp
-    )
-    target_include_directories(cnode_target_address_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-    target_link_libraries(cnode_target_address_test PRIVATE
-        asio::asio
-    )
-    target_compile_options(cnode_target_address_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_target_address_test
-        COMMAND cnode_target_address_test)
-
-    add_executable(cnode_reality_client_version_test
-        tests/reality_client_version_test.cpp
-        src/transport/internet/reality_client_version.cpp
-    )
-    target_include_directories(cnode_reality_client_version_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-    target_compile_options(cnode_reality_client_version_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_reality_client_version_test
-        COMMAND cnode_reality_client_version_test)
-
-    add_executable(cnode_reality_key_test
-        tests/reality_key_test.cpp
-        src/transport/internet/reality_key.cpp
-    )
-    target_include_directories(cnode_reality_key_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-    target_link_libraries(cnode_reality_key_test PRIVATE
-        crypto
-    )
-    target_compile_options(cnode_reality_key_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_reality_key_test
-        COMMAND cnode_reality_key_test)
-
-    add_executable(cnode_reality_key_share_test
-        tests/reality_key_share_test.cpp
-        src/transport/internet/reality_key_share.cpp
-    )
-    target_include_directories(cnode_reality_key_share_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/internet
-    )
-    target_compile_options(cnode_reality_key_share_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_reality_key_share_test
-        COMMAND cnode_reality_key_share_test)
-
-    add_executable(cnode_reality_server_name_test
-        tests/reality_server_name_test.cpp
-        src/transport/internet/reality_server_name.cpp
-        src/transport/internet/tls_server_name.cpp
-    )
-    target_include_directories(cnode_reality_server_name_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-    target_compile_options(cnode_reality_server_name_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_reality_server_name_test
-        COMMAND cnode_reality_server_name_test)
-
-    add_executable(cnode_reality_short_id_test
-        tests/reality_short_id_test.cpp
-        src/transport/internet/reality_short_id.cpp
-    )
-    target_include_directories(cnode_reality_short_id_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-    target_compile_options(cnode_reality_short_id_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_reality_short_id_test
-        COMMAND cnode_reality_short_id_test)
-
-    add_executable(cnode_trojan_udp_framing_test
-        tests/trojan_udp_framing_test.cpp
-        src/infra/log.cpp
-        src/proxy/trojan/trojan_codec.cpp
-        src/proxy/trojan/udp_framing.cpp
-    )
-    add_executable(cnode_trojan_request_test
-        tests/trojan_request_test.cpp
-        src/infra/log.cpp
-        src/proxy/trojan/trojan_codec.cpp
-        src/proxy/trojan/credentials.cpp
-    )
-    target_include_directories(cnode_trojan_request_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/trojan
-        ${concurrentqueue_SOURCE_DIR}
-    )
-    target_link_libraries(cnode_trojan_request_test PRIVATE
-        asio::asio Threads::Threads crypto cnode_zlib)
-    target_compile_options(cnode_trojan_request_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(NAME cnode_trojan_request_test COMMAND cnode_trojan_request_test)
-
-    add_executable(cnode_vless_credentials_test
-        tests/vless_credentials_test.cpp
-        src/proxy/vless/credentials.cpp
-    )
-    target_include_directories(cnode_vless_credentials_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/vless)
-    target_link_libraries(cnode_vless_credentials_test PRIVATE crypto)
-    target_compile_options(cnode_vless_credentials_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(NAME cnode_vless_credentials_test COMMAND cnode_vless_credentials_test)
-
-    target_include_directories(cnode_trojan_udp_framing_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/trojan
-        ${concurrentqueue_SOURCE_DIR}
-    )
-    target_link_libraries(cnode_trojan_udp_framing_test PRIVATE
-        asio::asio
-        Threads::Threads
-        crypto
-        cnode_zlib
-    )
-    target_compile_options(cnode_trojan_udp_framing_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_trojan_udp_framing_test
-        COMMAND cnode_trojan_udp_framing_test)
-
-    add_executable(cnode_vless_udp_framing_test
-        tests/vless_udp_framing_test.cpp
-        src/infra/log.cpp
-        src/proxy/vless/vless_codec.cpp
-        src/proxy/vless/udp_framing.cpp
-    )
-    target_include_directories(cnode_vless_udp_framing_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/vless
-        ${concurrentqueue_SOURCE_DIR}
-    )
-    target_link_libraries(cnode_vless_udp_framing_test PRIVATE
-        asio::asio
-        Threads::Threads
-        cnode_zlib
-    )
-    target_compile_options(cnode_vless_udp_framing_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_vless_udp_framing_test
-        COMMAND cnode_vless_udp_framing_test)
-
-    add_executable(cnode_vless_vision_test
-        tests/vless_vision_test.cpp
-        src/proxy/vless/vless_vision.cpp
-        src/common/error.cpp)
-    target_include_directories(cnode_vless_vision_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/vless)
-    target_link_libraries(cnode_vless_vision_test PRIVATE asio::asio Threads::Threads crypto)
-    target_compile_options(cnode_vless_vision_test PRIVATE -Wall -Wextra -Wpedantic)
-    add_test(NAME cnode_vless_vision_test COMMAND cnode_vless_vision_test)
-
-    add_executable(cnode_vless_encryption_io_test
-        tests/vless_encryption_io_test.cpp
-        src/proxy/vless/vless_encryption_io.cpp
-        src/proxy/vless/vless_encryption_record.cpp
-        src/proxy/vless/vless_encryption_xor.cpp)
-    target_include_directories(cnode_vless_encryption_io_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/vless)
-    target_link_libraries(cnode_vless_encryption_io_test PRIVATE
-        asio::asio Threads::Threads crypto cnode_blake3)
-    target_compile_options(cnode_vless_encryption_io_test PRIVATE
-        -Wall -Wextra -Wpedantic)
-    add_test(NAME cnode_vless_encryption_io_test COMMAND cnode_vless_encryption_io_test)
-    set_tests_properties(cnode_vless_encryption_io_test PROPERTIES TIMEOUT 10)
-
-    set(CNODE_VLESS_ENCRYPTION_TEST_SOURCES ${CNODE_SOURCES})
-    list(FILTER CNODE_VLESS_ENCRYPTION_TEST_SOURCES INCLUDE REGEX
-        "^src/proxy/vless/vless_encryption[^/]*\\.cpp$")
-    foreach(ticket_test IN ITEMS store service)
-        set(target cnode_vless_ticket_${ticket_test}_test)
-        add_executable(${target}
-            tests/vless_ticket_${ticket_test}_test.cpp
-            ${CNODE_VLESS_ENCRYPTION_TEST_SOURCES}
-            src/proxy/vless/vless_ticket_service.cpp
-            src/common/error.cpp)
-        target_include_directories(${target} PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/vless)
-        target_link_libraries(${target} PRIVATE asio::asio Threads::Threads crypto cnode_blake3)
-        target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
-        add_test(NAME ${target} COMMAND ${target})
-        set_tests_properties(${target} PROPERTIES TIMEOUT 20)
-    endforeach()
-
-    add_executable(cnode_grpc_hunk_test
-        tests/grpc_hunk_test.cpp
-        src/transport/internet/grpc_hunk.cpp
-    )
-    target_include_directories(cnode_grpc_hunk_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/internet
-    )
-    target_compile_options(cnode_grpc_hunk_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(NAME cnode_grpc_hunk_test COMMAND cnode_grpc_hunk_test)
-
-    add_executable(cnode_vmess_auth_snapshot_test
-        tests/vmess_auth_snapshot_test.cpp
-        src/proxy/vmess/validator.cpp
-        src/proxy/vmess/aead/authid.cpp
-        src/app/proxyman/inbound/user_store.cpp
-        src/common/sharded_user_stats.cpp)
-    target_include_directories(cnode_vmess_auth_snapshot_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/vmess)
-    target_link_libraries(cnode_vmess_auth_snapshot_test PRIVATE asio::asio Threads::Threads cnode_zlib crypto)
-    target_compile_options(cnode_vmess_auth_snapshot_test PRIVATE
-        -Wall -Wextra -Wpedantic)
-    add_test(NAME cnode_vmess_auth_snapshot_test COMMAND cnode_vmess_auth_snapshot_test)
-
-    add_executable(cnode_vmess_cipher_test
-        tests/vmess_cipher_test.cpp
-        src/proxy/vmess/vmess_cipher.cpp
-        src/proxy/vmess/vmess_crypto.cpp
-    )
-    target_include_directories(cnode_vmess_cipher_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/vmess
-    )
-    target_link_libraries(cnode_vmess_cipher_test PRIVATE asio::asio Threads::Threads crypto)
-    target_compile_options(cnode_vmess_cipher_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    # --wrap runs after LTO: keep unresolved EVP calls in these test objects
-    # so optimization cannot bypass the allocation/error injectors.
-    set_property(TARGET cnode_vmess_cipher_test
-        PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE OFF)
-    target_compile_definitions(cnode_vmess_cipher_test PRIVATE CNODE_TEST_CRYPTO_FAULT)
-    target_link_options(cnode_vmess_cipher_test PRIVATE
-        -Wl,--wrap=EVP_MD_CTX_new
-        -Wl,--wrap=EVP_CIPHER_CTX_new
-        -Wl,--wrap=EVP_DigestSqueeze)
-    add_test(NAME cnode_vmess_cipher_test COMMAND cnode_vmess_cipher_test)
-
-    add_executable(cnode_vmess_udp_datagram_test
-        tests/vmess_udp_datagram_test.cpp
-        src/proxy/vmess/encoding/body.cpp
-        src/proxy/vmess/encoding/server.cpp
-        src/proxy/vmess/vmess_cipher.cpp
-        src/proxy/vmess/vmess_crypto.cpp
-        src/proxy/vmess/aead/kdf.cpp
-        src/proxy/vmess/aead/encrypt.cpp
-        src/proxy/vmess/validator.cpp
-        src/proxy/vmess/aead/authid.cpp
-        src/app/proxyman/inbound/user_store.cpp
-        src/common/sharded_user_stats.cpp
-        src/transport/async_stream.cpp
-        src/transport/internet/tcp_stream.cpp
-        src/transport/internet/proxy_protocol.cpp
-        src/transport/internet/timeout_scheduler.cpp
-        src/common/error.cpp
-        src/common/session.cpp
-        src/infra/log.cpp
-    )
-    target_include_directories(cnode_vmess_udp_datagram_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/vmess
-        ${concurrentqueue_SOURCE_DIR}
-    )
-    target_link_libraries(cnode_vmess_udp_datagram_test PRIVATE
-        asio::asio
-        Threads::Threads
-        cnode_zlib
-        ssl
-        crypto
-    )
-    target_compile_options(cnode_vmess_udp_datagram_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_vmess_udp_datagram_test
-        COMMAND cnode_vmess_udp_datagram_test)
-
-    add_executable(cnode_shadowsocks_udp_datagram_test
-        tests/shadowsocks_udp_datagram_test.cpp
-        src/proxy/shadowsocks/shadowsocks_protocol.cpp
-        src/proxy/shadowsocks/ss_udp.cpp
-    )
-    target_include_directories(cnode_shadowsocks_udp_datagram_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/shadowsocks
-        ${blake3_SOURCE_DIR}/c
-    )
-    target_link_libraries(cnode_shadowsocks_udp_datagram_test PRIVATE
-        asio::asio
-        Threads::Threads
-        crypto
-        cnode_blake3
-    )
-    target_compile_options(cnode_shadowsocks_udp_datagram_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_shadowsocks_udp_datagram_test
-        COMMAND cnode_shadowsocks_udp_datagram_test)
-
-    add_executable(cnode_uot_ss2022_test
-        tests/uot_ss2022_test.cpp
-        src/common/error.cpp
-        src/proxy/uot/uot.cpp
-        src/proxy/shadowsocks/shadowsocks_protocol.cpp
-    )
-    target_include_directories(cnode_uot_ss2022_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/uot
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/shadowsocks
-        ${blake3_SOURCE_DIR}/c
-    )
-    target_link_libraries(cnode_uot_ss2022_test PRIVATE
-        asio::asio
-        Threads::Threads
-        crypto
-        cnode_blake3
-    )
-    target_compile_options(cnode_uot_ss2022_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(NAME cnode_uot_ss2022_test COMMAND cnode_uot_ss2022_test)
-
-    add_executable(cnode_ss_outbound_credentials_test
-        tests/ss_outbound_credentials_test.cpp
-        src/proxy/shadowsocks/outbound/ss_outbound_credentials.cpp
-        src/proxy/shadowsocks/shadowsocks_protocol.cpp
-    )
-    target_include_directories(cnode_ss_outbound_credentials_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/shadowsocks
-        ${blake3_SOURCE_DIR}/c
-    )
-    target_link_libraries(cnode_ss_outbound_credentials_test PRIVATE
-        asio::asio Threads::Threads crypto cnode_blake3)
-    target_compile_options(cnode_ss_outbound_credentials_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(NAME cnode_ss_outbound_credentials_test COMMAND cnode_ss_outbound_credentials_test)
-
-    add_executable(cnode_mux_codec_test
-        tests/mux_codec_test.cpp
-        src/common/mux/mux_codec.cpp
-    )
-    target_include_directories(cnode_mux_codec_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/mux/inbound
-    )
-    target_link_libraries(cnode_mux_codec_test PRIVATE
-        asio::asio
-        Threads::Threads
-    )
-    target_compile_options(cnode_mux_codec_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(NAME cnode_mux_codec_test COMMAND cnode_mux_codec_test)
-
-    add_executable(cnode_shadowsocks_stream_crypto_test
-        tests/shadowsocks_stream_crypto_test.cpp
-        src/proxy/shadowsocks/shadowsocks_protocol.cpp
-    )
-    target_compile_definitions(cnode_shadowsocks_stream_crypto_test PRIVATE CNODE_TEST_ALLOCATOR_FAULT)
-    target_include_directories(cnode_shadowsocks_stream_crypto_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/shadowsocks
-        ${blake3_SOURCE_DIR}/c
-    )
-    target_link_libraries(cnode_shadowsocks_stream_crypto_test PRIVATE
-        asio::asio
-        Threads::Threads
-        crypto
-        cnode_blake3
-    )
-    target_compile_options(cnode_shadowsocks_stream_crypto_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_shadowsocks_stream_crypto_test
-        COMMAND cnode_shadowsocks_stream_crypto_test)
-    set_property(TARGET cnode_shadowsocks_stream_crypto_test
-        PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE OFF)
-    target_compile_definitions(cnode_shadowsocks_stream_crypto_test PRIVATE CNODE_WRAP_MALLOC)
-    target_link_options(cnode_shadowsocks_stream_crypto_test PRIVATE
-        -Wl,--wrap=malloc -Wl,--wrap=EVP_CIPHER_CTX_new)
-    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
-        add_test(NAME cnode_shadowsocks_aes_software_test
-            COMMAND cnode_shadowsocks_stream_crypto_test)
-        set_tests_properties(cnode_shadowsocks_aes_software_test PROPERTIES
-            ENVIRONMENT "OPENSSL_ia32cap=0")
+function(cnode_unit name)
+    cmake_parse_arguments(TEST "" "LIBRARY;TIMEOUT" "SOURCES;INCLUDES" ${ARGN})
+    if(NOT TEST_LIBRARY)
+        set(TEST_LIBRARY cnode_core)
     endif()
-
-    add_executable(cnode_v2board_http_response_test
-        tests/v2board_http_response_test.cpp
-    )
-    target_include_directories(cnode_v2board_http_response_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/api/v2board
-    )
-    target_link_libraries(cnode_v2board_http_response_test PRIVATE
-        asio::asio
-        Threads::Threads
-    )
-    target_compile_options(cnode_v2board_http_response_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_v2board_http_response_test
-        COMMAND cnode_v2board_http_response_test)
-
-    add_executable(cnode_v2board_request_task_test tests/v2board_request_task_test.cpp)
-    target_include_directories(cnode_v2board_request_task_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/api/v2board)
-    target_link_libraries(cnode_v2board_request_task_test PRIVATE asio::asio Threads::Threads)
-    target_compile_options(cnode_v2board_request_task_test PRIVATE
-        -Wall -Wextra -Wpedantic)
-    add_test(NAME cnode_v2board_request_task_test COMMAND cnode_v2board_request_task_test)
-    set_tests_properties(cnode_v2board_request_task_test PROPERTIES TIMEOUT 10)
-
-    add_executable(cnode_online_snapshot_test
-        tests/online_snapshot_test.cpp
-        src/service/controller/online_snapshot.cpp
-    )
-    target_include_directories(cnode_online_snapshot_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/service/controller
-    )
-    target_link_libraries(cnode_online_snapshot_test PRIVATE
-        asio::asio
-        Threads::Threads
-    )
-    target_compile_options(cnode_online_snapshot_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_online_snapshot_test
-        COMMAND cnode_online_snapshot_test)
-
-    add_executable(cnode_v2board_online_report_test
-        tests/v2board_online_report_test.cpp
-        src/api/v2board/online_report.cpp
-        src/infra/json.cpp
-    )
-    target_include_directories(cnode_v2board_online_report_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/api/v2board
-    )
-    target_link_libraries(cnode_v2board_online_report_test PRIVATE
-        asio::asio
-        Threads::Threads
-    )
-    target_compile_options(cnode_v2board_online_report_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_v2board_online_report_test
-        COMMAND cnode_v2board_online_report_test)
-
-    add_executable(cnode_v2board_node_info_json_test
-        tests/v2board_node_info_json_test.cpp
-        src/api/v2board/node_info_json.cpp
-        src/transport/internet/reality_client_version.cpp
-        src/transport/internet/reality_key.cpp
-        src/transport/internet/reality_short_id.cpp
-        src/infra/inbound_field_rules.cpp
-        src/transport/internet/stream_settings.cpp
-        src/proxy/anytls/padding.cpp
-        src/infra/json.cpp
-        src/infra/json_field.cpp
-    )
-    target_include_directories(cnode_v2board_node_info_json_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/api/v2board
-    )
-    target_link_libraries(cnode_v2board_node_info_json_test PRIVATE
-        asio::asio
-        Threads::Threads
-        crypto
-    )
-    target_compile_options(cnode_v2board_node_info_json_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_v2board_node_info_json_test
-        COMMAND cnode_v2board_node_info_json_test)
-
-    add_executable(cnode_v2board_user_list_json_test
-        tests/v2board_user_list_json_test.cpp
-        src/api/v2board/user_list_json.cpp
-        src/infra/json.cpp
-        src/infra/json_field.cpp
-    )
-    target_include_directories(cnode_v2board_user_list_json_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/api/v2board
-    )
-    target_link_libraries(cnode_v2board_user_list_json_test PRIVATE
-        asio::asio
-        Threads::Threads
-    )
-    target_compile_options(cnode_v2board_user_list_json_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_v2board_user_list_json_test
-        COMMAND cnode_v2board_user_list_json_test)
-
-    add_executable(cnode_anytls_outbound_settings_test
-        tests/anytls_outbound_settings_test.cpp
-        src/proxy/anytls/outbound/anytls_outbound_settings.cpp
-        src/proxy/anytls/credentials.cpp
-        src/infra/json.cpp
-        src/infra/json_field.cpp
-    )
-    add_executable(cnode_substream_inbound_lifecycle_test
-        tests/substream_inbound_lifecycle_test.cpp
-        src/proxy/mux/inbound/mux_inbound.cpp
-        src/common/mux/mux_codec.cpp
-        src/proxy/uot/uot.cpp
-        src/proxy/anytls/inbound/anytls_inbound.cpp
-        src/proxy/anytls/anytls_codec.cpp
-        src/proxy/anytls/padding.cpp
-        src/proxy/anytls/credentials.cpp
-        src/app/proxyman/inbound/factory.cpp
-        src/app/proxyman/inbound/user_store.cpp
-        src/transport/async_stream.cpp
-        src/transport/internet/tcp_stream.cpp
-        src/transport/internet/proxy_protocol.cpp
-        src/transport/internet/timeout_scheduler.cpp
-        src/common/error.cpp
-        src/common/session.cpp
-        src/common/sharded_user_stats.cpp
-        src/infra/log.cpp)
-    target_include_directories(cnode_substream_inbound_lifecycle_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include ${concurrentqueue_SOURCE_DIR}
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/anytls/inbound
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/mux/inbound)
-    target_compile_definitions(cnode_substream_inbound_lifecycle_test PRIVATE CNODE_TEST_BUFFER_STATS)
-    target_link_libraries(cnode_substream_inbound_lifecycle_test PRIVATE
-        asio::asio Threads::Threads cnode_zlib crypto)
-    target_compile_options(cnode_substream_inbound_lifecycle_test PRIVATE
-        -Wall -Wextra -Wpedantic)
-    add_test(NAME cnode_substream_inbound_lifecycle_test COMMAND cnode_substream_inbound_lifecycle_test)
-    set_tests_properties(cnode_substream_inbound_lifecycle_test PROPERTIES TIMEOUT 90)
-
-    add_executable(cnode_anytls_codec_errors_test
-        tests/anytls_codec_errors_test.cpp
-        src/proxy/anytls/anytls_codec.cpp
-        src/proxy/anytls/padding.cpp
-        src/proxy/uot/uot.cpp
-        src/transport/async_stream.cpp
-        src/transport/internet/tcp_stream.cpp
-        src/transport/internet/proxy_protocol.cpp
-        src/transport/internet/timeout_scheduler.cpp
-        src/common/error.cpp
-        src/common/session.cpp
-        src/common/sharded_user_stats.cpp
-        src/infra/log.cpp)
-    target_include_directories(cnode_anytls_codec_errors_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include ${concurrentqueue_SOURCE_DIR}
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/anytls)
-    target_link_libraries(cnode_anytls_codec_errors_test PRIVATE asio::asio Threads::Threads cnode_zlib crypto)
-    target_compile_options(cnode_anytls_codec_errors_test PRIVATE
-        -Wall -Wextra -Wpedantic)
-    add_test(NAME cnode_anytls_codec_errors_test COMMAND cnode_anytls_codec_errors_test)
-    set_tests_properties(cnode_anytls_codec_errors_test PROPERTIES TIMEOUT 10)
-
-    add_executable(cnode_anytls_padding_test
-        tests/anytls_padding_test.cpp
-        src/proxy/anytls/padding.cpp)
-    target_include_directories(cnode_anytls_padding_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/anytls)
-    target_link_libraries(cnode_anytls_padding_test PRIVATE crypto)
-    target_compile_options(cnode_anytls_padding_test PRIVATE
-        -Wall -Wextra -Wpedantic)
-    add_test(NAME cnode_anytls_padding_test COMMAND cnode_anytls_padding_test)
-
-    add_executable(cnode_inbound_process_errors_test
-        tests/inbound_process_errors_test.cpp
-        src/app/proxyman/inbound/handler.cpp
-        src/app/proxyman/inbound/factory.cpp
-        src/proxy/anytls/anytls_codec.cpp
-        src/proxy/anytls/padding.cpp
-        src/proxy/uot/uot.cpp
-        src/transport/async_stream.cpp
-        src/transport/internet/stream_settings.cpp
-        src/transport/internet/tcp_stream.cpp
-        src/transport/internet/proxy_protocol.cpp
-        src/transport/internet/timeout_scheduler.cpp
-        src/transport/internet/tls_client_context.cpp
-        src/common/error.cpp
-        src/common/session.cpp
-        src/common/sharded_user_stats.cpp
-        src/infra/json.cpp
-        src/infra/log.cpp)
-    target_include_directories(cnode_inbound_process_errors_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include ${concurrentqueue_SOURCE_DIR}
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/anytls)
-    target_link_libraries(cnode_inbound_process_errors_test PRIVATE asio::asio Threads::Threads cnode_zlib ssl crypto)
-    target_compile_options(cnode_inbound_process_errors_test PRIVATE
-        -Wall -Wextra -Wpedantic)
-    add_test(NAME cnode_inbound_process_errors_test COMMAND cnode_inbound_process_errors_test)
-    set_tests_properties(cnode_inbound_process_errors_test PROPERTIES TIMEOUT 10)
-
-    add_executable(cnode_anytls_outbound_lifecycle_test
-        tests/anytls_outbound_lifecycle_test.cpp
-        src/proxy/anytls/outbound/anytls_outbound.cpp
-        src/proxy/anytls/outbound/anytls_outbound_settings.cpp
-        src/proxy/anytls/anytls_codec.cpp
-        src/proxy/anytls/padding.cpp
-        src/proxy/anytls/credentials.cpp
-        src/proxy/uot/uot.cpp
-        src/app/proxyman/outbound/factory.cpp
-        src/app/dns/dns.cpp
-        src/app/dns/cache.cpp
-        src/infra/runtime_failure.cpp
-        src/transport/async_stream.cpp
-        src/transport/internet/outbound_target_builder.cpp
-        src/transport/internet/outbound_bind.cpp
-        src/transport/internet/stream_settings.cpp
-        src/transport/internet/tcp_stream.cpp
-        src/transport/internet/proxy_protocol.cpp
-        src/transport/internet/timeout_scheduler.cpp
-        src/transport/internet/tls_client_context.cpp
-        src/common/error.cpp
-        src/common/session.cpp
-        src/infra/json.cpp
-        src/infra/json_field.cpp
-        src/infra/log.cpp)
-    target_include_directories(cnode_anytls_outbound_lifecycle_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include ${concurrentqueue_SOURCE_DIR}
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/anytls/outbound)
-    target_compile_definitions(cnode_anytls_outbound_lifecycle_test PRIVATE CNODE_TEST_BUFFER_STATS)
-    target_link_libraries(cnode_anytls_outbound_lifecycle_test PRIVATE
-        asio::asio Threads::Threads cnode_zlib ssl crypto)
-    target_compile_options(cnode_anytls_outbound_lifecycle_test PRIVATE
-        -Wall -Wextra -Wpedantic -Wno-mismatched-new-delete)
-    add_test(NAME cnode_anytls_outbound_lifecycle_test COMMAND cnode_anytls_outbound_lifecycle_test)
-    set_tests_properties(cnode_anytls_outbound_lifecycle_test PROPERTIES TIMEOUT 30)
-
-    target_include_directories(cnode_anytls_outbound_settings_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/anytls/outbound
-    )
-    target_link_libraries(cnode_anytls_outbound_settings_test PRIVATE
-        asio::asio
-        Threads::Threads
-        crypto
-    )
-    target_compile_options(cnode_anytls_outbound_settings_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_anytls_outbound_settings_test
-        COMMAND cnode_anytls_outbound_settings_test)
-
-    add_executable(cnode_ss_outbound_uot_test
-        tests/ss_outbound_uot_test.cpp
-        src/proxy/shadowsocks/outbound/ss_outbound_uot.cpp
-        src/infra/json.cpp
-        src/infra/json_field.cpp
-    )
-    target_include_directories(cnode_ss_outbound_uot_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/shadowsocks/outbound
-    )
-    target_link_libraries(cnode_ss_outbound_uot_test PRIVATE
-        asio::asio
-        Threads::Threads
-    )
-    target_compile_options(cnode_ss_outbound_uot_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_ss_outbound_uot_test
-        COMMAND cnode_ss_outbound_uot_test)
-
-    add_executable(cnode_inbound_tls_policy_test
-        tests/inbound_tls_policy_test.cpp
-        src/transport/internet/inbound_listen.cpp
-        src/transport/internet/outbound_bind.cpp
-    )
-    target_include_directories(cnode_inbound_tls_policy_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/service/controller
-    )
-    target_link_libraries(cnode_inbound_tls_policy_test PRIVATE
-        asio::asio
-        Threads::Threads
-    )
-    target_compile_options(cnode_inbound_tls_policy_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_inbound_tls_policy_test
-        COMMAND cnode_inbound_tls_policy_test)
-
-    add_executable(cnode_config_semantics_test
-        tests/config_semantics_test.cpp
-        src/infra/config_semantics.cpp
-        src/infra/json.cpp
-        src/transport/internet/inbound_listen.cpp
-    )
-    target_include_directories(cnode_config_semantics_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/infra
-    )
-    target_link_libraries(cnode_config_semantics_test PRIVATE
-        asio::asio
-        Threads::Threads
-    )
-    target_compile_options(cnode_config_semantics_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_config_semantics_test
-        COMMAND cnode_config_semantics_test)
-
-    add_executable(cnode_json_field_test
-        tests/json_field_test.cpp
-        src/infra/json_field.cpp
-        src/infra/json.cpp
-    )
-    target_include_directories(cnode_json_field_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-    target_compile_options(cnode_json_field_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_json_field_test
-        COMMAND cnode_json_field_test)
-
-    add_executable(cnode_http2_initial_window_test
-        tests/http2_initial_window_test.cpp
-        src/infra/http2_initial_window.cpp
-        src/infra/json_field.cpp
-        src/infra/json.cpp
-        src/transport/internet/http2_settings.cpp
-    )
-    target_include_directories(cnode_http2_initial_window_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/infra
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/internet
-    )
-    target_compile_options(cnode_http2_initial_window_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_http2_initial_window_test
-        COMMAND cnode_http2_initial_window_test)
-
-    add_executable(cnode_http_path_match_test
-        tests/http_path_match_test.cpp
-    )
-    target_include_directories(cnode_http_path_match_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/internet
-    )
-    target_compile_options(cnode_http_path_match_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_http_path_match_test
-        COMMAND cnode_http_path_match_test)
-
-    add_executable(cnode_json_object_test
-        tests/json_object_test.cpp
-        src/infra/json_field.cpp
-        src/infra/json.cpp
-    )
-    target_include_directories(cnode_json_object_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-    target_compile_options(cnode_json_object_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_json_object_test
-        COMMAND cnode_json_object_test)
-
-    add_executable(cnode_routing_ip_network_test
-        tests/routing_ip_network_test.cpp
-        src/infra/routing_ip_network.cpp
-    )
-    target_include_directories(cnode_routing_ip_network_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-    target_link_libraries(cnode_routing_ip_network_test PRIVATE
-        asio::asio
-        Threads::Threads
-    )
-    target_compile_options(cnode_routing_ip_network_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_routing_ip_network_test
-        COMMAND cnode_routing_ip_network_test)
-
-    add_executable(cnode_dns_inflight_test
-        tests/dns_inflight_test.cpp
-        src/app/dns/dns.cpp
-        src/app/dns/cache.cpp
-        src/infra/runtime_failure.cpp
-        src/transport/internet/timeout_scheduler.cpp
-        src/infra/log.cpp
-    )
-    target_include_directories(cnode_dns_inflight_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${concurrentqueue_SOURCE_DIR}
-    )
-    target_link_libraries(cnode_dns_inflight_test PRIVATE asio::asio Threads::Threads cnode_zlib ssl crypto)
-    target_compile_options(cnode_dns_inflight_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(NAME cnode_dns_inflight_test COMMAND cnode_dns_inflight_test)
-
-    add_executable(cnode_dns_cache_test
-        tests/dns_cache_test.cpp
-        src/app/dns/cache.cpp
-    )
-    target_include_directories(cnode_dns_cache_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-    )
-    target_link_libraries(cnode_dns_cache_test PRIVATE asio::asio Threads::Threads ssl crypto)
-    target_compile_options(cnode_dns_cache_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(NAME cnode_dns_cache_test COMMAND cnode_dns_cache_test)
-
-    add_executable(cnode_dns_datagram_test
-        tests/dns_datagram_test.cpp
-        src/app/dns/dns.cpp
-        src/app/dns/cache.cpp
-        src/infra/runtime_failure.cpp
-        src/transport/internet/timeout_scheduler.cpp
-        src/infra/log.cpp)
-    target_include_directories(cnode_dns_datagram_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src ${concurrentqueue_SOURCE_DIR})
-    target_link_libraries(cnode_dns_datagram_test PRIVATE asio::asio Threads::Threads cnode_zlib ssl crypto)
-    target_compile_options(cnode_dns_datagram_test PRIVATE
-        -Wall -Wextra -Wpedantic)
-    add_test(NAME cnode_dns_datagram_test COMMAND cnode_dns_datagram_test)
-    set_tests_properties(cnode_dns_datagram_test cnode_dns_inflight_test PROPERTIES TIMEOUT 20)
-
-    add_executable(cnode_router_test
-        tests/router_test.cpp
-        src/app/router/router.cpp
-        src/infra/routing_ip_network.cpp
-        src/geo/geodata.cpp
-        src/infra/log.cpp
-    )
-    target_include_directories(cnode_router_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${concurrentqueue_SOURCE_DIR}
-    )
-    target_link_libraries(cnode_router_test PRIVATE
-        asio::asio Threads::Threads cnode_zlib
-    )
-    target_compile_options(cnode_router_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(NAME cnode_router_test COMMAND cnode_router_test)
-
-    add_executable(cnode_geodata_test
-        tests/geodata_test.cpp
-        src/geo/geodata.cpp
-    )
-    target_include_directories(cnode_geodata_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-    target_link_libraries(cnode_geodata_test PRIVATE asio::asio Threads::Threads)
-    target_compile_options(cnode_geodata_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(NAME cnode_geodata_test COMMAND cnode_geodata_test)
-
-    add_executable(cnode_outbound_selection_test
-        tests/outbound_selection_test.cpp
-    )
-    target_include_directories(cnode_outbound_selection_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-    )
-    target_compile_options(cnode_outbound_selection_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_outbound_selection_test
-        COMMAND cnode_outbound_selection_test)
-
-    add_executable(cnode_outbound_bind_test
-        tests/outbound_bind_test.cpp
-        src/transport/internet/outbound_bind.cpp
-        src/infra/json.cpp
-    )
-    target_include_directories(cnode_outbound_bind_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-    target_link_libraries(cnode_outbound_bind_test PRIVATE
-        asio::asio
-        Threads::Threads
-    )
-    target_compile_options(cnode_outbound_bind_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_outbound_bind_test
-        COMMAND cnode_outbound_bind_test)
-
-    add_executable(cnode_inbound_listen_test
-        tests/inbound_listen_test.cpp
-        src/app/worker/tcp_listener.cpp
-        src/transport/internet/inbound_listen.cpp
-    )
-    target_include_directories(cnode_inbound_listen_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/app
-    )
-    target_link_libraries(cnode_inbound_listen_test PRIVATE
-        asio::asio
-        Threads::Threads
-    )
-    target_compile_options(cnode_inbound_listen_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_inbound_listen_test
-        COMMAND cnode_inbound_listen_test)
-
-    add_executable(cnode_panel_node_ids_test
-        tests/panel_node_ids_test.cpp
-        src/infra/panel_node_ids.cpp
-        src/infra/json.cpp
-    )
-    target_include_directories(cnode_panel_node_ids_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-    target_compile_options(cnode_panel_node_ids_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_panel_node_ids_test
-        COMMAND cnode_panel_node_ids_test)
-
-    add_executable(cnode_log_format_test
-        tests/log_format_test.cpp
-        src/infra/log.cpp
-    )
-    target_include_directories(cnode_log_format_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${concurrentqueue_SOURCE_DIR}
-    )
-    target_link_libraries(cnode_log_format_test PRIVATE
-        Threads::Threads
-        cnode_zlib
-    )
-    target_compile_options(cnode_log_format_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_log_format_test
-        COMMAND cnode_log_format_test)
-
-    add_executable(cnode_session_access_log_test
-        tests/session_access_log_test.cpp
-        src/common/session.cpp
-    )
-    target_include_directories(cnode_session_access_log_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-    target_link_libraries(cnode_session_access_log_test PRIVATE asio::asio Threads::Threads)
-    add_test(NAME cnode_session_access_log_test COMMAND cnode_session_access_log_test)
-
-    add_executable(cnode_runtime_failure_test
-        tests/runtime_failure_test.cpp src/infra/runtime_failure.cpp)
-    target_include_directories(cnode_runtime_failure_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    target_compile_options(cnode_runtime_failure_test PRIVATE
-        -Wall -Wextra -Wpedantic)
-    add_test(NAME cnode_runtime_failure_test COMMAND ${CMAKE_COMMAND}
-        -DTEST_EXECUTABLE=$<TARGET_FILE:cnode_runtime_failure_test>
-        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime_failure_test.cmake)
-
-    # Instrument the real runtime, not a second listener implementation. Reuse
-    # production source/target settings; test-only cold seams vanish in cnode.
-    set(CNODE_UDP_LISTENER_RUNTIME_SOURCES ${CNODE_SOURCES})
-    list(REMOVE_ITEM CNODE_UDP_LISTENER_RUNTIME_SOURCES src/main.cpp)
-    add_executable(cnode_worker_udp_listener_runtime_test
-        ${CNODE_UDP_LISTENER_RUNTIME_SOURCES}
-        tests/worker_udp_listener_runtime_test.cpp
-        tests/worker_udp_listener_runtime_new.cpp)
-    add_executable(cnode_worker_udp_retirement_runtime_test
-        ${CNODE_UDP_LISTENER_RUNTIME_SOURCES}
-        tests/worker_udp_retirement_runtime_test.cpp)
-    add_executable(cnode_worker_connection_limit_runtime_test
-        ${CNODE_UDP_LISTENER_RUNTIME_SOURCES}
-        tests/worker_connection_limit_runtime_test.cpp)
-    # The concrete outbound Handler/lookup bring the dialer and every transport.
-    add_executable(cnode_handler_registry_test
-        ${CNODE_UDP_LISTENER_RUNTIME_SOURCES}
-        tests/handler_registry_test.cpp)
-    add_executable(cnode_dispatcher_cancellation_test
-        ${CNODE_UDP_LISTENER_RUNTIME_SOURCES}
-        tests/dispatcher_cancellation_test.cpp)
-    set(CNODE_HTTP_HANDSHAKE_TEST_SOURCES ${CNODE_SOURCES})
-    list(FILTER CNODE_HTTP_HANDSHAKE_TEST_SOURCES INCLUDE REGEX
-        "^src/(transport/|common/(error|session)\\.cpp$|infra/(json[^/]*|http2_initial_window|log)\\.cpp$)")
-    list(REMOVE_ITEM CNODE_HTTP_HANDSHAKE_TEST_SOURCES
-        src/transport/internet/datagram_socket.cpp
-        src/transport/internet/hysteria/hysteria_protocol.cpp
-        src/transport/internet/hysteria/quic_memory.cpp
-        src/transport/internet/hysteria/quic_stream.cpp
-        src/transport/internet/hysteria/hysteria_ingress.cpp)
-    list(APPEND CNODE_HTTP_HANDSHAKE_TEST_SOURCES
-        src/app/dns/dns.cpp
-        src/infra/runtime_failure.cpp
-        src/app/dns/cache.cpp)
-    add_executable(cnode_http_handshake_read_ahead_test
-        tests/http_handshake_read_ahead_test.cpp
-        ${CNODE_HTTP_HANDSHAKE_TEST_SOURCES})
-    add_executable(cnode_http2_server_errors_test
-        tests/http2_server_errors_test.cpp
-        ${CNODE_HTTP_HANDSHAKE_TEST_SOURCES})
-    add_executable(cnode_http2_flow_control_test
-        tests/http2_flow_control_test.cpp
-        ${CNODE_HTTP_HANDSHAKE_TEST_SOURCES})
-    add_executable(cnode_http2_receive_credit_test
-        tests/http2_receive_credit_test.cpp
-        ${CNODE_HTTP_HANDSHAKE_TEST_SOURCES})
-    add_executable(cnode_xhttp_http1_test
-        tests/xhttp_http1_test.cpp
-        ${CNODE_HTTP_HANDSHAKE_TEST_SOURCES})
-    add_executable(cnode_xhttp_session_lifecycle_test
-        tests/xhttp_session_lifecycle_test.cpp
-        ${CNODE_HTTP_HANDSHAKE_TEST_SOURCES})
-    add_executable(cnode_tls_record_buffer_test
-        tests/tls_record_buffer_test.cpp
-        ${CNODE_HTTP_HANDSHAKE_TEST_SOURCES})
-    foreach(runtime_test IN ITEMS cnode_worker_udp_listener_runtime_test
-            cnode_worker_udp_retirement_runtime_test
-            cnode_worker_connection_limit_runtime_test
-            cnode_handler_registry_test
-            cnode_dispatcher_cancellation_test
-            cnode_http_handshake_read_ahead_test
-            cnode_http2_server_errors_test
-            cnode_http2_flow_control_test
-            cnode_http2_receive_credit_test
-            cnode_xhttp_http1_test
-            cnode_xhttp_session_lifecycle_test
-            cnode_tls_record_buffer_test)
-        foreach(property IN ITEMS INCLUDE_DIRECTORIES COMPILE_DEFINITIONS
-                COMPILE_OPTIONS LINK_LIBRARIES LINK_OPTIONS)
-            get_target_property(value cnode ${property})
-            if(value AND NOT value MATCHES "-NOTFOUND$")
-                set_property(TARGET ${runtime_test} PROPERTY ${property} "${value}")
-            endif()
-        endforeach()
-        target_precompile_headers(${runtime_test} REUSE_FROM cnode)
-        if(CNODE_IO_URING)
-            add_dependencies(${runtime_test} cnode_liburing_static)
-        endif()
-    endforeach()
-    add_test(NAME cnode_handler_registry_test COMMAND cnode_handler_registry_test)
-    set_tests_properties(cnode_handler_registry_test PROPERTIES TIMEOUT 20)
-    add_test(NAME cnode_dispatcher_cancellation_test COMMAND cnode_dispatcher_cancellation_test)
-    set_tests_properties(cnode_dispatcher_cancellation_test PROPERTIES TIMEOUT 20)
-    target_compile_definitions(cnode_tls_record_buffer_test PRIVATE
-        ACPP_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
-        CNODE_TEST_ALLOCATOR_FAULT CNODE_TEST_BUFFER_STATS)
-    add_test(NAME cnode_tls_record_buffer_test COMMAND cnode_tls_record_buffer_test)
-    set_tests_properties(cnode_tls_record_buffer_test PROPERTIES TIMEOUT 30)
-    target_compile_definitions(cnode_http_handshake_read_ahead_test PRIVATE
-        ACPP_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
-        CNODE_TEST_ALLOCATOR_FAULT CNODE_TEST_BUFFER_STATS)
-    add_test(NAME cnode_http_handshake_read_ahead_test
-        COMMAND cnode_http_handshake_read_ahead_test)
-    set_tests_properties(cnode_http_handshake_read_ahead_test PROPERTIES TIMEOUT 30)
-    add_test(NAME cnode_http2_server_errors_test COMMAND cnode_http2_server_errors_test)
-    set_tests_properties(cnode_http2_server_errors_test PROPERTIES TIMEOUT 30)
-    add_test(NAME cnode_http2_flow_control_test COMMAND cnode_http2_flow_control_test)
-    set_tests_properties(cnode_http2_flow_control_test PROPERTIES TIMEOUT 30)
-    add_test(NAME cnode_http2_receive_credit_test COMMAND cnode_http2_receive_credit_test)
-    set_tests_properties(cnode_http2_receive_credit_test PROPERTIES TIMEOUT 30)
-    add_test(NAME cnode_xhttp_http1_test COMMAND cnode_xhttp_http1_test)
-    set_tests_properties(cnode_xhttp_http1_test PROPERTIES TIMEOUT 30)
-    target_include_directories(cnode_xhttp_session_lifecycle_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/internet)
-    add_test(NAME cnode_xhttp_session_lifecycle_test COMMAND cnode_xhttp_session_lifecycle_test)
-    set_tests_properties(cnode_xhttp_session_lifecycle_test PROPERTIES TIMEOUT 30)
-    add_test(NAME cnode_worker_connection_limit_runtime_test
-        COMMAND cnode_worker_connection_limit_runtime_test)
-    set_tests_properties(cnode_worker_connection_limit_runtime_test PROPERTIES TIMEOUT 45)
-    add_test(NAME cnode_worker_udp_retirement_runtime_test
-        COMMAND cnode_worker_udp_retirement_runtime_test)
-    add_test(NAME cnode_worker_udp_delayed_retirement_runtime_test
-        COMMAND cnode_worker_udp_retirement_runtime_test --delayed-retirement)
-    add_test(NAME cnode_worker_shutdown_dns_test
-        COMMAND cnode_worker_udp_retirement_runtime_test --shutdown-dns)
-    add_test(NAME cnode_worker_shutdown_delayed_mutation_test
-        COMMAND cnode_worker_udp_retirement_runtime_test --shutdown-delayed)
-    set_tests_properties(cnode_worker_udp_retirement_runtime_test
-        cnode_worker_udp_delayed_retirement_runtime_test
-        cnode_worker_shutdown_dns_test cnode_worker_shutdown_delayed_mutation_test
-        PROPERTIES TIMEOUT 25)
-    target_compile_definitions(cnode_worker_udp_listener_runtime_test PRIVATE
-        CNODE_TEST_UDP_LISTENER_RUNTIME_FAULT CNODE_TEST_ALLOCATOR_FAULT
-        ASIO_DISABLE_AWAITABLE_FRAME_RECYCLING)
-    target_compile_options(cnode_worker_udp_listener_runtime_test PRIVATE
-        "-include${CMAKE_CURRENT_SOURCE_DIR}/tests/worker_udp_listener_runtime_fault.hpp")
-    add_test(NAME cnode_worker_udp_listener_runtime_test
-        COMMAND cnode_worker_udp_listener_runtime_test)
-    add_test(NAME cnode_worker_udp_association_runtime_test
-        COMMAND cnode_worker_udp_listener_runtime_test --associations)
-    set_tests_properties(cnode_worker_udp_association_runtime_test PROPERTIES TIMEOUT 20)
-    add_test(NAME cnode_two_worker_udp_association_runtime_test
-        COMMAND cnode_worker_udp_listener_runtime_test --two-workers-associations)
-    set_tests_properties(cnode_two_worker_udp_association_runtime_test PROPERTIES TIMEOUT 20)
-    add_test(NAME cnode_worker_udp_listener_prepare_std_fault_test
-        COMMAND ${CMAKE_COMMAND}
-            -DTEST_EXECUTABLE=$<TARGET_FILE:cnode_worker_udp_listener_runtime_test>
-            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/worker_udp_listener_prepare_sweep_test.cmake)
-    add_test(NAME cnode_worker_udp_listener_prepare_pmr_fault_test
-        COMMAND cnode_worker_udp_listener_runtime_test --prepare-fault-pmr)
-    foreach(index RANGE 0 1)
-        add_test(NAME cnode_worker_udp_listener_spawn_${index}_fault_test
-            COMMAND ${CMAKE_COMMAND}
-                -DTEST_EXECUTABLE=$<TARGET_FILE:cnode_worker_udp_listener_runtime_test>
-                -DSPAWN_INDEX=${index}
-                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/worker_udp_listener_runtime_shutdown_test.cmake)
-        set_tests_properties(cnode_worker_udp_listener_spawn_${index}_fault_test
-            PROPERTIES TIMEOUT 20 SKIP_REGULAR_EXPRESSION "SKIP: IPv6 unavailable")
-    endforeach()
-    add_test(NAME cnode_worker_udp_listener_ready_fault_test
-        COMMAND ${CMAKE_COMMAND}
-            -DTEST_EXECUTABLE=$<TARGET_FILE:cnode_worker_udp_listener_runtime_test>
-            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/worker_udp_listener_ready_shutdown_test.cmake)
-    set_tests_properties(cnode_worker_udp_listener_ready_fault_test
-        PROPERTIES TIMEOUT 20 SKIP_REGULAR_EXPRESSION "SKIP: IPv6 unavailable")
-    add_test(NAME cnode_worker_udp_same_socket_cancel_test
-        COMMAND cnode_worker_udp_listener_runtime_test --same-socket-cancel)
-    set_tests_properties(cnode_worker_udp_same_socket_cancel_test PROPERTIES TIMEOUT 15)
-    set_tests_properties(cnode_worker_udp_listener_runtime_test
-        cnode_worker_udp_listener_prepare_std_fault_test
-        cnode_worker_udp_listener_prepare_pmr_fault_test
-        PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77)
-
-    add_executable(cnode_worker_udp_listener_oom_test
-        tests/worker_udp_listener_oom_test.cpp
-        tests/worker_udp_listener_new.cpp
-        src/app/worker/udp_ingress.cpp
-        src/common/sharded_user_stats.cpp
-        src/app/worker/udp_association_reclaimer.cpp
-        src/transport/internet/timeout_scheduler.cpp
-        src/common/session.cpp
-        src/infra/runtime_failure.cpp
-        src/infra/log.cpp)
-    target_include_directories(cnode_worker_udp_listener_oom_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/app
-        ${concurrentqueue_SOURCE_DIR})
-    target_compile_definitions(cnode_worker_udp_listener_oom_test PRIVATE
-        CNODE_TEST_ALLOCATOR_FAULT ASIO_DISABLE_AWAITABLE_FRAME_RECYCLING)
-    target_link_libraries(cnode_worker_udp_listener_oom_test PRIVATE asio::asio Threads::Threads cnode_zlib)
-    target_compile_options(cnode_worker_udp_listener_oom_test PRIVATE
-        -Wall -Wextra -Wpedantic
-        "-include${CMAKE_CURRENT_SOURCE_DIR}/tests/async_allocation_fault.hpp")
-    add_test(NAME cnode_worker_udp_listener_oom_test COMMAND cnode_worker_udp_listener_oom_test)
-    set_tests_properties(cnode_worker_udp_listener_oom_test PROPERTIES TIMEOUT 15)
-
-    add_executable(cnode_udp_association_reclaimer_test
-        tests/udp_association_reclaimer_test.cpp
-        src/app/worker/udp_ingress.cpp
-        src/common/sharded_user_stats.cpp
-        src/app/worker/udp_association_reclaimer.cpp
-        src/transport/internet/timeout_scheduler.cpp
-        src/common/session.cpp
-        src/infra/runtime_failure.cpp
-        src/infra/log.cpp)
-    target_include_directories(cnode_udp_association_reclaimer_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/app
-        ${concurrentqueue_SOURCE_DIR})
-    target_link_libraries(cnode_udp_association_reclaimer_test PRIVATE
-        asio::asio Threads::Threads cnode_zlib)
-    target_compile_options(cnode_udp_association_reclaimer_test PRIVATE
-        -Wall -Wextra -Wpedantic)
-    add_test(NAME cnode_udp_association_reclaimer_test COMMAND cnode_udp_association_reclaimer_test)
-    set_tests_properties(cnode_udp_association_reclaimer_test PROPERTIES TIMEOUT 15)
-
-    add_executable(cnode_udp_native_lifecycle_test
-        tests/udp_native_lifecycle_test.cpp
-        tests/udp_native_lifecycle_allocation.cpp
-        src/app/worker/udp_ingress.cpp
-        src/common/sharded_user_stats.cpp
-        src/app/worker/udp_association_reclaimer.cpp
-        src/transport/internet/timeout_scheduler.cpp
-        src/common/session.cpp
-        src/infra/runtime_failure.cpp
-        src/infra/log.cpp)
-    target_include_directories(cnode_udp_native_lifecycle_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/app
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/shadowsocks
-        ${concurrentqueue_SOURCE_DIR})
-    target_link_libraries(cnode_udp_native_lifecycle_test PRIVATE
-        asio::asio Threads::Threads cnode_zlib)
-    target_compile_definitions(cnode_udp_native_lifecycle_test PRIVATE
-        ASIO_DISABLE_AWAITABLE_FRAME_RECYCLING CNODE_TEST_UDP_NATIVE_LIFECYCLE_FAULT)
-    target_compile_options(cnode_udp_native_lifecycle_test PRIVATE
-        "-include${CMAKE_CURRENT_SOURCE_DIR}/tests/udp_native_lifecycle_allocation.hpp"
-        "-include${CMAKE_CURRENT_SOURCE_DIR}/tests/async_allocation_fault.hpp"
-        -Wall -Wextra -Wpedantic)
-    add_test(NAME cnode_udp_native_lifecycle_test COMMAND cnode_udp_native_lifecycle_test)
-    set_tests_properties(cnode_udp_native_lifecycle_test PROPERTIES TIMEOUT 15)
-
-    add_executable(cnode_udp_socket_owner_test
-        tests/udp_socket_owner_test.cpp
-        src/app/worker/udp_ingress.cpp
-        src/common/sharded_user_stats.cpp
-        src/app/worker/udp_association_reclaimer.cpp
-        src/transport/internet/timeout_scheduler.cpp
-        src/common/session.cpp
-        src/infra/runtime_failure.cpp
-        src/infra/log.cpp
-    )
-    target_include_directories(cnode_udp_socket_owner_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/app
-        ${concurrentqueue_SOURCE_DIR}
-    )
-    target_link_libraries(cnode_udp_socket_owner_test PRIVATE
-        asio::asio
-        Threads::Threads
-        cnode_zlib
-    )
-    target_compile_definitions(cnode_udp_socket_owner_test PRIVATE CNODE_TEST_ALLOCATOR_FAULT)
-    target_compile_options(cnode_udp_socket_owner_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_udp_socket_owner_test
-        COMMAND cnode_udp_socket_owner_test)
-
-    # Native associations now own the same session capabilities as TCP and
-    # QUIC. Instrument that real runtime under each fixture's allocator flags.
-    foreach(udp_domain_test IN ITEMS cnode_worker_udp_listener_oom_test
-            cnode_udp_association_reclaimer_test
-            cnode_udp_native_lifecycle_test cnode_udp_socket_owner_test)
-        get_target_property(udp_domain_sources ${udp_domain_test} SOURCES)
-        foreach(source IN LISTS CNODE_UDP_LISTENER_RUNTIME_SOURCES)
-            if(NOT source IN_LIST udp_domain_sources)
-                target_sources(${udp_domain_test} PRIVATE ${source})
-            endif()
-        endforeach()
-        foreach(property IN ITEMS INCLUDE_DIRECTORIES COMPILE_DEFINITIONS
-                LINK_LIBRARIES LINK_OPTIONS)
-            get_target_property(value cnode ${property})
-            if(value AND NOT value MATCHES "-NOTFOUND$")
-                set_property(TARGET ${udp_domain_test} APPEND PROPERTY ${property} "${value}")
-            endif()
-        endforeach()
-        target_precompile_headers(${udp_domain_test} PRIVATE src/pch.hpp)
-    endforeach()
-
-    foreach(test IN ITEMS udp_request ss_udp_request native_socket_handoff)
-        add_executable(cnode_${test}_test
-            tests/${test}_test.cpp
-            src/transport/async_stream.cpp
-            src/transport/internet/tcp_stream.cpp
-            src/transport/internet/proxy_protocol.cpp
-            src/transport/internet/datagram_socket.cpp
-            src/app/dns/dns.cpp
-            src/app/dns/cache.cpp
-            src/infra/runtime_failure.cpp
-            src/transport/internet/timeout_scheduler.cpp
-            src/common/error.cpp
-            src/common/session.cpp
-            src/infra/log.cpp
-        )
-        target_include_directories(cnode_${test}_test PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/include
-            ${CMAKE_CURRENT_SOURCE_DIR}/src
-            ${concurrentqueue_SOURCE_DIR}
-        )
-        target_link_libraries(cnode_${test}_test PRIVATE asio::asio Threads::Threads cnode_zlib crypto)
-        if(test STREQUAL "ss_udp_request")
-            target_sources(cnode_${test}_test PRIVATE
-                src/proxy/shadowsocks/shadowsocks_protocol.cpp
-                src/proxy/shadowsocks/ss_udp.cpp
-            )
-            target_include_directories(cnode_${test}_test PRIVATE ${blake3_SOURCE_DIR}/c)
-            target_link_libraries(cnode_${test}_test PRIVATE cnode_blake3)
-        endif()
-        target_compile_options(cnode_${test}_test PRIVATE
-            -Wall -Wextra -Wpedantic
-        )
-        add_test(NAME cnode_${test}_test COMMAND cnode_${test}_test)
-        set_tests_properties(cnode_${test}_test PROPERTIES TIMEOUT 30)
-    endforeach()
-
-    foreach(test IN ITEMS connection_timeouts datagram_socket)
-        add_executable(cnode_${test}_test
-            tests/${test}_test.cpp
-            src/transport/internet/timeout_scheduler.cpp
-            src/common/error.cpp)
-        if(test STREQUAL "datagram_socket")
-            target_sources(cnode_${test}_test PRIVATE src/transport/internet/datagram_socket.cpp)
-        endif()
-        target_include_directories(cnode_${test}_test PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
-        target_link_libraries(cnode_${test}_test PRIVATE asio::asio Threads::Threads)
-        target_compile_options(cnode_${test}_test PRIVATE
-            -Wall -Wextra -Wpedantic)
-        add_test(NAME cnode_${test}_test COMMAND cnode_${test}_test)
-        set_tests_properties(cnode_${test}_test PROPERTIES TIMEOUT 30)
-    endforeach()
-
-    add_executable(cnode_cancellation_source_test tests/cancellation_source_test.cpp)
-    target_include_directories(cnode_cancellation_source_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    target_link_libraries(cnode_cancellation_source_test PRIVATE asio::asio Threads::Threads)
-    target_compile_options(cnode_cancellation_source_test PRIVATE
-        -Wall -Wextra -Wpedantic)
-    add_test(NAME cnode_cancellation_source_test COMMAND cnode_cancellation_source_test)
-
-    add_executable(cnode_token_bucket_test tests/token_bucket_test.cpp)
-    target_include_directories(cnode_token_bucket_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    target_link_libraries(cnode_token_bucket_test PRIVATE Threads::Threads)
-    target_compile_options(cnode_token_bucket_test PRIVATE
-        -Wall -Wextra -Wpedantic)
-    add_test(NAME cnode_token_bucket_test COMMAND cnode_token_bucket_test)
-
-    add_executable(cnode_buffer_ownership_test tests/buffer_ownership_test.cpp)
-    target_include_directories(cnode_buffer_ownership_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    target_link_libraries(cnode_buffer_ownership_test PRIVATE asio::asio Threads::Threads)
-    target_compile_options(cnode_buffer_ownership_test PRIVATE
-        -Wall -Wextra -Wpedantic)
-    add_test(NAME cnode_buffer_ownership_test COMMAND cnode_buffer_ownership_test)
-
-    add_executable(cnode_blake3_dispatch_test tests/blake3_dispatch_test.cpp)
-    target_link_libraries(cnode_blake3_dispatch_test PRIVATE cnode_blake3)
-    add_test(NAME cnode_blake3_dispatch_test COMMAND cnode_blake3_dispatch_test)
-
-    # Exercise the fallback dispatcher independently of the build host's ISA.
-    add_library(cnode_blake3_portable_test_lib STATIC
-        ${blake3_SOURCE_DIR}/c/blake3.c
-        ${blake3_SOURCE_DIR}/c/blake3_dispatch.c
-        ${blake3_SOURCE_DIR}/c/blake3_portable.c)
-    target_include_directories(cnode_blake3_portable_test_lib PUBLIC ${blake3_SOURCE_DIR}/c)
-    target_compile_definitions(cnode_blake3_portable_test_lib PRIVATE
-        BLAKE3_NO_SSE2 BLAKE3_NO_SSE41 BLAKE3_NO_AVX2 BLAKE3_NO_AVX512 BLAKE3_USE_NEON=0)
-    add_executable(cnode_blake3_portable_test tests/blake3_dispatch_test.cpp)
-    target_compile_definitions(cnode_blake3_portable_test PRIVATE CNODE_EXPECT_PORTABLE)
-    target_link_libraries(cnode_blake3_portable_test PRIVATE cnode_blake3_portable_test_lib)
-    add_test(NAME cnode_blake3_portable_test COMMAND cnode_blake3_portable_test)
-
-    add_executable(cnode_thread_memory_pool_test tests/thread_memory_pool_test.cpp)
-    target_include_directories(cnode_thread_memory_pool_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    target_link_libraries(cnode_thread_memory_pool_test PRIVATE asio::asio Threads::Threads)
-    target_compile_definitions(cnode_thread_memory_pool_test PRIVATE
-        CNODE_MEMORY_STATS CNODE_TEST_ALLOCATOR_FAULT)
-    target_compile_options(cnode_thread_memory_pool_test PRIVATE
-        -Wall -Wextra -Wpedantic)
-    add_test(NAME cnode_thread_memory_pool_test COMMAND cnode_thread_memory_pool_test)
-
-    foreach(test IN ITEMS asio_operation_allocator phase_deadline)
-        add_executable(cnode_${test}_test
-            tests/${test}_test.cpp
-            src/transport/async_stream.cpp
-            src/transport/internet/tcp_stream.cpp
-            src/transport/internet/proxy_protocol.cpp
-            src/transport/internet/timeout_scheduler.cpp
-            src/common/error.cpp
-            src/common/session.cpp
-            src/infra/log.cpp)
-        target_include_directories(cnode_${test}_test PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/include ${concurrentqueue_SOURCE_DIR})
-        target_link_libraries(cnode_${test}_test PRIVATE asio::asio Threads::Threads cnode_zlib ssl crypto)
-        target_compile_options(cnode_${test}_test PRIVATE
-            -Wall -Wextra -Wpedantic)
-        add_test(NAME cnode_${test}_test COMMAND cnode_${test}_test)
-        set_tests_properties(cnode_${test}_test PROPERTIES TIMEOUT 10)
-    endforeach()
-
-    foreach(cache_size IN ITEMS 8 32 64)
-        add_executable(cnode_asio_recycling_cache_${cache_size}_test tests/asio_recycling_cache_test.cpp)
-        target_include_directories(cnode_asio_recycling_cache_${cache_size}_test PRIVATE
-            ${asio_SOURCE_DIR}/asio/include)
-        target_compile_definitions(cnode_asio_recycling_cache_${cache_size}_test PRIVATE
-            ASIO_STANDALONE ASIO_RECYCLING_ALLOCATOR_CACHE_SIZE=${cache_size})
-        target_link_libraries(cnode_asio_recycling_cache_${cache_size}_test PRIVATE Threads::Threads)
-        target_compile_definitions(cnode_asio_recycling_cache_${cache_size}_test PRIVATE CNODE_WRAP_ALIGNED_ALLOC)
-        target_link_options(cnode_asio_recycling_cache_${cache_size}_test PRIVATE -Wl,--wrap=aligned_alloc)
-        target_compile_options(cnode_asio_recycling_cache_${cache_size}_test PRIVATE
-            -Wall -Wextra -Wpedantic)
-        add_test(NAME cnode_asio_recycling_cache_${cache_size}_test
-            COMMAND cnode_asio_recycling_cache_${cache_size}_test)
-    endforeach()
-
-
-
-    add_executable(cnode_relay_initial_payload_test
-        tests/relay_initial_payload_test.cpp
-        src/transport/async_stream.cpp
-        src/transport/internet/tcp_stream.cpp
-        src/transport/internet/proxy_protocol.cpp
-        src/transport/internet/timeout_scheduler.cpp
-        src/common/error.cpp
-        src/common/session.cpp
-        src/infra/log.cpp)
-    target_include_directories(cnode_relay_initial_payload_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include ${concurrentqueue_SOURCE_DIR})
-    target_compile_definitions(cnode_relay_initial_payload_test PRIVATE CNODE_TEST_ALLOCATOR_FAULT)
-    target_link_libraries(cnode_relay_initial_payload_test PRIVATE asio::asio Threads::Threads cnode_zlib)
-    target_compile_options(cnode_relay_initial_payload_test PRIVATE
-        -Wall -Wextra -Wpedantic)
-    add_test(NAME cnode_relay_initial_payload_test COMMAND cnode_relay_initial_payload_test)
-    set_tests_properties(cnode_relay_initial_payload_test PROPERTIES TIMEOUT 30)
-    add_test(NAME cnode_relay_full_close_test COMMAND cnode_relay_initial_payload_test --full-close)
-    set_tests_properties(cnode_relay_full_close_test PROPERTIES TIMEOUT 15)
-    add_test(NAME cnode_relay_half_close_backpressure_test
-        COMMAND cnode_relay_initial_payload_test --half-close-backpressure)
-    set_tests_properties(cnode_relay_half_close_backpressure_test PROPERTIES TIMEOUT 15)
-
-    add_executable(cnode_xhttp_packet_session_key_test
-        tests/xhttp_packet_session_key_test.cpp
-    )
-    target_include_directories(cnode_xhttp_packet_session_key_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/internet
-    )
-    target_link_libraries(cnode_xhttp_packet_session_key_test PRIVATE
-        asio::asio
-        Threads::Threads
-    )
-    target_compile_options(cnode_xhttp_packet_session_key_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_xhttp_packet_session_key_test
-        COMMAND cnode_xhttp_packet_session_key_test)
-
-    add_executable(cnode_xhttp_packet_queue_test
-        tests/xhttp_packet_queue_test.cpp
-    )
-    target_include_directories(cnode_xhttp_packet_queue_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/internet
-    )
-    target_link_libraries(cnode_xhttp_packet_queue_test PRIVATE
-        asio::asio
-        Threads::Threads
-    )
-    target_compile_options(cnode_xhttp_packet_queue_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_xhttp_packet_queue_test
-        COMMAND cnode_xhttp_packet_queue_test)
-
-    add_executable(cnode_xhttp_upload_stream_slot_test
-        tests/xhttp_upload_stream_slot_test.cpp
-    )
-    target_include_directories(cnode_xhttp_upload_stream_slot_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/internet
-    )
-    target_link_libraries(cnode_xhttp_upload_stream_slot_test PRIVATE
-        asio::asio
-        Threads::Threads
-    )
-    target_compile_options(cnode_xhttp_upload_stream_slot_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_xhttp_upload_stream_slot_test
-        COMMAND cnode_xhttp_upload_stream_slot_test)
-
-    add_executable(cnode_timeout_scheduler_test
-        tests/timeout_scheduler_test.cpp
-        tests/timeout_scheduler_new.cpp
-        src/transport/internet/timeout_scheduler.cpp
-    )
-    target_include_directories(cnode_timeout_scheduler_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-    target_link_libraries(cnode_timeout_scheduler_test PRIVATE
-        asio::asio
-        Threads::Threads
-    )
-    target_compile_options(cnode_timeout_scheduler_test PRIVATE
-        -Wall -Wextra -Wpedantic
-        "-include${CMAKE_CURRENT_SOURCE_DIR}/tests/timeout_scheduler_allocation.hpp"
-    )
-    add_test(
-        NAME cnode_timeout_scheduler_test
-        COMMAND cnode_timeout_scheduler_test)
-    # Includes 1000 no-traffic PMR reclamation cycles on the same scheduler.
-    set_tests_properties(cnode_timeout_scheduler_test PROPERTIES TIMEOUT 30)
-    add_executable(cnode_async_write_gate_test
-        tests/async_write_gate_test.cpp
-    )
-    target_include_directories(cnode_async_write_gate_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/internet
-    )
-    target_link_libraries(cnode_async_write_gate_test PRIVATE
-        asio::asio
-        Threads::Threads
-    )
-    target_compile_options(cnode_async_write_gate_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_async_write_gate_test
-        COMMAND cnode_async_write_gate_test)
-
-    add_executable(cnode_node_transition_test
-        tests/node_transition_test.cpp
-        src/service/controller/node_transition.cpp
-    )
-    target_include_directories(cnode_node_transition_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/service/controller
-    )
-    target_link_libraries(cnode_node_transition_test PRIVATE
-        asio::asio
-        Threads::Threads
-    )
-    target_compile_options(cnode_node_transition_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_node_transition_test
-        COMMAND cnode_node_transition_test)
-
-    add_executable(cnode_node_transaction_test
-        tests/node_transaction_test.cpp
-        src/service/controller/node_transition.cpp
-        src/transport/internet/inbound_listen.cpp)
-    target_include_directories(cnode_node_transaction_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/service/controller)
-    target_link_libraries(cnode_node_transaction_test PRIVATE asio::asio Threads::Threads crypto)
-    target_compile_options(cnode_node_transaction_test PRIVATE
-        -Wall -Wextra -Wpedantic)
-    add_test(NAME cnode_node_transaction_test COMMAND cnode_node_transaction_test)
-    set_tests_properties(cnode_node_transaction_test PROPERTIES TIMEOUT 10)
-
-    add_executable(cnode_panel_schedule_test
-        tests/panel_schedule_test.cpp
-    )
-    target_include_directories(cnode_panel_schedule_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/service/controller
-    )
-    target_compile_options(cnode_panel_schedule_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_panel_schedule_test
-        COMMAND cnode_panel_schedule_test)
-
-    add_executable(cnode_ban_tracking_contract_test
-        tests/ban_tracking_contract_test.cpp
-        src/infra/log.cpp
-    )
-    target_include_directories(cnode_ban_tracking_contract_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${concurrentqueue_SOURCE_DIR}
-    )
-    target_link_libraries(cnode_ban_tracking_contract_test PRIVATE
-        asio::asio
-        Threads::Threads
-        cnode_zlib
-    )
-    target_compile_options(cnode_ban_tracking_contract_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_ban_tracking_contract_test
-        COMMAND cnode_ban_tracking_contract_test)
-
-    add_executable(cnode_awaitable_batch_test
-        tests/awaitable_batch_test.cpp
-        src/common/awaitable_batch.cpp
-    )
-    target_include_directories(cnode_awaitable_batch_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/common
-    )
-    target_link_libraries(cnode_awaitable_batch_test PRIVATE
-        asio::asio
-        Threads::Threads
-    )
-    # Exercise launch allocations even after an earlier case populated Asio caches.
-    target_compile_definitions(cnode_awaitable_batch_test PRIVATE
-        ASIO_DISABLE_AWAITABLE_FRAME_RECYCLING)
-    target_compile_options(cnode_awaitable_batch_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_awaitable_batch_test
-        COMMAND cnode_awaitable_batch_test)
-    set_tests_properties(cnode_awaitable_batch_test PROPERTIES TIMEOUT 10)
-
-    add_executable(cnode_awaitable_task_group_test
-        tests/awaitable_task_group_test.cpp
-    )
-    target_include_directories(cnode_awaitable_task_group_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/common
-    )
-    target_link_libraries(cnode_awaitable_task_group_test PRIVATE
-        asio::asio
-        Threads::Threads
-    )
-    # Exercise launch allocations even after an earlier case populated Asio caches.
-    target_compile_definitions(cnode_awaitable_task_group_test PRIVATE
-        ASIO_DISABLE_AWAITABLE_FRAME_RECYCLING CNODE_MEMORY_STATS)
-    target_compile_options(cnode_awaitable_task_group_test PRIVATE
-        "-include${CMAKE_CURRENT_SOURCE_DIR}/tests/async_allocation_fault.hpp"
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_awaitable_task_group_test
-        COMMAND cnode_awaitable_task_group_test)
-    set_tests_properties(cnode_awaitable_task_group_test PROPERTIES TIMEOUT 10)
-
-    add_executable(cnode_process_resources_test tests/process_resources_test.cpp)
-    target_include_directories(cnode_process_resources_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    target_compile_options(cnode_process_resources_test PRIVATE
-        -Wall -Wextra -Wpedantic)
-    add_test(NAME cnode_process_resources_test COMMAND cnode_process_resources_test)
-
-    add_executable(cnode_monitor_loop_test
-        tests/monitor_loop_test.cpp src/common/awaitable_batch.cpp)
-    target_include_directories(cnode_monitor_loop_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    target_link_libraries(cnode_monitor_loop_test PRIVATE asio::asio Threads::Threads)
-    target_compile_options(cnode_monitor_loop_test PRIVATE
-        -Wall -Wextra -Wpedantic)
-    add_test(NAME cnode_monitor_loop_test COMMAND cnode_monitor_loop_test)
-    set_tests_properties(cnode_monitor_loop_test PROPERTIES TIMEOUT 10)
-
-    add_executable(cnode_rule_lifecycle_test
-        tests/rule_lifecycle_test.cpp
-        src/common/rule.cpp
-    )
-    target_include_directories(cnode_rule_lifecycle_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-    target_link_libraries(cnode_rule_lifecycle_test PRIVATE
-        asio::asio
-        Threads::Threads
-    )
-    target_compile_options(cnode_rule_lifecycle_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_rule_lifecycle_test
-        COMMAND cnode_rule_lifecycle_test)
-
-    add_executable(cnode_worker_mailbox_test
-        tests/worker_mailbox_test.cpp
-        src/infra/runtime_failure.cpp
-    )
-    target_include_directories(cnode_worker_mailbox_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-    target_link_libraries(cnode_worker_mailbox_test PRIVATE
-        asio::asio
-        Threads::Threads
-    )
-    target_compile_options(cnode_worker_mailbox_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_worker_mailbox_test
-        COMMAND cnode_worker_mailbox_test)
-    set_tests_properties(cnode_worker_mailbox_test PROPERTIES TIMEOUT 10)
-
-    add_executable(cnode_worker_runtime_contract_test
-        tests/worker_runtime_contract_test.cpp
-    )
-    target_include_directories(cnode_worker_runtime_contract_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-    target_link_libraries(cnode_worker_runtime_contract_test PRIVATE
-        asio::asio
-        Threads::Threads
-    )
-    target_compile_options(cnode_worker_runtime_contract_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_worker_runtime_contract_test
-        COMMAND cnode_worker_runtime_contract_test)
-
-    add_executable(cnode_runtime_exit_test
-        tests/runtime_exit_test.cpp
-    )
-    target_link_libraries(cnode_runtime_exit_test PRIVATE
-        asio::asio
-        Threads::Threads
-    )
-    target_compile_options(cnode_runtime_exit_test PRIVATE -Wall -Wextra -Wpedantic)
-    add_test(
-        NAME cnode_structured_shutdown_test
-        COMMAND cnode_runtime_exit_test
-            $<TARGET_FILE:cnode>
-            ${CMAKE_CURRENT_BINARY_DIR}/structured_shutdown_test)
-    set_tests_properties(cnode_structured_shutdown_test PROPERTIES TIMEOUT 15)
-
-    add_test(
-        NAME cnode_static_inbound_startup_test
-        COMMAND cnode_runtime_exit_test
-            $<TARGET_FILE:cnode>
-            ${CMAKE_CURRENT_BINARY_DIR}/runtime_startup_failure_test
-            startup-failure)
-    set_tests_properties(cnode_static_inbound_startup_test PROPERTIES TIMEOUT 15)
-
-    foreach(startup_case IN ITEMS tag-collision port-collision coexist implicit)
-        string(REPLACE "-" "_" startup_test "${startup_case}")
-        add_test(NAME cnode_test_mode_${startup_test}_test
-            COMMAND cnode_runtime_exit_test
-                $<TARGET_FILE:cnode>
-                ${CMAKE_CURRENT_BINARY_DIR}/test_mode_${startup_test}_test
-                test-mode-${startup_case})
-        set_tests_properties(cnode_test_mode_${startup_test}_test PROPERTIES
-            TIMEOUT 30 RESOURCE_LOCK builtin_test_port)
-    endforeach()
-
-    foreach(PANEL_HTTP_CASE IN ITEMS replay fallback timeout)
-        add_test(
-            NAME cnode_panel_http_${PANEL_HTTP_CASE}_test
-            COMMAND cnode_runtime_exit_test
-                $<TARGET_FILE:cnode>
-                ${CMAKE_CURRENT_BINARY_DIR}/panel_http_${PANEL_HTTP_CASE}_test
-                panel-${PANEL_HTTP_CASE})
-        set_tests_properties(cnode_panel_http_${PANEL_HTTP_CASE}_test PROPERTIES
-            TIMEOUT 30)
-    endforeach()
-
-    add_test(NAME cnode_panel_heartbeat_test
-        COMMAND cnode_runtime_exit_test
-            $<TARGET_FILE:cnode>
-            ${CMAKE_CURRENT_BINARY_DIR}/panel_heartbeat_test
-            panel-heartbeat)
-    set_tests_properties(cnode_panel_heartbeat_test PROPERTIES
-        TIMEOUT 90)
-
-    add_test(NAME cnode_panel_lifecycle_test
-        COMMAND cnode_runtime_exit_test
-            $<TARGET_FILE:cnode>
-            ${CMAKE_CURRENT_BINARY_DIR}/panel_lifecycle_test
-            panel-lifecycle)
-    set_tests_properties(cnode_panel_lifecycle_test PROPERTIES
-        TIMEOUT 110)
-
-    add_test(NAME cnode_panel_collision_test
-        COMMAND cnode_runtime_exit_test
-            $<TARGET_FILE:cnode>
-            ${CMAKE_CURRENT_BINARY_DIR}/panel_collision_test
-            panel-collision)
-    set_tests_properties(cnode_panel_collision_test PROPERTIES
-        TIMEOUT 30)
-
-    foreach(collision_mode IN ITEMS collision-race static-collision)
-        string(REPLACE "-" "_" collision_test "${collision_mode}")
-        add_test(NAME cnode_panel_${collision_test}_test
-            COMMAND cnode_runtime_exit_test
-                $<TARGET_FILE:cnode>
-                ${CMAKE_CURRENT_BINARY_DIR}/panel_${collision_test}_test
-                panel-${collision_mode})
-        set_tests_properties(cnode_panel_${collision_test}_test PROPERTIES
-            TIMEOUT 30)
-    endforeach()
-
-    add_executable(cnode_protocol_registration_test
-        tests/protocol_registration_test.cpp
-        src/app/proxyman/inbound/factory.cpp
-        src/app/proxyman/inbound/user_store.cpp
-        src/app/proxyman/outbound/factory.cpp
-        src/transport/internet/outbound_bind.cpp
-        src/infra/json.cpp
-    )
-    target_include_directories(cnode_protocol_registration_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/app/proxyman/outbound
-    )
-    target_link_libraries(cnode_protocol_registration_test PRIVATE
-        asio::asio
-        Threads::Threads
-        crypto
-    )
-    target_compile_options(cnode_protocol_registration_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_protocol_registration_test
-        COMMAND cnode_protocol_registration_test)
-
-    add_executable(cnode_user_store_typed_payload_test
-        tests/user_store_typed_payload_test.cpp
-        src/app/proxyman/inbound/user_store.cpp
-    )
-    target_include_directories(cnode_user_store_typed_payload_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-    target_link_libraries(cnode_user_store_typed_payload_test PRIVATE
-        Threads::Threads
-        crypto
-    )
-    target_compile_options(cnode_user_store_typed_payload_test PRIVATE
-        -Wall -Wextra -Wpedantic
-    )
-    add_test(
-        NAME cnode_user_store_typed_payload_test
-        COMMAND cnode_user_store_typed_payload_test)
-
-    add_executable(cnode_user_store_batch_test
-        tests/user_store_batch_test.cpp
-        src/app/proxyman/inbound/user_store.cpp)
-    target_include_directories(cnode_user_store_batch_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    target_link_libraries(cnode_user_store_batch_test PRIVATE Threads::Threads crypto)
-    target_compile_options(cnode_user_store_batch_test PRIVATE
-        -Wall -Wextra -Wpedantic)
-    add_test(NAME cnode_user_store_batch_test COMMAND cnode_user_store_batch_test)
-
-    add_executable(cnode_startup_inbounds_test
-        tests/startup_inbounds_test.cpp
-        src/app/startup_inbounds.cpp
-        src/app/prepared_inbound.cpp
-        src/app/proxyman/inbound/factory.cpp
-        src/app/proxyman/inbound/user_store.cpp
-        src/infra/config_semantics.cpp
-        src/transport/internet/inbound_listen.cpp)
-    target_include_directories(cnode_startup_inbounds_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/app)
-    target_link_libraries(cnode_startup_inbounds_test PRIVATE asio::asio Threads::Threads crypto)
-    target_compile_options(cnode_startup_inbounds_test PRIVATE
-        -Wall -Wextra -Wpedantic)
-    add_test(NAME cnode_startup_inbounds_test COMMAND cnode_startup_inbounds_test)
-
-    find_package(Python3 REQUIRED COMPONENTS Interpreter)
-    if(Python3_Interpreter_FOUND)
-        add_custom_target(anytls_reference_prepare
-            COMMAND ${Python3_EXECUTABLE}
-                ${CMAKE_CURRENT_SOURCE_DIR}/tests/anytls_reference_integration.py
-                prepare --workspace ${CMAKE_CURRENT_BINARY_DIR}/anytls-reference --download
-            USES_TERMINAL)
-        add_custom_target(anytls_reference_integration
-            COMMAND ${Python3_EXECUTABLE}
-                ${CMAKE_CURRENT_SOURCE_DIR}/tests/anytls_reference_integration.py
-                run --workspace ${CMAKE_CURRENT_BINARY_DIR}/anytls-reference
-                --binary $<TARGET_FILE:cnode>
-                --output ${CMAKE_CURRENT_BINARY_DIR}/anytls-integration
-            DEPENDS cnode
-            USES_TERMINAL)
-        add_test(NAME cnode_xhttp_worker_migration_integration_test
-            COMMAND ${Python3_EXECUTABLE}
-                ${CMAKE_CURRENT_SOURCE_DIR}/tests/xhttp_worker_migration_integration.py
-                --binary $<TARGET_FILE:cnode>
-                --output ${CMAKE_CURRENT_BINARY_DIR}/xhttp_worker_migration_integration_test)
-        set_tests_properties(cnode_xhttp_worker_migration_integration_test PROPERTIES TIMEOUT 180)
-        add_test(NAME cnode_panel_user_sync_integration_test
-            COMMAND ${Python3_EXECUTABLE}
-                ${CMAKE_CURRENT_SOURCE_DIR}/tests/panel_user_sync_integration.py
-                --binary $<TARGET_FILE:cnode>
-                --output ${CMAKE_CURRENT_BINARY_DIR}/panel_user_sync_integration_test)
-        set_tests_properties(cnode_panel_user_sync_integration_test PROPERTIES TIMEOUT 120)
-        add_test(NAME cnode_panel_integrity_integration_test
-            COMMAND ${Python3_EXECUTABLE}
-                ${CMAKE_CURRENT_SOURCE_DIR}/tests/panel_integrity_integration.py
-                --binary $<TARGET_FILE:cnode>
-                --root ${CMAKE_CURRENT_BINARY_DIR}/panel_integrity_integration_test)
-        set_tests_properties(cnode_panel_integrity_integration_test PROPERTIES TIMEOUT 120)
-        add_test(NAME cnode_udp_relay_integration_test
-            COMMAND ${Python3_EXECUTABLE}
-                ${CMAKE_CURRENT_SOURCE_DIR}/tests/udp_relay_integration.py
-                --binary $<TARGET_FILE:cnode>
-                --output ${CMAKE_CURRENT_BINARY_DIR}/udp_relay_integration_test)
-        set_tests_properties(cnode_udp_relay_integration_test PROPERTIES TIMEOUT 90)
-        foreach(integration IN ITEMS dns_endpoint tls_cancellation http_upgrade grpc_eof grpc_substream logical_transport_deadline reality
-                initial_payload ip_literal substream_cancellation grpc_hunk http2_server_errors proxy_protocol tls_autosign)
-            add_test(NAME cnode_${integration}_integration_test
-                COMMAND ${Python3_EXECUTABLE}
-                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/${integration}_integration.py
-                    --binary $<TARGET_FILE:cnode>
-                    --output ${CMAKE_CURRENT_BINARY_DIR}/${integration}_integration_test)
-            set_tests_properties(cnode_${integration}_integration_test PROPERTIES TIMEOUT 40)
-        endforeach()
-        set_tests_properties(cnode_grpc_eof_integration_test
-            cnode_grpc_substream_integration_test
-            cnode_logical_transport_deadline_integration_test
-            cnode_initial_payload_integration_test
-            cnode_ip_literal_integration_test
-            cnode_substream_cancellation_integration_test
-            cnode_grpc_hunk_integration_test PROPERTIES TIMEOUT 90)
-        set_tests_properties(cnode_http2_server_errors_integration_test PROPERTIES TIMEOUT 150)
-        add_test(NAME cnode_tls_cancellation_partial_integration_test
-            COMMAND ${Python3_EXECUTABLE}
-                ${CMAKE_CURRENT_SOURCE_DIR}/tests/tls_cancellation_integration.py
-                --binary $<TARGET_FILE:cnode>
-                --output ${CMAKE_CURRENT_BINARY_DIR}/tls_cancellation_partial_integration_test
-                --partial-record)
-        set_tests_properties(cnode_tls_cancellation_partial_integration_test PROPERTIES TIMEOUT 40)
-        add_test(NAME cnode_tls_coalesced_records_integration_test
-            COMMAND ${Python3_EXECUTABLE}
-                ${CMAKE_CURRENT_SOURCE_DIR}/tests/tls_coalesced_records_integration.py
-                --binary $<TARGET_FILE:cnode>
-                --output ${CMAKE_CURRENT_BINARY_DIR}/tls_coalesced_records_integration_test)
-        set_tests_properties(cnode_tls_coalesced_records_integration_test PROPERTIES TIMEOUT 35)
-        add_test(NAME cnode_tls_idle_write_integration_test
-            COMMAND ${Python3_EXECUTABLE}
-                ${CMAKE_CURRENT_SOURCE_DIR}/tests/tls_idle_write_integration.py
-                --binary $<TARGET_FILE:cnode>
-                --output ${CMAKE_CURRENT_BINARY_DIR}/tls_idle_write_integration_test)
-        set_tests_properties(cnode_tls_idle_write_integration_test PROPERTIES TIMEOUT 45)
-        foreach(mode IN ITEMS idle idle_partial)
-            set(extra_args)
-            if(mode STREQUAL "idle_partial")
-                set(extra_args --partial-record --resume-record)
-            endif()
-            add_test(NAME cnode_tls_${mode}_integration_test
-                COMMAND ${Python3_EXECUTABLE}
-                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/tls_cancellation_integration.py
-                    --binary $<TARGET_FILE:cnode>
-                    --output ${CMAKE_CURRENT_BINARY_DIR}/tls_${mode}_integration_test
-                    --idle-seconds 12 ${extra_args})
-            set_tests_properties(cnode_tls_${mode}_integration_test PROPERTIES TIMEOUT 40)
-        endforeach()
-        add_test(
-            NAME cnode_static_inbound_outbound_integration_test
-            COMMAND ${Python3_EXECUTABLE}
-                ${CMAKE_CURRENT_SOURCE_DIR}/tests/static_inbound_outbound_integration.py
-                --binary $<TARGET_FILE:cnode>
-                --output ${CMAKE_CURRENT_BINARY_DIR}/static_inbound_outbound_integration_test)
-        set_tests_properties(cnode_static_inbound_outbound_integration_test PROPERTIES TIMEOUT 40)
-        add_test(
-            NAME cnode_vmess_inbound_handshake_integration_test
-            COMMAND ${Python3_EXECUTABLE}
-                ${CMAKE_CURRENT_SOURCE_DIR}/tests/vmess_inbound_handshake_integration.py
-                --binary $<TARGET_FILE:cnode>
-                --output ${CMAKE_CURRENT_BINARY_DIR}/vmess_inbound_handshake_integration_test)
-        set_tests_properties(cnode_vmess_inbound_handshake_integration_test PROPERTIES TIMEOUT 45)
-        add_test(
-            NAME cnode_outbound_bind_integration_test
-            COMMAND ${Python3_EXECUTABLE}
-                ${CMAKE_CURRENT_SOURCE_DIR}/tests/outbound_bind_integration.py
-                --binary $<TARGET_FILE:cnode>
-                --output ${CMAKE_CURRENT_BINARY_DIR}/outbound_bind_integration_test)
-        set_tests_properties(cnode_outbound_bind_integration_test PROPERTIES TIMEOUT 95)
+    if(NOT TEST_TIMEOUT)
+        set(TEST_TIMEOUT 90)
     endif()
+    set(target cnode_${name}_test)
+    add_executable(${target} EXCLUDE_FROM_ALL tests/${name}_test.cpp ${TEST_SOURCES})
+    target_link_libraries(${target} PRIVATE ${TEST_LIBRARY} GTest::gtest_main)
+    target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    foreach(directory IN LISTS TEST_INCLUDES)
+        target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/${directory})
+    endforeach()
+    target_compile_options(${target} PRIVATE -UNDEBUG -Wno-mismatched-new-delete)
+    add_dependencies(cnode_tests ${target})
+    gtest_discover_tests(${target} DISCOVERY_MODE PRE_TEST
+        TEST_PREFIX "${name}." PROPERTIES LABELS unit TIMEOUT ${TEST_TIMEOUT})
+endfunction()
 
-    add_executable(cnode_stream_settings_test
-        tests/stream_settings_test.cpp
-        src/transport/internet/stream_settings.cpp)
-    target_include_directories(cnode_stream_settings_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    target_link_libraries(cnode_stream_settings_test PRIVATE asio::asio Threads::Threads)
-    target_compile_options(cnode_stream_settings_test PRIVATE
-        -Wall -Wextra -Wpedantic)
-    add_test(NAME cnode_stream_settings_test COMMAND cnode_stream_settings_test)
+cnode_unit(anytls_codec_errors INCLUDES src/proxy/anytls)
+cnode_unit(anytls_outbound_lifecycle LIBRARY cnode_test_core INCLUDES src/proxy/anytls/outbound)
+cnode_unit(anytls_outbound_settings INCLUDES src/proxy/anytls/outbound)
+cnode_unit(anytls_padding INCLUDES src/proxy/anytls)
+cnode_unit(asio_operation_allocator)
+cnode_unit(async_write_gate INCLUDES src/transport/internet)
+cnode_unit(autosign_cert INCLUDES src/transport/internet)
+cnode_unit(autosign_context INCLUDES src/transport/internet)
+cnode_unit(awaitable_batch LIBRARY cnode_build_options SOURCES src/common/awaitable_batch.cpp INCLUDES src/common)
+cnode_unit(awaitable_task_group LIBRARY cnode_build_options INCLUDES src/common)
+cnode_unit(ban_tracking_contract)
+cnode_unit(buffer_ownership)
+cnode_unit(cancellation_source)
+cnode_unit(config_semantics INCLUDES src/infra)
+cnode_unit(connection_timeouts)
+cnode_unit(datagram_socket)
+cnode_unit(dispatcher_cancellation)
+cnode_unit(dns_cache)
+cnode_unit(dns_datagram)
+cnode_unit(dns_inflight)
+cnode_unit(domain_name)
+cnode_unit(geodata)
+cnode_unit(grpc_hunk INCLUDES src/transport/internet)
+cnode_unit(handler_registry)
+cnode_unit(http2_flow_control)
+cnode_unit(http2_initial_window INCLUDES src/infra src/transport/internet)
+cnode_unit(http2_receive_credit)
+cnode_unit(http2_server_errors)
+cnode_unit(http_handshake_read_ahead LIBRARY cnode_test_core)
+cnode_unit(http_path_match INCLUDES src/transport/internet)
+cnode_unit(http_sniffer)
+cnode_unit(hysteria_protocol INCLUDES src/transport/internet/hysteria)
+cnode_unit(inbound_listen INCLUDES src/app)
+cnode_unit(inbound_process_errors INCLUDES src/proxy/anytls)
+cnode_unit(inbound_tls_policy INCLUDES src/service/controller)
+cnode_unit(ip_address)
+cnode_unit(json_field)
+cnode_unit(json_object)
+cnode_unit(log_format)
+cnode_unit(monitor_loop)
+cnode_unit(mux_codec INCLUDES src/proxy/mux/inbound)
+cnode_unit(native_socket_handoff)
+cnode_unit(node_transaction INCLUDES src/service/controller)
+cnode_unit(node_transition INCLUDES src/service/controller)
+cnode_unit(online_snapshot INCLUDES src/service/controller)
+cnode_unit(outbound_bind)
+cnode_unit(outbound_selection)
+cnode_unit(panel_node_ids)
+cnode_unit(panel_schedule INCLUDES src/service/controller)
+cnode_unit(phase_deadline)
+cnode_unit(process_resources)
+cnode_unit(protocol_registration LIBRARY "$<LINK_LIBRARY:WHOLE_ARCHIVE,cnode_core>" INCLUDES src/app/proxyman/outbound)
+cnode_unit(proxy_protocol_literal)
+cnode_unit(quic_directory INCLUDES src/transport/internet/hysteria)
+cnode_unit(quic_sniffer)
+cnode_unit(reality_client_hello INCLUDES src/transport/internet)
+cnode_unit(reality_client_version)
+cnode_unit(reality_key_share INCLUDES src/transport/internet)
+cnode_unit(reality_key)
+cnode_unit(reality_server_name)
+cnode_unit(reality_short_id)
+cnode_unit(relay_initial_payload LIBRARY cnode_test_core)
+cnode_unit(router)
+cnode_unit(routing_ip_network)
+cnode_unit(rule_lifecycle)
+cnode_unit(session_access_log)
+cnode_unit(session_group_executor)
+cnode_unit(shadowsocks_stream_crypto LIBRARY cnode_build_options SOURCES src/proxy/shadowsocks/shadowsocks_protocol.cpp INCLUDES src/proxy/shadowsocks)
+cnode_unit(shadowsocks_udp_datagram INCLUDES src/proxy/shadowsocks)
+cnode_unit(sniff_config)
+cnode_unit(ss_outbound_credentials INCLUDES src/proxy/shadowsocks)
+cnode_unit(ss_outbound_uot INCLUDES src/proxy/shadowsocks/outbound)
+cnode_unit(ss_udp_request)
+cnode_unit(startup_inbounds INCLUDES src/app)
+cnode_unit(stream_settings)
+cnode_unit(substream_inbound_lifecycle LIBRARY cnode_test_core INCLUDES src/proxy/anytls/inbound src/proxy/mux/inbound)
+cnode_unit(target_address)
+cnode_unit(thread_memory_pool LIBRARY cnode_build_options)
+cnode_unit(timeout_scheduler LIBRARY cnode_build_options SOURCES tests/timeout_scheduler_new.cpp src/transport/internet/timeout_scheduler.cpp src/app/session_group_executor.cpp src/infra/runtime_failure.cpp src/infra/log.cpp)
+cnode_unit(tls_client_certificate INCLUDES src/transport/internet)
+cnode_unit(tls_record_buffer LIBRARY cnode_test_core)
+cnode_unit(tls_sniffer)
+cnode_unit(token_bucket)
+cnode_unit(traffic_journal)
+cnode_unit(trojan_request INCLUDES src/proxy/trojan)
+cnode_unit(trojan_udp_framing INCLUDES src/proxy/trojan)
+cnode_unit(udp_association_reclaimer INCLUDES src/app)
+cnode_unit(udp_native_lifecycle INCLUDES src/app src/proxy/shadowsocks)
+cnode_unit(udp_request)
+cnode_unit(udp_socket_owner LIBRARY cnode_test_core INCLUDES src/app)
+cnode_unit(uot_ss2022 INCLUDES src/proxy/uot src/proxy/shadowsocks)
+cnode_unit(user_store_batch)
+cnode_unit(user_store_typed_payload)
+cnode_unit(v2board_http_response INCLUDES src/api/v2board)
+cnode_unit(v2board_node_info_json INCLUDES src/api/v2board)
+cnode_unit(v2board_online_report INCLUDES src/api/v2board)
+cnode_unit(v2board_request_task INCLUDES src/api/v2board)
+cnode_unit(v2board_user_list_json INCLUDES src/api/v2board)
+cnode_unit(vless_credentials INCLUDES src/proxy/vless)
+cnode_unit(vless_encryption_io INCLUDES src/proxy/vless)
+cnode_unit(vless_ticket_service INCLUDES src/proxy/vless)
+cnode_unit(vless_ticket_store INCLUDES src/proxy/vless)
+cnode_unit(vless_udp_framing INCLUDES src/proxy/vless)
+cnode_unit(vless_vision INCLUDES src/proxy/vless)
+cnode_unit(vmess_auth_snapshot INCLUDES src/proxy/vmess)
+cnode_unit(vmess_cipher LIBRARY cnode_build_options SOURCES src/proxy/vmess/vmess_cipher.cpp src/proxy/vmess/vmess_crypto.cpp INCLUDES src/proxy/vmess)
+cnode_unit(vmess_udp_datagram INCLUDES src/proxy/vmess)
+cnode_unit(worker_connection_limit_runtime)
+cnode_unit(worker_mailbox)
+cnode_unit(worker_runtime_contract)
+cnode_unit(worker_udp_retirement_runtime LIBRARY "$<LINK_LIBRARY:WHOLE_ARCHIVE,cnode_core>")
+cnode_unit(xhttp_http1)
+cnode_unit(xhttp_packet_queue INCLUDES src/transport/internet)
+cnode_unit(xhttp_packet_session_key INCLUDES src/transport/internet)
+cnode_unit(xhttp_session_lifecycle INCLUDES src/transport/internet)
+cnode_unit(xhttp_upload_stream_slot INCLUDES src/transport/internet)
 
-    add_test(
-        NAME cnode_invalid_config_sources_test
-        COMMAND ${CMAKE_COMMAND}
-            "-DCNODE_EXE=$<TARGET_FILE:cnode>"
-            "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/invalid_config_sources_test"
-            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/invalid_config_sources_test.cmake)
-    set_tests_properties(cnode_invalid_config_sources_test PROPERTIES RESOURCE_LOCK builtin_test_port)
+# Small isolated seams do not pull production objects compiled with other macros.
+target_compile_definitions(cnode_thread_memory_pool_test PRIVATE
+    CNODE_MEMORY_STATS CNODE_TEST_ALLOCATOR_FAULT)
+target_compile_definitions(cnode_awaitable_batch_test PRIVATE
+    ASIO_DISABLE_AWAITABLE_FRAME_RECYCLING)
+target_compile_definitions(cnode_awaitable_task_group_test PRIVATE
+    ASIO_DISABLE_AWAITABLE_FRAME_RECYCLING CNODE_MEMORY_STATS)
+target_compile_options(cnode_awaitable_task_group_test PRIVATE
+    "-include${CMAKE_CURRENT_SOURCE_DIR}/tests/async_allocation_fault.hpp")
+target_compile_options(cnode_timeout_scheduler_test PRIVATE
+    "-include${CMAKE_CURRENT_SOURCE_DIR}/tests/timeout_scheduler_allocation.hpp")
+foreach(target IN ITEMS cnode_http_handshake_read_ahead_test cnode_tls_record_buffer_test)
+    target_compile_definitions(${target} PRIVATE ACPP_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+endforeach()
 
-    include(cmake/test_suite.cmake)
-endif()
+# Keep EVP allocation/error injection visible to the linker, including Release.
+foreach(target IN ITEMS cnode_vmess_cipher_test cnode_shadowsocks_stream_crypto_test)
+    set_target_properties(${target} PROPERTIES
+        INTERPROCEDURAL_OPTIMIZATION OFF INTERPROCEDURAL_OPTIMIZATION_RELEASE OFF)
+endforeach()
+target_compile_definitions(cnode_vmess_cipher_test PRIVATE CNODE_TEST_CRYPTO_FAULT)
+target_link_options(cnode_vmess_cipher_test PRIVATE
+    -Wl,--wrap=EVP_MD_CTX_new -Wl,--wrap=EVP_AEAD_CTX_new -Wl,--wrap=EVP_DigestSqueeze)
+target_compile_definitions(cnode_shadowsocks_stream_crypto_test PRIVATE
+    CNODE_TEST_ALLOCATOR_FAULT CNODE_WRAP_MALLOC)
+target_link_options(cnode_shadowsocks_stream_crypto_test PRIVATE
+    -Wl,--wrap=malloc -Wl,--wrap=EVP_AEAD_CTX_new)
 
-# Every project executable consumes the same C++20 result type, including
-# standalone regression targets that do not link the networking dependencies.
-get_property(cnode_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
-foreach(target IN LISTS cnode_targets)
-    get_target_property(target_type ${target} TYPE)
-    if(target_type STREQUAL "EXECUTABLE" AND target MATCHES "^cnode($|_)")
-        target_link_libraries(${target} PRIVATE tl::expected)
-        # Transport and ticket runtimes use the same session-domain executor in
-        # standalone tests. Compile it with each target's allocator/sanitizer
-        # settings rather than mixing an uninstrumented shared implementation.
-        get_target_property(target_sources ${target} SOURCES)
-        if(target_sources MATCHES "(timeout_scheduler|tcp_stream|session_group_executor|vless_ticket_service|dns|sharded_user_stats|validator)\\.cpp")
-            foreach(domain_source IN ITEMS src/app/session_group_executor.cpp
-                    src/infra/runtime_failure.cpp src/infra/log.cpp)
-                if(NOT domain_source IN_LIST target_sources)
-                    target_sources(${target} PRIVATE ${domain_source})
-                endif()
-            endforeach()
-            target_include_directories(${target} PRIVATE ${concurrentqueue_SOURCE_DIR})
-            target_link_libraries(${target} PRIVATE asio::asio Threads::Threads cnode_zlib)
-        endif()
-        if(NOT target MATCHES "_sanitized$")
-            target_compile_definitions(${target} PRIVATE CNODE_USE_MIMALLOC)
-            target_include_directories(${target} SYSTEM PRIVATE ${mimalloc_SOURCE_DIR}/include)
-            target_link_libraries(${target} PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,mimalloc-static>")
-            if(target MATCHES "^cnode_")
-                target_link_options(${target} PRIVATE -Wl,--allow-multiple-definition)
-            endif()
-        endif()
+# Independent wire peers exercise the real cnode process, not its core archive.
+find_package(nlohmann_json CONFIG REQUIRED)
+find_package(unofficial-sodium CONFIG REQUIRED)
+add_library(cnode_e2e_support STATIC EXCLUDE_FROM_ALL tests/e2e/support.cpp)
+target_link_libraries(cnode_e2e_support PUBLIC
+    cnode_build_options GTest::gtest nlohmann_json::nlohmann_json)
+target_include_directories(cnode_e2e_support PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e)
+target_compile_definitions(cnode_e2e_support PUBLIC
+    CNODE_TEST_BINARY="$<TARGET_FILE:cnode>"
+    CNODE_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_options(cnode_e2e_support PRIVATE -UNDEBUG)
+
+function(cnode_e2e name source)
+    set(target cnode_e2e_${name})
+    add_executable(${target} EXCLUDE_FROM_ALL "${source}")
+    target_link_libraries(${target} PRIVATE cnode_e2e_support GTest::gtest_main)
+    target_compile_options(${target} PRIVATE -UNDEBUG)
+    add_dependencies(${target} cnode)
+    add_dependencies(cnode_tests ${target})
+    set(timeout 180)
+    if((name MATCHES "^http2_" AND NOT name STREQUAL "http2_deadline")
+            OR name STREQUAL "reference_hysteria")
+        set(timeout 600)
+    elseif(name STREQUAL "config_panel_config")
+        set(timeout 300)
+    endif()
+    gtest_discover_tests(${target} DISCOVERY_MODE PRE_TEST
+        TEST_PREFIX "e2e.${name}." PROPERTIES LABELS e2e TIMEOUT ${timeout})
+endfunction()
+
+file(GLOB e2e_sources CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e/*.cpp")
+list(FILTER e2e_sources EXCLUDE REGEX "/(support|reference_[^/]+|anytls_sessions_reference)\\.cpp$")
+foreach(source IN LISTS e2e_sources)
+    get_filename_component(name "${source}" NAME_WE)
+    cnode_e2e("${name}" "${source}")
+    if(name MATCHES "^udp_")
+        target_link_libraries(cnode_e2e_${name} PRIVATE unofficial-sodium::sodium)
+    elseif(name STREQUAL "config_panel_failure")
+        target_sources(cnode_e2e_${name} PRIVATE src/infra/runtime_failure.cpp)
+    elseif(name STREQUAL "config_panel_integrity")
+        target_compile_definitions(cnode_e2e_${name} PRIVATE
+            CNODE_TEST_JOURNAL_BINARY="$<TARGET_FILE:cnode_traffic_journal>")
+        add_dependencies(cnode_e2e_${name} cnode_traffic_journal)
     endif()
 endforeach()
-# ============================================================================
-# 打印配置摘要
-# ============================================================================
-message(STATUS "")
-message(STATUS "=== cnode Build Configuration ===")
-message(STATUS "  Version:      ${PROJECT_VERSION}")
-message(STATUS "  Build Type:   ${CNODE_BUILD_TYPE_SUMMARY}")
-message(STATUS "  Build Channel: ${CNODE_BUILD_CHANNEL_SUMMARY}")
-message(STATUS "  C++ Standard: ${CMAKE_CXX_STANDARD}")
-message(STATUS "  Compiler:     ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
-message(STATUS "  Network:      standalone Asio")
-message(STATUS "  Crypto:       AWS-LC")
-message(STATUS "  I/O Backend:  ${CNODE_IO_BACKEND_SUMMARY}")
-if(CNODE_IO_URING)
-    message(STATUS "  liburing:     ${CNODE_LIBURING_TAG} (FetchContent, static)")
-endif()
-message(STATUS "  Allocator:    ${CNODE_ALLOCATOR_SUMMARY}")
-message(STATUS "  MemoryStats:  ${CNODE_MEMORY_STATS}")
-message(STATUS "  DebugSymbols: ${CNODE_RELEASE_DEBUG_SYMBOLS_SUMMARY}")
-message(STATUS "  FramePointer: ${CNODE_RELEASE_FRAME_POINTERS_SUMMARY}")
-message(STATUS "  LTO:          ${CNODE_LTO_SUMMARY}")
-message(STATUS "")
+
+# Reference binaries are explicit local inputs; configuration never downloads them.
+set(CNODE_REFERENCE_GO "" CACHE FILEPATH "Go executable for reference provenance checks")
+set(CNODE_REFERENCE_XRAY "" CACHE FILEPATH "Pinned Xray reference executable")
+set(CNODE_REFERENCE_ANYTLS_CLIENT "" CACHE FILEPATH "Pinned AnyTLS reference client")
+set(CNODE_REFERENCE_ANYTLS_SERVER "" CACHE FILEPATH "Pinned AnyTLS reference server")
+set(CNODE_REFERENCE_HYSTERIA1 "" CACHE FILEPATH "Pinned Hysteria v1 reference executable")
+set(CNODE_REFERENCE_HYSTERIA2 "" CACHE FILEPATH "Pinned Hysteria v2 reference executable")
+foreach(group IN ITEMS xray anytls hysteria)
+    if(group STREQUAL "xray")
+        set(references CNODE_REFERENCE_XRAY)
+    elseif(group STREQUAL "anytls")
+        set(references CNODE_REFERENCE_ANYTLS_CLIENT CNODE_REFERENCE_ANYTLS_SERVER)
+    else()
+        set(references)
+        foreach(reference IN ITEMS CNODE_REFERENCE_HYSTERIA1 CNODE_REFERENCE_HYSTERIA2)
+            if(NOT "${${reference}}" STREQUAL "")
+                list(APPEND references ${reference})
+            endif()
+        endforeach()
+    endif()
+    set(enabled OFF)
+    foreach(reference IN LISTS references)
+        if(NOT "${${reference}}" STREQUAL "")
+            set(enabled ON)
+        endif()
+    endforeach()
+    if(NOT enabled)
+        continue()
+    endif()
+    list(APPEND references CNODE_REFERENCE_GO)
+    foreach(reference IN LISTS references)
+        if(NOT EXISTS "${${reference}}" OR IS_DIRECTORY "${${reference}}")
+            message(FATAL_ERROR "${reference} must name an existing executable for ${group} E2E")
+        endif()
+    endforeach()
+    cnode_e2e(reference_${group} "${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e/reference_${group}.cpp")
+    foreach(reference IN LISTS references)
+        target_compile_definitions(cnode_e2e_reference_${group} PRIVATE
+            ${reference}="${${reference}}")
+    endforeach()
+    if(group STREQUAL "anytls")
+        cnode_e2e(anytls_reference_padding_frame
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e/anytls_padding_frame.cpp")
+        target_compile_definitions(cnode_e2e_anytls_reference_padding_frame PRIVATE
+            CNODE_REFERENCE_ANYTLS_CLIENT="${CNODE_REFERENCE_ANYTLS_CLIENT}"
+            CNODE_REFERENCE_GO="${CNODE_REFERENCE_GO}")
+        cnode_e2e(anytls_sessions_reference
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e/anytls_sessions_reference.cpp")
+        target_compile_definitions(cnode_e2e_anytls_sessions_reference PRIVATE
+            CNODE_REFERENCE_GO="${CNODE_REFERENCE_GO}"
+            CNODE_REFERENCE_ANYTLS_CLIENT="${CNODE_REFERENCE_ANYTLS_CLIENT}"
+            CNODE_REFERENCE_ANYTLS_SERVER="${CNODE_REFERENCE_ANYTLS_SERVER}")
+    endif()
+endforeach()

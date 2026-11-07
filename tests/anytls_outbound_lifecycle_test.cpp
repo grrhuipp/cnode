@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "anytls_outbound.hpp"
 #include "../anytls_codec.hpp"
 #include "acppnode/app/dns/dns_worker.hpp"
@@ -494,13 +496,6 @@ public:
 // Only the external dial boundary is replaced. The production target builder,
 // Handler, codec, session pool, logical endpoint and relay execute unchanged.
 namespace acpp {
-TransportSecurity::TransportSecurity(const StreamSettings& settings, StreamEndpointRole) {
-    if (settings.IsTlsLike()) throw std::logic_error("unexpected TLS outbound");
-}
-TransportSecurity::~TransportSecurity() = default;
-void TransportSecurity::Prepare(StreamSettings& settings, StreamEndpointRole role) {
-    settings.prepared_security = std::make_shared<TransportSecurity>(settings, role);
-}
 
 net::awaitable<DialResult> DialOutboundTransport(net::io_context& io, session::Context&,
                                                 const OutboundTransportTarget&) {
@@ -1559,7 +1554,7 @@ bool RunNativePoolMigration() {
 }
 }
 
-int main(int argc, char** argv) {
+TEST(AnytlsOutboundLifecycle, Contract) {
     FailingPmrResource resource(std::pmr::get_default_resource());
     auto* original = std::pmr::set_default_resource(&resource);
     struct RestoreResource {
@@ -1567,28 +1562,12 @@ int main(int argc, char** argv) {
         ~RestoreResource() { std::pmr::set_default_resource(original); }
     } restore{original};
     try {
-        if (argc == 2 && std::string_view(argv[1]) == "--client-padding")
-            return RunClientPadding() ? 0 : 1;
-        if (argc == 2 && std::string_view(argv[1]) == "--native-pool-migration")
-            return RunNativePoolMigration() ? 0 : 1;
-        if (argc == 2 && std::string_view(argv[1]) == "--queue-baseline") {
-            bool passed = RunQueue(0, 1, true);
-            passed &= RunQueue(1, 1, true);
-            return passed ? 0 : 1;
-        }
-        if (argc == 2 && std::string_view(argv[1]) == "--open-order") {
-            bool passed = true;
-            for (int mode = 0; mode < 9; ++mode)
-                for (bool before : {false, true})
-                    if (!before || (mode != 6 && mode != 7)) passed &= RunOpenOrder(mode, before);
-            return passed ? 0 : 1;
-        }
         bool passed = RunClientPadding();
         passed &= RunNativePoolMigration();
         for (int mode = 0; mode < 9; ++mode)
             for (bool before : {false, true})
                 if (!before || (mode != 6 && mode != 7)) passed &= RunOpenOrder(mode, before);
-        for (int mode = 0; mode < 4; ++mode) passed &= Run(mode);
+        for (int mode = 0; mode < 4; ++mode) passed &= ::Run(mode);
         passed &= RunPoolLifecycle(false);
         passed &= RunPoolLifecycle(true);
         passed &= RunDomainPoolIsolation();
@@ -1598,11 +1577,11 @@ int main(int argc, char** argv) {
         for (unsigned seed = 1; seed <= 16; ++seed) passed &= RunQueue(8, seed);
         for (int mode = 9; mode <= 12; ++mode) passed &= RunQueue(mode);
         for (int mode = 13; mode <= 15; ++mode) passed &= RunQueue(mode);
-        return passed ? 0 : 1;
+        { ASSERT_TRUE(passed); return; }
     } catch (const std::exception& error) {
         fail_next_allocation = false;
         fail_next_pmr_allocation = false;
         std::fprintf(stderr, "fixture failure: %s\n", error.what());
-        return 1;
+        FAIL() << error.what();
     }
 }

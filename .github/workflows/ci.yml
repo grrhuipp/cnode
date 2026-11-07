@@ -4,251 +4,161 @@ on:
   workflow_dispatch:
   push:
     branches: [master, main]
-    paths:
+    paths: &build-paths
       - '.github/workflows/ci.yml'
-      - '.gitignore'
+      - 'mise.toml'
+      - 'vcpkg.json'
       - 'CMakeLists.txt'
+      - 'CMakePresets.json'
       - 'cmake/**'
       - 'README.md'
-      - 'scripts/**/*.sh'
-      - 'src/**/*.cpp'
-      - 'src/**/*.hpp'
-      - 'include/**/*.hpp'
+      - 'scripts/**'
+      - 'src/**'
+      - 'include/**'
+      - 'tools/**'
       - 'tests/**'
   pull_request:
-    paths:
-      - '.github/workflows/ci.yml'
-      - '.gitignore'
-      - 'CMakeLists.txt'
-      - 'cmake/**'
-      - 'README.md'
-      - 'scripts/**/*.sh'
-      - 'src/**/*.cpp'
-      - 'src/**/*.hpp'
-      - 'include/**/*.hpp'
-      - 'tests/**'
+    paths: *build-paths
+
+permissions:
+  contents: read
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   RELEASE_TAG: cnode-latest
 
 jobs:
-  build-metadata:
-    name: Build metadata
-    runs-on: ubuntu-26.04
-    outputs:
-      build_id: ${{ steps.time.outputs.build_id }}
-      release_time: ${{ steps.time.outputs.release_time }}
-    steps:
-      - name: Generate timestamp build id
-        id: time
-        run: |
-          echo "build_id=$(date -u +'%Y%m%dT%H%M%SZ')" >> "$GITHUB_OUTPUT"
-          echo "release_time=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
-
   build:
-    name: Build and test (${{ matrix.libc }})
+    name: musl static / unit / E2E
     runs-on: ubuntu-26.04
-    needs: build-metadata
-    container:
-      image: ${{ matrix.image }}
     defaults:
       run:
         shell: bash
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - libc: musl
-            image: alpine:3.24.4
-            link_flags: -static
-            sanitizers: 'OFF'
-          - libc: glibc
-            # Keep the published glibc ABI baseline independent of dependency upgrades.
-            image: ubuntu:24.04
-            link_flags: ''
-            sanitizers: 'ON'
-    env:
-      BUILD_ID: ${{ needs.build-metadata.outputs.build_id }}
-      BUILD_DIR: build-${{ matrix.libc }}-epoll
-      ASSET_NAME: cnode-linux-amd64-${{ matrix.libc }}
-      CCACHE_DIR: ${{ github.workspace }}/build-${{ matrix.libc }}-epoll/.ccache
-      CCACHE_BASEDIR: ${{ github.workspace }}
-
     steps:
-      - name: Install build tools
-        shell: sh
-        run: |
-          if [ '${{ matrix.libc }}' = musl ]; then
-            apk add --no-cache build-base binutils ccache cmake ninja git curl \
-              zip unzip tar zstd pkgconf linux-headers musl-dev perl nasm python3 py3-pip libsodium bash file ca-certificates openssl
-          else
-            # Keep package manpages: update-alternatives must find its targets.
-            rm -f /etc/dpkg/dpkg.cfg.d/excludes
-            apt-get update
-            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-              build-essential binutils ccache cmake ninja-build git curl \
-              zip unzip tar zstd pkg-config perl nasm file linux-libc-dev python3 python3-venv libsodium23 ca-certificates openssl
-          fi
-
       - uses: actions/checkout@v7.0.1
-
-      - name: Install independent protocol test dependencies
-        run: |
-          python3 -m venv "$BUILD_DIR/test-python"
-          "$BUILD_DIR/test-python/bin/python" -m pip install --only-binary=:all: 'blake3==1.0.11' 'cryptography==50.0.2'
-
-      - name: Restore compiler cache
-        uses: actions/cache/restore@v6.1.0
         with:
-          path: ${{ env.BUILD_DIR }}/.ccache
-          key: ccache-${{ matrix.libc }}-epoll-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: ccache-${{ matrix.libc }}-epoll-${{ runner.os }}-
+          persist-credentials: false
+
+      - name: Install host utilities
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential binutils git curl zip unzip tar xz-utils pkg-config jq file \
+            autoconf autoconf-archive automake libtool perl nasm openssl
+
+      - uses: jdx/mise-action@v5.2.1
+        with:
+          cache: true
+        env:
+          MISE_GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Restore dependency and compiler caches
+        uses: actions/cache@v6.1.0
+        with:
+          path: |
+            build/cache/vcpkg
+            build/cache/ccache
+          key: musl-${{ runner.arch }}-${{ hashFiles('mise.toml', 'vcpkg.json', 'cmake/ports/**', 'cmake/triplets/**', 'cmake/musl.cmake') }}-${{ github.sha }}
+          restore-keys: |
+            musl-${{ runner.arch }}-${{ hashFiles('mise.toml', 'vcpkg.json', 'cmake/ports/**', 'cmake/triplets/**', 'cmake/musl.cmake') }}-
 
       - name: Configure
         run: |
-          mkdir -p "$BUILD_DIR"
-          ccache --zero-stats
-          cmake -S . -B "$BUILD_DIR" -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_SHARED_LIBS=OFF \
-            -DCNODE_BUILD_TESTS=ON \
-            -DPython3_EXECUTABLE="$PWD/$BUILD_DIR/test-python/bin/python" \
-            -DCNODE_TEST_SANITIZERS=${{ matrix.sanitizers }} \
-            -DCNODE_MEMORY_STATS=ON \
-            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_EXE_LINKER_FLAGS="${{ matrix.link_flags }}" \
-            -DBUILD_ID="$BUILD_ID" 2>&1 | tee "$BUILD_DIR/configure.log"
+          set -euo pipefail
+          export BUILD_ID="$(date -u +'%Y%m%dT%H%M%SZ')"
+          echo "BUILD_ID=$BUILD_ID" >> "$GITHUB_ENV"
+          mise run bootstrap
+          mise exec -- cmake --preset musl-tests -DBUILD_ID="$BUILD_ID" -DCNODE_ENABLE_LTO=ON
 
-      - name: Build all tests
+      - name: Build explicit test targets
+        run: mise exec -- cmake --build --preset musl-tests
+
+      - name: Unit tests
+        run: mise exec -- ctest --preset musl-tests --parallel -L '^unit$' --output-junit "$PWD/build/unit-results.xml"
+
+      - name: E2E tests
+        run: mise exec -- ctest --preset musl-tests --parallel -L '^e2e$' --output-junit "$PWD/build/e2e-results.xml"
+
+      - name: Verify and package static ELF
         run: |
-          cmake --build "$BUILD_DIR" --target cnode_tests --parallel "$(nproc)" \
-            2>&1 | tee "$BUILD_DIR/build.log"
-          if grep -Ei '(^|[[:space:]])warning(:|[[:space:]])' "$BUILD_DIR/configure.log" "$BUILD_DIR/build.log"; then
-            echo 'Build warnings must be fixed before publishing.'
+          set -euo pipefail
+          binary=build/musl/cnode
+          file "$binary"
+          if readelf -l "$binary" | grep -q INTERP; then
+            echo 'musl release must have no dynamic interpreter'
             exit 1
           fi
-
-      - name: Test
-        run: |
-          ctest --test-dir "$BUILD_DIR" --no-tests=error --output-on-failure \
-            --parallel "$(nproc)" --output-junit "$PWD/$BUILD_DIR/test-results.xml"
-
-      - name: Preserve failed regression diagnostics
-        if: failure()
-        uses: actions/upload-artifact@v7.0.2
-        with:
-          name: failed-${{ matrix.libc }}-regressions
-          retention-days: 3
-          path: |
-            ${{ env.BUILD_DIR }}/cnode
-            ${{ env.BUILD_DIR }}/configure.log
-            ${{ env.BUILD_DIR }}/build.log
-            ${{ env.BUILD_DIR }}/test-results.xml
-            ${{ env.BUILD_DIR }}/Testing/Temporary/LastTest.log
-            ${{ env.BUILD_DIR }}/*_integration_test/**
-
-      - name: Verify and package
-        run: |
-          file "$BUILD_DIR/cnode"
-          "$BUILD_DIR/cnode" -v
-          if [ '${{ matrix.libc }}' = musl ]; then
-            if readelf -l "$BUILD_DIR/cnode" | grep 'INTERP'; then
-              echo 'The default musl artifact must be static.'
-              exit 1
-            fi
-          else
-            ldd "$BUILD_DIR/cnode"
+          if readelf -d "$binary" | grep -q NEEDED; then
+            echo 'musl release must have no shared-library dependencies'
+            exit 1
           fi
-          mkdir -p release-assets
-          # Never mutate the build/test executable during packaging.
-          cp "$BUILD_DIR/cnode" "release-assets/$ASSET_NAME"
-          objcopy --only-keep-debug "release-assets/$ASSET_NAME" "release-assets/$ASSET_NAME.debug"
-          strip "release-assets/$ASSET_NAME"
-          objcopy --add-gnu-debuglink="release-assets/$ASSET_NAME.debug" "release-assets/$ASSET_NAME"
-          if [ '${{ matrix.libc }}' = musl ]; then
-            cp "release-assets/$ASSET_NAME" release-assets/cnode-linux-amd64
-            cp "release-assets/$ASSET_NAME.debug" release-assets/cnode-linux-amd64.debug
-          fi
-          ls -lh release-assets
+          "$binary" -v
+          mkdir -p build/release
+          cp "$binary" build/release/cnode-linux-amd64-musl
+          objcopy --only-keep-debug build/release/cnode-linux-amd64-musl build/release/cnode-linux-amd64-musl.debug
+          strip build/release/cnode-linux-amd64-musl
+          objcopy --add-gnu-debuglink=build/release/cnode-linux-amd64-musl.debug build/release/cnode-linux-amd64-musl
+          cp build/release/cnode-linux-amd64-musl build/release/cnode-linux-amd64
+          cp build/release/cnode-linux-amd64-musl.debug build/release/cnode-linux-amd64.debug
+          printf 'build_id: %s\ncommit: %s\nvariant: musl+epoll (static)\n' "$BUILD_ID" "$GITHUB_SHA" > build/release/notes.md
 
-      - name: Upload release artifacts
-        uses: actions/upload-artifact@v7.0.2
+      - uses: actions/upload-artifact@v7.0.2
         with:
-          name: cnode-${{ matrix.libc }}-epoll-assets
-          path: release-assets/*
+          name: cnode-musl-assets
+          path: build/release/*
           if-no-files-found: error
           compression-level: 0
 
-      - name: Show compiler cache stats
-        if: always()
-        run: ccache --show-stats
-
-      - name: Save compiler cache
-        if: always()
-        uses: actions/cache/save@v6.1.0
+      - name: Preserve failed diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v7.0.2
         with:
-          path: ${{ env.BUILD_DIR }}/.ccache
-          key: ccache-${{ matrix.libc }}-epoll-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: failed-musl-tests
+          retention-days: 3
+          path: |
+            build/*-results.xml
+            build/musl/Testing/Temporary/LastTest.log
+            build/musl/*_test/**/*.log
+            build/musl/e2e-artifacts/**
+            build/musl/vcpkg-manifest-install.log
 
   publish-release:
     name: Publish GitHub Release
     runs-on: ubuntu-26.04
-    needs: [build-metadata, build]
+    needs: build
     if: github.event_name == 'push'
-    env:
-      BUILD_ID: ${{ needs.build-metadata.outputs.build_id }}
-      RELEASE_TIME: ${{ needs.build-metadata.outputs.release_time }}
     permissions:
       contents: write
       actions: read
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - name: Download release artifacts
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -euo pipefail
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
-            --pattern 'cnode-*-assets' --dir artifact-download
-          mkdir -p release-assets
-          while IFS= read -r -d '' asset; do
-            name="$(basename "$asset")"
-            test ! -e "release-assets/$name" || { echo "Duplicate release asset: $name"; exit 1; }
-            cp -- "$asset" "release-assets/$name"
-          done < <(find artifact-download -type f -print0)
+            --name cnode-musl-assets --dir release-assets
           test -s release-assets/cnode-linux-amd64-musl
-          test -s release-assets/cnode-linux-amd64-glibc
+          test -s release-assets/cnode-linux-amd64
 
       - name: Publish release assets
         run: |
           set -euo pipefail
-          cat > release-notes.md <<EOF
-          branch: ${{ github.ref_name }}
-          build_id: $BUILD_ID
-          release_time: $RELEASE_TIME
-          commit: ${{ github.sha }}
-          variants: musl+epoll, glibc+epoll
-          EOF
-
-          tag_ref="tags/${{ env.RELEASE_TAG }}"
-          if gh api "repos/${{ github.repository }}/git/ref/${tag_ref}" >/dev/null 2>&1; then
-            gh api -X PATCH "repos/${{ github.repository }}/git/refs/${tag_ref}" \
-              -f sha="${{ github.sha }}" -F force=true >/dev/null
+          tag_ref="tags/$RELEASE_TAG"
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/$tag_ref" >/dev/null 2>&1; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/$tag_ref" \
+              -f sha="$GITHUB_SHA" -F force=true >/dev/null
           else
-            gh api -X POST "repos/${{ github.repository }}/git/refs" \
-              -f ref="refs/${tag_ref}" -f sha="${{ github.sha }}" >/dev/null
+            gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref="refs/$tag_ref" -f sha="$GITHUB_SHA" >/dev/null
           fi
-          if gh release view "${{ env.RELEASE_TAG }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            gh release delete "${{ env.RELEASE_TAG }}" --repo "${{ github.repository }}" --yes
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release delete "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --yes
           fi
-          gh release create "${{ env.RELEASE_TAG }}" --repo "${{ github.repository }}" \
-            --target "${{ github.sha }}" --title "${{ env.RELEASE_TAG }}" \
-            --notes-file release-notes.md --latest
-          gh release upload "${{ env.RELEASE_TAG }}" release-assets/* \
-            --repo "${{ github.repository }}" --clobber
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" --title "$RELEASE_TAG" \
+            --notes-file release-assets/notes.md --latest
+          gh release upload "$RELEASE_TAG" release-assets/cnode-linux-* \
+            --repo "$GITHUB_REPOSITORY" --clobber

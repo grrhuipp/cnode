@@ -3,22 +3,14 @@
 #include "acppnode/common/binary_text_codec.hpp"
 
 #include <openssl/err.h>
-#include <openssl/evp.h>
-#include <openssl/crypto.h>
-#include <openssl/nid.h>
+#include <openssl/bytestring.h>
+#include <openssl/mem.h>
+#include <openssl/mldsa.h>
 
 #include <array>
-#include <memory>
 
 namespace acpp::transport::internet {
 namespace {
-
-struct EvpPkeyDeleter {
-    void operator()(EVP_PKEY* key) const noexcept {
-        EVP_PKEY_free(key);
-    }
-};
-using UniquePkey = std::unique_ptr<EVP_PKEY, EvpPkeyDeleter>;
 
 template <std::size_t N>
 tl::expected<std::array<uint8_t, N>, RealityKeyError>
@@ -50,9 +42,10 @@ ParseRealityMldsa65Seed(std::string_view value) noexcept {
     if (!seed) {
         return tl::unexpected(seed.error());
     }
-    UniquePkey pkey(EVP_PKEY_pqdsa_new_raw_private_key(
-        NID_MLDSA65, seed->data(), seed->size()));
-    if (!pkey) {
+    MLDSA65_private_key key;
+    const int valid = MLDSA65_private_key_from_seed(&key, seed->data(), seed->size());
+    OPENSSL_cleanse(&key, sizeof(key));
+    if (valid != 1) {
         OPENSSL_cleanse(seed->data(), seed->size());
         ERR_clear_error();
         return tl::unexpected(RealityKeyError::InvalidFormat);
@@ -66,9 +59,10 @@ ParseRealityMldsa65PublicKey(std::string_view value) noexcept {
     if (!pub) {
         return tl::unexpected(pub.error());
     }
-    UniquePkey pkey(EVP_PKEY_pqdsa_new_raw_public_key(
-        NID_MLDSA65, pub->data(), pub->size()));
-    if (!pkey) {
+    MLDSA65_public_key key;
+    CBS encoded;
+    CBS_init(&encoded, pub->data(), pub->size());
+    if (MLDSA65_parse_public_key(&key, &encoded) != 1) {
         ERR_clear_error();
         return tl::unexpected(RealityKeyError::InvalidFormat);
     }

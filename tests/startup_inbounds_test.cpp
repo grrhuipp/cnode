@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "startup_inbounds.hpp"
 #include "acppnode/app/proxyman/inbound/factory.hpp"
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
@@ -11,11 +13,6 @@
 #include <span>
 #include <stdexcept>
 
-namespace acpp {
-void TransportSecurity::Prepare(StreamSettings& settings, StreamEndpointRole) {
-    if (settings.IsTlsLike()) throw std::logic_error("unexpected TLS in plaintext startup fixture");
-}
-}
 
 namespace {
 using namespace acpp;
@@ -49,7 +46,7 @@ bool Rejected(std::vector<StaticInboundConfig> sources, bool test_mode) {
 }
 }
 
-int main() {
+TEST(StartupInbounds, Contract) {
     // Use the production registry and startup preparation with a narrow fake
     // credential builder. Actual VMess startup is covered by process tests.
     ProxyRegistration registration;
@@ -69,13 +66,13 @@ int main() {
         UserStore::InstallWorkerView(std::move(view));
     }
     const auto old = UserStore::VmessUsers("static-owner").users;
-    if (!Rejected({Source(std::string(constants::test::kTestInboundTag), 12000)}, true) || user_builds != 0 ||
-        !Rejected({Source("static-owner", constants::test::kTestPort)}, true) || user_builds != 0) return 1;
+    ASSERT_FALSE((!Rejected({Source(std::string(constants::test::kTestInboundTag), 12000)}, true) || user_builds != 0 ||
+        !Rejected({Source("static-owner", constants::test::kTestPort)}, true) || user_builds != 0));
 
     const auto prepared = PrepareStartupInbounds({Source("static-owner", 12000)}, true);
-    if (prepared.size() != 2 || prepared[0].receiver.proxy_protocol != ProxyProtocolMode::Auto ||
-        prepared[1].receiver.proxy_protocol != ProxyProtocolMode::Auto) return 6;
-    if (user_builds != 2 || prepared.size() != 2 ||
+    ASSERT_FALSE((prepared.size() != 2 || prepared[0].receiver.proxy_protocol != ProxyProtocolMode::Auto ||
+        prepared[1].receiver.proxy_protocol != ProxyProtocolMode::Auto));
+    ASSERT_FALSE((user_builds != 2 || prepared.size() != 2 ||
         prepared[0].binding.tag != "static-owner" || prepared[0].build_request.tag != "static-owner" ||
         prepared[1].binding.tag != constants::test::kTestInboundTag ||
         prepared[1].build_request.tag != constants::test::kTestInboundTag ||
@@ -87,12 +84,12 @@ int main() {
         !prepared[1].receiver.dispatch_policy.sniffing.enabled || !prepared[1].binding.listen.IsAuto() ||
         std::get<PreparedVmessUsers>(*prepared[1].users).front().uuid != constants::test::kTestVmessUuid ||
         UserStore::VmessUsers("static-owner").users != old ||
-        !UserStore::VmessUsers(constants::test::kTestInboundTag).empty()) return 2;
+        !UserStore::VmessUsers(constants::test::kTestInboundTag).empty()));
 
     user_builds = 0;
-    if (!Rejected({Source("static-owner", 12000), Source("invalid-users", 12001, "reject")}, false) ||
-        user_builds != 2 || UserStore::VmessUsers("static-owner").users != old) return 3;
-    if (!PrepareStartupInbounds({}, false).empty() || PrepareStartupInbounds({}, true).size() != 1) return 4;
+    ASSERT_FALSE((!Rejected({Source("static-owner", 12000), Source("invalid-users", 12001, "reject")}, false) ||
+        user_builds != 2 || UserStore::VmessUsers("static-owner").users != old));
+    ASSERT_FALSE((!PrepareStartupInbounds({}, false).empty() || PrepareStartupInbounds({}, true).size() != 1));
 
     auto routed = Source("routed", 12002);
     routed.routing_enabled = true;
@@ -104,9 +101,9 @@ int main() {
     forced_override.outbound_tag = "custom-out";
     const auto policies = PrepareStartupInbounds(
         {Source("default-direct", 12000), routed, forced, forced_override}, false);
-    if (policies.size() != 4 || policies[1].receiver.proxy_protocol != ProxyProtocolMode::On ||
-        policies[0].receiver.proxy_protocol != ProxyProtocolMode::Auto) return 7;
-    if (policies.size() != 4 ||
+    ASSERT_FALSE((policies.size() != 4 || policies[1].receiver.proxy_protocol != ProxyProtocolMode::On ||
+        policies[0].receiver.proxy_protocol != ProxyProtocolMode::Auto));
+    ASSERT_FALSE((policies.size() != 4 ||
         !std::holds_alternative<routing::ForceOutbound>(policies[0].receiver.dispatch_policy.outbound) ||
         std::get<routing::ForceOutbound>(policies[0].receiver.dispatch_policy.outbound).outbound_tag != "direct" ||
         !std::holds_alternative<routing::RouteWithFallback>(policies[1].receiver.dispatch_policy.outbound) ||
@@ -114,6 +111,6 @@ int main() {
         !std::holds_alternative<routing::ForceOutbound>(policies[2].receiver.dispatch_policy.outbound) ||
         std::get<routing::ForceOutbound>(policies[2].receiver.dispatch_policy.outbound).outbound_tag != "custom-out" ||
         !std::holds_alternative<routing::ForceOutbound>(policies[3].receiver.dispatch_policy.outbound) ||
-        std::get<routing::ForceOutbound>(policies[3].receiver.dispatch_policy.outbound).outbound_tag != "custom-out") return 5;
+        std::get<routing::ForceOutbound>(policies[3].receiver.dispatch_policy.outbound).outbound_tag != "custom-out"));
     std::cout << "startup sources share validation and preparation without user publication\n";
 }

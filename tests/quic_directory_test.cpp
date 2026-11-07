@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "quic_handoff.hpp"
 
 #include <array>
@@ -10,7 +12,7 @@ void Require(bool condition) {
     if (!condition) throw std::runtime_error("QUIC CID directory invariant failed");
 }
 
-void TestPublicationIsExclusiveAndNamespaceScoped() {
+TEST(QuicDirectory, PublicationIsExclusiveAndNamespaceScoped) {
     acpp::net::io_context io;
     auto& directory = acpp::net::use_service<QuicDirectory>(io);
     auto first = std::make_shared<QuicOwnership>();
@@ -34,7 +36,7 @@ void TestPublicationIsExclusiveAndNamespaceScoped() {
     Require(directory.Find("listener-a", cid_b) == first);
 }
 
-void TestRetirementWinsAgainstQueuedPublication() {
+TEST(QuicDirectory, RetirementWinsAgainstQueuedPublication) {
     acpp::net::io_context io;
     auto& directory = acpp::net::use_service<QuicDirectory>(io);
     auto original = std::make_shared<QuicOwnership>();
@@ -54,7 +56,3 @@ void TestRetirementWinsAgainstQueuedPublication() {
 }
 } // namespace
 
-int main() {
-    TestPublicationIsExclusiveAndNamespaceScoped();
-    TestRetirementWinsAgainstQueuedPublication();
-}

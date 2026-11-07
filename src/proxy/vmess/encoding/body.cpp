@@ -5,6 +5,7 @@
 #include "acppnode/common/error.hpp"
 #include "acppnode/infra/log.hpp"
 
+#include <openssl/mem.h>
 #include <openssl/rand.h>
 #include <asio/this_coro.hpp>
 

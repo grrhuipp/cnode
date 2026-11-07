@@ -1,3 +1,6 @@
+#include <stdexcept>
+#include <gtest/gtest.h>
+
 #include "online_report.hpp"
 
 #include <cstdlib>
@@ -9,7 +12,7 @@ namespace {
 
 [[noreturn]] void Fail(std::string_view message) {
     std::cerr << message << '\n';
-    std::exit(1);
+    ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed");
 }
 
 void Check(bool condition, std::string_view message) {
@@ -20,7 +23,7 @@ void Check(bool condition, std::string_view message) {
 
 }  // namespace
 
-int main() {
+TEST(V2BoardOnlineReport, Contract) {
     std::vector<acpp::api::OnlineUser> devices{
         {.UID = 7, .IP = "203.0.113.2"},
         {.UID = 7, .IP = "203.0.113.1"},
@@ -48,5 +51,4 @@ int main() {
           "empty online snapshot did not build an empty device payload");
 
     std::cout << "v2board_online_report_test: ok\n";
-    return 0;
 }

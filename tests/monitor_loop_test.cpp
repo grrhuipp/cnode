@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "common/monitor_loop.hpp"
 #include "common/awaitable_batch.hpp"
 
@@ -297,7 +299,7 @@ void TestStopJoinsAcceptedBatch() {
 
 }  // namespace
 
-int main() {
+TEST(MonitorLoop, Contract) {
     try {
         TestIndependentCompletionAndOwnership();
         TestFactoryFailure();
@@ -308,7 +310,6 @@ int main() {
         TestStopJoinsAcceptedBatch();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
-        return 1;
+        FAIL() << error.what();
     }
-    return 0;
 }

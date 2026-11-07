@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "acppnode/infra/runtime_config_types.hpp"
 
 #include <array>
@@ -11,37 +13,29 @@ bool Rejects(std::string_view value) {
 
 }  // namespace
 
-int main() {
+TEST(RoutingIpNetwork, Contract) {
     auto ipv4 = acpp::RoutingIpNetwork::Parse("192.0.2.129/24");
-    if (!ipv4 || ipv4->IsV6() || ipv4->Prefix() != 24 ||
+    ASSERT_FALSE((!ipv4 || ipv4->IsV6() || ipv4->Prefix() != 24 ||
         ipv4->Network()[0] != 192 || ipv4->Network()[1] != 0 ||
-        ipv4->Network()[2] != 2 || ipv4->Network()[3] != 0) {
-        return 1;
-    }
+        ipv4->Network()[2] != 2 || ipv4->Network()[3] != 0));
 
     auto bare_ipv4 = acpp::RoutingIpNetwork::Parse("198.51.100.7");
-    if (!bare_ipv4 || bare_ipv4->IsV6() || bare_ipv4->Prefix() != 32 ||
-        bare_ipv4->Network()[3] != 7) {
-        return 2;
-    }
+    ASSERT_FALSE((!bare_ipv4 || bare_ipv4->IsV6() || bare_ipv4->Prefix() != 32 ||
+        bare_ipv4->Network()[3] != 7));
 
     auto ipv6 = acpp::RoutingIpNetwork::Parse("2001:db8:abcd:1234::1/48");
     const std::array<uint8_t, 6> ipv6_prefix{0x20, 0x01, 0x0d, 0xb8, 0xab, 0xcd};
-    if (!ipv6 || !ipv6->IsV6() || ipv6->Prefix() != 48) {
-        return 3;
-    }
+    ASSERT_FALSE((!ipv6 || !ipv6->IsV6() || ipv6->Prefix() != 48));
     for (size_t i = 0; i < ipv6_prefix.size(); ++i) {
-        if (ipv6->Network()[i] != ipv6_prefix[i]) return 4;
+        ASSERT_FALSE((ipv6->Network()[i] != ipv6_prefix[i]));
     }
     for (size_t i = ipv6_prefix.size(); i < ipv6->Network().size(); ++i) {
-        if (ipv6->Network()[i] != 0) return 5;
+        ASSERT_FALSE((ipv6->Network()[i] != 0));
     }
 
     auto bare_ipv6 = acpp::RoutingIpNetwork::Parse("2001:db8::1");
-    if (!bare_ipv6 || !bare_ipv6->IsV6() || bare_ipv6->Prefix() != 128 ||
-        bare_ipv6->Network()[15] != 1) {
-        return 6;
-    }
+    ASSERT_FALSE((!bare_ipv6 || !bare_ipv6->IsV6() || bare_ipv6->Prefix() != 128 ||
+        bare_ipv6->Network()[15] != 1));
 
     constexpr std::array<std::string_view, 11> invalid{
         "", "not-an-ip", "192.0.2.1/", "192.0.2.1/24junk",
@@ -50,14 +44,13 @@ int main() {
         "2001:db8::/64/1",
     };
     for (const auto value : invalid) {
-        if (!Rejects(value)) return 7;
+        ASSERT_FALSE((!Rejects(value)));
     }
 
     using namespace std::string_view_literals;
     for (const auto value : {"192.0.2.1:9/24"sv, "192.0.2.1\0ignored/24"sv,
                              "[2001:db8::1]/64"sv, "192.0.2.1 /24"sv,
                              "192.00.2.1/24"sv, "fe80::1%invalid/64"sv}) {
-        if (!Rejects(value)) return 8;
+        ASSERT_FALSE((!Rejects(value)));
     }
-    return 0;
 }

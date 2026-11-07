@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
 
 #include <array>
@@ -29,7 +31,7 @@ void operator delete[](void* memory) noexcept { std::free(memory); }
 void operator delete(void* memory, std::size_t) noexcept { std::free(memory); }
 void operator delete[](void* memory, std::size_t) noexcept { std::free(memory); }
 
-int main() {
+TEST(UserStoreBatch, Contract) {
     const UserSet first_old = PreparedVmessUsers{PreparedVmessUser{
         .uuid = "old-first",
         .profile = {.user_id = 101, .email = {}}}};
@@ -77,15 +79,15 @@ int main() {
             UserStore::FindTrojanUser("second", "old-second") != second_view ||
             UserStore::FindTrojanUser("second", "new-second") || !UserStore::VlessUsers("third").empty()) {
             std::cerr << "allocation failure changed a committed snapshot or Worker view\n";
-            return 1;
+            FAIL() << "allocation failure changed a committed snapshot or Worker view";
         }
     }
-    if (!completed || failures < 5 || UserStore::VmessUsers("first").size() != 2 ||
+    ASSERT_FALSE((!completed || failures < 5 || UserStore::VmessUsers("first").size() != 2 ||
         !UserStore::FindTrojanUser("second", "new-second") ||
         UserStore::FindTrojanUser("second", "old-second") ||
         UserStore::VlessUsers("third").size() != 1 ||
         UserStore::VmessUsers("unrelated").users != unrelated_view ||
-        first_view->size() != 1 || (*first_view)[0].profile.user_id != 101 || second_view->profile.user_id != 102) return 2;
+        first_view->size() != 1 || (*first_view)[0].profile.user_id != 101 || second_view->profile.user_id != 102));
 
     auto current = UserStore::CaptureSnapshot();
     auto worker_one = UserStore::PrepareWorkerView(current);
@@ -94,21 +96,21 @@ int main() {
     auto first_lease_user = UserStore::FindTrojanUser("second", "new-second");
     UserStore::InstallWorkerView(std::move(worker_two));
     auto second_lease_user = UserStore::FindTrojanUser("second", "new-second");
-    if (first_lease_user.get() != second_lease_user.get() ||
+    ASSERT_FALSE((first_lease_user.get() != second_lease_user.get() ||
         (!first_lease_user.owner_before(second_lease_user) &&
-         !second_lease_user.owner_before(first_lease_user))) return 3;
+         !second_lease_user.owner_before(first_lease_user))));
     // A shared table has distinct per-Worker control blocks. Lookup does not
     // allocate, and retiring a Worker leaves already authenticated users alive.
     fail_after = 0;
     auto hot_user = UserStore::FindTrojanUser("second", "new-second");
     fail_after = -1;
     UserStore::ClearWorkerView();
-    if (UserStore::FindTrojanUser("second", "new-second") ||
-        hot_user->profile.user_id != 203 || first_lease_user->profile.user_id != 203) return 4;
+    ASSERT_FALSE((UserStore::FindTrojanUser("second", "new-second") ||
+        hot_user->profile.user_id != 203 || first_lease_user->profile.user_id != 203));
     std::weak_ptr<const UserStore::TrojanCredential> retired_lease = hot_user;
     hot_user.reset();
     second_lease_user.reset();
-    if (!retired_lease.expired()) return 5;
+    ASSERT_FALSE((!retired_lease.expired()));
     UserStore::InstallWorkerView(UserStore::PrepareWorkerView(current));
 
     PreparedShadowsocksUser ss_user;
@@ -118,9 +120,9 @@ int main() {
     const auto ss_view = UserStore::ShadowsocksUsers("ss-hash");
     ss_user.psk_hash.fill(0x22);
     Commit(UserStore::PrepareUsers("ss-hash", UserSet{PreparedShadowsocksUsers{ss_user}}));
-    if (ss_view[0].psk_hash[0] != 0x11 || UserStore::ShadowsocksUsers("ss-hash")[0].psk_hash[0] != 0x22) return 6;
+    ASSERT_FALSE((ss_view[0].psk_hash[0] != 0x11 || UserStore::ShadowsocksUsers("ss-hash")[0].psk_hash[0] != 0x22));
     Commit(UserStore::PrepareClearUsers(UserProtocol::Shadowsocks, "ss-hash"));
-    if (!UserStore::ShadowsocksUsers("ss-hash").empty() || ss_view[0].psk_hash[0] != 0x11) return 7;
+    ASSERT_FALSE((!UserStore::ShadowsocksUsers("ss-hash").empty() || ss_view[0].psk_hash[0] != 0x11));
     UserStore::ClearWorkerView();
     std::cout << "snapshot/Worker-lease atomicity preserved across " << failures << " allocation failures\n";
 }

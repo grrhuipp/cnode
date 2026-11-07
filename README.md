@@ -21,30 +21,59 @@ cnode 是面向 V2Board 面板的高性能 Linux 代理节点服务端。项目�
 
 ## 构建与测试
 
-需要 CMake 3.20 或更新版本，以及支持 C++20 协程、`std::span` 和 `std::format` 的编译器与标准库。主程序和测试统一使用严格 C++20 模式，不依赖 C++23 标准库接口；依赖由 CMake 按固定版本获取。
+仅构建 Linux x86-64 musl 全静态程序，使用 C++20。自有编译与测试规则集中在根 `CMakeLists.txt`；`mise.toml` 管理 CMake、Ninja、ccache 和带 SHA256 校验的 LLVM musl 工具链。依赖、版本基线和 overlay 入口统一放在 `vcpkg.json`；BoringSSL 提供 TLS/QUIC 密码实现，overlay 保留 REALITY 与 VMess 所需接口补丁。`cmake/` 仅保留 vcpkg 配方、补丁、triplet 和 musl 工具链。
 
-本地与 CI 使用同一测试入口，需要 Python 3 相关测试依赖以及 PATH 中可执行的 `openssl` 命令。REALITY 集成测试用该命令生成临时证书；Alpine 使用 `apk add openssl`，Debian/Ubuntu 使用 `apt-get install openssl`，仅安装系统库不能替代命令行工具：
-
-```sh
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCNODE_BUILD_TESTS=ON
-cmake --build build --config Release --target cnode_tests --parallel 2
-ctest --test-dir build -C Release --no-tests=error --output-on-failure --parallel 2
-```
-
-`cnode_tests` 构建主程序和全部测试，CTest 统一执行单元、契约及集成测试。Linux glibc 可在配置时添加 `-DCNODE_TEST_SANITIZERS=ON`，将内存池和调度器的 ASan/UBSan 回归纳入同一次 CTest。CI 的 musl/glibc 共用这一流程；默认发布产物仍为静态 musl。
-
-官方 AnyTLS 参考验证单独运行；准备步骤显式下载并校验固定提交，执行步骤使用本地参考二进制，不隐式联网：
+以下命令适用于 Linux x86-64、Bash。先安装 [mise](https://mise.jdx.dev/getting-started.html)，以及宿主工具（Debian/Ubuntu）：
 
 ```sh
-cmake --build build --target anytls_reference_prepare
-cmake --build build --target anytls_reference_integration
+sudo apt-get install build-essential binutils git curl zip unzip tar xz-utils pkg-config jq \
+  autoconf autoconf-archive automake libtool perl nasm openssl
+mise trust
+mise install
+mise run build
 ```
 
-与官方 Xray 的双向 Vision、VLESS Encryption 跨 Worker 票据及明文 XHTTP stream-up 互通，分别使用 `tests/vless_xray_interop.py`、`tests/vless_encryption_xray_interop.py`、`tests/xhttp_stream_up_xray_integration.py`；三个入口都接受 `--binary build/cnode --xray /path/to/xray --output build/<独立结果目录>`。参考版本要求由脚本维护，结果目录保留协议观察与子进程日志。
+产物为 `build/musl/cnode`。默认 `BUILD_TESTING=OFF`，仅构建主程序；不安装测试依赖、不构建测试可执行文件。本地关闭 LTO，Ninja 与 vcpkg 使用自动并发；依赖、缓存和临时产物均位于 `build/`。
 
-被动跨 Worker 接管验证：`python3 tests/udp_relay_integration.py --binary build/cnode --output build/udp-handoff --case freedom-native_ss2022_isolation` 使用四 Worker，覆盖 SS2022 AES/ChaCha、换源后的回包、防重放与出站端口连续性。Hysteria 使用真实 v1/v2 客户端：先启动四 Worker、固定 UDP 端口、debug 日志的 cnode，再运行 `python3 tests/hysteria_passive_migration.py --version 2 --client /path/to/hysteria --server-port 38443 --server-log /path/to/server.log --auth <测试口令> --output build/hy2-handoff`；v1 改为 `--version 1` 和对应客户端。脚本要求实际跨 Worker 提交证据，并保持原 TCP/UDP 会话与第二条独立连接；TCP/AnyTLS 上游的连接不重建验证可通过脚本的 `--upstream-target`、`--upstream-proxy-port` 透明计数入口执行。
+单元与 E2E 测试均使用 C++ GoogleTest，由 CTest 调度；不使用 Python/JavaScript 测试脚本。测试必须显式启用：
 
-发布回归应使用 `Release`：默认启用 LTO，`RelWithDebInfo` 不覆盖这条优化路径，不能替代发布配置的验证。Linux 的密码学故障注入测试单独保留链接器可拦截的调用边界，主程序与依赖仍使用 Release LTO。
+```sh
+mise run test
+```
+
+`mise run test` 构建 `cnode_tests` 并运行 CTest。测试仅分 `unit` 和 `e2e`；测试可执行文件不进入默认构建，普通测试复用生产静态库，分配故障场景共用一份按需构建的测试库。需要分步操作时：
+
+```sh
+mise run test:configure
+mise exec -- cmake --build --preset musl-tests
+mise exec -- ctest --preset musl-tests --parallel -L '^unit$'
+mise exec -- ctest --preset musl-tests --parallel -L '^e2e$'
+```
+
+主程序与测试共用 `build/musl`，不重复建立独立发布构建树。若只需要某个测试，可显式构建其 `cnode_*_test` 目标，再用 `ctest --preset musl-tests -R <名称>` 执行。切回 `mise run build` 会关闭测试注册。可选 io_uring 后端通过 `mise exec -- cmake --preset musl -DCNODE_IO_URING=ON` 配置，再执行 `mise exec -- cmake --build --preset musl`；官方发布仅提供 epoll。
+
+官方参考程序互操作测试按需配置，使用本地可执行文件，不在测试期间下载。AnyTLS 参考程序可先用宿主 Go 准备，默认离线且要求固定提交的干净源码：
+
+```sh
+CNODE_ANYTLS_SOURCE=/path/to/anytls-go mise run reference:prepare
+# 没有本地源码时，只有显式授权下载才会联网：
+CNODE_REFERENCE_DOWNLOAD=ON mise run reference:prepare
+```
+
+配置参考程序后，仍通过同一 GoogleTest/CTest 入口运行：
+
+```sh
+mise exec -- cmake --preset musl-tests \
+  -DCNODE_REFERENCE_GO="$(command -v go)" \
+  -DCNODE_REFERENCE_ANYTLS_CLIENT="$PWD/build/reference/anytls/bin/anytls-client" \
+  -DCNODE_REFERENCE_ANYTLS_SERVER="$PWD/build/reference/anytls/bin/anytls-server"
+mise exec -- cmake --build --preset musl-tests
+mise exec -- ctest --preset musl-tests --parallel -L '^e2e$'
+```
+
+Xray 使用 `-DCNODE_REFERENCE_XRAY=/path/to/xray`，要求 `v26.10.31` 对应版本；Hysteria v1/v2 分别使用 `CNODE_REFERENCE_HYSTERIA1`、`CNODE_REFERENCE_HYSTERIA2`，可独立配置。参考测试通过 `CNODE_REFERENCE_GO` 检查来源和构建元数据；AnyTLS 必须同时提供客户端与服务端。不配置参考程序时只注册本地可控对端 E2E，不把缺失参考程序计为测试通过。
+
+本地与 CI 均使用 `Release`，仅 CI 配置时显式启用 `CNODE_ENABLE_LTO=ON`；本地验证不覆盖发布 LTO 路径。密码学故障注入测试单独保留链接器可拦截的调用边界。CTest 使用不指定数量的 `--parallel`，按可用 CPU 自动调度。
 
 集成测试按实际监听范围预留动态端口：同时监听 TCP/UDP 的场景会占有两个协议的同号端口，写完配置后才释放并启动进程，避免把仅 UDP 空闲的端口用于 TCP 监听。
 
@@ -207,22 +236,21 @@ geosite.dat
 
 ## Release 产物
 
-GitHub Release 发布正常 Release 二进制和独立 `.debug` 符号文件。默认兼容资产 `cnode-linux-amd64` 指向 `musl+epoll`；显式资产包括：
+GitHub Release 仅发布 musl+epoll 全静态二进制及匹配的 `.debug` 符号文件：
 
 ```text
+cnode-linux-amd64
+cnode-linux-amd64.debug
 cnode-linux-amd64-musl
-cnode-linux-amd64-musl-io_uring
-cnode-linux-amd64-glibc
-cnode-linux-amd64-glibc-io_uring
+cnode-linux-amd64-musl.debug
 ```
 
-对应符号文件使用同名 `.debug` 后缀。需要 heaptrack、perf 或 core dump 符号时，优先使用 glibc 变体和匹配的 `.debug` 文件；不需要单独 heaptrack release channel。
+两种二进制名称对应同一产物，不再发布 glibc 变体。CI 在打包前检查 ELF 不含动态解释器和共享库依赖。
 
-部署脚本默认仍下载 `cnode-linux-amd64`。如需选择后端或 libc 变体：
+部署脚本默认下载 `cnode-linux-amd64`；符号文件只在显式要求时下载：
 
 ```sh
-bash scripts/cnode.sh -variant musl-io_uring
-bash scripts/cnode.sh -variant glibc -debug_file true
+bash scripts/cnode.sh -debug_file true
 ```
 
 配置进入 Worker 前必须完成归一化。Worker 热路径只读取不可变 runtime snapshot；控制面更新时以原子替换快照的方式发布，新旧连接按生命周期自然释放。
@@ -398,8 +426,9 @@ V2Board 上报是无幂等键的增量接口，不能承诺 exactly-once。发�
 停机后根据面板侧账务证据逐批对账；确认已应用则删除未知批次，确认未应用才重新置为可发送。工具使用独占锁并持久化审计记录，不能仅凭超时判断“未应用”：
 
 ```sh
-python3 scripts/traffic_journal.py '/path/to/traffic-journal/<身份哈希>' list
-python3 scripts/traffic_journal.py '/path/to/traffic-journal/<身份哈希>' resolve batch-XXXXXX.unknown \
+mise exec -- cmake --build --preset musl --target cnode_traffic_journal
+build/musl/cnode_traffic_journal '/path/to/traffic-journal/<身份哈希>' list
+build/musl/cnode_traffic_journal '/path/to/traffic-journal/<身份哈希>' resolve batch-XXXXXX.unknown \
   --decision confirmed-applied --evidence '面板侧对账记录编号'
 ```
 
@@ -442,4 +471,4 @@ scripts/              部署与更新脚本
 
 ## 构建兼容性
 
-- x86-64 构建默认启用摘要算法的运行时 SIMD 分派，保留 portable 回退，不要求部署机器与构建机器具有相同指令集。排查时可用 `-DCNODE_BLAKE3_SIMD=OFF` 构建纯 portable 版本。
+- x86-64 构建启用 BLAKE3 运行时 SIMD 分派并保留 portable 回退，不要求部署机器与构建机器具有相同指令集。

@@ -1,27 +1,16 @@
 #include "vless_encryption_crypto.hpp"
 
+#include <openssl/bytestring.h>
 #include <openssl/curve25519.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
-#include <openssl/experimental/kem_deterministic_api.h>
-#include <openssl/nid.h>
+#include <openssl/mlkem.h>
 
 #include <memory>
 #include <new>
 
 namespace acpp::vless {
 namespace {
-
-[[nodiscard]] bssl::UniquePtr<EVP_PKEY_CTX> NewMlKem768KeygenContext() noexcept {
-    bssl::UniquePtr<EVP_PKEY_CTX> ctx(EVP_PKEY_CTX_new_id(EVP_PKEY_KEM, nullptr));
-    if (!ctx ||
-        EVP_PKEY_keygen_init(ctx.get()) != 1 ||
-        EVP_PKEY_CTX_kem_set_params(ctx.get(), NID_MLKEM768) != 1) {
-        ERR_clear_error();
-        return {};
-    }
-    return ctx;
-}
 
 [[nodiscard]] std::shared_ptr<EVP_PKEY> ShareKey(
     bssl::UniquePtr<EVP_PKEY> key) noexcept {
@@ -69,22 +58,14 @@ CreateVlessMlKem768PrivateKeyFromSeed(
     if (seed.size() != kVlessMlKem768SeedSize) {
         return nullptr;
     }
-    auto ctx = NewMlKem768KeygenContext();
-    if (!ctx) {
-        return nullptr;
-    }
-    EVP_PKEY* raw = nullptr;
-    size_t seed_len = seed.size();
-    if (EVP_PKEY_keygen_deterministic(
-            ctx.get(),
-            &raw,
-            seed.data(),
-            &seed_len) != 1) {
-        EVP_PKEY_free(raw);
+    // ML-KEM's seed is d || z (64 bytes), not the expanded private key.
+    bssl::UniquePtr<EVP_PKEY> key(EVP_PKEY_from_private_seed(
+        EVP_pkey_ml_kem_768(), seed.data(), seed.size()));
+    if (!key) {
         ERR_clear_error();
         return nullptr;
     }
-    return ShareKey(bssl::UniquePtr<EVP_PKEY>(raw));
+    return ShareKey(std::move(key));
 }
 
 std::shared_ptr<EVP_PKEY>
@@ -93,8 +74,8 @@ CreateVlessMlKem768PublicKey(
     if (public_key.size() != kVlessMlKem768PublicKeySize) {
         return nullptr;
     }
-    bssl::UniquePtr<EVP_PKEY> key(EVP_PKEY_kem_new_raw_public_key(
-        NID_MLKEM768,
+    bssl::UniquePtr<EVP_PKEY> key(EVP_PKEY_from_raw_public_key(
+        EVP_pkey_ml_kem_768(),
         public_key.data(),
         public_key.size()));
     if (!key) {
@@ -105,34 +86,22 @@ CreateVlessMlKem768PublicKey(
 }
 
 bssl::UniquePtr<EVP_PKEY> GenerateVlessMlKem768PrivateKey() noexcept {
-    auto ctx = NewMlKem768KeygenContext();
-    if (!ctx) {
-        return {};
-    }
-    EVP_PKEY* raw = nullptr;
-    if (EVP_PKEY_keygen(ctx.get(), &raw) != 1) {
-        EVP_PKEY_free(raw);
+    bssl::UniquePtr<EVP_PKEY> key(
+        EVP_PKEY_generate_from_alg(EVP_pkey_ml_kem_768()));
+    if (!key) {
         ERR_clear_error();
-        return {};
     }
-    return bssl::UniquePtr<EVP_PKEY>(raw);
+    return key;
 }
 
 std::optional<std::array<uint8_t, kVlessMlKem768PublicKeySize>>
 DeriveVlessMlKem768PublicKey(const EVP_PKEY* key) noexcept {
-    if (!key) {
-        return std::nullopt;
-    }
-
-    size_t public_len = 0;
-    if (EVP_PKEY_get_raw_public_key(key, nullptr, &public_len) != 1 ||
-        public_len != kVlessMlKem768PublicKeySize) {
-        ERR_clear_error();
+    if (!key || EVP_PKEY_id(key) != EVP_PKEY_ML_KEM_768) {
         return std::nullopt;
     }
 
     std::array<uint8_t, kVlessMlKem768PublicKeySize> public_key{};
-    public_len = public_key.size();
+    size_t public_len = public_key.size();
     if (EVP_PKEY_get_raw_public_key(
             key,
             public_key.data(),
@@ -145,42 +114,19 @@ DeriveVlessMlKem768PublicKey(const EVP_PKEY* key) noexcept {
 }
 
 std::optional<VlessMlKem768Encapsulation>
-EncapsulateVlessMlKem768(EVP_PKEY* public_key) noexcept {
+EncapsulateVlessMlKem768(const EVP_PKEY* public_key) noexcept {
     if (!public_key) {
         return std::nullopt;
     }
 
-    bssl::UniquePtr<EVP_PKEY_CTX> ctx(EVP_PKEY_CTX_new(public_key, nullptr));
-    if (!ctx) {
-        ERR_clear_error();
-        return std::nullopt;
-    }
-
-    size_t ciphertext_len = 0;
-    size_t shared_len = 0;
-    if (EVP_PKEY_encapsulate(
-            ctx.get(),
-            nullptr,
-            &ciphertext_len,
-            nullptr,
-            &shared_len) != 1 ||
-        ciphertext_len != kVlessMlKem768CiphertextSize ||
-        shared_len != kVlessMlKem768SharedSecretSize) {
-        ERR_clear_error();
-        return std::nullopt;
-    }
-
     VlessMlKem768Encapsulation result;
-    ciphertext_len = result.ciphertext.size();
-    shared_len = result.shared_secret.bytes.size();
-    if (EVP_PKEY_encapsulate(
-            ctx.get(),
+    if (EVP_KEM_encap(
+            EVP_kem_ml_kem_768(),
             result.ciphertext.data(),
-            &ciphertext_len,
+            result.ciphertext.size(),
             result.shared_secret.bytes.data(),
-            &shared_len) != 1 ||
-        ciphertext_len != result.ciphertext.size() ||
-        shared_len != result.shared_secret.bytes.size()) {
+            result.shared_secret.bytes.size(),
+            public_key) != 1) {
         ERR_clear_error();
         return std::nullopt;
     }
@@ -193,39 +139,34 @@ EncapsulateVlessMlKem768(std::span<const uint8_t> public_key) noexcept {
         return std::nullopt;
     }
 
-    bssl::UniquePtr<EVP_PKEY> key(EVP_PKEY_kem_new_raw_public_key(
-        NID_MLKEM768,
-        public_key.data(),
-        public_key.size()));
-    if (!key) {
+    MLKEM768_public_key key;
+    CBS input;
+    CBS_init(&input, public_key.data(), public_key.size());
+    if (MLKEM768_parse_public_key(&key, &input) != 1) {
         ERR_clear_error();
         return std::nullopt;
     }
-    return EncapsulateVlessMlKem768(key.get());
+    VlessMlKem768Encapsulation result;
+    MLKEM768_encap(result.ciphertext.data(), result.shared_secret.bytes.data(),
+                  &key);
+    return result;
 }
 
 bool DecapsulateVlessMlKem768(
-    EVP_PKEY* private_key,
+    const EVP_PKEY* private_key,
     std::span<const uint8_t> ciphertext,
     std::span<uint8_t, kVlessMlKem768SharedSecretSize> out_shared) noexcept {
     if (!private_key || ciphertext.size() != kVlessMlKem768CiphertextSize) {
         return false;
     }
 
-    bssl::UniquePtr<EVP_PKEY_CTX> ctx(EVP_PKEY_CTX_new(private_key, nullptr));
-    if (!ctx) {
-        ERR_clear_error();
-        return false;
-    }
-
-    size_t shared_len = out_shared.size();
-    if (EVP_PKEY_decapsulate(
-            ctx.get(),
+    if (EVP_KEM_decap(
+            EVP_kem_ml_kem_768(),
             out_shared.data(),
-            &shared_len,
+            out_shared.size(),
             ciphertext.data(),
-            ciphertext.size()) != 1 ||
-        shared_len != out_shared.size()) {
+            ciphertext.size(),
+            private_key) != 1) {
         ERR_clear_error();
         return false;
     }

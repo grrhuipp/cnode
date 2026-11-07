@@ -9,7 +9,7 @@
 #include "acppnode/transport/internet/tcp_stream.hpp"
 #include "acppnode/transport/internet/ws_stream.hpp"
 
-#include <openssl/evp.h>
+#include <openssl/base64.h>
 
 #include <algorithm>
 #include <array>

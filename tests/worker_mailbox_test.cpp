@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "acppnode/app/worker_mailbox.hpp"
 
 #include <asio/as_tuple.hpp>
@@ -165,11 +167,11 @@ int Run() {
 
 }  // namespace
 
-int main() {
+TEST(WorkerMailbox, Contract) {
     try {
-        return Run();
+        { ASSERT_EQ((::Run()), 0); return; }
     } catch (const std::exception& error) {
         std::fprintf(stderr, "worker_mailbox_test: %s\n", error.what());
-        return 1;
+        FAIL() << error.what();
     }
 }

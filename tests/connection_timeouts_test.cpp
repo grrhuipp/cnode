@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "../src/transport/internet/connection_timeouts.hpp"
 
 #include <chrono>
@@ -86,7 +88,7 @@ bool TestActivityDoesNotExtendPhase() {
 }
 }  // namespace
 
-int main() {
+TEST(ConnectionTimeouts, Contract) {
     const bool idle = TestIdleAndOperations();
     const bool phase = TestPhaseReplacementAndClear();
     const bool expired = TestExpiredPhaseAndStopFlag();
@@ -94,5 +96,5 @@ int main() {
     const bool dual = TestActivityDoesNotExtendPhase();
     std::printf("connection timeouts: idle=%d phase=%d expired=%d destruction=%d dual=%d\n",
                 idle, phase, expired, destruction, dual);
-    return idle && phase && expired && destruction && dual ? 0 : 1;
+    { ASSERT_TRUE(idle && phase && expired && destruction && dual); return; }
 }

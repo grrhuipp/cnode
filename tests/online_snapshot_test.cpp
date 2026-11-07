@@ -1,3 +1,6 @@
+#include <stdexcept>
+#include <gtest/gtest.h>
+
 #include "online_snapshot.hpp"
 
 #include <cstdlib>
@@ -9,7 +12,7 @@ namespace {
 
 [[noreturn]] void Fail(std::string_view message) {
     std::cerr << message << '\n';
-    std::exit(1);
+    ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed");
 }
 
 void Check(bool condition, std::string_view message) {
@@ -20,7 +23,7 @@ void Check(bool condition, std::string_view message) {
 
 }  // namespace
 
-int main() {
+TEST(OnlineSnapshot, Contract) {
     std::vector<acpp::OnlineDevice> devices{
         {8, "203.0.113.8"},
         {7, "203.0.113.2"},
@@ -43,5 +46,4 @@ int main() {
           "second online user was lost");
 
     std::cout << "online_snapshot_test: ok\n";
-    return 0;
 }

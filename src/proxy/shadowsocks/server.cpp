@@ -201,8 +201,6 @@ public:
     }
 
 private:
-    static constexpr size_t kLenHeaderSize = 2 + SsAeadCipher::kTagSize;
-
     struct FirstChunk {
         std::span<const uint8_t> direct;
         memory::ByteVector storage;

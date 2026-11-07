@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "xhttp_session.hpp"
 #include "acppnode/transport/internet/tcp_stream.hpp"
 #include "acppnode/app/session_group_executor.hpp"
@@ -274,7 +276,7 @@ void UploadResponseIsDrained() {
 }
 } // namespace
 
-int main() {
+TEST(XhttpSessionLifecycle, Contract) {
     try {
         RunTableScenario(NamespaceAndRetirement);
         RunTableScenario(StandaloneContextsDoNotShare);
@@ -284,6 +286,6 @@ int main() {
         UploadResponseIsDrained();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());
-        return 1;
+        FAIL() << error.what();
     }
 }

@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "acppnode/transport/internet/datagram_socket.hpp"
 
 #include "acppnode/common/buf/multi_buffer.hpp"
@@ -376,7 +378,7 @@ bool TestAdmissionBucketSurvivesDomainMigration() {
 
 }  // namespace
 
-int main() {
+TEST(DatagramSocket, Contract) {
     try {
         const bool bindings = TestIndependentBindingsAndLargeScatter();
         const bool cancel = TestZeroLengthAndCancellationIsolation();
@@ -389,10 +391,10 @@ int main() {
         const bool reclaimed = DatagramSocket::ActiveCount() == 0;
         std::printf("datagram socket: bindings=%d cancel=%d parent_cancel=%d ipv6=%d timeout_close=%d limit=%d empty=%d migrated=%d reclaimed=%d\n",
                     bindings, cancel, parent_cancel, ipv6, timeout_close, limit, empty, migrated, reclaimed);
-        return bindings && cancel && parent_cancel && ipv6 && timeout_close && limit &&
-            empty && migrated && reclaimed ? 0 : 1;
+        { ASSERT_TRUE(bindings && cancel && parent_cancel && ipv6 && timeout_close && limit &&
+            empty && migrated && reclaimed); return; }
     } catch (const std::exception& error) {
         std::fprintf(stderr, "datagram socket test exception: %s\n", error.what());
-        return 1;
+        FAIL() << error.what();
     }
 }

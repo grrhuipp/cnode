@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "acppnode/transport/internet/timeout_scheduler.hpp"
 #include "acppnode/transport/internet/async_delay.hpp"
 #include "acppnode/app/session_group_executor.hpp"
@@ -703,7 +705,7 @@ bool TestDomainTimeoutHandoff() {
 
 }  // namespace
 
-int main() {
+TEST(TimeoutScheduler, Contract) {
     const struct { const char* name; bool (*run)(); } cases[] = {
         {"cancel/rearm/destruction without allocation", TestCancellationAndRearm},
         {"reentrant owner destruction and exception isolation", TestReentrantDestructionAndExceptions},
@@ -732,5 +734,5 @@ int main() {
         std::printf("%s: %s\n", test.name, result ? "PASS" : "FAIL");
         passed = passed && result;
     }
-    return passed ? 0 : 1;
+    { ASSERT_TRUE(passed); return; }
 }

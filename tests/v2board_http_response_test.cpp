@@ -1,3 +1,6 @@
+#include <stdexcept>
+#include <gtest/gtest.h>
+
 #include "http_response.hpp"
 
 #include <asio/co_spawn.hpp>
@@ -20,7 +23,7 @@ namespace http = acpp::api::v2board::http;
 
 [[noreturn]] void Fail(std::string_view message) {
     std::cerr << message << '\n';
-    std::exit(1);
+    ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed");
 }
 
 void Check(bool condition, std::string_view message) {
@@ -105,7 +108,7 @@ http::Response ReadResponse(std::vector<std::string> segments,
     return response;
 }
 
-void TestChunkedBodyAlreadyBufferedBeforeEof() {
+TEST(V2BoardHttpResponse, ChunkedBodyAlreadyBufferedBeforeEof) {
     size_t read_calls = 0;
     auto response = ReadResponse({
         "HTTP/1.1 200 OK\r\n"
@@ -125,7 +128,7 @@ void TestChunkedBodyAlreadyBufferedBeforeEof() {
     Check(read_calls == 1, "chunked reader waited for EOF after terminal chunk");
 }
 
-void TestFragmentedChunksExtensionsAndTrailers() {
+TEST(V2BoardHttpResponse, FragmentedChunksExtensionsAndTrailers) {
     auto response = ReadResponse({
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nETag: \"abc\"\r\n\r\n"
         "4;sour",
@@ -140,7 +143,7 @@ void TestFragmentedChunksExtensionsAndTrailers() {
     Check(response.etag == "abc", "response ETag mismatch");
 }
 
-void TestContentLengthStillUsesPrefetchedBody() {
+TEST(V2BoardHttpResponse, ContentLengthStillUsesPrefetchedBody) {
     auto response = ReadResponse({
         "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
     });
@@ -149,7 +152,7 @@ void TestContentLengthStillUsesPrefetchedBody() {
     Check(response.body == "hello", "prefetched content-length body mismatch");
 }
 
-void TestMalformedChunkTerminatorRejected() {
+TEST(V2BoardHttpResponse, MalformedChunkTerminatorRejected) {
     auto response = ReadResponse({
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
         "3\r\nbadXX0\r\n\r\n",
@@ -160,7 +163,7 @@ void TestMalformedChunkTerminatorRejected() {
           "malformed chunk error lost its cause");
 }
 
-void TestMalformedContentLengthRejected() {
+TEST(V2BoardHttpResponse, MalformedContentLengthRejected) {
     auto trailing = ReadResponse({
         "HTTP/1.1 200 OK\r\nContent-Length: 5junk\r\n\r\nhello",
     });
@@ -182,7 +185,7 @@ void TestMalformedContentLengthRejected() {
           "conflicting Content-Length values were accepted");
 }
 
-void TestOversizedBodiesRejectedBeforeRead() {
+TEST(V2BoardHttpResponse, OversizedBodiesRejectedBeforeRead) {
     auto fixed = ReadResponse({
         "HTTP/1.1 200 OK\r\nContent-Length: 67108865\r\n\r\n",
     });
@@ -199,7 +202,7 @@ void TestOversizedBodiesRejectedBeforeRead() {
           "oversized chunked body lost its cause");
 }
 
-void TestOversizedHeadersRejected() {
+TEST(V2BoardHttpResponse, OversizedHeadersRejected) {
     std::string oversized_line = "HTTP/1.1 200 OK\r\nX-Large: ";
     oversized_line.append(64 * 1024, 'x');
     oversized_line += "\r\n\r\n";
@@ -223,7 +226,7 @@ void TestOversizedHeadersRejected() {
           "oversized header section lost its cause");
 }
 
-void TestIncompleteHeadersReturnStructuredError() {
+TEST(V2BoardHttpResponse, IncompleteHeadersReturnStructuredError) {
     auto response = ReadResponse({
         "HTTP/1.1 200 OK\r\nX-Incomplete: value",
     });
@@ -233,7 +236,7 @@ void TestIncompleteHeadersReturnStructuredError() {
           "unterminated response headers escaped structured error handling");
 }
 
-void TestEtagWithControlBytesRejected() {
+TEST(V2BoardHttpResponse, EtagWithControlBytesRejected) {
     auto response = ReadResponse({
         "HTTP/1.1 200 OK\r\nETag: \"abc\nInjected: yes\"\r\nContent-Length: 2\r\n\r\nOK",
     });
@@ -256,7 +259,7 @@ void CheckRejected(const std::string& wire,
     }
 }
 
-void TestTransferCodingListParsed() {
+TEST(V2BoardHttpResponse, TransferCodingListParsed) {
     auto mixed_case = ReadResponse({
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: , CHUNKED ,\r\n\r\n"
         "2\r\nOK\r\n0\r\n\r\n",
@@ -289,7 +292,7 @@ void TestTransferCodingListParsed() {
         "unknown coding containing \"chunked\" was decoded as chunked");
 }
 
-void TestAmbiguousFramingRejected() {
+TEST(V2BoardHttpResponse, AmbiguousFramingRejected) {
     CheckRejected(
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 2\r\n\r\n"
         "2\r\nOK\r\n0\r\n\r\n",
@@ -332,7 +335,7 @@ void TestAmbiguousFramingRejected() {
           "chunk extension after BWS was rejected");
 }
 
-void TestChunkExtensionGrammarAndBoundaries() {
+TEST(V2BoardHttpResponse, ChunkExtensionGrammarAndBoundaries) {
     using transport::internet::ParseHttpChunkSize;
     const std::string max_hex(sizeof(size_t) * 2, 'f');
     Check(ParseHttpChunkSize(max_hex) == std::numeric_limits<size_t>::max(),
@@ -381,7 +384,7 @@ void TestChunkExtensionGrammarAndBoundaries() {
     }
 }
 
-void TestNotModifiedEndsAtHeaderSection() {
+TEST(V2BoardHttpResponse, NotModifiedEndsAtHeaderSection) {
     size_t read_calls = 0;
     auto response = ReadResponse({
         "HTTP/1.1 304 Not Modified\r\nETag: \"v2\"\r\nContent-Length: 1024\r\n\r\n",
@@ -393,7 +396,7 @@ void TestNotModifiedEndsAtHeaderSection() {
     Check(read_calls == 1, "304 response waited for a body");
 }
 
-void TestInterimResponsesSkipped() {
+TEST(V2BoardHttpResponse, InterimResponsesSkipped) {
     auto response = ReadResponse({
         "HTTP/1.1 100 Continue\r\n\r\n"
         "HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\n",
@@ -415,21 +418,3 @@ void TestInterimResponsesSkipped() {
 
 }  // namespace
 
-int main() {
-    TestChunkedBodyAlreadyBufferedBeforeEof();
-    TestFragmentedChunksExtensionsAndTrailers();
-    TestContentLengthStillUsesPrefetchedBody();
-    TestMalformedChunkTerminatorRejected();
-    TestMalformedContentLengthRejected();
-    TestOversizedBodiesRejectedBeforeRead();
-    TestOversizedHeadersRejected();
-    TestIncompleteHeadersReturnStructuredError();
-    TestEtagWithControlBytesRejected();
-    TestTransferCodingListParsed();
-    TestAmbiguousFramingRejected();
-    TestChunkExtensionGrammarAndBoundaries();
-    TestNotModifiedEndsAtHeaderSection();
-    TestInterimResponsesSkipped();
-    std::cout << "v2board_http_response_test: ok\n";
-    return 0;
-}

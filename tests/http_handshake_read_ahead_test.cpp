@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/transport/internet/tcp_stream.hpp"
@@ -1135,7 +1137,7 @@ void HttpLogRedaction() {
 }
 }  // namespace
 
-int main() {
+TEST(HttpHandshakeReadAhead, Contract) {
     acpp::TlsStream::InitializeIo();
     acpp::memory::ThreadMemoryResource resource;
     auto* previous = std::pmr::set_default_resource(&resource);
@@ -1162,5 +1164,5 @@ int main() {
         passed = false;
     }
     std::pmr::set_default_resource(previous);
-    return passed ? 0 : 1;
+    { ASSERT_TRUE(passed); return; }
 }

@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "acppnode/transport/internet/async_write_gate.hpp"
 
 #include <asio/co_spawn.hpp>
@@ -10,7 +12,7 @@
 #include <stdexcept>
 #include <utility>
 
-int main() {
+TEST(AsyncWriteGate, Contract) {
     acpp::net::io_context io_context;
     acpp::transport::internet::AsyncWriteGate gate;
 
@@ -18,9 +20,9 @@ int main() {
     // releases also leave a stale notification for the contended path below.
     for (int i = 0; i < 64; ++i) {
         auto lease = gate.TryAcquire();
-        if (!lease || gate.TryAcquire()) return 6;
+        ASSERT_FALSE((!lease || gate.TryAcquire()));
         auto moved = std::move(lease);
-        if (lease || !moved || gate.TryAcquire()) return 7;
+        ASSERT_FALSE((lease || !moved || gate.TryAcquire()));
     }
     {
         auto held = gate.TryAcquire();
@@ -34,12 +36,12 @@ int main() {
                 resumed = true;
             }, acpp::net::use_future);
         io_context.poll();
-        if (resumed) return 8;
+        ASSERT_FALSE((resumed));
         held.Reset();
         io_context.restart();
         io_context.run();
         waiter.get();
-        if (!resumed) return 9;
+        ASSERT_FALSE((!resumed));
         io_context.restart();
     }
 
@@ -80,18 +82,12 @@ int main() {
     try {
         coordinator.get();
     } catch (...) {
-        return 1;
+        FAIL() << "asynchronous write-gate operation unexpectedly threw";
     }
 
-    if (!active_acquired) {
-        return 2;
-    }
-    if (completed_waiters != kWaiterCount) {
-        return 3;
-    }
-    if (acquired_after_cancel != 0) {
-        return 4;
-    }
+    ASSERT_FALSE((!active_acquired));
+    ASSERT_FALSE((completed_waiters != kWaiterCount));
+    ASSERT_FALSE((acquired_after_cancel != 0));
 
     io_context.restart();
     auto after_cancel = acpp::net::co_spawn(
@@ -102,9 +98,6 @@ int main() {
         },
         acpp::net::use_future);
     io_context.run();
-    if (after_cancel.get() || gate.TryAcquire()) {
-        return 5;
-    }
+    ASSERT_FALSE((after_cancel.get() || gate.TryAcquire()));
 
-    return 0;
 }

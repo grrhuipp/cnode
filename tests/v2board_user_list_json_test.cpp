@@ -1,3 +1,6 @@
+#include <stdexcept>
+#include <gtest/gtest.h>
+
 #include "user_list_json.hpp"
 
 #include <cstdlib>
@@ -9,7 +12,7 @@ namespace {
 
 [[noreturn]] void Fail(std::string_view message) {
     std::cerr << message << '\n';
-    std::exit(1);
+    ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed");
 }
 
 void Check(bool condition, std::string_view message) {
@@ -26,7 +29,7 @@ void CheckInvalid(std::string_view body) {
     Check(!result, "invalid user list was accepted");
 }
 
-void TestValidUsersAreNormalized() {
+TEST(V2BoardUserListJson, ValidUsersAreNormalized) {
     auto result = Parse(
         R"({"users":[{"id":7,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","flow":"xtls-rprx-vision","speed_limit":8,"device_limit":3,"email":"user@example.com"},{"id":8,"uuid":"11111111-1111-1111-1111-111111111111","speed_limit":null,"device_limit":null},{"id":9,"uuid":"22222222-2222-2222-2222-222222222222","speed_limit":140737488355327,"device_limit":4294967295}]})");
     Check(result.has_value(), "valid users were rejected");
@@ -53,7 +56,7 @@ void TestValidUsersAreNormalized() {
     Check(empty.has_value() && empty->empty(), "empty user list was rejected");
 }
 
-void TestInvalidLimitsAreRejected() {
+TEST(V2BoardUserListJson, InvalidLimitsAreRejected) {
     CheckInvalid(R"({"users":[{"id":7,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","speed_limit":140737488355328}]})");
     CheckInvalid(R"({"users":[{"id":7,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","device_limit":4294967296}]})");
     CheckInvalid(R"({"users":[{"id":7,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","speed_limit":-1}]})");
@@ -61,7 +64,7 @@ void TestInvalidLimitsAreRejected() {
     CheckInvalid(R"({"users":[{"id":7,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","speed_limit":"1.5"}]})");
 }
 
-void TestXv2BoardUserTypesAreCompatible() {
+TEST(V2BoardUserListJson, Xv2BoardUserTypesAreCompatible) {
     auto result = Parse(
         R"({"users":[{"id":"7","uuid":"B831381D-6324-4D53-AD4F-8CDA48B30811","flow":"XTLS-RPRX-VISION","speed_limit":"8","device_limit":"3"}]})");
     Check(result && result->size() == 1, "xv2board string user integers were rejected");
@@ -72,7 +75,7 @@ void TestXv2BoardUserTypesAreCompatible() {
           "user field compatibility mismatch");
 }
 
-void TestMalformedUsersAreRejected() {
+TEST(V2BoardUserListJson, MalformedUsersAreRejected) {
     CheckInvalid(R"({})");
     CheckInvalid(R"({"users":null})");
     CheckInvalid(R"({"users":[1]})");
@@ -85,11 +88,3 @@ void TestMalformedUsersAreRejected() {
 
 }  // namespace
 
-int main() {
-    TestValidUsersAreNormalized();
-    TestInvalidLimitsAreRejected();
-    TestMalformedUsersAreRejected();
-    TestXv2BoardUserTypesAreCompatible();
-    std::cout << "v2board_user_list_json_test: ok\n";
-    return 0;
-}

@@ -1,3 +1,6 @@
+#include <stdexcept>
+#include <gtest/gtest.h>
+
 // Wire timing reference: XTLS/Xray-core a4a3dff5b20c2faae567b742c172c7b95e75c083
 // proxy/proxy.go: VisionWriter.WriteMultiBuffer, IsCompleteRecord, XtlsPadding.
 #include "vless_vision.hpp"
@@ -13,7 +16,7 @@
 namespace {
 using namespace acpp;
 void Check(bool ok, const char* message) {
-    if (!ok) { std::cerr << message << '\n'; std::exit(1); }
+    if (!ok) { std::cerr << message << '\n'; ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed"); }
 }
 class Capture final : public transport::MultiBufferWriter {
 public:
@@ -182,9 +185,9 @@ net::awaitable<void> Exercise() {
     }
 }
 }
-int main() {
+TEST(VlessVision, Contract) {
     net::io_context io;
     auto result = net::co_spawn(io, Exercise(), net::use_future);
     io.run();
-    try { result.get(); } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
+    try { result.get(); } catch (const std::exception& e) { std::cerr << e.what() << '\n'; FAIL() << e.what(); }
 }

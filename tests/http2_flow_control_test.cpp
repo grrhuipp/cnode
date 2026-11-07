@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "acppnode/transport/internet/tcp_stream.hpp"
 #include "acppnode/transport/internet/transport_stack.hpp"
 
@@ -466,16 +468,16 @@ void ServerWaitsForPeerWindows() {
 
 }  // namespace
 
-int main() {
+TEST(Http2FlowControl, Contract) {
     try {
         ClientWaitsForPeerWindows();
         ClientEnforcesReceiveWindow();
         ClientReturnsCreditAsReaderTakesData();
         ServerWaitsForPeerWindows();
         std::puts("HTTP/2 flow control: client and server honour peer windows");
-        return 0;
+        return;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "HTTP/2 flow control: %s\n", error.what());
-        return 1;
+        FAIL() << error.what();
     }
 }

@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "acppnode/common/target_address.hpp"
 
 #include <array>
@@ -13,55 +15,55 @@ bool Require(bool condition, const char* message) {
 
 }  // namespace
 
-int main() {
+TEST(TargetAddress, Contract) {
     const acpp::TargetAddress empty;
-    if (!Require(!empty.IsValid() && !empty.IsIP() && !empty.IsDomain(),
-                 "a default target must have an explicit invalid type")) return 1;
+    ASSERT_FALSE((!Require(!empty.IsValid() && !empty.IsIP() && !empty.IsDomain(),
+                 "a default target must have an explicit invalid type")));
 
     const acpp::TargetAddress injected("bad.example\r\nforged-log", 443);
-    if (!Require(!injected.IsValid() && injected.host.empty(),
-                 "an invalid target must not retain log-injectable bytes")) return 2;
+    ASSERT_FALSE((!Require(!injected.IsValid() && injected.host.empty(),
+                 "an invalid target must not retain log-injectable bytes")));
 
     const acpp::TargetAddress empty_label("bad..example", 443);
-    if (!Require(!empty_label.IsValid(),
-                 "a malformed DNS hostname must not become a valid target")) return 3;
+    ASSERT_FALSE((!Require(!empty_label.IsValid(),
+                 "a malformed DNS hostname must not become a valid target")));
 
-    if (!Require(!acpp::TargetAddress::Parse("bad..example:443"),
-                 "TargetAddress::Parse must reject malformed hostnames")) return 4;
+    ASSERT_FALSE((!Require(!acpp::TargetAddress::Parse("bad..example:443"),
+                 "TargetAddress::Parse must reject malformed hostnames")));
 
     const acpp::TargetAddress domain("example.com.", 443);
-    if (!Require(domain.IsValid() && domain.IsDomain() &&
+    ASSERT_FALSE((!Require(domain.IsValid() && domain.IsDomain() &&
                      domain.host == "example.com",
-                 "an absolute DNS hostname must be stored canonically")) return 5;
+                 "an absolute DNS hostname must be stored canonically")));
 
     const auto ipv6 = acpp::TargetAddress::Parse("[2001:db8::1]:443");
-    if (!Require(ipv6 && ipv6->IsValid() && ipv6->IsIPv6(),
-                 "a bracketed IPv6 endpoint must remain valid")) return 6;
+    ASSERT_FALSE((!Require(ipv6 && ipv6->IsValid() && ipv6->IsIPv6(),
+                 "a bracketed IPv6 endpoint must remain valid")));
 
     const acpp::TargetAddress mapped("::ffff:192.0.2.1", 443);
-    if (!Require(mapped.IsValid() && mapped.IsIPv4() &&
+    ASSERT_FALSE((!Require(mapped.IsValid() && mapped.IsIPv4() &&
                      mapped.resolved_addr->to_string() == "192.0.2.1",
-                 "an IPv4-mapped IPv6 target must be canonicalized")) return 7;
+                 "an IPv4-mapped IPv6 target must be canonicalized")));
 
     const acpp::TargetAddress same_domain("example.com", 443);
     const acpp::TargetAddress different_port("example.com", 8443);
-    if (!Require(domain.SameEndpoint(same_domain) &&
+    ASSERT_FALSE((!Require(domain.SameEndpoint(same_domain) &&
                      !domain.SameEndpoint(different_port),
-                 "endpoint identity must use canonical host and port")) return 8;
+                 "endpoint identity must use canonical host and port")));
 
     const acpp::TargetAddress same_mapped("192.0.2.1", 443);
-    if (!Require(mapped.SameEndpoint(same_mapped),
-                 "canonical IP endpoints must compare equal")) return 9;
+    ASSERT_FALSE((!Require(mapped.SameEndpoint(same_mapped),
+                 "canonical IP endpoints must compare equal")));
     using namespace std::string_view_literals;
     for (const auto text : {"127.0.0.1:9"sv, "127.0.0.1\0ignored"sv,
                             "[::ffff:127.0.0.1]"sv, "::1\0ignored"sv}) {
         const acpp::TargetAddress target(std::string(text), 443);
-        if (!Require(!target.IsValid() && target.host.empty(),
-                     "invalid host bytes must never acquire a routable target")) return 10;
+        ASSERT_FALSE((!Require(!target.IsValid() && target.host.empty(),
+                     "invalid host bytes must never acquire a routable target")));
     }
     for (const auto text : {"[example.com]:443", "[127.0.0.1]:443", "[::1]:443junk"}) {
-        if (!Require(!acpp::TargetAddress::Parse(text),
-                     "endpoint brackets must contain exactly an IPv6 literal")) return 11;
+        ASSERT_FALSE((!Require(!acpp::TargetAddress::Parse(text),
+                     "endpoint brackets must contain exactly an IPv6 literal")));
     }
     struct NumericCase {
         acpp::net::ip::address address;
@@ -82,17 +84,16 @@ int main() {
     };
     for (const auto& test : numeric_cases) {
         const acpp::iputil::AddressText text(test.address);
-        if (!Require(text.View() == test.text, "numeric IP text or scope changed")) return 12;
+        ASSERT_FALSE((!Require(text.View() == test.text, "numeric IP text or scope changed")));
         const acpp::TargetAddress target(test.address, 65535);
         std::array<char, 128> logged;
         const auto end = std::format_to(logged.begin(), "{}", target);
-        if (!Require(std::string_view(logged.data(), end - logged.begin()) == test.endpoint,
-                     "logging must preserve normalized endpoint text")) return 13;
+        ASSERT_FALSE((!Require(std::string_view(logged.data(), end - logged.begin()) == test.endpoint,
+                     "logging must preserve normalized endpoint text")));
     }
     const acpp::net::ip::address_v6 named_scope(
         acpp::net::ip::make_address_v6("fe80::1").to_bytes(), 1);
     const acpp::iputil::AddressText scoped_text(named_scope);
-    if (!Require(scoped_text.View() == named_scope.to_string(),
-                 "interface-name scope formatting must match the platform")) return 14;
-    return 0;
+    ASSERT_FALSE((!Require(scoped_text.View() == named_scope.to_string(),
+                 "interface-name scope formatting must match the platform")));
 }

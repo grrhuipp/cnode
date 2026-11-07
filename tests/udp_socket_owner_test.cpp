@@ -1,3 +1,6 @@
+#include <stdexcept>
+#include <gtest/gtest.h>
+
 #include "worker/udp_ingress.hpp"
 #include "worker/udp_association_reclaimer.hpp"
 #include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
@@ -184,26 +187,14 @@ public:
         acpp::InitialPayload, acpp::session::Context&, acpp::StatsShard&,
         const acpp::TimeoutsConfig&) override {
         std::cerr << "uplink fixture started an unexpected native job\n";
-        std::exit(1);
+        ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed");
     }
 };
 
-static_assert(noexcept(
-    std::declval<acpp::worker_detail::UdpIngress&>().RequestStop()));
-static_assert(noexcept(
-    std::declval<acpp::worker_detail::UdpIngress&>().ReplaceHandler(
-        std::declval<std::unique_ptr<acpp::Inbound>>())));
-static_assert(noexcept(
-    std::declval<acpp::worker_detail::UdpIngress&>().CleanupAllClientSessions()));
-static_assert(noexcept(
-    std::declval<acpp::worker_detail::UdpIngress&>().CloseSocket(
-        std::declval<const std::string&>())));
-static_assert(noexcept(
-    std::declval<acpp::worker_detail::UdpIngress&>().CloseAllSockets()));
 
 [[noreturn]] void Fail(std::string_view message) {
     std::cerr << message << '\n';
-    std::exit(1);
+    ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed");
 }
 
 void VerifyMigratedBudgetReservations() {
@@ -419,7 +410,7 @@ void VerifyWorkerBudget() {
 
 }  // namespace
 
-int main() {
+TEST(UdpSocketOwner, Contract) {
     ThreadResourceScope thread_resource;
     VerifyWorkerBudget();
     VerifyMigratedBudgetReservations();
@@ -1313,5 +1304,4 @@ int main() {
     }
     worker.CleanupClientSessions(idle_cleanup_socket);
 
-    return 0;
 }

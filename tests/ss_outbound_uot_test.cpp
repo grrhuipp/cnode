@@ -1,3 +1,6 @@
+#include <stdexcept>
+#include <gtest/gtest.h>
+
 #include "ss_outbound_uot.hpp"
 
 #include <cstdlib>
@@ -10,7 +13,7 @@ using acpp::SsUotVersion;
 
 [[noreturn]] void Fail(std::string_view message) {
     std::cerr << message << '\n';
-    std::exit(1);
+    ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed");
 }
 
 void Check(bool condition, std::string_view message) {
@@ -28,7 +31,7 @@ void CheckInvalid(std::string_view body) {
     Check(!result, "invalid UoT settings were accepted");
 }
 
-void TestValidFormsAreNormalized() {
+TEST(SsOutboundUot, ValidFormsAreNormalized) {
     auto absent = Parse(R"({})");
     Check(absent.has_value() && !*absent, "absent UoT was enabled");
 
@@ -50,7 +53,7 @@ void TestValidFormsAreNormalized() {
           "object UoT v2 mismatch");
 }
 
-void TestInvalidFormsAreRejected() {
+TEST(SsOutboundUot, InvalidFormsAreRejected) {
     CheckInvalid(R"({"uot":true,"uotVersion":3})");
     CheckInvalid(R"({"uot":"true"})");
     CheckInvalid(R"({"uot":{"enabled":true,"version":3}})");
@@ -62,9 +65,3 @@ void TestInvalidFormsAreRejected() {
 
 }  // namespace
 
-int main() {
-    TestValidFormsAreNormalized();
-    TestInvalidFormsAreRejected();
-    std::cout << "ss_outbound_uot_test: ok\n";
-    return 0;
-}

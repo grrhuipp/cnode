@@ -6,6 +6,7 @@
 #include "acppnode/common/buffer_util.hpp"
 #include "acppnode/infra/log.hpp"
 
+#include <openssl/base64.h>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
 #include <asio/bind_cancellation_slot.hpp>

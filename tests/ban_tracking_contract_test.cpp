@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "acppnode/app/rate_limiter.hpp"
 #include "acppnode/common/session.hpp"
 #include <iostream>
@@ -6,7 +8,7 @@
 #include <string>
 #include <vector>
 
-int main() {
+TEST(BanTrackingContract, Contract) {
     acpp::RateLimitConfig config;
     config.auth_fail_limit = 1;
     config.auth_fail_window = 60;
@@ -27,46 +29,38 @@ int main() {
     acpp::session::Inbound inbound;
     inbound.source_ip = ip;
     record_auth_failure(inbound, ip);  // socket peer must not count
-    if (limiter->IsBanned(tag, ip)) return 1;
+    ASSERT_FALSE((limiter->IsBanned(tag, ip)));
 
     inbound.client_ip_source = "http_header";
     record_auth_failure(inbound, ip);  // forwarded header must not count
-    if (limiter->IsBanned(tag, ip)) return 2;
+    ASSERT_FALSE((limiter->IsBanned(tag, ip)));
 
     inbound.client_ip_source = "proxy_protocol";
     inbound.source_ip.clear();
-    if (inbound.HasProxyProtocolClientIP()) return 3;  // no usable PP source
+    ASSERT_FALSE((inbound.HasProxyProtocolClientIP()));  // no usable PP source
     record_auth_failure(inbound, ip);
-    if (limiter->IsBanned(tag, ip)) return 4;
+    ASSERT_FALSE((limiter->IsBanned(tag, ip)));
 
     inbound.source_ip = ip;
-    if (!inbound.HasProxyProtocolClientIP()) return 5;
-    if (limiter->IsBanned(tag, ip)) return 6;
+    ASSERT_FALSE((!inbound.HasProxyProtocolClientIP()));
+    ASSERT_FALSE((limiter->IsBanned(tag, ip)));
     record_auth_failure(inbound, ip);
-    if (!limiter->IsBanned(tag, ip)) return 7;
-    if (limiter->IsBanned(other_tag, ip)) return 8;
-    if (limiter->TryAcceptIP(tag, ip)
-        != acpp::ConnectionLimiterCore::RejectReason::IP_BANNED) {
-        return 9;
-    }
-    if (limiter->TryAcceptIP(tag, "192.0.2.2")
-        != acpp::ConnectionLimiterCore::RejectReason::NONE) {
-        return 10;
-    }
+    ASSERT_FALSE((!limiter->IsBanned(tag, ip)));
+    ASSERT_FALSE((limiter->IsBanned(other_tag, ip)));
+    ASSERT_FALSE((limiter->TryAcceptIP(tag, ip)
+        != acpp::ConnectionLimiterCore::RejectReason::IP_BANNED));
+    ASSERT_FALSE((limiter->TryAcceptIP(tag, "192.0.2.2")
+        != acpp::ConnectionLimiterCore::RejectReason::NONE));
 
     acpp::RateLimitConfig limits_config;
     limits_config.auth_fail_limit = 1;
     limits_config.max_conn_per_ip = 1;
     auto limits = std::make_unique<acpp::ConnectionLimiterCore>(limits_config);
     limits->OnAuthFailTracked(tag, ip);
-    if (limits->TryAcceptIP(tag, ip, false)
-        != acpp::ConnectionLimiterCore::RejectReason::NONE) {
-        return 11;  // non-PP skips the auth ban but still enters IP limits
-    }
-    if (limits->TryAcceptIP(tag, ip, false)
-        != acpp::ConnectionLimiterCore::RejectReason::MAX_CONNECTIONS_PER_IP) {
-        return 12;
-    }
+    ASSERT_FALSE((limits->TryAcceptIP(tag, ip, false)
+        != acpp::ConnectionLimiterCore::RejectReason::NONE));
+    ASSERT_FALSE((limits->TryAcceptIP(tag, ip, false)
+        != acpp::ConnectionLimiterCore::RejectReason::MAX_CONNECTIONS_PER_IP));
     // Exhaust tracking with distinct, live source addresses. Lack of tracking
     // storage must reject admission, not silently remove the per-IP policy.
     auto capacity = std::make_unique<acpp::ConnectionLimiterCore>(
@@ -78,7 +72,7 @@ int main() {
                        std::to_string(value & 255);
         const auto reason = capacity->TryAcceptIP(tag, address);
         if (reason != acpp::ConnectionLimiterCore::RejectReason::NONE) {
-            if (reason != acpp::ConnectionLimiterCore::RejectReason::TRACKING_CAPACITY) return 21;
+            ASSERT_FALSE((reason != acpp::ConnectionLimiterCore::RejectReason::TRACKING_CAPACITY));
             rejected = std::move(address);
             break;
         }
@@ -86,39 +80,38 @@ int main() {
     }
     if (rejected.empty()) {
         std::cerr << "exhausted IP tracking admitted untracked connections\n";
-        return 13;
+        FAIL() << "exhausted IP tracking admitted untracked connections";
     }
     for (const auto& address : admitted) capacity->ReleaseHash(acpp::ConnectionLimiterCore::IpHash(address));
-    if (capacity->TryAcceptIP(tag, rejected) !=
-        acpp::ConnectionLimiterCore::RejectReason::NONE) return 14;
-    if (capacity->TryAcceptIP(tag, rejected) !=
-        acpp::ConnectionLimiterCore::RejectReason::MAX_CONNECTIONS_PER_IP) return 15;
+    ASSERT_FALSE((capacity->TryAcceptIP(tag, rejected) !=
+        acpp::ConnectionLimiterCore::RejectReason::NONE));
+    ASSERT_FALSE((capacity->TryAcceptIP(tag, rejected) !=
+        acpp::ConnectionLimiterCore::RejectReason::MAX_CONNECTIONS_PER_IP));
     capacity->ReleaseHash(acpp::ConnectionLimiterCore::IpHash(rejected));
 
     auto independent = std::make_unique<acpp::ConnectionLimiterCore>(
         acpp::RateLimitConfig{.max_connections = 1, .max_conn_per_ip = 1});
-    if (independent->TryAcceptGlobal() !=
-        acpp::ConnectionLimiterCore::RejectReason::NONE) return 16;
-    if (independent->TryAcceptIP(tag, ip) !=
-        acpp::ConnectionLimiterCore::RejectReason::NONE) return 17;
+    ASSERT_FALSE((independent->TryAcceptGlobal() !=
+        acpp::ConnectionLimiterCore::RejectReason::NONE));
+    ASSERT_FALSE((independent->TryAcceptIP(tag, ip) !=
+        acpp::ConnectionLimiterCore::RejectReason::NONE));
     independent->ReleaseHash(acpp::ConnectionLimiterCore::IpHash(ip));
-    if (independent->TryAcceptGlobal() !=
-        acpp::ConnectionLimiterCore::RejectReason::MAX_CONNECTIONS) return 18;
-    if (independent->TryAcceptIP(tag, ip) !=
-        acpp::ConnectionLimiterCore::RejectReason::NONE) return 19;
+    ASSERT_FALSE((independent->TryAcceptGlobal() !=
+        acpp::ConnectionLimiterCore::RejectReason::MAX_CONNECTIONS));
+    ASSERT_FALSE((independent->TryAcceptIP(tag, ip) !=
+        acpp::ConnectionLimiterCore::RejectReason::NONE));
     independent->ReleaseHash(acpp::ConnectionLimiterCore::IpHash(ip));
     independent->ReleaseGlobal();
-    if (independent->TryAcceptGlobal() !=
-        acpp::ConnectionLimiterCore::RejectReason::NONE) return 20;
+    ASSERT_FALSE((independent->TryAcceptGlobal() !=
+        acpp::ConnectionLimiterCore::RejectReason::NONE));
     independent->ReleaseGlobal();
     // Multiple auth failures within the same second must accumulate and reach ban limit.
     auto multi_fail = std::make_unique<acpp::ConnectionLimiterCore>(
         acpp::RateLimitConfig{.auth_fail_limit = 3, .auth_fail_window = 60, .auth_ban_seconds = 60});
     multi_fail->OnAuthFailTracked(tag, "192.0.2.55");
-    if (multi_fail->IsBanned(tag, "192.0.2.55")) return 22;
+    ASSERT_FALSE((multi_fail->IsBanned(tag, "192.0.2.55")));
     multi_fail->OnAuthFailTracked(tag, "192.0.2.55");
-    if (multi_fail->IsBanned(tag, "192.0.2.55")) return 23;
+    ASSERT_FALSE((multi_fail->IsBanned(tag, "192.0.2.55")));
     multi_fail->OnAuthFailTracked(tag, "192.0.2.55");
-    if (!multi_fail->IsBanned(tag, "192.0.2.55")) return 24;
-    return 0;
+    ASSERT_FALSE((!multi_fail->IsBanned(tag, "192.0.2.55")));
 }

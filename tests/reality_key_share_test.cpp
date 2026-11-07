@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "reality_key_share.hpp"
 
 #include <algorithm>
@@ -39,7 +41,7 @@ bool Require(bool condition, const char* message) {
 
 }  // namespace
 
-int main() {
+TEST(RealityKeyShare, Contract) {
     using acpp::transport::internet::ParseRealityClientKeyShareExtension;
     constexpr uint16_t kX25519 = 29;
     constexpr uint16_t kX25519MlKem768 = 0x11ec;
@@ -48,44 +50,37 @@ int main() {
     const std::vector<Entry> valid_entries{{kX25519, x25519_key}};
     const auto valid =
         ParseRealityClientKeyShareExtension(BuildExtension(valid_entries));
-    if (!Require(valid && valid->front() == 0x2a,
-                 "a canonical X25519 key share must parse")) return 1;
+    ASSERT_FALSE((!Require(valid && valid->front() == 0x2a,
+                 "a canonical X25519 key share must parse")));
 
     const std::vector<uint8_t> trailing{0xff};
-    if (!Require(!ParseRealityClientKeyShareExtension(
+    ASSERT_FALSE((!Require(!ParseRealityClientKeyShareExtension(
                      BuildExtension(valid_entries, trailing)),
-                 "bytes after an X25519 key share must not be ignored")) {
-        return 2;
-    }
+                 "bytes after an X25519 key share must not be ignored")));
 
     const std::vector<Entry> duplicate_entries{
         {kX25519, x25519_key}, {kX25519, x25519_key}};
-    if (!Require(!ParseRealityClientKeyShareExtension(
+    ASSERT_FALSE((!Require(!ParseRealityClientKeyShareExtension(
                      BuildExtension(duplicate_entries)),
-                 "duplicate X25519 groups must be rejected")) return 3;
+                 "duplicate X25519 groups must be rejected")));
 
     const std::vector<Entry> short_hybrid{{kX25519MlKem768, x25519_key}};
-    if (!Require(!ParseRealityClientKeyShareExtension(
+    ASSERT_FALSE((!Require(!ParseRealityClientKeyShareExtension(
                      BuildExtension(short_hybrid)),
-                 "a truncated X25519MLKEM768 share must be rejected")) {
-        return 4;
-    }
+                 "a truncated X25519MLKEM768 share must be rejected")));
 
     std::vector<uint8_t> hybrid_key(1216, 0x11);
     std::fill_n(hybrid_key.end() - 32, 32, uint8_t{0x3b});
     const std::vector<Entry> valid_hybrid{{kX25519MlKem768, hybrid_key}};
     const auto parsed_hybrid =
         ParseRealityClientKeyShareExtension(BuildExtension(valid_hybrid));
-    if (!Require(parsed_hybrid && parsed_hybrid->front() == 0x3b,
-                 "a canonical hybrid share must expose its X25519 suffix")) {
-        return 5;
-    }
+    ASSERT_FALSE((!Require(parsed_hybrid && parsed_hybrid->front() == 0x3b,
+                 "a canonical hybrid share must expose its X25519 suffix")));
 
     const std::vector<Entry> hybrid_then_x25519{
         {kX25519MlKem768, hybrid_key}, {kX25519, x25519_key}};
     const auto preferred_x25519 = ParseRealityClientKeyShareExtension(
         BuildExtension(hybrid_then_x25519));
-    if (!Require(preferred_x25519 && preferred_x25519->front() == 0x2a,
-                 "a standalone X25519 share must remain preferred")) return 6;
-    return 0;
+    ASSERT_FALSE((!Require(preferred_x25519 && preferred_x25519->front() == 0x2a,
+                 "a standalone X25519 share must remain preferred")));
 }

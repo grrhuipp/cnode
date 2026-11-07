@@ -15,11 +15,13 @@
 
 #include <openssl/aead.h>
 #include <openssl/asn1.h>
+#include <openssl/bytestring.h>
 #include <openssl/curve25519.h>
 #include <openssl/evp.h>
 #include <openssl/hkdf.h>
 #include <openssl/hmac.h>
 #include <openssl/mem.h>
+#include <openssl/mldsa.h>
 #include <openssl/nid.h>
 #include <openssl/obj.h>
 #include <openssl/rand.h>
@@ -74,9 +76,10 @@ struct X509Deleter {
     }
 };
 
-struct EvpMdCtxDeleter {
-    void operator()(EVP_MD_CTX* ctx) const noexcept {
-        EVP_MD_CTX_free(ctx);
+struct Mldsa65PrivateKeyDeleter {
+    void operator()(MLDSA65_private_key* key) const noexcept {
+        OPENSSL_cleanse(key, sizeof(*key));
+        delete key;
     }
 };
 
@@ -99,7 +102,8 @@ struct X509ExtensionDeleter {
 };
 
 using UniqueEvpPkey = std::unique_ptr<EVP_PKEY, EvpPkeyDeleter>;
-using UniqueEvpMdCtx = std::unique_ptr<EVP_MD_CTX, EvpMdCtxDeleter>;
+using UniqueMldsa65PrivateKey =
+    std::unique_ptr<MLDSA65_private_key, Mldsa65PrivateKeyDeleter>;
 using UniqueX509 = std::unique_ptr<X509, X509Deleter>;
 using UniqueAsn1Object = std::unique_ptr<ASN1_OBJECT, Asn1ObjectDeleter>;
 using UniqueAsn1OctetString = std::unique_ptr<ASN1_OCTET_STRING, Asn1OctetStringDeleter>;
@@ -118,12 +122,12 @@ struct RealityServerState final : SslContext::ContextState {
     uint64_t max_time_diff_ms = 0;
     UniqueEvpPkey ed25519_key;
     std::array<uint8_t, 32> ed25519_public{};
-    UniqueEvpPkey mldsa65_key;
+    UniqueMldsa65PrivateKey mldsa65_key;
     std::vector<uint8_t> certificate_template;
 };
 
 struct RealityClientContextState final : SslContext::ContextState {
-    UniqueEvpPkey mldsa65_verify_key;
+    MLDSA65_public_key mldsa65_verify_key;
 };
 
 void FreeRealityServerConnState(void* /*parent*/,
@@ -331,7 +335,7 @@ BuildRealityClientAuthPlain(
 
 [[nodiscard]] std::unique_ptr<RealityClientState> BuildRealityClientState(
     const RealityConfig& config,
-    EVP_PKEY* mldsa65_verify_key) {
+    const MLDSA65_public_key* mldsa65_verify_key) {
     if (!config.public_key) {
         LOG_ERROR("REALITY client public key is missing");
         return nullptr;
@@ -539,16 +543,11 @@ bool VerifyRealityClientHandshake(
             return false;
         }
 
-        UniqueEvpMdCtx md_ctx(EVP_MD_CTX_new());
-        if (!md_ctx ||
-            EVP_DigestVerifyInit(
-                md_ctx.get(), nullptr, nullptr, nullptr, state.mldsa65_verify_key) != 1 ||
-            EVP_DigestVerify(
-                md_ctx.get(),
+        if (MLDSA65_verify(
+                state.mldsa65_verify_key,
                 ASN1_STRING_get0_data(ext_data),
                 static_cast<size_t>(ASN1_STRING_length(ext_data)),
-                mldsa_msg.data(),
-                mldsa_msg.size()) != 1) {
+                mldsa_msg.data(), mldsa_msg.size(), nullptr, 0) != 1) {
             LOG_NET_DEBUG("REALITY client verification failed > invalid ML-DSA-65 signature");
             return false;
         }
@@ -744,18 +743,9 @@ void RealityServerMsgCallback(int is_write,
     }
 
     std::array<uint8_t, transport::internet::kRealityMldsa65SignatureSize> mldsa_sig{};
-    size_t sig_len = mldsa_sig.size();
-    UniqueEvpMdCtx md_ctx(EVP_MD_CTX_new());
-    if (!md_ctx ||
-        EVP_DigestSignInit(
-            md_ctx.get(), nullptr, nullptr, nullptr, state->mldsa65_key.get()) != 1 ||
-        EVP_DigestSign(
-            md_ctx.get(),
-            mldsa_sig.data(),
-            &sig_len,
-            mldsa_msg.data(),
-            mldsa_msg.size()) != 1 ||
-        sig_len != mldsa_sig.size()) {
+    static_assert(mldsa_sig.size() == MLDSA65_SIGNATURE_BYTES);
+    if (MLDSA65_sign(mldsa_sig.data(), state->mldsa65_key.get(),
+                     mldsa_msg.data(), mldsa_msg.size(), nullptr, 0) != 1) {
         SSL_certs_clear(ssl);
         return;
     }
@@ -1002,11 +992,10 @@ VerifyRealityClientHelloHandshake(
     state->short_ids = config.short_ids;
 
     if (config.mldsa65_seed) {
-        state->mldsa65_key.reset(EVP_PKEY_pqdsa_new_raw_private_key(
-            NID_MLDSA65,
-            config.mldsa65_seed->data(),
-            config.mldsa65_seed->size()));
-        if (!state->mldsa65_key) {
+        state->mldsa65_key.reset(new MLDSA65_private_key);
+        if (MLDSA65_private_key_from_seed(
+                state->mldsa65_key.get(), config.mldsa65_seed->data(),
+                config.mldsa65_seed->size()) != 1) {
             LOG_ERROR("REALITY ML-DSA-65 key generation from seed failed");
             return {};
         }
@@ -1059,35 +1048,43 @@ VerifyRealityClientHelloHandshake(
     return state;
 }
 
-void ConfigureRealityClientFingerprint(SSL_CTX* ctx,
-                                       std::string_view fingerprint) {
+[[nodiscard]] bool ConfigureRealityClientFingerprint(SSL_CTX* ctx,
+                                                    std::string_view fingerprint) {
+    uint16_t tls13_ciphers[] = {
+        SSL_CIPHER_AES_128_GCM_SHA256,
+        SSL_CIPHER_AES_256_GCM_SHA384,
+        SSL_CIPHER_CHACHA20_POLY1305_SHA256,
+    };
+    if (fingerprint == "firefox") {
+        std::swap(tls13_ciphers[1], tls13_ciphers[2]);
+    }
+    if (SSL_CTX_set1_tls13_ciphers(ctx, tls13_ciphers, nullptr,
+                                  std::size(tls13_ciphers)) != 1) {
+        return false;
+    }
     if (fingerprint == "firefox") {
         SSL_CTX_set_grease_enabled(ctx, 0);
         SSL_CTX_set_permute_extensions(ctx, 0);
-        (void)SSL_CTX_set_strict_cipher_list(
+        return SSL_CTX_set_strict_cipher_list(
             ctx,
-            "TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256:"
-            "TLS_AES_256_GCM_SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:"
+            "ECDHE-ECDSA-AES128-GCM-SHA256:"
             "ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-CHACHA20-POLY1305:"
             "ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES256-GCM-SHA384:"
             "ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-SHA:"
             "ECDHE-RSA-AES256-SHA:AES128-GCM-SHA256:AES256-GCM-SHA384:"
-            "AES128-SHA:AES256-SHA");
-        return;
+            "AES128-SHA:AES256-SHA") == 1;
     }
     if (fingerprint == "safari" || fingerprint == "ios") {
         SSL_CTX_set_grease_enabled(ctx, 1);
         SSL_CTX_set_permute_extensions(ctx, 0);
-        (void)SSL_CTX_set_strict_cipher_list(
+        return SSL_CTX_set_strict_cipher_list(
             ctx,
-            "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:"
-            "TLS_CHACHA20_POLY1305_SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:"
+            "ECDHE-ECDSA-AES256-GCM-SHA384:"
             "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-CHACHA20-POLY1305:"
             "ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-GCM-SHA256:"
             "ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES256-SHA:"
             "ECDHE-ECDSA-AES128-SHA:ECDHE-RSA-AES256-SHA:ECDHE-RSA-AES128-SHA:"
-            "AES256-GCM-SHA384:AES128-GCM-SHA256:AES256-SHA:AES128-SHA");
-        return;
+            "AES256-GCM-SHA384:AES128-GCM-SHA256:AES256-SHA:AES128-SHA") == 1;
     }
     if (fingerprint == "360" || fingerprint == "qq") {
         SSL_CTX_set_grease_enabled(ctx, 1);
@@ -1097,15 +1094,14 @@ void ConfigureRealityClientFingerprint(SSL_CTX* ctx,
         SSL_CTX_set_grease_enabled(ctx, 1);
         SSL_CTX_set_permute_extensions(ctx, 1);
     }
-    (void)SSL_CTX_set_strict_cipher_list(
+    return SSL_CTX_set_strict_cipher_list(
         ctx,
-        "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:"
-        "TLS_CHACHA20_POLY1305_SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:"
+        "ECDHE-ECDSA-AES128-GCM-SHA256:"
         "ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:"
             "ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:"
         "ECDHE-RSA-CHACHA20-POLY1305:ECDHE-RSA-AES128-SHA:"
         "ECDHE-RSA-AES256-SHA:AES128-GCM-SHA256:AES256-GCM-SHA384:"
-        "AES128-SHA:AES256-SHA");
+        "AES128-SHA:AES256-SHA") == 1;
 }
 
 // Groups and signature algorithms are part of the fingerprint: parse them once
@@ -1113,24 +1109,33 @@ void ConfigureRealityClientFingerprint(SSL_CTX* ctx,
 [[nodiscard]] bool ConfigureRealityClientKeyExchange(SSL_CTX* ctx,
                                                      std::string_view fingerprint) {
     const char* groups = "X25519MLKEM768:X25519:P-256:P-384";
-    const char* sigalgs =
-        "ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:rsa_pkcs1_sha256:"
-        "ecdsa_secp384r1_sha384:rsa_pss_rsae_sha384:rsa_pkcs1_sha384:"
-        "rsa_pss_rsae_sha512:rsa_pkcs1_sha512";
+    static constexpr uint16_t chrome_sigalgs[] = {
+        SSL_SIGN_ECDSA_SECP256R1_SHA256, SSL_SIGN_RSA_PSS_RSAE_SHA256,
+        SSL_SIGN_RSA_PKCS1_SHA256, SSL_SIGN_ECDSA_SECP384R1_SHA384,
+        SSL_SIGN_RSA_PSS_RSAE_SHA384, SSL_SIGN_RSA_PKCS1_SHA384,
+        SSL_SIGN_RSA_PSS_RSAE_SHA512, SSL_SIGN_RSA_PKCS1_SHA512,
+    };
+    static constexpr uint16_t firefox_sigalgs[] = {
+        SSL_SIGN_ECDSA_SECP256R1_SHA256, SSL_SIGN_ECDSA_SECP384R1_SHA384,
+        SSL_SIGN_ECDSA_SECP521R1_SHA512, SSL_SIGN_RSA_PSS_RSAE_SHA256,
+        SSL_SIGN_RSA_PSS_RSAE_SHA384, SSL_SIGN_RSA_PSS_RSAE_SHA512,
+        SSL_SIGN_RSA_PKCS1_SHA256, SSL_SIGN_RSA_PKCS1_SHA384,
+        SSL_SIGN_RSA_PKCS1_SHA512,
+    };
+    static constexpr uint16_t safari_sigalgs[] = {
+        SSL_SIGN_ECDSA_SECP256R1_SHA256, SSL_SIGN_RSA_PSS_RSAE_SHA256,
+        SSL_SIGN_RSA_PKCS1_SHA256, SSL_SIGN_ECDSA_SECP384R1_SHA384,
+        SSL_SIGN_ECDSA_SECP521R1_SHA512, SSL_SIGN_RSA_PSS_RSAE_SHA384,
+        SSL_SIGN_RSA_PSS_RSAE_SHA512, SSL_SIGN_RSA_PKCS1_SHA384,
+        SSL_SIGN_RSA_PKCS1_SHA512, SSL_SIGN_RSA_PKCS1_SHA1,
+    };
+    std::span<const uint16_t> sigalgs = chrome_sigalgs;
     if (fingerprint == "firefox") {
         groups = "X25519MLKEM768:X25519:P-256:P-384:P-521";
-        sigalgs =
-            "ecdsa_secp256r1_sha256:ecdsa_secp384r1_sha384:"
-            "ecdsa_secp521r1_sha512:rsa_pss_rsae_sha256:rsa_pss_rsae_sha384:"
-            "rsa_pss_rsae_sha512:rsa_pkcs1_sha256:rsa_pkcs1_sha384:"
-            "rsa_pkcs1_sha512";
+        sigalgs = firefox_sigalgs;
     } else if (fingerprint == "safari" || fingerprint == "ios") {
         groups = "X25519MLKEM768:X25519:P-256:P-384:P-521";
-        sigalgs =
-            "ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:rsa_pkcs1_sha256:"
-            "ecdsa_secp384r1_sha384:ecdsa_secp521r1_sha512:"
-            "rsa_pss_rsae_sha384:rsa_pss_rsae_sha512:rsa_pkcs1_sha384:"
-            "rsa_pkcs1_sha512:rsa_pkcs1_sha1";
+        sigalgs = safari_sigalgs;
     } else if (fingerprint == "random" || fingerprint == "randomized") {
         groups = "X25519MLKEM768:X25519:P-256:P-384:P-521";
     }
@@ -1138,7 +1143,8 @@ void ConfigureRealityClientFingerprint(SSL_CTX* ctx,
         LOG_ERROR("REALITY client failed to configure key share groups");
         return false;
     }
-    if (SSL_CTX_set1_sigalgs_list(ctx, sigalgs) != 1) {
+    if (SSL_CTX_set_signing_algorithm_prefs(ctx, sigalgs.data(), sigalgs.size()) != 1 ||
+        SSL_CTX_set_verify_algorithm_prefs(ctx, sigalgs.data(), sigalgs.size()) != 1) {
         LOG_ERROR("REALITY client failed to configure signature algorithms");
         return false;
     }
@@ -1207,8 +1213,8 @@ std::unique_ptr<SslContext> SslContext::CreateClientReality(
     SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
     SSL_CTX_set_options(ctx, SSL_OP_NO_TICKET);
     SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nullptr);
-    ConfigureRealityClientFingerprint(ctx, reality.fingerprint);
-    if (!ConfigureRealityClientKeyExchange(ctx, reality.fingerprint)) {
+    if (!ConfigureRealityClientFingerprint(ctx, reality.fingerprint) ||
+        !ConfigureRealityClientKeyExchange(ctx, reality.fingerprint)) {
         SSL_CTX_free(ctx);
         return nullptr;
     }
@@ -1221,11 +1227,10 @@ std::unique_ptr<SslContext> SslContext::CreateClientReality(
     std::unique_ptr<RealityClientContextState> state;
     if (reality.mldsa65_verify) {
         state = std::make_unique<RealityClientContextState>();
-        state->mldsa65_verify_key.reset(EVP_PKEY_pqdsa_new_raw_public_key(
-            NID_MLDSA65,
-            reality.mldsa65_verify->data(),
-            reality.mldsa65_verify->size()));
-        if (!state->mldsa65_verify_key) {
+        CBS encoded;
+        CBS_init(&encoded, reality.mldsa65_verify->data(),
+                 reality.mldsa65_verify->size());
+        if (MLDSA65_parse_public_key(&state->mldsa65_verify_key, &encoded) != 1) {
             LOG_ERROR("REALITY client ML-DSA-65 public key initialization failed");
             SSL_CTX_free(ctx);
             return nullptr;
@@ -1252,8 +1257,8 @@ bool TlsStream::SetRealityClient(const RealityConfig& reality) {
         ? static_cast<const RealityClientContextState*>(
               SSL_CTX_get_ex_data(ssl_ctx, RealityClientContextStateExIndex()))
         : nullptr;
-    EVP_PKEY* verify_key =
-        ctx_state ? ctx_state->mldsa65_verify_key.get() : nullptr;
+    const MLDSA65_public_key* verify_key =
+        ctx_state ? &ctx_state->mldsa65_verify_key : nullptr;
     if (reality.mldsa65_verify && !verify_key) {
         LOG_ERROR("REALITY client missing prebuilt ML-DSA-65 verification key");
         return false;

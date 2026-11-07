@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "acppnode/transport/internet/tcp_stream.hpp"
 #include "acppnode/transport/internet/transport_stack.hpp"
 
@@ -565,7 +567,7 @@ void InvalidPaddingFailsConnection() {
 
 }  // namespace
 
-int main() {
+TEST(Http2ReceiveCredit, Contract) {
     try {
         ConsumptionPaddingAndDiscard("http");
         ConsumptionPaddingAndDiscard("xhttp");
@@ -583,9 +585,9 @@ int main() {
         XHttpSplitCredit(acpp::XHttpMode::StreamUp);
         XHttpSplitCredit(acpp::XHttpMode::PacketUp);
         std::puts("HTTP/2 receive credit: consumption, isolation, padding, reset, gRPC, XHTTP");
-        return 0;
+        return;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "HTTP/2 receive credit: %s\n", error.what());
-        return 1;
+        FAIL() << error.what();
     }
 }

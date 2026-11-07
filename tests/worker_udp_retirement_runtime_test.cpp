@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "acppnode/app/dns/dns_worker.hpp"
 #include "acppnode/app/port_binding.hpp"
 #include "acppnode/app/proxyman/inbound/factory.hpp"
@@ -736,7 +738,12 @@ template <typename T>
 
 } // namespace
 
-int main(int argc, char** argv) {
+class WorkerUdpRetirementRuntime : public ::testing::TestWithParam<std::string> {};
+
+TEST_P(WorkerUdpRetirementRuntime, Lifecycle) {
+    std::string option = GetParam();
+    const int argc = option.empty() ? 1 : 2;
+    char* argv[] = {nullptr, option.data()};
     RuntimeMode mode = RuntimeMode::Dns;
     if (argc == 2 && std::string_view(argv[1]) == "--delayed-retirement") {
         mode = RuntimeMode::DelayedRetirement;
@@ -746,7 +753,7 @@ int main(int argc, char** argv) {
         mode = RuntimeMode::ShutdownDelayed;
     } else if (argc != 1) {
         std::cerr << "usage: worker_udp_retirement_runtime_test [--delayed-retirement | --shutdown-dns | --shutdown-delayed]\\n";
-        return 64;
+        FAIL() << "unknown retirement test scenario";
     }
     try {
         acpp::memory::ConfigureProcessAllocator();
@@ -891,7 +898,7 @@ int main(int argc, char** argv) {
             if (cache_future.get().entries != 0)
                 Fail("delayed test unexpectedly entered DNS cache");
             std::cout << "worker UDP retirement delayed completion passed\n";
-            return 0;
+            return;
         }
 
         // On main/control thread, drive DNSWorker and its real UDP peer while
@@ -937,7 +944,7 @@ int main(int argc, char** argv) {
             worker_exit.responses_created == 0 ||
             worker_exit.responses_created != worker_exit.responses_destroyed)
             Fail("response ownership did not close on the data Worker thread");
-        if (mode == RuntimeMode::ShutdownDns) return 0;
+        if (mode == RuntimeMode::ShutdownDns) return;
         // DNS state observation is made only by its owning executor through
         // the public bounded API. No Worker/private state is inspected here.
         control_io.restart();
@@ -949,9 +956,11 @@ int main(int argc, char** argv) {
         const auto cache = cache_future.get();
         if (cache.entries != 0) Fail("held, canceled DNS query unexpectedly entered cache");
         std::cout << "worker UDP retirement native DNS cancellation passed\n";
-        return 0;
+        return;
     } catch (const std::exception& e) {
         std::cerr << "worker UDP retirement runtime test: " << e.what() << '\n';
-        return 1;
+        FAIL() << e.what();
     }
 }
+
+INSTANTIATE_TEST_SUITE_P(Scenarios, WorkerUdpRetirementRuntime, ::testing::Values("", "--delayed-retirement", "--shutdown-dns", "--shutdown-delayed"));

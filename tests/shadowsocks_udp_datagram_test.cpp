@@ -1,3 +1,6 @@
+#include <stdexcept>
+#include <gtest/gtest.h>
+
 #include "ss_udp.hpp"
 #include "shadowsocks_crypto.hpp"
 #include "acppnode/common/buf/contiguous_buffer_view.hpp"
@@ -16,7 +19,7 @@ using namespace acpp;
 
 [[noreturn]] void Fail(std::string_view message) {
     std::cerr << message << '\n';
-    std::exit(1);
+    ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed");
 }
 
 void Check(bool condition, std::string_view message) {
@@ -445,7 +448,7 @@ void Check2022ReplayWindow() {
 
 }  // namespace
 
-int main() {
+TEST(ShadowsocksUdpDatagram, Contract) {
     const TargetAddress target("1.1.1.1", 53);
     const std::vector<uint8_t> source(buf::Buffer::kSize + 257, 0x6d);
     const buf::MultiBuffer fragmented = MakePayload(source, target);
@@ -466,5 +469,4 @@ int main() {
     Check2022(target, source, payload.Bytes(), ss::SsCipherType::AES_256_GCM_2022, 32, true);
     Check2022ReplayWindow();
     Check2022AssociationPaths();
-    return 0;
 }

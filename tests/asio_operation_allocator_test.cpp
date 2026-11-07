@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "acppnode/transport/internet/tcp_stream.hpp"
 #include "acppnode/common/allocator.hpp"
 #include <asio/co_spawn.hpp>
@@ -218,7 +220,7 @@ void TestPendingOperationDestruction() {
 }
 } // namespace
 
-int main() {
+TEST(AsioOperationAllocator, Contract) {
     acpp::memory::ThreadMemoryResource pool;
     CountingResource resource(&pool);
     auto original = std::pmr::set_default_resource(&resource);
@@ -234,5 +236,5 @@ int main() {
                 "all private scheduler allocations must be released on their owner");
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; passed = false; }
     std::pmr::set_default_resource(original);
-    return passed ? 0 : 1;
+    { ASSERT_TRUE(passed); return; }
 }

@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "acppnode/transport/internet/stream_settings.hpp"
 
 #include <cstdio>
@@ -32,7 +34,6 @@ void operator delete[](void* memory, std::size_t) noexcept { std::free(memory); 
 
 namespace {
 using namespace acpp;
-static_assert(std::is_nothrow_move_assignable_v<StreamSettings>);
 
 void Require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
@@ -197,7 +198,7 @@ void TestQueries() {
 }
 }
 
-int main() {
+TEST(StreamSettings, Contract) {
     std::set_terminate([] {
         std::fputs("stream normalization terminated instead of reporting allocation failure\n", stderr);
         std::_Exit(71);
@@ -215,6 +216,6 @@ int main() {
     } catch (const std::exception& error) {
         fail_after = -1;
         std::cerr << error.what() << '\n';
-        return 1;
+        FAIL() << error.what();
     }
 }

@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "acppnode/app/dispatcher/default_dispatcher.hpp"
 #include "acppnode/app/dns/dns_worker.hpp"
 #include "acppnode/app/relay.hpp"
@@ -506,7 +508,7 @@ bool StableAccounting() {
 }
 }
 
-int main() {
+TEST(DispatcherCancellation, Contract) {
     try {
         bool passed = StableAccounting();
         for (bool controlled : {false, true}) {
@@ -514,15 +516,15 @@ int main() {
                 Case::Parent, Case::Pending, Case::Success, Case::RelaySuccess, Case::RelayFailure,
                 Case::SniffMemory, Case::SniffLinkError, Case::RoutedFallback, Case::RuleMatch,
                 Case::PolicyBlockedForce, Case::PolicyBlockedRoute, Case::PolicyAllowed})
-                passed &= Run(which, controlled);
-            if (controlled) passed &= Run(Case::RelayCancelled, true);
+                passed &= ::Run(which, controlled);
+            if (controlled) passed &= ::Run(Case::RelayCancelled, true);
             for (const auto which : {Case::PreStopped, Case::Sniff, Case::Handshake})
-                passed &= Run(which, controlled, ErrorCode::RESOURCE_EXHAUSTED);
+                passed &= ::Run(which, controlled, ErrorCode::RESOURCE_EXHAUSTED);
             passed &= SiblingIsolation(controlled);
         }
-        return passed ? 0 : 1;
+        { ASSERT_TRUE(passed); return; }
     } catch (const std::exception& error) {
         std::fprintf(stderr, "fixture failure: %s\n", error.what());
-        return 1;
+        FAIL() << error.what();
     }
 }

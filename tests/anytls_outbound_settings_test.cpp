@@ -1,3 +1,6 @@
+#include <stdexcept>
+#include <gtest/gtest.h>
+
 #include "anytls_outbound_settings.hpp"
 
 #include <cstdlib>
@@ -8,7 +11,7 @@ namespace {
 
 [[noreturn]] void Fail(std::string_view message) {
     std::cerr << message << '\n';
-    std::exit(1);
+    ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed");
 }
 
 void Check(bool condition, std::string_view message) {
@@ -25,7 +28,7 @@ void CheckInvalid(std::string_view body) {
     Check(!result, "invalid AnyTLS settings were accepted");
 }
 
-void TestValidSettingsAreNormalized() {
+TEST(AnytlsOutboundSettings, ValidSettingsAreNormalized) {
     auto explicit_values = Parse(
         R"({"address":"example.com","port":8443,"password":"secret","idleSessionCheckInterval":10,"idleSessionTimeout":20,"minIdleSession":2})");
     Check(explicit_values.has_value(), "valid explicit AnyTLS settings were rejected");
@@ -37,7 +40,7 @@ void TestValidSettingsAreNormalized() {
           "explicit minimum idle mismatch");
 }
 
-void TestPreparedPasswordHashes() {
+TEST(AnytlsOutboundSettings, PreparedPasswordHashes) {
     auto check_hash = [](std::string_view body, std::string_view expected) {
         const auto settings = Parse(body);
         Check(settings.has_value(), "valid AnyTLS credentials rejected");
@@ -55,7 +58,7 @@ void TestPreparedPasswordHashes() {
                "516a5e926ce20c5f4d80f00e1a01abdf14986def6588d6abeed9fce090bc660c");
 }
 
-void TestInvalidSessionSettingsAreRejected() {
+TEST(AnytlsOutboundSettings, InvalidSessionSettingsAreRejected) {
     CheckInvalid(R"({"address":"example.com","port":443,"password":"secret","idleSessionCheckInterval":9223372036854775807})");
     CheckInvalid(R"({"address":"example.com","port":443,"password":"secret","idleSessionTimeout":9223372036854775807})");
     CheckInvalid(R"({"address":"example.com","port":443,"password":"secret","idleSessionCheckInterval":"30"})");
@@ -67,10 +70,3 @@ void TestInvalidSessionSettingsAreRejected() {
 
 }  // namespace
 
-int main() {
-    TestValidSettingsAreNormalized();
-    TestPreparedPasswordHashes();
-    TestInvalidSessionSettingsAreRejected();
-    std::cout << "anytls_outbound_settings_test: ok\n";
-    return 0;
-}

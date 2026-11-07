@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "acppnode/infra/json_field.hpp"
 
 #include <cstdint>
@@ -13,7 +15,7 @@ namespace {
 
 [[noreturn]] void Fail(std::string_view message) {
     std::cerr << message << '\n';
-    std::exit(1);
+    ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed");
 }
 
 void Check(bool condition, std::string_view message) {
@@ -24,7 +26,7 @@ acpp::json::object ParseObject(std::string_view body) {
     return acpp::json::parse(body).as_object();
 }
 
-void CheckBool() {
+TEST(JsonField, Bool) {
     const auto parse = [](std::string_view body) {
         return acpp::ParseJsonBool(ParseObject(body), "camelFlag");
     };
@@ -46,7 +48,7 @@ void CheckBool() {
     Check(!parse(R"({"camelFlag":null})"), "null boolean was accepted");
 }
 
-void CheckString() {
+TEST(JsonField, String) {
     const auto parse = [](std::string_view body) {
         return acpp::ParseJsonString(ParseObject(body), "camelText");
     };
@@ -86,7 +88,7 @@ void CheckString() {
     Check(!parse_array(R"({"camelList":["one",2]})"), "mixed string array was accepted");
 }
 
-void CheckUnsigned() {
+TEST(JsonField, Unsigned) {
     const auto parse = [](std::string_view body,
                           uint64_t maximum = std::numeric_limits<uint64_t>::max()) {
         return acpp::ParseJsonUint64(ParseObject(body), "camelValue", maximum);
@@ -110,7 +112,7 @@ void CheckUnsigned() {
     Check(!parse(R"({"camelValue":1.5})"), "fractional number was accepted");
 }
 
-void CheckPort() {
+TEST(JsonField, Port) {
     using acpp::JsonPortError;
     using acpp::ReadJsonPort;
     using acpp::json::object;
@@ -152,7 +154,7 @@ bool Throws(Read read) {
     return false;
 }
 
-void CheckThrowingFallbacks() {
+TEST(JsonField, ThrowingFallbacks) {
     const auto source = ParseObject(R"({"text":"set","flag":false,"bad":1})");
 
     Check(acpp::JsonStringOr(source, "text", "fallback") == "set",
@@ -172,13 +174,3 @@ void CheckThrowingFallbacks() {
 
 }  // namespace
 
-int main() {
-    CheckBool();
-    CheckString();
-    CheckUnsigned();
-    CheckPort();
-    CheckThrowingFallbacks();
-
-    std::cout << "json_field_test: ok\n";
-    return 0;
-}

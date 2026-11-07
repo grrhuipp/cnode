@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "acppnode/geo/geodata.hpp"
 
 #include <array>
@@ -19,7 +21,7 @@ namespace fs = std::filesystem;
 void Require(bool condition, const char* message) {
     if (!condition) {
         std::fprintf(stderr, "FAIL: %s\n", message);
-        std::exit(1);
+        ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed");
     }
 }
 
@@ -198,9 +200,8 @@ void TestRejectsCorruptOrIncompleteData(const TempDir& dir) {
 
 }  // namespace
 
-int main() {
+TEST(Geodata, Contract) {
     const TempDir dir;
     TestLoadsRequestedCategories(dir);
     TestRejectsCorruptOrIncompleteData(dir);
-    return 0;
 }

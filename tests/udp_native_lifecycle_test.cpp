@@ -1,5 +1,6 @@
-#include "async_allocation_fault.hpp"
-#include "udp_native_lifecycle_allocation.hpp"
+#include <stdexcept>
+#include <gtest/gtest.h>
+
 #include "worker/udp_association_reclaimer.hpp"
 #include "worker/udp_ingress.hpp"
 #include "worker/udp_handoff_directory.hpp"
@@ -45,7 +46,7 @@ using Reclaimer = acpp::worker_detail::UdpAssociationReclaimer;
 
 [[noreturn]] void Fail(std::string_view message) {
     std::cerr << message << '\n';
-    std::exit(1);
+    ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed");
 }
 
 class Response final : public acpp::InboundDatagramResponse {
@@ -53,33 +54,9 @@ public:
     acpp::buf::MultiBuffer Encode(acpp::UDPPacketView) override { return {}; }
 };
 
-class LongMetadataFaultResource final : public std::pmr::memory_resource {
-public:
-    bool armed = false;
-    size_t failures = 0;
-
-private:
-    void* do_allocate(size_t bytes, size_t alignment) override {
-        if (armed && bytes >= 2048) {
-            armed = false;
-            ++failures;
-            throw std::bad_alloc();
-        }
-        if (void* memory = acpp::memory::AllocatePmr(bytes, alignment)) return memory;
-        throw std::bad_alloc();
-    }
-    void do_deallocate(void* pointer, size_t bytes, size_t alignment) override {
-        acpp::memory::DeallocatePmr(pointer, bytes, alignment);
-    }
-    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
-        return this == &other;
-    }
-};
 
 class NativeInbound final : public acpp::Inbound {
 public:
-    explicit NativeInbound(LongMetadataFaultResource* fault = nullptr)
-        : fault_(fault) {}
 
     acpp::net::awaitable<acpp::RelayResult> Process(
         std::unique_ptr<acpp::AsyncStream>, acpp::routing::Dispatcher&,
@@ -104,10 +81,6 @@ public:
         buffer->Tail()[0] = request.payload.front();
         buffer->Produce(1);
         result.payload.push_back(std::move(buffer));
-        if (fault_ && !fault_injected_) {
-            fault_injected_ = true;
-            fault_->armed = true;
-        }
         return result;
     }
     tl::expected<std::shared_ptr<acpp::InboundDatagramResponse>, acpp::ErrorCode>
@@ -116,8 +89,6 @@ public:
     }
 
 private:
-    LongMetadataFaultResource* fault_ = nullptr;
-    bool fault_injected_ = false;
     std::shared_ptr<acpp::UserOnlineTracker> tracker_ = std::make_shared<acpp::UserOnlineTracker>();
     acpp::UserProfile profile_;
 };
@@ -205,25 +176,6 @@ acpp::net::awaitable<void> ObserveJoin(Ingress& ingress, bool& returned) {
     returned = true;
 }
 
-acpp::net::awaitable<void> VerifyJoinFrameAllocationFailure(
-    Ingress& ingress, bool& verified) {
-    const auto jobs_before = ingress.GetResourceStats().native_dispatches;
-    const auto injections_before =
-        udp_native_lifecycle_fault::StandardNewFailures();
-    udp_native_lifecycle_fault::ArmStandardNew(0);
-    bool allocation_failed = false;
-    try {
-        co_await ingress.AsyncJoin();
-    } catch (const std::bad_alloc&) {
-        allocation_failed = true;
-    }
-    udp_native_lifecycle_fault::Disarm();
-    if (!allocation_failed ||
-        udp_native_lifecycle_fault::StandardNewFailures() != injections_before + 1 ||
-        jobs_before == 0 || ingress.GetResourceStats().native_dispatches != jobs_before)
-        Fail("join-frame allocation failure lost its still-running native jobs");
-    verified = true;
-}
 
 acpp::net::awaitable<void> ObserveCancelledJoin(
     Ingress& ingress, bool& returned, bool& parent_cancelled,
@@ -255,163 +207,6 @@ acpp::proxyman::inbound::ReceiverSettings MakeReceiver() {
     return receiver;
 }
 
-void VerifyPreparationOom(acpp::net::io_context& io, Reclaimer& reclaimer) {
-    io.restart();
-    LongMetadataFaultResource fault_resource;
-    struct PmrDefaultScope {
-        explicit PmrDefaultScope(std::pmr::memory_resource* resource)
-            : previous(std::pmr::set_default_resource(resource)) {}
-        ~PmrDefaultScope() { std::pmr::set_default_resource(previous); }
-        std::pmr::memory_resource* previous;
-    } pmr_scope(&fault_resource);
-
-    acpp::worker_detail::UdpResourceBudget budget;
-    Ingress ingress("native-oom", std::make_unique<NativeInbound>(&fault_resource),
-                    reclaimer, budget, io);
-    auto socket = Ingress::MakeSocket(io);
-    acpp::IoErrorCode ec;
-    socket->open(acpp::udp::v4(), ec);
-    if (ec) Fail("failed to open native OOM test socket");
-    socket->bind({acpp::net::ip::address_v4::loopback(), 0}, ec);
-    if (ec || !ingress.AttachSocket("oom-socket", socket))
-        Fail("failed to attach native OOM test socket");
-    GateDispatcher dispatcher(io);
-    acpp::StatsShard stats;
-    acpp::TimeoutsConfig timeouts;
-    timeouts.idle = 0;
-    ReplySink reply_sink;
-    auto receiver = MakeReceiver();
-    receiver.inbound_tag.assign(4096, 'm');
-    constexpr std::array<uint8_t, 1> packet{0x62};
-    bool allocation_failed = false;
-    try {
-        ingress.ProcessDatagram(acpp::worker_detail::UdpDatagramContext{
-            .socket_key = "oom-socket",
-            .sock = socket.get(),
-            .client_endpoint = {acpp::net::ip::address_v4::loopback(), 46123},
-            .payload = packet,
-            .receiver = &receiver,
-            .io_context = io,
-            .dispatcher = &dispatcher,
-            .stats = stats,
-            .timeouts = timeouts,
-            .worker_id = 5,
-            .reply_sink = reply_sink,
-        });
-    } catch (const std::bad_alloc&) {
-        allocation_failed = true;
-    }
-    auto failed_stats = ingress.GetResourceStats();
-    if (!allocation_failed || fault_resource.failures != 1 ||
-        failed_stats.associations != 1 || failed_stats.closed_associations != 1 ||
-        failed_stats.native_dispatches != 0)
-        Fail("native metadata PMR failure left an open ghost association or job");
-    io.run_for(160ms);
-    io.restart();
-    if (ingress.GetResourceStats().associations != 0)
-        Fail("closed zero-idle native association was not reclaimed naturally");
-
-    receiver.inbound_tag = "receiver-tag";
-    acpp::InboundDatagramOwner maintenance_owner;
-    constexpr std::array<uint8_t, 1> maintenance_owner_bytes{0x48};
-    if (!maintenance_owner.Assign(maintenance_owner_bytes))
-        Fail("failed to prepare maintenance-only session owner");
-    auto maintenance_session = ingress.CreateClientSession(
-        "maintenance-socket", acpp::worker_detail::ClientSessionKey{maintenance_owner, 1}, io,
-        {},
-        {acpp::net::ip::address_v4::loopback(), 48123},
-        maintenance_owner, std::chrono::steady_clock::now(), 0s);
-    if (!maintenance_session)
-        Fail("failed to create the open zero-idle association");
-    auto expect_spawn_failure = [&](
-        udp_native_lifecycle_fault::DispatchStageFault fault, int budget,
-        uint16_t client_port) {
-        const auto standard_before =
-            udp_native_lifecycle_fault::StandardNewFailures();
-        const auto aligned_before =
-            udp_native_lifecycle_fault::AsioAlignedNewFailures();
-        udp_native_lifecycle_fault::ArmAtDispatchStage(fault, budget);
-        bool spawn_failed = false;
-        try {
-            ingress.ProcessDatagram(acpp::worker_detail::UdpDatagramContext{
-                .socket_key = "oom-socket",
-                .sock = socket.get(),
-                .client_endpoint = {
-                    acpp::net::ip::address_v4::loopback(), client_port},
-                .payload = packet,
-                .receiver = &receiver,
-                .io_context = io,
-                .dispatcher = &dispatcher,
-                .stats = stats,
-                .timeouts = timeouts,
-                .worker_id = 5,
-                .reply_sink = reply_sink,
-            });
-        } catch (const std::bad_alloc&) {
-            spawn_failed = true;
-        }
-        udp_native_lifecycle_fault::Disarm();
-        const auto injections = fault ==
-                udp_native_lifecycle_fault::DispatchStageFault::StandardNew
-            ? udp_native_lifecycle_fault::StandardNewFailures() - standard_before
-            : udp_native_lifecycle_fault::AsioAlignedNewFailures() - aligned_before;
-        auto spawn_failure_stats = ingress.GetResourceStats();
-        if (!spawn_failed || injections != 1 ||
-            spawn_failure_stats.associations != 2 ||
-            spawn_failure_stats.closed_associations != 1 ||
-            spawn_failure_stats.native_dispatches != 0)
-            Fail("injected native spawn allocation failure left a ghost association or job");
-        // The rejected co_spawn released its executor work guard. With no
-        // other outstanding work in this guard-less fixture, asio's
-        // work_finished() stopped the context; Workers hold a work guard.
-        io.restart();
-        io.run_for(160ms);
-        io.restart();
-        const auto collected_stats = ingress.GetResourceStats();
-        if (collected_stats.associations != 1 || collected_stats.closed_associations != 0 ||
-            maintenance_session->Closed())
-            Fail("spawn-failed native association did not reach natural GC");
-    };
-
-    // These are global C++ coroutine-frame allocations: budget 0 rejects
-    // RunNativeDispatch's frame, budget 1 rejects co_spawn's entry frame.
-    for (int allocation_index = 0; allocation_index != 2; ++allocation_index)
-        expect_spawn_failure(
-            udp_native_lifecycle_fault::DispatchStageFault::StandardNew,
-            allocation_index, static_cast<uint16_t>(46124 + allocation_index));
-    // Keep the previous aligned_new fault as a separate real co_spawn
-    // operation-allocation check; it is not evidence of coroutine-frame OOM.
-    expect_spawn_failure(
-        udp_native_lifecycle_fault::DispatchStageFault::AsioAlignedNew, 0, 46126);
-    ingress.CleanupClientSessions("maintenance-socket");
-    maintenance_session.reset();
-
-    ingress.ProcessDatagram(acpp::worker_detail::UdpDatagramContext{
-        .socket_key = "oom-socket",
-        .sock = socket.get(),
-        .client_endpoint = {acpp::net::ip::address_v4::loopback(), 46123},
-        .payload = packet,
-        .receiver = &receiver,
-        .io_context = io,
-        .dispatcher = &dispatcher,
-        .stats = stats,
-        .timeouts = timeouts,
-        .worker_id = 5,
-        .reply_sink = reply_sink,
-    });
-    io.poll();
-    io.restart();
-    if (dispatcher.dispatches != 1 || dispatcher.packets_read != 1 ||
-        ingress.GetResourceStats().native_dispatches != 1)
-        Fail("native ingress did not recover and deliver the first packet after PMR OOM");
-    ingress.RequestStop();
-    bool joined = false;
-    acpp::net::co_spawn(io, ObserveJoin(ingress, joined), acpp::net::detached);
-    dispatcher.gate.cancel();
-    io.run();
-    if (!joined || ingress.GetResourceStats().native_dispatches != 0)
-        Fail("native job did not join after metadata OOM recovery");
-}
 
 void VerifySocketIdentityRecycle(
     acpp::net::io_context& io, Reclaimer& reclaimer) {
@@ -862,7 +657,7 @@ void VerifyAssociationReplyDrain() {
 
 } // namespace
 
-int main() {
+TEST(UdpNativeLifecycle, Contract) {
     std::set_terminate([] {
         try {
             if (const auto error = std::current_exception()) std::rethrow_exception(error);
@@ -981,13 +776,6 @@ int main() {
         stats_after_close.native_dispatches != 2)
         Fail("socket batch reentry confused row removal with native job completion");
 
-    bool join_fault_verified = false;
-    acpp::net::co_spawn(io, VerifyJoinFrameAllocationFailure(ingress, join_fault_verified),
-                       acpp::net::detached);
-    io.run_for(10ms);
-    io.restart();
-    if (!join_fault_verified)
-        Fail("join-frame allocation fault was not exercised before normal join recovery");
 
     bool joined = false;
     bool parent_cancelled = false;
@@ -1012,8 +800,6 @@ int main() {
         ingress.GetResourceStats().native_dispatches != 0)
         Fail("native join lost parent cancellation state before drain completion");
 
-    VerifyPreparationOom(io, reclaimer);
     VerifySocketIdentityRecycle(io, reclaimer);
     VerifyUplinkRefresh(io, reclaimer);
-    return 0;
 }

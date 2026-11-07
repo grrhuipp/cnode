@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "acppnode/sniff/sniffer.hpp"
 
 #include <openssl/evp.h>
@@ -370,12 +372,12 @@ void Run() {
 
 }  // namespace
 
-int main() {
+TEST(QuicSniffer, Contract) {
     try {
-        Run();
-        return 0;
+        ::Run();
+        return;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());
-        return 1;
+        FAIL() << error.what();
     }
 }

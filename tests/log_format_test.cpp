@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "acppnode/infra/log.hpp"
 
 #include <array>
@@ -234,7 +236,7 @@ struct SessionLogContext {
 
 }  // namespace
 
-int main() {
+TEST(LogFormat, Contract) {
     const auto directory = std::filesystem::temp_directory_path() /
         ("cnode-log-format-" + std::to_string(
             std::chrono::steady_clock::now().time_since_epoch().count()));
@@ -372,8 +374,7 @@ int main() {
         acpp::Log::Shutdown();
         std::filesystem::remove_all(directory);
         std::cerr << error.what() << '\n';
-        return 1;
+        FAIL() << error.what();
     }
     std::filesystem::remove_all(directory);
-    return 0;
 }

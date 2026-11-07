@@ -1,3 +1,6 @@
+#include <stdexcept>
+#include <gtest/gtest.h>
+
 #include "vless_encryption_runtime.hpp"
 #include <array>
 #include <chrono>
@@ -6,10 +9,10 @@
 
 namespace {
 void Check(bool ok, const char* what) {
-    if (!ok) { std::cerr << what << '\n'; std::exit(1); }
+    if (!ok) { std::cerr << what << '\n'; ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed"); }
 }
 }
-int main() {
+TEST(VlessTicketStore, Contract) {
     using namespace acpp::vless;
     using namespace std::chrono_literals;
     const auto now = std::chrono::steady_clock::time_point{} + 100s;

@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
 #include "acppnode/app/proxyman/inbound/prepared_config.hpp"
 #include "validator.hpp"
@@ -18,7 +20,7 @@ void Check(bool condition, const char* message) {
 }
 }
 
-int main() {
+TEST(VmessAuthSnapshot, Contract) {
     using namespace acpp::proxyman::inbound;
     try {
         PreparedVmessUser user;
@@ -81,6 +83,6 @@ int main() {
         std::cout << "VMess replacement, removal, tag isolation and Worker shutdown lifetime passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
-        return 1;
+        FAIL() << error.what();
     }
 }

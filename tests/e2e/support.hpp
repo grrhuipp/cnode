@@ -1,0 +1,148 @@
+#pragma once
+
+#include <gtest/gtest.h>
+#include <nlohmann/json.hpp>
+#include <openssl/ssl.h>
+
+#include <chrono>
+#include <cstdint>
+#include <cstddef>
+#include <exception>
+#include <filesystem>
+#include <functional>
+#include <memory>
+#include <span>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <vector>
+
+namespace cnode::e2e {
+using Json = nlohmann::json;
+using namespace std::chrono_literals;
+using Milliseconds = std::chrono::milliseconds;
+
+std::filesystem::path Binary();
+std::filesystem::path SourceRoot();
+std::string ReadFile(const std::filesystem::path& path);
+void WriteFile(const std::filesystem::path& path, std::string_view content);
+void WriteJson(const std::filesystem::path& root, std::string_view name, const Json& value);
+void Configure(const std::filesystem::path& root, Json inbound, Json outbound, unsigned workers = 1);
+Json TlsSettings(bool server);
+void Until(const std::function<bool()>& condition, Milliseconds timeout = 5s);
+
+class TempDir {
+public:
+    TempDir();
+    ~TempDir();
+    TempDir(const TempDir&) = delete;
+    TempDir& operator=(const TempDir&) = delete;
+    const std::filesystem::path& Path() const noexcept { return path_; }
+private:
+    std::filesystem::path path_;
+};
+
+class Child {
+public:
+    Child(std::vector<std::string> argv, const std::filesystem::path& log,
+          const std::filesystem::path& cwd = {});
+    ~Child();
+    Child(const Child&) = delete;
+    Child& operator=(const Child&) = delete;
+    bool Running();
+    // Wait/Stop return the exit code, or 128 + signal for signal termination.
+    int Wait(Milliseconds timeout = 5s);
+    void Signal(int signal);
+    int Stop(Milliseconds timeout = 5s);
+    void WaitForLog(std::string_view text, Milliseconds timeout = 10s);
+    const std::filesystem::path& LogPath() const noexcept { return log_; }
+private:
+    int pid_ = -1;
+    int status_ = -1;
+    bool reaped_ = false;
+    std::filesystem::path log_;
+};
+
+class Socket {
+public:
+    Socket() = default;
+    explicit Socket(int fd);
+    ~Socket();
+    Socket(Socket&& other) noexcept;
+    Socket& operator=(Socket&& other) noexcept;
+    Socket(const Socket&) = delete;
+    Socket& operator=(const Socket&) = delete;
+    // Local socket addresses are numeric IPv4/IPv6 (or localhost): no
+    // unbounded resolver call is hidden inside an I/O deadline.
+    static Socket Listen(uint16_t port = 0, std::string_view address = "127.0.0.1");
+    static Socket Connect(uint16_t port, std::string_view address = "127.0.0.1", Milliseconds timeout = 5s);
+    static Socket BindUdp(uint16_t port = 0, std::string_view address = "127.0.0.1");
+    Socket Accept(Milliseconds timeout = 5s) const;
+    uint16_t Port() const;
+    int Fd() const noexcept { return fd_; }
+    int Release() noexcept;
+    void Close() noexcept;
+    void ShutdownWrite();
+    void Write(std::string_view bytes, Milliseconds timeout = 5s);
+    std::string Read(size_t maximum = 65536, Milliseconds timeout = 5s);
+    std::string ReadExact(size_t count, Milliseconds timeout = 5s);
+    void SendTo(std::string_view bytes, uint16_t port, std::string_view address = "127.0.0.1");
+private:
+    int fd_ = -1;
+};
+
+class TlsContext {
+public:
+    explicit TlsContext(bool server);
+    ~TlsContext();
+    TlsContext(const TlsContext&) = delete;
+    TlsContext& operator=(const TlsContext&) = delete;
+    SSL_CTX* Get() const noexcept { return context_; }
+private:
+    SSL_CTX* context_ = nullptr;
+};
+
+class TlsSocket {
+public:
+    TlsSocket(Socket socket, TlsContext& context, bool server, Milliseconds timeout = 5s);
+    ~TlsSocket();
+    TlsSocket(const TlsSocket&) = delete;
+    TlsSocket& operator=(const TlsSocket&) = delete;
+    void Write(std::string_view bytes, Milliseconds timeout = 5s);
+    std::string Read(size_t maximum = 65536, Milliseconds timeout = 5s);
+    std::string ReadExact(size_t count, Milliseconds timeout = 5s);
+    void ShutdownWrite();
+    void Close() noexcept;
+    int Fd() const noexcept { return socket_.Fd(); }
+    SSL* Get() const noexcept { return ssl_; }
+private:
+    Socket socket_;
+    SSL* ssl_ = nullptr;
+};
+
+// Each peer thread is joined; exceptions are observed explicitly by Join().
+class PeerThread {
+public:
+    explicit PeerThread(std::function<void()> task);
+    ~PeerThread();
+    PeerThread(const PeerThread&) = delete;
+    PeerThread& operator=(const PeerThread&) = delete;
+    void Join();
+private:
+    std::exception_ptr error_;
+    std::thread thread_;
+};
+
+inline constexpr std::string_view UserId = "b831381d-6324-4d53-ad4f-8cda48b30811";
+std::string UuidBytes(std::string_view uuid = UserId);
+std::string VlessRequest(uint16_t port, std::string_view payload = {}, uint8_t command = 1,
+                         std::string_view host = "127.0.0.1", std::string_view user = UserId);
+std::string SocksAddress(uint16_t port, std::string_view host = "127.0.0.1");
+std::string AnyTlsFrame(uint8_t command, uint32_t stream, std::string_view payload = {});
+struct AnyTlsRecord { uint8_t command; uint32_t stream; std::string payload; };
+AnyTlsRecord ReadAnyTls(TlsSocket& socket, Milliseconds timeout = 5s);
+void AnyTlsAuthenticate(TlsSocket& socket, std::string_view password, uint16_t padding = 0);
+void ReadAnyTlsAuthentication(TlsSocket& socket, std::string_view password);
+std::string BigEndian(uint64_t value, size_t width);
+uint64_t ReadBigEndian(std::string_view bytes);
+} // namespace cnode::e2e

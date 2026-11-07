@@ -1,3 +1,6 @@
+#include <stdexcept>
+#include <gtest/gtest.h>
+
 #include "acppnode/common/mux/mux_codec.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
 #include "acppnode/common/buffer_util.hpp"
@@ -18,7 +21,7 @@ namespace {
 
 [[noreturn]] void Fail(std::string_view message) {
     std::cerr << message << '\n';
-    std::exit(1);
+    ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed");
 }
 
 void Check(bool condition, std::string_view message) {
@@ -93,7 +96,7 @@ void CheckInvalidAcrossLayouts(
 
 }  // namespace
 
-int main() {
+TEST(MuxCodec, Contract) {
     using namespace acpp;
 
     constexpr size_t kMaxPayload = std::numeric_limits<uint16_t>::max();
@@ -308,5 +311,4 @@ int main() {
         encoded, "oversized Mux GlobalID metadata was accepted");
 
     std::cout << "mux_codec_test: ok\n";
-    return 0;
 }

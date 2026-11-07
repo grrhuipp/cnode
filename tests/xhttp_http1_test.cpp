@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "acppnode/transport/internet/tcp_stream.hpp"
 #include "acppnode/transport/internet/transport_stack.hpp"
 
@@ -318,7 +320,7 @@ void StreamOneHonoursBodyFraming() {
 
 }  // namespace
 
-int main() {
+TEST(XhttpHttp1, Contract) {
     try {
         PacketUpPersistsAndPrecedesDownlink();
         ConcurrentUploadsPrecedeDownlink();
@@ -326,9 +328,9 @@ int main() {
         StreamOneOverHttp1();
         StreamOneHonoursBodyFraming();
         std::puts("XHTTP HTTP/1: persistent packet-up and stream-one completed");
-        return 0;
+        return;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "XHTTP HTTP/1: %s\n", error.what());
-        return 1;
+        FAIL() << error.what();
     }
 }

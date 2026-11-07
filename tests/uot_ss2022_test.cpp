@@ -1,3 +1,6 @@
+#include <stdexcept>
+#include <gtest/gtest.h>
+
 #include "uot.hpp"
 
 #include "shadowsocks_protocol.hpp"
@@ -26,7 +29,7 @@ using namespace acpp;
 
 [[noreturn]] void Fail(std::string_view message) {
     std::cerr << message << '\n';
-    std::exit(1);
+    ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed");
 }
 
 void Check(bool condition, std::string_view message) {
@@ -200,7 +203,7 @@ void Run(Factory&& factory) {
     future.get();
 }
 
-void TestV2BoardSs2022Keys() {
+TEST(UotSs2022, V2BoardSs2022Keys) {
     const auto cipher = ss::ParseCipherMethod("2022-blake3-aes-256-gcm");
     Check(cipher.has_value(), "SS2022 cipher was not parsed");
 
@@ -228,7 +231,7 @@ void TestV2BoardSs2022Keys() {
         "oversized SS2022 PSK was accepted");
 }
 
-void TestMagicAndRequestCodec() {
+TEST(UotSs2022, MagicAndRequestCodec) {
     Check(proxy::uot::VersionFromMagicAddress(
         TargetAddress(proxy::uot::kMagicAddress, 0)) == proxy::uot::Version::V2,
         "UoT v2 magic was not recognized");
@@ -251,18 +254,18 @@ void TestMagicAndRequestCodec() {
           "UoT request port mismatch");
 }
 
-void TestConnectPacketRoundTrip() {
+TEST(UotSs2022, ConnectPacketRoundTrip) {
     const TargetAddress target("1.1.1.1", 53);
     CaptureWriter capture;
     proxy::uot::PacketWriter writer(capture, true, target);
-    Run([&]() -> net::awaitable<void> {
+    ::Run([&]() -> net::awaitable<void> {
         co_await writer.WriteMultiBuffer(MakePacket("alpha", target));
         co_await writer.WriteMultiBuffer(MakePacket("beta-payload", target));
     });
 
     FragmentReader source(capture.bytes, {1, 1, 2, 3, 1, 4, 2});
     proxy::uot::PacketReader reader(source, true, target);
-    Run([&]() -> net::awaitable<void> {
+    ::Run([&]() -> net::awaitable<void> {
         auto first = co_await reader.ReadMultiBuffer();
         auto second = co_await reader.ReadMultiBuffer();
         Check(Flatten(first) == std::vector<uint8_t>({'a','l','p','h','a'}),
@@ -275,13 +278,13 @@ void TestConnectPacketRoundTrip() {
     });
 }
 
-void TestLargeConnectPacketRoundTrip() {
+TEST(UotSs2022, LargeConnectPacketRoundTrip) {
     const TargetAddress target("1.1.1.1", 53);
     const std::string large_payload(buf::Buffer::kSize + 257, '\x6d');
 
     CaptureWriter capture;
     proxy::uot::PacketWriter writer(capture, true, target);
-    Run([&]() -> net::awaitable<void> {
+    ::Run([&]() -> net::awaitable<void> {
         co_await writer.WriteMultiBuffer(MakePacket(large_payload, target));
     });
 
@@ -295,7 +298,7 @@ void TestLargeConnectPacketRoundTrip() {
     FragmentReader source(
         capture.bytes, {1, 2, 4096, 17, 2048, 3, 1024});
     proxy::uot::PacketReader reader(source, true, target);
-    Run([&]() -> net::awaitable<void> {
+    ::Run([&]() -> net::awaitable<void> {
         auto decoded = co_await reader.ReadMultiBuffer();
         Check(Flatten(decoded) == std::vector<uint8_t>(
             large_payload.begin(), large_payload.end()),
@@ -305,7 +308,7 @@ void TestLargeConnectPacketRoundTrip() {
     });
 }
 
-void TestFramedEndpointWriteAndRead() {
+TEST(UotSs2022, FramedEndpointWriteAndRead) {
     const TargetAddress target("1.1.1.1", 53);
     FramedEndpointDouble underlying;
     underlying.suspend_write = true;
@@ -313,7 +316,7 @@ void TestFramedEndpointWriteAndRead() {
     auto pending_write = endpoint.WriteMultiBuffer(MakePacket("framed", target));
     Check(underlying.write_calls == 0 && underlying.bytes.empty(),
           "UoT framed write started before its awaitable was awaited");
-    Run([&]() -> net::awaitable<void> {
+    ::Run([&]() -> net::awaitable<void> {
         co_await std::move(pending_write);
     });
     Check(underlying.write_calls == 1 && underlying.resumed,
@@ -327,7 +330,7 @@ void TestFramedEndpointWriteAndRead() {
     auto pending_buffers = endpoint.WriteBuffers(borrowed_buffers);
     Check(underlying.write_calls == 1,
           "UoT framed WriteBuffers started before its awaitable was awaited");
-    Run([&]() -> net::awaitable<void> {
+    ::Run([&]() -> net::awaitable<void> {
         co_await std::move(pending_buffers);
     });
     Check(underlying.write_calls == 2 && underlying.resumed &&
@@ -342,7 +345,7 @@ void TestFramedEndpointWriteAndRead() {
     auto pending_read = read_endpoint.ReadMultiBuffer();
     Check(encoded.read_calls == 0,
           "UoT framed read started before its awaitable was awaited");
-    Run([&]() -> net::awaitable<void> {
+    ::Run([&]() -> net::awaitable<void> {
         auto packet = co_await std::move(pending_read);
         Check(Flatten(packet) == std::vector<uint8_t>({'f','r','a','m','e','d'}),
               "UoT framed endpoint failed to read a fragmented frame");
@@ -352,14 +355,14 @@ void TestFramedEndpointWriteAndRead() {
     });
 }
 
-void TestFramedEndpointWriteException() {
+TEST(UotSs2022, FramedEndpointWriteException) {
     const TargetAddress target("1.1.1.1", 53);
     FramedEndpointDouble underlying;
     underlying.throw_on_write = true;
     proxy::uot::FramedEndpoint endpoint(underlying, true, target);
     bool propagated = false;
     try {
-        Run([&]() -> net::awaitable<void> {
+        ::Run([&]() -> net::awaitable<void> {
             co_await endpoint.WriteMultiBuffer(MakePacket("failure", target));
         });
     } catch (const std::runtime_error& error) {
@@ -368,7 +371,7 @@ void TestFramedEndpointWriteException() {
     Check(propagated, "UoT framed endpoint swallowed the underlying write exception");
 }
 
-void TestNonConnectRequestAndPackets() {
+TEST(UotSs2022, NonConnectRequestAndPackets) {
     const TargetAddress initial("dns.example", 53);
     const TargetAddress second("8.8.8.8", 5353);
 
@@ -379,14 +382,14 @@ void TestNonConnectRequestAndPackets() {
     capture.bytes.insert(
         capture.bytes.end(), request->span().begin(), request->span().end());
     proxy::uot::PacketWriter writer(capture, false, initial);
-    Run([&]() -> net::awaitable<void> {
+    ::Run([&]() -> net::awaitable<void> {
         co_await writer.WriteMultiBuffer(MakePacket("one", initial));
         co_await writer.WriteMultiBuffer(MakePacket("two-two", second));
     });
 
     FragmentReader source(capture.bytes, {1, 2, 1, 3, 2, 5, 1, 4});
     buf::MultiBuffer pending;
-    Run([&]() -> net::awaitable<void> {
+    ::Run([&]() -> net::awaitable<void> {
         auto decoded_request = co_await proxy::uot::ReadRequest(source, pending);
         Check(decoded_request.has_value(), "fragmented UoT request decode failed");
         Check(!decoded_request->is_connect &&
@@ -412,7 +415,7 @@ void TestNonConnectRequestAndPackets() {
 }
 
 // Exercise the public wire codec independently of each protocol's handshake.
-void TestSharedAddressCodec() {
+TEST(UotSs2022, SharedAddressCodec) {
     const std::array targets{
         TargetAddress("192.0.2.1", 0x1234),
         TargetAddress("2001:db8::1", 0x1234),
@@ -468,7 +471,7 @@ void TestSharedAddressCodec() {
                 input.push_back(0xbb);
                 FragmentReader source(input, {1, split ? split : 1, 1});
                 buf::MultiBuffer pending;
-                Run([&]() -> net::awaitable<void> {
+                ::Run([&]() -> net::awaitable<void> {
                     auto decoded = co_await ReadAddress(source, pending, format, 1);
                     Check(decoded && decoded->consumed == size &&
                           decoded->target.SameEndpoint(target),
@@ -487,7 +490,7 @@ void TestSharedAddressCodec() {
                 FragmentReader truncated(
                     std::vector<uint8_t>(encoded.begin(), encoded.begin() + split), {1, 2});
                 buf::MultiBuffer incomplete;
-                Run([&]() -> net::awaitable<void> {
+                ::Run([&]() -> net::awaitable<void> {
                     auto decoded = co_await ReadAddress(truncated, incomplete, format);
                     Check(!decoded && decoded.error() == ErrorCode::PROTOCOL_DECODE_FAILED,
                           "incremental address accepted truncated EOF");
@@ -583,12 +586,12 @@ void TestSharedAddressCodec() {
     }
 }
 
-void TestPacketEofBoundaries() {
+TEST(UotSs2022, PacketEofBoundaries) {
     const TargetAddress target("192.0.2.1", 53);
     for (bool connect : {false, true}) {
         CaptureWriter capture;
         proxy::uot::PacketWriter writer(capture, connect, target);
-        Run([&]() -> net::awaitable<void> {
+        ::Run([&]() -> net::awaitable<void> {
             co_await writer.WriteMultiBuffer(MakePacket("end", target));
         });
         for (size_t length = 0; length <= capture.bytes.size(); ++length) {
@@ -597,7 +600,7 @@ void TestPacketEofBoundaries() {
             proxy::uot::PacketReader reader(source, connect, target);
             bool failed = false;
             try {
-                Run([&]() -> net::awaitable<void> {
+                ::Run([&]() -> net::awaitable<void> {
                     auto packet = co_await reader.ReadMultiBuffer();
                     Check(length == 0 ? packet.byte_size() == 0
                         : Flatten(packet) == std::vector<uint8_t>({'e','n','d'}),
@@ -616,16 +619,3 @@ void TestPacketEofBoundaries() {
 
 }  // namespace
 
-int main() {
-    TestV2BoardSs2022Keys();
-    TestMagicAndRequestCodec();
-    TestSharedAddressCodec();
-    TestPacketEofBoundaries();
-    TestConnectPacketRoundTrip();
-    TestLargeConnectPacketRoundTrip();
-    TestNonConnectRequestAndPackets();
-    TestFramedEndpointWriteAndRead();
-    TestFramedEndpointWriteException();
-    std::cout << "uot_ss2022_test: ok\n";
-    return 0;
-}

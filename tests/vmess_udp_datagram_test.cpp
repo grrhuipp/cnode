@@ -1,3 +1,6 @@
+#include <stdexcept>
+#include <gtest/gtest.h>
+
 #include "udp_datagram.hpp"
 #include "acppnode/common/buf/contiguous_buffer_view.hpp"
 #include "encoding/server.hpp"
@@ -26,7 +29,7 @@ using namespace acpp;
 
 [[noreturn]] void Fail(std::string_view message) {
     std::cerr << message << '\n';
-    std::exit(1);
+    ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed");
 }
 
 void Check(bool condition, std::string_view message) {
@@ -579,7 +582,7 @@ void TestAuthenticatedHeaderFailure() {
 
 }  // namespace
 
-int main() {
+TEST(VmessUdpDatagram, Contract) {
     const TargetAddress target("1.1.1.1", 53);
     const TargetAddress other("8.8.8.8", 53);
 
@@ -633,5 +636,4 @@ int main() {
     TestResponseAuthenticatedLength(vmess::Security::AES_128_GCM);
     TestResponseAuthenticatedLength(vmess::Security::CHACHA20_POLY1305);
 
-    return 0;
 }

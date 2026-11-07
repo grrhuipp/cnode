@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "xhttp_packet_queue.hpp"
 
 #include <algorithm>
@@ -23,80 +25,68 @@ acpp::buf::MultiBuffer MakePayload(uint8_t value, size_t size = 1) {
 
 }  // namespace
 
-int main() {
+TEST(XhttpPacketQueue, Contract) {
     acpp::detail::XHttpPacketQueue ordered;
-    if (!ordered.Push(1, MakePayload(0x22)) ||
+    ASSERT_FALSE((!ordered.Push(1, MakePayload(0x22)) ||
         !ordered.Push(1, MakePayload(0x99)) ||
-        !ordered.Push(0, MakePayload(0x11))) {
-        return 1;
-    }
+        !ordered.Push(0, MakePayload(0x11))));
     auto first = ordered.Pop();
     auto second = ordered.Pop();
-    if (first.size() != 1 || second.size() != 1 ||
+    ASSERT_FALSE((first.size() != 1 || second.size() != 1 ||
         (*first.begin())->Bytes()[0] != 0x11 ||
         (*second.begin())->Bytes()[0] != 0x22 ||
-        ordered.QueuedPackets() != 0 || ordered.QueuedBytes() != 0) {
-        return 2;
-    }
+        ordered.QueuedPackets() != 0 || ordered.QueuedBytes() != 0));
 
     acpp::detail::XHttpPacketQueue packet_bounded;
     for (size_t i = 0;
          i < acpp::detail::XHttpPacketQueue::kMaxQueuedPackets;
          ++i) {
-        if (!packet_bounded.Push(i + 1, {})) {
-            return 3;
-        }
+        ASSERT_FALSE((!packet_bounded.Push(i + 1, {})));
     }
-    if (packet_bounded.Push(
+    ASSERT_FALSE((packet_bounded.Push(
             acpp::detail::XHttpPacketQueue::kMaxQueuedPackets + 1,
-            {})) {
-        return 4;
-    }
+            {})));
 
     acpp::detail::XHttpPacketQueue byte_bounded;
-    if (byte_bounded.Push(
+    ASSERT_FALSE((byte_bounded.Push(
             0,
             MakePayload(
                 0x55,
-                acpp::detail::XHttpPacketQueue::kMaxQueuedBytes + 1))) {
-        return 5;
-    }
+                acpp::detail::XHttpPacketQueue::kMaxQueuedBytes + 1))));
     acpp::detail::XHttpPacketQueue capacity_bounded;
     constexpr size_t blocks = acpp::detail::XHttpPacketQueue::kMaxQueuedBytes /
                               acpp::buf::Buffer::kSize;
     for (size_t i = 0; i < blocks; ++i) {
-        if (!capacity_bounded.Push(i, MakePayload(0x66))) return 6;
+        ASSERT_FALSE((!capacity_bounded.Push(i, MakePayload(0x66))));
     }
-    if (capacity_bounded.Push(blocks, MakePayload(0x77)) ||
-        capacity_bounded.UsedCapacity() != acpp::detail::XHttpPacketQueue::kMaxQueuedBytes)
-        return 7;
+    ASSERT_FALSE((capacity_bounded.Push(blocks, MakePayload(0x77)) ||
+        capacity_bounded.UsedCapacity() != acpp::detail::XHttpPacketQueue::kMaxQueuedBytes));
     auto released = capacity_bounded.Pop();
-    if (!capacity_bounded.Push(blocks, MakePayload(0x77))) return 8;
+    ASSERT_FALSE((!capacity_bounded.Push(blocks, MakePayload(0x77))));
     capacity_bounded.Clear();
-    if (capacity_bounded.UsedCapacity() != 0) return 9;
+    ASSERT_FALSE((capacity_bounded.UsedCapacity() != 0));
 
     acpp::detail::XHttpPacketQueue shared_budget;
     constexpr size_t budget = acpp::detail::XHttpPacketQueue::kMaxQueuedBytes;
-    if (!shared_budget.Reserve(budget) ||
+    ASSERT_FALSE((!shared_budget.Reserve(budget) ||
         shared_budget.Reserve(1) ||
-        shared_budget.Push(0, MakePayload(0x88))) return 10;
+        shared_budget.Push(0, MakePayload(0x88))));
     shared_budget.Release(acpp::buf::Buffer::kSize);
-    if (!shared_budget.Push(0, MakePayload(0x88)) ||
-        shared_budget.Reserve(1)) return 11;
+    ASSERT_FALSE((!shared_budget.Push(0, MakePayload(0x88)) ||
+        shared_budget.Reserve(1)));
     shared_budget.Clear();
-    if (shared_budget.UsedCapacity() != budget - acpp::buf::Buffer::kSize)
-        return 12;
+    ASSERT_FALSE((shared_budget.UsedCapacity() != budget - acpp::buf::Buffer::kSize));
     shared_budget.Release(budget - acpp::buf::Buffer::kSize);
-    if (!shared_budget.Reserve(budget)) return 13;
+    ASSERT_FALSE((!shared_budget.Reserve(budget)));
     shared_budget.Release(budget);
     for (size_t i = 0; i < acpp::detail::XHttpPacketQueue::kMaxUploads; ++i)
-        if (!shared_budget.AcquireUpload()) return 14;
-    if (shared_budget.AcquireUpload()) return 15;
+        ASSERT_FALSE((!shared_budget.AcquireUpload()));
+    ASSERT_FALSE((shared_budget.AcquireUpload()));
     shared_budget.ReleaseUpload();
-    if (!shared_budget.AcquireUpload()) return 16;
+    ASSERT_FALSE((!shared_budget.AcquireUpload()));
     for (size_t i = 0; i < acpp::detail::XHttpPacketQueue::kMaxUploads; ++i)
         shared_budget.ReleaseUpload();
-    if (!shared_budget.AcquireUpload()) return 17;
+    ASSERT_FALSE((!shared_budget.AcquireUpload()));
     shared_budget.ReleaseUpload();
     // Out-of-order packets (seq > next_seq_) must leave headroom so seq == next_seq_ can still be admitted.
     acpp::detail::XHttpPacketQueue ooo_headroom;
@@ -105,10 +95,10 @@ int main() {
          acpp::detail::XHttpPacketQueue::kInOrderHeadroomBytes) /
         acpp::buf::Buffer::kSize;
     for (size_t i = 0; i < ooo_blocks; ++i) {
-        if (!ooo_headroom.Push(i + 1, MakePayload(0x33, acpp::buf::Buffer::kSize))) return 18;
+        ASSERT_FALSE((!ooo_headroom.Push(i + 1, MakePayload(0x33, acpp::buf::Buffer::kSize))));
     }
-    if (ooo_headroom.Push(ooo_blocks + 1, MakePayload(0x33, acpp::buf::Buffer::kSize))) return 19;
-    if (!ooo_headroom.Push(0, MakePayload(0x44, acpp::buf::Buffer::kSize))) return 20;
-    if (!ooo_headroom.HasReady()) return 21;
-    return EXIT_SUCCESS;
+    ASSERT_FALSE((ooo_headroom.Push(ooo_blocks + 1, MakePayload(0x33, acpp::buf::Buffer::kSize))));
+    ASSERT_FALSE((!ooo_headroom.Push(0, MakePayload(0x44, acpp::buf::Buffer::kSize))));
+    ASSERT_FALSE((!ooo_headroom.HasReady()));
+    { ASSERT_EQ((EXIT_SUCCESS), 0); return; }
 }

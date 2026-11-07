@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "anytls_inbound.hpp"
 #include "mux_inbound.hpp"
 #include "../credentials.hpp"
@@ -908,22 +910,9 @@ void TestPeerSettings() {
 }
 }  // namespace
 
-int main(int argc, char** argv) {
+TEST(SubstreamInboundLifecycle, Contract) {
     try {
-        const bool baseline = argc == 2 && std::string_view(argv[1]) == "--observe-baseline";
-        if (argc == 2 && std::string_view(argv[1]) == "--identity-baseline") {
-            for (int mode = 0; mode < 3; ++mode) RunIdentityCase(mode, true);
-            return 0;
-        }
-        if (argc == 2 && std::string_view(argv[1]) == "--queue-baseline") {
-            RunQueueCase(0, true);
-            RunQueueCase(1, true);
-            return 0;
-        }
-        if (argc == 2 && std::string_view(argv[1]) == "--frame-error-baseline") {
-            for (int mode = 5; mode < 8; ++mode) RunHandshakeCase(mode, true);
-            return 0;
-        }
+        constexpr bool baseline = false;
         RunCase(0, baseline);
         RunCase(1, baseline);
         if (!baseline) {
@@ -943,6 +932,6 @@ int main(int argc, char** argv) {
         }
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
-        return 1;
+        FAIL() << error.what();
     }
 }

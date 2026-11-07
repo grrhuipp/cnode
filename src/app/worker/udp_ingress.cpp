@@ -31,10 +31,6 @@
 #include <stdexcept>
 #include <utility>
 
-namespace udp_native_lifecycle_fault {
-void OnNativeDispatchStage() noexcept;
-}
-
 namespace acpp::worker_detail {
 
 void UdpReplyFence::Lease::Reset() noexcept {
@@ -1411,11 +1407,6 @@ void UdpIngress::ProcessDecoded(const UdpDatagramContext& datagram,
             return;
         }
         RegisterNativeJob(client_session);
-#ifdef CNODE_TEST_UDP_NATIVE_LIFECYCLE_FAULT
-        // Test-only arm point: the next C++ allocations are the real coroutine
-        // frames. No production path or synthetic throw is introduced.
-        ::udp_native_lifecycle_fault::OnNativeDispatchStage();
-#endif
         try {
             net::co_spawn(
                 session_impl.domain ? session_impl.domain->Executor() :

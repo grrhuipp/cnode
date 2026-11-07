@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "app/dns/cache_internal.hpp"
 #include "acppnode/common/allocator.hpp"
 
@@ -217,7 +219,7 @@ void TestNegativeEventLifecycle() {
 
 }  // namespace
 
-int main() {
+TEST(DnsCache, Contract) {
     acpp::memory::ConfigureProcessAllocator();
     FailingResource resource(std::pmr::get_default_resource());
     auto* original = std::pmr::set_default_resource(&resource);
@@ -233,5 +235,5 @@ int main() {
         passed = false;
     }
     std::pmr::set_default_resource(original);
-    return passed ? 0 : 1;
+    { ASSERT_TRUE(passed); return; }
 }

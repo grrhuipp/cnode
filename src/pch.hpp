@@ -85,7 +85,7 @@
 #include <vector>
 
 // ============================================================================
-// AWS-LC（OpenSSL-compatible headers）
+// BoringSSL（OpenSSL-compatible headers）
 // ============================================================================
 #include <openssl/aes.h>
 #include <openssl/bn.h>

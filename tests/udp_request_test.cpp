@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "proxy/freedom/outbound/udp_request.hpp"
 #include "acppnode/app/dns/dns_worker.hpp"
 #include "acppnode/app/relay.hpp"
@@ -462,7 +464,7 @@ net::awaitable<void> TestRelayExternalCancellation(Fixture& fixture, bool deadli
 }
 }  // namespace
 
-int main() {
+TEST(UdpRequest, Contract) {
     try {
         { Fixture fixture; fixture.Run(TestCancellationIsolation(fixture)); }
         { Fixture fixture; fixture.Run(TestDnsWriteCancellation(fixture, WriteAbort::RequestCancel)); }
@@ -481,7 +483,6 @@ int main() {
         }
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
-        return 1;
+        FAIL() << error.what();
     }
-    return 0;
 }

@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "acppnode/transport/internet/proxy_protocol.hpp"
 
 #include <algorithm>
@@ -87,7 +89,7 @@ bool V2BoundaryCasesPass() {
 
 }  // namespace
 
-int main() {
+TEST(ProxyProtocolLiteral, Contract) {
     using namespace std::string_view_literals;
     struct Case { std::string_view family, host; bool accepted; };
     for (const auto item : {
@@ -104,7 +106,7 @@ int main() {
         if (result.success() != item.accepted || (item.accepted &&
                 (!result.src_addr || result.src_port != 32100 || result.consumed != packet.size()))) {
             std::fprintf(stderr, "PROXY source literal acceptance or tuple mismatch\n");
-            return 1;
+            FAIL() << "PROXY source literal acceptance or tuple mismatch";
         }
     }
     for (const uint8_t version : {uint8_t{1}, uint8_t{2}}) {
@@ -122,17 +124,17 @@ int main() {
                 parsed.src_port != 45678) {
                 std::fprintf(stderr, "PROXY v%u encode/parse round-trip failed\n",
                              static_cast<unsigned>(version));
-                return 2;
+                FAIL() << "PROXY v%u encode/parse round-trip failed";
             }
         }
     }
     if (!V1BoundaryCasesPass()) {
         std::fprintf(stderr, "PROXY v1 UNKNOWN or 107-byte line limit mismatch\n");
-        return 3;
+        FAIL() << "PROXY v1 UNKNOWN or 107-byte line limit mismatch";
     }
     if (!V2BoundaryCasesPass()) {
         std::fprintf(stderr, "PROXY v2 version/command/family/transport validation mismatch\n");
-        return 4;
+        FAIL() << "PROXY v2 version/command/family/transport validation mismatch";
     }
     std::puts("PROXY v1/v2 source literal, family, boundary, and encode round-trip cases passed");
 }

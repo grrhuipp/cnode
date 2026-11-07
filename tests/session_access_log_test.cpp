@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "acppnode/common/session.hpp"
 
 #include <asio/ip/address.hpp>
@@ -30,7 +32,7 @@ void* operator new(std::size_t n) {
 void operator delete(void* p) noexcept { std::free(p); }
 void operator delete(void* p, std::size_t) noexcept { std::free(p); }
 
-int main() {
+TEST(SessionAccessLog, Contract) {
     try {
         acpp::session::Context ctx;
         ctx.inbound.source_addr = acpp::net::ip::make_address("192.0.2.10");
@@ -162,7 +164,6 @@ int main() {
     } catch (const std::exception& error) {
         count_allocations = false;
         std::cerr << error.what() << '\n';
-        return 1;
+        FAIL() << error.what();
     }
-    return 0;
 }

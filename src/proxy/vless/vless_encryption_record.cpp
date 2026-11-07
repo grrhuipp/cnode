@@ -116,19 +116,13 @@ std::optional<VlessEncryptionAead> VlessEncryptionAead::Create(
     VlessEncryptionAead aead;
     auto derived = DeriveAeadKey(context, key);
     aead.cipher_ = cipher;
-    const bool initialized = EVP_AEAD_CTX_init(
-                                 &aead.aead_ctx_,
-                                 algorithm,
-                                 derived.data(),
-                                 derived.size(),
-                                 kVlessEncryptionTagSize,
-                                 nullptr) == 1;
+    aead.aead_ctx_.reset(EVP_AEAD_CTX_new(
+        algorithm, derived.data(), derived.size(), kVlessEncryptionTagSize));
     OPENSSL_cleanse(derived.data(), derived.size());
-    if (!initialized) {
+    if (!aead.aead_ctx_) {
         ERR_clear_error();
         return std::nullopt;
     }
-    aead.initialized_ = true;
     return aead;
 }
 
@@ -136,7 +130,7 @@ std::optional<size_t> VlessEncryptionAead::Seal(
     std::span<const uint8_t> plaintext,
     std::span<const uint8_t> additional_data,
     std::span<uint8_t> output) noexcept {
-    if (!initialized_ || output.size() < kVlessEncryptionTagSize ||
+    if (!aead_ctx_ || output.size() < kVlessEncryptionTagSize ||
         output.size() - kVlessEncryptionTagSize < plaintext.size()) {
         return std::nullopt;
     }
@@ -149,13 +143,13 @@ std::optional<size_t> VlessEncryptionAead::SealWithNonce(
     std::span<const uint8_t> plaintext,
     std::span<const uint8_t> additional_data,
     std::span<uint8_t> output) noexcept {
-    if (!initialized_ || output.size() < kVlessEncryptionTagSize ||
+    if (!aead_ctx_ || output.size() < kVlessEncryptionTagSize ||
         output.size() - kVlessEncryptionTagSize < plaintext.size()) {
         return std::nullopt;
     }
     size_t out_len = 0;
     if (EVP_AEAD_CTX_seal(
-            &aead_ctx_,
+            aead_ctx_.get(),
             output.data(),
             &out_len,
             output.size(),
@@ -175,7 +169,7 @@ std::optional<size_t> VlessEncryptionAead::Open(
     std::span<const uint8_t> ciphertext,
     std::span<const uint8_t> additional_data,
     std::span<uint8_t> output) noexcept {
-    if (!initialized_ || ciphertext.size() < kVlessEncryptionTagSize ||
+    if (!aead_ctx_ || ciphertext.size() < kVlessEncryptionTagSize ||
         output.size() < ciphertext.size() - kVlessEncryptionTagSize) {
         return std::nullopt;
     }
@@ -188,13 +182,13 @@ std::optional<size_t> VlessEncryptionAead::OpenWithNonce(
     std::span<const uint8_t> ciphertext,
     std::span<const uint8_t> additional_data,
     std::span<uint8_t> output) noexcept {
-    if (!initialized_ || ciphertext.size() < kVlessEncryptionTagSize ||
+    if (!aead_ctx_ || ciphertext.size() < kVlessEncryptionTagSize ||
         output.size() < ciphertext.size() - kVlessEncryptionTagSize) {
         return std::nullopt;
     }
     size_t out_len = 0;
     if (EVP_AEAD_CTX_open(
-            &aead_ctx_,
+            aead_ctx_.get(),
             output.data(),
             &out_len,
             output.size(),

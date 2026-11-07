@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "service/controller/traffic_journal.hpp"
 #include "acppnode/infra/json.hpp"
 
@@ -46,7 +48,7 @@ void CrashWrite(const acpp::PanelConfig& config, bool begin) {
           "crash fixture failed");
 }
 }
-int main() {
+TEST(TrafficJournal, Contract) {
     char name[] = "/tmp/cnode-traffic-journal-XXXXXX";
     const auto* created = ::mkdtemp(name);
     Check(created != nullptr, "temporary directory failed");

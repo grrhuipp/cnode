@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "trojan_codec.hpp"
 #include "credentials.hpp"
 
@@ -96,7 +98,7 @@ void TestRequest(acpp::trojan::TrojanCommand command, const acpp::TargetAddress&
 }
 }  // namespace
 
-int main() {
+TEST(TrojanRequest, Contract) {
     try {
         TestHashes();
         constexpr std::array<uint8_t, 5> ipv4{1, 127, 0, 0, 1};
@@ -111,6 +113,6 @@ int main() {
     } catch (const std::exception& error) {
         reject_allocation = false;
         std::cerr << "Trojan request encoding failed with C++ allocations disabled: " << error.what() << '\n';
-        return 1;
+        FAIL() << error.what();
     }
 }

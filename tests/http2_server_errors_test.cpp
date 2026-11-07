@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "acppnode/transport/internet/tcp_stream.hpp"
 #include "acppnode/transport/internet/transport_stack.hpp"
 
@@ -223,7 +225,7 @@ void ResetsMalformedRequest(std::string_view network, std::string_view extra_fie
 }
 }  // namespace
 
-int main() {
+TEST(Http2ServerErrors, Contract) {
     try {
         for (const auto network : {"grpc", "h2", "xhttp"}) {
             ParentWaitsForCleanup(network, false);
@@ -232,9 +234,9 @@ int main() {
             ResetsMalformedRequest(network, HeaderField("host", "other.example"));
         }
         std::puts("HTTP/2 parent cleanup: all network cases completed");
-        return 0;
+        return;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "HTTP/2 parent cleanup: %s\n", error.what());
-        return 1;
+        FAIL() << error.what();
     }
 }

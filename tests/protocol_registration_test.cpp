@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "acppnode/app/proxyman/inbound/factory.hpp"
 #include "acppnode/app/stats.hpp"
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
@@ -379,14 +381,9 @@ bool TestOutboundRegistration() {
 
 }  // namespace
 
-int main() {
-    if (!TestInboundRegistration()) {
-        std::cerr << "inbound protocol registration accepted invalid state\n";
-        return 1;
-    }
-    if (!TestOutboundRegistration()) {
-        std::cerr << "outbound protocol registration accepted invalid state\n";
-        return 1;
-    }
-    return 0;
+TEST(ProtocolRegistration, Contract) {
+    ASSERT_TRUE(TestInboundRegistration())
+        << "inbound protocol registration accepted invalid state";
+    ASSERT_TRUE(TestOutboundRegistration())
+        << "outbound protocol registration accepted invalid state";
 }

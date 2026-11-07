@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "proxy/shadowsocks/outbound/udp_request.hpp"
 #include "proxy/shadowsocks/ss_udp.hpp"
 #include "acppnode/app/dns/dns_worker.hpp"
@@ -384,7 +386,7 @@ bool RunCase(std::string_view name, Test&& test) {
 }
 }  // namespace
 
-int main() {
+TEST(SsUdpRequest, Contract) {
     size_t failures = 0;
     failures += !RunCase("authenticated response round trip", TestAuthenticatedRoundTrip);
     failures += !RunCase("single read budget with same-server garbage", TestReadBudgetAgainstSameServerGarbage);
@@ -392,5 +394,5 @@ int main() {
     failures += !RunCase("same-source garbage does not extend idle", TestSameSourceGarbageCannotExtendIdle);
     failures += !RunCase("IPv4 wire-size rejection and recovery", TestMaximumWirePayload);
     std::cout << "SS UDP request cases: " << (5 - failures) << "/5 passed\n";
-    return failures == 0 ? 0 : 1;
+    { ASSERT_TRUE(failures == 0); return; }
 }

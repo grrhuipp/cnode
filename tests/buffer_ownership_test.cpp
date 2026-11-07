@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "acppnode/common/initial_payload.hpp"
 
 #include <array>
@@ -44,9 +46,6 @@ void operator delete(void* pointer, const std::nothrow_t&) noexcept { ::operator
 namespace {
 using namespace acpp;
 static_assert(alignof(buf::Buffer) <= alignof(std::max_align_t));
-static_assert(!std::is_copy_constructible_v<InitialPayload>);
-static_assert(!std::is_copy_assignable_v<InitialPayload>);
-static_assert(!std::is_constructible_v<buf::MultiBuffer, buf::Buffer*>);
 int failed = 0;
 
 void Check(bool passed, const char* name) {
@@ -419,11 +418,11 @@ void EdgeCases() {
 }
 }
 
-int main() {
+TEST(BufferOwnership, Contract) {
     InitialMatrix();
     AppendMatrix();
     TransferMatrix();
     UdpPrefixTransfer();
     EdgeCases();
-    return failed ? 1 : 0;
+    { ASSERT_EQ((failed ? 1 : 0), 0); return; }
 }

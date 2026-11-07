@@ -1,10 +1,12 @@
+#include <gtest/gtest.h>
+
 #include "acppnode/transport/internet/reality_key.hpp"
 
-#include <openssl/evp.h>
-#include <openssl/nid.h>
+#include <openssl/bytestring.h>
+#include <openssl/mem.h>
+#include <openssl/mldsa.h>
 
 #include <cstdio>
-#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -19,18 +21,22 @@ bool Require(bool condition, const char* message) {
     return condition;
 }
 
-// Test fixture helper (also used by reality_integration.py): the product only
-// parses configured keys, it never derives or encodes them.
+// The product parses configured keys; key derivation is only fixture setup.
 std::optional<RealityMldsa65PublicKey> DeriveRealityMldsa65PublicKeyFromSeed(
     const RealityKey& seed) {
-    std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> pkey(
-        EVP_PKEY_pqdsa_new_raw_private_key(NID_MLDSA65, seed.data(), seed.size()),
-        EVP_PKEY_free);
-    if (!pkey) return std::nullopt;
+    MLDSA65_private_key private_key;
+    MLDSA65_public_key public_key;
+    const bool valid =
+        MLDSA65_private_key_from_seed(&private_key, seed.data(), seed.size()) == 1 &&
+        MLDSA65_public_from_private(&public_key, &private_key) == 1;
+    OPENSSL_cleanse(&private_key, sizeof(private_key));
+    if (!valid) return std::nullopt;
     RealityMldsa65PublicKey pub{};
-    std::size_t pub_len = pub.size();
-    if (EVP_PKEY_get_raw_public_key(pkey.get(), pub.data(), &pub_len) != 1 ||
-        pub_len != pub.size()) {
+    static_assert(pub.size() == MLDSA65_PUBLIC_KEY_BYTES);
+    bssl::ScopedCBB encoded;
+    CBB_init_fixed(encoded.get(), pub.data(), pub.size());
+    if (MLDSA65_marshal_public_key(encoded.get(), &public_key) != 1 ||
+        CBB_len(encoded.get()) != pub.size()) {
         return std::nullopt;
     }
     return pub;
@@ -59,24 +65,16 @@ std::string EncodeRealityBase64Url(std::span<const uint8_t> bytes) {
 
 }  // namespace
 
-int main(int argc, char** argv) {
+TEST(RealityKey, Contract) {
     using acpp::transport::internet::NormalizeRealityFingerprint;
     using acpp::transport::internet::ParseRealityKey;
     using acpp::transport::internet::ParseRealityMldsa65PublicKey;
     using acpp::transport::internet::ParseRealityMldsa65Seed;
 
-    if (argc == 3 && std::string(argv[1]) == "--derive-mldsa65") {
-        const auto seed = ParseRealityMldsa65Seed(argv[2]);
-        if (!seed) return 10;
-        const auto pub = DeriveRealityMldsa65PublicKeyFromSeed(*seed);
-        if (!pub) return 11;
-        std::puts(EncodeRealityBase64Url(*pub).c_str());
-        return 0;
-    }
     const std::string zero_key(43, 'A');
     const auto parsed = ParseRealityKey(zero_key);
-    if (!Require(parsed && *parsed == RealityKey{},
-                 "canonical 32-byte Base64URL key must decode")) return 1;
+    ASSERT_FALSE((!Require(parsed && *parsed == RealityKey{},
+                 "canonical 32-byte Base64URL key must decode")));
 
     std::string noncanonical = zero_key;
     noncanonical.back() = 'B';
@@ -84,27 +82,26 @@ int main(int argc, char** argv) {
              std::string(42, 'A'), std::string(44, 'A'),
              zero_key.substr(0, 42) + "=", noncanonical,
              zero_key.substr(0, 42) + "!"}) {
-        if (!Require(!ParseRealityKey(invalid),
-                     "invalid REALITY key must be rejected")) return 2;
+        ASSERT_FALSE((!Require(!ParseRealityKey(invalid),
+                     "invalid REALITY key must be rejected")));
     }
 
     const auto mldsa_seed = ParseRealityMldsa65Seed(zero_key);
-    if (!Require(mldsa_seed.has_value(),
-                 "valid 32-byte ML-DSA-65 seed must parse")) return 3;
+    ASSERT_FALSE((!Require(mldsa_seed.has_value(),
+                 "valid 32-byte ML-DSA-65 seed must parse")));
     const auto mldsa_pub = DeriveRealityMldsa65PublicKeyFromSeed(*mldsa_seed);
-    if (!Require(mldsa_pub.has_value(),
-                 "ML-DSA-65 public key derivation from seed failed")) return 4;
+    ASSERT_FALSE((!Require(mldsa_pub.has_value(),
+                 "ML-DSA-65 public key derivation from seed failed")));
     const std::string encoded_pub = EncodeRealityBase64Url(*mldsa_pub);
     const auto parsed_pub = ParseRealityMldsa65PublicKey(encoded_pub);
-    if (!Require(parsed_pub && *parsed_pub == *mldsa_pub,
-                 "ML-DSA-65 public key round-trip failed")) return 5;
-    if (!Require(!ParseRealityMldsa65PublicKey("invalid-pub"),
-                 "invalid ML-DSA-65 public key must be rejected")) return 6;
+    ASSERT_FALSE((!Require(parsed_pub && *parsed_pub == *mldsa_pub,
+                 "ML-DSA-65 public key round-trip failed")));
+    ASSERT_FALSE((!Require(!ParseRealityMldsa65PublicKey("invalid-pub"),
+                 "invalid ML-DSA-65 public key must be rejected")));
 
-    if (!Require(NormalizeRealityFingerprint("Chrome") == "chrome" &&
+    ASSERT_FALSE((!Require(NormalizeRealityFingerprint("Chrome") == "chrome" &&
                  NormalizeRealityFingerprint("Firefox") == "firefox" &&
                  NormalizeRealityFingerprint("iOS") == "ios" &&
                  !NormalizeRealityFingerprint("unknown-browser"),
-                 "REALITY fingerprint normalization failed")) return 7;
-    return 0;
+                 "REALITY fingerprint normalization failed")));
 }

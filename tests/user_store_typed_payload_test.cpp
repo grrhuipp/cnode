@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "acppnode/app/proxyman/inbound/prepared_config.hpp"
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
 #include <array>
@@ -99,14 +101,14 @@ bool TestAmbiguousCredentialsRejected() {
 }
 }  // namespace
 
-int main() {
+TEST(UserStoreTypedPayload, Contract) {
     if (!TestTypedUpdatesStayProtocolLocal() || !TestTypedClearStaysProtocolLocal()) {
         std::cerr << "typed replacement/clear crossed protocol storage boundaries\n";
-        return 1;
+        FAIL() << "typed replacement/clear crossed protocol storage boundaries";
     }
     if (!TestAmbiguousCredentialsRejected()) {
         std::cerr << "ambiguous credentials were published or silently merged\n";
-        return 1;
+        FAIL() << "ambiguous credentials were published or silently merged";
     }
     UserStore::ClearWorkerView();
 }

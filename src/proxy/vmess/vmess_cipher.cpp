@@ -28,7 +28,7 @@ VMessCipher::VMessCipher(Security security, const uint8_t* key, const uint8_t* i
     // ChaCha20-Poly1305 needs 32 bytes: MD5(key16) || MD5(MD5(key16)).
     std::array<uint8_t, 32> expanded{};
     std::span<const uint8_t> actual_key(key, 16);
-    const EVP_CIPHER* algorithm = EVP_aes_128_gcm();
+    const EVP_AEAD* algorithm = EVP_aead_aes_128_gcm();
     if (security == Security::CHACHA20_POLY1305) {
         auto first = MD5Hash(key, 16);
         auto second = MD5Hash(first.data(), first.size());
@@ -37,7 +37,7 @@ VMessCipher::VMessCipher(Security security, const uint8_t* key, const uint8_t* i
         OPENSSL_cleanse(first.data(), first.size());
         OPENSSL_cleanse(second.data(), second.size());
         actual_key = expanded;
-        algorithm = EVP_chacha20_poly1305();
+        algorithm = EVP_aead_chacha20_poly1305();
     }
     const bool ok = direction == proxy::AeadDirection::Encrypt
         ? cipher_.emplace<proxy::AeadEncryptor>().Configure(algorithm, actual_key)

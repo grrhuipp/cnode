@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "request_task.hpp"
 
 #include <asio/as_tuple.hpp>
@@ -135,7 +137,7 @@ void TestCallerCancellation(WaitResult result) {
 }
 }  // namespace
 
-int main() {
+TEST(V2BoardRequestTask, Contract) {
     try {
         TestOrdinaryCompletion(false);
         TestOrdinaryCompletion(true);
@@ -146,7 +148,6 @@ int main() {
         TestCallerCancellation(WaitResult::FailureValue);
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
-        return 1;
+        FAIL() << error.what();
     }
-    return 0;
 }

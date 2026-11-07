@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "acppnode/app/dns/dns_worker.hpp"
 #include "acppnode/app/port_binding.hpp"
 #include "acppnode/app/proxyman/inbound/factory.hpp"
@@ -276,7 +278,7 @@ void RunCase(app::dns::DNSWorker& dns, uint32_t global, uint32_t per_ip, bool li
 }
 } // namespace
 
-int main() {
+TEST(WorkerConnectionLimitRuntime, Contract) {
     try {
         memory::ConfigureProcessAllocator();
         RegisterProtocol();
@@ -288,9 +290,9 @@ int main() {
         RunCase(dns, 0, 0, false);
         RunCase(dns, std::numeric_limits<uint32_t>::max(), 0, false);
         RunCase(dns, 0, std::numeric_limits<uint32_t>::max(), false);
-        return 0;
+        return;
     } catch (const std::exception& error) {
         std::cerr << "Worker connection ownership: " << error.what() << '\n';
-        return 1;
+        FAIL() << error.what();
     }
 }

@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "acppnode/transport/internet/tls_stream.hpp"
 #include "autosign_cert.hpp"
 #include "tls_client_context.hpp"
@@ -111,15 +113,13 @@ bool ReplaceCommonName(X509* certificate,
 
 }  // namespace
 
-int main() {
+TEST(TlsClientCertificate, Contract) {
     auto material = acpp::transport::internet::AutoSignCertificate::Create("client.example");
     CertificateFiles files;
-    if (!Require(material != nullptr,
+    ASSERT_FALSE((!Require(material != nullptr,
                  "client certificate material must be generated") ||
         !Require(WriteCertificateFiles(files, material->Certificate(), material->Key()),
-                 "client certificate files must be written")) {
-        return 1;
-    }
+                 "client certificate files must be written")));
 
     acpp::TlsConfig config;
     config.cert_file = files.cert.string();
@@ -128,33 +128,23 @@ int main() {
     acpp::LoadTlsPemMaterial(config);
 
     auto context = acpp::SslContext::CreateClient(config);
-    if (!Require(context != nullptr, "client context must be created")) return 2;
-    if (!Require(SSL_CTX_get0_certificate(context->Native()) != nullptr,
-                 "client context must expose the configured certificate")) {
-        return 3;
-    }
-    if (!Require(SSL_CTX_get0_privatekey(context->Native()) != nullptr,
-                 "client context must expose the configured private key")) {
-        return 4;
-    }
-    if (!Require(SSL_CTX_check_private_key(context->Native()) == 1,
-                 "client certificate and private key must match")) {
-        return 5;
-    }
+    ASSERT_FALSE((!Require(context != nullptr, "client context must be created")));
+    ASSERT_FALSE((!Require(SSL_CTX_get0_certificate(context->Native()) != nullptr,
+                 "client context must expose the configured certificate")));
+    ASSERT_FALSE((!Require(SSL_CTX_get0_privatekey(context->Native()) != nullptr,
+                 "client context must expose the configured private key")));
+    ASSERT_FALSE((!Require(SSL_CTX_check_private_key(context->Native()) == 1,
+                 "client certificate and private key must match")));
 
     acpp::TlsConfig private_ca_config;
     private_ca_config.ca_file = files.cert.string();
     acpp::LoadTlsPemMaterial(private_ca_config);
     auto private_ca_context = acpp::SslContext::CreateClient(private_ca_config);
-    if (!Require(private_ca_context != nullptr,
-                 "client context with private CA must be created")) {
-        return 6;
-    }
-    if (!Require(VerifyCertificateWithContextStore(
+    ASSERT_FALSE((!Require(private_ca_context != nullptr,
+                 "client context with private CA must be created")));
+    ASSERT_FALSE((!Require(VerifyCertificateWithContextStore(
                      material->Certificate(), private_ca_context->Native()),
-                 "configured private CA must be present in the client trust store")) {
-        return 7;
-    }
+                 "configured private CA must be present in the client trust store")));
 
     // Like SSL_CTX_use_certificate_chain_file, only a clean end of input may
     // follow the leaf: a malformed later block fails the whole chain.
@@ -164,10 +154,8 @@ int main() {
     malformed_chain->private_key = config.pem->private_key;
     acpp::TlsConfig malformed_chain_config = config;
     malformed_chain_config.pem = std::move(malformed_chain);
-    if (!Require(acpp::SslContext::CreateClient(malformed_chain_config) == nullptr,
-                 "a malformed PEM block after the leaf certificate must be rejected")) {
-        return 32;
-    }
+    ASSERT_FALSE((!Require(acpp::SslContext::CreateClient(malformed_chain_config) == nullptr,
+                 "a malformed PEM block after the leaf certificate must be rejected")));
 
     acpp::TlsConfig unreadable_config;
     unreadable_config.ca_file = files.cert.string() + ".missing";
@@ -177,28 +165,22 @@ int main() {
     } catch (const std::invalid_argument&) {
         unreadable_rejected = true;
     }
-    if (!Require(unreadable_rejected && !unreadable_config.pem,
-                 "an unreadable TLS file must be rejected while loading configuration")) {
-        return 33;
-    }
+    ASSERT_FALSE((!Require(unreadable_rejected && !unreadable_config.pem,
+                 "an unreadable TLS file must be rejected while loading configuration")));
 
     acpp::TlsConfig tls13_config;
     tls13_config.allow_insecure = true;
     tls13_config.min_version = acpp::TlsVersion::V1_3;
     tls13_config.max_version = acpp::TlsVersion::V1_3;
     auto tls13_context = acpp::SslContext::CreateClient(tls13_config);
-    if (!Require(tls13_context != nullptr,
-                 "TLS 1.3-only client context must be created")) {
-        return 8;
-    }
-    if (!Require(
+    ASSERT_FALSE((!Require(tls13_context != nullptr,
+                 "TLS 1.3-only client context must be created")));
+    ASSERT_FALSE((!Require(
             SSL_CTX_get_min_proto_version(tls13_context->Native()) ==
                 TLS1_3_VERSION &&
             SSL_CTX_get_max_proto_version(tls13_context->Native()) ==
                 TLS1_3_VERSION,
-            "TLS 1.3-only policy must reach the client SSL context")) {
-        return 9;
-    }
+            "TLS 1.3-only policy must reach the client SSL context")));
 
     using namespace std::string_view_literals;
     for (const auto identity : {"127.0.0.1:9"sv, "[::1]"sv, "bad..example"sv,
@@ -206,14 +188,14 @@ int main() {
         SSL* client = SSL_new(context->Native());
         const bool rejected = client && !acpp::ConfigureTlsServerIdentity(client, identity);
         SSL_free(client);
-        if (!Require(rejected, "invalid TLS identity must be rejected before SNI or SAN setup")) return 30;
+        ASSERT_FALSE((!Require(rejected, "invalid TLS identity must be rejected before SNI or SAN setup")));
     }
     for (const auto identity : {"2001:db8::1", "fe80::1%3", "::ffff:192.0.2.1"}) {
         SSL* client = SSL_new(context->Native());
         const bool configured = client && acpp::ConfigureTlsServerIdentity(client, identity) &&
             SSL_get_servername(client, TLSEXT_NAMETYPE_host_name) == nullptr;
         SSL_free(client);
-        if (!Require(configured, "IPv6 TLS identity must use IP SAN bytes without SNI")) return 31;
+        ASSERT_FALSE((!Require(configured, "IPv6 TLS identity must use IP SAN bytes without SNI")));
     }
 
     auto ip_material = acpp::transport::internet::AutoSignCertificate::Create("192.0.2.1");
@@ -222,32 +204,30 @@ int main() {
                      ip_client != nullptr,
                  "IP identity test material must be created")) {
         if (ip_client) SSL_free(ip_client);
-        return 10;
+        FAIL() << "IP identity test material must be created";
     }
     if (!Require(ReplaceCommonName(
                      ip_material->Certificate(), ip_material->Key(), "unrelated.example"),
                  "IP identity certificate common name must be replaced")) {
         SSL_free(ip_client);
-        return 11;
+        FAIL() << "IP identity certificate common name must be replaced";
     }
     if (!Require(acpp::ConfigureTlsServerIdentity(ip_client, "192.0.2.1"),
                  "IP server identity must be configured")) {
         SSL_free(ip_client);
-        return 12;
+        FAIL() << "IP server identity must be configured";
     }
     if (!Require(SSL_get_servername(
                      ip_client, TLSEXT_NAMETYPE_host_name) == nullptr,
                  "IP server identity must not be sent as SNI")) {
         SSL_free(ip_client);
-        return 13;
+        FAIL() << "IP server identity must not be sent as SNI";
     }
     const bool ip_verified = VerifyCertificate(
         ip_material->Certificate(), SSL_get0_param(ip_client));
     SSL_free(ip_client);
-    if (!Require(ip_verified,
-                 "IP SAN certificate must verify for its configured identity")) {
-        return 14;
-    }
+    ASSERT_FALSE((!Require(ip_verified,
+                 "IP SAN certificate must verify for its configured identity")));
 
     SSL* wrong_ip_client = SSL_new(context->Native());
     if (!Require(wrong_ip_client != nullptr &&
@@ -255,15 +235,13 @@ int main() {
                          wrong_ip_client, "192.0.2.2"),
                  "wrong IP identity must be configured for rejection test")) {
         if (wrong_ip_client) SSL_free(wrong_ip_client);
-        return 15;
+        FAIL() << "wrong IP identity must be configured for rejection test";
     }
     const bool wrong_ip_verified = VerifyCertificate(
         ip_material->Certificate(), SSL_get0_param(wrong_ip_client));
     SSL_free(wrong_ip_client);
-    if (!Require(!wrong_ip_verified,
-                 "IP SAN certificate must reject a different IP identity")) {
-        return 16;
-    }
+    ASSERT_FALSE((!Require(!wrong_ip_verified,
+                 "IP SAN certificate must reject a different IP identity")));
 
     SSL* dns_client = SSL_new(context->Native());
     if (!Require(dns_client != nullptr &&
@@ -271,7 +249,7 @@ int main() {
                          dns_client, "client.example"),
                  "DNS server identity must be configured")) {
         if (dns_client) SSL_free(dns_client);
-        return 17;
+        FAIL() << "DNS server identity must be configured";
     }
     const char* configured_sni = SSL_get_servername(
         dns_client, TLSEXT_NAMETYPE_host_name);
@@ -281,20 +259,18 @@ int main() {
                      std::string_view(configured_sni) == "client.example",
                  "DNS server identity must be sent as SNI")) {
         SSL_free(dns_client);
-        return 18;
+        FAIL() << "DNS server identity must be sent as SNI";
     }
     SSL_free(dns_client);
-    if (!Require(dns_verified,
-                 "DNS SAN certificate must verify for its configured identity")) {
-        return 19;
-    }
+    ASSERT_FALSE((!Require(dns_verified,
+                 "DNS SAN certificate must verify for its configured identity")));
     // FQDN with trailing root dot must strip the dot for SNI (RFC 6066) and X.509 SAN host verification.
     SSL* fqdn_client = SSL_new(context->Native());
     if (!Require(fqdn_client != nullptr &&
                      acpp::ConfigureTlsServerIdentity(fqdn_client, "client.example."),
                  "FQDN server identity with trailing dot must be configured")) {
         if (fqdn_client) SSL_free(fqdn_client);
-        return 34;
+        FAIL() << "FQDN server identity with trailing dot must be configured";
     }
     const char* fqdn_sni = SSL_get_servername(fqdn_client, TLSEXT_NAMETYPE_host_name);
     const bool fqdn_verified = VerifyCertificate(
@@ -302,37 +278,26 @@ int main() {
     if (!Require(fqdn_sni != nullptr && std::string_view(fqdn_sni) == "client.example",
                  "FQDN trailing root dot must be stripped from SNI")) {
         SSL_free(fqdn_client);
-        return 35;
+        FAIL() << "FQDN trailing root dot must be stripped from SNI";
     }
     SSL_free(fqdn_client);
-    if (!Require(fqdn_verified,
-                 "FQDN with trailing root dot must verify against certificate SAN")) {
-        return 36;
-    }
+    ASSERT_FALSE((!Require(fqdn_verified,
+                 "FQDN with trailing root dot must verify against certificate SAN")));
 
     std::vector<unsigned char> alpn_wire;
     const std::vector<std::string> valid_alpn = {"h2", "http/1.1"};
     const std::vector<unsigned char> expected_alpn_wire = {
         2, 'h', '2', 8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
-    if (!Require(acpp::EncodeTlsAlpnProtocols(valid_alpn, alpn_wire) &&
+    ASSERT_FALSE((!Require(acpp::EncodeTlsAlpnProtocols(valid_alpn, alpn_wire) &&
                      alpn_wire == expected_alpn_wire,
-                 "valid ALPN protocols must have canonical wire encoding")) {
-        return 20;
-    }
+                 "valid ALPN protocols must have canonical wire encoding")));
     const std::vector<std::string> empty_alpn = {""};
-    if (!Require(!acpp::EncodeTlsAlpnProtocols(empty_alpn, alpn_wire),
-                 "empty ALPN protocol must be rejected")) {
-        return 21;
-    }
+    ASSERT_FALSE((!Require(!acpp::EncodeTlsAlpnProtocols(empty_alpn, alpn_wire),
+                 "empty ALPN protocol must be rejected")));
     const std::vector<std::string> overlong_alpn = {std::string(256, 'a')};
-    if (!Require(!acpp::EncodeTlsAlpnProtocols(overlong_alpn, alpn_wire),
-                 "overlong ALPN protocol must be rejected")) {
-        return 22;
-    }
+    ASSERT_FALSE((!Require(!acpp::EncodeTlsAlpnProtocols(overlong_alpn, alpn_wire),
+                 "overlong ALPN protocol must be rejected")));
     const std::vector<std::string> duplicate_alpn = {"h2", "h2"};
-    if (!Require(!acpp::EncodeTlsAlpnProtocols(duplicate_alpn, alpn_wire),
-                 "duplicate ALPN protocol must be rejected")) {
-        return 23;
-    }
-    return 0;
+    ASSERT_FALSE((!Require(!acpp::EncodeTlsAlpnProtocols(duplicate_alpn, alpn_wire),
+                 "duplicate ALPN protocol must be rejected")));
 }

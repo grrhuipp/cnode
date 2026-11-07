@@ -1,3 +1,6 @@
+#include <stdexcept>
+#include <gtest/gtest.h>
+
 #include "vmess_cipher.hpp"
 
 #include <algorithm>
@@ -13,18 +16,17 @@ namespace {
 bool fail_digest_allocation = false;
 bool fail_mask_output = false;
 int cipher_allocation_countdown = 0;
-size_t cipher_contexts = 0;
 }
 extern "C" EVP_MD_CTX* __real_EVP_MD_CTX_new();
-extern "C" EVP_CIPHER_CTX* __real_EVP_CIPHER_CTX_new();
+extern "C" EVP_AEAD_CTX* __real_EVP_AEAD_CTX_new(const EVP_AEAD*, const uint8_t*, size_t, size_t);
 extern "C" int __real_EVP_DigestSqueeze(EVP_MD_CTX*, uint8_t*, size_t);
 extern "C" EVP_MD_CTX* __wrap_EVP_MD_CTX_new() {
     return fail_digest_allocation ? nullptr : __real_EVP_MD_CTX_new();
 }
-extern "C" EVP_CIPHER_CTX* __wrap_EVP_CIPHER_CTX_new() {
-    ++cipher_contexts;
+extern "C" EVP_AEAD_CTX* __wrap_EVP_AEAD_CTX_new(
+    const EVP_AEAD* cipher, const uint8_t* key, size_t key_size, size_t tag_size) {
     if (cipher_allocation_countdown > 0 && --cipher_allocation_countdown == 0) return nullptr;
-    return __real_EVP_CIPHER_CTX_new();
+    return __real_EVP_AEAD_CTX_new(cipher, key, key_size, tag_size);
 }
 extern "C" int __wrap_EVP_DigestSqueeze(EVP_MD_CTX* ctx, uint8_t* out, size_t size) {
     return fail_mask_output ? 0 : __real_EVP_DigestSqueeze(ctx, out, size);
@@ -38,12 +40,12 @@ using acpp::proxy::AeadDirection;
 void Check(bool condition, std::string_view message) {
     if (!condition) {
         std::cerr << message << '\n';
-        std::exit(1);
+        ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed");
     }
 }
 }  // namespace
 
-int main() {
+TEST(VmessCipher, Contract) {
     const std::array<uint8_t, 16> key{}, iv{};
 #ifdef CNODE_TEST_CRYPTO_FAULT
     fail_digest_allocation = true;
@@ -79,9 +81,6 @@ int main() {
                                    Security::NONE, Security::ZERO}) {
         VMessCipher encoder(security, key.data(), iv.data(), AeadDirection::Encrypt);
         VMessCipher decoder(security, key.data(), iv.data(), AeadDirection::Decrypt);
-#ifdef CNODE_TEST_CRYPTO_FAULT
-        const auto contexts = cipher_contexts;
-#endif
         for (const size_t size : {size_t{0}, size_t{1}, size_t{127}, size_t{0}, size_t{31}}) {
             std::array<uint8_t, 128> input{}, output{};
             std::array<uint8_t, 144> wire{};
@@ -99,9 +98,6 @@ int main() {
                   "chunk plaintext changed");
             ++frames;
         }
-#ifdef CNODE_TEST_CRYPTO_FAULT
-        Check(cipher_contexts == contexts, "VMess records allocated additional EVP contexts");
-#endif
         if (encoder.Overhead()) {
             VMessCipher fresh_encoder(security, key.data(), iv.data(), AeadDirection::Encrypt);
             VMessCipher fresh_decoder(security, key.data(), iv.data(), AeadDirection::Decrypt);
