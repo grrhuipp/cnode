@@ -42,14 +42,32 @@ ErrorCode MapAsioError(const IoErrorCode& ec) {
         return ErrorCode::DNS_SERVER_FAILED;
     }
 
-    if (ec.category() == std::system_category()) {
+    if (ec.category() == std::system_category() ||
+        ec.category() == net::error::get_system_category()) {
         switch (ec.value()) {
+            case ECANCELED:
+                return ErrorCode::CANCELLED;
+            case ETIMEDOUT:
+                return ErrorCode::TIMEOUT;
+            case ECONNREFUSED:
+                return ErrorCode::DIAL_REFUSED;
+            case ECONNRESET:
+            case EPIPE:
+            case ENOTCONN:
+                return ErrorCode::SOCKET_CLOSED;
+            case ENETUNREACH:
+            case ENETDOWN:
+                return ErrorCode::DIAL_NETWORK_UNREACHABLE;
+            case EHOSTUNREACH:
+            case EHOSTDOWN:
+                return ErrorCode::DIAL_HOST_UNREACHABLE;
             case EADDRINUSE:
             case EADDRNOTAVAIL:
                 return ErrorCode::SOCKET_BIND_FAILED;
             case EACCES:
             case EPERM:
                 return ErrorCode::PERMISSION_DENIED;
+            case ENOBUFS:
             case EMFILE:
             case ENFILE:
             case ENOMEM:

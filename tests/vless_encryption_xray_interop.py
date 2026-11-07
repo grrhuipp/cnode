@@ -7,6 +7,7 @@ and must never reach the target. All listeners/credentials are loopback fixtures
 """
 import argparse
 import asyncio
+import errno
 import hashlib
 import json
 from pathlib import Path
@@ -124,7 +125,13 @@ async def run_case(args, mode, output):
             if payload is not None:
                 writer.write(payload)
                 await writer.drain()
-                writer.write_eof()
+                try:
+                    writer.write_eof()
+                except OSError as error:
+                    # Rejected ciphertext can close the socket before our FIN.
+                    # The peer log and target count below still prove rejection.
+                    if error.errno != errno.ENOTCONN:
+                        raise
             try:
                 await asyncio.wait_for(reader.read(), 4)
             except ConnectionError:

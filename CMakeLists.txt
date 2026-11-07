@@ -54,6 +54,15 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 get_property(CNODE_IS_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+find_program(CNODE_CCACHE_PROGRAM ccache)
+if(CNODE_CCACHE_PROGRAM)
+    if(NOT CMAKE_C_COMPILER_LAUNCHER)
+        set(CMAKE_C_COMPILER_LAUNCHER "${CNODE_CCACHE_PROGRAM}" CACHE STRING "C compiler launcher" FORCE)
+    endif()
+    if(NOT CMAKE_CXX_COMPILER_LAUNCHER)
+        set(CMAKE_CXX_COMPILER_LAUNCHER "${CNODE_CCACHE_PROGRAM}" CACHE STRING "C++ compiler launcher" FORCE)
+    endif()
+endif()
 
 
 # ============================================================================
@@ -170,7 +179,7 @@ endif()
 FetchContent_Declare(
     aws_lc
     GIT_REPOSITORY https://github.com/aws/aws-lc.git
-    GIT_TAG v5.12.0
+    GIT_TAG v5.13.0
     PATCH_COMMAND
         ${CMAKE_COMMAND}
             -DAWS_LC_SOURCE_DIR=<SOURCE_DIR>
@@ -194,7 +203,7 @@ set(ENABLE_POPCNT ON CACHE BOOL "" FORCE)
 FetchContent_Declare(
     nghttp3
     GIT_REPOSITORY https://github.com/ngtcp2/nghttp3.git
-    GIT_TAG v1.12.0
+    GIT_TAG v1.19.0
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(nghttp3)
@@ -222,7 +231,7 @@ set(HAVE_AWSLC 1 CACHE INTERNAL "Have symbol OPENSSL_IS_AWSLC")
 FetchContent_Declare(
     ngtcp2
     GIT_REPOSITORY https://github.com/ngtcp2/ngtcp2.git
-    GIT_TAG v1.16.0
+    GIT_TAG v1.26.0
     GIT_SHALLOW TRUE
     PATCH_COMMAND
         ${CMAKE_COMMAND}
@@ -230,12 +239,12 @@ FetchContent_Declare(
             -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_ngtcp2_check_target.cmake
 )
 FetchContent_MakeAvailable(ngtcp2)
-message(STATUS "Using ngtcp2 v1.16.0 and nghttp3 v1.12.0 via FetchContent")
+message(STATUS "Using ngtcp2 v1.26.0 and nghttp3 v1.19.0 via FetchContent")
 
 FetchContent_Declare(
     zlib
     GIT_REPOSITORY https://github.com/madler/zlib.git
-    GIT_TAG v1.3.2
+    GIT_TAG v1.4
     SOURCE_SUBDIR cnode-no-upstream-cmake
 )
 FetchContent_MakeAvailable(zlib)
@@ -652,6 +661,15 @@ if(CNODE_BUILD_TESTS)
     target_compile_options(cnode_hysteria_protocol_test PRIVATE
         -Wall -Wextra -Wpedantic)
     add_test(NAME cnode_hysteria_protocol_test COMMAND cnode_hysteria_protocol_test)
+
+    add_executable(cnode_quic_directory_test tests/quic_directory_test.cpp)
+    target_include_directories(cnode_quic_directory_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/internet/hysteria)
+    target_link_libraries(cnode_quic_directory_test PRIVATE
+        asio::asio Threads::Threads ngtcp2_static)
+    target_compile_options(cnode_quic_directory_test PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME cnode_quic_directory_test COMMAND cnode_quic_directory_test)
 
     add_executable(cnode_autosign_cert_test
         tests/autosign_cert_test.cpp
@@ -1909,12 +1927,13 @@ if(CNODE_BUILD_TESTS)
             cnode_xhttp_session_lifecycle_test
             cnode_tls_record_buffer_test)
         foreach(property IN ITEMS INCLUDE_DIRECTORIES COMPILE_DEFINITIONS
-                COMPILE_OPTIONS LINK_LIBRARIES LINK_OPTIONS PRECOMPILE_HEADERS)
+                COMPILE_OPTIONS LINK_LIBRARIES LINK_OPTIONS)
             get_target_property(value cnode ${property})
             if(value AND NOT value MATCHES "-NOTFOUND$")
                 set_property(TARGET ${runtime_test} PROPERTY ${property} "${value}")
             endif()
         endforeach()
+        target_precompile_headers(${runtime_test} REUSE_FROM cnode)
         if(CNODE_IO_URING)
             add_dependencies(${runtime_test} cnode_liburing_static)
         endif()
@@ -2056,6 +2075,7 @@ if(CNODE_BUILD_TESTS)
         src/infra/log.cpp)
     target_include_directories(cnode_udp_native_lifecycle_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/app
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/shadowsocks
         ${concurrentqueue_SOURCE_DIR})
     target_link_libraries(cnode_udp_native_lifecycle_test PRIVATE
         asio::asio Threads::Threads cnode_zlib)
@@ -2108,12 +2128,13 @@ if(CNODE_BUILD_TESTS)
             endif()
         endforeach()
         foreach(property IN ITEMS INCLUDE_DIRECTORIES COMPILE_DEFINITIONS
-                LINK_LIBRARIES LINK_OPTIONS PRECOMPILE_HEADERS)
+                LINK_LIBRARIES LINK_OPTIONS)
             get_target_property(value cnode ${property})
             if(value AND NOT value MATCHES "-NOTFOUND$")
                 set_property(TARGET ${udp_domain_test} APPEND PROPERTY ${property} "${value}")
             endif()
         endforeach()
+        target_precompile_headers(${udp_domain_test} PRIVATE src/pch.hpp)
     endforeach()
 
     foreach(test IN ITEMS udp_request ss_udp_request native_socket_handoff)

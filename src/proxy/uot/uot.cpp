@@ -59,12 +59,14 @@ std::optional<Version> VersionFromMagicAddress(
 
 tl::expected<EncodedRequest, ErrorCode> EncodeRequest(
     bool is_connect,
-    const TargetAddress& destination) {
+    const TargetAddress& destination,
+    ForwardedMetadataView forwarded) {
     EncodedRequest out;
     out.bytes[0] = is_connect ? 0x01 : 0x00;
     const size_t address_size = destination.IsValid()
         ? EncodeAddressTo(destination, out.bytes.data() + 1,
-                          out.bytes.size() - 1, AddressWireFormat::Socks5)
+                          out.bytes.size() - 1, AddressWireFormat::Socks5,
+                          forwarded)
         : 0;
     if (address_size == 0) {
         return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
@@ -95,6 +97,7 @@ net::awaitable<tl::expected<Request, ErrorCode>> ReadRequest(
     Request request;
     request.is_connect = first[0] != 0;
     request.destination = std::move(address->target);
+    request.forwarded = std::move(address->forwarded);
     pending.DropPrefixBytes(1 + address->consumed);
     pending.ReleaseIfIdle();
     co_return request;
@@ -115,6 +118,7 @@ net::awaitable<tl::expected<PreparedRequest, ErrorCode>> ReadUotRequestHeader(
         }
         out.is_connect = request->is_connect;
         out.destination = std::move(request->destination);
+        out.forwarded = std::move(request->forwarded);
         out.pending = std::move(pending);
         co_return out;
     }

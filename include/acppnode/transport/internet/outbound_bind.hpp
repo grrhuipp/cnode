@@ -20,7 +20,7 @@ public:
         Ordered,
     };
 
-    enum class ChoicePolicy : uint8_t { Random, SourceHash };
+    enum class ChoicePolicy : uint8_t { Random, IpHash, UserHash };
 
     struct Selection {
         std::optional<net::ip::address> address; // Empty only when no same-family entry exists.
@@ -42,8 +42,10 @@ public:
         std::span<const std::string_view> entries, ChoicePolicy policy);
     [[nodiscard]] Selection Select(
         const net::ip::address& remote,
-        std::string_view inbound_source_ip,
-        uint16_t inbound_source_port) const noexcept;
+        std::string_view client_ip,
+        int64_t user_id = 0,
+        std::string_view user_email = {},
+        std::string_view inbound_tag = {}) const noexcept;
     // Local address for the None/Auto/Explicit modes; Ordered binds use Select.
     [[nodiscard]] std::optional<net::ip::address> BindAddressFor(
         const tcp::endpoint* inbound_local, const net::ip::address& remote) const noexcept;
@@ -56,7 +58,7 @@ private:
     };
 
     Mode mode_ = Mode::None;
-    ChoicePolicy policy_ = ChoicePolicy::SourceHash;
+    ChoicePolicy policy_ = ChoicePolicy::Random;
     std::optional<net::ip::address> explicit_address_;
     std::shared_ptr<const std::vector<Entry>> entries_; // Immutable cold-path snapshot.
 };

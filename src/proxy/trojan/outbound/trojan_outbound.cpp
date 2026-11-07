@@ -71,19 +71,23 @@ SendTrojanHandshake(
     const TargetAddress& target,
     bool is_udp,
     std::chrono::seconds handshake_timeout,
-    session::Context& ctx) {
+    session::Context& ctx,
+    ForwardedMetadataView forwarded) {
     stream.SetIdleTimeout(handshake_timeout);
     PhaseDeadlineHandle outbound_protocol_deadline =
         stream.StartPhaseDeadline(handshake_timeout);
 
-    std::array<uint8_t, 320> header_buf{};
+    std::array<uint8_t, ::acpp::trojan::kRequestPrefixSize + kMaxEncodedAddressSize + 2> header_buf{};
     const size_t header_len = ::acpp::trojan::EncodeRequestTo(
         config.password_hash,
         is_udp ? ::acpp::trojan::TrojanCommand::UDP_ASSOCIATE
                : ::acpp::trojan::TrojanCommand::CONNECT,
         target,
         header_buf.data(),
-        header_buf.size());
+        header_buf.size(),
+        nullptr,
+        0,
+        forwarded);
     if (header_len == 0) {
         LOG_CONN_WARN(ctx, "handshake encode failed");
         co_return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
@@ -145,7 +149,8 @@ proxy::trojan::outbound::Handler::Process(
 
     const bool is_udp = ctx.content.network == Network::UDP;
     if (auto ok = co_await SendTrojanHandshake(
-            *stream, *config_, target, is_udp, timeouts.HandshakeTimeout(), ctx); !ok) {
+            *stream, *config_, target, is_udp, timeouts.HandshakeTimeout(),
+            ctx, dialer.ForwardedMetadata(ctx)); !ok) {
         co_return fail_abortive(ok.error());
     }
 

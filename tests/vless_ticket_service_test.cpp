@@ -55,6 +55,8 @@ int main() {
     auto work1 = net::make_work_guard(io1);
     auto workc = net::make_work_guard(control);
     auto coordinator = std::make_shared<GroupCoordinator>(control, 1);
+    coordinator->RegisterWorker(0, io0, io0.get_executor());
+    coordinator->RegisterWorker(1, io1, io1.get_executor());
     std::atomic<int> physical_hosts{0};
     auto domain0 = ExecutionDomain::Create(io0, 0, io0.get_executor(),
         std::make_shared<Hooks>(physical_hosts), coordinator);

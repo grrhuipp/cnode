@@ -1,6 +1,9 @@
 """Compare AnyTLS stream closure with pinned, unmodified anytls-go binaries.
 
 Build cmd/client and cmd/server at REFERENCE_COMMIT outside the source tree.
+The reference snapshot below follows v0.0.13 (9666872946857b50a74fdb692896d77b53773cb2)
+with documentation-only changes; retain it rather than downgrade the reference.
+Latest stable release: https://github.com/anytls/anytls-go/releases/tag/v0.0.13
 All peers, ports, credentials and certificates below belong to this loopback test.
 FIN expectations come from docs/protocol.md#cmdfin at REFERENCE_COMMIT:
 https://github.com/anytls/anytls-go/blob/fd6167acd6d73b9fa3e607659951847fbc9e6c50/docs/protocol.md#cmdfin

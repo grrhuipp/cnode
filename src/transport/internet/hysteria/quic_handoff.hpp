@@ -6,7 +6,6 @@
 #include <array>
 #include <atomic>
 #include <limits>
-#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -42,70 +41,88 @@ struct QuicListenerIdentity {};
 struct QuicOwnership {
     std::weak_ptr<Connection> connection;
     std::shared_ptr<ExecutionDomain> domain;
+    // Sequential consistency orders claim admission, retirement and the owner
+    // change. A successful claim still requires the domain's exclusive lease.
     std::atomic<uint32_t> owner{0};
     std::atomic<const QuicListenerIdentity*> listener{nullptr};
     std::atomic<bool> claiming{false};
     std::atomic<bool> retired{false};
     std::atomic<ngtcp2_tstamp> expiry{std::numeric_limits<ngtcp2_tstamp>::max()};
-    std::vector<ConnectionId> ids; // directory mutex only
+    // Worker-local, never read by the directory. Prepare/Cancel drain the
+    // publishing task before transferring this state or its socket send gate.
+    bool publishing = false;
+    bool publication_pending = false;
 };
 
+// All methods run on GroupCoordinator::Reactor(), through its bounded mailbox
+// or a retirement operation reserved before the connection is published.
+// No packet, listener pointer, or Worker allocator enters this control index.
 class QuicDirectory final : public net::execution_context::service {
 public:
     inline static net::execution_context::id id;
     explicit QuicDirectory(net::execution_context& context) : service(context) {}
-    bool Publish(const std::string& space, const ConnectionId& cid,
-                 const std::shared_ptr<QuicOwnership>& record) {
-        std::lock_guard lock(mutex_);
-        if (record->retired.load()) return false;
+
+    bool Publish(const std::string& space, std::vector<ConnectionId> ids,
+                 const std::shared_ptr<QuicOwnership>& owner) {
+        if (owner->retired.load()) return false;
         auto& entries = spaces_[space];
-        auto found = entries.find(cid);
-        if (found != entries.end()) return found->second == record;
-        // Reserve the retirement list before making a CID externally visible.
-        record->ids.push_back(cid);
-        try { entries.emplace(cid, record); }
-        catch (...) { record->ids.pop_back(); throw; }
+        for (const auto& cid : ids) {
+            auto found = entries.find(cid);
+            if (found != entries.end() && found->second != owner) return false;
+        }
+        auto [record, inserted] = records_.try_emplace(owner.get());
+        auto& previous = record->second;
+        try {
+            for (const auto& cid : ids) entries.emplace(cid, owner);
+        } catch (...) {
+            for (const auto& cid : ids) {
+                if (std::find(previous.begin(), previous.end(), cid) == previous.end())
+                    entries.erase(cid);
+            }
+            if (inserted) records_.erase(record);
+            if (entries.empty()) spaces_.erase(space);
+            throw;
+        }
+        for (const auto& cid : previous) {
+            if (std::find(ids.begin(), ids.end(), cid) == ids.end()) entries.erase(cid);
+        }
+        previous.swap(ids);
         return true;
     }
     std::shared_ptr<QuicOwnership> Find(const std::string& space,
-                                      const ConnectionId& cid) {
-        std::lock_guard lock(mutex_);
+                                      const ConnectionId& cid) const {
         auto ns = spaces_.find(space);
         if (ns == spaces_.end()) return {};
         auto it = ns->second.find(cid);
-        return it == ns->second.end() ? nullptr : it->second;
-    }
-    void Remove(const std::string& space, const ConnectionId& cid,
-                const std::shared_ptr<QuicOwnership>& record) noexcept {
-        std::lock_guard lock(mutex_);
-        auto ns = spaces_.find(space);
-        if (ns == spaces_.end()) return;
-        auto it = ns->second.find(cid);
-        if (it != ns->second.end() && it->second == record) ns->second.erase(it);
-        std::erase(record->ids, cid);
-        if (ns->second.empty()) spaces_.erase(ns);
+        return it == ns->second.end() || it->second->retired.load() ? nullptr : it->second;
     }
     void Retire(const std::string& space,
-                const std::shared_ptr<QuicOwnership>& record) noexcept {
-        std::lock_guard lock(mutex_);
-        record->retired.store(true);
+                const std::shared_ptr<QuicOwnership>& owner) noexcept {
+        auto record = records_.find(owner.get());
+        if (record == records_.end()) return;
         auto ns = spaces_.find(space);
         if (ns != spaces_.end()) {
-            for (const auto& cid : record->ids) {
+            for (const auto& cid : record->second) {
                 auto it = ns->second.find(cid);
-                if (it != ns->second.end() && it->second == record) ns->second.erase(it);
+                if (it != ns->second.end() && it->second == owner) ns->second.erase(it);
             }
             if (ns->second.empty()) spaces_.erase(ns);
         }
-        record->ids.clear();
+        records_.erase(record);
     }
-    std::vector<ConnectionId> Snapshot(const std::shared_ptr<QuicOwnership>& record) {
-        std::lock_guard lock(mutex_);
-        return record->ids;
-    }
+    struct Retirement final : GroupCoordinator::ReservedOperation {
+        QuicDirectory& directory;
+        std::string space;
+        std::shared_ptr<QuicOwnership> owner;
+        Retirement(QuicDirectory& directory_value, std::string space_value,
+                   std::shared_ptr<QuicOwnership> owner_value)
+            : directory(directory_value), space(std::move(space_value)),
+              owner(std::move(owner_value)) {}
+        void Invoke() noexcept override { directory.Retire(space, owner); }
+    };
 private:
-    void shutdown() override { spaces_.clear(); }
-    std::mutex mutex_;
+    void shutdown() override { records_.clear(); spaces_.clear(); }
+    std::unordered_map<QuicOwnership*, std::vector<ConnectionId>> records_;
     std::unordered_map<std::string,
         std::unordered_map<ConnectionId, std::shared_ptr<QuicOwnership>, ConnectionIdHash>> spaces_;
 };

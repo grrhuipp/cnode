@@ -92,6 +92,9 @@ ParseHandshake(AsyncStream& stream,
             limiter, ctx, "authentication failed: no authenticated user");
         co_return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
     }
+    if (request->forwarded) {
+        ctx.inbound.ApplyForwardedMetadata(*request->forwarded);
+    }
     proxy::BindAuthenticatedInbound(
         ctx, request->user->profile,
         proxy::InboundRequestTarget{RequestNetwork(request->command), request->target});

@@ -50,6 +50,26 @@ int main() {
                Has(access, " sendThrough:2602:2b5:20:111::abcd"),
                "verified UID, existing identity and actual local address must coexist");
 
+        ctx.inbound.ApplyForwardedMetadata(acpp::ForwardedMetadata{
+            .user_id = 1001,
+            .user_email = acpp::memory::ThreadLocalString("alice@origin.example"),
+            .client_ip = acpp::net::ip::make_address("203.0.113.88"),
+            .inbound_tag = acpp::memory::ThreadLocalString("panel/site-a/10/vless/443"),
+        });
+        allocations = 0;
+        count_allocations = true;
+        access = acpp::FormatAccessLog(ctx);
+        count_allocations = false;
+        Expect(allocations == 1, "access log with passthrough fields must allocate once");
+        Expect(Has(access, " origin:203.0.113.88|panel/site-a/10/vless/443|1001|alice@origin.example ") &&
+               Has(access, " sendThrough:2602:2b5:20:111::abcd"),
+               "passthrough origin IP, tag and user identity must appear in access log");
+        ctx.inbound.origin_tag.clear();
+        ctx.inbound.origin_user_id = 0;
+        ctx.inbound.origin_user_email.clear();
+        ctx.inbound.origin_source_addr = acpp::net::ip::address{};
+        ctx.inbound.origin_source_ip.clear();
+
         ctx.inbound.user_email = "714443";
         access = acpp::FormatAccessLog(ctx);
         Expect(Has(access, " user:714443 ") && !Has(access, "email:"),

@@ -17,9 +17,11 @@ public:
     UdpRequest(net::io_context& io, app::dns::DNS& dns,
                const net::ip::address& bind_address, TargetAddress server,
                const ss::SsCipherInfo& cipher_info, const ss::KeyBytes& master_key,
-               std::span<const ss::KeyBytes> psk_chain)
+               std::span<const ss::KeyBytes> psk_chain,
+               ForwardedMetadataView forwarded = {})
         : OutboundDatagramEndpointBase(io, bind_address), io_(io), dns_(dns), server_(std::move(server)),
-          cipher_info_(cipher_info), master_key_(master_key), psk_chain_(psk_chain) {
+          cipher_info_(cipher_info), master_key_(master_key), psk_chain_(psk_chain),
+          forwarded_(forwarded) {
         if (ss::Is2022Cipher(cipher_info_.type)) {
             ss2022_state_.emplace();
             if (!ss::Init2022UdpSessionState(*ss2022_state_, cipher_info_, master_key_))
@@ -86,9 +88,10 @@ private:
                           uint8_t* output, size_t output_size) {
         if (ss2022_state_)
             return ss::Encode2022UdpRequestPacketTo(target, payload.data(), payload.size(),
-                *ss2022_state_, psk_chain_, output, output_size);
+                *ss2022_state_, psk_chain_, output, output_size, forwarded_);
         return ss::EncodeUdpPacketTo(target, payload.data(), payload.size(), master_key_.span(),
-            cipher_info_.type, cipher_info_.key_size, cipher_info_.salt_size, output, output_size);
+            cipher_info_.type, cipher_info_.key_size, cipher_info_.salt_size,
+            output, output_size, forwarded_);
     }
 
     net::io_context& io_;
@@ -98,6 +101,7 @@ private:
     const ss::SsCipherInfo cipher_info_;
     const ss::KeyBytes master_key_;
     const std::span<const ss::KeyBytes> psk_chain_;
+    const ForwardedMetadataView forwarded_;
     std::optional<ss::Ss2022UdpSessionState> ss2022_state_;
 };
 

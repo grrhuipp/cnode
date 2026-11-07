@@ -162,7 +162,8 @@ WriteTCPRequest2022(const TargetAddress& target,
                     const SsCipherInfo& cipher_info,
                     const KeyBytes& master_key,
                     std::span<const KeyBytes> psk_chain,
-                    AsyncStream& stream) {
+                    AsyncStream& stream,
+                    ForwardedMetadataView forwarded) {
     if (cipher_info.salt_size > KeyBytes::kMaxSize ||
         cipher_info.key_size > KeyBytes::kMaxSize ||
         master_key.size < cipher_info.key_size) {
@@ -172,8 +173,9 @@ WriteTCPRequest2022(const TargetAddress& target,
         psk_chain = std::span<const KeyBytes>(&master_key, 1);
     }
 
-    std::array<uint8_t, 259> addr_bytes{};
-    const size_t addr_size = EncodeAddressTo(target, addr_bytes.data(), addr_bytes.size(), AddressWireFormat::Socks5);
+    std::array<uint8_t, kMaxEncodedAddressSize> addr_bytes{};
+    const size_t addr_size = EncodeAddressTo(
+        target, addr_bytes.data(), addr_bytes.size(), AddressWireFormat::Socks5, forwarded);
     if (addr_size == 0) {
         co_return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
@@ -203,7 +205,7 @@ WriteTCPRequest2022(const TargetAddress& target,
     StoreU16BE(fixed_plain.data() + 9, static_cast<uint16_t>(variable_len));
 
     constexpr size_t kMaxVariablePlain =
-        259 + 2 + kPaddingLen;
+        kMaxEncodedAddressSize + 2 + kPaddingLen;
     std::array<uint8_t, kMaxVariablePlain> variable_plain{};
     std::memcpy(variable_plain.data(), addr_bytes.data(), addr_size);
     StoreU16BE(variable_plain.data() + addr_size, static_cast<uint16_t>(kPaddingLen));
@@ -287,10 +289,11 @@ WriteTCPRequest(const TargetAddress& target,
                 const SsCipherInfo& cipher_info,
                 const KeyBytes& master_key,
                 std::span<const KeyBytes> psk_chain,
-                AsyncStream& stream) {
+                AsyncStream& stream,
+                ForwardedMetadataView forwarded) {
     if (Is2022Cipher(cipher_info.type)) {
         co_return co_await WriteTCPRequest2022(
-            target, cipher_info, master_key, psk_chain, stream);
+            target, cipher_info, master_key, psk_chain, stream, forwarded);
     }
 
     if (cipher_info.salt_size > 64 || cipher_info.key_size > 64 ||
@@ -299,8 +302,9 @@ WriteTCPRequest(const TargetAddress& target,
     }
 
     try {
-        std::array<uint8_t, 259> addr_bytes{};
-        const size_t addr_size = EncodeAddressTo(target, addr_bytes.data(), addr_bytes.size(), AddressWireFormat::Socks5);
+        std::array<uint8_t, kMaxEncodedAddressSize> addr_bytes{};
+        const size_t addr_size = EncodeAddressTo(
+            target, addr_bytes.data(), addr_bytes.size(), AddressWireFormat::Socks5, forwarded);
         if (addr_size == 0 || addr_size > kMaxChunkPayload) {
             co_return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
         }

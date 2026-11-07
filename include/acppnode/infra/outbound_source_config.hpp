@@ -17,7 +17,7 @@ struct OutboundSourceConfig {
     json::object settings;
     StreamSettings stream_settings;
     std::optional<OutboundBind> send_through;
-
+    bool passthrough = false;
     static OutboundSourceConfig FromJson(const json::object& j);
 };
 

@@ -88,8 +88,11 @@ bool TestReentrantDestructionAndExceptions() {
     (void)scheduler.ScheduleAfter(0ms, *owner);
     (void)scheduler.ScheduleAfter(0ms, failure);
     (void)scheduler.ScheduleAfter(0ms, survivor);
+    bool failure_reported = false;
+    try { io.run(); }
+    catch (const std::runtime_error&) { failure_reported = true; }
     io.run();
-    if (owner || cancelled_calls || survivor_calls != 1) return false;
+    if (!failure_reported || owner || cancelled_calls || survivor_calls != 1) return false;
 
     struct Self final : TimeoutEvent {
         Self(TimeoutScheduler& scheduler, std::unique_ptr<Self>& owner, bool& fired)
@@ -451,6 +454,7 @@ bool TestDomainSchedulerIsolationAndJoin() {
     };
     net::io_context io;
     auto coordinator = std::make_shared<GroupCoordinator>(io);
+    coordinator->RegisterWorker(0, io, io.get_executor());
     auto first_hooks = std::make_shared<Hooks>();
     auto second_hooks = std::make_shared<Hooks>();
     auto first = ExecutionDomain::Create(io, 0, io.get_executor(), first_hooks, coordinator);
@@ -476,6 +480,7 @@ bool TestDomainSchedulerIsolationAndJoin() {
                 first_joined = !error;
                 (void)scheduler_joins.try_send(IoErrorCode{});
             });
+        throw std::runtime_error("domain timeout callback failed");
     });
     Event second_event([&] {
         second_owner = ExecutionDomain::Current() == second &&
@@ -504,7 +509,7 @@ bool TestDomainSchedulerIsolationAndJoin() {
         passed = first_scheduler && second_scheduler &&
             first_scheduler == second_scheduler && first_owner && second_owner &&
             first_joined && second_joined && !first_pending.Valid() &&
-            !second_pending.Valid() && !first_hooks->failure && !second_hooks->failure;
+            !second_pending.Valid() && first_hooks->failure && !second_hooks->failure;
         first.reset();
         second.reset();
         owner->CloseAdmission();
@@ -542,6 +547,8 @@ bool TestDomainTimeoutHandoff() {
     } pause;
     net::io_context old_io, new_io;
     auto coordinator = std::make_shared<GroupCoordinator>(old_io);
+    coordinator->RegisterWorker(0, old_io, old_io.get_executor());
+    coordinator->RegisterWorker(1, new_io, new_io.get_executor());
     auto hooks = std::make_shared<Hooks>();
     auto domain = ExecutionDomain::Create(old_io, 0, old_io.get_executor(), hooks, coordinator);
     hooks->allocation.SetLeaseGroup(domain->LeaseIdentity(), ExecutionDomain::SharesLeaseIdentity);

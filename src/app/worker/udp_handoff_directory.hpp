@@ -1,15 +1,14 @@
 #pragma once
 
 #include "udp_ingress.hpp"
-#include "../../proxy/shadowsocks/ss_udp.hpp"
 
 #include <atomic>
 #include <unordered_map>
 
 namespace acpp::worker_detail {
 
-// Only authenticated identity, replay and ownership metadata live here. The
-// receiving Worker retains the datagram; the coordinator never sees payload.
+// Only authenticated identity and execution ownership metadata live here.
+// Protocol continuity state is owned, but never interpreted, by this directory.
 struct UdpHandoffIdentity {
     std::string listener;
     std::string tag;
@@ -29,40 +28,15 @@ struct UdpHandoffIdentityHash {
     }
 };
 struct UdpHandoffRecord {
-    ss::Ss2022UdpReplayWindow replay;
-    // A claim blocks the old local fast path before its native owner is drained.
-    std::atomic<bool> claimed{true};
-    std::atomic<int64_t> last_seen{0};
+    std::unique_ptr<InboundDatagramAssociation> association;
     std::weak_ptr<UdpIngress::ClientSession> session;
     std::weak_ptr<ExecutionDomain> domain;
     // Coordinator-only fields.
     uint32_t owner = 0;
     std::shared_ptr<const void> configuration;
 
-    // Replay permits unseen reordering on the current path. Changing the path
-    // additionally requires a packet newer than every committed packet, so a
-    // delayed old-address packet cannot steal either ownership or the reply route.
-    bool CanAcceptPath(uint64_t packet_id, uint32_t worker,
-                       const udp::endpoint& endpoint) const noexcept {
-        return !path_packet_id_ || packet_id > *path_packet_id_ ||
-            (worker == path_worker_ && endpoint == path_endpoint_);
-    }
-
-    bool Accept(uint64_t packet_id, uint32_t worker,
-                const udp::endpoint& endpoint) noexcept {
-        if (!CanAcceptPath(packet_id, worker, endpoint) || !replay.Accept(packet_id))
-            return false;
-        if (!path_packet_id_ || packet_id > *path_packet_id_) path_packet_id_ = packet_id;
-        path_worker_ = worker;
-        path_endpoint_ = endpoint;
-        last_seen.store(std::chrono::steady_clock::now().time_since_epoch().count(),
-                        std::memory_order_relaxed);
-        return true;
-    }
-private:
-    std::optional<uint64_t> path_packet_id_;
-    uint32_t path_worker_ = 0;
-    udp::endpoint path_endpoint_;
+    explicit UdpHandoffRecord(const InboundDatagramAssociationPolicy& policy)
+        : association(policy.create()) {}
 };
 class UdpHandoffDirectory final : public net::execution_context::service {
 public:
@@ -72,24 +46,26 @@ public:
     // Called only on GroupCoordinator. A tombstone is retained after its live
     // association ends until the entire timestamp/replay protection expires.
     std::shared_ptr<UdpHandoffRecord> Claim(const UdpHandoffIdentity& key,
-                                          std::shared_ptr<const void> configuration) {
+                                          std::shared_ptr<const void> configuration,
+                                          const InboundDatagramAssociationPolicy& policy) {
         if (auto found = records_.find(key); found != records_.end()) {
-            if (found->second->claimed.exchange(true, std::memory_order_acq_rel)) return {};
+            if (&found->second->association->Policy() != &policy ||
+                found->second->association->claimed.exchange(true, std::memory_order_acq_rel))
+                return {};
             return found->second;
         }
-        if (records_.size() >= ss::Ss2022UdpReplayCache::kMaxSessions) {
-            const auto expiry = (std::chrono::steady_clock::now() -
-                ss::Ss2022UdpReplayCache::kRetention).time_since_epoch().count();
+        if (records_.size() >= policy.capacity) {
+            const auto now = std::chrono::steady_clock::now();
             for (auto it = records_.begin(); it != records_.end();) {
                 const auto& row = *it->second;
-                if (!row.claimed.load(std::memory_order_acquire) && row.session.expired() &&
-                    row.last_seen.load(std::memory_order_relaxed) < expiry)
+                if (!row.association->claimed.load(std::memory_order_acquire) &&
+                    row.session.expired() && row.association->ProtectedUntil() < now)
                     it = records_.erase(it);
                 else ++it;
             }
-            if (records_.size() >= ss::Ss2022UdpReplayCache::kMaxSessions) return {};
+            if (records_.size() >= policy.capacity) return {};
         }
-        auto record = std::make_shared<UdpHandoffRecord>();
+        auto record = std::make_shared<UdpHandoffRecord>(policy);
         record->configuration = std::move(configuration);
         records_.emplace(key, record);
         return record;

@@ -64,8 +64,9 @@ public:
     explicit DomainFixture(net::io_context& io)
         : io_(io), hooks_(std::make_shared<Hooks>()),
           previous_users_(UserStore::ExchangeWorkerView({})),
-          coordinator_(std::make_shared<GroupCoordinator>(io)),
-          domain_(ExecutionDomain::Create(io, 0, io.get_executor(), hooks_, coordinator_)) {
+          coordinator_(std::make_shared<GroupCoordinator>(io)) {
+        coordinator_->RegisterWorker(0, io, io.get_executor());
+        domain_ = ExecutionDomain::Create(io, 0, io.get_executor(), hooks_, coordinator_);
         hooks_->memory.SetLeaseGroup(domain_->LeaseIdentity(), &ExecutionDomain::SharesLeaseIdentity);
     }
     ~DomainFixture() {

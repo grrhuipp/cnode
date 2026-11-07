@@ -382,6 +382,7 @@ struct UdpIngress::Impl : memory::ThreadAllocated {
         UdpIngress::SocketPtr socket;
         // Resolved once at attachment; the bound address never changes.
         std::optional<tcp::endpoint> local_endpoint;
+        InboundDatagramAssociationIndex associations;
     };
     using UdpSocketMap = memory::ThreadLocalUnorderedMap<
         memory::ThreadLocalString,
@@ -449,7 +450,26 @@ struct UdpIngress::Impl : memory::ThreadAllocated {
                            UdpAssociationExpiry(row.last_active, idle_timeout));
         row.link->impl_->association_hook = &row.reclaim_hook;
     }
+    void SetLocalAssociation(const UdpAssociationHook& hook,
+                             InboundDatagramAssociation* association) noexcept {
+        if (!hook.client_key || !hook.client_key->session_id) return;
+        auto socket = udp_sockets.find(hook.socket_key);
+        if (socket == udp_sockets.end()) return;
+        const auto& key = *hook.client_key;
+        auto entry = socket->second.associations.find(
+            InboundDatagramAssociationKey{key.owner, *key.session_id, key.configuration});
+        if (entry != socket->second.associations.end()) entry->second = association;
+    }
     void Unlink(UdpClientSession& row) noexcept {
+        const auto& hook = row.reclaim_hook;
+        if (hook.client_key && hook.client_key->session_id) {
+            auto socket = udp_sockets.find(hook.socket_key);
+            if (socket != udp_sockets.end()) {
+                const auto& key = *hook.client_key;
+                socket->second.associations.erase(
+                    InboundDatagramAssociationKey{key.owner, *key.session_id, key.configuration});
+            }
+        }
         reclaimer.Unregister(row.reclaim_hook);
         if (row.link) row.link->impl_->association_hook = nullptr;
     }
@@ -499,6 +519,10 @@ net::awaitable<void> UdpIngress::ClientSession::PrepareHandoff(
             outer->first, row->first, transfer.transfer_idle,
             UdpAssociationHook::TimePoint::max());
         transfer.target_reserved = true;
+        auto socket = destination.udp_sockets.find(transfer.next_reply->socket_key);
+        const auto& key = *transfer.transfer_key;
+        socket->second.associations.try_emplace(
+            InboundDatagramAssociationKey{key.owner, *key.session_id, key.configuration}, nullptr);
         co_return;
     };
     co_await net::co_spawn(target.executor, reserve_target(), net::use_awaitable);
@@ -508,6 +532,7 @@ net::awaitable<void> UdpIngress::ClientSession::PrepareHandoff(
     source_row = source_outer->second.find(*state.transfer_key);
     // Keep a capacity-reserved, inert source row until commit/cancel. Rollback
     // can restore it without allocating under memory pressure.
+    state.owner->impl_->SetLocalAssociation(source_row->second.reclaim_hook, nullptr);
     state.association_hook = nullptr;
     source_row->second.link.reset();
     state.owner->impl_->reclaimer.Rearm(source_row->second.reclaim_hook,
@@ -530,6 +555,8 @@ void UdpIngress::ClientSession::CommitHandoff(
             row->second.link = pin;
             row->second.last_active = state.transfer_activity;
             state.association_hook = &row->second.reclaim_hook;
+            destination->impl_->SetLocalAssociation(
+                row->second.reclaim_hook, state.handoff_record->association.get());
             destination->impl_->reclaimer.Rearm(row->second.reclaim_hook,
                 UdpAssociationExpiry(state.transfer_activity, state.transfer_idle));
         }
@@ -601,6 +628,8 @@ net::awaitable<void> UdpIngress::ClientSession::CancelHandoff(
             if (row != outer->second.end() && !row->second.link) {
                 row->second.link = state.job_pin.lock();
                 state.association_hook = &row->second.reclaim_hook;
+                state.owner->impl_->SetLocalAssociation(
+                    row->second.reclaim_hook, state.handoff_record->association.get());
                 state.owner->impl_->reclaimer.Rearm(row->second.reclaim_hook,
                     UdpAssociationExpiry(state.transfer_activity, state.transfer_idle));
             }
@@ -647,6 +676,7 @@ void UdpIngress::ClientSession::CloseWithError(ErrorCode error) noexcept {
     // Closure is the row's reclaim event. Re-arm before cancellation callbacks
     // can re-enter the ingress and unlink the row.
     if (auto* hook = impl_->association_hook) {
+        hook->owner->impl_->SetLocalAssociation(*hook, nullptr);
         hook->owner->impl_->reclaimer.Rearm(*hook, UdpAssociationHook::TimePoint::min());
     }
     impl_->cancellation.Stop(error);
@@ -965,20 +995,22 @@ net::awaitable<void> UdpIngress::ProcessAuthenticated(
                          packet->environment.prepared->settings.get()}};
     auto configuration = packet->environment.prepared->settings;
     auto record = co_await coordinator->PostCall(
-        [coordinator, identity = std::move(identity), configuration] {
+        [coordinator, identity = std::move(identity), configuration,
+         policy = decoded.association_policy] {
             return net::use_service<UdpHandoffDirectory>(coordinator->Services())
-                .Claim(identity, configuration);
+                .Claim(identity, configuration, *policy);
         });
     if (!record) co_return;
     auto release_claim = MakeScopeExit([record] {
-        record->claimed.store(false, std::memory_order_release);
+        record->association->claimed.store(false, std::memory_order_release);
     });
     if (impl_->state != Impl::State::Running ||
         !OwnsSocket(packet->socket_key, context.sock)) co_return;
     auto session = record->session.lock();
     auto domain = record->domain.lock();
     if (!session) {
-        if (!record->Accept(*decoded.packet_id, context.worker_id, context.client_endpoint))
+        if (!record->association->Check(*decoded.packet_id, context.worker_id,
+                context.client_endpoint, InboundDatagramCheck::Commit))
             co_return;
         packet->reservation = {};
         ProcessDecoded(context, std::move(decoded), record, std::move(packet->response));
@@ -987,7 +1019,8 @@ net::awaitable<void> UdpIngress::ProcessAuthenticated(
     if (!domain) co_return;
     if (record->owner == context.worker_id) {
         if (session->Closed() ||
-            !record->Accept(*decoded.packet_id, context.worker_id, context.client_endpoint))
+            !record->association->Check(*decoded.packet_id, context.worker_id,
+                context.client_endpoint, InboundDatagramCheck::Commit))
             co_return;
         session->UpdateReplyEndpoint(context.client_endpoint);
         if (auto* hook = session->impl_->association_hook) {
@@ -1010,16 +1043,15 @@ net::awaitable<void> UdpIngress::ProcessAuthenticated(
         .sink = &context.reply_sink,
         .worker_id = context.worker_id,
         .fence = std::make_shared<UdpReplyFence>(context.io_context)};
-    // The source sees metadata only. Check path freshness and a replay copy
-    // before freezing; commit both once under the exclusive handoff lease.
+    // The source sees authenticated metadata only. Protocol inspection precedes
+    // freezing; its continuity state commits once under the exclusive lease.
     auto prepare_metadata = [session, destination = this, next = std::move(next),
                              packet_id = *decoded.packet_id, worker = context.worker_id,
                              endpoint = context.client_endpoint]() mutable -> net::awaitable<bool> {
         auto& state = *session->impl_;
         if (session->Closed() || state.transferring || !state.association_hook) co_return false;
-        if (!state.handoff_record->CanAcceptPath(packet_id, worker, endpoint)) co_return false;
-        auto replay = state.handoff_record->replay;
-        if (!replay.Accept(packet_id)) co_return false;
+        if (!state.handoff_record->association->Check(
+                packet_id, worker, endpoint, InboundDatagramCheck::Inspect)) co_return false;
         next.response = state.reply.response;
         state.destination = destination;
         state.next_reply = std::move(next);
@@ -1037,8 +1069,8 @@ net::awaitable<void> UdpIngress::ProcessAuthenticated(
             if (impl_->state == Impl::State::Running &&
                 OwnsSocket(packet->socket_key, context.sock) &&
                 session->impl_->transferring && !session->impl_->close_pending)
-                accepted = record->Accept(
-                    *decoded.packet_id, context.worker_id, context.client_endpoint);
+                accepted = record->association->Check(*decoded.packet_id, context.worker_id,
+                    context.client_endpoint, InboundDatagramCheck::Commit);
         });
         if (accepted) {
             co_await handoff->Commit();
@@ -1092,7 +1124,8 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
     }
 
     const std::string_view socket_key = datagram.socket_key;
-    if (!OwnsSocket(socket_key, datagram.sock)) return;
+    const auto socket = impl_->udp_sockets.find(socket_key);
+    if (socket == impl_->udp_sockets.end() || socket->second.socket.get() != datagram.sock) return;
     const auto now = std::chrono::steady_clock::now();
 
     const auto normalized_client_addr =
@@ -1100,7 +1133,11 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
     auto decoded = impl_->proxy->Process(InboundDatagramRequest{
         .tag = impl_->tag,
         .payload = datagram.payload,
-        .deferred_replay = datagram.environment != nullptr,
+        .associations = datagram.environment ? &socket->second.associations : nullptr,
+        .configuration = datagram.environment && datagram.environment->prepared
+            ? datagram.environment->prepared->settings.get() : nullptr,
+        .worker_id = datagram.worker_id,
+        .client_endpoint = datagram.client_endpoint,
     });
     if (!decoded) {
         if (decoded.error() == ErrorCode::PROTOCOL_AUTH_FAILED) {
@@ -1118,26 +1155,27 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
         }
         return;
     }
-    if (datagram.environment && decoded->session_id && decoded->packet_id) {
+    if (datagram.environment && decoded->association_policy &&
+        decoded->session_id && decoded->packet_id) {
         if (!datagram.environment->prepared || !datagram.environment->prepared->settings) return;
-        const ClientSessionKey key{decoded->session_owner, decoded->session_id, {},
-                                   datagram.environment->prepared->settings.get()};
-        if (auto outer = impl_->client_sessions.find(socket_key);
-            outer != impl_->client_sessions.end()) {
-            auto row = outer->second.find(key);
-            if (row != outer->second.end() && row->second.link) {
-                auto session = row->second.link;
-                auto& state = *session->impl_;
-                if (state.handoff_record && !session->Closed()) {
-                    if (state.handoff_record->claimed.load(std::memory_order_acquire) ||
-                        !state.handoff_record->Accept(
-                            *decoded->packet_id, datagram.worker_id, datagram.client_endpoint)) return;
-                    row->second.last_active = now;
-                    session->UpdateReplyEndpoint(datagram.client_endpoint);
-                    (void)session->Push(decoded->target, std::move(decoded->payload));
-                    return;
+        if (decoded->committed_association) {
+            const ClientSessionKey key{decoded->session_owner, decoded->session_id, {},
+                                       datagram.environment->prepared->settings.get()};
+            if (auto outer = impl_->client_sessions.find(socket_key);
+                outer != impl_->client_sessions.end()) {
+                auto row = outer->second.find(key);
+                if (row != outer->second.end() && row->second.link) {
+                    auto session = row->second.link;
+                    auto& state = *session->impl_;
+                    if (state.handoff_record && !session->Closed() &&
+                        state.handoff_record->association.get() == decoded->committed_association) {
+                        row->second.last_active = now;
+                        session->UpdateReplyEndpoint(datagram.client_endpoint);
+                        (void)session->Push(decoded->target, std::move(decoded->payload));
+                    }
                 }
             }
+            return;
         }
         if (!decoded->user || !datagram.environment->prepared ||
             !datagram.environment->prepared->settings ||
@@ -1280,6 +1318,13 @@ void UdpIngress::ProcessDecoded(const UdpDatagramContext& datagram,
                 record->session = client_session;
                 record->domain = session_impl.domain;
                 record->owner = worker_id;
+                auto socket = impl_->udp_sockets.find(socket_key);
+                if (socket == impl_->udp_sockets.end() ||
+                    socket->second.socket.get() != datagram.sock) return;
+                socket->second.associations.insert_or_assign(
+                    InboundDatagramAssociationKey{decoded->session_owner, *decoded->session_id,
+                        client_session_key.configuration},
+                    record->association.get());
             }
         }
         session_impl.request.emplace(datagram.receiver->dispatch_policy);
@@ -1305,6 +1350,9 @@ void UdpIngress::ProcessDecoded(const UdpDatagramContext& datagram,
         request.profile = *decoded->user;
         request.tracker = datagram.environment ? nullptr : decoded->tracker;
         request.limiter = datagram.environment ? nullptr : decoded->limiter;
+        if (decoded->forwarded) {
+            ctx.inbound.ApplyForwardedMetadata(*decoded->forwarded);
+        }
         ::acpp::proxy::BindAuthenticatedInbound(
             ctx, request.profile,
             ::acpp::proxy::InboundRequestTarget{Network::UDP, decoded->target});
@@ -1480,6 +1528,7 @@ UdpIngress::ClientSessionPtr UdpIngress::CreateClientSession(
         // The replaced session's closure must not mark the reused row due.
         auto previous = std::move(row.link);
         if (previous) previous->impl_->association_hook = nullptr;
+        impl_->SetLocalAssociation(row.reclaim_hook, nullptr);
         row.link = session;
         row.last_active = last_active;
         row.reclaim_hook.idle_timeout = idle_timeout;

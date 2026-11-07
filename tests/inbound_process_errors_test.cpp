@@ -46,6 +46,7 @@ template<class Scenario>
 bool RunFixture(const RateLimitConfig& config, Scenario scenario) {
     net::io_context io;
     auto coordinator = std::make_shared<GroupCoordinator>(io);
+    coordinator->RegisterWorker(0, io, io.get_executor());
     auto hooks = std::make_shared<DomainHooks>();
     auto domain = ExecutionDomain::Create(io, 0, io.get_executor(), hooks, coordinator);
     hooks->allocation.SetLeaseGroup(

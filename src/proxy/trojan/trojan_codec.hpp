@@ -9,6 +9,7 @@
 #include "credentials.hpp"
 #include "acppnode/common.hpp"
 #include "acppnode/common/target_address.hpp"
+#include "acppnode/common/address_codec.hpp"
 
 #include <array>
 #include <optional>
@@ -32,6 +33,7 @@ struct TrojanRequest {
     PasswordHash         password_hash{};  // SHA224 密码哈希（十六进制，56字节）
     TrojanCommand        command = TrojanCommand::CONNECT;
     TargetAddress        target;
+    std::optional<ForwardedMetadata> forwarded;
 
     [[nodiscard]] std::string_view PasswordHashView() const noexcept {
         return {password_hash.data(), password_hash.size()};
@@ -65,7 +67,8 @@ struct RequestDecodeResult {
     uint8_t* output,
     size_t output_size,
     const uint8_t* payload = nullptr,
-    size_t payload_len = 0);
+    size_t payload_len = 0,
+    ForwardedMetadataView forwarded = {});
 
 // 返回写入字节数，0 表示目标非法、负载超过 uint16 或缓冲区不足。
 [[nodiscard]] size_t EncodeUdpPacketHeaderTo(

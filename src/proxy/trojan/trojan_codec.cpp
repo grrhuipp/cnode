@@ -59,6 +59,7 @@ RequestDecodeResult DecodeRequest(std::span<const uint8_t> data) {
     std::memcpy(result.request.password_hash.data(), data.data(), kPasswordHashSize);
     result.request.command = static_cast<TrojanCommand>(command);
     result.request.target = std::move(address.target);
+    result.request.forwarded = std::move(address.forwarded);
     result.consumed = address_end + 2;
     result.status = RequestDecodeStatus::Complete;
     return result;
@@ -71,9 +72,10 @@ size_t EncodeRequestTo(
     uint8_t* output,
     size_t output_size,
     const uint8_t* payload,
-    size_t payload_len) {
+    size_t payload_len,
+    ForwardedMetadataView forwarded) {
 
-    const size_t addr_size = AddressEncodedSize(target);
+    const size_t addr_size = AddressEncodedSize(target, forwarded);
     if (addr_size == 0 || payload_len > output_size ||
         (payload_len != 0 && !payload)) {
         return 0;
@@ -102,7 +104,7 @@ size_t EncodeRequestTo(
     writer.WriteU8(static_cast<uint8_t>(cmd));
 
     const size_t encoded = EncodeAddressTo(target, output + writer.Position(),
-        header_size - writer.Position(), AddressWireFormat::Socks5);
+        header_size - writer.Position(), AddressWireFormat::Socks5, forwarded);
     if (encoded == 0) return 0;
     ByteWriter tail(output + writer.Position() + encoded,
                     header_size - writer.Position() - encoded);

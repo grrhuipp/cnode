@@ -2,6 +2,7 @@
 
 #include "acppnode/common.hpp"
 #include "acppnode/common/allocator.hpp"
+#include "acppnode/common/address_codec.hpp"
 #include "acppnode/common/target_address.hpp"
 
 #include <array>
@@ -16,7 +17,7 @@ inline constexpr uint8_t kVersion = 0x00;
 
 // Version, UUID, addons length, 255 addon bytes, command and the largest
 // port-first address (port, type, length, 253-byte domain).
-inline constexpr size_t kMaxRequestHeaderSize = 1 + 16 + 1 + 255 + 1 + 2 + 1 + 1 + 253;
+inline constexpr size_t kMaxRequestHeaderSize = 1 + 16 + 1 + 255 + 1 + kMaxEncodedAddressSize;
 
 // The server never sends response addons.
 inline constexpr std::array<uint8_t, 2> kResponseHeader{kVersion, 0};
@@ -33,6 +34,7 @@ struct RequestHeader {
     memory::ThreadLocalString flow;
     Command command = Command::TCP;
     TargetAddress target;
+    std::optional<ForwardedMetadata> forwarded;
 };
 
 enum class RequestHeaderDecodeStatus : uint8_t {
@@ -64,6 +66,7 @@ struct RequestHeaderDecodeResult {
     const TargetAddress& target,
     uint8_t* output,
     size_t output_size,
-    std::string_view flow = {});
+    std::string_view flow = {},
+    ForwardedMetadataView forwarded = {});
 
 }  // namespace acpp::vless

@@ -104,6 +104,9 @@ PrepareSsTcpSession(
     // UoT resolves its UDP destination only after admission; the magic address
     // is admitted as the TCP request target, as before.
     const auto uot_version = proxy::uot::VersionFromMagicAddress(session_result->target);
+    if (session_result->forwarded) {
+        ctx.inbound.ApplyForwardedMetadata(*session_result->forwarded);
+    }
     proxy::BindAuthenticatedInbound(
         ctx, matched->profile,
         proxy::InboundRequestTarget{Network::TCP, std::move(session_result->target)});
@@ -163,6 +166,9 @@ net::awaitable<RelayResult> DispatchSsUotSession(
     }
     const bool is_connect = prepared->is_connect;
     const TargetAddress udp_target = prepared->destination;
+    if (prepared->forwarded) {
+        ctx.inbound.ApplyForwardedMetadata(*prepared->forwarded);
+    }
     proxy::uot::PacketReader uot_reader(request_reader, std::move(*prepared));
     proxy::uot::PacketWriter uot_writer(response_writer, is_connect, udp_target);
     ctx.outbound.original_target = udp_target;
@@ -301,7 +307,7 @@ proxy::shadowsocks::inbound::Handler::Process(
     auto decoded = ss::DecodeUdpPacket(
         request.payload.data(), request.payload.size(), users,
         cipher_info_.type, cipher_info_.key_size, cipher_info_.salt_size,
-        udp_replay_cache_, request.deferred_replay);
+        udp_replay_cache_, request.associations != nullptr);
     if (!decoded) {
         // UDP datagrams use the socket peer address, never a PROXY protocol source.
         return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
@@ -315,8 +321,28 @@ proxy::shadowsocks::inbound::Handler::Process(
     }
     result.target = std::move(decoded->target);
     result.payload = std::move(decoded->payload);
+    result.forwarded = std::move(decoded->forwarded);
     result.session_id = decoded->session_id;
     result.packet_id = decoded->packet_id;
+    if (request.associations && decoded->session_id && decoded->packet_id) {
+        result.association_policy = &ss::Ss2022UdpAssociation::Policy();
+        const auto found = request.associations->find(InboundDatagramAssociationKey{
+            result.session_owner, *decoded->session_id, request.configuration});
+        if (found != request.associations->end() && found->second) {
+            auto* association = found->second;
+            // The configuration/credential/session lookup and immutable policy
+            // identity together establish the concrete protocol state type.
+            if (&association->Policy() != result.association_policy)
+                return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
+            if (!association->claimed.load(std::memory_order_acquire)) {
+                auto& state = static_cast<ss::Ss2022UdpAssociation&>(*association);
+                if (!state.ss::Ss2022UdpAssociation::Check(*decoded->packet_id, request.worker_id,
+                        request.client_endpoint, InboundDatagramCheck::Commit))
+                    return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
+                result.committed_association = association;
+            }
+        }
+    }
     result.user_owner = std::shared_ptr<const UserProfile>(users.users, &user.profile);
     result.user = result.user_owner.get();
     result.limiter = limiter_;

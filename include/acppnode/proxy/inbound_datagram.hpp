@@ -1,12 +1,15 @@
 #pragma once
 
 #include "acppnode/app/udp_types.hpp"
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
 #include "acppnode/common/target_address.hpp"
 #include "acppnode/common/user_profile.hpp"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -49,23 +52,98 @@ struct InboundDatagramOwner {
     uint8_t size = 0;
 };
 
+struct InboundDatagramAssociationPolicy;
+
+enum class InboundDatagramCheck : uint8_t { Inspect, Commit };
+
+// Protocol-owned continuity state. Control calls require an exclusive claim;
+// the protocol's normal Process entry uses its concrete implementation locally.
+class InboundDatagramAssociation {
+public:
+    using Clock = std::chrono::steady_clock;
+    explicit InboundDatagramAssociation(const InboundDatagramAssociationPolicy& policy) noexcept
+        : policy_(policy) {}
+    virtual ~InboundDatagramAssociation() noexcept = default;
+    [[nodiscard]] virtual bool Check(
+        uint64_t packet_id, uint32_t worker, const udp::endpoint& endpoint,
+        InboundDatagramCheck check, Clock::time_point now = Clock::now()) noexcept = 0;
+    [[nodiscard]] const InboundDatagramAssociationPolicy& Policy() const noexcept {
+        return policy_;
+    }
+    [[nodiscard]] Clock::time_point ProtectedUntil() const noexcept {
+        return Clock::time_point(Clock::duration(protected_until_.load(std::memory_order_relaxed)));
+    }
+    // A coordinator claim fences new local packets; source-executor drainage
+    // then excludes the already executing callback before control inspection.
+    std::atomic<bool> claimed{true};
+
+protected:
+    void ProtectUntil(Clock::time_point deadline) noexcept {
+        // The coordinator reads only this deadline, never the mutable protocol
+        // state. The claim's acquire/release pair publishes ownership changes.
+        protected_until_.store(deadline.time_since_epoch().count(), std::memory_order_relaxed);
+    }
+
+private:
+    const InboundDatagramAssociationPolicy& policy_;
+    std::atomic<Clock::duration::rep> protected_until_{0};
+};
+
+struct InboundDatagramAssociationPolicy {
+    size_t capacity;
+    std::chrono::steady_clock::duration retention;
+    std::unique_ptr<InboundDatagramAssociation> (*create)();
+};
+
+struct InboundDatagramAssociationKey {
+    InboundDatagramOwner owner;
+    uint64_t session_id;
+    const void* configuration;
+    [[nodiscard]] bool operator==(const InboundDatagramAssociationKey& other) const noexcept {
+        return session_id == other.session_id && configuration == other.configuration &&
+            owner.Same(other.owner);
+    }
+};
+
+struct InboundDatagramAssociationKeyHash {
+    [[nodiscard]] size_t operator()(const InboundDatagramAssociationKey& key) const noexcept {
+        size_t hash = 2166136261u;
+        for (size_t i = 0; i < key.owner.size; ++i)
+            hash = (hash ^ key.owner.bytes[i]) * 16777619u;
+        hash = (hash ^ key.owner.size) * 16777619u;
+        hash ^= std::hash<uint64_t>{}(key.session_id) + (hash << 6) + (hash >> 2);
+        return hash ^ std::hash<const void*>{}(key.configuration);
+    }
+};
+
+// One index per listener on its receiving Worker. Entries borrow the state
+// owned by a live association row; detached/prepared rows carry null entries.
+using InboundDatagramAssociationIndex = memory::ThreadLocalUnorderedMap<
+    InboundDatagramAssociationKey, InboundDatagramAssociation*,
+    InboundDatagramAssociationKeyHash>;
+
 struct InboundDatagramRequest {
     std::string_view tag;
     std::span<const uint8_t> payload;
-    // The ingress directory commits replay only after authenticated ownership
-    // resolution. Standalone protocol callers retain synchronous replay checks.
-    bool deferred_replay = false;
+    const InboundDatagramAssociationIndex* associations = nullptr;
+    const void* configuration = nullptr;
+    uint32_t worker_id = 0;
+    udp::endpoint client_endpoint;
 };
 
 struct InboundDatagramResult {
     TargetAddress target;
     buf::MultiBuffer payload;
+    std::optional<ForwardedMetadata> forwarded;
     // Absent means that the normalized client endpoint identifies the session.
     std::optional<uint64_t> session_id;
     // Protocol session IDs are scoped by the authenticated credential.
     InboundDatagramOwner session_owner;
     // Present only with an authenticated, replay-protected protocol session.
     std::optional<uint64_t> packet_id;
+    const InboundDatagramAssociationPolicy* association_policy = nullptr;
+    // Borrowed only until the synchronous ProcessDatagram call returns.
+    InboundDatagramAssociation* committed_association = nullptr;
     // Production authentication aliases an owned credential snapshot. The raw
     // view is synchronous-only for protocols without an owning snapshot;
     // ingress must copy the profile before any asynchronous handoff.

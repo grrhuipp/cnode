@@ -31,6 +31,7 @@ static std::array<uint8_t, 12> kZeroNonce{};
 struct Parsed2022Body {
     TargetAddress target;
     std::span<const uint8_t> payload;
+    std::optional<ForwardedMetadata> forwarded;
     std::array<uint8_t, 8> client_session_id{};
 };
 
@@ -44,22 +45,25 @@ struct Parsed2022Body {
 [[nodiscard]] bool WriteClassicUdpPlaintext(const TargetAddress& target,
                                             const uint8_t* payload,
                                             size_t payload_len,
-                                            std::span<uint8_t> plaintext) noexcept {
-    const size_t addr_size = AddressEncodedSize(target);
+                                            std::span<uint8_t> plaintext,
+                                            ForwardedMetadataView forwarded = {}) noexcept {
+    const size_t addr_size = AddressEncodedSize(target, forwarded);
     if (addr_size == 0 || plaintext.size() != addr_size + payload_len) {
         return false;
     }
     if (payload_len > 0) {
         std::memmove(plaintext.data() + addr_size, payload, payload_len);
     }
-    return EncodeAddressTo(target, plaintext.data(), addr_size, AddressWireFormat::Socks5) == addr_size;
+    return EncodeAddressTo(
+               target, plaintext.data(), addr_size, AddressWireFormat::Socks5, forwarded) == addr_size;
 }
 
 [[nodiscard]] bool Write2022ClientBodyPlaintext(const TargetAddress& target,
                                                 const uint8_t* payload,
                                                 size_t payload_len,
-                                                std::span<uint8_t> plaintext) noexcept {
-    const size_t addr_size = AddressEncodedSize(target);
+                                                std::span<uint8_t> plaintext,
+                                                ForwardedMetadataView forwarded = {}) noexcept {
+    const size_t addr_size = AddressEncodedSize(target, forwarded);
     constexpr size_t kHeaderSize = 1 + 8 + 2;
     if (addr_size == 0 || plaintext.size() != kHeaderSize + addr_size + payload_len) {
         return false;
@@ -73,7 +77,8 @@ struct Parsed2022Body {
     pos += 8;
     StoreU16BE(plaintext.data() + pos, 0);
     pos += 2;
-    return EncodeAddressTo(target, plaintext.data() + pos, addr_size, AddressWireFormat::Socks5) == addr_size;
+    return EncodeAddressTo(
+               target, plaintext.data() + pos, addr_size, AddressWireFormat::Socks5, forwarded) == addr_size;
 }
 
 [[nodiscard]] bool Write2022ServerBodyPlaintext(const TargetAddress& target,
@@ -128,6 +133,7 @@ struct Parsed2022Body {
 
     Parsed2022Body parsed;
     parsed.target = std::move(addr.target);
+    parsed.forwarded = std::move(addr.forwarded);
     parsed.payload = plaintext.subspan(pos);
     std::copy(client_session_id.begin(), client_session_id.end(),
               parsed.client_session_id.begin());
@@ -333,6 +339,7 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
 
     SsUdpDecodeResult result;
     result.target = std::move(parsed.target);
+    result.forwarded = std::move(parsed.forwarded);
     uint64_t session_id = 0;
     for (uint8_t byte : client_session_id) session_id = (session_id << 8) | byte;
     result.session_id = session_id;
@@ -520,14 +527,15 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
     size_t key_size,
     size_t salt_size,
     uint8_t* output,
-    size_t output_size) {
+    size_t output_size,
+    ForwardedMetadataView forwarded) {
 
     if (key_size > 64 || salt_size > 64 || master_key.size() < key_size ||
         (payload_len > 0 && !payload)) {
         return 0;
     }
 
-    const size_t addr_size = AddressEncodedSize(target);
+    const size_t addr_size = AddressEncodedSize(target, forwarded);
     if (addr_size == 0) {
         return 0;
     }
@@ -540,7 +548,7 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
     uint8_t* salt = output;
     uint8_t* ciphertext = output + salt_size;
     if (!WriteClassicUdpPlaintext(target, payload, payload_len,
-                                  std::span<uint8_t>(ciphertext, plain_size))) {
+                                  std::span<uint8_t>(ciphertext, plain_size), forwarded)) {
         return 0;
     }
     if (!RandomBytes(std::span<uint8_t>(salt, salt_size))) {
@@ -573,7 +581,8 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
     std::span<const KeyBytes> psk_chain,
     bool response,
     uint8_t* output,
-    size_t output_size) {
+    size_t output_size,
+    ForwardedMetadataView forwarded = {}) {
 
     const KeyBytes* body_key = &state.key;
     if (!response && !psk_chain.empty()) {
@@ -583,7 +592,7 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
         return 0;
     }
 
-    const size_t addr_size = AddressEncodedSize(target);
+    const size_t addr_size = AddressEncodedSize(target, response ? ForwardedMetadataView{} : forwarded);
     if (addr_size == 0) {
         return 0;
     }
@@ -608,7 +617,7 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
               std::span<uint8_t>(body_out, body_plain_size))
         : Write2022ClientBodyPlaintext(
               target, payload, payload_len,
-              std::span<uint8_t>(body_out, body_plain_size));
+              std::span<uint8_t>(body_out, body_plain_size), forwarded);
     if (!wrote_body) {
         return 0;
     }
@@ -679,13 +688,14 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
     Ss2022UdpSessionState& state,
     bool response,
     uint8_t* output,
-    size_t output_size) {
+    size_t output_size,
+    ForwardedMetadataView forwarded = {}) {
 
     if (state.key.size != 32 || (payload_len > 0 && !payload)) {
         return 0;
     }
 
-    const size_t addr_size = AddressEncodedSize(target);
+    const size_t addr_size = AddressEncodedSize(target, response ? ForwardedMetadataView{} : forwarded);
     if (addr_size == 0) {
         return 0;
     }
@@ -708,7 +718,7 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
               std::span<uint8_t>(body_out, body_plain_size))
         : Write2022ClientBodyPlaintext(
               target, payload, payload_len,
-              std::span<uint8_t>(body_out, body_plain_size));
+              std::span<uint8_t>(body_out, body_plain_size), forwarded);
     if (!wrote_body) {
         return 0;
     }
@@ -835,6 +845,36 @@ void Ss2022UdpReplayCache::PruneExpired(
     }
 }
 
+const InboundDatagramAssociationPolicy& Ss2022UdpAssociation::Policy() noexcept {
+    static const InboundDatagramAssociationPolicy policy{
+        Ss2022UdpReplayCache::kMaxSessions,
+        Ss2022UdpReplayCache::kRetention,
+        []() -> std::unique_ptr<InboundDatagramAssociation> {
+            return std::make_unique<Ss2022UdpAssociation>();
+        }};
+    return policy;
+}
+
+bool Ss2022UdpAssociation::Check(
+    uint64_t packet_id, uint32_t worker, const udp::endpoint& endpoint,
+    InboundDatagramCheck check, Clock::time_point now) noexcept {
+    // SIP022 permits unseen in-window reordering. A path change additionally
+    // requires a newer authenticated packet, preventing an old source from
+    // reclaiming either execution ownership or the reply endpoint.
+    if (path_packet_id_ && packet_id <= *path_packet_id_ &&
+        (worker != path_worker_ || endpoint != path_endpoint_)) return false;
+    if (check == InboundDatagramCheck::Inspect) {
+        auto candidate = replay_;
+        return candidate.Accept(packet_id);
+    }
+    if (!replay_.Accept(packet_id)) return false;
+    if (!path_packet_id_ || packet_id > *path_packet_id_) path_packet_id_ = packet_id;
+    path_worker_ = worker;
+    path_endpoint_ = endpoint;
+    ProtectUntil(now + Policy().retention);
+    return true;
+}
+
 std::optional<SsUdpDecodeResult> DecodeUdpPacket(
     const uint8_t* datagram,
     size_t datagram_len,
@@ -901,6 +941,7 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacket(
 
         SsUdpDecodeResult result;
         result.target = std::move(addr.target);
+        result.forwarded = std::move(addr.forwarded);
         result.user_index = i;
 
         const size_t payload_offset = std::min(addr.consumed, plaintext_len);
@@ -928,7 +969,8 @@ size_t EncodeUdpPacketTo(
     size_t key_size,
     size_t salt_size,
     uint8_t* output,
-    size_t output_size) {
+    size_t output_size,
+    ForwardedMetadataView forwarded) {
 
     if (Is2022Cipher(cipher_type)) {
         return 0;
@@ -942,7 +984,8 @@ size_t EncodeUdpPacketTo(
         key_size,
         salt_size,
         output,
-        output_size);
+        output_size,
+        forwarded);
 }
 
 std::optional<SsUdpDecodeResult> DecodeUdpPacketWithKey(
@@ -1028,16 +1071,17 @@ size_t Encode2022UdpRequestPacketTo(
     Ss2022UdpSessionState& state,
     std::span<const KeyBytes> psk_chain,
     uint8_t* output,
-    size_t output_size) {
+    size_t output_size,
+    ForwardedMetadataView forwarded) {
 
     if (Is2022AesCipher(state.cipher_info.type)) {
         return Encode2022UdpAesPacketTo(
             target, payload, payload_len, state, psk_chain,
-            false, output, output_size);
+            false, output, output_size, forwarded);
     }
     if (state.cipher_info.type == SsCipherType::CHACHA20_POLY1305_2022) {
         return Encode2022UdpChachaPacketTo(
-            target, payload, payload_len, state, false, output, output_size);
+            target, payload, payload_len, state, false, output, output_size, forwarded);
     }
     return 0;
 }

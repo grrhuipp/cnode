@@ -32,6 +32,7 @@ tl::expected<size_t, ErrorCode> BuildRequestHeaderPacket(
     Command command,
     const BodyKey& request_body,
     uint8_t response_header,
+    ForwardedMetadataView forwarded,
     std::array<uint8_t, kRequestPacketMax>& packet) {
     std::array<uint8_t, kRequestHeaderMax> header{};
     ByteWriter writer(header.data(), header.size());
@@ -54,7 +55,7 @@ tl::expected<size_t, ErrorCode> BuildRequestHeaderPacket(
         }
         const size_t address_size = EncodeAddressTo(
             target, header.data() + header_len, header.size() - header_len,
-            AddressWireFormat::PortFirst);
+            AddressWireFormat::PortFirst, forwarded);
         if (address_size == 0) {
             return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
         }
@@ -126,10 +127,12 @@ ClientSession::ClientSession(const MemoryAccount& user,
                              const AES_KEY& auth_id_key,
                              const TargetAddress& target,
                              Security security,
-                             Command command)
+                             Command command,
+                             ForwardedMetadataView forwarded)
     : user_(&user)
     , auth_id_key_(&auth_id_key)
     , target_(&target)
+    , forwarded_(forwarded)
     , security_(security)
     , command_(command)
     , keys_(GenerateKeys())
@@ -145,7 +148,7 @@ net::awaitable<VMessHandshakeResult> ClientSession::EncodeRequestHeader(AsyncStr
     std::array<uint8_t, kRequestPacketMax> packet{};
     auto built = BuildRequestHeaderPacket(
         *user_, *auth_id_key_, *target_, security_, command_, keys_.request,
-        keys_.response_header, packet);
+        keys_.response_header, forwarded_, packet);
     if (!built) {
         co_return tl::unexpected(built.error());
     }

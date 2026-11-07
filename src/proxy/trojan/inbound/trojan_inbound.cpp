@@ -72,12 +72,14 @@ private:
     AsyncStream& dst_;
 };
 
-constexpr size_t kMaxTrojanHandshakeBytes = 320;
+constexpr size_t kMaxTrojanHandshakeBytes =
+    ::acpp::trojan::kRequestPrefixSize + kMaxEncodedAddressSize + 2;
 
 struct TrojanHandshakeResult {
     std::shared_ptr<const proxyman::inbound::UserStore::TrojanCredential> user;
     ::acpp::trojan::TrojanCommand command = ::acpp::trojan::TrojanCommand::CONNECT;
     TargetAddress target;
+    std::optional<ForwardedMetadata> forwarded;
 };
 
 net::awaitable<tl::expected<TrojanHandshakeResult, ErrorCode>>
@@ -141,6 +143,7 @@ ParseTrojanRequest(AsyncStream& stream,
         .user = std::move(user_info),
         .command = request.command,
         .target = std::move(request.target),
+        .forwarded = std::move(request.forwarded),
     };
 }
 
@@ -187,6 +190,9 @@ proxy::trojan::inbound::Handler::Process(
         }
         net = (handshake->command == ::acpp::trojan::TrojanCommand::UDP_ASSOCIATE)
               ? Network::UDP : Network::TCP;
+        if (handshake->forwarded) {
+            ctx.inbound.ApplyForwardedMetadata(*handshake->forwarded);
+        }
         proxy::BindAuthenticatedInbound(
             ctx, handshake->user->profile,
             proxy::InboundRequestTarget{net, std::move(handshake->target)});

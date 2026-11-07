@@ -38,7 +38,7 @@ env:
 jobs:
   build-metadata:
     name: Build metadata
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     outputs:
       build_id: ${{ steps.time.outputs.build_id }}
       release_time: ${{ steps.time.outputs.release_time }}
@@ -51,7 +51,7 @@ jobs:
 
   build:
     name: Build and test (${{ matrix.libc }})
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     needs: build-metadata
     container:
       image: ${{ matrix.image }}
@@ -63,10 +63,11 @@ jobs:
       matrix:
         include:
           - libc: musl
-            image: alpine:3.20
+            image: alpine:3.24.4
             link_flags: -static
             sanitizers: 'OFF'
           - libc: glibc
+            # Keep the published glibc ABI baseline independent of dependency upgrades.
             image: ubuntu:24.04
             link_flags: ''
             sanitizers: 'ON'
@@ -83,25 +84,25 @@ jobs:
         run: |
           if [ '${{ matrix.libc }}' = musl ]; then
             apk add --no-cache build-base binutils ccache cmake ninja git curl \
-              zip unzip tar zstd pkgconf linux-headers musl-dev perl nasm python3 py3-pip py3-cryptography bash file ca-certificates openssl
+              zip unzip tar zstd pkgconf linux-headers musl-dev perl nasm python3 py3-pip libsodium bash file ca-certificates openssl
           else
             # Keep package manpages: update-alternatives must find its targets.
             rm -f /etc/dpkg/dpkg.cfg.d/excludes
             apt-get update
             DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
               build-essential binutils ccache cmake ninja-build git curl \
-              zip unzip tar zstd pkg-config perl nasm file linux-libc-dev python3 python3-venv python3-cryptography ca-certificates openssl
+              zip unzip tar zstd pkg-config perl nasm file linux-libc-dev python3 python3-venv libsodium23 ca-certificates openssl
           fi
 
-      - uses: actions/checkout@v6.0.3
+      - uses: actions/checkout@v7.0.1
 
       - name: Install independent protocol test dependencies
         run: |
-          python3 -m venv --system-site-packages "$BUILD_DIR/test-python"
-          "$BUILD_DIR/test-python/bin/python" -m pip install --only-binary=:all: 'blake3==1.0.8'
+          python3 -m venv "$BUILD_DIR/test-python"
+          "$BUILD_DIR/test-python/bin/python" -m pip install --only-binary=:all: 'blake3==1.0.11' 'cryptography==50.0.2'
 
       - name: Restore compiler cache
-        uses: actions/cache/restore@v5.0.5
+        uses: actions/cache/restore@v6.1.0
         with:
           path: ${{ env.BUILD_DIR }}/.ccache
           key: ccache-${{ matrix.libc }}-epoll-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -141,7 +142,7 @@ jobs:
 
       - name: Preserve failed regression diagnostics
         if: failure()
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: failed-${{ matrix.libc }}-regressions
           retention-days: 3
@@ -178,7 +179,7 @@ jobs:
           ls -lh release-assets
 
       - name: Upload release artifacts
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: cnode-${{ matrix.libc }}-epoll-assets
           path: release-assets/*
@@ -191,14 +192,14 @@ jobs:
 
       - name: Save compiler cache
         if: always()
-        uses: actions/cache/save@v5.0.5
+        uses: actions/cache/save@v6.1.0
         with:
           path: ${{ env.BUILD_DIR }}/.ccache
           key: ccache-${{ matrix.libc }}-epoll-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
 
   publish-release:
     name: Publish GitHub Release
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     needs: [build-metadata, build]
     if: github.event_name == 'push'
     env:

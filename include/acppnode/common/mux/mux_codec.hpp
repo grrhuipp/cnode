@@ -1,6 +1,7 @@
 #pragma once
 
 #include "acppnode/common/target_address.hpp"
+#include "acppnode/common/address_codec.hpp"
 
 #include <array>
 #include <cstddef>
@@ -49,7 +50,7 @@ enum class NetworkType : uint8_t {
 
 constexpr uint8_t kOptionData  = 0x01;
 constexpr uint8_t kOptionError = 0x02;
-inline constexpr size_t kMaxFrameHeaderBytes = 269;
+inline constexpr size_t kMaxFrameHeaderBytes = 2 + 4 + 1 + kMaxEncodedAddressSize + 8 + 2;
 // ============================================================================
 // FrameHeader - 解析结果
 // ============================================================================
@@ -63,6 +64,7 @@ struct FrameHeader {
     bool          has_target    = false;
     TargetAddress target;
 
+    std::optional<ForwardedMetadata> forwarded;
     // New UDP 帧是否携带 8 字节 GlobalID（XUDP），其取值不参与本端语义
     bool          has_global_id = false;
 
@@ -96,7 +98,8 @@ struct FrameHeader {
                                        uint16_t session_id,
                                        NetworkType network,
                                        const TargetAddress& target,
-                                       size_t payload_len) noexcept;
+                                       size_t payload_len,
+                                       ForwardedMetadataView forwarded = {}) noexcept;
 
 [[nodiscard]] size_t EncodeEndTo(std::span<uint8_t> out,
                                  uint16_t session_id,

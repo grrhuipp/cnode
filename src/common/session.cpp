@@ -69,10 +69,19 @@ std::string FormatAccessLog(const session::Context& ctx,
     const bool has_target = accepted || target_valid;
     // Only the final owning string crosses the logging queue. Do not use the
     // Worker PMR for it or retain connection-local formatting scratch.
+    std::optional<iputil::AddressText> origin_host_storage;
+    std::string_view origin_host = ctx.inbound.origin_source_ip;
+    if (origin_host.empty() && !ctx.inbound.origin_source_addr.is_unspecified()) {
+        origin_host_storage.emplace(iputil::NormalizeAddress(ctx.inbound.origin_source_addr));
+        origin_host = origin_host_storage->View();
+    }
     std::string access;
-    access.reserve(128 + src_host.size() + target_host.size() +
+    access.reserve(224 + src_host.size() + target_host.size() +
                    in_tag.size() + out_tag.size() +
-                   ctx.inbound.user_email.size() + reason.size());
+                   ctx.inbound.user_email.size() +
+                   origin_host.size() + ctx.inbound.origin_tag.size() +
+                   ctx.inbound.origin_user_email.size() +
+                   reason.size());
     auto endpoint = [&](std::string_view host, uint16_t port) {
         const bool brackets = iputil::NeedsIpv6Brackets(host);
         std::format_to(std::back_inserter(access), "{}{}{}:{}",
@@ -113,6 +122,37 @@ std::string FormatAccessLog(const session::Context& ctx,
     }
     if (!ctx.inbound.user_email.empty() && ctx.inbound.user_email != uid) {
         access.append(" email:").append(ctx.inbound.user_email);
+    }
+    std::array<char, 20> origin_uid_buffer{};
+    std::string_view origin_uid;
+    if (ctx.inbound.origin_user_id > 0) {
+        const auto result = std::to_chars(
+            origin_uid_buffer.data(),
+            origin_uid_buffer.data() + origin_uid_buffer.size(),
+            ctx.inbound.origin_user_id);
+        origin_uid = {
+            origin_uid_buffer.data(),
+            static_cast<size_t>(result.ptr - origin_uid_buffer.data())};
+    }
+    const std::string_view origin_email =
+        (!ctx.inbound.origin_user_email.empty() &&
+         ctx.inbound.origin_user_email != origin_uid)
+            ? std::string_view(ctx.inbound.origin_user_email)
+            : std::string_view{};
+    if (!origin_host.empty() || !ctx.inbound.origin_tag.empty() ||
+        !origin_uid.empty() || !origin_email.empty()) {
+        access.append(" origin:");
+        bool has_part = false;
+        auto append_origin_part = [&](std::string_view part) {
+            if (part.empty()) return;
+            if (has_part) access.push_back('|');
+            access.append(part);
+            has_part = true;
+        };
+        append_origin_part(origin_host);
+        append_origin_part(ctx.inbound.origin_tag);
+        append_origin_part(origin_uid);
+        append_origin_part(origin_email);
     }
     if (ctx.outbound.connected_local_addr &&
         !ctx.outbound.connected_local_addr->is_unspecified()) {

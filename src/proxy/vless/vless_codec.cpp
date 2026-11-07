@@ -153,6 +153,7 @@ RequestHeaderDecodeResult DecodeRequestHeader(std::span<const uint8_t> data) {
             return result;
         }
         header.target = std::move(address.target);
+        header.forwarded = std::move(address.forwarded);
         if (!header.target.IsValid() &&
             !(command == static_cast<uint8_t>(Command::UDP) &&
               IsPacketAddrMagic(header.target))) {
@@ -183,7 +184,8 @@ size_t EncodeRequestHeaderTo(
     const TargetAddress& target,
     uint8_t* output,
     size_t output_size,
-    std::string_view flow) {
+    std::string_view flow,
+    ForwardedMetadataView forwarded) {
     const size_t addons_len = EncodedAddonsSize(flow);
     if (addons_len > std::numeric_limits<uint8_t>::max()) {
         return 0;
@@ -193,7 +195,7 @@ size_t EncodeRequestHeaderTo(
         if (target.IsDomain() && (target.host.empty() || target.host.size() > 253)) {
             return 0;
         }
-        address_size = AddressEncodedSize(target);
+        address_size = AddressEncodedSize(target, forwarded);
         if (address_size == 0) {
             return 0;
         }
@@ -216,7 +218,7 @@ size_t EncodeRequestHeaderTo(
         return writer.Position();
     }
     const size_t encoded = EncodeAddressTo(target, output + writer.Position(),
-        output_size - writer.Position(), AddressWireFormat::PortFirst);
+        output_size - writer.Position(), AddressWireFormat::PortFirst, forwarded);
     return encoded == 0 ? 0 : writer.Position() + encoded;
 }
 

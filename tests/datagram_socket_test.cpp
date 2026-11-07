@@ -337,6 +337,7 @@ bool TestAdmissionBucketSurvivesDomainMigration() {
     };
     acpp::net::io_context io;
     auto coordinator = std::make_shared<acpp::GroupCoordinator>(io);
+    coordinator->RegisterWorker(0, io, io.get_executor());
     auto hooks = std::make_shared<Hooks>();
     auto domain = acpp::ExecutionDomain::Create(io, 0, io.get_executor(), hooks, coordinator);
     hooks->allocation.SetLeaseGroup(domain->LeaseIdentity(), acpp::ExecutionDomain::SharesLeaseIdentity);

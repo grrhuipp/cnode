@@ -104,7 +104,8 @@ SendShadowsocksHandshake(
     bool use_uot,
     const TargetAddress& target,
     std::chrono::seconds handshake_timeout,
-    const PhaseDeadlineHandle& outbound_protocol_deadline) {
+    const PhaseDeadlineHandle& outbound_protocol_deadline,
+    ForwardedMetadataView forwarded) {
     const TargetAddress protocol_target = use_uot
         ? TargetAddress(
             *prepared.config.uot_version == SsUotVersion::V1
@@ -120,7 +121,8 @@ SendShadowsocksHandshake(
         prepared.credentials.Cipher(),
         prepared.credentials.MasterKey(),
         prepared.credentials.PskChain(),
-        stream);
+        stream,
+        forwarded);
     if (!request_writer_result) {
         const bool timed_out = proxy::ConsumeOutboundHandshakeTimeout(
             stream, outbound_protocol_deadline);
@@ -136,8 +138,9 @@ net::awaitable<tl::expected<void, ErrorCode>>
 WriteUotRequest(
     ShadowsocksOutboundEndpoint& target_endpoint,
     const TargetAddress& target,
-    const PhaseDeadlineHandle& outbound_protocol_deadline) {
-    auto request = proxy::uot::EncodeRequest(false, target);
+    const PhaseDeadlineHandle& outbound_protocol_deadline,
+    ForwardedMetadataView forwarded) {
+    auto request = proxy::uot::EncodeRequest(false, target, forwarded);
     if (!request) {
         target_endpoint.Cancel();
         co_return tl::unexpected(request.error());
@@ -173,6 +176,7 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
     const auto& server = prepared_->config.server;
     const bool use_uot =
         ctx.content.network == Network::UDP && prepared_->config.uot_version.has_value();
+    const auto forwarded = dialer.ForwardedMetadata(ctx);
 
     if (ctx.content.network == Network::UDP && !use_uot) {
         auto server_target = MakeServerTarget(server);
@@ -186,7 +190,8 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
                 std::move(server_target),
                 prepared_->credentials.Cipher(),
                 prepared_->credentials.MasterKey(),
-                prepared_->credentials.PskChain());
+                prepared_->credentials.PskChain(),
+                forwarded);
             !opened) {
             co_return tl::unexpected(opened.error());
         }
@@ -211,7 +216,8 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
         use_uot,
         ctx.outbound.target,
         timeouts.HandshakeTimeout(),
-        outbound_protocol_deadline);
+        outbound_protocol_deadline,
+        forwarded);
     if (!request_session) {
         stream->CloseAbortive();
         co_return tl::unexpected(request_session.error());
@@ -229,7 +235,8 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
         if (auto ok = co_await WriteUotRequest(
                 target_endpoint,
                 ctx.outbound.target,
-                outbound_protocol_deadline);
+                outbound_protocol_deadline,
+                forwarded);
             !ok) {
             stream->CloseAbortive();
             co_return tl::unexpected(ok.error());

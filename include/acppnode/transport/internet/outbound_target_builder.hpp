@@ -3,6 +3,7 @@
 #include "acppnode/common/asio_types.hpp"
 #include "acppnode/common/defaults.hpp"
 #include "acppnode/common/error.hpp"
+#include "acppnode/common/target_address.hpp"
 #include "acppnode/transport/async_stream.hpp"
 #include "acppnode/transport/link_error.hpp"
 #include "acppnode/transport/internet/dial_target.hpp"
@@ -43,6 +44,9 @@ struct OutboundTargetOptions {
     const tcp::endpoint* inbound_local_addr = nullptr;
     std::string_view inbound_source_ip{};
     uint16_t inbound_source_port = 0;
+    int64_t inbound_user_id = 0;
+    std::string_view inbound_user_email{};
+    std::string_view inbound_tag{};
     std::optional<OutboundBind::Selection> ordered_bind_v4 = std::nullopt;
     std::optional<OutboundBind::Selection> ordered_bind_v6 = std::nullopt;
 };
@@ -95,6 +99,9 @@ public:
     [[nodiscard]] net::io_context& IoContext() const noexcept;
     [[nodiscard]] app::dns::DNS& Dns() const noexcept { return dns_; }
 
+    [[nodiscard]] bool Passthrough() const noexcept { return sender_.passthrough; }
+    [[nodiscard]] ForwardedMetadataView ForwardedMetadata(
+        const session::Context& ctx) const noexcept;
     // Empty unless sendThrough is Ordered.
     [[nodiscard]] std::optional<OrderedBind> SelectOrderedBind(
         const session::Context& ctx) const;

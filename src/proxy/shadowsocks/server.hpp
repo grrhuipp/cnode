@@ -17,6 +17,7 @@ namespace acpp::ss {
 struct ReadTCPSessionResult {
     std::shared_ptr<const proxyman::inbound::UserStore::ShadowsocksCredential> user;
     TargetAddress target;
+    std::optional<ForwardedMetadata> forwarded;
     InitialPayload initial_payload;
     std::unique_ptr<transport::MultiBufferReader> body_reader;
     KeyBytes request_salt;

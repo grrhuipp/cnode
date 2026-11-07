@@ -21,6 +21,7 @@ namespace acpp {
 struct OutboundSenderSettings {
     StreamSettings stream_settings;
     OutboundBind send_through;
+    bool passthrough = false;
 };
 
 // A proxy protocol's next hop. The literal form is parsed once on the cold

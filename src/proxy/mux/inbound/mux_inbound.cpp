@@ -1251,6 +1251,9 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                         sub_sessions.size() >= kMaxConcurrentSubSessions) {
                         session::Context rejected_ctx;
                         rejected_ctx.InitSubstreamFrom(parent_ctx);
+                        if (hdr.forwarded) {
+                            rejected_ctx.inbound.ApplyForwardedMetadata(*hdr.forwarded);
+                        }
                         rejected_ctx.content.network = hdr.network == mux::NetworkType::UDP
                             ? Network::UDP : Network::TCP;
                         rejected_ctx.outbound.original_target = hdr.target;
@@ -1284,6 +1287,9 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                             hdr.target);
                         auto& sub_ctx = sub_state->ctx;
                         sub_ctx.InitSubstreamFrom(parent_ctx);
+                        if (hdr.forwarded) {
+                            sub_ctx.inbound.ApplyForwardedMetadata(*hdr.forwarded);
+                        }
                         sub_ctx.content.network          = Network::UDP;
                         sub_ctx.outbound.original_target = hdr.target;
                         sub_ctx.outbound.target          = hdr.target;
@@ -1325,6 +1331,9 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                             io_context, sid, reply_queue);
                         auto& sub_ctx = sub_state->ctx;
                         sub_ctx.InitSubstreamFrom(parent_ctx);
+                        if (hdr.forwarded) {
+                            sub_ctx.inbound.ApplyForwardedMetadata(*hdr.forwarded);
+                        }
                         sub_ctx.content.network          = Network::TCP;
                         sub_ctx.outbound.original_target = hdr.target;
                         sub_ctx.outbound.target          = hdr.target;

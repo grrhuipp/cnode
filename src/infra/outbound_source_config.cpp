@@ -43,6 +43,7 @@ OutboundSourceConfig OutboundSourceConfig::FromJson(const json::object& j) {
     if (send_through) {
         cfg.send_through = ParseOutboundBindConfig(*send_through, strategy);
     }
+    cfg.passthrough = JsonBoolOr(j, "passthrough", false);
 
     return cfg;
 }

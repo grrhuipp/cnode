@@ -45,8 +45,8 @@ async def scenario(args, size, unicode, array, output, result, resources):
     result.update(cold_exit_code=child.poll(), server_started='server started' in log)
     if child.poll() is not None:
         diagnostics = list((output / 'logs').glob('error_*.log'))
-        error_log = '\n'.join(path.read_text(encoding='utf-8') for path in diagnostics)
-        reason_found = 'padding scheme exceeds 65535 bytes' in error_log
+        error_log = '\n'.join([log] + [path.read_text(encoding='utf-8') for path in diagnostics])
+        reason_found = 'paddingScheme exceeds 65535 bytes' in error_log or 'padding scheme exceeds 65535 bytes' in error_log
         result.update(passed=size > 65535 and child.returncode != 0 and 'server started' not in log
                       and reason_found,
                       rejection_reason_found=reason_found,

@@ -8,7 +8,6 @@
 #include <asio/use_awaitable.hpp>
 #include <asio/posix/stream_descriptor.hpp>
 #include <sys/eventfd.h>
-#include <mutex>
 #include <vector>
 #include <unistd.h>
 #include <cerrno>
@@ -25,11 +24,12 @@ thread_local bool validating_domain = false;
 thread_local bool unwinding_native = false;
 std::atomic<uint64_t> next_group_identity{1};
 
-// Worker routes are interned on the cold path and live until the coordinator
-// retires. Each Worker runs its reactor on one thread; an extra strand would
-// retain context-owned state beyond that reactor's lifetime.
+// Cold-published immutable routes live until coordinator retirement, after every
+// domain and queued notification has drained. No published node is removed or
+// mutated, so readers need neither a lock nor reclamation retries.
 struct WorkerRoute {
     ExecutionDomain::HandoffTarget target;
+    WorkerRoute* next = nullptr;
     explicit WorkerRoute(ExecutionDomain::HandoffTarget value)
         : target(std::move(value)) {}
 };
@@ -59,21 +59,32 @@ struct GroupCoordinator::ReservedState {
     bool started = false;
     bool stopping = false;
     bool joined = false;
-    std::mutex routes_mutex;
-    std::vector<std::unique_ptr<WorkerRoute>> routes;
-    WorkerRoute* Route(ExecutionDomain::HandoffTarget target) {
+    std::atomic<WorkerRoute*> routes{nullptr};
+    ~ReservedState() {
+        auto* route = routes.load(std::memory_order_relaxed);
+        while (route) {
+            auto* next = route->next;
+            delete route;
+            route = next;
+        }
+    }
+    static WorkerRoute* FindRoute(WorkerRoute* first,
+                                 const ExecutionDomain::HandoffTarget& target) {
         if (!target.reactor || !target.executor)
             throw std::invalid_argument("handoff requires an actual receiving worker");
-        std::lock_guard lock(routes_mutex);
-        for (const auto& route : routes) {
+        for (auto* route = first; route; route = route->next) {
             if (route->target.worker_id != target.worker_id) continue;
             if (route->target.reactor != target.reactor ||
                 route->target.executor != target.executor)
                 throw std::invalid_argument("worker route changed within coordinator");
-            return route.get();
+            return route;
         }
-        routes.push_back(std::make_unique<WorkerRoute>(std::move(target)));
-        return routes.back().get();
+        return nullptr;
+    }
+    WorkerRoute* Route(const ExecutionDomain::HandoffTarget& target) const {
+        auto* route = FindRoute(routes.load(std::memory_order_acquire), target);
+        if (!route) throw std::logic_error("worker route was not registered before admission");
+        return route;
     }
 };
 
@@ -96,6 +107,25 @@ void GroupCoordinator::EnsureStarted() {
 void GroupCoordinator::Start() {
     if (reserved_->start_posted.exchange(true, std::memory_order_acq_rel)) return;
     net::post(reactor_, [self = shared_from_this()] { self->EnsureStarted(); });
+}
+
+void GroupCoordinator::RegisterWorker(uint32_t worker_id, net::io_context& reactor,
+                                      net::any_io_executor executor) {
+    ExecutionDomain::HandoffTarget target{worker_id, &reactor, std::move(executor)};
+    auto* previous = reserved_->routes.load(std::memory_order_acquire);
+    std::unique_ptr<WorkerRoute> candidate;
+    for (;;) {
+        if (ReservedState::FindRoute(previous, target)) return;
+        if (!candidate) candidate = std::make_unique<WorkerRoute>(target);
+        candidate->next = previous;
+        // Registration is cold and append-only. Acquire on failure observes a
+        // concurrent registration before checking its immutable identity.
+        if (reserved_->routes.compare_exchange_weak(previous, candidate.get(),
+                std::memory_order_release, std::memory_order_acquire)) {
+            (void)candidate.release();
+            return;
+        }
+    }
 }
 
 void GroupCoordinator::PostReserved(std::unique_ptr<ReservedOperation> operation) noexcept {
@@ -410,7 +440,7 @@ void ExecutionDomain::Thaw(const std::shared_ptr<Group>& group) noexcept {
     }
 }
 
-net::awaitable<void> ExecutionDomain::MergeGroups(
+net::awaitable<bool> ExecutionDomain::MergeGroups(
     std::shared_ptr<ExecutionDomain> first, std::shared_ptr<ExecutionDomain> second,
     bool exclusive) {
     co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
@@ -426,10 +456,15 @@ net::awaitable<void> ExecutionDomain::MergeGroups(
         if (a == b || !second->state_->attached_to.expired() ||
             b->members.size() != 1 || b->permanently_shared)
             throw std::logic_error("physical domain is not exclusively detachable");
+        // Pool reuse is not a passive handoff trigger. This gate also excludes
+        // a concurrent inbound handoff between the ownership check and attach.
+        if (first->state_->route.load(std::memory_order_acquire) !=
+            second->state_->route.load(std::memory_order_acquire))
+            co_return false;
     } else {
         if (!first->state_->attached_to.expired() || !second->state_->attached_to.expired())
             throw std::logic_error("permanent join cannot consume an exclusive physical lease");
-        if (a == b) co_return;
+        if (a == b) co_return true;
     }
     // Preserve XHTTP's established union-by-rank owner, without retaining any
     // retired parent nodes. Only cold membership metadata is rewritten.
@@ -469,6 +504,7 @@ net::awaitable<void> ExecutionDomain::MergeGroups(
     if (exclusive) second->state_->attached_to = first;
     else destination->permanently_shared = true;
     Thaw(destination);
+    co_return true;
 }
 
 net::awaitable<void> ExecutionDomain::SplitGroup(
@@ -571,14 +607,21 @@ struct ExecutionDomain::Handoff::Transaction {
             for (auto* resource = member->state_->resources; resource; resource = resource->next_)
                 ++count;
         prepared.reserve(count);
-        for (const auto& member : members) {
-            for (auto* resource = member->state_->resources; resource; resource = resource->next_) {
-                prepared.push_back({member.get(), resource});
-                co_await net::co_spawn(
-                    net::any_io_executor(NativeExecutor{member, old_route->target.executor}),
-                    resource->PrepareHandoff(target->target), net::use_awaitable);
+        std::exception_ptr failure;
+        try {
+            for (const auto& member : members) {
+                for (auto* resource = member->state_->resources; resource; resource = resource->next_) {
+                    prepared.push_back({member.get(), resource});
+                    co_await net::co_spawn(
+                        net::any_io_executor(NativeExecutor{member, old_route->target.executor}),
+                        resource->PrepareHandoff(target->target), net::use_awaitable);
+                }
             }
-        }
+        } catch (...) { failure = std::current_exception(); }
+        // co_spawn can deliver completion before NativeExecutor's scope exits.
+        // Cross the source queue before exposing the domain to another Worker.
+        co_await net::post(old_route->target.executor, net::use_awaitable);
+        if (failure) std::rethrow_exception(failure);
     }
     net::awaitable<void> ReportFailure(ExecutionDomain* domain, std::exception_ptr failure) {
         const bool previous = std::exchange(unwinding_native, true);
@@ -604,6 +647,10 @@ struct ExecutionDomain::Handoff::Transaction {
                 co_await net::co_spawn(net::any_io_executor(NativeExecutor{
                     member, old_route->target.executor}),
                     ReportFailure(member.get(), failure), net::use_awaitable);
+        }
+        // Rollback completion must also outlive the final native execution lease.
+        co_await net::post(old_route->target.executor, net::use_awaitable);
+        if (failure) {
             std::rethrow_exception(failure);
         }
     }
@@ -771,11 +818,12 @@ net::awaitable<void> ExecutionDomain::Join(std::shared_ptr<ExecutionDomain> othe
     if (other.get() == this) co_return;
     co_await state_->coordinator->Post(MergeGroups(shared_from_this(), std::move(other)));
 }
-net::awaitable<void> ExecutionDomain::AttachExclusive(std::shared_ptr<ExecutionDomain> other) {
+net::awaitable<bool> ExecutionDomain::AttachExclusive(std::shared_ptr<ExecutionDomain> other) {
     if (!other || Current().get() != this || state_->coordinator != other->state_->coordinator)
         throw std::logic_error("exclusive attachment requires compatible domains");
     co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
-    co_await state_->coordinator->Post(MergeGroups(shared_from_this(), std::move(other), true));
+    co_return co_await state_->coordinator->Post(
+        MergeGroups(shared_from_this(), std::move(other), true));
 }
 net::awaitable<void> ExecutionDomain::DetachExclusive(std::shared_ptr<ExecutionDomain> other) {
     if (!other || Current().get() != this || state_->coordinator != other->state_->coordinator)

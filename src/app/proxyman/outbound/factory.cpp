@@ -53,6 +53,7 @@ std::optional<PreparedOutboundConfig> PrepareOutboundConfig(
     if (config.send_through) {
         prepared->sender.send_through = *config.send_through;
     }
+    prepared->sender.passthrough = config.passthrough;
     return PreparedOutboundConfig{
         .tag = config.tag,
         .protocol = config.protocol,

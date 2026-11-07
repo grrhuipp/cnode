@@ -129,6 +129,9 @@ struct DomainHooks final : acpp::ExecutionDomain::Hooks {
 // protection by arriving on a different physical connection's domain.
 net::awaitable<void> DomainsJoinBySession(net::io_context& io) {
     auto coordinator = std::make_shared<acpp::GroupCoordinator>(io);
+    coordinator->RegisterWorker(1, io, io.get_executor());
+    coordinator->RegisterWorker(2, io, io.get_executor());
+    coordinator->RegisterWorker(3, io, io.get_executor());
     auto hooks = std::make_shared<DomainHooks>();
     auto first_domain = acpp::ExecutionDomain::Create(io, 1, io.get_executor(), hooks, coordinator);
     auto other_domain = acpp::ExecutionDomain::Create(io, 2, io.get_executor(), hooks, coordinator);

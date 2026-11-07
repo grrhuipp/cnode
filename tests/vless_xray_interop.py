@@ -2,6 +2,7 @@
 
 Reference: https://github.com/XTLS/Xray-core/blob/
 a4a3dff5b20c2faae567b742c172c7b95e75c083/proxy/proxy.go
+Official release: https://github.com/XTLS/Xray-core/releases/tag/v26.10.31
 Run after building both products:
 python3 tests/vless_xray_interop.py --binary build/cnode --xray /path/to/xray \
     --output build/vless-xray-interop
@@ -16,9 +17,12 @@ import ssl
 import struct
 import subprocess
 
-from anytls_fin_integration import Resources, USER, CERTIFICATES, available_port, configure, target, tls_settings
+from anytls_fin_integration import Resources, USER, CERTIFICATES, available_port, configure, target, tls_settings, until
 
 REFERENCE_COMMIT = 'a4a3dff5b20c2faae567b742c172c7b95e75c083'
+# SHA-256 of the extracted xray executable, not the release ZIP.
+# Xray-linux-64.zip: e4bd9119f50ae7c41658b1abd0679ae06f98bd864a2907ff33f2f2cf7081b214
+# Archive digest: https://github.com/XTLS/Xray-core/releases/download/v26.10.31/Xray-linux-64.zip.dgst
 RELEASE_SHA256 = 'cc4b84d3069569f297a61f04b914f2bb37e9d202fd7b84cb50def1fc30fd40e1'
 
 
@@ -78,6 +82,8 @@ async def run_case(args, direction, mode, output):
         xray_path.write_text(json.dumps(xray))
         resources.spawn([args.xray, 'run', '-config', xray_path], output / 'xray.log')
         resources.spawn([args.binary, '--config-dir', output], output / 'cnode.log')
+        if direction == 'xray-server':
+            await until(lambda: (output / 'xray.log').exists() and 'started' in (output / 'xray.log').read_text(errors='ignore'), timeout=8)
         for _ in range(2):
             reader, writer = await resources.connect(front_port)
             if direction == 'xray-client':

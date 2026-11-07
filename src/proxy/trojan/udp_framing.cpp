@@ -31,8 +31,8 @@ bool UdpFramer::Next(FramedUdpPacket& out) {
     out = {};
     for (;;) {
         if (!target_) {
-            // SOCKS5 address (at most 259 bytes), length and CRLF only.
-            std::array<uint8_t, 263> header{};
+            // SOCKS5 address, length and CRLF only.
+            std::array<uint8_t, kMaxEncodedAddressSize + 4> header{};
             const size_t copied = pending_.CopyPrefixTo(header);
             auto address = DecodeAddress(
                 std::span<const uint8_t>(header.data(), copied),

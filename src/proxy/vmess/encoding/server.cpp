@@ -83,6 +83,7 @@ bool ParseDecryptedHeader(const uint8_t* data, size_t len,
         if (address.status != AddressDecodeStatus::Complete) return false;
         reader.Skip(address.consumed);
         request.target = std::move(address.target);
+        request.forwarded = std::move(address.forwarded);
         if (!request.target.IsValid()) return false;
     } else {
         LOG_CONN_DEBUG(trace_conn_id, "unsupported command {}", static_cast<int>(request.command));

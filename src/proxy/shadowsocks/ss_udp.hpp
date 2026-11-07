@@ -5,6 +5,7 @@
 #include "shadowsocks_protocol.hpp"
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
 #include "acppnode/common/target_address.hpp"
+#include "acppnode/proxy/inbound_datagram.hpp"
 
 #include <algorithm>
 #include <array>
@@ -87,6 +88,23 @@ private:
     memory::ThreadLocalUnorderedMap<SessionKey, Session, SessionKeyHash> sessions_;
 };
 
+// The sole SS2022 path/replay authority, retained by the ingress directory
+// even after the live relay ends. The local index only borrows this object.
+class Ss2022UdpAssociation final : public InboundDatagramAssociation {
+public:
+    Ss2022UdpAssociation() noexcept : InboundDatagramAssociation(Policy()) {}
+    [[nodiscard]] static const InboundDatagramAssociationPolicy& Policy() noexcept;
+    [[nodiscard]] bool Check(
+        uint64_t packet_id, uint32_t worker, const udp::endpoint& endpoint,
+        InboundDatagramCheck check, Clock::time_point now = Clock::now()) noexcept override;
+
+private:
+    Ss2022UdpReplayWindow replay_;
+    std::optional<uint64_t> path_packet_id_;
+    uint32_t path_worker_ = 0;
+    udp::endpoint path_endpoint_;
+};
+
 // ============================================================================
 // SS AEAD UDP 数据报格式（Xray/shadowsocks-go 兼容）
 //
@@ -115,6 +133,7 @@ struct Ss2022UdpSessionState {
 struct SsUdpDecodeResult {
     TargetAddress        target;       // 解析出的 SOCKS5 目标地址
     buf::MultiBuffer     payload;      // 解密后的 payload Buffer 所有权
+    std::optional<ForwardedMetadata> forwarded;
     std::optional<uint64_t> session_id;
     // SS2022 authenticated metadata, available before replay acceptance.
     std::optional<uint64_t> packet_id;
@@ -162,7 +181,8 @@ struct SsUdpDecodeResult {
     size_t                      key_size,
     size_t                      salt_size,
     uint8_t*                    output,
-    size_t                      output_size);
+    size_t                      output_size,
+    ForwardedMetadataView       forwarded = {});
 
 [[nodiscard]] std::optional<SsUdpDecodeResult> DecodeUdpPacketWithKey(
     const uint8_t* datagram,
@@ -184,7 +204,8 @@ struct SsUdpDecodeResult {
     Ss2022UdpSessionState& state,
     std::span<const KeyBytes> psk_chain,
     uint8_t* output,
-    size_t output_size);
+    size_t output_size,
+    ForwardedMetadataView forwarded = {});
 
 [[nodiscard]] size_t Encode2022UdpResponsePacketTo(
     const TargetAddress& target,

@@ -4,6 +4,7 @@
 #include "acppnode/common/buf/multi_buffer.hpp"
 #include "acppnode/common/error.hpp"
 #include "acppnode/common/target_address.hpp"
+#include "acppnode/common/address_codec.hpp"
 #include "acppnode/transport/async_stream.hpp"
 #include "acppnode/transport/link.hpp"
 
@@ -20,7 +21,7 @@ namespace acpp::proxy::uot {
 
 inline constexpr std::string_view kMagicAddress = "sp.v2.udp-over-tcp.arpa";
 inline constexpr std::string_view kV1MagicAddress = "sp.udp-over-tcp.arpa";
-inline constexpr size_t kMaxAddressSize = 1 + 1 + 255 + 2;
+inline constexpr size_t kMaxAddressSize = kMaxEncodedAddressSize;
 inline constexpr size_t kMaxRequestSize = 1 + kMaxAddressSize;
 
 enum class Version : uint8_t {
@@ -31,8 +32,8 @@ enum class Version : uint8_t {
 struct Request {
     bool is_connect = false;
     TargetAddress destination;
+    std::optional<ForwardedMetadata> forwarded;
 };
-
 struct EncodedRequest {
     std::array<uint8_t, kMaxRequestSize> bytes{};
     size_t size = 0;
@@ -47,7 +48,8 @@ struct EncodedRequest {
 
 [[nodiscard]] tl::expected<EncodedRequest, ErrorCode> EncodeRequest(
     bool is_connect,
-    const TargetAddress& destination);
+    const TargetAddress& destination,
+    ForwardedMetadataView forwarded = {});
 
 [[nodiscard]] net::awaitable<tl::expected<Request, ErrorCode>> ReadRequest(
     transport::MultiBufferReader& reader,
@@ -57,6 +59,7 @@ struct EncodedRequest {
 struct PreparedRequest {
     bool is_connect = false;
     TargetAddress destination;
+    std::optional<ForwardedMetadata> forwarded;
     buf::MultiBuffer pending;
     buf::MultiBuffer initial_decoded;
 };

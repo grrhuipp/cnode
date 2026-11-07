@@ -498,7 +498,7 @@ void TestSharedAddressCodec() {
                       AddressDecodeStatus::Invalid,
                   "shared address accepted an unknown type");
         }
-        std::array<uint8_t, kMaxEncodedAddressSize> domain{};
+        std::array<uint8_t, kMaxBaseEncodedAddressSize> domain{};
         const size_t type_pos = format == AddressWireFormat::PortFirst ? 2 : 0;
         domain[type_pos] = format == AddressWireFormat::Socks5 ? 3 : 2;
         domain[type_pos + 1] = 0;
@@ -514,6 +514,54 @@ void TestSharedAddressCodec() {
                             format).status == AddressDecodeStatus::Incomplete &&
               DecodeAddress(domain, format).consumed == domain.size(),
               "shared address failed its maximum wire-domain boundary");
+
+        const std::array<ForwardedMetadataView, 3> metadata_cases{
+            ForwardedMetadataView{
+                .user_id = 424242,
+                .user_email = "alice@example.com",
+                .client_ip = net::ip::make_address("203.0.113.99"),
+            },
+            ForwardedMetadataView{
+                .user_id = 0,
+                .user_email = "only-email@example.com",
+                .client_ip = std::nullopt,
+            },
+            ForwardedMetadataView{
+                .user_id = 7,
+                .user_email = {},
+                .client_ip = net::ip::make_address("2001:db8::abcd"),
+            },
+        };
+        for (const auto& target : targets) {
+            for (const auto& meta : metadata_cases) {
+                std::array<uint8_t, kMaxEncodedAddressSize> encoded{};
+                const size_t size = EncodeAddressTo(
+                    target, encoded.data(), encoded.size(), format, meta);
+                Check(size == AddressEncodedSize(target, meta) &&
+                      size > AddressEncodedSize(target),
+                      "extended address size mismatch");
+                for (size_t split = 0; split <= size; ++split) {
+                    const auto parsed = DecodeAddress(
+                        std::span<const uint8_t>(encoded.data(), split), format);
+                    Check(parsed.status == (split == size ? AddressDecodeStatus::Complete
+                                                          : AddressDecodeStatus::Incomplete),
+                          "extended address split status mismatch");
+                    if (split == size) {
+                        Check(parsed.consumed == size &&
+                              parsed.target.SameEndpoint(target) &&
+                              parsed.forwarded.has_value() &&
+                              parsed.forwarded->user_id == meta.user_id &&
+                              parsed.forwarded->user_email == meta.user_email &&
+                              parsed.forwarded->client_ip == meta.client_ip,
+                              "extended address roundtrip metadata mismatch");
+                    }
+                }
+                Check(DecodeAddress(std::span<const uint8_t>(encoded.data(), size),
+                                    format, {255, false, false}).status ==
+                          AddressDecodeStatus::Invalid,
+                      "disallowed metadata was accepted");
+            }
+        }
     }
 }
 

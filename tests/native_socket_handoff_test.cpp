@@ -49,14 +49,16 @@ struct Fixture {
     net::executor_work_guard<net::io_context::executor_type> control_work{control.get_executor()};
     std::shared_ptr<GroupCoordinator> coordinator = std::make_shared<GroupCoordinator>(control);
     std::shared_ptr<Hooks> hooks = std::make_shared<Hooks>();
-    std::shared_ptr<ExecutionDomain> domain = ExecutionDomain::Create(
-        old_io, 0, old_io.get_executor(), hooks, coordinator);
+    std::shared_ptr<ExecutionDomain> domain;
     std::thread old_thread, new_thread, control_thread;
     std::latch old_stopped{1};
     std::latch reactors_stopped{3};
     std::latch release_pools{1};
 
     Fixture() {
+        coordinator->RegisterWorker(0, old_io, old_io.get_executor());
+        coordinator->RegisterWorker(1, new_io, new_io.get_executor());
+        domain = ExecutionDomain::Create(old_io, 0, old_io.get_executor(), hooks, coordinator);
         hooks->allocation.SetLeaseGroup(domain->LeaseIdentity(), ExecutionDomain::SharesLeaseIdentity);
         old_thread = std::thread([&] {
             old_io.run();

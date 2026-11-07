@@ -276,7 +276,14 @@ private:
         for (std::size_t count = 0; count != 64 && ready_first_; ++count) {
             auto* event = ready_first_;
             Detach(*event);
-            try { event->OnTimeout(); } catch (...) {}
+            try { event->OnTimeout(); }
+            catch (...) {
+                // The event may already have destroyed itself. Retire this
+                // domain's remaining waits before its executor reports failure
+                // to the owning session; unrelated domains keep their timers.
+                Release();
+                throw;
+            }
         }
         if (ready_first_) Notify();
     }
@@ -312,7 +319,7 @@ void TimeoutScheduler::Impl::OnTimer(const IoErrorCode& ec) {
             if (event->domain_owner_) event->domain_owner_->Queue(*event);
             else {
                 Remove(*event);
-                try { event->OnTimeout(); } catch (...) {}
+                event->OnTimeout();
             }
         }
         if (!released && maintenance && maintenance_deadline <= std::chrono::steady_clock::now()) {
@@ -322,6 +329,9 @@ void TimeoutScheduler::Impl::OnTimer(const IoErrorCode& ec) {
         }
     } catch (...) {
         dispatching = false;
+        // Unscoped Worker callbacks have no session failure hook. Preserve
+        // unrelated waits, then propagate to the runtime's error boundary.
+        if (!released) ArmTimer();
         throw;
     }
     dispatching = false;

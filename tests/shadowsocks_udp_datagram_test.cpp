@@ -371,6 +371,41 @@ void Check2022(const TargetAddress& target,
           "Shadowsocks 2022 accepted a replayed response packet");
 }
 
+void Check2022AssociationPaths() {
+    using enum InboundDatagramCheck;
+    const udp::endpoint first{net::ip::address_v4::loopback(), 48234};
+    const udp::endpoint second{net::ip::address_v4::loopback(), 48235};
+    ss::Ss2022UdpAssociation record;
+    const auto now = std::chrono::steady_clock::now();
+    Check(record.Check(10, 0, first, Commit, now), "failed to seed protocol association");
+    const auto deadline = record.ProtectedUntil();
+    Check(record.Check(12, 0, second, Inspect, now + std::chrono::seconds(1)) &&
+          record.Check(12, 0, second, Inspect, now + std::chrono::seconds(2)) &&
+          record.ProtectedUntil() == deadline &&
+          record.Check(11, 0, first, Commit, now),
+          "inspection committed a packet, changed the path, or extended retention");
+    Check(record.Check(12, 0, second, Commit) &&
+          !record.Check(9, 0, first, Inspect) && !record.Check(9, 0, first, Commit) &&
+          record.Check(9, 0, second, Commit) && !record.Check(9, 0, second, Commit),
+          "same-Worker path freshness rejected reordering or admitted a stale endpoint");
+    Check(record.Check(14, 1, first, Commit) &&
+          !record.Check(13, 0, second, Inspect) && !record.Check(13, 0, second, Commit) &&
+          record.Check(13, 1, first, Commit) && !record.Check(13, 1, first, Commit),
+          "cross-Worker path freshness lost replay history or allowed rollback");
+    // Reordering on the current path must not lower the path watermark.
+    Check(record.Check(17, 1, first, Commit) && record.Check(15, 1, first, Commit) &&
+          !record.Check(16, 1, second, Inspect) && !record.Check(16, 1, second, Commit) &&
+          !record.Check(16, 0, first, Inspect) && !record.Check(16, 0, first, Commit) &&
+          record.Check(16, 1, first, Commit) && record.Check(18, 0, second, Commit) &&
+          record.Check(20, 2, first, Commit) && !record.Check(19, 0, second, Commit) &&
+          record.Check(19, 2, first, Commit),
+          "repeated path changes regressed the freshness watermark");
+    ss::Ss2022UdpAssociation zero;
+    Check(zero.Check(0, 0, first, Commit) && !zero.Check(0, 1, second, Commit) &&
+          zero.Check(1, 1, second, Commit),
+          "zero packet ID bypassed path freshness or replay protection");
+}
+
 void Check2022ReplayWindow() {
     ss::Ss2022UdpReplayWindow window;
     Check(window.Accept(100) && window.Accept(98) && window.Accept(99),
@@ -430,5 +465,6 @@ int main() {
     Check2022(target, source, payload.Bytes(), ss::SsCipherType::AES_128_GCM_2022, 16, true);
     Check2022(target, source, payload.Bytes(), ss::SsCipherType::AES_256_GCM_2022, 32, true);
     Check2022ReplayWindow();
+    Check2022AssociationPaths();
     return 0;
 }

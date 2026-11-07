@@ -19,6 +19,7 @@
 #include "acppnode/infra/config_types.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/transport/internet/transport_stack.hpp"
+#include "acppnode/transport/internet/timeout_scheduler.hpp"
 #include "../tls_client_context.hpp"
 #include "../../../proxy/inbound_admission.hpp"
 #include "../../../common/awaitable_task_group.hpp"
@@ -43,7 +44,6 @@
 #include <limits>
 #include <optional>
 #include <stdexcept>
-#include <deque>
 #include <utility>
 
 namespace acpp::transport::internet::hysteria {
@@ -149,7 +149,8 @@ int SelectAlpn(SSL*, const uint8_t** out, uint8_t* outlen,
 struct PendingPacket {
     std::shared_ptr<SocketState> socket;
     udp::endpoint remote;
-    std::vector<uint8_t> bytes;
+    ConnectionId cid;
+    memory::ThreadLocalVector<uint8_t> bytes;
 };
 
 struct SocketState final : memory::ThreadAllocated {
@@ -163,6 +164,7 @@ struct SocketState final : memory::ThreadAllocated {
         std::vector<uint8_t> data;
         udp::endpoint remote;
         std::shared_ptr<QuicOwnership> owner;
+        bool terminal = false;
     };
     memory::ThreadLocalDeque<Output> output;
     SignalChannel changed;
@@ -184,8 +186,10 @@ public:
     void Spawn(net::awaitable<void> task);
     [[nodiscard]] bool Queue(SocketState& socket, std::vector<uint8_t> data,
                              udp::endpoint remote,
-                             std::shared_ptr<QuicOwnership> owner);
+                             std::shared_ptr<QuicOwnership> owner, bool terminal = false);
     void Associate(const ngtcp2_cid& cid, std::shared_ptr<Connection> connection);
+    void PublishIds(const std::shared_ptr<Connection>& connection);
+    net::awaitable<void> Publish(std::shared_ptr<Connection> connection);
     void Dissociate(const ngtcp2_cid& cid) noexcept;
     void DissociateAll(const std::shared_ptr<QuicOwnership>& owner) noexcept;
     SocketState* Resolve(const udp::endpoint& local) noexcept;
@@ -193,12 +197,18 @@ public:
     void Enqueue(std::shared_ptr<Connection> connection, PendingPacket packet);
     void Pump(const std::shared_ptr<Connection>& connection);
     net::awaitable<void> Claim(std::shared_ptr<QuicOwnership> owner);
+    struct ClaimWait final : TimeoutEvent {
+        explicit ClaimWait(net::io_context& io)
+            : TimeoutEvent(WorkerLocal{}), wake(io, 1) {}
+        void Notify() { (void)wake.try_send(IoErrorCode{}); }
+        void OnTimeout() override { Notify(); }
+        SignalChannel wake;
+    };
     struct Inbox {
-        explicit Inbox(net::io_context& io) : wake(io) {}
-        std::deque<PendingPacket> packets;
+        memory::ThreadLocalDeque<PendingPacket> packets;
         size_t bytes = 0;
         bool scheduled = false;
-        net::steady_timer wake;
+        std::unique_ptr<ClaimWait> claim;
     };
     bool Stage(Inbox& inbox, PendingPacket packet);
     std::unordered_map<QuicOwnership*, std::shared_ptr<Inbox>> inboxes;
@@ -251,6 +261,8 @@ Connection::Connection(
     , closed_signal_(ownership_->domain->Executor(), 1)
     , physical_ready_(ownership_->domain->Executor(), 1) {
     capabilities_->BindDomain(ownership_->domain);
+    retirement_ = std::make_unique<QuicDirectory::Retirement>(
+        listener.directory, listener.directory_space, ownership_);
     core_ = std::make_unique<Core>(allocation_);
     core_->local = socket.local;
     core_->remote = remote;
@@ -264,10 +276,12 @@ std::shared_ptr<Connection> Connection::Create(
         new Connection(listener, socket, remote));
     connection->ownership_->connection = connection;
     connection->registry_ = listener.environment.registry;
+    bool tracked = false;
+    try {
     listener.Associate(header.dcid, connection);
     listener.sessions.emplace(connection->ownership_.get(), connection);
     ++listener.connection_tasks;
-    try {
+    tracked = true;
     net::co_spawn(connection->Executor(), connection->Run(header),
         [connection](std::exception_ptr error) {
             auto* owner = connection->listener_;
@@ -282,7 +296,7 @@ std::shared_ptr<Connection> Connection::Create(
     } catch (...) {
         connection->Close();
         listener.sessions.erase(connection->ownership_.get());
-        --listener.connection_tasks;
+        if (tracked) --listener.connection_tasks;
         throw;
     }
     return connection;
@@ -308,9 +322,11 @@ int Connection::NewConnectionId(ngtcp2_conn*, ngtcp2_cid* cid, uint8_t* token,
 int Connection::RemoveConnectionId(ngtcp2_conn*, const ngtcp2_cid* cid,
     void* user_data) {
     auto& self = *static_cast<Connection*>(user_data);
-    self.listener_->directory.Remove(self.listener_->directory_space,
-        ConnectionId(*cid), self.ownership_);
-    (self.validating_ ? self.validation_listener_ : self.listener_)->Dissociate(*cid);
+    auto* target = self.validating_ ? self.validation_listener_ : self.listener_;
+    target->Dissociate(*cid);
+    std::erase(self.connection_ids_, ConnectionId(*cid));
+    try { target->PublishIds(self.shared_from_this()); }
+    catch (...) { return NGTCP2_ERR_CALLBACK_FAILURE; }
     return 0;
 }
 
@@ -494,6 +510,7 @@ net::awaitable<void> Connection::WaitClosed() {
             net::as_tuple(net::use_awaitable));
         (void)error;
     }
+    Close();
     capabilities_->RequestStop();
 }
 
@@ -544,15 +561,20 @@ net::awaitable<void> Connection::CancelHandoff(const ExecutionDomain::HandoffTar
     // Server-side ngtcp2 has no public rollback API. A rejected ciphertext
     // leaves the path untouched, and a failed probe normally restores its
     // fallback. Never resume an old owner with a different selected path.
-    if (validating_ && !closed_ &&
+    const bool path_changed = validating_ && !closed_ &&
         !ngtcp2_path_eq(ngtcp2_conn_get_path(core_->quic),
-                        &validation_original_path_.path)) {
-        Close();
-    }
+                        &validation_original_path_.path);
+    // Claim has already removed target-local CIDs and drained its publication
+    // and socket work. From here onward only the original Worker is accessible.
     EndValidation(false);
+    if (path_changed) {
+        Close();
+        LOG_DEBUG("QUIC passive rollback closed connection worker={} reason=selected-path-changed",
+            listener_->worker_id);
+    }
     if (!closed_) {
         memory::ScopedWorkerAllocation worker_allocation;
-        for (const auto& cid : listener_->directory.Snapshot(ownership_))
+        for (const auto& cid : connection_ids_)
             listener_->connections.emplace(cid, shared_from_this());
         PublishExpiry();
     }
@@ -940,7 +962,8 @@ void Connection::Close() noexcept {
             session->Detach();
         }
         core_->udp_sessions.clear();
-        listener_->directory.Retire(listener_->directory_space, ownership_);
+        ownership_->retired.store(true);
+        if (retirement_) ownership_->domain->Coordinator().PostReserved(std::move(retirement_));
         (validating_ ? validation_listener_ : listener_)->DissociateAll(ownership_);
     }
     if (physical_ == PhysicalAdmission::Pending) (void)physical_ready_.try_send(IoErrorCode{});
@@ -951,6 +974,14 @@ void Connection::Close() noexcept {
     stream_sink_.reset();
     online_session_.reset();
     physical_reservation_ = {};
+    (void)closed_signal_.try_send(IoErrorCode{});
+}
+
+void Connection::FailPublication() noexcept {
+    ownership_->retired.store(true);
+    if (retirement_) ownership_->domain->Coordinator().PostReserved(std::move(retirement_));
+    (validating_ ? validation_listener_ : listener_)->DissociateAll(ownership_);
+    if (physical_ == PhysicalAdmission::Pending) (void)physical_ready_.try_send(IoErrorCode{});
     (void)closed_signal_.try_send(IoErrorCode{});
 }
 
@@ -1003,7 +1034,7 @@ void Connection::Refuse() noexcept {
                 if (auto* socket = OutputSocket(path))
                     (void)listener_->Queue(*socket,
                         std::vector<uint8_t>(packet.begin(), packet.begin() + written),
-                        core_->remote, ownership_);
+                        core_->remote, ownership_, true);
             } catch (const std::bad_alloc&) {
                 // The close frame is advisory; state is dropped regardless.
             }
@@ -1407,10 +1438,11 @@ void QuicListener::Spawn(net::awaitable<void> task) {
 }
 
 bool QuicListener::Queue(SocketState& socket, std::vector<uint8_t> data,
-                         udp::endpoint remote, std::shared_ptr<QuicOwnership> owner) {
+                         udp::endpoint remote, std::shared_ptr<QuicOwnership> owner,
+                         bool terminal) {
     memory::ScopedWorkerAllocation worker_allocation;
     if (stopping || socket.output.size() >= kMaxQueuedSocketPackets) return false;
-    socket.output.push_back({std::move(data), std::move(remote), std::move(owner)});
+    socket.output.push_back({std::move(data), std::move(remote), std::move(owner), terminal});
     (void)socket.changed.try_send(IoErrorCode{});
     return true;
 }
@@ -1419,13 +1451,57 @@ void QuicListener::Associate(
     const ngtcp2_cid& cid, std::shared_ptr<Connection> connection) {
     memory::ScopedWorkerAllocation worker_allocation;
     const auto id = ConnectionId(cid);
-    if (!directory.Publish(directory_space, id, connection->Ownership()))
-        throw std::runtime_error("QUIC CID publication collision");
-    auto [it, inserted] = connections.emplace(id, connection);
-    if (!inserted && it->second != connection) {
-        directory.Remove(directory_space, id, connection->Ownership());
-        throw std::runtime_error("QUIC local CID collision");
+    if (std::find(connection->connection_ids_.begin(), connection->connection_ids_.end(), id) ==
+        connection->connection_ids_.end()) {
+        if (connection->connection_ids_.size() >= 32)
+            throw std::runtime_error("QUIC CID capacity exceeded");
+        connection->connection_ids_.push_back(id);
     }
+    auto [it, inserted] = connections.emplace(id, connection);
+    if (!inserted && it->second != connection)
+        throw std::runtime_error("QUIC local CID collision");
+    PublishIds(connection);
+}
+
+void QuicListener::PublishIds(const std::shared_ptr<Connection>& connection) {
+    auto& owner = *connection->Ownership();
+    owner.publication_pending = true;
+    if (owner.publishing || owner.retired.load()) return;
+    owner.publishing = true;
+    try { Spawn(Publish(connection)); }
+    catch (...) { owner.publishing = false; throw; }
+}
+
+net::awaitable<void> QuicListener::Publish(std::shared_ptr<Connection> connection) {
+    co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
+    const auto owner = connection->Ownership();
+    try {
+        while (owner->publication_pending && !owner->retired.load()) {
+            owner->publication_pending = false;
+            std::vector<ConnectionId> ids(
+                connection->connection_ids_.begin(), connection->connection_ids_.end());
+            const bool published = co_await environment.coordinator->PostCall(
+                [index = &directory, space = directory_space, owner, ids = std::move(ids)]() mutable {
+                    return index->Publish(space, std::move(ids), owner);
+                });
+            if (!published && !owner->retired.load())
+                throw std::runtime_error("QUIC CID publication collision");
+        }
+    } catch (const std::exception& error) {
+        connection->FailPublication();
+        try { LOG_DEBUG("QUIC CID publication failed worker={} reason={}", worker_id, error.what()); }
+        catch (...) {} // Diagnostic allocation cannot strand the publication gate.
+    } catch (...) {
+        connection->FailPublication();
+        try { LOG_ERROR("QUIC CID publication failed worker={}", worker_id); }
+        catch (...) {} // Closing and waking the native drain remain mandatory.
+    }
+    owner->publishing = false;
+    for (auto& [key, socket] : sockets) {
+        (void)key;
+        (void)socket->changed.try_send(IoErrorCode{});
+    }
+    changed.cancel();
 }
 
 void QuicListener::Dissociate(const ngtcp2_cid& cid) noexcept {
@@ -1448,6 +1524,11 @@ SocketState* QuicListener::Resolve(const udp::endpoint& local) noexcept {
 }
 
 net::awaitable<void> QuicListener::Drain(const std::shared_ptr<QuicOwnership>& owner) {
+    while (owner->publishing) {
+        changed.expires_at(std::chrono::steady_clock::time_point::max());
+        auto [error] = co_await changed.async_wait(net::as_tuple(net::use_awaitable));
+        (void)error;
+    }
     for (auto& [key, socket] : sockets) {
         (void)key;
         size_t kept = 0;
@@ -1469,17 +1550,19 @@ net::awaitable<void> QuicListener::Drain(const std::shared_ptr<QuicOwnership>& o
 bool QuicListener::Stage(Inbox& inbox, PendingPacket packet) {
     if (inbox.packets.size() >= 64 || packet.bytes.size() > 256 * 1024 - inbox.bytes)
         return false;
-    inbox.bytes += packet.bytes.size();
+    const size_t bytes = packet.bytes.size();
     inbox.packets.push_back(std::move(packet));
-    inbox.wake.cancel();
+    inbox.bytes += bytes;
+    if (inbox.claim) inbox.claim->Notify();
     return true;
 }
 
 void QuicListener::Enqueue(std::shared_ptr<Connection> connection, PendingPacket packet) {
+    memory::ScopedWorkerAllocation worker_allocation;
     auto owner = connection->Ownership();
     if (owner->retired.load() || owner->claiming.load() || owner->owner.load() != worker_id) return;
     auto& slot = inboxes[owner.get()];
-    if (!slot) slot = std::make_shared<Inbox>(io);
+    if (!slot) slot = memory::AllocateShared<Inbox>();
     if (!Stage(*slot, std::move(packet)) || slot->scheduled) return;
     slot->scheduled = true;
     // Only metadata enters the migratable queue. A stale operation cannot
@@ -1505,7 +1588,7 @@ void QuicListener::Pump(const std::shared_ptr<Connection>& connection) {
         inbox->bytes -= packet.bytes.size();
         connection->Feed(*packet.socket, packet.remote, packet.bytes);
     }
-    if (connection->Closed()) inboxes.erase(owner.get());
+    if (connection->Closed() || inbox->packets.empty()) inboxes.erase(owner.get());
 }
 
 net::awaitable<void> QuicListener::Claim(std::shared_ptr<QuicOwnership> owner) {
@@ -1525,6 +1608,8 @@ net::awaitable<void> QuicListener::Claim(std::shared_ptr<QuicOwnership> owner) {
             auto remote = EndpointFromAddress(current->remote);
             auto local = EndpointFromAddress(current->local);
             const auto& first = inbox->packets.front();
+            if (std::find(connection->connection_ids_.begin(), connection->connection_ids_.end(), first.cid) ==
+                connection->connection_ids_.end()) return;
             if (!local || !remote || *local != first.socket->local || *remote == first.remote) return;
             connection->BeginValidation(*this, first.socket->local, first.remote);
             eligible = true;
@@ -1537,6 +1622,8 @@ net::awaitable<void> QuicListener::Claim(std::shared_ptr<QuicOwnership> owner) {
                     auto packet = std::move(inbox->packets.front());
                     inbox->packets.pop_front();
                     inbox->bytes -= packet.bytes.size();
+                    if (std::find(connection->connection_ids_.begin(), connection->connection_ids_.end(), packet.cid) ==
+                        connection->connection_ids_.end()) continue;
                     if (packet.socket->local != connection->candidate_local_ ||
                         packet.remote != connection->candidate_remote_) continue;
                     connection->Feed(*packet.socket, packet.remote, packet.bytes);
@@ -1555,14 +1642,21 @@ net::awaitable<void> QuicListener::Claim(std::shared_ptr<QuicOwnership> owner) {
                         connection->candidate_remote_.port());
             });
             if (done) break;
-            inbox->wake.expires_at(std::min(deadline, std::chrono::steady_clock::time_point(
-                std::chrono::nanoseconds(owner->expiry.load()))));
+            const auto wake_at = std::min(deadline, std::chrono::steady_clock::time_point(
+                std::chrono::nanoseconds(owner->expiry.load())));
             if (!inbox->packets.empty()) continue;
-            auto [error] = co_await inbox->wake.async_wait(net::as_tuple(net::use_awaitable));
+            const auto delay = std::chrono::ceil<std::chrono::milliseconds>(
+                wake_at - std::chrono::steady_clock::now());
+            if (!inbox->claim->ScheduleAfter(delay, io))
+                throw std::runtime_error("QUIC claim scheduler stopped");
+            auto [error] = co_await inbox->claim->wake.async_receive(net::as_tuple(net::use_awaitable));
+            inbox->claim->Cancel();
             (void)error;
         }
         bool valid = false;
         co_await ticket->Validate([&] {
+            if (eligible && stopping && connection->validation_authenticated_)
+                LOG_DEBUG("QUIC passive claim abandoned receiving_worker={} reason=listener-stopped", worker_id);
             valid = eligible && !stopping && !connection->Closed() && connection->ValidationSucceeded();
             if (!valid) return;
             const auto* selected = ngtcp2_conn_get_path(connection->core_->quic);
@@ -1572,7 +1666,7 @@ net::awaitable<void> QuicListener::Claim(std::shared_ptr<QuicOwnership> owner) {
                 *remote == connection->candidate_remote_;
             if (!valid) return;
             memory::ScopedWorkerAllocation worker_allocation;
-            for (const auto& cid : directory.Snapshot(owner)) connections.emplace(cid, connection);
+            for (const auto& cid : connection->connection_ids_) connections.emplace(cid, connection);
             sessions.emplace(owner.get(), connection);
         });
         if (valid) {
@@ -1593,6 +1687,10 @@ net::awaitable<void> QuicListener::Claim(std::shared_ptr<QuicOwnership> owner) {
             catch (const std::exception& error) {
                 LOG_DEBUG("QUIC passive rollback terminated connection receiving_worker={} reason={}",
                     worker_id, error.what());
+            }
+            catch (...) {
+                LOG_ERROR("QUIC passive rollback terminated connection receiving_worker={} reason=unknown-failure",
+                    worker_id);
             }
         }
     }
@@ -1618,10 +1716,9 @@ net::awaitable<void> QuicListener::ReceiveLoop(std::shared_ptr<SocketState> sock
             net::as_tuple(net::use_awaitable));
         if (error == net::error::operation_aborted) co_return;
         if (error || bytes == 0) continue;
-        const std::span<const uint8_t> packet(socket->receive_buffer.data(), bytes);
         ngtcp2_version_cid version_cid{};
         if (ngtcp2_pkt_decode_version_cid(
-                &version_cid, packet.data(), packet.size(),
+                &version_cid, socket->receive_buffer.data(), bytes,
                 kServerConnectionIdLength) != 0)
             continue;
         if (version_cid.dcidlen > NGTCP2_MAX_CIDLEN) continue;
@@ -1629,12 +1726,35 @@ net::awaitable<void> QuicListener::ReceiveLoop(std::shared_ptr<SocketState> sock
         auto found = connections.find(cid);
         std::shared_ptr<Connection> connection =
             found == connections.end() ? nullptr : found->second;
-        auto owner = connection ? connection->Ownership() : directory.Find(directory_space, cid);
+        PendingPacket received{socket, socket->remote, cid,
+            memory::ThreadLocalVector<uint8_t>(
+                socket->receive_buffer.begin(), socket->receive_buffer.begin() + bytes)};
+        auto owner = connection ? connection->Ownership() : nullptr;
+        if (!owner) {
+            try {
+                owner = co_await environment.coordinator->PostCall(
+                    [index = &directory, space = directory_space, cid] {
+                        return index->Find(space, cid);
+                    });
+            } catch (const WorkerMailboxFull&) {
+                continue;
+            } catch (const std::system_error& failure) {
+                if (failure.code() == net::error::operation_aborted) co_return;
+                throw;
+            }
+            if (stopping) co_return;
+            // Publication or a completed claim may have installed this CID
+            // while the metadata-only lookup was suspended.
+            found = connections.find(cid);
+            if (found != connections.end()) {
+                connection = found->second;
+                owner = connection->Ownership();
+            }
+        }
         if (owner && !owner->retired.load() && owner->owner.load() != worker_id) {
             auto pending = inboxes.find(owner.get());
             if (pending != inboxes.end()) {
-                Stage(*pending->second, {socket, socket->remote,
-                    std::vector<uint8_t>(packet.begin(), packet.end())});
+                Stage(*pending->second, std::move(received));
                 continue;
             }
             if (pending_claims >= 32) continue;
@@ -1642,9 +1762,9 @@ net::awaitable<void> QuicListener::ReceiveLoop(std::shared_ptr<SocketState> sock
             if (!owner->claiming.compare_exchange_strong(expected, true)) continue;
             ++pending_claims;
             try {
-                auto inbox = std::make_shared<Inbox>(io);
-                Stage(*inbox, {socket, socket->remote,
-                    std::vector<uint8_t>(packet.begin(), packet.end())});
+                auto inbox = memory::AllocateShared<Inbox>();
+                inbox->claim = std::make_unique<ClaimWait>(io);
+                Stage(*inbox, std::move(received));
                 inboxes.emplace(owner.get(), std::move(inbox));
                 Spawn(Claim(owner));
             } catch (...) {
@@ -1656,17 +1776,16 @@ net::awaitable<void> QuicListener::ReceiveLoop(std::shared_ptr<SocketState> sock
             continue;
         }
         if (!connection) {
-            if (owner || (packet[0] & 0x80) == 0) continue;
+            if (owner || (received.bytes[0] & 0x80) == 0) continue;
             if (connections.size() >= kMaxConnections) {
                 LOG_DEBUG("Hysteria listener connection capacity reached worker={}", worker_id);
                 continue;
             }
             ngtcp2_pkt_hd header{};
-            if (ngtcp2_accept(&header, packet.data(), packet.size()) != 0) continue;
-            connection = Connection::Create(*this, *socket, socket->remote, header);
+            if (ngtcp2_accept(&header, received.bytes.data(), received.bytes.size()) != 0) continue;
+            connection = Connection::Create(*this, *socket, received.remote, header);
         }
-        Enqueue(std::move(connection), {socket, socket->remote,
-            std::vector<uint8_t>(packet.begin(), packet.end())});
+        Enqueue(std::move(connection), std::move(received));
     }
 }
 
@@ -1680,7 +1799,19 @@ net::awaitable<void> QuicListener::SendLoop(std::shared_ptr<SocketState> socket)
         }
         auto packet = std::move(socket->output.front());
         socket->output.pop_front();
+        if (packet.owner->retired.load() && !packet.terminal) continue;
         socket->sending = packet.owner;
+        // A CID may not reach the peer until its control-index reservation has
+        // succeeded. This gate is local; publication never carries packet bytes.
+        while (packet.owner->publishing && !stopping && !packet.terminal) {
+            auto [wait_error] = co_await socket->changed.async_receive(net::as_tuple(net::use_awaitable));
+            (void)wait_error;
+        }
+        if (stopping || (packet.owner->retired.load() && !packet.terminal)) {
+            socket->sending.reset();
+            socket->drained.cancel();
+            continue;
+        }
         auto [error, bytes] = co_await socket->socket->async_send_to(
             net::buffer(packet.data), packet.remote,
             net::as_tuple(net::use_awaitable));
@@ -1766,7 +1897,7 @@ void QuicListener::Stop() noexcept {
     }
     for (auto& [owner, inbox] : inboxes) {
         (void)owner;
-        inbox->wake.cancel();
+        if (inbox->claim) inbox->claim->Notify();
     }
     for (auto& [owner, connection] : sessions) {
         (void)owner;

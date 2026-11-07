@@ -378,6 +378,7 @@ Worker::~Worker() = default;
 void Worker::SetGroupCoordinator(std::shared_ptr<GroupCoordinator> coordinator) {
     if (!coordinator || runtime_->started)
         throw std::logic_error("group coordinator must be installed before startup");
+    coordinator->RegisterWorker(id_, io_context_, io_context_.get_executor());
     group_coordinator_ = std::move(coordinator);
 }
 
@@ -386,6 +387,7 @@ void Worker::StartRuntime() {
         throw IoSystemError(net::error::operation_aborted);
     if (!group_coordinator_) {
         group_coordinator_ = std::make_shared<GroupCoordinator>(io_context_);
+        group_coordinator_->RegisterWorker(id_, io_context_, io_context_.get_executor());
         owns_group_coordinator_ = true;
     }
     runtime_->Start(*this);

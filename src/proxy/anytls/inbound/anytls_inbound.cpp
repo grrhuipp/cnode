@@ -477,6 +477,9 @@ net::awaitable<ErrorCode> AnyTLSDemuxSession::ProcessUdpSubstream(
 
     session::Context& ctx = sub.ctx;
     const bool is_connect = prepared->is_connect;
+    if (prepared->forwarded) {
+        ctx.inbound.ApplyForwardedMetadata(*prepared->forwarded);
+    }
     ctx.outbound.original_target = prepared->destination;
     ctx.outbound.target = ctx.outbound.original_target;
     ctx.outbound.route_target = ctx.outbound.original_target;
@@ -510,6 +513,9 @@ net::awaitable<ErrorCode> AnyTLSDemuxSession::ProcessStream(
                                            0, {255, true});
         if (!parsed) co_return parsed.error();
         pending.DropPrefixBytes(parsed->consumed);
+        if (parsed->forwarded) {
+            ctx.inbound.ApplyForwardedMetadata(*parsed->forwarded);
+        }
         uot_version = proxy::uot::VersionFromMagicAddress(parsed->target);
         if (!parsed->target.IsValid() && !uot_version) {
             co_return ErrorCode::PROTOCOL_INVALID_ADDRESS;

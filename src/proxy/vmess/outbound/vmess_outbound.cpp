@@ -141,7 +141,8 @@ proxy::vmess::outbound::Handler::Process(
         prepared_->auth_id_key,
         target,
         prepared_->config.security,
-        is_udp ? ::acpp::vmess::Command::UDP : ::acpp::vmess::Command::TCP);
+        is_udp ? ::acpp::vmess::Command::UDP : ::acpp::vmess::Command::TCP,
+        dialer.ForwardedMetadata(ctx));
 
     if (auto ok = co_await SendVMessHandshake(
             *stream, vmess_session, timeouts.HandshakeTimeout(), ctx); !ok) {

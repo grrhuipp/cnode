@@ -13,7 +13,7 @@
     "protocol": "freedom",
     "settings": { "domainStrategy": "UseIPv6v4" },
     "sendThrough": ["2001:db8:1234::/64"],
-    "sendThroughStrategy": "hash"
+    "sendThroughStrategy": "ip_hash"
   },
   {
     "tag": "blackhole",

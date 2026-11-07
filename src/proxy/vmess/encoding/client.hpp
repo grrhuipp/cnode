@@ -23,7 +23,8 @@ public:
                   const AES_KEY& auth_id_key,
                   const TargetAddress& target,
                   Security security,
-                  Command command);
+                  Command command,
+                  ForwardedMetadataView forwarded = {});
 
     ClientSession(const ClientSession&) = delete;
     ClientSession& operator=(const ClientSession&) = delete;
@@ -53,6 +54,7 @@ private:
     const MemoryAccount* user_ = nullptr;
     const AES_KEY* auth_id_key_ = nullptr;
     const TargetAddress* target_ = nullptr;
+    ForwardedMetadataView forwarded_{};
     Security security_ = Security::AES_128_GCM;
     Command command_ = Command::TCP;
     SessionKeys keys_;

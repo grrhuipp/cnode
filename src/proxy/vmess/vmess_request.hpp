@@ -84,6 +84,7 @@ struct VMessRequest {
     Security security       = Security::AES_128_GCM;
     Command  command        = Command::TCP;
     TargetAddress target;
+    std::optional<ForwardedMetadata> forwarded;
 
     std::shared_ptr<const proxyman::inbound::UserStore::VmessCredential> user;
 };

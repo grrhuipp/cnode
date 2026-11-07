@@ -23,6 +23,14 @@ server's outbound to dial a local tap port; pass, for example,
   --upstream-target 127.0.0.1:44443 --upstream-proxy-port 44444
 The transparent tap verifies that established upstream connections are not
 redialed during migration. Neither endpoint is mocked.
+
+Optional Linux lifecycle regression: --stop-server-pid PID first proves the
+normal migration assertions, then selects a fresh foreign-Worker source using
+an actual forged-CID rejection. It withholds the real client's PATH_RESPONSE
+by dropping server replies on that path and sends SIGTERM after the first
+server packet arrives. It requires target-listener cancellation, fail-closed
+rollback of the selected path, and process exit within ten seconds. Use only
+with a disposable cnode process; the PID is deliberately terminated.
 """
 import argparse
 import asyncio
@@ -32,6 +40,7 @@ import os
 from pathlib import Path
 import re
 import socket
+import signal
 import struct
 import time
 
@@ -60,6 +69,8 @@ class NatRelay:
         self.tasks = []
         self.trace = []
         self.cid = None
+        self.blocked_upstream = None
+        self.blocked_response = asyncio.Event()
 
     def start(self):
         self.tasks.append(asyncio.create_task(self.receive_client()))
@@ -77,6 +88,9 @@ class NatRelay:
         while True:
             packet, peer = await self.loop.sock_recvfrom(sock, 65536)
             if peer == self.server and self.client:
+                if sock is self.blocked_upstream:
+                    self.blocked_response.set()
+                    continue
                 await self.loop.sock_sendto(self.front, packet, self.client)
 
     def switch(self, previous=None):
@@ -447,6 +461,75 @@ async def run(args):
         assert result["control_rounds"] > control_before_migration, "independent request made no progress"
         if control_task.done():
             await control_task
+        if args.stop_server_pid:
+            # A previously validated B path can commit without a new challenge.
+            # Find a genuinely fresh foreign path instead, without ever moving
+            # a client packet until its receiving Worker has been observed.
+            candidates = {}
+            for _ in range(args.max_switches):
+                candidate = udp_socket()
+                relay.sockets.append(candidate)
+                relay.tasks.append(asyncio.create_task(relay.receive_server(candidate)))
+                port = candidate.getsockname()[1]
+                candidates[port] = candidate
+                await loop.sock_sendto(candidate, b"\x40" + relay.cid + os.urandom(80), relay.server)
+                await asyncio.wait_for(exchange(), 1.5)
+            chosen = None
+            deadline = loop.time() + 7
+            while chosen is None and loop.time() < deadline:
+                rejected = re.findall(
+                    r"QUIC passive claim rejected receiving_worker=(\d+) remote=[^\n]*?:(\d+) "
+                    r"reason=no-path-evidence", server_events())
+                for worker, port in rejected:
+                    if int(port) in candidates:
+                        chosen = candidates[int(port)]
+                        result["shutdown_claim"] = {
+                            "receiving_worker": int(worker), "source_port": int(port)}
+                        break
+                await asyncio.wait_for(exchange(), 1.5)
+                await asyncio.sleep(0.02)
+            assert chosen is not None, "no fresh foreign-Worker path for shutdown regression"
+            relay.blocked_upstream = chosen
+            relay.switch(chosen)
+            interrupted = asyncio.create_task(exchange())
+            try:
+                await asyncio.wait_for(relay.blocked_response.wait(), 1.5)
+                # The independent session has remained live until the deliberate
+                # whole-server stop. Its termination is not a migration failure.
+                if control_task.done():
+                    await control_task
+                control_task.cancel()
+                await asyncio.gather(control_task, return_exceptions=True)
+                control_task = None
+                os.kill(args.stop_server_pid, signal.SIGTERM)
+                deadline = loop.time() + 10
+                while True:
+                    try:
+                        os.kill(args.stop_server_pid, 0)
+                        stat = Path(f"/proc/{args.stop_server_pid}/stat").read_text().rsplit(")", 1)[1].split()
+                        if stat[0] == "Z":
+                            # stat field 52 is waitpid's encoded exit status;
+                            # fields here begin at field 3 after the comm name.
+                            status = int(stat[49])
+                            assert status == 0, f"cnode exited abnormally: wait status {status}"
+                            result["shutdown_claim"]["exit_status"] = status
+                            break
+                    except (ProcessLookupError, FileNotFoundError):
+                        break
+                    if loop.time() >= deadline:
+                        raise AssertionError("cnode did not join the interrupted claim during shutdown")
+                    await asyncio.sleep(0.02)
+                events = server_events()
+                assert (f"QUIC passive claim abandoned receiving_worker="
+                        f"{result['shutdown_claim']['receiving_worker']} reason=listener-stopped") in events, \
+                    "target listener did not stop during the authenticated claim"
+                assert re.search(
+                    r"QUIC passive rollback closed connection worker=\d+ reason=selected-path-changed", events), \
+                    "shutdown did not exercise fail-closed rollback of a changed selected path"
+                result["shutdown_claim"]["joined"] = True
+            finally:
+                interrupted.cancel()
+                await asyncio.gather(interrupted, return_exceptions=True)
         result.update(success=True, client_pid=process.pid, control_client_pid=control_process.pid,
                       tcp_egress=tcp_peers, udp_egress=sorted(udp_peers), relay=relay.trace,
                       upstream_accepts=upstream_accepts, upstream_baseline=upstream_baseline)
@@ -495,12 +578,16 @@ def main():
     parser.add_argument("--auth", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--max-switches", type=int, default=32)
+    parser.add_argument("--stop-server-pid", type=int,
+                        help="Linux only: terminate this disposable cnode PID during authenticated path validation")
     parser.add_argument("--upstream-target", help="Real AnyTLS/TCP upstream host:port; cnode outbound must dial --upstream-proxy-port")
     parser.add_argument("--upstream-proxy-port", type=int, default=0,
                         help="Fixed listening port for transparent upstream accept-count tap")
     args = parser.parse_args()
     if bool(args.upstream_target) != bool(args.upstream_proxy_port):
         parser.error("--upstream-target and --upstream-proxy-port must be specified together")
+    if args.stop_server_pid is not None and (args.stop_server_pid <= 1 or args.stop_server_pid == os.getpid()):
+        parser.error("--stop-server-pid must name a separate disposable cnode process")
     asyncio.run(run(args))
 
 

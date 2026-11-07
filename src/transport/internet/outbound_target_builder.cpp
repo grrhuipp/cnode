@@ -109,6 +109,9 @@ AttachXHttpDownloadTarget(OutboundTransportTarget target,
             .inbound_local_addr = options.inbound_local_addr,
             .inbound_source_ip = options.inbound_source_ip,
             .inbound_source_port = options.inbound_source_port,
+            .inbound_user_id = options.inbound_user_id,
+            .inbound_user_email = options.inbound_user_email,
+            .inbound_tag = options.inbound_tag,
         });
     if (!download_target) {
         co_return tl::unexpected(download_target.error());
@@ -147,12 +150,18 @@ BuildOutboundTransportTarget(OutboundTargetOptions options) {
     const auto ordered_v4 = bind.GetMode() == OutboundBind::Mode::Ordered
         ? (options.ordered_bind_v4 ? *options.ordered_bind_v4
             : bind.Select(net::ip::address_v4::any(),
-                          options.inbound_source_ip, options.inbound_source_port))
+                          options.inbound_source_ip,
+                          options.inbound_user_id,
+                          options.inbound_user_email,
+                          options.inbound_tag))
         : OutboundBind::Selection{};
     const auto ordered_v6 = bind.GetMode() == OutboundBind::Mode::Ordered
         ? (options.ordered_bind_v6 ? *options.ordered_bind_v6
             : bind.Select(net::ip::address_v6::any(),
-                          options.inbound_source_ip, options.inbound_source_port))
+                          options.inbound_source_ip,
+                          options.inbound_user_id,
+                          options.inbound_user_email,
+                          options.inbound_tag))
         : OutboundBind::Selection{};
 
     OutboundTransportTarget target;
@@ -293,15 +302,23 @@ net::io_context& OutboundDialer::IoContext() const noexcept {
     return domain ? domain->Reactor() : io_context_;
 }
 
+ForwardedMetadataView OutboundDialer::ForwardedMetadata(
+    const session::Context& ctx) const noexcept {
+    return sender_.passthrough ? ctx.inbound.MakeForwardedMetadata()
+                               : ForwardedMetadataView{};
+}
+
 std::optional<OutboundDialer::OrderedBind> OutboundDialer::SelectOrderedBind(
     const session::Context& ctx) const {
     const auto& bind = sender_.send_through;
     if (bind.GetMode() != OutboundBind::Mode::Ordered) return std::nullopt;
+    const auto client_ip = ctx.inbound.EffectiveClientIp();
+    const auto user_id = ctx.inbound.EffectiveUserId();
+    const auto user_email = ctx.inbound.EffectiveUserEmail();
+    const auto inbound_tag = ctx.inbound.EffectiveInboundTag();
     return OrderedBind{
-        .v4 = bind.Select(net::ip::address_v4::any(),
-                          ctx.inbound.source_ip, ctx.inbound.source_port),
-        .v6 = bind.Select(net::ip::address_v6::any(),
-                          ctx.inbound.source_ip, ctx.inbound.source_port),
+        .v4 = bind.Select(net::ip::address_v4::any(), client_ip, user_id, user_email, inbound_tag),
+        .v6 = bind.Select(net::ip::address_v6::any(), client_ip, user_id, user_email, inbound_tag),
     };
 }
 
@@ -319,8 +336,11 @@ OutboundDialer::Dial(session::Context& ctx, const OutboundServer& server,
         .send_through = &sender_.send_through,
         .inbound_local_addr = ctx.inbound.local_endpoint
             ? &*ctx.inbound.local_endpoint : nullptr,
-        .inbound_source_ip = ctx.inbound.source_ip,
+        .inbound_source_ip = ctx.inbound.EffectiveClientIp(),
         .inbound_source_port = ctx.inbound.source_port,
+        .inbound_user_id = ctx.inbound.EffectiveUserId(),
+        .inbound_user_email = ctx.inbound.EffectiveUserEmail(),
+        .inbound_tag = ctx.inbound.EffectiveInboundTag(),
         .ordered_bind_v4 = ordered ? std::optional{ordered->v4} : std::nullopt,
         .ordered_bind_v6 = ordered ? std::optional{ordered->v6} : std::nullopt,
     });
@@ -412,14 +432,18 @@ tl::expected<net::ip::address, ErrorCode> OutboundDialer::SelectDatagramBind(
         : net::ip::address(net::ip::address_v4::any());
     if (bind.GetMode() != OutboundBind::Mode::Ordered) return any;
 
+    const auto client_ip = ctx.inbound.EffectiveClientIp();
+    const auto user_id = ctx.inbound.EffectiveUserId();
+    const auto user_email = ctx.inbound.EffectiveUserEmail();
+    const auto inbound_tag = ctx.inbound.EffectiveInboundTag();
     auto selected = bind.Select(remote.address.value_or(any),
-                                ctx.inbound.source_ip, ctx.inbound.source_port);
+                                client_ip, user_id, user_email, inbound_tag);
     // A hostname may still be reached over the other accepted family.
     if (!selected.address && !remote.address && (v6 ? remote.accepts_v4 : remote.accepts_v6)) {
         const net::ip::address other = v6
             ? net::ip::address(net::ip::address_v4::any())
             : net::ip::address(net::ip::address_v6::any());
-        selected = bind.Select(other, ctx.inbound.source_ip, ctx.inbound.source_port);
+        selected = bind.Select(other, client_ip, user_id, user_email, inbound_tag);
     }
     if (!selected.address) return tl::unexpected(ErrorCode::SOCKET_BIND_FAILED);
     return *selected.address;

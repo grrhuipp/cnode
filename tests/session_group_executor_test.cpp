@@ -70,6 +70,9 @@ void StableDomainOwnership() {
     auto second_work = net::make_work_guard(second);
     auto third_work = net::make_work_guard(third);
     auto coordinator = std::make_shared<GroupCoordinator>(first, 2);
+    coordinator->RegisterWorker(0, first, first.get_executor());
+    coordinator->RegisterWorker(1, second, second.get_executor());
+    coordinator->RegisterWorker(2, third, third.get_executor());
     std::atomic<unsigned> live{0};
     auto make = [&](net::io_context& io, uint32_t id) {
         return ExecutionDomain::Create(io, id, io.get_executor(),
@@ -245,6 +248,8 @@ void PassiveHandoffAndExclusiveDetach() {
     auto first_work = net::make_work_guard(first);
     auto second_work = net::make_work_guard(second);
     auto coordinator = std::make_shared<GroupCoordinator>(first);
+    coordinator->RegisterWorker(0, first, first.get_executor());
+    coordinator->RegisterWorker(1, second, second.get_executor());
     std::atomic<unsigned> live{0};
     std::atomic<unsigned> failures{0};
     auto make = [&](net::io_context& io, uint32_t id) {
@@ -268,7 +273,8 @@ void PassiveHandoffAndExclusiveDetach() {
     }, net::use_future).get();
     const auto identity = physical->LeaseIdentity();
     const auto request_identity = request->LeaseIdentity();
-    net::co_spawn(request->Executor(), request->AttachExclusive(physical), net::use_future).get();
+    Require(net::co_spawn(request->Executor(), request->AttachExclusive(physical), net::use_future).get(),
+            "same-owner physical attachment was rejected");
     Require(ExecutionDomain::SharesLeaseIdentity(identity.get(), request_identity.get()),
             "attachment did not update retained lease identity");
     bool rejected = false;
@@ -314,16 +320,31 @@ void PassiveHandoffAndExclusiveDetach() {
     net::co_spawn(first, handoff->Commit(), net::use_future).get();
     handoff.reset();
     Require(physical->OwnerId() == 1, "detached physical domain followed former borrower");
-    // Reuse in the original cache namespace rebinds the independent physical
-    // socket to its new borrower, never the borrower to the idle socket.
-    net::co_spawn(request->Executor(), request->AttachExclusive(physical), net::use_future).get();
-    Require(request->OwnerId() == 0 && physical->OwnerId() == 0,
-            "idle physical reuse chose the wrong native owner");
-    Require(native.commits == 2, "cross-owner attachment skipped native resource migration");
+    Require(!net::co_spawn(request->Executor(),
+        request->AttachExclusive(physical), net::use_future).get(),
+        "pool reuse initiated a cross-owner migration");
+    Require(request->OwnerId() == 0 && physical->OwnerId() == 1 && native.commits == 1,
+            "rejected reuse changed native ownership");
+    Require(net::co_spawn(target_domain->Executor(),
+        target_domain->AttachExclusive(physical), net::use_future).get(),
+        "healthy migrated resource was not reusable on its current owner");
+    net::co_spawn(target_domain->Executor(),
+        target_domain->DetachExclusive(physical), net::use_future).get();
+    // A later receive-path handoff, not a pool borrow, can change ownership.
+    handoff = net::co_spawn(first,
+        physical->PreparePassiveHandoff(old_target), net::use_future).get();
+    net::co_spawn(first, handoff->Commit(), net::use_future).get();
+    handoff.reset();
+    Require(net::co_spawn(request->Executor(),
+        request->AttachExclusive(physical), net::use_future).get(),
+        "same-owner reuse after passive handoff failed");
+    Require(native.commits == 2, "passive handoff did not move the native resource");
     for (unsigned i = 0; i != 64; ++i) {
         net::co_spawn(request->Executor(), request->DetachExclusive(physical), net::use_future).get();
         Require(!request->SharesGroup(*physical), "repeated detach retained ancestry");
-        net::co_spawn(request->Executor(), request->AttachExclusive(physical), net::use_future).get();
+        Require(net::co_spawn(request->Executor(),
+            request->AttachExclusive(physical), net::use_future).get(),
+            "same-owner reattachment was rejected");
         Require(physical->LeaseIdentity().get() == identity.get(), "repeated attach replaced identity");
     }
 
@@ -411,6 +432,7 @@ void PassiveHandoffAndExclusiveDetach() {
 void FinalizeJoinsDomainRetirement() {
     net::io_context io;
     auto coordinator = std::make_shared<GroupCoordinator>(io);
+    coordinator->RegisterWorker(0, io, io.get_executor());
     std::atomic<unsigned> live{0};
     auto domain = ExecutionDomain::Create(io, 0, io.get_executor(),
         std::make_shared<Hooks>(live), coordinator);
@@ -436,11 +458,104 @@ void FinalizeJoinsDomainRetirement() {
     if (failure) std::rethrow_exception(failure);
     Require(finalized, "finalization did not resume");
 }
+
+void HandoffCompletionWaitsForNativeLease() {
+    struct LeaseHooks final : ExecutionDomain::Hooks {
+        std::atomic<bool> entered{false};
+        bool pause = false;
+        std::promise<void> leaving;
+        std::shared_future<void> release;
+        void Enter() noexcept override {
+            Require(!entered.exchange(true), "handoff overlapped native execution");
+        }
+        void Leave() noexcept override {
+            if (std::exchange(pause, false)) {
+                leaving.set_value();
+                release.wait();
+            }
+            entered.store(false);
+        }
+        void OnFailure(std::exception_ptr) noexcept override { std::terminate(); }
+    };
+    struct Resource final : ExecutionDomain::NativeResource {
+        LeaseHooks& hooks;
+        explicit Resource(LeaseHooks& value) : hooks(value) {}
+        net::awaitable<void> PrepareHandoff(const ExecutionDomain::HandoffTarget&) override {
+            co_await net::post(net::use_awaitable);
+            hooks.pause = true;
+        }
+        void CommitHandoff(const ExecutionDomain::HandoffTarget&) noexcept override {}
+        net::awaitable<void> CancelHandoff(const ExecutionDomain::HandoffTarget&) override {
+            co_await net::post(net::use_awaitable);
+            hooks.pause = true;
+        }
+    };
+    net::io_context control, source, target;
+    auto control_work = net::make_work_guard(control);
+    auto source_work = net::make_work_guard(source);
+    auto target_work = net::make_work_guard(target);
+    auto coordinator = std::make_shared<GroupCoordinator>(control);
+    coordinator->RegisterWorker(0, source, source.get_executor());
+    coordinator->RegisterWorker(1, target, target.get_executor());
+    auto hooks = std::make_shared<LeaseHooks>();
+    auto domain = ExecutionDomain::Create(source, 0, source.get_executor(), hooks, coordinator);
+    Resource resource(*hooks);
+    std::thread control_thread([&] { control.run(); });
+    std::thread source_thread([&] { source.run(); });
+    std::thread target_thread([&] { target.run(); });
+    net::co_spawn(domain->Executor(), [&]() -> net::awaitable<void> {
+        domain->RegisterResource(resource);
+        co_return;
+    }, net::use_future).get();
+
+    std::promise<void> release_prepare;
+    hooks->release = release_prepare.get_future().share();
+    auto leaving = hooks->leaving.get_future();
+    auto preparing = net::co_spawn(control, domain->PreparePassiveHandoff(
+        {1, &target, target.get_executor()}), net::use_future);
+    leaving.get();
+    const bool prepare_waited =
+        preparing.wait_for(std::chrono::milliseconds(100)) == std::future_status::timeout;
+    release_prepare.set_value();
+    auto handoff = preparing.get();
+    Require(prepare_waited, "prepare completed before its native lease exited");
+    net::co_spawn(control, handoff->Validate([&] {
+        Require(hooks->entered.load(), "validation lacked an exclusive lease");
+    }), net::use_future).get();
+
+    std::promise<void> release_cancel;
+    hooks->release = release_cancel.get_future().share();
+    hooks->leaving = {};
+    leaving = hooks->leaving.get_future();
+    auto cancelling = net::co_spawn(control, handoff->Cancel(), net::use_future);
+    leaving.get();
+    const bool cancel_waited =
+        cancelling.wait_for(std::chrono::milliseconds(100)) == std::future_status::timeout;
+    release_cancel.set_value();
+    cancelling.get();
+    Require(cancel_waited, "rollback completed before its native lease exited");
+    net::co_spawn(domain->Executor(), [&]() -> net::awaitable<void> {
+        domain->UnregisterResource(resource);
+        co_return;
+    }, net::use_future).get();
+    handoff.reset();
+    domain.reset();
+    coordinator->CloseAdmission();
+    net::co_spawn(control, coordinator->AsyncJoin(), net::use_future).get();
+    net::co_spawn(control, [&]() -> net::awaitable<void> {
+        coordinator->ReleaseServices();
+        co_await coordinator->Finalize();
+    }, net::use_future).get();
+    coordinator.reset();
+    control_work.reset(); source_work.reset(); target_work.reset();
+    control_thread.join(); source_thread.join(); target_thread.join();
+}
 }
 
 int main() {
     StableDomainOwnership();
     FinalizeJoinsDomainRetirement();
     PassiveHandoffAndExclusiveDetach();
+    HandoffCompletionWaitsForNativeLease();
     std::cout << "session_group_executor_test passed\n";
 }

@@ -47,7 +47,9 @@ public:
         const udp::endpoint& remote, const ngtcp2_pkt_hd& header);
 
     ~Connection() noexcept {
+        memory::ScopedAllocationDomain scope(allocation_);
         Close();
+        fragments_.clear();
         core_.reset();
     }
 
@@ -63,6 +65,7 @@ public:
     }
     [[nodiscard]] bool Closed() const noexcept { return closed_; }
     void Close() noexcept;
+    void FailPublication() noexcept;
     [[nodiscard]] const std::shared_ptr<QuicOwnership>& Ownership() const noexcept { return ownership_; }
     [[nodiscard]] net::any_io_executor Executor() const { return ownership_->domain->Executor(); }
     [[nodiscard]] net::io_context& Reactor() const noexcept { return ownership_->domain->Reactor(); }
@@ -234,6 +237,8 @@ private:
     QuicListener* validation_listener_ = nullptr;
     std::shared_ptr<app::PhysicalSessionCapabilities> capabilities_;
     std::shared_ptr<QuicOwnership> ownership_;
+    memory::ThreadLocalVector<ConnectionId> connection_ids_;
+    std::unique_ptr<QuicDirectory::Retirement> retirement_;
     std::shared_ptr<app::PhysicalSessionRegistry> registry_;
     std::shared_ptr<app::PhysicalSessionRecord> registry_record_;
     AwaitableTaskGroup* tasks_ = nullptr;

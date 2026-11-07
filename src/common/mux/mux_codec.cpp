@@ -17,13 +17,17 @@ constexpr size_t kMaxFrameMetadataBytes = 4 + 1 + kMaxEncodedAddressSize + 8;
 // MetaLen + 元数据 + DataLen：解码所需的全部连续前缀
 constexpr size_t kMaxFramePrefixBytes = 2 + kMaxFrameMetadataBytes + 2;
 
-[[nodiscard]] bool ParsePortThenAddress(ByteReader& reader, TargetAddress& target) {
+[[nodiscard]] bool ParsePortThenAddress(
+    ByteReader& reader,
+    TargetAddress& target,
+    std::optional<ForwardedMetadata>& forwarded) {
     auto view = reader;
     auto decoded = DecodeAddress(view.ReadBytes(view.Remaining()),
                                  AddressWireFormat::PortFirst);
     if (decoded.status != AddressDecodeStatus::Complete ||
         !reader.Skip(decoded.consumed)) return false;
     target = std::move(decoded.target);
+    forwarded = std::move(decoded.forwarded);
     return target.IsValid();
 }
 
@@ -62,7 +66,7 @@ constexpr size_t kMaxFramePrefixBytes = 2 + kMaxFrameMetadataBytes + 2;
         }
         out.network = static_cast<NetworkType>(network_raw);
         out.has_target = true;
-        if (!ParsePortThenAddress(meta, out.target)) {
+        if (!ParsePortThenAddress(meta, out.target, out.forwarded)) {
             return false;
         }
 
@@ -198,7 +202,8 @@ size_t EncodeNewHeaderTo(std::span<uint8_t> out,
                          uint16_t session_id,
                          NetworkType network,
                          const TargetAddress& target,
-                         size_t payload_len) noexcept {
+                         size_t payload_len,
+                         ForwardedMetadataView forwarded) noexcept {
     if ((network != NetworkType::TCP && network != NetworkType::UDP) ||
         payload_len > std::numeric_limits<uint16_t>::max() ||
         !target.IsValid()) {
@@ -217,7 +222,8 @@ size_t EncodeNewHeaderTo(std::span<uint8_t> out,
         target,
         out.data() + pos,
         out.size() - pos,
-        AddressWireFormat::PortFirst);
+        AddressWireFormat::PortFirst,
+        forwarded);
     if (addr_len == 0) {
         return 0;
     }

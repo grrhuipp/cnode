@@ -18,6 +18,9 @@ public:
     explicit GroupCoordinator(net::io_context& io, size_t capacity = 1024);
     ~GroupCoordinator();
     void Start();
+    // Register fixed Worker routes before their request admission starts.
+    void RegisterWorker(uint32_t worker_id, net::io_context& reactor,
+                        net::any_io_executor executor);
     struct ReservedOperation {
         ReservedOperation* next = nullptr;
         virtual ~ReservedOperation() = default;
@@ -154,7 +157,7 @@ public:
     net::awaitable<std::shared_ptr<Handoff>> PreparePassiveHandoff(HandoffTarget target);
     // Attach an independent, exclusively leased physical domain. Detach moves
     // only that domain out, preserving its current native owner and identity.
-    net::awaitable<void> AttachExclusive(std::shared_ptr<ExecutionDomain> other);
+    [[nodiscard]] net::awaitable<bool> AttachExclusive(std::shared_ptr<ExecutionDomain> other);
     net::awaitable<void> DetachExclusive(std::shared_ptr<ExecutionDomain> other);
 
     struct Operation {
@@ -183,7 +186,7 @@ private:
     struct NativeExecutor;
     void Notify(bool force = false) noexcept;
     void Run(const void* scheduled_route) noexcept;
-    static net::awaitable<void> MergeGroups(std::shared_ptr<ExecutionDomain> first,
+    static net::awaitable<bool> MergeGroups(std::shared_ptr<ExecutionDomain> first,
                                            std::shared_ptr<ExecutionDomain> second,
                                            bool exclusive = false);
     static net::awaitable<void> SplitGroup(std::shared_ptr<ExecutionDomain> first,

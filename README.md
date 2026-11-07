@@ -87,13 +87,15 @@ main
 
 QUIC 与具有已认证会话身份的原生 UDP 关联只因同一会话的数据实际落到另一 Worker 而被动接管，不按负载或空闲定时迁移。QUIC 必须完成路径验证；SS2022 按配置、凭据和客户端会话身份隔离并保持唯一防重放状态。交接先冻结业务执行、排空原生 I/O 与回包，再将原 socket、协议状态、未完成读写和超时绑定到实际收包 Worker；失败回滚，不能恢复的会话关闭。仍在使用的出站连接一并接管，不重新拨号或更换本地端口，不移动共享入站监听 socket。TCP 重连是新连接，TCP 承载的 UoT 不单独迁移；无可验证会话身份的 UDP 不跨地址拼接关联。Hysteria2 仍只提供配置的服务端 UDP 端口，不实现端口跳跃。
 
-执行域直接复用 Worker executor，不在协调器路由缓存中保留 `strand` 等依赖 reactor 私有分配器的对象，避免 Worker 退出后的延迟析构访问失效服务。饱和到时钟上限的超时仍保留可取消的原生等待，取消或提前到期不因重新分配等待节点而失败。
+迁移准备和回滚的协程完成通知不等于原生执行回调已退出：返回控制面前必须经过来源 Worker 队列屏障，确认旧分配租约已释放，才允许目标校验或恢复业务。回归同时覆盖该通知顺序，以及真实 SS2022 换源时的防重放、旧路径拒绝和当前路径乱序接收。
+
+执行域直接复用 Worker executor；Worker 路由在准入前冷注册，接入与接管只查询不可变路由，不加同步锁，也不在协调器中保留依赖 reactor 私有分配器的 `strand`。Worker 退出后的延迟析构不会访问失效服务。饱和到时钟上限的超时仍保留可取消的原生等待，取消或提前到期不因重新分配等待节点而失败。会话域的超时回调异常先取消本域剩余等待，再交给所属会话的失败入口；无会话归属的 Worker 回调异常向运行时传播，其他域的等待不被一并取消。
 
 监听前完成配置校验、路由编译、不可变策略和 TLS／REALITY 上下文准备；物理执行域只按实际协议与所选出口延迟创建运行态宿主，不复制整套 Worker runtime。控制面发布候选快照失败时保留旧配置。
 
 数据 Worker 的监听标签、端点索引与 socket 控制块使用所属线程的 PMR。注销完成后移除注册项；尚未结束的 accept / receive 循环仅保留收束所需的退役状态，并在原 Worker 上释放，不累计空标签条目，也不把监听所有权带入每个请求。
 
-出站配置与认证凭据在冷路径准备为不可变快照，handler 持有该快照，不在各执行域内重复解析或深拷贝。AnyTLS 空闲池与 VLESS Encryption 票据宿主按原准入 Worker、配置快照与出站 tag 隔离，不因请求迁移改变命名空间。AnyTLS 物理连接具有独立执行域，借出时独占附着到请求会话组，使用期间随请求接管；请求结束后分离，健康连接返回原池。不同活跃请求不并发借用同一物理连接。VLESS 请求按值借用票据并在宿主内条件发布，不因共享票据永久合并入站执行域。替换配置停止旧池的新借用，已有请求继续使用旧快照，结束后收束旧池任务。空 PMR 容器只弱引用轻量分配域，不延长已退役物理连接寿命；若该容器随后复用，则在首次分配前绑定当前执行域。
+出站配置与认证凭据在冷路径准备为不可变快照，handler 持有该快照，不在各执行域内重复解析或深拷贝。AnyTLS 空闲池与 VLESS Encryption 票据宿主按原准入 Worker、配置快照与出站 tag 隔离，不因请求迁移改变命名空间。AnyTLS 物理连接具有独立执行域，借出时独占附着到请求会话组，使用期间随请求被动接管；请求结束后分离，健康连接按其当前 Worker 归入原池索引。借用只选择与请求当前 Worker 一致的连接，归池与复用都不主动迁移物理连接；不同活跃请求不并发借用同一物理连接。padding 更新在池宿主串行发布，借用时一并取得下一次握手的不可变快照，不在请求路径读取 `atomic<shared_ptr>`，也不修改其他已建立会话的 padding 状态。VLESS 请求按值借用票据并在宿主内条件发布，不因共享票据永久合并入站执行域。替换配置停止旧池的新借用，已有请求继续使用旧快照，结束后收束旧池任务。空 PMR 容器只弱引用轻量分配域，不延长已退役物理连接寿命；若该容器随后复用，则在首次分配前绑定当前执行域。
 
 proxyman / ingress 在冷路径准备 receiver 语义，公开 Dispatcher 只接收请求所需的窄契约；强制出口和未命中回退属于 Dispatcher 编排，Router 只回答“哪条路由规则命中”。每个 receiver 必须在构建时明确选择 `ForceOutbound` 或 `RouteWithFallback`，不存在 Worker 全局默认出口，也不存在可进入热路径的空策略。cnode 使用强类型、只读 `DispatchPolicy`，不把完整 `ReceiverSettings` 或可变配置 context 传入 Dispatcher。面板 `DetectRule` 由 Worker-local 实现通过通用 `RequestPolicy` 接口提供 allow / block 结果，不进入 Router，也不让 Dispatcher 依赖面板规则管理器。
 
@@ -274,14 +276,14 @@ bash scripts/cnode.sh -variant glibc -debug_file true
 - 空闲 Worker 不再执行固定周期的内存回收；回收由真实负载变化、资源归还或最近到期事件驱动。周期资源日志与内存回收不是同一机制。
 - WS 入站默认使用 `X-Forwarded-For` 的首个 IP 作为客户端地址；缺失或无效时保留 TCP 对端。`streamSettings.wsSettings.realIpHeader` 可指定其他头，设为 `""` 可关闭该行为。此头可被伪造：仅应通过可信代理访问源站，且代理必须覆盖客户端传入的同名头；当前程序不自行校验代理来源。通过 HTTP 头无法恢复客户端源端口，日志记为 `:0`。
 - 面板 `dnsType` 会映射到 freedom outbound 的 `settings.domainStrategy`。
-- 静态 outbound 的顶层 `sendThrough` 可填单个源 IP、`auto`，或按优先级排列的 IP/CIDR 数组；数组按顺序选首个同地址族条目：单个 IP 直接用，CIDR 从网段中生成一个地址；不检查接口地址或本地路由。CIDR 地址由 `sendThroughStrategy` 选择：默认 `hash`（入站源 IP＋源端口），也可设 `random`。每个目标地址族仅选定一个源 IP：绑定或连接失败不更换同族源 IP，也不回退系统默认源 IP；只有完全没有同族条目才由系统选择。`settings.domainStrategy: "UseIPv6v4"` 下 IPv6 目标失败仍可尝试 IPv4 目标，IPv4 单独选源 IP；若目标已由路由预先解析为单个 IP，则不会重新查询另一地址族。UDP 域名逐包解析，建立 socket 前无法获知每包最终地址族；数组绑定依据请求初始目标地址族。原有字符串 `sendThrough` 行为不变。
+- 静态 outbound 的顶层 `sendThrough` 可填单个源 IP、`auto`，或按优先级排列的 IP/CIDR 数组；数组按顺序选首个同地址族条目：单个 IP 直接用，CIDR 从网段中生成一个地址；不检查接口地址或本地路由。CIDR 地址由 `sendThroughStrategy` 选择：默认 `random`，也可显式设 `ip_hash`（按最初入站客户端源 IP 哈希，不含端口）或 `user_hash`（按最初入站 `inbound_tag + user_id + email` 组合哈希，无用户标识时回退按最初客户端源 IP 哈希）。代理 outbound 顶层可设 `"passthrough": true`（默认 `false`），在向下一跳 cnode 节点发起请求或复用子流时透传最初入站的标签、用户身份与真实客户端 IP，供下游节点的 `ip_hash` / `user_hash` 使用。每个目标地址族仅选定一个源 IP：绑定或连接失败不更换同族源 IP，也不回退系统默认源 IP；只有完全没有同族条目才由系统选择。`settings.domainStrategy: "UseIPv6v4"` 下 IPv6 目标失败仍可尝试 IPv4 目标，IPv4 单独选源 IP；若目标已由路由预先解析为单个 IP，则不会重新查询另一地址族。UDP 域名逐包解析，建立 socket 前无法获知每包最终地址族；数组绑定依据请求初始目标地址族。原有字符串 `sendThrough` 行为不变。
 - 未显式配置 `inboundTag` 的路由规则匹配所有入站；只有显式写出 `inboundTag` 时才限制入站来源。`network`、`inboundTag`、`user`、`source`、`protocol` 显式写成空字符串或空数组时拒绝启动，不按“匹配全部”解释。
 - 启动时只加载路由规则实际引用的 geoip / geosite 分类（tag 大小写无关），之后所有 Worker 只读共享。`geoip.dat` / `geosite.dat` 缺失、截断或格式损坏，或引用的分类不存在、重复时拒绝启动；geosite 的 regexp 条目不加载。
 - 静态 inbound 默认 `"routingEnabled": false`，不经过分流，直接走内置 `direct`（`sendThrough: "auto"` 源进源出）出口；仅当显式设置 `"routingEnabled": true` 且未指定 `outboundTag` 时参与 routing，未命中回落内置 `direct`；指定 `"outboundTag": "出口标签"` 时全部走该出口，不经过分流（即使规则可命中）。标签必须指向已配置或内置的静态 outbound；不存在或为空会拒绝启动。
 - 面板创建的 direct outbound 是 routing 未命中时的 fallback，命中规则始终优先生效。
 - 出口列表顺序不表达默认出口；动态增删 outbound 不会改变其他 receiver 的选择。明确的 forced / fallback tag 不存在时请求失败，不隐式切换到第一个 outbound。
 - AnyTLS 使用 TLS session pool、单物理 session read loop、按 sid demux、共享 session 串行写，以及 `settings.clients` 和 `settings.paddingScheme` 配置。
-- Hysteria v1 使用 ALPN `hysteria`，Hysteria2 使用 HTTP/3 `/auth` 后切换原生 QUIC stream；两代均支持 QUIC DATAGRAM UDP 与分片重组。按 Xray `transport/internet/hysteria` 的划分，QUIC、认证与流/数据报会话属于传输层，认证后每个 TCP 请求流与 UDP 会话作为逻辑传输流交给同一入站 Handler 与 `Inbound::Process`，连接级物理准入与连接统计在认证前完成。QUIC 与 TCP 一样由全部数据 Worker 以 `SO_REUSEPORT` 监听，连接归接受它的 Worker；路径变化后落到其他 Worker 的短包头数据包因连接 ID 未知被丢弃（RFC 9000 §10.3），不跨 Worker 转发，因此只有仍落在原 Worker 的路径迁移可继续。`ngtcp2`、`nghttp3` 及流队列借用 Worker PMR，监听入口共享收发循环和超时调度。`ngtcp2` 不提供 Hysteria v1 的 Brutal 拥塞控制，v1 服务端使用其 BBR v2 实现；线协议与官方 v1 客户端互通，但带宽控制行为不是 Brutal。
+- Hysteria v1 使用 ALPN `hysteria`，Hysteria2 使用 HTTP/3 `/auth` 后切换原生 QUIC stream；两代均支持 QUIC DATAGRAM UDP 与分片重组。按 Xray `transport/internet/hysteria` 的划分，QUIC、认证与流/数据报会话属于传输层，认证后每个 TCP 请求流与 UDP 会话作为逻辑传输流交给同一入站 Handler 与 `Inbound::Process`，连接级物理准入与连接统计在认证前完成。QUIC 与 TCP 一样由全部数据 Worker 以 `SO_REUSEPORT` 监听；未认证连接归接受它的 Worker，已认证会话在路径变化使数据包实际落到另一 Worker 且完成路径验证后被动接管，不跨 Worker 转发数据包（RFC 9000 §9、§10.3）。`ngtcp2`、`nghttp3` 及流队列借用当前 Worker PMR，监听入口共享收发循环和超时调度。`ngtcp2` 不提供 Hysteria v1 的 Brutal 拥塞控制，v1 服务端使用其 BBR v2 实现；线协议与官方 v1 客户端互通，但带宽控制行为不是 Brutal。
 
 AnyTLS FIN 关闭整个逻辑流：远端 FIN 之前的已接收数据按有界队列排空，同时停止新的反向写入且不回复 FIN；本地关闭只发送一次 FIN。请求的两个方向结束后，完整且正常的物理会话可供新流复用；物理帧写入中断则关闭会话。第四十八轮已通过固定提交官方实现对照、双向直接互通和提前 FIN 检查，验证范围及当前环境限制见[架构审查记录](docs/architecture-review-20260909.md#第四十八轮anytls-完整关闭与-tls-取消传递)。
 - REALITY 支持 TLS 1.3 + X25519 + Ed25519 临时证书签发与验证、服务端准入控制（`serverNames`、`shortIds`、`minClientVer`、`maxClientVer`、`maxTimeDiff`）、可选后量子 `mldsa65Seed` / `mldsa65Verify`（ML-DSA-65 证书扩展签名与验签）、未认证连接透明回落转发（`dest` + `xver` 0/1/2 PROXY Protocol v1/v2）、客户端 `fingerprint` 浏览器指纹模拟（`chrome`/`firefox`/`safari`/`ios`/`android`/`edge`/`360`/`qq`/`random`）、客户端 `spiderX` 回退路径访问，以及 V2Board 面板 `tls=2` REALITY 节点自动同步。握手阶段的认证状态与 transcript 缓冲在握手结束时立即释放，不随连接常驻；无读者的 `show`、`type`、`masterKeyLog` 字段会被配置加载器拒绝。
@@ -298,7 +300,7 @@ AnyTLS FIN 关闭整个逻辑流：远端 FIN 之前的已接收数据按有界�
 time="2026-11-05T12:30:00+08:00" level=info msg="Panel status: state=ready inbound=ready protocol=vless port=443 network=tcp users=128 rules=12 pull=60s push=60s" Host="https://panel.example.com" ID=1041 Name=main Type=vless
 ```
 
-**访问文件**：只记录访问事实，不带日志级别。`accepted` 的记录时机不变；认证、配额和策略拒绝使用 `rejected` 并说明实际原因。认证成功后，flow、设备限制与重放等拒绝保留已确认身份、已解析目标及 network；Mux 子流拒绝使用子流目标，不冒用父连接目标。`user:` 是已确认的数字 UID，`email:` 是已有用户标识，不用其冒充 UID；与 UID 完全相同的标识不重复输出。`sendThrough:` 只记录实际连接的本地地址。认证前不记录候选用户，尚无有效目标或出口时不填写虚构值。
+**访问文件**：只记录访问事实，不带日志级别。`accepted` 的记录时机不变；认证、配额和策略拒绝使用 `rejected` 并说明实际原因。认证成功后，flow、设备限制与重放等拒绝保留已确认身份、已解析目标及 network；Mux 子流拒绝使用子流目标，不冒用父连接目标。`user:` 是已确认的数字 UID，`email:` 是已有用户标识，不用其冒充 UID；与 UID 完全相同的标识不重复输出。当入站收到上游 `passthrough` 透传元数据时，额外以 `|` 分隔记录最初入口的客户端 IP、入站标签与用户标识（`origin:<ip>|<tag>|<uid>|<email>`，与 UID 相同的标识同样不重复输出）。`sendThrough:` 只记录实际连接的本地地址。认证前不记录候选用户，尚无有效目标或出口时不填写虚构值。
 
 ```text
 2026/11/05 12:30:01.123456 from 192.0.2.10:52000 accepted tcp:example.com:443 [vless-in -> direct] user:123 email:user@example.com sendThrough:198.51.100.2

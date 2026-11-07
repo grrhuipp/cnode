@@ -590,6 +590,7 @@ net::awaitable<tl::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession2022
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
     result.target = std::move(addr_result.target);
+    result.forwarded = std::move(addr_result.forwarded);
     if (!result.target.IsValid() && !proxy::uot::VersionFromMagicAddress(result.target)) {
         co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
     }
@@ -724,6 +725,7 @@ net::awaitable<tl::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession(
     }
 
     result.target = std::move(addr_result.target);
+    result.forwarded = std::move(addr_result.forwarded);
     if (!result.target.IsValid() && !proxy::uot::VersionFromMagicAddress(result.target)) {
         co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
     }

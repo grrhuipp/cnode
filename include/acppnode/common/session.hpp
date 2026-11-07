@@ -44,8 +44,10 @@ struct Inbound {
         , tag(resource)
         , accounting_key(resource)
         , tags(resource)
-        , user_email(resource) {}
-
+        , user_email(resource)
+        , origin_tag(resource)
+        , origin_user_email(resource)
+        , origin_source_ip(resource) {}
     net::ip::address source_addr;
     memory::ThreadLocalString source_ip;
     uint16_t source_port = 0;
@@ -60,10 +62,80 @@ struct Inbound {
     memory::ThreadLocalVector<memory::ThreadLocalString> tags;
     int64_t user_id = 0;
     memory::ThreadLocalString user_email;
+
+    // 链式代理透传自最初入站的标签、身份与真实客户端 IP。
+    memory::ThreadLocalString origin_tag;
+    int64_t origin_user_id = 0;
+    memory::ThreadLocalString origin_user_email;
+    net::ip::address origin_source_addr;
+    memory::ThreadLocalString origin_source_ip;
+
     // Connection-limit family lease of the physical connection this request
     // arrived on. Set by the inbound handler; substreams inherit it and take
     // their logical admission against it.
     std::shared_ptr<ConnectionFamily> connection_family;
+
+    void ApplyForwardedMetadata(const ForwardedMetadata& metadata) {
+        if (!metadata.inbound_tag.empty()) {
+            origin_tag.assign(metadata.inbound_tag.data(), metadata.inbound_tag.size());
+        }
+        if (metadata.user_id > 0) {
+            origin_user_id = metadata.user_id;
+        }
+        if (!metadata.user_email.empty()) {
+            origin_user_email.assign(metadata.user_email.data(), metadata.user_email.size());
+        }
+        if (metadata.client_ip && !metadata.client_ip->is_unspecified()) {
+            origin_source_addr = iputil::NormalizeAddress(*metadata.client_ip);
+            const auto text = iputil::AddressText(origin_source_addr);
+            origin_source_ip.assign(text.View());
+        }
+    }
+
+    [[nodiscard]] bool HasOriginIdentity() const noexcept {
+        return origin_user_id > 0 || !origin_user_email.empty() || !origin_tag.empty();
+    }
+
+    [[nodiscard]] std::string_view EffectiveInboundTag() const noexcept {
+        return !origin_tag.empty() ? std::string_view(origin_tag)
+                                   : std::string_view(tag);
+    }
+    [[nodiscard]] int64_t EffectiveUserId() const noexcept {
+        return HasOriginIdentity() ? origin_user_id : user_id;
+    }
+
+    [[nodiscard]] std::string_view EffectiveUserEmail() const noexcept {
+        return HasOriginIdentity() ? std::string_view(origin_user_email)
+                                   : std::string_view(user_email);
+    }
+
+    [[nodiscard]] const net::ip::address& EffectiveClientAddress() const noexcept {
+        return !origin_source_addr.is_unspecified() ? origin_source_addr : source_addr;
+    }
+
+    [[nodiscard]] std::string_view EffectiveClientIp() const noexcept {
+        return !origin_source_ip.empty() ? std::string_view(origin_source_ip)
+                                         : std::string_view(source_ip);
+    }
+
+    [[nodiscard]] ForwardedMetadataView MakeForwardedMetadata() const noexcept {
+        std::optional<net::ip::address> client_ip;
+        const auto& addr = EffectiveClientAddress();
+        if (!addr.is_unspecified()) {
+            client_ip = addr;
+        } else if (const auto literal = iputil::ParseLiteral(EffectiveClientIp())) {
+            const auto normalized = iputil::NormalizeAddress(*literal);
+            if (!normalized.is_unspecified()) {
+                client_ip = normalized;
+            }
+        }
+        return ForwardedMetadataView{
+            .user_id = EffectiveUserId(),
+            .user_email = EffectiveUserEmail(),
+            .client_ip = client_ip,
+            .inbound_tag = EffectiveInboundTag(),
+        };
+    }
 };
 
 // xray-core common/session.Outbound 对应的出站目标/路由元数据。

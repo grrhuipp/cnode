@@ -182,6 +182,45 @@ inline std::optional<TargetAddress> TargetAddress::Parse(std::string_view addr) 
     return target;
 }
 
+
+inline constexpr size_t kMaxForwardedEmailLength = 96;
+inline constexpr size_t kMaxForwardedTagLength = 96;
+// 链式代理透传的最初入站身份与真实客户端 IP 只读视图。
+struct ForwardedMetadataView {
+    int64_t user_id = 0;
+    std::string_view user_email{};
+    std::optional<net::ip::address> client_ip{};
+    std::string_view inbound_tag{};
+
+    [[nodiscard]] bool Empty() const noexcept {
+        return user_id <= 0 && user_email.empty() &&
+               (!client_ip || client_ip->is_unspecified()) &&
+               inbound_tag.empty();
+    }
+};
+
+// 链式代理透传的最初入站身份与真实客户端 IP 拥有型存储。
+struct ForwardedMetadata {
+    int64_t user_id = 0;
+    memory::ThreadLocalString user_email;
+    std::optional<net::ip::address> client_ip;
+    memory::ThreadLocalString inbound_tag;
+
+    [[nodiscard]] bool Empty() const noexcept {
+        return user_id <= 0 && user_email.empty() &&
+               (!client_ip || client_ip->is_unspecified()) &&
+               inbound_tag.empty();
+    }
+
+    [[nodiscard]] ForwardedMetadataView View() const noexcept {
+        return ForwardedMetadataView{
+            .user_id = user_id,
+            .user_email = user_email,
+            .client_ip = client_ip,
+            .inbound_tag = inbound_tag,
+        };
+    }
+};
 }  // namespace acpp
 
 template <>

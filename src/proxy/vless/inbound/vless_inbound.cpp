@@ -335,6 +335,9 @@ CompleteVlessInboundHandshake(
         ::acpp::vless::IsPacketAddrMagic(request.target);
     // Published before flow/transport validation so those rejections log the
     // authenticated user and the requested target.
+    if (request.forwarded) {
+        ctx.inbound.ApplyForwardedMetadata(*request.forwarded);
+    }
     proxy::BindAuthenticatedInbound(
         ctx, user_info->profile,
         proxy::InboundRequestTarget{net, std::move(request.target)});

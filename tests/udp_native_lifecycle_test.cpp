@@ -3,6 +3,8 @@
 #include "worker/udp_association_reclaimer.hpp"
 #include "worker/udp_ingress.hpp"
 #include "worker/udp_handoff_directory.hpp"
+#include "ss_udp.hpp"
+#include "inbound/ss_inbound.hpp"
 
 #include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
 #include "acppnode/app/stats.hpp"
@@ -32,7 +34,9 @@
 #include <memory>
 #include <memory_resource>
 #include <new>
+#include <span>
 #include <string_view>
+#include <vector>
 
 namespace {
 using namespace std::chrono_literals;
@@ -571,10 +575,110 @@ void VerifyUplinkRefresh(acpp::net::io_context& io, Reclaimer& reclaimer) {
         Fail("idle-expired native dispatch did not join at actual completion");
 }
 
+void VerifyProtocolLocalAssociation() {
+    using namespace acpp;
+    using namespace acpp::proxyman::inbound;
+    auto previous_view = UserStore::CaptureWorkerView();
+    UserOnlineTracker tracker;
+    StatsShard stats{};
+    const int configuration = 1;
+    const int other_configuration = 2;
+    const udp::endpoint first{net::ip::address_v4::loopback(), 48234};
+    const udp::endpoint second{net::ip::address_v4::loopback(), 48235};
+    const TargetAddress target("127.0.0.1", 53);
+    constexpr std::array<uint8_t, 3> payload{1, 2, 3};
+    for (auto method : {"2022-blake3-aes-128-gcm", "2022-blake3-chacha20-poly1305"}) {
+        const auto cipher = ss::ParseCipherMethod(method);
+        if (!cipher) Fail("protocol association fixture cipher is unavailable");
+        ss::KeyBytes key;
+        std::array<uint8_t, 32> credential{0x61, 0x72};
+        if (!key.assign(std::span(credential).first(cipher->key_size)))
+            Fail("failed to prepare protocol association credential");
+        PreparedShadowsocksUser user;
+        if (!user.derived_key.assign(key.span())) Fail("failed to prepare local protocol user");
+        user.key_size = cipher->key_size;
+        user.salt_size = cipher->salt_size;
+        user.profile.user_id = 41;
+        UserSet users = PreparedShadowsocksUsers{std::move(user)};
+        UserStore::InstallWorkerView(UserStore::PrepareWorkerView(
+            UserStore::PrepareUsers("protocol-association", users)));
+        proxy::shadowsocks::inbound::Handler handler(tracker, stats, nullptr, *cipher);
+        ss::Ss2022UdpSessionState encoder;
+        if (!ss::Init2022UdpSessionState(encoder, *cipher, key))
+            Fail("failed to initialize protocol association encoder");
+        const auto encode = [&](uint64_t packet_id) {
+            encoder.next_packet_id = packet_id;
+            const auto size = ss::Encode2022UdpRequestPacketTo(
+                target, payload.data(), payload.size(), encoder, {}, nullptr, 0);
+            std::vector<uint8_t> packet(size);
+            if (size == 0 || ss::Encode2022UdpRequestPacketTo(
+                    target, payload.data(), payload.size(), encoder, {},
+                    packet.data(), packet.size()) != size)
+                Fail("failed to encode protocol association packet");
+            return packet;
+        };
+        InboundDatagramAssociationIndex index;
+        InboundDatagramRequest request{
+            .tag = "protocol-association", .payload = {}, .associations = &index,
+            .configuration = &configuration, .worker_id = 0, .client_endpoint = first};
+        auto initial = encode(0);
+        request.payload = initial;
+        auto decoded = handler.Process(request);
+        if (!decoded || !decoded->association_policy || decoded->committed_association ||
+            !decoded->session_id || !decoded->packet_id)
+            Fail("authenticated first packet did not request cold association resolution");
+        auto association = decoded->association_policy->create();
+        if (!association->Check(*decoded->packet_id, 0, first, InboundDatagramCheck::Commit))
+            Fail("failed to commit authenticated first packet");
+        index.emplace(InboundDatagramAssociationKey{
+            decoded->session_owner, *decoded->session_id, &configuration}, association.get());
+        association->claimed.store(false, std::memory_order_release);
+        if (handler.Process(request)) Fail("local protocol reopened the cold replay window");
+
+        auto newer = encode(2);
+        request.payload = newer;
+        auto accepted = handler.Process(request);
+        if (!accepted || accepted->committed_association != association.get() ||
+            !accepted->target.SameEndpoint(target) || accepted->payload.byte_size() != payload.size())
+            Fail("normal protocol entry did not commit local authenticated payload");
+        if (handler.Process(request)) Fail("normal protocol entry accepted a local replay");
+        auto reordered = encode(1);
+        request.payload = reordered;
+        request.client_endpoint = second;
+        if (handler.Process(request)) Fail("old path packet stole the local response endpoint");
+        request.client_endpoint = first;
+        if (!handler.Process(request)) Fail("current path reordering was not accepted");
+
+        auto claimed = encode(3);
+        request.payload = claimed;
+        association->claimed.store(true, std::memory_order_release);
+        auto pending = handler.Process(request);
+        if (!pending || pending->committed_association ||
+            !association->Check(3, 0, first, InboundDatagramCheck::Commit))
+            Fail("claimed local state was mutated before exclusive control commit");
+        association->claimed.store(false, std::memory_order_release);
+        if (handler.Process(request)) Fail("control commit did not reach the local replay authority");
+
+        auto scoped = encode(4);
+        request.payload = scoped;
+        request.configuration = &other_configuration;
+        auto other = handler.Process(request);
+        if (!other || other->committed_association)
+            Fail("local protocol state crossed configuration namespaces");
+        request.configuration = &configuration;
+        scoped.back() ^= 1;
+        if (handler.Process(request)) Fail("invalid ciphertext reached local association commit");
+        scoped.back() ^= 1;
+        if (!handler.Process(request)) Fail("invalid ciphertext poisoned local replay state");
+    }
+    UserStore::InstallWorkerView(std::move(previous_view));
+}
+
 void VerifyHandoffDirectoryNamespaces() {
     using namespace acpp::worker_detail;
     acpp::net::io_context coordinator;
     auto& directory = acpp::net::use_service<UdpHandoffDirectory>(coordinator);
+    const auto& policy = acpp::ss::Ss2022UdpAssociation::Policy();
     auto configuration = std::make_shared<int>(1);
     auto other_configuration = std::make_shared<int>(1);
     acpp::InboundDatagramOwner owner;
@@ -586,29 +690,29 @@ void VerifyHandoffDirectoryNamespaces() {
         .listener = "listener", .tag = "inbound", .configuration = configuration.get(),
         .client = ClientSessionKey{owner, 0x00123456789abcdeULL}};
     const acpp::udp::endpoint endpoint{acpp::net::ip::address_v4::loopback(), 48234};
-    auto record = directory.Claim(key, configuration);
-    if (!record || !record->claimed.load(std::memory_order_acquire) ||
-        directory.Claim(key, configuration) || !record->Accept(7, 0, endpoint))
+    auto record = directory.Claim(key, configuration, policy);
+    if (!record || !record->association->claimed.load(std::memory_order_acquire) ||
+        directory.Claim(key, configuration, policy) || !record->association->Check(7, 0, endpoint, acpp::InboundDatagramCheck::Commit))
         Fail("directory allowed duplicate ownership claims");
-    record->claimed.store(false, std::memory_order_release);
-    auto reclaimed = directory.Claim(key, configuration);
-    if (reclaimed != record || reclaimed->Accept(7, 0, endpoint) ||
-        directory.Claim(key, configuration))
+    record->association->claimed.store(false, std::memory_order_release);
+    auto reclaimed = directory.Claim(key, configuration, policy);
+    if (reclaimed != record || reclaimed->association->Check(7, 0, endpoint, acpp::InboundDatagramCheck::Commit) ||
+        directory.Claim(key, configuration, policy))
         Fail("directory claim lost unique ownership or committed replay");
-    record->claimed.store(false, std::memory_order_release);
+    record->association->claimed.store(false, std::memory_order_release);
 
     const auto expect_isolated = [&](const UdpHandoffIdentity& identity,
                                      std::shared_ptr<const void> snapshot) {
-        auto isolated = directory.Claim(identity, snapshot);
-        if (!isolated || isolated == record || !isolated->Accept(7, 1, endpoint) ||
-            directory.Claim(identity, snapshot))
+        auto isolated = directory.Claim(identity, snapshot, policy);
+        if (!isolated || isolated == record || !isolated->association->Check(7, 1, endpoint, acpp::InboundDatagramCheck::Commit) ||
+            directory.Claim(identity, snapshot, policy))
             Fail("directory merged distinct authenticated namespaces");
-        isolated->claimed.store(false, std::memory_order_release);
-        auto repeated = directory.Claim(identity, snapshot);
-        if (repeated != isolated || repeated->Accept(7, 1, endpoint) ||
-            !repeated->Accept(6, 1, endpoint) || repeated->Accept(5, 0, endpoint))
+        isolated->association->claimed.store(false, std::memory_order_release);
+        auto repeated = directory.Claim(identity, snapshot, policy);
+        if (repeated != isolated || repeated->association->Check(7, 1, endpoint, acpp::InboundDatagramCheck::Commit) ||
+            !repeated->association->Check(6, 1, endpoint, acpp::InboundDatagramCheck::Commit) || repeated->association->Check(5, 0, endpoint, acpp::InboundDatagramCheck::Commit))
             Fail("directory failed to retain isolated namespace replay");
-        repeated->claimed.store(false, std::memory_order_release);
+        repeated->association->claimed.store(false, std::memory_order_release);
     };
     for (size_t i = 0; i < credential.size(); ++i) {
         auto distinct = key;
@@ -632,38 +736,11 @@ void VerifyHandoffDirectoryNamespaces() {
     expect_isolated(settings, other_configuration);
 }
 
-void VerifyHandoffPathFreshness() {
-    using namespace acpp::worker_detail;
-    const acpp::udp::endpoint first{acpp::net::ip::address_v4::loopback(), 48234};
-    const acpp::udp::endpoint second{acpp::net::ip::address_v4::loopback(), 48235};
-    UdpHandoffRecord record;
-    if (!record.Accept(10, 0, first) || !record.Accept(12, 0, second) ||
-        record.CanAcceptPath(11, 0, first) || record.Accept(11, 0, first) ||
-        !record.Accept(11, 0, second) || record.Accept(11, 0, second))
-        Fail("same-Worker path freshness rejected reordering or admitted a stale endpoint");
-    if (!record.Accept(14, 1, first) || record.CanAcceptPath(13, 0, second) ||
-        record.Accept(13, 0, second) || !record.Accept(13, 1, first) ||
-        record.Accept(13, 1, first))
-        Fail("cross-Worker path freshness lost single replay commit or allowed rollback");
-    // A newer packet on the current path advances the path watermark too.
-    // Receiving an older in-window packet must not lower that watermark.
-    if (!record.Accept(17, 1, first) || !record.Accept(15, 1, first) ||
-        record.CanAcceptPath(16, 1, second) || record.Accept(16, 1, second) ||
-        record.CanAcceptPath(16, 0, first) || record.Accept(16, 0, first) ||
-        !record.Accept(16, 1, first) || !record.Accept(18, 0, second) ||
-        !record.Accept(20, 2, first) || record.Accept(19, 0, second) ||
-        !record.Accept(19, 2, first))
-        Fail("repeated path changes regressed the freshness watermark");
-    UdpHandoffRecord zero;
-    if (!zero.Accept(0, 0, first) || zero.Accept(0, 1, second) ||
-        !zero.Accept(1, 1, second))
-        Fail("zero packet ID bypassed path freshness or replay protection");
-}
-
 void VerifyHandoffDirectoryTombstone(acpp::net::io_context& io, Reclaimer& reclaimer) {
     using namespace acpp::worker_detail;
     acpp::net::io_context coordinator;
     auto& directory = acpp::net::use_service<UdpHandoffDirectory>(coordinator);
+    const auto& policy = acpp::ss::Ss2022UdpAssociation::Policy();
     auto configuration = std::make_shared<int>(1);
     std::weak_ptr<const void> configuration_lifetime = configuration;
     acpp::InboundDatagramOwner owner;
@@ -680,11 +757,11 @@ void VerifyHandoffDirectoryTombstone(acpp::net::io_context& io, Reclaimer& recla
         key.listener, key.client, io, {},
         {acpp::net::ip::address_v4::loopback(), 48234},
         owner, std::chrono::steady_clock::now(), 0s);
-    auto record = directory.Claim(key, configuration);
-    if (!session || !record || !record->Accept(31, 0, endpoint))
+    auto record = directory.Claim(key, configuration, policy);
+    if (!session || !record || !record->association->Check(31, 0, endpoint, acpp::InboundDatagramCheck::Commit))
         Fail("failed to prepare live directory association");
     record->session = session;
-    record->claimed.store(false, std::memory_order_release);
+    record->association->claimed.store(false, std::memory_order_release);
     ingress.CleanupClientSessions(key.listener);
     if (!session->Closed() || record->session.expired())
         Fail("closed association did not retain its outstanding session owner");
@@ -696,12 +773,12 @@ void VerifyHandoffDirectoryTombstone(acpp::net::io_context& io, Reclaimer& recla
     configuration.reset();
     if (tombstone.expired() || configuration_lifetime.expired())
         Fail("directory discarded its replay tombstone or settings snapshot");
-    auto resumed = directory.Claim(key, configuration_lifetime.lock());
-    if (!resumed || resumed != tombstone.lock() || resumed->Accept(31, 0, endpoint) ||
-        resumed->Accept(30, 1, endpoint) || !resumed->Accept(32, 1, endpoint) ||
-        resumed->Accept(30, 0, endpoint) || !resumed->Accept(30, 1, endpoint))
+    auto resumed = directory.Claim(key, configuration_lifetime.lock(), policy);
+    if (!resumed || resumed != tombstone.lock() || resumed->association->Check(31, 0, endpoint, acpp::InboundDatagramCheck::Commit) ||
+        resumed->association->Check(30, 1, endpoint, acpp::InboundDatagramCheck::Commit) || !resumed->association->Check(32, 1, endpoint, acpp::InboundDatagramCheck::Commit) ||
+        resumed->association->Check(30, 0, endpoint, acpp::InboundDatagramCheck::Commit) || !resumed->association->Check(30, 1, endpoint, acpp::InboundDatagramCheck::Commit))
         Fail("association closure reopened a protected replay window");
-    resumed->claimed.store(false, std::memory_order_release);
+    resumed->association->claimed.store(false, std::memory_order_release);
     ingress.RequestStop();
 }
 
@@ -709,6 +786,7 @@ void VerifyHandoffDirectoryCapacity() {
     using namespace acpp::worker_detail;
     acpp::net::io_context coordinator;
     auto& directory = acpp::net::use_service<UdpHandoffDirectory>(coordinator);
+    const auto& policy = acpp::ss::Ss2022UdpAssociation::Policy();
     auto configuration = std::make_shared<int>(1);
     acpp::InboundDatagramOwner owner;
     constexpr std::array<uint8_t, 32> credential{0x63};
@@ -720,31 +798,32 @@ void VerifyHandoffDirectoryCapacity() {
     std::shared_ptr<UdpHandoffRecord> first;
     for (size_t i = 0; i < acpp::ss::Ss2022UdpReplayCache::kMaxSessions; ++i) {
         key.client.session_id = i;
-        auto record = directory.Claim(key, configuration);
-        if (!record || !record->Accept(11, 0, endpoint))
+        auto record = directory.Claim(key, configuration, policy);
+        if (!record || !record->association->Check(11, 0, endpoint, acpp::InboundDatagramCheck::Commit))
             Fail("directory rejected a session before reaching capacity");
-        record->claimed.store(false, std::memory_order_release);
+        record->association->claimed.store(false, std::memory_order_release);
         if (i == 0) first = std::move(record);
     }
     key.client.session_id = acpp::ss::Ss2022UdpReplayCache::kMaxSessions;
-    if (directory.Claim(key, configuration))
+    if (directory.Claim(key, configuration, policy))
         Fail("full directory evicted an unexpired closed-session replay tombstone");
     auto protected_key = key;
     protected_key.client.session_id = 0;
-    auto protected_record = directory.Claim(protected_key, configuration);
-    if (protected_record != first || protected_record->Accept(11, 0, endpoint))
+    auto protected_record = directory.Claim(protected_key, configuration, policy);
+    if (protected_record != first || protected_record->association->Check(11, 0, endpoint, acpp::InboundDatagramCheck::Commit))
         Fail("capacity rejection lost an existing session or its replay history");
     const auto expired = std::chrono::steady_clock::now() -
         acpp::ss::Ss2022UdpReplayCache::kRetention - 1s;
-    first->last_seen.store(expired.time_since_epoch().count(), std::memory_order_relaxed);
-    if (directory.Claim(key, configuration))
+    if (!first->association->Check(12, 0, endpoint, acpp::InboundDatagramCheck::Commit, expired))
+        Fail("failed to commit an expired protocol retention deadline");
+    if (directory.Claim(key, configuration, policy))
         Fail("directory reclaimed a still-claimed expired tombstone");
-    first->claimed.store(false, std::memory_order_release);
-    auto replacement = directory.Claim(key, configuration);
-    if (!replacement || replacement == first || !replacement->Accept(11, 0, endpoint))
+    first->association->claimed.store(false, std::memory_order_release);
+    auto replacement = directory.Claim(key, configuration, policy);
+    if (!replacement || replacement == first || !replacement->association->Check(11, 0, endpoint, acpp::InboundDatagramCheck::Commit))
         Fail("directory did not reclaim an expired unclaimed tombstone");
-    replacement->claimed.store(false, std::memory_order_release);
-    if (directory.Claim(protected_key, configuration))
+    replacement->association->claimed.store(false, std::memory_order_release);
+    if (directory.Claim(protected_key, configuration, policy))
         Fail("directory exceeded capacity after reclaiming one expired tombstone");
 }
 
@@ -804,7 +883,7 @@ int main() {
     auto& scheduler = acpp::TimeoutScheduler::ForIoContext(io);
     Reclaimer reclaimer(scheduler, nullptr, [](void*, std::exception_ptr) { std::terminate(); });
     VerifyHandoffDirectoryNamespaces();
-    VerifyHandoffPathFreshness();
+    VerifyProtocolLocalAssociation();
     VerifyHandoffDirectoryTombstone(io, reclaimer);
     VerifyHandoffDirectoryCapacity();
     acpp::worker_detail::UdpResourceBudget budget;

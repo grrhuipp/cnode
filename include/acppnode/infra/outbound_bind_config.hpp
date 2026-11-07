@@ -31,15 +31,21 @@ namespace acpp::infra {
         throw std::invalid_argument("sendThrough must be a string or an array of IPs/CIDRs");
     }
 
-    auto policy = OutboundBind::ChoicePolicy::SourceHash;
+    auto policy = OutboundBind::ChoicePolicy::Random;
     if (strategy) {
         if (!strategy->is_string()) {
-            throw std::invalid_argument("sendThroughStrategy must be hash or random");
+            throw std::invalid_argument(
+                "sendThroughStrategy must be random, ip_hash, or user_hash");
         }
         if (transport::internet::EqualsAsciiCI(strategy->as_string(), "random")) {
             policy = OutboundBind::ChoicePolicy::Random;
-        } else if (!transport::internet::EqualsAsciiCI(strategy->as_string(), "hash")) {
-            throw std::invalid_argument("sendThroughStrategy must be hash or random");
+        } else if (transport::internet::EqualsAsciiCI(strategy->as_string(), "ip_hash")) {
+            policy = OutboundBind::ChoicePolicy::IpHash;
+        } else if (transport::internet::EqualsAsciiCI(strategy->as_string(), "user_hash")) {
+            policy = OutboundBind::ChoicePolicy::UserHash;
+        } else {
+            throw std::invalid_argument(
+                "sendThroughStrategy must be random, ip_hash, or user_hash");
         }
     }
     std::vector<std::string_view> entries;
