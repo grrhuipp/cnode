@@ -31,11 +31,13 @@ static_assert(buf::Buffer::kSize > (2 + GCM_TAG_SIZE) + GCM_TAG_SIZE + kMaxPaddi
 }  // namespace
 
 BodyKey ResponseBodyKey(const BodyKey& request) {
-    const auto key_hash = SHA256Hash(request.key.data(), request.key.size());
-    const auto iv_hash = SHA256Hash(request.iv.data(), request.iv.size());
+    auto key_hash = SHA256Hash(request.key.data(), request.key.size());
+    auto iv_hash = SHA256Hash(request.iv.data(), request.iv.size());
     BodyKey response;
     std::memcpy(response.key.data(), key_hash.data(), response.key.size());
     std::memcpy(response.iv.data(), iv_hash.data(), response.iv.size());
+    OPENSSL_cleanse(key_hash.data(), key_hash.size());
+    OPENSSL_cleanse(iv_hash.data(), iv_hash.size());
     return response;
 }
 
@@ -53,8 +55,9 @@ BodyChunkCipher::BodyChunkCipher(const BodyOptions& options,
         (options.security == Security::AES_128_GCM ||
          options.security == Security::CHACHA20_POLY1305)) {
         const std::array<std::string_view, 1> path{"auth_len"};
-        const auto length_key = KDF16(request_body.key.data(), request_body.key.size(), path);
+        auto length_key = KDF16(request_body.key.data(), request_body.key.size(), path);
         length_.emplace(options.security, length_key.data(), request_body.iv.data(), direction);
+        OPENSSL_cleanse(length_key.data(), length_key.size());
     }
     if ((options.options & Option::CHUNK_MASKING) != 0) {
         mask_.emplace(direction_key.iv.data());

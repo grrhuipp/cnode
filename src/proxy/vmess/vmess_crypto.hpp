@@ -11,7 +11,7 @@
 #include "acppnode/common.hpp"
 #include "acppnode/common/allocator.hpp"
 #include <openssl/aes.h>
-
+#include <openssl/crypto.h>
 #include <array>
 #include <span>
 #include <string_view>
@@ -43,6 +43,10 @@ std::array<uint8_t, 16> KDF16(const uint8_t* key, size_t key_len,
 struct HeaderAeadKey {
     std::array<uint8_t, 16> key{};
     std::array<uint8_t, 12> nonce{};
+    ~HeaderAeadKey() noexcept {
+        OPENSSL_cleanse(key.data(), key.size());
+        OPENSSL_cleanse(nonce.data(), nonce.size());
+    }
 };
 
 // 请求头：由 cmd_key、AuthID 与 8 字节连接 nonce 派生

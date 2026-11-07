@@ -40,8 +40,8 @@ VMessCipher::VMessCipher(Security security, const uint8_t* key, const uint8_t* i
         algorithm = EVP_chacha20_poly1305();
     }
     const bool ok = direction == proxy::AeadDirection::Encrypt
-        ? encryptor_.Configure(algorithm, actual_key)
-        : decryptor_.Configure(algorithm, actual_key);
+        ? cipher_.emplace<proxy::AeadEncryptor>().Configure(algorithm, actual_key)
+        : cipher_.emplace<proxy::AeadDecryptor>().Configure(algorithm, actual_key);
     OPENSSL_cleanse(expanded.data(), expanded.size());
     if (!ok) {
         throw std::runtime_error("VMess AEAD initialization failed");
@@ -56,8 +56,10 @@ ssize_t VMessCipher::Encrypt(const uint8_t* plaintext, size_t len, uint8_t* ciph
 
     std::array<uint8_t, 12> nonce{};
     BuildNonce(count_++, nonce.data());
-    const auto result = encryptor_.Process(nonce, {plaintext, len}, {},
-                                           {ciphertext, len + GCM_TAG_SIZE});
+    auto* enc = std::get_if<proxy::AeadEncryptor>(&cipher_);
+    if (!enc) return -1;
+    const auto result = enc->Process(nonce, {plaintext, len}, {},
+                                     {ciphertext, len + GCM_TAG_SIZE});
     return result ? static_cast<ssize_t>(*result) : -1;
 }
 
@@ -70,8 +72,10 @@ ssize_t VMessCipher::Decrypt(const uint8_t* ciphertext, size_t len, uint8_t* pla
     if (len < GCM_TAG_SIZE) return -1;
     std::array<uint8_t, 12> nonce{};
     BuildNonce(count_++, nonce.data());
-    const auto result = decryptor_.Process(nonce, {ciphertext, len}, {},
-                                           {plaintext, len - GCM_TAG_SIZE});
+    auto* dec = std::get_if<proxy::AeadDecryptor>(&cipher_);
+    if (!dec) return -1;
+    const auto result = dec->Process(nonce, {ciphertext, len}, {},
+                                     {plaintext, len - GCM_TAG_SIZE});
     return result ? static_cast<ssize_t>(*result) : -1;
 }
 

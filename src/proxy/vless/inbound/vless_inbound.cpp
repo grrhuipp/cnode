@@ -171,6 +171,13 @@ ReadVlessRequestHeader(VlessBufferedReader& active_reader,
     using ::acpp::vless::RequestHeaderDecodeStatus;
     std::array<uint8_t, ::acpp::vless::kMaxRequestHeaderSize> handshake{};
     size_t total_read = 0;
+    struct HandshakeCleanseGuard {
+        std::array<uint8_t, ::acpp::vless::kMaxRequestHeaderSize>& buf;
+        size_t& read_bytes;
+        ~HandshakeCleanseGuard() noexcept {
+            if (read_bytes > 0) OPENSSL_cleanse(buf.data(), read_bytes);
+        }
+    } cleanse_handshake{handshake, total_read};
     size_t required = 1;
     for (;;) {
         bool read_ok = false;

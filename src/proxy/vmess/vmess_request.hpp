@@ -13,6 +13,7 @@
 #include "acppnode/common/target_address.hpp"
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
 #include "types.hpp"
+#include <openssl/crypto.h>
 #include <array>
 #include <cstdint>
 #include <memory>
@@ -87,6 +88,10 @@ struct VMessRequest {
     std::optional<ForwardedMetadata> forwarded;
 
     std::shared_ptr<const proxyman::inbound::UserStore::VmessCredential> user;
+    ~VMessRequest() noexcept {
+        OPENSSL_cleanse(body_iv.data(), body_iv.size());
+        OPENSSL_cleanse(body_key.data(), body_key.size());
+    }
 };
 
 }  // namespace vmess

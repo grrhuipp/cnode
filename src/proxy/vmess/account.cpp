@@ -36,7 +36,7 @@ std::optional<MemoryAccount> MemoryAccount::FromUUID(
     std::memcpy(key_material.data() + account.uuid_bytes.size(),
                 kVmessMagic.data(), kVmessMagic.size());
     account.cmd_key = MD5Hash(key_material.data(), key_material.size());
-
+    OPENSSL_cleanse(key_material.data(), key_material.size());
     const std::array<std::string_view, 1> auth_key_path{
         KDFSalt::AUTH_ID_ENCRYPTION_KEY
     };

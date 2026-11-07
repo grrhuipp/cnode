@@ -18,6 +18,8 @@
 #include <array>
 #include <memory>
 #include <cstdint>
+#include <variant>
+#include <openssl/crypto.h>
 #include <openssl/ossl_typ.h>
 
 namespace acpp {
@@ -34,7 +36,9 @@ class VMessCipher {
 public:
     VMessCipher(Security security, const uint8_t* key, const uint8_t* iv,
                 proxy::AeadDirection direction);
-    ~VMessCipher() = default;
+    ~VMessCipher() noexcept {
+        OPENSSL_cleanse(iv_.data(), iv_.size());
+    }
 
     VMessCipher(const VMessCipher&)            = delete;
     VMessCipher& operator=(const VMessCipher&) = delete;
@@ -59,8 +63,7 @@ private:
     std::array<uint8_t, 16> iv_;
     uint16_t count_ = 0;
 
-    proxy::AeadEncryptor encryptor_;
-    proxy::AeadDecryptor decryptor_;
+    std::variant<std::monostate, proxy::AeadEncryptor, proxy::AeadDecryptor> cipher_;
 };
 
 // ============================================================================

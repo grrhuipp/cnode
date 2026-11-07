@@ -24,6 +24,10 @@ namespace acpp::vmess::encoding {
 struct BodyKey {
     std::array<uint8_t, 16> key{};
     std::array<uint8_t, 16> iv{};
+    ~BodyKey() noexcept {
+        OPENSSL_cleanse(key.data(), key.size());
+        OPENSSL_cleanse(iv.data(), iv.size());
+    }
 };
 
 // Response body key/IV: first 16 bytes of SHA-256 over the request body

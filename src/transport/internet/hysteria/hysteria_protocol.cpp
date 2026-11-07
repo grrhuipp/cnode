@@ -339,27 +339,29 @@ EncodeUdpMessage(Version version, const UdpMessage& message) {
         AppendU16(output, message.packet_id);
         output.push_back(message.fragment_id);
         output.push_back(message.fragment_count);
-        std::string authority;
+        char port_buf[5]{};
+        size_t port_len = 0;
         if (!host.empty()) {
-            if (host.find(':') != std::string_view::npos) {
-                authority.reserve(host.size() + 8);
-                authority.push_back('[');
-                authority.append(host);
-                authority.push_back(']');
-            } else {
-                authority.assign(host);
-            }
-            authority.push_back(':');
-            char port[5];
-            const auto [end, ec] = std::to_chars(port, port + sizeof(port), message.target.port);
+            const auto [end, ec] = std::to_chars(
+                port_buf, port_buf + sizeof(port_buf), message.target.port);
             if (ec != std::errc{}) return tl::unexpected(ProtocolError::Invalid);
-            authority.append(port, end);
+            port_len = static_cast<size_t>(end - port_buf);
         } else if (message.fragment_id == 0) {
             return tl::unexpected(ProtocolError::Invalid);
         }
-        if (!AppendVarint(output, authority.size()))
+        const bool bracket_v6 = !host.empty() && host.find(':') != std::string_view::npos;
+        const size_t authority_len = host.empty()
+            ? 0
+            : host.size() + (bracket_v6 ? 2 : 0) + 1 + port_len;
+        if (!AppendVarint(output, authority_len))
             return tl::unexpected(ProtocolError::TooLarge);
-        output.insert(output.end(), authority.begin(), authority.end());
+        if (!host.empty()) {
+            if (bracket_v6) output.push_back('[');
+            output.insert(output.end(), host.begin(), host.end());
+            if (bracket_v6) output.push_back(']');
+            output.push_back(':');
+            output.insert(output.end(), port_buf, port_buf + port_len);
+        }
     }
     output.insert(output.end(), message.payload.begin(), message.payload.end());
     return output;

@@ -103,7 +103,7 @@ public:
                           VlessBufferedReader& reader,
                           transport::MultiBufferWriter& writer,
                           bool is_udp,
-                          const TargetAddress& udp_target,
+                          TargetAddress udp_target,
                           bool packet_addr,
                           bool vision,
                           std::array<uint8_t, 16> user_uuid)
@@ -111,7 +111,7 @@ public:
         , reader_(reader)
         , writer_(writer)
         , is_udp_(is_udp)
-        , udp_target_(udp_target)
+        , udp_target_(std::move(udp_target))
         , packet_addr_(packet_addr) {
         if (is_udp_) {
             io_state_.emplace<UdpIoState>(packet_addr);
@@ -174,7 +174,7 @@ private:
     transport::MultiBufferWriter& writer_;
     VlessResponseHeaderState response_header_;
     bool is_udp_ = false;
-    const TargetAddress& udp_target_;
+    TargetAddress udp_target_;
     bool packet_addr_ = false;
     std::variant<std::monostate, VisionIoState, UdpIoState> io_state_;
 };
@@ -185,12 +185,12 @@ public:
     VlessMuxUdpEndpoint(AsyncStream& control,
                         VlessBufferedReader& reader,
                         transport::MultiBufferWriter& writer,
-                        const TargetAddress& udp_target,
+                        TargetAddress udp_target,
                         ForwardedMetadataView forwarded)
         : OutboundStreamEndpointBase(control)
         , reader_(reader)
         , writer_(writer)
-        , udp_target_(udp_target) {
+        , udp_target_(std::move(udp_target)) {
         if (!forwarded.Empty()) {
             auto& owned = forwarded_.emplace();
             owned.user_id = forwarded.user_id;
@@ -359,7 +359,7 @@ private:
 
     VlessBufferedReader& reader_;
     transport::MultiBufferWriter& writer_;
-    const TargetAddress& udp_target_;
+    TargetAddress udp_target_;
     std::optional<ForwardedMetadata> forwarded_;
     VlessResponseHeaderState response_header_;
     bool session_started_ = false;
@@ -464,7 +464,8 @@ proxy::vless::outbound::Handler::Handler(
     , encryption_tickets_(config_->encryption
           ? std::make_shared<::acpp::vless::VlessEncryptionClientTicketCache>()
           : nullptr)
-    , ticket_domain_(ExecutionDomain::Current()) {}
+    , ticket_domain_(ExecutionDomain::Current())
+    , has_ticket_domain_(static_cast<bool>(ExecutionDomain::Current())) {}
 
 proxy::vless::outbound::Handler::~Handler() = default;
 
@@ -510,12 +511,13 @@ proxy::vless::outbound::Handler::Process(
     struct TicketLease {
         std::shared_ptr<::acpp::vless::VlessEncryptionClientTicketCache> cache{};
         std::shared_ptr<ExecutionDomain> domain{};
+        bool has_domain = false;
         ::acpp::vless::VlessEncryptionClientTicketCache local{};
         std::array<uint8_t, ::acpp::vless::kVlessEncryptionTicketSize> identity{};
         std::chrono::steady_clock::time_point original_expiry{};
 
         net::awaitable<void> Acquire() {
-            if (!cache) co_return;
+            if (!cache || (has_domain && !domain)) co_return;
             auto read = [&]() -> net::awaitable<::acpp::vless::VlessEncryptionClientTicketCache> {
                 co_return *cache;
             };
@@ -527,7 +529,8 @@ proxy::vless::outbound::Handler::Process(
             original_expiry = local.expires_at;
         }
         net::awaitable<void> Publish() {
-            if (!cache || (local.ticket == identity && local.expires_at == original_expiry))
+            if (!cache || (has_domain && !domain) ||
+                (local.ticket == identity && local.expires_at == original_expiry))
                 co_return;
             auto publish = [&]() -> net::awaitable<void> {
                 if (cache->ticket == identity) *cache = local;
@@ -542,7 +545,8 @@ proxy::vless::outbound::Handler::Process(
             identity = local.ticket;
         }
         ~TicketLease() {
-            if (!cache || local.expires_at != std::chrono::steady_clock::time_point{}) return;
+            if (!cache || (has_domain && !domain) ||
+                local.expires_at != std::chrono::steady_clock::time_point{}) return;
             auto invalidate = [cache = std::move(cache), identity = identity] {
                 if (cache->ticket == identity) cache->Clear();
             };
@@ -552,6 +556,7 @@ proxy::vless::outbound::Handler::Process(
     } tickets{
         .cache = encryption_tickets_,
         .domain = ticket_domain_.lock(),
+        .has_domain = has_ticket_domain_,
         .local = {},
         .identity = {},
         .original_expiry = {},

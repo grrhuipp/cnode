@@ -36,12 +36,11 @@ public:
     VMessOutboundEndpoint(vmess::encoding::ClientSession& session,
                           AsyncStream& stream,
                           bool is_udp,
-                          const TargetAddress& udp_target)
+                          TargetAddress udp_target)
         : OutboundStreamEndpointBase(stream)
         , session_(session)
         , is_udp_(is_udp)
-        , udp_target_(udp_target) {}
-
+        , udp_target_(std::move(udp_target)) {}
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
         auto mb = co_await session_.DecodeResponse(stream_);
         if (is_udp_) {
@@ -76,7 +75,7 @@ public:
 private:
     vmess::encoding::ClientSession& session_;
     bool is_udp_ = false;
-    const TargetAddress& udp_target_;
+    TargetAddress udp_target_;
 };
 
 net::awaitable<tl::expected<void, ErrorCode>>

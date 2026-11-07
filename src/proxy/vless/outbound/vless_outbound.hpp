@@ -50,6 +50,7 @@ private:
     std::shared_ptr<const ::acpp::VlessOutboundConfig> config_;
     std::shared_ptr<::acpp::vless::VlessEncryptionClientTicketCache> encryption_tickets_;
     std::weak_ptr<ExecutionDomain> ticket_domain_;
+    bool has_ticket_domain_ = false;
 };
 
 }  // namespace proxy::vless::outbound

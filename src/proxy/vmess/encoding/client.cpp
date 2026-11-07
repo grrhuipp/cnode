@@ -159,6 +159,8 @@ net::awaitable<VMessHandshakeResult> ClientSession::EncodeRequestHeader(AsyncStr
         *user_, *auth_id_key_, *target_, security_, command_, keys_.request,
         keys_.response_header, forwarded_, packet);
     forwarded_ = {};
+    OPENSSL_cleanse(keys_.request.key.data(), keys_.request.key.size());
+    OPENSSL_cleanse(keys_.request.iv.data(), keys_.request.iv.size());
     if (!built) {
         co_return tl::unexpected(built.error());
     }
@@ -267,6 +269,8 @@ net::awaitable<void> ClientSession::DecodeResponseHeader(AsyncStream& stream) {
             fail();
         }
         response_header_received_ = true;
+        OPENSSL_cleanse(keys_.response.key.data(), keys_.response.key.size());
+        OPENSSL_cleanse(keys_.response.iv.data(), keys_.response.iv.size());
         reset_header_state();
     } catch (const IoSystemError& error) {
         if (error.code() != io_error::operation_aborted) {

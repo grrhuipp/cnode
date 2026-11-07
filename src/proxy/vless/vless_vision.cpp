@@ -138,7 +138,7 @@ private:
 void AppendVisionFrameBuffers(
     VisionHeaderArena& header_owner,
     VisionFrameBufferBuilder& out,
-    std::span<const uint8_t, 16> user_uuid,
+    std::span<uint8_t, 16> user_uuid,
     bool& send_uuid,
     std::span<const uint8_t> content,
     uint8_t command,
@@ -152,6 +152,7 @@ void AppendVisionFrameBuffers(
     size_t pos = 0;
     if (send_uuid) {
         std::memcpy(tail, user_uuid.data(), user_uuid.size());
+        OPENSSL_cleanse(user_uuid.data(), user_uuid.size());
         pos += user_uuid.size();
         send_uuid = false;
     }
@@ -176,7 +177,7 @@ void AppendVisionFrameBuffers(
 void AppendVisionFramed(
     VisionHeaderArena& header_owner,
     VisionFrameBufferBuilder& out,
-    std::span<const uint8_t, 16> user_uuid,
+    std::span<uint8_t, 16> user_uuid,
     bool& send_uuid,
     bool& write_process,
     const VisionTrafficState& traffic,
@@ -237,7 +238,7 @@ void AppendVisionFramed(
 template <typename BufferRange>
 net::awaitable<void> WriteVisionFramed(
     transport::MultiBufferWriter& dst,
-    std::span<const uint8_t, 16> user_uuid,
+    std::span<uint8_t, 16> user_uuid,
     bool& send_uuid,
     bool& write_process,
     VisionTrafficState& traffic,
@@ -344,9 +345,12 @@ void VisionReader::Decode(buf::MultiBuffer& out) {
         const uint8_t* fields = header_.data();
         if (expect_uuid_) {
             if (CRYPTO_memcmp(fields, user_uuid_.data(), user_uuid_.size()) != 0) {
+                OPENSSL_cleanse(user_uuid_.data(), user_uuid_.size());
+                OPENSSL_cleanse(header_.data(), user_uuid_.size());
                 throw IoSystemError(io_error::connection_reset, "VLESS Vision UUID mismatch");
             }
             fields += user_uuid_.size();
+            OPENSSL_cleanse(user_uuid_.data(), user_uuid_.size());
             expect_uuid_ = false;
         }
         command_ = fields[0];
