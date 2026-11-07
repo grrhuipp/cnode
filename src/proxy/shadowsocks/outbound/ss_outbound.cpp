@@ -70,7 +70,7 @@ public:
                 io_error::not_connected,
                 "Shadowsocks request writer is not initialized");
         }
-        co_await request_writer_->WriteMultiBuffer(std::move(mb));
+        return request_writer_->WriteMultiBuffer(std::move(mb));
     }
 
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
@@ -79,7 +79,7 @@ public:
                 io_error::not_connected,
                 "Shadowsocks request writer is not initialized");
         }
-        co_await request_writer_->WriteBuffers(buffers);
+        return request_writer_->WriteBuffers(buffers);
     }
 
     net::awaitable<void> AsyncShutdownWrite() override {
@@ -88,7 +88,7 @@ public:
                 io_error::not_connected,
                 "Shadowsocks request writer is not initialized");
         }
-        co_await request_writer_->AsyncShutdownWrite();
+        return request_writer_->AsyncShutdownWrite();
     }
 
     operator AsyncStream&() noexcept {

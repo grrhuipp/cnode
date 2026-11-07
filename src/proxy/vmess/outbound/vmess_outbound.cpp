@@ -53,15 +53,15 @@ public:
         if (is_udp_) {
             ::acpp::vmess::ValidateFixedUdpDatagram(mb, udp_target_);
         }
-        co_await session_.EncodeRequestBody(stream_, std::move(mb));
+        return session_.EncodeRequestBody(stream_, std::move(mb));
     }
 
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
-        co_await session_.EncodeRequestBody(stream_, buffers);
+        return session_.EncodeRequestBody(stream_, buffers);
     }
 
     net::awaitable<void> AsyncShutdownWrite() override {
-        co_await session_.EncodeRequestBodyEOF(stream_);
+        return session_.EncodeRequestBodyEOF(stream_);
     }
 
     bool WriteShutdownClosesLink() const noexcept override {

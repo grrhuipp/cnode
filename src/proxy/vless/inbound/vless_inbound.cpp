@@ -490,7 +490,10 @@ proxy::vless::inbound::Handler::Process(
         net = handshake->net;
         packet_addr_udp = handshake->packet_addr_udp;
         use_vision = handshake->use_vision;
-        request_uuid = handshake->request_uuid;
+        if (use_vision) {
+            request_uuid = handshake->request_uuid;
+        }
+        OPENSSL_cleanse(handshake->request_uuid.data(), handshake->request_uuid.size());
     }
     VlessResponseHeaderWriter response_writer(*active_writer);
     active_writer = &response_writer;
@@ -531,6 +534,7 @@ proxy::vless::inbound::Handler::Process(
             request_uuid,
             traffic);
         ::acpp::vless::VisionWriter vision_writer(*active_writer, request_uuid, traffic);
+        OPENSSL_cleanse(request_uuid.data(), request_uuid.size());
         co_return co_await dispatcher.Dispatch(
             io_context,
             receiver.dispatch_policy,

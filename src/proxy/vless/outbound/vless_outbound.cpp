@@ -118,6 +118,7 @@ public:
         } else if (vision) {
             io_state_.emplace<VisionIoState>(reader_, writer_, user_uuid);
         }
+        OPENSSL_cleanse(user_uuid.data(), user_uuid.size());
     }
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
@@ -135,14 +136,12 @@ public:
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
         if (!is_udp_) {
             if (auto* vision_io = std::get_if<VisionIoState>(&io_state_)) {
-                co_await vision_io->writer.WriteMultiBuffer(std::move(mb));
-                co_return;
+                return vision_io->writer.WriteMultiBuffer(std::move(mb));
             }
-            co_await writer_.WriteMultiBuffer(std::move(mb));
-            co_return;
+            return writer_.WriteMultiBuffer(std::move(mb));
         }
 
-        co_await ::acpp::vless::WriteUdpDatagram(
+        return ::acpp::vless::WriteUdpDatagram(
             writer_, std::move(mb), packet_addr_,
             packet_addr_ ? nullptr : &udp_target_);
     }
@@ -150,19 +149,17 @@ public:
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
         if (!is_udp_) {
             if (auto* vision_io = std::get_if<VisionIoState>(&io_state_)) {
-                co_await vision_io->writer.WriteBuffers(buffers);
-                co_return;
+                return vision_io->writer.WriteBuffers(buffers);
             }
-            co_await writer_.WriteBuffers(buffers);
-            co_return;
+            return writer_.WriteBuffers(buffers);
         }
 
-        co_await ::acpp::vless::WriteUdpDatagram(
+        return ::acpp::vless::WriteUdpDatagram(
             writer_, udp_target_, packet_addr_, buffers);
     }
 
     net::awaitable<void> AsyncShutdownWrite() override {
-        co_await writer_.AsyncShutdownWrite();
+        return writer_.AsyncShutdownWrite();
     }
 
     transport::EofAction ReadEofAction() const noexcept override {

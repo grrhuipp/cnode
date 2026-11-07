@@ -519,6 +519,10 @@ ReadTCPResponse(const SsCipherInfo& cipher_info,
             }
 
             std::array<uint8_t, kFixedPlainMaxSize> fixed_plain{};
+            struct CleanseFixedPlain {
+                std::array<uint8_t, kFixedPlainMaxSize>& buf;
+                ~CleanseFixedPlain() noexcept { OPENSSL_cleanse(buf.data(), buf.size()); }
+            } cleanse_fixed_plain{fixed_plain};
             auto nonce0 = MakeNonce(0);
             if (!read_cipher.Decrypt(nonce0.data(), fixed_cipher.data(), fixed_cipher_size,
                                      fixed_plain.data())) {
