@@ -7,6 +7,7 @@
 #include "acppnode/common/user_profile.hpp"
 
 #include <algorithm>
+#include <openssl/crypto.h>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -35,6 +36,15 @@ public:
 struct InboundDatagramOwner {
     static constexpr size_t kMaxBytes = 32;
 
+    InboundDatagramOwner() = default;
+    InboundDatagramOwner(const InboundDatagramOwner&) = default;
+    InboundDatagramOwner& operator=(const InboundDatagramOwner&) = default;
+    InboundDatagramOwner(InboundDatagramOwner&&) noexcept = default;
+    InboundDatagramOwner& operator=(InboundDatagramOwner&&) noexcept = default;
+    ~InboundDatagramOwner() noexcept {
+        OPENSSL_cleanse(bytes.data(), bytes.size());
+    }
+
     [[nodiscard]] bool Assign(std::span<const uint8_t> value) noexcept {
         if (value.empty() || value.size() > bytes.size()) {
             size = 0;
@@ -47,9 +57,8 @@ struct InboundDatagramOwner {
 
     [[nodiscard]] bool Same(const InboundDatagramOwner& other) const noexcept {
         return size == other.size &&
-            std::equal(bytes.begin(), bytes.begin() + size, other.bytes.begin());
+            CRYPTO_memcmp(bytes.data(), other.bytes.data(), size) == 0;
     }
-
 
     std::array<uint8_t, kMaxBytes> bytes{};
     uint8_t size = 0;

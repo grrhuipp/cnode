@@ -335,12 +335,80 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
     return XChaCha20Poly1305Crypt(false, key, nonce, ciphertext, output);
 }
 
+struct PlaintextScratch {
+    buf::BufferGuard pooled;
+    memory::ByteVector large;
+    size_t len = 0;
+
+    ~PlaintextScratch() noexcept {
+        if (pooled) {
+            OPENSSL_cleanse(pooled->Tail().data(), len);
+        }
+        if (!large.empty()) {
+            OPENSSL_cleanse(large.data(), large.size());
+        }
+    }
+
+    [[nodiscard]] uint8_t* Prepare(size_t size) {
+        len = size;
+        if (size <= buf::Buffer::kSize) {
+            if (!pooled) {
+                pooled = buf::BufferGuard{buf::Buffer::New()};
+                if (!pooled) {
+                    return nullptr;
+                }
+            } else {
+                pooled->Reset();
+            }
+            return pooled->Tail().data();
+        }
+        pooled.reset();
+        large.resize(size);
+        return large.data();
+    }
+
+    [[nodiscard]] std::span<const uint8_t> Span() const noexcept {
+        if (pooled) {
+            return {pooled->Tail().data(), len};
+        }
+        return {large.data(), len};
+    }
+
+    [[nodiscard]] bool MoveSuffixTo(size_t offset, buf::MultiBuffer& out) {
+        if (offset > len) {
+            return false;
+        }
+        const size_t payload_len = len - offset;
+        if (pooled) {
+            if (offset != 0) {
+                OPENSSL_cleanse(pooled->Tail().data(), offset);
+            }
+            if (payload_len == 0) {
+                len = 0;
+                return true;
+            }
+            pooled->Produce(static_cast<uint32_t>(len));
+            pooled->Advance(static_cast<uint32_t>(offset));
+            try {
+                out.push_back(std::move(pooled));
+                len = 0;
+                return true;
+            } catch (...) {
+                return false;
+            }
+        }
+        return buf::AppendSpanToMultiBuffer(
+            std::span<const uint8_t>(large.data() + offset, payload_len), out);
+    }
+};
+
 [[nodiscard]] std::optional<SsUdpDecodeResult> Make2022DecodeResult(
     size_t user_index,
     std::span<const uint8_t, 8> client_session_id,
     std::span<const uint8_t> authenticated_key,
     uint64_t packet_id,
-    Parsed2022Body parsed) {
+    Parsed2022Body parsed,
+    PlaintextScratch& scratch) {
 
     SsUdpDecodeResult result;
     result.target = std::move(parsed.target);
@@ -353,7 +421,9 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
         return std::nullopt;
     }
     result.user_index = user_index;
-    if (!buf::AppendSpanToMultiBuffer(parsed.payload, result.payload)) {
+    const auto full = scratch.Span();
+    const size_t payload_offset = static_cast<size_t>(parsed.payload.data() - full.data());
+    if (!scratch.MoveSuffixTo(payload_offset, result.payload)) {
         return std::nullopt;
     }
     return result;
@@ -381,7 +451,15 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
     std::span<const uint8_t> previous_identity_key;
     std::array<uint8_t, 16> previous_separate{};
     std::array<uint8_t, 16> previous_identity{};
-    memory::ByteVector plaintext;
+    struct CleansePreviousIdentity {
+        std::array<uint8_t, 16>& sep;
+        std::array<uint8_t, 16>& id;
+        ~CleansePreviousIdentity() noexcept {
+            OPENSSL_cleanse(sep.data(), sep.size());
+            OPENSSL_cleanse(id.data(), id.size());
+        }
+    } cleanse_prev{previous_separate, previous_identity};
+    PlaintextScratch scratch;
     for (size_t i = 0; i < users.size(); ++i) {
         const auto& user = users[i];
         const bool has_identity = !user.identity_key.empty();
@@ -437,7 +515,10 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
         if (ciphertext_len < SsAeadCipher::kTagSize) {
             continue;
         }
-        plaintext.resize(ciphertext_len - SsAeadCipher::kTagSize);
+        uint8_t* plain_dst = scratch.Prepare(ciphertext_len - SsAeadCipher::kTagSize);
+        if (!plain_dst) {
+            return std::nullopt;
+        }
         std::array<uint8_t, 32> subkey{};
         if (!Derive2022Subkey(user.derived_key.data(), user.derived_key.size,
                               separate.data(), kSs2022UdpSessionIdSize,
@@ -452,14 +533,14 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
             std::span<const uint8_t>(subkey.data(), cipher_info.key_size),
             nonce,
             std::span<const uint8_t>(datagram + body_offset, ciphertext_len),
-            plaintext.data());
+            plain_dst);
         OPENSSL_cleanse(subkey.data(), subkey.size());
         if (!decrypted) {
             continue;
         }
         std::array<uint8_t, 8> client_session_id{};
         std::memcpy(client_session_id.data(), separate.data(), client_session_id.size());
-        auto parsed = Parse2022ClientBodyPlaintext(plaintext, client_session_id);
+        auto parsed = Parse2022ClientBodyPlaintext(scratch.Span(), client_session_id);
         if (!parsed) {
             return std::nullopt;
         }
@@ -470,7 +551,7 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
             return std::nullopt;
         }
         return Make2022DecodeResult(
-            i, client_session_id, user.derived_key.span(), packet_id, std::move(*parsed));
+            i, client_session_id, user.derived_key.span(), packet_id, std::move(*parsed), scratch);
     }
 
     return std::nullopt;
@@ -494,7 +575,11 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
     const uint8_t* ciphertext = datagram + nonce.size();
     const size_t ciphertext_len = datagram_len - nonce.size();
 
-    memory::ByteVector plaintext(ciphertext_len - SsAeadCipher::kTagSize);
+    PlaintextScratch scratch;
+    uint8_t* plain_dst = scratch.Prepare(ciphertext_len - SsAeadCipher::kTagSize);
+    if (!plain_dst) {
+        return std::nullopt;
+    }
     for (size_t i = 0; i < users.size(); ++i) {
         const auto& user = users[i];
         if (user.derived_key.size != 32) {
@@ -503,15 +588,16 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
         if (!XChaCha20Poly1305Decrypt(
                 user.derived_key.span(), nonce,
                 std::span<const uint8_t>(ciphertext, ciphertext_len),
-                plaintext.data())) {
+                plain_dst)) {
             continue;
         }
 
+        const auto plaintext = scratch.Span();
         std::array<uint8_t, 8> client_session_id{};
         std::memcpy(client_session_id.data(), plaintext.data(), client_session_id.size());
         const uint64_t packet_id = LoadU64BE(
             plaintext.data() + kSs2022UdpSessionIdSize);
-        const auto body = std::span<const uint8_t>(plaintext).subspan(
+        const auto body = plaintext.subspan(
             kSs2022UdpSessionIdSize + kSs2022UdpPacketIdSize);
         auto parsed = Parse2022ClientBodyPlaintext(body, client_session_id);
         if (!parsed) {
@@ -522,7 +608,7 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
             return std::nullopt;
         }
         return Make2022DecodeResult(
-            i, client_session_id, user.derived_key.span(), packet_id, std::move(*parsed));
+            i, client_session_id, user.derived_key.span(), packet_id, std::move(*parsed), scratch);
     }
 
     return std::nullopt;
@@ -950,7 +1036,11 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacket(
     const uint8_t* cipher = datagram + salt_size;
     const size_t cipherlen = datagram_len - salt_size;
     const size_t plaintext_len = cipherlen - SsAeadCipher::kTagSize;
-    memory::ByteVector plaintext(plaintext_len);
+    PlaintextScratch scratch;
+    uint8_t* plain_dst = scratch.Prepare(plaintext_len);
+    if (!plain_dst) {
+        return std::nullopt;
+    }
 
     for (size_t i = 0; i < users.size(); ++i) {
         const auto& user = users[i];
@@ -968,13 +1058,13 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacket(
             std::span<const uint8_t>(subkey.data(), key_size),
             kZeroNonce,
             std::span<const uint8_t>(cipher, cipherlen),
-            plaintext.data());
+            plain_dst);
         OPENSSL_cleanse(subkey.data(), subkey.size());
         if (!decrypted) {
             continue;
         }
         auto addr = DecodeAddress(
-            std::span<const uint8_t>(plaintext.data(), plaintext_len),
+            scratch.Span(),
             AddressWireFormat::Socks5,
             {.max_domain_len = 255, .require_non_empty_domain = true, .allow_metadata = true});
         if (addr.status != AddressDecodeStatus::Complete || !addr.target.IsValid()) {
@@ -987,12 +1077,7 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacket(
         result.user_index = i;
 
         const size_t payload_offset = std::min(addr.consumed, plaintext_len);
-        const size_t payload_size = plaintext_len - payload_offset;
-        if (!buf::AppendSpanToMultiBuffer(
-                std::span<const uint8_t>(
-                    plaintext.data() + payload_offset,
-                    payload_size),
-                result.payload)) {
+        if (!scratch.MoveSuffixTo(payload_offset, result.payload)) {
             return std::nullopt;
         }
 
@@ -1060,20 +1145,25 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacketWithKey(
         return std::nullopt;
     }
 
-    memory::ByteVector plaintext(plaintext_len);
+    PlaintextScratch scratch;
+    uint8_t* plain_dst = scratch.Prepare(plaintext_len);
+    if (!plain_dst) {
+        OPENSSL_cleanse(subkey.data(), subkey.size());
+        return std::nullopt;
+    }
     const bool decrypted = AeadDecrypt(
         cipher_type,
         std::span<const uint8_t>(subkey.data(), key_size),
         kZeroNonce,
         std::span<const uint8_t>(cipher, cipherlen),
-        plaintext.data());
+        plain_dst);
     OPENSSL_cleanse(subkey.data(), subkey.size());
     if (!decrypted) {
         return std::nullopt;
     }
 
     auto addr = DecodeAddress(
-        std::span<const uint8_t>(plaintext.data(), plaintext_len),
+        scratch.Span(),
         AddressWireFormat::Socks5,
         {.max_domain_len = 255, .require_non_empty_domain = true, .allow_metadata = false});
     if (addr.status != AddressDecodeStatus::Complete || !addr.target.IsValid()) {
@@ -1084,11 +1174,7 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacketWithKey(
     result.target = std::move(addr.target);
 
     const size_t payload_offset = std::min(addr.consumed, plaintext_len);
-    if (!buf::AppendSpanToMultiBuffer(
-            std::span<const uint8_t>(
-                plaintext.data() + payload_offset,
-                plaintext_len - payload_offset),
-            result.payload)) {
+    if (!scratch.MoveSuffixTo(payload_offset, result.payload)) {
         return std::nullopt;
     }
     return result;
@@ -1161,7 +1247,7 @@ std::optional<SsUdpDecodeResult> Decode2022UdpResponsePacket(
         return std::nullopt;
     }
 
-    memory::ByteVector plaintext;
+    PlaintextScratch scratch;
     std::span<const uint8_t> body_span;
     std::array<uint8_t, kSs2022UdpSessionIdSize> server_session_id{};
     uint64_t packet_id = 0;
@@ -1182,7 +1268,10 @@ std::optional<SsUdpDecodeResult> Decode2022UdpResponsePacket(
         packet_id = LoadU64BE(separate.data() + kSs2022UdpSessionIdSize);
         const size_t body_offset = kSs2022UdpSeparateHeaderSize;
         const size_t ciphertext_len = datagram_len - body_offset;
-        plaintext.resize(ciphertext_len - SsAeadCipher::kTagSize);
+        uint8_t* plain_dst = scratch.Prepare(ciphertext_len - SsAeadCipher::kTagSize);
+        if (!plain_dst) {
+            return std::nullopt;
+        }
 
         std::array<uint8_t, 32> subkey{};
         if (!Derive2022Subkey(state.key.data(), state.key.size,
@@ -1198,12 +1287,12 @@ std::optional<SsUdpDecodeResult> Decode2022UdpResponsePacket(
             std::span<const uint8_t>(subkey.data(), state.cipher_info.key_size),
             nonce,
             std::span<const uint8_t>(datagram + body_offset, ciphertext_len),
-            plaintext.data());
+            plain_dst);
         OPENSSL_cleanse(subkey.data(), subkey.size());
         if (!decrypted) {
             return std::nullopt;
         }
-        body_span = plaintext;
+        body_span = scratch.Span();
     } else if (state.cipher_info.type == SsCipherType::CHACHA20_POLY1305_2022) {
         constexpr size_t kMinPlain =
             kSs2022UdpSessionIdSize + kSs2022UdpPacketIdSize + 1 + 8 + 8 + 2 + 1 + 4 + 2;
@@ -1214,18 +1303,22 @@ std::optional<SsUdpDecodeResult> Decode2022UdpResponsePacket(
         std::memcpy(nonce.data(), datagram, nonce.size());
         const uint8_t* ciphertext = datagram + nonce.size();
         const size_t ciphertext_len = datagram_len - nonce.size();
-        plaintext.resize(ciphertext_len - SsAeadCipher::kTagSize);
+        uint8_t* plain_dst = scratch.Prepare(ciphertext_len - SsAeadCipher::kTagSize);
+        if (!plain_dst) {
+            return std::nullopt;
+        }
         if (!XChaCha20Poly1305Decrypt(
                 state.key.span(), nonce,
                 std::span<const uint8_t>(ciphertext, ciphertext_len),
-                plaintext.data())) {
+                plain_dst)) {
             return std::nullopt;
         }
+        const auto plaintext = scratch.Span();
         std::memcpy(
             server_session_id.data(), plaintext.data(), server_session_id.size());
         packet_id = LoadU64BE(
             plaintext.data() + kSs2022UdpSessionIdSize);
-        body_span = std::span<const uint8_t>(plaintext).subspan(
+        body_span = plaintext.subspan(
             kSs2022UdpSessionIdSize + kSs2022UdpPacketIdSize);
     } else {
         return std::nullopt;
@@ -1241,7 +1334,9 @@ std::optional<SsUdpDecodeResult> Decode2022UdpResponsePacket(
 
     SsUdpDecodeResult result;
     result.target = std::move(parsed->target);
-    if (!buf::AppendSpanToMultiBuffer(parsed->payload, result.payload)) {
+    const size_t payload_offset = static_cast<size_t>(
+        parsed->payload.data() - scratch.Span().data());
+    if (!scratch.MoveSuffixTo(payload_offset, result.payload)) {
         return std::nullopt;
     }
     return result;
