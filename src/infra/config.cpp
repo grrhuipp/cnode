@@ -49,6 +49,11 @@ namespace {
             kind, value));
     }
     domain::NormalizeDnsHostnameInPlace(value);
+    if (iputil::ParseLiteral(value).has_value()) {
+        throw std::invalid_argument(std::format(
+            "routing domain {} contains invalid DNS hostname '{}'",
+            kind, value));
+    }
     return value;
 }
 
@@ -823,9 +828,17 @@ std::shared_ptr<const XHttpDownloadSettings> ParseXHttpDownloadSettings(
         throw std::invalid_argument("xhttp download address must be a non-empty string");
     }
     std::string address(address_val->as_string());
-    if (!iputil::ParseLiteral(address) && !domain::IsValidDnsHostname(
-            address, domain::TrailingDotPolicy::Allow)) {
-        throw std::invalid_argument("xhttp download address must be an IP literal or DNS hostname");
+    if (!iputil::ParseLiteral(address)) {
+        if (!domain::IsValidDnsHostname(
+                address, domain::TrailingDotPolicy::Allow)) {
+            throw std::invalid_argument(
+                "xhttp download address must be an IP literal or DNS hostname");
+        }
+        domain::NormalizeDnsHostnameInPlace(address);
+        if (iputil::ParseLiteral(address).has_value()) {
+            throw std::invalid_argument(
+                "xhttp download address must be an IP literal or DNS hostname");
+        }
     }
     settings->address = std::move(address);
 

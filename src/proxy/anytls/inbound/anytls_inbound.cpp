@@ -24,6 +24,7 @@
 #include "acppnode/common/address_codec.hpp"
 
 #include <asio/experimental/channel.hpp>
+#include <openssl/crypto.h>
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -319,8 +320,11 @@ public:
         if (it == streams_.end()) {
             return;
         }
-        it->second->Cancel();
+        auto sub = std::move(it->second);
         streams_.erase(it);
+        if (sub) {
+            sub->Cancel();
+        }
     }
 
 private:
@@ -335,13 +339,16 @@ private:
         }
         cancelled_ = true;
         write_gate_.Cancel();
-        for (auto& [sid, sub] : streams_) {
+        auto streams = std::exchange(
+            streams_,
+            memory::ThreadLocalUnorderedMap<uint32_t, std::shared_ptr<AnyTLSSubStream>>{
+                streams_.get_allocator()});
+        for (auto& [sid, sub] : streams) {
             (void)sid;
             if (sub) {
                 sub->Cancel();
             }
         }
-        streams_.clear();
         if (stream_) {
             stream_->CloseAbortive();
         }
@@ -617,15 +624,25 @@ net::awaitable<RelayResult> AnyTLSDemuxSession::ReadFrames(AwaitableTaskGroup& t
         if (header->cmd == anytls::kCmdSettings) {
             if (header->sid != 0 || session_version_)
                 co_return co_await RejectSession("invalid or repeated client settings", ErrorCode::PROTOCOL_INVALID_COMMAND);
-            auto text = co_await anytls::ReadFrameText(*stream_, header->length);
-            if (!text) {
-                result.error = resolve_handshake_error(text.error());
-                break;
+            bool update_padding = false;
+            std::optional<ErrorCode> settings_error;
+            {
+                auto text = co_await anytls::ReadFrameText(*stream_, header->length);
+                if (!text) {
+                    result.error = resolve_handshake_error(text.error());
+                    break;
+                }
+                auto parsed = anytls::ParsePeerSettings(*text);
+                if (!parsed) {
+                    settings_error = parsed.error();
+                } else {
+                    session_version_ = parsed->version; // Publish once before accepting any SYN.
+                    update_padding = padding_scheme_ && !parsed->padding_md5.empty() &&
+                        parsed->padding_md5 != padding_scheme_->Digest();
+                }
             }
-            auto parsed = anytls::ParsePeerSettings(*text);
-            if (!parsed)
-                co_return co_await RejectSession("invalid client settings", parsed.error());
-            session_version_ = parsed->version; // Publish once before accepting any SYN.
+            if (settings_error)
+                co_return co_await RejectSession("invalid client settings", *settings_error);
             stream_->ClearPhaseDeadline();
             stream_->SetIdleTimeout(control_idle_timeout_);
             if (session_version_ == anytls::SessionVersion::V2) {
@@ -636,8 +653,7 @@ net::awaitable<RelayResult> AnyTLSDemuxSession::ReadFrames(AwaitableTaskGroup& t
                     break;
                 }
             }
-            if (padding_scheme_ && !parsed->padding_md5.empty() &&
-                parsed->padding_md5 != padding_scheme_->Digest()) {
+            if (update_padding) {
                 if (auto ok = co_await WriteFrameSerialized(anytls::kCmdUpdatePaddingScheme, 0,
                         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(padding_scheme_->Raw().data()),
                             padding_scheme_->Raw().size())); !ok) {
@@ -759,6 +775,10 @@ net::awaitable<tl::expected<void, ErrorCode>> ReadAuth(
     AsyncStream& stream,
     std::array<uint8_t, 32>& hash) {
     std::array<uint8_t, 34> auth{};
+    struct CleanseAuth {
+        std::array<uint8_t, 34>& buf;
+        ~CleanseAuth() noexcept { OPENSSL_cleanse(buf.data(), buf.size()); }
+    } cleanse_auth{auth};
     size_t offset = 0;
     while (offset < auth.size()) {
         try {
@@ -780,6 +800,7 @@ net::awaitable<tl::expected<void, ErrorCode>> ReadAuth(
     std::copy_n(auth.begin(), hash.size(), hash.begin());
     const uint16_t padding = static_cast<uint16_t>(
         (static_cast<uint16_t>(auth[32]) << 8) | auth[33]);
+    OPENSSL_cleanse(auth.data(), auth.size());
     if (auto ok = co_await anytls::DiscardFramePayload(stream, padding); !ok) {
         co_return tl::unexpected(
             proxy::ResolveHandshakeReadFailure(stream, ok.error()));
@@ -796,15 +817,19 @@ AuthenticateSession(
     const TimeoutsConfig& timeouts,
     uint32_t pressure_idle_timeout) {
     std::array<uint8_t, 32> auth_hash{};
+    struct CleanseHash {
+        std::array<uint8_t, 32>& buf;
+        ~CleanseHash() noexcept { OPENSSL_cleanse(buf.data(), buf.size()); }
+    } cleanse_hash{auth_hash};
     if (auto ok = co_await ReadAuth(stream, auth_hash); !ok) {
         co_return tl::unexpected(ok.error());
     }
     auto user = proxyman::inbound::UserStore::FindAnyTlsUser(ctx.inbound.tag, auth_hash);
+    OPENSSL_cleanse(auth_hash.data(), auth_hash.size());
     if (!user) {
         co_await proxy::RecordInboundAuthFailure(limiter, ctx, "no matching credential");
         co_return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
     }
-
     auto control_idle_timeout = timeouts.IdleTimeout();
     if (pressure_idle_timeout > 0) {
         control_idle_timeout = std::min(

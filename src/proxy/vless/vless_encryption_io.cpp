@@ -295,7 +295,13 @@ net::awaitable<void> VlessEncryptionWriter::WriteBuffers(
             skip_empty();
         }
         chunk->Produce(static_cast<uint32_t>(filled));
-        co_await WritePlaintext(chunk->Bytes());
+        try {
+            co_await WritePlaintext(chunk->Bytes());
+        } catch (...) {
+            OPENSSL_cleanse(dst, filled);
+            throw;
+        }
+        OPENSSL_cleanse(dst, filled);
     }
 }
 

@@ -126,6 +126,12 @@ bool OpenRequestHeader(const uint8_t* packet,
         std::span<const uint8_t, 16>(packet, 16),
         std::span<const uint8_t, 8>(packet + 34, 8));
     memory::ByteVector plain(header_len);
+    struct PlainCleanseGuard {
+        memory::ByteVector& buf;
+        ~PlainCleanseGuard() noexcept {
+            if (!buf.empty()) OPENSSL_cleanse(buf.data(), buf.size());
+        }
+    } cleanse_plain{plain};
     size_t written = 0;
     if (!AES128GCMDecryptTo(key.key.data(), key.nonce.data(), key.nonce.size(),
             packet + kRequestHeaderPrefixSize, header_len + 16, packet, 16,
@@ -178,11 +184,11 @@ public:
 
     RequestBodyReader(const VMessRequest& request,
                       AsyncStream& stream,
-                      const TargetAddress& udp_target)
+                      TargetAddress udp_target)
         : decoder_(RequestBodyOptions(request), RequestBodyKey(request), RequestBodyKey(request))
         , stream_(stream)
         , is_udp_(request.command == Command::UDP)
-        , udp_target_(udp_target) {}
+        , udp_target_(std::move(udp_target)) {}
 
     RequestBodyReader(const RequestBodyReader&) = delete;
     RequestBodyReader& operator=(const RequestBodyReader&) = delete;
@@ -199,7 +205,7 @@ private:
     BodyDecoder decoder_;
     AsyncStream& stream_;
     bool is_udp_ = false;
-    const TargetAddress& udp_target_;
+    TargetAddress udp_target_;
 };
 
 // The response header is coalesced into the first body write.
@@ -210,11 +216,11 @@ public:
     ResponseBodyWriter(const VMessRequest& request,
                        const BodyKey& response,
                        AsyncStream& stream,
-                       const TargetAddress& udp_target,
+                       TargetAddress udp_target,
                        const std::array<uint8_t, kResponseHeaderSize>& response_header)
         : encoder_(RequestBodyOptions(request), RequestBodyKey(request), response)
         , stream_(stream)
-        , udp_target_(udp_target)
+        , udp_target_(std::move(udp_target))
         , response_header_(response_header) {}
 
     ResponseBodyWriter(const ResponseBodyWriter&) = delete;
@@ -265,7 +271,7 @@ private:
 
     BodyEncoder encoder_;
     AsyncStream& stream_;
-    const TargetAddress& udp_target_;
+    TargetAddress udp_target_;
     std::array<uint8_t, kResponseHeaderSize> response_header_;
     bool header_sent_ = false;
     bool eof_sent_ = false;
@@ -306,6 +312,15 @@ std::pair<std::optional<VMessRequest>, size_t> ServerSession::DecodeRequestHeade
             return {std::nullopt, 0};
         }
         header_length_ = (static_cast<uint16_t>(plain[0]) << 8) | plain[1];
+        constexpr size_t kMinRequestHeaderLength = 38 + 4;
+        constexpr size_t kMaxRequestHeaderLength = 38 + kMaxEncodedAddressSize + 15 + 4;
+        if (header_length_ < kMinRequestHeaderLength ||
+            header_length_ > kMaxRequestHeaderLength) {
+            header_failure_reason_ = "invalid authenticated request header";
+            header_user_.reset();
+            required_header_bytes_ = 0;
+            return {std::nullopt, 0};
+        }
         required_header_bytes_ =
             kRequestHeaderPrefixSize + static_cast<size_t>(header_length_) + 16;
     }

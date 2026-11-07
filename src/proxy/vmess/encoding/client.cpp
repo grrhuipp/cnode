@@ -35,6 +35,10 @@ tl::expected<size_t, ErrorCode> BuildRequestHeaderPacket(
     ForwardedMetadataView forwarded,
     std::array<uint8_t, kRequestPacketMax>& packet) {
     std::array<uint8_t, kRequestHeaderMax> header{};
+    struct HeaderCleanseGuard {
+        std::array<uint8_t, kRequestHeaderMax>& buf;
+        ~HeaderCleanseGuard() noexcept { OPENSSL_cleanse(buf.data(), buf.size()); }
+    } cleanse_header{header};
     ByteWriter writer(header.data(), header.size());
     writer.WriteU8(VERSION);
     writer.WriteBytes(request_body.iv.data(), request_body.iv.size());
@@ -120,6 +124,7 @@ ClientSession::SessionKeys ClientSession::GenerateKeys() {
     std::memcpy(keys.request.iv.data(), random_bytes.data() + 16, 16);
     keys.response_header = random_bytes[32];
     keys.response = ResponseBodyKey(keys.request);
+    OPENSSL_cleanse(random_bytes.data(), random_bytes.size());
     return keys;
 }
 
@@ -146,6 +151,10 @@ net::awaitable<VMessHandshakeResult> ClientSession::EncodeRequestHeader(AsyncStr
         co_return VMessHandshakeResult{};
     }
     std::array<uint8_t, kRequestPacketMax> packet{};
+    struct PacketCleanseGuard {
+        std::array<uint8_t, kRequestPacketMax>& buf;
+        ~PacketCleanseGuard() noexcept { OPENSSL_cleanse(buf.data(), buf.size()); }
+    } cleanse_packet{packet};
     auto built = BuildRequestHeaderPacket(
         *user_, *auth_id_key_, *target_, security_, command_, keys_.request,
         keys_.response_header, forwarded_, packet);

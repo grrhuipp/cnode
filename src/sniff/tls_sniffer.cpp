@@ -18,7 +18,45 @@ constexpr uint16_t kExtensionServerName = 0x0000;
 constexpr uint16_t kSsl30 = 0x0300;
 constexpr uint16_t kTls10 = 0x0301;
 constexpr uint16_t kTls13 = 0x0304;
-constexpr size_t kMaxTlsSniffHandshakeBytes = 4096;
+constexpr size_t kTlsRecordHeaderBytes = 5;
+constexpr size_t kMaxTlsSniffWireBytes = 4096;
+constexpr size_t kMaxTlsSniffHandshakeBytes =
+    kMaxTlsSniffWireBytes - kTlsRecordHeaderBytes;
+
+[[nodiscard]] size_t ClientHelloSize(std::span<const uint8_t> handshake) noexcept {
+    return 4 + ((static_cast<size_t>(handshake[1]) << 16) |
+                (static_cast<size_t>(handshake[2]) << 8) | handshake[3]);
+}
+
+[[nodiscard]] bool FitsTlsSniffWireBudget(
+    size_t record_headers_bytes,
+    size_t committed_payload_bytes,
+    std::span<const uint8_t> handshake_prefix) noexcept {
+    if (record_headers_bytes > kMaxTlsSniffWireBytes ||
+        committed_payload_bytes > kMaxTlsSniffWireBytes - record_headers_bytes) {
+        return false;
+    }
+    if (handshake_prefix.size() >= 4) {
+        const size_t hello_size = ClientHelloSize(handshake_prefix);
+        const size_t extra_header =
+            hello_size > committed_payload_bytes ? kTlsRecordHeaderBytes : 0;
+        if (hello_size > kMaxTlsSniffWireBytes - record_headers_bytes ||
+            extra_header >
+                kMaxTlsSniffWireBytes - record_headers_bytes - hello_size) {
+            return false;
+        }
+        return true;
+    }
+    if (committed_payload_bytes == handshake_prefix.size()) {
+        const size_t min_remaining_hello = 4 - handshake_prefix.size();
+        if (kTlsRecordHeaderBytes + min_remaining_hello >
+            kMaxTlsSniffWireBytes - record_headers_bytes -
+                committed_payload_bytes) {
+            return false;
+        }
+    }
+    return true;
+}
 [[nodiscard]] std::optional<std::string_view> ExtractServerName(
     std::span<const uint8_t> extensions) {
     std::optional<std::string_view> server_name;
@@ -47,9 +85,7 @@ constexpr size_t kMaxTlsSniffHandshakeBytes = 4096;
 [[nodiscard]] bool TryFinishClientHelloSniff(
     std::span<const uint8_t> handshake, SniffResult& result) {
     if (handshake.size() < 4) return false;
-    const size_t hello_size =
-        4 + ((static_cast<size_t>(handshake[1]) << 16) |
-             (static_cast<size_t>(handshake[2]) << 8) | handshake[3]);
+    const size_t hello_size = ClientHelloSize(handshake);
     if (hello_size > kMaxTlsSniffHandshakeBytes) return true;
     if (handshake.size() < hello_size) return false;
     if (auto server_name =
@@ -116,23 +152,27 @@ SniffResult SniffTls(std::span<const uint8_t> data) {
         return result;
     }
     const uint16_t record_len = reader.ReadU16BE();
-    if (record_len == 0 || record_len > kMaxTlsSniffHandshakeBytes) return result;
+    if (record_len == 0 ||
+        !FitsTlsSniffWireBudget(kTlsRecordHeaderBytes, record_len, {})) {
+        return result;
+    }
     const auto record = reader.ReadBytes(record_len);
     if (!reader.Ok()) {
+        const auto partial_first = data.subspan(kTlsRecordHeaderBytes);
         if (version_supports_need_more &&
-            (data.size() < 6 || data[5] == kHandshakeClientHello)) {
-            if (data.size() >= 9) {
-                const std::size_t hello_size =
-                    4 + ((static_cast<std::size_t>(data[6]) << 16) |
-                         (static_cast<std::size_t>(data[7]) << 8) | data[8]);
-                if (hello_size > kMaxTlsSniffHandshakeBytes) return result;
-            }
+            (partial_first.empty() ||
+             partial_first[0] == kHandshakeClientHello) &&
+            FitsTlsSniffWireBudget(
+                kTlsRecordHeaderBytes, record_len, partial_first)) {
             result.need_more = true;
             result.protocol = constants::protocol::kTls;
         }
         return result;
     }
     if (record[0] != kHandshakeClientHello) return result;
+    if (!FitsTlsSniffWireBudget(kTlsRecordHeaderBytes, record.size(), record)) {
+        return result;
+    }
 
     if (TryFinishClientHelloSniff(record, result)) return result;
     if (reader.Empty()) {
@@ -146,8 +186,19 @@ SniffResult SniffTls(std::span<const uint8_t> data) {
     std::array<uint8_t, kMaxTlsSniffHandshakeBytes> reassembled{};
     std::copy_n(record.data(), record.size(), reassembled.data());
     size_t reassembled_size = record.size();
+    size_t record_headers_bytes = kTlsRecordHeaderBytes;
 
     while (!reader.Empty()) {
+        record_headers_bytes += kTlsRecordHeaderBytes;
+        if (record_headers_bytes + reassembled_size >= kMaxTlsSniffWireBytes) {
+            return result;
+        }
+        if (reassembled_size >= 4 &&
+            ClientHelloSize(
+                std::span<const uint8_t>(reassembled.data(), reassembled_size)) >
+                kMaxTlsSniffWireBytes - record_headers_bytes) {
+            return result;
+        }
         if (reader.ReadU8() != kContentTypeHandshake) return result;
         if (reader.Empty()) {
             if (version_supports_need_more) {
@@ -184,17 +235,18 @@ SniffResult SniffTls(std::span<const uint8_t> data) {
             next_len > kMaxTlsSniffHandshakeBytes - reassembled_size) {
             return result;
         }
+        const size_t committed_payload_bytes = reassembled_size + next_len;
         if (reader.Remaining() < next_len) {
             const size_t avail = reader.Remaining();
             const auto partial = reader.ReadBytes(avail);
             std::copy_n(partial.data(), avail, reassembled.data() + reassembled_size);
             reassembled_size += avail;
-            if (reassembled_size >= 4) {
-                const size_t hello_size =
-                    4 + ((static_cast<size_t>(reassembled[1]) << 16) |
-                         (static_cast<size_t>(reassembled[2]) << 8) |
-                         reassembled[3]);
-                if (hello_size > kMaxTlsSniffHandshakeBytes) return result;
+            if (!FitsTlsSniffWireBudget(
+                    record_headers_bytes,
+                    committed_payload_bytes,
+                    std::span<const uint8_t>(
+                        reassembled.data(), reassembled_size))) {
+                return result;
             }
             if (version_supports_need_more) {
                 result.need_more = true;
@@ -205,9 +257,13 @@ SniffResult SniffTls(std::span<const uint8_t> data) {
         const auto next_record = reader.ReadBytes(next_len);
         std::copy_n(next_record.data(), next_len, reassembled.data() + reassembled_size);
         reassembled_size += next_len;
-        if (TryFinishClientHelloSniff(
-                std::span<const uint8_t>(reassembled.data(), reassembled_size),
-                result)) {
+        const auto reassembled_span =
+            std::span<const uint8_t>(reassembled.data(), reassembled_size);
+        if (!FitsTlsSniffWireBudget(
+                record_headers_bytes, committed_payload_bytes, reassembled_span)) {
+            return result;
+        }
+        if (TryFinishClientHelloSniff(reassembled_span, result)) {
             return result;
         }
     }

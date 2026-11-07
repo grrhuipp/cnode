@@ -52,6 +52,8 @@ public:
         fragments_ = {};
         connection_ids_ = {};
         core_.reset();
+        base_context_.inbound = session::Inbound(memory::worker_pool_resource());
+        base_context_.content = session::Content(memory::worker_pool_resource());
     }
 
     Connection(const Connection&) = delete;

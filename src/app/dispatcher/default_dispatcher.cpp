@@ -162,7 +162,7 @@ net::awaitable<bool> SniffInitialPayload(
             if (datagram) {
                 sniff_payload = std::move(payload);
             } else {
-                payload.MoveTo(sniff_payload);
+                sniff_payload.AppendAndCoalesce(std::move(payload));
             }
             co_return true;
         };
@@ -220,6 +220,7 @@ net::awaitable<bool> SniffInitialPayload(
                     read.error = std::current_exception();
                 }
             };
+            memory::ByteVector{}.swap(sniff_scratch);
             AsyncDelay delay(io_context);
             auto next = co_await (read_more() || delay.WaitFor(remaining));
             if (sniff_cancellation.cancelled() != net::cancellation_type::none) {

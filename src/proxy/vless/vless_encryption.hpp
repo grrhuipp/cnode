@@ -1,6 +1,7 @@
 #pragma once
 
 #include <openssl/base.h>
+#include <openssl/crypto.h>
 
 #include <cstdint>
 #include <memory>
@@ -51,6 +52,23 @@ struct VlessServerPfsKey {
     std::vector<uint8_t> private_key;
     std::vector<uint8_t> public_key;
     std::shared_ptr<EVP_PKEY> mlkem_key;
+
+    VlessServerPfsKey() = default;
+    VlessServerPfsKey(std::vector<uint8_t> priv,
+                      std::vector<uint8_t> pub,
+                      std::shared_ptr<EVP_PKEY> mlkem) noexcept
+        : private_key(std::move(priv))
+        , public_key(std::move(pub))
+        , mlkem_key(std::move(mlkem)) {}
+    VlessServerPfsKey(const VlessServerPfsKey&) = default;
+    VlessServerPfsKey& operator=(const VlessServerPfsKey&) = default;
+    VlessServerPfsKey(VlessServerPfsKey&&) noexcept = default;
+    VlessServerPfsKey& operator=(VlessServerPfsKey&&) noexcept = default;
+    ~VlessServerPfsKey() noexcept {
+        if (!private_key.empty()) {
+            OPENSSL_cleanse(private_key.data(), private_key.size());
+        }
+    }
 };
 
 struct VlessEncryptionConfig {

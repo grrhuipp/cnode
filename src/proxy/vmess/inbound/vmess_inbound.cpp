@@ -56,10 +56,11 @@ ParseHandshake(AsyncStream& stream,
                     proxy::ClassifyHandshakeReadException(stream, error));
             }
             if (n == 0) {
-                // EOF in a structured header is truncation, never an auth miss.
                 co_return tl::unexpected(
                     proxy::ResolveHandshakeReadFailure(
-                        stream, ErrorCode::PROTOCOL_DECODE_FAILED));
+                        stream,
+                        total_read == 0 ? ErrorCode::SOCKET_EOF
+                                        : ErrorCode::PROTOCOL_DECODE_FAILED));
             }
             total_read += n;
         }

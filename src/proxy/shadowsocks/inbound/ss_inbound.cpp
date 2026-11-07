@@ -20,6 +20,7 @@
 #include "acppnode/common/buffer_util.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
 #include <openssl/rand.h>
+#include <openssl/crypto.h>
 #include <algorithm>
 #include <cstring>
 #include <span>
@@ -40,6 +41,14 @@ public:
     explicit ShadowsocksUdpResponseContext(ss::Ss2022UdpSessionState session)
         : ss2022_session_(std::move(session)) {}
 
+
+    ~ShadowsocksUdpResponseContext() noexcept override {
+        OPENSSL_cleanse(reply_key_.bytes.data(), reply_key_.bytes.size());
+        if (ss2022_session_) {
+            OPENSSL_cleanse(ss2022_session_->key.bytes.data(),
+                            ss2022_session_->key.bytes.size());
+        }
+    }
     [[nodiscard]] buf::MultiBuffer Encode(UDPPacketView packet) override;
 
 private:
@@ -118,6 +127,8 @@ PrepareSsTcpSession(
 
     auto response_writer_result = ss::WriteTCPResponse(
         *matched, cipher_info, session_result->request_salt, stream);
+    OPENSSL_cleanse(session_result->request_salt.bytes.data(),
+                    session_result->request_salt.bytes.size());
     if (!request_reader) {
         co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
     }
@@ -314,7 +325,8 @@ proxy::shadowsocks::inbound::Handler::Process(
         // UDP datagrams use the socket peer address, never a PROXY protocol source.
         return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
     }
-
+    OPENSSL_cleanse(decoded->session_owner.bytes.data(),
+                    decoded->session_owner.bytes.size());
     const auto& user = users[decoded->user_index];
 
     InboundDatagramResult result;
@@ -354,7 +366,12 @@ proxy::shadowsocks::inbound::Handler::Process(
 tl::expected<std::shared_ptr<InboundDatagramResponse>, ErrorCode>
 proxy::shadowsocks::inbound::Handler::CreateDatagramResponse(
     const InboundDatagramResult& decoded) {
+    memory::ScopedWorkerAllocation worker_allocation;
     ss::KeyBytes key;
+    struct CleanseKey {
+        ss::KeyBytes& k;
+        ~CleanseKey() noexcept { OPENSSL_cleanse(k.bytes.data(), k.bytes.size()); }
+    } cleanse_key{key};
     if (!key.assign(std::span(decoded.session_owner.bytes).first(decoded.session_owner.size))) {
         return tl::unexpected(ErrorCode::INTERNAL);
     }
@@ -363,6 +380,10 @@ proxy::shadowsocks::inbound::Handler::CreateDatagramResponse(
     }
     if (!decoded.session_id) return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     ss::Ss2022UdpSessionState state;
+    struct CleanseStateKey {
+        ss::KeyBytes& k;
+        ~CleanseStateKey() noexcept { OPENSSL_cleanse(k.bytes.data(), k.bytes.size()); }
+    } cleanse_state_key{state.key};
     state.cipher_info = cipher_info_;
     state.key = key;
     for (size_t i = 0; i < state.client_session_id.size(); ++i) {
@@ -438,6 +459,7 @@ namespace {
 acpp::proxyman::inbound::PreparedKeyBytes ToPreparedKey(acpp::ss::KeyBytes key) {
     acpp::proxyman::inbound::PreparedKeyBytes prepared;
     prepared.assign(key.span());
+    OPENSSL_cleanse(key.bytes.data(), key.bytes.size());
     return prepared;
 }
 
@@ -551,7 +573,6 @@ const bool kSsInboundRegistered = [] {
                     return std::nullopt;
                 }
                 acpp::proxyman::inbound::PreparedShadowsocksUser info;
-                info.password = spec.credential;
                 info.profile.email = spec.email;
                 info.profile.user_id = spec.user_id;
                 info.profile.speed_limit = spec.speed_limit;

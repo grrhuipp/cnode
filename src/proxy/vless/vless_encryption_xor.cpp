@@ -106,8 +106,10 @@ bool XorVlessEncryptionInPlace(
             return false;
         }
     }
-    return InitCtr(tls_ctx.get(), key, iv) &&
-           CtrXorInPlace(tls_ctx.get(), data);
+    const bool ok = InitCtr(tls_ctx.get(), key, iv) &&
+                    CtrXorInPlace(tls_ctx.get(), data);
+    EVP_CIPHER_CTX_reset(tls_ctx.get());
+    return ok;
 }
 
 std::optional<VlessEncryptionHeaderXor> VlessEncryptionHeaderXor::Create(

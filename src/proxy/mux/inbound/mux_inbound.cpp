@@ -606,19 +606,15 @@ public:
         }
 
         size_t payload_bytes = 0;
-        size_t reply_count = 0;
         for (const net::const_buffer& buffer : buffers) {
-            if (buffer.size() == 0) {
-                continue;
-            }
             payload_bytes += buffer.size();
-            reply_count +=
-                (buffer.size() + std::numeric_limits<uint16_t>::max() - 1) /
-                std::numeric_limits<uint16_t>::max();
         }
         if (payload_bytes == 0) {
             co_return;
         }
+        constexpr size_t kMaxMuxChunkSize = std::numeric_limits<uint16_t>::max();
+        const size_t reply_count =
+            (payload_bytes + kMaxMuxChunkSize - 1) / kMaxMuxChunkSize;
         if (!reply_queue_.CanPushTcp(payload_bytes, reply_count)) {
             reply_queue_.MarkTcpOverflow();
             Cancel();
@@ -627,40 +623,49 @@ public:
                 "Mux TCP reply queue full");
         }
 
-        for (const net::const_buffer& buffer : buffers) {
-            const auto* data = static_cast<const uint8_t*>(buffer.data());
-            if (!data || buffer.size() == 0) {
-                continue;
-            }
-
-            std::span<const uint8_t> remaining(data, buffer.size());
-            while (!remaining.empty()) {
-                const size_t chunk_size = std::min(
-                    remaining.size(),
-                    static_cast<size_t>(std::numeric_limits<uint16_t>::max()));
-                const auto chunk = remaining.first(chunk_size);
-
-                buf::MultiBuffer payload;
-                if (!buf::AppendSpanToMultiBuffer(chunk, payload)) {
+        size_t buf_idx = 0;
+        size_t buf_off = 0;
+        size_t remaining_total = payload_bytes;
+        while (remaining_total > 0) {
+            const size_t chunk_target = std::min(remaining_total, kMaxMuxChunkSize);
+            buf::MultiBuffer payload;
+            size_t chunk_filled = 0;
+            while (chunk_filled < chunk_target && buf_idx < buffers.size()) {
+                const auto* data = static_cast<const uint8_t*>(buffers[buf_idx].data());
+                const size_t sz = buffers[buf_idx].size();
+                if (!data || buf_off >= sz) {
+                    ++buf_idx;
+                    buf_off = 0;
+                    continue;
+                }
+                const size_t take = std::min(sz - buf_off, chunk_target - chunk_filled);
+                if (!buf::AppendSpanToMultiBuffer(
+                        std::span<const uint8_t>(data + buf_off, take), payload)) {
                     Cancel();
                     throw std::bad_alloc();
                 }
-
-                MuxReply reply;
-                reply.session_id = session_id_;
-                reply.is_end = false;
-                reply.is_udp = false;
-                reply.payload_size = chunk_size;
-                reply.payload = std::move(payload);
-                if (!reply_queue_.PushTcp(std::move(reply))) {
-                    reply_queue_.MarkTcpOverflow();
-                    Cancel();
-                    throw IoSystemError(
-                        io_error::no_buffer_space,
-                        "Mux TCP reply queue admission changed");
+                buf_off += take;
+                chunk_filled += take;
+                if (buf_off == sz) {
+                    ++buf_idx;
+                    buf_off = 0;
                 }
-                remaining = remaining.subspan(chunk_size);
             }
+
+            MuxReply reply;
+            reply.session_id = session_id_;
+            reply.is_end = false;
+            reply.is_udp = false;
+            reply.payload_size = chunk_filled;
+            reply.payload = std::move(payload);
+            if (!reply_queue_.PushTcp(std::move(reply))) {
+                reply_queue_.MarkTcpOverflow();
+                Cancel();
+                throw IoSystemError(
+                    io_error::no_buffer_space,
+                    "Mux TCP reply queue admission changed");
+            }
+            remaining_total -= chunk_filled;
         }
     }
 
@@ -1171,7 +1176,7 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                 if (read_bytes > 0) {
                     parent_ctx.traffic.bytes_up += read_bytes;
                     result.bytes_up += read_bytes;
-                    read_mb.MoveTo(frame_buf);
+                    frame_buf.AppendAndCoalesce(std::move(read_mb));
                     frame_buf_bytes += read_bytes;
                 } else {
                     read_mb.clear();

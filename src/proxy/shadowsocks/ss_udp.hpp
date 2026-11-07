@@ -7,6 +7,7 @@
 #include "acppnode/common/target_address.hpp"
 #include "acppnode/proxy/inbound_datagram.hpp"
 
+#include <openssl/crypto.h>
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -62,9 +63,11 @@ private:
         uint64_t session_id = 0;
 
         [[nodiscard]] bool operator==(const SessionKey& other) const noexcept {
-            return session_id == other.session_id && credential.size == other.credential.size &&
-                std::equal(credential.bytes.begin(), credential.bytes.begin() + credential.size,
-                           other.credential.bytes.begin());
+            return session_id == other.session_id &&
+                credential.size == other.credential.size &&
+                CRYPTO_memcmp(credential.bytes.data(),
+                              other.credential.bytes.data(),
+                              credential.size) == 0;
         }
     };
     struct SessionKeyHash {

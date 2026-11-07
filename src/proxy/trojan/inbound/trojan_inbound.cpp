@@ -19,6 +19,7 @@
 #include "acppnode/transport/link.hpp"
 #include "acppnode/app/udp_types.hpp"
 #include <array>
+#include <openssl/crypto.h>
 #include <span>
 #include <tl/expected.hpp>
 #include <optional>
@@ -92,6 +93,14 @@ ParseTrojanRequest(AsyncStream& stream,
     size_t total_read = 0;
     size_t required = ::acpp::trojan::kRequestPrefixSize;
     ::acpp::trojan::RequestDecodeResult decoded;
+    struct CleanseHandshake {
+        std::array<uint8_t, kMaxTrojanHandshakeBytes>& buf;
+        ::acpp::trojan::PasswordHash& hash;
+        ~CleanseHandshake() noexcept {
+            OPENSSL_cleanse(buf.data(), buf.size());
+            OPENSSL_cleanse(hash.data(), hash.size());
+        }
+    } cleanse_handshake{handshake_buf, decoded.request.password_hash};
     while (true) {
         if (required > kMaxTrojanHandshakeBytes) {
             co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
@@ -134,6 +143,8 @@ ParseTrojanRequest(AsyncStream& stream,
     auto& request = decoded.request;
     auto user_info = proxyman::inbound::UserStore::FindTrojanUser(
         tag, request.PasswordHashView());
+    OPENSSL_cleanse(handshake_buf.data(), handshake_buf.size());
+    OPENSSL_cleanse(request.password_hash.data(), request.password_hash.size());
     if (!user_info) {
         co_await proxy::RecordInboundAuthFailure(limiter, ctx, "no matching credential");
         co_return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);

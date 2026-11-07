@@ -1148,8 +1148,7 @@ void Worker::InstallUserView(proxyman::inbound::UserStore::WorkerView view) {
     for (const auto& [key, record] : runtime_->connections) {
         (void)key;
         if (record->finished.load(std::memory_order_acquire) ||
-            !record->domain || !record->capabilities ||
-            !record->domain->CanDestroyDirectlyOn(id_)) continue;
+            !record->domain || !record->capabilities) continue;
         try {
             record->domain->Execute([cap = record->capabilities, view] {
                 cap->UpdateUserView(view);
@@ -1255,7 +1254,7 @@ net::awaitable<void> Worker::CommitTraffic(
         if (auto domain = token.domain.lock();
             domain && !domain->CanDestroyDirectlyOn(id_)) {
             co_await net::co_spawn(domain->Executor(),
-                [owner = token.owner, &tag, &counters = token.counters]() -> net::awaitable<void> {
+                [owner = token.owner, tag = std::string(tag), counters = token.counters]() -> net::awaitable<void> {
                     owner->CommitTraffic(tag, counters);
                     co_return;
                 }, net::use_awaitable);
@@ -1274,7 +1273,7 @@ net::awaitable<void> Worker::RollbackTraffic(
         if (auto domain = token.domain.lock();
             domain && !domain->CanDestroyDirectlyOn(id_)) {
             available = co_await net::co_spawn(domain->Executor(),
-                [owner = token.owner, &tag, &counters = token.counters]()
+                [owner = token.owner, tag = std::string(tag), counters = token.counters]()
                     -> net::awaitable<app::UserTrafficCounters> {
                     owner->RollbackTraffic(tag, counters);
                     co_return owner->ExtractAvailableTraffic(tag);

@@ -252,10 +252,10 @@ ExtractBlockDetectRules(const json::object& config) {
         }
 
         const auto& matches = match_value->as_array();
-        const std::string pattern = JoinRouteMatches(matches);
-        if (pattern.empty()) {
-            continue;
+        if (matches.empty()) {
+            throw std::invalid_argument("block route match must not be empty");
         }
+        const std::string pattern = JoinRouteMatches(matches);
         try {
             rule::DetectRule rule;
             rule.Pattern = std::regex(pattern);

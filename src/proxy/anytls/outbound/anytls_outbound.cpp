@@ -27,6 +27,8 @@
 #include "acppnode/transport/link_error.hpp"
 
 #include <asio/experimental/channel.hpp>
+#include <asio/dispatch.hpp>
+#include <openssl/crypto.h>
 #include <algorithm>
 #include <chrono>
 #include <exception>
@@ -95,9 +97,8 @@ template <class T, class... Args>
 struct Handler::PaddingState {
     explicit PaddingState(net::io_context& io) : executor(SessionExecutor(io)) {}
 
-    net::awaitable<void> Publish(std::shared_ptr<const PaddingScheme> next) {
+    void Publish(std::shared_ptr<const PaddingScheme> next) noexcept {
         scheme = std::move(next);
-        co_return;
     }
 
     const net::any_io_executor executor;
@@ -336,13 +337,16 @@ struct Handler::ClientSession : memory::ThreadAllocated {
         closed = true;
         close_error = error;
         write_gate.Cancel();
-        for (auto& [sid, weak] : logical_streams) {
+        auto streams = std::exchange(
+            logical_streams,
+            acpp::memory::ThreadLocalUnorderedMap<uint32_t, std::weak_ptr<LogicalStream>>{
+                logical_streams.get_allocator()});
+        for (auto& [sid, weak] : streams) {
             (void)sid;
             if (auto logical = weak.lock()) {
                 logical->Close(error);
             }
         }
-        logical_streams.clear();
         if (stream) {
             stream->CloseAbortive();
         }
@@ -545,31 +549,24 @@ struct Handler::ClientSession : memory::ThreadAllocated {
                             }
                             if (auto parsed = ParsePaddingScheme(*text)) {
                                 scheme_ = AllocateWorkerShared<const PaddingScheme>(std::move(*parsed));
-                                co_await net::co_spawn(padding_state_->executor,
-                                    padding_state_->Publish(scheme_), net::use_awaitable);
+                                net::dispatch(padding_state_->executor,
+                                    [state = padding_state_, next = scheme_]() mutable noexcept {
+                                        state->Publish(std::move(next));
+                                    });
                             }
                         }
                         break;
                     }
                     case kCmdHeartResponse:
-                        if (auto ok = co_await discard_current(); !ok) {
-                            CloseAll(ok.error());
-                            co_return;
-                        }
                         break;
                     case kCmdHeartRequest:
-                        if (auto ok = co_await discard_current(); !ok) {
-                            CloseAll(ok.error());
-                            co_return;
-                        }
                         if (auto ok = co_await WriteFrameSerialized(kCmdHeartResponse, 0, {}); !ok) {
                             CloseAll(ok.error());
                             co_return;
                         }
                         break;
                     case kCmdAlert: {
-                        auto text = co_await ReadFrameText(*stream, header->length);
-                        (void)text;
+                        (void)co_await DiscardFramePayload(*stream, header->length);
                         CloseAll(ErrorCode::PROTOCOL_DECODE_FAILED);
                         co_return;
                     }
@@ -609,9 +606,8 @@ struct Handler::ClientSession : memory::ThreadAllocated {
             switch (header->cmd) {
                 case kCmdSYNACK:
                     if (header->length > 0) {
-                        auto text = co_await ReadFrameText(*stream, header->length);
-                        if (!text) {
-                            CloseAll(text.error());
+                        if (auto ok = co_await DiscardFramePayload(*stream, header->length); !ok) {
+                            CloseAll(ok.error());
                             co_return;
                         }
                         logical->Close(ErrorCode::PROTOCOL_DECODE_FAILED);
@@ -642,8 +638,8 @@ struct Handler::ClientSession : memory::ThreadAllocated {
                     logical->CloseRemote();
                     break;
                 case kCmdAlert: {
-                    if (auto text = co_await ReadFrameText(*stream, header->length); !text) {
-                        CloseAll(text.error());
+                    if (auto ok = co_await DiscardFramePayload(*stream, header->length); !ok) {
+                        CloseAll(ok.error());
                         co_return;
                     }
                     logical->Close(ErrorCode::PROTOCOL_DECODE_FAILED);
@@ -664,13 +660,16 @@ class Handler::SessionPool final : public memory::ThreadAllocated {
     using Clock = std::chrono::steady_clock;
     struct State;
 
-    static void Close(const std::shared_ptr<ClientSession>& session) noexcept {
+    static void Close(const std::shared_ptr<ClientSession>& session,
+                      ErrorCode error = ErrorCode::CANCELLED) noexcept {
         if (!session) return;
-        if (session->domain) {
-            session->domain->Execute([session] { session->CloseAll(ErrorCode::CANCELLED); });
-        } else {
-            session->CloseAll(ErrorCode::CANCELLED);
+        if (!session->domain || session->domain->CanExecuteInline()) {
+            session->CloseAll(error);
+            return;
         }
+        try {
+            session->domain->Execute([session, error] { session->CloseAll(error); });
+        } catch (...) {}
     }
 
 public:
@@ -706,14 +705,21 @@ public:
             // Detach has completed: the physical domain's native owner is
             // stable until the next exclusive checkout. The original host is
             // only its configuration namespace, not its reuse destination.
+            const auto executor = state_->executor;
             const auto worker = session_->domain ? session_->domain->OwnerId() : 0;
             auto release = [state = std::move(state_), session = std::move(session_),
                             reusable = reusable_, worker] {
                 if (reusable) state->Release(session, worker);
                 else state->Remove(session);
             };
-            if (auto domain = owner_domain_.lock()) domain->Execute(std::move(release));
-            else release();
+            try {
+                if (auto domain = owner_domain_.lock()) {
+                    if (domain->CanExecuteInline()) release();
+                    else domain->Execute(std::move(release));
+                } else {
+                    net::dispatch(executor, std::move(release));
+                }
+            } catch (...) {}
         }
         std::shared_ptr<State> state_;
         std::shared_ptr<ClientSession> session_;
@@ -835,11 +841,7 @@ private:
                                             : ErrorCode::CONNECTION_CLOSED;
             // A loop that returned or threw must never remain reusable.
             // CloseAll retains the first terminal cause.
-            if (session->domain) {
-                session->domain->Execute([session, error] { session->CloseAll(error); });
-            } else {
-                session->CloseAll(error);
-            }
+            Close(session, error);
             owner->Remove(session);
             if (failure && error != ErrorCode::CANCELLED &&
                 error != ErrorCode::CONNECTION_CLOSED && error != ErrorCode::SOCKET_EOF) {
@@ -890,7 +892,7 @@ private:
         void StopIfEmpty() noexcept {
             if (!entries.empty()) return;
             Cancel();
-            memory::ThreadLocalVector<Entry>{}.swap(entries);
+            memory::ThreadLocalVector<Entry>{entries.get_allocator()}.swap(entries);
         }
 
         void Schedule() {
@@ -919,7 +921,7 @@ private:
         void Retire() noexcept {
             retired = true;
             Cancel();
-            memory::ThreadLocalVector<Entry> closing;
+            memory::ThreadLocalVector<Entry> closing(entries.get_allocator());
             closing.swap(entries);
             for (const auto& entry : closing) Close(entry.session);
         }
@@ -1000,6 +1002,14 @@ DialPhysicalSession(
 
     const uint16_t auth_padding_size = opening_scheme.SampleAuthPaddingSize();
     memory::ByteVector auth_packet(34 + auth_padding_size, uint8_t{0});
+    struct CleanseAuthPacket {
+        memory::ByteVector& buf;
+        ~CleanseAuthPacket() noexcept {
+            if (!buf.empty()) {
+                OPENSSL_cleanse(buf.data(), buf.size());
+            }
+        }
+    } cleanse_auth_packet{auth_packet};
     std::copy(settings.password_hash.begin(), settings.password_hash.end(), auth_packet.begin());
     auth_packet[32] = static_cast<uint8_t>(auth_padding_size >> 8);
     auth_packet[33] = static_cast<uint8_t>(auth_padding_size);
@@ -1012,9 +1022,11 @@ DialPhysicalSession(
                 auth_packet.data(),
                 auth_packet.size()));
     } catch (...) {
+        OPENSSL_cleanse(auth_packet.data(), auth_packet.size());
         new_stream->CloseAbortive();
         throw;
     }
+    OPENSSL_cleanse(auth_packet.data(), auth_packet.size());
     if (!ok) {
         const bool timed_out =
             proxy::ConsumeOutboundHandshakeTimeout(*new_stream, deadline);
@@ -1161,9 +1173,14 @@ net::awaitable<OutboundProcessResult> Handler::Process(
                 memory::ScopedWorkerAllocation worker_allocation;
                 co_return std::shared_ptr<ClientSession>(
                     raw_session,
-                    [physical](ClientSession* value) {
-                        if (physical) physical->Execute([value] { delete value; });
-                        else delete value;
+                    [physical](ClientSession* value) noexcept {
+                        if (!physical || physical->CanExecuteInline()) {
+                            delete value;
+                            return;
+                        }
+                        try {
+                            physical->Execute([value] { delete value; });
+                        } catch (...) {}
                     },
                     memory::ThreadLocalAllocator<ClientSession>{});
             };

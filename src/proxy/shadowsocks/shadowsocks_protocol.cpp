@@ -4,6 +4,7 @@
 #include "acppnode/core/naming.hpp"
 
 #include <blake3.h>
+#include <openssl/crypto.h>
 #include <openssl/evp.h>
 #include <openssl/hkdf.h>
 
@@ -83,7 +84,11 @@ KeyBytes DeriveKey(const std::string& password, size_t key_size) {
         return key;
     }
 
-    uint8_t prev[16];
+    uint8_t prev[16]{};
+    struct CleansePrev {
+        uint8_t (&buf)[16];
+        ~CleansePrev() noexcept { OPENSSL_cleanse(buf, sizeof(buf)); }
+    } cleanse_prev{prev};
     size_t prev_len = 0;
     size_t written = 0;
     const auto* pw = reinterpret_cast<const uint8_t*>(password.data());
@@ -120,6 +125,12 @@ KeyBytes Decode2022Psk(std::string_view password, size_t key_size) {
     }
 
     std::string encoded;
+    struct CleanseEncoded {
+        std::string& buf;
+        ~CleanseEncoded() noexcept {
+            if (!buf.empty()) OPENSSL_cleanse(buf.data(), buf.size());
+        }
+    } cleanse_encoded{encoded};
     encoded.reserve(44);
     for (const char ch : password) {
         if (ch == '\r' || ch == '\n' || ch == '\t' || ch == ' ') {
@@ -181,6 +192,10 @@ KeyBytes Decode2022Psk(std::string_view password, size_t key_size) {
     }
 
     std::array<uint8_t, 36> decoded{};
+    struct CleanseDecoded {
+        std::array<uint8_t, 36>& buf;
+        ~CleanseDecoded() noexcept { OPENSSL_cleanse(buf.data(), buf.size()); }
+    } cleanse_decoded{decoded};
     const int decoded_len = EVP_DecodeBlock(
         decoded.data(),
         reinterpret_cast<const uint8_t*>(encoded.data()),
@@ -237,6 +252,7 @@ bool Derive2022Subkey(const uint8_t* key, size_t key_size,
     blake3_hasher_update(&hasher, key, key_size);
     blake3_hasher_update(&hasher, salt, salt_size);
     blake3_hasher_finalize(&hasher, out_subkey, key_size);
+    OPENSSL_cleanse(&hasher, sizeof(hasher));
     return true;
 }
 
@@ -253,6 +269,7 @@ bool Derive2022IdentitySubkey(const uint8_t* key, size_t key_size,
     blake3_hasher_update(&hasher, key, key_size);
     blake3_hasher_update(&hasher, salt, salt_size);
     blake3_hasher_finalize(&hasher, out_key, key_size);
+    OPENSSL_cleanse(&hasher, sizeof(hasher));
     return true;
 }
 
@@ -264,6 +281,7 @@ bool Hash2022Psk(std::span<const uint8_t> key, std::span<uint8_t, 16> out_hash) 
     blake3_hasher_init(&hasher);
     blake3_hasher_update(&hasher, key.data(), key.size());
     blake3_hasher_finalize(&hasher, out_hash.data(), out_hash.size());
+    OPENSSL_cleanse(&hasher, sizeof(hasher));
     return true;
 }
 

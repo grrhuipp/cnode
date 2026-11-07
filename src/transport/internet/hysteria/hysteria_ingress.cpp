@@ -264,6 +264,7 @@ Connection::Connection(
     capabilities_->BindDomain(ownership_->domain);
     retirement_ = std::make_unique<QuicDirectory::Retirement>(
         listener.directory, listener.directory_space, ownership_);
+    memory::ScopedAllocationDomain scope(capabilities_->Allocation());
     core_ = std::make_unique<Core>(capabilities_->Allocation());
     core_->local = socket.local;
     core_->remote = remote;
@@ -345,9 +346,12 @@ int Connection::UpdateKey(ngtcp2_conn* conn, uint8_t* rx_secret,
     const uint8_t* current_rx, const uint8_t* current_tx, size_t secret_length,
     void*) {
     std::array<uint8_t, 64> rx_key{}, tx_key{};
-    return ngtcp2_crypto_update_key(conn, rx_secret, tx_secret, rx_ctx,
+    const int rc = ngtcp2_crypto_update_key(conn, rx_secret, tx_secret, rx_ctx,
         rx_key.data(), rx_iv, tx_ctx, tx_key.data(), tx_iv,
         current_rx, current_tx, secret_length);
+    OPENSSL_cleanse(rx_key.data(), rx_key.size());
+    OPENSSL_cleanse(tx_key.data(), tx_key.size());
+    return rc;
 }
 
 int Connection::ReceiveTxKey(ngtcp2_conn*, ngtcp2_encryption_level level,
@@ -565,7 +569,7 @@ void Connection::CommitHandoff(const ExecutionDomain::HandoffTarget& target) noe
     EndValidation(true);
     try {
         LOG_CONN_DEBUG(base_context_, "QUIC passive handoff committed old_owner={} receiving_worker={} remote={}:{} path_evidence={}",
-            previous_worker, target.worker_id, candidate_remote_.address().to_string(),
+            previous_worker, target.worker_id, iputil::AddressText(candidate_remote_.address()).View(),
             candidate_remote_.port(), validation_reused_ ? "reused" : "challenge");
     } catch (...) {} // A logging allocation must not interrupt native commit.
 }
@@ -1352,14 +1356,23 @@ void Connection::HandleUdpMessage(const UdpMessage& message) {
         (static_cast<uint64_t>(message.session_id) << 16) | message.packet_id;
     auto it = fragments_.find(key);
     if (it == fragments_.end()) {
-        if (fragments_.size() >= kMaxPendingFragments || message.fragment_id != 0 ||
-            !message.target.IsValid()) return;
+        if (message.fragment_id == 0 && !message.target.IsValid()) return;
+        if (fragments_.size() >= kMaxPendingFragments) {
+            fragments_.erase(fragments_.begin());
+        }
         PendingFragments pending;
-        pending.target = message.target;
+        if (message.fragment_id == 0) pending.target = message.target;
         pending.count = message.fragment_count;
         it = fragments_.emplace(key, std::move(pending)).first;
     }
     auto& pending = it->second;
+    if (message.fragment_id == 0) {
+        if (!message.target.IsValid()) {
+            fragments_.erase(it);
+            return;
+        }
+        pending.target = message.target;
+    }
     if (message.payload.empty() ||
         pending.count != message.fragment_count ||
         message.fragment_id >= pending.count ||
@@ -1376,6 +1389,10 @@ void Connection::HandleUdpMessage(const UdpMessage& message) {
     pending.bytes += part.size();
     ++pending.received;
     if (pending.received != pending.count) return;
+    if (!pending.target.IsValid()) {
+        fragments_.erase(it);
+        return;
+    }
     memory::ThreadLocalVector<uint8_t> payload;
     payload.reserve(pending.bytes);
     for (const auto& fragment : pending.payloads)
@@ -1593,7 +1610,10 @@ net::awaitable<void> QuicListener::Drain(const std::shared_ptr<QuicOwnership>& o
         (void)key;
         size_t kept = 0;
         for (size_t index = 0; index < socket->output.size(); ++index) {
-            if (socket->output[index].owner == owner) continue;
+            if (socket->output[index].owner == owner) {
+                if (!socket->output[index].terminal) continue;
+                socket->output[index].owner.reset();
+            }
             if (kept != index)
                 socket->output[kept] = std::move(socket->output[index]);
             ++kept;
@@ -1700,7 +1720,7 @@ net::awaitable<void> QuicListener::Claim(std::shared_ptr<QuicOwnership> owner) {
                     !connection->CandidateValidationPending();
                 if (done && !connection->Closed() && !connection->ValidationSucceeded())
                     LOG_DEBUG("QUIC passive claim rejected receiving_worker={} remote={}:{} reason=no-path-evidence",
-                        worker_id, connection->candidate_remote_.address().to_string(),
+                        worker_id, iputil::AddressText(connection->candidate_remote_.address()).View(),
                         connection->candidate_remote_.port());
             });
             if (done) break;

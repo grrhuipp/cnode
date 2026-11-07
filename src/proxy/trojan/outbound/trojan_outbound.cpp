@@ -21,6 +21,7 @@
 #include "acppnode/transport/internet/outbound_target_builder.hpp"
 
 #include <algorithm>
+#include <openssl/crypto.h>
 #include <array>
 #include <cstring>
 #include <new>
@@ -78,6 +79,10 @@ SendTrojanHandshake(
         stream.StartPhaseDeadline(handshake_timeout);
 
     std::array<uint8_t, ::acpp::trojan::kRequestPrefixSize + kMaxEncodedAddressSize + 2> header_buf{};
+    struct CleanseHeader {
+        std::array<uint8_t, ::acpp::trojan::kRequestPrefixSize + kMaxEncodedAddressSize + 2>& buf;
+        ~CleanseHeader() noexcept { OPENSSL_cleanse(buf.data(), buf.size()); }
+    } cleanse_header{header_buf};
     const size_t header_len = ::acpp::trojan::EncodeRequestTo(
         config.password_hash,
         is_udp ? ::acpp::trojan::TrojanCommand::UDP_ASSOCIATE
@@ -97,9 +102,11 @@ SendTrojanHandshake(
         ConstBufferSpanBuilder<1> header_buffers;
         header_buffers.Append(net::const_buffer(header_buf.data(), header_len));
         co_await stream.WriteBuffers(header_buffers.Span());
+        OPENSSL_cleanse(header_buf.data(), header_buf.size());
         LOG_CONN_DEBUG(ctx, "handshake sent {} bytes", header_len);
         co_return tl::expected<void, ErrorCode>{};
     } catch (...) {
+        OPENSSL_cleanse(header_buf.data(), header_buf.size());
         co_return tl::unexpected(
             proxy::ClassifyOutboundHandshakeException(
                 stream, outbound_protocol_deadline));

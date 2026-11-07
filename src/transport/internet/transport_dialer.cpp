@@ -160,7 +160,8 @@ protected:
             ThrowXHttpPacketError(missing_settings_error);
         }
         target_.single_candidate = candidate_;
-        target_.candidates.clear();
+        memory::ThreadLocalVector<OutboundDialCandidate>{target_.candidates.get_allocator()}.swap(target_.candidates);
+        target_.xhttp_download_target.reset();
     }
 
 public:

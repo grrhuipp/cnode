@@ -266,6 +266,7 @@ void HandlerLookup::Refresh() noexcept {
 }
 
 void HandlerLookup::Sync(uint64_t generation) {
+    memory::ScopedWorkerAllocation worker_allocation;
     const auto snapshot = configuration_.Capture();
     memory::ThreadLocalVector<Entry> next;
     next.reserve(snapshot->size());
@@ -285,6 +286,7 @@ void HandlerLookup::Sync(uint64_t generation) {
 }
 
 std::shared_ptr<Handler> HandlerLookup::Instantiate(const OutboundConfiguration::Entry& config) {
+    memory::ScopedWorkerAllocation worker_allocation;
     return memory::AllocateShared<Handler>(config, io_context_, dns_, dial_timeout_, tasks_);
 }
 

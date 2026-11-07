@@ -263,7 +263,6 @@ WritePacketWithPadding(AsyncStream& stream,
     }
 
     size_t offset = 0;
-    memory::ByteVector record;
     for (const PaddingRecord& rule : record_rules) {
         const int sampled_size = rule.SampleSize();
         if (sampled_size == -1) {
@@ -274,8 +273,8 @@ WritePacketWithPadding(AsyncStream& stream,
         }
         // Compiled records are positive and every possible Waste fits uint16.
         const size_t size = static_cast<size_t>(sampled_size);
-        record.clear();
         const size_t remaining = packet.size() - offset;
+        memory::ByteVector record;
         std::span<const uint8_t> output;
         if (remaining >= size) {
             output = std::span<const uint8_t>(packet).subspan(offset, size);
@@ -284,11 +283,13 @@ WritePacketWithPadding(AsyncStream& stream,
             output = std::span<const uint8_t>(packet).subspan(offset);
             offset = packet.size();
             if (size - remaining > kFrameHeaderSize) {
+                record.reserve(size);
                 record.assign(output.begin(), output.end());
                 AppendWaste(record, static_cast<uint16_t>(size - remaining - kFrameHeaderSize));
                 output = record;
             }
         } else {
+            record.reserve(kFrameHeaderSize + size);
             AppendWaste(record, static_cast<uint16_t>(size));
             output = record;
         }
@@ -298,7 +299,6 @@ WritePacketWithPadding(AsyncStream& stream,
             co_return tl::unexpected(ok.error());
         }
     }
-    memory::ByteVector{}.swap(record);
     if (offset < packet.size()) {
         co_return co_await WriteAll(
             stream,
@@ -423,19 +423,22 @@ ReadFrameHeader(AsyncStream& stream) {
 
 net::awaitable<tl::expected<memory::ThreadLocalString, ErrorCode>>
 ReadFrameText(AsyncStream& stream, uint16_t length) {
-    memory::ThreadLocalString text(length, '\0');
-    auto bytes = std::span<uint8_t>(
-        reinterpret_cast<uint8_t*>(text.data()),
-        text.size());
-    size_t offset = 0;
-    while (offset < bytes.size()) {
+    memory::ThreadLocalString text;
+    if (length == 0) {
+        co_return text;
+    }
+    std::array<char, 1024> scratch{};
+    size_t remaining = length;
+    while (remaining > 0) {
+        const size_t want = std::min(remaining, scratch.size());
         try {
             const auto n = co_await stream.AsyncRead(
-                net::buffer(bytes.data() + offset, bytes.size() - offset));
+                net::buffer(scratch.data(), want));
             if (n == 0) {
                 co_return tl::unexpected(ErrorCode::CONNECTION_CLOSED);
             }
-            offset += n;
+            text.append(scratch.data(), n);
+            remaining -= n;
         } catch (const IoSystemError& e) {
             co_return tl::unexpected(MapAsioError(e.code()));
         }
@@ -445,6 +448,9 @@ ReadFrameText(AsyncStream& stream, uint16_t length) {
 
 net::awaitable<tl::expected<void, ErrorCode>>
 DiscardFramePayload(AsyncStream& stream, uint16_t length) {
+    if (length == 0) {
+        co_return tl::expected<void, ErrorCode>{};
+    }
     std::array<uint8_t, 512> scratch{};
     size_t remaining = length;
     while (remaining > 0) {

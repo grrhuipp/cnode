@@ -179,6 +179,12 @@ VlessEncryptionParseResult ParseErrorResult(VlessEncryptionParseError error) {
         }
 
         std::vector<uint8_t> key(Base64UrlDecodedSize(part.size()));
+        struct KeyCleanseGuard {
+            std::vector<uint8_t>& buf;
+            ~KeyCleanseGuard() noexcept {
+                if (!buf.empty()) OPENSSL_cleanse(buf.data(), buf.size());
+            }
+        } cleanse_key{key};
         if (!DecodeBase64Url(part, key)) {
             return ParseErrorResult(VlessEncryptionParseError::InvalidBase64);
         }
@@ -210,12 +216,10 @@ VlessEncryptionParseResult ParseErrorResult(VlessEncryptionParseError error) {
                     return ParseErrorResult(
                         VlessEncryptionParseError::InvalidKeyMaterial);
                 }
-                config.server_keys.push_back(VlessServerPfsKey{
-                    .private_key = std::move(key),
-                    .public_key = std::vector<uint8_t>(
-                        public_key.begin(), public_key.end()),
-                    .mlkem_key = nullptr,
-                });
+                config.server_keys.emplace_back(
+                    std::move(key),
+                    std::vector<uint8_t>(public_key.begin(), public_key.end()),
+                    nullptr);
             } else if (len == kVlessMlKem768SeedSize) {
                 auto mlkem_key = CreateVlessMlKem768PrivateKeyFromSeed(key);
                 auto public_key = DeriveVlessMlKem768PublicKey(mlkem_key.get());
@@ -223,12 +227,10 @@ VlessEncryptionParseResult ParseErrorResult(VlessEncryptionParseError error) {
                     return ParseErrorResult(
                         VlessEncryptionParseError::InvalidKeyMaterial);
                 }
-                config.server_keys.push_back(VlessServerPfsKey{
-                    .private_key = std::move(key),
-                    .public_key = std::vector<uint8_t>(
-                        public_key->begin(), public_key->end()),
-                    .mlkem_key = std::move(mlkem_key),
-                });
+                config.server_keys.emplace_back(
+                    std::move(key),
+                    std::vector<uint8_t>(public_key->begin(), public_key->end()),
+                    std::move(mlkem_key));
             } else {
                 return ParseErrorResult(
                     VlessEncryptionParseError::InvalidKeyLength);

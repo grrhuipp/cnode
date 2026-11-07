@@ -881,8 +881,17 @@ private:
     return detail::current_allocation_domain;
 }
 
+[[nodiscard]] inline std::pmr::memory_resource* worker_pool_resource() noexcept;
+
 [[nodiscard]] inline std::pmr::memory_resource* CurrentResource() noexcept {
-    if (detail::allocate_for_worker) return ThreadMemoryPool().resource();
+    if (detail::allocate_for_worker) {
+        auto* default_resource = std::pmr::get_default_resource();
+        if (default_resource == worker_pool_resource() ||
+            default_resource == std::pmr::new_delete_resource()) {
+            return worker_pool_resource();
+        }
+        return default_resource;
+    }
     if (auto* domain = CurrentAllocationDomain()) return domain->resource();
     return std::pmr::get_default_resource();
 }
@@ -1025,7 +1034,14 @@ struct ThreadAllocated {
 class ThreadMemoryResource final : public std::pmr::memory_resource {
 protected:
     void* do_allocate(size_t bytes, size_t alignment) override {
-        if (void* p = AllocatePmr(bytes, alignment)) return p;
+#ifdef CNODE_TEST_ALLOCATOR_FAULT
+        if (reject_next_pmr_allocation) {
+            reject_next_pmr_allocation = false;
+            ++rejected_pmr_allocations;
+            throw std::bad_alloc();
+        }
+#endif
+        if (void* p = ThreadMemoryPool().Allocate(bytes, alignment)) return p;
         throw std::bad_alloc();
     }
     void do_deallocate(void* p, size_t bytes, size_t alignment) override {
@@ -1036,14 +1052,18 @@ protected:
     }
 };
 
+[[nodiscard]] inline std::pmr::memory_resource* worker_pool_resource() noexcept {
+    static ThreadMemoryResource resource;
+    return &resource;
+}
+
 inline void ConfigureProcessAllocator() noexcept {
     DisableTransparentHugePages();
 #if defined(CNODE_USE_MIMALLOC) && !defined(__SANITIZE_ADDRESS__)
     mi_option_set(mi_option_allow_thp, 0);
     mi_option_set(mi_option_purge_delay, 10);
 #endif
-    static ThreadMemoryResource default_resource;
-    std::pmr::set_default_resource(&default_resource);
+    std::pmr::set_default_resource(worker_pool_resource());
 }
 
 inline void CollectSteady() noexcept {

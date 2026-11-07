@@ -159,6 +159,10 @@ static constexpr std::array<std::string_view, 9> kHttpMethods{
             parsed.host, domain::TrailingDotPolicy::Allow)) {
         return std::nullopt;
     }
+    if (parsed.host.ends_with('.') &&
+        iputil::ParseLiteral(domain::WithoutTrailingRootDot(parsed.host)).has_value()) {
+        return std::nullopt;
+    }
     return parsed;
 }
 

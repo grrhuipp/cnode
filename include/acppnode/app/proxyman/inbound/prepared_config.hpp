@@ -75,7 +75,6 @@ struct PreparedTrojanUser {
 };
 
 struct PreparedShadowsocksUser {
-    std::string password;
     PreparedKeyBytes derived_key;
     PreparedKeyBytes identity_key;
     std::array<uint8_t, 16> psk_hash{};

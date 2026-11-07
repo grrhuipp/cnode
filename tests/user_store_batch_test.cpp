@@ -112,7 +112,6 @@ int main() {
     UserStore::InstallWorkerView(UserStore::PrepareWorkerView(current));
 
     PreparedShadowsocksUser ss_user;
-    ss_user.password = "identity-user";
     ss_user.profile.user_id = 7;
     ss_user.psk_hash.fill(0x11);
     Commit(UserStore::PrepareUsers("ss-hash", UserSet{PreparedShadowsocksUsers{ss_user}}));

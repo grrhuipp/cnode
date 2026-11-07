@@ -264,7 +264,10 @@ net::awaitable<void> Controller::Impl::panelSyncLoop(
                 }
             }
             now = Clock::now();
-            next_pull = now + interval(true);
+            const auto pull_delay = panel.node.HasPendingCleanup()
+                ? std::min(interval(true), std::chrono::seconds(1))
+                : interval(true);
+            next_pull = now + pull_delay;
             if (panel.node.committed && panel.node.phase == controller::NodeRuntimePhase::Ready) {
                 const auto scheduled_push = now + interval(false);
                 if (next_push == Clock::time_point::max()) {

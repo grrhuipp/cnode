@@ -86,11 +86,13 @@ net::awaitable<std::optional<UserOnlineSessionGuard>> UserOnlineTracker::TryConn
     if (user_id <= 0 || client_ip.empty()) {
         co_return std::optional<UserOnlineSessionGuard>(std::in_place);
     }
+    std::string owned_tag(tag);
+    std::string owned_client_ip(client_ip);
     // Held across the admission: the domain owns the coordinator reference.
     auto domain = ExecutionDomain::Current();
     if (!domain) throw std::logic_error("user admission requires an execution domain");
     co_return co_await TryConnectSession(
-        domain->Coordinator(), tag, user_id, client_ip, device_limit);
+        domain->Coordinator(), owned_tag, user_id, owned_client_ip, device_limit);
 }
 
 net::awaitable<std::optional<UserOnlineSessionGuard>> UserOnlineTracker::TryConnectSession(
@@ -102,15 +104,18 @@ net::awaitable<std::optional<UserOnlineSessionGuard>> UserOnlineTracker::TryConn
     if (user_id <= 0 || client_ip.empty()) {
         co_return std::optional<UserOnlineSessionGuard>(std::in_place);
     }
+    const std::string owned_tag(tag);
+    const std::string owned_client_ip(client_ip);
     const auto uid = static_cast<uint64_t>(user_id);
     // Prepare the guard's owned strings before reserving either counter.
-    std::optional<UserOnlineSessionGuard> guard(std::in_place, tag, uid, client_ip);
+    std::optional<UserOnlineSessionGuard> guard(
+        std::in_place, owned_tag, uid, owned_client_ip);
     auto reservation = std::make_shared<DeviceReservation>();
     reservation->node = std::make_unique<DeviceReturn>();
     auto& node = *reservation->node;
     node.coordinator = &coordinator;
-    node.tag = tag;
-    node.ip = client_ip;
+    node.tag = owned_tag;
+    node.ip = owned_client_ip;
     node.user = uid;
     guard->quota_reservation_ = reservation;
     const bool admitted = co_await coordinator.PostCall(
@@ -143,16 +148,17 @@ net::awaitable<std::optional<UserOnlineSessionGuard>> UserOnlineTracker::TryConn
             return true;
         });
     if (!admitted) co_return std::nullopt;
-    auto tag_it = impl_->devices.find(tag);
+    memory::ScopedWorkerAllocation worker_allocation;
+    auto tag_it = impl_->devices.find(owned_tag);
     bool tag_inserted = false;
     if (tag_it == impl_->devices.end()) {
         std::tie(tag_it, tag_inserted) =
-            impl_->devices.try_emplace(memory::ThreadLocalString(tag));
+            impl_->devices.try_emplace(memory::ThreadLocalString(owned_tag));
     }
     try {
         auto [user_it, user_inserted] = tag_it->second.try_emplace(uid);
         try {
-            ++user_it->second.try_emplace(memory::ThreadLocalString(client_ip), 0u).first->second;
+            ++user_it->second.try_emplace(memory::ThreadLocalString(owned_client_ip), 0u).first->second;
         } catch (...) {
             if (user_inserted && user_it->second.empty()) tag_it->second.erase(user_it);
             throw;

@@ -7,6 +7,7 @@
 #include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
 #include "acppnode/app/stats.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
+#include "acppnode/common/buf/length_prefixed_packet_buffer.hpp"
 #include "acppnode/common/initial_payload.hpp"
 #include "acppnode/common/session.hpp"
 #include "acppnode/core/constants.hpp"
@@ -16,10 +17,12 @@
 #include "acppnode/proxy/inbound.hpp"
 #include "acppnode/transport/async_stream.hpp"
 #include "acppnode/transport/link.hpp"
+#include "acppnode/transport/link_error.hpp"
 
 #include <tl/expected.hpp>
 
 #include <algorithm>
+#include <array>
 #include <memory>
 #include <span>
 #include <utility>
@@ -31,8 +34,11 @@ namespace wire = ::acpp::transport::internet::hysteria;
 
 constexpr size_t kMaxRequestHeaderBytes = 8192;
 
-net::io_context& SessionReactor() noexcept {
-    return ExecutionDomain::Current()->Reactor();
+net::io_context& SessionReactor(net::io_context& fallback) noexcept {
+    if (auto domain = ExecutionDomain::Current()) {
+        return domain->Reactor();
+    }
+    return fallback;
 }
 
 struct TcpRequest {
@@ -64,6 +70,9 @@ ReadTcpRequest(AsyncStream& stream, wire::Version version, session::Context& ctx
         buf::MultiBuffer chunk;
         try {
             chunk = co_await stream.ReadMultiBuffer();
+        } catch (const transport::LinkError& error) {
+            co_return tl::unexpected(
+                ResolveHandshakeReadFailure(stream, error.code()));
         } catch (const IoSystemError& error) {
             co_return tl::unexpected(ClassifyHandshakeReadException(stream, error));
         }
@@ -71,16 +80,22 @@ ReadTcpRequest(AsyncStream& stream, wire::Version version, session::Context& ctx
             co_return tl::unexpected(ResolveHandshakeReadFailure(
                 stream, ErrorCode::PROTOCOL_DECODE_FAILED));
         }
-        chunk.MoveTo(received);
+        buf::AppendCoalescedStreamInput(received, std::move(chunk));
 
         size_t header_bytes = 0;
         tl::expected<TargetAddress, wire::ProtocolError> target =
             tl::unexpected(wire::ProtocolError::Incomplete);
         {
-            memory::ThreadLocalVector<uint8_t> header(
-                std::min(received.byte_size(), kMaxRequestHeaderBytes));
-            (void)received.CopyPrefixTo(header);
-            target = ParseTcpRequest(version, header, header_bytes);
+            const size_t inspect_bytes =
+                std::min(received.byte_size(), kMaxRequestHeaderBytes);
+            if (const auto contiguous = received.PrefixSpan(inspect_bytes);
+                !contiguous.empty()) {
+                target = ParseTcpRequest(version, contiguous, header_bytes);
+            } else {
+                memory::ThreadLocalVector<uint8_t> header(inspect_bytes);
+                (void)received.CopyPrefixTo(header);
+                target = ParseTcpRequest(version, header, header_bytes);
+            }
         }
         if (target) {
             (void)received.DropPrefixBytes(header_bytes);
@@ -114,15 +129,16 @@ public:
         std::unique_ptr<AsyncStream> stream,
         routing::Dispatcher& dispatcher,
         const proxyman::inbound::ReceiverSettings& receiver,
-        net::io_context& /*io_context*/,
+        net::io_context& io_context,
         session::Context& ctx,
         const TimeoutsConfig& timeouts,
         uint32_t /*pressure_idle_timeout*/) override {
+        auto& reactor = SessionReactor(io_context);
         if (auto* session = dynamic_cast<wire::UdpSessionStream*>(stream.get())) {
             BindInboundRequestTarget(
                 ctx, InboundRequestTarget{Network::UDP, session->FirstTarget()});
             co_return co_await dispatcher.Dispatch(
-                SessionReactor(), receiver.dispatch_policy, std::move(stream),
+                reactor, receiver.dispatch_policy, std::move(stream),
                 transport::Link{session, session}, InitialPayload{},
                 ctx, stats_, timeouts);
         }
@@ -133,11 +149,21 @@ public:
             if (!request) {
                 co_return RejectInbound(stats_, stream.get(), request.error());
             }
-            {
-                auto response = version_ == wire::Version::V1
-                    ? wire::EncodeV1Response(true, 0, "")
-                    : wire::EncodeV2TcpResponse(true, "");
+            static constexpr std::array<uint8_t, 7> kV1OkResponse{1, 0, 0, 0, 0, 0, 0};
+            static constexpr std::array<uint8_t, 3> kV2OkResponse{0, 0, 0};
+            const auto response = version_ == wire::Version::V1
+                ? std::span<const uint8_t>(kV1OkResponse)
+                : std::span<const uint8_t>(kV2OkResponse);
+            try {
                 co_await stream->AsyncWrite(net::buffer(response));
+            } catch (const transport::LinkError& error) {
+                co_return RejectInbound(
+                    stats_, stream.get(),
+                    ResolveHandshakeReadFailure(*stream, error.code()));
+            } catch (const IoSystemError& error) {
+                co_return RejectInbound(
+                    stats_, stream.get(),
+                    ClassifyHandshakeReadException(*stream, error));
             }
             BindInboundRequestTarget(
                 ctx, InboundRequestTarget{Network::TCP, std::move(request->target)});
@@ -147,7 +173,7 @@ public:
 
         auto* tcp_stream = stream.get();
         co_return co_await dispatcher.Dispatch(
-            SessionReactor(), receiver.dispatch_policy, std::move(stream),
+            reactor, receiver.dispatch_policy, std::move(stream),
             transport::Link{tcp_stream, tcp_stream},
             std::move(initial_payload),
             ctx, stats_, timeouts);

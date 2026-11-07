@@ -157,29 +157,23 @@ net::awaitable<std::optional<H2Frame>> ReadH2Frame(AsyncStream& stream) {
         throw IoSystemError(io_error::message_size, "HTTP/2 frame exceeds receive limit");
     }
     if (frame.length > 0) {
-        std::array<uint8_t, 256> chunk{};
         try {
-            while (frame.payload.size() < frame.length) {
-                const size_t want = std::min<size_t>(
-                    frame.length - frame.payload.size(), chunk.size());
+            size_t filled = 0;
+            while (filled < frame.length) {
+                if (filled == frame.payload.size()) {
+                    const size_t next_size = std::min<size_t>(
+                        frame.length,
+                        std::max<size_t>(1024, frame.payload.size() * 2));
+                    frame.payload.resize(next_size);
+                }
                 const size_t n = co_await stream.AsyncRead(
-                    net::buffer(chunk.data(), want));
+                    net::buffer(frame.payload.data() + filled,
+                                frame.payload.size() - filled));
                 if (n == 0) {
                     throw IoSystemError(
                         io_error::connection_reset, "truncated HTTP/2 frame payload");
                 }
-                const size_t required = frame.payload.size() + n;
-                if (required > frame.payload.capacity()) {
-                    const size_t capacity = std::max(
-                        required,
-                        std::min<size_t>(
-                            frame.length,
-                            std::max<size_t>(
-                                256,
-                                frame.payload.capacity() + frame.payload.capacity() / 2)));
-                    frame.payload.reserve(capacity);
-                }
-                frame.payload.insert(frame.payload.end(), chunk.data(), chunk.data() + n);
+                filled += n;
             }
         } catch (const IoSystemError& error) {
             if (error.code() == io_error::operation_aborted) {
@@ -1568,18 +1562,18 @@ private:
         } catch (const IoSystemError& error) {
             failure = std::current_exception();
             stored_failure = failure;
-            if (frame_read) {
+            if (store_failure || frame_read) {
                 inner_->CloseAbortive();
-                if (error.code() == io_error::operation_aborted) {
-                    stored_failure = std::make_exception_ptr(
-                        IoSystemError(io_error::connection_reset,
-                                      "cancelled mid-HTTP/2 frame dispatch"));
-                }
+            }
+            if (frame_read && error.code() == io_error::operation_aborted) {
+                stored_failure = std::make_exception_ptr(
+                    IoSystemError(io_error::connection_reset,
+                                  "cancelled mid-HTTP/2 frame dispatch"));
             }
         } catch (...) {
             failure = std::current_exception();
             stored_failure = failure;
-            if (frame_read) {
+            if (store_failure || frame_read) {
                 inner_->CloseAbortive();
             }
         }
@@ -3410,13 +3404,14 @@ net::awaitable<void> Http2ServerSubStreamState::AsyncShutdownWrite() {
         co_return;
     }
     write_closed_ = true;
+    trailers_sent_ = true;
     if (auto session = session_.lock()) {
         const bool sent = payload_codec_ == H2PayloadCodec::RawData
             ? co_await session->WriteFrameSerialized(
                   H2FrameType::DATA, kFlagEndStream, stream_id_)
             : co_await session->WriteTrailersSerialized(stream_id_);
-        if (sent) {
-            trailers_sent_ = true;
+        if (!sent) {
+            trailers_sent_ = false;
         }
     }
 }

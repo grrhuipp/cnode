@@ -294,6 +294,7 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
     Store32LE(out.data() + 20, state[13]);
     Store32LE(out.data() + 24, state[14]);
     Store32LE(out.data() + 28, state[15]);
+    OPENSSL_cleanse(state.data(), sizeof(state));
     return true;
 }
 
@@ -306,14 +307,17 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
     std::array<uint8_t, 16> hnonce{};
     std::memcpy(hnonce.data(), nonce.data(), hnonce.size());
     if (!HChaCha20(key, hnonce, subkey)) {
+        OPENSSL_cleanse(subkey.data(), subkey.size());
         return false;
     }
 
     std::array<uint8_t, 12> ietf_nonce{};
     std::memcpy(ietf_nonce.data() + 4, nonce.data() + 16, 8);
-    return encrypt
+    const bool ok = encrypt
         ? AeadEncrypt(SsCipherType::CHACHA20_POLY1305, subkey, ietf_nonce, input, output)
         : AeadDecrypt(SsCipherType::CHACHA20_POLY1305, subkey, ietf_nonce, input, output);
+    OPENSSL_cleanse(subkey.data(), subkey.size());
+    return ok;
 }
 
 [[nodiscard]] bool XChaCha20Poly1305Encrypt(std::span<const uint8_t> key,
@@ -435,18 +439,21 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
         if (!Derive2022Subkey(user.derived_key.data(), user.derived_key.size,
                               separate.data(), kSs2022UdpSessionIdSize,
                               subkey.data())) {
+            OPENSSL_cleanse(subkey.data(), subkey.size());
             continue;
         }
         std::array<uint8_t, 12> nonce{};
         std::memcpy(nonce.data(), separate.data() + 4, nonce.size());
-        if (!AeadDecrypt(cipher_info.type,
-                         std::span<const uint8_t>(subkey.data(), cipher_info.key_size),
-                         nonce,
-                         std::span<const uint8_t>(datagram + body_offset, ciphertext_len),
-                         plaintext.data())) {
+        const bool decrypted = AeadDecrypt(
+            cipher_info.type,
+            std::span<const uint8_t>(subkey.data(), cipher_info.key_size),
+            nonce,
+            std::span<const uint8_t>(datagram + body_offset, ciphertext_len),
+            plaintext.data());
+        OPENSSL_cleanse(subkey.data(), subkey.size());
+        if (!decrypted) {
             continue;
         }
-
         std::array<uint8_t, 8> client_session_id{};
         std::memcpy(client_session_id.data(), separate.data(), client_session_id.size());
         auto parsed = Parse2022ClientBodyPlaintext(plaintext, client_session_id);
@@ -559,14 +566,18 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
     if (!DeriveSubkey(master_key.data(), key_size,
                       salt, salt_size,
                       subkey.data())) {
+        OPENSSL_cleanse(subkey.data(), subkey.size());
         return 0;
     }
 
-    if (!AeadEncrypt(cipher_type,
-                     std::span<const uint8_t>(subkey.data(), key_size),
-                     kZeroNonce,
-                     std::span<const uint8_t>(ciphertext, plain_size),
-                     ciphertext)) {
+    const bool encrypted = AeadEncrypt(
+        cipher_type,
+        std::span<const uint8_t>(subkey.data(), key_size),
+        kZeroNonce,
+        std::span<const uint8_t>(ciphertext, plain_size),
+        ciphertext);
+    OPENSSL_cleanse(subkey.data(), subkey.size());
+    if (!encrypted) {
         return 0;
     }
 
@@ -665,15 +676,19 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
     if (!Derive2022Subkey(body_key->data(), body_key->size,
                           session_id, kSs2022UdpSessionIdSize,
                           subkey.data())) {
+        OPENSSL_cleanse(subkey.data(), subkey.size());
         return 0;
     }
     std::array<uint8_t, 12> nonce{};
     std::memcpy(nonce.data(), separate.data() + 4, nonce.size());
-    if (!AeadEncrypt(state.cipher_info.type,
-                     std::span<const uint8_t>(subkey.data(), state.cipher_info.key_size),
-                     nonce,
-                     std::span<const uint8_t>(body_out, body_plain_size),
-                     body_out)) {
+    const bool encrypted = AeadEncrypt(
+        state.cipher_info.type,
+        std::span<const uint8_t>(subkey.data(), state.cipher_info.key_size),
+        nonce,
+        std::span<const uint8_t>(body_out, body_plain_size),
+        body_out);
+    OPENSSL_cleanse(subkey.data(), subkey.size());
+    if (!encrypted) {
         return 0;
     }
 
@@ -804,6 +819,12 @@ bool Ss2022UdpReplayCache::Accept(
     uint64_t packet_id,
     std::chrono::steady_clock::time_point now) {
     SessionKey key;
+    struct CleanseSessionKey {
+        KeyBytes& cred;
+        ~CleanseSessionKey() noexcept {
+            OPENSSL_cleanse(cred.bytes.data(), cred.bytes.size());
+        }
+    } cleanse_key{key.credential};
     if (authenticated_key.empty() || !key.credential.assign(authenticated_key)) return false;
     key.session_id = LoadU64BE(session_id.data());
     auto it = sessions_.find(key);
@@ -920,17 +941,20 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacket(
         if (!DeriveSubkey(user.derived_key.data(), key_size,
                           salt, salt_size,
                           subkey.data())) {
+            OPENSSL_cleanse(subkey.data(), subkey.size());
             continue;
         }
 
-        if (!AeadDecrypt(cipher_type,
-                         std::span<const uint8_t>(subkey.data(), key_size),
-                         kZeroNonce,
-                         std::span<const uint8_t>(cipher, cipherlen),
-                         plaintext.data())) {
+        const bool decrypted = AeadDecrypt(
+            cipher_type,
+            std::span<const uint8_t>(subkey.data(), key_size),
+            kZeroNonce,
+            std::span<const uint8_t>(cipher, cipherlen),
+            plaintext.data());
+        OPENSSL_cleanse(subkey.data(), subkey.size());
+        if (!decrypted) {
             continue;
         }
-
         auto addr = DecodeAddress(
             std::span<const uint8_t>(plaintext.data(), plaintext_len),
             AddressWireFormat::Socks5,
@@ -1014,15 +1038,19 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacketWithKey(
     if (!DeriveSubkey(master_key.data(), key_size,
                       salt, salt_size,
                       subkey.data())) {
+        OPENSSL_cleanse(subkey.data(), subkey.size());
         return std::nullopt;
     }
 
     memory::ByteVector plaintext(plaintext_len);
-    if (!AeadDecrypt(cipher_type,
-                     std::span<const uint8_t>(subkey.data(), key_size),
-                     kZeroNonce,
-                     std::span<const uint8_t>(cipher, cipherlen),
-                     plaintext.data())) {
+    const bool decrypted = AeadDecrypt(
+        cipher_type,
+        std::span<const uint8_t>(subkey.data(), key_size),
+        kZeroNonce,
+        std::span<const uint8_t>(cipher, cipherlen),
+        plaintext.data());
+    OPENSSL_cleanse(subkey.data(), subkey.size());
+    if (!decrypted) {
         return std::nullopt;
     }
 
@@ -1142,15 +1170,19 @@ std::optional<SsUdpDecodeResult> Decode2022UdpResponsePacket(
         if (!Derive2022Subkey(state.key.data(), state.key.size,
                               separate.data(), kSs2022UdpSessionIdSize,
                               subkey.data())) {
+            OPENSSL_cleanse(subkey.data(), subkey.size());
             return std::nullopt;
         }
         std::array<uint8_t, 12> nonce{};
         std::memcpy(nonce.data(), separate.data() + 4, nonce.size());
-        if (!AeadDecrypt(state.cipher_info.type,
-                         std::span<const uint8_t>(subkey.data(), state.cipher_info.key_size),
-                         nonce,
-                         std::span<const uint8_t>(datagram + body_offset, ciphertext_len),
-                         plaintext.data())) {
+        const bool decrypted = AeadDecrypt(
+            state.cipher_info.type,
+            std::span<const uint8_t>(subkey.data(), state.cipher_info.key_size),
+            nonce,
+            std::span<const uint8_t>(datagram + body_offset, ciphertext_len),
+            plaintext.data());
+        OPENSSL_cleanse(subkey.data(), subkey.size());
+        if (!decrypted) {
             return std::nullopt;
         }
         body_span = plaintext;

@@ -1,4 +1,5 @@
 #include "awaitable_batch.hpp"
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/common/error.hpp"
 
 #include <asio/async_result.hpp>
@@ -53,7 +54,7 @@ net::awaitable<void> RunBatchOnExecutor(std::vector<net::awaitable<void>> tasks)
             static_assert(std::is_nothrow_move_constructible_v<decltype(handler)>);
             std::shared_ptr<BatchState<decltype(handler)>> state;
             try {
-                state = std::make_shared<BatchState<decltype(handler)>>(
+                state = memory::AllocateShared<BatchState<decltype(handler)>>(
                     std::move(handler), tasks.size());
             } catch (...) {
                 tasks.clear();

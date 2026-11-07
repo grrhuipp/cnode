@@ -676,6 +676,7 @@ net::awaitable<void> UdpIngress::ClientSession::CancelHandoff(
 }
 
 void UdpIngress::ClientSession::CloseWithError(ErrorCode error) noexcept {
+    memory::ScopedWorkerAllocation worker_allocation;
     if (impl_->transferring) {
         impl_->close_pending = true;
         impl_->terminal_error = error;
@@ -940,6 +941,7 @@ net::awaitable<void> UdpIngress::RunNativeDispatch(ClientSessionPtr client_sessi
             try { co_await job.registry->Retire(std::move(job.registration)); }
             catch (...) { if (!failure) failure = std::current_exception(); }
         }
+        job.capabilities.reset();
         if (failure) std::rethrow_exception(failure);
         co_return;
     }

@@ -111,17 +111,23 @@ net::awaitable<tl::expected<PreparedRequest, ErrorCode>> ReadUotRequestHeader(
     ErrorCode v1_eof_error) {
     PreparedRequest out;
     if (version == Version::V2) {
-        auto request = co_await ReadRequest(reader, pending);
-        if (!request || !request->destination.IsValid()) {
-            co_return tl::unexpected(request
-                ? ErrorCode::PROTOCOL_INVALID_ADDRESS
-                : request.error());
+        try {
+            auto request = co_await ReadRequest(reader, pending);
+            if (!request || !request->destination.IsValid()) {
+                co_return tl::unexpected(request
+                    ? ErrorCode::PROTOCOL_INVALID_ADDRESS
+                    : request.error());
+            }
+            out.is_connect = request->is_connect;
+            out.destination = std::move(request->destination);
+            out.forwarded = std::move(request->forwarded);
+            out.pending = std::move(pending);
+            co_return out;
+        } catch (const transport::LinkError& e) {
+            co_return tl::unexpected(e.code());
+        } catch (const IoSystemError& e) {
+            co_return tl::unexpected(MapAsioError(e.code()));
         }
-        out.is_connect = request->is_connect;
-        out.destination = std::move(request->destination);
-        out.forwarded = std::move(request->forwarded);
-        out.pending = std::move(pending);
-        co_return out;
     }
 
     PacketReader packet_reader(reader, false, TargetAddress{}, std::move(pending));
@@ -142,6 +148,8 @@ net::awaitable<tl::expected<PreparedRequest, ErrorCode>> ReadUotRequestHeader(
         out.pending = packet_reader.TakePending();
         out.initial_decoded = std::move(first_packet);
         co_return out;
+    } catch (const transport::LinkError& e) {
+        co_return tl::unexpected(e.code());
     } catch (const IoSystemError& e) {
         co_return tl::unexpected(MapAsioError(e.code()));
     }
@@ -178,6 +186,7 @@ net::awaitable<buf::MultiBuffer> PacketReader::ReadMultiBuffer() {
         if (co_await EnsurePending(reader_, pending_, 1) != PendingStatus::Ready)
             co_return buf::MultiBuffer{};
         TargetAddress packet_target = destination_;
+        size_t address_bytes = 0;
         if (is_connect_) {
             if (co_await EnsurePending(reader_, pending_, 2) != PendingStatus::Ready) {
                 ThrowDecodeFailure();
@@ -190,24 +199,25 @@ net::awaitable<buf::MultiBuffer> PacketReader::ReadMultiBuffer() {
                 ThrowDecodeFailure();
             }
             packet_target = std::move(address->target);
-            const size_t header_size = address->consumed + 2;
-            if (co_await EnsurePending(reader_, pending_, header_size) != PendingStatus::Ready) {
+            address_bytes = address->consumed;
+            if (co_await EnsurePending(reader_, pending_, address_bytes + 2) != PendingStatus::Ready) {
                 ThrowDecodeFailure();
             }
-            (void)pending_.DropPrefixBytes(address->consumed);
         }
 
-        std::array<uint8_t, 2> length_bytes{};
-        if (pending_.CopyPrefixTo(length_bytes) != length_bytes.size()) {
+        std::array<uint8_t, kMaxAddressSize + 2> header_bytes{};
+        const size_t header_size = address_bytes + 2;
+        if (header_size > header_bytes.size() ||
+            pending_.CopyPrefixTo(std::span<uint8_t>(header_bytes.data(), header_size)) != header_size) {
             ThrowDecodeFailure();
         }
-        (void)pending_.DropPrefixBytes(2);
-        const size_t payload_size = LoadU16BE(length_bytes.data());
-        if (co_await EnsurePending(reader_, pending_, payload_size) !=
+        const size_t payload_size = LoadU16BE(header_bytes.data() + address_bytes);
+        const size_t total_frame_bytes = address_bytes + 2 + payload_size;
+        if (co_await EnsurePending(reader_, pending_, total_frame_bytes) !=
             PendingStatus::Ready) {
             ThrowDecodeFailure();
         }
-
+        (void)pending_.DropPrefixBytes(address_bytes + 2);
         if (payload_size == 0) {
             pending_.ReleaseIfIdle();
             continue;

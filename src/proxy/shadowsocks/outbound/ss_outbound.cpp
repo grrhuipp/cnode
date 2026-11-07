@@ -231,43 +231,46 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
         co_return tl::unexpected(dialed.error());
     }
     auto stream = std::move(*dialed);
-    PhaseDeadlineHandle outbound_protocol_deadline =
-        stream->StartPhaseDeadline(timeouts.HandshakeTimeout());
+    std::optional<ShadowsocksOutboundEndpoint> target_endpoint;
+    {
+        PhaseDeadlineHandle outbound_protocol_deadline =
+            stream->StartPhaseDeadline(timeouts.HandshakeTimeout());
 
-    auto request_session = co_await SendShadowsocksHandshake(
-        *stream,
-        *prepared_,
-        use_uot,
-        ctx.outbound.target,
-        timeouts.HandshakeTimeout(),
-        outbound_protocol_deadline,
-        dialer,
-        ctx);
-    if (!request_session) {
-        stream->CloseAbortive();
-        co_return tl::unexpected(request_session.error());
-    }
-
-    ShadowsocksOutboundEndpoint target_endpoint(
-        std::move(request_session->request_writer),
-        prepared_->credentials.Cipher(),
-        prepared_->credentials.MasterKey(),
-        request_session->request_salt,
-        *stream);
-    OPENSSL_cleanse(request_session->request_salt.bytes.data(),
-                    request_session->request_salt.bytes.size());
-
-    if (use_uot &&
-        *prepared_->config.uot_version != SsUotVersion::V1) {
-        if (auto ok = co_await WriteUotRequest(
-                target_endpoint,
-                ctx.outbound.target,
-                outbound_protocol_deadline,
-                dialer,
-                ctx);
-            !ok) {
+        auto request_session = co_await SendShadowsocksHandshake(
+            *stream,
+            *prepared_,
+            use_uot,
+            ctx.outbound.target,
+            timeouts.HandshakeTimeout(),
+            outbound_protocol_deadline,
+            dialer,
+            ctx);
+        if (!request_session) {
             stream->CloseAbortive();
-            co_return tl::unexpected(ok.error());
+            co_return tl::unexpected(request_session.error());
+        }
+
+        target_endpoint.emplace(
+            std::move(request_session->request_writer),
+            prepared_->credentials.Cipher(),
+            prepared_->credentials.MasterKey(),
+            request_session->request_salt,
+            *stream);
+        OPENSSL_cleanse(request_session->request_salt.bytes.data(),
+                        request_session->request_salt.bytes.size());
+
+        if (use_uot &&
+            *prepared_->config.uot_version != SsUotVersion::V1) {
+            if (auto ok = co_await WriteUotRequest(
+                    *target_endpoint,
+                    ctx.outbound.target,
+                    outbound_protocol_deadline,
+                    dialer,
+                    ctx);
+                !ok) {
+                stream->CloseAbortive();
+                co_return tl::unexpected(ok.error());
+            }
         }
     }
 
@@ -284,10 +287,10 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
 
     if (use_uot) {
         proxy::uot::FramedEndpoint uot_endpoint(
-            target_endpoint, false, ctx.outbound.target);
+            *target_endpoint, false, ctx.outbound.target);
         co_return co_await relay_endpoint(uot_endpoint);
     }
-    co_return co_await relay_endpoint(target_endpoint);
+    co_return co_await relay_endpoint(*target_endpoint);
 }
 
 proxy::shadowsocks::outbound::Handler::Handler(

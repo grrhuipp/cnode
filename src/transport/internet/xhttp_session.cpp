@@ -1172,7 +1172,16 @@ net::awaitable<size_t> XHttpPacketUpSession::AsyncRead(net::mutable_buffer buffe
         if (auto stream = stream_input_.Snapshot()) {
             UploadRead pending(*this, stream);
             const uint64_t epoch = read_abort_epoch_;
-            const size_t n = co_await stream->AsyncRead(buffer);
+            size_t n = 0;
+            try {
+                n = co_await stream->AsyncRead(buffer);
+            } catch (const IoSystemError& e) {
+                if (e.code() != io_error::operation_aborted) {
+                    ReleaseAttachedUpload(stream);
+                    stream->CloseAbortive();
+                }
+                throw;
+            }
             if (n > 0) {
                 co_return n;
             }
@@ -1201,7 +1210,16 @@ net::awaitable<buf::MultiBuffer> XHttpPacketUpSession::ReadMultiBuffer() {
         if (auto stream = stream_input_.Snapshot()) {
             UploadRead pending(*this, stream);
             const uint64_t epoch = read_abort_epoch_;
-            buf::MultiBuffer mb = co_await stream->ReadMultiBuffer();
+            buf::MultiBuffer mb;
+            try {
+                mb = co_await stream->ReadMultiBuffer();
+            } catch (const IoSystemError& e) {
+                if (e.code() != io_error::operation_aborted) {
+                    ReleaseAttachedUpload(stream);
+                    stream->CloseAbortive();
+                }
+                throw;
+            }
             if (mb.byte_size() != 0) {
                 co_return mb;
             }

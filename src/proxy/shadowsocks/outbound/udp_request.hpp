@@ -5,6 +5,7 @@
 #include "../ss_udp.hpp"
 #include "acppnode/common/buf/contiguous_buffer_view.hpp"
 
+#include <openssl/crypto.h>
 #include <array>
 #include <optional>
 
@@ -40,6 +41,14 @@ public:
         }
     }
 
+    ~UdpRequest() noexcept override {
+        OPENSSL_cleanse(master_key_.bytes.data(), master_key_.bytes.size());
+        if (ss2022_state_) {
+            OPENSSL_cleanse(ss2022_state_->key.bytes.data(),
+                            ss2022_state_->key.bytes.size());
+        }
+    }
+
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
         // Keep one absolute read budget across unauthenticated or wrong-source
         // packets. Only an authenticated payload is valid receive activity.
@@ -53,7 +62,10 @@ public:
                 ? ss::Decode2022UdpResponsePacket(bytes.data(), bytes.size(), *ss2022_state_)
                 : ss::DecodeUdpPacketWithKey(bytes.data(), bytes.size(), master_key_.span(),
                     cipher_info_.type, cipher_info_.key_size, cipher_info_.salt_size);
-            if (!decoded || !decoded->target.IsValid() || decoded->payload.byte_size() == 0) continue;
+            if (!decoded) continue;
+            OPENSSL_cleanse(decoded->session_owner.bytes.data(),
+                            decoded->session_owner.bytes.size());
+            if (!decoded->target.IsValid() || decoded->payload.byte_size() == 0) continue;
             for (auto* buffer : decoded->payload) buffer->SetUDP(decoded->target);
             socket_.TouchActivity();
             co_return std::move(decoded->payload);
@@ -110,7 +122,7 @@ private:
     const TargetAddress server_;
     std::optional<udp::endpoint> server_endpoint_;
     const ss::SsCipherInfo cipher_info_;
-    const ss::KeyBytes master_key_;
+    ss::KeyBytes master_key_;
     const std::span<const ss::KeyBytes> psk_chain_;
     std::optional<ForwardedMetadata> forwarded_;
     std::optional<ss::Ss2022UdpSessionState> ss2022_state_;

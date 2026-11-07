@@ -72,7 +72,9 @@ public:
     }
 
     void Clear() noexcept {
-        spill_.clear();
+        if (spill_.capacity() != 0) {
+            memory::ThreadLocalVector<net::const_buffer>{spill_.get_allocator()}.swap(spill_);
+        }
         count_ = 0;
     }
 

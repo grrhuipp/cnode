@@ -144,34 +144,25 @@ ReadAndDecryptStreamPayload(
 
     buf::MultiBuffer decoded;
 
-    if (payload_len > 0) {
-        buf::BufferGuard cipher_buf{buf::Buffer::New()};
-        if (!cipher_buf) {
+    size_t remaining = payload_len;
+    while (remaining > 0) {
+        buf::BufferGuard plain{buf::Buffer::New()};
+        if (!plain) {
             co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
         }
 
-        size_t remaining = payload_len;
-        while (remaining > 0) {
-            buf::BufferGuard plain{buf::Buffer::New()};
-            if (!plain) {
-                co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
-            }
-
-            const size_t to_process =
-                std::min(remaining, static_cast<size_t>(plain->Available()));
-            cipher_buf->Reset();
-            if (!co_await ReadFull(stream, cipher_buf->Tail().data(), to_process)) {
-                co_return tl::unexpected(ErrorCode::SOCKET_READ_FAILED);
-            }
-            cipher_buf->Produce(static_cast<uint32_t>(to_process));
-
-            if (!cipher.DecryptUpdate(cipher_buf->Bytes(), plain->Tail().first(to_process))) {
-                co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
-            }
-            plain->Produce(static_cast<uint32_t>(to_process));
-            decoded.push_back(std::move(plain));
-            remaining -= to_process;
+        const size_t to_process =
+            std::min(remaining, static_cast<size_t>(plain->Available()));
+        if (!co_await ReadFull(stream, plain->Tail().data(), to_process)) {
+            co_return tl::unexpected(ErrorCode::SOCKET_READ_FAILED);
         }
+        plain->Produce(static_cast<uint32_t>(to_process));
+
+        if (!cipher.DecryptUpdate(plain->Bytes(), plain->Bytes())) {
+            co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        }
+        decoded.push_back(std::move(plain));
+        remaining -= to_process;
     }
 
     std::array<uint8_t, SsAeadCipher::kTagSize> payload_tag{};

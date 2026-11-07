@@ -113,30 +113,29 @@ public:
         , is_udp_(is_udp)
         , udp_target_(udp_target)
         , packet_addr_(packet_addr) {
-        if (vision) {
-            vision_io_ = std::make_unique<VisionIoState>(reader_, writer_, user_uuid);
-        }
         if (is_udp_) {
-            udp_io_ = std::make_unique<UdpIoState>(packet_addr);
+            io_state_.emplace<UdpIoState>(packet_addr);
+        } else if (vision) {
+            io_state_.emplace<VisionIoState>(reader_, writer_, user_uuid);
         }
     }
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
         co_await ReadVlessResponseHeader(
             reader_, response_header_, "VLESS response header read failed");
-        if (is_udp_) {
-            co_return co_await udp_io_->framer.ReadDatagram(reader_, udp_target_);
+        if (auto* udp_io = std::get_if<UdpIoState>(&io_state_)) {
+            co_return co_await udp_io->framer.ReadDatagram(reader_, udp_target_);
         }
-        if (vision_io_) {
-            co_return co_await vision_io_->reader.ReadMultiBuffer();
+        if (auto* vision_io = std::get_if<VisionIoState>(&io_state_)) {
+            co_return co_await vision_io->reader.ReadMultiBuffer();
         }
         co_return co_await reader_.ReadMultiBuffer();
     }
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
         if (!is_udp_) {
-            if (vision_io_) {
-                co_await vision_io_->writer.WriteMultiBuffer(std::move(mb));
+            if (auto* vision_io = std::get_if<VisionIoState>(&io_state_)) {
+                co_await vision_io->writer.WriteMultiBuffer(std::move(mb));
                 co_return;
             }
             co_await writer_.WriteMultiBuffer(std::move(mb));
@@ -150,8 +149,8 @@ public:
 
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
         if (!is_udp_) {
-            if (vision_io_) {
-                co_await vision_io_->writer.WriteBuffers(buffers);
+            if (auto* vision_io = std::get_if<VisionIoState>(&io_state_)) {
+                co_await vision_io->writer.WriteBuffers(buffers);
                 co_return;
             }
             co_await writer_.WriteBuffers(buffers);
@@ -177,8 +176,7 @@ private:
     bool is_udp_ = false;
     const TargetAddress& udp_target_;
     bool packet_addr_ = false;
-    std::unique_ptr<VisionIoState> vision_io_;
-    std::unique_ptr<UdpIoState> udp_io_;
+    std::variant<std::monostate, VisionIoState, UdpIoState> io_state_;
 };
 
 
@@ -446,6 +444,7 @@ SendVlessHandshake(
         co_await WriteVlessBytes(
             *active_writer, std::span<const uint8_t>(header_buf.data(), header_len));
     } catch (...) {
+        OPENSSL_cleanse(header_buf.data(), header_len);
         const ErrorCode classified = proxy::ClassifyOutboundHandshakeException(
             stream, outbound_protocol_deadline);
         if (encrypted_io && classified != ErrorCode::CANCELLED) {
@@ -453,6 +452,7 @@ SendVlessHandshake(
         }
         co_return tl::unexpected(classified);
     }
+    OPENSSL_cleanse(header_buf.data(), header_len);
     co_return tl::expected<void, ErrorCode>{};
 }
 

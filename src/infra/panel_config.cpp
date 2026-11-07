@@ -67,12 +67,14 @@ std::optional<PanelApiUrlParts> ParsePanelApiUrl(std::string_view url) {
         return std::nullopt;
     }
     const std::string_view scheme = url.substr(0, scheme_pos);
-    if (scheme != constants::protocol::kHttp &&
-        scheme != constants::protocol::kHttps) {
+    const bool is_http =
+        transport::internet::EqualsAsciiCI(scheme, constants::protocol::kHttp);
+    const bool is_https =
+        transport::internet::EqualsAsciiCI(scheme, constants::protocol::kHttps);
+    if (!is_http && !is_https) {
         return std::nullopt;
     }
-    const bool use_ssl = (scheme == constants::protocol::kHttps);
-
+    const bool use_ssl = is_https;
     const std::string_view rest = url.substr(scheme_pos + 3);
     const size_t path_pos = rest.find('/');
     const std::string_view authority = path_pos == std::string_view::npos
@@ -141,9 +143,10 @@ std::optional<PanelApiUrlParts> ParsePanelApiUrl(std::string_view url) {
                 !domain::IsValidDnsHostname(host, domain::TrailingDotPolicy::Allow))) {
         return std::nullopt;
     }
+    std::string normalized_host(host);
     if (!literal_address) {
-        host = domain::WithoutTrailingRootDot(host);
-        if (iputil::ParseLiteral(host).has_value()) {
+        domain::NormalizeDnsHostnameInPlace(normalized_host);
+        if (iputil::ParseLiteral(normalized_host).has_value()) {
             return std::nullopt;
         }
     }
@@ -153,7 +156,7 @@ std::optional<PanelApiUrlParts> ParsePanelApiUrl(std::string_view url) {
     }
 
     return PanelApiUrlParts{
-        .host = std::string(host),
+        .host = std::move(normalized_host),
         .port = port,
         .path_prefix = std::string(path_prefix),
         .use_ssl = use_ssl,

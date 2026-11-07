@@ -6,6 +6,7 @@
 #include "acppnode/common/allocator.hpp"
 
 #include <openssl/rand.h>
+#include <openssl/crypto.h>
 
 #include <algorithm>
 #include <cstring>
@@ -164,6 +165,16 @@ struct PreparedTCPRequestHandshake {
     buf::MultiBuffer handshake_mb;
     std::optional<SsAeadCipher> write_cipher;
     KeyBytes request_salt;
+
+    PreparedTCPRequestHandshake() = default;
+    PreparedTCPRequestHandshake(const PreparedTCPRequestHandshake&) = delete;
+    PreparedTCPRequestHandshake& operator=(const PreparedTCPRequestHandshake&) = delete;
+    PreparedTCPRequestHandshake(PreparedTCPRequestHandshake&&) noexcept = default;
+    PreparedTCPRequestHandshake& operator=(PreparedTCPRequestHandshake&&) noexcept = default;
+
+    ~PreparedTCPRequestHandshake() noexcept {
+        OPENSSL_cleanse(request_salt.bytes.data(), request_salt.bytes.size());
+    }
 };
 
 tl::expected<PreparedTCPRequestHandshake, ErrorCode>
@@ -202,6 +213,10 @@ PrepareTCPRequest2022(const TargetAddress& target,
     }
 
     std::array<uint8_t, 32> write_subkey{};
+    struct CleanseWriteSubkey {
+        std::array<uint8_t, 32>& buf;
+        ~CleanseWriteSubkey() noexcept { OPENSSL_cleanse(buf.data(), buf.size()); }
+    } cleanse_write_subkey{write_subkey};
     if (!Derive2022Subkey(master_key.data(), cipher_info.key_size,
                           prepared.request_salt.data(), prepared.request_salt.size,
                           write_subkey.data())) {
@@ -309,6 +324,14 @@ PrepareTCPRequestLegacy(const TargetAddress& target,
     }
 
     std::array<uint8_t, 64> write_subkey{};
+    struct CleanseLegacySecrets {
+        std::array<uint8_t, 64>& salt;
+        std::array<uint8_t, 64>& subkey;
+        ~CleanseLegacySecrets() noexcept {
+            OPENSSL_cleanse(salt.data(), salt.size());
+            OPENSSL_cleanse(subkey.data(), subkey.size());
+        }
+    } cleanse_legacy{client_salt, write_subkey};
     if (!DeriveSubkey(master_key.data(), cipher_info.key_size,
                       client_salt.data(), cipher_info.salt_size,
                       write_subkey.data())) {
@@ -317,7 +340,6 @@ PrepareTCPRequestLegacy(const TargetAddress& target,
 
     buf::BufferGuard out{buf::Buffer::New()};
     if (!out) {
-        OPENSSL_cleanse(write_subkey.data(), write_subkey.size());
         return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
     }
 
@@ -364,6 +386,12 @@ WriteTCPRequest2022(const TargetAddress& target,
     buf::MultiBuffer handshake_mb;
     std::optional<SsAeadCipher> write_cipher;
     KeyBytes request_salt;
+    struct CleanseRequestSalt {
+        KeyBytes& salt;
+        ~CleanseRequestSalt() noexcept {
+            OPENSSL_cleanse(salt.bytes.data(), salt.bytes.size());
+        }
+    } cleanse_request_salt{request_salt};
     {
         auto prepared = PrepareTCPRequest2022(
             target, cipher_info, master_key, psk_chain, forwarded);
@@ -459,6 +487,14 @@ ReadTCPResponse(const SsCipherInfo& cipher_info,
             }
 
             std::array<uint8_t, 32> read_subkey{};
+            struct Cleanse2022ReadSecrets {
+                std::array<uint8_t, 64>& salt;
+                std::array<uint8_t, 32>& subkey;
+                ~Cleanse2022ReadSecrets() noexcept {
+                    OPENSSL_cleanse(salt.data(), salt.size());
+                    OPENSSL_cleanse(subkey.data(), subkey.size());
+                }
+            } cleanse_2022_read{server_salt, read_subkey};
             if (!Derive2022Subkey(master_key.data(), cipher_info.key_size,
                                   server_salt.data(), cipher_info.salt_size,
                                   read_subkey.data())) {
@@ -467,6 +503,7 @@ ReadTCPResponse(const SsCipherInfo& cipher_info,
 
             SsAeadCipher read_cipher(cipher_info.type, read_subkey.data(), cipher_info.key_size,
                                      proxy::AeadDirection::Decrypt);
+            OPENSSL_cleanse(server_salt.data(), server_salt.size());
             OPENSSL_cleanse(read_subkey.data(), read_subkey.size());
             const size_t fixed_plain_size = 1 + 8 + cipher_info.salt_size + 2;
             constexpr size_t kFixedPlainMaxSize = 1 + 8 + KeyBytes::kMaxSize + 2;
@@ -519,6 +556,14 @@ ReadTCPResponse(const SsCipherInfo& cipher_info,
         }
 
         std::array<uint8_t, 64> read_subkey{};
+        struct CleanseLegacyReadSecrets {
+            std::array<uint8_t, 64>& salt;
+            std::array<uint8_t, 64>& subkey;
+            ~CleanseLegacyReadSecrets() noexcept {
+                OPENSSL_cleanse(salt.data(), salt.size());
+                OPENSSL_cleanse(subkey.data(), subkey.size());
+            }
+        } cleanse_legacy_read{server_salt, read_subkey};
         if (!DeriveSubkey(master_key.data(), cipher_info.key_size,
                           server_salt.data(), cipher_info.salt_size,
                           read_subkey.data())) {
@@ -527,6 +572,7 @@ ReadTCPResponse(const SsCipherInfo& cipher_info,
 
         SsAeadCipher read_cipher(cipher_info.type, read_subkey.data(), cipher_info.key_size,
                                  proxy::AeadDirection::Decrypt);
+        OPENSSL_cleanse(server_salt.data(), server_salt.size());
         OPENSSL_cleanse(read_subkey.data(), read_subkey.size());
         co_return std::make_unique<detail::BodyReader>(
             std::move(read_cipher), 0, stream);
