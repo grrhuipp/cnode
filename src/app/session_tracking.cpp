@@ -1,6 +1,7 @@
 #include "acppnode/app/session_tracking.hpp"
 
 #include "acppnode/common/session.hpp"
+#include "acppnode/common/container_util.hpp"
 #include <stdexcept>
 
 namespace acpp::app {
@@ -57,7 +58,10 @@ void SessionTrackingState::UnregisterActiveSession(ActiveSession& node) noexcept
         if (bucket->traffic.empty()) {
             if (const auto entry = accounts_.find(bucket->key); entry != accounts_.end()) {
                 accounts_.erase(entry);
+                MaybeShrinkHashContainer(accounts_, 8);
             }
+        } else {
+            MaybeShrinkHashContainer(bucket->traffic);
         }
     }
     node = {};
@@ -117,7 +121,12 @@ void SessionTrackingState::CommitTraffic(
             bucket.traffic.erase(it);
         }
     }
-    if (bucket.traffic.empty()) accounts_.erase(entry);
+    if (bucket.traffic.empty()) {
+        accounts_.erase(entry);
+        MaybeShrinkHashContainer(accounts_, 8);
+    } else {
+        MaybeShrinkHashContainer(bucket.traffic);
+    }
 }
 
 void SessionTrackingState::RollbackTraffic(
@@ -168,7 +177,12 @@ UserTrafficCounters SessionTrackingState::ExtractAvailableTraffic(
             ++it;
         }
     }
-    if (bucket.traffic.empty()) accounts_.erase(entry);
+    if (bucket.traffic.empty()) {
+        accounts_.erase(entry);
+        MaybeShrinkHashContainer(accounts_, 8);
+    } else {
+        MaybeShrinkHashContainer(bucket.traffic);
+    }
     return result;
 }
 

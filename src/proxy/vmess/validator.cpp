@@ -45,7 +45,7 @@ struct SessionKeyHash {
         static constexpr size_t kMaxEntries = 65536;
 
         memory::ThreadLocalUnorderedMap<SessionKey, int64_t, SessionKeyHash, SessionKeyEqual> entries;
-        memory::ThreadLocalDeque<std::pair<SessionKey, int64_t>> order;
+        memory::ThreadLocalDeque<std::pair<const SessionKey*, int64_t>> order;
         int64_t last_cleanup = 0;
 
         SessionHistory()
@@ -64,8 +64,8 @@ struct SessionKeyHash {
             }
             last_cleanup = now;
             while (!order.empty()) {
-                const auto& [key, expires_at] = order.front();
-                auto it = entries.find(key);
+                const auto [key_ptr, expires_at] = order.front();
+                auto it = entries.find(*key_ptr);
                 if (it == entries.end() || it->second != expires_at) {
                     order.pop_front();
                     continue;
@@ -77,10 +77,7 @@ struct SessionKeyHash {
                 order.pop_front();
             }
             MaybeShrinkHashContainer(entries);
-            if (order.empty()) {
-                memory::ThreadLocalDeque<std::pair<SessionKey, int64_t>>{
-                    order.get_allocator()}.swap(order);
-            }
+            order.shrink_to_fit();
         }
 
         bool AddIfNew(SessionKey key, int64_t now) {
@@ -89,23 +86,29 @@ struct SessionKeyHash {
             if (it != entries.end() && it->second > now) {
                 return false;
             }
-            if (it == entries.end()) {
-                while (entries.size() >= kMaxEntries && !order.empty()) {
-                    const auto& [oldest_key, oldest_expires] = order.front();
-                    if (auto oldest_it = entries.find(oldest_key);
-                        oldest_it != entries.end() && oldest_it->second == oldest_expires) {
-                        entries.erase(oldest_it);
-                    }
-                    order.pop_front();
-                }
-                if (entries.size() >= kMaxEntries) {
-                    entries.erase(entries.begin());
+            const int64_t expires_at = now + kTtlSeconds;
+            if (it != entries.end()) {
+                order.emplace_back(&it->first, expires_at);
+                it->second = expires_at;
+                return true;
+            }
+            while (entries.size() >= kMaxEntries && !order.empty()) {
+                const auto [oldest_key_ptr, oldest_expires] = order.front();
+                order.pop_front();
+                if (auto oldest_it = entries.find(*oldest_key_ptr);
+                    oldest_it != entries.end() && oldest_it->second == oldest_expires) {
+                    entries.erase(oldest_it);
                 }
             }
-            const int64_t expires_at = now + kTtlSeconds;
-            order.emplace_back(key, expires_at);
-            try { entries.insert_or_assign(std::move(key), expires_at); }
-            catch (...) { order.pop_back(); throw; }
+            auto [inserted_it, inserted] = entries.emplace(std::move(key), expires_at);
+            try {
+                order.emplace_back(&inserted_it->first, expires_at);
+            } catch (...) {
+                if (inserted) {
+                    entries.erase(inserted_it);
+                }
+                throw;
+            }
             return true;
         }
 

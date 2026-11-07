@@ -10,6 +10,7 @@
 #include "acppnode/transport/async_stream.hpp"
 #include "acppnode/transport/link_error.hpp"
 #include "acppnode/common/buffer_util.hpp"
+#include "acppnode/common/container_util.hpp"
 #include "acppnode/infra/log.hpp"
 
 #include <asio/as_tuple.hpp>
@@ -1112,6 +1113,7 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                 if (reply.is_end || reply.dispatch_done) {
                     if (reply.dispatch_done) {
                         sub_sessions.erase(reply.session_id);
+                        MaybeShrinkHashContainer(sub_sessions, 8);
                     }
                     if (!reply.is_end) {
                         continue;

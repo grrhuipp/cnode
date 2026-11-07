@@ -2,6 +2,7 @@
 
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/string_hash.hpp"
+#include "acppnode/common/container_util.hpp"
 #include "acppnode/app/session_group_executor.hpp"
 
 #include <string>
@@ -23,9 +24,18 @@ struct DeviceQuota {
         if (user_it == tag_it->second.end()) return;
         const auto ip_it = user_it->second.find(ip);
         if (ip_it == user_it->second.end()) return;
-        if (--ip_it->second == 0) user_it->second.erase(ip_it);
-        if (user_it->second.empty()) tag_it->second.erase(user_it);
-        if (tag_it->second.empty()) devices.erase(tag_it);
+        if (--ip_it->second == 0) {
+            user_it->second.erase(ip_it);
+            MaybeShrinkHashContainer(user_it->second, 8);
+        }
+        if (user_it->second.empty()) {
+            tag_it->second.erase(user_it);
+            MaybeShrinkHashContainer(tag_it->second, 8);
+        }
+        if (tag_it->second.empty()) {
+            devices.erase(tag_it);
+            MaybeShrinkHashContainer(devices, 8);
+        }
     }
 };
 
@@ -192,12 +202,15 @@ void UserOnlineTracker::OnUserDisconnected(std::string_view tag,
     }
     if (--ip_it->second == 0) {
         device_user_it->second.erase(ip_it);
+        MaybeShrinkHashContainer(device_user_it->second, 8);
     }
     if (device_user_it->second.empty()) {
         device_tag_it->second.erase(device_user_it);
+        MaybeShrinkHashContainer(device_tag_it->second, 8);
     }
     if (device_tag_it->second.empty()) {
         impl_->devices.erase(device_tag_it);
+        MaybeShrinkHashContainer(impl_->devices, 8);
     }
 }
 

@@ -22,6 +22,7 @@
 #include "acppnode/transport/internet/timeout_scheduler.hpp"
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
 #include "acppnode/common/address_codec.hpp"
+#include "acppnode/common/container_util.hpp"
 
 #include <asio/experimental/channel.hpp>
 #include <openssl/crypto.h>
@@ -322,6 +323,7 @@ public:
         }
         auto sub = std::move(it->second);
         streams_.erase(it);
+        MaybeShrinkHashContainer(streams_, 8);
         if (sub) {
             sub->Cancel();
         }

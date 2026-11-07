@@ -16,6 +16,7 @@
 #include "acppnode/app/stats.hpp"
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/ip_utils.hpp"
+#include "acppnode/common/container_util.hpp"
 #include "acppnode/common/session.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/infra/runtime_failure.hpp"
@@ -330,6 +331,7 @@ struct Handler::ClientSession : memory::ThreadAllocated {
 
     void UnregisterLogicalStream(uint32_t sid) {
         logical_streams.erase(sid);
+        MaybeShrinkHashContainer(logical_streams, 8);
     }
 
     void CloseAll(ErrorCode error) noexcept {

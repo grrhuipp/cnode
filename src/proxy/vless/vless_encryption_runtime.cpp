@@ -2,6 +2,7 @@
 #include "vless_ticket_service.hpp"
 
 #include "acppnode/common/allocator.hpp"
+#include "acppnode/common/container_util.hpp"
 
 #include <blake3.h>
 #include <openssl/rand.h>
@@ -308,6 +309,8 @@ void VlessEncryptionServerTicketStore::Prune(
         }
         EraseOldest();
     }
+    MaybeShrinkHashContainer(sessions_);
+    order_.shrink_to_fit();
 }
 
 std::optional<VlessEncryptionServerTicketStore::ResumedSession>
@@ -382,7 +385,7 @@ void VlessEncryptionServerTicketStore::Store(
         EraseOldest();
     }
     const auto expires_at = now + std::chrono::seconds(seconds);
-    sessions_.try_emplace(
+    auto [inserted_it, inserted] = sessions_.try_emplace(
         ticket_array,
         Session{
             .pfs_key = pfs_key,
@@ -391,7 +394,14 @@ void VlessEncryptionServerTicketStore::Store(
             .seen_nfs_keys = decltype(Session::seen_nfs_keys)(
                 0, sessions_.hash_function(), sessions_.key_eq()),
         });
-    order_.emplace_back(ticket_array, expires_at);
+    try {
+        order_.emplace_back(ticket_array, expires_at);
+    } catch (...) {
+        if (inserted) {
+            sessions_.erase(inserted_it);
+        }
+        throw;
+    }
 }
 
 net::awaitable<VlessEncryptionHandshakeResult>

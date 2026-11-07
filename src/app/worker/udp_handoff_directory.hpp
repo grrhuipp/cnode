@@ -1,6 +1,7 @@
 #pragma once
 
 #include "udp_ingress.hpp"
+#include "acppnode/common/container_util.hpp"
 
 #include <atomic>
 #include <unordered_map>
@@ -78,6 +79,7 @@ public:
                     it = records_.erase(it);
                 else ++it;
             }
+            MaybeShrinkHashContainer(records_);
             if (records_.size() >= policy.capacity) return {};
         }
         auto record = std::make_shared<UdpHandoffRecord>(policy);

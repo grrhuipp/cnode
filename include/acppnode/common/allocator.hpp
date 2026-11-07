@@ -1317,6 +1317,8 @@ public:
         head_ = (head_ + 1) & (capacity_ - 1);
         if (--size_ == 0) {
             ReleaseStorage();
+        } else if (capacity_ >= 64 && size_ <= capacity_ / 8) {
+            shrink_to_fit();
         }
     }
 
@@ -1325,6 +1327,8 @@ public:
         std::destroy_at(data_ + idx);
         if (--size_ == 0) {
             ReleaseStorage();
+        } else if (capacity_ >= 64 && size_ <= capacity_ / 8) {
+            shrink_to_fit();
         }
     }
 
@@ -1339,6 +1343,34 @@ public:
     void shrink_to_fit() noexcept {
         if (size_ == 0) {
             ReleaseStorage();
+            return;
+        }
+        if constexpr (std::is_nothrow_move_constructible_v<T>) {
+            if (capacity_ < 64 || size_ > capacity_ / 4) {
+                return;
+            }
+            std::size_t target_cap = 4;
+            while (target_cap < size_ * 2) {
+                target_cap *= 2;
+            }
+            if (target_cap >= capacity_) {
+                return;
+            }
+            try {
+                auto lifetime = PinResource();
+                T* next_data = static_cast<T*>(
+                    resource_->allocate(target_cap * sizeof(T), alignof(T)));
+                for (std::size_t i = 0; i < size_; ++i) {
+                    const std::size_t idx = (head_ + i) & (capacity_ - 1);
+                    ConstructAt(next_data + i, std::move(data_[idx]));
+                    std::destroy_at(data_ + idx);
+                }
+                resource_->deallocate(data_, capacity_ * sizeof(T), alignof(T));
+                data_ = next_data;
+                head_ = 0;
+                capacity_ = target_cap;
+            } catch (...) {
+            }
         }
     }
 
