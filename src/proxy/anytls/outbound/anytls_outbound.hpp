@@ -5,6 +5,7 @@
 #include "acppnode/transport/internet/outbound_sender.hpp"
 
 #include <array>
+#include <openssl/crypto.h>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -25,6 +26,15 @@ struct Settings {
     std::chrono::seconds idle_session_check_interval{30};
     std::chrono::seconds idle_session_timeout{60};
     size_t min_idle_sessions = 0;
+
+    Settings() = default;
+    Settings(const Settings&) = default;
+    Settings& operator=(const Settings&) = default;
+    Settings(Settings&&) noexcept = default;
+    Settings& operator=(Settings&&) noexcept = default;
+    ~Settings() noexcept {
+        OPENSSL_cleanse(password_hash.data(), password_hash.size());
+    }
 };
 
 // ============================================================================

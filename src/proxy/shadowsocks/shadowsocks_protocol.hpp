@@ -75,7 +75,7 @@ struct KeyBytes {
 };
 
 // 从密码派生主密钥（EVP_BytesToKey + MD5，Shadowsocks 标准）
-[[nodiscard]] KeyBytes DeriveKey(const std::string& password, size_t key_size);
+[[nodiscard]] KeyBytes DeriveKey(std::string_view password, size_t key_size);
 [[nodiscard]] KeyBytes Decode2022Psk(std::string_view password, size_t key_size);
 [[nodiscard]] KeyBytes Build2022UserKeyFromUuid(
     std::string_view uuid,

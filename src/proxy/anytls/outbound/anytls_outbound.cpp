@@ -1001,32 +1001,39 @@ DialPhysicalSession(
     auto deadline = new_stream->StartPhaseDeadline(handshake_timeout);
 
     const uint16_t auth_padding_size = opening_scheme.SampleAuthPaddingSize();
-    memory::ByteVector auth_packet(34 + auth_padding_size, uint8_t{0});
+    const size_t auth_packet_size = 34 + static_cast<size_t>(auth_padding_size);
+    std::array<uint8_t, 256> inline_auth{};
+    memory::ByteVector heap_auth;
     struct CleanseAuthPacket {
-        memory::ByteVector& buf;
+        std::array<uint8_t, 256>& stack_buf;
+        memory::ByteVector& heap_buf;
         ~CleanseAuthPacket() noexcept {
-            if (!buf.empty()) {
-                OPENSSL_cleanse(buf.data(), buf.size());
+            OPENSSL_cleanse(stack_buf.data(), stack_buf.size());
+            if (!heap_buf.empty()) {
+                OPENSSL_cleanse(heap_buf.data(), heap_buf.size());
             }
         }
-    } cleanse_auth_packet{auth_packet};
-    std::copy(settings.password_hash.begin(), settings.password_hash.end(), auth_packet.begin());
-    auth_packet[32] = static_cast<uint8_t>(auth_padding_size >> 8);
-    auth_packet[33] = static_cast<uint8_t>(auth_padding_size);
+    } cleanse_auth_packet{inline_auth, heap_auth};
+    uint8_t* auth_ptr = inline_auth.data();
+    if (auth_packet_size > inline_auth.size()) {
+        heap_auth.assign(auth_packet_size, uint8_t{0});
+        auth_ptr = heap_auth.data();
+    }
+    std::copy(settings.password_hash.begin(), settings.password_hash.end(), auth_ptr);
+    auth_ptr[32] = static_cast<uint8_t>(auth_padding_size >> 8);
+    auth_ptr[33] = static_cast<uint8_t>(auth_padding_size);
 
     tl::expected<void, ErrorCode> ok;
     try {
         ok = co_await WriteAll(
             *new_stream,
-            std::span<const uint8_t>(
-                auth_packet.data(),
-                auth_packet.size()));
+            std::span<const uint8_t>(auth_ptr, auth_packet_size));
     } catch (...) {
-        OPENSSL_cleanse(auth_packet.data(), auth_packet.size());
+        OPENSSL_cleanse(auth_ptr, auth_packet_size);
         new_stream->CloseAbortive();
         throw;
     }
-    OPENSSL_cleanse(auth_packet.data(), auth_packet.size());
+    OPENSSL_cleanse(auth_ptr, auth_packet_size);
     if (!ok) {
         const bool timed_out =
             proxy::ConsumeOutboundHandshakeTimeout(*new_stream, deadline);

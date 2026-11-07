@@ -203,6 +203,14 @@ const bool kTrojanRegistered = (acpp::proxyman::outbound::RegisterProxy(
         std::string address;
         uint16_t port = 443;
         std::string password;
+        struct CleansePassword {
+            std::string& str;
+            ~CleansePassword() noexcept {
+                if (!str.empty()) {
+                    OPENSSL_cleanse(str.data(), str.size());
+                }
+            }
+        } cleanse_password{password};
         std::string server_name;
         bool allow_insecure = false;
         std::vector<std::string> alpn;
@@ -275,10 +283,12 @@ const bool kTrojanRegistered = (acpp::proxyman::outbound::RegisterProxy(
                     acpp::AwaitableTaskGroup& /*tasks*/) -> std::unique_ptr<acpp::Outbound> {
                     return std::make_unique<acpp::proxy::trojan::outbound::Handler>(
                         std::move(cfg_state));
-                }>(acpp::TrojanOutboundConfig{
-                    .server = std::move(next_hop->server),
-                    .password_hash = acpp::trojan::HashPassword(password),
-                }),
+                }>([] (acpp::OutboundServer srv, const std::string& pwd) {
+                    acpp::TrojanOutboundConfig cfg_val;
+                    cfg_val.server = std::move(srv);
+                    cfg_val.password_hash = acpp::trojan::HashPassword(pwd);
+                    return cfg_val;
+                }(std::move(next_hop->server), password)),
             .sender = std::move(next_hop->sender),
         };
     }), true);

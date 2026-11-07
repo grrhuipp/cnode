@@ -78,7 +78,7 @@ SsCipherType BaseCipherType(SsCipherType type) noexcept {
 // ============================================================================
 // DeriveKey — EVP_BytesToKey + MD5
 // ============================================================================
-KeyBytes DeriveKey(const std::string& password, size_t key_size) {
+KeyBytes DeriveKey(std::string_view password, size_t key_size) {
     KeyBytes key;
     if (key_size > KeyBytes::kMaxSize) {
         return key;
@@ -236,7 +236,7 @@ KeyBytes BuildMasterKey(std::string_view password, const SsCipherInfo& info) {
     if (Is2022Cipher(info.type)) {
         return Decode2022Psk(password, info.key_size);
     }
-    return DeriveKey(std::string(password), info.key_size);
+    return DeriveKey(password, info.key_size);
 }
 
 bool Derive2022Subkey(const uint8_t* key, size_t key_size,

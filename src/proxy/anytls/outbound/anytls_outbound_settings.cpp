@@ -4,6 +4,7 @@
 #include "acppnode/infra/json_field.hpp"
 
 #include <chrono>
+#include <openssl/crypto.h>
 #include <format>
 #include <limits>
 #include <optional>
@@ -61,8 +62,15 @@ tl::expected<Settings, std::string> ParseSettings(const json::object& source) {
     auto source_key = ParseJsonString(source, "key");
     if (!source_key) return tl::unexpected(std::move(source_key.error()));
     auto password = std::move(*source_password).value_or(std::string{});
+    struct CleansePassword {
+        std::string& str;
+        ~CleansePassword() noexcept {
+            if (!str.empty()) {
+                OPENSSL_cleanse(str.data(), str.size());
+            }
+        }
+    } cleanse_password{password};
     if (password.empty()) password = std::move(*source_key).value_or(std::string{});
-
     auto check_interval = ReadPositiveSeconds(
         source,
         "idleSessionCheckInterval",

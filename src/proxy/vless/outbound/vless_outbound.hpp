@@ -4,6 +4,7 @@
 #include "acppnode/transport/internet/outbound_sender.hpp"
 
 #include <array>
+#include <openssl/crypto.h>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -25,6 +26,15 @@ struct VlessOutboundConfig {
     std::string flow;
     bool packet_xudp = true;
     bool packet_addr = false;
+
+    VlessOutboundConfig() = default;
+    VlessOutboundConfig(const VlessOutboundConfig&) = default;
+    VlessOutboundConfig& operator=(const VlessOutboundConfig&) = default;
+    VlessOutboundConfig(VlessOutboundConfig&&) noexcept = default;
+    VlessOutboundConfig& operator=(VlessOutboundConfig&&) noexcept = default;
+    ~VlessOutboundConfig() noexcept {
+        OPENSSL_cleanse(uuid_bytes.data(), uuid_bytes.size());
+    }
 };
 
 namespace proxy::vless::outbound {
