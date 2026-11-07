@@ -201,9 +201,12 @@ net::awaitable<void> RuntimeSamplingLoop(
                 }
                 last_force_collect_at = now;
                 last_force_collect_total_connections = aggregate_stats.connections_total;
+                last_sample_total_conns = total_conns;
+            } else if ((burst_drain || newly_idle) && !cooldown_ok) {
+                last_sample_total_conns = std::max(last_sample_total_conns, total_conns);
+            } else {
+                last_sample_total_conns = total_conns;
             }
-
-            last_sample_total_conns = total_conns;
         }
         {
             const auto flush_now = steady_clock::now();

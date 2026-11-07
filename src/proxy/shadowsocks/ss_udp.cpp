@@ -3,6 +3,7 @@
 #include "shadowsocks_crypto.hpp"
 #include "acppnode/common/address_codec.hpp"
 #include "acppnode/common/allocator.hpp"
+#include "acppnode/common/container_util.hpp"
 
 #include <openssl/evp.h>
 #include <openssl/aead.h>
@@ -968,6 +969,7 @@ void Ss2022UdpReplayCache::PruneExpired(
             ++it;
         }
     }
+    MaybeShrinkHashContainer(sessions_);
 }
 
 const InboundDatagramAssociationPolicy& Ss2022UdpAssociation::Policy() noexcept {

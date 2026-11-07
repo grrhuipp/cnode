@@ -3,6 +3,7 @@
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/sharded_user_stats.hpp"
 #include "acppnode/common/string_hash.hpp"
+#include "acppnode/common/container_util.hpp"
 #include "vmess_crypto.hpp"
 #include "vmess_request.hpp"
 #include "acppnode/app/session_group_executor.hpp"
@@ -74,6 +75,11 @@ struct SessionKeyHash {
                 }
                 entries.erase(it);
                 order.pop_front();
+            }
+            MaybeShrinkHashContainer(entries);
+            if (order.empty()) {
+                memory::ThreadLocalDeque<std::pair<SessionKey, int64_t>>{
+                    order.get_allocator()}.swap(order);
             }
         }
 

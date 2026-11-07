@@ -12,6 +12,7 @@
 #include "acppnode/app/worker_runtime_config.hpp"
 #include "acppnode/app/worker_stats.hpp"
 #include "acppnode/common/rule.hpp"
+#include "acppnode/common/container_util.hpp"
 #include "acppnode/common/session.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/transport/async_stream.hpp"
@@ -72,6 +73,7 @@ void PhysicalSessionRegistry::CompleteOnOwner(
     totals_.cold.errors += record->final_stats.errors;
     record->finished.store(true, std::memory_order_release);
     records_.erase(record.get());
+    MaybeShrinkHashContainer(records_);
     if (record->domain && !record->domain->CanDestroyDirectlyOn(worker_id_)) {
         record->capabilities.reset();
         auto* domain = record->domain.get();
@@ -86,6 +88,7 @@ void PhysicalSessionRegistry::CancelRegistration(
     const std::shared_ptr<PhysicalSessionRecord>& record) noexcept {
     if (!record) return;
     records_.erase(record.get());
+    MaybeShrinkHashContainer(records_);
     (void)changed_.try_send(IoErrorCode{});
 }
 
