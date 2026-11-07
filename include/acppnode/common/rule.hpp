@@ -27,7 +27,7 @@ public:
     DetectRulePolicy(DetectRulePolicy&&) = delete;
     DetectRulePolicy& operator=(DetectRulePolicy&&) = delete;
 
-    void UpdateRule(std::string_view tag, const std::vector<DetectRule>& new_rule_list);
+    void UpdateRule(std::string_view tag, std::vector<DetectRule> new_rule_list);
     [[nodiscard]] bool Blocked(
         const session::Context& ctx) override;
 private:

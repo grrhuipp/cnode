@@ -1200,12 +1200,12 @@ net::awaitable<void> Worker::UnregisterListenerTask(std::string tag) {
     co_return;
 }
 
-void Worker::UpdateRule(std::string_view tag, const std::vector<rule::DetectRule>& rules) {
+void Worker::UpdateRule(std::string_view tag, std::vector<rule::DetectRule> rules) {
     if (stop_requested_.load(std::memory_order_acquire) ||
         drain_requested_.load(std::memory_order_relaxed) ||
         !runtime_ || runtime_->listener_state->stopping)
         throw IoSystemError(net::error::operation_aborted);
-    runtime_->detect_rule_policy->UpdateRule(tag, rules);
+    runtime_->detect_rule_policy->UpdateRule(tag, std::move(rules));
 }
 
 // ============================================================================

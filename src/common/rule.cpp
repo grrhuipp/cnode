@@ -16,14 +16,14 @@ DetectRulePolicy::DetectRulePolicy()
 DetectRulePolicy::~DetectRulePolicy() = default;
 
 void DetectRulePolicy::UpdateRule(std::string_view tag,
-                                  const std::vector<DetectRule>& new_rule_list) {
+                                  std::vector<DetectRule> new_rule_list) {
     if (tag.empty()) return;
     const std::lock_guard lock(update_mutex_);
     auto next = std::make_shared<InboundRule>(*rules_.load(std::memory_order_acquire));
     if (new_rule_list.empty()) {
         if (auto it = next->find(tag); it != next->end()) next->erase(it);
     } else {
-        next->insert_or_assign(std::string(tag), new_rule_list);
+        next->insert_or_assign(std::string(tag), std::move(new_rule_list));
     }
     rules_.store(std::move(next), std::memory_order_release);
 }

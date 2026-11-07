@@ -2,6 +2,7 @@
 
 #include "acppnode/app/dns/dns.hpp"
 #include "acppnode/common/allocator.hpp"
+#include "acppnode/common/container_util.hpp"
 #include "../../common/awaitable_task_group.hpp"
 
 #include <asio/as_tuple.hpp>
@@ -34,7 +35,10 @@ class InflightResolves {
 
     void Remove(Pending& pending) noexcept {
         const auto found = table_.find(std::string_view(pending.domain));
-        if (found != table_.end() && found->second.get() == &pending) table_.erase(found);
+        if (found != table_.end() && found->second.get() == &pending) {
+            table_.erase(found);
+            MaybeShrinkHashContainer(table_, 8);
+        }
     }
 
     struct Subscription {
@@ -112,8 +116,7 @@ public:
                 rejected.error = ErrorCode::RESOURCE_EXHAUSTED;
                 co_return rejected;
             }
-            pending = std::allocate_shared<Pending>(
-                memory::ThreadLocalAllocator<Pending>{}, io_context_, domain);
+            pending = memory::AllocateShared<Pending>(io_context_, domain);
             table_.emplace(std::string_view(pending->domain), pending);
             ++active_;
             try {

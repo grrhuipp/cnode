@@ -147,8 +147,8 @@ net::awaitable<void> NodeRuntime::UpdateRules(
                       std::vector<rule::DetectRule> rules) -> net::awaitable<void> {
                 runtime->ThrowIfStopping();
                 co_await current->PostCall(
-                    [current, tag = std::move(current_tag), rules = std::move(rules)] {
-                        current->UpdateRule(tag, rules);
+                    [current, tag = std::move(current_tag), rules = std::move(rules)]() mutable {
+                        current->UpdateRule(tag, std::move(rules));
                     });
             }(this, &worker, tag, new_rule_list);
         });

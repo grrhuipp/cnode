@@ -13,6 +13,7 @@
 #include "acppnode/app/stats.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
 #include "acppnode/common/ip_utils.hpp"
+#include "acppnode/common/container_util.hpp"
 #include "acppnode/common/session.hpp"
 #include "acppnode/common/sharded_user_stats.hpp"
 #include "acppnode/common/string_hash.hpp"
@@ -293,7 +294,9 @@ std::shared_ptr<Connection> Connection::Create(
                 connection->Close();
                 memory::ScopedWorkerAllocation worker_allocation;
                 owner->sessions.erase(connection->ownership_.get());
+                MaybeShrinkHashContainer(owner->sessions);
                 owner->inboxes.erase(connection->ownership_.get());
+                MaybeShrinkHashContainer(owner->inboxes, 8);
                 --owner->connection_tasks;
                 owner->changed.cancel();
                 if (error && !IsOperationCancelled(error))
@@ -306,6 +309,7 @@ std::shared_ptr<Connection> Connection::Create(
         }
         memory::ScopedWorkerAllocation worker_allocation;
         listener.sessions.erase(connection->ownership_.get());
+        MaybeShrinkHashContainer(listener.sessions);
         if (tracked) --listener.connection_tasks;
         throw;
     }
@@ -544,6 +548,7 @@ net::awaitable<void> Connection::PrepareHandoff(const ExecutionDomain::HandoffTa
         memory::ScopedWorkerAllocation worker_allocation;
         listener_->DissociateAll(ownership_);
         listener_->inboxes.erase(ownership_.get());
+        MaybeShrinkHashContainer(listener_->inboxes, 8);
     }
     co_await listener_->Drain(ownership_);
     listener_->ArmExpiry();
@@ -558,8 +563,10 @@ void Connection::CommitHandoff(const ExecutionDomain::HandoffTarget& target) noe
     ownership_->listener.store(listener_->identity.get());
     net::post(previous->io, [previous, owner = ownership_] {
         memory::ScopedWorkerAllocation worker_allocation;
-        if (owner->listener.load() != previous->identity.get())
+        if (owner->listener.load() != previous->identity.get()) {
             previous->sessions.erase(owner.get());
+            MaybeShrinkHashContainer(previous->sessions);
+        }
         --previous->connection_tasks;
         previous->changed.cancel();
     });
@@ -828,8 +835,10 @@ int Connection::CloseStream(ngtcp2_conn* conn, uint32_t flags, int64_t stream_id
         it != self.core_->streams.end()) {
         state = std::move(it->second.state);
         self.core_->streams.erase(it);
+        MaybeShrinkHashContainer(self.core_->streams, 8);
     }
     self.core_->h3_requests.erase(stream_id);
+    MaybeShrinkHashContainer(self.core_->h3_requests, 8);
     if (state) {
         if (conn != nullptr &&
             (flags & NGTCP2_STREAM_CLOSE_FLAG_APP_ERROR_CODE_SET) == 0) {
@@ -1461,7 +1470,10 @@ bool Connection::SendUdpMessage(
 }
 
 void Connection::CloseUdpSession(uint32_t session_id) noexcept {
-    if (core_) core_->udp_sessions.erase(session_id);
+    if (core_) {
+        core_->udp_sessions.erase(session_id);
+        MaybeShrinkHashContainer(core_->udp_sessions, 8);
+    }
 }
 
 QuicListener::QuicListener(
@@ -1583,6 +1595,7 @@ net::awaitable<void> QuicListener::Publish(std::shared_ptr<QuicOwnership> owner)
 void QuicListener::Dissociate(const ngtcp2_cid& cid) noexcept {
     memory::ScopedWorkerAllocation worker_allocation;
     connections.erase(ConnectionId(cid));
+    MaybeShrinkHashContainer(connections);
 }
 
 void QuicListener::DissociateAll(const std::shared_ptr<QuicOwnership>& owner) noexcept {
@@ -1590,6 +1603,7 @@ void QuicListener::DissociateAll(const std::shared_ptr<QuicOwnership>& owner) no
     std::erase_if(connections, [&](const auto& entry) {
         return entry.second->Ownership() == owner;
     });
+    MaybeShrinkHashContainer(connections);
 }
 
 SocketState* QuicListener::Resolve(const udp::endpoint& local) noexcept {
@@ -1670,6 +1684,7 @@ void QuicListener::Pump(const std::shared_ptr<Connection>& connection) {
     if (connection->Closed() || inbox->packets.empty()) {
         memory::ScopedWorkerAllocation worker_allocation;
         inboxes.erase(owner.get());
+        MaybeShrinkHashContainer(inboxes, 8);
     }
 }
 
@@ -1763,6 +1778,7 @@ net::awaitable<void> QuicListener::Claim(std::shared_ptr<QuicOwnership> owner) {
     if (!committed) {
         DissociateAll(owner);
         sessions.erase(owner.get());
+        MaybeShrinkHashContainer(sessions);
         co_await Drain(owner);
         if (ticket) {
             try { co_await ticket->Cancel(); }
@@ -1778,6 +1794,7 @@ net::awaitable<void> QuicListener::Claim(std::shared_ptr<QuicOwnership> owner) {
     }
     owner->claiming.store(false);
     inboxes.erase(owner.get());
+    MaybeShrinkHashContainer(inboxes, 8);
     --pending_claims;
     if (connection && !owner->retired.load())
         owner->domain->Execute([connection] { connection->PublishExpiry(); });

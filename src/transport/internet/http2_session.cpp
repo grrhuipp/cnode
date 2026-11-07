@@ -10,6 +10,7 @@
 #include "acppnode/app/session_group_executor.hpp"
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/buffer_util.hpp"
+#include "acppnode/common/container_util.hpp"
 #include "acppnode/common/unsafe.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/transport/internet/async_write_gate.hpp"
@@ -2323,6 +2324,7 @@ public:
         }
         auto sub = std::move(it->second);
         streams_.erase(it);
+        MaybeShrinkHashContainer(streams_, 8);
         if (sub) {
             sub->CancelFromSession(error);
         }

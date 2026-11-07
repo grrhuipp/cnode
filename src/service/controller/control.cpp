@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <exception>
+#include <iterator>
 #include <format>
 #include <vector>
 
@@ -112,8 +113,10 @@ Controller::Impl::GetOnlineSnapshot(const std::string& tag) {
 
     std::vector<OnlineDevice> devices;
     devices.reserve(total_online);
-    for (const auto& online : per_worker) {
-        devices.insert(devices.end(), online.begin(), online.end());
+    for (auto& online : per_worker) {
+        devices.insert(devices.end(),
+                       std::make_move_iterator(online.begin()),
+                       std::make_move_iterator(online.end()));
     }
     co_return controller::BuildOnlineSnapshot(std::move(devices));
 }
