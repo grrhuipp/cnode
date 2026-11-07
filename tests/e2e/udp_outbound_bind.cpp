@@ -9,7 +9,8 @@ constexpr std::string_view UserA = "11111111-1111-4111-8111-111111111111";
 constexpr std::string_view UserB = "22222222-2222-4222-8222-222222222222";
 constexpr std::string_view RelayUser = "99999999-9999-4999-8999-999999999999";
 
-void ConfigFiles(const TempDir& root, const Json& config, const Json& inbounds, const Json& outbounds) {
+void ConfigFiles(const TempDir& root, Json config, const Json& inbounds, const Json& outbounds) {
+    config["log"]["logDir"] = (root.Path() / "logs").string();
     WriteJson(root.Path(), "config.json", config);
     WriteJson(root.Path(), "inbounds.json", inbounds);
     WriteJson(root.Path(), "outbounds.json", outbounds);
