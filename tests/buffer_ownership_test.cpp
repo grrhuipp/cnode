@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "common/initial_payload.hpp"
+#include "common/buf/length_prefixed_packet_buffer.hpp"
 
 #include <array>
 #include <cstdio>
@@ -584,4 +585,48 @@ TEST(BufferOwnership, UnrepresentableWriteCapacityReturnsFailureAndAllowsReuse) 
         }
         std::_Exit(passed ? 0 : 1);
     }()), ::testing::ExitedWithCode(0), "");
+}
+
+TEST(BufferOwnership, StreamInputTransfersInlineBlocksWhenMetadataAllocationIsUnavailable) {
+    FailingResource resource(std::pmr::get_default_resource());
+    ScopedDefaultResource scope(&resource);
+    buf::MultiBuffer pending, input;
+    std::array<const buf::Buffer*, buf::MultiBuffer::kInlineCapacity> original{};
+    for (size_t i = 0; i < original.size(); ++i) {
+        input.push_back(Buffer(buf::Buffer::kSize, static_cast<uint8_t>(i)));
+        original[i] = input.back();
+    }
+
+    resource.RejectNextAllocation();
+    ASSERT_NO_THROW(buf::AppendPacketStreamInput(pending, std::move(input)));
+    ASSERT_EQ(pending.size(), original.size());
+    EXPECT_EQ(resource.RejectedAllocations(), 0);
+    EXPECT_EQ(pending.byte_size(), original.size() * buf::Buffer::kSize);
+    for (size_t i = 0; i < original.size(); ++i) {
+        const auto* block = *(pending.begin() + i);
+        EXPECT_EQ(block, original[i]);
+        const auto bytes = block->Bytes();
+        EXPECT_TRUE(std::all_of(bytes.begin(), bytes.end(),
+            [i](uint8_t value) { return value == static_cast<uint8_t>(i); }));
+    }
+    EXPECT_TRUE(Consistent(pending));
+}
+
+TEST(BufferOwnership, PacketStreamRetiresPartiallyAppendedInputOnRequiredAllocationFailure) {
+    FailingResource resource(std::pmr::get_default_resource());
+    ScopedDefaultResource scope(&resource);
+    buf::LengthPrefixedPacketBuffer stream;
+    buf::MultiBuffer input;
+    for (size_t i = 0; i <= buf::MultiBuffer::kInlineCapacity; ++i)
+        input.push_back(Buffer(buf::Buffer::kSize, static_cast<uint8_t>(i)));
+
+    resource.RejectNextAllocation();
+    EXPECT_THROW(stream.Append(std::move(input)), std::bad_alloc);
+    EXPECT_EQ(resource.RejectedAllocations(), 1);
+    EXPECT_EQ(stream.PendingBytes(), 0);
+    buf::MultiBuffer output;
+    EXPECT_EQ(stream.Pop(output), buf::LengthPrefixedPacketBuffer::PopResult::Invalid);
+    EXPECT_TRUE(output.empty());
+    EXPECT_THROW(stream.Append({}), IoSystemError);
+    EXPECT_THROW(stream.Finish(), IoSystemError);
 }

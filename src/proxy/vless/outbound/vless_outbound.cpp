@@ -348,11 +348,84 @@ private:
     buf::MultiBuffer pending_;
 };
 
+// 稳态只保留拒绝信号和身份；完整 PFS 快照仅属于握手子协程。
+// 此对象先于 encrypted_io 构造，且禁止移动，保证延迟读端的借用有效。
+struct VlessClientTicketLease {
+    VlessClientTicketLease(
+        std::shared_ptr<::vless::VlessEncryptionClientTicketCache> cache,
+        std::shared_ptr<ExecutionDomain> domain,
+        bool has_domain)
+        : cache(std::move(cache)), domain(std::move(domain)), has_domain(has_domain) {}
+
+    VlessClientTicketLease(const VlessClientTicketLease&) = delete;
+    VlessClientTicketLease& operator=(const VlessClientTicketLease&) = delete;
+    VlessClientTicketLease(VlessClientTicketLease&&) = delete;
+    VlessClientTicketLease& operator=(VlessClientTicketLease&&) = delete;
+
+    static net::awaitable<::vless::VlessEncryptionClientTicketCache> ReadCache(
+        std::shared_ptr<::vless::VlessEncryptionClientTicketCache> owner) {
+        co_return *owner;
+    }
+
+    static net::awaitable<void> PublishCache(
+        std::shared_ptr<::vless::VlessEncryptionClientTicketCache> owner,
+        ::vless::VlessEncryptionClientTicketCache candidate,
+        std::array<uint8_t, ::vless::kVlessEncryptionTicketSize> expected) {
+        if (CRYPTO_memcmp(owner->ticket.data(), expected.data(), expected.size()) == 0) {
+            *owner = candidate;
+        }
+        co_return;
+    }
+
+    net::awaitable<void> Acquire(::vless::VlessEncryptionClientTicketCache& local) {
+        if (!cache || (has_domain && !domain)) co_return;
+        if (domain && !domain->CanExecuteInline()) {
+            local = co_await net::co_spawn(domain->Executor(), ReadCache(cache),
+                net::bind_cancellation_slot(net::cancellation_slot{}, net::use_awaitable));
+        } else {
+            local = *cache;
+        }
+        identity = local.ticket;
+    }
+
+    net::awaitable<void> Publish(
+        const ::vless::VlessEncryptionClientTicketCache& local,
+        std::chrono::steady_clock::time_point original_expiry) {
+        if (!cache || (has_domain && !domain) ||
+            (CRYPTO_memcmp(local.ticket.data(), identity.data(), identity.size()) == 0 &&
+             local.expires_at == original_expiry)) co_return;
+        if (domain && !domain->CanExecuteInline()) {
+            co_await net::co_spawn(domain->Executor(), PublishCache(cache, local, identity),
+                net::bind_cancellation_slot(net::cancellation_slot{}, net::use_awaitable));
+        } else if (CRYPTO_memcmp(cache->ticket.data(), identity.data(), identity.size()) == 0) {
+            *cache = local;
+        }
+        identity = local.ticket;
+    }
+
+    ~VlessClientTicketLease() {
+        if (!cache || (has_domain && !domain) || !rejection.rejected) return;
+        auto invalidate = [cache = std::move(cache), identity = identity] {
+            if (CRYPTO_memcmp(cache->ticket.data(), identity.data(), identity.size()) == 0) {
+                cache->Clear();
+            }
+        };
+        if (domain) domain->Execute(std::move(invalidate));
+        else invalidate();
+    }
+
+    std::shared_ptr<::vless::VlessEncryptionClientTicketCache> cache;
+    std::shared_ptr<ExecutionDomain> domain;
+    bool has_domain;
+    std::array<uint8_t, ::vless::kVlessEncryptionTicketSize> identity{};
+    ::vless::VlessEncryptionTicketRejection rejection;
+};
+
 net::awaitable<tl::expected<void, ErrorCode>>
 SendVlessHandshake(
     AsyncStream& stream,
     const VlessOutboundConfig& config,
-    ::vless::VlessEncryptionClientTicketCache* encryption_tickets,
+    VlessClientTicketLease& tickets,
     const TargetAddress& target,
     bool is_udp,
     bool use_vision,
@@ -366,6 +439,9 @@ SendVlessHandshake(
     transport::MultiBufferWriter*& active_writer,
     const OutboundDialer& dialer,
     const session::Context& ctx) {
+    ::vless::VlessEncryptionClientTicketCache local_tickets;
+    co_await tickets.Acquire(local_tickets);
+    const auto original_expiry = local_tickets.expires_at;
     stream.SetIdleTimeout(handshake_timeout);
     PhaseDeadlineHandle outbound_protocol_deadline =
         stream.StartPhaseDeadline(handshake_timeout);
@@ -377,7 +453,10 @@ SendVlessHandshake(
                     protocol_reader,
                     protocol_writer,
                     *config.encryption,
-                    encryption_tickets);
+                    tickets.cache ? &local_tickets : nullptr,
+                    tickets.rejection);
+            tickets.rejection.rejected =
+                local_tickets.expires_at == std::chrono::steady_clock::time_point{};
             if (!runtime) {
                 if (proxy::ConsumeOutboundHandshakeTimeout(
                         stream, outbound_protocol_deadline)) {
@@ -393,6 +472,8 @@ SendVlessHandshake(
             active_reader = &encrypted_io->plain_reader;
             active_writer = &encrypted_io->writer;
         } catch (...) {
+            tickets.rejection.rejected =
+                local_tickets.expires_at == std::chrono::steady_clock::time_point{};
             co_return tl::unexpected(
                 proxy::ClassifyOutboundHandshakeException(
                     stream,
@@ -427,11 +508,12 @@ SendVlessHandshake(
         const ErrorCode classified = proxy::ClassifyOutboundHandshakeException(
             stream, outbound_protocol_deadline);
         if (encrypted_io && classified != ErrorCode::CANCELLED) {
-            encrypted_io->reader.ClearDeferredTicket();
+            encrypted_io->reader.RejectDeferredTicket();
         }
         co_return tl::unexpected(classified);
     }
     OPENSSL_cleanse(header_buf.data(), header_len);
+    co_await tickets.Publish(local_tickets, original_expiry);
     co_return tl::expected<void, ErrorCode>{};
 }
 
@@ -484,63 +566,8 @@ proxy::vless::outbound::Handler::Process(
     const bool use_vision = !config_->flow.empty();
     const bool use_xudp = is_udp && config_->packet_xudp;
     const bool use_packet_addr = is_udp && config_->packet_addr;
-    // Only the stable host reads/writes the cache. The deferred 0-RTT reader
-    // holds a private snapshot; rejection clears only that exact ticket identity,
-    // never a ticket published by a concurrent successful handshake.
-    struct TicketLease {
-        std::shared_ptr<::vless::VlessEncryptionClientTicketCache> cache{};
-        std::shared_ptr<ExecutionDomain> domain{};
-        bool has_domain = false;
-        ::vless::VlessEncryptionClientTicketCache local{};
-        std::array<uint8_t, ::vless::kVlessEncryptionTicketSize> identity{};
-        std::chrono::steady_clock::time_point original_expiry{};
-
-        net::awaitable<void> Acquire() {
-            if (!cache || (has_domain && !domain)) co_return;
-            auto read = [&]() -> net::awaitable<::vless::VlessEncryptionClientTicketCache> {
-                co_return *cache;
-            };
-            local = domain
-                ? co_await net::co_spawn(domain->Executor(), read(),
-                    net::bind_cancellation_slot(net::cancellation_slot{}, net::use_awaitable))
-                : co_await read();
-            identity = local.ticket;
-            original_expiry = local.expires_at;
-        }
-        net::awaitable<void> Publish() {
-            if (!cache || (has_domain && !domain) ||
-                (local.ticket == identity && local.expires_at == original_expiry))
-                co_return;
-            auto publish = [&]() -> net::awaitable<void> {
-                if (cache->ticket == identity) *cache = local;
-                co_return;
-            };
-            if (domain) {
-                co_await net::co_spawn(domain->Executor(), publish(),
-                    net::bind_cancellation_slot(net::cancellation_slot{}, net::use_awaitable));
-            } else {
-                co_await publish();
-            }
-            identity = local.ticket;
-        }
-        ~TicketLease() {
-            if (!cache || (has_domain && !domain) ||
-                local.expires_at != std::chrono::steady_clock::time_point{}) return;
-            auto invalidate = [cache = std::move(cache), identity = identity] {
-                if (cache->ticket == identity) cache->Clear();
-            };
-            if (domain) domain->Execute(std::move(invalidate));
-            else invalidate();
-        }
-    } tickets{
-        .cache = encryption_tickets_,
-        .domain = ticket_domain_.lock(),
-        .has_domain = has_ticket_domain_,
-        .local = {},
-        .identity = {},
-        .original_expiry = {},
-    };
-    co_await tickets.Acquire();
+    VlessClientTicketLease tickets(
+        encryption_tickets_, ticket_domain_.lock(), has_ticket_domain_);
     VlessBufferedReader protocol_reader(*stream);
     transport::MultiBufferWriter& protocol_writer = *stream;
     VlessBufferedReader* active_reader = &protocol_reader;
@@ -548,13 +575,12 @@ proxy::vless::outbound::Handler::Process(
     std::unique_ptr<::vless::VlessEncryptedIo> encrypted_io;
 
     if (auto ok = co_await SendVlessHandshake(
-            *stream, *config_, encryption_tickets_ ? &tickets.local : nullptr, target,
+            *stream, *config_, tickets, target,
             is_udp, use_vision, use_xudp, use_packet_addr,
             timeouts.HandshakeTimeout(), protocol_reader, protocol_writer,
             encrypted_io, active_reader, active_writer, dialer, ctx); !ok) {
         co_return fail_abortive(ok.error());
     }
-    co_await tickets.Publish();
     stream->SetIdleTimeout(relay_idle_timeout);
     stream->SetReadTimeout(std::chrono::seconds(0));
     stream->SetWriteTimeout(relay_write_timeout);
@@ -571,7 +597,7 @@ proxy::vless::outbound::Handler::Process(
             dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
             target_endpoint, ctx, stats, relay_config, std::move(first_payload));
         if (encrypted_io && !res) {
-            encrypted_io->reader.ClearDeferredTicket();
+            encrypted_io->reader.RejectDeferredTicket();
         }
         co_return res;
     }
@@ -589,7 +615,7 @@ proxy::vless::outbound::Handler::Process(
         dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
         target_endpoint, ctx, stats, relay_config, std::move(first_payload));
     if (encrypted_io && !res) {
-        encrypted_io->reader.ClearDeferredTicket();
+        encrypted_io->reader.RejectDeferredTicket();
     }
     co_return res;
 }

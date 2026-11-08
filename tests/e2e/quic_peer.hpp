@@ -30,7 +30,8 @@ namespace cnode::e2e::quic {
 class Peer final {
 public:
     explicit Peer(uint16_t server_port, std::string_view auth = "smoke-secret",
-                  uint64_t max_datagram_frame_size = 65535)
+                  uint64_t max_datagram_frame_size = 65535,
+                  uint64_t initial_receive_stream_window = 4 * 1024 * 1024)
         : socket_(Socket::BindUdp()), context_(SSL_CTX_new(TLS_method()), SSL_CTX_free),
           ssl_(nullptr, SSL_free), http_(nullptr, nghttp3_conn_del),
           quic_(nullptr, ngtcp2_conn_del) {
@@ -61,7 +62,7 @@ public:
         if (SSL_set_alpn_protos(ssl_.get(), alpn.data(), alpn.size()) != 0 ||
             SSL_set_tlsext_host_name(ssl_.get(), "localhost") != 1)
             throw std::runtime_error("QUIC TLS ALPN/SNI");
-        InitializeQuic(max_datagram_frame_size);
+        InitializeQuic(max_datagram_frame_size, initial_receive_stream_window);
         WaitUntil([&] { return handshake_complete_ && http_ != nullptr; }, deadline);
         const uint8_t* selected = nullptr;
         unsigned selected_length = 0;
@@ -239,6 +240,89 @@ public:
         WaitUntil(condition, Clock::now() + timeout);
     }
 
+    // Predicates inspect borrowed storage only during the call, never across Pump.
+    void WaitStream(int64_t id, const std::function<bool()>& condition,
+                    Milliseconds timeout = Milliseconds(5000)) {
+        try {
+            Wait([&] {
+                const auto& stream = Find(id);
+                if (stream.reset || stream.read_stopped || stream.write_stopped || stream.close_error)
+                    throw std::runtime_error("TCP stream terminated abnormally");
+                if (condition()) return true;
+                RequireActiveStream(id);
+                return false;
+            }, timeout);
+        } catch (const std::exception& error) {
+            throw std::runtime_error(std::string(error.what()) + " (" + DescribeStream(id) + ")");
+        }
+    }
+
+    void WaitPayload(int64_t id, std::string_view expected, bool normal_close = false,
+                     Milliseconds timeout = Milliseconds(5000)) {
+        WaitStream(id, [&] {
+            const auto& stream = Find(id);
+            const bool complete = PayloadEquals(id, expected);
+            if (stream.fin_received && !complete)
+                throw std::runtime_error("TCP FIN before exact payload");
+            return complete && (!normal_close || (stream.closed && stream.fin_received));
+        }, timeout);
+    }
+
+    void WaitClosed(int64_t id, Milliseconds timeout = Milliseconds(5000)) {
+        try { Wait([&] { return StreamClosed(id); }, timeout); }
+        catch (const std::exception& error) {
+            throw std::runtime_error(std::string(error.what()) + " (" + DescribeStream(id) + ")");
+        }
+    }
+
+    void HoldReceiveCredit(int64_t id, bool hold = true) {
+        auto& stream = Find(id);
+        stream.hold_receive_credit = hold;
+        if (!hold && stream.withheld_receive_credit != 0) {
+            CheckQuic(ngtcp2_conn_extend_max_stream_offset(quic_.get(), id,
+                stream.withheld_receive_credit), "restore receive stream credit");
+            stream.withheld_receive_credit = 0;
+            Flush();
+        }
+    }
+
+    uint64_t StreamSendCredit(int64_t id) const {
+        return ngtcp2_conn_get_max_stream_data_left2(quic_.get(), id);
+    }
+    uint64_t Submitted(int64_t id) const { return Find(id).submitted; }
+    uint64_t Acknowledged(int64_t id) const { return Find(id).acknowledged; }
+    uint64_t Queued(int64_t id) const { return Find(id).queued; }
+    size_t Received(int64_t id) const { return Find(id).received.size(); }
+    bool PayloadEquals(int64_t id, std::string_view expected) const {
+        return PayloadView(id) == expected;
+    }
+    std::string DescribeStream(int64_t id) const {
+        const auto& stream = Find(id);
+        const auto* error = ngtcp2_conn_get_ccerr2(quic_.get());
+        return "stream=" + std::to_string(id) +
+            " queued=" + std::to_string(stream.queued) +
+            " submitted=" + std::to_string(stream.submitted) +
+            " acknowledged=" + std::to_string(stream.acknowledged) +
+            " received=" + std::to_string(stream.received.size()) +
+            " fin_requested=" + std::to_string(stream.fin_requested) +
+            " fin_submitted=" + std::to_string(stream.fin_submitted) +
+            " fin_received=" + std::to_string(stream.fin_received) +
+            " reset=" + std::to_string(stream.reset) +
+            " reset_code=" + std::to_string(stream.reset_code) +
+            " write_stopped=" + std::to_string(stream.write_stopped) +
+            " local_read_stopped=" + std::to_string(stream.read_stopped) +
+            " local_read_stop_code=" + std::to_string(stream.read_stop_code) +
+            " closed=" + std::to_string(stream.closed) +
+            " close_error=" + std::to_string(stream.close_error) +
+            " close_code=" + std::to_string(stream.close_code) +
+            " stream_send_credit=" + std::to_string(StreamSendCredit(id)) +
+            " connection_send_credit=" + std::to_string(SendCredit()) +
+            " withheld_receive_credit=" + std::to_string(stream.withheld_receive_credit) +
+            " connection_closed=" + std::to_string(closed_) +
+            " connection_close_type=" + std::to_string(error->type) +
+            " connection_close_code=" + std::to_string(error->error_code);
+    }
+
     bool AllAcknowledged(int64_t id) const {
         const auto& stream = Find(id);
         return stream.submitted == stream.queued && stream.acknowledged == stream.queued;
@@ -247,7 +331,10 @@ public:
     bool Closed() const noexcept { return closed_; }
     uint64_t SendCredit() const { return ngtcp2_conn_get_max_data_left2(quic_.get()); }
 
-    std::string Payload(int64_t id) const {
+    std::string Payload(int64_t id) const { return std::string(PayloadView(id)); }
+
+private:
+    std::string_view PayloadView(int64_t id) const {
         const auto& stream = Find(id);
         const std::string_view wire = stream.received;
         if (wire.empty()) return {};
@@ -263,10 +350,9 @@ public:
         if (length > MaxReceiveBytes) throw std::runtime_error("HY2 response padding limit");
         if (length > wire.size() - cursor) return {};
         cursor += static_cast<size_t>(length);
-        return std::string(wire.substr(cursor));
+        return wire.substr(cursor);
     }
 
-private:
     using Clock = std::chrono::steady_clock;
     static constexpr size_t MaxStreams = 4096;
     static constexpr size_t MaxSendBytes = 64 * 1024 * 1024;
@@ -280,10 +366,18 @@ private:
         uint64_t queued = 0;
         uint64_t submitted = 0;
         uint64_t acknowledged = 0;
+        uint64_t withheld_receive_credit = 0;
+        uint64_t reset_code = 0;
+        uint64_t read_stop_code = 0;
+        uint64_t close_code = 0;
         bool fin_requested = false;
         bool fin_submitted = false;
+        bool fin_received = false;
+        bool hold_receive_credit = false;
+        bool close_error = false;
         bool reset = false;
         bool write_stopped = false;
+        bool read_stopped = false;
         bool closed = false;
     };
 
@@ -348,6 +442,11 @@ private:
         if (it == streams_.end()) throw std::runtime_error("unknown QUIC TCP stream");
         return it->second;
     }
+    void RequireActiveStream(int64_t id) const {
+        const auto& stream = Find(id);
+        if (stream.closed || stream.reset || stream.read_stopped || stream.write_stopped)
+            throw std::runtime_error("TCP stream terminated before wait condition");
+    }
     ngtcp2_path Path() noexcept {
         return {{reinterpret_cast<sockaddr*>(&local_), sizeof(local_)},
                 {reinterpret_cast<sockaddr*>(&remote_), sizeof(remote_)}, nullptr};
@@ -390,7 +489,7 @@ private:
         RequireOpen();
     }
 
-    void InitializeQuic(uint64_t max_datagram_frame_size) {
+    void InitializeQuic(uint64_t max_datagram_frame_size, uint64_t initial_receive_stream_window) {
         ngtcp2_callbacks callbacks{};
         callbacks.client_initial = ngtcp2_crypto_client_initial_cb;
         callbacks.recv_crypto_data = ngtcp2_crypto_recv_crypto_data_cb;
@@ -443,11 +542,13 @@ private:
             auto& self = *static_cast<Peer*>(data);
             return self.Callback([&] { self.Ack(id, offset, length); });
         };
-        callbacks.stream_close = [](ngtcp2_conn*, uint32_t, int64_t id, uint64_t code, void* data, void*) {
+        callbacks.stream_close = [](ngtcp2_conn*, uint32_t flags, int64_t id, uint64_t code, void* data, void*) {
             auto& self = *static_cast<Peer*>(data);
             return self.Callback([&] {
                 if (auto it = self.streams_.find(id); it != self.streams_.end()) {
                     it->second.closed = true;
+                    it->second.close_error = (flags & NGTCP2_STREAM_CLOSE_FLAG_APP_ERROR_CODE_SET) != 0;
+                    it->second.close_code = code;
                     self.ReleaseOutput(it->second);
                 } else if (self.http_) {
                     const int result = nghttp3_conn_close_stream(self.http_.get(), id, code);
@@ -455,18 +556,26 @@ private:
                 }
             });
         };
-        callbacks.stream_reset = [](ngtcp2_conn*, int64_t id, uint64_t, uint64_t, void* data, void*) {
+        callbacks.stream_reset = [](ngtcp2_conn*, int64_t id, uint64_t, uint64_t code, void* data, void*) {
             auto& self = *static_cast<Peer*>(data);
             return self.Callback([&] {
-                if (auto it = self.streams_.find(id); it != self.streams_.end()) it->second.reset = true;
+                if (auto it = self.streams_.find(id); it != self.streams_.end()) {
+                    it->second.reset = true;
+                    it->second.reset_code = code;
+                }
                 else if (self.http_) self.CheckHttp(nghttp3_conn_shutdown_stream_read(self.http_.get(), id), "HTTP reset");
             });
         };
-        callbacks.stream_stop_sending = [](ngtcp2_conn*, int64_t id, uint64_t, void* data, void*) {
+        callbacks.stream_stop_sending = [](ngtcp2_conn*, int64_t id, uint64_t code, void* data, void*) {
             auto& self = *static_cast<Peer*>(data);
             return self.Callback([&] {
-                if (auto it = self.streams_.find(id); it != self.streams_.end()) it->second.write_stopped = true;
-                else if (self.http_) nghttp3_conn_shutdown_stream_write(self.http_.get(), id);
+                if (auto it = self.streams_.find(id); it != self.streams_.end()) {
+                    it->second.read_stopped = true;
+                    it->second.read_stop_code = code;
+                }
+                else if (self.http_)
+                    self.CheckHttp(nghttp3_conn_shutdown_stream_read(self.http_.get(), id),
+                        "HTTP local read shutdown");
             });
         };
         callbacks.extend_max_stream_data = [](ngtcp2_conn*, int64_t id, uint64_t, void* data, void*) {
@@ -484,7 +593,7 @@ private:
         settings.no_pmtud = 1;
         ngtcp2_transport_params params;
         ngtcp2_transport_params_default(&params);
-        params.initial_max_stream_data_bidi_local = 4 * 1024 * 1024;
+        params.initial_max_stream_data_bidi_local = initial_receive_stream_window;
         params.initial_max_stream_data_bidi_remote = 64 * 1024;
         params.initial_max_stream_data_uni = 256 * 1024;
         params.initial_max_data = 16 * 1024 * 1024;
@@ -581,7 +690,15 @@ private:
             if (length > MaxReceiveBytes - receive_bytes_) Fail("TCP receive storage limit");
             stream.received.append(reinterpret_cast<const char*>(bytes), length);
             receive_bytes_ += length;
-            Credit(id, length);
+            stream.fin_received |= (flags & NGTCP2_STREAM_DATA_FLAG_FIN) != 0;
+            if (stream.hold_receive_credit) {
+                stream.withheld_receive_credit += length;
+                // Only the selected stream is blocked; ACKs and connection-wide
+                // credit continue so another TCP stream can prove liveness.
+                ngtcp2_conn_extend_max_offset(quic_.get(), length);
+            } else {
+                Credit(id, length);
+            }
             return;
         }
         if (!http_ || (id != auth_stream_ && (id & 2) == 0)) Fail("unexpected incoming stream");
@@ -761,12 +878,16 @@ inline Json HysteriaInbound(uint16_t port) {
 class DnsBlackhole final {
 public:
     Socket socket = Socket::BindUdp(0, "127.77.0.2");
+    explicit DnsBlackhole(bool retain_queries = false) : retain_queries_(retain_queries) {}
 
     bool Observed(std::string_view expected) {
         bool found = false;
         for (size_t packet = 0; packet < 64; ++packet) {
             std::array<uint8_t, 4096> bytes{};
-            const auto received = recv(socket.Fd(), bytes.data(), bytes.size(), MSG_DONTWAIT);
+            sockaddr_in source{};
+            socklen_t source_length = sizeof(source);
+            const auto received = recvfrom(socket.Fd(), bytes.data(), bytes.size(), MSG_DONTWAIT,
+                reinterpret_cast<sockaddr*>(&source), &source_length);
             if (received < 0) {
                 if (errno == EINTR) continue;
                 if (errno == EAGAIN || errno == EWOULDBLOCK) break;
@@ -780,6 +901,12 @@ public:
                 const size_t count = bytes[offset++];
                 if (count == 0) {
                     found |= name == expected;
+                    if (retain_queries_ && name == expected) {
+                        if (offset + 4 > length || queries_.size() >= 32)
+                            throw std::runtime_error("retained DNS question limit");
+                        queries_.push_back({std::string(reinterpret_cast<const char*>(bytes.data()),
+                            offset + 4), source});
+                    }
                     break;
                 }
                 if (count > 63 || count > length - offset)
@@ -789,8 +916,54 @@ public:
                 offset += count;
             }
         }
+        if (released_ && !queries_.empty()) Release();
         return found;
     }
-};
 
+    void Hold() {
+        if (!queries_.empty()) throw std::runtime_error("unreleased DNS question");
+        released_ = false;
+    }
+
+    // Release just the observed questions on the real resolver socket. A gets
+    // loopback; AAAA gets a successful empty answer, avoiding an external DNS.
+    void Release() {
+        released_ = true;
+        if (queries_.empty()) throw std::runtime_error("no retained DNS question");
+        for (auto& query : queries_) {
+            auto& reply = query.wire;
+            const bool address = static_cast<uint8_t>(reply[reply.size() - 4]) == 0 &&
+                static_cast<uint8_t>(reply[reply.size() - 3]) == 1;
+            reply[2] = static_cast<char>(0x81);
+            reply[3] = static_cast<char>(0x80);
+            reply[4] = 0;
+            reply[5] = 1;
+            reply[6] = 0;
+            reply[7] = address ? 1 : 0;
+            for (size_t i = 8; i < 12; ++i) reply[i] = 0;
+            if (address) {
+                constexpr std::array<uint8_t, 16> answer{
+                    0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 127, 0, 0, 1};
+                reply.append(reinterpret_cast<const char*>(answer.data()), answer.size());
+            }
+            const auto sent = sendto(socket.Fd(), reply.data(), reply.size(), 0,
+                reinterpret_cast<const sockaddr*>(&query.source), sizeof(query.source));
+            if (sent < 0)
+                throw std::system_error(errno, std::generic_category(), "release DNS question");
+            if (static_cast<size_t>(sent) != reply.size())
+                throw std::runtime_error("partial DNS response");
+        }
+        queries_.clear();
+    }
+
+private:
+    struct Query {
+        std::string wire;
+        sockaddr_in source;
+    };
+    bool retain_queries_ = false;
+    bool released_ = false;
+    std::vector<Query> queries_;
+
+};
 } // namespace cnode::e2e::quic

@@ -165,7 +165,8 @@ RunVlessEncryptionClientHandshake(
     VlessBufferedReader& raw_reader,
     transport::MultiBufferWriter& raw_writer,
     const VlessEncryptionConfig& config,
-    VlessEncryptionClientTicketCache* ticket_cache = nullptr);
+    VlessEncryptionClientTicketCache* ticket_cache,
+    VlessEncryptionTicketRejection& ticket_rejection);
 
 [[nodiscard]] net::awaitable<VlessEncryptionHandshakeResult>
 RunVlessEncryptionServerHandshake(

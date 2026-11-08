@@ -410,15 +410,16 @@ net::awaitable<RelayResult> DoRelayLink(
                            : error);
         }
     }
-    // Our own final Cancel/Close notifications are not an external failure.
+    // Both directions and shutdowns are joined. Healthy protocol output may
+    // still await transport ACKs; only failure needs an abortive cancellation.
     cancellation.client_cancel.Unsubscribe();
     cancellation.target_cancel.Unsubscribe();
-    if (client_control) relay_detail::CancelIfSupported(*client_control);
-    relay_detail::CancelIfSupported(target);
     if (state.reason == ErrorCode::OK) {
         if (client_control) relay_detail::CloseIfSupported(*client_control);
         relay_detail::CloseIfSupported(target);
     } else {
+        if (client_control) relay_detail::CancelIfSupported(*client_control);
+        relay_detail::CancelIfSupported(target);
         if (client_control) relay_detail::CloseAbortiveIfSupported(*client_control);
         relay_detail::CloseAbortiveIfSupported(target);
     }

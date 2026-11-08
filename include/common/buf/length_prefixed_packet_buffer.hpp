@@ -29,7 +29,6 @@ inline constexpr size_t kPacketStreamPendingLimit = 256 * 1024;
 
 inline void AppendCoalescedStreamInput(MultiBuffer& pending, MultiBuffer input) {
     constexpr size_t min_bytes = Buffer::kSize / 2;
-    pending.reserve((pending.byte_size() + input.byte_size() + min_bytes - 1) / min_bytes);
     // Tiny TCP fragments share an existing tail rather than retaining one 8KB
     // allocation per byte. Whole input blocks otherwise transfer ownership.
     while (!input.empty()) {

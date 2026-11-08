@@ -26,10 +26,16 @@
 #include <optional>
 #include <span>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
 namespace {
+static_assert(!std::is_copy_constructible_v<vless::VlessEncryptionTicketRejection>);
+static_assert(!std::is_copy_assignable_v<vless::VlessEncryptionTicketRejection>);
+static_assert(!std::is_move_constructible_v<vless::VlessEncryptionTicketRejection>);
+static_assert(!std::is_move_assignable_v<vless::VlessEncryptionTicketRejection>);
+
 
 
 [[noreturn]] void Fail(std::string_view message) {
@@ -220,12 +226,14 @@ void RunResumeCase(vless::VlessEncryptionAeadCipher cipher,
             boundaries[2] - 1,
         });
         InterruptedReader source(capture.bytes, cutpoints, signal, empty_on_cancel);
+        vless::VlessEncryptionTicketRejection rejection;
         std::optional<vless::VlessEncryptionReader> reader;
         if (lazy_context) {
             reader.emplace(source,
                            vless::VlessEncryptionDeferredRead{
                                .cipher = cipher,
                                .header_xor = header_xor,
+                               .ticket_rejection = &rejection,
                            },
                            key, std::nullopt);
         } else {
@@ -249,6 +257,8 @@ void RunResumeCase(vless::VlessEncryptionAeadCipher cipher,
                 interrupted = true;
             }
             if (interrupted) {
+                Check(!rejection.rejected,
+                      "cancelled deferred read invalidated a reusable ticket");
                 Check(cancelled < cutpoints.size() &&
                           source.Interruptions() == cancelled + 1 &&
                           source.Offset() == cutpoints[cancelled],
@@ -270,6 +280,9 @@ void RunResumeCase(vless::VlessEncryptionAeadCipher cipher,
               "real encrypted stream EOF returned plaintext");
         Check((co_await reader->ReadMultiBuffer()).byte_size() == 0,
               "repeated encrypted stream EOF returned plaintext");
+        reader->RejectDeferredTicket();
+        Check(!rejection.rejected,
+              "authenticated response or later EOF invalidated the ticket");
     };
     auto future = net::co_spawn(io, exercise(),
         net::bind_cancellation_slot(signal.slot(), net::use_future));
@@ -285,6 +298,73 @@ void RunResumeCase(vless::VlessEncryptionAeadCipher cipher,
     }
 }
 
+void RunDeferredRejectionCase(vless::VlessEncryptionAeadCipher cipher,
+                              bool header_xor,
+                              unsigned boundary) {
+    net::io_context io;
+    net::cancellation_signal signal;
+    const auto exercise = [&]() -> net::awaitable<void> {
+        std::array<uint8_t, vless::kVlessEncryptionCtrIvSize> context{};
+        vless::VlessEncryptionUnitedKey key;
+        auto aead = vless::VlessEncryptionAead::Create(context, key.bytes, cipher);
+        Check(aead.has_value(), "failed to create deferred response AEAD");
+        CaptureWriter capture;
+        capture.bytes.insert(capture.bytes.end(), context.begin(), context.end());
+        vless::VlessEncryptionWriter writer(
+            capture, std::move(*aead), key,
+            MakeHeaderXor(header_xor, key.bytes, context));
+        constexpr std::string_view payload = "authenticated-ticket-response";
+        const net::const_buffer buffer(payload.data(), payload.size());
+        co_await writer.WriteBuffers(std::span<const net::const_buffer>(&buffer, 1));
+        switch (boundary) {
+            case 0: capture.bytes.clear(); break;
+            case 1: capture.bytes.resize(context.size() - 1); break;
+            case 2: capture.bytes.resize(context.size()); break;
+            case 3: capture.bytes.resize(context.size() + 1); break;
+            case 4: capture.bytes.pop_back(); break;
+            case 5: capture.bytes.back() ^= 1; break;
+            case 6: break;
+        }
+        InterruptedReader source(capture.bytes, {}, signal, false);
+        vless::VlessEncryptionTicketRejection rejection;
+        vless::VlessEncryptionReader reader(
+            source,
+            vless::VlessEncryptionDeferredRead{
+                .cipher = cipher,
+                .header_xor = header_xor,
+                .ticket_rejection = &rejection,
+            },
+            key, std::nullopt);
+        bool failed = false;
+        try {
+            auto result = co_await reader.ReadMultiBuffer();
+            if (boundary == 6) {
+                const auto bytes = Flatten(result);
+                Check(std::string_view(reinterpret_cast<const char*>(bytes.data()),
+                                       bytes.size()) == payload,
+                      "deferred authenticated response changed payload");
+            } else {
+                Check(boundary == 2 && result.empty(),
+                      "incomplete deferred response produced plaintext");
+            }
+        } catch (const IoSystemError& error) {
+            Check(error.code() != io_error::operation_aborted,
+                  "deferred rejection unexpectedly reported cancellation");
+            failed = true;
+        }
+        Check(failed == (boundary != 2 && boundary != 6),
+              "deferred response failure category changed");
+        Check(rejection.rejected == (boundary != 6),
+              "ticket rejection did not match first-response authentication");
+        reader.RejectDeferredTicket();
+        Check(rejection.rejected == (boundary != 6),
+              "late failure invalidated an authenticated ticket");
+    };
+    auto future = net::co_spawn(io, exercise(), net::use_future);
+    io.run();
+    future.get();
+}
+
 }  // namespace
 
 TEST(VlessEncryptionIo, Contract) {
@@ -295,6 +375,19 @@ TEST(VlessEncryptionIo, Contract) {
                 for (const bool lazy_context : {false, true}) {
                     RunResumeCase(cipher, header_xor, empty_on_cancel, lazy_context);
                 }
+            }
+        }
+    }
+}
+
+TEST(VlessEncryptionIo, DeferredTicketAuthenticationAndCloseBoundaries) {
+    for (const auto cipher : {vless::VlessEncryptionAeadCipher::Aes256Gcm,
+                              vless::VlessEncryptionAeadCipher::Chacha20Poly1305}) {
+        for (const bool header_xor : {false, true}) {
+            for (unsigned boundary = 0; boundary != 7; ++boundary) {
+                SCOPED_TRACE(testing::Message() << "cipher=" << static_cast<int>(cipher)
+                    << " xor=" << header_xor << " boundary=" << boundary);
+                RunDeferredRejectionCase(cipher, header_xor, boundary);
             }
         }
     }

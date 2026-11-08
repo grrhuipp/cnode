@@ -1,5 +1,4 @@
 #include "vless_encryption_io.hpp"
-#include "vless_encryption_runtime.hpp"
 
 #include "common/error.hpp"
 #include "common/buffer_util.hpp"
@@ -50,14 +49,14 @@ VlessEncryptionReader::VlessEncryptionReader(
     , united_key_(united_key)
     , header_xor_(std::move(header_xor)) {
     if (const auto* deferred = std::get_if<VlessEncryptionDeferredRead>(&keys_)) {
-        unverified_ticket_cache_ = deferred->ticket_cache;
+        unverified_ticket_ = deferred->ticket_rejection;
     }
 }
 
-void VlessEncryptionReader::ClearDeferredTicket() noexcept {
-    if (unverified_ticket_cache_) {
-        unverified_ticket_cache_->Clear();
-        unverified_ticket_cache_ = nullptr;
+void VlessEncryptionReader::RejectDeferredTicket() noexcept {
+    if (unverified_ticket_) {
+        unverified_ticket_->rejected = true;
+        unverified_ticket_ = nullptr;
     }
 }
 
@@ -131,7 +130,7 @@ net::awaitable<buf::MultiBuffer> VlessEncryptionReader::ReadMultiBuffer() {
                             io_error::operation_aborted,
                             "VLESS Encryption read cancelled");
                     }
-                    ClearDeferredTicket();
+                    RejectDeferredTicket();
                     read_record_.Reset();
                     co_return buf::MultiBuffer{};
                 }
@@ -174,7 +173,7 @@ net::awaitable<buf::MultiBuffer> VlessEncryptionReader::ReadMultiBuffer() {
             if (!opened) {
                 ThrowVlessEncryptionIoError("VLESS Encryption record decrypt failed");
             }
-            unverified_ticket_cache_ = nullptr;
+            unverified_ticket_ = nullptr;
 
             if (!rekey_context.empty() &&
                 !RekeyAead(*aead, rekey_context, united_key_)) {
@@ -197,7 +196,7 @@ net::awaitable<buf::MultiBuffer> VlessEncryptionReader::ReadMultiBuffer() {
         }
     } catch (const IoSystemError& error) {
         if (error.code() != io_error::operation_aborted) {
-            ClearDeferredTicket();
+            RejectDeferredTicket();
             header_read_ = 0;
             bytes_read_ = 0;
             encrypted_size_ = 0;
@@ -205,7 +204,7 @@ net::awaitable<buf::MultiBuffer> VlessEncryptionReader::ReadMultiBuffer() {
         }
         throw;
     } catch (...) {
-        ClearDeferredTicket();
+        RejectDeferredTicket();
         header_read_ = 0;
         bytes_read_ = 0;
         encrypted_size_ = 0;

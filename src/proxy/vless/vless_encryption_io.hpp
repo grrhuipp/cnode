@@ -18,14 +18,24 @@
 
 namespace vless {
 
-struct VlessEncryptionClientTicketCache;
+// 记录层只报告首个认证响应前的拒绝，不借用握手凭据。
+// 宿主必须地址稳定，并比延迟读端活得更久；取消本身不构成拒绝。
+struct VlessEncryptionTicketRejection {
+    VlessEncryptionTicketRejection() noexcept = default;
+    VlessEncryptionTicketRejection(const VlessEncryptionTicketRejection&) = delete;
+    VlessEncryptionTicketRejection& operator=(const VlessEncryptionTicketRejection&) = delete;
+    VlessEncryptionTicketRejection(VlessEncryptionTicketRejection&&) = delete;
+    VlessEncryptionTicketRejection& operator=(VlessEncryptionTicketRejection&&) = delete;
+
+    bool rejected = false;
+};
 
 // 0-RTT client read side: it is keyed by the server random that prefixes the
 // first response bytes, which also seeds the header XOR when enabled.
 struct VlessEncryptionDeferredRead {
     VlessEncryptionAeadCipher cipher = VlessEncryptionAeadCipher::Aes256Gcm;
     bool header_xor = false;
-    VlessEncryptionClientTicketCache* ticket_cache = nullptr;
+    VlessEncryptionTicketRejection* ticket_rejection = nullptr;
 };
 using VlessEncryptionReadKeys =
     std::variant<VlessEncryptionAead, VlessEncryptionDeferredRead>;
@@ -44,7 +54,7 @@ public:
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override;
     [[nodiscard]] bool EnableRawRead() noexcept override;
-    void ClearDeferredTicket() noexcept;
+    void RejectDeferredTicket() noexcept;
 
 private:
     [[nodiscard]] VlessEncryptionAead& KeyDeferredRead(
@@ -64,7 +74,7 @@ private:
     size_t bytes_read_ = 0;
     size_t encrypted_size_ = 0;
     bool raw_read_ = false;
-    VlessEncryptionClientTicketCache* unverified_ticket_cache_ = nullptr;
+    VlessEncryptionTicketRejection* unverified_ticket_ = nullptr;
 };
 
 class VlessEncryptionWriter final : public transport::MultiBufferWriter {

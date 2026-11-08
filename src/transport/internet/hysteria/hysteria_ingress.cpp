@@ -72,7 +72,7 @@ constexpr size_t kMaxUdpMessageSize = 1100;
 constexpr size_t kUdpDatagramFrameOverhead = 3; // type + 至多两字节 LEN。
 constexpr size_t kMaxStreamOutputBytes = 512 * 1024;
 constexpr uint64_t kMaxConnectionData = 16 * 1024 * 1024;
-constexpr uint64_t kMaxStreamData = 4 * 1024 * 1024;
+constexpr uint64_t kMaxStreamData = QuicStreamState::kMaxQueuedInputBytes;
 constexpr uint64_t kMaxStreams = 1024;
 
 [[nodiscard]] ngtcp2_tstamp Timestamp() noexcept {
@@ -445,6 +445,7 @@ bool Connection::Initialize(const ngtcp2_pkt_hd& header) {
     ngtcp2_settings_default(&quic_settings);
     quic_settings.initial_ts = Timestamp();
     quic_settings.cc_algo = NGTCP2_CC_ALGO_BBR;
+    quic_settings.max_stream_window = kMaxStreamData;
     quic_settings.handshake_timeout =
         static_cast<ngtcp2_duration>(timeouts.HandshakeTimeout().count()) * NGTCP2_SECONDS;
 
@@ -738,21 +739,30 @@ void Connection::OnExpiry() {
 
 net::awaitable<void> Connection::WriteStream(
     int64_t stream_id, buf::MultiBuffer payload) {
-    auto it = core_->streams.find(stream_id);
-    if (closed_ || it == core_->streams.end()) {
-        payload.clear();
-        throw transport::LinkError(ErrorCode::CONNECTION_CLOSED);
-    }
     const size_t bytes = payload.byte_size();
-    if (bytes > kMaxStreamOutputBytes ||
-        it->second.queued_bytes > kMaxStreamOutputBytes - bytes) {
-        payload.clear();
-        throw transport::LinkError(ErrorCode::RESOURCE_EXHAUSTED);
+    for (;;) {
+        std::shared_ptr<QuicStreamState> state;
+        {
+            if (!core_ || closed_)
+                throw transport::LinkError(ErrorCode::CONNECTION_CLOSED);
+            auto it = core_->streams.find(stream_id);
+            if (it == core_->streams.end())
+                throw transport::LinkError(ErrorCode::CONNECTION_CLOSED);
+            state = it->second.state;
+            state->CheckWriteOpen();
+            if (bytes > kMaxStreamOutputBytes)
+                throw transport::LinkError(ErrorCode::RESOURCE_EXHAUSTED);
+            if (it->second.queued_bytes <= kMaxStreamOutputBytes - bytes) {
+                if (bytes != 0) it->second.output.push_back(std::move(payload));
+                it->second.queued_bytes += bytes;
+                Flush();
+                co_return;
+            }
+        }
+        // Only the stable state survives suspension, never a map iterator.
+        // ACKs release retained buffers; packet transmission alone does not.
+        co_await state->WaitWritable();
     }
-    it->second.queued_bytes += bytes;
-    it->second.output.push_back(std::move(payload));
-    Flush();
-    co_return;
 }
 
 void Connection::ConsumeStream(int64_t stream_id, size_t bytes) noexcept {
@@ -772,6 +782,13 @@ void Connection::ShutdownStreamWrite(int64_t stream_id) noexcept {
 
 void Connection::CancelStream(int64_t stream_id) noexcept {
     if (!core_ || closed_) return;
+    std::shared_ptr<QuicStreamState> state;
+    {
+        auto it = core_->streams.find(stream_id);
+        if (it != core_->streams.end()) state = it->second.state;
+    }
+    if (state) state->RemoteReset();
+    if (closed_) return;
     ngtcp2_conn_shutdown_stream(core_->quic, 0, stream_id, 0);
     Flush();
 }
@@ -780,9 +797,11 @@ int Connection::AckStreamData(ngtcp2_conn*, int64_t stream_id, uint64_t offset,
     uint64_t length, void* user_data, void*) {
     auto& self = *static_cast<Connection*>(user_data);
     if (self.core_->http &&
-        self.core_->h3_requests.contains(stream_id))
+        (!ngtcp2_is_bidi_stream(stream_id) ||
+         self.core_->h3_requests.contains(stream_id)))
         return nghttp3_conn_add_ack_offset(
-            self.core_->http, stream_id, length);
+            self.core_->http, stream_id, length) == 0
+            ? 0 : NGTCP2_ERR_CALLBACK_FAILURE;
     auto it = self.core_->streams.find(stream_id);
     if (it == self.core_->streams.end() || length == 0) return 0;
     auto& stream = it->second;
@@ -820,6 +839,8 @@ int Connection::AckStreamData(ngtcp2_conn*, int64_t stream_id, uint64_t offset,
         if (stream.output.front().empty()) stream.output.pop_front();
         if (dropped == 0) break;
     }
+    if (stream.acknowledged != previous_acknowledged)
+        stream.state->NotifyWritable();
     return 0;
 }
 
@@ -845,8 +866,16 @@ int Connection::OpenStream(ngtcp2_conn*, int64_t stream_id, void* user_data) {
 }
 
 int Connection::CloseStream(ngtcp2_conn* conn, uint32_t flags, int64_t stream_id,
-    uint64_t, void* user_data, void*) {
+    uint64_t app_error_code, void* user_data, void*) {
     auto& self = *static_cast<Connection*>(user_data);
+    if (self.core_->http &&
+        (!ngtcp2_is_bidi_stream(stream_id) ||
+         self.core_->h3_requests.contains(stream_id))) {
+        const int result = nghttp3_conn_close_stream(
+            self.core_->http, stream_id, app_error_code);
+        if (result != 0 && result != NGHTTP3_ERR_STREAM_NOT_FOUND)
+            return NGTCP2_ERR_CALLBACK_FAILURE;
+    }
     std::shared_ptr<QuicStreamState> state;
     if (auto it = self.core_->streams.find(stream_id);
         it != self.core_->streams.end()) {
@@ -870,17 +899,32 @@ int Connection::CloseStream(ngtcp2_conn* conn, uint32_t flags, int64_t stream_id
     return 0;
 }
 
-int Connection::ResetStream(ngtcp2_conn* conn, int64_t stream_id, uint64_t,
+int Connection::ResetStream(ngtcp2_conn*, int64_t stream_id, uint64_t,
     uint64_t, void* user_data, void*) {
-    CloseStream(nullptr, 0, stream_id, 0, user_data, nullptr);
-    if (conn) ngtcp2_conn_shutdown_stream(conn, 0, stream_id, 0);
+    // RESET_STREAM is not stream_close: ngtcp2 may still borrow output for
+    // the opposite direction until its actual close callback.
+    auto& self = *static_cast<Connection*>(user_data);
+    if (self.core_->http &&
+        (!ngtcp2_is_bidi_stream(stream_id) ||
+         self.core_->h3_requests.contains(stream_id))) {
+        return nghttp3_conn_shutdown_stream_read(self.core_->http, stream_id) == 0
+            ? 0 : NGTCP2_ERR_CALLBACK_FAILURE;
+    }
+    self.CancelStream(stream_id);
     return 0;
 }
 
-int Connection::StopSending(ngtcp2_conn* conn, int64_t stream_id, uint64_t,
+int Connection::StopSending(ngtcp2_conn*, int64_t stream_id, uint64_t,
     void* user_data, void*) {
-    CloseStream(nullptr, 0, stream_id, 0, user_data, nullptr);
-    if (conn) ngtcp2_conn_shutdown_stream(conn, 0, stream_id, 0);
+    // This callback reports local read shutdown, not a peer STOP_SENDING.
+    auto& self = *static_cast<Connection*>(user_data);
+    if (self.core_->http &&
+        (!ngtcp2_is_bidi_stream(stream_id) ||
+         self.core_->h3_requests.contains(stream_id))) {
+        return nghttp3_conn_shutdown_stream_read(self.core_->http, stream_id) == 0
+            ? 0 : NGTCP2_ERR_CALLBACK_FAILURE;
+    }
+    self.CancelStream(stream_id);
     return 0;
 }
 
@@ -892,12 +936,22 @@ void Connection::Flush() {
     struct RefreshExpiry {
         Connection& connection;
         ~RefreshExpiry() {
+            ngtcp2_conn_update_pkt_tx_time(connection.core_->quic, Timestamp());
             connection.in_ngtcp2_callback_ = false;
             connection.PublishExpiry();
         }
     } refresh{*this};
     std::array<uint8_t, NGTCP2_MAX_UDP_PAYLOAD_SIZE> packet;
-    for (size_t attempt = 0; attempt < 64; ++attempt) {
+    const size_t packet_limit = std::clamp<size_t>(
+        ngtcp2_conn_get_send_quantum2(core_->quic) / packet.size(), 1, 64);
+    // Every nonfatal write error removes one app/HTTP candidate until a
+    // credit event. Include HTTP/3's three local unidirectional streams,
+    // so exhausting blocked candidates still reaches a transport-only write.
+    const size_t attempt_limit = packet_limit + core_->streams.size() +
+        core_->h3_requests.size() + 3;
+    size_t packets = 0;
+    for (size_t attempt = 0;
+         attempt < attempt_limit && packets < packet_limit; ++attempt) {
         int64_t stream_id = -1;
         int fin = 0;
         std::array<ngtcp2_vec, 16> vectors{};
@@ -915,13 +969,21 @@ void Connection::Flush() {
             vector_count = static_cast<size_t>(count);
             for (size_t i = 0; i < vector_count; ++i)
                 vectors[i] = {http_vectors[i].base, http_vectors[i].len};
-            http_data = vector_count != 0 || stream_id >= 0;
+            http_data = stream_id >= 0;
         }
-        if (!validating_ && !http_data) {
-            for (auto& [id, stream] : core_->streams) {
+        if (!validating_ && !http_data && !core_->streams.empty()) {
+            auto next = core_->streams.find(core_->next_output_stream);
+            if (next == core_->streams.end()) next = core_->streams.begin();
+            for (size_t remaining = core_->streams.size();
+                 remaining != 0; --remaining) {
+                auto current = next++;
+                if (next == core_->streams.end()) next = core_->streams.begin();
+                auto& [id, stream] = *current;
+                if (!stream.state->Open() || stream.flow_blocked) continue;
                 const bool has_unsent =
                     stream.output_offset < stream.queued_bytes;
                 if (!has_unsent && !stream.fin_pending) continue;
+                core_->next_output_stream = next->first;
                 stream_id = id;
                 fin = stream.fin_pending && !has_unsent;
                 size_t skip = stream.output_offset;
@@ -973,6 +1035,7 @@ void Connection::Flush() {
                 Close();
                 return;
             }
+            ++packets;
             continue;
         }
         ngtcp2_ssize accepted = -1;
@@ -982,29 +1045,43 @@ void Connection::Flush() {
             core_->quic, &path, &packet_info, packet.data(), packet.size(),
             &accepted, flags, stream_id, vectors.data(), vector_count, Timestamp());
         if (written == 0) return;
+        if (written == NGTCP2_ERR_STREAM_DATA_BLOCKED ||
+            written == NGTCP2_ERR_STREAM_SHUT_WR ||
+            written == NGTCP2_ERR_STREAM_NOT_FOUND) {
+            if (http_data) {
+                if (written == NGTCP2_ERR_STREAM_DATA_BLOCKED)
+                    nghttp3_conn_block_stream(core_->http, stream_id);
+                else
+                    nghttp3_conn_shutdown_stream_write(core_->http, stream_id);
+            } else if (auto it = core_->streams.find(stream_id);
+                       it != core_->streams.end()) {
+                if (written == NGTCP2_ERR_STREAM_DATA_BLOCKED) {
+                    it->second.flow_blocked = true;
+                } else {
+                    auto state = it->second.state;
+                    state->RemoteReset();
+                }
+            }
+            continue;
+        }
         if (written < 0) {
-            if (written == NGTCP2_ERR_STREAM_DATA_BLOCKED ||
-                written == NGTCP2_ERR_STREAM_SHUT_WR) return;
             Close();
             return;
         }
-        if (accepted > 0) {
+        // A packet carrying only ACK/control frames has accepted == -1;
+        // neither an application FIN nor HTTP/3's write offset can commit.
+        if (accepted >= 0) {
             if (http_data) {
                 if (nghttp3_conn_add_write_offset(
                         core_->http, stream_id,
-                        static_cast<uint64_t>(accepted)) != 0) {
+                        static_cast<size_t>(accepted)) != 0) {
                     Close();
                     return;
                 }
             } else if (auto it = core_->streams.find(stream_id);
                        it != core_->streams.end()) {
                 it->second.output_offset += static_cast<size_t>(accepted);
-            }
-        }
-        if (!http_data && fin) {
-            if (auto it = core_->streams.find(stream_id);
-                it != core_->streams.end()) {
-                it->second.fin_pending = false;
+                if (fin) it->second.fin_pending = false;
             }
         }
         auto* output_socket = OutputSocket(path);
@@ -1017,6 +1094,7 @@ void Connection::Flush() {
             Close();
             return;
         }
+        ++packets;
     }
 }
 
@@ -1025,9 +1103,9 @@ void Connection::Close() noexcept {
     closed_ = true;
     ExpireUdpFragments(std::numeric_limits<ngtcp2_tstamp>::max());
     if (core_) {
-        auto streams = std::move(core_->streams);
-        core_->streams.clear();
-        for (auto& [id, stream] : streams) {
+        // Native QUIC still borrows output until Run drains I/O and destroys
+        // Core. Closing only cancels application work and releases input.
+        for (auto& [id, stream] : core_->streams) {
             (void)id;
             stream.state->RemoteReset();
         }
@@ -1525,7 +1603,7 @@ bool Connection::SendUdpMessage(
                     core_->datagrams.pop_back();
                 return false;
             }
-            core_->datagrams.emplace_back(encoded->begin(), encoded->end());
+            core_->datagrams.push_back(std::move(*encoded));
         }
     } catch (...) {
         while (core_->datagrams.size() > initial_datagrams)

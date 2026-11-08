@@ -38,10 +38,33 @@ public:
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer();
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer payload);
     void ShutdownWrite() noexcept;
+    void CheckWriteOpen() const;
+    // A notification is only a hint: the connection must recheck its queue
+    // and stream identity after every wait. ACKs broadcast to current waiters;
+    // shutdown/reset/cancel also wake them, but make the wait fail.
+    net::awaitable<void> WaitWritable();
+    void NotifyWritable() noexcept;
 
     [[nodiscard]] bool Open() const noexcept { return !cancelled_; }
+    // Application completion does not retire transport output: queued bytes
+    // and FIN remain owned by the connection until native stream closure.
+    [[nodiscard]] bool DuplexFinished() const noexcept {
+        return !cancelled_ && input_done_ && input_.empty() && write_done_;
+    }
 
 private:
+    struct OutputWait final : memory::ThreadAllocated {
+        explicit OutputWait(net::any_io_executor executor)
+            : ready(std::move(executor), 0) {}
+        OutputWait(const OutputWait&) = delete;
+        OutputWait& operator=(const OutputWait&) = delete;
+        OutputWait(OutputWait&&) = delete;
+        OutputWait& operator=(OutputWait&&) = delete;
+
+        SignalChannel ready;
+        size_t waiters = 0;
+    };
+
     void AcknowledgeInput(size_t bytes) noexcept;
     void WakeReader() noexcept;
 
@@ -49,6 +72,8 @@ private:
     int64_t stream_id_;
     std::weak_ptr<Connection> owner_;
     SignalChannel input_signal_;
+    // Borrowed only while writers actually wait; idle streams retain no node.
+    std::unique_ptr<OutputWait> output_wait_;
     buf::MultiBuffer input_;
     bool input_done_ = false;
     bool write_done_ = false;
@@ -73,6 +98,7 @@ public:
     void ShutdownWrite() override;
     void Cancel() noexcept override;
     void Close() override;
+    void CloseAbortive() override;
     [[nodiscard]] int NativeHandle() const override { return -1; }
     [[nodiscard]] bool IsOpen() const override;
 

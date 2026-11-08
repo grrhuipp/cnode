@@ -7,6 +7,7 @@
 #include "transport/link_error.hpp"
 
 #include <asio/as_tuple.hpp>
+#include <asio/this_coro.hpp>
 #include <asio/use_awaitable.hpp>
 
 #include <cstring>
@@ -49,6 +50,7 @@ void QuicStreamState::OnStreamClosed() noexcept {
     input_done_ = true;
     write_done_ = true;
     WakeReader();
+    NotifyWritable();
     // The buffered tail may still be drained, but must not retain connection
     // credit or acknowledge it twice after the transport stream is gone.
     if (owner && unread != 0) owner->ConsumeStream(stream_id, unread);
@@ -63,6 +65,7 @@ void QuicStreamState::RemoteReset() noexcept {
     write_done_ = true;
     input_.clear();
     WakeReader();
+    NotifyWritable();
     cancellation_.Stop();
     if (owner && unread != 0) owner->ConsumeStream(stream_id, unread);
 }
@@ -77,6 +80,7 @@ void QuicStreamState::Cancel() noexcept {
     write_done_ = true;
     input_.clear();
     WakeReader();
+    NotifyWritable();
     cancellation_.Stop();
     if (owner) {
         owner->CancelStream(stream_id);
@@ -126,14 +130,7 @@ net::awaitable<buf::MultiBuffer> QuicStreamState::ReadMultiBuffer() {
 }
 
 net::awaitable<void> QuicStreamState::WriteMultiBuffer(buf::MultiBuffer payload) {
-    if (cancelled_) {
-        payload.clear();
-        throw transport::LinkError(ErrorCode::CANCELLED);
-    }
-    if (write_done_) {
-        payload.clear();
-        throw transport::WriteClosed();
-    }
+    CheckWriteOpen();
     auto owner = owner_.lock();
     if (!owner) {
         payload.clear();
@@ -145,7 +142,40 @@ net::awaitable<void> QuicStreamState::WriteMultiBuffer(buf::MultiBuffer payload)
 void QuicStreamState::ShutdownWrite() noexcept {
     if (write_done_) return;
     write_done_ = true;
+    NotifyWritable();
     if (auto owner = owner_.lock()) owner->ShutdownStreamWrite(stream_id_);
+}
+
+void QuicStreamState::CheckWriteOpen() const {
+    if (cancelled_) throw transport::LinkError(ErrorCode::CANCELLED);
+    if (write_done_) throw transport::WriteClosed();
+}
+
+net::awaitable<void> QuicStreamState::WaitWritable() {
+    CheckWriteOpen();
+    if (!output_wait_)
+        output_wait_ = std::make_unique<OutputWait>(domain_->Executor());
+    struct PendingWriteWait {
+        QuicStreamState& owner;
+        OutputWait& wait;
+        ~PendingWriteWait() {
+            if (--wait.waiters == 0) owner.output_wait_.reset();
+        }
+    } pending{*this, *output_wait_};
+    ++pending.wait.waiters;
+    const auto cancellation = co_await net::this_coro::cancellation_state;
+    auto [error] = co_await pending.wait.ready.async_receive(
+        net::as_tuple(net::use_awaitable));
+    CheckWriteOpen();
+    if (cancellation.cancelled() != net::cancellation_type::none)
+        throw IoSystemError(net::error::operation_aborted, "QUIC stream output cancelled");
+    // channel.cancel() is the broadcast event, not stream cancellation.
+    if (error && error != net::experimental::error::channel_cancelled)
+        throw IoSystemError(error, "QUIC stream output cancelled");
+}
+
+void QuicStreamState::NotifyWritable() noexcept {
+    if (output_wait_) output_wait_->ready.cancel();
 }
 
 void QuicStreamState::WakeReader() noexcept {
@@ -208,6 +238,12 @@ void QuicStream::Cancel() noexcept {
 }
 
 void QuicStream::Close() {
+    deadline_.Clear();
+    if (std::exchange(closed_, true)) return;
+    if (!state_->DuplexFinished()) state_->Cancel();
+}
+
+void QuicStream::CloseAbortive() {
     deadline_.Clear();
     if (std::exchange(closed_, true)) return;
     state_->Cancel();

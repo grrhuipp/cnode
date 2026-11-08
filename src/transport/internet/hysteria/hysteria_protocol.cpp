@@ -71,12 +71,14 @@ private:
     size_t position_ = 0;
 };
 
-void AppendU16(std::vector<uint8_t>& output, uint16_t value) {
+template <class Allocator>
+void AppendU16(std::vector<uint8_t, Allocator>& output, uint16_t value) {
     output.push_back(static_cast<uint8_t>(value >> 8));
     output.push_back(static_cast<uint8_t>(value));
 }
 
-void AppendU32(std::vector<uint8_t>& output, uint32_t value) {
+template <class Allocator>
+void AppendU32(std::vector<uint8_t, Allocator>& output, uint32_t value) {
     for (unsigned shift : {24u, 16u, 8u, 0u})
         output.push_back(static_cast<uint8_t>(value >> shift));
 }
@@ -94,17 +96,15 @@ void AppendU64(std::vector<uint8_t>& output, uint64_t value) {
     return 0;
 }
 
-bool AppendVarint(std::vector<uint8_t>& output, uint64_t value) {
+template <class Allocator>
+bool AppendVarint(std::vector<uint8_t, Allocator>& output, uint64_t value) {
     const size_t width = VarintWidth(value);
     if (width == 0) return false;
     const uint8_t prefix = static_cast<uint8_t>(
         (width == 1 ? 0 : width == 2 ? 1 : width == 4 ? 2 : 3) << 6);
-    const size_t start = output.size();
-    output.resize(start + width);
-    for (size_t i = 0; i < width; ++i) {
-        output[start + width - 1 - i] = static_cast<uint8_t>(value >> (i * 8));
-    }
-    output[start] = static_cast<uint8_t>(output[start] | prefix);
+    output.push_back(static_cast<uint8_t>((value >> ((width - 1) * 8)) | prefix));
+    for (size_t i = 1; i < width; ++i)
+        output.push_back(static_cast<uint8_t>(value >> ((width - 1 - i) * 8)));
     return true;
 }
 
@@ -366,7 +366,7 @@ UdpMessageHeaderSize(Version version, const TargetAddress& target) {
     return UdpHeaderSize(version, *text);
 }
 
-tl::expected<std::vector<uint8_t>, ProtocolError>
+tl::expected<memory::ByteVector, ProtocolError>
 EncodeUdpMessage(Version version, const UdpMessage& message) {
     if (!ValidFragmentIndex(version, message.fragment_id, message.fragment_count) ||
         message.payload.size() > kMaxUdpPayloadLength)
@@ -383,7 +383,7 @@ EncodeUdpMessage(Version version, const UdpMessage& message) {
     if (message.payload.size() > std::numeric_limits<size_t>::max() - *header_size)
         return tl::unexpected(ProtocolError::TooLarge);
 
-    std::vector<uint8_t> output;
+    memory::ByteVector output;
     output.reserve(*header_size + message.payload.size());
     AppendU32(output, message.session_id);
     if (version == Version::V1) {

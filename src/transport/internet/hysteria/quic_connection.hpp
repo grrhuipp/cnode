@@ -113,6 +113,7 @@ private:
         uint64_t acknowledged = 0;
         memory::ThreadLocalMap<uint64_t, uint64_t> acked_ranges;
         bool fin_pending = false;
+        bool flow_blocked = false;
         // A Hysteria request stream rather than an HTTP/3 or v1 control stream.
         bool raw = false;
         // Handed to the inbound handler, or consumed as a v1 UDP-session open.
@@ -122,8 +123,8 @@ private:
         explicit Core(memory::AllocationDomain& domain)
             : memory(domain) {}
         ~Core() {
-            if (http) nghttp3_conn_del(http);
             if (quic) ngtcp2_conn_del(quic);
+            if (http) nghttp3_conn_del(http);
             if (ssl) SSL_free(ssl);
         }
         QuicMemory memory;
@@ -137,6 +138,8 @@ private:
         udp::endpoint remote;
         ngtcp2_cid server_cid{};
         memory::ThreadLocalUnorderedMap<int64_t, StreamRecord> streams;
+        // IDs, not iterators, survive stream retirement during packet writes.
+        int64_t next_output_stream = -1;
         memory::ThreadLocalUnorderedMap<int64_t, H3Request> h3_requests;
         memory::ThreadLocalDeque<memory::ByteVector> datagrams;
         // Registered sessions; each unregisters itself on destruction and is
@@ -227,6 +230,9 @@ private:
     static int ExtendMaxStreamData(ngtcp2_conn*, int64_t stream_id, uint64_t,
         void* user_data, void*) {
         auto& self = *static_cast<Connection*>(user_data);
+        if (auto it = self.core_->streams.find(stream_id);
+            it != self.core_->streams.end())
+            it->second.flow_blocked = false;
         return self.core_->http
             ? nghttp3_conn_unblock_stream(self.core_->http, stream_id) : 0;
     }

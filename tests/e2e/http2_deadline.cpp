@@ -1,5 +1,6 @@
 #include "http2_peer.hpp"
 #include <openssl/base64.h>
+#include <array>
 
 namespace cnode::e2e::http2 {
 namespace {
@@ -161,6 +162,188 @@ public:
         uploaders_.clear(); if (error) std::rethrow_exception(error);
     }
 };
+// 只转发真实双节点之间的字节或制造关闭；不实现加密协议，也不保存密钥/票据。
+class VlessTicketBridge {
+    Socket listener_ = Socket::Listen();
+    std::mutex mutex_;
+    std::vector<std::shared_ptr<Socket>> sockets_;
+    std::vector<std::unique_ptr<PeerThread>> peers_;
+    std::unique_ptr<PeerThread> accept_;
+    std::atomic<bool> stop_{false};
+
+    void Forward(Socket& client, Socket& remote, size_t index) {
+        bool upload = true, download = true, responded = false;
+        size_t sent = 0;
+        const auto deadline = Clock::now() + 30s;
+        while ((upload || download) && !stop_) {
+            Require(Clock::now() < deadline, "VLESS ticket bridge deadline");
+            pollfd fds[] = {{upload ? client.Fd() : -1, POLLIN, 0},
+                            {download ? remote.Fd() : -1, POLLIN, 0}};
+            const int ready = poll(fds, 2, 25);
+            if (ready < 0 && errno == EINTR) continue;
+            Require(ready >= 0, "polling VLESS ticket bridge");
+            for (unsigned direction = 0; direction != 2; ++direction) {
+                if (!(fds[direction].revents & (POLLIN | POLLHUP | POLLERR))) continue;
+                auto& source = direction == 0 ? client : remote;
+                auto& destination = direction == 0 ? remote : client;
+                std::array<char, 65536> bytes{};
+                const auto count = recv(source.Fd(), bytes.data(), bytes.size(), 0);
+                if (count <= 0) {
+                    if (count < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+                    Require(count == 0 || errno == ECONNRESET, "reading VLESS ticket bridge");
+                    if (direction == 0) upload = false; else download = false;
+                    shutdown(destination.Fd(), SHUT_WR);
+                    continue;
+                }
+                if (direction == 0) sent += static_cast<size_t>(count);
+                else if (!responded) {
+                    first_response[index] = sent;
+                    responded = true;
+                }
+                try { destination.Write(std::string_view(bytes.data(), static_cast<size_t>(count))); }
+                catch (const std::system_error& error) {
+                    if (error.code().value() == EPIPE || error.code().value() == ECONNRESET ||
+                        error.code().value() == ENOTCONN) return;
+                    throw;
+                }
+            }
+        }
+    }
+
+public:
+    std::array<std::atomic<size_t>, 8> first_response{};
+    std::array<std::atomic<bool>, 8> arrived{}, completed{};
+    std::atomic<bool> reject_old{false};
+
+    explicit VlessTicketBridge(uint16_t target) {
+        accept_ = std::make_unique<PeerThread>([this, target] {
+            size_t index = 0;
+            while (!stop_) {
+                pollfd item{listener_.Fd(), POLLIN, 0};
+                if (poll(&item, 1, 25) <= 0) continue;
+                Require(index < first_response.size(), "unexpected VLESS ticket connection");
+                auto client = std::make_shared<Socket>(listener_.Accept());
+                { std::lock_guard lock(mutex_); sockets_.push_back(client); }
+                peers_.push_back(std::make_unique<PeerThread>([this, target, client, index] {
+                    try {
+                        if (index == 1 || index == 2 || index == 5) {
+                            // X25519 NFS + 0-RTT 请求；取消场景还等到两个记录
+                            // （无 addons 的 VLESS 头、首份 relay payload）都已写出。
+                            const size_t prefix = index == 5
+                                ? 98 + VlessRequest(target, Ready).size() + 2 * (5 + 16)
+                                : 98;
+                            client->ReadExact(prefix);
+                            arrived[index] = true;
+                            if (index == 1) Until([&] { return reject_old.load() || stop_.load(); }, 15s);
+                            if (index == 5) {
+                                try { while (!stop_ && !client->Read().empty()) {} }
+                                catch (const std::system_error& error) {
+                                    if (error.code().value() != ECONNRESET) throw;
+                                }
+                            }
+                            shutdown(client->Fd(), SHUT_RDWR);
+                        } else {
+                            auto remote = std::make_shared<Socket>(Socket::Connect(target));
+                            { std::lock_guard lock(mutex_); sockets_.push_back(remote); }
+                            Forward(*client, *remote, index);
+                        }
+                        completed[index] = true;
+                    } catch (...) { if (!stop_) throw; }
+                }));
+                ++index;
+            }
+        });
+    }
+    ~VlessTicketBridge() { try { Join(); } catch (...) { ADD_FAILURE() << "unobserved VLESS ticket bridge failure"; } }
+    uint16_t Port() const { return listener_.Port(); }
+    void Join() {
+        if (!accept_) return;
+        stop_ = true;
+        std::exception_ptr error;
+        try { accept_->Join(); } catch (...) { error = std::current_exception(); }
+        accept_.reset();
+        { std::lock_guard lock(mutex_); for (auto& socket : sockets_) shutdown(socket->Fd(), SHUT_RDWR); }
+        for (auto& peer : peers_) { try { peer->Join(); } catch (...) { if (!error) error = std::current_exception(); } }
+        peers_.clear();
+        if (error) std::rethrow_exception(error);
+    }
+};
+
+class VlessEncryptionLifecycle : public testing::TestWithParam<std::string> {};
+TEST_P(VlessEncryptionLifecycle, HandshakeResumptionLateRejectionAndCancellation) {
+    Targets target([](Socket& socket) {
+        for (;;) { auto bytes = socket.Read(65536, 30s); if (bytes.empty()) break; socket.Write(bytes); }
+    });
+    Node server, client;
+    auto inbound = [&](uint16_t port) {
+        return Json{{"protocol", "vless"}, {"listen", "127.0.0.1"}, {"port", port},
+                    {"settings", Protocol()}};
+    };
+    auto encrypted_inbound = inbound(server.port);
+    // RFC 7748 §6.1 公共夹具；固定单 Worker，确保后续连接复用同一出站缓存。
+    encrypted_inbound["settings"]["decryption"] = "mlkem768x25519plus." + GetParam() + ".600s." +
+        FixtureKey("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
+    Configure(server.root.Path(), encrypted_inbound, Freedom(), 1);
+    Deadlines(server, 10); server.Start();
+    VlessTicketBridge bridge(server.port);
+    auto outbound = Protocol("vless", bridge.Port());
+    outbound["encryption"] = "mlkem768x25519plus." + GetParam() + ".0rtt." +
+        FixtureKey("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a");
+    Configure(client.root.Path(), inbound(client.port),
+              {{"protocol", "vless"}, {"settings", outbound}}, 1);
+    Deadlines(client, 10); client.Start();
+    auto open = [&] {
+        auto socket = Socket::Connect(client.port);
+        socket.Write(VlessRequest(target.Port(), Ready));
+        return socket;
+    };
+    auto accepted = [&] {
+        auto socket = open();
+        EXPECT_EQ(socket.ReadExact(Response.size()), Response);
+        return socket;
+    };
+    auto closed = [](Socket& socket) {
+        try { EXPECT_TRUE(socket.Read().empty()); }
+        catch (const std::system_error& error) { EXPECT_EQ(error.code().value(), ECONNRESET); }
+    };
+
+    auto first = accepted(); // A：完整握手已发布，连接继续停在真实 relay 中。
+    EXPECT_GE(bridge.first_response[0].load(), 1298u);
+    auto old = open();
+    Until([&] { return bridge.arrived[1].load(); });
+    auto rejected = open();
+    closed(rejected); // 同一个 A 被拒绝，使下一次连接走完整握手。
+    auto replacement = accepted(); // B 在旧 A 的延迟读端仍存活时发布。
+    EXPECT_GE(bridge.first_response[3].load(), 1298u);
+    bridge.reject_old = true;
+    closed(old);
+    first.ShutdownWrite(); closed(first);
+    auto resumed = accepted();
+    EXPECT_GE(bridge.first_response[4].load(), 98u);
+    EXPECT_LT(bridge.first_response[4].load(), 1000u); // 旧拒绝没有删除 B。
+    resumed.ShutdownWrite(); closed(resumed);
+    replacement.ShutdownWrite(); closed(replacement);
+
+    auto cancelled = open();
+    Until([&] { return bridge.arrived[5].load(); });
+    linger abortive{1, 0};
+    Require(setsockopt(cancelled.Fd(), SOL_SOCKET, SO_LINGER, &abortive, sizeof(abortive)) == 0,
+            "setting VLESS cancellation reset");
+    cancelled.Close();
+    Until([&] { return bridge.completed[5].load(); });
+    auto recovered = accepted();
+    EXPECT_GE(bridge.first_response[6].load(), 1298u);
+    recovered.ShutdownWrite(); closed(recovered);
+    auto recovered_resume = accepted();
+    EXPECT_GE(bridge.first_response[7].load(), 98u);
+    EXPECT_LT(bridge.first_response[7].load(), 1000u);
+    recovered_resume.ShutdownWrite(); closed(recovered_resume);
+    EXPECT_TRUE(client.child->Running()); EXPECT_TRUE(server.child->Running());
+    client.child->Stop(); server.child->Stop(); bridge.Join(); target.Join();
+}
+INSTANTIATE_TEST_SUITE_P(AllModes, VlessEncryptionLifecycle,
+    testing::Values(std::string("native"), std::string("xorpub"), std::string("random")));
+
 TEST(Http2EncryptedDeadline, ExpiredChildReturnsQuotaBeforeBlockedSiblingResumes) {
     constexpr size_t FloodSize = 256 * 65536;
     std::atomic<bool> go{false}, drained{false}, closed{false}; std::atomic<size_t> sent{0};

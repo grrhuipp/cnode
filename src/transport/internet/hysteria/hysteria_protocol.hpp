@@ -1,5 +1,6 @@
 #pragma once
 
+#include "common/allocator.hpp"
 #include "common/target_address.hpp"
 
 #include <array>
@@ -87,7 +88,8 @@ ParseUdpMessage(Version version, std::span<const uint8_t> input);
 [[nodiscard]] tl::expected<size_t, ProtocolError>
 UdpMessageHeaderSize(Version version, const TargetAddress& target);
 
-[[nodiscard]] tl::expected<std::vector<uint8_t>, ProtocolError>
+// 输出归属当前分配域，可直接移动到连接的待发送队列。
+[[nodiscard]] tl::expected<memory::ByteVector, ProtocolError>
 EncodeUdpMessage(Version version, const UdpMessage& message);
 
 [[nodiscard]] std::array<uint8_t, 32> HashCredential(std::string_view credential) noexcept;

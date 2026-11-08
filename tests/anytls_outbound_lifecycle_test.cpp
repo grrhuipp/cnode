@@ -32,10 +32,8 @@
 
 namespace {
 thread_local bool fail_next_allocation = false;
-thread_local bool fail_next_pmr_allocation = false;
 thread_local size_t allocation_failures = 0;
 thread_local size_t failed_allocation_size = 0;
-thread_local size_t fail_allocation_bytes = 0;
 static_assert(alignof(::buf::Buffer) <= alignof(std::max_align_t));
 }
 #if defined(__GNUC__) || defined(__clang__)
@@ -67,10 +65,8 @@ public:
 
 private:
     void* do_allocate(size_t size, size_t alignment) override {
-        if (fail_next_allocation || (fail_next_pmr_allocation && size == fail_allocation_bytes)) {
+        if (fail_next_allocation) {
             fail_next_allocation = false;
-            fail_next_pmr_allocation = false;
-            fail_allocation_bytes = 0;
             ++allocation_failures;
             failed_allocation_size = size;
             throw std::bad_alloc();
@@ -264,7 +260,7 @@ struct Wire {
                 payload_offset += bytes;
                 if (queue->mode >= 13 && payload_offset == 3 * 65535) Frame(anytls::kCmdHeartRequest, 0);
             }
-            if (queue->mode != 6 && queue->mode != 7 && queue->mode != 9) Frame(anytls::kCmdFIN, 1);
+            if (queue->mode != 6 && queue->mode != 9) Frame(anytls::kCmdFIN, 1);
             if (queue->mode == 12) Frame(anytls::kCmdAlert, 0);
         } else if (fail_settings) {
             Frame(anytls::kCmdServerSettings, 0, std::string(1024, 'x'));
@@ -335,10 +331,6 @@ public:
         }
         std::memcpy(output.data(), wire_->input.data() + wire_->offset, count);
         wire_->offset += count;
-        if (wire_->queue && wire_->queue->mode == 7 && count == 4096) {
-            fail_allocation_bytes = 128;
-            fail_next_pmr_allocation = true;
-        }
         if (wire_->fail_on_header && count == 7) {
             wire_->fail_on_header = false;
             // Fail the production codec's next coroutine/string allocation,
@@ -741,7 +733,7 @@ bool RunOpenOrder(int mode, bool before) {
     return passed;
 }
 
-bool RunQueue(int mode, unsigned seed = 1, bool baseline = false) {
+bool RunQueue(int mode, unsigned seed = 1) {
     net::io_context io;
     QueueScenario queue;
     queue.mode = mode;
@@ -752,7 +744,6 @@ bool RunQueue(int mode, unsigned seed = 1, bool baseline = false) {
     else if (mode == 11) queue.fragments.assign(29003, 1);
     else if (mode >= 13) queue.fragments.assign(4, 65535);
     else if (mode == 4) queue.fragments.assign(65535, 1);
-    else if (mode == 7) { queue.fragments.assign(7, 4097); queue.fragments.push_back(4096); }
     else {
         size_t remaining = 65535;
         unsigned random = seed;
@@ -800,8 +791,6 @@ bool RunQueue(int mode, unsigned seed = 1, bool baseline = false) {
     io_fault_mode = io_fault_kind = 0;
     memory::detail::test_buffers_peak = BufferCount();
     failed_allocation_size = 0;
-    fail_allocation_bytes = 0;
-    const auto failures_before = allocation_failures;
     Client client;
     auto control_wire = std::make_shared<Wire>(io);
     Stream control(control_wire);
@@ -852,22 +841,20 @@ bool RunQueue(int mode, unsigned seed = 1, bool baseline = false) {
     }
     io.restart();
     io.run_for(mode == 15 ? 1300ms : 80ms);
-    const ErrorCode expected = mode == 7 ? ErrorCode::RESOURCE_EXHAUSTED
-        : mode == 6 || mode == 14 ? ErrorCode::CANCELLED : mode == 15 ? ErrorCode::RELAY_TIMEOUT
+    const ErrorCode expected = mode == 6 || mode == 14 ? ErrorCode::CANCELLED : mode == 15 ? ErrorCode::RELAY_TIMEOUT
         : mode == 12 ? ErrorCode::PROTOCOL_DECODE_FAILED : ErrorCode::OK;
     passed &= done && !exception && observed == expected;
-    if (mode != 6 && mode != 7 && mode != 12 && mode != 14 && mode != 15) passed &= queue.received == queue.expected;
+    if (mode != 6 && mode != 12 && mode != 14 && mode != 15) passed &= queue.received == queue.expected;
     else passed &= queue.received.empty();
     if (mode == 1) passed &= queue.read_addresses.size() == 8 && queue.delivered_addresses == queue.read_addresses;
-    if (mode == 7) passed &= allocation_failures - failures_before == 1 && failed_allocation_size == 128;
     if (mode == 14 || mode == 15) passed &= queue.consumer_cleaned && queue.pending_consumer == 0;
     if (mode == 15) passed &= completed_ms >= 900 && completed_ms < 1500;
     if (mode == 13) passed &= dialed[0]->heart_responses == 1;
     if (mode == 10 || mode == 11) passed &= queue.datagram_sizes == std::vector<size_t>{9000, 19999};
     const bool bounded = queue.queued_blocks <= 16 && BufferPeak() <= 24;
-    if (mode != 7 && mode != 12) passed &= queue.snapshot;
-    if (mode == 0) passed &= baseline || queue.queued_blocks == 1;
-    if (!baseline) passed &= bounded;
+    if (mode != 12) passed &= queue.snapshot;
+    if (mode == 0) passed &= queue.queued_blocks == 1;
+    passed &= bounded;
     handler.reset();
     io.restart();
     io.run_for(100ms);
@@ -1570,14 +1557,13 @@ TEST(AnytlsOutboundLifecycle, Contract) {
         passed &= RunDomainPoolIsolation();
         for (int mode = 1; mode <= 5; ++mode)
             for (int kind = 1; kind <= 3; ++kind) passed &= RunIoFault(mode, kind);
-        for (int mode = 0; mode <= 7; ++mode) passed &= RunQueue(mode);
+        for (int mode = 0; mode <= 6; ++mode) passed &= RunQueue(mode);
         for (unsigned seed = 1; seed <= 16; ++seed) passed &= RunQueue(8, seed);
         for (int mode = 9; mode <= 12; ++mode) passed &= RunQueue(mode);
         for (int mode = 13; mode <= 15; ++mode) passed &= RunQueue(mode);
         { ASSERT_TRUE(passed); return; }
     } catch (const std::exception& error) {
         fail_next_allocation = false;
-        fail_next_pmr_allocation = false;
         std::fprintf(stderr, "fixture failure: %s\n", error.what());
         FAIL() << error.what();
     }

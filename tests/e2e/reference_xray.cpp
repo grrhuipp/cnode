@@ -261,10 +261,12 @@ TEST_P(EncryptionReference, CnodeOutboundResumesRealXrayTickets) {
     TempDir root;
     const auto [decryption, encryption] = EncryptionKeys(GetParam());
     std::atomic<size_t> requests{0};
-    TcpServer target([&](Socket socket, size_t) {
+    std::atomic<bool> release_first{false};
+    TcpServer target([&](Socket socket, size_t number) {
         EXPECT_EQ(socket.ReadExact(20), "vless-0rtt-real-xray");
         ++requests;
         socket.Write("accepted-once-per-nfs-key");
+        if (number == 0) Until([&] { return release_first.load(); }, 15s);
     });
     const auto server_port = TcpPort(), front_port = TcpPort();
     Bridge bridge(server_port);
@@ -277,12 +279,21 @@ TEST_P(EncryptionReference, CnodeOutboundResumesRealXrayTickets) {
     Child reference({CNODE_REFERENCE_XRAY, "run", "-config", (root.Path() / "xray.json").string()}, root.Path() / "xray.log");
     reference.WaitForLog("started");
     Child cnode({Binary().string(), "--config-dir", root.Path().string()}, root.Path() / "cnode.log");
+    Socket first;
     for (size_t number = 0; number != 17; ++number) {
         auto socket = Connect(front_port);
         socket.Write(VlessRequest(target.Port(), "vless-0rtt-real-xray"));
         EXPECT_EQ(socket.ReadExact(2), std::string("\0\0", 2));
         EXPECT_EQ(socket.ReadExact(25), "accepted-once-per-nfs-key");
-        EXPECT_EQ(socket.Read(), "");
+        if (number == 0) {
+            first = std::move(socket);
+        } else {
+            EXPECT_EQ(socket.Read(), "");
+            if (number == 1) {
+                release_first = true;
+                EXPECT_EQ(first.Read(), "");
+            }
+        }
         EXPECT_EQ(requests.load(), number + 1);
     }
     const auto flights = bridge.Flights();

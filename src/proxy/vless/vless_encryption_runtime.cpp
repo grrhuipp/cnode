@@ -188,7 +188,7 @@ net::awaitable<tl::expected<void, VlessEncryptionHandshakeFailure>> ReadAndOpenP
     const VlessEncryptionClientZeroRttRequest& request,
     std::span<const uint8_t, kVlessEncryptionIvSize> client_iv,
     VlessEncryptionAeadCipher cipher,
-    VlessEncryptionClientTicketCache* ticket_cache) noexcept {
+    VlessEncryptionTicketRejection& ticket_rejection) noexcept {
     auto write_aead = VlessEncryptionAead::Create(
         request.EncryptedTicket(),
         request.united_key.bytes,
@@ -202,7 +202,7 @@ net::awaitable<tl::expected<void, VlessEncryptionHandshakeFailure>> ReadAndOpenP
     runtime.read_keys = VlessEncryptionDeferredRead{
         .cipher = cipher,
         .header_xor = config.mode == VlessEncryptionMode::Random,
-        .ticket_cache = ticket_cache,
+        .ticket_rejection = &ticket_rejection,
     };
     runtime.write_aead = std::move(*write_aead);
     runtime.write_xor = MakeHeaderXor(config, runtime.united_key, client_iv);
@@ -409,7 +409,8 @@ RunVlessEncryptionClientHandshake(
     VlessBufferedReader& raw_reader,
     transport::MultiBufferWriter& raw_writer,
     const VlessEncryptionConfig& config,
-    VlessEncryptionClientTicketCache* ticket_cache) {
+    VlessEncryptionClientTicketCache* ticket_cache,
+    VlessEncryptionTicketRejection& ticket_rejection) {
     auto nfs = BuildVlessEncryptionClientNfsHello(config);
     if (!nfs) {
         co_return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
@@ -439,7 +440,7 @@ RunVlessEncryptionClientHandshake(
                 throw;
             }
             auto runtime = BuildClientZeroRttRuntime(
-                config, *zero, nfs->iv, cipher, ticket_cache);
+                config, *zero, nfs->iv, cipher, ticket_rejection);
             if (!runtime) {
                 ticket_cache->Clear();
             }

@@ -2,7 +2,10 @@
 
 #include "quic_stream.hpp"
 #include "common/memory_stats.hpp"
+#include "transport/link_error.hpp"
 
+#include <asio/bind_cancellation_slot.hpp>
+#include <asio/cancellation_signal.hpp>
 #include <asio/co_spawn.hpp>
 #include <asio/post.hpp>
 #include <algorithm>
@@ -16,6 +19,7 @@
 namespace {
 using namespace std::chrono_literals;
 using transport::internet::hysteria::UdpSessionStream;
+using transport::internet::hysteria::QuicStreamState;
 
 void Require(bool value, const char* reason) {
     if (!value) throw std::runtime_error(reason);
@@ -228,6 +232,324 @@ TEST(QuicUdpQueue, EmptyMessagesConsumeBufferAdmissionAndRemainReadable) {
         EXPECT_EQ(buf::InspectUdpDatagram(packet).status, buf::UdpDatagramStatus::Valid);
         packet.clear();
         EXPECT_EQ(memory::detail::test_buffers_live, baseline);
+    });
+}
+
+struct StreamCancellation final : transport::CancellationSubscription {
+    bool notified = false;
+    ErrorCode reason = ErrorCode::OK;
+    bool terminal = false;
+
+    void OnCancellation(transport::Cancellation cancellation) noexcept override {
+        notified = true;
+        reason = cancellation.reason;
+        terminal = cancellation.terminal;
+    }
+};
+
+TEST(QuicStreamClose, CompletedDuplexLeavesTransportAliveUntilNativeRetirement) {
+    RunInDomain([](net::io_context& io) -> net::awaitable<void> {
+        auto state = memory::AllocateShared<QuicStreamState>(
+            io, 4, std::weak_ptr<transport::internet::hysteria::Connection>{});
+        StreamCancellation cancellation;
+        cancellation.Resubscribe(state->Cancellation());
+        {
+            transport::internet::hysteria::QuicStream stream(state);
+            const std::array<uint8_t, 3> input{0x12, 0x34, 0x56};
+            Require(state->PushInput(input, true), "input FIN was not admitted");
+            std::array<uint8_t, 3> received{};
+            EXPECT_EQ(co_await stream.AsyncRead(net::buffer(received)), input.size());
+            EXPECT_EQ(received, input);
+            EXPECT_TRUE((co_await stream.ReadMultiBuffer()).empty());
+            stream.ShutdownWrite();
+            stream.Close();
+            stream.Close();
+            EXPECT_FALSE(stream.IsOpen());
+            EXPECT_TRUE(state->Open());
+            EXPECT_FALSE(cancellation.notified);
+            EXPECT_THROW(state->CheckWriteOpen(), transport::WriteClosed);
+        }
+        // The facade's destructor must not turn completed application I/O into
+        // RESET_STREAM while the connection still owns unacknowledged output.
+        EXPECT_TRUE(state->Open());
+        EXPECT_FALSE(cancellation.notified);
+        state->OnStreamClosed();
+        EXPECT_TRUE((co_await state->ReadMultiBuffer()).empty());
+        EXPECT_FALSE(cancellation.notified);
+    });
+}
+
+TEST(QuicStreamClose, UnreadFinTailIsDiscardedAndCancelled) {
+    RunInDomain([](net::io_context& io) -> net::awaitable<void> {
+        auto state = memory::AllocateShared<QuicStreamState>(
+            io, 8, std::weak_ptr<transport::internet::hysteria::Connection>{});
+        transport::internet::hysteria::QuicStream stream(state);
+        StreamCancellation cancellation;
+        cancellation.Resubscribe(stream.Cancellation());
+        const std::array<uint8_t, 3> input{0x21, 0x43, 0x65};
+        Require(state->PushInput(input, true), "input FIN was not admitted");
+        uint8_t first = 0;
+        EXPECT_EQ(co_await stream.AsyncRead(net::buffer(&first, 1)), 1);
+        EXPECT_EQ(first, input.front());
+        stream.ShutdownWrite();
+        stream.Close();
+        EXPECT_FALSE(stream.IsOpen());
+        EXPECT_FALSE(state->Open());
+        EXPECT_TRUE(state->PendingInput().empty());
+        EXPECT_TRUE(cancellation.notified);
+        EXPECT_TRUE(cancellation.terminal);
+        EXPECT_EQ(cancellation.reason, ErrorCode::CANCELLED);
+        try {
+            (void)co_await state->ReadMultiBuffer();
+            throw std::runtime_error("aborted input tail became graceful EOF");
+        } catch (const transport::LinkError& error) {
+            EXPECT_EQ(error.code(), ErrorCode::CANCELLED);
+        }
+    });
+}
+
+class QuicStreamHalfClose : public testing::TestWithParam<bool> {};
+
+TEST_P(QuicStreamHalfClose, CloseAbortsIncompleteDuplex) {
+    const bool remote_fin = GetParam();
+    RunInDomain([remote_fin](net::io_context& io) -> net::awaitable<void> {
+        auto state = memory::AllocateShared<QuicStreamState>(
+            io, 12, std::weak_ptr<transport::internet::hysteria::Connection>{});
+        transport::internet::hysteria::QuicStream stream(state);
+        StreamCancellation cancellation;
+        cancellation.Resubscribe(stream.Cancellation());
+        if (remote_fin) {
+            Require(state->PushInput({}, true), "input FIN was not admitted");
+            EXPECT_TRUE((co_await stream.ReadMultiBuffer()).empty());
+        } else {
+            stream.ShutdownWrite();
+        }
+        stream.Close();
+        EXPECT_FALSE(stream.IsOpen());
+        EXPECT_FALSE(state->Open());
+        EXPECT_TRUE(cancellation.notified);
+        EXPECT_TRUE(cancellation.terminal);
+        EXPECT_EQ(cancellation.reason, ErrorCode::CANCELLED);
+        EXPECT_THROW(state->CheckWriteOpen(), transport::LinkError);
+        co_return;
+    });
+}
+
+INSTANTIATE_TEST_SUITE_P(Directions, QuicStreamHalfClose, testing::Bool(),
+    [](const testing::TestParamInfo<bool>& info) {
+        return info.param ? "RemoteFin" : "LocalShutdown";
+    });
+
+class QuicStreamAbort : public testing::TestWithParam<bool> {};
+
+TEST_P(QuicStreamAbort, ExplicitAbortCancelsEvenCompletedDuplex) {
+    const bool abortive_close = GetParam();
+    RunInDomain([abortive_close](net::io_context& io) -> net::awaitable<void> {
+        auto state = memory::AllocateShared<QuicStreamState>(
+            io, 16, std::weak_ptr<transport::internet::hysteria::Connection>{});
+        transport::internet::hysteria::QuicStream stream(state);
+        StreamCancellation cancellation;
+        cancellation.Resubscribe(stream.Cancellation());
+        Require(state->PushInput({}, true), "input FIN was not admitted");
+        EXPECT_TRUE((co_await stream.ReadMultiBuffer()).empty());
+        stream.ShutdownWrite();
+        if (abortive_close) stream.CloseAbortive();
+        else stream.Cancel();
+        stream.Close();
+        EXPECT_FALSE(state->Open());
+        EXPECT_TRUE(cancellation.notified);
+        EXPECT_TRUE(cancellation.terminal);
+        EXPECT_EQ(cancellation.reason, ErrorCode::CANCELLED);
+        try {
+            (void)co_await state->ReadMultiBuffer();
+            throw std::runtime_error("explicit cancellation became graceful EOF");
+        } catch (const transport::LinkError& error) {
+            EXPECT_EQ(error.code(), ErrorCode::CANCELLED);
+        }
+    });
+}
+
+INSTANTIATE_TEST_SUITE_P(Operations, QuicStreamAbort, testing::Bool(),
+    [](const testing::TestParamInfo<bool>& info) {
+        return info.param ? "CloseAbortive" : "Cancel";
+    });
+
+TEST(QuicStreamWriteWait, BroadcastsWithoutLeavingStaleReadiness) {
+    RunInDomain([](net::io_context& io) -> net::awaitable<void> {
+        QuicStreamState state(io, 4, {});
+        const auto executor = co_await net::this_coro::executor;
+        SignalChannel joined(executor, 2);
+        std::exception_ptr failure;
+        size_t started = 0;
+        size_t completed = 0;
+        auto wait = [&]() -> net::awaitable<void> {
+            ++started;
+            co_await state.WaitWritable();
+            ++completed;
+        };
+        auto finish = [&](std::exception_ptr error) {
+            if (error) failure = error;
+            (void)joined.try_send(IoErrorCode{});
+        };
+        for (size_t round = 0; round < 2; ++round) {
+            // An ACK with no current waiter must not make a later full-queue
+            // wait complete immediately.
+            state.NotifyWritable();
+            net::co_spawn(executor, wait(), finish);
+            net::co_spawn(executor, wait(), finish);
+            co_await net::post(executor, net::use_awaitable);
+            Require(started == (round + 1) * 2, "output waiters did not start");
+            Require(completed == round * 2, "output wait retained stale readiness");
+            state.NotifyWritable();
+            co_await joined.async_receive(net::use_awaitable);
+            co_await joined.async_receive(net::use_awaitable);
+            if (failure) std::rethrow_exception(failure);
+            Require(completed == (round + 1) * 2, "output event did not broadcast");
+        }
+    });
+}
+
+enum class WriteWaitEnd { ShutdownWrite, Cancel, Reset, StreamClose, HostClose };
+class QuicStreamWriteWaitEnd : public testing::TestWithParam<WriteWaitEnd> {};
+
+TEST_P(QuicStreamWriteWaitEnd, SettlesPendingAndSubsequentWaits) {
+    const auto ending = GetParam();
+    RunInDomain([ending](net::io_context& io) -> net::awaitable<void> {
+        auto state = memory::AllocateShared<QuicStreamState>(
+            io, 8, std::weak_ptr<transport::internet::hysteria::Connection>{});
+        transport::internet::hysteria::QuicStream stream(state);
+        const std::array<uint8_t, 3> tail{0x21, 0x43, 0x65};
+        Require(state->PushInput(tail, false), "input tail was not admitted");
+        const auto executor = co_await net::this_coro::executor;
+        SignalChannel joined(executor, 1);
+        bool started = false;
+        bool completed = false;
+        std::exception_ptr failure;
+        const bool cancelled = ending == WriteWaitEnd::Cancel ||
+            ending == WriteWaitEnd::Reset || ending == WriteWaitEnd::HostClose;
+        auto expect_closed = [&]() -> net::awaitable<void> {
+            try {
+                co_await state->WaitWritable();
+                throw std::runtime_error("ended output wait succeeded");
+            } catch (const transport::WriteClosed&) {
+                Require(!cancelled, "cancelled stream reported graceful write closure");
+            } catch (const transport::LinkError& error) {
+                Require(cancelled && error.code() == ErrorCode::CANCELLED,
+                        "output wait lost its cancellation reason");
+            }
+        };
+        auto wait = [&]() -> net::awaitable<void> {
+            started = true;
+            co_await expect_closed();
+            completed = true;
+        };
+        net::co_spawn(executor, wait(), [&](std::exception_ptr error) {
+            failure = error;
+            (void)joined.try_send(IoErrorCode{});
+        });
+        co_await net::post(executor, net::use_awaitable);
+        Require(started && !completed, "write did not suspend before termination");
+        switch (ending) {
+        case WriteWaitEnd::ShutdownWrite: state->ShutdownWrite(); break;
+        case WriteWaitEnd::Cancel: state->Cancel(); break;
+        case WriteWaitEnd::Reset: state->RemoteReset(); break;
+        case WriteWaitEnd::StreamClose: state->OnStreamClosed(); break;
+        case WriteWaitEnd::HostClose: stream.Close(); break;
+        }
+        co_await joined.async_receive(net::use_awaitable);
+        if (failure) std::rethrow_exception(failure);
+        Require(completed, "ended stream left a writer suspended");
+        co_await expect_closed();
+        if (!cancelled) {
+            Require(state->Open(), "write closure cancelled the readable stream");
+            auto input = co_await state->ReadMultiBuffer();
+            Require(input.byte_size() == tail.size(), "write closure discarded unread input");
+            EXPECT_TRUE(std::equal(tail.begin(), tail.end(), (*input.begin())->Bytes().begin()));
+            if (ending == WriteWaitEnd::ShutdownWrite)
+                Require(state->PushInput({}, true), "write shutdown rejected remote FIN");
+            EXPECT_EQ((co_await state->ReadMultiBuffer()).byte_size(), 0);
+        } else {
+            EXPECT_FALSE(state->Open());
+            EXPECT_TRUE(state->PendingInput().empty());
+        }
+    });
+}
+
+INSTANTIATE_TEST_SUITE_P(Lifecycle, QuicStreamWriteWaitEnd,
+    testing::Values(WriteWaitEnd::ShutdownWrite, WriteWaitEnd::Cancel,
+                    WriteWaitEnd::Reset, WriteWaitEnd::StreamClose, WriteWaitEnd::HostClose),
+    [](const testing::TestParamInfo<WriteWaitEnd>& info) {
+        switch (info.param) {
+        case WriteWaitEnd::ShutdownWrite: return "ShutdownWrite";
+        case WriteWaitEnd::Cancel: return "Cancel";
+        case WriteWaitEnd::Reset: return "Reset";
+        case WriteWaitEnd::StreamClose: return "StreamClose";
+        case WriteWaitEnd::HostClose: return "HostClose";
+        }
+        return "Unknown";
+    });
+
+TEST(QuicStreamWriteWait, RemoteFinLeavesWriterWaitingForOutputCredit) {
+    RunInDomain([](net::io_context& io) -> net::awaitable<void> {
+        QuicStreamState state(io, 12, {});
+        const auto executor = co_await net::this_coro::executor;
+        SignalChannel joined(executor, 1);
+        std::exception_ptr failure;
+        bool started = false;
+        bool completed = false;
+        auto wait = [&]() -> net::awaitable<void> {
+            started = true;
+            co_await state.WaitWritable();
+            completed = true;
+        };
+        net::co_spawn(executor, wait(), [&](std::exception_ptr error) {
+            failure = error;
+            (void)joined.try_send(IoErrorCode{});
+        });
+        co_await net::post(executor, net::use_awaitable);
+        Require(started && !completed, "writer did not wait for credit");
+        Require(state.PushInput({}, true), "remote FIN was not admitted");
+        EXPECT_EQ((co_await state.ReadMultiBuffer()).byte_size(), 0);
+        co_await net::post(executor, net::use_awaitable);
+        Require(!completed, "remote FIN spuriously supplied output credit");
+        state.CheckWriteOpen();
+        state.NotifyWritable();
+        co_await joined.async_receive(net::use_awaitable);
+        if (failure) std::rethrow_exception(failure);
+        Require(completed, "remote FIN prevented ACK wakeup");
+    });
+}
+
+TEST(QuicStreamWriteWait, CoroutineCancellationDoesNotBecomeAnAck) {
+    RunInDomain([](net::io_context& io) -> net::awaitable<void> {
+        QuicStreamState state(io, 16, {});
+        const auto executor = co_await net::this_coro::executor;
+        SignalChannel joined(executor, 1);
+        net::cancellation_signal cancellation;
+        std::exception_ptr failure;
+        bool started = false;
+        auto wait = [&]() -> net::awaitable<void> {
+            started = true;
+            co_await state.WaitWritable();
+        };
+        net::co_spawn(executor, wait(), net::bind_cancellation_slot(
+            cancellation.slot(), [&](std::exception_ptr error) {
+                failure = error;
+                (void)joined.try_send(IoErrorCode{});
+            }));
+        co_await net::post(executor, net::use_awaitable);
+        Require(started, "writer did not begin its cancellation-aware wait");
+        cancellation.emit(net::cancellation_type::terminal);
+        co_await joined.async_receive(net::use_awaitable);
+        Require(failure != nullptr, "coroutine cancellation was mistaken for credit");
+        try {
+            std::rethrow_exception(failure);
+        } catch (const IoSystemError& error) {
+            EXPECT_EQ(error.code(), net::error::operation_aborted);
+        }
+        // Cancelling one operation must leave this stream usable.
+        state.CheckWriteOpen();
+        EXPECT_TRUE(state.Open());
     });
 }
 
