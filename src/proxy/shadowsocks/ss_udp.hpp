@@ -140,8 +140,10 @@ struct SsUdpDecodeResult {
 // ============================================================================
 // DecodeUdpPacket — 解码 SS AEAD UDP 数据报
 //
-// 遍历 users，用每个用户的 key 派生子密钥并尝试 AEAD 解密。
-// 第一个 AEAD Tag 验证通过的用户即为匹配用户。
+// users must be an immutable UserStore snapshot. SS2022 AES identity users
+// share header decoding per identity-key group, then binary-search PSK hashes;
+// every matching candidate still requires full AEAD authentication.
+// Nonidentity users retain linear authentication in snapshot order.
 //
 // 最小包长: salt_size + 1(ATYP) + 1(域名长度或4字节IP) + 2(port) + kTagSize
 // 返回 nullopt: 包过短 / 所有用户均不匹配

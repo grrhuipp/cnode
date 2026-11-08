@@ -179,9 +179,8 @@ void Check2022(const TargetAddress& target,
     Check(encoder.next_packet_id == 1,
           "Shadowsocks 2022 request did not advance packet state once");
 
-    auto user_list = std::make_shared<
-        proxyman::inbound::UserStore::ShadowsocksUserList>();
-    proxyman::inbound::UserStore::ShadowsocksCredential user;
+    proxyman::inbound::PreparedShadowsocksUsers prepared_users;
+    proxyman::inbound::PreparedShadowsocksUser user;
     Check(user.derived_key.assign(key.span()),
           "failed to initialize Shadowsocks 2022 decode user");
     if (identity) {
@@ -198,19 +197,32 @@ void Check2022(const TargetAddress& target,
               "failed to prepare decoy credential");
         auto other_identity = decoy;
         other_identity.identity_key.bytes[0] ^= 0x33;
-        user_list->push_back(std::move(other_identity));
-        user_list->push_back(std::move(decoy));
+        other_identity.derived_key.bytes[1] ^= 0x33;
+        Check(ss::Hash2022Psk(other_identity.derived_key.span(), other_identity.psk_hash),
+              "failed to prepare other identity credential");
+        prepared_users.push_back(std::move(other_identity));
+        prepared_users.push_back(std::move(decoy));
     }
-    user_list->push_back(std::move(user));
-    const proxyman::inbound::UserStore::ShadowsocksUsersView users{user_list};
+    prepared_users.push_back(std::move(user));
+    const auto prepare_view = [](const proxyman::inbound::PreparedShadowsocksUsers& prepared) {
+        using proxyman::inbound::UserStore;
+        constexpr std::string_view tag = "ss-udp-datagram-test";
+        auto previous = UserStore::ExchangeWorkerView(UserStore::PrepareWorkerView(
+            UserStore::PrepareUsers(tag, proxyman::inbound::UserSet{prepared})));
+        auto view = UserStore::ShadowsocksUsers(tag);
+        UserStore::InstallWorkerView(std::move(previous));
+        return view;
+    };
+    const auto users = prepare_view(prepared_users);
     if (identity) {
-        auto bad_users = std::make_shared<proxyman::inbound::UserStore::ShadowsocksUserList>(*user_list);
-        bad_users->back().psk_hash[0] ^= 1;
+        auto bad_prepared = prepared_users;
+        bad_prepared.back().psk_hash[0] ^= 1;
+        const auto bad_users = prepare_view(bad_prepared);
         ss::Ss2022UdpReplayCache bad_cache;
-        Check(!ss::DecodeUdpPacket(encoded.data(), encoded.size(), {bad_users},
+        Check(!ss::DecodeUdpPacket(encoded.data(), encoded.size(), bad_users,
                                   cipher.type, cipher.key_size, cipher.salt_size, bad_cache),
               "identity authentication ignored prepared PSK hash");
-        Check(!ss::DecodeUdpPacket(encoded.data(), encoded.size(), {bad_users},
+        Check(!ss::DecodeUdpPacket(encoded.data(), encoded.size(), bad_users,
                                   cipher.type, cipher.key_size, cipher.salt_size, bad_cache, true) &&
               bad_cache.Size() == 0,
               "deferred identity authentication accepted an invalid PSK hash or mutated replay");
@@ -331,12 +343,13 @@ void Check2022(const TargetAddress& target,
     // and packet IDs. Authentication must scope the replay window too.
     ss::KeyBytes second_key = key;
     second_key.bytes[second_key.size - 1] ^= 0x5a;
-    auto second_user = user_list->back();
+    auto second_user = prepared_users.back();
     Check(second_user.derived_key.assign(second_key.span()), "failed to prepare second user's key");
     if (identity)
         Check(ss::Hash2022Psk(second_key.span(), second_user.psk_hash),
               "failed to prepare second identity credential");
-    user_list->push_back(std::move(second_user));
+    prepared_users.push_back(std::move(second_user));
+    const auto second_users = prepare_view(prepared_users);
     ss::Ss2022UdpSessionState second_encoder;
     Check(ss::Init2022UdpSessionState(second_encoder, cipher, second_key),
           "failed to prepare second user's UDP session");
@@ -350,10 +363,11 @@ void Check2022(const TargetAddress& target,
               second_packet.data(), second_packet.size()) == second_size,
           "failed to encode second user's UDP packet");
     auto second_decoded = ss::DecodeUdpPacket(
-        second_packet.data(), second_packet.size(), users,
+        second_packet.data(), second_packet.size(), second_users,
         cipher.type, cipher.key_size, cipher.salt_size, replay_cache);
     Check(second_decoded && second_decoded->session_id == decoded->session_id &&
-          second_decoded->user_index != decoded->user_index &&
+          !std::equal(decoded->session_owner.span().begin(), decoded->session_owner.span().end(),
+                      second_decoded->session_owner.span().begin()) &&
           Flatten(second_decoded->payload) == source,
           "SS2022 replay state crossed authenticated users with identical session and packet IDs");
     Check(second_decoded->packet_id == decoded->packet_id &&
@@ -364,7 +378,7 @@ void Check2022(const TargetAddress& target,
                                 authenticated_session, *second_decoded->packet_id),
           "SS2022 external replay namespace truncated the authenticated credential");
     Check(!ss::DecodeUdpPacket(
-              second_packet.data(), second_packet.size(), users,
+              second_packet.data(), second_packet.size(), second_users,
               cipher.type, cipher.key_size, cipher.salt_size, replay_cache),
           "SS2022 second user accepted its own repeated packet");
 

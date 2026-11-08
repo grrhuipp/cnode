@@ -72,13 +72,15 @@ TCP 发送基准通过真实回环连接测量 1 B / 8 KiB / 64 KiB 突发，分
 
 执行器微基准与守护进程使用相同的全局 mimalloc 分配器，覆盖属性适配、work tracking 的复制与释放，以及每批 1/8/64 个任务的真实投递执行。生命周期阶段预热 4096 轮、测量 262144 轮；投递阶段预热 128 批、测量 4096 批，逐批排空并校验执行顺序、执行域与 checksum。输出每操作 CPU/墙钟耗时及 tracked/untracked 执行器尺寸；CPU 包含对应阶段的构造、释放、队列调度与校验开销，不包含夹具初始化。
 
-SS2022 身份匹配微基准覆盖 1/16/256/4096 个用户、无 identity key 或 1/4 个 key 组、输入首/中/末用户及 hint 命中/失效/缺失；失效 hint 在新旧实现中指向同一名其他用户。每格预热 32 次、默认测量 512 次，可用 `CNODE_BENCH_ITERATIONS` 调整。计时包含生产认证函数、协程驱动、结果校验与释放，不含客户端握手报文准备；这是认证微基准，不覆盖 TCP 传输或完整入站的重放检查。
+SS2022 TCP 身份匹配微基准覆盖 1/16/256/4096 个用户、无 identity key 或 1/4 个 key 组、输入首/中/末用户及 hint 命中/失效/缺失；失效 hint 在新旧实现中指向同一名其他用户。每格预热 32 次、默认测量 512 次，可用 `CNODE_BENCH_ITERATIONS` 调整。计时包含生产认证函数、协程驱动、结果校验与释放，不含客户端握手报文准备；这是认证微基准，不覆盖 TCP 传输或完整入站的重放检查。
 
-运行时统计基准先建立真实 VLESS → Freedom 回环链路，覆盖 0/1/64/512 条物理连接、有/无资源统计，预热 16 轮后采集 64/256 轮。计时只包含 `Worker::CollectRuntimeStats` 与结果校验，不包含建连、载荷转发和停机；计时外等待既有空闲池回收截止期，再报告回收后的占用，不强制清池。两项基准输出 CPU、延迟分位数、内存池映射和进程 RSS/峰值，并区分匿名页与文件页；峰值读取 Linux `/proc/self/status` 的 `VmHWM`，包含准备阶段。分配计数仅统计拦截到的 throwing C++ `new` 和 `mi_malloc_aligned` 入口，不等于全部 PMR 分配，两类不能相加。使用 CTest 使每个参数在独立进程运行：
+SS2022 UDP 身份匹配基准包含 94 格：AES-128/256、1/16/256/4096 个用户、1/4 个 identity key 组、已发布快照的首/中/末用户、0/1200 B 载荷，并保留无 identity 与普通重放接收对照。预热和测量次数与 TCP 身份基准相同；每批最多预编码 32 个唯一包，编码在计时外，计时包含解码认证、目标/载荷/归属校验及结果释放。主矩阵只测延迟提交重放的认证阶段，不含入站目录的重放提交、路由或网络 I/O，不代表 UDP 转发吞吐。
+
+运行时统计基准先建立真实 VLESS → Freedom 回环链路，覆盖 0/1/64/512 条物理连接、有/无资源统计，预热 16 轮后采集 64/256 轮。计时只包含 `Worker::CollectRuntimeStats` 与结果校验，不包含建连、载荷转发和停机；计时外等待既有空闲池回收截止期，再报告回收后的占用，不强制清池。这三项基准输出 CPU、延迟分位数、内存池映射和进程 RSS/峰值，并区分匿名页与文件页；峰值读取 Linux `/proc/self/status` 的 `VmHWM`，包含准备阶段。分配计数仅统计拦截到的 throwing C++ `new` 和 `mi_malloc_aligned` 入口，不等于全部 PMR 分配，两类不能相加。使用 CTest 使每个参数在独立进程运行：
 
 ```sh
 mise exec -- ctest --test-dir build/musl --no-tests=error \
-  -R '^benchmark\.(ShadowsocksIdentityBenchmark|SessionCountsAndRounds/RuntimeSamplingBenchmark)\.' -V
+  -R '^benchmark\.(Shadowsocks(Udp)?IdentityBenchmark|SessionCountsAndRounds/RuntimeSamplingBenchmark)\.' -V
 ```
 
 真实 cnode 进程基准覆盖 VLESS/TLS 上传、下载：固定 1 个 Worker、1/8 条并发流，每流预热 1 MiB、测量 16 MiB；对端按完整 64 KiB 块接收并校验载荷，避免每次短读重新分配大缓冲。

@@ -643,27 +643,18 @@ net::awaitable<tl::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession2022
             ~CleanseIdentityHash() noexcept { OPENSSL_cleanse(hash.data(), hash.size()); }
         } cleanse_identity{identity_hash};
         const auto& list = *users.users;
-        const auto group_end = [&](auto begin) {
-            const auto& key = begin->identity_key;
-            return std::partition_point(begin, list.end(), [&](const auto& user) {
-                return user.identity_key.size == key.size &&
-                    CRYPTO_memcmp(user.identity_key.data(), key.data(), key.size) == 0;
-            });
-        };
-        const auto try_candidates = [&](auto begin, auto end) {
+        const auto try_candidates = [&](size_t begin, size_t end) {
             // The hash selects candidates, never authenticates a user:
             // collisions still require the fixed header's AEAD tag.
-            auto candidate = std::lower_bound(begin, end, identity_hash,
-                [](const auto& user, const auto& hash) { return user.psk_hash < hash; });
-            for (; candidate != end &&
-                   CRYPTO_memcmp(candidate->psk_hash.data(), identity_hash.data(),
-                                 identity_hash.size()) == 0; ++candidate) {
-                const size_t index = static_cast<size_t>(candidate - list.begin());
+            for (size_t index = users.IdentityHashLowerBound(begin, end, identity_hash);
+                 index != end &&
+                 CRYPTO_memcmp(users[index].psk_hash.data(), identity_hash.data(),
+                               identity_hash.size()) == 0; ++index) {
                 if (index != hint && try_user(index)) break;
             }
         };
-        auto hinted_begin = list.end();
-        auto hinted_end = list.end();
+        size_t hinted_begin = users.size();
+        size_t hinted_end = users.size();
         if (hint < list.size()) {
             const auto& key = list[hint].identity_key;
             const bool decoded = DecryptIdentityHeader(
@@ -676,22 +667,22 @@ net::awaitable<tl::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession2022
             if (!result.user) {
                 // A hit remains O(1). Only a miss needs to locate the hinted
                 // group, whose identity work must not be repeated below.
-                hinted_begin = std::partition_point(list.begin(), list.begin() + hint,
-                    [&](const auto& user) {
+                hinted_begin = static_cast<size_t>(std::partition_point(
+                    list.begin(), list.begin() + hint, [&](const auto& user) {
                         return user.identity_key.size != key.size ||
                             CRYPTO_memcmp(user.identity_key.data(), key.data(), key.size) != 0;
-                    });
-                hinted_end = group_end(list.begin() + hint);
+                    }) - list.begin());
+                hinted_end = users.IdentityGroupEnd(hint);
                 if (decoded) try_candidates(hinted_begin, hinted_end);
             }
         }
-        for (auto group = list.begin(); group != list.end() && !result.user;) {
+        for (size_t group = 0; group != users.size() && !result.user;) {
             if (group == hinted_begin) {
                 group = hinted_end;
                 continue;
             }
-            const auto end = group_end(group);
-            if (DecryptIdentityHeader(group->identity_key, cipher_info,
+            const size_t end = users.IdentityGroupEnd(group);
+            if (DecryptIdentityHeader(users[group].identity_key, cipher_info,
                                       result.request_salt.span(), identity_header, identity_hash)) {
                 try_candidates(group, end);
             }

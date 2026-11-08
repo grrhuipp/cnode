@@ -1,6 +1,7 @@
 #include "app/proxyman/inbound/user_store.hpp"
 
 #include "app/proxyman/inbound/prepared_config.hpp"
+#include <openssl/crypto.h>
 #include <algorithm>
 #include <atomic>
 #include <cstring>
@@ -434,6 +435,25 @@ UserStore::ShadowsocksUsersView UserStore::ShadowsocksUsers(std::string_view tag
     auto it = view->snapshot->shadowsocks.find(tag);
     return {it == view->snapshot->shadowsocks.end()
         ? nullptr : std::shared_ptr<const ShadowsocksUserList>(view, it->second.get())};
+}
+
+size_t UserStore::ShadowsocksUsersView::IdentityGroupEnd(size_t begin) const noexcept {
+    const auto& list = *users;
+    const auto& key = list[begin].identity_key;
+    const auto end = std::partition_point(list.begin() + begin, list.end(),
+        [&](const auto& user) {
+            return user.identity_key.size == key.size &&
+                CRYPTO_memcmp(user.identity_key.data(), key.data(), key.size) == 0;
+        });
+    return static_cast<size_t>(end - list.begin());
+}
+
+size_t UserStore::ShadowsocksUsersView::IdentityHashLowerBound(
+    size_t begin, size_t end, const std::array<uint8_t, 16>& hash) const noexcept {
+    const auto& list = *users;
+    const auto candidate = std::lower_bound(list.begin() + begin, list.begin() + end, hash,
+        [](const auto& user, const auto& value) { return user.psk_hash < value; });
+    return static_cast<size_t>(candidate - list.begin());
 }
 
 std::shared_ptr<const UserStore::AnyTlsCredential>

@@ -56,10 +56,11 @@ inline std::string Base64(std::string_view input) {
     return output;
 }
 inline std::string AesBlock(std::string_view key, std::string_view input, bool encrypt) {
-    Require(input.size() == 16, "AES header length");
+    Require((key.size() == 16 || key.size() == 32) && input.size() == 16, "AES header lengths");
     std::unique_ptr<EVP_CIPHER_CTX, decltype(&EVP_CIPHER_CTX_free)> ctx(EVP_CIPHER_CTX_new(), EVP_CIPHER_CTX_free);
     Require(ctx != nullptr, "AES context allocation");
-    Require(EVP_CipherInit_ex(ctx.get(), EVP_aes_128_ecb(), nullptr, Bytes(key), nullptr, encrypt) == 1,
+    Require(EVP_CipherInit_ex(ctx.get(), key.size() == 16 ? EVP_aes_128_ecb() : EVP_aes_256_ecb(),
+                             nullptr, Bytes(key), nullptr, encrypt) == 1,
             "AES init");
     Require(EVP_CIPHER_CTX_set_padding(ctx.get(), 0) == 1, "AES padding");
     std::string out(32, '\0');
@@ -71,10 +72,12 @@ inline std::string AesBlock(std::string_view key, std::string_view input, bool e
 }
 inline std::string Gcm(std::string_view key, std::string_view nonce, std::string_view input,
                        bool encrypt, std::string_view aad = {}) {
-    Require(key.size() == 16 && nonce.size() == 12 && (encrypt || input.size() >= 16), "GCM lengths");
+    Require((key.size() == 16 || key.size() == 32) && nonce.size() == 12 &&
+            (encrypt || input.size() >= 16), "GCM lengths");
     std::unique_ptr<EVP_CIPHER_CTX, decltype(&EVP_CIPHER_CTX_free)> ctx(EVP_CIPHER_CTX_new(), EVP_CIPHER_CTX_free);
     Require(ctx != nullptr, "GCM context allocation");
-    Require(EVP_CipherInit_ex(ctx.get(), EVP_aes_128_gcm(), nullptr, Bytes(key), Bytes(nonce), encrypt) == 1,
+    Require(EVP_CipherInit_ex(ctx.get(), key.size() == 16 ? EVP_aes_128_gcm() : EVP_aes_256_gcm(),
+                             nullptr, Bytes(key), Bytes(nonce), encrypt) == 1,
             "GCM init");
     int size = 0, final = 0;
     if (!aad.empty()) Require(EVP_CipherUpdate(ctx.get(), nullptr, &size, Bytes(aad), static_cast<int>(aad.size())) == 1, "GCM AAD");
@@ -184,7 +187,8 @@ public:
         const auto header = session + BigEndian(packet_id_++, 8);
         const auto body = std::string(1, '\0') + BigEndian(static_cast<uint64_t>(std::time(nullptr)), 8) +
                           std::string(2, '\0') + target_ + std::string(payload);
-        if (cipher_ == "aes") return AesBlock(key_, header, true) + Gcm(Subkey(session), header.substr(4), body, true);
+        if (cipher_ == "aes" || cipher_ == "aes256")
+            return AesBlock(key_, header, true) + Gcm(Subkey(session), header.substr(4), body, true);
         auto nonce = Random(24);
         return nonce + XChaCha(nonce, header + body, true);
     }
@@ -205,7 +209,7 @@ public:
         auto packet = Receive(*socket, timeout).payload;
         if (cipher_.empty()) { Require(LegacyDecrypt(packet, password_) == target_ + std::string(expected), "native SS response changed"); return; }
         std::string header, plain;
-        if (cipher_ == "aes") {
+        if (cipher_ == "aes" || cipher_ == "aes256") {
             Require(packet.size() >= 32, "short SS2022 response");
             header = AesBlock(key_, std::string_view(packet).substr(0, 16), false);
             plain = Gcm(Subkey(header.substr(0, 8)), header.substr(4), std::string_view(packet).substr(16), false);
@@ -238,7 +242,7 @@ private:
         blake3_hasher_init_derive_key(&hasher, "shadowsocks 2022 session subkey");
         blake3_hasher_update(&hasher, key_.data(), key_.size());
         blake3_hasher_update(&hasher, session_id.data(), session_id.size());
-        std::string result(16, '\0');
+        std::string result(key_.size(), '\0');
         blake3_hasher_finalize(&hasher, Bytes(result), result.size());
         return result;
     }

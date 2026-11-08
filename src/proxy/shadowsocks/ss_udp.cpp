@@ -446,37 +446,28 @@ struct PlaintextScratch {
     std::array<uint8_t, 16> encrypted_separate{};
     std::memcpy(encrypted_separate.data(), datagram, encrypted_separate.size());
 
-    // Reuse the identity header only within this packet and snapshot view.
-    // Users sharing a server key do not need identical AES work repeated.
-    std::span<const uint8_t> previous_identity_key;
-    std::array<uint8_t, 16> previous_separate{};
-    std::array<uint8_t, 16> previous_identity{};
-    struct CleansePreviousIdentity {
+    std::array<uint8_t, 16> separate{};
+    std::array<uint8_t, 16> identity_hash{};
+    struct CleanseIdentityHeaders {
         std::array<uint8_t, 16>& sep;
         std::array<uint8_t, 16>& id;
-        ~CleansePreviousIdentity() noexcept {
+        ~CleanseIdentityHeaders() noexcept {
             OPENSSL_cleanse(sep.data(), sep.size());
             OPENSSL_cleanse(id.data(), id.size());
         }
-    } cleanse_prev{previous_separate, previous_identity};
+    } cleanse_headers{separate, identity_hash};
     PlaintextScratch scratch;
-    for (size_t i = 0; i < users.size(); ++i) {
-        const auto& user = users[i];
-        const bool has_identity = !user.identity_key.empty();
-        const auto header_key = has_identity ? user.identity_key.span()
-                                             : user.derived_key.span();
-        if (header_key.empty()) {
-            continue;
-        }
-
-        const bool reuse_identity = has_identity &&
-            header_key.size() == previous_identity_key.size() &&
-            CRYPTO_memcmp(header_key.data(), previous_identity_key.data(),
-                          header_key.size()) == 0;
-        std::array<uint8_t, 16> separate = reuse_identity
-            ? previous_separate : std::array<uint8_t, 16>{};
-        if (!reuse_identity &&
-            !AesBlockCrypt(header_key, encrypted_separate, separate, false)) {
+    for (size_t group = 0; group < users.size();) {
+        const auto& first = users[group];
+        const bool has_identity = !first.identity_key.empty();
+        // Pure/nonidentity credentials are not hash-indexed: authenticate each
+        // in snapshot order. Identity groups share both AES header operations.
+        const size_t end = has_identity ? users.IdentityGroupEnd(group) : group + 1;
+        size_t candidate = group;
+        group = end;
+        const auto& header_key = has_identity ? first.identity_key : first.derived_key;
+        if (header_key.empty() ||
+            !AesBlockCrypt(header_key.span(), encrypted_separate, separate, false)) {
             continue;
         }
 
@@ -486,28 +477,17 @@ struct PlaintextScratch {
                     kMinBodyPlain + SsAeadCipher::kTagSize) {
                 continue;
             }
-            if (!reuse_identity) {
-                std::array<uint8_t, 16> identity_cipher{};
-                std::memcpy(identity_cipher.data(),
-                            datagram + kSs2022UdpSeparateHeaderSize,
-                            identity_cipher.size());
-                std::array<uint8_t, 16> identity_plain{};
-                if (!AesBlockCrypt(header_key, identity_cipher, identity_plain, false)) {
-                    continue;
-                }
-                for (size_t j = 0; j < identity_plain.size(); ++j) {
-                    identity_plain[j] ^= separate[j];
-                }
-                previous_identity_key = header_key;
-                previous_separate = separate;
-                previous_identity = identity_plain;
-                OPENSSL_cleanse(identity_plain.data(), identity_plain.size());
-            }
-
-            if (CRYPTO_memcmp(previous_identity.data(), user.psk_hash.data(),
-                              previous_identity.size()) != 0) {
+            std::array<uint8_t, 16> identity_cipher{};
+            std::memcpy(identity_cipher.data(),
+                        datagram + kSs2022UdpSeparateHeaderSize,
+                        identity_cipher.size());
+            if (!AesBlockCrypt(header_key.span(), identity_cipher, identity_hash, false)) {
                 continue;
             }
+            for (size_t j = 0; j < identity_hash.size(); ++j) {
+                identity_hash[j] ^= separate[j];
+            }
+            candidate = users.IdentityHashLowerBound(candidate, end, identity_hash);
             body_offset += kSs2022UdpSeparateHeaderSize;
         }
 
@@ -515,43 +495,53 @@ struct PlaintextScratch {
         if (ciphertext_len < SsAeadCipher::kTagSize) {
             continue;
         }
-        uint8_t* plain_dst = scratch.Prepare(ciphertext_len - SsAeadCipher::kTagSize);
-        if (!plain_dst) {
-            return std::nullopt;
-        }
-        std::array<uint8_t, 32> subkey{};
-        if (!Derive2022Subkey(user.derived_key.data(), user.derived_key.size,
-                              separate.data(), kSs2022UdpSessionIdSize,
-                              subkey.data())) {
+        for (; candidate < end; ++candidate) {
+            const auto& user = users[candidate];
+            if (has_identity &&
+                CRYPTO_memcmp(identity_hash.data(), user.psk_hash.data(),
+                              identity_hash.size()) != 0) {
+                break;
+            }
+            // The hash only narrows candidates; every collision must pass AEAD.
+            uint8_t* plain_dst = scratch.Prepare(ciphertext_len - SsAeadCipher::kTagSize);
+            if (!plain_dst) {
+                return std::nullopt;
+            }
+            std::array<uint8_t, 32> subkey{};
+            if (!Derive2022Subkey(user.derived_key.data(), user.derived_key.size,
+                                  separate.data(), kSs2022UdpSessionIdSize,
+                                  subkey.data())) {
+                OPENSSL_cleanse(subkey.data(), subkey.size());
+                continue;
+            }
+            std::array<uint8_t, 12> nonce{};
+            std::memcpy(nonce.data(), separate.data() + 4, nonce.size());
+            const bool decrypted = AeadDecrypt(
+                cipher_info.type,
+                std::span<const uint8_t>(subkey.data(), cipher_info.key_size),
+                nonce,
+                std::span<const uint8_t>(datagram + body_offset, ciphertext_len),
+                plain_dst);
             OPENSSL_cleanse(subkey.data(), subkey.size());
-            continue;
+            if (!decrypted) {
+                continue;
+            }
+            std::array<uint8_t, 8> client_session_id{};
+            std::memcpy(client_session_id.data(), separate.data(), client_session_id.size());
+            auto parsed = Parse2022ClientBodyPlaintext(scratch.Span(), client_session_id);
+            if (!parsed) {
+                return std::nullopt;
+            }
+            const uint64_t packet_id = LoadU64BE(
+                separate.data() + kSs2022UdpSessionIdSize);
+            if (!deferred_replay &&
+                !replay_cache.Accept(user.derived_key.span(), client_session_id, packet_id)) {
+                return std::nullopt;
+            }
+            return Make2022DecodeResult(
+                candidate, client_session_id, user.derived_key.span(), packet_id,
+                std::move(*parsed), scratch);
         }
-        std::array<uint8_t, 12> nonce{};
-        std::memcpy(nonce.data(), separate.data() + 4, nonce.size());
-        const bool decrypted = AeadDecrypt(
-            cipher_info.type,
-            std::span<const uint8_t>(subkey.data(), cipher_info.key_size),
-            nonce,
-            std::span<const uint8_t>(datagram + body_offset, ciphertext_len),
-            plain_dst);
-        OPENSSL_cleanse(subkey.data(), subkey.size());
-        if (!decrypted) {
-            continue;
-        }
-        std::array<uint8_t, 8> client_session_id{};
-        std::memcpy(client_session_id.data(), separate.data(), client_session_id.size());
-        auto parsed = Parse2022ClientBodyPlaintext(scratch.Span(), client_session_id);
-        if (!parsed) {
-            return std::nullopt;
-        }
-        const uint64_t packet_id = LoadU64BE(
-            separate.data() + kSs2022UdpSessionIdSize);
-        if (!deferred_replay &&
-            !replay_cache.Accept(user.derived_key.span(), client_session_id, packet_id)) {
-            return std::nullopt;
-        }
-        return Make2022DecodeResult(
-            i, client_session_id, user.derived_key.span(), packet_id, std::move(*parsed), scratch);
     }
 
     return std::nullopt;
