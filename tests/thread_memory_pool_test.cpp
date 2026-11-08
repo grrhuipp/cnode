@@ -1018,3 +1018,50 @@ TEST(ThreadMemoryPool, DrainedBorrowedQueueReleasesRetiredDomainAndRebinds) {
     EXPECT_TRUE(lifetime.expired());
     memory::ThreadMemoryPool().PurgeIdle();
 }
+
+TEST(ThreadMemoryPool, BorrowedQueueConstructsNestedPayloadsAfterHostRetirement) {
+    auto retired = std::make_unique<memory::AllocationDomain>();
+    memory::AllocationDomain current;
+    auto group = std::make_shared<int>(0);
+    auto shares = +[](const void* left, const void* right) noexcept { return left == right; };
+    retired->SetLeaseGroup(group, shares);
+    current.SetLeaseGroup(group, shares);
+    auto* original = retired->resource();
+    std::weak_ptr<void> lifetime = retired->memory().Lifetime();
+    memory::RingDeque<memory::ThreadLocalString> queue(original);
+    {
+        memory::ScopedAllocationDomain lease(*retired);
+        queue.emplace_back(80, 'a');
+    }
+    retired.reset();
+    ASSERT_FALSE(lifetime.expired());
+    bool intact = false;
+    std::thread migrated([&] {
+        memory::ScopedAllocationDomain lease(current);
+        queue.emplace_back(96, 'b');
+        queue.emplace_front(112, 'c');
+        queue.emplace_back(128, 'd');
+        queue.emplace_front(144, 'e');
+        constexpr std::array sizes{144u, 112u, 80u, 96u, 128u};
+        constexpr std::array values{'e', 'c', 'a', 'b', 'd'};
+        intact = queue.size() == sizes.size();
+        for (std::size_t index = 0; index < queue.size(); ++index) {
+            const auto& value = queue[index];
+            intact = intact && value.size() == sizes[index] &&
+                value.find_first_not_of(values[index]) == memory::ThreadLocalString::npos &&
+                value.get_allocator().resource() == original;
+        }
+        queue.clear();
+        intact = intact && lifetime.expired();
+        queue.emplace_back(80, 'f');
+        intact = intact && queue.front().get_allocator().resource() == current.resource() &&
+            queue.front().size() == 80 &&
+            queue.front().find_first_not_of('f') == memory::ThreadLocalString::npos;
+        queue.clear();
+        intact = intact && current.OutstandingAllocations() == 0;
+    });
+    migrated.join();
+    EXPECT_TRUE(intact);
+    EXPECT_TRUE(lifetime.expired());
+    memory::ThreadMemoryPool().PurgeIdle();
+}

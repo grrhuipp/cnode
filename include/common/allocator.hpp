@@ -1393,7 +1393,7 @@ public:
 private:
     template <class... Args>
     void ConstructAt(T* ptr, Args&&... args) {
-        auto lifetime = PinResource();
+        // The live backing allocation already retains its domain resource.
         std::pmr::polymorphic_allocator<T>(resource_).construct(
             ptr, std::forward<Args>(args)...);
     }
@@ -1458,8 +1458,9 @@ private:
         capacity_ = next_cap;
     }
 
+    // Keep allocation and relocation out of the common insertion path.
     template <typename... Args>
-    T& GrowEmplace(bool at_back, Args&&... args) {
+    [[gnu::noinline]] T& GrowEmplace(bool at_back, Args&&... args) {
         if (capacity_ > (std::numeric_limits<std::size_t>::max() / sizeof(T)) / 2) {
             throw std::bad_alloc();
         }
