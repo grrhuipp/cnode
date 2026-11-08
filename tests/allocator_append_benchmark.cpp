@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "common/allocator.hpp"
+#include "common/buf/multi_buffer.hpp"
 
 #include <algorithm>
 #include <array>
@@ -119,6 +120,72 @@ TEST(AllocatorAppendBenchmark, TrackedResource) {
         }
     }
     EXPECT_EQ(domain.OutstandingAllocations(), 0u);
+    memory::ThreadMemoryPool().PurgeIdle();
+}
+
+buf::MultiBuffer TransferBuffers(std::size_t count) {
+    buf::MultiBuffer source;
+    for (std::size_t index = 0; index < count; ++index) {
+        buf::BufferGuard buffer{buf::Buffer::New()};
+        if (!buffer) throw std::bad_alloc();
+        buffer->Tail()[0] = static_cast<uint8_t>(index);
+        buffer->Produce(1);
+        source.push_back(std::move(buffer));
+    }
+    // Model ownership handoffs, not payload copies. Escaping each container's
+    // address prevents ThinLTO from eliding the intermediate moved-from states.
+    buf::MultiBuffer first(std::move(source));
+    asm volatile("" : : "g"(&source), "g"(&first) : "memory");
+    buf::MultiBuffer second;
+    second = std::move(first);
+    asm volatile("" : : "g"(&first), "g"(&second) : "memory");
+    buf::MultiBuffer third(std::move(second));
+    asm volatile("" : : "g"(&second), "g"(&third) : "memory");
+    return third;
+}
+
+TEST(MultiBufferBenchmark, TrackedTransfers) {
+    memory::AllocationDomain domain;
+    memory::ScopedAllocationDomain lease(domain);
+    for (const std::size_t blocks : {1u, 8u, 9u, 16u}) {
+        SCOPED_TRACE(blocks);
+        memory::ThreadMemoryPool().PurgeIdle();
+        {
+            auto probe = TransferBuffers(blocks);
+            ASSERT_EQ(probe.size(), blocks);
+            ASSERT_EQ(probe.byte_size(), blocks);
+            for (std::size_t index = 0; index < blocks; ++index) {
+                auto buffer = probe.pop_front();
+                ASSERT_TRUE(buffer);
+                ASSERT_EQ(buffer->Len(), 1u);
+                ASSERT_EQ(buffer->Bytes()[0], index);
+            }
+            ASSERT_TRUE(probe.empty());
+        }
+        ASSERT_EQ(domain.OutstandingAllocations(), 0u);
+        const std::size_t iterations = 262144 / blocks;
+        const auto before = memory::ThreadMemoryPool().GetFootprint();
+        timespec cpu_start{}, cpu_end{};
+        ASSERT_EQ(::clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu_start), 0);
+        const auto start = std::chrono::steady_clock::now();
+        for (std::size_t iteration = 0; iteration < iterations; ++iteration) {
+            auto payload = TransferBuffers(blocks);
+            payload.drop_front(blocks - 1);
+            asm volatile("" : : "g"(&payload) : "memory");
+        }
+        const auto finish = std::chrono::steady_clock::now();
+        ASSERT_EQ(::clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu_end), 0);
+        const auto after = memory::ThreadMemoryPool().GetFootprint();
+        EXPECT_EQ(domain.OutstandingAllocations(), 0u);
+        const double wall_ns = std::chrono::duration<double, std::nano>(finish - start).count();
+        const double cpu_ns = static_cast<double>(CpuNanoseconds(cpu_end) - CpuNanoseconds(cpu_start));
+        std::printf("multibuffer-transfer blocks=%zu operations=%zu "
+                    "wall_ns_per_operation=%.3f cpu_ns_per_operation=%.3f "
+                    "live_after=%zu mapped_before=%zu mapped_after=%zu idle_after=%zu\n",
+            blocks, iterations, wall_ns / iterations, cpu_ns / iterations,
+            domain.OutstandingAllocations(), before.mapped_bytes, after.mapped_bytes,
+            after.idle_bytes);
+    }
     memory::ThreadMemoryPool().PurgeIdle();
 }
 } // namespace

@@ -459,6 +459,69 @@ TEST(BufferOwnership, PartialConsumptionReturnsSpillStorageWithoutCopyingPayload
     EXPECT_EQ(domain.OutstandingAllocations(), 0);
 }
 
+TEST(BufferOwnership, MovedInlineAndSpilledContainersRemainReusable) {
+    memory::AllocationDomain domain;
+    memory::ScopedAllocationDomain lease(domain);
+    for (const size_t source_count : {0u, 1u, 8u, 9u, 16u}) {
+        for (const size_t destination_count : {0u, 1u, 9u}) {
+            SCOPED_TRACE(source_count);
+            SCOPED_TRACE(destination_count);
+            auto expected = Pattern(source_count);
+            buf::MultiBuffer source;
+            for (const auto byte : expected) source.push_back(Buffer(1, byte));
+            if (source_count > 1) {
+                source.drop_front(1);
+                expected.erase(expected.begin());
+            }
+            buf::MultiBuffer transferred(std::move(source));
+            EXPECT_TRUE(source.empty());
+            EXPECT_EQ(source.byte_size(), 0u);
+            for (size_t i = 0; i < 9; ++i) source.push_back(Buffer(1, 0xa5));
+
+            buf::MultiBuffer destination;
+            for (size_t i = 0; i < destination_count; ++i)
+                destination.push_back(Buffer(1, 0xff));
+            destination = std::move(transferred);
+            EXPECT_TRUE(transferred.empty());
+            EXPECT_EQ(transferred.byte_size(), 0u);
+            EXPECT_EQ(Flatten(destination), expected);
+            EXPECT_TRUE(Consistent(destination));
+            EXPECT_EQ(Flatten(source), std::vector<uint8_t>(9, 0xa5));
+
+            transferred.push_back(Buffer(1, 0x73));
+            EXPECT_EQ(Flatten(transferred), std::vector<uint8_t>{0x73});
+            source.clear();
+            destination.clear();
+            transferred.clear();
+            EXPECT_EQ(domain.OutstandingAllocations(), 0u);
+        }
+    }
+}
+
+TEST(BufferOwnership, FailedFirstSpillPreservesInlinePayloadAndCanRetry) {
+    FailingResource resource(std::pmr::get_default_resource());
+    ScopedDefaultResource scope(&resource);
+    const auto expected = Pattern(buf::MultiBuffer::kInlineCapacity);
+    buf::MultiBuffer payload;
+    for (const auto byte : expected) payload.push_back(Buffer(1, byte));
+    std::array<buf::Buffer*, buf::MultiBuffer::kInlineCapacity> original;
+    std::copy(payload.begin(), payload.end(), original.begin());
+
+    resource.RejectNextAllocation();
+    EXPECT_THROW(payload.reserve(buf::MultiBuffer::kInlineCapacity + 1), std::bad_alloc);
+    EXPECT_EQ(resource.RejectedAllocations(), 1u);
+    EXPECT_EQ(Flatten(payload), expected);
+    EXPECT_TRUE(Consistent(payload));
+    EXPECT_TRUE(std::equal(payload.begin(), payload.end(), original.begin(), original.end()));
+
+    payload.reserve(buf::MultiBuffer::kInlineCapacity + 1);
+    payload.push_back(Buffer(1, 0x91));
+    auto extended = expected;
+    extended.push_back(0x91);
+    EXPECT_EQ(Flatten(payload), extended);
+    EXPECT_TRUE(Consistent(payload));
+}
+
 TEST(BufferOwnership, CoalescingUsesExistingTailWhenMetadataAllocationIsUnavailable) {
     FailingResource resource(std::pmr::get_default_resource());
     ScopedDefaultResource scope(&resource);

@@ -49,8 +49,10 @@ template <class Stream>
 void ReceiveVerified(Stream& stream, std::string_view expected, Deadline deadline) {
     size_t offset = 0;
     while (offset < expected.size()) {
-        const auto bytes = stream.Read(std::min(ChunkBytes, expected.size() - offset), Remaining(deadline));
-        Require(!bytes.empty(), "premature EOF in benchmark payload");
+        // TLS may return one 8 KiB record per read. Fill the complete chunk
+        // before allocating again, so peer allocation churn cannot cap cnode.
+        const auto bytes = stream.ReadExact(
+            std::min(ChunkBytes, expected.size() - offset), Remaining(deadline));
         if (std::string_view(bytes) != expected.substr(offset, bytes.size()))
             throw std::runtime_error("benchmark payload mismatch at offset " + std::to_string(offset));
         offset += bytes.size();

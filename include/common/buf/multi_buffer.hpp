@@ -179,8 +179,8 @@ struct BufferGuard {
 //   - MultiBuffer 是 owning 容器；析构和 clear() 都归还持有的 Buffer
 //   - std::move(mb) 即为所有权转移，零数据拷贝（只移动指针）
 //   - 常规协议/分帧路径最多 8 个 Buffer，指针链内联保存，避免每次
-//     ReadMultiBuffer() 为 vector 元数据再做一次堆分配；超过 8 个才 spill
-//     到所属会话域的地址稳定资源。
+//     ReadMultiBuffer() 为 vector 元数据再做一次堆分配；超过 8 个才构造
+//     spill vector 及其分配器，借用当时所属会话域的地址稳定资源。
 // ============================================================================
 class MultiBuffer {
 public:
@@ -210,7 +210,6 @@ public:
             spill_ = std::move(other.spill_);
             inline_start_ = 0;
             size_ = 0;
-            using_spill_ = false;
             spill_start_ = 0;
             total_bytes_ = 0;
             MoveFrom(std::move(other));
@@ -224,7 +223,7 @@ public:
 
     [[nodiscard]] bool empty() const noexcept { return size() == 0; }
     [[nodiscard]] size_t size() const noexcept {
-        return using_spill_ ? spill_.size() - spill_start_ : size_;
+        return spill_ ? spill_->size() - spill_start_ : size_;
     }
     [[nodiscard]] size_t byte_size() const noexcept {
         return total_bytes_;
@@ -239,27 +238,27 @@ public:
         if (empty()) {
             return nullptr;
         }
-        return using_spill_ ? spill_.back() : inline_buffers_[inline_start_ + size_ - 1];
+        return spill_ ? spill_->back() : inline_buffers_[inline_start_ + size_ - 1];
     }
     [[nodiscard]] const Buffer* back() const noexcept {
         if (empty()) {
             return nullptr;
         }
-        return using_spill_ ? spill_.back() : inline_buffers_[inline_start_ + size_ - 1];
+        return spill_ ? spill_->back() : inline_buffers_[inline_start_ + size_ - 1];
     }
 
     void reserve(size_t n) {
-        if (!using_spill_) {
+        if (!spill_) {
             if (n > kInlineCapacity) EnsureSpill(n);
             return;
         }
-        if (n <= spill_.capacity() - spill_start_) return;
+        if (n <= spill_->capacity() - spill_start_) return;
         if (spill_start_ != 0) {
-            spill_.erase(spill_.begin(), spill_.begin() +
+            spill_->erase(spill_->begin(), spill_->begin() +
                 static_cast<std::ptrdiff_t>(spill_start_));
             spill_start_ = 0;
         }
-        spill_.reserve(n);
+        spill_->reserve(n);
     }
 
     // Consumes the guard even on failure. A failed insertion releases that
@@ -271,7 +270,7 @@ public:
         const size_t bytes = buffer->Len();
         if (bytes > std::numeric_limits<size_t>::max() - total_bytes_)
             throw std::length_error("MultiBuffer byte size overflow");
-        if (!using_spill_ && size_ < kInlineCapacity) {
+        if (!spill_ && size_ < kInlineCapacity) {
             if (inline_start_ + size_ >= kInlineCapacity) {
                 CompactInline();
             }
@@ -280,7 +279,7 @@ public:
             return;
         }
         EnsureSpill();
-        spill_.push_back(buffer.get());
+        spill_->push_back(buffer.get());
         (void)buffer.release();
         total_bytes_ += bytes;
     }
@@ -290,12 +289,12 @@ public:
             return {};
         }
 
-        if (using_spill_) {
-            Buffer* out = spill_[spill_start_];
+        if (spill_) {
+            Buffer* out = (*spill_)[spill_start_];
             if (out) {
                 total_bytes_ -= std::min(total_bytes_, static_cast<size_t>(out->Len()));
             }
-            spill_[spill_start_++] = nullptr;
+            (*spill_)[spill_start_++] = nullptr;
             CompactConsumedSpill();
             return BufferGuard{out};
         }
@@ -323,15 +322,15 @@ public:
             clear();
             return;
         }
-        if (using_spill_) {
+        if (spill_) {
             for (size_t i = 0; i < n; ++i) {
-                if (spill_[spill_start_ + i]) {
+                if ((*spill_)[spill_start_ + i]) {
                     total_bytes_ -= std::min(
                         total_bytes_,
-                        static_cast<size_t>(spill_[spill_start_ + i]->Len()));
+                        static_cast<size_t>((*spill_)[spill_start_ + i]->Len()));
                 }
-                Buffer::Free(spill_[spill_start_ + i]);
-                spill_[spill_start_ + i] = nullptr;
+                Buffer::Free((*spill_)[spill_start_ + i]);
+                (*spill_)[spill_start_ + i] = nullptr;
             }
             spill_start_ += n;
             CompactConsumedSpill();
@@ -552,17 +551,9 @@ public:
 
     void clear() noexcept {
         ReleaseOwnedBuffers();
-        if (using_spill_) {
-            memory::ThreadLocalVector<Buffer*> empty{spill_.get_allocator()};
-            spill_.swap(empty);
-            using_spill_ = false;
-            spill_start_ = 0;
-        } else {
-            for (size_t i = 0; i < size_; ++i) {
-                inline_buffers_[inline_start_ + i] = nullptr;
-            }
-            inline_start_ = 0;
-        }
+        spill_.reset();
+        spill_start_ = 0;
+        inline_start_ = 0;
         size_ = 0;
         total_bytes_ = 0;
     }
@@ -617,7 +608,7 @@ public:
             return;
         }
         size_t additional = next.size();
-        const size_t capacity = using_spill_ ? spill_.capacity() : kInlineCapacity;
+        const size_t capacity = spill_ ? spill_->capacity() : kInlineCapacity;
         // Resolve the exact slot budget only when the upper bound would allocate.
         if (additional > capacity - size()) {
             additional = 0;
@@ -661,16 +652,16 @@ public:
     }
 
     Buffer** begin() noexcept {
-        return using_spill_ && size() > 0
-            ? spill_.data() + spill_start_
+        return spill_ && size() > 0
+            ? spill_->data() + spill_start_
             : inline_buffers_ + inline_start_;
     }
     Buffer** end() noexcept {
         return begin() + size();
     }
     Buffer* const* begin() const noexcept {
-        return using_spill_ && size() > 0
-            ? spill_.data() + spill_start_
+        return spill_ && size() > 0
+            ? spill_->data() + spill_start_
             : inline_buffers_ + inline_start_;
     }
     Buffer* const* end() const noexcept {
@@ -686,10 +677,10 @@ private:
     }
 
     void ReleaseOwnedBuffers() noexcept {
-        if (using_spill_) {
-            for (size_t i = spill_start_; i < spill_.size(); ++i) {
-                Buffer::Free(spill_[i]);
-                spill_[i] = nullptr;
+        if (spill_) {
+            for (size_t i = spill_start_; i < spill_->size(); ++i) {
+                Buffer::Free((*spill_)[i]);
+                (*spill_)[i] = nullptr;
             }
             return;
         }
@@ -713,48 +704,47 @@ private:
     }
 
     void EnsureSpill(size_t capacity = kInlineCapacity * 2) {
-        if (using_spill_) {
+        if (spill_) {
             return;
         }
-        spill_.reserve(std::max(capacity, kInlineCapacity * 2));
+        // Do not publish spilled state until the only fallible step succeeds.
+        memory::ThreadLocalVector<Buffer*> prepared;
+        prepared.reserve(std::max(capacity, kInlineCapacity * 2));
+        spill_.emplace(std::move(prepared));
         for (size_t i = 0; i < size_; ++i) {
-            spill_.push_back(inline_buffers_[inline_start_ + i]);
+            spill_->push_back(inline_buffers_[inline_start_ + i]);
             inline_buffers_[inline_start_ + i] = nullptr;
         }
-        using_spill_ = true;
         spill_start_ = 0;
         inline_start_ = 0;
         size_ = 0;
     }
 
     void CompactConsumedSpill() noexcept {
-        if (!using_spill_ || spill_start_ == 0) {
+        if (!spill_ || spill_start_ == 0) {
             return;
         }
-        const size_t remaining = spill_.size() - spill_start_;
+        const size_t remaining = spill_->size() - spill_start_;
         if (remaining <= kInlineCapacity) {
             for (size_t i = 0; i < remaining; ++i)
-                inline_buffers_[i] = spill_[spill_start_ + i];
+                inline_buffers_[i] = (*spill_)[spill_start_ + i];
             size_ = remaining;
             inline_start_ = 0;
-            memory::ThreadLocalVector<Buffer*> empty{spill_.get_allocator()};
-            spill_.swap(empty);
-            using_spill_ = false;
+            spill_.reset();
             spill_start_ = 0;
             return;
         }
-        if (spill_start_ < kInlineCapacity || spill_start_ * 2 < spill_.size()) {
+        if (spill_start_ < kInlineCapacity || spill_start_ * 2 < spill_->size()) {
             return;
         }
-        spill_.erase(
-            spill_.begin(),
-            spill_.begin() + static_cast<std::ptrdiff_t>(spill_start_));
+        spill_->erase(
+            spill_->begin(),
+            spill_->begin() + static_cast<std::ptrdiff_t>(spill_start_));
         spill_start_ = 0;
     }
 
     void MoveFrom(MultiBuffer&& other) noexcept {
-        using_spill_ = other.using_spill_;
-        if (using_spill_) {
+        if (spill_) {
             spill_start_ = other.spill_start_;
         } else {
             inline_start_ = 0;
@@ -766,7 +756,7 @@ private:
         }
         other.inline_start_ = 0;
         other.size_ = 0;
-        other.using_spill_ = false;
+        other.spill_.reset();
         other.spill_start_ = 0;
         total_bytes_ = other.total_bytes_;
         other.total_bytes_ = 0;
@@ -776,9 +766,8 @@ private:
     size_t inline_start_ = 0;
     size_t size_ = 0;
     size_t total_bytes_ = 0;
-    bool using_spill_ = false;
     size_t spill_start_ = 0;
-    memory::ThreadLocalVector<Buffer*> spill_;
+    std::optional<memory::ThreadLocalVector<Buffer*>> spill_;
 };
 
 // A completed UDP message owns a buffer even when it carries no data. An empty

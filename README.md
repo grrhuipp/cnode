@@ -62,7 +62,9 @@ mise exec -- cmake --build build/musl --target cnode_benchmarks
 mise exec -- ctest --test-dir build/musl --no-tests=error -L '^benchmark$' -V
 ```
 
-当前基准覆盖带生命周期跟踪的字节缓冲追加，以及真实 cnode 进程的 VLESS/TLS 上传、下载（1 个 Worker，1/8 条并发流，每流预热 1 MiB、测量 16 MiB，并校验完整载荷）。TLS 基准可用 `CNODE_BENCHMARK_BINARY=/absolute/path/to/cnode` 指定对比二进制；其 CPU 指标包含进程启动、握手、预热、传输和停机，不等于纯传输阶段 CPU。基准输出测量值，不以耗时阈值判定测试成功。启用基准时，功能回归使用 `-L '^(unit|e2e)$'`；重新运行未显式开启基准的 mise 配置任务会关闭基准注册。
+当前基准覆盖带生命周期跟踪的字节缓冲追加、`MultiBuffer` 的 1/8/9/16 块所有权移交与回收，以及真实 cnode 进程的 VLESS/TLS 上传、下载。TLS 负载固定为 1 个 Worker、1/8 条并发流，每流预热 1 MiB、测量 16 MiB；对端按完整 64 KiB 块接收并校验载荷，避免每次短读重新分配大缓冲。微基准不代表端到端吞吐。
+
+TLS 基准可用 `CNODE_BENCHMARK_BINARY=/absolute/path/to/cnode` 指定对比二进制；新旧二进制应使用同一份 benchmark，避免把测量端的改动计入生产收益。其 CPU 指标包含进程启动、握手、预热、传输和停机，不等于纯传输阶段 CPU。基准输出测量值，不以耗时阈值判定测试成功。启用基准时，功能回归使用 `-L '^(unit|e2e)$'`；重新运行未显式开启基准的 mise 配置任务会关闭基准注册。
 
 官方参考程序互操作测试按需配置，使用本地可执行文件，不在测试期间下载。AnyTLS 参考程序可先用宿主 Go 准备，默认离线且要求固定提交的干净源码：
 
