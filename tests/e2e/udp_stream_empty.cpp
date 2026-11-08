@@ -7,6 +7,11 @@ enum class StreamProtocol {
     Trojan,
     ShadowsocksUotV1,
     ShadowsocksUotV2,
+    Shadowsocks2022Identity128First,
+    Shadowsocks2022Identity128Middle,
+    Shadowsocks2022Identity128Last,
+    Shadowsocks2022Identity256,
+    Shadowsocks2022WithoutIdentity,
     AnyTlsUotV2,
 };
 
@@ -14,8 +19,10 @@ class StreamUdpEmpty : public testing::TestWithParam<StreamProtocol> {};
 
 TEST_P(StreamUdpEmpty, PreservesEmptyFirstPacketRepliesAndAssociationLifetime) {
     const auto protocol = GetParam();
+    const bool ss2022 = protocol >= StreamProtocol::Shadowsocks2022Identity128First &&
+                        protocol <= StreamProtocol::Shadowsocks2022WithoutIdentity;
     const bool shadowsocks = protocol == StreamProtocol::ShadowsocksUotV1 ||
-                             protocol == StreamProtocol::ShadowsocksUotV2;
+                             protocol == StreamProtocol::ShadowsocksUotV2 || ss2022;
     TempDir front_root;
     TempDir back_root;
     PortReservation front_port;
@@ -39,6 +46,24 @@ TEST_P(StreamUdpEmpty, PreservesEmptyFirstPacketRepliesAndAssociationLifetime) {
             {"version", protocol == StreamProtocol::ShadowsocksUotV1 ? 1 : 2}};
     } else {
         front_outbound["streamSettings"] = TlsSettings(false);
+    }
+    if (ss2022) {
+        const bool aes256 = protocol == StreamProtocol::Shadowsocks2022Identity256;
+        const bool identity = protocol != StreamProtocol::Shadowsocks2022WithoutIdentity;
+        const size_t key_size = aes256 ? 32 : 16;
+        const std::string method = aes256 ? "2022-blake3-aes-256-gcm"
+                                          : "2022-blake3-aes-128-gcm";
+        const auto identity_key = Base64(Sequence(key_size, 193));
+        Json clients = Json::array();
+        for (size_t i = 0; i < 17; ++i)
+            clients.push_back({{"password", Base64(Sequence(key_size, i))}});
+        const size_t selected = protocol == StreamProtocol::Shadowsocks2022Identity128First ? 0
+            : protocol == StreamProtocol::Shadowsocks2022Identity128Middle ? 8 : 16;
+        const auto user_key = Base64(Sequence(key_size, selected));
+        back_inbound["settings"] = {{"method", method}, {"clients", std::move(clients)}};
+        if (identity) back_inbound["settings"]["password"] = identity_key;
+        front_outbound["settings"]["method"] = method;
+        front_outbound["settings"]["password"] = identity ? identity_key + ':' + user_key : user_key;
     }
 
     // Both hops are real proxy processes: the controlled peer is native UDP,
@@ -84,12 +109,22 @@ TEST_P(StreamUdpEmpty, PreservesEmptyFirstPacketRepliesAndAssociationLifetime) {
 
 INSTANTIATE_TEST_SUITE_P(RealProxyChains, StreamUdpEmpty,
     testing::Values(StreamProtocol::Trojan, StreamProtocol::ShadowsocksUotV1,
-                    StreamProtocol::ShadowsocksUotV2, StreamProtocol::AnyTlsUotV2),
+                    StreamProtocol::ShadowsocksUotV2, StreamProtocol::AnyTlsUotV2,
+                    StreamProtocol::Shadowsocks2022Identity128First,
+                    StreamProtocol::Shadowsocks2022Identity128Middle,
+                    StreamProtocol::Shadowsocks2022Identity128Last,
+                    StreamProtocol::Shadowsocks2022Identity256,
+                    StreamProtocol::Shadowsocks2022WithoutIdentity),
     [](const testing::TestParamInfo<StreamProtocol>& info) {
         switch (info.param) {
         case StreamProtocol::Trojan: return "Trojan";
         case StreamProtocol::ShadowsocksUotV1: return "ShadowsocksUotV1";
         case StreamProtocol::ShadowsocksUotV2: return "ShadowsocksUotV2";
+        case StreamProtocol::Shadowsocks2022Identity128First: return "Shadowsocks2022Identity128First";
+        case StreamProtocol::Shadowsocks2022Identity128Middle: return "Shadowsocks2022Identity128Middle";
+        case StreamProtocol::Shadowsocks2022Identity128Last: return "Shadowsocks2022Identity128Last";
+        case StreamProtocol::Shadowsocks2022Identity256: return "Shadowsocks2022Identity256";
+        case StreamProtocol::Shadowsocks2022WithoutIdentity: return "Shadowsocks2022WithoutIdentity";
         case StreamProtocol::AnyTlsUotV2: return "AnyTlsUotV2Connect";
         }
         return "Unknown";

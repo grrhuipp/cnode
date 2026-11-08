@@ -171,11 +171,30 @@ BuildShadowsocksUsers(const std::vector<PreparedShadowsocksUser>& users) {
     std::unordered_set<std::string_view> seen;
     seen.reserve(users.size());
     for (const auto& user : users) {
+        if (user.identity_key.size > user.identity_key.bytes.size()) {
+            throw std::invalid_argument("Shadowsocks identity key exceeds prepared storage");
+        }
         const std::string_view key(
             reinterpret_cast<const char*>(user.derived_key.data()), user.derived_key.size);
         if (!seen.insert(key).second) ThrowAmbiguousCredential("Shadowsocks");
         list->push_back(BuildShadowsocksCredential(user));
     }
+    // Non-identity handshakes still scan candidates; keep their original hint
+    // and first-candidate behavior rather than imposing an unused hash order.
+    if (std::none_of(list->begin(), list->end(),
+                     [](const auto& user) { return !user.identity_key.empty(); })) {
+        return list;
+    }
+    // The immutable vector is also the identity index: no second per-user
+    // table, and sessions retaining an old snapshot retain its ordering.
+    std::sort(list->begin(), list->end(), [](const auto& a, const auto& b) {
+        if (a.identity_key.size != b.identity_key.size) {
+            return a.identity_key.size < b.identity_key.size;
+        }
+        const int key_order = std::memcmp(a.identity_key.data(), b.identity_key.data(),
+                                          a.identity_key.size);
+        return key_order != 0 ? key_order < 0 : a.psk_hash < b.psk_hash;
+    });
     return list;
 }
 

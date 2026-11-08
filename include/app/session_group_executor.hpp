@@ -100,6 +100,20 @@ public:
     [[nodiscard]] bool CanDestroyDirectlyOn(uint32_t worker_id) const noexcept;
     [[nodiscard]] static std::shared_ptr<ExecutionDomain> Current() noexcept;
     [[nodiscard]] bool CanExecuteInline() const noexcept;
+    // A synchronous borrow from the owning single-threaded reactor. Freeze is
+    // acknowledged on that same reactor, so it cannot pass this scope. A frozen
+    // or foreign domain must instead be entered through Executor(). Never hold
+    // this scope across suspension or use it from a nested domain callback.
+    class LocalLease final {
+    public:
+        explicit LocalLease(ExecutionDomain& domain) noexcept;
+        ~LocalLease();
+        LocalLease(const LocalLease&) = delete;
+        LocalLease& operator=(const LocalLease&) = delete;
+        [[nodiscard]] explicit operator bool() const noexcept { return domain_ != nullptr; }
+    private:
+        ExecutionDomain* domain_ = nullptr;
+    };
     // Suspends the caller before freezing both execution groups. Completion
     // resumes only after both run tokens have drained and ownership is unified.
     net::awaitable<void> Join(std::shared_ptr<ExecutionDomain> other);

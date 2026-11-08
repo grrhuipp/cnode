@@ -534,48 +534,24 @@ private:
     AsyncStream* stream_ = nullptr;
 };
 
-bool HasIdentityKey(
-    const proxyman::inbound::UserStore::ShadowsocksUsersView& users,
-    size_t key_size) {
-    for (size_t i = 0; i < users.size(); ++i) {
-        if (users[i].identity_key.size >= key_size) {
-            return true;
-        }
-    }
-    return false;
-}
-
-bool MatchIdentityHeader(const proxyman::inbound::UserStore::ShadowsocksCredential& user,
-                         const SsCipherInfo& cipher_info,
-                         std::span<const uint8_t> salt,
-                         std::span<const uint8_t, 16> encrypted_identity) {
-    if (user.identity_key.size < cipher_info.key_size ||
-        user.derived_key.size < cipher_info.key_size) {
-        return false;
-    }
-
+bool DecryptIdentityHeader(
+    const proxyman::inbound::PreparedKeyBytes& identity_key,
+    const SsCipherInfo& cipher_info,
+    std::span<const uint8_t> salt,
+    std::span<const uint8_t, 16> encrypted_identity,
+    std::array<uint8_t, 16>& identity_hash) {
+    // BuildMasterKey/Decode2022Psk admit only the configured cipher's exact
+    // key length; malformed prepared credentials are not identity groups.
+    if (identity_key.size != cipher_info.key_size) return false;
     std::array<uint8_t, 32> block_key{};
-    if (!Derive2022IdentitySubkey(user.identity_key.data(), cipher_info.key_size,
-                                  salt.data(), salt.size(), block_key.data())) {
-        return false;
-    }
-
-    std::array<uint8_t, 16> identity_hash{};
-    const bool ok = AesBlockCrypt(
-        std::span<const uint8_t>(block_key.data(), cipher_info.key_size),
-        encrypted_identity,
-        std::span<uint8_t, 16>(identity_hash),
-        false);
+    const bool ok =
+        Derive2022IdentitySubkey(identity_key.data(), cipher_info.key_size,
+                                 salt.data(), salt.size(), block_key.data()) &&
+        AesBlockCrypt(
+            std::span<const uint8_t>(block_key.data(), cipher_info.key_size),
+            encrypted_identity, std::span<uint8_t, 16>(identity_hash), false);
     OPENSSL_cleanse(block_key.data(), block_key.size());
-    if (!ok) {
-        OPENSSL_cleanse(identity_hash.data(), identity_hash.size());
-        return false;
-    }
-
-    const bool matched =
-        CRYPTO_memcmp(identity_hash.data(), user.psk_hash.data(), identity_hash.size()) == 0;
-    OPENSSL_cleanse(identity_hash.data(), identity_hash.size());
-    return matched;
+    return ok;
 }
 
 bool DecryptSs2022FixedHeader(const proxyman::inbound::UserStore::ShadowsocksCredential& user,
@@ -620,7 +596,8 @@ net::awaitable<tl::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession2022
         co_return tl::unexpected(read_res.error());
     }
 
-    const bool use_identity = Is2022AesCipher(cipher_info.type) && HasIdentityKey(users, key_size);
+    const bool use_identity = Is2022AesCipher(cipher_info.type) &&
+        users[users.size() - 1].identity_key.size >= key_size;
     std::array<uint8_t, 16> identity_header{};
     if (use_identity) {
         if (auto read_res = co_await ReadFull(stream, identity_header.data(), identity_header.size());
@@ -645,12 +622,6 @@ net::awaitable<tl::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession2022
 
     auto try_user = [&](size_t index) -> bool {
         const auto& user = users[index];
-        if (use_identity &&
-            !MatchIdentityHeader(
-                user, cipher_info, result.request_salt.span(),
-                std::span<const uint8_t, 16>(identity_header))) {
-            return false;
-        }
         if (!DecryptSs2022FixedHeader(
                 user,
                 cipher_info,
@@ -665,12 +636,70 @@ net::awaitable<tl::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession2022
         return true;
     };
 
-    if (hint >= users.size() || !try_user(hint)) {
-        for (size_t i = 0; i < users.size(); ++i) {
-            if (i == hint) continue;
-            if (try_user(i)) {
-                break;
+    if (use_identity) {
+        std::array<uint8_t, 16> identity_hash{};
+        struct CleanseIdentityHash {
+            std::array<uint8_t, 16>& hash;
+            ~CleanseIdentityHash() noexcept { OPENSSL_cleanse(hash.data(), hash.size()); }
+        } cleanse_identity{identity_hash};
+        const auto& list = *users.users;
+        const auto group_end = [&](auto begin) {
+            const auto& key = begin->identity_key;
+            return std::partition_point(begin, list.end(), [&](const auto& user) {
+                return user.identity_key.size == key.size &&
+                    CRYPTO_memcmp(user.identity_key.data(), key.data(), key.size) == 0;
+            });
+        };
+        const auto try_candidates = [&](auto begin, auto end) {
+            // The hash selects candidates, never authenticates a user:
+            // collisions still require the fixed header's AEAD tag.
+            auto candidate = std::lower_bound(begin, end, identity_hash,
+                [](const auto& user, const auto& hash) { return user.psk_hash < hash; });
+            for (; candidate != end &&
+                   CRYPTO_memcmp(candidate->psk_hash.data(), identity_hash.data(),
+                                 identity_hash.size()) == 0; ++candidate) {
+                const size_t index = static_cast<size_t>(candidate - list.begin());
+                if (index != hint && try_user(index)) break;
             }
+        };
+        auto hinted_begin = list.end();
+        auto hinted_end = list.end();
+        if (hint < list.size()) {
+            const auto& key = list[hint].identity_key;
+            const bool decoded = DecryptIdentityHeader(
+                key, cipher_info, result.request_salt.span(), identity_header, identity_hash);
+            if (decoded &&
+                CRYPTO_memcmp(list[hint].psk_hash.data(), identity_hash.data(),
+                              identity_hash.size()) == 0) {
+                try_user(hint);
+            }
+            if (!result.user) {
+                // A hit remains O(1). Only a miss needs to locate the hinted
+                // group, whose identity work must not be repeated below.
+                hinted_begin = std::partition_point(list.begin(), list.begin() + hint,
+                    [&](const auto& user) {
+                        return user.identity_key.size != key.size ||
+                            CRYPTO_memcmp(user.identity_key.data(), key.data(), key.size) != 0;
+                    });
+                hinted_end = group_end(list.begin() + hint);
+                if (decoded) try_candidates(hinted_begin, hinted_end);
+            }
+        }
+        for (auto group = list.begin(); group != list.end() && !result.user;) {
+            if (group == hinted_begin) {
+                group = hinted_end;
+                continue;
+            }
+            const auto end = group_end(group);
+            if (DecryptIdentityHeader(group->identity_key, cipher_info,
+                                      result.request_salt.span(), identity_header, identity_hash)) {
+                try_candidates(group, end);
+            }
+            group = end;
+        }
+    } else if (hint >= users.size() || !try_user(hint)) {
+        for (size_t i = 0; i < users.size(); ++i) {
+            if (i != hint && try_user(i)) break;
         }
     }
 

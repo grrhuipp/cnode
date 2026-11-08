@@ -1373,65 +1373,54 @@ WorkerRuntimeStatsSnapshot Worker::CollectNativeRuntimeStats(bool include_resour
 
 net::awaitable<WorkerRuntimeStatsSnapshot> Worker::CollectRuntimeStats(bool include_resources) const {
     auto result = CollectNativeRuntimeStats(include_resources);
-    struct Sample {
-        std::shared_ptr<app::PhysicalSessionRecord> record;
-        bool was_active = false;
+    auto add_stats = [&result](const StatsSnapshot& stats) {
+        result.stats.connections_total += stats.connections_total;
+        result.stats.connections_active += stats.connections_active;
+        result.stats.bytes_in += stats.bytes_in;
+        result.stats.bytes_out += stats.bytes_out;
+        result.stats.errors += stats.errors;
     };
-    std::vector<Sample> samples;
-    samples.reserve(runtime_->connections.size());
+    // Registration and final folding belong to this Worker, even after passive
+    // migration. Do not suspend while borrowing the registry: local leases read
+    // each live shard before any close can fold it into the sampled base total.
+    // Only foreign/frozen domains need ownership retained across suspension.
+    std::vector<std::shared_ptr<app::PhysicalSessionRecord>> deferred;
     for (const auto& [key, record] : runtime_->connections) {
         (void)key;
-        samples.push_back(Sample{
-            .record = record,
-            .was_active = !record->finished.load(std::memory_order_acquire),
-        });
-    }
-    for (const auto& [record, was_active] : samples) {
-        if (was_active && record->finished.load(std::memory_order_acquire)) {
-            result.stats.connections_total += record->final_stats.connections_total;
-            result.stats.bytes_in += record->final_stats.bytes_in;
-            result.stats.bytes_out += record->final_stats.bytes_out;
-            result.stats.errors += record->final_stats.errors;
-            if (result.active_connections > 0) {
-                --result.active_connections;
-            }
-            continue;
-        }
-        if (!record->initialized.load(std::memory_order_acquire) ||
-            !runtime_->connections.contains(record.get()) ||
+        if (record->finished.load(std::memory_order_acquire) ||
+            !record->initialized.load(std::memory_order_acquire) ||
             !record->domain || !record->capabilities)
             continue;
-        const bool include_stats = !record->finished.load(std::memory_order_acquire);
-        const auto values = co_await net::co_spawn(record->domain->Executor(),
-            [cap = record->capabilities, domain = record->domain,
-             include_stats]() mutable -> net::awaitable<WorkerRuntimeStatsSnapshot> {
-                WorkerRuntimeStatsSnapshot snapshot;
-                if (include_stats) snapshot.stats = cap->Stats().Snapshot();
-                cap.reset();
-                domain.reset();
-                co_return snapshot;
-            }, net::use_awaitable);
-        const bool still_active = !record->finished.load(std::memory_order_acquire);
-        if (still_active) {
-            result.stats.connections_total += values.stats.connections_total;
-            result.stats.connections_active += values.stats.connections_active;
-            result.stats.bytes_in += values.stats.bytes_in;
-            result.stats.bytes_out += values.stats.bytes_out;
-            result.stats.errors += values.stats.errors;
-            if (values.resources) {
-                result.resources->timeout_events += values.resources->timeout_events;
-                result.resources->timeout_heap_capacity += values.resources->timeout_heap_capacity;
-                result.resources->timeout_waiters += values.resources->timeout_waiters;
-            }
-        } else if (include_stats) {
-            result.stats.connections_total += record->final_stats.connections_total;
-            result.stats.bytes_in += record->final_stats.bytes_in;
-            result.stats.bytes_out += record->final_stats.bytes_out;
-            result.stats.errors += record->final_stats.errors;
-            if (result.active_connections > 0) {
-                --result.active_connections;
+        ExecutionDomain::LocalLease lease(*record->domain);
+        if (lease) {
+            add_stats(record->capabilities->Stats().Snapshot());
+        } else {
+            // Reserve only on the exceptional path, bounded by the existing
+            // registry size rather than geometric growth beyond that budget.
+            if (deferred.empty()) deferred.reserve(runtime_->connections.size());
+            deferred.push_back(record);
+        }
+    }
+    for (const auto& record : deferred) {
+        if (!record->finished.load(std::memory_order_acquire)) {
+            const auto stats = co_await net::co_spawn(record->domain->Executor(),
+                [cap = record->capabilities]() mutable -> net::awaitable<StatsSnapshot> {
+                    const auto snapshot = cap->Stats().Snapshot();
+                    cap.reset();
+                    co_return snapshot;
+                }, net::use_awaitable);
+            if (!record->finished.load(std::memory_order_acquire)) {
+                add_stats(stats);
+                continue;
             }
         }
+        // A close during a deferred sample was not included in the base total.
+        // Use its final snapshot rather than the earlier live sample, preserving
+        // the last traffic without counting the owner's later fold twice.
+        auto stats = record->final_stats;
+        stats.connections_active = 0;
+        add_stats(stats);
+        if (result.active_connections > 0) --result.active_connections;
     }
     if (runtime_->session_configuration && runtime_->session_configuration->outbounds) {
         co_await runtime_->session_configuration->outbounds->CollectRuntimeStats(

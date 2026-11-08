@@ -128,6 +128,8 @@ public:
     };
 
     struct ShadowsocksUsersView {
+        // Identity-enabled vectors are ordered by key length, key bytes, then
+        // PSK hash; others retain input order. Indices are snapshot-local hints.
         std::shared_ptr<const ShadowsocksUserList> users;
 
         [[nodiscard]] bool empty() const noexcept { return !users || users->empty(); }

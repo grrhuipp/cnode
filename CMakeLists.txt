@@ -395,8 +395,10 @@ cnode_unit(relay_initial_payload LIBRARY cnode_test_core)
 cnode_unit(router)
 cnode_unit(routing_ip_network)
 cnode_unit(rule_lifecycle)
+cnode_unit(runtime_sampling LIBRARY "$<LINK_LIBRARY:WHOLE_ARCHIVE,cnode_core>")
 cnode_unit(session_access_log)
 cnode_unit(session_group_executor)
+cnode_unit(shadowsocks_identity INCLUDES src/proxy/shadowsocks)
 cnode_unit(shadowsocks_stream_crypto LIBRARY cnode_build_options SOURCES src/proxy/shadowsocks/shadowsocks_protocol.cpp INCLUDES src/proxy/shadowsocks)
 cnode_unit(shadowsocks_udp_datagram INCLUDES src/proxy/shadowsocks)
 cnode_unit(sniff_config)
@@ -529,9 +531,27 @@ if(BUILD_BENCHMARKS)
         tests/tcp_send_benchmark.cpp)
     target_link_libraries(cnode_tcp_send_benchmark PRIVATE
         "$<LINK_LIBRARY:WHOLE_ARCHIVE,cnode_core,mimalloc-static>" GTest::gtest_main)
+    add_executable(cnode_shadowsocks_identity_benchmark EXCLUDE_FROM_ALL
+        tests/shadowsocks_identity_benchmark.cpp)
+    target_include_directories(cnode_shadowsocks_identity_benchmark PRIVATE
+        src/proxy/shadowsocks)
+    target_link_libraries(cnode_shadowsocks_identity_benchmark PRIVATE
+        cnode_core "$<LINK_LIBRARY:WHOLE_ARCHIVE,mimalloc-static>" GTest::gtest_main)
+    add_executable(cnode_runtime_sampling_benchmark EXCLUDE_FROM_ALL
+        tests/runtime_sampling_benchmark.cpp)
+    target_link_libraries(cnode_runtime_sampling_benchmark PRIVATE
+        "$<LINK_LIBRARY:WHOLE_ARCHIVE,cnode_core,mimalloc-static>" GTest::gtest_main)
+    foreach(target IN ITEMS cnode_shadowsocks_identity_benchmark cnode_runtime_sampling_benchmark)
+        target_sources(${target} PRIVATE tests/benchmark_memory.cpp)
+        target_link_options(${target} PRIVATE
+            "-Wl,--wrap=_Znwm" "-Wl,--wrap=_Znam"
+            "-Wl,--wrap=_ZnwmSt11align_val_t" "-Wl,--wrap=_ZnamSt11align_val_t"
+            "-Wl,--wrap=mi_malloc_aligned")
+    endforeach()
     foreach(target IN ITEMS cnode_allocator_append_benchmark cnode_tls_throughput_benchmark
                             cnode_tcp_receive_benchmark cnode_executor_benchmark
-                            cnode_tcp_send_benchmark)
+                            cnode_tcp_send_benchmark cnode_shadowsocks_identity_benchmark
+                            cnode_runtime_sampling_benchmark)
         target_compile_options(${target} PRIVATE -UNDEBUG)
         add_dependencies(cnode_benchmarks ${target})
         gtest_discover_tests(${target} DISCOVERY_MODE PRE_TEST
