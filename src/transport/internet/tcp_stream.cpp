@@ -576,19 +576,27 @@ std::size_t TcpStream::WriteAvailable(
         error = io_error::broken_pipe;
         return 0;
     }
-    std::array<iovec, 16> vectors;
-    size_t count = 0;
-    for (size_t i = 0; i < buffers.size() && count < vectors.size(); ++i) {
-        const auto buffer = buffers[i] + (i == 0 ? offset : 0);
-        if (!buffer.size()) continue;
-        vectors[count++] = {const_cast<void*>(buffer.data()), buffer.size()};
+    ssize_t sent;
+    if (buffers.size() == 1) {
+        const auto buffer = buffers.front() + offset;
+        if (buffer.size() == 0) return 0;
+        sent = ::send(impl_->socket.native_handle(), buffer.data(),
+                      buffer.size(), MSG_DONTWAIT | MSG_NOSIGNAL);
+    } else {
+        std::array<iovec, 16> vectors;
+        size_t count = 0;
+        for (size_t i = 0; i < buffers.size() && count < vectors.size(); ++i) {
+            const auto buffer = buffers[i] + (i == 0 ? offset : 0);
+            if (!buffer.size()) continue;
+            vectors[count++] = {const_cast<void*>(buffer.data()), buffer.size()};
+        }
+        if (count == 0) return 0;
+        msghdr message{};
+        message.msg_iov = vectors.data();
+        message.msg_iovlen = count;
+        sent = ::sendmsg(impl_->socket.native_handle(), &message,
+                         MSG_DONTWAIT | MSG_NOSIGNAL);
     }
-    if (count == 0) return 0;
-    msghdr message{};
-    message.msg_iov = vectors.data();
-    message.msg_iovlen = count;
-    const auto sent = ::sendmsg(impl_->socket.native_handle(), &message,
-                               MSG_DONTWAIT | MSG_NOSIGNAL);
     if (sent < 0) {
         error = IoErrorCode(errno, io_error::get_system_category());
         return 0;
