@@ -630,3 +630,45 @@ TEST(BufferOwnership, PacketStreamRetiresPartiallyAppendedInputOnRequiredAllocat
     EXPECT_THROW(stream.Append({}), IoSystemError);
     EXPECT_THROW(stream.Finish(), IoSystemError);
 }
+
+TEST(BufferOwnership, TruncatedPacketStreamCannotResumeAfterEof) {
+    const std::array<uint8_t, 5> wire{0, 3, 0x11, 0x22, 0x33};
+    for (size_t cut = 1; cut < wire.size(); ++cut) {
+        SCOPED_TRACE(cut);
+        buf::LengthPrefixedPacketBuffer stream;
+        stream.Append(Packet(std::span(wire).first(cut)));
+        buf::MultiBuffer output;
+        ASSERT_EQ(stream.Pop(output), buf::LengthPrefixedPacketBuffer::PopResult::NeedMore);
+        EXPECT_THROW(stream.Finish(), IoSystemError);
+        EXPECT_EQ(stream.PendingBytes(), 0);
+        EXPECT_THROW(stream.Append(Packet(std::span(wire).subspan(cut))), IoSystemError);
+        EXPECT_EQ(stream.Pop(output), buf::LengthPrefixedPacketBuffer::PopResult::Invalid);
+        EXPECT_TRUE(output.empty());
+        EXPECT_THROW(stream.Finish(), IoSystemError);
+        stream.Reset();
+        stream.Append(Packet(wire));
+        ASSERT_EQ(stream.Pop(output), buf::LengthPrefixedPacketBuffer::PopResult::Packet);
+        EXPECT_EQ(Flatten(output), std::vector<uint8_t>({0x11, 0x22, 0x33}));
+        stream.Finish();
+    }
+}
+
+TEST(BufferOwnership, CleanPacketStreamEofRequiresExplicitResetBeforeReuse) {
+    const std::array<uint8_t, 3> wire{0, 1, 0x73};
+    buf::LengthPrefixedPacketBuffer stream;
+    stream.Append(Packet(wire));
+    buf::MultiBuffer output;
+    ASSERT_EQ(stream.Pop(output), buf::LengthPrefixedPacketBuffer::PopResult::Packet);
+    EXPECT_EQ(Flatten(output), std::vector<uint8_t>({0x73}));
+    stream.Finish();
+    stream.Finish();
+    EXPECT_THROW(stream.Append({}), IoSystemError);
+    EXPECT_THROW(stream.Append(Packet(wire)), IoSystemError);
+    EXPECT_EQ(stream.Pop(output), buf::LengthPrefixedPacketBuffer::PopResult::Finished);
+    EXPECT_TRUE(output.empty());
+    stream.Reset();
+    stream.Append(Packet(wire));
+    ASSERT_EQ(stream.Pop(output), buf::LengthPrefixedPacketBuffer::PopResult::Packet);
+    EXPECT_EQ(Flatten(output), std::vector<uint8_t>({0x73}));
+    stream.Finish();
+}

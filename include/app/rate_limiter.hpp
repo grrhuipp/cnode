@@ -80,7 +80,7 @@ private:
 struct RateLimitConfig {
     uint32_t max_connections = 0; // 全局最大连接数 (0=不限制)
     uint32_t max_conn_per_ip = 0; // 单 IP 最大并发连接 (0=不限制)
-    AuthFailureLimitConfig ip_ban;
+    AuthFailureLimitConfig ip_ban{};
 };
 
 // Sans-I/O bounded model; mutable state belongs exclusively to the coordinator.

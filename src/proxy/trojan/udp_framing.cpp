@@ -12,77 +12,81 @@
 namespace trojan {
 
 void UdpFramer::Feed(buf::MultiBuffer input) {
-    if (failed_) {
-        throw IoSystemError(io_error::invalid_argument, "failed Trojan UDP stream");
+    if (state_ != State::Active) {
+        throw IoSystemError(io_error::invalid_argument, "inactive Trojan UDP stream");
     }
     try {
         buf::AppendPacketStreamInput(pending_, std::move(input));
     } catch (...) {
-        failed_ = true;
-        pending_.clear();
+        Fail();
         throw;
     }
 }
 
 bool UdpFramer::Next(FramedUdpPacket& out) {
-    if (failed_) {
+    out = {};
+    if (state_ == State::Failed) {
         throw IoSystemError(io_error::invalid_argument, "failed Trojan UDP stream");
     }
-    out = {};
-    for (;;) {
-        if (!target_) {
-            // SOCKS5 address, length and CRLF only.
-            std::array<uint8_t, kMaxEncodedAddressSize + 4> header{};
-            const size_t copied = pending_.CopyPrefixTo(header);
-            auto address = DecodeAddress(
-                std::span<const uint8_t>(header.data(), copied),
-                AddressWireFormat::Socks5,
-                {.require_non_empty_domain = true, .allow_metadata = false});
-            if (address.status == AddressDecodeStatus::Incomplete) return false;
-            if (address.status == AddressDecodeStatus::Invalid || !address.target.IsValid()) {
-                failed_ = true;
-                pending_.clear();
-                throw IoSystemError(io_error::invalid_argument, "invalid Trojan UDP address");
-            }
-            const size_t pos = address.consumed;
-            if (copied < pos + 4) return false;
-            if (header[pos + 2] != '\r' || header[pos + 3] != '\n') {
-                failed_ = true;
-                pending_.clear();
-                throw IoSystemError(io_error::invalid_argument, "invalid Trojan UDP delimiter");
-            }
-            payload_size_ = (static_cast<size_t>(header[pos]) << 8) | header[pos + 1];
-            target_.emplace(std::move(address.target));
-            (void)pending_.DropPrefixBytes(pos + 4);
+    if (state_ == State::Finished) return false;
+    if (!target_) {
+        // SOCKS5 address, length and CRLF only.
+        std::array<uint8_t, kMaxEncodedAddressSize + 4> header{};
+        const size_t copied = pending_.CopyPrefixTo(header);
+        auto address = DecodeAddress(
+            std::span<const uint8_t>(header.data(), copied),
+            AddressWireFormat::Socks5,
+            {.require_non_empty_domain = true, .allow_metadata = false});
+        if (address.status == AddressDecodeStatus::Incomplete) return false;
+        if (address.status == AddressDecodeStatus::Invalid || !address.target.IsValid()) {
+            Fail();
+            throw IoSystemError(io_error::invalid_argument, "invalid Trojan UDP address");
         }
-        const size_t bytes = payload_size_;
-        if (pending_.byte_size() < bytes) return false;
-        if (!pending_.MovePrefixTo(out.payload, bytes)) {
-            failed_ = true;
-            pending_.clear();
-            throw std::bad_alloc();
+        const size_t pos = address.consumed;
+        if (copied < pos + 4) return false;
+        if (header[pos + 2] != '\r' || header[pos + 3] != '\n') {
+            Fail();
+            throw IoSystemError(io_error::invalid_argument, "invalid Trojan UDP delimiter");
         }
-        pending_.ReleaseIfIdle();
-        out.target = std::move(*target_);
-        target_.reset();
-        if (!buf::SetUdpTarget(out.payload, out.target)) {
-            failed_ = true;
-            pending_.clear();
-            throw std::bad_alloc();
-        }
-        return true;
+        payload_size_ = (static_cast<size_t>(header[pos]) << 8) | header[pos + 1];
+        target_.emplace(std::move(address.target));
+        (void)pending_.DropPrefixBytes(pos + 4);
     }
+    const size_t bytes = payload_size_;
+    if (pending_.byte_size() < bytes) return false;
+    if (!pending_.MovePrefixTo(out.payload, bytes)) {
+        Fail();
+        throw std::bad_alloc();
+    }
+    pending_.ReleaseIfIdle();
+    out.target = std::move(*target_);
+    target_.reset();
+    if (!buf::SetUdpTarget(out.payload, out.target)) {
+        Fail();
+        throw std::bad_alloc();
+    }
+    return true;
 }
 
-void UdpFramer::Finish() const {
-    if (failed_ || target_ || pending_.byte_size() != 0) {
+void UdpFramer::Finish() {
+    if (state_ == State::Failed || target_ || pending_.byte_size() != 0) {
+        Fail();
         throw IoSystemError(io_error::invalid_argument, "truncated Trojan UDP stream");
     }
+    state_ = State::Finished;
+}
+
+void UdpFramer::Fail() noexcept {
+    pending_.clear();
+    target_.reset();
+    payload_size_ = 0;
+    state_ = State::Failed;
 }
 
 net::awaitable<buf::MultiBuffer> ReadUdpDatagram(
     AsyncStream& stream,
     UdpFramer& framer) {
+    if (framer.Finished()) co_return buf::MultiBuffer{};
     while (true) {
         FramedUdpPacket packet;
         if (framer.Next(packet)) {

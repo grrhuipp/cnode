@@ -1,6 +1,8 @@
 #include "http2_peer.hpp"
 #include <openssl/base64.h>
+#include <openssl/mlkem.h>
 #include <array>
+#include <condition_variable>
 
 namespace cnode::e2e::http2 {
 namespace {
@@ -113,8 +115,9 @@ TEST_P(Http2WebSocketDeadline, DecoderResumesAcrossSniffAndCloseCancelsTarget) {
 INSTANTIATE_TEST_SUITE_P(FramingAndClose, Http2WebSocketDeadline, testing::Values(
     std::string("full-close"), std::string("prefix-resume"), std::string("mask-resume"), std::string("extended-resume"), std::string("large-extended-resume"), std::string("payload-resume"), std::string("ping-resume"), std::string("upgrade-rejection")));
 
-// Maps a real encrypted cnode client's bytes to XHTTP packets. Encryption remains
-// entirely in the two production cnode processes; this bridge only owns framing.
+// Maps the two real encrypted clients to XHTTP packets. The victim contributes
+// its complete key-exchange flight but not padding, so the server must write its
+// response behind the blocked sibling without racing further upload connections.
 class EncryptedBridge {
     Socket listener_ = Socket::Listen();
     std::mutex mutex_;
@@ -122,21 +125,43 @@ class EncryptedBridge {
     std::vector<std::unique_ptr<PeerThread>> uploaders_;
     std::unique_ptr<PeerThread> accept_;
     std::atomic<bool> stop_{false};
+    std::condition_variable stop_signal_;
+
+    void ForwardUpload(uint16_t front, unsigned index, Socket& client) {
+        try {
+            if (index == 1) {
+                // Native 1-RTT: IV, one X25519 NFS relay, AEAD length,
+                // then the AEAD-wrapped ML-KEM-768/X25519 public keys.
+                constexpr size_t key_exchange_size =
+                    16 + 32 + (2 + 16) + (MLKEM768_PUBLIC_KEY_BYTES + 32 + 16);
+                {
+                    const auto key_exchange = client.ReadExact(key_exchange_size, 30s);
+                    H1Packet(front, false, "s3", 0, key_exchange);
+                }
+                // Publish the completed POST before the probes reserve slots.
+                victim_keys_committed.store(true, std::memory_order_release);
+                std::unique_lock lock(mutex_);
+                stop_signal_.wait(lock, [this] { return stop_.load(); });
+                return;
+            }
+            for (unsigned sequence = 0; !stop_; ++sequence) {
+                auto bytes = client.Read(65536, 30s);
+                if (bytes.empty()) break;
+                H1Packet(front, false, "s1", sequence, bytes);
+            }
+        } catch (...) {
+            if (!stop_) throw;
+        }
+    }
 public:
-    std::atomic<unsigned> uploads[2]{};
+    std::atomic<bool> victim_keys_committed{false};
     explicit EncryptedBridge(uint16_t front) {
         accept_ = std::make_unique<PeerThread>([&, front] {
             for (unsigned index = 0; index < 2; ++index) {
                 auto client = std::make_shared<Socket>(listener_.Accept(15s));
                 { std::lock_guard lock(mutex_); clients_.push_back(client); }
-                uploaders_.push_back(std::make_unique<PeerThread>([this, front, index, client] {
-                    try {
-                        for (unsigned sequence = 0; !stop_; ++sequence) {
-                            auto bytes = client->Read(65536, 30s); if (bytes.empty()) break;
-                            H1Packet(front, false, "s" + std::to_string(index * 2 + 1), sequence, bytes); ++uploads[index];
-                        }
-                    } catch (...) { if (!stop_) throw; }
-                }));
+                uploaders_.push_back(std::make_unique<PeerThread>(
+                    [this, front, index, client] { ForwardUpload(front, index, *client); }));
             }
         });
     }
@@ -152,7 +177,8 @@ public:
     }
     void Join() {
         if (!accept_) return;
-        stop_ = true;
+        { std::lock_guard lock(mutex_); stop_ = true; }
+        stop_signal_.notify_all();
         // Accept has a finite deadline even on an earlier assertion failure.
         std::exception_ptr error;
         try { accept_->Join(); } catch (...) { error = std::current_exception(); }
@@ -398,7 +424,7 @@ TEST(Http2EncryptedDeadline, ExpiredChildReturnsQuotaBeforeBlockedSiblingResumes
         return current > 0 && Clock::now() - stable >= 300ms;
     }, 5s);
     auto victim = Socket::Connect(client.port); victim.Write(VlessRequest(target.Port(), "V"));
-    Until([&] { return bridge.uploads[1].load() > 0; }, 3s); EXPECT_LT(Clock::now() - opened, 7s);
+    Until([&] { return bridge.victim_keys_committed.load(std::memory_order_acquire); }, 3s); EXPECT_LT(Clock::now() - opened, 7s);
     auto admission_probe = [&](std::string_view tag, Milliseconds timeout) {
         std::unique_ptr<Socket> result;
         Until([&] {

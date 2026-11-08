@@ -118,57 +118,46 @@ bool IsPacketAddrMagic(const TargetAddress& target) noexcept {
 }
 
 void UdpFramer::Feed(buf::MultiBuffer input) {
-    if (failed_) {
-        throw IoSystemError(io_error::invalid_argument, "failed VLESS UDP stream");
-    }
     pending_.Append(std::move(input));
 }
 
 bool UdpFramer::Next(FramedUdpPacket& out) {
-    if (failed_) {
-        throw IoSystemError(io_error::invalid_argument, "failed VLESS UDP stream");
-    }
     out = {};
-    for (;;) {
-        buf::MultiBuffer payload;
-        const auto result = pending_.Pop(payload);
-        if (result == buf::LengthPrefixedPacketBuffer::PopResult::NeedMore) {
-            return false;
-        }
-        if (result == buf::LengthPrefixedPacketBuffer::PopResult::Invalid) {
-            failed_ = true;
-            pending_.Clear();
-            throw IoSystemError(io_error::invalid_argument, "invalid VLESS UDP frame");
-        }
-        if (packet_addr_) {
-            std::array<uint8_t, 19> address{};
-            const size_t copied = payload.CopyPrefixTo(address);
-            auto header = DecodePacketAddrHeader(
-                std::span<const uint8_t>(address.data(), copied));
-            if (!header || !header->target.IsValid()) {
-                failed_ = true;
-                pending_.Clear();
-                throw IoSystemError(
-                    io_error::invalid_argument, "invalid VLESS packet address");
-            }
-            out.target = std::move(header->target);
-            (void)payload.DropPrefixBytes(header->consumed);
-        }
-        out.payload = std::move(payload);
-        return true;
+    buf::MultiBuffer payload;
+    switch (pending_.Pop(payload)) {
+    case buf::LengthPrefixedPacketBuffer::PopResult::NeedMore:
+    case buf::LengthPrefixedPacketBuffer::PopResult::Finished:
+        return false;
+    case buf::LengthPrefixedPacketBuffer::PopResult::Invalid:
+        throw IoSystemError(io_error::invalid_argument, "invalid VLESS UDP frame");
+    case buf::LengthPrefixedPacketBuffer::PopResult::Packet:
+        break;
     }
+    if (packet_addr_) {
+        std::array<uint8_t, 19> address{};
+        const size_t copied = payload.CopyPrefixTo(address);
+        auto header = DecodePacketAddrHeader(
+            std::span<const uint8_t>(address.data(), copied));
+        if (!header || !header->target.IsValid()) {
+            pending_.Fail();
+            throw IoSystemError(
+                io_error::invalid_argument, "invalid VLESS packet address");
+        }
+        out.target = std::move(header->target);
+        (void)payload.DropPrefixBytes(header->consumed);
+    }
+    out.payload = std::move(payload);
+    return true;
 }
 
-void UdpFramer::Finish() const {
-    if (failed_) {
-        throw IoSystemError(io_error::invalid_argument, "failed VLESS UDP stream");
-    }
+void UdpFramer::Finish() {
     pending_.Finish();
 }
 
 net::awaitable<buf::MultiBuffer> UdpFramer::ReadDatagram(
     transport::MultiBufferReader& src,
     const TargetAddress& session_target) {
+    if (pending_.Finished()) co_return buf::MultiBuffer{};
     for (;;) {
         FramedUdpPacket packet;
         if (Next(packet)) {
@@ -176,6 +165,7 @@ net::awaitable<buf::MultiBuffer> UdpFramer::ReadDatagram(
                 ? *packet.target
                 : session_target;
             if (!buf::SetUdpTarget(packet.payload, target)) {
+                pending_.Fail();
                 throw std::bad_alloc();
             }
             co_return std::move(packet.payload);

@@ -1204,3 +1204,31 @@ Linux x86-64 musl静态构建与主程序CLI smoke通过。最终定向unit **15
 以508c3b8为基线建立独立原生Git worktree，仅应用本轮补丁；复用已安装依赖，关闭依赖自动安装，保持Linux x86-64 musl Release、LTO和四并行测试设置。cnode、cnode_tests与cnode_traffic_journal全部构建成功，全量 **1,174/1,174** 通过，其中279项unit与895项真实进程E2E，用时210.50秒；包含新增的13项写端回归、所有权转移、空UDP、首包顺序、加密转发、半关闭及取消。主程序--version成功，file确认为x86-64静态ELF。
 
 本轮验证不包含并行认证改动的联合行为；未测吞吐或总RSS，不宣称性能或内存数值收益。编译期防线不引入运行时借用检查、复制或分配。临时编译探针已删除，独立验证目录在交付前移除；文档和提交仅包含本轮整改。
+
+## 2026-11-08：AGENTS 定向整改——UDP 分帧 EOF 终态
+
+### 失败前证据与状态边界
+
+LengthPrefixedPacketBuffer、VLESS与Trojan的Finish原本只校验当前残留，不记录结束状态；截断报错既不终结输入，也不立即释放残留。新增八项公开行为回归在38239c4基线上全部失败：截断的长度、地址或正文可以在EOF报错后继续补齐并产出数据报；正常EOF后仍接受新输入；真实回环TCP还确认同一分帧器结束后会消费另一条传输的字节。
+
+分帧现在使用active/finished/failed三态。截断EOF立即进入failed并释放待解析字节，Trojan同时释放已解析但尚未交付的目标；普通Feed/Append不能恢复终态。公共长度分帧器仅经显式Reset重新启用，旧Clear入口删除，XUDP现有独立场景迁移为显式重置。正常Finish可重复调用，Pop明确区分Finished与NeedMore，后续读取不再等待或消费底层传输。
+
+VLESS复用公共分帧器的唯一终态，删除外围重复的failed标记；非法packet address与空UDP目标分配失败也进入同一失败出口。Trojan将既有失败清理收敛至私有Fail，清退pending、目标与长度状态。两处分帧Next中没有继续迭代路径的空循环一并删除；不改变线上长度、地址格式、空UDP边界或无进度读取取消恢复契约。
+
+### 验证
+
+在38239c4隔离基线上先构建真实回环回归，八项新增测试全部失败；仅应用本轮修复后，分帧、XUDP、公共缓冲与域名边界定向 **36/36** 通过，四并行全量 **1,182/1,182** 通过，含287项unit与895项真实进程E2E，用时209.65秒。静态主程序--version成功，file确认为x86-64静态ELF。TCP回归验证EOF后新传输仍保有完整线上字节，不用调用计数或mock回声代替消费边界。
+
+另在a379b30基线上独立复现空UDP拥有型Buffer分配失败后仍可跳帧继续的问题：额外一项回归修复前失败，修复后通过。VLESS分帧单测改为复用既有cnode_test_core故障注入变体，不新增生产故障入口或协议私有测试库，也不依赖vector内联容量、分配次数或阈值。
+
+### CI 错误与编译警告
+
+[CI 42440996145](https://github.com/grrhuipp/cnode/actions/runs/42440996145)在a379b30上仅ExpiredChildReturnsQuotaBeforeBlockedSiblingResumes失败，异常为unexpected EOF reading exact socket payload。保留现场确认：准入探针先取得最后一个连接槽，随后新的加密握手HTTP上传连接被MAX_CONNECTIONS拒绝；上传线程保存的EOF到最终join才传播。过期子流仍按时释放配额，正常链路转发字节完整，不能将这个失败归为配额泄漏或增加超时解决。
+
+测试原先以“第一个TCP读取片段的HTTP上传完成”作为准入探针的屏障，错误地把TCP分段当成加密握手阶段。桥接器现在精确收集并提交native 1-RTT固定密钥交换飞行，暂存而不再上传后续padding，确保服务端真正进入加密响应写阶段并保持握手未完成。线面长度由IV、X25519 relay、AEAD长度、ML-KEM-768/X25519公钥及tag组成，不依赖一次recv读满。提交完成经release/acquire发布，再开始争用配额；停车线程由同一互斥锁保护的停止条件唤醒并join。保留16MiB洪泛、三连接上限、8秒握手截止期、截止前旁路准入、截止后配额回收、正常链路完整转发与物理PING全部原有断言；不重试失败上传，不忽略EOF。
+
+同一CI原始构建日志确认inbound_process_errors_test.cpp两处-Wmissing-designated-field-initializers，根因是RateLimitConfig::ip_ban缺少显式成员初始化。在定义处补{}，保持AuthFailureLimitConfig既有缺省语义，不在各调用方复制默认值。相同musl编译器以-Werror=missing-designated-field-initializers通过临时聚合初始化探针，后续联合构建没有编译警告；没有屏蔽或降低诊断级别。
+
+CI失败场景修复后通过真实双进程、ML-KEM/X25519加密和回环对端验证，用时9.09秒；此前a379b30联合快照全量1,215项通过只能说明本地当次时序成立，不能替代上述竞争边界的确定性约束。
+
+最终在a379b30基线上合并本轮分帧整改、编译警告修复和CI协议屏障，cnode、cnode_tests与cnode_traffic_journal构建成功；四并行全量 **1,215/1,215** 通过，含299项unit与916项真实进程E2E，用时207.79秒。主程序--version及静态ELF检查通过。原始CI失败现场保留于build/musl/ci-42440996145；临时探针、补丁、独立验证worktree与构建目录交付前清理。未测吞吐或总RSS，不宣称对应数值收益。

@@ -353,3 +353,68 @@ TEST(TrojanUdpFraming, EmptyDatagramsAreNotEof) {
     io.run();
     result.get();
 }
+
+TEST(TrojanUdpFraming, TruncatedEofCannotResume) {
+    const std::array<uint8_t, 14> wire{
+        1, 127, 0, 0, 1, 0, 53, 0, 3, '\r', '\n', 0x11, 0x22, 0x33};
+    for (size_t cut = 1; cut < wire.size(); ++cut) {
+        SCOPED_TRACE(cut);
+        trojan::UdpFramer framer;
+        framer.Feed(MakeInput(std::span(wire).first(cut)));
+        trojan::FramedUdpPacket packet;
+        ASSERT_FALSE(framer.Next(packet));
+        EXPECT_THROW(framer.Finish(), IoSystemError);
+        EXPECT_THROW(framer.Feed(MakeInput(std::span(wire).subspan(cut))), IoSystemError);
+        EXPECT_THROW((void)framer.Next(packet), IoSystemError);
+        EXPECT_THROW(framer.Finish(), IoSystemError);
+    }
+}
+
+TEST(TrojanUdpFraming, CleanEofRejectsFurtherInput) {
+    const std::array<uint8_t, 12> wire{
+        1, 127, 0, 0, 1, 0, 53, 0, 1, '\r', '\n', 0x73};
+    trojan::UdpFramer framer;
+    framer.Feed(MakeInput(wire));
+    trojan::FramedUdpPacket packet;
+    ASSERT_TRUE(framer.Next(packet));
+    EXPECT_EQ(Flatten(packet.payload), std::vector<uint8_t>({0x73}));
+    framer.Finish();
+    framer.Finish();
+    EXPECT_THROW(framer.Feed({}), IoSystemError);
+    EXPECT_THROW(framer.Feed(MakeInput(wire)), IoSystemError);
+    EXPECT_FALSE(framer.Next(packet));
+    EXPECT_TRUE(packet.payload.empty());
+}
+
+TEST(TrojanUdpFraming, ReadEofDoesNotConsumeAnotherTransport) {
+    const std::array<uint8_t, 12> wire{
+        1, 127, 0, 0, 1, 0, 53, 0, 1, '\r', '\n', 0x73};
+    net::io_context io;
+    tcp::acceptor listener(io, {net::ip::address_v4::loopback(), 0});
+    tcp::socket ended_peer(io);
+    ended_peer.connect(listener.local_endpoint());
+    TcpStream ended(listener.accept());
+    ended_peer.shutdown(tcp::socket::shutdown_send);
+    tcp::socket fresh_peer(io);
+    fresh_peer.connect(listener.local_endpoint());
+    TcpStream fresh(listener.accept());
+    net::write(fresh_peer, net::buffer(wire));
+    fresh_peer.shutdown(tcp::socket::shutdown_send);
+    trojan::UdpFramer framer;
+    auto result = net::co_spawn(io, [&]() -> net::awaitable<void> {
+        Check((co_await trojan::ReadUdpDatagram(ended, framer)).empty(), "clean EOF produced a datagram");
+        Check((co_await trojan::ReadUdpDatagram(fresh, framer)).empty(),
+              "finished Trojan framer consumed another transport");
+        std::vector<uint8_t> retained;
+        for (;;) {
+            auto input = co_await fresh.ReadMultiBuffer();
+            if (input.empty()) break;
+            const auto bytes = Flatten(input);
+            retained.insert(retained.end(), bytes.begin(), bytes.end());
+        }
+        Check(retained == std::vector<uint8_t>(wire.begin(), wire.end()),
+              "finished Trojan framer changed another transport's bytes");
+    }, net::use_future);
+    io.run();
+    result.get();
+}

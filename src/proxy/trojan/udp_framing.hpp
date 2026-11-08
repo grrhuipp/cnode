@@ -24,13 +24,17 @@ class UdpFramer {
 public:
     void Feed(buf::MultiBuffer input);
     [[nodiscard]] bool Next(FramedUdpPacket& out);
-    void Finish() const;
+    void Finish();
+    [[nodiscard]] bool Finished() const noexcept { return state_ == State::Finished; }
 
 private:
+    enum class State : uint8_t { Active, Finished, Failed };
+    void Fail() noexcept;
+
     buf::MultiBuffer pending_;
     std::optional<TargetAddress> target_;
     size_t payload_size_ = 0;
-    bool failed_ = false;
+    State state_ = State::Active;
 };
 
 net::awaitable<buf::MultiBuffer> ReadUdpDatagram(

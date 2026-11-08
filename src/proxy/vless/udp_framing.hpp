@@ -31,7 +31,7 @@ public:
 
     void Feed(buf::MultiBuffer input);
     [[nodiscard]] bool Next(FramedUdpPacket& out);
-    void Finish() const;
+    void Finish();
 
     // Returns one framed datagram whose buffers carry its packet address, or
     // `session_target` without one; an empty datagram owns a tagged zero-length
@@ -43,7 +43,6 @@ public:
 
 private:
     bool packet_addr_ = false;
-    bool failed_ = false;
     buf::LengthPrefixedPacketBuffer pending_;
 };
 

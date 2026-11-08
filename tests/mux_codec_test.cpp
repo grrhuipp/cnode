@@ -126,6 +126,7 @@ TEST(MuxCodec, Contract) {
               xudp_decoder.PendingBytes() == 0,
           "XUDP packet larger than one Buffer was rejected or truncated");
     xudp_decoder.Finish();
+    xudp_decoder.Reset();
     const std::array<uint8_t, 5> empty_then_packet{0, 0, 0, 1, 0x4f};
     buf::MultiBuffer empty_input;
     Check(buf::AppendSpanToMultiBuffer(empty_then_packet, empty_input),
@@ -142,6 +143,7 @@ TEST(MuxCodec, Contract) {
     xudp_decoder.Finish();
     for (const auto& truncated : {std::vector<uint8_t>{0},
                                   std::vector<uint8_t>{0, 2, 0x41}}) {
+        xudp_decoder.Reset();
         buf::MultiBuffer input;
         Check(buf::AppendSpanToMultiBuffer(truncated, input),
               "failed to allocate truncated XUDP fixture");
@@ -156,7 +158,6 @@ TEST(MuxCodec, Contract) {
             rejected = true;
         }
         Check(rejected, "XUDP EOF accepted a partial length or payload");
-        xudp_decoder.Clear();
     }
 
     Check(EncodeNewHeaderTo(

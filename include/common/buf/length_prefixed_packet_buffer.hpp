@@ -66,24 +66,24 @@ inline void AppendPacketStreamInput(MultiBuffer& pending, MultiBuffer input) {
 
 class LengthPrefixedPacketBuffer final {
 public:
-    enum class PopResult : uint8_t { NeedMore, Packet, Invalid };
+    enum class PopResult : uint8_t { NeedMore, Packet, Invalid, Finished };
 
     void Append(MultiBuffer input) {
-        if (failed_) {
-            throw IoSystemError(io_error::invalid_argument, "failed packet stream");
+        if (state_ != State::Active) {
+            throw IoSystemError(io_error::invalid_argument, "inactive packet stream");
         }
         try {
             AppendPacketStreamInput(pending_, std::move(input));
         } catch (...) {
-            failed_ = true;
-            pending_.clear();
+            Fail();
             throw;
         }
     }
 
     [[nodiscard]] PopResult Pop(MultiBuffer& payload) {
         payload.clear();
-        if (failed_) return PopResult::Invalid;
+        if (state_ == State::Failed) return PopResult::Invalid;
+        if (state_ == State::Finished) return PopResult::Finished;
         if (pending_.byte_size() < 2) return PopResult::NeedMore;
         std::array<uint8_t, 2> length{};
         (void)pending_.CopyPrefixTo(length);
@@ -91,29 +91,37 @@ public:
         if (pending_.byte_size() < bytes + 2) return PopResult::NeedMore;
         (void)pending_.DropPrefixBytes(2);
         if (!pending_.MovePrefixTo(payload, bytes)) {
-            failed_ = true;
-            pending_.clear();
+            Fail();
             throw std::bad_alloc();
         }
         pending_.ReleaseIfIdle();
         return PopResult::Packet;
     }
 
-    void Finish() const {
-        if (failed_ || pending_.byte_size() != 0) {
+    void Finish() {
+        if (state_ == State::Failed || pending_.byte_size() != 0) {
+            Fail();
             throw IoSystemError(io_error::invalid_argument, "truncated packet stream");
         }
+        state_ = State::Finished;
     }
 
-    void Clear() noexcept {
+    void Fail() noexcept {
         pending_.clear();
-        failed_ = false;
+        state_ = State::Failed;
     }
+
+    void Reset() noexcept {
+        pending_.clear();
+        state_ = State::Active;
+    }
+    [[nodiscard]] bool Finished() const noexcept { return state_ == State::Finished; }
     [[nodiscard]] size_t PendingBytes() const noexcept { return pending_.byte_size(); }
 
 private:
+    enum class State : uint8_t { Active, Finished, Failed };
     MultiBuffer pending_;
-    bool failed_ = false;
+    State state_ = State::Active;
 };
 
 }  // namespace buf

@@ -3,6 +3,7 @@
 
 #include "udp_framing.hpp"
 #include "common/buf/length_prefixed_packet_buffer.hpp"
+#include "transport/internet/tcp_stream.hpp"
 
 #include <asio/co_spawn.hpp>
 #include <asio/use_future.hpp>
@@ -335,4 +336,95 @@ TEST(VlessUdpFraming, Contract) {
     }, "oversized VLESS datagram accepted");
     Check(rejected_capture.bytes.empty(), "oversized VLESS datagram partially written");
 
+}
+
+TEST(VlessUdpFraming, TruncatedEofCannotResume) {
+    const std::array<uint8_t, 5> wire{0, 3, 0x11, 0x22, 0x33};
+    for (size_t cut = 1; cut < wire.size(); ++cut) {
+        SCOPED_TRACE(cut);
+        vless::UdpFramer framer(false);
+        framer.Feed(MakeInput(std::span(wire).first(cut)));
+        vless::FramedUdpPacket packet;
+        ASSERT_FALSE(framer.Next(packet));
+        EXPECT_THROW(framer.Finish(), IoSystemError);
+        EXPECT_THROW(framer.Feed(MakeInput(std::span(wire).subspan(cut))), IoSystemError);
+        EXPECT_THROW((void)framer.Next(packet), IoSystemError);
+        EXPECT_THROW(framer.Finish(), IoSystemError);
+    }
+}
+
+TEST(VlessUdpFraming, CleanEofRejectsFurtherInput) {
+    const std::array<uint8_t, 3> wire{0, 1, 0x73};
+    vless::UdpFramer framer(false);
+    framer.Feed(MakeInput(wire));
+    vless::FramedUdpPacket packet;
+    ASSERT_TRUE(framer.Next(packet));
+    EXPECT_EQ(Flatten(packet.payload), std::vector<uint8_t>({0x73}));
+    framer.Finish();
+    framer.Finish();
+    EXPECT_THROW(framer.Feed({}), IoSystemError);
+    EXPECT_THROW(framer.Feed(MakeInput(wire)), IoSystemError);
+    EXPECT_FALSE(framer.Next(packet));
+    EXPECT_TRUE(packet.payload.empty());
+}
+
+TEST(VlessUdpFraming, ReadEofDoesNotConsumeAnotherTransport) {
+    const std::array<uint8_t, 3> wire{0, 1, 0x73};
+    const TargetAddress target("127.0.0.1", 53);
+    net::io_context io;
+    tcp::acceptor listener(io, {net::ip::address_v4::loopback(), 0});
+    tcp::socket ended_peer(io);
+    ended_peer.connect(listener.local_endpoint());
+    TcpStream ended(listener.accept());
+    ended_peer.shutdown(tcp::socket::shutdown_send);
+    tcp::socket fresh_peer(io);
+    fresh_peer.connect(listener.local_endpoint());
+    TcpStream fresh(listener.accept());
+    net::write(fresh_peer, net::buffer(wire));
+    fresh_peer.shutdown(tcp::socket::shutdown_send);
+    vless::UdpFramer framer(false);
+    auto result = net::co_spawn(io, [&]() -> net::awaitable<void> {
+        Check((co_await framer.ReadDatagram(ended, target)).empty(), "clean EOF produced a datagram");
+        Check((co_await framer.ReadDatagram(fresh, target)).empty(),
+              "finished VLESS framer consumed another transport");
+        std::vector<uint8_t> retained;
+        for (;;) {
+            auto input = co_await fresh.ReadMultiBuffer();
+            if (input.empty()) break;
+            const auto bytes = Flatten(input);
+            retained.insert(retained.end(), bytes.begin(), bytes.end());
+        }
+        Check(retained == std::vector<uint8_t>(wire.begin(), wire.end()),
+              "finished VLESS framer changed another transport's bytes");
+    }, net::use_future);
+    io.run();
+    result.get();
+}
+
+TEST(VlessUdpFraming, EmptyDatagramAllocationFailureRetiresFramer) {
+    const std::array<uint8_t, 2> empty_wire{0, 0};
+    const std::array<uint8_t, 3> next_wire{0, 1, 0x73};
+    const TargetAddress target("127.0.0.1", 53);
+    vless::UdpFramer framer(false);
+    framer.Feed(MakeInput(empty_wire));
+    FragmentReader source(std::span<const uint8_t>{});
+    ::Run([&]() -> net::awaitable<void> {
+        auto operation = framer.ReadDatagram(source, target);
+        bool failed = false;
+        memory::reject_next_pmr_allocation = true;
+        try {
+            (void)co_await std::move(operation);
+        } catch (const std::bad_alloc&) {
+            failed = true;
+        } catch (...) {
+            memory::reject_next_pmr_allocation = false;
+            throw;
+        }
+        memory::reject_next_pmr_allocation = false;
+        Check(failed, "empty VLESS datagram allocation failure was hidden");
+    });
+    EXPECT_THROW(framer.Feed(MakeInput(next_wire)), IoSystemError);
+    vless::FramedUdpPacket packet;
+    EXPECT_THROW((void)framer.Next(packet), IoSystemError);
+    EXPECT_THROW(framer.Finish(), IoSystemError);
 }
