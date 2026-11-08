@@ -10,9 +10,12 @@
 #include <asio/steady_timer.hpp>
 #include <asio/use_future.hpp>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <future>
+#include <initializer_list>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -551,6 +554,39 @@ void HandoffCompletionWaitsForNativeLease() {
     control_work.reset(); source_work.reset(); target_work.reset();
     control_thread.join(); source_thread.join(); target_thread.join();
 }
+
+// Pump the existing handoff protocol without background threads or sleeps.
+// Only the control reactor waits; worker polls drain finite protocol steps.
+template<class T>
+T AwaitWorkTracking(std::future<T> result, net::io_context& control,
+                    std::initializer_list<net::io_context*> workers) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (result.wait_for(std::chrono::seconds(0)) != std::future_status::ready &&
+           std::chrono::steady_clock::now() < deadline) {
+        for (auto* worker : workers) {
+            worker->restart();
+            worker->poll();
+        }
+        control.restart();
+        control.run_one_for(std::chrono::milliseconds(1));
+    }
+    Require(result.wait_for(std::chrono::seconds(0)) == std::future_status::ready,
+            "work-tracking protocol did not complete within its deadline");
+    return result.get();
+}
+
+void FinalizeWorkTracking(std::shared_ptr<GroupCoordinator>& coordinator,
+                         net::io_context& control,
+                         std::initializer_list<net::io_context*> workers) {
+    coordinator->CloseAdmission();
+    auto shutdown = [&]() -> net::awaitable<void> {
+        co_await coordinator->AsyncJoin();
+        coordinator->ReleaseServices();
+        co_await coordinator->Finalize();
+    };
+    AwaitWorkTracking(net::co_spawn(control, shutdown(), net::use_future), control, workers);
+    coordinator.reset();
+}
 }
 
 TEST(SessionGroupExecutor, Contract) {
@@ -559,4 +595,131 @@ TEST(SessionGroupExecutor, Contract) {
     PassiveHandoffAndExclusiveDetach();
     HandoffCompletionWaitsForNativeLease();
     std::cout << "session_group_executor_test passed\n";
+}
+
+TEST(SessionGroupExecutor, TrackedCopiesKeepWorkUntilOnlyUntrackedExecutorsRemain) {
+    net::io_context control, io;
+    auto coordinator = std::make_shared<GroupCoordinator>(control);
+    coordinator->RegisterWorker(0, io, io.get_executor());
+    std::atomic<unsigned> live{0};
+    auto domain = ExecutionDomain::Create(io, 0, io.get_executor(),
+        std::make_shared<Hooks>(live), coordinator);
+    const std::weak_ptr<ExecutionDomain> retained = domain;
+    std::optional<GroupExecutor> tracked(net::prefer(
+        net::require(GroupExecutor(domain), net::execution::blocking.never),
+        net::execution::outstanding_work.tracked));
+    domain.reset();
+    io.poll();
+    Require(!io.stopped() && !retained.expired(), "tracked executor lost work or domain");
+
+    std::optional<GroupExecutor> copy(*tracked);
+    std::optional<GroupExecutor> untracked(
+        net::prefer(*tracked, net::execution::outstanding_work.untracked));
+    tracked.reset();
+    io.poll();
+    Require(!io.stopped(), "typed tracked copy did not retain reactor work");
+    net::any_io_executor erased(*copy);
+    copy.reset();
+    io.poll();
+    Require(!io.stopped(), "erased tracked executor did not retain reactor work");
+    auto erased_copy = erased;
+    erased = {};
+    io.poll();
+    Require(!io.stopped(), "erased tracked copy did not retain reactor work");
+
+    auto erased_untracked =
+        net::prefer(erased_copy, net::execution::outstanding_work.untracked);
+    erased_copy = {};
+    io.poll();
+    Require(io.stopped(), "untracked conversion retained outstanding reactor work");
+    Require(!retained.expired() && live.load() == 1,
+            "untracked conversion released the domain with the last tracked copy");
+    erased_untracked = {};
+    Require(!retained.expired(), "typed untracked executor did not retain the domain");
+
+    bool delivered = false;
+    bool inside_callback = false;
+    io.restart();
+    net::post(*untracked, [&] {
+        Require(ExecutionDomain::Current() == retained.lock(),
+                "untracked executor lost its retained domain lease");
+        inside_callback = true;
+        untracked->execute([&] {
+            Require(!inside_callback, "work conversion lost blocking.never");
+            delivered = true;
+        });
+        inside_callback = false;
+    });
+    io.poll();
+    Require(delivered && io.stopped(), "untracked executor could not run and release work");
+    untracked.reset();
+    io.restart();
+    io.poll();
+    Require(retained.expired() && live.load() == 0,
+            "last untracked executor retained the domain");
+    FinalizeWorkTracking(coordinator, control, {&io});
+}
+
+TEST(SessionGroupExecutor, TrackedWorkReturnsToSourceReactorAfterPassiveHandoff) {
+    net::io_context control, source, target;
+    auto coordinator = std::make_shared<GroupCoordinator>(control);
+    coordinator->RegisterWorker(0, source, source.get_executor());
+    coordinator->RegisterWorker(1, target, target.get_executor());
+    std::atomic<unsigned> live{0};
+    auto domain = ExecutionDomain::Create(source, 0, source.get_executor(),
+        std::make_shared<Hooks>(live), coordinator);
+    std::optional<GroupExecutor> source_tracked(
+        net::prefer(GroupExecutor(domain), net::execution::outstanding_work.tracked));
+    auto handoff = AwaitWorkTracking(net::co_spawn(control,
+        domain->PreparePassiveHandoff({1, &target, target.get_executor()}),
+        net::use_future), control, {&source, &target});
+    AwaitWorkTracking(net::co_spawn(control, handoff->Commit(), net::use_future),
+                      control, {&source, &target});
+    handoff.reset();
+    Require(&domain->Reactor() == &target && domain->OwnerId() == 1,
+            "work-tracking fixture did not migrate the native reactor");
+
+    // Re-tracking retains source work; untrack then track captures the new owner.
+    std::optional<GroupExecutor> source_copy(
+        net::prefer(*source_tracked, net::execution::outstanding_work.tracked));
+    std::optional<GroupExecutor> untracked(
+        net::prefer(*source_tracked, net::execution::outstanding_work.untracked));
+    std::optional<GroupExecutor> target_tracked(
+        net::prefer(*untracked, net::execution::outstanding_work.tracked));
+    source.restart();
+    source.poll();
+    target.restart();
+    target.poll();
+    Require(!source.stopped() && !target.stopped(),
+            "migration moved or discarded outstanding executor work");
+    source_tracked.reset();
+    source.poll();
+    target.poll();
+    Require(!source.stopped() && !target.stopped(),
+            "re-tracking did not retain the original reactor work");
+    source_copy.reset();
+    source.poll();
+    target.poll();
+    Require(source.stopped(), "migrated tracked executor did not return source work");
+    Require(!target.stopped(), "migrated tracked executor returned work to the target reactor");
+    target_tracked.reset();
+    target.poll();
+    Require(target.stopped(), "untracked migrated executor retained target work");
+
+    // The converted executor remains usable on the new owner after both work
+    // roots are gone; no tracking is allowed to follow it implicitly.
+    bool delivered = false;
+    target.restart();
+    net::post(*untracked, [&] {
+        Require(ExecutionDomain::Current() == domain && &domain->Reactor() == &target,
+                "converted executor did not dispatch on the migrated domain");
+        delivered = true;
+    });
+    target.poll();
+    Require(delivered && target.stopped(), "migrated untracked executor retained work");
+    // Retire both remaining domain roots before joining the coordinator.
+    untracked.reset();
+    domain.reset();
+    FinalizeWorkTracking(coordinator, control, {&source, &target});
+    Require(live.load() == 0, "migrated executor retained its domain after finalization");
 }

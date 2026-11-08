@@ -241,8 +241,8 @@ public:
         return copy;
     }
     GroupExecutor prefer(net::execution::outstanding_work_t::untracked_t) const {
-        auto copy = *this;
-        copy.work_.reset();
+        GroupExecutor copy(domain_);
+        copy.never_inline_ = never_inline_;
         return copy;
     }
     template<class Function> void execute(Function&& function) const {

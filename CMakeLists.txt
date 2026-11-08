@@ -279,8 +279,8 @@ set_property(SOURCE src/app/bootstrap.cpp src/app/bootstrap_cli.cpp
     BUILD_CHANNEL="$<IF:$<CONFIG:Debug>,debug,release>")
 
 add_executable(cnode src/main.cpp)
-# Only the daemon overrides malloc/new. Tests retain their allocation-failure hooks;
-# their explicit mi_* calls still use the same mimalloc API through build_options.
+# The daemon and executor benchmark override malloc/new. Regression tests retain
+# allocation-failure hooks; their explicit mi_* calls still use the same API.
 target_link_libraries(cnode PRIVATE
     "$<LINK_LIBRARY:WHOLE_ARCHIVE,cnode_core,mimalloc-static>")
 
@@ -521,8 +521,12 @@ if(BUILD_BENCHMARKS)
         tests/tcp_receive_benchmark.cpp)
     target_link_libraries(cnode_tcp_receive_benchmark PRIVATE
         cnode_core GTest::gtest_main)
+    add_executable(cnode_executor_benchmark EXCLUDE_FROM_ALL
+        tests/executor_benchmark.cpp)
+    target_link_libraries(cnode_executor_benchmark PRIVATE
+        "$<LINK_LIBRARY:WHOLE_ARCHIVE,cnode_core,mimalloc-static>" GTest::gtest_main)
     foreach(target IN ITEMS cnode_allocator_append_benchmark cnode_tls_throughput_benchmark
-                            cnode_tcp_receive_benchmark)
+                            cnode_tcp_receive_benchmark cnode_executor_benchmark)
         target_compile_options(${target} PRIVATE -UNDEBUG)
         add_dependencies(cnode_benchmarks ${target})
         gtest_discover_tests(${target} DISCOVERY_MODE PRE_TEST
