@@ -320,14 +320,28 @@ CompleteVlessInboundHandshake(
         co_return tl::unexpected(parsed_request.error());
     }
     auto& request = *parsed_request;
+    const auto credential_revision = proxyman::inbound::UserStore::CredentialRevision(
+        proxyman::inbound::UserProtocol::Vless, ctx.inbound.tag);
+    const auto credential = limiter
+        ? std::optional(limiter->FingerprintCredential(
+              ctx.inbound.tag, request.uuid, credential_revision))
+        : std::nullopt;
+    if (credential) {
+        const auto error = co_await proxy::CheckInboundCredential(
+            *limiter, ctx, *credential, proxyman::inbound::UserProtocol::Vless,
+            credential_revision);
+        if (error != ErrorCode::OK) co_return tl::unexpected(error);
+    }
     if (resumed_identity &&
         CRYPTO_memcmp(resumed_identity->data(), request.uuid.data(), request.uuid.size()) != 0) {
-        co_await proxy::RecordInboundAuthFailure(limiter, ctx, "resumed identity mismatch");
+        co_await proxy::RecordInboundAuthFailure(
+            limiter, ctx, "resumed identity mismatch", credential);
         co_return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
     }
     auto user_info = proxyman::inbound::UserStore::FindVlessUser(tag, request.uuid);
     if (!user_info) {
-        co_await proxy::RecordInboundAuthFailure(limiter, ctx, "no matching user");
+        co_await proxy::RecordInboundAuthFailure(
+            limiter, ctx, "no matching user", credential);
         co_return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
     }
     Network net = Network::TCP;

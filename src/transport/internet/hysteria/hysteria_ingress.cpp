@@ -1192,6 +1192,12 @@ void Connection::Refuse() noexcept {
 
 net::awaitable<Connection::AdmitResult> Connection::AdmitConnection(
     std::string_view credential) {
+    auto auth_hash = HashCredential(credential);
+    struct CleanseAuthHash {
+        std::array<uint8_t, 32>& hash;
+        ~CleanseAuthHash() noexcept { OPENSSL_cleanse(hash.data(), hash.size()); }
+    } cleanse_auth_hash{auth_hash};
+    auto* limiter = listener_->environment.limiter.get();
     while (physical_ == PhysicalAdmission::Pending && !closed_) {
         auto [error] = co_await physical_ready_.async_receive(
             net::as_tuple(net::use_awaitable));
@@ -1199,12 +1205,28 @@ net::awaitable<Connection::AdmitResult> Connection::AdmitConnection(
     }
     if (closed_ || physical_ != PhysicalAdmission::Admitted)
         co_return AdmitResult::Limited;
+    const auto credential_revision = proxyman::inbound::UserStore::CredentialRevision(
+        proxyman::inbound::UserProtocol::Hysteria, base_context_.inbound.tag);
+    const auto failure_key = limiter
+        ? std::optional(limiter->FingerprintCredential(
+              base_context_.inbound.tag, auth_hash, credential_revision))
+        : std::nullopt;
+    if (failure_key) {
+        const auto error = co_await proxy::CheckInboundCredential(
+            *limiter, base_context_, *failure_key,
+            proxyman::inbound::UserProtocol::Hysteria, credential_revision);
+        if (error != ErrorCode::OK) {
+            capabilities_->Stats().OnError();
+            co_return AdmitResult::Limited;
+        }
+    }
+    if (closed_) co_return AdmitResult::Limited;
     const auto& receiver = listener_->Receiver();
     auto user = proxyman::inbound::UserStore::FindHysteriaUser(
-        receiver.inbound_tag, HashCredential(credential));
+        receiver.inbound_tag, auth_hash);
     if (!user) {
         co_await proxy::RecordInboundAuthFailure(
-            listener_->environment.limiter.get(), base_context_, "no matching credential");
+            limiter, base_context_, "no matching credential", failure_key);
         capabilities_->Stats().OnError();
         co_return AdmitResult::AuthFailed;
     }

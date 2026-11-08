@@ -573,6 +573,7 @@ void Worker::RuntimeState::Start(Worker& worker) {
         connection_limiter = ConnectionLimiter::Acquire(RateLimitConfig{
             .max_connections = config->limits.max_connections,
             .max_conn_per_ip = config->limits.max_connections_per_ip,
+            .ip_ban = config->limits.ip_ban,
         }, worker.group_coordinator_);
     }
     if (!request_load) {

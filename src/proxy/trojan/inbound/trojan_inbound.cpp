@@ -140,12 +140,30 @@ ParseTrojanRequest(AsyncStream& stream,
     }
 
     auto& request = decoded.request;
+    struct CleansePasswordHash {
+        ::trojan::PasswordHash& hash;
+        ~CleansePasswordHash() noexcept { OPENSSL_cleanse(hash.data(), hash.size()); }
+    } cleanse_password_hash{request.password_hash};
+    const auto credential_revision = proxyman::inbound::UserStore::CredentialRevision(
+        proxyman::inbound::UserProtocol::Trojan, ctx.inbound.tag);
+    const auto credential = limiter
+        ? std::optional(limiter->FingerprintCredential(
+              ctx.inbound.tag,
+              {reinterpret_cast<const uint8_t*>(request.password_hash.data()),
+               request.password_hash.size()}, credential_revision))
+        : std::nullopt;
+    OPENSSL_cleanse(handshake_buf.data(), handshake_buf.size());
+    if (credential) {
+        const auto error = co_await proxy::CheckInboundCredential(
+            *limiter, ctx, *credential, proxyman::inbound::UserProtocol::Trojan,
+            credential_revision);
+        if (error != ErrorCode::OK) co_return tl::unexpected(error);
+    }
     auto user_info = proxyman::inbound::UserStore::FindTrojanUser(
         tag, request.PasswordHashView());
-    OPENSSL_cleanse(handshake_buf.data(), handshake_buf.size());
-    OPENSSL_cleanse(request.password_hash.data(), request.password_hash.size());
     if (!user_info) {
-        co_await proxy::RecordInboundAuthFailure(limiter, ctx, "no matching credential");
+        co_await proxy::RecordInboundAuthFailure(
+            limiter, ctx, "no matching credential", credential);
         co_return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
     }
 

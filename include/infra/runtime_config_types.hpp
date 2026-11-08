@@ -1,5 +1,6 @@
 #pragma once
 
+#include "common/auth_failure_limit.hpp"
 #include "common/defaults.hpp"
 #include "features/routing/router.hpp"
 #include "infra/json.hpp"
@@ -19,6 +20,7 @@
 struct LimitsConfig {
     uint32_t max_connections = defaults::kMaxConnections;
     uint32_t max_connections_per_ip = defaults::kMaxConnectionsPerIP;
+    AuthFailureLimitConfig ip_ban;
 
     static LimitsConfig FromJson(const json::object& j);
 };

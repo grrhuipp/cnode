@@ -7,6 +7,14 @@
     "enable": false
   },
   "workers": 0,
+  "limits": {
+    "ipBan": {
+      "enabled": false,
+      "failureLimit": 10,
+      "windowSeconds": 60,
+      "banSeconds": 180
+    }
+  },
   "dns": {
     "servers": ["8.8.8.8", "1.1.1.1:53"],
     "timeout": 5,

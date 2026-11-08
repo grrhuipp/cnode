@@ -492,6 +492,25 @@ LimitsConfig LimitsConfig::FromJson(const json::object& j) {
     LimitsConfig cfg;
     cfg.max_connections = JsonUint32Or(j, "maxConnections", cfg.max_connections);
     cfg.max_connections_per_ip = JsonUint32Or(j, "maxConnectionsPerIP", cfg.max_connections_per_ip);
+    if (j.contains("credentialBan")) {
+        throw std::invalid_argument(
+            "limits.credentialBan is not configurable; credential failure limiting is always enabled");
+    }
+    if (const auto* ip_ban = OptionalJsonObject(j, "ipBan")) {
+        cfg.ip_ban.enabled = JsonBoolOr(*ip_ban, "enabled", cfg.ip_ban.enabled);
+        cfg.ip_ban.failure_limit =
+            JsonUint32Or(*ip_ban, "failureLimit", cfg.ip_ban.failure_limit);
+        cfg.ip_ban.window_seconds =
+            JsonUint32Or(*ip_ban, "windowSeconds", cfg.ip_ban.window_seconds);
+        cfg.ip_ban.ban_seconds =
+            JsonUint32Or(*ip_ban, "banSeconds", cfg.ip_ban.ban_seconds);
+        if (cfg.ip_ban.failure_limit == 0 ||
+            cfg.ip_ban.window_seconds == 0 ||
+            cfg.ip_ban.ban_seconds == 0) {
+            throw std::invalid_argument(
+                "limits.ipBan failureLimit, windowSeconds and banSeconds must be greater than zero");
+        }
+    }
     return cfg;
 }
 

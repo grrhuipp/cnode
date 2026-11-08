@@ -825,10 +825,23 @@ AuthenticateSession(
     if (auto ok = co_await ReadAuth(stream, auth_hash); !ok) {
         co_return tl::unexpected(ok.error());
     }
+    const auto credential_revision = proxyman::inbound::UserStore::CredentialRevision(
+        proxyman::inbound::UserProtocol::AnyTls, ctx.inbound.tag);
+    const auto credential = limiter
+        ? std::optional(limiter->FingerprintCredential(
+              ctx.inbound.tag, auth_hash, credential_revision))
+        : std::nullopt;
+    if (credential) {
+        const auto error = co_await proxy::CheckInboundCredential(
+            *limiter, ctx, *credential, proxyman::inbound::UserProtocol::AnyTls,
+            credential_revision);
+        if (error != ErrorCode::OK) co_return tl::unexpected(error);
+    }
     auto user = proxyman::inbound::UserStore::FindAnyTlsUser(ctx.inbound.tag, auth_hash);
     OPENSSL_cleanse(auth_hash.data(), auth_hash.size());
     if (!user) {
-        co_await proxy::RecordInboundAuthFailure(limiter, ctx, "no matching credential");
+        co_await proxy::RecordInboundAuthFailure(
+            limiter, ctx, "no matching credential", credential);
         co_return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
     }
     auto control_idle_timeout = timeouts.IdleTimeout();

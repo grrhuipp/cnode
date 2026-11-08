@@ -1,6 +1,6 @@
 #pragma once
 #include "app/rate_limiter_fwd.hpp"
-#include "common/allocator.hpp"
+#include "common/auth_failure_limit.hpp"
 #include "app/session_group_executor.hpp"
 // ============================================================================
 // Process-wide connection/admission control. Session domains share this bounded
@@ -10,270 +10,331 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <string_view>
 #include <utility>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <span>
+#include <stdexcept>
 #include <string>
-#include "infra/log.hpp"
+#include <openssl/crypto.h>
+#include <openssl/rand.h>
+#include <openssl/sha.h>
 
+using AuthCredentialKey = std::array<uint8_t, 32>;
 
-// ============================================================================
-// 配置
-// ============================================================================
+namespace auth_limit_detail {
+// OpenSSL 的低层 SHA256 上下文可在栈上复制；EVP 每次构造上下文会分配内存。
+class Fingerprint {
+public:
+    explicit Fingerprint(bool credential) {
+        SHA256_Init(&initial_);
+        constexpr std::string_view credential_namespace = "cnode/auth-credential";
+        constexpr std::string_view ip_namespace = "cnode/auth-ip";
+        const auto domain = credential ? credential_namespace : ip_namespace;
+        SHA256_Update(&initial_, domain.data(), domain.size());
+        if (credential) {
+            std::array<uint8_t, 32> salt;
+            if (RAND_bytes(salt.data(), static_cast<int>(salt.size())) != 1) {
+                throw std::runtime_error("authentication fingerprint randomness failed");
+            }
+            SHA256_Update(&initial_, salt.data(), salt.size());
+            OPENSSL_cleanse(salt.data(), salt.size());
+        }
+    }
+    ~Fingerprint() noexcept { OPENSSL_cleanse(&initial_, sizeof(initial_)); }
+
+    [[nodiscard]] AuthCredentialKey Hash(
+        std::string_view tag, std::span<const uint8_t> credential,
+        uint64_t credential_revision) const noexcept {
+        auto context = initial_;
+        std::array<uint8_t, 8> revision{};
+        for (auto& byte : revision) {
+            byte = static_cast<uint8_t>(credential_revision);
+            credential_revision >>= 8;
+        }
+        SHA256_Update(&context, revision.data(), revision.size());
+        std::array<uint8_t, 8> length{};
+        uint64_t remaining = tag.size();
+        for (auto& byte : length) {
+            byte = static_cast<uint8_t>(remaining);
+            remaining >>= 8;
+        }
+        SHA256_Update(&context, length.data(), length.size());
+        if (!tag.empty()) SHA256_Update(&context, tag.data(), tag.size());
+        if (!credential.empty())
+            SHA256_Update(&context, credential.data(), credential.size());
+        AuthCredentialKey result;
+        SHA256_Final(result.data(), &context);
+        OPENSSL_cleanse(&context, sizeof(context));
+        return result;
+    }
+private:
+    SHA256_CTX initial_;
+};
+} // namespace auth_limit_detail
+
 struct RateLimitConfig {
-    uint32_t max_connections = 0;      // 全局最大连接数 (0=不限制)
-    uint32_t max_conn_per_ip = 0;      // 单 IP 最大并发连接 (0=不限制)
-    uint32_t auth_fail_limit = 10;     // 认证失败阈值 (屏蔽源 IP)
-    uint32_t auth_fail_window = 60;    // 认证失败计数窗口（秒），超过此时间重置计数
-    uint32_t auth_ban_seconds = 180;   // 认证失败屏蔽秒数
+    uint32_t max_connections = 0; // 全局最大连接数 (0=不限制)
+    uint32_t max_conn_per_ip = 0; // 单 IP 最大并发连接 (0=不限制)
+    AuthFailureLimitConfig ip_ban;
 };
 
-// ============================================================================
-// Sans-I/O bounded model, accessed only by its owning control executor.
-// Production requests use ConnectionLimiter below, never this model directly.
+// Sans-I/O bounded model; mutable state belongs exclusively to the coordinator.
 class ConnectionLimiterCore {
-    static constexpr size_t kSlotCount = 16384;
-    static_assert((kSlotCount & (kSlotCount - 1)) == 0,
-                  "kSlotCount must be power of 2");
-    static constexpr size_t kMask = kSlotCount - 1;
-    static constexpr size_t kProbe = 32;
-
-    struct Slot {
-        uint64_t hash = 0;        // IP 或 tag:IP 哈希 (0=空槽)
-        uint32_t conns = 0;       // 当前连接数
-        uint32_t auth_fails = 0;  // 认证失败计数
-        uint32_t auth_ts = 0;     // 最后认证失败时间
-        uint32_t ban_until = 0;   // 屏蔽解除时间
-
-        [[nodiscard]] bool Match(uint64_t h) const noexcept { return hash == h; }
-        [[nodiscard]] bool Empty() const noexcept { return hash == 0; }
-        [[nodiscard]] bool Idle(uint32_t now, uint32_t auth_fail_window) const noexcept {
-            return conns == 0 && ban_until <= now &&
-                   (auth_fails == 0 || now - auth_ts > auth_fail_window);
-        }
-        void Reset(uint64_t h) noexcept {
-            hash = h;
-            conns = 0;
-            auth_fails = 0;
-            auth_ts = 0;
-            ban_until = 0;
-        }
-    };
-    static_assert(sizeof(Slot) == 24, "Slot must remain compact (24 bytes)");
 public:
-    // 单 IP 连接槽位键（FNV-1a，0 保留为空槽）。
-    [[nodiscard]] static constexpr uint64_t IpHash(std::string_view ip) noexcept {
-        return NonZero(Fnv1a(kFnvOffset, ip));
-    }
+    static constexpr size_t kSlotCount = 16384;
+    static constexpr size_t kProbe = 32;
+    static constexpr AuthFailureLimitConfig kCredentialBan{
+        .enabled = true, .failure_limit = 10, .window_seconds = 60, .ban_seconds = 180};
 
     enum class RejectReason : uint8_t {
         NONE = 0,
         MAX_CONNECTIONS,
         MAX_CONNECTIONS_PER_IP,
         IP_BANNED,
+        CREDENTIAL_BANNED,
         TRACKING_CAPACITY,
     };
 
-    [[nodiscard]] static const char* RejectReasonToString(
-        RejectReason r) noexcept {
-        static constexpr const char* kNames[] = {
+    [[nodiscard]] static const char* RejectReasonToString(RejectReason r) noexcept {
+        static constexpr const char* names[] = {
             "not rejected (NONE)",
             "total connection limit exceeded (MAX_CONNECTIONS)",
             "per-IP connection limit exceeded (MAX_CONNECTIONS_PER_IP)",
             "IP banned (IP_BANNED)",
-            "IP tracking capacity exhausted (TRACKING_CAPACITY)"};
-        return kNames[static_cast<size_t>(r)];
+            "credential banned (CREDENTIAL_BANNED)",
+            "admission tracking capacity exhausted (TRACKING_CAPACITY)"};
+        return names[static_cast<size_t>(r)];
     }
 
-    explicit ConnectionLimiterCore(const RateLimitConfig& cfg) noexcept
-        : cfg_(cfg) {}
+    [[nodiscard]] static uint64_t NowSeconds() noexcept {
+        using namespace std::chrono;
+        return static_cast<uint64_t>(
+            duration_cast<seconds>(steady_clock::now().time_since_epoch()).count());
+    }
+
+    explicit ConnectionLimiterCore(const RateLimitConfig& cfg)
+        : cfg_(cfg),
+          connections_(cfg.max_conn_per_ip ? std::make_unique<ConnectionSlots>() : nullptr),
+          ip_failures_(cfg.ip_ban.enabled ? std::make_unique<FailureTable>() : nullptr),
+          ip_fingerprint_(cfg.ip_ban.enabled
+              ? std::optional<auth_limit_detail::Fingerprint>(std::in_place, false)
+              : std::nullopt),
+          credential_failures_(std::make_unique<FailureTable>()) {}
+
     [[nodiscard]] bool TracksGlobalConnections() const noexcept {
         return cfg_.max_connections > 0;
     }
-
     [[nodiscard]] bool TracksIpConnections() const noexcept {
         return cfg_.max_conn_per_ip > 0;
     }
+    [[nodiscard]] bool TracksAuthBan() const noexcept { return cfg_.ip_ban.enabled; }
 
-    [[nodiscard]] bool TracksAuthBan() const noexcept {
-        return cfg_.auth_fail_limit > 0;
+    // 原连接配额表仍为 16384 槽、最多 32 次探测，与两张失败表完全独立。
+    [[nodiscard]] static constexpr uint64_t IpHash(std::string_view ip) noexcept {
+        const auto hash = Fnv1a(kFnvOffset, ip);
+        return hash == 0 ? 1 : hash;
     }
 
-
     [[nodiscard]] RejectReason TryAcceptGlobal() noexcept {
-        if (cfg_.max_connections == 0) {
-            return RejectReason::NONE;
-        }
-        if (total_ >= cfg_.max_connections) {
-            return RejectReason::MAX_CONNECTIONS;
-        }
+        if (!TracksGlobalConnections()) return RejectReason::NONE;
+        if (total_ >= cfg_.max_connections) return RejectReason::MAX_CONNECTIONS;
         ++total_;
         return RejectReason::NONE;
     }
 
+    [[nodiscard]] RejectReason CheckIPBan(
+        std::string_view tag, std::string_view ip, uint64_t now = NowSeconds()) const noexcept {
+        if (!TracksAuthBan() || ip.empty()) return RejectReason::NONE;
+        return ip_failures_->Check(IpBanKey(tag, ip), cfg_.ip_ban, now,
+                                   RejectReason::IP_BANNED);
+    }
+
     [[nodiscard]] RejectReason TryAcceptIP(
-        std::string_view tag,
-        std::string_view ip,
-        bool check_auth_ban = true) noexcept {
-        const uint32_t now = NowSeconds();
-        if (check_auth_ban && cfg_.auth_fail_limit > 0) {
-            const uint64_t ban_h = BanHash(tag, ip);
-            if (const Slot* ban_s = Find(ban_h)) {
-                if (ban_s->ban_until > now) {
-                    return RejectReason::IP_BANNED;
-                }
-            }
+        std::string_view tag, std::string_view ip, bool check_auth_ban = true,
+        uint64_t now = NowSeconds()) noexcept {
+        if (check_auth_ban && TracksAuthBan()) {
+            const auto reason = CheckIPBan(tag, ip, now);
+            if (reason != RejectReason::NONE) return reason;
         }
-
-        if (cfg_.max_conn_per_ip == 0) {
-            return RejectReason::NONE;
-        }
-
-        const uint64_t h = IpHash(ip);
-        Slot* s = FindOrCreate(h, now);
-        if (!s) {
-            return RejectReason::TRACKING_CAPACITY;
-        }
-        if (s->conns >= cfg_.max_conn_per_ip) {
+        if (!TracksIpConnections()) return RejectReason::NONE;
+        auto* slot = FindOrCreateConnection(IpHash(ip));
+        if (!slot) return RejectReason::TRACKING_CAPACITY;
+        if (slot->conns >= cfg_.max_conn_per_ip)
             return RejectReason::MAX_CONNECTIONS_PER_IP;
-        }
-        ++s->conns;
+        ++slot->conns;
         return RejectReason::NONE;
     }
 
     void ReleaseGlobal() noexcept {
-        if (cfg_.max_connections > 0 && total_ > 0) {
-            --total_;
-        }
+        if (TracksGlobalConnections() && total_ > 0) --total_;
     }
-
-    // IP reservations are independent of physical/logical global ownership.
-    void ReleaseHash(uint64_t ip_hash) noexcept {
-        if (cfg_.max_conn_per_ip > 0 && ip_hash != 0) {
-            if (Slot* s = Find(ip_hash)) {
-                if (s->conns > 0) {
-                    --s->conns;
-                }
+    void ReleaseHash(uint64_t hash) noexcept {
+        if (!TracksIpConnections() || hash == 0) return;
+        const size_t index = hash & kMask;
+        for (size_t i = 0; i < kProbe; ++i) {
+            auto& slot = (*connections_)[(index + i) & kMask];
+            if (slot.hash == hash) {
+                if (slot.conns) --slot.conns;
+                return;
             }
+            if (slot.hash == 0) return;
         }
     }
 
-    void OnAuthFailTracked(std::string_view tag, std::string_view ip) noexcept {
-        if (cfg_.auth_fail_limit == 0) return;
-
-        const uint64_t h = BanHash(tag, ip);
-        const uint32_t now = NowSeconds();
-        Slot* s = FindOrCreate(h, now);
-        if (!s || s->ban_until > now) return;
-
-        const uint32_t last = s->auth_ts;
-        if (last > 0 && now - last > cfg_.auth_fail_window) {
-            s->auth_fails = 0;
-        }
-        s->auth_ts = now;
-
-        const uint32_t cnt = ++s->auth_fails;
-        if (cnt >= cfg_.auth_fail_limit) {
-            s->ban_until = now > std::numeric_limits<uint32_t>::max() - cfg_.auth_ban_seconds
-                ? std::numeric_limits<uint32_t>::max()
-                : now + cfg_.auth_ban_seconds;
-            LOG_NET_WARN("IP banned inbound={} source={} duration={}s authentication_failures={}",
-                         tag, ip, cfg_.auth_ban_seconds, cnt);
-            s->auth_fails = 0;
-        }
+    void OnAuthFailTracked(
+        std::string_view tag, std::string_view ip,
+        std::optional<AuthCredentialKey> credential = std::nullopt,
+        uint64_t now = NowSeconds()) noexcept {
+        if (TracksAuthBan() && !ip.empty())
+            ip_failures_->Record(IpBanKey(tag, ip), cfg_.ip_ban, now);
+        if (credential)
+            credential_failures_->Record(*credential, kCredentialBan, now);
     }
 
     [[nodiscard]] bool IsBanned(
-        std::string_view tag, std::string_view ip) const noexcept {
-        if (cfg_.auth_fail_limit == 0) return false;
-        const uint64_t h = BanHash(tag, ip);
-        const uint32_t now = NowSeconds();
-        if (const Slot* s = Find(h)) {
-            return s->ban_until > now;
-        }
-        return false;
+        std::string_view tag, std::string_view ip, uint64_t now = NowSeconds()) const noexcept {
+        return CheckIPBan(tag, ip, now) == RejectReason::IP_BANNED;
+    }
+    [[nodiscard]] RejectReason CheckCredential(
+        const AuthCredentialKey& credential, uint64_t now = NowSeconds()) const noexcept {
+        return credential_failures_->Check(
+            credential, kCredentialBan, now, RejectReason::CREDENTIAL_BANNED);
     }
 
 private:
+    static constexpr size_t kMask = kSlotCount - 1;
+    static_assert((kSlotCount & kMask) == 0);
     static constexpr uint64_t kFnvOffset = 14695981039346656037ULL;
     static constexpr uint64_t kFnvPrime = 1099511628211ULL;
 
     [[nodiscard]] static constexpr uint64_t Fnv1a(
-        uint64_t h, std::string_view bytes) noexcept {
-        for (const char ch : bytes) {
-            h ^= static_cast<uint8_t>(ch);
-            h *= kFnvPrime;
+        uint64_t hash, std::string_view bytes) noexcept {
+        for (const char byte : bytes) {
+            hash ^= static_cast<uint8_t>(byte);
+            hash *= kFnvPrime;
         }
-        return h;
+        return hash;
     }
 
-    [[nodiscard]] static constexpr uint64_t NonZero(uint64_t h) noexcept {
-        return h == 0 ? 1ULL : h;
-    }
+    struct ConnectionSlot {
+        uint64_t hash = 0;
+        uint32_t conns = 0;
+    };
+    using ConnectionSlots = std::array<ConnectionSlot, kSlotCount>;
 
-    // 认证屏蔽键与单 IP 连接键共用槽表：标签长度前缀使 (tag, ip) 编码单射，
-    // 且其输入以 NUL 字节开头的长度编码，不会与纯文本 IP 键的输入流重合。
-    [[nodiscard]] static constexpr uint64_t BanHash(
-        std::string_view tag, std::string_view ip) noexcept {
-        uint64_t h = kFnvOffset;
-        uint64_t length = tag.size();
-        for (size_t i = 0; i < sizeof(length); ++i, length >>= 8) {
-            h ^= length & 0xFF;
-            h *= kFnvPrime;
+    struct FailureCounter {
+        uint64_t window_start = 0;
+        uint64_t ban_until = 0;
+        uint32_t failures = 0;
+
+        [[nodiscard]] bool Banned(uint64_t now) const noexcept { return now < ban_until; }
+        [[nodiscard]] bool Expired(
+            const AuthFailureLimitConfig& config, uint64_t now) const noexcept {
+            return !Banned(now) &&
+                (failures == 0 || now - window_start >= config.window_seconds);
         }
-        return NonZero(Fnv1a(Fnv1a(h, tag), ip));
-    }
-
-    [[nodiscard]] static uint32_t NowSeconds() noexcept {
-        using namespace std::chrono;
-        return static_cast<uint32_t>(
-            duration_cast<seconds>(steady_clock::now().time_since_epoch()).count());
-    }
-
-    [[nodiscard]] Slot* Find(uint64_t h) noexcept {
-        return const_cast<Slot*>(std::as_const(*this).Find(h));
-    }
-
-    [[nodiscard]] const Slot* Find(uint64_t h) const noexcept {
-        const size_t idx = h & kMask;
-        for (size_t i = 0; i < kProbe; ++i) {
-            const Slot& s = slots_[(idx + i) & kMask];
-            if (s.Match(h)) return &s;
-            if (s.Empty()) return nullptr;
+        void Record(const AuthFailureLimitConfig& config, uint64_t now) noexcept {
+            if (Banned(now)) return; // 拒绝期内既不计数，也不续封。
+            if (failures == 0 || now - window_start >= config.window_seconds) {
+                failures = 0;
+                window_start = now;
+            }
+            if (++failures >= config.failure_limit) {
+                ban_until = now > std::numeric_limits<uint64_t>::max() - config.ban_seconds
+                    ? std::numeric_limits<uint64_t>::max() : now + config.ban_seconds;
+                failures = 0;
+            }
         }
-        return nullptr;
-    }
+    };
 
-    [[nodiscard]] Slot* FindOrCreate(uint64_t h, uint32_t now) noexcept {
-        const size_t idx = h & kMask;
-        Slot* idle = nullptr;
-        for (size_t i = 0; i < kProbe; ++i) {
-            Slot& s = slots_[(idx + i) & kMask];
-            if (s.Match(h)) return &s;
-            if (s.Empty()) {
-                if (idle) {
-                    idle->Reset(h);
-                    return idle;
+    // 两个真实消费者共用固定窗口算法。每表上限 16384 个键，每次最多探测 32 槽；
+    // 只在失败时插入，查询不插入。过期槽惰性复用，无扫描、锁或额外容器。
+    // 探测范围没有可用槽时，未知键查询返回 TRACKING_CAPACITY（fail closed）。
+    class FailureTable {
+        struct Slot {
+            AuthCredentialKey key{};
+            FailureCounter counter;
+            bool occupied = false;
+        };
+        [[nodiscard]] static size_t Index(const AuthCredentialKey& key) noexcept {
+            uint64_t hash;
+            std::memcpy(&hash, key.data(), sizeof(hash));
+            return hash & kMask;
+        }
+    public:
+        [[nodiscard]] RejectReason Check(
+            const AuthCredentialKey& key, const AuthFailureLimitConfig& config,
+            uint64_t now, RejectReason banned) const noexcept {
+            const size_t index = Index(key);
+            bool available = false;
+            for (size_t i = 0; i < kProbe; ++i) {
+                const auto& slot = slots_[(index + i) & kMask];
+                if (!slot.occupied) return RejectReason::NONE;
+                if (slot.key == key)
+                    return slot.counter.Banned(now) ? banned : RejectReason::NONE;
+                available |= slot.counter.Expired(config, now);
+            }
+            return available ? RejectReason::NONE : RejectReason::TRACKING_CAPACITY;
+        }
+        void Record(const AuthCredentialKey& key, const AuthFailureLimitConfig& config,
+                    uint64_t now) noexcept {
+            const size_t index = Index(key);
+            Slot* reusable = nullptr;
+            for (size_t i = 0; i < kProbe; ++i) {
+                auto& slot = slots_[(index + i) & kMask];
+                if (slot.occupied && slot.key == key) {
+                    slot.counter.Record(config, now);
+                    return;
                 }
-                s.Reset(h);
-                return &s;
+                if (!slot.occupied) {
+                    if (!reusable) reusable = &slot;
+                    break;
+                }
+                if (!reusable && slot.counter.Expired(config, now)) reusable = &slot;
             }
-            if (!idle && s.Idle(now, cfg_.auth_fail_window)) {
-                idle = &s;
+            if (!reusable) return; // 后续准入查询将报告容量不足，而不是无保护放行。
+            reusable->key = key;
+            reusable->counter = {};
+            reusable->occupied = true;
+            reusable->counter.Record(config, now);
+        }
+    private:
+        std::array<Slot, kSlotCount> slots_{};
+    };
+
+    [[nodiscard]] AuthCredentialKey IpBanKey(
+        std::string_view tag, std::string_view ip) const noexcept {
+        return ip_fingerprint_->Hash(tag, std::span(
+            reinterpret_cast<const uint8_t*>(ip.data()), ip.size()), 0);
+    }
+    [[nodiscard]] ConnectionSlot* FindOrCreateConnection(uint64_t hash) noexcept {
+        const size_t index = hash & kMask;
+        ConnectionSlot* idle = nullptr;
+        for (size_t i = 0; i < kProbe; ++i) {
+            auto& slot = (*connections_)[(index + i) & kMask];
+            if (slot.hash == hash) return &slot;
+            if (slot.hash == 0) {
+                auto* selected = idle ? idle : &slot;
+                *selected = {hash, 0};
+                return selected;
             }
+            if (!idle && slot.conns == 0) idle = &slot;
         }
-        if (idle) {
-            idle->Reset(h);
-            return idle;
-        }
-        return nullptr;
+        if (idle) *idle = {hash, 0};
+        return idle;
     }
 
-    RateLimitConfig cfg_;
+    const RateLimitConfig cfg_;
     uint32_t total_ = 0;
-    std::array<Slot, kSlotCount> slots_{};
+    std::unique_ptr<ConnectionSlots> connections_;
+    std::unique_ptr<FailureTable> ip_failures_;
+    const std::optional<auth_limit_detail::Fingerprint> ip_fingerprint_;
+    std::unique_ptr<FailureTable> credential_failures_;
 };
 
 // Lease shared by one physical connection and its logical children; carried in
@@ -356,6 +417,7 @@ public:
     net::awaitable<Admission> ReservePhysical(
         std::string_view tag = {}, std::string_view ip = {},
         bool check_ban = false) {
+        check_ban = check_ban && TracksAuthBan() && !ip.empty();
         auto node = std::make_unique<Return>();
         node->owner = shared_from_this();
         node->family = std::make_shared<Family>();
@@ -367,8 +429,10 @@ public:
              ip = std::string(check_ban ? ip : std::string_view{}),
              check_ban]() mutable {
                 auto& node = *reservation.node_;
-                if (check_ban && node.owner->core_.IsBanned(tag, ip)) {
-                    return Admission{RejectReason::IP_BANNED, std::move(reservation)};
+                if (check_ban) {
+                    const auto reason = node.owner->core_.CheckIPBan(tag, ip);
+                    if (reason != RejectReason::NONE)
+                        return Admission{reason, std::move(reservation)};
                 }
                 const auto reason = node.owner->core_.TryAcceptGlobal();
                 node.admitted = reason == RejectReason::NONE;
@@ -384,16 +448,36 @@ public:
         std::string_view tag, std::string_view ip, bool check_ban) {
         return Reserve(std::move(family), tag, ip, check_ban);
     }
+    [[nodiscard]] bool TracksAuthBan() const noexcept { return core_.TracksAuthBan(); }
+    [[nodiscard]] AuthCredentialKey FingerprintCredential(
+        std::string_view tag, std::span<const uint8_t> credential,
+        uint64_t credential_revision) const noexcept {
+        return credential_fingerprint_.Hash(tag, credential, credential_revision);
+    }
+    net::awaitable<RejectReason> CheckCredential(AuthCredentialKey credential) {
+        return coordinator_->PostCall(
+            [self = shared_from_this(), credential] {
+                return self->core_.CheckCredential(credential);
+            });
+    }
     net::awaitable<bool> IsBanned(std::string_view tag, std::string_view ip) {
+        if (!TracksAuthBan() || ip.empty())
+            return []() -> net::awaitable<bool> { co_return false; }();
         return coordinator_->PostCall([self = shared_from_this(),
             tag = std::string(tag), ip = std::string(ip)] {
             return self->core_.IsBanned(tag, ip);
         });
     }
-    net::awaitable<void> OnAuthFailTracked(std::string_view tag, std::string_view ip) {
+    net::awaitable<void> OnAuthFailTracked(
+        std::string_view tag, std::string_view ip,
+        std::optional<AuthCredentialKey> credential = std::nullopt) {
+        const bool track_ip = TracksAuthBan() && !ip.empty();
+        if (!track_ip && !credential)
+            return []() -> net::awaitable<void> { co_return; }();
         return coordinator_->PostCall([self = shared_from_this(),
-            tag = std::string(tag), ip = std::string(ip)] {
-            self->core_.OnAuthFailTracked(tag, ip);
+            tag = std::string(track_ip ? tag : std::string_view{}),
+            ip = std::string(track_ip ? ip : std::string_view{}), credential] {
+            self->core_.OnAuthFailTracked(tag, ip, credential);
         });
     }
     // The control coordinator that also owns session-level device admission
@@ -426,18 +510,19 @@ private:
         std::weak_ptr<ConnectionLimiter> published_;
     };
     ConnectionLimiter(const RateLimitConfig& config, std::shared_ptr<GroupCoordinator> coordinator)
-        : core_(config), coordinator_(std::move(coordinator)) {
+        : core_(config), credential_fingerprint_(true), coordinator_(std::move(coordinator)) {
         if (!coordinator_) throw std::invalid_argument("missing admission coordinator");
     }
     net::awaitable<Admission> Reserve(std::shared_ptr<Family> family,
         std::string_view tag, std::string_view ip, bool check_ban) {
+        check_ban = check_ban && TracksAuthBan() && !ip.empty();
         auto node = std::make_unique<Return>();
         node->owner = shared_from_this();
         node->family = std::move(family);
         node->child = bool(node->family);
         auto reservation = Reservation(std::move(node));
         return coordinator_->PostCall([reservation = std::move(reservation),
-            tag = std::string(check_ban && core_.TracksAuthBan() ? tag : std::string_view{}),
+            tag = std::string(check_ban ? tag : std::string_view{}),
             ip = std::string(ip), check_ban]() mutable {
             auto& node = *reservation.node_;
             auto& core = node.owner->core_;
@@ -464,6 +549,7 @@ private:
         });
     }
     ConnectionLimiterCore core_;
+    const auth_limit_detail::Fingerprint credential_fingerprint_;
     std::shared_ptr<GroupCoordinator> coordinator_;
 };
 

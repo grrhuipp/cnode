@@ -238,6 +238,28 @@ geosite.dat
 
 `-c, --config <path>` 会自动判断路径是文件还是目录；`--config-file` 用于只接受配置文件路径；`-C, --config-dir` 用于只接受配置目录路径。目录模式只读取上述固定文件名，不回退到 YAML 入口，也不读取旧 sidecar path 字段。
 
+### 认证失败限制
+
+`config.json` 可独立开启 IPBan；省略时关闭，配置默认值如下：
+
+```json
+{
+  "limits": {
+    "ipBan": {
+      "enabled": false,
+      "failureLimit": 10,
+      "windowSeconds": 60,
+      "banSeconds": 180
+    }
+  }
+}
+```
+
+- IPBan 按入站标签和 PROXY protocol 提供的非空客户端 IP 计数；直连 socket IP、HTTP 转发头不参与。启用后可在传输握手前拒绝已封禁 IP，不踢掉已有连接。三个数值字段均为正整数，单位分别为次数、秒、秒；即使关闭也拒绝非法值。
+- **失败凭据限制固定开启，不可配置或关闭**：同一入站、同一认证信息跨 IP 累计，60 秒内达到 10 次失败后临时拒绝 180 秒，拒绝期间跳过用户认证查找。支持 VLESS、Trojan、AnyTLS 和 Hysteria v1/v2；VMess、Shadowsocks 在认证失败时不能可靠识别原始凭据，只使用可选 IPBan。配置 `limits.credentialBan` 会报错。
+- 两种限制独立，所有 Worker 共用计数。窗口从本轮首次失败起算，到达窗口末尾重新计数；认证成功不清零，封禁期间的请求不累计、不续期。用户快照更新后，该协议和入站的旧凭据失败记录不再影响新用户；其他入站记录不变。
+- 失败状态仅保存在内存，进程重启后清空。每种规则最多跟踪 16,384 个键，局部跟踪容量耗尽时拒绝未知键，不无保护放行。凭据原文和跟踪指纹不写入日志。
+
 ## Release 产物
 
 GitHub Release 仅发布 musl+epoll 全静态二进制及匹配的 `.debug` 符号文件：

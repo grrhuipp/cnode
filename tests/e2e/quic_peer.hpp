@@ -31,8 +31,10 @@ class Peer final {
 public:
     explicit Peer(uint16_t server_port, std::string_view auth = "smoke-secret",
                   uint64_t max_datagram_frame_size = 65535,
-                  uint64_t initial_receive_stream_window = 4 * 1024 * 1024)
-        : socket_(Socket::BindUdp()), context_(SSL_CTX_new(TLS_method()), SSL_CTX_free),
+                  uint64_t initial_receive_stream_window = 4 * 1024 * 1024,
+                  std::string_view expected_auth_status = "233",
+                  std::string_view client_address = "127.0.0.1")
+        : socket_(Socket::BindUdp(0, client_address)), context_(SSL_CTX_new(TLS_method()), SSL_CTX_free),
           ssl_(nullptr, SSL_free), http_(nullptr, nghttp3_conn_del),
           quic_(nullptr, ngtcp2_conn_del) {
         const auto deadline = Clock::now() + std::chrono::seconds(10);
@@ -82,7 +84,9 @@ public:
         CheckHttp(nghttp3_conn_submit_request(http_.get(), auth_stream_, headers.data(),
                                              headers.size(), nullptr, nullptr), "submit auth");
         WaitUntil([&] { return auth_headers_complete_; }, deadline);
-        if (auth_status_ != "233") Fail("HY2 authentication rejected (status " + auth_status_ + ")");
+        if (auth_status_ != expected_auth_status)
+            Fail("unexpected HY2 authentication status " + auth_status_ +
+                 ", expected " + std::string(expected_auth_status));
     }
 
     ~Peer() {

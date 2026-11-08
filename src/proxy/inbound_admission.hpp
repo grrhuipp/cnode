@@ -3,6 +3,7 @@
 #include "handshake_timeout.hpp"
 
 #include "app/proxyman/inbound/factory.hpp"
+#include "app/proxyman/inbound/user_store.hpp"
 #include "app/rate_limiter.hpp"
 #include "app/relay_types.hpp"
 #include "app/stats.hpp"
@@ -28,7 +29,7 @@ namespace proxy {
     session::Context& ctx) {
     ctx.inbound.user_id = 0;
     ctx.inbound.user_email.clear();
-    if (limiter && ctx.inbound.HasProxyProtocolClientIP() &&
+    if (limiter && limiter->TracksAuthBan() && ctx.inbound.HasProxyProtocolClientIP() &&
         co_await limiter->IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {
         LOG_CONN_DEBUG(ctx, "Rejected banned IP {}", ctx.inbound.source_ip);
         LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "IP banned"));
@@ -247,20 +248,44 @@ inline void LogInboundAuthFailure(
     LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, reason));
 }
 
-// The single credential-failure entry: one log shape and one ban counter for
-// every protocol. Only a trusted client address may feed the ban table.
+// A credential key is already owned and salted before entering the coordinator.
+// Only PROXY protocol addresses may additionally feed the independent IP rule.
 inline net::awaitable<void> RecordInboundAuthFailure(
     ConnectionLimiter* limiter,
     session::Context& ctx,
-    std::string_view reason) {
+    std::string_view reason,
+    std::optional<AuthCredentialKey> credential = std::nullopt) {
     LogInboundAuthFailure(ctx, reason);
-    if (limiter && ctx.inbound.HasProxyProtocolClientIP()) {
+    const bool track_ip = limiter && limiter->TracksAuthBan() &&
+                          ctx.inbound.HasProxyProtocolClientIP();
+    if (limiter && (track_ip || credential)) {
         try {
-            co_await limiter->OnAuthFailTracked(ctx.inbound.tag, ctx.inbound.source_ip);
+            co_await limiter->OnAuthFailTracked(
+                ctx.inbound.tag,
+                track_ip ? std::string_view(ctx.inbound.source_ip) : std::string_view{},
+                std::move(credential));
         } catch (const WorkerMailboxFull&) {
+            LOG_CONN_WARN(ctx, "authentication failure tracking unavailable > mailbox full");
         } catch (const IoSystemError&) {
+            LOG_CONN_WARN(ctx, "authentication failure tracking unavailable > coordinator I/O error");
         }
     }
+}
+
+[[nodiscard]] inline net::awaitable<ErrorCode> CheckInboundCredential(
+    ConnectionLimiter& limiter,
+    session::Context& ctx,
+    AuthCredentialKey credential,
+    proxyman::inbound::UserProtocol protocol,
+    uint64_t credential_revision) {
+    const auto reason = co_await limiter.CheckCredential(std::move(credential));
+    if (proxyman::inbound::UserStore::CredentialRevision(protocol, ctx.inbound.tag) !=
+        credential_revision) co_return ErrorCode::OK;
+    if (reason == ConnectionLimiter::RejectReason::NONE) co_return ErrorCode::OK;
+    co_await RecordInboundAuthFailure(
+        &limiter, ctx, ConnectionLimiter::RejectReasonToString(reason));
+    co_return reason == ConnectionLimiter::RejectReason::TRACKING_CAPACITY
+        ? ErrorCode::RESOURCE_EXHAUSTED : ErrorCode::BLOCKED;
 }
 
 // The single pre-dispatch rejection exit. Peer EOF and local cancellation are

@@ -6,6 +6,7 @@
 #include <cstring>
 #include <format>
 #include <stdexcept>
+#include <limits>
 #include <string_view>
 #include <unordered_set>
 #include <utility>
@@ -54,6 +55,9 @@ struct UserStore::Snapshot {
     ShadowsocksTagMap shadowsocks;
     AnyTlsTagMap anytls;
     HysteriaTagMap hysteria;
+    std::array<std::unordered_map<std::string, uint64_t,
+                                  TransparentStringHash, TransparentStringEq>,
+               std::variant_size_v<UserSet>> credential_revisions;
 };
 
 struct UserStore::WorkerLease {
@@ -295,6 +299,15 @@ uint64_t UserStore::WorkerViewRevision() noexcept {
     return view ? view->revision : 0;
 }
 
+uint64_t UserStore::CredentialRevision(
+    UserProtocol protocol, std::string_view tag) noexcept {
+    const auto& view = LocalView();
+    if (!view || !view->snapshot) return 0;
+    const auto& revisions = view->snapshot->credential_revisions[static_cast<size_t>(protocol)];
+    const auto found = revisions.find(tag);
+    return found == revisions.end() ? 0 : found->second;
+}
+
 void UserStore::CommitSnapshot(PublishedSnapshot snapshot) noexcept {
     GlobalSnapshot().store(std::move(snapshot), std::memory_order_release);
 }
@@ -322,6 +335,19 @@ UserStore::PublishedSnapshot UserStore::PrepareUsers(
         } else if (const auto* hysteria = std::get_if<PreparedHysteriaUsers>(&users)) {
             SetOrErase(next->hysteria, tag, BuildHysteriaUsers(*hysteria));
         }
+        const auto protocol = UserProtocolOf(users);
+        if (protocol == UserProtocol::Vmess || protocol == UserProtocol::Shadowsocks) continue;
+        auto& revisions = next->credential_revisions[static_cast<size_t>(protocol)];
+        if (std::visit([](const auto& entries) { return entries.empty(); }, users)) {
+            EraseByTag(revisions, tag);
+        } else {
+            // Prepare operations are serialized by the control-plane gate.
+            static uint64_t next_revision = 1;
+            if (next_revision == std::numeric_limits<uint64_t>::max()) {
+                throw std::overflow_error("credential revision exhausted");
+            }
+            revisions.insert_or_assign(std::string(tag), next_revision++);
+        }
     }
     return next;
 }
@@ -338,6 +364,7 @@ UserStore::PublishedSnapshot UserStore::PrepareClearUsers(
         case UserProtocol::AnyTls: EraseByTag(next->anytls, tag); break;
         case UserProtocol::Hysteria: EraseByTag(next->hysteria, tag); break;
     }
+    EraseByTag(next->credential_revisions[static_cast<size_t>(protocol)], tag);
     return next;
 }
 

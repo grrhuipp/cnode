@@ -169,6 +169,10 @@ public:
     [[nodiscard]] static WorkerView CaptureWorkerView() noexcept;
     static void ClearWorkerView() noexcept;
     [[nodiscard]] static uint64_t WorkerViewRevision() noexcept;
+    // Shared by Workers using the same protocol/tag credential publication;
+    // negative authentication caches must not outlive that publication.
+    [[nodiscard]] static uint64_t CredentialRevision(
+        UserProtocol protocol, std::string_view tag) noexcept;
 
     struct UserUpdate {
         std::string_view tag;
