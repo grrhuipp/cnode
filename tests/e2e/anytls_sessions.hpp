@@ -16,7 +16,6 @@
 
 namespace cnode::e2e::sessions {
 inline void Require(bool value, std::string_view reason) { if (!value) throw std::runtime_error(std::string(reason)); }
-inline uint16_t Port() { return Socket::Listen().Port(); }
 inline std::string Pattern(size_t size) { std::string out(size, '\0'); for (size_t i=0;i<size;++i) out[i]=static_cast<char>(i%251); return out; }
 inline bool Ready(int fd, Milliseconds timeout) {
     pollfd p{fd,POLLIN,0}; int result;
@@ -95,15 +94,22 @@ inline Json Inbound(uint16_t port, bool anytls=true) {
 inline Json Outbound(uint16_t port, unsigned minimum=1, unsigned idle=30) {
     return {{"protocol","anytls"},{"settings",{{"address","127.0.0.1"},{"port",port},{"password","secret"},{"minIdleSession",minimum},{"idleSessionTimeout",idle},{"idleSessionCheckInterval",1}}},{"streamSettings",TlsSettings(false)}};
 }
+// Keep node ports reserved while peers are constructed; release only at child startup.
 struct Node {
-    TempDir directory; uint16_t port=Port(); std::unique_ptr<Child> child;
+    TempDir directory; Socket port_reservation=Socket::Listen(); uint16_t port=port_reservation.Port(); std::unique_ptr<Child> child;
     Node(bool inbound, uint16_t peer=0, Json timeouts=Json::object(), unsigned minimum=1, unsigned idle=30) {
         Configure(directory.Path(),Inbound(port,inbound),inbound?Json{{"protocol","freedom"},{"settings",Json::object()}}:Outbound(peer,minimum,idle));
         if(!timeouts.empty()) {auto config=Json::parse(ReadFile(directory.Path()/"config.json")); config["timeouts"].update(timeouts); WriteJson(directory.Path(),"config.json",config);}
         Start();
     }
     Node() = default;
-    void Start() {child=std::make_unique<Child>(std::vector<std::string>{Binary().string(),"--config-dir",directory.Path().string()},directory.Path()/"child.log"); child->WaitForLog("server started");}
+    void Start(std::vector<std::string> command={}) {
+        const bool native=command.empty();
+        if(native) command={Binary().string(),"--config-dir",directory.Path().string()};
+        port_reservation.Close();
+        child=std::make_unique<Child>(std::move(command),directory.Path()/(native?"child.log":"reference.log"));
+        if(native) child->WaitForLog("server started");
+    }
     void Stop() {if(child) EXPECT_EQ(child->Stop(),0);}
     Socket Application(std::string_view payload="request!",uint8_t command=1) {auto socket=Socket::Connect(port); socket.Write(VlessRequest(443,payload,command)); return socket;}
 };
@@ -112,7 +118,7 @@ inline void Open(TlsSocket& socket, uint32_t sid, uint16_t port, std::string_vie
 inline std::string Magic(bool v1) {return SocksAddress(0,v1?"sp.udp-over-tcp.arpa":"sp.v2.udp-over-tcp.arpa");}
 // Panel provisioning remains real: the rate-limited user travels through the HTTP panel adapter and user store.
 struct PanelNode {
-    TempDir directory; uint16_t port=Port(); std::atomic<unsigned> userRequests=0; Server panel; std::unique_ptr<Child> child;
+    TempDir directory; Socket port_reservation=Socket::Listen(); uint16_t port=port_reservation.Port(); std::atomic<unsigned> userRequests=0; Server panel; std::unique_ptr<Child> child;
     explicit PanelNode(bool anytls=true, Json timeouts=Json::object()):panel([this](Socket socket){
         for(;;) {std::string header; while(!header.ends_with("\r\n\r\n")){auto b=socket.Read(1);if(b.empty())return;header+=b;Require(header.size()<65536,"panel header too large");}
             auto lower=header; std::transform(lower.begin(),lower.end(),lower.begin(),[](unsigned char c){return static_cast<char>(std::tolower(c));});
@@ -126,6 +132,7 @@ struct PanelNode {
         auto cert=SourceRoot()/"tests/fixtures/anytls-pool";
         Json config={{"workers",1},{"log",{{"enable",false},{"logDir",(directory.Path()/"logs").string()}}},{"timeouts",{{"connIdle",10},{"uplinkOnly",3},{"downlinkOnly",3}}},{"panels",Json::array({{{"name","session-test"},{"type","V2board"},{"apiHost","http://127.0.0.1:"+std::to_string(panel.Port())},{"key","local-test-key"},{"nodeIDs",Json::array({1})},{"nodeType",anytls?"anytls":"vless"},{"listenIP","127.0.0.1"},{"tlsEnable",anytls},{"tlsCert",(cert/"cert.pem").string()},{"tlsKey",(cert/"key.pem").string()}}})}};
         config["timeouts"].update(timeouts);WriteJson(directory.Path(),"config.json",config);
+        port_reservation.Close();
         child=std::make_unique<Child>(std::vector<std::string>{Binary().string(),"--config-dir",directory.Path().string()},directory.Path()/"child.log");
         Until([&]{Require(child->Running(),"panel node exited");return userRequests.load()!=0;},8s);
     }
@@ -142,7 +149,7 @@ inline void ServerFin(bool remote,std::string reference={}) {
         late=Drain(socket);targetEof=true;
     });
     Node node; if(reference.empty()){Configure(node.directory.Path(),Inbound(node.port),{{"protocol","freedom"},{"settings",Json::object()}});node.Start();}
-    else node.child=std::make_unique<Child>(std::vector<std::string>{reference,"-l","127.0.0.1:"+std::to_string(node.port),"-p","secret"},node.directory.Path()/"reference.log");
+    else node.Start({reference,"-l","127.0.0.1:"+std::to_string(node.port),"-p","secret"});
     TlsContext context(false);TlsSocket client(ConnectChild(*node.child,node.port),context,false);Frames frames(client);Authenticate(client);Open(client,1,target.Port(),"request!");frames.Await([&]{return frames.Payload(1)=="accepted";});
     if(remote){client.Write(AnyTlsFrame(3,1));frames.Barrier();client.Write(AnyTlsFrame(2,1,"forbidden-after-fin"));frames.Barrier();release=true;}
     else{release=true;frames.Await([&]{return frames.Count(3,1)>0;});client.Write(AnyTlsFrame(2,1,"forbidden-after-fin"));frames.Barrier();}
@@ -163,7 +170,7 @@ inline void ClientFin(bool remote,std::string reference={}) {
         }
     });
     Node node;if(reference.empty()){Configure(node.directory.Path(),Inbound(node.port,false),Outbound(peer.Port()));node.Start();}
-    else node.child=std::make_unique<Child>(std::vector<std::string>{reference,"-l","127.0.0.1:"+std::to_string(node.port),"-s","127.0.0.1:"+std::to_string(peer.Port()),"-p","secret","-m","1"},node.directory.Path()/"reference.log");
+    else node.Start({reference,"-l","127.0.0.1:"+std::to_string(node.port),"-s","127.0.0.1:"+std::to_string(peer.Port()),"-p","secret","-m","1"});
     auto application=[&]{auto app=ConnectChild(*node.child,node.port);if(reference.empty()){app.Write(VlessRequest(443,"request!"));EXPECT_EQ(app.ReadExact(2),std::string("\0\0",2));}
         else{app.Write(std::string("\5\1\0",3));EXPECT_EQ(app.ReadExact(2),std::string("\5\0",2));app.Write(std::string("\5\1\0",3)+SocksAddress(443));auto reply=app.ReadExact(4);EXPECT_EQ(reply.substr(0,2),std::string("\5\0",2));Require(reply[3]==1||reply[3]==4,"SOCKS address type");app.ReadExact(reply[3]==1?6:18);app.Write("request!");}return app;};
     auto app=application();EXPECT_EQ(app.ReadExact(8),"accepted");if(!remote)app.ShutdownWrite();EXPECT_EQ(Drain(app,2s),expected);Until([&]{return hearts.load()>0;});
