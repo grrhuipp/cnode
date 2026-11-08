@@ -64,7 +64,7 @@ mise exec -- ctest --test-dir build/musl --no-tests=error -L '^benchmark$' -V
 
 分配微基准与守护进程使用相同的全局 mimalloc，覆盖带生命周期跟踪的字节缓冲追加、1/8/9/16 块 `MultiBuffer` 所有权移交，以及散布写描述符的构建与回收；描述符基准分别使用 span 和 `MultiBuffer` 输入，覆盖内联容量与溢出边界，并校验借用视图的地址与长度，不复制 payload。环形队列基准按每批 1/8/64 个元素填充并完全排空，预热 128 批后测量 `262144 / 批大小` 批，验证 FIFO、checksum、排空归还存储及活跃分配数，并输出 CPU/墙钟耗时和内存池 mapped/idle 字节。归还操作的计时包含空闲登记与到期回收检查；mapped/idle 是采样时刻的快照，不是全程峰值。微基准不代表端到端吞吐。
 
-只运行环形队列微基准可用 `mise exec -- ctest --test-dir build/musl --no-tests=error -R '^benchmark\.RingDequeBenchmark\.' -V`。
+只运行分配与容器微基准可用 `mise exec -- ctest --test-dir build/musl --no-tests=error -R '^benchmark\.(AllocatorAppendBenchmark|MultiBufferBenchmark|BufferSpanBenchmark|RingDequeBenchmark)\.' -V`。
 
 TCP 接收基准通过真实回环连接测量 1 B / 8 KiB / 64 KiB 突发：每种负载预热 128 轮、测量 4096 轮，逐字节校验载荷，输出每轮 CPU、墙钟耗时及读取次数。CPU 包含同进程收发双方与载荷校验，不是守护进程单侧 CPU，也不代表公网吞吐。
 

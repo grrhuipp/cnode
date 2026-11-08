@@ -5,6 +5,7 @@
 #include "common/session.hpp"
 #include <algorithm>
 #include <array>
+#include <barrier>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -1089,6 +1090,56 @@ TEST(ThreadMemoryPool, RemoteBatchExpiresOldIdleChunksAndRetainsNewReturns) {
     EXPECT_EQ(footprint.idle_bytes, retained);
     EXPECT_EQ(footprint.chunks, 2u);
     EXPECT_GT(pool.NextPurgeDeadline(), expired_deadline);
+    pool.PurgeIdle();
+    EXPECT_EQ(pool.GetFootprint().mapped_bytes, 0u);
+}
+
+TEST(ThreadMemoryPool, ConcurrentRemoteReturnsPreserveLiveBlocksAndReclaimStorage) {
+    memory::worker_memory pool;
+    constexpr size_t returners = 4;
+    constexpr size_t rounds = 16;
+    constexpr size_t batch_size = 64;
+    constexpr size_t bytes = 256;
+    auto* pinned = pool.Allocate(bytes, 16);
+    ASSERT_NE(pinned, nullptr);
+    std::memset(pinned, 0x5a, bytes);
+    const auto pinned_bytes = memory::worker_memory::Describe(bytes, 16).map_bytes;
+    std::array<std::array<void*, batch_size>, returners> batches{};
+    std::barrier phase(static_cast<std::ptrdiff_t>(returners + 1));
+    std::array<std::thread, returners> threads;
+    for (size_t index = 0; index < returners; ++index) {
+        threads[index] = std::thread([&, index] {
+            for (size_t round = 0; round < rounds; ++round) {
+                phase.arrive_and_wait();
+                for (auto* block : batches[index]) pool.Deallocate(block);
+                phase.arrive_and_wait();
+            }
+        });
+    }
+    for (size_t round = 0; round < rounds; ++round) {
+        for (auto& batch : batches) {
+            for (auto& block : batch) {
+                block = pool.Allocate(bytes, 16);
+                EXPECT_NE(block, nullptr);
+            }
+        }
+        // First drain an empty queue, then race local borrowing with remote returns.
+        pool.PurgeIdle();
+        phase.arrive_and_wait();
+        for (size_t index = 0; index < batch_size; ++index) {
+            auto* local = pool.Allocate(bytes, 16);
+            EXPECT_NE(local, nullptr);
+            if (local) std::memset(local, 0xa5, bytes);
+            pool.Deallocate(local);
+        }
+        phase.arrive_and_wait();
+        pool.PurgeIdle();
+        EXPECT_TRUE(Intact(pinned, bytes, 0x5a));
+        EXPECT_EQ(pool.GetFootprint().mapped_bytes, pinned_bytes);
+        EXPECT_EQ(pool.GetFootprint().idle_bytes, 0u);
+    }
+    for (auto& thread : threads) thread.join();
+    pool.Deallocate(pinned);
     pool.PurgeIdle();
     EXPECT_EQ(pool.GetFootprint().mapped_bytes, 0u);
 }

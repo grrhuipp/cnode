@@ -192,6 +192,55 @@ TEST(BufferSpanBuilder, FailedSpillPreservesBorrowedDescriptorsAndCanRetry) {
     }
 }
 
+TEST(BufferSpanBuilder, SelfAppendWithinCapacityKeepsBorrowedStorage) {
+    RetiringResource resource;
+    ScopedResource scope(resource);
+    const std::string text = "abc";
+    ::ConstBufferSpanBuilder<4> builder;
+    builder.Append(::net::buffer(text.data(), 1));
+    builder.Append(::net::buffer(text.data() + 1, 1));
+    auto* storage = builder.Span().data();
+    resource.RejectNextAllocation();
+    builder.AppendBuffers(builder.Span());
+    EXPECT_EQ(builder.Span().data(), storage);
+    EXPECT_EQ(Flatten(builder.Span()), "abab");
+    EXPECT_THROW(builder.Append(::net::buffer(text.data() + 2, 1)), std::bad_alloc);
+    EXPECT_EQ(Flatten(builder.Span()), "abab");
+    builder.Append(::net::buffer(text.data() + 2, 1));
+    storage = builder.Span().data();
+    resource.RejectNextAllocation();
+    builder.AppendBuffers(builder.Span().subspan(3, 2));
+    builder.AppendBuffers(builder.Span().last(1));
+    EXPECT_EQ(builder.Span().data(), storage);
+    EXPECT_EQ(Flatten(builder.Span()), "ababcbcc");
+    EXPECT_THROW(builder.AppendBuffers(builder.Span().last(1)), std::bad_alloc);
+    EXPECT_EQ(builder.Span().data(), storage);
+    EXPECT_EQ(Flatten(builder.Span()), "ababcbcc");
+    builder.AppendBuffers(builder.Span().last(1));
+    EXPECT_EQ(Flatten(builder.Span()), "ababcbccc");
+}
+
+TEST(BufferSpanBuilder, SparseExternalAppendUsesOnlyNonemptyCapacity) {
+    ::memory::AllocationDomain domain;
+    ::memory::ScopedAllocationDomain lease(domain);
+    const std::string text = "abcd";
+    const std::array prefix{
+        ::net::buffer(text.data(), 1), ::net::buffer(text.data() + 1, 1),
+        ::net::buffer(text.data() + 2, 1)};
+    const std::array<::net::const_buffer, 3> suffix{
+        ::net::const_buffer{}, ::net::buffer(text.data() + 3, 1), {}};
+    ::ConstBufferSpanBuilder<4> builder;
+    builder.AppendBuffers(prefix);
+    builder.AppendBuffers(suffix);
+    EXPECT_EQ(Flatten(builder.Span()), "abcd");
+    EXPECT_EQ(domain.OutstandingAllocations(), 0u);
+    builder.AppendBuffers(suffix);
+    EXPECT_EQ(Flatten(builder.Span()), "abcdd");
+    EXPECT_EQ(domain.OutstandingAllocations(), 1u);
+    builder.Clear();
+    EXPECT_EQ(domain.OutstandingAllocations(), 0u);
+}
+
 TEST(BufferSpanBuilder, SpillUsesActiveDomainAndClearReleasesItsStorage) {
     ::ConstBufferSpanBuilder<2> builder;
     const std::string text = "abc";

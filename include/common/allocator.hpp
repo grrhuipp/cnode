@@ -468,7 +468,14 @@ private:
             head, &header, std::memory_order_release, std::memory_order_relaxed));
     }
     void DrainRemoteFrees() noexcept {
+        // The probe only tests emptiness; ReclaimRemoteBatch acquires QueueRemote's release.
+        // A push after an empty probe remains queued for the next drain.
+        if (remote_frees_.load(std::memory_order_relaxed) == nullptr) return;
         if (owner_token_ != 0 && owner_token_ != detail::CurrentThreadToken()) return;
+        ReclaimRemoteBatch();
+    }
+    // Keep the nonempty batch walk out of local allocation and return callers.
+    [[gnu::noinline]] void ReclaimRemoteBatch() noexcept {
         auto* current = remote_frees_.exchange(nullptr, std::memory_order_acquire);
         while (current) {
             auto* next = current->next_free;

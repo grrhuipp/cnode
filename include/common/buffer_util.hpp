@@ -31,25 +31,27 @@ public:
     }
 
     void AppendBuffers(std::span<const net::const_buffer> buffers) {
-        size_t non_empty = 0;
-        for (const auto& buffer : buffers) {
-            if (buffer.size() != 0) {
-                ++non_empty;
+        const size_t available = spill_
+            ? spill_->capacity() - spill_->size() : StackCapacity - count_;
+        size_t additional = buffers.size();
+        // Existing capacity also guarantees borrowed descriptors cannot move.
+        if (additional > available) {
+            additional = 0;
+            for (const auto& buffer : buffers) {
+                if (buffer.size() != 0) ++additional;
             }
         }
-        if (non_empty == 0) {
-            return;
+        if (additional == 0) return;
+        if (additional > available) {
+            // A borrowed subspan must follow the descriptors if spill storage moves.
+            const auto current = Span();
+            const auto source = reinterpret_cast<uintptr_t>(buffers.data());
+            const auto base = reinterpret_cast<uintptr_t>(current.data());
+            const bool aliases = source >= base && source - base < current.size_bytes();
+            const size_t offset = aliases ? (source - base) / sizeof(net::const_buffer) : 0;
+            EnsureSpillCapacity(additional);
+            if (aliases) buffers = Span().subspan(offset, buffers.size());
         }
-        // A borrowed subspan must follow the descriptors if spill storage moves.
-        const auto current = Span();
-        const auto source = reinterpret_cast<uintptr_t>(buffers.data());
-        const auto base = reinterpret_cast<uintptr_t>(current.data());
-        const bool aliases = source >= base && source - base < current.size_bytes();
-        const size_t offset = aliases ? (source - base) / sizeof(net::const_buffer) : 0;
-        if (spill_ || non_empty > StackCapacity - count_) {
-            EnsureSpillCapacity(non_empty);
-        }
-        if (aliases) buffers = Span().subspan(offset, buffers.size());
         for (const auto& buffer : buffers) {
             if (buffer.size() != 0) AppendPrepared(buffer);
         }
