@@ -29,6 +29,9 @@ public:
     ClientSession(const ClientSession&) = delete;
     ClientSession& operator=(const ClientSession&) = delete;
 
+    // Pre-start cancellation preserves framing. Once framing starts, failures
+    // (including cancellation) retire request writes. Clean EOF/WriteClosed
+    // ends only the request direction; responses remain readable.
     net::awaitable<VMessHandshakeResult> EncodeRequestHeader(AsyncStream& stream);
     net::awaitable<void> EncodeRequestBody(
         AsyncStream& stream,
@@ -61,7 +64,6 @@ private:
     Command command_ = Command::TCP;
     SessionKeys keys_;
     bool request_header_sent_ = false;
-    bool request_eof_sent_ = false;
     BodyEncoder request_encoder_;
     BodyDecoder response_decoder_;
     // Response header progress survives a cancelled read.

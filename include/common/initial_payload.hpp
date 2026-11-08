@@ -45,15 +45,16 @@ public:
 
     [[nodiscard]] bool empty() const noexcept { return inline_size_ == 0 && overflow_.empty(); }
     [[nodiscard]] size_t size() const noexcept { return overflow_.empty() ? inline_size_ : overflow_.byte_size(); }
-    [[nodiscard]] std::span<const uint8_t> span() const noexcept {
+    [[nodiscard]] std::span<const uint8_t> span() const& noexcept {
         return overflow_.empty()
             ? std::span<const uint8_t>{inline_.data(), inline_size_}
             : std::span<const uint8_t>{};
     }
+    std::span<const uint8_t> span() const&& = delete;
     [[nodiscard]] bool IsContiguous() const noexcept {
         return overflow_.empty();
     }
-    [[nodiscard]] std::span<const uint8_t> PrefixSpan(size_t len) const noexcept {
+    [[nodiscard]] std::span<const uint8_t> PrefixSpan(size_t len) const& noexcept {
         if (len == 0 || len > size()) {
             return {};
         }
@@ -62,6 +63,7 @@ public:
         }
         return overflow_.PrefixSpan(len);
     }
+    std::span<const uint8_t> PrefixSpan(size_t) const&& = delete;
     // 复制最多 out_size 字节的前缀到 out，返回实际复制量。用于嗅探：只需首部
     // 若干字节即可解析 TLS ClientHello SNI / HTTP Host，无需拷贝整个首包。
     [[nodiscard]] size_t CopyPrefixTo(uint8_t* out, size_t out_size) const {
@@ -76,7 +78,7 @@ public:
         return overflow_.CopyPrefixTo(std::span<uint8_t>(out, want));
     }
 
-    [[nodiscard]] buf::MultiBuffer MoveToMultiBuffer() {
+    [[nodiscard]] buf::MultiBuffer MoveToMultiBuffer() && {
         if (!overflow_.empty()) {
             inline_size_ = 0;
             return std::move(overflow_);

@@ -223,8 +223,23 @@ VlessEncryptionWriter::VlessEncryptionWriter(
     , united_key_(united_key)
     , header_xor_(std::move(header_xor)) {}
 
+void VlessEncryptionWriter::CheckWritable() const {
+    if (state_ == State::Failed) {
+        ThrowVlessEncryptionIoError("VLESS Encryption writer failed");
+    }
+    if (state_ == State::Finished) {
+        throw transport::WriteClosed();
+    }
+}
+
 net::awaitable<void> VlessEncryptionWriter::WriteMultiBuffer(
     buf::MultiBuffer mb) {
+    CheckWritable();
+    const auto cancellation = co_await net::this_coro::cancellation_state;
+    if (cancellation.cancelled() != net::cancellation_type::none) {
+        throw IoSystemError(io_error::operation_aborted,
+                            "VLESS Encryption write cancelled");
+    }
     if (mb.empty()) {
         co_return;
     }
@@ -238,79 +253,120 @@ net::awaitable<void> VlessEncryptionWriter::WriteMultiBuffer(
 
 net::awaitable<void> VlessEncryptionWriter::WriteBuffers(
     std::span<const net::const_buffer> buffers) {
-    size_t idx = 0;
-    size_t offset = 0;
-    auto skip_empty = [&]() noexcept {
-        while (idx < buffers.size()) {
-            const auto* data = static_cast<const uint8_t*>(buffers[idx].data());
-            if (data && offset < buffers[idx].size()) {
-                return;
+    CheckWritable();
+    const auto cancellation = co_await net::this_coro::cancellation_state;
+    if (cancellation.cancelled() != net::cancellation_type::none) {
+        throw IoSystemError(io_error::operation_aborted,
+                            "VLESS Encryption write cancelled");
+    }
+    bool record_started = false;
+    try {
+        size_t idx = 0;
+        size_t offset = 0;
+        auto skip_empty = [&]() noexcept {
+            while (idx < buffers.size()) {
+                const auto* data = static_cast<const uint8_t*>(buffers[idx].data());
+                if (data && offset < buffers[idx].size()) {
+                    return;
+                }
+                ++idx;
+                offset = 0;
             }
-            ++idx;
-            offset = 0;
-        }
-    };
+        };
 
-    skip_empty();
-    while (idx < buffers.size()) {
-        const auto* first_data =
-            static_cast<const uint8_t*>(buffers[idx].data()) + offset;
-        const size_t first_rem = buffers[idx].size() - offset;
+        skip_empty();
+        while (idx < buffers.size()) {
+            const auto* first_data =
+                static_cast<const uint8_t*>(buffers[idx].data()) + offset;
+            const size_t first_rem = buffers[idx].size() - offset;
 
-        bool has_more = false;
-        if (first_rem < kVlessEncryptionMaxPlaintextSize) {
-            for (size_t j = idx + 1; j < buffers.size(); ++j) {
-                if (buffers[j].data() && buffers[j].size() > 0) {
-                    has_more = true;
-                    break;
+            bool has_more = false;
+            if (first_rem < kVlessEncryptionMaxPlaintextSize) {
+                for (size_t j = idx + 1; j < buffers.size(); ++j) {
+                    if (buffers[j].data() && buffers[j].size() > 0) {
+                        has_more = true;
+                        break;
+                    }
                 }
             }
-        }
 
-        if (!has_more) {
-            const size_t n = std::min(first_rem, kVlessEncryptionMaxPlaintextSize);
-            offset += n;
-            skip_empty();
-            co_await WritePlaintext(std::span<const uint8_t>{first_data, n});
-            continue;
-        }
+            if (!has_more) {
+                const size_t n = std::min(first_rem, kVlessEncryptionMaxPlaintextSize);
+                offset += n;
+                skip_empty();
+                co_await WritePlaintext(
+                    std::span<const uint8_t>{first_data, n}, record_started);
+                continue;
+            }
 
-        static_assert(kVlessEncryptionMaxPlaintextSize <= buf::Buffer::kSize);
-        buf::BufferGuard chunk{buf::Buffer::New()};
-        if (!chunk) {
-            ThrowVlessEncryptionIoError("VLESS Encryption buffer allocation failed");
-        }
-        uint8_t* dst = chunk->Tail().data();
-        size_t filled = 0;
-        while (idx < buffers.size() && filled < kVlessEncryptionMaxPlaintextSize) {
-            const auto* data =
-                static_cast<const uint8_t*>(buffers[idx].data()) + offset;
-            const size_t rem = buffers[idx].size() - offset;
-            const size_t copy_len =
-                std::min(rem, kVlessEncryptionMaxPlaintextSize - filled);
-            std::memcpy(dst + filled, data, copy_len);
-            filled += copy_len;
-            offset += copy_len;
-            skip_empty();
-        }
-        chunk->Produce(static_cast<uint32_t>(filled));
-        try {
-            co_await WritePlaintext(chunk->Bytes());
-        } catch (...) {
+            static_assert(kVlessEncryptionMaxPlaintextSize <= buf::Buffer::kSize);
+            buf::BufferGuard chunk{buf::Buffer::New()};
+            if (!chunk) {
+                ThrowVlessEncryptionIoError("VLESS Encryption buffer allocation failed");
+            }
+            uint8_t* dst = chunk->Tail().data();
+            size_t filled = 0;
+            while (idx < buffers.size() && filled < kVlessEncryptionMaxPlaintextSize) {
+                const auto* data =
+                    static_cast<const uint8_t*>(buffers[idx].data()) + offset;
+                const size_t rem = buffers[idx].size() - offset;
+                const size_t copy_len =
+                    std::min(rem, kVlessEncryptionMaxPlaintextSize - filled);
+                std::memcpy(dst + filled, data, copy_len);
+                filled += copy_len;
+                offset += copy_len;
+                skip_empty();
+            }
+            chunk->Produce(static_cast<uint32_t>(filled));
+            try {
+                co_await WritePlaintext(chunk->Bytes(), record_started);
+            } catch (...) {
+                OPENSSL_cleanse(dst, filled);
+                throw;
+            }
             OPENSSL_cleanse(dst, filled);
-            throw;
         }
-        OPENSSL_cleanse(dst, filled);
+    } catch (const transport::WriteClosed&) {
+        state_ = State::Finished;
+        throw;
+    } catch (...) {
+        if (record_started) {
+            state_ = State::Failed;
+        }
+        throw;
     }
 }
 
 net::awaitable<void> VlessEncryptionWriter::AsyncShutdownWrite() {
-    co_await dst_.AsyncShutdownWrite();
+    if (state_ == State::Finished) {
+        co_return;
+    }
+    CheckWritable();
+    const auto cancellation = co_await net::this_coro::cancellation_state;
+    if (cancellation.cancelled() != net::cancellation_type::none) {
+        throw IoSystemError(io_error::operation_aborted,
+                            "VLESS Encryption write shutdown cancelled");
+    }
+    try {
+        co_await dst_.AsyncShutdownWrite();
+        state_ = State::Finished;
+    } catch (const transport::WriteClosed&) {
+        state_ = State::Finished;
+        throw;
+    } catch (...) {
+        state_ = State::Failed;
+        throw;
+    }
 }
 
 net::awaitable<void> VlessEncryptionWriter::WritePlaintext(
-    std::span<const uint8_t> data) {
+    std::span<const uint8_t> data, bool& record_started) {
     while (!data.empty()) {
+        const auto cancellation = co_await net::this_coro::cancellation_state;
+        if (cancellation.cancelled() != net::cancellation_type::none) {
+            throw IoSystemError(io_error::operation_aborted,
+                                "VLESS Encryption write cancelled");
+        }
         const size_t n = std::min<size_t>(
             data.size(),
             kVlessEncryptionMaxPlaintextSize);
@@ -323,6 +379,9 @@ net::awaitable<void> VlessEncryptionWriter::WritePlaintext(
         }
         std::span<uint8_t> frame{frame_ptr, frame_capacity};
 
+        // Seal advances the nonce even if record encryption subsequently fails.
+        // Keep this set across every record in the public write request.
+        record_started = true;
         const auto written = SealVlessEncryptionRecord(
             aead_,
             data.first(n),

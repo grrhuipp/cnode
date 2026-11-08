@@ -168,7 +168,7 @@ net::awaitable<bool> SniffInitialPayload(
         };
         const auto sniff_started = std::chrono::steady_clock::now();
         if (!first_packet.empty()) {
-            sniff_payload = first_packet.MoveToMultiBuffer();
+            sniff_payload = std::move(first_packet).MoveToMultiBuffer();
             cached_bytes = sniff_payload.byte_size();
             cached_datagrams = 1;
         }
@@ -489,7 +489,7 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
     relay_cfg.speed_limit   = ctx.content.speed_limit;
 
     if (outbound_first_payload.empty() && !first_packet.empty()) {
-        outbound_first_payload.Push(first_packet.MoveToMultiBuffer());
+        outbound_first_payload.Push(std::move(first_packet).MoveToMultiBuffer());
     }
     first_packet = {};
     const size_t relay_payload_size = outbound_first_payload.byte_size();

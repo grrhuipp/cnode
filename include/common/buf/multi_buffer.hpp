@@ -489,7 +489,7 @@ public:
         return true;
     }
 
-    [[nodiscard]] std::span<const uint8_t> PrefixSpan(size_t len) const noexcept {
+    [[nodiscard]] std::span<const uint8_t> PrefixSpan(size_t len) const& noexcept {
         if (len == 0) {
             return {};
         }
@@ -505,8 +505,9 @@ public:
         }
         return {};
     }
+    std::span<const uint8_t> PrefixSpan(size_t) const&& = delete;
 
-    [[nodiscard]] std::span<const uint8_t> FrontSpan() const noexcept {
+    [[nodiscard]] std::span<const uint8_t> FrontSpan() const& noexcept {
         for (const Buffer* buffer : *this) {
             if (!buffer || buffer->IsEmpty()) {
                 continue;
@@ -515,6 +516,7 @@ public:
         }
         return {};
     }
+    std::span<const uint8_t> FrontSpan() const&& = delete;
 
     size_t CopyPrefixTo(std::span<uint8_t> dst) const noexcept {
         size_t copied = 0;

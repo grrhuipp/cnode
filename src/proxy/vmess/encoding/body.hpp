@@ -86,20 +86,34 @@ public:
     // Stream mode splits payload into chunks that fit one pooled buffer;
     // packet mode seals the whole datagram as exactly one chunk, rejecting
     // empty UDP with NOT_SUPPORTED because an empty body is the EOF marker.
+    // Input/output must be distinct; input rejection does not advance framing.
     void Encode(const buf::MultiBuffer& payload, buf::MultiBuffer& out);
     void Encode(std::span<const net::const_buffer> payload, buf::MultiBuffer& out);
-    // Zero-length chunk ending this direction.
+    // Zero-length chunk ending this direction; repeated EOF emits no bytes.
     void EncodeEnd(buf::MultiBuffer& out);
     [[nodiscard]] size_t EncodeEndTo(std::span<uint8_t, 128> out);
     [[nodiscard]] bool PacketMode() const noexcept { return cipher_.PacketMode(); }
 
+    // Framing failures and failed downstream writes retire this direction.
+    // A clean downstream WriteClosed instead finishes it without touching reads.
+    void CheckWritable() const;
+    [[nodiscard]] bool Failed() const noexcept { return state_ == State::Failed; }
+    [[nodiscard]] bool Finished() const noexcept { return state_ == State::Finished; }
+    void Abort() noexcept { state_ = State::Failed; }
+    void Finish() noexcept {
+        if (state_ != State::Failed) state_ = State::Finished;
+    }
+
 private:
+    enum class State { Active, Finished, Failed };
+
     void EncodeStream(std::span<const uint8_t> bytes, buf::MultiBuffer& out);
     void EncodePacket(std::span<const uint8_t> bytes, buf::MultiBuffer& out);
     void EncodeChunk(std::span<const uint8_t> bytes, buf::MultiBuffer& out);
 
     BodyChunkCipher cipher_;
     size_t stream_chunk_size_ = 0;
+    State state_ = State::Active;
 };
 
 // Resumable body reader state. A cancelled read keeps buffered bytes, the

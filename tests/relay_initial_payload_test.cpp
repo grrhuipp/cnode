@@ -643,12 +643,12 @@ bool TestInitialPayloadAllocation() {
     const auto before = memory::rejected_pmr_allocations;
     bool failed = false;
     memory::reject_next_pmr_allocation = true;
-    try { auto payload = initial.MoveToMultiBuffer(); }
+    try { auto payload = std::move(initial).MoveToMultiBuffer(); }
     catch (const std::bad_alloc&) { failed = true; }
     memory::reject_next_pmr_allocation = false;
     const bool retained = initial.size() == bytes.size() &&
         std::equal(initial.span().begin(), initial.span().end(), bytes.begin(), bytes.end());
-    auto recovered = initial.MoveToMultiBuffer();
+    auto recovered = std::move(initial).MoveToMultiBuffer();
     const bool passed = failed && retained && memory::rejected_pmr_allocations > before &&
         initial.empty() && recovered.byte_size() == bytes.size();
     std::printf("initial allocation: failed=%d retained=%d recovered=%zu passed=%d\n",

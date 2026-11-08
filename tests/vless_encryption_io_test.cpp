@@ -35,6 +35,10 @@ static_assert(!std::is_copy_constructible_v<vless::VlessEncryptionTicketRejectio
 static_assert(!std::is_copy_assignable_v<vless::VlessEncryptionTicketRejection>);
 static_assert(!std::is_move_constructible_v<vless::VlessEncryptionTicketRejection>);
 static_assert(!std::is_move_assignable_v<vless::VlessEncryptionTicketRejection>);
+static_assert(!std::is_copy_constructible_v<vless::VlessEncryptionWriter>);
+static_assert(!std::is_copy_assignable_v<vless::VlessEncryptionWriter>);
+static_assert(!std::is_move_constructible_v<vless::VlessEncryptionWriter>);
+static_assert(!std::is_move_assignable_v<vless::VlessEncryptionWriter>);
 
 
 
@@ -365,6 +369,193 @@ void RunDeferredRejectionCase(vless::VlessEncryptionAeadCipher cipher,
     future.get();
 }
 
+enum class WriteFault { PartialFailure, SuspendedCancellation, Closed };
+
+class InterruptedWriter final : public transport::MultiBufferWriter {
+public:
+    InterruptedWriter(WriteFault fault, net::cancellation_signal& signal)
+        : fault_(fault), signal_(signal) {}
+
+    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer payload) override {
+        const auto bytes = Flatten(payload);
+        const net::const_buffer buffer(bytes.data(), bytes.size());
+        co_await WriteBuffers(std::span<const net::const_buffer>(&buffer, 1));
+    }
+
+    net::awaitable<void> WriteBuffers(
+        std::span<const net::const_buffer> buffers) override {
+        if (!armed_) {
+            co_await capture.WriteBuffers(buffers);
+            co_return;
+        }
+        armed_ = false;
+        if (fault_ == WriteFault::Closed) {
+            throw transport::WriteClosed();
+        }
+        // Publish an incomplete record before reporting an unknown write result.
+        const net::const_buffer prefix(
+            buffers.front().data(), vless::kVlessEncryptionRecordHeaderSize + 3);
+        co_await capture.WriteBuffers(
+            std::span<const net::const_buffer>(&prefix, 1));
+        if (fault_ == WriteFault::PartialFailure) {
+            throw IoSystemError(io_error::connection_refused,
+                                "controlled partial encrypted write");
+        }
+        const auto executor = co_await net::this_coro::executor;
+        net::steady_timer pending(executor);
+        pending.expires_at(net::steady_timer::time_point::max());
+        net::post(executor, [this] {
+            signal_.emit(net::cancellation_type::terminal);
+        });
+        IoErrorCode error;
+        co_await pending.async_wait(
+            net::redirect_error(net::use_awaitable, error));
+        Check(error == io_error::operation_aborted,
+              "controlled encrypted write was not cancelled");
+        throw IoSystemError(error);
+    }
+
+    CaptureWriter capture;
+
+private:
+    WriteFault fault_;
+    net::cancellation_signal& signal_;
+    bool armed_ = true;
+};
+
+void RunWriterFailureCase(vless::VlessEncryptionAeadCipher cipher,
+                          bool header_xor, WriteFault fault) {
+    net::io_context io;
+    net::cancellation_signal signal;
+    const auto exercise = [&]() -> net::awaitable<void> {
+        const std::array<uint8_t, vless::kVlessEncryptionCtrIvSize> context{};
+        const vless::VlessEncryptionUnitedKey key;
+        auto aead = vless::VlessEncryptionAead::Create(context, key.bytes, cipher);
+        Check(aead.has_value(), "failed to create faulting writer AEAD");
+        InterruptedWriter destination(fault, signal);
+        vless::VlessEncryptionWriter writer(
+            destination, std::move(*aead), key,
+            MakeHeaderXor(header_xor, key.bytes, context));
+        constexpr std::string_view payload = "encrypted-write-lifecycle";
+        const net::const_buffer buffer(payload.data(), payload.size());
+        bool original_error = false;
+        try {
+            co_await writer.WriteBuffers(
+                std::span<const net::const_buffer>(&buffer, 1));
+        } catch (const transport::WriteClosed&) {
+            original_error = fault == WriteFault::Closed;
+        } catch (const IoSystemError& error) {
+            original_error = error.code() ==
+                (fault == WriteFault::PartialFailure
+                     ? io_error::connection_refused : io_error::operation_aborted);
+        }
+        Check(original_error, "encrypted write did not preserve its original error");
+        co_await net::this_coro::reset_cancellation_state();
+        const auto published = destination.capture.bytes;
+        bool rejected = false;
+        try {
+            co_await writer.WriteBuffers(
+                std::span<const net::const_buffer>(&buffer, 1));
+        } catch (const transport::WriteClosed&) {
+            rejected = fault == WriteFault::Closed;
+        } catch (const IoSystemError& error) {
+            rejected = fault != WriteFault::Closed &&
+                       error.code() == io_error::connection_reset;
+        }
+        Check(destination.capture.bytes == published,
+              "terminal encrypted writer published another record");
+        Check(rejected, "terminal encrypted writer accepted another write");
+    };
+    auto future = net::co_spawn(io, exercise(),
+        net::bind_cancellation_slot(signal.slot(), net::use_future));
+    io.run();
+    future.get();
+}
+
+void RunWriterShutdownCase(vless::VlessEncryptionAeadCipher cipher,
+                           bool header_xor) {
+    net::io_context io;
+    const auto exercise = [&]() -> net::awaitable<void> {
+        const std::array<uint8_t, vless::kVlessEncryptionCtrIvSize> context{};
+        const vless::VlessEncryptionUnitedKey key;
+        auto aead = vless::VlessEncryptionAead::Create(context, key.bytes, cipher);
+        Check(aead.has_value(), "failed to create shutdown writer AEAD");
+        CaptureWriter destination;
+        vless::VlessEncryptionWriter writer(
+            destination, std::move(*aead), key,
+            MakeHeaderXor(header_xor, key.bytes, context));
+        constexpr std::string_view payload = "before-write-shutdown";
+        const net::const_buffer buffer(payload.data(), payload.size());
+        co_await writer.WriteBuffers(
+            std::span<const net::const_buffer>(&buffer, 1));
+        co_await writer.AsyncShutdownWrite();
+        co_await writer.AsyncShutdownWrite();
+        const auto published = destination.bytes;
+        bool rejected = false;
+        try {
+            co_await writer.WriteBuffers(
+                std::span<const net::const_buffer>(&buffer, 1));
+        } catch (const transport::WriteClosed&) {
+            rejected = true;
+        }
+        Check(destination.bytes == published,
+              "finished encrypted writer published another record");
+        Check(rejected, "finished encrypted writer accepted another write");
+    };
+    auto future = net::co_spawn(io, exercise(), net::use_future);
+    io.run();
+    future.get();
+}
+
+void RunWriterPrecancelCase(vless::VlessEncryptionAeadCipher cipher,
+                            bool header_xor) {
+    net::io_context io;
+    net::cancellation_signal signal;
+    const auto exercise = [&]() -> net::awaitable<void> {
+        const std::array<uint8_t, vless::kVlessEncryptionCtrIvSize> context{};
+        const vless::VlessEncryptionUnitedKey key;
+        auto aead = vless::VlessEncryptionAead::Create(context, key.bytes, cipher);
+        auto read_aead = vless::VlessEncryptionAead::Create(context, key.bytes, cipher);
+        Check(aead.has_value() && read_aead.has_value(),
+              "failed to create pre-cancel writer AEAD");
+        CaptureWriter destination;
+        vless::VlessEncryptionWriter writer(
+            destination, std::move(*aead), key,
+            MakeHeaderXor(header_xor, key.bytes, context));
+        constexpr std::string_view payload = "recoverable-before-record-start";
+        const net::const_buffer buffer(payload.data(), payload.size());
+        co_await net::this_coro::throw_if_cancelled(false);
+        signal.emit(net::cancellation_type::terminal);
+        bool cancelled = false;
+        try {
+            co_await writer.WriteBuffers(
+                std::span<const net::const_buffer>(&buffer, 1));
+        } catch (const IoSystemError& error) {
+            cancelled = error.code() == io_error::operation_aborted;
+        }
+        Check(destination.bytes.empty(),
+              "pre-cancelled encrypted writer published a record");
+        Check(cancelled, "pre-cancelled encrypted write did not report cancellation");
+        co_await net::this_coro::reset_cancellation_state();
+        co_await writer.WriteBuffers(
+            std::span<const net::const_buffer>(&buffer, 1));
+        InterruptedReader source(destination.bytes, {}, signal, false);
+        vless::VlessEncryptionReader reader(
+            source, std::move(*read_aead), key,
+            MakeHeaderXor(header_xor, key.bytes, context));
+        const auto decoded = Flatten(co_await reader.ReadMultiBuffer());
+        Check(std::string_view(reinterpret_cast<const char*>(decoded.data()),
+                               decoded.size()) == payload,
+              "pre-cancelled writer could not resume a consumable stream");
+        Check((co_await reader.ReadMultiBuffer()).empty(),
+              "pre-cancelled writer emitted extra plaintext");
+    };
+    auto future = net::co_spawn(io, exercise(),
+        net::bind_cancellation_slot(signal.slot(), net::use_future));
+    io.run();
+    future.get();
+}
+
 }  // namespace
 
 TEST(VlessEncryptionIo, Contract) {
@@ -389,6 +580,47 @@ TEST(VlessEncryptionIo, DeferredTicketAuthenticationAndCloseBoundaries) {
                     << " xor=" << header_xor << " boundary=" << boundary);
                 RunDeferredRejectionCase(cipher, header_xor, boundary);
             }
+        }
+    }
+}
+
+TEST(VlessEncryptionIo, WriterPartialFailureIsTerminal) {
+    for (const auto cipher : {vless::VlessEncryptionAeadCipher::Aes256Gcm,
+                              vless::VlessEncryptionAeadCipher::Chacha20Poly1305}) {
+        for (const bool header_xor : {false, true}) {
+            RunWriterFailureCase(cipher, header_xor, WriteFault::PartialFailure);
+        }
+    }
+}
+
+TEST(VlessEncryptionIo, WriterSuspendedCancellationIsTerminal) {
+    for (const auto cipher : {vless::VlessEncryptionAeadCipher::Aes256Gcm,
+                              vless::VlessEncryptionAeadCipher::Chacha20Poly1305}) {
+        for (const bool header_xor : {false, true}) {
+            RunWriterFailureCase(cipher, header_xor, WriteFault::SuspendedCancellation);
+        }
+    }
+}
+
+TEST(VlessEncryptionIo, WriterClosedRejectionIsTerminal) {
+    RunWriterFailureCase(vless::VlessEncryptionAeadCipher::Aes256Gcm,
+                         true, WriteFault::Closed);
+}
+
+TEST(VlessEncryptionIo, WriterShutdownIsTerminal) {
+    for (const auto cipher : {vless::VlessEncryptionAeadCipher::Aes256Gcm,
+                              vless::VlessEncryptionAeadCipher::Chacha20Poly1305}) {
+        for (const bool header_xor : {false, true}) {
+            RunWriterShutdownCase(cipher, header_xor);
+        }
+    }
+}
+
+TEST(VlessEncryptionIo, WriterPrecancelDoesNotAdvanceRecord) {
+    for (const auto cipher : {vless::VlessEncryptionAeadCipher::Aes256Gcm,
+                              vless::VlessEncryptionAeadCipher::Chacha20Poly1305}) {
+        for (const bool header_xor : {false, true}) {
+            RunWriterPrecancelCase(cipher, header_xor);
         }
     }
 }

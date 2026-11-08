@@ -2,6 +2,7 @@
 
 #include "common/buffer_util.hpp"
 #include "common/buf/contiguous_buffer_view.hpp"
+#include "common/initial_payload.hpp"
 
 #include <array>
 #include <cstring>
@@ -36,6 +37,59 @@ static_assert(BorrowableUdpInfo<::buf::MultiBuffer&>);
 static_assert(BorrowableUdpInfo<const ::buf::MultiBuffer&>);
 static_assert(!BorrowableUdpInfo<::buf::MultiBuffer&&>);
 static_assert(!BorrowableUdpInfo<const ::buf::MultiBuffer&&>);
+
+template<class T>
+concept BorrowablePrefix = requires(T&& payload) {
+    std::forward<T>(payload).PrefixSpan(1);
+};
+template<class T>
+concept BorrowableFront = requires(T&& payload) {
+    std::forward<T>(payload).FrontSpan();
+};
+template<class T>
+concept BorrowableDescriptors = requires(T&& builder) {
+    std::forward<T>(builder).Span();
+};
+template<class T>
+concept BorrowableInitialBytes = requires(T&& payload) {
+    std::forward<T>(payload).span();
+};
+template<class T>
+concept AppendablePacket = requires(::ConstBufferSpanBuilder<2>& builder, T&& payload) {
+    builder.AppendMultiBuffer(std::forward<T>(payload));
+};
+template<class T>
+concept ExtractableInitialPayload = requires(T&& payload) {
+    std::forward<T>(payload).MoveToMultiBuffer();
+};
+static_assert(BorrowablePrefix<::buf::MultiBuffer&>);
+static_assert(BorrowablePrefix<const ::buf::MultiBuffer&>);
+static_assert(!BorrowablePrefix<::buf::MultiBuffer&&>);
+static_assert(!BorrowablePrefix<const ::buf::MultiBuffer&&>);
+static_assert(BorrowableFront<::buf::MultiBuffer&>);
+static_assert(BorrowableFront<const ::buf::MultiBuffer&>);
+static_assert(!BorrowableFront<::buf::MultiBuffer&&>);
+static_assert(!BorrowableFront<const ::buf::MultiBuffer&&>);
+static_assert(BorrowableDescriptors<::ConstBufferSpanBuilder<2>&>);
+static_assert(BorrowableDescriptors<const ::ConstBufferSpanBuilder<2>&>);
+static_assert(!BorrowableDescriptors<::ConstBufferSpanBuilder<2>&&>);
+static_assert(!BorrowableDescriptors<const ::ConstBufferSpanBuilder<2>&&>);
+static_assert(AppendablePacket<::buf::MultiBuffer&>);
+static_assert(AppendablePacket<const ::buf::MultiBuffer&>);
+static_assert(!AppendablePacket<::buf::MultiBuffer&&>);
+static_assert(!AppendablePacket<const ::buf::MultiBuffer&&>);
+static_assert(BorrowablePrefix<::InitialPayload&>);
+static_assert(BorrowablePrefix<const ::InitialPayload&>);
+static_assert(!BorrowablePrefix<::InitialPayload&&>);
+static_assert(!BorrowablePrefix<const ::InitialPayload&&>);
+static_assert(BorrowableInitialBytes<::InitialPayload&>);
+static_assert(BorrowableInitialBytes<const ::InitialPayload&>);
+static_assert(!BorrowableInitialBytes<::InitialPayload&&>);
+static_assert(!BorrowableInitialBytes<const ::InitialPayload&&>);
+static_assert(ExtractableInitialPayload<::InitialPayload&&>);
+static_assert(!ExtractableInitialPayload<::InitialPayload&>);
+static_assert(!ExtractableInitialPayload<const ::InitialPayload&>);
+static_assert(!ExtractableInitialPayload<const ::InitialPayload&&>);
 
 // Retain poisoned retired blocks so stale descriptor reads fail deterministically.
 class RetiringResource final : public std::pmr::memory_resource {

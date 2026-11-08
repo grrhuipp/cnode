@@ -76,6 +76,7 @@ public:
             Append(net::const_buffer(bytes.data(), bytes.size()));
         }
     }
+    void AppendMultiBuffer(const buf::MultiBuffer&&) = delete;
 
     void Clear() noexcept {
         if (spill_.capacity() != 0) {
@@ -92,12 +93,13 @@ public:
         return spill_.empty() ? count_ : spill_.size();
     }
 
-    [[nodiscard]] std::span<const net::const_buffer> Span() const noexcept {
+    [[nodiscard]] std::span<const net::const_buffer> Span() const& noexcept {
         if (!spill_.empty()) {
             return std::span<const net::const_buffer>(spill_.data(), spill_.size());
         }
         return std::span<const net::const_buffer>(stack_.data(), count_);
     }
+    std::span<const net::const_buffer> Span() const&& = delete;
 
 private:
     void EnsureSpillCapacity(size_t additional) {

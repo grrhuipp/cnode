@@ -125,7 +125,21 @@ BodyEncoder::BodyEncoder(const BodyOptions& options,
                                   size_t{buf::Buffer::kSize} - reserved);
 }
 
+void BodyEncoder::CheckWritable() const {
+    if (state_ == State::Failed) {
+        ThrowWriteError("VMess body writer is failed");
+    }
+    if (state_ == State::Finished) {
+        throw transport::WriteClosed();
+    }
+}
+
 void BodyEncoder::Encode(const buf::MultiBuffer& payload, buf::MultiBuffer& out) {
+    CheckWritable();
+    if (&payload == &out) {
+        throw IoSystemError(io_error::invalid_argument,
+                            "VMess body input and output must be distinct");
+    }
     if (PacketMode() &&
         (payload.byte_size() != 0 || buf::InspectUdpDatagram(payload).Valid())) {
         const buf::ContiguousBufferView packet(payload);
@@ -143,6 +157,7 @@ void BodyEncoder::Encode(const buf::MultiBuffer& payload, buf::MultiBuffer& out)
 }
 
 void BodyEncoder::Encode(std::span<const net::const_buffer> payload, buf::MultiBuffer& out) {
+    CheckWritable();
     if (PacketMode()) {
         const buf::ContiguousBufferView packet(payload);
         EncodePacket(packet.Bytes(), out);
@@ -162,7 +177,10 @@ void BodyEncoder::Encode(std::span<const net::const_buffer> payload, buf::MultiB
 }
 
 void BodyEncoder::EncodeEnd(buf::MultiBuffer& out) {
+    if (state_ == State::Finished) return;
+    CheckWritable();
     EncodeChunk({}, out);
+    Finish();
 }
 
 void BodyEncoder::EncodeStream(std::span<const uint8_t> bytes, buf::MultiBuffer& out) {
@@ -174,26 +192,34 @@ void BodyEncoder::EncodeStream(std::span<const uint8_t> bytes, buf::MultiBuffer&
 }
 
 size_t BodyEncoder::EncodeEndTo(std::span<uint8_t, 128> out) {
-    const size_t padding = cipher_.NextPaddingSize();
-    const size_t length_size = cipher_.LengthSize();
-    const size_t capacity = length_size + cipher_.Overhead() + padding;
-    if (capacity > out.size()) {
-        ThrowWriteError("VMess EOF chunk exceeds inline buffer");
+    if (state_ == State::Finished) return 0;
+    CheckWritable();
+    try {
+        const size_t padding = cipher_.NextPaddingSize();
+        const size_t length_size = cipher_.LengthSize();
+        const size_t capacity = length_size + cipher_.Overhead() + padding;
+        if (capacity > out.size()) {
+            ThrowWriteError("VMess EOF chunk exceeds inline buffer");
+        }
+        uint8_t* dst = out.data();
+        const ssize_t sealed = cipher_.Payload().Encrypt(nullptr, 0, dst + length_size);
+        if (sealed < 0) {
+            ThrowWriteError("VMess body encrypt failed");
+        }
+        const size_t chunk_size = static_cast<size_t>(sealed) + padding;
+        if (!cipher_.EncodeLength(chunk_size, dst)) {
+            ThrowWriteError("VMess body length encode failed");
+        }
+        if (padding > 0 &&
+            RAND_bytes(dst + length_size + sealed, static_cast<int>(padding)) != 1) {
+            ThrowWriteError("VMess body padding generation failed");
+        }
+        Finish();
+        return length_size + chunk_size;
+    } catch (...) {
+        Abort();
+        throw;
     }
-    uint8_t* dst = out.data();
-    const ssize_t sealed = cipher_.Payload().Encrypt(nullptr, 0, dst + length_size);
-    if (sealed < 0) {
-        ThrowWriteError("VMess body encrypt failed");
-    }
-    const size_t chunk_size = static_cast<size_t>(sealed) + padding;
-    if (!cipher_.EncodeLength(chunk_size, dst)) {
-        ThrowWriteError("VMess body length encode failed");
-    }
-    if (padding > 0 &&
-        RAND_bytes(dst + length_size + sealed, static_cast<int>(padding)) != 1) {
-        ThrowWriteError("VMess body padding generation failed");
-    }
-    return length_size + chunk_size;
 }
 
 void BodyEncoder::EncodePacket(std::span<const uint8_t> bytes, buf::MultiBuffer& out) {
@@ -209,7 +235,7 @@ void BodyEncoder::EncodePacket(std::span<const uint8_t> bytes, buf::MultiBuffer&
     EncodeChunk(bytes, out);
 }
 
-void BodyEncoder::EncodeChunk(std::span<const uint8_t> bytes, buf::MultiBuffer& out) {
+void BodyEncoder::EncodeChunk(std::span<const uint8_t> bytes, buf::MultiBuffer& out) try {
     const size_t padding = cipher_.NextPaddingSize();
     const size_t length_size = cipher_.LengthSize();
     const size_t capacity = length_size + bytes.size() + cipher_.Overhead() + padding;
@@ -233,6 +259,9 @@ void BodyEncoder::EncodeChunk(std::span<const uint8_t> bytes, buf::MultiBuffer& 
     }
 
     encoded.AppendTo(length_size + chunk_size, out);
+} catch (...) {
+    Abort();
+    throw;
 }
 
 // ============================================================================

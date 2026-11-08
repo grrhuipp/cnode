@@ -6,6 +6,7 @@
 #include "common/address_codec.hpp"
 #include "infra/log.hpp"
 #include "../udp_datagram.hpp"
+#include <asio/this_coro.hpp>
 #include <openssl/mem.h>
 #include <algorithm>
 #include <cstring>
@@ -230,41 +231,96 @@ public:
     ResponseBodyWriter& operator=(const ResponseBodyWriter&) = delete;
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
-        if (encoder_.PacketMode()) {
-            ::vmess::ValidateFixedUdpDatagram(mb, udp_target_);
+        encoder_.CheckWritable();
+        if ((co_await net::this_coro::cancellation_state).cancelled() !=
+            net::cancellation_type::none) {
+            throw IoSystemError(io_error::operation_aborted,
+                                "VMess response write cancelled before start");
         }
-        buf::MultiBuffer chunks;
-        encoder_.Encode(mb, chunks);
-        mb.clear();
-        co_await Flush(std::move(chunks));
+        bool frame_generated = false;
+        try {
+            if (encoder_.PacketMode()) {
+                ::vmess::ValidateFixedUdpDatagram(mb, udp_target_);
+            }
+            buf::MultiBuffer chunks;
+            encoder_.Encode(mb, chunks);
+            frame_generated = chunks.byte_size() != 0;
+            mb.clear();
+            co_await Flush(std::move(chunks));
+        } catch (const transport::WriteClosed&) {
+            encoder_.Finish();
+            throw;
+        } catch (...) {
+            if (frame_generated || encoder_.Failed()) {
+                encoder_.Abort();
+                stream_.CloseAbortive();
+            }
+            throw;
+        }
     }
 
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
-        buf::MultiBuffer chunks;
-        encoder_.Encode(buffers, chunks);
-        co_await Flush(std::move(chunks));
+        encoder_.CheckWritable();
+        if ((co_await net::this_coro::cancellation_state).cancelled() !=
+            net::cancellation_type::none) {
+            throw IoSystemError(io_error::operation_aborted,
+                                "VMess response write cancelled before start");
+        }
+        bool frame_generated = false;
+        try {
+            buf::MultiBuffer chunks;
+            encoder_.Encode(buffers, chunks);
+            frame_generated = chunks.byte_size() != 0;
+            co_await Flush(std::move(chunks));
+        } catch (const transport::WriteClosed&) {
+            encoder_.Finish();
+            throw;
+        } catch (...) {
+            if (frame_generated || encoder_.Failed()) {
+                encoder_.Abort();
+                stream_.CloseAbortive();
+            }
+            throw;
+        }
     }
 
     net::awaitable<void> AsyncShutdownWrite() override {
-        if (eof_sent_) {
-            co_return;
+        if (encoder_.Finished()) co_return;
+        encoder_.CheckWritable();
+        if ((co_await net::this_coro::cancellation_state).cancelled() !=
+            net::cancellation_type::none) {
+            throw IoSystemError(io_error::operation_aborted,
+                                "VMess response EOF cancelled before start");
         }
-        std::array<uint8_t, 128> eof_chunk{};
-        const size_t eof_len = encoder_.EncodeEndTo(eof_chunk);
-        if (!header_sent_) {
-            header_sent_ = true;
-            const std::array<net::const_buffer, 2> buffers{
-                net::buffer(response_header_),
-                net::buffer(eof_chunk.data(), eof_len),
-            };
-            co_await stream_.WriteBuffers(buffers);
-        } else {
-            const std::array<net::const_buffer, 1> buffers{
-                net::buffer(eof_chunk.data(), eof_len),
-            };
-            co_await stream_.WriteBuffers(buffers);
+        bool frame_generated = false;
+        try {
+            std::array<uint8_t, 128> eof_chunk{};
+            const size_t eof_len = encoder_.EncodeEndTo(eof_chunk);
+            if (eof_len == 0) co_return;
+            frame_generated = true;
+            if (!header_sent_) {
+                header_sent_ = true;
+                const std::array<net::const_buffer, 2> buffers{
+                    net::buffer(response_header_),
+                    net::buffer(eof_chunk.data(), eof_len),
+                };
+                co_await stream_.WriteBuffers(buffers);
+            } else {
+                const std::array<net::const_buffer, 1> buffers{
+                    net::buffer(eof_chunk.data(), eof_len),
+                };
+                co_await stream_.WriteBuffers(buffers);
+            }
+        } catch (const transport::WriteClosed&) {
+            encoder_.Finish();
+            throw;
+        } catch (...) {
+            if (frame_generated || encoder_.Failed()) {
+                encoder_.Abort();
+                stream_.CloseAbortive();
+            }
+            throw;
         }
-        eof_sent_ = true;
     }
 
 private:
@@ -289,7 +345,6 @@ private:
     TargetAddress udp_target_;
     std::array<uint8_t, kResponseHeaderSize> response_header_;
     bool header_sent_ = false;
-    bool eof_sent_ = false;
 };
 
 }  // namespace

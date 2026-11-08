@@ -286,7 +286,7 @@ proxy::shadowsocks::inbound::Handler::Process(
             std::move(stream),
             *request_reader,
             *response_writer,
-            initial_payload.MoveToMultiBuffer(),
+            std::move(initial_payload).MoveToMultiBuffer(),
             dispatcher,
             receiver.dispatch_policy,
             io_context,

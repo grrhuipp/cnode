@@ -644,7 +644,7 @@ public:
         InitialPayload first, session::Context& ctx, StatsShard&, const TimeoutsConfig&) override {
         ++calls;
         host = ctx.outbound.target.host;
-        auto data = first.MoveToMultiBuffer();
+        auto data = std::move(first).MoveToMultiBuffer();
         while (bytes.size() < 60000) {
             for (const auto* buffer : data) {
                 if (buffer) bytes.insert(bytes.end(), buffer->Bytes().begin(), buffer->Bytes().end());
@@ -755,7 +755,7 @@ public:
         ++active;
         (void)co_await gate.async_wait(net::as_tuple(net::use_awaitable));
         if (consume) {
-            auto data = first.MoveToMultiBuffer();
+            auto data = std::move(first).MoveToMultiBuffer();
             try {
                 while (true) {
                     for (const auto* buffer : data) {

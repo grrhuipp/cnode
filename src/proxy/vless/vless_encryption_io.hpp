@@ -84,6 +84,10 @@ public:
                           const VlessEncryptionUnitedKey& united_key,
                           std::optional<VlessEncryptionHeaderXor>
                               header_xor) noexcept;
+    VlessEncryptionWriter(const VlessEncryptionWriter&) = delete;
+    VlessEncryptionWriter& operator=(const VlessEncryptionWriter&) = delete;
+    VlessEncryptionWriter(VlessEncryptionWriter&&) = delete;
+    VlessEncryptionWriter& operator=(VlessEncryptionWriter&&) = delete;
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override;
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override;
@@ -93,12 +97,17 @@ public:
     }
 
 private:
-    net::awaitable<void> WritePlaintext(std::span<const uint8_t> data);
+    enum class State : uint8_t { Active, Finished, Failed };
+
+    void CheckWritable() const;
+    net::awaitable<void> WritePlaintext(std::span<const uint8_t> data,
+                                       bool& record_started);
 
     transport::MultiBufferWriter& dst_;
     VlessEncryptionAead aead_;
     VlessEncryptionUnitedKey united_key_;
     std::optional<VlessEncryptionHeaderXor> header_xor_;
+    State state_ = State::Active;
 };
 
 }  // namespace vless

@@ -192,7 +192,7 @@ void InitialMatrix() {
             auto expected = mode == 2 ? std::vector<uint8_t>{} : before;
             expected.insert(expected.end(), added.begin(), added.end());
             const bool matched = Matches(payload, expected);
-            auto moved = payload.MoveToMultiBuffer();
+            auto moved = std::move(payload).MoveToMultiBuffer();
             return unchanged && matched && payload.empty() && Flatten(moved) == expected && Consistent(moved);
         });
     }
@@ -382,7 +382,7 @@ void EdgeCases() {
     buf::MultiBuffer transferred;
     Check(Inject(0, [&] {
         InitialPayload from_stream{std::move(owned)};
-        transferred = from_stream.MoveToMultiBuffer();
+        transferred = std::move(from_stream).MoveToMultiBuffer();
         return from_stream.empty();
     }) && owned.empty() && *transferred.begin() == original_buffer &&
           Flatten(transferred) == owned_bytes, "logical stream remainder transfers without allocation or payload copy");
@@ -534,7 +534,7 @@ TEST(BufferOwnership, EmptyUdpMessageSurvivesTransfersAndChecksEveryTarget) {
     InitialPayload initial(std::move(packet));
     EXPECT_FALSE(initial.empty());
     EXPECT_EQ(initial.size(), 0);
-    auto moved = initial.MoveToMultiBuffer();
+    auto moved = std::move(initial).MoveToMultiBuffer();
     moved.ReleaseIfIdle();
     EXPECT_TRUE(initial.empty());
     {
