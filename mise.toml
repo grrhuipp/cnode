@@ -44,6 +44,7 @@ cmake -S . -B build/musl -G Ninja \
     -DVCPKG_CHAINLOAD_TOOLCHAIN_FILE="$PWD/cmake/musl.cmake" \
     -DCNODE_ENABLE_LTO=ON \
     -DBUILD_TESTING=OFF \
+    -DBUILD_BENCHMARKS=OFF \
     -DBUILD_ID="${BUILD_ID:-}"
 '''
 

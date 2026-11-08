@@ -1082,6 +1082,14 @@ inline void CollectBurst() noexcept {
 
 template <class T>
 class ThreadLocalAllocator {
+    template <class U>
+    struct UsesAllocatorConstruction
+        : std::uses_allocator<U, std::pmr::polymorphic_allocator<T>> {};
+    // [allocator.uses.construction] propagates into pair members even though
+    // uses_allocator<pair<...>> itself is false.
+    template <class First, class Second>
+    struct UsesAllocatorConstruction<std::pair<First, Second>> : std::true_type {};
+
 public:
     using value_type = T;
     using propagate_on_container_move_assignment = std::true_type;
@@ -1131,9 +1139,11 @@ public:
         std::pmr::polymorphic_allocator<T>(resource_).deallocate(pointer, count);
     }
     template <class U, class... Args>
+        requires (UsesAllocatorConstruction<std::remove_cv_t<U>>::value)
     void construct(U* pointer, Args&&... args) {
         auto lifetime = PinResource();
-        // Preserve uses-allocator construction for nested strings/containers.
+        // Ordinary elements use allocator_traits' construct_at fallback without
+        // touching the resource; only allocator-consuming construction pins it.
         std::pmr::polymorphic_allocator<T>(resource_).construct(
             pointer, std::forward<Args>(args)...);
     }

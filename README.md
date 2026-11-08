@@ -43,7 +43,7 @@ mise run build
 mise run test
 ```
 
-`mise run test` 构建 `cnode_tests` 并运行 CTest。测试仅分 `unit` 和 `e2e`；测试可执行文件不进入默认构建，普通测试复用生产静态库，分配故障场景共用一份按需构建的测试库。需要分步操作时：
+`mise run test` 构建 `cnode_tests` 并运行 CTest。功能测试分为 `unit` 和 `e2e`；测试可执行文件不进入默认构建，普通测试复用生产静态库，分配故障场景共用一份按需构建的测试库。需要分步操作时：
 
 ```sh
 mise run test:configure
@@ -53,6 +53,16 @@ mise exec -- ctest --test-dir build/musl --output-on-failure --no-tests=error --
 ```
 
 主程序与测试共用 `build/musl`，不重复建立独立发布构建树。若只需要某个测试，可显式构建其 `cnode_*_test` 目标，再用 `mise exec -- ctest --test-dir build/musl --output-on-failure --no-tests=error -R <名称>` 执行。切回 `mise run build` 会关闭测试注册。可选 io_uring 后端通过 `mise run configure -- -DCNODE_IO_URING=ON` 配置，再执行 `mise exec -- cmake --build build/musl --target cnode`；官方发布仅提供 epoll。
+
+性能基准默认关闭，显式开启后通过独立的 `cnode_benchmarks` 目标和 CTest `benchmark` 标签运行，不随 `cnode_tests` 构建：
+
+```sh
+mise run test:configure -- -DBUILD_BENCHMARKS=ON
+mise exec -- cmake --build build/musl --target cnode_benchmarks
+mise exec -- ctest --test-dir build/musl --no-tests=error -L '^benchmark$' -V
+```
+
+当前基准覆盖带生命周期跟踪的字节缓冲追加，以及真实 cnode 进程的 VLESS/TLS 上传、下载（1 个 Worker，1/8 条并发流，每流预热 1 MiB、测量 16 MiB，并校验完整载荷）。TLS 基准可用 `CNODE_BENCHMARK_BINARY=/absolute/path/to/cnode` 指定对比二进制；其 CPU 指标包含进程启动、握手、预热、传输和停机，不等于纯传输阶段 CPU。基准输出测量值，不以耗时阈值判定测试成功。启用基准时，功能回归使用 `-L '^(unit|e2e)$'`；重新运行未显式开启基准的 mise 配置任务会关闭基准注册。
 
 官方参考程序互操作测试按需配置，使用本地可执行文件，不在测试期间下载。AnyTLS 参考程序可先用宿主 Go 准备，默认离线且要求固定提交的干净源码：
 

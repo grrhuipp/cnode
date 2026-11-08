@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.24)
 
 # Manifest features must be selected before project() loads the vcpkg toolchain.
 option(BUILD_TESTING "Configure unit and E2E tests (build with target cnode_tests)" OFF)
+option(BUILD_BENCHMARKS "Configure opt-in benchmarks (requires BUILD_TESTING)" OFF)
 if(BUILD_TESTING)
     list(APPEND VCPKG_MANIFEST_FEATURES tests)
 endif()
@@ -504,8 +505,27 @@ function(cnode_e2e name source)
         TEST_PREFIX "e2e.${name}." PROPERTIES LABELS e2e TIMEOUT ${timeout})
 endfunction()
 
+if(BUILD_BENCHMARKS)
+    add_custom_target(cnode_benchmarks)
+    add_executable(cnode_allocator_append_benchmark EXCLUDE_FROM_ALL
+        tests/allocator_append_benchmark.cpp)
+    target_link_libraries(cnode_allocator_append_benchmark PRIVATE
+        cnode_build_options GTest::gtest_main)
+    add_executable(cnode_tls_throughput_benchmark EXCLUDE_FROM_ALL
+        tests/e2e/tls_throughput_benchmark.cpp)
+    target_link_libraries(cnode_tls_throughput_benchmark PRIVATE
+        cnode_e2e_support GTest::gtest_main)
+    add_dependencies(cnode_tls_throughput_benchmark cnode)
+    foreach(target IN ITEMS cnode_allocator_append_benchmark cnode_tls_throughput_benchmark)
+        target_compile_options(${target} PRIVATE -UNDEBUG)
+        add_dependencies(cnode_benchmarks ${target})
+        gtest_discover_tests(${target} DISCOVERY_MODE PRE_TEST
+            TEST_PREFIX "benchmark." PROPERTIES LABELS benchmark RUN_SERIAL TRUE TIMEOUT 180)
+    endforeach()
+endif()
+
 file(GLOB e2e_sources CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e/*.cpp")
-list(FILTER e2e_sources EXCLUDE REGEX "/(support|reference_[^/]+|anytls_sessions_reference)\\.cpp$")
+list(FILTER e2e_sources EXCLUDE REGEX "/(support|reference_[^/]+|anytls_sessions_reference|[^/]+_benchmark)\\.cpp$")
 foreach(source IN LISTS e2e_sources)
     get_filename_component(name "${source}" NAME_WE)
     cnode_e2e("${name}" "${source}")
