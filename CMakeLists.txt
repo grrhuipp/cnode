@@ -279,8 +279,8 @@ set_property(SOURCE src/app/bootstrap.cpp src/app/bootstrap_cli.cpp
     BUILD_CHANNEL="$<IF:$<CONFIG:Debug>,debug,release>")
 
 add_executable(cnode src/main.cpp)
-# The daemon, executor and TCP send benchmarks override malloc/new. Regression
-# tests retain allocation-failure hooks; explicit mi_* calls use the same API.
+# The daemon and allocation/executor/TCP send benchmarks override malloc/new.
+# Regression tests retain allocation-failure hooks; explicit mi_* calls use the same API.
 target_link_libraries(cnode PRIVATE
     "$<LINK_LIBRARY:WHOLE_ARCHIVE,cnode_core,mimalloc-static>")
 
@@ -511,7 +511,7 @@ if(BUILD_BENCHMARKS)
     add_executable(cnode_allocator_append_benchmark EXCLUDE_FROM_ALL
         tests/allocator_append_benchmark.cpp)
     target_link_libraries(cnode_allocator_append_benchmark PRIVATE
-        cnode_build_options GTest::gtest_main)
+        cnode_build_options "$<LINK_LIBRARY:WHOLE_ARCHIVE,mimalloc-static>" GTest::gtest_main)
     add_executable(cnode_tls_throughput_benchmark EXCLUDE_FROM_ALL
         tests/e2e/tls_throughput_benchmark.cpp)
     target_link_libraries(cnode_tls_throughput_benchmark PRIVATE

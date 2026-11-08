@@ -1408,14 +1408,15 @@ private:
         }
     }
 
-    void ReleaseStorage() noexcept {
-        if (data_) {
-            auto lifetime = PinResource();
-            resource_->deallocate(data_, capacity_ * sizeof(T), alignof(T));
-            data_ = nullptr;
-            capacity_ = 0;
-        }
+    // Keep the shared drain path out of callers to bound executable footprint.
+    [[gnu::noinline]] void ReleaseStorage() noexcept {
+        auto* data = std::exchange(data_, nullptr);
+        const auto capacity = std::exchange(capacity_, 0);
         head_ = 0;
+        if (data) {
+            // Detach storage before releasing its last domain lifetime.
+            resource_->deallocate(data, capacity * sizeof(T), alignof(T));
+        }
     }
 
     void Reserve(std::size_t min_cap) {

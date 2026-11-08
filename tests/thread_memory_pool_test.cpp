@@ -985,3 +985,36 @@ TEST(ThreadMemoryPool, RetiredAllocatorRebindsForNestedPairConstructionWithoutAl
     }
     EXPECT_EQ(current.OutstandingAllocations(), 0u);
 }
+
+TEST(ThreadMemoryPool, DrainedBorrowedQueueReleasesRetiredDomainAndRebinds) {
+    auto retired = std::make_unique<memory::AllocationDomain>();
+    memory::AllocationDomain current;
+    auto group = std::make_shared<int>(0);
+    auto shares = +[](const void* left, const void* right) noexcept { return left == right; };
+    retired->SetLeaseGroup(group, shares);
+    current.SetLeaseGroup(group, shares);
+    std::weak_ptr<void> lifetime = retired->memory().Lifetime();
+    memory::RingDeque<int> queue(retired->resource());
+    {
+        memory::ScopedAllocationDomain lease(*retired);
+        queue.push_back(42);
+    }
+    retired.reset();
+    ASSERT_FALSE(lifetime.expired());
+    bool intact = false;
+    std::thread migrated([&] {
+        memory::ScopedAllocationDomain lease(current);
+        intact = queue.front() == 42;
+        queue.pop_front();
+        intact = intact && lifetime.expired() && queue.capacity() == 0;
+        queue.push_back(73);
+        intact = intact && queue.front() == 73 &&
+            queue.get_allocator().resource() == current.resource();
+        queue.pop_front();
+        intact = intact && current.OutstandingAllocations() == 0;
+    });
+    migrated.join();
+    EXPECT_TRUE(intact);
+    EXPECT_TRUE(lifetime.expired());
+    memory::ThreadMemoryPool().PurgeIdle();
+}

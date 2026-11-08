@@ -249,4 +249,60 @@ TEST(BufferSpanBenchmark, TrackedDescriptors) {
     }
     memory::ThreadMemoryPool().PurgeIdle();
 }
+
+uint64_t FillAndDrain(memory::RingDeque<uint64_t>& queue,
+                     std::size_t batch, std::size_t iterations) {
+    uint64_t checksum = 0;
+    for (std::size_t iteration = 0; iteration < iterations; ++iteration) {
+        for (std::size_t value = 0; value < batch; ++value) queue.push_back(value);
+        asm volatile("" : : "g"(&queue) : "memory");
+        while (!queue.empty()) {
+            checksum += queue.front();
+            queue.pop_front();
+        }
+        asm volatile("" : : "g"(&queue), "g"(checksum) : "memory");
+    }
+    return checksum;
+}
+
+TEST(RingDequeBenchmark, TrackedFillAndDrain) {
+    memory::AllocationDomain domain;
+    memory::ScopedAllocationDomain lease(domain);
+    for (const std::size_t batch : {1u, 8u, 64u}) {
+        SCOPED_TRACE(batch);
+        memory::ThreadMemoryPool().PurgeIdle();
+        memory::RingDeque<uint64_t> queue;
+        for (std::size_t value = 0; value < batch; ++value) queue.push_back(value);
+        for (std::size_t value = 0; value < batch; ++value) {
+            ASSERT_EQ(queue.front(), value);
+            queue.pop_front();
+        }
+        ASSERT_EQ(queue.capacity(), 0u);
+        ASSERT_EQ(domain.OutstandingAllocations(), 0u);
+        constexpr std::size_t warmup = 128;
+        const std::size_t iterations = 262144 / batch;
+        const uint64_t batch_sum = batch * (batch - 1) / 2;
+        ASSERT_EQ(FillAndDrain(queue, batch, warmup), warmup * batch_sum);
+        const auto before = memory::ThreadMemoryPool().GetFootprint();
+        timespec cpu_start{}, cpu_end{};
+        ASSERT_EQ(::clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu_start), 0);
+        const auto start = std::chrono::steady_clock::now();
+        const auto checksum = FillAndDrain(queue, batch, iterations);
+        const auto finish = std::chrono::steady_clock::now();
+        ASSERT_EQ(::clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu_end), 0);
+        const auto after = memory::ThreadMemoryPool().GetFootprint();
+        EXPECT_EQ(checksum, iterations * batch_sum);
+        EXPECT_EQ(queue.capacity(), 0u);
+        EXPECT_EQ(domain.OutstandingAllocations(), 0u);
+        const double wall_ns = std::chrono::duration<double, std::nano>(finish - start).count();
+        const double cpu_ns = static_cast<double>(CpuNanoseconds(cpu_end) - CpuNanoseconds(cpu_start));
+        std::printf("ring-deque batch=%zu operations=%zu "
+                    "wall_ns_per_operation=%.3f cpu_ns_per_operation=%.3f "
+                    "live_after=%zu mapped_before=%zu mapped_after=%zu idle_after=%zu\n",
+            batch, iterations, wall_ns / iterations, cpu_ns / iterations,
+            domain.OutstandingAllocations(), before.mapped_bytes, after.mapped_bytes,
+            after.idle_bytes);
+    }
+    memory::ThreadMemoryPool().PurgeIdle();
+}
 } // namespace
