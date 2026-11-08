@@ -42,6 +42,7 @@ public:
         if (!stream_) {
             throw IoSystemError(io_error::not_connected, "Shadowsocks request writer has no stream");
         }
+        if (write_finished_) throw transport::WriteClosed();
         if (mb.byte_size() == 0) {
             co_return;
         }
@@ -49,20 +50,38 @@ public:
             ThrowSsWriteError("Shadowsocks client request writer is not initialized");
         }
 
-        buf::MultiBuffer out_mb;
-        out_mb.reserve(mb.size());
-
-        for (auto* buf : mb) {
-            auto bytes = buf->Bytes();
-            if (bytes.empty()) continue;
-
-            detail::EncryptToMultiBuffer(
-                *write_cipher_, write_nonce_, bytes, out_mb);
+        const auto cancellation = co_await net::this_coro::cancellation_state;
+        if (cancellation.cancelled() != net::cancellation_type::none) {
+            throw IoSystemError(io_error::operation_aborted);
         }
+        const uint64_t initial_nonce = write_nonce_;
+        bool write_started = false;
+        try {
+            buf::MultiBuffer out_mb;
+            out_mb.reserve(mb.size());
 
-        mb.clear();
-        if (out_mb.byte_size() != 0) {
-            co_await stream_->WriteMultiBuffer(std::move(out_mb));
+            for (auto* buf : mb) {
+                auto bytes = buf->Bytes();
+                if (bytes.empty()) continue;
+
+                detail::EncryptToMultiBuffer(
+                    *write_cipher_, write_nonce_, bytes, out_mb);
+            }
+
+            mb.clear();
+            if (out_mb.byte_size() != 0) {
+                write_started = true;
+                co_await stream_->WriteMultiBuffer(std::move(out_mb));
+            }
+        } catch (const transport::WriteClosed&) {
+            Finish();
+            throw;
+        } catch (const std::bad_alloc&) {
+            if (write_nonce_ != initial_nonce || write_started) Retire();
+            throw;
+        } catch (...) {
+            Retire();
+            throw;
         }
     }
 
@@ -70,31 +89,67 @@ public:
         if (!stream_) {
             throw IoSystemError(io_error::not_connected, "Shadowsocks request writer has no stream");
         }
+        if (write_finished_) throw transport::WriteClosed();
         if (!write_cipher_) {
             ThrowSsWriteError("Shadowsocks client request writer is not initialized");
         }
 
-        buf::MultiBuffer out_mb;
-        out_mb.reserve(buffers.size());
-        for (const net::const_buffer& buffer : buffers) {
-            const auto* data = static_cast<const uint8_t*>(buffer.data());
-            const size_t size = buffer.size();
-            if (!data || size == 0) {
-                continue;
-            }
-            detail::EncryptToMultiBuffer(
-                *write_cipher_,
-                write_nonce_,
-                std::span<const uint8_t>{data, size},
-                out_mb);
+        const auto cancellation = co_await net::this_coro::cancellation_state;
+        if (cancellation.cancelled() != net::cancellation_type::none) {
+            throw IoSystemError(io_error::operation_aborted);
         }
-        if (out_mb.byte_size() != 0) {
-            co_await stream_->WriteMultiBuffer(std::move(out_mb));
+        const uint64_t initial_nonce = write_nonce_;
+        bool write_started = false;
+        try {
+            buf::MultiBuffer out_mb;
+            out_mb.reserve(buffers.size());
+            for (const net::const_buffer& buffer : buffers) {
+                const auto* data = static_cast<const uint8_t*>(buffer.data());
+                const size_t size = buffer.size();
+                if (!data || size == 0) {
+                    continue;
+                }
+                detail::EncryptToMultiBuffer(
+                    *write_cipher_,
+                    write_nonce_,
+                    std::span<const uint8_t>{data, size},
+                    out_mb);
+            }
+            if (out_mb.byte_size() != 0) {
+                write_started = true;
+                co_await stream_->WriteMultiBuffer(std::move(out_mb));
+            }
+        } catch (const transport::WriteClosed&) {
+            Finish();
+            throw;
+        } catch (const std::bad_alloc&) {
+            if (write_nonce_ != initial_nonce || write_started) Retire();
+            throw;
+        } catch (...) {
+            Retire();
+            throw;
         }
     }
 
     net::awaitable<void> AsyncShutdownWrite() override {
-        return stream_->AsyncShutdownWrite();
+        if (!stream_) {
+            throw IoSystemError(io_error::not_connected, "Shadowsocks request writer has no stream");
+        }
+        if (write_finished_) co_return;
+        const auto cancellation = co_await net::this_coro::cancellation_state;
+        if (cancellation.cancelled() != net::cancellation_type::none) {
+            throw IoSystemError(io_error::operation_aborted);
+        }
+        try {
+            co_await stream_->AsyncShutdownWrite();
+            Finish();
+        } catch (const transport::WriteClosed&) {
+            Finish();
+            throw;
+        } catch (...) {
+            Retire();
+            throw;
+        }
     }
 
     bool WriteShutdownClosesLink() const noexcept override {
@@ -102,8 +157,20 @@ public:
     }
 
 private:
+    void Finish() {
+        write_finished_ = true;
+        write_cipher_.reset();
+    }
+
+    void Retire() {
+        auto* stream = std::exchange(stream_, nullptr);
+        write_cipher_.reset();
+        if (stream) stream->CloseAbortive();
+    }
+
     std::optional<SsAeadCipher> write_cipher_;
     uint64_t write_nonce_ = 0;
+    bool write_finished_ = false;
     AsyncStream* stream_ = nullptr;
 };
 

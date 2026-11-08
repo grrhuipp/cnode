@@ -849,6 +849,8 @@ struct UdpDatagramInfo {
     return info;
 }
 
+UdpDatagramInfo InspectUdpDatagram(const MultiBuffer&&) = delete;
+
 [[nodiscard]] inline bool AppendSpanToMultiBuffer(std::span<const uint8_t> data,
                                                   MultiBuffer& out_mb) {
     if (data.empty()) return true;

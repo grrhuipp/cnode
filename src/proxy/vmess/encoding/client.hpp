@@ -39,6 +39,8 @@ public:
     net::awaitable<void> EncodeRequestBodyEOF(AsyncStream& stream);
     // Authenticates the response header on first use, then returns body
     // chunks; empty at the end of the response body.
+    // Authentication/truncation and real I/O errors are terminal; a cancelled
+    // read instead preserves the current header/body progress for resumption.
     net::awaitable<buf::MultiBuffer> DecodeResponse(AsyncStream& stream);
 
 private:

@@ -225,15 +225,17 @@ net::awaitable<void> ClientSession::DecodeResponseHeader(AsyncStream& stream) {
         response_length_read_ = 0;
         response_header_read_ = 0;
     };
-    auto fail = [&]() {
+    auto fail_response = [&]() noexcept {
+        response_decoder_.Abort();
         reset_header_state();
-        ThrowResponseHeaderError();
+        OPENSSL_cleanse(keys_.response.key.data(), keys_.response.key.size());
+        OPENSSL_cleanse(keys_.response.iv.data(), keys_.response.iv.size());
     };
     try {
         if (response_header_sealed_.empty()) {
             if (!co_await response_decoder_.ReadExact(
                     stream, response_length_, response_length_read_)) {
-                fail();
+                ThrowResponseHeaderError();
             }
             const auto length_key = ResponseHeaderLengthKey(keys_.response.key, keys_.response.iv);
             std::array<uint8_t, 2> length{};
@@ -244,18 +246,18 @@ net::awaitable<void> ClientSession::DecodeResponseHeader(AsyncStream& stream) {
                                     nullptr, 0,
                                     length.data(), length.size(), length_size) ||
                 length_size != length.size()) {
-                fail();
+                ThrowResponseHeaderError();
             }
             const size_t header_len = (static_cast<size_t>(length[0]) << 8) | length[1];
             if (header_len < 4 || header_len > kResponseHeaderMax) {
-                fail();
+                ThrowResponseHeaderError();
             }
             response_header_sealed_.resize(header_len + 16);
         }
 
         if (!co_await response_decoder_.ReadExact(
                 stream, response_header_sealed_, response_header_read_)) {
-            fail();
+            ThrowResponseHeaderError();
         }
         const auto payload_key = ResponseHeaderPayloadKey(keys_.response.key, keys_.response.iv);
         const size_t header_len = response_header_sealed_.size() - 16;
@@ -267,7 +269,7 @@ net::awaitable<void> ClientSession::DecodeResponseHeader(AsyncStream& stream) {
                                 response_header_sealed_.data(), header_len, opened) ||
             opened != header_len ||
             response_header_sealed_[0] != keys_.response_header) {
-            fail();
+            ThrowResponseHeaderError();
         }
         response_header_received_ = true;
         OPENSSL_cleanse(keys_.response.key.data(), keys_.response.key.size());
@@ -275,11 +277,11 @@ net::awaitable<void> ClientSession::DecodeResponseHeader(AsyncStream& stream) {
         reset_header_state();
     } catch (const IoSystemError& error) {
         if (error.code() != io_error::operation_aborted) {
-            reset_header_state();
+            fail_response();
         }
         throw;
     } catch (...) {
-        reset_header_state();
+        fail_response();
         throw;
     }
 }

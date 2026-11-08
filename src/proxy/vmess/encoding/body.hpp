@@ -112,8 +112,8 @@ public:
                 const BodyKey& direction_key);
 
     // Empty result: EOF chunk, or transport EOF exactly at a record boundary.
-    // Transport EOF inside a record or authentication failure throws
-    // connection_reset; afterwards every Read returns empty.
+    // Transport EOF inside a record, authentication failure and other real
+    // errors are terminal; subsequent reads throw connection_reset.
     net::awaitable<buf::MultiBuffer> Read(transport::MultiBufferReader& src);
 
     // Exact read through the same buffered input, for the response header
@@ -122,7 +122,13 @@ public:
                                    std::span<uint8_t> out,
                                    size_t& filled);
 
+    // Discards this direction's buffered input and any undelivered plaintext.
+    // The response header shares this failure state with its body decoder.
+    void Abort() noexcept;
+
 private:
+    enum class State { Active, Finished, Failed };
+
     net::awaitable<buf::MultiBuffer> ReadChunk(transport::MultiBufferReader& src);
     [[noreturn]] void Fail(const char* what);
     void FinishRecord() noexcept;
@@ -140,7 +146,7 @@ private:
     size_t padding_len_ = 0;
     bool header_decoded_ = false;
     buf::ContiguousWriteBuffer read_buffer_;
-    bool eof_ = false;
+    State state_ = State::Active;
 };
 
 }  // namespace vmess::encoding

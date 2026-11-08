@@ -3,6 +3,15 @@
 
 #include "ss_udp.hpp"
 #include "shadowsocks_crypto.hpp"
+#include "client.hpp"
+#include "server.hpp"
+#include <asio/bind_cancellation_slot.hpp>
+#include <asio/cancellation_signal.hpp>
+#include <asio/co_spawn.hpp>
+#include <asio/post.hpp>
+#include <asio/redirect_error.hpp>
+#include <asio/steady_timer.hpp>
+#include <asio/use_future.hpp>
 #include "common/buf/contiguous_buffer_view.hpp"
 
 #include <algorithm>
@@ -463,6 +472,224 @@ void Check2022ReplayWindow() {
           "Shadowsocks 2022 replay cache lost state during handler adoption");
 }
 
+enum class WriteFault { None, PartialIo, PartialCancel, Allocation, ClosedBeforeStart };
+
+// The transport accepts a prefix before failing. Cancellation uses an actual
+// suspended operation, so retrying requires resetting the caller's cancellation.
+class FailingWriteStream final : public AsyncStream {
+public:
+    net::awaitable<size_t> AsyncRead(net::mutable_buffer buffer) override {
+        if (!open) co_return 0;
+        const size_t count = std::min(buffer.size(), reverse.size() - reverse_offset);
+        std::copy_n(reverse.data() + reverse_offset, count, static_cast<uint8_t*>(buffer.data()));
+        reverse_offset += count;
+        co_return count;
+    }
+    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override { co_return buf::MultiBuffer{}; }
+    net::awaitable<size_t> AsyncWrite(net::const_buffer) override {
+        throw std::logic_error("unexpected byte write");
+        co_return 0;
+    }
+    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
+        if (!open) throw IoSystemError(io_error::not_connected);
+        if (write_closed || fault == WriteFault::ClosedBeforeStart) throw transport::WriteClosed();
+        const auto bytes = Flatten(mb);
+        const size_t accepted = fault == WriteFault::None ? bytes.size() : std::min(size_t{7}, bytes.size());
+        wire.insert(wire.end(), bytes.begin(), bytes.begin() + accepted);
+        if (fault == WriteFault::Allocation) throw std::bad_alloc();
+        if (fault == WriteFault::PartialIo) throw IoSystemError(io_error::connection_reset);
+        if (fault == WriteFault::PartialCancel) {
+            const auto executor = co_await net::this_coro::executor;
+            net::steady_timer wait(executor);
+            wait.expires_at(net::steady_timer::time_point::max());
+            net::post(executor, [this] { signal->emit(net::cancellation_type::terminal); });
+            IoErrorCode error;
+            co_await wait.async_wait(net::redirect_error(net::use_awaitable, error));
+            Check(error == io_error::operation_aborted, "write cancellation did not interrupt a wait");
+            throw IoSystemError(error);
+        }
+    }
+    void ShutdownWrite() override { write_closed = true; }
+    void Cancel() noexcept override { NotifyCancellation(); }
+    void Close() override { Cancel(); open = false; NotifyClosed(); }
+    int NativeHandle() const override { return -1; }
+    bool IsOpen() const override { return open; }
+
+    WriteFault fault = WriteFault::None;
+    net::cancellation_signal* signal = nullptr;
+    std::vector<uint8_t> wire;
+    const std::array<uint8_t, 3> reverse{0x27, 0x49, 0x68};
+    size_t reverse_offset = 0;
+    bool write_closed = false;
+    bool open = true;
+};
+
+net::awaitable<void> WriteTcpPayload(transport::MultiBufferWriter& writer, bool scatter) {
+    const std::array<uint8_t, 3> payload{0x31, 0x52, 0x73};
+    if (scatter) {
+        const std::array<net::const_buffer, 1> buffers{net::buffer(payload)};
+        co_await writer.WriteBuffers(buffers);
+    } else {
+        buf::MultiBuffer mb;
+        Check(buf::AppendSpanToMultiBuffer(payload, mb), "TCP write fixture allocation failed");
+        co_await writer.WriteMultiBuffer(std::move(mb));
+    }
+}
+
+
+net::awaitable<std::unique_ptr<transport::MultiBufferWriter>> CreateTcpWriter(
+    const ss::SsCipherInfo& cipher, const ss::KeyBytes& key, bool response,
+    FailingWriteStream& stream) {
+    if (response) {
+        proxyman::inbound::UserStore::ShadowsocksCredential user;
+        Check(user.derived_key.assign(key.span()), "TCP response credential fixture failed");
+        user.key_size = cipher.key_size;
+        user.salt_size = cipher.salt_size;
+        ss::KeyBytes request_salt;
+        Check(request_salt.assign(key.span()), "TCP request salt fixture failed");
+        auto result = ss::WriteTCPResponse(user, cipher, request_salt, stream);
+        Check(bool(result), "public TCP response writer creation failed");
+        co_return std::move(*result);
+    }
+    auto result = co_await ss::WriteTCPRequest(
+        TargetAddress("1.1.1.1", 443), cipher, key, {}, stream);
+    Check(bool(result), "public TCP request writer creation failed");
+    co_return std::move(result->request_writer);
+}
+
+void CheckTcpWriterFailure(const ss::SsCipherInfo& cipher, bool response, bool scatter,
+                           bool initialized, WriteFault fault) {
+    net::io_context io;
+    net::cancellation_signal signal;
+    FailingWriteStream stream;
+    stream.signal = &signal;
+    ss::KeyBytes key;
+    std::array<uint8_t, 32> key_bytes{0x17, 0x29, 0x41};
+    Check(key.assign(std::span<const uint8_t>(key_bytes).first(cipher.key_size)),
+          "TCP writer key fixture failed");
+    const auto exercise = [&]() -> net::awaitable<void> {
+        auto writer = co_await CreateTcpWriter(cipher, key, response, stream);
+        if (initialized) co_await WriteTcpPayload(*writer, scatter);
+        stream.fault = fault;
+        bool failed = false;
+        try {
+            co_await WriteTcpPayload(*writer, scatter);
+        }
+        catch (const std::bad_alloc&) {
+            failed = fault == WriteFault::Allocation;
+        }
+        catch (const IoSystemError& error) {
+            failed = error.code() == (fault == WriteFault::PartialCancel
+                ? io_error::operation_aborted : io_error::connection_reset);
+        }
+        Check(failed, "TCP frame write did not preserve its original failure");
+        co_await net::this_coro::reset_cancellation_state();
+        EXPECT_FALSE(stream.IsOpen()) << "failed encrypted write left its transport reusable";
+        const auto wire = stream.wire;
+        stream.fault = WriteFault::None;
+        for (bool retry_scatter : {false, true}) {
+            bool rejected = false;
+            try { co_await WriteTcpPayload(*writer, retry_scatter); }
+            catch (const IoSystemError&) { rejected = true; }
+            EXPECT_TRUE(rejected) << "failed writer emitted another encrypted frame";
+        }
+        bool rejected = false;
+        try { co_await writer->AsyncShutdownWrite(); }
+        catch (const IoSystemError&) { rejected = true; }
+        EXPECT_TRUE(rejected) << "failed writer half-closed a retired transport";
+        EXPECT_EQ(stream.wire, wire);
+    };
+    auto done = net::co_spawn(io, exercise(),
+        net::bind_cancellation_slot(signal.slot(), net::use_future));
+    io.run();
+    done.get();
+}
+
+void CheckTcpCancellationBeforeEncryption(const ss::SsCipherInfo& cipher, bool response) {
+    net::io_context io;
+    net::cancellation_signal signal;
+    FailingWriteStream stream;
+    const auto key = ss::DeriveKey("tcp-writer-admission", cipher.key_size);
+    const auto exercise = [&]() -> net::awaitable<void> {
+        auto writer = co_await CreateTcpWriter(cipher, key, response, stream);
+        co_await WriteTcpPayload(*writer, true);
+        const auto wire = stream.wire;
+        for (const bool scatter : {false, true}) {
+            co_await net::this_coro::throw_if_cancelled(false);
+            signal.emit(net::cancellation_type::terminal);
+            bool cancelled = false;
+            try { co_await WriteTcpPayload(*writer, scatter); }
+            catch (const IoSystemError& error) {
+                cancelled = error.code() == io_error::operation_aborted;
+            }
+            co_await net::this_coro::reset_cancellation_state();
+            co_await net::this_coro::throw_if_cancelled(true);
+            Check(cancelled && stream.IsOpen() && stream.wire == wire,
+                  "cancelled-before-start write progressed or retired a healthy stream");
+        }
+        co_await WriteTcpPayload(*writer, true);
+        std::array<uint8_t, 32> subkey{};
+        const auto derive = ss::Is2022Cipher(cipher.type) ? ss::Derive2022Subkey : ss::DeriveSubkey;
+        Check(derive(key.data(), key.size, stream.wire.data(), cipher.salt_size, subkey.data()),
+              "retry decryption subkey derivation failed");
+        ss::SsAeadCipher decryptor(cipher.type, subkey.data(), cipher.key_size, proxy::AeadDirection::Decrypt);
+        std::array<uint8_t, 12> nonce{};
+        nonce[0] = response ? 2 : 4;
+        Check(stream.wire.size() - wire.size() == 37, "retry did not publish one complete encrypted frame");
+        std::array<uint8_t, 2> length{};
+        const auto* retry = stream.wire.data() + wire.size();
+        Check(decryptor.Decrypt(nonce.data(), retry, 18, length.data()) &&
+              length == std::array<uint8_t, 2>{0, 3}, "rejected write advanced the next record nonce");
+        ++nonce[0];
+        std::array<uint8_t, 3> payload{};
+        Check(decryptor.Decrypt(nonce.data(), retry + 18, 19, payload.data()) &&
+              payload == std::array<uint8_t, 3>{0x31, 0x52, 0x73},
+              "retry after pre-encryption cancellation changed plaintext");
+    };
+    auto done = net::co_spawn(io, exercise(),
+        net::bind_cancellation_slot(signal.slot(), net::use_future));
+    io.run();
+    done.get();
+}
+
+void CheckTcpFinishedWriter(const ss::SsCipherInfo& cipher, bool response, bool initialized,
+                            bool closed_before_start, bool scatter) {
+    net::io_context io;
+    FailingWriteStream stream;
+    const auto key = ss::DeriveKey("tcp-writer-finished", cipher.key_size);
+    const auto exercise = [&]() -> net::awaitable<void> {
+        auto writer = co_await CreateTcpWriter(cipher, key, response, stream);
+        if (initialized) co_await WriteTcpPayload(*writer, scatter);
+        if (closed_before_start) {
+            const auto wire = stream.wire;
+            stream.fault = WriteFault::ClosedBeforeStart;
+            bool closed = false;
+            try { co_await WriteTcpPayload(*writer, scatter); }
+            catch (const transport::WriteClosed&) { closed = true; }
+            Check(closed && stream.IsOpen() && stream.wire == wire,
+                  "definite write-side closure aborted the reverse direction or emitted data");
+            stream.fault = WriteFault::None;
+        } else {
+            co_await writer->AsyncShutdownWrite();
+        }
+        const auto wire = stream.wire;
+        for (const bool retry_scatter : {false, true}) {
+            bool closed = false;
+            try { co_await WriteTcpPayload(*writer, retry_scatter); }
+            catch (const transport::WriteClosed&) { closed = true; }
+            Check(closed, "finished writer did not reject before encryption with WriteClosed");
+        }
+        co_await writer->AsyncShutdownWrite();
+        Check(stream.IsOpen() && stream.wire == wire, "finished writer altered its transport on reuse");
+        std::array<uint8_t, 3> reply{};
+        Check(co_await stream.AsyncRead(net::buffer(reply)) == reply.size() && reply == stream.reverse,
+              "write-side completion discarded reverse-direction data");
+    };
+    auto done = net::co_spawn(io, exercise(), net::use_future);
+    io.run();
+    done.get();
+}
+
 }  // namespace
 
 TEST(ShadowsocksUdpDatagram, Contract) {
@@ -524,6 +751,54 @@ TEST(ShadowsocksUdpDatagram, AuthenticatedShortDomainDatagrams) {
             Check2022(target, source, payload.Bytes(), ss::SsCipherType::CHACHA20_POLY1305_2022, 32);
             Check2022(target, source, payload.Bytes(), ss::SsCipherType::AES_128_GCM_2022, 16, true);
             Check2022(target, source, payload.Bytes(), ss::SsCipherType::AES_256_GCM_2022, 32, true);
+        }
+    }
+}
+
+TEST(ShadowsocksTcpWriter, FailedFrameRetiresWriterAndTransport) {
+    for (std::string_view method : {"aes-128-gcm", "aes-256-gcm", "chacha20-poly1305",
+                                    "2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm",
+                                    "2022-blake3-chacha20-poly1305"}) {
+        SCOPED_TRACE(method);
+        const auto cipher = ss::ParseCipherMethod(method);
+        ASSERT_TRUE(cipher);
+        for (const bool response : {false, true}) {
+            SCOPED_TRACE(response);
+            CheckTcpCancellationBeforeEncryption(*cipher, response);
+            for (const bool scatter : {false, true}) {
+                SCOPED_TRACE(scatter);
+                for (const bool initialized : {false, true}) {
+                    SCOPED_TRACE(initialized);
+                    for (const auto fault : {WriteFault::PartialIo, WriteFault::PartialCancel,
+                                             WriteFault::Allocation}) {
+                        SCOPED_TRACE(static_cast<int>(fault));
+                        CheckTcpWriterFailure(*cipher, response, scatter, initialized, fault);
+                    }
+                }
+            }
+        }
+    }
+}
+
+TEST(ShadowsocksTcpWriter, FinishedWriterPreservesReverseRead) {
+    for (std::string_view method : {"aes-128-gcm", "aes-256-gcm", "chacha20-poly1305",
+                                    "2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm",
+                                    "2022-blake3-chacha20-poly1305"}) {
+        SCOPED_TRACE(method);
+        const auto cipher = ss::ParseCipherMethod(method);
+        ASSERT_TRUE(cipher);
+        for (const bool response : {false, true}) {
+            SCOPED_TRACE(response);
+            for (const bool initialized : {false, true}) {
+                SCOPED_TRACE(initialized);
+                for (const bool closed_before_start : {false, true}) {
+                    SCOPED_TRACE(closed_before_start);
+                    for (const bool scatter : {false, true}) {
+                        SCOPED_TRACE(scatter);
+                        CheckTcpFinishedWriter(*cipher, response, initialized, closed_before_start, scatter);
+                    }
+                }
+            }
         }
     }
 }

@@ -28,6 +28,15 @@ static_assert(BorrowableContiguousBytes<const ContiguousView&>);
 static_assert(!BorrowableContiguousBytes<ContiguousView&&>);
 static_assert(!BorrowableContiguousBytes<const ContiguousView&&>);
 
+template<class T>
+concept BorrowableUdpInfo = requires(T&& packet) {
+    ::buf::InspectUdpDatagram(std::forward<T>(packet));
+};
+static_assert(BorrowableUdpInfo<::buf::MultiBuffer&>);
+static_assert(BorrowableUdpInfo<const ::buf::MultiBuffer&>);
+static_assert(!BorrowableUdpInfo<::buf::MultiBuffer&&>);
+static_assert(!BorrowableUdpInfo<const ::buf::MultiBuffer&&>);
+
 // Retain poisoned retired blocks so stale descriptor reads fail deterministically.
 class RetiringResource final : public std::pmr::memory_resource {
 public:
