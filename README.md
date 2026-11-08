@@ -74,7 +74,7 @@ TCP 发送基准通过真实回环连接测量 1 B / 8 KiB / 64 KiB 突发，分
 
 SS2022 身份匹配微基准覆盖 1/16/256/4096 个用户、无 identity key 或 1/4 个 key 组、输入首/中/末用户及 hint 命中/失效/缺失；失效 hint 在新旧实现中指向同一名其他用户。每格预热 32 次、默认测量 512 次，可用 `CNODE_BENCH_ITERATIONS` 调整。计时包含生产认证函数、协程驱动、结果校验与释放，不含客户端握手报文准备；这是认证微基准，不覆盖 TCP 传输或完整入站的重放检查。
 
-运行时统计基准先建立真实 VLESS → Freedom 回环链路，覆盖 0/1/64/512 条物理连接、有/无资源统计，预热 16 轮后采集 64/256 轮。计时只包含 `Worker::CollectRuntimeStats` 与结果校验，不包含建连、载荷转发和停机。两项基准输出 CPU、延迟分位数、内存池映射和进程 RSS/峰值；峰值读取 Linux `/proc/self/status` 的 `VmHWM`，包含准备阶段。分配计数仅统计拦截到的 throwing C++ `new` 和 `mi_malloc_aligned` 入口，不等于全部 PMR 分配，两类不能相加。使用 CTest 使每个参数在独立进程运行：
+运行时统计基准先建立真实 VLESS → Freedom 回环链路，覆盖 0/1/64/512 条物理连接、有/无资源统计，预热 16 轮后采集 64/256 轮。计时只包含 `Worker::CollectRuntimeStats` 与结果校验，不包含建连、载荷转发和停机；计时外等待既有空闲池回收截止期，再报告回收后的占用，不强制清池。两项基准输出 CPU、延迟分位数、内存池映射和进程 RSS/峰值，并区分匿名页与文件页；峰值读取 Linux `/proc/self/status` 的 `VmHWM`，包含准备阶段。分配计数仅统计拦截到的 throwing C++ `new` 和 `mi_malloc_aligned` 入口，不等于全部 PMR 分配，两类不能相加。使用 CTest 使每个参数在独立进程运行：
 
 ```sh
 mise exec -- ctest --test-dir build/musl --no-tests=error \

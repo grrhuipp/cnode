@@ -79,20 +79,22 @@ TEST(ShadowsocksIdentityBenchmark, AuthenticationMatrix) {
                     }
                     const auto pool_after = memory::ThreadMemoryPool().GetFootprint();
                     const size_t after_rss = ResidentBytes();
-                    const size_t peak_rss = benchmark::PeakResidentBytes();
+                    const auto process_memory = benchmark::ReadProcessMemory();
                     std::sort(latencies.begin(), latencies.end());
                     double total_ns = 0;
                     for (double value : latencies) total_ns += value;
                     std::printf("ss-identity users=%zu groups=%zu input_position=%zu hint=%s n=%zu "
                         "cpu_ns=%.1f mean_ns=%.1f p50_ns=%.1f p95_ns=%.1f p99_ns=%.1f "
                         "cpp_new_calls=%.3f cpp_bytes=%.1f pmr_live_allocations_peak=%zu pool_before=%zu pool_after=%zu "
-                        "idle_rss=%zu warm_rss=%zu after_rss=%zu process_peak_rss=%zu\n",
+                        "idle_rss=%zu warm_rss=%zu after_rss=%zu process_peak_rss=%zu "
+                        "anonymous_rss=%zu file_rss=%zu\n",
                         count, groups, position, hint_mode, iterations, double(cpu_ns) / iterations,
                         total_ns / iterations, latencies[iterations / 2],
                         latencies[(iterations - 1) * 95 / 100], latencies[(iterations - 1) * 99 / 100],
                         double(counts.cpp_calls) / iterations, double(counts.cpp_bytes) / iterations, live_peak,
                         pool_before.mapped_bytes, pool_after.mapped_bytes, idle_rss, warm_rss,
-                        after_rss, peak_rss);
+                        after_rss, process_memory.peak_resident_bytes,
+                        process_memory.anonymous_resident_bytes, process_memory.file_resident_bytes);
                 }
             }
             UserStore::ClearWorkerView();

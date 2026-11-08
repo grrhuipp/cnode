@@ -4,6 +4,7 @@
 #include <exception>
 #include <new>
 #include <cstdio>
+#include <cstring>
 #include <stdexcept>
 #include <unistd.h>
 
@@ -65,20 +66,29 @@ size_t benchmark::ResidentBytes() {
     return pages * static_cast<size_t>(page_size);
 }
 
-size_t benchmark::PeakResidentBytes() {
+benchmark::ProcessMemorySnapshot benchmark::ReadProcessMemory() {
     // Unlike getrusage's inherited high-water mark, VmHWM belongs to this exec.
     auto* file = std::fopen("/proc/self/status", "r");
-    if (!file) throw std::runtime_error("process peak resident memory unavailable");
-    char line[256];
+    if (!file) throw std::runtime_error("process memory unavailable");
+    ProcessMemorySnapshot result;
+    char line[256], field[64];
     size_t kib = 0;
-    bool found = false;
+    unsigned found = 0;
     while (std::fgets(line, sizeof(line), file)) {
-        if (std::sscanf(line, "VmHWM: %zu kB", &kib) == 1) {
-            found = true;
-            break;
+        if (std::sscanf(line, "%63s %zu kB", field, &kib) != 2) continue;
+        if (std::strcmp(field, "VmHWM:") == 0) {
+            result.peak_resident_bytes = kib * 1024;
+            found |= 1;
+        } else if (std::strcmp(field, "RssAnon:") == 0) {
+            result.anonymous_resident_bytes = kib * 1024;
+            found |= 2;
+        } else if (std::strcmp(field, "RssFile:") == 0) {
+            result.file_resident_bytes = kib * 1024;
+            found |= 4;
         }
+        if (found == 7) break;
     }
     std::fclose(file);
-    if (!found) throw std::runtime_error("process peak resident memory parse failed");
-    return kib * 1024;
+    if (found != 7) throw std::runtime_error("process memory parse failed");
+    return result;
 }
