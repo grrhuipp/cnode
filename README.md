@@ -62,7 +62,7 @@ mise exec -- cmake --build build/musl --target cnode_benchmarks
 mise exec -- ctest --test-dir build/musl --no-tests=error -L '^benchmark$' -V
 ```
 
-分配微基准与守护进程使用相同的全局 mimalloc，覆盖带生命周期跟踪的字节缓冲追加、1/8/9/16 块 `MultiBuffer` 所有权移交，以及散布写描述符的构建与回收；描述符基准分别使用 span 和 `MultiBuffer` 输入，覆盖内联容量与溢出边界。环形队列基准按每批 1/8/64 个元素填充并完全排空，预热 128 批后测量 `262144 / 批大小` 批，验证 FIFO、checksum、排空归还存储及活跃分配数，并输出 CPU/墙钟耗时和内存池 mapped/idle 字节。微基准不代表端到端吞吐。
+分配微基准与守护进程使用相同的全局 mimalloc，覆盖带生命周期跟踪的字节缓冲追加、1/8/9/16 块 `MultiBuffer` 所有权移交，以及散布写描述符的构建与回收；描述符基准分别使用 span 和 `MultiBuffer` 输入，覆盖内联容量与溢出边界。环形队列基准按每批 1/8/64 个元素填充并完全排空，预热 128 批后测量 `262144 / 批大小` 批，验证 FIFO、checksum、排空归还存储及活跃分配数，并输出 CPU/墙钟耗时和内存池 mapped/idle 字节。归还操作的计时包含空闲登记与到期回收检查；mapped/idle 是采样时刻的快照，不是全程峰值。微基准不代表端到端吞吐。
 
 只运行环形队列微基准可用 `mise exec -- ctest --test-dir build/musl --no-tests=error -R '^benchmark\.RingDequeBenchmark\.' -V`。
 

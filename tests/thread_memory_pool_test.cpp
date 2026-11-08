@@ -1065,3 +1065,30 @@ TEST(ThreadMemoryPool, BorrowedQueueConstructsNestedPayloadsAfterHostRetirement)
     EXPECT_TRUE(lifetime.expired());
     memory::ThreadMemoryPool().PurgeIdle();
 }
+
+TEST(ThreadMemoryPool, RemoteBatchExpiresOldIdleChunksAndRetainsNewReturns) {
+    memory::worker_memory pool;
+    auto* expired = pool.Allocate(64, 16);
+    auto* small = pool.Allocate(256, 16);
+    auto* large = pool.Allocate(32768, 16);
+    ASSERT_NE(expired, nullptr);
+    ASSERT_NE(small, nullptr);
+    ASSERT_NE(large, nullptr);
+    pool.Deallocate(expired);
+    const auto expired_deadline = pool.NextPurgeDeadline();
+    std::this_thread::sleep_until(expired_deadline + std::chrono::milliseconds(5));
+    std::thread remote([&] {
+        pool.Deallocate(small);
+        pool.Deallocate(large);
+    });
+    remote.join();
+    const auto footprint = pool.GetFootprint();
+    const auto retained = memory::worker_memory::Describe(256, 16).map_bytes +
+        memory::worker_memory::Describe(32768, 16).map_bytes;
+    EXPECT_EQ(footprint.mapped_bytes, retained);
+    EXPECT_EQ(footprint.idle_bytes, retained);
+    EXPECT_EQ(footprint.chunks, 2u);
+    EXPECT_GT(pool.NextPurgeDeadline(), expired_deadline);
+    pool.PurgeIdle();
+    EXPECT_EQ(pool.GetFootprint().mapped_bytes, 0u);
+}

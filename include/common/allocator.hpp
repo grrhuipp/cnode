@@ -244,11 +244,7 @@ public:
     void Purge() noexcept {
         DrainRemoteFrees();
         if (!pooling_ || !pooling_->idle_head) return;
-        const auto now = Clock::now();
-        while (pooling_->idle_head &&
-               now - pooling_->idle_head->idle_at >= kThreadMemoryPoolPurgeDelay) {
-            ReleaseChunk(*pooling_->idle_head);
-        }
+        ReleaseExpiredChunks(Clock::now());
     }
 
     void PurgeIdle() noexcept {
@@ -481,6 +477,13 @@ private:
             current = next;
         }
     }
+    // Keep expiry scanning shared; reuse the phase clock without re-entering remote drains.
+    [[gnu::noinline]] void ReleaseExpiredChunks(Clock::time_point now) noexcept {
+        while (pooling_->idle_head &&
+               now - pooling_->idle_head->idle_at >= kThreadMemoryPoolPurgeDelay) {
+            ReleaseChunk(*pooling_->idle_head);
+        }
+    }
     void DeallocateLocal(SlotHeader& header, Chunk& chunk) noexcept {
         if (chunk.live == 0) std::terminate();
         --chunk.live;
@@ -493,7 +496,7 @@ private:
                 } else {
                     const bool first_idle = pooling_->idle_head == nullptr;
                     MarkLargeIdle(chunk);
-                    if (!first_idle) Purge();
+                    if (!first_idle) ReleaseExpiredChunks(chunk.idle_at);
                     if (first_idle && wakeup_) wakeup_->OnPoolIdle();
                 }
             } else {
@@ -504,7 +507,7 @@ private:
                 chunk.bump = reinterpret_cast<std::byte*>(&chunk) + ChunkLead();
                 const bool first_idle = pooling_->idle_head == nullptr;
                 MarkIdle(chunk);
-                if (!first_idle) Purge();
+                if (!first_idle) ReleaseExpiredChunks(chunk.idle_at);
                 if (first_idle && wakeup_) wakeup_->OnPoolIdle();
             }
             return;
