@@ -1,12 +1,11 @@
-#include "acppnode/app/bootstrap_shutdown.hpp"
-#include "acppnode/infra/log.hpp"
+#include "app/bootstrap_shutdown.hpp"
+#include "infra/log.hpp"
 
 #include <asio/signal_set.hpp>
 
 #include <csignal>
 #include <memory>
 
-namespace acpp {
 
 std::unique_ptr<net::signal_set> InstallShutdownHandler(
     net::io_context& io_context, std::function<void()> request_stop) {
@@ -23,4 +22,3 @@ std::unique_ptr<net::signal_set> InstallShutdownHandler(
     return signals;
 }
 
-}  // namespace acpp

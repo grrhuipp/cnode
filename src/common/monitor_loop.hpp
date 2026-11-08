@@ -1,6 +1,6 @@
 #pragma once
 
-#include "acppnode/common/error.hpp"
+#include "common/error.hpp"
 
 #include <asio/co_spawn.hpp>
 #include <asio/bind_cancellation_slot.hpp>
@@ -17,7 +17,7 @@
 #include <string_view>
 #include <utility>
 
-namespace acpp::monitor_detail {
+namespace monitor_detail {
 
 // Each process or panel monitor has its own completion boundary. The factory owns its
 // context, and co_spawn retains this state until this loop's exit is reported.
@@ -84,4 +84,4 @@ private:
     bool stopping_ = false;
 };
 
-}  // namespace acpp::monitor_detail
+}  // namespace monitor_detail

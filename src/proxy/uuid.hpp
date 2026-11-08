@@ -1,6 +1,6 @@
 #pragma once
 
-#include "acppnode/common/binary_text_codec.hpp"
+#include "common/binary_text_codec.hpp"
 
 #include <array>
 #include <cstddef>
@@ -8,7 +8,7 @@
 #include <optional>
 #include <string_view>
 
-namespace acpp::proxy {
+namespace proxy {
 
 // Parses exactly 32 hexadecimal digits; '-' separators are ignored wherever
 // they appear. Signs, whitespace and prefixes are rejected.
@@ -36,4 +36,4 @@ ParseUuid(std::string_view text) noexcept {
     return out;
 }
 
-}  // namespace acpp::proxy
+}  // namespace proxy

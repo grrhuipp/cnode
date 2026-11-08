@@ -1,9 +1,9 @@
-#include "acppnode/transport/internet/reality_server_name.hpp"
-#include "acppnode/common/domain_name.hpp"
+#include "transport/internet/reality_server_name.hpp"
+#include "common/domain_name.hpp"
 
 #include <algorithm>
 
-namespace acpp::transport::internet {
+namespace transport::internet {
 bool IsRealityServerNameAllowed(
     std::span<const std::string> allowed,
     std::string_view requested) noexcept {
@@ -12,4 +12,4 @@ bool IsRealityServerNameAllowed(
     });
 }
 
-}  // namespace acpp::transport::internet
+}  // namespace transport::internet

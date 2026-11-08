@@ -1,8 +1,8 @@
-#include "acppnode/geo/geodata.hpp"
+#include "geo/geodata.hpp"
 
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/domain_name.hpp"
-#include "acppnode/common/unsafe.hpp"
+#include "common/allocator.hpp"
+#include "common/domain_name.hpp"
+#include "common/unsafe.hpp"
 
 #include <algorithm>
 #include <array>
@@ -11,7 +11,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace acpp::geo {
+namespace geo {
 
 // ============================================================================
 // CidrSet
@@ -573,4 +573,4 @@ GeoDatabase::Stats GeoDatabase::GetStats() const noexcept {
     };
 }
 
-}  // namespace acpp::geo
+}  // namespace geo

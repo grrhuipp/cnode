@@ -1,6 +1,6 @@
 #include "ss_outbound_credentials.hpp"
 
-namespace acpp::proxy::shadowsocks::outbound {
+namespace proxy::shadowsocks::outbound {
 
 std::optional<Credentials> Credentials::Prepare(
     std::string_view method, std::string_view password) {
@@ -37,4 +37,4 @@ std::optional<Credentials> Credentials::Prepare(
     return Credentials(*cipher, master_key, std::move(chain));
 }
 
-}  // namespace acpp::proxy::shadowsocks::outbound
+}  // namespace proxy::shadowsocks::outbound

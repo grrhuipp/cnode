@@ -1,7 +1,7 @@
 #include "anytls_outbound_settings.hpp"
 #include "../credentials.hpp"
 
-#include "acppnode/infra/json_field.hpp"
+#include "infra/json_field.hpp"
 
 #include <chrono>
 #include <openssl/crypto.h>
@@ -11,7 +11,7 @@
 #include <string_view>
 #include <utility>
 
-namespace acpp::proxy::anytls::outbound {
+namespace proxy::anytls::outbound {
 
 namespace {
 
@@ -96,8 +96,8 @@ tl::expected<Settings, std::string> ParseSettings(const json::object& source) {
     if (!server) return tl::unexpected(std::string(server.error()));
     result.server = std::move(*server);
     if (password.empty()) return tl::unexpected("AnyTLS password is required");
-    result.password_hash = acpp::anytls::PasswordHash(password);
+    result.password_hash = ::anytls::PasswordHash(password);
     return result;
 }
 
-}  // namespace acpp::proxy::anytls::outbound
+}  // namespace proxy::anytls::outbound

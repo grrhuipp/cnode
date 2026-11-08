@@ -1,9 +1,8 @@
-#include "acppnode/infra/runtime_failure.hpp"
+#include "infra/runtime_failure.hpp"
 
 #include <cstdio>
 #include <cstdlib>
 
-namespace acpp {
 
 [[noreturn]] void FailRuntime(const char* phase, const char* reason) noexcept {
     // The asynchronous logger may itself have failed. Do not allocate a
@@ -13,4 +12,3 @@ namespace acpp {
     std::_Exit(EXIT_FAILURE);
 }
 
-} // namespace acpp

@@ -1,10 +1,10 @@
-#include "acppnode/app/proxyman/outbound/handler.hpp"
+#include "app/proxyman/outbound/handler.hpp"
 
-#include "acppnode/app/dns/dns.hpp"
-#include "acppnode/app/proxyman/outbound/factory.hpp"
-#include "acppnode/app/session_group_executor.hpp"
-#include "acppnode/app/worker_stats.hpp"
-#include "acppnode/infra/log.hpp"
+#include "app/dns/dns.hpp"
+#include "app/proxyman/outbound/factory.hpp"
+#include "app/session_group_executor.hpp"
+#include "app/worker_stats.hpp"
+#include "infra/log.hpp"
 #include "../../../common/awaitable_task_group.hpp"
 #include "../../../transport/internet/xhttp_session.hpp"
 
@@ -18,7 +18,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace acpp::proxyman::outbound {
+namespace proxyman::outbound {
 
 // The host serializes cache creation and retirement, never request execution.
 // Protocol pools lease independent physical domains to individual requests.
@@ -167,7 +167,7 @@ private:
         }
     }
 
-    net::awaitable<::acpp::Outbound*> Acquire() {
+    net::awaitable<::Outbound*> Acquire() {
         if (retired_) throw IoSystemError(net::error::operation_aborted);
         if (!proxy_) {
             try {
@@ -188,7 +188,7 @@ private:
     std::optional<memory::ScopedAllocationDomain> allocation_scope_;
     std::weak_ptr<ExecutionDomain> domain_;
     std::unique_ptr<ResidentTaskGroup> tasks_;
-    std::unique_ptr<::acpp::Outbound> proxy_;
+    std::unique_ptr<::Outbound> proxy_;
     size_t active_ = 0;
     bool retired_ = false;
     bool cancel_join_spawned_ = false;
@@ -489,4 +489,4 @@ void OutboundConfiguration::Remove(std::string_view tag) {
     Publish(std::move(snapshot));
 }
 
-}  // namespace acpp::proxyman::outbound
+}  // namespace proxyman::outbound

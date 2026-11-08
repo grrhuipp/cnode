@@ -1,7 +1,7 @@
-#include "acppnode/common/rule.hpp"
+#include "common/rule.hpp"
 
-#include "acppnode/common/ip_utils.hpp"
-#include "acppnode/common/session.hpp"
+#include "common/ip_utils.hpp"
+#include "common/session.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -9,7 +9,7 @@
 #include <optional>
 #include <regex>
 
-namespace acpp::rule {
+namespace rule {
 
 DetectRulePolicy::DetectRulePolicy()
     : rules_(std::make_shared<const InboundRule>()) {}
@@ -111,4 +111,4 @@ bool DetectRulePolicy::Blocked(const session::Context& ctx) {
     return false;
 }
 
-}  // namespace acpp::rule
+}  // namespace rule

@@ -1,24 +1,25 @@
 #pragma once
 
-#include "acppnode/common/asio_types.hpp"
-#include "acppnode/common/buf/multi_buffer.hpp"
-#include "acppnode/common/target_address.hpp"
-#include "acppnode/transport/async_stream.hpp"
-#include "acppnode/transport/link.hpp"
+#include "common/asio_types.hpp"
+#include "common/buf/multi_buffer.hpp"
+#include "common/target_address.hpp"
+#include "transport/async_stream.hpp"
+#include "transport/link.hpp"
 
 #include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <span>
 
-namespace acpp::trojan {
+namespace trojan {
 
 struct FramedUdpPacket {
     TargetAddress target;
     buf::MultiBuffer payload;
 };
 
-// Owns stream fragments until one complete datagram can be transferred.
+// Owns stream fragments until one complete tagged datagram, including an empty
+// payload, can be transferred. An empty container is reserved for stream EOF.
 class UdpFramer {
 public:
     void Feed(buf::MultiBuffer input);
@@ -45,4 +46,4 @@ net::awaitable<void> WriteUdpDatagram(
     const TargetAddress& target,
     std::span<const net::const_buffer> payload);
 
-}  // namespace acpp::trojan
+}  // namespace trojan

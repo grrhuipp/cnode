@@ -1,17 +1,16 @@
-#include "acppnode/sniff/sniffer.hpp"
-#include "acppnode/common/ip_address.hpp"
+#include "sniff/sniffer.hpp"
+#include "common/ip_address.hpp"
 
-#include "acppnode/common/domain_name.hpp"
-#include "acppnode/common/ip_utils.hpp"
-#include "acppnode/common/unsafe.hpp"
-#include "acppnode/core/constants.hpp"
-#include "acppnode/transport/internet/http_headers.hpp"
+#include "common/domain_name.hpp"
+#include "common/ip_utils.hpp"
+#include "common/unsafe.hpp"
+#include "core/constants.hpp"
+#include "transport/internet/http_headers.hpp"
 
 #include <algorithm>
 #include <array>
 #include <charconv>
 
-namespace acpp {
 namespace {
 
 struct HostPortView {
@@ -228,4 +227,3 @@ SniffResult SniffHttp(std::span<const uint8_t> data) {
     }
 }
 
-}  // namespace acpp

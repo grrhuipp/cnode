@@ -4,25 +4,25 @@
 
 #include "../anytls_codec.hpp"
 #include "../padding.hpp"
-#include "acppnode/common/buf/length_prefixed_packet_buffer.hpp"
+#include "common/buf/length_prefixed_packet_buffer.hpp"
 #include "../credentials.hpp"
 #include "../../uot/uot.hpp"
-#include "acppnode/transport/internet/async_write_gate.hpp"
-#include "acppnode/app/stats.hpp"
-#include "acppnode/app/rate_limiter.hpp"
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/session.hpp"
-#include "acppnode/features/routing/dispatcher.hpp"
-#include "acppnode/infra/config_types.hpp"
-#include "acppnode/infra/log.hpp"
-#include "acppnode/app/proxyman/inbound/factory.hpp"
-#include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
-#include "acppnode/transport/async_stream.hpp"
-#include "acppnode/transport/link_error.hpp"
-#include "acppnode/transport/internet/timeout_scheduler.hpp"
-#include "acppnode/app/proxyman/inbound/user_store.hpp"
-#include "acppnode/common/address_codec.hpp"
-#include "acppnode/common/container_util.hpp"
+#include "transport/internet/async_write_gate.hpp"
+#include "app/stats.hpp"
+#include "app/rate_limiter.hpp"
+#include "common/allocator.hpp"
+#include "common/session.hpp"
+#include "features/routing/dispatcher.hpp"
+#include "infra/config_types.hpp"
+#include "infra/log.hpp"
+#include "app/proxyman/inbound/factory.hpp"
+#include "app/proxyman/inbound/receiver_settings.hpp"
+#include "transport/async_stream.hpp"
+#include "transport/link_error.hpp"
+#include "transport/internet/timeout_scheduler.hpp"
+#include "app/proxyman/inbound/user_store.hpp"
+#include "common/address_codec.hpp"
+#include "common/container_util.hpp"
 
 #include <asio/experimental/channel.hpp>
 #include <openssl/crypto.h>
@@ -36,10 +36,10 @@
 #include <system_error>
 #include <utility>
 
-namespace acpp::proxy::anytls::inbound {
+namespace proxy::anytls::inbound {
 
-namespace anytls = ::acpp::anytls;
-using namespace ::acpp::anytls;
+namespace anytls = ::anytls;
+using namespace ::anytls;
 
 namespace {
 
@@ -53,7 +53,7 @@ constexpr size_t kMaxConcurrentSubstreams = 128;
 Handler::Handler(UserOnlineTracker& validator,
                  StatsShard& stats,
                  ConnectionLimiter* limiter,
-                 std::shared_ptr<const ::acpp::anytls::PaddingScheme> padding_scheme)
+                 std::shared_ptr<const ::anytls::PaddingScheme> padding_scheme)
     : validator_(validator)
     , stats_(&stats)
     , limiter_(limiter)
@@ -522,8 +522,7 @@ net::awaitable<ErrorCode> AnyTLSDemuxSession::ProcessStream(
     auto prepare = [&]() -> net::awaitable<ErrorCode> {
         auto parsed = co_await ReadAddress(sub, pending, AddressWireFormat::Socks5,
                                            0,
-                                           {.max_domain_len = 255,
-                                            .require_non_empty_domain = true,
+                                           {.require_non_empty_domain = true,
                                             .allow_metadata = true});
         if (!parsed) co_return parsed.error();
         pending.DropPrefixBytes(parsed->consumed);
@@ -910,40 +909,40 @@ Handler::Process(
     co_return co_await demux.Run();
 }
 
-}  // namespace acpp::proxy::anytls::inbound
+}  // namespace proxy::anytls::inbound
 
 namespace {
 class AnyTlsSettings final
-    : public acpp::proxyman::inbound::ProtocolSettings {
+    : public ::proxyman::inbound::ProtocolSettings {
 public:
-    std::shared_ptr<const acpp::anytls::PaddingScheme> padding_scheme;
+    std::shared_ptr<const ::anytls::PaddingScheme> padding_scheme;
 };
 
 [[nodiscard]] const AnyTlsSettings* GetAnyTlsSettings(
-    const acpp::proxyman::inbound::BuildRequest& req) noexcept {
+    const ::proxyman::inbound::BuildRequest& req) noexcept {
     return dynamic_cast<const AnyTlsSettings*>(req.settings.get());
 }
 
 const bool kInboundRegistered = [] {
-    acpp::proxyman::inbound::ProxyRegistration reg;
-    reg.user_protocol = acpp::proxyman::inbound::UserProtocol::AnyTls;
+    ::proxyman::inbound::ProxyRegistration reg;
+    reg.user_protocol = ::proxyman::inbound::UserProtocol::AnyTls;
 
     reg.create_runtime = []() -> std::unique_ptr<
-        acpp::proxyman::inbound::ProtocolRuntime> {
-        return std::make_unique<acpp::proxy::UserOnlineProtocolRuntime>();
+        ::proxyman::inbound::ProtocolRuntime> {
+        return std::make_unique<::proxy::UserOnlineProtocolRuntime>();
     };
 
     reg.create_tcp_handler =
-        [](acpp::proxyman::inbound::ProtocolRuntime& runtime,
-           acpp::StatsShard& stats,
-           acpp::ConnectionLimiter* limiter,
-           const acpp::proxyman::inbound::BuildRequest& req) -> std::unique_ptr<acpp::Inbound> {
-            auto* anytls_runtime = dynamic_cast<acpp::proxy::UserOnlineProtocolRuntime*>(&runtime);
+        [](::proxyman::inbound::ProtocolRuntime& runtime,
+           ::StatsShard& stats,
+           ::ConnectionLimiter* limiter,
+           const ::proxyman::inbound::BuildRequest& req) -> std::unique_ptr<::Inbound> {
+            auto* anytls_runtime = dynamic_cast<::proxy::UserOnlineProtocolRuntime*>(&runtime);
             const auto* settings = GetAnyTlsSettings(req);
             if (!anytls_runtime || !settings) {
                 return nullptr;
             }
-            return std::make_unique<acpp::proxy::anytls::inbound::Handler>(
+            return std::make_unique<::proxy::anytls::inbound::Handler>(
                 anytls_runtime->validator,
                 stats,
                 limiter,
@@ -951,50 +950,50 @@ const bool kInboundRegistered = [] {
         };
 
     reg.prepare_settings =
-        [](std::string_view tag, const acpp::InboundProtocolSettings& config)
+        [](std::string_view tag, const ::InboundProtocolSettings& config)
             -> std::optional<std::shared_ptr<
-                const acpp::proxyman::inbound::ProtocolSettings>> {
+                const ::proxyman::inbound::ProtocolSettings>> {
             // Text was validated (size and grammar) by infra::ParseAnyTlsPaddingScheme;
             // this only builds the runtime scheme object.
             auto settings = std::make_shared<AnyTlsSettings>();
             if (!config.padding_scheme.empty()) {
                 auto parsed =
-                    acpp::anytls::ParsePaddingScheme(config.padding_scheme);
+                    ::anytls::ParsePaddingScheme(config.padding_scheme);
                 if (!parsed) {
                     LOG_WARN(
                         "AnyTLS inbound '{}': invalid padding scheme", tag);
                     return std::nullopt;
                 }
                 settings->padding_scheme =
-                    std::make_shared<const acpp::anytls::PaddingScheme>(std::move(*parsed));
+                    std::make_shared<const ::anytls::PaddingScheme>(std::move(*parsed));
             }
             return settings;
         };
 
     reg.build_users =
-        [](const acpp::proxyman::inbound::BuildRequest& req,
-           std::span<const acpp::InboundUserSpec> specs)
-            -> std::optional<acpp::proxyman::inbound::UserSet> {
-            std::vector<acpp::proxyman::inbound::PreparedAnyTlsUser> users;
+        [](const ::proxyman::inbound::BuildRequest& req,
+           std::span<const ::InboundUserSpec> specs)
+            -> std::optional<::proxyman::inbound::UserSet> {
+            std::vector<::proxyman::inbound::PreparedAnyTlsUser> users;
             users.reserve(specs.size());
             for (const auto& spec : specs) {
                 if (spec.credential.empty()) {
                     LOG_WARN("AnyTLS inbound '{}': user password is empty", req.tag);
                     return std::nullopt;
                 }
-                acpp::proxyman::inbound::PreparedAnyTlsUser info;
-                info.password_hash = acpp::anytls::PasswordHash(spec.credential);
+                ::proxyman::inbound::PreparedAnyTlsUser info;
+                info.password_hash = ::anytls::PasswordHash(spec.credential);
                 info.profile.email = spec.email;
                 info.profile.user_id = spec.user_id;
                 info.profile.speed_limit = spec.speed_limit;
                 info.profile.device_limit = spec.device_limit;
                 users.push_back(std::move(info));
             }
-            return acpp::proxyman::inbound::UserSet{std::move(users)};
+            return ::proxyman::inbound::UserSet{std::move(users)};
         };
 
-    acpp::proxyman::inbound::RegisterProxy(
-        acpp::constants::protocol::kAnyTLS, std::move(reg));
+    ::proxyman::inbound::RegisterProxy(
+        ::constants::protocol::kAnyTLS, std::move(reg));
     return true;
 }();
 }  // namespace

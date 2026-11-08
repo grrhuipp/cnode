@@ -1,7 +1,7 @@
-#include "acppnode/common/session.hpp"
-#include "acppnode/common/clock.hpp"
-#include "acppnode/common/ip_utils.hpp"
-#include "acppnode/common/network.hpp"
+#include "common/session.hpp"
+#include "common/clock.hpp"
+#include "common/ip_utils.hpp"
+#include "common/network.hpp"
 
 #include <charconv>
 #include <array>
@@ -9,7 +9,6 @@
 #include <iterator>
 #include <optional>
 
-namespace acpp {
 
 namespace session {
 
@@ -170,4 +169,3 @@ std::string FormatAccessLog(const session::Context& ctx,
     return access;
 }
 
-}  // namespace acpp

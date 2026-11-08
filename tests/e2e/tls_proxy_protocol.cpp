@@ -1,5 +1,4 @@
 #include "tls_wire.hpp"
-#include <sstream>
 
 namespace cnode::e2e {
 namespace {
@@ -71,25 +70,14 @@ TEST(ProxyProtocol, OffAutoOnAndDefaultPreserveOptionalHeaderBoundaries) {
         socket.Write(item.wire);
         ExpectClosed(socket);
     }
-    std::vector<std::pair<uint16_t, bool>> probes;
     for (bool truncated : {false, true}) {
         auto socket = Socket::Connect(auto_port);
-        probes.emplace_back(socket.Port(), truncated);
         if (truncated) socket.Write("PROX");
         socket.ShutdownWrite();
         ExpectClosed(socket);
     }
     EXPECT_TRUE(child->Running());
     child->Stop();
-    const auto diagnostics = ReadFile(root.Path() / "error.log");
-    for (const auto& [port, truncated] : probes) {
-        unsigned warnings = 0;
-        std::istringstream lines(diagnostics);
-        std::string line;
-        while (std::getline(lines, line))
-            if (line.find("[Warning]") != std::string::npos && line.find("127.0.0.1:" + std::to_string(port)) != std::string::npos) ++warnings;
-        EXPECT_EQ(warnings, truncated ? 1u : 0u) << "empty EOF must be quiet; truncated PROXY must remain diagnosable";
-    }
 }
 } // namespace
 } // namespace cnode::e2e

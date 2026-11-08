@@ -1,9 +1,9 @@
 #pragma once
 
-#include "acppnode/common/buf/multi_buffer.hpp"
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/asio_types.hpp"
-#include "acppnode/transport/link.hpp"
+#include "common/buf/multi_buffer.hpp"
+#include "common/allocator.hpp"
+#include "common/asio_types.hpp"
+#include "transport/link.hpp"
 
 #include <array>
 #include <cstdint>
@@ -11,7 +11,7 @@
 #include <string_view>
 #include <vector>
 
-namespace acpp::vless {
+namespace vless {
 
 inline constexpr std::string_view kVisionFlow = "xtls-rprx-vision";
 
@@ -94,4 +94,4 @@ private:
     VisionTrafficState& traffic_;
 };
 
-}  // namespace acpp::vless
+}  // namespace vless

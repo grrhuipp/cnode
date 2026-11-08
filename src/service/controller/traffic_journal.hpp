@@ -1,14 +1,14 @@
 #pragma once
 
-#include "acppnode/api/api.hpp"
-#include "acppnode/app/traffic_types.hpp"
-#include "acppnode/infra/panel_config.hpp"
+#include "api/api.hpp"
+#include "app/traffic_types.hpp"
+#include "infra/panel_config.hpp"
 
 #include <filesystem>
 #include <mutex>
 #include <vector>
 
-namespace acpp::controller {
+namespace controller {
 
 // UniProxy is additive and has no idempotency token. Only ready records may be
 // sent. Unknown records require external reconciliation, never automatic retry.
@@ -43,4 +43,4 @@ private:
     bool failed_ = false;
 };
 
-} // namespace acpp::controller
+} // namespace controller

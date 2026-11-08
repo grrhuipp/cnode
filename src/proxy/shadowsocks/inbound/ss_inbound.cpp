@@ -1,24 +1,24 @@
 #include "ss_inbound.hpp"
 #include "../../inbound_admission.hpp"
-#include "acppnode/transport/async_stream.hpp"
-#include "acppnode/transport/link_error.hpp"
+#include "transport/async_stream.hpp"
+#include "transport/link_error.hpp"
 #include "../server.hpp"
 #include "../ss_udp.hpp"
 #include "../../uot/uot.hpp"
-#include "acppnode/app/rate_limiter.hpp"
-#include "acppnode/app/relay.hpp"
-#include "acppnode/app/stats.hpp"
-#include "acppnode/features/routing/dispatcher.hpp"
-#include "acppnode/app/proxyman/inbound/factory.hpp"
-#include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
-#include "acppnode/infra/config_types.hpp"
-#include "acppnode/infra/log.hpp"
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/initial_payload.hpp"
-#include "acppnode/common/session.hpp"
+#include "app/rate_limiter.hpp"
+#include "app/relay.hpp"
+#include "app/stats.hpp"
+#include "features/routing/dispatcher.hpp"
+#include "app/proxyman/inbound/factory.hpp"
+#include "app/proxyman/inbound/receiver_settings.hpp"
+#include "infra/config_types.hpp"
+#include "infra/log.hpp"
+#include "common/allocator.hpp"
+#include "common/initial_payload.hpp"
+#include "common/session.hpp"
 
-#include "acppnode/common/buffer_util.hpp"
-#include "acppnode/common/buf/multi_buffer.hpp"
+#include "common/buffer_util.hpp"
+#include "common/buf/multi_buffer.hpp"
 #include <openssl/rand.h>
 #include <openssl/crypto.h>
 #include <algorithm>
@@ -26,7 +26,6 @@
 #include <span>
 #include <utility>
 
-namespace acpp {
 
 namespace {
 
@@ -307,7 +306,7 @@ proxy::shadowsocks::inbound::Handler::Process(
         timeouts);
 }
 
-tl::expected<acpp::InboundDatagramResult, acpp::ErrorCode>
+tl::expected<::InboundDatagramResult, ::ErrorCode>
 proxy::shadowsocks::inbound::Handler::Process(
     const InboundDatagramRequest& request) {
     const auto tag = request.tag;
@@ -450,55 +449,54 @@ buf::MultiBuffer ShadowsocksUdpResponseContext::Encode(UDPPacketView packet) {
     return payload;
 }
 
-}  // namespace acpp
 
 // ============================================================================
 // 自注册（静态初始化）
 // ============================================================================
 namespace {
-acpp::proxyman::inbound::PreparedKeyBytes ToPreparedKey(acpp::ss::KeyBytes key) {
-    acpp::proxyman::inbound::PreparedKeyBytes prepared;
+::proxyman::inbound::PreparedKeyBytes ToPreparedKey(::ss::KeyBytes key) {
+    ::proxyman::inbound::PreparedKeyBytes prepared;
     prepared.assign(key.span());
     OPENSSL_cleanse(key.bytes.data(), key.bytes.size());
     return prepared;
 }
 
 class ShadowsocksSettings final
-    : public acpp::proxyman::inbound::ProtocolSettings {
+    : public ::proxyman::inbound::ProtocolSettings {
 public:
-    acpp::ss::SsCipherInfo cipher;
+    ::ss::SsCipherInfo cipher;
     // SS2022-AES identity header key; empty when EIH is disabled.
-    acpp::proxyman::inbound::PreparedKeyBytes identity_key;
-    acpp::Ss2022UserKey user_key = acpp::Ss2022UserKey::Base64Psk;
+    ::proxyman::inbound::PreparedKeyBytes identity_key;
+    ::Ss2022UserKey user_key = ::Ss2022UserKey::Base64Psk;
 };
 
 [[nodiscard]] const ShadowsocksSettings* GetSettings(
-    const acpp::proxyman::inbound::BuildRequest& req) noexcept {
+    const ::proxyman::inbound::BuildRequest& req) noexcept {
     return dynamic_cast<const ShadowsocksSettings*>(req.settings.get());
 }
 
 const bool kSsInboundRegistered = [] {
-    acpp::proxyman::inbound::ProxyRegistration reg;
-    reg.user_protocol = acpp::proxyman::inbound::UserProtocol::Shadowsocks;
+    ::proxyman::inbound::ProxyRegistration reg;
+    reg.user_protocol = ::proxyman::inbound::UserProtocol::Shadowsocks;
     reg.datagram_transport =
-        acpp::proxyman::inbound::DatagramTransport::Packet;
+        ::proxyman::inbound::DatagramTransport::Packet;
 
     reg.create_runtime = []() -> std::unique_ptr<
-        acpp::proxyman::inbound::ProtocolRuntime> {
-        return std::make_unique<acpp::proxy::UserOnlineProtocolRuntime>();
+        ::proxyman::inbound::ProtocolRuntime> {
+        return std::make_unique<::proxy::UserOnlineProtocolRuntime>();
     };
 
     reg.create_tcp_handler =
-        [](acpp::proxyman::inbound::ProtocolRuntime& runtime,
-           acpp::StatsShard& stats,
-           acpp::ConnectionLimiter* limiter,
-           const acpp::proxyman::inbound::BuildRequest& req) -> std::unique_ptr<acpp::Inbound> {
-            auto* ss_runtime = dynamic_cast<acpp::proxy::UserOnlineProtocolRuntime*>(&runtime);
+        [](::proxyman::inbound::ProtocolRuntime& runtime,
+           ::StatsShard& stats,
+           ::ConnectionLimiter* limiter,
+           const ::proxyman::inbound::BuildRequest& req) -> std::unique_ptr<::Inbound> {
+            auto* ss_runtime = dynamic_cast<::proxy::UserOnlineProtocolRuntime*>(&runtime);
             const auto* settings = GetSettings(req);
             if (!ss_runtime || !settings) {
                 return nullptr;
             }
-            return std::make_unique<acpp::proxy::shadowsocks::inbound::Handler>(
+            return std::make_unique<::proxy::shadowsocks::inbound::Handler>(
                 ss_runtime->validator,
                 stats,
                 limiter,
@@ -506,28 +504,28 @@ const bool kSsInboundRegistered = [] {
         };
 
     reg.create_datagram_handler =
-        [](acpp::proxyman::inbound::ProtocolRuntime& runtime,
-           acpp::StatsShard& stats,
-           acpp::ConnectionLimiter* limiter,
-           const acpp::proxyman::inbound::BuildRequest& req)
-            -> std::unique_ptr<acpp::Inbound> {
-            auto* ss_runtime = dynamic_cast<acpp::proxy::UserOnlineProtocolRuntime*>(&runtime);
+        [](::proxyman::inbound::ProtocolRuntime& runtime,
+           ::StatsShard& stats,
+           ::ConnectionLimiter* limiter,
+           const ::proxyman::inbound::BuildRequest& req)
+            -> std::unique_ptr<::Inbound> {
+            auto* ss_runtime = dynamic_cast<::proxy::UserOnlineProtocolRuntime*>(&runtime);
             const auto* settings = GetSettings(req);
             if (!ss_runtime || !settings) {
                 return nullptr;
             }
-            return std::make_unique<acpp::proxy::shadowsocks::inbound::Handler>(
+            return std::make_unique<::proxy::shadowsocks::inbound::Handler>(
                 ss_runtime->validator, stats, limiter, settings->cipher);
         };
 
     reg.prepare_settings =
-        [](std::string_view tag, const acpp::InboundProtocolSettings& config)
+        [](std::string_view tag, const ::InboundProtocolSettings& config)
             -> std::optional<std::shared_ptr<
-                const acpp::proxyman::inbound::ProtocolSettings>> {
+                const ::proxyman::inbound::ProtocolSettings>> {
             const std::string method = config.method.empty()
-                ? std::string(acpp::constants::protocol::kAes256Gcm)
+                ? std::string(::constants::protocol::kAes256Gcm)
                 : config.method;
-            auto cipher = acpp::ss::ParseCipherMethod(method);
+            auto cipher = ::ss::ParseCipherMethod(method);
             if (!cipher) {
                 LOG_WARN("Inbound '{}': unknown SS cipher '{}'", tag, method);
                 return std::nullopt;
@@ -535,15 +533,15 @@ const bool kSsInboundRegistered = [] {
             auto settings = std::make_shared<ShadowsocksSettings>();
             settings->cipher = *cipher;
             settings->user_key = config.ss2022_user_key;
-            if (acpp::ss::Is2022AesCipher(cipher->type)) {
+            if (::ss::Is2022AesCipher(cipher->type)) {
                 if (!config.identity_password.empty()) {
                     settings->identity_key = ToPreparedKey(
-                        acpp::ss::BuildMasterKey(config.identity_password, *cipher));
+                        ::ss::BuildMasterKey(config.identity_password, *cipher));
                     if (settings->identity_key.empty()) {
                         LOG_WARN("Inbound '{}': invalid SS2022 identity password", tag);
                         return std::nullopt;
                     }
-                } else if (config.ss2022_user_key == acpp::Ss2022UserKey::UuidDerived) {
+                } else if (config.ss2022_user_key == ::Ss2022UserKey::UuidDerived) {
                     LOG_WARN("Inbound '{}': SS2022 UUID users require server identity key", tag);
                     return std::nullopt;
                 }
@@ -552,9 +550,9 @@ const bool kSsInboundRegistered = [] {
         };
 
     reg.build_users =
-        [](const acpp::proxyman::inbound::BuildRequest& req,
-           std::span<const acpp::InboundUserSpec> specs)
-            -> std::optional<acpp::proxyman::inbound::UserSet> {
+        [](const ::proxyman::inbound::BuildRequest& req,
+           std::span<const ::InboundUserSpec> specs)
+            -> std::optional<::proxyman::inbound::UserSet> {
             const auto* settings = GetSettings(req);
             if (!settings) {
                 LOG_WARN("Inbound '{}': missing prepared SS settings", req.tag);
@@ -562,17 +560,17 @@ const bool kSsInboundRegistered = [] {
             }
             const auto& cipher_info = settings->cipher;
             const bool uuid_derived =
-                acpp::ss::Is2022Cipher(cipher_info.type) &&
-                settings->user_key == acpp::Ss2022UserKey::UuidDerived;
+                ::ss::Is2022Cipher(cipher_info.type) &&
+                settings->user_key == ::Ss2022UserKey::UuidDerived;
 
-            std::vector<acpp::proxyman::inbound::PreparedShadowsocksUser> users;
+            std::vector<::proxyman::inbound::PreparedShadowsocksUser> users;
             users.reserve(specs.size());
             for (const auto& spec : specs) {
                 if (spec.credential.empty()) {
                     LOG_WARN("Inbound '{}': SS password is empty", req.tag);
                     return std::nullopt;
                 }
-                acpp::proxyman::inbound::PreparedShadowsocksUser info;
+                ::proxyman::inbound::PreparedShadowsocksUser info;
                 info.profile.email = spec.email;
                 info.profile.user_id = spec.user_id;
                 info.profile.speed_limit = spec.speed_limit;
@@ -580,8 +578,8 @@ const bool kSsInboundRegistered = [] {
                 info.key_size = cipher_info.key_size;
                 info.salt_size = cipher_info.salt_size;
                 info.derived_key = ToPreparedKey(uuid_derived
-                    ? acpp::ss::Build2022UserKeyFromUuid(spec.credential, cipher_info)
-                    : acpp::ss::BuildMasterKey(spec.credential, cipher_info));
+                    ? ::ss::Build2022UserKeyFromUuid(spec.credential, cipher_info)
+                    : ::ss::BuildMasterKey(spec.credential, cipher_info));
                 info.identity_key = settings->identity_key;
                 if (info.derived_key.empty()) {
                     LOG_WARN("Inbound '{}': invalid SS password for user '{}'",
@@ -589,17 +587,17 @@ const bool kSsInboundRegistered = [] {
                     return std::nullopt;
                 }
                 if (!info.identity_key.empty() &&
-                    !acpp::ss::Hash2022Psk(info.derived_key.span(), info.psk_hash)) {
+                    !::ss::Hash2022Psk(info.derived_key.span(), info.psk_hash)) {
                     return std::nullopt;
                 }
                 users.push_back(std::move(info));
             }
 
-            return acpp::proxyman::inbound::UserSet{std::move(users)};
+            return ::proxyman::inbound::UserSet{std::move(users)};
         };
 
-    acpp::proxyman::inbound::RegisterProxy(
-        acpp::constants::protocol::kShadowsocks, std::move(reg));
+    ::proxyman::inbound::RegisterProxy(
+        ::constants::protocol::kShadowsocks, std::move(reg));
     return true;
 }();
 }  // namespace

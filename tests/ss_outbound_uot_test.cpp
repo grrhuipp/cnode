@@ -9,7 +9,7 @@
 
 namespace {
 
-using acpp::SsUotVersion;
+using ::SsUotVersion;
 
 [[noreturn]] void Fail(std::string_view message) {
     std::cerr << message << '\n';
@@ -21,8 +21,8 @@ void Check(bool condition, std::string_view message) {
 }
 
 auto Parse(std::string_view body) {
-    const auto parsed = acpp::json::parse(body);
-    return acpp::proxy::shadowsocks::outbound::ParseUotVersion(
+    const auto parsed = ::json::parse(body);
+    return ::proxy::shadowsocks::outbound::ParseUotVersion(
         parsed.as_object());
 }
 

@@ -1,23 +1,23 @@
 #include "udp_ingress.hpp"
 #include "udp_association_reclaimer.hpp"
 #include "udp_handoff_directory.hpp"
-#include "acppnode/app/session_capabilities.hpp"
+#include "app/session_capabilities.hpp"
 #include "../../common/awaitable_task_group.hpp"
-#include "acppnode/app/proxyman/inbound/factory.hpp"
+#include "app/proxyman/inbound/factory.hpp"
 #include "../../proxy/inbound_admission.hpp"
 
-#include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
-#include "acppnode/common/initial_payload.hpp"
-#include "acppnode/common/ip_utils.hpp"
-#include "acppnode/common/session.hpp"
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/container_util.hpp"
-#include "acppnode/common/string_hash.hpp"
-#include "acppnode/features/routing/dispatcher.hpp"
-#include "acppnode/infra/config_types.hpp"
-#include "acppnode/infra/log.hpp"
-#include "acppnode/infra/runtime_failure.hpp"
-#include "acppnode/transport/async_stream.hpp"
+#include "app/proxyman/inbound/receiver_settings.hpp"
+#include "common/initial_payload.hpp"
+#include "common/ip_utils.hpp"
+#include "common/session.hpp"
+#include "common/allocator.hpp"
+#include "common/container_util.hpp"
+#include "common/string_hash.hpp"
+#include "features/routing/dispatcher.hpp"
+#include "infra/config_types.hpp"
+#include "infra/log.hpp"
+#include "infra/runtime_failure.hpp"
+#include "transport/async_stream.hpp"
 
 #include <asio/as_tuple.hpp>
 #include <asio/bind_cancellation_slot.hpp>
@@ -31,7 +31,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace acpp::worker_detail {
+namespace worker_detail {
 
 void UdpReplyFence::Lease::Reset() noexcept {
     if (!fence_) return;
@@ -266,7 +266,7 @@ bool UdpIngress::ClientSession::Push(
     const TargetAddress& target,
     buf::MultiBuffer payload) {
     const size_t payload_size = payload.byte_size();
-    if (Closed() || payload_size == 0) {
+    if (Closed()) {
         payload.clear();
         return false;
     }
@@ -277,13 +277,9 @@ bool UdpIngress::ClientSession::Push(
         return false;
     }
 
+    if (!buf::SetUdpTarget(payload, target)) return false;
     auto reservation = impl_->budget->ReservePayload(payload);
     if (!reservation) return false;
-    for (buf::Buffer* buffer : payload) {
-        if (buffer && !buffer->IsEmpty()) {
-            buffer->SetUDP(target);
-        }
-    }
 
     Impl::QueuedInput input{std::move(payload), payload_size, std::move(reservation)};
     impl_->input_queue.push_back(std::move(input));
@@ -399,7 +395,7 @@ struct UdpIngress::Impl : memory::ThreadAllocated {
 
     enum class State : uint8_t { Running, Stopping, Drained };
 
-    Impl(std::string_view tag, std::unique_ptr<::acpp::Inbound> proxy,
+    Impl(std::string_view tag, std::unique_ptr<::Inbound> proxy,
          UdpAssociationReclaimer& reclaimer, UdpResourceBudget& budget,
          net::io_context& io_context)
         : tag(tag)
@@ -427,7 +423,7 @@ struct UdpIngress::Impl : memory::ThreadAllocated {
     }
 
     memory::ThreadLocalString tag;
-    std::unique_ptr<::acpp::Inbound> proxy;
+    std::unique_ptr<::Inbound> proxy;
     UdpAssociationReclaimer& reclaimer;
     UdpResourceBudget& budget;
     UdpSocketMap udp_sockets;
@@ -712,7 +708,7 @@ void UdpIngress::ClientSession::CloseWithError(ErrorCode error) noexcept {
 
 UdpIngress::UdpIngress(
     std::string_view tag,
-    std::unique_ptr<::acpp::Inbound> proxy,
+    std::unique_ptr<::Inbound> proxy,
     UdpAssociationReclaimer& reclaimer,
     UdpResourceBudget& budget,
     net::io_context& io_context)
@@ -761,7 +757,7 @@ UdpIngress::ResourceStats UdpIngress::GetResourceStats() const noexcept {
 }
 
 bool UdpIngress::ReplaceHandler(
-    std::unique_ptr<::acpp::Inbound> proxy) noexcept {
+    std::unique_ptr<::Inbound> proxy) noexcept {
     if (!proxy) {
         return false;
     }
@@ -1190,11 +1186,12 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
             rejected.inbound.source_ip = iputil::AddressText(normalized_client_addr).View();
             rejected.inbound.source_port = datagram.client_endpoint.port();
             rejected.content.network = Network::UDP;
-            ::acpp::proxy::LogInboundAuthFailure(
+            ::proxy::LogInboundAuthFailure(
                 rejected, "datagram authentication or validation failed");
         }
         return;
     }
+    if (!buf::SetUdpTarget(decoded->payload, decoded->target)) return;
     if (datagram.environment && decoded->association_policy &&
         decoded->session_id && decoded->packet_id) {
         if (!datagram.environment->prepared || !datagram.environment->prepared->settings) return;
@@ -1390,9 +1387,9 @@ void UdpIngress::ProcessDecoded(const UdpDatagramContext& datagram,
         request.profile = *decoded->user;
         request.tracker = datagram.environment ? nullptr : decoded->tracker;
         request.limiter = datagram.environment ? nullptr : decoded->limiter;
-        ::acpp::proxy::BindAuthenticatedInbound(
+        ::proxy::BindAuthenticatedInbound(
             ctx, request.profile,
-            ::acpp::proxy::InboundRequestTarget{
+            ::proxy::InboundRequestTarget{
                 Network::UDP,
                 decoded->target,
                 std::move(decoded->forwarded)});
@@ -1751,4 +1748,4 @@ void UdpIngress::CloseAllSockets() noexcept {
     }
 }
 
-}  // namespace acpp::worker_detail
+}  // namespace worker_detail

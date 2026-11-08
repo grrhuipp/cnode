@@ -2,8 +2,8 @@
 
 #include "anytls_codec.hpp"
 #include "padding.hpp"
-#include "acppnode/transport/async_stream.hpp"
-#include "acppnode/transport/link_error.hpp"
+#include "transport/async_stream.hpp"
+#include "transport/link_error.hpp"
 
 #include <asio/co_spawn.hpp>
 #include <asio/post.hpp>
@@ -14,7 +14,6 @@
 #include <stdexcept>
 
 namespace {
-using namespace acpp;
 std::array<void*, 128> allocations{};
 size_t live = 0;
 bool tracking = false;

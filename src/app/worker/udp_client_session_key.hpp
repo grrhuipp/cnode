@@ -1,13 +1,13 @@
 #pragma once
 
-#include "acppnode/common/ip_utils.hpp"
-#include "acppnode/proxy/inbound_datagram.hpp"
+#include "common/ip_utils.hpp"
+#include "proxy/inbound_datagram.hpp"
 
 #include <cstddef>
 #include <cstdint>
 #include <optional>
 
-namespace acpp::worker_detail {
+namespace worker_detail {
 
 struct ClientSessionKey final {
     ClientSessionKey(InboundDatagramOwner authenticated_owner,
@@ -64,4 +64,4 @@ struct ClientSessionKeyHash final {
     }
 };
 
-} // namespace acpp::worker_detail
+} // namespace worker_detail

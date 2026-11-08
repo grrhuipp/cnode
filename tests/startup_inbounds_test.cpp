@@ -1,13 +1,13 @@
 #include <gtest/gtest.h>
 
 #include "startup_inbounds.hpp"
-#include "acppnode/app/proxyman/inbound/factory.hpp"
-#include "acppnode/app/proxyman/inbound/user_store.hpp"
-#include "acppnode/core/constants.hpp"
-#include "acppnode/infra/config_types.hpp"
-#include "acppnode/features/routing/dispatch_policy.hpp"
-#include "acppnode/proxy/inbound.hpp"
-#include "acppnode/transport/internet/transport_security.hpp"
+#include "app/proxyman/inbound/factory.hpp"
+#include "app/proxyman/inbound/user_store.hpp"
+#include "core/constants.hpp"
+#include "infra/config_types.hpp"
+#include "features/routing/dispatch_policy.hpp"
+#include "proxy/inbound.hpp"
+#include "transport/internet/transport_security.hpp"
 
 #include <iostream>
 #include <span>
@@ -15,8 +15,7 @@
 
 
 namespace {
-using namespace acpp;
-using namespace acpp::proxyman::inbound;
+using namespace ::proxyman::inbound;
 size_t user_builds = 0;
 
 std::optional<UserSet> FakeBuildUsers(const BuildRequest&, std::span<const InboundUserSpec> specs) {

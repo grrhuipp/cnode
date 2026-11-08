@@ -1,18 +1,19 @@
 #include "uot.hpp"
-#include "acppnode/common/byte_reader.hpp"
-#include "acppnode/common/address_codec.hpp"
+#include "common/byte_reader.hpp"
+#include "common/address_codec.hpp"
 
-#include "acppnode/common/buffer_util.hpp"
-#include "acppnode/common/buf/length_prefixed_packet_buffer.hpp"
+#include "common/buffer_util.hpp"
+#include "common/buf/length_prefixed_packet_buffer.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <new>
 #include <utility>
 
-namespace acpp::proxy::uot {
+namespace proxy::uot {
 namespace {
 
 enum class PendingStatus : uint8_t {
@@ -86,9 +87,9 @@ net::awaitable<tl::expected<Request, ErrorCode>> ReadRequest(
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
-    auto address = co_await acpp::ReadAddress(
+    auto address = co_await ::ReadAddress(
         reader, pending, AddressWireFormat::Socks5, 1,
-        {.max_domain_len = 255, .require_non_empty_domain = true, .allow_metadata = true});
+        {.require_non_empty_domain = true, .allow_metadata = true});
     if (!address || !address->target.IsValid()) {
         co_return tl::unexpected(address
             ? ErrorCode::PROTOCOL_INVALID_ADDRESS
@@ -133,14 +134,12 @@ net::awaitable<tl::expected<PreparedRequest, ErrorCode>> ReadUotRequestHeader(
     PacketReader packet_reader(reader, false, TargetAddress{}, std::move(pending));
     try {
         auto first_packet = co_await packet_reader.ReadMultiBuffer();
-        if (first_packet.byte_size() == 0) {
+        if (first_packet.empty()) {
             co_return tl::unexpected(v1_eof_error);
         }
-        for (const buf::Buffer* buffer : first_packet) {
-            if (buffer && buffer->HasUDP()) {
-                out.destination = buffer->UDP();
-                break;
-            }
+        const auto datagram = buf::InspectUdpDatagram(first_packet);
+        if (datagram.Valid()) {
+            out.destination = *datagram.target;
         }
         if (!out.destination.IsValid()) {
             co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
@@ -161,14 +160,14 @@ PacketReader::PacketReader(transport::MultiBufferReader& reader,
                            buf::MultiBuffer pending)
     : reader_(reader)
     , is_connect_(is_connect)
-    , destination_(std::move(destination))
+    , destination_(is_connect ? std::move(destination) : TargetAddress{})
     , pending_(std::move(pending)) {}
 
 PacketReader::PacketReader(transport::MultiBufferReader& reader,
                            PreparedRequest prepared)
     : reader_(reader)
     , is_connect_(prepared.is_connect)
-    , destination_(std::move(prepared.destination))
+    , destination_(prepared.is_connect ? std::move(prepared.destination) : TargetAddress{})
     , pending_(std::move(prepared.pending))
     , initial_decoded_(std::move(prepared.initial_decoded)) {}
 
@@ -178,23 +177,23 @@ buf::MultiBuffer PacketReader::TakePending() noexcept {
     return out;
 }
 net::awaitable<buf::MultiBuffer> PacketReader::ReadMultiBuffer() {
-    if (initial_decoded_.byte_size() != 0) {
+    if (!initial_decoded_.empty()) {
         co_return std::move(initial_decoded_);
     }
 
     for (;;) {
         if (co_await EnsurePending(reader_, pending_, 1) != PendingStatus::Ready)
             co_return buf::MultiBuffer{};
-        TargetAddress packet_target = destination_;
+        TargetAddress packet_target;
         size_t address_bytes = 0;
         if (is_connect_) {
             if (co_await EnsurePending(reader_, pending_, 2) != PendingStatus::Ready) {
                 ThrowDecodeFailure();
             }
         } else {
-            auto address = co_await acpp::ReadAddress(
+            auto address = co_await ::ReadAddress(
                 reader_, pending_, AddressWireFormat::Uot, 0,
-                {.max_domain_len = 255, .require_non_empty_domain = true, .allow_metadata = false});
+                {.require_non_empty_domain = true, .allow_metadata = false});
             if (!address || !address->target.IsValid()) {
                 ThrowDecodeFailure();
             }
@@ -218,19 +217,13 @@ net::awaitable<buf::MultiBuffer> PacketReader::ReadMultiBuffer() {
             ThrowDecodeFailure();
         }
         (void)pending_.DropPrefixBytes(address_bytes + 2);
-        if (payload_size == 0) {
-            pending_.ReleaseIfIdle();
-            continue;
-        }
         buf::MultiBuffer packet;
         if (!pending_.MovePrefixTo(packet, payload_size)) {
             ThrowDecodeFailure();
         }
         pending_.ReleaseIfIdle();
-        for (buf::Buffer* buffer : packet) {
-            if (buffer) {
-                buffer->SetUDP(packet_target);
-            }
+        if (!buf::SetUdpTarget(packet, is_connect_ ? destination_ : packet_target)) {
+            throw std::bad_alloc();
         }
         co_return packet;
     }
@@ -274,6 +267,13 @@ net::awaitable<void> PacketWriter::WritePacket(
 }
 
 net::awaitable<void> PacketWriter::WriteMultiBuffer(buf::MultiBuffer mb) {
+    const auto datagram = buf::InspectUdpDatagram(mb);
+    if (datagram.status == buf::UdpDatagramStatus::Empty) {
+        co_return;
+    }
+    if (!datagram.Valid() || !datagram.target->IsValid()) {
+        ThrowDecodeFailure();
+    }
     const TargetAddress* target = nullptr;
     if (is_connect_) {
         if (!destination_.IsValid()) {
@@ -281,27 +281,12 @@ net::awaitable<void> PacketWriter::WriteMultiBuffer(buf::MultiBuffer mb) {
         }
         target = std::addressof(destination_);
     } else {
-        const auto datagram = buf::InspectUdpDatagram(mb);
-        if (datagram.status == buf::UdpDatagramStatus::Empty) {
-            co_return;
-        }
-        if (!datagram.Valid() || !datagram.target->IsValid()) {
-            ThrowDecodeFailure();
-        }
         target = datagram.target;
     }
 
     ConstBufferSpanBuilder<buf::MultiBuffer::kInlineCapacity> payload;
-    for (const buf::Buffer* buffer : mb) {
-        if (!buffer || buffer->IsEmpty()) {
-            continue;
-        }
-        const auto bytes = buffer->Bytes();
-        payload.Append(net::const_buffer(bytes.data(), bytes.size()));
-    }
-    if (!payload.empty()) {
-        co_await WritePacket(*target, payload.Span());
-    }
+    payload.AppendMultiBuffer(mb);
+    co_await WritePacket(*target, payload.Span());
 }
 
 net::awaitable<void> PacketWriter::WriteBuffers(
@@ -316,4 +301,4 @@ net::awaitable<void> PacketWriter::AsyncShutdownWrite() {
     co_await writer_.AsyncShutdownWrite();
 }
 
-}  // namespace acpp::proxy::uot
+}  // namespace proxy::uot

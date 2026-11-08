@@ -13,9 +13,9 @@
 #include <string_view>
 
 namespace {
-namespace net = acpp::net;
-using acpp::api::v2board::http::Response;
-using acpp::api::v2board::http::RunRequest;
+namespace net = ::net;
+using ::api::v2board::http::Response;
+using ::api::v2board::http::RunRequest;
 using namespace std::chrono_literals;
 
 void Require(bool condition, const char* message) {

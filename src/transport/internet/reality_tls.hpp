@@ -1,9 +1,9 @@
 #pragma once
 
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/transport/internet/reality_key.hpp"
-#include "acppnode/transport/internet/reality_short_id.hpp"
-#include "acppnode/transport/internet/stream_settings.hpp"
+#include "common/allocator.hpp"
+#include "transport/internet/reality_key.hpp"
+#include "transport/internet/reality_short_id.hpp"
+#include "transport/internet/stream_settings.hpp"
 #include <array>
 #include <cstdint>
 #include <memory>
@@ -13,7 +13,6 @@
 #include <openssl/mem.h>
 #include <openssl/mldsa.h>
 
-namespace acpp {
 
 class SslContext;
 
@@ -56,4 +55,3 @@ void ClearRealityServerConnState(SSL* ssl) noexcept;
 VerifyRealityClientHello(
     std::span<const uint8_t> handshake,
     const SslContext& ctx);
-}  // namespace acpp

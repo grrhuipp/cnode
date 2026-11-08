@@ -2,14 +2,13 @@
 
 #include <openssl/ssl.h>
 
-#include "acppnode/transport/internet/tls_config.hpp"
+#include "transport/internet/tls_config.hpp"
 
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
-namespace acpp {
 
 [[nodiscard]] bool ConfigureTlsServerIdentity(
     SSL* ssl, std::string_view identity);
@@ -33,4 +32,3 @@ namespace acpp {
 [[nodiscard]] bool ConfigureTlsCertificatePem(
     SSL_CTX* context, const TlsPemMaterial& pem);
 
-}  // namespace acpp

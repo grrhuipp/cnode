@@ -5,7 +5,7 @@
 #include <string>
 #include <string_view>
 
-namespace acpp::vless {
+namespace vless {
 
 // Directory entries carry only routing/lifetime metadata. PFS secrets and the
 // mutable replay set are accessed exclusively on the ticket owner's domain.
@@ -23,4 +23,4 @@ LookupVlessTicket(
     std::array<uint8_t, kVlessEncryptionTicketSize> ticket,
     VlessEncryptionNfsKey nfs_key);
 
-} // namespace acpp::vless
+} // namespace vless

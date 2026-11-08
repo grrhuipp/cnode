@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 
-#include "acppnode/transport/internet/tcp_stream.hpp"
-#include "acppnode/transport/internet/transport_stack.hpp"
+#include "transport/internet/tcp_stream.hpp"
+#include "transport/internet/transport_stack.hpp"
 
 #include <asio/as_tuple.hpp>
 #include <asio/co_spawn.hpp>
@@ -18,7 +18,7 @@
 #include <string_view>
 
 namespace {
-namespace net = acpp::net;
+namespace net = ::net;
 using namespace std::chrono_literals;
 
 void Require(bool condition, const char* message) {
@@ -63,18 +63,18 @@ std::string Headers(std::string_view network) {
     return block;
 }
 
-class CleanupSink final : public acpp::InboundTransportStreamHandler {
+class CleanupSink final : public ::InboundTransportStreamHandler {
 public:
     explicit CleanupSink(net::io_context& io) : release_cleanup(io, 1) {}
 
     net::awaitable<void> OnInboundTransportStream(
-        std::unique_ptr<acpp::AsyncStream> stream,
-        acpp::InboundTransportMetadata) override {
+        std::unique_ptr<::AsyncStream> stream,
+        ::InboundTransportMetadata) override {
         ++started;
         std::array<uint8_t, 1> byte{};
         try {
             (void)co_await stream->AsyncRead(net::buffer(byte));
-        } catch (const acpp::IoSystemError&) {
+        } catch (const ::IoSystemError&) {
             // Physical EOF/error and task cancellation may race. Both must
             // unwind through the same owned request-cleanup barrier.
         }
@@ -86,7 +86,7 @@ public:
         ++cleanup_finished;
     }
 
-    net::experimental::channel<void(acpp::IoErrorCode)> release_cleanup;
+    net::experimental::channel<void(::IoErrorCode)> release_cleanup;
     int started = 0;
     int cleanup_started = 0;
     int cleanup_finished = 0;
@@ -102,30 +102,30 @@ void RunUntil(net::io_context& io, Predicate predicate, const char* message) {
     Require(predicate(), message);
 }
 
-acpp::StreamSettings FixtureSettings(std::string_view network) {
-    acpp::StreamSettings settings;
+::StreamSettings FixtureSettings(std::string_view network) {
+    ::StreamSettings settings;
     settings.network = network;
     settings.grpc.service_name = "fixture";
     settings.http.path = "/fixture";
     settings.http.method = "POST";
     settings.xhttp.path = "/fixture";
-    settings.xhttp.mode = acpp::XHttpMode::StreamOne;
-    return acpp::NormalizeStreamSettings(settings);
+    settings.xhttp.mode = ::XHttpMode::StreamOne;
+    return ::NormalizeStreamSettings(settings);
 }
 
 void ParentWaitsForCleanup(std::string_view network, bool protocol_error) {
     net::io_context io;
-    acpp::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
-    acpp::tcp::socket client(io), accepted(io);
+    ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
+    ::tcp::socket client(io), accepted(io);
     client.connect(acceptor.local_endpoint());
     acceptor.accept(accepted);
-    auto raw = std::make_unique<acpp::TcpStream>(std::move(accepted));
+    auto raw = std::make_unique<::TcpStream>(std::move(accepted));
     auto sink = std::make_shared<CleanupSink>(io);
     const auto settings = FixtureSettings(network);
     bool returned = false;
     std::exception_ptr failure;
     auto build = [&]() -> net::awaitable<void> {
-        const auto result = co_await acpp::BuildInboundTransport(io, std::move(raw), settings, nullptr, 0, sink);
+        const auto result = co_await ::BuildInboundTransport(io, std::move(raw), settings, nullptr, 0, sink);
         Require(result.has_value() && !*result, "demux builder returned a request stream");
         Require(sink->cleanup_finished == 1, "builder returned before child cleanup finished");
     };
@@ -143,7 +143,7 @@ void ParentWaitsForCleanup(std::string_view network, bool protocol_error) {
         const auto invalid = Frame(6, 0, 1, "bad-ping");
         net::write(client, net::buffer(invalid));
     } else {
-        acpp::IoErrorCode ignored;
+        ::IoErrorCode ignored;
         client.close(ignored);
     }
     RunUntil(io, [&] { return sink->cleanup_started == 1 || returned; },
@@ -152,7 +152,7 @@ void ParentWaitsForCleanup(std::string_view network, bool protocol_error) {
     io.run_for(20ms);
     Require(sink->cleanup_started == 1 && sink->cleanup_finished == 0 && !returned,
             "parent completed while request cleanup was suspended");
-    Require(sink->release_cleanup.try_send(acpp::IoErrorCode{}), "cleanup gate was not released");
+    Require(sink->release_cleanup.try_send(::IoErrorCode{}), "cleanup gate was not released");
     RunUntil(io, [&] { return returned; }, "parent failed to join released request cleanup");
     if (failure) std::rethrow_exception(failure);
     Require(sink->cleanup_finished == 1, "request cleanup was skipped or repeated");
@@ -181,17 +181,17 @@ bool HasProtocolReset(std::string_view wire, uint32_t stream) {
 // never reaches the sink, and a later request on the same connection does.
 void ResetsMalformedRequest(std::string_view network, std::string_view extra_field) {
     net::io_context io;
-    acpp::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
-    acpp::tcp::socket client(io), accepted(io);
+    ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
+    ::tcp::socket client(io), accepted(io);
     client.connect(acceptor.local_endpoint());
     acceptor.accept(accepted);
-    auto raw = std::make_unique<acpp::TcpStream>(std::move(accepted));
+    auto raw = std::make_unique<::TcpStream>(std::move(accepted));
     auto sink = std::make_shared<CleanupSink>(io);
     const auto settings = FixtureSettings(network);
     bool returned = false;
     std::exception_ptr failure;
     auto build = [&]() -> net::awaitable<void> {
-        const auto result = co_await acpp::BuildInboundTransport(io, std::move(raw), settings, nullptr, 0, sink);
+        const auto result = co_await ::BuildInboundTransport(io, std::move(raw), settings, nullptr, 0, sink);
         Require(result.has_value() && !*result, "demux builder returned a request stream");
     };
     net::co_spawn(io, build(), [&](std::exception_ptr error) {
@@ -206,7 +206,7 @@ void ResetsMalformedRequest(std::string_view network, std::string_view extra_fie
     std::string received;
     const auto reset_seen = [&] {
         std::array<char, 4096> chunk{};
-        acpp::IoErrorCode error;
+        ::IoErrorCode error;
         const size_t n = client.read_some(net::buffer(chunk), error);
         if (!error) received.append(chunk.data(), n);
         return HasProtocolReset(received, 1);
@@ -215,10 +215,10 @@ void ResetsMalformedRequest(std::string_view network, std::string_view extra_fie
              "malformed request was not reset while its sibling started");
     Require(!returned, "malformed request ended the connection");
     Require(sink->started == 1, "malformed request was delivered");
-    acpp::IoErrorCode ignored;
+    ::IoErrorCode ignored;
     client.close(ignored);
     RunUntil(io, [&] { return sink->cleanup_started == 1; }, "sibling request was not cancelled");
-    Require(sink->release_cleanup.try_send(acpp::IoErrorCode{}), "cleanup gate was not released");
+    Require(sink->release_cleanup.try_send(::IoErrorCode{}), "cleanup gate was not released");
     RunUntil(io, [&] { return returned; }, "parent failed to join released request cleanup");
     if (failure) std::rethrow_exception(failure);
     Require(sink->started == 1 && sink->cleanup_finished == 1, "malformed request was delivered");

@@ -7,8 +7,8 @@
 #include "vless_encryption_record.hpp"
 #include "vless_encryption_xor.hpp"
 
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/asio_types.hpp"
+#include "common/allocator.hpp"
+#include "common/asio_types.hpp"
 
 #include <tl/expected.hpp>
 #include <openssl/mem.h>
@@ -21,7 +21,7 @@
 #include <string_view>
 #include <utility>
 
-namespace acpp::vless {
+namespace vless {
 
 struct VlessEncryptionIssuedTicket {
     std::array<uint8_t, kVlessEncryptionTicketSize> ticket{};
@@ -174,4 +174,4 @@ RunVlessEncryptionServerHandshake(
     std::shared_ptr<const VlessEncryptionConfig> config,
     std::string_view inbound_tag);
 
-}  // namespace acpp::vless
+}  // namespace vless

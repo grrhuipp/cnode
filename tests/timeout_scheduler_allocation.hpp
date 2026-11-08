@@ -11,6 +11,7 @@
 
 namespace timeout_allocation_test {
 inline thread_local bool reject_allocations = false;
+inline thread_local std::ptrdiff_t fail_after = -1;
 inline thread_local std::size_t rejected_allocations = 0;
 inline thread_local bool reject_asio_allocations = false;
 inline thread_local std::size_t rejected_asio_allocations = 0;

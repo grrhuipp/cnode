@@ -1,14 +1,14 @@
 #pragma once
 
-#include "acppnode/app/proxyman/inbound/prepared_config.hpp"
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/asio_types.hpp"
-#include "acppnode/app/session_capabilities.hpp"
+#include "app/proxyman/inbound/prepared_config.hpp"
+#include "common/allocator.hpp"
+#include "common/asio_types.hpp"
+#include "app/session_capabilities.hpp"
 
 #include <memory>
 #include <string_view>
 
-namespace acpp::transport::internet::hysteria {
+namespace transport::internet::hysteria {
 
 class QuicListener;
 
@@ -40,4 +40,4 @@ private:
     std::unique_ptr<QuicListener> listener_;
 };
 
-}  // namespace acpp::transport::internet::hysteria
+}  // namespace transport::internet::hysteria

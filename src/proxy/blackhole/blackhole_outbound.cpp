@@ -1,14 +1,14 @@
 #include "blackhole_outbound.hpp"
-#include "acppnode/app/proxyman/outbound/factory.hpp"
+#include "app/proxyman/outbound/factory.hpp"
 #include "../../app/proxyman/outbound/registration.hpp"
-#include "acppnode/common/buf/multi_buffer.hpp"
-#include "acppnode/common/session.hpp"
-#include "acppnode/core/constants.hpp"
-#include "acppnode/core/naming.hpp"
-#include "acppnode/infra/json_field.hpp"
-#include "acppnode/infra/log.hpp"
+#include "common/buf/multi_buffer.hpp"
+#include "common/session.hpp"
+#include "core/constants.hpp"
+#include "core/naming.hpp"
+#include "infra/json_field.hpp"
+#include "infra/log.hpp"
 
-namespace acpp::proxy::blackhole::outbound {
+namespace proxy::blackhole::outbound {
 
 namespace {
 constexpr std::string_view kHttp403Response =
@@ -55,46 +55,46 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     co_return tl::unexpected(ErrorCode::BLOCKED);
 }
 
-}  // namespace acpp::proxy::blackhole::outbound
+}  // namespace proxy::blackhole::outbound
 
 // ============================================================================
 // 自注册（静态初始化，Xray init() 设计）
 // ============================================================================
 namespace {
-const bool kBlackholeRegistered = (acpp::proxyman::outbound::RegisterProxy(
-    acpp::constants::protocol::kBlackhole,
-    [](const acpp::infra::OutboundSourceConfig& cfg)
-        -> std::optional<acpp::proxyman::outbound::PreparedOutboundProxy> {
-        acpp::proxy::blackhole::outbound::BlackholeSettings settings;
+const bool kBlackholeRegistered = (::proxyman::outbound::RegisterProxy(
+    ::constants::protocol::kBlackhole,
+    [](const ::infra::OutboundSourceConfig& cfg)
+        -> std::optional<::proxyman::outbound::PreparedOutboundProxy> {
+        ::proxy::blackhole::outbound::BlackholeSettings settings;
         if (const auto* p = cfg.settings.if_contains("response")) {
             // Xray 格式: {"response": {"type": "http"}}；未知类型或错误类型拒绝加载。
             if (!p->is_object()) {
                 LOG_ERROR("blackhole outbound '{}': response must be an object", cfg.tag);
                 return std::nullopt;
             }
-            const auto type = acpp::ParseJsonString(p->as_object(), "type");
+            const auto type = ::ParseJsonString(p->as_object(), "type");
             if (!type) {
                 LOG_ERROR("blackhole outbound '{}': response {}", cfg.tag, type.error());
                 return std::nullopt;
             }
             if (*type) {
-                const std::string value = acpp::naming::LowerAscii(**type);
-                if (value == acpp::constants::protocol::kHttp) {
+                const std::string value = ::naming::LowerAscii(**type);
+                if (value == ::constants::protocol::kHttp) {
                     settings.http_response = true;
-                } else if (value != acpp::constants::protocol::kNone) {
+                } else if (value != ::constants::protocol::kNone) {
                     LOG_ERROR("blackhole outbound '{}': response type must be http or none", cfg.tag);
                     return std::nullopt;
                 }
             }
         }
-        return acpp::proxyman::outbound::PreparedOutboundProxy{
-            .create = acpp::proxyman::outbound::MakePreparedOutboundCreator<
-                acpp::proxy::blackhole::outbound::BlackholeSettings,
+        return ::proxyman::outbound::PreparedOutboundProxy{
+            .create = ::proxyman::outbound::MakePreparedOutboundCreator<
+                ::proxy::blackhole::outbound::BlackholeSettings,
                 +[](std::string_view /*tag*/,
-                    std::shared_ptr<const acpp::proxy::blackhole::outbound::BlackholeSettings> s,
-                    acpp::net::io_context& /*io_context*/,
-                    acpp::AwaitableTaskGroup& /*tasks*/) -> std::unique_ptr<acpp::Outbound> {
-                    return std::make_unique<acpp::proxy::blackhole::outbound::Handler>(*s);
+                    std::shared_ptr<const ::proxy::blackhole::outbound::BlackholeSettings> s,
+                    ::net::io_context& /*io_context*/,
+                    ::AwaitableTaskGroup& /*tasks*/) -> std::unique_ptr<::Outbound> {
+                    return std::make_unique<::proxy::blackhole::outbound::Handler>(*s);
                 }>(std::move(settings)),
             .sender = {},
         };

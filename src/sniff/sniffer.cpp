@@ -1,9 +1,8 @@
-#include "acppnode/sniff/sniffer.hpp"
-#include "acppnode/core/constants.hpp"
+#include "sniff/sniffer.hpp"
+#include "core/constants.hpp"
 
 #include <algorithm>
 
-namespace acpp {
 
 SniffResult SniffBittorrent(std::span<const uint8_t> data) {
     SniffResult result;
@@ -40,4 +39,3 @@ SniffResult Sniffer::Sniff(std::span<const uint8_t> data, Network network) {
     return SniffBittorrent(data);
 }
 
-}  // namespace acpp

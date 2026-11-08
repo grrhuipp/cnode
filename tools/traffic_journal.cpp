@@ -1,4 +1,4 @@
-#include "acppnode/infra/json.hpp"
+#include "infra/json.hpp"
 
 #include <openssl/sha.h>
 
@@ -79,7 +79,7 @@ std::string ReadRecord(int directory, const std::string& name) {
     return raw;
 }
 
-uint64_t Counter(const acpp::json::value& value) {
+uint64_t Counter(const ::json::value& value) {
     if (value.is_int64() && value.as_int64() >= 0)
         return static_cast<uint64_t>(value.as_int64());
     if (value.is_uint64() && value.as_uint64() <= static_cast<uint64_t>(INT64_MAX))
@@ -94,7 +94,7 @@ struct Summary {
 };
 
 Summary Summarize(std::string_view raw) {
-    const auto value = acpp::json::parse(raw);
+    const auto value = ::json::parse(raw);
     if (!value.is_array()) throw std::runtime_error("record must contain a row array");
     Summary summary;
     for (const auto& row : value.as_array()) {
@@ -120,7 +120,7 @@ std::string Decimal(__uint128_t value) {
 }
 
 std::string Quote(std::string_view text) {
-    return acpp::json::serialize(acpp::json::value(text));
+    return ::json::serialize(::json::value(text));
 }
 
 std::string Digest(std::string_view raw) {
@@ -211,11 +211,11 @@ void Resolve(int directory, const std::string& record, std::string_view decision
     std::array<char, 32> timestamp {};
     if (std::strftime(timestamp.data(), timestamp.size(), "%Y-%m-%dT%H:%M:%SZ", &utc) == 0)
         throw std::runtime_error("cannot format audit time");
-    const acpp::json::object entry {
+    const ::json::object entry {
         {"event", "reconciliation-intent"}, {"record", record}, {"sha256", Digest(raw)},
         {"decision", decision}, {"evidence", evidence}, {"time", timestamp.data()}
     };
-    const auto audit_line = acpp::json::serialize(entry) + '\n';
+    const auto audit_line = ::json::serialize(entry) + '\n';
     File audit(::openat(directory, ".reconciliation.jsonl", O_CREAT | O_WRONLY | O_APPEND |
                        O_CLOEXEC | O_NOFOLLOW, 0600));
     struct stat info {};

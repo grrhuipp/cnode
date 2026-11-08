@@ -15,7 +15,7 @@ bool Require(bool condition, const char* message) {
 }
 
 TEST(AutosignCert, Contract) {
-    using acpp::transport::internet::AutoSignCertificate;
+    using ::transport::internet::AutoSignCertificate;
     auto injected_dns = AutoSignCertificate::Create("first.example,DNS:second.example");
     ASSERT_FALSE((!Require(injected_dns && X509_check_host(injected_dns->Certificate(), "second.example", sizeof("second.example") - 1,
                     X509_CHECK_FLAG_NEVER_CHECK_SUBJECT, nullptr) == 0,

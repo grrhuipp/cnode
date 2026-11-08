@@ -1,15 +1,15 @@
 #include "udp_framing.hpp"
 
 #include "trojan_codec.hpp"
-#include "acppnode/common/buffer_util.hpp"
-#include "acppnode/common/address_codec.hpp"
-#include "acppnode/common/buf/length_prefixed_packet_buffer.hpp"
+#include "common/buffer_util.hpp"
+#include "common/address_codec.hpp"
+#include "common/buf/length_prefixed_packet_buffer.hpp"
 
 #include <array>
 #include <limits>
 #include <new>
 
-namespace acpp::trojan {
+namespace trojan {
 
 void UdpFramer::Feed(buf::MultiBuffer input) {
     if (failed_) {
@@ -37,7 +37,7 @@ bool UdpFramer::Next(FramedUdpPacket& out) {
             auto address = DecodeAddress(
                 std::span<const uint8_t>(header.data(), copied),
                 AddressWireFormat::Socks5,
-                {.max_domain_len = 253, .require_non_empty_domain = true, .allow_metadata = false});
+                {.require_non_empty_domain = true, .allow_metadata = false});
             if (address.status == AddressDecodeStatus::Incomplete) return false;
             if (address.status == AddressDecodeStatus::Invalid || !address.target.IsValid()) {
                 failed_ = true;
@@ -63,12 +63,13 @@ bool UdpFramer::Next(FramedUdpPacket& out) {
             throw std::bad_alloc();
         }
         pending_.ReleaseIfIdle();
-        if (bytes == 0) {
-            target_.reset();
-            continue;
-        }
         out.target = std::move(*target_);
         target_.reset();
+        if (!buf::SetUdpTarget(out.payload, out.target)) {
+            failed_ = true;
+            pending_.clear();
+            throw std::bad_alloc();
+        }
         return true;
     }
 }
@@ -85,7 +86,6 @@ net::awaitable<buf::MultiBuffer> ReadUdpDatagram(
     while (true) {
         FramedUdpPacket packet;
         if (framer.Next(packet)) {
-            buf::SetUdpDatagramTarget(packet.payload, packet.target);
             co_return std::move(packet.payload);
         }
         buf::MultiBuffer raw = co_await ReadMultiBufferOrThrowOnCancel(stream);
@@ -137,9 +137,6 @@ net::awaitable<void> WriteUdpDatagram(
         throw IoSystemError(
             io_error::message_size, "Trojan UDP datagram is too large");
     }
-    if (*payload_size == 0) {
-        co_return;
-    }
 
     std::array<uint8_t, 272> header{};
     const size_t header_size = EncodeUdpPacketHeaderTo(
@@ -158,4 +155,4 @@ net::awaitable<void> WriteUdpDatagram(
     co_await writer.WriteBuffers(framed.Span());
 }
 
-}  // namespace acpp::trojan
+}  // namespace trojan

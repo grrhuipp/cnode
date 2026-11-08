@@ -3,17 +3,17 @@
 #include "../../outbound_stream_endpoint.hpp"
 #include "../../udp_target.hpp"
 #include "../ss_udp.hpp"
-#include "acppnode/common/buf/contiguous_buffer_view.hpp"
+#include "common/buf/contiguous_buffer_view.hpp"
 
-#include "acppnode/common/unsafe.hpp"
+#include "common/unsafe.hpp"
 #include <array>
 #include <optional>
 
-namespace acpp::proxy::shadowsocks::outbound {
+namespace proxy::shadowsocks::outbound {
 
 // One authenticated UDP association, with a fixed proxy next hop. The inner
 // packet target is encoded as supplied; only the server name is resolved here.
-class UdpRequest final : public acpp::proxy::OutboundDatagramEndpointBase {
+class UdpRequest final : public ::proxy::OutboundDatagramEndpointBase {
 public:
     UdpRequest(net::io_context& io, app::dns::DNS& dns,
                const net::ip::address& bind_address, TargetAddress server,
@@ -42,9 +42,9 @@ public:
     }
 
     ~UdpRequest() noexcept override {
-        ::acpp::SecureZeroMemory(master_key_.bytes.data(), master_key_.bytes.size());
+        ::SecureZeroMemory(master_key_.bytes.data(), master_key_.bytes.size());
         if (ss2022_state_) {
-            ::acpp::SecureZeroMemory(ss2022_state_->key.bytes.data(),
+            ::SecureZeroMemory(ss2022_state_->key.bytes.data(),
                                      ss2022_state_->key.bytes.size());
         }
     }
@@ -63,10 +63,9 @@ public:
                 : ss::DecodeUdpPacketWithKey(bytes.data(), bytes.size(), master_key_.span(),
                     cipher_info_.type, cipher_info_.key_size, cipher_info_.salt_size);
             if (!decoded) continue;
-            ::acpp::SecureZeroMemory(decoded->session_owner.bytes.data(),
+            ::SecureZeroMemory(decoded->session_owner.bytes.data(),
                                      decoded->session_owner.bytes.size());
-            if (!decoded->target.IsValid() || decoded->payload.byte_size() == 0) continue;
-            for (auto* buffer : decoded->payload) buffer->SetUDP(decoded->target);
+            if (!decoded->target.IsValid()) continue;
             socket_.TouchActivity();
             co_return std::move(decoded->payload);
         }
@@ -128,4 +127,4 @@ private:
     std::optional<ss::Ss2022UdpSessionState> ss2022_state_;
 };
 
-}  // namespace acpp::proxy::shadowsocks::outbound
+}  // namespace proxy::shadowsocks::outbound

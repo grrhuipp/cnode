@@ -18,8 +18,7 @@
 
 namespace {
 
-using namespace acpp;
-namespace http = acpp::api::v2board::http;
+namespace http = ::api::v2board::http;
 
 [[noreturn]] void Fail(std::string_view message) {
     std::cerr << message << '\n';

@@ -10,8 +10,8 @@
 #include <type_traits>
 
 namespace {
-using acpp::proxy::shadowsocks::outbound::Credentials;
-using acpp::ss::SsCipherType;
+using ::proxy::shadowsocks::outbound::Credentials;
+using ::ss::SsCipherType;
 
 constexpr std::string_view kKey16 = "AAECAwQFBgcICQoLDA0ODw==";
 constexpr std::string_view kKey32 = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
@@ -21,7 +21,7 @@ void Check(bool success, const char* message) {
     if (!success) throw std::runtime_error(message);
 }
 
-void CheckAscending(const acpp::ss::KeyBytes& key, size_t length) {
+void CheckAscending(const ::ss::KeyBytes& key, size_t length) {
     Check(key.size == length, "wrong decoded key length");
     for (size_t i = 0; i < length; ++i) {
         Check(key.bytes[i] == i, "wrong decoded key bytes");

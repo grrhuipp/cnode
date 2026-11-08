@@ -1,6 +1,6 @@
 #pragma once
 
-#include "acppnode/app/session_group_executor.hpp"
+#include "app/session_group_executor.hpp"
 #include <ngtcp2/ngtcp2.h>
 #include <algorithm>
 #include <array>
@@ -10,7 +10,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace acpp::transport::internet::hysteria {
+namespace transport::internet::hysteria {
 class Connection;
 
 struct ConnectionId {
@@ -138,4 +138,4 @@ private:
     std::unordered_map<std::string,
         std::unordered_map<ConnectionId, std::shared_ptr<QuicOwnership>, ConnectionIdHash>> spaces_;
 };
-} // namespace acpp::transport::internet::hysteria
+} // namespace transport::internet::hysteria

@@ -5,7 +5,7 @@
 #include "vless_encryption_handshake.hpp"
 #include "vless_encryption_io.hpp"
 
-#include "acppnode/common/error.hpp"
+#include "common/error.hpp"
 
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/cancellation_signal.hpp>
@@ -31,7 +31,6 @@
 
 namespace {
 
-using namespace acpp;
 
 [[noreturn]] void Fail(std::string_view message) {
     std::cerr << message << '\n';

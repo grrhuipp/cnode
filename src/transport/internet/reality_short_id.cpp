@@ -1,7 +1,7 @@
-#include "acppnode/transport/internet/reality_short_id.hpp"
-#include "acppnode/common/binary_text_codec.hpp"
+#include "transport/internet/reality_short_id.hpp"
+#include "common/binary_text_codec.hpp"
 
-namespace acpp::transport::internet {
+namespace transport::internet {
 tl::expected<RealityShortId, RealityShortIdError>
 ParseRealityShortId(std::string_view value) noexcept {
     if (value.size() % 2 != 0 || value.size() > kRealityShortIdSize * 2) {
@@ -20,4 +20,4 @@ ParseRealityShortId(std::string_view value) noexcept {
     return parsed;
 }
 
-}  // namespace acpp::transport::internet
+}  // namespace transport::internet

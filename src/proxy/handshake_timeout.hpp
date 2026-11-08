@@ -1,13 +1,13 @@
 #pragma once
 
-#include "acppnode/common/asio_types.hpp"
-#include "acppnode/common/error.hpp"
-#include "acppnode/transport/async_stream.hpp"
-#include "acppnode/transport/link_error.hpp"
+#include "common/asio_types.hpp"
+#include "common/error.hpp"
+#include "transport/async_stream.hpp"
+#include "transport/link_error.hpp"
 
 #include <new>
 
-namespace acpp::proxy {
+namespace proxy {
 
 [[nodiscard]] inline bool ConsumeStreamReadTimeout(
     AsyncStream& stream) noexcept {
@@ -65,4 +65,4 @@ namespace acpp::proxy {
     }
 }
 
-}  // namespace acpp::proxy
+}  // namespace proxy

@@ -2,13 +2,13 @@
 
 #include "../../outbound_stream_endpoint.hpp"
 #include "../../udp_target.hpp"
-#include "acppnode/common/ip_utils.hpp"
+#include "common/ip_utils.hpp"
 
-namespace acpp::proxy::freedom::outbound {
+namespace proxy::freedom::outbound {
 
 // One direct UDP association. Target resolution belongs to this outbound;
 // its concrete transport owns the socket, byte I/O and aggregate deadlines.
-class UdpRequest final : public acpp::proxy::OutboundDatagramEndpointBase {
+class UdpRequest final : public ::proxy::OutboundDatagramEndpointBase {
 public:
     UdpRequest(net::io_context& io, app::dns::DNS& dns,
                const net::ip::address& bind_address)
@@ -18,12 +18,13 @@ public:
         auto read = socket_.StartRead();
         for (;;) {
             auto packet = co_await read.Receive();
-            if (packet.payload.byte_size() == 0 || packet.source.port() == 0) {
+            if (packet.source.port() == 0) {
                 continue;
             }
             const TargetAddress source(iputil::NormalizeAddress(packet.source.address()),
                                        packet.source.port());
-            for (auto* buffer : packet.payload) buffer->SetUDP(source);
+            if (!buf::SetUdpTarget(packet.payload, source))
+                throw transport::LinkError(ErrorCode::RESOURCE_EXHAUSTED);
             socket_.TouchActivity();
             co_return std::move(packet.payload);
         }
@@ -54,4 +55,4 @@ private:
     app::dns::DNS& dns_;
 };
 
-}  // namespace acpp::proxy::freedom::outbound
+}  // namespace proxy::freedom::outbound

@@ -20,10 +20,10 @@
 #include <vector>
 
 namespace {
-namespace net = acpp::net;
-using namespace acpp::controller;
-using acpp::api::NodeInfo;
-using acpp::proxyman::inbound::UserSet;
+namespace net = ::net;
+using namespace ::controller;
+using ::api::NodeInfo;
+using ::proxyman::inbound::UserSet;
 
 void Require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
@@ -43,18 +43,18 @@ std::shared_ptr<const NodeSnapshot> Snapshot(uint16_t port, size_t version = 1) 
     snapshot->users_etag = "users-" + std::to_string(version);
     snapshot->config_etag = "config-" + std::to_string(version);
     snapshot->rules.resize(version);
-    acpp::StreamSettings stream;
+    ::StreamSettings stream;
     stream.ws.path = snapshot->config.Path;
-    snapshot->inbound = std::make_shared<const acpp::PreparedInbound>(acpp::PreparedInbound{
+    snapshot->inbound = std::make_shared<const ::PreparedInbound>(::PreparedInbound{
         .binding = {.port = port, .protocol = snapshot->protocol, .tag = snapshot->tag, .listen = {}},
-        .receiver = acpp::proxyman::inbound::MakeReceiverSettings(
+        .receiver = ::proxyman::inbound::MakeReceiverSettings(
             snapshot->tag, {}, snapshot->protocol, std::move(stream), {},
-            acpp::ProxyProtocolMode::Auto, acpp::routing::RouteWithFallback(snapshot->tag), {}),
+            ::ProxyProtocolMode::Auto, ::routing::RouteWithFallback(snapshot->tag), {}),
         .build_request = {},
         .users = std::make_shared<const UserSet>(
-            acpp::proxyman::inbound::PreparedVmessUsers(version)),
+            ::proxyman::inbound::PreparedVmessUsers(version)),
     });
-    auto outbound = std::make_shared<acpp::proxyman::outbound::PreparedOutboundConfig>();
+    auto outbound = std::make_shared<::proxyman::outbound::PreparedOutboundConfig>();
     outbound->tag = snapshot->tag;
     snapshot->outbound = std::move(outbound);
     return snapshot;
@@ -62,9 +62,9 @@ std::shared_ptr<const NodeSnapshot> Snapshot(uint16_t port, size_t version = 1) 
 
 // A users-only change keeps every prepared setting and replaces the users.
 void ReplaceUsers(NodeSnapshot& snapshot, size_t count) {
-    auto inbound = std::make_shared<acpp::PreparedInbound>(*snapshot.inbound);
+    auto inbound = std::make_shared<::PreparedInbound>(*snapshot.inbound);
     inbound->users = std::make_shared<const UserSet>(
-        acpp::proxyman::inbound::PreparedVmessUsers(count));
+        ::proxyman::inbound::PreparedVmessUsers(count));
     snapshot.inbound = std::move(inbound);
 }
 
@@ -111,7 +111,7 @@ struct Runtime {
     [[nodiscard]] bool IsStopping() const noexcept { return closed; }
 
     bool Step(std::string operation, const std::function<void()>& mutate) {
-        if (closed) throw acpp::IoSystemError(net::error::operation_aborted);
+        if (closed) throw ::IoSystemError(net::error::operation_aborted);
         calls.push_back(operation);
         const int occurrence = ++counts[operation];
         const Fault* fault = nullptr;
@@ -140,7 +140,7 @@ struct Runtime {
         co_await net::post(net::use_awaitable);
         Step("remove-out:" + tag, [&] { resources[tag].outbound = false; });
     }
-    net::awaitable<bool> AddInbound(const acpp::PreparedInbound& inbound) {
+    net::awaitable<bool> AddInbound(const ::PreparedInbound& inbound) {
         ++operations_started;
         co_await net::post(net::use_awaitable);
         if (inbound_gate) {
@@ -157,13 +157,13 @@ struct Runtime {
             resources[tag].version = inbound.receiver.stream_settings.ws.path;
         });
     }
-    net::awaitable<void> AddOutbound(const acpp::proxyman::outbound::PreparedOutboundConfig& outbound) {
+    net::awaitable<void> AddOutbound(const ::proxyman::outbound::PreparedOutboundConfig& outbound) {
         ++operations_started;
         co_await net::post(net::use_awaitable);
         const auto& tag = outbound.tag;
         Step("add-out:" + tag, [&] { resources[tag].outbound = true; });
     }
-    net::awaitable<void> UpdateRules(const std::string& tag, const std::vector<acpp::rule::DetectRule>& rules) {
+    net::awaitable<void> UpdateRules(const std::string& tag, const std::vector<::rule::DetectRule>& rules) {
         ++operations_started;
         co_await net::post(net::use_awaitable);
         Step("rules:" + tag, [&] { resources[tag].rules = rules.size(); });

@@ -1,10 +1,9 @@
 #pragma once
 
-#include "acppnode/app/prepared_inbound.hpp"
+#include "app/prepared_inbound.hpp"
 
 #include <vector>
 
-namespace acpp {
 
 struct StaticInboundConfig;
 
@@ -14,4 +13,3 @@ struct StaticInboundConfig;
 [[nodiscard]] std::vector<PreparedInbound> PrepareStartupInbounds(
     std::vector<StaticInboundConfig> sources, bool enable_test_mode);
 
-}  // namespace acpp

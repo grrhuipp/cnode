@@ -3,14 +3,14 @@
 #include "http1_handshake.hpp"
 #include "http_path_match.hpp"
 #include "xhttp_packet_session_key.hpp"
-#include "acppnode/app/session_group_executor.hpp"
+#include "app/session_group_executor.hpp"
 #include "../../common/awaitable_task_group.hpp"
-#include "acppnode/common/buffer_util.hpp"
-#include "acppnode/infra/log.hpp"
-#include "acppnode/transport/internet/http_headers.hpp"
-#include "acppnode/transport/internet/tcp_stream.hpp"
-#include "acppnode/transport/phase_deadline.hpp"
-#include "acppnode/transport/internet/async_delay.hpp"
+#include "common/buffer_util.hpp"
+#include "infra/log.hpp"
+#include "transport/internet/http_headers.hpp"
+#include "transport/internet/tcp_stream.hpp"
+#include "transport/phase_deadline.hpp"
+#include "transport/internet/async_delay.hpp"
 
 #include <array>
 #include <charconv>
@@ -22,7 +22,7 @@
 #include <unordered_map>
 #include <asio/this_coro.hpp>
 
-namespace acpp::transport::internet {
+namespace transport::internet {
 namespace {
 
 constexpr size_t kXHttpMaxPacketSessions = 1024;
@@ -493,7 +493,7 @@ private:
 // Consumes a Content-Length body nobody will use, keeping the connection in
 // step with its next request. Bodies above the packet budget are refused.
 net::awaitable<bool> DiscardHttp1Body(AsyncStream& connection, uint64_t length) {
-    if (length > ::acpp::detail::XHttpPacketQueue::kMaxQueuedBytes) {
+    if (length > ::detail::XHttpPacketQueue::kMaxQueuedBytes) {
         co_return false;
     }
     while (length > 0) {
@@ -525,7 +525,7 @@ net::awaitable<std::optional<buf::MultiBuffer>> ReadXHttpPacketBody(
     buf::MultiBuffer payload;
 
     if (content_length) {
-        if (*content_length > ::acpp::detail::XHttpPacketQueue::kMaxQueuedBytes) {
+        if (*content_length > ::detail::XHttpPacketQueue::kMaxQueuedBytes) {
             co_return std::nullopt;
         }
         auto remaining = static_cast<size_t>(*content_length);
@@ -545,7 +545,7 @@ net::awaitable<std::optional<buf::MultiBuffer>> ReadXHttpPacketBody(
         if (n == 0) {
             break;
         }
-        if (payload.byte_size() > ::acpp::detail::XHttpPacketQueue::kMaxQueuedBytes) {
+        if (payload.byte_size() > ::detail::XHttpPacketQueue::kMaxQueuedBytes) {
             payload.clear();
             co_return std::nullopt;
         }
@@ -858,7 +858,7 @@ net::awaitable<void> JoinXHttpClientTasks(net::execution_context& services) {
 
 struct XHttpSessionTableEntry {
     XHttpSessionTable* table = nullptr;
-    const ::acpp::detail::XHttpPacketSessionKey* key = nullptr;
+    const ::detail::XHttpPacketSessionKey* key = nullptr;
     std::weak_ptr<XHttpPacketUpSession> session;
     XHttpPacketUpSession* live = nullptr;
     XHttpSessionTableEntry* previous = nullptr;
@@ -879,7 +879,7 @@ public:
         std::string_view id, XHttpSessionAccess access,
         std::shared_ptr<ExecutionDomain> owner = {},
         std::shared_ptr<XHttpSessionDirectory::Record> record = {}) {
-        const ::acpp::detail::XHttpPacketSessionKeyRef lookup{id, session_namespace};
+        const ::detail::XHttpPacketSessionKeyRef lookup{id, session_namespace};
         auto found = sessions_.find(lookup);
         if (found != sessions_.end() && found->second.live)
             return found->second.session.lock();
@@ -891,7 +891,7 @@ public:
         auto session = memory::AllocateShared<XHttpPacketUpSession>(io, owner);
         const bool inserting = found == sessions_.end();
         if (found == sessions_.end()) {
-            ::acpp::detail::XHttpPacketSessionKey key{
+            ::detail::XHttpPacketSessionKey key{
                 .session_id = memory::ThreadLocalString(id),
                 .session_namespace = memory::ThreadLocalString(session_namespace),
             };
@@ -960,9 +960,9 @@ private:
     }
 
     memory::ThreadLocalUnorderedMap<
-        ::acpp::detail::XHttpPacketSessionKey, XHttpSessionTableEntry,
-        ::acpp::detail::XHttpPacketSessionKeyHash,
-        ::acpp::detail::XHttpPacketSessionKeyEq> sessions_;
+        ::detail::XHttpPacketSessionKey, XHttpSessionTableEntry,
+        ::detail::XHttpPacketSessionKeyHash,
+        ::detail::XHttpPacketSessionKeyEq> sessions_;
     XHttpSessionTableEntry* first_ = nullptr;
     XHttpSessionTableEntry* last_ = nullptr;
     size_t active_ = 0;
@@ -1548,7 +1548,7 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
             if (HeaderListContainsTokenCI(request, "Expect", "100-continue") &&
                 (!content_length ||
                  (session && session->AcceptingInput() &&
-                  content_length->bytes <= ::acpp::detail::XHttpPacketQueue::kMaxQueuedBytes)) &&
+                  content_length->bytes <= ::detail::XHttpPacketQueue::kMaxQueuedBytes)) &&
                 !co_await WriteFullToStream(*stream, "HTTP/1.1 100 Continue\r\n\r\n")) {
                 co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
             }
@@ -1829,4 +1829,4 @@ net::awaitable<TransportBuildResult> DoXHttp1ClientRequest(
         std::move(stream), read_framing, false, head->ReadAhead());
 }
 
-}  // namespace acpp::transport::internet
+}  // namespace transport::internet

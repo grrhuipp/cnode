@@ -1,11 +1,12 @@
 #include <gtest/gtest.h>
 
-#include "acppnode/common/initial_payload.hpp"
+#include "common/initial_payload.hpp"
 
 #include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <type_traits>
+#include <limits>
 #include <vector>
 
 namespace {
@@ -44,7 +45,6 @@ void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
 void operator delete(void* pointer, const std::nothrow_t&) noexcept { ::operator delete(pointer); }
 
 namespace {
-using namespace acpp;
 static_assert(alignof(buf::Buffer) <= alignof(std::max_align_t));
 int failed = 0;
 
@@ -425,4 +425,163 @@ TEST(BufferOwnership, Contract) {
     UdpPrefixTransfer();
     EdgeCases();
     { ASSERT_EQ((failed ? 1 : 0), 0); return; }
+}
+
+TEST(BufferOwnership, PartialConsumptionReturnsSpillStorageWithoutCopyingPayload) {
+    ::memory::AllocationDomain domain;
+    ::memory::ScopedAllocationDomain lease(domain);
+    ::buf::MultiBuffer payload;
+    payload.reserve(4096);
+    for (size_t i = 0; i < 4096; ++i)
+        payload.push_back(Buffer(1, static_cast<uint8_t>(i)));
+    auto* const last = payload.back();
+    const ::TargetAddress endpoint{"127.0.0.1", 1234};
+    last->SetUDP(endpoint);
+
+    EXPECT_EQ(payload.DropPrefixBytes(4096 - ::buf::MultiBuffer::kInlineCapacity),
+              4096 - ::buf::MultiBuffer::kInlineCapacity);
+    ASSERT_EQ(payload.size(), ::buf::MultiBuffer::kInlineCapacity);
+    EXPECT_EQ(domain.OutstandingAllocations(), payload.size());
+    EXPECT_TRUE(Consistent(payload));
+    EXPECT_EQ(payload.back(), last);
+    EXPECT_TRUE(last->UDP().SameEndpoint(endpoint));
+
+    ::buf::MultiBuffer moved = std::move(payload);
+    EXPECT_TRUE(payload.empty());
+    for (size_t i = 0; i < ::buf::MultiBuffer::kInlineCapacity; ++i) {
+        auto buffer = moved.pop_front();
+        ASSERT_TRUE(buffer);
+        ASSERT_EQ(buffer->Len(), 1);
+        EXPECT_EQ(buffer->Bytes()[0], static_cast<uint8_t>(4096 - ::buf::MultiBuffer::kInlineCapacity + i));
+    }
+    EXPECT_TRUE(moved.empty());
+    EXPECT_EQ(domain.OutstandingAllocations(), 0);
+}
+
+TEST(BufferOwnership, CoalescingUsesExistingTailWhenMetadataAllocationIsUnavailable) {
+    FailingResource resource(std::pmr::get_default_resource());
+    ScopedDefaultResource scope(&resource);
+    buf::MultiBuffer target, source;
+    for (size_t i = 0; i < buf::MultiBuffer::kInlineCapacity; ++i)
+        target.push_back(Buffer(1, static_cast<uint8_t>(i)));
+    auto* const tail = target.back();
+    for (size_t i = 0; i < 16; ++i)
+        source.push_back(Buffer(1, static_cast<uint8_t>(0x80 + i)));
+    source.push_back(Buffer(0));
+    auto expected = Flatten(target);
+    const auto added = Flatten(source);
+    expected.insert(expected.end(), added.begin(), added.end());
+
+    resource.RejectNextAllocation();
+    ASSERT_NO_THROW(target.AppendAndCoalesce(std::move(source)));
+    EXPECT_EQ(Flatten(target), expected);
+    EXPECT_EQ(target.size(), buf::MultiBuffer::kInlineCapacity);
+    EXPECT_EQ(target.back(), tail);
+    EXPECT_TRUE(source.empty());
+    EXPECT_TRUE(Consistent(target));
+    EXPECT_EQ(resource.RejectedAllocations(), 0);
+}
+
+TEST(BufferOwnership, CoalescingPreparesNewSlotsBeforeChangingBytesOrUdpBoundaries) {
+    FailingResource resource(std::pmr::get_default_resource());
+    ScopedDefaultResource scope(&resource);
+    buf::MultiBuffer target, source;
+    for (size_t i = 0; i < buf::MultiBuffer::kInlineCapacity; ++i)
+        target.push_back(Buffer(1, static_cast<uint8_t>(i)));
+    for (uint8_t value = 0x80; value < 0x84; ++value)
+        source.push_back(Buffer(value == 0x81 ? 0 : 1, value));
+    auto* const datagram = *(source.begin() + 1);
+    const TargetAddress endpoint{"127.0.0.1", 4321};
+    datagram->SetUDP(endpoint);
+    const auto before = Flatten(target);
+    const auto added = Flatten(source);
+
+    resource.RejectNextAllocation();
+    EXPECT_THROW(target.AppendAndCoalesce(std::move(source)), std::bad_alloc);
+    EXPECT_EQ(Flatten(target), before);
+    EXPECT_EQ(Flatten(source), added);
+    ASSERT_EQ(source.size(), 4);
+    EXPECT_EQ(*(source.begin() + 1), datagram);
+    EXPECT_TRUE(datagram->UDP().SameEndpoint(endpoint));
+    EXPECT_TRUE(Consistent(target));
+    EXPECT_TRUE(Consistent(source));
+
+    target.AppendAndCoalesce(std::move(source));
+    auto expected = before;
+    expected.insert(expected.end(), added.begin(), added.end());
+    EXPECT_EQ(Flatten(target), expected);
+    ASSERT_EQ(target.size(), buf::MultiBuffer::kInlineCapacity + 2);
+    EXPECT_EQ(*(target.begin() + buf::MultiBuffer::kInlineCapacity), datagram);
+    EXPECT_TRUE(datagram->UDP().SameEndpoint(endpoint));
+    EXPECT_FALSE(target.back()->HasUDP());
+    EXPECT_EQ(target.back()->Len(), 2);
+    EXPECT_TRUE(source.empty());
+    EXPECT_TRUE(Consistent(target));
+}
+
+TEST(BufferOwnership, EmptyUdpMessageSurvivesTransfersAndChecksEveryTarget) {
+    buf::MultiBuffer stream_empty;
+    stream_empty.push_back(Buffer(0));
+    stream_empty.ReleaseIfIdle();
+    EXPECT_TRUE(stream_empty.empty());
+
+    const TargetAddress first_target{"127.0.0.1", 1234};
+    const TargetAddress second_target{"127.0.0.1", 4321};
+    buf::MultiBuffer packet;
+    ASSERT_TRUE(buf::SetUdpTarget(packet, first_target));
+    const auto* original = *packet.begin();
+    InitialPayload initial(std::move(packet));
+    EXPECT_FALSE(initial.empty());
+    EXPECT_EQ(initial.size(), 0);
+    auto moved = initial.MoveToMultiBuffer();
+    moved.ReleaseIfIdle();
+    EXPECT_TRUE(initial.empty());
+    {
+        const auto info = buf::InspectUdpDatagram(moved);
+        ASSERT_TRUE(info.Valid());
+        EXPECT_EQ(info.payload_size, 0);
+        EXPECT_TRUE(info.target->SameEndpoint(first_target));
+    }
+    buf::MultiBuffer destination;
+    moved.MoveTo(destination);
+    ASSERT_EQ(destination.size(), 1);
+    EXPECT_EQ(*destination.begin(), original);
+    EXPECT_TRUE(moved.empty());
+
+    buf::MultiBuffer later;
+    later.push_back(Buffer(1));
+    ASSERT_TRUE(buf::SetUdpTarget(later, second_target));
+    destination.AppendAndCoalesce(std::move(later));
+    EXPECT_EQ(destination.size(), 2);
+    EXPECT_EQ(destination.byte_size(), 1);
+    EXPECT_EQ(buf::InspectUdpDatagram(destination).status, buf::UdpDatagramStatus::MixedTarget);
+}
+
+TEST(BufferOwnership, UnrepresentableWriteCapacityReturnsFailureAndAllowsReuse) {
+    EXPECT_EXIT(([] {
+        bool passed = true;
+        for (const size_t initial_size : {size_t{32}, size_t{buf::Buffer::kSize + 1}}) {
+            memory::AllocationDomain domain;
+            memory::ScopedAllocationDomain lease(domain);
+            {
+                buf::ContiguousWriteBuffer storage;
+                (void)storage.Prepare(initial_size);
+                passed &= storage.TryPrepare(std::numeric_limits<size_t>::max()) == nullptr;
+                passed &= storage.Empty() && storage.Data() == nullptr;
+                passed &= domain.OutstandingAllocations() == 0;
+
+                const auto expected = Pattern(
+                    initial_size <= buf::Buffer::kSize ? buf::Buffer::kSize + 1 : 33);
+                auto* data = storage.TryPrepare(expected.size());
+                if (!data) std::_Exit(1);
+                std::memcpy(data, expected.data(), expected.size());
+                buf::MultiBuffer output;
+                passed &= storage.TryAppendTo(expected.size(), output);
+                passed &= Flatten(output) == expected && Consistent(output);
+                passed &= storage.Empty() && storage.Data() == nullptr;
+            }
+            passed &= domain.OutstandingAllocations() == 0;
+        }
+        std::_Exit(passed ? 0 : 1);
+    }()), ::testing::ExitedWithCode(0), "");
 }

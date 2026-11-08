@@ -4,8 +4,8 @@
 
 namespace {
 
-using acpp::api::NodeInfo;
-using acpp::controller::NodeTransitionMode;
+using ::api::NodeInfo;
+using ::controller::NodeTransitionMode;
 
 NodeInfo MakeNode() {
     NodeInfo node;
@@ -20,7 +20,7 @@ bool HasMode(const NodeInfo* current,
              bool current_started,
              const NodeInfo& candidate,
              NodeTransitionMode mode) {
-    const auto plan = acpp::controller::PlanNodeTransition(
+    const auto plan = ::controller::PlanNodeTransition(
         current, current_started, candidate);
     return plan.mode == mode
         && plan.Transitioning() == (mode != NodeTransitionMode::Refresh)
@@ -55,23 +55,23 @@ TEST(NodeTransition, Contract) {
 
     NodeInfo changed = current;
     changed.TransportProtocol = "ws";
-    ASSERT_FALSE((!acpp::controller::NodeConfigChanged(current, changed)));
+    ASSERT_FALSE((!::controller::NodeConfigChanged(current, changed)));
     changed = current;
     changed.Path = "/proxy";
-    ASSERT_FALSE((!acpp::controller::NodeConfigChanged(current, changed)));
+    ASSERT_FALSE((!::controller::NodeConfigChanged(current, changed)));
     changed = current;
     changed.NodeType = "shadowsocks";
-    ASSERT_FALSE((!acpp::controller::NodeConfigChanged(current, changed)));
+    ASSERT_FALSE((!::controller::NodeConfigChanged(current, changed)));
     changed = current;
     changed.Sniffing.enabled = !current.Sniffing.enabled;
-    ASSERT_FALSE((!acpp::controller::NodeConfigChanged(current, changed)));
+    ASSERT_FALSE((!::controller::NodeConfigChanged(current, changed)));
     changed = current;
-    changed.Sniffing.dest_override = acpp::SniffConfig::kHttp;
-    ASSERT_FALSE((!acpp::controller::NodeConfigChanged(current, changed)));
+    changed.Sniffing.dest_override = ::SniffConfig::kHttp;
+    ASSERT_FALSE((!::controller::NodeConfigChanged(current, changed)));
 
     changed = current;
     changed.PullInterval = current.PullInterval + 1;
     changed.PushInterval = current.PushInterval + 2;
-    ASSERT_FALSE((acpp::controller::NodeConfigChanged(current, changed)));
+    ASSERT_FALSE((::controller::NodeConfigChanged(current, changed)));
 
 }

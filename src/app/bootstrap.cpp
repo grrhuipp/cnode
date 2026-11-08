@@ -1,14 +1,14 @@
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/app/bootstrap_cli.hpp"
-#include "acppnode/infra/config.hpp"
-#include "acppnode/infra/log.hpp"
-#include "acppnode/app/bootstrap_setup.hpp"
-#include "acppnode/app/bootstrap_runtime.hpp"
-#include "acppnode/service/controller/controller.hpp"
-#include "acppnode/app/stats.hpp"
-#include "acppnode/app/worker.hpp"
-#include "acppnode/geo/geodata.hpp"
-#include "acppnode/app/bootstrap.hpp"
+#include "common/allocator.hpp"
+#include "app/bootstrap_cli.hpp"
+#include "infra/config.hpp"
+#include "infra/log.hpp"
+#include "app/bootstrap_setup.hpp"
+#include "app/bootstrap_runtime.hpp"
+#include "service/controller/controller.hpp"
+#include "app/stats.hpp"
+#include "app/worker.hpp"
+#include "geo/geodata.hpp"
+#include "app/bootstrap.hpp"
 
 #include <iostream>
 #include <exception>
@@ -26,7 +26,6 @@
 #define BUILD_ID "unknown"
 #endif
 
-namespace acpp {
 
 namespace {
 
@@ -137,4 +136,3 @@ int RunFromCommandLine(int argc, char* argv[]) {
     return result;
 }
 
-}  // namespace acpp

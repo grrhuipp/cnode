@@ -4,7 +4,7 @@
 // Wire timing reference: XTLS/Xray-core a4a3dff5b20c2faae567b742c172c7b95e75c083
 // proxy/proxy.go: VisionWriter.WriteMultiBuffer, IsCompleteRecord, XtlsPadding.
 #include "vless_vision.hpp"
-#include "acppnode/common/byte_reader.hpp"
+#include "common/byte_reader.hpp"
 #include <asio/co_spawn.hpp>
 #include <asio/use_future.hpp>
 #include <algorithm>
@@ -14,7 +14,6 @@
 #include <vector>
 
 namespace {
-using namespace acpp;
 void Check(bool ok, const char* message) {
     if (!ok) { std::cerr << message << '\n'; ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed"); }
 }

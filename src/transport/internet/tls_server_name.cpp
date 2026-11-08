@@ -1,10 +1,10 @@
-#include "acppnode/transport/internet/tls_server_name.hpp"
-#include "acppnode/common/byte_reader.hpp"
+#include "transport/internet/tls_server_name.hpp"
+#include "common/byte_reader.hpp"
 
 #include <algorithm>
 #include <bitset>
 
-namespace acpp::transport::internet {
+namespace transport::internet {
 
 tl::expected<std::string_view, TlsServerNameExtensionError>
 ParseTlsServerNameExtension(std::span<const uint8_t> extension) noexcept {
@@ -53,4 +53,4 @@ ParseTlsServerNameExtension(std::span<const uint8_t> extension) noexcept {
     return host_name;
 }
 
-}  // namespace acpp::transport::internet
+}  // namespace transport::internet

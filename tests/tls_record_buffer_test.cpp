@@ -1,10 +1,10 @@
 #include <gtest/gtest.h>
 
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/buf/multi_buffer.hpp"
-#include "acppnode/transport/internet/tcp_stream.hpp"
-#include "acppnode/transport/internet/tls_config.hpp"
-#include "acppnode/transport/internet/tls_stream.hpp"
+#include "common/allocator.hpp"
+#include "common/buf/multi_buffer.hpp"
+#include "transport/internet/tcp_stream.hpp"
+#include "transport/internet/tls_config.hpp"
+#include "transport/internet/tls_stream.hpp"
 
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/co_spawn.hpp>
@@ -24,7 +24,7 @@
 #include <vector>
 
 namespace {
-namespace net = acpp::net;
+namespace net = ::net;
 using namespace std::chrono_literals;
 
 void Require(bool value, const char* why) {
@@ -37,24 +37,24 @@ public:
 private:
     void* do_allocate(std::size_t size, std::size_t alignment) override {
         void* p = pool.allocate(size, alignment);
-        if (size >= acpp::buf::Buffer::kSize) large_live += size;
+        if (size >= ::buf::Buffer::kSize) large_live += size;
         return p;
     }
     void do_deallocate(void* p, std::size_t size, std::size_t alignment) override {
-        if (size >= acpp::buf::Buffer::kSize) large_live -= size;
+        if (size >= ::buf::Buffer::kSize) large_live -= size;
         pool.deallocate(p, size, alignment);
     }
     bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
         return this == &other;
     }
-    acpp::memory::ThreadMemoryResource pool;
+    ::memory::ThreadMemoryResource pool;
 };
 
 // An independent public-API TLS peer. Memory BIOs are test wire capture only:
 // they let the test split an authenticated TLS record at an exact byte boundary.
 class Peer {
 public:
-    Peer(acpp::tcp::socket socket, SSL_CTX* context, bool server)
+    Peer(::tcp::socket socket, SSL_CTX* context, bool server)
         : socket(std::move(socket)), ssl(SSL_new(context), SSL_free) {
         Require(ssl != nullptr, "peer SSL allocation failed");
         BIO* input = BIO_new(BIO_s_mem());
@@ -128,7 +128,7 @@ public:
         co_return result;
     }
 
-    acpp::tcp::socket socket;
+    ::tcp::socket socket;
     std::unique_ptr<SSL, decltype(&SSL_free)> ssl;
 };
 
@@ -136,17 +136,17 @@ struct Fixture {
     explicit Fixture(bool product_server = false, bool large_chain = false,
                      const Resource* resource = nullptr) {
         const auto dir = std::filesystem::path(ACPP_TEST_SOURCE_DIR) / "tests/fixtures/anytls-pool";
-        acpp::TlsConfig server_config;
+        ::TlsConfig server_config;
         server_config.cert_file = (dir / "cert.pem").string();
         server_config.key_file = (dir / "key.pem").string();
-        acpp::LoadTlsPemMaterial(server_config);
+        ::LoadTlsPemMaterial(server_config);
         server_config.alpn = {"h2"};
-        server_config.min_version = acpp::TlsVersion::V1_3;
-        server = acpp::SslContext::CreateServer(server_config);
-        acpp::TlsConfig client_config;
+        server_config.min_version = ::TlsVersion::V1_3;
+        server = ::SslContext::CreateServer(server_config);
+        ::TlsConfig client_config;
         client_config.allow_insecure = true;
         client_config.alpn = {"h2"};
-        client = acpp::SslContext::CreateClient(client_config);
+        client = ::SslContext::CreateClient(client_config);
         Require(server && client, "TLS fixture contexts failed");
         SSL_CTX_set_num_tickets(server->Native(), 0);
         SSL_CTX_set_max_cert_list(client->Native(), 512 * 1024);
@@ -158,8 +158,8 @@ struct Fixture {
                 Require(SSL_CTX_add1_chain_cert(server->Native(), certificate) == 1,
                         "large certificate chain preparation failed");
         }
-        acpp::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
-        acpp::tcp::socket socket(io), other(io);
+        ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
+        ::tcp::socket socket(io), other(io);
         socket.connect(acceptor.local_endpoint());
         acceptor.accept(other);
         socket.set_option(net::socket_base::send_buffer_size(4096));
@@ -168,8 +168,8 @@ struct Fixture {
         other.set_option(net::socket_base::receive_buffer_size(32768));
         peer = std::make_unique<Peer>(std::move(other),
             product_server ? client->Native() : server->Native(), !product_server);
-        stream = std::make_unique<acpp::TlsStream>(
-            std::make_unique<acpp::TcpStream>(std::move(socket)),
+        stream = std::make_unique<::TlsStream>(
+            std::make_unique<::TcpStream>(std::move(socket)),
             product_server ? *server : *client, product_server);
         if (resource) retained_before_handshake = resource->large_live;
         try {
@@ -188,7 +188,7 @@ struct Fixture {
 
     void CloseAndJoin() {
         stream->CloseAbortive();
-        acpp::IoErrorCode ignored;
+        ::IoErrorCode ignored;
         peer->socket.close(ignored);
         io.restart();
         io.run();
@@ -205,9 +205,9 @@ struct Fixture {
     }
 
     net::io_context io;
-    std::unique_ptr<acpp::SslContext> server, client;
+    std::unique_ptr<::SslContext> server, client;
     std::unique_ptr<Peer> peer;
-    std::unique_ptr<acpp::TlsStream> stream;
+    std::unique_ptr<::TlsStream> stream;
     std::size_t retained_before_handshake = 0;
 };
 
@@ -216,7 +216,7 @@ struct JoinPending {
     Fixture& fixture;
 };
 
-std::string Flatten(acpp::buf::MultiBuffer data) {
+std::string Flatten(::buf::MultiBuffer data) {
     std::string result;
     while (!data.empty()) {
         auto buffer = data.pop_front();
@@ -226,7 +226,7 @@ std::string Flatten(acpp::buf::MultiBuffer data) {
     return result;
 }
 
-net::awaitable<std::string> ReadBytes(acpp::TlsStream& stream, std::size_t count) {
+net::awaitable<std::string> ReadBytes(::TlsStream& stream, std::size_t count) {
     std::string result;
     while (result.size() < count) {
         auto data = co_await stream.ReadMultiBuffer();
@@ -247,12 +247,12 @@ void FragmentedAndCoalesced(Resource& resource) {
     fixture.io.restart();
     fixture.io.run_for(20ms);
     Require(read.wait_for(0s) != std::future_status::ready, "partial TLS header completed a read");
-    Require(acpp::memory::detail::test_buffers_live == 0 && resource.large_live == idle_bytes,
+    Require(::memory::detail::test_buffers_live == 0 && resource.large_live == idle_bytes,
             "partial record wait retained a relay or ciphertext staging buffer");
     fixture.stream->Cancel();
     bool cancelled = false;
     try { (void)fixture.Wait(read); }
-    catch (const acpp::IoSystemError& error) {
+    catch (const ::IoSystemError& error) {
         if (error.code() != net::error::operation_aborted) throw;
         cancelled = true;
     }
@@ -276,14 +276,14 @@ void FragmentedAndCoalesced(Resource& resource) {
     Require(fixture.Wait(consume) == 1 && prefix == 'a', "OOM fixture did not retain plaintext");
     // SSL_pending now avoids socket-wait allocation; the next PMR request is
     // the relay Buffer itself, not a coroutine or asynchronous socket handler.
-    acpp::memory::reject_next_pmr_allocation = true;
+    ::memory::reject_next_pmr_allocation = true;
     bool rejected = false;
     try {
         auto failed = net::co_spawn(fixture.io, fixture.stream->ReadMultiBuffer(), net::use_future);
         (void)fixture.Wait(failed);
     } catch (const std::bad_alloc&) { rejected = true; }
-    const bool consumed_fault = !acpp::memory::reject_next_pmr_allocation;
-    acpp::memory::reject_next_pmr_allocation = false;
+    const bool consumed_fault = !::memory::reject_next_pmr_allocation;
+    ::memory::reject_next_pmr_allocation = false;
     Require(rejected && consumed_fault && fixture.stream->IsOpen(),
             "read allocation failure became EOF or closed TLS");
     auto retry = net::co_spawn(fixture.io, fixture.stream->ReadMultiBuffer(), net::use_future);
@@ -311,7 +311,7 @@ void DuplexKeyUpdate(Resource& resource) {
     auto read = net::co_spawn(fixture.io, fixture.stream->ReadMultiBuffer(), net::use_future);
     auto received = net::co_spawn(fixture.io, fixture.peer->Read(payload.size()), net::use_future);
     try { fixture.Wait(write); }
-    catch (const acpp::IoSystemError& error) {
+    catch (const ::IoSystemError& error) {
         if (error.code() != net::error::operation_aborted) throw;
     }
     Require(fixture.Wait(received) == payload, "logical cancellation truncated or interleaved physical TLS output");
@@ -375,7 +375,7 @@ void ReadDeadline() {
     auto read = net::co_spawn(fixture.io, fixture.stream->ReadMultiBuffer(), net::use_future);
     bool timed_out = false;
     try { (void)fixture.Wait(read); }
-    catch (const acpp::IoSystemError& error) {
+    catch (const ::IoSystemError& error) {
         if (error.code() != net::error::operation_aborted) throw;
         timed_out = true;
     }
@@ -385,7 +385,7 @@ void ReadDeadline() {
 }  // namespace
 
 TEST(TlsRecordBuffer, Contract) {
-    acpp::TlsStream::InitializeIo();
+    ::TlsStream::InitializeIo();
     Resource resource;
     auto* previous = std::pmr::set_default_resource(&resource);
     bool passed = true;
@@ -395,7 +395,7 @@ TEST(TlsRecordBuffer, Contract) {
         BidirectionalBackpressure();
         LargeHandshake(resource);
         ReadDeadline();
-        Require(resource.large_live == 0 && acpp::memory::detail::test_buffers_live == 0,
+        Require(resource.large_live == 0 && ::memory::detail::test_buffers_live == 0,
                 "TLS test retained operation payload");
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
@@ -404,3 +404,51 @@ TEST(TlsRecordBuffer, Contract) {
     std::pmr::set_default_resource(previous);
     { ASSERT_TRUE(passed); return; }
 }
+
+namespace {
+class TlsReadShutdown : public testing::TestWithParam<std::string> {};
+
+TEST_P(TlsReadShutdown, PendingReadEndsWithoutClosingWriteDirection) {
+    TlsStream::InitializeIo();
+    Fixture fixture;
+    const bool multi_buffer = GetParam().starts_with("multi");
+    if (GetParam().ends_with("partial")) {
+        const auto record = fixture.peer->Encrypt("discarded-peer-payload");
+        net::write(fixture.peer->socket, net::buffer(record.data(), 3));
+    }
+    std::array<char, 64> target{};
+    auto read = net::co_spawn(fixture.io, [&]() -> net::awaitable<std::size_t> {
+        if (multi_buffer)
+            co_return (co_await fixture.stream->ReadMultiBuffer()).byte_size();
+        co_return co_await fixture.stream->AsyncRead(net::buffer(target));
+    }, net::use_future);
+    JoinPending join{fixture};
+    fixture.io.restart();
+    fixture.io.run_for(20ms);
+    ASSERT_NE(read.wait_for(0s), std::future_status::ready);
+
+    fixture.stream->ShutdownRead();
+    EXPECT_EQ(fixture.Wait(read), 0);
+    ASSERT_TRUE(fixture.stream->IsOpen());
+    auto eof = net::co_spawn(fixture.io,
+        fixture.stream->AsyncRead(net::buffer(target)), net::use_future);
+    EXPECT_EQ(fixture.Wait(eof), 0);
+
+    const std::string payload = "write-after-local-read-shutdown";
+    auto write = net::co_spawn(fixture.io,
+        fixture.stream->AsyncWrite(net::buffer(payload)), net::use_future);
+    auto received = net::co_spawn(fixture.io,
+        fixture.peer->Read(payload.size()), net::use_future);
+    EXPECT_EQ(fixture.Wait(write), payload.size());
+    EXPECT_EQ(fixture.Wait(received), payload);
+    auto shutdown = net::co_spawn(fixture.io,
+        fixture.stream->AsyncShutdownWrite(), net::use_future);
+    auto closed = net::co_spawn(fixture.io, fixture.peer->Read(1), net::use_future);
+    fixture.Wait(shutdown);
+    EXPECT_TRUE(fixture.Wait(closed).empty());
+    EXPECT_NE(SSL_get_shutdown(fixture.peer->ssl.get()) & SSL_RECEIVED_SHUTDOWN, 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(ReadModes, TlsReadShutdown,
+    testing::Values("multi-idle", "span-idle", "multi-partial", "span-partial"));
+} // namespace

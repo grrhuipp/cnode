@@ -7,7 +7,6 @@
 #include <dirent.h>
 #include <sys/resource.h>
 
-namespace acpp {
 
 struct ProcessDescriptors {
     std::optional<size_t> open;
@@ -39,4 +38,3 @@ struct ProcessDescriptors {
     return result;
 }
 
-} // namespace acpp

@@ -42,7 +42,7 @@ bool Require(bool condition, const char* message) {
 }  // namespace
 
 TEST(RealityKeyShare, Contract) {
-    using acpp::transport::internet::ParseRealityClientKeyShareExtension;
+    using ::transport::internet::ParseRealityClientKeyShareExtension;
     constexpr uint16_t kX25519 = 29;
     constexpr uint16_t kX25519MlKem768 = 0x11ec;
 

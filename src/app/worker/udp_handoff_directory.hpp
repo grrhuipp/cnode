@@ -1,12 +1,12 @@
 #pragma once
 
 #include "udp_ingress.hpp"
-#include "acppnode/common/container_util.hpp"
+#include "common/container_util.hpp"
 
 #include <atomic>
 #include <unordered_map>
 
-namespace acpp::worker_detail {
+namespace worker_detail {
 
 // Only authenticated identity and execution ownership metadata live here.
 // Protocol continuity state is owned, but never interpreted, by this directory.
@@ -92,4 +92,4 @@ private:
     std::unordered_map<UdpHandoffIdentity, std::shared_ptr<UdpHandoffRecord>,
                        UdpHandoffIdentityHash> records_;
 };
-} // namespace acpp::worker_detail
+} // namespace worker_detail

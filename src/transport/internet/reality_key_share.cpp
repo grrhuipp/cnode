@@ -1,10 +1,10 @@
 #include "reality_key_share.hpp"
-#include "acppnode/common/byte_reader.hpp"
+#include "common/byte_reader.hpp"
 
 #include <algorithm>
 #include <optional>
 
-namespace acpp::transport::internet {
+namespace transport::internet {
 namespace {
 
 constexpr uint16_t kTlsGroupX25519 = 29;
@@ -71,4 +71,4 @@ ParseRealityClientKeyShareExtension(
     return tl::unexpected(RealityKeyShareError::InvalidFormat);
 }
 
-}  // namespace acpp::transport::internet
+}  // namespace transport::internet

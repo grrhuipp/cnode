@@ -6,10 +6,10 @@
 #include "panel_schedule.hpp"
 #include "../../proxy/freedom/freedom_outbound.hpp"
 
-#include "acppnode/app/prepared_inbound.hpp"
-#include "acppnode/core/constants.hpp"
-#include "acppnode/core/naming.hpp"
-#include "acppnode/infra/log.hpp"
+#include "app/prepared_inbound.hpp"
+#include "core/constants.hpp"
+#include "core/naming.hpp"
+#include "infra/log.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -19,7 +19,6 @@
 #include <utility>
 #include <variant>
 
-namespace acpp {
 
 namespace {
 
@@ -510,4 +509,3 @@ void Controller::Impl::logPanelStatus(const PanelRuntime& panel) const {
         push_interval.count());
 }
 
-}  // namespace acpp

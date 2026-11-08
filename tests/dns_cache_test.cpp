@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "app/dns/cache_internal.hpp"
-#include "acppnode/common/allocator.hpp"
+#include "common/allocator.hpp"
 
 #include <array>
 #include <iostream>
@@ -41,12 +41,12 @@ void Require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
 
-using acpp::app::dns::DnsCache;
-using acpp::app::dns::DnsResult;
+using ::app::dns::DnsCache;
+using ::app::dns::DnsResult;
 
 DnsResult Answer(std::string_view address, size_t count = 1) {
     DnsResult result;
-    result.addresses.assign(count, acpp::net::ip::make_address(address));
+    result.addresses.assign(count, ::net::ip::make_address(address));
     result.ttl = 60;
     return result;
 }
@@ -58,7 +58,7 @@ void TestFailedInsertion(bool negative) {
     auto candidate = new_answer;
     if (negative) {
         candidate.addresses.clear();
-        candidate.error = acpp::ErrorCode::DNS_NO_RECORD;
+        candidate.error = ::ErrorCode::DNS_NO_RECORD;
     }
     int failures = 0;
     bool completed = false;
@@ -111,11 +111,11 @@ void TestCapacityAndResults() {
             "insertion must evict the oldest write only after reaching capacity");
 
     DnsResult negative;
-    negative.error = acpp::ErrorCode::DNS_NO_RECORD;
+    negative.error = ::ErrorCode::DNS_NO_RECORD;
     negative.ttl = 1;
     cache.Store("two.example", negative);
     const auto cached_negative = cache.GetResult("two.example");
-    Require(cached_negative && cached_negative->error == acpp::ErrorCode::DNS_NO_RECORD &&
+    Require(cached_negative && cached_negative->error == ::ErrorCode::DNS_NO_RECORD &&
                 cached_negative->addresses.empty() && cached_negative->ttl <= 10,
             "negative answers must replace positives and clamp the TTL");
     auto cached_answer = answer;
@@ -125,7 +125,7 @@ void TestCapacityAndResults() {
             "positive answers must replace negatives and clamp the TTL");
 
     DnsResult temporary_failure;
-    temporary_failure.error = acpp::ErrorCode::DNS_RESOLVE_FAILED;
+    temporary_failure.error = ::ErrorCode::DNS_RESOLVE_FAILED;
     cache.Store("two.example", temporary_failure);
     Require(cache.GetResult("two.example").has_value(),
             "temporary failures must not replace valid cached data");
@@ -173,7 +173,7 @@ void RecordNegativeEvent(std::string_view domain, std::string_view reason,
 void TestNegativeEventLifecycle() {
     negative_events.clear();
     DnsResult negative;
-    negative.error = acpp::ErrorCode::DNS_NO_RECORD;
+    negative.error = ::ErrorCode::DNS_NO_RECORD;
     negative.error_msg = "NXDOMAIN";
     negative.ttl = 60;
     {
@@ -220,7 +220,7 @@ void TestNegativeEventLifecycle() {
 }  // namespace
 
 TEST(DnsCache, Contract) {
-    acpp::memory::ConfigureProcessAllocator();
+    ::memory::ConfigureProcessAllocator();
     FailingResource resource(std::pmr::get_default_resource());
     auto* original = std::pmr::set_default_resource(&resource);
     bool passed = true;
@@ -236,4 +236,44 @@ TEST(DnsCache, Contract) {
     }
     std::pmr::set_default_resource(original);
     { ASSERT_TRUE(passed); return; }
+}
+
+TEST(DnsCache, ZeroTtlAddressesInvalidateOldAnswersAndReleaseTheirStorage) {
+    ::memory::ConfigureProcessAllocator();
+    ::memory::AllocationDomain domain;
+    ::memory::ScopedAllocationDomain lease(domain);
+    {
+        DnsCache cache(2, 60, 3600);
+        const auto empty_allocations = domain.OutstandingAllocations();
+        cache.Store("ttl.example", Answer("192.0.2.1", 400));
+        auto current = Answer("192.0.2.2");
+        current.ttl = 0;
+        cache.Store("ttl.example", current);
+        EXPECT_FALSE(cache.GetResult("ttl.example"));
+        EXPECT_EQ(cache.GetStats().entries, 0);
+        EXPECT_EQ(domain.OutstandingAllocations(), empty_allocations);
+
+        cache.Store("uncached.example", current);
+        EXPECT_FALSE(cache.GetResult("uncached.example"));
+        EXPECT_EQ(cache.GetStats().entries, 0);
+        EXPECT_EQ(domain.OutstandingAllocations(), empty_allocations);
+
+        DnsResult negative;
+        negative.error = ErrorCode::DNS_NO_RECORD;
+        negative.error_msg = "NODATA";
+        negative.ttl = 0;
+        cache.Store("ttl.example", negative);
+        EXPECT_FALSE(cache.GetResult("ttl.example"));
+        cache.Store("ttl.example", current);
+        EXPECT_FALSE(cache.GetResult("ttl.example"));
+        EXPECT_EQ(cache.GetStats().entries, 0);
+        EXPECT_EQ(domain.OutstandingAllocations(), empty_allocations);
+
+        const auto retained = Answer("192.0.2.3");
+        cache.Store("ttl.example", retained);
+        const auto cached = cache.GetResult("ttl.example");
+        ASSERT_TRUE(cached);
+        EXPECT_EQ(cached->addresses, retained.addresses);
+    }
+    EXPECT_EQ(domain.OutstandingAllocations(), 0);
 }

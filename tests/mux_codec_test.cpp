@@ -1,10 +1,10 @@
 #include <stdexcept>
 #include <gtest/gtest.h>
 
-#include "acppnode/common/mux/mux_codec.hpp"
-#include "acppnode/common/buf/multi_buffer.hpp"
-#include "acppnode/common/buffer_util.hpp"
-#include "acppnode/common/buf/length_prefixed_packet_buffer.hpp"
+#include "common/mux/mux_codec.hpp"
+#include "common/buf/multi_buffer.hpp"
+#include "common/buffer_util.hpp"
+#include "common/buf/length_prefixed_packet_buffer.hpp"
 
 #include <algorithm>
 #include <array>
@@ -30,54 +30,55 @@ void Check(bool condition, std::string_view message) {
     }
 }
 
-std::optional<acpp::mux::FrameHeader> DecodeSplit(
+std::optional<::mux::FrameHeader> DecodeSplit(
     std::span<const uint8_t> frame,
     size_t split) {
-    acpp::buf::MultiBuffer buffers;
-    acpp::buf::MultiBuffer suffix;
+    ::buf::MultiBuffer buffers;
+    ::buf::MultiBuffer suffix;
     split = std::min(split, frame.size());
-    Check(acpp::buf::AppendSpanToMultiBuffer(frame.first(split), buffers) &&
-              acpp::buf::AppendSpanToMultiBuffer(frame.subspan(split), suffix),
+    Check(::buf::AppendSpanToMultiBuffer(frame.first(split), buffers) &&
+              ::buf::AppendSpanToMultiBuffer(frame.subspan(split), suffix),
           "failed to allocate Mux test input");
     // A separate suffix keeps the split as a real Buffer boundary.
     suffix.MoveTo(buffers);
-    return acpp::mux::DecodeFrame(buffers);
+    return ::mux::DecodeFrame(buffers);
 }
 
-std::optional<acpp::mux::FrameHeader> Decode(std::span<const uint8_t> frame) {
+std::optional<::mux::FrameHeader> Decode(std::span<const uint8_t> frame) {
     return DecodeSplit(frame, frame.size());
 }
 
 bool EncodeKeepDataHeader(
-    acpp::memory::ByteVector& out,
+    ::memory::ByteVector& out,
     uint16_t session_id,
     size_t payload_len) {
-    std::array<uint8_t, acpp::mux::kMaxFrameHeaderBytes> header{};
-    const size_t n = acpp::mux::EncodeKeepDataHeaderTo(header, session_id, payload_len);
+    std::array<uint8_t, ::mux::kMaxFrameHeaderBytes> header{};
+    const size_t n = ::mux::EncodeKeepDataHeaderTo(header, session_id, payload_len);
     out.assign(header.data(), header.data() + n);
     return n != 0;
 }
 
 bool EncodeNewHeaderTo(
-    acpp::memory::ByteVector& out,
+    ::memory::ByteVector& out,
     uint16_t session_id,
-    acpp::mux::NetworkType network,
-    const acpp::TargetAddress& target,
-    size_t payload_len) {
-    std::array<uint8_t, acpp::mux::kMaxFrameHeaderBytes> header{};
-    const size_t n = acpp::mux::EncodeNewHeaderTo(
-        header, session_id, network, target, payload_len);
+    ::mux::NetworkType network,
+    const ::TargetAddress& target,
+    size_t payload_len,
+    bool has_data) {
+    std::array<uint8_t, ::mux::kMaxFrameHeaderBytes> header{};
+    const size_t n = ::mux::EncodeNewHeaderTo(
+        header, session_id, network, target, payload_len, has_data);
     out.assign(header.data(), header.data() + n);
     return n != 0;
 }
 
 bool EncodeKeepUDPHeaderTo(
-    acpp::memory::ByteVector& out,
+    ::memory::ByteVector& out,
     uint16_t session_id,
-    const acpp::TargetAddress& src,
+    const ::TargetAddress& src,
     size_t payload_len) {
-    std::array<uint8_t, acpp::mux::kMaxFrameHeaderBytes> header{};
-    const size_t n = acpp::mux::EncodeKeepUDPHeaderTo(
+    std::array<uint8_t, ::mux::kMaxFrameHeaderBytes> header{};
+    const size_t n = ::mux::EncodeKeepUDPHeaderTo(
         header, session_id, src, payload_len);
     out.assign(header.data(), header.data() + n);
     return n != 0;
@@ -97,7 +98,6 @@ void CheckInvalidAcrossLayouts(
 }  // namespace
 
 TEST(MuxCodec, Contract) {
-    using namespace acpp;
 
     constexpr size_t kMaxPayload = std::numeric_limits<uint16_t>::max();
     std::vector<uint8_t> maximum(kMaxPayload, 0x5a);
@@ -164,7 +164,7 @@ TEST(MuxCodec, Contract) {
               9,
               mux::NetworkType::UDP,
               TargetAddress("example.com", 53),
-              large_xudp_packet.size()),
+              large_xudp_packet.size(), true),
           "large Mux NEW header was rejected");
     encoded.insert(
         encoded.end(), large_xudp_packet.begin(), large_xudp_packet.end());
@@ -189,6 +189,26 @@ TEST(MuxCodec, Contract) {
               empty_decoded->frame_size == encoded.size() &&
               empty_decoded->has_data && empty_decoded->data_len == 0,
           "zero-length Mux DATA frame omitted its wire length");
+    Check(EncodeNewHeaderTo(encoded, 7, mux::NetworkType::UDP,
+                            TargetAddress("example.com", 53), 0, false),
+          "pure Mux UDP NEW control frame was rejected");
+    const auto control_new = Decode(encoded);
+    const size_t control_size = encoded.size();
+    Check(control_new && !control_new->has_data && control_new->data_len == 0 &&
+          control_new->frame_size == control_size,
+          "Mux UDP NEW control frame manufactured Data");
+    Check(EncodeNewHeaderTo(encoded, 7, mux::NetworkType::UDP,
+                            TargetAddress("example.com", 53), 0, true),
+          "Mux UDP NEW with empty Data was rejected");
+    for (size_t split = 0; split <= encoded.size(); ++split) {
+        const auto data_new = DecodeSplit(encoded, split);
+        Check(data_new && data_new->has_data && data_new->data_len == 0 &&
+              data_new->frame_size == encoded.size() && encoded.size() == control_size + 2,
+              "Mux UDP NEW lost empty Data or its length across Buffer layouts");
+    }
+    Check(!EncodeNewHeaderTo(encoded, 7, mux::NetworkType::UDP,
+                             TargetAddress("example.com", 53), 1, false),
+          "Mux NEW without Data silently encoded a nonzero payload length");
     Check(!EncodeKeepDataHeader(encoded, 7, oversized.size()) &&
               encoded.empty(),
           "oversized Mux TCP header was truncated instead of rejected");
@@ -204,7 +224,7 @@ TEST(MuxCodec, Contract) {
               7,
               mux::NetworkType::TCP,
               zero_port_target,
-              0) &&
+              0, false) &&
               encoded.empty(),
           "Mux NEW encoded a zero-port target");
     Check(!EncodeKeepUDPHeaderTo(
@@ -215,7 +235,7 @@ TEST(MuxCodec, Contract) {
               7,
               mux::NetworkType::TCP,
               oversized_domain_target,
-              0) &&
+              0, false) &&
               encoded.empty(),
           "Mux NEW truncated an oversized domain target");
     Check(!EncodeNewHeaderTo(
@@ -223,7 +243,7 @@ TEST(MuxCodec, Contract) {
               7,
               static_cast<mux::NetworkType>(0xff),
               target,
-              0) &&
+              0, false) &&
               encoded.empty(),
           "Mux NEW encoded an unknown network type");
 
@@ -232,7 +252,7 @@ TEST(MuxCodec, Contract) {
               7,
               mux::NetworkType::UDP,
               target,
-              oversized.size()) &&
+              oversized.size(), true) &&
               encoded.empty(),
           "oversized Mux NEW payload was truncated instead of rejected");
     Check(!EncodeKeepUDPHeaderTo(
@@ -286,7 +306,7 @@ TEST(MuxCodec, Contract) {
               7,
               mux::NetworkType::UDP,
               target,
-              0),
+              0, false),
           "failed to encode GlobalID fixture");
     const uint16_t base_meta_len = static_cast<uint16_t>(
         (static_cast<uint16_t>(encoded[0]) << 8) | encoded[1]);

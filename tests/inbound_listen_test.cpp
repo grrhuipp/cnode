@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "acppnode/transport/internet/inbound_listen.hpp"
+#include "transport/internet/inbound_listen.hpp"
 #include "worker/tcp_listener.hpp"
 
 #include <array>
@@ -9,29 +9,29 @@
 
 TEST(InboundListen, Contract) {
     for (const auto value : std::array<std::string_view, 2>{"", "auto"}) {
-        auto listen = acpp::InboundListen::Parse(value);
+        auto listen = ::InboundListen::Parse(value);
         ASSERT_FALSE((!listen || !listen->IsAuto() || listen->Candidates().size() != 2 ||
             !listen->Candidates()[0].is_v4() || !listen->Candidates()[0].is_unspecified() ||
             !listen->Candidates()[1].is_v6() || !listen->Candidates()[1].is_unspecified()));
     }
 
-    auto ipv4 = acpp::InboundListen::Parse("127.0.0.1");
+    auto ipv4 = ::InboundListen::Parse("127.0.0.1");
     ASSERT_FALSE((!ipv4 || ipv4->IsAuto() || ipv4->Candidates().size() != 1 ||
         !ipv4->Candidates()[0].is_v4() || !ipv4->Candidates()[0].is_loopback()));
 
-    auto ipv6 = acpp::InboundListen::Parse("::1");
+    auto ipv6 = ::InboundListen::Parse("::1");
     ASSERT_FALSE((!ipv6 || ipv6->IsAuto() || ipv6->Candidates().size() != 1 ||
         !ipv6->Candidates()[0].is_v6() || !ipv6->Candidates()[0].is_loopback()));
 
-    auto mapped = acpp::InboundListen::Parse("::ffff:127.0.0.1");
+    auto mapped = ::InboundListen::Parse("::ffff:127.0.0.1");
     ASSERT_FALSE((!mapped || mapped->Candidates().size() != 1 ||
         !mapped->Candidates()[0].is_v4() || !mapped->Candidates()[0].is_loopback()));
 
     for (const auto value :
          std::array<std::string_view, 3>{"not-an-ip", "127.0.0.1junk", " auto"}) {
-        ASSERT_FALSE((acpp::InboundListen::Parse(value)));
+        ASSERT_FALSE((::InboundListen::Parse(value)));
     }
-    auto upper = acpp::InboundListen::Parse("AUTO");
+    auto upper = ::InboundListen::Parse("AUTO");
     ASSERT_FALSE((!upper || !upper->IsAuto()));
 
     struct OverlapCase { std::string_view left, right; bool overlaps; };
@@ -47,8 +47,8 @@ TEST(InboundListen, Contract) {
              OverlapCase{"auto", "auto", true},
              OverlapCase{"::ffff:127.0.0.1", "127.0.0.1", true},
              OverlapCase{"fe80::1%1", "fe80::1%2", false}}) {
-        const auto left = acpp::InboundListen::Parse(item.left);
-        const auto right = acpp::InboundListen::Parse(item.right);
+        const auto left = ::InboundListen::Parse(item.left);
+        const auto right = ::InboundListen::Parse(item.right);
         ASSERT_FALSE((!left || !right || left->Overlaps(*right) != item.overlaps ||
             right->Overlaps(*left) != item.overlaps));
     }
@@ -56,21 +56,21 @@ TEST(InboundListen, Contract) {
     for (const auto value : std::array<std::string_view, 7>{"127.0.0.1:9", "[127.0.0.1]", "[::1]", "127.0.0.1 ",
              "fe80::1%invalid", std::string_view("127.0.0.1\0ignored", 17),
              std::string_view("::1\0ignored", 11)}) {
-        ASSERT_FALSE((acpp::InboundListen::Parse(value)));
+        ASSERT_FALSE((::InboundListen::Parse(value)));
     }
 
-    acpp::net::io_context io_context;
-    acpp::worker_detail::TcpListenerOwner worker;
+    ::net::io_context io_context;
+    ::worker_detail::TcpListenerOwner worker;
     auto acceptor = worker.CreateAcceptor("stable-listener", io_context);
     ASSERT_FALSE((!acceptor || !worker.OwnsAcceptor("stable-listener", acceptor.get())));
 
-    acpp::IoErrorCode ec;
-    acceptor->open(acpp::tcp::v4(), ec);
+    ::IoErrorCode ec;
+    acceptor->open(::tcp::v4(), ec);
     ASSERT_FALSE((ec || !acceptor->is_open()));
     acceptor->bind(
-        acpp::tcp::endpoint(acpp::net::ip::address_v4::loopback(), 0), ec);
+        ::tcp::endpoint(::net::ip::address_v4::loopback(), 0), ec);
     ASSERT_FALSE((ec));
-    acceptor->listen(acpp::net::socket_base::max_listen_connections, ec);
+    acceptor->listen(::net::socket_base::max_listen_connections, ec);
     ASSERT_FALSE((ec));
 
     ASSERT_FALSE((worker.CreateAcceptor("stable-listener", io_context) != nullptr));
@@ -79,9 +79,9 @@ TEST(InboundListen, Contract) {
 
     bool accept_cancelled = false;
     acceptor->async_accept(
-        [&](acpp::IoErrorCode accept_ec, acpp::tcp::socket) {
+        [&](::IoErrorCode accept_ec, ::tcp::socket) {
             accept_cancelled =
-                accept_ec == acpp::io_error::operation_aborted;
+                accept_ec == ::io_error::operation_aborted;
         });
 
     worker.CloseAcceptor("stable-listener");
@@ -89,21 +89,21 @@ TEST(InboundListen, Contract) {
         worker.OwnsAcceptor("stable-listener", acceptor.get())));
     io_context.run();
     ASSERT_FALSE((!accept_cancelled));
-    acpp::worker_detail::TcpListenerOwner::AcceptorPtr retained;
+    ::worker_detail::TcpListenerOwner::AcceptorPtr retained;
     bool retired_accept_cancelled = false;
     {
-        acpp::worker_detail::TcpListenerOwner retiring;
+        ::worker_detail::TcpListenerOwner retiring;
         retained = retiring.CreateAcceptor("retained-until-completion", io_context);
-        retained->open(acpp::tcp::v4(), ec);
+        retained->open(::tcp::v4(), ec);
         ASSERT_FALSE((ec));
         retained->bind(
-            acpp::tcp::endpoint(acpp::net::ip::address_v4::loopback(), 0), ec);
+            ::tcp::endpoint(::net::ip::address_v4::loopback(), 0), ec);
         ASSERT_FALSE((ec));
-        retained->listen(acpp::net::socket_base::max_listen_connections, ec);
+        retained->listen(::net::socket_base::max_listen_connections, ec);
         ASSERT_FALSE((ec));
         retained->async_accept(
-            [&](acpp::IoErrorCode error, acpp::tcp::socket) {
-                retired_accept_cancelled = error == acpp::io_error::operation_aborted;
+            [&](::IoErrorCode error, ::tcp::socket) {
+                retired_accept_cancelled = error == ::io_error::operation_aborted;
             });
     }
     io_context.restart();

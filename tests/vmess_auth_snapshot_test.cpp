@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 
-#include "acppnode/app/proxyman/inbound/user_store.hpp"
-#include "acppnode/app/proxyman/inbound/prepared_config.hpp"
+#include "app/proxyman/inbound/user_store.hpp"
+#include "app/proxyman/inbound/prepared_config.hpp"
 #include "validator.hpp"
 #include "vmess_crypto.hpp"
 #include <chrono>
@@ -9,7 +9,7 @@
 #include <stdexcept>
 
 namespace {
-using namespace acpp::proxyman::inbound;
+using namespace ::proxyman::inbound;
 void Commit(UserStore::PublishedSnapshot snapshot) {
     auto view = UserStore::PrepareWorkerView(snapshot);
     UserStore::CommitSnapshot(std::move(snapshot));
@@ -21,7 +21,7 @@ void Check(bool condition, const char* message) {
 }
 
 TEST(VmessAuthSnapshot, Contract) {
-    using namespace acpp::proxyman::inbound;
+    using namespace ::proxyman::inbound;
     try {
         PreparedVmessUser user;
         user.uuid = "11111111-1111-1111-1111-111111111111";
@@ -30,12 +30,12 @@ TEST(VmessAuthSnapshot, Contract) {
         constexpr auto tag = "snapshot-lifetime";
         const UserSet users = PreparedVmessUsers{user};
         Commit(UserStore::PrepareUsers(tag, users));
-        acpp::vmess::TimedUserValidator validator;
+        ::vmess::TimedUserValidator validator;
         const auto now = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
         std::array<uint8_t, 16> auth;
-        acpp::vmess::GenerateAuthID(
-            acpp::vmess::ExpandAuthIDEncryptKey(user.auth_key), now, auth.data());
+        ::vmess::GenerateAuthID(
+            ::vmess::ExpandAuthIDEncryptKey(user.auth_key), now, auth.data());
         int64_t timestamp = 0;
         auto authenticated = validator.FindByAuthIDForTag(tag, auth.data(), timestamp);
         Check(authenticated && timestamp == now, "authentication failed");
@@ -64,8 +64,8 @@ TEST(VmessAuthSnapshot, Contract) {
               "preparation changed an installed Worker view");
         Commit(std::move(prepared));
         std::array<uint8_t, 16> other_auth;
-        acpp::vmess::GenerateAuthID(
-            acpp::vmess::ExpandAuthIDEncryptKey(other.auth_key), now, other_auth.data());
+        ::vmess::GenerateAuthID(
+            ::vmess::ExpandAuthIDEncryptKey(other.auth_key), now, other_auth.data());
         for (int round = 0; round < 64; ++round) {
             auto first = validator.FindByAuthIDForTag(tag, auth.data(), timestamp);
             auto second = validator.FindByAuthIDForTag("other-tag", other_auth.data(), timestamp);

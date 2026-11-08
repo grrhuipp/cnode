@@ -5,7 +5,7 @@
 #include <iterator>
 #include <memory>
 
-namespace acpp::app::dns {
+namespace app::dns {
 
 DnsCache::DnsCache(size_t max_size, uint32_t min_ttl, uint32_t max_ttl,
                    NegativeEvent negative_event)
@@ -82,6 +82,18 @@ void DnsCache::Store(std::string_view domain, const DnsResult& result) {
     if (capacity_ == 0 || (!result.Ok() && result.error != ErrorCode::DNS_NO_RECORD)) {
         return;
     }
+    const auto existing = entries_.find(domain);
+    // 零 TTL 地址只供本次查询使用，不受本地 TTL 下限延长，也不保留载荷。
+    if (result.Ok() && result.ttl == 0) {
+        if (existing != entries_.end()) {
+            const auto node = existing->second;
+            Report(*node, "recovered");
+            if (node->entry.expired_negative) --expired_negatives_;
+            entries_.erase(existing);
+            order_.erase(node);
+        }
+        return;
+    }
 
     DnsCacheEntry prepared;
     if (result.Ok()) {
@@ -91,10 +103,9 @@ void DnsCache::Store(std::string_view domain, const DnsResult& result) {
         prepared.answer.emplace<memory::ThreadLocalString>(
             result.error_msg.data(), result.error_msg.size());
     }
-    const uint32_t ttl = std::clamp(result.ttl, min_ttl_, max_ttl_);
+    const uint32_t ttl = result.ttl == 0 ? 0 : std::clamp(result.ttl, min_ttl_, max_ttl_);
     prepared.expire_time = steady_clock::now() + std::chrono::seconds(ttl);
 
-    const auto existing = entries_.find(domain);
     if (existing != entries_.end()) {
         const auto node = existing->second;
         if (result.Ok() || !node->entry.expired_negative) {
@@ -139,4 +150,4 @@ DnsCacheStats DnsCache::GetStats() const {
     };
 }
 
-}  // namespace acpp::app::dns
+}  // namespace app::dns

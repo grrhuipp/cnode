@@ -4,10 +4,10 @@
 #include <set>
 #include <string>
 
-namespace acpp::api::v2board {
+namespace api::v2board {
 
 OnlineReportPayload BuildOnlineReportPayload(
-    std::span<const ::acpp::api::OnlineUser> online_devices,
+    std::span<const ::api::OnlineUser> online_devices,
     int node_id) {
     const std::string suffix = "_" + std::to_string(node_id);
     std::map<int64_t, std::set<std::string>> grouped;
@@ -32,4 +32,4 @@ OnlineReportPayload BuildOnlineReportPayload(
     return result;
 }
 
-}  // namespace acpp::api::v2board
+}  // namespace api::v2board

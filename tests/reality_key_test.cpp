@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "acppnode/transport/internet/reality_key.hpp"
+#include "transport/internet/reality_key.hpp"
 
 #include <openssl/bytestring.h>
 #include <openssl/mem.h>
@@ -13,8 +13,8 @@
 
 namespace {
 
-using acpp::transport::internet::RealityKey;
-using acpp::transport::internet::RealityMldsa65PublicKey;
+using ::transport::internet::RealityKey;
+using ::transport::internet::RealityMldsa65PublicKey;
 
 bool Require(bool condition, const char* message) {
     if (!condition) std::fprintf(stderr, "%s\n", message);
@@ -66,10 +66,10 @@ std::string EncodeRealityBase64Url(std::span<const uint8_t> bytes) {
 }  // namespace
 
 TEST(RealityKey, Contract) {
-    using acpp::transport::internet::NormalizeRealityFingerprint;
-    using acpp::transport::internet::ParseRealityKey;
-    using acpp::transport::internet::ParseRealityMldsa65PublicKey;
-    using acpp::transport::internet::ParseRealityMldsa65Seed;
+    using ::transport::internet::NormalizeRealityFingerprint;
+    using ::transport::internet::ParseRealityKey;
+    using ::transport::internet::ParseRealityMldsa65PublicKey;
+    using ::transport::internet::ParseRealityMldsa65Seed;
 
     const std::string zero_key(43, 'A');
     const auto parsed = ParseRealityKey(zero_key);

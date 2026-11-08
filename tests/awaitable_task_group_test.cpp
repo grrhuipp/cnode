@@ -24,7 +24,7 @@
 #include <vector>
 
 namespace {
-namespace net = acpp::net;
+namespace net = ::net;
 using async_allocation_test::fail_after;
 using async_allocation_test::injected;
 
@@ -45,7 +45,7 @@ private:
     bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
         return this == &other;
     }
-    acpp::memory::ThreadMemoryResource upstream_;
+    ::memory::ThreadMemoryResource upstream_;
 };
 
 void Check(bool condition, const char* message) {
@@ -71,7 +71,7 @@ net::awaitable<void> Wait(net::steady_timer& timer, Counts& counts,
                           bool delay_cleanup = false) {
     Lifetime lifetime(counts);
     auto token = net::as_tuple(net::use_awaitable);
-    (void)co_await net::async_initiate<decltype(token), void(acpp::IoErrorCode)>(
+    (void)co_await net::async_initiate<decltype(token), void(::IoErrorCode)>(
         [&timer](auto handler) {
             const int saved = std::exchange(fail_after, -1);
             timer.async_wait(std::move(handler));
@@ -85,7 +85,7 @@ net::awaitable<void> Wait(net::steady_timer& timer, Counts& counts,
     }
 }
 
-net::awaitable<void> AddChild(acpp::AwaitableTaskGroup& group,
+net::awaitable<void> AddChild(::AwaitableTaskGroup& group,
                               net::steady_timer& timer, Counts& counts) {
     Lifetime lifetime(counts);
     co_await net::post(net::use_awaitable);
@@ -100,8 +100,8 @@ void TestDynamicCancellation() {
     Counts counts;
     int returned = -1;
     std::exception_ptr failure;
-    net::co_spawn(io, acpp::RunAwaitableTaskGroup(io.get_executor(),
-        [&](acpp::AwaitableTaskGroup& group) {
+    net::co_spawn(io, ::RunAwaitableTaskGroup(io.get_executor(),
+        [&](::AwaitableTaskGroup& group) {
             group.Spawn(Wait(gate, counts, true));
             group.Spawn(AddChild(group, gate, counts));
         }), net::bind_cancellation_slot(cancellation.slot(),
@@ -117,7 +117,7 @@ void TestDynamicCancellation() {
     io.run_for(std::chrono::seconds(1));
     Check(counts.active == 0 && returned == 3 && failure, "cancel must finish every child");
     try { std::rethrow_exception(failure); }
-    catch (const acpp::IoSystemError& error) {
+    catch (const ::IoSystemError& error) {
         Check(error.code() == net::error::operation_aborted, "wrong cancellation error");
     }
 }
@@ -127,13 +127,13 @@ net::awaitable<void> Fail() {
     throw OwnerFailure{};
 }
 
-net::awaitable<void> Stop(acpp::AwaitableTaskGroup& group,
+net::awaitable<void> Stop(::AwaitableTaskGroup& group,
                          net::steady_timer& gate, Counts& counts, bool& rejected) {
     co_await net::post(net::use_awaitable);
     group.Cancel();
     group.Cancel();
     try { group.Spawn(Wait(gate, counts)); }
-    catch (const acpp::IoSystemError& error) {
+    catch (const ::IoSystemError& error) {
         rejected = error.code() == net::error::operation_aborted;
     }
 }
@@ -144,8 +144,8 @@ void TestExplicitCancel() {
     gate.expires_at(net::steady_timer::time_point::max());
     Counts counts;
     bool rejected = false;
-    auto result = net::co_spawn(io, acpp::RunAwaitableTaskGroup(io.get_executor(),
-        [&](acpp::AwaitableTaskGroup& group) {
+    auto result = net::co_spawn(io, ::RunAwaitableTaskGroup(io.get_executor(),
+        [&](::AwaitableTaskGroup& group) {
             group.Spawn(Wait(gate, counts, true));
             group.Spawn(Stop(group, gate, counts, rejected));
         }), net::use_future);
@@ -162,8 +162,8 @@ void TestFailure(bool start_failure) {
     net::steady_timer gate(io);
     gate.expires_at(net::steady_timer::time_point::max());
     Counts counts;
-    auto result = net::co_spawn(io, acpp::RunAwaitableTaskGroup(io.get_executor(),
-        [&](acpp::AwaitableTaskGroup& group) {
+    auto result = net::co_spawn(io, ::RunAwaitableTaskGroup(io.get_executor(),
+        [&](::AwaitableTaskGroup& group) {
             group.Spawn(Wait(gate, counts, true));
             if (start_failure) throw OwnerFailure{};
             group.Spawn(Fail());
@@ -179,7 +179,7 @@ void TestFailure(bool start_failure) {
 
 net::awaitable<void> AbortedChild() {
     co_await net::post(net::use_awaitable);
-    throw acpp::IoSystemError(net::error::operation_aborted);
+    throw ::IoSystemError(net::error::operation_aborted);
 }
 
 net::awaitable<void> FailingCleanup(bool& finished) {
@@ -187,21 +187,21 @@ net::awaitable<void> FailingCleanup(bool& finished) {
     co_await net::post(net::use_awaitable);
     co_await net::post(net::use_awaitable);
     finished = true;
-    throw acpp::IoSystemError(net::error::address_in_use);
+    throw ::IoSystemError(net::error::address_in_use);
 }
 
 void TestFailureOutranksCancellation() {
     net::io_context io;
     bool cleanup_finished = false;
-    auto result = net::co_spawn(io, acpp::RunAwaitableTaskGroup(io.get_executor(),
-        [&](acpp::AwaitableTaskGroup& group) {
+    auto result = net::co_spawn(io, ::RunAwaitableTaskGroup(io.get_executor(),
+        [&](::AwaitableTaskGroup& group) {
             group.Spawn(AbortedChild());
             group.Spawn(FailingCleanup(cleanup_finished));
         }), net::use_future);
     io.run();
     bool preserved = false;
     try { result.get(); }
-    catch (const acpp::IoSystemError& error) {
+    catch (const ::IoSystemError& error) {
         preserved = error.code() == net::error::address_in_use;
     }
     Check(cleanup_finished && preserved, "cancellation masked a joined child's real failure");
@@ -209,7 +209,7 @@ void TestFailureOutranksCancellation() {
 
 net::awaitable<void> CancelledRequest(
     net::steady_timer& operation, net::steady_timer& cleanup, Counts& counts,
-    std::unique_ptr<acpp::transport::CancellationSource> source, bool fail_cleanup) {
+    std::unique_ptr<::transport::CancellationSource> source, bool fail_cleanup) {
     Lifetime lifetime(counts);
     auto [error] = co_await operation.async_wait(net::as_tuple(net::use_awaitable));
     Check(error == net::error::operation_aborted, "request operation was not cancelled");
@@ -219,7 +219,7 @@ net::awaitable<void> CancelledRequest(
     // subscription must detach even though the group still owns the child.
     source.reset();
     if (fail_cleanup) throw OwnerFailure{};
-    throw acpp::IoSystemError(net::error::operation_aborted);
+    throw ::IoSystemError(net::error::operation_aborted);
 }
 
 void TestRequestCancellation(bool fail_cleanup) {
@@ -229,12 +229,12 @@ void TestRequestCancellation(bool fail_cleanup) {
     cleanup.expires_at(net::steady_timer::time_point::max());
     sibling.expires_at(net::steady_timer::time_point::max());
     Counts request_counts, sibling_counts;
-    auto source = std::make_unique<acpp::transport::CancellationSource>();
+    auto source = std::make_unique<::transport::CancellationSource>();
     auto* request_source = source.get();
     auto request = CancelledRequest(operation, cleanup, request_counts,
                                     std::move(source), fail_cleanup);
-    auto result = net::co_spawn(io, acpp::RunAwaitableTaskGroup(io.get_executor(),
-        [&](acpp::AwaitableTaskGroup& group) {
+    auto result = net::co_spawn(io, ::RunAwaitableTaskGroup(io.get_executor(),
+        [&](::AwaitableTaskGroup& group) {
             group.Spawn(std::move(request), request_source);
             group.Spawn(Wait(sibling, sibling_counts));
         }), net::use_future);
@@ -268,11 +268,11 @@ void TestStoppedRequest() {
     net::io_context io;
     net::steady_timer gate(io);
     gate.expires_at(net::steady_timer::time_point::max());
-    acpp::transport::CancellationSource source;
+    ::transport::CancellationSource source;
     source.Stop();
     Counts counts;
-    auto result = net::co_spawn(io, acpp::RunAwaitableTaskGroup(io.get_executor(),
-        [&](acpp::AwaitableTaskGroup& group) {
+    auto result = net::co_spawn(io, ::RunAwaitableTaskGroup(io.get_executor(),
+        [&](::AwaitableTaskGroup& group) {
             group.Spawn(Wait(gate, counts), &source);
         }), net::use_future);
     io.run();
@@ -285,12 +285,12 @@ net::awaitable<void> WithFailure(net::io_context& io, net::steady_timer& timer,
                                 Counts& counts, int allocation) {
     std::vector<net::awaitable<void>> tasks;
     for (int i = 0; i < 3; ++i) tasks.push_back(Wait(timer, counts));
-    auto start = [&](acpp::AwaitableTaskGroup& group) {
+    auto start = [&](::AwaitableTaskGroup& group) {
         for (auto& task : tasks) group.Spawn(std::move(task));
     };
     fail_after = allocation;
     try {
-        co_await acpp::RunAwaitableTaskGroup(io.get_executor(), start);
+        co_await ::RunAwaitableTaskGroup(io.get_executor(), start);
     } catch (...) {
         fail_after = -1;
         throw;
@@ -349,7 +349,7 @@ net::awaitable<void> Observe(net::any_io_executor expected, bool& matched) {
 
 net::awaitable<void> CrossExecutor(net::any_io_executor caller,
                                   net::any_io_executor worker, bool& child, bool& parent) {
-    co_await acpp::RunAwaitableTaskGroup(worker, [&](acpp::AwaitableTaskGroup& group) {
+    co_await ::RunAwaitableTaskGroup(worker, [&](::AwaitableTaskGroup& group) {
         group.Spawn(Observe(worker, child));
     });
     parent = (co_await net::this_coro::executor) == caller;
@@ -358,8 +358,8 @@ net::awaitable<void> CrossExecutor(net::any_io_executor caller,
 void TestMoveOnlyStart() {
     net::io_context io;
     bool started = false;
-    auto result = net::co_spawn(io, acpp::RunAwaitableTaskGroup(io.get_executor(),
-        [value = std::make_unique<int>(42), &started](acpp::AwaitableTaskGroup&) {
+    auto result = net::co_spawn(io, ::RunAwaitableTaskGroup(io.get_executor(),
+        [value = std::make_unique<int>(42), &started](::AwaitableTaskGroup&) {
             started = *value == 42;
         }), net::use_future);
     io.run();
@@ -386,7 +386,7 @@ void TestIdleResidentGroup(GroupResource& resource) {
     net::io_context io;
     const auto before = resource.live.load(std::memory_order_relaxed);
     for (int i = 0; i != 1000; ++i) {
-        acpp::ResidentTaskGroup resident(io.get_executor());
+        ::ResidentTaskGroup resident(io.get_executor());
         resident.Tasks().Cancel();
     }
     Check(resource.live.load(std::memory_order_relaxed) == before,
@@ -404,8 +404,8 @@ void TestResidentGroup() {
     bool joined = false;
     bool rejected = false;
     {
-        acpp::ResidentTaskGroup resident(io.get_executor());
-        acpp::transport::CancellationSource own;
+        ::ResidentTaskGroup resident(io.get_executor());
+        ::transport::CancellationSource own;
         net::co_spawn(io, [&]() -> net::awaitable<void> {
             resident.Tasks().Spawn(Wait(gate, counts, true));
             resident.Tasks().Spawn(Wait(gate, counts, true), &own);
@@ -424,7 +424,7 @@ void TestResidentGroup() {
         Check(!joined, "resident join must wait for asynchronous child cleanup");
         io.run_for(std::chrono::milliseconds(200));
         try { resident.Tasks().Spawn(Wait(gate, counts)); }
-        catch (const acpp::IoSystemError& error) {
+        catch (const ::IoSystemError& error) {
             rejected = error.code() == net::error::operation_aborted;
         }
     }
@@ -460,7 +460,7 @@ TEST(AwaitableTaskGroup, Contract) {
         TestIdleResidentGroup(resource);
         TestResidentGroup();
         Check(resource.live.load() == 0, "all PMR task bookkeeping must be released");
-        Check(acpp::memory::RemoteFreeCount() == 0,
+        Check(::memory::RemoteFreeCount() == 0,
               "group and child PMR objects must be freed on the target executor");
     } catch (const std::exception& error) {
         fail_after = -1;

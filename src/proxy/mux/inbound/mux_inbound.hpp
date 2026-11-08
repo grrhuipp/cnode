@@ -1,28 +1,26 @@
 #pragma once
 
-#include "acppnode/common/asio_types.hpp"
-#include "acppnode/app/relay_types.hpp"
-#include "acppnode/transport/link.hpp"
+#include "common/asio_types.hpp"
+#include "app/relay_types.hpp"
+#include "transport/link.hpp"
 
 #include <cstdint>
 
-namespace acpp {
 class AsyncStream;
 class ConnectionLimiter;
 struct StatsShard;
 struct TimeoutsConfig;
-}  // namespace acpp
 
-namespace acpp::routing {
+namespace routing {
 class Dispatcher;
 struct DispatchPolicy;
-}  // namespace acpp::routing
+}  // namespace routing
 
-namespace acpp::session {
+namespace session {
 struct Context;
-}  // namespace acpp::session
+}  // namespace session
 
-namespace acpp::mux {
+namespace mux {
 
 // ============================================================================
 // ProcessInbound - Mux.Cool 多路复用入站容器（VMess/VLESS Command=Mux）
@@ -46,4 +44,4 @@ net::awaitable<RelayResult> ProcessInbound(
     const TimeoutsConfig& timeouts,
     uint32_t pressure_idle_timeout);
 
-}  // namespace acpp::mux
+}  // namespace mux

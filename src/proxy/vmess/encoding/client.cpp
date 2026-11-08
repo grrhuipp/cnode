@@ -1,13 +1,13 @@
 #include "client.hpp"
-#include "acppnode/common/error.hpp"
-#include "acppnode/common/address_codec.hpp"
-#include "acppnode/common/byte_reader.hpp"
+#include "common/error.hpp"
+#include "common/address_codec.hpp"
+#include "common/byte_reader.hpp"
 #include <openssl/mem.h>
 #include <openssl/rand.h>
 #include <chrono>
 #include <cstring>
 
-namespace acpp::vmess::encoding {
+namespace vmess::encoding {
 
 namespace {
 
@@ -291,4 +291,4 @@ net::awaitable<buf::MultiBuffer> ClientSession::DecodeResponse(AsyncStream& stre
     co_return co_await response_decoder_.Read(stream);
 }
 
-}  // namespace acpp::vmess::encoding
+}  // namespace vmess::encoding

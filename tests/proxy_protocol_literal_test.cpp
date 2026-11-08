@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "acppnode/transport/internet/proxy_protocol.hpp"
+#include "transport/internet/proxy_protocol.hpp"
 
 #include <algorithm>
 #include <array>
@@ -11,11 +11,11 @@
 
 namespace {
 
-acpp::ProxyProtocolResult Parse(std::span<const uint8_t> bytes) {
-    return acpp::ParseProxyProtocolHeader(bytes);
+::ProxyProtocolResult Parse(std::span<const uint8_t> bytes) {
+    return ::ParseProxyProtocolHeader(bytes);
 }
 
-acpp::ProxyProtocolResult Parse(std::string_view text) {
+::ProxyProtocolResult Parse(std::string_view text) {
     return Parse(std::span<const uint8_t>(
         reinterpret_cast<const uint8_t*>(text.data()), text.size()));
 }
@@ -30,16 +30,16 @@ bool V1BoundaryCasesPass() {
         return false;
     }
     const std::string no_crlf = "PROXY " + std::string(101, 'x');
-    if (Parse(no_crlf).status != acpp::ProxyProtocolParseStatus::Invalid) return false;
+    if (Parse(no_crlf).status != ::ProxyProtocolParseStatus::Invalid) return false;
     if (!Parse(std::string_view(no_crlf).substr(0, 106)).incomplete()) return false;
     // A CRLF that only ends past byte 107 is still too late.
-    if (Parse(no_crlf + "\r\n").status != acpp::ProxyProtocolParseStatus::Invalid) return false;
+    if (Parse(no_crlf + "\r\n").status != ::ProxyProtocolParseStatus::Invalid) return false;
     if (Parse("PROXY TCP4 192.0.2.1 GARBAGE 32100 443\r\n").status !=
-        acpp::ProxyProtocolParseStatus::Invalid) return false;
+        ::ProxyProtocolParseStatus::Invalid) return false;
     if (Parse("PROXY TCP4 192.0.2.1 198.51.100.1 32100 70000\r\n").status !=
-        acpp::ProxyProtocolParseStatus::Invalid) return false;
+        ::ProxyProtocolParseStatus::Invalid) return false;
     if (Parse("PROXY TCP4 192.0.2.1 198.51.100.1 32100 443 EXTRA\r\n").status !=
-        acpp::ProxyProtocolParseStatus::Invalid) return false;
+        ::ProxyProtocolParseStatus::Invalid) return false;
     return true;
 }
 
@@ -58,7 +58,7 @@ std::array<uint8_t, 28> V2Header(uint8_t version_command, uint8_t family_transpo
 // families above UNIX and transports above DGRAM, while LOCAL ignores the
 // protocol block. Rejection does not wait for the declared address block.
 bool V2BoundaryCasesPass() {
-    using Status = acpp::ProxyProtocolParseStatus;
+    using Status = ::ProxyProtocolParseStatus;
     for (const auto& [version_command, family_transport] : {
              std::pair<uint8_t, uint8_t>{0x11, 0x11}, {0x31, 0x11}, {0x22, 0x11},
              {0x2F, 0x11}, {0x21, 0x41}, {0x21, 0xF1}, {0x21, 0x13}, {0x21, 0x1F}}) {
@@ -83,7 +83,7 @@ bool V2BoundaryCasesPass() {
     }
     const auto proxied = Parse(V2Header(0x21, 0x11));
     return proxied.success() && proxied.src_addr &&
-        *proxied.src_addr == acpp::net::ip::make_address("192.0.2.1") &&
+        *proxied.src_addr == ::net::ip::make_address("192.0.2.1") &&
         proxied.src_port == 32100 && proxied.consumed == 28;
 }
 
@@ -101,7 +101,7 @@ TEST(ProxyProtocolLiteral, Contract) {
              Case{"TCP6", "192.0.2.1", false}}) {
         const std::string packet = std::string("PROXY ") + std::string(item.family) + " " +
             std::string(item.host) + (item.family == "TCP4" ? " 198.51.100.1" : " 2001:db8::2") + " 32100 443\r\n";
-        const auto result = acpp::ParseProxyProtocolHeader(std::span<const uint8_t>(
+        const auto result = ::ParseProxyProtocolHeader(std::span<const uint8_t>(
             reinterpret_cast<const uint8_t*>(packet.data()), packet.size()));
         if (result.success() != item.accepted || (item.accepted &&
                 (!result.src_addr || result.src_port != 32100 || result.consumed != packet.size()))) {
@@ -111,13 +111,13 @@ TEST(ProxyProtocolLiteral, Contract) {
     }
     for (const uint8_t version : {uint8_t{1}, uint8_t{2}}) {
         for (const char* ip_text : {"192.0.2.10", "2001:db8::10"}) {
-            const auto addr = acpp::net::ip::make_address(ip_text);
-            const acpp::tcp::endpoint src(addr, 45678);
-            const acpp::tcp::endpoint dst(addr, 443);
+            const auto addr = ::net::ip::make_address(ip_text);
+            const ::tcp::endpoint src(addr, 45678);
+            const ::tcp::endpoint dst(addr, 443);
             std::array<uint8_t, 108> encoded{};
-            const size_t n = acpp::EncodeProxyProtocolHeader(
+            const size_t n = ::EncodeProxyProtocolHeader(
                 version, src, dst, encoded);
-            const auto parsed = acpp::ParseProxyProtocolHeader(
+            const auto parsed = ::ParseProxyProtocolHeader(
                 std::span<const uint8_t>(encoded.data(), n));
             if (n == 0 || !parsed.success() || parsed.consumed != n ||
                 !parsed.src_addr || *parsed.src_addr != addr ||

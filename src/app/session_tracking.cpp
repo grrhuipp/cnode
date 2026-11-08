@@ -1,10 +1,10 @@
-#include "acppnode/app/session_tracking.hpp"
+#include "app/session_tracking.hpp"
 
-#include "acppnode/common/session.hpp"
-#include "acppnode/common/container_util.hpp"
+#include "common/session.hpp"
+#include "common/container_util.hpp"
 #include <stdexcept>
 
-namespace acpp::app {
+namespace app {
 
 SessionTrackingState::SessionTrackingState() = default;
 SessionTrackingState::~SessionTrackingState() = default;
@@ -209,4 +209,4 @@ void SessionTrackingState::MergeCompletedTraffic(
     }
 }
 
-}  // namespace acpp::app
+}  // namespace app

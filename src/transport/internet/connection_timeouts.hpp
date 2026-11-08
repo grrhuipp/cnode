@@ -1,8 +1,8 @@
 #pragma once
 
-#include "acppnode/common/error.hpp"
-#include "acppnode/transport/phase_deadline.hpp"
-#include "acppnode/transport/internet/timeout_scheduler.hpp"
+#include "common/error.hpp"
+#include "transport/phase_deadline.hpp"
+#include "transport/internet/timeout_scheduler.hpp"
 
 #include <chrono>
 #include <cstdint>
@@ -10,7 +10,7 @@
 #include <optional>
 #include <stdexcept>
 
-namespace acpp::transport::internet::detail {
+namespace transport::internet::detail {
 
 // Domain-owned aggregate deadlines. The sole embedded event follows the domain's
 // current Worker scheduler without retaining a pre-handoff scheduler reference.
@@ -226,4 +226,4 @@ private:
     bool idle_expired_ = false, read_expired_ = false, write_expired_ = false, phase_expired_ = false;
 };
 
-}  // namespace acpp::transport::internet::detail
+}  // namespace transport::internet::detail

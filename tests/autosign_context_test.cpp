@@ -13,7 +13,7 @@
 #include <thread>
 
 namespace {
-using Renewal = acpp::AutoSignContextRenewal;
+using Renewal = ::AutoSignContextRenewal;
 using namespace std::chrono_literals;
 
 bool Require(bool condition, const char* message) {
@@ -21,7 +21,7 @@ bool Require(bool condition, const char* message) {
     return condition;
 }
 std::shared_ptr<SSL_CTX> Context(long validity_seconds) {
-    auto certificate = acpp::transport::internet::AutoSignCertificate::Create("renewal.example");
+    auto certificate = ::transport::internet::AutoSignCertificate::Create("renewal.example");
     if (!certificate || !X509_gmtime_adj(X509_get_notAfter(certificate->Certificate()), validity_seconds) ||
         X509_sign(certificate->Certificate(), certificate->Key(), EVP_sha256()) <= 0)
         throw std::runtime_error("test certificate construction failed");

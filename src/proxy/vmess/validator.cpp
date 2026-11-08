@@ -1,12 +1,12 @@
 #include "validator.hpp"
-#include "acppnode/app/proxyman/inbound/user_store.hpp"
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/sharded_user_stats.hpp"
-#include "acppnode/common/string_hash.hpp"
-#include "acppnode/common/container_util.hpp"
+#include "app/proxyman/inbound/user_store.hpp"
+#include "common/allocator.hpp"
+#include "common/sharded_user_stats.hpp"
+#include "common/string_hash.hpp"
+#include "common/container_util.hpp"
 #include "vmess_crypto.hpp"
 #include "vmess_request.hpp"
-#include "acppnode/app/session_group_executor.hpp"
+#include "app/session_group_executor.hpp"
 
 #include <algorithm>
 #include <openssl/mem.h>
@@ -18,7 +18,6 @@
 #include <cstring>
 #include <utility>
 
-namespace acpp {
 namespace vmess {
 
 namespace {
@@ -299,4 +298,3 @@ net::awaitable<bool> TimedUserValidator::RegisterSessionIfNew(
 
 
 }  // namespace vmess
-}  // namespace acpp

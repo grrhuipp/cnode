@@ -2,7 +2,7 @@
 
 #include <string_view>
 
-namespace acpp::transport::internet::detail {
+namespace transport::internet::detail {
 
 // An unset configured path addresses the origin root.
 [[nodiscard]] constexpr std::string_view EffectiveHttpPath(
@@ -36,4 +36,4 @@ namespace acpp::transport::internet::detail {
     return actual[expected.size()] == '/';
 }
 
-}  // namespace acpp::transport::internet::detail
+}  // namespace transport::internet::detail

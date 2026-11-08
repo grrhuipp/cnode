@@ -1,22 +1,21 @@
 #pragma once
 
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/proxy/outbound.hpp"
-#include "acppnode/transport/internet/outbound_sender.hpp"
+#include "common/allocator.hpp"
+#include "proxy/outbound.hpp"
+#include "transport/internet/outbound_sender.hpp"
 
 #include <array>
-#include "acppnode/common/unsafe.hpp"
+#include "common/unsafe.hpp"
 #include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string_view>
 
-namespace acpp {
 
 class AwaitableTaskGroup;
 
-// 协议核心 codec/validator 位于 acpp::anytls；handler 与其它协议一致归于
-// acpp::proxy::<name>::outbound（对应 vmess core=acpp::vmess, handler=acpp::proxy::vmess::*）。
+// 协议核心 codec/validator 位于 anytls；handler 与其它协议一致归于
+// proxy::<name>::outbound（对应 vmess core=vmess, handler=proxy::vmess::*）。
 namespace proxy::anytls::outbound {
 
 // 传输层与 sendThrough 属于 Handler 的 sender settings。
@@ -33,7 +32,7 @@ struct Settings {
     Settings(Settings&&) noexcept = default;
     Settings& operator=(Settings&&) noexcept = default;
     ~Settings() noexcept {
-        ::acpp::SecureZeroMemory(password_hash.data(), password_hash.size());
+        ::SecureZeroMemory(password_hash.data(), password_hash.size());
     }
 };
 
@@ -88,4 +87,3 @@ private:
 };
 
 }  // namespace proxy::anytls::outbound
-}  // namespace acpp

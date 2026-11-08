@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "acppnode/proxy/sniff_config.hpp"
+#include "proxy/sniff_config.hpp"
 
 #include <cstdio>
 
@@ -14,7 +14,7 @@ bool Require(bool condition, const char* message) {
 }  // namespace
 
 TEST(SniffConfig, Contract) {
-    acpp::SniffConfig config;
+    ::SniffConfig config;
     config.domains_excluded = {"Blocked.Example", "safe.example"};
 
     ASSERT_FALSE((!Require(config.IsDomainExcluded("blocked.example"),
@@ -28,12 +28,12 @@ TEST(SniffConfig, Contract) {
     ASSERT_FALSE((!Require(config.MatchesDestOverride("tls") && config.MatchesDestOverride("http") &&
                  config.MatchesDestOverride("quic") && !config.MatchesDestOverride("bittorrent"),
                  "default destOverride must be tls, http and quic")));
-    config.dest_override = acpp::SniffConfig::DestOverrideBit("quic");
+    config.dest_override = ::SniffConfig::DestOverrideBit("quic");
     ASSERT_FALSE((!Require(config.MatchesDestOverride("quic"),
                  "quic destOverride must be recognized")));
     ASSERT_FALSE((!Require(!config.MatchesDestOverride("tls"),
                  "unlisted destOverride protocols must not match")));
-    ASSERT_FALSE((!Require(acpp::SniffConfig::DestOverrideBit("fakedns") == 0 &&
+    ASSERT_FALSE((!Require(::SniffConfig::DestOverrideBit("fakedns") == 0 &&
                  !config.MatchesDestOverride("fakedns"),
                  "unsupported protocol names must not map to a destOverride bit")));
 }

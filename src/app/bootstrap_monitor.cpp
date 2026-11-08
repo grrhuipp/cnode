@@ -1,21 +1,21 @@
-#include "acppnode/app/bootstrap_monitor.hpp"
-#include "acppnode/app/bootstrap_runtime.hpp"
+#include "app/bootstrap_monitor.hpp"
+#include "app/bootstrap_runtime.hpp"
 
 #include "../common/awaitable_batch.hpp"
 #include "../common/monitor_loop.hpp"
 #include "../common/process_resources.hpp"
 
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/defaults.hpp"
-#include "acppnode/common/memory_stats.hpp"
-#include "acppnode/service/controller/controller.hpp"
-#include "acppnode/infra/log.hpp"
-#include "acppnode/app/proxyman/inbound/user_store.hpp"
-#include "acppnode/app/dns/dns.hpp"
-#include "acppnode/app/dns/dns_worker.hpp"
-#include "acppnode/app/stats.hpp"
-#include "acppnode/app/worker.hpp"
-#include "acppnode/app/worker_stats.hpp"
+#include "common/allocator.hpp"
+#include "common/defaults.hpp"
+#include "common/memory_stats.hpp"
+#include "service/controller/controller.hpp"
+#include "infra/log.hpp"
+#include "app/proxyman/inbound/user_store.hpp"
+#include "app/dns/dns.hpp"
+#include "app/dns/dns_worker.hpp"
+#include "app/stats.hpp"
+#include "app/worker.hpp"
+#include "app/worker_stats.hpp"
 
 #include <algorithm>
 #include <array>
@@ -28,7 +28,6 @@
 #include <string_view>
 #include <vector>
 
-namespace acpp {
 
 namespace {
 
@@ -71,14 +70,14 @@ size_t ReadResidentMemoryBytes() noexcept {
 
 std::string FormatRate(double bytes_per_sec) {
     if (!std::isfinite(bytes_per_sec) || bytes_per_sec <= 0.0) {
-        return acpp::FormatBytes(0) + "/s";
+        return ::FormatBytes(0) + "/s";
     }
     constexpr double kMaxBytes =
         static_cast<double>(std::numeric_limits<uint64_t>::max());
     const uint64_t rate = bytes_per_sec >= kMaxBytes
         ? std::numeric_limits<uint64_t>::max()
         : static_cast<uint64_t>(bytes_per_sec);
-    return acpp::FormatBytes(rate) + "/s";
+    return ::FormatBytes(rate) + "/s";
 }
 
 net::awaitable<std::vector<WorkerRuntimeStatsSnapshot>>
@@ -263,7 +262,7 @@ net::awaitable<void> RuntimeStatsOutputLoop(
                     pool_direct_bytes / (1024 * 1024), pool_idle_bytes / 1024,
                     pool_chunks, memory::RemoteFreeCount());
         LOG_CONSOLE("Runtime traffic: traffic_in={} traffic_out={} rate_down={} rate_up={}",
-                    acpp::FormatBytes(snapshot.bytes_in), acpp::FormatBytes(snapshot.bytes_out),
+                    ::FormatBytes(snapshot.bytes_in), ::FormatBytes(snapshot.bytes_out),
                     FormatRate(snapshot.bytes_in_rate), FormatRate(snapshot.bytes_out_rate));
         LOG_CONSOLE("Runtime DNS cache: dns_hit={:.0f}% dns_cache={}/{}",
                     dns_hit_rate, dns_stats.entries, dns_stats.capacity);
@@ -307,15 +306,15 @@ net::awaitable<void> RuntimeStatsOutputLoop(
                     ns.network,
                     ns.total_users,
                     ns.online_users,
-                    acpp::FormatBytes(ns.bytes_up),
-                    acpp::FormatBytes(ns.bytes_down));
+                    ::FormatBytes(ns.bytes_up),
+                    ::FormatBytes(ns.bytes_down));
             }
             LOG_CONSOLE("Panel node totals: count={} users={} online={} upload={} download={}",
                      node_stats.size(),
                      node_users,
                      node_online,
-                     acpp::FormatBytes(node_up),
-                     acpp::FormatBytes(node_down));
+                     ::FormatBytes(node_up),
+                     ::FormatBytes(node_down));
         }
 
         timer.expires_after(std::chrono::seconds(defaults::kStatsOutputInterval));
@@ -384,4 +383,3 @@ net::awaitable<void> RuntimeMonitor::AsyncJoin() {
     for (const auto& loop : impl_->loops) co_await loop->AsyncJoin();
 }
 
-}  // namespace acpp

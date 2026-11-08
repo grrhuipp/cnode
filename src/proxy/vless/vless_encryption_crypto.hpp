@@ -11,7 +11,7 @@
 #include <memory>
 #include <optional>
 #include <span>
-namespace acpp::vless {
+namespace vless {
 
 inline constexpr size_t kVlessX25519KeySize = 32;
 inline constexpr size_t kVlessMlKem768SeedSize = 64;
@@ -93,4 +93,4 @@ EncapsulateVlessMlKem768(std::span<const uint8_t> public_key) noexcept;
     std::span<const uint8_t> ciphertext,
     std::span<uint8_t, kVlessMlKem768SharedSecretSize> out_shared) noexcept;
 
-}  // namespace acpp::vless
+}  // namespace vless

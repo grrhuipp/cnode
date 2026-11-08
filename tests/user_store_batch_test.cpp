@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "acppnode/app/proxyman/inbound/user_store.hpp"
+#include "app/proxyman/inbound/user_store.hpp"
 
 #include <array>
 #include <cstdlib>
@@ -9,7 +9,7 @@
 
 namespace {
 thread_local std::ptrdiff_t fail_after = -1;
-using namespace acpp::proxyman::inbound;
+using namespace ::proxyman::inbound;
 
 void Commit(UserStore::PublishedSnapshot snapshot) {
     auto view = UserStore::PrepareWorkerView(snapshot);

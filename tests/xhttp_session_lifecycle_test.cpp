@@ -1,8 +1,8 @@
 #include <gtest/gtest.h>
 
 #include "xhttp_session.hpp"
-#include "acppnode/transport/internet/tcp_stream.hpp"
-#include "acppnode/app/session_group_executor.hpp"
+#include "transport/internet/tcp_stream.hpp"
+#include "app/session_group_executor.hpp"
 
 #include <asio/co_spawn.hpp>
 #include <asio/post.hpp>
@@ -17,8 +17,8 @@
 #include <vector>
 
 namespace {
-namespace net = acpp::net;
-using namespace acpp::transport::internet;
+namespace net = ::net;
+using namespace ::transport::internet;
 using namespace std::chrono_literals;
 
 void Require(bool value, const char* message) {
@@ -119,7 +119,7 @@ net::awaitable<void> BoundedReplayWindow(net::io_context& io) {
     Require(bool(oldest), "oldest tombstone was not bounded by FIFO eviction");
 }
 
-struct DomainHooks final : acpp::ExecutionDomain::Hooks {
+struct DomainHooks final : ::ExecutionDomain::Hooks {
     std::exception_ptr failure;
     void Enter() noexcept override {}
     void Leave() noexcept override {}
@@ -130,14 +130,14 @@ struct DomainHooks final : acpp::ExecutionDomain::Hooks {
 // the same logical session merges them; late uploads cannot bypass replay
 // protection by arriving on a different physical connection's domain.
 net::awaitable<void> DomainsJoinBySession(net::io_context& io) {
-    auto coordinator = std::make_shared<acpp::GroupCoordinator>(io);
+    auto coordinator = std::make_shared<::GroupCoordinator>(io);
     coordinator->RegisterWorker(1, io, io.get_executor());
     coordinator->RegisterWorker(2, io, io.get_executor());
     coordinator->RegisterWorker(3, io, io.get_executor());
     auto hooks = std::make_shared<DomainHooks>();
-    auto first_domain = acpp::ExecutionDomain::Create(io, 1, io.get_executor(), hooks, coordinator);
-    auto other_domain = acpp::ExecutionDomain::Create(io, 2, io.get_executor(), hooks, coordinator);
-    auto upload_domain = acpp::ExecutionDomain::Create(io, 3, io.get_executor(), hooks, coordinator);
+    auto first_domain = ::ExecutionDomain::Create(io, 1, io.get_executor(), hooks, coordinator);
+    auto other_domain = ::ExecutionDomain::Create(io, 2, io.get_executor(), hooks, coordinator);
+    auto upload_domain = ::ExecutionDomain::Create(io, 3, io.get_executor(), hooks, coordinator);
     auto scenario = [&]() -> net::awaitable<void> {
     auto first = co_await net::co_spawn(first_domain->Executor(),
         GetXHttpPacketSession(io, "group", "session-a", XHttpSessionAccess::Open), net::use_awaitable);
@@ -196,11 +196,11 @@ net::awaitable<void> DomainsJoinBySession(net::io_context& io) {
     if (hooks->failure) std::rethrow_exception(hooks->failure);
 }
 
-std::string Receive(acpp::tcp::socket& socket) {
+std::string Receive(::tcp::socket& socket) {
     std::string bytes;
     std::array<char, 8192> buffer;
     for (;;) {
-        acpp::IoErrorCode ec;
+        ::IoErrorCode ec;
         const auto n = socket.read_some(net::buffer(buffer), ec);
         if (ec) break;
         bytes.append(buffer.data(), n);
@@ -213,24 +213,24 @@ std::string Receive(acpp::tcp::socket& socket) {
 // peer send buffer, and cancellation of a reader still waiting for padding.
 void UploadResponseIsDrained() {
     net::io_context io;
-    acpp::tcp::acceptor listener(io, {net::ip::address_v4::loopback(), 0});
-    acpp::tcp::socket client(io), peer(io);
+    ::tcp::acceptor listener(io, {net::ip::address_v4::loopback(), 0});
+    ::tcp::socket client(io), peer(io);
     client.connect(listener.local_endpoint());
     listener.accept(peer);
     peer.non_blocking(true);
     peer.set_option(net::socket_base::send_buffer_size(4096));
-    acpp::HttpConfig config;
+    ::HttpConfig config;
     config.path = "/fixture/id";
     config.method = "POST";
     config.headers.emplace("Connection", "keep-alive");
-    std::unique_ptr<acpp::AsyncStream> upload;
+    std::unique_ptr<::AsyncStream> upload;
     std::exception_ptr failure;
     bool built = false;
     const std::string initial = "first";
     const std::array<net::const_buffer, 1> payload{net::buffer(initial)};
-    net::co_spawn(io, DoXHttp1ClientRequest(std::make_unique<acpp::TcpStream>(std::move(client)),
-        config, "localhost", acpp::XHttpClientRequestKind::StreamUp, payload, 0),
-        [&](std::exception_ptr error, acpp::TransportBuildResult result) {
+    net::co_spawn(io, DoXHttp1ClientRequest(std::make_unique<::TcpStream>(std::move(client)),
+        config, "localhost", ::XHttpClientRequestKind::StreamUp, payload, 0),
+        [&](std::exception_ptr error, ::TransportBuildResult result) {
             failure = error;
             if (!error && result) upload = std::move(*result);
             built = true;

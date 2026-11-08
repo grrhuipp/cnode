@@ -1,45 +1,44 @@
 #include "vmess_inbound.hpp"
 #include "../../mux/inbound/mux_inbound.hpp"
 #include "../../inbound_admission.hpp"
-#include "acppnode/transport/async_stream.hpp"
-#include "acppnode/app/rate_limiter.hpp"
-#include "acppnode/app/stats.hpp"
-#include "acppnode/features/routing/dispatcher.hpp"
+#include "transport/async_stream.hpp"
+#include "app/rate_limiter.hpp"
+#include "app/stats.hpp"
+#include "features/routing/dispatcher.hpp"
 #include "../encoding/server.hpp"
 #include "../account.hpp"
-#include "acppnode/app/proxyman/inbound/factory.hpp"
-#include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
-#include "acppnode/infra/config_types.hpp"
-#include "acppnode/infra/log.hpp"
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/initial_payload.hpp"
-#include "acppnode/common/session.hpp"
+#include "app/proxyman/inbound/factory.hpp"
+#include "app/proxyman/inbound/receiver_settings.hpp"
+#include "infra/config_types.hpp"
+#include "infra/log.hpp"
+#include "common/allocator.hpp"
+#include "common/initial_payload.hpp"
+#include "common/session.hpp"
 
 #include <cstring>
 #include <tl/expected.hpp>
 #include <span>
 #include <utility>
 
-namespace acpp {
 
 namespace {
 
-Network RequestNetwork(::acpp::vmess::Command command) noexcept {
-    return command == ::acpp::vmess::Command::UDP
-        ? Network::UDP : command == ::acpp::vmess::Command::Mux
+Network RequestNetwork(::vmess::Command command) noexcept {
+    return command == ::vmess::Command::UDP
+        ? Network::UDP : command == ::vmess::Command::Mux
         ? Network::MUX : Network::TCP;
 }
 
 net::awaitable<tl::expected<UserOnlineSessionGuard, ErrorCode>>
 ParseHandshake(AsyncStream& stream,
-               ::acpp::vmess::encoding::ServerSession& vmess_session,
-               ::acpp::vmess::TimedUserValidator& validator,
+               ::vmess::encoding::ServerSession& vmess_session,
+               ::vmess::TimedUserValidator& validator,
                ConnectionLimiter* limiter,
                session::Context& ctx,
                std::string_view client_ip) {
     memory::ByteVector header_buf;
     size_t total_read = 0;
-    std::optional<::acpp::vmess::VMessRequest> request;
+    std::optional<::vmess::VMessRequest> request;
     size_t consumed = 0;
     while (!request) {
         const size_t required = vmess_session.RequiredHeaderBytes();
@@ -139,7 +138,7 @@ ParseHandshake(AsyncStream& stream,
 // ============================================================================
 
 proxy::vmess::inbound::Handler::Handler(
-    ::acpp::vmess::TimedUserValidator& validator,
+    ::vmess::TimedUserValidator& validator,
     StatsShard& stats,
     ConnectionLimiter* limiter)
     : validator_(validator)
@@ -177,7 +176,7 @@ proxy::vmess::inbound::Handler::Process(
     std::unique_ptr<transport::MultiBufferReader> request_reader;
     std::unique_ptr<transport::MultiBufferWriter> response_writer;
     try {
-        ::acpp::vmess::encoding::ServerSession vmess_session(validator_, tag);
+        ::vmess::encoding::ServerSession vmess_session(validator_, tag);
         auto parsed_session = co_await ParseHandshake(
             *stream, vmess_session, validator_, limiter_, ctx, client_ip);
         if (!parsed_session) {
@@ -223,20 +222,19 @@ proxy::vmess::inbound::Handler::Process(
         timeouts);
 }
 
-}  // namespace acpp
 
 // ============================================================================
 // 自注册（静态初始化）
 // ============================================================================
 namespace {
-[[nodiscard]] std::optional<acpp::proxyman::inbound::PreparedVmessUser>
-BuildPreparedVmessUser(const acpp::InboundUserSpec& spec) {
-    auto user = acpp::vmess::MemoryAccount::FromUUID(
+[[nodiscard]] std::optional<::proxyman::inbound::PreparedVmessUser>
+BuildPreparedVmessUser(const ::InboundUserSpec& spec) {
+    auto user = ::vmess::MemoryAccount::FromUUID(
         spec.credential, spec.user_id, spec.email, spec.speed_limit, spec.device_limit);
     if (!user) {
         return std::nullopt;
     }
-    return acpp::proxyman::inbound::PreparedVmessUser{
+    return ::proxyman::inbound::PreparedVmessUser{
         .uuid = std::move(user->uuid),
         .uuid_bytes = user->uuid_bytes,
         .cmd_key = user->cmd_key,
@@ -246,36 +244,36 @@ BuildPreparedVmessUser(const acpp::InboundUserSpec& spec) {
 }
 
 const bool kVmessInboundRegistered = [] {
-    acpp::proxyman::inbound::ProxyRegistration reg;
-    reg.user_protocol = acpp::proxyman::inbound::UserProtocol::Vmess;
+    ::proxyman::inbound::ProxyRegistration reg;
+    reg.user_protocol = ::proxyman::inbound::UserProtocol::Vmess;
 
     reg.create_runtime = []() -> std::unique_ptr<
-        acpp::proxyman::inbound::ProtocolRuntime> {
+        ::proxyman::inbound::ProtocolRuntime> {
         return std::make_unique<
-            acpp::proxy::InboundTrackerRuntime<acpp::vmess::TimedUserValidator>>();
+            ::proxy::InboundTrackerRuntime<::vmess::TimedUserValidator>>();
     };
 
     reg.create_tcp_handler =
-        [](acpp::proxyman::inbound::ProtocolRuntime& runtime,
-           acpp::StatsShard& stats,
-           acpp::ConnectionLimiter* limiter,
-           const acpp::proxyman::inbound::BuildRequest&) -> std::unique_ptr<acpp::Inbound> {
+        [](::proxyman::inbound::ProtocolRuntime& runtime,
+           ::StatsShard& stats,
+           ::ConnectionLimiter* limiter,
+           const ::proxyman::inbound::BuildRequest&) -> std::unique_ptr<::Inbound> {
             auto* vmess_runtime = dynamic_cast<
-                acpp::proxy::InboundTrackerRuntime<acpp::vmess::TimedUserValidator>*>(&runtime);
+                ::proxy::InboundTrackerRuntime<::vmess::TimedUserValidator>*>(&runtime);
             if (!vmess_runtime) {
                 return nullptr;
             }
-            return std::make_unique<acpp::proxy::vmess::inbound::Handler>(
+            return std::make_unique<::proxy::vmess::inbound::Handler>(
                 vmess_runtime->validator,
                 stats,
                 limiter);
         };
 
     reg.build_users =
-        [](const acpp::proxyman::inbound::BuildRequest& req,
-           std::span<const acpp::InboundUserSpec> specs)
-            -> std::optional<acpp::proxyman::inbound::UserSet> {
-            std::vector<acpp::proxyman::inbound::PreparedVmessUser> users;
+        [](const ::proxyman::inbound::BuildRequest& req,
+           std::span<const ::InboundUserSpec> specs)
+            -> std::optional<::proxyman::inbound::UserSet> {
+            std::vector<::proxyman::inbound::PreparedVmessUser> users;
             users.reserve(specs.size());
 
             for (const auto& spec : specs) {
@@ -286,11 +284,11 @@ const bool kVmessInboundRegistered = [] {
                 }
                 users.push_back(std::move(*user));
             }
-            return acpp::proxyman::inbound::UserSet{std::move(users)};
+            return ::proxyman::inbound::UserSet{std::move(users)};
         };
 
-    acpp::proxyman::inbound::RegisterProxy(
-        acpp::constants::protocol::kVmess, std::move(reg));
+    ::proxyman::inbound::RegisterProxy(
+        ::constants::protocol::kVmess, std::move(reg));
     return true;
 }();
 }  // namespace

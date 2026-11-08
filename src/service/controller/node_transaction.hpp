@@ -12,7 +12,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace acpp::controller {
+namespace controller {
 
 // One address-stable wait slot belongs to each panel fixed before Start. FIFO
 // admission spans the complete all-Worker transaction, not just one publication:
@@ -336,4 +336,4 @@ net::awaitable<void> ApplyNodeChange(
     std::rethrow_exception(failure);
 }
 
-}  // namespace acpp::controller
+}  // namespace controller

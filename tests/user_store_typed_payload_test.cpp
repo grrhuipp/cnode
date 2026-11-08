@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 
-#include "acppnode/app/proxyman/inbound/prepared_config.hpp"
-#include "acppnode/app/proxyman/inbound/user_store.hpp"
+#include "app/proxyman/inbound/prepared_config.hpp"
+#include "app/proxyman/inbound/user_store.hpp"
 #include <array>
 #include <iostream>
 #include <stdexcept>
@@ -9,7 +9,7 @@
 #include <variant>
 
 namespace {
-using namespace acpp::proxyman::inbound;
+using namespace ::proxyman::inbound;
 
 void Commit(UserStore::PublishedSnapshot snapshot) {
     auto view = UserStore::PrepareWorkerView(snapshot);

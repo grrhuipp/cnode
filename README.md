@@ -295,7 +295,7 @@ bash scripts/cnode.sh -debug_file true
 - AnyTLS 出站请求使用统一的 relay 空闲、写入和半关闭超时；持续接收数据不会延长半关闭的绝对截止时间。取消受阻写入会关闭物理会话；成功请求归还前清除请求超时，空闲连接的寿命随后由会话池控制。
 - Freedom 和 Shadowsocks 原生 UDP 出站共用 datagram transport，并沿统一请求主链进入 relay。每个逻辑请求独占一个 UDP socket，本地源端口在请求存续期间保持不变；取消或关闭不会影响其他请求，即使它们访问同一远端。写入预算包含 DNS 等待；Shadowsocks 仅把认证通过的回包计为有效活动。
 - UDP 出站 socket 的地址族在创建时确定：literal IPv6 目标自动使用 IPv6，显式绑定按配置执行；不兼容的目标或解析结果会失败，不会重建 socket 或改变源端口。每 Worker 最多同时拥有 4096 个原生 UDP 出站 socket；容量或系统资源不足时拒绝新请求，不降级为共享 socket。运行时日志的 `udp_sockets` 统计实际打开的出站 socket，不包含入站监听或 DNS socket。
-- UDP 按需接收，在可读后才申请 payload，不保留应用层回包队列；内核接收队列满时遵循 UDP 丢包语义。上行半关闭后，在 `timeouts.downlinkOnly` 的绝对窗口内继续收包；流量只在成功发送后计入。底层 socket 可识别零长度 datagram，但当前 MultiBuffer 转发边界不将其当作数据转发。
+- UDP 按需接收，在可读后才申请 payload，不保留应用层回包队列；内核接收队列满时遵循 UDP 丢包语义。上行半关闭后，在 `timeouts.downlinkOnly` 的绝对窗口内继续收包；流量只在成功发送后计入。零长度 UDP 载荷保留报文边界，不视为 EOF。向普通 VMess UDP 转发空报文时，以 `NOT_SUPPORTED` 结束该请求，不将其伪装成协议结束帧。
 - 原生 UDP 入站在接收缓冲或单包处理内存不足时丢弃当前包，继续在原 socket 上接收；空闲等待前释放接收缓冲。仍在注册的接收循环意外结束、或监听提交后无法启动接收循环时，进程以失败状态退出，避免留下已绑定但无人读取的端口。
 - 原生 UDP association 在没有新包时也会分批回收已关闭和过期记录；每个 Worker 共用一个维护事件，不为每个 association 建定时器。该事件只在有记录关闭或到达最近的过期时刻时唤醒，没有可回收记录时不唤醒，单个上行包也不调整它。association 的 idle 按有效上行活动判断，单纯下行不续期；idle 为零只禁用开放会话过期，已关闭记录仍回收。每个 Worker 的全部原生 UDP 入站共享资源预算：最多 4096 个仍存活的 association、8192 份排队或正在发送的数据报，以及 64 MiB 排队 payload Buffer 容量。容量按实际缓冲容量而非有效字节数计量；association 直到请求清理与最后持有者完成才归还额度。满额时拒绝新 association 或当前新数据报，已有请求不被驱逐。这些是资源限制，不是协议限制，也不代表整个进程的内存上限。
 - 原生 UDP 更换监听 socket 或注销入站时，先停止新请求并取消旧请求，再等待旧分发任务实际结束；删除 association 或关闭 socket 不等于请求完成。同 socket 的协议更新保留现有会话，旧请求继续使用创建时的元数据和分发策略，新请求使用新配置。
@@ -316,6 +316,8 @@ bash scripts/cnode.sh -debug_file true
 - 出口列表顺序不表达默认出口；动态增删 outbound 不会改变其他 receiver 的选择。明确的 forced / fallback tag 不存在时请求失败，不隐式切换到第一个 outbound。
 - AnyTLS 使用 TLS session pool、单物理 session read loop、按 sid demux、共享 session 串行写，以及 `settings.clients` 和 `settings.paddingScheme` 配置。
 - Hysteria v1 使用 ALPN `hysteria`，Hysteria2 使用 HTTP/3 `/auth` 后切换原生 QUIC stream；两代均支持 QUIC DATAGRAM UDP 与分片重组。按 Xray `transport/internet/hysteria` 的划分，QUIC、认证与流/数据报会话属于传输层，认证后每个 TCP 请求流与 UDP 会话作为逻辑传输流交给同一入站 Handler 与 `Inbound::Process`，连接级物理准入与连接统计在认证前完成。QUIC 与 TCP 一样由全部数据 Worker 以 `SO_REUSEPORT` 监听；未认证连接归接受它的 Worker，已认证会话在路径变化使数据包实际落到另一 Worker 且完成路径验证后被动接管，不跨 Worker 转发数据包（RFC 9000 §9、§10.3）。`ngtcp2`、`nghttp3` 及流队列借用当前 Worker PMR，监听入口共享收发循环和超时调度。`ngtcp2` 不提供 Hysteria v1 的 Brutal 拥塞控制，v1 服务端使用其 BBR v2 实现；线协议与官方 v1 客户端互通，但带宽控制行为不是 Brutal。
+- Hysteria UDP 每轮未完成分片重组采用固定资源预算：5 秒没有有效新片，或达到 15 秒整体期限，即丢弃并释放该轮分片；有效进度只续空闲期限，不续整体期限。分片到期不会主动关闭健康的 UDP 会话或 QUIC 连接。这是本地资源限制，不是协议规定的时限。
+- Hysteria UDP 下行按对端 QUIC DATAGRAM 帧上限与本地报文预算分片，每片携带完整地址。地址本身放不下或超过协议片数上限时，仅终止对应 UDP 请求，不关闭共享 QUIC 连接。
 
 AnyTLS FIN 关闭整个逻辑流：远端 FIN 之前的已接收数据按有界队列排空，同时停止新的反向写入且不回复 FIN；本地关闭只发送一次 FIN。请求的两个方向结束后，完整且正常的物理会话可供新流复用；物理帧写入中断则关闭会话。第四十八轮已通过固定提交官方实现对照、双向直接互通和提前 FIN 检查，验证范围及当前环境限制见[架构审查记录](docs/architecture-review-20260909.md#第四十八轮anytls-完整关闭与-tls-取消传递)。
 - REALITY 支持 TLS 1.3 + X25519 + Ed25519 临时证书签发与验证、服务端准入控制（`serverNames`、`shortIds`、`minClientVer`、`maxClientVer`、`maxTimeDiff`）、可选后量子 `mldsa65Seed` / `mldsa65Verify`（ML-DSA-65 证书扩展签名与验签）、未认证连接透明回落转发（`dest` + `xver` 0/1/2 PROXY Protocol v1/v2）、客户端 `fingerprint` 浏览器指纹模拟（`chrome`/`firefox`/`safari`/`ios`/`android`/`edge`/`360`/`qq`/`random`）、客户端 `spiderX` 回退路径访问，以及 V2Board 面板 `tls=2` REALITY 节点自动同步。握手阶段的认证状态与 transcript 缓冲在握手结束时立即释放，不随连接常驻；无读者的 `show`、`type`、`masterKeyLog` 字段会被配置加载器拒绝。
@@ -377,7 +379,7 @@ IP 字段必须是完整地址：IPv4 使用四段无前导零的十进制格式
 
 DNSWorker 将多个调用者的并发同域查询合并为一次服务级解析，每个调用者独立等待、独立取消；首个调用者取消不会终止其他等待者的查询。最后一个等待者退出后取消无用查询，已取消但尚未收束的查询仍占准入容量；停机等待全部查询完成清理。每个上游复用一个 UDP socket，三次 A 地址采样与 AAAA 查询并发执行，仍保留多地址合并与按顺序切换上游的语义。主控线程只有一层 DNS 缓存；缓存写入分配失败不会丢失已经取得的答案，缓存在完整构建新条目后才淘汰旧条目。
 
-DNS 缓存默认容量为 `dns.cacheSize: 10240`，设置为 `0` 可禁用；`minTTL` / `maxTTL` 默认分别为 60 / 3600 秒。仅成功地址结果与无记录结果进入缓存，超时、SERVFAIL、REFUSED 等临时失败不缓存。A / AAAA 数据长度错误属于 `DNS_FORMAT_ERROR`，不伪装成无记录结果，按既有上游失败策略尝试备用服务器。
+DNS 缓存默认容量为 `dns.cacheSize: 10240`，设置为 `0` 可禁用；`minTTL` / `maxTTL` 默认分别为 60 / 3600 秒。仅成功地址结果与无记录结果进入缓存，超时、SERVFAIL、REFUSED 等临时失败不缓存。零 TTL 地址结果只用于本次解析，不受 `minTTL` 延长；接收到最高位置位的 TTL 时整体按零处理，仍保留本次可用地址。A / AAAA 数据长度错误属于 `DNS_FORMAT_ERROR`，不伪装成无记录结果，按既有上游失败策略尝试备用服务器。
 
 共享上游查询最终失败时，在 `warning` 级别向 error 日志记录一次域名、错误码、`source=upstream`、最后使用的上游地址／端口及 A、AAAA 查询原因。`NXDOMAIN` 表示域名不存在，`NODATA` 表示响应没有所需地址记录；仅含不支持的记录、服务失败、拒绝、超时与畸形响应分别保留具体原因。负缓存命中保留原始原因而不逐连接刷 Warning；在到期、刷新、恢复、淘汰或停机时以 `info` 汇总 `event`、`hits`、`suppressed` 和原始原因，计数只包含负缓存命中，不包含共享查询等待者。过期条目不再提供答案，仅保留受缓存容量约束的恢复元数据；`cacheSize: 0` 不保留该状态。每条连接的访问拒绝记录仍保留。只要 A 或 AAAA 提供可用地址，解析仍成功；正常取消不记录成解析故障，真实系统异常不伪装成 DNS 无记录错误。
 
@@ -457,7 +459,7 @@ build/musl/cnode_traffic_journal '/path/to/traffic-journal/<身份哈希>' resol
 ## 代码组织
 
 ```text
-include/acppnode/      公共 API 和窄接口
+include/               公共 API 和窄接口
 src/app/              Worker、dispatcher、router、proxyman、stats、bootstrap
 src/proxy/            协议实现
 src/transport/        传输层实现
@@ -470,6 +472,8 @@ src/sniff/            HTTP / TLS / QUIC sniffing
 config/               示例配置
 scripts/              部署与更新脚本
 ```
+
+公共头直接使用 `common/...`、`transport/...` 等路径；命名空间按职责划分，不再套项目根命名空间。
 
 协议、面板和路由各自位于独立边界，通过统一请求链路及只读运行时配置协作。
 

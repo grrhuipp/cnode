@@ -2,17 +2,19 @@
 #include <gtest/gtest.h>
 
 #include "udp_datagram.hpp"
-#include "acppnode/common/buf/contiguous_buffer_view.hpp"
+#include "common/buf/contiguous_buffer_view.hpp"
 #include "encoding/server.hpp"
 #include "vmess_cipher.hpp"
+#include "encoding/body.hpp"
 #include "vmess_crypto.hpp"
-#include "acppnode/transport/internet/tcp_stream.hpp"
-#include "acppnode/app/proxyman/inbound/prepared_config.hpp"
+#include "transport/internet/tcp_stream.hpp"
+#include "app/proxyman/inbound/prepared_config.hpp"
 
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/cancellation_signal.hpp>
 #include <asio/co_spawn.hpp>
 #include <asio/this_coro.hpp>
+#include <asio/read.hpp>
 #include <openssl/sha.h>
 
 #include <algorithm>
@@ -25,7 +27,6 @@
 
 namespace {
 
-using namespace acpp;
 
 [[noreturn]] void Fail(std::string_view message) {
     std::cerr << message << '\n';
@@ -580,11 +581,79 @@ void TestAuthenticatedHeaderFailure() {
     UserStore::ClearWorkerView();
 }
 
+
+template <typename Fn>
+void CheckNotSupported(Fn&& fn) {
+    bool rejected = false;
+    try {
+        fn();
+    } catch (const transport::LinkError& error) {
+        rejected = error.code() == ErrorCode::NOT_SUPPORTED;
+    }
+    Check(rejected, "empty VMess UDP must fail explicitly without encoding EOF");
+}
+
+void TestEmptyUdpWrite(vmess::Security security) {
+    const uint8_t options = vmess::Option::CHUNK_STREAM | vmess::Option::CHUNK_MASKING |
+        vmess::Option::GLOBAL_PADDING | vmess::Option::AUTHENTICATED_LENGTH;
+    const auto request = MakeRequest(security, options, vmess::Command::UDP);
+    Connection connection;
+    vmess::TimedUserValidator validator;
+    vmess::encoding::ServerSession session(validator, "empty-udp-test");
+    session.SetRequest(request);
+    auto writer = session.EncodeResponseBodyWithHeader(connection.stream);
+    auto reject = [&](net::awaitable<void> operation) {
+        bool completed = false;
+        std::exception_ptr failure;
+        connection.io.restart();
+        net::co_spawn(connection.io, std::move(operation),
+            [&](std::exception_ptr error) { failure = error; completed = true; });
+        connection.io.run_for(std::chrono::seconds(1));
+        Check(completed && failure, "empty VMess UDP write silently succeeded");
+        CheckNotSupported([&] { std::rethrow_exception(failure); });
+    };
+    buf::MultiBuffer empty{MakeBuffer(0, &request.target)};
+    reject(writer->WriteMultiBuffer(std::move(empty)));
+    reject(writer->WriteBuffers(std::span<const net::const_buffer>{}));
+    Check(connection.peer.available() == 0,
+          "rejected VMess UDP write emitted an EOF or response header");
+
+    buf::MultiBuffer data{MakeBuffer(17, &request.target, 0x42)};
+    WriteReady(connection, *writer, std::move(data));
+    buf::MultiBuffer later_empty{MakeBuffer(0, &request.target)};
+    reject(writer->WriteMultiBuffer(std::move(later_empty)));
+    const size_t available = connection.peer.available();
+    memory::ByteVector wire(available);
+    Check(net::read(connection.peer, net::buffer(wire)) == wire.size(),
+          "VMess UDP response wire was incomplete");
+    ResponseDecoder decoder(request);
+    size_t offset = 38;
+    const auto decoded = decoder.Decode(wire, offset);
+    Check(decoded == memory::ByteVector(17, 0x42) && offset == wire.size(),
+          "rejected empty VMess UDP consumed framing state or appended EOF");
+
+    const vmess::encoding::BodyKey key{request.body_key, request.body_iv};
+    vmess::encoding::BodyEncoder encoder(
+        {security, options, vmess::Command::UDP}, key, key);
+    buf::MultiBuffer encoded;
+    buf::MultiBuffer request_empty{MakeBuffer(0, &request.target)};
+    CheckNotSupported([&] { encoder.Encode(request_empty, encoded); });
+    CheckNotSupported([&] {
+        encoder.Encode(std::span<const net::const_buffer>{}, encoded);
+    });
+    Check(encoded.empty(), "VMess request encoder emitted a forbidden empty chunk");
+    encoder.EncodeEnd(encoded);
+    Check(!encoded.empty(), "VMess explicit EOF marker was disabled");
+}
 }  // namespace
 
 TEST(VmessUdpDatagram, Contract) {
     const TargetAddress target("1.1.1.1", 53);
     const TargetAddress other("8.8.8.8", 53);
+    buf::MultiBuffer no_message;
+    vmess::ValidateFixedUdpDatagram(no_message, target);
+    buf::MultiBuffer empty{MakeBuffer(0, &target)};
+    CheckNotSupported([&] { vmess::ValidateFixedUdpDatagram(empty, target); });
 
     buf::MultiBuffer valid;
     valid.push_back(MakeBuffer(buf::Buffer::kSize, &target, 0x11));
@@ -635,5 +704,7 @@ TEST(VmessUdpDatagram, Contract) {
     TestEncryptedCancellation();
     TestResponseAuthenticatedLength(vmess::Security::AES_128_GCM);
     TestResponseAuthenticatedLength(vmess::Security::CHACHA20_POLY1305);
+    TestEmptyUdpWrite(vmess::Security::AES_128_GCM);
+    TestEmptyUdpWrite(vmess::Security::CHACHA20_POLY1305);
 
 }

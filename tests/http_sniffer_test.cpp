@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "acppnode/sniff/sniffer.hpp"
+#include "sniff/sniffer.hpp"
 
 #include <cstdio>
 #include <span>
@@ -8,8 +8,8 @@
 
 namespace {
 
-acpp::SniffResult SniffHttp(std::string_view request) {
-    return acpp::SniffHttp(std::span<const uint8_t>(
+::SniffResult SniffHttp(std::string_view request) {
+    return ::SniffHttp(std::span<const uint8_t>(
         reinterpret_cast<const uint8_t*>(request.data()), request.size()));
 }
 

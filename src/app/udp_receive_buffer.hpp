@@ -1,8 +1,8 @@
 #pragma once
 
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/asio_types.hpp"
-#include "acppnode/common/buf/multi_buffer.hpp"
+#include "common/allocator.hpp"
+#include "common/asio_types.hpp"
+#include "common/buf/multi_buffer.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -10,7 +10,7 @@
 #include <new>
 #include <span>
 
-namespace acpp::detail {
+namespace detail {
 
 class UdpReceiveBuffer final {
 public:
@@ -64,4 +64,4 @@ private:
     memory::ByteVector large_;
 };
 
-}  // namespace acpp::detail
+}  // namespace detail

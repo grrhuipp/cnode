@@ -1,7 +1,7 @@
 #include "shadowsocks_crypto.hpp"
 
-#include "acppnode/core/constants.hpp"
-#include "acppnode/core/naming.hpp"
+#include "core/constants.hpp"
+#include "core/naming.hpp"
 
 #include <blake3.h>
 #include <openssl/base64.h>
@@ -17,7 +17,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace acpp::ss {
+namespace ss {
 
 // ============================================================================
 // ParseCipherMethod
@@ -362,4 +362,4 @@ bool SsAeadCipher::Decrypt(const uint8_t* nonce, const uint8_t* ciphertext,
                          {output, ciphertext_len - kTagSize}).has_value();
 }
 
-}  // namespace acpp::ss
+}  // namespace ss

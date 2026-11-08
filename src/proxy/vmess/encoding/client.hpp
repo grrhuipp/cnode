@@ -2,8 +2,8 @@
 
 #include "../account.hpp"
 #include "body.hpp"
-#include "acppnode/transport/async_stream.hpp"
-#include "acppnode/transport/link.hpp"
+#include "transport/async_stream.hpp"
+#include "transport/link.hpp"
 
 #include <openssl/aes.h>
 
@@ -11,7 +11,7 @@
 #include <tl/expected.hpp>
 #include <span>
 
-namespace acpp::vmess::encoding {
+namespace vmess::encoding {
 
 using VMessHandshakeResult = tl::expected<void, ErrorCode>;
 
@@ -70,4 +70,4 @@ private:
     bool response_header_received_ = false;
 };
 
-}  // namespace acpp::vmess::encoding
+}  // namespace vmess::encoding

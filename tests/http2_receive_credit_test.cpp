@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 
-#include "acppnode/transport/internet/tcp_stream.hpp"
-#include "acppnode/transport/internet/transport_stack.hpp"
+#include "transport/internet/tcp_stream.hpp"
+#include "transport/internet/transport_stack.hpp"
 
 #include <asio/co_spawn.hpp>
 #include <asio/write.hpp>
@@ -19,7 +19,7 @@
 #include <vector>
 
 namespace {
-namespace net = acpp::net;
+namespace net = ::net;
 using namespace std::chrono_literals;
 constexpr size_t kStreamWindow = 4 * 1024 * 1024;
 constexpr size_t kConnectionWindow = 8 * 1024 * 1024;
@@ -86,23 +86,23 @@ struct WireFrame {
 
 // The sink deliberately retains request ownership without starting a reader.
 // Tests can consume, reject, half-close, or destroy exactly one logical stream.
-class HoldingSink final : public acpp::InboundTransportStreamHandler {
+class HoldingSink final : public ::InboundTransportStreamHandler {
 public:
     net::awaitable<void> OnInboundTransportStream(
-        std::unique_ptr<acpp::AsyncStream> stream,
-        acpp::InboundTransportMetadata) override {
+        std::unique_ptr<::AsyncStream> stream,
+        ::InboundTransportMetadata) override {
         if (reject) throw std::runtime_error("fixture rejects callback");
         streams.push_back(std::move(stream));
         co_return;
     }
     bool reject = false;
-    std::vector<std::unique_ptr<acpp::AsyncStream>> streams;
+    std::vector<std::unique_ptr<::AsyncStream>> streams;
 };
 
 class Fixture {
 public:
     explicit Fixture(std::string_view network = "http", uint32_t initial_window = kStreamWindow,
-                     acpp::XHttpMode mode = acpp::XHttpMode::StreamOne)
+                     ::XHttpMode mode = ::XHttpMode::StreamOne)
         : acceptor(io, {net::ip::address_v4::loopback(), 0}), peer(io), sink(std::make_shared<HoldingSink>()) {
         settings.network = network;
         settings.http.path = "/fixture";
@@ -112,11 +112,11 @@ public:
         settings.grpc.initial_window_size = initial_window;
         settings.xhttp.path = "/fixture";
         settings.xhttp.mode = mode;
-        settings = acpp::NormalizeStreamSettings(settings);
+        settings = ::NormalizeStreamSettings(settings);
         peer.connect(acceptor.local_endpoint());
-        acpp::tcp::socket accepted(io);
+        ::tcp::socket accepted(io);
         acceptor.accept(accepted);
-        raw = std::make_unique<acpp::TcpStream>(std::move(accepted));
+        raw = std::make_unique<::TcpStream>(std::move(accepted));
         net::co_spawn(io, Serve(), [this](std::exception_ptr error) {
             failure = error;
             returned = true;
@@ -131,12 +131,12 @@ public:
     ~Fixture() {
         for (auto& stream : sink->streams) if (stream) stream->CloseAbortive();
         sink->streams.clear();
-        acpp::IoErrorCode ignored;
+        ::IoErrorCode ignored;
         peer.close(ignored);
     }
 
     net::awaitable<void> Serve() {
-        const auto result = co_await acpp::BuildInboundTransport(io, std::move(raw), settings, nullptr, 0, sink);
+        const auto result = co_await ::BuildInboundTransport(io, std::move(raw), settings, nullptr, 0, sink);
         Require(result.has_value() && !*result, "HTTP/2 server build failed");
     }
 
@@ -144,7 +144,7 @@ public:
         peer.non_blocking(true);
         std::array<char, 32768> bytes{};
         for (;;) {
-            acpp::IoErrorCode error;
+            ::IoErrorCode error;
             const auto n = peer.read_some(net::buffer(bytes), error);
             if (error) break;
             wire.append(bytes.data(), n);
@@ -247,7 +247,7 @@ public:
     void Stop() {
         for (auto& stream : sink->streams) if (stream) stream->CloseAbortive();
         sink->streams.clear();
-        acpp::IoErrorCode ignored;
+        ::IoErrorCode ignored;
         peer.close(ignored);
         // Poll uses the socket; completion after close is driven separately.
         const auto deadline = std::chrono::steady_clock::now() + 5s;
@@ -260,11 +260,11 @@ public:
     }
 
     net::io_context io;
-    acpp::tcp::acceptor acceptor;
-    acpp::tcp::socket peer;
+    ::tcp::acceptor acceptor;
+    ::tcp::socket peer;
     std::shared_ptr<HoldingSink> sink;
-    acpp::StreamSettings settings;
-    std::unique_ptr<acpp::AsyncStream> raw;
+    ::StreamSettings settings;
+    std::unique_ptr<::AsyncStream> raw;
     std::vector<WireFrame> frames;
     std::string wire;
     size_t initial_credit = 0;
@@ -485,11 +485,11 @@ void GrpcFragmentedMessageAdvancesWindow(uint32_t window, size_t body_size) {
     f.Stop();
 }
 
-void XHttpSplitCredit(acpp::XHttpMode mode) {
+void XHttpSplitCredit(::XHttpMode mode) {
     Fixture f("xhttp", kStreamWindow, mode);
-    const std::string session = mode == acpp::XHttpMode::StreamUp ? "/fixture/receive-stream" : "/fixture/receive-packet";
+    const std::string session = mode == ::XHttpMode::StreamUp ? "/fixture/receive-stream" : "/fixture/receive-packet";
     f.Open(1, session, "GET", true);
-    const bool packet = mode == acpp::XHttpMode::PacketUp;
+    const bool packet = mode == ::XHttpMode::PacketUp;
     f.Open(3, packet ? session + "/0" : session);
     f.Send(Frame(0, packet ? 1 : 0, 3, "upload"));
     f.Barrier();
@@ -504,11 +504,11 @@ void GrpcAssemblySharesConnectionMemoryBudget() {
     Fixture f("grpc");
     size_t completed_reads = 0;
     size_t sent = 0;
-    auto hold_incomplete = [](acpp::AsyncStream* stream) -> net::awaitable<void> {
+    auto hold_incomplete = [](::AsyncStream* stream) -> net::awaitable<void> {
         std::array<char, 1> byte{};
         try {
             (void)co_await stream->AsyncRead(net::buffer(byte));
-        } catch (const acpp::IoSystemError&) {
+        } catch (const ::IoSystemError&) {
         }
     };
     const std::string chunk(16384, 'g');
@@ -582,8 +582,8 @@ TEST(Http2ReceiveCredit, Contract) {
         GrpcFragmentedMessageAdvancesWindow(65535, kStreamWindow - 5);
         GrpcFragmentedMessageAdvancesWindow(kStreamWindow, kStreamWindow - 5);
         GrpcAssemblySharesConnectionMemoryBudget();
-        XHttpSplitCredit(acpp::XHttpMode::StreamUp);
-        XHttpSplitCredit(acpp::XHttpMode::PacketUp);
+        XHttpSplitCredit(::XHttpMode::StreamUp);
+        XHttpSplitCredit(::XHttpMode::PacketUp);
         std::puts("HTTP/2 receive credit: consumption, isolation, padding, reset, gRPC, XHTTP");
         return;
     } catch (const std::exception& error) {

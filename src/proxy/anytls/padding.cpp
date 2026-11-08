@@ -7,7 +7,7 @@
 #include <random>
 #include <utility>
 
-namespace acpp::anytls {
+namespace anytls {
 namespace {
 
 template<class Integer>
@@ -172,4 +172,4 @@ const std::shared_ptr<const PaddingScheme>& DefaultPaddingScheme() {
     return scheme;
 }
 
-} // namespace acpp::anytls
+} // namespace anytls

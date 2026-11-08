@@ -2,7 +2,7 @@
 
 #include <openssl/evp.h>
 
-namespace acpp::anytls {
+namespace anytls {
 
 std::array<uint8_t, 32> PasswordHash(std::string_view password) noexcept {
     std::array<uint8_t, 32> out{};
@@ -12,4 +12,4 @@ std::array<uint8_t, 32> PasswordHash(std::string_view password) noexcept {
     return out;
 }
 
-}  // namespace acpp::anytls
+}  // namespace anytls

@@ -1,11 +1,11 @@
-#include "acppnode/app/proxyman/outbound/factory.hpp"
+#include "app/proxyman/outbound/factory.hpp"
 
 #include "registration.hpp"
 
 #include <map>
 #include <stdexcept>
 
-namespace acpp::proxyman::outbound {
+namespace proxyman::outbound {
 
 namespace {
 
@@ -62,10 +62,10 @@ std::optional<PreparedOutboundConfig> PrepareOutboundConfig(
     };
 }
 
-std::unique_ptr<::acpp::Outbound> NewProxy(
+std::unique_ptr<::Outbound> NewProxy(
     const PreparedOutboundConfig& config,
-    ::acpp::net::io_context& io_context,
-    ::acpp::AwaitableTaskGroup& tasks) {
+    ::net::io_context& io_context,
+    ::AwaitableTaskGroup& tasks) {
     if (!config.create) {
         throw std::logic_error(
             "prepared outbound '" + config.tag + "' has no creator");
@@ -82,4 +82,4 @@ bool HasProxy(std::string_view protocol) {
     return Proxies().contains(protocol);
 }
 
-}  // namespace acpp::proxyman::outbound
+}  // namespace proxyman::outbound

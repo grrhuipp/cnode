@@ -1,10 +1,9 @@
-#include "acppnode/infra/json_field.hpp"
+#include "infra/json_field.hpp"
 
 #include <format>
 #include <stdexcept>
 #include <utility>
 
-namespace acpp {
 
 std::optional<uint64_t> JsonUnsignedInteger(const json::value& value) noexcept {
     if (value.is_uint64()) {
@@ -131,4 +130,3 @@ JsonPortResult ReadJsonPort(
     };
 }
 
-}  // namespace acpp

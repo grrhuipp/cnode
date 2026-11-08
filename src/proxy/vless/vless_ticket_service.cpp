@@ -1,7 +1,7 @@
 #include "vless_ticket_service.hpp"
 
-#include "acppnode/app/session_group_executor.hpp"
-#include "acppnode/infra/log.hpp"
+#include "app/session_group_executor.hpp"
+#include "infra/log.hpp"
 
 #include <asio/co_spawn.hpp>
 #include <asio/steady_timer.hpp>
@@ -11,7 +11,7 @@
 #include <string>
 #include <unordered_map>
 
-namespace acpp::vless {
+namespace vless {
 namespace {
 using Clock = std::chrono::steady_clock;
 using Ticket = std::array<uint8_t, kVlessEncryptionTicketSize>;
@@ -336,4 +336,4 @@ net::awaitable<std::optional<Resumed>> LookupVlessTicket(
     co_return co_await coordinator->Post(ResolveAndLookup(coordinator,
         std::move(config), std::string(tag), ticket, std::move(nfs), receiver->OwnerId()));
 }
-} // namespace acpp::vless
+} // namespace vless

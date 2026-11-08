@@ -5,18 +5,19 @@
 #include "../credentials.hpp"
 #include "../anytls_codec.hpp"
 #include "../padding.hpp"
-#include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
-#include "acppnode/app/proxyman/inbound/user_store.hpp"
-#include "acppnode/app/stats.hpp"
-#include "acppnode/app/session_group_executor.hpp"
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/buffer_util.hpp"
-#include "acppnode/common/memory_stats.hpp"
-#include "acppnode/common/session.hpp"
-#include "acppnode/features/routing/dispatcher.hpp"
-#include "acppnode/infra/config_types.hpp"
-#include "acppnode/transport/async_stream.hpp"
-#include "acppnode/transport/link_error.hpp"
+#include "app/proxyman/inbound/receiver_settings.hpp"
+#include "app/proxyman/inbound/user_store.hpp"
+#include "app/stats.hpp"
+#include "app/session_group_executor.hpp"
+#include "common/allocator.hpp"
+#include "common/buffer_util.hpp"
+#include "common/memory_stats.hpp"
+#include "common/mux/mux_codec.hpp"
+#include "common/session.hpp"
+#include "features/routing/dispatcher.hpp"
+#include "infra/config_types.hpp"
+#include "transport/async_stream.hpp"
+#include "transport/link_error.hpp"
 
 #include <asio/as_tuple.hpp>
 #include <asio/bind_cancellation_slot.hpp>
@@ -31,7 +32,6 @@
 #include <vector>
 
 namespace {
-using namespace acpp;
 using namespace std::chrono_literals;
 
 size_t BufferCount() noexcept { return memory::detail::test_buffers_live; }
@@ -908,6 +908,180 @@ void TestPeerSettings() {
           "advertised settings must identify this implementation and its supported version");
     std::cout << "peer-settings cases=" << valid.size() + invalid.size() + 2 << " passed=1\n";
 }
+class MuxUdpDispatcher final : public routing::Dispatcher {
+public:
+    explicit MuxUdpDispatcher(net::io_context& io) : gate(io) {
+        gate.expires_at(net::steady_timer::time_point::max());
+    }
+    struct Packet {
+        TargetAddress target;
+        std::vector<uint8_t> bytes;
+    };
+    net::steady_timer gate;
+    bool pause = false;
+    int active = 0;
+    int finished = 0;
+    bool input_eof = false;
+    std::exception_ptr failure;
+    std::vector<Packet> received;
+
+    net::awaitable<RelayResult> Dispatch(net::io_context&,
+        const routing::DispatchPolicy&, std::unique_ptr<AsyncStream>, transport::Link link,
+        InitialPayload, session::Context& ctx, StatsShard&, const TimeoutsConfig&) override {
+        struct Scope {
+            MuxUdpDispatcher& owner;
+            explicit Scope(MuxUdpDispatcher& value) : owner(value) { ++owner.active; }
+            ~Scope() { --owner.active; ++owner.finished; }
+        } scope(*this);
+        try {
+            Check(ctx.content.network == Network::UDP, "Mux UDP must use the ordinary UDP dispatcher");
+            if (pause) (void)co_await gate.async_wait(net::as_tuple(net::use_awaitable));
+            for (;;) {
+                auto packet = co_await link.reader->ReadMultiBuffer();
+                if (packet.empty()) {
+                    input_eof = true;
+                    break;
+                }
+                const auto datagram = buf::InspectUdpDatagram(packet);
+                Check(datagram.Valid(), "Mux UDP input must retain a complete message and target");
+                Packet observation{*datagram.target, {}};
+                for (const auto* buffer : packet) {
+                    const auto bytes = buffer->Bytes();
+                    observation.bytes.insert(observation.bytes.end(), bytes.begin(), bytes.end());
+                }
+                received.push_back(std::move(observation));
+                co_await link.writer->WriteMultiBuffer(std::move(packet));
+            }
+        } catch (...) {
+            failure = std::current_exception();
+            throw;
+        }
+        co_return RelayResult{};
+    }
+};
+
+void RunMuxUdpCase(int mode) {
+    net::io_context io;
+    DomainFixture domain(io);
+    memory::ScopedAllocationDomain allocation(domain.Memory());
+    StreamState stream(io);
+    MuxUdpDispatcher dispatcher(io);
+    dispatcher.pause = mode >= 2;
+    StatsShard stats;
+    proxyman::inbound::ReceiverSettings receiver{
+        .inbound_tag = {}, .inbound_tags = {}, .protocol = {}, .stream_settings = {},
+        .dispatch_policy = {{}, routing::ForceOutbound{"direct"}}};
+    session::Context context;
+    context.inbound.tag = "mux-udp";
+    TimeoutsConfig timeouts;
+    const TargetAddress target("127.0.0.1", 53);
+    const TargetAddress changed("127.0.0.2", 5353);
+    std::array<uint8_t, mux::kMaxFrameHeaderBytes> header{};
+    auto append = [&](size_t size) {
+        Check(size != 0, "Mux UDP fixture header encoding failed");
+        stream.input.insert(stream.input.end(), header.begin(), header.begin() + size);
+    };
+    const size_t open_size = mux::EncodeNewHeaderTo(
+        header, 1, mux::NetworkType::UDP, target, 0, mode == 1);
+    append(open_size);
+    std::vector<MuxUdpDispatcher::Packet> expected_packets;
+    if (mode == 1) expected_packets.push_back({target, {}});
+    bool returned = false;
+    std::exception_ptr failure;
+    net::cancellation_signal cancellation;
+    Check(BufferCount() == 0, "Mux UDP fixture must start without live buffers");
+    net::co_spawn(domain.Executor(),
+        RunMux(std::make_unique<Stream>(stream), dispatcher, receiver, io, context, stats, timeouts),
+        net::bind_cancellation_slot(cancellation.slot(),
+            [&](std::exception_ptr error, RelayResult) { failure = error; returned = true; }));
+    io.poll();
+    Check(dispatcher.active == 1 && dispatcher.received.size() == (mode == 1 ? 1u : 0u),
+          "Mux NEW without Data must not manufacture an empty datagram");
+    // Neither a no-Data KEEP nor a KEEPALIVE with Data is a UDP packet.
+    stream.input.insert(stream.input.end(), {0, 4, 0, 1, 2, 0, 0, 4, 0, 1, 4, 1, 0, 0});
+    const size_t count = mode >= 2 ? 1500 : 1;
+    for (size_t i = 0; i < count; ++i) {
+        append(mux::EncodeKeepUDPHeaderTo(header, 1, changed, 0));
+        expected_packets.push_back({changed, {}});
+    }
+    if (mode < 2) {
+        append(mux::EncodeKeepDataHeaderTo(header, 1, 1));
+        stream.input.push_back(0x42);
+        append(mux::EncodeKeepDataHeaderTo(header, 1, 0));
+        expected_packets.push_back({target, {0x42}});
+        expected_packets.push_back({target, {}});
+    }
+    const bool end_has_data = mode != 2 && mode != 3;
+    const bool end_empty = mode == 1 || mode == 4;
+    if (end_has_data) {
+        stream.input.insert(stream.input.end(), {0, 4, 0, 1, 3, 1, 0, uint8_t(end_empty ? 0 : 1)});
+        if (!end_empty) stream.input.push_back(0xff);
+        expected_packets.push_back({target, end_empty ? std::vector<uint8_t>{} : std::vector<uint8_t>{0xff}});
+    } else {
+        append(mux::EncodeEndTo(header, 1));
+    }
+    stream.wake.cancel();
+    io.poll();
+    if (mode >= 2) {
+        Check(dispatcher.received.empty() && dispatcher.active == 1,
+              "paused Mux dispatcher must retain queued empty datagrams");
+        Check(BufferCount() <= 4 * 1024 * 1024 / buf::Buffer::kSize + 32,
+              "empty Mux UDP queue must charge a Buffer capacity floor");
+        if (mode == 3) {
+            cancellation.emit(net::cancellation_type::terminal);
+        } else {
+            dispatcher.gate.cancel();
+        }
+        io.run_for(100ms);
+    }
+    if (mode != 3) {
+        if (dispatcher.failure) std::rethrow_exception(dispatcher.failure);
+        const size_t expected = expected_packets.size();
+        Check(dispatcher.received.size() == expected && dispatcher.finished == 1 &&
+              dispatcher.input_eof,
+              "Mux must deliver every datagram, including END Data, before input EOF");
+        for (size_t i = 0; i < expected; ++i) {
+            const auto& packet = dispatcher.received[i];
+            Check(packet.target.SameEndpoint(expected_packets[i].target) &&
+                  packet.bytes == expected_packets[i].bytes,
+                  "Mux UDP target, final END payload or zero/nonzero boundary changed");
+        }
+        buf::MultiBuffer output;
+        Check(buf::AppendSpanToMultiBuffer(stream.output, output), "Mux reply fixture allocation failed");
+        size_t replies = 0;
+        while (!output.empty()) {
+            const auto frame = mux::DecodeFrame(output);
+            Check(frame && frame->frame_size != 0, "Mux UDP reply must have a real wire header");
+            if (frame->status == mux::SessionStatus::KEEP) {
+                Check(frame->has_data && frame->has_target &&
+                      replies < dispatcher.received.size(), "Mux UDP reply lost Data or endpoint");
+                const auto& packet = dispatcher.received[replies++];
+                Check(frame->target.SameEndpoint(packet.target) && frame->data_len == packet.bytes.size(),
+                      "Mux UDP zero reply was dropped or misframed");
+                output.DropPrefixBytes(frame->data_offset);
+                std::vector<uint8_t> bytes(frame->data_len);
+                Check(output.CopyPrefixTo(bytes) == bytes.size() && bytes == packet.bytes,
+                      "Mux UDP reply changed or truncated payload bytes");
+                output.DropPrefixBytes(frame->data_len);
+            } else {
+                output.DropPrefixBytes(frame->frame_size);
+            }
+        }
+        Check(replies == expected, "Mux UDP must encode every empty reply exactly once");
+        stream.FeedInvalidFrame(true);
+        io.run_for(100ms);
+    }
+    if (mode == 3) {
+        Check(dispatcher.received.empty() && !dispatcher.input_eof,
+              "cancelling queued Mux UDP input must not report normal EOF or deliver discarded packets");
+    }
+    Check(returned && !failure && dispatcher.active == 0 &&
+          stream.pending_reads == 0 && stream.pending_writes == 0 && stream.destroyed,
+          "Mux UDP cancellation and close must join all logical and physical work");
+    Check(BufferCount() == 0, "Mux UDP must release every queued and in-flight Buffer");
+    domain.Shutdown();
+}
+
 }  // namespace
 
 TEST(SubstreamInboundLifecycle, Contract) {
@@ -933,5 +1107,12 @@ TEST(SubstreamInboundLifecycle, Contract) {
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         FAIL() << error.what();
+    }
+}
+
+TEST(SubstreamInboundLifecycle, MuxUdpEmptyDatagramsAndControlFrames) {
+    for (int mode = 0; mode < 6; ++mode) {
+        SCOPED_TRACE(mode);
+        RunMuxUdpCase(mode);
     }
 }

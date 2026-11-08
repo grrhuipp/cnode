@@ -1,5 +1,5 @@
 #include "autosign_context.hpp"
-#include "acppnode/infra/log.hpp"
+#include "infra/log.hpp"
 
 #include <openssl/asn1.h>
 #include <openssl/ssl.h>
@@ -16,7 +16,6 @@
 #include <sys/timerfd.h>
 #include <unistd.h>
 
-namespace acpp {
 
 class AutoSignRenewalScheduler {
 public:
@@ -194,4 +193,3 @@ std::shared_ptr<SSL_CTX> AutoSignContextRenewal::Acquire(Clock::time_point now) 
     return snapshot->context;
 }
 
-} // namespace acpp

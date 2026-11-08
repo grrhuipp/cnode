@@ -1,8 +1,8 @@
 #pragma once
 
-#include "acppnode/common/buf/multi_buffer.hpp"
-#include "acppnode/common/unsafe.hpp"
-#include "acppnode/transport/internet/transport_stack.hpp"
+#include "common/buf/multi_buffer.hpp"
+#include "common/unsafe.hpp"
+#include "transport/internet/transport_stack.hpp"
 
 #include <tl/expected.hpp>
 
@@ -14,7 +14,7 @@
 #include <string_view>
 #include <variant>
 
-namespace acpp::transport::internet {
+namespace transport::internet {
 
 // HTTP/1 message head read into one pooled Buffer. Bytes past the blank line
 // are read-ahead that the caller must hand to the next reader in order.
@@ -141,4 +141,4 @@ using Http1ReadFraming =
     uint64_t conn_id,
     InboundTransportMetadata* transport_metadata);
 
-}  // namespace acpp::transport::internet
+}  // namespace transport::internet

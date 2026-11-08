@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "acppnode/infra/json_field.hpp"
+#include "infra/json_field.hpp"
 
 #include <cstdint>
 #include <cstdlib>
@@ -22,13 +22,13 @@ void Check(bool condition, std::string_view message) {
     if (!condition) Fail(message);
 }
 
-acpp::json::object ParseObject(std::string_view body) {
-    return acpp::json::parse(body).as_object();
+::json::object ParseObject(std::string_view body) {
+    return ::json::parse(body).as_object();
 }
 
 TEST(JsonField, Bool) {
     const auto parse = [](std::string_view body) {
-        return acpp::ParseJsonBool(ParseObject(body), "camelFlag");
+        return ::ParseJsonBool(ParseObject(body), "camelFlag");
     };
 
     auto absent = parse(R"({})");
@@ -50,10 +50,10 @@ TEST(JsonField, Bool) {
 
 TEST(JsonField, String) {
     const auto parse = [](std::string_view body) {
-        return acpp::ParseJsonString(ParseObject(body), "camelText");
+        return ::ParseJsonString(ParseObject(body), "camelText");
     };
     const auto parse_array = [](std::string_view body) {
-        return acpp::ParseJsonStringArray(ParseObject(body), "camelList");
+        return ::ParseJsonStringArray(ParseObject(body), "camelList");
     };
 
     auto absent = parse(R"({})");
@@ -91,7 +91,7 @@ TEST(JsonField, String) {
 TEST(JsonField, Unsigned) {
     const auto parse = [](std::string_view body,
                           uint64_t maximum = std::numeric_limits<uint64_t>::max()) {
-        return acpp::ParseJsonUint64(ParseObject(body), "camelValue", maximum);
+        return ::ParseJsonUint64(ParseObject(body), "camelValue", maximum);
     };
 
     auto absent = parse(R"({})");
@@ -113,9 +113,9 @@ TEST(JsonField, Unsigned) {
 }
 
 TEST(JsonField, Port) {
-    using acpp::JsonPortError;
-    using acpp::ReadJsonPort;
-    using acpp::json::object;
+    using ::JsonPortError;
+    using ::ReadJsonPort;
+    using ::json::object;
 
     auto result = ReadJsonPort(object{}, "port");
     Check(result.error == JsonPortError::Missing && result.value == 0,
@@ -157,18 +157,18 @@ bool Throws(Read read) {
 TEST(JsonField, ThrowingFallbacks) {
     const auto source = ParseObject(R"({"text":"set","flag":false,"bad":1})");
 
-    Check(acpp::JsonStringOr(source, "text", "fallback") == "set",
+    Check(::JsonStringOr(source, "text", "fallback") == "set",
           "present string was replaced by fallback");
-    Check(acpp::JsonStringOr(source, "missing", "fallback") == "fallback",
+    Check(::JsonStringOr(source, "missing", "fallback") == "fallback",
           "absent string did not use fallback");
-    Check(Throws([&] { return acpp::JsonStringOr(source, "bad", "fallback"); }),
+    Check(Throws([&] { return ::JsonStringOr(source, "bad", "fallback"); }),
           "wrongly typed string fell back instead of failing");
 
-    Check(!acpp::JsonBoolOr(source, "flag", true),
+    Check(!::JsonBoolOr(source, "flag", true),
           "present boolean was replaced by fallback");
-    Check(acpp::JsonBoolOr(source, "missing", true),
+    Check(::JsonBoolOr(source, "missing", true),
           "absent boolean did not use fallback");
-    Check(Throws([&] { return acpp::JsonBoolOr(source, "bad", true); }),
+    Check(Throws([&] { return ::JsonBoolOr(source, "bad", true); }),
           "wrongly typed boolean fell back instead of failing");
 }
 

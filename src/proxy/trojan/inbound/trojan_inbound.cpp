@@ -1,23 +1,23 @@
 #include "trojan_inbound.hpp"
 #include "../../inbound_admission.hpp"
-#include "acppnode/transport/async_stream.hpp"
+#include "transport/async_stream.hpp"
 #include "../trojan_codec.hpp"
 #include "../credentials.hpp"
 #include "../udp_framing.hpp"
-#include "acppnode/app/rate_limiter.hpp"
-#include "acppnode/app/stats.hpp"
-#include "acppnode/features/routing/dispatcher.hpp"
-#include "acppnode/app/proxyman/inbound/factory.hpp"
-#include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
-#include "acppnode/app/proxyman/inbound/user_store.hpp"
-#include "acppnode/infra/config_types.hpp"
-#include "acppnode/infra/log.hpp"
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/initial_payload.hpp"
-#include "acppnode/common/session.hpp"
-#include "acppnode/common/buf/multi_buffer.hpp"
-#include "acppnode/transport/link.hpp"
-#include "acppnode/app/udp_types.hpp"
+#include "app/rate_limiter.hpp"
+#include "app/stats.hpp"
+#include "features/routing/dispatcher.hpp"
+#include "app/proxyman/inbound/factory.hpp"
+#include "app/proxyman/inbound/receiver_settings.hpp"
+#include "app/proxyman/inbound/user_store.hpp"
+#include "infra/config_types.hpp"
+#include "infra/log.hpp"
+#include "common/allocator.hpp"
+#include "common/initial_payload.hpp"
+#include "common/session.hpp"
+#include "common/buf/multi_buffer.hpp"
+#include "transport/link.hpp"
+#include "app/udp_types.hpp"
 #include <array>
 #include <openssl/crypto.h>
 #include <span>
@@ -25,7 +25,6 @@
 #include <optional>
 #include <utility>
 
-namespace acpp {
 
 namespace {
 
@@ -74,11 +73,11 @@ private:
 };
 
 constexpr size_t kMaxTrojanHandshakeBytes =
-    ::acpp::trojan::kRequestPrefixSize + kMaxEncodedAddressSize + 2;
+    ::trojan::kRequestPrefixSize + kMaxEncodedAddressSize + 2;
 
 struct TrojanHandshakeResult {
     std::shared_ptr<const proxyman::inbound::UserStore::TrojanCredential> user;
-    ::acpp::trojan::TrojanCommand command = ::acpp::trojan::TrojanCommand::CONNECT;
+    ::trojan::TrojanCommand command = ::trojan::TrojanCommand::CONNECT;
     TargetAddress target;
     std::optional<ForwardedMetadata> forwarded;
 };
@@ -91,11 +90,11 @@ ParseTrojanRequest(AsyncStream& stream,
                    std::string_view client_ip) {
     std::array<uint8_t, kMaxTrojanHandshakeBytes> handshake_buf{};
     size_t total_read = 0;
-    size_t required = ::acpp::trojan::kRequestPrefixSize;
-    ::acpp::trojan::RequestDecodeResult decoded;
+    size_t required = ::trojan::kRequestPrefixSize;
+    ::trojan::RequestDecodeResult decoded;
     struct CleanseHandshake {
         std::array<uint8_t, kMaxTrojanHandshakeBytes>& buf;
-        ::acpp::trojan::PasswordHash& hash;
+        ::trojan::PasswordHash& hash;
         ~CleanseHandshake() noexcept {
             OPENSSL_cleanse(buf.data(), buf.size());
             OPENSSL_cleanse(hash.data(), hash.size());
@@ -121,18 +120,18 @@ ParseTrojanRequest(AsyncStream& stream,
             }
             total_read += n;
         }
-        decoded = ::acpp::trojan::DecodeRequest(
+        decoded = ::trojan::DecodeRequest(
             std::span<const uint8_t>(handshake_buf.data(), total_read));
-        if (decoded.status == ::acpp::trojan::RequestDecodeStatus::Complete) {
+        if (decoded.status == ::trojan::RequestDecodeStatus::Complete) {
             break;
         }
-        if (decoded.status == ::acpp::trojan::RequestDecodeStatus::InvalidAddress) {
+        if (decoded.status == ::trojan::RequestDecodeStatus::InvalidAddress) {
             LOG_CONN_WARN(ctx, "request rejected from {}:{} > invalid target address",
                           client_ip, ctx.inbound.source_port);
             LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "invalid target address"));
             co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
         }
-        if (decoded.status == ::acpp::trojan::RequestDecodeStatus::InvalidHeader) {
+        if (decoded.status == ::trojan::RequestDecodeStatus::InvalidHeader) {
             LOG_CONN_WARN(ctx, "invalid request header from {}:{}", client_ip, ctx.inbound.source_port);
             LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "invalid request header"));
             co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
@@ -165,7 +164,7 @@ ParseTrojanRequest(AsyncStream& stream,
 // ============================================================================
 
 proxy::trojan::inbound::Handler::Handler(
-    ::acpp::UserOnlineTracker& validator,
+    ::UserOnlineTracker& validator,
     StatsShard& stats,
     ConnectionLimiter* limiter)
     : validator_(validator)
@@ -199,7 +198,7 @@ proxy::trojan::inbound::Handler::Process(
         if (!handshake) {
             co_return proxy::RejectInbound(*stats_, stream.get(), handshake.error());
         }
-        net = (handshake->command == ::acpp::trojan::TrojanCommand::UDP_ASSOCIATE)
+        net = (handshake->command == ::trojan::TrojanCommand::UDP_ASSOCIATE)
               ? Network::UDP : Network::TCP;
         proxy::BindAuthenticatedInbound(
             ctx, handshake->user->profile,
@@ -243,41 +242,40 @@ proxy::trojan::inbound::Handler::Process(
         timeouts);
 }
 
-}  // namespace acpp
 
 // ============================================================================
 // 自注册（静态初始化）
 // ============================================================================
 namespace {
 const bool kTrojanInboundRegistered = [] {
-    acpp::proxyman::inbound::ProxyRegistration reg;
-    reg.user_protocol = acpp::proxyman::inbound::UserProtocol::Trojan;
+    ::proxyman::inbound::ProxyRegistration reg;
+    reg.user_protocol = ::proxyman::inbound::UserProtocol::Trojan;
 
     reg.create_runtime = []() -> std::unique_ptr<
-        acpp::proxyman::inbound::ProtocolRuntime> {
-        return std::make_unique<acpp::proxy::UserOnlineProtocolRuntime>();
+        ::proxyman::inbound::ProtocolRuntime> {
+        return std::make_unique<::proxy::UserOnlineProtocolRuntime>();
     };
 
     reg.create_tcp_handler =
-        [](acpp::proxyman::inbound::ProtocolRuntime& runtime,
-           acpp::StatsShard& stats,
-           acpp::ConnectionLimiter* limiter,
-           const acpp::proxyman::inbound::BuildRequest&) -> std::unique_ptr<acpp::Inbound> {
-            auto* trojan_runtime = dynamic_cast<acpp::proxy::UserOnlineProtocolRuntime*>(&runtime);
+        [](::proxyman::inbound::ProtocolRuntime& runtime,
+           ::StatsShard& stats,
+           ::ConnectionLimiter* limiter,
+           const ::proxyman::inbound::BuildRequest&) -> std::unique_ptr<::Inbound> {
+            auto* trojan_runtime = dynamic_cast<::proxy::UserOnlineProtocolRuntime*>(&runtime);
             if (!trojan_runtime) {
                 return nullptr;
             }
-            return std::make_unique<acpp::proxy::trojan::inbound::Handler>(
+            return std::make_unique<::proxy::trojan::inbound::Handler>(
                 trojan_runtime->validator,
                 stats,
                 limiter);
         };
 
     reg.build_users =
-        [](const acpp::proxyman::inbound::BuildRequest& req,
-           std::span<const acpp::InboundUserSpec> specs)
-            -> std::optional<acpp::proxyman::inbound::UserSet> {
-            std::vector<acpp::proxyman::inbound::PreparedTrojanUser> users;
+        [](const ::proxyman::inbound::BuildRequest& req,
+           std::span<const ::InboundUserSpec> specs)
+            -> std::optional<::proxyman::inbound::UserSet> {
+            std::vector<::proxyman::inbound::PreparedTrojanUser> users;
             users.reserve(specs.size());
 
             for (const auto& spec : specs) {
@@ -285,8 +283,8 @@ const bool kTrojanInboundRegistered = [] {
                     LOG_WARN("Trojan inbound '{}': user password is empty", req.tag);
                     return std::nullopt;
                 }
-                acpp::proxyman::inbound::PreparedTrojanUser info;
-                const auto hash = acpp::trojan::HashPassword(spec.credential);
+                ::proxyman::inbound::PreparedTrojanUser info;
+                const auto hash = ::trojan::HashPassword(spec.credential);
                 info.password_hash.assign(hash.data(), hash.size());
                 info.profile.email = spec.email;
                 info.profile.user_id = spec.user_id;
@@ -295,11 +293,11 @@ const bool kTrojanInboundRegistered = [] {
                 users.push_back(std::move(info));
             }
 
-            return acpp::proxyman::inbound::UserSet{std::move(users)};
+            return ::proxyman::inbound::UserSet{std::move(users)};
         };
 
-    acpp::proxyman::inbound::RegisterProxy(
-        acpp::constants::protocol::kTrojan, std::move(reg));
+    ::proxyman::inbound::RegisterProxy(
+        ::constants::protocol::kTrojan, std::move(reg));
     return true;
 }();
 }  // namespace

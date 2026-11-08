@@ -1,15 +1,15 @@
 #pragma once
 
-#include "acppnode/app/dns/dns.hpp"
-#include "acppnode/app/dns/stats.hpp"
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/clock.hpp"
+#include "app/dns/dns.hpp"
+#include "app/dns/stats.hpp"
+#include "common/allocator.hpp"
+#include "common/clock.hpp"
 
 #include <optional>
 #include <string_view>
 #include <variant>
 
-namespace acpp::app::dns {
+namespace app::dns {
 
 
 // One bounded cache owned by the main/control DNS executor.
@@ -57,4 +57,4 @@ private:
     uint64_t misses_ = 0;
 };
 
-}  // namespace acpp::app::dns
+}  // namespace app::dns

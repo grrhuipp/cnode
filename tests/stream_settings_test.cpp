@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "acppnode/transport/internet/stream_settings.hpp"
+#include "transport/internet/stream_settings.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -33,7 +33,6 @@ void operator delete(void* memory, std::size_t) noexcept { std::free(memory); }
 void operator delete[](void* memory, std::size_t) noexcept { std::free(memory); }
 
 namespace {
-using namespace acpp;
 
 void Require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);

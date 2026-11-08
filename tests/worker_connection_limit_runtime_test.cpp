@@ -1,17 +1,17 @@
 #include <gtest/gtest.h>
 
-#include "acppnode/app/dns/dns_worker.hpp"
-#include "acppnode/app/port_binding.hpp"
-#include "acppnode/app/proxyman/inbound/factory.hpp"
-#include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
-#include "acppnode/app/rate_limiter.hpp"
-#include "acppnode/app/stats.hpp"
-#include "acppnode/app/worker.hpp"
-#include "acppnode/app/worker_runtime_config.hpp"
-#include "acppnode/app/worker_stats.hpp"
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/proxy/inbound.hpp"
-#include "acppnode/transport/async_stream.hpp"
+#include "app/dns/dns_worker.hpp"
+#include "app/port_binding.hpp"
+#include "app/proxyman/inbound/factory.hpp"
+#include "app/proxyman/inbound/receiver_settings.hpp"
+#include "app/rate_limiter.hpp"
+#include "app/stats.hpp"
+#include "app/worker.hpp"
+#include "app/worker_runtime_config.hpp"
+#include "app/worker_stats.hpp"
+#include "common/allocator.hpp"
+#include "proxy/inbound.hpp"
+#include "transport/async_stream.hpp"
 
 #include <asio/co_spawn.hpp>
 #include <asio/steady_timer.hpp>
@@ -28,7 +28,6 @@
 #include <thread>
 
 namespace {
-using namespace acpp;
 using namespace std::chrono_literals;
 constexpr std::string_view kProtocol = "worker-budget-fixture";
 

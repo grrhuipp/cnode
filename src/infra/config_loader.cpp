@@ -1,8 +1,8 @@
-#include "acppnode/infra/config.hpp"
-#include "acppnode/infra/log.hpp"
+#include "infra/config.hpp"
+#include "infra/log.hpp"
 
-#include "acppnode/infra/json.hpp"
-#include "acppnode/infra/outbound_source_config.hpp"
+#include "infra/json.hpp"
+#include "infra/outbound_source_config.hpp"
 #include "config_semantics.hpp"
 
 #include <array>
@@ -16,7 +16,6 @@
 #include <utility>
 #include <variant>
 #include <vector>
-namespace acpp {
 
 namespace {
 
@@ -244,4 +243,3 @@ std::optional<Config> LoadConfig(const std::filesystem::path& path) {
     return cfg;
 }
 
-}  // namespace acpp

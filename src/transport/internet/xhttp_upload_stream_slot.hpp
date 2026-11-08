@@ -1,12 +1,12 @@
 #pragma once
 
-#include "acppnode/transport/async_stream.hpp"
-#include "acppnode/common/allocator.hpp"
+#include "transport/async_stream.hpp"
+#include "common/allocator.hpp"
 
 #include <memory>
 #include <utility>
 
-namespace acpp::detail {
+namespace detail {
 
 // Worker-local single-upload owner. Readers take a shared snapshot across
 // co_await so Close can cancel and detach the stream without destroying an
@@ -58,4 +58,4 @@ private:
 
 using XHttpUploadStreamSlot = BasicXHttpUploadStreamSlot<AsyncStream>;
 
-}  // namespace acpp::detail
+}  // namespace detail

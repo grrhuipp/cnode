@@ -1,8 +1,8 @@
 #include "vless_encryption_runtime.hpp"
 #include "vless_ticket_service.hpp"
 
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/container_util.hpp"
+#include "common/allocator.hpp"
+#include "common/container_util.hpp"
 
 #include <blake3.h>
 #include <openssl/rand.h>
@@ -12,7 +12,7 @@
 #include <chrono>
 #include <cstdlib>
 
-namespace acpp::vless {
+namespace vless {
 namespace {
 
 static_assert(kVlessEncryptionServerRandomSize == kVlessEncryptionCtrIvSize,
@@ -674,4 +674,4 @@ VlessEncryptedIo::VlessEncryptedIo(VlessBufferedReader& raw_reader,
              std::move(runtime.write_xor))
     , plain_reader(reader) {}
 
-}  // namespace acpp::vless
+}  // namespace vless

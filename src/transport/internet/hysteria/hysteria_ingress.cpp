@@ -6,21 +6,21 @@
 #include "quic_memory.hpp"
 #include "quic_stream.hpp"
 
-#include "acppnode/app/proxyman/inbound/handler.hpp"
-#include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
-#include "acppnode/app/proxyman/inbound/user_store.hpp"
-#include "acppnode/app/rate_limiter.hpp"
-#include "acppnode/app/stats.hpp"
-#include "acppnode/common/buf/multi_buffer.hpp"
-#include "acppnode/common/ip_utils.hpp"
-#include "acppnode/common/container_util.hpp"
-#include "acppnode/common/session.hpp"
-#include "acppnode/common/sharded_user_stats.hpp"
-#include "acppnode/common/string_hash.hpp"
-#include "acppnode/infra/config_types.hpp"
-#include "acppnode/infra/log.hpp"
-#include "acppnode/transport/internet/transport_stack.hpp"
-#include "acppnode/transport/internet/timeout_scheduler.hpp"
+#include "app/proxyman/inbound/handler.hpp"
+#include "app/proxyman/inbound/receiver_settings.hpp"
+#include "app/proxyman/inbound/user_store.hpp"
+#include "app/rate_limiter.hpp"
+#include "app/stats.hpp"
+#include "common/buf/multi_buffer.hpp"
+#include "common/ip_utils.hpp"
+#include "common/container_util.hpp"
+#include "common/session.hpp"
+#include "common/sharded_user_stats.hpp"
+#include "common/string_hash.hpp"
+#include "infra/config_types.hpp"
+#include "infra/log.hpp"
+#include "transport/internet/transport_stack.hpp"
+#include "transport/internet/timeout_scheduler.hpp"
 #include "../tls_client_context.hpp"
 #include "../../../proxy/inbound_admission.hpp"
 #include "../../../common/awaitable_task_group.hpp"
@@ -47,7 +47,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace acpp::transport::internet::hysteria {
+namespace transport::internet::hysteria {
 
 struct SslContextDeleter {
     void operator()(SSL_CTX* context) const noexcept { SSL_CTX_free(context); }
@@ -63,8 +63,13 @@ constexpr size_t kMaxConnections = 65536;
 constexpr size_t kMaxStreamHeaderBytes = 8192;
 constexpr size_t kMaxUdpSessions = 256;
 constexpr size_t kMaxPendingFragments = 64;
+// 丢片无法补齐原包，必须限制孤片在长连接中的滞留，而非等待连接关闭。
+constexpr ngtcp2_duration kUdpFragmentIdleTimeout = 5 * NGTCP2_SECONDS;
+constexpr ngtcp2_duration kUdpFragmentLifetime = 15 * NGTCP2_SECONDS;
 constexpr size_t kMaxQueuedDatagrams = 1024;
-constexpr size_t kUdpFragmentPayload = 1100;
+// 完整 HY 报文预算为 1100B，给最小 1200B QUIC 路径保留封包开销。
+constexpr size_t kMaxUdpMessageSize = 1100;
+constexpr size_t kUdpDatagramFrameOverhead = 3; // type + 至多两字节 LEN。
 constexpr size_t kMaxStreamOutputBytes = 512 * 1024;
 constexpr uint64_t kMaxConnectionData = 16 * 1024 * 1024;
 constexpr uint64_t kMaxStreamData = 4 * 1024 * 1024;
@@ -74,6 +79,12 @@ constexpr uint64_t kMaxStreams = 1024;
     return static_cast<ngtcp2_tstamp>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+[[nodiscard]] ngtcp2_tstamp UdpFragmentDeadline(
+    ngtcp2_tstamp now, ngtcp2_duration delay) noexcept {
+    const auto maximum = std::numeric_limits<ngtcp2_tstamp>::max();
+    return maximum - now < delay ? maximum : now + delay;
 }
 
 int SelectAlpn(SSL*, const uint8_t** out, uint8_t* outlen,
@@ -709,8 +720,14 @@ bool Connection::Feed(SocketState& socket, const udp::endpoint& remote,
 
 void Connection::OnExpiry() {
     if (!core_ || closed_) return;
+    const auto now = Timestamp();
+    if (fragment_expiry_ <= now) ExpireUdpFragments(now);
+    if (ngtcp2_conn_get_expiry(core_->quic) > now) {
+        PublishExpiry();
+        return;
+    }
     in_ngtcp2_callback_ = true;
-    const int result = ngtcp2_conn_handle_expiry(core_->quic, Timestamp());
+    const int result = ngtcp2_conn_handle_expiry(core_->quic, now);
     in_ngtcp2_callback_ = false;
     if (result != 0) {
         Close();
@@ -869,9 +886,15 @@ int Connection::StopSending(ngtcp2_conn* conn, int64_t stream_id, uint64_t,
 
 void Connection::Flush() {
     if (!core_ || closed_ || in_ngtcp2_callback_) return;
+    // ngtcp2 can retire streams while encoding packets as well as receiving
+    // them. Credit and cancellation callbacks must not start a nested write.
+    in_ngtcp2_callback_ = true;
     struct RefreshExpiry {
         Connection& connection;
-        ~RefreshExpiry() { connection.PublishExpiry(); }
+        ~RefreshExpiry() {
+            connection.in_ngtcp2_callback_ = false;
+            connection.PublishExpiry();
+        }
     } refresh{*this};
     std::array<uint8_t, NGTCP2_MAX_UDP_PAYLOAD_SIZE> packet;
     for (size_t attempt = 0; attempt < 64; ++attempt) {
@@ -1000,7 +1023,7 @@ void Connection::Flush() {
 void Connection::Close() noexcept {
     if (closed_) return;
     closed_ = true;
-    fragments_.clear();
+    ExpireUdpFragments(std::numeric_limits<ngtcp2_tstamp>::max());
     if (core_) {
         auto streams = std::move(core_->streams);
         core_->streams.clear();
@@ -1140,6 +1163,9 @@ void Connection::OnStreamData(
     if (it == core_->streams.end()) return;
     auto& stream = it->second;
     if (!stream.state->PushInput(data, fin)) {
+        // ngtcp2 has already delivered these bytes; its stream teardown only
+        // credits bytes not delivered to the application.
+        ConsumeStream(stream_id, data.size());
         CancelStream(stream_id);
         return;
     }
@@ -1355,12 +1381,31 @@ net::awaitable<void> Connection::AuthenticateV2(int64_t stream_id) {
     SubmitHttpStatus(stream_id, "233", true);
 }
 
+void Connection::ExpireUdpFragments(ngtcp2_tstamp now) noexcept {
+    if (!fragments_.empty() && fragment_expiry_ > now) return;
+    fragment_expiry_ = std::numeric_limits<ngtcp2_tstamp>::max();
+    for (auto it = fragments_.begin(); it != fragments_.end();) {
+        if (it->second.expires_at <= now) {
+            it = fragments_.erase(it);
+        } else {
+            fragment_expiry_ = std::min(fragment_expiry_, it->second.expires_at);
+            ++it;
+        }
+    }
+    if (fragments_.empty()) {
+        decltype(fragments_) released;
+        fragments_.swap(released);
+    }
+}
+
 void Connection::HandleUdpMessage(const UdpMessage& message) {
     if (message.fragment_count == 1) {
         if (message.target.IsValid())
             DeliverUdpPacket(message.session_id, message.target, message.payload);
         return;
     }
+    const auto now = Timestamp();
+    if (fragment_expiry_ <= now) ExpireUdpFragments(now);
     const uint64_t key =
         (static_cast<uint64_t>(message.session_id) << 16) | message.packet_id;
     auto it = fragments_.find(key);
@@ -1369,45 +1414,54 @@ void Connection::HandleUdpMessage(const UdpMessage& message) {
         if (fragments_.size() >= kMaxPendingFragments) {
             fragments_.erase(fragments_.begin());
         }
-        PendingFragments pending;
-        if (message.fragment_id == 0) pending.target = message.target;
-        pending.count = message.fragment_count;
-        it = fragments_.emplace(key, std::move(pending)).first;
+        it = fragments_.try_emplace(key).first;
+        it->second.count = message.fragment_count;
+        it->second.deadline = UdpFragmentDeadline(now, kUdpFragmentLifetime);
+        it->second.expires_at = std::min(it->second.deadline,
+            UdpFragmentDeadline(now, kUdpFragmentIdleTimeout));
+        fragment_expiry_ = std::min(fragment_expiry_, it->second.expires_at);
     }
     auto& pending = it->second;
-    if (message.fragment_id == 0) {
-        if (!message.target.IsValid()) {
-            fragments_.erase(it);
-            return;
-        }
-        pending.target = message.target;
-    }
-    if (message.payload.empty() ||
+    if ((message.fragment_id == 0 && !message.target.IsValid()) ||
         pending.count != message.fragment_count ||
         message.fragment_id >= pending.count ||
-        (message.fragment_id < pending.payloads.size() &&
-         !pending.payloads[message.fragment_id].empty()) ||
+        pending.received_fragments.test(message.fragment_id) ||
         pending.bytes > kMaxUdpPayloadLength - message.payload.size()) {
         fragments_.erase(it);
+        ExpireUdpFragments(now);
         return;
     }
-    if (message.fragment_id >= pending.payloads.size())
-        pending.payloads.resize(static_cast<size_t>(message.fragment_id) + 1);
-    auto& part = pending.payloads[message.fragment_id];
-    part.assign(message.payload.begin(), message.payload.end());
-    pending.bytes += part.size();
+    if (message.fragment_id == 0) pending.target = message.target;
+    // Header-only fragments still satisfy an index; do not allocate a payload
+    // slot for them or confuse their empty data with a missing fragment.
+    if (!message.payload.empty()) {
+        pending.payloads.emplace_back(message.payload.begin(), message.payload.end());
+        // At most count distinct indices can arrive, and count fits uint8_t.
+        pending.payload_slots[message.fragment_id] =
+            static_cast<uint8_t>(pending.payloads.size());
+    }
+    pending.received_fragments.set(message.fragment_id);
+    pending.bytes += message.payload.size();
     ++pending.received;
+    pending.expires_at = std::min(pending.deadline,
+        UdpFragmentDeadline(now, kUdpFragmentIdleTimeout));
     if (pending.received != pending.count) return;
     if (!pending.target.IsValid()) {
         fragments_.erase(it);
+        ExpireUdpFragments(now);
         return;
     }
     memory::ThreadLocalVector<uint8_t> payload;
     payload.reserve(pending.bytes);
-    for (const auto& fragment : pending.payloads)
+    for (size_t id = 0; id < pending.count; ++id) {
+        const auto slot = pending.payload_slots[id];
+        if (slot == 0) continue;
+        const auto& fragment = pending.payloads[slot - 1];
         payload.insert(payload.end(), fragment.begin(), fragment.end());
+    }
     const TargetAddress target = std::move(pending.target);
     fragments_.erase(it);
+    ExpireUdpFragments(now);
     DeliverUdpPacket(message.session_id, target, payload);
 }
 
@@ -1431,27 +1485,40 @@ void Connection::DeliverUdpPacket(
 bool Connection::SendUdpMessage(
     uint32_t session_id, const TargetAddress& target,
     std::span<const uint8_t> payload) {
-    if (closed_ || !target.IsValid() || payload.empty() ||
+    if (closed_ || !target.IsValid() ||
         payload.size() > kMaxUdpPayloadLength) return false;
-    const size_t fragments =
-        (payload.size() + kUdpFragmentPayload - 1) / kUdpFragmentPayload;
+    const auto* parameters = ngtcp2_conn_get_remote_transport_params2(core_->quic);
+    if (!parameters) return false;
+    const auto frame_budget = std::min<uint64_t>(
+        parameters->max_datagram_frame_size, kMaxUdpMessageSize + kUdpDatagramFrameOverhead);
+    if (frame_budget < 2) return false;
+    // 消息至多 1100B；LEN 在 63B 边界由一字节增为两字节。
+    const auto message_budget = static_cast<size_t>(
+        frame_budget <= 65 ? frame_budget - 2 : frame_budget - kUdpDatagramFrameOverhead);
+    const auto version = listener_->version;
+    const auto header_size = UdpMessageHeaderSize(version, target);
+    if (!header_size || *header_size > message_budget) return false;
+    const size_t fragment_payload = message_budget - *header_size;
+    if (!payload.empty() && fragment_payload == 0) return false;
+    const size_t fragments = payload.empty()
+        ? 1 : 1 + (payload.size() - 1) / fragment_payload;
+    if (fragments > std::numeric_limits<uint8_t>::max()) return false;
     if (core_->datagrams.size() >= kMaxQueuedDatagrams ||
         fragments > kMaxQueuedDatagrams - core_->datagrams.size()) return false;
     const size_t initial_datagrams = core_->datagrams.size();
-    const uint16_t packet_id = next_udp_packet_id_++;
-    const auto version = listener_->version;
+    UdpMessage message{
+        .session_id = session_id,
+        .packet_id = next_udp_packet_id_++,
+        .fragment_count = static_cast<uint8_t>(fragments),
+        .target = target,
+        .payload = {},
+    };
     try {
         for (size_t index = 0; index < fragments; ++index) {
-            const size_t offset = index * kUdpFragmentPayload;
-            UdpMessage message;
-            message.session_id = session_id;
-            message.packet_id = packet_id;
+            const size_t offset = index * fragment_payload;
             message.fragment_id = static_cast<uint8_t>(index);
-            message.fragment_count = static_cast<uint8_t>(fragments);
-            if (version == Version::V1 || index == 0)
-                message.target = target;
             message.payload = payload.subspan(
-                offset, std::min(kUdpFragmentPayload, payload.size() - offset));
+                offset, std::min(fragment_payload, payload.size() - offset));
             auto encoded = EncodeUdpMessage(version, message);
             if (!encoded) {
                 while (core_->datagrams.size() > initial_datagrams)
@@ -2082,4 +2149,4 @@ net::awaitable<void> HysteriaIngress::AsyncJoin() {
     }
 }
 
-}  // namespace acpp::transport::internet::hysteria
+}  // namespace transport::internet::hysteria

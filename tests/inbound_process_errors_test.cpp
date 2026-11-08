@@ -1,14 +1,14 @@
 #include <gtest/gtest.h>
 
-#include "acppnode/app/proxyman/inbound/handler.hpp"
-#include "acppnode/app/request_load_state.hpp"
-#include "acppnode/app/rate_limiter.hpp"
-#include "acppnode/app/session_group_executor.hpp"
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/session.hpp"
-#include "acppnode/transport/internet/tls_stream.hpp"
-#include "acppnode/transport/internet/transport_stack.hpp"
-#include "acppnode/transport/link_error.hpp"
+#include "app/proxyman/inbound/handler.hpp"
+#include "app/request_load_state.hpp"
+#include "app/rate_limiter.hpp"
+#include "app/session_group_executor.hpp"
+#include "common/allocator.hpp"
+#include "common/session.hpp"
+#include "transport/internet/tls_stream.hpp"
+#include "transport/internet/transport_stack.hpp"
+#include "transport/link_error.hpp"
 #include "anytls_codec.hpp"
 #include "../src/common/awaitable_task_group.hpp"
 
@@ -24,7 +24,6 @@
 #include <vector>
 
 namespace {
-using namespace acpp;
 
 struct State { int fault = 0; int active = 0; bool destroyed = false; int id = 0; };
 
@@ -311,7 +310,6 @@ bool TestQuota(uint32_t limit, bool reject_ip, bool reverse) {
 
 // Replace the external transport builder and reporting sink; execute the
 // production accepted-TCP and logical-transport ownership/error boundaries.
-namespace acpp {
 
 net::awaitable<TransportBuildResult> BuildInboundTransport(net::io_context&,
     std::unique_ptr<AsyncStream> raw, const StreamSettings&, SslContext*, uint64_t,
@@ -332,7 +330,6 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(net::io_context&,
 }
 net::awaitable<ProxyProtocolReadResult> ReadInboundProxyProtocol(AsyncStream&, std::chrono::seconds) {
     throw std::logic_error("unexpected proxy protocol"); co_return ProxyProtocolReadResult{};
-}
 }
 TEST(InboundProcessErrors, Contract) {
     size_t passed = 0, total = 0;

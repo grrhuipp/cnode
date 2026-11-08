@@ -1,13 +1,12 @@
 #pragma once
 
-#include "acppnode/common/allocator.hpp"
+#include "common/allocator.hpp"
 #include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <span>
 
-namespace acpp {
 
 // RFC 8446 sections 4.1.2 and 5.1: handshake messages may span records.
 // Retain the original wire image for fallback/replay, but authenticate the
@@ -88,4 +87,3 @@ private:
     memory::ByteVector hello_;
 };
 
-} // namespace acpp

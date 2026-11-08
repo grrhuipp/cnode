@@ -1,8 +1,8 @@
 #pragma once
 
-#include "acppnode/common/asio_types.hpp"
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/transport/cancellation.hpp"
+#include "common/asio_types.hpp"
+#include "common/allocator.hpp"
+#include "transport/cancellation.hpp"
 
 #include <asio/async_result.hpp>
 #include <asio/bind_cancellation_slot.hpp>
@@ -20,7 +20,6 @@
 #include <type_traits>
 #include <utility>
 
-namespace acpp {
 
 // A finite group on one executor. Spawn is only valid while the group is alive:
 // during start, from a running child, or under a ResidentTaskGroup owner. The
@@ -296,4 +295,3 @@ private:
     bool closed_ = false;
 };
 
-}  // namespace acpp

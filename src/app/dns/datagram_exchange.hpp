@@ -1,8 +1,8 @@
 #pragma once
 
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/asio_types.hpp"
-#include "acppnode/transport/internet/timeout_scheduler.hpp"
+#include "common/allocator.hpp"
+#include "common/asio_types.hpp"
+#include "transport/internet/timeout_scheduler.hpp"
 
 #include <asio/as_tuple.hpp>
 #include <asio/experimental/channel.hpp>
@@ -16,7 +16,7 @@
 #include <openssl/rand.h>
 #include <span>
 
-namespace acpp::app::dns {
+namespace app::dns {
 
 // One connected UDP socket per upstream, owned exclusively by the DNS executor.
 // Pending pointers borrow live Exchange frames; registration is removed before
@@ -250,4 +250,4 @@ private:
     bool reading_ = false;
 };
 
-} // namespace acpp::app::dns
+} // namespace app::dns

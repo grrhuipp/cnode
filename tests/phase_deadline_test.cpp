@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 
-#include "acppnode/transport/async_stream.hpp"
-#include "acppnode/transport/internet/tcp_stream.hpp"
+#include "transport/async_stream.hpp"
+#include "transport/internet/tcp_stream.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -13,18 +13,18 @@ using namespace std::chrono_literals;
 
 // Exercise the real AsyncStream capability dispatch and Worker scheduler, with
 // a shared physical transport and independently observable logical cancellation.
-class LogicalStream final : public acpp::AsyncStream {
+class LogicalStream final : public ::AsyncStream {
 public:
-    LogicalStream(acpp::net::io_context& io, acpp::TcpStream& physical, int& cancellations)
+    LogicalStream(::net::io_context& io, ::TcpStream& physical, int& cancellations)
         : physical_(physical), cancellations_(cancellations), deadline_(io, *this) {}
 
-    acpp::net::awaitable<std::size_t> AsyncRead(acpp::net::mutable_buffer) override {
+    ::net::awaitable<std::size_t> AsyncRead(::net::mutable_buffer) override {
         throw std::logic_error("deadline test does not perform byte reads");
     }
-    acpp::net::awaitable<std::size_t> AsyncWrite(acpp::net::const_buffer) override {
+    ::net::awaitable<std::size_t> AsyncWrite(::net::const_buffer) override {
         throw std::logic_error("deadline test does not perform byte writes");
     }
-    acpp::net::awaitable<acpp::buf::MultiBuffer> ReadMultiBuffer() override {
+    ::net::awaitable<::buf::MultiBuffer> ReadMultiBuffer() override {
         throw std::logic_error("deadline test does not perform buffer reads");
     }
     void ShutdownWrite() override { Close(); }
@@ -43,37 +43,37 @@ public:
     int physical_lookups = 0;
 
 protected:
-    acpp::StreamPhaseDeadline* LogicalPhaseDeadline() noexcept override { return &deadline_; }
-    acpp::TcpStream* BaseTcpStream() override {
+    ::StreamPhaseDeadline* LogicalPhaseDeadline() noexcept override { return &deadline_; }
+    ::TcpStream* BaseTcpStream() override {
         ++physical_lookups;
         return &physical_;
     }
 
 private:
-    acpp::TcpStream& physical_;
+    ::TcpStream& physical_;
     int& cancellations_;
-    acpp::StreamPhaseDeadline deadline_;
+    ::StreamPhaseDeadline deadline_;
     bool open_ = true;
 };
 
-struct CancellationObserver final : acpp::transport::CancellationSubscription {
+struct CancellationObserver final : ::transport::CancellationSubscription {
     explicit CancellationObserver(int& notifications) noexcept : notifications(notifications) {}
     int& notifications;
 private:
-    void OnCancellation(acpp::transport::Cancellation) noexcept override {
+    void OnCancellation(::transport::Cancellation) noexcept override {
         ++notifications;
     }
 };
 
 bool TestClearAndTimeoutIsolation() {
-    acpp::net::io_context io;
-    acpp::TcpStream physical(acpp::tcp::socket(io, acpp::tcp::v4()));
-    auto& scheduler = acpp::TimeoutScheduler::ForIoContext(io);
+    ::net::io_context io;
+    ::TcpStream physical(::tcp::socket(io, ::tcp::v4()));
+    auto& scheduler = ::TimeoutScheduler::ForIoContext(io);
     int first_cancelled = 0, second_cancelled = 0;
     LogicalStream first(io, physical, first_cancelled);
     LogicalStream second(io, physical, second_cancelled);
-    acpp::AsyncStream& first_control = first;
-    acpp::AsyncStream& second_control = second;
+    ::AsyncStream& first_control = first;
+    ::AsyncStream& second_control = second;
     int physical_notifications = 0, first_notifications = 0, second_notifications = 0;
     CancellationObserver physical_observer(physical_notifications);
     CancellationObserver first_observer(first_notifications);
@@ -104,12 +104,12 @@ bool TestClearAndTimeoutIsolation() {
 }
 
 bool TestReplacementDisabledAndClosed() {
-    acpp::net::io_context io;
-    acpp::TcpStream physical(acpp::tcp::socket(io, acpp::tcp::v4()));
-    auto& scheduler = acpp::TimeoutScheduler::ForIoContext(io);
+    ::net::io_context io;
+    ::TcpStream physical(::tcp::socket(io, ::tcp::v4()));
+    auto& scheduler = ::TimeoutScheduler::ForIoContext(io);
     int cancellations = 0;
     LogicalStream stream(io, physical, cancellations);
-    acpp::AsyncStream& control = stream;
+    ::AsyncStream& control = stream;
     const auto old = control.StartPhaseDeadline(1s);
     const auto maximum = control.StartPhaseDeadline(std::chrono::seconds::max());
     if (!old || !maximum || scheduler.GetResourceStats().active_events != 1) return false;
@@ -133,9 +133,9 @@ bool TestReplacementDisabledAndClosed() {
 }
 
 bool TestDestructionCancelsOnlyOwnedEvent() {
-    acpp::net::io_context io;
-    acpp::TcpStream physical(acpp::tcp::socket(io, acpp::tcp::v4()));
-    auto& scheduler = acpp::TimeoutScheduler::ForIoContext(io);
+    ::net::io_context io;
+    ::TcpStream physical(::tcp::socket(io, ::tcp::v4()));
+    auto& scheduler = ::TimeoutScheduler::ForIoContext(io);
     int destroyed_cancellations = 0, survivor_cancellations = 0;
     {
         LogicalStream survivor(io, physical, survivor_cancellations);

@@ -143,6 +143,7 @@ inline Datagram Receive(const Socket& socket, Milliseconds timeout = 4s) {
     auto size = recvfrom(socket.Fd(), packet.payload.data(), packet.payload.size(), 0,
                          reinterpret_cast<sockaddr*>(&packet.address), &packet.address_size);
     Require(size >= 0, "recvfrom failed");
+    // recvfrom == 0 is a complete empty UDP datagram, not stream EOF.
     packet.payload.resize(static_cast<size_t>(size));
     return packet;
 }

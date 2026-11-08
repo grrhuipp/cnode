@@ -1,12 +1,11 @@
-#include "acppnode/app/bootstrap_inbounds.hpp"
+#include "app/bootstrap_inbounds.hpp"
 
-#include "acppnode/app/runtime_publication.hpp"
-#include "acppnode/app/worker.hpp"
+#include "app/runtime_publication.hpp"
+#include "app/worker.hpp"
 
 #include <format>
 #include <stdexcept>
 
-namespace acpp {
 
 net::awaitable<void> StartWorkerInbounds(
     Worker& worker,
@@ -24,4 +23,3 @@ net::awaitable<void> StartWorkerInbounds(
     }
 }
 
-}  // namespace acpp

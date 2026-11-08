@@ -1,11 +1,11 @@
-#include "acppnode/api/panel_factory.hpp"
-#include "acppnode/common/ip_address.hpp"
-#include "acppnode/common/ip_utils.hpp"
-#include "acppnode/core/naming.hpp"
-#include "acppnode/app/dns/dns.hpp"
-#include "acppnode/infra/json.hpp"
-#include "acppnode/infra/log.hpp"
-#include "acppnode/infra/panel_config.hpp"
+#include "api/panel_factory.hpp"
+#include "common/ip_address.hpp"
+#include "common/ip_utils.hpp"
+#include "core/naming.hpp"
+#include "app/dns/dns.hpp"
+#include "infra/json.hpp"
+#include "infra/log.hpp"
+#include "infra/panel_config.hpp"
 #include "http_response.hpp"
 #include "request_task.hpp"
 #include "node_info_json.hpp"
@@ -30,14 +30,14 @@
 #include <vector>
 #include <openssl/x509_vfy.h>
 
-namespace acpp::api::v2board {
+namespace api::v2board {
 
 namespace ssl = net::ssl;
 
-class APIClient final : public ::acpp::api::API {
+class APIClient final : public ::api::API {
 public:
-    APIClient(net::io_context& io_context, const ::acpp::api::Config& config,
-              ::acpp::app::dns::DNS& dns_service);
+    APIClient(net::io_context& io_context, const ::api::Config& config,
+              ::app::dns::DNS& dns_service);
     ~APIClient() override;
 
     net::awaitable<NodeInfoFetchResult>
@@ -47,10 +47,10 @@ public:
     GetUserList(std::string committed_etag) override;
 
     net::awaitable<bool>
-    ReportNodeOnlineUsers(const std::vector<::acpp::api::OnlineUser>& online_users) override;
+    ReportNodeOnlineUsers(const std::vector<::api::OnlineUser>& online_users) override;
 
     net::awaitable<bool>
-    ReportUserTraffic(const std::vector<::acpp::api::UserTraffic>& data) override;
+    ReportUserTraffic(const std::vector<::api::UserTraffic>& data) override;
 
 private:
     struct Impl;
@@ -231,8 +231,8 @@ ExtractBlockDetectRules(const json::object& config) {
 
 struct APIClient::Impl {
     Impl(net::io_context& io_context,
-         const ::acpp::api::Config& config,
-         ::acpp::app::dns::DNS& dns_service);
+         const ::api::Config& config,
+         ::app::dns::DNS& dns_service);
 
     [[nodiscard]] const std::string& ApiNodeType() const noexcept;
 
@@ -252,23 +252,23 @@ struct APIClient::Impl {
 
     net::awaitable<NodeInfoFetchResult> GetNodeInfo(std::string committed_etag);
     net::awaitable<UserListFetchResult> GetUserList(std::string committed_etag);
-    net::awaitable<bool> ReportNodeOnlineUsers(const std::vector<::acpp::api::OnlineUser>& online_users);
-    net::awaitable<bool> ReportUserTraffic(const std::vector<::acpp::api::UserTraffic>& data);
+    net::awaitable<bool> ReportNodeOnlineUsers(const std::vector<::api::OnlineUser>& online_users);
+    net::awaitable<bool> ReportUserTraffic(const std::vector<::api::UserTraffic>& data);
 
     net::io_context& io_context_;
-    ::acpp::api::Config config_;
+    ::api::Config config_;
     PanelApiUrlParts url_parts_;
     std::optional<net::ip::address> literal_address_;
     std::string api_node_type_;
     std::string host_header_;
-    ::acpp::app::dns::DNS& dns_service_;
+    ::app::dns::DNS& dns_service_;
 
     std::unique_ptr<net::ssl::context> https_context_;
 };
 
 APIClient::Impl::Impl(net::io_context& io_context,
-                      const ::acpp::api::Config& config,
-                      ::acpp::app::dns::DNS& dns_service)
+                      const ::api::Config& config,
+                      ::app::dns::DNS& dns_service)
     : io_context_(io_context)
     , config_(config)
     , dns_service_(dns_service) {
@@ -596,12 +596,12 @@ APIClient::Impl::GetUserList(std::string committed_etag) {
 }
 
 net::awaitable<bool>
-APIClient::Impl::ReportUserTraffic(const std::vector<::acpp::api::UserTraffic>& data) {
+APIClient::Impl::ReportUserTraffic(const std::vector<::api::UserTraffic>& data) {
     const int node_id = config_.NodeID;
     const PanelLogContext log_context{config_.Name, config_.APIHost, node_id, config_.NodeType};
 
     // V2Board UniProxy push 格式: {user_id: [upload, download], ...}
-    std::map<int64_t, ::acpp::api::UserTraffic> aggregated;
+    std::map<int64_t, ::api::UserTraffic> aggregated;
     for (const auto& t : data) {
         if (t.UID <= 0 || (t.Upload <= 0 && t.Download <= 0)) {
             continue;
@@ -635,7 +635,7 @@ APIClient::Impl::ReportUserTraffic(const std::vector<::acpp::api::UserTraffic>& 
 }
 
 net::awaitable<bool>
-APIClient::Impl::ReportNodeOnlineUsers(const std::vector<::acpp::api::OnlineUser>& online_users) {
+APIClient::Impl::ReportNodeOnlineUsers(const std::vector<::api::OnlineUser>& online_users) {
     const int node_id = config_.NodeID;
     const PanelLogContext log_context{config_.Name, config_.APIHost, node_id, config_.NodeType};
     auto report = BuildOnlineReportPayload(online_users, node_id);
@@ -657,8 +657,8 @@ APIClient::Impl::ReportNodeOnlineUsers(const std::vector<::acpp::api::OnlineUser
 }
 
 APIClient::APIClient(net::io_context& io_context,
-                     const ::acpp::api::Config& config,
-                     ::acpp::app::dns::DNS& dns_service)
+                     const ::api::Config& config,
+                     ::app::dns::DNS& dns_service)
     : impl_(std::make_unique<Impl>(io_context, config, dns_service)) {}
 
 APIClient::~APIClient() = default;
@@ -675,18 +675,18 @@ APIClient::GetUserList(std::string committed_etag) {
 }
 
 net::awaitable<bool>
-APIClient::ReportNodeOnlineUsers(const std::vector<::acpp::api::OnlineUser>& online_users) {
+APIClient::ReportNodeOnlineUsers(const std::vector<::api::OnlineUser>& online_users) {
     return impl_->ReportNodeOnlineUsers(online_users);
 }
 
 net::awaitable<bool>
-APIClient::ReportUserTraffic(const std::vector<::acpp::api::UserTraffic>& data) {
+APIClient::ReportUserTraffic(const std::vector<::api::UserTraffic>& data) {
     return impl_->ReportUserTraffic(data);
 }
 
-}  // namespace acpp::api::v2board
+}  // namespace api::v2board
 
-namespace acpp::api {
+namespace api {
 
 std::unique_ptr<API> CreatePanelClient(
     net::io_context& io_context,
@@ -695,4 +695,4 @@ std::unique_ptr<API> CreatePanelClient(
     return std::make_unique<v2board::APIClient>(io_context, config, dns_service);
 }
 
-}  // namespace acpp::api
+}  // namespace api

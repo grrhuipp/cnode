@@ -11,7 +11,7 @@
 #include <span>
 #include <utility>
 
-namespace acpp::vless {
+namespace vless {
 
 inline constexpr size_t kVlessEncryptionCtrIvSize = 16;
 
@@ -58,4 +58,4 @@ private:
     size_t skip_ = 0;
 };
 
-}  // namespace acpp::vless
+}  // namespace vless

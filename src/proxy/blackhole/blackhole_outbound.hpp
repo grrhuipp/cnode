@@ -1,6 +1,6 @@
 #pragma once
 
-#include "acppnode/proxy/outbound.hpp"
+#include "proxy/outbound.hpp"
 
 #include <chrono>
 #include <cstdint>
@@ -8,7 +8,7 @@
 #include <string>
 #include <string_view>
 
-namespace acpp::proxy::blackhole::outbound {
+namespace proxy::blackhole::outbound {
 
 // ============================================================================
 // Blackhole 出站设置
@@ -39,4 +39,4 @@ private:
     bool http_response_;
 };
 
-}  // namespace acpp::proxy::blackhole::outbound
+}  // namespace proxy::blackhole::outbound

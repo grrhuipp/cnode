@@ -4,20 +4,23 @@
 #include "quic_memory.hpp"
 #include "quic_stream.hpp"
 #include "quic_handoff.hpp"
-#include "acppnode/app/session_capabilities.hpp"
+#include "app/session_capabilities.hpp"
 
-#include "acppnode/app/rate_limiter.hpp"
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/asio_types.hpp"
-#include "acppnode/common/buf/multi_buffer.hpp"
-#include "acppnode/common/session.hpp"
-#include "acppnode/common/sharded_user_stats.hpp"
+#include "app/rate_limiter.hpp"
+#include "common/allocator.hpp"
+#include "common/asio_types.hpp"
+#include "common/buf/multi_buffer.hpp"
+#include "common/session.hpp"
+#include "common/sharded_user_stats.hpp"
 
 #include <nghttp3/nghttp3.h>
 #include <ngtcp2/ngtcp2.h>
 #include <ngtcp2/ngtcp2_crypto.h>
 #include <openssl/ssl.h>
 
+#include <algorithm>
+#include <array>
+#include <bitset>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -25,12 +28,10 @@
 #include <string>
 #include <string_view>
 
-namespace acpp {
 class InboundTransportStreamHandler;
 class AwaitableTaskGroup;
-}  // namespace acpp
 
-namespace acpp::transport::internet::hysteria {
+namespace transport::internet::hysteria {
 
 class QuicListener;
 struct SocketState;
@@ -63,8 +64,9 @@ public:
               std::span<const uint8_t> packet);
     void OnExpiry();
     [[nodiscard]] ngtcp2_tstamp Expiry() const noexcept {
-        return core_ && core_->quic ? ngtcp2_conn_get_expiry(core_->quic)
-                                    : std::numeric_limits<ngtcp2_tstamp>::max();
+        return std::min(fragment_expiry_,
+            core_ && core_->quic ? ngtcp2_conn_get_expiry(core_->quic)
+                                : std::numeric_limits<ngtcp2_tstamp>::max());
     }
     [[nodiscard]] bool Closed() const noexcept { return closed_; }
     void Close() noexcept;
@@ -144,9 +146,14 @@ private:
     struct PendingFragments {
         TargetAddress target;
         memory::ThreadLocalVector<memory::ByteVector> payloads;
+        // One-based indices into arrived nonempty payloads; zero carries no bytes.
+        std::array<uint8_t, 256> payload_slots{};
+        std::bitset<256> received_fragments;
         uint8_t count = 0;
         uint8_t received = 0;
         size_t bytes = 0;
+        ngtcp2_tstamp deadline = 0;
+        ngtcp2_tstamp expires_at = 0;
     };
     enum class PhysicalAdmission : uint8_t { Pending, Admitted, Rejected };
     enum class AdmitResult : uint8_t { Admitted, AuthFailed, Limited, DeviceLimited };
@@ -182,6 +189,7 @@ private:
     void OnHttpHeader(int64_t stream_id, int32_t token,
                       nghttp3_rcbuf* name, nghttp3_rcbuf* value);
     void HandleUdpMessage(const UdpMessage& message);
+    void ExpireUdpFragments(ngtcp2_tstamp now) noexcept;
     void DeliverUdpPacket(uint32_t session_id, const TargetAddress& target,
                           std::span<const uint8_t> payload);
 
@@ -257,6 +265,8 @@ private:
     std::optional<UserOnlineSessionGuard> online_session_;
     std::shared_ptr<InboundTransportStreamHandler> stream_sink_;
     memory::ThreadLocalUnorderedMap<uint64_t, PendingFragments> fragments_;
+    // 续期或删除后允许保留较早的唤醒；到期时重算，避免逐片扫描。
+    ngtcp2_tstamp fragment_expiry_ = std::numeric_limits<ngtcp2_tstamp>::max();
     uint32_t next_udp_session_id_ = 1;
     uint16_t next_udp_packet_id_ = 0;
     PhysicalAdmission physical_ = PhysicalAdmission::Pending;
@@ -267,4 +277,4 @@ private:
     bool closed_ = false;
 };
 
-}  // namespace acpp::transport::internet::hysteria
+}  // namespace transport::internet::hysteria

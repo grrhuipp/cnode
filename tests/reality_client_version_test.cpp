@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "acppnode/transport/internet/reality_client_version.hpp"
+#include "transport/internet/reality_client_version.hpp"
 
 #include <array>
 #include <cstdio>
@@ -15,9 +15,9 @@ bool Require(bool condition, const char* message) {
 }  // namespace
 
 TEST(RealityClientVersion, Contract) {
-    using acpp::transport::internet::ParseRealityClientVersion;
-    using acpp::transport::internet::RealityClientVersion;
-    using acpp::transport::internet::RealityClientVersionValue;
+    using ::transport::internet::ParseRealityClientVersion;
+    using ::transport::internet::RealityClientVersion;
+    using ::transport::internet::RealityClientVersionValue;
 
     const auto unset = ParseRealityClientVersion("");
     ASSERT_FALSE((!Require(unset && !*unset,

@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "acppnode/common/domain_name.hpp"
+#include "common/domain_name.hpp"
 
 #include <cstdio>
 #include <string>
@@ -15,10 +15,10 @@ bool Require(bool condition, const char* message) {
 }  // namespace
 
 TEST(DomainName, Contract) {
-    using acpp::domain::IsValidDnsHostname;
-    using acpp::domain::DnsHostnamesEqual;
-    using acpp::domain::NormalizeDnsHostnameInPlace;
-    using acpp::domain::TrailingDotPolicy;
+    using ::domain::IsValidDnsHostname;
+    using ::domain::DnsHostnamesEqual;
+    using ::domain::NormalizeDnsHostnameInPlace;
+    using ::domain::TrailingDotPolicy;
 
     ASSERT_FALSE((!Require(IsValidDnsHostname("example.com", TrailingDotPolicy::Forbid),
                  "a canonical DNS hostname must be valid")));

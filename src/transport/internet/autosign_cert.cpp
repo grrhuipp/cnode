@@ -8,7 +8,7 @@
 #include <string>
 #include <string_view>
 
-namespace acpp::transport::internet {
+namespace transport::internet {
 namespace {
 
 EVP_PKEY* GenerateEcP256Key() {
@@ -129,4 +129,4 @@ std::unique_ptr<AutoSignCertificate> AutoSignCertificate::Create(std::string_vie
     return material;
 }
 
-}  // namespace acpp::transport::internet
+}  // namespace transport::internet

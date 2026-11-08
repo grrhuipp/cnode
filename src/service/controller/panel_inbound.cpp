@@ -1,15 +1,15 @@
 #include "panel_inbound.hpp"
 #include "tls_policy.hpp"
 
-#include "acppnode/core/constants.hpp"
-#include "acppnode/core/naming.hpp"
-#include "acppnode/features/routing/dispatch_policy.hpp"
-#include "acppnode/transport/internet/http_headers.hpp"
-#include "acppnode/transport/internet/tls_config.hpp"
+#include "core/constants.hpp"
+#include "core/naming.hpp"
+#include "features/routing/dispatch_policy.hpp"
+#include "transport/internet/http_headers.hpp"
+#include "transport/internet/tls_config.hpp"
 
 #include <stdexcept>
 
-namespace acpp::controller {
+namespace controller {
 
 namespace {
 
@@ -129,4 +129,4 @@ InboundSpec MapPanelInbound(
     };
 }
 
-}  // namespace acpp::controller
+}  // namespace controller

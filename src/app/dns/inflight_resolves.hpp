@@ -1,8 +1,8 @@
 #pragma once
 
-#include "acppnode/app/dns/dns.hpp"
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/container_util.hpp"
+#include "app/dns/dns.hpp"
+#include "common/allocator.hpp"
+#include "common/container_util.hpp"
 #include "../../common/awaitable_task_group.hpp"
 
 #include <asio/as_tuple.hpp>
@@ -14,7 +14,7 @@
 #include <optional>
 #include <string_view>
 
-namespace acpp::app::dns {
+namespace app::dns {
 
 // Executor-local service ownership: callers subscribe, never own the query.
 // Retired generations remain counted until their query has actually unwound.
@@ -151,4 +151,4 @@ private:
     ResidentTaskGroup tasks_;
 };
 
-}  // namespace acpp::app::dns
+}  // namespace app::dns

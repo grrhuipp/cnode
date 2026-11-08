@@ -1,14 +1,13 @@
 #include "startup_inbounds.hpp"
 #include "../infra/config_semantics.hpp"
 
-#include "acppnode/core/constants.hpp"
-#include "acppnode/core/naming.hpp"
-#include "acppnode/infra/config_types.hpp"
+#include "core/constants.hpp"
+#include "core/naming.hpp"
+#include "infra/config_types.hpp"
 
 #include <stdexcept>
 #include <utility>
 
-namespace acpp {
 
 namespace {
 
@@ -91,4 +90,3 @@ std::vector<PreparedInbound> PrepareStartupInbounds(
     return prepared;
 }
 
-}  // namespace acpp

@@ -1,17 +1,17 @@
 #include "reality_tls.hpp"
 #include "reality_key_share.hpp"
 #include "tls_client_context.hpp"
-#include "acppnode/transport/internet/reality_client_version.hpp"
-#include "acppnode/transport/internet/reality_key.hpp"
-#include "acppnode/transport/internet/reality_server_name.hpp"
-#include "acppnode/transport/internet/reality_short_id.hpp"
-#include "acppnode/transport/internet/tls_server_name.hpp"
+#include "transport/internet/reality_client_version.hpp"
+#include "transport/internet/reality_key.hpp"
+#include "transport/internet/reality_server_name.hpp"
+#include "transport/internet/reality_short_id.hpp"
+#include "transport/internet/tls_server_name.hpp"
 
-#include "acppnode/transport/internet/tls_stream.hpp"
-#include "acppnode/transport/internet/stream_settings.hpp"
-#include "acppnode/infra/log.hpp"
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/unsafe.hpp"
+#include "transport/internet/tls_stream.hpp"
+#include "transport/internet/stream_settings.hpp"
+#include "infra/log.hpp"
+#include "common/allocator.hpp"
+#include "common/unsafe.hpp"
 
 #include <openssl/aead.h>
 #include <openssl/asn1.h>
@@ -37,7 +37,6 @@
 #include <string_view>
 #include <vector>
 
-namespace acpp {
 
 namespace {
 
@@ -1341,4 +1340,3 @@ void ClearRealityServerConnState(SSL* ssl) noexcept {
         delete state;
     }
 }
-}  // namespace acpp

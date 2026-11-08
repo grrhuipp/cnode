@@ -1,8 +1,8 @@
 #pragma once
 
-#include "acppnode/common/asio_types.hpp"
-#include "acppnode/transport/internet/http_headers.hpp"
-#include "acppnode/core/naming.hpp"
+#include "common/asio_types.hpp"
+#include "transport/internet/http_headers.hpp"
+#include "core/naming.hpp"
 
 #include <asio/as_tuple.hpp>
 #include <asio/buffers_iterator.hpp>
@@ -21,7 +21,7 @@
 #include <string>
 #include <string_view>
 
-namespace acpp::api::v2board::http {
+namespace api::v2board::http {
 
 inline constexpr size_t kMaxHttpBodySize = 64 * 1024 * 1024;
 inline constexpr size_t kMaxHttpLineSize = 64 * 1024;
@@ -481,4 +481,4 @@ net::awaitable<Response> ReadResponse(Stream& stream) {
     co_return result;
 }
 
-}  // namespace acpp::api::v2board::http
+}  // namespace api::v2board::http

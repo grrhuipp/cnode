@@ -19,7 +19,7 @@ TEST(VlessCredentials, Contract) {
     };
     constexpr std::string_view hex = "0123456789abcdef";
     for (const auto& item : cases) {
-        const auto bytes = acpp::vless::ParseUuidBytes(item.id);
+        const auto bytes = ::vless::ParseUuidBytes(item.id);
         if (!bytes) { std::cerr << "valid VLESS id rejected\n"; FAIL() << "valid VLESS id rejected"; }
         std::string actual;
         for (const auto byte : *bytes) {
@@ -29,10 +29,10 @@ TEST(VlessCredentials, Contract) {
         ASSERT_EQ(actual, item.expected) << "VLESS identity vector changed";
     }
     for (const auto invalid : {"", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "b831381d-6324-4d53-ad4f-8cda48b3081Z"}) {
-        if (acpp::vless::ParseUuidBytes(invalid)) { std::cerr << "invalid VLESS id accepted\n"; FAIL() << "invalid VLESS id accepted"; }
+        if (::vless::ParseUuidBytes(invalid)) { std::cerr << "invalid VLESS id accepted\n"; FAIL() << "invalid VLESS id accepted"; }
     }
-    if (acpp::vless::NormalizeFlow("XTLS-rprx-VISION") != "xtls-rprx-vision" ||
-        !acpp::vless::NormalizeFlow("").empty()) {
+    if (::vless::NormalizeFlow("XTLS-rprx-VISION") != "xtls-rprx-vision" ||
+        !::vless::NormalizeFlow("").empty()) {
         std::cerr << "flow normalization changed\n";
         FAIL() << "flow normalization changed";
     }

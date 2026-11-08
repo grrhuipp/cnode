@@ -1,9 +1,10 @@
 #include "body.hpp"
 
-#include "acppnode/common/buf/contiguous_buffer_view.hpp"
-#include "acppnode/common/buffer_util.hpp"
-#include "acppnode/common/error.hpp"
-#include "acppnode/infra/log.hpp"
+#include "common/buf/contiguous_buffer_view.hpp"
+#include "common/buffer_util.hpp"
+#include "common/error.hpp"
+#include "infra/log.hpp"
+#include "transport/link.hpp"
 
 #include <openssl/mem.h>
 #include <openssl/rand.h>
@@ -14,7 +15,7 @@
 #include <new>
 #include <string_view>
 
-namespace acpp::vmess::encoding {
+namespace vmess::encoding {
 
 namespace {
 
@@ -125,12 +126,13 @@ BodyEncoder::BodyEncoder(const BodyOptions& options,
 }
 
 void BodyEncoder::Encode(const buf::MultiBuffer& payload, buf::MultiBuffer& out) {
-    if (payload.byte_size() == 0) {
-        return;
-    }
-    if (PacketMode()) {
+    if (PacketMode() &&
+        (payload.byte_size() != 0 || buf::InspectUdpDatagram(payload).Valid())) {
         const buf::ContiguousBufferView packet(payload);
         EncodePacket(packet.Bytes(), out);
+        return;
+    }
+    if (payload.byte_size() == 0) {
         return;
     }
     for (const buf::Buffer* buffer : payload) {
@@ -141,14 +143,14 @@ void BodyEncoder::Encode(const buf::MultiBuffer& payload, buf::MultiBuffer& out)
 }
 
 void BodyEncoder::Encode(std::span<const net::const_buffer> payload, buf::MultiBuffer& out) {
-    const bool has_data = std::any_of(payload.begin(), payload.end(),
-        [](const net::const_buffer& buffer) { return buffer.data() && buffer.size() > 0; });
-    if (!has_data) {
-        return;
-    }
     if (PacketMode()) {
         const buf::ContiguousBufferView packet(payload);
         EncodePacket(packet.Bytes(), out);
+        return;
+    }
+    const bool has_data = std::any_of(payload.begin(), payload.end(),
+        [](const net::const_buffer& buffer) { return buffer.data() && buffer.size() > 0; });
+    if (!has_data) {
         return;
     }
     for (const net::const_buffer& buffer : payload) {
@@ -195,6 +197,10 @@ size_t BodyEncoder::EncodeEndTo(std::span<uint8_t, 128> out) {
 }
 
 void BodyEncoder::EncodePacket(std::span<const uint8_t> bytes, buf::MultiBuffer& out) {
+    // Standard VMess framing uses an empty body exclusively as EOF.
+    if (bytes.empty()) {
+        throw transport::LinkError(ErrorCode::NOT_SUPPORTED);
+    }
     if (bytes.size() > MAX_CHUNK_SIZE - cipher_.Overhead()) {
         throw IoSystemError(
             io_error::message_size,
@@ -387,4 +393,4 @@ void BodyDecoder::FinishRecord() noexcept {
     pending_read_.ReleaseIfIdle();
 }
 
-}  // namespace acpp::vmess::encoding
+}  // namespace vmess::encoding

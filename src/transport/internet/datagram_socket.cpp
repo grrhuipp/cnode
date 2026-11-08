@@ -1,9 +1,9 @@
-#include "acppnode/transport/internet/datagram_socket.hpp"
+#include "transport/internet/datagram_socket.hpp"
 
-#include "acppnode/common/allocator.hpp"
+#include "common/allocator.hpp"
 #include "connection_timeouts.hpp"
 #include "native_socket_handoff.hpp"
-#include "acppnode/transport/link_error.hpp"
+#include "transport/link_error.hpp"
 
 #include <asio/ip/v6_only.hpp>
 
@@ -13,7 +13,7 @@
 #include <new>
 #include <utility>
 
-namespace acpp::transport::internet {
+namespace transport::internet {
 namespace {
 constexpr std::size_t kMaxActiveSockets = 4096;
 constexpr std::size_t kMaxReceiveBuffers = 8;
@@ -216,7 +216,7 @@ net::awaitable<ReceivedDatagram> DatagramSocket::Impl::Receive(ReadOperation& op
 
         buf::MultiBuffer payload;
         std::size_t remaining = received;
-        for (std::size_t i = 0; i < count && remaining != 0; ++i) {
+        for (std::size_t i = 0; i < count && (remaining != 0 || i == 0); ++i) {
             const auto produced = std::min<std::size_t>(remaining, guards[i]->Available());
             guards[i]->Produce(static_cast<uint32_t>(produced));
             remaining -= produced;
@@ -444,4 +444,4 @@ std::size_t DatagramSocket::ActiveCount() noexcept {
     return Impl::active_budget ? Impl::active_budget->load(std::memory_order_relaxed) : 0;
 }
 
-}  // namespace acpp::transport::internet
+}  // namespace transport::internet

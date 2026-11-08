@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "acppnode/infra/log.hpp"
+#include "infra/log.hpp"
 
 #include <array>
 #include <cstdio>
@@ -73,7 +73,7 @@ struct StreamCapture {
             throw std::runtime_error("cannot capture console descriptor");
     }
     ~StreamCapture() {
-        acpp::Log::Shutdown();
+        ::Log::Shutdown();
         ::dup2(previous, target);
         ::close(previous);
         std::fclose(file);
@@ -94,10 +94,10 @@ struct StreamCapture {
 
 void CheckConsoleFileOffset(const std::filesystem::path& directory) {
     StreamCapture capture(STDOUT_FILENO);
-    Expect(acpp::Log::Init("info", directory, 1, "access.log", "error.log", false, false),
+    Expect(::Log::Init("info", directory, 1, "access.log", "error.log", false, false),
            "cannot initialize redirected console");
-    acpp::Log::WriteConsole(acpp::LogLevel::INFO, "async console offset");
-    acpp::Log::Shutdown();
+    ::Log::WriteConsole(::LogLevel::INFO, "async console offset");
+    ::Log::Shutdown();
     const auto before_direct = capture.Text();
     Expect(before_direct.find("async console offset") != std::string::npos,
            "redirected console record missing");
@@ -106,7 +106,7 @@ void CheckConsoleFileOffset(const std::filesystem::path& directory) {
                static_cast<ssize_t>(marker.size()), "direct console write failed");
     Expect(capture.Text() == before_direct + std::string(marker),
            "direct output overwrote asynchronous console records");
-    acpp::Log::WriteConsole(acpp::LogLevel::INFO, "after-shutdown console offset");
+    ::Log::WriteConsole(::LogLevel::INFO, "after-shutdown console offset");
     const auto before_second_direct = capture.Text();
     Expect(before_second_direct.starts_with(before_direct + std::string(marker)) &&
                before_second_direct.find("after-shutdown console offset") != std::string::npos,
@@ -128,13 +128,13 @@ void CheckBlockedConsole(const std::filesystem::path& directory) {
         ::dup2(pipe[1], STDOUT_FILENO);
         ::close(pipe[1]);
         // Retain the read descriptor without consuming bytes: EAGAIN, not EPIPE.
-        if (!acpp::Log::Init("info", directory, 1, "access.log", "error.log", false, false))
+        if (!::Log::Init("info", directory, 1, "access.log", "error.log", false, false))
             ::_exit(2);
         const std::string message(512, 'x');
         for (int i = 0; i < 20000; ++i)
-            acpp::Log::WriteConsole(acpp::LogLevel::INFO, message);
-        acpp::Log::WriteAccess("access survives blocked stdout");
-        acpp::Log::Shutdown();
+            ::Log::WriteConsole(::LogLevel::INFO, message);
+        ::Log::WriteAccess("access survives blocked stdout");
+        ::Log::Shutdown();
         ::_exit(0);
     }
     ::close(pipe[1]);
@@ -154,10 +154,10 @@ void CheckSocketConsole(const std::filesystem::path& directory) {
     const int saved = ::dup(STDOUT_FILENO);
     Expect(saved >= 0 && ::dup2(sockets[0], STDOUT_FILENO) >= 0, "cannot redirect socket stdout");
     const int flags = ::fcntl(sockets[0], F_GETFL);
-    const bool initialized = acpp::Log::Init(
+    const bool initialized = ::Log::Init(
         "info", directory, 1, "access.log", "error.log", false, false);
-    acpp::Log::WriteConsole(acpp::LogLevel::INFO, "journald console record");
-    acpp::Log::Shutdown();
+    ::Log::WriteConsole(::LogLevel::INFO, "journald console record");
+    ::Log::Shutdown();
     const bool unchanged = ::fcntl(sockets[0], F_GETFL) == flags;
     ::dup2(saved, STDOUT_FILENO);
     ::close(saved);
@@ -190,9 +190,9 @@ void CheckAliasedSocketPartialRecord(const std::filesystem::path& directory) {
            ::dup2(sockets[0], STDERR_FILENO) >= 0, "cannot alias console descriptors");
     // Warning suppresses the initialization info record, leaving the socket's
     // controlled free space for this single large, valid logfmt record.
-    const bool initialized = acpp::Log::Init(
+    const bool initialized = ::Log::Init(
         "warning", directory, 1, "access.log", "error.log", false, false);
-    acpp::Log::WriteConsole(acpp::LogLevel::WARN, std::string(4000, 'x'));
+    ::Log::WriteConsole(::LogLevel::WARN, std::string(4000, 'x'));
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     int available = 0;
     while (std::chrono::steady_clock::now() < deadline) {
@@ -205,8 +205,8 @@ void CheckAliasedSocketPartialRecord(const std::filesystem::path& directory) {
         bytes[static_cast<size_t>(first_count - 1)] != '\n';
     // Draining restores writability. The stderr alias must nevertheless stay
     // retired: neither this event nor the drop warning may follow the prefix.
-    acpp::Log::WriteConsole(acpp::LogLevel::ERROR, "must-not-follow-partial-record");
-    acpp::Log::Shutdown();
+    ::Log::WriteConsole(::LogLevel::ERROR, "must-not-follow-partial-record");
+    ::Log::Shutdown();
     ::dup2(saved_stdout, STDOUT_FILENO);
     ::dup2(saved_stderr, STDERR_FILENO);
     ::close(saved_stdout);
@@ -243,36 +243,36 @@ TEST(LogFormat, Contract) {
     try {
         StreamCapture console(STDOUT_FILENO);
         StreamCapture errors(STDERR_FILENO);
-        Expect(acpp::Log::Init("trace", directory, 1,
+        Expect(::Log::Init("trace", directory, 1,
                               "access.log", "error.log", false, false),
                "logger initialization failed");
         std::string injection = "diagnostic injection\nforged\r\t\x1b";
         injection.push_back('\0');
-        acpp::Log::WriteSystem(acpp::LogLevel::WARN, injection);
-        acpp::Log::WriteConnection(acpp::LogLevel::WARN,
+        ::Log::WriteSystem(::LogLevel::WARN, injection);
+        ::Log::WriteConnection(::LogLevel::WARN,
             SessionLogContext{
                 .inbound = {.tag = "vless-in", .user_id = 123},
                 .outbound = {.tag = "direct"},
                 .conn_id = (1ull << 32) | 7},
             "authenticated outbound failure");
-        acpp::Log::WriteConnection(acpp::LogLevel::WARN,
+        ::Log::WriteConnection(::LogLevel::WARN,
             SessionLogContext{
                 .inbound = {.tag = "vless-in", .user_id = 0},
                 .outbound = {},
                 .conn_id = (2ull << 32) | 7},
             "authentication failed from 192.0.2.10:52000 > invalid credential");
-        acpp::Log::WriteConnection(acpp::LogLevel::DEBUG, uint64_t{0},
+        ::Log::WriteConnection(::LogLevel::DEBUG, uint64_t{0},
                                   "diagnostic without connection identity");
-        const acpp::PanelLogContext panel{
+        const ::PanelLogContext panel{
             .name = "main panel", .host = "https://login:password@panel.example.com:8443/api?key=secret#private",
             .node_id = 1041, .type = "Vless"};
-        acpp::Log::WritePanel(acpp::LogLevel::INFO, panel, "node ready");
-        acpp::Log::WritePanel(acpp::LogLevel::WARN, panel, "panel request failed");
-        acpp::Log::WriteConsole(acpp::LogLevel::ERROR, "fatal startup failure");
-        acpp::Log::WriteConsole(acpp::LogLevel::INFO, "quoted \"value\"\\path\nnext");
-        acpp::Log::WriteAccess("from 192.0.2.10:52000 accepted tcp:example.com:443 [vless-in -> direct] user:123");
-        acpp::Log::WriteAccess("rejected invalid input\nforged-access\x1b");
-        acpp::Log::Shutdown();
+        ::Log::WritePanel(::LogLevel::INFO, panel, "node ready");
+        ::Log::WritePanel(::LogLevel::WARN, panel, "panel request failed");
+        ::Log::WriteConsole(::LogLevel::ERROR, "fatal startup failure");
+        ::Log::WriteConsole(::LogLevel::INFO, "quoted \"value\"\\path\nnext");
+        ::Log::WriteAccess("from 192.0.2.10:52000 accepted tcp:example.com:443 [vless-in -> direct] user:123");
+        ::Log::WriteAccess("rejected invalid input\nforged-access\x1b");
+        ::Log::Shutdown();
 
         const auto diagnostics = ReadLines(directory / "error.log");
         const auto access = ReadLines(directory / "access.log");
@@ -316,14 +316,14 @@ TEST(LogFormat, Contract) {
                    !Contains(diagnostics, secret), "panel URL credentials leaked");
         }
 
-        Expect(acpp::Log::Init("warning", directory / "filtered", 1,
+        Expect(::Log::Init("warning", directory / "filtered", 1,
                               "access.log", "error.log", false, false),
                "filtered logger initialization failed");
-        acpp::Log::WriteConsole(acpp::LogLevel::INFO, "hidden console event");
-        acpp::Log::WriteSystem(acpp::LogLevel::DEBUG, "hidden diagnostic event");
-        acpp::Log::WriteSystem(acpp::LogLevel::WARN, "visible warning");
-        acpp::Log::WriteAccess("accepted despite diagnostic severity");
-        acpp::Log::Shutdown();
+        ::Log::WriteConsole(::LogLevel::INFO, "hidden console event");
+        ::Log::WriteSystem(::LogLevel::DEBUG, "hidden diagnostic event");
+        ::Log::WriteSystem(::LogLevel::WARN, "visible warning");
+        ::Log::WriteAccess("accepted despite diagnostic severity");
+        ::Log::Shutdown();
         const auto filtered = ReadLines(directory / "filtered/error.log");
         Expect(filtered.size() == 1 && Contains(filtered, "visible warning") &&
                console.Text().find("hidden console event") == std::string::npos,
@@ -331,13 +331,13 @@ TEST(LogFormat, Contract) {
         Expect(Contains(ReadLines(directory / "filtered/access.log"), "accepted despite"),
                "diagnostic filtering must not discard access facts");
 
-        Expect(acpp::Log::Init("none", directory / "disabled", 1,
+        Expect(::Log::Init("none", directory / "disabled", 1,
                               "access.log", "error.log", false, false),
                "disabled logger initialization failed");
         LOG_CONSOLE_ERROR("hidden ordinary error");
-        acpp::Log::WriteConsole(acpp::LogLevel::ERROR, "unconditional fatal startup failure");
-        acpp::Log::WriteAccess("rejected despite disabled diagnostics");
-        acpp::Log::Shutdown();
+        ::Log::WriteConsole(::LogLevel::ERROR, "unconditional fatal startup failure");
+        ::Log::WriteAccess("rejected despite disabled diagnostics");
+        ::Log::Shutdown();
         Expect(ReadLines(directory / "disabled/error.log").empty() &&
                errors.Text().find("hidden ordinary error") == std::string::npos &&
                errors.Text().find("unconditional fatal startup failure") != std::string::npos,
@@ -345,23 +345,23 @@ TEST(LogFormat, Contract) {
         Expect(Contains(ReadLines(directory / "disabled/access.log"), "rejected despite"),
                "disabled diagnostics must preserve access facts");
 
-        Expect(acpp::Log::Init("info", directory / "failed-error", 1,
+        Expect(::Log::Init("info", directory / "failed-error", 1,
                               "access.log", "/dev/full", false, false),
                "cannot initialize failing error sink");
         for (int i = 0; i < 100; ++i)
-            acpp::Log::WriteSystem(acpp::LogLevel::WARN, "unwritable error record");
-        acpp::Log::WriteAccess("healthy access channel");
-        acpp::Log::Shutdown();
+            ::Log::WriteSystem(::LogLevel::WARN, "unwritable error record");
+        ::Log::WriteAccess("healthy access channel");
+        ::Log::Shutdown();
         Expect(errors.Text().find("channel=error write-failure") != std::string::npos &&
                Contains(ReadLines(directory / "failed-error/access.log"), "healthy access"),
                "error sink failure was silent or affected access channel");
 
-        Expect(acpp::Log::Init("info", directory / "failed-access", 1,
+        Expect(::Log::Init("info", directory / "failed-access", 1,
                               "/dev/full", "error.log", false, false),
                "cannot initialize failing access sink");
-        acpp::Log::WriteAccess("unwritable access record");
-        acpp::Log::WriteSystem(acpp::LogLevel::WARN, "healthy error channel");
-        acpp::Log::Shutdown();
+        ::Log::WriteAccess("unwritable access record");
+        ::Log::WriteSystem(::LogLevel::WARN, "healthy error channel");
+        ::Log::Shutdown();
         Expect(errors.Text().find("channel=access write-failure") != std::string::npos &&
                Contains(ReadLines(directory / "failed-access/error.log"), "healthy error"),
                "access sink flush failure was silent or affected error channel");
@@ -371,7 +371,7 @@ TEST(LogFormat, Contract) {
         CheckAliasedSocketPartialRecord(directory / "aliased-socket-console");
         CheckConsoleFileOffset(directory / "console-file-offset");
     } catch (const std::exception& error) {
-        acpp::Log::Shutdown();
+        ::Log::Shutdown();
         std::filesystem::remove_all(directory);
         std::cerr << error.what() << '\n';
         FAIL() << error.what();

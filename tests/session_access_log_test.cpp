@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "acppnode/common/session.hpp"
+#include "common/session.hpp"
 
 #include <asio/ip/address.hpp>
 
@@ -34,16 +34,16 @@ void operator delete(void* p, std::size_t) noexcept { std::free(p); }
 
 TEST(SessionAccessLog, Contract) {
     try {
-        acpp::session::Context ctx;
-        ctx.inbound.source_addr = acpp::net::ip::make_address("192.0.2.10");
+        ::session::Context ctx;
+        ctx.inbound.source_addr = ::net::ip::make_address("192.0.2.10");
         ctx.inbound.source_port = 52000;
         ctx.inbound.tag = "panel/hj-anytls/1041/anytls/55911";
         ctx.inbound.user_id = 714443;
         ctx.inbound.user_email = "panel/hj-anytls/1041|714443|714443";
-        ctx.outbound.target = acpp::TargetAddress("example.com", 443);
+        ctx.outbound.target = ::TargetAddress("example.com", 443);
         ctx.outbound.tag = "direct";
-        ctx.outbound.connected_local_addr = acpp::net::ip::make_address("2602:2b5:20:111::abcd");
-        auto access = acpp::FormatAccessLog(ctx);
+        ctx.outbound.connected_local_addr = ::net::ip::make_address("2602:2b5:20:111::abcd");
+        auto access = ::FormatAccessLog(ctx);
         Expect(Has(access, "from 192.0.2.10:52000 accepted tcp:example.com:443") &&
                Has(access, "[panel/hj-anytls/1041/anytls/55911 -> direct]"),
                "accepted connection lost its source, target or route");
@@ -52,21 +52,21 @@ TEST(SessionAccessLog, Contract) {
                Has(access, " sendThrough:2602:2b5:20:111::abcd"),
                "verified UID, existing identity and actual local address must coexist");
 
-        ctx.inbound.ApplyForwardedMetadata(acpp::ForwardedMetadata{
+        ctx.inbound.ApplyForwardedMetadata(::ForwardedMetadata{
             .user_id = 1001,
-            .user_email = acpp::memory::ThreadLocalString("alice@origin.example"),
-            .client_ip = acpp::net::ip::make_address("203.0.113.88"),
-            .inbound_tag = acpp::memory::ThreadLocalString("panel/site-a/10/vless/443"),
+            .user_email = ::memory::ThreadLocalString("alice@origin.example"),
+            .client_ip = ::net::ip::make_address("203.0.113.88"),
+            .inbound_tag = ::memory::ThreadLocalString("panel/site-a/10/vless/443"),
         });
         allocations = 0;
         count_allocations = true;
-        access = acpp::FormatAccessLog(ctx);
+        access = ::FormatAccessLog(ctx);
         count_allocations = false;
         Expect(allocations == 1, "access log with passthrough fields must allocate once");
         Expect(Has(access, " origin:203.0.113.88|panel/site-a/10/vless/443|1001|alice@origin.example ") &&
                Has(access, " sendThrough:2602:2b5:20:111::abcd"),
                "passthrough origin IP, tag and user identity must appear in access log");
-        acpp::ForwardedMetadata partial_origin;
+        ::ForwardedMetadata partial_origin;
         partial_origin.user_email = "bob@origin.example";
         ctx.inbound.ApplyForwardedMetadata(partial_origin);
         Expect(ctx.inbound.origin_tag.empty() &&
@@ -75,7 +75,7 @@ TEST(SessionAccessLog, Contract) {
                ctx.inbound.origin_source_addr.is_unspecified() &&
                ctx.inbound.origin_source_ip.empty(),
                "partial forwarded metadata must replace rather than merge stale origin fields");
-        ctx.inbound.ApplyForwardedMetadata(acpp::ForwardedMetadata{});
+        ctx.inbound.ApplyForwardedMetadata(::ForwardedMetadata{});
         Expect(!ctx.inbound.HasOriginIdentity() &&
                ctx.inbound.origin_source_addr.is_unspecified() &&
                ctx.inbound.origin_source_ip.empty(),
@@ -83,7 +83,7 @@ TEST(SessionAccessLog, Contract) {
 
         ctx.worker_id = 7;
         ctx.content.speed_limit = 123456;
-        ctx.content.network = acpp::Network::UDP;
+        ctx.content.network = ::Network::UDP;
         ctx.content.protocol = "quic";
         ctx.InitSubstreamFrom(ctx, 53000);
         Expect(ctx.worker_id == 7 &&
@@ -91,73 +91,73 @@ TEST(SessionAccessLog, Contract) {
                ctx.inbound.tag == "panel/hj-anytls/1041/anytls/55911" &&
                ctx.outbound.tag == "direct" &&
                ctx.content.speed_limit == 123456 &&
-               ctx.content.network == acpp::Network::TCP &&
+               ctx.content.network == ::Network::TCP &&
                ctx.content.protocol.empty(),
                "self-aliased InitSubstreamFrom must preserve parent fields and reset content");
         ctx.inbound.source_port = 52000;
-        ctx.outbound.target = acpp::TargetAddress("example.com", 443);
-        ctx.outbound.connected_local_addr = acpp::net::ip::make_address("2602:2b5:20:111::abcd");
+        ctx.outbound.target = ::TargetAddress("example.com", 443);
+        ctx.outbound.connected_local_addr = ::net::ip::make_address("2602:2b5:20:111::abcd");
 
         ctx.inbound.user_email = "714443";
-        access = acpp::FormatAccessLog(ctx);
+        access = ::FormatAccessLog(ctx);
         Expect(Has(access, " user:714443 ") && !Has(access, "email:"),
                "numeric identity duplicated the verified UID");
         ctx.inbound.user_id = 0;
         ctx.inbound.user_email = "user@example.com";
         ctx.outbound.connected_local_addr.reset();
-        access = acpp::FormatAccessLog(ctx);
+        access = ::FormatAccessLog(ctx);
         Expect(Has(access, " email:user@example.com") && !Has(access, " user:") &&
                !Has(access, "sendThrough:"),
                "email-only identity must not become a numeric UID or fake local address");
-        access = acpp::FormatAccessLog(ctx, acpp::AccessStatus::Rejected, "device limit exceeded");
+        access = ::FormatAccessLog(ctx, ::AccessStatus::Rejected, "device limit exceeded");
         Expect(Has(access, " email:user@example.com") && !Has(access, " user:"),
                "authenticated static identity must survive admission rejection");
         ctx.inbound.user_email.clear();
 
         ctx.outbound.target = {};
         ctx.outbound.tag = {};
-        access = acpp::FormatAccessLog(ctx, acpp::AccessStatus::Rejected, "authentication failed");
+        access = ::FormatAccessLog(ctx, ::AccessStatus::Rejected, "authentication failed");
         Expect(Has(access, "from 192.0.2.10:52000 rejected authentication failed") &&
                Has(access, "[panel/hj-anytls/1041/anytls/55911]") &&
                !Has(access, "user:") && !Has(access, "email:") &&
                !Has(access, "tcp:") && !Has(access, "unknown") && !Has(access, " -> "),
                "pre-authentication rejection must omit unverified identity, target and outbound");
-        ctx.outbound.target = acpp::TargetAddress("invalid host", 443);
-        access = acpp::FormatAccessLog(ctx, acpp::AccessStatus::Rejected, "invalid target");
+        ctx.outbound.target = ::TargetAddress("invalid host", 443);
+        access = ::FormatAccessLog(ctx, ::AccessStatus::Rejected, "invalid target");
         Expect(!Has(access, "invalid host") && !Has(access, "tcp:"),
                "malformed target must not be logged as a valid destination");
 
         ctx.inbound.user_id = 714443;
         ctx.inbound.user_email = "714443";
-        ctx.outbound.target = acpp::TargetAddress("example.com", 443);
-        access = acpp::FormatAccessLog(ctx, acpp::AccessStatus::Rejected, "device limit exceeded");
+        ctx.outbound.target = ::TargetAddress("example.com", 443);
+        access = ::FormatAccessLog(ctx, ::AccessStatus::Rejected, "device limit exceeded");
         Expect(Has(access, "rejected tcp:example.com:443 device limit exceeded") &&
                Has(access, "user:714443") && !Has(access, "authentication failed"),
                "authenticated admission rejection lost its identity or true reason");
 
         ctx.inbound.source_ip = "2001:db8::1";
-        ctx.outbound.target = acpp::TargetAddress("2001:db8::2", 65535);
-        access = acpp::FormatAccessLog(ctx);
+        ctx.outbound.target = ::TargetAddress("2001:db8::2", 65535);
+        access = ::FormatAccessLog(ctx);
         Expect(Has(access, "from [2001:db8::1]:52000") &&
                Has(access, "tcp:[2001:db8::2]:65535"),
                "IPv6 endpoints need unambiguous port boundaries");
         allocations = 0;
         count_allocations = true;
-        access = acpp::FormatAccessLog(ctx);
+        access = ::FormatAccessLog(ctx);
         count_allocations = false;
         Expect(allocations == 1, "access log must allocate only its final owning string");
 
         ctx.inbound.source_ip.clear();
-        ctx.inbound.source_addr = acpp::net::ip::make_address("::ffff:192.0.2.1");
-        ctx.outbound.target = acpp::TargetAddress(acpp::net::ip::make_address("::ffff:198.51.100.1"), 443);
-        access = acpp::FormatAccessLog(ctx);
+        ctx.inbound.source_addr = ::net::ip::make_address("::ffff:192.0.2.1");
+        ctx.outbound.target = ::TargetAddress(::net::ip::make_address("::ffff:198.51.100.1"), 443);
+        access = ::FormatAccessLog(ctx);
         Expect(Has(access, "from 192.0.2.1:52000") && Has(access, "tcp:198.51.100.1:443"),
                "IPv4-mapped endpoints must retain their normalized identity");
-        ctx.inbound.source_addr = acpp::net::ip::address{};
+        ctx.inbound.source_addr = ::net::ip::address{};
         ctx.inbound.user_id = 0;
         ctx.inbound.user_email.clear();
         ctx.outbound.target = {};
-        access = acpp::FormatAccessLog(ctx, acpp::AccessStatus::Rejected, "connection limit exceeded");
+        access = ::FormatAccessLog(ctx, ::AccessStatus::Rejected, "connection limit exceeded");
         Expect(!Has(access, "unknown") && !Has(access, " from ") &&
                !Has(access, "email:") && !Has(access, "user:"),
                "missing pre-authentication fields must not be fabricated");

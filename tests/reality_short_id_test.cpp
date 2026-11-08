@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "acppnode/transport/internet/reality_short_id.hpp"
+#include "transport/internet/reality_short_id.hpp"
 
 #include <cstdio>
 
@@ -14,8 +14,8 @@ bool Require(bool condition, const char* message) {
 }  // namespace
 
 TEST(RealityShortId, Contract) {
-    using acpp::transport::internet::ParseRealityShortId;
-    using acpp::transport::internet::RealityShortId;
+    using ::transport::internet::ParseRealityShortId;
+    using ::transport::internet::RealityShortId;
 
     const auto empty = ParseRealityShortId("");
     ASSERT_FALSE((!Require(empty && *empty == RealityShortId{},

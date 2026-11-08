@@ -1,6 +1,6 @@
 #pragma once
 
-#include "acppnode/common/allocator.hpp"
+#include "common/allocator.hpp"
 
 #include <array>
 #include <cstddef>
@@ -9,7 +9,7 @@
 #include <span>
 #include <string_view>
 
-namespace acpp::transport::internet {
+namespace transport::internet {
 
 inline constexpr size_t kMaxGrpcHunkMessageSize = 4 * 1024 * 1024;
 
@@ -41,4 +41,4 @@ private:
     size_t data_end_ = 0;
 };
 
-}  // namespace acpp::transport::internet
+}  // namespace transport::internet

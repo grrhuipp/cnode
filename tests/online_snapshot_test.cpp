@@ -24,7 +24,7 @@ void Check(bool condition, std::string_view message) {
 }  // namespace
 
 TEST(OnlineSnapshot, Contract) {
-    std::vector<acpp::OnlineDevice> devices{
+    std::vector<::OnlineDevice> devices{
         {8, "203.0.113.8"},
         {7, "203.0.113.2"},
         {7, "203.0.113.1"},
@@ -33,7 +33,7 @@ TEST(OnlineSnapshot, Contract) {
         {9, ""},
     };
 
-    auto snapshot = acpp::controller::BuildOnlineSnapshot(std::move(devices));
+    auto snapshot = ::controller::BuildOnlineSnapshot(std::move(devices));
     Check(snapshot.user_count == 2,
           "multiple IPs for one UID were counted as multiple users");
     Check(snapshot.entries.size() == 3,

@@ -1,11 +1,11 @@
 #pragma once
 
-#include "acppnode/app/proxyman/inbound/prepared_config.hpp"
+#include "app/proxyman/inbound/prepared_config.hpp"
 #include "hysteria_protocol.hpp"
 
 #include <cstdint>
 
-namespace acpp::transport::internet::hysteria {
+namespace transport::internet::hysteria {
 
 // Prepared Hysteria settings, built by the proxy registration on the cold
 // path. The QUIC transport selects ALPN/auth/framing by version and announces
@@ -22,4 +22,4 @@ public:
     return dynamic_cast<const Settings*>(request.settings.get());
 }
 
-}  // namespace acpp::transport::internet::hysteria
+}  // namespace transport::internet::hysteria

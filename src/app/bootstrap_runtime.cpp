@@ -1,15 +1,15 @@
-#include "acppnode/app/bootstrap_runtime.hpp"
+#include "app/bootstrap_runtime.hpp"
 
-#include "acppnode/app/bootstrap_inbounds.hpp"
-#include "acppnode/app/bootstrap_monitor.hpp"
-#include "acppnode/app/bootstrap_shutdown.hpp"
-#include "acppnode/app/dns/dns_worker.hpp"
-#include "acppnode/infra/log.hpp"
-#include "acppnode/infra/runtime_failure.hpp"
-#include "acppnode/service/controller/controller.hpp"
-#include "acppnode/app/worker.hpp"
-#include "acppnode/app/session_group_executor.hpp"
-#include "acppnode/transport/internet/timeout_scheduler.hpp"
+#include "app/bootstrap_inbounds.hpp"
+#include "app/bootstrap_monitor.hpp"
+#include "app/bootstrap_shutdown.hpp"
+#include "app/dns/dns_worker.hpp"
+#include "infra/log.hpp"
+#include "infra/runtime_failure.hpp"
+#include "service/controller/controller.hpp"
+#include "app/worker.hpp"
+#include "app/session_group_executor.hpp"
+#include "transport/internet/timeout_scheduler.hpp"
 #include "../common/awaitable_batch.hpp"
 
 #include <asio/co_spawn.hpp>
@@ -24,7 +24,6 @@
 #include <thread>
 #include <stdexcept>
 
-namespace acpp {
 namespace {
 
 // All state transitions run on main_ctx. Data threads may only publish one
@@ -240,4 +239,3 @@ int RunApplicationRuntime(const RuntimeContext& ctx) noexcept {
     }
 }
 
-}  // namespace acpp

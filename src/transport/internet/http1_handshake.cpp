@@ -1,13 +1,13 @@
 #include "http1_handshake.hpp"
-#include "acppnode/common/binary_text_codec.hpp"
+#include "common/binary_text_codec.hpp"
 
 #include "http_path_match.hpp"
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/buffer_util.hpp"
-#include "acppnode/infra/log.hpp"
-#include "acppnode/transport/internet/http_headers.hpp"
-#include "acppnode/transport/internet/tcp_stream.hpp"
-#include "acppnode/transport/internet/ws_stream.hpp"
+#include "common/allocator.hpp"
+#include "common/buffer_util.hpp"
+#include "infra/log.hpp"
+#include "transport/internet/http_headers.hpp"
+#include "transport/internet/tcp_stream.hpp"
+#include "transport/internet/ws_stream.hpp"
 
 #include <openssl/base64.h>
 
@@ -19,7 +19,7 @@
 #include <limits>
 #include <optional>
 
-namespace acpp::transport::internet {
+namespace transport::internet {
 namespace {
 
 using detail::EffectiveHttpPath;
@@ -1335,4 +1335,4 @@ net::awaitable<TransportBuildResult> DoWsServerHandshake(
     co_return std::unique_ptr<AsyncStream>(std::move(ws));
 }
 
-}  // namespace acpp::transport::internet
+}  // namespace transport::internet

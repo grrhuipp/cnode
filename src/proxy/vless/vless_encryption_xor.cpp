@@ -8,7 +8,7 @@
 #include <algorithm>
 #include <limits>
 #include <utility>
-namespace acpp::vless {
+namespace vless {
 namespace {
 
 constexpr char kVlessCtrContext[] = "VLESS";
@@ -181,4 +181,4 @@ bool VlessEncryptionHeaderXor::FinishHeader() noexcept {
     return true;
 }
 
-}  // namespace acpp::vless
+}  // namespace vless

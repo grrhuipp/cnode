@@ -1,9 +1,9 @@
 #pragma once
 
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/asio_types.hpp"
-#include "acppnode/common/buf/multi_buffer.hpp"
-#include "acppnode/transport/link.hpp"
+#include "common/allocator.hpp"
+#include "common/asio_types.hpp"
+#include "common/buf/multi_buffer.hpp"
+#include "transport/link.hpp"
 
 #include "vless_encryption_crypto.hpp"
 #include "vless_encryption_record.hpp"
@@ -16,7 +16,7 @@
 #include <span>
 #include <variant>
 
-namespace acpp::vless {
+namespace vless {
 
 struct VlessEncryptionClientTicketCache;
 
@@ -91,4 +91,4 @@ private:
     std::optional<VlessEncryptionHeaderXor> header_xor_;
 };
 
-}  // namespace acpp::vless
+}  // namespace vless

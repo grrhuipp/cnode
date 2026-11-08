@@ -1,10 +1,10 @@
 #include <gtest/gtest.h>
 
-#include "acppnode/transport/internet/datagram_socket.hpp"
+#include "transport/internet/datagram_socket.hpp"
 
-#include "acppnode/common/buf/multi_buffer.hpp"
-#include "acppnode/transport/link_error.hpp"
-#include "acppnode/app/session_group_executor.hpp"
+#include "common/buf/multi_buffer.hpp"
+#include "transport/link_error.hpp"
+#include "app/session_group_executor.hpp"
 #include <optional>
 #include <thread>
 
@@ -25,14 +25,14 @@
 
 namespace {
 using namespace std::chrono_literals;
-using acpp::transport::internet::DatagramSocket;
-using acpp::transport::internet::ReceivedDatagram;
+using ::transport::internet::DatagramSocket;
+using ::transport::internet::ReceivedDatagram;
 
-acpp::buf::MultiBuffer MakePayload(std::span<const uint8_t> bytes) {
-    acpp::buf::MultiBuffer payload;
+::buf::MultiBuffer MakePayload(std::span<const uint8_t> bytes) {
+    ::buf::MultiBuffer payload;
     std::size_t offset = 0;
     while (offset < bytes.size()) {
-        acpp::buf::BufferGuard buffer{acpp::buf::Buffer::New()};
+        ::buf::BufferGuard buffer{::buf::Buffer::New()};
         if (!buffer) throw std::bad_alloc();
         const auto count = std::min<std::size_t>(buffer->Available(), bytes.size() - offset);
         std::memcpy(buffer->Tail().data(), bytes.data() + offset, count);
@@ -43,35 +43,35 @@ acpp::buf::MultiBuffer MakePayload(std::span<const uint8_t> bytes) {
     return payload;
 }
 
-acpp::net::awaitable<void> SendPayload(
-    DatagramSocket& socket, acpp::udp::endpoint destination, acpp::buf::MultiBuffer payload) {
+::net::awaitable<void> SendPayload(
+    DatagramSocket& socket, ::udp::endpoint destination, ::buf::MultiBuffer payload) {
     auto operation = socket.StartWrite();
     co_await operation.SendTo(std::move(destination), std::move(payload));
 }
 
-acpp::net::awaitable<void> SendBuffers(
-    DatagramSocket& socket, acpp::udp::endpoint destination,
-    std::span<const acpp::net::const_buffer> buffers) {
+::net::awaitable<void> SendBuffers(
+    DatagramSocket& socket, ::udp::endpoint destination,
+    std::span<const ::net::const_buffer> buffers) {
     auto operation = socket.StartWrite();
     co_await operation.SendTo(std::move(destination), buffers);
 }
 
-acpp::net::awaitable<void> ParentRead(DatagramSocket& socket) {
+::net::awaitable<void> ParentRead(DatagramSocket& socket) {
     auto operation = socket.StartRead();
     (void)co_await operation.Receive();
 }
 
-acpp::net::awaitable<void> SendEmptyRaw(
-    acpp::net::io_context& io, acpp::udp::endpoint destination) {
-    acpp::udp::socket sender(io, acpp::udp::v4());
-    const std::array<acpp::net::const_buffer, 1> empty{acpp::net::const_buffer{}};
-    (void)co_await sender.async_send_to(empty, destination, acpp::net::use_awaitable);
+::net::awaitable<void> SendEmptyRaw(
+    ::net::io_context& io, ::udp::endpoint destination) {
+    ::udp::socket sender(io, ::udp::v4());
+    const std::array<::net::const_buffer, 1> empty{::net::const_buffer{}};
+    (void)co_await sender.async_send_to(empty, destination, ::net::use_awaitable);
 }
 
 bool TestIndependentBindingsAndLargeScatter() {
-    acpp::net::io_context io;
-    DatagramSocket receiver(io, acpp::net::ip::address_v4::loopback());
-    DatagramSocket sender(io, acpp::net::ip::address_v4::loopback());
+    ::net::io_context io;
+    DatagramSocket receiver(io, ::net::ip::address_v4::loopback());
+    DatagramSocket sender(io, ::net::ip::address_v4::loopback());
     const auto target = receiver.LocalEndpoint();
     if (target.port() == sender.LocalEndpoint().port() || DatagramSocket::ActiveCount() < 2)
         return false;
@@ -79,9 +79,9 @@ bool TestIndependentBindingsAndLargeScatter() {
     std::vector<uint8_t> bytes(60000);
     for (std::size_t i = 0; i < bytes.size(); ++i) bytes[i] = static_cast<uint8_t>(i * 31u);
     auto read = receiver.StartRead();
-    auto receiving = acpp::net::co_spawn(io, read.Receive(), acpp::net::use_future);
-    auto sending = acpp::net::co_spawn(io,
-        SendPayload(sender, target, MakePayload(bytes)), acpp::net::use_future);
+    auto receiving = ::net::co_spawn(io, read.Receive(), ::net::use_future);
+    auto sending = ::net::co_spawn(io,
+        SendPayload(sender, target, MakePayload(bytes)), ::net::use_future);
     io.run();
     sending.get();
     ReceivedDatagram packet = receiving.get();
@@ -95,18 +95,18 @@ bool TestIndependentBindingsAndLargeScatter() {
     }
     if (offset != bytes.size()) return false;
 
-    acpp::buf::MultiBuffer fragmented;
+    ::buf::MultiBuffer fragmented;
     for (uint8_t i = 0; i < 100; ++i) {
-        acpp::buf::BufferGuard buffer{acpp::buf::Buffer::New()};
+        ::buf::BufferGuard buffer{::buf::Buffer::New()};
         if (!buffer) return false;
         buffer->Tail()[0] = i;
         buffer->Produce(1);
         fragmented.push_back(std::move(buffer));
     }
     io.restart();
-    auto fragmented_receive = acpp::net::co_spawn(io, read.Receive(), acpp::net::use_future);
-    auto fragmented_send = acpp::net::co_spawn(io,
-        SendPayload(sender, target, std::move(fragmented)), acpp::net::use_future);
+    auto fragmented_receive = ::net::co_spawn(io, read.Receive(), ::net::use_future);
+    auto fragmented_send = ::net::co_spawn(io,
+        SendPayload(sender, target, std::move(fragmented)), ::net::use_future);
     io.run();
     fragmented_send.get();
     const auto fragments = fragmented_receive.get();
@@ -119,14 +119,14 @@ bool TestIndependentBindingsAndLargeScatter() {
     if (index != 100) return false;
 
     std::array<uint8_t, 100> raw{};
-    std::array<acpp::net::const_buffer, 100> scatter{};
+    std::array<::net::const_buffer, 100> scatter{};
     for (std::size_t i = 0; i < raw.size(); ++i) {
         raw[i] = static_cast<uint8_t>(i);
-        scatter[i] = acpp::net::buffer(&raw[i], 1);
+        scatter[i] = ::net::buffer(&raw[i], 1);
     }
     io.restart();
-    auto raw_receive = acpp::net::co_spawn(io, read.Receive(), acpp::net::use_future);
-    auto raw_send = acpp::net::co_spawn(io, SendBuffers(sender, target, scatter), acpp::net::use_future);
+    auto raw_receive = ::net::co_spawn(io, read.Receive(), ::net::use_future);
+    auto raw_send = ::net::co_spawn(io, SendBuffers(sender, target, scatter), ::net::use_future);
     io.run();
     raw_send.get();
     const auto raw_packet = raw_receive.get();
@@ -139,30 +139,31 @@ bool TestIndependentBindingsAndLargeScatter() {
 }
 
 bool TestZeroLengthAndCancellationIsolation() {
-    acpp::net::io_context io;
-    DatagramSocket first(io, acpp::net::ip::address_v4::loopback());
-    DatagramSocket second(io, acpp::net::ip::address_v4::loopback());
+    ::net::io_context io;
+    DatagramSocket first(io, ::net::ip::address_v4::loopback());
+    DatagramSocket second(io, ::net::ip::address_v4::loopback());
     const auto count = DatagramSocket::ActiveCount();
 
     auto cancelled_read = first.StartRead();
-    auto cancelled_future = acpp::net::co_spawn(io, cancelled_read.Receive(), acpp::net::use_future);
+    auto cancelled_future = ::net::co_spawn(io, cancelled_read.Receive(), ::net::use_future);
     auto live_read = second.StartRead();
-    auto live_future = acpp::net::co_spawn(io, live_read.Receive(), acpp::net::use_future);
+    auto live_future = ::net::co_spawn(io, live_read.Receive(), ::net::use_future);
     io.poll();
     first.Cancel();
-    auto empty_send = acpp::net::co_spawn(io,
-        SendEmptyRaw(io, second.LocalEndpoint()), acpp::net::use_future);
+    auto empty_send = ::net::co_spawn(io,
+        SendEmptyRaw(io, second.LocalEndpoint()), ::net::use_future);
     io.restart();
     io.run();
     empty_send.get();
 
     bool cancelled = false;
     try { (void)cancelled_future.get(); }
-    catch (const acpp::transport::LinkError& error) {
-        cancelled = error.code() == acpp::ErrorCode::CANCELLED;
+    catch (const ::transport::LinkError& error) {
+        cancelled = error.code() == ::ErrorCode::CANCELLED;
     }
     const auto packet = live_future.get();
-    if (!cancelled || !packet.payload.empty() || packet.source.address().is_v6() ||
+    if (!cancelled || packet.payload.empty() || packet.payload.byte_size() != 0 ||
+        packet.source.address().is_v6() ||
         DatagramSocket::ActiveCount() != count || first.IsIPv6() || second.IsIPv6())
         return false;
     first.Close();
@@ -170,13 +171,13 @@ bool TestZeroLengthAndCancellationIsolation() {
 }
 
 bool TestParentCancellationPropagation() {
-    acpp::net::io_context io;
-    DatagramSocket socket(io, acpp::net::ip::address_v4::loopback());
-    acpp::net::cancellation_signal parent_cancel;
-    auto future = acpp::net::co_spawn(io, ParentRead(socket),
-        acpp::net::bind_cancellation_slot(parent_cancel.slot(), acpp::net::use_future));
+    ::net::io_context io;
+    DatagramSocket socket(io, ::net::ip::address_v4::loopback());
+    ::net::cancellation_signal parent_cancel;
+    auto future = ::net::co_spawn(io, ParentRead(socket),
+        ::net::bind_cancellation_slot(parent_cancel.slot(), ::net::use_future));
     io.poll();
-    parent_cancel.emit(acpp::net::cancellation_type::terminal);
+    parent_cancel.emit(::net::cancellation_type::terminal);
     io.restart();
     io.run_for(100ms);
     const bool completed_without_socket_cancel =
@@ -189,21 +190,21 @@ bool TestParentCancellationPropagation() {
     bool aborted = false;
     try { future.get(); }
     catch (const std::system_error& error) {
-        aborted = error.code() == acpp::io_error::operation_aborted;
+        aborted = error.code() == ::io_error::operation_aborted;
     }
     return completed_without_socket_cancel && aborted;
 }
 
 bool TestIPv6MaximumAndFamilyValidation() {
-    acpp::net::io_context io;
-    DatagramSocket receiver(io, acpp::net::ip::address_v6::loopback());
-    DatagramSocket sender(io, acpp::net::ip::address_v6::loopback());
-    DatagramSocket v4(io, acpp::net::ip::address_v4::loopback());
+    ::net::io_context io;
+    DatagramSocket receiver(io, ::net::ip::address_v6::loopback());
+    DatagramSocket sender(io, ::net::ip::address_v6::loopback());
+    DatagramSocket v4(io, ::net::ip::address_v4::loopback());
     std::vector<uint8_t> bytes(65527, 0xA5);
     auto read = receiver.StartRead();
-    auto receiving = acpp::net::co_spawn(io, read.Receive(), acpp::net::use_future);
-    auto sending = acpp::net::co_spawn(io,
-        SendPayload(sender, receiver.LocalEndpoint(), MakePayload(bytes)), acpp::net::use_future);
+    auto receiving = ::net::co_spawn(io, read.Receive(), ::net::use_future);
+    auto sending = ::net::co_spawn(io,
+        SendPayload(sender, receiver.LocalEndpoint(), MakePayload(bytes)), ::net::use_future);
     io.run();
     sending.get();
     const auto packet = receiving.get();
@@ -212,62 +213,62 @@ bool TestIPv6MaximumAndFamilyValidation() {
     bool family_rejected = false;
     {
         auto invalid_family = sender.StartWrite();
-        auto family_future = acpp::net::co_spawn(io,
+        auto family_future = ::net::co_spawn(io,
             invalid_family.SendTo(v4.LocalEndpoint(), MakePayload(std::span<const uint8_t>{})),
-            acpp::net::use_future);
+            ::net::use_future);
         io.restart();
         io.run();
         try { family_future.get(); }
-        catch (const acpp::transport::LinkError& error) {
-            family_rejected = error.code() == acpp::ErrorCode::INVALID_ARGUMENT;
+        catch (const ::transport::LinkError& error) {
+            family_rejected = error.code() == ::ErrorCode::INVALID_ARGUMENT;
         }
     }
 
     std::vector<uint8_t> too_large(65528, 0x5A);
     auto invalid_size = sender.StartWrite();
-    auto size_future = acpp::net::co_spawn(io,
+    auto size_future = ::net::co_spawn(io,
         invalid_size.SendTo(receiver.LocalEndpoint(), MakePayload(too_large)),
-        acpp::net::use_future);
+        ::net::use_future);
     io.restart();
     io.run();
     bool size_rejected = false;
     try { size_future.get(); }
-    catch (const acpp::transport::LinkError& error) {
-        size_rejected = error.code() == acpp::ErrorCode::INVALID_ARGUMENT;
+    catch (const ::transport::LinkError& error) {
+        size_rejected = error.code() == ::ErrorCode::INVALID_ARGUMENT;
     }
     return family_rejected && size_rejected;
 }
 
 bool TestCloseAndReadScopeTimeout() {
     const auto baseline = DatagramSocket::ActiveCount();
-    acpp::net::io_context io;
-    DatagramSocket receiver(io, acpp::net::ip::address_v4::loopback());
-    DatagramSocket sender(io, acpp::net::ip::address_v4::loopback());
+    ::net::io_context io;
+    DatagramSocket receiver(io, ::net::ip::address_v4::loopback());
+    DatagramSocket sender(io, ::net::ip::address_v4::loopback());
     receiver.SetReadTimeout(1s);
     auto operation = receiver.StartRead();
-    auto first = acpp::net::co_spawn(io, operation.Receive(), acpp::net::use_future);
+    auto first = ::net::co_spawn(io, operation.Receive(), ::net::use_future);
     const std::array<uint8_t, 1> one_byte{7};
-    auto send_one = acpp::net::co_spawn(io,
+    auto send_one = ::net::co_spawn(io,
         SendPayload(sender, receiver.LocalEndpoint(), MakePayload(one_byte)),
-        acpp::net::use_future);
+        ::net::use_future);
     io.run_for(100ms);
     send_one.get();
     if (first.wait_for(0ms) != std::future_status::ready || first.get().payload.byte_size() != 1)
         return false;
 
     // The same scope keeps its original read deadline across repeated receives.
-    auto second = acpp::net::co_spawn(io, operation.Receive(), acpp::net::use_future);
+    auto second = ::net::co_spawn(io, operation.Receive(), ::net::use_future);
     io.restart();
     io.run_for(1100ms);
     if (second.wait_for(0ms) != std::future_status::ready) return false;
     bool timed_out = false;
     try { (void)second.get(); }
-    catch (const acpp::transport::LinkError&) { timed_out = true; }
+    catch (const ::transport::LinkError&) { timed_out = true; }
     if (!timed_out || !receiver.ConsumeReadTimeout()) return false;
 
-    DatagramSocket closed(io, acpp::net::ip::address_v4::loopback());
+    DatagramSocket closed(io, ::net::ip::address_v4::loopback());
     auto pending = closed.StartRead();
-    auto pending_future = acpp::net::co_spawn(io, pending.Receive(), acpp::net::use_future);
+    auto pending_future = ::net::co_spawn(io, pending.Receive(), ::net::use_future);
     io.restart();
     io.poll();
     closed.Close();
@@ -275,43 +276,43 @@ bool TestCloseAndReadScopeTimeout() {
     io.run();
     bool closed_error = false;
     try { (void)pending_future.get(); }
-    catch (const acpp::transport::LinkError&) { closed_error = true; }
+    catch (const ::transport::LinkError&) { closed_error = true; }
     return closed_error && DatagramSocket::ActiveCount() == baseline + 1;
 }
 bool TestSocketLimitAndReclamation() {
     constexpr std::size_t limit = 4096;
     const auto baseline = DatagramSocket::ActiveCount();
     if (baseline >= limit) return false;
-    acpp::net::io_context io;
+    ::net::io_context io;
     std::vector<std::unique_ptr<DatagramSocket>> sockets;
     sockets.reserve(limit - baseline);
     for (std::size_t i = baseline; i < limit; ++i)
-        sockets.push_back(std::make_unique<DatagramSocket>(io, acpp::net::ip::address_v4::loopback()));
+        sockets.push_back(std::make_unique<DatagramSocket>(io, ::net::ip::address_v4::loopback()));
     bool rejected = false;
-    try { DatagramSocket extra(io, acpp::net::ip::address_v4::loopback()); }
-    catch (const acpp::transport::LinkError& error) {
-        rejected = error.code() == acpp::ErrorCode::RESOURCE_EXHAUSTED;
+    try { DatagramSocket extra(io, ::net::ip::address_v4::loopback()); }
+    catch (const ::transport::LinkError& error) {
+        rejected = error.code() == ::ErrorCode::RESOURCE_EXHAUSTED;
     }
     if (!rejected || DatagramSocket::ActiveCount() != limit) return false;
     sockets.pop_back();
     {
-        DatagramSocket replacement(io, acpp::net::ip::address_v4::loopback());
+        DatagramSocket replacement(io, ::net::ip::address_v4::loopback());
         if (DatagramSocket::ActiveCount() != limit) return false;
     }
     sockets.clear();
     return DatagramSocket::ActiveCount() == baseline;
 }
 bool TestZeroLengthNativeSends() {
-    acpp::net::io_context io;
-    DatagramSocket sender(io, acpp::net::ip::address_v4::loopback());
-    DatagramSocket receiver(io, acpp::net::ip::address_v4::loopback());
+    ::net::io_context io;
+    DatagramSocket sender(io, ::net::ip::address_v4::loopback());
+    DatagramSocket receiver(io, ::net::ip::address_v4::loopback());
     for (bool owned : {false, true}) {
         auto operation = receiver.StartRead();
-        auto receiving = acpp::net::co_spawn(io, operation.Receive(), acpp::net::use_future);
-        auto sending = acpp::net::co_spawn(io,
+        auto receiving = ::net::co_spawn(io, operation.Receive(), ::net::use_future);
+        auto sending = ::net::co_spawn(io,
             owned ? SendPayload(sender, receiver.LocalEndpoint(), {})
                   : SendBuffers(sender, receiver.LocalEndpoint(), {}),
-            acpp::net::use_future);
+            ::net::use_future);
         io.run_for(1s);
         if (sending.wait_for(0s) != std::future_status::ready ||
             receiving.wait_for(0s) != std::future_status::ready) {
@@ -322,31 +323,33 @@ bool TestZeroLengthNativeSends() {
             return false;
         }
         sending.get();
-        if (!receiving.get().payload.empty()) return false;
+        const auto packet = receiving.get();
+        if (packet.payload.empty() || packet.payload.byte_size() != 0 ||
+            packet.source != sender.LocalEndpoint()) return false;
         io.restart();
     }
     return true;
 }
 
 bool TestAdmissionBucketSurvivesDomainMigration() {
-    struct Hooks final : acpp::ExecutionDomain::Hooks {
-        acpp::memory::AllocationDomain allocation;
-        std::optional<acpp::memory::ScopedAllocationDomain> lease;
+    struct Hooks final : ::ExecutionDomain::Hooks {
+        ::memory::AllocationDomain allocation;
+        std::optional<::memory::ScopedAllocationDomain> lease;
         std::exception_ptr failure;
         void Enter() noexcept override { lease.emplace(allocation); }
         void Leave() noexcept override { lease.reset(); }
         void OnFailure(std::exception_ptr error) noexcept override { failure = error; }
     };
-    acpp::net::io_context io;
-    auto coordinator = std::make_shared<acpp::GroupCoordinator>(io);
+    ::net::io_context io;
+    auto coordinator = std::make_shared<::GroupCoordinator>(io);
     coordinator->RegisterWorker(0, io, io.get_executor());
     auto hooks = std::make_shared<Hooks>();
-    auto domain = acpp::ExecutionDomain::Create(io, 0, io.get_executor(), hooks, coordinator);
-    hooks->allocation.SetLeaseGroup(domain->LeaseIdentity(), acpp::ExecutionDomain::SharesLeaseIdentity);
+    auto domain = ::ExecutionDomain::Create(io, 0, io.get_executor(), hooks, coordinator);
+    hooks->allocation.SetLeaseGroup(domain->LeaseIdentity(), ::ExecutionDomain::SharesLeaseIdentity);
     const auto baseline = DatagramSocket::ActiveCount();
     std::unique_ptr<DatagramSocket> socket;
     domain->Execute([&] {
-        socket = std::make_unique<DatagramSocket>(io, acpp::net::ip::address_v4::loopback());
+        socket = std::make_unique<DatagramSocket>(io, ::net::ip::address_v4::loopback());
     });
     io.poll();
     if (!socket || DatagramSocket::ActiveCount() != baseline + 1) return false;
@@ -362,14 +365,14 @@ bool TestAdmissionBucketSurvivesDomainMigration() {
         DatagramSocket::ActiveCount() == baseline;
     domain.reset();
     bool finalized = false;
-    auto finalize = [](std::shared_ptr<acpp::GroupCoordinator> owner)
-        -> acpp::net::awaitable<void> {
+    auto finalize = [](std::shared_ptr<::GroupCoordinator> owner)
+        -> ::net::awaitable<void> {
         owner->CloseAdmission();
         co_await owner->AsyncJoin();
         owner->ReleaseServices();
         co_await owner->Finalize();
     };
-    acpp::net::co_spawn(io, finalize(coordinator),
+    ::net::co_spawn(io, finalize(coordinator),
         [&](std::exception_ptr error) { finalized = !error; });
     io.restart();
     io.run_for(1s);

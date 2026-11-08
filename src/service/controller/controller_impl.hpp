@@ -1,11 +1,11 @@
 #pragma once
 
-#include "acppnode/service/controller/controller.hpp"
+#include "service/controller/controller.hpp"
 
-#include "acppnode/api/api.hpp"
-#include "acppnode/app/prepared_inbound.hpp"
-#include "acppnode/infra/panel_config.hpp"
-#include "acppnode/core/naming.hpp"
+#include "api/api.hpp"
+#include "app/prepared_inbound.hpp"
+#include "infra/panel_config.hpp"
+#include "core/naming.hpp"
 #include "online_snapshot.hpp"
 #include "node_state.hpp"
 #include "node_transaction.hpp"
@@ -17,7 +17,6 @@
 #include <string_view>
 #include <vector>
 
-namespace acpp {
 
 namespace monitor_detail {
 class MonitorLoop;
@@ -86,4 +85,3 @@ struct Controller::Impl : std::enable_shared_from_this<Controller::Impl> {
     std::vector<std::unique_ptr<PanelRuntime>> panels_;
 };
 
-}  // namespace acpp

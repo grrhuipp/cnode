@@ -1,22 +1,22 @@
-#include "acppnode/app/session_capabilities.hpp"
+#include "app/session_capabilities.hpp"
 
-#include "acppnode/app/dispatcher/default_dispatcher.hpp"
-#include "acppnode/app/dns/dns.hpp"
-#include "acppnode/app/proxyman/inbound/factory.hpp"
-#include "acppnode/app/proxyman/inbound/handler.hpp"
-#include "acppnode/app/rate_limiter.hpp"
-#include "acppnode/app/request_load_state.hpp"
-#include "acppnode/app/router/router.hpp"
-#include "acppnode/app/session_tracking.hpp"
-#include "acppnode/app/stats.hpp"
-#include "acppnode/app/worker_runtime_config.hpp"
-#include "acppnode/app/worker_stats.hpp"
-#include "acppnode/common/rule.hpp"
-#include "acppnode/common/container_util.hpp"
-#include "acppnode/common/session.hpp"
-#include "acppnode/infra/log.hpp"
-#include "acppnode/transport/async_stream.hpp"
-#include "acppnode/transport/internet/timeout_scheduler.hpp"
+#include "app/dispatcher/default_dispatcher.hpp"
+#include "app/dns/dns.hpp"
+#include "app/proxyman/inbound/factory.hpp"
+#include "app/proxyman/inbound/handler.hpp"
+#include "app/rate_limiter.hpp"
+#include "app/request_load_state.hpp"
+#include "app/router/router.hpp"
+#include "app/session_tracking.hpp"
+#include "app/stats.hpp"
+#include "app/worker_runtime_config.hpp"
+#include "app/worker_stats.hpp"
+#include "common/rule.hpp"
+#include "common/container_util.hpp"
+#include "common/session.hpp"
+#include "infra/log.hpp"
+#include "transport/async_stream.hpp"
+#include "transport/internet/timeout_scheduler.hpp"
 #include "../common/awaitable_task_group.hpp"
 #include "../transport/internet/xhttp_session.hpp"
 #include "../proxy/inbound_admission.hpp"
@@ -29,7 +29,7 @@
 #include <stdexcept>
 #include <algorithm>
 #include <vector>
-namespace acpp::app {
+namespace app {
 
 PhysicalSessionRegistry::PhysicalSessionRegistry(
     net::io_context& io, uint32_t worker_id, StatsShard& totals,
@@ -358,4 +358,4 @@ void PhysicalSessionCapabilities::OnFailure(std::exception_ptr error) noexcept {
     } catch (...) {} // Failure reporting must remain noexcept, including under OOM.
 }
 
-} // namespace acpp::app
+} // namespace app

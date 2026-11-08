@@ -1,9 +1,9 @@
 #include <gtest/gtest.h>
 
 #include "app/dns/inflight_resolves.hpp"
-#include "acppnode/app/dns/dns_worker.hpp"
-#include "acppnode/app/worker_mailbox.hpp"
-#include "acppnode/common/allocator.hpp"
+#include "app/dns/dns_worker.hpp"
+#include "app/worker_mailbox.hpp"
+#include "common/allocator.hpp"
 
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/cancellation_signal.hpp>
@@ -24,9 +24,9 @@
 
 namespace {
 
-using acpp::app::dns::DnsResult;
-using acpp::app::dns::InflightResolves;
-namespace net = acpp::net;
+using ::app::dns::DnsResult;
+using ::app::dns::InflightResolves;
+namespace net = ::net;
 using namespace std::chrono_literals;
 
 thread_local size_t fail_size = 0;
@@ -43,8 +43,8 @@ net::awaitable<DnsResult> Query(net::io_context& io, size_t& calls, Failure fail
     ++calls;
     co_await net::post(io, net::use_awaitable);
     if (failure == Failure::Query) throw std::runtime_error("query failed");
-    if (failure == Failure::IoQuery) throw acpp::IoSystemError(acpp::io_error::connection_reset);
-    if (failure == Failure::CancelledQuery) throw acpp::IoSystemError(acpp::io_error::operation_aborted);
+    if (failure == Failure::IoQuery) throw ::IoSystemError(::io_error::connection_reset);
+    if (failure == Failure::CancelledQuery) throw ::IoSystemError(::io_error::operation_aborted);
     DnsResult result;
     result.addresses.assign(400, net::ip::make_address("192.0.2.1"));
     if (failure == Failure::ResultCopy) {
@@ -63,7 +63,7 @@ void TestCompletion(Failure failure) {
     std::array<std::exception_ptr, clients> errors;
     net::steady_timer watchdog(io, 2s);
     bool timed_out = false;
-    watchdog.async_wait([&](const acpp::IoErrorCode& error) {
+    watchdog.async_wait([&](const ::IoErrorCode& error) {
         if (!error) { timed_out = true; io.stop(); }
     });
     const auto failures_before = injected_failures;
@@ -91,8 +91,8 @@ void TestCompletion(Failure failure) {
                     "every uncancelled subscriber must receive the actual query exception");
             try {
                 std::rethrow_exception(errors[i]);
-            } catch (const acpp::IoSystemError& error) {
-                Require(failure == Failure::IoQuery && error.code() == acpp::io_error::connection_reset,
+            } catch (const ::IoSystemError& error) {
+                Require(failure == Failure::IoQuery && error.code() == ::io_error::connection_reset,
                         "non-cancellation I/O failures must preserve their concrete error code");
             } catch (const std::runtime_error& error) {
                 Require(failure == Failure::Query && std::string_view(error.what()) == "query failed",
@@ -107,7 +107,7 @@ void TestCompletion(Failure failure) {
                 ++copy_failures;
             }
         } else if (failure == Failure::CancelledQuery) {
-            Require(results[i].error == acpp::ErrorCode::CANCELLED,
+            Require(results[i].error == ::ErrorCode::CANCELLED,
                     "operation_aborted must remain an explicit cancellation result");
         } else {
             Require(results[i].Ok() && results[i].addresses.size() == 400,
@@ -140,7 +140,7 @@ void TestCompletion(Failure failure) {
 }
 
 net::awaitable<DnsResult> GatedQuery(
-    net::experimental::channel<void(acpp::IoErrorCode)>& gate, size_t& calls) {
+    net::experimental::channel<void(::IoErrorCode)>& gate, size_t& calls) {
     ++calls;
     (void)co_await gate.async_receive(net::as_tuple(net::use_awaitable));
     DnsResult result;
@@ -151,7 +151,7 @@ net::awaitable<DnsResult> GatedQuery(
 void TestSubscriberCancellation() {
     net::io_context io;
     InflightResolves inflight(io, 8);
-    net::experimental::channel<void(acpp::IoErrorCode)> gate(io);
+    net::experimental::channel<void(::IoErrorCode)> gate(io);
     net::cancellation_signal cancel;
     size_t calls = 0;
     std::array<DnsResult, 3> results;
@@ -177,12 +177,12 @@ void TestSubscriberCancellation() {
     Require(completed == 3 && calls == 1 && !errors[0] && !errors[2] &&
                 results[0].Ok() && results[2].Ok(),
             "cancelling one subscriber must not cancel the owner or another subscriber");
-    Require(errors[1] || results[1].error == acpp::ErrorCode::CANCELLED,
+    Require(errors[1] || results[1].error == ::ErrorCode::CANCELLED,
             "the cancelled subscriber must observe cancellation");
 }
 
 net::awaitable<DnsResult> DelayedCancellationQuery(
-    net::experimental::channel<void(acpp::IoErrorCode)>& gate, size_t& calls) {
+    net::experimental::channel<void(::IoErrorCode)>& gate, size_t& calls) {
     // Model an upstream whose cleanup cannot complete until its final callback.
     co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
     co_return co_await GatedQuery(gate, calls);
@@ -191,7 +191,7 @@ net::awaitable<DnsResult> DelayedCancellationQuery(
 void TestRetiredGenerationCapacity() {
     net::io_context io;
     InflightResolves inflight(io, 2);
-    net::experimental::channel<void(acpp::IoErrorCode)> old_gate(io), new_gate(io);
+    net::experimental::channel<void(::IoErrorCode)> old_gate(io), new_gate(io);
     net::cancellation_signal cancel;
     size_t calls = 0, survivors = 0;
     bool cancelled = false, rejected = false;
@@ -201,7 +201,7 @@ void TestRetiredGenerationCapacity() {
     net::co_spawn(io, inflight.Run("generation.example", old_query),
         net::bind_cancellation_slot(cancel.slot(),
             [&](std::exception_ptr error, DnsResult result) {
-                cancelled = error || result.error == acpp::ErrorCode::CANCELLED;
+                cancelled = error || result.error == ::ErrorCode::CANCELLED;
             }));
     io.poll();
     cancel.emit(net::cancellation_type::terminal);
@@ -216,7 +216,7 @@ void TestRetiredGenerationCapacity() {
     Require(calls == 2, "a new waiter must not attach to a cancelled generation");
     net::co_spawn(io, inflight.Run("capacity.example", new_query),
         [&](std::exception_ptr error, DnsResult result) {
-            rejected = !error && result.error == acpp::ErrorCode::RESOURCE_EXHAUSTED;
+            rejected = !error && result.error == ::ErrorCode::RESOURCE_EXHAUSTED;
         });
     io.poll();
     Require(rejected && calls == 2, "retired but unfinished queries must still consume capacity");
@@ -240,15 +240,15 @@ void TestRetiredGenerationCapacity() {
 }
 
 void TestDNSWorker() {
-    acpp::app::dns::Config config;
+    ::app::dns::Config config;
     config.servers = {{net::ip::make_address("127.0.0.1"), 53}};
     net::io_context main_context;
     auto main_guard = net::make_work_guard(main_context);
-    acpp::app::dns::DNSWorker worker(main_context, config, 8);
+    ::app::dns::DNSWorker worker(main_context, config, 8);
     net::io_context first_io;
     net::io_context second_io;
-    acpp::app::dns::DNS first(worker);
-    acpp::app::dns::DNS second(worker);
+    ::app::dns::DNS first(worker);
+    ::app::dns::DNS second(worker);
     std::array<DnsResult, 2> answers;
     std::array<std::exception_ptr, 2> failures;
     size_t completed = 0;
@@ -283,10 +283,10 @@ void TestDNSWorker() {
 void TestDNSRemoteInputOwnership() {
     net::io_context main_context;
     net::ip::udp::socket sink(main_context, {net::ip::address_v4::loopback(), 0});
-    acpp::app::dns::Config config;
+    ::app::dns::Config config;
     config.servers = {sink.local_endpoint()};
-    acpp::app::dns::DNSWorker worker(main_context, config, 8);
-    acpp::app::dns::DNS client(worker);
+    ::app::dns::DNSWorker worker(main_context, config, 8);
+    ::app::dns::DNS client(worker);
     std::string domain = "192.0.2.1";
     auto task = client.Resolve(domain);
     // The remote facade must capture owned input before the task is scheduled.
@@ -310,12 +310,12 @@ void TestDNSRemoteInputOwnership() {
 void TestDNSClientLifetime() {
     net::io_context main_context;
     net::ip::udp::socket sink(main_context, {net::ip::address_v4::loopback(), 0});
-    acpp::app::dns::Config config;
+    ::app::dns::Config config;
     config.servers = {sink.local_endpoint()};
-    acpp::app::dns::DNSWorker worker(main_context, config, 8);
+    ::app::dns::DNSWorker worker(main_context, config, 8);
     // The facade must not be captured in a deferred coroutine: the task only
     // needs its input and the DNSWorker, not this already-destroyed client.
-    auto task = acpp::app::dns::DNS(worker).Resolve("192.0.2.3");
+    auto task = ::app::dns::DNS(worker).Resolve("192.0.2.3");
     bool resolved = false;
     net::co_spawn(main_context, std::move(task),
         [&](std::exception_ptr error, DnsResult result) {
@@ -329,18 +329,18 @@ void TestDNSClientLifetime() {
 void TestDNSWorkerCancellation() {
     net::io_context caller;
     net::ip::udp::socket sink(caller, {net::ip::address_v4::loopback(), 0});
-    acpp::app::dns::Config config;
+    ::app::dns::Config config;
     config.servers = {sink.local_endpoint()};
     config.timeout_sec = 2;
-    acpp::app::dns::DNSWorker worker(caller, config, 8);
-    acpp::app::dns::DNS client(worker);
+    ::app::dns::DNSWorker worker(caller, config, 8);
+    ::app::dns::DNS client(worker);
     net::cancellation_signal signal;
     bool completed = false;
     net::co_spawn(caller, client.Resolve("cancel-dns-worker.example"),
         net::bind_cancellation_slot(signal.slot(),
             [&](std::exception_ptr, DnsResult) { completed = true; }));
     net::steady_timer timer(caller, 50ms);
-    timer.async_wait([&](const acpp::IoErrorCode& ec) {
+    timer.async_wait([&](const ::IoErrorCode& ec) {
         if (!ec) signal.emit(net::cancellation_type::terminal);
     });
     caller.run_for(1s);
@@ -350,17 +350,17 @@ void TestDNSWorkerCancellation() {
 void TestDNSWorkerCapacity(bool stats_request) {
     net::io_context main_context;
     net::ip::udp::socket sink(main_context, {net::ip::address_v4::loopback(), 0});
-    acpp::app::dns::Config config;
+    ::app::dns::Config config;
     config.servers = {sink.local_endpoint()};
     config.timeout_sec = 2;
-    acpp::app::dns::DNSWorker worker(main_context, config, 1);
-    acpp::app::dns::DNS client(worker);
+    ::app::dns::DNSWorker worker(main_context, config, 1);
+    ::app::dns::DNS client(worker);
     net::cancellation_signal cancel;
     bool owner_done = false;
     bool rejected = false;
     std::exception_ptr failure;
     net::steady_timer watchdog(main_context, 1s);
-    watchdog.async_wait([&](const acpp::IoErrorCode& error) {
+    watchdog.async_wait([&](const ::IoErrorCode& error) {
         if (!error) {
             cancel.emit(net::cancellation_type::terminal);
             sink.cancel();
@@ -373,15 +373,15 @@ void TestDNSWorkerCapacity(bool stats_request) {
     std::array<uint8_t, 512> query{};
     net::ip::udp::endpoint sender;
     sink.async_receive_from(net::buffer(query), sender,
-        [&](const acpp::IoErrorCode& error, size_t) {
+        [&](const ::IoErrorCode& error, size_t) {
             if (error) return;
             if (stats_request) {
                 net::co_spawn(main_context, worker.GetCacheStats(),
-                    [&](std::exception_ptr error, acpp::app::dns::DnsCacheStats) {
+                    [&](std::exception_ptr error, ::app::dns::DnsCacheStats) {
                         failure = error;
                         try {
                             if (error) std::rethrow_exception(error);
-                        } catch (const acpp::WorkerMailboxFull&) {
+                        } catch (const ::WorkerMailboxFull&) {
                             rejected = true;
                             failure = {};
                         } catch (...) {}
@@ -392,7 +392,7 @@ void TestDNSWorkerCapacity(bool stats_request) {
                 net::co_spawn(main_context, client.Resolve("192.0.2.4"),
                     [&](std::exception_ptr error, DnsResult result) {
                         failure = error;
-                        rejected = result.error == acpp::ErrorCode::RESOURCE_EXHAUSTED;
+                        rejected = result.error == ::ErrorCode::RESOURCE_EXHAUSTED;
                         cancel.emit(net::cancellation_type::terminal);
                         watchdog.cancel();
                     });
@@ -406,7 +406,7 @@ void TestDNSWorkerCapacity(bool stats_request) {
     bool recovered = false;
     if (stats_request) {
         net::co_spawn(main_context, worker.GetCacheStats(),
-            [&](std::exception_ptr error, acpp::app::dns::DnsCacheStats) {
+            [&](std::exception_ptr error, ::app::dns::DnsCacheStats) {
                 recovered = !error;
             });
     } else {
@@ -422,7 +422,7 @@ void TestDNSWorkerCapacity(bool stats_request) {
 void TestInflightStopBeforeLeaderCompletion() {
     net::io_context io;
     auto inflight = std::make_unique<InflightResolves>(io, 8);
-    net::experimental::channel<void(acpp::IoErrorCode)> gate(io);
+    net::experimental::channel<void(::IoErrorCode)> gate(io);
     size_t calls = 0, completed = 0;
     std::array<DnsResult, 3> results;
     std::array<std::exception_ptr, 3> errors;
@@ -437,7 +437,7 @@ void TestInflightStopBeforeLeaderCompletion() {
         });
     }
     net::steady_timer watchdog(io, 2s);
-    watchdog.async_wait([&](acpp::IoErrorCode error) {
+    watchdog.async_wait([&](::IoErrorCode error) {
         if (!error) { expired = true; gate.close(); }
     });
     while (calls == 0 && !expired) io.run_one();
@@ -456,23 +456,23 @@ void TestInflightStopBeforeLeaderCompletion() {
     Require(!expired && joined && completed == results.size() && calls == 1,
             "join must finish the service query and every subscriber before destruction");
     for (size_t i = 0; i < results.size(); ++i) {
-        Require(!errors[i] && results[i].error == acpp::ErrorCode::CANCELLED,
+        Require(!errors[i] && results[i].error == ::ErrorCode::CANCELLED,
                 "late successful leader completion must not replace service cancellation");
     }
 }
 
 void TestDNSWorkerStoppedWithoutQueries() {
     net::io_context io;
-    acpp::app::dns::Config config;
+    ::app::dns::Config config;
     config.servers = {{net::ip::address_v4::loopback(), 53}};
-    auto worker = std::make_unique<acpp::app::dns::DNSWorker>(io, config, 1);
+    auto worker = std::make_unique<::app::dns::DNSWorker>(io, config, 1);
     worker->RequestStop();
     worker->RequestStop();
     bool done = false;
     std::exception_ptr failure;
     auto stop = [&]() -> net::awaitable<void> {
         const auto result = co_await worker->Resolve("192.0.2.1");
-        Require(result.error == acpp::ErrorCode::CANCELLED,
+        Require(result.error == ::ErrorCode::CANCELLED,
                 "an unused stopped service must reject queries without starting I/O");
         co_await worker->AsyncJoin();
         co_await worker->AsyncJoin();
@@ -490,11 +490,11 @@ void TestDNSWorkerStoppedWithoutQueries() {
 void TestDNSWorkerCrossExecutorStop() {
     net::io_context main_context, first_io, second_io;
     net::ip::udp::socket sink(main_context, {net::ip::address_v4::loopback(), 0});
-    acpp::app::dns::Config config;
+    ::app::dns::Config config;
     config.servers = {sink.local_endpoint()};
     config.timeout_sec = 30;
-    auto worker = std::make_unique<acpp::app::dns::DNSWorker>(main_context, config, 8);
-    acpp::app::dns::DNS first(*worker), second(*worker);
+    auto worker = std::make_unique<::app::dns::DNSWorker>(main_context, config, 8);
+    ::app::dns::DNS first(*worker), second(*worker);
     auto guard = net::make_work_guard(main_context);
     std::array<DnsResult, 4> results;
     std::array<std::exception_ptr, 4> errors;
@@ -536,7 +536,7 @@ void TestDNSWorkerCrossExecutorStop() {
         joined = true;
         finish();
     });
-    watchdog.async_wait([&](acpp::IoErrorCode error) {
+    watchdog.async_wait([&](::IoErrorCode error) {
         if (error) return;
         expired = true;
         worker->RequestStop();
@@ -553,7 +553,7 @@ void TestDNSWorkerCrossExecutorStop() {
             "service stop must join real UDP leaders and cross-executor subscribers");
     if (join_error) std::rethrow_exception(join_error);
     for (size_t i = 0; i < results.size(); ++i) {
-        Require(!errors[i] && results[i].error == acpp::ErrorCode::CANCELLED,
+        Require(!errors[i] && results[i].error == ::ErrorCode::CANCELLED,
                 "cross-executor shutdown must return owned cancellation results");
     }
 }
@@ -572,7 +572,7 @@ void* operator new(std::size_t size) {
 void operator delete(void* pointer) noexcept { std::free(pointer); }
 void operator delete(void* pointer, std::size_t) noexcept { std::free(pointer); }
 TEST(DnsInflight, Contract) {
-    acpp::memory::ConfigureProcessAllocator();
+    ::memory::ConfigureProcessAllocator();
     bool passed = true;
     try {
         TestCompletion(Failure::None);

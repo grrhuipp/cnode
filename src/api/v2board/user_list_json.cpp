@@ -1,7 +1,7 @@
 #include "user_list_json.hpp"
 
-#include "acppnode/infra/json_field.hpp"
-#include "acppnode/core/naming.hpp"
+#include "infra/json_field.hpp"
+#include "core/naming.hpp"
 #include "panel_json_compat.hpp"
 
 #include <format>
@@ -11,7 +11,7 @@
 #include <unordered_set>
 #include <utility>
 
-namespace acpp::api::v2board {
+namespace api::v2board {
 
 namespace {
 
@@ -62,7 +62,7 @@ tl::expected<std::string, std::string> ParseOptionalString(
 
 }  // namespace
 
-tl::expected<std::vector<::acpp::api::UserInfo>, std::string>
+tl::expected<std::vector<::api::UserInfo>, std::string>
 ParseUserList(const json::object& source) {
     const auto* users_value = source.if_contains("users");
     if (!users_value) {
@@ -73,7 +73,7 @@ ParseUserList(const json::object& source) {
     }
 
     const auto& users_array = users_value->as_array();
-    std::vector<::acpp::api::UserInfo> users;
+    std::vector<::api::UserInfo> users;
     users.reserve(users_array.size());
     // A repeated id would merge accounting for two users. Credentials are
     // compared after protocol derivation, when the UserStore snapshot is built.
@@ -85,7 +85,7 @@ ParseUserList(const json::object& source) {
             return tl::unexpected(std::format("users[{}] must be an object", i));
         }
         const auto& source_user = user_value.as_object();
-        ::acpp::api::UserInfo user;
+        ::api::UserInfo user;
 
         const auto* id = source_user.if_contains("id");
         const auto parsed_id = id ? PanelUnsignedInteger(*id) : std::nullopt;
@@ -144,4 +144,4 @@ ParseUserList(const json::object& source) {
     return users;
 }
 
-}  // namespace acpp::api::v2board
+}  // namespace api::v2board

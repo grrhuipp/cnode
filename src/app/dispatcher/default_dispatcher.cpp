@@ -1,27 +1,27 @@
-#include "acppnode/app/dispatcher/default_dispatcher.hpp"
+#include "app/dispatcher/default_dispatcher.hpp"
 
 #include "outbound_selection.hpp"
 #include "../../common/awaitable_task_group.hpp"
 
-#include "acppnode/app/stats.hpp"
-#include "acppnode/app/session_tracking.hpp"
-#include "acppnode/app/request_load_state.hpp"
-#include "acppnode/app/dns/dns.hpp"
-#include "acppnode/common/session.hpp"
-#include "acppnode/features/policy/request_policy.hpp"
-#include "acppnode/app/proxyman/outbound/handler.hpp"
-#include "acppnode/infra/runtime_config_types.hpp"
-#include "acppnode/infra/log.hpp"
-#include "acppnode/features/routing/router.hpp"
-#include "acppnode/sniff/sniffer.hpp"
-#include "acppnode/transport/link.hpp"
-#include "acppnode/transport/async_stream.hpp"
-#include "acppnode/common/buf/multi_buffer.hpp"
-#include "acppnode/common/buf/multi_buffer_batch.hpp"
+#include "app/stats.hpp"
+#include "app/session_tracking.hpp"
+#include "app/request_load_state.hpp"
+#include "app/dns/dns.hpp"
+#include "common/session.hpp"
+#include "features/policy/request_policy.hpp"
+#include "app/proxyman/outbound/handler.hpp"
+#include "infra/runtime_config_types.hpp"
+#include "infra/log.hpp"
+#include "features/routing/router.hpp"
+#include "sniff/sniffer.hpp"
+#include "transport/link.hpp"
+#include "transport/async_stream.hpp"
+#include "common/buf/multi_buffer.hpp"
+#include "common/buf/multi_buffer_batch.hpp"
 
 #include <algorithm>
 #include <asio/experimental/awaitable_operators.hpp>
-#include "acppnode/transport/internet/async_delay.hpp"
+#include "transport/internet/async_delay.hpp"
 #include <asio/this_coro.hpp>
 #include <asio/use_awaitable.hpp>
 #include <charconv>
@@ -32,7 +32,7 @@
 #include <vector>
 #include <variant>
 
-namespace acpp::app::dispatcher {
+namespace app::dispatcher {
 
 namespace {
 
@@ -175,7 +175,7 @@ net::awaitable<bool> SniffInitialPayload(
 
         int no_clue_attempts = 0;
         for (;;) {
-            if (cached_bytes > 0) {
+            if (!sniff_payload.empty()) {
                 const auto sniffed = sniff_cached();
                 if (datagram) {
                     // Keep each original read result intact. Only decrypted
@@ -659,4 +659,4 @@ net::awaitable<DefaultDispatcher::RouteResult> DefaultDispatcher::RouteAsync(
         initial_selection ? *initial_selection : SelectRoute(ctx, policy));
 }
 
-}  // namespace acpp::app::dispatcher
+}  // namespace app::dispatcher

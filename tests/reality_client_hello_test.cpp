@@ -5,7 +5,7 @@
 #include <vector>
 
 namespace {
-using Reader = acpp::RealityClientHelloReader;
+using Reader = ::RealityClientHelloReader;
 bool Require(bool ok, const char* message) {
     if (!ok) std::fprintf(stderr, "%s\n", message);
     return ok;

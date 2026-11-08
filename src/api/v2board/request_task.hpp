@@ -12,7 +12,7 @@
 #include <system_error>
 #include <utility>
 
-namespace acpp::api::v2board::http {
+namespace api::v2board::http {
 
 // The timeout cancels the owning exchange coroutine and waits for its completion.
 // A fully received response remains authoritative even if TLS cleanup is cancelled.
@@ -69,4 +69,4 @@ inline net::awaitable<Response> RunRequest(
     co_return std::move(*result);
 }
 
-}  // namespace acpp::api::v2board::http
+}  // namespace api::v2board::http

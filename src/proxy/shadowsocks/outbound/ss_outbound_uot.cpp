@@ -1,12 +1,12 @@
 #include "ss_outbound_uot.hpp"
 
-#include "acppnode/infra/json_field.hpp"
+#include "infra/json_field.hpp"
 
 #include <format>
 #include <string_view>
 #include <utility>
 
-namespace acpp::proxy::shadowsocks::outbound {
+namespace proxy::shadowsocks::outbound {
 
 namespace {
 
@@ -107,4 +107,4 @@ ParseUotVersion(const json::object& source) {
     return ParseActivation(*uot, "uot", *top_level_version);
 }
 
-}  // namespace acpp::proxy::shadowsocks::outbound
+}  // namespace proxy::shadowsocks::outbound

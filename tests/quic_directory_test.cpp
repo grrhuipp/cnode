@@ -5,7 +5,7 @@
 #include <array>
 #include <stdexcept>
 
-using namespace acpp::transport::internet::hysteria;
+using namespace ::transport::internet::hysteria;
 
 namespace {
 void Require(bool condition) {
@@ -13,8 +13,8 @@ void Require(bool condition) {
 }
 
 TEST(QuicDirectory, PublicationIsExclusiveAndNamespaceScoped) {
-    acpp::net::io_context io;
-    auto& directory = acpp::net::use_service<QuicDirectory>(io);
+    ::net::io_context io;
+    auto& directory = ::net::use_service<QuicDirectory>(io);
     auto first = std::make_shared<QuicOwnership>();
     auto second = std::make_shared<QuicOwnership>();
     auto isolated = std::make_shared<QuicOwnership>();
@@ -37,8 +37,8 @@ TEST(QuicDirectory, PublicationIsExclusiveAndNamespaceScoped) {
 }
 
 TEST(QuicDirectory, RetirementWinsAgainstQueuedPublication) {
-    acpp::net::io_context io;
-    auto& directory = acpp::net::use_service<QuicDirectory>(io);
+    ::net::io_context io;
+    auto& directory = ::net::use_service<QuicDirectory>(io);
     auto original = std::make_shared<QuicOwnership>();
     auto replacement = std::make_shared<QuicOwnership>();
     const std::array<uint8_t, 4> bytes{9, 10, 11, 12};

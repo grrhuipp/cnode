@@ -1,13 +1,13 @@
-#include "acppnode/transport/internet/tls_stream.hpp"
-#include "acppnode/transport/internet/tcp_stream.hpp"
+#include "transport/internet/tls_stream.hpp"
+#include "transport/internet/tcp_stream.hpp"
 #include "tls_client_context.hpp"
 #include "reality_tls.hpp"
-#include "acppnode/transport/internet/async_write_gate.hpp"
-#include "acppnode/transport/internet/stream_settings.hpp"
-#include "acppnode/transport/internet/transport_security.hpp"
-#include "acppnode/common/buffer_util.hpp"
-#include "acppnode/infra/log.hpp"
-#include "acppnode/common/unsafe.hpp"
+#include "transport/internet/async_write_gate.hpp"
+#include "transport/internet/stream_settings.hpp"
+#include "transport/internet/transport_security.hpp"
+#include "common/buffer_util.hpp"
+#include "infra/log.hpp"
+#include "common/unsafe.hpp"
 #include "autosign_cert.hpp"
 #include "autosign_context.hpp"
 #include <openssl/err.h>
@@ -26,7 +26,6 @@
 #include <optional>
 #include <stdexcept>
 
-namespace acpp {
 
 // ============================================================================
 // SslContext 实现
@@ -373,7 +372,7 @@ struct TlsStream::Impl final : memory::ThreadAllocated, private transport::Cance
         Unsubscribe();
     }
 
-    acpp::tcp::socket::executor_type Executor() {
+    ::tcp::socket::executor_type Executor() {
         return tcp->GetExecutor();
     }
 
@@ -527,6 +526,9 @@ struct TlsStream::Impl final : memory::ThreadAllocated, private transport::Cance
         CheckCancellation(epoch);
         if (!lease) throw IoSystemError(io_error::operation_aborted);
         for (;;) {
+            // A local receive shutdown is not a truncated peer TLS record.
+            // Recheck after input/engine waits before SSL or buffer allocation.
+            if (kind == Kind::Read && !tcp->CanRead()) co_return 0;
             if (allocated && !*allocated) {
                 *allocated = buf::BufferGuard{buf::Buffer::New()};
                 if (!*allocated) throw std::bad_alloc();
@@ -1046,4 +1048,3 @@ net::awaitable<std::unique_ptr<TlsStream>> WrapRealityClient(
 
     co_return stream;
 }
-}  // namespace acpp

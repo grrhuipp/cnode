@@ -1,6 +1,6 @@
 #pragma once
 
-#include "acppnode/common/unsafe.hpp"
+#include "common/unsafe.hpp"
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -10,7 +10,7 @@
 #include <string>
 #include <string_view>
 
-namespace acpp::ss {
+namespace ss {
 
 // ============================================================================
 // 密码类型
@@ -54,7 +54,7 @@ struct KeyBytes {
     KeyBytes(KeyBytes&&) noexcept = default;
     KeyBytes& operator=(KeyBytes&&) noexcept = default;
     ~KeyBytes() noexcept {
-        ::acpp::SecureZeroMemory(bytes.data(), bytes.size());
+        ::SecureZeroMemory(bytes.data(), bytes.size());
     }
     [[nodiscard]] const uint8_t* data() const noexcept { return bytes.data(); }
     [[nodiscard]] uint8_t* data() noexcept { return bytes.data(); }
@@ -91,4 +91,4 @@ struct KeyBytes {
 [[nodiscard]] bool Hash2022Psk(std::span<const uint8_t> key,
                                std::span<uint8_t, 16> out_hash);
 
-}  // namespace acpp::ss
+}  // namespace ss

@@ -14,7 +14,7 @@
 #include <type_traits>
 #include <utility>
 
-namespace acpp::worker_detail {
+namespace worker_detail {
 
 [[nodiscard]] inline bool IsTransientReceiveError(
     const IoErrorCode& error) noexcept {
@@ -108,4 +108,4 @@ net::awaitable<void> RunUdpReceiveLoop(
     }
 }
 
-}  // namespace acpp::worker_detail
+}  // namespace worker_detail

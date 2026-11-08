@@ -1,7 +1,7 @@
 #pragma once
 
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/buf/multi_buffer.hpp"
+#include "common/allocator.hpp"
+#include "common/buf/multi_buffer.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -9,7 +9,7 @@
 #include <span>
 #include <utility>
 
-namespace acpp::detail {
+namespace detail {
 
 class XHttpPacketQueue final {
 public:
@@ -163,4 +163,4 @@ private:
     uint64_t next_seq_ = 0;
 };
 
-}  // namespace acpp::detail
+}  // namespace detail

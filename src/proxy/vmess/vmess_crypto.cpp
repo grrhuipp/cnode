@@ -7,7 +7,6 @@
 #include <new>
 #include <stdexcept>
 
-namespace acpp {
 namespace vmess {
 
 std::array<uint8_t, 16> MD5Hash(const uint8_t* data, size_t len) {
@@ -40,4 +39,3 @@ uint32_t FNV1a32(const uint8_t* data, size_t len) {
     return hash;
 }
 }  // namespace vmess
-}  // namespace acpp

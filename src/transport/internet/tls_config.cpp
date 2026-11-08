@@ -1,4 +1,4 @@
-#include "acppnode/transport/internet/tls_config.hpp"
+#include "transport/internet/tls_config.hpp"
 
 #include <openssl/mem.h>
 #include <fcntl.h>
@@ -10,7 +10,6 @@
 #include <stdexcept>
 #include <string_view>
 
-namespace acpp {
 
 namespace {
 
@@ -112,4 +111,3 @@ void LoadTlsPemMaterial(TlsConfig& config) {
     config.pem = std::move(material);
 }
 
-}  // namespace acpp

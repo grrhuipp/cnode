@@ -2,7 +2,8 @@
 #include <gtest/gtest.h>
 
 #include "udp_framing.hpp"
-#include "acppnode/common/buf/length_prefixed_packet_buffer.hpp"
+#include "common/buf/length_prefixed_packet_buffer.hpp"
+#include "transport/internet/tcp_stream.hpp"
 
 #include <asio/co_spawn.hpp>
 #include <asio/use_future.hpp>
@@ -24,7 +25,6 @@
 
 namespace {
 
-using namespace acpp;
 
 [[noreturn]] void Fail(std::string_view message) {
     std::cerr << message << '\n';
@@ -111,13 +111,24 @@ void CheckFrameBoundaries() {
         trojan::UdpFramer framer;
         trojan::FramedUdpPacket packet;
         framer.Feed(MakeInput(std::span(wire).first(split)));
-        const bool first = framer.Next(packet);
+        std::vector<size_t> sizes;
+        while (framer.Next(packet)) {
+            sizes.push_back(packet.payload.byte_size());
+            Check(buf::InspectUdpDatagram(packet.payload).Valid(),
+                  "Trojan frame did not produce a tagged UDP datagram");
+        }
         framer.Feed(MakeInput(std::span(wire).subspan(split)));
-        Check(first || framer.Next(packet), "split Trojan frame lost");
-        Check(Flatten(packet.payload) == std::vector<uint8_t>({0x11, 0x22, 0x33}) &&
-                  packet.target.SameEndpoint(TargetAddress("127.0.0.1", 53)),
-              "empty Trojan frame damaged next datagram");
-        Check(!framer.Next(packet), "extra Trojan datagram");
+        while (framer.Next(packet)) {
+            sizes.push_back(packet.payload.byte_size());
+            Check(packet.target.SameEndpoint(TargetAddress("127.0.0.1", 53)),
+                  "Trojan datagram target changed");
+            if (packet.payload.byte_size() != 0) {
+                Check(Flatten(packet.payload) == std::vector<uint8_t>({0x11, 0x22, 0x33}),
+                      "Trojan datagram payload changed");
+            }
+        }
+        Check(sizes == std::vector<size_t>({0, 3}),
+              "Trojan UDP lost an empty datagram boundary");
         framer.Finish();
     }
     for (size_t cut = 1; cut < 14; ++cut) {
@@ -136,13 +147,12 @@ void CheckFrameBoundaries() {
         CheckRejected([&] { (void)invalid.Next(packet); }, "invalid Trojan frame accepted");
         CheckRejected([&] { (void)invalid.Next(packet); }, "Trojan stream resynchronized");
     }
-    for (const uint8_t length : {uint8_t{0}, uint8_t{254}, uint8_t{255}}) {
-        trojan::UdpFramer invalid;
-        const std::array<uint8_t, 2> prefix{3, length};
-        invalid.Feed(MakeInput(prefix));
-        trojan::FramedUdpPacket packet;
-        CheckRejected([&] { (void)invalid.Next(packet); }, "invalid Trojan domain accepted");
-    }
+    trojan::UdpFramer empty_domain;
+    const std::array<uint8_t, 2> empty_domain_prefix{3, 0};
+    empty_domain.Feed(MakeInput(empty_domain_prefix));
+    trojan::FramedUdpPacket empty_domain_packet;
+    CheckRejected([&] { (void)empty_domain.Next(empty_domain_packet); },
+                  "empty Trojan domain accepted");
     trojan::UdpFramer invalid_domain;
     const std::array<uint8_t, 10> malformed_domain{
         3, 1, ' ', 0, 53, 0, 1, '\r', '\n', 0x42};
@@ -302,4 +312,44 @@ TEST(TrojanUdpFraming, Contract) {
     }, "oversized Trojan datagram accepted");
     Check(rejected_capture.bytes.empty(), "oversized Trojan datagram partially written");
 
+}
+
+TEST(TrojanUdpFraming, EmptyDatagramsAreNotEof) {
+    const TargetAddress target("127.0.0.1", 53);
+    CaptureWriter capture;
+    ::Run([&]() -> net::awaitable<void> {
+        buf::MultiBuffer empty;
+        Check(buf::SetUdpTarget(empty, target), "empty UDP allocation failed");
+        co_await trojan::WriteUdpDatagram(capture, std::move(empty));
+        const std::array<uint8_t, 1> data{0x42};
+        const std::array<net::const_buffer, 1> buffers{net::buffer(data)};
+        co_await trojan::WriteUdpDatagram(capture, target, buffers);
+        co_await trojan::WriteUdpDatagram(
+            capture, target, std::span<const net::const_buffer>{});
+    });
+    Check(capture.bytes.size() == 34, "empty Trojan UDP frame header was omitted");
+
+    net::io_context io;
+    tcp::acceptor listener(io, {net::ip::address_v4::loopback(), 0});
+    tcp::socket peer(io);
+    peer.connect(listener.local_endpoint());
+    TcpStream stream(listener.accept());
+    net::write(peer, net::buffer(capture.bytes));
+    peer.shutdown(tcp::socket::shutdown_send);
+    trojan::UdpFramer framer;
+    auto result = net::co_spawn(io, [&]() -> net::awaitable<void> {
+        for (const size_t size : {size_t{0}, size_t{1}, size_t{0}}) {
+            auto packet = co_await trojan::ReadUdpDatagram(stream, framer);
+            const auto datagram = buf::InspectUdpDatagram(packet);
+            Check(datagram.Valid() && datagram.payload_size == size &&
+                      datagram.target->SameEndpoint(target),
+                  "Trojan empty/data sequence became EOF or lost its target");
+            if (size != 0) Check(Flatten(packet) == std::vector<uint8_t>{0x42},
+                                 "Trojan UDP data changed");
+        }
+        Check((co_await trojan::ReadUdpDatagram(stream, framer)).empty(),
+              "Trojan TCP EOF became an empty datagram");
+    }, net::use_future);
+    io.run();
+    result.get();
 }

@@ -1,13 +1,13 @@
 #pragma once
 
-#include "acppnode/common/asio_types.hpp"
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/string_hash.hpp"
+#include "common/asio_types.hpp"
+#include "common/allocator.hpp"
+#include "common/string_hash.hpp"
 
 #include <memory>
 #include <string_view>
 
-namespace acpp::worker_detail {
+namespace worker_detail {
 
 // Worker-private owner for one inbound tag's TCP acceptors.
 class TcpListenerOwner final : public memory::ThreadAllocated {
@@ -38,4 +38,4 @@ private:
                                    TransparentStringHash, TransparentStringEq> acceptors_;
 };
 
-}  // namespace acpp::worker_detail
+}  // namespace worker_detail

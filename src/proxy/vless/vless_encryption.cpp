@@ -1,8 +1,8 @@
 #include "vless_encryption.hpp"
 
 #include "vless_encryption_crypto.hpp"
-#include "acppnode/common/binary_text_codec.hpp"
-#include "acppnode/transport/internet/http_headers.hpp"
+#include "common/binary_text_codec.hpp"
+#include "transport/internet/http_headers.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -10,7 +10,7 @@
 #include <limits>
 #include <string>
 
-namespace acpp::vless {
+namespace vless {
 namespace {
 
 constexpr std::string_view kEncryptionName = "mlkem768x25519plus";
@@ -309,4 +309,4 @@ std::string_view VlessEncryptionParseErrorMessage(
     return "unknown error";
 }
 
-}  // namespace acpp::vless
+}  // namespace vless

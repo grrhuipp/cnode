@@ -8,16 +8,16 @@
 
 namespace {
 using namespace std::chrono_literals;
-using Timeouts = acpp::transport::internet::detail::ConnectionTimeouts<struct Owner>;
+using Timeouts = ::transport::internet::detail::ConnectionTimeouts<struct Owner>;
 
 struct Owner {
     int calls = 0;
-    acpp::ErrorCode reason = acpp::ErrorCode::OK;
-    void OnTimeout(acpp::ErrorCode error) noexcept { ++calls; reason = error; }
+    ::ErrorCode reason = ::ErrorCode::OK;
+    void OnTimeout(::ErrorCode error) noexcept { ++calls; reason = error; }
 };
 
 bool TestIdleAndOperations() {
-    acpp::net::io_context io;
+    ::net::io_context io;
     Owner owner;
     Timeouts timeouts(io, owner);
     timeouts.SetIdleTimeout(1s);
@@ -25,12 +25,12 @@ bool TestIdleAndOperations() {
     timeouts.EndWrite();
     timeouts.TouchActivity();
     io.run_for(1100ms);
-    return owner.calls == 1 && owner.reason == acpp::ErrorCode::CANCELLED &&
+    return owner.calls == 1 && owner.reason == ::ErrorCode::CANCELLED &&
            timeouts.ConsumeIdleTimeout() && !timeouts.ConsumeWriteTimeout();
 }
 
 bool TestPhaseReplacementAndClear() {
-    acpp::net::io_context io;
+    ::net::io_context io;
     Owner owner;
     Timeouts timeouts(io, owner);
     auto old = timeouts.StartPhaseDeadline(1s);
@@ -47,7 +47,7 @@ bool TestPhaseReplacementAndClear() {
 }
 
 bool TestExpiredPhaseAndStopFlag() {
-    acpp::net::io_context io;
+    ::net::io_context io;
     Owner owner;
     Timeouts timeouts(io, owner);
     auto phase = timeouts.StartPhaseDeadline(1s);
@@ -59,7 +59,7 @@ bool TestExpiredPhaseAndStopFlag() {
 }
 
 bool TestDestroyOwnerAndMaximumTimeout() {
-    acpp::net::io_context io;
+    ::net::io_context io;
     auto owner = std::make_unique<Owner>();
     {
         auto timeouts = std::make_unique<Timeouts>(io, *owner);
@@ -73,7 +73,7 @@ bool TestDestroyOwnerAndMaximumTimeout() {
 }
 
 bool TestActivityDoesNotExtendPhase() {
-    acpp::net::io_context io;
+    ::net::io_context io;
     Owner owner;
     Timeouts timeouts(io, owner);
     timeouts.SetIdleTimeout(1s);

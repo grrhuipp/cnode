@@ -7,7 +7,7 @@
 
 #include <algorithm>
 
-namespace acpp::vless {
+namespace vless {
 namespace {
 
 [[nodiscard]] const EVP_AEAD* ResolveAead(
@@ -245,4 +245,4 @@ std::optional<size_t> OpenVlessEncryptionRecord(
     return aead.Open(ciphertext, header, output);
 }
 
-}  // namespace acpp::vless
+}  // namespace vless

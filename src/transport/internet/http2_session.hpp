@@ -1,12 +1,12 @@
 #pragma once
 
-#include "acppnode/transport/internet/transport_stack.hpp"
+#include "transport/internet/transport_stack.hpp"
 
 #include <cstdint>
 #include <memory>
 #include <string_view>
 
-namespace acpp::transport::internet {
+namespace transport::internet {
 
 inline constexpr std::string_view kHttp2ClientPreface =
     "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -60,4 +60,4 @@ inline constexpr std::string_view kHttp2ClientPreface =
     bool tls,
     uint64_t conn_id);
 
-}  // namespace acpp::transport::internet
+}  // namespace transport::internet

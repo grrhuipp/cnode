@@ -1,0 +1,341 @@
+#pragma once
+
+#include "transport/internet/reality_client_version.hpp"
+#include "transport/internet/reality_key.hpp"
+#include "transport/internet/reality_short_id.hpp"
+
+#include "core/constants.hpp"
+#include "infra/json.hpp"
+#include "transport/internet/outbound_bind.hpp"
+#include "transport/internet/http_headers.hpp"
+#include "transport/internet/tls_config.hpp"
+#include "common/unsafe.hpp"
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <span>
+#include <string>
+#include <string_view>
+#include <vector>
+
+
+enum class StreamEndpointRole {
+    Inbound,
+    Outbound,
+};
+
+struct XHttpDownloadSettings;
+class TransportSecurity;
+
+// ============================================================================
+// 传输模式缓存（初始化期归一化，运行时零字符串比较）
+// ============================================================================
+enum class NetworkMode : uint8_t {
+    Tcp = 0,
+    Ws  = 1,
+    HttpUpgrade = 2,
+    Grpc = 3,
+    Http = 4,
+    XHttp = 5,
+    Unsupported = 255,
+};
+
+enum class SecurityMode : uint8_t {
+    None = 0,
+    Tls  = 1,
+    Reality = 2,
+    Unsupported = 255,
+};
+
+enum StreamFlags : uint8_t {
+    kFlagNone        = 0,
+    kFlagWs          = 1 << 0,
+    kFlagTls         = 1 << 1,
+    kFlagHttpUpgrade = 1 << 2,
+    kFlagGrpc        = 1 << 3,
+    kFlagHttp        = 1 << 4,
+    kFlagXHttp       = 1 << 5,
+    kFlagReality     = 1 << 6,
+};
+
+// ============================================================================
+// WebSocket 传输配置
+// ============================================================================
+struct WsConfig {
+    std::string path = std::string(constants::binding::kRootPath);
+    transport::internet::HttpHeaders headers;
+
+    // 默认从 X-Forwarded-For 的首个 IP 提取客户端地址（覆盖 TCP 对端）。
+    // 只在源站限制为可信代理且代理覆盖客户端自带 header 时可信。
+    // 显式设为空字符串可禁用；也可选择其他 HTTP header。
+    std::string real_ip_header = "X-Forwarded-For";
+
+    static WsConfig FromJson(const json::object& j);
+};
+
+// ============================================================================
+// HTTPUpgrade 传输配置
+// ============================================================================
+struct HttpUpgradeConfig {
+    std::string path = std::string(constants::binding::kRootPath);
+    std::string host;
+    transport::internet::HttpHeaders headers;
+
+    // 与 WS 相同，只在明确配置后信任指定 header。
+    std::string real_ip_header;
+
+    static HttpUpgradeConfig FromJson(const json::object& j);
+};
+
+// ============================================================================
+// V2Ray HTTP / h2 传输配置
+// ============================================================================
+struct HttpConfig {
+    std::string path = std::string(constants::binding::kRootPath);
+    std::string host;
+    std::string method;
+    transport::internet::HttpHeaders headers;
+
+    // 明确配置后才信任指定 header 覆盖 TCP 层源地址。
+    std::string real_ip_header;
+
+    // network == "h2" 时强制使用 HTTP/2；network == "http" 时按生态习惯：
+    // TLS 默认 HTTP/2，显式 ALPN=http/1.1 时使用 HTTP/1.1，明文使用 HTTP/1.1。
+    bool force_http2 = false;
+
+    std::optional<uint32_t> initial_window_size;
+
+    static HttpConfig FromJson(const json::object& j);
+};
+
+// ============================================================================
+// gRPC 传输配置
+// ============================================================================
+struct GrpcConfig {
+    std::string authority;
+    std::string service_name;
+    std::string user_agent;
+    bool multi_mode = false;
+    std::optional<uint32_t> initial_window_size;
+    // Derived by stream-settings normalization from RequestPath().
+    std::string request_path;
+
+    static GrpcConfig FromJson(const json::object& j);
+    [[nodiscard]] std::string RequestPath() const;
+};
+
+// ============================================================================
+// XHTTP / SplitHTTP 传输配置
+// ============================================================================
+// Xray-core accepts exactly these modes; "" means auto.
+enum class XHttpMode : uint8_t {
+    Auto,
+    PacketUp,
+    StreamUp,
+    StreamOne,
+};
+
+[[nodiscard]] constexpr std::string_view XHttpModeName(XHttpMode mode) noexcept {
+    switch (mode) {
+    case XHttpMode::PacketUp: return "packet-up";
+    case XHttpMode::StreamUp: return "stream-up";
+    case XHttpMode::StreamOne: return "stream-one";
+    case XHttpMode::Auto: break;
+    }
+    return "auto";
+}
+
+struct XHttpConfig {
+    std::string path = std::string(constants::binding::kRootPath);
+    std::string host;
+    XHttpMode mode = XHttpMode::Auto;
+    transport::internet::HttpHeaders headers;
+    std::shared_ptr<const XHttpDownloadSettings> download_settings;
+
+    bool no_grpc_header = false;
+    bool no_sse_header = false;
+    // Derived by stream-settings normalization from NormalizedPath().
+    std::string normalized_path;
+    // Runtime identity of this inbound configuration generation, never parsed
+    // from the wire. Separates equal session ids on different listeners.
+    std::string session_namespace;
+
+    static XHttpConfig FromJson(const json::object& j);
+    [[nodiscard]] std::string NormalizedPath() const;
+    [[nodiscard]] bool IsStreamOne() const noexcept { return mode == XHttpMode::StreamOne; }
+    [[nodiscard]] bool AcceptsStreamOne() const noexcept {
+        return mode == XHttpMode::Auto || mode == XHttpMode::StreamOne ||
+               mode == XHttpMode::StreamUp;
+    }
+    [[nodiscard]] bool AcceptsPacketUp() const noexcept {
+        return mode == XHttpMode::Auto || mode == XHttpMode::PacketUp;
+    }
+    [[nodiscard]] bool AcceptsStreamUp() const noexcept {
+        return mode == XHttpMode::Auto || mode == XHttpMode::StreamUp;
+    }
+};
+
+// ============================================================================
+// REALITY 安全层配置
+// ============================================================================
+struct RealityConfig {
+    // 服务端字段
+    std::string dest_host;
+    uint16_t dest_port = 0;
+    uint8_t xver = 0;
+    std::vector<std::string> server_names;
+    std::optional<transport::internet::RealityKey> private_key;
+    std::vector<transport::internet::RealityShortId> short_ids;
+    std::optional<transport::internet::RealityClientVersion> min_client_version;
+    std::optional<transport::internet::RealityClientVersion> max_client_version;
+    uint64_t max_time_diff = 0;
+    std::optional<transport::internet::RealityKey> mldsa65_seed;
+
+    // 客户端字段
+    std::string fingerprint;
+    std::string server_name;
+    std::optional<transport::internet::RealityKey> public_key;
+    transport::internet::RealityShortId short_id{};
+    std::string spider_x;
+    std::shared_ptr<const transport::internet::RealityMldsa65PublicKey> mldsa65_verify;
+
+    RealityConfig() = default;
+    RealityConfig(const RealityConfig&) = default;
+    RealityConfig& operator=(const RealityConfig&) = default;
+    RealityConfig(RealityConfig&&) noexcept = default;
+    RealityConfig& operator=(RealityConfig&&) noexcept = default;
+    ~RealityConfig() noexcept {
+        if (private_key) {
+            ::SecureZeroMemory(private_key->data(), private_key->size());
+        }
+        for (auto& id : short_ids) {
+            ::SecureZeroMemory(id.data(), id.size());
+        }
+        if (mldsa65_seed) {
+            ::SecureZeroMemory(mldsa65_seed->data(), mldsa65_seed->size());
+        }
+        ::SecureZeroMemory(short_id.data(), short_id.size());
+    }
+
+    [[nodiscard]] bool IsClient() const noexcept { return public_key.has_value(); }
+    [[nodiscard]] bool HasDest() const noexcept { return !dest_host.empty() && dest_port != 0; }
+    [[nodiscard]] bool operator==(const RealityConfig& other) const noexcept {
+        const auto opt_key_eq = [](const std::optional<transport::internet::RealityKey>& a,
+                                   const std::optional<transport::internet::RealityKey>& b) noexcept {
+            if (a.has_value() != b.has_value()) return false;
+            return !a || ::ConstantTimeEqual(a->data(), b->data(), a->size());
+        };
+        const auto short_ids_eq = [](const std::vector<transport::internet::RealityShortId>& a,
+                                     const std::vector<transport::internet::RealityShortId>& b) noexcept {
+            if (a.size() != b.size()) return false;
+            uint8_t diff = 0;
+            for (size_t i = 0; i < a.size(); ++i) {
+                diff |= static_cast<uint8_t>(
+                    !::ConstantTimeEqual(a[i].data(), b[i].data(), a[i].size()));
+            }
+            return diff == 0;
+        };
+        const bool verify_equal =
+            (mldsa65_verify == nullptr) == (other.mldsa65_verify == nullptr) &&
+            (!mldsa65_verify || *mldsa65_verify == *other.mldsa65_verify);
+        return dest_host == other.dest_host &&
+               dest_port == other.dest_port &&
+               xver == other.xver &&
+               server_names == other.server_names &&
+               opt_key_eq(private_key, other.private_key) &&
+               short_ids_eq(short_ids, other.short_ids) &&
+               min_client_version == other.min_client_version &&
+               max_client_version == other.max_client_version &&
+               max_time_diff == other.max_time_diff &&
+               opt_key_eq(mldsa65_seed, other.mldsa65_seed) &&
+               fingerprint == other.fingerprint &&
+               server_name == other.server_name &&
+               public_key == other.public_key &&
+               ::ConstantTimeEqual(short_id.data(), other.short_id.data(), short_id.size()) &&
+               spider_x == other.spider_x &&
+               verify_equal;
+    }
+    static RealityConfig FromJson(const json::object& j);
+};
+
+// ============================================================================
+// StreamSettings - 传输层 + 安全层组合配置
+//
+// 实现 Xray 式「传输层自由组合」：
+//   network (raw/tcp | ws/websocket | http/http2/h2 | httpupgrade | grpc | xhttp/splithttp)
+//     × security (none | tls)
+//   REALITY 按 Xray 生态约束只支持 raw/tcp、grpc、xhttp/splithttp。
+//
+// 示例：
+//   { "network": "ws", "security": "tls" }          → WS over TLS
+//   { "network": "httpupgrade", "security": "tls" } → HTTPUpgrade over TLS
+//   { "network": "tcp", "security": "none" }        → 明文 TCP
+// ============================================================================
+struct StreamSettings {
+    std::string network  = std::string(constants::protocol::kTcp);
+    std::string security = std::string(constants::protocol::kNone);
+
+    TlsConfig tls;             // 当 security == "tls" 时生效
+    RealityConfig reality;     // 当 security == "reality" 时生效
+    WsConfig  ws;              // 当 network  == "ws" / "websocket" 时生效
+    HttpUpgradeConfig http_upgrade; // 当 network == "httpupgrade" 时生效
+    HttpConfig http;            // 当 network == "http" / "h2" 时生效
+    GrpcConfig grpc;           // 当 network == "grpc" 时生效
+    XHttpConfig xhttp;          // 当 network == "xhttp" / "splithttp" 时生效
+
+    // 归一化后的缓存字段（热路径使用）
+    NetworkMode  network_mode  = NetworkMode::Tcp;
+    SecurityMode security_mode = SecurityMode::None;
+    uint8_t      flags         = kFlagNone;
+    // Explicit outbound Host/:authority of the ws/httpupgrade/grpc/xhttp
+    // layer; empty means derive it from the dial address.
+    std::string configured_http_host;
+    // Configuration-prepared, read-only security shared by all physical domains.
+    // Not part of wire configuration identity; rebuild on config changes.
+    std::shared_ptr<const TransportSecurity> prepared_security;
+
+    bool IsTls() const noexcept { return (flags & kFlagTls) != 0; }
+    bool IsReality() const noexcept { return (flags & kFlagReality) != 0; }
+    bool IsTlsLike() const noexcept { return IsTls() || IsReality(); }
+    bool IsWs()  const noexcept { return (flags & kFlagWs)  != 0; }
+    bool IsHttpUpgrade() const noexcept { return (flags & kFlagHttpUpgrade) != 0; }
+    bool IsHttp() const noexcept { return (flags & kFlagHttp) != 0; }
+    bool IsGrpc() const noexcept { return (flags & kFlagGrpc) != 0; }
+    bool IsXHttp() const noexcept { return (flags & kFlagXHttp) != 0; }
+    bool IsUnsupported() const noexcept {
+        return network_mode == NetworkMode::Unsupported ||
+               security_mode == SecurityMode::Unsupported;
+    }
+
+    static StreamSettings FromJson(
+        const json::object& j, StreamEndpointRole role);
+};
+
+struct XHttpDownloadSettings {
+    std::string address;
+    uint16_t port = 0;
+    OutboundBind send_through;
+    StreamSettings stream_settings;
+};
+
+struct OutboundStreamDefaults {
+    bool require_tls = false;
+    std::string_view fallback_server_name;
+    bool allow_insecure = false;
+    std::span<const std::string> alpn;
+};
+
+// Cold-path value transformations. The source remains unchanged, including
+// when normalization or default construction fails to allocate.
+[[nodiscard]] StreamSettings NormalizeStreamSettings(const StreamSettings& source);
+// The one network-name classification (case-insensitive) used by normalization;
+// lets builders select the transport sub-config before normalizing once.
+[[nodiscard]] NetworkMode ParseNetworkMode(std::string_view network) noexcept;
+// Concrete XHTTP client mode; auto follows Xray-core: downloadSettings →
+// stream-up, REALITY → stream-one, TLS without an http/1.1-only ALPN →
+// stream-up, otherwise packet-up. Never returns XHttpMode::Auto.
+[[nodiscard]] XHttpMode ResolveXHttpOutboundMode(const StreamSettings& settings) noexcept;
+
+[[nodiscard]] StreamSettings NormalizeOutboundStreamSettings(
+    const StreamSettings& source, const OutboundStreamDefaults& defaults = {});
+

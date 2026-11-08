@@ -1,11 +1,10 @@
-#include "acppnode/transport/internet/stream_settings.hpp"
-#include "acppnode/core/naming.hpp"
+#include "transport/internet/stream_settings.hpp"
+#include "core/naming.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <utility>
 
-namespace acpp {
 
 std::string XHttpConfig::NormalizedPath() const {
     std::string normalized = path.empty()
@@ -212,4 +211,3 @@ StreamSettings NormalizeOutboundStreamSettings(
     return settings;
 }
 
-}  // namespace acpp

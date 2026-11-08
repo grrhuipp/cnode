@@ -1,13 +1,13 @@
 #pragma once
 
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/buf/multi_buffer.hpp"
+#include "common/allocator.hpp"
+#include "common/buf/multi_buffer.hpp"
 #include "shadowsocks_protocol.hpp"
-#include "acppnode/app/proxyman/inbound/user_store.hpp"
-#include "acppnode/common/target_address.hpp"
-#include "acppnode/proxy/inbound_datagram.hpp"
+#include "app/proxyman/inbound/user_store.hpp"
+#include "common/target_address.hpp"
+#include "proxy/inbound_datagram.hpp"
 
-#include "acppnode/common/unsafe.hpp"
+#include "common/unsafe.hpp"
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -16,7 +16,7 @@
 #include <span>
 #include <vector>
 
-namespace acpp::ss {
+namespace ss {
 
 class Ss2022UdpReplayWindow {
 public:
@@ -65,7 +65,7 @@ private:
         [[nodiscard]] bool operator==(const SessionKey& other) const noexcept {
             return session_id == other.session_id &&
                 credential.size == other.credential.size &&
-                ::acpp::ConstantTimeEqual(credential.bytes.data(),
+                ::ConstantTimeEqual(credential.bytes.data(),
                                           other.credential.bytes.data(),
                                           credential.size);
         }
@@ -216,4 +216,4 @@ struct SsUdpDecodeResult {
     size_t datagram_len,
     Ss2022UdpSessionState& state);
 
-}  // namespace acpp::ss
+}  // namespace ss

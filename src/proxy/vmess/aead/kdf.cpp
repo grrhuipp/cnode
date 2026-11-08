@@ -1,6 +1,6 @@
 #include "../vmess_crypto.hpp"
 #include "../vmess_request.hpp"
-#include "acppnode/common/unsafe.hpp"
+#include "common/unsafe.hpp"
 
 #include <openssl/hmac.h>
 #include <openssl/mem.h>
@@ -9,7 +9,6 @@
 #include <cstring>
 #include <stdexcept>
 
-namespace acpp {
 namespace vmess {
 
 namespace {
@@ -164,4 +163,3 @@ HeaderAeadKey ResponseHeaderPayloadKey(std::span<const uint8_t, 16> response_key
 }
 
 }  // namespace vmess
-}  // namespace acpp

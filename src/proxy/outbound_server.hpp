@@ -1,17 +1,17 @@
 #pragma once
 
-#include "acppnode/infra/log.hpp"
-#include "acppnode/infra/outbound_source_config.hpp"
-#include "acppnode/transport/internet/outbound_sender.hpp"
-#include "acppnode/transport/internet/stream_settings.hpp"
-#include "acppnode/transport/internet/transport_security.hpp"
+#include "infra/log.hpp"
+#include "infra/outbound_source_config.hpp"
+#include "transport/internet/outbound_sender.hpp"
+#include "transport/internet/stream_settings.hpp"
+#include "transport/internet/transport_security.hpp"
 
 #include <cstdint>
 #include <optional>
 #include <string>
 #include <utility>
 
-namespace acpp::proxy {
+namespace proxy {
 
 // Cold-path result for a proxy protocol with a next hop: the validated server
 // and the Handler's sender settings (sendThrough is applied by proxyman).
@@ -50,4 +50,4 @@ struct PreparedNextHop {
     return prepared;
 }
 
-}  // namespace acpp::proxy
+}  // namespace proxy

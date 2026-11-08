@@ -1,5 +1,5 @@
 #include "support.hpp"
-#include "acppnode/infra/runtime_failure.hpp"
+#include "infra/runtime_failure.hpp"
 
 #include <cstdlib>
 #include <new>
@@ -16,7 +16,7 @@ void operator delete(void* memory, std::size_t) noexcept { std::free(memory); }
 TEST(RuntimeFailure, FatalInfrastructureReportingDoesNotAllocateOrUnwindLiveOwners) {
     ASSERT_EXIT({
         reject_allocations = true;
-        acpp::FailRuntime("udp-receive", "registered socket receive loop stopped");
+        ::FailRuntime("udp-receive", "registered socket receive loop stopped");
     }, testing::ExitedWithCode(1),
        "runtime failed phase=udp-receive error=registered socket receive loop stopped status=forced");
 }

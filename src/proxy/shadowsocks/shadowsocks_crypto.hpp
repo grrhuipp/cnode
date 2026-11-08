@@ -1,7 +1,7 @@
 #pragma once
 
 #include "shadowsocks_protocol.hpp"
-#include "acppnode/common/byte_reader.hpp"
+#include "common/byte_reader.hpp"
 #include "../aead.hpp"
 
 #include <openssl/evp.h>
@@ -14,7 +14,7 @@
 #include <span>
 #include <variant>
 
-namespace acpp::ss {
+namespace ss {
 
 // 从主密钥 + 随机 salt 派生子密钥（HKDF-SHA1，ss-subkey）
 [[nodiscard]] bool DeriveSubkey(const uint8_t* key, size_t key_size,
@@ -99,4 +99,4 @@ inline bool AesBlockCrypt(std::span<const uint8_t> key,
     return status == 0;
 }
 
-}  // namespace acpp::ss
+}  // namespace ss

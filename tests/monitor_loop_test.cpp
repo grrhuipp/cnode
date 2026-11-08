@@ -13,8 +13,8 @@
 
 namespace {
 
-namespace net = acpp::net;
-using acpp::monitor_detail::MonitorLoop;
+namespace net = ::net;
+using ::monitor_detail::MonitorLoop;
 
 void Require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
@@ -274,7 +274,7 @@ void TestStopJoinsAcceptedBatch() {
             std::vector<net::awaitable<void>> tasks;
             tasks.push_back(WaitLoop(first, first_starts));
             tasks.push_back(WaitLoop(second, second_starts));
-            return acpp::RunAwaitableBatch(io.get_executor(), std::move(tasks));
+            return ::RunAwaitableBatch(io.get_executor(), std::move(tasks));
         },
         [&](std::string_view, std::exception_ptr) { ++reports; });
     loop->Start();

@@ -1,14 +1,13 @@
-#include "acppnode/app/runtime_publication.hpp"
+#include "app/runtime_publication.hpp"
 #include "../common/awaitable_batch.hpp"
 
-#include "acppnode/app/prepared_inbound.hpp"
-#include "acppnode/app/proxyman/inbound/factory.hpp"
-#include "acppnode/app/worker.hpp"
+#include "app/prepared_inbound.hpp"
+#include "app/proxyman/inbound/factory.hpp"
+#include "app/worker.hpp"
 
 #include <stdexcept>
 #include <utility>
 
-namespace acpp {
 
 namespace {
 
@@ -108,4 +107,3 @@ net::awaitable<void> RollbackUsers(
     rollback.reset();
 }
 
-}  // namespace acpp

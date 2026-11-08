@@ -1,8 +1,8 @@
 #include <gtest/gtest.h>
 
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/buf/multi_buffer.hpp"
-#include "acppnode/common/session.hpp"
+#include "common/allocator.hpp"
+#include "common/buf/multi_buffer.hpp"
+#include "common/session.hpp"
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -17,7 +17,7 @@
 #include <unistd.h>
 
 namespace {
-using namespace acpp::memory;
+using namespace ::memory;
 using Pool = worker_memory;
 using namespace std::chrono_literals;
 
@@ -272,7 +272,7 @@ bool RunOwnershipAndPmr() {
 }
 
 bool RunBuffer() {
-    using acpp::buf::Buffer;
+    using ::buf::Buffer;
     auto& pool = ThreadMemoryPool();
     pool.PurgeIdle();
     std::array<Buffer*, 64> buffers{};
@@ -347,8 +347,15 @@ public:
     std::size_t live = 0;
     std::size_t live_bytes = 0;
 
+    void LimitAllocations(std::size_t count) noexcept { remaining_ = count; }
+    void AllowAllocations() noexcept { remaining_ = std::numeric_limits<std::size_t>::max(); }
+
 private:
     void* do_allocate(std::size_t bytes, std::size_t alignment) override {
+        if (remaining_ != std::numeric_limits<std::size_t>::max()) {
+            if (remaining_ == 0) throw std::bad_alloc();
+            --remaining_;
+        }
         void* block = process_resource()->allocate(bytes, alignment);
         ++allocations;
         ++live;
@@ -363,6 +370,32 @@ private:
     }
     [[nodiscard]] bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
         return this == &other;
+    }
+    std::size_t remaining_ = std::numeric_limits<std::size_t>::max();
+};
+
+struct NestedDequeEntry {
+    int value;
+    memory::RingDeque<NestedDequeEntry> children;
+
+    NestedDequeEntry(int value, std::pmr::memory_resource* resource)
+        : value(value), children(resource) {}
+    NestedDequeEntry(NestedDequeEntry&&) noexcept = default;
+    NestedDequeEntry(const NestedDequeEntry&) = delete;
+};
+
+struct AllocatorAwareEntry {
+    using allocator_type = std::pmr::polymorphic_allocator<std::byte>;
+    std::pmr::vector<int> payload;
+
+    AllocatorAwareEntry(std::allocator_arg_t, allocator_type allocator, int value)
+        : payload(allocator.resource()) { payload.push_back(value); }
+    AllocatorAwareEntry(AllocatorAwareEntry&&) noexcept = default;
+    AllocatorAwareEntry(const AllocatorAwareEntry&) = delete;
+    // 指定分配器的构造可以重建载荷，不能用普通移动的 noexcept 推断它不会失败。
+    AllocatorAwareEntry(std::allocator_arg_t, allocator_type allocator, AllocatorAwareEntry&& other)
+        : payload(other.payload, std::pmr::polymorphic_allocator<int>(allocator.resource())) {
+        other.payload.clear();
     }
 };
 
@@ -408,7 +441,7 @@ bool RunRequestArenaAndContext() {
 
         auto* prev = std::pmr::set_default_resource(worker.resource());
         {
-            acpp::session::Context ctx;
+            ::session::Context ctx;
             if (ctx.inbound.tag.get_allocator().resource() != worker.resource() ||
                 ctx.content.protocol.get_allocator().resource() != worker.resource()) {
                 std::pmr::set_default_resource(prev);
@@ -471,7 +504,7 @@ bool RunDomainMigration() {
         ThreadLocalString string = ThreadLocalString(80, 's');
         ThreadLocalDeque<int> queue;
         ThreadLocalUnorderedMap<int, ThreadLocalString> map;
-        acpp::buf::MultiBuffer buffers;
+        ::buf::MultiBuffer buffers;
         std::shared_ptr<int> shared = AllocateShared<int>(42);
         request_memory arena;
     };
@@ -485,7 +518,7 @@ bool RunDomainMigration() {
         payload->queue.push_back(9);
         payload->map.try_emplace(1, 80, 'm');
         for (int i = 0; i != 12; ++i) {
-            acpp::buf::BufferGuard buffer(acpp::buf::Buffer::New());
+            ::buf::BufferGuard buffer(::buf::Buffer::New());
             if (!buffer) return false;
             buffer->Tail()[0] = static_cast<uint8_t>(i);
             buffer->Produce(1);
@@ -528,10 +561,10 @@ bool RunLeaseRejection() {
     });
     const bool other_domain = RejectsLeaseViolation([] {
         AllocationDomain first, second;
-        acpp::buf::Buffer* buffer;
-        { ScopedAllocationDomain lease(first); buffer = acpp::buf::Buffer::New(); }
+        ::buf::Buffer* buffer;
+        { ScopedAllocationDomain lease(first); buffer = ::buf::Buffer::New(); }
         ScopedAllocationDomain wrong(second);
-        acpp::buf::Buffer::Free(buffer);
+        ::buf::Buffer::Free(buffer);
     });
     const bool concurrent = RejectsLeaseViolation([] {
         AllocationDomain domain;
@@ -561,13 +594,13 @@ bool RunJoinedDomainBorrow() {
     std::weak_ptr<void> arena = first->memory().Lifetime();
     struct Raw : ThreadAllocated { int value = 17; };
     Raw* raw;
-    acpp::buf::Buffer* buffer;
+    ::buf::Buffer* buffer;
     ThreadLocalVector<int>* vector;
     ThreadLocalVector<int>* empty;
     ThreadLocalDeque<int>* empty_queue;
     {
         ScopedAllocationDomain lease(*first);
-        buffer = acpp::buf::Buffer::New();
+        buffer = ::buf::Buffer::New();
         if (!buffer) return false;
         buffer->Produce(1);
         vector = new ThreadLocalVector<int>(32, 7);
@@ -586,7 +619,7 @@ bool RunJoinedDomainBorrow() {
             intact = buffer->Len() == 1 && moved.get_allocator().resource() == resource &&
                 raw->value == 17;
             moved.resize(10000, 8);
-            acpp::buf::Buffer::Free(buffer);
+            ::buf::Buffer::Free(buffer);
             delete raw;
         }
         // Empty containers do not pin a retired physical connection arena.
@@ -700,4 +733,124 @@ TEST(ThreadMemoryPool, Contract) {
     const bool main = RunAll();
     std::printf("unified pool layout/ownership/reuse/purge: %s\n", worker && main ? "PASS" : "FAIL");
     { ASSERT_TRUE(worker && main); return; }
+}
+
+TEST(ThreadMemoryPool, NestedDequeMovePreservesDescendantsAndResourceOwnership) {
+    CountingResource outer_resource;
+    CountingResource child_resource;
+    memory::RingDeque<NestedDequeEntry> queue(&outer_resource);
+    for (int value = 1; value <= 4; ++value)
+        queue.emplace_back(value, &child_resource);
+    queue.pop_front();
+    queue.pop_front();
+    queue.emplace_back(5, &child_resource);
+    queue.emplace_back(6, &child_resource);
+    auto& children = queue.back().children;
+    children.emplace_back(71, &outer_resource);
+    children.emplace_back(72, &child_resource);
+    children.front().children.emplace_back(911, &outer_resource);
+    children.front().children.emplace_back(922, &outer_resource);
+
+    queue = std::move(children);
+    ASSERT_EQ(queue.size(), 2u);
+    EXPECT_EQ(queue.front().value, 71);
+    EXPECT_EQ(queue.back().value, 72);
+    EXPECT_EQ(queue.get_allocator().resource(), &child_resource);
+    ASSERT_EQ(queue.front().children.size(), 2u);
+    EXPECT_EQ(queue.front().children.front().value, 911);
+    EXPECT_EQ(queue.front().children.back().value, 922);
+
+    queue = std::move(queue.front().children);
+    ASSERT_EQ(queue.size(), 2u);
+    EXPECT_EQ(queue.front().value, 911);
+    EXPECT_EQ(queue.back().value, 922);
+    EXPECT_EQ(queue.get_allocator().resource(), &outer_resource);
+    EXPECT_EQ(child_resource.live, 0u);
+    queue.clear();
+    EXPECT_EQ(outer_resource.live, 0u);
+    EXPECT_EQ(child_resource.live, 0u);
+    EXPECT_EQ(outer_resource.live_bytes, 0u);
+    EXPECT_EQ(child_resource.live_bytes, 0u);
+}
+
+TEST(ThreadMemoryPool, AllocatorAwareDequeGrowthPreservesPayloadsAcrossAllocationFailures) {
+    for (std::size_t allowance = 0; allowance <= 3; ++allowance) {
+        SCOPED_TRACE(allowance);
+        CountingResource resource;
+        {
+            memory::RingDeque<AllocatorAwareEntry> queue(&resource);
+            for (int value = 0; value < 4; ++value) queue.emplace_back(value);
+            while (queue.size() < queue.capacity())
+                queue.emplace_back(static_cast<int>(queue.size()));
+            const auto retained = queue.size();
+            bool appended = false;
+            resource.LimitAllocations(allowance);
+            try {
+                queue.emplace_back(static_cast<int>(retained));
+                appended = true;
+            } catch (const std::bad_alloc&) {}
+            resource.AllowAllocations();
+            ASSERT_EQ(queue.size(), retained + static_cast<std::size_t>(appended));
+            for (std::size_t index = 0; index < queue.size(); ++index) {
+                ASSERT_EQ(queue[index].payload.size(), 1u) << "index=" << index;
+                EXPECT_EQ(queue[index].payload.front(), static_cast<int>(index));
+                EXPECT_EQ(queue[index].payload.get_allocator().resource(), &resource);
+            }
+        }
+        EXPECT_EQ(resource.live, 0u);
+        EXPECT_EQ(resource.live_bytes, 0u);
+    }
+}
+
+TEST(ThreadMemoryPool, AllocatorAwareDequeShrinkPreservesPayloadsAndReclaimsStorage) {
+    ASSERT_EXIT({
+        CountingResource resource;
+        memory::RingDeque<AllocatorAwareEntry> queue(&resource);
+        for (int value = 0; value < 64; ++value) queue.emplace_back(value);
+        for (int index = 0; index < 7; ++index) queue.pop_front();
+        for (int value = 64; value < 71; ++value) queue.emplace_back(value);
+        for (int index = 0; index < 48; ++index) queue.pop_front();
+        const auto before = resource.live_bytes;
+        resource.LimitAllocations(2);
+        queue.shrink_to_fit();
+        resource.AllowAllocations();
+        // 失败实现可能已析构旧前缀；先在隔离进程检查泄漏，避免继续触碰失效对象。
+        if (resource.live_bytes > before) {
+            std::fprintf(stderr, "shrink leaked storage: before=%zu after=%zu live=%zu\n",
+                before, resource.live_bytes, resource.live);
+            std::_Exit(2);
+        }
+        if (queue.size() != 16) std::_Exit(3);
+        for (std::size_t index = 0; index < queue.size(); ++index) {
+            const auto& payload = queue[index].payload;
+            if (payload.size() != 1 || payload.front() != static_cast<int>(55 + index) ||
+                payload.get_allocator().resource() != &resource) std::_Exit(4);
+        }
+        queue.clear();
+        if (resource.live != 0 || resource.live_bytes != 0) std::_Exit(5);
+        std::_Exit(0);
+    }, ::testing::ExitedWithCode(0), "");
+}
+
+TEST(ThreadMemoryPool, AllocatorAwareDequeInsertionKeepsDestinationResource) {
+    CountingResource source;
+    CountingResource destination;
+    {
+        AllocatorAwareEntry incoming(std::allocator_arg,
+            AllocatorAwareEntry::allocator_type(&source), 77);
+        memory::RingDeque<AllocatorAwareEntry> queue(&destination);
+        for (int value = 0; value < 4; ++value) queue.emplace_back(value);
+        while (queue.size() < queue.capacity())
+            queue.emplace_back(static_cast<int>(queue.size()));
+        const auto retained = queue.size();
+        queue.emplace_back(std::move(incoming));
+        ASSERT_EQ(queue.size(), retained + 1);
+        for (std::size_t index = 0; index < queue.size(); ++index) {
+            ASSERT_EQ(queue[index].payload.size(), 1u);
+            EXPECT_EQ(queue[index].payload.front(), index == retained ? 77 : static_cast<int>(index));
+            EXPECT_EQ(queue[index].payload.get_allocator().resource(), &destination);
+        }
+    }
+    EXPECT_EQ(source.live, 0u);
+    EXPECT_EQ(destination.live, 0u);
 }

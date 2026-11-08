@@ -1,25 +1,25 @@
-#include "acppnode/app/proxyman/inbound/handler.hpp"
-#include "acppnode/common/ip_address.hpp"
+#include "app/proxyman/inbound/handler.hpp"
+#include "common/ip_address.hpp"
 
-#include "acppnode/app/request_load_state.hpp"
-#include "acppnode/app/session_group_executor.hpp"
+#include "app/request_load_state.hpp"
+#include "app/session_group_executor.hpp"
 
-#include "acppnode/app/rate_limiter.hpp"
-#include "acppnode/app/stats.hpp"
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/ip_utils.hpp"
-#include "acppnode/common/session.hpp"
-#include "acppnode/infra/config_types.hpp"
-#include "acppnode/infra/log.hpp"
-#include "acppnode/proxy/inbound.hpp"
-#include "acppnode/transport/internet/proxy_protocol.hpp"
-#include "acppnode/transport/internet/transport_stack.hpp"
-#include "acppnode/transport/link_error.hpp"
+#include "app/rate_limiter.hpp"
+#include "app/stats.hpp"
+#include "common/allocator.hpp"
+#include "common/ip_utils.hpp"
+#include "common/session.hpp"
+#include "infra/config_types.hpp"
+#include "infra/log.hpp"
+#include "proxy/inbound.hpp"
+#include "transport/internet/proxy_protocol.hpp"
+#include "transport/internet/transport_stack.hpp"
+#include "transport/link_error.hpp"
 
 #include <exception>
 #include <new>
 
-namespace acpp::proxyman::inbound {
+namespace proxyman::inbound {
 
 namespace {
 
@@ -476,4 +476,4 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
         request_load.PressureIdleTimeout(), stats);
 }
 
-}  // namespace acpp::proxyman::inbound
+}  // namespace proxyman::inbound

@@ -1,13 +1,13 @@
 #pragma once
 
-#include "acppnode/api/api.hpp"
-#include "acppnode/infra/config_types.hpp"
-#include "acppnode/infra/panel_config.hpp"
+#include "api/api.hpp"
+#include "infra/config_types.hpp"
+#include "infra/panel_config.hpp"
 
 #include <span>
 #include <vector>
 
-namespace acpp::controller {
+namespace controller {
 
 // Panel configuration mapping: node and user records to the source-neutral
 // InboundSpec consumed by the shared inbound builder. Throws
@@ -21,4 +21,4 @@ namespace acpp::controller {
     const api::NodeInfo& node_config,
     std::span<const api::UserInfo> users);
 
-}  // namespace acpp::controller
+}  // namespace controller

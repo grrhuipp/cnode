@@ -8,7 +8,7 @@
 #include <utility>
 #include <vector>
 
-namespace acpp::proxy::shadowsocks::outbound {
+namespace proxy::shadowsocks::outbound {
 
 // A complete, validated credential value. Preparation never drops a chain link
 // or substitutes a different cipher; Worker handlers only consume this value.
@@ -33,4 +33,4 @@ private:
     std::vector<ss::KeyBytes> psk_chain_;
 };
 
-}  // namespace acpp::proxy::shadowsocks::outbound
+}  // namespace proxy::shadowsocks::outbound

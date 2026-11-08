@@ -1,9 +1,9 @@
 #include "ss_udp.hpp"
-#include "acppnode/common/byte_reader.hpp"
+#include "common/byte_reader.hpp"
 #include "shadowsocks_crypto.hpp"
-#include "acppnode/common/address_codec.hpp"
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/container_util.hpp"
+#include "common/address_codec.hpp"
+#include "common/allocator.hpp"
+#include "common/container_util.hpp"
 
 #include <openssl/evp.h>
 #include <openssl/aead.h>
@@ -17,7 +17,7 @@
 #include <limits>
 #include <span>
 
-namespace acpp::ss {
+namespace ss {
 
 namespace {
 
@@ -27,6 +27,8 @@ constexpr size_t kSs2022UdpSessionIdSize = 8;
 constexpr size_t kSs2022UdpPacketIdSize = 8;
 constexpr uint8_t kSs2022ClientPacket = 0;
 constexpr uint8_t kSs2022ServerPacket = 1;
+// SOCKS5 最短非空域名地址：ATYP、长度、一字节域名及两字节端口。
+constexpr size_t kMinSocks5AddressSize = 1 + 1 + 1 + 2;
 
 static std::array<uint8_t, 12> kZeroNonce{};
 
@@ -127,7 +129,7 @@ struct Parsed2022Body {
     auto addr = DecodeAddress(
         std::span<const uint8_t>(plaintext.data() + pos, plaintext.size() - pos),
         AddressWireFormat::Socks5,
-        {.max_domain_len = 255, .require_non_empty_domain = true, .allow_metadata = true});
+        {.require_non_empty_domain = true, .allow_metadata = true});
     if (addr.status != AddressDecodeStatus::Complete || !addr.target.IsValid()) {
         return std::nullopt;
     }
@@ -167,7 +169,7 @@ struct Parsed2022Body {
     auto addr = DecodeAddress(
         std::span<const uint8_t>(plaintext.data() + pos, plaintext.size() - pos),
         AddressWireFormat::Socks5,
-        {.max_domain_len = 255, .require_non_empty_domain = true, .allow_metadata = false});
+        {.require_non_empty_domain = true, .allow_metadata = false});
     if (addr.status != AddressDecodeStatus::Complete || !addr.target.IsValid()) {
         return std::nullopt;
     }
@@ -384,10 +386,6 @@ struct PlaintextScratch {
             if (offset != 0) {
                 OPENSSL_cleanse(pooled->Tail().data(), offset);
             }
-            if (payload_len == 0) {
-                len = 0;
-                return true;
-            }
             pooled->Produce(static_cast<uint32_t>(len));
             pooled->Advance(static_cast<uint32_t>(offset));
             try {
@@ -424,7 +422,8 @@ struct PlaintextScratch {
     result.user_index = user_index;
     const auto full = scratch.Span();
     const size_t payload_offset = static_cast<size_t>(parsed.payload.data() - full.data());
-    if (!scratch.MoveSuffixTo(payload_offset, result.payload)) {
+    if (!scratch.MoveSuffixTo(payload_offset, result.payload) ||
+        !buf::SetUdpTarget(result.payload, result.target)) {
         return std::nullopt;
     }
     return result;
@@ -438,7 +437,7 @@ struct PlaintextScratch {
     Ss2022UdpReplayCache& replay_cache,
     bool deferred_replay) {
 
-    constexpr size_t kMinBodyPlain = 1 + 8 + 2 + 1 + 4 + 2;
+    constexpr size_t kMinBodyPlain = 1 + 8 + 2 + kMinSocks5AddressSize;
     if (datagram_len < kSs2022UdpSeparateHeaderSize +
             kMinBodyPlain + SsAeadCipher::kTagSize) {
         return std::nullopt;
@@ -566,7 +565,7 @@ struct PlaintextScratch {
     bool deferred_replay) {
 
     constexpr size_t kMinPlain =
-        kSs2022UdpSessionIdSize + kSs2022UdpPacketIdSize + 1 + 8 + 2 + 1 + 4 + 2;
+        kSs2022UdpSessionIdSize + kSs2022UdpPacketIdSize + 1 + 8 + 2 + kMinSocks5AddressSize;
     if (datagram_len < kSs2022UdpNonceSize + kMinPlain + SsAeadCipher::kTagSize) {
         return std::nullopt;
     }
@@ -1030,7 +1029,7 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacket(
         return std::nullopt;
     }
 
-    if (datagram_len < salt_size + SsAeadCipher::kTagSize + 7) {
+    if (datagram_len < salt_size + SsAeadCipher::kTagSize + kMinSocks5AddressSize) {
         return std::nullopt;
     }
 
@@ -1068,7 +1067,7 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacket(
         auto addr = DecodeAddress(
             scratch.Span(),
             AddressWireFormat::Socks5,
-            {.max_domain_len = 255, .require_non_empty_domain = true, .allow_metadata = true});
+            {.require_non_empty_domain = true, .allow_metadata = true});
         if (addr.status != AddressDecodeStatus::Complete || !addr.target.IsValid()) {
             return std::nullopt;
         }
@@ -1079,7 +1078,8 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacket(
         result.user_index = i;
 
         const size_t payload_offset = std::min(addr.consumed, plaintext_len);
-        if (!scratch.MoveSuffixTo(payload_offset, result.payload)) {
+        if (!scratch.MoveSuffixTo(payload_offset, result.payload) ||
+            !buf::SetUdpTarget(result.payload, result.target)) {
             return std::nullopt;
         }
 
@@ -1130,7 +1130,7 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacketWithKey(
         master_key.size() < key_size) {
         return std::nullopt;
     }
-    if (datagram_len < salt_size + SsAeadCipher::kTagSize + 7) {
+    if (datagram_len < salt_size + SsAeadCipher::kTagSize + kMinSocks5AddressSize) {
         return std::nullopt;
     }
 
@@ -1167,7 +1167,7 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacketWithKey(
     auto addr = DecodeAddress(
         scratch.Span(),
         AddressWireFormat::Socks5,
-        {.max_domain_len = 255, .require_non_empty_domain = true, .allow_metadata = false});
+        {.require_non_empty_domain = true, .allow_metadata = false});
     if (addr.status != AddressDecodeStatus::Complete || !addr.target.IsValid()) {
         return std::nullopt;
     }
@@ -1176,7 +1176,8 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacketWithKey(
     result.target = std::move(addr.target);
 
     const size_t payload_offset = std::min(addr.consumed, plaintext_len);
-    if (!scratch.MoveSuffixTo(payload_offset, result.payload)) {
+    if (!scratch.MoveSuffixTo(payload_offset, result.payload) ||
+        !buf::SetUdpTarget(result.payload, result.target)) {
         return std::nullopt;
     }
     return result;
@@ -1254,7 +1255,7 @@ std::optional<SsUdpDecodeResult> Decode2022UdpResponsePacket(
     std::array<uint8_t, kSs2022UdpSessionIdSize> server_session_id{};
     uint64_t packet_id = 0;
     if (Is2022AesCipher(state.cipher_info.type)) {
-        constexpr size_t kMinBodyPlain = 1 + 8 + 8 + 2 + 1 + 4 + 2;
+        constexpr size_t kMinBodyPlain = 1 + 8 + 8 + 2 + kMinSocks5AddressSize;
         if (datagram_len < kSs2022UdpSeparateHeaderSize +
                 kMinBodyPlain + SsAeadCipher::kTagSize) {
             return std::nullopt;
@@ -1297,7 +1298,7 @@ std::optional<SsUdpDecodeResult> Decode2022UdpResponsePacket(
         body_span = scratch.Span();
     } else if (state.cipher_info.type == SsCipherType::CHACHA20_POLY1305_2022) {
         constexpr size_t kMinPlain =
-            kSs2022UdpSessionIdSize + kSs2022UdpPacketIdSize + 1 + 8 + 8 + 2 + 1 + 4 + 2;
+            kSs2022UdpSessionIdSize + kSs2022UdpPacketIdSize + 1 + 8 + 8 + 2 + kMinSocks5AddressSize;
         if (datagram_len < kSs2022UdpNonceSize + kMinPlain + SsAeadCipher::kTagSize) {
             return std::nullopt;
         }
@@ -1338,10 +1339,11 @@ std::optional<SsUdpDecodeResult> Decode2022UdpResponsePacket(
     result.target = std::move(parsed->target);
     const size_t payload_offset = static_cast<size_t>(
         parsed->payload.data() - scratch.Span().data());
-    if (!scratch.MoveSuffixTo(payload_offset, result.payload)) {
+    if (!scratch.MoveSuffixTo(payload_offset, result.payload) ||
+        !buf::SetUdpTarget(result.payload, result.target)) {
         return std::nullopt;
     }
     return result;
 }
 
-}  // namespace acpp::ss
+}  // namespace ss

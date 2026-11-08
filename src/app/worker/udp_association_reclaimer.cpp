@@ -1,13 +1,13 @@
 #include "udp_association_reclaimer.hpp"
 
-#include "acppnode/infra/runtime_failure.hpp"
+#include "infra/runtime_failure.hpp"
 #include "udp_ingress.hpp"
 
 #include <algorithm>
 #include <exception>
 #include <utility>
 
-namespace acpp::worker_detail {
+namespace worker_detail {
 namespace {
 // Rows inspected per wake; further due rows wait for the next event-loop turn.
 constexpr std::size_t kMaxChecks = 64;
@@ -171,4 +171,4 @@ void UdpAssociationReclaimer::Repair(std::size_t index) noexcept {
     }
 }
 
-} // namespace acpp::worker_detail
+} // namespace worker_detail

@@ -7,7 +7,7 @@
 #include <span>
 #include <openssl/aead.h>
 
-namespace acpp::vless {
+namespace vless {
 
 inline constexpr size_t kVlessEncryptionLengthSize = 2;
 inline constexpr size_t kVlessEncryptionRecordHeaderSize = 5;
@@ -110,4 +110,4 @@ private:
     std::span<const uint8_t> ciphertext,
     std::span<uint8_t> output) noexcept;
 
-}  // namespace acpp::vless
+}  // namespace vless

@@ -1,13 +1,13 @@
 #include "udp_framing.hpp"
 
-#include "acppnode/common/buffer_util.hpp"
+#include "common/buffer_util.hpp"
 
 #include <array>
 #include <cstring>
 #include <limits>
 #include <new>
 
-namespace acpp::vless {
+namespace vless {
 
 namespace {
 
@@ -86,7 +86,7 @@ size_t EncodeUdpHeaderTo(const TargetAddress& target,
                          bool packet_addr,
                          size_t payload_size,
                          std::span<uint8_t> out) noexcept {
-    if (payload_size == 0 || payload_size > std::numeric_limits<uint16_t>::max()) {
+    if (payload_size > std::numeric_limits<uint16_t>::max()) {
         return 0;
     }
 
@@ -140,8 +140,6 @@ bool UdpFramer::Next(FramedUdpPacket& out) {
             pending_.Clear();
             throw IoSystemError(io_error::invalid_argument, "invalid VLESS UDP frame");
         }
-        // Empty frames still consume their two-byte length prefix.
-        if (payload.byte_size() == 0) continue;
         if (packet_addr_) {
             std::array<uint8_t, 19> address{};
             const size_t copied = payload.CopyPrefixTo(address);
@@ -155,7 +153,6 @@ bool UdpFramer::Next(FramedUdpPacket& out) {
             }
             out.target = std::move(header->target);
             (void)payload.DropPrefixBytes(header->consumed);
-            if (payload.byte_size() == 0) continue;
         }
         out.payload = std::move(payload);
         return true;
@@ -178,7 +175,9 @@ net::awaitable<buf::MultiBuffer> UdpFramer::ReadDatagram(
             const TargetAddress& target = packet.target
                 ? *packet.target
                 : session_target;
-            buf::SetUdpDatagramTarget(packet.payload, target);
+            if (!buf::SetUdpTarget(packet.payload, target)) {
+                throw std::bad_alloc();
+            }
             co_return std::move(packet.payload);
         }
 
@@ -237,9 +236,6 @@ net::awaitable<void> WriteUdpDatagram(
         throw IoSystemError(
             io_error::message_size, "VLESS UDP datagram is too large");
     }
-    if (*payload_size == 0) {
-        co_return;
-    }
 
     std::array<uint8_t, 32> header{};
     const size_t header_size = EncodeUdpHeaderTo(
@@ -255,4 +251,4 @@ net::awaitable<void> WriteUdpDatagram(
     co_await writer.WriteBuffers(framed.Span());
 }
 
-}  // namespace acpp::vless
+}  // namespace vless

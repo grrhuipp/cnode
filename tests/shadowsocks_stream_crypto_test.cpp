@@ -39,7 +39,6 @@ extern "C" EVP_AEAD_CTX* __wrap_EVP_AEAD_CTX_new(
 
 namespace {
 
-using namespace acpp;
 
 [[noreturn]] void Fail(std::string_view message) {
     std::cerr << message << '\n';

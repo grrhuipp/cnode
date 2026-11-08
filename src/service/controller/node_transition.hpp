@@ -1,8 +1,8 @@
 #pragma once
 
-#include "acppnode/api/api.hpp"
+#include "api/api.hpp"
 
-namespace acpp::controller {
+namespace controller {
 
 enum class NodeTransitionMode {
     Refresh,
@@ -38,4 +38,4 @@ struct NodeTransitionPlan {
     bool current_started,
     const api::NodeInfo& candidate) noexcept;
 
-}  // namespace acpp::controller
+}  // namespace controller

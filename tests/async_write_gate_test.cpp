@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "acppnode/transport/internet/async_write_gate.hpp"
+#include "transport/internet/async_write_gate.hpp"
 
 #include <asio/co_spawn.hpp>
 #include <asio/detached.hpp>
@@ -13,8 +13,8 @@
 #include <utility>
 
 TEST(AsyncWriteGate, Contract) {
-    acpp::net::io_context io_context;
-    acpp::transport::internet::AsyncWriteGate gate;
+    ::net::io_context io_context;
+    ::transport::internet::AsyncWriteGate gate;
 
     // The immediate path must be exclusive, movable, and reusable. Repeated
     // releases also leave a stale notification for the contended path below.
@@ -27,14 +27,14 @@ TEST(AsyncWriteGate, Contract) {
     {
         auto held = gate.TryAcquire();
         bool resumed = false;
-        auto waiter = acpp::net::co_spawn(io_context,
-            [&]() -> acpp::net::awaitable<void> {
+        auto waiter = ::net::co_spawn(io_context,
+            [&]() -> ::net::awaitable<void> {
                 auto lease = gate.TryAcquire();
                 if (lease) throw std::runtime_error("gate admitted concurrent writer");
                 lease = co_await gate.Acquire();
                 if (!lease) throw std::runtime_error("gate failed to wake writer");
                 resumed = true;
-            }, acpp::net::use_future);
+            }, ::net::use_future);
         io_context.poll();
         ASSERT_FALSE((resumed));
         held.Reset();
@@ -50,16 +50,16 @@ TEST(AsyncWriteGate, Contract) {
     size_t acquired_after_cancel = 0;
     bool active_acquired = false;
 
-    auto coordinator = acpp::net::co_spawn(
+    auto coordinator = ::net::co_spawn(
         io_context,
-        [&]() -> acpp::net::awaitable<void> {
+        [&]() -> ::net::awaitable<void> {
             auto active = gate.TryAcquire();
             active_acquired = static_cast<bool>(active);
 
             for (size_t i = 0; i < kWaiterCount; ++i) {
-                acpp::net::co_spawn(
+                ::net::co_spawn(
                     io_context,
-                    [&]() -> acpp::net::awaitable<void> {
+                    [&]() -> ::net::awaitable<void> {
                         auto lease = gate.TryAcquire();
                         if (!lease) lease = co_await gate.Acquire();
                         if (lease) {
@@ -67,16 +67,16 @@ TEST(AsyncWriteGate, Contract) {
                         }
                         ++completed_waiters;
                     },
-                    acpp::net::detached);
+                    ::net::detached);
             }
 
             // Queue cancellation after every spawned writer has reached the
             // busy gate. A terminal cancel must resume all four, not only one.
-            co_await acpp::net::post(
-                io_context, acpp::net::use_awaitable);
+            co_await ::net::post(
+                io_context, ::net::use_awaitable);
             gate.Cancel();
         },
-        acpp::net::use_future);
+        ::net::use_future);
 
     io_context.run();
     try {
@@ -90,13 +90,13 @@ TEST(AsyncWriteGate, Contract) {
     ASSERT_FALSE((acquired_after_cancel != 0));
 
     io_context.restart();
-    auto after_cancel = acpp::net::co_spawn(
+    auto after_cancel = ::net::co_spawn(
         io_context,
-        [&]() -> acpp::net::awaitable<bool> {
+        [&]() -> ::net::awaitable<bool> {
             auto lease = co_await gate.Acquire();
             co_return static_cast<bool>(lease);
         },
-        acpp::net::use_future);
+        ::net::use_future);
     io_context.run();
     ASSERT_FALSE((after_cancel.get() || gate.TryAcquire()));
 

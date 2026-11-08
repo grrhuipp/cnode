@@ -1,15 +1,15 @@
 #pragma once
 
-#include "acppnode/common/buf/multi_buffer.hpp"
-#include "acppnode/common/error.hpp"
-#include "acppnode/transport/link.hpp"
+#include "common/buf/multi_buffer.hpp"
+#include "common/error.hpp"
+#include "transport/link.hpp"
 
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <span>
 
-namespace acpp::vless {
+namespace vless {
 
 class VlessBufferedReader final : public transport::MultiBufferReader {
 public:
@@ -73,4 +73,4 @@ inline net::awaitable<void> WriteVlessBytes(
     co_await writer.WriteBuffers(std::span<const net::const_buffer>{&buffer, 1});
 }
 
-}  // namespace acpp::vless
+}  // namespace vless

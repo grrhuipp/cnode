@@ -1,12 +1,12 @@
-#include "acppnode/infra/outbound_source_config.hpp"
-#include "acppnode/core/naming.hpp"
-#include "acppnode/infra/json_field.hpp"
-#include "acppnode/infra/outbound_bind_config.hpp"
+#include "infra/outbound_source_config.hpp"
+#include "core/naming.hpp"
+#include "infra/json_field.hpp"
+#include "infra/outbound_bind_config.hpp"
 
 #include <stdexcept>
 #include <utility>
 
-namespace acpp::infra {
+namespace infra {
 
 OutboundSourceConfig OutboundSourceConfig::FromJson(const json::object& j) {
     OutboundSourceConfig cfg;
@@ -48,4 +48,4 @@ OutboundSourceConfig OutboundSourceConfig::FromJson(const json::object& j) {
     return cfg;
 }
 
-}  // namespace acpp::infra
+}  // namespace infra

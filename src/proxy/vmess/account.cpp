@@ -8,7 +8,7 @@
 #include <cstring>
 #include <string_view>
 
-namespace acpp::vmess {
+namespace vmess {
 
 namespace {
 constexpr std::string_view kVmessMagic = "c48619fe-8f02-49e0-b9e9-edf763e17e21";
@@ -47,4 +47,4 @@ std::optional<MemoryAccount> MemoryAccount::FromUUID(
     return account;
 }
 
-}  // namespace acpp::vmess
+}  // namespace vmess

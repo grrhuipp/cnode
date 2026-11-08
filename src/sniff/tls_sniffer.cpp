@@ -1,15 +1,14 @@
-#include "acppnode/sniff/sniffer.hpp"
-#include "acppnode/common/ip_address.hpp"
+#include "sniff/sniffer.hpp"
+#include "common/ip_address.hpp"
 
-#include "acppnode/common/byte_reader.hpp"
-#include "acppnode/common/domain_name.hpp"
-#include "acppnode/core/constants.hpp"
-#include "acppnode/transport/internet/tls_server_name.hpp"
+#include "common/byte_reader.hpp"
+#include "common/domain_name.hpp"
+#include "core/constants.hpp"
+#include "transport/internet/tls_server_name.hpp"
 
 #include <algorithm>
 #include <array>
 
-namespace acpp {
 namespace {
 
 constexpr uint8_t kContentTypeHandshake = 0x16;
@@ -275,4 +274,3 @@ SniffResult SniffTls(std::span<const uint8_t> data) {
     return result;
 }
 
-}  // namespace acpp

@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-namespace acpp::vmess {
+namespace vmess {
 
 // Wire values of the request header security nibble.
 enum class Security : uint8_t {
@@ -12,4 +12,4 @@ enum class Security : uint8_t {
     ZERO              = 6
 };
 
-}  // namespace acpp::vmess
+}  // namespace vmess

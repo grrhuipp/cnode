@@ -2,12 +2,12 @@
 
 #include "shadowsocks_crypto.hpp"
 
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/buf/multi_buffer.hpp"
-#include "acppnode/common/buf/length_prefixed_packet_buffer.hpp"
-#include "acppnode/common/buffer_util.hpp"
-#include "acppnode/transport/async_stream.hpp"
-#include "acppnode/transport/link.hpp"
+#include "common/allocator.hpp"
+#include "common/buf/multi_buffer.hpp"
+#include "common/buf/length_prefixed_packet_buffer.hpp"
+#include "common/buffer_util.hpp"
+#include "transport/async_stream.hpp"
+#include "transport/link.hpp"
 
 #include <algorithm>
 #include <array>
@@ -17,7 +17,7 @@
 #include <span>
 #include <tl/expected.hpp>
 
-namespace acpp::ss::detail {
+namespace ss::detail {
 
 inline constexpr size_t kStreamChunkPayloadSize =
     buf::Buffer::kSize - (2 + SsAeadCipher::kTagSize) - SsAeadCipher::kTagSize;
@@ -261,4 +261,4 @@ private:
     std::exception_ptr failure_;
 };
 
-} // namespace acpp::ss::detail
+} // namespace ss::detail

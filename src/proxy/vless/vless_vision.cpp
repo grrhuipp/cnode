@@ -1,15 +1,15 @@
 #include "vless_vision.hpp"
-#include "acppnode/common/byte_reader.hpp"
-#include "acppnode/common/buffer_util.hpp"
+#include "common/byte_reader.hpp"
+#include "common/buffer_util.hpp"
 
-#include "acppnode/common/error.hpp"
+#include "common/error.hpp"
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <openssl/mem.h>
 #include <openssl/rand.h>
 
-namespace acpp::vless {
+namespace vless {
 
 namespace {
 
@@ -452,4 +452,4 @@ net::awaitable<void> VisionWriter::AsyncShutdownWrite() {
     co_await dst_.AsyncShutdownWrite();
 }
 
-}  // namespace acpp::vless
+}  // namespace vless

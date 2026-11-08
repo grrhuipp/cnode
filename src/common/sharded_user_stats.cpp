@@ -1,14 +1,13 @@
-#include "acppnode/common/sharded_user_stats.hpp"
+#include "common/sharded_user_stats.hpp"
 
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/string_hash.hpp"
-#include "acppnode/common/container_util.hpp"
-#include "acppnode/app/session_group_executor.hpp"
+#include "common/allocator.hpp"
+#include "common/string_hash.hpp"
+#include "common/container_util.hpp"
+#include "app/session_group_executor.hpp"
 
 #include <string>
 #include <unordered_map>
 
-namespace acpp {
 
 namespace {
 struct DeviceQuota {
@@ -246,4 +245,3 @@ UserOnlineTracker::GetOnlineDevices(std::string_view tag) const {
     return result;
 }
 
-}  // namespace acpp

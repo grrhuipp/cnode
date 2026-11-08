@@ -1,18 +1,18 @@
 #include "node_runtime.hpp"
 #include "../../common/awaitable_batch.hpp"
 
-#include "acppnode/app/proxyman/inbound/user_store.hpp"
-#include "acppnode/app/proxyman/inbound/factory.hpp"
-#include "acppnode/app/runtime_publication.hpp"
-#include "acppnode/app/worker.hpp"
-#include "acppnode/infra/log.hpp"
+#include "app/proxyman/inbound/user_store.hpp"
+#include "app/proxyman/inbound/factory.hpp"
+#include "app/runtime_publication.hpp"
+#include "app/worker.hpp"
+#include "infra/log.hpp"
 
 #include <algorithm>
 #include <cstdint>
 #include <exception>
 #include <vector>
 
-namespace acpp::controller {
+namespace controller {
 
 namespace {
 
@@ -176,4 +176,4 @@ net::awaitable<void> NodeRuntime::ApplyUsers(
         state_.user_recovery, stopping_);
 }
 
-}  // namespace acpp::controller
+}  // namespace controller

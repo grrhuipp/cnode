@@ -1,21 +1,20 @@
-#include "acppnode/transport/internet/outbound_target_builder.hpp"
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/ip_address.hpp"
-#include "acppnode/transport/internet/http_headers.hpp"
+#include "transport/internet/outbound_target_builder.hpp"
+#include "common/allocator.hpp"
+#include "common/ip_address.hpp"
+#include "transport/internet/http_headers.hpp"
 
-#include "acppnode/app/dns/dns.hpp"
-#include "acppnode/app/session_group_executor.hpp"
-#include "acppnode/common/ip_utils.hpp"
-#include "acppnode/core/constants.hpp"
-#include "acppnode/common/session.hpp"
-#include "acppnode/infra/log.hpp"
-#include "acppnode/transport/internet/transport_dialer.hpp"
+#include "app/dns/dns.hpp"
+#include "app/session_group_executor.hpp"
+#include "common/ip_utils.hpp"
+#include "core/constants.hpp"
+#include "common/session.hpp"
+#include "infra/log.hpp"
+#include "transport/internet/transport_dialer.hpp"
 
 #include <algorithm>
 #include <memory>
 #include <utility>
 
-namespace acpp {
 
 namespace {
 
@@ -511,4 +510,3 @@ void OutboundDialer::RecordEgress(session::Context& ctx,
     LOG_ACCESS(FormatAccessLog(ctx));
 }
 
-}  // namespace acpp

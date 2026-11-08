@@ -1,31 +1,31 @@
 #include "anytls_outbound.hpp"
-#include "acppnode/common/address_codec.hpp"
+#include "common/address_codec.hpp"
 #include "anytls_outbound_settings.hpp"
 #include "../../../common/awaitable_task_group.hpp"
 
 #include "../anytls_codec.hpp"
 #include "../padding.hpp"
-#include "acppnode/common/buf/length_prefixed_packet_buffer.hpp"
+#include "common/buf/length_prefixed_packet_buffer.hpp"
 #include "../../outbound_server.hpp"
 #include "../../handshake_timeout.hpp"
 #include "../../uot/uot.hpp"
-#include "acppnode/transport/internet/async_write_gate.hpp"
-#include "acppnode/app/dns/dns.hpp"
-#include "acppnode/app/session_group_executor.hpp"
-#include "acppnode/app/relay.hpp"
-#include "acppnode/app/stats.hpp"
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/ip_utils.hpp"
-#include "acppnode/common/container_util.hpp"
-#include "acppnode/common/session.hpp"
-#include "acppnode/infra/log.hpp"
-#include "acppnode/infra/runtime_failure.hpp"
-#include "acppnode/infra/config_types.hpp"
-#include "acppnode/app/proxyman/outbound/factory.hpp"
+#include "transport/internet/async_write_gate.hpp"
+#include "app/dns/dns.hpp"
+#include "app/session_group_executor.hpp"
+#include "app/relay.hpp"
+#include "app/stats.hpp"
+#include "common/allocator.hpp"
+#include "common/ip_utils.hpp"
+#include "common/container_util.hpp"
+#include "common/session.hpp"
+#include "infra/log.hpp"
+#include "infra/runtime_failure.hpp"
+#include "infra/config_types.hpp"
+#include "app/proxyman/outbound/factory.hpp"
 #include "../../../app/proxyman/outbound/registration.hpp"
-#include "acppnode/transport/internet/outbound_target_builder.hpp"
-#include "acppnode/transport/internet/timeout_scheduler.hpp"
-#include "acppnode/transport/link_error.hpp"
+#include "transport/internet/outbound_target_builder.hpp"
+#include "transport/internet/timeout_scheduler.hpp"
+#include "transport/link_error.hpp"
 
 #include <asio/experimental/channel.hpp>
 #include <asio/dispatch.hpp>
@@ -45,16 +45,16 @@
 
 namespace {
 
-constexpr size_t kMaxLogicalQueuedPayloadBytes = acpp::anytls::kMaxFramePayload;
+constexpr size_t kMaxLogicalQueuedPayloadBytes = ::anytls::kMaxFramePayload;
 // anytls-go Session.OpenStream: a v2 stream with sid >= 2 must see SYNACK
 // within 3 s or the whole session closes (proxy/session/session.go).
 constexpr std::chrono::seconds kSynAckTimeout{3};
 
 }  // namespace
 
-namespace acpp::proxy::anytls::outbound {
+namespace proxy::anytls::outbound {
 
-using namespace ::acpp::anytls;
+using namespace ::anytls;
 
 namespace {
 
@@ -284,7 +284,7 @@ struct Handler::ClientSession : memory::ThreadAllocated {
     uint32_t packet_index = 1;
     std::optional<SessionVersion> session_version;
     transport::internet::AsyncWriteGate write_gate;
-    acpp::memory::ThreadLocalUnorderedMap<
+    ::memory::ThreadLocalUnorderedMap<
         uint32_t,
         std::weak_ptr<LogicalStream>>
         logical_streams;
@@ -341,7 +341,7 @@ struct Handler::ClientSession : memory::ThreadAllocated {
         write_gate.Cancel();
         auto streams = std::exchange(
             logical_streams,
-            acpp::memory::ThreadLocalUnorderedMap<uint32_t, std::weak_ptr<LogicalStream>>{
+            ::memory::ThreadLocalUnorderedMap<uint32_t, std::weak_ptr<LogicalStream>>{
                 logical_streams.get_allocator()});
         for (auto& [sid, weak] : streams) {
             (void)sid;
@@ -1447,40 +1447,40 @@ net::awaitable<OutboundProcessResult> Handler::ProcessSession(
     co_return result;
 }
 
-}  // namespace acpp::proxy::anytls::outbound
+}  // namespace proxy::anytls::outbound
 
 namespace {
-const bool kOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
-    acpp::constants::protocol::kAnyTLS,
-    [](const acpp::infra::OutboundSourceConfig& cfg)
-        -> std::optional<acpp::proxyman::outbound::PreparedOutboundProxy> {
-        auto settings = acpp::proxy::anytls::outbound::ParseSettings(cfg.settings);
+const bool kOutboundRegistered = (::proxyman::outbound::RegisterProxy(
+    ::constants::protocol::kAnyTLS,
+    [](const ::infra::OutboundSourceConfig& cfg)
+        -> std::optional<::proxyman::outbound::PreparedOutboundProxy> {
+        auto settings = ::proxy::anytls::outbound::ParseSettings(cfg.settings);
         if (!settings) {
             LOG_ERROR("AnyTLS outbound '{}': invalid settings: {}",
                       cfg.tag, settings.error());
             return std::nullopt;
         }
-        auto stream_settings = acpp::proxy::PrepareOutboundStream(
+        auto stream_settings = ::proxy::PrepareOutboundStream(
             cfg,
             settings->server,
-            acpp::OutboundStreamDefaults{
+            ::OutboundStreamDefaults{
                 .require_tls = true,
                 .fallback_server_name = {},
                 .allow_insecure = false,
                 .alpn = {},
             });
-        using Settings = acpp::proxy::anytls::outbound::Settings;
-        return acpp::proxyman::outbound::PreparedOutboundProxy{
-            .create = acpp::proxyman::outbound::MakePreparedOutboundCreator<
+        using Settings = ::proxy::anytls::outbound::Settings;
+        return ::proxyman::outbound::PreparedOutboundProxy{
+            .create = ::proxyman::outbound::MakePreparedOutboundCreator<
                 Settings,
                 +[](std::string_view tag,
                     std::shared_ptr<const Settings> state,
-                    acpp::net::io_context& io_context,
-                    acpp::AwaitableTaskGroup& tasks) -> std::unique_ptr<acpp::Outbound> {
-                    return std::make_unique<acpp::proxy::anytls::outbound::Handler>(
+                    ::net::io_context& io_context,
+                    ::AwaitableTaskGroup& tasks) -> std::unique_ptr<::Outbound> {
+                    return std::make_unique<::proxy::anytls::outbound::Handler>(
                         tag, io_context, std::move(state), tasks);
                 }>(std::move(*settings), true),
-            .sender = acpp::OutboundSenderSettings{
+            .sender = ::OutboundSenderSettings{
                 .stream_settings = std::move(stream_settings),
                 .send_through = {},
             },

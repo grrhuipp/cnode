@@ -1,15 +1,15 @@
 #include "vless_codec.hpp"
 #include "udp_framing.hpp"
-#include "acppnode/common/address_codec.hpp"
+#include "common/address_codec.hpp"
 
-#include "acppnode/common/byte_reader.hpp"
+#include "common/byte_reader.hpp"
 
 #include <array>
 #include <cstring>
 #include <limits>
 #include <optional>
 
-namespace acpp::vless {
+namespace vless {
 
 namespace {
 
@@ -144,7 +144,7 @@ RequestHeaderDecodeResult DecodeRequestHeader(std::span<const uint8_t> data) {
                command == static_cast<uint8_t>(Command::UDP)) {
         auto address = DecodeAddress(
             data.subspan(consumed), AddressWireFormat::PortFirst,
-            {.max_domain_len = 253, .require_non_empty_domain = true, .allow_metadata = true});
+            {.require_non_empty_domain = true, .allow_metadata = true});
         if (address.status == AddressDecodeStatus::Invalid) {
             result.status = RequestHeaderDecodeStatus::InvalidAddress;
             return result;
@@ -223,4 +223,4 @@ size_t EncodeRequestHeaderTo(
     return encoded == 0 ? 0 : writer.Position() + encoded;
 }
 
-}  // namespace acpp::vless
+}  // namespace vless

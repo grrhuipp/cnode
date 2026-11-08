@@ -1,13 +1,13 @@
-#include "acppnode/common/mux/mux_codec.hpp"
-#include "acppnode/common/byte_reader.hpp"
-#include "acppnode/common/buf/multi_buffer.hpp"
-#include "acppnode/common/address_codec.hpp"
+#include "common/mux/mux_codec.hpp"
+#include "common/byte_reader.hpp"
+#include "common/buf/multi_buffer.hpp"
+#include "common/address_codec.hpp"
 
 #include <algorithm>
 #include <array>
 #include <limits>
 
-namespace acpp::mux {
+namespace mux {
 
 namespace {
 
@@ -228,9 +228,11 @@ size_t EncodeNewHeaderTo(std::span<uint8_t> out,
                          NetworkType network,
                          const TargetAddress& target,
                          size_t payload_len,
+                         bool has_data,
                          ForwardedMetadataView forwarded) noexcept {
     if ((network != NetworkType::TCP && network != NetworkType::UDP) ||
         payload_len > std::numeric_limits<uint16_t>::max() ||
+        (!has_data && payload_len != 0) ||
         !target.IsValid()) {
         return 0;
     }
@@ -238,7 +240,7 @@ size_t EncodeNewHeaderTo(std::span<uint8_t> out,
         out,
         session_id,
         SessionStatus::NEW,
-        payload_len > 0 ? kOptionData : 0x00);
+        has_data ? kOptionData : 0x00);
     if (pos == 0 || out.size() < pos + 1) {
         return 0;
     }
@@ -253,7 +255,7 @@ size_t EncodeNewHeaderTo(std::span<uint8_t> out,
         return 0;
     }
     pos += addr_len;
-    return FinalizeFrameHeaderSpan(out, pos, payload_len, payload_len > 0);
+    return FinalizeFrameHeaderSpan(out, pos, payload_len, has_data);
 }
 
 // ============================================================================
@@ -316,4 +318,4 @@ size_t EncodeKeepUDPHeaderTo(std::span<uint8_t> out,
     return FinalizeFrameHeaderSpan(out, pos, payload_len, true);
 }
 
-}  // namespace acpp::mux
+}  // namespace mux

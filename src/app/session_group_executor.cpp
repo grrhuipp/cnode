@@ -1,6 +1,6 @@
-#include "acppnode/app/session_group_executor.hpp"
-#include "acppnode/infra/runtime_failure.hpp"
-#include "acppnode/infra/log.hpp"
+#include "app/session_group_executor.hpp"
+#include "infra/runtime_failure.hpp"
+#include "infra/log.hpp"
 
 #include <asio/associated_executor.hpp>
 #include <asio/async_result.hpp>
@@ -20,7 +20,6 @@
 #include <stdexcept>
 #include <system_error>
 
-namespace acpp {
 namespace {
 thread_local ExecutionDomain* current_domain = nullptr;
 thread_local bool validating_domain = false;
@@ -58,8 +57,7 @@ struct GroupCoordinator::ReservedState {
     std::atomic<size_t> live_domains{0};
     bool waiting_for_domains = false;
     std::atomic<ReservedOperation*> incoming{nullptr};
-    std::atomic<bool> start_posted{false};
-    bool started = false;
+    std::atomic<bool> started{false};
     bool stopping = false;
     bool joined = false;
     std::atomic<WorkerRoute*> routes{nullptr};
@@ -97,18 +95,20 @@ GroupCoordinator::GroupCoordinator(net::io_context& io, size_t capacity)
     (void)merge_gate_.try_send(IoErrorCode{});
 }
 GroupCoordinator::~GroupCoordinator() {
-    if (reserved_->started && !reserved_->joined)
+    if (reserved_->started.load(std::memory_order_relaxed) && !reserved_->joined)
         FailRuntime("group-coordinator", "reserved controls were not joined");
     DrainReserved();
 }
 
 void GroupCoordinator::EnsureStarted() {
-    if (reserved_->started || reserved_->joined) return;
+    if (reserved_->started.load(std::memory_order_relaxed) || reserved_->joined) return;
     ArmReserved();
-    reserved_->started = true;
+    // Only the coordinator publishes successful arms. Release/acquire shares
+    // readiness with Workers; an arm failure leaves the collector inactive.
+    reserved_->started.store(true, std::memory_order_release);
 }
 void GroupCoordinator::Start() {
-    if (reserved_->start_posted.exchange(true, std::memory_order_acq_rel)) return;
+    if (reserved_->started.load(std::memory_order_acquire)) return;
     net::post(reactor_, [self = shared_from_this()] { self->EnsureStarted(); });
 }
 
@@ -168,18 +168,25 @@ void GroupCoordinator::RetireDomain() noexcept {
         (void)reserved_->domains_retired.try_send(IoErrorCode{});
 }
 void GroupCoordinator::ArmReserved() {
-    reserved_->event.async_wait(net::posix::stream_descriptor::wait_read,
-        [this](IoErrorCode error) {
-            uint64_t count;
-            while (::read(reserved_->event.native_handle(), &count, sizeof(count)) > 0) {}
-            DrainReserved();
-            if (reserved_->stopping) {
-                (void)reserved_->stopped.try_send(IoErrorCode{});
-                return;
-            }
-            if (error) FailRuntime("group-coordinator", "reserved return readiness failed");
-            ArmReserved();
-        });
+    try {
+        reserved_->event.async_wait(net::posix::stream_descriptor::wait_read,
+            [this](IoErrorCode error) {
+                uint64_t count;
+                while (::read(reserved_->event.native_handle(), &count, sizeof(count)) > 0) {}
+                DrainReserved();
+                if (reserved_->stopping) {
+                    (void)reserved_->stopped.try_send(IoErrorCode{});
+                    return;
+                }
+                if (error) FailRuntime("group-coordinator", "reserved return readiness failed");
+                ArmReserved();
+            });
+    } catch (...) {
+        // The previous native completion has already been consumed. Neither
+        // Start nor Finalize may assume a cancellation completion still exists.
+        reserved_->started.store(false, std::memory_order_release);
+        throw;
+    }
 }
 net::awaitable<void> GroupCoordinator::AsyncJoin() {
     co_await mailbox_.AsyncJoinAccepted();
@@ -191,13 +198,15 @@ net::awaitable<void> GroupCoordinator::Finalize() {
     // Completion promises may become ready before their executor and the
     // enclosing Run callback release the last domain reference. Keep accepting
     // reserved retirements until those owners have actually gone away.
+    if (reserved_->live_domains.load(std::memory_order_acquire) != 0)
+        EnsureStarted();
     reserved_->waiting_for_domains = true;
     while (reserved_->live_domains.load(std::memory_order_acquire) != 0)
         co_await reserved_->domains_retired.async_receive(net::use_awaitable);
     reserved_->waiting_for_domains = false;
     reserved_->stopping = true;
     IoErrorCode error;
-    if (reserved_->started) {
+    if (reserved_->started.load(std::memory_order_relaxed)) {
         reserved_->event.cancel(error);
         co_await reserved_->stopped.async_receive(net::use_awaitable);
     }
@@ -215,8 +224,11 @@ struct ExecutionDomain::Group {
     };
     using Members = std::list<Member>;
     Members members;
-    using Leases = std::list<std::weak_ptr<::acpp::LeaseIdentity>>;
+    using Leases = std::list<std::weak_ptr<::LeaseIdentity>>;
     Leases leases;
+    // Frozen snapshots pin every member until the complete group is thawed.
+    // Native preparation borrows resources owned by these domains.
+    std::vector<std::shared_ptr<ExecutionDomain>> frozen_members;
     const uint64_t identity = next_group_identity.fetch_add(1, std::memory_order_relaxed);
     unsigned rank = 0;
     bool permanently_shared = false;
@@ -227,7 +239,7 @@ struct ExecutionDomain::State {
     // group and membership are coordinator-only, except construction/destruction
     // while no callback can hold the domain. Hot-path identity is separate.
     std::shared_ptr<Group> group;
-    std::shared_ptr<::acpp::LeaseIdentity> identity;
+    std::shared_ptr<::LeaseIdentity> identity;
     std::atomic<WorkerRoute*> route;
     std::atomic<bool> frozen{false};
     std::weak_ptr<ExecutionDomain> attached_to;
@@ -252,7 +264,7 @@ struct ExecutionDomain::State {
     State(WorkerRoute* r, std::shared_ptr<Hooks> h, std::shared_ptr<Group> g,
           std::shared_ptr<GroupCoordinator> c)
         : hooks(std::move(h)), group(std::move(g)),
-          identity(std::make_shared<::acpp::LeaseIdentity>(group->identity)),
+          identity(std::make_shared<::LeaseIdentity>(group->identity)),
           route(r), coordinator(std::move(c)) {}
 };
 
@@ -290,7 +302,27 @@ std::shared_ptr<ExecutionDomain> ExecutionDomain::Create(
     auto* route = coordinator->reserved_->Route({worker_id, &reactor, std::move(worker_executor)});
     auto group = std::make_shared<Group>();
     auto domain = std::shared_ptr<ExecutionDomain>(new ExecutionDomain(
-        std::make_unique<State>(route, std::move(hooks), group, coordinator)));
+        std::make_unique<State>(route, std::move(hooks), group, coordinator)),
+        [](ExecutionDomain* retired) noexcept {
+            // Before registration commits, the candidate still belongs to its
+            // constructor; rollback cannot depend on a Worker ever starting.
+            if (!retired->state_->retirement) {
+                delete retired;
+                return;
+            }
+            const auto* route = retired->state_->route.load(std::memory_order_acquire);
+            if (route->target.reactor->get_executor().running_in_this_thread()) {
+                delete retired;
+                return;
+            }
+            // The last metadata reference can disappear on the coordinator.
+            // Service teardown and allocator release still belong to the Worker.
+            try {
+                net::post(route->target.executor, [retired] { delete retired; });
+            } catch (...) {
+                FailRuntime("session-domain", "cannot deliver domain retirement");
+            }
+        });
     auto retirement = std::make_unique<State::Retirement>();
     group->leases.emplace_back(domain->state_->identity);
     domain->state_->lease_position = std::prev(group->leases.end());
@@ -307,8 +339,8 @@ std::shared_ptr<const void> ExecutionDomain::LeaseIdentity() const noexcept {
 }
 bool ExecutionDomain::SharesLeaseIdentity(const void* a, const void* b) noexcept {
     if (!a || !b) return false;
-    return static_cast<const ::acpp::LeaseIdentity*>(a)->group.load(std::memory_order_acquire) ==
-           static_cast<const ::acpp::LeaseIdentity*>(b)->group.load(std::memory_order_acquire);
+    return static_cast<const ::LeaseIdentity*>(a)->group.load(std::memory_order_acquire) ==
+           static_cast<const ::LeaseIdentity*>(b)->group.load(std::memory_order_acquire);
 }
 net::any_io_executor ExecutionDomain::Executor() { return GroupExecutor(shared_from_this()); }
 net::io_context& ExecutionDomain::Reactor() noexcept {
@@ -425,22 +457,37 @@ net::awaitable<void> ExecutionDomain::Freeze(std::shared_ptr<ExecutionDomain> do
             std::vector<std::shared_ptr<ExecutionDomain>> members;
             for (const auto& entry : domain->state_->group->members)
                 if (auto member = entry.domain.lock()) members.push_back(std::move(member));
-            net::post(route->target.executor,
-                [domain, members = std::move(members),
-                 acknowledgement = std::move(acknowledgement)]() mutable {
-                    for (const auto& member : members)
-                        member->state_->frozen.store(true, std::memory_order_seq_cst);
-                    domain->Coordinator().PostReserved(std::move(acknowledgement));
-                });
+            auto group = domain->state_->group;
+            group->frozen_members = std::move(members);
+            try {
+                net::post(route->target.executor,
+                    [domain, group, acknowledgement = std::move(acknowledgement)]() mutable {
+                        for (const auto& member : group->frozen_members)
+                            member->state_->frozen.store(true, std::memory_order_seq_cst);
+                        domain->Coordinator().PostReserved(std::move(acknowledgement));
+                    });
+            } catch (...) {
+                std::vector<std::shared_ptr<ExecutionDomain>>{}.swap(group->frozen_members);
+                throw;
+            }
         }, token);
 }
-void ExecutionDomain::Thaw(const std::shared_ptr<Group>& group) noexcept {
-    for (const auto& entry : group->members) {
-        if (auto member = entry.domain.lock()) {
+void ExecutionDomain::Thaw(const std::shared_ptr<Group>& first,
+                           const std::shared_ptr<Group>& second) noexcept {
+    // No resumed callback may borrow a still-frozen peer in the merged group.
+    for (const auto& member : first->frozen_members)
+        member->state_->frozen.store(false, std::memory_order_seq_cst);
+    if (second) {
+        for (const auto& member : second->frozen_members)
             member->state_->frozen.store(false, std::memory_order_seq_cst);
-            member->Notify(true);
-        }
     }
+    for (const auto& member : first->frozen_members) member->Notify(true);
+    if (second) {
+        for (const auto& member : second->frozen_members) member->Notify(true);
+    }
+    std::vector<std::shared_ptr<ExecutionDomain>>{}.swap(first->frozen_members);
+    if (second)
+        std::vector<std::shared_ptr<ExecutionDomain>>{}.swap(second->frozen_members);
 }
 
 net::awaitable<bool> ExecutionDomain::MergeGroups(
@@ -493,7 +540,7 @@ net::awaitable<bool> ExecutionDomain::MergeGroups(
             co_await RebindFrozen(std::move(moved), route->target);
     } catch (...) { failure = std::current_exception(); }
     if (failure) {
-        Thaw(a); Thaw(b);
+        Thaw(a, b);
         std::rethrow_exception(failure);
     }
     for (auto& entry : source->members) {
@@ -516,7 +563,7 @@ net::awaitable<bool> ExecutionDomain::MergeGroups(
     if (destination->rank == source->rank) ++destination->rank;
     if (exclusive) second->state_->attached_to = first;
     else destination->permanently_shared = true;
-    Thaw(destination);
+    Thaw(a, b);
     co_return true;
 }
 
@@ -545,7 +592,6 @@ net::awaitable<void> ExecutionDomain::SplitGroup(
     second->state_->identity->group.store(independent->identity, std::memory_order_release);
     second->state_->attached_to.reset();
     Thaw(original);
-    Thaw(independent);
 }
 
 // A control coroutine can suspend on native readiness while the business
@@ -602,7 +648,6 @@ struct ExecutionDomain::Handoff::Transaction {
     std::shared_ptr<ExecutionDomain> origin;
     std::shared_ptr<GroupCoordinator> coordinator;
     std::shared_ptr<Group> group;
-    std::vector<std::shared_ptr<ExecutionDomain>> members;
     struct Prepared { ExecutionDomain* domain; NativeResource* resource; };
     std::vector<Prepared> prepared;
     WorkerRoute* old_route;
@@ -612,19 +657,16 @@ struct ExecutionDomain::Handoff::Transaction {
     explicit Transaction(std::shared_ptr<ExecutionDomain> domain, WorkerRoute* destination)
         : origin(std::move(domain)), coordinator(origin->state_->coordinator),
           group(origin->state_->group),
-          old_route(origin->state_->route.load(std::memory_order_acquire)), target(destination) {
-        for (const auto& entry : group->members)
-            if (auto member = entry.domain.lock()) members.push_back(std::move(member));
-    }
+          old_route(origin->state_->route.load(std::memory_order_acquire)), target(destination) {}
     net::awaitable<void> PrepareResources() {
         size_t count = 0;
-        for (const auto& member : members)
+        for (const auto& member : group->frozen_members)
             for (auto* resource = member->state_->resources; resource; resource = resource->next_)
                 ++count;
         prepared.reserve(count);
         std::exception_ptr failure;
         try {
-            for (const auto& member : members) {
+            for (const auto& member : group->frozen_members) {
                 for (auto* resource = member->state_->resources; resource; resource = resource->next_) {
                     prepared.push_back({member.get(), resource});
                     co_await net::co_spawn(
@@ -658,7 +700,7 @@ struct ExecutionDomain::Handoff::Transaction {
             // Every failed rollback has already made its resource terminal.
             // Cancel the complete association before releasing queued business
             // completions; do not expose a partially healthy session.
-            for (const auto& member : members)
+            for (const auto& member : group->frozen_members)
                 co_await net::co_spawn(net::any_io_executor(NativeExecutor{
                     member, old_route->target.executor}),
                     ReportFailure(member.get(), failure), net::use_awaitable);
@@ -687,9 +729,8 @@ struct ExecutionDomain::Handoff::Transaction {
         auto& coord = *coordinator;
         complete = true;
         prepared.clear();
-        members.clear();
-        origin.reset();
         Thaw(group);
+        origin.reset();
         (void)coord.merge_gate_.try_send(IoErrorCode{});
     }
     net::awaitable<void> Resolve(bool commit) {
@@ -697,12 +738,12 @@ struct ExecutionDomain::Handoff::Transaction {
         if (complete) co_return;
         if (busy) throw std::logic_error("handoff operation already in progress");
         busy = true;
-        const size_t domain_count = members.size();
+        const size_t domain_count = group->frozen_members.size();
         std::exception_ptr failure;
         try {
             if (commit) {
                 co_await net::co_spawn(target->target.executor, CommitResources(), net::use_awaitable);
-                for (const auto& member : members)
+                for (const auto& member : group->frozen_members)
                     member->state_->route.store(target, std::memory_order_release);
             } else {
                 co_await net::co_spawn(old_route->target.executor, CancelResources(), net::use_awaitable);
@@ -934,4 +975,3 @@ net::awaitable<void> ExecutionDomain::DetachExclusive(std::shared_ptr<ExecutionD
     if (failure) std::rethrow_exception(failure);
 }
 
-} // namespace acpp

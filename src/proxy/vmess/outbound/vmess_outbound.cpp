@@ -1,33 +1,33 @@
 #include "vmess_outbound.hpp"
-#include "acppnode/common/domain_name.hpp"
-#include "acppnode/common/ip_address.hpp"
+#include "common/domain_name.hpp"
+#include "common/ip_address.hpp"
 #include "../encoding/client.hpp"
 #include "../vmess_crypto.hpp"
 #include "../udp_datagram.hpp"
 #include "../../handshake_timeout.hpp"
 #include "../../outbound_server.hpp"
 #include "../../outbound_stream_endpoint.hpp"
-#include "acppnode/app/relay.hpp"
-#include "acppnode/app/dns/dns.hpp"
-#include "acppnode/app/proxyman/outbound/factory.hpp"
+#include "app/relay.hpp"
+#include "app/dns/dns.hpp"
+#include "app/proxyman/outbound/factory.hpp"
 #include "../../../app/proxyman/outbound/registration.hpp"
-#include "acppnode/infra/json_field.hpp"
-#include "acppnode/infra/log.hpp"
-#include "acppnode/infra/config_types.hpp"
-#include "acppnode/core/naming.hpp"
-#include "acppnode/common/error.hpp"
-#include "acppnode/common/session.hpp"
-#include "acppnode/transport/link.hpp"
-#include "acppnode/transport/internet/outbound_target_builder.hpp"
+#include "infra/json_field.hpp"
+#include "infra/log.hpp"
+#include "infra/config_types.hpp"
+#include "core/naming.hpp"
+#include "common/error.hpp"
+#include "common/session.hpp"
+#include "transport/link.hpp"
+#include "transport/internet/outbound_target_builder.hpp"
 #include <chrono>
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <new>
 #include <openssl/rand.h>
-#include "acppnode/common/buffer_util.hpp"
-#include "acppnode/common/buf/length_prefixed_packet_buffer.hpp"
+#include "common/buffer_util.hpp"
+#include "common/buf/length_prefixed_packet_buffer.hpp"
 
-namespace acpp {
 
 namespace {
 
@@ -43,15 +43,16 @@ public:
         , udp_target_(std::move(udp_target)) {}
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
         auto mb = co_await session_.DecodeResponse(stream_);
-        if (is_udp_) {
-            buf::SetUdpDatagramTarget(mb, udp_target_);
+        if (is_udp_ && mb.byte_size() != 0 &&
+            !buf::SetUdpTarget(mb, udp_target_)) {
+            throw std::bad_alloc();
         }
         co_return mb;
     }
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
         if (is_udp_) {
-            ::acpp::vmess::ValidateFixedUdpDatagram(mb, udp_target_);
+            ::vmess::ValidateFixedUdpDatagram(mb, udp_target_);
         }
         return session_.EncodeRequestBody(stream_, std::move(mb));
     }
@@ -81,7 +82,7 @@ private:
 net::awaitable<tl::expected<void, ErrorCode>>
 SendVMessHandshake(
     AsyncStream& stream,
-    ::acpp::vmess::encoding::ClientSession& vmess_session,
+    ::vmess::encoding::ClientSession& vmess_session,
     std::chrono::seconds handshake_timeout,
     session::Context& ctx) {
     stream.SetIdleTimeout(handshake_timeout);
@@ -135,12 +136,12 @@ proxy::vmess::outbound::Handler::Process(
     auto stream = std::move(*dialed);
 
     const bool is_udp = ctx.content.network == Network::UDP;
-    ::acpp::vmess::encoding::ClientSession vmess_session(
+    ::vmess::encoding::ClientSession vmess_session(
         prepared_->user,
         prepared_->auth_id_key,
         target,
         prepared_->config.security,
-        is_udp ? ::acpp::vmess::Command::UDP : ::acpp::vmess::Command::TCP,
+        is_udp ? ::vmess::Command::UDP : ::vmess::Command::TCP,
         dialer.ForwardedMetadata(ctx));
 
     if (auto ok = co_await SendVMessHandshake(
@@ -159,24 +160,24 @@ proxy::vmess::outbound::Handler::Process(
         target_endpoint, ctx, stats, relay_config, std::move(first_payload));
 }
 
-}  // namespace
+  // namespace
 
 // ============================================================================
 // 自注册（静态初始化，Xray init() 设计）
 // ============================================================================
 namespace {
-const bool kVMessRegistered = (acpp::proxyman::outbound::RegisterProxy(
-    acpp::constants::protocol::kVmess,
-    [](const acpp::infra::OutboundSourceConfig& cfg)
-        -> std::optional<acpp::proxyman::outbound::PreparedOutboundProxy> {
+const bool kVMessRegistered = (::proxyman::outbound::RegisterProxy(
+    ::constants::protocol::kVmess,
+    [](const ::infra::OutboundSourceConfig& cfg)
+        -> std::optional<::proxyman::outbound::PreparedOutboundProxy> {
         const auto& s = cfg.settings;
 
         // A present field of the wrong type is a configuration error, never
         // an implicit default.
         bool invalid_field = false;
-        auto json_string = [&](const acpp::json::object& obj,
+        auto json_string = [&](const ::json::object& obj,
                                std::string_view key) -> std::string {
-            auto parsed = acpp::ParseJsonString(obj, key);
+            auto parsed = ::ParseJsonString(obj, key);
             if (!parsed) {
                 LOG_ERROR("VMess outbound '{}': {}", cfg.tag, parsed.error());
                 invalid_field = true;
@@ -184,36 +185,36 @@ const bool kVMessRegistered = (acpp::proxyman::outbound::RegisterProxy(
             }
             return std::move(*parsed).value_or(std::string{});
         };
-        auto has_supported_alter_id = [](const acpp::json::object& obj) {
+        auto has_supported_alter_id = [](const ::json::object& obj) {
             const auto* value = obj.if_contains("alterId");
             if (!value) return true;
-            const auto alter_id = acpp::JsonUnsignedInteger(*value);
+            const auto alter_id = ::JsonUnsignedInteger(*value);
             return alter_id && *alter_id == 0;
         };
         auto parse_security = [&](std::string security)
-            -> std::optional<acpp::vmess::Security> {
-            security = acpp::naming::LowerAscii(std::move(security));
+            -> std::optional<::vmess::Security> {
+            security = ::naming::LowerAscii(std::move(security));
             if (security.empty() ||
-                security == acpp::constants::protocol::kAes128Gcm ||
-                security == acpp::constants::binding::kAuto) {
-                return acpp::vmess::Security::AES_128_GCM;
+                security == ::constants::protocol::kAes128Gcm ||
+                security == ::constants::binding::kAuto) {
+                return ::vmess::Security::AES_128_GCM;
             }
-            if (security == acpp::constants::protocol::kChacha20IetfPoly1305 ||
+            if (security == ::constants::protocol::kChacha20IetfPoly1305 ||
                 security == "chacha20-poly1305") {
-                return acpp::vmess::Security::CHACHA20_POLY1305;
+                return ::vmess::Security::CHACHA20_POLY1305;
             }
-            if (security == acpp::constants::protocol::kNone) {
-                return acpp::vmess::Security::NONE;
+            if (security == ::constants::protocol::kNone) {
+                return ::vmess::Security::NONE;
             }
             if (security == "zero") {
-                return acpp::vmess::Security::ZERO;
+                return ::vmess::Security::ZERO;
             }
             return std::nullopt;
         };
 
         std::string address;
         uint16_t port = 443;
-        auto security = acpp::vmess::Security::AES_128_GCM;
+        auto security = ::vmess::Security::AES_128_GCM;
         std::string uuid;
 
         bool parsed_xray = false;
@@ -226,7 +227,7 @@ const bool kVMessRegistered = (acpp::proxyman::outbound::RegisterProxy(
                     users_p->as_array()[0].is_object()) {
                 const auto& user = users_p->as_array()[0].as_object();
                 address = json_string(server, "address");
-                const auto source_port = acpp::ReadJsonPort(server, "port");
+                const auto source_port = ::ReadJsonPort(server, "port");
                 if (source_port.Invalid()) {
                     return std::nullopt;
                 }
@@ -248,7 +249,7 @@ const bool kVMessRegistered = (acpp::proxyman::outbound::RegisterProxy(
 
         if (!parsed_xray) {
             address = json_string(s, "address");
-            const auto source_port = acpp::ReadJsonPort(s, "port");
+            const auto source_port = ::ReadJsonPort(s, "port");
             if (source_port.Invalid()) {
                 return std::nullopt;
             }
@@ -269,34 +270,34 @@ const bool kVMessRegistered = (acpp::proxyman::outbound::RegisterProxy(
             return std::nullopt;
         }
 
-        auto user = acpp::vmess::MemoryAccount::FromUUID(uuid);
+        auto user = ::vmess::MemoryAccount::FromUUID(uuid);
         if (!user) {
             LOG_ERROR("VMess outbound '{}': invalid UUID", cfg.tag);
             return std::nullopt;
         }
-        auto next_hop = acpp::proxy::PrepareNextHop(
-            cfg, std::move(address), port, acpp::OutboundStreamDefaults{});
+        auto next_hop = ::proxy::PrepareNextHop(
+            cfg, std::move(address), port, ::OutboundStreamDefaults{});
         if (!next_hop) {
             return std::nullopt;
         }
 
-        using PreparedSettings = acpp::proxy::vmess::outbound::PreparedSettings;
-        return acpp::proxyman::outbound::PreparedOutboundProxy{
-            .create = acpp::proxyman::outbound::MakePreparedOutboundCreator<
+        using PreparedSettings = ::proxy::vmess::outbound::PreparedSettings;
+        return ::proxyman::outbound::PreparedOutboundProxy{
+            .create = ::proxyman::outbound::MakePreparedOutboundCreator<
                 PreparedSettings,
                 +[](std::string_view,
                     std::shared_ptr<const PreparedSettings> state,
-                    acpp::net::io_context& /*io_context*/,
-                    acpp::AwaitableTaskGroup& /*tasks*/) -> std::unique_ptr<acpp::Outbound> {
-                    return std::make_unique<acpp::proxy::vmess::outbound::Handler>(
+                    ::net::io_context& /*io_context*/,
+                    ::AwaitableTaskGroup& /*tasks*/) -> std::unique_ptr<::Outbound> {
+                    return std::make_unique<::proxy::vmess::outbound::Handler>(
                         std::move(state));
                 }>(PreparedSettings{
-                    acpp::VMessOutboundConfig{
+                    ::VMessOutboundConfig{
                         .server = std::move(next_hop->server),
                         .security = security,
                     },
                     *user,
-                    acpp::vmess::ExpandAuthIDEncryptKey(user->auth_key)}),
+                    ::vmess::ExpandAuthIDEncryptKey(user->auth_key)}),
             .sender = std::move(next_hop->sender),
         };
     }), true);

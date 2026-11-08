@@ -2,7 +2,7 @@
 
 #include <openssl/sha.h>
 
-namespace acpp::trojan {
+namespace trojan {
 
 PasswordHash HashPassword(std::string_view password) noexcept {
     std::array<unsigned char, SHA224_DIGEST_LENGTH> digest{};
@@ -17,4 +17,4 @@ PasswordHash HashPassword(std::string_view password) noexcept {
     return result;
 }
 
-}  // namespace acpp::trojan
+}  // namespace trojan

@@ -1,8 +1,8 @@
 #include <gtest/gtest.h>
 
-#include "acppnode/transport/internet/timeout_scheduler.hpp"
-#include "acppnode/transport/internet/async_delay.hpp"
-#include "acppnode/app/session_group_executor.hpp"
+#include "transport/internet/timeout_scheduler.hpp"
+#include "transport/internet/async_delay.hpp"
+#include "app/session_group_executor.hpp"
 #include "../src/app/worker_memory_reclaimer.hpp"
 
 #include <asio/co_spawn.hpp>
@@ -11,6 +11,7 @@
 #include <asio/post.hpp>
 #include <asio/use_future.hpp>
 #include <asio/steady_timer.hpp>
+#include <asio/posix/stream_descriptor.hpp>
 
 #include <chrono>
 #include <cstdio>
@@ -23,9 +24,10 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include <sys/eventfd.h>
+#include <unistd.h>
 
 namespace {
-using namespace acpp;
 using namespace std::chrono_literals;
 using timeout_allocation_test::reject_allocations;
 using timeout_allocation_test::rejected_allocations;
@@ -735,4 +737,256 @@ TEST(TimeoutScheduler, Contract) {
         passed = passed && result;
     }
     { ASSERT_TRUE(passed); return; }
+}
+
+TEST(SessionGroupExecutor, AllocationFailureRollsBackBeforeWorkerStarts) {
+    struct Hooks final : ExecutionDomain::Hooks {
+        bool entered = false;
+        void Enter() noexcept override { entered = true; }
+        void Leave() noexcept override { entered = false; }
+        void OnFailure(std::exception_ptr) noexcept override { std::terminate(); }
+    };
+    net::io_context control, worker;
+    auto coordinator = std::make_shared<GroupCoordinator>(control);
+    coordinator->RegisterWorker(0, worker, worker.get_executor());
+    coordinator->Start();
+    control.poll();
+    bool recovered = false;
+    for (std::ptrdiff_t fail_at = 0; fail_at != 64; ++fail_at) {
+        auto hooks = std::make_shared<Hooks>();
+        const std::weak_ptr<Hooks> released = hooks;
+        std::shared_ptr<ExecutionDomain> domain;
+        bool failed = false;
+        timeout_allocation_test::fail_after = fail_at;
+        try {
+            domain = ExecutionDomain::Create(
+                worker, 0, worker.get_executor(), std::move(hooks), coordinator);
+        } catch (const std::bad_alloc&) { failed = true; }
+        timeout_allocation_test::fail_after = -1;
+        if (failed) {
+            EXPECT_TRUE(released.expired())
+                << "construction failure retained its host at allocation " << fail_at;
+        } else {
+            bool entered = false;
+            domain->Execute([&] {
+                auto owner = released.lock();
+                entered = ExecutionDomain::Current() == domain && owner && owner->entered;
+            });
+            worker.restart();
+            worker.poll();
+            EXPECT_TRUE(entered) << "recovered domain did not execute under its host lease";
+            domain.reset();
+            recovered = true;
+        }
+        // Drain only after checking rollback: a failed candidate must not need
+        // a Worker which may never start after construction has thrown.
+        worker.restart();
+        worker.poll();
+        EXPECT_TRUE(released.expired()) << "host survived owner cleanup";
+        control.poll();
+        if (recovered) break;
+    }
+    EXPECT_TRUE(recovered) << "allocation sweep never reached a healthy domain";
+    bool finalized = false;
+    net::co_spawn(control, [coordinator]() -> net::awaitable<void> {
+        coordinator->CloseAdmission();
+        co_await coordinator->AsyncJoin();
+        coordinator->ReleaseServices();
+        co_await coordinator->Finalize();
+    }, [&](std::exception_ptr error) { finalized = !error; });
+    control.restart();
+    control.run_for(1s);
+    EXPECT_TRUE(finalized) << "construction rollback left coordinator ownership";
+}
+
+namespace {
+void FailedStartupDoesNotStrandRetirement(bool fail_arm) {
+    struct Hooks final : ExecutionDomain::Hooks {
+        void Enter() noexcept override {}
+        void Leave() noexcept override {}
+        void OnFailure(std::exception_ptr) noexcept override { std::terminate(); }
+    };
+    net::io_context control, worker;
+    auto coordinator = std::make_shared<GroupCoordinator>(control);
+    coordinator->RegisterWorker(0, worker, worker.get_executor());
+    bool failed = false;
+    if (fail_arm) coordinator->Start();
+    timeout_allocation_test::reject_asio_allocations = true;
+    try {
+        if (fail_arm) control.poll();
+        else coordinator->Start();
+    }
+    catch (const std::bad_alloc&) { failed = true; }
+    timeout_allocation_test::reject_asio_allocations = false;
+    EXPECT_TRUE(failed) << "startup allocation fault was not exercised";
+    coordinator->Start();
+    control.restart();
+    control.poll();
+    auto hooks = std::make_shared<Hooks>();
+    const std::weak_ptr<Hooks> released = hooks;
+    auto domain = ExecutionDomain::Create(
+        worker, 0, worker.get_executor(), std::move(hooks), coordinator);
+    bool finalized = false;
+    std::exception_ptr failure;
+    net::co_spawn(control, [coordinator]() -> net::awaitable<void> {
+        coordinator->CloseAdmission();
+        co_await coordinator->AsyncJoin();
+        coordinator->ReleaseServices();
+        co_await coordinator->Finalize();
+    }, [&](std::exception_ptr error) {
+        failure = error;
+        finalized = true;
+    });
+    control.restart();
+    control.poll();
+    EXPECT_FALSE(finalized) << "finalization failed to wait for the live domain";
+    domain.reset();
+    worker.poll();
+    EXPECT_TRUE(released.expired()) << "owner Worker retained the retired host";
+    control.restart();
+    control.run_for(1s);
+    EXPECT_TRUE(finalized)
+        << "startup retry did not restore native retirement notifications";
+    // Preserve the observation above, then drain a broken implementation so
+    // this failure does not leave the fixture's pending Finalize coroutine.
+    if (!finalized) {
+        net::co_spawn(control, coordinator->AsyncJoin(),
+            [&](std::exception_ptr error) { if (error) failure = error; });
+        control.restart();
+        control.run_for(1s);
+    }
+    EXPECT_TRUE(finalized) << "manual fixture cleanup did not join finalization";
+    EXPECT_FALSE(failure);
+}
+}  // namespace
+
+TEST(SessionGroupExecutor, FailedStartDoesNotStrandNativeRetirement) {
+    FailedStartupDoesNotStrandRetirement(false);
+}
+
+TEST(SessionGroupExecutor, FailedNativeArmDoesNotStrandRetirement) {
+    FailedStartupDoesNotStrandRetirement(true);
+}
+
+namespace {
+enum class RearmResolution { Restart, StopRetired, StopLive };
+
+void FailedRearmDoesNotStrandShutdown(RearmResolution resolution) {
+    struct Hooks final : ExecutionDomain::Hooks {
+        void Enter() noexcept override {}
+        void Leave() noexcept override {}
+        void OnFailure(std::exception_ptr) noexcept override { std::terminate(); }
+    };
+    net::io_context control, worker;
+    net::posix::stream_descriptor spare(control);
+    const int fd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (fd < 0) throw std::runtime_error("cannot create spare native notification");
+    try { spare.assign(fd); }
+    catch (...) { ::close(fd); throw; }
+    auto coordinator = std::make_shared<GroupCoordinator>(control);
+    coordinator->RegisterWorker(0, worker, worker.get_executor());
+    coordinator->Start();
+    control.poll();
+    auto hooks = std::make_shared<Hooks>();
+    const std::weak_ptr<Hooks> released = hooks;
+    auto domain = ExecutionDomain::Create(
+        worker, 0, worker.get_executor(), std::move(hooks), coordinator);
+    bool spare_completed = false;
+    struct ConsumeWaitStorage final : GroupCoordinator::ReservedOperation {
+        net::posix::stream_descriptor& spare;
+        bool& completed;
+        ConsumeWaitStorage(net::posix::stream_descriptor& spare, bool& completed)
+            : spare(spare), completed(completed) {}
+        void Invoke() noexcept override {
+            // Consume the just-completed descriptor wait's recycled block.
+            // Rearming the real collector must then cross the fault seam.
+            spare.async_wait(net::posix::stream_descriptor::wait_read,
+                [flag = &completed](IoErrorCode) { *flag = true; });
+            timeout_allocation_test::reject_asio_allocations = true;
+        }
+    };
+    coordinator->PostReserved(
+        std::make_unique<ConsumeWaitStorage>(spare, spare_completed));
+    bool failed = false;
+    try { control.poll(); }
+    catch (const std::bad_alloc&) { failed = true; }
+    timeout_allocation_test::reject_asio_allocations = false;
+    if (!failed) {
+        std::fprintf(stderr, "native rearm allocation fault was not exercised\n");
+        std::_Exit(2);
+    }
+    spare.cancel();
+    control.restart();
+    control.poll();
+    if (!spare_completed) {
+        std::fprintf(stderr, "spare native wait did not join\n");
+        std::_Exit(2);
+    }
+    if (resolution == RearmResolution::Restart) {
+        coordinator->Start();
+        control.restart();
+        control.poll();
+    }
+    if (resolution == RearmResolution::StopRetired) {
+        domain.reset();
+        worker.poll();
+    }
+    bool finalized = false;
+    std::exception_ptr failure;
+    net::co_spawn(control, [coordinator]() -> net::awaitable<void> {
+        coordinator->CloseAdmission();
+        co_await coordinator->AsyncJoin();
+        coordinator->ReleaseServices();
+        co_await coordinator->Finalize();
+    }, [&](std::exception_ptr error) {
+        failure = error;
+        finalized = true;
+    });
+    control.restart();
+    control.poll();
+    if (domain) {
+        if (finalized) {
+            std::fprintf(stderr, "finalization did not retain the live domain\n");
+            std::_Exit(2);
+        }
+        domain.reset();
+        worker.poll();
+    }
+    control.restart();
+    control.run_for(1s);
+    if (!finalized || failure || !released.expired()) {
+        std::fprintf(stderr, "native rearm failure stranded domain retirement or shutdown\n");
+        std::_Exit(1);
+    }
+    const std::weak_ptr<GroupCoordinator> retired = coordinator;
+    coordinator.reset();
+    if (!retired.expired()) {
+        std::fprintf(stderr, "finalization retained the coordinator\n");
+        std::_Exit(2);
+    }
+}
+}  // namespace
+
+TEST(SessionGroupExecutorDeathTest, FailedRearmCanRestart) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_EXIT({
+        FailedRearmDoesNotStrandShutdown(RearmResolution::Restart);
+        std::_Exit(0);
+    }, ::testing::ExitedWithCode(0), "");
+}
+
+TEST(SessionGroupExecutorDeathTest, FailedRearmCanStopWithRetiredDomains) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_EXIT({
+        FailedRearmDoesNotStrandShutdown(RearmResolution::StopRetired);
+        std::_Exit(0);
+    }, ::testing::ExitedWithCode(0), "");
+}
+
+TEST(SessionGroupExecutorDeathTest, FailedRearmCanJoinLiveDomains) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_EXIT({
+        FailedRearmDoesNotStrandShutdown(RearmResolution::StopLive);
+        std::_Exit(0);
+    }, ::testing::ExitedWithCode(0), "");
 }

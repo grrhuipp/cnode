@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 
-#include "acppnode/app/dns/dns_worker.hpp"
-#include "acppnode/common/allocator.hpp"
+#include "app/dns/dns_worker.hpp"
+#include "common/allocator.hpp"
 #include "app/dns/datagram_exchange.hpp"
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/cancellation_signal.hpp>
@@ -10,18 +10,19 @@
 #include <array>
 #include <iostream>
 #include <map>
+#include <optional>
 #include <set>
 #include <stdexcept>
 
 namespace {
-namespace net = acpp::net;
+namespace net = ::net;
 using namespace std::chrono_literals;
-using acpp::app::dns::DNS;
-using acpp::app::dns::DnsResult;
+using ::app::dns::DNS;
+using ::app::dns::DnsResult;
 void Require(bool yes, const char* why) { if (!yes) throw std::runtime_error(why); }
 
 struct Peer {
-    struct Query { std::vector<uint8_t> bytes; acpp::udp::endpoint sender; };
+    struct Query { std::vector<uint8_t> bytes; ::udp::endpoint sender; };
     explicit Peer(net::io_context& io, bool ipv6 = false)
         : socket(io, {ipv6 ? net::ip::address(net::ip::address_v6::loopback()) :
                      net::ip::address(net::ip::address_v4::loopback()), 0}), foreign(io) {
@@ -30,7 +31,7 @@ struct Peer {
     }
     void Stop() { socket.close(); foreign.close(); }
     void Receive() {
-        socket.async_receive_from(net::buffer(buffer), sender, [&](acpp::IoErrorCode ec, size_t size) {
+        socket.async_receive_from(net::buffer(buffer), sender, [&](::IoErrorCode ec, size_t size) {
             if (ec) return;
             ++packets;
             ports.insert(sender.port());
@@ -68,8 +69,11 @@ struct Peer {
                 (malformed_type == 0 || malformed_type == (v6 ? 28 : 1))) {
                 packet[7] = 1;
                 const uint8_t size = v6 ? 16 : 4;
+                const uint32_t ttl = ttl_type == 0 || ttl_type == (v6 ? 28 : 1)
+                    ? answer_ttl.value_or(static_cast<uint32_t>(ordinal * 10)) : 60;
                 packet.insert(packet.end(), {0xc0, 0x0c, 0, static_cast<uint8_t>(v6 ? 28 : 1),
-                    0, 1, 0, 0, 0, static_cast<uint8_t>(ordinal * 10), 0, size});
+                    0, 1, static_cast<uint8_t>(ttl >> 24), static_cast<uint8_t>(ttl >> 16),
+                    static_cast<uint8_t>(ttl >> 8), static_cast<uint8_t>(ttl), 0, size});
                 if (v6) {
                     const auto bytes = net::ip::make_address_v6("2001:db8::1").to_bytes();
                     packet.insert(packet.end(), bytes.begin(), bytes.end());
@@ -105,8 +109,8 @@ struct Peer {
             socket.send_to(net::buffer(packet), it->sender);
         }
     }
-    acpp::udp::socket socket, foreign;
-    acpp::udp::endpoint sender;
+    ::udp::socket socket, foreign;
+    ::udp::endpoint sender;
     std::array<uint8_t, 512> buffer{};
     std::map<std::string, std::vector<Query>> queries;
     std::set<uint16_t> ports;
@@ -115,10 +119,12 @@ struct Peer {
     bool hold = false, refuse = false, negative = false, nodata = false;
     bool noise = false, duplicate_id = false;
     int malformed_type = 0;
+    std::optional<uint32_t> answer_ttl;
+    int ttl_type = 0;
 };
 
-acpp::app::dns::Config Config(Peer& peer) {
-    acpp::app::dns::Config c;
+::app::dns::Config Config(Peer& peer) {
+    ::app::dns::Config c;
     c.servers = {peer.socket.local_endpoint()}; c.min_ttl = 1; c.timeout_sec = 1;
     return c;
 }
@@ -127,7 +133,7 @@ void TestQueries(bool ipv6) {
     net::io_context io;
     Peer peer(io, ipv6);
     peer.noise = true;
-    acpp::app::dns::DNSWorker worker(io, Config(peer), 8);
+    ::app::dns::DNSWorker worker(io, Config(peer), 8);
     DNS dns(worker);
     std::exception_ptr error;
     bool done = false;
@@ -146,13 +152,13 @@ void TestQueries(bool ipv6) {
                 "separate resolutions must reuse the same connected UDP socket");
         peer.negative = true;
         result = co_await dns.Resolve("negative.example");
-        Require(result.error == acpp::ErrorCode::DNS_NO_RECORD, "NXDOMAIN must be retained");
+        Require(result.error == ::ErrorCode::DNS_NO_RECORD, "NXDOMAIN must be retained");
         result = co_await dns.Resolve("negative.example");
         Require(result.from_cache && peer.packets == 12, "negative answers must be cached");
         peer.negative = false;
         peer.nodata = true;
         result = co_await dns.Resolve("nodata.example");
-        Require(result.error == acpp::ErrorCode::DNS_NO_RECORD &&
+        Require(result.error == ::ErrorCode::DNS_NO_RECORD &&
                     result.error_msg.find("NODATA") != std::string::npos,
                 "an existing name without addresses must be distinguished from NXDOMAIN");
         result = co_await dns.Resolve("nodata.example");
@@ -171,7 +177,7 @@ void TestIsolation(bool cancel) {
     net::io_context io;
     Peer peer(io);
     peer.hold = cancel;
-    acpp::app::dns::DNSWorker worker(io, Config(peer), 8);
+    ::app::dns::DNSWorker worker(io, Config(peer), 8);
     DNS dns(worker);
     net::cancellation_signal signal;
     std::array<DnsResult, 2> answers;
@@ -184,13 +190,13 @@ void TestIsolation(bool cancel) {
     net::co_spawn(io, dns.Resolve("timeout.example"), net::bind_cancellation_slot(signal.slot(), finish(0)));
     net::co_spawn(io, dns.Resolve("other.example"), finish(1));
     net::steady_timer timer(io, 40ms);
-    if (cancel) timer.async_wait([&](acpp::IoErrorCode ec) {
+    if (cancel) timer.async_wait([&](::IoErrorCode ec) {
         if (!ec) { signal.emit(net::cancellation_type::terminal); peer.Flush("other.example"); }
     });
     io.run_for(3s);
     Require(completed == 2 && !errors[1] && answers[1].Ok(),
             "one cancellation/timeout must not cancel another query's shared socket");
-    Require(cancel ? (errors[0] || !answers[0].Ok()) : answers[0].error == acpp::ErrorCode::DNS_TIMEOUT,
+    Require(cancel ? (errors[0] || !answers[0].Ok()) : answers[0].error == ::ErrorCode::DNS_TIMEOUT,
             "cancelled or expired requests must return promptly");
     Require(peer.ports.size() == 1, "concurrent requests must multiplex one socket");
 }
@@ -199,14 +205,14 @@ void TestSameDomainCancellation(size_t cancelled) {
     net::io_context io;
     Peer peer(io);
     peer.hold = true;
-    acpp::app::dns::DNSWorker worker(io, Config(peer), 8);
+    ::app::dns::DNSWorker worker(io, Config(peer), 8);
     std::array<net::cancellation_signal, 2> signals;
     std::array<DnsResult, 2> answers;
     std::array<std::exception_ptr, 2> errors;
     std::array<bool, 2> completed{};
     bool expired = false;
     net::steady_timer watchdog(io, 2s);
-    watchdog.async_wait([&](acpp::IoErrorCode ec) {
+    watchdog.async_wait([&](::IoErrorCode ec) {
         if (!ec) { expired = true; io.stop(); }
     });
     auto start = [&](size_t i) {
@@ -227,7 +233,7 @@ void TestSameDomainCancellation(size_t cancelled) {
     io.poll();
     Require(completed[cancelled] && !completed[1 - cancelled],
             "only the cancelled same-domain waiter may finish before the UDP reply");
-    Require(errors[cancelled] || answers[cancelled].error == acpp::ErrorCode::CANCELLED,
+    Require(errors[cancelled] || answers[cancelled].error == ::ErrorCode::CANCELLED,
             "cancelled same-domain waiter must observe cancellation");
     peer.Flush("same.example");
     while (!completed[1 - cancelled] && !expired) io.run_one();
@@ -253,7 +259,7 @@ void TestMalformedFallback(int type, bool fallback) {
     first.malformed_type = type;
     auto config = Config(first);
     if (fallback) config.servers.push_back(second.socket.local_endpoint());
-    acpp::app::dns::DNSWorker worker(io, config, 8);
+    ::app::dns::DNSWorker worker(io, config, 8);
     std::exception_ptr failure;
     bool done = false;
     auto run = [&]() -> net::awaitable<void> {
@@ -265,12 +271,12 @@ void TestMalformedFallback(int type, bool fallback) {
             Require(result.Ok() && result.from_cache && first.packets == 4 && second.packets == 4,
                     "fallback success must enter the positive cache, never a negative cache");
         } else {
-            Require(result.error == acpp::ErrorCode::DNS_FORMAT_ERROR &&
+            Require(result.error == ::ErrorCode::DNS_FORMAT_ERROR &&
                         result.error_msg.find(type == 1 ? "A record has invalid RDLENGTH 3" :
                                                         "AAAA record has invalid RDLENGTH 15") != std::string::npos,
                     "malformed address length must retain a precise format-error reason");
             result = co_await worker.Resolve("malformed.example");
-            Require(result.error == acpp::ErrorCode::DNS_FORMAT_ERROR && !result.from_cache &&
+            Require(result.error == ::ErrorCode::DNS_FORMAT_ERROR && !result.from_cache &&
                         first.packets == 8 && second.packets == 0,
                     "malformed answers must never poison the negative cache");
         }
@@ -290,7 +296,7 @@ void TestFallback() {
     first.refuse = true;
     auto config = Config(first);
     config.servers.push_back(second.socket.local_endpoint());
-    acpp::app::dns::DNSWorker worker(io, config, 8);
+    ::app::dns::DNSWorker worker(io, config, 8);
     DNS dns(worker);
     bool ok = false;
     net::co_spawn(io, dns.Resolve("fallback.example"), [&](std::exception_ptr e, DnsResult result) {
@@ -305,7 +311,7 @@ void TestIdRotation() {
     net::io_context io;
     Peer peer(io);
     peer.batch_size = 1;
-    auto transport = std::make_shared<acpp::app::dns::DatagramExchange>(io, peer.socket.local_endpoint());
+    auto transport = std::make_shared<::app::dns::DatagramExchange>(io, peer.socket.local_endpoint());
     std::exception_ptr error;
     bool done = false;
     auto run = [&]() -> net::awaitable<void> {
@@ -347,7 +353,7 @@ void TestCacheFailure() {
     try {
         net::io_context io;
         Peer peer(io);
-        acpp::app::dns::DNSWorker worker(io, Config(peer), 8);
+        ::app::dns::DNSWorker worker(io, Config(peer), 8);
         DNS dns(worker);
         std::exception_ptr error;
         bool done = false;
@@ -376,7 +382,7 @@ void TestServiceStopJoin() {
     auto config = Config(peer);
     config.servers.push_back(fallback.socket.local_endpoint());
     config.timeout_sec = 30;
-    auto worker = std::make_unique<acpp::app::dns::DNSWorker>(io, config, 8);
+    auto worker = std::make_unique<::app::dns::DNSWorker>(io, config, 8);
     std::array<DnsResult, 5> answers;
     std::array<std::exception_ptr, 5> errors;
     size_t completed = 0;
@@ -391,7 +397,7 @@ void TestServiceStopJoin() {
     }
     net::steady_timer watchdog(io, 2s);
     bool expired = false;
-    watchdog.async_wait([&](acpp::IoErrorCode ec) {
+    watchdog.async_wait([&](::IoErrorCode ec) {
         if (!ec) { expired = true; io.stop(); }
     });
     while (peer.packets != 12 && !expired) io.run_one();
@@ -405,7 +411,7 @@ void TestServiceStopJoin() {
             auto reply = query.bytes;
             reply[2] = 0x81;
             reply[3] = 0x83;
-            acpp::IoErrorCode ignored;
+            ::IoErrorCode ignored;
             peer.socket.send_to(net::buffer(reply), query.sender, 0, ignored);
         }
     }
@@ -413,7 +419,7 @@ void TestServiceStopJoin() {
     std::exception_ptr join_error;
     auto stop = [&]() -> net::awaitable<void> {
         const auto rejected = co_await worker->Resolve("192.0.2.9");
-        Require(rejected.error == acpp::ErrorCode::CANCELLED,
+        Require(rejected.error == ::ErrorCode::CANCELLED,
                 "stopped DNS must reject even a literal without doing new work");
         co_await worker->AsyncJoin();
         co_await worker->AsyncJoin();
@@ -431,7 +437,7 @@ void TestServiceStopJoin() {
             "stop must join every accepted leader and subscriber promptly");
     if (join_error) std::rethrow_exception(join_error);
     for (size_t i = 0; i < answers.size(); ++i) {
-        Require(!errors[i] && answers[i].error == acpp::ErrorCode::CANCELLED,
+        Require(!errors[i] && answers[i].error == ::ErrorCode::CANCELLED,
                 "service cancellation must survive leader and subscriber completion");
     }
     Require(peer.packets == 12 && fallback.packets == 0,
@@ -443,16 +449,16 @@ void TestDatagramStopJoin(bool active) {
     Peer peer(io);
     peer.hold = true;
     peer.batch_size = 1;
-    auto transport = std::make_shared<acpp::app::dns::DatagramExchange>(
+    auto transport = std::make_shared<::app::dns::DatagramExchange>(
         io, peer.socket.local_endpoint());
     std::weak_ptr weak = transport;
     std::array<uint8_t, 19> query{0,0,1,0,0,1,0,0,0,0,0,0,1,'r',0,0,1,0,1};
     bool query_done = !active;
     std::exception_ptr query_error;
-    acpp::IoErrorCode reply_error;
+    ::IoErrorCode reply_error;
     if (active) {
         net::co_spawn(io, transport->Exchange(query, 30s),
-            [&](std::exception_ptr error, acpp::app::dns::DatagramExchange::Reply reply) {
+            [&](std::exception_ptr error, ::app::dns::DatagramExchange::Reply reply) {
                 query_error = error;
                 reply_error = reply.error;
                 query_done = true;
@@ -460,7 +466,7 @@ void TestDatagramStopJoin(bool active) {
     }
     net::steady_timer watchdog(io, 2s);
     bool expired = false;
-    watchdog.async_wait([&](acpp::IoErrorCode ec) {
+    watchdog.async_wait([&](::IoErrorCode ec) {
         if (!ec) { expired = true; io.stop(); }
     });
     while (active && peer.packets != 1 && !expired) io.run_one();
@@ -472,7 +478,7 @@ void TestDatagramStopJoin(bool active) {
     auto stop = [&]() -> net::awaitable<void> {
         co_await transport->AsyncJoin();
         const auto rejected = co_await transport->Exchange(query, 30s);
-        Require(rejected.error == acpp::io_error::operation_aborted,
+        Require(rejected.error == ::io_error::operation_aborted,
                 "a stopped exchange must not reopen its socket");
         transport.reset();
         Require(weak.expired(),
@@ -488,7 +494,7 @@ void TestDatagramStopJoin(bool active) {
     Require(!expired && joined && query_done && !query_error,
             "exchange and receive completions must both finish before destruction");
     if (join_error) std::rethrow_exception(join_error);
-    Require(!active || reply_error == acpp::io_error::operation_aborted,
+    Require(!active || reply_error == ::io_error::operation_aborted,
             "the stopped pending query must retain cancellation");
     Require(peer.packets == (active ? 1 : 0),
             "zero-query stop and late rejected queries must not send datagrams");
@@ -500,7 +506,7 @@ void TestDatagramAllocationFailureJoin() {
     try {
         net::io_context io;
         Peer peer(io);
-        auto transport = std::make_shared<acpp::app::dns::DatagramExchange>(
+        auto transport = std::make_shared<::app::dns::DatagramExchange>(
             io, peer.socket.local_endpoint());
         std::weak_ptr weak = transport;
         std::array<uint8_t, 19> query{0,0,1,0,0,1,0,0,0,0,0,0,1,'r',0,0,1,0,1};
@@ -535,7 +541,7 @@ void TestDatagramAllocationFailureJoin() {
 }
 }
 TEST(DnsDatagram, Contract) {
-    acpp::memory::ConfigureProcessAllocator();
+    ::memory::ConfigureProcessAllocator();
     try {
         TestQueries(false); TestQueries(true); TestIsolation(true); TestIsolation(false);
         TestSameDomainCancellation(0); TestSameDomainCancellation(1);
@@ -548,3 +554,56 @@ TEST(DnsDatagram, Contract) {
     catch (const std::exception& e) { std::cerr << e.what() << '\n'; FAIL() << e.what(); }
     std::cout << "DNS parallel sampling / socket reuse / validation / isolation / fallback / cache: PASS\n";
 }
+
+struct TtlCase {
+    uint32_t wire;
+    uint32_t expected;
+    int type = 0;
+};
+class DnsTtl : public testing::TestWithParam<TtlCase> {};
+
+TEST_P(DnsTtl, PreservesAddressesButDoesNotCacheZeroTtl) {
+    ::memory::ConfigureProcessAllocator();
+    const auto [wire_ttl, expected_ttl, affected_type] = GetParam();
+    net::io_context io;
+    Peer peer(io);
+    peer.answer_ttl = wire_ttl;
+    peer.ttl_type = affected_type;
+    auto config = Config(peer);
+    config.min_ttl = 60;
+    config.max_ttl = 3600;
+    ::app::dns::DNSWorker worker(io, config, 8);
+    DNS dns(worker);
+    bool done = false;
+    std::exception_ptr error;
+    auto run = [&]() -> net::awaitable<void> {
+        const auto first = co_await dns.Resolve("ttl.example");
+        const auto second = co_await dns.Resolve("TTL.EXAMPLE.");
+        const std::vector<net::ip::address> expected{
+            net::ip::make_address("192.0.2.1"), net::ip::make_address("192.0.2.2"),
+            net::ip::make_address("192.0.2.3"), net::ip::make_address("2001:db8::1")};
+        EXPECT_EQ(first.addresses, expected);
+        EXPECT_EQ(second.addresses, expected);
+        EXPECT_EQ(first.ttl, expected_ttl);
+        EXPECT_EQ(second.from_cache, expected_ttl != 0);
+        EXPECT_EQ(peer.packets, expected_ttl == 0 ? 8u : 4u);
+        if (expected_ttl == 0) EXPECT_EQ(second.ttl, 0);
+        co_await worker.AsyncJoin();
+    };
+    net::co_spawn(io, run(), [&](std::exception_ptr failure) {
+        error = failure;
+        done = true;
+        peer.Stop();
+    });
+    io.run_for(3s);
+    EXPECT_TRUE(done);
+    if (error) std::rethrow_exception(error);
+}
+
+INSTANTIATE_TEST_SUITE_P(WireBoundaries, DnsTtl, testing::Values(
+    TtlCase{0, 0}, TtlCase{60, 60}, TtlCase{0x7fffffffu, 0x7fffffffu},
+    TtlCase{0x80000000u, 0}, TtlCase{0xffffffffu, 0},
+    TtlCase{0x80000000u, 0, 1}, TtlCase{0x80000000u, 0, 28}),
+    [](const testing::TestParamInfo<TtlCase>& info) {
+        return "raw_" + std::to_string(info.param.wire) + "_type_" + std::to_string(info.param.type);
+    });

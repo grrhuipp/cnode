@@ -1,10 +1,10 @@
 #include "node_info_json.hpp"
 
-#include "acppnode/core/constants.hpp"
-#include "acppnode/core/naming.hpp"
-#include "acppnode/infra/inbound_field_rules.hpp"
-#include "acppnode/infra/json_field.hpp"
-#include "acppnode/transport/internet/http_headers.hpp"
+#include "core/constants.hpp"
+#include "core/naming.hpp"
+#include "infra/inbound_field_rules.hpp"
+#include "infra/json_field.hpp"
+#include "transport/internet/http_headers.hpp"
 #include "panel_json_compat.hpp"
 
 #include <format>
@@ -13,7 +13,7 @@
 #include <utility>
 #include <vector>
 
-namespace acpp::api::v2board {
+namespace api::v2board {
 
 namespace {
 
@@ -256,7 +256,7 @@ tl::expected<void, std::string> MapRealitySettings(
 
 }  // namespace
 
-tl::expected<::acpp::api::NodeInfo, std::string> ParseNodeInfo(
+tl::expected<::api::NodeInfo, std::string> ParseNodeInfo(
     const json::object& source,
     std::string_view node_type) {
     auto port = ParseServerPort(source);
@@ -264,7 +264,7 @@ tl::expected<::acpp::api::NodeInfo, std::string> ParseNodeInfo(
         return tl::unexpected(std::move(port.error()));
     }
 
-    ::acpp::api::NodeInfo config;
+    ::api::NodeInfo config;
     config.NodeType = naming::LowerAscii(std::string(node_type));
     config.Port = *port;
 
@@ -545,4 +545,4 @@ tl::expected<::acpp::api::NodeInfo, std::string> ParseNodeInfo(
     return config;
 }
 
-}  // namespace acpp::api::v2board
+}  // namespace api::v2board

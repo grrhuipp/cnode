@@ -1,6 +1,6 @@
 #include "http2_settings.hpp"
 
-namespace acpp::transport::internet {
+namespace transport::internet {
 
 memory::ByteVector EncodeInitialWindowSetting(uint32_t initial_window) {
     memory::ByteVector payload(6);
@@ -13,4 +13,4 @@ memory::ByteVector EncodeInitialWindowSetting(uint32_t initial_window) {
     return payload;
 }
 
-}  // namespace acpp::transport::internet
+}  // namespace transport::internet

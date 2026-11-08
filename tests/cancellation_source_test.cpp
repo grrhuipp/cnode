@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "acppnode/transport/cancellation.hpp"
+#include "transport/cancellation.hpp"
 
 #include <array>
 #include <cstdio>
@@ -18,10 +18,10 @@ void* operator new(std::size_t size) {
 void operator delete(void* value) noexcept { std::free(value); }
 void operator delete(void* value, std::size_t) noexcept { std::free(value); }
 
-using acpp::ErrorCode;
-using acpp::transport::CancellationSource;
-using acpp::transport::Cancellation;
-using acpp::transport::CancellationSubscription;
+using ::ErrorCode;
+using ::transport::CancellationSource;
+using ::transport::Cancellation;
+using ::transport::CancellationSubscription;
 
 namespace {
 struct Counter {

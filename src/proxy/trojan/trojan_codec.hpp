@@ -7,16 +7,16 @@
 // ============================================================================
 
 #include "credentials.hpp"
-#include "acppnode/common.hpp"
-#include "acppnode/common/target_address.hpp"
-#include "acppnode/common/address_codec.hpp"
+#include "common.hpp"
+#include "common/target_address.hpp"
+#include "common/address_codec.hpp"
 
 #include <array>
 #include <optional>
 #include <span>
 #include <string_view>
 
-namespace acpp::trojan {
+namespace trojan {
 
 // ============================================================================
 // Trojan 命令类型
@@ -77,4 +77,4 @@ struct RequestDecodeResult {
     uint8_t* output,
     size_t output_size);
 
-}  // namespace acpp::trojan
+}  // namespace trojan

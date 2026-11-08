@@ -1,14 +1,14 @@
 #pragma once
 
-#include "acppnode/transport/internet/http_headers.hpp"
-#include "acppnode/infra/json_field.hpp"
+#include "transport/internet/http_headers.hpp"
+#include "infra/json_field.hpp"
 
 #include <charconv>
 #include <cstdint>
 #include <optional>
 #include <string_view>
 
-namespace acpp::api::v2board {
+namespace api::v2board {
 
 // PHP encodes an empty associative-array configuration as [] instead of {}.
 [[nodiscard]] inline bool IsPanelEmptyObject(const json::value& value) noexcept {
@@ -55,4 +55,4 @@ namespace acpp::api::v2board {
     return std::nullopt;
 }
 
-}  // namespace acpp::api::v2board
+}  // namespace api::v2board

@@ -2,10 +2,10 @@
 
 #include "xhttp_packet_queue.hpp"
 #include "xhttp_upload_stream_slot.hpp"
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/buf/multi_buffer.hpp"
-#include "acppnode/transport/cancellation.hpp"
-#include "acppnode/transport/internet/transport_stack.hpp"
+#include "common/allocator.hpp"
+#include "common/buf/multi_buffer.hpp"
+#include "transport/cancellation.hpp"
+#include "transport/internet/transport_stack.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -13,9 +13,9 @@
 #include <span>
 #include <string_view>
 
-namespace acpp { class ExecutionDomain; }
+ class ExecutionDomain; 
 
-namespace acpp::transport::internet {
+namespace transport::internet {
 
 class XHttpSessionTable;
 struct XHttpSessionTableEntry;
@@ -107,8 +107,8 @@ private:
 
     net::io_context& io_context_;
     SignalChannel input_signal_;
-    ::acpp::detail::XHttpPacketQueue packet_queue_;
-    ::acpp::detail::XHttpUploadStreamSlot stream_input_;
+    ::detail::XHttpPacketQueue packet_queue_;
+    ::detail::XHttpUploadStreamSlot stream_input_;
     transport::CancellationSource cancellation_;
     SignalChannel upload_signal_;
     // Event that AttachDownlink and Close broadcast to AwaitDownlink waiters.
@@ -196,4 +196,4 @@ enum class XHttpSessionAccess : uint8_t {
     std::span<const net::const_buffer> packet_payload,
     uint64_t conn_id);
 
-}  // namespace acpp::transport::internet
+}  // namespace transport::internet

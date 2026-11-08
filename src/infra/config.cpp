@@ -1,14 +1,14 @@
-#include "acppnode/infra/config.hpp"
-#include "acppnode/common/ip_address.hpp"
-#include "acppnode/common/domain_name.hpp"
-#include "acppnode/common/ip_utils.hpp"
-#include "acppnode/common/target_address.hpp"
-#include "acppnode/core/naming.hpp"
-#include "acppnode/infra/json_field.hpp"
-#include "acppnode/infra/inbound_field_rules.hpp"
-#include "acppnode/infra/proxy_protocol_config.hpp"
-#include "acppnode/infra/outbound_bind_config.hpp"
-#include "acppnode/infra/log.hpp"
+#include "infra/config.hpp"
+#include "common/ip_address.hpp"
+#include "common/domain_name.hpp"
+#include "common/ip_utils.hpp"
+#include "common/target_address.hpp"
+#include "core/naming.hpp"
+#include "infra/json_field.hpp"
+#include "infra/inbound_field_rules.hpp"
+#include "infra/proxy_protocol_config.hpp"
+#include "infra/outbound_bind_config.hpp"
+#include "infra/log.hpp"
 #include "http2_initial_window.hpp"
 #include <algorithm>
 #include <cctype>
@@ -21,7 +21,6 @@
 #include <thread>
 #include <utility>
 
-namespace acpp {
 
 // ============================================================================
 // JSON 辅助函数
@@ -1476,4 +1475,3 @@ std::optional<Config> ParseConfig(const json::object& j) {
     }
 }
 
-}  // namespace acpp

@@ -1,10 +1,10 @@
 #include <gtest/gtest.h>
 
 #include "proxy/freedom/outbound/udp_request.hpp"
-#include "acppnode/app/dns/dns_worker.hpp"
-#include "acppnode/app/relay.hpp"
-#include "acppnode/transport/async_stream.hpp"
-#include "acppnode/transport/internet/timeout_scheduler.hpp"
+#include "app/dns/dns_worker.hpp"
+#include "app/relay.hpp"
+#include "transport/async_stream.hpp"
+#include "transport/internet/timeout_scheduler.hpp"
 
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/cancellation_signal.hpp>
@@ -21,7 +21,6 @@
 #include <vector>
 
 namespace {
-using namespace acpp;
 using namespace std::chrono_literals;
 using UdpRequest = proxy::freedom::outbound::UdpRequest;
 

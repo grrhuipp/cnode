@@ -6,7 +6,6 @@
 
 #include <stdexcept>
 
-namespace acpp {
 namespace vmess {
 
 uint32_t CRC32(const uint8_t* data, size_t len) {
@@ -43,4 +42,3 @@ void GenerateAuthID(const AES_KEY& auth_id_key, int64_t timestamp, uint8_t* out_
 }
 
 }  // namespace vmess
-}  // namespace acpp

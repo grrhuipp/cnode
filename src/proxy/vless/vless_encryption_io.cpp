@@ -1,14 +1,14 @@
 #include "vless_encryption_io.hpp"
 #include "vless_encryption_runtime.hpp"
 
-#include "acppnode/common/error.hpp"
-#include "acppnode/common/buffer_util.hpp"
+#include "common/error.hpp"
+#include "common/buffer_util.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cstring>
 
-namespace acpp::vless {
+namespace vless {
 namespace {
 
 [[noreturn]] void ThrowVlessEncryptionIoError(const char* what) {
@@ -348,4 +348,4 @@ net::awaitable<void> VlessEncryptionWriter::WritePlaintext(
     }
 }
 
-}  // namespace acpp::vless
+}  // namespace vless

@@ -76,10 +76,11 @@ auto SnapshotUnknown(const std::filesystem::path& root) {
     for (const auto& path : Records(root, "unknown")) result.emplace_back(path.filename().string(), ReadFile(path));
     return result;
 }
-void WaitEcho(Child& child, uint16_t node, uint16_t echo, std::string_view host = "127.0.0.1") {
+void WaitEcho(Child& child, uint16_t node, uint16_t echo, std::string_view host = "127.0.0.1",
+              std::string_view inbound_address = "127.0.0.1") {
     Until([&] {
         if (!child.Running()) throw std::runtime_error("panel child exited");
-        try { return Echo(node, echo, UserA, host); }
+        try { return Echo(node, echo, UserA, host, inbound_address); }
         catch (const std::system_error& error) {
             if (error.code() == std::errc::connection_refused) return false;
             throw;
@@ -182,13 +183,17 @@ TEST(PanelIntegrity, GracefulShutdownPersistsUnsampledCountersAndReplaysExactlyO
 
 TEST(PanelIntegrity, InvalidRuleCandidateNeverAdmitsOrPartiallyReplacesCommittedRules) {
     TempDir directory;
-    auto reservation = Socket::Listen();
-    const auto node = reservation.Port();
+    auto reservation = ReserveRuntimePort();
+    const auto node = reservation.tcp.Port();
     LoopServer echo(EchoPeer, "0.0.0.0");
     IntegrityPanel panel(node);
     panel.Rules("invalid");
     PanelConfig(directory.Path(), panel.Port(), "integrity");
-    reservation.Close();
+    auto config = Json::parse(ReadFile(directory.Path() / "config.json"));
+    config["panels"][0]["listenIP"] = reservation.address;
+    WriteJson(directory.Path(), "config.json", config);
+    reservation.tcp.Close();
+    reservation.udp.Close();
     auto child = Start(directory.Path());
     // A rejected initial candidate cannot publish its one-second pull interval;
     // without committed state the controller retains the 60-second default.
@@ -205,27 +210,31 @@ TEST(PanelIntegrity, InvalidRuleCandidateNeverAdmitsOrPartiallyReplacesCommitted
         EXPECT_EQ(phase, "invalid");
         EXPECT_TRUE(validator.empty()) << "invalid initial rules committed a validator";
     }
-    EXPECT_FALSE(Listening(node)) << "invalid initial rules admitted a listener";
+    SCOPED_TRACE("default loopback port remains owned by this fixture, not the child");
+    EXPECT_TRUE(Listening(node)) << "the unrelated default-address listener must remain live";
+    EXPECT_FALSE(Listening(node, reservation.address)) << "invalid initial rules admitted a listener";
     EXPECT_EQ(child->Stop(10s), 0);
     panel.Rules("blocked");
-    child = Start(directory.Path());
-    WaitEcho(*child, node, echo.Port(), "127.0.0.2");
-    EXPECT_FALSE(Echo(node, echo.Port()));
+    child = Start(directory.Path(), "committed.log");
+    WaitEcho(*child, node, echo.Port(), "127.0.0.2", reservation.address);
+    EXPECT_FALSE(Echo(node, echo.Port(), UserA, "127.0.0.1", reservation.address));
     const auto baseline = panel.Gets().size();
     panel.Rules("invalid");
     Until([&] { return panel.Gets().size() >= baseline + 3; }, 12s);
-    EXPECT_FALSE(Echo(node, echo.Port()));
-    EXPECT_TRUE(Echo(node, echo.Port(), UserA, "127.0.0.2"));
+    EXPECT_FALSE(Echo(node, echo.Port(), UserA, "127.0.0.1", reservation.address));
+    EXPECT_TRUE(Echo(node, echo.Port(), UserA, "127.0.0.2", reservation.address));
     const auto requests = panel.Gets();
     size_t invalid = 0;
     for (size_t i = baseline; i < requests.size(); ++i)
         if (requests[i].first == "invalid") { ++invalid; EXPECT_EQ(requests[i].second, "rules-blocked"); }
     EXPECT_GT(invalid, 0u);
     panel.Rules("none");
-    WaitEcho(*child, node, echo.Port());
-    EXPECT_TRUE(Echo(node, echo.Port(), UserA, "127.0.0.2"))
+    WaitEcho(*child, node, echo.Port(), "127.0.0.1", reservation.address);
+    EXPECT_TRUE(Echo(node, echo.Port(), UserA, "127.0.0.2", reservation.address))
         << "valid recovery retained a prefix from the invalid candidate";
     EXPECT_EQ(child->Stop(10s), 0);
+    EXPECT_FALSE(Listening(node, reservation.address));
+    EXPECT_TRUE(Listening(node));
     panel.Join();
     echo.Join();
 }

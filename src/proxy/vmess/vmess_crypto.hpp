@@ -8,16 +8,15 @@
 // 底层 OpenSSL 失败属于系统故障，统一以异常上报，不返回未初始化输出。
 // ============================================================================
 
-#include "acppnode/common.hpp"
-#include "acppnode/common/allocator.hpp"
+#include "common.hpp"
+#include "common/allocator.hpp"
 #include <openssl/aes.h>
-#include "acppnode/common/unsafe.hpp"
+#include "common/unsafe.hpp"
 #include <array>
 #include <span>
 #include <string_view>
 #include <cstdint>
 
-namespace acpp {
 namespace vmess {
 
 // ============================================================================
@@ -44,8 +43,8 @@ struct HeaderAeadKey {
     std::array<uint8_t, 16> key{};
     std::array<uint8_t, 12> nonce{};
     ~HeaderAeadKey() noexcept {
-        ::acpp::SecureZeroMemory(key.data(), key.size());
-        ::acpp::SecureZeroMemory(nonce.data(), nonce.size());
+        ::SecureZeroMemory(key.data(), key.size());
+        ::SecureZeroMemory(nonce.data(), nonce.size());
     }
 };
 
@@ -97,4 +96,3 @@ uint32_t FNV1a32(const uint8_t* data, size_t len);
 void GenerateAuthID(const AES_KEY& auth_id_key, int64_t timestamp, uint8_t* out_auth_id);
 
 }  // namespace vmess
-}  // namespace acpp

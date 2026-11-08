@@ -1,6 +1,6 @@
 #include "awaitable_batch.hpp"
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/error.hpp"
+#include "common/allocator.hpp"
+#include "common/error.hpp"
 
 #include <asio/async_result.hpp>
 #include <asio/bind_cancellation_slot.hpp>
@@ -13,7 +13,6 @@
 #include <type_traits>
 #include <utility>
 
-namespace acpp {
 
 namespace {
 
@@ -96,4 +95,3 @@ net::awaitable<void> RunAwaitableBatch(
     }
 }
 
-}  // namespace acpp

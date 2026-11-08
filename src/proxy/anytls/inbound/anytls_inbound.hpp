@@ -1,19 +1,17 @@
 #pragma once
 
-#include "acppnode/proxy/inbound.hpp"
-#include "acppnode/common/sharded_user_stats.hpp"
+#include "proxy/inbound.hpp"
+#include "common/sharded_user_stats.hpp"
 
 #include <memory>
 
-namespace acpp {
 struct StatsShard;
-}  // namespace acpp
 
-namespace acpp::anytls {
+namespace anytls {
 class PaddingScheme;
-}  // namespace acpp::anytls
+}  // namespace anytls
 
-namespace acpp::proxy::anytls::inbound {
+namespace proxy::anytls::inbound {
 
 // ============================================================================
 // Handler - AnyTLS inbound proxy
@@ -21,15 +19,15 @@ namespace acpp::proxy::anytls::inbound {
 // AnyTLS 服务端侧协议处理器：负责 sha256(password) 认证头、
 // settings/SYN/PSH/FIN 帧解析，并将单请求 TCP framed stream 交给 dispatcher。
 //
-// 协议核心 codec 位于 acpp::anytls；handler 与其它协议一致归于
-// acpp::proxy::<name>::inbound（对应 vmess core=acpp::vmess, handler=acpp::proxy::vmess::*）。
+// 协议核心 codec 位于 anytls；handler 与其它协议一致归于
+// proxy::<name>::inbound（对应 vmess core=vmess, handler=proxy::vmess::*）。
 // ============================================================================
 class Handler final : public Inbound {
 public:
-    Handler(::acpp::UserOnlineTracker& validator,
-            ::acpp::StatsShard& stats,
-            ::acpp::ConnectionLimiter* limiter,
-            std::shared_ptr<const ::acpp::anytls::PaddingScheme> padding_scheme = {});
+    Handler(::UserOnlineTracker& validator,
+            ::StatsShard& stats,
+            ::ConnectionLimiter* limiter,
+            std::shared_ptr<const ::anytls::PaddingScheme> padding_scheme = {});
 
     net::awaitable<RelayResult> Process(
         std::unique_ptr<AsyncStream> stream,
@@ -41,10 +39,10 @@ public:
         uint32_t pressure_idle_timeout) override;
 
 private:
-    ::acpp::UserOnlineTracker& validator_;
-    ::acpp::StatsShard* stats_ = nullptr;
-    ::acpp::ConnectionLimiter* limiter_;
-    std::shared_ptr<const ::acpp::anytls::PaddingScheme> padding_scheme_;
+    ::UserOnlineTracker& validator_;
+    ::StatsShard* stats_ = nullptr;
+    ::ConnectionLimiter* limiter_;
+    std::shared_ptr<const ::anytls::PaddingScheme> padding_scheme_;
 };
 
-}  // namespace acpp::proxy::anytls::inbound
+}  // namespace proxy::anytls::inbound

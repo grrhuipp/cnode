@@ -1,10 +1,10 @@
 #pragma once
 
-#include "acppnode/common/asio_types.hpp"
-#include "acppnode/common/buf/multi_buffer.hpp"
-#include "acppnode/common/buf/length_prefixed_packet_buffer.hpp"
-#include "acppnode/common/target_address.hpp"
-#include "acppnode/transport/link.hpp"
+#include "common/asio_types.hpp"
+#include "common/buf/multi_buffer.hpp"
+#include "common/buf/length_prefixed_packet_buffer.hpp"
+#include "common/target_address.hpp"
+#include "transport/link.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -12,7 +12,7 @@
 #include <span>
 #include <string_view>
 
-namespace acpp::vless {
+namespace vless {
 
 inline constexpr std::string_view kPacketAddrMagicAddress =
     "sp.packet-addr.v2fly.arpa";
@@ -34,8 +34,9 @@ public:
     void Finish() const;
 
     // Returns one framed datagram whose buffers carry its packet address, or
-    // `session_target` without one; empty only at a clean EOF. Partial frames
-    // stay in this framer when `src` throws or is cancelled.
+    // `session_target` without one; an empty datagram owns a tagged zero-length
+    // Buffer, while an empty container means clean EOF. Partial frames stay
+    // in this framer when `src` throws or is cancelled.
     net::awaitable<buf::MultiBuffer> ReadDatagram(
         transport::MultiBufferReader& src,
         const TargetAddress& session_target);
@@ -58,4 +59,4 @@ net::awaitable<void> WriteUdpDatagram(
     bool packet_addr,
     std::span<const net::const_buffer> payload);
 
-}  // namespace acpp::vless
+}  // namespace vless

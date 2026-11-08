@@ -6,7 +6,6 @@
 #include <functional>
 #include <memory>
 
-namespace acpp {
 
 // One registration per prepared configuration, not per Worker or handshake.
 // A single bounded background scheduler signs and publishes immutable contexts.
@@ -30,4 +29,3 @@ private:
     std::atomic<Clock::time_point> next_attempt_{Clock::time_point::min()};
 };
 
-} // namespace acpp

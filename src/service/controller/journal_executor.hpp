@@ -1,6 +1,6 @@
 #pragma once
 
-#include "acppnode/common/asio_types.hpp"
+#include "common/asio_types.hpp"
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/co_spawn.hpp>
 #include <asio/this_coro.hpp>
@@ -12,7 +12,7 @@
 #include <type_traits>
 #include <utility>
 
-namespace acpp::controller {
+namespace controller {
 
 // One cold-path disk thread shared by all panels. Admission is bounded and
 // shutdown joins outstanding work. Cancellation never abandons a disk write:
@@ -81,4 +81,4 @@ private:
     net::thread_pool pool_{1};
     std::atomic<size_t> pending_{0};
 };
-} // namespace acpp::controller
+} // namespace controller

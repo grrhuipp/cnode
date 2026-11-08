@@ -1,7 +1,7 @@
-#include "acppnode/sniff/sniffer.hpp"
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/byte_reader.hpp"
-#include "acppnode/core/constants.hpp"
+#include "sniff/sniffer.hpp"
+#include "common/allocator.hpp"
+#include "common/byte_reader.hpp"
+#include "core/constants.hpp"
 
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
@@ -14,7 +14,6 @@
 #include <span>
 #include <string_view>
 
-namespace acpp {
 namespace {
 
 struct QuicVersion {
@@ -425,4 +424,3 @@ SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
     return result;
 }
 
-}  // namespace acpp

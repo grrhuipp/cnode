@@ -19,7 +19,7 @@ void Require(bool condition, std::string_view message) {
 }  // namespace
 
 TEST(HttpPathMatch, Contract) {
-    using acpp::transport::internet::detail::PathPrefixMatchesSegment;
+    using ::transport::internet::detail::PathPrefixMatchesSegment;
 
     Require(PathPrefixMatchesSegment("/api", "/api"), "exact path rejected");
     Require(PathPrefixMatchesSegment("/api", "/api/child"), "child path rejected");

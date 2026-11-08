@@ -1,12 +1,12 @@
 #pragma once
 
-#include "acppnode/transport/async_stream.hpp"
-#include "acppnode/transport/link.hpp"
-#include "acppnode/transport/internet/datagram_socket.hpp"
+#include "transport/async_stream.hpp"
+#include "transport/link.hpp"
+#include "transport/internet/datagram_socket.hpp"
 
 #include <chrono>
 
-namespace acpp::proxy {
+namespace proxy {
 
 class OutboundStreamEndpointBase
     : public transport::MultiBufferReader
@@ -137,4 +137,4 @@ protected:
     bool write_closed_ = false;
 };
 
-}  // namespace acpp::proxy
+}  // namespace proxy

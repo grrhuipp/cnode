@@ -7,16 +7,16 @@
 #include "ss_udp.hpp"
 #include "inbound/ss_inbound.hpp"
 
-#include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
-#include "acppnode/app/stats.hpp"
-#include "acppnode/common/sharded_user_stats.hpp"
-#include "acppnode/common/user_profile.hpp"
-#include "acppnode/common/session.hpp"
-#include "acppnode/features/routing/dispatcher.hpp"
-#include "acppnode/infra/config_types.hpp"
-#include "acppnode/proxy/inbound.hpp"
-#include "acppnode/proxy/inbound_datagram.hpp"
-#include "acppnode/transport/async_stream.hpp"
+#include "app/proxyman/inbound/receiver_settings.hpp"
+#include "app/stats.hpp"
+#include "common/sharded_user_stats.hpp"
+#include "common/user_profile.hpp"
+#include "common/session.hpp"
+#include "features/routing/dispatcher.hpp"
+#include "infra/config_types.hpp"
+#include "proxy/inbound.hpp"
+#include "proxy/inbound_datagram.hpp"
+#include "transport/async_stream.hpp"
 
 #include <asio/as_tuple.hpp>
 #include <asio/bind_cancellation_slot.hpp>
@@ -41,64 +41,64 @@
 
 namespace {
 using namespace std::chrono_literals;
-using Ingress = acpp::worker_detail::UdpIngress;
-using Reclaimer = acpp::worker_detail::UdpAssociationReclaimer;
+using Ingress = ::worker_detail::UdpIngress;
+using Reclaimer = ::worker_detail::UdpAssociationReclaimer;
 
 [[noreturn]] void Fail(std::string_view message) {
     std::cerr << message << '\n';
     ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed");
 }
 
-class Response final : public acpp::InboundDatagramResponse {
+class Response final : public ::InboundDatagramResponse {
 public:
-    acpp::buf::MultiBuffer Encode(acpp::UDPPacketView) override { return {}; }
+    ::buf::MultiBuffer Encode(::UDPPacketView) override { return {}; }
 };
 
 
-class NativeInbound final : public acpp::Inbound {
+class NativeInbound final : public ::Inbound {
 public:
 
-    acpp::net::awaitable<acpp::RelayResult> Process(
-        std::unique_ptr<acpp::AsyncStream>, acpp::routing::Dispatcher&,
-        const acpp::proxyman::inbound::ReceiverSettings&, acpp::net::io_context&,
-        acpp::session::Context&, const acpp::TimeoutsConfig&, uint32_t) override {
-        co_return acpp::RelayResult{};
+    ::net::awaitable<::RelayResult> Process(
+        std::unique_ptr<::AsyncStream>, ::routing::Dispatcher&,
+        const ::proxyman::inbound::ReceiverSettings&, ::net::io_context&,
+        ::session::Context&, const ::TimeoutsConfig&, uint32_t) override {
+        co_return ::RelayResult{};
     }
 
-    tl::expected<acpp::InboundDatagramResult, acpp::ErrorCode> Process(
-        const acpp::InboundDatagramRequest& request) override {
-        acpp::InboundDatagramResult result;
+    tl::expected<::InboundDatagramResult, ::ErrorCode> Process(
+        const ::InboundDatagramRequest& request) override {
+        ::InboundDatagramResult result;
         result.user = &profile_;
         result.tracker = tracker_;
         constexpr std::array<uint8_t, 1> owner{0x47};
         if (!result.session_owner.Assign(owner))
-            return tl::unexpected(acpp::ErrorCode::RESOURCE_EXHAUSTED);
+            return tl::unexpected(::ErrorCode::RESOURCE_EXHAUSTED);
         result.session_id = request.payload.front() == 0x63 ? 2 : 1;
-        result.target = acpp::TargetAddress(
-            acpp::net::ip::address_v4::loopback(), 53);
-        auto buffer = acpp::buf::BufferGuard{acpp::buf::Buffer::New()};
-        if (!buffer) return tl::unexpected(acpp::ErrorCode::RESOURCE_EXHAUSTED);
+        result.target = ::TargetAddress(
+            ::net::ip::address_v4::loopback(), 53);
+        auto buffer = ::buf::BufferGuard{::buf::Buffer::New()};
+        if (!buffer) return tl::unexpected(::ErrorCode::RESOURCE_EXHAUSTED);
         buffer->Tail()[0] = request.payload.front();
         buffer->Produce(1);
         result.payload.push_back(std::move(buffer));
         return result;
     }
-    tl::expected<std::shared_ptr<acpp::InboundDatagramResponse>, acpp::ErrorCode>
-    CreateDatagramResponse(const acpp::InboundDatagramResult&) override {
-        return acpp::memory::AllocateShared<Response>();
+    tl::expected<std::shared_ptr<::InboundDatagramResponse>, ::ErrorCode>
+    CreateDatagramResponse(const ::InboundDatagramResult&) override {
+        return ::memory::AllocateShared<Response>();
     }
 
 private:
-    std::shared_ptr<acpp::UserOnlineTracker> tracker_ = std::make_shared<acpp::UserOnlineTracker>();
-    acpp::UserProfile profile_;
+    std::shared_ptr<::UserOnlineTracker> tracker_ = std::make_shared<::UserOnlineTracker>();
+    ::UserProfile profile_;
 };
 
-class GateDispatcher final : public acpp::routing::Dispatcher {
-    struct RequestCancellation final : acpp::transport::CancellationSubscription {
+class GateDispatcher final : public ::routing::Dispatcher {
+    struct RequestCancellation final : ::transport::CancellationSubscription {
         explicit RequestCancellation(GateDispatcher& owner) noexcept : owner(owner) {}
         GateDispatcher& owner;
     private:
-        void OnCancellation(acpp::transport::Cancellation) noexcept override {
+        void OnCancellation(::transport::Cancellation) noexcept override {
             ++owner.cancellations;
             if (owner.reenter_stop && !owner.stop_reentered) {
                 owner.stop_reentered = true;
@@ -108,16 +108,16 @@ class GateDispatcher final : public acpp::routing::Dispatcher {
     };
 
 public:
-    explicit GateDispatcher(acpp::net::io_context& io) : gate(io) {
+    explicit GateDispatcher(::net::io_context& io) : gate(io) {
         gate.expires_after(10s);
     }
 
-    acpp::net::awaitable<acpp::RelayResult> Dispatch(
-        acpp::net::io_context&, const acpp::routing::DispatchPolicy& policy,
-        std::unique_ptr<acpp::AsyncStream>, acpp::transport::Link link,
-        acpp::InitialPayload, acpp::session::Context& context, acpp::StatsShard&,
-        const acpp::TimeoutsConfig&) override {
-        const auto* forced = std::get_if<acpp::routing::ForceOutbound>(
+    ::net::awaitable<::RelayResult> Dispatch(
+        ::net::io_context&, const ::routing::DispatchPolicy& policy,
+        std::unique_ptr<::AsyncStream>, ::transport::Link link,
+        ::InitialPayload, ::session::Context& context, ::StatsShard&,
+        const ::TimeoutsConfig&) override {
+        const auto* forced = std::get_if<::routing::ForceOutbound>(
             &policy.outbound);
         if (!forced || forced->outbound_tag != "loopback")
             Fail("native job did not retain its narrow dispatch policy snapshot");
@@ -143,14 +143,14 @@ public:
         RequestCancellation cancellation(*this);
         cancellation.Resubscribe(link.reader->Cancellation());
         auto [ec] = co_await gate.async_wait(
-            acpp::net::as_tuple(acpp::net::use_awaitable));
+            ::net::as_tuple(::net::use_awaitable));
         (void)ec;
         (void)first_byte;
-        co_return acpp::RelayResult{};
+        co_return ::RelayResult{};
     }
 
 
-    acpp::net::steady_timer gate;
+    ::net::steady_timer gate;
     Ingress* ingress = nullptr;
     // Kept alive by their native jobs until the gate releases them.
     std::array<Ingress::ClientSession*, 4> sessions{};
@@ -161,47 +161,47 @@ public:
     bool stop_reentered = false;
 };
 
-class ReplySink final : public acpp::worker_detail::UdpReplySink {
+class ReplySink final : public ::worker_detail::UdpReplySink {
 public:
-    bool EnqueueUdpReply(std::string_view, acpp::udp::socket*,
-                         acpp::udp::endpoint, acpp::buf::MultiBuffer,
+    bool EnqueueUdpReply(std::string_view, ::udp::socket*,
+                         ::udp::endpoint, ::buf::MultiBuffer,
                          uint32_t,
-                         std::shared_ptr<acpp::worker_detail::UdpReplyFence> = {}) override {
+                         std::shared_ptr<::worker_detail::UdpReplyFence> = {}) override {
         return true;
     }
 };
 
-acpp::net::awaitable<void> ObserveJoin(Ingress& ingress, bool& returned) {
+::net::awaitable<void> ObserveJoin(Ingress& ingress, bool& returned) {
     co_await ingress.AsyncJoin();
     returned = true;
 }
 
 
-acpp::net::awaitable<void> ObserveCancelledJoin(
+::net::awaitable<void> ObserveCancelledJoin(
     Ingress& ingress, bool& returned, bool& parent_cancelled,
-    bool& throw_setting, acpp::net::cancellation_signal& parent_signal) {
-    co_await acpp::net::this_coro::throw_if_cancelled(false);
+    bool& throw_setting, ::net::cancellation_signal& parent_signal) {
+    co_await ::net::this_coro::throw_if_cancelled(false);
     // Cancel after the child starts, but before joining. Cancelling co_spawn
     // before entry would prevent this coroutine from ever calling AsyncJoin.
-    parent_signal.emit(acpp::net::cancellation_type::terminal);
+    parent_signal.emit(::net::cancellation_type::terminal);
     co_await ingress.AsyncJoin();
     const auto cancellation_state =
-        co_await acpp::net::this_coro::cancellation_state;
+        co_await ::net::this_coro::cancellation_state;
     parent_cancelled = cancellation_state.cancelled() !=
-        acpp::net::cancellation_type::none;
-    throw_setting = co_await acpp::net::this_coro::throw_if_cancelled();
+        ::net::cancellation_type::none;
+    throw_setting = co_await ::net::this_coro::throw_if_cancelled();
     returned = true;
 }
 
-acpp::proxyman::inbound::ReceiverSettings MakeReceiver() {
-    auto receiver = acpp::proxyman::inbound::ReceiverSettings{
+::proxyman::inbound::ReceiverSettings MakeReceiver() {
+    auto receiver = ::proxyman::inbound::ReceiverSettings{
         .inbound_tag = "receiver-tag",
         .inbound_tags = {"route-tag"},
         .protocol = "native-test",
         .stream_settings = {},
         .dispatch_policy = {
             .sniffing = {},
-            .outbound = acpp::routing::ForceOutbound{"loopback"}},
+            .outbound = ::routing::ForceOutbound{"loopback"}},
         .has_route_inbound_tags = true};
     receiver.stream_settings.security = "tls";
     return receiver;
@@ -209,30 +209,30 @@ acpp::proxyman::inbound::ReceiverSettings MakeReceiver() {
 
 
 void VerifySocketIdentityRecycle(
-    acpp::net::io_context& io, Reclaimer& reclaimer) {
+    ::net::io_context& io, Reclaimer& reclaimer) {
     io.restart();
-    acpp::worker_detail::UdpResourceBudget budget({
+    ::worker_detail::UdpResourceBudget budget({
         .associations = 2, .datagrams = 8, .payload_capacity = 64 * 1024});
     Ingress ingress("native-reuse", std::make_unique<NativeInbound>(), reclaimer, budget, io);
     Ingress other("native-other", std::make_unique<NativeInbound>(), reclaimer, budget, io);
     auto old_socket = Ingress::MakeSocket(io);
-    acpp::IoErrorCode ec;
-    old_socket->open(acpp::udp::v4(), ec);
+    ::IoErrorCode ec;
+    old_socket->open(::udp::v4(), ec);
     if (ec) Fail("failed to open old socket identity test socket");
-    old_socket->bind({acpp::net::ip::address_v4::loopback(), 0}, ec);
+    old_socket->bind({::net::ip::address_v4::loopback(), 0}, ec);
     if (ec || !ingress.AttachSocket("identity-socket", old_socket))
         Fail("failed to attach old socket identity");
     GateDispatcher dispatcher(io);
-    acpp::StatsShard stats;
-    acpp::TimeoutsConfig timeouts;
+    ::StatsShard stats;
+    ::TimeoutsConfig timeouts;
     ReplySink reply_sink;
     auto receiver = MakeReceiver();
     constexpr std::array<uint8_t, 1> packet{0x62};
     auto process = [&](const Ingress::SocketPtr& current) {
-        ingress.ProcessDatagram(acpp::worker_detail::UdpDatagramContext{
+        ingress.ProcessDatagram(::worker_detail::UdpDatagramContext{
             .socket_key = "identity-socket",
             .sock = current.get(),
-            .client_endpoint = {acpp::net::ip::address_v4::loopback(), 47123},
+            .client_endpoint = {::net::ip::address_v4::loopback(), 47123},
             .payload = packet,
             .receiver = &receiver,
             .io_context = io,
@@ -248,19 +248,19 @@ void VerifySocketIdentityRecycle(
     io.restart();
     if (dispatcher.dispatches != 1 || dispatcher.packets_read != 1)
         Fail("old socket identity did not start its native dispatch");
-    acpp::InboundDatagramOwner owner;
+    ::InboundDatagramOwner owner;
     constexpr std::array<uint8_t, 1> owner_bytes{0x47};
     if (!owner.Assign(owner_bytes)) Fail("failed to create socket identity owner");
-    const acpp::worker_detail::ClientSessionKey client_key{owner, 1};
+    const ::worker_detail::ClientSessionKey client_key{owner, 1};
     auto* const old_session = dispatcher.sessions[0];
     if (!old_session || ingress.GetResourceStats().associations != 1)
         Fail("old socket session was not created");
     ingress.CloseSocket("identity-socket");
 
     auto replacement_socket = Ingress::MakeSocket(io);
-    replacement_socket->open(acpp::udp::v4(), ec);
+    replacement_socket->open(::udp::v4(), ec);
     if (ec) Fail("failed to open replacement socket identity");
-    replacement_socket->bind({acpp::net::ip::address_v4::loopback(), 0}, ec);
+    replacement_socket->bind({::net::ip::address_v4::loopback(), 0}, ec);
     if (ec || !ingress.AttachSocket("identity-socket", replacement_socket))
         Fail("failed to attach replacement socket identity");
     process(old_socket);
@@ -280,7 +280,7 @@ void VerifySocketIdentityRecycle(
     const auto create_other = [&] {
         return other.CreateClientSession("other-socket", client_key, io,
             {},
-            {acpp::net::ip::address_v4::loopback(), 47124}, owner,
+            {::net::ip::address_v4::loopback(), 47124}, owner,
             std::chrono::steady_clock::now(), 0s);
     };
     if (budget.GetUsage().associations != 2 || create_other())
@@ -288,7 +288,7 @@ void VerifySocketIdentityRecycle(
 
     replacement_session->Close();
     bool joined = false;
-    acpp::net::co_spawn(io, ObserveJoin(ingress, joined), acpp::net::detached);
+    ::net::co_spawn(io, ObserveJoin(ingress, joined), ::net::detached);
     dispatcher.gate.cancel();
     io.run();
     if (!joined || ingress.GetResourceStats().native_dispatches != 0 ||
@@ -304,30 +304,30 @@ void VerifySocketIdentityRecycle(
     ingress.RequestStop();
 }
 
-void VerifyUplinkRefresh(acpp::net::io_context& io, Reclaimer& reclaimer) {
+void VerifyUplinkRefresh(::net::io_context& io, Reclaimer& reclaimer) {
     io.restart();
-    acpp::worker_detail::UdpResourceBudget budget;
+    ::worker_detail::UdpResourceBudget budget;
     Ingress ingress("native-refresh", std::make_unique<NativeInbound>(), reclaimer, budget, io);
     auto socket = Ingress::MakeSocket(io);
-    acpp::IoErrorCode ec;
-    socket->open(acpp::udp::v4(), ec);
+    ::IoErrorCode ec;
+    socket->open(::udp::v4(), ec);
     if (ec) Fail("failed to open UDP refresh test socket");
-    socket->bind({acpp::net::ip::address_v4::loopback(), 0}, ec);
+    socket->bind({::net::ip::address_v4::loopback(), 0}, ec);
     if (ec || !ingress.AttachSocket("refresh-socket", socket))
         Fail("failed to attach UDP refresh test socket");
 
     GateDispatcher dispatcher(io);
-    acpp::StatsShard stats;
-    acpp::TimeoutsConfig timeouts;
+    ::StatsShard stats;
+    ::TimeoutsConfig timeouts;
     timeouts.idle = 1;
     ReplySink reply_sink;
     auto receiver = MakeReceiver();
     constexpr std::array<uint8_t, 1> packet{0x62};
     auto process_packet = [&]() {
-        ingress.ProcessDatagram(acpp::worker_detail::UdpDatagramContext{
+        ingress.ProcessDatagram(::worker_detail::UdpDatagramContext{
             .socket_key = "refresh-socket",
             .sock = socket.get(),
-            .client_endpoint = {acpp::net::ip::address_v4::loopback(), 45123},
+            .client_endpoint = {::net::ip::address_v4::loopback(), 45123},
             .payload = packet,
             .receiver = &receiver,
             .io_context = io,
@@ -347,9 +347,9 @@ void VerifyUplinkRefresh(acpp::net::io_context& io, Reclaimer& reclaimer) {
     if (!session || ingress.GetResourceStats().associations != 1)
         Fail("UDP refresh session row is missing");
 
-    acpp::net::steady_timer refresh(io);
+    ::net::steady_timer refresh(io);
     refresh.expires_after(650ms);
-    refresh.async_wait([&](acpp::IoErrorCode timer_ec) {
+    refresh.async_wait([&](::IoErrorCode timer_ec) {
         if (!timer_ec) process_packet();
     });
     io.run_for(1250ms);
@@ -363,7 +363,7 @@ void VerifyUplinkRefresh(acpp::net::io_context& io, Reclaimer& reclaimer) {
         Fail("refreshed native association did not expire naturally after idleness");
     ingress.RequestStop();
     bool joined = false;
-    acpp::net::co_spawn(io, ObserveJoin(ingress, joined), acpp::net::detached);
+    ::net::co_spawn(io, ObserveJoin(ingress, joined), ::net::detached);
     dispatcher.gate.cancel();
     io.run();
     if (!joined || ingress.GetResourceStats().native_dispatches != 0)
@@ -371,8 +371,7 @@ void VerifyUplinkRefresh(acpp::net::io_context& io, Reclaimer& reclaimer) {
 }
 
 void VerifyProtocolLocalAssociation() {
-    using namespace acpp;
-    using namespace acpp::proxyman::inbound;
+    using namespace ::proxyman::inbound;
     auto previous_view = UserStore::CaptureWorkerView();
     UserOnlineTracker tracker;
     StatsShard stats{};
@@ -470,13 +469,13 @@ void VerifyProtocolLocalAssociation() {
 }
 
 void VerifyHandoffDirectoryNamespaces() {
-    using namespace acpp::worker_detail;
-    acpp::net::io_context coordinator;
-    auto& directory = acpp::net::use_service<UdpHandoffDirectory>(coordinator);
-    const auto& policy = acpp::ss::Ss2022UdpAssociation::Policy();
-    auto configuration = std::make_shared<const acpp::proxyman::inbound::ProtocolSettings>();
-    auto other_configuration = std::make_shared<const acpp::proxyman::inbound::ProtocolSettings>();
-    acpp::InboundDatagramOwner owner;
+    using namespace ::worker_detail;
+    ::net::io_context coordinator;
+    auto& directory = ::net::use_service<UdpHandoffDirectory>(coordinator);
+    const auto& policy = ::ss::Ss2022UdpAssociation::Policy();
+    auto configuration = std::make_shared<const ::proxyman::inbound::ProtocolSettings>();
+    auto other_configuration = std::make_shared<const ::proxyman::inbound::ProtocolSettings>();
+    ::InboundDatagramOwner owner;
     std::array<uint8_t, 32> credential{};
     for (size_t i = 0; i < credential.size(); ++i)
         credential[i] = static_cast<uint8_t>(i + 1);
@@ -484,29 +483,29 @@ void VerifyHandoffDirectoryNamespaces() {
     UdpHandoffIdentity key{
         .listener = "listener", .tag = "inbound", .configuration = configuration.get(),
         .client = ClientSessionKey{owner, 0x00123456789abcdeULL}};
-    const acpp::udp::endpoint endpoint{acpp::net::ip::address_v4::loopback(), 48234};
+    const ::udp::endpoint endpoint{::net::ip::address_v4::loopback(), 48234};
     auto record = directory.Claim(key, configuration, policy);
     if (!record || !record->association->claimed.load(std::memory_order_acquire) ||
-        directory.Claim(key, configuration, policy) || !record->association->Check(7, 0, endpoint, acpp::InboundDatagramCheck::Commit))
+        directory.Claim(key, configuration, policy) || !record->association->Check(7, 0, endpoint, ::InboundDatagramCheck::Commit))
         Fail("directory allowed duplicate ownership claims");
     record->association->claimed.store(false, std::memory_order_release);
     auto reclaimed = directory.Claim(key, configuration, policy);
-    if (reclaimed != record || reclaimed->association->Check(7, 0, endpoint, acpp::InboundDatagramCheck::Commit) ||
+    if (reclaimed != record || reclaimed->association->Check(7, 0, endpoint, ::InboundDatagramCheck::Commit) ||
         directory.Claim(key, configuration, policy))
         Fail("directory claim lost unique ownership or committed replay");
     record->association->claimed.store(false, std::memory_order_release);
 
     const auto expect_isolated = [&](
         const UdpHandoffIdentity& identity,
-        std::shared_ptr<const acpp::proxyman::inbound::ProtocolSettings> snapshot) {
+        std::shared_ptr<const ::proxyman::inbound::ProtocolSettings> snapshot) {
         auto isolated = directory.Claim(identity, snapshot, policy);
-        if (!isolated || isolated == record || !isolated->association->Check(7, 1, endpoint, acpp::InboundDatagramCheck::Commit) ||
+        if (!isolated || isolated == record || !isolated->association->Check(7, 1, endpoint, ::InboundDatagramCheck::Commit) ||
             directory.Claim(identity, snapshot, policy))
             Fail("directory merged distinct authenticated namespaces");
         isolated->association->claimed.store(false, std::memory_order_release);
         auto repeated = directory.Claim(identity, snapshot, policy);
-        if (repeated != isolated || repeated->association->Check(7, 1, endpoint, acpp::InboundDatagramCheck::Commit) ||
-            !repeated->association->Check(6, 1, endpoint, acpp::InboundDatagramCheck::Commit) || repeated->association->Check(5, 0, endpoint, acpp::InboundDatagramCheck::Commit))
+        if (repeated != isolated || repeated->association->Check(7, 1, endpoint, ::InboundDatagramCheck::Commit) ||
+            !repeated->association->Check(6, 1, endpoint, ::InboundDatagramCheck::Commit) || repeated->association->Check(5, 0, endpoint, ::InboundDatagramCheck::Commit))
             Fail("directory failed to retain isolated namespace replay");
         repeated->association->claimed.store(false, std::memory_order_release);
     };
@@ -532,29 +531,29 @@ void VerifyHandoffDirectoryNamespaces() {
     expect_isolated(settings, other_configuration);
 }
 
-void VerifyHandoffDirectoryTombstone(acpp::net::io_context& io, Reclaimer& reclaimer) {
-    using namespace acpp::worker_detail;
-    acpp::net::io_context coordinator;
-    auto& directory = acpp::net::use_service<UdpHandoffDirectory>(coordinator);
-    const auto& policy = acpp::ss::Ss2022UdpAssociation::Policy();
-    auto configuration = std::make_shared<const acpp::proxyman::inbound::ProtocolSettings>();
-    std::weak_ptr<const acpp::proxyman::inbound::ProtocolSettings> configuration_lifetime = configuration;
-    acpp::InboundDatagramOwner owner;
+void VerifyHandoffDirectoryTombstone(::net::io_context& io, Reclaimer& reclaimer) {
+    using namespace ::worker_detail;
+    ::net::io_context coordinator;
+    auto& directory = ::net::use_service<UdpHandoffDirectory>(coordinator);
+    const auto& policy = ::ss::Ss2022UdpAssociation::Policy();
+    auto configuration = std::make_shared<const ::proxyman::inbound::ProtocolSettings>();
+    std::weak_ptr<const ::proxyman::inbound::ProtocolSettings> configuration_lifetime = configuration;
+    ::InboundDatagramOwner owner;
     constexpr std::array<uint8_t, 32> credential{0x71};
     if (!owner.Assign(credential)) Fail("failed to prepare tombstone credential");
     UdpHandoffIdentity key{
         .listener = "closed-listener", .tag = "closed-inbound",
         .configuration = configuration.get(), .client = ClientSessionKey{owner, 9}};
     UdpResourceBudget budget;
-    const acpp::udp::endpoint endpoint{acpp::net::ip::address_v4::loopback(), 48234};
+    const ::udp::endpoint endpoint{::net::ip::address_v4::loopback(), 48234};
     Ingress ingress("directory-tombstone", std::make_unique<NativeInbound>(),
                     reclaimer, budget, io);
     auto session = ingress.CreateClientSession(
         key.listener, key.client, io, {},
-        {acpp::net::ip::address_v4::loopback(), 48234},
+        {::net::ip::address_v4::loopback(), 48234},
         owner, std::chrono::steady_clock::now(), 0s);
     auto record = directory.Claim(key, configuration, policy);
-    if (!session || !record || !record->association->Check(31, 0, endpoint, acpp::InboundDatagramCheck::Commit))
+    if (!session || !record || !record->association->Check(31, 0, endpoint, ::InboundDatagramCheck::Commit))
         Fail("failed to prepare live directory association");
     record->session = session;
     record->association->claimed.store(false, std::memory_order_release);
@@ -570,53 +569,53 @@ void VerifyHandoffDirectoryTombstone(acpp::net::io_context& io, Reclaimer& recla
     if (tombstone.expired() || configuration_lifetime.expired())
         Fail("directory discarded its replay tombstone or settings snapshot");
     auto resumed = directory.Claim(key, configuration_lifetime.lock(), policy);
-    if (!resumed || resumed != tombstone.lock() || resumed->association->Check(31, 0, endpoint, acpp::InboundDatagramCheck::Commit) ||
-        resumed->association->Check(30, 1, endpoint, acpp::InboundDatagramCheck::Commit) || !resumed->association->Check(32, 1, endpoint, acpp::InboundDatagramCheck::Commit) ||
-        resumed->association->Check(30, 0, endpoint, acpp::InboundDatagramCheck::Commit) || !resumed->association->Check(30, 1, endpoint, acpp::InboundDatagramCheck::Commit))
+    if (!resumed || resumed != tombstone.lock() || resumed->association->Check(31, 0, endpoint, ::InboundDatagramCheck::Commit) ||
+        resumed->association->Check(30, 1, endpoint, ::InboundDatagramCheck::Commit) || !resumed->association->Check(32, 1, endpoint, ::InboundDatagramCheck::Commit) ||
+        resumed->association->Check(30, 0, endpoint, ::InboundDatagramCheck::Commit) || !resumed->association->Check(30, 1, endpoint, ::InboundDatagramCheck::Commit))
         Fail("association closure reopened a protected replay window");
     resumed->association->claimed.store(false, std::memory_order_release);
     ingress.RequestStop();
 }
 
 void VerifyHandoffDirectoryCapacity() {
-    using namespace acpp::worker_detail;
-    acpp::net::io_context coordinator;
-    auto& directory = acpp::net::use_service<UdpHandoffDirectory>(coordinator);
-    const auto& policy = acpp::ss::Ss2022UdpAssociation::Policy();
-    auto configuration = std::make_shared<const acpp::proxyman::inbound::ProtocolSettings>();
-    acpp::InboundDatagramOwner owner;
+    using namespace ::worker_detail;
+    ::net::io_context coordinator;
+    auto& directory = ::net::use_service<UdpHandoffDirectory>(coordinator);
+    const auto& policy = ::ss::Ss2022UdpAssociation::Policy();
+    auto configuration = std::make_shared<const ::proxyman::inbound::ProtocolSettings>();
+    ::InboundDatagramOwner owner;
     constexpr std::array<uint8_t, 32> credential{0x63};
     if (!owner.Assign(credential)) Fail("failed to prepare capacity credential");
     UdpHandoffIdentity key{
         .listener = "capacity-listener", .tag = "capacity-inbound",
         .configuration = configuration.get(), .client = ClientSessionKey{owner, 0}};
-    const acpp::udp::endpoint endpoint{acpp::net::ip::address_v4::loopback(), 48234};
+    const ::udp::endpoint endpoint{::net::ip::address_v4::loopback(), 48234};
     std::shared_ptr<UdpHandoffRecord> first;
-    for (size_t i = 0; i < acpp::ss::Ss2022UdpReplayCache::kMaxSessions; ++i) {
+    for (size_t i = 0; i < ::ss::Ss2022UdpReplayCache::kMaxSessions; ++i) {
         key.client.session_id = i;
         auto record = directory.Claim(key, configuration, policy);
-        if (!record || !record->association->Check(11, 0, endpoint, acpp::InboundDatagramCheck::Commit))
+        if (!record || !record->association->Check(11, 0, endpoint, ::InboundDatagramCheck::Commit))
             Fail("directory rejected a session before reaching capacity");
         record->association->claimed.store(false, std::memory_order_release);
         if (i == 0) first = std::move(record);
     }
-    key.client.session_id = acpp::ss::Ss2022UdpReplayCache::kMaxSessions;
+    key.client.session_id = ::ss::Ss2022UdpReplayCache::kMaxSessions;
     if (directory.Claim(key, configuration, policy))
         Fail("full directory evicted an unexpired closed-session replay tombstone");
     auto protected_key = key;
     protected_key.client.session_id = 0;
     auto protected_record = directory.Claim(protected_key, configuration, policy);
-    if (protected_record != first || protected_record->association->Check(11, 0, endpoint, acpp::InboundDatagramCheck::Commit))
+    if (protected_record != first || protected_record->association->Check(11, 0, endpoint, ::InboundDatagramCheck::Commit))
         Fail("capacity rejection lost an existing session or its replay history");
     const auto expired = std::chrono::steady_clock::now() -
-        acpp::ss::Ss2022UdpReplayCache::kRetention - 1s;
-    if (!first->association->Check(12, 0, endpoint, acpp::InboundDatagramCheck::Commit, expired))
+        ::ss::Ss2022UdpReplayCache::kRetention - 1s;
+    if (!first->association->Check(12, 0, endpoint, ::InboundDatagramCheck::Commit, expired))
         Fail("failed to commit an expired protocol retention deadline");
     if (directory.Claim(key, configuration, policy))
         Fail("directory reclaimed a still-claimed expired tombstone");
     first->association->claimed.store(false, std::memory_order_release);
     auto replacement = directory.Claim(key, configuration, policy);
-    if (!replacement || replacement == first || !replacement->association->Check(11, 0, endpoint, acpp::InboundDatagramCheck::Commit))
+    if (!replacement || replacement == first || !replacement->association->Check(11, 0, endpoint, ::InboundDatagramCheck::Commit))
         Fail("directory did not reclaim an expired unclaimed tombstone");
     replacement->association->claimed.store(false, std::memory_order_release);
     if (directory.Claim(protected_key, configuration, policy))
@@ -624,14 +623,14 @@ void VerifyHandoffDirectoryCapacity() {
 }
 
 void VerifyAssociationReplyDrain() {
-    acpp::net::io_context io;
-    auto fence = std::make_shared<acpp::worker_detail::UdpReplyFence>(io);
-    auto unrelated = std::make_shared<acpp::worker_detail::UdpReplyFence>(io);
-    acpp::worker_detail::UdpReplyFence::Lease queued(fence);
-    acpp::worker_detail::UdpReplyFence::Lease active(fence);
-    acpp::worker_detail::UdpReplyFence::Lease other_active(unrelated);
+    ::net::io_context io;
+    auto fence = std::make_shared<::worker_detail::UdpReplyFence>(io);
+    auto unrelated = std::make_shared<::worker_detail::UdpReplyFence>(io);
+    ::worker_detail::UdpReplyFence::Lease queued(fence);
+    ::worker_detail::UdpReplyFence::Lease active(fence);
+    ::worker_detail::UdpReplyFence::Lease other_active(unrelated);
     bool drained = false;
-    acpp::net::co_spawn(io, fence->AsyncDrain(),
+    ::net::co_spawn(io, fence->AsyncDrain(),
         [&](std::exception_ptr failure) {
             if (failure) Fail("association reply fence failed");
             drained = true;
@@ -669,41 +668,41 @@ TEST(UdpNativeLifecycle, Contract) {
         std::fflush(stderr);
         std::_Exit(99);
     });
-    acpp::memory::ThreadMemoryResource owner_resource;
+    ::memory::ThreadMemoryResource owner_resource;
     struct RestoreDefaultResource {
         std::pmr::memory_resource* previous;
         ~RestoreDefaultResource() { std::pmr::set_default_resource(previous); }
     } resource_scope{std::pmr::set_default_resource(&owner_resource)};
     VerifyAssociationReplyDrain();
-    acpp::net::io_context io;
-    auto& scheduler = acpp::TimeoutScheduler::ForIoContext(io);
+    ::net::io_context io;
+    auto& scheduler = ::TimeoutScheduler::ForIoContext(io);
     Reclaimer reclaimer(scheduler, nullptr, [](void*, std::exception_ptr) { std::terminate(); });
     VerifyHandoffDirectoryNamespaces();
     VerifyProtocolLocalAssociation();
     VerifyHandoffDirectoryTombstone(io, reclaimer);
     VerifyHandoffDirectoryCapacity();
-    acpp::worker_detail::UdpResourceBudget budget;
+    ::worker_detail::UdpResourceBudget budget;
     Ingress ingress("native-test", std::make_unique<NativeInbound>(), reclaimer, budget, io);
     auto socket = Ingress::MakeSocket(io);
-    acpp::IoErrorCode ec;
-    socket->open(acpp::udp::v4(), ec);
+    ::IoErrorCode ec;
+    socket->open(::udp::v4(), ec);
     if (ec) Fail("failed to open native UDP test socket");
-    socket->bind({acpp::net::ip::address_v4::loopback(), 0}, ec);
+    socket->bind({::net::ip::address_v4::loopback(), 0}, ec);
     if (ec || !ingress.AttachSocket("native-socket", socket))
         Fail("failed to attach native UDP test socket");
 
     GateDispatcher dispatcher(io);
     dispatcher.ingress = &ingress;
     dispatcher.reenter_stop = true;
-    acpp::StatsShard stats;
-    acpp::TimeoutsConfig timeouts;
+    ::StatsShard stats;
+    ::TimeoutsConfig timeouts;
     ReplySink reply_sink;
     auto receiver = MakeReceiver();
     constexpr std::array<uint8_t, 1> datagram{0x62};
-    ingress.ProcessDatagram(acpp::worker_detail::UdpDatagramContext{
+    ingress.ProcessDatagram(::worker_detail::UdpDatagramContext{
         .socket_key = "native-socket",
         .sock = socket.get(),
-        .client_endpoint = {acpp::net::ip::address_v4::loopback(), 43123},
+        .client_endpoint = {::net::ip::address_v4::loopback(), 43123},
         .payload = datagram,
         .receiver = &receiver,
         .io_context = io,
@@ -714,10 +713,10 @@ TEST(UdpNativeLifecycle, Contract) {
         .reply_sink = reply_sink,
     });
     constexpr std::array<uint8_t, 1> second_datagram{0x63};
-    ingress.ProcessDatagram(acpp::worker_detail::UdpDatagramContext{
+    ingress.ProcessDatagram(::worker_detail::UdpDatagramContext{
         .socket_key = "native-socket",
         .sock = socket.get(),
-        .client_endpoint = {acpp::net::ip::address_v4::loopback(), 43124},
+        .client_endpoint = {::net::ip::address_v4::loopback(), 43124},
         .payload = second_datagram,
         .receiver = &receiver,
         .io_context = io,
@@ -731,7 +730,7 @@ TEST(UdpNativeLifecycle, Contract) {
     receiver.inbound_tags.front().assign(256, 'y');
     receiver.protocol.assign(256, 'z');
     receiver.stream_settings.security.assign(256, 'q');
-    std::get<acpp::routing::ForceOutbound>(receiver.dispatch_policy.outbound)
+    std::get<::routing::ForceOutbound>(receiver.dispatch_policy.outbound)
         .outbound_tag.assign(256, 'r');
 
     const auto installed = ingress.GetResourceStats();
@@ -749,10 +748,10 @@ TEST(UdpNativeLifecycle, Contract) {
     auto* const session_b = dispatcher.sessions[1];
     // A datagram decoded by the replacement handler must reach the existing
     // row's queue instead of starting a new job.
-    ingress.ProcessDatagram(acpp::worker_detail::UdpDatagramContext{
+    ingress.ProcessDatagram(::worker_detail::UdpDatagramContext{
         .socket_key = "native-socket",
         .sock = socket.get(),
-        .client_endpoint = {acpp::net::ip::address_v4::loopback(), 43123},
+        .client_endpoint = {::net::ip::address_v4::loopback(), 43123},
         .payload = datagram,
         .receiver = &receiver,
         .io_context = io,
@@ -780,12 +779,12 @@ TEST(UdpNativeLifecycle, Contract) {
     bool joined = false;
     bool parent_cancelled = false;
     bool join_throw_setting = true;
-    acpp::net::cancellation_signal parent_signal;
-    acpp::net::co_spawn(
+    ::net::cancellation_signal parent_signal;
+    ::net::co_spawn(
         io, ObserveCancelledJoin(ingress, joined, parent_cancelled,
                                  join_throw_setting, parent_signal),
-        acpp::net::bind_cancellation_slot(
-            parent_signal.slot(), acpp::net::detached));
+        ::net::bind_cancellation_slot(
+            parent_signal.slot(), ::net::detached));
     io.run_for(20ms);
     io.restart();
     if (joined || ingress.GetResourceStats().native_dispatches != 2)

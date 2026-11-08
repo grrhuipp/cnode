@@ -1,5 +1,5 @@
-#include "acppnode/infra/json.hpp"
-#include "acppnode/common/binary_text_codec.hpp"
+#include "infra/json.hpp"
+#include "common/binary_text_codec.hpp"
 
 #include <charconv>
 #include <cmath>
@@ -7,7 +7,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace acpp::json {
+namespace json {
 
 void object_deleter::operator()(object* ptr) const noexcept {
     delete ptr;
@@ -589,4 +589,4 @@ std::string serialize(const value& v) {
     return out;
 }
 
-}  // namespace acpp::json
+}  // namespace json

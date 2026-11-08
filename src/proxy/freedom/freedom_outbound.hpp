@@ -1,10 +1,10 @@
 #pragma once
 
-#include "acppnode/common/target_address.hpp"
-#include "acppnode/proxy/outbound.hpp"
-#include "acppnode/proxy/freedom_domain_strategy.hpp"
-#include "acppnode/app/proxyman/outbound/prepared_config.hpp"
-#include "acppnode/common/allocator.hpp"
+#include "common/target_address.hpp"
+#include "proxy/outbound.hpp"
+#include "proxy/freedom_domain_strategy.hpp"
+#include "app/proxyman/outbound/prepared_config.hpp"
+#include "common/allocator.hpp"
 
 #include <chrono>
 #include <tl/expected.hpp>
@@ -12,13 +12,11 @@
 #include <optional>
 #include <string_view>
 
-namespace acpp {
 namespace app::dns {
 class DNS;
 }  // namespace app::dns
-}  // namespace acpp
 
-namespace acpp::proxy::freedom::outbound {
+namespace proxy::freedom::outbound {
 
 // ============================================================================
 // Freedom 出站设置（sendThrough 属于 Handler 的 sender settings）
@@ -58,10 +56,10 @@ private:
 
     // 解析目标地址列表（保留多 IP 顺序，按策略过滤/排序）
     net::awaitable<tl::expected<memory::ThreadLocalVector<net::ip::address>, ErrorCode>>
-    ResolveTargets(::acpp::app::dns::DNS& dns, session::Context& ctx);
+    ResolveTargets(::app::dns::DNS& dns, session::Context& ctx);
 
     DomainStrategy domain_strategy_;
     std::optional<TargetAddress> redirect_target_;
 };
 
-}  // namespace acpp::proxy::freedom::outbound
+}  // namespace proxy::freedom::outbound

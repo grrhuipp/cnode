@@ -17,7 +17,7 @@ public:
           dns(Socket::BindUdp(0, IsQuic() ? "127.0.0.1" : "127.77.0.2")) {
         PortReservation reservation(Native());
         port = reservation.port;
-        bool isolated = IsIsolation();
+        bool isolated = IsIsolation() || EmptyDatagrams();
         Json inbound = {{"tag", "udp-probe"}, {"protocol", "vless"}, {"listen", "127.0.0.1"},
             {"port", port}, {"routingEnabled", true},
             {"settings", {{"clients", Json::array({{{"id", UserId}}})}}},
@@ -31,10 +31,12 @@ public:
         Json config = {{"workers", 1}, {"timeouts", {{"write", 1}, {"connIdle", 30}, {"downlinkOnly", 1}}},
             {"dns", {{"servers", Json::array({std::string(IsQuic() ? "127.0.0.1:" : "127.77.0.2:") + std::to_string(dns.Port())})}, {"timeout", 10}}},
             {"log", {{"enable", false}, {"logDir", (root.Path() / "logs").string()}}}};
-        if (Handoff()) {
+        if (Native() && !this->value.cipher.empty()) {
             size_t size = this->value.cipher == "aes" ? 16 : 32;
             inbound["settings"] = {{"method", this->value.cipher == "aes" ? "2022-blake3-aes-128-gcm" : "2022-blake3-chacha20-poly1305"},
                 {"clients", Json::array({{{"password", Base64(Sequence(size))}}, {{"password", Base64(Sequence(size, size))}}})}};
+        }
+        if (Handoff()) {
             config["workers"] = 4;
             config["log"] = {{"loglevel", "debug"}, {"logDir", root.Path().string()},
                 {"error", "handoff.log"}, {"access", "access.log"}, {"rotateDaily", false}, {"gzip", false}};
@@ -67,6 +69,9 @@ public:
     bool Sniffing() const { return IsQuic() || value.mode.find("sniff_") != std::string::npos; }
     bool Handoff() const { return value.mode == "native_ss2022_isolation"; }
     bool IsIsolation() const { return value.mode.find("isolation") != std::string::npos; }
+    bool EmptyDatagrams() const {
+        return value.mode == "native_empty_datagrams" || value.mode == "native_empty_short_domain";
+    }
     uint16_t Destination() const { return value.protocol == "shadowsocks" ? 53 : peer.Port(); }
     void Echo(Socket& endpoint, std::string_view expected, bool delayed = false) {
         auto packet = Receive(endpoint);
@@ -208,6 +213,57 @@ void ExerciseIsolation(RelayRun& run) {
     EXPECT_FALSE(Readable(run.peer.Fd(), 100ms));
 }
 
+void ExerciseEmptyDatagrams(RelayRun& run) {
+    const std::string host = run.value.mode == "native_empty_short_domain" ? "a" : "127.0.0.1";
+    Client first(run.port, run.Destination(), true, false, host, run.value.cipher);
+    Client second(run.port, run.Destination(), true, true, host, run.value.cipher);
+    second.socket = first.socket;
+    const std::vector<std::shared_ptr<Socket>> paths{first.socket};
+    run.Rejected({}, first, paths);
+    run.Rejected("malformed encrypted datagram", first, paths);
+    auto forged = first.Encode({});
+    forged.back() ^= 1;
+    run.Rejected(forged, first, paths);
+
+    const bool encrypted = run.value.protocol == "shadowsocks";
+    auto exchange = [&](Client& client, std::string_view request, std::string_view response) {
+        client.Send(request);
+        auto packet = Receive(run.peer);
+        const auto plain = encrypted ? LegacyDecrypt(packet.payload) : packet.payload;
+        const auto header = encrypted ? SocksAddress(53, host) : std::string{};
+        Require(plain == header + std::string(request),
+                "empty UDP changed outbound header, payload or boundary");
+        run.observed.push_back(std::string(request));
+        if (encrypted) {
+            Reply(run.peer, packet, {});
+            auto bad_tag = LegacyEncrypt(header + std::string(response));
+            bad_tag.back() ^= 1;
+            Reply(run.peer, packet, bad_tag);
+            Reply(run.peer, packet, LegacyEncrypt(header + std::string(response)));
+        } else {
+            Reply(run.peer, packet, response);
+        }
+        client.Expect(response);
+        return packet;
+    };
+
+    const auto one = exchange(first, {}, {});
+    const auto two = exchange(second, {}, {});
+    EXPECT_NE(one.Port(), two.Port());
+    EXPECT_TRUE(exchange(first, "one-after-empty", {}).SameEndpoint(one));
+    EXPECT_TRUE(exchange(second, "two-after-empty", "two-reply").SameEndpoint(two));
+    run.Rejected(forged, first, paths);
+    EXPECT_TRUE(exchange(first, {}, {}).SameEndpoint(one));
+    EXPECT_TRUE(exchange(second, {}, {}).SameEndpoint(two));
+    EXPECT_TRUE(exchange(first, "one-after-second-empty", "one-reply").SameEndpoint(one));
+    EXPECT_TRUE(exchange(second, "two-after-second-empty", {}).SameEndpoint(two));
+    EXPECT_EQ(run.observed, (std::vector<std::string>{
+        "", "", "one-after-empty", "two-after-empty", "", "",
+        "one-after-second-empty", "two-after-second-empty"}));
+    EXPECT_FALSE(Readable(run.peer.Fd(), 100ms));
+    EXPECT_FALSE(Readable(first.socket->Fd(), 100ms));
+}
+
 void ExerciseDns(RelayRun& run) {
     Client blocked(run.port, 53, false, false, run.value.protocol == "freedom" ? "udp-sink.test" : "127.0.0.1");
     auto start = std::chrono::steady_clock::now();
@@ -270,6 +326,7 @@ TEST_P(UdpRelay, PreservesProtocolDatagramsAndAssociationLifetime) {
     const auto& item = GetParam();
     SCOPED_TRACE(item.protocol + "/" + item.mode + "/" + item.cipher);
     RelayRun run(item);
+    if (run.EmptyDatagrams()) { ExerciseEmptyDatagrams(run); return; }
     if (run.Handoff()) { ExerciseHandoff(run); return; }
     if (run.IsIsolation()) { ExerciseIsolation(run); return; }
     if (item.mode == "dns_timeout" || item.mode == "shared_cancel") { ExerciseDns(run); return; }
@@ -306,6 +363,11 @@ std::vector<Case> Cases() {
     for (const auto* protocol : {"freedom", "shadowsocks"})
         for (const auto* mode : {"echo", "late_reply", "sniff_echo", "native_sniff_echo", "sniff_burst", "native_sniff_burst"})
             result.push_back({protocol, mode, {}});
+    for (const auto* protocol : {"freedom", "shadowsocks"})
+        for (const auto* cipher : {"", "aes", "chacha"})
+            result.push_back({protocol, "native_empty_datagrams", cipher});
+    for (const auto* cipher : {"", "aes", "chacha"})
+        result.push_back({"shadowsocks", "native_empty_short_domain", cipher});
     for (const auto* prefix : {"quic_", "native_quic_"})
         for (const auto* suffix : {"fragmented", "missing", "interrupted", "invalid"})
             result.push_back({"shadowsocks", std::string(prefix) + suffix, {}});

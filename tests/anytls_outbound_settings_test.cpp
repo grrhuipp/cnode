@@ -19,8 +19,8 @@ void Check(bool condition, std::string_view message) {
 }
 
 auto Parse(std::string_view body) {
-    const auto parsed = acpp::json::parse(body);
-    return acpp::proxy::anytls::outbound::ParseSettings(parsed.as_object());
+    const auto parsed = ::json::parse(body);
+    return ::proxy::anytls::outbound::ParseSettings(parsed.as_object());
 }
 
 void CheckInvalid(std::string_view body) {

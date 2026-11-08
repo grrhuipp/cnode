@@ -1,9 +1,9 @@
-#include "acppnode/transport/internet/outbound_bind.hpp"
+#include "transport/internet/outbound_bind.hpp"
 
-#include "acppnode/common/ip_utils.hpp"
-#include "acppnode/common/ip_address.hpp"
-#include "acppnode/core/constants.hpp"
-#include "acppnode/transport/internet/http_headers.hpp"
+#include "common/ip_utils.hpp"
+#include "common/ip_address.hpp"
+#include "core/constants.hpp"
+#include "transport/internet/http_headers.hpp"
 
 #include <asio/ip/network_v4.hpp>
 #include <asio/ip/network_v6.hpp>
@@ -15,7 +15,6 @@
 #include <string>
 #include <thread>
 
-namespace acpp {
 namespace {
 
 uint64_t MixHash(uint64_t value) noexcept {
@@ -207,4 +206,3 @@ OutboundBind::Selection OutboundBind::Select(
     return {};
 }
 
-}  // namespace acpp

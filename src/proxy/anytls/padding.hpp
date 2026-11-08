@@ -8,7 +8,7 @@
 #include <string_view>
 #include <vector>
 
-namespace acpp::anytls {
+namespace anytls {
 
 struct PaddingRecord {
     bool copy_payload = false;
@@ -51,4 +51,4 @@ private:
 [[nodiscard]] std::optional<PaddingScheme> ParsePaddingScheme(std::string_view raw);
 [[nodiscard]] const std::shared_ptr<const PaddingScheme>& DefaultPaddingScheme();
 
-} // namespace acpp::anytls
+} // namespace anytls

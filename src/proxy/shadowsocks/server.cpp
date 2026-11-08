@@ -1,11 +1,11 @@
 #include "shadowsocks_crypto.hpp"
-#include "acppnode/common/byte_reader.hpp"
+#include "common/byte_reader.hpp"
 #include "stream_crypto.hpp"
 #include "server.hpp"
 #include "../uot/uot.hpp"
 #include "../handshake_timeout.hpp"
-#include "acppnode/common/address_codec.hpp"
-#include "acppnode/common/allocator.hpp"
+#include "common/address_codec.hpp"
+#include "common/allocator.hpp"
 
 #include <openssl/rand.h>
 
@@ -15,7 +15,7 @@
 #include <optional>
 #include <utility>
 
-namespace acpp::ss {
+namespace ss {
 
 namespace {
 
@@ -623,7 +623,7 @@ net::awaitable<tl::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession2022
     const auto first_bytes = first_payload->Bytes();
     auto addr_result = DecodeAddress(
         first_bytes, AddressWireFormat::Socks5,
-        {.max_domain_len = 255, .require_non_empty_domain = true, .allow_metadata = true});
+        {.require_non_empty_domain = true, .allow_metadata = true});
     if (addr_result.status != AddressDecodeStatus::Complete) {
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
@@ -764,7 +764,7 @@ net::awaitable<tl::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession(
     auto first_bytes = first_payload->Bytes();
     auto addr_result = DecodeAddress(
         first_bytes, AddressWireFormat::Socks5,
-        {.max_domain_len = 255, .require_non_empty_domain = true, .allow_metadata = true});
+        {.require_non_empty_domain = true, .allow_metadata = true});
     if (addr_result.status != AddressDecodeStatus::Complete) {
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
@@ -803,4 +803,4 @@ tl::expected<std::unique_ptr<transport::MultiBufferWriter>, ErrorCode> WriteTCPR
     }
 }
 
-}  // namespace acpp::ss
+}  // namespace ss

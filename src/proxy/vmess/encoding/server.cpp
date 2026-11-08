@@ -1,16 +1,17 @@
 #include "server.hpp"
 #include "body.hpp"
-#include "acppnode/common/buffer_util.hpp"
-#include "acppnode/common/buf/length_prefixed_packet_buffer.hpp"
-#include "acppnode/common/byte_reader.hpp"
-#include "acppnode/common/address_codec.hpp"
-#include "acppnode/infra/log.hpp"
+#include "common/buffer_util.hpp"
+#include "common/buf/length_prefixed_packet_buffer.hpp"
+#include "common/byte_reader.hpp"
+#include "common/address_codec.hpp"
+#include "infra/log.hpp"
 #include "../udp_datagram.hpp"
 #include <openssl/mem.h>
 #include <algorithm>
 #include <cstring>
+#include <new>
 
-namespace acpp::vmess::encoding {
+namespace vmess::encoding {
 
 namespace {
 
@@ -80,7 +81,7 @@ bool ParseDecryptedHeader(const uint8_t* data, size_t len,
         auto address = DecodeAddress(
             std::span(data + reader.Position(), reader.Remaining()),
             AddressWireFormat::PortFirst,
-            {.max_domain_len = 253, .require_non_empty_domain = true, .allow_metadata = true});
+            {.require_non_empty_domain = true, .allow_metadata = true});
         if (address.status != AddressDecodeStatus::Complete) return false;
         reader.Skip(address.consumed);
         request.target = std::move(address.target);
@@ -196,8 +197,9 @@ public:
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
         auto mb = co_await decoder_.Read(stream_);
-        if (is_udp_) {
-            buf::SetUdpDatagramTarget(mb, udp_target_);
+        if (is_udp_ && mb.byte_size() != 0 &&
+            !buf::SetUdpTarget(mb, udp_target_)) {
+            throw std::bad_alloc();
         }
         co_return mb;
     }
@@ -229,7 +231,7 @@ public:
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
         if (encoder_.PacketMode()) {
-            ::acpp::vmess::ValidateFixedUdpDatagram(mb, udp_target_);
+            ::vmess::ValidateFixedUdpDatagram(mb, udp_target_);
         }
         buf::MultiBuffer chunks;
         encoder_.Encode(mb, chunks);
@@ -389,4 +391,4 @@ std::unique_ptr<transport::MultiBufferWriter> ServerSession::EncodeResponseBodyW
     }
 }
 
-}  // namespace acpp::vmess::encoding
+}  // namespace vmess::encoding

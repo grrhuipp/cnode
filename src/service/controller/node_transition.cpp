@@ -1,6 +1,6 @@
 #include "node_transition.hpp"
 
-namespace acpp::controller {
+namespace controller {
 bool NodeConfigChanged(const api::NodeInfo& current,
                        const api::NodeInfo& candidate) noexcept {
     return current.Port != candidate.Port
@@ -43,4 +43,4 @@ NodeTransitionPlan PlanNodeTransition(const api::NodeInfo* current,
     return {NodeTransitionMode::SwapSameEndpoint};
 }
 
-}  // namespace acpp::controller
+}  // namespace controller

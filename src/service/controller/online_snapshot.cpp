@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <optional>
 
-namespace acpp::controller {
+namespace controller {
 
 OnlineSnapshot BuildOnlineSnapshot(std::vector<OnlineDevice> devices) {
     std::sort(devices.begin(), devices.end());
@@ -28,4 +28,4 @@ OnlineSnapshot BuildOnlineSnapshot(std::vector<OnlineDevice> devices) {
     return result;
 }
 
-}  // namespace acpp::controller
+}  // namespace controller

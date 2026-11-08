@@ -1,22 +1,22 @@
 #include "freedom_outbound.hpp"
-#include "acppnode/app/dns/dns.hpp"
-#include "acppnode/app/relay.hpp"
-#include "acppnode/common/ip_utils.hpp"
-#include "acppnode/common/session.hpp"
-#include "acppnode/core/constants.hpp"
-#include "acppnode/app/proxyman/outbound/factory.hpp"
+#include "app/dns/dns.hpp"
+#include "app/relay.hpp"
+#include "common/ip_utils.hpp"
+#include "common/session.hpp"
+#include "core/constants.hpp"
+#include "app/proxyman/outbound/factory.hpp"
 #include "../../app/proxyman/outbound/registration.hpp"
 #include "outbound/udp_request.hpp"
-#include "acppnode/transport/internet/outbound_target_builder.hpp"
-#include "acppnode/transport/internet/transport_dialer.hpp"
-#include "acppnode/infra/log.hpp"
-#include "acppnode/infra/outbound_bind_config.hpp"
+#include "transport/internet/outbound_target_builder.hpp"
+#include "transport/internet/transport_dialer.hpp"
+#include "infra/log.hpp"
+#include "infra/outbound_bind_config.hpp"
 
 #include <algorithm>
 #include <cctype>
 #include <limits>
 
-namespace acpp::proxy::freedom::outbound {
+namespace proxy::freedom::outbound {
 
 namespace {
 
@@ -176,7 +176,7 @@ Handler::DialTarget(OutboundDialer& dialer, session::Context& ctx) {
 }
 
 net::awaitable<tl::expected<memory::ThreadLocalVector<net::ip::address>, ErrorCode>>
-Handler::ResolveTargets(::acpp::app::dns::DNS& dns, session::Context& ctx) {
+Handler::ResolveTargets(::app::dns::DNS& dns, session::Context& ctx) {
     const auto& target = ctx.outbound.target;
 
     if (!target.IsDomain()) {
@@ -253,22 +253,22 @@ proxyman::outbound::PreparedOutboundCreator PrepareOutbound(FreedomSettings sett
         }>(std::move(settings));
 }
 
-}  // namespace acpp::proxy::freedom::outbound
+}  // namespace proxy::freedom::outbound
 
 // ============================================================================
 // 自注册（静态初始化，Xray init() 设计）
 // ============================================================================
 namespace {
-const bool kFreedomRegistered = (acpp::proxyman::outbound::RegisterProxy(
-    acpp::constants::protocol::kFreedom,
-    [](const acpp::infra::OutboundSourceConfig& cfg)
-        -> std::optional<acpp::proxyman::outbound::PreparedOutboundProxy> {
+const bool kFreedomRegistered = (::proxyman::outbound::RegisterProxy(
+    ::constants::protocol::kFreedom,
+    [](const ::infra::OutboundSourceConfig& cfg)
+        -> std::optional<::proxyman::outbound::PreparedOutboundProxy> {
         const auto& s = cfg.settings;
-        acpp::proxy::freedom::outbound::FreedomSettings settings;
+        ::proxy::freedom::outbound::FreedomSettings settings;
         // Freedom keeps the default raw TCP stream; its sendThrough defaults
         // to same-in-same-out. A top-level sendThrough overrides this nested one.
-        acpp::OutboundSenderSettings sender{.stream_settings = {},
-                                            .send_through = acpp::OutboundBind::Auto()};
+        ::OutboundSenderSettings sender{.stream_settings = {},
+                                            .send_through = ::OutboundBind::Auto()};
 
         if (s.contains("send_through")) return std::nullopt;
         const auto* nested_send_through = s.if_contains("sendThrough");
@@ -276,14 +276,14 @@ const bool kFreedomRegistered = (acpp::proxyman::outbound::RegisterProxy(
         if (nested_strategy && !nested_send_through) return std::nullopt;
         if (nested_send_through) {
             try {
-                sender.send_through = acpp::infra::ParseOutboundBindConfig(
+                sender.send_through = ::infra::ParseOutboundBindConfig(
                     *nested_send_through, nested_strategy);
             } catch (const std::invalid_argument&) {
                 return std::nullopt;
             }
         }
         const auto domain_strategy =
-            acpp::proxy::freedom::outbound::ParseConfiguredDomainStrategy(s);
+            ::proxy::freedom::outbound::ParseConfiguredDomainStrategy(s);
         if (!domain_strategy) {
             return std::nullopt;
         }
@@ -292,7 +292,7 @@ const bool kFreedomRegistered = (acpp::proxyman::outbound::RegisterProxy(
         if (const auto* v = s.if_contains("redirect");
             v && !(v->is_string() && v->as_string().empty())) {
             auto redirect = v->is_string()
-                ? acpp::TargetAddress::Parse(v->as_string())
+                ? ::TargetAddress::Parse(v->as_string())
                 : std::nullopt;
             if (!redirect || !redirect->IsValid()) {
                 LOG_ERROR("freedom outbound '{}': redirect must be a valid host:port", cfg.tag);
@@ -301,8 +301,8 @@ const bool kFreedomRegistered = (acpp::proxyman::outbound::RegisterProxy(
             settings.redirect = std::move(*redirect);
         }
 
-        return acpp::proxyman::outbound::PreparedOutboundProxy{
-            .create = acpp::proxy::freedom::outbound::PrepareOutbound(std::move(settings)),
+        return ::proxyman::outbound::PreparedOutboundProxy{
+            .create = ::proxy::freedom::outbound::PrepareOutbound(std::move(settings)),
             .sender = std::move(sender),
         };
     }), true);

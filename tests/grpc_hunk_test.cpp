@@ -13,7 +13,7 @@
 #include <vector>
 
 namespace {
-using namespace acpp::transport::internet;
+using namespace ::transport::internet;
 bool measuring = false;
 size_t largest = 0, allocated = 0, denied = 0, live_large = 0, peak_large = 0, checks = 0;
 size_t allocation_limit = kMaxGrpcHunkMessageSize;

@@ -1,13 +1,12 @@
-#include "acppnode/infra/config.hpp"
-#include "acppnode/core/naming.hpp"
-#include "acppnode/infra/log.hpp"
+#include "infra/config.hpp"
+#include "core/naming.hpp"
+#include "infra/log.hpp"
 
 #include "config_semantics.hpp"
 
 #include <algorithm>
 #include <unordered_set>
 
-namespace acpp {
 
 namespace {
 
@@ -122,4 +121,3 @@ std::vector<std::string> GetUsedGeoSiteTags(const RoutingConfig& routing) {
     return GetUsedRouteRuleTags(routing, &RouteRuleConfig::geosite);
 }
 
-}  // namespace acpp

@@ -1,7 +1,7 @@
-#include "acppnode/transport/internet/proxy_protocol.hpp"
-#include "acppnode/common/ip_address.hpp"
-#include "acppnode/infra/log.hpp"
-#include "acppnode/common/ip_utils.hpp"
+#include "transport/internet/proxy_protocol.hpp"
+#include "common/ip_address.hpp"
+#include "infra/log.hpp"
+#include "common/ip_utils.hpp"
 
 #include <algorithm>
 #include <array>
@@ -11,7 +11,6 @@
 #include <optional>
 #include <string_view>
 
-namespace acpp {
 
 namespace {
 
@@ -351,4 +350,3 @@ size_t EncodeProxyProtocolHeader(
     return 0;
 }
 
-}  // namespace acpp

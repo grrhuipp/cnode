@@ -1,11 +1,11 @@
 #include "trojan_codec.hpp"
-#include "acppnode/common/binary_text_codec.hpp"
-#include "acppnode/common/address_codec.hpp"
-#include "acppnode/common/byte_reader.hpp"
+#include "common/binary_text_codec.hpp"
+#include "common/address_codec.hpp"
+#include "common/byte_reader.hpp"
 
 #include <cstring>
 
-namespace acpp::trojan {
+namespace trojan {
 
 // ============================================================================
 // TCP 请求编解码
@@ -34,7 +34,7 @@ RequestDecodeResult DecodeRequest(std::span<const uint8_t> data) {
 
     auto address = DecodeAddress(
         data.subspan(kRequestPrefixSize), AddressWireFormat::Socks5,
-        {.max_domain_len = 253, .require_non_empty_domain = true, .allow_metadata = true});
+        {.require_non_empty_domain = true, .allow_metadata = true});
     if (address.status == AddressDecodeStatus::Invalid) {
         result.status = RequestDecodeStatus::InvalidAddress;
         return result;
@@ -148,4 +148,4 @@ size_t EncodeUdpPacketHeaderTo(
 }
 
 
-}  // namespace acpp::trojan
+}  // namespace trojan

@@ -1,10 +1,10 @@
-#include "acppnode/transport/internet/transport_dialer.hpp"
-#include "acppnode/common/buffer_util.hpp"
-#include "acppnode/transport/internet/async_write_gate.hpp"
-#include "acppnode/common/session.hpp"
-#include "acppnode/transport/internet/tcp_stream.hpp"
-#include "acppnode/transport/internet/transport_stack.hpp"
-#include "acppnode/infra/log.hpp"
+#include "transport/internet/transport_dialer.hpp"
+#include "common/buffer_util.hpp"
+#include "transport/internet/async_write_gate.hpp"
+#include "common/session.hpp"
+#include "transport/internet/tcp_stream.hpp"
+#include "transport/internet/transport_stack.hpp"
+#include "infra/log.hpp"
 
 #include <array>
 #include <charconv>
@@ -16,7 +16,6 @@
 #include <utility>
 #include <vector>
 
-namespace acpp {
 
 namespace {
 
@@ -1091,4 +1090,3 @@ net::awaitable<DialResult> DialOutboundTransport(
     co_return result;
 }
 
-}  // namespace acpp

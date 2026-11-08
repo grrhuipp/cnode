@@ -1,11 +1,11 @@
-#include "acppnode/transport/internet/tls_stream.hpp"
-#include "acppnode/common/domain_name.hpp"
-#include "acppnode/common/ip_address.hpp"
+#include "transport/internet/tls_stream.hpp"
+#include "common/domain_name.hpp"
+#include "common/ip_address.hpp"
 
 #include "tls_client_context.hpp"
 
-#include "acppnode/common/asio_types.hpp"
-#include "acppnode/infra/log.hpp"
+#include "common/asio_types.hpp"
+#include "infra/log.hpp"
 
 #include <openssl/bio.h>
 #include <openssl/err.h>
@@ -18,7 +18,6 @@
 #include <memory>
 #include <string>
 
-namespace acpp {
 
 namespace {
 
@@ -294,4 +293,3 @@ SslContext::SslContext(SSL_CTX* ctx, std::unique_ptr<ContextState> context_state
 
 SslContext::~SslContext() = default;
 
-}  // namespace acpp

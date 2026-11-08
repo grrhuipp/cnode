@@ -1,8 +1,8 @@
 #include "ss_outbound.hpp"
-#include "acppnode/common/domain_name.hpp"
-#include "acppnode/common/ip_address.hpp"
-#include "acppnode/common/ip_utils.hpp"
-#include "acppnode/core/naming.hpp"
+#include "common/domain_name.hpp"
+#include "common/ip_address.hpp"
+#include "common/ip_utils.hpp"
+#include "core/naming.hpp"
 #include "ss_outbound_uot.hpp"
 #include "udp_request.hpp"
 #include "../client.hpp"
@@ -10,22 +10,21 @@
 #include "../../handshake_timeout.hpp"
 #include "../../outbound_server.hpp"
 #include "../../outbound_stream_endpoint.hpp"
-#include "acppnode/app/relay.hpp"
-#include "acppnode/app/proxyman/outbound/factory.hpp"
+#include "app/relay.hpp"
+#include "app/proxyman/outbound/factory.hpp"
 #include "../../../app/proxyman/outbound/registration.hpp"
-#include "acppnode/infra/json_field.hpp"
-#include "acppnode/app/dns/dns.hpp"
-#include "acppnode/infra/log.hpp"
-#include "acppnode/infra/config_types.hpp"
-#include "acppnode/transport/link.hpp"
-#include "acppnode/transport/internet/outbound_target_builder.hpp"
+#include "infra/json_field.hpp"
+#include "app/dns/dns.hpp"
+#include "infra/log.hpp"
+#include "infra/config_types.hpp"
+#include "transport/link.hpp"
+#include "transport/internet/outbound_target_builder.hpp"
 
 #include <openssl/crypto.h>
 #include <memory>
 #include <span>
 #include <utility>
 
-namespace acpp {
 
 namespace {
 
@@ -297,37 +296,36 @@ proxy::shadowsocks::outbound::Handler::Handler(
     std::shared_ptr<const PreparedSettings> prepared)
     : prepared_(std::move(prepared)) {}
 
-}  // namespace acpp
 
 // ============================================================================
 // 自注册（静态初始化）
 // ============================================================================
 namespace {
-const bool kSsOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
-    acpp::constants::protocol::kShadowsocks,
-    [](const acpp::infra::OutboundSourceConfig& cfg)
-        -> std::optional<acpp::proxyman::outbound::PreparedOutboundProxy> {
+const bool kSsOutboundRegistered = (::proxyman::outbound::RegisterProxy(
+    ::constants::protocol::kShadowsocks,
+    [](const ::infra::OutboundSourceConfig& cfg)
+        -> std::optional<::proxyman::outbound::PreparedOutboundProxy> {
         std::string password;
-        std::string method(acpp::constants::protocol::kAes256Gcm);
+        std::string method(::constants::protocol::kAes256Gcm);
         std::string address;
         uint16_t port = 8388;
-        std::optional<acpp::SsUotVersion> uot_version;
+        std::optional<::SsUotVersion> uot_version;
         // A present field of the wrong type is a configuration error, never
         // an implicit default.
-        auto read_ss_server = [&](const acpp::json::object& obj) {
+        auto read_ss_server = [&](const ::json::object& obj) {
             const auto fail = [&](std::string_view error) {
                 LOG_ERROR("Shadowsocks outbound '{}': {}", cfg.tag, error);
                 return false;
             };
-            auto source_address = acpp::ParseJsonString(obj, "address");
+            auto source_address = ::ParseJsonString(obj, "address");
             if (!source_address) return fail(source_address.error());
-            const auto source_port = acpp::ReadJsonPort(obj, "port");
+            const auto source_port = ::ReadJsonPort(obj, "port");
             if (source_port.Invalid()) return fail("invalid port");
-            auto source_password = acpp::ParseJsonString(obj, "password");
+            auto source_password = ::ParseJsonString(obj, "password");
             if (!source_password) return fail(source_password.error());
-            auto source_key = acpp::ParseJsonString(obj, "key");
+            auto source_key = ::ParseJsonString(obj, "key");
             if (!source_key) return fail(source_key.error());
-            auto source_method = acpp::ParseJsonString(obj, "method");
+            auto source_method = ::ParseJsonString(obj, "method");
             if (!source_method) return fail(source_method.error());
             if (*source_method && (*source_method)->empty()) return fail("method must not be empty");
 
@@ -340,9 +338,9 @@ const bool kSsOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 password = std::move(*source_key).value_or(std::string{});
             }
             if (*source_method) {
-                method = acpp::naming::LowerAscii(std::move(**source_method));
+                method = ::naming::LowerAscii(std::move(**source_method));
             }
-            auto parsed_uot = acpp::proxy::shadowsocks::outbound::ParseUotVersion(obj);
+            auto parsed_uot = ::proxy::shadowsocks::outbound::ParseUotVersion(obj);
             if (!parsed_uot) {
                 LOG_ERROR("Shadowsocks outbound '{}': invalid UoT settings: {}",
                           cfg.tag, parsed_uot.error());
@@ -365,29 +363,29 @@ const bool kSsOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
         } else if (!read_ss_server(cfg.settings)) {
             return std::nullopt;
         }
-        auto next_hop = acpp::proxy::PrepareNextHop(
-            cfg, std::move(address), port, acpp::OutboundStreamDefaults{});
+        auto next_hop = ::proxy::PrepareNextHop(
+            cfg, std::move(address), port, ::OutboundStreamDefaults{});
         if (!next_hop) {
             return std::nullopt;
         }
-        auto credentials = acpp::proxy::shadowsocks::outbound::Credentials::Prepare(
+        auto credentials = ::proxy::shadowsocks::outbound::Credentials::Prepare(
             method, password);
         if (!credentials) {
             LOG_ERROR("Shadowsocks outbound '{}': invalid cipher, password or identity chain", cfg.tag);
             return std::nullopt;
         }
-        using PreparedSettings = acpp::proxy::shadowsocks::outbound::PreparedSettings;
-        return acpp::proxyman::outbound::PreparedOutboundProxy{
-            .create = acpp::proxyman::outbound::MakePreparedOutboundCreator<
+        using PreparedSettings = ::proxy::shadowsocks::outbound::PreparedSettings;
+        return ::proxyman::outbound::PreparedOutboundProxy{
+            .create = ::proxyman::outbound::MakePreparedOutboundCreator<
                 PreparedSettings,
                 +[](std::string_view,
                     std::shared_ptr<const PreparedSettings> state,
-                    acpp::net::io_context& /*io_context*/,
-                    acpp::AwaitableTaskGroup& /*tasks*/) -> std::unique_ptr<acpp::Outbound> {
-                    return std::make_unique<acpp::proxy::shadowsocks::outbound::Handler>(
+                    ::net::io_context& /*io_context*/,
+                    ::AwaitableTaskGroup& /*tasks*/) -> std::unique_ptr<::Outbound> {
+                    return std::make_unique<::proxy::shadowsocks::outbound::Handler>(
                         std::move(state));
                 }>(PreparedSettings{
-                    acpp::SsOutboundConfig{
+                    ::SsOutboundConfig{
                         .server = std::move(next_hop->server),
                         .uot_version = uot_version,
                     },

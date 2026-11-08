@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "acppnode/transport/internet/tls_stream.hpp"
+#include "transport/internet/tls_stream.hpp"
 #include "autosign_cert.hpp"
 #include "tls_client_context.hpp"
 
@@ -114,20 +114,20 @@ bool ReplaceCommonName(X509* certificate,
 }  // namespace
 
 TEST(TlsClientCertificate, Contract) {
-    auto material = acpp::transport::internet::AutoSignCertificate::Create("client.example");
+    auto material = ::transport::internet::AutoSignCertificate::Create("client.example");
     CertificateFiles files;
     ASSERT_FALSE((!Require(material != nullptr,
                  "client certificate material must be generated") ||
         !Require(WriteCertificateFiles(files, material->Certificate(), material->Key()),
                  "client certificate files must be written")));
 
-    acpp::TlsConfig config;
+    ::TlsConfig config;
     config.cert_file = files.cert.string();
     config.key_file = files.key.string();
     config.allow_insecure = true;
-    acpp::LoadTlsPemMaterial(config);
+    ::LoadTlsPemMaterial(config);
 
-    auto context = acpp::SslContext::CreateClient(config);
+    auto context = ::SslContext::CreateClient(config);
     ASSERT_FALSE((!Require(context != nullptr, "client context must be created")));
     ASSERT_FALSE((!Require(SSL_CTX_get0_certificate(context->Native()) != nullptr,
                  "client context must expose the configured certificate")));
@@ -136,10 +136,10 @@ TEST(TlsClientCertificate, Contract) {
     ASSERT_FALSE((!Require(SSL_CTX_check_private_key(context->Native()) == 1,
                  "client certificate and private key must match")));
 
-    acpp::TlsConfig private_ca_config;
+    ::TlsConfig private_ca_config;
     private_ca_config.ca_file = files.cert.string();
-    acpp::LoadTlsPemMaterial(private_ca_config);
-    auto private_ca_context = acpp::SslContext::CreateClient(private_ca_config);
+    ::LoadTlsPemMaterial(private_ca_config);
+    auto private_ca_context = ::SslContext::CreateClient(private_ca_config);
     ASSERT_FALSE((!Require(private_ca_context != nullptr,
                  "client context with private CA must be created")));
     ASSERT_FALSE((!Require(VerifyCertificateWithContextStore(
@@ -148,31 +148,31 @@ TEST(TlsClientCertificate, Contract) {
 
     // Like SSL_CTX_use_certificate_chain_file, only a clean end of input may
     // follow the leaf: a malformed later block fails the whole chain.
-    auto malformed_chain = std::make_shared<acpp::TlsPemMaterial>();
+    auto malformed_chain = std::make_shared<::TlsPemMaterial>();
     malformed_chain->certificate_chain = config.pem->certificate_chain +
         "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
     malformed_chain->private_key = config.pem->private_key;
-    acpp::TlsConfig malformed_chain_config = config;
+    ::TlsConfig malformed_chain_config = config;
     malformed_chain_config.pem = std::move(malformed_chain);
-    ASSERT_FALSE((!Require(acpp::SslContext::CreateClient(malformed_chain_config) == nullptr,
+    ASSERT_FALSE((!Require(::SslContext::CreateClient(malformed_chain_config) == nullptr,
                  "a malformed PEM block after the leaf certificate must be rejected")));
 
-    acpp::TlsConfig unreadable_config;
+    ::TlsConfig unreadable_config;
     unreadable_config.ca_file = files.cert.string() + ".missing";
     bool unreadable_rejected = false;
     try {
-        acpp::LoadTlsPemMaterial(unreadable_config);
+        ::LoadTlsPemMaterial(unreadable_config);
     } catch (const std::invalid_argument&) {
         unreadable_rejected = true;
     }
     ASSERT_FALSE((!Require(unreadable_rejected && !unreadable_config.pem,
                  "an unreadable TLS file must be rejected while loading configuration")));
 
-    acpp::TlsConfig tls13_config;
+    ::TlsConfig tls13_config;
     tls13_config.allow_insecure = true;
-    tls13_config.min_version = acpp::TlsVersion::V1_3;
-    tls13_config.max_version = acpp::TlsVersion::V1_3;
-    auto tls13_context = acpp::SslContext::CreateClient(tls13_config);
+    tls13_config.min_version = ::TlsVersion::V1_3;
+    tls13_config.max_version = ::TlsVersion::V1_3;
+    auto tls13_context = ::SslContext::CreateClient(tls13_config);
     ASSERT_FALSE((!Require(tls13_context != nullptr,
                  "TLS 1.3-only client context must be created")));
     ASSERT_FALSE((!Require(
@@ -186,19 +186,19 @@ TEST(TlsClientCertificate, Contract) {
     for (const auto identity : {"127.0.0.1:9"sv, "[::1]"sv, "bad..example"sv,
                                "fe80::1%invalid"sv, "127.0.0.1\0ignored"sv}) {
         SSL* client = SSL_new(context->Native());
-        const bool rejected = client && !acpp::ConfigureTlsServerIdentity(client, identity);
+        const bool rejected = client && !::ConfigureTlsServerIdentity(client, identity);
         SSL_free(client);
         ASSERT_FALSE((!Require(rejected, "invalid TLS identity must be rejected before SNI or SAN setup")));
     }
     for (const auto identity : {"2001:db8::1", "fe80::1%3", "::ffff:192.0.2.1"}) {
         SSL* client = SSL_new(context->Native());
-        const bool configured = client && acpp::ConfigureTlsServerIdentity(client, identity) &&
+        const bool configured = client && ::ConfigureTlsServerIdentity(client, identity) &&
             SSL_get_servername(client, TLSEXT_NAMETYPE_host_name) == nullptr;
         SSL_free(client);
         ASSERT_FALSE((!Require(configured, "IPv6 TLS identity must use IP SAN bytes without SNI")));
     }
 
-    auto ip_material = acpp::transport::internet::AutoSignCertificate::Create("192.0.2.1");
+    auto ip_material = ::transport::internet::AutoSignCertificate::Create("192.0.2.1");
     SSL* ip_client = SSL_new(context->Native());
     if (!Require(ip_material != nullptr &&
                      ip_client != nullptr,
@@ -212,7 +212,7 @@ TEST(TlsClientCertificate, Contract) {
         SSL_free(ip_client);
         FAIL() << "IP identity certificate common name must be replaced";
     }
-    if (!Require(acpp::ConfigureTlsServerIdentity(ip_client, "192.0.2.1"),
+    if (!Require(::ConfigureTlsServerIdentity(ip_client, "192.0.2.1"),
                  "IP server identity must be configured")) {
         SSL_free(ip_client);
         FAIL() << "IP server identity must be configured";
@@ -231,7 +231,7 @@ TEST(TlsClientCertificate, Contract) {
 
     SSL* wrong_ip_client = SSL_new(context->Native());
     if (!Require(wrong_ip_client != nullptr &&
-                     acpp::ConfigureTlsServerIdentity(
+                     ::ConfigureTlsServerIdentity(
                          wrong_ip_client, "192.0.2.2"),
                  "wrong IP identity must be configured for rejection test")) {
         if (wrong_ip_client) SSL_free(wrong_ip_client);
@@ -245,7 +245,7 @@ TEST(TlsClientCertificate, Contract) {
 
     SSL* dns_client = SSL_new(context->Native());
     if (!Require(dns_client != nullptr &&
-                     acpp::ConfigureTlsServerIdentity(
+                     ::ConfigureTlsServerIdentity(
                          dns_client, "client.example"),
                  "DNS server identity must be configured")) {
         if (dns_client) SSL_free(dns_client);
@@ -267,7 +267,7 @@ TEST(TlsClientCertificate, Contract) {
     // FQDN with trailing root dot must strip the dot for SNI (RFC 6066) and X.509 SAN host verification.
     SSL* fqdn_client = SSL_new(context->Native());
     if (!Require(fqdn_client != nullptr &&
-                     acpp::ConfigureTlsServerIdentity(fqdn_client, "client.example."),
+                     ::ConfigureTlsServerIdentity(fqdn_client, "client.example."),
                  "FQDN server identity with trailing dot must be configured")) {
         if (fqdn_client) SSL_free(fqdn_client);
         FAIL() << "FQDN server identity with trailing dot must be configured";
@@ -288,16 +288,16 @@ TEST(TlsClientCertificate, Contract) {
     const std::vector<std::string> valid_alpn = {"h2", "http/1.1"};
     const std::vector<unsigned char> expected_alpn_wire = {
         2, 'h', '2', 8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
-    ASSERT_FALSE((!Require(acpp::EncodeTlsAlpnProtocols(valid_alpn, alpn_wire) &&
+    ASSERT_FALSE((!Require(::EncodeTlsAlpnProtocols(valid_alpn, alpn_wire) &&
                      alpn_wire == expected_alpn_wire,
                  "valid ALPN protocols must have canonical wire encoding")));
     const std::vector<std::string> empty_alpn = {""};
-    ASSERT_FALSE((!Require(!acpp::EncodeTlsAlpnProtocols(empty_alpn, alpn_wire),
+    ASSERT_FALSE((!Require(!::EncodeTlsAlpnProtocols(empty_alpn, alpn_wire),
                  "empty ALPN protocol must be rejected")));
     const std::vector<std::string> overlong_alpn = {std::string(256, 'a')};
-    ASSERT_FALSE((!Require(!acpp::EncodeTlsAlpnProtocols(overlong_alpn, alpn_wire),
+    ASSERT_FALSE((!Require(!::EncodeTlsAlpnProtocols(overlong_alpn, alpn_wire),
                  "overlong ALPN protocol must be rejected")));
     const std::vector<std::string> duplicate_alpn = {"h2", "h2"};
-    ASSERT_FALSE((!Require(!acpp::EncodeTlsAlpnProtocols(duplicate_alpn, alpn_wire),
+    ASSERT_FALSE((!Require(!::EncodeTlsAlpnProtocols(duplicate_alpn, alpn_wire),
                  "duplicate ALPN protocol must be rejected")));
 }

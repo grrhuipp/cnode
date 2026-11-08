@@ -1,8 +1,8 @@
 #pragma once
 
-#include "acppnode/infra/config_types.hpp"
-#include "acppnode/infra/outbound_source_config.hpp"
-#include "acppnode/infra/runtime_config_types.hpp"
+#include "infra/config_types.hpp"
+#include "infra/outbound_source_config.hpp"
+#include "infra/runtime_config_types.hpp"
 
 #include <cstddef>
 #include <span>
@@ -10,7 +10,6 @@
 #include <string_view>
 #include <vector>
 
-namespace acpp {
 
 enum class ConfigSemanticError {
     None,
@@ -64,4 +63,3 @@ struct StaticInboundSemanticValidation {
 [[nodiscard]] StaticInboundSemanticValidation ValidateStaticInboundSemantics(
     std::span<const StaticInboundConfig> inbounds);
 
-}  // namespace acpp

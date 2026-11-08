@@ -1,12 +1,12 @@
 #pragma once
 
-#include "acppnode/common/asio_types.hpp"
-#include "acppnode/common/buf/multi_buffer.hpp"
-#include "acppnode/common/error.hpp"
-#include "acppnode/common/target_address.hpp"
-#include "acppnode/common/address_codec.hpp"
-#include "acppnode/transport/async_stream.hpp"
-#include "acppnode/transport/link.hpp"
+#include "common/asio_types.hpp"
+#include "common/buf/multi_buffer.hpp"
+#include "common/error.hpp"
+#include "common/target_address.hpp"
+#include "common/address_codec.hpp"
+#include "transport/async_stream.hpp"
+#include "transport/link.hpp"
 
 #include <array>
 #include <chrono>
@@ -17,7 +17,7 @@
 #include <span>
 #include <string_view>
 
-namespace acpp::proxy::uot {
+namespace proxy::uot {
 
 inline constexpr std::string_view kMagicAddress = "sp.v2.udp-over-tcp.arpa";
 inline constexpr std::string_view kV1MagicAddress = "sp.udp-over-tcp.arpa";
@@ -92,6 +92,7 @@ public:
 private:
     transport::MultiBufferReader& reader_;
     bool is_connect_ = false;
+    // 非 connect 仅使用帧内地址，请求目标已由会话上下文拥有。
     TargetAddress destination_;
     buf::MultiBuffer pending_;
     buf::MultiBuffer initial_decoded_;
@@ -129,7 +130,7 @@ public:
                    TargetAddress destination,
                    buf::MultiBuffer pending = {})
         : underlying_(underlying)
-        , reader_(underlying, is_connect, destination, std::move(pending))
+        , reader_(underlying, is_connect, is_connect ? destination : TargetAddress{}, std::move(pending))
         , writer_(underlying, is_connect, std::move(destination)) {}
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
@@ -245,4 +246,4 @@ private:
     PacketWriter writer_;
 };
 
-}  // namespace acpp::proxy::uot
+}  // namespace proxy::uot

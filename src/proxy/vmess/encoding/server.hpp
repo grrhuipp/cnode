@@ -2,14 +2,14 @@
 
 #include "../validator.hpp"
 #include "../vmess_request.hpp"
-#include "acppnode/transport/async_stream.hpp"
-#include "acppnode/transport/link.hpp"
+#include "transport/async_stream.hpp"
+#include "transport/link.hpp"
 
 #include <memory>
 #include <optional>
 #include <string_view>
 
-namespace acpp::vmess::encoding {
+namespace vmess::encoding {
 
 class ServerSession final {
 public:
@@ -57,4 +57,4 @@ private:
     std::string_view header_failure_reason_;
 };
 
-}  // namespace acpp::vmess::encoding
+}  // namespace vmess::encoding

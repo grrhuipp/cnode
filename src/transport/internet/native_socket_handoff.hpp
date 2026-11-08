@@ -1,7 +1,7 @@
 #pragma once
 
-#include "acppnode/app/session_group_executor.hpp"
-#include "acppnode/common/allocator.hpp"
+#include "app/session_group_executor.hpp"
+#include "common/allocator.hpp"
 
 #include <asio/as_tuple.hpp>
 #include <asio/associated_executor.hpp>
@@ -18,7 +18,7 @@
 #include <optional>
 #include <unistd.h>
 
-namespace acpp::transport::internet::detail {
+namespace transport::internet::detail {
 
 inline net::io_context& CurrentSocketReactor(net::io_context& fallback) noexcept {
     const auto domain = ExecutionDomain::Current();
@@ -211,4 +211,4 @@ private:
     uint64_t cancellation_epoch_ = 0;
 };
 
-}  // namespace acpp::transport::internet::detail
+}  // namespace transport::internet::detail

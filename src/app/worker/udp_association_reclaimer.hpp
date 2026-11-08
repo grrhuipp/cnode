@@ -1,14 +1,14 @@
 #pragma once
 
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/transport/internet/timeout_scheduler.hpp"
+#include "common/allocator.hpp"
+#include "transport/internet/timeout_scheduler.hpp"
 
 #include <chrono>
 #include <cstddef>
 #include <exception>
 #include <string_view>
 
-namespace acpp::worker_detail {
+namespace worker_detail {
 
 class UdpIngress;
 struct ClientSessionKey;
@@ -76,4 +76,4 @@ private:
     bool running_batch_ = false;
 };
 
-} // namespace acpp::worker_detail
+} // namespace worker_detail

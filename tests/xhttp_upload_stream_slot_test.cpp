@@ -23,7 +23,7 @@ private:
 }  // namespace
 
 TEST(XhttpUploadStreamSlot, Contract) {
-    acpp::detail::BasicXHttpUploadStreamSlot<TestStream> slot;
+    ::detail::BasicXHttpUploadStreamSlot<TestStream> slot;
     size_t first_destructions = 0;
     size_t rejected_destructions = 0;
     ASSERT_FALSE((!slot.Attach(std::make_unique<TestStream>(first_destructions))));

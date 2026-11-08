@@ -3,15 +3,15 @@
 #include "hysteria_protocol.hpp"
 #include "quic_connection.hpp"
 
-#include "acppnode/common/buf/multi_buffer.hpp"
-#include "acppnode/transport/link_error.hpp"
+#include "common/buf/multi_buffer.hpp"
+#include "transport/link_error.hpp"
 
 #include <asio/as_tuple.hpp>
 #include <asio/use_awaitable.hpp>
 
 #include <cstring>
 
-namespace acpp::transport::internet::hysteria {
+namespace transport::internet::hysteria {
 
 QuicStreamState::QuicStreamState(
     net::io_context& io_context, int64_t stream_id,
@@ -43,30 +43,45 @@ void QuicStreamState::AcknowledgeInput(size_t bytes) noexcept {
 }
 
 void QuicStreamState::OnStreamClosed() noexcept {
-    owner_.reset();
+    auto owner = std::exchange(owner_, {}).lock();
+    const auto stream_id = stream_id_;
+    const size_t unread = input_.byte_size();
     input_done_ = true;
     write_done_ = true;
     WakeReader();
+    // The buffered tail may still be drained, but must not retain connection
+    // credit or acknowledge it twice after the transport stream is gone.
+    if (owner && unread != 0) owner->ConsumeStream(stream_id, unread);
 }
 
 void QuicStreamState::RemoteReset() noexcept {
-    owner_.reset();
+    auto owner = std::exchange(owner_, {}).lock();
+    const auto stream_id = stream_id_;
+    const size_t unread = input_.byte_size();
     cancelled_ = true;
     input_done_ = true;
     write_done_ = true;
     input_.clear();
     WakeReader();
+    cancellation_.Stop();
+    if (owner && unread != 0) owner->ConsumeStream(stream_id, unread);
 }
 
 void QuicStreamState::Cancel() noexcept {
     if (cancelled_) return;
+    auto owner = std::exchange(owner_, {}).lock();
+    const auto stream_id = stream_id_;
+    const size_t unread = input_.byte_size();
     cancelled_ = true;
     input_done_ = true;
     write_done_ = true;
     input_.clear();
     WakeReader();
-    if (auto owner = std::exchange(owner_, {}).lock())
-        owner->CancelStream(stream_id_);
+    cancellation_.Stop();
+    if (owner) {
+        owner->CancelStream(stream_id);
+        if (unread != 0) owner->ConsumeStream(stream_id, unread);
+    }
 }
 
 net::awaitable<size_t> QuicStreamState::Read(net::mutable_buffer buffer) {
@@ -142,17 +157,16 @@ QuicStream::QuicStream(std::shared_ptr<QuicStreamState> state)
     , deadline_(state_->IoContext(), *this) {}
 
 QuicStream::~QuicStream() noexcept {
-    deadline_.Clear();
-    if (state_) state_->Cancel();
+    Close();
 }
 
 net::awaitable<size_t> QuicStream::AsyncRead(net::mutable_buffer buffer) {
-    if (!state_) co_return 0;
+    if (closed_) co_return 0;
     co_return co_await state_->Read(buffer);
 }
 
 net::awaitable<size_t> QuicStream::AsyncWrite(net::const_buffer buffer) {
-    if (!state_) throw transport::LinkError(ErrorCode::CONNECTION_CLOSED);
+    if (closed_) throw transport::LinkError(ErrorCode::CONNECTION_CLOSED);
     buf::MultiBuffer payload;
     const auto bytes = std::span(
         static_cast<const uint8_t*>(buffer.data()), buffer.size());
@@ -162,12 +176,12 @@ net::awaitable<size_t> QuicStream::AsyncWrite(net::const_buffer buffer) {
 }
 
 net::awaitable<buf::MultiBuffer> QuicStream::ReadMultiBuffer() {
-    if (!state_) co_return buf::MultiBuffer{};
+    if (closed_) co_return buf::MultiBuffer{};
     co_return co_await state_->ReadMultiBuffer();
 }
 
 net::awaitable<void> QuicStream::WriteMultiBuffer(buf::MultiBuffer payload) {
-    if (!state_) {
+    if (closed_) {
         payload.clear();
         throw transport::LinkError(ErrorCode::CONNECTION_CLOSED);
     }
@@ -186,23 +200,21 @@ net::awaitable<void> QuicStream::WriteBuffers(
 }
 
 void QuicStream::ShutdownWrite() {
-    if (state_) state_->ShutdownWrite();
+    if (!closed_) state_->ShutdownWrite();
 }
 
 void QuicStream::Cancel() noexcept {
-    if (state_) state_->Cancel();
-    NotifyCancellation();
+    if (!closed_) state_->Cancel();
 }
 
 void QuicStream::Close() {
     deadline_.Clear();
-    Cancel();
-    state_.reset();
-    NotifyClosed();
+    if (std::exchange(closed_, true)) return;
+    state_->Cancel();
 }
 
 bool QuicStream::IsOpen() const {
-    return state_ && state_->Open();
+    return !closed_ && state_->Open();
 }
 
 UdpSessionStream::UdpSessionStream(
@@ -221,13 +233,18 @@ UdpSessionStream::~UdpSessionStream() noexcept {
 
 bool UdpSessionStream::Push(
     const TargetAddress& target, std::span<const uint8_t> payload) {
-    if (closed_ || cancelled_ || payload.empty() ||
-        queued_bytes_ > kMaxQueuedBytes - payload.size()) return false;
+    if (closed_ || cancelled_) return false;
+    // Datagrams cannot share a block. Count rounded capacity before allocating,
+    // without subtracting an externally sized payload from the byte budget.
+    const size_t buffer_count = payload.empty()
+        ? 1 : 1 + (payload.size() - 1) / buf::Buffer::kSize;
+    if (buffer_count > kMaxQueuedBytes / buf::Buffer::kSize - queued_buffer_count_)
+        return false;
     buf::MultiBuffer packet;
-    if (!buf::AppendSpanToMultiBuffer(payload, packet)) return false;
-    for (auto* buffer : packet) buffer->SetUDP(target);
+    if (!buf::AppendSpanToMultiBuffer(payload, packet) ||
+        !buf::SetUdpTarget(packet, target)) return false;
     input_.push_back(std::move(packet));
-    queued_bytes_ += payload.size();
+    queued_buffer_count_ += buffer_count;
     WakeReader();
     return true;
 }
@@ -237,7 +254,7 @@ void UdpSessionStream::Detach() noexcept {
     if (closed_) return;
     closed_ = true;
     input_.clear();
-    queued_bytes_ = 0;
+    queued_buffer_count_ = 0;
     WakeReader();
     NotifyClosed();
 }
@@ -256,7 +273,7 @@ net::awaitable<buf::MultiBuffer> UdpSessionStream::ReadMultiBuffer() {
         if (!input_.empty()) {
             auto packet = std::move(input_.front());
             input_.pop_front();
-            queued_bytes_ -= std::min(queued_bytes_, packet.byte_size());
+            queued_buffer_count_ -= packet.size();
             co_return packet;
         }
         if (closed_) co_return buf::MultiBuffer{};
@@ -301,6 +318,10 @@ net::awaitable<void> UdpSessionStream::WriteMultiBuffer(buf::MultiBuffer packet)
 
 void UdpSessionStream::Cancel() noexcept {
     cancelled_ = true;
+    // No later read can consume this input; release it before callbacks can
+    // retain or destroy the cancelled host.
+    input_.clear();
+    queued_buffer_count_ = 0;
     WakeReader();
     NotifyCancellation();
 }
@@ -310,7 +331,7 @@ void UdpSessionStream::Close() {
     if (closed_) return;
     closed_ = true;
     input_.clear();
-    queued_bytes_ = 0;
+    queued_buffer_count_ = 0;
     WakeReader();
     if (auto owner = std::exchange(owner_, {}).lock())
         owner->CloseUdpSession(session_id_);
@@ -321,4 +342,4 @@ void UdpSessionStream::WakeReader() noexcept {
     (void)signal_.try_send(IoErrorCode{});
 }
 
-}  // namespace acpp::transport::internet::hysteria
+}  // namespace transport::internet::hysteria

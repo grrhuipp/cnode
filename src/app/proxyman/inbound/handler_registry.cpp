@@ -1,12 +1,12 @@
-#include "acppnode/app/proxyman/inbound/handler_registry.hpp"
+#include "app/proxyman/inbound/handler_registry.hpp"
 
-#include "acppnode/app/proxyman/inbound/factory.hpp"
-#include "acppnode/app/proxyman/inbound/handler.hpp"
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/online_device.hpp"
-#include "acppnode/common/string_hash.hpp"
+#include "app/proxyman/inbound/factory.hpp"
+#include "app/proxyman/inbound/handler.hpp"
+#include "common/allocator.hpp"
+#include "common/online_device.hpp"
+#include "common/string_hash.hpp"
 
-namespace acpp::proxyman::inbound {
+namespace proxyman::inbound {
 
 struct HandlerRegistry::Impl : memory::ThreadAllocated {
     using HandlerMap = memory::ThreadLocalUnorderedMap<
@@ -55,25 +55,25 @@ HandlerRegistry::GetHandler(std::string_view tag) const noexcept {
     return it == impl_->handlers.end() ? nullptr : it->second;
 }
 
-std::unique_ptr<::acpp::Inbound> HandlerRegistry::NewHandler(
-    ::acpp::ConnectionLimiter* limiter,
+std::unique_ptr<::Inbound> HandlerRegistry::NewHandler(
+    ::ConnectionLimiter* limiter,
     const BuildRequest& req) {
     auto* runtime = impl_->EnsureRuntime(req.protocol);
     if (!runtime) {
         return nullptr;
     }
-    return ::acpp::proxyman::inbound::NewHandler(
+    return ::proxyman::inbound::NewHandler(
         req.protocol, *runtime, impl_->stats, std::move(limiter), req);
 }
 
 DatagramHandlerBuildResult HandlerRegistry::NewDatagramHandler(
-    ::acpp::ConnectionLimiter* limiter,
+    ::ConnectionLimiter* limiter,
     const BuildRequest& req) {
     auto* runtime = impl_->EnsureRuntime(req.protocol);
     if (!runtime) {
         return {DatagramHandlerBuildStatus::Failed, nullptr};
     }
-    return ::acpp::proxyman::inbound::NewDatagramHandler(
+    return ::proxyman::inbound::NewDatagramHandler(
         req.protocol, *runtime, impl_->stats, std::move(limiter), req);
 }
 
@@ -111,7 +111,7 @@ void HandlerRegistry::RemoveHandler(std::string_view tag) {
     impl_->handlers.erase(it);
 }
 
-std::vector<::acpp::OnlineDevice>
+std::vector<::OnlineDevice>
 HandlerRegistry::GetOnlineDevices(std::string_view protocol, std::string_view tag) const {
     if (auto it = impl_->runtimes.find(protocol); it != impl_->runtimes.end()) {
         return it->second->GetOnlineDevices(tag);
@@ -119,4 +119,4 @@ HandlerRegistry::GetOnlineDevices(std::string_view protocol, std::string_view ta
     return {};
 }
 
-}  // namespace acpp::proxyman::inbound
+}  // namespace proxyman::inbound

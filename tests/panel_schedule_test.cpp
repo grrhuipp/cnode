@@ -5,7 +5,7 @@
 #include <chrono>
 
 TEST(PanelSchedule, Contract) {
-    using acpp::controller::PanelInterval;
+    using ::controller::PanelInterval;
     using namespace std::chrono_literals;
 
     ASSERT_FALSE((PanelInterval(45, 60) != 45s));

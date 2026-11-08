@@ -2,17 +2,17 @@
 
 #include "handshake_timeout.hpp"
 
-#include "acppnode/app/proxyman/inbound/factory.hpp"
-#include "acppnode/app/rate_limiter.hpp"
-#include "acppnode/app/relay_types.hpp"
-#include "acppnode/app/stats.hpp"
-#include "acppnode/common/asio_types.hpp"
-#include "acppnode/common/session.hpp"
-#include "acppnode/common/sharded_user_stats.hpp"
-#include "acppnode/common/target_address.hpp"
-#include "acppnode/common/user_profile.hpp"
-#include "acppnode/infra/log.hpp"
-#include "acppnode/transport/async_stream.hpp"
+#include "app/proxyman/inbound/factory.hpp"
+#include "app/rate_limiter.hpp"
+#include "app/relay_types.hpp"
+#include "app/stats.hpp"
+#include "common/asio_types.hpp"
+#include "common/session.hpp"
+#include "common/sharded_user_stats.hpp"
+#include "common/target_address.hpp"
+#include "common/user_profile.hpp"
+#include "infra/log.hpp"
+#include "transport/async_stream.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -21,7 +21,7 @@
 #include <vector>
 #include <utility>
 
-namespace acpp::proxy {
+namespace proxy {
 
 [[nodiscard]] inline net::awaitable<bool> CheckInboundIpBanned(
     ConnectionLimiter* limiter,
@@ -280,16 +280,16 @@ inline net::awaitable<void> RecordInboundAuthFailure(
     return result;
 }
 
-template <typename Tracker = ::acpp::UserOnlineTracker>
-class InboundTrackerRuntime final : public ::acpp::proxyman::inbound::ProtocolRuntime {
+template <typename Tracker = ::UserOnlineTracker>
+class InboundTrackerRuntime final : public ::proxyman::inbound::ProtocolRuntime {
 public:
-    [[nodiscard]] std::vector<::acpp::OnlineDevice>
+    [[nodiscard]] std::vector<::OnlineDevice>
     GetOnlineDevices(std::string_view tag) const override {
         return validator.GetOnlineDevices(tag);
     }
 
     Tracker validator;
 };
-using UserOnlineProtocolRuntime = InboundTrackerRuntime<::acpp::UserOnlineTracker>;
+using UserOnlineProtocolRuntime = InboundTrackerRuntime<::UserOnlineTracker>;
 
-}  // namespace acpp::proxy
+}  // namespace proxy

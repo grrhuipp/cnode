@@ -1,12 +1,12 @@
 #pragma once
 
-#include "acppnode/common/allocator.hpp"
+#include "common/allocator.hpp"
 
 #include <cstddef>
 #include <functional>
 #include <string_view>
 
-namespace acpp::detail {
+namespace detail {
 
 struct XHttpPacketSessionKeyRef {
     std::string_view session_id;
@@ -61,4 +61,4 @@ struct XHttpPacketSessionKeyEq {
     }
 };
 
-}  // namespace acpp::detail
+}  // namespace detail

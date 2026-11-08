@@ -1,24 +1,24 @@
 #include <gtest/gtest.h>
 
-#include "acppnode/app/dns/dns_worker.hpp"
-#include "acppnode/app/port_binding.hpp"
-#include "acppnode/app/proxyman/inbound/factory.hpp"
-#include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
+#include "app/dns/dns_worker.hpp"
+#include "app/port_binding.hpp"
+#include "app/proxyman/inbound/factory.hpp"
+#include "app/proxyman/inbound/receiver_settings.hpp"
 #include "../src/app/proxyman/outbound/registration.hpp"
-#include "acppnode/app/stats.hpp"
-#include "acppnode/app/worker.hpp"
-#include "acppnode/app/worker_runtime_config.hpp"
-#include "acppnode/app/worker_stats.hpp"
-#include "acppnode/common/sharded_user_stats.hpp"
-#include "acppnode/common/user_profile.hpp"
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/session.hpp"
-#include "acppnode/infra/outbound_source_config.hpp"
-#include "acppnode/proxy/inbound.hpp"
-#include "acppnode/proxy/inbound_datagram.hpp"
-#include "acppnode/proxy/outbound.hpp"
-#include "acppnode/transport/async_stream.hpp"
-#include "acppnode/transport/internet/inbound_listen.hpp"
+#include "app/stats.hpp"
+#include "app/worker.hpp"
+#include "app/worker_runtime_config.hpp"
+#include "app/worker_stats.hpp"
+#include "common/sharded_user_stats.hpp"
+#include "common/user_profile.hpp"
+#include "common/allocator.hpp"
+#include "common/session.hpp"
+#include "infra/outbound_source_config.hpp"
+#include "proxy/inbound.hpp"
+#include "proxy/inbound_datagram.hpp"
+#include "proxy/outbound.hpp"
+#include "transport/async_stream.hpp"
+#include "transport/internet/inbound_listen.hpp"
 
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/buffer.hpp>
@@ -80,9 +80,9 @@ struct FixtureState {
     bool shutdown_worker = false;
     uint16_t target_port = 0;
     bool delayed_mode = false;
-    acpp::net::io_context* owner_io = nullptr;
-    std::unique_ptr<acpp::net::steady_timer> shutdown_signal;
-    std::unique_ptr<acpp::net::steady_timer> cleanup_gate;
+    ::net::io_context* owner_io = nullptr;
+    std::unique_ptr<::net::steady_timer> shutdown_signal;
+    std::unique_ptr<::net::steady_timer> cleanup_gate;
     std::promise<ProcessEntered> process_entered;
     ProcessEntered entered_metadata;
     bool gate_waiting = false;
@@ -90,13 +90,13 @@ struct FixtureState {
     bool unregister_started = false;
     bool unregister_done = false;
     std::exception_ptr unregister_error;
-    acpp::net::cancellation_signal unregister_cancel;
+    ::net::cancellation_signal unregister_cancel;
 };
 
 struct DelayedRetirementResult {
     ProcessEntered process;
-    acpp::WorkerRuntimeStatsSnapshot held_stats;
-    acpp::WorkerRuntimeStatsSnapshot final_stats;
+    ::WorkerRuntimeStatsSnapshot held_stats;
+    ::WorkerRuntimeStatsSnapshot final_stats;
     unsigned response_created_before_release = 0;
     unsigned response_destroyed_before_release = 0;
     unsigned response_created_after_join = 0;
@@ -109,7 +109,7 @@ struct DelayedRetirementResult {
     bool post_drain_mutations_succeeded = false;
 };
 
-class TrackedResponse final : public acpp::InboundDatagramResponse {
+class TrackedResponse final : public ::InboundDatagramResponse {
 public:
     explicit TrackedResponse(FixtureState& state) : state_(state) {
         ++state_.created;
@@ -119,23 +119,23 @@ public:
             state_.wrong_destructor_thread = true;
         ++state_.destroyed;
     }
-    acpp::buf::MultiBuffer Encode(acpp::UDPPacketView) override { return {}; }
+    ::buf::MultiBuffer Encode(::UDPPacketView) override { return {}; }
 private:
     FixtureState& state_;
 };
 
-struct Settings final : acpp::proxyman::inbound::ProtocolSettings {};
-struct Runtime final : acpp::proxyman::inbound::ProtocolRuntime {
-    std::vector<acpp::OnlineDevice> GetOnlineDevices(std::string_view) const override {
+struct Settings final : ::proxyman::inbound::ProtocolSettings {};
+struct Runtime final : ::proxyman::inbound::ProtocolRuntime {
+    std::vector<::OnlineDevice> GetOnlineDevices(std::string_view) const override {
         return {};
     }
-    std::shared_ptr<acpp::UserOnlineTracker> tracker = std::make_shared<acpp::UserOnlineTracker>();
+    std::shared_ptr<::UserOnlineTracker> tracker = std::make_shared<::UserOnlineTracker>();
 };
 
-class NativeDecoder final : public acpp::Inbound {
+class NativeDecoder final : public ::Inbound {
 public:
-    NativeDecoder(FixtureState& state, std::shared_ptr<acpp::UserOnlineTracker> tracker,
-                  acpp::ConnectionLimiter* limiter)
+    NativeDecoder(FixtureState& state, std::shared_ptr<::UserOnlineTracker> tracker,
+                  ::ConnectionLimiter* limiter)
         : state_(state), tracker_(tracker), limiter_(limiter) {
         ++state_.handlers_created;
         profile_.user_id = 71;
@@ -146,63 +146,63 @@ public:
             state_.wrong_destructor_thread = true;
         ++state_.handlers_destroyed;
     }
-    acpp::net::awaitable<acpp::RelayResult> Process(
-        std::unique_ptr<acpp::AsyncStream>, acpp::routing::Dispatcher&,
-        const acpp::proxyman::inbound::ReceiverSettings&, acpp::net::io_context&,
-        acpp::session::Context&, const acpp::TimeoutsConfig&, uint32_t) override {
-        co_return acpp::RelayResult{};
+    ::net::awaitable<::RelayResult> Process(
+        std::unique_ptr<::AsyncStream>, ::routing::Dispatcher&,
+        const ::proxyman::inbound::ReceiverSettings&, ::net::io_context&,
+        ::session::Context&, const ::TimeoutsConfig&, uint32_t) override {
+        co_return ::RelayResult{};
     }
-    tl::expected<acpp::InboundDatagramResult, acpp::ErrorCode> Process(
-        const acpp::InboundDatagramRequest& request) override {
+    tl::expected<::InboundDatagramResult, ::ErrorCode> Process(
+        const ::InboundDatagramRequest& request) override {
         if (request.payload.size() != 1 || request.payload.front() != kMarker)
-            return tl::unexpected(acpp::ErrorCode::PROTOCOL_AUTH_FAILED);
-        acpp::InboundDatagramResult decoded;
+            return tl::unexpected(::ErrorCode::PROTOCOL_AUTH_FAILED);
+        ::InboundDatagramResult decoded;
         decoded.target = state_.delayed_mode
-            ? acpp::TargetAddress(acpp::net::ip::address_v4::loopback(), state_.target_port)
-            : acpp::TargetAddress(kDomain, state_.target_port);
+            ? ::TargetAddress(::net::ip::address_v4::loopback(), state_.target_port)
+            : ::TargetAddress(kDomain, state_.target_port);
         decoded.session_id = 0x444e532d73657373;
         const std::array<uint8_t, 8> owner{0x44, 0x4e, 0x53, 0x2d, 0x6f, 0x77, 0x6e, 0x72};
         if (!decoded.session_owner.Assign(owner)) throw std::bad_alloc();
         decoded.user = &profile_;
         decoded.tracker = tracker_;
         decoded.limiter = limiter_;
-        auto* first = acpp::buf::Buffer::New();
+        auto* first = ::buf::Buffer::New();
         if (!first) throw std::bad_alloc();
         first->data[0] = 0x51;
         first->data[1] = 0x52;
         first->Produce(2);
-        decoded.payload.push_back(acpp::buf::BufferGuard(first));
+        decoded.payload.push_back(::buf::BufferGuard(first));
         return decoded;
     }
-    tl::expected<std::shared_ptr<acpp::InboundDatagramResponse>, acpp::ErrorCode>
-    CreateDatagramResponse(const acpp::InboundDatagramResult&) override {
-        return acpp::memory::AllocateShared<TrackedResponse>(state_);
+    tl::expected<std::shared_ptr<::InboundDatagramResponse>, ::ErrorCode>
+    CreateDatagramResponse(const ::InboundDatagramResult&) override {
+        return ::memory::AllocateShared<TrackedResponse>(state_);
     }
 private:
     FixtureState& state_;
-    std::shared_ptr<acpp::UserOnlineTracker> tracker_;
-    acpp::ConnectionLimiter* limiter_;
-    acpp::UserProfile profile_;
+    std::shared_ptr<::UserOnlineTracker> tracker_;
+    ::ConnectionLimiter* limiter_;
+    ::UserProfile profile_;
 };
 
 thread_local FixtureState* g_state = nullptr;
-std::unique_ptr<acpp::proxyman::inbound::ProtocolRuntime> MakeRuntime() {
+std::unique_ptr<::proxyman::inbound::ProtocolRuntime> MakeRuntime() {
     return std::make_unique<Runtime>();
 }
-std::unique_ptr<acpp::Inbound> MakeHandler(
-    acpp::proxyman::inbound::ProtocolRuntime& runtime, acpp::StatsShard&,
-    acpp::ConnectionLimiter* limiter,
-    const acpp::proxyman::inbound::BuildRequest&) {
+std::unique_ptr<::Inbound> MakeHandler(
+    ::proxyman::inbound::ProtocolRuntime& runtime, ::StatsShard&,
+    ::ConnectionLimiter* limiter,
+    const ::proxyman::inbound::BuildRequest&) {
     if (!g_state) throw std::logic_error("fixture state not installed on Worker thread");
     return std::make_unique<NativeDecoder>(
         *g_state, static_cast<Runtime&>(runtime).tracker, limiter);
 }
 void RegisterProtocol() {
     static const bool registered = [] {
-        acpp::proxyman::inbound::RegisterProxy(kProtocol, {
+        ::proxyman::inbound::RegisterProxy(kProtocol, {
             .user_protocol = std::nullopt,
             .datagram_transport =
-                acpp::proxyman::inbound::DatagramTransport::Packet,
+                ::proxyman::inbound::DatagramTransport::Packet,
             .create_runtime = MakeRuntime,
             .create_tcp_handler = MakeHandler,
             .create_datagram_handler = MakeHandler,
@@ -212,24 +212,24 @@ void RegisterProtocol() {
     (void)registered;
 }
 
-struct LinkStopObserver final : acpp::transport::CancellationSubscription {
+struct LinkStopObserver final : ::transport::CancellationSubscription {
     explicit LinkStopObserver(FixtureState& owner) noexcept : owner(owner) {}
     FixtureState& owner;
 private:
-    void OnCancellation(acpp::transport::Cancellation) noexcept override {
+    void OnCancellation(::transport::Cancellation) noexcept override {
         owner.stop_observed = true;
     }
 };
 
-class DelayedOutbound final : public acpp::Outbound {
+class DelayedOutbound final : public ::Outbound {
 public:
     DelayedOutbound(std::string tag, FixtureState& state)
         : tag_(std::move(tag)), state_(state) {}
 
-    acpp::net::awaitable<acpp::OutboundProcessResult> Process(
-        acpp::session::Context& ctx, acpp::transport::Link inbound,
-        acpp::OutboundDialer&, const acpp::TimeoutsConfig&, acpp::StatsShard&,
-        const acpp::RelayConfig&, acpp::buf::MultiBufferBatch first_payload,
+    ::net::awaitable<::OutboundProcessResult> Process(
+        ::session::Context& ctx, ::transport::Link inbound,
+        ::OutboundDialer&, const ::TimeoutsConfig&, ::StatsShard&,
+        const ::RelayConfig&, ::buf::MultiBufferBatch first_payload,
         std::chrono::seconds, std::chrono::seconds) override {
         if (!inbound.reader || !state_.cleanup_gate)
             throw std::logic_error("delayed outbound missing owner-local link/gate");
@@ -253,10 +253,10 @@ public:
         state_.gate_waiting = true;
 
         const bool previous_throw_setting =
-            co_await acpp::net::this_coro::throw_if_cancelled();
-        co_await acpp::net::this_coro::throw_if_cancelled(false);
+            co_await ::net::this_coro::throw_if_cancelled();
+        co_await ::net::this_coro::throw_if_cancelled(false);
         std::exception_ptr wait_failure;
-        acpp::IoErrorCode wait_error;
+        ::IoErrorCode wait_error;
         try {
             co_await state_.cleanup_gate->async_wait(
                 asio::bind_cancellation_slot(asio::cancellation_slot{},
@@ -267,13 +267,13 @@ public:
         } catch (...) {
             wait_failure = std::current_exception();
         }
-        co_await acpp::net::this_coro::throw_if_cancelled(previous_throw_setting);
+        co_await ::net::this_coro::throw_if_cancelled(previous_throw_setting);
         if (wait_failure) std::rethrow_exception(wait_failure);
-        const auto cancellation = co_await acpp::net::this_coro::cancellation_state;
+        const auto cancellation = co_await ::net::this_coro::cancellation_state;
         if (state_.stop_observed ||
-            cancellation.cancelled() != acpp::net::cancellation_type::none)
-            co_return tl::unexpected(acpp::ErrorCode::CANCELLED);
-        co_return acpp::RelayResult{};
+            cancellation.cancelled() != ::net::cancellation_type::none)
+            co_return tl::unexpected(::ErrorCode::CANCELLED);
+        co_return ::RelayResult{};
     }
 
 private:
@@ -281,7 +281,7 @@ private:
     FixtureState& state_;
 };
 
-acpp::proxyman::outbound::PreparedOutboundConfig MakeDelayedOutbound(
+::proxyman::outbound::PreparedOutboundConfig MakeDelayedOutbound(
     FixtureState& state, std::string tag) {
     struct DelayedState {
         FixtureState* owner_state = nullptr;
@@ -292,12 +292,12 @@ acpp::proxyman::outbound::PreparedOutboundConfig MakeDelayedOutbound(
         .tag = std::move(tag),
         .protocol = "test-delayed-completion",
         .sender = {},
-        .create = acpp::proxyman::outbound::MakePreparedOutboundCreator<
+        .create = ::proxyman::outbound::MakePreparedOutboundCreator<
             DelayedState,
             +[](std::string_view requested_tag,
                 std::shared_ptr<const DelayedState> s,
-                acpp::net::io_context&,
-                acpp::AwaitableTaskGroup&) -> std::unique_ptr<acpp::Outbound> {
+                ::net::io_context&,
+                ::AwaitableTaskGroup&) -> std::unique_ptr<::Outbound> {
                 if (requested_tag != s->prepared_tag)
                     throw std::logic_error("prepared delayed outbound tag mismatch");
                 return std::make_unique<DelayedOutbound>(
@@ -309,12 +309,12 @@ acpp::proxyman::outbound::PreparedOutboundConfig MakeDelayedOutbound(
 struct DnsPacket {
     std::array<uint8_t, 512> bytes{};
     std::size_t size = 0;
-    acpp::udp::endpoint peer;
+    ::udp::endpoint peer;
 };
 
 // DNS peer receives the real question and deliberately retains the unanswered
 // transaction. Its socket and coroutine both belong to the control executor.
-acpp::net::awaitable<DnsPacket> ReceiveQuery(acpp::udp::socket& socket) {
+::net::awaitable<DnsPacket> ReceiveQuery(::udp::socket& socket) {
     DnsPacket packet;
     packet.size = co_await socket.async_receive_from(
         asio::buffer(packet.bytes), packet.peer, asio::use_awaitable);
@@ -323,7 +323,7 @@ acpp::net::awaitable<DnsPacket> ReceiveQuery(acpp::udp::socket& socket) {
     co_return packet;
 }
 
-void SendLateDnsReply(acpp::udp::socket& socket, DnsPacket& query) {
+void SendLateDnsReply(::udp::socket& socket, DnsPacket& query) {
     if (query.size < 12) Fail("missing held DNS query");
     // Copy question from the actual request; answer nativeJoin.example as
     // loopback, allowing a late response to produce an observable UDP attempt.
@@ -340,19 +340,19 @@ void SendLateDnsReply(acpp::udp::socket& socket, DnsPacket& query) {
     reply[p++] = 0; reply[p++] = 0; reply[p++] = 0; reply[p++] = 30;
     reply[p++] = 0; reply[p++] = 4;
     reply[p++] = 127; reply[p++] = 0; reply[p++] = 0; reply[p++] = 1;
-    acpp::IoErrorCode ec;
+    ::IoErrorCode ec;
     socket.send_to(asio::buffer(reply.data(), p), query.peer, 0, ec);
     if (ec) Fail("sending delayed DNS response failed");
 }
 
-acpp::net::awaitable<void> Pause(acpp::net::io_context& io,
+::net::awaitable<void> Pause(::net::io_context& io,
                                   std::chrono::milliseconds duration) {
-    acpp::net::steady_timer timer(io, duration);
-    co_await timer.async_wait(acpp::net::use_awaitable);
+    ::net::steady_timer timer(io, duration);
+    co_await timer.async_wait(::net::use_awaitable);
 }
 
-acpp::net::awaitable<void> WorkerJob(
-    acpp::net::io_context& io, acpp::Worker& worker, FixtureState& state,
+::net::awaitable<void> WorkerJob(
+    ::net::io_context& io, ::Worker& worker, FixtureState& state,
     uint16_t inbound_port, uint16_t target_port, RuntimeMode mode,
     std::promise<std::future<ProcessEntered>>& entered_handoff,
     std::promise<void>& ready) {
@@ -361,10 +361,10 @@ acpp::net::awaitable<void> WorkerJob(
     state.delayed_mode = mode == RuntimeMode::DelayedRetirement || mode == RuntimeMode::ShutdownDelayed;
     state.shutdown_worker = mode == RuntimeMode::ShutdownDns || mode == RuntimeMode::ShutdownDelayed;
     state.owner_io = &io;
-    state.shutdown_signal = std::make_unique<acpp::net::steady_timer>(io);
+    state.shutdown_signal = std::make_unique<::net::steady_timer>(io);
     if (state.delayed_mode) {
-        state.cleanup_gate = std::make_unique<acpp::net::steady_timer>(io);
-        state.cleanup_gate->expires_at(acpp::net::steady_timer::time_point::max());
+        state.cleanup_gate = std::make_unique<::net::steady_timer>(io);
+        state.cleanup_gate->expires_at(::net::steady_timer::time_point::max());
         entered_handoff.set_value(state.process_entered.get_future());
     }
     g_state = &state;
@@ -372,35 +372,35 @@ acpp::net::awaitable<void> WorkerJob(
     if (state.delayed_mode) {
         worker.AddOutbound(MakeDelayedOutbound(state, "native-test"));
     } else {
-        auto outbound_source = acpp::infra::OutboundSourceConfig{};
+        auto outbound_source = ::infra::OutboundSourceConfig{};
         outbound_source.tag = "native-test";
         outbound_source.protocol = "freedom";
         outbound_source.settings["domainStrategy"] = "UseIP";
-        auto prepared = acpp::proxyman::outbound::PrepareOutboundConfig(outbound_source);
+        auto prepared = ::proxyman::outbound::PrepareOutboundConfig(outbound_source);
         if (!prepared) Fail("production Freedom outbound preparation failed");
         worker.AddOutbound(std::move(*prepared));
     }
 
-    acpp::proxyman::inbound::BuildRequest request{
+    ::proxyman::inbound::BuildRequest request{
         .tag = std::string(kTag), .protocol = std::string(kProtocol),
         .settings = std::make_shared<Settings>()};
-    acpp::proxyman::inbound::ReceiverSettings receiver{
+    ::proxyman::inbound::ReceiverSettings receiver{
         .inbound_tag = std::string(kTag), .inbound_tags = {}, .protocol = std::string(kProtocol),
         .stream_settings = {},
-        .dispatch_policy = {.sniffing = {}, .outbound = acpp::routing::ForceOutbound{"native-test"}}};
+        .dispatch_policy = {.sniffing = {}, .outbound = ::routing::ForceOutbound{"native-test"}}};
     if (!worker.RegisterInbound(request, receiver))
         Fail("real native inbound registration failed");
-    const auto listen = acpp::InboundListen::Parse("127.0.0.1");
+    const auto listen = ::InboundListen::Parse("127.0.0.1");
     if (!listen) Fail("loopback inbound address could not be parsed");
     if (!co_await worker.AddUdpListenerTask(
-            acpp::PortBinding{.port = inbound_port, .protocol = std::string(kProtocol), .tag = std::string(kTag), .listen = *listen}, request))
+            ::PortBinding{.port = inbound_port, .protocol = std::string(kProtocol), .tag = std::string(kTag), .listen = *listen}, request))
         Fail("real native UDP listener failed to bind");
-    state.shutdown_signal->expires_at(acpp::net::steady_timer::time_point::max());
+    state.shutdown_signal->expires_at(::net::steady_timer::time_point::max());
     ready.set_value();
-    acpp::IoErrorCode ec;
+    ::IoErrorCode ec;
     co_await state.shutdown_signal->async_wait(
         asio::redirect_error(asio::use_awaitable, ec));
-    if (ec != acpp::net::error::operation_aborted)
+    if (ec != ::net::error::operation_aborted)
         Fail("Worker shutdown signal ended without explicit cancellation");
     worker.RequestStop();
     co_await worker.AsyncJoin();
@@ -418,13 +418,13 @@ struct WorkerExit {
 };
 
 template <typename Predicate>
-acpp::net::awaitable<void> WaitTestPredicate(
-    acpp::net::io_context& io, Predicate predicate,
+::net::awaitable<void> WaitTestPredicate(
+    ::net::io_context& io, Predicate predicate,
     std::chrono::milliseconds limit, std::string_view failure) {
     auto expired = std::make_shared<bool>(false);
-    acpp::net::steady_timer deadline(io);
+    ::net::steady_timer deadline(io);
     deadline.expires_after(limit);
-    deadline.async_wait([expired](const acpp::IoErrorCode& ec) {
+    deadline.async_wait([expired](const ::IoErrorCode& ec) {
         if (!ec) *expired = true;
     });
     while (!predicate()) {
@@ -434,18 +434,18 @@ acpp::net::awaitable<void> WaitTestPredicate(
     deadline.cancel();
 }
 
-acpp::proxyman::inbound::BuildRequest BuildFixtureRequest(std::string tag) {
+::proxyman::inbound::BuildRequest BuildFixtureRequest(std::string tag) {
     return {.tag = std::move(tag), .protocol = std::string(kProtocol),
             .settings = std::make_shared<Settings>()};
 }
 
-acpp::proxyman::inbound::ReceiverSettings BuildFixtureReceiver(
+::proxyman::inbound::ReceiverSettings BuildFixtureReceiver(
     std::string tag, std::string outbound_tag) {
     return {.inbound_tag = std::move(tag), .inbound_tags = {}, .protocol = std::string(kProtocol),
             .stream_settings = {},
             .dispatch_policy = {
                 .sniffing = {},
-                .outbound = acpp::routing::ForceOutbound(std::move(outbound_tag))}};
+                .outbound = ::routing::ForceOutbound(std::move(outbound_tag))}};
 }
 
 bool IsBusy(const std::exception_ptr& error) {
@@ -464,8 +464,8 @@ struct UnregisterCompletion {
     }
 };
 
-acpp::net::awaitable<DelayedRetirementResult> RunDelayedRetirementOwner(
-    acpp::Worker& worker) {
+::net::awaitable<DelayedRetirementResult> RunDelayedRetirementOwner(
+    ::Worker& worker) {
     if (!g_state || !g_state->owner_io || !g_state->cleanup_gate)
         Fail("delayed fixture state is not initialized on Worker owner");
     FixtureState& state = *g_state;
@@ -480,7 +480,7 @@ acpp::net::awaitable<DelayedRetirementResult> RunDelayedRetirementOwner(
         Fail("DefaultDispatcher did not preserve the initial payload and session metadata");
 
     state.unregister_started = true;
-    acpp::net::co_spawn(*state.owner_io,
+    ::net::co_spawn(*state.owner_io,
         worker.UnregisterListenerTask(std::string(kTag)),
         asio::bind_cancellation_slot(state.unregister_cancel.slot(),
             UnregisterCompletion{&state}));
@@ -517,7 +517,7 @@ acpp::net::awaitable<DelayedRetirementResult> RunDelayedRetirementOwner(
 
     // Parent cancellation is delivered on the owner executor while the
     // outbound's empty-slot gate remains held; join must still await cleanup.
-    state.unregister_cancel.emit(acpp::net::cancellation_type::terminal);
+    state.unregister_cancel.emit(::net::cancellation_type::terminal);
     if (state.shutdown_worker) worker.RequestStop();
     co_await Pause(*state.owner_io, 40ms);
     result.held_stats = co_await worker.CollectRuntimeStats(true);
@@ -537,9 +537,9 @@ acpp::net::awaitable<DelayedRetirementResult> RunDelayedRetirementOwner(
     result.cancel_committed_then_aborted = false;
     try {
         if (state.unregister_error) std::rethrow_exception(state.unregister_error);
-    } catch (const acpp::IoSystemError& e) {
+    } catch (const ::IoSystemError& e) {
         result.cancel_committed_then_aborted =
-            e.code() == acpp::net::error::operation_aborted;
+            e.code() == ::net::error::operation_aborted;
     } catch (...) {}
     if (!result.cancel_committed_then_aborted) {
         if (!state.unregister_error)
@@ -580,22 +580,22 @@ acpp::net::awaitable<DelayedRetirementResult> RunDelayedRetirementOwner(
 }
 
 struct RetirementSnapshot {
-    acpp::WorkerRuntimeStatsSnapshot stats;
+    ::WorkerRuntimeStatsSnapshot stats;
     unsigned responses_created = 0;
     unsigned responses_destroyed = 0;
     bool wrong_destructor_thread = false;
 };
 
-acpp::net::awaitable<RetirementSnapshot> UnregisterAndSnapshot(
-    acpp::Worker& worker) {
+::net::awaitable<RetirementSnapshot> UnregisterAndSnapshot(
+    ::Worker& worker) {
     co_await worker.UnregisterListenerTask(std::string(kTag));
     if (!g_state || !g_state->owner_io)
         Fail("Worker-local fixture state is unavailable during retirement");
 
     auto expired = std::make_shared<bool>(false);
-    acpp::net::steady_timer deadline(*g_state->owner_io);
+    ::net::steady_timer deadline(*g_state->owner_io);
     deadline.expires_after(3s);
-    deadline.async_wait([expired](const acpp::IoErrorCode& ec) {
+    deadline.async_wait([expired](const ::IoErrorCode& ec) {
         if (!ec) *expired = true;
     });
     RetirementSnapshot result;
@@ -623,7 +623,7 @@ void StopOwner() {
     g_state->shutdown_signal->cancel();
 }
 
-acpp::net::awaitable<void> AbortWorkerTask(acpp::Worker& worker) {
+::net::awaitable<void> AbortWorkerTask(::Worker& worker) {
     if (!g_state) Fail("Worker-local fixture state is unavailable during abort cleanup");
     FixtureState& state = *g_state;
     std::exception_ptr failure;
@@ -632,7 +632,7 @@ acpp::net::awaitable<void> AbortWorkerTask(acpp::Worker& worker) {
             state.cleanup_gate->cancel();
         }
         if (state.unregister_started) {
-            state.unregister_cancel.emit(acpp::net::cancellation_type::terminal);
+            state.unregister_cancel.emit(::net::cancellation_type::terminal);
             try {
                 co_await WaitTestPredicate(*state.owner_io,
                     [&state] { return state.unregister_done; },
@@ -650,26 +650,26 @@ acpp::net::awaitable<void> AbortWorkerTask(acpp::Worker& worker) {
     if (failure) std::rethrow_exception(failure);
 }
 
-uint16_t BindUdp(acpp::net::io_context& io, acpp::udp::socket& socket) {
-    acpp::IoErrorCode ec;
-    socket.open(acpp::udp::v4(), ec);
+uint16_t BindUdp(::net::io_context& io, ::udp::socket& socket) {
+    ::IoErrorCode ec;
+    socket.open(::udp::v4(), ec);
     if (ec) Fail("opening loopback UDP socket failed");
-    socket.bind({acpp::net::ip::address_v4::loopback(), 0}, ec);
+    socket.bind({::net::ip::address_v4::loopback(), 0}, ec);
     if (ec) Fail("binding loopback UDP socket failed");
     return socket.local_endpoint(ec).port();
 }
 
-acpp::net::awaitable<void> RunControl(
-    acpp::net::io_context& control_io, acpp::app::dns::DNSWorker& dns,
-    acpp::Worker& worker, acpp::udp::socket& dns_peer, DnsPacket& held_query,
-    uint16_t inbound_port, acpp::udp::socket& echo_observer, bool shutdown_worker) {
+::net::awaitable<void> RunControl(
+    ::net::io_context& control_io, ::app::dns::DNSWorker& dns,
+    ::Worker& worker, ::udp::socket& dns_peer, DnsPacket& held_query,
+    uint16_t inbound_port, ::udp::socket& echo_observer, bool shutdown_worker) {
     // Send one valid datagram through the real listener; its owned first Link
     // payload enters DefaultDispatcher and the frozen Freedom outbound.
     const std::array<uint8_t, 1> marker{kMarker};
-    acpp::udp::socket client(control_io, acpp::udp::v4());
-    acpp::IoErrorCode ec;
+    ::udp::socket client(control_io, ::udp::v4());
+    ::IoErrorCode ec;
     client.send_to(asio::buffer(marker),
-        {acpp::net::ip::address_v4::loopback(), inbound_port}, 0, ec);
+        {::net::ip::address_v4::loopback(), inbound_port}, 0, ec);
     if (ec) Fail("sending native UDP datagram failed");
     held_query = co_await ReceiveQuery(dns_peer);
     if (shutdown_worker) {
@@ -695,13 +695,13 @@ acpp::net::awaitable<void> RunControl(
     SendLateDnsReply(dns_peer, held_query);
     co_await Pause(control_io, 200ms);
     std::array<uint8_t, 32> received{};
-    acpp::udp::endpoint sender;
+    ::udp::endpoint sender;
     echo_observer.non_blocking(true, ec);
     if (ec) Fail("could not make the loopback echo observer nonblocking");
     const auto received_size = echo_observer.receive_from(asio::buffer(received), sender, 0, ec);
     if (!ec || received_size != 0)
         Fail("a late DNS response launched an outbound UDP request after cancellation");
-    if (ec != acpp::net::error::would_block && ec != acpp::net::error::try_again)
+    if (ec != ::net::error::would_block && ec != ::net::error::try_again)
         Fail("echo observer failed for a reason other than no late UDP request");
     co_await worker.PostCall([] { StopOwner(); });
 
@@ -710,7 +710,7 @@ acpp::net::awaitable<void> RunControl(
 struct SharedWorker {
     // The Worker remains constructed, used and destroyed on the data thread.
     // Cross-thread callers only use its public bounded mailbox entrypoints.
-    acpp::Worker* worker = nullptr;
+    ::Worker* worker = nullptr;
     std::promise<std::future<ProcessEntered>> entered_handoff;
     std::future<std::future<ProcessEntered>> entered_handoff_future =
         entered_handoff.get_future();
@@ -725,7 +725,7 @@ struct SharedWorker {
 // Drives the caller side of a mailbox completion until it is ready or the
 // watchdog expires. The posted body itself runs on the data Worker thread.
 template <typename T>
-[[nodiscard]] bool PollUntilReady(acpp::net::io_context& io, std::future<T>& future,
+[[nodiscard]] bool PollUntilReady(::net::io_context& io, std::future<T>& future,
                                   std::chrono::milliseconds limit) {
     const auto deadline = std::chrono::steady_clock::now() + limit;
     while (future.wait_for(0ms) != std::future_status::ready) {
@@ -756,35 +756,35 @@ TEST_P(WorkerUdpRetirementRuntime, Lifecycle) {
         FAIL() << "unknown retirement test scenario";
     }
     try {
-        acpp::memory::ConfigureProcessAllocator();
+        ::memory::ConfigureProcessAllocator();
         RegisterProtocol();
-        acpp::net::io_context control_io;
-        acpp::udp::socket dns_peer(control_io);
+        ::net::io_context control_io;
+        ::udp::socket dns_peer(control_io);
         const auto dns_port = BindUdp(control_io, dns_peer);
-        acpp::app::dns::Config dns_config{
-            .servers = {{acpp::net::ip::address_v4::loopback(), dns_port}},
+        ::app::dns::Config dns_config{
+            .servers = {{::net::ip::address_v4::loopback(), dns_port}},
             .timeout_sec = 15};
-        acpp::app::dns::DNSWorker dns(control_io, dns_config, 8);
+        ::app::dns::DNSWorker dns(control_io, dns_config, 8);
 
-        acpp::udp::socket echo_observer(control_io);
+        ::udp::socket echo_observer(control_io);
         const auto echo_port = BindUdp(control_io, echo_observer);
-        acpp::udp::socket reservation(control_io);
+        ::udp::socket reservation(control_io);
         const auto inbound_port = BindUdp(control_io, reservation);
         reservation.close();
 
-        acpp::WorkerRuntimeConfig runtime;
+        ::WorkerRuntimeConfig runtime;
         runtime.timeouts.idle = 0;
         runtime.timeouts.read = 0;
         SharedWorker shared;
         std::thread data_thread([&] {
             try {
-                acpp::net::io_context data_io;
-                acpp::StatsShard stats;
+                ::net::io_context data_io;
+                ::StatsShard stats;
                 FixtureState fixture;
-                auto worker = std::make_unique<acpp::Worker>(1, data_io, runtime, stats, dns);
+                auto worker = std::make_unique<::Worker>(1, data_io, runtime, stats, dns);
                 shared.worker = worker.get();
                 std::string runtime_error;
-                acpp::net::co_spawn(data_io, WorkerJob(data_io, *worker, fixture,
+                ::net::co_spawn(data_io, WorkerJob(data_io, *worker, fixture,
                     inbound_port, echo_port, mode, shared.entered_handoff, shared.ready),
                     [&shared, &runtime_error](std::exception_ptr error) {
                         if (!error) return;
@@ -835,11 +835,11 @@ TEST_P(WorkerUdpRetirementRuntime, Lifecycle) {
             catch (...) { failure = std::current_exception(); }
 
             if (!failure) {
-                acpp::udp::socket client(control_io, acpp::udp::v4());
+                ::udp::socket client(control_io, ::udp::v4());
                 const std::array<uint8_t, 1> marker{kMarker};
-                acpp::IoErrorCode ec;
+                ::IoErrorCode ec;
                 client.send_to(asio::buffer(marker),
-                    {acpp::net::ip::address_v4::loopback(), inbound_port}, 0, ec);
+                    {::net::ip::address_v4::loopback(), inbound_port}, 0, ec);
                 if (ec) failure = std::make_exception_ptr(
                     std::runtime_error("sending delayed native UDP request failed"));
             }
@@ -906,7 +906,7 @@ TEST_P(WorkerUdpRetirementRuntime, Lifecycle) {
         DnsPacket held;
         bool control_complete = false;
         std::exception_ptr control_error;
-        acpp::net::co_spawn(control_io,
+        ::net::co_spawn(control_io,
             RunControl(control_io, dns, *shared.worker, dns_peer, held,
                        inbound_port, echo_observer, mode == RuntimeMode::ShutdownDns),
             [&control_complete, &control_error](std::exception_ptr error) {
@@ -922,7 +922,7 @@ TEST_P(WorkerUdpRetirementRuntime, Lifecycle) {
         if (!control_complete) {
             control_error = std::make_exception_ptr(
                 std::runtime_error("control-side retirement orchestration timed out"));
-            acpp::IoErrorCode ignored;
+            ::IoErrorCode ignored;
             dns_peer.cancel(ignored);
         }
         std::exception_ptr cleanup_error;

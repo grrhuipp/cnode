@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 
-#include "acppnode/transport/internet/reality_server_name.hpp"
-#include "acppnode/transport/internet/tls_server_name.hpp"
+#include "transport/internet/reality_server_name.hpp"
+#include "transport/internet/tls_server_name.hpp"
 
 #include <array>
 #include <cstdio>
@@ -18,8 +18,8 @@ bool Require(bool condition, const char* message) {
 }  // namespace
 
 TEST(RealityServerName, Contract) {
-    using acpp::transport::internet::IsRealityServerNameAllowed;
-    using acpp::transport::internet::ParseTlsServerNameExtension;
+    using ::transport::internet::IsRealityServerNameAllowed;
+    using ::transport::internet::ParseTlsServerNameExtension;
 
     constexpr std::array<uint8_t, 16> valid_extension{
         0x00, 0x0e, 0x00, 0x00, 0x0b,

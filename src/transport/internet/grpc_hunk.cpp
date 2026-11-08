@@ -5,7 +5,7 @@
 #include <cstring>
 #include <optional>
 
-namespace acpp::transport::internet {
+namespace transport::internet {
 namespace {
 
 bool ReadVarint(std::span<const uint8_t> bytes, size_t& offset, uint64_t& value) noexcept {
@@ -131,4 +131,4 @@ void GrpcHunkDecoder::Clear() noexcept {
     memory::ByteVector{}.swap(message_);
 }
 
-}  // namespace acpp::transport::internet
+}  // namespace transport::internet

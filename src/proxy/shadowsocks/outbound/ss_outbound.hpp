@@ -1,8 +1,8 @@
 #pragma once
 
-#include "acppnode/proxy/outbound.hpp"
+#include "proxy/outbound.hpp"
 #include "ss_outbound_credentials.hpp"
-#include "acppnode/transport/internet/outbound_sender.hpp"
+#include "transport/internet/outbound_sender.hpp"
 
 #include <chrono>
 #include <cstdint>
@@ -12,7 +12,6 @@
 #include <string>
 #include <string_view>
 
-namespace acpp {
 
 // ============================================================================
 // SS Outbound 配置
@@ -38,20 +37,20 @@ struct PreparedSettings {
     Credentials credentials;
 };
 
-class Handler final : public ::acpp::Outbound {
+class Handler final : public ::Outbound {
 public:
     explicit Handler(std::shared_ptr<const PreparedSettings> prepared);
 
     ~Handler() noexcept override = default;
 
-    ::acpp::net::awaitable<::acpp::OutboundProcessResult> Process(
-        ::acpp::session::Context& ctx,
-        ::acpp::transport::Link inbound,
-        ::acpp::OutboundDialer& dialer,
-        const ::acpp::TimeoutsConfig& timeouts,
-        ::acpp::StatsShard& stats,
-        const ::acpp::RelayConfig& relay_config,
-        ::acpp::buf::MultiBufferBatch first_payload,
+    ::net::awaitable<::OutboundProcessResult> Process(
+        ::session::Context& ctx,
+        ::transport::Link inbound,
+        ::OutboundDialer& dialer,
+        const ::TimeoutsConfig& timeouts,
+        ::StatsShard& stats,
+        const ::RelayConfig& relay_config,
+        ::buf::MultiBufferBatch first_payload,
         std::chrono::seconds relay_idle_timeout,
         std::chrono::seconds relay_write_timeout) override;
 
@@ -61,4 +60,3 @@ private:
 
 }  // namespace proxy::shadowsocks::outbound
 
-}  // namespace acpp

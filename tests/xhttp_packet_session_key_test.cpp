@@ -6,12 +6,12 @@
 #include <unordered_map>
 
 TEST(XhttpPacketSessionKey, Contract) {
-    using Key = acpp::detail::XHttpPacketSessionKey;
+    using Key = ::detail::XHttpPacketSessionKey;
     using Map = std::unordered_map<
         Key,
         int,
-        acpp::detail::XHttpPacketSessionKeyHash,
-        acpp::detail::XHttpPacketSessionKeyEq>;
+        ::detail::XHttpPacketSessionKeyHash,
+        ::detail::XHttpPacketSessionKeyEq>;
     Map sessions;
 
     Key first{.session_id = "shared-session", .session_namespace = "inbound-a"};
@@ -21,11 +21,11 @@ TEST(XhttpPacketSessionKey, Contract) {
     sessions.emplace(std::move(second), 2);
     sessions.emplace(std::move(other_namespace), 3);
 
-    const auto first_it = sessions.find(acpp::detail::XHttpPacketSessionKeyRef{
+    const auto first_it = sessions.find(::detail::XHttpPacketSessionKeyRef{
         "shared-session", "inbound-a"});
-    const auto second_it = sessions.find(acpp::detail::XHttpPacketSessionKeyRef{
+    const auto second_it = sessions.find(::detail::XHttpPacketSessionKeyRef{
         "second-session", "inbound-a"});
-    const auto other_it = sessions.find(acpp::detail::XHttpPacketSessionKeyRef{
+    const auto other_it = sessions.find(::detail::XHttpPacketSessionKeyRef{
         "shared-session", "inbound-b"});
     if (sessions.size() != 3 || first_it == sessions.end() ||
         second_it == sessions.end() || other_it == sessions.end() ||

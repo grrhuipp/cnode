@@ -1,17 +1,17 @@
 #include <gtest/gtest.h>
 
-#include "acppnode/app/dispatcher/default_dispatcher.hpp"
-#include "acppnode/app/dns/dns_worker.hpp"
-#include "acppnode/app/relay.hpp"
-#include "acppnode/app/request_load_state.hpp"
-#include "acppnode/app/session_tracking.hpp"
-#include "acppnode/common/rule.hpp"
-#include "acppnode/app/proxyman/outbound/handler.hpp"
-#include "acppnode/app/stats.hpp"
-#include "acppnode/features/routing/router.hpp"
-#include "acppnode/infra/runtime_config_types.hpp"
-#include "acppnode/proxy/outbound.hpp"
-#include "acppnode/transport/internet/tcp_stream.hpp"
+#include "app/dispatcher/default_dispatcher.hpp"
+#include "app/dns/dns_worker.hpp"
+#include "app/relay.hpp"
+#include "app/request_load_state.hpp"
+#include "app/session_tracking.hpp"
+#include "common/rule.hpp"
+#include "app/proxyman/outbound/handler.hpp"
+#include "app/stats.hpp"
+#include "features/routing/router.hpp"
+#include "infra/runtime_config_types.hpp"
+#include "proxy/outbound.hpp"
+#include "transport/internet/tcp_stream.hpp"
 #include "../src/common/awaitable_task_group.hpp"
 
 #include <asio/as_tuple.hpp>
@@ -25,7 +25,6 @@
 #include <stdexcept>
 
 namespace {
-using namespace acpp;
 using namespace std::chrono_literals;
 
 buf::MultiBuffer Payload(size_t size) {

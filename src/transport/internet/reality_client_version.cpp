@@ -1,6 +1,6 @@
-#include "acppnode/transport/internet/reality_client_version.hpp"
+#include "transport/internet/reality_client_version.hpp"
 
-namespace acpp::transport::internet {
+namespace transport::internet {
 
 tl::expected<std::optional<RealityClientVersion>, RealityClientVersionError>
 ParseRealityClientVersion(std::string_view value) noexcept {
@@ -47,4 +47,4 @@ uint32_t RealityClientVersionValue(
            static_cast<uint32_t>(version[3]);
 }
 
-}  // namespace acpp::transport::internet
+}  // namespace transport::internet

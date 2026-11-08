@@ -1,8 +1,8 @@
 #include "anytls_codec.hpp"
-#include "acppnode/common/byte_reader.hpp"
+#include "common/byte_reader.hpp"
 #include "padding.hpp"
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/transport/async_stream.hpp"
+#include "common/allocator.hpp"
+#include "transport/async_stream.hpp"
 
 #include <algorithm>
 #include <array>
@@ -11,7 +11,7 @@
 #include <format>
 #include <utility>
 
-namespace acpp::anytls {
+namespace anytls {
 
 
 namespace {
@@ -498,4 +498,4 @@ ReadFramePayload(AsyncStream& stream, uint16_t length) {
     co_return mb;
 }
 
-}  // namespace acpp::anytls
+}  // namespace anytls

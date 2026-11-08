@@ -1,60 +1,58 @@
 #pragma once
 
-#include "acppnode/proxy/inbound.hpp"
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/app/udp_types.hpp"
+#include "proxy/inbound.hpp"
+#include "common/allocator.hpp"
+#include "app/udp_types.hpp"
 #include "../ss_udp.hpp"
-#include "acppnode/common/sharded_user_stats.hpp"
+#include "common/sharded_user_stats.hpp"
 
 #include <array>
 #include <memory>
 #include <tl/expected.hpp>
 #include <utility>
 
-namespace acpp {
 struct StatsShard;
-}  // namespace acpp
 
-namespace acpp::proxy::shadowsocks::inbound {
+namespace proxy::shadowsocks::inbound {
 
-class Handler final : public ::acpp::Inbound {
+class Handler final : public ::Inbound {
 public:
-    Handler(::acpp::UserOnlineTracker& validator,
-            ::acpp::StatsShard& stats,
-            ::acpp::ConnectionLimiter* limiter,
-            ::acpp::ss::SsCipherInfo cipher_info);
+    Handler(::UserOnlineTracker& validator,
+            ::StatsShard& stats,
+            ::ConnectionLimiter* limiter,
+            ::ss::SsCipherInfo cipher_info);
 
     void AdoptWorkerStateFrom(
-        ::acpp::Inbound& previous) noexcept override;
+        ::Inbound& previous) noexcept override;
 
     // 解析首包：读 salt + 首 chunk，尝试所有用户密钥，解析 SOCKS5 地址
-    ::acpp::net::awaitable<::acpp::RelayResult> Process(
-        std::unique_ptr<::acpp::AsyncStream> stream,
-        ::acpp::routing::Dispatcher& dispatcher,
-        const ::acpp::proxyman::inbound::ReceiverSettings& receiver,
-        ::acpp::net::io_context& io_context,
-        ::acpp::session::Context& ctx,
-        const ::acpp::TimeoutsConfig& timeouts,
+    ::net::awaitable<::RelayResult> Process(
+        std::unique_ptr<::AsyncStream> stream,
+        ::routing::Dispatcher& dispatcher,
+        const ::proxyman::inbound::ReceiverSettings& receiver,
+        ::net::io_context& io_context,
+        ::session::Context& ctx,
+        const ::TimeoutsConfig& timeouts,
         uint32_t pressure_idle_timeout) override;
 
     // 对应 xray-core proxy/shadowsocks/server.go 的 handleUDPPayload 解码路径。
     [[nodiscard]] tl::expected<
-        ::acpp::InboundDatagramResult,
-        ::acpp::ErrorCode> Process(
-        const ::acpp::InboundDatagramRequest& request) override;
+        ::InboundDatagramResult,
+        ::ErrorCode> Process(
+        const ::InboundDatagramRequest& request) override;
 
     [[nodiscard]] tl::expected<
-        std::shared_ptr<::acpp::InboundDatagramResponse>, ::acpp::ErrorCode>
-    CreateDatagramResponse(const ::acpp::InboundDatagramResult& decoded) override;
+        std::shared_ptr<::InboundDatagramResponse>, ::ErrorCode>
+    CreateDatagramResponse(const ::InboundDatagramResult& decoded) override;
 
 private:
-    ::acpp::UserOnlineTracker& validator_;
-    ::acpp::StatsShard* stats_ = nullptr;
-    ::acpp::ConnectionLimiter* limiter_;
-    ::acpp::ss::SsCipherInfo cipher_info_;
-    ::acpp::ss::Ss2022UdpReplayCache udp_replay_cache_;
+    ::UserOnlineTracker& validator_;
+    ::StatsShard* stats_ = nullptr;
+    ::ConnectionLimiter* limiter_;
+    ::ss::SsCipherInfo cipher_info_;
+    ::ss::Ss2022UdpReplayCache udp_replay_cache_;
     // 上次匹配成功的用户索引，用于优先尝试（大概率命中同一活跃用户）
     size_t last_matched_index_ = 0;
 };
 
-}  // namespace acpp::proxy::shadowsocks::inbound
+}  // namespace proxy::shadowsocks::inbound

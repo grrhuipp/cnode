@@ -1,15 +1,15 @@
 #pragma once
 
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/target_address.hpp"
-#include "acppnode/transport/async_stream.hpp"
-#include "acppnode/transport/phase_deadline.hpp"
-#include "acppnode/app/session_group_executor.hpp"
+#include "common/allocator.hpp"
+#include "common/target_address.hpp"
+#include "transport/async_stream.hpp"
+#include "transport/phase_deadline.hpp"
+#include "app/session_group_executor.hpp"
 
 #include <memory>
 #include <span>
 
-namespace acpp::transport::internet::hysteria {
+namespace transport::internet::hysteria {
 
 // The QUIC connection behind every request stream and UDP session
 // (quic_connection.hpp). Streams hold it weakly: a dispatched request may
@@ -25,6 +25,7 @@ public:
 
     [[nodiscard]] int64_t Id() const noexcept { return stream_id_; }
     [[nodiscard]] net::io_context& IoContext() const noexcept { return domain_->Reactor(); }
+    transport::CancellationSource& Cancellation() noexcept { return cancellation_; }
     [[nodiscard]] bool PushInput(std::span<const uint8_t> data, bool fin);
     // Bytes received but not yet read; the transport inspects a request
     // prefix here before deciding who reads the stream.
@@ -52,6 +53,7 @@ private:
     bool input_done_ = false;
     bool write_done_ = false;
     bool cancelled_ = false;
+    transport::CancellationSource cancellation_;
 };
 
 // One Hysteria TCP request stream handed to the inbound handler.
@@ -60,6 +62,7 @@ public:
     // |state| must be non-null.
     explicit QuicStream(std::shared_ptr<QuicStreamState> state);
     ~QuicStream() noexcept override;
+    transport::CancellationSource& Cancellation() noexcept override { return state_->Cancellation(); }
 
     net::awaitable<size_t> AsyncRead(net::mutable_buffer buffer) override;
     net::awaitable<size_t> AsyncWrite(net::const_buffer buffer) override;
@@ -79,6 +82,7 @@ protected:
 private:
     std::shared_ptr<QuicStreamState> state_;
     StreamPhaseDeadline deadline_;
+    bool closed_ = false;
 };
 
 // One Hysteria UDP session handed to the inbound handler. Every read yields
@@ -88,6 +92,7 @@ private:
 // destruction unregisters it, and connection close detaches it first.
 class UdpSessionStream final : public AsyncStream {
 public:
+    // Bounds queued Buffer data capacity, not only the datagrams' payload sizes.
     static constexpr size_t kMaxQueuedBytes = 512 * 1024;
 
     UdpSessionStream(net::io_context& io_context, uint32_t session_id,
@@ -128,10 +133,10 @@ private:
     std::weak_ptr<Connection> owner_;
     SignalChannel signal_;
     memory::ThreadLocalDeque<buf::MultiBuffer> input_;
-    size_t queued_bytes_ = 0;
+    size_t queued_buffer_count_ = 0;
     bool cancelled_ = false;
     bool closed_ = false;
     StreamPhaseDeadline deadline_;
 };
 
-}  // namespace acpp::transport::internet::hysteria
+}  // namespace transport::internet::hysteria

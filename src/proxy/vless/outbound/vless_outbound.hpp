@@ -1,16 +1,15 @@
 #pragma once
 
-#include "acppnode/proxy/outbound.hpp"
-#include "acppnode/transport/internet/outbound_sender.hpp"
+#include "proxy/outbound.hpp"
+#include "transport/internet/outbound_sender.hpp"
 
 #include <array>
-#include "acppnode/common/unsafe.hpp"
+#include "common/unsafe.hpp"
 #include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
 
-namespace acpp {
 class ExecutionDomain;
 
 namespace vless {
@@ -33,36 +32,35 @@ struct VlessOutboundConfig {
     VlessOutboundConfig(VlessOutboundConfig&&) noexcept = default;
     VlessOutboundConfig& operator=(VlessOutboundConfig&&) noexcept = default;
     ~VlessOutboundConfig() noexcept {
-        ::acpp::SecureZeroMemory(uuid_bytes.data(), uuid_bytes.size());
+        ::SecureZeroMemory(uuid_bytes.data(), uuid_bytes.size());
     }
 };
 
 namespace proxy::vless::outbound {
 
-class Handler final : public ::acpp::Outbound {
+class Handler final : public ::Outbound {
 public:
-    explicit Handler(std::shared_ptr<const ::acpp::VlessOutboundConfig> config);
+    explicit Handler(std::shared_ptr<const ::VlessOutboundConfig> config);
 
     ~Handler() override;
 
-    ::acpp::net::awaitable<::acpp::OutboundProcessResult> Process(
-        ::acpp::session::Context& ctx,
-        ::acpp::transport::Link inbound,
-        ::acpp::OutboundDialer& dialer,
-        const ::acpp::TimeoutsConfig& timeouts,
-        ::acpp::StatsShard& stats,
-        const ::acpp::RelayConfig& relay_config,
-        ::acpp::buf::MultiBufferBatch first_payload,
+    ::net::awaitable<::OutboundProcessResult> Process(
+        ::session::Context& ctx,
+        ::transport::Link inbound,
+        ::OutboundDialer& dialer,
+        const ::TimeoutsConfig& timeouts,
+        ::StatsShard& stats,
+        const ::RelayConfig& relay_config,
+        ::buf::MultiBufferBatch first_payload,
         std::chrono::seconds relay_idle_timeout,
         std::chrono::seconds relay_write_timeout) override;
 
 private:
-    std::shared_ptr<const ::acpp::VlessOutboundConfig> config_;
-    std::shared_ptr<::acpp::vless::VlessEncryptionClientTicketCache> encryption_tickets_;
+    std::shared_ptr<const ::VlessOutboundConfig> config_;
+    std::shared_ptr<::vless::VlessEncryptionClientTicketCache> encryption_tickets_;
     std::weak_ptr<ExecutionDomain> ticket_domain_;
     bool has_ticket_domain_ = false;
 };
 
 }  // namespace proxy::vless::outbound
 
-}  // namespace acpp

@@ -8,7 +8,9 @@
 // and incorrectly diagnose this legal malloc-backed replacement as a mismatch.
 // No production allocator is replaced and no diagnostics are disabled.
 void* operator new(std::size_t size) {
-    if (timeout_allocation_test::reject_allocations) {
+    if (timeout_allocation_test::reject_allocations ||
+        (timeout_allocation_test::fail_after >= 0 &&
+         timeout_allocation_test::fail_after-- == 0)) {
         ++timeout_allocation_test::rejected_allocations;
         throw std::bad_alloc();
     }

@@ -7,24 +7,24 @@
 
 
 TEST(OutboundSelection, Contract) {
-    using acpp::app::dispatcher::detail::RequiresRouting;
-    using acpp::routing::RouteDecision;
-    using acpp::app::dispatcher::detail::SelectionSource;
-    using acpp::app::dispatcher::detail::SelectOutbound;
+    using ::app::dispatcher::detail::RequiresRouting;
+    using ::routing::RouteDecision;
+    using ::app::dispatcher::detail::SelectionSource;
+    using ::app::dispatcher::detail::SelectOutbound;
 
     try {
-        (void)acpp::routing::ForceOutbound("");
+        (void)::routing::ForceOutbound("");
         FAIL() << "empty forced outbound tag must be rejected";
     } catch (const std::invalid_argument&) {
     }
     try {
-        (void)acpp::routing::RouteWithFallback("");
+        (void)::routing::RouteWithFallback("");
         FAIL() << "empty route fallback tag must be rejected";
     } catch (const std::invalid_argument&) {
     }
 
-    const acpp::routing::OutboundSelectionPolicy forced =
-        acpp::routing::ForceOutbound("direct");
+    const ::routing::OutboundSelectionPolicy forced =
+        ::routing::ForceOutbound("direct");
     ASSERT_FALSE((RequiresRouting(forced)));
     const auto forced_selection = SelectOutbound(
         forced,
@@ -35,8 +35,8 @@ TEST(OutboundSelection, Contract) {
     ASSERT_FALSE((forced_selection.outbound_tag != "direct" ||
         forced_selection.source != SelectionSource::Forced));
 
-    const acpp::routing::OutboundSelectionPolicy routed =
-        acpp::routing::RouteWithFallback("panel-direct");
+    const ::routing::OutboundSelectionPolicy routed =
+        ::routing::RouteWithFallback("panel-direct");
     ASSERT_FALSE((!RequiresRouting(routed)));
     const auto rule_selection = SelectOutbound(
         routed,

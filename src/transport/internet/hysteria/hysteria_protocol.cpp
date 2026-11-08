@@ -1,6 +1,6 @@
 #include "hysteria_protocol.hpp"
 
-#include "acppnode/common/ip_address.hpp"
+#include "common/ip_address.hpp"
 
 #include <openssl/sha.h>
 
@@ -8,7 +8,7 @@
 #include <charconv>
 #include <limits>
 
-namespace acpp::transport::internet::hysteria {
+namespace transport::internet::hysteria {
 namespace {
 
 class Cursor final {
@@ -86,23 +86,19 @@ void AppendU64(std::vector<uint8_t>& output, uint64_t value) {
         output.push_back(static_cast<uint8_t>(value >> shift));
 }
 
+[[nodiscard]] size_t VarintWidth(uint64_t value) noexcept {
+    if (value <= 63) return 1;
+    if (value <= 16383) return 2;
+    if (value <= 1073741823) return 4;
+    if (value <= 4611686018427387903ULL) return 8;
+    return 0;
+}
+
 bool AppendVarint(std::vector<uint8_t>& output, uint64_t value) {
-    size_t width = 0;
-    uint8_t prefix = 0;
-    if (value <= 63) {
-        width = 1;
-    } else if (value <= 16383) {
-        width = 2;
-        prefix = 0x40;
-    } else if (value <= 1073741823) {
-        width = 4;
-        prefix = 0x80;
-    } else if (value <= 4611686018427387903ULL) {
-        width = 8;
-        prefix = 0xc0;
-    } else {
-        return false;
-    }
+    const size_t width = VarintWidth(value);
+    if (width == 0) return false;
+    const uint8_t prefix = static_cast<uint8_t>(
+        (width == 1 ? 0 : width == 2 ? 1 : width == 4 ? 2 : 3) << 6);
     const size_t start = output.size();
     output.resize(start + width);
     for (size_t i = 0; i < width; ++i) {
@@ -128,6 +124,57 @@ ParseV1Target(std::span<const uint8_t> host, uint16_t port) {
         std::string_view(reinterpret_cast<const char*>(host.data()), host.size()), port);
     if (!target.IsValid()) return tl::unexpected(ProtocolError::Invalid);
     return target;
+}
+
+[[nodiscard]] bool ValidFragmentIndex(Version version, uint8_t index, uint8_t count) noexcept {
+    // HY2 declares Fragment ID irrelevant for an unfragmented packet.
+    return count != 0 && ((version == Version::V2 && count == 1) || index < count);
+}
+
+[[nodiscard]] bool RequiresUdpTarget(Version version, uint8_t index, uint8_t count) noexcept {
+    return version == Version::V1 || count == 1 || index == 0;
+}
+
+struct UdpTargetText {
+    // host 借用调用方的 target 或 address_storage，只用于同步计长与编码。
+    std::string_view host;
+    std::array<char, 5> port{};
+    size_t port_size = 0;
+    size_t authority_size = 0;
+    bool bracket_v6 = false;
+};
+
+[[nodiscard]] tl::expected<UdpTargetText, ProtocolError> PrepareUdpTargetText(
+    Version version, const TargetAddress& target,
+    std::optional<iputil::AddressText>& address_storage) {
+    UdpTargetText text;
+    if (target.IsValid()) text.host = TargetHost(target, address_storage);
+    if (version == Version::V1) {
+        if (text.host.empty() || text.host.size() > kMaxAddressLength)
+            return tl::unexpected(ProtocolError::Invalid);
+        return text;
+    }
+    if (text.host.empty()) return text;
+    const auto [end, error] = std::to_chars(
+        text.port.data(), text.port.data() + text.port.size(), target.port);
+    if (error != std::errc{}) return tl::unexpected(ProtocolError::Invalid);
+    text.port_size = static_cast<size_t>(end - text.port.data());
+    text.bracket_v6 = text.host.find(':') != std::string_view::npos;
+    const size_t suffix = (text.bracket_v6 ? 2 : 0) + 1 + text.port_size;
+    if (text.host.size() > std::numeric_limits<size_t>::max() - suffix)
+        return tl::unexpected(ProtocolError::TooLarge);
+    text.authority_size = text.host.size() + suffix;
+    return text;
+}
+
+[[nodiscard]] tl::expected<size_t, ProtocolError> UdpHeaderSize(
+    Version version, const UdpTargetText& text) {
+    if (version == Version::V1) return 14 + text.host.size();
+    const size_t width = VarintWidth(text.authority_size);
+    if (width == 0 ||
+        text.authority_size > std::numeric_limits<size_t>::max() - 8 - width)
+        return tl::unexpected(ProtocolError::TooLarge);
+    return 8 + width + text.authority_size;
 }
 
 }  // namespace
@@ -267,7 +314,7 @@ ParseUdpMessage(Version version, std::span<const uint8_t> input) {
         const auto payload_size = cursor.U16();
         if (!packet_id || !fragment_id || !fragment_count || !payload_size)
             return tl::unexpected(ProtocolError::Incomplete);
-        if (*fragment_count == 0 || *fragment_id >= *fragment_count)
+        if (!ValidFragmentIndex(version, *fragment_id, *fragment_count))
             return tl::unexpected(ProtocolError::Invalid);
         if (*payload_size > kMaxUdpPayloadLength)
             return tl::unexpected(ProtocolError::TooLarge);
@@ -287,7 +334,7 @@ ParseUdpMessage(Version version, std::span<const uint8_t> input) {
     const auto address_size = cursor.Varint();
     if (!packet_id || !fragment_id || !fragment_count || !address_size)
         return tl::unexpected(ProtocolError::Incomplete);
-    if (*fragment_count == 0 || *fragment_id >= *fragment_count)
+    if (!ValidFragmentIndex(version, *fragment_id, *fragment_count))
         return tl::unexpected(ProtocolError::Invalid);
     if (*address_size > kMaxAddressLength)
         return tl::unexpected(ProtocolError::TooLarge);
@@ -299,7 +346,7 @@ ParseUdpMessage(Version version, std::span<const uint8_t> input) {
         auto target = TargetAddress::Parse(text);
         if (!target) return tl::unexpected(ProtocolError::Invalid);
         result.target = std::move(*target);
-    } else if (*fragment_id == 0) {
+    } else if (RequiresUdpTarget(version, *fragment_id, *fragment_count)) {
         return tl::unexpected(ProtocolError::Invalid);
     }
     if (cursor.remaining() > kMaxUdpPayloadLength)
@@ -311,25 +358,37 @@ ParseUdpMessage(Version version, std::span<const uint8_t> input) {
     return result;
 }
 
+tl::expected<size_t, ProtocolError>
+UdpMessageHeaderSize(Version version, const TargetAddress& target) {
+    std::optional<iputil::AddressText> address_storage;
+    const auto text = PrepareUdpTargetText(version, target, address_storage);
+    if (!text) return tl::unexpected(text.error());
+    return UdpHeaderSize(version, *text);
+}
+
 tl::expected<std::vector<uint8_t>, ProtocolError>
 EncodeUdpMessage(Version version, const UdpMessage& message) {
-    if (message.fragment_count == 0 || message.fragment_id >= message.fragment_count ||
+    if (!ValidFragmentIndex(version, message.fragment_id, message.fragment_count) ||
         message.payload.size() > kMaxUdpPayloadLength)
         return tl::unexpected(ProtocolError::Invalid);
 
     std::optional<iputil::AddressText> address_storage;
-    const auto host = message.target.IsValid()
-        ? TargetHost(message.target, address_storage)
-        : std::string_view{};
-    if (version == Version::V1 && (host.empty() || host.size() > kMaxAddressLength))
+    const auto text = PrepareUdpTargetText(version, message.target, address_storage);
+    if (!text) return tl::unexpected(text.error());
+    if (text->host.empty() && RequiresUdpTarget(
+            version, message.fragment_id, message.fragment_count))
         return tl::unexpected(ProtocolError::Invalid);
+    const auto header_size = UdpHeaderSize(version, *text);
+    if (!header_size) return tl::unexpected(header_size.error());
+    if (message.payload.size() > std::numeric_limits<size_t>::max() - *header_size)
+        return tl::unexpected(ProtocolError::TooLarge);
 
     std::vector<uint8_t> output;
-    output.reserve(32 + host.size() + message.payload.size());
+    output.reserve(*header_size + message.payload.size());
     AppendU32(output, message.session_id);
     if (version == Version::V1) {
-        AppendU16(output, static_cast<uint16_t>(host.size()));
-        output.insert(output.end(), host.begin(), host.end());
+        AppendU16(output, static_cast<uint16_t>(text->host.size()));
+        output.insert(output.end(), text->host.begin(), text->host.end());
         AppendU16(output, message.target.port);
         AppendU16(output, message.packet_id);
         output.push_back(message.fragment_id);
@@ -339,28 +398,14 @@ EncodeUdpMessage(Version version, const UdpMessage& message) {
         AppendU16(output, message.packet_id);
         output.push_back(message.fragment_id);
         output.push_back(message.fragment_count);
-        char port_buf[5]{};
-        size_t port_len = 0;
-        if (!host.empty()) {
-            const auto [end, ec] = std::to_chars(
-                port_buf, port_buf + sizeof(port_buf), message.target.port);
-            if (ec != std::errc{}) return tl::unexpected(ProtocolError::Invalid);
-            port_len = static_cast<size_t>(end - port_buf);
-        } else if (message.fragment_id == 0) {
-            return tl::unexpected(ProtocolError::Invalid);
-        }
-        const bool bracket_v6 = !host.empty() && host.find(':') != std::string_view::npos;
-        const size_t authority_len = host.empty()
-            ? 0
-            : host.size() + (bracket_v6 ? 2 : 0) + 1 + port_len;
-        if (!AppendVarint(output, authority_len))
+        if (!AppendVarint(output, text->authority_size))
             return tl::unexpected(ProtocolError::TooLarge);
-        if (!host.empty()) {
-            if (bracket_v6) output.push_back('[');
-            output.insert(output.end(), host.begin(), host.end());
-            if (bracket_v6) output.push_back(']');
+        if (!text->host.empty()) {
+            if (text->bracket_v6) output.push_back('[');
+            output.insert(output.end(), text->host.begin(), text->host.end());
+            if (text->bracket_v6) output.push_back(']');
             output.push_back(':');
-            output.insert(output.end(), port_buf, port_buf + port_len);
+            output.insert(output.end(), text->port.data(), text->port.data() + text->port_size);
         }
     }
     output.insert(output.end(), message.payload.begin(), message.payload.end());
@@ -373,4 +418,4 @@ std::array<uint8_t, 32> HashCredential(std::string_view credential) noexcept {
     return digest;
 }
 
-}  // namespace acpp::transport::internet::hysteria
+}  // namespace transport::internet::hysteria

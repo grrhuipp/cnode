@@ -1,10 +1,10 @@
 #pragma once
 
-#include "acppnode/common/asio_types.hpp"
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/buf/multi_buffer.hpp"
-#include "acppnode/common/error.hpp"
-#include "acppnode/common/target_address.hpp"
+#include "common/asio_types.hpp"
+#include "common/allocator.hpp"
+#include "common/buf/multi_buffer.hpp"
+#include "common/error.hpp"
+#include "common/target_address.hpp"
 
 #include <array>
 #include <cstdint>
@@ -13,11 +13,9 @@
 #include <string>
 #include <string_view>
 
-namespace acpp {
 class AsyncStream;
-}
 
-namespace acpp::anytls {
+namespace anytls {
 
 inline constexpr uint8_t kCmdWaste = 0;
 inline constexpr uint8_t kCmdSYN = 1;
@@ -139,4 +137,4 @@ DiscardFramePayload(AsyncStream& stream, uint16_t length);
 net::awaitable<tl::expected<buf::MultiBuffer, ErrorCode>>
 ReadFramePayload(AsyncStream& stream, uint16_t length);
 
-}  // namespace acpp::anytls
+}  // namespace anytls

@@ -1,11 +1,11 @@
 #pragma once
 
-#include "acppnode/app/dns/dns.hpp"
-#include "acppnode/app/session_group_executor.hpp"
-#include "acppnode/common/target_address.hpp"
-#include "acppnode/transport/internet/datagram_socket.hpp"
-#include "acppnode/transport/link.hpp"
-#include "acppnode/transport/link_error.hpp"
+#include "app/dns/dns.hpp"
+#include "app/session_group_executor.hpp"
+#include "common/target_address.hpp"
+#include "transport/internet/datagram_socket.hpp"
+#include "transport/link.hpp"
+#include "transport/link_error.hpp"
 
 #include <asio/as_tuple.hpp>
 #include <asio/experimental/awaitable_operators.hpp>
@@ -14,7 +14,7 @@
 #include <asio/this_coro.hpp>
 
 #include <tl/expected.hpp>
-namespace acpp::proxy {
+namespace proxy {
 
 // Outbound-only endpoint preparation. A packet's target and payload remain
 // owned by its logical write until DNS and socket I/O have both finished.
@@ -104,4 +104,4 @@ inline net::awaitable<tl::expected<udp::endpoint, ErrorCode>> ResolveUdpEndpoint
     }
 }
 
-}  // namespace acpp::proxy
+}  // namespace proxy

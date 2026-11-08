@@ -5,7 +5,7 @@
 #include "vless_encryption_record.hpp"
 #include "vless_encryption_xor.hpp"
 
-#include "acppnode/common/allocator.hpp"
+#include "common/allocator.hpp"
 
 #include <array>
 #include <cstddef>
@@ -13,7 +13,7 @@
 #include <optional>
 #include <span>
 
-namespace acpp::vless {
+namespace vless {
 
 inline constexpr size_t kVlessEncryptionIvSize = kVlessEncryptionCtrIvSize;
 inline constexpr size_t kVlessEncryptionTicketSize = 16;
@@ -149,4 +149,4 @@ AcceptVlessEncryptionClientZeroRtt(
     const VlessEncryptionNfsKey& nfs_key,
     const VlessEncryptionPfsKey& pfs_key) noexcept;
 
-}  // namespace acpp::vless
+}  // namespace vless

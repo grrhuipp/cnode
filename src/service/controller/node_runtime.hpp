@@ -1,17 +1,16 @@
 #pragma once
 
-#include "acppnode/api/api.hpp"
-#include "acppnode/app/prepared_inbound.hpp"
-#include "acppnode/app/proxyman/inbound/prepared_config.hpp"
-#include "acppnode/app/proxyman/outbound/prepared_config.hpp"
+#include "api/api.hpp"
+#include "app/prepared_inbound.hpp"
+#include "app/proxyman/inbound/prepared_config.hpp"
+#include "app/proxyman/outbound/prepared_config.hpp"
 #include "node_state.hpp"
-#include "acppnode/infra/panel_config.hpp"
+#include "infra/panel_config.hpp"
 
 #include <memory>
 #include <string>
 #include <vector>
 
-namespace acpp {
 class Worker;
 
 namespace controller {
@@ -48,4 +47,3 @@ private:
 };
 
 }  // namespace controller
-}  // namespace acpp

@@ -1,10 +1,9 @@
-#include "acppnode/app/stats.hpp"
+#include "app/stats.hpp"
 
 #include <format>
 #include <stdexcept>
 #include <string_view>
 
-namespace acpp {
 
 // ============================================================================
 // ShardedStats 实现
@@ -88,4 +87,3 @@ std::string FormatBytes(uint64_t bytes) {
     return std::format("{:.2f}{}", value, units[unit_index]);
 }
 
-}  // namespace acpp

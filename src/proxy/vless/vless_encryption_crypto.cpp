@@ -9,7 +9,7 @@
 #include <memory>
 #include <new>
 
-namespace acpp::vless {
+namespace vless {
 namespace {
 
 [[nodiscard]] std::shared_ptr<EVP_PKEY> ShareKey(
@@ -173,4 +173,4 @@ bool DecapsulateVlessMlKem768(
     return true;
 }
 
-}  // namespace acpp::vless
+}  // namespace vless

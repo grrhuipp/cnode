@@ -1,6 +1,6 @@
 #include "config_semantics.hpp"
 
-#include "acppnode/core/naming.hpp"
+#include "core/naming.hpp"
 
 #include <format>
 #include <stdexcept>
@@ -10,7 +10,6 @@
 #include <unordered_set>
 #include <vector>
 
-namespace acpp {
 
 ConfigSemanticValidation ValidateOutboundSelectionSemantics(
     std::span<const infra::OutboundSourceConfig> outbounds,
@@ -170,4 +169,3 @@ StaticInboundSemanticValidation ValidateStaticInboundSemantics(
     return {};
 }
 
-}  // namespace acpp

@@ -1,10 +1,10 @@
-#include "acppnode/transport/internet/ws_stream.hpp"
+#include "transport/internet/ws_stream.hpp"
 #include "http1_handshake.hpp"
 #include "http_path_match.hpp"
-#include "acppnode/common/binary_text_codec.hpp"
-#include "acppnode/common/unsafe.hpp"
-#include "acppnode/common/buffer_util.hpp"
-#include "acppnode/infra/log.hpp"
+#include "common/binary_text_codec.hpp"
+#include "common/unsafe.hpp"
+#include "common/buffer_util.hpp"
+#include "infra/log.hpp"
 
 #include <openssl/base64.h>
 #include <openssl/rand.h>
@@ -16,7 +16,6 @@
 #include <string_view>
 #include <stdexcept>
 
-namespace acpp {
 
 namespace ws {
 
@@ -637,4 +636,3 @@ net::awaitable<WsHandshakeResult> WsClientStream::Handshake(
     co_return WsHandshakeResult{};
 }
 
-}  // namespace acpp

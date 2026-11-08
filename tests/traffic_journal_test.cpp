@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "service/controller/traffic_journal.hpp"
-#include "acppnode/infra/json.hpp"
+#include "infra/json.hpp"
 
 #include <sys/wait.h>
 #include <sys/stat.h>
@@ -17,10 +17,10 @@ namespace {
 void Check(bool value, const char* message) {
     if (!value) throw std::runtime_error(message);
 }
-using acpp::controller::TrafficJournal;
-acpp::app::UserTrafficSnapshot Sample() {
-    acpp::app::UserTrafficSnapshot result;
-    result.users.emplace(42, acpp::app::UserTraffic{17, 29});
+using ::controller::TrafficJournal;
+::app::UserTrafficSnapshot Sample() {
+    ::app::UserTrafficSnapshot result;
+    result.users.emplace(42, ::app::UserTraffic{17, 29});
     return result;
 }
 void CheckSample(const TrafficJournal::Batch& batch) {
@@ -28,7 +28,7 @@ void CheckSample(const TrafficJournal::Batch& batch) {
           batch.traffic[0].Upload == 17 && batch.traffic[0].Download == 29,
           "durable traffic changed across lifecycle");
 }
-void CrashWrite(const acpp::PanelConfig& config, bool begin) {
+void CrashWrite(const ::PanelConfig& config, bool begin) {
     const auto child = ::fork();
     Check(child >= 0, "fork failed");
     if (child == 0) {
@@ -54,11 +54,11 @@ TEST(TrafficJournal, Contract) {
     Check(created != nullptr, "temporary directory failed");
     const std::filesystem::path root(created);
     try {
-        acpp::PanelConfig config;
+        ::PanelConfig config;
         config.Name = "test";
         config.APIHost = "http://127.0.0.1:12345";
         config.Key = "not-written-to-journal";
-        config.NodeIDs = acpp::PanelNodeIds::Parse(acpp::json::array{1});
+        config.NodeIDs = ::PanelNodeIds::Parse(::json::array{1});
         config.TrafficJournalDir = root / "journal";
         std::filesystem::path directory;
         CrashWrite(config, false);
@@ -112,10 +112,10 @@ TEST(TrafficJournal, Contract) {
             TrafficJournal isolated(config);
             Check(isolated.Directory() != directory && isolated.UnknownCount() == 0,
                   "different panel identity reused accounting state");
-            acpp::app::UserTrafficSnapshot domain_only;
-            acpp::app::DomainTrafficSnapshot first, second;
-            first.counters.users.emplace(42, acpp::app::UserTraffic{5, 8});
-            second.counters.users.emplace(42, acpp::app::UserTraffic{12, 21});
+            ::app::UserTrafficSnapshot domain_only;
+            ::app::DomainTrafficSnapshot first, second;
+            first.counters.users.emplace(42, ::app::UserTraffic{5, 8});
+            second.counters.users.emplace(42, ::app::UserTraffic{12, 21});
             domain_only.domains.push_back(std::move(first));
             domain_only.domains.push_back(std::move(second));
             Check(!domain_only.empty(), "domain-only traffic was mistaken for an empty snapshot");

@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 
-#include "acppnode/transport/internet/tcp_stream.hpp"
-#include "acppnode/transport/internet/transport_stack.hpp"
+#include "transport/internet/tcp_stream.hpp"
+#include "transport/internet/transport_stack.hpp"
 
 #include <asio/as_tuple.hpp>
 #include <asio/co_spawn.hpp>
@@ -22,7 +22,7 @@
 #include <vector>
 
 namespace {
-namespace net = acpp::net;
+namespace net = ::net;
 using namespace std::chrono_literals;
 
 constexpr uint32_t kDefaultWindow = 65535;
@@ -98,11 +98,11 @@ void Settle(net::io_context& io) {
     io.run_for(50ms);
 }
 
-acpp::StreamSettings GrpcSettings() {
-    acpp::StreamSettings settings;
+::StreamSettings GrpcSettings() {
+    ::StreamSettings settings;
     settings.network = "grpc";
     settings.grpc.service_name = "fixture";
-    return acpp::NormalizeStreamSettings(settings);
+    return ::NormalizeStreamSettings(settings);
 }
 
 struct WireFrame {
@@ -115,7 +115,7 @@ struct WireFrame {
 // Raw HTTP/2 peer on a non-blocking socket; Poll() collects complete frames.
 class RawPeer {
 public:
-    RawPeer(acpp::tcp::socket& socket, size_t preface) : socket_(socket), skip_(preface) {
+    RawPeer(::tcp::socket& socket, size_t preface) : socket_(socket), skip_(preface) {
         socket_.non_blocking(true);
     }
 
@@ -124,7 +124,7 @@ public:
     void Poll() {
         std::array<char, 16384> chunk{};
         while (true) {
-            acpp::IoErrorCode error;
+            ::IoErrorCode error;
             const size_t n = socket_.read_some(net::buffer(chunk), error);
             if (error) break;
             buffer_.append(chunk.data(), n);
@@ -198,7 +198,7 @@ public:
     std::vector<WireFrame> frames;
 
 private:
-    acpp::tcp::socket& socket_;
+    ::tcp::socket& socket_;
     std::string buffer_;
     size_t skip_ = 0;
 };
@@ -208,19 +208,19 @@ private:
 // stream by the difference while the connection window stays independent.
 void ClientWaitsForPeerWindows() {
     net::io_context io;
-    acpp::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
-    acpp::tcp::socket dialed(io), server(io);
+    ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
+    ::tcp::socket dialed(io), server(io);
     dialed.connect(acceptor.local_endpoint());
     acceptor.accept(server);
-    auto raw = std::make_unique<acpp::TcpStream>(std::move(dialed));
+    auto raw = std::make_unique<::TcpStream>(std::move(dialed));
     const auto settings = GrpcSettings();
     const std::string payload(200000, 'x');
-    std::unique_ptr<acpp::AsyncStream> stream;
+    std::unique_ptr<::AsyncStream> stream;
     bool written = false;
     bool finished = false;
     std::exception_ptr failure;
     auto client = [&]() -> net::awaitable<void> {
-        auto result = co_await acpp::BuildOutboundTransport(std::move(raw), settings, nullptr);
+        auto result = co_await ::BuildOutboundTransport(std::move(raw), settings, nullptr);
         Require(result.has_value() && *result, "gRPC client handshake failed");
         stream = std::move(*result);
         (void)co_await stream->AsyncWrite(net::buffer(payload));
@@ -270,9 +270,9 @@ struct ParkedWriterClient {
         : acceptor(io, {net::ip::address_v4::loopback(), 0}), dialed(io), server(io) {
         dialed.connect(acceptor.local_endpoint());
         acceptor.accept(server);
-        auto client = [this, raw = std::make_unique<acpp::TcpStream>(std::move(dialed))]()
+        auto client = [this, raw = std::make_unique<::TcpStream>(std::move(dialed))]()
             mutable -> net::awaitable<void> {
-            auto result = co_await acpp::BuildOutboundTransport(std::move(raw), settings, nullptr);
+            auto result = co_await ::BuildOutboundTransport(std::move(raw), settings, nullptr);
             Require(result.has_value() && *result, "gRPC client handshake failed");
             stream = std::move(*result);
             (void)co_await stream->AsyncWrite(net::buffer(payload));
@@ -296,12 +296,12 @@ struct ParkedWriterClient {
         Require(!writer_finished, "client writer stopped waiting for send credit");
     }
 
-    acpp::tcp::acceptor acceptor;
-    acpp::tcp::socket dialed;
-    acpp::tcp::socket server;
-    acpp::StreamSettings settings = GrpcSettings();
+    ::tcp::acceptor acceptor;
+    ::tcp::socket dialed;
+    ::tcp::socket server;
+    ::StreamSettings settings = GrpcSettings();
     std::string payload = std::string(200000, 'x');
-    std::unique_ptr<acpp::AsyncStream> stream;
+    std::unique_ptr<::AsyncStream> stream;
     std::exception_ptr writer_failure;
     bool writer_finished = false;
 };
@@ -390,24 +390,24 @@ void ClientReturnsCreditAsReaderTakesData() {
     RunUntil(io, [&] { return client.writer_finished; }, "client writer did not finish");
 }
 
-class WritingSink final : public acpp::InboundTransportStreamHandler {
+class WritingSink final : public ::InboundTransportStreamHandler {
 public:
     WritingSink(net::io_context& io, size_t size) : release(io, 1), payload(size, 'y') {}
 
     net::awaitable<void> OnInboundTransportStream(
-        std::unique_ptr<acpp::AsyncStream> stream,
-        acpp::InboundTransportMetadata) override {
+        std::unique_ptr<::AsyncStream> stream,
+        ::InboundTransportMetadata) override {
         try {
             (void)co_await stream->AsyncWrite(net::buffer(payload));
             written = true;
-        } catch (const acpp::IoSystemError&) {
+        } catch (const ::IoSystemError&) {
         }
         co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
         (void)co_await release.async_receive(net::as_tuple(net::use_awaitable));
         stream->CloseAbortive();
     }
 
-    net::experimental::channel<void(acpp::IoErrorCode)> release;
+    net::experimental::channel<void(::IoErrorCode)> release;
     std::string payload;
     bool written = false;
 };
@@ -416,17 +416,17 @@ public:
 // the 65535-octet connection window until WINDOW_UPDATE grants more.
 void ServerWaitsForPeerWindows() {
     net::io_context io;
-    acpp::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
-    acpp::tcp::socket client(io), accepted(io);
+    ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
+    ::tcp::socket client(io), accepted(io);
     client.connect(acceptor.local_endpoint());
     acceptor.accept(accepted);
-    auto raw = std::make_unique<acpp::TcpStream>(std::move(accepted));
+    auto raw = std::make_unique<::TcpStream>(std::move(accepted));
     auto sink = std::make_shared<WritingSink>(io, 100000);
     const auto settings = GrpcSettings();
     bool returned = false;
     std::exception_ptr failure;
     auto build = [&]() -> net::awaitable<void> {
-        (void)co_await acpp::BuildInboundTransport(io, std::move(raw), settings, nullptr, 0, sink);
+        (void)co_await ::BuildInboundTransport(io, std::move(raw), settings, nullptr, 0, sink);
     };
     net::co_spawn(io, build(), [&](std::exception_ptr error) {
         failure = error;
@@ -459,9 +459,9 @@ void ServerWaitsForPeerWindows() {
              "server did not resume after the connection WINDOW_UPDATE");
     Require(peer.LargestData() <= kMaxFramePayload, "server exceeded SETTINGS_MAX_FRAME_SIZE");
 
-    acpp::IoErrorCode ignored;
+    ::IoErrorCode ignored;
     client.close(ignored);
-    Require(sink->release.try_send(acpp::IoErrorCode{}), "sink release failed");
+    Require(sink->release.try_send(::IoErrorCode{}), "sink release failed");
     RunUntil(io, [&] { return returned; }, "server session did not finish");
     if (failure) std::rethrow_exception(failure);
 }

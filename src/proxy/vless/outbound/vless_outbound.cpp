@@ -1,6 +1,6 @@
 #include "vless_outbound.hpp"
-#include "acppnode/common/domain_name.hpp"
-#include "acppnode/common/ip_address.hpp"
+#include "common/domain_name.hpp"
+#include "common/ip_address.hpp"
 
 #include "../vless_codec.hpp"
 #include "../vless_encryption.hpp"
@@ -12,27 +12,27 @@
 #include "../../handshake_timeout.hpp"
 #include "../../outbound_server.hpp"
 #include "../../outbound_stream_endpoint.hpp"
-#include "acppnode/app/dns/dns.hpp"
-#include "acppnode/app/proxyman/outbound/factory.hpp"
-#include "acppnode/app/session_group_executor.hpp"
+#include "app/dns/dns.hpp"
+#include "app/proxyman/outbound/factory.hpp"
+#include "app/session_group_executor.hpp"
 #include "../../../app/proxyman/outbound/registration.hpp"
-#include "acppnode/infra/json_field.hpp"
-#include "acppnode/app/relay.hpp"
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/buffer_util.hpp"
-#include "acppnode/common/buf/multi_buffer.hpp"
-#include "acppnode/common/buf/length_prefixed_packet_buffer.hpp"
-#include "acppnode/common/error.hpp"
-#include "acppnode/common/mux/mux_codec.hpp"
-#include "acppnode/common/session.hpp"
-#include "acppnode/core/constants.hpp"
-#include "acppnode/core/naming.hpp"
-#include "acppnode/infra/log.hpp"
-#include "acppnode/infra/config_types.hpp"
+#include "infra/json_field.hpp"
+#include "app/relay.hpp"
+#include "common/allocator.hpp"
+#include "common/buffer_util.hpp"
+#include "common/buf/multi_buffer.hpp"
+#include "common/buf/length_prefixed_packet_buffer.hpp"
+#include "common/error.hpp"
+#include "common/mux/mux_codec.hpp"
+#include "common/session.hpp"
+#include "core/constants.hpp"
+#include "core/naming.hpp"
+#include "infra/log.hpp"
+#include "infra/config_types.hpp"
 #include "../credentials.hpp"
-#include "acppnode/transport/async_stream.hpp"
-#include "acppnode/transport/internet/outbound_target_builder.hpp"
-#include "acppnode/transport/link.hpp"
+#include "transport/async_stream.hpp"
+#include "transport/internet/outbound_target_builder.hpp"
+#include "transport/link.hpp"
 
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/co_spawn.hpp>
@@ -46,12 +46,11 @@
 #include <utility>
 #include <vector>
 
-namespace acpp {
 
 namespace {
 
-using ::acpp::vless::VlessBufferedReader;
-using ::acpp::vless::WriteVlessBytes;
+using ::vless::VlessBufferedReader;
+using ::vless::WriteVlessBytes;
 
 // Version, addons length, then addons this client ignores. Progress lives in
 // the endpoint so a cancelled read resumes at the same stream offset.
@@ -84,9 +83,9 @@ net::awaitable<void> ReadVlessResponseHeader(VlessBufferedReader& reader,
 class VlessOutboundEndpoint final : public proxy::OutboundStreamEndpointBase {
 public:
     struct VisionIoState : memory::ThreadAllocated {
-        ::acpp::vless::VisionTrafficState traffic;
-        ::acpp::vless::VisionReader reader;
-        ::acpp::vless::VisionWriter writer;
+        ::vless::VisionTrafficState traffic;
+        ::vless::VisionReader reader;
+        ::vless::VisionWriter writer;
 
         VisionIoState(VlessBufferedReader& src,
                       transport::MultiBufferWriter& dst,
@@ -96,7 +95,7 @@ public:
     };
     struct UdpIoState : memory::ThreadAllocated {
         explicit UdpIoState(bool packet_addr) : framer(packet_addr) {}
-        ::acpp::vless::UdpFramer framer;
+        ::vless::UdpFramer framer;
     };
 
     VlessOutboundEndpoint(AsyncStream& control,
@@ -141,7 +140,7 @@ public:
             return writer_.WriteMultiBuffer(std::move(mb));
         }
 
-        return ::acpp::vless::WriteUdpDatagram(
+        return ::vless::WriteUdpDatagram(
             writer_, std::move(mb), packet_addr_,
             packet_addr_ ? nullptr : &udp_target_);
     }
@@ -154,7 +153,7 @@ public:
             return writer_.WriteBuffers(buffers);
         }
 
-        return ::acpp::vless::WriteUdpDatagram(
+        return ::vless::WriteUdpDatagram(
             writer_, udp_target_, packet_addr_, buffers);
     }
 
@@ -244,15 +243,17 @@ public:
                 if (header->status == mux::SessionStatus::END) {
                     peer_ended_ = true;
                     pending_.clear();
-                    if (payload.byte_size() == 0) {
+                    if (!header->has_data) {
                         co_return buf::MultiBuffer{};
                     }
                 }
-                if (payload.byte_size() == 0) continue;
+                if (!header->has_data) continue;
                 const TargetAddress& src = header->has_target
                     ? header->target
                     : udp_target_;
-                buf::SetUdpDatagramTarget(payload, src);
+                if (!buf::SetUdpTarget(payload, src)) {
+                    throw std::bad_alloc();
+                }
                 co_return payload;
             }
 
@@ -268,34 +269,18 @@ public:
     }
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
-        struct ClearOnExit {
-            buf::MultiBuffer& mb;
-            ~ClearOnExit() { mb.clear(); }
-        } clear_guard{mb};
-        const TargetAddress* target = nullptr;
-        ConstBufferSpanBuilder<buf::MultiBuffer::kInlineCapacity> payload;
-        for (const buf::Buffer* buffer : mb) {
-            if (!buffer || buffer->IsEmpty()) {
-                continue;
-            }
-            const TargetAddress& buffer_target = buffer->HasUDP()
-                ? buffer->UDP()
-                : udp_target_;
-            if (!target) {
-                target = std::addressof(buffer_target);
-            } else if (!target->SameEndpoint(buffer_target)) {
-                throw IoSystemError(
-                    io_error::invalid_argument,
-                    "VLESS mux datagram contains mixed targets");
-            }
-            const auto bytes = buffer->Bytes();
-            payload.Append(net::const_buffer(bytes.data(), bytes.size()));
-        }
-        if (!target || payload.empty()) {
+        const auto datagram = buf::InspectUdpDatagram(mb);
+        if (datagram.status == buf::UdpDatagramStatus::Empty) {
             co_return;
         }
-
-        co_await WriteDatagram(*target, payload.Span());
+        if (!datagram.Valid() || !datagram.target->IsValid()) {
+            throw IoSystemError(
+                io_error::invalid_argument,
+                "VLESS mux datagram contains missing or mixed targets");
+        }
+        ConstBufferSpanBuilder<buf::MultiBuffer::kInlineCapacity> payload;
+        payload.AppendMultiBuffer(mb);
+        co_await WriteDatagram(*datagram.target, payload.Span());
     }
 
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
@@ -328,15 +313,12 @@ private:
                 io_error::message_size,
                 "VLESS mux datagram exceeds wire length");
         }
-        if (*payload_size == 0) {
-            co_return;
-        }
 
         std::array<uint8_t, mux::kMaxFrameHeaderBytes> write_frame{};
         const size_t header_len = !session_started_
             ? mux::EncodeNewHeaderTo(
                   write_frame, session_id_, mux::NetworkType::UDP,
-                  target, *payload_size,
+                  target, *payload_size, true,
                   forwarded_ ? forwarded_->View() : ForwardedMetadataView{})
             : mux::EncodeKeepUDPHeaderTo(
                   write_frame, session_id_, target, *payload_size);
@@ -370,7 +352,7 @@ net::awaitable<tl::expected<void, ErrorCode>>
 SendVlessHandshake(
     AsyncStream& stream,
     const VlessOutboundConfig& config,
-    ::acpp::vless::VlessEncryptionClientTicketCache* encryption_tickets,
+    ::vless::VlessEncryptionClientTicketCache* encryption_tickets,
     const TargetAddress& target,
     bool is_udp,
     bool use_vision,
@@ -379,7 +361,7 @@ SendVlessHandshake(
     std::chrono::seconds handshake_timeout,
     VlessBufferedReader& protocol_reader,
     transport::MultiBufferWriter& protocol_writer,
-    std::unique_ptr<::acpp::vless::VlessEncryptedIo>& encrypted_io,
+    std::unique_ptr<::vless::VlessEncryptedIo>& encrypted_io,
     VlessBufferedReader*& active_reader,
     transport::MultiBufferWriter*& active_writer,
     const OutboundDialer& dialer,
@@ -391,7 +373,7 @@ SendVlessHandshake(
     if (config.encryption) {
         try {
             auto runtime =
-                co_await ::acpp::vless::RunVlessEncryptionClientHandshake(
+                co_await ::vless::RunVlessEncryptionClientHandshake(
                     protocol_reader,
                     protocol_writer,
                     *config.encryption,
@@ -401,12 +383,12 @@ SendVlessHandshake(
                         stream, outbound_protocol_deadline)) {
                     co_return tl::unexpected(ErrorCode::TIMEOUT);
                 }
-                if (runtime.error() == ::acpp::vless::VlessEncryptionHandshakeFailure::Truncated) {
+                if (runtime.error() == ::vless::VlessEncryptionHandshakeFailure::Truncated) {
                     co_return tl::unexpected(ErrorCode::SOCKET_READ_FAILED);
                 }
                 co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
             }
-            encrypted_io = std::make_unique<::acpp::vless::VlessEncryptedIo>(
+            encrypted_io = std::make_unique<::vless::VlessEncryptedIo>(
                 protocol_reader, protocol_writer, std::move(*runtime));
             active_reader = &encrypted_io->plain_reader;
             active_writer = &encrypted_io->writer;
@@ -419,16 +401,16 @@ SendVlessHandshake(
         }
     }
 
-    std::array<uint8_t, ::acpp::vless::kMaxRequestHeaderSize> header_buf{};
+    std::array<uint8_t, ::vless::kMaxRequestHeaderSize> header_buf{};
     const TargetAddress packet_magic_target = use_packet_addr
-        ? TargetAddress(::acpp::vless::kPacketAddrMagicAddress, 0)
+        ? TargetAddress(::vless::kPacketAddrMagicAddress, 0)
         : TargetAddress{};
     const TargetAddress& request_target = use_packet_addr ? packet_magic_target : target;
-    const size_t header_len = ::acpp::vless::EncodeRequestHeaderTo(
+    const size_t header_len = ::vless::EncodeRequestHeaderTo(
         config.uuid_bytes,
         use_xudp
-            ? ::acpp::vless::Command::MUX
-            : (is_udp ? ::acpp::vless::Command::UDP : ::acpp::vless::Command::TCP),
+            ? ::vless::Command::MUX
+            : (is_udp ? ::vless::Command::UDP : ::vless::Command::TCP),
         request_target,
         header_buf.data(),
         header_buf.size(),
@@ -459,7 +441,7 @@ proxy::vless::outbound::Handler::Handler(
     std::shared_ptr<const VlessOutboundConfig> config)
     : config_(std::move(config))
     , encryption_tickets_(config_->encryption
-          ? std::make_shared<::acpp::vless::VlessEncryptionClientTicketCache>()
+          ? std::make_shared<::vless::VlessEncryptionClientTicketCache>()
           : nullptr)
     , ticket_domain_(ExecutionDomain::Current())
     , has_ticket_domain_(static_cast<bool>(ExecutionDomain::Current())) {}
@@ -506,16 +488,16 @@ proxy::vless::outbound::Handler::Process(
     // holds a private snapshot; rejection clears only that exact ticket identity,
     // never a ticket published by a concurrent successful handshake.
     struct TicketLease {
-        std::shared_ptr<::acpp::vless::VlessEncryptionClientTicketCache> cache{};
+        std::shared_ptr<::vless::VlessEncryptionClientTicketCache> cache{};
         std::shared_ptr<ExecutionDomain> domain{};
         bool has_domain = false;
-        ::acpp::vless::VlessEncryptionClientTicketCache local{};
-        std::array<uint8_t, ::acpp::vless::kVlessEncryptionTicketSize> identity{};
+        ::vless::VlessEncryptionClientTicketCache local{};
+        std::array<uint8_t, ::vless::kVlessEncryptionTicketSize> identity{};
         std::chrono::steady_clock::time_point original_expiry{};
 
         net::awaitable<void> Acquire() {
             if (!cache || (has_domain && !domain)) co_return;
-            auto read = [&]() -> net::awaitable<::acpp::vless::VlessEncryptionClientTicketCache> {
+            auto read = [&]() -> net::awaitable<::vless::VlessEncryptionClientTicketCache> {
                 co_return *cache;
             };
             local = domain
@@ -563,7 +545,7 @@ proxy::vless::outbound::Handler::Process(
     transport::MultiBufferWriter& protocol_writer = *stream;
     VlessBufferedReader* active_reader = &protocol_reader;
     transport::MultiBufferWriter* active_writer = &protocol_writer;
-    std::unique_ptr<::acpp::vless::VlessEncryptedIo> encrypted_io;
+    std::unique_ptr<::vless::VlessEncryptedIo> encrypted_io;
 
     if (auto ok = co_await SendVlessHandshake(
             *stream, *config_, encryption_tickets_ ? &tickets.local : nullptr, target,
@@ -612,19 +594,18 @@ proxy::vless::outbound::Handler::Process(
     co_return res;
 }
 
-}  // namespace acpp
 
 namespace {
-const bool kVlessRegistered = (acpp::proxyman::outbound::RegisterProxy(
-    acpp::constants::protocol::kVless,
-    [](const acpp::infra::OutboundSourceConfig& cfg)
-        -> std::optional<acpp::proxyman::outbound::PreparedOutboundProxy> {
+const bool kVlessRegistered = (::proxyman::outbound::RegisterProxy(
+    ::constants::protocol::kVless,
+    [](const ::infra::OutboundSourceConfig& cfg)
+        -> std::optional<::proxyman::outbound::PreparedOutboundProxy> {
         // A present field of the wrong type is a configuration error, never
         // an implicit default.
         bool invalid_field = false;
-        auto json_string = [&](const acpp::json::object& obj,
+        auto json_string = [&](const ::json::object& obj,
                                std::string_view key) -> std::string {
-            auto parsed = acpp::ParseJsonString(obj, key);
+            auto parsed = ::ParseJsonString(obj, key);
             if (!parsed) {
                 LOG_ERROR("VLESS outbound '{}': {}", cfg.tag, parsed.error());
                 invalid_field = true;
@@ -633,7 +614,7 @@ const bool kVlessRegistered = (acpp::proxyman::outbound::RegisterProxy(
             return std::move(*parsed).value_or(std::string{});
         };
 
-        acpp::VlessOutboundConfig vless_config;
+        ::VlessOutboundConfig vless_config;
         std::string address;
         uint16_t port = 443;
         std::string uuid;
@@ -646,7 +627,7 @@ const bool kVlessRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 vnext_p->as_array()[0].is_object()) {
             const auto& server = vnext_p->as_array()[0].as_object();
             address = json_string(server, "address");
-            const auto source_port = acpp::ReadJsonPort(server, "port");
+            const auto source_port = ::ReadJsonPort(server, "port");
             if (source_port.Invalid()) {
                 return std::nullopt;
             }
@@ -674,7 +655,7 @@ const bool kVlessRegistered = (acpp::proxyman::outbound::RegisterProxy(
             }
         } else {
             address = json_string(s, "address");
-            const auto source_port = acpp::ReadJsonPort(s, "port");
+            const auto source_port = ::ReadJsonPort(s, "port");
             if (source_port.Invalid()) {
                 return std::nullopt;
             }
@@ -693,21 +674,21 @@ const bool kVlessRegistered = (acpp::proxyman::outbound::RegisterProxy(
             return std::nullopt;
         }
 
-        if (!acpp::vless::IsNoVlessEncryption(encryption)) {
-            auto parsed = acpp::vless::ParseVlessClientEncryption(
+        if (!::vless::IsNoVlessEncryption(encryption)) {
+            auto parsed = ::vless::ParseVlessClientEncryption(
                 encryption);
             if (!parsed) {
                 LOG_WARN("VLESS outbound '{}': invalid encryption: {}",
                          cfg.tag,
-                         acpp::vless::VlessEncryptionParseErrorMessage(
+                         ::vless::VlessEncryptionParseErrorMessage(
                              parsed.error));
                 return std::nullopt;
             }
-            vless_config.encryption = std::make_shared<const acpp::vless::VlessEncryptionConfig>(
+            vless_config.encryption = std::make_shared<const ::vless::VlessEncryptionConfig>(
                 std::move(*parsed.config));
         }
 
-        packet_encoding = acpp::naming::LowerAscii(std::move(packet_encoding));
+        packet_encoding = ::naming::LowerAscii(std::move(packet_encoding));
         if (packet_encoding.empty() || packet_encoding == "xudp") {
             vless_config.packet_xudp = true;
             vless_config.packet_addr = false;
@@ -725,43 +706,43 @@ const bool kVlessRegistered = (acpp::proxyman::outbound::RegisterProxy(
             return std::nullopt;
         }
 
-        vless_config.flow = acpp::vless::NormalizeFlow(vless_config.flow);
+        vless_config.flow = ::vless::NormalizeFlow(vless_config.flow);
         if (!vless_config.flow.empty() &&
-            !acpp::vless::IsVisionFlow(vless_config.flow)) {
+            !::vless::IsVisionFlow(vless_config.flow)) {
             LOG_WARN("VLESS outbound '{}': flow '{}' is not supported",
                      cfg.tag, vless_config.flow);
             return std::nullopt;
         }
 
-        const auto uuid_bytes = acpp::vless::ParseUuidBytes(uuid);
+        const auto uuid_bytes = ::vless::ParseUuidBytes(uuid);
         if (!uuid_bytes) {
             LOG_ERROR("VLESS outbound '{}': invalid UUID", cfg.tag);
             return std::nullopt;
         }
         vless_config.uuid_bytes = *uuid_bytes;
-        auto next_hop = acpp::proxy::PrepareNextHop(
-            cfg, std::move(address), port, acpp::OutboundStreamDefaults{});
+        auto next_hop = ::proxy::PrepareNextHop(
+            cfg, std::move(address), port, ::OutboundStreamDefaults{});
         if (!next_hop) {
             return std::nullopt;
         }
         const auto& stream_settings = next_hop->sender.stream_settings;
         if (!vless_config.flow.empty() &&
             (!(stream_settings.IsTlsLike() || vless_config.encryption != nullptr) ||
-             stream_settings.network_mode != acpp::NetworkMode::Tcp)) {
+             stream_settings.network_mode != ::NetworkMode::Tcp)) {
             LOG_ERROR("VLESS outbound '{}': Vision requires TCP with TLS, Reality, or VLESS Encryption", cfg.tag);
             return std::nullopt;
         }
         vless_config.server = std::move(next_hop->server);
         const bool persistent_state = bool(vless_config.encryption);
 
-        return acpp::proxyman::outbound::PreparedOutboundProxy{
-            .create = acpp::proxyman::outbound::MakePreparedOutboundCreator<
-                acpp::VlessOutboundConfig,
+        return ::proxyman::outbound::PreparedOutboundProxy{
+            .create = ::proxyman::outbound::MakePreparedOutboundCreator<
+                ::VlessOutboundConfig,
                 +[](std::string_view,
-                    std::shared_ptr<const acpp::VlessOutboundConfig> cfg_state,
-                    acpp::net::io_context& /*io_context*/,
-                    acpp::AwaitableTaskGroup& /*tasks*/) -> std::unique_ptr<acpp::Outbound> {
-                    return std::make_unique<acpp::proxy::vless::outbound::Handler>(
+                    std::shared_ptr<const ::VlessOutboundConfig> cfg_state,
+                    ::net::io_context& /*io_context*/,
+                    ::AwaitableTaskGroup& /*tasks*/) -> std::unique_ptr<::Outbound> {
+                    return std::make_unique<::proxy::vless::outbound::Handler>(
                         std::move(cfg_state));
                 }>(std::move(vless_config), persistent_state),
             .sender = std::move(next_hop->sender),

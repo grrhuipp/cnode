@@ -2,7 +2,7 @@
 #include <gtest/gtest.h>
 
 #include "vless_ticket_service.hpp"
-#include "acppnode/app/session_group_executor.hpp"
+#include "app/session_group_executor.hpp"
 #include <asio/co_spawn.hpp>
 #include <asio/executor_work_guard.hpp>
 #include <asio/post.hpp>
@@ -17,8 +17,7 @@
 #include <thread>
 
 namespace {
-using namespace acpp;
-using namespace acpp::vless;
+using namespace ::vless;
 using Ticket = std::array<uint8_t, 16>;
 void Check(bool value, const char* what) {
     if (!value) { std::cerr << what << '\n'; ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed"); }

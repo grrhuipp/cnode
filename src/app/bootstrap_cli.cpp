@@ -1,10 +1,9 @@
-#include "acppnode/app/bootstrap_cli.hpp"
+#include "app/bootstrap_cli.hpp"
 
 #include <format>
 #include <iostream>
 #include <utility>
 
-namespace acpp {
 
 namespace {
 
@@ -104,4 +103,3 @@ void PrintVersion(std::ostream& out) {
     out << BUILD_CHANNEL << ":" << BUILD_ID << "\n";
 }
 
-}  // namespace acpp

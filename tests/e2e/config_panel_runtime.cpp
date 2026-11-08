@@ -81,7 +81,9 @@ void WaitEvent(Child& child, std::string_view event, int node, Milliseconds time
         return Events(child.LogPath(), event, node) != 0;
     }, timeout);
 }
-void ShutdownConfig(const std::filesystem::path& root, const std::vector<uint16_t>& ports, uint16_t panel) {
+
+void ShutdownConfig(const std::filesystem::path& root, const std::vector<uint16_t>& ports,
+                    uint16_t panel, std::string_view listen) {
     Json config = {{"workers", 2}, {"log", {{"enable", false}, {"logDir", (root / "logs").string()}}},
         {"dns", {{"servers", {"127.0.0.1", "::1"}}, {"timeout", 5}, {"cacheSize", 1000}, {"minTTL", 30}, {"maxTTL", 3600}}},
         {"limits", {{"maxConnections", 0}, {"maxConnectionsPerIP", 100}}},
@@ -92,7 +94,7 @@ void ShutdownConfig(const std::filesystem::path& root, const std::vector<uint16_
     WriteJson(root, "config.json", config);
     Json inbounds = Json::array();
     for (const auto port : ports) inbounds.push_back({{"tag", "shutdown-test-" + std::to_string(inbounds.size())},
-        {"protocol", "shadowsocks"}, {"listen", "127.0.0.1"}, {"port", port},
+        {"protocol", "shadowsocks"}, {"listen", listen}, {"port", port},
         {"settings", {{"method", "aes-128-gcm"}, {"password", "shutdown-fixture"}}},
         {"streamSettings", {{"network", "tcp"}, {"security", "none"}}}});
     WriteJson(root, "inbounds.json", inbounds);
@@ -100,27 +102,28 @@ void ShutdownConfig(const std::filesystem::path& root, const std::vector<uint16_
     WriteJson(root, "routing.json", {{"rules", Json::array({{{"port", "80,443,1000-2000"},
         {"sourcePort", Json::array({53, "1024-65535"})}, {"outboundTag", "direct"}}})}});
 }
-void ExpectPortsReleased(uint16_t port) {
-    EXPECT_NO_THROW({ auto tcp = Socket::Listen(port); auto udp = Socket::BindUdp(port); });
+void ExpectPortsReleased(uint16_t port, std::string_view address) {
+    EXPECT_NO_THROW({ auto tcp = Socket::Listen(port, address); auto udp = Socket::BindUdp(port, address); });
 }
 TEST(RuntimeExit, StartupFailureRollsBackEarlierTcpAndUdpListeners) {
     TempDir directory;
-    auto blocked = Socket::Listen();
-    auto available = Socket::Listen();
+    auto reservation = ReserveRuntimePort();
+    auto blocked = Socket::Listen(0, reservation.address);
     auto unavailable_panel = Socket::Listen();
-    const auto port = available.Port();
-    ShutdownConfig(directory.Path(), {port, blocked.Port()}, unavailable_panel.Port());
-    available.Close();
+    const auto port = reservation.tcp.Port();
+    ShutdownConfig(directory.Path(), {port, blocked.Port()}, unavailable_panel.Port(), reservation.address);
+    reservation.tcp.Close();
+    reservation.udp.Close();
     auto child = Start(directory.Path());
     EXPECT_EQ(child->Wait(10s), 1) << ReadFile(child->LogPath());
-    ExpectPortsReleased(port);
+    ExpectPortsReleased(port, reservation.address);
 }
 TEST(RuntimeExit, SigtermJoinsPendingTcpUdpAndHangingPanelOperations) {
     TempDir directory;
-    auto available = Socket::Listen();
+    auto reservation = ReserveRuntimePort();
     auto panel = Socket::Listen();
-    const auto port = available.Port();
-    ShutdownConfig(directory.Path(), {port}, panel.Port());
+    const auto port = reservation.tcp.Port();
+    ShutdownConfig(directory.Path(), {port}, panel.Port(), reservation.address);
     std::atomic<bool> connected{false}, closed{false};
     PeerThread peer([&] {
         auto socket = panel.Accept(8s);
@@ -128,20 +131,21 @@ TEST(RuntimeExit, SigtermJoinsPendingTcpUdpAndHangingPanelOperations) {
         connected = true;
         closed = ReadClosed(socket, 10s);
     });
-    available.Close();
+    reservation.tcp.Close();
+    reservation.udp.Close();
     auto child = Start(directory.Path());
     child->WaitForLog("server started");
-    Until([&] { return connected.load() && Listening(port); }, 8s);
-    auto held = Socket::Connect(port);
+    Until([&] { return connected.load(); }, 8s);
+    auto held = Socket::Connect(port, reservation.address);
     held.Write("z");
     auto udp = Socket::BindUdp();
-    udp.SendTo("z", port);
-    EXPECT_THROW(Socket::BindUdp(port), std::exception);
+    udp.SendTo("z", port, reservation.address);
+    EXPECT_THROW(Socket::BindUdp(port, reservation.address), std::exception);
     EXPECT_EQ(child->Stop(10s), 0);
     peer.Join();
     EXPECT_TRUE(closed.load());
     EXPECT_TRUE(ReadClosed(held, 2s));
-    ExpectPortsReleased(port);
+    ExpectPortsReleased(port, reservation.address);
 }
 class TestMode : public testing::TestWithParam<std::string> {};
 TEST_P(TestMode, ExplicitAndImplicitListenerOwnership) {

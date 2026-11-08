@@ -1,6 +1,6 @@
-#include "acppnode/app/proxyman/inbound/user_store.hpp"
+#include "app/proxyman/inbound/user_store.hpp"
 
-#include "acppnode/app/proxyman/inbound/prepared_config.hpp"
+#include "app/proxyman/inbound/prepared_config.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cstring>
@@ -10,7 +10,7 @@
 #include <unordered_set>
 #include <utility>
 
-namespace acpp::proxyman::inbound {
+namespace proxyman::inbound {
 
 namespace {
 
@@ -433,4 +433,4 @@ size_t UserStore::TotalUsers() {
     return total;
 }
 
-}  // namespace acpp::proxyman::inbound
+}  // namespace proxyman::inbound

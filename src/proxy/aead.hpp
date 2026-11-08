@@ -10,7 +10,7 @@
 #include <optional>
 #include <span>
 
-namespace acpp::proxy {
+namespace proxy {
 
 enum class AeadDirection { Encrypt, Decrypt };
 
@@ -76,4 +76,4 @@ private:
 using AeadEncryptor = AeadContext<AeadDirection::Encrypt>;
 using AeadDecryptor = AeadContext<AeadDirection::Decrypt>;
 
-} // namespace acpp::proxy
+} // namespace proxy

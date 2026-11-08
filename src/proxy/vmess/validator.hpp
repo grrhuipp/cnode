@@ -11,8 +11,8 @@
 //   - 在线用户追踪
 // ============================================================================
 
-#include "acppnode/app/proxyman/inbound/user_store.hpp"
-#include "acppnode/common/sharded_user_stats.hpp"
+#include "app/proxyman/inbound/user_store.hpp"
+#include "common/sharded_user_stats.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -20,7 +20,6 @@
 #include <string_view>
 #include <vector>
 
-namespace acpp {
 
 namespace vmess {
 
@@ -55,4 +54,3 @@ public:
 };
 
 }  // namespace vmess
-}  // namespace acpp

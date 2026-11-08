@@ -1,44 +1,42 @@
 #pragma once
 
-#include "acppnode/proxy/inbound.hpp"
-#include "acppnode/common/sharded_user_stats.hpp"
+#include "proxy/inbound.hpp"
+#include "common/sharded_user_stats.hpp"
 
 #include <memory>
 #include <string>
 
-namespace acpp {
 struct StatsShard;
-}  // namespace acpp
 
-namespace acpp::vless {
+namespace vless {
 struct VlessEncryptionConfig;
-}  // namespace acpp::vless
+}  // namespace vless
 
-namespace acpp::proxy::vless::inbound {
+namespace proxy::vless::inbound {
 
-class Handler final : public ::acpp::Inbound {
+class Handler final : public ::Inbound {
 public:
-    Handler(::acpp::UserOnlineTracker& validator,
-            ::acpp::StatsShard& stats,
-            ::acpp::ConnectionLimiter* limiter,
+    Handler(::UserOnlineTracker& validator,
+            ::StatsShard& stats,
+            ::ConnectionLimiter* limiter,
             std::shared_ptr<
-                const ::acpp::vless::VlessEncryptionConfig> decryption = {});
+                const ::vless::VlessEncryptionConfig> decryption = {});
     ~Handler() override;
 
-    ::acpp::net::awaitable<::acpp::RelayResult> Process(
-        std::unique_ptr<::acpp::AsyncStream> stream,
-        ::acpp::routing::Dispatcher& dispatcher,
-        const ::acpp::proxyman::inbound::ReceiverSettings& receiver,
-        ::acpp::net::io_context& io_context,
-        ::acpp::session::Context& ctx,
-        const ::acpp::TimeoutsConfig& timeouts,
+    ::net::awaitable<::RelayResult> Process(
+        std::unique_ptr<::AsyncStream> stream,
+        ::routing::Dispatcher& dispatcher,
+        const ::proxyman::inbound::ReceiverSettings& receiver,
+        ::net::io_context& io_context,
+        ::session::Context& ctx,
+        const ::TimeoutsConfig& timeouts,
         uint32_t pressure_idle_timeout) override;
 
 private:
-    ::acpp::UserOnlineTracker& validator_;
-    ::acpp::StatsShard* stats_ = nullptr;
-    ::acpp::ConnectionLimiter* limiter_;
-    std::shared_ptr<const ::acpp::vless::VlessEncryptionConfig> decryption_;
+    ::UserOnlineTracker& validator_;
+    ::StatsShard* stats_ = nullptr;
+    ::ConnectionLimiter* limiter_;
+    std::shared_ptr<const ::vless::VlessEncryptionConfig> decryption_;
 };
 
-}  // namespace acpp::proxy::vless::inbound
+}  // namespace proxy::vless::inbound

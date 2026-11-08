@@ -44,7 +44,7 @@ void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
 void operator delete(void* value, const std::nothrow_t&) noexcept { ::operator delete(value); }
 
 TEST(AnytlsPadding, Contract) {
-    (void)acpp::anytls::DefaultPaddingScheme();
+    (void)::anytls::DefaultPaddingScheme();
     constexpr std::array cases{
         std::string_view("stop=8\n0=30-30\n1=64-65\n7=96-96\n"),
         std::string_view("stop=2\n1=64-65\n2147483647=64-65\n"),
@@ -59,7 +59,7 @@ TEST(AnytlsPadding, Contract) {
         bool parsed = false;
         measuring = true;
         try {
-            parsed = acpp::anytls::ParsePaddingScheme(cases[index]).has_value();
+            parsed = ::anytls::ParsePaddingScheme(cases[index]).has_value();
         } catch (const std::bad_alloc&) {
         }
         measuring = false;
@@ -70,7 +70,7 @@ TEST(AnytlsPadding, Contract) {
             parsed, bounded ? "PASS" : "FAIL");
     }
 
-    using namespace acpp::anytls;
+    using namespace ::anytls;
     const PaddingScheme empty;
     Check(empty.RecordFor(0).empty() && empty.RecordFor(UINT32_MAX).empty() &&
           empty.SampleAuthPaddingSize() == 0, "disabled scheme");

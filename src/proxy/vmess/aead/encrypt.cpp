@@ -8,7 +8,6 @@
 #include <algorithm>
 #include <cstring>
 
-namespace acpp {
 namespace vmess {
 
 namespace {
@@ -76,4 +75,3 @@ bool AES128GCMEncrypt(
     return true;
 }
 }  // namespace vmess
-}  // namespace acpp

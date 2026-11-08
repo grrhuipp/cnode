@@ -1,14 +1,14 @@
-#include "acppnode/infra/panel_config.hpp"
+#include "infra/panel_config.hpp"
 
-#include "acppnode/common/domain_name.hpp"
-#include "acppnode/common/ip_utils.hpp"
-#include "acppnode/core/naming.hpp"
-#include "acppnode/infra/json_field.hpp"
-#include "acppnode/infra/proxy_protocol_config.hpp"
-#include "acppnode/infra/log.hpp"
-#include "acppnode/transport/internet/http_headers.hpp"
-#include "acppnode/transport/internet/tls_config.hpp"
-#include "acppnode/transport/internet/tls_stream.hpp"
+#include "common/domain_name.hpp"
+#include "common/ip_utils.hpp"
+#include "core/naming.hpp"
+#include "infra/json_field.hpp"
+#include "infra/proxy_protocol_config.hpp"
+#include "infra/log.hpp"
+#include "transport/internet/http_headers.hpp"
+#include "transport/internet/tls_config.hpp"
+#include "transport/internet/tls_stream.hpp"
 
 #include <charconv>
 #include <filesystem>
@@ -19,7 +19,6 @@
 #include <string_view>
 #include <utility>
 
-namespace acpp {
 
 namespace {
 
@@ -349,4 +348,3 @@ bool PanelConfig::Validate() const {
     return true;
 }
 
-}  // namespace acpp

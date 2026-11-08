@@ -1,11 +1,10 @@
-#include "acppnode/infra/panel_node_ids.hpp"
+#include "infra/panel_node_ids.hpp"
 
 #include <format>
 #include <limits>
 #include <stdexcept>
 #include <unordered_set>
 
-namespace acpp {
 
 PanelNodeIds PanelNodeIds::Parse(const json::value& value) {
     if (!value.is_array()) {
@@ -56,4 +55,3 @@ PanelNodeIds PanelNodeIds::Single(int node_id) {
     return result;
 }
 
-}  // namespace acpp

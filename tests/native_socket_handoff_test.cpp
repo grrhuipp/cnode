@@ -1,9 +1,10 @@
 #include <gtest/gtest.h>
 
-#include "acppnode/app/session_group_executor.hpp"
-#include "acppnode/transport/internet/tcp_stream.hpp"
-#include "acppnode/transport/internet/datagram_socket.hpp"
-#include "acppnode/transport/link_error.hpp"
+#include "app/session_group_executor.hpp"
+#include "transport/internet/tcp_stream.hpp"
+#include "transport/internet/datagram_socket.hpp"
+#include "transport/internet/timeout_scheduler.hpp"
+#include "transport/link_error.hpp"
 
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/co_spawn.hpp>
@@ -23,7 +24,6 @@
 #include <stdexcept>
 
 namespace {
-using namespace acpp;
 using namespace std::chrono_literals;
 using transport::internet::DatagramSocket;
 
@@ -390,6 +390,45 @@ void DatagramSameFdAndCancellation() {
     Require(Finish(std::move(cancelled)), "UDP explicit cancellation was hidden");
     f.OnDomain([&]() -> net::awaitable<void> { socket.reset(); co_return; });
 }
+
+void RetiredMemberDuringHandoff(bool commit) {
+    Fixture f;
+    std::promise<std::thread::id> retired;
+    auto retired_on = retired.get_future();
+    auto hooks = std::shared_ptr<Hooks>(new Hooks, [&retired](Hooks* value) {
+        delete value;
+        retired.set_value(std::this_thread::get_id());
+    });
+    auto member = f.domain->CreateSibling(hooks);
+    hooks->allocation.SetLeaseGroup(
+        member->LeaseIdentity(), ExecutionDomain::SharesLeaseIdentity);
+    hooks.reset();
+    f.OnDomain([&]() -> net::awaitable<void> { co_await f.domain->Join(member); });
+    Finish(net::co_spawn(member->Executor(), [&]() -> net::awaitable<void> {
+        struct Event final : TimeoutEvent {
+            void OnTimeout() override { Require(false, "cancelled member deadline fired"); }
+        } event;
+        Require(TimeoutScheduler::ForIoContext(f.old_io).ScheduleAfter(1h, event),
+                "member deadline was not admitted");
+        event.Cancel();
+        co_await TimeoutScheduler::AsyncReleaseForIoContext(f.old_io);
+    }, net::use_future));
+
+    auto handoff = f.Prepare();
+    const std::weak_ptr<ExecutionDomain> weak_member = member;
+    member.reset();
+    Require(!weak_member.expired(), "prepared handoff failed to pin its member");
+    if (commit) f.Commit(handoff);
+    else f.Cancel(handoff);
+    handoff.reset();
+    const auto expected_owner = commit ? f.new_thread.get_id() : f.old_thread.get_id();
+    Require(Finish(std::move(retired_on)) == expected_owner,
+            "retired member services were destroyed outside their owner Worker");
+    Require(weak_member.expired(), "resolved handoff retained an unused member");
+    Require(f.OnDomain([]() -> net::awaitable<std::thread::id> {
+        co_return std::this_thread::get_id();
+    }) == expected_owner, "surviving member lost its execution owner");
+}
 }  // namespace
 
 TEST(NativeSocketHandoff, Contract) {
@@ -400,4 +439,12 @@ TEST(NativeSocketHandoff, Contract) {
     TcpWriteCancellationDuringFreeze(true);
     DatagramSameFdAndCancellation();
     std::puts("native socket handoff: fd/tuple, drain, rollback, scatter progress, cancellation, half-close passed");
+}
+
+TEST(NativeSocketHandoff, RetiredMemberDuringCommit) {
+    RetiredMemberDuringHandoff(true);
+}
+
+TEST(NativeSocketHandoff, RetiredMemberDuringCancel) {
+    RetiredMemberDuringHandoff(false);
 }

@@ -8,7 +8,6 @@
 #include <stdexcept>
 #include <utility>
 
-namespace acpp {
 namespace vmess {
 
 // ============================================================================
@@ -156,4 +155,3 @@ uint16_t ShakeMask::NextMask() {
 }
 
 }  // namespace vmess
-}  // namespace acpp

@@ -1,11 +1,10 @@
-#include "acppnode/transport/internet/inbound_listen.hpp"
+#include "transport/internet/inbound_listen.hpp"
 
-#include "acppnode/common/ip_utils.hpp"
-#include "acppnode/common/ip_address.hpp"
-#include "acppnode/core/constants.hpp"
-#include "acppnode/transport/internet/http_headers.hpp"
+#include "common/ip_utils.hpp"
+#include "common/ip_address.hpp"
+#include "core/constants.hpp"
+#include "transport/internet/http_headers.hpp"
 
-namespace acpp {
 
 InboundListen::InboundListen() noexcept {
     candidates_[0] = net::ip::address_v4::any();
@@ -49,4 +48,3 @@ std::optional<InboundListen> InboundListen::Parse(std::string_view value) {
     return listen;
 }
 
-}  // namespace acpp

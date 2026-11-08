@@ -1,12 +1,12 @@
 #pragma once
 
-#include "acppnode/app/proxyman/outbound/prepared_config.hpp"
-#include "acppnode/infra/outbound_source_config.hpp"
+#include "app/proxyman/outbound/prepared_config.hpp"
+#include "infra/outbound_source_config.hpp"
 
 #include <optional>
 #include <string_view>
 
-namespace acpp::proxyman::outbound {
+namespace proxyman::outbound {
 
 // What a protocol contributes to its Handler: the protocol constructor and the
 // sender settings with its stream defaults applied. The top-level sendThrough
@@ -26,4 +26,4 @@ void RegisterProxy(
 [[nodiscard]] std::optional<PreparedOutboundConfig> PrepareOutboundConfig(
     const infra::OutboundSourceConfig& config);
 
-}  // namespace acpp::proxyman::outbound
+}  // namespace proxyman::outbound

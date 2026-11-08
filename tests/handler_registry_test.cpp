@@ -1,13 +1,13 @@
 #include <gtest/gtest.h>
 
-#include "acppnode/app/proxyman/inbound/handler_registry.hpp"
-#include "acppnode/app/proxyman/outbound/handler.hpp"
-#include "acppnode/app/dns/dns.hpp"
-#include "acppnode/app/dns/dns_worker.hpp"
-#include "acppnode/common/session.hpp"
-#include "acppnode/app/stats.hpp"
-#include "acppnode/infra/runtime_config_types.hpp"
-#include "acppnode/proxy/outbound.hpp"
+#include "app/proxyman/inbound/handler_registry.hpp"
+#include "app/proxyman/outbound/handler.hpp"
+#include "app/dns/dns.hpp"
+#include "app/dns/dns_worker.hpp"
+#include "common/session.hpp"
+#include "app/stats.hpp"
+#include "infra/runtime_config_types.hpp"
+#include "proxy/outbound.hpp"
 #include "../src/common/awaitable_task_group.hpp"
 
 #include <asio/co_spawn.hpp>
@@ -20,29 +20,29 @@
 
 namespace {
 
-using acpp::proxyman::outbound::HandlerLookup;
-using acpp::proxyman::outbound::OutboundConfiguration;
-using acpp::proxyman::outbound::PreparedOutboundConfig;
+using ::proxyman::outbound::HandlerLookup;
+using ::proxyman::outbound::OutboundConfiguration;
+using ::proxyman::outbound::PreparedOutboundConfig;
 
 struct Probe {
     int created = 0;
     int destroyed = 0;
     int processed = 0;
-    acpp::OutboundDialer* last_dialer = nullptr;
+    ::OutboundDialer* last_dialer = nullptr;
 };
 
-class CountingOutbound final : public acpp::Outbound {
+class CountingOutbound final : public ::Outbound {
 public:
     explicit CountingOutbound(Probe& probe) : probe_(probe) { ++probe_.created; }
     ~CountingOutbound() noexcept override { ++probe_.destroyed; }
 
-    acpp::net::awaitable<acpp::OutboundProcessResult> Process(
-        acpp::session::Context&, acpp::transport::Link, acpp::OutboundDialer& dialer,
-        const acpp::TimeoutsConfig&, acpp::StatsShard&, const acpp::RelayConfig&,
-        acpp::buf::MultiBufferBatch, std::chrono::seconds, std::chrono::seconds) override {
+    ::net::awaitable<::OutboundProcessResult> Process(
+        ::session::Context&, ::transport::Link, ::OutboundDialer& dialer,
+        const ::TimeoutsConfig&, ::StatsShard&, const ::RelayConfig&,
+        ::buf::MultiBufferBatch, std::chrono::seconds, std::chrono::seconds) override {
         ++probe_.processed;
         probe_.last_dialer = &dialer;
-        co_return acpp::RelayResult{};
+        co_return ::RelayResult{};
     }
 
 private:
@@ -54,26 +54,26 @@ PreparedOutboundConfig MakeConfig(std::string tag, Probe& probe) {
         .tag = std::move(tag),
         .protocol = "test-counting",
         .sender = {},
-        .create = acpp::proxyman::outbound::MakePreparedOutboundCreator<
+        .create = ::proxyman::outbound::MakePreparedOutboundCreator<
             Probe*,
             +[](std::string_view, std::shared_ptr<Probe* const> probe,
-                acpp::net::io_context&, acpp::AwaitableTaskGroup&)
-                -> std::unique_ptr<acpp::Outbound> {
+                ::net::io_context&, ::AwaitableTaskGroup&)
+                -> std::unique_ptr<::Outbound> {
                 return std::make_unique<CountingOutbound>(**probe);
             }>(&probe),
     };
 }
 
-using InboundRegistry = acpp::proxyman::inbound::HandlerRegistry;
+using InboundRegistry = ::proxyman::inbound::HandlerRegistry;
 
 int Run() {
-    acpp::net::io_context io;
+    ::net::io_context io;
     // Lookup tests never resolve names; one inert endpoint satisfies DNSWorker.
-    acpp::app::dns::Config dns_config{
-        .servers = {{acpp::net::ip::address_v4::loopback(), 9}}};
-    acpp::app::dns::DNSWorker dns_worker(io, dns_config, 8);
-    acpp::app::dns::DNS dns(dns_worker);
-    acpp::ResidentTaskGroup tasks(io.get_executor());
+    ::app::dns::Config dns_config{
+        .servers = {{::net::ip::address_v4::loopback(), 9}}};
+    ::app::dns::DNSWorker dns_worker(io, dns_config, 8);
+    ::app::dns::DNS dns(dns_worker);
+    ::ResidentTaskGroup tasks(io.get_executor());
 
     Probe first_probe;
     Probe second_probe;
@@ -88,15 +88,15 @@ int Run() {
     if (lookup.GetHandler("") || lookup.GetHandler("missing")) return 4;
 
     // Dispatch reaches the protocol exactly once, with the handler's dialer.
-    acpp::session::Context ctx;
-    acpp::TimeoutsConfig timeouts;
-    acpp::StatsShard stats;
-    acpp::RelayConfig relay;
+    ::session::Context ctx;
+    ::TimeoutsConfig timeouts;
+    ::StatsShard stats;
+    ::RelayConfig relay;
     bool dispatched = false;
-    acpp::net::co_spawn(io,
-        first->Dispatch(ctx, acpp::transport::Link{}, timeouts, stats, relay, {},
+    ::net::co_spawn(io,
+        first->Dispatch(ctx, ::transport::Link{}, timeouts, stats, relay, {},
                         std::chrono::seconds(1), std::chrono::seconds(1)),
-        [&](std::exception_ptr error, acpp::OutboundProcessResult result) {
+        [&](std::exception_ptr error, ::OutboundProcessResult result) {
             dispatched = !error && result.has_value();
         });
     for (int round = 0; round < 100 && !dispatched; ++round) {

@@ -5,7 +5,7 @@
 #include <memory>
 #include <string_view>
 
-namespace acpp::transport::internet {
+namespace transport::internet {
 
 // Built from trusted configuration before accepting connections. No SNI-driven
 // generation, mutable certificate cache, or request-path key rotation.
@@ -23,4 +23,4 @@ private:
     EVP_PKEY* key_ = nullptr;
 };
 
-} // namespace acpp::transport::internet
+} // namespace transport::internet

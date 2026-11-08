@@ -1,6 +1,6 @@
-#include "acppnode/transport/internet/timeout_scheduler.hpp"
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/app/session_group_executor.hpp"
+#include "transport/internet/timeout_scheduler.hpp"
+#include "common/allocator.hpp"
+#include "app/session_group_executor.hpp"
 
 #include <asio/as_tuple.hpp>
 #include <asio/bind_allocator.hpp>
@@ -16,7 +16,6 @@
 #include <stdexcept>
 #include <vector>
 
-namespace acpp {
 
 struct TimeoutScheduler::Impl {
     explicit Impl(net::io_context& context) : context(context), timer(context) {
@@ -514,4 +513,3 @@ TimeoutScheduler::ResourceStats TimeoutScheduler::GetResourceStats() const noexc
         .wait_pending = impl_->wait_pending};
 }
 
-}  // namespace acpp

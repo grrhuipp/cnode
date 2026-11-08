@@ -1,21 +1,21 @@
-#include "acppnode/infra/inbound_field_rules.hpp"
+#include "infra/inbound_field_rules.hpp"
 
-#include "acppnode/common/domain_name.hpp"
-#include "acppnode/common/ip_utils.hpp"
-#include "acppnode/common/target_address.hpp"
-#include "acppnode/core/constants.hpp"
-#include "acppnode/core/naming.hpp"
-#include "acppnode/proxy/sniff_config.hpp"
-#include "acppnode/transport/internet/http_headers.hpp"
-#include "acppnode/transport/internet/reality_client_version.hpp"
-#include "acppnode/transport/internet/reality_key.hpp"
-#include "acppnode/transport/internet/reality_short_id.hpp"
+#include "common/domain_name.hpp"
+#include "common/ip_utils.hpp"
+#include "common/target_address.hpp"
+#include "core/constants.hpp"
+#include "core/naming.hpp"
+#include "proxy/sniff_config.hpp"
+#include "transport/internet/http_headers.hpp"
+#include "transport/internet/reality_client_version.hpp"
+#include "transport/internet/reality_key.hpp"
+#include "transport/internet/reality_short_id.hpp"
 #include "../proxy/anytls/anytls_codec.hpp"
 #include "../proxy/anytls/padding.hpp"
 
 #include <format>
 
-namespace acpp::infra {
+namespace infra {
 
 bool IsValidRealityServerName(std::string_view name) noexcept {
     return !name.empty() && !iputil::ParseLiteral(name) &&
@@ -246,4 +246,4 @@ tl::expected<std::string, std::string> ParseAnyTlsPaddingScheme(
     return scheme;
 }
 
-}  // namespace acpp::infra
+}  // namespace infra

@@ -1,7 +1,7 @@
 #include <stdexcept>
 #include <gtest/gtest.h>
 
-#include "acppnode/infra/json_field.hpp"
+#include "infra/json_field.hpp"
 
 #include <cstdlib>
 #include <iostream>
@@ -20,12 +20,12 @@ void Check(bool condition, std::string_view message) {
 }
 
 struct ParsedObject {
-    acpp::json::value source;
-    tl::expected<const acpp::json::object*, std::string> result;
+    ::json::value source;
+    tl::expected<const ::json::object*, std::string> result;
 
     explicit ParsedObject(std::string_view body)
-        : source(acpp::json::parse(body)),
-          result(acpp::ParseJsonObject(
+        : source(::json::parse(body)),
+          result(::ParseJsonObject(
               source.as_object(), "camelObject")) {}
 };
 
@@ -34,10 +34,10 @@ void CheckInvalid(std::string_view body) {
     Check(!parsed.result, "invalid JSON object was accepted");
 }
 
-using acpp::json::KeyComparison;
+using ::json::KeyComparison;
 
 void CheckKeyComparisonModes() {
-    const auto insensitive = acpp::json::parse(
+    const auto insensitive = ::json::parse(
         R"({"CaMeLKey":1,"camel_key":2,"\u00c4":3,"\u00e4":4})",
         KeyComparison::AsciiCaseInsensitive);
     const auto& object = insensitive.as_object();
@@ -56,8 +56,8 @@ void CheckKeyComparisonModes() {
           "key comparison accepted a prefix or unrelated key");
 
     for (const auto& sensitive : {
-             acpp::json::parse(R"({"CaMeLKey":1,"camelKey":2})"),
-             acpp::json::parse(R"({"CaMeLKey":1,"camelKey":2})",
+             ::json::parse(R"({"CaMeLKey":1,"camelKey":2})"),
+             ::json::parse(R"({"CaMeLKey":1,"camelKey":2})",
                                KeyComparison::CaseSensitive)}) {
         Check(sensitive.as_object().size() == 2 &&
                   sensitive.as_object().at("CaMeLKey").as_int64() == 1 &&
@@ -65,16 +65,16 @@ void CheckKeyComparisonModes() {
                   !sensitive.as_object().contains("CAMELKEY"),
               "case-insensitive parsing leaked into ordinary JSON");
     }
-    acpp::json::object constructed;
+    ::json::object constructed;
     constructed["Key"] = 1;
     constructed["key"] = 2;
-    const acpp::json::object initialized{{"Key", 1}, {"key", 2}};
+    const ::json::object initialized{{"Key", 1}, {"key", 2}};
     Check(constructed.size() == 2 && initialized.size() == 2,
           "ordinary object construction became case-insensitive");
 }
 
 void CheckNestedKeyComparison() {
-    auto parsed = acpp::json::parse(
+    auto parsed = ::json::parse(
         R"({"SeTTings":{"PaNeLs":[{"DeEp":{"VaLuE":"UnChanged"}}]},"Empty":{}})",
         KeyComparison::AsciiCaseInsensitive);
     auto* settings = parsed.as_object().if_contains("settings");
@@ -95,21 +95,21 @@ void CheckNestedKeyComparison() {
     Check(empty.at("newkey").as_int64() == 1 && empty.begin()->first == "newkey",
           "empty parsed object lost its comparator or key normalization");
 
-    const auto array_root = acpp::json::parse(
+    const auto array_root = ::json::parse(
         R"([[{"MiXeD":true}]])", KeyComparison::AsciiCaseInsensitive);
     Check(array_root.as_array()[0].as_array()[0].as_object().at("mixed").as_bool(),
           "objects in root arrays lost their comparison mode");
 }
 
 void CheckCopiesAndMoves() {
-    const auto original = acpp::json::parse(
+    const auto original = ::json::parse(
         R"({"Outer":[{"Inner":"OriginalValue"}]})",
         KeyComparison::AsciiCaseInsensitive);
     auto copied = original;
     auto moved = std::move(copied);
-    acpp::json::value copy_assigned;
+    ::json::value copy_assigned;
     copy_assigned = original;
-    acpp::json::value move_assigned;
+    ::json::value move_assigned;
     move_assigned = std::move(copy_assigned);
     for (const auto* item : {&original, &std::as_const(moved)}) {
         Check(item->as_object().at("outer").as_array()[0].as_object()
@@ -124,24 +124,24 @@ void CheckCopiesAndMoves() {
               .at("inner").as_string() == "OriginalValue",
           "copied value shared mutable object storage");
 
-    acpp::json::object copied_object(original.as_object());
-    acpp::json::object moved_object(std::move(copied_object));
-    acpp::json::object assigned_object;
+    ::json::object copied_object(original.as_object());
+    ::json::object moved_object(std::move(copied_object));
+    ::json::object assigned_object;
     assigned_object = original.as_object();
-    acpp::json::object moved_assigned_object;
+    ::json::object moved_assigned_object;
     moved_assigned_object = std::move(assigned_object);
     Check(moved_object.contains("OUTER") && moved_assigned_object.contains("outer"),
           "object copy or move lost its comparator");
-    moved_assigned_object = acpp::json::object{{"Mixed", 1}};
+    moved_assigned_object = ::json::object{{"Mixed", 1}};
     Check(moved_assigned_object.contains("Mixed") &&
               !moved_assigned_object.contains("MIXED"),
           "object move assignment retained the old comparison mode");
-    const acpp::json::object sensitive{{"Mixed", 1}};
+    const ::json::object sensitive{{"Mixed", 1}};
     moved_object = sensitive;
     Check(moved_object.contains("Mixed") && !moved_object.contains("MIXED"),
           "object copy assignment retained the old comparison mode");
 
-    auto self_object = acpp::json::parse(
+    auto self_object = ::json::parse(
         R"({"child":{"GrandChild":"Kept"},"sibling":1})",
         KeyComparison::AsciiCaseInsensitive).as_object();
     self_object = std::move(self_object["child"].as_object());
@@ -149,7 +149,7 @@ void CheckCopiesAndMoves() {
               self_object.at("GRANDCHILD").as_string() == "Kept",
           "self-contained object move assignment corrupted nested storage");
 
-    auto self_copied_object = acpp::json::parse(
+    auto self_copied_object = ::json::parse(
         R"({"child":{"GrandChild":"Copied"},"sibling":2})",
         KeyComparison::AsciiCaseInsensitive).as_object();
     self_copied_object = self_copied_object["child"].as_object();
@@ -157,29 +157,29 @@ void CheckCopiesAndMoves() {
               self_copied_object.at("GRANDCHILD").as_string() == "Copied",
           "self-contained object copy assignment corrupted nested storage");
 
-    auto self_array = acpp::json::parse(R"([["KeptElement",42],"Sibling"])").as_array();
+    auto self_array = ::json::parse(R"([["KeptElement",42],"Sibling"])").as_array();
     self_array = std::move(self_array[0].as_array());
     Check(self_array.size() == 2 &&
               self_array[0].as_string() == "KeptElement" &&
               self_array[1].as_int64() == 42,
           "self-contained array move assignment corrupted nested storage");
 
-    auto self_copied_array = acpp::json::parse(R"([["CopiedElement",7],"Sibling"])").as_array();
+    auto self_copied_array = ::json::parse(R"([["CopiedElement",7],"Sibling"])").as_array();
     self_copied_array = self_copied_array[0].as_array();
     Check(self_copied_array.size() == 2 &&
               self_copied_array[0].as_string() == "CopiedElement" &&
               self_copied_array[1].as_int64() == 7,
           "self-contained array copy assignment corrupted nested storage");
 
-    Check(acpp::json::value(int64_t{42}) == acpp::json::value(uint64_t{42}) &&
-              acpp::json::value(uint64_t{0}) == acpp::json::value(int64_t{0}) &&
-              acpp::json::value(int64_t{-1}) != acpp::json::value(uint64_t{1}) &&
-              acpp::json::value(int64_t{-1}) !=
-                  acpp::json::value(static_cast<uint64_t>(-1)),
+    Check(::json::value(int64_t{42}) == ::json::value(uint64_t{42}) &&
+              ::json::value(uint64_t{0}) == ::json::value(int64_t{0}) &&
+              ::json::value(int64_t{-1}) != ::json::value(uint64_t{1}) &&
+              ::json::value(int64_t{-1}) !=
+                  ::json::value(static_cast<uint64_t>(-1)),
           "signed/unsigned integer value equality was inconsistent");
-    Check(acpp::json::parse(R"({"b":[1,true,"x"],"a":null})") ==
-              acpp::json::parse(R"({"a":null,"b":[1,true,"x"]})") &&
-              acpp::json::parse(R"({"a":1})") != acpp::json::parse(R"({"a":2})"),
+    Check(::json::parse(R"({"b":[1,true,"x"],"a":null})") ==
+              ::json::parse(R"({"a":null,"b":[1,true,"x"]})") &&
+              ::json::parse(R"({"a":1})") != ::json::parse(R"({"a":2})"),
           "structural value equality failed on objects or arrays");
 }
 
@@ -192,24 +192,24 @@ void CheckDuplicateKeys() {
              R"({"Nested":{"Key":1,"KEY":2}})",
              R"([{"Key":1,"KEY":2}])"}) {
         try {
-            (void)acpp::json::parse(body, KeyComparison::AsciiCaseInsensitive);
+            (void)::json::parse(body, KeyComparison::AsciiCaseInsensitive);
             Fail("case-insensitive parser accepted a duplicate key");
-        } catch (const acpp::json::parse_error&) {
+        } catch (const ::json::parse_error&) {
         }
     }
     for (const auto body : {
              R"({"key":1,"key":2})",
              R"({"users":[{"id":1,"uuid":"a","uuid":"b"}]})"}) {
         try {
-            (void)acpp::json::parse(body);
+            (void)::json::parse(body);
             Fail("case-sensitive parser accepted a duplicate key");
-        } catch (const acpp::json::parse_error&) {
+        } catch (const ::json::parse_error&) {
         }
     }
-    const auto distinct_case = acpp::json::parse(R"({"Key":1,"key":2})");
+    const auto distinct_case = ::json::parse(R"({"Key":1,"key":2})");
     Check(distinct_case.as_object().size() == 2,
           "case-sensitive parser merged keys differing only in case");
-    const auto siblings = acpp::json::parse(
+    const auto siblings = ::json::parse(
         R"([{"Key":1},{"KEY":2}])", KeyComparison::AsciiCaseInsensitive);
     Check(siblings.as_array()[0].as_object().at("key").as_int64() == 1 &&
               siblings.as_array()[1].as_object().at("key").as_int64() == 2,
@@ -220,13 +220,13 @@ void CheckNestingDepth() {
     const auto nested = [](size_t depth) {
         return std::string(depth, '[') + std::string(depth, ']');
     };
-    Check(acpp::json::parse(nested(128)).is_array(),
+    Check(::json::parse(nested(128)).is_array(),
           "nesting at the depth limit was rejected");
     for (const std::string& body : {nested(129), std::string(1'000'000, '[')}) {
         try {
-            (void)acpp::json::parse(body);
+            (void)::json::parse(body);
             Fail("nesting beyond the depth limit was accepted");
-        } catch (const acpp::json::parse_error& error) {
+        } catch (const ::json::parse_error& error) {
             Check(std::string_view(error.what()).find("nesting too deep") !=
                       std::string_view::npos,
                   "deep nesting was rejected for the wrong reason");
@@ -237,41 +237,41 @@ void CheckNestingDepth() {
     nested_objects += "{}" + std::string(126, '}');
     const std::string siblings = "[" + nested(127) + "," + nested_objects + "," +
                                  nested_objects + "]";
-    Check(acpp::json::parse(siblings).is_array(),
+    Check(::json::parse(siblings).is_array(),
           "depth accounting leaked across closed containers");
 }
 
 void CheckNormalizedKeysAndValues() {
     const std::string_view text = R"({"MiXeD-Key":"VaLuE/ABC_def"})";
-    const auto parsed = acpp::json::parse(text, KeyComparison::AsciiCaseInsensitive);
+    const auto parsed = ::json::parse(text, KeyComparison::AsciiCaseInsensitive);
     Check(parsed.as_object().begin()->first == "mixed-key" &&
               parsed.as_object().at("MiXeD-Key").as_string() == "VaLuE/ABC_def",
           "case-insensitive parsing failed to normalize only the key");
-    Check(acpp::json::serialize(parsed) == R"({"mixed-key":"VaLuE/ABC_def"})",
+    Check(::json::serialize(parsed) == R"({"mixed-key":"VaLuE/ABC_def"})",
           "serialization lost lowercase key storage or original string value");
-    Check(acpp::json::serialize(acpp::json::parse(text)) == text,
+    Check(::json::serialize(::json::parse(text)) == text,
           "ordinary JSON parsing changed original key or value spelling");
 
-    auto object = acpp::json::object(KeyComparison::AsciiCaseInsensitive);
+    auto object = ::json::object(KeyComparison::AsciiCaseInsensitive);
     object["SuBscript"] = "MixedValue";
     auto [entry, inserted] = object.insert_or_assign("InSert", "OtherValue");
     Check(inserted && entry->first == "insert" &&
               object.at("SUBSCRIPT").as_string() == "MixedValue",
           "object insertion failed to normalize keys independently of parsing");
-    Check(acpp::json::serialize(object) ==
+    Check(::json::serialize(object) ==
               R"({"insert":"OtherValue","subscript":"MixedValue"})",
           "programmatic insertion retained uppercase key storage");
 }
 
 void CheckUnicodeEscapes() {
-    const auto supplementary = acpp::json::parse(R"("\uD83D\uDE00")");
+    const auto supplementary = ::json::parse(R"("\uD83D\uDE00")");
     Check(supplementary.as_string() == "\xF0\x9F\x98\x80",
           "unicode surrogate pair was not decoded as one code point");
     for (const std::string_view lone_surrogate : {R"("\uD83D")", R"("\uDE00")"}) {
         bool rejected = false;
         try {
-            (void)acpp::json::parse(lone_surrogate);
-        } catch (const acpp::json::parse_error&) {
+            (void)::json::parse(lone_surrogate);
+        } catch (const ::json::parse_error&) {
             rejected = true;
         }
         Check(rejected, "invalid JSON unicode escape was accepted");

@@ -1,14 +1,14 @@
 #include "credentials.hpp"
 
 #include "../uuid.hpp"
-#include "acppnode/core/naming.hpp"
+#include "core/naming.hpp"
 
 #include <openssl/sha.h>
 
 #include <algorithm>
 #include <cstring>
 
-namespace acpp::vless {
+namespace vless {
 
 namespace {
 
@@ -44,4 +44,4 @@ std::string NormalizeFlow(std::string_view flow) {
     return naming::LowerAscii(std::string(flow));
 }
 
-}  // namespace acpp::vless
+}  // namespace vless

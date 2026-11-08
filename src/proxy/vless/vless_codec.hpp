@@ -1,9 +1,9 @@
 #pragma once
 
-#include "acppnode/common.hpp"
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/address_codec.hpp"
-#include "acppnode/common/target_address.hpp"
+#include "common.hpp"
+#include "common/allocator.hpp"
+#include "common/address_codec.hpp"
+#include "common/target_address.hpp"
 
 #include <array>
 #include <cstddef>
@@ -11,7 +11,7 @@
 #include <span>
 #include <string_view>
 
-namespace acpp::vless {
+namespace vless {
 
 inline constexpr uint8_t kVersion = 0x00;
 
@@ -69,4 +69,4 @@ struct RequestHeaderDecodeResult {
     std::string_view flow = {},
     ForwardedMetadataView forwarded = {});
 
-}  // namespace acpp::vless
+}  // namespace vless

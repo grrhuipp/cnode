@@ -1,18 +1,18 @@
 #pragma once
 
-#include "acppnode/common/initial_payload.hpp"
-#include "acppnode/common/target_address.hpp"
+#include "common/initial_payload.hpp"
+#include "common/target_address.hpp"
 #include "shadowsocks_protocol.hpp"
-#include "acppnode/app/proxyman/inbound/user_store.hpp"
-#include "acppnode/transport/async_stream.hpp"
-#include "acppnode/transport/link.hpp"
+#include "app/proxyman/inbound/user_store.hpp"
+#include "transport/async_stream.hpp"
+#include "transport/link.hpp"
 
 #include <tl/expected.hpp>
 #include <memory>
 #include <string_view>
 #include <utility>
 
-namespace acpp::ss {
+namespace ss {
 
 struct ReadTCPSessionResult {
     std::shared_ptr<const proxyman::inbound::UserStore::ShadowsocksCredential> user;
@@ -36,4 +36,4 @@ WriteTCPResponse(const proxyman::inbound::UserStore::ShadowsocksCredential& user
                  const KeyBytes& request_salt,
                  AsyncStream& stream);
 
-}  // namespace acpp::ss
+}  // namespace ss

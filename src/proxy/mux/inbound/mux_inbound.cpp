@@ -1,17 +1,17 @@
 #include "mux_inbound.hpp"
 #include "../../inbound_admission.hpp"
 #include "../../../common/awaitable_task_group.hpp"
-#include "acppnode/features/routing/dispatcher.hpp"
-#include "acppnode/common/mux/mux_codec.hpp"
-#include "acppnode/common/session.hpp"
-#include "acppnode/infra/config_types.hpp"
-#include "acppnode/app/stats.hpp"
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/transport/async_stream.hpp"
-#include "acppnode/transport/link_error.hpp"
-#include "acppnode/common/buffer_util.hpp"
-#include "acppnode/common/container_util.hpp"
-#include "acppnode/infra/log.hpp"
+#include "features/routing/dispatcher.hpp"
+#include "common/mux/mux_codec.hpp"
+#include "common/session.hpp"
+#include "infra/config_types.hpp"
+#include "app/stats.hpp"
+#include "common/allocator.hpp"
+#include "transport/async_stream.hpp"
+#include "transport/link_error.hpp"
+#include "common/buffer_util.hpp"
+#include "common/container_util.hpp"
+#include "infra/log.hpp"
 
 #include <asio/as_tuple.hpp>
 
@@ -28,7 +28,7 @@
 #include <variant>
 #include <vector>
 
-namespace acpp::mux {
+namespace mux {
 
 // ============================================================================
 // 内部类型
@@ -778,13 +778,17 @@ public:
         Cancel();
     }
 
-    void PushClientPayload(buf::MultiBuffer mb, size_t bytes) {
-        if (InputClosed() || bytes == 0) {
+    void PushClientPayload(
+        buf::MultiBuffer mb, size_t bytes, const TargetAddress* target = nullptr) {
+        if (InputClosed()) {
             mb.clear();
             return;
         }
-        StampDefaultTarget(mb);
-        QueueInput(std::move(mb), bytes);
+        if (!buf::SetUdpTarget(mb, target ? *target : default_target_)) {
+            throw std::bad_alloc();
+        }
+        // Empty datagrams still own a Buffer and a queue entry.
+        QueueInput(std::move(mb), std::max(bytes, size_t{buf::Buffer::kSize}));
     }
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
@@ -841,13 +845,6 @@ public:
     }
 
 private:
-    void StampDefaultTarget(buf::MultiBuffer& mb) {
-        for (auto* buffer : mb) {
-            if (buffer && !buffer->IsEmpty() && !buffer->HasUDP()) {
-                buffer->SetUDP(default_target_);
-            }
-        }
-    }
 
     uint64_t parent_conn_id_ = 0;
     TargetAddress default_target_;
@@ -1301,7 +1298,7 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                                 hdr.target,
                                 std::move(hdr.forwarded)});
 
-                        if (frame_payload.byte_size() != 0) {
+                        if (hdr.has_data) {
                             sub_state->PushClientPayload(std::move(frame_payload), hdr.data_len);
                         }
 
@@ -1394,15 +1391,10 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                         break;
                     }
                     if (udp_sub) {
-                        if (hdr.has_target && frame_payload.byte_size() != 0) {
-                            for (auto* buffer : frame_payload) {
-                                if (buffer && !buffer->IsEmpty()) {
-                                    buffer->SetUDP(hdr.target);
-                                }
-                            }
-                        }
-                        if (frame_payload.byte_size() != 0) {
-                            (*udp_sub)->PushClientPayload(std::move(frame_payload), hdr.data_len);
+                        if (hdr.has_data) {
+                            (*udp_sub)->PushClientPayload(
+                                std::move(frame_payload), hdr.data_len,
+                                hdr.has_target ? &hdr.target : nullptr);
                         }
                     } else {
                         // TCP 数据
@@ -1426,7 +1418,7 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                         if ((hdr.option & mux::kOptionError) != 0) {
                             std::visit([](auto& state) { state->Cancel(); }, session_it->second);
                         } else if (auto* udp_sub = std::get_if<UdpSubInfo>(&session_it->second)) {
-                            if (frame_payload.byte_size() != 0) {
+                            if (hdr.has_data) {
                                 (*udp_sub)->PushClientPayload(
                                     std::move(frame_payload), hdr.data_len);
                             }
@@ -1580,4 +1572,4 @@ net::awaitable<RelayResult> ProcessInbound(
     co_return result;
 }
 
-}  // namespace acpp::mux
+}  // namespace mux

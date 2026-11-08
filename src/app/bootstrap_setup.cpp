@@ -1,23 +1,23 @@
-#include "acppnode/app/bootstrap_setup.hpp"
+#include "app/bootstrap_setup.hpp"
 #include "startup_inbounds.hpp"
 
-#include "acppnode/app/bootstrap_inbounds.hpp"
-#include "acppnode/app/bootstrap_panels.hpp"
-#include "acppnode/app/bootstrap_runtime.hpp"
-#include "acppnode/app/dns/dns.hpp"
-#include "acppnode/app/dns/dns_worker.hpp"
-#include "acppnode/infra/config.hpp"
-#include "acppnode/app/proxyman/inbound/user_store.hpp"
-#include "acppnode/app/runtime_publication.hpp"
+#include "app/bootstrap_inbounds.hpp"
+#include "app/bootstrap_panels.hpp"
+#include "app/bootstrap_runtime.hpp"
+#include "app/dns/dns.hpp"
+#include "app/dns/dns_worker.hpp"
+#include "infra/config.hpp"
+#include "app/proxyman/inbound/user_store.hpp"
+#include "app/runtime_publication.hpp"
 #include "proxyman/outbound/registration.hpp"
-#include "acppnode/app/worker.hpp"
-#include "acppnode/app/session_group_executor.hpp"
-#include "acppnode/app/worker_runtime_config.hpp"
-#include "acppnode/infra/log.hpp"
-#include "acppnode/service/controller/controller.hpp"
-#include "acppnode/app/stats.hpp"
-#include "acppnode/geo/geodata.hpp"
-#include "acppnode/transport/internet/tls_stream.hpp"
+#include "app/worker.hpp"
+#include "app/session_group_executor.hpp"
+#include "app/worker_runtime_config.hpp"
+#include "infra/log.hpp"
+#include "service/controller/controller.hpp"
+#include "app/stats.hpp"
+#include "geo/geodata.hpp"
+#include "transport/internet/tls_stream.hpp"
 
 #include <asio/co_spawn.hpp>
 #include <asio/use_future.hpp>
@@ -29,7 +29,6 @@
 #include <optional>
 #include <stdexcept>
 
-namespace acpp {
 
 BootstrapEnvironment::BootstrapEnvironment() = default;
 BootstrapEnvironment::~BootstrapEnvironment() = default;
@@ -38,8 +37,8 @@ BootstrapEnvironment& BootstrapEnvironment::operator=(BootstrapEnvironment&&) no
 
 namespace {
 
-::acpp::app::dns::Config MakeDnsServiceConfig(const Config& config) {
-    ::acpp::app::dns::Config dns_config;
+::app::dns::Config MakeDnsServiceConfig(const Config& config) {
+    ::app::dns::Config dns_config;
     dns_config.servers     = config.dns.servers;
     dns_config.timeout_sec = config.dns.timeout;
     dns_config.cache_size  = config.dns.cache_size;
@@ -228,4 +227,3 @@ RuntimeContext MakeRuntimeContext(BootstrapEnvironment& env) {
     };
 }
 
-}  // namespace acpp

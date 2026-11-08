@@ -1,9 +1,9 @@
 #include "tcp_listener.hpp"
 
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/container_util.hpp"
+#include "common/allocator.hpp"
+#include "common/container_util.hpp"
 
-namespace acpp::worker_detail {
+namespace worker_detail {
 
 TcpListenerOwner::~TcpListenerOwner() noexcept { Close(); }
 
@@ -45,4 +45,4 @@ void TcpListenerOwner::CloseAcceptor(std::string_view listener_key) noexcept {
     acceptor->close(ec);
 }
 
-}  // namespace acpp::worker_detail
+}  // namespace worker_detail

@@ -1,6 +1,6 @@
-#include "acppnode/transport/internet/reality_key.hpp"
-#include "acppnode/core/naming.hpp"
-#include "acppnode/common/binary_text_codec.hpp"
+#include "transport/internet/reality_key.hpp"
+#include "core/naming.hpp"
+#include "common/binary_text_codec.hpp"
 
 #include <openssl/err.h>
 #include <openssl/bytestring.h>
@@ -9,7 +9,7 @@
 
 #include <array>
 
-namespace acpp::transport::internet {
+namespace transport::internet {
 namespace {
 
 template <std::size_t N>
@@ -89,4 +89,4 @@ NormalizeRealityFingerprint(std::string_view value) {
     return std::nullopt;
 }
 
-}  // namespace acpp::transport::internet
+}  // namespace transport::internet

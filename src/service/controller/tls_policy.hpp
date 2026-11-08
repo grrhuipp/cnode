@@ -1,10 +1,10 @@
 #pragma once
 
-#include "acppnode/api/api.hpp"
-#include "acppnode/core/constants.hpp"
-#include "acppnode/infra/panel_config.hpp"
+#include "api/api.hpp"
+#include "core/constants.hpp"
+#include "infra/panel_config.hpp"
 
-namespace acpp::controller {
+namespace controller {
 
 [[nodiscard]] inline bool ShouldEnableInboundTls(
     const PanelConfig& panel_config,
@@ -22,4 +22,4 @@ namespace acpp::controller {
         node_config.NodeType == constants::protocol::kHysteria2;
 }
 
-}  // namespace acpp::controller
+}  // namespace controller

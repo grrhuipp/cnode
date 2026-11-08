@@ -1,9 +1,9 @@
 #include "shadowsocks_crypto.hpp"
-#include "acppnode/common/byte_reader.hpp"
+#include "common/byte_reader.hpp"
 #include "stream_crypto.hpp"
 #include "client.hpp"
-#include "acppnode/common/address_codec.hpp"
-#include "acppnode/common/allocator.hpp"
+#include "common/address_codec.hpp"
+#include "common/allocator.hpp"
 
 #include <openssl/rand.h>
 #include <openssl/crypto.h>
@@ -14,7 +14,7 @@
 #include <optional>
 #include <utility>
 
-namespace acpp::ss {
+namespace ss {
 
 namespace {
 
@@ -589,4 +589,4 @@ ReadTCPResponse(const SsCipherInfo& cipher_info,
     }
 }
 
-}  // namespace acpp::ss
+}  // namespace ss

@@ -1,12 +1,12 @@
-#include "acppnode/app/proxyman/inbound/factory.hpp"
+#include "app/proxyman/inbound/factory.hpp"
 
-#include "acppnode/infra/config_types.hpp"
-#include "acppnode/proxy/inbound.hpp"
+#include "infra/config_types.hpp"
+#include "proxy/inbound.hpp"
 
 #include <map>
 #include <stdexcept>
 
-namespace acpp::proxyman::inbound {
+namespace proxyman::inbound {
 
 namespace {
 
@@ -76,11 +76,11 @@ std::unique_ptr<ProtocolRuntime> NewProtocolRuntime(
     return it->second.create_runtime();
 }
 
-std::unique_ptr<::acpp::Inbound> NewHandler(
+std::unique_ptr<::Inbound> NewHandler(
     std::string_view protocol,
     ProtocolRuntime& runtime,
-    ::acpp::StatsShard& stats,
-    ::acpp::ConnectionLimiter* limiter,
+    ::StatsShard& stats,
+    ::ConnectionLimiter* limiter,
     const BuildRequest& req) {
     auto& registrations = Registrations();
     auto it = registrations.find(protocol);
@@ -93,8 +93,8 @@ std::unique_ptr<::acpp::Inbound> NewHandler(
 DatagramHandlerBuildResult NewDatagramHandler(
     std::string_view protocol,
     ProtocolRuntime& runtime,
-    ::acpp::StatsShard& stats,
-    ::acpp::ConnectionLimiter* limiter,
+    ::StatsShard& stats,
+    ::ConnectionLimiter* limiter,
     const BuildRequest& req) {
     auto& registrations = Registrations();
     auto it = registrations.find(protocol);
@@ -115,7 +115,7 @@ DatagramHandlerBuildResult NewDatagramHandler(
 std::optional<BuildRequest> PrepareBuildRequest(
     std::string_view protocol,
     std::string_view tag,
-    const ::acpp::InboundProtocolSettings& settings) {
+    const ::InboundProtocolSettings& settings) {
     auto& registrations = Registrations();
     auto it = registrations.find(protocol);
     if (it == registrations.end()) {
@@ -139,7 +139,7 @@ std::optional<BuildRequest> PrepareBuildRequest(
 
 std::optional<UserSet> BuildUsers(
     const BuildRequest& req,
-    std::span<const ::acpp::InboundUserSpec> users) {
+    std::span<const ::InboundUserSpec> users) {
     auto& registrations = Registrations();
     auto it = registrations.find(req.protocol);
     if (it == registrations.end() || !it->second.build_users) {
@@ -152,4 +152,4 @@ std::optional<UserSet> BuildUsers(
     return result;
 }
 
-}  // namespace acpp::proxyman::inbound
+}  // namespace proxyman::inbound

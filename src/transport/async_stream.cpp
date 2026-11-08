@@ -1,12 +1,11 @@
-#include "acppnode/transport/async_stream.hpp"
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/buffer_util.hpp"
-#include "acppnode/common/memory_stats.hpp"
-#include "acppnode/transport/internet/tcp_stream.hpp"
+#include "transport/async_stream.hpp"
+#include "common/allocator.hpp"
+#include "common/buffer_util.hpp"
+#include "common/memory_stats.hpp"
+#include "transport/internet/tcp_stream.hpp"
 
 #include <new>
 
-namespace acpp {
 
 StreamPhaseDeadline::StreamPhaseDeadline(net::io_context& io_context, AsyncStream& owner)
     : TimeoutEvent(io_context), owner_(owner) {}
@@ -193,4 +192,3 @@ std::optional<tcp::endpoint> AsyncStream::RemoteEndpoint() const {
     return std::nullopt;
 }
 
-}  // namespace acpp

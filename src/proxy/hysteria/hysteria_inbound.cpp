@@ -3,21 +3,21 @@
 #include "../../transport/internet/hysteria/hysteria_settings.hpp"
 #include "../../transport/internet/hysteria/quic_stream.hpp"
 
-#include "acppnode/app/proxyman/inbound/factory.hpp"
-#include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
-#include "acppnode/app/stats.hpp"
-#include "acppnode/common/buf/multi_buffer.hpp"
-#include "acppnode/common/buf/length_prefixed_packet_buffer.hpp"
-#include "acppnode/common/initial_payload.hpp"
-#include "acppnode/common/session.hpp"
-#include "acppnode/core/constants.hpp"
-#include "acppnode/features/routing/dispatcher.hpp"
-#include "acppnode/infra/config_types.hpp"
-#include "acppnode/infra/log.hpp"
-#include "acppnode/proxy/inbound.hpp"
-#include "acppnode/transport/async_stream.hpp"
-#include "acppnode/transport/link.hpp"
-#include "acppnode/transport/link_error.hpp"
+#include "app/proxyman/inbound/factory.hpp"
+#include "app/proxyman/inbound/receiver_settings.hpp"
+#include "app/stats.hpp"
+#include "common/buf/multi_buffer.hpp"
+#include "common/buf/length_prefixed_packet_buffer.hpp"
+#include "common/initial_payload.hpp"
+#include "common/session.hpp"
+#include "core/constants.hpp"
+#include "features/routing/dispatcher.hpp"
+#include "infra/config_types.hpp"
+#include "infra/log.hpp"
+#include "proxy/inbound.hpp"
+#include "transport/async_stream.hpp"
+#include "transport/link.hpp"
+#include "transport/link_error.hpp"
 
 #include <tl/expected.hpp>
 
@@ -27,10 +27,10 @@
 #include <span>
 #include <utility>
 
-namespace acpp::proxy::hysteria {
+namespace proxy::hysteria {
 namespace {
 
-namespace wire = ::acpp::transport::internet::hysteria;
+namespace wire = ::transport::internet::hysteria;
 
 constexpr size_t kMaxRequestHeaderBytes = 8192;
 
@@ -120,7 +120,7 @@ ReadTcpRequest(AsyncStream& stream, wire::Version version, session::Context& ctx
 // proxy/hysteria server: the transport has authenticated the connection and
 // bound its identity; each logical stream is either a UDP session or a TCP
 // request whose target this handler reads before dispatch.
-class HysteriaInbound final : public ::acpp::Inbound {
+class HysteriaInbound final : public ::Inbound {
 public:
     HysteriaInbound(StatsShard& stats, wire::Version version) noexcept
         : stats_(stats), version_(version) {}
@@ -201,7 +201,7 @@ PrepareSettings(wire::Version version, const InboundProtocolSettings& config) {
     return settings;
 }
 
-std::unique_ptr<::acpp::Inbound> CreateInbound(
+std::unique_ptr<::Inbound> CreateInbound(
     proxyman::inbound::ProtocolRuntime&,
     StatsShard& stats,
     ConnectionLimiter*,
@@ -263,4 +263,4 @@ const bool kHysteriaRegistered = [] {
 }();
 
 }  // namespace
-}  // namespace acpp::proxy::hysteria
+}  // namespace proxy::hysteria

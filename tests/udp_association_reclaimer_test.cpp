@@ -4,18 +4,18 @@
 #include "worker/udp_association_reclaimer.hpp"
 #include "worker/udp_ingress.hpp"
 
-#include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
-#include "acppnode/app/stats.hpp"
-#include "acppnode/common/sharded_user_stats.hpp"
-#include "acppnode/common/user_profile.hpp"
-#include "acppnode/common/session.hpp"
-#include "acppnode/common/target_address.hpp"
-#include "acppnode/features/routing/dispatcher.hpp"
-#include "acppnode/infra/config_types.hpp"
-#include "acppnode/proxy/inbound.hpp"
-#include "acppnode/proxy/inbound_datagram.hpp"
-#include "acppnode/transport/async_stream.hpp"
-#include "acppnode/transport/cancellation.hpp"
+#include "app/proxyman/inbound/receiver_settings.hpp"
+#include "app/stats.hpp"
+#include "common/sharded_user_stats.hpp"
+#include "common/user_profile.hpp"
+#include "common/session.hpp"
+#include "common/target_address.hpp"
+#include "features/routing/dispatcher.hpp"
+#include "infra/config_types.hpp"
+#include "proxy/inbound.hpp"
+#include "proxy/inbound_datagram.hpp"
+#include "transport/async_stream.hpp"
+#include "transport/cancellation.hpp"
 
 #include <asio/co_spawn.hpp>
 #include <asio/detached.hpp>
@@ -49,23 +49,23 @@ constexpr size_t kBatchLimit = 64;
     ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed");
 }
 
-class DummyInbound : public acpp::Inbound {
+class DummyInbound : public ::Inbound {
 public:
-    acpp::net::awaitable<acpp::RelayResult> Process(
-        std::unique_ptr<acpp::AsyncStream>, acpp::routing::Dispatcher&,
-        const acpp::proxyman::inbound::ReceiverSettings&, acpp::net::io_context&,
-        acpp::session::Context&, const acpp::TimeoutsConfig&, uint32_t) override {
-        co_return acpp::RelayResult{};
+    ::net::awaitable<::RelayResult> Process(
+        std::unique_ptr<::AsyncStream>, ::routing::Dispatcher&,
+        const ::proxyman::inbound::ReceiverSettings&, ::net::io_context&,
+        ::session::Context&, const ::TimeoutsConfig&, uint32_t) override {
+        co_return ::RelayResult{};
     }
 
-    tl::expected<acpp::InboundDatagramResult, acpp::ErrorCode> Process(
-        const acpp::InboundDatagramRequest&) override {
-        return tl::unexpected(acpp::ErrorCode::PROTOCOL_AUTH_FAILED);
+    tl::expected<::InboundDatagramResult, ::ErrorCode> Process(
+        const ::InboundDatagramRequest&) override {
+        return tl::unexpected(::ErrorCode::PROTOCOL_AUTH_FAILED);
     }
 };
 
-using Ingress = acpp::worker_detail::UdpIngress;
-using Reclaimer = acpp::worker_detail::UdpAssociationReclaimer;
+using Ingress = ::worker_detail::UdpIngress;
+using Reclaimer = ::worker_detail::UdpAssociationReclaimer;
 using SessionPtr = Ingress::ClientSessionPtr;
 
 class CountingPmrResource final : public std::pmr::memory_resource {
@@ -77,13 +77,13 @@ public:
 private:
     void* do_allocate(size_t bytes, size_t alignment) override {
         ++allocation_calls;
-        if (void* ptr = acpp::memory::AllocatePmr(bytes, alignment)) return ptr;
+        if (void* ptr = ::memory::AllocatePmr(bytes, alignment)) return ptr;
         throw std::bad_alloc();
     }
     void do_deallocate(void* ptr, size_t bytes, size_t alignment) override {
         ++deallocation_calls;
         deallocated_bytes += bytes;
-        acpp::memory::DeallocatePmr(ptr, bytes, alignment);
+        ::memory::DeallocatePmr(ptr, bytes, alignment);
     }
     bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
         return this == &other;
@@ -103,34 +103,34 @@ struct ReenterOnCancel {
     }
 };
 
-struct ReentryCancellation final : acpp::transport::CancellationSubscription {
+struct ReentryCancellation final : ::transport::CancellationSubscription {
     explicit ReentryCancellation(ReenterOnCancel& owner) noexcept : owner(owner) {}
     ReenterOnCancel& owner;
 private:
-    void OnCancellation(acpp::transport::Cancellation) noexcept override {
+    void OnCancellation(::transport::Cancellation) noexcept override {
         owner.Cancel();
     }
 };
 
-class DatagramResponse final : public acpp::InboundDatagramResponse {
+class DatagramResponse final : public ::InboundDatagramResponse {
 public:
-    acpp::buf::MultiBuffer Encode(acpp::UDPPacketView) override { return {}; }
+    ::buf::MultiBuffer Encode(::UDPPacketView) override { return {}; }
 };
 
-class AcceptedReplyResponse final : public acpp::InboundDatagramResponse {
+class AcceptedReplyResponse final : public ::InboundDatagramResponse {
 public:
-    acpp::buf::MultiBuffer Encode(acpp::UDPPacketView packet) override {
-        acpp::buf::MultiBuffer result;
-        if (!acpp::buf::AppendSpanToMultiBuffer(packet.data, result)) throw std::bad_alloc();
+    ::buf::MultiBuffer Encode(::UDPPacketView packet) override {
+        ::buf::MultiBuffer result;
+        if (!::buf::AppendSpanToMultiBuffer(packet.data, result)) throw std::bad_alloc();
         return result;
     }
 };
 
-class AcceptedReplySink final : public acpp::worker_detail::UdpReplySink {
+class AcceptedReplySink final : public ::worker_detail::UdpReplySink {
 public:
-    bool EnqueueUdpReply(std::string_view, acpp::udp::socket*, acpp::udp::endpoint,
-                         acpp::buf::MultiBuffer, uint32_t,
-                         std::shared_ptr<acpp::worker_detail::UdpReplyFence> = {}) override {
+    bool EnqueueUdpReply(std::string_view, ::udp::socket*, ::udp::endpoint,
+                         ::buf::MultiBuffer, uint32_t,
+                         std::shared_ptr<::worker_detail::UdpReplyFence> = {}) override {
         ++packets;
         return true;
     }
@@ -141,35 +141,35 @@ public:
 // 0x43 selects protocol session 2, anything else session 1.
 class DatagramInbound final : public DummyInbound {
 public:
-    tl::expected<acpp::InboundDatagramResult, acpp::ErrorCode> Process(
-        const acpp::InboundDatagramRequest& request) override {
-        acpp::InboundDatagramResult result;
+    tl::expected<::InboundDatagramResult, ::ErrorCode> Process(
+        const ::InboundDatagramRequest& request) override {
+        ::InboundDatagramResult result;
         result.user = &profile_;
         result.tracker = tracker_;
         const std::array<uint8_t, 1> owner{0x71};
         if (!result.session_owner.Assign(owner)) {
-            return tl::unexpected(acpp::ErrorCode::RESOURCE_EXHAUSTED);
+            return tl::unexpected(::ErrorCode::RESOURCE_EXHAUSTED);
         }
         result.session_id = !request.payload.empty() && request.payload[0] == 0x43 ? 2 : 1;
-        result.target = acpp::TargetAddress(
-            acpp::net::ip::address_v4::loopback(), 53);
-        acpp::buf::BufferGuard payload{acpp::buf::Buffer::New()};
-        if (!payload) return tl::unexpected(acpp::ErrorCode::RESOURCE_EXHAUSTED);
+        result.target = ::TargetAddress(
+            ::net::ip::address_v4::loopback(), 53);
+        ::buf::BufferGuard payload{::buf::Buffer::New()};
+        if (!payload) return tl::unexpected(::ErrorCode::RESOURCE_EXHAUSTED);
         payload->Tail()[0] = 0x42;
         payload->Produce(1);
         result.payload.push_back(std::move(payload));
         return result;
     }
-    tl::expected<std::shared_ptr<acpp::InboundDatagramResponse>, acpp::ErrorCode>
-    CreateDatagramResponse(const acpp::InboundDatagramResult&) override {
+    tl::expected<std::shared_ptr<::InboundDatagramResponse>, ::ErrorCode>
+    CreateDatagramResponse(const ::InboundDatagramResult&) override {
         return std::make_shared<DatagramResponse>();
     }
 private:
-    std::shared_ptr<acpp::UserOnlineTracker> tracker_ = std::make_shared<acpp::UserOnlineTracker>();
-    acpp::UserProfile profile_;
+    std::shared_ptr<::UserOnlineTracker> tracker_ = std::make_shared<::UserOnlineTracker>();
+    ::UserProfile profile_;
 };
 
-bool IsDecodedPayload(const acpp::buf::MultiBuffer& payload) {
+bool IsDecodedPayload(const ::buf::MultiBuffer& payload) {
     if (payload.size() != 1) return false;
     for (const auto* buffer : payload)
         if (!buffer || buffer->Len() != 1 || buffer->Bytes()[0] != 0x42) return false;
@@ -177,16 +177,16 @@ bool IsDecodedPayload(const acpp::buf::MultiBuffer& payload) {
 }
 
 // The reader of a dispatched native request is the association's session.
-class DatagramDispatcher final : public acpp::routing::Dispatcher {
+class DatagramDispatcher final : public ::routing::Dispatcher {
 public:
     unsigned dispatched = 0;
     unsigned packets_read = 0;
-    const acpp::transport::MultiBufferReader* last_reader = nullptr;
-    acpp::net::awaitable<acpp::RelayResult> Dispatch(
-        acpp::net::io_context&, const acpp::routing::DispatchPolicy&,
-        std::unique_ptr<acpp::AsyncStream>, acpp::transport::Link link,
-        acpp::InitialPayload, acpp::session::Context&, acpp::StatsShard&,
-        const acpp::TimeoutsConfig&) override {
+    const ::transport::MultiBufferReader* last_reader = nullptr;
+    ::net::awaitable<::RelayResult> Dispatch(
+        ::net::io_context&, const ::routing::DispatchPolicy&,
+        std::unique_ptr<::AsyncStream>, ::transport::Link link,
+        ::InitialPayload, ::session::Context&, ::StatsShard&,
+        const ::TimeoutsConfig&) override {
         ++dispatched;
         if (!link.reader) Fail("rebuilt native request has no reader");
         last_reader = link.reader;
@@ -194,16 +194,16 @@ public:
         if (!IsDecodedPayload(payload))
             Fail("rebuilt native request did not receive exactly its decoded first packet");
         ++packets_read;
-        co_return acpp::RelayResult{};
+        co_return ::RelayResult{};
     }
 };
 
-class DiscardReplySink final : public acpp::worker_detail::UdpReplySink {
+class DiscardReplySink final : public ::worker_detail::UdpReplySink {
 public:
-    bool EnqueueUdpReply(std::string_view, acpp::udp::socket*,
-                         acpp::udp::endpoint, acpp::buf::MultiBuffer,
+    bool EnqueueUdpReply(std::string_view, ::udp::socket*,
+                         ::udp::endpoint, ::buf::MultiBuffer,
                          uint32_t,
-                         std::shared_ptr<acpp::worker_detail::UdpReplyFence> = {}) override {
+                         std::shared_ptr<::worker_detail::UdpReplyFence> = {}) override {
         return false;
     }
 };
@@ -212,19 +212,19 @@ public:
 struct DatagramSource {
     DatagramDispatcher dispatcher;
     DiscardReplySink reply_sink;
-    acpp::StatsShard stats;
-    acpp::proxyman::inbound::ReceiverSettings receiver{
+    ::StatsShard stats;
+    ::proxyman::inbound::ReceiverSettings receiver{
         .inbound_tag = {}, .inbound_tags = {}, .protocol = {},
         .stream_settings = {},
-        .dispatch_policy = {.sniffing = {}, .outbound = acpp::routing::ForceOutbound{"loopback"}}};
+        .dispatch_policy = {.sniffing = {}, .outbound = ::routing::ForceOutbound{"loopback"}}};
 
-    void Send(Ingress& ingress, acpp::net::io_context& io, std::string_view socket_key,
-              acpp::udp::socket* sock, uint16_t client_port,
-              std::span<const uint8_t> packet, const acpp::TimeoutsConfig& timeouts) {
-        ingress.ProcessDatagram(acpp::worker_detail::UdpDatagramContext{
+    void Send(Ingress& ingress, ::net::io_context& io, std::string_view socket_key,
+              ::udp::socket* sock, uint16_t client_port,
+              std::span<const uint8_t> packet, const ::TimeoutsConfig& timeouts) {
+        ingress.ProcessDatagram(::worker_detail::UdpDatagramContext{
             .socket_key = socket_key,
             .sock = sock,
-            .client_endpoint = {acpp::net::ip::address_v4::loopback(), client_port},
+            .client_endpoint = {::net::ip::address_v4::loopback(), client_port},
             .payload = packet,
             .receiver = &receiver,
             .io_context = io,
@@ -236,34 +236,34 @@ struct DatagramSource {
     }
 };
 
-acpp::net::awaitable<void> ReadDecodedPayload(SessionPtr session, bool& received) {
+::net::awaitable<void> ReadDecodedPayload(SessionPtr session, bool& received) {
     auto payload = co_await session->ReadMultiBuffer();
     received = IsDecodedPayload(payload);
 }
 
-acpp::worker_detail::ClientSessionKey Key(uint64_t id) {
-    acpp::InboundDatagramOwner owner;
+::worker_detail::ClientSessionKey Key(uint64_t id) {
+    ::InboundDatagramOwner owner;
     const std::array<uint8_t, 1> bytes{0x71};
     if (!owner.Assign(bytes)) Fail("failed to prepare typed session owner");
     return {owner, id};
 }
 
-SessionPtr MakeSession(Ingress& ingress, acpp::net::io_context& io,
-                       std::string socket_key, acpp::worker_detail::ClientSessionKey client_key,
+SessionPtr MakeSession(Ingress& ingress, ::net::io_context& io,
+                       std::string socket_key, ::worker_detail::ClientSessionKey client_key,
                        Clock::time_point last_active,
                        std::chrono::seconds idle_timeout) {
     return ingress.CreateClientSession(
         socket_key, client_key, io,
         {},
-        {acpp::net::ip::address_v4::loopback(), 10001}, client_key.owner, last_active,
+        {::net::ip::address_v4::loopback(), 10001}, client_key.owner, last_active,
         idle_timeout);
 }
 
-Ingress::SocketPtr AttachOpenSocket(Ingress& ingress, acpp::net::io_context& io,
+Ingress::SocketPtr AttachOpenSocket(Ingress& ingress, ::net::io_context& io,
                                     std::string_view socket_key) {
     auto socket = Ingress::MakeSocket(io);
-    acpp::IoErrorCode ec;
-    socket->open(acpp::udp::v4(), ec);
+    ::IoErrorCode ec;
+    socket->open(::udp::v4(), ec);
     if (ec || !ingress.AttachSocket(socket_key, socket)) {
         Fail("failed to attach an open UDP socket");
     }
@@ -276,18 +276,18 @@ size_t Associations(std::initializer_list<const Ingress*> ingresses) {
     return total;
 }
 
-size_t ActiveEvents(const acpp::TimeoutScheduler& scheduler) {
+size_t ActiveEvents(const ::TimeoutScheduler& scheduler) {
     return scheduler.GetResourceStats().active_events;
 }
 
-void RunFor(acpp::net::io_context& io, std::chrono::milliseconds duration) {
+void RunFor(::net::io_context& io, std::chrono::milliseconds duration) {
     io.run_for(duration);
     io.restart();
 }
 
 // Runs handlers until `done` holds or the generous bound elapses.
 template <class Done>
-bool RunUntil(acpp::net::io_context& io, Done done, std::chrono::milliseconds limit = 5000ms) {
+bool RunUntil(::net::io_context& io, Done done, std::chrono::milliseconds limit = 5000ms) {
     const auto deadline = Clock::now() + limit;
     while (!done()) {
         if (Clock::now() >= deadline) return false;
@@ -302,7 +302,7 @@ bool RunUntil(acpp::net::io_context& io, Done done, std::chrono::milliseconds li
 // single handler reclaims more than one batch. `after_batch` runs after every
 // handler that reclaimed rows.
 template <class Count, class AfterBatch>
-bool StepReclaimBatches(acpp::net::io_context& io, Count count, size_t target,
+bool StepReclaimBatches(::net::io_context& io, Count count, size_t target,
                         AfterBatch after_batch, size_t& reclaiming_handlers) {
     const auto deadline = Clock::now() + 5000ms;
     size_t current = count();
@@ -329,11 +329,11 @@ TEST(UdpAssociationReclaimer, Contract) {
         std::pmr::memory_resource* previous = std::pmr::set_default_resource(&resource);
         ~PmrScope() { std::pmr::set_default_resource(previous); }
     } pmr_scope;
-    acpp::net::io_context io;
-    auto& scheduler = acpp::TimeoutScheduler::ForIoContext(io);
+    ::net::io_context io;
+    auto& scheduler = ::TimeoutScheduler::ForIoContext(io);
     const size_t idle_events = ActiveEvents(scheduler);
     Reclaimer reclaimer(scheduler, nullptr, [](void*, std::exception_ptr) { std::terminate(); });
-    acpp::worker_detail::UdpResourceBudget budget;
+    ::worker_detail::UdpResourceBudget budget;
     Ingress first("first", std::make_unique<DummyInbound>(), reclaimer, budget, io);
     Ingress second("second", std::make_unique<DummyInbound>(), reclaimer, budget, io);
     const auto now = Clock::now();
@@ -457,9 +457,9 @@ TEST(UdpAssociationReclaimer, Contract) {
 
     // Downlink traffic does not refresh idle time: the row still expires at
     // its original deadline, well before a refreshed deadline could pass.
-    acpp::TargetAddress target;
-    target.type = acpp::AddressType::IPv4;
-    target.resolved_addr = acpp::net::ip::address_v4::loopback();
+    ::TargetAddress target;
+    target.type = ::AddressType::IPv4;
+    target.resolved_addr = ::net::ip::address_v4::loopback();
     target.port = 53;
     Ingress downlink_ingress("downlink", std::make_unique<DummyInbound>(), reclaimer, budget, io);
     AcceptedReplySink accepted_reply;
@@ -468,16 +468,16 @@ TEST(UdpAssociationReclaimer, Contract) {
         "activity", Key(1), io,
         {.socket_key = {}, .socket = {}, .response = std::make_shared<AcceptedReplyResponse>(),
          .sink = &accepted_reply, .worker_id = 0, .fence = {}},
-        {acpp::net::ip::address_v4::loopback(), 10001}, Key(1).owner,
+        {::net::ip::address_v4::loopback(), 10001}, Key(1).owner,
         Clock::now() - downlink_idle + 200ms, downlink_idle);
-    acpp::buf::BufferGuard reply{acpp::buf::Buffer::New()};
+    ::buf::BufferGuard reply{::buf::Buffer::New()};
     if (!reply) Fail("failed to allocate UDP downlink activity payload");
     reply->Tail()[0] = 2;
     reply->Produce(1);
     reply->SetUDP(target);
     bool reply_completed = false;
-    acpp::net::co_spawn(io,
-        downlink->WriteMultiBuffer(acpp::buf::MultiBuffer{std::move(reply)}),
+    ::net::co_spawn(io,
+        downlink->WriteMultiBuffer(::buf::MultiBuffer{std::move(reply)}),
         [&](std::exception_ptr error) { reply_completed = !error; });
     if (!RunUntil(io, [&] { return reply_completed; }) || accepted_reply.packets != 1) {
         Fail("UDP downlink write did not complete");
@@ -496,7 +496,7 @@ TEST(UdpAssociationReclaimer, Contract) {
     Ingress activity_ingress("activity", std::make_unique<DatagramInbound>(), reclaimer, budget, io);
     auto activity_socket = AttachOpenSocket(activity_ingress, io, "activity");
     DatagramSource activity_source;
-    acpp::TimeoutsConfig activity_timeouts;
+    ::TimeoutsConfig activity_timeouts;
     activity_timeouts.idle = 1;
     constexpr auto uplink_idle = 1s;
     auto uplink = MakeSession(activity_ingress, io, "activity", Key(1),
@@ -511,7 +511,7 @@ TEST(UdpAssociationReclaimer, Contract) {
         Fail("UDP uplink was not delivered to its existing association");
     }
     bool uplink_received = false;
-    acpp::net::co_spawn(io, ReadDecodedPayload(uplink, uplink_received), asio::detached);
+    ::net::co_spawn(io, ReadDecodedPayload(uplink, uplink_received), asio::detached);
     RunFor(io, 600ms);
     if (!uplink_received || uplink->Closed() ||
         activity_ingress.GetResourceStats().associations != 1) {
@@ -561,7 +561,7 @@ TEST(UdpAssociationReclaimer, Contract) {
     Ingress request_ingress("request", std::make_unique<DatagramInbound>(),
                             reclaimer, budget, io);
     DatagramSource request_source;
-    acpp::TimeoutsConfig packet_timeouts;
+    ::TimeoutsConfig packet_timeouts;
     auto request_socket = AttachOpenSocket(request_ingress, io, "request");
     const auto scoped_key = Key(1);
     auto expired_same_key = MakeSession(
@@ -586,13 +586,13 @@ TEST(UdpAssociationReclaimer, Contract) {
         Fail("current packet timeout overwrote the row's zero-timeout snapshot");
     }
     bool zero_timeout_received = false;
-    acpp::net::co_spawn(io, ReadDecodedPayload(zero_timeout_row, zero_timeout_received),
+    ::net::co_spawn(io, ReadDecodedPayload(zero_timeout_row, zero_timeout_received),
                         asio::detached);
 
     io.poll();
     io.restart();
-    const acpp::transport::MultiBufferReader* expired_reader = expired_same_key.get();
-    const acpp::transport::MultiBufferReader* zero_timeout_reader = zero_timeout_row.get();
+    const ::transport::MultiBufferReader* expired_reader = expired_same_key.get();
+    const ::transport::MultiBufferReader* zero_timeout_reader = zero_timeout_row.get();
     if (request_source.dispatcher.dispatched != 1 || request_source.dispatcher.packets_read != 1)
         Fail("same-key rebuild did not dispatch exactly one request with its first packet");
     if (!request_source.dispatcher.last_reader ||

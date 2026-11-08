@@ -1,14 +1,13 @@
-#include "acppnode/app/prepared_inbound.hpp"
+#include "app/prepared_inbound.hpp"
 
-#include "acppnode/app/proxyman/inbound/factory.hpp"
-#include "acppnode/infra/config_types.hpp"
-#include "acppnode/transport/internet/transport_security.hpp"
+#include "app/proxyman/inbound/factory.hpp"
+#include "infra/config_types.hpp"
+#include "transport/internet/transport_security.hpp"
 
 #include <stdexcept>
 #include <utility>
 #include <variant>
 
-namespace acpp {
 
 std::shared_ptr<const proxyman::inbound::UserSet> PrepareInboundUsers(
     const proxyman::inbound::BuildRequest& request,
@@ -65,4 +64,3 @@ PreparedInbound PrepareInbound(const InboundSpec& spec) {
     };
 }
 
-}  // namespace acpp

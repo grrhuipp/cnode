@@ -1,12 +1,12 @@
 #pragma once
 
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/buf/multi_buffer.hpp"
-#include "acppnode/common/buffer_util.hpp"
-#include "acppnode/common/error.hpp"
-#include "acppnode/proxy/inbound.hpp"
-#include "acppnode/app/session_group_executor.hpp"
-#include "acppnode/transport/link.hpp"
+#include "common/allocator.hpp"
+#include "common/buf/multi_buffer.hpp"
+#include "common/buffer_util.hpp"
+#include "common/error.hpp"
+#include "proxy/inbound.hpp"
+#include "app/session_group_executor.hpp"
+#include "transport/link.hpp"
 #include "udp_client_session_key.hpp"
 #include "udp_resource_budget.hpp"
 
@@ -18,7 +18,6 @@
 #include <string>
 #include <string_view>
 
-namespace acpp {
 struct TargetAddress;
 struct StatsShard;
 struct TimeoutsConfig;
@@ -31,9 +30,8 @@ class Dispatcher;
 namespace proxyman::inbound {
 struct ReceiverSettings;
 }
-}  // namespace acpp
 
-namespace acpp::worker_detail {
+namespace worker_detail {
 
 class UdpAssociationReclaimer;
 struct UdpAssociationHook;
@@ -121,7 +119,7 @@ public:
     struct ReplyRoute {
         memory::ThreadLocalString socket_key;
         SocketPtr socket;
-        std::shared_ptr<::acpp::InboundDatagramResponse> response;
+        std::shared_ptr<::InboundDatagramResponse> response;
         UdpReplySink* sink = nullptr;
         uint32_t worker_id = 0;
         std::shared_ptr<UdpReplyFence> fence;
@@ -148,7 +146,7 @@ public:
     };
 
 
-    UdpIngress(std::string_view tag, std::unique_ptr<::acpp::Inbound> proxy,
+    UdpIngress(std::string_view tag, std::unique_ptr<::Inbound> proxy,
                UdpAssociationReclaimer& reclaimer, UdpResourceBudget& budget,
                net::io_context& io_context);
     ~UdpIngress() noexcept;
@@ -161,7 +159,7 @@ public:
 
     // Keep Worker-local sockets stable while replacing cold-path protocol state.
     [[nodiscard]] bool ReplaceHandler(
-        std::unique_ptr<::acpp::Inbound> proxy) noexcept;
+        std::unique_ptr<::Inbound> proxy) noexcept;
     void RequestStop() noexcept;
     [[nodiscard]] net::awaitable<void> AsyncJoin();
 
@@ -187,7 +185,7 @@ public:
         net::io_context& io_context,
         ReplyRoute reply,
         udp::endpoint reply_endpoint,
-        ::acpp::InboundDatagramOwner session_owner,
+        ::InboundDatagramOwner session_owner,
         std::chrono::steady_clock::time_point last_active,
         std::chrono::seconds idle_timeout);
     void CleanupClientSessions(std::string_view socket_key) noexcept;
@@ -239,7 +237,7 @@ public:
     ClientSession(net::io_context& io_context,
                   ReplyRoute reply,
                   udp::endpoint reply_endpoint,
-                  ::acpp::InboundDatagramOwner session_owner,
+                  ::InboundDatagramOwner session_owner,
                   UdpResourceBudget& budget,
                   UdpResourceBudget::AssociationLease association);
     ~ClientSession() noexcept override;
@@ -249,7 +247,7 @@ public:
 
     [[nodiscard]] bool Closed() const noexcept;
     [[nodiscard]] bool Owns(
-        const ::acpp::InboundDatagramOwner& owner) const noexcept;
+        const ::InboundDatagramOwner& owner) const noexcept;
 
     void UpdateReplyEndpoint(udp::endpoint endpoint) noexcept;
     [[nodiscard]] bool Push(
@@ -271,4 +269,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-}  // namespace acpp::worker_detail
+}  // namespace worker_detail

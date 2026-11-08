@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "acppnode/geo/geodata.hpp"
+#include "geo/geodata.hpp"
 
 #include <array>
 #include <cstdint>
@@ -15,7 +15,7 @@
 
 namespace {
 
-using acpp::geo::GeoDatabase;
+using ::geo::GeoDatabase;
 namespace fs = std::filesystem;
 
 void Require(bool condition, const char* message) {

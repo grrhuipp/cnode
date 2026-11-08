@@ -7,18 +7,17 @@
 // 不包含加密实现、用户管理或解析逻辑。
 // ============================================================================
 
-#include "acppnode/common.hpp"
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/buf/multi_buffer.hpp"
-#include "acppnode/common/target_address.hpp"
-#include "acppnode/app/proxyman/inbound/user_store.hpp"
+#include "common.hpp"
+#include "common/allocator.hpp"
+#include "common/buf/multi_buffer.hpp"
+#include "common/target_address.hpp"
+#include "app/proxyman/inbound/user_store.hpp"
 #include "types.hpp"
-#include "acppnode/common/unsafe.hpp"
+#include "common/unsafe.hpp"
 #include <array>
 #include <cstdint>
 #include <memory>
 
-namespace acpp {
 namespace vmess {
 
 // ============================================================================
@@ -89,10 +88,9 @@ struct VMessRequest {
 
     std::shared_ptr<const proxyman::inbound::UserStore::VmessCredential> user;
     ~VMessRequest() noexcept {
-        ::acpp::SecureZeroMemory(body_iv.data(), body_iv.size());
-        ::acpp::SecureZeroMemory(body_key.data(), body_key.size());
+        ::SecureZeroMemory(body_iv.data(), body_iv.size());
+        ::SecureZeroMemory(body_key.data(), body_key.size());
     }
 };
 
 }  // namespace vmess
-}  // namespace acpp

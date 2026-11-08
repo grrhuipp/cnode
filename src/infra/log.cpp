@@ -1,6 +1,6 @@
-#include "acppnode/infra/log.hpp"
+#include "infra/log.hpp"
 
-#include "acppnode/common/clock.hpp"
+#include "common/clock.hpp"
 
 #include <concurrentqueue.h>
 #include <lightweightsemaphore.h>
@@ -32,7 +32,6 @@
 #include <utility>
 #include <vector>
 
-namespace acpp {
 
 std::atomic<LogLevel> Log::min_level_{LogLevel::INFO};
 std::atomic_bool Log::initialized_{false};
@@ -1575,4 +1574,3 @@ bool Log::ShouldLog(LogLevel level) noexcept {
     return level >= min_level;
 }
 
-}  // namespace acpp

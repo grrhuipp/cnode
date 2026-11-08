@@ -1,12 +1,12 @@
-#include "acppnode/app/router/router.hpp"
+#include "app/router/router.hpp"
 
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/asio_types.hpp"
-#include "acppnode/common/session.hpp"
-#include "acppnode/core/constants.hpp"
-#include "acppnode/geo/geodata.hpp"
-#include "acppnode/infra/config_types.hpp"
-#include "acppnode/infra/log.hpp"
+#include "common/allocator.hpp"
+#include "common/asio_types.hpp"
+#include "common/session.hpp"
+#include "core/constants.hpp"
+#include "geo/geodata.hpp"
+#include "infra/config_types.hpp"
+#include "infra/log.hpp"
 
 #include <algorithm>
 #include <optional>
@@ -16,7 +16,7 @@
 #include <utility>
 #include <vector>
 
-namespace acpp::app::router {
+namespace app::router {
 
 namespace {
 using StringVector = std::vector<std::string>;
@@ -67,24 +67,24 @@ class GeoSiteCondition {
 public:
     GeoSiteCondition(
         const std::vector<std::string>& tags,
-        const ::acpp::geo::GeoDatabase* geo);
+        const ::geo::GeoDatabase* geo);
 
     [[nodiscard]] bool Match(const session::Context& ctx) const;
 
 private:
-    std::vector<const ::acpp::geo::DomainRuleSet*> sets_;
+    std::vector<const ::geo::DomainRuleSet*> sets_;
 };
 
 class GeoIPCondition {
 public:
     GeoIPCondition(
         const std::vector<std::string>& tags,
-        const ::acpp::geo::GeoDatabase* geo);
+        const ::geo::GeoDatabase* geo);
 
     [[nodiscard]] bool Match(const session::Context& ctx) const;
 
 private:
-    std::vector<const ::acpp::geo::CidrSet*> sets_;
+    std::vector<const ::geo::CidrSet*> sets_;
 };
 
 struct CompoundRoutingRule {
@@ -156,9 +156,9 @@ struct CompoundRoutingRule {
                geoip_condition.has_value();
     }
 
-    std::optional<::acpp::geo::CidrSet> source_ip_matcher;
-    std::optional<::acpp::geo::CidrSet> ip_matcher;
-    std::optional<::acpp::geo::DomainRuleSet> domain_matcher;
+    std::optional<::geo::CidrSet> source_ip_matcher;
+    std::optional<::geo::CidrSet> ip_matcher;
+    std::optional<::geo::DomainRuleSet> domain_matcher;
     std::optional<GeoSiteCondition> geosite_condition;
     std::optional<GeoIPCondition> geoip_condition;
     std::string outbound_tag;
@@ -291,13 +291,13 @@ private:
 // ============================================================================
 
 struct Router::Impl {
-    Impl(const RoutingConfig& routing, const ::acpp::geo::GeoDatabase* geo);
+    Impl(const RoutingConfig& routing, const ::geo::GeoDatabase* geo);
 
     std::vector<CompoundRoutingRule> compound_rules;
     routing::DomainStrategy domain_strategy;
 };
 
-Router::Router(const RoutingConfig& config, const ::acpp::geo::GeoDatabase* geo_database)
+Router::Router(const RoutingConfig& config, const ::geo::GeoDatabase* geo_database)
     : impl_(std::make_unique<const Impl>(config, geo_database)) {}
 Router::~Router() noexcept = default;
 
@@ -327,7 +327,7 @@ routing::RouteDecision Router::Route(const session::Context& ctx) const {
 
 Router::Impl::Impl(
     const RoutingConfig& routing,
-    const ::acpp::geo::GeoDatabase* geo)
+    const ::geo::GeoDatabase* geo)
     : domain_strategy(routing.domain_strategy) {
     compound_rules.reserve(routing.rules.size());
     for (const auto& rc : routing.rules) {
@@ -361,7 +361,7 @@ Router::Impl::Impl(
             compound.SetProtocolCondition(rc.protocol);
         }
 
-        ::acpp::geo::CidrSet source_ip_matcher(memory::process_resource());
+        ::geo::CidrSet source_ip_matcher(memory::process_resource());
         for (const auto& value : rc.source) {
             source_ip_matcher.Insert(NetworkBytes(value), value.Prefix());
         }
@@ -369,7 +369,7 @@ Router::Impl::Impl(
             compound.source_ip_matcher.emplace(std::move(source_ip_matcher));
         }
 
-        ::acpp::geo::CidrSet ip_matcher(memory::process_resource());
+        ::geo::CidrSet ip_matcher(memory::process_resource());
         for (const auto& value : rc.ip) {
             ip_matcher.Insert(NetworkBytes(value), value.Prefix());
         }
@@ -377,7 +377,7 @@ Router::Impl::Impl(
             compound.ip_matcher.emplace(std::move(ip_matcher));
         }
 
-        ::acpp::geo::DomainRuleSet domain_matcher(memory::process_resource());
+        ::geo::DomainRuleSet domain_matcher(memory::process_resource());
         for (const auto& value : rc.domain_suffix) {
             domain_matcher.AddSuffix(value);
         }
@@ -425,7 +425,7 @@ bool GeoSiteCondition::Match(const session::Context& ctx) const {
 
 GeoSiteCondition::GeoSiteCondition(
     const std::vector<std::string>& tags,
-    const ::acpp::geo::GeoDatabase* geo) {
+    const ::geo::GeoDatabase* geo) {
     if (!geo) {
         throw std::logic_error(
             "geosite condition reached runtime without GeoDatabase");
@@ -452,7 +452,7 @@ bool GeoIPCondition::Match(const session::Context& ctx) const {
 
 GeoIPCondition::GeoIPCondition(
     const std::vector<std::string>& tags,
-    const ::acpp::geo::GeoDatabase* geo) {
+    const ::geo::GeoDatabase* geo) {
     if (!geo) {
         throw std::logic_error(
             "geoip condition reached runtime without GeoDatabase");
@@ -468,4 +468,4 @@ GeoIPCondition::GeoIPCondition(
     }
 }
 
-}  // namespace acpp::app::router
+}  // namespace app::router

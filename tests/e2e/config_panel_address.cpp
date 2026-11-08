@@ -1,5 +1,7 @@
 #include "config_panel_common.hpp"
 
+#include <arpa/inet.h>
+#include <openssl/sha.h>
 #include <array>
 #include <tuple>
 
@@ -13,8 +15,8 @@ std::string DomainRequest(uint16_t port, std::string_view host) {
 }
 class Resolver {
 public:
-    Resolver(bool reject, std::string_view address)
-        : socket_(Socket::BindUdp(0, address)), thread_([this, reject] {
+    Resolver(bool reject, std::string_view address, uint32_t ttl = 30)
+        : socket_(Socket::BindUdp(0, address)), thread_([this, reject, ttl] {
             while (!stop_.load()) {
                 pollfd descriptor{socket_.Fd(), POLLIN, 0};
                 const int ready = ::poll(&descriptor, 1, 50);
@@ -45,7 +47,7 @@ public:
                 std::string answer;
                 if (!reject && kind == 1)
                     answer = std::string("\xc0\x0c", 2) + BigEndian(1, 2) + BigEndian(1, 2) +
-                        BigEndian(30, 4) + BigEndian(4, 2) + std::string("\x7f\0\0\1", 4);
+                        BigEndian(ttl, 4) + BigEndian(4, 2) + BigEndian(answer_ipv4_.load(), 4);
                 const auto response = std::string(wire.substr(0, 2)) + BigEndian(reject ? 0x8182 : 0x8180, 2) +
                     BigEndian(1, 2) + BigEndian(answer.empty() ? 0 : 1, 2) + std::string(4, '\0') +
                     std::string(wire.substr(12, offset + 4 - 12)) + answer;
@@ -60,10 +62,19 @@ public:
     }
     uint16_t Port() const { return socket_.Port(); }
     std::vector<std::string> Names() { std::lock_guard lock(mutex_); return names_; }
+    void SetLastOctet(uint8_t value) { answer_ipv4_ = 0x7f000000u | value; }
+    void SetIpv4Address(const std::string& address) {
+        in_addr parsed{};
+        if (::inet_pton(AF_INET, address.c_str(), &parsed) != 1)
+            throw std::invalid_argument("invalid DNS fixture IPv4 answer");
+        answer_ipv4_ = ntohl(parsed.s_addr);
+    }
     void Join() { if (!joined_) { stop_ = true; thread_.Join(); joined_ = true; } }
 private:
     Socket socket_;
     std::atomic<bool> stop_{false};
+    // 主测试线程仅在上一 TCP 应答后发布地址快照，接收线程用配对的 seq_cst 读取。
+    std::atomic<uint32_t> answer_ipv4_{0x7f000001u};
     std::mutex mutex_;
     std::vector<std::string> names_;
     PeerThread thread_;
@@ -117,6 +128,155 @@ TEST_P(DnsEndpoints, NormalizesEndpointFallsBackAndSharesCacheAcrossWorkers) {
     }
 }
 INSTANTIATE_TEST_SUITE_P(AddressFamilies, DnsEndpoints, testing::Values("ipv4", "ipv6", "fallback-same-address"));
+
+class DnsAnswerTtl : public testing::TestWithParam<uint32_t> {};
+TEST_P(DnsAnswerTtl, RequeriesZeroTtlBeforeDialingTheNextDestination) {
+    const auto ttl = GetParam();
+    const bool reusable = ttl != 0 && ttl <= 0x7fffffffu;
+    TempDir directory;
+    Resolver resolver(false, "127.0.0.1", ttl);
+    auto backend = Socket::Listen(0, "0.0.0.0");
+    auto reservation = Socket::Listen();
+    const auto port = reservation.Port();
+    Configure(directory.Path(), Inbound(port), Direct(), 2);
+    auto config = Json::parse(ReadFile(directory.Path() / "config.json"));
+    config["dns"] = {{"servers", {"127.0.0.1:" + std::to_string(resolver.Port())}},
+        {"timeout", 1}, {"minTTL", 60}, {"maxTTL", 3600}};
+    WriteJson(directory.Path(), "config.json", config);
+    PeerThread peer([&] {
+        for (size_t i = 0; i < 2; ++i) {
+            auto socket = backend.Accept();
+            EXPECT_EQ(socket.ReadExact(Request.size()), Request);
+            sockaddr_in local{};
+            socklen_t size = sizeof(local);
+            if (::getsockname(socket.Fd(), reinterpret_cast<sockaddr*>(&local), &size) != 0)
+                throw std::runtime_error("destination address lookup failed");
+            EXPECT_EQ(local.sin_family, AF_INET);
+            const auto last_octet = static_cast<char>(ntohl(local.sin_addr.s_addr) & 0xff);
+            socket.Write(std::string(Banner) + std::string(1, last_octet));
+        }
+    });
+    reservation.Close();
+    auto child = Start(directory.Path());
+    child->WaitForLog("server started");
+    for (size_t i = 0; i < 2; ++i) {
+        resolver.SetLastOctet(static_cast<uint8_t>(i + 1));
+        auto socket = Socket::Connect(port);
+        socket.Write(DomainRequest(backend.Port(), "ttl.destination.test"));
+        const char expected_address = i == 0 || reusable ? 1 : 2;
+        EXPECT_EQ(socket.ReadExact(Banner.size() + 3), std::string("\0\0", 2) +
+            std::string(Banner) + std::string(1, expected_address));
+    }
+    peer.Join();
+    EXPECT_EQ(resolver.Names().size(), reusable ? 4u : 8u);
+    EXPECT_TRUE(child->Running());
+    EXPECT_EQ(child->Stop(), 0);
+    resolver.Join();
+}
+INSTANTIATE_TEST_SUITE_P(WireBoundaries, DnsAnswerTtl, testing::Values(
+    0u, 60u, 0x7fffffffu, 0x80000000u, 0xffffffffu),
+    [](const testing::TestParamInfo<uint32_t>& info) {
+        return "raw_" + std::to_string(info.param);
+    });
+
+class AbsoluteDomainInbound : public testing::TestWithParam<std::string> {};
+TEST_P(AbsoluteDomainInbound, SegmentedRaw254ByteNameAuthenticatesResolvesAndForwards) {
+    const auto protocol = GetParam();
+    constexpr std::string_view password = "segmented-secret";
+    const std::string normalized = std::string(63, 'a') + "." + std::string(63, 'b') + "." +
+        std::string(63, 'c') + "." + std::string(61, 'd');
+    const std::string absolute = std::string(63, 'A') + "." + std::string(63, 'B') + "." +
+        std::string(63, 'C') + "." + std::string(61, 'D') + ".";
+    ASSERT_EQ(normalized.size(), 253u);
+    ASSERT_EQ(absolute.size(), 254u);
+    const std::array<std::string_view, 2> names{absolute, normalized};
+    const std::array<std::string_view, 2> requests{"absolute-name-request", "rootless-name-request"};
+    const std::array<std::string_view, 2> responses{"absolute-backend-reply", "rootless-backend-reply"};
+    TempDir directory;
+    Resolver resolver(false, "127.0.0.1");
+    auto destination = ReserveRuntimePort();
+    resolver.SetIpv4Address(destination.address);
+    auto front = ReserveRuntimePort();
+    const auto port = front.tcp.Port();
+    auto inbound = Inbound(port, protocol);
+    inbound["listen"] = front.address;
+    if (protocol == "trojan") {
+        inbound["settings"] = {{"clients", Json::array({{{"password", password}}})}};
+        inbound["streamSettings"] = TlsSettings(true);
+    }
+    Configure(directory.Path(), inbound, Direct());
+    auto config = Json::parse(ReadFile(directory.Path() / "config.json"));
+    config["dns"] = {{"servers", {"127.0.0.1:" + std::to_string(resolver.Port())}},
+        {"timeout", 1}, {"minTTL", 1}, {"maxTTL", 30}};
+    WriteJson(directory.Path(), "config.json", config);
+    PeerThread peer([&] {
+        for (size_t i = 0; i < names.size(); ++i) {
+            auto socket = destination.tcp.Accept();
+            EXPECT_EQ(socket.ReadExact(requests[i].size()), requests[i]);
+            socket.Write(responses[i]);
+            EXPECT_TRUE(socket.Read(1).empty()) << "backend received extra bytes or missed client EOF";
+            socket.ShutdownWrite();
+        }
+    });
+    front.tcp.Close();
+    auto child = Start(directory.Path());
+    child->WaitForLog("server started");
+    TlsContext tls(false);
+    for (size_t i = 0; i < names.size(); ++i) {
+        SCOPED_TRACE("raw domain length: " + std::to_string(names[i].size()));
+        const auto host = names[i];
+        // 独立客户端保留原始长度和根点，不能经过会提前规范化的 TargetAddress 或 cnode 出站。
+        std::string header;
+        if (protocol == "vless") {
+            header = std::string(1, '\0') + UuidBytes() + std::string("\0\1", 2) +
+                BigEndian(destination.tcp.Port(), 2) + std::string(1, '\2') +
+                std::string(1, static_cast<char>(host.size())) + std::string(host);
+        } else {
+            unsigned char digest[SHA224_DIGEST_LENGTH];
+            SHA224(reinterpret_cast<const unsigned char*>(password.data()), password.size(), digest);
+            constexpr char digits[] = "0123456789abcdef";
+            for (const auto byte : digest) {
+                header += digits[byte >> 4];
+                header += digits[byte & 15];
+            }
+            header += "\r\n\1";
+            header += std::string(1, '\3') + std::string(1, static_cast<char>(host.size())) +
+                std::string(host) + BigEndian(destination.tcp.Port(), 2) + "\r\n";
+        }
+        auto exchange = [&](auto& stream) {
+            // 长度字段、每个标签和最终根点均分段写入真实协议消费链路。
+            for (const auto byte : header) {
+                stream.Write(std::string_view(&byte, 1));
+                std::this_thread::sleep_for(1ms);
+            }
+            stream.Write(requests[i].substr(0, 5));
+            stream.Write(requests[i].substr(5));
+            const auto expected = (protocol == "vless" ? std::string("\0\0", 2) : std::string()) +
+                std::string(responses[i]);
+            EXPECT_EQ(stream.ReadExact(expected.size()), expected);
+            stream.ShutdownWrite();
+            EXPECT_TRUE(stream.Read(1).empty()) << "client received extra bytes or missed backend EOF";
+        };
+        if (protocol == "trojan") {
+            TlsSocket stream(Socket::Connect(port, front.address), tls, false);
+            exchange(stream);
+        } else {
+            auto stream = Socket::Connect(port, front.address);
+            exchange(stream);
+        }
+    }
+    peer.Join();
+    EXPECT_TRUE(child->Running());
+    EXPECT_EQ(child->Stop(), 0);
+    resolver.Join();
+    const auto queried_names = resolver.Names();
+    ASSERT_FALSE(queried_names.empty());
+    for (const auto& name : queried_names) EXPECT_EQ(name, normalized);
+}
+INSTANTIATE_TEST_SUITE_P(WireBoundaries, AbsoluteDomainInbound, testing::Values("vless", "trojan"),
+    [](const testing::TestParamInfo<std::string>& info) {
+        return info.param == "vless" ? "VlessTcp" : "TrojanTlsTcp";
+    });
 
 using LiteralCase = std::tuple<std::string, std::string, bool>;
 class IpLiterals : public testing::TestWithParam<LiteralCase> {};

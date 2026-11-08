@@ -1,6 +1,5 @@
-#include "acppnode/common/error.hpp"
+#include "common/error.hpp"
 
-namespace acpp {
 
 ErrorCode MapAsioError(const IoErrorCode& ec) {
     if (!ec) {
@@ -81,4 +80,3 @@ ErrorCode MapAsioError(const IoErrorCode& ec) {
     return ErrorCode::INTERNAL;
 }
 
-}  // namespace acpp

@@ -1,12 +1,11 @@
-#include "acppnode/app/bootstrap_panels.hpp"
+#include "app/bootstrap_panels.hpp"
 
-#include "acppnode/api/panel_factory.hpp"
-#include "acppnode/service/controller/controller.hpp"
-#include "acppnode/infra/panel_config.hpp"
-#include "acppnode/infra/config.hpp"
-#include "acppnode/infra/log.hpp"
+#include "api/panel_factory.hpp"
+#include "service/controller/controller.hpp"
+#include "infra/panel_config.hpp"
+#include "infra/config.hpp"
+#include "infra/log.hpp"
 
-namespace acpp {
 
 void SetupPanels(net::io_context& main_ctx,
                  Controller& controller,
@@ -39,4 +38,3 @@ void SetupPanels(net::io_context& main_ctx,
     }
 }
 
-}  // namespace acpp

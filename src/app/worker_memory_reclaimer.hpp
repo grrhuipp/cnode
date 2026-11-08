@@ -1,11 +1,10 @@
 #pragma once
 
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/transport/internet/timeout_scheduler.hpp"
+#include "common/allocator.hpp"
+#include "transport/internet/timeout_scheduler.hpp"
 
 #include <stdexcept>
 
-namespace acpp {
 
 // Owned by Worker::RuntimeState. Start/Stop and all notifications run on its
 // executor. The allocator reports only empty-FIFO transitions, not every free.
@@ -62,4 +61,3 @@ private:
     TimeoutScheduler* scheduler_ = nullptr;
 };
 
-} // namespace acpp

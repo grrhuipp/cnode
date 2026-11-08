@@ -1,7 +1,7 @@
 #include "traffic_journal.hpp"
 
-#include "acppnode/infra/json.hpp"
-#include "acppnode/infra/json_field.hpp"
+#include "infra/json.hpp"
+#include "infra/json_field.hpp"
 #include <openssl/sha.h>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -16,7 +16,7 @@
 #include <system_error>
 #include <unordered_map>
 
-namespace acpp::controller {
+namespace controller {
 namespace {
 [[noreturn]] void SystemFailure(const char* operation) {
     throw std::system_error(errno, std::generic_category(), operation);
@@ -278,4 +278,4 @@ size_t TrafficJournal::UnknownCount() {
     }
     return count;
 }
-} // namespace acpp::controller
+} // namespace controller

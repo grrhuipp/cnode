@@ -2,18 +2,18 @@
 
 #include "anytls_outbound.hpp"
 #include "../anytls_codec.hpp"
-#include "acppnode/app/dns/dns_worker.hpp"
-#include "acppnode/app/stats.hpp"
-#include "acppnode/app/session_group_executor.hpp"
-#include "acppnode/common/session.hpp"
-#include "acppnode/common/memory_stats.hpp"
-#include "acppnode/infra/runtime_config_types.hpp"
-#include "acppnode/transport/internet/tls_stream.hpp"
-#include "acppnode/transport/internet/tcp_stream.hpp"
-#include "acppnode/transport/internet/outbound_target_builder.hpp"
-#include "acppnode/transport/internet/transport_dialer.hpp"
-#include "acppnode/transport/internet/timeout_scheduler.hpp"
-#include "acppnode/transport/link_error.hpp"
+#include "app/dns/dns_worker.hpp"
+#include "app/stats.hpp"
+#include "app/session_group_executor.hpp"
+#include "common/session.hpp"
+#include "common/memory_stats.hpp"
+#include "infra/runtime_config_types.hpp"
+#include "transport/internet/tls_stream.hpp"
+#include "transport/internet/tcp_stream.hpp"
+#include "transport/internet/outbound_target_builder.hpp"
+#include "transport/internet/transport_dialer.hpp"
+#include "transport/internet/timeout_scheduler.hpp"
+#include "transport/link_error.hpp"
 #include "../src/common/awaitable_task_group.hpp"
 
 #include <asio/as_tuple.hpp>
@@ -36,7 +36,7 @@ thread_local bool fail_next_pmr_allocation = false;
 thread_local size_t allocation_failures = 0;
 thread_local size_t failed_allocation_size = 0;
 thread_local size_t fail_allocation_bytes = 0;
-static_assert(alignof(acpp::buf::Buffer) <= alignof(std::max_align_t));
+static_assert(alignof(::buf::Buffer) <= alignof(std::max_align_t));
 }
 #if defined(__GNUC__) || defined(__clang__)
 #define CNODE_TEST_NOINLINE __attribute__((noinline))
@@ -59,7 +59,6 @@ CNODE_TEST_NOINLINE void* operator new(std::size_t size, const std::nothrow_t&) 
 CNODE_TEST_NOINLINE void operator delete(void* value, const std::nothrow_t&) noexcept { ::operator delete(value); }
 
 namespace {
-using namespace acpp;
 using namespace std::chrono_literals;
 
 class FailingPmrResource final : public std::pmr::memory_resource {
@@ -495,7 +494,6 @@ public:
 
 // Only the external dial boundary is replaced. The production target builder,
 // Handler, codec, session pool, logical endpoint and relay execute unchanged.
-namespace acpp {
 
 net::awaitable<DialResult> DialOutboundTransport(net::io_context& io, session::Context&,
                                                 const OutboundTransportTarget&) {
@@ -520,7 +518,6 @@ net::awaitable<DialResult> DialOutboundTransport(net::io_context& io, session::C
     DialResult result;
     result.stream = std::make_unique<Stream>(wire);
     co_return result;
-}
 }
 
 namespace {

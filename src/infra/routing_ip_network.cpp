@@ -1,12 +1,11 @@
-#include "acppnode/infra/runtime_config_types.hpp"
+#include "infra/runtime_config_types.hpp"
 
-#include "acppnode/common/ip_address.hpp"
+#include "common/ip_address.hpp"
 
 #include <algorithm>
 #include <charconv>
 #include <string>
 
-namespace acpp {
 
 std::optional<RoutingIpNetwork> RoutingIpNetwork::Parse(std::string_view value) {
     const auto slash = value.find('/');
@@ -61,4 +60,3 @@ std::optional<RoutingIpNetwork> RoutingIpNetwork::Parse(std::string_view value) 
     return result;
 }
 
-}  // namespace acpp

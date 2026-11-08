@@ -24,7 +24,7 @@ void Check(bool condition, std::string_view message) {
 }  // namespace
 
 TEST(V2BoardOnlineReport, Contract) {
-    std::vector<acpp::api::OnlineUser> devices{
+    std::vector<::api::OnlineUser> devices{
         {.UID = 7, .IP = "203.0.113.2"},
         {.UID = 7, .IP = "203.0.113.1"},
         {.UID = 7, .IP = "203.0.113.1"},
@@ -32,7 +32,7 @@ TEST(V2BoardOnlineReport, Contract) {
         {.UID = 0, .IP = "203.0.113.9"},
     };
 
-    auto report = acpp::api::v2board::BuildOnlineReportPayload(devices, 42);
+    auto report = ::api::v2board::BuildOnlineReportPayload(devices, 42);
     Check(report.user_count == 2, "online report did not count unique UIDs");
     Check(report.device_count == 3, "online report did not deduplicate devices");
     Check(report.alive_body.size() == 2, "alive payload user count mismatch");
@@ -44,7 +44,7 @@ TEST(V2BoardOnlineReport, Contract) {
     Check(uid7_alive[1].as_string() == "203.0.113.2_42",
           "alive payload node suffix mismatch");
 
-    auto empty = acpp::api::v2board::BuildOnlineReportPayload({}, 42);
+    auto empty = ::api::v2board::BuildOnlineReportPayload({}, 42);
     Check(empty.user_count == 0 && empty.device_count == 0,
           "empty online snapshot did not report zero");
     Check(empty.alive_body.empty(),

@@ -266,43 +266,6 @@ public:
     void Committed(uint32_t sid) { Wait([&] { return Terminal(sid); }); Require(Ended(sid) && !Has(3, sid), "XHTTP upload did not commit"); }
 };
 
-// Every accepted handler is a real TCP destination, not a proxy substitute.
-class Targets {
-    Socket listener_ = Socket::Listen();
-    std::atomic<bool> stop_{false};
-    std::mutex mutex_;
-    std::set<int> active_;
-    std::vector<std::unique_ptr<PeerThread>> handlers_;
-    std::unique_ptr<PeerThread> accept_;
-public:
-    explicit Targets(std::function<void(Socket&)> handler) {
-        accept_ = std::make_unique<PeerThread>([this, handler = std::move(handler)] {
-            while (!stop_) {
-                pollfd item{listener_.Fd(), POLLIN, 0};
-                if (poll(&item, 1, 25) <= 0) continue;
-                auto socket = std::make_shared<Socket>(listener_.Accept());
-                { std::lock_guard lock(mutex_); active_.insert(socket->Fd()); }
-                handlers_.push_back(std::make_unique<PeerThread>([this, handler, socket] {
-                    try { handler(*socket); }
-                    catch (...) { if (!stop_) { std::lock_guard lock(mutex_); active_.erase(socket->Fd()); throw; } }
-                    std::lock_guard lock(mutex_); active_.erase(socket->Fd());
-                }));
-            }
-        });
-    }
-    ~Targets() { try { Join(); } catch (...) { ADD_FAILURE() << "unobserved destination peer failure"; } }
-    uint16_t Port() const { return listener_.Port(); }
-    void Join() {
-        if (!accept_) return;
-        stop_ = true;
-        accept_->Join(); accept_.reset();
-        { std::lock_guard lock(mutex_); for (int fd : active_) shutdown(fd, SHUT_RDWR); }
-        std::exception_ptr error;
-        for (auto& handler : handlers_) { try { handler->Join(); } catch (...) { if (!error) error = std::current_exception(); } }
-        handlers_.clear();
-        if (error) std::rethrow_exception(error);
-    }
-};
 inline std::string ReadAll(Socket& socket, Milliseconds timeout = 5s) {
     auto deadline = Clock::now() + timeout; std::string result;
     for (;;) { Require(Clock::now() < deadline, "EOF deadline"); auto data = socket.Read(65536, std::chrono::duration_cast<Milliseconds>(deadline - Clock::now())); if (data.empty()) return result; result += data; }

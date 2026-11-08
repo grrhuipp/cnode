@@ -1,22 +1,22 @@
-#include "acppnode/transport/internet/transport_stack.hpp"
+#include "transport/internet/transport_stack.hpp"
 
 #include "http1_handshake.hpp"
 #include "http2_session.hpp"
 #include "reality_tls.hpp"
 #include "reality_client_hello.hpp"
 #include "xhttp_session.hpp"
-#include "acppnode/app/relay.hpp"
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/session.hpp"
-#include "acppnode/common/unsafe.hpp"
-#include "acppnode/infra/log.hpp"
-#include "acppnode/infra/runtime_config_types.hpp"
-#include "acppnode/transport/internet/http_headers.hpp"
-#include "acppnode/transport/internet/outbound_target_builder.hpp"
-#include "acppnode/transport/internet/tcp_stream.hpp"
-#include "acppnode/transport/internet/tls_stream.hpp"
-#include "acppnode/transport/internet/transport_dialer.hpp"
-#include "acppnode/transport/internet/ws_stream.hpp"
+#include "app/relay.hpp"
+#include "common/allocator.hpp"
+#include "common/session.hpp"
+#include "common/unsafe.hpp"
+#include "infra/log.hpp"
+#include "infra/runtime_config_types.hpp"
+#include "transport/internet/http_headers.hpp"
+#include "transport/internet/outbound_target_builder.hpp"
+#include "transport/internet/tcp_stream.hpp"
+#include "transport/internet/tls_stream.hpp"
+#include "transport/internet/transport_dialer.hpp"
+#include "transport/internet/ws_stream.hpp"
 
 #include <algorithm>
 #include <array>
@@ -24,7 +24,6 @@
 #include <span>
 #include <string_view>
 
-namespace acpp {
 
 net::awaitable<ProxyProtocolReadResult> ReadInboundProxyProtocol(
     AsyncStream& raw,
@@ -686,4 +685,3 @@ net::awaitable<TransportBuildResult> BuildOutboundXHttpClientRequest(
     co_return http2_result;
 }
 
-}  // namespace acpp

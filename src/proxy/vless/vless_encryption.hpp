@@ -1,7 +1,7 @@
 #pragma once
 
 #include <openssl/base.h>
-#include "acppnode/common/unsafe.hpp"
+#include "common/unsafe.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -9,7 +9,7 @@
 #include <string_view>
 #include <vector>
 
-namespace acpp::vless {
+namespace vless {
 
 enum class VlessEncryptionMode : uint8_t {
     Native,
@@ -66,7 +66,7 @@ struct VlessServerPfsKey {
     VlessServerPfsKey& operator=(VlessServerPfsKey&&) noexcept = default;
     ~VlessServerPfsKey() noexcept {
         if (!private_key.empty()) {
-            ::acpp::SecureZeroMemory(private_key.data(), private_key.size());
+            ::SecureZeroMemory(private_key.data(), private_key.size());
         }
     }
 };
@@ -102,4 +102,4 @@ struct VlessEncryptionParseResult {
 [[nodiscard]] std::string_view VlessEncryptionParseErrorMessage(
     VlessEncryptionParseError error) noexcept;
 
-}  // namespace acpp::vless
+}  // namespace vless

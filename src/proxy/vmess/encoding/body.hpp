@@ -9,9 +9,9 @@
 // ============================================================================
 
 #include "../vmess_cipher.hpp"
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/buf/multi_buffer.hpp"
-#include "acppnode/transport/link.hpp"
+#include "common/allocator.hpp"
+#include "common/buf/multi_buffer.hpp"
+#include "transport/link.hpp"
 
 #include <array>
 #include <cstddef>
@@ -19,14 +19,14 @@
 #include <optional>
 #include <span>
 
-namespace acpp::vmess::encoding {
+namespace vmess::encoding {
 
 struct BodyKey {
     std::array<uint8_t, 16> key{};
     std::array<uint8_t, 16> iv{};
     ~BodyKey() noexcept {
-        ::acpp::SecureZeroMemory(key.data(), key.size());
-        ::acpp::SecureZeroMemory(iv.data(), iv.size());
+        ::SecureZeroMemory(key.data(), key.size());
+        ::SecureZeroMemory(iv.data(), iv.size());
     }
 };
 
@@ -84,7 +84,8 @@ public:
                 const BodyKey& direction_key);
 
     // Stream mode splits payload into chunks that fit one pooled buffer;
-    // packet mode seals the whole datagram as exactly one chunk.
+    // packet mode seals the whole datagram as exactly one chunk, rejecting
+    // empty UDP with NOT_SUPPORTED because an empty body is the EOF marker.
     void Encode(const buf::MultiBuffer& payload, buf::MultiBuffer& out);
     void Encode(std::span<const net::const_buffer> payload, buf::MultiBuffer& out);
     // Zero-length chunk ending this direction.
@@ -142,4 +143,4 @@ private:
     bool eof_ = false;
 };
 
-}  // namespace acpp::vmess::encoding
+}  // namespace vmess::encoding

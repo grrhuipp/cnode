@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 
-#include "acppnode/transport/internet/tcp_stream.hpp"
-#include "acppnode/common/allocator.hpp"
+#include "transport/internet/tcp_stream.hpp"
+#include "common/allocator.hpp"
 #include <asio/co_spawn.hpp>
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/bind_allocator.hpp>
@@ -14,7 +14,7 @@
 #include <stdexcept>
 
 namespace {
-namespace net = acpp::net;
+namespace net = ::net;
 using namespace std::chrono_literals;
 void Require(bool yes, const char* why) { if (!yes) throw std::runtime_error(why); }
 class CountingResource : public std::pmr::memory_resource {
@@ -40,11 +40,11 @@ private:
 
 void TestIO(CountingResource& resource) {
     net::io_context io;
-    acpp::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
-    acpp::tcp::socket socket(io), peer(io);
+    ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
+    ::tcp::socket socket(io), peer(io);
     socket.connect(acceptor.local_endpoint());
     acceptor.accept(peer);
-    acpp::TcpStream stream(std::move(socket));
+    ::TcpStream stream(std::move(socket));
     constexpr size_t count = 128;
     size_t completed = 0;
     std::exception_ptr error;
@@ -85,10 +85,10 @@ void TestIO(CountingResource& resource) {
     const auto before = resource.allocations;
     const auto live = resource.live;
     net::co_spawn(io, stream.WaitReadable(), net::bind_cancellation_slot(signal.slot(),
-        [&](std::exception_ptr e, acpp::IoErrorCode ec) {
+        [&](std::exception_ptr e, ::IoErrorCode ec) {
             cancelled = e || ec == net::error::operation_aborted;
         }));
-    timer.async_wait([&](acpp::IoErrorCode ec) { if (!ec) signal.emit(net::cancellation_type::terminal); });
+    timer.async_wait([&](::IoErrorCode ec) { if (!ec) signal.emit(net::cancellation_type::terminal); });
     io.run_for(1s);
     Require(cancelled && resource.allocations == before && resource.live == live,
             "cancellation must release process-allocated socket operations without touching private PMR");
@@ -96,11 +96,11 @@ void TestIO(CountingResource& resource) {
 
 void TestReadCancellation(CountingResource& resource, bool multi_buffer) {
     net::io_context io;
-    acpp::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
-    acpp::tcp::socket socket(io), peer(io);
+    ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
+    ::tcp::socket socket(io), peer(io);
     socket.connect(acceptor.local_endpoint());
     acceptor.accept(peer);
-    acpp::TcpStream stream(std::move(socket));
+    ::TcpStream stream(std::move(socket));
     net::cancellation_signal signal;
     net::steady_timer timer(io, 5ms);
     bool completed = false, cancelled = false;
@@ -114,14 +114,14 @@ void TestReadCancellation(CountingResource& resource, bool multi_buffer) {
                 char byte{};
                 (void)co_await stream.AsyncRead(net::buffer(&byte, 1));
             }
-        } catch (const acpp::IoSystemError& failure) {
-            if (failure.code() != acpp::io_error::operation_aborted) throw;
+        } catch (const ::IoSystemError& failure) {
+            if (failure.code() != ::io_error::operation_aborted) throw;
             cancelled = true;
         }
     };
     net::co_spawn(io, read(), net::bind_cancellation_slot(signal.slot(),
         [&](std::exception_ptr e) { error = e; completed = true; }));
-    timer.async_wait([&](acpp::IoErrorCode ec) {
+    timer.async_wait([&](::IoErrorCode ec) {
         if (!ec) signal.emit(net::cancellation_type::terminal);
     });
     io.run_for(1s);
@@ -133,21 +133,21 @@ void TestReadCancellation(CountingResource& resource, bool multi_buffer) {
 
 void TestPrivateAllocatorIsolation(CountingResource& resource) {
     net::io_context io;
-    acpp::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
-    acpp::tcp::socket socket(io), peer(io);
+    ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
+    ::tcp::socket socket(io), peer(io);
     socket.connect(acceptor.local_endpoint());
     acceptor.accept(peer);
-    acpp::TcpStream stream(std::move(socket));
+    ::TcpStream stream(std::move(socket));
     net::cancellation_signal signal;
     net::steady_timer timer(io, 5ms);
     bool cancelled = false;
     resource.fail_next = true;
     net::co_spawn(io, stream.WaitReadable(), net::bind_cancellation_slot(signal.slot(),
-        [&](std::exception_ptr error, acpp::IoErrorCode ec) {
+        [&](std::exception_ptr error, ::IoErrorCode ec) {
             if (error) std::rethrow_exception(error);
             cancelled = ec == net::error::operation_aborted;
         }));
-    timer.async_wait([&](acpp::IoErrorCode ec) {
+    timer.async_wait([&](::IoErrorCode ec) {
         if (!ec) signal.emit(net::cancellation_type::terminal);
     });
     io.run_for(1s);
@@ -157,24 +157,24 @@ void TestPrivateAllocatorIsolation(CountingResource& resource) {
 }
 
 void TestQueuedReadinessAcrossMigration() {
-    using namespace acpp::memory;
+    using namespace ::memory;
     AllocationDomain domain;
     net::io_context reactor, destination;
-    acpp::tcp::acceptor acceptor(reactor, {net::ip::address_v4::loopback(), 0});
-    acpp::tcp::socket socket(reactor), peer(reactor);
+    ::tcp::acceptor acceptor(reactor, {net::ip::address_v4::loopback(), 0});
+    ::tcp::socket socket(reactor), peer(reactor);
     socket.connect(acceptor.local_endpoint());
     acceptor.accept(peer);
-    acpp::buf::Buffer* payload = nullptr;
+    ::buf::Buffer* payload = nullptr;
     bool delivered = false;
     bool consumed = false;
     {
         ScopedAllocationDomain lease(domain);
-        payload = acpp::buf::Buffer::New();
+        payload = ::buf::Buffer::New();
         Require(payload != nullptr, "payload allocation failed");
         const auto outstanding = domain.OutstandingAllocations();
-        socket.async_wait(acpp::tcp::socket::wait_read,
+        socket.async_wait(::tcp::socket::wait_read,
             net::bind_allocator(ProcessAllocator<std::byte>{},
-                [&](acpp::IoErrorCode ec) {
+                [&](::IoErrorCode ec) {
                     // Reactor completion transports metadata only. No payload
                     // access or private-object destruction occurs on this thread.
                     delivered = !ec;
@@ -184,7 +184,7 @@ void TestQueuedReadinessAcrossMigration() {
                         const auto count = socket.read_some(net::buffer(payload->Tail().data(), 1));
                         payload->Produce(static_cast<uint32_t>(count));
                         consumed = payload->Bytes()[0] == 'q';
-                        acpp::buf::Buffer::Free(payload);
+                        ::buf::Buffer::Free(payload);
                         payload = nullptr;
                     }));
                 }));
@@ -202,14 +202,14 @@ void TestQueuedReadinessAcrossMigration() {
 }
 
 void TestPendingOperationDestruction() {
-    using namespace acpp::memory;
+    using namespace ::memory;
     AllocationDomain domain;
     auto reactor = std::make_unique<net::io_context>();
     auto timer = std::make_unique<net::steady_timer>(*reactor, 1h);
     {
         ScopedAllocationDomain lease(domain);
         timer->async_wait(net::bind_allocator(ProcessAllocator<std::byte>{},
-            [](acpp::IoErrorCode) {}));
+            [](::IoErrorCode) {}));
         Require(domain.OutstandingAllocations() == 0,
                 "pending operation storage must belong to process allocator");
     }
@@ -221,7 +221,7 @@ void TestPendingOperationDestruction() {
 } // namespace
 
 TEST(AsioOperationAllocator, Contract) {
-    acpp::memory::ThreadMemoryResource pool;
+    ::memory::ThreadMemoryResource pool;
     CountingResource resource(&pool);
     auto original = std::pmr::set_default_resource(&resource);
     bool passed = true;

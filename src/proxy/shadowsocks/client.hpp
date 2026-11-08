@@ -1,16 +1,16 @@
 #pragma once
 
-#include "acppnode/common/target_address.hpp"
+#include "common/target_address.hpp"
 #include "shadowsocks_protocol.hpp"
-#include "acppnode/transport/async_stream.hpp"
-#include "acppnode/transport/link.hpp"
+#include "transport/async_stream.hpp"
+#include "transport/link.hpp"
 
 #include <tl/expected.hpp>
 #include <memory>
 #include <span>
 #include <vector>
 
-namespace acpp::ss {
+namespace ss {
 
 struct WriteTCPRequestResult {
     std::unique_ptr<transport::MultiBufferWriter> request_writer;
@@ -32,4 +32,4 @@ ReadTCPResponse(const SsCipherInfo& cipher_info,
                 const KeyBytes& request_salt,
                 AsyncStream& stream);
 
-}  // namespace acpp::ss
+}  // namespace ss

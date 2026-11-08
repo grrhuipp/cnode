@@ -1,13 +1,13 @@
 #pragma once
 
-#include "acppnode/common/buf/multi_buffer.hpp"
+#include "common/buf/multi_buffer.hpp"
 
 #include <atomic>
 #include <cstddef>
 #include <limits>
 #include <utility>
 
-namespace acpp::worker_detail {
+namespace worker_detail {
 
 // Limits are Worker-scoped. Reservation release is atomic so a frozen native
 // association can transfer its leases without borrowing the old Worker thread.
@@ -127,4 +127,4 @@ private:
     std::atomic<size_t> payload_capacity_{0};
 };
 
-} // namespace acpp::worker_detail
+} // namespace worker_detail

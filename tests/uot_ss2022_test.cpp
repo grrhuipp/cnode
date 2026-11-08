@@ -4,7 +4,7 @@
 #include "uot.hpp"
 
 #include "shadowsocks_protocol.hpp"
-#include "acppnode/common/address_codec.hpp"
+#include "common/address_codec.hpp"
 
 #include <asio/co_spawn.hpp>
 #include <asio/steady_timer.hpp>
@@ -17,6 +17,8 @@
 #include <cstring>
 #include <future>
 #include <iostream>
+#include <memory_resource>
+#include <new>
 #include <span>
 #include <string>
 #include <string_view>
@@ -25,7 +27,6 @@
 
 namespace {
 
-using namespace acpp;
 
 [[noreturn]] void Fail(std::string_view message) {
     std::cerr << message << '\n';
@@ -57,11 +58,7 @@ buf::MultiBuffer MakePacket(std::string_view payload, const TargetAddress& targe
         std::span<const uint8_t>(
             reinterpret_cast<const uint8_t*>(payload.data()), payload.size()),
         packet), "packet allocation failed");
-    for (buf::Buffer* buffer : packet) {
-        if (buffer) {
-            buffer->SetUDP(target);
-        }
-    }
+    Check(buf::SetUdpTarget(packet, target), "packet target allocation failed");
     return packet;
 }
 
@@ -308,6 +305,73 @@ TEST(UotSs2022, LargeConnectPacketRoundTrip) {
     });
 }
 
+TEST(UotSs2022, EmptyDatagramsPreserveSequenceAndTargets) {
+    const TargetAddress first("1.1.1.1", 53);
+    const TargetAddress second("8.8.8.8", 5353);
+    for (const bool connect : {false, true}) {
+        CaptureWriter capture;
+        proxy::uot::PacketWriter writer(capture, connect, first);
+        const auto& last = connect ? first : second;
+        ::Run([&]() -> net::awaitable<void> {
+            co_await writer.WriteMultiBuffer({});
+            Check(capture.bytes.empty(), "no UDP message wrote an empty frame");
+            co_await writer.WriteMultiBuffer(MakePacket("", first));
+            co_await writer.WriteMultiBuffer(MakePacket("data", first));
+            if (connect) {
+                co_await writer.WriteBuffers(std::span<const net::const_buffer>{});
+            } else {
+                co_await writer.WriteMultiBuffer(MakePacket("", last));
+            }
+        });
+        Check(capture.bytes.size() == (connect ? 10 : 31),
+              "UoT empty datagrams did not write complete protocol headers");
+        FragmentReader source(capture.bytes, {1, 1, 1, 1, 1, 1, 1, 1});
+        proxy::uot::PacketReader reader(source, connect, first);
+        ::Run([&]() -> net::awaitable<void> {
+            const std::array<size_t, 3> sizes{0, 4, 0};
+            for (size_t index = 0; index < sizes.size(); ++index) {
+                const size_t size = sizes[index];
+                auto packet = co_await reader.ReadMultiBuffer();
+                const auto datagram = buf::InspectUdpDatagram(packet);
+                Check(datagram.Valid() && datagram.payload_size == size &&
+                          datagram.target->SameEndpoint(index == 2 ? last : first),
+                      "UoT empty/data sequence became EOF or lost a target");
+                if (size != 0) Check(Flatten(packet) == std::vector<uint8_t>({'d','a','t','a'}),
+                                     "UoT UDP data changed");
+            }
+            Check((co_await reader.ReadMultiBuffer()).empty(),
+                  "UoT TCP EOF became an empty datagram");
+        });
+    }
+}
+
+TEST(UotSs2022, V1FirstEmptyDatagramSurvivesPreparation) {
+    const TargetAddress target("dns.example", 53);
+    CaptureWriter capture;
+    proxy::uot::PacketWriter writer(capture, false, target);
+    ::Run([&]() -> net::awaitable<void> {
+        co_await writer.WriteMultiBuffer(MakePacket("", target));
+        co_await writer.WriteMultiBuffer(MakePacket("next", target));
+    });
+    FragmentReader source(capture.bytes, {1, 2, 3, 1});
+    ::Run([&]() -> net::awaitable<void> {
+        auto prepared = co_await proxy::uot::ReadUotRequestHeader(
+            proxy::uot::Version::V1, source);
+        Check(prepared.has_value() && prepared->destination.SameEndpoint(target),
+              "UoT v1 first empty UDP message was mistaken for EOF");
+        proxy::uot::PacketReader reader(source, std::move(*prepared));
+        auto empty = co_await reader.ReadMultiBuffer();
+        const auto datagram = buf::InspectUdpDatagram(empty);
+        Check(datagram.Valid() && datagram.payload_size == 0 &&
+                  datagram.target->SameEndpoint(target),
+              "UoT prepared first empty datagram was lost");
+        Check(Flatten(co_await reader.ReadMultiBuffer()) ==
+                  std::vector<uint8_t>({'n','e','x','t'}),
+              "UoT first empty datagram damaged the following payload");
+        Check((co_await reader.ReadMultiBuffer()).empty(), "UoT v1 EOF changed");
+    });
+}
+
 TEST(UotSs2022, FramedEndpointWriteAndRead) {
     const TargetAddress target("1.1.1.1", 53);
     FramedEndpointDouble underlying;
@@ -505,13 +569,9 @@ TEST(UotSs2022, SharedAddressCodec) {
         const size_t type_pos = format == AddressWireFormat::PortFirst ? 2 : 0;
         domain[type_pos] = format == AddressWireFormat::Socks5 ? 3 : 2;
         domain[type_pos + 1] = 0;
-        Check(DecodeAddress(domain, format, {253, true}).status ==
+        Check(DecodeAddress(domain, format, {.require_non_empty_domain = true}).status ==
                   AddressDecodeStatus::Invalid,
               "shared address accepted a forbidden empty domain");
-        domain[type_pos + 1] = 254;
-        Check(DecodeAddress(domain, format, {253, true}).status ==
-                  AddressDecodeStatus::Invalid,
-              "shared address accepted an excessive domain length");
         domain[type_pos + 1] = 255;
         Check(DecodeAddress(std::span<const uint8_t>(domain.data(), domain.size() - 1),
                             format).status == AddressDecodeStatus::Incomplete &&
@@ -561,7 +621,7 @@ TEST(UotSs2022, SharedAddressCodec) {
                 }
                 const auto disallowed = DecodeAddress(
                     std::span<const uint8_t>(encoded.data(), size),
-                    format, {255, false, false});
+                    format, {.allow_metadata = false});
                 Check(disallowed.status == AddressDecodeStatus::Invalid &&
                       !disallowed.target.IsValid() &&
                       disallowed.target.host.empty() &&
@@ -614,6 +674,79 @@ TEST(UotSs2022, PacketEofBoundaries) {
             Check(failed == (length != 0 && length != capture.bytes.size()),
                   "UoT confused truncated framing with normal EOF");
         }
+    }
+}
+
+TEST(UotSs2022, NonConnectIpPacketDoesNotDependOnUnusedRequestDomainStorage) {
+    class AllocationGate final : public std::pmr::memory_resource {
+    public:
+        explicit AllocationGate(std::pmr::memory_resource* upstream) : upstream_(upstream) {}
+        bool reject = false;
+        size_t live_bytes = 0;
+    private:
+        void* do_allocate(size_t bytes, size_t alignment) override {
+            if (reject) throw std::bad_alloc();
+            auto* result = upstream_->allocate(bytes, alignment);
+            live_bytes += bytes;
+            return result;
+        }
+        void do_deallocate(void* pointer, size_t bytes, size_t alignment) override {
+            live_bytes -= bytes;
+            upstream_->deallocate(pointer, bytes, alignment);
+        }
+        bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
+            return this == &other;
+        }
+        std::pmr::memory_resource* upstream_;
+    };
+    struct ResourceScope {
+        std::pmr::memory_resource* previous;
+        explicit ResourceScope(std::pmr::memory_resource* resource)
+            : previous(std::pmr::set_default_resource(resource)) {}
+        ~ResourceScope() { std::pmr::set_default_resource(previous); }
+    };
+    struct RejectAllocations {
+        AllocationGate& resource;
+        explicit RejectAllocations(AllocationGate& value) : resource(value) { resource.reject = true; }
+        ~RejectAllocations() { resource.reject = false; }
+    };
+    memory::ConfigureProcessAllocator();
+    AllocationGate resource(std::pmr::get_default_resource());
+    ResourceScope scope(&resource);
+    const std::string domain = std::string(63, 'a') + "." +
+        std::string(63, 'b') + "." + std::string(61, 'c');
+    const std::array<uint8_t, 12> wire{0, 192, 0, 2, 7, 0x14, 0xe9, 0, 3, 'u', 'd', 'p'};
+    for (const bool prepared_constructor : {false, true}) {
+        SCOPED_TRACE(prepared_constructor);
+        {
+            buf::MultiBuffer pending;
+            ASSERT_TRUE(buf::AppendSpanToMultiBuffer(wire, pending));
+            FragmentReader source({}, {});
+            std::optional<proxy::uot::PacketReader> reader;
+            TargetAddress unused(domain, 53);
+            if (prepared_constructor) {
+                proxy::uot::PreparedRequest prepared;
+                prepared.destination = std::move(unused);
+                prepared.pending = std::move(pending);
+                reader.emplace(source, std::move(prepared));
+            } else {
+                reader.emplace(source, false, std::move(unused), std::move(pending));
+            }
+            EXPECT_EQ(resource.live_bytes, 0) << "non-connect request target must not remain resident";
+            ASSERT_NO_THROW(::Run([&]() -> net::awaitable<void> {
+                buf::MultiBuffer packet;
+                {
+                    RejectAllocations pressure(resource);
+                    packet = co_await reader->ReadMultiBuffer();
+                }
+                const auto datagram = buf::InspectUdpDatagram(packet);
+                Check(datagram.Valid() &&
+                      datagram.target->SameEndpoint(TargetAddress("192.0.2.7", 5353)) &&
+                      Flatten(packet) == std::vector<uint8_t>({'u', 'd', 'p'}),
+                      "complete non-connect IP packet must survive unrelated allocation pressure");
+            }));
+        }
+        EXPECT_EQ(resource.live_bytes, 0);
     }
 }
 

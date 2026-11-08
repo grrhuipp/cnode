@@ -1,10 +1,11 @@
 #pragma once
 
-#include "acppnode/common/buf/multi_buffer.hpp"
-#include "acppnode/common/error.hpp"
-#include "acppnode/common/target_address.hpp"
+#include "common/buf/multi_buffer.hpp"
+#include "common/error.hpp"
+#include "common/target_address.hpp"
+#include "transport/link.hpp"
 
-namespace acpp::vmess {
+namespace vmess {
 
 inline void ValidateFixedUdpDatagram(const buf::MultiBuffer& payload,
                                      const TargetAddress& fixed_target) {
@@ -23,6 +24,10 @@ inline void ValidateFixedUdpDatagram(const buf::MultiBuffer& payload,
             io_error::invalid_argument,
             "VMess UDP datagram target differs from the fixed session target");
     }
+    // VMess reserves an empty authenticated body for end-of-stream.
+    if (datagram.payload_size == 0) {
+        throw transport::LinkError(ErrorCode::NOT_SUPPORTED);
+    }
 }
 
-}  // namespace acpp::vmess
+}  // namespace vmess

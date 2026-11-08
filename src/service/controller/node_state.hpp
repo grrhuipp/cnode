@@ -1,9 +1,9 @@
 #pragma once
 
-#include "acppnode/api/api.hpp"
-#include "acppnode/app/prepared_inbound.hpp"
-#include "acppnode/app/runtime_publication.hpp"
-#include "acppnode/app/proxyman/outbound/prepared_config.hpp"
+#include "api/api.hpp"
+#include "app/prepared_inbound.hpp"
+#include "app/runtime_publication.hpp"
+#include "app/proxyman/outbound/prepared_config.hpp"
 
 #include <array>
 #include <cstdint>
@@ -12,7 +12,7 @@
 #include <string>
 #include <vector>
 
-namespace acpp::controller {
+namespace controller {
 
 // Constructed before runtime mutations and immutable after publication.
 struct NodeSnapshot {
@@ -62,4 +62,4 @@ struct PreparedNodeChange {
     bool replace_rules = true;
 };
 
-}  // namespace acpp::controller
+}  // namespace controller

@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "acppnode/app/session_group_executor.hpp"
+#include "app/session_group_executor.hpp"
 
 #include <asio/co_spawn.hpp>
 #include <asio/bind_cancellation_slot.hpp>
@@ -18,7 +18,6 @@
 #include <vector>
 
 namespace {
-using namespace acpp;
 void Require(bool condition, const char* message) {
     if (!condition) {
         std::cerr << message << '\n';

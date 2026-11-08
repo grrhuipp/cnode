@@ -1,6 +1,6 @@
 #pragma once
 
-#include "acppnode/common/target_address.hpp"
+#include "common/target_address.hpp"
 
 #include <array>
 #include <cstddef>
@@ -12,7 +12,7 @@
 
 #include <tl/expected.hpp>
 
-namespace acpp::transport::internet::hysteria {
+namespace transport::internet::hysteria {
 
 enum class Version : uint8_t {
     V1,
@@ -83,9 +83,13 @@ EncodeV2TcpResponse(bool accepted, std::string_view message,
 [[nodiscard]] tl::expected<UdpMessage, ProtocolError>
 ParseUdpMessage(Version version, std::span<const uint8_t> input);
 
+// V2 的空目标按无地址续片计长；是否必须带目标仍由报文语义校验决定。
+[[nodiscard]] tl::expected<size_t, ProtocolError>
+UdpMessageHeaderSize(Version version, const TargetAddress& target);
+
 [[nodiscard]] tl::expected<std::vector<uint8_t>, ProtocolError>
 EncodeUdpMessage(Version version, const UdpMessage& message);
 
 [[nodiscard]] std::array<uint8_t, 32> HashCredential(std::string_view credential) noexcept;
 
-}  // namespace acpp::transport::internet::hysteria
+}  // namespace transport::internet::hysteria

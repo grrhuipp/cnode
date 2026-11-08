@@ -1,12 +1,12 @@
 #pragma once
 
-#include "acppnode/transport/internet/reality_key.hpp"
+#include "transport/internet/reality_key.hpp"
 
 #include <cstdint>
 #include <tl/expected.hpp>
 #include <span>
 
-namespace acpp::transport::internet {
+namespace transport::internet {
 
 enum class RealityKeyShareError {
     InvalidFormat,
@@ -16,4 +16,4 @@ enum class RealityKeyShareError {
 ParseRealityClientKeyShareExtension(
     std::span<const uint8_t> extension) noexcept;
 
-}  // namespace acpp::transport::internet
+}  // namespace transport::internet

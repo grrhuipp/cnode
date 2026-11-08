@@ -10,12 +10,12 @@
 
 
 TEST(ProcessResources, Contract) {
-    const auto before = acpp::ReadProcessDescriptors();
+    const auto before = ::ReadProcessDescriptors();
     const int resource = ::open("/dev/null", O_RDONLY);
     ASSERT_FALSE((resource < 0));
-    const auto during = acpp::ReadProcessDescriptors();
+    const auto during = ::ReadProcessDescriptors();
     ::close(resource);
-    const auto after = acpp::ReadProcessDescriptors();
+    const auto after = ::ReadProcessDescriptors();
     ASSERT_FALSE((!before.open || !during.open || !after.open ||
         *during.open != *before.open + 1 || *after.open != *before.open));
     rlimit limits{};

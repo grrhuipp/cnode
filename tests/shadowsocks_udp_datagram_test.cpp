@@ -3,7 +3,7 @@
 
 #include "ss_udp.hpp"
 #include "shadowsocks_crypto.hpp"
-#include "acppnode/common/buf/contiguous_buffer_view.hpp"
+#include "common/buf/contiguous_buffer_view.hpp"
 
 #include <algorithm>
 #include <array>
@@ -15,7 +15,6 @@
 
 namespace {
 
-using namespace acpp;
 
 [[noreturn]] void Fail(std::string_view message) {
     std::cerr << message << '\n';
@@ -46,11 +45,8 @@ buf::MultiBuffer MakePayload(const std::vector<uint8_t>& source,
     buf::MultiBuffer payload;
     Check(buf::AppendSpanToMultiBuffer(source, payload),
           "failed to allocate Shadowsocks UDP test payload");
-    for (buf::Buffer* buffer : payload) {
-        if (buffer && !buffer->IsEmpty()) {
-            buffer->SetUDP(target);
-        }
-    }
+    Check(buf::SetUdpTarget(payload, target),
+          "failed to mark Shadowsocks UDP test datagram");
     return payload;
 }
 
@@ -62,8 +58,6 @@ void CheckClassic(const TargetAddress& target,
     const size_t encoded_size = ss::EncodeUdpPacketTo(
         target, payload.data(), payload.size(), key.span(),
         cipher.type, cipher.key_size, cipher.salt_size, nullptr, 0);
-    Check(encoded_size > source.size(),
-          "classic Shadowsocks UDP size calculation failed");
     std::vector<uint8_t> encoded(encoded_size);
     Check(ss::EncodeUdpPacketTo(
               target, payload.data(), payload.size(), key.span(),
@@ -79,6 +73,10 @@ void CheckClassic(const TargetAddress& target,
           "classic Shadowsocks split one MultiBuffer datagram");
     Check(!decoded->session_id, "classic UDP unexpectedly supplied a protocol session ID");
     Check(!decoded->packet_id, "classic UDP unexpectedly supplied an authenticated packet ID");
+    const auto reply_datagram = buf::InspectUdpDatagram(decoded->payload);
+    Check(reply_datagram.Valid() && reply_datagram.target->SameEndpoint(target) &&
+          reply_datagram.payload_size == source.size(),
+          "classic Shadowsocks reply lost its UDP message boundary");
 
     auto user_list = std::make_shared<
         proxyman::inbound::UserStore::ShadowsocksUserList>();
@@ -94,8 +92,17 @@ void CheckClassic(const TargetAddress& target,
               inbound->target.SameEndpoint(target) && Flatten(inbound->payload) == source &&
               replay_cache.Size() == 0,
               "deferred replay changed classic UDP decoding");
+        const auto request_datagram = buf::InspectUdpDatagram(inbound->payload);
+        Check(request_datagram.Valid() && request_datagram.target->SameEndpoint(target) &&
+              request_datagram.payload_size == source.size(),
+              "classic authenticated request lost its UDP message boundary");
     }
 
+    Check(!ss::DecodeUdpPacket(nullptr, 0, {user_list}, cipher.type,
+                              cipher.key_size, cipher.salt_size, replay_cache) &&
+          !ss::DecodeUdpPacketWithKey(nullptr, 0, key.span(), cipher.type,
+                                     cipher.key_size, cipher.salt_size),
+          "raw empty Shadowsocks wire bypassed authentication");
     // Cross-check the one-shot AEAD API against the existing streaming EVP
     // implementation, rather than only round-tripping through the new path.
     std::array<uint8_t, 32> subkey{};
@@ -153,8 +160,6 @@ void Check2022(const TargetAddress& target,
     encoder.client_session_id = {0x00, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde};
     const size_t encoded_size = ss::Encode2022UdpRequestPacketTo(
         target, payload.data(), payload.size(), encoder, psk_chain, nullptr, 0);
-    Check(encoded_size > source.size(),
-          "Shadowsocks 2022 UDP size calculation failed");
     Check(encoder.next_packet_id == 0,
           "Shadowsocks 2022 size calculation advanced packet state");
     std::vector<uint8_t> encoded(encoded_size);
@@ -216,6 +221,10 @@ void Check2022(const TargetAddress& target,
               cipher.type, cipher.key_size, cipher.salt_size, validation_cache, true) &&
           validation_cache.Size() == 0,
           "deferred invalid authentication accepted ciphertext or mutated replay");
+    Check(!ss::DecodeUdpPacket(nullptr, 0, users, cipher.type, cipher.key_size,
+                              cipher.salt_size, validation_cache) &&
+          validation_cache.Size() == 0,
+          "raw empty SS2022 wire bypassed authentication or created replay state");
     Check(ss::DecodeUdpPacket(
               encoded.data(), encoded.size(), users,
               cipher.type, cipher.key_size, cipher.salt_size,
@@ -242,6 +251,10 @@ void Check2022(const TargetAddress& target,
     Check(decoded && decoded->target.SameEndpoint(target) &&
           Flatten(decoded->payload) == source,
           "Shadowsocks 2022 split one MultiBuffer datagram");
+    const auto request_datagram = buf::InspectUdpDatagram(decoded->payload);
+    Check(request_datagram.Valid() && request_datagram.target->SameEndpoint(target) &&
+          request_datagram.payload_size == source.size(),
+          "SS2022 authenticated request lost its UDP message boundary");
     Check(decoded->session_id == 0x00123456789abcdeULL,
           "Shadowsocks 2022 session ID lost byte order or leading zeros");
     Check(decoded->packet_id == 0 && decoded->session_owner.size == key.size &&
@@ -369,6 +382,10 @@ void Check2022(const TargetAddress& target,
           response_decoded->target.SameEndpoint(target) &&
           Flatten(response_decoded->payload) == source,
           "Shadowsocks 2022 UDP response decoding failed");
+    const auto reply_datagram = buf::InspectUdpDatagram(response_decoded->payload);
+    Check(reply_datagram.Valid() && reply_datagram.target->SameEndpoint(target) &&
+          reply_datagram.payload_size == source.size(),
+          "SS2022 authenticated response lost its UDP message boundary");
     Check(!ss::Decode2022UdpResponsePacket(
               response.data(), response.size(), response_decoder),
           "Shadowsocks 2022 accepted a replayed response packet");
@@ -469,4 +486,44 @@ TEST(ShadowsocksUdpDatagram, Contract) {
     Check2022(target, source, payload.Bytes(), ss::SsCipherType::AES_256_GCM_2022, 32, true);
     Check2022ReplayWindow();
     Check2022AssociationPaths();
+}
+
+TEST(ShadowsocksUdpDatagram, AuthenticatedEmptyDatagrams) {
+    const TargetAddress target("1.1.1.1", 53);
+    const std::vector<uint8_t> source;
+    const auto packet = MakePayload(source, target);
+    const buf::ContiguousBufferView payload(packet);
+    for (std::string_view method : {"aes-128-gcm", "aes-256-gcm", "chacha20-poly1305"}) {
+        const auto cipher = ss::ParseCipherMethod(method);
+        Check(cipher.has_value(), "test cipher unavailable");
+        CheckClassic(target, source, payload.Bytes(), *cipher);
+    }
+    Check2022(target, source, payload.Bytes(), ss::SsCipherType::AES_128_GCM_2022, 16);
+    Check2022(target, source, payload.Bytes(), ss::SsCipherType::AES_256_GCM_2022, 32);
+    Check2022(target, source, payload.Bytes(), ss::SsCipherType::CHACHA20_POLY1305_2022, 32);
+    Check2022(target, source, payload.Bytes(), ss::SsCipherType::AES_128_GCM_2022, 16, true);
+    Check2022(target, source, payload.Bytes(), ss::SsCipherType::AES_256_GCM_2022, 32, true);
+}
+
+TEST(ShadowsocksUdpDatagram, AuthenticatedShortDomainDatagrams) {
+    for (std::string_view host : {"a", "ab"}) {
+        SCOPED_TRACE(host);
+        const TargetAddress target(host, 54321);
+        for (size_t length : {size_t{0}, size_t{1}}) {
+            SCOPED_TRACE(length);
+            const std::vector<uint8_t> source(length, 0x7b);
+            const auto packet = MakePayload(source, target);
+            const buf::ContiguousBufferView payload(packet);
+            for (std::string_view method : {"aes-128-gcm", "aes-256-gcm", "chacha20-poly1305"}) {
+                const auto cipher = ss::ParseCipherMethod(method);
+                Check(cipher.has_value(), "test cipher unavailable");
+                CheckClassic(target, source, payload.Bytes(), *cipher);
+            }
+            Check2022(target, source, payload.Bytes(), ss::SsCipherType::AES_128_GCM_2022, 16);
+            Check2022(target, source, payload.Bytes(), ss::SsCipherType::AES_256_GCM_2022, 32);
+            Check2022(target, source, payload.Bytes(), ss::SsCipherType::CHACHA20_POLY1305_2022, 32);
+            Check2022(target, source, payload.Bytes(), ss::SsCipherType::AES_128_GCM_2022, 16, true);
+            Check2022(target, source, payload.Bytes(), ss::SsCipherType::AES_256_GCM_2022, 32, true);
+        }
+    }
 }

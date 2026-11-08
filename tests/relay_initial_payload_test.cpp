@@ -1,9 +1,9 @@
 #include <gtest/gtest.h>
 
-#include "acppnode/app/relay.hpp"
-#include "acppnode/common/initial_payload.hpp"
-#include "acppnode/transport/internet/tcp_stream.hpp"
-#include "acppnode/transport/internet/timeout_scheduler.hpp"
+#include "app/relay.hpp"
+#include "common/initial_payload.hpp"
+#include "transport/internet/tcp_stream.hpp"
+#include "transport/internet/timeout_scheduler.hpp"
 
 #include <asio/co_spawn.hpp>
 #include <asio/bind_cancellation_slot.hpp>
@@ -19,7 +19,6 @@
 #include <vector>
 
 namespace {
-using namespace acpp;
 using namespace std::chrono_literals;
 
 template<class F>
@@ -407,12 +406,14 @@ net::awaitable<bool> TestDatagramBatch(net::io_context& io, bool controlled, int
     client.io = target.io = &io;
     auto packet = [](size_t size, uint8_t byte, uint16_t port) {
         auto result = Payload(size, byte);
-        for (auto* fragment : result) fragment->SetUDP(TargetAddress("127.0.0.1", port));
+        if (!buf::SetUdpTarget(result, TargetAddress("127.0.0.1", port))) throw std::bad_alloc();
         return result;
     };
     buf::MultiBufferBatch batch;
     batch.Push(packet(3, 0x11, 1001));
+    batch.Push(packet(0, 0, 1005));
     batch.Push(packet(buf::Buffer::kSize + 7, 0x22, 1002));
+    batch.Push(packet(0, 0, 1006));
     batch.Push(packet(5, 0x33, 1003));
     const size_t queued_bytes = 3 + buf::Buffer::kSize + 7 + 5;
     const bool queued_ok = batch.byte_size() == queued_bytes;
@@ -433,9 +434,9 @@ net::awaitable<bool> TestDatagramBatch(net::io_context& io, bool controlled, int
     std::vector<uint16_t> ports{1001};
     std::vector<uint8_t> bytes(3, 0x11);
     if (mode < 2) {
-        sizes.insert(sizes.end(), {buf::Buffer::kSize + 7, 5});
-        fragments.insert(fragments.end(), {2, 1});
-        ports.insert(ports.end(), {1002, 1003});
+        sizes.insert(sizes.end(), {0, buf::Buffer::kSize + 7, 0, 5});
+        fragments.insert(fragments.end(), {1, 2, 1, 1});
+        ports.insert(ports.end(), {1005, 1002, 1006, 1003});
         bytes.insert(bytes.end(), buf::Buffer::kSize + 7, 0x22);
         bytes.insert(bytes.end(), 5, 0x33);
         if (mode == 0) {

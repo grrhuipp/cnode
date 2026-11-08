@@ -28,6 +28,33 @@ inline Json Inbound(uint16_t port, std::string_view protocol = "vless", std::str
             {"settings", {{"clients", Json::array({{{"id", user}, {"email", "handshake@example.test"}}})}}}};
 }
 inline Json Direct() { return {{"protocol", "freedom"}, {"settings", Json::object()}}; }
+struct RuntimePortReservation {
+    std::string address;
+    Socket tcp_guard;
+    Socket udp_guard;
+    Socket tcp;
+    Socket udp;
+};
+
+inline RuntimePortReservation ReserveRuntimePort() {
+    // 默认地址守卫阻止通配绑定及默认地址抢占；独占端口同时确定隔离的回环别名。
+    for (unsigned attempt = 0; attempt < 32; ++attempt) {
+        auto tcp_guard = Socket::Listen();
+        const auto port = tcp_guard.Port();
+        auto address = "127.1." + std::to_string(port >> 8) + "." +
+            std::to_string(port & 0xff);
+        try {
+            auto udp_guard = Socket::BindUdp(port);
+            auto tcp = Socket::Listen(port, address);
+            auto udp = Socket::BindUdp(port, address);
+            return {std::move(address), std::move(tcp_guard), std::move(udp_guard),
+                std::move(tcp), std::move(udp)};
+        } catch (const std::system_error& error) {
+            if (error.code() != std::errc::address_in_use) throw;
+        }
+    }
+    throw std::runtime_error("no available TCP/UDP runtime fixture port");
+}
 inline Json MixedKeys(const Json& value) {
     if (value.is_array()) {
         Json result = Json::array();
@@ -48,16 +75,17 @@ inline Json MixedKeys(const Json& value) {
 inline std::unique_ptr<Child> Start(const std::filesystem::path& root, std::string_view log = "child.log") {
     return std::make_unique<Child>(std::vector<std::string>{Binary().string(), "--config-dir", root.string()}, root / log, root);
 }
-inline bool Listening(uint16_t port) {
-    try { auto socket = Socket::Connect(port, "127.0.0.1", 200ms); return true; }
+inline bool Listening(uint16_t port, std::string_view address = "127.0.0.1") {
+    try { auto socket = Socket::Connect(port, address, 200ms); return true; }
     catch (const std::system_error& error) {
         if (error.code() == std::errc::connection_refused) return false;
         throw;
     }
 }
 inline bool Echo(uint16_t port, uint16_t target, std::string_view user = UserA,
-                 std::string_view host = "127.0.0.1") {
-    auto socket = Socket::Connect(port, "127.0.0.1", 500ms);
+                 std::string_view host = "127.0.0.1",
+                 std::string_view inbound_address = "127.0.0.1") {
+    auto socket = Socket::Connect(port, inbound_address, 500ms);
     socket.Write(VlessRequest(target, Payload, 1, host, user), 1s);
     const auto expected = std::string("\0\0", 2) + std::string(Payload);
     std::string received(expected.size(), '\0');

@@ -1,12 +1,12 @@
 #pragma once
 
-#include "acppnode/api/api.hpp"
-#include "acppnode/common/online_device.hpp"
+#include "api/api.hpp"
+#include "common/online_device.hpp"
 
 #include <cstddef>
 #include <vector>
 
-namespace acpp::controller {
+namespace controller {
 
 struct OnlineSnapshot {
     std::vector<api::OnlineUser> entries;
@@ -16,4 +16,4 @@ struct OnlineSnapshot {
 [[nodiscard]] OnlineSnapshot
 BuildOnlineSnapshot(std::vector<OnlineDevice> devices);
 
-}  // namespace acpp::controller
+}  // namespace controller

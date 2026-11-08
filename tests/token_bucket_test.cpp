@@ -1,4 +1,4 @@
-#include "acppnode/app/token_bucket.hpp"
+#include "app/token_bucket.hpp"
 
 #include <gtest/gtest.h>
 
@@ -14,7 +14,7 @@
 using namespace std::chrono_literals;
 
 namespace {
-using Clock = acpp::TokenBucket::Clock;
+using Clock = ::TokenBucket::Clock;
 Clock::time_point At(int64_t millis) {
     return Clock::time_point{std::chrono::milliseconds{millis}};
 }
@@ -58,7 +58,7 @@ private:
 };
 
 TEST(TokenBucket, RealClockWaitDoesNotDoubleRefillReservations) {
-    acpp::TokenBucket bucket(1000);
+    ::TokenBucket bucket(1000);
     const auto first = bucket.Consume(2000);
     std::this_thread::sleep_for(first);
     const auto second = bucket.Consume(1000);
@@ -67,30 +67,30 @@ TEST(TokenBucket, RealClockWaitDoesNotDoubleRefillReservations) {
 }
 
 TEST(TokenBucket, MaximumConsumptionSaturatesWait) {
-    acpp::TokenBucket slow(1, At(0));
+    ::TokenBucket slow(1, At(0));
     EXPECT_EQ(slow.Consume(std::numeric_limits<size_t>::max(), At(0)), std::chrono::milliseconds::max());
 }
 
 TEST(TokenBucket, ContinuousAndOverlappingReservations) {
-    acpp::TokenBucket continuous(1000, At(0));
+    ::TokenBucket continuous(1000, At(0));
     EXPECT_EQ(continuous.Consume(2000, At(0)), 1000ms);
     EXPECT_EQ(continuous.Consume(1000, At(1000)), 1000ms);
     EXPECT_EQ(continuous.Consume(1000, At(2000)), 1000ms);
-    acpp::TokenBucket reserved(1000, At(0));
+    ::TokenBucket reserved(1000, At(0));
     EXPECT_EQ(reserved.Consume(2000, At(0)), 1000ms);
     EXPECT_EQ(reserved.Consume(1000, At(0)), 2000ms);
     EXPECT_EQ(reserved.Consume(1000, At(2000)), 1000ms);
 }
 
 TEST(TokenBucket, IdleCreditIsLimitedToTwoSeconds) {
-    acpp::TokenBucket idle(1000, At(0));
+    ::TokenBucket idle(1000, At(0));
     EXPECT_EQ(idle.Consume(1000, At(0)), 0ms);
     EXPECT_EQ(idle.Consume(2000, At(10000)), 0ms);
     EXPECT_EQ(idle.Consume(1000, At(10000)), 1000ms);
 }
 
 TEST(TokenBucket, FractionalCreditSurvivesReservations) {
-    acpp::TokenBucket fractional(3, At(0));
+    ::TokenBucket fractional(3, At(0));
     EXPECT_EQ(fractional.Consume(3, At(0)), 0ms);
     EXPECT_EQ(fractional.Consume(1, At(333)), 1ms);
     EXPECT_EQ(fractional.Consume(1, At(334)), 333ms);
@@ -99,12 +99,12 @@ TEST(TokenBucket, FractionalCreditSurvivesReservations) {
 
 TEST(TokenBucket, UnlimitedExtremeRateAndCapacitySaturation) {
     constexpr auto maximum = std::numeric_limits<size_t>::max();
-    acpp::TokenBucket unlimited(0, At(0));
+    ::TokenBucket unlimited(0, At(0));
     EXPECT_EQ(unlimited.Consume(maximum, At(0)), 0ms);
-    acpp::TokenBucket extreme(std::numeric_limits<uint64_t>::max(), At(0));
+    ::TokenBucket extreme(std::numeric_limits<uint64_t>::max(), At(0));
     EXPECT_EQ(extreme.Consume(maximum, At(0)), 0ms);
     EXPECT_EQ(extreme.Consume(maximum, At(1)), 999ms);
-    acpp::TokenBucket saturated(uint64_t{1} << 63, At(0));
+    ::TokenBucket saturated(uint64_t{1} << 63, At(0));
     EXPECT_EQ(saturated.Consume(uint64_t{1} << 63, At(0)), 0ms);
     EXPECT_EQ(saturated.Consume(maximum, At(2000)), 0ms);
     EXPECT_EQ(saturated.Consume(1, At(2000)), 1ms);
@@ -120,7 +120,7 @@ TEST(TokenBucket, ExactIntegerOracleAcrossRatesSizesAndTimeJumps) {
     constexpr std::array<int64_t, 4> starts{-1000, 0, 100000, 1'000'000'000'000};
     for (const auto rate : rates) {
         int64_t now = starts[rng() % starts.size()];
-        std::optional<acpp::TokenBucket> bucket(std::in_place, rate, At(now));
+        std::optional<::TokenBucket> bucket(std::in_place, rate, At(now));
         ExactModel model(rate, now);
         for (unsigned index = 0; index < 600; ++index) {
             const std::array<uint64_t, 7> sizes{0, 1, 8192, maximum, std::max(uint64_t{1}, rate / 1000),
@@ -149,7 +149,7 @@ TEST(TokenBucket, ExactOracleAtRepresentableClockBoundariesAndBackwardsTime) {
     const std::array<uint64_t, 7> sizes{0, 1, 999, 1000, uint64_t{1} << 63, maximum - 1, maximum};
     for (const auto rate : rates) {
         for (const auto start : {earliest, int64_t{-1000}, int64_t{0}, latest}) {
-            acpp::TokenBucket bucket(rate, At(start));
+            ::TokenBucket bucket(rate, At(start));
             ExactModel model(rate, start);
             for (const auto now : {start, start, earliest, latest, int64_t{0}}) {
                 for (const auto size : sizes) {

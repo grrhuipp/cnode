@@ -1,6 +1,6 @@
 #include "vless_encryption_handshake.hpp"
 
-#include "acppnode/common/allocator.hpp"
+#include "common/allocator.hpp"
 
 #include <blake3.h>
 #include <openssl/rand.h>
@@ -11,7 +11,7 @@
 #include <limits>
 #include <utility>
 
-namespace acpp::vless {
+namespace vless {
 namespace {
 
 constexpr size_t kHashSize = 32;
@@ -650,4 +650,4 @@ AcceptVlessEncryptionClientZeroRtt(
     return accept;
 }
 
-}  // namespace acpp::vless
+}  // namespace vless

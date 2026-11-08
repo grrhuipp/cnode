@@ -13,7 +13,7 @@ void Check(bool ok, const char* what) {
 }
 }
 TEST(VlessTicketStore, Contract) {
-    using namespace acpp::vless;
+    using namespace ::vless;
     using namespace std::chrono_literals;
     const auto now = std::chrono::steady_clock::time_point{} + 100s;
     std::array<uint8_t, 16> ticket{};

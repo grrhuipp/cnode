@@ -1,5 +1,5 @@
 #include "http2_session.hpp"
-#include "acppnode/common/byte_reader.hpp"
+#include "common/byte_reader.hpp"
 
 #include "grpc_hunk.hpp"
 #include "http1_handshake.hpp"
@@ -7,16 +7,16 @@
 #include "http_path_match.hpp"
 #include "xhttp_session.hpp"
 #include "../../common/awaitable_task_group.hpp"
-#include "acppnode/app/session_group_executor.hpp"
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/buffer_util.hpp"
-#include "acppnode/common/container_util.hpp"
-#include "acppnode/common/unsafe.hpp"
-#include "acppnode/infra/log.hpp"
-#include "acppnode/transport/internet/async_write_gate.hpp"
-#include "acppnode/transport/internet/http_headers.hpp"
-#include "acppnode/transport/internet/tcp_stream.hpp"
-#include "acppnode/transport/phase_deadline.hpp"
+#include "app/session_group_executor.hpp"
+#include "common/allocator.hpp"
+#include "common/buffer_util.hpp"
+#include "common/container_util.hpp"
+#include "common/unsafe.hpp"
+#include "infra/log.hpp"
+#include "transport/internet/async_write_gate.hpp"
+#include "transport/internet/http_headers.hpp"
+#include "transport/internet/tcp_stream.hpp"
+#include "transport/phase_deadline.hpp"
 
 #include <algorithm>
 #include <array>
@@ -27,7 +27,7 @@
 
 #include <tl/expected.hpp>
 
-namespace acpp::transport::internet {
+namespace transport::internet {
 namespace {
 
 // Capture once at the physical session entry, before native I/O can suspend.
@@ -3802,4 +3802,4 @@ net::awaitable<TransportBuildResult> DoHttp2ClientHandshake(
         !request_body_expected);
 }
 
-}  // namespace acpp::transport::internet
+}  // namespace transport::internet

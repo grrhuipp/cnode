@@ -1,11 +1,11 @@
 #include "controller_impl.hpp"
 #include "../../common/awaitable_batch.hpp"
 
-#include "acppnode/app/traffic_types.hpp"
-#include "acppnode/app/worker.hpp"
-#include "acppnode/core/naming.hpp"
-#include "acppnode/infra/log.hpp"
-#include "acppnode/common/online_device.hpp"
+#include "app/traffic_types.hpp"
+#include "app/worker.hpp"
+#include "core/naming.hpp"
+#include "infra/log.hpp"
+#include "common/online_device.hpp"
 
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/co_spawn.hpp>
@@ -16,7 +16,6 @@
 #include <format>
 #include <vector>
 
-namespace acpp {
 
 net::awaitable<bool>
 Controller::Impl::collectTraffic(PanelRuntime& panel, bool* appended_out) {
@@ -240,4 +239,3 @@ net::awaitable<void> Controller::Impl::userInfoMonitor(PanelRuntime& panel,
     co_return;
 }
 
-}  // namespace acpp

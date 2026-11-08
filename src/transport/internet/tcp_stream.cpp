@@ -1,8 +1,8 @@
-#include "acppnode/transport/internet/tcp_stream.hpp"
-#include "acppnode/app/session_group_executor.hpp"
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/buffer_util.hpp"
-#include "acppnode/transport/internet/timeout_scheduler.hpp"
+#include "transport/internet/tcp_stream.hpp"
+#include "app/session_group_executor.hpp"
+#include "common/allocator.hpp"
+#include "common/buffer_util.hpp"
+#include "transport/internet/timeout_scheduler.hpp"
 #include "connection_timeouts.hpp"
 #include "native_socket_handoff.hpp"
 
@@ -18,7 +18,6 @@
 #include <sys/socket.h>
 #include <netinet/tcp.h>
 
-namespace acpp {
 
 namespace {
 constexpr size_t kProxyProbeBytes = 256;
@@ -775,4 +774,3 @@ void SetupConnectedSocket(tcp::socket& sock) {
 }
 }  // namespace
 
-}  // namespace acpp

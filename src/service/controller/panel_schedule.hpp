@@ -3,7 +3,7 @@
 #include <chrono>
 #include <cstdint>
 
-namespace acpp::controller {
+namespace controller {
 
 [[nodiscard]] constexpr std::chrono::seconds PanelInterval(
     int configured_seconds,
@@ -14,4 +14,4 @@ namespace acpp::controller {
             : fallback_seconds);
 }
 
-}  // namespace acpp::controller
+}  // namespace controller

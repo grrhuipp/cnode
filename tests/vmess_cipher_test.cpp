@@ -34,8 +34,8 @@ extern "C" int __wrap_EVP_DigestSqueeze(EVP_MD_CTX* ctx, uint8_t* out, size_t si
 #endif
 
 namespace {
-using namespace acpp::vmess;
-using acpp::proxy::AeadDirection;
+using namespace ::vmess;
+using ::proxy::AeadDirection;
 
 void Check(bool condition, std::string_view message) {
     if (!condition) {

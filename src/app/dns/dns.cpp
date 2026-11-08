@@ -1,10 +1,11 @@
 #include "cache_internal.hpp"
-#include "acppnode/app/dns/dns_worker.hpp"
-#include "acppnode/app/worker_mailbox.hpp"
-#include "acppnode/common/domain_name.hpp"
-#include "acppnode/common/ip_address.hpp"
-#include "acppnode/common/ip_utils.hpp"
-#include "acppnode/infra/log.hpp"
+#include "app/dns/dns_worker.hpp"
+#include "app/worker_mailbox.hpp"
+#include "common/byte_reader.hpp"
+#include "common/domain_name.hpp"
+#include "common/ip_address.hpp"
+#include "common/ip_utils.hpp"
+#include "infra/log.hpp"
 #include "datagram_exchange.hpp"
 #include "../../common/awaitable_task_group.hpp"
 #include "inflight_resolves.hpp"
@@ -16,7 +17,7 @@
 #include <stdexcept>
 #include <span>
 
-namespace acpp::app::dns {
+namespace app::dns {
 
 namespace wire {
 
@@ -113,14 +114,14 @@ net::awaitable<DnsResult> DNSWorker::Impl::ResolveOwned(std::string owned_domain
         result.addresses.push_back(*address);
         co_return result;
     }
-    if (!acpp::domain::IsValidDnsHostname(
-            domain, acpp::domain::TrailingDotPolicy::Allow)) {
+    if (!::domain::IsValidDnsHostname(
+            domain, ::domain::TrailingDotPolicy::Allow)) {
         DnsResult result;
         result.error = ErrorCode::INVALID_ARGUMENT;
         co_return result;
     }
 
-    acpp::domain::NormalizeDnsHostnameInPlace(owned_domain);
+    ::domain::NormalizeDnsHostnameInPlace(owned_domain);
     domain = owned_domain;
     auto cached = cache.GetResult(domain);
     auto result = cached ? std::move(*cached) :
@@ -468,11 +469,9 @@ DnsResult DNSWorker::Impl::ParseResponse(
             result.error_msg = "DNS answer class is not IN";
             return result;
         }
-        const uint32_t ttl =
-            (static_cast<uint32_t>(response[pos + 4]) << 24) |
-            (static_cast<uint32_t>(response[pos + 5]) << 16) |
-            (static_cast<uint32_t>(response[pos + 6]) << 8) |
-            response[pos + 7];
+        const uint32_t wire_ttl = LoadU32BE(response.data() + pos + 4);
+        // RFC 2181 §8：收到最高位置位的 TTL 时，整个值按零处理。
+        const uint32_t ttl = (wire_ttl & 0x80000000u) != 0 ? 0 : wire_ttl;
         const uint16_t rdlength =
             (static_cast<uint16_t>(response[pos + 8]) << 8) | response[pos + 9];
 
@@ -568,4 +567,4 @@ net::awaitable<DnsResult> DNS::Resolve(std::string_view domain) {
     return worker_.Resolve(std::string(domain));
 }
 
-}  // namespace acpp::app::dns
+}  // namespace app::dns
