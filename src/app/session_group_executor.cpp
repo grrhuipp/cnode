@@ -403,7 +403,15 @@ void ExecutionDomain::Notify(bool force) noexcept {
     if (!force && was_notified) return;
     auto* route = state_->route.load(std::memory_order_acquire);
     try {
-        net::post(route->target.executor, [self = shared_from_this(), route] { self->Run(route); });
+        auto notification = [self = shared_from_this(), route] { self->Run(route); };
+        // Native reactors need no second function-erasure allocation. Preserve
+        // custom executor semantics, deferred delivery and the captured route.
+        if (const auto* native =
+                route->target.executor.target<net::io_context::executor_type>()) {
+            net::post(*native, std::move(notification));
+        } else {
+            net::post(route->target.executor, std::move(notification));
+        }
     } catch (...) {
         FailRuntime("session-domain", "cannot deliver reserved readiness notification");
     }

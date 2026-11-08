@@ -56,6 +56,23 @@ public:
     ~Child();
     Child(const Child&) = delete;
     Child& operator=(const Child&) = delete;
+    struct MemorySnapshot {
+        uint64_t vm_rss_bytes;
+        uint64_t vm_hwm_bytes;
+        uint64_t smaps_rollup_rss_bytes;
+        uint64_t smaps_rollup_pss_bytes;
+        uint64_t smaps_rollup_anonymous_bytes;
+        uint64_t smaps_rollup_anon_huge_pages_bytes;
+        uint64_t smaps_rollup_file_pmd_mapped_bytes;
+    };
+    // Linux /proc status and smaps_rollup for this live process, not descendants
+    // or the harness. VmRSS is current RSS; VmHWM is its lifetime high-water mark
+    // at sampling. Both are kernel RSS accounting estimates, not PSS.
+    // Rollup sums per-mapping accounting at sampling, not a peak. Its PSS
+    // apportions shared resident pages; neither source measures private memory.
+    // The two reads and the rollup mapping walk are not an atomic snapshot.
+    // Throws if the child exits or any required field cannot be read/parsed.
+    MemorySnapshot ReadMemorySnapshot();
     bool Running();
     // Wait/Stop return the exit code, or 128 + signal for signal termination.
     int Wait(Milliseconds timeout = 5s);

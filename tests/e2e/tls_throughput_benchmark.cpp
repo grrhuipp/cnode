@@ -186,6 +186,7 @@ TEST_P(TlsThroughputBenchmark, VerifiedTransfer) {
     Child child({binary.string(), "--config-dir", root.Path().string()}, root.Path() / "child.log");
     child.WaitForLog("server started", Remaining(deadline));
     Require(child.Running(), "cnode exited at startup");
+    const auto startup_memory = child.ReadMemorySnapshot();
     TlsContext context(false);
     std::vector<std::unique_ptr<TlsSocket>> clients;
     clients.reserve(workload.streams);
@@ -199,7 +200,12 @@ TEST_P(TlsThroughputBenchmark, VerifiedTransfer) {
     }
 
     Transfer(clients, workload.upload, std::string_view(payload).substr(0, WarmupBytes), "W", deadline);
+    // All warmup completion markers are verified; targets now wait for M.
+    const auto warmup_memory = child.ReadMemorySnapshot();
     const double elapsed = Transfer(clients, workload.upload, payload, "M", deadline);
+    // Transfer has recorded its last completion time. D/EOF has not been sent,
+    // so every TLS/VLESS connection remains open during this sample.
+    const auto measured_memory = child.ReadMemorySnapshot();
 
     for (auto& client : clients) {
         client->Write("D", Remaining(deadline));
@@ -218,6 +224,15 @@ TEST_P(TlsThroughputBenchmark, VerifiedTransfer) {
     const auto total_bytes = MeasuredBytes * workload.streams;
     const double user_cpu = Seconds(usage_after.ru_utime) - Seconds(usage_before.ru_utime);
     const double system_cpu = Seconds(usage_after.ru_stime) - Seconds(usage_before.ru_stime);
+    const auto memory_sample = [](std::string_view stage, const Child::MemorySnapshot& sample) {
+        return Json{{"stage", stage}, {"vm_rss_bytes", sample.vm_rss_bytes},
+                    {"vm_hwm_bytes", sample.vm_hwm_bytes},
+                    {"smaps_rollup_rss_bytes", sample.smaps_rollup_rss_bytes},
+                    {"smaps_rollup_pss_bytes", sample.smaps_rollup_pss_bytes},
+                    {"smaps_rollup_anonymous_bytes", sample.smaps_rollup_anonymous_bytes},
+                    {"smaps_rollup_anon_huge_pages_bytes", sample.smaps_rollup_anon_huge_pages_bytes},
+                    {"smaps_rollup_file_pmd_mapped_bytes", sample.smaps_rollup_file_pmd_mapped_bytes}};
+    };
     const Json metrics{
         {"binary", binary.string()}, {"direction", workload.upload ? "upload" : "download"},
         {"streams", workload.streams}, {"workers", Workers}, {"chunk_bytes", ChunkBytes},
@@ -228,7 +243,20 @@ TEST_P(TlsThroughputBenchmark, VerifiedTransfer) {
         {"daemon_lifetime_wall_seconds", lifetime}, {"daemon_lifetime_user_cpu_seconds", user_cpu},
         {"daemon_lifetime_system_cpu_seconds", system_cpu},
         {"daemon_lifetime_cpu_seconds", user_cpu + system_cpu},
-        {"cpu_scope", "RUSAGE_CHILDREN_delta_spawn_through_reap_including_startup_handshake_warmup_transfer_shutdown"}};
+        {"cpu_scope", "RUSAGE_CHILDREN_delta_spawn_through_reap_including_startup_handshake_warmup_transfer_shutdown"},
+        {"memory", {
+            {"source", "/proc/<child_pid>/status"}, {"unit", "bytes"},
+            {"smaps_rollup_source", "/proc/<child_pid>/smaps_rollup"},
+            {"process_scope", "single_daemon_process_excluding_harness_and_descendants"},
+            {"vm_rss_scope", "resident_memory_at_each_sample_including_shared_pages"},
+            {"vm_hwm_scope", "process_lifetime_high_water_mark_through_each_sample_not_transfer_only_or_post_shutdown"},
+            {"smaps_rollup_scope", "per_mapping_accounting_summed_at_each_sample_not_peak"},
+            {"smaps_rollup_pss_scope", "resident_pages_with_shared_pages_proportionally_attributed"},
+            {"limitations", "status_RSS_estimates_rollup_walks_mappings_sequentially_sources_not_atomic_no_continuous_sampling"},
+            {"samples", Json::array({
+                memory_sample("server_started", startup_memory),
+                memory_sample("warmup_complete_waiting_for_M", warmup_memory),
+                memory_sample("measured_transfer_complete_connections_open", measured_memory)})}}}};
     std::cout << "TLS_THROUGHPUT " << metrics.dump() << '\n';
     RecordProperty("tls_throughput", metrics.dump());
 }

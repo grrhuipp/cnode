@@ -231,7 +231,7 @@ net::awaitable<buf::MultiBuffer> TcpStream::ReadMultiBuffer() {
         if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
             continue;
         }
-        throw IoSystemError(IoErrorCode(errno, std::system_category()));
+        throw IoSystemError(IoErrorCode(errno, io_error::get_system_category()));
     }
 }
 

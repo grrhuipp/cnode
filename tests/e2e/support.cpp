@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <charconv>
 #include <climits>
 #include <csignal>
 #include <cstring>
@@ -341,6 +342,72 @@ bool Child::Running() {
     status_ = ExitCode(status);
     reaped_ = true;
     return false;
+}
+
+Child::MemorySnapshot Child::ReadMemorySnapshot() {
+    if (!Running()) throw std::runtime_error("cannot sample memory of an exited child");
+    const auto directory = "/proc/" + std::to_string(pid_) + "/";
+    MemorySnapshot snapshot{};
+    struct Field {
+        std::string_view name;
+        uint64_t& bytes;
+        bool found = false;
+    };
+    const auto read_fields = [&](std::string_view filename, std::span<Field> fields) {
+        const auto path = directory + std::string(filename);
+        std::ifstream input(path);
+        if (!input.is_open()) throw std::runtime_error("cannot open child memory data: " + path);
+        const auto parse = [&](std::string_view text, Field& field) {
+            const auto invalid = [&] {
+                throw std::runtime_error("invalid or duplicate child memory field in " + path + ": " + std::string(text));
+            };
+            if (field.found) invalid();
+            auto value = text.substr(field.name.size());
+            const auto trim = [](std::string_view content) {
+                const auto first = content.find_first_not_of(" \t");
+                if (first == std::string_view::npos) return std::string_view{};
+                return content.substr(first, content.find_last_not_of(" \t") - first + 1);
+            };
+            value = trim(value);
+            if (value.empty()) invalid();
+            uint64_t kib = 0;
+            const auto result = std::from_chars(value.data(), value.data() + value.size(), kib);
+            if (result.ec != std::errc{} || result.ptr == value.data() + value.size() ||
+                (*result.ptr != ' ' && *result.ptr != '\t') ||
+                trim(value.substr(static_cast<size_t>(result.ptr - value.data()))) != "kB" ||
+                kib > std::numeric_limits<uint64_t>::max() / 1024) invalid();
+            field.bytes = kib * 1024; // Linux procfs labels binary KiB as "kB".
+            field.found = true;
+        };
+        std::string line;
+        while (std::getline(input, line)) {
+            for (auto& field : fields) {
+                if (line.starts_with(field.name)) {
+                    parse(line, field);
+                    break;
+                }
+            }
+        }
+        if (input.bad() || !input.eof())
+            throw std::runtime_error("cannot read child memory data: " + path);
+        for (const auto& field : fields) {
+            if (!field.found)
+                throw std::runtime_error("missing child memory field " + std::string(field.name) + " in " + path);
+        }
+    };
+    Field status_fields[] = {
+        {"VmRSS:", snapshot.vm_rss_bytes},
+        {"VmHWM:", snapshot.vm_hwm_bytes}};
+    read_fields("status", status_fields);
+    Field rollup_fields[] = {
+        {"Rss:", snapshot.smaps_rollup_rss_bytes},
+        {"Pss:", snapshot.smaps_rollup_pss_bytes},
+        {"Anonymous:", snapshot.smaps_rollup_anonymous_bytes},
+        {"AnonHugePages:", snapshot.smaps_rollup_anon_huge_pages_bytes},
+        {"FilePmdMapped:", snapshot.smaps_rollup_file_pmd_mapped_bytes}};
+    read_fields("smaps_rollup", rollup_fields);
+    if (!Running()) throw std::runtime_error("child exited while sampling memory: " + directory);
+    return snapshot;
 }
 
 int Child::Wait(Milliseconds timeout) {

@@ -62,7 +62,11 @@ mise exec -- cmake --build build/musl --target cnode_benchmarks
 mise exec -- ctest --test-dir build/musl --no-tests=error -L '^benchmark$' -V
 ```
 
-当前微基准覆盖带生命周期跟踪的字节缓冲追加、1/8/9/16 块 `MultiBuffer` 所有权移交，以及散布写描述符的构建与回收；描述符基准分别使用 span 和 `MultiBuffer` 输入，覆盖内联容量与溢出边界。真实 cnode 进程基准覆盖 VLESS/TLS 上传、下载：固定 1 个 Worker、1/8 条并发流，每流预热 1 MiB、测量 16 MiB；对端按完整 64 KiB 块接收并校验载荷，避免每次短读重新分配大缓冲。微基准不代表端到端吞吐。
+当前微基准覆盖带生命周期跟踪的字节缓冲追加、1/8/9/16 块 `MultiBuffer` 所有权移交，以及散布写描述符的构建与回收；描述符基准分别使用 span 和 `MultiBuffer` 输入，覆盖内联容量与溢出边界。微基准不代表端到端吞吐。
+
+TCP 接收基准通过真实回环连接测量 1 B / 8 KiB / 64 KiB 突发：每种负载预热 128 轮、测量 4096 轮，逐字节校验载荷，输出每轮 CPU、墙钟耗时及读取次数。CPU 包含同进程收发双方与载荷校验，不是守护进程单侧 CPU，也不代表公网吞吐。
+
+真实 cnode 进程基准覆盖 VLESS/TLS 上传、下载：固定 1 个 Worker、1/8 条并发流，每流预热 1 MiB、测量 16 MiB；对端按完整 64 KiB 块接收并校验载荷，避免每次短读重新分配大缓冲。
 
 只测 TLS 链路并指定待测二进制：
 
@@ -73,6 +77,8 @@ CNODE_BENCHMARK_BINARY=/absolute/path/to/cnode \
 ```
 
 新旧二进制应使用同一份 benchmark，避免把测量端的改动计入生产收益。其 CPU 指标包含进程启动、握手、预热、传输和停机，不等于纯传输阶段 CPU；`daemon_lifetime_wall_seconds` 同时报告完整生命周期耗时，避免只看传输吞吐而漏掉握手或停机延迟。基准输出测量值，不以耗时阈值判定测试成功。启用基准时，功能回归使用 `-L '^(unit|e2e)$'`；重新运行未显式开启基准的 mise 配置任务会关闭基准注册。
+
+Linux TLS 基准还在服务启动、预热完成及测量传输完成但连接尚未关闭时读取 cnode 自身 `/proc/<pid>/status`，输出 `memory.samples` 中以 bytes 为单位的 `vm_rss_bytes`、`vm_hwm_bytes`。RSS 包含共享驻留页，不含测试驱动和内核 socket 缓冲；HWM 是截至采样点的进程峰值，并非仅传输阶段的峰值，也不覆盖停机后的变化。同时读取 `smaps_rollup` 的 RSS、PSS、匿名页及匿名/文件透明大页，用于归因驻留内存波动；这些逐映射统计是采样时的值而不是峰值，与 status 也不是原子快照。
 
 官方参考程序互操作测试按需配置，使用本地可执行文件，不在测试期间下载。AnyTLS 参考程序可先用宿主 Go 准备，默认离线且要求固定提交的干净源码：
 
@@ -306,7 +312,7 @@ bash scripts/cnode.sh -debug_file true
 - 静态入站和面板均支持 `proxyProtocol`：`"off"` 不探测，`"auto"` 自动识别 PROXY v1/v2 或保留普通应用字节，`"on"` 强制要求有效头；省略时默认 `"auto"`。畸形或截断头会失败，不静默降级。自动识别不验证代理来源：`auto/on` 接入端只应允许可信前置代理访问，否则客户端可伪造源地址；直连且不需要此功能时使用 `off`。
 - `sendIP: "auto"` 表示 direct outbound 优先绑定入站连接命中的本地 IP，用于多 IP 服务器源进源出。
 - `enableDNS` 默认值为 `true`。
-- 每条 TCP relay 连接的每个方向最多挂起一个 8KB payload Buffer，双向 payload 容量总计 16KB；空闲时先等待可读事件、不持有 payload Buffer，持续流量通过连续读取推进。
+- 原生 TCP 的单次 socket 接收最多借用一个 8 KiB Buffer；每个 relay 方向发送完当前批次才继续读取，空闲等待读取时不持有 payload Buffer。协议预读数据仍先于后续 socket 字节交付。
 - TCP 嗅探只复制至多 4KB 的必要前缀。UDP 按原始数据报执行有状态 QUIC 嗅探，仅 `need_more` 触发续读：总窗口 200ms，最多 64 个数据报，累计输入达到 64KiB 后停止续读；已经读取的最后一个数据报即使跨过预算也完整保留。CRYPTO 重组上限 64KiB，独立记录已收到的字节，空洞不能作为有效 ClientHello 解析；不同 DCID / version 不混合，原始密文不修改。临时嗅探缓冲在路由前释放。
 - 初始数据以 `MultiBufferBatch` 按值转交出站；每个元素保留一个原始 reader 结果，UDP 包边界、目标和顺序不变，零／单元素不分配队列。普通上行 relay 逐个发送缓存元素后继续读取，与后续数据共用限速、错误分类和统计。VLESS、Trojan、AnyTLS 的握手只写协议控制数据，用户数据由 relay 发送；结果字节数、会话字节数和流量统计保持一致，发送失败不计入成功流量。
 - 嗅探续读超时不等于传输 EOF：TCP/TLS 活跃读取取消报告 `operation_aborted`，内存不足不能伪装成空数据。HTTP/1 chunked、VLESS Encryption 和 VMess reader 保留尚未完成的头、记录、读取进度及长度／掩码状态，取消后 relay 可继续读取同一会话；已经解码但尚未交出的批次也不会丢失。

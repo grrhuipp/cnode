@@ -246,7 +246,7 @@ void TcpPendingReadAndScatterWrite() {
     });
 }
 
-void TcpCancellationDuringFreeze(bool parent_cancel) {
+void TcpCancellationDuringFreeze(bool parent_cancel, bool multi_buffer) {
     Fixture f;
     tcp::acceptor acceptor(f.control, {net::ip::address_v4::loopback(), 0});
     tcp::socket socket(f.old_io), peer(f.control);
@@ -262,7 +262,13 @@ void TcpCancellationDuringFreeze(bool parent_cancel) {
     std::promise<void> armed;
     auto read = net::co_spawn(f.domain->Executor(), [&]() -> net::awaitable<bool> {
         armed.set_value();
-        try { char byte; (void)co_await stream->AsyncRead(net::buffer(&byte, 1)); }
+        try {
+            if (multi_buffer) (void)co_await stream->ReadMultiBuffer();
+            else {
+                char byte;
+                (void)co_await stream->AsyncRead(net::buffer(&byte, 1));
+            }
+        }
         catch (const IoSystemError& error) { co_return error.code() == io_error::operation_aborted; }
         co_return false;
     }, net::bind_cancellation_slot(signal.slot(), net::use_future));
@@ -433,8 +439,10 @@ void RetiredMemberDuringHandoff(bool commit) {
 
 TEST(NativeSocketHandoff, Contract) {
     TcpPendingReadAndScatterWrite();
-    TcpCancellationDuringFreeze(false);
-    TcpCancellationDuringFreeze(true);
+    for (const bool multi_buffer : {false, true}) {
+        TcpCancellationDuringFreeze(false, multi_buffer);
+        TcpCancellationDuringFreeze(true, multi_buffer);
+    }
     TcpWriteCancellationDuringFreeze(false);
     TcpWriteCancellationDuringFreeze(true);
     DatagramSameFdAndCancellation();
@@ -447,4 +455,74 @@ TEST(NativeSocketHandoff, RetiredMemberDuringCommit) {
 
 TEST(NativeSocketHandoff, RetiredMemberDuringCancel) {
     RetiredMemberDuringHandoff(false);
+}
+
+TEST(NativeSocketHandoff, TcpQueuedBatchesSurviveRollbackAndMigration) {
+    Fixture fixture;
+    tcp::acceptor acceptor(fixture.control, {net::ip::address_v4::loopback(), 0});
+    tcp::socket socket(fixture.old_io), peer(fixture.control);
+    socket.open(tcp::v4());
+    socket.set_option(net::socket_base::receive_buffer_size(256 * 1024));
+    socket.connect(acceptor.local_endpoint());
+    acceptor.accept(peer);
+    std::unique_ptr<TcpStream> stream;
+    fixture.OnDomain([&]() -> net::awaitable<void> {
+        stream = std::make_unique<TcpStream>(std::move(socket));
+        const std::array<uint8_t, 3> prefix{'p', 'r', 'e'};
+        stream->PrependReadData(prefix);
+        co_return;
+    });
+    std::vector<uint8_t> payload(131089);
+    for (size_t index = 0; index < payload.size(); ++index)
+        payload[index] = static_cast<uint8_t>((index * 131 + index / 251) & 255);
+    auto reading = net::co_spawn(fixture.domain->Executor(), [&]() -> net::awaitable<std::vector<uint8_t>> {
+        std::vector<uint8_t> received;
+        for (;;) {
+            auto batch = co_await stream->ReadMultiBuffer();
+            if (batch.empty()) break;
+            Require(batch.byte_size() <= buf::Buffer::kSize, "migrated TCP exceeded one payload buffer");
+            for (const auto* buffer : batch) {
+                const auto bytes = buffer->Bytes();
+                received.insert(received.end(), bytes.begin(), bytes.end());
+            }
+        }
+        co_return received;
+    }, net::use_future);
+    std::exception_ptr failure;
+    std::shared_ptr<ExecutionDomain::Handoff> handoff;
+    try {
+        fixture.OnDomain([]() -> net::awaitable<void> { co_return; });
+        handoff = fixture.Prepare();
+        fixture.Cancel(handoff);
+        handoff.reset();
+        handoff = fixture.Prepare();
+        auto writing = net::co_spawn(fixture.control, [&]() -> net::awaitable<void> {
+            co_await net::async_write(peer, net::buffer(payload), net::use_awaitable);
+            peer.shutdown(tcp::socket::shutdown_send);
+        }, net::use_future);
+        Finish(std::move(writing));
+        Require(reading.wait_for(0s) != std::future_status::ready,
+                "frozen read consumed queued TCP payload");
+        fixture.Commit(handoff);
+        handoff.reset();
+        fixture.StopOldReactor();
+        payload.insert(payload.begin(), {'p', 'r', 'e'});
+        EXPECT_EQ(Finish(std::move(reading)), payload);
+    } catch (...) {
+        failure = std::current_exception();
+        if (handoff) {
+            fixture.Cancel(handoff);
+            handoff.reset();
+        }
+    }
+    fixture.OnDomain([&]() -> net::awaitable<void> {
+        stream->Close();
+        co_return;
+    });
+    if (reading.valid()) {
+        try { (void)Finish(std::move(reading)); }
+        catch (...) { if (!failure) failure = std::current_exception(); }
+    }
+    fixture.OnDomain([&]() -> net::awaitable<void> { stream.reset(); co_return; });
+    if (failure) std::rethrow_exception(failure);
 }

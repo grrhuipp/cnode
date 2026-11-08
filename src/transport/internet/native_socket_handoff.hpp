@@ -97,11 +97,20 @@ public:
                                         // can fail after the last native wait completes.
                                         (void)drained_->cancel();
                                     }
-                                    net::post(executor, net::bind_allocator(
+                                    auto completion = net::bind_allocator(
                                         memory::ProcessAllocator<std::byte>{},
                                         [handler = std::move(handler), error]() mutable {
                                             std::move(handler)(error);
-                                        }));
+                                        });
+                                    if (executor.template target<GroupExecutor>()) {
+                                        // The group always forks. Keep its queue and
+                                        // release-before-invoke erased handler, without
+                                        // rewrapping the identical relationship property.
+                                        net::require(executor, net::execution::blocking.never)
+                                            .execute(std::move(completion));
+                                    } else {
+                                        net::post(executor, std::move(completion));
+                                    }
                                 }))));
                     } catch (...) {
                         --pending_;

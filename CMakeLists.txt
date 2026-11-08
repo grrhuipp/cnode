@@ -407,6 +407,7 @@ cnode_unit(startup_inbounds INCLUDES src/app)
 cnode_unit(stream_settings)
 cnode_unit(substream_inbound_lifecycle LIBRARY cnode_test_core INCLUDES src/proxy/anytls/inbound src/proxy/mux/inbound)
 cnode_unit(target_address)
+cnode_unit(tcp_read LIBRARY cnode_test_core)
 cnode_unit(thread_memory_pool LIBRARY cnode_build_options)
 cnode_unit(timeout_scheduler LIBRARY cnode_build_options SOURCES tests/timeout_scheduler_new.cpp src/transport/internet/timeout_scheduler.cpp src/app/session_group_executor.cpp src/infra/runtime_failure.cpp src/infra/log.cpp)
 cnode_unit(tls_client_certificate INCLUDES src/transport/internet)
@@ -516,7 +517,12 @@ if(BUILD_BENCHMARKS)
     target_link_libraries(cnode_tls_throughput_benchmark PRIVATE
         cnode_e2e_support GTest::gtest_main)
     add_dependencies(cnode_tls_throughput_benchmark cnode)
-    foreach(target IN ITEMS cnode_allocator_append_benchmark cnode_tls_throughput_benchmark)
+    add_executable(cnode_tcp_receive_benchmark EXCLUDE_FROM_ALL
+        tests/tcp_receive_benchmark.cpp)
+    target_link_libraries(cnode_tcp_receive_benchmark PRIVATE
+        cnode_core GTest::gtest_main)
+    foreach(target IN ITEMS cnode_allocator_append_benchmark cnode_tls_throughput_benchmark
+                            cnode_tcp_receive_benchmark)
         target_compile_options(${target} PRIVATE -UNDEBUG)
         add_dependencies(cnode_benchmarks ${target})
         gtest_discover_tests(${target} DISCOVERY_MODE PRE_TEST
