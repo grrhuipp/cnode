@@ -62,7 +62,7 @@ mise exec -- cmake --build build/musl --target cnode_benchmarks
 mise exec -- ctest --test-dir build/musl --no-tests=error -L '^benchmark$' -V
 ```
 
-当前基准覆盖带生命周期跟踪的字节缓冲追加、`MultiBuffer` 的 1/8/9/16 块所有权移交与回收，以及真实 cnode 进程的 VLESS/TLS 上传、下载。TLS 负载固定为 1 个 Worker、1/8 条并发流，每流预热 1 MiB、测量 16 MiB；对端按完整 64 KiB 块接收并校验载荷，避免每次短读重新分配大缓冲。微基准不代表端到端吞吐。
+当前微基准覆盖带生命周期跟踪的字节缓冲追加、1/8/9/16 块 `MultiBuffer` 所有权移交，以及散布写描述符的构建与回收；描述符基准分别使用 span 和 `MultiBuffer` 输入，覆盖内联容量与溢出边界。真实 cnode 进程基准覆盖 VLESS/TLS 上传、下载：固定 1 个 Worker、1/8 条并发流，每流预热 1 MiB、测量 16 MiB；对端按完整 64 KiB 块接收并校验载荷，避免每次短读重新分配大缓冲。微基准不代表端到端吞吐。
 
 只测 TLS 链路并指定待测二进制：
 

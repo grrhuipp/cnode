@@ -2,6 +2,7 @@
 
 #include "common/allocator.hpp"
 #include "common/buf/multi_buffer.hpp"
+#include "common/buffer_util.hpp"
 
 #include <algorithm>
 #include <array>
@@ -185,6 +186,66 @@ TEST(MultiBufferBenchmark, TrackedTransfers) {
             blocks, iterations, wall_ns / iterations, cpu_ns / iterations,
             domain.OutstandingAllocations(), before.mapped_bytes, after.mapped_bytes,
             after.idle_bytes);
+    }
+    memory::ThreadMemoryPool().PurgeIdle();
+}
+
+TEST(BufferSpanBenchmark, TrackedDescriptors) {
+    memory::AllocationDomain domain;
+    memory::ScopedAllocationDomain lease(domain);
+    for (const std::size_t blocks : {1u, 8u, 9u, 16u}) {
+        memory::ThreadMemoryPool().PurgeIdle();
+        {
+            auto payload = TransferBuffers(blocks);
+            std::array<net::const_buffer, 16> input;
+            std::size_t position = 0;
+            for (const auto* buffer : payload) {
+                const auto bytes = buffer->Bytes();
+                input[position++] = net::buffer(bytes.data(), bytes.size());
+            }
+            const auto descriptors = std::span(input).first(blocks);
+            const auto payload_allocations = domain.OutstandingAllocations();
+            for (const bool from_multibuffer : {false, true}) {
+                SCOPED_TRACE(blocks);
+                SCOPED_TRACE(from_multibuffer);
+                {
+                    ConstBufferSpanBuilder<8> probe;
+                    if (from_multibuffer) probe.AppendMultiBuffer(payload);
+                    else probe.AppendBuffers(descriptors);
+                    ASSERT_EQ(probe.size(), blocks);
+                    for (std::size_t index = 0; index < blocks; ++index) {
+                        EXPECT_EQ(probe.Span()[index].data(), input[index].data());
+                        EXPECT_EQ(probe.Span()[index].size(), input[index].size());
+                    }
+                }
+                ASSERT_EQ(domain.OutstandingAllocations(), payload_allocations);
+                const std::size_t iterations = 1048576 / blocks;
+                const auto before = memory::ThreadMemoryPool().GetFootprint();
+                timespec cpu_start{}, cpu_end{};
+                ASSERT_EQ(::clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu_start), 0);
+                const auto start = std::chrono::steady_clock::now();
+                for (std::size_t iteration = 0; iteration < iterations; ++iteration) {
+                    ConstBufferSpanBuilder<8> output;
+                    if (from_multibuffer) output.AppendMultiBuffer(payload);
+                    else output.AppendBuffers(descriptors);
+                    const auto views = output.Span();
+                    asm volatile("" : : "g"(views.data()), "g"(views.size()) : "memory");
+                }
+                const auto finish = std::chrono::steady_clock::now();
+                ASSERT_EQ(::clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu_end), 0);
+                const auto after = memory::ThreadMemoryPool().GetFootprint();
+                EXPECT_EQ(domain.OutstandingAllocations(), payload_allocations);
+                const double wall_ns = std::chrono::duration<double, std::nano>(finish - start).count();
+                const double cpu_ns = static_cast<double>(CpuNanoseconds(cpu_end) - CpuNanoseconds(cpu_start));
+                std::printf("buffer-span source=%s blocks=%zu operations=%zu "
+                            "wall_ns_per_operation=%.3f cpu_ns_per_operation=%.3f "
+                            "mapped_before=%zu mapped_after=%zu idle_after=%zu\n",
+                    from_multibuffer ? "multibuffer" : "descriptors", blocks, iterations,
+                    wall_ns / iterations, cpu_ns / iterations,
+                    before.mapped_bytes, after.mapped_bytes, after.idle_bytes);
+            }
+        }
+        ASSERT_EQ(domain.OutstandingAllocations(), 0u);
     }
     memory::ThreadMemoryPool().PurgeIdle();
 }

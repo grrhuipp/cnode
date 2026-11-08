@@ -94,6 +94,7 @@ static_assert(!ExtractableInitialPayload<const ::InitialPayload&&>);
 // Retain poisoned retired blocks so stale descriptor reads fail deterministically.
 class RetiringResource final : public std::pmr::memory_resource {
 public:
+    void RejectNextAllocation() noexcept { reject_next_ = true; }
     ~RetiringResource() override {
         for (const auto& block : retired_)
             std::pmr::new_delete_resource()->deallocate(block.pointer, block.bytes, block.alignment);
@@ -101,7 +102,9 @@ public:
 
 private:
     struct Block { void* pointer; size_t bytes; size_t alignment; };
+    bool reject_next_ = false;
     void* do_allocate(size_t bytes, size_t alignment) override {
+        if (std::exchange(reject_next_, false)) throw std::bad_alloc();
         return std::pmr::new_delete_resource()->allocate(bytes, alignment);
     }
     void do_deallocate(void* pointer, size_t bytes, size_t alignment) override {
@@ -163,6 +166,50 @@ TEST(BufferSpanBuilder, AppendingExternalBuffersPreservesOrderAndSkipsEmptyViews
     builder.AppendBuffers(buffers);
     EXPECT_EQ(Flatten(builder.Span()), "abcabc");
     for (const auto& buffer : builder.Span()) EXPECT_EQ(buffer.size(), 1);
+}
+
+TEST(BufferSpanBuilder, FailedSpillPreservesBorrowedDescriptorsAndCanRetry) {
+    RetiringResource resource;
+    ScopedResource scope(resource);
+    const std::string text = "abc";
+    for (const bool already_spilled : {false, true}) {
+        SCOPED_TRACE(already_spilled);
+        ::ConstBufferSpanBuilder<2> builder;
+        builder.Append(::net::buffer(text.data(), 1));
+        builder.Append(::net::buffer(text.data() + 1, 1));
+        if (already_spilled) builder.AppendBuffers(builder.Span());
+        const auto borrowed = builder.Span();
+        const auto expected = Flatten(borrowed);
+        resource.RejectNextAllocation();
+        EXPECT_THROW(builder.AppendBuffers(borrowed), std::bad_alloc);
+        EXPECT_EQ(builder.Span().data(), borrowed.data());
+        EXPECT_EQ(Flatten(builder.Span()), expected);
+        builder.AppendBuffers(borrowed);
+        EXPECT_EQ(Flatten(builder.Span()), expected + expected);
+        builder.Clear();
+        builder.Append(::net::buffer(text));
+        EXPECT_EQ(Flatten(builder.Span()), text);
+    }
+}
+
+TEST(BufferSpanBuilder, SpillUsesActiveDomainAndClearReleasesItsStorage) {
+    ::ConstBufferSpanBuilder<2> builder;
+    const std::string text = "abc";
+    builder.Append(::net::buffer(text.data(), 1));
+    builder.Append(::net::buffer(text.data() + 1, 1));
+    for (int cycle = 0; cycle < 2; ++cycle) {
+        ::memory::AllocationDomain domain;
+        ::memory::ScopedAllocationDomain lease(domain);
+        if (cycle != 0) {
+            builder.Append(::net::buffer(text.data(), 1));
+            builder.Append(::net::buffer(text.data() + 1, 1));
+        }
+        builder.Append(::net::buffer(text.data() + 2, 1));
+        EXPECT_EQ(Flatten(builder.Span()), text);
+        EXPECT_EQ(domain.OutstandingAllocations(), 1u);
+        builder.Clear();
+        EXPECT_EQ(domain.OutstandingAllocations(), 0u);
+    }
 }
 
 TEST(ContiguousBufferView, MultiBufferBorrowAndOwnedCopyPreserveBinaryPayload) {
