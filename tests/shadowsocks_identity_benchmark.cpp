@@ -40,13 +40,17 @@ TEST(ShadowsocksIdentityBenchmark, AuthenticationMatrix) {
                 const size_t position = *position_it;
                 Wire wire;
                 Prepare(io, wire, users[position], cipher);
-                size_t actual_hint = 0;
-                for (size_t i = 0; i < view.size(); ++i)
+                size_t actual_hint = 0, wrong_hint = 0;
+                const auto other_user = users[(position + 1) % count].profile.user_id;
+                // Sorting must not change which credential supplies the miss.
+                for (size_t i = 0; i < view.size(); ++i) {
                     if (view[i].profile.user_id == users[position].profile.user_id) actual_hint = i;
+                    if (view[i].profile.user_id == other_user) wrong_hint = i;
+                }
                 for (const char* hint_mode : {"hit", "miss", "absent"}) {
                     if (count == 1 && std::string_view(hint_mode) == "miss") continue;
                     const size_t hint_value = std::string_view(hint_mode) == "hit" ? actual_hint
-                        : std::string_view(hint_mode) == "miss" ? (actual_hint + 1) % count
+                        : std::string_view(hint_mode) == "miss" ? wrong_hint
                         : std::numeric_limits<size_t>::max();
                     for (size_t i = 0; i < 32; ++i) {
                         size_t hint = hint_value;
