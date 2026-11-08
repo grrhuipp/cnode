@@ -56,24 +56,22 @@ public:
     }
 
     void AppendMultiBuffer(const buf::MultiBuffer& mb) {
-        size_t non_empty = 0;
-        for (const auto* buffer : mb) {
-            if (buffer && !buffer->IsEmpty()) {
-                ++non_empty;
+        const size_t available = spill_
+            ? spill_->capacity() - spill_->size() : StackCapacity - count_;
+        // Count exact non-empty descriptors only if the slot upper bound would grow storage.
+        if (mb.size() > available) {
+            size_t non_empty = 0;
+            for (const auto* buffer : mb) {
+                if (buffer && !buffer->IsEmpty()) ++non_empty;
             }
-        }
-        if (non_empty == 0) {
-            return;
-        }
-        if (spill_ || non_empty > StackCapacity - count_) {
-            EnsureSpillCapacity(non_empty);
+            if (non_empty == 0) return;
+            if (non_empty > available) EnsureSpillCapacity(non_empty);
         }
         for (const auto* buffer : mb) {
-            if (!buffer || buffer->IsEmpty()) {
-                continue;
-            }
+            if (!buffer) continue;
             const auto bytes = buffer->Bytes();
-            AppendPrepared(net::const_buffer(bytes.data(), bytes.size()));
+            if (!bytes.empty())
+                AppendPrepared(net::const_buffer(bytes.data(), bytes.size()));
         }
     }
     void AppendMultiBuffer(const buf::MultiBuffer&&) = delete;
