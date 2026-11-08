@@ -318,6 +318,16 @@ void DuplexKeyUpdate(Resource& resource) {
     Require(Flatten(fixture.Wait(read)) == "concurrent-control-record", "full-duplex TLS control record stalled");
     Require(resource.large_live == idle_bytes, "completed duplex TLS operation retained ciphertext");
 
+    const std::string next_record = "after-backpressure-and-key-update";
+    auto next_write = net::co_spawn(fixture.io,
+        fixture.stream->AsyncWrite(net::buffer(next_record)), net::use_future);
+    auto next_read = net::co_spawn(fixture.io,
+        fixture.peer->Read(next_record.size()), net::use_future);
+    Require(fixture.Wait(next_write) == next_record.size() &&
+                fixture.Wait(next_read) == next_record,
+            "resuming direct output after a queued TLS control record corrupted the sequence");
+    Require(resource.large_live == idle_bytes, "resumed TLS output retained ciphertext");
+
     auto close = net::co_spawn(fixture.io, fixture.stream->AsyncShutdownWrite(), net::use_future);
     auto eof = net::co_spawn(fixture.io, fixture.peer->Read(1), net::use_future);
     fixture.Wait(close);
@@ -403,6 +413,57 @@ TEST(TlsRecordBuffer, Contract) {
     }
     std::pmr::set_default_resource(previous);
     { ASSERT_TRUE(passed); return; }
+}
+
+TEST(TlsRecordBuffer, SocketResetAbortsDirectAndBackpressuredWrites) {
+    TlsStream::InitializeIo();
+    for (const bool backpressured : {false, true}) {
+        SCOPED_TRACE(backpressured);
+        Fixture fixture;
+        const std::string payload(512 * 1024, 'r');
+        JoinPending join{fixture};
+        std::future<std::size_t> write;
+        if (backpressured) {
+            write = net::co_spawn(fixture.io,
+                fixture.stream->AsyncWrite(net::buffer(payload)), net::use_future);
+            fixture.io.restart();
+            fixture.io.run_for(20ms);
+            ASSERT_NE(write.wait_for(0s), std::future_status::ready);
+        }
+        fixture.peer->socket.set_option(net::socket_base::linger(true, 0));
+        fixture.peer->socket.close();
+        if (!backpressured)
+            write = net::co_spawn(fixture.io,
+                fixture.stream->AsyncWrite(net::buffer(payload)), net::use_future);
+        bool failed = false;
+        try { (void)fixture.Wait(write); }
+        catch (const IoSystemError& error) {
+            EXPECT_TRUE(error.code() == net::error::connection_reset ||
+                        error.code() == net::error::broken_pipe) << error.what();
+            failed = true;
+        }
+        EXPECT_TRUE(failed);
+        EXPECT_FALSE(fixture.stream->IsOpen());
+    }
+}
+
+TEST(TlsRecordBuffer, PeerResetCannotBecomeSuccessfulCloseNotify) {
+    TlsStream::InitializeIo();
+    Fixture fixture;
+    JoinPending join{fixture};
+    fixture.peer->socket.set_option(net::socket_base::linger(true, 0));
+    fixture.peer->socket.close();
+    auto shutdown = net::co_spawn(fixture.io,
+        fixture.stream->AsyncShutdownWrite(), net::use_future);
+    bool failed = false;
+    try { fixture.Wait(shutdown); }
+    catch (const IoSystemError& error) {
+        EXPECT_TRUE(error.code() == net::error::connection_reset ||
+                    error.code() == net::error::broken_pipe) << error.what();
+        failed = true;
+    }
+    EXPECT_TRUE(failed);
+    EXPECT_FALSE(fixture.stream->IsOpen());
 }
 
 namespace {

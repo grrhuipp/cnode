@@ -282,9 +282,10 @@ struct TlsStream::Impl final : memory::ThreadAllocated, private transport::Cance
     enum class Kind { Handshake, Read, Write, Shutdown };
 
     struct Invocation {
-        // A full record fits; larger handshake flights apply BIO backpressure.
+        // Only unsent ciphertext needs owned storage; bound handshake flights
+        // and never retain a library buffer across another SSL call.
         static constexpr std::size_t kOutputLimit = 64 * 1024;
-        memory::ByteVector output;
+        std::optional<memory::ByteVector> output;
         IoErrorCode transport_error;
         std::exception_ptr failure;
         unsigned long library_error = 0;
@@ -432,19 +433,37 @@ struct TlsStream::Impl final : memory::ThreadAllocated, private transport::Cance
         if (size <= 0) return 0;
         if (!self.invocation) return -1;
         auto& call = *self.invocation;
+        const auto queued = call.output ? call.output->size() : 0;
         const auto count = std::min<std::size_t>(
-            size, Invocation::kOutputLimit - call.output.size());
+            size, Invocation::kOutputLimit - queued);
         if (count == 0) {
             BIO_set_retry_write(bio);
             return -1;
         }
+        std::size_t sent = 0;
+        if (!self.output_tail && !call.output) {
+            // The engine lease excludes other SSL calls. Once output has been
+            // queued, even a new control record must stay behind that turn.
+            const auto buffer = net::buffer(data, count);
+            IoErrorCode error;
+            sent = self.tcp->WriteAvailable(
+                std::span<const net::const_buffer>(&buffer, 1), 0, error);
+            if (error && error != io_error::would_block &&
+                error != io_error::try_again && error != io_error::interrupted) {
+                call.transport_error = error;
+                return -1;
+            }
+            if (sent == count) return static_cast<int>(count);
+        }
         try {
-            const auto required = call.output.size() + count;
-            if (required > call.output.capacity())
-                call.output.reserve(std::min(Invocation::kOutputLimit,
-                    std::max(required, call.output.capacity() * 2)));
+            if (!call.output) call.output.emplace();
+            auto& output = *call.output;
+            const auto required = output.size() + count - sent;
+            if (required > output.capacity())
+                output.reserve(std::min(Invocation::kOutputLimit,
+                    std::max(required, output.capacity() * 2)));
             const auto* first = reinterpret_cast<const uint8_t*>(data);
-            call.output.insert(call.output.end(), first, first + count);
+            output.insert(output.end(), first + sent, first + count);
             return static_cast<int>(count);
         } catch (...) {
             // No C++ exception may cross a library callback.
@@ -542,14 +561,19 @@ struct TlsStream::Impl final : memory::ThreadAllocated, private transport::Cance
                 generation = input_generation;
                 result = call.result;
                 error = call.ssl_error;
-                if (call.failure) Fail(call);
+                // A failed direct send is terminal even if SSL has already set
+                // SSL_SENT_SHUTDOWN while constructing close_notify.
+                if (call.failure || call.transport_error) Fail(call);
+                // Synchronous transport progress may retire the connection
+                // while reconciling its activity deadline.
+                CheckCancellation(epoch);
                 // No empty relay buffer survives a read retry, even when TLS
                 // consumed only a partial record or a post-handshake message.
                 if (allocated && result <= 0 && error == SSL_ERROR_WANT_READ)
                     *allocated = {};
                 const bool shutdown_sent = kind == Kind::Shutdown &&
                     (SSL_get_shutdown(ssl.get()) & SSL_SENT_SHUTDOWN) != 0;
-                if (!call.output.empty()) {
+                if (call.output) {
                     try {
                         // Reserve the physical turn before the first suspension
                         // or another SSL call can generate a subsequent record.
@@ -572,8 +596,8 @@ struct TlsStream::Impl final : memory::ThreadAllocated, private transport::Cance
                             if (ec) throw IoSystemError(io_error::operation_aborted);
                             CheckCancellation(epoch);
                         }
-                        const auto size = co_await tcp->AsyncWrite(net::buffer(call.output));
-                        if (size != call.output.size())
+                        const auto size = co_await tcp->AsyncWrite(net::buffer(*call.output));
+                        if (size != call.output->size())
                             throw IoSystemError(io_error::broken_pipe);
                         CheckCancellation(epoch);
                     } catch (...) {
@@ -588,7 +612,7 @@ struct TlsStream::Impl final : memory::ThreadAllocated, private transport::Cance
                 if (kind == Kind::Read && error == SSL_ERROR_ZERO_RETURN) co_return 0;
                 if (error != SSL_ERROR_WANT_READ && error != SSL_ERROR_WANT_WRITE)
                     Fail(call);
-                if (error == SSL_ERROR_WANT_WRITE && call.output.empty()) Fail(call);
+                if (error == SSL_ERROR_WANT_WRITE && !call.output) Fail(call);
             } // Ciphertext is released before a readable wait.
             if (error == SSL_ERROR_WANT_READ) {
                 // WANT_READ has no partially accepted BIO output. Another

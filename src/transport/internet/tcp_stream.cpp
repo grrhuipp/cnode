@@ -263,35 +263,23 @@ net::awaitable<void> TcpStream::WriteBuffers(
             if (completion.Cancelled() ||
                 (!deferred && cancellation.cancelled() != net::cancellation_type::none))
                 throw IoSystemError(io_error::operation_aborted);
-            std::array<iovec, 16> vectors;
-            size_t count = 0;
-            for (size_t i = 0; i < buffers.size() && count < vectors.size(); ++i) {
-                const auto buffer = buffers[i] + (i == 0 ? offset : 0);
-                if (!buffer.size()) continue;
-                vectors[count++] = {const_cast<void*>(buffer.data()), buffer.size()};
-            }
-            msghdr message{};
-            message.msg_iov = vectors.data();
-            message.msg_iovlen = count;
-            const auto sent = ::sendmsg(impl_->socket.native_handle(), &message,
-                                        MSG_DONTWAIT | MSG_NOSIGNAL);
-            if (sent < 0) {
-                if (errno == EINTR) continue;
-                if (errno != EAGAIN && errno != EWOULDBLOCK)
-                    throw IoSystemError(IoErrorCode(errno, std::system_category()));
+            IoErrorCode error;
+            const auto sent = WriteAvailable(buffers, offset, error);
+            if (error) {
+                if (error == io_error::interrupted) continue;
+                if (error != io_error::would_block && error != io_error::try_again)
+                    throw IoSystemError(error);
                 const auto ec = co_await impl_->Wait(tcp::socket::wait_write, slot);
                 if (ec) throw IoSystemError(ec);
                 continue;
             }
-            if (!sent) throw IoSystemError(io_error::broken_pipe);
-            auto remaining = static_cast<size_t>(sent);
+            auto remaining = sent;
             while (!buffers.empty() && remaining >= buffers.front().size() - offset) {
                 remaining -= buffers.front().size() - offset;
                 buffers = buffers.subspan(1);
                 offset = 0;
             }
             offset += remaining;
-            TouchActivity();
         }
     } catch (...) { failure = std::current_exception(); }
     co_await net::this_coro::throw_if_cancelled(previous_throw);
@@ -578,6 +566,39 @@ std::size_t TcpStream::ReadAvailable(
     if (n == 0) n = impl_->socket.read_some(target, error);
     if (n != 0) TouchActivity();
     return n;
+}
+
+std::size_t TcpStream::WriteAvailable(
+    std::span<const net::const_buffer> buffers, std::size_t offset,
+    IoErrorCode& error) noexcept {
+    error.clear();
+    if (!CanWrite()) {
+        error = io_error::broken_pipe;
+        return 0;
+    }
+    std::array<iovec, 16> vectors;
+    size_t count = 0;
+    for (size_t i = 0; i < buffers.size() && count < vectors.size(); ++i) {
+        const auto buffer = buffers[i] + (i == 0 ? offset : 0);
+        if (!buffer.size()) continue;
+        vectors[count++] = {const_cast<void*>(buffer.data()), buffer.size()};
+    }
+    if (count == 0) return 0;
+    msghdr message{};
+    message.msg_iov = vectors.data();
+    message.msg_iovlen = count;
+    const auto sent = ::sendmsg(impl_->socket.native_handle(), &message,
+                               MSG_DONTWAIT | MSG_NOSIGNAL);
+    if (sent < 0) {
+        error = IoErrorCode(errno, io_error::get_system_category());
+        return 0;
+    }
+    if (sent == 0) {
+        error = io_error::broken_pipe;
+        return 0;
+    }
+    TouchActivity();
+    return static_cast<std::size_t>(sent);
 }
 
 tcp::endpoint TcpStream::LocalEndpoint() const {

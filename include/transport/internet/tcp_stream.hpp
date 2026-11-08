@@ -100,6 +100,10 @@ private:
     [[nodiscard]] bool CanWrite() const noexcept;
     [[nodiscard]] std::size_t ReadAvailable(
         net::mutable_buffer target, IoErrorCode& error) noexcept;
+    // One nonblocking attempt; only WriteBuffers waits and owns write deadlines.
+    [[nodiscard]] std::size_t WriteAvailable(
+        std::span<const net::const_buffer> buffers, std::size_t offset,
+        IoErrorCode& error) noexcept;
 
     net::awaitable<std::pair<IoErrorCode, std::size_t>> AsyncReceiveSome(
         net::mutable_buffer buffer,
