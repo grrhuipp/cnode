@@ -8,6 +8,7 @@
 #include <chrono>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -34,5 +35,11 @@ struct OutboundTransportTarget {
 
     // XHTTP packet-up / stream-up 可用独立下行入口；仅保存已解析候选和不可变配置视图。
     std::shared_ptr<const OutboundTransportTarget> xhttp_download_target;
+
+    [[nodiscard]] std::span<const OutboundDialCandidate> Candidates() const noexcept {
+        return single_candidate
+            ? std::span<const OutboundDialCandidate>(&*single_candidate, 1)
+            : std::span<const OutboundDialCandidate>(candidates);
+    }
 };
 

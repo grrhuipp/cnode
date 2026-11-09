@@ -61,35 +61,8 @@ void SortUniqueStrings(StringVector& values) {
     return std::span<const uint8_t>(network.Network()).first(network.IsV6() ? 16 : 4);
 }
 
-// geosite / geoip 条件在构建期解析为 GeoDatabase 内只读集合的指针；
-// GeoDatabase 生命周期覆盖所有 Worker 的 Router。
-class GeoSiteCondition {
-public:
-    GeoSiteCondition(
-        const std::vector<std::string>& tags,
-        const ::geo::GeoDatabase* geo);
-
-    [[nodiscard]] bool Match(const session::Context& ctx) const;
-
-private:
-    std::vector<const ::geo::DomainRuleSet*> sets_;
-};
-
-class GeoIPCondition {
-public:
-    GeoIPCondition(
-        const std::vector<std::string>& tags,
-        const ::geo::GeoDatabase* geo);
-
-    [[nodiscard]] bool Match(const session::Context& ctx) const;
-
-private:
-    std::vector<const ::geo::CidrSet*> sets_;
-};
-
 struct CompoundRoutingRule {
     void SetNetworkCondition(const std::vector<std::string>& networks) {
-        has_network_condition = true;
         network_mask = 0;
         for (const auto& network : networks) {
             if (network == constants::protocol::kTcp) {
@@ -104,7 +77,6 @@ struct CompoundRoutingRule {
     }
 
     void SetProtocolCondition(const std::vector<std::string>& protocols) {
-        has_protocol_condition = true;
         protocol_mask = 0;
         protocol_values.clear();
         for (const auto& protocol : protocols) {
@@ -118,56 +90,39 @@ struct CompoundRoutingRule {
     }
 
     void SetInboundTagCondition(const std::vector<std::string>& tags) {
-        has_inbound_tag_condition = true;
-        inbound_tag_values.clear();
-        inbound_tag_values.reserve(tags.size());
-        for (const auto& tag : tags) {
-            inbound_tag_values.emplace_back(tag);
-        }
+        inbound_tag_values.assign(tags.begin(), tags.end());
         SortUniqueStrings(inbound_tag_values);
     }
 
     void SetUserCondition(const std::vector<std::string>& users) {
-        has_user_condition = true;
-        user_values.clear();
-        user_values.reserve(users.size());
-        for (const auto& user : users) {
-            user_values.emplace_back(user);
-        }
+        user_values.assign(users.begin(), users.end());
         SortUniqueStrings(user_values);
     }
 
     void SetPortCondition(const std::vector<RoutingPortRange>& ports) {
-        has_port_condition = true;
         port_ranges.assign(ports.begin(), ports.end());
     }
 
     void SetSourcePortCondition(const std::vector<RoutingPortRange>& ports) {
-        has_source_port_condition = true;
         source_port_ranges.assign(ports.begin(), ports.end());
     }
 
     [[nodiscard]] bool HasAnyCondition() const noexcept {
-        return has_network_condition || has_protocol_condition ||
-               has_inbound_tag_condition || has_user_condition ||
-               has_port_condition || has_source_port_condition ||
+        return network_mask != 0 || protocol_mask != 0 ||
+               !protocol_values.empty() || !inbound_tag_values.empty() ||
+               !user_values.empty() || !port_ranges.empty() ||
+               !source_port_ranges.empty() ||
                source_ip_matcher.has_value() || ip_matcher.has_value() ||
-               domain_matcher.has_value() || geosite_condition.has_value() ||
-               geoip_condition.has_value();
+               domain_matcher.has_value() || !geosite_sets.empty() ||
+               !geoip_sets.empty();
     }
 
     std::optional<::geo::CidrSet> source_ip_matcher;
     std::optional<::geo::CidrSet> ip_matcher;
     std::optional<::geo::DomainRuleSet> domain_matcher;
-    std::optional<GeoSiteCondition> geosite_condition;
-    std::optional<GeoIPCondition> geoip_condition;
+    std::vector<const ::geo::DomainRuleSet*> geosite_sets;
+    std::vector<const ::geo::CidrSet*> geoip_sets;
     std::string outbound_tag;
-    bool has_network_condition = false;
-    bool has_protocol_condition = false;
-    bool has_inbound_tag_condition = false;
-    bool has_user_condition = false;
-    bool has_port_condition = false;
-    bool has_source_port_condition = false;
     uint8_t network_mask = 0;
     uint8_t protocol_mask = 0;
     StringVector protocol_values;
@@ -176,19 +131,19 @@ struct CompoundRoutingRule {
     std::vector<RoutingPortRange> port_ranges;
     std::vector<RoutingPortRange> source_port_ranges;
 
-    [[nodiscard]] bool Match(const session::Context& ctx) const {
-        if (!HasAnyCondition()) return false;
-        if (has_network_condition && !MatchNetwork(ctx)) return false;
-        if (has_protocol_condition && !MatchProtocol(ctx)) return false;
-        if (has_inbound_tag_condition && !MatchInboundTag(ctx)) return false;
-        if (has_user_condition && !MatchUser(ctx)) return false;
-        if (has_source_port_condition && !MatchPortRanges(source_port_ranges, ctx.inbound.source_port)) {
+    [[nodiscard]] bool Match(
+        const session::Context& ctx,
+        std::string_view target_domain,
+        const net::ip::address* target_addr,
+        uint16_t target_port) const {
+        if (network_mask != 0 && !MatchNetwork(ctx)) return false;
+        if ((protocol_mask != 0 || !protocol_values.empty()) && !MatchProtocol(ctx)) return false;
+        if (!inbound_tag_values.empty() && !MatchInboundTag(ctx)) return false;
+        if (!user_values.empty() && !MatchUser(ctx)) return false;
+        if (!source_port_ranges.empty() && !MatchPortRanges(source_port_ranges, ctx.inbound.source_port)) {
             return false;
         }
-        const uint16_t target_port = ctx.outbound.route_target.IsValid()
-            ? ctx.outbound.route_target.port
-            : ctx.outbound.target.port;
-        if (has_port_condition && !MatchPortRanges(port_ranges, target_port)) {
+        if (!port_ranges.empty() && !MatchPortRanges(port_ranges, target_port)) {
             return false;
         }
         if (source_ip_matcher) {
@@ -197,27 +152,30 @@ struct CompoundRoutingRule {
                 return false;
             }
         }
-        if (ip_matcher) {
-            const auto* addr = RoutingAddress(ctx);
-            if (!addr || !ip_matcher->Match(*addr)) {
+        if (ip_matcher && (!target_addr || !ip_matcher->Match(*target_addr))) {
+            return false;
+        }
+        if (domain_matcher && (target_domain.empty() || !domain_matcher->Match(target_domain))) {
+            return false;
+        }
+        if (!geosite_sets.empty()) {
+            if (target_domain.empty() ||
+                std::ranges::none_of(geosite_sets, [&](const ::geo::DomainRuleSet* set) {
+                    return set->Match(target_domain);
+                })) {
                 return false;
             }
         }
-        if (domain_matcher) {
-            const auto domain = RoutingDomain(ctx);
-            if (domain.empty() || !domain_matcher->Match(domain)) {
+        if (!geoip_sets.empty()) {
+            if (!target_addr ||
+                std::ranges::none_of(geoip_sets, [&](const ::geo::CidrSet* set) {
+                    return set->Match(*target_addr);
+                })) {
                 return false;
             }
-        }
-        if (geosite_condition && !geosite_condition->Match(ctx)) {
-            return false;
-        }
-        if (geoip_condition && !geoip_condition->Match(ctx)) {
-            return false;
         }
         return true;
     }
-
 private:
     static constexpr uint8_t kNetworkTcp = 1u << 0;
     static constexpr uint8_t kNetworkUdp = 1u << 1;
@@ -303,10 +261,15 @@ Router::~Router() noexcept = default;
 
 routing::RouteDecision Router::Route(const session::Context& ctx) const {
     const auto& target = ctx.outbound.target;
+    const std::string_view target_domain = RoutingDomain(ctx);
+    const net::ip::address* const target_addr = RoutingAddress(ctx);
+    const uint16_t target_port = ctx.outbound.route_target.IsValid()
+        ? ctx.outbound.route_target.port
+        : target.port;
 
     // 顺序检查复合规则（AND 语义）
     for (const auto& rule : impl_->compound_rules) {
-        if (rule.Match(ctx)) {
+        if (rule.Match(ctx, target_domain, target_addr, target_port)) {
             LOG_CONN_DEBUG(ctx, "matched compound routing rule target={} outbound={}",
                       target, rule.outbound_tag);
             return routing::RouteDecision{
@@ -315,7 +278,6 @@ routing::RouteDecision Router::Route(const session::Context& ctx) const {
             };
         }
     }
-
     // No match is an explicit empty decision. Dispatcher owns the receiver's
     // explicit fallback.
     LOG_CONN_DEBUG(ctx, "no matching routing rule target={}", target);
@@ -395,11 +357,35 @@ Router::Impl::Impl(
         }
 
         if (!rc.geosite.empty()) {
-            compound.geosite_condition.emplace(rc.geosite, geo);
+            if (!geo) {
+                throw std::logic_error(
+                    "geosite condition reached runtime without GeoDatabase");
+            }
+            compound.geosite_sets.reserve(rc.geosite.size());
+            for (const auto& tag : rc.geosite) {
+                const auto* set = geo->FindGeoSite(tag);
+                if (!set) {
+                    throw std::logic_error(
+                        "unresolved geosite tag reached routing runtime");
+                }
+                compound.geosite_sets.push_back(set);
+            }
         }
 
         if (!rc.geoip.empty()) {
-            compound.geoip_condition.emplace(rc.geoip, geo);
+            if (!geo) {
+                throw std::logic_error(
+                    "geoip condition reached runtime without GeoDatabase");
+            }
+            compound.geoip_sets.reserve(rc.geoip.size());
+            for (const auto& tag : rc.geoip) {
+                const auto* set = geo->FindGeoIP(tag);
+                if (!set) {
+                    throw std::logic_error(
+                        "unresolved geoip tag reached routing runtime");
+                }
+                compound.geoip_sets.push_back(set);
+            }
         }
 
         if (!compound.HasAnyCondition()) {
@@ -413,59 +399,4 @@ Router::Impl::Impl(
 routing::DomainStrategy Router::DomainStrategy() const noexcept {
     return impl_->domain_strategy;
 }
-
-bool GeoSiteCondition::Match(const session::Context& ctx) const {
-    const auto domain = RoutingDomain(ctx);
-    if (domain.empty()) return false;
-    for (const auto* set : sets_) {
-        if (set->Match(domain)) return true;
-    }
-    return false;
-}
-
-GeoSiteCondition::GeoSiteCondition(
-    const std::vector<std::string>& tags,
-    const ::geo::GeoDatabase* geo) {
-    if (!geo) {
-        throw std::logic_error(
-            "geosite condition reached runtime without GeoDatabase");
-    }
-    sets_.reserve(tags.size());
-    for (const auto& tag : tags) {
-        const auto* set = geo->FindGeoSite(tag);
-        if (!set) {
-            throw std::logic_error(
-                "unresolved geosite tag reached routing runtime");
-        }
-        sets_.push_back(set);
-    }
-}
-
-bool GeoIPCondition::Match(const session::Context& ctx) const {
-    const auto* addr = RoutingAddress(ctx);
-    if (!addr) return false;
-    for (const auto* set : sets_) {
-        if (set->Match(*addr)) return true;
-    }
-    return false;
-}
-
-GeoIPCondition::GeoIPCondition(
-    const std::vector<std::string>& tags,
-    const ::geo::GeoDatabase* geo) {
-    if (!geo) {
-        throw std::logic_error(
-            "geoip condition reached runtime without GeoDatabase");
-    }
-    sets_.reserve(tags.size());
-    for (const auto& tag : tags) {
-        const auto* set = geo->FindGeoIP(tag);
-        if (!set) {
-            throw std::logic_error(
-                "unresolved geoip tag reached routing runtime");
-        }
-        sets_.push_back(set);
-    }
-}
-
 }  // namespace app::router

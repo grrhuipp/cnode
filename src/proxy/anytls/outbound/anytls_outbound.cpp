@@ -363,15 +363,9 @@ struct Handler::ClientSession : memory::ThreadAllocated {
 
         try {
             const uint32_t this_packet = NextPacketIndex();
-            tl::expected<void, ErrorCode> ok;
-            if (scheme_->RecordFor(this_packet).empty()) {
-                ok = co_await WriteMultiBufferAsFrameBatch(
-                    *stream, kCmdPSH, sid, std::move(mb));
-            } else {
-                auto scheme_snapshot = scheme_;
-                ok = co_await WriteMultiBufferAsFramesWithPadding(
-                    *stream, *scheme_snapshot, this_packet, kCmdPSH, sid, std::move(mb));
-            }
+            auto scheme_snapshot = scheme_;
+            auto ok = co_await WriteMultiBufferAsFramesWithPadding(
+                *stream, *scheme_snapshot, this_packet, kCmdPSH, sid, std::move(mb));
             if (!ok) {
                 CloseAll(ok.error());
                 co_return tl::unexpected(ok.error());
@@ -406,14 +400,9 @@ struct Handler::ClientSession : memory::ThreadAllocated {
 
         try {
             const uint32_t this_packet = NextPacketIndex();
-            tl::expected<void, ErrorCode> ok;
-            if (scheme_->RecordFor(this_packet).empty()) {
-                ok = co_await WriteBuffersAsFrameBatch(*stream, kCmdPSH, sid, buffers);
-            } else {
-                auto scheme_snapshot = scheme_;
-                ok = co_await WriteBuffersAsFramesWithPadding(
-                    *stream, *scheme_snapshot, this_packet, kCmdPSH, sid, buffers);
-            }
+            auto scheme_snapshot = scheme_;
+            auto ok = co_await WriteBuffersAsFramesWithPadding(
+                *stream, *scheme_snapshot, this_packet, kCmdPSH, sid, buffers);
             if (!ok) {
                 CloseAll(ok.error());
                 co_return tl::unexpected(ok.error());
@@ -940,11 +929,9 @@ DialPhysicalSession(
             *new_stream,
             std::span<const uint8_t>(auth_ptr, auth_packet_size));
     } catch (...) {
-        OPENSSL_cleanse(auth_ptr, auth_packet_size);
         new_stream->CloseAbortive();
         throw;
     }
-    OPENSSL_cleanse(auth_ptr, auth_packet_size);
     if (!ok) {
         const bool timed_out =
             proxy::ConsumeOutboundHandshakeTimeout(*new_stream, deadline);
@@ -1158,8 +1145,6 @@ net::awaitable<OutboundProcessResult> Handler::ProcessSession(
         std::shared_ptr<ClientSession> session;
         std::shared_ptr<ClientSession::LogicalStream> logical;
         uint32_t sid = 0;
-        bool is_udp = false;
-        const TargetAddress& original_target;
         bool cancelled = false;
         size_t pending_writes = 0;
 
@@ -1173,14 +1158,10 @@ net::awaitable<OutboundProcessResult> Handler::ProcessSession(
 
         LogicalEndpoint(std::shared_ptr<ClientSession> s,
                         std::shared_ptr<ClientSession::LogicalStream> l,
-                        uint32_t stream_id,
-                        bool udp,
-                        const TargetAddress& target)
+                        uint32_t stream_id)
             : session(std::move(s))
             , logical(std::move(l))
-            , sid(stream_id)
-            , is_udp(udp)
-            , original_target(target) {}
+            , sid(stream_id) {}
 
         net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
             auto payload = co_await logical->ReadPayload();
@@ -1189,13 +1170,6 @@ net::awaitable<OutboundProcessResult> Handler::ProcessSession(
                     co_return buf::MultiBuffer{};
                 }
                 throw transport::LinkError(payload.error());
-            }
-            if (is_udp) {
-                for (auto* buffer : *payload) {
-                    if (buffer && !buffer->IsEmpty()) {
-                        buffer->SetUDP(original_target);
-                    }
-                }
             }
             co_return std::move(*payload);
         }
@@ -1275,9 +1249,7 @@ net::awaitable<OutboundProcessResult> Handler::ProcessSession(
     LogicalEndpoint target_endpoint(
         session,
         logical,
-        sid,
-        is_udp,
-        original_target);
+        sid);
 
     RelayResult result;
     auto relay_endpoint = [&](auto& endpoint) {

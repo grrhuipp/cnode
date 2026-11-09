@@ -3,6 +3,7 @@
 #include "common/asio_types.hpp"
 #include "common/buf/multi_buffer.hpp"
 #include "common/buffer_util.hpp"
+#include "common/byte_reader.hpp"
 #include "common/error.hpp"
 #include "common/target_address.hpp"
 
@@ -58,28 +59,6 @@ struct AddressDecodeResult {
 
 namespace detail {
 
-[[nodiscard]] constexpr size_t AddressMetadataVarintSize(uint64_t value) noexcept {
-    size_t size = 1;
-    while (value >= 0x80) {
-        value >>= 7;
-        ++size;
-    }
-    return size;
-}
-
-[[nodiscard]] inline size_t WriteAddressMetadataVarint(
-    std::span<uint8_t> out, uint64_t value) noexcept {
-    size_t pos = 0;
-    while (value >= 0x80) {
-        if (pos >= out.size()) return 0;
-        out[pos++] = static_cast<uint8_t>((value & 0x7Fu) | 0x80u);
-        value >>= 7;
-    }
-    if (pos >= out.size()) return 0;
-    out[pos++] = static_cast<uint8_t>(value);
-    return pos;
-}
-
 [[nodiscard]] inline bool ReadAddressMetadataVarint(
     std::span<const uint8_t> data, size_t& pos, uint64_t& out) noexcept {
     uint64_t value = 0;
@@ -117,7 +96,7 @@ struct NormalizedMetadataView {
     if (metadata.user_id > 0) {
         out.flags |= kAddressMetaHasUserId;
         out.user_id = static_cast<uint64_t>(metadata.user_id);
-        out.payload_size += AddressMetadataVarintSize(out.user_id);
+        out.payload_size += VarintU64Size(out.user_id);
     }
     std::string_view email = metadata.user_email.substr(
         0, std::min(metadata.user_email.size(), kMaxForwardedEmailLength));
@@ -244,50 +223,39 @@ struct NormalizedMetadataView {
     } else {
         return 0;
     }
-    out_span[port_pos] = static_cast<uint8_t>(target.port >> 8);
-    out_span[port_pos + 1] = static_cast<uint8_t>(target.port);
+    StoreU16BE(out_span.data() + port_pos, target.port);
     if (normalized.payload_size != 0) {
-        std::span<uint8_t> meta_rem = out_span.subspan(base_size);
-        if (meta_rem.size() < 2) return 0;
-        meta_rem[0] = static_cast<uint8_t>(normalized.payload_size);
-        meta_rem[1] = normalized.flags;
-        meta_rem = meta_rem.subspan(2);
-        if ((normalized.flags & kAddressMetaHasUserId) != 0) {
-            const size_t varint_len = detail::WriteAddressMetadataVarint(
-                meta_rem, normalized.user_id);
-            if (varint_len == 0 || varint_len > meta_rem.size()) return 0;
-            meta_rem = meta_rem.subspan(varint_len);
+        ByteWriter meta_writer(
+            out_span.data() + base_size, out_span.size() - base_size);
+        if (!meta_writer.WriteU8(static_cast<uint8_t>(normalized.payload_size)) ||
+            !meta_writer.WriteU8(normalized.flags)) {
+            return 0;
         }
-        if ((normalized.flags & kAddressMetaHasUserEmail) != 0) {
-            const size_t email_len = normalized.user_email.size();
-            if (meta_rem.size() < 1 + email_len) return 0;
-            meta_rem[0] = static_cast<uint8_t>(email_len);
-            std::memcpy(meta_rem.data() + 1,
-                        normalized.user_email.data(),
-                        email_len);
-            meta_rem = meta_rem.subspan(1 + email_len);
+        if ((normalized.flags & kAddressMetaHasUserId) != 0 &&
+            !meta_writer.WriteVarintU64(normalized.user_id)) {
+            return 0;
+        }
+        if ((normalized.flags & kAddressMetaHasUserEmail) != 0 &&
+            (!meta_writer.WriteU8(static_cast<uint8_t>(normalized.user_email.size())) ||
+             !meta_writer.WriteString(normalized.user_email))) {
+            return 0;
         }
         if ((normalized.flags & kAddressMetaHasClientIpv4) != 0) {
             const auto bytes = normalized.client_ip.to_v4().to_bytes();
-            if (meta_rem.size() < bytes.size()) return 0;
-            std::memcpy(meta_rem.data(), bytes.data(), bytes.size());
-            meta_rem = meta_rem.subspan(bytes.size());
+            if (!meta_writer.WriteBytes(bytes.data(), bytes.size())) return 0;
         } else if ((normalized.flags & kAddressMetaHasClientIpv6) != 0) {
             const auto bytes = normalized.client_ip.to_v6().to_bytes();
-            if (meta_rem.size() < bytes.size()) return 0;
-            std::memcpy(meta_rem.data(), bytes.data(), bytes.size());
-            meta_rem = meta_rem.subspan(bytes.size());
+            if (!meta_writer.WriteBytes(bytes.data(), bytes.size())) return 0;
         }
-        if ((normalized.flags & kAddressMetaHasInboundTag) != 0) {
-            const size_t tag_len = normalized.inbound_tag.size();
-            if (meta_rem.size() < 1 + tag_len) return 0;
-            meta_rem[0] = static_cast<uint8_t>(tag_len);
-            std::memcpy(meta_rem.data() + 1,
-                        normalized.inbound_tag.data(),
-                        tag_len);
-            meta_rem = meta_rem.subspan(1 + tag_len);
+        if ((normalized.flags & kAddressMetaHasInboundTag) != 0 &&
+            (!meta_writer.WriteU8(static_cast<uint8_t>(normalized.inbound_tag.size())) ||
+             !meta_writer.WriteString(normalized.inbound_tag))) {
+            return 0;
         }
-        if (!meta_rem.empty()) return 0;
+        if (!meta_writer.Ok() ||
+            meta_writer.Position() != out_span.size() - base_size) {
+            return 0;
+        }
     }
     return size;
 }
@@ -330,10 +298,7 @@ struct NormalizedMetadataView {
     }
     const size_t base_size = body_pos + body_size + (port_first ? 0 : 2);
     size_t total_size = base_size;
-    int64_t meta_user_id = 0;
-    std::string_view meta_email_view{};
-    std::optional<net::ip::address> meta_client_ip{};
-    std::string_view meta_tag_view{};
+    ForwardedMetadataView validated_view{};
     if (!has_metadata) {
         result.required = base_size;
         if (data.size() < base_size) return result;
@@ -372,7 +337,7 @@ struct NormalizedMetadataView {
                 result.required = 0;
                 return result;
             }
-            meta_user_id = static_cast<int64_t>(uid);
+            validated_view.user_id = static_cast<int64_t>(uid);
         }
         if ((flags & kAddressMetaHasUserEmail) != 0) {
             if (meta_pos >= meta.size()) {
@@ -387,9 +352,9 @@ struct NormalizedMetadataView {
                 result.required = 0;
                 return result;
             }
-            meta_email_view = std::string_view(
+            validated_view.user_email = std::string_view(
                 reinterpret_cast<const char*>(meta.data() + meta_pos), email_len);
-            if (meta_email_view.find('\0') != std::string_view::npos) {
+            if (validated_view.user_email.find('\0') != std::string_view::npos) {
                 result.status = AddressDecodeStatus::Invalid;
                 result.required = 0;
                 return result;
@@ -411,7 +376,7 @@ struct NormalizedMetadataView {
                 result.required = 0;
                 return result;
             }
-            meta_client_ip = addr;
+            validated_view.client_ip = addr;
         } else if ((flags & kAddressMetaHasClientIpv6) != 0) {
             if (meta.size() - meta_pos < 16) {
                 result.status = AddressDecodeStatus::Invalid;
@@ -427,7 +392,7 @@ struct NormalizedMetadataView {
                 result.required = 0;
                 return result;
             }
-            meta_client_ip = addr;
+            validated_view.client_ip = addr;
         }
         if ((flags & kAddressMetaHasInboundTag) != 0) {
             if (meta_pos >= meta.size()) {
@@ -442,21 +407,15 @@ struct NormalizedMetadataView {
                 result.required = 0;
                 return result;
             }
-            meta_tag_view = std::string_view(
+            validated_view.inbound_tag = std::string_view(
                 reinterpret_cast<const char*>(meta.data() + meta_pos), tag_len);
-            if (meta_tag_view.find('\0') != std::string_view::npos) {
+            if (validated_view.inbound_tag.find('\0') != std::string_view::npos) {
                 result.status = AddressDecodeStatus::Invalid;
                 result.required = 0;
                 return result;
             }
             meta_pos += tag_len;
         }
-        const ForwardedMetadataView validated_view{
-            .user_id = meta_user_id,
-            .user_email = meta_email_view,
-            .client_ip = meta_client_ip,
-            .inbound_tag = meta_tag_view,
-        };
         if (meta_pos != meta.size() || validated_view.Empty()) {
             result.status = AddressDecodeStatus::Invalid;
             result.required = 0;
@@ -464,8 +423,7 @@ struct NormalizedMetadataView {
         }
     }
     const size_t port_pos = port_first ? 0 : base_size - 2;
-    const uint16_t port = static_cast<uint16_t>(
-        (static_cast<uint16_t>(data[port_pos]) << 8) | data[port_pos + 1]);
+    const uint16_t port = LoadU16BE(data.data() + port_pos);
     if (type == v4_type) {
         net::ip::address_v4::bytes_type bytes{};
         std::memcpy(bytes.data(), data.data() + body_pos, bytes.size());
@@ -479,15 +437,7 @@ struct NormalizedMetadataView {
             reinterpret_cast<const char*>(data.data() + body_pos), body_size), port);
     }
     if (has_metadata) {
-        auto& forwarded = result.forwarded.emplace();
-        forwarded.user_id = meta_user_id;
-        if (!meta_email_view.empty()) {
-            forwarded.user_email.assign(meta_email_view.data(), meta_email_view.size());
-        }
-        forwarded.client_ip = meta_client_ip;
-        if (!meta_tag_view.empty()) {
-            forwarded.inbound_tag.assign(meta_tag_view.data(), meta_tag_view.size());
-        }
+        result.forwarded = ForwardedMetadata::FromView(validated_view);
     }
     result.status = AddressDecodeStatus::Complete;
     result.consumed = total_size;

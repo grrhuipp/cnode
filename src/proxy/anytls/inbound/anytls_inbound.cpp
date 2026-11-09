@@ -713,27 +713,13 @@ net::awaitable<RelayResult> AnyTLSDemuxSession::ReadFrames(AwaitableTaskGroup& t
         // The dispatcher can retire this stream during any following await.
         // Retain the stream itself, never an iterator into the live index.
         const auto sub = FindStream(sid);
-        if (!sub) {
+        if (!sub || header->cmd == anytls::kCmdFIN || sub->IsClosed()) {
             if (auto ok = co_await anytls::DiscardFramePayload(*stream_, header->length); !ok) {
                 result.error = ok.error();
                 break;
             }
-            continue;
-        }
-
-        if (header->cmd == anytls::kCmdFIN) {
-            if (auto ok = co_await anytls::DiscardFramePayload(*stream_, header->length); !ok) {
-                result.error = ok.error();
-                break;
-            }
-            sub->CloseRemote();
-            continue;
-        }
-
-        if (sub->IsClosed()) {
-            if (auto ok = co_await anytls::DiscardFramePayload(*stream_, header->length); !ok) {
-                result.error = ok.error();
-                break;
+            if (sub && header->cmd == anytls::kCmdFIN) {
+                sub->CloseRemote();
             }
             continue;
         }
@@ -794,7 +780,7 @@ AuthenticateSession(
     ConnectionLimiter* limiter,
     session::Context& ctx,
     const TimeoutsConfig& timeouts,
-    uint32_t pressure_idle_timeout) {
+    std::chrono::seconds control_idle_timeout) {
     std::array<uint8_t, 32> auth_hash{};
     struct CleanseHash {
         std::array<uint8_t, 32>& buf;
@@ -812,12 +798,6 @@ AuthenticateSession(
         co_await proxy::RecordInboundAuthFailure(
             limiter, ctx, "no matching credential", credential.key);
         co_return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
-    }
-    auto control_idle_timeout = timeouts.IdleTimeout();
-    if (pressure_idle_timeout > 0) {
-        control_idle_timeout = std::min(
-            control_idle_timeout,
-            std::chrono::seconds(pressure_idle_timeout));
     }
     stream.SetReadTimeout(std::chrono::seconds(0));
     stream.SetWriteTimeout(
@@ -861,21 +841,21 @@ Handler::Process(
         co_return proxy::RejectInbound(*stats_, stream.get(), ErrorCode::BLOCKED);
     }
 
-    UserOnlineSessionGuard user_session;
-    {
-        auto auth = co_await AuthenticateSession(
-            *stream, validator_, limiter_, ctx, timeouts, pressure_idle_timeout);
-        if (!auth) {
-            co_return proxy::RejectInbound(*stats_, stream.get(), auth.error());
-        }
-        user_session = std::move(*auth);
-    }
-
     auto control_idle_timeout = timeouts.IdleTimeout();
     if (pressure_idle_timeout > 0) {
         control_idle_timeout = std::min(
             control_idle_timeout,
             std::chrono::seconds(pressure_idle_timeout));
+    }
+
+    UserOnlineSessionGuard user_session;
+    {
+        auto auth = co_await AuthenticateSession(
+            *stream, validator_, limiter_, ctx, timeouts, control_idle_timeout);
+        if (!auth) {
+            co_return proxy::RejectInbound(*stats_, stream.get(), auth.error());
+        }
+        user_session = std::move(*auth);
     }
     AnyTLSDemuxSession demux(
         std::move(stream),

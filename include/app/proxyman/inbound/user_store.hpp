@@ -53,30 +53,10 @@ public:
         Profile profile;
     };
 
-    struct VlessCredential {
-        std::array<uint8_t, 16> uuid_bytes{};
-        std::string flow;
-        Profile profile;
-    };
-
-    struct ShadowsocksCredential {
-        PreparedKeyBytes derived_key;
-        PreparedKeyBytes identity_key;
-        std::array<uint8_t, 16> psk_hash{};
-        size_t key_size = 32;
-        size_t salt_size = 32;
-        Profile profile;
-    };
-
-    struct AnyTlsCredential {
-        std::array<uint8_t, 32> password_hash{};
-        Profile profile;
-    };
-
-    struct HysteriaCredential {
-        std::array<uint8_t, 32> credential_hash{};
-        Profile profile;
-    };
+    using VlessCredential = PreparedVlessUser;
+    using ShadowsocksCredential = PreparedShadowsocksUser;
+    using AnyTlsCredential = PreparedAnyTlsUser;
+    using HysteriaCredential = PreparedHysteriaUser;
 
     using VmessUserMap = std::vector<VmessCredential>;
     using TrojanUserMap =
@@ -111,19 +91,6 @@ public:
             return users
                 ? std::shared_ptr<const VmessCredential>(users, &user)
                 : std::shared_ptr<const VmessCredential>{};
-        }
-    };
-
-    struct VlessUsersView {
-        std::shared_ptr<const VlessUserMap> users;
-
-        [[nodiscard]] bool empty() const noexcept { return !users || users->empty(); }
-        [[nodiscard]] size_t size() const noexcept { return users ? users->size() : 0; }
-        [[nodiscard]] std::shared_ptr<const VlessCredential>
-        Share(const VlessCredential& user) const noexcept {
-            return users
-                ? std::shared_ptr<const VlessCredential>(users, &user)
-                : std::shared_ptr<const VlessCredential>{};
         }
     };
 
@@ -183,7 +150,6 @@ public:
     };
 
     [[nodiscard]] static VmessUsersView VmessUsers(std::string_view tag);
-    [[nodiscard]] static VlessUsersView VlessUsers(std::string_view tag);
     [[nodiscard]] static std::shared_ptr<const VlessCredential>
     FindVlessUser(std::string_view tag,
                   const std::array<uint8_t, 16>& uuid_bytes);

@@ -43,7 +43,7 @@ void ApplyHttpRealIp(
     // Forwarded address headers do not reliably carry the original client
     // port. Zero is explicit unknown; retaining the CDN port is a false tuple.
     ctx.inbound.source_port = 0;
-    ctx.inbound.client_ip_source = "http_header";
+    ctx.inbound.client_ip_source = session::Inbound::ClientIpSource::HttpHeader;
     LOG_CONN_DEBUG(
         ctx,
         "HTTP transport client address overridden by header: {} -> {}",
@@ -64,7 +64,7 @@ void ApplyProxyProtocolResult(
     ctx.inbound.source_addr = normalized_addr;
     ctx.inbound.source_ip = normalized_ip.View();
     ctx.inbound.source_port = result.src_port;
-    ctx.inbound.client_ip_source = "proxy_protocol";
+    ctx.inbound.client_ip_source = session::Inbound::ClientIpSource::ProxyProtocol;
     LOG_CONN_DEBUG(
         ctx,
         "PROXY protocol applied proxy={} real_ip={}:{}",
@@ -127,7 +127,6 @@ public:
                                const TimeoutsConfig& timeouts,
                                const session::Context& base_ctx,
                                SessionIdentity identity,
-                               InboundTransportMetadata metadata,
                                std::shared_ptr<ConnectionLimiter::Family> family)
         : handler_(std::move(handler))
         , io_context_(io_context)
@@ -135,21 +134,14 @@ public:
         , stats_(stats)
         , request_load_(request_load)
         , timeouts_(timeouts)
-        , metadata_(std::move(metadata))
         , family_(std::move(family)) {
         base_ctx_.InitSubstreamFrom(base_ctx);
         base_ctx_.conn_id = base_ctx.conn_id;
-        base_ctx_.accept_time_us = base_ctx.accept_time_us;
         if (identity == SessionIdentity::Unauthenticated) {
             base_ctx_.inbound.user_id = 0;
             base_ctx_.inbound.user_email.clear();
         }
     }
-
-    [[nodiscard]] InboundTransportMetadata& Metadata() noexcept {
-        return metadata_;
-    }
-
     void OnInboundTransportReady(AsyncStream& stream) override {
         if (stream.ConsumePhaseDeadline()) {
             throw transport::LinkError(ErrorCode::TIMEOUT);
@@ -193,7 +185,6 @@ private:
     app::RequestLoadState& request_load_;
     TimeoutsConfig timeouts_;
     session::Context base_ctx_;
-    InboundTransportMetadata metadata_;
     std::shared_ptr<ConnectionLimiter::Family> family_;
 };
 
@@ -219,7 +210,7 @@ std::shared_ptr<InboundTransportStreamHandler> Handler::NewAuthenticatedStreamSi
     return memory::AllocateShared<LogicalTransportStreamSink>(
         shared_from_this(), io_context, dispatcher, stats, request_load, timeouts,
         session_ctx, LogicalTransportStreamSink::SessionIdentity::Authenticated,
-        InboundTransportMetadata{}, std::move(family));
+        std::move(family));
 }
 
 net::awaitable<void> Handler::ProcessPreparedTransportStream(
@@ -238,11 +229,6 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
     // Protocol substreams (Mux.Cool, AnyTLS) inside this logical stream
     // reserve against the same physical family.
     ctx.inbound.connection_family = family;
-
-    if (!stream) {
-        stats.OnError();
-        co_return;
-    }
 
     auto admission = co_await limiter_.ReserveLogical(
         family, ctx.inbound.tag, ctx.inbound.source_ip,
@@ -371,7 +357,6 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
 
     InboundTransportMetadata local_metadata;
     local_metadata.real_ip_header.assign(RealIpHeader(listener.stream_settings));
-    InboundTransportMetadata* transport_metadata = &local_metadata;
     std::shared_ptr<LogicalTransportStreamSink> logical_stream_handler;
     if (listener.stream_settings.IsGrpc() ||
         listener.stream_settings.IsHttp() ||
@@ -385,13 +370,8 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
             timeouts,
             ctx,
             LogicalTransportStreamSink::SessionIdentity::Unauthenticated,
-            std::move(local_metadata), connection_limit.FamilyLease());
-        transport_metadata = &logical_stream_handler->Metadata();
+            connection_limit.FamilyLease());
     }
-    // HTTP/1 handshakes drop their sink reference before returning the
-    // stream; keep the sink that owns the extracted metadata until read.
-    auto metadata_owner = logical_stream_handler;
-
     // The physical reservation above stays held while a REALITY fallback runs
     // inside the transport build.
     const InboundFallbackContext fallback{
@@ -403,7 +383,7 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
         security_.Context(),
         ctx.conn_id,
         std::move(logical_stream_handler),
-        transport_metadata,
+        &local_metadata,
         &fallback);
     if (!build_result) {
         LOG_CONN_DEBUG(ctx, "transport handshake failed security={} network={}",
@@ -420,9 +400,7 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
         co_return;
     }
 
-    ApplyHttpRealIp(ctx, transport_metadata->real_ip);
-
-    metadata_owner.reset();
+    ApplyHttpRealIp(ctx, local_metadata.real_ip);
     local_metadata = {};
     auto ip_admission = co_await limiter_.ReserveIP(
         ctx.inbound.tag, ctx.inbound.source_ip,

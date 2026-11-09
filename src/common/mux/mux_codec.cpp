@@ -94,8 +94,7 @@ constexpr size_t kMaxFramePrefixBytes = 2 + kMaxFrameMetadataBytes + 2;
         return std::nullopt;
     }
 
-    const uint16_t meta_len = static_cast<uint16_t>(
-        (static_cast<uint16_t>(prefix[0]) << 8) | prefix[1]);
+    const uint16_t meta_len = LoadU16BE(prefix.data());
     if (meta_len < 4 || meta_len > kMaxFrameMetadataBytes) {
         return FrameHeader{};
     }
@@ -115,8 +114,7 @@ constexpr size_t kMaxFramePrefixBytes = 2 + kMaxFrameMetadataBytes + 2;
         if (prefix.size() < frame_size + 2) {
             return std::nullopt;
         }
-        const uint16_t data_len = static_cast<uint16_t>(
-            (static_cast<uint16_t>(prefix[frame_size]) << 8) | prefix[frame_size + 1]);
+        const uint16_t data_len = LoadU16BE(prefix.data() + frame_size);
         frame_size += 2 + static_cast<size_t>(data_len);
         if (total_len < frame_size) {
             return std::nullopt;
@@ -139,15 +137,13 @@ std::optional<FrameHeader> DecodeFrame(const buf::MultiBuffer& data) {
     const auto front = data.FrontSpan();
     uint16_t meta_len = 0;
     if (front.size() >= 2) {
-        meta_len = static_cast<uint16_t>(
-            (static_cast<uint16_t>(front[0]) << 8) | front[1]);
+        meta_len = LoadU16BE(front.data());
     } else {
         std::array<uint8_t, 2> len_bytes{};
         if (data.CopyPrefixTo(len_bytes) < 2) {
             return std::nullopt;
         }
-        meta_len = static_cast<uint16_t>(
-            (static_cast<uint16_t>(len_bytes[0]) << 8) | len_bytes[1]);
+        meta_len = LoadU16BE(len_bytes.data());
     }
     if (meta_len < 4 || meta_len > kMaxFrameMetadataBytes) {
         return FrameHeader{};
@@ -173,10 +169,8 @@ std::optional<FrameHeader> DecodeFrame(const buf::MultiBuffer& data) {
     if (out.size() < 6) {
         return 0;
     }
-    out[0] = 0;
-    out[1] = 0;
-    out[2] = static_cast<uint8_t>(session_id >> 8);
-    out[3] = static_cast<uint8_t>(session_id & 0xFF);
+    StoreU16BE(out.data(), 0);
+    StoreU16BE(out.data() + 2, session_id);
     out[4] = static_cast<uint8_t>(status);
     out[5] = option;
     return 6;
@@ -196,12 +190,9 @@ std::optional<FrameHeader> DecodeFrame(const buf::MultiBuffer& data) {
     if (out.size() < total_len) {
         return 0;
     }
-    const uint16_t meta_len = static_cast<uint16_t>(meta_end - 2);
-    out[0] = static_cast<uint8_t>(meta_len >> 8);
-    out[1] = static_cast<uint8_t>(meta_len & 0xFF);
+    StoreU16BE(out.data(), static_cast<uint16_t>(meta_end - 2));
     if (has_data) {
-        out[meta_end] = static_cast<uint8_t>(payload_len >> 8);
-        out[meta_end + 1] = static_cast<uint8_t>(payload_len & 0xFF);
+        StoreU16BE(out.data() + meta_end, static_cast<uint16_t>(payload_len));
     }
     return total_len;
 }

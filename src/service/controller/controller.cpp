@@ -99,12 +99,13 @@ Controller::Impl::PanelRuntime::PanelRuntime(
     controller::NodeMutationGate& gate, net::any_io_executor executor)
     : client(ValidatePanelRuntimeArgs(std::move(api), source))
     , config(source)
-    , accounting_key(naming::BuildPanelNodeAccountingKey(config.Name, config.NodeIDs.Front()))
+    , node_id(config.NodeIDs.Front())
+    , log_context{config.Name, config.APIHost, node_id, config.NodeType}
+    , accounting_key(naming::BuildPanelNodeAccountingKey(config.Name, node_id))
     , mutation(gate, std::move(executor), node) {
     traffic_journal = std::make_unique<controller::TrafficJournal>(config);
     const auto unknown = traffic_journal->UnknownCount();
     if (unknown != 0) {
-        const PanelLogContext log_context{config.Name, config.APIHost, config.NodeIDs.Front(), config.NodeType};
         LOG_PANEL_ERROR(log_context, "Traffic accounting requires reconciliation: unknown_records={} directory={}",
                         unknown, traffic_journal->Directory().string());
     }
@@ -132,7 +133,7 @@ void Controller::Impl::Start() {
             auto& slot = kind == LoopKind::Sync ? panel->sync_loop : panel->status_loop;
             if (!slot.expired()) continue;
             const auto name = std::format("{}/{} {}",
-                panel->config.Name, panel->config.NodeIDs.Front(),
+                panel->config.Name, panel->node_id,
                 kind == LoopKind::Sync ? "sync" : "status");
             auto self = shared_from_this();
             auto loop = std::make_shared<monitor_detail::MonitorLoop>(
@@ -143,21 +144,19 @@ void Controller::Impl::Start() {
                 },
                 [self, panel, kind](std::string_view loop_name, std::exception_ptr failure) {
                     if (self->stopping_ && !failure) return;
-                    const PanelLogContext log_context{panel->config.Name, panel->config.APIHost,
-                        panel->config.NodeIDs.Front(), panel->config.NodeType};
                     if (kind == LoopKind::Sync) {
                         panel->state = PanelState::Unavailable;
                     }
                     if (!failure) {
-                        LOG_PANEL_WARN(log_context, "Panel monitor stopped unexpectedly: loop={}", loop_name);
+                        LOG_PANEL_WARN(panel->log_context, "Panel monitor stopped unexpectedly: loop={}", loop_name);
                         return;
                     }
                     try {
                         std::rethrow_exception(failure);
                     } catch (const std::exception& error) {
-                        LOG_PANEL_ERROR(log_context, "Panel monitor failed: loop={} reason={}", loop_name, error.what());
+                        LOG_PANEL_ERROR(panel->log_context, "Panel monitor failed: loop={} reason={}", loop_name, error.what());
                     } catch (...) {
-                        LOG_PANEL_ERROR(log_context, "Panel monitor failed: loop={} reason=unknown exception", loop_name);
+                        LOG_PANEL_ERROR(panel->log_context, "Panel monitor failed: loop={} reason=unknown exception", loop_name);
                     }
                 });
             slot = loop;
@@ -202,7 +201,7 @@ std::vector<Controller::NodeStatsInfo> Controller::Impl::GetNodeStats() const {
         info.panel_name  = panel->config.Name;
         info.panel_host  = panel->config.APIHost;
         info.node_type   = panel->config.NodeType;
-        info.node_id     = panel->config.NodeIDs.Front();
+        info.node_id     = panel->node_id;
         info.network      = std::string(ResolvedNodeNetwork(state));
         info.port       = state.config.Port;
         info.total_users  = state.users ? state.users->size() : 0;
@@ -217,8 +216,7 @@ std::vector<Controller::NodeStatsInfo> Controller::Impl::GetNodeStats() const {
 net::awaitable<void> Controller::Impl::panelSyncLoop(
     PanelRuntime& panel) {
     using Clock = std::chrono::steady_clock;
-    const PanelLogContext log_context{panel.config.Name, panel.config.APIHost,
-        panel.config.NodeIDs.Front(), panel.config.NodeType};
+    const auto& log_context = panel.log_context;
     auto next_pull = Clock::now();
     // Match v2node reporting semantics: the first traffic/online snapshot
     // needs one complete push interval to accumulate meaningful activity.
@@ -322,9 +320,9 @@ net::awaitable<void> Controller::Impl::panelStatusLoop(const PanelRuntime& panel
 }
 
 net::awaitable<void> Controller::Impl::nodeInfoMonitor(PanelRuntime& panel) {
-    const int node_id = panel.config.NodeIDs.Front();
+    const int node_id = panel.node_id;
     const auto& panel_name = panel.config.Name;
-    const PanelLogContext log_context{panel_name, panel.config.APIHost, node_id, panel.config.NodeType};
+    const auto& log_context = panel.log_context;
 
     controller::NodeRuntime runtime(io_context_, workers_, panel.config, panel.node, stopping_);
 
@@ -451,7 +449,7 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(PanelRuntime& panel) {
             other->config.ListenIP.Overlaps(panel.config.ListenIP)) {
             throw std::runtime_error(std::format(
                 "panel listener endpoint conflict owner={}/{} port={}",
-                other->config.Name, other->config.NodeIDs.Front(), change.next->config.Port));
+                other->config.Name, other->node_id, change.next->config.Port));
         }
     }
     co_await controller::ApplyNodeChange(runtime, panel.node, std::move(change));
@@ -464,8 +462,7 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(PanelRuntime& panel) {
 }
 
 void Controller::Impl::logPanelStatus(const PanelRuntime& panel) const {
-    const PanelLogContext log_context{panel.config.Name, panel.config.APIHost,
-        panel.config.NodeIDs.Front(), panel.config.NodeType};
+    const auto& log_context = panel.log_context;
     const std::string_view state_text = [&]() -> std::string_view {
         switch (panel.state) {
             case PanelState::Connecting: return "connecting";

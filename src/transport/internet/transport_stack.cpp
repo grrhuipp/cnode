@@ -521,9 +521,7 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
     }
 
     const std::string_view sni = tls_server_name.empty()
-        ? (s.IsReality() && !s.reality.server_name.empty()
-               ? std::string_view(s.reality.server_name)
-               : std::string_view(s.tls.server_name))
+        ? ResolveOutboundTlsServerName(s, {})
         : tls_server_name;
     // Host for HTTP-based layers unless the transport config names one.
     const std::string_view dial_host = ws_host.empty() ? sni : ws_host;
@@ -636,9 +634,7 @@ net::awaitable<TransportBuildResult> BuildOutboundXHttpClientRequest(
     }
 
     const std::string_view sni = tls_server_name.empty()
-        ? (s.IsReality() && !s.reality.server_name.empty()
-               ? std::string_view(s.reality.server_name)
-               : std::string_view(s.tls.server_name))
+        ? ResolveOutboundTlsServerName(s, {})
         : tls_server_name;
     std::unique_ptr<AsyncStream> stream = std::move(raw);
     if (s.IsTlsLike()) {

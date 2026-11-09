@@ -23,7 +23,7 @@
 #include <cstdlib>
 #include <exception>
 #include <format>
-#include <functional>
+#include <span>
 #include <thread>
 #include <stdexcept>
 
@@ -31,7 +31,7 @@ namespace {
 
 net::awaitable<void> StartWorkerInbounds(
     Worker& worker,
-    std::vector<PreparedInbound> inbounds) {
+    std::span<const PreparedInbound> inbounds) {
     worker.StartRuntime();
 
     for (const auto& inbound : inbounds) {
@@ -45,8 +45,9 @@ net::awaitable<void> StartWorkerInbounds(
     }
 }
 
+template <typename StopFn>
 [[nodiscard]] std::unique_ptr<net::signal_set> InstallShutdownHandler(
-    net::io_context& io_context, std::function<void()> request_stop) {
+    net::io_context& io_context, StopFn request_stop) {
     auto signals = std::make_unique<net::signal_set>(io_context);
     signals->add(SIGINT);
     signals->add(SIGTERM);

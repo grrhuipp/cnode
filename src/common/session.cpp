@@ -1,5 +1,4 @@
 #include "common/session.hpp"
-#include "common/clock.hpp"
 #include "common/ip_utils.hpp"
 #include "common/network.hpp"
 
@@ -25,7 +24,6 @@ void Context::InitSubstreamFrom(const Context& parent, uint16_t sub_source_port)
 
     worker_id = parent_worker_id;
     conn_id = NewID(worker_id);
-    accept_time_us = NowMicros();
     if (&parent != this) {
         inbound = parent.inbound;
     }

@@ -77,6 +77,7 @@ private:
     bool spilled_ = false;
 };
 
+struct PaddingRecord;
 class PaddingScheme;
 
 [[nodiscard]] memory::ThreadLocalString ClientSettings(const PaddingScheme& scheme);
@@ -93,6 +94,11 @@ WriteAll(AsyncStream& stream, std::span<const uint8_t> data);
 
 net::awaitable<tl::expected<void, ErrorCode>>
 WriteFrame(AsyncStream& stream, uint8_t cmd, uint32_t sid, std::span<const uint8_t> payload);
+
+net::awaitable<tl::expected<void, ErrorCode>>
+WritePacketWithPadding(AsyncStream& stream,
+                       std::span<const PaddingRecord> record_rules,
+                       memory::ByteVector packet);
 
 net::awaitable<tl::expected<void, ErrorCode>>
 WritePacketWithPadding(AsyncStream& stream,

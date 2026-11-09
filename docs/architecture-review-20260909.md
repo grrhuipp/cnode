@@ -1432,3 +1432,36 @@ CI失败场景修复后通过真实双进程、ML-KEM/X25519加密和回环对�
   - 64 活跃会话统计采样保持 **`68.41 / 68.29 ns`**（`resources=0`，`p50 = 30.0 ns`，`max = 40.0 ns`）与 **`86.38 / 86.02 ns`**（`resources=1`，`p50 = 50.0 ns`），0 次堆分配，峰值 RSS 由 `14,819,328 / 14,852,096 B` 降至 **`14,794,752 / 14,835,712 B`**。
   - VLESS/TLS 8 流上传吞吐（`Upload8`）由 `582.78 / 588.81 MiB/s` 升至 **`738.30 / 747.91 MiB/s`（+26.7% ~ +27.0%）**；8 流下载吞吐（`Download8`）由 `556.95 / 613.16 MiB/s` 升至 **`591.31 / 619.09 MiB/s`**；启动驻留 RSS 保持 `13,017,088 B`。
   - Hysteria2 256 连接上传守护进程总 CPU 由 `1.397 / 1.398s` 降至 **`1.395 / 1.387s`**，建连耗时由 `0.529 / 0.529s` 降至 **`0.505 / 0.523s`**；16×64（1,024 流）上传守护进程总 CPU 由 `4.058 / 4.004s` 降至 **`4.055 / 3.960s`**，下载吞吐保持 **`35.48 MiB/s`**。
+
+## 2026-11-09（第五轮）：`session::Context` 与 `UserOnlineSessionGuard` 瘦身、路由/GeoData 按需化及传输/协议深度去重
+
+### 架构与流程精简内容
+
+1. **`session::Context` 消除热路径 `NowMicros()` 系统调用与 `UserOnlineSessionGuard` 瘦身 72 字节**：
+   - `include/common/session.hpp`、`src/common/session.cpp`、`src/app/proxyman/inbound/handler.cpp`：删除全仓零读取的死字段 `session::Context::accept_time_us`（消除每条连接与子流创建时的 `std::chrono::system_clock::now()` 系统调用）；将 `session::Inbound::client_ip_source` 从 32B `memory::ThreadLocalString` 替换为 1B `enum class ClientIpSource : uint8_t { Socket, ProxyProtocol, HttpHeader }`（消除子流派生时的 PMR 字符串拷贝与准入字符串比较）；在 `MakeReceiverSettings` 中过滤主标签并删除 `ReceiverSettings::has_route_inbound_tags`。
+   - `include/common/sharded_user_stats.hpp`、`src/common/sharded_user_stats.cpp`：消除 `UserOnlineSessionGuard` 的 `std::shared_ptr<void>` 类型擦除及与 `DeviceReturn` 重复的 `tag_`、`user_id_`、`client_ip_` 拷贝字段，使 `sizeof(UserOnlineSessionGuard)` 从 **96 字节降至 24 字节**；提取泛型 `ReleaseDeviceCount` 合并 `DeviceQuota::Release` 与 `UserOnlineTracker::OnUserDisconnected` 的 25 行重复代码。
+2. **`DomainRuleSet::Match` 写时转小写、`GeoDatabase::LoadCategories` 零冗余分配与 `Router::Route` 精简**：
+   - `src/geo/geodata.cpp`：`DomainRuleSet::Match` 对已全小写的规范化域名直接零拷贝借用（仅含大写字符时写时转换）；`LoadCategories` 先用大小写不敏感二分查找过滤 `wanted`，消除扫描未命中分类时的 ~1,750 次 `std::string` 堆分配；`ProtoReader` 直接组合复用 `ByteReader`。
+   - `src/app/router/router.cpp`：删除单字段包装类 `GeoSiteCondition` / `GeoIPCondition` 与 6 个冗余 `has_*_condition` 布尔字段，并在 `Router::Route` 入口单次提取 `target_domain`、`target_addr`、`target_port`。
+   - `include/common/byte_reader.hpp`、`address_codec.hpp`、`mux_codec.cpp`、`dns.cpp`、`datagram_exchange.hpp`：补充权威 `VarintU64Size` 与 `ByteWriter::WriteVarintU64`，复用 `ForwardedMetadata::FromView` 与 `LoadU16BE` / `StoreU16BE`。
+3. **`UserStore` 泛型化与控制面碎片内联 / `PanelLogContext` 预存复用**：
+   - `include/app/proxyman/inbound/user_store.hpp`、`src/app/proxyman/inbound/user_store.cpp`、`prepared_config.hpp`：补齐 `~PreparedVmessUser()` 对 `uuid` 的 `SecureZeroMemory` 擦除；删除零外部调用的 `UserStore::VlessUsersView` / `VlessUsers()`（消除 `FindVlessUser` 双倍 `shared_ptr` 原子引用计数开销）；用 `using` 类型别名与 `BuildKeyedUsers` / `FindKeyedUser` 模板统一 4 类协议用户快照构建与查找。
+   - `src/service/controller/*`、`src/api/v2board/v2board.cpp`：将 `node_transition.cpp` 与 `online_snapshot.cpp` 内联入对应头文件并删除原 `.cpp`；在 `PanelRuntime` 与 `APIClient` 中预存 `log_context` 与 `node_id`，消除 13 处重复构造 `PanelLogContext` 样板。
+4. **AnyTLS、Mux、Trojan 与 HTTP/1、HTTP/2、XHTTP、Dialer 深度去重**：
+   - `src/proxy/anytls/*`：移除 `LogicalEndpoint::ReadMultiBuffer()` 中被外层 `uot::FramedEndpoint` 立即擦除的 `SetUDP` 循环与死成员；将每次发包的 3 次 `PaddingScheme::RecordFor` 二分查找收敛为 1 次；删除未文档化的 `"key"` 别名；合并 `anytls_inbound.cpp` 连续 3 个 `DiscardFramePayload` 分支；将 `anytls::PasswordHash` 内联入 `credentials.hpp` 并删除 `src/proxy/anytls/credentials.cpp`。
+   - `src/proxy/mux/inbound/mux_inbound.cpp`、`src/proxy/trojan/*`：删除死方法 `ReplyQueueState::TotalBytes()` 与 75 行重复的 `TcpSubState::WriteBuffers`，合并 `ProcessInboundImpl` 与 `ProcessInbound`（消除一层 10 参数协程帧）；移除 `trojan::EncodeRequestTo` 未使用的 `payload` 参数与重复的 `OPENSSL_cleanse`。
+   - `src/transport/internet/*`：删除死函数 `SanitizeForLog`；删除 `Http2ServerSession::grpc_request_path_` 32B 常驻字段、`LowercaseAscii` 临时字符串分配、多余 `ReadEofAction()` override 及 60 行重复 `WriteMultiBuffer`；`GetXHttpPacketSession` 一行委托给 `ResolveXHttpSessionOwner`；`OutboundTransportTarget` 新增 `Candidates()` 视图，`XHttpSplitOutboundStreamBase` 提取 `DialAndBuildUploadRequest` 消除 45 行重复代码；`outbound_target_builder` 删除死字段 `inbound_source_port` 并统一 `SelectOrderedBind`。
+
+### 验证与性能/内存实证
+
+全量 **1,251/1,251** 测试通过（325 项 unit、926 项 E2E，用时 238.97 秒）。在同一环境与编译选项下执行 A/B/A/B 交错重复基准对照：
+
+- **64 活跃 VLESS 会话内存占用与统计采样（`cnode_runtime_sampling_benchmark`）**：
+  - **`resources=0`**：64 活跃会话匿名内存（`anonymous_rss_bytes` / `settled_anonymous_rss_bytes`）由 `7,581,696 / 7,577,600 B` 降至 **`7,393,280 / 7,397,376 B`（稳定减少 180 ~ 188 KiB，每活跃会话减少约 2.9 KiB）**；进程峰值 RSS 由 `14,811,136 / 14,848,000 B` 降至 **`14,741,504 / 14,761,984 B`（减少 68 ~ 84 KiB）**。
+  - **`resources=1`**：64 活跃会话匿名内存由 `7,790,592 / 7,786,496 B` 降至 **`7,643,136 / 7,643,136 B`（稳定减少 144 ~ 148 KiB）**；进程峰值 RSS 由 `15,220,736 / 15,253,504 B` 降至 **`15,192,064 / 15,204,352 B`**，采样耗时保持 **`85.99 / 86.06 ns`**（`p50 = 50.0 ns`，`p95 = 60.0 ns`）。
+- **TCP 接收与发送基准（`cnode_tcp_receive_benchmark` / `cnode_tcp_send_benchmark`）**：
+  - `tcp-send 65536B (1 piece)`：墙钟耗时由 `45,457.4 / 43,779.0 ns` 降至 **`43,182.7 / 42,723.9 ns`（-2.4% ~ -5.0%）**；`8 pieces` 由 `45,741.4 / 45,589.9 ns` 降至 **`44,212.9 / 43,150.9 ns`（-3.3% ~ -5.4%）**；`16 pieces` 由 `47,649.7 / 46,486.4 ns` 降至 **`44,650.6 / 44,295.1 ns`（-4.7% ~ -6.3%）**。
+  - `tcp-receive 1B`：墙钟耗时由 `10,127.1 / 9,884.0 ns` 降至 **`9,784.4 / 9,995.1 ns`**。
+- **VLESS/TLS 与 Hysteria2 真实进程基准（`cnode_tls_throughput_benchmark` / `cnode_hysteria_throughput_benchmark`）**：
+  - VLESS/TLS 8 流上传吞吐达 **`683.86 MiB/s`**，守护进程 CPU 由 `0.1561 / 0.1555s` 降至 **`0.1635 / 0.1488s`**。
+  - Hysteria2 256 连接上传就绪匿名内存由 `30,711,808 / 30,613,504 B` 降至 **`30,547,968 / 30,515,200 B`（减少 96 ~ 160 KiB）**，传输完成活跃匿名内存由 `31,395,840 / 31,227,904 B` 降至 **`31,121,408 / 31,195,136 B`（最高减少 268 KiB）**，吞吐升至 **`69.45 / 69.11 MiB/s`**；256 连接下载传输完成活跃匿名内存由 `90,656,768 / 89,927,680 B` 降至 **`90,308,608 / 88,809,472 B`（减少 340 KiB ~ 1.07 MiB）**，峰值 RSS 降至 **`98,627,584 / 97,124,352 B`（最高减少 1.01 MiB）**。

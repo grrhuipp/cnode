@@ -140,10 +140,6 @@ ParseTrojanRequest(AsyncStream& stream,
     }
 
     auto& request = decoded.request;
-    struct CleansePasswordHash {
-        ::trojan::PasswordHash& hash;
-        ~CleansePasswordHash() noexcept { OPENSSL_cleanse(hash.data(), hash.size()); }
-    } cleanse_password_hash{request.password_hash};
     OPENSSL_cleanse(handshake_buf.data(), handshake_buf.size());
     const auto credential = co_await proxy::VerifyInboundCredential(
         limiter, ctx, proxyman::inbound::UserProtocol::Trojan,

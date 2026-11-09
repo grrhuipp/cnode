@@ -10,6 +10,31 @@
 
 
 namespace {
+template <typename Map>
+void ReleaseDeviceCount(Map& devices,
+                        std::string_view tag,
+                        uint64_t user_id,
+                        std::string_view ip) noexcept {
+    const auto tag_it = devices.find(tag);
+    if (tag_it == devices.end()) return;
+    const auto user_it = tag_it->second.find(user_id);
+    if (user_it == tag_it->second.end()) return;
+    const auto ip_it = user_it->second.find(ip);
+    if (ip_it == user_it->second.end()) return;
+    if (--ip_it->second == 0) {
+        user_it->second.erase(ip_it);
+        MaybeShrinkHashContainer(user_it->second, 8);
+    }
+    if (user_it->second.empty()) {
+        tag_it->second.erase(user_it);
+        MaybeShrinkHashContainer(tag_it->second, 8);
+    }
+    if (tag_it->second.empty()) {
+        devices.erase(tag_it);
+        MaybeShrinkHashContainer(devices, 8);
+    }
+}
+
 struct DeviceQuota {
     using IpMap = std::unordered_map<std::string, uint32_t,
                                     TransparentStringHash, TransparentStringEq>;
@@ -17,24 +42,7 @@ struct DeviceQuota {
     std::unordered_map<std::string, Users, TransparentStringHash, TransparentStringEq> devices;
 
     void Release(std::string_view tag, uint64_t user, std::string_view ip) noexcept {
-        const auto tag_it = devices.find(tag);
-        if (tag_it == devices.end()) return;
-        const auto user_it = tag_it->second.find(user);
-        if (user_it == tag_it->second.end()) return;
-        const auto ip_it = user_it->second.find(ip);
-        if (ip_it == user_it->second.end()) return;
-        if (--ip_it->second == 0) {
-            user_it->second.erase(ip_it);
-            MaybeShrinkHashContainer(user_it->second, 8);
-        }
-        if (user_it->second.empty()) {
-            tag_it->second.erase(user_it);
-            MaybeShrinkHashContainer(tag_it->second, 8);
-        }
-        if (tag_it->second.empty()) {
-            devices.erase(tag_it);
-            MaybeShrinkHashContainer(devices, 8);
-        }
+        ReleaseDeviceCount(devices, tag, user, ip);
     }
 };
 
@@ -56,7 +64,9 @@ struct DeviceReturn final : GroupCoordinator::ReservedOperation {
     void Invoke() noexcept override { quota->Release(tag, user, ip); }
 };
 
-struct DeviceReservation {
+} // namespace
+
+struct UserOnlineTracker::DeviceReservation {
     std::unique_ptr<DeviceReturn> node;
     ~DeviceReservation() {
         if (node && node->admitted) {
@@ -65,7 +75,16 @@ struct DeviceReservation {
         }
     }
 };
-} // namespace
+
+void UserOnlineSessionGuard::Reset() noexcept {
+    if (auto* tracker = std::exchange(tracker_, nullptr)) {
+        if (quota_reservation_ && quota_reservation_->node) {
+            const auto& node = *quota_reservation_->node;
+            tracker->OnUserDisconnected(node.tag, node.user, node.ip);
+        }
+    }
+    quota_reservation_.reset();
+}
 
 struct UserOnlineTracker::Impl : memory::ThreadAllocated {
     using DeviceIpMap =
@@ -99,18 +118,14 @@ net::awaitable<std::optional<UserOnlineSessionGuard>> UserOnlineTracker::TryConn
     auto* coordinator = GroupCoordinator::ForContext(
         net::query(executor, net::execution::context));
     if (!coordinator) throw std::logic_error("user admission requires a registered coordinator");
-    std::string owned_tag(tag);
-    std::string owned_client_ip(client_ip);
     const auto uid = static_cast<uint64_t>(user_id);
-    // Prepare the guard's owned strings before reserving either counter.
-    std::optional<UserOnlineSessionGuard> guard(
-        std::in_place, owned_tag, uid, owned_client_ip);
+    std::optional<UserOnlineSessionGuard> guard(std::in_place);
     auto reservation = std::make_shared<DeviceReservation>();
     reservation->node = std::make_unique<DeviceReturn>();
     auto& node = *reservation->node;
     node.coordinator = coordinator;
-    node.tag = std::move(owned_tag);
-    node.ip = std::move(owned_client_ip);
+    node.tag.assign(tag);
+    node.ip.assign(client_ip);
     node.user = uid;
     guard->quota_reservation_ = reservation;
     const bool admitted = co_await coordinator->PostCall(
@@ -175,31 +190,7 @@ void UserOnlineTracker::OnUserDisconnected(std::string_view tag,
     if (client_ip.empty()) {
         return;
     }
-
-    auto device_tag_it = impl_->devices.find(tag);
-    if (device_tag_it == impl_->devices.end()) {
-        return;
-    }
-    auto device_user_it = device_tag_it->second.find(user_id);
-    if (device_user_it == device_tag_it->second.end()) {
-        return;
-    }
-    auto ip_it = device_user_it->second.find(client_ip);
-    if (ip_it == device_user_it->second.end()) {
-        return;
-    }
-    if (--ip_it->second == 0) {
-        device_user_it->second.erase(ip_it);
-        MaybeShrinkHashContainer(device_user_it->second, 8);
-    }
-    if (device_user_it->second.empty()) {
-        device_tag_it->second.erase(device_user_it);
-        MaybeShrinkHashContainer(device_tag_it->second, 8);
-    }
-    if (device_tag_it->second.empty()) {
-        impl_->devices.erase(device_tag_it);
-        MaybeShrinkHashContainer(impl_->devices, 8);
-    }
+    ReleaseDeviceCount(impl_->devices, tag, user_id, client_ip);
 }
 
 size_t UserOnlineTracker::OnlineDeviceCount(std::string_view tag,

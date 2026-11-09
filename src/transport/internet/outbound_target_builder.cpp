@@ -17,6 +17,18 @@
 
 namespace {
 
+[[nodiscard]] std::optional<OutboundDialer::OrderedBind> SelectOrderedBind(
+    const OutboundBind& bind,
+    std::string_view source_ip,
+    int64_t user_id,
+    std::string_view user_email,
+    std::string_view inbound_tag) {
+    if (bind.GetMode() != OutboundBind::Mode::Ordered) return std::nullopt;
+    return OutboundDialer::OrderedBind{
+        .v4 = bind.Select(net::ip::address_v4::any(), source_ip, user_id, user_email, inbound_tag),
+        .v6 = bind.Select(net::ip::address_v6::any(), source_ip, user_id, user_email, inbound_tag),
+    };
+}
 
 bool AutoPrefersIPv6(const OutboundBind& bind,
                      const tcp::endpoint* inbound_local_addr) noexcept {
@@ -61,8 +73,7 @@ AttachXHttpDownloadTarget(
     OutboundTransportTarget target,
     const OutboundTargetOptions& options,
     const tcp::endpoint* inbound_local_addr,
-    std::optional<OutboundBind::Selection> download_ordered_v4,
-    std::optional<OutboundBind::Selection> download_ordered_v6) {
+    const std::optional<OutboundDialer::OrderedBind>& download_ordered) {
     if (!options.stream_settings ||
         !options.stream_settings->IsXHttp() ||
         !options.stream_settings->xhttp.download_settings) {
@@ -98,10 +109,9 @@ AttachXHttpDownloadTarget(
             .timeout = options.timeout,
             .send_through = &download.send_through,
             .inbound_local_addr = inbound_local_addr,
-            .inbound_source_port = options.inbound_source_port,
             .inbound_user_id = options.inbound_user_id,
-            .ordered_bind_v4 = download_ordered_v4,
-            .ordered_bind_v6 = download_ordered_v6,
+            .ordered_bind_v4 = download_ordered ? std::optional{download_ordered->v4} : std::nullopt,
+            .ordered_bind_v6 = download_ordered ? std::optional{download_ordered->v6} : std::nullopt,
         });
     if (!download_target) {
         co_return tl::unexpected(download_target.error());
@@ -143,43 +153,31 @@ BuildOutboundTransportTarget(OutboundTargetOptions options) {
 
     const OutboundBind unbound;
     const auto& bind = options.send_through ? *options.send_through : unbound;
-    const auto ordered_v4 = bind.GetMode() == OutboundBind::Mode::Ordered
-        ? (options.ordered_bind_v4 ? *options.ordered_bind_v4
-            : bind.Select(net::ip::address_v4::any(),
-                          options.inbound_source_ip,
-                          options.inbound_user_id,
-                          options.inbound_user_email,
-                          options.inbound_tag))
-        : OutboundBind::Selection{};
-    const auto ordered_v6 = bind.GetMode() == OutboundBind::Mode::Ordered
-        ? (options.ordered_bind_v6 ? *options.ordered_bind_v6
-            : bind.Select(net::ip::address_v6::any(),
-                          options.inbound_source_ip,
-                          options.inbound_user_id,
-                          options.inbound_user_email,
-                          options.inbound_tag))
-        : OutboundBind::Selection{};
+    const auto default_ordered =
+        (!options.ordered_bind_v4 || !options.ordered_bind_v6)
+            ? SelectOrderedBind(
+                  bind,
+                  options.inbound_source_ip,
+                  options.inbound_user_id,
+                  options.inbound_user_email,
+                  options.inbound_tag)
+            : std::nullopt;
+    const auto ordered_v4 = options.ordered_bind_v4
+        ? *options.ordered_bind_v4
+        : (default_ordered ? default_ordered->v4 : OutboundBind::Selection{});
+    const auto ordered_v6 = options.ordered_bind_v6
+        ? *options.ordered_bind_v6
+        : (default_ordered ? default_ordered->v6 : OutboundBind::Selection{});
 
-    std::optional<OutboundBind::Selection> download_ordered_v4;
-    std::optional<OutboundBind::Selection> download_ordered_v6;
+    std::optional<OutboundDialer::OrderedBind> download_ordered;
     if (options.stream_settings->IsXHttp() &&
         options.stream_settings->xhttp.download_settings) {
-        const auto& download_bind =
-            options.stream_settings->xhttp.download_settings->send_through;
-        if (download_bind.GetMode() == OutboundBind::Mode::Ordered) {
-            download_ordered_v4 = download_bind.Select(
-                net::ip::address_v4::any(),
-                options.inbound_source_ip,
-                options.inbound_user_id,
-                options.inbound_user_email,
-                options.inbound_tag);
-            download_ordered_v6 = download_bind.Select(
-                net::ip::address_v6::any(),
-                options.inbound_source_ip,
-                options.inbound_user_id,
-                options.inbound_user_email,
-                options.inbound_tag);
-        }
+        download_ordered = SelectOrderedBind(
+            options.stream_settings->xhttp.download_settings->send_through,
+            options.inbound_source_ip,
+            options.inbound_user_id,
+            options.inbound_user_email,
+            options.inbound_tag);
     }
 
     options.inbound_local_addr = nullptr;
@@ -218,8 +216,7 @@ BuildOutboundTransportTarget(OutboundTargetOptions options) {
             std::move(target),
             options,
             inbound_local_ptr,
-            download_ordered_v4,
-            download_ordered_v6);
+            download_ordered);
     }
     if (auto literal = iputil::ParseLiteral(options.address)) {
         append_single(*literal);
@@ -227,8 +224,7 @@ BuildOutboundTransportTarget(OutboundTargetOptions options) {
             std::move(target),
             options,
             inbound_local_ptr,
-            download_ordered_v4,
-            download_ordered_v6);
+            download_ordered);
     }
     if (!options.dns_service) {
         co_return tl::unexpected(ErrorCode::DNS_RESOLVE_FAILED);
@@ -261,20 +257,8 @@ BuildOutboundTransportTarget(OutboundTargetOptions options) {
             std::move(target),
             options,
             inbound_local_ptr,
-            download_ordered_v4,
-            download_ordered_v6);
+            download_ordered);
     };
-
-    if (bind.GetMode() == OutboundBind::Mode::Ordered) {
-        for (const bool ipv6 : {bind.PrefersIPv6(), !bind.PrefersIPv6()}) {
-            for (const auto& raw_addr : dns_result.addresses) {
-                const auto addr = iputil::NormalizeAddress(raw_addr);
-                if (addr.is_v6() != ipv6) continue;
-                add_candidate(addr);
-            }
-        }
-        co_return co_await finalize_candidates();
-    }
 
     if (bind.GetMode() == OutboundBind::Mode::Explicit) {
         const bool want_v6 = bind.ExplicitAddress() &&
@@ -288,8 +272,12 @@ BuildOutboundTransportTarget(OutboundTargetOptions options) {
         co_return co_await finalize_candidates();
     }
 
-    if (AutoPrefersIPv6(bind, inbound_local_ptr)) {
-        for (const bool ipv6 : {true, false}) {
+    if (bind.GetMode() == OutboundBind::Mode::Ordered ||
+        AutoPrefersIPv6(bind, inbound_local_ptr)) {
+        const bool prefer_v6 = bind.GetMode() == OutboundBind::Mode::Ordered
+            ? bind.PrefersIPv6()
+            : true;
+        for (const bool ipv6 : {prefer_v6, !prefer_v6}) {
             for (const auto& raw_addr : dns_result.addresses) {
                 const auto addr = iputil::NormalizeAddress(raw_addr);
                 if (addr.is_v6() == ipv6) {
@@ -334,16 +322,12 @@ ForwardedMetadataView OutboundDialer::ForwardedMetadata(
 
 std::optional<OutboundDialer::OrderedBind> OutboundDialer::SelectOrderedBind(
     const session::Context& ctx) const {
-    const auto& bind = sender_.send_through;
-    if (bind.GetMode() != OutboundBind::Mode::Ordered) return std::nullopt;
-    const auto client_ip = ctx.inbound.EffectiveClientIp();
-    const auto user_id = ctx.inbound.EffectiveUserId();
-    const auto user_email = ctx.inbound.EffectiveUserEmail();
-    const auto inbound_tag = ctx.inbound.EffectiveInboundTag();
-    return OrderedBind{
-        .v4 = bind.Select(net::ip::address_v4::any(), client_ip, user_id, user_email, inbound_tag),
-        .v6 = bind.Select(net::ip::address_v6::any(), client_ip, user_id, user_email, inbound_tag),
-    };
+    return ::SelectOrderedBind(
+        sender_.send_through,
+        ctx.inbound.EffectiveClientIp(),
+        ctx.inbound.EffectiveUserId(),
+        ctx.inbound.EffectiveUserEmail(),
+        ctx.inbound.EffectiveInboundTag());
 }
 
 net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, ErrorCode>>
@@ -361,7 +345,6 @@ OutboundDialer::Dial(session::Context& ctx, const OutboundServer& server,
         .inbound_local_addr = ctx.inbound.local_endpoint
             ? &*ctx.inbound.local_endpoint : nullptr,
         .inbound_source_ip = ctx.inbound.EffectiveClientIp(),
-        .inbound_source_port = ctx.inbound.source_port,
         .inbound_user_id = ctx.inbound.EffectiveUserId(),
         .inbound_user_email = ctx.inbound.EffectiveUserEmail(),
         .inbound_tag = ctx.inbound.EffectiveInboundTag(),

@@ -671,8 +671,7 @@ TEST(UdpSocketOwner, Contract) {
         .stream_settings = {},
         .dispatch_policy = {
             .sniffing = {}, .outbound = ::routing::ForceOutbound{"direct"}},
-        .proxy_protocol = ::ProxyProtocolMode::Auto,
-        .has_route_inbound_tags = false};
+        .proxy_protocol = ::ProxyProtocolMode::Auto};
     RecordingReplySink uplink_sink;
     const auto attach_uplink_socket = [&](std::string_view socket_key) {
         auto socket = worker.AttachSocket(

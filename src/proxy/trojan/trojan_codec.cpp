@@ -72,30 +72,26 @@ size_t EncodeRequestTo(
     const TargetAddress& target,
     uint8_t* output,
     size_t output_size,
-    const uint8_t* payload,
-    size_t payload_len,
     ForwardedMetadataView forwarded) {
 
     const size_t addr_size = AddressEncodedSize(target, forwarded);
-    if (addr_size == 0 || payload_len > output_size ||
-        (payload_len != 0 && !payload)) {
+    if (addr_size == 0) {
         return 0;
     }
     const size_t header_size = 56 + 2 + 1 + addr_size + 2;
 
-    if (!output || header_size > output_size - payload_len) {
+    if (!output || header_size > output_size) {
         return 0;
     }
-    const size_t total_out_size = header_size + payload_len;
     const auto out_begin = reinterpret_cast<uintptr_t>(output);
-    auto overlaps_output = [out_begin, total_out_size](const void* ptr, size_t len) noexcept {
+    auto overlaps_output = [out_begin, header_size](const void* ptr, size_t len) noexcept {
         if (!ptr || len == 0) {
             return false;
         }
         const auto in_begin = reinterpret_cast<uintptr_t>(ptr);
         return in_begin <= out_begin
             ? out_begin - in_begin < len
-            : in_begin - out_begin < total_out_size;
+            : in_begin - out_begin < header_size;
     };
     if (overlaps_output(password_hash.data(), password_hash.size()) ||
         (target.IsDomain() && overlaps_output(target.host.data(), target.host.size())) ||
@@ -103,10 +99,6 @@ size_t EncodeRequestTo(
         overlaps_output(forwarded.inbound_tag.data(), forwarded.inbound_tag.size())) {
         return 0;
     }
-    if (payload && payload_len > 0) {
-        std::memmove(output + header_size, payload, payload_len);
-    }
-
     ByteWriter writer(output, header_size);
 
     writer.WriteString(std::string_view(password_hash.data(), password_hash.size()));
@@ -122,7 +114,7 @@ size_t EncodeRequestTo(
     tail.WriteU8(0x0D);
     tail.WriteU8(0x0A);
 
-    return writer.Position() + encoded + tail.Position() + payload_len;
+    return writer.Position() + encoded + tail.Position();
 }
 
 size_t EncodeUdpPacketHeaderTo(

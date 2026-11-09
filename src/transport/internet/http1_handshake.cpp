@@ -56,12 +56,12 @@ public:
 
     net::awaitable<size_t> AsyncRead(net::mutable_buffer buffer) override {
         if (read_chunked_) {
-            co_return co_await ReadChunked(buffer);
+            return ReadChunked(buffer);
         }
         if (content_remaining_) {
-            co_return co_await ReadContentLength(buffer);
+            return ReadContentLength(buffer);
         }
-        co_return co_await ReadRaw(buffer);
+        return ReadRaw(buffer);
     }
 
     net::awaitable<size_t> AsyncWrite(net::const_buffer buffer) override {
@@ -111,7 +111,7 @@ public:
             mb.clear();
             throw IoSystemError(io_error::operation_aborted, "http1 body write closed");
         }
-        co_await AsyncStream::WriteMultiBuffer(std::move(mb));
+        return AsyncStream::WriteMultiBuffer(std::move(mb));
     }
 
     net::awaitable<void> WriteBuffers(
@@ -790,33 +790,6 @@ void RecordExtractedRealIp(std::string_view head,
     }
 }
 
-std::string SanitizeForLog(std::string_view value, size_t max_len) {
-    value = TrimAscii(value);
-    if (value.empty()) {
-        return "-";
-    }
-
-    const size_t limit = std::min(value.size(), max_len);
-    std::string out;
-    out.reserve(limit + 4);
-
-    for (size_t i = 0; i < limit; ++i) {
-        const auto ch = static_cast<unsigned char>(value[i]);
-        if (ch == '\r' || ch == '\n' || ch == '\t') {
-            out.push_back(' ');
-        } else if (std::isprint(ch)) {
-            out.push_back(static_cast<char>(ch));
-        } else {
-            out.push_back('?');
-        }
-    }
-
-    if (value.size() > limit) {
-        out.append("...");
-    }
-    return out;
-}
-
 std::string_view PublicHttpTargetForLog(std::string_view value) {
     constexpr std::string_view invalid = "[invalid HTTP target]";
     value = TrimAscii(value);
@@ -1298,7 +1271,7 @@ net::awaitable<TransportBuildResult> DoWsServerHandshake(
         LOG_CONN_TRACE(conn_id, "WebSocket server rejected invalid key line='{}' host='{}' version='{}'",
                       SanitizeHttpRequestLineForLog(parsed_line),
                       PublicHttpTargetForLog(host),
-                      SanitizeForLog(version));
+                      TrimAscii(version));
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 

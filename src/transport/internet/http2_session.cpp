@@ -279,7 +279,13 @@ void AppendHpackLiteralNewName(memory::ByteVector& out,
                                std::string_view name,
                                std::string_view value) {
     out.push_back(0);
-    AppendHpackString(out, name);
+    AppendHpackInt(out, 7, 0, static_cast<uint32_t>(name.size()));
+    for (unsigned char ch : name) {
+        if (ch >= 'A' && ch <= 'Z') {
+            ch = static_cast<unsigned char>(ch - 'A' + 'a');
+        }
+        out.push_back(ch);
+    }
     AppendHpackString(out, value);
 }
 
@@ -326,16 +332,6 @@ constexpr std::array<uint8_t, 15> kGrpcTrailerBlock{
           EqualsAsciiCI(key, "upgrade");
 }
 
-[[nodiscard]] memory::ThreadLocalString LowercaseAscii(std::string_view input) {
-    memory::ThreadLocalString out(input);
-    for (char& ch : out) {
-        if (ch >= 'A' && ch <= 'Z') {
-            ch = static_cast<char>(ch - 'A' + 'a');
-        }
-    }
-    return out;
-}
-
 [[nodiscard]] constexpr bool IsValidHttp2HeaderName(std::string_view name) noexcept {
     if (name.empty()) return false;
     for (const unsigned char ch : name) {
@@ -377,8 +373,7 @@ constexpr std::array<uint8_t, 15> kGrpcTrailerBlock{
         if (key.empty() || IsConnectionSpecificHttp2Header(key)) {
             continue;
         }
-        const auto lower_key = LowercaseAscii(key);
-        AppendHpackLiteralNewName(h, lower_key, value);
+        AppendHpackLiteralNewName(h, key, value);
     }
     return h;
 }
@@ -392,8 +387,7 @@ constexpr std::array<uint8_t, 15> kGrpcTrailerBlock{
         if (key.empty() || IsConnectionSpecificHttp2Header(key)) {
             continue;
         }
-        const auto lower_key = LowercaseAscii(key);
-        AppendHpackLiteralNewName(h, lower_key, value);
+        AppendHpackLiteralNewName(h, key, value);
     }
     return h;
 }
@@ -1152,10 +1146,6 @@ struct H2RequestHeaders {
 class Http2ClientStream final : public AsyncStream,
                                 private transport::CancellationSubscription {
 public:
-    transport::EofAction ReadEofAction() const noexcept override {
-        return transport::EofAction::ShutdownPeerWrite;
-    }
-
     Http2ClientStream(std::unique_ptr<AsyncStream> inner,
                       uint32_t stream_id,
                       H2PayloadCodec payload_codec,
@@ -1212,37 +1202,6 @@ public:
         }
         buffer->Produce(static_cast<uint32_t>(n));
         co_return buf::MultiBuffer{std::move(buffer)};
-    }
-
-    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
-        if (payload_codec_ == H2PayloadCodec::RawData) {
-            ConstBufferSpanBuilder<16> payloads;
-            payloads.AppendMultiBuffer(mb);
-            try {
-                if (!payloads.empty()) co_await SendData(payloads.Span());
-            } catch (...) {
-                mb.clear();
-                throw;
-            }
-            mb.clear();
-            co_return;
-        }
-
-        for (buf::Buffer*& buffer : mb) {
-            if (!buffer) {
-                continue;
-            }
-            if (!buffer->IsEmpty()) {
-                try {
-                    co_await SendGrpcHunkMessage(buffer->Bytes());
-                } catch (...) {
-                    mb.clear();
-                    throw;
-                }
-            }
-            mb.FreeSlot(buffer);
-        }
-        mb.clear();
     }
 
     net::awaitable<void> WriteBuffers(
@@ -1983,7 +1942,6 @@ public:
     net::awaitable<size_t> AsyncRead(net::mutable_buffer buffer);
     net::awaitable<size_t> AsyncWrite(net::const_buffer buffer);
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer();
-    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb);
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers);
     net::awaitable<void> AsyncShutdownWrite();
 
@@ -2051,10 +2009,6 @@ private:
 
 class Http2ServerSubStream final : public AsyncStream {
 public:
-    transport::EofAction ReadEofAction() const noexcept override {
-        return transport::EofAction::ShutdownPeerWrite;
-    }
-
     explicit Http2ServerSubStream(std::shared_ptr<Http2ServerSubStreamState> state)
         : state_(std::move(state)), deadline_(state_->IoContext(), *this) {}
 
@@ -2087,7 +2041,7 @@ public:
             mb.clear();
             ThrowHttp2StreamError("gRPC WriteMultiBuffer on closed stream");
         }
-        return state_->WriteMultiBuffer(std::move(mb));
+        return AsyncStream::WriteMultiBuffer(std::move(mb));
     }
 
     net::awaitable<void> WriteBuffers(
@@ -2190,8 +2144,6 @@ public:
                 throw std::invalid_argument("HTTP/2 raw session requires an HTTP config");
             }
             response_header_block_ = EncodeHttpResponseHeaders(http_config_->headers);
-        } else if (grpc_config_ && grpc_config_->request_path.empty()) {
-            grpc_request_path_ = memory::ThreadLocalString(grpc_config_->RequestPath());
         }
         Resubscribe(stream_->Cancellation());
     }
@@ -2778,11 +2730,8 @@ private:
             }
         }
         if (payload_codec_ == H2PayloadCodec::GrpcHunk && grpc_config_) {
-            const std::string_view expected_path = !grpc_config_->request_path.empty()
-                ? std::string_view(grpc_config_->request_path)
-                : std::string_view(grpc_request_path_);
             if (!EqualsAsciiCI(request->method, "POST") ||
-                !detail::PathMatchesExactly(expected_path, request->path)) {
+                !detail::PathMatchesExactly(grpc_config_->request_path, request->path)) {
                 co_return co_await ResetStream(stream_id, H2Error::Protocol);
             }
             if (const std::string_view expected_authority = TrimAscii(grpc_config_->authority);
@@ -3037,7 +2986,6 @@ private:
     const HttpConfig* http_config_ = nullptr;
     const XHttpConfig* xhttp_config_ = nullptr;
     const GrpcConfig* grpc_config_ = nullptr;
-    memory::ThreadLocalString grpc_request_path_;
     // HPACK blocks encoded once per connection; neither uses the dynamic table.
     memory::ByteVector response_header_block_;
     HpackDecoder hpack_decoder_;
@@ -3324,56 +3272,15 @@ net::awaitable<buf::MultiBuffer> Http2ServerSubStreamState::ReadMultiBuffer() {
     co_return buf::MultiBuffer{std::move(buffer)};
 }
 
-net::awaitable<void> Http2ServerSubStreamState::WriteMultiBuffer(
-    buf::MultiBuffer mb) {
-    if (payload_codec_ == H2PayloadCodec::RawData) {
-        ConstBufferSpanBuilder<16> payloads;
-        payloads.AppendMultiBuffer(mb);
-
-        try {
-            if (!payloads.empty()) {
-                auto session = LockWritableSession();
-                if (!co_await session->WriteDataSerialized(stream_id_, payloads.Span())) {
-                    ThrowHttp2StreamError("HTTP/2 raw server stream WriteMultiBuffer failed");
-                }
-            }
-        } catch (...) {
-            mb.clear();
-            throw;
-        }
-
-        mb.clear();
-        co_return;
-    }
-
-    for (buf::Buffer*& buffer : mb) {
-        if (!buffer) {
-            continue;
-        }
-        if (!buffer->IsEmpty()) {
-            const auto bytes = buffer->Bytes();
-            try {
-                (void)co_await AsyncWrite(net::buffer(bytes.data(), bytes.size()));
-            } catch (...) {
-                mb.FreeSlot(buffer);
-                mb.clear();
-                throw;
-            }
-        }
-        mb.FreeSlot(buffer);
-    }
-    mb.clear();
-}
-
 net::awaitable<void> Http2ServerSubStreamState::WriteBuffers(
     std::span<const net::const_buffer> buffers) {
+    auto session = LockWritableSession();
     if (payload_codec_ == H2PayloadCodec::RawData) {
         const bool has_data = std::any_of(buffers.begin(), buffers.end(),
             [](const net::const_buffer& buffer) { return buffer.size() > 0; });
         if (!has_data) {
             co_return;
         }
-        auto session = LockWritableSession();
         if (!co_await session->WriteDataSerialized(stream_id_, buffers)) {
             ThrowHttp2StreamError("HTTP/2 raw server stream WriteBuffers failed");
         }
@@ -3700,12 +3607,7 @@ net::awaitable<TransportBuildResult> DoGrpcClientHandshake(
     std::string_view authority,
     bool tls,
     uint64_t conn_id) {
-    std::string fallback_path;
-    std::string_view path = cfg.request_path;
-    if (path.empty()) {
-        fallback_path = cfg.RequestPath();
-        path = fallback_path;
-    }
+    const std::string_view path = cfg.request_path;
     const uint32_t initial_window = std::min<uint32_t>(
         cfg.initial_window_size.value_or(kDefaultInitialWindow),
         kHttp2MaxQueuedStreamBytes);

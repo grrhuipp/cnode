@@ -4,6 +4,7 @@
 
 #include "api/api.hpp"
 #include "app/prepared_inbound.hpp"
+#include "infra/log.hpp"
 #include "infra/panel_config.hpp"
 #include "core/naming.hpp"
 #include "online_snapshot.hpp"
@@ -72,6 +73,8 @@ struct Controller::Impl : std::enable_shared_from_this<Controller::Impl> {
 
         const std::unique_ptr<api::API> client;
         const PanelConfig config;
+        const int node_id;
+        const PanelLogContext log_context;
         const std::string accounting_key;
         PanelState state = PanelState::Connecting;
         controller::NodeState node;

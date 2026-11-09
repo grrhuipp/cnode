@@ -1,6 +1,7 @@
 #include "geo/geodata.hpp"
 
 #include "common/allocator.hpp"
+#include "common/byte_reader.hpp"
 #include "common/domain_name.hpp"
 #include "common/unsafe.hpp"
 
@@ -150,14 +151,17 @@ bool DomainRuleSet::Match(std::string_view domain) const {
 
     char stack_buf[256];
     std::optional<memory::ThreadLocalString> heap_buf;
-    char* lower = stack_buf;
-    if (domain.size() > sizeof(stack_buf)) {
-        lower = heap_buf.emplace(domain.size(), '\0').data();
+    std::string_view lower_domain = domain;
+    if (std::ranges::any_of(domain, [](char ch) { return 'A' <= ch && ch <= 'Z'; })) {
+        char* lower = stack_buf;
+        if (domain.size() > sizeof(stack_buf)) {
+            lower = heap_buf.emplace(domain.size(), '\0').data();
+        }
+        std::ranges::transform(domain, lower, [](char ch) {
+            return domain::ToLowerAscii(static_cast<unsigned char>(ch));
+        });
+        lower_domain = std::string_view(lower, domain.size());
     }
-    std::ranges::transform(domain, lower, [](char ch) {
-        return domain::ToLowerAscii(static_cast<unsigned char>(ch));
-    });
-    const std::string_view lower_domain(lower, domain.size());
 
     if (full_.contains(lower_domain) || MatchSuffix(lower_domain)) {
         return true;
@@ -231,10 +235,10 @@ struct ProtoField {
 class ProtoReader {
 public:
     ProtoReader(std::span<const uint8_t> bytes, const std::filesystem::path& path) noexcept
-        : cur_(bytes.data()), end_(bytes.data() + bytes.size()), path_(path) {}
+        : reader_(bytes), path_(path) {}
 
-    [[nodiscard]] bool AtEnd() const noexcept { return cur_ == end_; }
-    [[nodiscard]] const uint8_t* Cursor() const noexcept { return cur_; }
+    [[nodiscard]] bool AtEnd() const noexcept { return reader_.Empty(); }
+    [[nodiscard]] size_t Position() const noexcept { return reader_.Position(); }
 
     [[nodiscard]] ProtoField NextField() {
         const uint64_t key = Varint();
@@ -246,31 +250,19 @@ public:
     }
 
     [[nodiscard]] uint64_t Varint() {
-        uint64_t value = 0;
-        for (unsigned shift = 0; shift < 64; shift += 7) {
-            if (cur_ == end_) {
-                ThrowCorrupt(path_, "truncated varint");
-            }
-            const uint8_t byte = *cur_++;
-            if (shift == 63 && byte > 1) {
-                ThrowCorrupt(path_, "varint overflows 64-bit integer");
-            }
-            value |= static_cast<uint64_t>(byte & 0x7F) << shift;
-            if ((byte & 0x80) == 0) {
-                return value;
-            }
+        const auto value = reader_.ReadVarintU64();
+        if (!value) {
+            ThrowCorrupt(path_, "invalid or truncated varint");
         }
-        ThrowCorrupt(path_, "varint longer than 10 bytes");
+        return *value;
     }
 
     [[nodiscard]] std::span<const uint8_t> Bytes() {
         const uint64_t length = Varint();
-        if (length > static_cast<uint64_t>(end_ - cur_)) {
+        if (length > reader_.Remaining()) {
             ThrowCorrupt(path_, "length-delimited field exceeds its message");
         }
-        const std::span<const uint8_t> bytes(cur_, static_cast<size_t>(length));
-        cur_ += length;
-        return bytes;
+        return reader_.ReadBytes(static_cast<size_t>(length));
     }
 
     void Skip(uint32_t wire_type) {
@@ -285,14 +277,12 @@ public:
 
 private:
     void Advance(size_t count) {
-        if (count > static_cast<size_t>(end_ - cur_)) {
+        if (!reader_.Skip(count)) {
             ThrowCorrupt(path_, "truncated fixed-width field");
         }
-        cur_ += count;
     }
 
-    const uint8_t* cur_;
-    const uint8_t* end_;
+    ByteReader reader_;
     const std::filesystem::path& path_;
 };
 
@@ -336,7 +326,7 @@ struct EntryCountryCodeResult {
     const std::filesystem::path& path) {
     ProtoReader reader(entry, path);
     while (!reader.AtEnd()) {
-        const uint8_t* const field_start = reader.Cursor();
+        const size_t field_start = reader.Position();
         const auto field = reader.NextField();
         if (field.number == 1) {
             if (field.wire_type != kWireBytes) {
@@ -348,7 +338,7 @@ struct EntryCountryCodeResult {
             }
             return EntryCountryCodeResult{
                 .code = code,
-                .prefix = entry.first(static_cast<size_t>(field_start - entry.data())),
+                .prefix = entry.first(field_start),
                 .tail = reader,
             };
         }
@@ -490,6 +480,13 @@ void LoadCategories(
         return;
     }
 
+    const auto less_ignore_case = [](std::string_view lhs, std::string_view rhs) noexcept {
+        return std::ranges::lexicographical_compare(
+            lhs, rhs, {},
+            [](char ch) { return static_cast<unsigned char>(domain::ToLowerAscii(static_cast<unsigned char>(ch))); },
+            [](char ch) { return static_cast<unsigned char>(domain::ToLowerAscii(static_cast<unsigned char>(ch))); });
+    };
+
     const auto bytes = ReadWholeFile(path);
     ProtoReader list(bytes, path);
     while (!list.AtEnd()) {
@@ -503,10 +500,10 @@ void LoadCategories(
         }
         const auto entry = list.Bytes();
         auto parsed_code = EntryCountryCode(entry, path);
-        auto code = LowerTag(parsed_code.code);
-        if (!std::ranges::binary_search(wanted, code)) {
+        if (!std::ranges::binary_search(wanted, parsed_code.code, less_ignore_case)) {
             continue;
         }
+        auto code = LowerTag(parsed_code.code);
         auto [it, inserted] = out.try_emplace(std::move(code), memory::process_resource());
         if (!inserted) {
             ThrowCorrupt(path, std::format("duplicate {} tag '{}'", kind, it->first));

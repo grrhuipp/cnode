@@ -77,14 +77,10 @@ net::awaitable<void> Controller::Impl::FlushTraffic() {
             co_await collectTraffic(*panel);
         } catch (const std::exception& error) {
             if (!failure) failure = std::current_exception();
-            const PanelLogContext log_context{panel->config.Name, panel->config.APIHost,
-                panel->config.NodeIDs.Front(), panel->config.NodeType};
-            LOG_PANEL_ERROR(log_context, "Final traffic persistence failed: {}", error.what());
+            LOG_PANEL_ERROR(panel->log_context, "Final traffic persistence failed: {}", error.what());
         } catch (...) {
             if (!failure) failure = std::current_exception();
-            const PanelLogContext log_context{panel->config.Name, panel->config.APIHost,
-                panel->config.NodeIDs.Front(), panel->config.NodeType};
-            LOG_PANEL_ERROR(log_context, "Final traffic persistence failed: unknown error");
+            LOG_PANEL_ERROR(panel->log_context, "Final traffic persistence failed: unknown error");
         }
     }
     if (failure) std::rethrow_exception(failure);
@@ -129,8 +125,7 @@ Controller::Impl::GetOnlineSnapshot(const std::string& tag) {
 
 net::awaitable<void> Controller::Impl::userInfoMonitor(PanelRuntime& panel,
                                                        std::string tag) {
-    const PanelLogContext log_context{panel.config.Name, panel.config.APIHost,
-        panel.config.NodeIDs.Front(), panel.config.NodeType};
+    const auto& log_context = panel.log_context;
 
     ThrowIfStopping();
     // Drain never-attempted crash/backpressure records before collecting more;

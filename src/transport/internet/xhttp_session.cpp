@@ -562,15 +562,15 @@ net::awaitable<std::optional<buf::MultiBuffer>> ReadXHttpPacketBody(
     co_return payload;
 }
 
-[[nodiscard]] std::string BuildXHttpReferer(std::string_view host,
-                                            std::string_view path,
-                                            bool tls) {
+[[nodiscard]] memory::ThreadLocalString BuildXHttpReferer(std::string_view host,
+                                                          std::string_view path,
+                                                          bool tls) {
     const std::string_view scheme = tls ? "https://" : "http://";
     const std::string_view host_part = host.empty() ? "example.com" : host;
     const std::string_view req_path = detail::EffectiveHttpPath(path);
     constexpr std::string_view kPaddingKey = "x_padding=";
 
-    std::string referer;
+    memory::ThreadLocalString referer;
     referer.reserve(scheme.size() + host_part.size() + req_path.size() + 1 +
                     kPaddingKey.size() + kXHttpRefererPadding.size());
     referer.append(scheme);
@@ -1456,6 +1456,11 @@ private:
     std::chrono::seconds idle_timeout_;
 };
 
+struct XHttpSessionOwnerResolution {
+    net::io_context* owner = nullptr;
+    std::shared_ptr<XHttpPacketUpSession> session;
+};
+
 net::awaitable<XHttpSessionOwnerResolution> ResolveXHttpSessionOwner(
     net::io_context& io_context,
     std::string_view session_namespace,
@@ -1526,27 +1531,8 @@ net::awaitable<std::shared_ptr<XHttpPacketUpSession>> GetXHttpPacketSession(
     std::string_view session_namespace,
     std::string_view session_id,
     XHttpSessionAccess access) {
-    auto* coordinator = GroupCoordinator::ForContext(io_context);
-    if (!coordinator) {
-        co_return net::use_service<XHttpSessionTable>(io_context).Get(
-            io_context, session_namespace, session_id, access);
-    }
-
-    for (;;) {
-        auto claim = co_await coordinator->PostCall(
-            [coordinator, session_namespace, session_id, access, &io_context] {
-                return net::use_service<XHttpSessionDirectory>(coordinator->Services()).Acquire(
-                    session_namespace, session_id, access, &io_context, true);
-            });
-        if (claim.retry) continue;
-        if (!claim.owner) co_return nullptr;
-        if (claim.owner != &io_context) co_return nullptr;
-        if (claim.record->Retired()) continue;
-        auto session = net::use_service<XHttpSessionTable>(io_context).Get(
-            io_context, session_namespace, session_id, access, claim.record);
-        if (session) claim.reservation = false;
-        co_return session;
-    }
+    co_return (co_await ResolveXHttpSessionOwner(
+        io_context, session_namespace, session_id, access, true)).session;
 }
 
 std::unique_ptr<AsyncStream> MakeXHttpSplitStream(

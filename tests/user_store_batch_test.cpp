@@ -77,7 +77,7 @@ TEST(UserStoreBatch, Contract) {
         if (UserStore::CaptureSnapshot() != old_snapshot ||
             UserStore::VmessUsers("first").users != first_view ||
             UserStore::FindTrojanUser("second", "old-second") != second_view ||
-            UserStore::FindTrojanUser("second", "new-second") || !UserStore::VlessUsers("third").empty()) {
+            UserStore::FindTrojanUser("second", "new-second") || UserStore::FindVlessUser("third", {})) {
             std::cerr << "allocation failure changed a committed snapshot or Worker view\n";
             FAIL() << "allocation failure changed a committed snapshot or Worker view";
         }
@@ -85,7 +85,7 @@ TEST(UserStoreBatch, Contract) {
     ASSERT_FALSE((!completed || failures < 5 || UserStore::VmessUsers("first").size() != 2 ||
         !UserStore::FindTrojanUser("second", "new-second") ||
         UserStore::FindTrojanUser("second", "old-second") ||
-        UserStore::VlessUsers("third").size() != 1 ||
+        !UserStore::FindVlessUser("third", {}) ||
         UserStore::VmessUsers("unrelated").users != unrelated_view ||
         first_view->size() != 1 || (*first_view)[0].profile.user_id != 101 || second_view->profile.user_id != 102));
 

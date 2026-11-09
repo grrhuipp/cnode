@@ -2,7 +2,6 @@
 
 #include "common/allocator.hpp"
 #include "common/asio_types.hpp"
-#include "common/clock.hpp"
 #include "common/target_address.hpp"
 #include "common/network.hpp"
 
@@ -29,10 +28,11 @@ using ID = uint64_t;
 // xray-core common/session.Inbound 对应的连接入站元数据。
 // 配置标签、协议与安全方式在会话中按值保存在 Worker 本地 PMR 存储。
 struct Inbound {
+    enum class ClientIpSource : uint8_t { Socket, ProxyProtocol, HttpHeader };
+
     Inbound() : Inbound(memory::CurrentResource()) {}
     explicit Inbound(std::pmr::memory_resource* resource)
         : source_ip(resource)
-        , client_ip_source("socket", resource)
         , tag(resource)
         , accounting_key(resource)
         , tags(resource)
@@ -43,10 +43,10 @@ struct Inbound {
     net::ip::address source_addr;
     memory::ThreadLocalString source_ip;
     uint16_t source_port = 0;
-    memory::ThreadLocalString client_ip_source = "socket";
+    ClientIpSource client_ip_source = ClientIpSource::Socket;
 
     [[nodiscard]] bool HasProxyProtocolClientIP() const noexcept {
-        return client_ip_source == "proxy_protocol" && !source_ip.empty();
+        return client_ip_source == ClientIpSource::ProxyProtocol && !source_ip.empty();
     }
     std::optional<tcp::endpoint> local_endpoint;
     memory::ThreadLocalString tag;
@@ -143,6 +143,8 @@ struct Inbound {
     }
     ForwardedMetadataView MakeForwardedMetadata() const&& = delete;
 };
+using ClientIpSource = Inbound::ClientIpSource;
+
 
 // xray-core common/session.Outbound 对应的出站目标/路由元数据。
 struct Outbound {
@@ -182,14 +184,9 @@ struct Context {
     Content content;
     Traffic traffic;
 
-    // 接入时间戳（微秒，Unix 纪元），用于访问日志。
-    int64_t accept_time_us = 0;
-
     uint32_t worker_id = 0;
 
-    Context() {
-        accept_time_us = NowMicros();
-    }
+    Context() = default;
 
     Context(const Context&) = delete;
     Context& operator=(const Context&) = delete;

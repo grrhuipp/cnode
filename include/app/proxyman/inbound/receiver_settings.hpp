@@ -25,10 +25,9 @@ struct ReceiverSettings {
     StreamSettings   stream_settings;  // 传输层配置（network/security）
     routing::DispatchPolicy dispatch_policy;
     ProxyProtocolMode proxy_protocol = ProxyProtocolMode::Auto;
-    bool             has_route_inbound_tags = false;  // 构建期归一化，热入口只读位
 
     [[nodiscard]] const std::vector<std::string>* RouteInboundTags() const noexcept {
-        return has_route_inbound_tags ? &inbound_tags : nullptr;
+        return inbound_tags.empty() ? nullptr : &inbound_tags;
     }
 };
 
@@ -41,9 +40,7 @@ struct ReceiverSettings {
     ProxyProtocolMode proxy_protocol,
     routing::OutboundSelectionPolicy outbound_policy,
     std::string accounting_key) {
-    const bool has_route_inbound_tags =
-        !inbound_tags.empty() &&
-        !(inbound_tags.size() == 1 && inbound_tags.front() == inbound_tag);
+    std::erase(inbound_tags, inbound_tag);
     return ReceiverSettings{
         .inbound_tag = std::move(inbound_tag),
         .inbound_tags = std::move(inbound_tags),
@@ -55,7 +52,6 @@ struct ReceiverSettings {
             .outbound = std::move(outbound_policy),
         },
         .proxy_protocol = proxy_protocol,
-        .has_route_inbound_tags = has_route_inbound_tags,
     };
 }
 

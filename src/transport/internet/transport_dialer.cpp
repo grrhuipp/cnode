@@ -34,11 +34,9 @@ net::awaitable<DialResult> DialSingleCandidate(
 
 [[nodiscard]] std::optional<OutboundDialCandidate> FirstDialCandidate(
     const OutboundTransportTarget& target) {
-    if (target.single_candidate) {
-        return target.single_candidate;
-    }
-    if (!target.candidates.empty()) {
-        return target.candidates.front();
+    const auto candidates = target.Candidates();
+    if (!candidates.empty()) {
+        return candidates.front();
     }
     return std::nullopt;
 }
@@ -300,6 +298,65 @@ protected:
                 downlink_->Close();
             }
         }
+    }
+    net::awaitable<std::unique_ptr<AsyncStream>> DialAndBuildUploadRequest(
+        std::string_view path,
+        XHttpClientRequestKind kind,
+        std::span<const net::const_buffer> payloads) {
+        const bool stream_up = kind == XHttpClientRequestKind::StreamUp;
+        auto tcp_result = co_await DialSingleCandidate(io_context_, target_, candidate_);
+        if (!tcp_result.Ok()) {
+            if (tcp_result.error == ErrorCode::DIAL_TIMEOUT) {
+                upload_write_expired_ = true;
+                throw IoSystemError(io_error::timed_out,
+                    stream_up ? "xhttp stream-up dial timed out"
+                              : "xhttp packet-up dial timed out");
+            }
+            ThrowXHttpPacketError(
+                stream_up ? "xhttp stream-up dial failed"
+                          : "xhttp packet-up dial failed");
+        }
+        if (closed_ || write_closed_) {
+            tcp_result.stream->CloseAbortive();
+            ThrowXHttpPacketError(
+                stream_up ? "xhttp stream-up closed while dialing"
+                          : "xhttp packet-up closed while dialing");
+        }
+        tcp_result.stream->SetIdleTimeout(target_.timeout);
+        tcp_result.stream->SetWriteTimeout(write_timeout_);
+        (void)tcp_result.stream->StartPhaseDeadline(target_.timeout);
+
+        TransportBuildResult build_result;
+        {
+            InFlightUploadScope in_flight_scope(*this, BaseTcpStreamOf(*tcp_result.stream));
+            build_result = co_await BuildOutboundXHttpClientRequest(
+                std::move(tcp_result.stream),
+                *target_.stream_settings,
+                target_.security_context,
+                target_.tls_server_name,
+                target_.ws_host,
+                path,
+                kind,
+                payloads,
+                conn_id_);
+        }
+        if (!build_result || (stream_up && !*build_result)) {
+            if ((!build_result && build_result.error() == ErrorCode::TIMEOUT) ||
+                upload_write_expired_) {
+                upload_write_expired_ = true;
+                throw IoSystemError(io_error::timed_out,
+                    stream_up ? "xhttp stream-up request timed out"
+                              : "xhttp packet-up request timed out");
+            }
+            ThrowXHttpPacketError(
+                stream_up ? "xhttp stream-up request failed"
+                          : "xhttp packet-up request failed");
+        }
+        if (stream_up && (closed_ || write_closed_)) {
+            (*build_result)->CloseAbortive();
+            ThrowXHttpPacketError("xhttp stream-up closed while opening");
+        }
+        co_return std::move(*build_result);
     }
 
     net::io_context& io_context_;
@@ -615,49 +672,8 @@ private:
             ~OpeningScope() { opening = false; }
         } opening_scope{upload_opening_};
 
-        auto tcp_result = co_await DialSingleCandidate(io_context_, target_, candidate_);
-        if (!tcp_result.Ok()) {
-            if (tcp_result.error == ErrorCode::DIAL_TIMEOUT) {
-                upload_write_expired_ = true;
-                throw IoSystemError(io_error::timed_out, "xhttp stream-up dial timed out");
-            }
-            ThrowXHttpPacketError("xhttp stream-up dial failed");
-        }
-        if (closed_ || write_closed_) {
-            tcp_result.stream->CloseAbortive();
-            ThrowXHttpPacketError("xhttp stream-up closed while dialing");
-        }
-        tcp_result.stream->SetIdleTimeout(target_.timeout);
-        tcp_result.stream->SetWriteTimeout(write_timeout_);
-        (void)tcp_result.stream->StartPhaseDeadline(target_.timeout);
-
-        TransportBuildResult build_result;
-        {
-            InFlightUploadScope in_flight_scope(*this, BaseTcpStreamOf(*tcp_result.stream));
-            build_result = co_await BuildOutboundXHttpClientRequest(
-                std::move(tcp_result.stream),
-                *target_.stream_settings,
-                target_.security_context,
-                target_.tls_server_name,
-                target_.ws_host,
-                upload_path_,
-                XHttpClientRequestKind::StreamUp,
-                initial_payload.Span(),
-                conn_id_);
-        }
-        if (!build_result || !*build_result) {
-            if ((!build_result && build_result.error() == ErrorCode::TIMEOUT) ||
-                upload_write_expired_) {
-                upload_write_expired_ = true;
-                throw IoSystemError(io_error::timed_out, "xhttp stream-up request timed out");
-            }
-            ThrowXHttpPacketError("xhttp stream-up request failed");
-        }
-        if (closed_ || write_closed_) {
-            (*build_result)->CloseAbortive();
-            ThrowXHttpPacketError("xhttp stream-up closed while opening");
-        }
-        upload_ = std::move(*build_result);
+        upload_ = co_await DialAndBuildUploadRequest(
+            upload_path_, XHttpClientRequestKind::StreamUp, initial_payload.Span());
         upload_->ClearPhaseDeadline();
         upload_->SetIdleTimeout(std::chrono::seconds(0));
         upload_->SetWriteTimeout(write_timeout_);
@@ -721,7 +737,7 @@ public:
             mb.clear();
             ThrowXHttpPacketError("xhttp packet-up write after shutdown");
         }
-        co_await AsyncStream::WriteMultiBuffer(std::move(mb));
+        return AsyncStream::WriteMultiBuffer(std::move(mb));
     }
 
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
@@ -768,43 +784,8 @@ private:
         (void)ec;  // 20 digits always fit a uint64_t.
         path.append(seq_text.data(), static_cast<size_t>(seq_end - seq_text.data()));
 
-        auto tcp_result = co_await DialSingleCandidate(io_context_, target_, candidate_);
-        if (!tcp_result.Ok()) {
-            if (tcp_result.error == ErrorCode::DIAL_TIMEOUT) {
-                upload_write_expired_ = true;
-                throw IoSystemError(io_error::timed_out, "xhttp packet-up dial timed out");
-            }
-            ThrowXHttpPacketError("xhttp packet-up dial failed");
-        }
-        if (closed_ || write_closed_) {
-            tcp_result.stream->CloseAbortive();
-            ThrowXHttpPacketError("xhttp packet-up closed while dialing");
-        }
-        tcp_result.stream->SetIdleTimeout(target_.timeout);
-        tcp_result.stream->SetWriteTimeout(write_timeout_);
-        (void)tcp_result.stream->StartPhaseDeadline(target_.timeout);
-
-        TransportBuildResult build_result;
-        {
-            InFlightUploadScope in_flight_scope(*this, BaseTcpStreamOf(*tcp_result.stream));
-            build_result = co_await BuildOutboundXHttpClientRequest(
-                std::move(tcp_result.stream),
-                *target_.stream_settings,
-                target_.security_context,
-                target_.tls_server_name,
-                target_.ws_host,
-                path,
-                XHttpClientRequestKind::PacketUp,
-                payloads,
-                conn_id_);
-        }
-        if (!build_result) {
-            if (build_result.error() == ErrorCode::TIMEOUT || upload_write_expired_) {
-                upload_write_expired_ = true;
-                throw IoSystemError(io_error::timed_out, "xhttp packet-up request timed out");
-            }
-            ThrowXHttpPacketError("xhttp packet-up request failed");
-        }
+        (void)co_await DialAndBuildUploadRequest(
+            path, XHttpClientRequestKind::PacketUp, payloads);
         TouchDownlinkActivity();
     }
 
@@ -1009,13 +990,9 @@ net::awaitable<DialResult> DialXHttpSplitOutboundTransport(
         co_return false;
     };
 
-    if (downlink_target.single_candidate) {
-        (void)co_await try_downlink_candidate(*downlink_target.single_candidate);
-    } else {
-        for (const auto& candidate : downlink_target.candidates) {
-            if (co_await try_downlink_candidate(candidate)) {
-                break;
-            }
+    for (const auto& candidate : downlink_target.Candidates()) {
+        if (co_await try_downlink_candidate(candidate)) {
+            break;
         }
     }
 
@@ -1064,22 +1041,19 @@ net::awaitable<DialResult> DialOutboundTransport(
     const OutboundTransportTarget& target) {
 
 
+    const auto candidates = target.Candidates();
     DialResult result;
-    if ((!target.single_candidate && target.candidates.empty()) ||
-        target.stream_settings == nullptr) {
+    if (candidates.empty() || target.stream_settings == nullptr) {
         result = DialResult::Fail(
             ErrorCode::INVALID_ARGUMENT, "invalid outbound transport target");
     } else if (IsXHttpSplitOutbound(target)) {
         result = co_await DialXHttpSplitOutboundTransport(io_context, ctx, target);
-    } else if (target.single_candidate) {
+    } else if (candidates.size() == 1) {
         result = co_await DialAndBuildSingleCandidate(
-            io_context, ctx, target, *target.single_candidate);
-    } else if (target.candidates.size() == 1) {
-        result = co_await DialAndBuildSingleCandidate(
-            io_context, ctx, target, target.candidates.front());
+            io_context, ctx, target, candidates.front());
     } else {
         result = co_await DialAndBuildCandidatesSequential(
-            io_context, ctx, target, target.candidates);
+            io_context, ctx, target, candidates);
     }
 
     co_return result;

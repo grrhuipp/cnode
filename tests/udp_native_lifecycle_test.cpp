@@ -200,8 +200,7 @@ public:
         .stream_settings = {},
         .dispatch_policy = {
             .sniffing = {},
-            .outbound = ::routing::ForceOutbound{"loopback"}},
-        .has_route_inbound_tags = true};
+            .outbound = ::routing::ForceOutbound{"loopback"}}};
     receiver.stream_settings.security = "tls";
     return receiver;
 }

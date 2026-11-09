@@ -89,8 +89,6 @@ SendTrojanHandshake(
         target,
         header_buf.data(),
         header_buf.size(),
-        nullptr,
-        0,
         dialer.ForwardedMetadata(ctx));
     if (header_len == 0) {
         LOG_CONN_WARN(ctx, "handshake encode failed");
@@ -98,14 +96,11 @@ SendTrojanHandshake(
     }
 
     try {
-        ConstBufferSpanBuilder<1> header_buffers;
-        header_buffers.Append(net::const_buffer(header_buf.data(), header_len));
-        co_await stream.WriteBuffers(header_buffers.Span());
-        OPENSSL_cleanse(header_buf.data(), header_buf.size());
+        const net::const_buffer header_buffer(header_buf.data(), header_len);
+        co_await stream.WriteBuffers({&header_buffer, 1});
         LOG_CONN_DEBUG(ctx, "handshake sent {} bytes", header_len);
         co_return tl::expected<void, ErrorCode>{};
     } catch (...) {
-        OPENSSL_cleanse(header_buf.data(), header_buf.size());
         co_return tl::unexpected(
             proxy::ClassifyOutboundHandshakeException(
                 stream, outbound_protocol_deadline));

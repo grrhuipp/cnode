@@ -181,13 +181,13 @@ private:
     net::awaitable<tl::expected<HttpResponse, FetchResult>>
     FetchConditionalResource(std::string_view endpoint,
                              std::string committed_etag,
-                             const PanelLogContext& log_context,
                              std::string_view missing_etag_error,
                              std::string_view pull_failure_label,
                              bool log_not_modified = false);
 
     net::io_context& io_context_;
     ::api::Config config_;
+    const PanelLogContext log_context_;
     PanelApiUrlParts url_parts_;
     std::optional<net::ip::address> literal_address_;
     std::string api_node_type_;
@@ -202,6 +202,7 @@ APIClient::APIClient(net::io_context& io_context,
                      ::app::dns::DNS& dns_service)
     : io_context_(io_context)
     , config_(config)
+    , log_context_{config_.Name, config_.APIHost, config_.NodeID, config_.NodeType}
     , dns_service_(dns_service) {
     if (config_.RequestTimeout <= std::chrono::seconds::zero() ||
         config_.RequestTimeout > std::chrono::seconds(defaults::kMaxPanelRequestTimeout)) {
@@ -253,7 +254,6 @@ APIClient::HttpExchange(HttpMethod method,
                         std::string body_text,
                         std::string if_none_match) {
     HttpResponse result;
-    const PanelLogContext log_context{config_.Name, config_.APIHost, config_.NodeID, config_.NodeType};
 
     // 面板同步是冷路径；保留完整候选地址，避免双栈环境只尝试第一个解析结果。
     std::vector<tcp::endpoint> endpoints;
@@ -338,7 +338,7 @@ APIClient::HttpExchange(HttpMethod method,
                     throw;
                 }
                 last_error = e.what();
-                LOG_PANEL_DEBUG(log_context, "HTTPS endpoint connection failed: endpoint={} reason={}",
+                LOG_PANEL_DEBUG(log_context_, "HTTPS endpoint connection failed: endpoint={} reason={}",
                           iputil::FormatEndpointForLog(iputil::AddressText(endpoint.address()).View(), endpoint.port()),
                           last_error);
                 continue;
@@ -378,7 +378,7 @@ APIClient::HttpExchange(HttpMethod method,
                     throw;
                 }
                 last_error = e.what();
-                LOG_PANEL_DEBUG(log_context, "HTTP endpoint connection failed: endpoint={} reason={}",
+                LOG_PANEL_DEBUG(log_context_, "HTTP endpoint connection failed: endpoint={} reason={}",
                           iputil::FormatEndpointForLog(iputil::AddressText(endpoint.address()).View(), endpoint.port()),
                           last_error);
                 continue;
@@ -405,7 +405,6 @@ template <typename FetchResult>
 net::awaitable<tl::expected<HttpResponse, FetchResult>>
 APIClient::FetchConditionalResource(std::string_view endpoint,
                                     std::string committed_etag,
-                                    const PanelLogContext& log_context,
                                     std::string_view missing_etag_error,
                                     std::string_view pull_failure_label,
                                     bool log_not_modified) {
@@ -419,13 +418,13 @@ APIClient::FetchConditionalResource(std::string_view endpoint,
                 std::string(missing_etag_error)));
         }
         if (log_not_modified) {
-            LOG_PANEL_DEBUG(log_context, "Node users unchanged: HTTP status=304");
+            LOG_PANEL_DEBUG(log_context_, "Node users unchanged: HTTP status=304");
         }
         co_return tl::unexpected(FetchResult::NotModified());
     }
     if (resp.status != 200) {
         const auto error_message = FormatHttpFailure(resp);
-        LOG_PANEL_DEBUG(log_context, "{}: {}", pull_failure_label, error_message);
+        LOG_PANEL_DEBUG(log_context_, "{}: {}", pull_failure_label, error_message);
         co_return tl::unexpected(FetchResult::Fail(
             ErrorCode::PANEL_API_FAILED,
             error_message));
@@ -435,11 +434,9 @@ APIClient::FetchConditionalResource(std::string_view endpoint,
 
 net::awaitable<NodeInfoFetchResult>
 APIClient::GetNodeInfo(std::string committed_etag) {
-    const PanelLogContext log_context{config_.Name, config_.APIHost, config_.NodeID, config_.NodeType};
     auto fetched = co_await FetchConditionalResource<NodeInfoFetchResult>(
         "config",
         std::move(committed_etag),
-        log_context,
         "received 304 without a committed node ETag",
         "Node configuration pull failed");
     if (!fetched) {
@@ -449,7 +446,7 @@ APIClient::GetNodeInfo(std::string committed_etag) {
     try {
         auto jv = json::parse(resp.body);
         if (!jv.is_object()) {
-            LOG_PANEL_ERROR(log_context, "Invalid node configuration: root JSON value must be an object");
+            LOG_PANEL_ERROR(log_context_, "Invalid node configuration: root JSON value must be an object");
             co_return NodeInfoFetchResult::Fail(
                 ErrorCode::PANEL_INVALID_RESPONSE,
                 "root JSON value must be an object");
@@ -458,7 +455,7 @@ APIClient::GetNodeInfo(std::string committed_etag) {
 
         auto parsed_config = ParseNodeInfo(j, config_.NodeType);
         if (!parsed_config) {
-            LOG_PANEL_ERROR(log_context, "Invalid node configuration: {}", parsed_config.error());
+            LOG_PANEL_ERROR(log_context_, "Invalid node configuration: {}", parsed_config.error());
             co_return NodeInfoFetchResult::Fail(
                 ErrorCode::PANEL_INVALID_RESPONSE,
                 std::move(parsed_config.error()));
@@ -467,28 +464,25 @@ APIClient::GetNodeInfo(std::string committed_etag) {
 
         auto rules = ExtractBlockDetectRules(j);
 
-        LOG_PANEL_DEBUG(log_context, "Node configuration received: protocol={} port={} network={}",
+        LOG_PANEL_DEBUG(log_context_, "Node configuration received: protocol={} port={} network={}",
                         config.NodeType, config.Port, config.TransportProtocol);
 
         co_return NodeInfoFetchResult::Success(
             std::move(config), std::move(rules), std::move(resp.etag));
 
     } catch (const std::exception& e) {
-        LOG_PANEL_ERROR(log_context, "Node configuration parsing failed: {}", e.what());
+        LOG_PANEL_ERROR(log_context_, "Node configuration parsing failed: {}", e.what());
         co_return NodeInfoFetchResult::Fail(ErrorCode::PANEL_INVALID_RESPONSE, e.what());
     }
 }
 
 net::awaitable<UserListFetchResult>
 APIClient::GetUserList(std::string committed_etag) {
-    const PanelLogContext log_context{config_.Name, config_.APIHost, config_.NodeID, config_.NodeType};
-
     // Only the owner of a committed user snapshot may supply its validator.
     // A successful fetch alone must not acknowledge a failed runtime update.
     auto fetched = co_await FetchConditionalResource<UserListFetchResult>(
         "user",
         std::move(committed_etag),
-        log_context,
         "received 304 without a committed user ETag",
         "User list pull failed",
         true);
@@ -499,7 +493,7 @@ APIClient::GetUserList(std::string committed_etag) {
     try {
         auto jv = json::parse(resp.body);
         if (!jv.is_object()) {
-            LOG_PANEL_ERROR(log_context, "User list parsing failed: root JSON value must be an object");
+            LOG_PANEL_ERROR(log_context_, "User list parsing failed: root JSON value must be an object");
             co_return UserListFetchResult::Fail(
                 ErrorCode::PANEL_INVALID_RESPONSE,
                 "root JSON value must be an object");
@@ -508,17 +502,17 @@ APIClient::GetUserList(std::string committed_etag) {
 
         auto users = ParseUserList(j);
         if (!users) {
-            LOG_PANEL_ERROR(log_context, "User list parsing failed: {}", users.error());
+            LOG_PANEL_ERROR(log_context_, "User list parsing failed: {}", users.error());
             co_return UserListFetchResult::Fail(
                 ErrorCode::PANEL_INVALID_RESPONSE,
                 std::move(users.error()));
         }
 
-        LOG_PANEL_DEBUG(log_context, "User list received: users={}", users->size());
+        LOG_PANEL_DEBUG(log_context_, "User list received: users={}", users->size());
         co_return UserListFetchResult::Success(std::move(*users), std::move(resp.etag));
 
     } catch (const std::exception& e) {
-        LOG_PANEL_ERROR(log_context, "User list parsing failed: {}", e.what());
+        LOG_PANEL_ERROR(log_context_, "User list parsing failed: {}", e.what());
         co_return UserListFetchResult::Fail(ErrorCode::PANEL_INVALID_RESPONSE, e.what());
     }
 }
@@ -526,7 +520,6 @@ APIClient::GetUserList(std::string committed_etag) {
 net::awaitable<bool>
 APIClient::ReportUserTraffic(const std::vector<::api::UserTraffic>& data) {
     const int node_id = config_.NodeID;
-    const PanelLogContext log_context{config_.Name, config_.APIHost, node_id, config_.NodeType};
 
     // V2Board UniProxy push 格式: {user_id: [upload, download], ...}
     std::map<int64_t, ::api::UserTraffic> aggregated;
@@ -554,18 +547,17 @@ APIClient::ReportUserTraffic(const std::vector<::api::UserTraffic>& data) {
         HttpMethod::Post, std::move(path), json::serialize(json::value(std::move(body))), {});
 
     if (resp.status != 200) {
-        LOG_PANEL_WARN(log_context, "Traffic API acceptance unknown: {}", FormatHttpFailure(resp));
+        LOG_PANEL_WARN(log_context_, "Traffic API acceptance unknown: {}", FormatHttpFailure(resp));
         co_return false;
     }
 
-    LOG_PANEL_DEBUG(log_context, "Traffic API accepted: users={} (not a billing commit acknowledgement)", aggregated.size());
+    LOG_PANEL_DEBUG(log_context_, "Traffic API accepted: users={} (not a billing commit acknowledgement)", aggregated.size());
     co_return true;
 }
 
 net::awaitable<bool>
 APIClient::ReportNodeOnlineUsers(const std::vector<::api::OnlineUser>& online_users) {
     const int node_id = config_.NodeID;
-    const PanelLogContext log_context{config_.Name, config_.APIHost, node_id, config_.NodeType};
     auto report = BuildOnlineReportPayload(online_users, node_id);
 
     if (!report.alive_body.empty()) {
@@ -575,12 +567,12 @@ APIClient::ReportNodeOnlineUsers(const std::vector<::api::OnlineUser>& online_us
         auto alive_resp = co_await HttpRequest(
             HttpMethod::Post, alive_path, json::serialize(json::value(std::move(report.alive_body))), {});
         if (alive_resp.status != 200) {
-            LOG_PANEL_WARN(log_context, "Online device report failed: {}", FormatHttpFailure(alive_resp));
+            LOG_PANEL_WARN(log_context_, "Online device report failed: {}", FormatHttpFailure(alive_resp));
             co_return false;
         }
     }
 
-    LOG_PANEL_DEBUG(log_context, "Online devices reported: users={} devices={}", report.user_count, report.device_count);
+    LOG_PANEL_DEBUG(log_context_, "Online devices reported: users={} devices={}", report.user_count, report.device_count);
     co_return true;
 }
 

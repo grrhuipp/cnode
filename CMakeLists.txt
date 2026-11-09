@@ -150,9 +150,7 @@ set(CNODE_CORE_SOURCES
     src/service/controller/controller.cpp
     src/service/controller/traffic_journal.cpp
     src/common/awaitable_batch.cpp
-    src/service/controller/node_transition.cpp
     src/service/controller/node_runtime.cpp
-    src/service/controller/online_snapshot.cpp
     src/infra/panel_config.cpp
     src/infra/panel_node_ids.cpp
     src/service/controller/panel_inbound.cpp
@@ -236,7 +234,6 @@ set(CNODE_CORE_SOURCES
     # Proxy - AnyTLS
     src/proxy/anytls/anytls_codec.cpp
     src/proxy/anytls/padding.cpp
-    src/proxy/anytls/credentials.cpp
     src/proxy/anytls/inbound/anytls_inbound.cpp
     src/proxy/anytls/outbound/anytls_outbound_settings.cpp
     src/proxy/anytls/outbound/anytls_outbound.cpp

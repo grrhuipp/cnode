@@ -2,6 +2,7 @@
 
 #include "common/allocator.hpp"
 #include "common/asio_types.hpp"
+#include "common/byte_reader.hpp"
 #include "transport/internet/timeout_scheduler.hpp"
 
 #include <asio/as_tuple.hpp>
@@ -85,8 +86,7 @@ public:
             co_return failure;
         }
         while (used_ids_.test(id)) ++id;
-        query[0] = static_cast<uint8_t>(id >> 8);
-        query[1] = static_cast<uint8_t>(id);
+        StoreU16BE(query.data(), id);
         Pending request(*this, id, query);
         pending_.emplace(id, &request);
         if (!scheduler_.ScheduleAfter(timeout, request)) {
@@ -214,7 +214,7 @@ private:
                         return;
                     }
                     if (!ec && size >= 2) {
-                        const uint16_t id = (self->buffer_[0] << 8) | self->buffer_[1];
+                        const uint16_t id = LoadU16BE(self->buffer_.data());
                         const auto it = self->pending_.find(id);
                         if (it != self->pending_.end() &&
                             Matches(std::span(self->buffer_.data(), size), it->second->query)) {

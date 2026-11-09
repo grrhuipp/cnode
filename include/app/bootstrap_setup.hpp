@@ -62,7 +62,7 @@ struct BootstrapEnvironment {
     ShardedStats& stats,
     geo::GeoDatabase* geo_database,
     app::dns::DNSWorker& dns_worker,
-    net::io_context* control_io = nullptr);
+    net::io_context& control_io);
 
 [[nodiscard]] BootstrapEnvironment CreateBootstrapEnvironment(
     const Config& config,

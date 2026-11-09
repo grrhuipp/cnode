@@ -66,7 +66,6 @@ void RecordExtractedRealIp(std::string_view head,
                            std::string_view header_name,
                            InboundTransportMetadata* metadata);
 
-[[nodiscard]] std::string SanitizeForLog(std::string_view value, size_t max_len = 160);
 // Origin paths, absolute URLs and authorities share this log-only projection.
 // Removes URL credentials/query/fragment; ambiguous URLs and control bytes are
 // replaced with a fixed marker, never repaired into a plausible authority.

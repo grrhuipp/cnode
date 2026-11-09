@@ -97,8 +97,6 @@ struct ReplyQueueState {
     // watermark, so the aggregate never grows with the sub-session count.
     size_t sub_input_bytes = 0;
 
-    size_t TotalBytes() const noexcept { return tcp_queued_bytes + udp_queued_bytes; }
-
     void AddWaitingWriter(TcpSubState* writer) noexcept;
     void RemoveWaitingWriter(TcpSubState* writer) noexcept;
     void WakeWaitingWriters() noexcept;
@@ -582,81 +580,6 @@ public:
         mb.clear();
     }
 
-    net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
-        co_await WaitForOutputWindow();
-        if (cancelled_ || !reply_queue_.running) {
-            throw IoSystemError(
-                io_error::operation_aborted,
-                "Mux TCP reply path closed");
-        }
-        if (EndSent()) {
-            throw transport::WriteClosed{};
-        }
-
-        size_t payload_bytes = 0;
-        for (const net::const_buffer& buffer : buffers) {
-            payload_bytes += buffer.size();
-        }
-        if (payload_bytes == 0) {
-            co_return;
-        }
-        constexpr size_t kMaxMuxChunkSize = std::numeric_limits<uint16_t>::max();
-        const size_t reply_count =
-            (payload_bytes + kMaxMuxChunkSize - 1) / kMaxMuxChunkSize;
-        if (!reply_queue_.CanPushTcp(payload_bytes, reply_count)) {
-            reply_queue_.MarkTcpOverflow();
-            Cancel();
-            throw IoSystemError(
-                io_error::no_buffer_space,
-                "Mux TCP reply queue full");
-        }
-
-        size_t buf_idx = 0;
-        size_t buf_off = 0;
-        size_t remaining_total = payload_bytes;
-        while (remaining_total > 0) {
-            const size_t chunk_target = std::min(remaining_total, kMaxMuxChunkSize);
-            buf::MultiBuffer payload;
-            size_t chunk_filled = 0;
-            while (chunk_filled < chunk_target && buf_idx < buffers.size()) {
-                const auto* data = static_cast<const uint8_t*>(buffers[buf_idx].data());
-                const size_t sz = buffers[buf_idx].size();
-                if (!data || buf_off >= sz) {
-                    ++buf_idx;
-                    buf_off = 0;
-                    continue;
-                }
-                const size_t take = std::min(sz - buf_off, chunk_target - chunk_filled);
-                if (!buf::AppendSpanToMultiBuffer(
-                        std::span<const uint8_t>(data + buf_off, take), payload)) {
-                    Cancel();
-                    throw std::bad_alloc();
-                }
-                buf_off += take;
-                chunk_filled += take;
-                if (buf_off == sz) {
-                    ++buf_idx;
-                    buf_off = 0;
-                }
-            }
-
-            MuxReply reply;
-            reply.session_id = session_id_;
-            reply.is_end = false;
-            reply.is_udp = false;
-            reply.payload_size = chunk_filled;
-            reply.payload = std::move(payload);
-            if (!reply_queue_.PushTcp(std::move(reply))) {
-                reply_queue_.MarkTcpOverflow();
-                Cancel();
-                throw IoSystemError(
-                    io_error::no_buffer_space,
-                    "Mux TCP reply queue admission changed");
-            }
-            remaining_total -= chunk_filled;
-        }
-    }
-
 private:
     void OnCancel() noexcept override {
         reply_queue_.RemoveWaitingWriter(this);
@@ -870,15 +793,13 @@ net::awaitable<void> RunSubDispatch(
 
 }  // namespace
 
-namespace {
-
 // ============================================================================
 // ProcessInbound
 //
 // 处理已解密的 Mux.Cool 帧流。
 // 每帧可携带 TCP 或 UDP 子会话数据；服务端负责为每个子会话拨号出站。
 // ============================================================================
-net::awaitable<RelayResult> ProcessInboundImpl(
+net::awaitable<RelayResult> ProcessInbound(
     net::io_context& io_context,
     transport::Link client_link,
     AsyncStream& client_control,
@@ -890,13 +811,14 @@ net::awaitable<RelayResult> ProcessInboundImpl(
     const TimeoutsConfig& timeouts,
     uint32_t pressure_idle_timeout)
 {
+    RelayResult result;
+    try {
+    LOG_ACCESS(FormatAccessLog(parent_ctx));
     if (!client_link.Valid()) {
         client_control.CloseAbortive();
-        RelayResult error;
-        error.error = ErrorCode::PROTOCOL_DECODE_FAILED;
-        co_return error;
+        result.error = ErrorCode::PROTOCOL_DECODE_FAILED;
+        co_return result;
     }
-
     (void)client_control.ConsumePhaseDeadline();
     client_control.ClearPhaseDeadline();
     auto relay_idle_timeout = timeouts.IdleTimeout();
@@ -923,7 +845,6 @@ net::awaitable<RelayResult> ProcessInboundImpl(
     buf::MultiBuffer frame_buf;
     size_t frame_buf_bytes = 0;
 
-    RelayResult result;
     parent_ctx.traffic.bytes_up = 0;
     parent_ctx.traffic.bytes_down = 0;
 
@@ -1499,39 +1420,6 @@ net::awaitable<RelayResult> ProcessInboundImpl(
     }
 #endif
 
-    if (result.error != ErrorCode::OK) {
-        client_control.CloseAbortive();
-    }
-    co_return result;
-}
-
-}  // namespace
-
-net::awaitable<RelayResult> ProcessInbound(
-    net::io_context& io_context,
-    transport::Link client_link,
-    AsyncStream& client_control,
-    routing::Dispatcher& dispatcher,
-    const routing::DispatchPolicy& policy,
-    ConnectionLimiter* limiter,
-    session::Context& parent_ctx,
-    StatsShard& stats,
-    const TimeoutsConfig& timeouts,
-    uint32_t pressure_idle_timeout) {
-    RelayResult result;
-    try {
-        LOG_ACCESS(FormatAccessLog(parent_ctx));
-        result = co_await ProcessInboundImpl(
-            io_context,
-            client_link,
-            client_control,
-            dispatcher,
-            policy,
-            limiter,
-            parent_ctx,
-            stats,
-            timeouts,
-            pressure_idle_timeout);
     } catch (const std::bad_alloc&) {
         stats.OnError();
         result.error = ErrorCode::RESOURCE_EXHAUSTED;

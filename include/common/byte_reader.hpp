@@ -46,6 +46,15 @@ constexpr void StoreU64BE(uint8_t* out, uint64_t value) noexcept {
     StoreU32BE(out + 4, static_cast<uint32_t>(value));
 }
 
+[[nodiscard]] constexpr size_t VarintU64Size(uint64_t value) noexcept {
+    size_t size = 1;
+    while (value >= 0x80) {
+        value >>= 7;
+        ++size;
+    }
+    return size;
+}
+
 class ByteReader {
 public:
     ByteReader(const uint8_t* data, size_t size) noexcept
@@ -159,6 +168,16 @@ public:
         if (!CanWrite(2)) return false;
         StoreU16BE(data_ + pos_, value);
         pos_ += 2;
+        return true;
+    }
+
+    bool WriteVarintU64(uint64_t value) noexcept {
+        if (!CanWrite(VarintU64Size(value))) return false;
+        while (value >= 0x80) {
+            data_[pos_++] = static_cast<uint8_t>((value & 0x7Fu) | 0x80u);
+            value >>= 7;
+        }
+        data_[pos_++] = static_cast<uint8_t>(value);
         return true;
     }
 

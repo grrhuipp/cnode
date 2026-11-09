@@ -276,7 +276,7 @@ net::awaitable<DnsResult> DNSWorker::Impl::QueryServer(
         result.error_msg = response.error.message();
         co_return result;
     }
-    const uint16_t txid = (static_cast<uint16_t>(query[0]) << 8) | query[1];
+    const uint16_t txid = LoadU16BE(query.data());
     co_return ParseResponse(
         std::span<const uint8_t>(response.bytes.data(), response.size),
         txid,
@@ -309,11 +309,9 @@ size_t DNSWorker::Impl::BuildQueryTo(
     query[out++] = 0x00;
 
     const uint16_t qtype = query_aaaa ? wire::TYPE_AAAA : wire::TYPE_A;
-    query[out++] = static_cast<uint8_t>(qtype >> 8);
-    query[out++] = static_cast<uint8_t>(qtype & 0xFF);
-    query[out++] = 0x00;
-    query[out++] = 0x01;
-    return out;
+    StoreU16BE(query.data() + out, qtype);
+    StoreU16BE(query.data() + out + 2, 1);
+    return out + 4;
 }
 
 DnsResult DNSWorker::Impl::ParseResponse(
@@ -326,16 +324,14 @@ DnsResult DNSWorker::Impl::ParseResponse(
         return result;
     }
 
-    const uint16_t txid =
-        (static_cast<uint16_t>(response[0]) << 8) | response[1];
+    const uint16_t txid = LoadU16BE(response.data());
     if (txid != expected_txid) {
         result.error = ErrorCode::DNS_RESOLVE_FAILED;
         result.error_msg = "DNS transaction ID mismatch";
         return result;
     }
 
-    const uint16_t flags =
-        (static_cast<uint16_t>(response[2]) << 8) | response[3];
+    const uint16_t flags = LoadU16BE(response.data() + 2);
     if (!(flags & wire::FLAG_QR) || (flags & 0x0200)) {
         result.error = ErrorCode::DNS_FORMAT_ERROR;
         result.error_msg = "DNS packet is not a complete response";
@@ -362,8 +358,7 @@ DnsResult DNSWorker::Impl::ParseResponse(
         return result;
     }
 
-    const uint16_t qdcount =
-        (static_cast<uint16_t>(response[4]) << 8) | response[5];
+    const uint16_t qdcount = LoadU16BE(response.data() + 4);
     if (qdcount != 1) {
         result.error = ErrorCode::DNS_FORMAT_ERROR;
         result.error_msg = "DNS question count is not 1";
@@ -388,8 +383,7 @@ DnsResult DNSWorker::Impl::ParseResponse(
                 if (current_offset + 1 >= response.size()) {
                     return false;
                 }
-                const size_t ptr =
-                    (static_cast<size_t>(len & 0x3F) << 8) | response[current_offset + 1];
+                const size_t ptr = LoadU16BE(response.data() + current_offset) & 0x3FFFu;
                 if (ptr < 12 || ptr >= current_offset) {
                     return false;
                 }
@@ -421,10 +415,8 @@ DnsResult DNSWorker::Impl::ParseResponse(
         result.error_msg = "DNS question section truncated";
         return result;
     }
-    const uint16_t qtype =
-        (static_cast<uint16_t>(response[pos]) << 8) | response[pos + 1];
-    const uint16_t qclass =
-        (static_cast<uint16_t>(response[pos + 2]) << 8) | response[pos + 3];
+    const uint16_t qtype = LoadU16BE(response.data() + pos);
+    const uint16_t qclass = LoadU16BE(response.data() + pos + 2);
     if (qtype != (query_aaaa ? wire::TYPE_AAAA : wire::TYPE_A) || qclass != 1) {
         result.error = ErrorCode::DNS_FORMAT_ERROR;
         result.error_msg = "DNS question section invalid";
@@ -438,8 +430,7 @@ DnsResult DNSWorker::Impl::ParseResponse(
         return result;
     }
 
-    const uint16_t ancount =
-        (static_cast<uint16_t>(response[6]) << 8) | response[7];
+    const uint16_t ancount = LoadU16BE(response.data() + 6);
     if (ancount == 0) {
         result.error = ErrorCode::DNS_NO_RECORD;
         result.error_msg = "NODATA";
@@ -462,8 +453,7 @@ DnsResult DNSWorker::Impl::ParseResponse(
             return result;
         }
 
-        const uint16_t type =
-            (static_cast<uint16_t>(response[pos]) << 8) | response[pos + 1];
+        const uint16_t type = LoadU16BE(response.data() + pos);
         if (response[pos + 2] != 0 || response[pos + 3] != 1) {
             result.error = ErrorCode::DNS_FORMAT_ERROR;
             result.error_msg = "DNS answer class is not IN";
@@ -472,8 +462,7 @@ DnsResult DNSWorker::Impl::ParseResponse(
         const uint32_t wire_ttl = LoadU32BE(response.data() + pos + 4);
         // RFC 2181 §8：收到最高位置位的 TTL 时，整个值按零处理。
         const uint32_t ttl = (wire_ttl & 0x80000000u) != 0 ? 0 : wire_ttl;
-        const uint16_t rdlength =
-            (static_cast<uint16_t>(response[pos + 8]) << 8) | response[pos + 9];
+        const uint16_t rdlength = LoadU16BE(response.data() + pos + 8);
 
         pos += 10;
         if (pos + rdlength > response.size()) {

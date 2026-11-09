@@ -42,7 +42,6 @@ struct OutboundTargetOptions {
     const OutboundBind* send_through = nullptr; // Borrowed from the outbound handler.
     const tcp::endpoint* inbound_local_addr = nullptr;
     std::string_view inbound_source_ip{};
-    uint16_t inbound_source_port = 0;
     int64_t inbound_user_id = 0;
     std::string_view inbound_user_email{};
     std::string_view inbound_tag{};

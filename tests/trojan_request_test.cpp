@@ -60,13 +60,15 @@ void TestRequest(::trojan::TrojanCommand command, const ::TargetAddress& target,
     std::array<uint8_t, 512> output{};
     reject_allocation = true;
     const auto length = ::trojan::EncodeRequestTo(
-        hash, command, target, output.data(), output.size(), payload.data(), payload.size());
+        hash, command, target, output.data(), output.size());
     reject_allocation = false;
-    Check(length == expected.size(), "request size mismatch");
+    Check(length == header_size, "request size mismatch");
+    std::copy(payload.begin(), payload.end(), output.begin() + static_cast<std::ptrdiff_t>(length));
     Check(std::equal(expected.begin(), expected.end(), output.begin()), "Trojan wire bytes changed");
 
     using ::trojan::RequestDecodeStatus;
-    const auto decoded = ::trojan::DecodeRequest(std::span<const uint8_t>(output.data(), length));
+    const auto decoded = ::trojan::DecodeRequest(
+        std::span<const uint8_t>(output.data(), expected.size()));
     Check(decoded.status == RequestDecodeStatus::Complete && decoded.consumed == header_size,
           "request parser did not preserve trailing payload");
     Check(decoded.request.command == command && decoded.request.target.SameEndpoint(target),
@@ -91,7 +93,7 @@ void TestRequest(::trojan::TrojanCommand command, const ::TargetAddress& target,
     output.fill(0x5a);
     reject_allocation = true;
     const auto short_length = ::trojan::EncodeRequestTo(
-        hash, command, target, output.data(), expected.size() - 1, payload.data(), payload.size());
+        hash, command, target, output.data(), header_size - 1);
     reject_allocation = false;
     Check(short_length == 0 && std::all_of(output.begin(), output.end(), [](auto b) { return b == 0x5a; }),
           "short output buffer was partially modified");

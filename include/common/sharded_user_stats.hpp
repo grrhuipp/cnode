@@ -50,6 +50,8 @@ public:
 
     std::vector<OnlineDevice> GetOnlineDevices(std::string_view tag) const;
 private:
+    friend class UserOnlineSessionGuard;
+    struct DeviceReservation;
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
@@ -57,13 +59,6 @@ private:
 class UserOnlineSessionGuard {
 public:
     UserOnlineSessionGuard() noexcept = default;
-
-    UserOnlineSessionGuard(std::string_view tag,
-                           uint64_t user_id,
-                           std::string_view client_ip)
-        : tag_(tag)
-        , user_id_(user_id)
-        , client_ip_(client_ip) {}
 
     ~UserOnlineSessionGuard() noexcept {
         Reset();
@@ -74,9 +69,6 @@ public:
 
     UserOnlineSessionGuard(UserOnlineSessionGuard&& other) noexcept
         : tracker_(std::exchange(other.tracker_, nullptr))
-        , tag_(std::move(other.tag_))
-        , user_id_(std::exchange(other.user_id_, 0))
-        , client_ip_(std::move(other.client_ip_))
         , quota_reservation_(std::move(other.quota_reservation_)) {}
 
     UserOnlineSessionGuard& operator=(UserOnlineSessionGuard&& other) noexcept {
@@ -85,9 +77,6 @@ public:
         }
         Reset();
         tracker_ = std::exchange(other.tracker_, nullptr);
-        tag_ = std::move(other.tag_);
-        user_id_ = std::exchange(other.user_id_, 0);
-        client_ip_ = std::move(other.client_ip_);
         quota_reservation_ = std::move(other.quota_reservation_);
         return *this;
     }
@@ -95,21 +84,9 @@ public:
 private:
     friend class UserOnlineTracker;
     void Arm(UserOnlineTracker& tracker) noexcept { tracker_ = &tracker; }
-    void Reset() noexcept {
-        if (tracker_ && user_id_ != 0) {
-            auto* tracker = std::exchange(tracker_, nullptr);
-            tracker->OnUserDisconnected(tag_, std::exchange(user_id_, 0), client_ip_);
-        } else {
-            tracker_ = nullptr;
-            user_id_ = 0;
-        }
-        quota_reservation_.reset();
-    }
+    void Reset() noexcept;
 
     UserOnlineTracker* tracker_ = nullptr;
-    memory::ThreadLocalString tag_;
-    uint64_t user_id_ = 0;
-    memory::ThreadLocalString client_ip_;
-    std::shared_ptr<void> quota_reservation_;
+    std::shared_ptr<UserOnlineTracker::DeviceReservation> quota_reservation_;
 };
 

@@ -158,7 +158,7 @@ WorkerPool CreateWorkerPool(const WorkerRuntimeConfig& runtime_config,
                             ShardedStats& stats,
                             geo::GeoDatabase* geo_database,
                             app::dns::DNSWorker& dns_worker,
-                            net::io_context* control_io) {
+                            net::io_context& control_io) {
     WorkerPool pool;
     const uint32_t workers = std::max<uint32_t>(1, runtime_config.workers);
     pool.workers.reserve(workers);
@@ -174,8 +174,7 @@ WorkerPool CreateWorkerPool(const WorkerRuntimeConfig& runtime_config,
             i, *pool.io_contexts[i], runtime_config, worker_stats, dns_worker,
             geo_database));
     }
-    auto& coordinator_io = control_io ? *control_io : *pool.io_contexts.front();
-    auto coordinator = std::make_shared<GroupCoordinator>(coordinator_io);
+    auto coordinator = std::make_shared<GroupCoordinator>(control_io);
     for (const auto& worker : pool.workers) worker->SetGroupCoordinator(coordinator);
 
     return pool;
@@ -216,7 +215,7 @@ BootstrapEnvironment CreateBootstrapEnvironment(
     try {
         env.worker_pool = CreateWorkerPool(
             worker_runtime_config, *env.stats, env.geo_database.get(), *env.dns_worker,
-            env.main_ctx.get());
+            *env.main_ctx);
         env.controller = std::make_unique<Controller>(
             *env.main_ctx, env.worker_pool.workers);
 

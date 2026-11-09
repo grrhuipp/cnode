@@ -113,32 +113,17 @@ BuildVmessUsers(const std::vector<PreparedVmessUser>& users) {
     return list;
 }
 
-UserStore::VlessCredential
-BuildVlessCredential(const PreparedVlessUser& user) {
-    return UserStore::VlessCredential{
-        .uuid_bytes = user.uuid_bytes,
-        .flow = user.flow,
-        .profile = user.profile,
-    };
-}
-
-std::shared_ptr<const UserStore::VlessUserMap>
-BuildVlessUsers(const std::vector<PreparedVlessUser>& users) {
-    auto map = std::make_shared<UserStore::VlessUserMap>();
+template <typename UserMap, typename PreparedUser, auto KeyMember>
+std::shared_ptr<const UserMap>
+BuildKeyedUsers(const std::vector<PreparedUser>& users, std::string_view protocol) {
+    auto map = std::make_shared<UserMap>();
     map->reserve(users.size());
     for (const auto& user : users) {
-        if (!map->try_emplace(user.uuid_bytes, BuildVlessCredential(user)).second) {
-            ThrowAmbiguousCredential("VLESS");
+        if (!map->try_emplace(user.*KeyMember, user).second) {
+            ThrowAmbiguousCredential(protocol);
         }
     }
     return map;
-}
-
-UserStore::TrojanCredential
-BuildTrojanCredential(const PreparedTrojanUser& user) {
-    return UserStore::TrojanCredential{
-        .profile = user.profile,
-    };
 }
 
 std::shared_ptr<const UserStore::TrojanUserMap>
@@ -146,23 +131,11 @@ BuildTrojanUsers(const std::vector<PreparedTrojanUser>& users) {
     auto map = std::make_shared<UserStore::TrojanUserMap>();
     map->reserve(users.size());
     for (const auto& user : users) {
-        if (!map->try_emplace(user.password_hash, BuildTrojanCredential(user)).second) {
+        if (!map->try_emplace(user.password_hash, UserStore::TrojanCredential{user.profile}).second) {
             ThrowAmbiguousCredential("Trojan");
         }
     }
     return map;
-}
-
-UserStore::ShadowsocksCredential
-BuildShadowsocksCredential(const PreparedShadowsocksUser& user) {
-    return UserStore::ShadowsocksCredential{
-        .derived_key = user.derived_key,
-        .identity_key = user.identity_key,
-        .psk_hash = user.psk_hash,
-        .key_size = user.key_size,
-        .salt_size = user.salt_size,
-        .profile = user.profile,
-    };
 }
 
 std::shared_ptr<const UserStore::ShadowsocksUserList>
@@ -178,7 +151,7 @@ BuildShadowsocksUsers(const std::vector<PreparedShadowsocksUser>& users) {
         const std::string_view key(
             reinterpret_cast<const char*>(user.derived_key.data()), user.derived_key.size);
         if (!seen.insert(key).second) ThrowAmbiguousCredential("Shadowsocks");
-        list->push_back(BuildShadowsocksCredential(user));
+        list->push_back(user);
     }
     // Non-identity handshakes still scan candidates; keep their original hint
     // and first-candidate behavior rather than imposing an unused hash order.
@@ -197,47 +170,6 @@ BuildShadowsocksUsers(const std::vector<PreparedShadowsocksUser>& users) {
         return key_order != 0 ? key_order < 0 : a.psk_hash < b.psk_hash;
     });
     return list;
-}
-
-UserStore::AnyTlsCredential
-BuildAnyTlsCredential(const PreparedAnyTlsUser& user) {
-    return UserStore::AnyTlsCredential{
-        .password_hash = user.password_hash,
-        .profile = user.profile,
-    };
-}
-
-std::shared_ptr<const UserStore::AnyTlsUserMap>
-BuildAnyTlsUsers(const std::vector<PreparedAnyTlsUser>& users) {
-    auto map = std::make_shared<UserStore::AnyTlsUserMap>();
-    map->reserve(users.size());
-    for (const auto& user : users) {
-        if (!map->try_emplace(user.password_hash, BuildAnyTlsCredential(user)).second) {
-            ThrowAmbiguousCredential("AnyTLS");
-        }
-    }
-    return map;
-}
-
-UserStore::HysteriaCredential
-BuildHysteriaCredential(const PreparedHysteriaUser& user) {
-    return UserStore::HysteriaCredential{
-        .credential_hash = user.credential_hash,
-        .profile = user.profile,
-    };
-}
-
-std::shared_ptr<const UserStore::HysteriaUserMap>
-BuildHysteriaUsers(const std::vector<PreparedHysteriaUser>& users) {
-    auto map = std::make_shared<UserStore::HysteriaUserMap>();
-    map->reserve(users.size());
-    for (const auto& user : users) {
-        if (!map->try_emplace(
-                user.credential_hash, BuildHysteriaCredential(user)).second) {
-            ThrowAmbiguousCredential("Hysteria");
-        }
-    }
-    return map;
 }
 
 template <typename TagMap>
@@ -260,6 +192,20 @@ void SetOrErase(TagMap& map, std::string_view tag, ContainerPtr users) {
     map.emplace(std::string(tag), std::move(users));
 }
 
+template <typename Credential, typename TagMap, typename Key>
+std::shared_ptr<const Credential>
+FindKeyedUser(const TagMap UserStore::Snapshot::* member,
+              std::string_view tag,
+              const Key& key) {
+    const auto& view = LocalView();
+    if (!view || !view->snapshot) return nullptr;
+    const auto& tags = (*view->snapshot).*member;
+    auto tag_it = tags.find(tag);
+    if (tag_it == tags.end()) return nullptr;
+    auto user_it = tag_it->second->find(key);
+    if (user_it == tag_it->second->end()) return nullptr;
+    return std::shared_ptr<const Credential>(view, &user_it->second);
+}
 }  // namespace
 
 size_t UserStore::Array16Hash::operator()(const std::array<uint8_t, 16>& value) const noexcept {
@@ -336,15 +282,18 @@ UserStore::PublishedSnapshot UserStore::PrepareUsers(
         if (const auto* vmess = std::get_if<PreparedVmessUsers>(&users)) {
             SetOrErase(next->vmess, tag, BuildVmessUsers(*vmess));
         } else if (const auto* vless = std::get_if<PreparedVlessUsers>(&users)) {
-            SetOrErase(next->vless, tag, BuildVlessUsers(*vless));
+            SetOrErase(next->vless, tag,
+                       BuildKeyedUsers<VlessUserMap, PreparedVlessUser, &PreparedVlessUser::uuid_bytes>(*vless, "VLESS"));
         } else if (const auto* trojan = std::get_if<PreparedTrojanUsers>(&users)) {
             SetOrErase(next->trojan, tag, BuildTrojanUsers(*trojan));
         } else if (const auto* shadowsocks = std::get_if<PreparedShadowsocksUsers>(&users)) {
             SetOrErase(next->shadowsocks, tag, BuildShadowsocksUsers(*shadowsocks));
         } else if (const auto* anytls = std::get_if<PreparedAnyTlsUsers>(&users)) {
-            SetOrErase(next->anytls, tag, BuildAnyTlsUsers(*anytls));
+            SetOrErase(next->anytls, tag,
+                       BuildKeyedUsers<AnyTlsUserMap, PreparedAnyTlsUser, &PreparedAnyTlsUser::password_hash>(*anytls, "AnyTLS"));
         } else if (const auto* hysteria = std::get_if<PreparedHysteriaUsers>(&users)) {
-            SetOrErase(next->hysteria, tag, BuildHysteriaUsers(*hysteria));
+            SetOrErase(next->hysteria, tag,
+                       BuildKeyedUsers<HysteriaUserMap, PreparedHysteriaUser, &PreparedHysteriaUser::credential_hash>(*hysteria, "Hysteria"));
         }
         const auto protocol = UserProtocolOf(users);
         if (protocol == UserProtocol::Vmess || protocol == UserProtocol::Shadowsocks) continue;
@@ -387,37 +336,15 @@ UserStore::VmessUsersView UserStore::VmessUsers(std::string_view tag) {
         ? nullptr : std::shared_ptr<const VmessUserMap>(view, it->second.get())};
 }
 
-UserStore::VlessUsersView UserStore::VlessUsers(std::string_view tag) {
-    const auto& view = LocalView();
-    if (!view || !view->snapshot) return {};
-    auto it = view->snapshot->vless.find(tag);
-    return {it == view->snapshot->vless.end()
-        ? nullptr : std::shared_ptr<const VlessUserMap>(view, it->second.get())};
-}
-
 std::shared_ptr<const UserStore::VlessCredential>
 UserStore::FindVlessUser(std::string_view tag,
                          const std::array<uint8_t, 16>& uuid_bytes) {
-    auto view = VlessUsers(tag);
-    if (!view.users) {
-        return nullptr;
-    }
-    auto it = view.users->find(uuid_bytes);
-    if (it == view.users->end()) {
-        return nullptr;
-    }
-    return view.Share(it->second);
+    return FindKeyedUser<VlessCredential>(&Snapshot::vless, tag, uuid_bytes);
 }
 
 std::shared_ptr<const UserStore::TrojanCredential>
 UserStore::FindTrojanUser(std::string_view tag, std::string_view password_hash) {
-    const auto& view = LocalView();
-    if (!view || !view->snapshot) return nullptr;
-    auto tag_it = view->snapshot->trojan.find(tag);
-    if (tag_it == view->snapshot->trojan.end()) return nullptr;
-    auto user_it = tag_it->second->find(password_hash);
-    if (user_it == tag_it->second->end()) return nullptr;
-    return std::shared_ptr<const TrojanCredential>(view, &user_it->second);
+    return FindKeyedUser<TrojanCredential>(&Snapshot::trojan, tag, password_hash);
 }
 
 UserStore::ShadowsocksUsersView UserStore::ShadowsocksUsers(std::string_view tag) {
@@ -452,26 +379,14 @@ size_t UserStore::ShadowsocksUsersView::IdentityHashLowerBound(
 std::shared_ptr<const UserStore::AnyTlsCredential>
 UserStore::FindAnyTlsUser(std::string_view tag,
                           const std::array<uint8_t, 32>& password_hash) {
-    const auto& view = LocalView();
-    if (!view || !view->snapshot) return nullptr;
-    auto tag_it = view->snapshot->anytls.find(tag);
-    if (tag_it == view->snapshot->anytls.end()) return nullptr;
-    auto user_it = tag_it->second->find(password_hash);
-    if (user_it == tag_it->second->end()) return nullptr;
-    return std::shared_ptr<const AnyTlsCredential>(view, &user_it->second);
+    return FindKeyedUser<AnyTlsCredential>(&Snapshot::anytls, tag, password_hash);
 }
 
 std::shared_ptr<const UserStore::HysteriaCredential>
 UserStore::FindHysteriaUser(
     std::string_view tag,
     const std::array<uint8_t, 32>& credential_hash) {
-    const auto& view = LocalView();
-    if (!view || !view->snapshot) return nullptr;
-    auto tag_it = view->snapshot->hysteria.find(tag);
-    if (tag_it == view->snapshot->hysteria.end()) return nullptr;
-    auto user_it = tag_it->second->find(credential_hash);
-    if (user_it == tag_it->second->end()) return nullptr;
-    return std::shared_ptr<const HysteriaCredential>(view, &user_it->second);
+    return FindKeyedUser<HysteriaCredential>(&Snapshot::hysteria, tag, credential_hash);
 }
 
 size_t UserStore::TotalUsers() {
