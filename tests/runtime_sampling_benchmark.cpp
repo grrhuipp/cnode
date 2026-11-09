@@ -38,7 +38,7 @@ TEST_P(RuntimeSamplingBenchmark, EstablishedVlessSessions) {
         const auto idle_rss = ResidentBytes();
         constexpr size_t warmup = 16;
         for (size_t index = 0; index < warmup; ++index)
-            (void)co_await fixture.worker.CollectRuntimeStats(resources);
+            (void)fixture.worker.CollectRuntimeStats(resources);
         std::vector<double> latency(rounds);
         const auto warm_rss = ResidentBytes();
         const auto before = memory::ThreadMemoryPool().GetFootprint();
@@ -50,7 +50,7 @@ TEST_P(RuntimeSamplingBenchmark, EstablishedVlessSessions) {
             benchmark::AllocationCountScope allocation_scope(counts);
             for (size_t index = 0; index < rounds; ++index) {
                 const auto sample_start = std::chrono::steady_clock::now();
-                const auto sample = co_await fixture.worker.CollectRuntimeStats(resources);
+                const auto sample = fixture.worker.CollectRuntimeStats(resources);
                 latency[index] = std::chrono::duration<double, std::nano>(
                     std::chrono::steady_clock::now() - sample_start).count();
                 Require(sample.active_connections == sessions && sample.stats.connections_total == sessions,

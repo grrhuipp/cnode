@@ -43,13 +43,15 @@ public:
     using Snapshot = std::vector<Entry>;
 
     explicit OutboundConfiguration(
-        const std::vector<PreparedOutboundConfig>& configurations);
+        const std::vector<PreparedOutboundConfig>& configurations,
+        net::io_context* reactor = nullptr);
+    OutboundConfiguration(
+        const std::vector<PreparedOutboundConfig>& configurations,
+        net::io_context& reactor)
+        : OutboundConfiguration(configurations, &reactor) {}
     ~OutboundConfiguration();
     OutboundConfiguration(const OutboundConfiguration&) = delete;
     OutboundConfiguration& operator=(const OutboundConfiguration&) = delete;
-
-    // Cold Worker setup/publication only; no Worker state is captured by hosts.
-    void BindHosts(net::io_context& reactor);
     // Called only after the Worker's requests have drained.
     net::awaitable<void> AsyncJoinHosts();
 

@@ -229,8 +229,7 @@ proxy::vmess::inbound::Handler::Process(
 namespace {
 [[nodiscard]] std::optional<::proxyman::inbound::PreparedVmessUser>
 BuildPreparedVmessUser(const ::InboundUserSpec& spec) {
-    auto user = ::vmess::MemoryAccount::FromUUID(
-        spec.credential, spec.user_id, spec.email, spec.speed_limit, spec.device_limit);
+    auto user = ::vmess::MemoryAccount::FromUUID(spec.credential);
     if (!user) {
         return std::nullopt;
     }
@@ -239,7 +238,7 @@ BuildPreparedVmessUser(const ::InboundUserSpec& spec) {
         .uuid_bytes = user->uuid_bytes,
         .cmd_key = user->cmd_key,
         .auth_key = user->auth_key,
-        .profile = std::move(user->profile),
+        .profile = ::proxy::MakeUserProfile(spec),
     };
 }
 

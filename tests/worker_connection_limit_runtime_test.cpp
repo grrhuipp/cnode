@@ -150,7 +150,7 @@ net::awaitable<tcp::socket> Connect(net::io_context& io, uint16_t port, bool adm
 
 net::awaitable<void> WaitActive(net::io_context& io, Worker& worker, uint32_t expected) {
     const auto deadline = std::chrono::steady_clock::now() + 3s;
-    while ((co_await worker.CollectRuntimeStats(false)).active_connections != expected) {
+    while (worker.CollectRuntimeStats(false).active_connections != expected) {
         Require(std::chrono::steady_clock::now() < deadline, "active request guards did not drain");
         co_await Pause(io);
     }

@@ -27,7 +27,9 @@ Controller::Impl::collectTraffic(PanelRuntime& panel, bool* appended_out) {
     bool appended = false;
     for (const auto& worker : workers_) {
         auto* w = worker.get();
-        auto snapshot = co_await w->PostTask(w->SnapshotTraffic(panel.accounting_key));
+        auto snapshot = co_await w->PostCall([w, &panel] {
+            return w->SnapshotTraffic(panel.accounting_key);
+        });
         if (snapshot.empty()) continue;
         std::exception_ptr append_failure;
         try {
@@ -42,8 +44,9 @@ Controller::Impl::collectTraffic(PanelRuntime& panel, bool* appended_out) {
             // The snapshot token may be the last owner after a connection has
             // closed. Return it to the Worker ledger before unwinding.
             try {
-                co_await w->PostTask(
-                    w->RollbackTraffic(panel.accounting_key, snapshot));
+                co_await w->PostCall([w, &panel, &snapshot] {
+                    w->RollbackTraffic(panel.accounting_key, snapshot);
+                });
             } catch (...) {
                 panel.traffic_journal->Suspend();
                 throw;
@@ -55,7 +58,9 @@ Controller::Impl::collectTraffic(PanelRuntime& panel, bool* appended_out) {
         // A successful append is durable. A failed commit must suspend further
         // collection, otherwise the same in-memory delta could be persisted twice.
         try {
-            co_await w->PostTask(w->CommitTraffic(panel.accounting_key, snapshot));
+            co_await w->PostCall([w, &panel, &snapshot] {
+                w->CommitTraffic(panel.accounting_key, snapshot);
+            });
         } catch (...) {
             panel.traffic_journal->Suspend();
             throw;
@@ -97,7 +102,9 @@ Controller::Impl::GetOnlineSnapshot(const std::string& tag) {
             [](Impl* controller, Worker* w, std::string t,
                std::vector<OnlineDevice>& out) -> net::awaitable<void> {
                 controller->ThrowIfStopping();
-                out = co_await w->PostTask(w->GetOnlineDevices(std::move(t)));
+                out = co_await w->PostCall([w, t = std::move(t)] {
+                    return w->GetOnlineDevices(t);
+                });
             }(this, workers_[i].get(), tag, per_worker[i])
         );
     }

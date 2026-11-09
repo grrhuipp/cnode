@@ -59,8 +59,8 @@ public:
 
     ~SslContext();
 
-    SSL_CTX* Native() { return ctx_; }
-    const SSL_CTX* Native() const { return ctx_; }
+    SSL_CTX* Native() { return native_owner_.get(); }
+    const SSL_CTX* Native() const { return native_owner_.get(); }
     // Pin a published immutable context until SSL_new takes its own reference.
     [[nodiscard]] std::shared_ptr<SSL_CTX> AcquireNative() const noexcept;
 
@@ -80,7 +80,6 @@ private:
     [[nodiscard]] bool ConfigureServerAlpn(
         const std::vector<std::string>& protocols);
 
-    SSL_CTX* ctx_ = nullptr;
     SharedState* shared_state_ = nullptr;
     std::shared_ptr<SSL_CTX> native_owner_;
     std::shared_ptr<AutoSignContextRenewal> renewal_;

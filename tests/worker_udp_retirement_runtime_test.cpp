@@ -488,7 +488,7 @@ struct UnregisterCompletion {
         [&state] { return state.stop_observed && state.gate_waiting; },
         3s, "listener retirement did not stop the active native Link job");
 
-    result.held_stats = co_await worker.CollectRuntimeStats(true);
+    result.held_stats = worker.CollectRuntimeStats(true);
     if (!result.held_stats.resources ||
         result.held_stats.resources->udp_associations != 0 ||
         result.held_stats.resources->udp_native_dispatches != 1 ||
@@ -520,7 +520,7 @@ struct UnregisterCompletion {
     state.unregister_cancel.emit(::net::cancellation_type::terminal);
     if (state.shutdown_worker) worker.RequestStop();
     co_await Pause(*state.owner_io, 40ms);
-    result.held_stats = co_await worker.CollectRuntimeStats(true);
+    result.held_stats = worker.CollectRuntimeStats(true);
     result.still_joining_after_cancel = !state.unregister_done &&
         result.held_stats.resources &&
         result.held_stats.resources->udp_native_dispatches == 1;
@@ -555,7 +555,7 @@ struct UnregisterCompletion {
         }
     }
 
-    result.final_stats = co_await worker.CollectRuntimeStats(true);
+    result.final_stats = worker.CollectRuntimeStats(true);
     if (!result.final_stats.resources ||
         result.final_stats.resources->udp_native_dispatches != 0 ||
         result.final_stats.resources->udp_listeners != 0 ||
@@ -600,7 +600,7 @@ struct RetirementSnapshot {
     });
     RetirementSnapshot result;
     for (;;) {
-        result.stats = co_await worker.CollectRuntimeStats(true);
+        result.stats = worker.CollectRuntimeStats(true);
         const auto& resources = result.stats.resources;
         if (resources && resources->udp_native_dispatches == 0 &&
             resources->udp_listeners == 0 && resources->udp_receive_loops == 0 &&

@@ -144,26 +144,17 @@ ParseTrojanRequest(AsyncStream& stream,
         ::trojan::PasswordHash& hash;
         ~CleansePasswordHash() noexcept { OPENSSL_cleanse(hash.data(), hash.size()); }
     } cleanse_password_hash{request.password_hash};
-    const auto credential_revision = proxyman::inbound::UserStore::CredentialRevision(
-        proxyman::inbound::UserProtocol::Trojan, ctx.inbound.tag);
-    const auto credential = limiter
-        ? std::optional(limiter->FingerprintCredential(
-              ctx.inbound.tag,
-              {reinterpret_cast<const uint8_t*>(request.password_hash.data()),
-               request.password_hash.size()}, credential_revision))
-        : std::nullopt;
     OPENSSL_cleanse(handshake_buf.data(), handshake_buf.size());
-    if (credential) {
-        const auto error = co_await proxy::CheckInboundCredential(
-            *limiter, ctx, *credential, proxyman::inbound::UserProtocol::Trojan,
-            credential_revision);
-        if (error != ErrorCode::OK) co_return tl::unexpected(error);
-    }
+    const auto credential = co_await proxy::VerifyInboundCredential(
+        limiter, ctx, proxyman::inbound::UserProtocol::Trojan,
+        {reinterpret_cast<const uint8_t*>(request.password_hash.data()),
+         request.password_hash.size()});
+    if (credential.error != ErrorCode::OK) co_return tl::unexpected(credential.error);
     auto user_info = proxyman::inbound::UserStore::FindTrojanUser(
         tag, request.PasswordHashView());
     if (!user_info) {
         co_await proxy::RecordInboundAuthFailure(
-            limiter, ctx, "no matching credential", credential);
+            limiter, ctx, "no matching credential", credential.key);
         co_return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
     }
 
@@ -304,10 +295,7 @@ const bool kTrojanInboundRegistered = [] {
                 ::proxyman::inbound::PreparedTrojanUser info;
                 const auto hash = ::trojan::HashPassword(spec.credential);
                 info.password_hash.assign(hash.data(), hash.size());
-                info.profile.email = spec.email;
-                info.profile.user_id = spec.user_id;
-                info.profile.speed_limit = spec.speed_limit;
-                info.profile.device_limit = spec.device_limit;
+                info.profile = ::proxy::MakeUserProfile(spec);
                 users.push_back(std::move(info));
             }
 

@@ -10,7 +10,6 @@
 #include <openssl/rand.h>
 #include <openssl/sha.h>
 #include <asio/bind_cancellation_slot.hpp>
-#include <asio/co_spawn.hpp>
 #include <algorithm>
 #include <limits>
 #include <string_view>
@@ -372,14 +371,11 @@ void BaseWsStream::CheckWritable() const {
 net::awaitable<BaseWsStream::WriteGate::Lease> BaseWsStream::AcquireWrite(
     net::cancellation_slot caller_slot) {
     if (auto lease = write_gate_.TryAcquire()) co_return lease;
-    const auto executor = co_await net::this_coro::executor;
     // Cancel() is reusable, so only this acquisition is cancelled. Closing the
     // shared gate is reserved for terminal shutdown, not a sniff deadline.
     WriteGateWait wait(Cancellation(), caller_slot);
     if (wait.Cancelled()) throw IoSystemError(io_error::operation_aborted);
-    auto lease = co_await net::co_spawn(
-        executor, write_gate_.Acquire(),
-        net::bind_cancellation_slot(wait.Slot(), net::use_awaitable));
+    auto lease = co_await write_gate_.Acquire(false, wait.Slot());
     if (!lease || wait.Cancelled()) throw IoSystemError(io_error::operation_aborted);
     co_return lease;
 }

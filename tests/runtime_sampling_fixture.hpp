@@ -114,7 +114,7 @@ public:
     net::awaitable<WorkerRuntimeStatsSnapshot> WaitActive(size_t expected) {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
         for (;;) {
-            auto snapshot = co_await worker.CollectRuntimeStats(true);
+            auto snapshot = worker.CollectRuntimeStats(true);
             if (snapshot.active_connections == expected) co_return snapshot;
             Require(std::chrono::steady_clock::now() < deadline, "physical session did not retire");
             co_await net::post(net::use_awaitable);

@@ -71,7 +71,9 @@ public:
         return Lease{this};
     }
 
-    [[nodiscard]] net::awaitable<Lease> Acquire(bool ignore_caller_cancellation = false) {
+    [[nodiscard]] net::awaitable<Lease> Acquire(
+        bool ignore_caller_cancellation = false,
+        net::cancellation_slot custom_cancellation = {}) {
         const auto cancellation = co_await net::this_coro::cancellation_state;
         if (cancelled_ ||
             (!ignore_caller_cancellation &&
@@ -106,6 +108,11 @@ public:
                 std::tie(ec) = co_await signal_->async_receive(
                     net::bind_cancellation_slot(
                         net::cancellation_slot{},
+                        net::as_tuple(net::use_awaitable)));
+            } else if (custom_cancellation.is_connected()) {
+                std::tie(ec) = co_await signal_->async_receive(
+                    net::bind_cancellation_slot(
+                        custom_cancellation,
                         net::as_tuple(net::use_awaitable)));
             } else {
                 std::tie(ec) = co_await signal_->async_receive(

@@ -92,7 +92,9 @@ CollectWorkerRuntimeStats(const MonitorContext& ctx, bool include_resources) {
                WorkerRuntimeStatsSnapshot& out,
                bool collect_resources) -> net::awaitable<void> {
                 context.ThrowIfStopping();
-                out = co_await worker->PostTask(worker->CollectRuntimeStats(collect_resources));
+                out = co_await worker->PostCall([worker, collect_resources] {
+                    return worker->CollectRuntimeStats(collect_resources);
+                });
             }(ctx, ctx.workers[i].get(), snapshots[i], include_resources)
         );
     }

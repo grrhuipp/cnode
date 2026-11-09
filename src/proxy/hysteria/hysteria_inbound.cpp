@@ -215,10 +215,7 @@ std::optional<proxyman::inbound::UserSet> BuildUsers(
         }
         proxyman::inbound::PreparedHysteriaUser user;
         user.credential_hash = wire::HashCredential(spec.credential);
-        user.profile.email = spec.email;
-        user.profile.user_id = spec.user_id;
-        user.profile.speed_limit = spec.speed_limit;
-        user.profile.device_limit = spec.device_limit;
+        user.profile = MakeUserProfile(spec);
         users.push_back(std::move(user));
     }
     return proxyman::inbound::UserSet{std::move(users)};

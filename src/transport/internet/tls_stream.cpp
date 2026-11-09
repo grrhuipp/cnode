@@ -152,7 +152,6 @@ std::unique_ptr<SslContext> SslContext::CreateServerAutoSign(const TlsConfig& co
             auto replacement = CreateAutoSignSnapshot(config);
             return replacement ? std::move(replacement->native_owner_) : std::shared_ptr<SSL_CTX>{};
         });
-    context->ctx_ = nullptr;
     context->shared_state_ = nullptr;
     return context;
 }
@@ -202,7 +201,7 @@ bool SslContext::ConfigureServerAlpn(
     if (!EncodeTlsAlpnProtocols(protocols, wire)) return false;
 
     if (!wire.empty()) {
-        SSL_CTX_set_alpn_select_cb(ctx_, SelectServerAlpnCallback, &wire);
+        SSL_CTX_set_alpn_select_cb(native_owner_.get(), SelectServerAlpnCallback, &wire);
     }
     return true;
 }

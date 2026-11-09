@@ -819,23 +819,14 @@ AuthenticateSession(
     if (auto ok = co_await ReadAuth(stream, auth_hash); !ok) {
         co_return tl::unexpected(ok.error());
     }
-    const auto credential_revision = proxyman::inbound::UserStore::CredentialRevision(
-        proxyman::inbound::UserProtocol::AnyTls, ctx.inbound.tag);
-    const auto credential = limiter
-        ? std::optional(limiter->FingerprintCredential(
-              ctx.inbound.tag, auth_hash, credential_revision))
-        : std::nullopt;
-    if (credential) {
-        const auto error = co_await proxy::CheckInboundCredential(
-            *limiter, ctx, *credential, proxyman::inbound::UserProtocol::AnyTls,
-            credential_revision);
-        if (error != ErrorCode::OK) co_return tl::unexpected(error);
-    }
+    const auto credential = co_await proxy::VerifyInboundCredential(
+        limiter, ctx, proxyman::inbound::UserProtocol::AnyTls, auth_hash);
+    if (credential.error != ErrorCode::OK) co_return tl::unexpected(credential.error);
     auto user = proxyman::inbound::UserStore::FindAnyTlsUser(ctx.inbound.tag, auth_hash);
     OPENSSL_cleanse(auth_hash.data(), auth_hash.size());
     if (!user) {
         co_await proxy::RecordInboundAuthFailure(
-            limiter, ctx, "no matching credential", credential);
+            limiter, ctx, "no matching credential", credential.key);
         co_return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
     }
     auto control_idle_timeout = timeouts.IdleTimeout();
@@ -990,10 +981,7 @@ const bool kInboundRegistered = [] {
                 }
                 ::proxyman::inbound::PreparedAnyTlsUser info;
                 info.password_hash = ::anytls::PasswordHash(spec.credential);
-                info.profile.email = spec.email;
-                info.profile.user_id = spec.user_id;
-                info.profile.speed_limit = spec.speed_limit;
-                info.profile.device_limit = spec.device_limit;
+                info.profile = ::proxy::MakeUserProfile(spec);
                 users.push_back(std::move(info));
             }
             return ::proxyman::inbound::UserSet{std::move(users)};

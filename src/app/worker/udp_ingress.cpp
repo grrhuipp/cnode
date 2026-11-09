@@ -745,7 +745,7 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
         if (!decoded->user || !datagram.environment->prepared ||
             !datagram.environment->prepared->settings) return;
         UdpHandoffIdentity identity{
-            std::string(socket_key), std::string(impl_->tag),
+            memory::ThreadLocalString(socket_key), memory::ThreadLocalString(impl_->tag),
             datagram.environment->prepared->settings.get(),
             ClientSessionKey{decoded->session_owner, decoded->session_id, {},
                              datagram.environment->prepared->settings.get()}};

@@ -1345,3 +1345,31 @@ CI失败场景修复后通过真实双进程、ML-KEM/X25519加密和回环对�
 - **Hysteria2 四 Worker 真实进程基准（`cnode_hysteria_throughput_benchmark`）**：
   - **256 连接单流上传/下载**：上传守护进程总 CPU 由 `4.284 / 1.706s` 降至 **`1.409 / 1.437s`（-15.8% ~ -17.4%）**，活跃匿名内存由 `32.10 / 32.34 MiB` 降至 **`31.45 / 31.44 MiB`（减少 632 ~ 876 KiB）**，负载峰值 RSS 由 `40.28 / 40.78 MiB` 降至 **`39.82 / 39.63 MiB`（最高减少 1.09 MiB）**；下载守护进程总 CPU 由 `1.820 / 1.821s` 降至 **`1.545 / 1.621s`（-11.0% ~ -15.1%）**，256 连接就绪匿名内存由 `30.67 / 31.65 MiB` 降至 **`30.61 / 30.68 MiB`**。
   - **16 连接 × 64 流（1,024 并发流）**：上传守护进程总 CPU 由 `4.879 / 4.343s` 降至 **`4.337 / 3.949s`（-9.1%）**，吞吐升至 **`56.41 / 57.00 MiB/s`**；下载守护进程总 CPU 由 `5.146 / 4.316s` 降至 **`3.933 / 4.005s`（-7.2% ~ -23.6%）**。
+
+## 2026-11-09（续）：Worker 统计/采样去协程化、Outbound 构造即就绪与入站准入/传输层收敛
+
+### 架构与流程精简内容
+
+1. **Worker 统计、流量采样与在线设备查询去协程化（消除伪协程与双层协程帧分配）**：
+   - 将 `Worker::SnapshotTraffic`、`CommitTraffic`、`RollbackTraffic`、`GetOnlineDevices` 从无挂起点的 `net::awaitable<...>` 改为直接同步方法（参数由 `std::string` 按值拷贝改为 `std::string_view` 只读借用），并将 `CollectRuntimeStats` 与 `CollectNativeRuntimeStats` 合并为唯一的同步方法 `Worker::CollectRuntimeStats(bool include_resources) const`；`UserTrafficSnapshot` 简化为 `UserTrafficCounters` 类型别名。
+   - `Controller::Impl::collectTraffic`、`GetOnlineSnapshot` 与 `CollectWorkerRuntimeStats` 统一改用 `worker->PostCall(...)` 直接调用同步方法，省去每次统计/流量采样在每个 Worker 上额外分配内层 `awaitable` 协程帧的开销。
+2. **`OutboundConfiguration` 构造即就绪（RAII），删除 `BindHosts` 二次快照重建**：
+   - `OutboundConfiguration` 构造函数直接接收可选的 `net::io_context* reactor`（及 `net::io_context&` 重载），在构造期一次性创建 `Hosts` 与 `Snapshot`，删除 `BindHosts` 及 `Worker::RuntimeState::Start` 启动时对全部出站快照的二次全量复制重建。
+3. **WebSocket `AcquireWrite` 消除竞争时 `co_spawn` 与 `SslContext` 冗余指针清理**：
+   - `AsyncWriteGate::Acquire` 支持传入可选 `net::cancellation_slot custom_cancellation`；`BaseWsStream::AcquireWrite` 在写竞争时直接 `co_await write_gate_.Acquire(false, wait.Slot())`，省去每次写竞争的 `net::co_spawn` 协程帧分配与额外调度。
+   - 删除 `SslContext::ctx_` 冗余裸指针成员，`Native()` 直接返回 `native_owner_.get()`。
+4. **原生 UDP `UdpHandoffIdentity` 内存池化与统一入站凭据校验 / `MakeUserProfile` 收敛**：
+   - `UdpHandoffIdentity` 的 `listener` 与 `tag` 由 `std::string` 改为 `memory::ThreadLocalString`，消除新 UDP 关联向系统默认分配器的穿透。
+   - 在 `src/proxy/inbound_admission.hpp` 中提取 `VerifyInboundCredential` 与 `MakeUserProfile`，收敛 `anytls`、`trojan`、`vless`、`hysteria` 四处重复的 `CredentialRevision` + `FingerprintCredential` + `CheckInboundCredential` 频控检查样板及 6 个入站协议的 `UserProfile` 构建代码。
+   - 另对 `QuicListener::ReceiveLoop` 进行了同步直通 `Feed` 实验：实测表明在 16×64（1,024 并发流）单连接 256 KiB 满窗口突发下，若收包循环不经 `Enqueue` + `Pump` 让出事件循环，会阻塞队列中已被唤醒的 `QuicStreamState::ReadMultiBuffer()` 消费者协程排空流前缀，且同步执行 TLS/QUIC `Flush()` 会拖慢 UDP 套接字取包导致 256 连接并发握手重传（建连耗时由 0.51s 增至 2.16s）；因此保留 `Enqueue` + `Pump` 的收包与批量 `Flush` 解耦设计。
+
+### 验证与性能/内存实证
+
+全量 **1,251/1,251** 测试通过（325 项 unit、926 项 E2E，用时 231.81 秒）。在同一环境与编译选项下执行 A/B/A/B 交错重复基准对照：
+
+- **运行时统计采样基准（`cnode_runtime_sampling_benchmark`，64 活跃 VLESS 会话，256 轮）**：
+  - **不含资源遍历（`resources=0`）**：单次采样耗时由 `125.26 / 122.56 ns`（`p50 = 90.0 ns` / `p95 = 91.0 ns`）降至 **`78.38 / 78.54 ns`（`p50 = 40.0 ns` / `p95 = 50.0 ns`，耗时再降 -37.1%，p50 延迟再降 -55.6%，较初始 `bb393dc` 基线的 1,913 ns 快 47.8 倍）**；进程峰值 RSS 由 `15,101,952 / 15,167,488 B` 降至 **`14,647,296 / 14,704,640 B`（减少 452 KiB）**。
+  - **含资源遍历（`resources=1`）**：单次采样耗时由 `132.77 / 177.74 ns`（`p50 = 100.0 / 140.0 ns`）降至 **`86.25 / 85.97 ns`（`p50 = 50.0 ns` / `p95 = 60.0 ns`，耗时再降 -35.1% ~ -51.6%，p50 延迟减半 -50.0%）**；进程峰值 RSS 由 `15,503,360 / 15,556,608 B` 降至 **`15,036,416 / 15,089,664 B`（减少 456 KiB）**，内存池映射保持 `233,472 B`。
+- **VLESS/TLS 与 Hysteria2 真实进程基准（`cnode_tls_throughput_benchmark` / `cnode_hysteria_throughput_benchmark`）**：
+  - VLESS/TLS 8 流上传吞吐由 `580.65 / 259.62 MiB/s` 升至 **`602.35 / 609.21 MiB/s`**，守护进程 CPU 为 **`0.1692 / 0.1665s`**，峰值 RSS 由 `14,450,688 / 14,479,360 B` 降至 **`14,397,440 / 14,450,688 B`**。
+  - Hysteria2 256 连接上传/下载守护进程 CPU 为 `1.451s / 1.558s`，传输完成活跃匿名内存由 `31,428,608 B` 降至 **`31,244,288 B`（减少 180 KiB）**，负载峰值 RSS 由 `39,608,320 / 39,493,632 B` 降至 **`39,350,272 B`（减少 140 ~ 252 KiB）**；16×64（1,024 流）上传就绪匿名内存由 `40.28 / 40.16 MiB` 降至 **`39.95 MiB`（减少 204 ~ 320 KiB）**，负载峰值 RSS 由 `48.82 / 48.68 MiB` 降至 **`48.57 MiB`**。

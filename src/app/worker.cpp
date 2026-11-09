@@ -578,8 +578,8 @@ void Worker::RuntimeState::Start(Worker& worker) {
               worker.id_, config->routing.rules.size());
     dns = std::make_unique<app::dns::DNS>(dns_worker);
     outbound_tasks = std::make_unique<ResidentTaskGroup>(io_context.get_executor());
-    outbounds = std::make_unique<proxyman::outbound::OutboundConfiguration>(config->outbounds);
-    outbounds->BindHosts(io_context);
+    outbounds = std::make_unique<proxyman::outbound::OutboundConfiguration>(
+        config->outbounds, io_context);
     outbound_handlers = std::make_unique<proxyman::outbound::HandlerLookup>(
         *outbounds, io_context, *dns, timeouts.DialTimeout(), outbound_tasks->Tasks());
     dispatcher = std::make_unique<app::dispatcher::DefaultDispatcher>(
@@ -1161,30 +1161,28 @@ void Worker::UpdateRule(
 // 数据收集（在 Worker 线程执行）
 // ============================================================================
 
-net::awaitable<app::UserTrafficSnapshot> Worker::SnapshotTraffic(std::string tag) {
-    if (!runtime_ || !runtime_->session_tracking) co_return app::UserTrafficSnapshot{};
-    co_return app::UserTrafficSnapshot{runtime_->session_tracking->SnapshotTraffic(tag)};
+app::UserTrafficSnapshot Worker::SnapshotTraffic(std::string_view tag) {
+    if (!runtime_ || !runtime_->session_tracking) return app::UserTrafficSnapshot{};
+    return runtime_->session_tracking->SnapshotTraffic(tag);
 }
 
-net::awaitable<void> Worker::CommitTraffic(
-    std::string tag, const app::UserTrafficSnapshot& snapshot) {
-    co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
-    if (!runtime_ || !runtime_->session_tracking) co_return;
+void Worker::CommitTraffic(
+    std::string_view tag, const app::UserTrafficSnapshot& snapshot) {
+    if (!runtime_ || !runtime_->session_tracking) return;
     runtime_->session_tracking->CommitTraffic(tag, snapshot);
 }
 
-net::awaitable<void> Worker::RollbackTraffic(
-    std::string tag, const app::UserTrafficSnapshot& snapshot) {
-    co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
-    if (!runtime_ || !runtime_->session_tracking) co_return;
+void Worker::RollbackTraffic(
+    std::string_view tag, const app::UserTrafficSnapshot& snapshot) {
+    if (!runtime_ || !runtime_->session_tracking) return;
     runtime_->session_tracking->RollbackTraffic(tag, snapshot);
 }
 
-net::awaitable<std::vector<OnlineDevice>> Worker::GetOnlineDevices(std::string tag) const {
-    if (!runtime_ || !runtime_->inbound_handlers) co_return std::vector<OnlineDevice>{};
+std::vector<OnlineDevice> Worker::GetOnlineDevices(std::string_view tag) const {
+    if (!runtime_ || !runtime_->inbound_handlers) return {};
     auto handler = runtime_->inbound_handlers->GetHandler(tag);
-    if (!handler) co_return std::vector<OnlineDevice>{};
-    co_return runtime_->inbound_handlers->GetOnlineDevices(
+    if (!handler) return {};
+    return runtime_->inbound_handlers->GetOnlineDevices(
         handler->ReceiverSettings().protocol, tag);
 }
 
@@ -1192,7 +1190,7 @@ net::awaitable<std::vector<OnlineDevice>> Worker::GetOnlineDevices(std::string t
 // 运行时资源计数，仅在 Worker executor 上读取。
 // ============================================================================
 
-WorkerRuntimeStatsSnapshot Worker::CollectNativeRuntimeStats(bool include_resources) const {
+WorkerRuntimeStatsSnapshot Worker::CollectRuntimeStats(bool include_resources) const {
     WorkerRuntimeStatsSnapshot snapshot;
     // Sample this Worker-owned transport and pool state on its own event loop.
     snapshot.memory.udp_sockets = transport::internet::DatagramSocket::ActiveCount();
@@ -1234,10 +1232,6 @@ WorkerRuntimeStatsSnapshot Worker::CollectNativeRuntimeStats(bool include_resour
     resources.timeout_heap_capacity = timeouts.heap_capacity;
     resources.timeout_waiters = timeouts.wait_pending ? 1 : 0;
     return snapshot;
-}
-
-net::awaitable<WorkerRuntimeStatsSnapshot> Worker::CollectRuntimeStats(bool include_resources) const {
-    co_return CollectNativeRuntimeStats(include_resources);
 }
 
 void Worker::CollectHeap() {

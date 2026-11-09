@@ -563,10 +563,7 @@ const bool kSsInboundRegistered = [] {
                     return std::nullopt;
                 }
                 ::proxyman::inbound::PreparedShadowsocksUser info;
-                info.profile.email = spec.email;
-                info.profile.user_id = spec.user_id;
-                info.profile.speed_limit = spec.speed_limit;
-                info.profile.device_limit = spec.device_limit;
+                info.profile = ::proxy::MakeUserProfile(spec);
                 info.key_size = cipher_info.key_size;
                 info.salt_size = cipher_info.salt_size;
                 info.derived_key = ToPreparedKey(uuid_derived

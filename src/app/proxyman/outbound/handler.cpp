@@ -254,7 +254,9 @@ struct OutboundConfiguration::Hosts {
 };
 
 OutboundConfiguration::OutboundConfiguration(
-    const std::vector<PreparedOutboundConfig>& configurations) {
+    const std::vector<PreparedOutboundConfig>& configurations,
+    net::io_context* reactor) {
+    if (reactor) hosts_ = std::make_unique<Hosts>(Hosts{*reactor, {}});
     auto snapshot = std::make_shared<Snapshot>();
     snapshot->reserve(configurations.size());
     for (const auto& config : configurations)
@@ -290,15 +292,6 @@ OutboundConfiguration::Capture() const noexcept {
     return snapshot_;
 }
 
-void OutboundConfiguration::BindHosts(net::io_context& reactor) {
-    if (hosts_) throw std::logic_error("outbound hosts already bound");
-    hosts_ = std::make_unique<Hosts>(Hosts{reactor, {}});
-    auto snapshot = std::make_shared<Snapshot>();
-    const auto previous = Capture();
-    snapshot->reserve(previous->size());
-    for (const auto& config : *previous) snapshot->push_back(Prepare(*config));
-    Publish(std::move(snapshot));
-}
 
 net::awaitable<void> OutboundConfiguration::AsyncJoinHosts() {
     co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());

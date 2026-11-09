@@ -29,6 +29,6 @@ struct UserTrafficCounters {
     auto end() const noexcept { return users.end(); }
 };
 
-struct UserTrafficSnapshot : UserTrafficCounters {};
+using UserTrafficSnapshot = UserTrafficCounters;
 
 }  // namespace app

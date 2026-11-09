@@ -10,8 +10,8 @@ namespace worker_detail {
 // Only authenticated identity and execution ownership metadata live here.
 // Protocol continuity state is owned, but never interpreted, by this directory.
 struct UdpHandoffIdentity {
-    std::string listener;
-    std::string tag;
+    memory::ThreadLocalString listener;
+    memory::ThreadLocalString tag;
     const proxyman::inbound::ProtocolSettings* configuration = nullptr;
     ClientSessionKey client;
     bool operator==(const UdpHandoffIdentity& other) const noexcept {
@@ -22,8 +22,8 @@ struct UdpHandoffIdentity {
 struct UdpHandoffIdentityHash {
     size_t operator()(const UdpHandoffIdentity& key) const noexcept {
         auto hash = ClientSessionKeyHash{}(key.client);
-        hash ^= std::hash<std::string>{}(key.listener) + (hash << 6) + (hash >> 2);
-        hash ^= std::hash<std::string>{}(key.tag) + (hash << 6) + (hash >> 2);
+        hash ^= std::hash<std::string_view>{}(key.listener) + (hash << 6) + (hash >> 2);
+        hash ^= std::hash<std::string_view>{}(key.tag) + (hash << 6) + (hash >> 2);
         return hash ^ std::hash<const proxyman::inbound::ProtocolSettings*>{}(key.configuration);
     }
 };

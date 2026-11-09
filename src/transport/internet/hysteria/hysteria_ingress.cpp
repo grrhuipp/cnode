@@ -1059,20 +1059,11 @@ net::awaitable<Connection::AdmitResult> Connection::AdmitConnection(
     }
     if (closed_ || physical_ != PhysicalAdmission::Admitted)
         co_return AdmitResult::Limited;
-    const auto credential_revision = proxyman::inbound::UserStore::CredentialRevision(
-        proxyman::inbound::UserProtocol::Hysteria, base_context_.inbound.tag);
-    const auto failure_key = limiter
-        ? std::optional(limiter->FingerprintCredential(
-              base_context_.inbound.tag, auth_hash, credential_revision))
-        : std::nullopt;
-    if (failure_key) {
-        const auto error = co_await proxy::CheckInboundCredential(
-            *limiter, base_context_, *failure_key,
-            proxyman::inbound::UserProtocol::Hysteria, credential_revision);
-        if (error != ErrorCode::OK) {
-            listener_->environment.stats->OnError();
-            co_return AdmitResult::Limited;
-        }
+    const auto credential_check = co_await proxy::VerifyInboundCredential(
+        limiter, base_context_, proxyman::inbound::UserProtocol::Hysteria, auth_hash);
+    if (credential_check.error != ErrorCode::OK) {
+        listener_->environment.stats->OnError();
+        co_return AdmitResult::Limited;
     }
     if (closed_) co_return AdmitResult::Limited;
     const auto& receiver = listener_->Receiver();
@@ -1080,7 +1071,7 @@ net::awaitable<Connection::AdmitResult> Connection::AdmitConnection(
         receiver.inbound_tag, auth_hash);
     if (!user) {
         co_await proxy::RecordInboundAuthFailure(
-            limiter, base_context_, "no matching credential", failure_key);
+            limiter, base_context_, "no matching credential", credential_check.key);
         listener_->environment.stats->OnError();
         co_return AdmitResult::AuthFailed;
     }

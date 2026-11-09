@@ -28,9 +28,7 @@ class GeoDatabase;
 namespace app::dns {
 class DNSWorker;
 }
-namespace app {
-struct UserTrafficSnapshot;
-}
+#include "app/traffic_types.hpp"
 struct OnlineDevice;
 struct PortBinding;
 struct StatsShard;
@@ -125,15 +123,15 @@ public:
     // ── 数据收集（在所属 Worker 线程执行，无竞争）──
 
     // Snapshot on this Worker; acknowledge only after off-thread durable storage.
-    [[nodiscard]] net::awaitable<app::UserTrafficSnapshot> SnapshotTraffic(std::string tag);
-    net::awaitable<void> CommitTraffic(std::string tag, const app::UserTrafficSnapshot& snapshot);
-    net::awaitable<void> RollbackTraffic(std::string tag, const app::UserTrafficSnapshot& snapshot);
+    [[nodiscard]] app::UserTrafficSnapshot SnapshotTraffic(std::string_view tag);
+    void CommitTraffic(std::string_view tag, const app::UserTrafficSnapshot& snapshot);
+    void RollbackTraffic(std::string_view tag, const app::UserTrafficSnapshot& snapshot);
 
     // 协议类型由 inbound handler 的 ReceiverSettings 自动判断，无需外部传入。
-    [[nodiscard]] net::awaitable<std::vector<OnlineDevice>> GetOnlineDevices(std::string tag) const;
+    [[nodiscard]] std::vector<OnlineDevice> GetOnlineDevices(std::string_view tag) const;
 
     // Resource traversal is requested only by the low-frequency diagnostics loop.
-    [[nodiscard]] net::awaitable<WorkerRuntimeStatsSnapshot> CollectRuntimeStats(bool include_resources) const;
+    [[nodiscard]] WorkerRuntimeStatsSnapshot CollectRuntimeStats(bool include_resources) const;
     void CollectHeap();
 
 private:
@@ -143,7 +141,6 @@ private:
     void BeginStopOnWorker() noexcept;
     net::awaitable<void> StopRuntimeTask();
     net::awaitable<void> DrainRuntimeTask();
-    WorkerRuntimeStatsSnapshot CollectNativeRuntimeStats(bool include_resources) const;
     void ReportFailure(std::exception_ptr error) noexcept;
 
     // ── 成员 ────────────────────────────────────────────────────────────────

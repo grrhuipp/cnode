@@ -13,11 +13,13 @@
 #include "common/target_address.hpp"
 #include "common/user_profile.hpp"
 #include "infra/log.hpp"
+#include "infra/config_types.hpp"
 #include "transport/async_stream.hpp"
 
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string_view>
 #include <vector>
 #include <utility>
@@ -250,6 +252,36 @@ inline net::awaitable<void> RecordInboundAuthFailure(
         &limiter, ctx, ConnectionLimiter::RejectReasonToString(reason));
     co_return reason == ConnectionLimiter::RejectReason::TRACKING_CAPACITY
         ? ErrorCode::RESOURCE_EXHAUSTED : ErrorCode::BLOCKED;
+}
+
+struct PreparedInboundCredential {
+    std::optional<AuthCredentialKey> key;
+    ErrorCode error = ErrorCode::OK;
+};
+
+[[nodiscard]] inline net::awaitable<PreparedInboundCredential>
+VerifyInboundCredential(
+    ConnectionLimiter* limiter,
+    session::Context& ctx,
+    proxyman::inbound::UserProtocol protocol,
+    std::span<const uint8_t> raw_credential) {
+    if (!limiter) co_return PreparedInboundCredential{};
+    const auto credential_revision =
+        proxyman::inbound::UserStore::CredentialRevision(protocol, ctx.inbound.tag);
+    const auto key = limiter->FingerprintCredential(
+        ctx.inbound.tag, raw_credential, credential_revision);
+    const auto error = co_await CheckInboundCredential(
+        *limiter, ctx, key, protocol, credential_revision);
+    co_return PreparedInboundCredential{.key = key, .error = error};
+}
+
+[[nodiscard]] inline UserProfile MakeUserProfile(const InboundUserSpec& spec) {
+    UserProfile profile;
+    profile.email = spec.email;
+    profile.user_id = spec.user_id;
+    profile.speed_limit = spec.speed_limit;
+    profile.device_limit = spec.device_limit;
+    return profile;
 }
 
 // The single pre-dispatch rejection exit. Peer EOF and local cancellation are

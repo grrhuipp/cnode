@@ -23,7 +23,7 @@ TEST(RuntimeSampling, CreationFinishAndShutdownPreserveEveryTail) {
             // Collection overlaps admission, domain initialization and the real
             // authentication/dial. No private registry or snapshot is injected.
             while (opening.wait_for(0s) != std::future_status::ready) {
-                const auto sample = co_await fixture.worker.CollectRuntimeStats(false);
+                const auto sample = fixture.worker.CollectRuntimeStats(false);
                 EXPECT_FALSE(sample.resources.has_value());
                 EXPECT_GE(sample.stats.connections_total, index);
                 EXPECT_LE(sample.stats.connections_total, index + 1);
@@ -31,7 +31,7 @@ TEST(RuntimeSampling, CreationFinishAndShutdownPreserveEveryTail) {
                 co_await net::post(net::use_awaitable);
             }
             opening.get();
-            const auto sample = co_await fixture.worker.CollectRuntimeStats(true);
+            const auto sample = fixture.worker.CollectRuntimeStats(true);
             EXPECT_TRUE(sample.resources.has_value());
             EXPECT_EQ(sample.active_connections, index + 1);
             EXPECT_EQ(sample.stats.connections_total, index + 1);
@@ -58,7 +58,7 @@ TEST(RuntimeSampling, CreationFinishAndShutdownPreserveEveryTail) {
         EXPECT_EQ(stopped.stats.bytes_out, sessions * 998);
         EXPECT_EQ(stopped.stats.bytes_in, sessions * 510);
         for (unsigned round = 0; round < 4; ++round) {
-            const auto again = co_await fixture.worker.CollectRuntimeStats(round % 2 == 0);
+            const auto again = fixture.worker.CollectRuntimeStats(round % 2 == 0);
             EXPECT_EQ(again.stats.bytes_in, stopped.stats.bytes_in);
             EXPECT_EQ(again.stats.bytes_out, stopped.stats.bytes_out);
             EXPECT_EQ(again.stats.connections_total, sessions);
