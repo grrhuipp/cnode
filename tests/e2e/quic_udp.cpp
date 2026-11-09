@@ -389,6 +389,54 @@ TEST(QuicUdp, ConcurrentMultiSessionMigrationAndEphemeralAnyTlsStreams) {
         }
     });
     auto udp_target = Socket::BindUdp();
+    Socket dns_socket = Socket::BindUdp(0, "127.77.0.53");
+    std::atomic<size_t> dns_queries{0};
+    std::atomic<bool> stop_dns{false};
+    PeerThread dns_responder([&] {
+        while (!stop_dns.load()) {
+            pollfd descriptor{dns_socket.Fd(), POLLIN, 0};
+            if (::poll(&descriptor, 1, 10) <= 0) continue;
+            for (size_t step = 0; step < 32; ++step) {
+                std::array<uint8_t, 4096> bytes{};
+                sockaddr_in source{};
+                socklen_t length = sizeof(source);
+                const auto count = ::recvfrom(dns_socket.Fd(), bytes.data(), bytes.size(),
+                    MSG_DONTWAIT, reinterpret_cast<sockaddr*>(&source), &length);
+                if (count < 0) {
+                    if (errno == EINTR) continue;
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                    throw std::system_error(errno, std::generic_category(), "receive DNS query");
+                }
+                if (count < 17) continue;
+                ++dns_queries;
+                std::string reply(reinterpret_cast<const char*>(bytes.data()), static_cast<size_t>(count));
+                const bool is_a = static_cast<uint8_t>(reply[reply.size() - 4]) == 0 &&
+                    static_cast<uint8_t>(reply[reply.size() - 3]) == 1;
+                reply[2] = static_cast<char>(0x81);
+                reply[3] = static_cast<char>(0x80);
+                reply[4] = 0;
+                reply[5] = 1;
+                reply[6] = 0;
+                reply[7] = is_a ? 1 : 0;
+                for (size_t i = 8; i < 12; ++i) reply[i] = 0;
+                if (is_a) {
+                    constexpr std::array<uint8_t, 16> answer{
+                        0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 127, 0, 0, 1};
+                    reply.append(reinterpret_cast<const char*>(answer.data()), answer.size());
+                }
+                (void)::sendto(dns_socket.Fd(), reply.data(), reply.size(), MSG_NOSIGNAL,
+                    reinterpret_cast<const sockaddr*>(&source), sizeof(source));
+            }
+        }
+    });
+    struct DnsGuard {
+        std::atomic<bool>& stop;
+        PeerThread& thread;
+        ~DnsGuard() {
+            stop = true;
+            try { thread.Join(); } catch (...) {}
+        }
+    } dns_guard{stop_dns, dns_responder};
     auto upstream_reservation = Socket::Listen();
     const auto upstream_port = upstream_reservation.Port();
     Configure(upstream_root.Path(),
@@ -396,34 +444,144 @@ TEST(QuicUdp, ConcurrentMultiSessionMigrationAndEphemeralAnyTlsStreams) {
             {"settings", {{"clients", Json::array({{{"password", "secret"}}})}}},
             {"streamSettings", TlsSettings(true)}},
         {{"protocol", "freedom"}, {"settings", Json::object()}}, 4);
+    auto upstream_config = Json::parse(ReadFile(upstream_root.Path() / "config.json"));
+    upstream_config["dns"] = {
+        {"servers", Json::array({"127.77.0.53:" + std::to_string(dns_socket.Port())})},
+        {"timeout", 5}, {"cacheSize", 1024}};
+    WriteJson(upstream_root.Path(), "config.json", upstream_config);
     upstream_reservation.Close();
     Child upstream({Binary().string(), "--config-dir", upstream_root.Path().string()},
         upstream_root.Path() / "upstream.log");
     upstream.WaitForLog("server started");
-
     auto reservation = Socket::BindUdp();
     const auto port = reservation.Port();
-    auto inbound = HysteriaInbound(port);
-    inbound["settings"]["upMbps"] = 1000;
-    inbound["settings"]["downMbps"] = 1000;
-    Configure(root.Path(), std::move(inbound),
-        {{"protocol", "anytls"},
+    auto vless_reservation = Socket::Listen();
+    const auto vless_port = vless_reservation.Port();
+    udp::PortReservation ss_reservation(true);
+    const auto ss_port = ss_reservation.port;
+    const auto ss_key = udp::Sequence(16);
+
+    auto panel_node_reservation = Socket::Listen();
+    const auto panel_node_port = panel_node_reservation.Port();
+    Socket panel_listener = Socket::Listen();
+    std::atomic<int> panel_phase{0};
+    std::atomic<size_t> panel_user_pulls{0};
+    std::atomic<size_t> panel_reports{0};
+    std::atomic<bool> stop_panel{false};
+    static constexpr std::string_view PanelUserA = "11111111-1111-4111-8111-111111111111";
+    static constexpr std::string_view PanelUserB = "22222222-2222-4222-8222-222222222222";
+    PeerThread panel_responder([&] {
+        while (!stop_panel.load()) {
+            pollfd descriptor{panel_listener.Fd(), POLLIN, 0};
+            if (::poll(&descriptor, 1, 10) <= 0) continue;
+            Socket client;
+            try { client = panel_listener.Accept(200ms); }
+            catch (...) { continue; }
+            try {
+                std::string request;
+                while (request.find("\r\n\r\n") == std::string::npos) {
+                    const auto chunk = client.Read(4096, 500ms);
+                    if (chunk.empty()) break;
+                    request += chunk;
+                }
+                if (request.empty()) continue;
+                int status = 200;
+                std::string body = R"({"data":true})";
+                std::string etag;
+                if (request.starts_with("POST ")) {
+                    ++panel_reports;
+                } else if (request.find("/config?") != std::string::npos) {
+                    etag = "panel-cfg-v1";
+                    body = Json({{"server_port", panel_node_port}, {"network", "tcp"}, {"tls", 0},
+                        {"base_config", {{"pull_interval", 1}, {"push_interval", 1}}}}).dump();
+                } else if (request.find("/user?") != std::string::npos) {
+                    const int phase = panel_phase.load();
+                    if (phase == 2) {
+                        status = 503;
+                        body = R"({"message":"panel maintenance"})";
+                    } else {
+                        const auto active_user = phase == 0 ? PanelUserA : PanelUserB;
+                        etag = phase == 0 ? "users-a" : "users-b";
+                        body = Json({{"users", Json::array({{{"id", phase + 1}, {"uuid", active_user},
+                            {"speed_limit", nullptr}, {"device_limit", 0}}})}}).dump();
+                    }
+                    ++panel_user_pulls;
+                }
+                std::string response = "HTTP/1.1 " + std::to_string(status) +
+                    (status == 200 ? " OK\r\n" : " Service Unavailable\r\n") +
+                    "Content-Type: application/json\r\nConnection: close\r\n";
+                if (!etag.empty()) response += "ETag: \"" + etag + "\"\r\n";
+                response += "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+                client.Write(response, 500ms);
+            } catch (...) {}
+        }
+    });
+    struct PanelGuard {
+        std::atomic<bool>& stop;
+        PeerThread& thread;
+        ~PanelGuard() {
+            stop = true;
+            try { thread.Join(); } catch (...) {}
+        }
+    } panel_guard{stop_panel, panel_responder};
+    auto hy2_inbound = HysteriaInbound(port);
+    hy2_inbound["tag"] = "hy2-in";
+    hy2_inbound["sniffing"]["enabled"] = true;
+    hy2_inbound["settings"]["upMbps"] = 1000;
+    hy2_inbound["settings"]["downMbps"] = 1000;
+    hy2_inbound["fallbackTag"] = "anytls-out";
+
+    Json vless_inbound = {{"tag", "vless-in"}, {"protocol", "vless"},
+        {"listen", "127.0.0.1"}, {"port", vless_port}, {"fallbackTag", "anytls-out"},
+        {"settings", {{"decryption", "none"},
+            {"clients", Json::array({{{"id", UserId}}})}}}};
+
+    Json ss_inbound = {{"tag", "ss-udp-in"}, {"protocol", "shadowsocks"},
+        {"listen", "127.0.0.1"}, {"port", ss_port}, {"outboundTag", "direct-out"},
+        {"settings", {{"method", "2022-blake3-aes-128-gcm"},
+            {"clients", Json::array({{{"password", udp::Base64(ss_key)}}})}}}};
+
+    WriteJson(root.Path(), "config.json", {
+        {"workers", 4},
+        {"dns", {{"servers", Json::array({"127.77.0.53:" + std::to_string(dns_socket.Port())})},
+                 {"timeout", 5}, {"cacheSize", 1024}}},
+        {"timeouts", {{"handshake", 10}, {"dial", 10}, {"read", 15}, {"write", 30},
+                      {"connIdle", 60}, {"uplinkOnly", 5}, {"downlinkOnly", 5}}},
+        {"panels", Json::array({{{"name", "full-app"}, {"type", "V2board"},
+            {"apiHost", "http://127.0.0.1:" + std::to_string(panel_listener.Port())},
+            {"key", "panel-secret"}, {"nodeIDs", {1}}, {"nodeType", "vless"},
+            {"fallbackTag", "anytls-out"}}})},
+        {"log", {{"enable", true}, {"loglevel", "debug"},
+                 {"logDir", (root.Path() / "logs").string()}}}});
+    WriteJson(root.Path(), "inbounds.json",
+        Json::array({std::move(hy2_inbound), std::move(vless_inbound), std::move(ss_inbound)}));
+    WriteJson(root.Path(), "outbounds.json", Json::array({
+        {{"tag", "anytls-out"}, {"protocol", "anytls"},
             {"settings", {{"address", "127.0.0.1"}, {"port", upstream_port},
                 {"password", "secret"}, {"minIdleSession", 2}}},
-            {"streamSettings", TlsSettings(false)}}, 4);
-    auto config = Json::parse(ReadFile(root.Path() / "config.json"));
-    config["log"]["enable"] = true;
-    config["log"]["loglevel"] = "debug";
-    WriteJson(root.Path(), "config.json", config);
+            {"streamSettings", TlsSettings(false)}},
+        {{"tag", "direct-out"}, {"protocol", "freedom"}, {"settings", Json::object()}},
+        {{"tag", "block-out"}, {"protocol", "blackhole"}, {"settings", Json::object()}}}));
+    WriteJson(root.Path(), "routing.json", {{"rules", Json::array({
+        {{"domain", Json::array({"domain:anytls.route.test"})}, {"outboundTag", "anytls-out"}},
+        {{"domain", Json::array({"domain:direct.route.test"})}, {"outboundTag", "direct-out"}},
+        {{"domain", Json::array({"domain:blocked.route.test"})}, {"outboundTag", "block-out"}}})}});
     reservation.Close();
+    vless_reservation.Close();
+    ss_reservation.Release();
+    panel_node_reservation.Close();
     Child server({Binary().string(), "--config-dir", root.Path().string()},
         root.Path() / "child.log");
     server.WaitForLog("server started");
+    Until([&] { return panel_user_pulls.load() >= 1; }, 10s);
 
     constexpr size_t client_count = 8;
     constexpr size_t rounds = 12;
-    const auto tcp_address = "127.0.0.1:" + std::to_string(tcp_target.Port());
+    const auto direct_tcp_address = "direct.route.test:" + std::to_string(tcp_target.Port());
+    const auto anytls_tcp_address = "anytls.route.test:" + std::to_string(tcp_target.Port());
+    const auto blocked_tcp_address = "blocked.route.test:" + std::to_string(tcp_target.Port());
     const auto udp_address = "127.0.0.1:" + std::to_string(udp_target.Port());
+
 
     struct SessionState {
         std::unique_ptr<Peer> peer;
@@ -438,14 +596,16 @@ TEST(QuicUdp, ConcurrentMultiSessionMigrationAndEphemeralAnyTlsStreams) {
         SessionState state;
         state.peer = std::make_unique<Peer>(port);
         const auto init = "init-" + std::to_string(i) + ":";
-        state.persistent_stream = state.peer->Open(tcp_address, init);
+        state.persistent_stream = state.peer->Open(direct_tcp_address, init);
         state.persistent_expected = init;
         state.udp_session = static_cast<uint32_t>(0x2000 + i);
         clients.push_back(std::move(state));
     }
     Peer stalled_peer(port);
-    const auto stalled_stream = stalled_peer.Open(tcp_address, "stalled-init:");
-    stalled_peer.Wait([&] { return stalled_peer.PayloadEquals(stalled_stream, "stalled-init:"); });
+    const auto stalled_stream = stalled_peer.Open(anytls_tcp_address, "stalled-init:");
+    stalled_peer.Wait([&] {
+        return stalled_peer.PayloadEquals(stalled_stream, "stalled-init:");
+    });
     for (size_t attempt = 0; attempt < 16; ++attempt) {
         const auto path = stalled_peer.AddPath();
         stalled_peer.BlockPath(path, true);
@@ -453,6 +613,10 @@ TEST(QuicUdp, ConcurrentMultiSessionMigrationAndEphemeralAnyTlsStreams) {
         stalled_peer.Send(stalled_stream, "probe");
         stalled_peer.Pump(Milliseconds(1));
     }
+    Socket ss_udp_target = Socket::BindUdp();
+    udp::Client ss_client(ss_port, ss_udp_target.Port(), true, false,
+                          "127.0.0.1", "aes");
+    uint16_t ss_origin_port = 0;
 
     auto pump_all = [&] {
         for (auto& client : clients) client.peer->Pump(Milliseconds(1));
@@ -513,11 +677,13 @@ TEST(QuicUdp, ConcurrentMultiSessionMigrationAndEphemeralAnyTlsStreams) {
             ephemeral_expected[i] = "ephemeral-" + std::to_string(i) + "-" +
                 std::to_string(round) + ":" +
                 std::string(payload_bytes, static_cast<char>('a' + (round % 26)));
-            ephemeral_streams[i] = client.peer->Open(tcp_address, ephemeral_expected[i]);
+            ephemeral_streams[i] = client.peer->Open(anytls_tcp_address, ephemeral_expected[i]);
 
             if ((round % 3) == 0) {
-                const auto reset_id = client.peer->Open(tcp_address, "aborted-request");
+                const auto reset_id = client.peer->Open(anytls_tcp_address, "aborted-request");
                 client.peer->Reset(reset_id);
+                const auto blocked_id = client.peer->Open(blocked_tcp_address, "blocked-request");
+                (void)blocked_id;
             }
 
             udp_expected[i] = "udp-" + std::to_string(i) + "-" + std::to_string(round);
@@ -534,6 +700,58 @@ TEST(QuicUdp, ConcurrentMultiSessionMigrationAndEphemeralAnyTlsStreams) {
                     client.udp_session, packet_id, 0, 2, udp_address, head));
             }
         }
+        if (round == 0) {
+            auto panel_socket = Socket::Connect(panel_node_port);
+            const std::string payload = "panel-user-a-round-0";
+            panel_socket.Write(VlessRequest(
+                tcp_target.Port(), payload, 1, "anytls.route.test", PanelUserA));
+            EXPECT_EQ(panel_socket.ReadExact(2 + payload.size()),
+                std::string(2, '\0') + payload);
+        } else if (round == 4) {
+            const auto pulls_before = panel_user_pulls.load();
+            panel_phase.store(1);
+            Until([&] {
+                pump_all();
+                return panel_user_pulls.load() > pulls_before;
+            }, 5s);
+            auto panel_socket = Socket::Connect(panel_node_port);
+            const std::string payload = "panel-user-b-round-4";
+            panel_socket.Write(VlessRequest(
+                tcp_target.Port(), payload, 1, "anytls.route.test", PanelUserB));
+            EXPECT_EQ(panel_socket.ReadExact(2 + payload.size()),
+                std::string(2, '\0') + payload);
+        } else if (round == 8) {
+            const auto pulls_before = panel_user_pulls.load();
+            panel_phase.store(2);
+            Until([&] {
+                pump_all();
+                return panel_user_pulls.load() > pulls_before;
+            }, 5s);
+            auto panel_socket = Socket::Connect(panel_node_port);
+            const std::string payload = "panel-user-b-survives-503";
+            panel_socket.Write(VlessRequest(
+                tcp_target.Port(), payload, 1, "anytls.route.test", PanelUserB));
+            EXPECT_EQ(panel_socket.ReadExact(2 + payload.size()),
+                std::string(2, '\0') + payload);
+
+            auto vless_socket = Socket::Connect(vless_port);
+            const std::string vless_payload = "vless-static-round-8";
+            vless_socket.Write(VlessRequest(
+                tcp_target.Port(), vless_payload, 1, "anytls.route.test"));
+            EXPECT_EQ(vless_socket.ReadExact(2 + vless_payload.size()),
+                std::string(2, '\0') + vless_payload);
+        }
+        ss_client.socket = std::make_shared<Socket>(Socket::BindUdp());
+        const std::string ss_payload = "ss2022-round-" + std::to_string(round);
+        (void)ss_client.Send(ss_payload);
+        auto ss_received = udp::Receive(ss_udp_target);
+        EXPECT_EQ(ss_received.payload, ss_payload);
+        const auto* ss_sin = reinterpret_cast<const sockaddr_in*>(&ss_received.address);
+        if (ss_origin_port == 0) ss_origin_port = ss_sin->sin_port;
+        EXPECT_EQ(ss_sin->sin_port, ss_origin_port)
+            << "SS2022 passive migration replaced its outbound UDP socket";
+        udp::Reply(ss_udp_target, ss_received, "ss2022-reply-" + std::to_string(round));
+        ss_client.Expect("ss2022-reply-" + std::to_string(round));
 
         const auto deadline = std::chrono::steady_clock::now() + 15s;
         auto next_udp_retry = std::chrono::steady_clock::now() + 200ms;
@@ -622,6 +840,10 @@ TEST(QuicUdp, ConcurrentMultiSessionMigrationAndEphemeralAnyTlsStreams) {
     EXPECT_NE(logs.find("QUIC passive handoff committed"), std::string::npos);
     EXPECT_NE(logs.find("path_evidence=challenge"), std::string::npos);
     EXPECT_NE(logs.find("path_evidence=reused"), std::string::npos);
+    EXPECT_GT(dns_queries.load(), 0u);
+    EXPECT_NE(logs.find("UDP passive handoff"), std::string::npos);
+    EXPECT_GT(panel_user_pulls.load(), 2u);
+    EXPECT_GT(panel_reports.load(), 0u);
 }
 } // namespace
 } // namespace cnode::e2e::quic

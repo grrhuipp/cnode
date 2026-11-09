@@ -581,7 +581,7 @@ list(FILTER e2e_sources EXCLUDE REGEX "/(support|reference_[^/]+|anytls_sessions
 foreach(source IN LISTS e2e_sources)
     get_filename_component(name "${source}" NAME_WE)
     cnode_e2e("${name}" "${source}")
-    if(name MATCHES "^udp_")
+    if(name MATCHES "^udp_" OR name STREQUAL "quic_udp")
         target_link_libraries(cnode_e2e_${name} PRIVATE unofficial-sodium::sodium)
     elseif(name STREQUAL "config_panel_failure")
         target_sources(cnode_e2e_${name} PRIVATE src/infra/runtime_failure.cpp)
