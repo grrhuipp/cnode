@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "autosign_cert.hpp"
+#include "reality_tls.hpp"
 
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>

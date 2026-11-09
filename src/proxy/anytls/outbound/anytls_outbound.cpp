@@ -6,7 +6,6 @@
 #include "../anytls_codec.hpp"
 #include "proxy/anytls_padding.hpp"
 #include "common/buf/length_prefixed_packet_buffer.hpp"
-#include "../../outbound_server.hpp"
 #include "../../outbound_stream_endpoint.hpp"
 #include "../../inbound_admission.hpp"
 #include "../../uot/uot.hpp"

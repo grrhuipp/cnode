@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "common/process_resources.hpp"
+#include "common/awaitable_batch.hpp"
 
 #include <cstdio>
 #include <type_traits>

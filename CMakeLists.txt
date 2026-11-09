@@ -108,16 +108,13 @@ set(CNODE_CORE_SOURCES
 
     # App (Application layer)
     src/app/dispatcher/default_dispatcher.cpp
-    src/app/proxyman/inbound/factory.cpp
     src/app/proxyman/inbound/handler.cpp
     src/app/worker/udp_ingress.cpp
     src/app/proxyman/inbound/user_store.cpp
-    src/app/proxyman/outbound/factory.cpp
     src/app/proxyman/outbound/handler.cpp
     src/app/worker.cpp
     src/app/session_group_executor.cpp
     src/service/controller/controller.cpp
-    src/service/controller/traffic_journal.cpp
     src/app/prepared_inbound.cpp
     src/app/session_tracking.cpp
     src/proxy/mux/inbound/mux_inbound.cpp
@@ -135,7 +132,6 @@ set(CNODE_CORE_SOURCES
     # Proxy - VMess
     src/proxy/vmess/vmess_crypto.cpp
     src/proxy/vmess/validator.cpp
-    src/proxy/vmess/vmess_cipher.cpp
     src/proxy/vmess/encoding/body.cpp
     src/proxy/vmess/inbound/vmess_inbound.cpp
     src/proxy/vmess/outbound/vmess_outbound.cpp
@@ -143,7 +139,6 @@ set(CNODE_CORE_SOURCES
     # Proxy - VLESS
     src/proxy/vless/vless_codec.cpp
     src/proxy/vless/vless_encryption.cpp
-    src/proxy/vless/vless_vision.cpp
     src/proxy/vless/inbound/vless_inbound.cpp
     src/proxy/vless/outbound/vless_outbound.cpp
 
@@ -356,7 +351,7 @@ cnode_unit(vless_ticket_store INCLUDES src/proxy/vless)
 cnode_unit(vless_udp_framing LIBRARY cnode_test_core INCLUDES src/proxy/vless)
 cnode_unit(vless_vision INCLUDES src/proxy/vless)
 cnode_unit(vmess_auth_snapshot INCLUDES src/proxy/vmess)
-cnode_unit(vmess_cipher LIBRARY cnode_build_options SOURCES src/proxy/vmess/vmess_cipher.cpp src/proxy/vmess/vmess_crypto.cpp INCLUDES src/proxy/vmess)
+cnode_unit(vmess_cipher LIBRARY cnode_build_options SOURCES src/proxy/vmess/vmess_crypto.cpp INCLUDES src/proxy/vmess)
 cnode_unit(vmess_udp_datagram INCLUDES src/proxy/vmess)
 cnode_unit(worker_connection_limit_runtime)
 cnode_unit(worker_mailbox)

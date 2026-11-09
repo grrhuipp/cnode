@@ -122,6 +122,11 @@ public:
             if (closed_ || read_closed_) co_return buf::MultiBuffer{};
             FailBodyRead("truncated HTTP/1 chunk payload");
         }
+        if (pending_.byte_size() <= chunk_remaining_) {
+            chunk_remaining_ -= pending_.byte_size();
+            if (chunk_remaining_ == 0) chunk_terminator_pending_ = true;
+            co_return std::move(pending_);
+        }
         const size_t n = std::min(pending_.byte_size(), chunk_remaining_);
         buf::MultiBuffer payload;
         if (!pending_.MovePrefixTo(payload, n)) throw std::bad_alloc();

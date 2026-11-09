@@ -1,7 +1,7 @@
 #include <stdexcept>
 #include <gtest/gtest.h>
 
-#include "stream_crypto.hpp"
+#include "shadowsocks_protocol.hpp"
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/cancellation_signal.hpp>
 #include <asio/co_spawn.hpp>

@@ -1,6 +1,5 @@
 #include <gtest/gtest.h>
 
-#include "common/monitor_loop.hpp"
 #include "common/awaitable_batch.hpp"
 
 #include <asio/as_tuple.hpp>

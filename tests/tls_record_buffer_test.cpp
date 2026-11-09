@@ -3,7 +3,7 @@
 #include "common/allocator.hpp"
 #include "common/buf/multi_buffer.hpp"
 #include "transport/internet/tcp_stream.hpp"
-#include "transport/internet/tls_config.hpp"
+#include "transport/internet/stream_settings.hpp"
 #include "transport/internet/tls_stream.hpp"
 
 #include <asio/bind_cancellation_slot.hpp>

@@ -5,7 +5,6 @@
 #include "../encoding/body.hpp"
 #include "../vmess_crypto.hpp"
 #include "../../inbound_admission.hpp"
-#include "../../outbound_server.hpp"
 #include "../../outbound_stream_endpoint.hpp"
 #include "app/relay.hpp"
 #include "app/dns/dns.hpp"

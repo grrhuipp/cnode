@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "app/dns/cache_internal.hpp"
+#include "app/dns/dns.hpp"
 #include "common/allocator.hpp"
 
 #include <array>

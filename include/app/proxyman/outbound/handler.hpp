@@ -1,6 +1,6 @@
 #pragma once
 
-#include "app/proxyman/outbound/prepared_config.hpp"
+#include "app/proxyman/outbound/factory.hpp"
 #include "common/allocator.hpp"
 #include "proxy/outbound.hpp"
 #include "transport/internet/outbound_target_builder.hpp"

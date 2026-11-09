@@ -5,7 +5,6 @@
 #include "proxy/outbound.hpp"
 #include "../trojan_codec.hpp"
 #include "../../inbound_admission.hpp"
-#include "../../outbound_server.hpp"
 #include "../../outbound_stream_endpoint.hpp"
 #include "app/relay.hpp"
 #include "app/proxyman/outbound/factory.hpp"

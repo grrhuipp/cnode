@@ -2,7 +2,7 @@
 
 #include "common/allocator.hpp"
 #include "proxy/outbound.hpp"
-#include "transport/internet/outbound_target_builder.hpp"
+#include "../../outbound_stream_endpoint.hpp"
 #include "infra/json.hpp"
 
 #include <array>

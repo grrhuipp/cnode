@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "service/controller/traffic_journal.hpp"
+#include "service/controller/node_transaction.hpp"
 #include "infra/json.hpp"
 
 #include <sys/wait.h>

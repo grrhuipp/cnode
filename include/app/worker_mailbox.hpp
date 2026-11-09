@@ -4,19 +4,22 @@
 #include "common/error.hpp"
 #include "infra/runtime_failure.hpp"
 
+#include <asio/async_result.hpp>
 #include <asio/co_spawn.hpp>
 #include <asio/dispatch.hpp>
 #include <asio/experimental/channel.hpp>
+#include <asio/post.hpp>
 #include <asio/this_coro.hpp>
 #include <asio/use_awaitable.hpp>
 
 #include <atomic>
 #include <concepts>
-#include <memory>
 #include <cstddef>
 #include <exception>
 #include <functional>
 #include <limits>
+#include <memory>
+#include <optional>
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
@@ -74,17 +77,54 @@ public:
     }
     // Runs a synchronous, self-contained callable on the owner executor. Only
     // the cross-thread hop and the completion back to the caller are
-    // asynchronous; the owner-side frame exists solely to carry that result.
+    // asynchronous; no owner-side coroutine frame is allocated.
     template <typename Fn>
         requires std::invocable<Fn&>
     net::awaitable<std::invoke_result_t<Fn&>> PostCall(Fn fn) {
+        using R = std::invoke_result_t<Fn&>;
         Slot slot = Acquire();
-        if constexpr (std::is_void_v<std::invoke_result_t<Fn&>>) {
-            co_await net::co_spawn(io_context_.get_executor(),
-                CallHeld(std::move(slot), std::move(fn)), net::use_awaitable);
+        auto caller_exec = co_await net::this_coro::executor;
+        if constexpr (std::is_void_v<R>) {
+            co_await net::async_initiate<const net::use_awaitable_t<>&, void(std::exception_ptr)>(
+                [this, caller_exec, slot = std::move(slot), fn = std::move(fn)](auto handler) mutable {
+                    net::post(io_context_, [caller_exec, slot = std::move(slot), fn = std::move(fn),
+                                            handler = std::move(handler)]() mutable {
+                        std::exception_ptr err;
+                        try {
+                            std::invoke(fn);
+                        } catch (...) {
+                            err = std::current_exception();
+                        }
+                        slot.ReleaseOnOwner();
+                        net::dispatch(caller_exec,
+                            [handler = std::move(handler), err = std::move(err)]() mutable {
+                                std::move(handler)(std::move(err));
+                            });
+                    });
+                },
+                net::use_awaitable);
         } else {
-            co_return co_await net::co_spawn(io_context_.get_executor(),
-                CallHeld(std::move(slot), std::move(fn)), net::use_awaitable);
+            co_return co_await net::async_initiate<const net::use_awaitable_t<>&, void(std::exception_ptr, R)>(
+                [this, caller_exec, slot = std::move(slot), fn = std::move(fn)](auto handler) mutable {
+                    net::post(io_context_, [caller_exec, slot = std::move(slot), fn = std::move(fn),
+                                            handler = std::move(handler)]() mutable {
+                        std::optional<R> result;
+                        std::exception_ptr err;
+                        try {
+                            result.emplace(std::invoke(fn));
+                        } catch (...) {
+                            err = std::current_exception();
+                        }
+                        slot.ReleaseOnOwner();
+                        net::dispatch(caller_exec,
+                            [handler = std::move(handler), err = std::move(err),
+                             result = std::move(result)]() mutable {
+                                std::move(handler)(std::move(err),
+                                    result ? std::move(*result) : R{});
+                            });
+                    });
+                },
+                net::use_awaitable);
         }
     }
 
@@ -98,6 +138,9 @@ private:
         ~Slot() { if (mailbox_) mailbox_->Release(); }
         Slot(const Slot&) = delete;
         Slot& operator=(const Slot&) = delete;
+        void ReleaseOnOwner() noexcept {
+            if (auto* m = std::exchange(mailbox_, nullptr)) m->ReleaseOnOwner();
+        }
     private:
         WorkerMailbox* mailbox_;
     };
@@ -111,37 +154,35 @@ private:
                 return Slot(*this);
         }
     }
+    void ReleaseOnOwner() noexcept {
+        const auto previous = state_.fetch_sub(1, std::memory_order_acq_rel);
+        if ((previous & ~kClosed) == 0)
+            FailRuntime("mailbox-join", "accepted task completion underflow");
+        try {
+            if (previous == (kClosed | 1) && !joined_->try_send(IoErrorCode{}))
+                FailRuntime("mailbox-join", "completion channel already occupied");
+        } catch (...) {
+            FailRuntime("mailbox-join", "cannot signal accepted task completion");
+        }
+    }
     void Release() noexcept {
         try {
             // Inline for ordinary task completion. A failed cross-thread
             // initiation retains its slot until this bounded notification runs.
-            net::dispatch(io_context_, [this]() noexcept {
-                const auto previous = state_.fetch_sub(1, std::memory_order_acq_rel);
-                if ((previous & ~kClosed) == 0)
-                    FailRuntime("mailbox-join", "accepted task completion underflow");
-                try {
-                    if (previous == (kClosed | 1) && !joined_->try_send(IoErrorCode{}))
-                        FailRuntime("mailbox-join", "completion channel already occupied");
-                } catch (...) {
-                    FailRuntime("mailbox-join", "cannot signal accepted task completion");
-                }
-            });
+            net::dispatch(io_context_, [this]() noexcept { ReleaseOnOwner(); });
         } catch (...) {
             FailRuntime("mailbox-join", "cannot deliver accepted task completion");
         }
     }
     template <typename T>
-    static net::awaitable<T> RunHeld([[maybe_unused]] Slot slot, net::awaitable<T> task) {
+    static net::awaitable<T> RunHeld(Slot slot, net::awaitable<T> task) {
+        struct OwnerGuard {
+            Slot& slot;
+            ~OwnerGuard() noexcept { slot.ReleaseOnOwner(); }
+        } guard{slot};
         if constexpr (std::is_void_v<T>) co_await std::move(task);
         else co_return co_await std::move(task);
     }
-    template <typename Fn>
-    static net::awaitable<std::invoke_result_t<Fn&>> CallHeld(
-        [[maybe_unused]] Slot slot, Fn fn) {
-        if constexpr (std::is_void_v<std::invoke_result_t<Fn&>>) { std::invoke(fn); co_return; }
-        else co_return std::invoke(fn);
-    }
-
     net::io_context& io_context_;
     size_t capacity_;
     std::atomic<size_t> state_{0};

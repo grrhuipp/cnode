@@ -1355,44 +1355,32 @@ std::unique_ptr<AsyncStream> RestoreXHttpStream(
     return nullptr;
 }
 
-class UploadTransportStreamHandler final
-    : public memory::ThreadAllocated
-    , public InboundTransportStreamHandler {
-public:
-    UploadTransportStreamHandler(std::chrono::seconds handshake_timeout,
-                                 std::chrono::seconds idle_timeout) noexcept
-        : handshake_timeout_(handshake_timeout)
-        , idle_timeout_(idle_timeout) {}
+struct XHttpUploadTimeouts {
+    const std::shared_ptr<InboundTransportStreamHandler>* stream_handler = nullptr;
+    std::chrono::seconds handshake_timeout{0};
+    std::chrono::seconds idle_timeout{0};
+    bool active = false;
 
-    net::awaitable<void> OnInboundTransportStream(
-        std::unique_ptr<AsyncStream>, InboundTransportMetadata) override {
-        co_return;
-    }
-
-    void OnInboundTransportReady(AsyncStream& stream) override {
-        if (stream.ConsumePhaseDeadline()) {
-            throw transport::LinkError(ErrorCode::TIMEOUT);
+    void OnRequest(AsyncStream& stream) const {
+        if (stream_handler && *stream_handler) {
+            (*stream_handler)->OnInboundTransportRequest(stream);
+        } else if (active) {
+            stream.SetIdleTimeout(handshake_timeout);
+            (void)stream.StartPhaseDeadline(handshake_timeout);
         }
-        stream.ClearPhaseDeadline();
-        stream.SetIdleTimeout(idle_timeout_);
     }
 
-    void OnInboundTransportRequest(AsyncStream& stream) override {
-        stream.SetIdleTimeout(handshake_timeout_);
-        (void)stream.StartPhaseDeadline(handshake_timeout_);
+    void OnReady(AsyncStream& stream) const {
+        if (stream_handler && *stream_handler) {
+            (*stream_handler)->OnInboundTransportReady(stream);
+        } else if (active) {
+            if (stream.ConsumePhaseDeadline()) {
+                throw transport::LinkError(ErrorCode::TIMEOUT);
+            }
+            stream.ClearPhaseDeadline();
+            stream.SetIdleTimeout(idle_timeout);
+        }
     }
-
-    [[nodiscard]] std::chrono::seconds TransportHandshakeTimeout() const noexcept override {
-        return handshake_timeout_;
-    }
-
-    [[nodiscard]] std::chrono::seconds TransportIdleTimeout() const noexcept override {
-        return idle_timeout_;
-    }
-
-private:
-    std::chrono::seconds handshake_timeout_;
-    std::chrono::seconds idle_timeout_;
 };
 
 struct XHttpSessionOwnerResolution {
@@ -1428,13 +1416,13 @@ net::awaitable<XHttpSessionOwnerResolution> ResolveXHttpSessionOwner(
     for (;;) {
         auto claim = co_await coordinator->PostCall(
             [coordinator,
-             ns = std::string(session_namespace),
-             id = std::string(session_id),
+             session_namespace,
+             session_id,
              access,
              &io_context,
              bind_owner] {
                 return net::use_service<XHttpSessionDirectory>(coordinator->Services()).Acquire(
-                    ns, id, access, &io_context, bind_owner);
+                    session_namespace, session_id, access, &io_context, bind_owner);
             });
         if (claim.retry) continue;
         if (claim.owner) {
@@ -1534,7 +1522,180 @@ HttpConfig XHttpClientHttpConfig(const XHttpConfig& cfg,
     return http;
 }
 
-net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
+namespace {
+
+net::awaitable<tl::expected<bool, ErrorCode>> ExecuteXHttp1UploadRequest(
+    std::unique_ptr<AsyncStream>& stream,
+    const HttpConfig& cfg,
+    uint64_t conn_id,
+    XHttpRequestMeta::Kind kind,
+    std::string_view session_id,
+    uint64_t seq,
+    const Http1ReadFraming& body_framing,
+    bool expect_100_continue,
+    bool keep_alive,
+    buf::MultiBuffer read_ahead,
+    buf::BufferGuard head_storage,
+    std::shared_ptr<XHttpPacketUpSession> session,
+    const XHttpUploadTimeouts& timeouts) {
+    if (kind == XHttpRequestMeta::Kind::PacketUp) {
+        const auto* content_length = std::get_if<Http1BodyContentLength>(&body_framing);
+        if (!content_length) {
+            // The chunked decoder buffers past the body's last chunk, so
+            // this upload ends its connection instead of persisting.
+            if (!session) {
+                co_return tl::unexpected(ErrorCode::NOT_FOUND);
+            }
+        }
+        if (expect_100_continue &&
+            (!content_length ||
+             (session && session->AcceptingInput() &&
+              content_length->bytes <= ::detail::XHttpPacketQueue::kMaxQueuedBytes)) &&
+            !co_await WriteFullToStream(*stream, "HTTP/1.1 100 Continue\r\n\r\n")) {
+            co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+        }
+        if (!content_length) {
+            auto body = MakeHttp1BodyStream(
+                std::move(stream), Http1BodyChunked{}, false, std::move(read_ahead));
+            head_storage = buf::BufferGuard{};
+            try {
+                XHttpPacketUpSession::Upload upload(*session, *body);
+                auto payload = co_await ReadXHttpPacketBody(std::nullopt, upload);
+                if (!payload) {
+                    co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+                }
+                if (!upload.Commit(seq, std::move(*payload))) {
+                    co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+                }
+            } catch (const IoSystemError& e) {
+                co_return tl::unexpected(
+                    e.code() == io_error::no_buffer_space
+                        ? ErrorCode::RESOURCE_EXHAUSTED
+                        : ErrorCode::PROTOCOL_DECODE_FAILED);
+            }
+            if (!session->DownlinkAttached() && !co_await session->AwaitDownlink(*body)) {
+                co_return tl::unexpected(ErrorCode::TIMEOUT);
+            }
+            if (!co_await WriteFullToStream(
+                    *body, BuildXHttpResponseHeaders(cfg, false, true))) {
+                co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+            }
+            LOG_CONN_TRACE(conn_id, "XHTTP server packet-up payload accepted seq={}",
+                          seq);
+            co_return false;
+        }
+
+        // A Content-Length body is read from the connection itself, so the
+        // bytes after it stay queued in order for the next request head.
+        if (!read_ahead.empty()) {
+            stream->PrependReadMultiBuffer(std::move(read_ahead));
+        }
+        const size_t body_bytes = content_length->bytes;
+        head_storage = buf::BufferGuard{};
+        // A packet this server cannot take is answered and dropped without
+        // closing: pipelined requests behind it may belong to other sessions.
+        std::string_view rejection;
+        if (!session || !session->AcceptingInput()) {
+            if (!co_await DiscardHttp1Body(*stream, body_bytes)) {
+                co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+            }
+            rejection = "404 Not Found";
+        } else {
+            bool reading_body = false;
+            bool discard_after_rejection = false;
+            try {
+                XHttpPacketUpSession::Upload upload(*session, *stream);
+                reading_body = true;
+                auto payload = co_await ReadXHttpPacketBody(body_bytes, upload);
+                if (!payload) {
+                    co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+                }
+                if (!upload.Commit(seq, std::move(*payload))) {
+                    rejection = "503 Service Unavailable";
+                }
+            } catch (const IoSystemError& e) {
+                if (e.code() != io_error::no_buffer_space || !stream->IsOpen()) {
+                    co_return tl::unexpected(
+                        e.code() == io_error::no_buffer_space
+                            ? ErrorCode::RESOURCE_EXHAUSTED
+                            : ErrorCode::PROTOCOL_DECODE_FAILED);
+                }
+                if (reading_body) {
+                    co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+                }
+                discard_after_rejection = true;
+                rejection = "503 Service Unavailable";
+            }
+            if (discard_after_rejection &&
+                !co_await DiscardHttp1Body(*stream, body_bytes)) {
+                co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+            }
+        }
+        // An upload may reach the session before its downlink GET: hold
+        // the session for that GET within this request's deadline.
+        if (rejection.empty() && !session->DownlinkAttached() &&
+            !co_await session->AwaitDownlink(*stream)) {
+            co_return tl::unexpected(ErrorCode::TIMEOUT);
+        }
+        session.reset();
+        const auto response = rejection.empty()
+            ? BuildXHttpResponseHeaders(cfg, false, !keep_alive)
+            : BuildEmptyHttp1Response(rejection, !keep_alive);
+        if (!co_await WriteFullToStream(*stream, response)) {
+            co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+        }
+        LOG_CONN_TRACE(conn_id, "XHTTP server packet-up response seq={} status={}",
+                      seq,
+                      rejection.empty() ? std::string_view("200 OK") : rejection);
+        if (!keep_alive) {
+            co_return false;
+        }
+        // Between requests the connection idles under the transport idle
+        // timeout; each request's handshake budget ends with its response.
+        timeouts.OnReady(*stream);
+        co_return true;
+    }
+
+    if (!session || !session->CanAttachStream()) {
+        co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+    }
+    bool accepting = true;
+    struct StreamUpGuard {
+        XHttpPacketUpSession* session;
+        bool& active;
+        ~StreamUpGuard() {
+            if (active && session->CanAttachStream()) session->Close();
+        }
+    } guard{session.get(), accepting};
+    if (expect_100_continue &&
+        !co_await WriteFullToStream(*stream, "HTTP/1.1 100 Continue\r\n\r\n")) {
+        co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+    }
+    // Keep the upload response body open while the VLESS stream reads
+    // request chunks.
+    constexpr std::string_view kResponse =
+        "HTTP/1.1 200 OK\r\n"
+        "X-Accel-Buffering: no\r\n"
+        "Cache-Control: no-store\r\n"
+        "\r\n";
+    if (!co_await WriteFullToStream(*stream, kResponse)) {
+        co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+    }
+    auto body = MakeHttp1BodyStream(
+        std::move(stream), body_framing, false, std::move(read_ahead));
+    timeouts.OnReady(*body);
+    accepting = false;
+    LOG_CONN_DEBUG(conn_id, "XHTTP server stream-up upload ready session={}",
+                  PublicHttpTargetForLog(session_id));
+    if (!session->AttachStream(std::move(body))) {
+        co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+    }
+    head_storage = buf::BufferGuard{};
+    co_await session->JoinAttachedUpload();
+    co_return false;
+}
+
+net::awaitable<TransportBuildResult> RunXHttp1ServerHandshake(
     net::io_context& io_context,
     std::unique_ptr<AsyncStream> stream,
     const HttpConfig& cfg,
@@ -1542,12 +1703,14 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
     uint64_t conn_id,
     InboundTransportMetadata* transport_metadata,
     std::span<const uint8_t> initial,
-    const std::shared_ptr<InboundTransportStreamHandler>& stream_handler) {
+    const std::shared_ptr<InboundTransportStreamHandler>& stream_handler,
+    const XHttpUploadTimeouts& timeouts,
+    bool start_persistent) {
     // RFC 9112 9.3: a packet-up upload leaves its HTTP/1.1 connection open for
     // the client's next, possibly pipelined, request. Every other request kind
     // turns the connection into a long-lived stream and ends the loop.
     std::array<uint8_t, 1> request_start{};
-    for (bool persistent = false;; persistent = true) {
+    for (bool persistent = start_persistent;; persistent = true) {
         if (transport_metadata) transport_metadata->real_ip.clear();
         std::span<const uint8_t> received = initial;
         if (persistent) {
@@ -1562,7 +1725,7 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
             if (n == 0) {
                 co_return std::unique_ptr<AsyncStream>{};
             }
-            if (stream_handler) stream_handler->OnInboundTransportRequest(*stream);
+            timeouts.OnRequest(*stream);
             received = request_start;
         }
         auto head = co_await ReadHttp1MessageHead(*stream, received);
@@ -1667,13 +1830,15 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
             co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
         }
 
-        std::shared_ptr<XHttpPacketUpSession> resolved_session;
+        const bool expect_100_continue =
+            HeaderListContainsTokenCI(request, "Expect", "100-continue");
+        const bool keep_alive = RequestKeepsConnection(request_line, request);
         if (meta.kind == XHttpRequestMeta::Kind::PacketUp ||
             meta.kind == XHttpRequestMeta::Kind::StreamUp) {
             const auto access = meta.kind == XHttpRequestMeta::Kind::StreamUp
                 ? XHttpSessionAccess::Open
                 : XHttpSessionAccess::Upload;
-            const bool bind_immediately = (stream_handler == nullptr);
+            const bool bind_immediately = !timeouts.active;
             auto resolution = co_await ResolveXHttpSessionOwner(
                 io_context, xhttp_cfg.session_namespace, meta.session_id,
                 access, bind_immediately, &stream->Cancellation());
@@ -1688,38 +1853,64 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
                         : ErrorCode::NOT_FOUND);
             }
             if (owner_reactor != &io_context) {
-                auto detached = DetachXHttpStream(
-                    *stream, std::span<const uint8_t>(head->bytes, head->size));
+                const auto kind = meta.kind;
+                std::string session_id(meta.session_id);
+                const uint64_t seq = meta.seq;
+                const Http1ReadFraming framing = *body_framing;
+                auto detached = DetachXHttpStream(*stream, head->ReadAhead());
                 head->storage = buf::BufferGuard{};
                 stream.reset();
                 if (!detached) {
                     co_return tl::unexpected(ErrorCode::SOCKET_READ_FAILED);
                 }
-                const bool has_stream_handler = (stream_handler != nullptr);
-                const auto handshake_timeout = stream_handler
-                    ? stream_handler->TransportHandshakeTimeout()
-                    : std::chrono::seconds{0};
-                const auto idle_timeout = stream_handler
-                    ? stream_handler->TransportIdleTimeout()
-                    : std::chrono::seconds{0};
+                const bool has_stream_handler = timeouts.active;
+                const auto handshake_timeout = timeouts.handshake_timeout;
+                const auto idle_timeout = timeouts.idle_timeout;
                 auto handed = co_await net::co_spawn(
                     *owner_reactor,
                     [owner_reactor, detached = std::move(*detached),
-                     cfg, xhttp_cfg, conn_id, has_stream_handler,
-                     handshake_timeout, idle_timeout]() mutable
+                     &cfg, &xhttp_cfg, conn_id, has_stream_handler,
+                     handshake_timeout, idle_timeout,
+                     kind, session_id = std::move(session_id), seq,
+                     framing, expect_100_continue, keep_alive]() mutable
                         -> net::awaitable<tl::expected<void, ErrorCode>> {
                         auto restored = RestoreXHttpStream(*owner_reactor, std::move(detached));
                         if (!restored) co_return tl::unexpected(ErrorCode::SOCKET_READ_FAILED);
-                        std::shared_ptr<InboundTransportStreamHandler> local_handler;
                         if (has_stream_handler) {
-                            local_handler = memory::AllocateShared<UploadTransportStreamHandler>(
-                                handshake_timeout, idle_timeout);
-                            local_handler->OnInboundTransportRequest(*restored);
+                            restored->SetIdleTimeout(handshake_timeout);
+                            (void)restored->StartPhaseDeadline(handshake_timeout);
                         }
-                        auto result = co_await DoXHttp1ServerHandshake(
+                        const auto owner_access = kind == XHttpRequestMeta::Kind::StreamUp
+                            ? XHttpSessionAccess::Open
+                            : XHttpSessionAccess::Upload;
+                        auto owner_resolution = co_await ResolveXHttpSessionOwner(
+                            *owner_reactor, xhttp_cfg.session_namespace, session_id,
+                            owner_access, !has_stream_handler, &restored->Cancellation());
+                        if (!owner_resolution.owner) {
+                            if (restored->ConsumePhaseDeadline() || restored->ConsumeIdleTimeout()) {
+                                co_return tl::unexpected(ErrorCode::TIMEOUT);
+                            }
+                            co_return tl::unexpected(
+                                kind == XHttpRequestMeta::Kind::StreamUp
+                                    ? ErrorCode::RESOURCE_EXHAUSTED
+                                    : ErrorCode::NOT_FOUND);
+                        }
+                        const XHttpUploadTimeouts handed_timeouts{
+                            .stream_handler = nullptr,
+                            .handshake_timeout = handshake_timeout,
+                            .idle_timeout = idle_timeout,
+                            .active = has_stream_handler,
+                        };
+                        auto first_result = co_await ExecuteXHttp1UploadRequest(
+                            restored, cfg, conn_id, kind, session_id, seq,
+                            framing, expect_100_continue, keep_alive, {}, {},
+                            std::move(owner_resolution.session), handed_timeouts);
+                        if (!first_result) co_return tl::unexpected(first_result.error());
+                        if (!*first_result) co_return tl::expected<void, ErrorCode>{};
+                        std::shared_ptr<InboundTransportStreamHandler> no_handler;
+                        auto result = co_await RunXHttp1ServerHandshake(
                             *owner_reactor, std::move(restored), cfg, xhttp_cfg,
-                            conn_id, nullptr, {}, local_handler);
-                        local_handler.reset();
+                            conn_id, nullptr, {}, no_handler, handed_timeouts, true);
                         if (!result) co_return tl::unexpected(result.error());
                         if (*result) co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
                         co_return tl::expected<void, ErrorCode>{};
@@ -1728,167 +1919,19 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
                 if (!handed) co_return tl::unexpected(handed.error());
                 co_return std::unique_ptr<AsyncStream>{};
             }
-            resolved_session = std::move(resolution.session);
-        }
-        if (meta.kind == XHttpRequestMeta::Kind::PacketUp) {
-            auto session = std::move(resolved_session);
-            const auto* content_length = std::get_if<Http1BodyContentLength>(&*body_framing);
-            if (!content_length) {
-                // The chunked decoder buffers past the body's last chunk, so
-                // this upload ends its connection instead of persisting.
-                if (!session) {
-                    co_return tl::unexpected(ErrorCode::NOT_FOUND);
-                }
+            buf::MultiBuffer read_ahead = head->TakeReadAheadMultiBuffer();
+            auto upload_result = co_await ExecuteXHttp1UploadRequest(
+                stream, cfg, conn_id, meta.kind, meta.session_id, meta.seq,
+                *body_framing, expect_100_continue, keep_alive,
+                std::move(read_ahead), std::move(head->storage),
+                std::move(resolution.session), timeouts);
+            if (!upload_result) {
+                co_return tl::unexpected(upload_result.error());
             }
-            if (HeaderListContainsTokenCI(request, "Expect", "100-continue") &&
-                (!content_length ||
-                 (session && session->AcceptingInput() &&
-                  content_length->bytes <= ::detail::XHttpPacketQueue::kMaxQueuedBytes)) &&
-                !co_await WriteFullToStream(*stream, "HTTP/1.1 100 Continue\r\n\r\n")) {
-                co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
-            }
-            if (!content_length) {
-                auto body = MakeHttp1BodyStream(
-                    std::move(stream), Http1BodyChunked{}, false, head->TakeReadAheadMultiBuffer());
-                head->storage = buf::BufferGuard{};
-                try {
-                    XHttpPacketUpSession::Upload upload(*session, *body);
-                    auto payload = co_await ReadXHttpPacketBody(std::nullopt, upload);
-                    if (!payload) {
-                        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
-                    }
-                    if (!upload.Commit(meta.seq, std::move(*payload))) {
-                        co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
-                    }
-                } catch (const IoSystemError& e) {
-                    co_return tl::unexpected(
-                        e.code() == io_error::no_buffer_space
-                            ? ErrorCode::RESOURCE_EXHAUSTED
-                            : ErrorCode::PROTOCOL_DECODE_FAILED);
-                }
-                if (!session->DownlinkAttached() && !co_await session->AwaitDownlink(*body)) {
-                    co_return tl::unexpected(ErrorCode::TIMEOUT);
-                }
-                if (!co_await WriteFullToStream(
-                        *body, BuildXHttpResponseHeaders(cfg, false, true))) {
-                    co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
-                }
-                LOG_CONN_TRACE(conn_id, "XHTTP server packet-up payload accepted seq={}",
-                              meta.seq);
+            if (!*upload_result) {
                 co_return std::unique_ptr<AsyncStream>{};
-            }
-
-            // A Content-Length body is read from the connection itself, so the
-            // bytes after it stay queued in order for the next request head.
-            stream->PrependReadMultiBuffer(head->TakeReadAheadMultiBuffer());
-            const bool keep_alive = RequestKeepsConnection(request_line, request);
-            const size_t body_bytes = content_length->bytes;
-            head->storage = buf::BufferGuard{};
-            // A packet this server cannot take is answered and dropped without
-            // closing: pipelined requests behind it may belong to other sessions.
-            std::string_view rejection;
-            if (!session || !session->AcceptingInput()) {
-                if (!co_await DiscardHttp1Body(*stream, body_bytes)) {
-                    co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
-                }
-                rejection = "404 Not Found";
-            } else {
-                bool reading_body = false;
-                bool discard_after_rejection = false;
-                try {
-                    XHttpPacketUpSession::Upload upload(*session, *stream);
-                    reading_body = true;
-                    auto payload = co_await ReadXHttpPacketBody(body_bytes, upload);
-                    if (!payload) {
-                        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
-                    }
-                    if (!upload.Commit(meta.seq, std::move(*payload))) {
-                        rejection = "503 Service Unavailable";
-                    }
-                } catch (const IoSystemError& e) {
-                    if (e.code() != io_error::no_buffer_space || !stream->IsOpen()) {
-                        co_return tl::unexpected(
-                            e.code() == io_error::no_buffer_space
-                                ? ErrorCode::RESOURCE_EXHAUSTED
-                                : ErrorCode::PROTOCOL_DECODE_FAILED);
-                    }
-                    if (reading_body) {
-                        co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
-                    }
-                    discard_after_rejection = true;
-                    rejection = "503 Service Unavailable";
-                }
-                if (discard_after_rejection &&
-                    !co_await DiscardHttp1Body(*stream, body_bytes)) {
-                    co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
-                }
-            }
-            // An upload may reach the session before its downlink GET: hold
-            // the session for that GET within this request's deadline.
-            if (rejection.empty() && !session->DownlinkAttached() &&
-                !co_await session->AwaitDownlink(*stream)) {
-                co_return tl::unexpected(ErrorCode::TIMEOUT);
-            }
-            session.reset();
-            const auto response = rejection.empty()
-                ? BuildXHttpResponseHeaders(cfg, false, !keep_alive)
-                : BuildEmptyHttp1Response(rejection, !keep_alive);
-            if (!co_await WriteFullToStream(*stream, response)) {
-                co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
-            }
-            LOG_CONN_TRACE(conn_id, "XHTTP server packet-up response seq={} status={}",
-                          meta.seq,
-                          rejection.empty() ? std::string_view("200 OK") : rejection);
-            if (!keep_alive) {
-                co_return std::unique_ptr<AsyncStream>{};
-            }
-            // Between requests the connection idles under the transport idle
-            // timeout; each request's handshake budget ends with its response.
-            if (stream_handler) {
-                stream_handler->OnInboundTransportReady(*stream);
             }
             continue;
-        }
-
-        if (meta.kind == XHttpRequestMeta::Kind::StreamUp) {
-            auto session = std::move(resolved_session);
-            if (!session || !session->CanAttachStream()) {
-                co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
-            }
-            bool accepting = true;
-            struct StreamUpGuard {
-                XHttpPacketUpSession* session;
-                bool& active;
-                ~StreamUpGuard() {
-                    if (active && session->CanAttachStream()) session->Close();
-                }
-            } guard{session.get(), accepting};
-            if (HeaderListContainsTokenCI(request, "Expect", "100-continue") &&
-                !co_await WriteFullToStream(*stream, "HTTP/1.1 100 Continue\r\n\r\n")) {
-                co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
-            }
-            // Keep the upload response body open while the VLESS stream reads
-            // request chunks.
-            constexpr std::string_view kResponse =
-                "HTTP/1.1 200 OK\r\n"
-                "X-Accel-Buffering: no\r\n"
-                "Cache-Control: no-store\r\n"
-                "\r\n";
-            if (!co_await WriteFullToStream(*stream, kResponse)) {
-                co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
-            }
-            auto body = MakeHttp1BodyStream(
-                std::move(stream), *body_framing, false, head->TakeReadAheadMultiBuffer());
-            if (stream_handler) stream_handler->OnInboundTransportReady(*body);
-            accepting = false;
-            LOG_CONN_DEBUG(conn_id, "XHTTP server stream-up upload ready session={}",
-                          PublicHttpTargetForLog(meta.session_id));
-            if (!session->AttachStream(std::move(body))) {
-                co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
-            }
-            head->storage = buf::BufferGuard{};
-            co_await session->JoinAttachedUpload();
-            co_return std::unique_ptr<AsyncStream>{};
         }
 
         // StreamOne: one request carries both directions, its body as the
@@ -1896,7 +1939,7 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
         if (!xhttp_cfg.AcceptsStreamOne()) {
             co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
         }
-        if (HeaderListContainsTokenCI(request, "Expect", "100-continue") &&
+        if (expect_100_continue &&
             !co_await WriteFullToStream(*stream, "HTTP/1.1 100 Continue\r\n\r\n")) {
             co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
         }
@@ -1916,6 +1959,32 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
         co_await stream_handler->OnInboundTransportStream(std::move(body), std::move(metadata));
         co_return std::unique_ptr<AsyncStream>{};
     }
+}
+
+}  // namespace
+
+net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
+    net::io_context& io_context,
+    std::unique_ptr<AsyncStream> stream,
+    const HttpConfig& cfg,
+    const XHttpConfig& xhttp_cfg,
+    uint64_t conn_id,
+    InboundTransportMetadata* transport_metadata,
+    std::span<const uint8_t> initial,
+    const std::shared_ptr<InboundTransportStreamHandler>& stream_handler) {
+    const XHttpUploadTimeouts timeouts{
+        .stream_handler = &stream_handler,
+        .handshake_timeout = stream_handler
+            ? stream_handler->TransportHandshakeTimeout()
+            : std::chrono::seconds{0},
+        .idle_timeout = stream_handler
+            ? stream_handler->TransportIdleTimeout()
+            : std::chrono::seconds{0},
+        .active = (stream_handler != nullptr),
+    };
+    co_return co_await RunXHttp1ServerHandshake(
+        io_context, std::move(stream), cfg, xhttp_cfg, conn_id,
+        transport_metadata, initial, stream_handler, timeouts, false);
 }
 
 net::awaitable<TransportBuildResult> DoXHttp1ClientRequest(

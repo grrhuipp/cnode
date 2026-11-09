@@ -5,7 +5,6 @@
 #include "../vless_codec.hpp"
 #include "../vless_encryption.hpp"
 #include "app/worker_mailbox.hpp"
-#include "../vless_vision.hpp"
 #include "app/proxyman/inbound/factory.hpp"
 #include "app/proxyman/inbound/receiver_settings.hpp"
 #include "app/proxyman/inbound/user_store.hpp"

@@ -6,7 +6,6 @@
 #include "common/buffer_util.hpp"
 #include "infra/log.hpp"
 #include "common/unsafe.hpp"
-#include "autosign_cert.hpp"
 #include "common/domain_name.hpp"
 #include "common/ip_address.hpp"
 #include <openssl/asn1.h>

@@ -9,7 +9,7 @@
 // ============================================================================
 
 #include "../validator.hpp"
-#include "../vmess_cipher.hpp"
+#include "../vmess_crypto.hpp"
 #include "common/address_codec.hpp"
 #include "common/allocator.hpp"
 #include "common/buf/multi_buffer.hpp"

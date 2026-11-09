@@ -3,7 +3,7 @@
 #include "app/worker_mailbox.hpp"
 #include "app/proxyman/inbound/user_store.hpp"
 #include "app/proxyman/inbound/prepared_config.hpp"
-#include "app/proxyman/outbound/prepared_config.hpp"
+#include "app/proxyman/outbound/factory.hpp"
 #include "infra/runtime_config_types.hpp"
 #include "common/allocator.hpp"
 #include "common/asio_types.hpp"

@@ -1,8 +1,6 @@
 #include "app/bootstrap.hpp"
 
 #include "../common/awaitable_batch.hpp"
-#include "../common/monitor_loop.hpp"
-#include "../common/process_resources.hpp"
 #include "api/api.hpp"
 #include "app/dns/dns.hpp"
 #include "app/prepared_inbound.hpp"

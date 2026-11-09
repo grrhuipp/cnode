@@ -2,7 +2,6 @@
 
 #include "app/dns/dns.hpp"
 #include "common/allocator.hpp"
-#include "app/dns/datagram_exchange.hpp"
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/cancellation_signal.hpp>
 #include <asio/co_spawn.hpp>

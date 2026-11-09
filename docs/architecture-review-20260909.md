@@ -1654,3 +1654,32 @@ CI失败场景修复后通过真实双进程、ML-KEM/X25519加密和回环对�
 - **64 活跃会话统计采样与 TCP 发送基准（`cnode_runtime_sampling_benchmark` / `cnode_tcp_send_benchmark`）**：
   - `cnode_runtime_sampling_benchmark`：`resources=0` 采样延迟由 `68.45 / 69.59 ns` 两轮一致稳定降至 **`68.30 / 68.34 ns`**（`p50 = 30.0 ns`，首轮 `max = 40.0 ns`）；`resources=1` 采样延迟由 `107.90 / 86.07 ns` 稳定降至 **`86.10 / 85.98 ns`**，第 2 轮活跃匿名内存减少 **8 KiB**，0 次堆分配。
   - `tcp-send 8192B (8 pieces)`：单次 burst 墙钟耗时由 `10,675.1 / 10,601.2 ns` 两轮一致稳定降至 **`10,556.3 / 10,583.9 ns`（最高 -1.1%）**；`65536B (16 pieces)` 第 2 轮墙钟耗时由 `44,311.5 ns` 降至 **`43,756.1 ns`（-1.3%）**。
+
+## 2026-11-09（第十二轮）：`WorkerMailbox::PostCall` 零协程帧直通释放、XHTTP 移交零整头回塞、`Router::Impl` 内联与 22 个碎片文件合并
+
+### 架构与流程精简内容
+
+1. **`WorkerMailbox::PostCall` 零目标协程帧分配与 `ReleaseOnOwner()` 同线程直通释放**：
+   - `include/app/worker_mailbox.hpp`：提取 `WorkerMailbox::ReleaseOnOwner() noexcept` 与 `Slot::ReleaseOnOwner() noexcept`；在 `RunHeld` 协程结束时通过栈上 `OwnerGuard` 直接调用 `slot.ReleaseOnOwner()`（消除同线程完成时的二次 `net::dispatch`）；将 `PostCall(Fn fn)` 从 `net::co_spawn(io_context_.get_executor(), CallHeld(...), net::use_awaitable)` 改为 `net::async_initiate` + `net::post(io_context_, ...)`，在目标线程同步执行 `fn` 后立即 `slot.ReleaseOnOwner()` 并恢复调用方，彻底删除 `CallHeld` 并消除每次跨线程同步调用（含每条新连接 `ConnectionLimiter` 准入）在目标线程额外分配一个协程帧的开销。
+2. **XHTTP Split-HTTP 跨 Worker 移交消除整头回塞与二次解析 + `Http1BodyStream` Chunked 零拷贝快路径**：
+   - `src/transport/internet/xhttp_session.cpp`：当 `DoXHttp1ServerHandshake` 识别出 `owner_reactor != &io_context` 时，调用 `DetachXHttpStream(*stream, head->ReadAhead())` 仅移交 `\r\n\r\n` 之后的预读 body 字节（不再将整个 HTTP/1 请求头拷入 `std::vector<uint8_t>` 塞回字节流），将已解析出的首请求元数据传入 `owner_reactor` 并按 `const HttpConfig&` / `const XHttpConfig&` 引用借用配置（消除两份配置聚合与 `std::map` 的深拷贝），在原 Worker 恢复流后直接调用 `ExecuteXHttp1UploadRequest` 消费请求体（消除原 Worker 上的二次 `ReadHttp1MessageHead` 与二次 HTTP 头解析），同时删除 `UploadTransportStreamHandler` 类及其 `AllocateShared` 堆分配；在 `ResolveXHttpSessionOwner` 与 `XHttpSessionDirectory::Acquire` 中改用 `std::string_view` 透明查找，消除已存在会话跨请求查找时的 2 次 `std::string` 堆分配。
+   - `src/transport/internet/http1_handshake.cpp`：在 `Http1BodyStream::ReadMultiBuffer()` 的 `read_chunked_` 分支中增加 `pending_.byte_size() <= chunk_remaining_` 零拷贝快路径，直接 `co_return std::move(pending_);`。
+3. **内联 `app::router::Router::Impl`、消除 `RuntimeState` 无共享 `shared_ptr` 并合并 22 个碎片文件（六轮累计清理 202 个冗余碎片文件）**：
+   - `include/app/router/router.hpp`、`src/app/router/router.cpp`、`src/app/worker.cpp`：将 `detail::CompoundRoutingRule` 移入 `router.hpp`，让 `Router` 直接持有 `compound_rules_` 与 `domain_strategy_` 值成员，彻底删除 `Router::Impl` Pimpl 堆分配与每次路由匹配的指针解引用；将 `Worker::RuntimeState` 中的 `router` 与 `detect_rule_policy` 从 `std::shared_ptr` 收口为 `std::unique_ptr`。
+   - 合并并删除 `app`、`common`、`api/v2board`、`transport`、`proxy`、`service/controller` 下共 22 个单调用方碎片文件（含 `inbound/handler_registry.hpp`、`inbound/factory.cpp`、`outbound/prepared_config.hpp`、`outbound/factory.cpp`、`dns/{cache_internal,datagram_exchange,inflight_resolves}.hpp`、`common/{monitor_loop,process_resources}.hpp`、`v2board/panel_json_compat.hpp`、`transport/internet/{tls_config,tls_server_name,grpc_hunk,autosign_cert}.hpp`、`controller/traffic_journal.{hpp,cpp}`、`proxy/outbound_server.hpp`、`shadowsocks/stream_crypto.hpp`、`vless/vless_vision.{hpp,cpp}`、`vmess/vmess_cipher.{hpp,cpp}`）。
+
+### 验证与性能/内存实证
+
+全量 **1,251/1,251** 测试通过（325 项 unit、926 项 E2E，E2E 累计耗时进一步降至 `786.51 sec*proc`）。在同一环境与编译选项下执行 A/B/A/B 交错重复基准对照：
+
+- **64 活跃 VLESS 会话内存占用与统计采样（`cnode_runtime_sampling_benchmark`）**：
+  - **`resources=0`**：进程峰值 RSS（`process_peak_rss_bytes` / `idle_rss_bytes` / `warm_rss_bytes`）由 `14,614,528 / 14,618,624 B` **两轮一致稳定降至 `14,422,016 / 14,422,016 B`（稳定减少 188 ~ 192 KiB / -1.3%）**；第 2 轮采样延迟保持 **`68.34 ns`**（`p50 = 30.0 ns`，0 次堆分配）。
+  - **`resources=1`**：进程峰值 RSS 由 `15,060,992 / 15,060,992 B` **两轮一致稳定降至 `14,819,328 / 14,811,136 B`（稳定减少 236 ~ 244 KiB / -1.6%）**；采样延迟由 `86.11 / 87.36 ns` **两轮一致稳定降至 `86.02 / 86.02 ns`**（`p50 = 50.0 ns`，`p95 = 60.0 ns`，0 次堆分配）。
+- **VLESS/TLS 真实进程基准（`cnode_tls_throughput_benchmark`）**：
+  - **守护进程启动驻留内存（`server_started` RSS）**：常规启动 RSS 由 `13,271,040 ~ 13,283,328 B` 稳定降至 **`13,066,240 ~ 13,082,624 B`（稳定减少 196 ~ 212 KiB）**，启动匿名内存最低降至 **`5,931,008 B`（`5.66 MiB`）**。
+  - **8 流上传与下载（`Upload8` / `Download8`）**：`Upload8` 8 流上传吞吐由 `540.23 / 640.10 MiB/s` **两轮一致大幅提升至 `629.93 / 762.60 MiB/s`（+16.6% ~ +19.1%，第 2 轮 128 MiB 传输仅耗时 `0.1678s`）**，第 2 轮活跃匿名内存降至 **`6,406,144 B`**；`Download8` 8 流下载吞吐由 `610.89 / 625.66 MiB/s` **两轮一致提升至 `620.00 / 638.32 MiB/s`（+1.5% ~ +2.0%）**。
+  - **单流下载与上传（`Download1` / `Upload1`）**：首轮 `Download1` 吞吐由 `438.15 MiB/s` 升至 **`548.11 MiB/s`（+25.1%）**、守护进程 CPU -16.6%；首轮 `Upload1` 吞吐由 `639.17 MiB/s` 升至 **`802.37 MiB/s`（+25.5%）**、守护进程 CPU -5.9%。
+- **Hysteria2 四 Worker 真实进程基准（`cnode_hysteria_throughput_benchmark`）**：
+  - **守护进程启动驻留内存（`startup` RSS）**：4 项测试两轮共 8 次运行的启动 RSS 均由 `14,438,400 ~ 14,462,976 B` **100% 稳定降至 `14,385,152 ~ 14,397,440 B`（稳定减少 52 ~ 68 KiB）**。
+  - **256 连接上传与下载**：256 连接上传首轮就绪 RSS 减少 **180 KiB**、负载峰值 RSS 减少 **200 KiB**；256 连接下载守护进程总 CPU 由 `1.462 / 1.459s` **两轮一致稳定降至 `1.454 / 1.451s`**，空闲回收后常驻 RSS 由 `19,976,192 / 19,914,752 B` **两轮一致稳定降至 `19,836,928 / 19,877,888 B`（减少 36 ~ 136 KiB）**。
+  - **16×64（1,024 流）上传与下载**：16×64 上传吞吐由 `55.44 / 55.75 MiB/s` **两轮一致升至 `55.76 / 56.89 MiB/s`（第 2 轮 +2.0%）**，建连耗时由 `0.145 / 0.144s` **两轮一致降至 `0.135 / 0.140s`**，第 2 轮守护进程总 CPU 降至 **`3.752s`（-2.0%）**，首轮空闲回收高水位减少 **776 KiB**、回收常驻 RSS 减少 **540 KiB**；16×64 下载首轮建连耗时由 `0.139s` 降至 **`0.126s`（-9.1%）**，第 2 轮 1,024 流就绪 RSS 减少 **276 KiB**。

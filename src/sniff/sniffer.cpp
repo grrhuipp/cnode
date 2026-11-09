@@ -9,7 +9,7 @@
 #include "common/unsafe.hpp"
 #include "core/constants.hpp"
 #include "transport/internet/http_headers.hpp"
-#include "transport/internet/tls_server_name.hpp"
+#include "transport/internet/reality_key.hpp"
 
 #include <openssl/evp.h>
 #include <openssl/hmac.h>

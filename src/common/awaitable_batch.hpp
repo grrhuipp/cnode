@@ -4,18 +4,29 @@
 #include "common/asio_types.hpp"
 #include "common/error.hpp"
 
+#include <asio/as_tuple.hpp>
 #include <asio/async_result.hpp>
 #include <asio/bind_cancellation_slot.hpp>
+#include <asio/cancellation_signal.hpp>
 #include <asio/co_spawn.hpp>
+#include <asio/steady_timer.hpp>
 #include <asio/this_coro.hpp>
 #include <asio/use_awaitable.hpp>
 
+#include <cerrno>
+#include <cstddef>
 #include <exception>
+#include <functional>
 #include <memory>
+#include <optional>
+#include <string>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
+#include <dirent.h>
+#include <sys/resource.h>
 namespace detail {
 
 template <typename Handler>
@@ -99,5 +110,103 @@ inline net::awaitable<void> RunAwaitableBatch(
     if (cancellation.cancelled() != net::cancellation_type::none) {
         throw IoSystemError(net::error::operation_aborted);
     }
+}
+
+namespace monitor_detail {
+
+// Each process or panel monitor has its own completion boundary. The factory owns its
+// context, and co_spawn retains this state until this loop's exit is reported.
+// Construction, Start, stop, join and completion belong to the main executor.
+class MonitorLoop final : public std::enable_shared_from_this<MonitorLoop> {
+public:
+    using Factory = std::function<net::awaitable<void>()>;
+    using ReportExit = std::function<void(std::string_view, std::exception_ptr)>;
+
+    MonitorLoop(net::any_io_executor executor, std::string name,
+                Factory factory, ReportExit report_exit)
+        : executor_(std::move(executor)), name_(std::move(name)),
+          factory_(std::move(factory)), report_exit_(std::move(report_exit)),
+          completion_(executor_, net::steady_timer::time_point::max()) {}
+
+    MonitorLoop(const MonitorLoop&) = delete;
+    MonitorLoop& operator=(const MonitorLoop&) = delete;
+
+    void Start() {
+        if (active_ || stopping_) return;
+        auto self = shared_from_this();
+        active_ = true;
+        try {
+            net::co_spawn(executor_,
+                [self]() -> net::awaitable<void> {
+                    if (!self->stopping_) co_await self->factory_();
+                },
+                net::bind_cancellation_slot(cancellation_.slot(),
+                    [self](std::exception_ptr failure) {
+                        self->active_ = false;
+                        self->completion_.cancel();
+                        if (self->stopping_ && (!failure || IsOperationCancelled(failure))) return;
+                        self->report_exit_(self->name_, std::move(failure));
+                    }));
+        } catch (...) {
+            active_ = false;
+            throw;
+        }
+    }
+
+    void RequestStop() noexcept {
+        if (stopping_) return;
+        stopping_ = true;
+        cancellation_.emit(net::cancellation_type::all);
+    }
+
+    net::awaitable<void> AsyncJoin() {
+        // A cancelled owner still has to retain the loop through actual completion.
+        co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
+        while (active_) {
+            (void)co_await completion_.async_wait(net::as_tuple(net::use_awaitable));
+        }
+    }
+
+private:
+    net::any_io_executor executor_;
+    std::string name_;
+    Factory factory_;
+    ReportExit report_exit_;
+    bool active_ = false;
+    net::cancellation_signal cancellation_;
+    net::steady_timer completion_;
+    bool stopping_ = false;
+};
+
+}  // namespace monitor_detail
+
+struct ProcessDescriptors {
+    std::optional<size_t> open;
+    std::optional<size_t> soft_limit;
+    bool soft_limit_unlimited = false;
+};
+
+// Control-thread diagnostics only. Unavailable counters remain unknown, not zero.
+// Excludes the temporary directory descriptor used by this sample.
+[[nodiscard]] inline ProcessDescriptors ReadProcessDescriptors() noexcept {
+    ProcessDescriptors result;
+    rlimit limits{};
+    if (::getrlimit(RLIMIT_NOFILE, &limits) == 0) {
+        result.soft_limit_unlimited = limits.rlim_cur == RLIM_INFINITY;
+        if (!result.soft_limit_unlimited) {
+            result.soft_limit = static_cast<size_t>(limits.rlim_cur);
+        }
+    }
+    if (DIR* directory = ::opendir("/proc/self/fd")) {
+        size_t count = 0;
+        errno = 0;
+        while (const auto* entry = ::readdir(directory)) {
+            if (entry->d_name[0] >= '0' && entry->d_name[0] <= '9') ++count;
+        }
+        const bool complete = errno == 0;
+        ::closedir(directory);
+        if (complete && count > 0) result.open = count - 1;
+    }
+    return result;
 }
 

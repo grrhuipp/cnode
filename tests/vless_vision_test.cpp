@@ -3,7 +3,7 @@
 
 // Wire timing reference: XTLS/Xray-core a4a3dff5b20c2faae567b742c172c7b95e75c083
 // proxy/proxy.go: VisionWriter.WriteMultiBuffer, IsCompleteRecord, XtlsPadding.
-#include "vless_vision.hpp"
+#include "vless_codec.hpp"
 #include "common/byte_reader.hpp"
 #include <asio/co_spawn.hpp>
 #include <asio/use_future.hpp>

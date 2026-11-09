@@ -1,7 +1,7 @@
 #include <stdexcept>
 #include <gtest/gtest.h>
 
-#include "panel_json_compat.hpp"
+#include "http_response.hpp"
 
 #include <cstdlib>
 #include <iostream>

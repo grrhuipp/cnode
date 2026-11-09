@@ -18,7 +18,7 @@
 #include "infra/log.hpp"
 #include "transport/internet/transport_stack.hpp"
 #include "transport/internet/timeout_scheduler.hpp"
-#include "../autosign_cert.hpp"
+#include "../reality_tls.hpp"
 #include "../../../proxy/inbound_admission.hpp"
 #include "../../../common/awaitable_task_group.hpp"
 #include "../../../app/worker/udp_receive_loop.hpp"

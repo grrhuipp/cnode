@@ -1,6 +1,5 @@
 #include <gtest/gtest.h>
 
-#include "app/dns/inflight_resolves.hpp"
 #include "app/dns/dns.hpp"
 #include "app/worker_mailbox.hpp"
 #include "common/allocator.hpp"

@@ -10,7 +10,6 @@
 #include "infra/log.hpp"
 #include "infra/panel_config.hpp"
 #include "http_response.hpp"
-#include "panel_json_compat.hpp"
 
 #include <asio/ip/tcp.hpp>
 #include <asio/ssl.hpp>

@@ -1,9 +1,7 @@
 #include "reality_tls.hpp"
-#include "autosign_cert.hpp"
 #include "core/naming.hpp"
 #include "common/binary_text_codec.hpp"
 #include "transport/internet/reality_key.hpp"
-#include "transport/internet/tls_server_name.hpp"
 
 #include "transport/internet/tls_stream.hpp"
 #include "transport/internet/stream_settings.hpp"

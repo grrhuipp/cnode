@@ -1,4 +1,3 @@
-#include "cache_internal.hpp"
 #include "app/dns/dns.hpp"
 #include "app/worker_mailbox.hpp"
 #include "common/byte_reader.hpp"
@@ -6,9 +5,6 @@
 #include "common/ip_address.hpp"
 #include "common/ip_utils.hpp"
 #include "infra/log.hpp"
-#include "datagram_exchange.hpp"
-#include "../../common/awaitable_task_group.hpp"
-#include "inflight_resolves.hpp"
 
 #include <algorithm>
 #include <array>

@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "transport/internet/tls_server_name.hpp"
+#include "transport/internet/reality_key.hpp"
 
 #include <array>
 #include <cstdio>

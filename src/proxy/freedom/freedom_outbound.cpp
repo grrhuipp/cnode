@@ -1,6 +1,5 @@
 #include "app/dns/dns.hpp"
 #include "app/proxyman/outbound/factory.hpp"
-#include "app/proxyman/outbound/prepared_config.hpp"
 #include "app/relay.hpp"
 #include "common/allocator.hpp"
 #include "common/ip_utils.hpp"

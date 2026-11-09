@@ -4,7 +4,6 @@
 #include "common/allocator.hpp"
 #include "common/initial_payload.hpp"
 #include "../ss_udp.hpp"
-#include "../stream_crypto.hpp"
 #include "common/sharded_user_stats.hpp"
 #include "transport/async_stream.hpp"
 #include "transport/link.hpp"

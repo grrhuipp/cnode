@@ -1,7 +1,7 @@
 #include <stdexcept>
 #include <gtest/gtest.h>
 
-#include "grpc_hunk.hpp"
+#include "http2_session.hpp"
 
 #include <algorithm>
 #include <array>

@@ -5,7 +5,6 @@
 #include "../../udp_target.hpp"
 #include "../shadowsocks_protocol.hpp"
 #include "../ss_udp.hpp"
-#include "../stream_crypto.hpp"
 #include "../../uot/uot.hpp"
 #include "common/target_address.hpp"
 #include "common/unsafe.hpp"

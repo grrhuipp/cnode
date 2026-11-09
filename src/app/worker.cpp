@@ -17,7 +17,6 @@
 #include "common/string_hash.hpp"
 #include "infra/log.hpp"
 #include "infra/runtime_failure.hpp"
-#include "app/proxyman/inbound/handler_registry.hpp"
 #include "app/proxyman/inbound/factory.hpp"
 #include "app/proxyman/inbound/user_store.hpp"
 #include "worker/tcp_listener.hpp"
@@ -291,8 +290,8 @@ struct Worker::RuntimeState {
     std::unique_ptr<ListenerState> listener_state;
     std::unique_ptr<proxyman::inbound::HandlerRegistry> inbound_handlers;
     std::unique_ptr<app::SessionTrackingState> session_tracking;
-    std::shared_ptr<app::router::Router> router;
-    std::shared_ptr<rule::DetectRulePolicy> detect_rule_policy;
+    std::unique_ptr<app::router::Router> router;
+    std::unique_ptr<rule::DetectRulePolicy> detect_rule_policy;
     bool started = false;
     bool cold_mutation_active = false;
     WorkerMemoryReclaimer memory_reclaimer;
@@ -564,7 +563,7 @@ void Worker::RuntimeState::Start(Worker& worker) {
             });
     session_tracking = std::make_unique<app::SessionTrackingState>();
     inbound_handlers = std::make_unique<proxyman::inbound::HandlerRegistry>(stats);
-    detect_rule_policy = std::make_shared<rule::DetectRulePolicy>();
+    detect_rule_policy = std::make_unique<rule::DetectRulePolicy>();
     const auto* config = startup_config.get();
     if (!connection_limiter) {
         connection_limiter = ConnectionLimiter::Acquire(RateLimitConfig{
@@ -573,7 +572,7 @@ void Worker::RuntimeState::Start(Worker& worker) {
             .ip_ban = config->limits.ip_ban,
         }, worker.group_coordinator_);
     }
-    router = std::make_shared<app::router::Router>(config->routing, geo_database);
+    router = std::make_unique<app::router::Router>(config->routing, geo_database);
     LOG_DEBUG("router initialized worker={} rules={}",
               worker.id_, config->routing.rules.size());
     dns = std::make_unique<app::dns::DNS>(dns_worker);

@@ -8,11 +8,13 @@
 // ============================================================================
 
 #include "app/proxyman/inbound/user_store.hpp"
+#include "../aead.hpp"
 #include "common/allocator.hpp"
 #include "common/buf/multi_buffer.hpp"
 #include "common/target_address.hpp"
 #include "common/unsafe.hpp"
 #include <openssl/aes.h>
+#include <openssl/ossl_typ.h>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -20,6 +22,7 @@
 #include <optional>
 #include <span>
 #include <string_view>
+#include <variant>
 namespace vmess {
 
 // Wire values of the request header security nibble.
@@ -168,5 +171,75 @@ uint32_t FNV1a32(const uint8_t* data, size_t len);
 // outbound account is prepared; requests only borrow it.
 [[nodiscard]] AES_KEY ExpandAuthIDEncryptKey(const std::array<uint8_t, 16>& auth_key);
 void GenerateAuthID(const AES_KEY& auth_id_key, int64_t timestamp, uint8_t* out_auth_id);
+
+// ============================================================================
+// VMessCipher — 单方向 AEAD per-chunk 加密/解密器
+//
+// 支持：AES-128-GCM、ChaCha20-Poly1305；NONE/ZERO 原样复制。
+// 每次 Encrypt/Decrypt 递增内部计数器（16-bit，嵌入 nonce）。
+// 其他 Security 值构造即抛出，不进入数据路径。
+// ============================================================================
+class VMessCipher {
+public:
+    VMessCipher(Security security, const uint8_t* key, const uint8_t* iv,
+                proxy::AeadDirection direction);
+    ~VMessCipher() noexcept {
+        ::SecureZeroMemory(iv_.data(), iv_.size());
+    }
+
+    VMessCipher(const VMessCipher&)            = delete;
+    VMessCipher& operator=(const VMessCipher&) = delete;
+    VMessCipher(VMessCipher&& other) noexcept = default;
+    VMessCipher& operator=(VMessCipher&& other) noexcept = default;
+
+    // AEAD tag 大小（GCM_TAG_SIZE = 16）
+    size_t Overhead() const;
+
+    // 加密一个数据块（返回密文长度，包含 tag）
+    // ciphertext 必须有 len + Overhead() 字节空间
+    ssize_t Encrypt(const uint8_t* plaintext, size_t len, uint8_t* ciphertext);
+
+    // 解密一个数据块（输入包含 tag）
+    // plaintext 必须有 len - Overhead() 字节空间
+    ssize_t Decrypt(const uint8_t* ciphertext, size_t len, uint8_t* plaintext);
+
+private:
+    void BuildNonce(uint16_t count, uint8_t* nonce);
+
+    Security security_;
+    std::array<uint8_t, 16> iv_;
+    uint16_t count_ = 0;
+
+    std::variant<std::monostate, proxy::AeadEncryptor, proxy::AeadDecryptor> cipher_;
+};
+
+// ============================================================================
+// ShakeMask — chunk 长度掩码生成器
+//
+// 使用 SHAKE128 生成伪随机掩码序列，避免流量分析。
+// 固定小缓冲区（覆盖 256 个 chunk），懒加载，避免每连接常驻 4KB mask 缓冲。
+// ============================================================================
+class ShakeMask {
+public:
+    explicit ShakeMask(const uint8_t* nonce);
+    ~ShakeMask();
+
+    ShakeMask(const ShakeMask&)            = delete;
+    ShakeMask& operator=(const ShakeMask&) = delete;
+    ShakeMask(ShakeMask&& other) noexcept;
+    ShakeMask& operator=(ShakeMask&& other) noexcept;
+
+    // 获取下一个 mask（从 SHAKE128 XOF 流式读取，永不重复）
+    uint16_t NextMask();
+
+private:
+    static constexpr size_t kBufferSize = 512;  // 批量 squeeze 大小
+
+    EVP_MD_CTX* ctx_ = nullptr;
+    uint8_t buffer_[kBufferSize];
+    size_t                         offset_      = kBufferSize;  // 初始为满，触发首次 Refill
+
+    void Refill();
+};
 
 }  // namespace vmess
