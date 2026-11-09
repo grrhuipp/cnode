@@ -32,38 +32,6 @@
 
 namespace {
 
-class TrojanUdpOutboundEndpoint final : public proxy::OutboundStreamEndpointBase {
-public:
-    TrojanUdpOutboundEndpoint(AsyncStream& stream, TargetAddress fallback_target)
-        : OutboundStreamEndpointBase(stream)
-        , fallback_target_(std::move(fallback_target)) {}
-
-    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
-        return trojan::ReadUdpDatagram(stream_, framer_);
-    }
-
-    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
-        return trojan::WriteUdpDatagram(stream_, std::move(mb));
-    }
-
-    net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
-        return trojan::WriteUdpDatagram(
-            stream_, fallback_target_, buffers);
-    }
-
-    net::awaitable<void> AsyncShutdownWrite() override {
-        return stream_.AsyncShutdownWrite();
-    }
-
-    transport::EofAction ReadEofAction() const noexcept override {
-        return transport::EofAction::WaitForPeer;
-    }
-
-private:
-    TargetAddress fallback_target_;
-    trojan::UdpFramer framer_;
-};
-
 net::awaitable<tl::expected<void, ErrorCode>>
 SendTrojanHandshake(
     AsyncStream& stream,
@@ -162,10 +130,11 @@ proxy::trojan::outbound::Handler::Process(
 
     try {
         if (is_udp) {
-            TrojanUdpOutboundEndpoint target_endpoint(*stream, target);
+            ::trojan::UdpStreamEndpoint udp_endpoint(
+                *stream, std::move(target), transport::EofAction::WaitForPeer);
             co_return co_await DoRelayLink(
                 dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
-                target_endpoint, ctx, stats, relay_config, std::move(first_payload));
+                udp_endpoint, ctx, stats, relay_config, std::move(first_payload));
         }
 
         co_return co_await DoRelayLink(

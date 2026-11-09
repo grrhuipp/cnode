@@ -130,15 +130,6 @@ inline void FormatHttpHostHeaderInto(
     }
 }
 
-inline std::string FormatHttpHostHeader(
-    std::string_view host,
-    uint16_t port,
-    bool use_ssl) {
-    std::string header;
-    FormatHttpHostHeaderInto(header, host, port, use_ssl);
-    return header;
-}
-
 inline std::string FormatEndpointForLog(
     std::string_view host,
     uint16_t port) {

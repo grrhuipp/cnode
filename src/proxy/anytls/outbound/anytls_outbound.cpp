@@ -1309,7 +1309,7 @@ const bool kOutboundRegistered = (::proxyman::outbound::RegisterProxy(
                     ::AwaitableTaskGroup& tasks) -> std::unique_ptr<::Outbound> {
                     return std::make_unique<::proxy::anytls::outbound::Handler>(
                         tag, io_context, std::move(state), tasks);
-                }>(std::move(*settings), true),
+                }>(std::move(*settings)),
             .sender = ::OutboundSenderSettings{
                 .stream_settings = std::move(stream_settings),
                 .send_through = {},

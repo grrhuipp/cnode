@@ -6,9 +6,7 @@
 #include "common/string_hash.hpp"
 
 #include <memory>
-#include <string>
 #include <string_view>
-#include <unordered_map>
 #include <vector>
 
 namespace rule {
@@ -17,9 +15,11 @@ class DetectRulePolicy final : public features::policy::RequestPolicy {
 public:
     using RuleList = std::vector<DetectRule>;
     using RuleListPtr = std::shared_ptr<const RuleList>;
-    using InboundRule = std::unordered_map<std::string, RuleListPtr,
-                                          TransparentStringHash,
-                                          TransparentStringEq>;
+    using InboundRule = memory::ThreadLocalUnorderedMap<
+        memory::ThreadLocalString,
+        RuleListPtr,
+        TransparentStringHash,
+        TransparentStringEq>;
 
     DetectRulePolicy();
     ~DetectRulePolicy();

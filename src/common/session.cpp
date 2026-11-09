@@ -4,8 +4,6 @@
 
 #include <charconv>
 #include <array>
-#include <format>
-#include <iterator>
 #include <optional>
 
 
@@ -88,8 +86,15 @@ std::string FormatAccessLog(const session::Context& ctx,
                    reason.size());
     auto endpoint = [&](std::string_view host, uint16_t port) {
         const bool brackets = iputil::NeedsIpv6Brackets(host);
-        std::format_to(std::back_inserter(access), "{}{}{}:{}",
-                       brackets ? "[" : "", host, brackets ? "]" : "", port);
+        if (brackets) access.push_back('[');
+        access.append(host);
+        if (brackets) access.push_back(']');
+        access.push_back(':');
+        char port_buf[5];
+        const auto [ptr, ec] = std::to_chars(
+            port_buf, port_buf + sizeof(port_buf), port);
+        (void)ec;
+        access.append(port_buf, ptr);
     };
     if (accepted || src_host != "unknown") {
         access.append("from ");

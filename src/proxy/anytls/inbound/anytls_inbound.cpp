@@ -889,23 +889,20 @@ const bool kInboundRegistered = [] {
     ::proxyman::inbound::ProxyRegistration reg;
     reg.user_protocol = ::proxyman::inbound::UserProtocol::AnyTls;
 
-    reg.create_runtime = []() -> std::unique_ptr<
-        ::proxyman::inbound::ProtocolRuntime> {
-        return std::make_unique<::proxy::UserOnlineProtocolRuntime>();
-    };
+    reg.create_runtime = &::proxy::CreateUserOnlineProtocolRuntime;
 
     reg.create_tcp_handler =
         [](::proxyman::inbound::ProtocolRuntime& runtime,
            ::StatsShard& stats,
            ::ConnectionLimiter* limiter,
            const ::proxyman::inbound::BuildRequest& req) -> std::unique_ptr<::Inbound> {
-            auto* anytls_runtime = dynamic_cast<::proxy::UserOnlineProtocolRuntime*>(&runtime);
+            auto* tracker = runtime.OnlineTracker();
             const auto* settings = GetAnyTlsSettings(req);
-            if (!anytls_runtime || !settings) {
+            if (!tracker || !settings) {
                 return nullptr;
             }
             return std::make_unique<::proxy::anytls::inbound::Handler>(
-                anytls_runtime->validator,
+                *tracker,
                 stats,
                 limiter,
                 settings->padding_scheme);
@@ -934,21 +931,13 @@ const bool kInboundRegistered = [] {
 
     reg.build_users =
         [](const ::proxyman::inbound::BuildRequest& req,
-           std::span<const ::InboundUserSpec> specs)
-            -> std::optional<::proxyman::inbound::UserSet> {
-            std::vector<::proxyman::inbound::PreparedAnyTlsUser> users;
-            users.reserve(specs.size());
-            for (const auto& spec : specs) {
-                if (spec.credential.empty()) {
-                    LOG_WARN("AnyTLS inbound '{}': user password is empty", req.tag);
-                    return std::nullopt;
-                }
-                ::proxyman::inbound::PreparedAnyTlsUser info;
-                info.password_hash = ::anytls::PasswordHash(spec.credential);
-                info.profile = ::proxy::MakeUserProfile(spec);
-                users.push_back(std::move(info));
-            }
-            return ::proxyman::inbound::UserSet{std::move(users)};
+           std::span<const ::InboundUserSpec> specs) {
+            return ::proxy::BuildHashedInboundUsers<
+                ::proxyman::inbound::PreparedAnyTlsUser>(
+                "AnyTLS", req, specs,
+                [](auto& info, std::string_view credential) {
+                    info.password_hash = ::anytls::PasswordHash(credential);
+                });
         };
 
     ::proxyman::inbound::RegisterProxy(

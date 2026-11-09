@@ -37,9 +37,6 @@ struct PreparedOutboundCreator {
 
     std::shared_ptr<const OutboundProtocolSettings> settings;
     CreateFn create_fn = nullptr;
-    // Mutable protocol state that must survive individual inbound connections.
-    // Such handlers live in a stable, joinable execution domain per tag.
-    bool persistent_state = false;
 
     PreparedOutboundCreator() noexcept = default;
 
@@ -62,11 +59,10 @@ struct PreparedOutboundCreator {
 };
 
 template <typename State, auto Fn>
-[[nodiscard]] PreparedOutboundCreator MakePreparedOutboundCreator(
-    State state, bool persistent_state = false) {
+[[nodiscard]] PreparedOutboundCreator MakePreparedOutboundCreator(State state) {
     using Decayed = std::decay_t<State>;
     using Holder = TypedOutboundProtocolSettings<Decayed>;
-    auto creator = PreparedOutboundCreator{
+    return PreparedOutboundCreator{
         std::make_shared<const Holder>(std::move(state)),
         +[](std::string_view tag,
             const std::shared_ptr<const OutboundProtocolSettings>& base,
@@ -76,8 +72,6 @@ template <typename State, auto Fn>
             return Fn(tag, std::shared_ptr<const Decayed>(base, &holder->value),
                       io_context, tasks);
         }};
-    creator.persistent_state = persistent_state;
-    return creator;
 }
 
 // Xray core.OutboundHandlerConfig after preparation: tag, sender settings and

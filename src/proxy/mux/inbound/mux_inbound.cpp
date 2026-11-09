@@ -25,7 +25,6 @@
 #include <chrono>
 #include <cstring>
 #include <utility>
-#include <variant>
 #include <vector>
 
 namespace mux {
@@ -339,6 +338,7 @@ public:
 
     MuxSubSession(const MuxSubSession&) = delete;
     MuxSubSession& operator=(const MuxSubSession&) = delete;
+    ~MuxSubSession() noexcept override = default;
 
     void MarkDispatchDone() noexcept {
         dispatch_done_ = true;
@@ -349,6 +349,15 @@ public:
             Cancel();
         }
     }
+
+    [[nodiscard]] bool IsUdp() const noexcept {
+        return is_udp_;
+    }
+
+    virtual void PushClientFramePayload(
+        buf::MultiBuffer mb,
+        size_t data_len,
+        const TargetAddress* packet_target = nullptr) = 0;
 
     [[nodiscard]] bool DispatchDone() const noexcept {
         return dispatch_done_;
@@ -419,12 +428,15 @@ public:
     session::Context ctx;
 
 protected:
-    MuxSubSession(net::io_context& io_context, uint16_t session_id, ReplyQueueState& reply_queue)
+    MuxSubSession(
+        net::io_context& io_context,
+        uint16_t session_id,
+        ReplyQueueState& reply_queue,
+        bool is_udp)
         : session_id_(session_id)
         , reply_queue_(reply_queue)
+        , is_udp_(is_udp)
         , input_signal_(net::any_io_executor(io_context.get_executor()), 1) {}
-    // Derived destructors call Cancel() so their OnCancel still runs.
-    ~MuxSubSession() noexcept override = default;
 
     // Called once from Cancel() before queued input is discarded.
     virtual void OnCancel() noexcept {}
@@ -474,6 +486,7 @@ protected:
 
     const uint16_t session_id_;
     ReplyQueueState& reply_queue_;
+    const bool is_udp_ = false;
     bool input_done_ = false;
     bool cancelled_ = false;
 
@@ -499,7 +512,7 @@ public:
         net::io_context& io_context,
         uint16_t session_id,
         ReplyQueueState& reply_queue)
-        : MuxSubSession(io_context, session_id, reply_queue)
+        : MuxSubSession(io_context, session_id, reply_queue, false)
         , output_signal_(net::any_io_executor(io_context.get_executor()), 1) {}
     ~TcpSubState() noexcept override {
         Cancel();
@@ -512,6 +525,17 @@ public:
             return;
         }
         QueueInput(std::move(mb), bytes, true);
+    }
+
+    void PushClientFramePayload(
+        buf::MultiBuffer mb,
+        size_t data_len,
+        const TargetAddress* packet_target) override {
+        (void)data_len;
+        (void)packet_target;
+        if (mb.byte_size() != 0) {
+            PushClientPayload(std::move(mb));
+        }
     }
 
     transport::EofAction ReadEofAction() const noexcept override {
@@ -657,8 +681,6 @@ void ReplyQueueState::WakeWaitingWriters() noexcept {
     }
 }
 
-using TcpSubInfo = std::unique_ptr<TcpSubState>;
-
 class UdpSubState final : public MuxSubSession {
 public:
     UdpSubState(
@@ -667,7 +689,7 @@ public:
         ReplyQueueState& reply_queue,
         uint64_t parent_conn_id,
         TargetAddress default_target)
-        : MuxSubSession(io_context, session_id, reply_queue)
+        : MuxSubSession(io_context, session_id, reply_queue, true)
         , parent_conn_id_(parent_conn_id)
         , default_target_(std::move(default_target)) {}
 
@@ -686,6 +708,13 @@ public:
         }
         // Empty datagrams still own a Buffer and a queue entry.
         QueueInput(std::move(mb), std::max(bytes, size_t{buf::Buffer::kSize}));
+    }
+
+    void PushClientFramePayload(
+        buf::MultiBuffer mb,
+        size_t data_len,
+        const TargetAddress* packet_target) override {
+        PushClientPayload(std::move(mb), data_len, packet_target);
     }
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
@@ -746,9 +775,6 @@ private:
     uint64_t parent_conn_id_ = 0;
     TargetAddress default_target_;
 };
-
-using UdpSubInfo = std::unique_ptr<UdpSubState>;
-using MuxSubInfo = std::variant<TcpSubInfo, UdpSubInfo>;
 
 net::awaitable<void> RunSubDispatch(
     net::io_context& io_context,
@@ -839,7 +865,7 @@ net::awaitable<RelayResult> ProcessInbound(
     ClientReadQueueState client_reads{io_context, main_signal};
 
     // TCP / UDP 共用同一个 session_id 命名空间。
-    memory::ThreadLocalUnorderedMap<uint16_t, MuxSubInfo> sub_sessions;
+    memory::ThreadLocalUnorderedMap<uint16_t, std::unique_ptr<MuxSubSession>> sub_sessions;
 
     // 帧累积缓冲区（处理粘包）：持有从流读取的 Buffer，解析前短暂 flatten。
     buf::MultiBuffer frame_buf;
@@ -1145,6 +1171,7 @@ net::awaitable<RelayResult> ProcessInbound(
 
                 // ----------------------------------------------------------------
                 case mux::SessionStatus::NEW: {
+                    const bool is_udp = hdr.network == mux::NetworkType::UDP;
                     // A reused ID or a sub-session beyond the budget is refused
                     // with an error END; the refused frame's payload is dropped.
                     if (sub_sessions.contains(hdr.session_id) ||
@@ -1154,8 +1181,7 @@ net::awaitable<RelayResult> ProcessInbound(
                         proxy::BindInboundRequestTarget(
                             rejected_ctx,
                             proxy::InboundRequestTarget{
-                                hdr.network == mux::NetworkType::UDP
-                                    ? Network::UDP : Network::TCP,
+                                is_udp ? Network::UDP : Network::TCP,
                                 hdr.target,
                                 std::move(hdr.forwarded)});
                         LOG_CONN_DEBUG(rejected_ctx,
@@ -1174,99 +1200,56 @@ net::awaitable<RelayResult> ProcessInbound(
                         break;
                     }
                     const uint16_t sid = hdr.session_id;
-                    if (hdr.network == mux::NetworkType::UDP) {
-                        // ---- 新建 UDP 子会话 ----
+                    std::unique_ptr<MuxSubSession> sub_state;
+                    if (is_udp) {
                         LOG_CONN_DEBUG(parent_ctx,
                             "new UDP sid={} target={} data={}B",
-                            hdr.session_id, hdr.target, hdr.data_len);
-
-                        auto sub_state = std::make_unique<UdpSubState>(
+                            sid, hdr.target, hdr.data_len);
+                        sub_state = std::make_unique<UdpSubState>(
                             io_context,
                             sid,
                             reply_queue,
                             parent_conn_id,
                             hdr.target);
-                        auto& sub_ctx = sub_state->ctx;
-                        sub_ctx.InitSubstreamFrom(parent_ctx);
-                        proxy::BindInboundRequestTarget(
-                            sub_ctx,
-                            proxy::InboundRequestTarget{
-                                Network::UDP,
-                                hdr.target,
-                                std::move(hdr.forwarded)});
-
-                        if (hdr.has_data) {
-                            sub_state->PushClientPayload(std::move(frame_payload), hdr.data_len);
-                        }
-
-                        auto [insert_it, inserted] = sub_sessions.try_emplace(
-                            sid,
-                            UdpSubInfo{std::move(sub_state)});
-                        (void)inserted;
-                        UdpSubState* sub_ptr =
-                            std::get<UdpSubInfo>(insert_it->second).get();
-
-                        try {
-                            tasks.Spawn(RunSubDispatch(
-                                    io_context,
-                                    dispatcher,
-                                    policy,
-                                    limiter,
-                                    sub_ptr,
-                                    stats,
-                                    timeouts,
-                                    SubLoopLease{reply_queue}));
-                        } catch (...) {
-                            sub_ptr->Cancel();
-                            sub_ptr->MarkDispatchDone();
-                            result.error = ErrorCode::RESOURCE_EXHAUSTED;
-                            running = false;
-                        }
-
                     } else {
-                        // ---- 新建 TCP 子会话 ----
                         LOG_CONN_DEBUG(parent_ctx, "new TCP sid={} -> {}",
-                            hdr.session_id, hdr.target);
-
-                        auto sub_state = std::make_unique<TcpSubState>(
+                            sid, hdr.target);
+                        sub_state = std::make_unique<TcpSubState>(
                             io_context, sid, reply_queue);
-                        auto& sub_ctx = sub_state->ctx;
-                        sub_ctx.InitSubstreamFrom(parent_ctx);
-                        proxy::BindInboundRequestTarget(
-                            sub_ctx,
-                            proxy::InboundRequestTarget{
-                                Network::TCP,
-                                hdr.target,
-                                std::move(hdr.forwarded)});
+                    }
+                    sub_state->ctx.InitSubstreamFrom(parent_ctx);
+                    proxy::BindInboundRequestTarget(
+                        sub_state->ctx,
+                        proxy::InboundRequestTarget{
+                            is_udp ? Network::UDP : Network::TCP,
+                            hdr.target,
+                            std::move(hdr.forwarded)});
+                    if (hdr.has_data) {
+                        sub_state->PushClientFramePayload(
+                            std::move(frame_payload), hdr.data_len);
+                    }
 
-                        if (frame_payload.byte_size() != 0) {
-                            sub_state->PushClientPayload(std::move(frame_payload));
-                        }
+                    auto [insert_it, inserted] = sub_sessions.try_emplace(
+                        sid, std::move(sub_state));
+                    (void)inserted;
+                    MuxSubSession* sub_ptr = insert_it->second.get();
 
-                        auto [insert_it, inserted] = sub_sessions.try_emplace(
-                            sid,
-                            TcpSubInfo{std::move(sub_state)});
-                        (void)inserted;
-                        TcpSubState* sub_ptr =
-                            std::get<TcpSubInfo>(insert_it->second).get();
-
-                        // 计数仅用于正常 EOF 排空；任务组持有并 join 真正的完成回调。
-                        try {
-                            tasks.Spawn(RunSubDispatch(
-                                    io_context,
-                                    dispatcher,
-                                    policy,
-                                    limiter,
-                                    sub_ptr,
-                                    stats,
-                                    timeouts,
-                                    SubLoopLease{reply_queue}));
-                        } catch (...) {
-                            sub_ptr->Cancel();
-                            sub_ptr->MarkDispatchDone();
-                            result.error = ErrorCode::RESOURCE_EXHAUSTED;
-                            running = false;
-                        }
+                    // 计数仅用于正常 EOF 排空；任务组持有并 join 真正的完成回调。
+                    try {
+                        tasks.Spawn(RunSubDispatch(
+                                io_context,
+                                dispatcher,
+                                policy,
+                                limiter,
+                                sub_ptr,
+                                stats,
+                                timeouts,
+                                SubLoopLease{reply_queue}));
+                    } catch (...) {
+                        sub_ptr->Cancel();
+                        sub_ptr->MarkDispatchDone();
+                        result.error = ErrorCode::RESOURCE_EXHAUSTED;
+                        running = false;
                     }
                     break;
                 }
@@ -1274,58 +1257,46 @@ net::awaitable<RelayResult> ProcessInbound(
                 // ----------------------------------------------------------------
                 case mux::SessionStatus::KEEP: {
                     auto session_it = sub_sessions.find(hdr.session_id);
-                    auto* udp_sub = session_it == sub_sessions.end()
+                    MuxSubSession* sub = session_it == sub_sessions.end()
                         ? nullptr
-                        : std::get_if<UdpSubInfo>(&session_it->second);
-                    if (!udp_sub && hdr.has_target) {
+                        : session_it->second.get();
+                    if ((!sub || !sub->IsUdp()) && hdr.has_target) {
                         result.error = ErrorCode::PROTOCOL_DECODE_FAILED;
                         running = false;
                         break;
                     }
-                    if (session_it != sub_sessions.end() &&
-                        (hdr.option & mux::kOptionError) != 0) {
-                        std::visit([](auto& state) { state->Cancel(); }, session_it->second);
+                    if (!sub) {
                         break;
                     }
-                    if (udp_sub) {
-                        if (hdr.has_data) {
-                            (*udp_sub)->PushClientPayload(
-                                std::move(frame_payload), hdr.data_len,
-                                hdr.has_target ? &hdr.target : nullptr);
-                        }
-                    } else {
-                        // TCP 数据
-                        auto* tcp_sub = session_it == sub_sessions.end()
-                            ? nullptr
-                            : std::get_if<TcpSubInfo>(&session_it->second);
-                        if (tcp_sub && frame_payload.byte_size() != 0) {
-                            (*tcp_sub)->PushClientPayload(std::move(frame_payload));
-                        }
+                    if ((hdr.option & mux::kOptionError) != 0) {
+                        sub->Cancel();
+                        break;
+                    }
+                    if (hdr.has_data) {
+                        sub->PushClientFramePayload(
+                            std::move(frame_payload),
+                            hdr.data_len,
+                            hdr.has_target ? &hdr.target : nullptr);
                     }
                     break;
                 }
 
                 // ----------------------------------------------------------------
                 case mux::SessionStatus::END: {
-                    uint16_t sid = hdr.session_id;
+                    const uint16_t sid = hdr.session_id;
                     auto session_it = sub_sessions.find(sid);
                     const bool known_session = session_it != sub_sessions.end();
 
                     if (known_session) {
+                        MuxSubSession& sub = *session_it->second;
                         if ((hdr.option & mux::kOptionError) != 0) {
-                            std::visit([](auto& state) { state->Cancel(); }, session_it->second);
-                        } else if (auto* udp_sub = std::get_if<UdpSubInfo>(&session_it->second)) {
+                            sub.Cancel();
+                        } else {
                             if (hdr.has_data) {
-                                (*udp_sub)->PushClientPayload(
+                                sub.PushClientFramePayload(
                                     std::move(frame_payload), hdr.data_len);
                             }
-                            (*udp_sub)->CloseClientInput();
-                        } else if (auto* tcp_sub =
-                                       std::get_if<TcpSubInfo>(&session_it->second)) {
-                            if (frame_payload.byte_size() != 0) {
-                                (*tcp_sub)->PushClientPayload(std::move(frame_payload));
-                            }
-                            (*tcp_sub)->CloseClientInput();
+                            sub.CloseClientInput();
                         }
                     }
 
@@ -1368,7 +1339,7 @@ net::awaitable<RelayResult> ProcessInbound(
                 }
                 client_input_done = true;
                 for (auto& [sid, sub] : sub_sessions) {
-                    std::visit([](auto& state) { state->CloseClientInput(); }, sub);
+                    sub->CloseClientInput();
                 }
                 continue;
             }
@@ -1399,7 +1370,7 @@ net::awaitable<RelayResult> ProcessInbound(
             sub_sessions.size());
 
         for (auto& [sid, sub] : sub_sessions) {
-            std::visit([](auto& state) { state->Cancel(); }, sub);
+            sub->Cancel();
         }
         tasks.Cancel();
     };

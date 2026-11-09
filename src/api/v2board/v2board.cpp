@@ -222,8 +222,8 @@ APIClient::APIClient(net::io_context& io_context,
     url_parts_ = std::move(*parts);
     literal_address_ = iputil::ParseLiteral(url_parts_.host);
     api_node_type_ = naming::NormalizeV2BoardApiNodeType(config_.NodeType);
-    host_header_ = iputil::FormatHttpHostHeader(
-        url_parts_.host, url_parts_.port, url_parts_.use_ssl);
+    iputil::FormatHttpHostHeaderInto(
+        host_header_, url_parts_.host, url_parts_.port, url_parts_.use_ssl);
 
     if (url_parts_.use_ssl) {
         // Negotiate TLS 1.3 when the panel offers it; TLS 1.2 stays the floor

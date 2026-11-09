@@ -512,12 +512,11 @@ net::awaitable<void> Worker::StopRuntimeTask() {
     // They must finish before traversing or destroying those stable slots.
     co_await mailbox_->AsyncJoinAccepted();
     co_await DrainRuntimeTask();
+    runtime_->outbound_handlers.reset();
     if (runtime_->outbound_tasks) {
         runtime_->outbound_tasks->Tasks().Cancel();
         co_await runtime_->outbound_tasks->AsyncJoin();
     }
-    if (runtime_->outbounds)
-        co_await runtime_->outbounds->AsyncJoinHosts();
     co_await transport::internet::JoinXHttpClientTasks(io_context_);
     runtime_->memory_reclaimer.Stop();
     co_await TimeoutScheduler::AsyncReleaseForIoContext(io_context_);
@@ -579,7 +578,7 @@ void Worker::RuntimeState::Start(Worker& worker) {
     dns = std::make_unique<app::dns::DNS>(dns_worker);
     outbound_tasks = std::make_unique<ResidentTaskGroup>(io_context.get_executor());
     outbounds = std::make_unique<proxyman::outbound::OutboundConfiguration>(
-        config->outbounds, io_context);
+        config->outbounds);
     outbound_handlers = std::make_unique<proxyman::outbound::HandlerLookup>(
         *outbounds, io_context, *dns, timeouts.DialTimeout(), outbound_tasks->Tasks());
     dispatcher = std::make_unique<app::dispatcher::DefaultDispatcher>(

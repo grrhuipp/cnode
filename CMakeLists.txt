@@ -155,7 +155,6 @@ set(CNODE_CORE_SOURCES
     src/infra/panel_node_ids.cpp
     src/service/controller/panel_inbound.cpp
     src/service/controller/control.cpp
-    src/app/bootstrap_cli.cpp
     src/app/bootstrap_runtime.cpp
     src/app/bootstrap_monitor.cpp
     src/app/bootstrap_setup.cpp
@@ -262,7 +261,7 @@ target_precompile_headers(cnode_core PRIVATE src/pch.hpp)
 if(NOT DEFINED BUILD_ID OR BUILD_ID STREQUAL "")
     string(TIMESTAMP BUILD_ID "%Y%m%dT%H%M%SZ" UTC)
 endif()
-set_property(SOURCE src/app/bootstrap.cpp src/app/bootstrap_cli.cpp
+set_property(SOURCE src/app/bootstrap.cpp
     APPEND PROPERTY COMPILE_DEFINITIONS
     BUILD_ID="${BUILD_ID}"
     BUILD_CHANNEL="$<IF:$<CONFIG:Debug>,debug,release>")

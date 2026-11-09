@@ -206,29 +206,19 @@ std::unique_ptr<::Inbound> CreateInbound(
 std::optional<proxyman::inbound::UserSet> BuildUsers(
     const proxyman::inbound::BuildRequest& request,
     std::span<const InboundUserSpec> specs) {
-    std::vector<proxyman::inbound::PreparedHysteriaUser> users;
-    users.reserve(specs.size());
-    for (const auto& spec : specs) {
-        if (spec.credential.empty()) {
-            LOG_WARN("Hysteria inbound '{}': user credential is empty", request.tag);
-            return std::nullopt;
-        }
-        proxyman::inbound::PreparedHysteriaUser user;
-        user.credential_hash = wire::HashCredential(spec.credential);
-        user.profile = MakeUserProfile(spec);
-        users.push_back(std::move(user));
-    }
-    return proxyman::inbound::UserSet{std::move(users)};
+    return ::proxy::BuildHashedInboundUsers<
+        proxyman::inbound::PreparedHysteriaUser>(
+        "Hysteria", request, specs,
+        [](auto& user, std::string_view credential) {
+            user.credential_hash = wire::HashCredential(credential);
+        });
 }
 
 proxyman::inbound::ProxyRegistration Registration() {
     proxyman::inbound::ProxyRegistration registration;
     registration.user_protocol = proxyman::inbound::UserProtocol::Hysteria;
     registration.datagram_transport = proxyman::inbound::DatagramTransport::Quic;
-    registration.create_runtime = []() -> std::unique_ptr<
-        proxyman::inbound::ProtocolRuntime> {
-        return std::make_unique<UserOnlineProtocolRuntime>();
-    };
+    registration.create_runtime = &::proxy::CreateUserOnlineProtocolRuntime;
     registration.create_tcp_handler = &CreateInbound;
     registration.build_users = &BuildUsers;
     return registration;

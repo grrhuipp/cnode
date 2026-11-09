@@ -269,13 +269,6 @@ protected:
     }
 
 private:
-    void NotifyCancellation(ErrorCode reason = ErrorCode::CANCELLED) noexcept {
-        Cancellation().CancelPending(reason);
-    }
-    void NotifyClosed(ErrorCode reason = ErrorCode::CANCELLED) noexcept {
-        Cancellation().Stop(reason);
-    }
-
     std::shared_ptr<XHttpPacketUpSession> session_;
     std::unique_ptr<AsyncStream> downlink_;
     StreamPhaseDeadline deadline_;

@@ -28,50 +28,6 @@
 
 namespace {
 
-
-
-// ============================================================================
-// Trojan UDP reader/writer helper
-//
-// 把 TCP 隧道上的 Trojan UDP 帧解析/封装为携带逐包目标的 MultiBuffer，
-// 供 dispatcher.Dispatch -> outbound.Process -> DoRelayLink 以协议无关方式中继。
-// 对齐 xray-core 把 UDP 封帧放在入站 reader/writer，而非 relay 内部。
-// ============================================================================
-class TrojanUdpReader final : public transport::MultiBufferReader {
-public:
-    transport::CancellationSource& Cancellation() noexcept override { return src_.Cancellation(); }
-
-    explicit TrojanUdpReader(AsyncStream& src) : src_(src) {}
-
-    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
-        return trojan::ReadUdpDatagram(src_, framer_);
-    }
-
-private:
-    AsyncStream& src_;
-    trojan::UdpFramer framer_;
-};
-
-class TrojanUdpWriter final : public transport::MultiBufferWriter {
-public:
-    explicit TrojanUdpWriter(AsyncStream& dst) : dst_(dst) {}
-
-    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
-        return trojan::WriteUdpDatagram(dst_, std::move(mb));
-    }
-
-    net::awaitable<void> AsyncShutdownWrite() override {
-        return dst_.AsyncShutdownWrite();
-    }
-
-    bool WriteShutdownClosesLink() const noexcept override {
-        return dst_.WriteShutdownClosesLink();
-    }
-
-private:
-    AsyncStream& dst_;
-};
-
 constexpr size_t kMaxTrojanHandshakeBytes =
     ::trojan::kRequestPrefixSize + kMaxEncodedAddressSize + 2;
 
@@ -222,13 +178,12 @@ proxy::trojan::inbound::Handler::Process(
     }
 
     if (net == Network::UDP) {
-        TrojanUdpReader udp_reader(*stream);
-        TrojanUdpWriter udp_writer(*stream);
+        ::trojan::UdpStreamEndpoint udp_endpoint(*stream);
         co_return co_await dispatcher.Dispatch(
             io_context,
             receiver.dispatch_policy,
             std::move(stream),
-            transport::Link{&udp_reader, &udp_writer},
+            transport::Link{&udp_endpoint, &udp_endpoint},
             InitialPayload{},
             ctx,
             *stats_,
@@ -256,46 +211,33 @@ const bool kTrojanInboundRegistered = [] {
     ::proxyman::inbound::ProxyRegistration reg;
     reg.user_protocol = ::proxyman::inbound::UserProtocol::Trojan;
 
-    reg.create_runtime = []() -> std::unique_ptr<
-        ::proxyman::inbound::ProtocolRuntime> {
-        return std::make_unique<::proxy::UserOnlineProtocolRuntime>();
-    };
+    reg.create_runtime = &::proxy::CreateUserOnlineProtocolRuntime;
 
     reg.create_tcp_handler =
         [](::proxyman::inbound::ProtocolRuntime& runtime,
            ::StatsShard& stats,
            ::ConnectionLimiter* limiter,
            const ::proxyman::inbound::BuildRequest&) -> std::unique_ptr<::Inbound> {
-            auto* trojan_runtime = dynamic_cast<::proxy::UserOnlineProtocolRuntime*>(&runtime);
-            if (!trojan_runtime) {
+            auto* tracker = runtime.OnlineTracker();
+            if (!tracker) {
                 return nullptr;
             }
             return std::make_unique<::proxy::trojan::inbound::Handler>(
-                trojan_runtime->validator,
+                *tracker,
                 stats,
                 limiter);
         };
 
     reg.build_users =
         [](const ::proxyman::inbound::BuildRequest& req,
-           std::span<const ::InboundUserSpec> specs)
-            -> std::optional<::proxyman::inbound::UserSet> {
-            std::vector<::proxyman::inbound::PreparedTrojanUser> users;
-            users.reserve(specs.size());
-
-            for (const auto& spec : specs) {
-                if (spec.credential.empty()) {
-                    LOG_WARN("Trojan inbound '{}': user password is empty", req.tag);
-                    return std::nullopt;
-                }
-                ::proxyman::inbound::PreparedTrojanUser info;
-                const auto hash = ::trojan::HashPassword(spec.credential);
-                info.password_hash.assign(hash.data(), hash.size());
-                info.profile = ::proxy::MakeUserProfile(spec);
-                users.push_back(std::move(info));
-            }
-
-            return ::proxyman::inbound::UserSet{std::move(users)};
+           std::span<const ::InboundUserSpec> specs) {
+            return ::proxy::BuildHashedInboundUsers<
+                ::proxyman::inbound::PreparedTrojanUser>(
+                "Trojan", req, specs,
+                [](auto& info, std::string_view credential) {
+                    const auto hash = ::trojan::HashPassword(credential);
+                    info.password_hash.assign(hash.data(), hash.size());
+                });
         };
 
     ::proxyman::inbound::RegisterProxy(

@@ -1465,3 +1465,30 @@ CI失败场景修复后通过真实双进程、ML-KEM/X25519加密和回环对�
 - **VLESS/TLS 与 Hysteria2 真实进程基准（`cnode_tls_throughput_benchmark` / `cnode_hysteria_throughput_benchmark`）**：
   - VLESS/TLS 8 流上传吞吐达 **`683.86 MiB/s`**，守护进程 CPU 由 `0.1561 / 0.1555s` 降至 **`0.1635 / 0.1488s`**。
   - Hysteria2 256 连接上传就绪匿名内存由 `30,711,808 / 30,613,504 B` 降至 **`30,547,968 / 30,515,200 B`（减少 96 ~ 160 KiB）**，传输完成活跃匿名内存由 `31,395,840 / 31,227,904 B` 降至 **`31,121,408 / 31,195,136 B`（最高减少 268 KiB）**，吞吐升至 **`69.45 / 69.11 MiB/s`**；256 连接下载传输完成活跃匿名内存由 `90,656,768 / 89,927,680 B` 降至 **`90,308,608 / 88,809,472 B`（减少 340 KiB ~ 1.07 MiB）**，峰值 RSS 降至 **`98,627,584 / 97,124,352 B`（最高减少 1.01 MiB）**。
+
+## 2026-11-09（第六轮）：移除 `OutboundPoolHost` 二次分派、Mux 子流多态直接分派、Trojan UDP 端点合一与入站注册去重
+
+### 架构与流程精简内容
+
+1. **移除 `proxyman::outbound::OutboundPoolHost` 二次协程分派、`net::detached` 与死配置位**：
+   - `include/app/proxyman/outbound/handler.hpp`、`src/app/proxyman/outbound/handler.cpp`、`include/app/proxyman/outbound/prepared_config.hpp`、`src/app/worker.cpp`、`src/proxy/anytls/outbound/anytls_outbound.cpp`、`src/proxy/vless/outbound/vless_outbound.cpp`：删除 `OutboundPoolHost` 及其 `Process()` 协程包装器、`Borrow` 引用计数守卫、`CancelIfIdle` 中的 `net::co_spawn(..., net::detached)` 静默分离协程、`join_waiters_` 矢量与 `OutboundConfiguration::Hosts` / `AsyncJoinHosts` / `PreparedOutboundCreator::persistent_state` 死字段。
+   - `Handler` 直接持有按需懒分配的 `AwaitableTaskGroup tasks_`（仅在首次 `Spawn` 时分配内部状态）与 `std::unique_ptr<proxy::Outbound> proxy_`，`Handler::Dispatch(...)` 直接单次调用 `co_return co_await proxy_->Process(...)`，消除每次出站请求的一层多余协程帧分配与二次分派，且所有活跃请求由 `HandlerLookup::Get` 返回的 `std::shared_ptr<Handler>` 自然保活并在最后一条请求结束时触发 `proxy_` 析构退役；Worker 停机在排空入站与重置 `outbound_handlers` 后统一取消并 `AsyncJoin()` `outbound_tasks`。
+2. **Mux 入站子流去除 `std::variant` 二次分发与 Trojan 双向 UDP 帧端点合一**：
+   - `src/proxy/mux/inbound/mux_inbound.cpp`：在 `MuxSubSession` 基类中新增 `IsUdp()` 与虚函数 `PushClientFramePayload(...)`，由 `TcpSubState` 与 `UdpSubState` 各自实现；将 `sub_sessions` 从 `std::variant<TcpSubInfo, UdpSubInfo>` 改为 `std::unique_ptr<MuxSubSession>`，消除每帧查找后的 `std::visit` / `std::get_if` 二次分发，合并 `SessionStatus::NEW` 的 TCP/UDP 分支并统一收口 `SessionStatus::KEEP` / `END` / `EOF` 分派路径。
+   - `src/proxy/trojan/udp_framing.hpp`、`src/proxy/trojan/inbound/trojan_inbound.cpp`、`src/proxy/trojan/outbound/trojan_outbound.cpp`：在 `udp_framing.hpp` 中定义统一的 `trojan::UdpStreamEndpoint`（继承 `proxy::OutboundStreamEndpointBase`，支持可配置的 `ReadEofAction`、附带 `fallback_target` 的首包发送与 `ShutdownPeerWrite`），同时替代并删除入站 `TrojanUdpReader` / `TrojanUdpWriter`（45 行）与出站 `TrojanUdpOutboundEndpoint`（55 行）。
+3. **入站协议注册去重、异步流取消去重与公共基础库清理**：
+   - `src/proxy/inbound_admission.hpp`、`trojan_inbound.cpp`、`anytls_inbound.cpp`、`hysteria_inbound.cpp`、`ss_inbound.cpp`：提取 `proxy::CreateUserOnlineProtocolRuntime` 与泛型 `proxy::BuildHashedInboundUsers<PreparedUser>`，消除 4 个协议重复的 `OnlineTracker` 构造 lambda 与哈希用户构建循环；用基类虚函数 `runtime.OnlineTracker()` 替代 `trojan_inbound.cpp` 与 `anytls_inbound.cpp` 中的 `dynamic_cast<UserOnlineProtocolRuntime*>(&runtime)`。
+   - `include/transport/async_stream.hpp`、`src/transport/internet/xhttp_session.cpp`、`src/transport/internet/transport_dialer.cpp`：将 `AsyncStream` 默认 `NotifyCancellation` / `NotifyClosed` 的 `ErrorCode` 默认参数设为 `ErrorCode::CANCELLED`，删除派生类中重复转发的 override。
+   - `src/common/rule.cpp`、`src/common/session.cpp`、`include/common/ip_utils.hpp`、`src/api/v2board/v2board.cpp`、`src/app/bootstrap.cpp`：将 `DetectRulePolicy` 的全局 `std::unordered_map<std::string, ...>` 替换为支持 `std::string_view` 透明查找的 `memory::ThreadLocalUnorderedMap`（消除每次规则匹配的临时 `std::string` 分配与全局分配器旁路）；`FormatAccessLog` 用 `append` + `std::to_chars` 替代 `std::format_to(std::back_inserter(...))`；内联单调用方的 `FormatHttpHostHeader`；将 `bootstrap_cli.cpp` 合入 `bootstrap.cpp` 并删除 `include/app/bootstrap_cli.hpp` 与 `src/app/bootstrap_cli.cpp`（净减 2 个文件）。
+
+### 验证与性能/内存实证
+
+全量 **1,251/1,251** 测试通过（325 项 unit、926 项 E2E）。在同一环境与编译选项下执行 A/B/A/B 交错重复基准对照：
+
+- **启动期与运行期驻留内存（`cnode_tls_throughput_benchmark` / `cnode_runtime_sampling_benchmark` / `cnode_hysteria_throughput_benchmark`）**：
+  - **VLESS/TLS 真实进程基准**：守护进程启动驻留 RSS（`server_started`）由 `13,410,304 / 13,410,304 B` 稳定降至 **`13,021,184 / 13,021,184 B`（稳定减少 380 KiB / -2.9%）**；8 流上传（`Upload8`）峰值 RSS 由 `14,561,280 / 14,585,856 B` 稳定降至 **`14,397,440 / 14,360,576 B`（稳定减少 160 ~ 220 KiB）**，守护进程总 CPU 由 `0.1596 / 0.1468s` 降至 **`0.1481 / 0.1446s`（最高 -7.2%）**，上传吞吐峰值达 **`675.03 MiB/s`（+24.9%）**；8 流下载（`Download8`）峰值 RSS 由 `14,794,752 / 14,761,984 B` 稳定降至 **`14,581,760 / 14,569,472 B`（稳定减少 188 ~ 208 KiB）**。
+  - **64 活跃 VLESS 会话采样（`cnode_runtime_sampling_benchmark`）**：`resources=0` 进程峰值 RSS 由 `14,741,504 / 14,766,080 B` 降至 **`14,700,544 / 14,716,928 B`（减少 40 ~ 48 KiB）**；`resources=1` 进程峰值 RSS 由 `15,183,872 / 15,204,352 B` 降至 **`15,147,008 / 15,159,296 B`（减少 36 ~ 44 KiB）**，0 次堆分配，采样延迟 **`68.38 ns`**（`p50 = 30.0 ns`，`p95 = 40.0 ns`）。
+  - **Hysteria2 四 Worker 真实进程基准**：守护进程启动驻留 RSS 由 `14,487,552 / 14,532,608 B` 稳定降至 **`14,176,256 / 14,159,872 B`（稳定减少 304 ~ 364 KiB）**；256 连接上传峰值 RSS 由 `39,366,656 / 39,292,928 B` 降至 **`38,912,000 / 39,137,280 B`（减少 152 ~ 444 KiB）**，吞吐升至 **`69.67 MiB/s`**；16×64（1,024 流）上传峰值 RSS 由 `49,418,240 / 49,127,424 B` 降至 **`48,324,608 / 48,693,248 B`（减少 424 KiB ~ 1.04 MiB）**；16×64（1,024 流）下载峰值 RSS 由 `360,611,840 / 358,948,864 B` 降至 **`358,383,616 / 359,448,576 B`（最高减少 2.13 MiB）**。
+- **TCP 接收与发送基准（`cnode_tcp_receive_benchmark` / `cnode_tcp_send_benchmark`）**：
+  - `tcp-receive 1B`：单次 burst 墙钟耗时由 `9,999.3 / 9,900.3 ns` 降至 **`9,888.2 / 9,786.8 ns`（-1.1%）**，CPU 耗时由 `7,682.5 / 7,574.1 ns` 降至 **`7,602.5 / 7,493.2 ns`**。
+  - `tcp-send 1B`：单次 burst 墙钟耗时由 `6,310.0 / 6,276.2 ns` 降至 **`6,276.0 / 6,260.8 ns`**；`8192B (1 piece)` 由 `10,355.0 / 10,192.8 ns` 降至 **`10,251.1 / 10,137.5 ns`**；`8192B (16 pieces)` 由 `11,372.3 / 11,228.2 ns` 降至 **`11,190.3 / 11,220.7 ns`**。

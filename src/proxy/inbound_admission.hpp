@@ -316,4 +316,31 @@ public:
 };
 using UserOnlineProtocolRuntime = InboundTrackerRuntime<::UserOnlineTracker>;
 
+[[nodiscard]] inline std::unique_ptr<::proxyman::inbound::ProtocolRuntime>
+CreateUserOnlineProtocolRuntime() {
+    return std::make_unique<UserOnlineProtocolRuntime>();
+}
+
+template <typename PreparedUser, typename AssignCredential>
+[[nodiscard]] std::optional<::proxyman::inbound::UserSet>
+BuildHashedInboundUsers(
+    std::string_view protocol_name,
+    const ::proxyman::inbound::BuildRequest& req,
+    std::span<const ::InboundUserSpec> specs,
+    AssignCredential&& assign_credential) {
+    std::vector<PreparedUser> users;
+    users.reserve(specs.size());
+    for (const auto& spec : specs) {
+        if (spec.credential.empty()) {
+            LOG_WARN("{} inbound '{}': user credential is empty", protocol_name, req.tag);
+            return std::nullopt;
+        }
+        PreparedUser user;
+        assign_credential(user, spec.credential);
+        user.profile = MakeUserProfile(spec);
+        users.push_back(std::move(user));
+    }
+    return ::proxyman::inbound::UserSet{std::move(users)};
+}
+
 }  // namespace proxy

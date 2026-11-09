@@ -220,8 +220,12 @@ protected:
     // must cancel only that logical stream, never the shared physical stream.
     virtual StreamPhaseDeadline* LogicalPhaseDeadline() noexcept { return nullptr; }
 
-    void NotifyCancellation() noexcept { Cancellation().CancelPending(); }
-    void NotifyClosed() noexcept { Cancellation().Stop(); }
+    void NotifyCancellation(ErrorCode reason = ErrorCode::CANCELLED) noexcept {
+        Cancellation().CancelPending(reason);
+    }
+    void NotifyClosed(ErrorCode reason = ErrorCode::CANCELLED) noexcept {
+        Cancellation().Stop(reason);
+    }
     // 仅 transport/internet 包装链和 AsyncStream 自身能力方法使用。
     // 不能作为 app/proxy/relay 公开逃逸到 TcpStream 的入口。
     friend class BaseWsStream;

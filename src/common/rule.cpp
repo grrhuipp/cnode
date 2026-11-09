@@ -26,13 +26,18 @@ void DetectRulePolicy::UpdateRule(std::string_view tag,
 void DetectRulePolicy::UpdateSharedRule(std::string_view tag,
                                         RuleListPtr new_rule_list) {
     if (tag.empty()) return;
+    const auto it = rules_.find(tag);
     if (!new_rule_list || new_rule_list->empty()) {
-        if (auto it = rules_.find(tag); it != rules_.end()) {
+        if (it != rules_.end()) {
             rules_.erase(it);
         }
         return;
     }
-    rules_.insert_or_assign(std::string(tag), std::move(new_rule_list));
+    if (it != rules_.end()) {
+        it->second = std::move(new_rule_list);
+        return;
+    }
+    rules_.emplace(memory::ThreadLocalString(tag), std::move(new_rule_list));
 }
 
 bool DetectRulePolicy::Blocked(const session::Context& ctx) {

@@ -19,9 +19,6 @@ class DNS;
 
 namespace proxyman::outbound {
 
-// Stable cache namespace; active physical sessions have independent domains.
-class OutboundPoolHost;
-
 // ============================================================================
 // OutboundConfiguration - the one outbound publication of a Worker
 //
@@ -33,27 +30,14 @@ class OutboundPoolHost;
 // ============================================================================
 class OutboundConfiguration final {
 public:
-    struct Configuration final : PreparedOutboundConfig {
-        explicit Configuration(const PreparedOutboundConfig& config)
-            : PreparedOutboundConfig(config) {}
-        // Host of a persistent_state tag once hosts are bound.
-        std::shared_ptr<OutboundPoolHost> host;
-    };
-    using Entry = std::shared_ptr<const Configuration>;
+    using Entry = std::shared_ptr<const PreparedOutboundConfig>;
     using Snapshot = std::vector<Entry>;
 
     explicit OutboundConfiguration(
-        const std::vector<PreparedOutboundConfig>& configurations,
-        net::io_context* reactor = nullptr);
-    OutboundConfiguration(
-        const std::vector<PreparedOutboundConfig>& configurations,
-        net::io_context& reactor)
-        : OutboundConfiguration(configurations, &reactor) {}
+        const std::vector<PreparedOutboundConfig>& configurations);
     ~OutboundConfiguration();
     OutboundConfiguration(const OutboundConfiguration&) = delete;
     OutboundConfiguration& operator=(const OutboundConfiguration&) = delete;
-    // Called only after the Worker's requests have drained.
-    net::awaitable<void> AsyncJoinHosts();
 
     // Incremented after each snapshot store (release). A reader that observes
     // a generation (acquire) then captures a snapshot at least that new.
@@ -64,11 +48,9 @@ public:
     void Remove(std::string_view tag);
 
 private:
-    struct Hosts;
     Entry Prepare(const PreparedOutboundConfig& configuration);
     void Publish(std::shared_ptr<const Snapshot> snapshot) noexcept;
 
-    std::unique_ptr<Hosts> hosts_;
     std::shared_ptr<const Snapshot> snapshot_;
     uint64_t generation_ = 0;
 };
@@ -78,9 +60,7 @@ private:
 //
 // One concrete handler per outbound tag per executing domain. It owns the
 // prepared sender settings (through its configuration entry), the tag's
-// OutboundDialer and the protocol instance, or - for persistent_state tags -
-// a lease on the tag's stable cache host. Requests execute in their own domain;
-// only cold cache operations run on the host.
+// OutboundDialer and the protocol instance.
 // ============================================================================
 class Handler final : public memory::ThreadAllocated {
 public:
@@ -110,7 +90,6 @@ private:
     // Destroyed in reverse order: the protocol instance before the dialer,
     // the dialer before the sender settings it borrows from config_.
     OutboundConfiguration::Entry config_;
-    std::shared_ptr<OutboundPoolHost> host_;
     std::optional<OutboundDialer> dialer_;
     std::unique_ptr<::Outbound> proxy_;
 };
@@ -136,6 +115,10 @@ public:
     // tags now instead of at the next lookup. Under allocation failure all
     // cached handlers are dropped and the next lookup resynchronizes.
     void Refresh() noexcept;
+    void Clear() noexcept {
+        entries_.clear();
+        generation_ = 0;
+    }
 
 private:
     struct Entry {

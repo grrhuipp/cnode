@@ -729,8 +729,6 @@ const bool kVlessRegistered = (::proxyman::outbound::RegisterProxy(
             return std::nullopt;
         }
         vless_config.server = std::move(next_hop->server);
-        const bool persistent_state = bool(vless_config.encryption);
-
         return ::proxyman::outbound::PreparedOutboundProxy{
             .create = ::proxyman::outbound::MakePreparedOutboundCreator<
                 ::VlessOutboundConfig,
@@ -740,7 +738,7 @@ const bool kVlessRegistered = (::proxyman::outbound::RegisterProxy(
                     ::AwaitableTaskGroup& /*tasks*/) -> std::unique_ptr<::Outbound> {
                     return std::make_unique<::proxy::vless::outbound::Handler>(
                         std::move(cfg_state));
-                }>(std::move(vless_config), persistent_state),
+                }>(std::move(vless_config)),
             .sender = std::move(next_hop->sender),
         };
     }), true);
