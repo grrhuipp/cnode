@@ -63,7 +63,6 @@ private:
     void RetireDomain() noexcept;
     net::io_context& reactor_;
     WorkerMailbox mailbox_;
-    SignalChannel merge_gate_;
     std::unique_ptr<ReservedState> reserved_;
     std::unique_ptr<net::execution_context> services_ =
         std::make_unique<net::execution_context>();

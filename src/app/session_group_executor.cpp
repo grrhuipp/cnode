@@ -3,6 +3,7 @@
 #include "infra/log.hpp"
 
 #include <asio/associated_executor.hpp>
+#include <asio/as_tuple.hpp>
 #include <asio/async_result.hpp>
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/co_spawn.hpp>
@@ -90,10 +91,8 @@ struct GroupCoordinator::ReservedState {
 };
 
 GroupCoordinator::GroupCoordinator(net::io_context& io, size_t capacity)
-    : reactor_(io), mailbox_(io, capacity), merge_gate_(io, 1),
-      reserved_(std::make_unique<ReservedState>(io)) {
-    (void)merge_gate_.try_send(IoErrorCode{});
-}
+    : reactor_(io), mailbox_(io, capacity),
+      reserved_(std::make_unique<ReservedState>(io)) {}
 GroupCoordinator::~GroupCoordinator() {
     if (reserved_->started.load(std::memory_order_relaxed) && !reserved_->joined)
         FailRuntime("group-coordinator", "reserved controls were not joined");
@@ -232,6 +231,12 @@ struct ExecutionDomain::Group {
     const uint64_t identity = next_group_identity.fetch_add(1, std::memory_order_relaxed);
     unsigned rank = 0;
     bool permanently_shared = false;
+    std::optional<SignalChannel> wake;
+    bool busy = false;
+    void Unlock() noexcept {
+        busy = false;
+        if (wake) wake->cancel();
+    }
 };
 
 struct ExecutionDomain::State {
@@ -521,14 +526,25 @@ net::awaitable<bool> ExecutionDomain::MergeGroups(
     std::shared_ptr<ExecutionDomain> first, std::shared_ptr<ExecutionDomain> second,
     bool exclusive) {
     co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
-    auto& coordinator = first->Coordinator();
-    co_await coordinator.merge_gate_.async_receive(net::use_awaitable);
-    struct Gate {
-        SignalChannel& channel;
-        ~Gate() { (void)channel.try_send(IoErrorCode{}); }
-    } gate{coordinator.merge_gate_};
+    auto& reactor = first->Coordinator().Reactor();
+    while (first->state_->group->busy || second->state_->group->busy) {
+        auto blocked = first->state_->group->busy
+            ? first->state_->group : second->state_->group;
+        if (!blocked->wake) blocked->wake.emplace(reactor, 1);
+        (void)co_await blocked->wake->async_receive(net::as_tuple(net::use_awaitable));
+    }
     auto a = first->state_->group;
     auto b = second->state_->group;
+    a->busy = true;
+    b->busy = true;
+    struct Gate {
+        std::shared_ptr<Group> first;
+        std::shared_ptr<Group> second;
+        ~Gate() {
+            if (first) first->Unlock();
+            if (second && second != first) second->Unlock();
+        }
+    } gate{a, b};
     const auto has_attached_member = [](const std::shared_ptr<Group>& group) {
         for (const auto& entry : group->members) {
             if (auto member = entry.domain.lock();
@@ -597,17 +613,24 @@ net::awaitable<bool> ExecutionDomain::MergeGroups(
 net::awaitable<void> ExecutionDomain::SplitGroup(
     std::shared_ptr<ExecutionDomain> first, std::shared_ptr<ExecutionDomain> second) {
     co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
-    auto& coordinator = first->Coordinator();
-    co_await coordinator.merge_gate_.async_receive(net::use_awaitable);
+    auto& reactor = first->Coordinator().Reactor();
+    while (first->state_->group->busy) {
+        auto blocked = first->state_->group;
+        if (!blocked->wake) blocked->wake.emplace(reactor, 1);
+        (void)co_await blocked->wake->async_receive(net::as_tuple(net::use_awaitable));
+    }
+    auto original = first->state_->group;
+    original->busy = true;
     struct Gate {
-        SignalChannel& channel;
-        ~Gate() { (void)channel.try_send(IoErrorCode{}); }
-    } gate{coordinator.merge_gate_};
+        std::shared_ptr<Group> group;
+        ~Gate() {
+            if (group) group->Unlock();
+        }
+    } gate{original};
     if (second->state_->attached_to.lock() != first ||
         first->state_->group != second->state_->group)
         throw std::logic_error("physical domain is not attached to this lease");
     auto independent = std::make_shared<Group>();
-    auto original = first->state_->group;
     co_await Freeze(first);
     independent->members.splice(independent->members.end(), original->members,
                                 second->state_->retirement->position);
@@ -753,12 +776,11 @@ struct ExecutionDomain::Handoff::Transaction {
         co_return;
     }
     void Finish() noexcept {
-        auto& coord = *coordinator;
         complete = true;
         prepared.clear();
         Thaw(group);
         origin.reset();
-        (void)coord.merge_gate_.try_send(IoErrorCode{});
+        group->Unlock();
     }
     net::awaitable<void> Resolve(bool commit) {
         co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
@@ -902,7 +924,13 @@ net::awaitable<std::shared_ptr<ExecutionDomain::Handoff>> ExecutionDomain::Prepa
     co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
     auto& coordinator = domain->Coordinator();
     auto* route = coordinator.reserved_->Route(std::move(target));
-    co_await coordinator.merge_gate_.async_receive(net::use_awaitable);
+    while (domain->state_->group->busy) {
+        auto blocked = domain->state_->group;
+        if (!blocked->wake) blocked->wake.emplace(coordinator.Reactor(), 1);
+        (void)co_await blocked->wake->async_receive(net::as_tuple(net::use_awaitable));
+    }
+    auto locked_group = domain->state_->group;
+    locked_group->busy = true;
     std::shared_ptr<Handoff::Transaction> transaction;
     std::shared_ptr<Handoff> handoff;
     std::exception_ptr failure;
@@ -924,8 +952,8 @@ net::awaitable<std::shared_ptr<ExecutionDomain::Handoff>> ExecutionDomain::Prepa
                 if (!transaction->complete) transaction->Finish();
             } // Preserve preparation error; rollback is reported to session hooks.
         } else {
-            if (frozen) Thaw(domain->state_->group);
-            (void)coordinator.merge_gate_.try_send(IoErrorCode{});
+            if (frozen) Thaw(locked_group);
+            locked_group->Unlock();
         }
         std::rethrow_exception(failure);
     }

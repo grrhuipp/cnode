@@ -520,6 +520,11 @@ if(BUILD_BENCHMARKS)
     target_link_libraries(cnode_tls_throughput_benchmark PRIVATE
         cnode_e2e_support GTest::gtest_main)
     add_dependencies(cnode_tls_throughput_benchmark cnode)
+    add_executable(cnode_hysteria_throughput_benchmark EXCLUDE_FROM_ALL
+        tests/e2e/hysteria_throughput_benchmark.cpp)
+    target_link_libraries(cnode_hysteria_throughput_benchmark PRIVATE
+        cnode_e2e_support GTest::gtest_main)
+    add_dependencies(cnode_hysteria_throughput_benchmark cnode)
     add_executable(cnode_tcp_receive_benchmark EXCLUDE_FROM_ALL
         tests/tcp_receive_benchmark.cpp)
     target_link_libraries(cnode_tcp_receive_benchmark PRIVATE
@@ -561,7 +566,7 @@ if(BUILD_BENCHMARKS)
             "-Wl,--wrap=mi_malloc_aligned")
     endforeach()
     foreach(target IN ITEMS cnode_allocator_append_benchmark cnode_tls_throughput_benchmark
-                            cnode_tcp_receive_benchmark cnode_executor_benchmark
+                            cnode_hysteria_throughput_benchmark cnode_tcp_receive_benchmark cnode_executor_benchmark
                             cnode_tcp_send_benchmark cnode_udp_send_benchmark cnode_shadowsocks_identity_benchmark
                             cnode_shadowsocks_udp_identity_benchmark cnode_runtime_sampling_benchmark)
         target_compile_options(${target} PRIVATE -UNDEBUG)

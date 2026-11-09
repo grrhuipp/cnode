@@ -1118,8 +1118,11 @@ net::awaitable<void> UdpIngress::ProcessAuthenticated(
             session->UpdateReplyEndpoint(context.client_endpoint);
             if (auto* hook = session->impl_->association_hook) {
                 auto outer = impl_->client_sessions.find(hook->socket_key);
-                auto row = outer->second.find(*hook->client_key);
-                row->second.last_active = std::chrono::steady_clock::now();
+                if (outer != impl_->client_sessions.end()) {
+                    auto row = outer->second.find(*hook->client_key);
+                    if (row != outer->second.end())
+                        row->second.last_active = std::chrono::steady_clock::now();
+                }
             }
             packet->reservation = {};
             (void)session->Push(decoded.target, std::move(decoded.payload));

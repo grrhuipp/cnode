@@ -47,6 +47,7 @@ public:
         socklen_t local_length = sizeof(local_);
         if (::getsockname(socket_.Fd(), reinterpret_cast<sockaddr*>(&local_), &local_length) != 0)
             SocketError("QUIC UDP getsockname");
+        paths_.push_back(std::move(socket_));
         if (!context_ || ngtcp2_crypto_boringssl_configure_client_context(context_.get()) != 0)
             throw std::runtime_error("QUIC TLS context");
         // The local E2E fixture has a self-signed certificate, just like the
@@ -185,6 +186,29 @@ public:
         receive_bytes_ -= result.size();
         return result;
     }
+    size_t AddPath(std::string_view client_address = "127.0.0.1") {
+        RequireOpen();
+        Socket path = Socket::BindUdp(0, client_address);
+        if (::connect(path.Fd(), reinterpret_cast<const sockaddr*>(&remote_), sizeof(remote_)) != 0)
+            SocketError("QUIC UDP path connect");
+        paths_.push_back(std::move(path));
+        return paths_.size() - 1;
+    }
+
+    uint16_t SwitchPath(size_t index) {
+        RequireOpen();
+        active_path_ = index;
+        return paths_.at(index).Port();
+    }
+
+    size_t ActivePath() const noexcept { return active_path_; }
+    uint16_t PathPort(size_t index = 0) const { return paths_.at(index).Port(); }
+    bool HasDatagram() const noexcept { return !datagrams_.empty(); }
+    void BlockPath(size_t index, bool blocked = true) {
+        if (blocked) blocked_paths_.insert(index);
+        else blocked_paths_.erase(index);
+    }
+
 
     void Pump(Milliseconds timeout = Milliseconds(10)) {
         if (timeout < Milliseconds::zero()) throw std::runtime_error("negative QUIC pump timeout");
@@ -201,39 +225,54 @@ public:
             const auto delta = std::min<uint64_t>(expiry - now, 60 * NGTCP2_SECONDS);
             wake = std::min(wake, Clock::now() + std::chrono::nanoseconds(delta));
         }
-        pollfd descriptor{socket_.Fd(), static_cast<short>(POLLIN | (pending_size_ ? POLLOUT : 0)), 0};
+        std::vector<pollfd> descriptors;
+        descriptors.reserve(paths_.size());
+        for (size_t index = 0; index < paths_.size(); ++index) {
+            if (blocked_paths_.contains(index)) continue;
+            const short events = static_cast<short>(
+                POLLIN | (index == active_path_ && pending_size_ ? POLLOUT : 0));
+            descriptors.push_back({paths_[index].Fd(), events, 0});
+        }
         for (;;) {
             const auto remaining = wake - Clock::now();
             const auto delay = remaining <= Clock::duration::zero() ? 0 :
                 std::min<int64_t>(std::chrono::ceil<Milliseconds>(remaining).count(), 60000);
-            const int result = ::poll(&descriptor, 1, static_cast<int>(delay));
+            const int result = ::poll(descriptors.data(), descriptors.size(), static_cast<int>(delay));
             if (result >= 0) break;
             if (errno != EINTR) SocketError("QUIC poll");
             if (Clock::now() >= wake) break;
         }
-        if (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) Fail("QUIC UDP socket failed");
+        for (const auto& descriptor : descriptors) {
+            if (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL))
+                Fail("QUIC UDP socket failed");
+        }
         // A packet flood cannot extend a Pump call indefinitely.
         std::array<uint8_t, 65536> packet{};
-        for (size_t received = 0; received < 64; ++received) {
-            const auto length = ::recv(socket_.Fd(), packet.data(), packet.size(), MSG_DONTWAIT);
-            if (length < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-                if (errno == EINTR) {
-                    if (Clock::now() >= deadline) break;
-                    continue;
+        size_t received = 0;
+        for (size_t index = 0; index < paths_.size() && received < 64; ++index) {
+            if (blocked_paths_.contains(index)) continue;
+            while (received < 64) {
+                const auto length = ::recv(paths_[index].Fd(), packet.data(), packet.size(), MSG_DONTWAIT);
+                if (length < 0) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                    if (errno == EINTR) {
+                        if (Clock::now() >= deadline) break;
+                        continue;
+                    }
+                    SocketError("QUIC recv");
                 }
-                SocketError("QUIC recv");
+                ++received;
+                auto path = Path();
+                ngtcp2_pkt_info info{};
+                const int result = ngtcp2_conn_read_pkt(quic_.get(), &path, &info, packet.data(),
+                                                       static_cast<size_t>(length), Timestamp());
+                if (result == NGTCP2_ERR_DRAINING || result == NGTCP2_ERR_IDLE_CLOSE) {
+                    closed_ = true;
+                    return;
+                }
+                CheckQuic(result, "read packet");
+                if (Clock::now() >= deadline) break;
             }
-            auto path = Path();
-            ngtcp2_pkt_info info{};
-            const int result = ngtcp2_conn_read_pkt(quic_.get(), &path, &info, packet.data(),
-                                                   static_cast<size_t>(length), Timestamp());
-            if (result == NGTCP2_ERR_DRAINING || result == NGTCP2_ERR_IDLE_CLOSE) {
-                closed_ = true;
-                return;
-            }
-            CheckQuic(result, "read packet");
-            if (Clock::now() >= deadline) break;
         }
         HandleExpiry();
         if (!closed_) Flush();
@@ -755,7 +794,7 @@ private:
     }
     bool SendPacket() {
         if (pending_size_ == 0) return true;
-        const auto length = ::send(socket_.Fd(), packet_.data(), pending_size_, MSG_DONTWAIT | MSG_NOSIGNAL);
+        const auto length = ::send(paths_.at(active_path_).Fd(), packet_.data(), pending_size_, MSG_DONTWAIT | MSG_NOSIGNAL);
         if (length < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return false;
             SocketError("QUIC send");
@@ -846,6 +885,9 @@ private:
     }
 
     Socket socket_;
+    std::vector<Socket> paths_;
+    size_t active_path_ = 0;
+    std::set<size_t> blocked_paths_;
     sockaddr_in local_{};
     sockaddr_in remote_{};
     std::map<int64_t, Stream> streams_;

@@ -108,6 +108,16 @@ Linux TLS 基准还在服务启动、预热完成及测量传输完成但连接�
 
 比较内存前，以相同写入方式生成并预热新旧可执行文件副本，先用同字节二进制做 A/A 对照。文件页缓存、映射及透明大页都会影响 RSS，不能把不同文件缓存状态造成的驻留差异当作堆内存收益。
 
+HY2 的真实进程 TCP 基准固定 4 个 Worker，分别测量 `64/256/1024` 条物理 QUIC 连接（每连接 1 条流）和 `1/16` 条物理连接（每连接 64 条流）的上传、下载。每流预热 16 KiB、测量 256 KiB，全部连接和目标就绪后开始计时，并校验完整载荷及目标完成标记。Linux/Bash 下先按上述方式开启 `BUILD_BENCHMARKS`，再运行：
+
+```sh
+mise exec -- cmake --build build/musl --target cnode_hysteria_throughput_benchmark
+mise exec -- ctest --test-dir build/musl --no-tests=error \
+  -R 'HysteriaThroughputBenchmark' -V
+```
+
+HY2 基准同样支持 `CNODE_BENCHMARK_BINARY`。输出守护进程完整生命周期 CPU、传输吞吐，以及启动、活跃、空闲、流关闭和 QUIC 空闲超时后的 RSS/PSS；加载期间按 100 ms 间隔采样，采样峰值不等于瞬时峰值。单线程客户端/目标驱动可能限制吞吐，结果不代表服务端容量上限或公网性能，也不包含 UDP datagram 吞吐。独立子流保持活动，完成后停止保活并观察空闲关闭；回收后 RSS 是定时观测，不等于内部活对象计数。
+
 官方参考程序互操作测试按需配置，使用本地可执行文件，不在测试期间下载。AnyTLS 参考程序可先用宿主 Go 准备，默认离线且要求固定提交的干净源码：
 
 ```sh
@@ -127,7 +137,18 @@ mise exec -- cmake --build build/musl --target cnode_tests
 mise exec -- ctest --test-dir build/musl --output-on-failure --no-tests=error --parallel -L '^e2e$'
 ```
 
-Xray 使用 `-DCNODE_REFERENCE_XRAY=/path/to/xray`，要求 `v26.10.31` 对应版本；Hysteria v1/v2 分别使用 `CNODE_REFERENCE_HYSTERIA1`、`CNODE_REFERENCE_HYSTERIA2`，可独立配置。参考测试通过 `CNODE_REFERENCE_GO` 检查来源和构建元数据；AnyTLS 必须同时提供客户端与服务端。不配置参考程序时只注册本地可控对端 E2E，不把缺失参考程序计为测试通过。
+Xray 使用 `-DCNODE_REFERENCE_XRAY=/path/to/xray`，要求 `v26.10.31` 对应版本；Hysteria v1/v2 分别使用 `CNODE_REFERENCE_HYSTERIA1`、`CNODE_REFERENCE_HYSTERIA2`，可独立配置。Hysteria 支持带干净版本元数据的源码构建，以及按精确 SHA256 固定的[官方 v2.13.0 Linux amd64 发布文件](https://github.com/HyNetworks/hysteria/releases/tag/app/v2.13.0)。参考测试通过 `CNODE_REFERENCE_GO` 检查来源和构建元数据；AnyTLS 必须同时提供客户端与服务端。不配置参考程序时只注册本地可控对端 E2E，不把缺失参考程序计为测试通过。
+
+HY2 被动迁移测试复用同一物理连接内的 32 条 TCP 流和 16 个 UDP 关联，要求日志确认 8 次跨 Worker 的 A→B→A 往返，并验证原出站端点和承载连接保持、独立连接持续可用及路径验证期间停机。覆盖 direct、VLESS-over-TCP、AnyTLS 三种出站；这不是 Port Hopping 测试，也不以 NAT 转发夹具的吞吐代表服务端性能。Linux/Bash 下准备好宿主 Go 和参考文件后：
+
+```sh
+mise run test:configure -- \
+  -DCNODE_REFERENCE_GO="$(command -v go)" \
+  -DCNODE_REFERENCE_HYSTERIA2=/path/to/hysteria
+mise exec -- cmake --build build/musl --target cnode_e2e_reference_hysteria
+mise exec -- ctest --test-dir build/musl --no-tests=error \
+  -R '^e2e\.reference_hysteria\..*/V2_' -V
+```
 
 本地与 CI 使用同一份 mise 固定工具链、vcpkg 依赖基线和配置入口，均为 `Release` 并开启 LTO；测试配置统一运行 `mise run test:configure`。宿主发行版无需相同，不要求容器。密码学故障注入测试单独保留链接器可拦截的调用边界。CTest 使用不指定数量的 `--parallel`，按可用 CPU 自动调度。
 

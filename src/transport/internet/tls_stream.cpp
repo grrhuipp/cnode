@@ -347,7 +347,9 @@ struct TlsStream::Impl final : memory::ThreadAllocated, private transport::Cance
 
     Impl(std::unique_ptr<TcpStream> inner, const SslContext& context, bool server)
         : tcp(std::move(inner))
-        , ssl(nullptr, SSL_free) {
+        , ssl(nullptr, SSL_free)
+        , engine_gate(tcp ? tcp->GetExecutor() : net::any_io_executor{})
+        , input_gate(tcp ? tcp->GetExecutor() : net::any_io_executor{}) {
         if (!tcp) throw std::invalid_argument("TlsStream requires TcpStream");
         if (!tls_bio_method)
             throw std::logic_error("TlsStream::InitializeIo must precede Worker startup");

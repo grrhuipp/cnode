@@ -292,6 +292,28 @@ void PassiveHandoffAndExclusiveDetach() {
         request->PreparePassiveHandoff(new_target), net::use_future).get();
     Require(request->OwnerId() == 0 && physical->OwnerId() == 0,
             "prepare prematurely published receiving owner");
+    {
+        auto unrelated_physical = make(first, 0);
+        Require(net::co_spawn(unrelated->Executor(),
+            unrelated->AttachExclusive(unrelated_physical), net::use_future).get(),
+            "in-flight handoff on another group blocked exclusive attach");
+        auto unrelated_handoff = net::co_spawn(second,
+            unrelated->PreparePassiveHandoff(new_target), net::use_future).get();
+        net::co_spawn(second, unrelated_handoff->Commit(), net::use_future).get();
+        unrelated_handoff.reset();
+        Require(unrelated->OwnerId() == 1 && unrelated_physical->OwnerId() == 1,
+                "concurrent handoff on independent group did not commit");
+        net::co_spawn(unrelated->Executor(),
+            unrelated->DetachExclusive(unrelated_physical), net::use_future).get();
+        auto restore_unrelated = net::co_spawn(first,
+            unrelated->PreparePassiveHandoff(old_target), net::use_future).get();
+        net::co_spawn(first, restore_unrelated->Commit(), net::use_future).get();
+        restore_unrelated.reset();
+        auto restore_physical = net::co_spawn(first,
+            unrelated_physical->PreparePassiveHandoff(old_target), net::use_future).get();
+        net::co_spawn(first, restore_physical->Commit(), net::use_future).get();
+        restore_physical.reset();
+    }
     std::atomic<unsigned> delivered{0};
     std::promise<void> completed;
     request->Execute([&] { ++delivered; });

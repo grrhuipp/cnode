@@ -104,6 +104,15 @@ struct Buffer {
     [[nodiscard]] bool HasUDP() const noexcept { RequireLease(); return udp_.has_value(); }
     [[nodiscard]] TargetAddress& UDP() noexcept { RequireLease(); return *udp_; }
     [[nodiscard]] const TargetAddress& UDP() const noexcept { RequireLease(); return *udp_; }
+    void Adopt() {
+        RequireLease();
+        memory::AdoptPmr(this);
+        if (udp_ && udp_->IsDomain() &&
+            udp_->host.get_allocator().resource() != memory::CurrentResource()) {
+            udp_->host = memory::ThreadLocalString(
+                std::string_view(udp_->host), memory::CurrentResource());
+        }
+    }
     // 从当前会话域（或控制面 Worker-local PMR）取得固定 8KB 块。只初始化游标，payload 保持
     // 未初始化，避免热路径无谓 memset。
     [[nodiscard]] static Buffer* New() noexcept {
@@ -245,6 +254,21 @@ public:
             return nullptr;
         }
         return spill_ ? spill_->back() : inline_buffers_[inline_start_ + size_ - 1];
+    }
+
+    void Adopt() {
+        for (Buffer* buffer : *this) {
+            if (buffer) buffer->Adopt();
+        }
+        if (spill_ && spill_->get_allocator().resource() != memory::CurrentResource()) {
+            memory::ThreadLocalVector<Buffer*> adopted;
+            adopted.reserve(size());
+            for (size_t i = spill_start_; i < spill_->size(); ++i) {
+                adopted.push_back((*spill_)[i]);
+            }
+            spill_.emplace(std::move(adopted));
+            spill_start_ = 0;
+        }
     }
 
     void reserve(size_t n) {

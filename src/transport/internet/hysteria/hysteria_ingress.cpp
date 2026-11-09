@@ -87,6 +87,16 @@ constexpr uint64_t kMaxStreams = 1024;
     return maximum - now < delay ? maximum : now + delay;
 }
 
+[[nodiscard]] std::chrono::steady_clock::time_point ExpiryTimePoint(
+    ngtcp2_tstamp timestamp) noexcept {
+    constexpr auto kMaxNanoseconds = static_cast<ngtcp2_tstamp>(
+        std::chrono::steady_clock::time_point::max().time_since_epoch().count());
+    if (timestamp >= kMaxNanoseconds)
+        return std::chrono::steady_clock::time_point::max();
+    return std::chrono::steady_clock::time_point(
+        std::chrono::nanoseconds(static_cast<std::chrono::nanoseconds::rep>(timestamp)));
+}
+
 int SelectAlpn(SSL*, const uint8_t** out, uint8_t* outlen,
                const uint8_t* input, unsigned input_length, void* argument) {
     const auto expected = *static_cast<const std::string_view*>(argument);
@@ -753,7 +763,11 @@ net::awaitable<void> Connection::WriteStream(
             if (bytes > kMaxStreamOutputBytes)
                 throw transport::LinkError(ErrorCode::RESOURCE_EXHAUSTED);
             if (it->second.queued_bytes <= kMaxStreamOutputBytes - bytes) {
-                if (bytes != 0) it->second.output.push_back(std::move(payload));
+                memory::ScopedAllocationDomain scope(capabilities_->Allocation());
+                if (bytes != 0) {
+                    payload.Adopt();
+                    it->second.output.push_back(std::move(payload));
+                }
                 it->second.queued_bytes += bytes;
                 Flush();
                 co_return;
@@ -1587,6 +1601,7 @@ bool Connection::SendUdpMessage(
     std::span<const uint8_t> payload) {
     if (closed_ || !target.IsValid() ||
         payload.size() > kMaxUdpPayloadLength) return false;
+    memory::ScopedAllocationDomain scope(capabilities_->Allocation());
     const auto* parameters = ngtcp2_conn_get_remote_transport_params2(core_->quic);
     if (!parameters) return false;
     const auto frame_budget = std::min<uint64_t>(
@@ -1906,8 +1921,7 @@ net::awaitable<void> QuicListener::Claim(std::shared_ptr<QuicOwnership> owner) {
                         connection->candidate_remote_.port());
             });
             if (done) break;
-            const auto wake_at = std::min(deadline, std::chrono::steady_clock::time_point(
-                std::chrono::nanoseconds(owner->expiry.load())));
+            const auto wake_at = std::min(deadline, ExpiryTimePoint(owner->expiry.load()));
             if (!inbox->packets.empty()) continue;
             const auto delay = std::chrono::ceil<std::chrono::milliseconds>(
                 wake_at - std::chrono::steady_clock::now());
@@ -1963,8 +1977,13 @@ net::awaitable<void> QuicListener::Claim(std::shared_ptr<QuicOwnership> owner) {
     inboxes.erase(owner.get());
     MaybeShrinkHashContainer(inboxes, 8);
     --pending_claims;
-    if (connection && !owner->retired.load())
-        owner->domain->Execute([connection] { connection->PublishExpiry(); });
+    if (connection && !owner->retired.load()) {
+        const bool listener_stopping = committed && stopping;
+        owner->domain->Execute([connection, listener_stopping] {
+            if (listener_stopping) connection->Close();
+            else connection->PublishExpiry();
+        });
+    }
     if (committed) {
         while (!inbox->packets.empty()) {
             auto packet = std::move(inbox->packets.front());
@@ -2122,12 +2141,12 @@ void QuicListener::ArmExpiry() {
         if (!owner->retired.load() && !owner->claiming.load())
             nearest = std::min(nearest, owner->expiry.load());
     }
-    if (nearest == std::numeric_limits<ngtcp2_tstamp>::max()) {
+    const auto expiry_time = ExpiryTimePoint(nearest);
+    if (expiry_time == std::chrono::steady_clock::time_point::max()) {
         expiry.expires_at(std::chrono::steady_clock::time_point::max());
         return;
     }
-    expiry.expires_at(std::chrono::steady_clock::time_point(
-        std::chrono::nanoseconds(nearest)));
+    expiry.expires_at(expiry_time);
     if (!expiry_running) {
         expiry_running = true;
         Spawn(ExpiryLoop());
@@ -2168,9 +2187,9 @@ net::awaitable<void> QuicListener::ExpiryLoop() {
             if (!owner->retired.load() && !owner->claiming.load())
                 nearest = std::min(nearest, owner->expiry.load());
         }
-        if (nearest == std::numeric_limits<ngtcp2_tstamp>::max()) break;
-        expiry.expires_at(std::chrono::steady_clock::time_point(
-            std::chrono::nanoseconds(nearest)));
+        const auto expiry_time = ExpiryTimePoint(nearest);
+        if (expiry_time == std::chrono::steady_clock::time_point::max()) break;
+        expiry.expires_at(expiry_time);
     }
     expiry_running = false;
 }

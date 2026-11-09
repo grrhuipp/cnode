@@ -109,11 +109,12 @@ struct Handler::PaddingState {
 struct Handler::ClientSession : memory::ThreadAllocated {
     class LogicalStream final {
     public:
-        explicit LogicalStream(net::io_context& io_context)
+        explicit LogicalStream(net::io_context& io_context,
+                               net::any_io_executor executor)
             : io_context_(io_context)
-            , syn_signal_(SessionExecutor(io_context), 1)
-            , payload_signal_(SessionExecutor(io_context), 1)
-            , payload_space_signal_(SessionExecutor(io_context), 1) {}
+            , syn_signal_(executor, 1)
+            , payload_signal_(executor, 1)
+            , payload_space_signal_(std::move(executor), 1) {}
 
         ~LogicalStream() noexcept {
             Close(ErrorCode::CANCELLED);
@@ -266,8 +267,10 @@ struct Handler::ClientSession : memory::ThreadAllocated {
         , opening_scheme_(std::move(opening_scheme))
         , scheme_(opening_scheme_)
         , domain(ExecutionDomain::Current())
+        , allocation_domain(memory::CurrentAllocationDomain())
         , local_endpoint(stream->LocalEndpoint())
-        , remote_endpoint(stream->RemoteEndpoint()) {}
+        , remote_endpoint(stream->RemoteEndpoint())
+        , write_gate(SessionExecutor(io_context)) {}
 
     net::io_context& io_context_;
     std::unique_ptr<AsyncStream> stream;
@@ -277,6 +280,7 @@ struct Handler::ClientSession : memory::ThreadAllocated {
     std::shared_ptr<const PaddingScheme> opening_scheme_;
     std::shared_ptr<const PaddingScheme> scheme_;
     const std::shared_ptr<ExecutionDomain> domain;
+    memory::AllocationDomain* const allocation_domain = nullptr;
     const std::optional<tcp::endpoint> local_endpoint;
     const std::optional<tcp::endpoint> remote_endpoint;
     uint32_t next_sid = 1;
@@ -323,8 +327,11 @@ struct Handler::ClientSession : memory::ThreadAllocated {
     }
 
     std::shared_ptr<LogicalStream> RegisterLogicalStream(uint32_t sid) {
+        std::optional<memory::ScopedAllocationDomain> scope;
+        if (allocation_domain) scope.emplace(*allocation_domain);
         auto logical = memory::AllocateShared<LogicalStream>(
-            domain ? domain->Reactor() : io_context_);
+            domain ? domain->Reactor() : io_context_,
+            domain ? domain->Executor() : net::any_io_executor(io_context_.get_executor()));
         logical_streams[sid] = logical;
         return logical;
     }
@@ -1115,6 +1122,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
     auto request = ExecutionDomain::Current();
+    const bool request_has_allocation = memory::CurrentAllocationDomain() != nullptr;
     const auto ordered_bind = dialer.SelectOrderedBind(ctx);
     std::shared_ptr<const PaddingScheme> opening_scheme;
     uint32_t worker = 0;
@@ -1210,7 +1218,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
         if (session) {
             auto run = ProcessSession(ctx, inbound, dialer, timeouts, stats, relay_config,
                 std::move(first_payload), relay_idle_timeout, relay_write_timeout, session, reusable);
-            if (physical) {
+            if (physical && !request_has_allocation) {
                 result = co_await net::co_spawn(
                     physical->Executor(), std::move(run), net::use_awaitable);
             } else {
@@ -1223,6 +1231,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     // No lease can re-enter the idle index while its request domain is attached.
     // Cancellation of the request cannot strand the exclusive ownership edge.
     co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
+    session.reset();
     if (attached) co_await request->DetachExclusive(physical);
     if (reusable && !failure) transport_lease.Reuse();
     if (failure) std::rethrow_exception(failure);
@@ -1332,6 +1341,7 @@ net::awaitable<OutboundProcessResult> Handler::ProcessSession(
                 }
                 throw transport::LinkError(payload.error());
             }
+            payload->Adopt();
             if (is_udp) {
                 for (auto* buffer : *payload) {
                     if (buffer && !buffer->IsEmpty()) {

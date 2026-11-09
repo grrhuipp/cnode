@@ -1,6 +1,7 @@
 #include "reference_support.hpp"
 #include <openssl/rand.h>
 #include <csignal>
+#include <iostream>
 
 namespace cnode::e2e::reference {
 namespace {
@@ -138,8 +139,11 @@ void VerifyHysteria(const std::string& binary, int version) {
     const auto metadata = Command({CNODE_REFERENCE_GO, "version", "-m", binary});
     const auto expected = version == 1 ? "path\tgithub.com/apernet/hysteria/app/cmd\n" : "path\tgithub.com/apernet/hysteria/app/v2\n";
     Require(metadata.find(expected) != std::string::npos, "Hysteria reference is not the official github.com/apernet/hysteria app");
-    Require(metadata.find("vcs.modified=false") != std::string::npos &&
-        std::regex_search(metadata, std::regex("vcs.revision=[0-9a-f]{40}")), "Hysteria must contain clean source revision metadata");
+    const bool official_release = version == 2 &&
+        Digest(binary) == "907ba8c9693edb104b20582681fb7dc15639d5b64a9cbb616a7b539190a86691";
+    Require(official_release || (metadata.find("vcs.modified=false") != std::string::npos &&
+        std::regex_search(metadata, std::regex("vcs.revision=[0-9a-f]{40}"))),
+        "Hysteria must be a clean source build or the pinned official v2.13.0 linux-amd64 release");
     const auto banner = Command({binary, version == 1 ? "--version" : "version"});
     Require(std::regex_search(banner, std::regex("[vV]?" + std::to_string(version) + "\\.[0-9]+\\.[0-9]+")), "wrong Hysteria reference major version");
 }
@@ -172,6 +176,7 @@ TEST_P(HysteriaReference, AuthenticatedCrossWorkerReturnAndFailClosedShutdown) {
     VerifyHysteria(binary, version);
     BinaryGuard binaries{Binary(), binary};
     TempDir root, upstream_root;
+    constexpr size_t tcp_streams = 32, udp_associations = 16, required_returns = 8;
     const auto server_port = UdpPort(), socks_port = TcpPort(), control_port = TcpPort();
     TcpServer target([](Socket socket, size_t) {
         while (true) { auto data = socket.Read(65536, 20s); if (data.empty()) break; socket.Write(data); }
@@ -211,39 +216,70 @@ TEST_P(HysteriaReference, AuthenticatedCrossWorkerReturnAndFailClosedShutdown) {
     };
     Child client({binary, "client", "-c", config("client", relay.Port(), socks_port)}, root.Path() / "client.log");
     Child control_client({binary, "client", "-c", config("control", server_port, control_port)}, root.Path() / "control.log");
-    auto tcp = Connect(socks_port); Socks(tcp, target.Port());
-    auto association = Connect(socks_port); const auto udp_port = Socks(association, 0, 3);
+    std::vector<Socket> tcp, associations, udp;
+    std::vector<uint16_t> udp_ports;
+    tcp.reserve(tcp_streams);
+    associations.reserve(udp_associations);
+    udp.reserve(udp_associations);
+    for (size_t i = 0; i < tcp_streams; ++i) {
+        auto socket = Connect(socks_port); Socks(socket, target.Port());
+        tcp.push_back(std::move(socket));
+    }
+    for (size_t i = 0; i < udp_associations; ++i) {
+        auto association = Connect(socks_port);
+        udp_ports.push_back(Socks(association, 0, 3));
+        associations.push_back(std::move(association));
+        udp.push_back(Socket::BindUdp());
+    }
     auto control_socket = Connect(control_port); Socks(control_socket, target.Port());
     ControlStream control(std::move(control_socket));
     Until([&] { return control.Rounds() > 0; }, 15s);
-    auto udp = Socket::BindUdp();
     const auto nonce = Random(16);
     const auto udp_header = std::string("\0\0\0", 3) + SocksAddress(udp_target.Port());
-    std::string udp_peer;
-    size_t rounds = 0, upstream_baseline = 0;
+    std::vector<std::string> udp_peers(udp_associations);
+    size_t rounds = 0, upstream_baseline = 0, udp_attempts = 0;
+    double longest_exchange_seconds = 0;
     auto exchange = [&] {
         const auto started = Clock::now(), deadline = started + 1500ms;
+        auto remaining = [&] {
+            Require(Clock::now() < deadline, "migration traffic deadline");
+            return std::chrono::ceil<Milliseconds>(deadline - Clock::now());
+        };
         const auto payload = nonce + BigEndian(rounds, 8) + Random(4096);
-        tcp.Write(payload, 1400ms);
-        Require(tcp.ReadExact(payload.size(), 1400ms) == payload, "persistent TCP stream corrupted");
-        const auto datagram = nonce + BigEndian(rounds, 8);
-        bool received = false;
-        while (Clock::now() < deadline) {
-            udp.SendTo(udp_header + datagram, udp_port);
-            pollfd fd{udp.Fd(), POLLIN, 0};
-            const auto remaining = std::chrono::duration_cast<Milliseconds>(deadline - Clock::now()).count();
-            if (poll(&fd, 1, static_cast<int>(std::clamp<int64_t>(remaining, 0, 100))) <= 0) continue;
-            sockaddr_in peer{}; auto reply = ReceiveDatagram(udp.Fd(), peer);
-            Require(reply.size() >= 16 && reply.substr(0, 4) == std::string("\0\0\0\1", 4), "SOCKS UDP response framing changed");
-            const auto body = reply.substr(10);
-            if (body.substr(0, body.size() - 6) != datagram) continue;
-            if (udp_peer.empty()) udp_peer = body.substr(body.size() - 6);
-            Require(body.substr(body.size() - 6) == udp_peer, "UDP egress tuple changed (redial)");
-            received = true; break;
+        for (size_t i = 0; i < tcp.size(); ++i)
+            tcp[i].Write(payload + BigEndian(i, 8), remaining());
+        for (size_t i = 0; i < tcp.size(); ++i)
+            Require(tcp[i].ReadExact(payload.size() + 8, remaining()) == payload + BigEndian(i, 8),
+                    "persistent TCP stream corrupted or misrouted");
+        for (size_t i = 0; i < udp.size(); ++i) {
+            udp[i].SendTo(udp_header + nonce + BigEndian(rounds, 8) + BigEndian(i, 8), udp_ports[i]);
+            ++udp_attempts;
         }
-        Require(received, "persistent UDP association stopped");
-        Require(Clock::now() - started < 1500ms, "forged claim or migration stalled business traffic");
-        EXPECT_EQ(target.Count(), 2); EXPECT_EQ(udp_target.Count(), 1);
+        for (size_t i = 0; i < udp.size(); ++i) {
+            const auto datagram = nonce + BigEndian(rounds, 8) + BigEndian(i, 8);
+            bool received = false;
+            while (Clock::now() < deadline) {
+                pollfd fd{udp[i].Fd(), POLLIN, 0};
+                if (poll(&fd, 1, static_cast<int>(std::min<int64_t>(remaining().count(), 100))) <= 0) {
+                    udp[i].SendTo(udp_header + datagram, udp_ports[i]);
+                    ++udp_attempts;
+                    continue;
+                }
+                sockaddr_in peer{}; auto reply = ReceiveDatagram(udp[i].Fd(), peer);
+                Require(reply.size() >= 16 && reply.substr(0, 4) == std::string("\0\0\0\1", 4),
+                        "SOCKS UDP response framing changed");
+                const auto body = reply.substr(10);
+                if (body.substr(0, body.size() - 6) != datagram) continue;
+                if (udp_peers[i].empty()) udp_peers[i] = body.substr(body.size() - 6);
+                Require(body.substr(body.size() - 6) == udp_peers[i], "UDP egress tuple changed (redial)");
+                received = true;
+                break;
+            }
+            Require(received, "persistent UDP association stopped");
+        }
+        longest_exchange_seconds = std::max(longest_exchange_seconds,
+            std::chrono::duration<double>(Clock::now() - started).count());
+        EXPECT_EQ(target.Count(), tcp_streams + 1); EXPECT_EQ(udp_target.Count(), udp_associations);
         if (tap && upstream_baseline) EXPECT_EQ(tap->Count(), upstream_baseline) << "upstream tunnel redialed";
         ++rounds;
     };
@@ -267,25 +303,43 @@ TEST_P(HysteriaReference, AuthenticatedCrossWorkerReturnAndFailClosedShutdown) {
         for (const auto& commit : Commits(Logs(root.Path()))) EXPECT_FALSE(forged_ports.contains(commit.port));
     }
     ASSERT_TRUE(rejected) << "no foreign-Worker forged-CID rejection";
-    bool returned = false;
-    for (int attempt = 0; attempt != 32 && !returned; ++attempt) {
+    size_t completed_returns = 0, path_switches = 0;
+    const auto memory_before = server.ReadMemorySnapshot();
+    uint64_t largest_rss = memory_before.smaps_rollup_rss_bytes;
+    for (int attempt = 0; attempt != 64 && completed_returns < required_returns; ++attempt) {
+        const auto first_commit = Commits(Logs(root.Path())).size();
         const auto previous = relay.Active(); const auto path = relay.Add();
         const auto source = relay.Switch(path);
+        ++path_switches;
         for (int i = 0; i != 6; ++i) exchange();
         const auto return_port = relay.Switch(previous);
+        ++path_switches;
         for (int i = 0; i != 6; ++i) exchange();
-        const auto deadline = Clock::now() + 7s;
+        bool returned = false;
+        const auto deadline = Clock::now() + 1500ms;
         while (Clock::now() < deadline && !returned) {
             const auto commits = Commits(Logs(root.Path()));
-            for (const auto& outward : commits) {
+            for (size_t i = first_commit; i < commits.size(); ++i) {
+                const auto& outward = commits[i];
                 if (outward.port != source || outward.old_owner == outward.receiver) continue;
-                for (const auto& back : commits)
-                    if (back.port == return_port && back.evidence == "reused" && back.old_owner == outward.receiver && back.receiver == outward.old_owner) returned = true;
+                for (size_t j = i + 1; j < commits.size(); ++j) {
+                    const auto& back = commits[j];
+                    if (back.port == return_port && back.evidence == "reused" &&
+                        back.old_owner == outward.receiver && back.receiver == outward.old_owner) returned = true;
+                }
             }
-            if (!returned) { exchange(); std::this_thread::sleep_for(50ms); }
+            if (!returned) { exchange(); std::this_thread::sleep_for(20ms); }
         }
+        if (returned) ++completed_returns;
+        largest_rss = std::max(largest_rss, server.ReadMemorySnapshot().smaps_rollup_rss_bytes);
     }
-    ASSERT_TRUE(returned) << "no cross-Worker A -> B -> A historical-path reuse";
+    ASSERT_EQ(completed_returns, required_returns) << "insufficient authenticated cross-Worker A -> B -> A returns";
+    std::cout << Json{{"benchmark", "hysteria_passive_migration"}, {"version", version},
+        {"outbound", outbound_kind}, {"tcp_streams", tcp_streams}, {"udp_associations", udp_associations},
+        {"completed_returns", completed_returns}, {"path_switches", path_switches}, {"exchange_rounds", rounds},
+        {"udp_retransmissions", udp_attempts - rounds * udp_associations},
+        {"longest_exchange_seconds", longest_exchange_seconds},
+        {"rss_before", memory_before.smaps_rollup_rss_bytes}, {"largest_sampled_rss", largest_rss}}.dump() << '\n';
     for (int i = 0; i != 20; ++i) exchange();
     EXPECT_GT(control.Rounds(), control_before);
     EXPECT_TRUE(client.Running()); EXPECT_TRUE(control_client.Running()); EXPECT_TRUE(server.Running());
@@ -301,14 +355,14 @@ TEST_P(HysteriaReference, AuthenticatedCrossWorkerReturnAndFailClosedShutdown) {
     }
     ASSERT_GE(receiving_worker, 0) << "no fresh foreign-Worker path for shutdown";
     relay.Block(chosen); relay.Switch(chosen);
-    tcp.Write(nonce + "interrupted-path-validation");
+    tcp.front().Write(nonce + "interrupted-path-validation");
     Until([&] { return relay.BlockedResponse(); }, 1500ms);
     control.Join();
     server.Signal(SIGTERM); EXPECT_EQ(server.Wait(10s), 0);
     const auto events = Logs(root.Path());
     EXPECT_NE(events.find("QUIC passive claim abandoned receiving_worker=" + std::to_string(receiving_worker) + " reason=listener-stopped"), std::string::npos);
     EXPECT_TRUE(std::regex_search(events, std::regex("QUIC passive rollback closed connection worker=\\d+ reason=selected-path-changed")));
-    tcp.Close(); association.Close(); client.Stop(); control_client.Stop();
+    tcp.clear(); associations.clear(); udp.clear(); client.Stop(); control_client.Stop();
     if (upstream) upstream->Stop();
     relay.Join(); if (tap) tap->Join(); udp_target.Join(); target.Join(); binaries.Check();
 }

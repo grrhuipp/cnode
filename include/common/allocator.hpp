@@ -763,6 +763,19 @@ public:
         return live_allocations_;
     }
     void RequireLease() const noexcept;
+    void Adopt(void* pointer) noexcept {
+        if (!pointer) return;
+        RequireLease();
+        auto* source = worker_memory::DomainOf(pointer);
+        if (!source || source == this) return;
+        source->RequireLease();
+        if (source->live_allocations_ == 0) std::terminate();
+        if (live_allocations_++ == 0) live_lifetime_ = lifetime_.lock();
+        worker_memory::SetDomain(pointer, this);
+        std::shared_ptr<void> retiring;
+        if (--source->live_allocations_ == 0)
+            retiring = std::move(source->live_lifetime_);
+    }
 
 private:
     friend class AllocationDomain;
@@ -1013,6 +1026,12 @@ inline void RequireAllocationLease(const void* pointer) noexcept {
     if (!pointer) return;
     if (auto* domain = worker_memory::DomainOf(pointer))
         domain->RequireLease();
+}
+
+inline void AdoptPmr(void* pointer) noexcept {
+    if (!pointer) return;
+    if (auto* domain = CurrentAllocationDomain())
+        domain->memory().Adopt(pointer);
 }
 
 // Native Asio operation storage can be allocated, delivered, cancelled, or

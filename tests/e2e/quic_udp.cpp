@@ -378,5 +378,250 @@ TEST(QuicUdp, ShutdownJoinsSessionWaitingForDnsWithLaterInput) {
     EXPECT_EQ(server.Stop(8s), 0);
     control.Join();
 }
+
+TEST(QuicUdp, ConcurrentMultiSessionMigrationAndEphemeralAnyTlsStreams) {
+    TempDir root, upstream_root;
+    Targets tcp_target([](Socket& socket) {
+        for (;;) {
+            const auto bytes = socket.Read(16384, 30s);
+            if (bytes.empty()) break;
+            socket.Write(bytes);
+        }
+    });
+    auto udp_target = Socket::BindUdp();
+    auto upstream_reservation = Socket::Listen();
+    const auto upstream_port = upstream_reservation.Port();
+    Configure(upstream_root.Path(),
+        {{"protocol", "anytls"}, {"listen", "127.0.0.1"}, {"port", upstream_port},
+            {"settings", {{"clients", Json::array({{{"password", "secret"}}})}}},
+            {"streamSettings", TlsSettings(true)}},
+        {{"protocol", "freedom"}, {"settings", Json::object()}}, 4);
+    upstream_reservation.Close();
+    Child upstream({Binary().string(), "--config-dir", upstream_root.Path().string()},
+        upstream_root.Path() / "upstream.log");
+    upstream.WaitForLog("server started");
+
+    auto reservation = Socket::BindUdp();
+    const auto port = reservation.Port();
+    auto inbound = HysteriaInbound(port);
+    inbound["settings"]["upMbps"] = 1000;
+    inbound["settings"]["downMbps"] = 1000;
+    Configure(root.Path(), std::move(inbound),
+        {{"protocol", "anytls"},
+            {"settings", {{"address", "127.0.0.1"}, {"port", upstream_port},
+                {"password", "secret"}, {"minIdleSession", 2}}},
+            {"streamSettings", TlsSettings(false)}}, 4);
+    auto config = Json::parse(ReadFile(root.Path() / "config.json"));
+    config["log"]["enable"] = true;
+    config["log"]["loglevel"] = "debug";
+    WriteJson(root.Path(), "config.json", config);
+    reservation.Close();
+    Child server({Binary().string(), "--config-dir", root.Path().string()},
+        root.Path() / "child.log");
+    server.WaitForLog("server started");
+
+    constexpr size_t client_count = 8;
+    constexpr size_t rounds = 12;
+    const auto tcp_address = "127.0.0.1:" + std::to_string(tcp_target.Port());
+    const auto udp_address = "127.0.0.1:" + std::to_string(udp_target.Port());
+
+    struct SessionState {
+        std::unique_ptr<Peer> peer;
+        int64_t persistent_stream = -1;
+        std::string persistent_expected;
+        uint32_t udp_session = 0;
+        uint16_t origin_udp_port = 0;
+    };
+    std::vector<SessionState> clients;
+    clients.reserve(client_count);
+    for (size_t i = 0; i < client_count; ++i) {
+        SessionState state;
+        state.peer = std::make_unique<Peer>(port);
+        const auto init = "init-" + std::to_string(i) + ":";
+        state.persistent_stream = state.peer->Open(tcp_address, init);
+        state.persistent_expected = init;
+        state.udp_session = static_cast<uint32_t>(0x2000 + i);
+        clients.push_back(std::move(state));
+    }
+    Peer stalled_peer(port);
+    const auto stalled_stream = stalled_peer.Open(tcp_address, "stalled-init:");
+    stalled_peer.Wait([&] { return stalled_peer.PayloadEquals(stalled_stream, "stalled-init:"); });
+    for (size_t attempt = 0; attempt < 16; ++attempt) {
+        const auto path = stalled_peer.AddPath();
+        stalled_peer.BlockPath(path, true);
+        stalled_peer.SwitchPath(path);
+        stalled_peer.Send(stalled_stream, "probe");
+        stalled_peer.Pump(Milliseconds(1));
+    }
+
+    auto pump_all = [&] {
+        for (auto& client : clients) client.peer->Pump(Milliseconds(1));
+        for (size_t step = 0; step < 32; ++step) {
+            std::array<char, 4096> bytes{};
+            sockaddr_in source{};
+            socklen_t length = sizeof(source);
+            const auto count = ::recvfrom(udp_target.Fd(), bytes.data(), bytes.size(),
+                MSG_DONTWAIT, reinterpret_cast<sockaddr*>(&source), &length);
+            if (count < 0) {
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                throw std::system_error(errno, std::generic_category(), "receive concurrent UDP");
+            }
+            std::string reply(bytes.data(), static_cast<size_t>(count));
+            reply.append(reinterpret_cast<const char*>(&source.sin_port), 2);
+            const auto sent = ::sendto(udp_target.Fd(), reply.data(), reply.size(), MSG_NOSIGNAL,
+                reinterpret_cast<const sockaddr*>(&source), sizeof(source));
+            ASSERT_EQ(sent, static_cast<ssize_t>(reply.size()));
+        }
+    };
+
+    auto decode_udp_reply = [](std::string_view wire, uint32_t expected_session,
+                               std::string_view expected_address) {
+        udp::Require(wire.size() >= 9 &&
+            ReadBigEndian(wire.substr(0, 4)) == expected_session &&
+            static_cast<uint8_t>(wire[7]) == 1, "concurrent HY2 UDP header mismatch");
+        const size_t width = size_t{1} << (static_cast<uint8_t>(wire[8]) >> 6);
+        udp::Require(width <= wire.size() - 8, "truncated concurrent HY2 UDP address width");
+        size_t length = static_cast<uint8_t>(wire[8]) & 0x3f;
+        for (size_t i = 1; i < width; ++i)
+            length = (length << 8) | static_cast<uint8_t>(wire[8 + i]);
+        udp::Require(length <= wire.size() - 8 - width &&
+            wire.substr(8 + width, length) == expected_address,
+            "concurrent HY2 UDP source address mismatch");
+        return std::string(wire.substr(8 + width + length));
+    };
+
+    for (size_t round = 0; round < rounds; ++round) {
+        for (size_t i = 0; i < clients.size(); ++i) {
+            if ((round & 1) == 0) {
+                const auto path = clients[i].peer->AddPath();
+                clients[i].peer->SwitchPath(path);
+            } else {
+                clients[i].peer->SwitchPath(0);
+            }
+        }
+        std::vector<int64_t> ephemeral_streams(clients.size(), -1);
+        std::vector<std::string> ephemeral_expected(clients.size());
+        std::vector<std::string> udp_expected(clients.size());
+        for (size_t i = 0; i < clients.size(); ++i) {
+            auto& client = clients[i];
+            const auto chunk = "p-" + std::to_string(i) + "-" + std::to_string(round) + ":";
+            client.peer->Send(client.persistent_stream, chunk);
+            client.persistent_expected += chunk;
+
+            const size_t payload_bytes = (round % 4) == 0 ? 72 * 1024 : 1024;
+            ephemeral_expected[i] = "ephemeral-" + std::to_string(i) + "-" +
+                std::to_string(round) + ":" +
+                std::string(payload_bytes, static_cast<char>('a' + (round % 26)));
+            ephemeral_streams[i] = client.peer->Open(tcp_address, ephemeral_expected[i]);
+
+            if ((round % 3) == 0) {
+                const auto reset_id = client.peer->Open(tcp_address, "aborted-request");
+                client.peer->Reset(reset_id);
+            }
+
+            udp_expected[i] = "udp-" + std::to_string(i) + "-" + std::to_string(round);
+            const auto packet_id = static_cast<uint16_t>(round * 8 + 1);
+            if ((round & 1) == 0) {
+                client.peer->SendDatagram(UdpWire(
+                    client.udp_session, packet_id, 0, 1, udp_address, udp_expected[i]));
+            } else {
+                const auto head = udp_expected[i].substr(0, 4);
+                const auto tail = udp_expected[i].substr(4);
+                client.peer->SendDatagram(UdpWire(
+                    client.udp_session, packet_id, 1, 2, {}, tail));
+                client.peer->SendDatagram(UdpWire(
+                    client.udp_session, packet_id, 0, 2, udp_address, head));
+            }
+        }
+
+        const auto deadline = std::chrono::steady_clock::now() + 15s;
+        auto next_udp_retry = std::chrono::steady_clock::now() + 200ms;
+        std::vector<bool> ephemeral_closing(clients.size(), false);
+        std::vector<bool> udp_done(clients.size(), false);
+        for (;;) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                for (size_t i = 0; i < clients.size(); ++i) {
+                    std::cerr << "timeout round=" << round << " client=" << i
+                              << " persistent_ok=" << clients[i].peer->PayloadEquals(
+                                     clients[i].persistent_stream, clients[i].persistent_expected)
+                              << " ephemeral_ok=" << clients[i].peer->PayloadEquals(
+                                     ephemeral_streams[i], ephemeral_expected[i])
+                              << " ephemeral_closed=" << clients[i].peer->StreamClosed(ephemeral_streams[i])
+                              << " udp_done=" << udp_done[i]
+                              << " (" << clients[i].peer->DescribeStream(ephemeral_streams[i]) << ")\n";
+                }
+                tcp_target.Join();
+                FAIL() << "concurrent migration round=" << round << " timed out";
+            }
+            pump_all();
+            const auto now = std::chrono::steady_clock::now();
+            const bool retry_udp = now >= next_udp_retry;
+            if (retry_udp) next_udp_retry = now + 200ms;
+            bool all_done = true;
+            for (size_t i = 0; i < clients.size(); ++i) {
+                auto& client = clients[i];
+                if (!client.peer->PayloadEquals(client.persistent_stream, client.persistent_expected))
+                    all_done = false;
+                if (client.peer->PayloadEquals(ephemeral_streams[i], ephemeral_expected[i])) {
+                    if (!ephemeral_closing[i]) {
+                        client.peer->Send(ephemeral_streams[i], "", true);
+                        ephemeral_closing[i] = true;
+                    }
+                    if (!client.peer->StreamClosed(ephemeral_streams[i]))
+                        all_done = false;
+                } else {
+                    all_done = false;
+                }
+                if (!udp_done[i]) {
+                    if (client.peer->HasDatagram()) {
+                        const auto wire = client.peer->ReadDatagram();
+                        const auto body = decode_udp_reply(wire, client.udp_session, udp_address);
+                        ASSERT_EQ(body.size(), udp_expected[i].size() + 2);
+                        EXPECT_EQ(body.substr(0, udp_expected[i].size()), udp_expected[i]);
+                        uint16_t port_bytes = 0;
+                        std::memcpy(&port_bytes, body.data() + udp_expected[i].size(), 2);
+                        if (client.origin_udp_port == 0) client.origin_udp_port = port_bytes;
+                        EXPECT_EQ(port_bytes, client.origin_udp_port)
+                            << "concurrent migration replaced AnyTLS UoT UDP association";
+                        udp_done[i] = true;
+                    } else {
+                        if (retry_udp) {
+                            const auto packet_id = static_cast<uint16_t>(round * 8 + 1);
+                            client.peer->SendDatagram(UdpWire(
+                                client.udp_session, packet_id, 0, 1, udp_address, udp_expected[i]));
+                        }
+                        all_done = false;
+                    }
+                }
+            }
+            if (all_done) break;
+        }
+    }
+
+    for (auto& client : clients) {
+        EXPECT_FALSE(client.peer->Closed());
+        client.peer->Send(client.persistent_stream, "", true);
+    }
+    const auto close_deadline = std::chrono::steady_clock::now() + 10s;
+    for (;;) {
+        ASSERT_LT(std::chrono::steady_clock::now(), close_deadline);
+        pump_all();
+        const bool closed = std::all_of(clients.begin(), clients.end(), [](const auto& client) {
+            return client.peer->StreamClosed(client.persistent_stream);
+        });
+        if (closed) break;
+    }
+    EXPECT_EQ(server.Stop(10s), 0);
+    EXPECT_EQ(upstream.Stop(10s), 0);
+    tcp_target.Join();
+    std::string logs = ReadFile(server.LogPath());
+    for (const auto& entry : std::filesystem::directory_iterator(root.Path() / "logs")) {
+        if (entry.is_regular_file()) logs += ReadFile(entry.path());
+    }
+    EXPECT_NE(logs.find("QUIC passive handoff committed"), std::string::npos);
+    EXPECT_NE(logs.find("path_evidence=challenge"), std::string::npos);
+    EXPECT_NE(logs.find("path_evidence=reused"), std::string::npos);
+}
 } // namespace
 } // namespace cnode::e2e::quic
