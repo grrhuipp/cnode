@@ -34,13 +34,6 @@ namespace wire = ::transport::internet::hysteria;
 
 constexpr size_t kMaxRequestHeaderBytes = 8192;
 
-net::io_context& SessionReactor(net::io_context& fallback) noexcept {
-    if (auto domain = ExecutionDomain::Current()) {
-        return domain->Reactor();
-    }
-    return fallback;
-}
-
 struct TcpRequest {
     TargetAddress target;
     // Request-stream bytes that followed the header in the same read.
@@ -137,7 +130,7 @@ public:
             BindInboundRequestTarget(
                 ctx, InboundRequestTarget{Network::UDP, session->FirstTarget()});
             co_return co_await dispatcher.Dispatch(
-                SessionReactor(io_context), receiver.dispatch_policy, std::move(stream),
+                io_context, receiver.dispatch_policy, std::move(stream),
                 transport::Link{session, session}, InitialPayload{},
                 ctx, stats_, timeouts);
         }
@@ -172,7 +165,7 @@ public:
 
         auto* tcp_stream = stream.get();
         co_return co_await dispatcher.Dispatch(
-            SessionReactor(io_context), receiver.dispatch_policy, std::move(stream),
+            io_context, receiver.dispatch_policy, std::move(stream),
             transport::Link{tcp_stream, tcp_stream},
             std::move(initial_payload),
             ctx, stats_, timeouts);

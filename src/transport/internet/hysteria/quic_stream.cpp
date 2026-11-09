@@ -15,12 +15,13 @@
 namespace transport::internet::hysteria {
 
 QuicStreamState::QuicStreamState(
+    net::io_context& io_context,
     int64_t stream_id,
     std::weak_ptr<Connection> owner)
-    : domain_(ExecutionDomain::Current())
+    : io_context_(io_context)
     , stream_id_(stream_id)
     , owner_(std::move(owner))
-    , input_signal_(domain_->Executor(), 1) {}
+    , input_signal_(io_context.get_executor(), 1) {}
 
 bool QuicStreamState::PushInput(std::span<const uint8_t> data, bool fin) {
     if (cancelled_ || input_done_ ||
@@ -154,7 +155,7 @@ void QuicStreamState::CheckWriteOpen() const {
 net::awaitable<void> QuicStreamState::WaitWritable() {
     CheckWriteOpen();
     if (!output_wait_)
-        output_wait_ = std::make_unique<OutputWait>(domain_->Executor());
+        output_wait_ = std::make_unique<OutputWait>(io_context_.get_executor());
     struct PendingWriteWait {
         QuicStreamState& owner;
         OutputWait& wait;
@@ -259,7 +260,7 @@ UdpSessionStream::UdpSessionStream(
     : session_id_(session_id)
     , first_target_(std::move(first_target))
     , owner_(std::move(owner))
-    , signal_(ExecutionDomain::Current()->Executor(), 1)
+    , signal_(io_context.get_executor(), 1)
     , deadline_(io_context, *this) {}
 
 UdpSessionStream::~UdpSessionStream() noexcept {

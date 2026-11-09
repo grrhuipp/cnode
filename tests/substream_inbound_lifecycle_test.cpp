@@ -45,74 +45,56 @@ void Check(bool condition, const char* message) {
 // The coordinator stays alive until domain services and reserved returns drain.
 class DomainFixture {
     using UserStore = proxyman::inbound::UserStore;
-    struct Hooks final : ExecutionDomain::Hooks {
-        memory::AllocationDomain memory;
-        std::optional<memory::ScopedAllocationDomain> allocation;
-        UserStore::WorkerView users;
-        UserStore::WorkerView previous_users;
-
-        void Enter() noexcept override {
-            allocation.emplace(memory);
-            previous_users = UserStore::ExchangeWorkerView(users);
-        }
-        void Leave() noexcept override {
-            users = UserStore::ExchangeWorkerView(std::move(previous_users));
-            allocation.reset();
-        }
-        void OnFailure(std::exception_ptr) noexcept override { std::terminate(); }
-    };
 
 public:
     explicit DomainFixture(net::io_context& io)
-        : io_(io), hooks_(std::make_shared<Hooks>()),
+        : io_(io),
           previous_users_(UserStore::ExchangeWorkerView({})),
           coordinator_(std::make_shared<GroupCoordinator>(io)) {
         coordinator_->RegisterWorker(0, io, io.get_executor());
-        domain_ = ExecutionDomain::Create(io, 0, io.get_executor(), hooks_, coordinator_);
-        hooks_->memory.SetLeaseGroup(domain_->LeaseIdentity(), &ExecutionDomain::SharesLeaseIdentity);
     }
     ~DomainFixture() {
         Shutdown();
-        memory::ScopedAllocationDomain allocation(hooks_->memory);
-        hooks_->users.reset();
+        memory::ScopedAllocationDomain allocation(memory_);
+        users_.reset();
         UserStore::InstallWorkerView(std::move(previous_users_));
     }
 
-    memory::AllocationDomain& Memory() noexcept { return hooks_->memory; }
-    net::any_io_executor Executor() { return domain_->Executor(); }
+    memory::AllocationDomain& Memory() noexcept { return memory_; }
+    net::any_io_executor Executor() { return io_.get_executor(); }
 
     void InstallUsers(std::span<const UserStore::UserUpdate> updates) {
         auto snapshot = UserStore::PrepareUsers(updates);
         auto view = UserStore::PrepareWorkerView(snapshot);
         UserStore::CommitSnapshot(std::move(snapshot));
-        hooks_->users = view;
+        users_ = view;
         UserStore::InstallWorkerView(std::move(view));
     }
 
     void Shutdown() {
-        if (!domain_) return;
-        memory::ScopedAllocationDomain allocation(hooks_->memory);
+        if (!coordinator_) return;
+        memory::ScopedAllocationDomain allocation(memory_);
         coordinator_->CloseAdmission();
         std::exception_ptr failure;
         bool joined = false;
         net::co_spawn(io_, [this]() -> net::awaitable<void> {
             co_await coordinator_->AsyncJoin();
             coordinator_->ReleaseServices();
-            domain_.reset();
             co_await coordinator_->Finalize();
         }, [&](std::exception_ptr error) { failure = error; joined = true; });
         io_.restart();
         io_.poll();
+        coordinator_.reset();
         Check(joined && !failure && io_.stopped(),
-              "coordinator must join controls, retire domains, and finalize returns without pending work");
+              "coordinator must join controls and finalize returns without pending work");
     }
 
 private:
     net::io_context& io_;
-    std::shared_ptr<Hooks> hooks_;
+    memory::AllocationDomain memory_;
+    UserStore::WorkerView users_;
     UserStore::WorkerView previous_users_;
     std::shared_ptr<GroupCoordinator> coordinator_;
-    std::shared_ptr<ExecutionDomain> domain_;
 };
 
 void Frame(std::vector<uint8_t>& out, uint8_t command, uint32_t sid,

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "transport/async_stream.hpp"
+#include "transport/internet/tcp_stream.hpp"
 #include <openssl/ossl_typ.h>
 #include <memory>
 #include <string>
@@ -14,6 +15,20 @@ struct RealityServerConnState;
 struct RealityConfig;
 struct TlsConfig;
 class AutoSignContextRenewal;
+struct DetachedTlsState {
+    DetachedTcpState tcp;
+    SSL* ssl = nullptr;
+    bool is_server = true;
+    bool handshake_done = true;
+    std::vector<uint8_t> plaintext_prefix;
+
+    DetachedTlsState() noexcept = default;
+    ~DetachedTlsState() noexcept;
+    DetachedTlsState(DetachedTlsState&& other) noexcept;
+    DetachedTlsState& operator=(DetachedTlsState&& other) noexcept;
+    DetachedTlsState(const DetachedTlsState&) = delete;
+    DetachedTlsState& operator=(const DetachedTlsState&) = delete;
+};
 // ============================================================================
 // OpenSSL 上下文管理（RAII）
 // ============================================================================
@@ -123,12 +138,18 @@ public:
     // then read the raw TCP stream without touching the independent writer.
     [[nodiscard]] bool EnableRawRead() noexcept override;
 
+    [[nodiscard]] std::optional<DetachedTlsState> DetachForHandoff(
+        std::span<const uint8_t> plaintext_prefix = {});
+    [[nodiscard]] static std::unique_ptr<TlsStream> RestoreFromHandoff(
+        net::io_context& io_context, DetachedTlsState state);
 protected:
     TcpStream* BaseTcpStream() override;
     const TcpStream* BaseTcpStream() const override;
 
 private:
     struct Impl;
+    TlsStream(std::unique_ptr<TcpStream> inner, SSL* existing_ssl,
+              bool is_server, bool handshake_done);
 
     SSL* NativeSsl() noexcept;
     const SSL* NativeSsl() const noexcept;

@@ -2,10 +2,13 @@
 
 #include "common/allocator.hpp"
 #include "connection_timeouts.hpp"
-#include "native_socket_handoff.hpp"
 #include "transport/link_error.hpp"
 
+#include <asio/as_tuple.hpp>
+#include <asio/bind_allocator.hpp>
+#include <asio/bind_cancellation_slot.hpp>
 #include <asio/ip/v6_only.hpp>
+#include <asio/use_awaitable.hpp>
 
 #include <algorithm>
 #include <array>
@@ -77,16 +80,14 @@ void ValidateBuffers(
 }
 }  // namespace
 
-struct DatagramSocket::Impl final : memory::ThreadAllocated,
-                                    detail::NativeSocketHandoff<udp> {
+struct DatagramSocket::Impl final : memory::ThreadAllocated {
     using Timeouts = detail::ConnectionTimeouts<Impl>;
 
     Impl(net::io_context& io_context, const net::ip::address& bind_address)
-        : NativeSocketHandoff(udp::socket(detail::CurrentSocketReactor(io_context)))
-        , timeouts(detail::CurrentSocketReactor(io_context), *this)
-        , ipv6(bind_address.is_v6())
-        , budget(ActiveBudget()) {
-        if (budget->load(std::memory_order_relaxed) >= kMaxActiveSockets)
+        : socket(io_context)
+        , timeouts(io_context, *this)
+        , ipv6(bind_address.is_v6()) {
+        if (active_sockets >= kMaxActiveSockets)
             ThrowLink(ErrorCode::RESOURCE_EXHAUSTED);
         IoErrorCode ec;
         socket.open(ipv6 ? udp::v6() : udp::v4(), ec);
@@ -101,15 +102,48 @@ struct DatagramSocket::Impl final : memory::ThreadAllocated,
         // readiness must report would_block instead of blocking the Worker.
         socket.non_blocking(true, ec);
         if (ec) throw IoSystemError(ec);
-        budget->fetch_add(1, std::memory_order_relaxed);
+        ++active_sockets;
         counted = true;
     }
 
     ~Impl() noexcept { Close(ErrorCode::CANCELLED); }
 
     void OnTimeout(ErrorCode reason) noexcept { Close(reason); }
-    void HandoffFailed() noexcept override { Close(ErrorCode::CANCELLED); }
 
+    void MarkCancelled() noexcept { ++cancellation_epoch_; }
+
+    net::awaitable<IoErrorCode> Wait(
+        udp::socket::wait_type type, net::cancellation_slot cancellation) {
+        struct State {
+            net::cancellation_signal native;
+            bool cancelled = false;
+        } state;
+        struct Subscription {
+            net::cancellation_slot slot;
+            ~Subscription() { if (slot.is_connected()) slot.clear(); }
+        } subscription{cancellation};
+        const auto cancelled_at = cancellation_epoch_;
+        if (state.cancelled || cancelled_at != cancellation_epoch_)
+            co_return IoErrorCode(io_error::operation_aborted);
+        if (cancellation.is_connected()) {
+            cancellation.assign([&state](net::cancellation_type kind) {
+                if (kind == net::cancellation_type::none) return;
+                state.cancelled = true;
+                state.native.emit(kind);
+            });
+        }
+        auto [error] = co_await socket.async_wait(
+            type,
+            net::bind_cancellation_slot(
+                state.native.slot(),
+                net::bind_allocator(
+                    memory::ProcessAllocator<std::byte>{},
+                    net::as_tuple(net::use_awaitable))));
+        state.native.slot().clear();
+        if (state.cancelled || cancelled_at != cancellation_epoch_)
+            co_return IoErrorCode(io_error::operation_aborted);
+        co_return error;
+    }
     void Close(ErrorCode reason) noexcept {
         if (closed) return;
         closed = true;
@@ -122,7 +156,7 @@ struct DatagramSocket::Impl final : memory::ThreadAllocated,
         socket.cancel(ignored);
         socket.close(ignored);
         if (counted) {
-            budget->fetch_sub(1, std::memory_order_relaxed);
+            --active_sockets;
             counted = false;
         }
     }
@@ -152,9 +186,11 @@ struct DatagramSocket::Impl final : memory::ThreadAllocated,
     net::awaitable<void> SendMultiBuffer(
         WriteOperation& operation, udp::endpoint destination, buf::MultiBuffer payload);
 
+    udp::socket socket;
     Timeouts timeouts;
     transport::CancellationSource cancellation;
     uint64_t generation = 0;
+    uint64_t cancellation_epoch_ = 0;
     ErrorCode cancellation_reason = ErrorCode::OK;
     bool ipv6 = false;
     bool closed = false;
@@ -162,14 +198,7 @@ struct DatagramSocket::Impl final : memory::ThreadAllocated,
     bool read_active = false;
     bool write_active = false;
 
-    // Keep the original admission bucket stable when a session changes Worker.
-    // Only socket admission/close touches this cross-thread control metadata.
-    std::shared_ptr<std::atomic<std::size_t>> budget;
-    inline static thread_local std::shared_ptr<std::atomic<std::size_t>> active_budget;
-    static std::shared_ptr<std::atomic<std::size_t>> ActiveBudget() {
-        if (!active_budget) active_budget = std::make_shared<std::atomic<std::size_t>>(0);
-        return active_budget;
-    }
+    inline static thread_local std::size_t active_sockets = 0;
 };
 
 net::awaitable<ReceivedDatagram> DatagramSocket::Impl::Receive(ReadOperation& operation) {
@@ -451,7 +480,7 @@ udp::endpoint DatagramSocket::LocalEndpoint() const {
 }
 
 std::size_t DatagramSocket::ActiveCount() noexcept {
-    return Impl::active_budget ? Impl::active_budget->load(std::memory_order_relaxed) : 0;
+    return Impl::active_sockets;
 }
 
 }  // namespace transport::internet

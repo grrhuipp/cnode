@@ -1,5 +1,4 @@
 #include "transport/internet/transport_dialer.hpp"
-#include "app/session_group_executor.hpp"
 #include "common/buffer_util.hpp"
 #include "transport/internet/async_write_gate.hpp"
 #include "common/session.hpp"
@@ -251,9 +250,6 @@ protected:
         }
     }
     net::io_context& CurrentIoContext() const noexcept {
-        if (const auto domain = ExecutionDomain::Current()) {
-            return domain->Reactor();
-        }
         return io_context_;
     }
 

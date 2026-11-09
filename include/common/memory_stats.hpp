@@ -22,19 +22,4 @@ inline void OnBufferNew() noexcept {}
 inline void OnBufferFree() noexcept {}
 #endif
 
-#ifdef CNODE_MEMORY_STATS
-namespace detail {
-inline std::atomic<uint64_t> g_remote_frees{0};
-}  // namespace detail
-
-inline void OnRemoteFree() noexcept {
-    detail::g_remote_frees.fetch_add(1, std::memory_order_relaxed);
-}
-inline uint64_t RemoteFreeCount() noexcept {
-    return detail::g_remote_frees.load(std::memory_order_relaxed);
-}
-#else
-inline void OnRemoteFree() noexcept {}
-inline uint64_t RemoteFreeCount() noexcept { return 0; }
-#endif
 }  // namespace memory

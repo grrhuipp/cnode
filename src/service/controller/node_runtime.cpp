@@ -90,17 +90,11 @@ net::awaitable<bool> NodeRuntime::AddInbound(const PreparedInbound& inbound) {
     try {
         std::vector<InboundInstallFailure> installed(
             workers_.size(), InboundInstallFailure::None);
-        co_await RunWorkerMutationBatch(
-            io_context_.get_executor(), workers_,
-            [&](Worker& worker, size_t index) {
-                return [](NodeRuntime* runtime, Worker* current,
-                          const PreparedInbound* prepared,
-                          InboundInstallFailure* result) -> net::awaitable<void> {
-                    runtime->ThrowIfStopping();
-                    *result = co_await current->PostTask(
-                        InstallInbound(*current, *prepared));
-                }(this, &worker, &inbound, &installed[index]);
-            });
+        for (size_t index = 0; index < workers_.size(); ++index) {
+            ThrowIfStopping();
+            installed[index] = co_await workers_[index]->PostTask(
+                InstallInbound(*workers_[index], inbound));
+        }
 
         const auto failed = std::ranges::find_if(
             installed, [](InboundInstallFailure result) {

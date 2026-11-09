@@ -50,33 +50,6 @@ TEST_P(Http2WorkerMigration, SourceIndependentSessionsMergeAndDetachWithActiveRe
             for (auto& exchange : exchanges) exchange->Join();
         }
         node.child->Signal(SIGTERM); EXPECT_EQ(node.child->Wait(8s), 0);
-    } else if (mode == "h2-merge") {
-        Peer left(node.port, tls, "xhttp", "127.0.0.2"), right(node.port, tls, "xhttp", "127.0.0.3");
-        left.Ping("physical"); right.Ping("physical");
-        left.Down(1, "left"); right.Down(1, "right");
-        left.Packet(3, "left", 0, VlessRequest(target.Port(), "left-live")); right.Packet(3, "right", 0, VlessRequest(target.Port(), "right-live"));
-        std::string expected[2]{std::string(2, '\0') + "left-live", std::string(2, '\0') + "right-live"};
-        left.Message(1, expected[0]); right.Message(1, expected[1]);
-        Peer bridge(node.port, tls, "xhttp", "127.0.0.4"); bridge.Ping("physical");
-        std::map<Peer*, uint32_t> next{{&left, 5}, {&right, 5}, {&bridge, 1}};
-        for (unsigned sequence = 1; sequence <= 12; ++sequence) {
-            auto* source = sequence % 2 ? &bridge : sequence % 4 ? &left : &right;
-            for (unsigned i = 0; i < 2; ++i) {
-                const auto payload = BigEndian(i, 4) + BigEndian(sequence, 4) + Pattern(251 * 9);
-                auto sid = next[source]; next[source] += 2;
-                source->Packet(sid, i ? "right" : "left", sequence, payload); source->Committed(sid);
-                expected[i] += payload; (i ? right : left).Message(1, expected[i]);
-            }
-            left.Ping("leftlive"); right.Ping("rightliv"); bridge.Ping("joined!!");
-        }
-        bridge.wire.Abort();
-        for (unsigned i = 0; i < 2; ++i) {
-            auto name = i ? "right" : "left"; auto payload = std::string(name) + "-after-detach";
-            H1Packet(node.port, tls, name, 13, payload, "127.0.0." + std::to_string(80 + i));
-            expected[i] += payload; (i ? right : left).Message(1, expected[i]);
-        }
-        EXPECT_FALSE(left.closed); EXPECT_FALSE(right.closed);
-        node.child->Signal(SIGTERM); EXPECT_EQ(node.child->Wait(8s), 0);
     } else {
         ASSERT_NE(extra, node.port);
         Peer first(node.port, tls, "xhttp", "127.0.0.7"), second(extra, tls, "xhttp", "127.0.0.8");
@@ -92,6 +65,6 @@ TEST_P(Http2WorkerMigration, SourceIndependentSessionsMergeAndDetachWithActiveRe
     target.Join();
 }
 INSTANTIATE_TEST_SUITE_P(FourWorkersTcpTls, Http2WorkerMigration, testing::Combine(testing::Bool(), testing::Values(
-    std::string("packet-up"), std::string("stream-up"), std::string("h2-merge"), std::string("isolation"))));
+    std::string("packet-up"), std::string("stream-up"), std::string("isolation"))));
 } // namespace
 } // namespace cnode::e2e::http2

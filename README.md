@@ -1,6 +1,6 @@
 # cnode
 
-cnode 是面向 V2Board 面板的高性能 Linux 代理节点服务端。项目使用 C++20 协程、地址稳定的执行域和单 Worker 执行租约，将面板同步、配置归一化、协议处理和流量转发拆成清晰的运行边界。
+cnode 是面向 V2Board 面板的高性能 Linux 代理节点服务端。项目使用 C++20 协程与无共享（Share-Nothing）同构 Worker 架构，将面板同步、配置归一化、协议处理和流量转发拆成清晰的运行边界。
 
 ## 文档分工
 
@@ -16,7 +16,7 @@ cnode 是面向 V2Board 面板的高性能 Linux 代理节点服务端。项目�
 - 支持 TCP、TLS、WebSocket、PROXY protocol、QUIC、原生 datagram、UDP-over-TCP 和 Mux/子流。
 - 支持单进程接入多个 V2Board 面板和多个节点。
 - 支持 geoip、geosite、域名、IP、端口、协议、用户等路由条件。
-- 默认按多数据 Worker 运行；各数据 Worker 同构，通过 `SO_REUSEPORT` 分别拥有监听和转发资源。主线程作为唯一主控 Worker，面板、监控与 DNS 共用一个事件循环；数据 Worker 通过有界入口提交 DNS 请求。
+- 默认按多数据 Worker 运行；各数据 Worker 同构，通过 `SO_REUSEPORT` 分别拥有监听和转发资源。主线程运行唯一主控事件循环，面板、监控、DNS 与全局准入协调器共用该事件循环；数据 Worker 通过有界入口交互。
 - 部署脚本 `scripts/cnode.sh` 不带参数时更新默认线上二进制及 `geoip.dat`、`geosite.dat`，不改写既有配置。二进制先下载到同目录临时文件并校验版本，再原子替换；下载、空文件或版本校验失败时保留原二进制，不停止现有服务。二进制或 geo 数据变化后重启原本运行中的服务；geo 下载失败保留旧数据。`-variant <name>` 可选择 release 变体，`-debug_file true` 会额外下载匹配的 `.debug` 符号文件。
 
 ## 构建与测试
@@ -72,7 +72,7 @@ TCP 发送基准通过真实回环连接测量 1 B / 8 KiB / 64 KiB 突发，分
 
 UDP 发送基准覆盖 0 / 1 / 1200 / 60000 B 的真实回环报文，分别使用缓冲描述符与拥有型 `MultiBuffer` 两个发送入口，每格预热 128 轮、测量 4096 轮，校验完整报文和源端点。CPU 包含同进程收发双方与校验；拥有型路径还包含载荷构造和释放，不含夹具初始化与接收缓冲准备。输出每报文 CPU/墙钟耗时、拦截到的分配次数、池映射及进程 RSS，不代表守护进程单侧 CPU 或公网吞吐。单独运行可用 `mise exec -- ctest --test-dir build/musl --no-tests=error -R '^benchmark\.UdpSendBenchmark\.' -V`。
 
-执行器微基准与守护进程使用相同的全局 mimalloc 分配器，覆盖属性适配、work tracking 的复制与释放，以及每批 1/8/64 个任务的真实投递执行。生命周期阶段预热 4096 轮、测量 262144 轮；投递阶段预热 128 批、测量 4096 批，逐批排空并校验执行顺序、执行域与 checksum。输出每操作 CPU/墙钟耗时及 tracked/untracked 执行器尺寸；CPU 包含对应阶段的构造、释放、队列调度与校验开销，不包含夹具初始化。
+执行器微基准与守护进程使用相同的全局 mimalloc 分配器，覆盖属性适配、work tracking 的复制与释放，以及每批 1/8/64 个任务的真实投递执行。生命周期阶段预热 4096 轮、测量 262144 轮；投递阶段预热 128 批、测量 4096 批，逐批排空并校验执行顺序与 checksum。输出每操作 CPU/墙钟耗时及 tracked/untracked 执行器尺寸；CPU 包含对应阶段的构造、释放、队列调度与校验开销，不包含夹具初始化。
 
 SS2022 TCP 身份匹配微基准覆盖 1/16/256/4096 个用户、无 identity key 或 1/4 个 key 组、输入首/中/末用户及 hint 命中/失效/缺失；失效 hint 在新旧实现中指向同一名其他用户。每格预热 32 次、默认测量 512 次，可用 `CNODE_BENCH_ITERATIONS` 调整。计时包含生产认证函数、协程驱动、结果校验与释放，不含客户端握手报文准备；这是认证微基准，不覆盖 TCP 传输或完整入站的重放检查。
 
@@ -139,7 +139,7 @@ mise exec -- ctest --test-dir build/musl --output-on-failure --no-tests=error --
 
 Xray 使用 `-DCNODE_REFERENCE_XRAY=/path/to/xray`，要求 `v26.10.31` 对应版本；Hysteria v1/v2 分别使用 `CNODE_REFERENCE_HYSTERIA1`、`CNODE_REFERENCE_HYSTERIA2`，可独立配置。Hysteria 支持带干净版本元数据的源码构建，以及按精确 SHA256 固定的[官方 v2.13.0 Linux amd64 发布文件](https://github.com/HyNetworks/hysteria/releases/tag/app/v2.13.0)。参考测试通过 `CNODE_REFERENCE_GO` 检查来源和构建元数据；AnyTLS 必须同时提供客户端与服务端。不配置参考程序时只注册本地可控对端 E2E，不把缺失参考程序计为测试通过。
 
-HY2 被动迁移测试复用同一物理连接内的 32 条 TCP 流和 16 个 UDP 关联，要求日志确认 8 次跨 Worker 的 A→B→A 往返，并验证原出站端点和承载连接保持、独立连接持续可用及路径验证期间停机。覆盖 direct、VLESS-over-TCP、AnyTLS 三种出站；这不是 Port Hopping 测试，也不以 NAT 转发夹具的吞吐代表服务端性能。Linux/Bash 下准备好宿主 Go 和参考文件后：
+HY2 路径切换测试复用同一物理连接内的 32 条 TCP 流和 16 个 UDP 关联，要求确认 8 次跨路径的 A→B→A 往返，并验证原出站端点和承载连接保持、独立连接持续可用及路径验证期间停机。覆盖 direct、VLESS-over-TCP、AnyTLS 三种出站；这不是 Port Hopping 测试，也不以 NAT 转发夹具的吞吐代表服务端性能。Linux/Bash 下准备好宿主 Go 和参考文件后：
 
 ```sh
 mise run test:configure -- \
@@ -167,16 +167,15 @@ Inbound Handler::Process
   -> Relay
 ```
 
-原生 datagram、UDP-over-TCP 和 Mux/子流可以有必要的窄适配，例如 UDP framer、`DispatchUDP` 或 `DialUDP`。这些适配只服务主链路语义：inbound 解析并生成 metadata，dispatcher 做路由，outbound 使用所属执行域的出站资源，relay 以协议无关方式搬运数据。
+原生 datagram、UDP-over-TCP 和 Mux/子流可以有必要的窄适配，例如 UDP framer、`DispatchUDP` 或 `DialUDP`。这些适配只服务主链路语义：inbound 解析并生成 metadata，dispatcher 做路由，outbound 使用所属 Worker 的出站资源，relay 以协议无关方式搬运数据。
 
 运行时主链路：
 
 ```text
 main
   -> bootstrap
-  -> Worker(per-core)
+  -> Worker(per-core, Share-Nothing / Pin-to-Origin)
   -> listener / accept
-  -> ExecutionDomain / session group
   -> TransportStack(TCP / TLS / WebSocket / PROXY protocol)
   -> InboundHandler(VMess / VLESS / Trojan / Shadowsocks / AnyTLS / Hysteria / Hysteria2)
   -> Dispatcher::Dispatch(immutable DispatchPolicy)
@@ -189,22 +188,19 @@ main
   -> Relay(TCP / UDP / Mux)
 ```
 
-每个数据 Worker 独立绑定同一组 `SO_REUSEPORT` 端口，并且各自持有唯一完整的 Worker-local 多级 PMR 池。物理连接只持有轻量分配域和按阶段借用的 arena，不复制尺寸类表、large-bin、空闲队列或 reclaimer；小对象由同一 Worker 上的连接共用 slab，运行期 payload、Buffer、子流及可扩缩容器逐块借还。会话迁移后新分配使用当前 Worker 池，旧块按槽头记录的来源进入原 Worker 的 remote-free 队列，由原 Worker 回收，绝不跨线程直接操作 `unsynchronized` pool。执行域在任一时刻只有一个 Worker 执行租约。XHTTP 请求按配置命名空间与 session id 在有界控制目录会合；跨 Worker 相遇时冻结相关会话组的用户回调、合并执行归属，再恢复运行。H2 物理连接上的多个 session 及桥接它们的连接一起合组，不拆分仍共享状态的宿主。原 reactor 只提交就绪通知，实际 socket 读写和协议处理在当前 owner 上执行，不把数据包持续转发到另一个 Worker。
+每个数据 Worker 独立绑定同一组 `SO_REUSEPORT` 端口，并且各自持有唯一完整的单线程 Worker-local 多级 PMR 池。连接与有状态会话一生固定在创建它的原 Worker（Origin Worker）上由原生 `io_context` 直接驱动，不设虚拟执行域、跨线程 remote-free 队列或运行期跨 Worker 会话搬迁。物理连接只持有轻量分配域和按阶段借用的 arena，不复制尺寸类表、large-bin、空闲队列或 reclaimer；小对象由同一 Worker 上的连接共用 slab，运行期 payload、Buffer、子流及可扩缩容器在所属 Worker 线程闭环借还。
 
-不再使用源地址 CBPF 亲和；同一 XHTTP session 可来自不同客户端／CDN 回源地址，无须设为 `workers: 1`。不共享状态的会话组仍独立调度，整个入站不会被固定到一个 Worker。短上传完成后事件驱动移除目录和域成员，迟到上传由有界 tombstone 拒绝，不在满容量路径逐次扫描整张会话表。面板、DNS 和跨域元数据操作仍通过有界控制入口交互。
+XHTTP 分离上行传输（Split-HTTP）由下行 `GET` 所在的原 Worker 唯一拥有完整会话、路由、出站连接与 Relay。当同 `session_id` 的独立上行连接（`stream-up` 或 `packet-up`）落到其他 Worker 时，收包 Worker 仅读取首个 HTTP 请求头识别 `session_id`，随即在该连接无在途 I/O、无出站与定时器的静止边界单次提取裸入站 `fd`（含 TLS 状态与预读字节）经有界控制入口移交原 Worker `assign` 接管；接管后该连接的所有后续请求与流字节均在原 Worker 本地原生读写，不跨 Worker 转发 `MultiBuffer` 载荷，也不跨 Worker 合组运行中的 HTTP/2 会话。短上传完成后事件驱动移除目录项，迟到上传由有界 tombstone 拒绝，不在满容量路径逐次扫描整张会话表。
 
-QUIC 与具有已认证会话身份的原生 UDP 关联只因同一会话的数据实际落到另一 Worker 而被动接管，不按负载或空闲定时迁移。QUIC 必须完成路径验证；SS2022 按配置、凭据和客户端会话身份隔离并保持唯一防重放状态。交接先冻结业务执行、排空原生 I/O 与回包，再将原 socket、协议状态、未完成读写和超时绑定到实际收包 Worker；失败回滚，不能恢复的会话关闭。仍在使用的出站连接一并接管，不重新拨号或更换本地端口，不移动共享入站监听 socket。TCP 重连是新连接，TCP 承载的 UoT 不单独迁移；无可验证会话身份的 UDP 不跨地址拼接关联。Hysteria2 仍只提供配置的服务端 UDP 端口，不实现端口跳跃。
+QUIC 入站（Hysteria2）由全部数据 Worker 以 `SO_REUSEPORT` 监听同一 UDP 端口；服务端签发的 SCID 内嵌所属 `worker_id`，监听 socket 组挂载 `SO_ATTACH_REUSEPORT_CBPF` 过滤器，对 Short Header 与带服务端 CID 的 Long Header 包按 DCID 在内核态直接投递至原 Worker，客户端 Initial 握手包按随机 DCID 前缀均匀分流。客户端路径变化（RFC 9000 连接迁移、NAT 重绑定）后数据包在内核层直达原 Worker，由原 Worker 执行路径验证并直接使用本 Worker 的监听 UDP socket 向新端点回包，原出站连接保持在原 Worker 本地不变。Hysteria2 仍只提供配置的服务端 UDP 端口，不实现端口跳跃。
 
-迁移准备和回滚的协程完成通知不等于原生执行回调已退出：返回控制面前必须经过来源 Worker 队列屏障，确认旧分配租约已释放，才允许目标校验或恢复业务。回归同时覆盖该通知顺序，以及真实 SS2022 换源时的防重放、旧路径拒绝和当前路径乱序接收。
+原生 UDP 入站关联及其出站资源（含原生 UDP socket 与 UDP-over-TCP 隧道/连接池流）均由接受并创建该关联的 Worker 本地独占；SS2022 按配置、凭据和客户端会话身份在所属 Worker 内隔离并维护防重放状态与 tombstone。
 
-执行域直接复用 Worker executor；Worker 路由在准入前冷注册，接入与接管只查询不可变路由，不加同步锁，也不在协调器中保留依赖 reactor 私有分配器的 `strand`。Worker 退出后的延迟析构不会访问失效服务。饱和到时钟上限的超时仍保留可取消的原生等待，取消或提前到期不因重新分配等待节点而失败。会话域的超时回调异常先取消本域剩余等待，再交给所属会话的失败入口；无会话归属的 Worker 回调异常向运行时传播，其他域的等待不被一并取消。
-
-监听前完成配置校验、路由编译、不可变策略和 TLS／REALITY 上下文准备；物理执行域只按实际协议与所选出口延迟创建运行态宿主，不复制整套 Worker runtime。控制面发布候选快照失败时保留旧配置。
+Worker 路由在准入前冷注册，主控协调器运行在主控事件循环上，统一承载跨连接会话目录、全局与按 IP 的连接配额、认证失败封禁计数、按用户的在线设备配额、VMess 重放检查及 VLESS 0-RTT 票据目录。监听前完成配置校验、路由编译、不可变策略和 TLS／REALITY 上下文准备；控制面发布候选快照失败时保留旧配置。
 
 数据 Worker 的监听标签、端点索引与 socket 控制块使用所属线程的 PMR。注销完成后移除注册项；尚未结束的 accept / receive 循环仅保留收束所需的退役状态，并在原 Worker 上释放，不累计空标签条目，也不把监听所有权带入每个请求。
 
-出站配置与认证凭据在冷路径准备为不可变快照，handler 持有该快照，不在各执行域内重复解析或深拷贝。AnyTLS 空闲池与 VLESS Encryption 票据宿主按原准入 Worker、配置快照与出站 tag 隔离，不因请求迁移改变命名空间。AnyTLS 物理连接具有独立执行域，借出时独占附着到请求会话组，使用期间随请求被动接管；请求结束后分离，健康连接按其当前 Worker 归入原池索引。借用只选择与请求当前 Worker 一致的连接，归池与复用都不主动迁移物理连接；不同活跃请求不并发借用同一物理连接。padding 更新在池宿主串行发布，借用时一并取得下一次握手的不可变快照，不在请求路径读取 `atomic<shared_ptr>`，也不修改其他已建立会话的 padding 状态。VLESS 请求按值借用票据并在宿主内条件发布，不因共享票据永久合并入站执行域。替换配置停止旧池的新借用，已有请求继续使用旧快照，结束后收束旧池任务。空 PMR 容器只弱引用轻量分配域，不延长已退役物理连接寿命；若该容器随后复用，则在首次分配前绑定当前执行域。
-
+出站配置与认证凭据在冷路径准备为不可变快照，handler 持有该快照，不在每次请求中重复解析或深拷贝。AnyTLS 空闲池由所属 Worker 本地独占，按配置快照与出站 tag 隔离；物理连接在所属 Worker 内创建、借用与归池，不同活跃请求不并发借用同一物理连接。padding 更新在池宿主串行发布，借用时一并取得下一次握手的不可变快照，不在请求路径读取 `atomic<shared_ptr>`，也不修改其他已建立会话的 padding 状态。替换配置停止旧池的新借用，已有请求继续使用旧快照，结束后收束旧池任务。空 PMR 容器只弱引用轻量分配域，不延长已退役物理连接寿命；若该容器随后复用，则在同线程首次分配前绑定当前分配域。
 proxyman / ingress 在冷路径准备 receiver 语义，公开 Dispatcher 只接收请求所需的窄契约；强制出口和未命中回退属于 Dispatcher 编排，Router 只回答“哪条路由规则命中”。每个 receiver 必须在构建时明确选择 `ForceOutbound` 或 `RouteWithFallback`，不存在 Worker 全局默认出口，也不存在可进入热路径的空策略。cnode 使用强类型、只读 `DispatchPolicy`，不把完整 `ReceiverSettings` 或可变配置 context 传入 Dispatcher。面板 `DetectRule` 由 Worker-local 实现通过通用 `RequestPolicy` 接口提供 allow / block 结果，不进入 Router，也不让 Dispatcher 依赖面板规则管理器。
 
 HTTP 与 HTTPUpgrade 只在建链阶段处理 HTTP 握手，完成后继续使用原来的 TCP / TLS 流，不保留长期透传包装。握手提前读到的应用数据由实际读端按原顺序承接；TLS 明文残留不会进入底层 TCP 密文缓冲。残留读完或读端关闭后释放，取消、半关闭与 TLS 关闭仍沿原传输链路生效。
@@ -249,10 +245,10 @@ DNS 缓存链路：
 | inbound | 认证、入站协议解析、用户识别、目标地址解析、session metadata、调用 dispatcher | 路由选择、出站连接、relay 细节、访问 outbound handler registry 内部结构 |
 | dispatcher | 接收只读 DispatchPolicy / session / link；编排 sniff、强制出口、Router 规则、显式 fallback、通用 RequestPolicy；选择 handler 并调用 outbound.Process | 接收完整 ReceiverSettings、依赖具体 DetectRule 策略实现、维护全局默认出口、解析协议、协议特判、执行 relay、读取 panel 字段 |
 | router | 通过 `routing::Router` 只读契约查询真实规则命中；冷路径一次构建并共享不可变规则 | 原地重配规则、强制出口、隐式默认出口、未命中 fallback、创建连接、访问 outbound handler registry / relay / 协议实现 |
-| request policy | 基于统一 session context 返回 allow / block；执行域内应用只读策略快照 | 路由选择、outbound handler 查找、协议解析、暴露面板原始字段 |
+| request policy | 基于统一 session context 返回 allow / block；Worker 内应用只读策略快照 | 路由选择、outbound handler 查找、协议解析、暴露面板原始字段 |
 | outbound | 建立目标连接或下一跳连接，执行出站协议握手和编码，交给 relay | 路由决策、读取 panel 原始配置、绕过 dispatcher |
 | relay | TCP / UDP / Mux 数据搬运和流量统计打点 | 解析协议、选择 outbound、访问 panel、暴露 wrapper API |
-| Worker | 事件循环、accept 生命周期、执行域调度、监听与原生 UDP 资源所有权 | 协议解析、路由、panel 同步、理解具体 validator 或 outbound 类型 |
+| Worker | 事件循环、accept 生命周期、本执行器监听、出站池与原生 UDP 资源所有权 | 协议解析、路由、panel 同步、理解具体 validator 或 outbound 类型 |
 | control plane | 面板同步、配置归一化、runtime 构建、快照发布、状态与流量上报 | 进入热路径、直接改 live handler、访问 Worker buffer provider |
 
 更完整的边界规则、禁止项和删除标准见 `AGENTS.md`。
@@ -376,7 +372,7 @@ bash scripts/cnode.sh -debug_file true
 - HTTP/2 客户端与服务端发送 DATA 均受连接及流窗口约束（RFC 9113 §6.9），额度不足时等待 WINDOW_UPDATE，其他流与控制帧仍可写出；`SETTINGS_INITIAL_WINDOW_SIZE` 按差值调整已打开流。接收按含 padding 的完整 DATA 负载计费，消费、丢弃或转入有界 Hunk 装配后才归还对应额度；关闭／重置返还未消费的连接额度，不复活已关闭流。窗口溢出或违规发送按对应的 FLOW_CONTROL_ERROR 处理，合法最大 Hunk 不依赖对端违反窗口才能完成。
 - HTTP/2 物理连接的连接额度按 `max(1, 活动逻辑请求数)` 计费；子流的绝对握手期限独立于物理写入背压，到期后释放该子流额度，不中止仍在传输的同伴。H1 XHTTP 完成 HTTP 建链后移除物理握手期限，分离的逻辑请求独立执行代理握手期限，正常转发不受旧期限影响。H1 XHTTP 以 `Content-Length` 上传的 packet-up 请求遵循 HTTP/1.1 持久连接（RFC 9112 §9.3），同一连接可承载后续及流水线请求；每个请求从首字节起享有独立握手期限，请求之间只受空闲超时约束。分块上传、HTTP/1.0 或任一 `Connection` 字段行含 `close` 的请求以 `Connection: close` 响应后关闭，其后流水线请求不再处理。H1 上传正文（packet-up、stream-up、stream-one）须恰好使用一种分帧（RFC 9112 §6.1–6.3）：单个合法 `Content-Length`，或唯一且只含 `chunked` 的 `Transfer-Encoding`；两者并存、重复或非法长度、其他传输编码及无分帧的请求一律拒绝，`Content-Length` 正文读满声明长度即结束，其后字节不进入上行。上传可能先于其下行 GET 到达：上传为未出现过的 id 建立 session，并在本请求期限内等待下行加入，同一 session 的多个等待上传在下行加入或 session 关闭时全部放行；已结束 session 的迟到上传读完正文后以 404 丢弃，连接与其上其他 session 的请求继续。无 session 的 POST（stream-one）在 H1 下以分块响应承载下行。XHTTP 每个逻辑 session 的已排队数据及并发上传共用 4 MiB payload Buffer 容量预算，最多 1024 个排队包和 64 个在途上传；拒绝超额上传不破坏已有会话。XHTTP `mode` 只接受 `auto`（或省略）、`packet-up`、`stream-up`、`stream-one`（不区分大小写），其他值在加载配置时报错。
 - VMess 和 Trojan 入站按协议结构增量读取握手；正常 TCP 分段或不完整 EOF 不计为认证失败。VMess 请求头声明未知的 body security 时在路由前拒绝。协议认证诊断不输出认证字节、AuthID、密码哈希片段或私钥文本。
-- VMess 重放检查与用户设备准入在单 owner 的有界控制服务中原子执行，跨 Worker 或迁移不能绕过。VMess 重放窗口为 180 秒、最多 65,536 项；容量满时拒绝新记录。
+- VMess 重放检查与用户设备准入在单 owner 的有界控制服务中原子执行，跨 Worker 不能绕过。VMess 重放窗口为 180 秒、最多 65,536 项；容量满时拒绝新记录。
 - Shadowsocks、VMess 和 VLESS 共用 AEAD 上下文操作；连接内复用算法与密钥状态，记录之间只更新 nonce。Shadowsocks 与 VMess（入站请求体和出站响应体）reader 在取消后保留不完整记录；认证失败、非法长度和残帧 EOF 报告错误，不当作正常结束；VMess 仅在记录边界上的传输 EOF 视为正常结束。原生 SS2022 association 的回包保留同一 server session ID，packet ID 连续推进，重放窗口按认证用户与 session ID 隔离。
 - WebSocket 升级要求 HTTP/1.1 GET、`Upgrade: websocket`、所有 `Connection` 字段行合并后的 `upgrade` token、版本 `13` 和解码后为 16 字节的握手 key。HTTPUpgrade 同样按多行 token 列表处理 `Connection`。HTTP chunked 长度及扩展共用解析契约，支持合法 quoted-string，拒绝溢出和畸形分帧。
 - WebSocket 的帧头、扩展长度、mask、控制帧和分片状态在读取取消后保留；数据帧收到多少便交付多少，不等待调用者缓冲填满。错误方向的 mask、非法长度／opcode／RSV、无效 UTF-8、非法 Close 和截断帧均报协议错误。PING、PONG、Close 与普通数据按完整物理帧串行写入；写入失败立即关闭底层连接。
@@ -398,7 +394,7 @@ bash scripts/cnode.sh -debug_file true
 - 原生 UDP 更换监听 socket 或注销入站时，先停止新请求并取消旧请求，再等待旧分发任务实际结束；删除 association 或关闭 socket 不等于请求完成。同 socket 的协议更新保留现有会话，旧请求继续使用创建时的元数据和分发策略，新请求使用新配置。
 - 原生 UDP 回包按 socket 保持一个在途发送任务；payload 按值存于该任务帧内，普通数据报出队不额外申请堆节点，也不逐包复制监听字符串键。旧 socket 的发送完成不能清除替换 socket 的活动队列；删除队列后，在途 payload 仍计入共享预算，直至 I/O 完成并释放。
 - `limits.maxConnections` 和 `limits.maxConnectionsPerIP` 使用未拆分的进程配置值，所有 Worker／入站共享，`0` 表示不限；不再按 Worker 数向上取整。物理连接保留一个额度 floor，额外并发逻辑请求增加额度。IP 跟踪满时拒绝新准入；半关闭仍在工作的请求继续占用额度，完整结束后通过预留控制通道归还，业务邮箱满或关闭不能丢失归还。
-- TCP 和原生 UDP 的 idle/read/write/phase 超时共用聚合状态，由所属执行域／原生资源调度器承载；逻辑读写结束或连接关闭时撤销预算。超时终止在通知取消前设置 abortive close，排队写数据不会在逻辑失败后无限期继续发送。连接级驻留任务组在没有实际子任务时只保存 executor，首次启动子任务才申请 join 状态和自持有组；取消与 join 语义不变。
+- TCP 和原生 UDP 的 idle/read/write/phase 超时共用聚合状态，由所属 Worker 的 TimeoutScheduler 承载；逻辑读写结束或连接关闭时撤销预算。超时终止在通知取消前设置 abortive close，排队写数据不会在逻辑失败后无限期继续发送。连接级驻留任务组在没有实际子任务时只保存 executor，首次启动子任务才申请 join 状态和自持有组；取消与 join 语义不变。
 - `info` 级别的周期资源日志按 `Runtime activity / memory / traffic / DNS cache`、`Process descriptors`、`Worker activity / memory / UDP resources / UDP traffic` 和 `Panel node totals` 分行输出，不把原有指标隐藏到 `debug`。`udp_listeners` 是当前注册的入站 socket 数，`udp_receive_loops` 包含尚未完成退役的接收任务，`udp_native_dispatches` 是尚未实际完成的原生 UDP 分发任务数，包含退休中的任务；association 记录归零不代表此计数也已归零，不统计 TCP 或 Mux 子流。`udp_resource_drops` 累计记录接收资源不足、处理分配失败或截断导致的丢包。队列指标是当前占用，不是累计吞吐；回包统计包含正在发送的包，`udp_reply_senders` 是活跃发送 socket 数。`timeout_heap=活跃事件数/索引容量` 区分当前超时占用与历史峰值容量保留；取消会立即移除索引，不保留过期节点。容量未回落不等于泄漏，PMR 映射量也不等于 RSS。FD 采样不可用时显示 `unknown`，不会伪报为零。这些日志用于故障前后的趋势对照，不能单凭重启恢复判定资源耗尽。
 - 本地日志格式与分流见[日志格式](#日志格式)。`loglevel` 取 `none`、`trace`、`debug`、`info`、`warning`（或 `warn`）、`error`；缺省为 `info`，其他取值拒绝启动。默认启用 `rotateDaily` 和 `gzip`：`access` / `error` 配置作为基础文件名，运行时写入 `access_YYYY-MM-DD.log` / `error_YYYY-MM-DD.log`，历史日志轮转后压缩为 `.gz`，`maxDays` 控制保留天数。不提供集中上传。
 - `logDir`、`access`、`error` 和面板 `Name` 未配置时可使用显式缺省；显式空字符串属于错误配置，不能用默认值掩盖。
@@ -412,7 +408,7 @@ bash scripts/cnode.sh -debug_file true
 - 面板创建的 direct outbound 是 routing 未命中时的 fallback，命中规则始终优先生效。
 - 出口列表顺序不表达默认出口；动态增删 outbound 不会改变其他 receiver 的选择。明确的 forced / fallback tag 不存在时请求失败，不隐式切换到第一个 outbound。
 - AnyTLS 使用 TLS session pool、单物理 session read loop、按 sid demux、共享 session 串行写，以及 `settings.clients` 和 `settings.paddingScheme` 配置。
-- Hysteria v1 使用 ALPN `hysteria`，Hysteria2 使用 HTTP/3 `/auth` 后切换原生 QUIC stream；两代均支持 QUIC DATAGRAM UDP 与分片重组。按 Xray `transport/internet/hysteria` 的划分，QUIC、认证与流/数据报会话属于传输层，认证后每个 TCP 请求流与 UDP 会话作为逻辑传输流交给同一入站 Handler 与 `Inbound::Process`，连接级物理准入与连接统计在认证前完成。QUIC 与 TCP 一样由全部数据 Worker 以 `SO_REUSEPORT` 监听；未认证连接归接受它的 Worker，已认证会话在路径变化使数据包实际落到另一 Worker 且完成路径验证后被动接管，不跨 Worker 转发数据包（RFC 9000 §9、§10.3）。`ngtcp2`、`nghttp3` 及流队列借用当前 Worker PMR，监听入口共享收发循环和超时调度。`ngtcp2` 不提供 Hysteria v1 的 Brutal 拥塞控制，v1 服务端使用其 BBR v2 实现；线协议与官方 v1 客户端互通，但带宽控制行为不是 Brutal。
+- Hysteria v1 使用 ALPN `hysteria`，Hysteria2 使用 HTTP/3 `/auth` 后切换原生 QUIC stream；两代均支持 QUIC DATAGRAM UDP 与分片重组。按 Xray `transport/internet/hysteria` 的划分，QUIC、认证与流/数据报会话属于传输层，认证后每个 TCP 请求流与 UDP 会话作为逻辑传输流交给同一入站 Handler 与 `Inbound::Process`，连接级物理准入与连接统计在认证前完成。QUIC 与 TCP 一样由全部数据 Worker 以 `SO_REUSEPORT` 监听；服务端 SCID 编码所属 `worker_id` 并配合 `SO_ATTACH_REUSEPORT_CBPF` 在内核态将同连接数据包（含路径迁移后的新四元组包）直接路由至原 Worker，由原 Worker 完成路径验证并沿当前已验证路径回包，不跨 Worker 转发数据包（RFC 9000 §9、§10.3）。`ngtcp2`、`nghttp3` 及流队列借用所属 Worker PMR，监听入口共享收发循环和超时调度。`ngtcp2` 不提供 Hysteria v1 的 Brutal 拥塞控制，v1 服务端使用其 BBR v2 实现；线协议与官方 v1 客户端互通，但带宽控制行为不是 Brutal。
 - Hysteria UDP 每轮未完成分片重组采用固定资源预算：5 秒没有有效新片，或达到 15 秒整体期限，即丢弃并释放该轮分片；有效进度只续空闲期限，不续整体期限。分片到期不会主动关闭健康的 UDP 会话或 QUIC 连接。这是本地资源限制，不是协议规定的时限。
 - Hysteria UDP 下行按对端 QUIC DATAGRAM 帧上限与本地报文预算分片，每片携带完整地址。地址本身放不下或超过协议片数上限时，仅终止对应 UDP 请求，不关闭共享 QUIC 连接。
 
@@ -460,19 +456,19 @@ V2Board 上报只包含实际用户流量与在线设备；不发送该 API 未�
 
 传输配置归一化返回独立的新值，只有成功后才替换调用者持有的配置；分配失败可由冷路径捕获，不改写输入或终止进程。JSON 解析与传输模式、ALPN 的值转换分开实现。出站协议在注册配置的准备阶段完成归一化，各 Worker 的 handler 直接消费该结果。
 
-TCP 连接启用 keepalive，空闲 60 秒后开始探测，以 10 秒间隔探测 6 次；不设置 `TCP_QUICKACK`（tcp(7) 规定该选项不持久，仅在设置时刻切换一次）。XHTTP 握手元数据只在请求缓冲有效期内借用；跨域会合仅传递拥有型身份元数据，持久 session 状态随会话组执行。
+TCP 连接启用 keepalive，空闲 60 秒后开始探测，以 10 秒间隔探测 6 次；不设置 `TCP_QUICKACK`（tcp(7) 规定该选项不持久，仅在设置时刻切换一次）。XHTTP 握手元数据只在请求缓冲有效期内借用；跨连接上行请求在首部静止边界单次移交裸 `fd` 至原 Worker，持久 session 状态固定在原 Worker 执行。
 
 IP 目标、请求来源和访问日志共用数值地址文本转换：IPv4-mapped 地址按 IPv4 表示，IPv6 endpoint 使用方括号，非零 scope 保留所在平台的接口名或数字语义。临时 IP 文本只在栈上存在，不为格式化再申请普通堆字符串。
 
 `--test` 仍提供 `test-vmess-10086` 入站；未配置面板和静态入站时也会启用该默认测试入站。它与普通静态入站使用相同的准备流程，同名标签或重叠监听会在 Worker 创建之前报错，不能通过追加测试入站覆盖已有配置。
 
-生产环境只有一个主控 Worker，与主线程合并。面板、监控和 DNSWorker 共用主线程的 `io_context`；DNSWorker 不创建额外线程，独占 DNS service、缓存、在途查询、UDP socket 和 DNS 超时状态。数据 Worker 和面板持有 DNS 客户端，域名按值经有界 mailbox 投递，结果按值返回；数据 Worker 不持有 DNS live 状态。
+生产环境只有一个主控事件循环，与主线程合并。面板、监控、DNSWorker 和全局准入协调器共用主线程的 `io_context`；DNSWorker 不创建额外线程，独占 DNS service、缓存、在途查询、UDP socket 和 DNS 超时状态。数据 Worker 和面板持有 DNS 客户端，域名按值经有界 mailbox 投递，结果按值返回；数据 Worker 不持有 DNS live 状态。
 
 `dns.servers` 中每项可以是裸 IPv4/IPv6（默认 UDP 53），或指定端口的 `127.0.0.1:5353`、`[::1]:5353`。IPv6 带端口时必须使用方括号，端口为 1–65535 的十进制整数；只接受 IP，不使用域名解析 DNS 服务器。配置加载时完成地址与端口拆分并发布完整 endpoint，主控线程上的 DNSWorker 按列表顺序使用；解析、默认值和平台字符串兼容不进入查询路径。
 
 IP 字段必须是完整地址：IPv4 使用四段无前导零的十进制格式，IPv6 可使用数字 scope ID（如 `fe80::1%3`），不接受 `%eth0` 等接口名。`sendThrough` 数组项也可使用规范 CIDR。单独的 host、listen、sendThrough 等字段不接受端口、方括号、空白或 NUL 后缀。方括号仅用于支持 endpoint 或 URL 的入口，且括号内必须是 IPv6；出站服务器字段也可以使用合法 DNS 主机名。旧版在部分平台上接受的地址简写或多余后缀不再兼容。
 
-连接超时和会话池空闲检查由所属执行域的 TimeoutScheduler 汇聚；原生等待结束后才释放调度器与域。事件嵌入宿主，取消不保留失效节点。限速、Mux 背压和 accept 退避使用可取消等待；协议协程继承当前域 executor，native reactor 不能直接执行用户回调或访问域私有池。
+连接超时和会话池空闲检查由所属 Worker 的 TimeoutScheduler 汇聚；原生等待结束后才释放调度器。事件嵌入宿主，取消不保留失效节点。限速、Mux 背压和 accept 退避使用可取消等待；协议协程直接在所属 Worker 的原生 `io_context` 上运行。
 
 DNSWorker 将多个调用者的并发同域查询合并为一次服务级解析，每个调用者独立等待、独立取消；首个调用者取消不会终止其他等待者的查询。最后一个等待者退出后取消无用查询，已取消但尚未收束的查询仍占准入容量；停机等待全部查询完成清理。每个上游复用一个 UDP socket，三次 A 地址采样与 AAAA 查询并发执行，仍保留多地址合并与按顺序切换上游的语义。主控线程只有一层 DNS 缓存；缓存写入分配失败不会丢失已经取得的答案，缓存在完整构建新条目后才淘汰旧条目。
 
@@ -480,7 +476,7 @@ DNS 缓存默认容量为 `dns.cacheSize: 10240`，设置为 `0` 可禁用；`mi
 
 共享上游查询最终失败时，在 `warning` 级别向 error 日志记录一次域名、错误码、`source=upstream`、最后使用的上游地址／端口及 A、AAAA 查询原因。`NXDOMAIN` 表示域名不存在，`NODATA` 表示响应没有所需地址记录；仅含不支持的记录、服务失败、拒绝、超时与畸形响应分别保留具体原因。负缓存命中保留原始原因而不逐连接刷 Warning；在到期、刷新、恢复、淘汰或停机时以 `info` 汇总 `event`、`hits`、`suppressed` 和原始原因，计数只包含负缓存命中，不包含共享查询等待者。过期条目不再提供答案，仅保留受缓存容量约束的恢复元数据；`cacheSize: 0` 不保留该状态。每条连接的访问拒绝记录仍保留。只要 A 或 AAAA 提供可用地址，解析仍成功；正常取消不记录成解析故障，真实系统异常不伪装成 DNS 无记录错误。
 
-无锁设计的前提是唯一执行租约，而非连接终身固定在接入线程。listener slot 与原生 UDP 监听仍由原 Worker 独占；可迁移宿主、stats shard、allocator 与 buffer provider 只能在所属会话组的租约内访问。跨线程只投递有界元数据／就绪通知或发布只读快照，不共享可并发修改的 live handler。
+无锁设计建立在 Share-Nothing 同构 Worker 与会话固定归属（Pin-to-Origin）之上：连接、有状态会话、出站连接池、stats shard、allocator 与 buffer provider 终身固定在所属 Worker 线程访问。跨线程只经主控协调器或 DNSWorker 投递有界控制元数据、在静止边界单次移交裸 `fd`，或冷路径发布只读快照，不共享可并发修改的 live handler，也不跨 Worker 转发业务数据包。
 
 控制面批量任务在所有已启动的子任务结束后才返回。取消和部分启动失败遵守同一完成边界，避免子任务继续访问已经销毁的聚合结果或调用者状态。
 
@@ -490,7 +486,7 @@ Dispatcher 通过实际读端的取消来源管理完整请求，覆盖嗅探、
 
 每个面板的同步与状态输出分别运行独立循环，异常退出时记录面板名称、节点 ID 与循环职责。状态循环启动时输出一次，之后按稳态时钟每 60 秒读取最后提交的节点状态；网络请求的等待不会阻塞心跳，错过的周期不补发日志。同步循环继续按面板下发间隔拉取和推送，首次推送延后一个完整间隔。停机停止新同步并取消在途等待，等待已启动的任务收束；未完成的节点清理不会被标记为成功。
 
-Mux 和 AnyTLS 的帧循环及子请求由所属执行域的有限任务组持有，Mux 后台读取也在该组内。会话退出先终止逻辑读端并取消任务，覆盖尚未进入 relay 的等待；全部协程完成后才释放会话、transport 和在线租约。父任务取消与部分启动失败遵守同一顺序。正常逻辑 FIN 排空已接收数据，子请求仍经过 Dispatcher、outbound 和 relay。
+Mux 和 AnyTLS 的帧循环及子请求由所属会话的有限任务组持有，Mux 后台读取也在该组内。会话退出先终止逻辑读端并取消任务，覆盖尚未进入 relay 的等待；全部协程完成后才释放会话、transport 和在线租约。父任务取消与部分启动失败遵守同一顺序。正常逻辑 FIN 排空已接收数据，子请求仍经过 Dispatcher、outbound 和 relay。
 
 Mux 每条连接最多同时承载 1,024 个子会话（高于 Xray 客户端单条连接可承载的会话数），重复或超额的 NEW 帧收到带错误标志的 END。所有子会话尚未被转发的客户端数据共享一个预算：达到 4 MiB 时暂停解析后续客户端帧，降至 2 MiB 后恢复；单个子会话不另设上限，停滞的子会话会使同连接的其他子会话一并等待，直到它被消费或因超时结束（与 Xray 的队头阻塞语义相同）。子会话映射项只在其分发结束后移除，同一 sid 在此之前的 NEW 按重复处理。拒绝或结束子会话所需的 END 写入失败时，整条 Mux 连接立即关闭。
 
@@ -504,7 +500,7 @@ AnyTLS 入站和出站每条子流的接收队列最多保留 65,535 字节有�
 
 AnyTLS 入站和出站共用协议私有的 settings 解析，按完整 `v` 字段协商；未声明版本时使用 v1 能力，未来版本只启用本地已支持的功能。v1 会话不发送 SYNACK 或心跳，v2 会话启用 ServerSettings、SYNACK 和心跳；出站收到服务器声明之前保持 v1 行为。重复 settings、非法版本或方向不符的控制帧会结束会话，已建立请求不会被后来的设置改写。客户端标识为 `client=cnode`。
 
-AnyTLS 池的跨请求物理读取任务由独立池宿主的常驻任务组持有，不借用某条请求的栈、上下文或短物理宿主。坏会话立即从可借池摘除并关闭，后台清理仍由池 owner 跟踪。Worker 停机先收束全部请求，再取消并 join 池任务、释放 handler 与域调度器，最后释放域根；物理入站退出不会提前销毁健康池。
+AnyTLS 池的跨请求物理读取任务由独立池宿主的常驻任务组持有，不借用某条请求的栈、上下文或短物理宿主。坏会话立即从可借池摘除并关闭，后台清理仍由池 owner 跟踪。Worker 停机先收束全部请求，再取消并 join 池任务、释放 handler 与 Worker 调度器；物理入站退出不会提前销毁健康池。
 
 AnyTLS 编解码保留内存不足及逻辑链路错误，由拥有请求或物理会话的边界处理；只有真实系统 I/O 错误才按 socket 原因映射。已开始的物理帧写入异常会关闭会话，后续请求重新连接；出站物理读取在帧负载中途失败时同样关闭整个会话，而非只结束对应子流。子流即使已从会话索引移除，仍通过自己持有的请求上下文记录失败。
 
@@ -551,7 +547,7 @@ build/musl/cnode_traffic_journal '/path/to/traffic-journal/<身份哈希>' resol
 
 面板配置的 `RequestTimeout` 以秒为单位，默认 `30`，只接受 `1` 至 `3600` 的整数。每次 HTTP 请求共用一个时限，覆盖 DNS 等待、连接、TLS 握手、发送和响应读取；超时会取消请求并等待资源释放，再报告本次失败。完整收到响应后，TLS 关闭握手最多额外占用剩余请求时间中的 1 秒，关闭失败或取消不会丢弃已经收到的响应。
 
-运行时接管后，收到停机信号先关闭新请求与连接准入、取消控制面网络和监控，再收束请求并持久化最终流量；随后 join 独立池任务、清除已完成协程的取消槽、释放所有域根和服务，Finalize 最后停止预留返回通知。原生 reactor 的 work guard 保持到这一步之后，避免在途完成通知丢失；最后 join 数据线程。持久化临界区的取消屏蔽不能扩散到后续 HTTP 请求。不等待代理流量自然排空。启动、线程创建或事件循环故障走同一收束流程但返回失败，取消不掩盖原始错误。
+运行时接管后，收到停机信号先关闭新请求与连接准入、取消控制面网络和监控，再收束请求并持久化最终流量；随后收束协调器服务、停止并 join 各数据 Worker、释放预留返回通知，原生 reactor 的 work guard 保持到这一步之后，避免在途完成通知丢失；最后 join 数据线程。持久化临界区的取消屏蔽不能扩散到后续 HTTP 请求。不等待代理流量自然排空。启动、线程创建或事件循环故障走同一收束流程但返回失败，取消不掩盖原始错误。
 
 ## 代码组织
 

@@ -31,8 +31,6 @@
 #include "worker/tcp_listener.hpp"
 #include "worker/udp_ingress.hpp"
 #include "app/session_tracking.hpp"
-#include "app/session_capabilities.hpp"
-#include "app/session_group_executor.hpp"
 #include "app/dns/dns.hpp"
 #include "app/dns/dns_worker.hpp"
 #include "transport/internet/datagram_socket.hpp"
@@ -492,11 +490,7 @@ void Worker::BeginStopOnWorker() noexcept {
     }
     for (const auto& [key, record] : runtime_->connections) {
         (void)key;
-        try {
-            record->domain->Execute([cap = record->capabilities] { cap->RequestStop(); });
-        } catch (...) {
-            FailRuntime("worker-drain", "cannot deliver domain cancellation");
-        }
+        if (record->capabilities) record->capabilities->RequestStop();
     }
 }
 
@@ -518,16 +512,6 @@ net::awaitable<void> Worker::StopRuntimeTask() {
     co_await transport::internet::JoinXHttpClientTasks(io_context_);
     runtime_->memory_reclaimer.Stop();
     co_await TimeoutScheduler::AsyncReleaseForIoContext(io_context_);
-    for (auto& [key, record] : runtime_->connections) {
-        (void)key;
-        if (record->domain && !record->domain->CanDestroyDirectlyOn(id_)) {
-            record->capabilities.reset();
-            auto* domain = record->domain.get();
-            domain->Execute([domain = std::move(record->domain)]() mutable {
-                domain.reset();
-            });
-        }
-    }
     runtime_->connections.clear();
     runtime_.reset();
     proxyman::inbound::UserStore::ClearWorkerView();
@@ -960,14 +944,11 @@ net::awaitable<void> Worker::ListenerState::AcceptLoop(
             worker.runtime_->session_configuration, worker.runtime_->connection_limiter,
             worker.runtime_->request_load, worker.runtime_->dns_worker,
             slot->prepared, inbound_handler->SharedReceiverSettings());
-        auto domain = ExecutionDomain::Create(worker.io_context_, worker.id_,
-            worker.io_context_.get_executor(), capabilities, worker.group_coordinator_);
-        capabilities->BindDomain(domain);
         auto record = worker.runtime_->session_registry->Register(
-            std::move(capabilities), std::move(domain));
+            std::move(capabilities));
         ++tcp_tasks;
         try {
-            net::co_spawn(record->domain->Executor(),
+            net::co_spawn(worker.io_context_.get_executor(),
                 ProcessReceivedConnection(record, std::move(socket), remote_ep, worker.id_),
                 net::bind_executor(worker.io_context_.get_executor(),
                     [this, &worker, record](std::exception_ptr error) {
@@ -1011,7 +992,8 @@ net::awaitable<void> Worker::ListenerState::ProcessReceivedConnection(
     std::exception_ptr failure;
     record->conn_id = session::NewID(accepted_worker);
     try {
-        record->capabilities->Initialize(record->domain->Reactor());
+        auto& reactor = static_cast<net::io_context&>(socket.get_executor().context());
+        record->capabilities->Initialize(reactor);
         record->initialized.store(true, std::memory_order_release);
         const auto& listener = record->capabilities->Receiver();
         auto tcp_stream = std::make_unique<TcpStream>(std::move(socket));
@@ -1149,12 +1131,8 @@ void Worker::InstallUserView(proxyman::inbound::UserStore::WorkerView view) {
     for (const auto& [key, record] : runtime_->connections) {
         (void)key;
         if (record->finished.load(std::memory_order_acquire) ||
-            !record->domain || !record->capabilities) continue;
-        try {
-            record->domain->Execute([cap = record->capabilities, view] {
-                cap->UpdateUserView(view);
-            });
-        } catch (...) {}
+            !record->capabilities) continue;
+        record->capabilities->UpdateUserView(view);
     }
 }
 
@@ -1224,34 +1202,22 @@ void Worker::UpdateRule(
 
 net::awaitable<app::UserTrafficSnapshot> Worker::SnapshotTraffic(std::string tag) {
     app::UserTrafficSnapshot result;
+    if (!runtime_ || !runtime_->session_tracking) co_return result;
     auto worker_counters = runtime_->session_tracking->SnapshotTraffic(tag);
     result.users = std::move(worker_counters.users);
-    // Source registry membership never changes when a group migrates. Each
-    // logical domain is therefore sampled exactly once across all Workers.
-    std::vector<std::shared_ptr<app::PhysicalSessionRecord>> records;
-    records.reserve(runtime_->connections.size());
     for (const auto& [key, record] : runtime_->connections) {
         (void)key;
-        if (record->initialized.load(std::memory_order_acquire) &&
-            !record->finished.load(std::memory_order_acquire) &&
-            (tag.empty() || record->accounting_key == tag)) {
-            records.push_back(record);
-        }
-    }
-    for (const auto& record : records) {
-        if (!runtime_->connections.contains(record.get()) ||
-            !record->domain || !record->capabilities)
+        if (!record->initialized.load(std::memory_order_acquire) ||
+            record->finished.load(std::memory_order_acquire) ||
+            !record->capabilities ||
+            (!tag.empty() && record->accounting_key != tag))
             continue;
         auto owner = record->capabilities->TrackingOwner();
-        auto counters = co_await net::co_spawn(record->domain->Executor(),
-            [owner, tag]() -> net::awaitable<app::UserTrafficCounters> {
-                co_return owner->SnapshotTraffic(tag);
-            }, net::use_awaitable);
+        auto counters = owner->SnapshotTraffic(tag);
         if (counters.empty()) continue;
         result.domains.push_back({
             std::move(owner),
             std::move(counters),
-            record->domain,
         });
     }
     co_return result;
@@ -1260,69 +1226,40 @@ net::awaitable<app::UserTrafficSnapshot> Worker::SnapshotTraffic(std::string tag
 net::awaitable<void> Worker::CommitTraffic(
     std::string tag, const app::UserTrafficSnapshot& snapshot) {
     co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
+    if (!runtime_ || !runtime_->session_tracking) co_return;
     runtime_->session_tracking->CommitTraffic(tag, snapshot);
     for (const auto& token : snapshot.domains) {
-        if (auto domain = token.domain.lock();
-            domain && !domain->CanDestroyDirectlyOn(id_)) {
-            co_await net::co_spawn(domain->Executor(),
-                [owner = token.owner, tag = std::string(tag), counters = token.counters]() -> net::awaitable<void> {
-                    owner->CommitTraffic(tag, counters);
-                    co_return;
-                }, net::use_awaitable);
-        } else {
-            token.owner->CommitTraffic(tag, token.counters);
-        }
+        token.owner->CommitTraffic(tag, token.counters);
     }
 }
 
 net::awaitable<void> Worker::RollbackTraffic(
     std::string tag, const app::UserTrafficSnapshot& snapshot) {
     co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
+    if (!runtime_ || !runtime_->session_tracking) co_return;
     runtime_->session_tracking->RollbackTraffic(tag, snapshot);
     for (const auto& token : snapshot.domains) {
-        app::UserTrafficCounters available;
-        if (auto domain = token.domain.lock();
-            domain && !domain->CanDestroyDirectlyOn(id_)) {
-            available = co_await net::co_spawn(domain->Executor(),
-                [owner = token.owner, tag = std::string(tag), counters = token.counters]()
-                    -> net::awaitable<app::UserTrafficCounters> {
-                    owner->RollbackTraffic(tag, counters);
-                    co_return owner->ExtractAvailableTraffic(tag);
-                }, net::use_awaitable);
-        } else {
-            token.owner->RollbackTraffic(tag, token.counters);
-            available = token.owner->ExtractAvailableTraffic(tag);
-        }
+        token.owner->RollbackTraffic(tag, token.counters);
+        auto available = token.owner->ExtractAvailableTraffic(tag);
         runtime_->session_tracking->MergeCompletedTraffic(tag, available);
     }
 }
 
 net::awaitable<std::vector<OnlineDevice>> Worker::GetOnlineDevices(std::string tag) const {
-    auto handler = runtime_->inbound_handlers->GetHandler(tag);
     std::vector<OnlineDevice> result;
+    if (!runtime_ || !runtime_->inbound_handlers) co_return result;
+    auto handler = runtime_->inbound_handlers->GetHandler(tag);
     if (handler) {
         result = runtime_->inbound_handlers->GetOnlineDevices(handler->ReceiverSettings().protocol, tag);
     }
-    std::vector<std::shared_ptr<app::PhysicalSessionRecord>> records;
-    records.reserve(runtime_->connections.size());
     for (const auto& [key, record] : runtime_->connections) {
         (void)key;
-        if (!record->finished.load(std::memory_order_acquire) &&
-            record->initialized.load(std::memory_order_acquire) &&
-            record->inbound_tag == tag) {
-            records.push_back(record);
-        }
-    }
-    for (const auto& record : records) {
-        if (!runtime_->connections.contains(record.get()) ||
-            !record->domain || !record->capabilities)
+        if (record->finished.load(std::memory_order_acquire) ||
+            !record->initialized.load(std::memory_order_acquire) ||
+            !record->capabilities ||
+            record->inbound_tag != tag)
             continue;
-        auto devices = co_await net::co_spawn(record->domain->Executor(),
-            [capabilities = record->capabilities, tag]() mutable -> net::awaitable<std::vector<OnlineDevice>> {
-                auto online = capabilities->GetOnlineDevices(tag);
-                capabilities.reset();
-                co_return online;
-            }, net::use_awaitable);
+        auto devices = record->capabilities->GetOnlineDevices(tag);
         result.insert(result.end(), std::make_move_iterator(devices.begin()),
                       std::make_move_iterator(devices.end()));
     }
@@ -1390,47 +1327,13 @@ net::awaitable<WorkerRuntimeStatsSnapshot> Worker::CollectRuntimeStats(bool incl
         result.stats.bytes_out += stats.bytes_out;
         result.stats.errors += stats.errors;
     };
-    // Registration and final folding belong to this Worker, even after passive
-    // migration. Do not suspend while borrowing the registry: local leases read
-    // each live shard before any close can fold it into the sampled base total.
-    // Only foreign/frozen domains need ownership retained across suspension.
-    std::vector<std::shared_ptr<app::PhysicalSessionRecord>> deferred;
     for (const auto& [key, record] : runtime_->connections) {
         (void)key;
         if (record->finished.load(std::memory_order_acquire) ||
             !record->initialized.load(std::memory_order_acquire) ||
-            !record->domain || !record->capabilities)
+            !record->capabilities)
             continue;
-        ExecutionDomain::LocalLease lease(*record->domain);
-        if (lease) {
-            add_stats(record->capabilities->Stats().Snapshot());
-        } else {
-            // Reserve only on the exceptional path, bounded by the existing
-            // registry size rather than geometric growth beyond that budget.
-            if (deferred.empty()) deferred.reserve(runtime_->connections.size());
-            deferred.push_back(record);
-        }
-    }
-    for (const auto& record : deferred) {
-        if (!record->finished.load(std::memory_order_acquire)) {
-            const auto stats = co_await net::co_spawn(record->domain->Executor(),
-                [cap = record->capabilities]() mutable -> net::awaitable<StatsSnapshot> {
-                    const auto snapshot = cap->Stats().Snapshot();
-                    cap.reset();
-                    co_return snapshot;
-                }, net::use_awaitable);
-            if (!record->finished.load(std::memory_order_acquire)) {
-                add_stats(stats);
-                continue;
-            }
-        }
-        // A close during a deferred sample was not included in the base total.
-        // Use its final snapshot rather than the earlier live sample, preserving
-        // the last traffic without counting the owner's later fold twice.
-        auto stats = record->final_stats;
-        stats.connections_active = 0;
-        add_stats(stats);
-        if (result.active_connections > 0) --result.active_connections;
+        add_stats(record->capabilities->Stats().Snapshot());
     }
     co_return result;
 }

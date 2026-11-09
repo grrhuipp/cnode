@@ -279,16 +279,17 @@ net::awaitable<bool> TimedUserValidator::RegisterSessionIfNew(
     const proxyman::inbound::UserStore::VmessCredential& user,
     const std::array<uint8_t, 16>& body_key,
     const std::array<uint8_t, 16>& body_iv) const {
-    auto domain = ExecutionDomain::Current();
-    if (!domain) throw std::logic_error("VMess replay admission requires an execution domain");
+    auto executor = co_await net::this_coro::executor;
+    auto* coordinator = GroupCoordinator::ForContext(
+        net::query(executor, net::execution::context));
+    if (!coordinator) throw std::logic_error("VMess replay admission requires a registered coordinator");
     std::array<uint8_t, 48> material{};
     std::memcpy(material.data(), user.uuid_bytes.data(), 16);
     std::memcpy(material.data() + 16, body_key.data(), 16);
     std::memcpy(material.data() + 32, body_iv.data(), 16);
     const SessionKey key = SHA256Hash(material.data(), material.size());
     OPENSSL_cleanse(material.data(), material.size());
-    auto* coordinator = &domain->Coordinator();
-    return coordinator->PostCall([coordinator, key] {
+    co_return co_await coordinator->PostCall([coordinator, key] {
         const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
         return net::use_service<HistoryService>(

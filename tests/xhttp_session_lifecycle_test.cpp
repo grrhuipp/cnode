@@ -119,63 +119,39 @@ net::awaitable<void> BoundedReplayWindow(net::io_context& io) {
     Require(bool(oldest), "oldest tombstone was not bounded by FIFO eviction");
 }
 
-struct DomainHooks final : ::ExecutionDomain::Hooks {
-    std::exception_ptr failure;
-    void Enter() noexcept override {}
-    void Leave() noexcept override {}
-    void OnFailure(std::exception_ptr error) noexcept override { failure = error; }
-};
-
-// Distinct domains begin with distinct ownership even for one inbound. Only
-// the same logical session merges them; late uploads cannot bypass replay
-// protection by arriving on a different physical connection's domain.
 net::awaitable<void> DomainsJoinBySession(net::io_context& io) {
     auto coordinator = std::make_shared<::GroupCoordinator>(io);
     coordinator->RegisterWorker(1, io, io.get_executor());
-    coordinator->RegisterWorker(2, io, io.get_executor());
-    coordinator->RegisterWorker(3, io, io.get_executor());
-    auto hooks = std::make_shared<DomainHooks>();
-    auto first_domain = ::ExecutionDomain::Create(io, 1, io.get_executor(), hooks, coordinator);
-    auto other_domain = ::ExecutionDomain::Create(io, 2, io.get_executor(), hooks, coordinator);
-    auto upload_domain = ::ExecutionDomain::Create(io, 3, io.get_executor(), hooks, coordinator);
     auto scenario = [&]() -> net::awaitable<void> {
-    auto first = co_await net::co_spawn(first_domain->Executor(),
-        GetXHttpPacketSession(io, "group", "session-a", XHttpSessionAccess::Open), net::use_awaitable);
-    auto other = co_await net::co_spawn(other_domain->Executor(),
-        GetXHttpPacketSession(io, "group", "session-b", XHttpSessionAccess::Open), net::use_awaitable);
-    Require(first && other && first != other && !first_domain->SharesGroup(*other_domain),
-            "unrelated sessions of one inbound were pinned to one group");
-    auto upload = co_await net::co_spawn(upload_domain->Executor(),
-        GetXHttpPacketSession(io, "group", "session-a", XHttpSessionAccess::Upload), net::use_awaitable);
-    Require(upload == first && first_domain->SharesGroup(*upload_domain),
-            "split physical domains did not join the same logical session");
-    Require(!first_domain->SharesGroup(*other_domain), "session merge included an unrelated group");
-    co_await net::co_spawn(first_domain->Executor(), [&]() -> net::awaitable<void> {
+        auto first = co_await GetXHttpPacketSession(
+            io, "group", "session-a", XHttpSessionAccess::Open);
+        auto other = co_await GetXHttpPacketSession(
+            io, "group", "session-b", XHttpSessionAccess::Open);
+        Require(first && other && first != other,
+                "unrelated sessions of one inbound were not independent");
+        auto upload = co_await GetXHttpPacketSession(
+            io, "group", "session-a", XHttpSessionAccess::Upload);
+        Require(upload == first,
+                "upload did not resolve to the existing logical session");
         first->Close();
-        co_return;
-    }, net::use_awaitable);
-    auto replay = co_await net::co_spawn(other_domain->Executor(),
-        GetXHttpPacketSession(io, "group", "session-a", XHttpSessionAccess::Upload), net::use_awaitable);
-    Require(!replay && !first_domain->SharesGroup(*other_domain),
-            "retired upload recreated or merged a session from another domain");
-    auto reopened = co_await net::co_spawn(other_domain->Executor(),
-        GetXHttpPacketSession(io, "group", "session-a", XHttpSessionAccess::Open), net::use_awaitable);
-    Require(reopened && reopened != first, "explicit reopen did not claim a new domain generation");
-    co_await net::co_spawn(first_domain->Executor(), [&]() -> net::awaitable<void> {
+        auto replay = co_await GetXHttpPacketSession(
+            io, "group", "session-a", XHttpSessionAccess::Upload);
+        Require(!replay,
+                "retired upload recreated a session inside the replay window");
+        auto reopened = co_await GetXHttpPacketSession(
+            io, "group", "session-a", XHttpSessionAccess::Open);
+        Require(reopened && reopened != first,
+                "explicit reopen did not claim a new session generation");
         upload.reset();
         first.reset();
-        co_return;
-    }, net::use_awaitable);
-    auto joined = co_await net::co_spawn(other_domain->Executor(),
-        GetXHttpPacketSession(io, "group", "session-a", XHttpSessionAccess::Join), net::use_awaitable);
-    Require(joined == reopened, "old domain destruction retired the replacement generation");
-    co_await net::co_spawn(other_domain->Executor(), [&]() -> net::awaitable<void> {
+        auto joined = co_await GetXHttpPacketSession(
+            io, "group", "session-a", XHttpSessionAccess::Join);
+        Require(joined == reopened,
+                "old session destruction retired the replacement generation");
         joined.reset();
         reopened.reset();
         other.reset();
-        co_return;
-    }, net::use_awaitable);
-    co_await net::co_spawn(first_domain->Executor(), BoundedReplayWindow(io), net::use_awaitable);
+        co_await BoundedReplayWindow(io);
     };
     std::exception_ptr failure;
     try {
@@ -183,17 +159,12 @@ net::awaitable<void> DomainsJoinBySession(net::io_context& io) {
     } catch (...) {
         failure = std::current_exception();
     }
-    first_domain.reset();
-    other_domain.reset();
-    upload_domain.reset();
-    // Leave any inline domain completion before releasing coordinator services.
     co_await net::post(io, net::use_awaitable);
     coordinator->CloseAdmission();
     co_await coordinator->AsyncJoin();
     coordinator->ReleaseServices();
     co_await coordinator->Finalize();
     if (failure) std::rethrow_exception(failure);
-    if (hooks->failure) std::rethrow_exception(hooks->failure);
 }
 
 std::string Receive(::tcp::socket& socket) {

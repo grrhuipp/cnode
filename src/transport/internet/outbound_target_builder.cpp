@@ -4,7 +4,6 @@
 #include "transport/internet/http_headers.hpp"
 
 #include "app/dns/dns.hpp"
-#include "app/session_group_executor.hpp"
 #include "common/ip_utils.hpp"
 #include "core/constants.hpp"
 #include "common/session.hpp"
@@ -328,8 +327,7 @@ OutboundDialer::OutboundDialer(net::io_context& io_context,
     , timeout_(timeout) {}
 
 net::io_context& OutboundDialer::IoContext() const noexcept {
-    const auto domain = ExecutionDomain::Current();
-    return domain ? domain->Reactor() : io_context_;
+    return io_context_;
 }
 
 ForwardedMetadataView OutboundDialer::ForwardedMetadata(

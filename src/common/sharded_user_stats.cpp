@@ -95,11 +95,12 @@ net::awaitable<std::optional<UserOnlineSessionGuard>> UserOnlineTracker::TryConn
     if (user_id <= 0 || client_ip.empty()) {
         co_return std::optional<UserOnlineSessionGuard>(std::in_place);
     }
-    // Held across the admission: the domain owns the coordinator reference.
-    auto domain = ExecutionDomain::Current();
-    if (!domain) throw std::logic_error("user admission requires an execution domain");
+    auto executor = co_await net::this_coro::executor;
+    auto* coordinator = GroupCoordinator::ForContext(
+        net::query(executor, net::execution::context));
+    if (!coordinator) throw std::logic_error("user admission requires a registered coordinator");
     co_return co_await TryConnectSession(
-        domain->Coordinator(), tag, user_id, client_ip, device_limit);
+        *coordinator, tag, user_id, client_ip, device_limit);
 }
 
 net::awaitable<std::optional<UserOnlineSessionGuard>> UserOnlineTracker::TryConnectSession(

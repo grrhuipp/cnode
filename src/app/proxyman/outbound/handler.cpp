@@ -20,41 +20,25 @@
 namespace proxyman::outbound {
 
 // The host serializes cache creation and retirement, never request execution.
-// Protocol pools lease independent physical domains to individual requests.
-class OutboundPoolHost final : public ExecutionDomain::Hooks,
-                               public std::enable_shared_from_this<OutboundPoolHost> {
+class OutboundPoolHost final : public std::enable_shared_from_this<OutboundPoolHost> {
 public:
-    explicit OutboundPoolHost(const PreparedOutboundConfig& config) : config_(config) {}
-    ~OutboundPoolHost() override {
-        memory::ScopedAllocationDomain scope(allocation_);
+    OutboundPoolHost(const PreparedOutboundConfig& config, net::io_context& reactor)
+        : config_(config), reactor_(reactor) {}
+    ~OutboundPoolHost() {
         ReleaseInstance();
     }
-
-    void Bind(const std::shared_ptr<ExecutionDomain>& domain) {
-        domain_ = domain;
-        allocation_.SetLeaseGroup(domain->LeaseIdentity(), &ExecutionDomain::SharesLeaseIdentity);
-    }
-    std::shared_ptr<ExecutionDomain> Domain() const { return domain_.lock(); }
 
     net::awaitable<OutboundProcessResult> Process(
         session::Context& context, transport::Link inbound, OutboundDialer& dialer,
         const TimeoutsConfig& timeouts, StatsShard& stats, const RelayConfig& relay,
         buf::MultiBufferBatch payload, std::chrono::seconds idle_timeout,
         std::chrono::seconds write_timeout) {
-        auto domain = Domain();
-        if (!ExecutionDomain::Current() || !domain)
-            throw IoSystemError(net::error::operation_aborted);
-        auto* proxy = co_await net::co_spawn(domain->Executor(), Acquire(),
-            net::bind_cancellation_slot(net::cancellation_slot{}, net::use_awaitable));
+        auto* proxy = Acquire();
         struct Borrow {
             std::shared_ptr<OutboundPoolHost> host;
             ~Borrow() {
-                if (auto domain = host->Domain()) {
-                    domain->Execute([host = std::move(host)] {
-                        --host->active_;
-                        host->CancelIfIdle();
-                    });
-                }
+                --host->active_;
+                host->CancelIfIdle();
             }
         } borrow{shared_from_this()};
         co_return co_await proxy->Process(context, inbound, dialer, timeouts, stats,
@@ -62,12 +46,8 @@ public:
     }
 
     void Retire() {
-        auto domain = Domain();
-        if (!domain) return;
-        domain->Execute([self = shared_from_this()] {
-            self->retired_ = true;
-            self->CancelIfIdle();
-        });
+        retired_ = true;
+        CancelIfIdle();
     }
 
     [[nodiscard]] bool IsJoined() const noexcept {
@@ -102,39 +82,14 @@ public:
             try { co_await tasks_->AsyncJoin(); }
             catch (...) { failure = std::current_exception(); }
         }
-        auto domain = Domain();
-        if (domain) {
-            try { co_await transport::internet::JoinXHttpClientTasks(domain->Services()); }
-            catch (...) { if (!failure) failure = std::current_exception(); }
-        }
+        try { co_await transport::internet::JoinXHttpClientTasks(reactor_); }
+        catch (...) { if (!failure) failure = std::current_exception(); }
         ReleaseInstance();
         join_failure_ = failure;
         joined_.store(true, std::memory_order_release);
         for (auto& waiter : join_waiters_) waiter->cancel();
         join_waiters_.clear();
         if (failure) std::rethrow_exception(failure);
-    }
-
-    void Enter() noexcept override { allocation_scope_.emplace(allocation_); }
-    void Leave() noexcept override { allocation_scope_.reset(); }
-    void OnFailure(std::exception_ptr error) noexcept override {
-        retired_ = true;
-        if (tasks_) tasks_->Tasks().Cancel();
-        try { CancelIfIdle(); } catch (...) {}
-        try {
-            try { if (error) std::rethrow_exception(error); }
-            catch (const IoSystemError& failure) {
-                if (failure.code() != net::error::operation_aborted &&
-                    failure.code() != net::error::eof)
-                    LOG_ERROR("outbound pool host failed tag={} > {}", config_.tag, failure.what());
-            }
-            catch (const std::exception& failure) {
-                LOG_ERROR("outbound pool host failed tag={} > {}", config_.tag, failure.what());
-            }
-            catch (...) {
-                LOG_ERROR("outbound pool host failed tag={} > unknown error", config_.tag);
-            }
-        } catch (...) {}
     }
 
 private:
@@ -147,40 +102,35 @@ private:
         if (!retired_ || active_ != 0) return;
         if (tasks_) tasks_->Tasks().Cancel();
         if (cancel_join_spawned_ || joining_ || joined_.load(std::memory_order_relaxed)) return;
-        if (auto domain = Domain()) {
-            cancel_join_spawned_ = true;
-            try {
-                net::co_spawn(domain->Executor(),
-                    [self = shared_from_this()]() -> net::awaitable<void> {
-                        try { co_await self->AsyncJoin(); }
-                        catch (...) {}
-                    }, net::detached);
-            } catch (...) {
-                cancel_join_spawned_ = false;
-            }
+        cancel_join_spawned_ = true;
+        try {
+            net::co_spawn(reactor_.get_executor(),
+                [self = shared_from_this()]() -> net::awaitable<void> {
+                    try { co_await self->AsyncJoin(); }
+                    catch (...) {}
+                }, net::detached);
+        } catch (...) {
+            cancel_join_spawned_ = false;
         }
     }
 
-    net::awaitable<::Outbound*> Acquire() {
+    ::Outbound* Acquire() {
         if (retired_) throw IoSystemError(net::error::operation_aborted);
         if (!proxy_) {
             try {
-                auto domain = Domain();
-                tasks_ = std::make_unique<ResidentTaskGroup>(domain->Executor());
-                proxy_ = NewProxy(config_, domain->Reactor(), tasks_->Tasks());
+                tasks_ = std::make_unique<ResidentTaskGroup>(reactor_.get_executor());
+                proxy_ = NewProxy(config_, reactor_, tasks_->Tasks());
             } catch (...) {
                 ReleaseInstance();
                 throw;
             }
         }
         ++active_;
-        co_return proxy_.get();
+        return proxy_.get();
     }
 
     const PreparedOutboundConfig config_;
-    memory::AllocationDomain allocation_;
-    std::optional<memory::ScopedAllocationDomain> allocation_scope_;
-    std::weak_ptr<ExecutionDomain> domain_;
+    net::io_context& reactor_;
     std::unique_ptr<ResidentTaskGroup> tasks_;
     std::unique_ptr<::Outbound> proxy_;
     size_t active_ = 0;
@@ -200,12 +150,9 @@ Handler::Handler(OutboundConfiguration::Entry config, net::io_context& io_contex
                  app::dns::DNS& dns, std::chrono::seconds dial_timeout,
                  AwaitableTaskGroup& tasks)
     : config_(std::move(config)) {
-    auto& reactor = ExecutionDomain::Current()
-        ? ExecutionDomain::Current()->Reactor()
-        : io_context;
-    dialer_.emplace(reactor, dns, config_->sender, dial_timeout);
+    dialer_.emplace(io_context, dns, config_->sender, dial_timeout);
     if (config_->host) host_ = config_->host;
-    else proxy_ = NewProxy(*config_, reactor, tasks);
+    else proxy_ = NewProxy(*config_, io_context, tasks);
 }
 
 
@@ -285,10 +232,7 @@ void HandlerLookup::Sync(uint64_t generation) {
 
 std::shared_ptr<Handler> HandlerLookup::Instantiate(const OutboundConfiguration::Entry& config) {
     memory::ScopedWorkerAllocation worker_allocation;
-    auto& reactor = ExecutionDomain::Current()
-        ? ExecutionDomain::Current()->Reactor()
-        : io_context_;
-    return memory::AllocateShared<Handler>(config, reactor, dns_, dial_timeout_, tasks_);
+    return memory::AllocateShared<Handler>(config, io_context_, dns_, dial_timeout_, tasks_);
 }
 
 // ============================================================================
@@ -298,7 +242,6 @@ std::shared_ptr<Handler> HandlerLookup::Instantiate(const OutboundConfiguration:
 struct OutboundConfiguration::Hosts {
     struct Resident {
         std::shared_ptr<OutboundPoolHost> host;
-        std::shared_ptr<ExecutionDomain> domain;
     };
     net::io_context& reactor;
     uint32_t worker_id;
@@ -306,25 +249,14 @@ struct OutboundConfiguration::Hosts {
     std::vector<Resident> residents;
 
     std::shared_ptr<OutboundPoolHost> Create(const PreparedOutboundConfig& config) {
-        auto host = std::make_shared<OutboundPoolHost>(config);
-        auto domain = ExecutionDomain::Create(
-            reactor, worker_id, reactor.get_executor(), host, coordinator);
-        host->Bind(domain);
-        residents.push_back({host, std::move(domain)});
+        auto host = std::make_shared<OutboundPoolHost>(config, reactor);
+        residents.push_back({host});
         return host;
     }
 
     void Prune() {
-        std::erase_if(residents, [this](Resident& resident) {
-            if (!resident.host || !resident.host->IsJoined()) return false;
-            if (resident.domain && !resident.domain->CanDestroyDirectlyOn(worker_id)) {
-                resident.host.reset();
-                auto* domain = resident.domain.get();
-                domain->Execute([domain = std::move(resident.domain)]() mutable {
-                    domain.reset();
-                });
-            }
-            return true;
+        std::erase_if(residents, [](Resident& resident) {
+            return resident.host && resident.host->IsJoined();
         });
     }
 };
@@ -387,19 +319,9 @@ net::awaitable<void> OutboundConfiguration::AsyncJoinHosts() {
     std::exception_ptr failure;
     for (auto& resident : hosts_->residents) {
         try {
-            co_await net::co_spawn(resident.domain->Executor(),
-                resident.host->AsyncJoin(), net::use_awaitable);
+            co_await resident.host->AsyncJoin();
         } catch (...) { if (!failure) failure = std::current_exception(); }
-        if (resident.domain && !resident.domain->CanDestroyDirectlyOn(hosts_->worker_id)) {
-            auto* domain = resident.domain.get();
-            domain->Execute([host = std::move(resident.host),
-                             domain = std::move(resident.domain)]() mutable {
-                host.reset();
-                domain.reset();
-            });
-        }
     }
-    // Release all domain roots before the coordinator's Finalize barrier.
     hosts_.reset();
     if (failure) std::rethrow_exception(failure);
 }

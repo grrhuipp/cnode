@@ -13,7 +13,6 @@
 #include <span>
 #include <string_view>
 
- class ExecutionDomain; 
 
 namespace transport::internet {
 
@@ -25,8 +24,7 @@ struct XHttpSessionTableEntry;
 class XHttpPacketUpSession final : public memory::ThreadAllocated,
                                    private transport::CancellationSubscription {
 public:
-    explicit XHttpPacketUpSession(net::io_context& io_context,
-                                  std::shared_ptr<ExecutionDomain> owner = {});
+    explicit XHttpPacketUpSession(net::io_context& io_context);
     ~XHttpPacketUpSession() noexcept;
 
     transport::CancellationSource& Cancellation() noexcept { return cancellation_; }
@@ -85,8 +83,6 @@ private:
     void Retire() noexcept;
     // Stable table entry; detached on retirement or table destruction.
     XHttpSessionTableEntry* table_entry_ = nullptr;
-    // Services and the allocation arena outlive every session operation.
-    std::shared_ptr<ExecutionDomain> owner_domain_;
     // Counts a read in flight on the attached stream-up upload so Close can
     // wait for it before the upload stream is destroyed.
     struct UploadRead {

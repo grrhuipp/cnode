@@ -14,7 +14,6 @@
 #include "../../outbound_stream_endpoint.hpp"
 #include "app/dns/dns.hpp"
 #include "app/proxyman/outbound/factory.hpp"
-#include "app/session_group_executor.hpp"
 #include "../../../app/proxyman/outbound/registration.hpp"
 #include "infra/json_field.hpp"
 #include "app/relay.hpp"
@@ -350,72 +349,41 @@ private:
 // 稳态只保留拒绝信号和身份；完整 PFS 快照仅属于握手子协程。
 // 此对象先于 encrypted_io 构造，且禁止移动，保证延迟读端的借用有效。
 struct VlessClientTicketLease {
-    VlessClientTicketLease(
-        std::shared_ptr<::vless::VlessEncryptionClientTicketCache> cache,
-        std::shared_ptr<ExecutionDomain> domain,
-        bool has_domain)
-        : cache(std::move(cache)), domain(std::move(domain)), has_domain(has_domain) {}
+    explicit VlessClientTicketLease(
+        std::shared_ptr<::vless::VlessEncryptionClientTicketCache> cache)
+        : cache(std::move(cache)) {}
 
     VlessClientTicketLease(const VlessClientTicketLease&) = delete;
     VlessClientTicketLease& operator=(const VlessClientTicketLease&) = delete;
     VlessClientTicketLease(VlessClientTicketLease&&) = delete;
     VlessClientTicketLease& operator=(VlessClientTicketLease&&) = delete;
 
-    static net::awaitable<::vless::VlessEncryptionClientTicketCache> ReadCache(
-        std::shared_ptr<::vless::VlessEncryptionClientTicketCache> owner) {
-        co_return *owner;
-    }
-
-    static net::awaitable<void> PublishCache(
-        std::shared_ptr<::vless::VlessEncryptionClientTicketCache> owner,
-        ::vless::VlessEncryptionClientTicketCache candidate,
-        std::array<uint8_t, ::vless::kVlessEncryptionTicketSize> expected) {
-        if (CRYPTO_memcmp(owner->ticket.data(), expected.data(), expected.size()) == 0) {
-            *owner = candidate;
-        }
-        co_return;
-    }
-
-    net::awaitable<void> Acquire(::vless::VlessEncryptionClientTicketCache& local) {
-        if (!cache || (has_domain && !domain)) co_return;
-        if (domain && !domain->CanExecuteInline()) {
-            local = co_await net::co_spawn(domain->Executor(), ReadCache(cache),
-                net::bind_cancellation_slot(net::cancellation_slot{}, net::use_awaitable));
-        } else {
-            local = *cache;
-        }
+    void Acquire(::vless::VlessEncryptionClientTicketCache& local) {
+        if (!cache) return;
+        local = *cache;
         identity = local.ticket;
     }
 
-    net::awaitable<void> Publish(
+    void Publish(
         const ::vless::VlessEncryptionClientTicketCache& local,
         std::chrono::steady_clock::time_point original_expiry) {
-        if (!cache || (has_domain && !domain) ||
+        if (!cache ||
             (CRYPTO_memcmp(local.ticket.data(), identity.data(), identity.size()) == 0 &&
-             local.expires_at == original_expiry)) co_return;
-        if (domain && !domain->CanExecuteInline()) {
-            co_await net::co_spawn(domain->Executor(), PublishCache(cache, local, identity),
-                net::bind_cancellation_slot(net::cancellation_slot{}, net::use_awaitable));
-        } else if (CRYPTO_memcmp(cache->ticket.data(), identity.data(), identity.size()) == 0) {
+             local.expires_at == original_expiry)) return;
+        if (CRYPTO_memcmp(cache->ticket.data(), identity.data(), identity.size()) == 0) {
             *cache = local;
         }
         identity = local.ticket;
     }
 
     ~VlessClientTicketLease() {
-        if (!cache || (has_domain && !domain) || !rejection.rejected) return;
-        auto invalidate = [cache = std::move(cache), identity = identity] {
-            if (CRYPTO_memcmp(cache->ticket.data(), identity.data(), identity.size()) == 0) {
-                cache->Clear();
-            }
-        };
-        if (domain) domain->Execute(std::move(invalidate));
-        else invalidate();
+        if (!cache || !rejection.rejected) return;
+        if (CRYPTO_memcmp(cache->ticket.data(), identity.data(), identity.size()) == 0) {
+            cache->Clear();
+        }
     }
 
     std::shared_ptr<::vless::VlessEncryptionClientTicketCache> cache;
-    std::shared_ptr<ExecutionDomain> domain;
-    bool has_domain;
     std::array<uint8_t, ::vless::kVlessEncryptionTicketSize> identity{};
     ::vless::VlessEncryptionTicketRejection rejection;
 };
@@ -439,7 +407,7 @@ SendVlessHandshake(
     const OutboundDialer& dialer,
     const session::Context& ctx) {
     ::vless::VlessEncryptionClientTicketCache local_tickets;
-    co_await tickets.Acquire(local_tickets);
+    tickets.Acquire(local_tickets);
     const auto original_expiry = local_tickets.expires_at;
     stream.SetIdleTimeout(handshake_timeout);
     PhaseDeadlineHandle outbound_protocol_deadline =
@@ -512,7 +480,7 @@ SendVlessHandshake(
         co_return tl::unexpected(classified);
     }
     OPENSSL_cleanse(header_buf.data(), header_len);
-    co_await tickets.Publish(local_tickets, original_expiry);
+    tickets.Publish(local_tickets, original_expiry);
     co_return tl::expected<void, ErrorCode>{};
 }
 
@@ -523,9 +491,7 @@ proxy::vless::outbound::Handler::Handler(
     : config_(std::move(config))
     , encryption_tickets_(config_->encryption
           ? std::make_shared<::vless::VlessEncryptionClientTicketCache>()
-          : nullptr)
-    , ticket_domain_(ExecutionDomain::Current())
-    , has_ticket_domain_(static_cast<bool>(ExecutionDomain::Current())) {}
+          : nullptr) {}
 
 proxy::vless::outbound::Handler::~Handler() = default;
 
@@ -565,8 +531,7 @@ proxy::vless::outbound::Handler::Process(
     const bool use_vision = !config_->flow.empty();
     const bool use_xudp = is_udp && config_->packet_xudp;
     const bool use_packet_addr = is_udp && config_->packet_addr;
-    VlessClientTicketLease tickets(
-        encryption_tickets_, ticket_domain_.lock(), has_ticket_domain_);
+    VlessClientTicketLease tickets(encryption_tickets_);
     VlessBufferedReader protocol_reader(*stream);
     transport::MultiBufferWriter& protocol_writer = *stream;
     VlessBufferedReader* active_reader = &protocol_reader;

@@ -40,15 +40,13 @@ struct SocketState;
 // level authentication, request streams and UDP sessions. Owned by its
 // listener's CID map and by its own coroutines; delivered streams and
 // sessions hold it weakly because a dispatched request may outlive it.
-class Connection final : public std::enable_shared_from_this<Connection>,
-                         public ExecutionDomain::NativeResource {
+class Connection final : public std::enable_shared_from_this<Connection> {
 public:
     static std::shared_ptr<Connection> Create(
         QuicListener& listener, SocketState& socket,
         const udp::endpoint& remote, const ngtcp2_pkt_hd& header);
 
     ~Connection() noexcept {
-        memory::ScopedAllocationDomain scope(capabilities_->Allocation());
         Close();
         fragments_ = {};
         connection_ids_ = {};
@@ -71,17 +69,9 @@ public:
     [[nodiscard]] bool Closed() const noexcept { return closed_; }
     void Close() noexcept;
     [[nodiscard]] const std::shared_ptr<QuicOwnership>& Ownership() const noexcept { return ownership_; }
-    [[nodiscard]] net::any_io_executor Executor() const { return ownership_->domain->Executor(); }
-    [[nodiscard]] net::io_context& Reactor() const noexcept { return ownership_->domain->Reactor(); }
-    net::awaitable<void> PrepareHandoff(const ExecutionDomain::HandoffTarget&) override;
-    void CommitHandoff(const ExecutionDomain::HandoffTarget&) noexcept override;
-    net::awaitable<void> CancelHandoff(const ExecutionDomain::HandoffTarget&) override;
-    void BeginValidation(QuicListener& target, const udp::endpoint& local,
-                         const udp::endpoint& remote);
-    [[nodiscard]] bool ValidationSucceeded() const noexcept { return validation_succeeded_; }
+    [[nodiscard]] net::any_io_executor Executor() const { return reactor_.get_executor(); }
+    [[nodiscard]] net::io_context& Reactor() const noexcept { return reactor_; }
     [[nodiscard]] bool Authenticated() const noexcept { return authenticated_; }
-    void EndValidation(bool committed) noexcept;
-
     // Physical admission starts when the connection is accepted and resolves
     // before any credential is evaluated, as on the TCP path.
     net::awaitable<void> ReservePhysicalAdmission();
@@ -172,8 +162,6 @@ private:
     net::awaitable<void> WaitClosed();
     SocketState* OutputSocket(const ngtcp2_path& path) const noexcept;
     void PublishExpiry() noexcept;
-    [[nodiscard]] bool CandidateSelected() const noexcept;
-    [[nodiscard]] bool CandidateValidationPending() const noexcept { return validation_pending_; }
     void InitializeBaseContext(const udp::endpoint& remote);
     void Flush();
     void Refuse() noexcept;
@@ -246,24 +234,15 @@ private:
         const ngtcp2_path*, ngtcp2_path_validation_result, void*);
 
     QuicListener* listener_;
-    QuicListener* validation_listener_ = nullptr;
+    net::io_context& reactor_;
+    memory::AllocationDomain allocation_;
     std::shared_ptr<app::PhysicalSessionCapabilities> capabilities_;
     std::shared_ptr<QuicOwnership> ownership_;
     memory::ThreadLocalVector<ConnectionId> connection_ids_;
-    std::unique_ptr<QuicDirectory::Retirement> retirement_;
     std::shared_ptr<app::PhysicalSessionRegistry> registry_;
     std::shared_ptr<app::PhysicalSessionRecord> registry_record_;
     AwaitableTaskGroup* tasks_ = nullptr;
     SignalChannel closed_signal_;
-    udp::endpoint candidate_local_;
-    udp::endpoint candidate_remote_;
-    ngtcp2_path_storage validation_original_path_{};
-    bool validating_ = false;
-    bool validation_succeeded_ = false;
-    bool validation_reused_ = false;
-    bool validation_authenticated_ = false;
-    bool validation_pending_ = false;
-    bool resource_registered_ = false;
     std::unique_ptr<Core> core_;
     session::Context base_context_;
     SignalChannel physical_ready_;

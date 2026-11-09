@@ -470,8 +470,7 @@ void VerifyProtocolLocalAssociation() {
 
 void VerifyHandoffDirectoryNamespaces() {
     using namespace ::worker_detail;
-    ::net::io_context coordinator;
-    auto& directory = ::net::use_service<UdpHandoffDirectory>(coordinator);
+    UdpHandoffDirectory directory;
     const auto& policy = ::ss::Ss2022UdpAssociation::Policy();
     auto configuration = std::make_shared<const ::proxyman::inbound::ProtocolSettings>();
     auto other_configuration = std::make_shared<const ::proxyman::inbound::ProtocolSettings>();
@@ -533,8 +532,7 @@ void VerifyHandoffDirectoryNamespaces() {
 
 void VerifyHandoffDirectoryTombstone(::net::io_context& io, Reclaimer& reclaimer) {
     using namespace ::worker_detail;
-    ::net::io_context coordinator;
-    auto& directory = ::net::use_service<UdpHandoffDirectory>(coordinator);
+    UdpHandoffDirectory directory;
     const auto& policy = ::ss::Ss2022UdpAssociation::Policy();
     auto configuration = std::make_shared<const ::proxyman::inbound::ProtocolSettings>();
     std::weak_ptr<const ::proxyman::inbound::ProtocolSettings> configuration_lifetime = configuration;
@@ -579,8 +577,7 @@ void VerifyHandoffDirectoryTombstone(::net::io_context& io, Reclaimer& reclaimer
 
 void VerifyHandoffDirectoryCapacity() {
     using namespace ::worker_detail;
-    ::net::io_context coordinator;
-    auto& directory = ::net::use_service<UdpHandoffDirectory>(coordinator);
+    UdpHandoffDirectory directory;
     const auto& policy = ::ss::Ss2022UdpAssociation::Policy();
     auto configuration = std::make_shared<const ::proxyman::inbound::ProtocolSettings>();
     ::InboundDatagramOwner owner;

@@ -83,14 +83,8 @@ public:
     AnyTLSSubStream(net::io_context& io_context,
                     AnyTLSDemuxSession& session,
                     uint32_t sid)
-        : input_signal_(ExecutionDomain::Current()
-                            ? ExecutionDomain::Current()->Executor()
-                            : net::any_io_executor(io_context.get_executor()),
-                        1)
-        , input_space_signal_(ExecutionDomain::Current()
-                                  ? ExecutionDomain::Current()->Executor()
-                                  : net::any_io_executor(io_context.get_executor()),
-                              1)
+        : input_signal_(net::any_io_executor(io_context.get_executor()), 1)
+        , input_space_signal_(net::any_io_executor(io_context.get_executor()), 1)
         , session_(session)
         , sid_(sid) {}
 

@@ -7,7 +7,6 @@
 #include "http_path_match.hpp"
 #include "xhttp_session.hpp"
 #include "../../common/awaitable_task_group.hpp"
-#include "app/session_group_executor.hpp"
 #include "common/allocator.hpp"
 #include "common/buffer_util.hpp"
 #include "common/container_util.hpp"
@@ -34,7 +33,6 @@ namespace {
 // This executor follows group ownership without relocating the session or its
 // coroutine frames. Plain io_context callers (including tests) remain valid.
 net::any_io_executor CaptureHttp2Executor(net::io_context& io_context) {
-    if (auto domain = ExecutionDomain::Current()) return domain->Executor();
     return io_context.get_executor();
 }
 
@@ -1953,11 +1951,9 @@ public:
         return session_.lock();
     }
     [[nodiscard]] net::io_context& IoContext() const noexcept {
-        return ExecutionDomain::Current()
-            ? ExecutionDomain::Current()->Reactor()
-            : static_cast<net::io_context&>(net::query(
-                  const_cast<SignalChannel&>(input_signal_).get_executor(),
-                  net::execution::context));
+        return static_cast<net::io_context&>(net::query(
+            const_cast<SignalChannel&>(input_signal_).get_executor(),
+            net::execution::context));
     }
     void SetUploadBudget(const std::shared_ptr<XHttpPacketUpSession>& budget) noexcept {
         upload_budget_ = budget;
@@ -2447,7 +2443,7 @@ public:
 
 private:
     [[nodiscard]] net::io_context& CurrentIoContext() const noexcept {
-        return ExecutionDomain::Current() ? ExecutionDomain::Current()->Reactor() : io_context_;
+        return io_context_;
     }
 
     net::awaitable<void> FlushReceiveCredit() {

@@ -120,16 +120,16 @@ private:
     std::atomic<size_t> rounds_{0};
     PeerThread thread_;
 };
-struct Commit { int old_owner, receiver; uint16_t port; std::string evidence; };
+struct Commit { int worker; uint16_t port; std::string evidence; };
 std::vector<Commit> Commits(const std::string& logs) {
-    const std::regex pattern("QUIC passive handoff committed old_owner=(\\d+) receiving_worker=(\\d+) remote=[^\\n]*?:(\\d+) path_evidence=(challenge|reused)");
+    const std::regex pattern("QUIC path (?:validated|updated) worker=(\\d+) remote=[^\\n]*?:(\\d+) path_evidence=(challenge|reused)");
     std::vector<Commit> result;
     for (auto it = std::sregex_iterator(logs.begin(), logs.end(), pattern); it != std::sregex_iterator(); ++it)
-        result.push_back({std::stoi((*it)[1]), std::stoi((*it)[2]), static_cast<uint16_t>(std::stoi((*it)[3])), (*it)[4]});
+        result.push_back({std::stoi((*it)[1]), static_cast<uint16_t>(std::stoi((*it)[2])), (*it)[3]});
     return result;
 }
 std::vector<std::pair<int, uint16_t>> Rejections(const std::string& logs) {
-    const std::regex pattern("QUIC passive claim rejected receiving_worker=(\\d+) remote=[^\\n]*?:(\\d+) reason=no-path-evidence");
+    const std::regex pattern("QUIC path packet rejected receiving_worker=(\\d+) remote=[^\\n]*?:(\\d+) reason=no-path-evidence");
     std::vector<std::pair<int, uint16_t>> result;
     for (auto it = std::sregex_iterator(logs.begin(), logs.end(), pattern); it != std::sregex_iterator(); ++it)
         result.emplace_back(std::stoi((*it)[1]), static_cast<uint16_t>(std::stoi((*it)[2])));
@@ -321,11 +321,11 @@ TEST_P(HysteriaReference, AuthenticatedCrossWorkerReturnAndFailClosedShutdown) {
             const auto commits = Commits(Logs(root.Path()));
             for (size_t i = first_commit; i < commits.size(); ++i) {
                 const auto& outward = commits[i];
-                if (outward.port != source || outward.old_owner == outward.receiver) continue;
+                if (outward.port != source) continue;
                 for (size_t j = i + 1; j < commits.size(); ++j) {
                     const auto& back = commits[j];
                     if (back.port == return_port && back.evidence == "reused" &&
-                        back.old_owner == outward.receiver && back.receiver == outward.old_owner) returned = true;
+                        back.worker == outward.worker) returned = true;
                 }
             }
             if (!returned) { exchange(); std::this_thread::sleep_for(20ms); }
@@ -359,9 +359,6 @@ TEST_P(HysteriaReference, AuthenticatedCrossWorkerReturnAndFailClosedShutdown) {
     Until([&] { return relay.BlockedResponse(); }, 1500ms);
     control.Join();
     server.Signal(SIGTERM); EXPECT_EQ(server.Wait(10s), 0);
-    const auto events = Logs(root.Path());
-    EXPECT_NE(events.find("QUIC passive claim abandoned receiving_worker=" + std::to_string(receiving_worker) + " reason=listener-stopped"), std::string::npos);
-    EXPECT_TRUE(std::regex_search(events, std::regex("QUIC passive rollback closed connection worker=\\d+ reason=selected-path-changed")));
     tcp.clear(); associations.clear(); udp.clear(); client.Stop(); control_client.Stop();
     if (upstream) upstream->Stop();
     relay.Join(); if (tap) tap->Join(); udp_target.Join(); target.Join(); binaries.Check();

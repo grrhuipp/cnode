@@ -4,7 +4,6 @@
 #include "common/target_address.hpp"
 #include "transport/async_stream.hpp"
 #include "transport/phase_deadline.hpp"
-#include "app/session_group_executor.hpp"
 
 #include <memory>
 #include <span>
@@ -20,10 +19,10 @@ class QuicStreamState final : public memory::ThreadAllocated {
 public:
     static constexpr size_t kMaxQueuedInputBytes = 512 * 1024;
 
-    QuicStreamState(int64_t stream_id, std::weak_ptr<Connection> owner);
+    QuicStreamState(net::io_context& io_context, int64_t stream_id, std::weak_ptr<Connection> owner);
 
     [[nodiscard]] int64_t Id() const noexcept { return stream_id_; }
-    [[nodiscard]] net::io_context& IoContext() const noexcept { return domain_->Reactor(); }
+    [[nodiscard]] net::io_context& IoContext() const noexcept { return io_context_; }
     transport::CancellationSource& Cancellation() noexcept { return cancellation_; }
     [[nodiscard]] bool PushInput(std::span<const uint8_t> data, bool fin);
     // Bytes received but not yet read; the transport inspects a request
@@ -67,7 +66,7 @@ private:
     void AcknowledgeInput(size_t bytes) noexcept;
     void WakeReader() noexcept;
 
-    std::shared_ptr<ExecutionDomain> domain_;
+    net::io_context& io_context_;
     int64_t stream_id_;
     std::weak_ptr<Connection> owner_;
     SignalChannel input_signal_;

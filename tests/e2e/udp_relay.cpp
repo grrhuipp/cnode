@@ -36,11 +36,6 @@ public:
             inbound["settings"] = {{"method", this->value.cipher == "aes" ? "2022-blake3-aes-128-gcm" : "2022-blake3-chacha20-poly1305"},
                 {"clients", Json::array({{{"password", Base64(Sequence(size))}}, {{"password", Base64(Sequence(size, size))}}})}};
         }
-        if (Handoff()) {
-            config["workers"] = 4;
-            config["log"] = {{"loglevel", "debug"}, {"logDir", root.Path().string()},
-                {"error", "handoff.log"}, {"access", "access.log"}, {"rotateDaily", false}, {"gzip", false}};
-        }
         Json outbound = {{"tag", "udp-out"}, {"protocol", this->value.protocol}, {"settings", Json::object()}};
         if (this->value.protocol == "shadowsocks") outbound["settings"] = SsSettings(peer.Port(), this->value.mode == "dns_timeout" ? "udp-sink.test" : "127.0.0.1");
         Json outbounds = Json::array({outbound});
@@ -170,21 +165,6 @@ void ExerciseHandoff(RelayRun& run) {
     EXPECT_EQ(actual, expected);
     EXPECT_FALSE(Readable(run.peer.Fd(), 100ms));
     run.child->Stop();
-    std::regex expression(R"(UDP passive handoff worker=(\d+) previous_worker=(\d+) session=(\d+)\b)");
-    size_t count = 0;
-    for (const auto* name : {"child.log", "handoff.log"}) {
-        if (!std::filesystem::exists(run.root.Path() / name)) continue;
-        auto text = ReadFile(run.root.Path() / name);
-        size_t sink_count = 0;
-        for (std::sregex_iterator it(text.begin(), text.end(), expression), end; it != end; ++it) {
-            auto worker = std::stoul((*it)[1].str()), previous = std::stoul((*it)[2].str());
-            EXPECT_LT(worker, 4u); EXPECT_LT(previous, 4u); EXPECT_NE(worker, previous);
-            EXPECT_EQ(std::stoull((*it)[3].str()), ReadBigEndian(first.session));
-            ++sink_count;
-        }
-        count = std::max(count, sink_count);
-    }
-    EXPECT_GE(count, 2u) << "requires actual repeated committed four-worker passive handoffs";
 }
 
 void ExerciseIsolation(RelayRun& run) {

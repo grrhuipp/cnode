@@ -10,7 +10,6 @@
 #include <memory>
 #include <string>
 
-class ExecutionDomain;
 
 namespace vless {
 struct VlessEncryptionConfig;
@@ -58,8 +57,6 @@ public:
 private:
     std::shared_ptr<const ::VlessOutboundConfig> config_;
     std::shared_ptr<::vless::VlessEncryptionClientTicketCache> encryption_tickets_;
-    std::weak_ptr<ExecutionDomain> ticket_domain_;
-    bool has_ticket_domain_ = false;
 };
 
 }  // namespace proxy::vless::outbound

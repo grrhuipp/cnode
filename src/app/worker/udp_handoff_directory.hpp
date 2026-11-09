@@ -31,18 +31,15 @@ struct UdpHandoffIdentityHash {
 struct UdpHandoffRecord {
     std::unique_ptr<InboundDatagramAssociation> association;
     std::weak_ptr<UdpIngress::ClientSession> session;
-    std::weak_ptr<ExecutionDomain> domain;
-    // Coordinator-only fields.
     uint32_t owner = 0;
     std::shared_ptr<const proxyman::inbound::ProtocolSettings> configuration;
 
     explicit UdpHandoffRecord(const InboundDatagramAssociationPolicy& policy)
         : association(policy.create()) {}
 };
-class UdpHandoffDirectory final : public net::execution_context::service {
+class UdpHandoffDirectory final {
 public:
-    inline static net::execution_context::id id;
-    explicit UdpHandoffDirectory(net::execution_context& context) : service(context) {}
+    UdpHandoffDirectory() = default;
 
     // Called only on GroupCoordinator. A tombstone is retained after its live
     // association ends until the entire timestamp/replay protection expires.
@@ -88,7 +85,6 @@ public:
         return record;
     }
 private:
-    void shutdown() override { records_.clear(); }
     std::unordered_map<UdpHandoffIdentity, std::shared_ptr<UdpHandoffRecord>,
                        UdpHandoffIdentityHash> records_;
 };

@@ -1,13 +1,14 @@
 #include "transport/internet/tcp_stream.hpp"
-#include "app/session_group_executor.hpp"
 #include "common/allocator.hpp"
 #include "common/buffer_util.hpp"
 #include "transport/internet/timeout_scheduler.hpp"
 #include "connection_timeouts.hpp"
-#include "native_socket_handoff.hpp"
 
+#include <asio/as_tuple.hpp>
+#include <asio/bind_allocator.hpp>
+#include <asio/bind_cancellation_slot.hpp>
 #include <asio/buffer.hpp>
-
+#include <asio/use_awaitable.hpp>
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -95,10 +96,9 @@ enum Flag : uint8_t {
     kDeferWriteCancellation = 1u << 4,
 };
 
-struct TcpStream::Impl : memory::ThreadAllocated,
-                         transport::internet::detail::NativeSocketHandoff<tcp> {
-    explicit Impl(tcp::socket socket, TcpStream& owner)
-        : NativeSocketHandoff(std::move(socket))
+struct TcpStream::Impl : memory::ThreadAllocated {
+    explicit Impl(tcp::socket sock, TcpStream& owner)
+        : socket(std::move(sock))
         , owner(owner)
         , timeouts(SocketIoContext(this->socket), *this) {}
 
@@ -112,7 +112,44 @@ struct TcpStream::Impl : memory::ThreadAllocated,
         owner.Close();
     }
 
-    void HandoffFailed() noexcept override { owner.Cancel(); owner.Close(); }
+    void MarkCancelled() noexcept { ++cancellation_epoch_; }
+
+    tcp::socket::executor_type GetExecutor() noexcept {
+        return socket.get_executor();
+    }
+
+    net::awaitable<IoErrorCode> Wait(
+        tcp::socket::wait_type type, net::cancellation_slot cancellation) {
+        struct State {
+            net::cancellation_signal native;
+            bool cancelled = false;
+        } state;
+        struct Subscription {
+            net::cancellation_slot slot;
+            ~Subscription() { if (slot.is_connected()) slot.clear(); }
+        } subscription{cancellation};
+        const auto cancelled_at = cancellation_epoch_;
+        if (state.cancelled || cancelled_at != cancellation_epoch_)
+            co_return IoErrorCode(io_error::operation_aborted);
+        if (cancellation.is_connected()) {
+            cancellation.assign([&state](net::cancellation_type kind) {
+                if (kind == net::cancellation_type::none) return;
+                state.cancelled = true;
+                state.native.emit(kind);
+            });
+        }
+        auto [error] = co_await socket.async_wait(
+            type,
+            net::bind_cancellation_slot(
+                state.native.slot(),
+                net::bind_allocator(
+                    memory::ProcessAllocator<std::byte>{},
+                    net::as_tuple(net::use_awaitable))));
+        state.native.slot().clear();
+        if (state.cancelled || cancelled_at != cancellation_epoch_)
+            co_return IoErrorCode(io_error::operation_aborted);
+        co_return error;
+    }
 
     [[nodiscard]] bool HasFlag(Flag flag) const noexcept {
         return (flags & static_cast<uint8_t>(flag)) != 0;
@@ -126,11 +163,34 @@ struct TcpStream::Impl : memory::ThreadAllocated,
         }
     }
 
+    tcp::socket socket;
     TcpStream& owner;
     transport::internet::detail::ConnectionTimeouts<Impl> timeouts;
     buf::MultiBuffer pending_data;
+    std::uint64_t cancellation_epoch_ = 0;
     uint8_t flags = 0;
 };
+
+DetachedTcpState::~DetachedTcpState() noexcept {
+    if (fd >= 0) ::close(fd);
+}
+
+DetachedTcpState::DetachedTcpState(DetachedTcpState&& other) noexcept
+    : fd(std::exchange(other.fd, -1))
+    , protocol(other.protocol)
+    , nonblocking(other.nonblocking)
+    , pending_bytes(std::move(other.pending_bytes)) {}
+
+DetachedTcpState& DetachedTcpState::operator=(DetachedTcpState&& other) noexcept {
+    if (this != &other) {
+        if (fd >= 0) ::close(fd);
+        fd = std::exchange(other.fd, -1);
+        protocol = other.protocol;
+        nonblocking = other.nonblocking;
+        pending_bytes = std::move(other.pending_bytes);
+    }
+    return *this;
+}
 
 // ============================================================================
 // TcpStream 实现
@@ -498,6 +558,54 @@ void TcpStream::PrependReadData(std::span<const uint8_t> data) {
     impl_->pending_data = std::move(prefix);
 }
 
+std::optional<DetachedTcpState> TcpStream::DetachForHandoff(
+    std::span<const uint8_t> prefix) {
+    if (!impl_->socket.is_open() || impl_->HasFlag(kReadShutdown)) {
+        return std::nullopt;
+    }
+    DetachedTcpState state;
+    const size_t total = prefix.size() + impl_->pending_data.byte_size();
+    if (total != 0) {
+        state.pending_bytes.reserve(total);
+        state.pending_bytes.insert(state.pending_bytes.end(), prefix.begin(), prefix.end());
+        for (const auto* b : impl_->pending_data) {
+            if (!b) continue;
+            const auto span = b->Bytes();
+            state.pending_bytes.insert(state.pending_bytes.end(), span.begin(), span.end());
+        }
+    }
+    ReleasePendingData();
+    IoErrorCode ec;
+    const auto local_ep = impl_->socket.local_endpoint(ec);
+    if (ec) return std::nullopt;
+    state.protocol = local_ep.protocol();
+    state.nonblocking = impl_->socket.non_blocking();
+    impl_->MarkCancelled();
+    impl_->timeouts.Stop();
+    state.fd = impl_->socket.release(ec);
+    if (ec || state.fd < 0) return std::nullopt;
+    NotifyClosed();
+    impl_->SetFlag(kReadShutdown);
+    impl_->SetFlag(kWriteShutdown);
+    return state;
+}
+
+std::unique_ptr<TcpStream> TcpStream::RestoreFromHandoff(
+    net::io_context& io_context, DetachedTcpState state) {
+    if (state.fd < 0) return nullptr;
+    tcp::socket socket(io_context);
+    IoErrorCode ec;
+    socket.assign(state.protocol, state.fd, ec);
+    if (ec) return nullptr;
+    state.fd = -1;
+    socket.non_blocking(state.nonblocking, ec);
+    if (ec) return nullptr;
+    auto stream = std::make_unique<TcpStream>(std::move(socket));
+    if (!state.pending_bytes.empty()) {
+        stream->PrependReadData(state.pending_bytes);
+    }
+    return stream;
+}
 
 void TcpStream::SetAbortiveClose(bool enable) noexcept {
     impl_->SetFlag(kAbortiveClose, enable);
@@ -674,9 +782,8 @@ net::awaitable<DialResult> TcpStream::Connect(
     if (timeout.count() <= 0) {
         co_return DialResult::Fail(ErrorCode::DIAL_TIMEOUT, "connection timed out");
     }
-    auto& reactor = transport::internet::detail::CurrentSocketReactor(io_context);
     IoErrorCode ec;
-    tcp::socket socket(reactor);
+    tcp::socket socket(io_context);
     socket.open(endpoint.protocol(), ec);
     if (ec)
         co_return DialResult::Fail(ErrorCode::SOCKET_CREATE_FAILED, ec.message(), ec.value());
@@ -693,7 +800,7 @@ net::awaitable<DialResult> TcpStream::ConnectWithBind(
         co_return DialResult::Fail(ErrorCode::DIAL_TIMEOUT, "connection timed out");
     }
 
-    tcp::socket socket(transport::internet::detail::CurrentSocketReactor(io_context));
+    tcp::socket socket(io_context);
     IoErrorCode ec;
     socket.open(remote_endpoint.protocol(), ec);
     if (ec) {

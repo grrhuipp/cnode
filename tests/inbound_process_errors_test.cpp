@@ -31,47 +31,27 @@ void Check(bool condition) {
     if (!condition) throw std::runtime_error("inbound fixture invariant failed");
 }
 
-struct DomainHooks final : ExecutionDomain::Hooks {
-    memory::AllocationDomain allocation;
-    std::optional<memory::ScopedAllocationDomain> lease;
-    std::exception_ptr failure;
-
-    void Enter() noexcept override { lease.emplace(allocation); }
-    void Leave() noexcept override { lease.reset(); }
-    void OnFailure(std::exception_ptr error) noexcept override { failure = error; }
-};
-
-// Keep the coordinator on the reactor, but construct, execute and destroy every
-// request object on the real domain executor with its allocation lease active.
 template<class Scenario>
 bool RunFixture(const RateLimitConfig& config, Scenario scenario) {
     net::io_context io;
     auto coordinator = std::make_shared<GroupCoordinator>(io);
     coordinator->RegisterWorker(0, io, io.get_executor());
-    auto hooks = std::make_shared<DomainHooks>();
-    auto domain = ExecutionDomain::Create(io, 0, io.get_executor(), hooks, coordinator);
-    hooks->allocation.SetLeaseGroup(
-        domain->LeaseIdentity(), ExecutionDomain::SharesLeaseIdentity);
+    memory::AllocationDomain allocation;
+    memory::ScopedAllocationDomain lease(allocation);
     auto limiter = ConnectionLimiter::Acquire(config, coordinator);
     bool result = false;
     bool finalized = false;
     std::exception_ptr failure;
     auto run = [&]() -> net::awaitable<void> {
         try {
-            result = co_await net::co_spawn(domain->Executor(),
-                [&]() -> net::awaitable<bool> {
-                    Check(ExecutionDomain::Current() == domain);
-                    co_return co_await scenario(io, *limiter);
-                }, net::use_awaitable);
+            result = co_await scenario(io, *limiter);
         } catch (...) {
             failure = std::current_exception();
         }
-        // Leave any inline domain completion before destroying its services.
         co_await net::post(io, net::use_awaitable);
         coordinator->CloseAdmission();
         co_await coordinator->AsyncJoin();
         coordinator->ReleaseServices();
-        domain.reset();
         co_await coordinator->Finalize();
         limiter.reset();
         finalized = true;
@@ -80,7 +60,6 @@ bool RunFixture(const RateLimitConfig& config, Scenario scenario) {
         if (error) failure = error;
     });
     io.run();
-    if (!failure) failure = hooks->failure;
     if (failure) {
         try { std::rethrow_exception(failure); }
         catch (const std::exception& error) {
@@ -106,7 +85,6 @@ void Raise(int fault) {
 class Stream final : public AsyncStream {
 public:
     explicit Stream(State& state) : state_(state) {
-        Check(bool(ExecutionDomain::Current()));
         Check(memory::CurrentAllocationDomain() != nullptr);
     }
     State& GetState() noexcept { return state_; }

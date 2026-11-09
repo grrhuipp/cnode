@@ -69,20 +69,6 @@ ErrorCode SessionExceptionError(const std::exception_ptr& failure,
     catch (...) { return unknown; }
 }
 
-struct PhysicalHooks final : memory::ThreadAllocated, ExecutionDomain::Hooks {
-    memory::AllocationDomain allocation;
-    std::optional<memory::ScopedAllocationDomain> scope;
-    void Enter() noexcept override { scope.emplace(allocation); }
-    void Leave() noexcept override { scope.reset(); }
-    void OnFailure(std::exception_ptr) noexcept override {
-        FailRuntime("AnyTLS physical domain", "uncaught execution callback failure");
-    }
-};
-
-net::any_io_executor SessionExecutor(net::io_context& io) {
-    if (auto domain = ExecutionDomain::Current()) return domain->Executor();
-    return io.get_executor();
-}
 
 template <class T, class... Args>
 [[nodiscard]] std::shared_ptr<T> AllocateWorkerShared(Args&&... args) {
@@ -96,8 +82,7 @@ template <class T, class... Args>
 // physical reader awaits its control update (at most one outstanding per
 // session); it never forwards payload or changes another session's scheme.
 struct Handler::PaddingState {
-    explicit PaddingState(net::io_context& io) : executor(SessionExecutor(io)) {}
-
+    explicit PaddingState(net::io_context& io) : executor(io.get_executor()) {}
     void Publish(std::shared_ptr<const PaddingScheme> next) noexcept {
         scheme = std::move(next);
     }
@@ -263,7 +248,6 @@ struct Handler::ClientSession : memory::ThreadAllocated {
         , padding_state_(std::move(padding_state))
         , opening_scheme_(std::move(opening_scheme))
         , scheme_(opening_scheme_)
-        , domain(ExecutionDomain::Current())
         , allocation_domain(memory::CurrentAllocationDomain())
         , local_endpoint(stream->LocalEndpoint())
         , remote_endpoint(stream->RemoteEndpoint()) {}
@@ -275,7 +259,6 @@ struct Handler::ClientSession : memory::ThreadAllocated {
     // Releasing it also records that settings have been sent successfully.
     std::shared_ptr<const PaddingScheme> opening_scheme_;
     std::shared_ptr<const PaddingScheme> scheme_;
-    const std::shared_ptr<ExecutionDomain> domain;
     memory::AllocationDomain* const allocation_domain = nullptr;
     const std::optional<tcp::endpoint> local_endpoint;
     const std::optional<tcp::endpoint> remote_endpoint;
@@ -326,7 +309,7 @@ struct Handler::ClientSession : memory::ThreadAllocated {
         std::optional<memory::ScopedAllocationDomain> scope;
         if (allocation_domain) scope.emplace(*allocation_domain);
         auto logical = memory::AllocateShared<LogicalStream>(
-            domain ? domain->Executor() : net::any_io_executor(io_context_.get_executor()));
+            net::any_io_executor(io_context_.get_executor()));
         logical_streams[sid] = logical;
         return logical;
     }
@@ -649,13 +632,7 @@ class Handler::SessionPool final : public memory::ThreadAllocated {
     static void Close(const std::shared_ptr<ClientSession>& session,
                       ErrorCode error = ErrorCode::CANCELLED) noexcept {
         if (!session) return;
-        if (!session->domain || session->domain->CanExecuteInline()) {
-            session->CloseAll(error);
-            return;
-        }
-        try {
-            session->domain->Execute([session, error] { session->CloseAll(error); });
-        } catch (...) {}
+        session->CloseAll(error);
     }
 
 public:
@@ -670,7 +647,6 @@ public:
                 Discard();
                 state_ = std::move(other.state_);
                 session_ = std::move(other.session_);
-                owner_domain_ = std::move(other.owner_domain_);
                 reusable_ = std::exchange(other.reusable_, false);
             }
             return *this;
@@ -684,32 +660,16 @@ public:
     private:
         friend class SessionPool;
         Lease(std::shared_ptr<State> state, std::shared_ptr<ClientSession> session) noexcept
-            : state_(std::move(state)), session_(std::move(session)),
-              owner_domain_(ExecutionDomain::Current()) {}
+            : state_(std::move(state)), session_(std::move(session)) {}
         void Discard() noexcept {
             if (!state_ || !session_) return;
-            // Detach has completed: the physical domain's native owner is
-            // stable until the next exclusive checkout. The original host is
-            // only its configuration namespace, not its reuse destination.
-            const auto executor = state_->executor;
-            const auto worker = session_->domain ? session_->domain->OwnerId() : 0;
-            auto release = [state = std::move(state_), session = std::move(session_),
-                            reusable = reusable_, worker] {
-                if (reusable) state->Release(session, worker);
-                else state->Remove(session);
-            };
-            try {
-                if (auto domain = owner_domain_.lock()) {
-                    if (domain->CanExecuteInline()) release();
-                    else domain->Execute(std::move(release));
-                } else {
-                    net::dispatch(executor, std::move(release));
-                }
-            } catch (...) {}
+            auto state = std::move(state_);
+            auto session = std::move(session_);
+            if (reusable_) state->Release(session, 0);
+            else state->Remove(session);
         }
         std::shared_ptr<State> state_;
         std::shared_ptr<ClientSession> session_;
-        std::weak_ptr<ExecutionDomain> owner_domain_;
         bool reusable_ = false;
     };
 
@@ -746,8 +706,7 @@ public:
             if (!session) {
                 throw std::invalid_argument("cannot adopt a closed AnyTLS session");
             }
-            state_->entries.push_back({session, std::nullopt,
-                session->domain ? session->domain->OwnerId() : 0});
+            state_->entries.push_back({session, std::nullopt, 0});
             if (!state_->Valid()) state_->Schedule();
             state_->Start(session);
             return Lease(state_, std::move(session));
@@ -768,7 +727,7 @@ private:
         State(net::io_context& io_context, AwaitableTaskGroup& owner_tasks,
               Clock::duration check, Clock::duration timeout,
               size_t minimum, std::string_view name)
-            : TimeoutEvent(io_context), executor(SessionExecutor(io_context)),
+            : TimeoutEvent(io_context), executor(io_context.get_executor()),
               tasks(owner_tasks),
               check_interval(check), idle_timeout(timeout),
               minimum_idle(minimum), tag(name) {
@@ -801,25 +760,15 @@ private:
                                                 std::shared_ptr<ClientSession> session) {
             std::exception_ptr failure;
             try {
-                if (session->domain) {
-                    // Cancellation is delivered as a domain control, never by
-                    // touching a moved socket from the cache host's thread.
-                    auto cancellation = co_await net::this_coro::cancellation_state;
-                    cancellation.slot().assign([session](net::cancellation_type type) {
-                        if (type != net::cancellation_type::none) Close(session);
-                    });
-                    struct ClearSlot {
-                        net::cancellation_slot slot;
-                        ~ClearSlot() { slot.clear(); }
-                    } clear{cancellation.slot()};
-                    // Create the resident reader frame after entering the
-                    // physical domain, not in the pool's allocation arena.
-                    co_await net::co_spawn(session->domain->Executor(),
-                        [session]() -> net::awaitable<void> { co_await session->Run(); },
-                        net::bind_cancellation_slot(net::cancellation_slot{}, net::use_awaitable));
-                } else {
-                    co_await session->Run();
-                }
+                auto cancellation = co_await net::this_coro::cancellation_state;
+                cancellation.slot().assign([session](net::cancellation_type type) {
+                    if (type != net::cancellation_type::none) Close(session);
+                });
+                struct ClearSlot {
+                    net::cancellation_slot slot;
+                    ~ClearSlot() { slot.clear(); }
+                } clear{cancellation.slot()};
+                co_await session->Run();
             } catch (...) {
                 failure = std::current_exception();
             }
@@ -1113,17 +1062,17 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     if (!inbound.Valid()) {
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
-    auto request = ExecutionDomain::Current();
-    const bool request_has_allocation = memory::CurrentAllocationDomain() != nullptr;
     const auto ordered_bind = dialer.SelectOrderedBind(ctx);
     std::shared_ptr<const PaddingScheme> opening_scheme;
-    uint32_t worker = 0;
-    auto acquire = [&]() -> net::awaitable<SessionPool::Lease> {
-        // This already-required pool control is the snapshot read boundary;
-        // the handshake uses the returned immutable value, never an atomic.
+    SessionPool::Lease transport_lease;
+    std::shared_ptr<ClientSession> session;
+    bool reusable = false;
+    std::exception_ptr failure;
+    OutboundProcessResult result = tl::unexpected(ErrorCode::INTERNAL);
+    try {
         opening_scheme = padding_->scheme;
-        co_return ordered_bind
-            ? pool_->AcquireIf(worker, [&](const ClientSession& physical) {
+        transport_lease = ordered_bind
+            ? pool_->AcquireIf(0, [&](const ClientSession& physical) {
                 const auto& remote = physical.remote_endpoint;
                 const auto& local = physical.local_endpoint;
                 if (!remote || !local) return false;
@@ -1132,99 +1081,36 @@ net::awaitable<OutboundProcessResult> Handler::Process(
                 return !selected.address ||
                     iputil::NormalizeAddress(local->address()) == *selected.address;
             })
-            : pool_->Acquire(worker);
-    };
-    SessionPool::Lease transport_lease;
-    std::shared_ptr<ClientSession> session;
-    std::shared_ptr<ExecutionDomain> physical;
-    bool attached = false;
-    bool reusable = false;
-    std::exception_ptr failure;
-    OutboundProcessResult result = tl::unexpected(ErrorCode::INTERNAL);
-    try {
-        for (;;) {
-            worker = request ? request->OwnerId() : 0;
-            transport_lease = co_await net::co_spawn(
-                pool_->Executor(), acquire(), net::use_awaitable);
-            session = transport_lease.Get();
-            physical = session ? session->domain : std::shared_ptr<ExecutionDomain>{};
-            if (!session && request) {
-                auto hooks = AllocateWorkerShared<PhysicalHooks>();
-                physical = request->CreateSibling(hooks);
-                hooks->allocation.SetLeaseGroup(
-                    physical->LeaseIdentity(), &ExecutionDomain::SharesLeaseIdentity);
-            }
-            if (!request || !physical) break;
-            attached = co_await request->AttachExclusive(physical);
-            if (attached) break;
-            // A receive-path handoff raced the host checkout. Never move the
-            // healthy physical resource to satisfy this borrow; return it to
-            // its existing Worker partition, then select on the new owner.
-            transport_lease.Reuse();
-            transport_lease = {};
-            session.reset();
-            physical.reset();
-        }
+            : pool_->Acquire(0);
+        session = transport_lease.Get();
         if (!session) {
-            auto open = [&]() -> net::awaitable<tl::expected<std::shared_ptr<ClientSession>, ErrorCode>> {
-                auto dialed = co_await DialPhysicalSession(dialer, *settings_,
-                    ordered_bind ? &*ordered_bind : nullptr, timeouts.HandshakeTimeout(),
-                    *opening_scheme, ctx);
-                if (!dialed) co_return tl::unexpected(dialed.error());
-                auto& io = physical ? physical->Reactor() : dialer.IoContext();
+            auto dialed = co_await DialPhysicalSession(dialer, *settings_,
+                ordered_bind ? &*ordered_bind : nullptr, timeouts.HandshakeTimeout(),
+                *opening_scheme, ctx);
+            if (!dialed) {
+                result = tl::unexpected(dialed.error());
+            } else {
                 auto* raw_session = new ClientSession(
-                    io, std::move(*dialed), padding_, std::move(opening_scheme));
-                memory::ScopedWorkerAllocation worker_allocation;
-                co_return std::shared_ptr<ClientSession>(
-                    raw_session,
-                    [physical](ClientSession* value) noexcept {
-                        if (!physical || physical->CanExecuteInline()) {
-                            delete value;
-                            return;
-                        }
-                        try {
-                            physical->Execute([value] { delete value; });
-                        } catch (...) {}
-                    },
-                    memory::ThreadLocalAllocator<ClientSession>{});
-            };
-            tl::expected<std::shared_ptr<ClientSession>, ErrorCode> opened =
-                tl::unexpected(ErrorCode::INTERNAL);
-            if (physical) {
-                opened = co_await net::co_spawn(
-                    physical->Executor(), open(), net::use_awaitable);
-            } else {
-                opened = co_await open();
-            }
-            if (!opened) {
-                result = tl::unexpected(opened.error());
-            } else {
-                session = std::move(*opened);
-                auto adopt = [&]() -> net::awaitable<SessionPool::Lease> {
-                    co_return pool_->Adopt(session);
-                };
-                transport_lease = co_await net::co_spawn(
-                    pool_->Executor(), adopt(), net::use_awaitable);
+                    dialer.IoContext(), std::move(*dialed), padding_, std::move(opening_scheme));
+                {
+                    memory::ScopedWorkerAllocation worker_allocation;
+                    session = std::shared_ptr<ClientSession>(
+                        raw_session,
+                        [](ClientSession* value) noexcept { delete value; },
+                        memory::ThreadLocalAllocator<ClientSession>{});
+                }
+                transport_lease = pool_->Adopt(session);
             }
         }
         if (session) {
-            auto run = ProcessSession(ctx, inbound, dialer, timeouts, stats, relay_config,
+            result = co_await ProcessSession(ctx, inbound, dialer, timeouts, stats, relay_config,
                 std::move(first_payload), relay_idle_timeout, relay_write_timeout, session, reusable);
-            if (physical && !request_has_allocation) {
-                result = co_await net::co_spawn(
-                    physical->Executor(), std::move(run), net::use_awaitable);
-            } else {
-                result = co_await std::move(run);
-            }
         }
     } catch (...) {
         failure = std::current_exception();
     }
-    // No lease can re-enter the idle index while its request domain is attached.
-    // Cancellation of the request cannot strand the exclusive ownership edge.
     co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
     session.reset();
-    if (attached) co_await request->DetachExclusive(physical);
     if (reusable && !failure) transport_lease.Reuse();
     if (failure) std::rethrow_exception(failure);
     co_return result;

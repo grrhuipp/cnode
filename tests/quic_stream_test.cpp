@@ -25,42 +25,23 @@ void Require(bool value, const char* reason) {
     if (!value) throw std::runtime_error(reason);
 }
 
-struct Hooks final : ExecutionDomain::Hooks {
-    memory::AllocationDomain allocation;
-    std::optional<memory::ScopedAllocationDomain> lease;
-    std::exception_ptr failure;
-    void Enter() noexcept override { lease.emplace(allocation); }
-    void Leave() noexcept override { lease.reset(); }
-    void OnFailure(std::exception_ptr error) noexcept override { failure = error; }
-};
-
 template <class Scenario>
 void RunInDomain(Scenario scenario) {
     net::io_context io;
-    auto coordinator = std::make_shared<GroupCoordinator>(io);
-    coordinator->RegisterWorker(0, io, io.get_executor());
-    auto hooks = std::make_shared<Hooks>();
-    auto domain = ExecutionDomain::Create(io, 0, io.get_executor(), hooks, coordinator);
-    hooks->allocation.SetLeaseGroup(domain->LeaseIdentity(), ExecutionDomain::SharesLeaseIdentity);
+    memory::AllocationDomain allocation;
+    memory::ScopedAllocationDomain lease(allocation);
     std::exception_ptr failure;
     bool completed = false;
     auto run = [&]() -> net::awaitable<void> {
         try {
-            co_await net::co_spawn(domain->Executor(), scenario(io), net::use_awaitable);
+            co_await scenario(io);
         } catch (...) { failure = std::current_exception(); }
-        co_await net::post(io, net::use_awaitable);
-        coordinator->CloseAdmission();
-        co_await coordinator->AsyncJoin();
-        coordinator->ReleaseServices();
-        domain.reset();
-        co_await coordinator->Finalize();
         completed = true;
     };
     net::co_spawn(io, run(), [&](std::exception_ptr error) { if (error) failure = error; });
     io.run_for(3s);
-    EXPECT_TRUE(completed) << "UDP scenario left its execution domain alive";
+    EXPECT_TRUE(completed) << "UDP scenario did not complete";
     if (failure) std::rethrow_exception(failure);
-    if (hooks->failure) std::rethrow_exception(hooks->failure);
 }
 
 class QuicUdpCancellation : public testing::TestWithParam<bool> {};
@@ -249,9 +230,8 @@ struct StreamCancellation final : transport::CancellationSubscription {
 
 TEST(QuicStreamClose, CompletedDuplexLeavesTransportAliveUntilNativeRetirement) {
     RunInDomain([](net::io_context& io) -> net::awaitable<void> {
-        (void)io;
         auto state = memory::AllocateShared<QuicStreamState>(
-            4, std::weak_ptr<transport::internet::hysteria::Connection>{});
+            io, 4, std::weak_ptr<transport::internet::hysteria::Connection>{});
         StreamCancellation cancellation;
         cancellation.Resubscribe(state->Cancellation());
         {
@@ -282,9 +262,8 @@ TEST(QuicStreamClose, CompletedDuplexLeavesTransportAliveUntilNativeRetirement) 
 
 TEST(QuicStreamClose, UnreadFinTailIsDiscardedAndCancelled) {
     RunInDomain([](net::io_context& io) -> net::awaitable<void> {
-        (void)io;
         auto state = memory::AllocateShared<QuicStreamState>(
-            8, std::weak_ptr<transport::internet::hysteria::Connection>{});
+            io, 8, std::weak_ptr<transport::internet::hysteria::Connection>{});
         transport::internet::hysteria::QuicStream stream(state);
         StreamCancellation cancellation;
         cancellation.Resubscribe(stream.Cancellation());
@@ -315,9 +294,8 @@ class QuicStreamHalfClose : public testing::TestWithParam<bool> {};
 TEST_P(QuicStreamHalfClose, CloseAbortsIncompleteDuplex) {
     const bool remote_fin = GetParam();
     RunInDomain([remote_fin](net::io_context& io) -> net::awaitable<void> {
-        (void)io;
         auto state = memory::AllocateShared<QuicStreamState>(
-            12, std::weak_ptr<transport::internet::hysteria::Connection>{});
+            io, 12, std::weak_ptr<transport::internet::hysteria::Connection>{});
         transport::internet::hysteria::QuicStream stream(state);
         StreamCancellation cancellation;
         cancellation.Resubscribe(stream.Cancellation());
@@ -348,9 +326,8 @@ class QuicStreamAbort : public testing::TestWithParam<bool> {};
 TEST_P(QuicStreamAbort, ExplicitAbortCancelsEvenCompletedDuplex) {
     const bool abortive_close = GetParam();
     RunInDomain([abortive_close](net::io_context& io) -> net::awaitable<void> {
-        (void)io;
         auto state = memory::AllocateShared<QuicStreamState>(
-            16, std::weak_ptr<transport::internet::hysteria::Connection>{});
+            io, 16, std::weak_ptr<transport::internet::hysteria::Connection>{});
         transport::internet::hysteria::QuicStream stream(state);
         StreamCancellation cancellation;
         cancellation.Resubscribe(stream.Cancellation());
@@ -380,8 +357,7 @@ INSTANTIATE_TEST_SUITE_P(Operations, QuicStreamAbort, testing::Bool(),
 
 TEST(QuicStreamWriteWait, BroadcastsWithoutLeavingStaleReadiness) {
     RunInDomain([](net::io_context& io) -> net::awaitable<void> {
-        (void)io;
-        QuicStreamState state(4, {});
+        QuicStreamState state(io, 4, {});
         const auto executor = co_await net::this_coro::executor;
         SignalChannel joined(executor, 2);
         std::exception_ptr failure;
@@ -420,9 +396,8 @@ class QuicStreamWriteWaitEnd : public testing::TestWithParam<WriteWaitEnd> {};
 TEST_P(QuicStreamWriteWaitEnd, SettlesPendingAndSubsequentWaits) {
     const auto ending = GetParam();
     RunInDomain([ending](net::io_context& io) -> net::awaitable<void> {
-        (void)io;
         auto state = memory::AllocateShared<QuicStreamState>(
-            8, std::weak_ptr<transport::internet::hysteria::Connection>{});
+            io, 8, std::weak_ptr<transport::internet::hysteria::Connection>{});
         transport::internet::hysteria::QuicStream stream(state);
         const std::array<uint8_t, 3> tail{0x21, 0x43, 0x65};
         Require(state->PushInput(tail, false), "input tail was not admitted");
@@ -497,8 +472,7 @@ INSTANTIATE_TEST_SUITE_P(Lifecycle, QuicStreamWriteWaitEnd,
 
 TEST(QuicStreamWriteWait, RemoteFinLeavesWriterWaitingForOutputCredit) {
     RunInDomain([](net::io_context& io) -> net::awaitable<void> {
-        (void)io;
-        QuicStreamState state(12, {});
+        QuicStreamState state(io, 12, {});
         const auto executor = co_await net::this_coro::executor;
         SignalChannel joined(executor, 1);
         std::exception_ptr failure;
@@ -529,8 +503,7 @@ TEST(QuicStreamWriteWait, RemoteFinLeavesWriterWaitingForOutputCredit) {
 
 TEST(QuicStreamWriteWait, CoroutineCancellationDoesNotBecomeAnAck) {
     RunInDomain([](net::io_context& io) -> net::awaitable<void> {
-        (void)io;
-        QuicStreamState state(16, {});
+        QuicStreamState state(io, 16, {});
         const auto executor = co_await net::this_coro::executor;
         SignalChannel joined(executor, 1);
         net::cancellation_signal cancellation;

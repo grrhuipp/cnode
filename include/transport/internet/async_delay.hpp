@@ -1,7 +1,6 @@
 #pragma once
 
 #include "common/asio_types.hpp"
-#include "app/session_group_executor.hpp"
 #include "transport/internet/timeout_scheduler.hpp"
 
 #include <asio/as_tuple.hpp>
@@ -20,8 +19,7 @@ class AsyncDelay final : private TimeoutEvent {
 public:
     explicit AsyncDelay(net::io_context& io_context)
         : TimeoutEvent(io_context),
-          wake_(ExecutionDomain::Current() ? ExecutionDomain::Current()->Executor()
-              : net::any_io_executor(io_context.get_executor()), 0) {}
+          wake_(net::any_io_executor(io_context.get_executor()), 0) {}
     AsyncDelay(const AsyncDelay&) = delete;
     AsyncDelay& operator=(const AsyncDelay&) = delete;
 

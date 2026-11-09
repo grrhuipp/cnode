@@ -122,7 +122,6 @@ constexpr std::string_view kPaddingB = "stop=8\n0=91-91\n1=320-320\n2=80-80\n";
 
 struct Wire {
     explicit Wire(net::io_context& io) : wake(io), open_gate(io) {}
-    std::shared_ptr<ExecutionDomain> domain = ExecutionDomain::Current();
     net::steady_timer wake;
     net::steady_timer open_gate;
     std::vector<uint8_t> input;
@@ -285,16 +284,6 @@ int io_fault_mode = 0;
 int io_fault_kind = 0;
 
 // The migration regression uses actual TCP sockets and the production native
-// resource registration/rebind path, rather than the fault-injection Wire.
-struct NativeDial {
-    std::shared_ptr<ExecutionDomain> domain;
-    TcpStream* stream;
-    int descriptor;
-    tcp::endpoint local;
-};
-std::optional<tcp::endpoint> native_peer;
-std::vector<NativeDial> native_dials;
-
 class Stream final : public AsyncStream {
 public:
     explicit Stream(std::shared_ptr<Wire> wire) : wire_(std::move(wire)) {}
@@ -489,15 +478,6 @@ public:
 
 net::awaitable<DialResult> DialOutboundTransport(net::io_context& io, session::Context&,
                                                 const OutboundTransportTarget&) {
-    if (native_peer) {
-        auto result = co_await TcpStream::Connect(io, *native_peer, 2s);
-        if (result.Ok()) {
-            auto* stream = static_cast<TcpStream*>(result.stream.get());
-            native_dials.push_back({ExecutionDomain::Current(), stream,
-                stream->NativeHandle(), stream->LocalEndpoint()});
-        }
-        co_return result;
-    }
     auto wire = std::make_shared<Wire>(io);
     wire->fail_settings = fail_first_session && dialed.empty();
     wire->respond_on_auth = respond_on_auth;
@@ -1151,35 +1131,21 @@ bool RunPoolLifecycle(bool join_before_retirement) {
 }
 
 bool RunDomainPoolIsolation() {
-    struct Hooks final : ExecutionDomain::Hooks {
-        void Enter() noexcept override {}
-        void Leave() noexcept override {}
-        void OnFailure(std::exception_ptr) noexcept override { std::terminate(); }
-    };
     net::io_context io;
     auto coordinator = std::make_shared<GroupCoordinator>(io, 2);
     coordinator->RegisterWorker(0, io, io.get_executor());
-    auto make_domain = [&] {
-        return ExecutionDomain::Create(io, 0, io.get_executor(),
-            std::make_shared<Hooks>(), coordinator);
-    };
-    auto host = make_domain(), first = make_domain(), second = make_domain();
     app::dns::Config dns_config;
     dns_config.servers = {{net::ip::address_v4::loopback(), 1}};
     app::dns::DNSWorker dns_worker(io, dns_config, 8);
     app::dns::DNS dns(dns_worker);
     TestDialer outbound(io, dns);
-    auto tasks = std::make_unique<ResidentTaskGroup>(host->Executor());
-    std::unique_ptr<proxy::anytls::outbound::Handler> handler;
-    host->Execute([&] {
-        proxy::anytls::outbound::Settings settings;
-        settings.server = LoopbackServer();
-        settings.idle_session_check_interval = 60s;
-        settings.idle_session_timeout = 60s;
-        handler = std::make_unique<proxy::anytls::outbound::Handler>("isolation", io,
-            std::make_shared<const proxy::anytls::outbound::Settings>(settings), tasks->Tasks());
-    });
-    io.run_for(30ms);
+    auto tasks = std::make_unique<ResidentTaskGroup>(io.get_executor());
+    proxy::anytls::outbound::Settings settings;
+    settings.server = LoopbackServer();
+    settings.idle_session_check_interval = 60s;
+    settings.idle_session_timeout = 60s;
+    auto handler = std::make_unique<proxy::anytls::outbound::Handler>("isolation", io,
+        std::make_shared<const proxy::anytls::outbound::Settings>(settings), tasks->Tasks());
     OpenOrderScenario scenario{.mode = 0, .before_write_completion = false};
     open_order_scenario = &scenario;
     fail_first_session = respond_on_auth = client_padding_probe = false;
@@ -1199,8 +1165,8 @@ bool RunDomainPoolIsolation() {
             {&clients[index], &clients[index], nullptr}, outbound.dialer,
             timeouts, stats, relay, {}, 10s, 10s);
     };
-    auto start = [&](const std::shared_ptr<ExecutionDomain>& owner, size_t index) {
-        net::co_spawn(owner->Executor(), request(index),
+    auto start = [&](size_t index) {
+        net::co_spawn(io, request(index),
             [&, index](std::exception_ptr error, OutboundProcessResult result) {
                 done[index] = !error && result && result->error == ErrorCode::OK &&
                     clients[index].received == 5;
@@ -1208,31 +1174,24 @@ bool RunDomainPoolIsolation() {
         io.restart();
         io.run_for(100ms);
     };
-    start(first, 0);
-    if (!done[0] || dialed.size() != 1 || !dialed[0]->domain)
-        throw std::runtime_error("domain pool warmup did not create one independent session");
-    bool passed = done[0] && dialed.size() == 1 && dialed[0]->domain &&
-        !dialed[0]->domain->SharesGroup(*first);
-    start(second, 1);
-    passed &= !done[1] && dialed.size() == 1 &&
-        dialed[0]->domain->SharesGroup(*second) &&
-        !host->SharesGroup(*second) && !first->SharesGroup(*second);
-    start(first, 2);
-    passed &= done[2] && dialed.size() == 2 &&
-        !dialed[1]->domain->SharesGroup(*second) &&
-        dialed[0]->domain->SharesGroup(*second);
+    start(0);
+    if (!done[0] || dialed.size() != 1)
+        throw std::runtime_error("pool warmup did not create one session");
+    bool passed = done[0] && dialed.size() == 1;
+    start(1);
+    passed &= !done[1] && dialed.size() == 1;
+    start(2);
+    passed &= done[2] && dialed.size() == 2;
     if (!dialed.empty()) {
-        auto wire = dialed.front();
-        wire->domain->Execute([wire] { wire->DeliverOpenResult(); });
+        dialed.front()->DeliverOpenResult();
     }
     io.restart();
     io.run_for(100ms);
-    passed &= done[1] && !dialed[0]->domain->SharesGroup(*second);
-    start(first, 3);
-    passed &= done[3] && dialed.size() == 2 &&
-        !host->SharesGroup(*first) && !first->SharesGroup(*second);
+    passed &= done[1];
+    start(3);
+    passed &= done[3] && dialed.size() == 2;
     bool joined = false;
-    net::co_spawn(host->Executor(), [&]() -> net::awaitable<void> {
+    net::co_spawn(io, [&]() -> net::awaitable<void> {
         handler.reset();
         co_await tasks->AsyncJoin();
     }, [&](std::exception_ptr error) { joined = !error; });
@@ -1244,7 +1203,6 @@ bool RunDomainPoolIsolation() {
     dialed.clear();
     open_order_scenario = nullptr;
     tasks.reset();
-    first.reset(); second.reset(); host.reset();
     coordinator->CloseAdmission();
     bool finalized = false;
     net::co_spawn(io, [&]() -> net::awaitable<void> {
@@ -1260,282 +1218,6 @@ bool RunDomainPoolIsolation() {
     return passed;
 }
 
-struct NativePeer {
-    explicit NativePeer(tcp::socket accepted, bool hold)
-        : socket(std::move(accepted)), hold_next(hold) {}
-    tcp::socket socket;
-    std::array<uint8_t, 32> password{};
-    uint16_t auth_padding = 0;
-    std::string settings;
-    std::vector<uint32_t> streams;
-    std::vector<size_t> waste;
-    size_t hearts = 0;
-    uint32_t held_sid = 0;
-    bool hold_next = false;
-    bool done = false;
-
-    net::awaitable<void> Send(uint8_t command, uint32_t sid, std::string_view payload = {}) {
-        std::vector<uint8_t> bytes{command, uint8_t(sid >> 24), uint8_t(sid >> 16),
-            uint8_t(sid >> 8), uint8_t(sid), uint8_t(payload.size() >> 8), uint8_t(payload.size())};
-        bytes.insert(bytes.end(), payload.begin(), payload.end());
-        co_await net::async_write(socket, net::buffer(bytes), net::use_awaitable);
-    }
-    net::awaitable<void> Update(std::string_view scheme) {
-        co_await Send(anytls::kCmdUpdatePaddingScheme, 0, scheme);
-        co_await Send(anytls::kCmdHeartRequest, 0);
-    }
-    net::awaitable<void> Run() {
-        std::array<uint8_t, 34> auth{};
-        co_await net::async_read(socket, net::buffer(auth), net::use_awaitable);
-        std::copy_n(auth.begin(), password.size(), password.begin());
-        auth_padding = uint16_t((uint16_t(auth[32]) << 8) | auth[33]);
-        std::vector<uint8_t> padding(auth_padding);
-        co_await net::async_read(socket, net::buffer(padding), net::use_awaitable);
-        for (;;) {
-            std::array<uint8_t, 7> header{};
-            co_await net::async_read(socket, net::buffer(header), net::use_awaitable);
-            const auto command = header[0];
-            const uint32_t sid = (uint32_t(header[1]) << 24) | (uint32_t(header[2]) << 16) |
-                (uint32_t(header[3]) << 8) | header[4];
-            const size_t length = (size_t(header[5]) << 8) | header[6];
-            std::string payload(length, '\0');
-            co_await net::async_read(socket, net::buffer(payload), net::use_awaitable);
-            if (command == anytls::kCmdSettings) settings = std::move(payload);
-            if (command == anytls::kCmdWaste) waste.push_back(length);
-            if (command == anytls::kCmdHeartResponse) ++hearts;
-            if (command != anytls::kCmdPSH ||
-                std::find(streams.begin(), streams.end(), sid) != streams.end()) continue;
-            streams.push_back(sid);
-            if (streams.size() == 1) {
-                co_await Send(anytls::kCmdServerSettings, 0, "v=2");
-                if (hold_next) co_await Update(kPaddingA);
-            }
-            co_await Send(anytls::kCmdSYNACK, sid);
-            co_await Send(anytls::kCmdPSH, sid, "reply");
-            if (std::exchange(hold_next, false)) held_sid = sid;
-            else co_await Send(anytls::kCmdFIN, sid);
-        }
-    }
-};
-
-bool RunNativePoolMigration() {
-    struct Hooks final : ExecutionDomain::Hooks {
-        void Enter() noexcept override {}
-        void Leave() noexcept override {}
-        void OnFailure(std::exception_ptr) noexcept override { std::terminate(); }
-    };
-    net::io_context io0, io1;
-    auto coordinator = std::make_shared<GroupCoordinator>(io0, 16);
-    coordinator->RegisterWorker(0, io0, io0.get_executor());
-    coordinator->RegisterWorker(1, io1, io1.get_executor());
-    auto make_domain = [&](net::io_context& io, uint32_t id) {
-        return ExecutionDomain::Create(io, id, io.get_executor(),
-            std::make_shared<Hooks>(), coordinator);
-    };
-    auto host = make_domain(io0, 0), other_host = make_domain(io1, 1);
-    auto moving = make_domain(io0, 0), original = make_domain(io0, 0);
-    auto current = make_domain(io1, 1), concurrent = make_domain(io1, 1);
-    auto pump = [&](auto predicate) {
-        const auto until = std::chrono::steady_clock::now() + 3s;
-        while (!predicate()) {
-            if (std::chrono::steady_clock::now() >= until)
-                throw std::runtime_error("native pool regression barrier timed out");
-            io0.restart(); io0.run_for(1ms);
-            io1.restart(); io1.run_for(1ms);
-        }
-    };
-    tcp::acceptor listener(io0, {net::ip::address_v4::loopback(), 0});
-    native_peer = listener.local_endpoint();
-    native_dials.clear();
-    std::vector<std::shared_ptr<NativePeer>> peers;
-    bool accept_done = false;
-    net::co_spawn(io0, [&]() -> net::awaitable<void> {
-        for (;;) {
-            auto socket = co_await listener.async_accept(net::use_awaitable);
-            auto peer = std::make_shared<NativePeer>(std::move(socket), peers.empty());
-            peers.push_back(peer);
-            net::co_spawn(io0, peer->Run(), [peer](std::exception_ptr) { peer->done = true; });
-        }
-    }, [&](std::exception_ptr) { accept_done = true; });
-    app::dns::Config dns_config;
-    dns_config.servers = {{net::ip::address_v4::loopback(), 1}};
-    app::dns::DNSWorker dns_worker(io0, dns_config, 8);
-    app::dns::DNS dns(dns_worker);
-    TestDialer outbound(io0, dns);
-    auto tasks = std::make_unique<ResidentTaskGroup>(host->Executor());
-    auto other_tasks = std::make_unique<ResidentTaskGroup>(other_host->Executor());
-    std::unique_ptr<proxy::anytls::outbound::Handler> handler, other_handler;
-    auto prepare = [&](bool other) {
-        proxy::anytls::outbound::Settings settings;
-        settings.server = LoopbackServer();
-        settings.idle_session_check_interval = settings.idle_session_timeout = 60s;
-        if (other) settings.password_hash.fill(0x7b);
-        auto& destination = other ? other_handler : handler;
-        auto& owner_tasks = other ? other_tasks : tasks;
-        destination = std::make_unique<proxy::anytls::outbound::Handler>(
-            "same-tag", other ? io1 : io0,
-            std::make_shared<const proxy::anytls::outbound::Settings>(settings), owner_tasks->Tasks());
-    };
-    host->Execute([&] { prepare(false); });
-    other_host->Execute([&] { prepare(true); });
-    pump([&] { return handler && other_handler; });
-    std::array<Client, 6> clients;
-    std::array<session::Context, 6> contexts;
-    std::array<bool, 6> done{}, success{};
-    auto request = [&](size_t index, bool other) -> net::awaitable<OutboundProcessResult> {
-        contexts[index].outbound.target = TargetAddress("192.0.2.1", 443);
-        contexts[index].content.network = Network::TCP;
-        StatsShard stats;
-        TimeoutsConfig timeouts;
-        RelayConfig relay;
-        relay.uplink_only = relay.downlink_only = 5s;
-        co_return co_await (other ? other_handler : handler)->Process(contexts[index],
-            {&clients[index], &clients[index], nullptr}, outbound.dialer,
-            timeouts, stats, relay, {}, 10s, 10s);
-    };
-    auto start = [&](const std::shared_ptr<ExecutionDomain>& domain, size_t index, bool other = false) {
-        net::co_spawn(domain->Executor(), request(index, other),
-            [&, index](std::exception_ptr error, OutboundProcessResult result) {
-                success[index] = !error && result && result->error == ErrorCode::OK &&
-                    clients[index].received == 5;
-                done[index] = true;
-            });
-    };
-    start(moving, 0);
-    pump([&] { return clients[0].received == 5 && peers.size() == 1 && peers[0]->hearts == 1; });
-    bool passed = native_dials.size() == 1 && !done[0] &&
-        native_dials[0].domain->SharesGroup(*moving);
-
-    // A real datagram arriving on W1 supplies the receive-path target. This
-    // fixture tests the domain/resource transaction, not QUIC authentication.
-    udp::socket receive(io1, {net::ip::address_v4::loopback(), 0});
-    udp::socket send(io0, udp::v4());
-    bool handed_off = false;
-    net::co_spawn(io1, [&]() -> net::awaitable<void> {
-        std::array<uint8_t, 1> token{};
-        udp::endpoint remote;
-        const auto count = co_await receive.async_receive_from(
-            net::buffer(token), remote, net::use_awaitable);
-        if (count != 1 || token[0] != 0xa7) throw std::runtime_error("invalid continuity token");
-        auto transaction = co_await moving->PreparePassiveHandoff(
-            {1, &io1, io1.get_executor()});
-        co_await transaction->Commit();
-    }, [&](std::exception_ptr error) {
-        if (error) std::rethrow_exception(error);
-        handed_off = true;
-    });
-    const std::array<uint8_t, 1> token{0xa7};
-    send.send_to(net::buffer(token), receive.local_endpoint());
-    pump([&] { return handed_off; });
-    bool observed = false, native_owner = false;
-    auto observe = [&] {
-        observed = false;
-        native_dials[0].domain->Execute([&] {
-            const auto& physical = native_dials[0];
-            native_owner = physical.domain->OwnerId() == 1 &&
-                &physical.stream->GetExecutor().context() == &io1 &&
-                physical.stream->NativeHandle() == physical.descriptor &&
-                physical.stream->LocalEndpoint() == physical.local;
-            observed = true;
-        });
-        pump([&] { return observed; });
-        passed &= native_owner;
-    };
-    observe();
-    auto finish = [&](const std::shared_ptr<NativePeer>& peer) {
-        bool sent = false;
-        net::co_spawn(io0, peer->Send(anytls::kCmdFIN, peer->held_sid),
-            [&](std::exception_ptr error) {
-                if (error) std::rethrow_exception(error);
-                sent = true;
-            });
-        pump([&] { return sent; });
-    };
-    finish(peers[0]);
-    pump([&] { return done[0]; });
-    passed &= success[0] && !native_dials[0].domain->SharesGroup(*moving);
-
-    // W0 cannot pull the migrated idle socket back. Its new handshake uses A.
-    start(original, 1);
-    pump([&] { return done[1]; });
-    if (native_dials.size() != 2 || peers.size() != 2)
-        throw std::runtime_error("original Worker borrowed the migrated socket instead of opening locally");
-    passed &= success[1] && native_dials.size() == 2 && peers.size() == 2;
-    passed &= peers[1]->auth_padding == 45 && peers[1]->settings ==
-        "v=2\nclient=cnode\npadding-md5=52a2071298e4ff6f3bad08249a70a53c";
-    observe();
-
-    // Updating the second physical session to B must not modify the first's
-    // negotiated A. The host publication is acknowledged by the heartbeat.
-    bool updated = false;
-    net::co_spawn(io0, peers[1]->Update(kPaddingB), [&](std::exception_ptr error) {
-        if (error) std::rethrow_exception(error);
-        updated = true;
-    });
-    pump([&] { return updated && peers[1]->hearts == 1; });
-    const auto previous_waste = peers[0]->waste.size();
-    start(current, 2);
-    pump([&] { return done[2] && peers[0]->waste.size() > previous_waste; });
-    passed &= success[2] && native_dials.size() == 2 && peers[0]->streams.size() == 2;
-    // Packet 2: SYN(7) + PSH header/address(14) + waste header(7) + 36 = A's 64.
-    passed &= !peers[0]->waste.empty() && peers[0]->waste.back() == 36;
-    observe();
-
-    // Same tag/current Worker but a different credential/configuration
-    // namespace must authenticate its own physical session, with its own
-    // untouched default padding snapshot.
-    start(current, 3, true);
-    pump([&] { return done[3]; });
-    passed &= success[3] && native_dials.size() == 3 && peers.size() == 3 &&
-        peers[2]->password[0] == 0x7b && peers[2]->auth_padding == 30;
-    observe();
-
-    // Keep A busy and open another connection in the original namespace on
-    // W1: the new handshake must consume B without altering the in-flight A.
-    peers[0]->hold_next = true;
-    start(current, 4);
-    pump([&] { return clients[4].received == 5 && peers[0]->streams.size() == 3; });
-    passed &= !done[4] && native_dials.size() == 3;
-    start(concurrent, 5);
-    pump([&] { return done[5]; });
-    passed &= success[5] && native_dials.size() == 4 && peers.size() == 4 &&
-        peers[3]->auth_padding == 91 && peers[3]->settings ==
-        "v=2\nclient=cnode\npadding-md5=75051a2e7a47cba8affd2d07cbe8d0c8";
-    finish(peers[0]);
-    pump([&] { return done[4]; });
-    passed &= success[4];
-    observe();
-
-    bool joined = false, other_joined = false;
-    net::co_spawn(host->Executor(), [&]() -> net::awaitable<void> {
-        handler.reset();
-        co_await tasks->AsyncJoin();
-    }, [&](std::exception_ptr error) { joined = !error; });
-    net::co_spawn(other_host->Executor(), [&]() -> net::awaitable<void> {
-        other_handler.reset();
-        co_await other_tasks->AsyncJoin();
-    }, [&](std::exception_ptr error) { other_joined = !error; });
-    pump([&] { return joined && other_joined; });
-    listener.close();
-    pump([&] { return accept_done && std::all_of(peers.begin(), peers.end(),
-        [](const auto& peer) { return peer->done; }); });
-    native_peer.reset();
-    native_dials.clear();
-    tasks.reset(); other_tasks.reset();
-    moving.reset(); original.reset(); current.reset(); concurrent.reset();
-    host.reset(); other_host.reset();
-    coordinator->CloseAdmission();
-    bool finalized = false;
-    net::co_spawn(io0, [&]() -> net::awaitable<void> {
-        co_await coordinator->AsyncJoin();
-        coordinator->ReleaseServices();
-        co_await coordinator->Finalize();
-    }, [&](std::exception_ptr error) { finalized = !error; });
-    pump([&] { return finalized; });
-    std::printf("native-pool-migration physical=%zu original=%d current=%d isolated=%d padding=%d: %s\n",
-        peers.size(), success[1], success[2], success[3], success[5], passed ? "PASS" : "FAIL");
-    return passed;
-}
 }
 
 TEST(AnytlsOutboundLifecycle, Contract) {
@@ -1547,7 +1229,6 @@ TEST(AnytlsOutboundLifecycle, Contract) {
     } restore{original};
     try {
         bool passed = RunClientPadding();
-        passed &= RunNativePoolMigration();
         for (int mode = 0; mode < 9; ++mode)
             for (bool before : {false, true})
                 if (!before || (mode != 6 && mode != 7)) passed &= RunOpenOrder(mode, before);

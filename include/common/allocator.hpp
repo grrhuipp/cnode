@@ -224,7 +224,6 @@ public:
 
 
     ~worker_memory() override {
-        DrainRemoteFrees();
         if (pooling_) {
             for (auto* chunk = pooling_->all; chunk; chunk = chunk->all_next) {
                 if (chunk->live != 0) std::terminate();
@@ -235,27 +234,23 @@ public:
         }
     }
 
-    [[nodiscard]] Footprint GetFootprint() noexcept {
-        DrainRemoteFrees();
+    [[nodiscard]] Footprint GetFootprint() const noexcept {
         return footprint_;
     }
 
     void Purge() noexcept {
-        DrainRemoteFrees();
         if (!pooling_ || !pooling_->idle_head) return;
         ReleaseExpiredChunks(Clock::now());
     }
 
     void PurgeIdle() noexcept {
-        DrainRemoteFrees();
         if (!pooling_) return;
         while (pooling_->idle_head) {
             ReleaseChunk(*pooling_->idle_head);
         }
     }
 
-    [[nodiscard]] Clock::time_point NextPurgeDeadline() noexcept {
-        DrainRemoteFrees();
+    [[nodiscard]] Clock::time_point NextPurgeDeadline() const noexcept {
         return pooling_ && pooling_->idle_head
             ? pooling_->idle_head->idle_at + kThreadMemoryPoolPurgeDelay
             : Clock::time_point::max();
@@ -315,7 +310,6 @@ public:
         const auto token = detail::CurrentThreadToken();
         if (owner_token_ == 0) owner_token_ = token;
         if (owner_token_ != token) std::terminate();
-        DrainRemoteFrees();
         return AllocateImpl(bytes, alignment);
     }
 
@@ -364,12 +358,7 @@ public:
             bytes > chunk->slot_capacity ||
             (alignment && (!ValidAlignment(alignment) ||
              reinterpret_cast<std::uintptr_t>(pointer) % alignment != 0))) return;
-        if (chunk->owner != detail::CurrentThreadToken()) {
-            OnRemoteFree();
-            QueueRemote(*header);
-            return;
-        }
-        DrainRemoteFrees();
+        if (chunk->owner != detail::CurrentThreadToken()) std::terminate();
         DeallocateLocal(*header, *chunk);
     }
 
@@ -457,31 +446,7 @@ private:
         }
         return pooling_.get();
     }
-    void QueueRemote(SlotHeader& header) noexcept {
-        auto* head = remote_frees_.load(std::memory_order_relaxed);
-        do {
-            header.next_free = head;
-        } while (!remote_frees_.compare_exchange_weak(
-            head, &header, std::memory_order_release, std::memory_order_relaxed));
-    }
-    void DrainRemoteFrees() noexcept {
-        // The probe only tests emptiness; ReclaimRemoteBatch acquires QueueRemote's release.
-        // A push after an empty probe remains queued for the next drain.
-        if (remote_frees_.load(std::memory_order_relaxed) == nullptr) return;
-        if (owner_token_ != 0 && owner_token_ != detail::CurrentThreadToken()) return;
-        ReclaimRemoteBatch();
-    }
-    // Keep the nonempty batch walk out of local allocation and return callers.
-    [[gnu::noinline]] void ReclaimRemoteBatch() noexcept {
-        auto* current = remote_frees_.exchange(nullptr, std::memory_order_acquire);
-        while (current) {
-            auto* next = current->next_free;
-            auto* chunk = reinterpret_cast<Chunk*>(current->owner);
-            DeallocateLocal(*current, *chunk);
-            current = next;
-        }
-    }
-    // Keep expiry scanning shared; reuse the phase clock without re-entering remote drains.
+    // Keep expiry scanning shared; reuse the phase clock.
     [[gnu::noinline]] void ReleaseExpiredChunks(Clock::time_point now) noexcept {
         while (pooling_->idle_head &&
                now - pooling_->idle_head->idle_at >= kThreadMemoryPoolPurgeDelay) {
@@ -737,7 +702,6 @@ private:
 
     std::pmr::memory_resource* upstream_;
     std::uintptr_t owner_token_ = 0;
-    std::atomic<SlotHeader*> remote_frees_{nullptr};
     std::size_t request_initial_buffer_bytes_;
     std::size_t retained_block_bytes_;
     std::unique_ptr<PoolState, PoolStateDeleter> pooling_;
@@ -750,8 +714,6 @@ private:
 // resource without retaining the connection host.
 class domain_memory_resource final : public std::pmr::memory_resource {
 public:
-    using SharesLeaseGroup = bool (*)(const void*, const void*) noexcept;
-
     [[nodiscard]] std::shared_ptr<void> Lifetime() const noexcept {
         return lifetime_.lock();
     }
@@ -768,7 +730,7 @@ public:
         RequireLease();
         auto* source = worker_memory::DomainOf(pointer);
         if (!source || source == this) return;
-        source->RequireLease();
+        if (source->owner_token_ != owner_token_) std::terminate();
         if (source->live_allocations_ == 0) std::terminate();
         if (live_allocations_++ == 0) live_lifetime_ = lifetime_.lock();
         worker_memory::SetDomain(pointer, this);
@@ -804,11 +766,10 @@ private:
         return this == &other;
     }
 
+    const std::uintptr_t owner_token_ = detail::CurrentThreadToken();
     std::weak_ptr<domain_memory_resource> lifetime_;
     std::shared_ptr<void> live_lifetime_;
     std::size_t live_allocations_ = 0;
-    std::shared_ptr<const void> group_identity_;
-    SharesLeaseGroup shares_group_ = nullptr;
 };
 
 class AllocationDomain final {
@@ -820,17 +781,11 @@ public:
     AllocationDomain(const AllocationDomain&) = delete;
     AllocationDomain& operator=(const AllocationDomain&) = delete;
     ~AllocationDomain() {
-        if (lease_.load(std::memory_order_relaxed) != 0) std::terminate();
+        if (active_scopes_ != 0) std::terminate();
     }
     [[nodiscard]] domain_memory_resource& memory() noexcept { return *resource_; }
     [[nodiscard]] std::pmr::memory_resource* resource() noexcept {
         return resource_.get();
-    }
-    using SharesLeaseGroup = domain_memory_resource::SharesLeaseGroup;
-    void SetLeaseGroup(std::shared_ptr<const void> identity,
-                       SharesLeaseGroup shares_group) noexcept {
-        resource_->group_identity_ = std::move(identity);
-        resource_->shares_group_ = shares_group;
     }
     [[nodiscard]] std::size_t OutstandingAllocations() const noexcept {
         return resource_->OutstandingAllocations();
@@ -838,19 +793,14 @@ public:
 
 private:
     friend class ScopedAllocationDomain;
-    std::atomic<std::uintptr_t> lease_{0};
+    const std::uintptr_t owner_token_ = detail::CurrentThreadToken();
+    std::size_t active_scopes_ = 0;
     std::shared_ptr<domain_memory_resource> resource_;
 };
 
 inline void domain_memory_resource::RequireLease() const noexcept {
     const auto* current = detail::current_allocation_domain;
-    if (!current) std::terminate();
-    const auto& active =
-        const_cast<AllocationDomain*>(current)->memory();
-    if (&active == this) return;
-    if (!shares_group_ || shares_group_ != active.shares_group_ ||
-        !group_identity_ || !active.group_identity_ ||
-        !shares_group_(group_identity_.get(), active.group_identity_.get()))
+    if (!current || &const_cast<AllocationDomain*>(current)->memory() != this)
         std::terminate();
 }
 
@@ -865,17 +815,15 @@ class ScopedAllocationDomain final {
 public:
     explicit ScopedAllocationDomain(AllocationDomain& domain) noexcept
         : domain_(domain), previous_(detail::current_allocation_domain) {
-        const auto token = detail::CurrentThreadToken();
-        auto expected = std::uintptr_t{0};
-        acquired_ = domain_.lease_.compare_exchange_strong(
-            expected, token, std::memory_order_acquire);
-        if (!acquired_ && expected != token) std::terminate();
+        if (domain_.owner_token_ != detail::CurrentThreadToken()) std::terminate();
+        ++domain_.active_scopes_;
         detail::current_allocation_domain = &domain_;
     }
     ~ScopedAllocationDomain() {
-        if (detail::current_allocation_domain != &domain_) std::terminate();
+        if (detail::current_allocation_domain != &domain_ ||
+            domain_.active_scopes_ == 0) std::terminate();
+        --domain_.active_scopes_;
         detail::current_allocation_domain = previous_;
-        if (acquired_) domain_.lease_.store(0, std::memory_order_release);
     }
     ScopedAllocationDomain(const ScopedAllocationDomain&) = delete;
     ScopedAllocationDomain& operator=(const ScopedAllocationDomain&) = delete;
@@ -883,7 +831,6 @@ public:
 private:
     AllocationDomain& domain_;
     AllocationDomain* previous_;
-    bool acquired_ = false;
 };
 
 // Shared listener output remains on this Worker after the producing session

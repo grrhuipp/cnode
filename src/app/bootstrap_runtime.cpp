@@ -72,13 +72,10 @@ public:
         co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
         if (!stopping) {
             try {
-                std::vector<net::awaitable<void>> startups;
-                startups.reserve(ctx.workers.size());
                 for (const auto& worker : ctx.workers) {
-                    startups.push_back(worker->PostTask(
-                        StartWorkerInbounds(*worker, ctx.inbound_startup.entries)));
+                    co_await worker->PostTask(
+                        StartWorkerInbounds(*worker, ctx.inbound_startup.entries));
                 }
-                co_await RunAwaitableBatch(ctx.main_ctx.get_executor(), std::move(startups));
                 if (!stopping) {
                     if (ctx.enable_controller) ctx.controller.Start();
                     monitor.Start();
@@ -147,8 +144,6 @@ public:
                     }, net::use_awaitable);
             } catch (...) { RecordFailure(std::current_exception()); }
         }
-        // A migrated domain can retain a different Worker's native reactor.
-        // No reactor work guard is released until every Worker has joined.
         for (size_t i = 0; i < started_threads; ++i) ctx.work_guards[i].reset();
         bool dns_joined = false;
         while (!dns_joined) {

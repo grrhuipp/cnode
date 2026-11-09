@@ -460,8 +460,6 @@ TEST(AwaitableTaskGroup, Contract) {
         TestIdleResidentGroup(resource);
         TestResidentGroup();
         Check(resource.live.load() == 0, "all PMR task bookkeeping must be released");
-        Check(::memory::RemoteFreeCount() == 0,
-              "group and child PMR objects must be freed on the target executor");
     } catch (const std::exception& error) {
         fail_after = -1;
         std::cerr << error.what() << '\n';

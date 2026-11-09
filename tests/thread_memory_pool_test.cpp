@@ -257,11 +257,8 @@ bool RunOwnershipAndPmr() {
     void* p = AllocatePmr(8192, 16);
     if (!p) return false;
     std::memset(p, 0xa5, 8192);
-    const auto remote_frees = RemoteFreeCount();
-    std::thread wrong([p] { DeallocatePmr(p); });
-    wrong.join();
-    if (RemoteFreeCount() != remote_frees + 1 ||
-        pool.GetFootprint().mapped_bytes == 0) return false;
+    DeallocatePmr(p);
+    if (pool.GetFootprint().mapped_bytes == 0) return false;
     pool.PurgeIdle();
     if (pool.GetFootprint().mapped_bytes != 0) return false;
     reject_next_pmr_allocation = true;
@@ -540,10 +537,9 @@ bool RunDomainMigration() {
         }
     }
     bool intact = false;
-    std::thread migrated([&] {
+    {
         ScopedAllocationDomain lease(domain);
-        intact = ThreadMemoryPool().resource() != original &&
-            payload->vector.back() == 3 && payload->string.size() == 80 &&
+        intact = payload->vector.back() == 3 && payload->string.size() == 80 &&
             payload->queue.front() == 9 && *payload->shared == 42 &&
             payload->buffers.byte_size() == 12;
         payload->vector.resize(1024, 8);
@@ -551,8 +547,7 @@ bool RunDomainMigration() {
         (void)payload->arena.resource()->allocate(12000, 16);
         delete payload;
         intact = intact && domain.OutstandingAllocations() == 0;
-    });
-    migrated.join();
+    }
     ThreadMemoryPool().PurgeIdle();
     return intact && ThreadMemoryPool().GetFootprint().mapped_bytes == 0 &&
         CurrentAllocationDomain() == nullptr;
@@ -584,16 +579,18 @@ bool RunLeaseRejection() {
         ScopedAllocationDomain wrong(second);
         (void)arena.resource()->allocate(16, 8);
     });
-    return no_lease && other_domain && concurrent && arena_bypass;
+    const bool cross_thread_free = RejectsLeaseViolation([] {
+        void* block = AllocatePmr(256, 16);
+        if (!block) std::terminate();
+        std::thread wrong([block] { DeallocatePmr(block); });
+        wrong.join();
+    });
+    return no_lease && other_domain && concurrent && arena_bypass && cross_thread_free;
 }
 
 bool RunJoinedDomainBorrow() {
     auto first = std::make_unique<AllocationDomain>();
     AllocationDomain second;
-    auto group = std::make_shared<int>(0);
-    auto shares = +[](const void* left, const void* right) noexcept { return left == right; };
-    first->SetLeaseGroup(group, shares);
-    second.SetLeaseGroup(group, shares);
     auto* resource = first->resource();
     std::weak_ptr<void> arena = first->memory().Lifetime();
     struct Raw : ThreadAllocated { int value = 17; };
@@ -611,25 +608,24 @@ bool RunJoinedDomainBorrow() {
         empty = new ThreadLocalVector<int>;
         empty_queue = new ThreadLocalDeque<int>;
         raw = new Raw;
-    }
-    first.reset(); // Drop the physical host before borrowed payload/containers.
-    if (arena.expired()) return false;
-    bool intact = false;
-    std::thread migrated([&] {
-        ScopedAllocationDomain lease(second);
         {
             ThreadLocalVector<int> moved;
             moved = std::move(*vector);
-            intact = buffer->Len() == 1 && moved.get_allocator().resource() == resource &&
-                raw->value == 17;
+            if (buffer->Len() != 1 || moved.get_allocator().resource() != resource ||
+                raw->value != 17)
+                return false;
             moved.resize(10000, 8);
             ::buf::Buffer::Free(buffer);
             delete raw;
         }
-        // Empty containers do not pin a retired physical connection arena.
-        intact = intact && arena.expired();
+    }
+    first.reset();
+    if (!arena.expired()) return false;
+    bool intact = false;
+    {
+        ScopedAllocationDomain lease(second);
         vector->push_back(31);
-        intact = intact && vector->get_allocator().resource() == second.resource() &&
+        intact = vector->get_allocator().resource() == second.resource() &&
             vector->front() == 31;
         delete vector;
         {
@@ -655,8 +651,7 @@ bool RunJoinedDomainBorrow() {
         empty_queue->push_back(42);
         intact = intact && empty_queue->get_allocator().resource() == second.resource();
         delete empty_queue;
-    });
-    migrated.join();
+    }
     return intact;
 }
 
@@ -990,32 +985,25 @@ TEST(ThreadMemoryPool, RetiredAllocatorRebindsForNestedPairConstructionWithoutAl
 TEST(ThreadMemoryPool, DrainedBorrowedQueueReleasesRetiredDomainAndRebinds) {
     auto retired = std::make_unique<memory::AllocationDomain>();
     memory::AllocationDomain current;
-    auto group = std::make_shared<int>(0);
-    auto shares = +[](const void* left, const void* right) noexcept { return left == right; };
-    retired->SetLeaseGroup(group, shares);
-    current.SetLeaseGroup(group, shares);
     std::weak_ptr<void> lifetime = retired->memory().Lifetime();
     memory::RingDeque<int> queue(retired->resource());
     {
         memory::ScopedAllocationDomain lease(*retired);
         queue.push_back(42);
+        EXPECT_EQ(queue.front(), 42);
+        queue.pop_front();
     }
     retired.reset();
-    ASSERT_FALSE(lifetime.expired());
-    bool intact = false;
-    std::thread migrated([&] {
+    ASSERT_TRUE(lifetime.expired());
+    {
         memory::ScopedAllocationDomain lease(current);
-        intact = queue.front() == 42;
-        queue.pop_front();
-        intact = intact && lifetime.expired() && queue.capacity() == 0;
+        EXPECT_EQ(queue.capacity(), 0u);
         queue.push_back(73);
-        intact = intact && queue.front() == 73 &&
-            queue.get_allocator().resource() == current.resource();
+        EXPECT_EQ(queue.front(), 73);
+        EXPECT_EQ(queue.get_allocator().resource(), current.resource());
         queue.pop_front();
-        intact = intact && current.OutstandingAllocations() == 0;
-    });
-    migrated.join();
-    EXPECT_TRUE(intact);
+        EXPECT_EQ(current.OutstandingAllocations(), 0u);
+    }
     EXPECT_TRUE(lifetime.expired());
     memory::ThreadMemoryPool().PurgeIdle();
 }
@@ -1023,123 +1011,25 @@ TEST(ThreadMemoryPool, DrainedBorrowedQueueReleasesRetiredDomainAndRebinds) {
 TEST(ThreadMemoryPool, BorrowedQueueConstructsNestedPayloadsAfterHostRetirement) {
     auto retired = std::make_unique<memory::AllocationDomain>();
     memory::AllocationDomain current;
-    auto group = std::make_shared<int>(0);
-    auto shares = +[](const void* left, const void* right) noexcept { return left == right; };
-    retired->SetLeaseGroup(group, shares);
-    current.SetLeaseGroup(group, shares);
     auto* original = retired->resource();
     std::weak_ptr<void> lifetime = retired->memory().Lifetime();
     memory::RingDeque<memory::ThreadLocalString> queue(original);
     {
         memory::ScopedAllocationDomain lease(*retired);
         queue.emplace_back(80, 'a');
+        queue.clear();
     }
     retired.reset();
-    ASSERT_FALSE(lifetime.expired());
-    bool intact = false;
-    std::thread migrated([&] {
+    ASSERT_TRUE(lifetime.expired());
+    {
         memory::ScopedAllocationDomain lease(current);
-        queue.emplace_back(96, 'b');
-        queue.emplace_front(112, 'c');
-        queue.emplace_back(128, 'd');
-        queue.emplace_front(144, 'e');
-        constexpr std::array sizes{144u, 112u, 80u, 96u, 128u};
-        constexpr std::array values{'e', 'c', 'a', 'b', 'd'};
-        intact = queue.size() == sizes.size();
-        for (std::size_t index = 0; index < queue.size(); ++index) {
-            const auto& value = queue[index];
-            intact = intact && value.size() == sizes[index] &&
-                value.find_first_not_of(values[index]) == memory::ThreadLocalString::npos &&
-                value.get_allocator().resource() == original;
-        }
-        queue.clear();
-        intact = intact && lifetime.expired();
         queue.emplace_back(80, 'f');
-        intact = intact && queue.front().get_allocator().resource() == current.resource() &&
-            queue.front().size() == 80 &&
-            queue.front().find_first_not_of('f') == memory::ThreadLocalString::npos;
+        EXPECT_EQ(queue.front().get_allocator().resource(), current.resource());
+        EXPECT_EQ(queue.front().size(), 80u);
+        EXPECT_EQ(queue.front().find_first_not_of('f'), memory::ThreadLocalString::npos);
         queue.clear();
-        intact = intact && current.OutstandingAllocations() == 0;
-    });
-    migrated.join();
-    EXPECT_TRUE(intact);
+        EXPECT_EQ(current.OutstandingAllocations(), 0u);
+    }
     EXPECT_TRUE(lifetime.expired());
     memory::ThreadMemoryPool().PurgeIdle();
-}
-
-TEST(ThreadMemoryPool, RemoteBatchExpiresOldIdleChunksAndRetainsNewReturns) {
-    memory::worker_memory pool;
-    auto* expired = pool.Allocate(64, 16);
-    auto* small = pool.Allocate(256, 16);
-    auto* large = pool.Allocate(32768, 16);
-    ASSERT_NE(expired, nullptr);
-    ASSERT_NE(small, nullptr);
-    ASSERT_NE(large, nullptr);
-    pool.Deallocate(expired);
-    const auto expired_deadline = pool.NextPurgeDeadline();
-    std::this_thread::sleep_until(expired_deadline + std::chrono::milliseconds(5));
-    std::thread remote([&] {
-        pool.Deallocate(small);
-        pool.Deallocate(large);
-    });
-    remote.join();
-    const auto footprint = pool.GetFootprint();
-    const auto retained = memory::worker_memory::Describe(256, 16).map_bytes +
-        memory::worker_memory::Describe(32768, 16).map_bytes;
-    EXPECT_EQ(footprint.mapped_bytes, retained);
-    EXPECT_EQ(footprint.idle_bytes, retained);
-    EXPECT_EQ(footprint.chunks, 2u);
-    EXPECT_GT(pool.NextPurgeDeadline(), expired_deadline);
-    pool.PurgeIdle();
-    EXPECT_EQ(pool.GetFootprint().mapped_bytes, 0u);
-}
-
-TEST(ThreadMemoryPool, ConcurrentRemoteReturnsPreserveLiveBlocksAndReclaimStorage) {
-    memory::worker_memory pool;
-    constexpr size_t returners = 4;
-    constexpr size_t rounds = 16;
-    constexpr size_t batch_size = 64;
-    constexpr size_t bytes = 256;
-    auto* pinned = pool.Allocate(bytes, 16);
-    ASSERT_NE(pinned, nullptr);
-    std::memset(pinned, 0x5a, bytes);
-    const auto pinned_bytes = memory::worker_memory::Describe(bytes, 16).map_bytes;
-    std::array<std::array<void*, batch_size>, returners> batches{};
-    std::barrier phase(static_cast<std::ptrdiff_t>(returners + 1));
-    std::array<std::thread, returners> threads;
-    for (size_t index = 0; index < returners; ++index) {
-        threads[index] = std::thread([&, index] {
-            for (size_t round = 0; round < rounds; ++round) {
-                phase.arrive_and_wait();
-                for (auto* block : batches[index]) pool.Deallocate(block);
-                phase.arrive_and_wait();
-            }
-        });
-    }
-    for (size_t round = 0; round < rounds; ++round) {
-        for (auto& batch : batches) {
-            for (auto& block : batch) {
-                block = pool.Allocate(bytes, 16);
-                EXPECT_NE(block, nullptr);
-            }
-        }
-        // First drain an empty queue, then race local borrowing with remote returns.
-        pool.PurgeIdle();
-        phase.arrive_and_wait();
-        for (size_t index = 0; index < batch_size; ++index) {
-            auto* local = pool.Allocate(bytes, 16);
-            EXPECT_NE(local, nullptr);
-            if (local) std::memset(local, 0xa5, bytes);
-            pool.Deallocate(local);
-        }
-        phase.arrive_and_wait();
-        pool.PurgeIdle();
-        EXPECT_TRUE(Intact(pinned, bytes, 0x5a));
-        EXPECT_EQ(pool.GetFootprint().mapped_bytes, pinned_bytes);
-        EXPECT_EQ(pool.GetFootprint().idle_bytes, 0u);
-    }
-    for (auto& thread : threads) thread.join();
-    pool.Deallocate(pinned);
-    pool.PurgeIdle();
-    EXPECT_EQ(pool.GetFootprint().mapped_bytes, 0u);
 }

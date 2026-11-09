@@ -156,16 +156,15 @@ void TestPrivateAllocatorIsolation(CountingResource& resource) {
             "native operation initiation must not consult the private allocation resource");
 }
 
-void TestQueuedReadinessAcrossMigration() {
+void TestQueuedReadinessIsolation() {
     using namespace ::memory;
     AllocationDomain domain;
-    net::io_context reactor, destination;
+    net::io_context reactor;
     ::tcp::acceptor acceptor(reactor, {net::ip::address_v4::loopback(), 0});
     ::tcp::socket socket(reactor), peer(reactor);
     socket.connect(acceptor.local_endpoint());
     acceptor.accept(peer);
     ::buf::Buffer* payload = nullptr;
-    bool delivered = false;
     bool consumed = false;
     {
         ScopedAllocationDomain lease(domain);
@@ -175,30 +174,21 @@ void TestQueuedReadinessAcrossMigration() {
         socket.async_wait(::tcp::socket::wait_read,
             net::bind_allocator(ProcessAllocator<std::byte>{},
                 [&](::IoErrorCode ec) {
-                    // Reactor completion transports metadata only. No payload
-                    // access or private-object destruction occurs on this thread.
-                    delivered = !ec;
-                    net::post(destination, net::bind_allocator(ProcessAllocator<std::byte>{}, [&, ec] {
-                        ScopedAllocationDomain migrated(domain);
-                        Require(!ec, "readiness failed");
-                        const auto count = socket.read_some(net::buffer(payload->Tail().data(), 1));
-                        payload->Produce(static_cast<uint32_t>(count));
-                        consumed = payload->Bytes()[0] == 'q';
-                        ::buf::Buffer::Free(payload);
-                        payload = nullptr;
-                    }));
+                    ScopedAllocationDomain active(domain);
+                    Require(!ec, "readiness failed");
+                    const auto count = socket.read_some(net::buffer(payload->Tail().data(), 1));
+                    payload->Produce(static_cast<uint32_t>(count));
+                    consumed = payload->Bytes()[0] == 'q';
+                    ::buf::Buffer::Free(payload);
+                    payload = nullptr;
                 }));
         Require(domain.OutstandingAllocations() == outstanding,
                 "queued operation must not borrow the connection domain");
     }
     const char value = 'q';
     peer.write_some(net::buffer(&value, 1));
-    std::thread completion([&] { reactor.run_for(1s); });
-    completion.join();
-    Require(delivered && !consumed, "completion must be retained before owner resumes");
-    std::thread migrated([&] { destination.run(); });
-    migrated.join();
-    Require(consumed && !payload, "new owner must consume readiness and destroy payload");
+    reactor.run_for(1s);
+    Require(consumed && !payload, "owner must consume readiness and destroy payload");
 }
 
 void TestPendingOperationDestruction() {
@@ -230,7 +220,7 @@ TEST(AsioOperationAllocator, Contract) {
         TestReadCancellation(resource, false);
         TestReadCancellation(resource, true);
         TestPrivateAllocatorIsolation(resource);
-        TestQueuedReadinessAcrossMigration();
+        TestQueuedReadinessIsolation();
         TestPendingOperationDestruction();
         Require(resource.live == 0 && !resource.wrong_thread,
                 "all private scheduler allocations must be released on their owner");

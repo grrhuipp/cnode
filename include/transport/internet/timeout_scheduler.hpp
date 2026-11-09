@@ -10,17 +10,13 @@
 
 class TimeoutSchedulerService;
 class TimeoutScheduler;
-class ExecutionDomain;
-class DomainTimeouts;
-
-// An owner-domain event embedded in its owner, never separately allocated.
+// An event embedded in its owner, never separately allocated.
 // Its address is stable from scheduling through cancellation/completion. An
 // expiry detaches it before calling OnTimeout, which may rearm or destroy it.
 class TimeoutEvent {
 public:
-    // Fixed Worker maintenance only; never bind this event to a calling session.
     struct WorkerLocal {};
-    explicit TimeoutEvent(WorkerLocal) noexcept : worker_local_(true) {}
+    explicit TimeoutEvent(WorkerLocal) noexcept {}
     TimeoutEvent() noexcept = default;
     explicit TimeoutEvent(net::io_context& context) noexcept;
     TimeoutEvent(const TimeoutEvent&) = delete;
@@ -28,7 +24,7 @@ public:
     TimeoutEvent(TimeoutEvent&&) = delete;
     TimeoutEvent& operator=(TimeoutEvent&&) = delete;
 
-    [[nodiscard]] bool Valid() const noexcept { return owner_ || domain_owner_; }
+    [[nodiscard]] bool Valid() const noexcept { return owner_ != nullptr; }
     [[nodiscard]] bool ScheduleAfter(std::chrono::milliseconds delay);
     [[nodiscard]] bool ScheduleAfter(std::chrono::milliseconds delay, net::io_context& context);
     void Cancel() noexcept;
@@ -39,17 +35,7 @@ protected:
 
 private:
     friend class TimeoutScheduler;
-    friend class DomainTimeouts;
-    std::weak_ptr<ExecutionDomain> domain_;
     net::io_context* context_ = nullptr;
-    DomainTimeouts* domain_owner_ = nullptr;
-    TimeoutEvent* previous_ = nullptr;
-    TimeoutEvent* next_ = nullptr;
-    TimeoutEvent* ready_previous_ = nullptr;
-    TimeoutEvent* ready_next_ = nullptr;
-    bool ready_ = false;
-    bool domain_bound_ = false;
-    bool worker_local_ = false;
     TimeoutScheduler* owner_ = nullptr;
     std::chrono::steady_clock::time_point deadline_{};
     uint64_t sequence_ = 0;
@@ -101,7 +87,6 @@ public:
 private:
     friend class TimeoutSchedulerService;
     friend class TimeoutEvent;
-    friend class DomainTimeouts;
     explicit TimeoutScheduler(net::io_context& io_context);
     [[nodiscard]] static TimeoutScheduler& ForWorker(net::io_context& io_context);
     void Release() noexcept;

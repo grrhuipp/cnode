@@ -1,7 +1,6 @@
 #pragma once
 
 #include "app/dns/dns.hpp"
-#include "app/session_group_executor.hpp"
 #include "common/target_address.hpp"
 #include "transport/internet/datagram_socket.hpp"
 #include "transport/link.hpp"
@@ -38,10 +37,7 @@ inline net::awaitable<tl::expected<udp::endpoint, ErrorCode>> ResolveUdpEndpoint
 
     struct CancellationWait final : transport::CancellationSubscription {
         explicit CancellationWait(net::any_io_executor executor)
-            : wake(ExecutionDomain::Current()
-                       ? ExecutionDomain::Current()->Executor()
-                       : std::move(executor),
-                   1) {}
+            : wake(std::move(executor), 1) {}
         SignalChannel wake;
         ErrorCode reason = ErrorCode::OK;
 

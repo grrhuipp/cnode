@@ -4,7 +4,6 @@
 #include "../../common/awaitable_task_group.hpp"
 
 #include "app/stats.hpp"
-#include "app/session_group_executor.hpp"
 #include "app/session_tracking.hpp"
 #include "app/request_load_state.hpp"
 #include "app/dns/dns.hpp"
@@ -222,9 +221,7 @@ net::awaitable<bool> SniffInitialPayload(
                 }
             };
             memory::ByteVector{}.swap(sniff_scratch);
-            AsyncDelay delay(ExecutionDomain::Current()
-                ? ExecutionDomain::Current()->Reactor()
-                : io_context);
+            AsyncDelay delay(io_context);
             auto next = co_await (read_more() || delay.WaitFor(remaining));
             if (sniff_cancellation.cancelled() != net::cancellation_type::none) {
                 throw IoSystemError(net::error::operation_aborted);

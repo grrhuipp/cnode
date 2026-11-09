@@ -7,7 +7,6 @@
 #include <unordered_map>
 
 
-class ExecutionDomain;
 
 namespace app {
 
@@ -33,7 +32,6 @@ struct UserTrafficCounters {
 struct DomainTrafficSnapshot {
     std::shared_ptr<SessionTrackingState> owner;
     UserTrafficCounters counters;
-    std::weak_ptr<ExecutionDomain> domain;
 };
 
 struct UserTrafficSnapshot : UserTrafficCounters {

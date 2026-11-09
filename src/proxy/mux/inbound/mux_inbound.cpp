@@ -256,10 +256,7 @@ private:
 
 struct ClientReadQueueState {
     explicit ClientReadQueueState(net::io_context& io_context, SignalChannel& main_signal)
-        : space_signal(ExecutionDomain::Current()
-                           ? ExecutionDomain::Current()->Executor()
-                           : net::any_io_executor(io_context.get_executor()),
-                       1)
+        : space_signal(net::any_io_executor(io_context.get_executor()), 1)
         , main_signal_(main_signal) {}
     SignalChannel space_signal;
     SignalChannel& main_signal_;
@@ -427,10 +424,7 @@ protected:
     MuxSubSession(net::io_context& io_context, uint16_t session_id, ReplyQueueState& reply_queue)
         : session_id_(session_id)
         , reply_queue_(reply_queue)
-        , input_signal_(ExecutionDomain::Current()
-                            ? ExecutionDomain::Current()->Executor()
-                            : net::any_io_executor(io_context.get_executor()),
-                        1) {}
+        , input_signal_(net::any_io_executor(io_context.get_executor()), 1) {}
     // Derived destructors call Cancel() so their OnCancel still runs.
     ~MuxSubSession() noexcept override = default;
 
@@ -508,10 +502,7 @@ public:
         uint16_t session_id,
         ReplyQueueState& reply_queue)
         : MuxSubSession(io_context, session_id, reply_queue)
-        , output_signal_(ExecutionDomain::Current()
-                             ? ExecutionDomain::Current()->Executor()
-                             : net::any_io_executor(io_context.get_executor()),
-                         1) {}
+        , output_signal_(net::any_io_executor(io_context.get_executor()), 1) {}
     ~TcpSubState() noexcept override {
         Cancel();
     }
@@ -920,9 +911,7 @@ net::awaitable<RelayResult> ProcessInboundImpl(
 
     // 回包队列：单线程，无锁；running 保护回调不在 ProcessInbound 退出后继续推送。
     SignalChannel main_signal{
-        ExecutionDomain::Current()
-            ? ExecutionDomain::Current()->Executor()
-            : net::any_io_executor(io_context.get_executor()),
+        net::any_io_executor(io_context.get_executor()),
         1};
     ReplyQueueState reply_queue{main_signal};
     ClientReadQueueState client_reads{io_context, main_signal};

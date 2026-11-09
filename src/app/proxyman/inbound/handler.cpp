@@ -2,7 +2,6 @@
 #include "common/ip_address.hpp"
 
 #include "app/request_load_state.hpp"
-#include "app/session_group_executor.hpp"
 
 #include "app/rate_limiter.hpp"
 #include "app/stats.hpp"
@@ -22,13 +21,6 @@
 namespace proxyman::inbound {
 
 namespace {
-
-net::io_context& SessionReactor(net::io_context& fallback) noexcept {
-    if (auto domain = ExecutionDomain::Current()) {
-        return domain->Reactor();
-    }
-    return fallback;
-}
 
 std::string_view RealIpHeader(const StreamSettings& settings) noexcept {
     if (settings.IsWs()) return settings.ws.real_ip_header;
@@ -299,7 +291,7 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
                    listener.stream_settings.network);
 
     co_await RunInboundProxy(
-        Proxy(), std::move(stream), dispatcher, listener, SessionReactor(io_context), ctx, timeouts,
+        Proxy(), std::move(stream), dispatcher, listener, io_context, ctx, timeouts,
         request_load.PressureIdleTimeout(), stats);
 }
 

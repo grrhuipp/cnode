@@ -57,7 +57,8 @@ struct BootstrapEnvironment {
     const WorkerRuntimeConfig& runtime_config,
     ShardedStats& stats,
     geo::GeoDatabase* geo_database,
-    app::dns::DNSWorker& dns_worker);
+    app::dns::DNSWorker& dns_worker,
+    net::io_context* control_io = nullptr);
 
 [[nodiscard]] BootstrapEnvironment CreateBootstrapEnvironment(
     const Config& config,

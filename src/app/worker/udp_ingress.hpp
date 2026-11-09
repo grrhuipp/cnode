@@ -5,7 +5,6 @@
 #include "common/buffer_util.hpp"
 #include "common/error.hpp"
 #include "proxy/inbound.hpp"
-#include "app/session_group_executor.hpp"
 #include "transport/link.hpp"
 #include "udp_client_session_key.hpp"
 #include "udp_resource_budget.hpp"
@@ -214,23 +213,19 @@ private:
     void RetireNativeJob(ClientSession& session) noexcept;
     static net::awaitable<void> RunNativeDispatch(ClientSessionPtr session);
     static net::awaitable<void> RunNativeFlow(ClientSessionPtr session);
-    struct AuthenticatedPacket;
-    net::awaitable<void> ProcessAuthenticated(std::shared_ptr<AuthenticatedPacket> packet);
     void ProcessDecoded(const UdpDatagramContext& datagram,
         InboundDatagramResult decoded,
         std::shared_ptr<UdpHandoffRecord> record = {},
         std::shared_ptr<InboundDatagramResponse> response = {});
     void RegisterNativeJob(const ClientSessionPtr& session);
     void DetachNativeJob(ClientSession& session) noexcept;
-    void ReleaseControl() noexcept;
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
 
 class UdpIngress::ClientSession final
     : public transport::MultiBufferReader,
-      public transport::MultiBufferWriter,
-      public ExecutionDomain::NativeResource {
+      public transport::MultiBufferWriter {
 public:
     transport::CancellationSource& Cancellation() noexcept override;
 
@@ -261,10 +256,6 @@ public:
 private:
     friend class UdpIngress;
     void CloseWithError(ErrorCode error) noexcept;
-    net::awaitable<void> PrepareHandoff(const ExecutionDomain::HandoffTarget&) override;
-    void CommitHandoff(const ExecutionDomain::HandoffTarget&) noexcept override;
-    net::awaitable<void> CancelHandoff(const ExecutionDomain::HandoffTarget&) override;
-
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

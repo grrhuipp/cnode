@@ -4,7 +4,6 @@
 
 #include "common/buf/multi_buffer.hpp"
 #include "transport/link_error.hpp"
-#include "app/session_group_executor.hpp"
 #include <optional>
 #include <thread>
 
@@ -331,54 +330,6 @@ bool TestZeroLengthNativeSends() {
     return true;
 }
 
-bool TestAdmissionBucketSurvivesDomainMigration() {
-    struct Hooks final : ::ExecutionDomain::Hooks {
-        ::memory::AllocationDomain allocation;
-        std::optional<::memory::ScopedAllocationDomain> lease;
-        std::exception_ptr failure;
-        void Enter() noexcept override { lease.emplace(allocation); }
-        void Leave() noexcept override { lease.reset(); }
-        void OnFailure(std::exception_ptr error) noexcept override { failure = error; }
-    };
-    ::net::io_context io;
-    auto coordinator = std::make_shared<::GroupCoordinator>(io);
-    coordinator->RegisterWorker(0, io, io.get_executor());
-    auto hooks = std::make_shared<Hooks>();
-    auto domain = ::ExecutionDomain::Create(io, 0, io.get_executor(), hooks, coordinator);
-    hooks->allocation.SetLeaseGroup(domain->LeaseIdentity(), ::ExecutionDomain::SharesLeaseIdentity);
-    const auto baseline = DatagramSocket::ActiveCount();
-    std::unique_ptr<DatagramSocket> socket;
-    domain->Execute([&] {
-        socket = std::make_unique<DatagramSocket>(io, ::net::ip::address_v4::loopback());
-    });
-    io.poll();
-    if (!socket || DatagramSocket::ActiveCount() != baseline + 1) return false;
-    bool remote_clean = false;
-    domain->Execute([&] {
-        socket.reset();
-        remote_clean = DatagramSocket::ActiveCount() == 0;
-    });
-    // The same stable domain is now executed on another native thread.
-    std::thread migrated([&] { io.poll(); });
-    migrated.join();
-    const bool passed = remote_clean && !hooks->failure &&
-        DatagramSocket::ActiveCount() == baseline;
-    domain.reset();
-    bool finalized = false;
-    auto finalize = [](std::shared_ptr<::GroupCoordinator> owner)
-        -> ::net::awaitable<void> {
-        owner->CloseAdmission();
-        co_await owner->AsyncJoin();
-        owner->ReleaseServices();
-        co_await owner->Finalize();
-    };
-    ::net::co_spawn(io, finalize(coordinator),
-        [&](std::exception_ptr error) { finalized = !error; });
-    io.restart();
-    io.run_for(1s);
-    return passed && finalized;
-}
-
 }  // namespace
 
 TEST(DatagramSocket, Contract) {
@@ -390,12 +341,11 @@ TEST(DatagramSocket, Contract) {
         const bool timeout_close = TestCloseAndReadScopeTimeout();
         const bool limit = TestSocketLimitAndReclamation();
         const bool empty = TestZeroLengthNativeSends();
-        const bool migrated = TestAdmissionBucketSurvivesDomainMigration();
         const bool reclaimed = DatagramSocket::ActiveCount() == 0;
-        std::printf("datagram socket: bindings=%d cancel=%d parent_cancel=%d ipv6=%d timeout_close=%d limit=%d empty=%d migrated=%d reclaimed=%d\n",
-                    bindings, cancel, parent_cancel, ipv6, timeout_close, limit, empty, migrated, reclaimed);
+        std::printf("datagram socket: bindings=%d cancel=%d parent_cancel=%d ipv6=%d timeout_close=%d limit=%d empty=%d reclaimed=%d\n",
+                    bindings, cancel, parent_cancel, ipv6, timeout_close, limit, empty, reclaimed);
         { ASSERT_TRUE(bindings && cancel && parent_cancel && ipv6 && timeout_close && limit &&
-            empty && migrated && reclaimed); return; }
+            empty && reclaimed); return; }
     } catch (const std::exception& error) {
         std::fprintf(stderr, "datagram socket test exception: %s\n", error.what());
         FAIL() << error.what();

@@ -10,6 +10,8 @@
 #include "transport/internet/http_headers.hpp"
 #include "transport/internet/tcp_stream.hpp"
 #include "transport/phase_deadline.hpp"
+#include "transport/internet/tls_stream.hpp"
+#include <asio/co_spawn.hpp>
 #include "transport/internet/async_delay.hpp"
 
 #include <array>
@@ -689,15 +691,16 @@ public:
         enum class State : uint8_t { Reserved, Live, Retired };
         XHttpSessionDirectory* directory;
         const Key* key = nullptr;
-        std::weak_ptr<ExecutionDomain> owner;
+        net::io_context* owner = nullptr;
         std::atomic<State> state{State::Reserved};
         Record* incoming_next = nullptr;
         Record* previous = nullptr;
         Record* next = nullptr;
         bool processed = false;
         bool activated = false;
+        std::vector<std::shared_ptr<SignalChannel>> owner_waiters;
 
-        Record(XHttpSessionDirectory& directory, const std::shared_ptr<ExecutionDomain>& owner)
+        Record(XHttpSessionDirectory& directory, net::io_context* owner)
             : directory(&directory), owner(owner) {}
         void Retire(bool only_reserved = false) noexcept;
         bool MarkLive() noexcept {
@@ -708,22 +711,31 @@ public:
         bool Retired() const noexcept {
             return state.load(std::memory_order_acquire) == State::Retired;
         }
+        void NotifyOwnerWaiters() noexcept {
+            auto waiters = std::move(owner_waiters);
+            owner_waiters.clear();
+            for (auto& waiter : waiters) {
+                if (waiter) waiter->close();
+            }
+        }
     };
 
-    // Cancelled admission cannot strand capacity. Once any same-group caller
-    // installs the session, an older admission token cannot retire it.
     struct Claim {
-        std::shared_ptr<ExecutionDomain> owner;
+        net::io_context* owner = nullptr;
         std::shared_ptr<Record> record;
+        std::shared_ptr<SignalChannel> wait_owner;
         bool reservation = false;
         bool retry = false;
         Claim() = default;
-        Claim(std::shared_ptr<ExecutionDomain> owner, std::shared_ptr<Record> record,
+        Claim(net::io_context* owner, std::shared_ptr<Record> record,
               bool reservation)
-            : owner(std::move(owner)), record(std::move(record)), reservation(reservation) {}
+            : owner(owner), record(std::move(record)), reservation(reservation) {}
         Claim(Claim&& other) noexcept
-            : owner(std::move(other.owner)), record(std::move(other.record)),
-              reservation(std::exchange(other.reservation, false)), retry(other.retry) {}
+            : owner(std::exchange(other.owner, nullptr)),
+              record(std::move(other.record)),
+              wait_owner(std::move(other.wait_owner)),
+              reservation(std::exchange(other.reservation, false)),
+              retry(other.retry) {}
         Claim(const Claim&) = delete;
         Claim& operator=(const Claim&) = delete;
         ~Claim() {
@@ -732,28 +744,37 @@ public:
     };
 
     Claim Acquire(std::string_view session_namespace, std::string_view session_id,
-                  XHttpSessionAccess access, const std::shared_ptr<ExecutionDomain>& current) {
+                  XHttpSessionAccess access, net::io_context* current,
+                  bool bind_owner = true) {
         DrainRetirements();
         auto found = entries_.find(KeyRef{session_namespace, session_id});
         if (found != entries_.end() && !found->second->Retired()) {
-            if (auto owner = found->second->owner.lock())
-                return {std::move(owner), found->second, false};
-            found->second->Retire();
-            DrainRetirements();
-            found = entries_.find(KeyRef{session_namespace, session_id});
+            auto& record = found->second;
+            if (!record->owner && bind_owner && current) {
+                record->owner = current;
+                record->NotifyOwnerWaiters();
+                return {current, record, true};
+            }
+            if (record->owner) {
+                return {record->owner, record, false};
+            }
+            Claim pending;
+            pending.record = record;
+            pending.wait_owner = std::make_shared<SignalChannel>(
+                static_cast<net::io_context&>(context()).get_executor(), 1);
+            record->owner_waiters.push_back(pending.wait_owner);
+            return pending;
         }
         if (access == XHttpSessionAccess::Join ||
             (found != entries_.end() && access != XHttpSessionAccess::Open))
             return {};
         if (found != entries_.end() && !found->second->processed) {
-            // State was published just before the reserved queue node. Yield
-            // through another bounded control call rather than spin here.
             Claim claim;
             claim.retry = true;
             return claim;
         }
         if (active_ == kMaxActive) return {};
-        auto record = std::make_shared<Record>(*this, current);
+        auto record = std::make_shared<Record>(*this, bind_owner ? current : nullptr);
         if (found == entries_.end()) {
             found = entries_.try_emplace(
                 Key{std::string(session_namespace), std::string(session_id)}, record).first;
@@ -764,6 +785,14 @@ public:
         }
         record->key = &found->first;
         ++active_;
+        if (!bind_owner) {
+            Claim pending;
+            pending.record = std::move(record);
+            pending.wait_owner = std::make_shared<SignalChannel>(
+                static_cast<net::io_context&>(context()).get_executor(), 1);
+            pending.record->owner_waiters.push_back(pending.wait_owner);
+            return pending;
+        }
         return {current, std::move(record), true};
     }
 
@@ -788,7 +817,8 @@ private:
             auto* record = fifo;
             fifo = record->incoming_next;
             record->processed = true;
-            record->owner.reset();
+            record->owner = nullptr;
+            record->NotifyOwnerWaiters();
             --active_;
             if (!record->activated) {
                 if (auto it = entries_.find(*record->key);
@@ -877,7 +907,6 @@ public:
     std::shared_ptr<XHttpPacketUpSession> Get(
         net::io_context& io, std::string_view session_namespace,
         std::string_view id, XHttpSessionAccess access,
-        std::shared_ptr<ExecutionDomain> owner = {},
         std::shared_ptr<XHttpSessionDirectory::Record> record = {}) {
         const ::detail::XHttpPacketSessionKeyRef lookup{id, session_namespace};
         auto found = sessions_.find(lookup);
@@ -888,7 +917,7 @@ public:
             active_ == kXHttpMaxPacketSessions)
             return nullptr;
 
-        auto session = memory::AllocateShared<XHttpPacketUpSession>(io, owner);
+        auto session = memory::AllocateShared<XHttpPacketUpSession>(io);
         const bool inserting = found == sessions_.end();
         if (found == sessions_.end()) {
             ::detail::XHttpPacketSessionKey key{
@@ -911,7 +940,6 @@ public:
         entry.session = session;
         entry.live = session.get();
         entry.directory_record = std::move(record);
-        (void)owner;
         session->table_entry_ = &entry;
         ++active_;
         return session;
@@ -972,22 +1000,17 @@ private:
 net::execution_context::id XHttpSessionTable::id;
 
 XHttpPacketUpSession::XHttpPacketUpSession(
-    net::io_context& io_context,
-    std::shared_ptr<ExecutionDomain> owner)
-    : owner_domain_(std::move(owner))
-    , io_context_(io_context)
-    , input_signal_(owner_domain_ ? owner_domain_->Executor()
-                                  : net::any_io_executor(io_context.get_executor()), 1)
-    , upload_signal_(owner_domain_ ? owner_domain_->Executor()
-                                   : net::any_io_executor(io_context.get_executor()), 1) {}
-
+    net::io_context& io_context)
+    : io_context_(io_context)
+    , input_signal_(net::any_io_executor(io_context.get_executor()), 1)
+    , upload_signal_(net::any_io_executor(io_context.get_executor()), 1) {}
 XHttpPacketUpSession::~XHttpPacketUpSession() noexcept {
     Unsubscribe();
     Retire();
 }
 
 net::io_context& XHttpPacketUpSession::IoContext() const noexcept {
-    return owner_domain_ ? owner_domain_->Reactor() : io_context_;
+    return io_context_;
 }
 
 void XHttpPacketUpSession::Retire() noexcept {
@@ -1120,8 +1143,7 @@ bool XHttpPacketUpSession::AttachDownlink() noexcept {
 
 net::awaitable<bool> XHttpPacketUpSession::AwaitDownlink(
     transport::CancellationSource& cancellation) {
-    auto domain = ExecutionDomain::Current();
-    AsyncDelay wait(domain ? domain->Reactor() : io_context_);
+    AsyncDelay wait(io_context_);
     struct ReadyWatch final : transport::CancellationSubscription {
         explicit ReadyWatch(AsyncDelay& wait) noexcept : wait(wait) {}
         AsyncDelay& wait;
@@ -1326,33 +1348,129 @@ XHttpRequestMeta ParseXHttpRequestMeta(std::string_view base_path,
     return meta;
 }
 
+namespace {
+
+struct DetachedXHttpStream {
+    std::variant<DetachedTcpState, DetachedTlsState> state;
+};
+
+std::optional<DetachedXHttpStream> DetachXHttpStream(
+    AsyncStream& stream, std::span<const uint8_t> head_bytes) {
+    if (auto* tls = dynamic_cast<TlsStream*>(&stream)) {
+        if (auto detached = tls->DetachForHandoff(head_bytes)) {
+            return DetachedXHttpStream{std::move(*detached)};
+        }
+        return std::nullopt;
+    }
+    if (auto* tcp = dynamic_cast<TcpStream*>(&stream)) {
+        if (auto detached = tcp->DetachForHandoff(head_bytes)) {
+            return DetachedXHttpStream{std::move(*detached)};
+        }
+        return std::nullopt;
+    }
+    return std::nullopt;
+}
+
+std::unique_ptr<AsyncStream> RestoreXHttpStream(
+    net::io_context& io_context, DetachedXHttpStream detached) {
+    if (auto* tls = std::get_if<DetachedTlsState>(&detached.state)) {
+        return TlsStream::RestoreFromHandoff(io_context, std::move(*tls));
+    }
+    if (auto* tcp = std::get_if<DetachedTcpState>(&detached.state)) {
+        return TcpStream::RestoreFromHandoff(io_context, std::move(*tcp));
+    }
+    return nullptr;
+}
+
+net::awaitable<net::io_context*> ResolveXHttpSessionOwner(
+    net::io_context& io_context,
+    std::string_view session_namespace,
+    std::string_view session_id,
+    XHttpSessionAccess access,
+    bool bind_owner,
+    transport::CancellationSource* cancellation = nullptr) {
+    auto* coordinator = GroupCoordinator::ForContext(io_context);
+    if (!coordinator) co_return &io_context;
+    for (;;) {
+        auto claim = co_await coordinator->PostCall(
+            [coordinator, session_namespace, session_id, access, &io_context, bind_owner] {
+                return net::use_service<XHttpSessionDirectory>(coordinator->Services()).Acquire(
+                    session_namespace, session_id, access, &io_context, bind_owner);
+            });
+        if (claim.retry) continue;
+        if (claim.owner) {
+            // If we reserved the owner slot for PacketDown, create the local
+            // session entry immediately before releasing the claim guard.
+            if (claim.reservation && claim.owner == &io_context) {
+                (void)net::use_service<XHttpSessionTable>(io_context).Get(
+                    io_context, session_namespace, session_id, access, claim.record);
+                claim.reservation = false;
+            }
+            co_return claim.owner;
+        }
+        if (!claim.wait_owner) co_return nullptr;
+        struct CancelWait final : transport::CancellationSubscription {
+            std::shared_ptr<SignalChannel> channel;
+            bool cancelled = false;
+            explicit CancelWait(std::shared_ptr<SignalChannel> ch) noexcept
+                : channel(std::move(ch)) {}
+            void OnCancellation(transport::Cancellation) noexcept override {
+                cancelled = true;
+                if (channel) channel->close();
+            }
+        } cancel_wait{claim.wait_owner};
+        if (cancellation) cancel_wait.Resubscribe(*cancellation);
+        if (cancel_wait.cancelled) co_return nullptr;
+        IoErrorCode ec;
+        std::tie(ec) = co_await claim.wait_owner->async_receive(
+            net::as_tuple(net::use_awaitable));
+        (void)ec;
+        if (cancel_wait.cancelled ||
+            (co_await net::this_coro::cancellation_state).cancelled() !=
+                net::cancellation_type::none) {
+            co_return nullptr;
+        }
+    }
+}
+
+}  // namespace
+
 net::awaitable<std::shared_ptr<XHttpPacketUpSession>> GetXHttpPacketSession(
     net::io_context& io_context,
     std::string_view session_namespace,
     std::string_view session_id,
     XHttpSessionAccess access) {
-    auto current = ExecutionDomain::Current();
-    if (!current) {
+    auto* coordinator = GroupCoordinator::ForContext(io_context);
+    if (!coordinator) {
         co_return net::use_service<XHttpSessionTable>(io_context).Get(
             io_context, session_namespace, session_id, access);
     }
 
-    auto& coordinator = current->Coordinator();
     for (;;) {
-        auto claim = co_await coordinator.PostCall(
-            [&coordinator, session_namespace, session_id, access, current] {
-                return net::use_service<XHttpSessionDirectory>(coordinator.Services()).Acquire(
-                    session_namespace, session_id, access, current);
+        auto claim = co_await coordinator->PostCall(
+            [coordinator, session_namespace, session_id, access, &io_context] {
+                return net::use_service<XHttpSessionDirectory>(coordinator->Services()).Acquire(
+                    session_namespace, session_id, access, &io_context, true);
             });
         if (claim.retry) continue;
         if (!claim.owner) co_return nullptr;
-        if (!current->SharesGroup(*claim.owner)) co_await current->Join(claim.owner);
-        // The immutable record is the generation token. Join suspends, so
-        // re-check retirement after both groups have become one serial owner.
+        if (claim.owner != &io_context) {
+            co_return co_await net::co_spawn(
+                *claim.owner,
+                [owner = claim.owner, ns = std::string(session_namespace),
+                 id = std::string(session_id), access,
+                 record = claim.record]() -> net::awaitable<std::shared_ptr<XHttpPacketUpSession>> {
+                    if (record && record->Retired()) co_return nullptr;
+                    co_return net::use_service<XHttpSessionTable>(*owner).Get(
+                        *owner, ns, id, access, record);
+                },
+                net::use_awaitable);
+        }
         if (claim.record->Retired()) continue;
-        co_return net::use_service<XHttpSessionTable>(claim.owner->Services()).Get(
-            claim.owner->Reactor(), session_namespace, session_id, access,
-            claim.owner, claim.record);
+        auto session = net::use_service<XHttpSessionTable>(io_context).Get(
+            io_context, session_namespace, session_id, access, claim.record);
+        if (session) claim.reservation = false;
+        co_return session;
     }
 }
 
@@ -1531,6 +1649,52 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
             co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
         }
 
+        if (!persistent &&
+            (meta.kind == XHttpRequestMeta::Kind::PacketUp ||
+             meta.kind == XHttpRequestMeta::Kind::StreamUp)) {
+            const auto access = meta.kind == XHttpRequestMeta::Kind::StreamUp
+                ? XHttpSessionAccess::Open
+                : XHttpSessionAccess::Upload;
+            const bool bind_immediately = (stream_handler == nullptr);
+            auto* owner_reactor = co_await ResolveXHttpSessionOwner(
+                io_context, xhttp_cfg.session_namespace, meta.session_id,
+                access, bind_immediately, &stream->Cancellation());
+            if (!owner_reactor) {
+                if (stream->ConsumePhaseDeadline() || stream->ConsumeIdleTimeout()) {
+                    co_return tl::unexpected(ErrorCode::TIMEOUT);
+                }
+                co_return tl::unexpected(
+                    meta.kind == XHttpRequestMeta::Kind::StreamUp
+                        ? ErrorCode::RESOURCE_EXHAUSTED
+                        : ErrorCode::NOT_FOUND);
+            }
+            if (owner_reactor != &io_context) {
+                auto detached = DetachXHttpStream(
+                    *stream, std::span<const uint8_t>(head->bytes, head->size));
+                head->storage = buf::BufferGuard{};
+                stream.reset();
+                if (!detached) {
+                    co_return tl::unexpected(ErrorCode::SOCKET_READ_FAILED);
+                }
+                auto handed = co_await net::co_spawn(
+                    *owner_reactor,
+                    [owner_reactor, detached = std::move(*detached),
+                     cfg, xhttp_cfg, conn_id,
+                     stream_handler]() mutable -> net::awaitable<tl::expected<void, ErrorCode>> {
+                        auto restored = RestoreXHttpStream(*owner_reactor, std::move(detached));
+                        if (!restored) co_return tl::unexpected(ErrorCode::SOCKET_READ_FAILED);
+                        if (stream_handler) stream_handler->OnInboundTransportRequest(*restored);
+                        auto result = co_await DoXHttp1ServerHandshake(
+                            *owner_reactor, std::move(restored), cfg, xhttp_cfg,
+                            conn_id, nullptr, {}, stream_handler);
+                        if (!result) co_return tl::unexpected(result.error());
+                        co_return tl::expected<void, ErrorCode>{};
+                    },
+                    net::use_awaitable);
+                if (!handed) co_return tl::unexpected(handed.error());
+                co_return std::unique_ptr<AsyncStream>{};
+            }
+        }
         if (meta.kind == XHttpRequestMeta::Kind::PacketUp) {
             if (!xhttp_cfg.AcceptsPacketUp()) {
                 co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
@@ -1788,9 +1952,7 @@ net::awaitable<TransportBuildResult> DoXHttp1ClientRequest(
                       PublicHttpTargetForLog(detail::EffectiveHttpPath(cfg.path)),
                       payload_len);
         const auto executor = co_await net::this_coro::executor;
-        auto domain = ExecutionDomain::Current();
-        auto& services = domain ? domain->Services()
-                                : net::query(executor, net::execution::context);
+        auto& services = net::query(executor, net::execution::context);
         co_return std::make_unique<XHttpUploadClientStream>(
             executor, services,
             MakeHttp1BodyStream(std::move(stream), Http1BodyUntilClose{}, true));

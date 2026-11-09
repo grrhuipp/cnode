@@ -9,6 +9,23 @@
 #include <memory>
 #include <span>
 #include <string_view>
+#include <optional>
+#include <utility>
+#include <vector>
+
+struct DetachedTcpState {
+    int fd = -1;
+    tcp::endpoint::protocol_type protocol = tcp::v4();
+    bool nonblocking = true;
+    std::vector<uint8_t> pending_bytes;
+
+    DetachedTcpState() noexcept = default;
+    ~DetachedTcpState() noexcept;
+    DetachedTcpState(DetachedTcpState&& other) noexcept;
+    DetachedTcpState& operator=(DetachedTcpState&& other) noexcept;
+    DetachedTcpState(const DetachedTcpState&) = delete;
+    DetachedTcpState& operator=(const DetachedTcpState&) = delete;
+};
 
 
 // ============================================================================
@@ -45,6 +62,10 @@ public:
     // Return bytes read ahead by a completed handshake before unread socket data.
     // Only for this byte layer; a TLS owner must retain plaintext at its own layer.
     void PrependReadData(std::span<const uint8_t> data) override;
+    [[nodiscard]] std::optional<DetachedTcpState> DetachForHandoff(
+        std::span<const uint8_t> prefix = {});
+    [[nodiscard]] static std::unique_ptr<TcpStream> RestoreFromHandoff(
+        net::io_context& io_context, DetachedTcpState state);
 
     // ── 超时控制 & 端点查询（仅 TcpStream 实现，非虚）─────────────────────────
     tcp::socket::executor_type GetExecutor() noexcept;

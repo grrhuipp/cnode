@@ -1240,3 +1240,30 @@ CI失败场景修复后通过真实双进程、ML-KEM/X25519加密和回环对�
 删除返回裸空闲端口的Port()。Node与PanelNode持有实际监听socket，覆盖配置和对端监听的构造阶段，只在子进程启动前释放；原生与参考进程经同一Node::Start释放入口启动，清除两处绕过启动入口的赋值。未引入端口重选、失败重试或延长超时；子进程不支持继承监听，故启动前释放与子进程实际bind之间仍非跨进程原子交接，不声称消除任意外部进程抢占。
 
 整改后musl增量构建成功且无编译警告；真实AnyTLS会话E2E **83/83** 通过，19.25秒，包含原失败的IPv6分段场景。四并行全量 **1,215/1,215** 通过，299项unit与916项E2E，207.01秒；静态主程序--version与ELF检查通过。原CI现场保留于build/musl/ci-42444589001。未修改生产AnyTLS协议实现，未降低负载、连接限制或断言，也不以本地通过代替后续实际CI结果。
+
+## 2026-11-09：Pin-to-Origin（会话固定归属）与零跨 Worker 数据包转发架构重构
+
+### 动机与边界收敛
+
+旧设计为了支持运行期跨 Worker 会话合组与被动连接迁移，在原生 `asio::io_context` 之上叠加了虚拟执行域（`ExecutionDomain`）、Socket readiness 拆包层（`NativeSocketHandoff`）、双层定时器归属（`DomainTimeouts`）、内存池跨线程 `remote_frees_` 原子队列与执行域租约检查，以及出站连接池的跨域 `AttachExclusive` / `DetachExclusive` 转移。这些机制穿透了内存分配器、传输 I/O、超时调度、出站连接池和全部有状态协议，违反 Share-Nothing 同构执行器与单线程内存池闭环回收原则。
+
+本轮按 `AGENTS.md` 将多 Worker 架构统一收敛为 **Pin-to-Origin（会话固定归属 + 入口流量归集）**：
+
+1. **主控协调器与同构数据 Worker**：`GroupCoordinator` 运行在主控事件循环（`main_ctx`）上，通过 `execution_context::service` 在各 Worker 原生 `io_context` 注册固定路由与 `worker_id`。所有数据 Worker 完全同构、对等，不再将全局协调器寄生在 `Worker 0` 上。
+2. **纯单线程 Worker 内存池**：删除 `worker_memory::remote_frees_`、`QueueRemote`、`DrainRemoteFrees`、`ReclaimRemoteBatch`、`SetLeaseGroup` 与 `memory::OnRemoteFree` 计数。`AllocationDomain` 在构造时绑定所属线程标识，跨线程分配、释放或借用直接 `std::terminate()`，所有容器、Buffer 与会话对象在所属 Worker 线程闭环借还。
+3. **原生 Socket I/O 与单层超时调度**：删除 `src/transport/internet/native_socket_handoff.hpp` 及 `ExecutionDomain`。`TcpStream` 与 `DatagramSocket` 直接持有原生 `asio::ip::tcp::socket` / `udp::socket`；`TimeoutScheduler` 仅维护每 Worker 本地最小堆，`AsyncDelay` 与 `AsyncWriteGate` 直接绑定所属 Worker `io_context`。
+4. **QUIC 入站内核态 cBPF 归集**：服务端签发的 16 字节 SCID 在首 3 字节编码魔数与 `worker_id`；`SO_REUSEPORT` 监听组挂载 15 条指令的 `SO_ATTACH_REUSEPORT_CBPF` 过滤器，Short Header 与带服务端 CID 的 Long Header 包按 DCID 在内核态直达原 Worker，客户端 Initial 握手包按 `payload[6..9]`（随机 DCID 前缀）均匀哈希分流。客户端路径迁移后数据包在内核态直达原 Worker，由原 Worker 完成 RFC 9000 路径验证并经独立 `ngtcp2_path_storage` 与本地监听 socket 回包，出站连接与子流全程留在原 Worker。
+5. **XHTTP 分离上行静止边界裸 `fd` 移交**：下行 `GET` 所在的原 Worker 唯一拥有完整 `XHttpPacketUpSession`、路由、出站与 Relay。当同 `session_id` 的 HTTP/1.1 `stream-up` 或 `packet-up` 落到其他 Worker 时，收包 Worker 在读完首个 HTTP 请求头的静止边界（无在途 I/O、无出站、无定时器）调用 `DetachForHandoff` 提取裸 `fd`、TLS `SSL*` 与明文/密文预读前缀，经 `co_spawn` 移交原 Worker `RestoreFromHandoff` 重建流并直接处理该请求及后续 keep-alive 请求，零跨线程 `MultiBuffer` 转发，且不跨 Worker 合组运行中的 HTTP/2 会话。
+6. **原生 UDP 与出站连接池 Worker-local 独占**：原生 UDP 入站关联、`UdpHandoffDirectory`（SS2022 会话隔离与防重放 tombstone）、AnyTLS `OutboundPoolHost` 与 VLESS 0-RTT 票据状态均由所属 Worker 本地管理，消除跨 Worker 关联搬迁与出站池连接转移。未启动 `RuntimeState::Start` 的 Worker 在启动失败回滚采样中直接返回空流量/在线设备快照，避免空指针访问。
+
+### 验证与性能/内存实证
+
+在 Linux x86-64 musl Release（Clang 23.1.3、LTO、全局 mimalloc）环境下完成全量构建与四并行测试：**1,254/1,254** 全部通过（328 项 unit、926 项真实进程 E2E，含官方 Hysteria2 v2.13.0 参考客户端跨路径往返测试，总用时 233.56 秒）。静态主程序 `build/musl/cnode --version` 与静态 ELF 检查通过；主程序体积由 `bb393dc` 基线的 115,341,112 字节降至 107,490,952 字节（减少 7,850,160 字节 / 7.49 MiB）。
+
+以 `bb393dc`（HEAD）为可复现基线，在同一环境与固定负载下对新旧实现执行 A/B/A/B 交错对照：
+
+- **TCP 接收微基准（`cnode_tcp_receive_benchmark`）**：消除 `NativeSocketHandoff::Wait` 与 `ExecutionDomain` 二级调度后，1 B 突发耗时由 11,366.7 ns 降至 9,905.7 ns（-12.9%，CPU -15.5%）；8 KiB 突发耗时由 15,484.6 ns 降至 14,541.0 ns（-6.1%，CPU -7.2%）；64 KiB 突发耗时由 77,406.4 ns 降至 67,845.2 ns（-12.4%，CPU -12.8%）。
+- **分配器与容器微基准（`cnode_allocator_append_benchmark`）**：移除 `remote_frees_` 排空与跨域租约检查后，`multibuffer-transfer` 1/8/9/16 块耗时由 125.3 / 407.4 / 566.2 / 845.2 ns 降至 118.5 / 397.1 / 524.5 / 759.1 ns（最多 -10.2%）；`ring-deque` 1/8/64 批耗时由 58.4 / 134.8 / 540.3 ns 降至 58.3 / 132.2 / 514.3 ns，池映射与空闲字节保持不变。
+- **运行时统计采样（`cnode_runtime_sampling_benchmark`）**：消除每连接 `ExecutionDomain::LocalLease` 与跨域延迟采样后，64 活跃会话（256 轮，含资源统计）单次采样耗时由 2,001.8 ns（p50 1,913 ns / p95 1,944 ns）降至 389.9 ns（p50 351 ns / p95 370 ns，-80.5%），匿名 RSS 由 7,749,632 B 降至 7,602,176 B（-144 KiB），峰值 RSS 由 14,581,760 B 降至 14,069,760 B（-500 KiB）。
+- **VLESS/TLS 真实进程吞吐与内存（`cnode_tls_throughput_benchmark`）**：单流上传吞吐由 672.20 / 688.66 MiB/s 提升至 756.82 / 778.92 MiB/s（CPU 由 0.0294 / 0.0293s 降至 0.0267 / 0.0255s），8 流上传吞吐由 579.75 / 581.97 MiB/s 升至 579.79 / 605.48 MiB/s；8 流预热/活跃匿名内存由 6,545,408 / 6,549,504 B 降至 6,492,160 / 6,500,352 B，进程峰值 RSS（HWM）由 14.96 MiB 降至 14.37 MiB（减少约 595 KiB）。
+- **Hysteria2 四 Worker 真实进程基准（`cnode_hysteria_throughput_benchmark`）**：256 连接单流上传/下载的活跃匿名内存由 33.80 / 33.90 MiB 降至 32.45 / 32.45 MiB（减少 1.28 / 1.38 MiB），负载峰值 RSS 减少 1.75 / 1.81 MiB，守护进程 CPU 减少 4.2% / 6.5%；16 连接 × 64 流（1,024 并发流）上传/下载的建连耗时由 1.153 / 1.115s 降至 1.101 / 1.065s，活跃匿名内存由 45.76 / 44.34 MiB 降至 43.03 / 43.32 MiB（减少 2.61 / 0.96 MiB），负载峰值 RSS 减少 3.40 / 3.97 MiB。临时基线构建目录在验证后清理。

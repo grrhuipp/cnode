@@ -57,7 +57,7 @@ struct DatagramSessionEnvironment final {
 };
 
 
-class PhysicalSessionCapabilities final : public ExecutionDomain::Hooks {
+class PhysicalSessionCapabilities final {
 public:
     static std::shared_ptr<PhysicalSessionCapabilities> Create(
         std::shared_ptr<const SessionConfiguration> configuration,
@@ -73,17 +73,13 @@ public:
         dns::DNSWorker& dns_worker,
         std::shared_ptr<const proxyman::inbound::BuildRequest> prepared,
         proxyman::inbound::ReceiverSettings receiver);
-    ~PhysicalSessionCapabilities() override;
+    ~PhysicalSessionCapabilities();
     PhysicalSessionCapabilities(const PhysicalSessionCapabilities&) = delete;
     PhysicalSessionCapabilities& operator=(const PhysicalSessionCapabilities&) = delete;
 
-    void BindDomain(const std::shared_ptr<ExecutionDomain>& domain);
-    [[nodiscard]] std::shared_ptr<ExecutionDomain> Domain() const noexcept;
-    [[nodiscard]] memory::AllocationDomain& Allocation() noexcept { return allocation_; }
     [[nodiscard]] const proxyman::inbound::ReceiverSettings& Receiver() const noexcept { return *receiver_; }
     [[nodiscard]] bool Initialized() const noexcept { return initialized_; }
     [[nodiscard]] bool IsJoined() const noexcept { return joined_; }
-    // Must run in the domain before constructing its socket/Context payload.
     void Initialize(net::io_context& native_reactor);
     // The caller owns and joins this structured scope before AsyncJoin().
     void Initialize(net::io_context& native_reactor, AwaitableTaskGroup& tasks);
@@ -105,10 +101,6 @@ public:
     [[nodiscard]] std::vector<OnlineDevice> GetOnlineDevices(std::string_view tag) const;
     void UpdateUserView(proxyman::inbound::UserStore::WorkerView view) noexcept;
 
-    void Enter() noexcept override;
-    void Leave() noexcept override;
-    void OnFailure(std::exception_ptr error) noexcept override;
-
 private:
     PhysicalSessionCapabilities(std::shared_ptr<const SessionConfiguration> configuration,
         std::shared_ptr<ConnectionLimiter> limiter,
@@ -116,9 +108,6 @@ private:
         std::shared_ptr<const proxyman::inbound::BuildRequest> prepared,
         std::shared_ptr<const proxyman::inbound::ReceiverSettings> receiver);
     struct Impl;
-    memory::AllocationDomain allocation_;
-    std::optional<memory::ScopedAllocationDomain> allocation_scope_;
-    std::weak_ptr<ExecutionDomain> domain_;
     std::shared_ptr<const SessionConfiguration> configuration_;
     std::shared_ptr<ConnectionLimiter> limiter_;
     std::shared_ptr<RequestLoadState> request_load_;
@@ -126,7 +115,6 @@ private:
     std::shared_ptr<const proxyman::inbound::BuildRequest> prepared_;
     std::shared_ptr<const proxyman::inbound::ReceiverSettings> receiver_;
     proxyman::inbound::UserStore::WorkerView user_view_;
-    proxyman::inbound::UserStore::WorkerView previous_user_view_;
     std::unique_ptr<Impl> impl_;
     std::shared_ptr<SessionTrackingState> tracking_;
     StatsShard stats_;
@@ -138,7 +126,6 @@ private:
 // Registration stays at admission, independently of the current execution
 // owner. Control-plane sampling therefore observes every session exactly once.
 struct PhysicalSessionRecord final {
-    std::shared_ptr<ExecutionDomain> domain;
     std::shared_ptr<PhysicalSessionCapabilities> capabilities;
     std::string inbound_tag;
     std::string accounting_key;
@@ -156,8 +143,7 @@ public:
     PhysicalSessionRegistry(net::io_context& io, uint32_t worker_id,
         StatsShard& totals, SessionTrackingState& traffic, Records& records);
     [[nodiscard]] std::shared_ptr<PhysicalSessionRecord> Register(
-        std::shared_ptr<PhysicalSessionCapabilities> capabilities,
-        std::shared_ptr<ExecutionDomain> domain);
+        std::shared_ptr<PhysicalSessionCapabilities> capabilities);
     // Called within the session domain after its business and native I/O join.
     net::awaitable<void> Retire(std::shared_ptr<PhysicalSessionRecord> record);
     void CompleteOnOwner(const std::shared_ptr<PhysicalSessionRecord>& record);
@@ -166,7 +152,6 @@ public:
 private:
     net::awaitable<void> RetireOnOwner(std::shared_ptr<PhysicalSessionRecord> record);
     net::io_context& io_;
-    uint32_t worker_id_;
     StatsShard& totals_;
     SessionTrackingState& traffic_;
     Records& records_;
