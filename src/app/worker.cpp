@@ -17,7 +17,6 @@
 #include "infra/log.hpp"
 #include "app/proxyman/inbound/user_store.hpp"
 #include "worker/udp_ingress.hpp"
-#include "app/session_tracking.hpp"
 #include "app/dns/dns.hpp"
 #include "transport/internet/datagram_socket.hpp"
 #include "transport/internet/tcp_stream.hpp"

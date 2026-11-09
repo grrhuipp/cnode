@@ -1,5 +1,3 @@
-#include "app/bootstrap.hpp"
-
 #include "../common/awaitable_batch.hpp"
 #include "api/api.hpp"
 #include "app/dns/dns.hpp"

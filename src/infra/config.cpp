@@ -5,9 +5,8 @@
 #include "core/constants.hpp"
 #include "infra/json.hpp"
 #include "proxy/anytls_padding.hpp"
-#include "proxy/sniff_config.hpp"
+#include "features/routing/dispatcher.hpp"
 #include "transport/internet/http_headers.hpp"
-#include "transport/internet/reality_key.hpp"
 #include "transport/internet/tls_stream.hpp"
 #include "infra/log.hpp"
 #include <algorithm>

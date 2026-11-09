@@ -9,7 +9,7 @@
 #include "common/session.hpp"
 #include "common/unsafe.hpp"
 #include "infra/log.hpp"
-#include "infra/runtime_config_types.hpp"
+#include "infra/config_types.hpp"
 #include "transport/internet/http_headers.hpp"
 #include "transport/internet/outbound_target_builder.hpp"
 #include "transport/internet/tcp_stream.hpp"

@@ -1,12 +1,17 @@
 #pragma once
 
-#include "transport/internet/reality_key.hpp"
-
+#include "common/asio_types.hpp"
+#include "common/binary_text_codec.hpp"
+#include "common/byte_reader.hpp"
+#include "common/domain_name.hpp"
+#include "common/unsafe.hpp"
 #include "core/constants.hpp"
 #include "infra/json.hpp"
-#include "transport/internet/outbound_bind.hpp"
 #include "transport/internet/http_headers.hpp"
-#include "common/unsafe.hpp"
+
+#include <algorithm>
+#include <array>
+#include <bitset>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -14,8 +19,207 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <tl/expected.hpp>
 #include <vector>
 
+class OutboundBind {
+public:
+    enum class Mode : uint8_t {
+        None,
+        Auto,
+        Explicit,
+        Ordered,
+    };
+
+    enum class ChoicePolicy : uint8_t { Random, IpHash, UserHash };
+
+    struct Selection {
+        std::optional<net::ip::address> address; // Empty only when no same-family entry exists.
+    };
+
+    OutboundBind() = default;
+
+    [[nodiscard]] Mode GetMode() const noexcept { return mode_; }
+    [[nodiscard]] bool PrefersIPv6() const noexcept {
+        return mode_ == Mode::Ordered && entries_ && !entries_->empty() && entries_->front().is_v6;
+    }
+    [[nodiscard]] const std::optional<net::ip::address>& ExplicitAddress() const& noexcept {
+        return explicit_address_;
+    }
+    const std::optional<net::ip::address>& ExplicitAddress() const&& = delete;
+
+    [[nodiscard]] static OutboundBind Auto() noexcept;
+    [[nodiscard]] static std::optional<OutboundBind> Parse(std::string_view value);
+    [[nodiscard]] static std::optional<OutboundBind> ParseCandidates(
+        std::span<const std::string_view> entries, ChoicePolicy policy);
+    [[nodiscard]] Selection Select(
+        const net::ip::address& remote,
+        std::string_view client_ip,
+        int64_t user_id = 0,
+        std::string_view user_email = {},
+        std::string_view inbound_tag = {}) const noexcept;
+    // Local address for the None/Auto/Explicit modes; Ordered binds use Select.
+    [[nodiscard]] std::optional<net::ip::address> BindAddressFor(
+        const tcp::endpoint* inbound_local, const net::ip::address& remote) const noexcept;
+
+private:
+    struct Entry {
+        bool is_v6 = false;
+        net::ip::address network_or_ip;
+        uint8_t prefix_length = 0;
+    };
+
+    Mode mode_ = Mode::None;
+    ChoicePolicy policy_ = ChoicePolicy::Random;
+    std::optional<net::ip::address> explicit_address_;
+    std::shared_ptr<const std::vector<Entry>> entries_; // Immutable cold-path snapshot.
+};
+
+namespace transport::internet {
+
+inline constexpr std::size_t kRealityKeySize = 32;
+inline constexpr std::size_t kRealityMldsa65PublicKeySize = 1952;
+inline constexpr std::size_t kRealityMldsa65SignatureSize = 3309;
+
+using RealityKey = std::array<uint8_t, kRealityKeySize>;
+using RealityMldsa65PublicKey = std::array<uint8_t, kRealityMldsa65PublicKeySize>;
+
+enum class RealityKeyError {
+    InvalidFormat,
+};
+
+[[nodiscard]] tl::expected<RealityKey, RealityKeyError>
+ParseRealityKey(std::string_view value) noexcept;
+
+[[nodiscard]] tl::expected<RealityKey, RealityKeyError>
+ParseRealityMldsa65Seed(std::string_view value) noexcept;
+
+[[nodiscard]] tl::expected<RealityMldsa65PublicKey, RealityKeyError>
+ParseRealityMldsa65PublicKey(std::string_view value) noexcept;
+
+[[nodiscard]] std::optional<std::string>
+NormalizeRealityFingerprint(std::string_view value);
+
+inline constexpr std::size_t kRealityShortIdSize = 8;
+using RealityShortId = std::array<uint8_t, kRealityShortIdSize>;
+
+enum class RealityShortIdError {
+    InvalidFormat,
+};
+
+[[nodiscard]] inline tl::expected<RealityShortId, RealityShortIdError>
+ParseRealityShortId(std::string_view value) noexcept {
+    if (value.size() % 2 != 0 || value.size() > kRealityShortIdSize * 2) {
+        return tl::unexpected(RealityShortIdError::InvalidFormat);
+    }
+
+    RealityShortId parsed{};
+    for (std::size_t i = 0; i < value.size(); i += 2) {
+        const int high = HexDigitValue(value[i]);
+        const int low = HexDigitValue(value[i + 1]);
+        if (high < 0 || low < 0) {
+            return tl::unexpected(RealityShortIdError::InvalidFormat);
+        }
+        parsed[i / 2] = static_cast<uint8_t>((high << 4) | low);
+    }
+    return parsed;
+}
+
+using RealityClientVersion = std::array<uint8_t, 4>;
+
+enum class RealityClientVersionError {
+    InvalidFormat,
+};
+
+[[nodiscard]] inline tl::expected<
+    std::optional<RealityClientVersion>, RealityClientVersionError>
+ParseRealityClientVersion(std::string_view value) noexcept {
+    if (value.empty()) {
+        return std::optional<RealityClientVersion>{};
+    }
+
+    RealityClientVersion version{};
+    size_t part = 0;
+    size_t start = 0;
+    while (true) {
+        if (part >= 3) {
+            return tl::unexpected(RealityClientVersionError::InvalidFormat);
+        }
+        const size_t dot = value.find('.', start);
+        const size_t end = dot == std::string_view::npos ? value.size() : dot;
+        if (end == start) {
+            return tl::unexpected(RealityClientVersionError::InvalidFormat);
+        }
+        uint32_t parsed = 0;
+        for (char ch : value.substr(start, end - start)) {
+            if (ch < '0' || ch > '9') {
+                return tl::unexpected(RealityClientVersionError::InvalidFormat);
+            }
+            parsed = parsed * 10u + static_cast<uint32_t>(ch - '0');
+            if (parsed > 255u) {
+                return tl::unexpected(RealityClientVersionError::InvalidFormat);
+            }
+        }
+        version[part++] = static_cast<uint8_t>(parsed);
+        if (dot == std::string_view::npos) {
+            break;
+        }
+        start = dot + 1;
+    }
+    return std::optional<RealityClientVersion>{version};
+}
+
+[[nodiscard]] inline uint32_t RealityClientVersionValue(
+    std::span<const uint8_t, 4> version) noexcept {
+    return LoadU32BE(version.data());
+}
+
+enum class TlsServerNameExtensionError {
+    InvalidFormat,
+};
+
+[[nodiscard]] inline tl::expected<std::string_view, TlsServerNameExtensionError>
+ParseTlsServerNameExtension(std::span<const uint8_t> extension) noexcept {
+    ByteReader outer(extension);
+    const auto list = outer.ReadBytes(outer.ReadU16BE());
+    if (!outer.Ok() || !outer.Empty()) {
+        return tl::unexpected(TlsServerNameExtensionError::InvalidFormat);
+    }
+
+    std::bitset<256> seen_types;
+    std::string_view host_name;
+    ByteReader reader(list);
+    while (!reader.Empty()) {
+        const uint8_t name_type = reader.ReadU8();
+        const uint16_t name_size = reader.ReadU16BE();
+        const std::string_view name = reader.ReadStringView(name_size);
+        if (!reader.Ok() || name_size == 0 || seen_types.test(name_type)) {
+            return tl::unexpected(TlsServerNameExtensionError::InvalidFormat);
+        }
+        seen_types.set(name_type);
+        if (name_type == 0) {
+            if (std::ranges::find(name, '\0') != name.end()) {
+                return tl::unexpected(
+                    TlsServerNameExtensionError::InvalidFormat);
+            }
+            host_name = name;
+        }
+    }
+    if (host_name.empty()) {
+        return tl::unexpected(TlsServerNameExtensionError::InvalidFormat);
+    }
+    return host_name;
+}
+
+[[nodiscard]] inline bool IsRealityServerNameAllowed(
+    std::span<const std::string> allowed,
+    std::string_view requested) noexcept {
+    return std::ranges::any_of(allowed, [requested](const std::string& name) {
+        return domain::DnsHostnamesEqual(name, requested);
+    });
+}
+
+}  // namespace transport::internet
 
 enum class StreamEndpointRole {
     Inbound,

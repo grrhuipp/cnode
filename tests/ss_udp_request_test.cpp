@@ -1,6 +1,5 @@
 #include <gtest/gtest.h>
 
-#include "proxy/shadowsocks/outbound/ss_outbound.hpp"
 #include "proxy/shadowsocks/ss_udp.hpp"
 #include "app/dns/dns.hpp"
 

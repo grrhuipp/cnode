@@ -2,7 +2,6 @@
 
 #include "common/allocator.hpp"
 #include "common/byte_reader.hpp"
-#include "transport/internet/reality_key.hpp"
 #include "transport/internet/stream_settings.hpp"
 #include <algorithm>
 #include <array>

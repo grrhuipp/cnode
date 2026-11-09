@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "transport/internet/reality_key.hpp"
+#include "transport/internet/stream_settings.hpp"
 
 #include <cstdio>
 

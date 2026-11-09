@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "transport/internet/outbound_bind.hpp"
+#include "transport/internet/stream_settings.hpp"
 #include "infra/config.hpp"
 #include "common/target_address.hpp"
 

@@ -12,7 +12,6 @@
 #include "common/domain_name.hpp"
 #include "common/ip_utils.hpp"
 #include "core/constants.hpp"
-#include "transport/internet/reality_key.hpp"
 #include <openssl/aead.h>
 #include <openssl/asn1.h>
 #include <openssl/bytestring.h>

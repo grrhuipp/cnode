@@ -3,7 +3,7 @@
 #include "api/api.hpp"
 #include "app/prepared_inbound.hpp"
 #include "app/proxyman/outbound/handler.hpp"
-#include "app/session_tracking.hpp"
+#include "app/stats.hpp"
 #include "common/sharded_user_stats.hpp"
 #include "core/constants.hpp"
 #include "infra/config_types.hpp"

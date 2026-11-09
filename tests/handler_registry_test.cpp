@@ -5,7 +5,7 @@
 #include "app/dns/dns.hpp"
 #include "common/session.hpp"
 #include "app/stats.hpp"
-#include "infra/runtime_config_types.hpp"
+#include "infra/config_types.hpp"
 #include "proxy/outbound.hpp"
 #include "../src/common/awaitable_task_group.hpp"
 

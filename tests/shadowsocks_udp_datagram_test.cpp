@@ -3,8 +3,6 @@
 
 #include "ss_udp.hpp"
 #include "shadowsocks_protocol.hpp"
-#include "inbound/ss_inbound.hpp"
-#include "outbound/ss_outbound.hpp"
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/cancellation_signal.hpp>
 #include <asio/co_spawn.hpp>

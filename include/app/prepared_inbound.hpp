@@ -104,3 +104,5 @@ net::awaitable<void> RollbackUsers(
     std::span<const std::unique_ptr<Worker>> workers,
     std::optional<UserPublicationRollback>& rollback,
     const bool& stopping);
+
+int RunFromCommandLine(int argc, char* argv[]);

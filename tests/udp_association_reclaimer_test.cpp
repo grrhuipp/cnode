@@ -12,7 +12,6 @@
 #include "infra/config_types.hpp"
 #include "proxy/inbound.hpp"
 #include "transport/async_stream.hpp"
-#include "transport/cancellation.hpp"
 
 #include <asio/co_spawn.hpp>
 #include <asio/detached.hpp>

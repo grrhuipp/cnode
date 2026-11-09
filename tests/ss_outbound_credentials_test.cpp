@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "outbound/ss_outbound.hpp"
+#include "ss_udp.hpp"
 
 #include <array>
 #include <cstring>

@@ -8,7 +8,7 @@
 #include "common/unsafe.hpp"
 #include "core/constants.hpp"
 #include "transport/internet/http_headers.hpp"
-#include "transport/internet/reality_key.hpp"
+#include "transport/internet/stream_settings.hpp"
 
 #include <openssl/evp.h>
 #include <openssl/hmac.h>

@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "infra/runtime_config_types.hpp"
+#include "infra/config_types.hpp"
 
 #include <array>
 #include <string_view>

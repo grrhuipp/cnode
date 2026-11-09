@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "proxy/sniff_config.hpp"
+#include "features/routing/dispatcher.hpp"
 
 #include <cstdio>
 

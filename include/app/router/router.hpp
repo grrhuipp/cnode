@@ -4,7 +4,7 @@
 #include "common/asio_types.hpp"
 #include "features/routing/router.hpp"
 #include "geo/geodata.hpp"
-#include "infra/runtime_config_types.hpp"
+#include "infra/config_types.hpp"
 
 #include <cstdint>
 #include <optional>

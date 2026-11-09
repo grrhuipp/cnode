@@ -339,24 +339,22 @@ WritePacketWithPadding(AsyncStream& stream,
         // Compiled records are positive and every possible Waste fits uint16.
         const size_t size = static_cast<size_t>(sampled_size);
         const size_t remaining = packet.size() - offset;
-        memory::ByteVector record;
         std::span<const uint8_t> output;
         if (remaining >= size) {
             output = std::span<const uint8_t>(packet).subspan(offset, size);
             offset += size;
         } else if (remaining > 0) {
-            output = std::span<const uint8_t>(packet).subspan(offset);
-            offset = packet.size();
+            const size_t chunk_offset = offset;
             if (size - remaining > kFrameHeaderSize) {
-                record.reserve(size);
-                record.assign(output.begin(), output.end());
-                AppendWaste(record, static_cast<uint16_t>(size - remaining - kFrameHeaderSize));
-                output = record;
+                AppendWaste(packet, static_cast<uint16_t>(size - remaining - kFrameHeaderSize));
             }
+            offset = packet.size();
+            output = std::span<const uint8_t>(packet).subspan(chunk_offset);
         } else {
-            record.reserve(kFrameHeaderSize + size);
-            AppendWaste(record, static_cast<uint16_t>(size));
-            output = record;
+            packet.clear();
+            AppendWaste(packet, static_cast<uint16_t>(size));
+            offset = packet.size();
+            output = packet;
         }
 
         auto ok = co_await WriteAll(stream, output);

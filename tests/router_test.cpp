@@ -3,7 +3,7 @@
 #include "app/router/router.hpp"
 #include "app/proxyman/inbound/handler.hpp"
 #include "common/session.hpp"
-#include "infra/runtime_config_types.hpp"
+#include "infra/config_types.hpp"
 
 #include <concepts>
 #include <cstddef>

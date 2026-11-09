@@ -2,7 +2,7 @@
 
 #include "common/asio_types.hpp"
 #include "common/allocator.hpp"
-#include "transport/cancellation.hpp"
+#include "transport/link.hpp"
 
 #include <asio/async_result.hpp>
 #include <asio/bind_cancellation_slot.hpp>

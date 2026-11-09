@@ -410,7 +410,7 @@ TEST(Http2EncryptedDeadline, ExpiredChildReturnsQuotaBeforeBlockedSiblingResumes
     Deadlines(client, 20); client.Start();
     auto pump_until = [&](const std::function<bool()>& predicate, Milliseconds timeout) {
         auto deadline = Clock::now() + timeout;
-        while (!predicate()) { Require(Clock::now() < deadline && !peer.closed, "encrypted bridge observation deadline"); peer.Pump(10ms); bridge.Forward(peer); }
+        while (!predicate()) { Require(Clock::now() < deadline && !peer.closed, "encrypted bridge observation deadline"); if (peer.Pump(10ms)) while (!peer.closed && peer.messages[1].size() < 65536 && peer.Pump(0ms)) {} bridge.Forward(peer); }
     };
     peer.Down(1, "s1"); auto survivor = Socket::Connect(client.port); survivor.Write(VlessRequest(target.Port(), "A"));
     std::atomic<bool> initial_done{false};

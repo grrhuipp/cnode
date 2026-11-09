@@ -3,7 +3,7 @@
 #include "app/worker_mailbox.hpp"
 #include "app/proxyman/inbound/user_store.hpp"
 #include "app/proxyman/outbound/handler.hpp"
-#include "infra/runtime_config_types.hpp"
+#include "infra/config_types.hpp"
 #include "common/allocator.hpp"
 #include "common/asio_types.hpp"
 #include "common/container_util.hpp"
@@ -35,7 +35,7 @@ class GeoDatabase;
 namespace app::dns {
 class DNSWorker;
 }
-#include "app/session_tracking.hpp"
+#include "app/stats.hpp"
 struct OnlineDevice;
 struct PortBinding;
 struct StatsShard;

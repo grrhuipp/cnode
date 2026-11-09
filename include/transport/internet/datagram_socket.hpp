@@ -3,8 +3,7 @@
 #include "common/asio_types.hpp"
 #include "common/buf/multi_buffer.hpp"
 #include "common/error.hpp"
-#include "transport/cancellation.hpp"
-#include "transport/phase_deadline.hpp"
+#include "transport/async_stream.hpp"
 
 #include <asio/buffer.hpp>
 

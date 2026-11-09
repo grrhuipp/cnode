@@ -3,7 +3,6 @@
 #include "common/allocator.hpp"
 #include "common/buf/multi_buffer.hpp"
 #include "transport/async_stream.hpp"
-#include "transport/cancellation.hpp"
 #include "transport/internet/transport_stack.hpp"
 
 #include <algorithm>

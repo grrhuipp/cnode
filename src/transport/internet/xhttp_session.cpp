@@ -7,7 +7,6 @@
 #include "infra/log.hpp"
 #include "transport/internet/http_headers.hpp"
 #include "transport/internet/tcp_stream.hpp"
-#include "transport/phase_deadline.hpp"
 #include "transport/internet/tls_stream.hpp"
 #include <asio/as_tuple.hpp>
 #include <asio/co_spawn.hpp>

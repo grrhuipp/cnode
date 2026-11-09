@@ -12,7 +12,7 @@
 #include "transport/internet/async_write_gate.hpp"
 #include "transport/internet/http_headers.hpp"
 #include "transport/internet/tcp_stream.hpp"
-#include "transport/phase_deadline.hpp"
+#include "transport/async_stream.hpp"
 
 #include <algorithm>
 #include <array>
@@ -508,6 +508,16 @@ private:
     return increment;
 }
 
+void EncodeWindowUpdateFrame(uint8_t* out,
+                             uint32_t stream_id,
+                             uint32_t increment) noexcept {
+    StoreU24BE(out, 4);
+    out[3] = static_cast<uint8_t>(H2FrameType::WINDOW_UPDATE);
+    out[4] = 0;
+    StoreU32BE(out + 5, stream_id & 0x7fff'ffffu);
+    StoreU32BE(out + 9, increment & 0x7fff'ffffu);
+}
+
 net::awaitable<void> SendWindowUpdate(AsyncStream& stream,
                                       uint32_t stream_id,
                                       uint32_t increment) {
@@ -522,6 +532,22 @@ net::awaitable<void> SendWindowUpdate(AsyncStream& stream,
         0,
         stream_id,
         payload);
+}
+
+net::awaitable<void> SendDualWindowUpdate(AsyncStream& stream,
+                                          uint32_t conn_increment,
+                                          uint32_t stream_id,
+                                          uint32_t stream_increment) {
+    std::array<uint8_t, 26> frames{};
+    EncodeWindowUpdateFrame(frames.data(), 0, conn_increment);
+    EncodeWindowUpdateFrame(frames.data() + 13, stream_id, stream_increment);
+    const net::const_buffer buf = net::buffer(frames);
+    try {
+        co_await stream.WriteBuffers(std::span<const net::const_buffer>(&buf, 1));
+    } catch (...) {
+        stream.CloseAbortive();
+        throw;
+    }
 }
 
 // DATA payload without padding; empty when the padding length is invalid.
@@ -1463,25 +1489,7 @@ private:
         if (credit != 0) {
             // After END_STREAM the peer sends no more DATA on this stream.
             if (!input_done_) {
-                std::array<uint8_t, 26> frames{};
-                const uint32_t inc = credit & 0x7fff'ffffu;
-                StoreU24BE(frames.data(), 4);
-                frames[3] = static_cast<uint8_t>(H2FrameType::WINDOW_UPDATE);
-                frames[4] = 0;
-                StoreU32BE(frames.data() + 5, 0);
-                StoreU32BE(frames.data() + 9, inc);
-                StoreU24BE(frames.data() + 13, 4);
-                frames[16] = static_cast<uint8_t>(H2FrameType::WINDOW_UPDATE);
-                frames[17] = 0;
-                StoreU32BE(frames.data() + 18, stream_id_ & 0x7fff'ffffu);
-                StoreU32BE(frames.data() + 22, inc);
-                const net::const_buffer buf = net::buffer(frames);
-                try {
-                    co_await inner_->WriteBuffers(std::span<const net::const_buffer>(&buf, 1));
-                } catch (...) {
-                    inner_->CloseAbortive();
-                    throw;
-                }
+                co_await SendDualWindowUpdate(*inner_, credit, stream_id_, credit);
                 conn_recv_window_ += credit;
                 stream_recv_window_ += credit;
             } else {
@@ -1780,11 +1788,13 @@ private:
             } else if (flow_len > 0) {
                 auto lease = write_gate_.TryAcquire();
                 if (!lease) lease = co_await AcquireWrite();
+                const auto inc = static_cast<uint32_t>(flow_len);
                 conn_recv_window_ += flow_len;
-                co_await SendWindowUpdate(*inner_, 0, static_cast<uint32_t>(flow_len));
                 if (!input_done_) {
                     stream_recv_window_ += flow_len;
-                    co_await SendWindowUpdate(*inner_, stream_id_, static_cast<uint32_t>(flow_len));
+                    co_await SendDualWindowUpdate(*inner_, inc, stream_id_, inc);
+                } else {
+                    co_await SendWindowUpdate(*inner_, 0, inc);
                 }
             }
             co_return;
@@ -2428,32 +2438,44 @@ private:
                 auto lease = write_gate_.TryAcquire();
                 if (!lease) lease = co_await write_gate_.Acquire();
                 if (!lease || !ConnectionWritable()) break;
-                uint32_t id = 0;
-                uint32_t increment = std::exchange(consumed_connection_credit_, 0);
-                if (increment != 0) {
-                    connection_receive_window_ += increment;
+                const uint32_t conn_increment = std::exchange(consumed_connection_credit_, 0);
+                if (conn_increment != 0) {
+                    connection_receive_window_ += conn_increment;
+                }
+                uint32_t target_stream_id = 0;
+                uint32_t stream_increment = 0;
+                bool more_streams = false;
+                // Do not retain an unordered_map iterator over an await.
+                for (auto& [stream_id, sub] : streams_) {
+                    if (!sub->AcceptsData()) {
+                        sub->ConsumedCredit() = 0;
+                        continue;
+                    }
+                    if (sub->ConsumedCredit() == 0) continue;
+                    if (stream_increment == 0) {
+                        target_stream_id = stream_id;
+                        stream_increment = std::exchange(sub->ConsumedCredit(), 0);
+                        sub->ReceiveWindow() += stream_increment;
+                    } else {
+                        more_streams = true;
+                    }
+                }
+                if (conn_increment == 0 && stream_increment == 0) break;
+                if (conn_increment != 0 && stream_increment != 0) {
+                    co_await SendDualWindowUpdate(
+                        *stream_, conn_increment, target_stream_id, stream_increment);
                 } else {
-                    // Do not retain an unordered_map iterator over an await.
-                    for (auto& [stream_id, sub] : streams_) {
-                        if (!sub->AcceptsData()) {
-                            sub->ConsumedCredit() = 0;
-                            continue;
-                        }
-                        if (sub->ConsumedCredit() == 0) continue;
-                        id = stream_id;
-                        increment = std::exchange(sub->ConsumedCredit(), 0);
-                        sub->ReceiveWindow() += increment;
+                    const uint32_t id = stream_increment != 0 ? target_stream_id : 0;
+                    const uint32_t inc = stream_increment != 0 ? stream_increment : conn_increment;
+                    std::array<uint8_t, 4> payload{};
+                    StoreU32BE(payload.data(), inc & 0x7fff'ffffu);
+                    if (!co_await WriteH2Frame(
+                            *stream_, H2FrameType::WINDOW_UPDATE, 0, id, payload)) {
+                        CancelAll();
                         break;
                     }
                 }
-                if (increment == 0) break;
-                std::array<uint8_t, 4> payload{};
-                StoreU32BE(payload.data(), increment);
-                if (!co_await WriteH2Frame(
-                        *stream_, H2FrameType::WINDOW_UPDATE, 0, id, payload)) {
-                    CancelAll();
-                    break;
-                }
+                if (!more_streams && consumed_connection_credit_ == 0) break;
             }
         } catch (...) {
             CancelAll();

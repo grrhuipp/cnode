@@ -1,7 +1,7 @@
 #pragma once
 
 #include "common/error.hpp"
-#include "transport/phase_deadline.hpp"
+#include "transport/async_stream.hpp"
 #include "transport/internet/timeout_scheduler.hpp"
 
 #include "common/allocator.hpp"

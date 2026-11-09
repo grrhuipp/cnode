@@ -11,7 +11,6 @@
 
 #include "common/target_address.hpp"
 #include "transport/async_stream.hpp"
-#include "transport/phase_deadline.hpp"
 #include <asio/steady_timer.hpp>
 #include <openssl/ssl.h>
 #include <nghttp3/nghttp3.h>

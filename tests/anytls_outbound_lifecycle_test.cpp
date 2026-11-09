@@ -5,7 +5,7 @@
 #include "app/stats.hpp"
 #include "app/session_group_executor.hpp"
 #include "common/session.hpp"
-#include "infra/runtime_config_types.hpp"
+#include "infra/config_types.hpp"
 #include "transport/internet/tls_stream.hpp"
 #include "transport/internet/tcp_stream.hpp"
 #include "transport/internet/outbound_target_builder.hpp"

@@ -88,7 +88,6 @@ set(CNODE_CORE_SOURCES
     # Transport - common stream interface
     src/transport/async_stream.cpp
     src/transport/internet/stream_settings.cpp
-    src/transport/internet/outbound_bind.cpp
 
     # Transport - Internet
     src/transport/internet/datagram_socket.cpp
@@ -114,8 +113,6 @@ set(CNODE_CORE_SOURCES
     src/app/session_group_executor.cpp
     src/service/controller/controller.cpp
     src/app/prepared_inbound.cpp
-    src/app/session_tracking.cpp
-    src/proxy/mux/inbound/mux_inbound.cpp
     src/common/rule.cpp
     src/common/session.cpp
     src/common/sharded_user_stats.cpp
@@ -313,7 +310,7 @@ cnode_unit(shadowsocks_udp_datagram INCLUDES src/proxy/shadowsocks)
 cnode_unit(shadowsocks_udp_identity INCLUDES src/proxy/shadowsocks)
 cnode_unit(sniff_config)
 cnode_unit(ss_outbound_credentials INCLUDES src/proxy/shadowsocks)
-cnode_unit(ss_outbound_uot INCLUDES src/proxy/shadowsocks/outbound)
+cnode_unit(ss_outbound_uot INCLUDES src/proxy/shadowsocks)
 cnode_unit(ss_udp_request)
 cnode_unit(startup_inbounds INCLUDES src/app)
 cnode_unit(stream_settings)
