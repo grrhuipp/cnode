@@ -1,7 +1,7 @@
 #include <stdexcept>
 #include <gtest/gtest.h>
 
-#include "anytls_outbound_settings.hpp"
+#include "anytls_outbound.hpp"
 
 #include <cstdlib>
 #include <iostream>

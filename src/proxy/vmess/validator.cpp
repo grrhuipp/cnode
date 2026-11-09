@@ -190,15 +190,11 @@ struct SessionKeyHash {
     };
 }  // namespace
 
-TimedUserValidator::TimedUserValidator() = default;
-
-TimedUserValidator::~TimedUserValidator() = default;
-
 std::shared_ptr<const proxyman::inbound::UserStore::VmessCredential>
-TimedUserValidator::FindByAuthIDForTag(
+FindByAuthIDForTag(
     std::string_view tag,
     const uint8_t* auth_id,
-    int64_t& out_timestamp) const {
+    int64_t* out_timestamp) {
 
     int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
@@ -225,7 +221,9 @@ TimedUserValidator::FindByAuthIDForTag(
         OPENSSL_cleanse(plaintext.data(), plaintext.size());
 
         if (crc == expected_crc) {
-            out_timestamp = timestamp;
+            if (out_timestamp) {
+                *out_timestamp = timestamp;
+            }
             return true;
         }
         return false;
@@ -248,22 +246,36 @@ TimedUserValidator::FindByAuthIDForTag(
         return {};
     }
 
+    uint32_t tried_hot_mask = 0;
     if (revision != 0) {
-        for (auto it = tls_hot_cache.entries.begin();
-             it != tls_hot_cache.entries.begin() + tls_hot_cache.size;
-             ++it) {
-            if (it->table == view.users.get() &&
-                it->last_seen + HotUserCache::kWindowSeconds >= now) {
-                const auto* user = it->user;
+        for (size_t i = 0; i < tls_hot_cache.size; ++i) {
+            const auto& entry = tls_hot_cache.entries[i];
+            if (entry.table == view.users.get() &&
+                entry.last_seen + HotUserCache::kWindowSeconds >= now) {
+                const auto* user = entry.user;
                 if (tryUser(*user)) {
                     tls_hot_cache.Touch(user, view.users.get(), now);
                     return view.Share(*user);
                 }
+                tried_hot_mask |= (uint32_t{1} << i);
             }
         }
     }
 
     for (const auto& user : *view.users) {
+        if (tried_hot_mask != 0) {
+            bool already_tried = false;
+            for (size_t i = 0; i < tls_hot_cache.size; ++i) {
+                if ((tried_hot_mask & (uint32_t{1} << i)) != 0 &&
+                    tls_hot_cache.entries[i].user == &user) {
+                    already_tried = true;
+                    break;
+                }
+            }
+            if (already_tried) {
+                continue;
+            }
+        }
         if (tryUser(user)) {
             if (revision != 0) {
                 tls_hot_cache.Touch(&user, view.users.get(), now);
@@ -275,10 +287,10 @@ TimedUserValidator::FindByAuthIDForTag(
     return {};
 }
 
-net::awaitable<bool> TimedUserValidator::RegisterSessionIfNew(
+net::awaitable<bool> RegisterSessionIfNew(
     const proxyman::inbound::UserStore::VmessCredential& user,
     const std::array<uint8_t, 16>& body_key,
-    const std::array<uint8_t, 16>& body_iv) const {
+    const std::array<uint8_t, 16>& body_iv) {
     auto executor = co_await net::this_coro::executor;
     auto* coordinator = GroupCoordinator::ForContext(
         net::query(executor, net::execution::context));

@@ -38,6 +38,11 @@ struct PreparedKeyBytes {
     std::array<uint8_t, kMaxSize> bytes{};
     size_t size = 0;
 
+    PreparedKeyBytes() = default;
+    PreparedKeyBytes(const PreparedKeyBytes&) = default;
+    PreparedKeyBytes& operator=(const PreparedKeyBytes&) = default;
+    PreparedKeyBytes(PreparedKeyBytes&&) noexcept = default;
+    PreparedKeyBytes& operator=(PreparedKeyBytes&&) noexcept = default;
     ~PreparedKeyBytes() noexcept {
         ::SecureZeroMemory(bytes.data(), bytes.size());
     }
@@ -90,8 +95,6 @@ struct PreparedShadowsocksUser {
     PreparedKeyBytes derived_key;
     PreparedKeyBytes identity_key;
     std::array<uint8_t, 16> psk_hash{};
-    size_t key_size = 32;
-    size_t salt_size = 32;
     ::UserProfile profile;
 };
 

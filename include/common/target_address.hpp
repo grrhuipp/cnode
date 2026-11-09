@@ -89,8 +89,7 @@ struct TargetAddress {
     [[nodiscard]]
     static std::optional<TargetAddress> Parse(std::string_view addr);
 
-private:
-    static bool ParsePort(std::string_view text, uint16_t& port) {
+    [[nodiscard]] static bool ParsePort(std::string_view text, uint16_t& port) noexcept {
         if (text.empty()) {
             return false;
         }
@@ -104,6 +103,8 @@ private:
         port = static_cast<uint16_t>(value);
         return true;
     }
+
+private:
 
     void InitFromHost(std::string_view h) {
         type = AddressType::Invalid;

@@ -9,11 +9,9 @@
 #include <sys/eventfd.h>
 #include <unistd.h>
 #include <cerrno>
-#include <algorithm>
 #include <atomic>
 #include <stdexcept>
 #include <system_error>
-#include <vector>
 
 namespace {
 class WorkerCoordinatorService final : public net::execution_context::service {
@@ -22,18 +20,13 @@ public:
     explicit WorkerCoordinatorService(net::execution_context& context)
         : net::execution_context::service(context) {}
 
-    void Bind(std::weak_ptr<GroupCoordinator> coordinator,
-              std::optional<uint32_t> worker_id) {
+    bool Bind(std::weak_ptr<GroupCoordinator> coordinator, bool count_worker) {
         coordinator_ = std::move(coordinator);
-        worker_id_ = worker_id;
+        return count_worker && !std::exchange(registered_, true);
     }
 
     [[nodiscard]] GroupCoordinator* Coordinator() const noexcept {
         return coordinator_.lock().get();
-    }
-
-    [[nodiscard]] std::optional<uint32_t> WorkerId() const noexcept {
-        return worker_id_;
     }
 
 private:
@@ -42,7 +35,7 @@ private:
     }
 
     std::weak_ptr<GroupCoordinator> coordinator_;
-    std::optional<uint32_t> worker_id_;
+    bool registered_ = false;
 };
 
 net::execution_context::id WorkerCoordinatorService::id;
@@ -64,7 +57,6 @@ struct GroupCoordinator::ReservedState {
     std::atomic<bool> started{false};
     bool stopping = false;
     bool joined = false;
-    std::vector<const net::io_context*> workers;
     std::atomic<uint32_t> worker_count{0};
 };
 
@@ -89,15 +81,11 @@ void GroupCoordinator::Start() {
     net::post(reactor_, [self = shared_from_this()] { self->EnsureStarted(); });
 }
 
-void GroupCoordinator::RegisterWorker(uint32_t worker_id, net::io_context& reactor) {
-    net::use_service<WorkerCoordinatorService>(reactor).Bind(weak_from_this(), worker_id);
-    net::use_service<WorkerCoordinatorService>(reactor_).Bind(weak_from_this(), std::nullopt);
-    if (std::find(reserved_->workers.begin(), reserved_->workers.end(), &reactor) !=
-        reserved_->workers.end()) {
-        return;
+void GroupCoordinator::RegisterWorker(uint32_t, net::io_context& reactor) {
+    net::use_service<WorkerCoordinatorService>(reactor_).Bind(weak_from_this(), false);
+    if (net::use_service<WorkerCoordinatorService>(reactor).Bind(weak_from_this(), true)) {
+        reserved_->worker_count.fetch_add(1, std::memory_order_release);
     }
-    reserved_->workers.push_back(&reactor);
-    reserved_->worker_count.fetch_add(1, std::memory_order_release);
 }
 
 uint32_t GroupCoordinator::WorkerCount() const noexcept {
@@ -107,12 +95,6 @@ uint32_t GroupCoordinator::WorkerCount() const noexcept {
 GroupCoordinator* GroupCoordinator::ForContext(net::execution_context& context) noexcept {
     if (!net::has_service<WorkerCoordinatorService>(context)) return nullptr;
     return net::use_service<WorkerCoordinatorService>(context).Coordinator();
-}
-
-std::optional<uint32_t> GroupCoordinator::WorkerIdForContext(
-    net::execution_context& context) noexcept {
-    if (!net::has_service<WorkerCoordinatorService>(context)) return std::nullopt;
-    return net::use_service<WorkerCoordinatorService>(context).WorkerId();
 }
 
 void GroupCoordinator::PostReserved(std::unique_ptr<ReservedOperation> operation) noexcept {

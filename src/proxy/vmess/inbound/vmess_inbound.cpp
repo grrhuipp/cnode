@@ -5,6 +5,7 @@
 #include "app/rate_limiter.hpp"
 #include "app/stats.hpp"
 #include "features/routing/dispatcher.hpp"
+#include "../validator.hpp"
 #include "../encoding/server.hpp"
 #include "../account.hpp"
 #include "app/proxyman/inbound/factory.hpp"
@@ -32,7 +33,7 @@ Network RequestNetwork(::vmess::Command command) noexcept {
 net::awaitable<tl::expected<UserOnlineSessionGuard, ErrorCode>>
 ParseHandshake(AsyncStream& stream,
                ::vmess::encoding::ServerSession& vmess_session,
-               ::vmess::TimedUserValidator& validator,
+               ::UserOnlineTracker& validator,
                ConnectionLimiter* limiter,
                session::Context& ctx,
                std::string_view client_ip) {
@@ -98,7 +99,7 @@ ParseHandshake(AsyncStream& stream,
             RequestNetwork(request->command),
             request->target,
             std::move(request->forwarded)});
-    if (!co_await validator.RegisterSessionIfNew(
+    if (!co_await ::vmess::RegisterSessionIfNew(
             *request->user, request->body_key, request->body_iv)) {
         // Replay is not a credential failure: it never feeds the ban table.
         constexpr std::string_view reason = "session replay admission rejected";
@@ -138,11 +139,11 @@ ParseHandshake(AsyncStream& stream,
 // ============================================================================
 
 proxy::vmess::inbound::Handler::Handler(
-    ::vmess::TimedUserValidator& validator,
+    ::UserOnlineTracker& validator,
     StatsShard& stats,
     ConnectionLimiter* limiter)
     : validator_(validator)
-    , stats_(&stats)
+    , stats_(stats)
     , limiter_(limiter)
 {}
 
@@ -166,26 +167,26 @@ proxy::vmess::inbound::Handler::Process(
     std::unique_ptr<transport::MultiBufferWriter> response_writer;
     try {
         if (co_await proxy::CheckInboundIpBanned(limiter_, ctx)) {
-            co_return proxy::RejectInbound(*stats_, stream.get(), ErrorCode::BLOCKED);
+            co_return proxy::RejectInbound(stats_, stream.get(), ErrorCode::BLOCKED);
         }
-        ::vmess::encoding::ServerSession vmess_session(validator_, tag);
+        ::vmess::encoding::ServerSession vmess_session(tag);
         auto parsed_session = co_await ParseHandshake(
             *stream, vmess_session, validator_, limiter_, ctx, client_ip);
         if (!parsed_session) {
-            co_return proxy::RejectInbound(*stats_, stream.get(), parsed_session.error());
+            co_return proxy::RejectInbound(stats_, stream.get(), parsed_session.error());
         }
         user_session.emplace(std::move(*parsed_session));
         request_reader = vmess_session.DecodeRequestBody(*stream);
         response_writer = vmess_session.EncodeResponseBodyWithHeader(*stream);
     } catch (const WorkerMailboxFull&) {
-        co_return proxy::RejectInbound(*stats_, stream.get(), ErrorCode::RESOURCE_EXHAUSTED);
+        co_return proxy::RejectInbound(stats_, stream.get(), ErrorCode::RESOURCE_EXHAUSTED);
     } catch (const IoSystemError& e) {
         co_return proxy::RejectInbound(
-            *stats_, stream.get(),
+            stats_, stream.get(),
             e.code() == net::error::operation_aborted ? ErrorCode::CANCELLED : MapAsioError(e.code()));
     }
     if (!request_reader || !response_writer) {
-        co_return proxy::RejectInbound(*stats_, stream.get(), ErrorCode::RESOURCE_EXHAUSTED);
+        co_return proxy::RejectInbound(stats_, stream.get(), ErrorCode::RESOURCE_EXHAUSTED);
     }
     const Network net = ctx.content.network;
 
@@ -198,7 +199,7 @@ proxy::vmess::inbound::Handler::Process(
             receiver.dispatch_policy,
             limiter_,
             ctx,
-            *stats_,
+            stats_,
             timeouts,
             pressure_idle_timeout);
     }
@@ -210,7 +211,7 @@ proxy::vmess::inbound::Handler::Process(
         transport::Link{request_reader.get(), response_writer.get()},
         InitialPayload{},
         ctx,
-        *stats_,
+        stats_,
         timeouts);
 }
 
@@ -238,24 +239,19 @@ const bool kVmessInboundRegistered = [] {
     ::proxyman::inbound::ProxyRegistration reg;
     reg.user_protocol = ::proxyman::inbound::UserProtocol::Vmess;
 
-    reg.create_runtime = []() -> std::unique_ptr<
-        ::proxyman::inbound::ProtocolRuntime> {
-        return std::make_unique<
-            ::proxy::InboundTrackerRuntime<::vmess::TimedUserValidator>>();
-    };
+    reg.create_runtime = &::proxy::CreateUserOnlineProtocolRuntime;
 
     reg.create_tcp_handler =
         [](::proxyman::inbound::ProtocolRuntime& runtime,
            ::StatsShard& stats,
            ::ConnectionLimiter* limiter,
            const ::proxyman::inbound::BuildRequest&) -> std::unique_ptr<::Inbound> {
-            auto* vmess_runtime = dynamic_cast<
-                ::proxy::InboundTrackerRuntime<::vmess::TimedUserValidator>*>(&runtime);
-            if (!vmess_runtime) {
+            auto* tracker = runtime.OnlineTracker();
+            if (!tracker) {
                 return nullptr;
             }
             return std::make_unique<::proxy::vmess::inbound::Handler>(
-                vmess_runtime->validator,
+                *tracker,
                 stats,
                 limiter);
         };

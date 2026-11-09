@@ -246,4 +246,25 @@ tl::expected<std::string, std::string> ParseAnyTlsPaddingScheme(
     return scheme;
 }
 
+InboundListen ParseInboundListen(
+    const json::object& object,
+    std::string_view key,
+    std::string_view field_label,
+    InboundListen fallback) {
+    const auto* value = object.if_contains(key);
+    if (!value) {
+        return fallback;
+    }
+    if (!value->is_string()) {
+        throw std::invalid_argument(std::format("{} must be a string", field_label));
+    }
+    auto parsed = InboundListen::Parse(value->as_string());
+    if (!parsed) {
+        throw std::invalid_argument(std::format(
+            "{} '{}' must be auto or an IP address",
+            field_label, value->as_string()));
+    }
+    return std::move(*parsed);
+}
+
 }  // namespace infra

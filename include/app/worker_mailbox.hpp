@@ -26,7 +26,6 @@ class WorkerMailboxFull : public std::runtime_error {
 public:
     WorkerMailboxFull()
         : std::runtime_error(std::string(ErrorCodeToString(ErrorCode::RESOURCE_EXHAUSTED))) {}
-    static constexpr ErrorCode code = ErrorCode::RESOURCE_EXHAUSTED;
 };
 
 // Admission and closure have a single atomic linearization point. Accepted

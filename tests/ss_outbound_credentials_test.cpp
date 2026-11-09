@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "outbound/ss_outbound_credentials.hpp"
+#include "outbound/ss_outbound.hpp"
 
 #include <array>
 #include <cstring>

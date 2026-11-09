@@ -16,25 +16,6 @@ namespace {
 constexpr uint64_t kProtoWireLengthDelimited = 2;
 constexpr uint64_t kProtoAddonsFlowField = 1;
 
-bool WriteProtoVarint(ByteWriter& writer, size_t value) noexcept {
-    while (value >= 0x80) {
-        if (!writer.WriteU8(static_cast<uint8_t>((value & 0x7F) | 0x80))) {
-            return false;
-        }
-        value >>= 7;
-    }
-    return writer.WriteU8(static_cast<uint8_t>(value));
-}
-
-size_t ProtoVarintSize(size_t value) noexcept {
-    size_t size = 1;
-    while (value >= 0x80) {
-        value >>= 7;
-        ++size;
-    }
-    return size;
-}
-
 bool ParseHeaderAddons(std::span<const uint8_t> data,
                        RequestHeader& request) {
     ByteReader reader(data);
@@ -69,7 +50,7 @@ size_t EncodedAddonsSize(std::string_view flow) noexcept {
     if (flow.empty()) {
         return 0;
     }
-    return 1 + ProtoVarintSize(flow.size()) + flow.size();
+    return 1 + VarintU64Size(flow.size()) + flow.size();
 }
 
 bool WriteHeaderAddons(ByteWriter& writer, std::string_view flow) noexcept {
@@ -86,7 +67,7 @@ bool WriteHeaderAddons(ByteWriter& writer, std::string_view flow) noexcept {
     constexpr uint8_t flow_tag =
         static_cast<uint8_t>((kProtoAddonsFlowField << 3) | kProtoWireLengthDelimited);
     return writer.WriteU8(flow_tag) &&
-           WriteProtoVarint(writer, flow.size()) &&
+           writer.WriteVarintU64(flow.size()) &&
            writer.WriteString(flow);
 }
 

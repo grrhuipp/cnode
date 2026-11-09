@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common/allocator.hpp"
+#include "common/byte_reader.hpp"
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -40,7 +41,7 @@ public:
                 return;
             }
             if (header_size_ != header_.size()) return;
-            remaining_ = (size_t{header_[3]} << 8) | header_[4];
+            remaining_ = LoadU16BE(header_.data() + 3);
             if (remaining_ == 0 || remaining_ > 16384) {
                 status_ = Status::Invalid;
             }
@@ -56,7 +57,7 @@ public:
                 return;
             }
             if (hello_.size() == 4) {
-                hello_size_ = 4 + (size_t{hello_[1]} << 16) + (size_t{hello_[2]} << 8) + hello_[3];
+                hello_size_ = 4 + LoadU24BE(hello_.data() + 1);
                 if (hello_size_ < 4 + 2 + 32 + 1 + 32 + 2 + 2 + 1 + 1 + 2 || hello_size_ > kMaxHelloSize) {
                     status_ = Status::Invalid;
                     return;
@@ -76,6 +77,7 @@ public:
         }
     }
     [[nodiscard]] std::span<const uint8_t> Hello() const noexcept { return hello_; }
+    [[nodiscard]] memory::ByteVector TakeHello() noexcept { return std::move(hello_); }
     [[nodiscard]] memory::ByteVector TakeWire() noexcept { return std::move(wire_); }
 private:
     std::array<uint8_t, 5> header_{};

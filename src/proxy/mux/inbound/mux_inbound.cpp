@@ -138,7 +138,6 @@ struct ReplyQueueState {
         if (tcp_queued_bytes >= kMuxQueueHighWaterBytes) {
             tcp_backpressured = true;
         }
-        WakeReplyWriter();
         return true;
     }
 
@@ -518,24 +517,18 @@ public:
         Cancel();
     }
 
-    void PushClientPayload(buf::MultiBuffer mb) {
-        const size_t bytes = mb.byte_size();
-        if (InputClosed() || bytes == 0) {
-            mb.clear();
-            return;
-        }
-        QueueInput(std::move(mb), bytes, true);
-    }
-
     void PushClientFramePayload(
         buf::MultiBuffer mb,
         size_t data_len,
         const TargetAddress* packet_target) override {
         (void)data_len;
         (void)packet_target;
-        if (mb.byte_size() != 0) {
-            PushClientPayload(std::move(mb));
+        const size_t bytes = mb.byte_size();
+        if (InputClosed() || bytes == 0) {
+            mb.clear();
+            return;
         }
+        QueueInput(std::move(mb), bytes, true);
     }
 
     transport::EofAction ReadEofAction() const noexcept override {
@@ -601,6 +594,7 @@ public:
                     "Mux TCP reply queue admission changed");
             }
         }
+        reply_queue_.WakeReplyWriter();
         mb.clear();
     }
 
@@ -697,24 +691,19 @@ public:
         Cancel();
     }
 
-    void PushClientPayload(
-        buf::MultiBuffer mb, size_t bytes, const TargetAddress* target = nullptr) {
-        if (InputClosed()) {
-            mb.clear();
-            return;
-        }
-        if (!buf::SetUdpTarget(mb, target ? *target : default_target_)) {
-            throw std::bad_alloc();
-        }
-        // Empty datagrams still own a Buffer and a queue entry.
-        QueueInput(std::move(mb), std::max(bytes, size_t{buf::Buffer::kSize}));
-    }
-
     void PushClientFramePayload(
         buf::MultiBuffer mb,
         size_t data_len,
         const TargetAddress* packet_target) override {
-        PushClientPayload(std::move(mb), data_len, packet_target);
+        if (InputClosed()) {
+            mb.clear();
+            return;
+        }
+        if (!buf::SetUdpTarget(mb, packet_target ? *packet_target : default_target_)) {
+            throw std::bad_alloc();
+        }
+        // Empty datagrams still own a Buffer and a queue entry.
+        QueueInput(std::move(mb), std::max(data_len, size_t{buf::Buffer::kSize}));
     }
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {

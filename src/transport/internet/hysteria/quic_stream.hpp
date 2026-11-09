@@ -64,6 +64,7 @@ private:
     };
 
     void AcknowledgeInput(size_t bytes) noexcept;
+    void Abort(bool cancel_transport) noexcept;
     void WakeReader() noexcept;
 
     net::io_context& io_context_;

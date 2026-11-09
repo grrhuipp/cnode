@@ -40,9 +40,9 @@ bool ParseDecryptedHeader(const uint8_t* data, size_t len,
 
     ByteReader reader(data, len);
 
-    request.version = reader.ReadU8();
-    if (!reader.Ok() || request.version != VERSION) {
-        LOG_CONN_DEBUG(trace_conn_id, "unsupported version {}", request.version);
+    const uint8_t version = reader.ReadU8();
+    if (!reader.Ok() || version != VERSION) {
+        LOG_CONN_DEBUG(trace_conn_id, "unsupported version {}", version);
         return false;
     }
 
@@ -58,7 +58,7 @@ bool ParseDecryptedHeader(const uint8_t* data, size_t len,
     request.options = reader.ReadU8();
 
     uint8_t ps = reader.ReadU8();
-    request.padding_len = (ps >> 4) & 0x0F;
+    const uint8_t padding_len = (ps >> 4) & 0x0F;
     request.security = static_cast<Security>(ps & 0x0F);
     // Reject before routing: an unknown body security can never be framed.
     if (!IsSupportedSecurity(request.security)) {
@@ -88,7 +88,7 @@ bool ParseDecryptedHeader(const uint8_t* data, size_t len,
         return false;
     }
 
-    reader.Skip(request.padding_len);
+    reader.Skip(padding_len);
     if (!reader.Ok()) return false;
 
     size_t pos = reader.Position();
@@ -107,7 +107,7 @@ bool ParseDecryptedHeader(const uint8_t* data, size_t len,
                      static_cast<int>(request.command),
                      static_cast<int>(request.security),
                      static_cast<int>(request.options),
-                     request.padding_len);
+                     padding_len);
 
     return true;
 }
@@ -257,9 +257,8 @@ private:
 
 }  // namespace
 
-ServerSession::ServerSession(const TimedUserValidator& validator, std::string_view tag)
-    : validator_(&validator)
-    , tag_(tag) {}
+ServerSession::ServerSession(std::string_view tag)
+    : tag_(tag) {}
 
 std::pair<std::optional<VMessRequest>, size_t> ServerSession::DecodeRequestHeader(
     const uint8_t* data, size_t len, uint64_t trace_conn_id) {
@@ -269,8 +268,7 @@ std::pair<std::optional<VMessRequest>, size_t> ServerSession::DecodeRequestHeade
     }
     const std::span<const uint8_t, 16> auth_id(data, 16);
     if (!header_user_) {
-        int64_t timestamp = 0;
-        header_user_ = validator_->FindByAuthIDForTag(tag_, auth_id.data(), timestamp);
+        header_user_ = FindByAuthIDForTag(tag_, auth_id.data());
         if (!header_user_) {
             header_failure_reason_ = "authentication failed: no acceptable AuthID";
             required_header_bytes_ = 0;

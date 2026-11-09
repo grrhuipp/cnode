@@ -197,8 +197,6 @@ void Check2022(const TargetAddress& target,
               ss::Hash2022Psk(key.span(), user.psk_hash),
               "failed to prepare identity credential");
     }
-    user.key_size = cipher.key_size;
-    user.salt_size = cipher.salt_size;
     if (identity) {
         auto decoy = user;
         decoy.derived_key.bytes[0] ^= 0x5a;
@@ -566,8 +564,6 @@ net::awaitable<std::unique_ptr<transport::MultiBufferWriter>> CreateTcpWriter(
     if (response) {
         proxyman::inbound::UserStore::ShadowsocksCredential user;
         Check(user.derived_key.assign(key.span()), "TCP response credential fixture failed");
-        user.key_size = cipher.key_size;
-        user.salt_size = cipher.salt_size;
         ss::KeyBytes request_salt;
         Check(request_salt.assign(key.span()), "TCP request salt fixture failed");
         auto result = ss::WriteTCPResponse(user, cipher, request_salt, stream);

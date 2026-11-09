@@ -30,7 +30,7 @@ public:
 
 private:
     ::UserOnlineTracker& validator_;
-    ::StatsShard* stats_ = nullptr;
+    ::StatsShard& stats_;
     ::ConnectionLimiter* limiter_;
 };
 

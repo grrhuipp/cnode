@@ -34,7 +34,7 @@ public:
 
 private:
     ::UserOnlineTracker& validator_;
-    ::StatsShard* stats_ = nullptr;
+    ::StatsShard& stats_;
     ::ConnectionLimiter* limiter_;
     std::shared_ptr<const ::vless::VlessEncryptionConfig> decryption_;
 };

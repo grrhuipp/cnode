@@ -67,7 +67,6 @@ enum class ErrorCode : int {
     DIAL_HOST_UNREACHABLE = 405,
 
     // Relay 错误 (500-549)
-    RELAY_READ_FAILED = 500,
     RELAY_WRITE_FAILED = 501,
     RELAY_TIMEOUT = 502,
 
@@ -125,7 +124,6 @@ constexpr std::string_view ErrorCodeToString(ErrorCode code) {
         case ErrorCode::DIAL_NETWORK_UNREACHABLE: return "DIAL_NETWORK_UNREACHABLE";
         case ErrorCode::DIAL_HOST_UNREACHABLE: return "DIAL_HOST_UNREACHABLE";
 
-        case ErrorCode::RELAY_READ_FAILED: return "RELAY_READ_FAILED";
         case ErrorCode::RELAY_WRITE_FAILED: return "RELAY_WRITE_FAILED";
         case ErrorCode::RELAY_TIMEOUT: return "RELAY_TIMEOUT";
 

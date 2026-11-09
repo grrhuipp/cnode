@@ -19,10 +19,6 @@ namespace logging {
 inline constexpr std::string_view kDefaultLevel = "info";
 }  // namespace logging
 
-namespace network {
-inline constexpr std::string_view kDualStackAuto = "auto";
-}  // namespace network
-
 namespace binding {
 inline constexpr std::string_view kAuto = "auto";
 inline constexpr std::string_view kRootPath = "/";

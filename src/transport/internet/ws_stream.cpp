@@ -182,6 +182,16 @@ net::awaitable<bool> BaseWsStream::FillHeader() {
     co_return true;
 }
 
+void BaseWsStream::ConsumePayloadBytes(std::span<uint8_t> bytes) {
+    if (frame_masked_)
+        ws::MaskData(bytes.data(), bytes.size(), frame_mask_key_.data(), frame_mask_offset_);
+    frame_mask_offset_ += bytes.size();
+    frame_payload_remaining_ -= bytes.size();
+    if (text_message_ && !text_utf8_.Consume(bytes))
+        ProtocolFailure("WebSocket invalid UTF-8 text message");
+    if (frame_payload_remaining_ == 0) FinishDataFrame();
+}
+
 void BaseWsStream::FinishDataFrame() {
     if (frame_fin_ && text_message_ && text_utf8_.remaining != 0)
         ProtocolFailure("WebSocket incomplete UTF-8 text message");
@@ -192,8 +202,7 @@ void BaseWsStream::ValidateClose() {
     // RFC 6455 §§5.5.1, 7.4, 8.1: a Close is empty or status + UTF-8 reason.
     if (control_used_ == 1) ProtocolFailure("WebSocket invalid Close payload length");
     if (control_used_ < 2) return;
-    const unsigned status = (static_cast<unsigned>(control_payload_[0]) << 8) |
-                            control_payload_[1];
+    const unsigned status = LoadU16BE(control_payload_.data());
     const bool standard = status >= 1000 && status <= 1014 &&
                           status != 1004 && status != 1005 && status != 1006;
     if (!standard && !(status >= 3000 && status <= 4999))
@@ -247,9 +256,9 @@ net::awaitable<bool> BaseWsStream::PrepareNextDataFrame() {
             }
             case ReadStage::Length: {
                 if (!TryFillHeaderFromPending() && !co_await FillHeader()) co_return false;
-                uint64_t length = 0;
-                for (size_t i = 2; i < header_required_; ++i)
-                    length = (length << 8) | header_[i];
+                const uint64_t length = header_required_ == 4
+                    ? LoadU16BE(header_.data() + 2)
+                    : LoadU64BE(header_.data() + 2);
                 if ((header_required_ == 4 && length < 126) ||
                     (header_required_ == 10 && (length < 65536 || (header_[2] & 0x80))))
                     ProtocolFailure("WebSocket noncanonical payload length");
@@ -344,13 +353,7 @@ net::awaitable<size_t> BaseWsStream::AsyncRead(net::mutable_buffer buffer) {
     const size_t n = pending_data_.ConsumePrefixTo(std::span<uint8_t>(data, size));
     pending_data_.ReleaseIfIdle();
     if (n == 0) co_return 0;
-    if (frame_masked_)
-        ws::MaskData(data, n, frame_mask_key_.data(), frame_mask_offset_);
-    frame_mask_offset_ += n;
-    frame_payload_remaining_ -= n;
-    if (text_message_ && !text_utf8_.Consume(std::span<const uint8_t>(data, n)))
-        ProtocolFailure("WebSocket invalid UTF-8 text message");
-    if (frame_payload_remaining_ == 0) FinishDataFrame();
+    ConsumePayloadBytes({data, n});
     co_return n;
 }
 
@@ -365,14 +368,7 @@ net::awaitable<buf::MultiBuffer> BaseWsStream::ReadMultiBuffer() {
         front && front->Len() <= frame_payload_remaining_) {
         buf::BufferGuard output = pending_data_.pop_front();
         pending_data_.ReleaseIfIdle();
-        auto bytes = output->Bytes();
-        if (frame_masked_)
-            ws::MaskData(bytes.data(), bytes.size(), frame_mask_key_.data(), frame_mask_offset_);
-        frame_mask_offset_ += bytes.size();
-        frame_payload_remaining_ -= bytes.size();
-        if (text_message_ && !text_utf8_.Consume(bytes))
-            ProtocolFailure("WebSocket invalid UTF-8 text message");
-        if (frame_payload_remaining_ == 0) FinishDataFrame();
+        ConsumePayloadBytes(output->Bytes());
         co_return buf::MultiBuffer{std::move(output)};
     }
     buf::BufferGuard output{buf::Buffer::New()};
@@ -383,13 +379,7 @@ net::awaitable<buf::MultiBuffer> BaseWsStream::ReadMultiBuffer() {
     const size_t n = pending_data_.ConsumePrefixTo(std::span<uint8_t>(data, size));
     pending_data_.ReleaseIfIdle();
     if (n == 0) co_return buf::MultiBuffer{};
-    if (frame_masked_)
-        ws::MaskData(data, n, frame_mask_key_.data(), frame_mask_offset_);
-    frame_mask_offset_ += n;
-    frame_payload_remaining_ -= n;
-    if (text_message_ && !text_utf8_.Consume(std::span<const uint8_t>(data, n)))
-        ProtocolFailure("WebSocket invalid UTF-8 text message");
-    if (frame_payload_remaining_ == 0) FinishDataFrame();
+    ConsumePayloadBytes({data, n});
     output->Produce(static_cast<uint32_t>(n));
     co_return buf::MultiBuffer{std::move(output)};
 }
@@ -399,12 +389,14 @@ void BaseWsStream::CheckWritable() const {
         throw IoSystemError(io_error::broken_pipe, "WebSocket write after Close");
 }
 
-net::awaitable<BaseWsStream::WriteGate::Lease> BaseWsStream::AcquireWrite(
-    net::cancellation_slot caller_slot) {
+net::awaitable<BaseWsStream::WriteGate::Lease> BaseWsStream::AcquireWrite() {
+    const auto state = co_await net::this_coro::cancellation_state;
+    if (closed_ || state.cancelled() != net::cancellation_type::none)
+        throw IoSystemError(io_error::operation_aborted);
     if (auto lease = write_gate_.TryAcquire()) co_return lease;
     // Cancel() is reusable, so only this acquisition is cancelled. Closing the
     // shared gate is reserved for terminal shutdown, not a sniff deadline.
-    WriteGateWait wait(Cancellation(), caller_slot);
+    WriteGateWait wait(Cancellation(), state.slot());
     if (wait.Cancelled()) throw IoSystemError(io_error::operation_aborted);
     auto lease = co_await write_gate_.Acquire(false, wait.Slot());
     if (!lease || wait.Cancelled()) throw IoSystemError(io_error::operation_aborted);
@@ -414,11 +406,7 @@ net::awaitable<BaseWsStream::WriteGate::Lease> BaseWsStream::AcquireWrite(
 net::awaitable<void> BaseWsStream::WriteDataFrame(
     std::span<const net::const_buffer> buffers, size_t size) {
     if (size == 0) co_return;
-    const auto state = co_await net::this_coro::cancellation_state;
-    if (closed_ || state.cancelled() != net::cancellation_type::none)
-        throw IoSystemError(io_error::operation_aborted);
-    WriteGate::Lease lease = write_gate_.TryAcquire();
-    if (!lease) lease = co_await AcquireWrite(state.slot());
+    auto lease = co_await AcquireWrite();
     CheckWritable();
     uint8_t mask[4]{};
     if (is_client_ && RAND_bytes(mask, sizeof(mask)) != 1)
@@ -498,11 +486,7 @@ net::awaitable<void> BaseWsStream::WriteMultiBuffer(buf::MultiBuffer buffers) {
         AddPayloadSize(size, buffer->Len());
     }
     if (size == 0) co_return;
-    const auto state = co_await net::this_coro::cancellation_state;
-    if (closed_ || state.cancelled() != net::cancellation_type::none)
-        throw IoSystemError(io_error::operation_aborted);
-    WriteGate::Lease lease = write_gate_.TryAcquire();
-    if (!lease) lease = co_await AcquireWrite(state.slot());
+    auto lease = co_await AcquireWrite();
     CheckWritable();
     uint8_t mask[4]{};
     if (is_client_ && RAND_bytes(mask, sizeof(mask)) != 1)
@@ -530,11 +514,7 @@ net::awaitable<void> BaseWsStream::WriteMultiBuffer(buf::MultiBuffer buffers) {
 net::awaitable<void> BaseWsStream::WriteControlFrame(
     ws::Opcode opcode, std::span<const uint8_t> payload) {
     const bool closing = opcode == ws::Opcode::CLOSE;
-    const auto state = co_await net::this_coro::cancellation_state;
-    if (closed_ || state.cancelled() != net::cancellation_type::none)
-        throw IoSystemError(io_error::operation_aborted);
-    WriteGate::Lease lease = write_gate_.TryAcquire();
-    if (!lease) lease = co_await AcquireWrite(state.slot());
+    auto lease = co_await AcquireWrite();
     if (write_closed_ || (!closing && close_requested_)) co_return;
     if (closing) close_requested_ = true;
     uint8_t mask[4]{};

@@ -20,6 +20,93 @@
 #include <utility>
 
 
+std::optional<RoutingIpNetwork> RoutingIpNetwork::Parse(std::string_view value) {
+    const auto slash = value.find('/');
+    if (value.empty() ||
+        (slash != std::string_view::npos &&
+         value.find('/', slash + 1) != std::string_view::npos)) {
+        return std::nullopt;
+    }
+
+    const auto address_text = value.substr(0, slash);
+    const auto parsed = iputil::ParseLiteral(address_text);
+    if (!parsed) {
+        return std::nullopt;
+    }
+    const auto& address = *parsed;
+
+    const uint32_t max_prefix = address.is_v4() ? 32U : 128U;
+    uint32_t prefix = max_prefix;
+    if (slash != std::string_view::npos) {
+        const auto prefix_text = value.substr(slash + 1);
+        const auto [end, error] = std::from_chars(
+            prefix_text.data(), prefix_text.data() + prefix_text.size(), prefix);
+        if (prefix_text.empty() || error != std::errc{} ||
+            end != prefix_text.data() + prefix_text.size() || prefix > max_prefix) {
+            return std::nullopt;
+        }
+    }
+
+    RoutingIpNetwork result;
+    result.prefix_ = static_cast<uint8_t>(prefix);
+    result.is_v6_ = address.is_v6();
+    if (result.is_v6_) {
+        const auto bytes = address.to_v6().to_bytes();
+        std::ranges::copy(bytes, result.network_.begin());
+    } else {
+        const auto bytes = address.to_v4().to_bytes();
+        std::ranges::copy(bytes, result.network_.begin());
+    }
+
+    const size_t full_bytes = prefix / 8;
+    const uint8_t remaining_bits = static_cast<uint8_t>(prefix % 8);
+    const size_t address_size = result.is_v6_ ? 16U : 4U;
+    if (full_bytes < address_size) {
+        if (remaining_bits != 0) {
+            result.network_[full_bytes] &=
+                static_cast<uint8_t>(0xFFU << (8 - remaining_bits));
+        }
+        const size_t zero_start = full_bytes + (remaining_bits != 0 ? 1U : 0U);
+        std::fill(result.network_.begin() + zero_start,
+                  result.network_.begin() + address_size, uint8_t{0});
+    }
+    return result;
+}
+
+namespace infra {
+
+OutboundSourceConfig OutboundSourceConfig::FromJson(const json::object& j) {
+    OutboundSourceConfig cfg;
+
+    cfg.tag = JsonStringOr(j, "tag", "");
+    cfg.protocol = naming::LowerAscii(JsonStringOr(j, "protocol", ""));
+
+    auto settings = ParseJsonObject(j, "settings");
+    if (!settings) {
+        throw std::invalid_argument(std::move(settings.error()));
+    }
+    if (*settings) {
+        cfg.settings = **settings;
+    }
+
+    auto stream_settings = ParseJsonObject(
+        j, "streamSettings");
+    if (!stream_settings) {
+        throw std::invalid_argument(std::move(stream_settings.error()));
+    }
+    if (*stream_settings) {
+        cfg.stream_settings = StreamSettings::FromJson(
+            **stream_settings, StreamEndpointRole::Outbound);
+    }
+
+    cfg.send_through = ParseOptionalOutboundBind(j, "outbound");
+    cfg.passthrough = JsonBoolOr(j, "passthrough", false);
+
+    return cfg;
+}
+
+}  // namespace infra
+
 // ============================================================================
 // JSON 辅助函数
 // ============================================================================
@@ -1348,18 +1435,7 @@ StaticInboundConfig StaticInboundConfig::FromJson(const json::object& j) {
         cfg.protocol = naming::LowerAscii(std::string(proto->as_string()));
     }
 
-    if (j.contains("listen")) {
-        if (!j.at("listen").is_string()) {
-            throw std::invalid_argument("static inbound listen must be a string");
-        }
-        auto listen = InboundListen::Parse(j.at("listen").as_string());
-        if (!listen) {
-            throw std::invalid_argument(std::format(
-                "static inbound listen '{}' must be auto or an IP address",
-                j.at("listen").as_string()));
-        }
-        cfg.listen = std::move(*listen);
-    }
+    cfg.listen = ParseInboundListen(j, "listen", "static inbound listen", cfg.listen);
 
     cfg.port = RequiredJsonPort(j, "port");
     cfg.proxy_protocol = ParseProxyProtocolMode(j, "proxyProtocol");

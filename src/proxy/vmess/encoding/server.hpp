@@ -13,7 +13,7 @@ namespace vmess::encoding {
 
 class ServerSession final {
 public:
-    ServerSession(const TimedUserValidator& validator, std::string_view tag);
+    explicit ServerSession(std::string_view tag);
 
     // Re-submit the same growing prefix until complete. RequiredHeaderBytes()
     // is the next structured boundary; zero with no request is terminal failure.
@@ -37,7 +37,6 @@ public:
     std::unique_ptr<transport::MultiBufferWriter> EncodeResponseBodyWithHeader(
         AsyncStream& stream);
 private:
-    const TimedUserValidator* validator_ = nullptr;
     std::string_view tag_;
     VMessRequest request_;
     bool request_set_ = false;

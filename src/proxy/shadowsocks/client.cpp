@@ -4,6 +4,7 @@
 #include "client.hpp"
 #include "common/address_codec.hpp"
 #include "common/allocator.hpp"
+#include "common/buffer_util.hpp"
 
 #include <openssl/rand.h>
 #include <openssl/crypto.h>
@@ -25,51 +26,18 @@ using detail::ThrowSsWriteError;
 }  // namespace
 
 net::awaitable<void> RequestBodyWriter::WriteMultiBuffer(buf::MultiBuffer mb) {
-        if (!stream_) {
-            throw IoSystemError(io_error::not_connected, "Shadowsocks request writer has no stream");
-        }
-        if (write_finished_) throw transport::WriteClosed();
-        if (mb.byte_size() == 0) {
-            co_return;
-        }
-        if (!write_cipher_) {
-            ThrowSsWriteError("Shadowsocks client request writer is not initialized");
-        }
-
-        const auto cancellation = co_await net::this_coro::cancellation_state;
-        if (cancellation.cancelled() != net::cancellation_type::none) {
-            throw IoSystemError(io_error::operation_aborted);
-        }
-        const uint64_t initial_nonce = write_nonce_;
-        bool write_started = false;
-        try {
-            buf::MultiBuffer out_mb;
-            out_mb.reserve(mb.size());
-
-            for (auto* buf : mb) {
-                auto bytes = buf->Bytes();
-                if (bytes.empty()) continue;
-
-                detail::EncryptToMultiBuffer(
-                    *write_cipher_, write_nonce_, bytes, out_mb);
-            }
-
-            mb.clear();
-            if (out_mb.byte_size() != 0) {
-                write_started = true;
-                co_await stream_->WriteMultiBuffer(std::move(out_mb));
-            }
-        } catch (const transport::WriteClosed&) {
-            Finish();
-            throw;
-        } catch (const std::bad_alloc&) {
-            if (write_nonce_ != initial_nonce || write_started) Retire();
-            throw;
-        } catch (...) {
-            Retire();
-            throw;
-        }
+    if (!stream_) {
+        throw IoSystemError(io_error::not_connected, "Shadowsocks request writer has no stream");
     }
+    if (write_finished_) throw transport::WriteClosed();
+    if (mb.byte_size() == 0) {
+        co_return;
+    }
+    ConstBufferSpanBuilder<buf::MultiBuffer::kInlineCapacity> buffers;
+    buffers.AppendMultiBuffer(mb);
+    co_await WriteBuffers(buffers.Span());
+    mb.clear();
+}
 
 net::awaitable<void> RequestBodyWriter::WriteBuffers(std::span<const net::const_buffer> buffers) {
         if (!stream_) {

@@ -178,7 +178,7 @@ net::awaitable<bool> TestRateCancellation(net::io_context& io, int mode) {
     if (mode == 1 || mode == 3) target.input = Payload(4000);
     else client.input = Payload(4000);
     if (mode >= 6) target.input = Payload(4000);
-    if (mode == 2) target.read_error = ErrorCode::RELAY_READ_FAILED;
+    if (mode == 2) target.read_error = ErrorCode::SOCKET_READ_FAILED;
     if (mode >= 14) client.Cancel(mode == 15 ? ErrorCode::RESOURCE_EXHAUSTED : ErrorCode::CANCELLED);
     TestEvent external_cancel([&client, &target, mode] {
         if (mode >= 12) {
@@ -201,7 +201,7 @@ net::awaitable<bool> TestRateCancellation(net::io_context& io, int mode) {
         buf::MultiBufferBatch(mode >= 14 ? Payload(4000) : buf::MultiBuffer{}));
     const auto elapsed = std::chrono::steady_clock::now() - start;
     const auto expected = mode == 12 || mode == 14 ? ErrorCode::CANCELLED :
-        mode >= 10 ? ErrorCode::RESOURCE_EXHAUSTED : mode == 2 ? ErrorCode::RELAY_READ_FAILED :
+        mode >= 10 ? ErrorCode::RESOURCE_EXHAUSTED : mode == 2 ? ErrorCode::SOCKET_READ_FAILED :
         (mode == 6 || mode == 7 ? ErrorCode::CANCELLED : ErrorCode::RELAY_TIMEOUT);
     const bool passed = elapsed < (mode >= 6 ? 500ms : 1800ms) && result.bytes_up == 0 && result.bytes_down == 0 &&
         result.error == expected;
@@ -418,7 +418,7 @@ net::awaitable<bool> TestDatagramBatch(net::io_context& io, bool controlled, int
     const size_t queued_bytes = 3 + buf::Buffer::kSize + 7 + 5;
     const bool queued_ok = batch.byte_size() == queued_bytes;
     client.input = packet(9, 0x44, 1004);
-    if (mode == 1) client.read_error = ErrorCode::RELAY_READ_FAILED;
+    if (mode == 1) client.read_error = ErrorCode::SOCKET_READ_FAILED;
     if (mode >= 2) {
         target.fail_after_writes = 1;
         target.later_write_error = mode == 2 ? ErrorCode::RESOURCE_EXHAUSTED : ErrorCode::CANCELLED;
@@ -446,7 +446,7 @@ net::awaitable<bool> TestDatagramBatch(net::io_context& io, bool controlled, int
             bytes.insert(bytes.end(), 9, 0x44);
         }
     }
-    const auto expected = mode == 0 ? ErrorCode::OK : mode == 1 ? ErrorCode::RELAY_READ_FAILED :
+    const auto expected = mode == 0 ? ErrorCode::OK : mode == 1 ? ErrorCode::SOCKET_READ_FAILED :
         mode == 2 ? ErrorCode::RESOURCE_EXHAUSTED : ErrorCode::CANCELLED;
     const bool passed = queued_ok && batch.empty() && batch.byte_size() == 0 &&
         target.packet_sizes == sizes && target.packet_fragments == fragments &&

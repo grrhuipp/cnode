@@ -197,10 +197,6 @@ bool TimeoutEvent::ScheduleAfter(std::chrono::milliseconds delay) {
     if (!context_) throw std::logic_error("timeout event has no scheduling context");
     return TimeoutScheduler::ForIoContext(*context_).ScheduleAfter(delay, *this);
 }
-bool TimeoutEvent::ScheduleAfter(std::chrono::milliseconds delay, net::io_context& context) {
-    if (!context_) context_ = &context;
-    return ScheduleAfter(delay);
-}
 
 TimeoutScheduler& TimeoutScheduler::ForIoContext(net::io_context& context) {
     if (tl_cached_context == &context && tl_cached_scheduler) return *tl_cached_scheduler;
@@ -246,7 +242,6 @@ bool TimeoutScheduler::ScheduleAfter(std::chrono::milliseconds delay, TimeoutEve
         event.sequence_ = ++impl_->next_sequence;
         impl_->Repair(event.index_);
     } else {
-        event.Cancel();
         impl_->Reserve(1);
         event.context_ = &impl_->context;
         event.deadline_ = deadline;

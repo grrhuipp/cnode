@@ -209,18 +209,12 @@ TEST_F(HysteriaProtocol, UdpPreservesEmptyAndMaximumPayloadsAcrossAddressForms) 
 
 TEST_F(HysteriaProtocol, HandshakeResponsesKeepTheirWireEncoding) {
     using namespace ::transport::internet::hysteria;
-    const std::vector<uint8_t> hello{
+    const memory::ByteVector hello{
         1, 1, 2, 3, 4, 5, 6, 7, 8, 8, 7, 6, 5, 4, 3, 2, 1, 0, 2, 'o', 'k'};
     EXPECT_EQ(EncodeV1ServerHello(
         true, 0x0102030405060708ULL, 0x0807060504030201ULL, "ok"), hello);
-    const std::vector<uint8_t> response{0, 0x12, 0x34, 0x56, 0x78, 0, 2, 'n', 'o'};
+    const memory::ByteVector response{0, 0x12, 0x34, 0x56, 0x78, 0, 2, 'n', 'o'};
     EXPECT_EQ(EncodeV1Response(false, 0x12345678, "no"), response);
-    const std::string message(64, 'm');
-    const std::array<uint8_t, 2> padding{0xaa, 0xbb};
-    std::vector<uint8_t> tcp{0, 0x40, 0x40};
-    tcp.insert(tcp.end(), message.begin(), message.end());
-    tcp.insert(tcp.end(), {2, 0xaa, 0xbb});
-    EXPECT_EQ(EncodeV2TcpResponse(true, message, padding), tcp);
 }
 
 }  // namespace

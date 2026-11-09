@@ -2,7 +2,7 @@
 
 #include "proxy/outbound.hpp"
 #include "../account.hpp"
-#include "../types.hpp"
+#include "../vmess_request.hpp"
 #include "transport/internet/outbound_sender.hpp"
 
 #include <openssl/aes.h>

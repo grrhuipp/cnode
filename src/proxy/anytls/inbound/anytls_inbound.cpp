@@ -55,7 +55,7 @@ Handler::Handler(UserOnlineTracker& validator,
                  ConnectionLimiter* limiter,
                  std::shared_ptr<const ::anytls::PaddingScheme> padding_scheme)
     : validator_(validator)
-    , stats_(&stats)
+    , stats_(stats)
     , limiter_(limiter)
     , padding_scheme_(std::move(padding_scheme)) {}
 
@@ -838,7 +838,7 @@ Handler::Process(
     }
 
     if (co_await proxy::CheckInboundIpBanned(limiter_, ctx)) {
-        co_return proxy::RejectInbound(*stats_, stream.get(), ErrorCode::BLOCKED);
+        co_return proxy::RejectInbound(stats_, stream.get(), ErrorCode::BLOCKED);
     }
 
     auto control_idle_timeout = timeouts.IdleTimeout();
@@ -853,7 +853,7 @@ Handler::Process(
         auto auth = co_await AuthenticateSession(
             *stream, validator_, limiter_, ctx, timeouts, control_idle_timeout);
         if (!auth) {
-            co_return proxy::RejectInbound(*stats_, stream.get(), auth.error());
+            co_return proxy::RejectInbound(stats_, stream.get(), auth.error());
         }
         user_session = std::move(*auth);
     }
@@ -864,7 +864,7 @@ Handler::Process(
         limiter_,
         io_context,
         ctx,
-        *stats_,
+        stats_,
         timeouts,
         control_idle_timeout,
         padding_scheme_.get());

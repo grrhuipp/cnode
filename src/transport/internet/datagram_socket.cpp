@@ -453,9 +453,6 @@ CancellationSource& DatagramSocket::Cancellation() noexcept { return impl_->canc
 void DatagramSocket::Cancel() noexcept { impl_->Cancel(); }
 void DatagramSocket::Close() noexcept { impl_->Close(ErrorCode::CANCELLED); }
 bool DatagramSocket::IsIPv6() const noexcept { return impl_->ipv6; }
-int DatagramSocket::NativeHandle() const noexcept {
-    return impl_->socket.is_open() ? impl_->socket.native_handle() : -1;
-}
 
 udp::endpoint DatagramSocket::LocalEndpoint() const {
     IoErrorCode ec;

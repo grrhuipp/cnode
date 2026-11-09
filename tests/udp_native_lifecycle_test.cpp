@@ -387,8 +387,6 @@ void VerifyProtocolLocalAssociation() {
             Fail("failed to prepare protocol association credential");
         PreparedShadowsocksUser user;
         if (!user.derived_key.assign(key.span())) Fail("failed to prepare local protocol user");
-        user.key_size = cipher->key_size;
-        user.salt_size = cipher->salt_size;
         user.profile.user_id = 41;
         UserSet users = PreparedShadowsocksUsers{std::move(user)};
         UserStore::InstallWorkerView(UserStore::PrepareWorkerView(

@@ -211,7 +211,7 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
     outbound.relay = which == Case::RelaySuccess || which == Case::RelayFailure;
     outbound.state.return_cancelled = which == Case::RelayCancelled;
     outbound.target_state.payload_size = 13;
-    if (which == Case::RelayFailure) outbound.target_state.read_error = ErrorCode::RELAY_READ_FAILED;
+    if (which == Case::RelayFailure) outbound.target_state.read_error = ErrorCode::SOCKET_READ_FAILED;
     routing::DispatchPolicy policy{SniffConfig{}, routing::ForceOutbound{"direct"}};
     if (which == Case::RoutedFallback || which == Case::RuleMatch ||
         which == Case::PolicyBlockedRoute) {
@@ -291,7 +291,7 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
     if (which == Case::Success || which == Case::RelaySuccess ||
         which == Case::RoutedFallback || which == Case::RuleMatch ||
         which == Case::PolicyAllowed) expected = ErrorCode::OK;
-    if (which == Case::RelayFailure) expected = ErrorCode::RELAY_READ_FAILED;
+    if (which == Case::RelayFailure) expected = ErrorCode::SOCKET_READ_FAILED;
     if (which == Case::RelayCancelled) expected = ErrorCode::CANCELLED;
     if (which == Case::SniffMemory || which == Case::SniffLinkError) expected = ErrorCode::RESOURCE_EXHAUSTED;
     if (which == Case::PolicyBlockedForce || which == Case::PolicyBlockedRoute)

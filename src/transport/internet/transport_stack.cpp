@@ -232,7 +232,7 @@ net::awaitable<TransportBuildResult> AcceptInboundSecurity(
                 co_return tl::unexpected(ErrorCode::TLS_HANDSHAKE_FAILED);
             }
             if (reader.State() == RealityClientHelloReader::Status::Complete) {
-                reality_conn_state = VerifyRealityClientHello(reader.Hello(), *ctx);
+                reality_conn_state = VerifyRealityClientHello(reader.TakeHello(), *ctx);
             }
             initial_bytes = reader.TakeWire();
         }

@@ -19,7 +19,6 @@ struct DetachedTlsState {
     DetachedTcpState tcp;
     SSL* ssl = nullptr;
     bool is_server = true;
-    bool handshake_done = true;
     std::vector<uint8_t> plaintext_prefix;
 
     DetachedTlsState() noexcept = default;
@@ -148,8 +147,7 @@ protected:
 
 private:
     struct Impl;
-    TlsStream(std::unique_ptr<TcpStream> inner, SSL* existing_ssl,
-              bool is_server, bool handshake_done);
+    TlsStream(std::unique_ptr<TcpStream> inner, SSL* existing_ssl, bool is_server);
 
     net::awaitable<std::size_t> AsyncReadSlow(net::mutable_buffer buf);
     net::awaitable<buf::MultiBuffer> ReadMultiBufferSlow();

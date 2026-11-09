@@ -129,7 +129,7 @@ proxy::trojan::inbound::Handler::Handler(
     StatsShard& stats,
     ConnectionLimiter* limiter)
     : validator_(validator)
-    , stats_(&stats)
+    , stats_(stats)
     , limiter_(limiter)
 {}
 
@@ -149,7 +149,7 @@ proxy::trojan::inbound::Handler::Process(
     LOG_CONN_DEBUG(ctx, "processing connection from {}:{}", client_ip, ctx.inbound.source_port);
 
     if (co_await proxy::CheckInboundIpBanned(limiter_, ctx)) {
-        co_return proxy::RejectInbound(*stats_, stream.get(), ErrorCode::BLOCKED);
+        co_return proxy::RejectInbound(stats_, stream.get(), ErrorCode::BLOCKED);
     }
     std::optional<UserOnlineSessionGuard> user_session;
     Network net = Network::TCP;
@@ -157,7 +157,7 @@ proxy::trojan::inbound::Handler::Process(
         auto handshake = co_await ParseTrojanRequest(
             *stream, ctx, limiter_, tag, client_ip);
         if (!handshake) {
-            co_return proxy::RejectInbound(*stats_, stream.get(), handshake.error());
+            co_return proxy::RejectInbound(stats_, stream.get(), handshake.error());
         }
         net = (handshake->command == ::trojan::TrojanCommand::UDP_ASSOCIATE)
               ? Network::UDP : Network::TCP;
@@ -171,7 +171,7 @@ proxy::trojan::inbound::Handler::Process(
             validator_, ctx, handshake->user->profile);
         if (!user_session) {
             co_return proxy::RejectInbound(
-                *stats_, stream.get(), ErrorCode::PERMISSION_DENIED);
+                stats_, stream.get(), ErrorCode::PERMISSION_DENIED);
         }
         // Session metadata is owned; release the authentication snapshot before I/O.
         handshake->user.reset();
@@ -186,7 +186,7 @@ proxy::trojan::inbound::Handler::Process(
             transport::Link{&udp_endpoint, &udp_endpoint},
             InitialPayload{},
             ctx,
-            *stats_,
+            stats_,
             timeouts);
     }
 
@@ -198,7 +198,7 @@ proxy::trojan::inbound::Handler::Process(
         transport::Link{tcp_stream, tcp_stream},
         InitialPayload{},
         ctx,
-        *stats_,
+        stats_,
         timeouts);
 }
 

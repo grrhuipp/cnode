@@ -240,13 +240,16 @@ public:
 Connection::Connection(
     QuicListener& listener, SocketState& socket, const udp::endpoint& remote)
     : listener_(&listener)
-    , reactor_(listener.io)
-    , closed_signal_(reactor_.get_executor(), 1)
-    , physical_ready_(reactor_.get_executor(), 1) {
-    core_ = std::make_unique<Core>();
+    , closed_signal_(listener.io.get_executor(), 1)
+    , core_(std::in_place)
+    , physical_ready_(listener.io.get_executor(), 1) {
     core_->local = socket.local;
     core_->remote = remote;
     InitializeBaseContext(remote);
+}
+
+net::io_context& Connection::Reactor() const noexcept {
+    return listener_->io;
 }
 
 std::shared_ptr<Connection> Connection::Create(
@@ -260,7 +263,7 @@ std::shared_ptr<Connection> Connection::Create(
         listener.sessions.emplace(connection.get(), connection);
         ++listener.connection_tasks;
         tracked = true;
-        net::co_spawn(connection->Executor(), connection->Run(header),
+        net::co_spawn(connection->Reactor(), connection->Run(header),
             [connection](std::exception_ptr error) {
                 auto* owner = connection->listener_;
                 connection->Close();
@@ -420,7 +423,7 @@ bool Connection::Initialize(const ngtcp2_pkt_hd& header) {
     if (ngtcp2_conn_server_new(
             &core_->quic, &header.scid, &core_->server_cid, &path,
             header.version, &callbacks, &quic_settings, &parameters,
-            core_->memory.Ngtcp2(), this) != 0)
+            QuicMemory::Ngtcp2(), this) != 0)
         return false;
 
     core_->conn_ref = {&GetConn, this};
@@ -450,7 +453,7 @@ net::awaitable<void> Connection::Run(ngtcp2_pkt_hd header) {
     std::exception_ptr failure;
     if (listener_->environment.active_sessions) ++*listener_->environment.active_sessions;
     try {
-        co_await RunAwaitableTaskGroup(Executor(), [&](AwaitableTaskGroup& tasks) {
+        co_await RunAwaitableTaskGroup(Reactor().get_executor(), [&](AwaitableTaskGroup& tasks) {
             tasks_ = &tasks;
             if (!Initialize(header)) {
                 Close();
@@ -1085,7 +1088,7 @@ net::awaitable<Connection::AdmitResult> Connection::AdmitConnection(
     if (closed_) co_return AdmitResult::Limited;
     online_session_.emplace(std::move(*session));
     stream_sink_ = listener_->environment.handler->NewAuthenticatedStreamSink(
-        reactor_, *listener_->environment.dispatcher, *listener_->environment.stats,
+        Reactor(), *listener_->environment.dispatcher, *listener_->environment.stats,
         *listener_->environment.request_load, listener_->environment.timeouts,
         base_context_, physical_reservation_.FamilyLease());
     authenticated_ = true;
@@ -1128,14 +1131,19 @@ void Connection::StartRawStream(int64_t stream_id, StreamRecord& stream) {
     if (stream.delivered) return;
     if (listener_->version == Version::V1) {
         const auto& input = stream.state->PendingInput();
-        if (input.empty()) return;
-        std::array<uint8_t, 1> kind{};
-        (void)input.CopyPrefixTo(kind);
-        if (kind[0] != 0) {
-            memory::ThreadLocalVector<uint8_t> header(
-                std::min(input.byte_size(), kMaxStreamHeaderBytes));
-            (void)input.CopyPrefixTo(header);
-            auto request = ParseV1Request(header);
+        const auto front = input.FrontSpan();
+        if (front.empty()) return;
+        if (front[0] != 0) {
+            const size_t inspect_bytes =
+                std::min(input.byte_size(), kMaxStreamHeaderBytes);
+            auto prefix = input.PrefixSpan(inspect_bytes);
+            memory::ThreadLocalVector<uint8_t> header;
+            if (prefix.empty()) {
+                header.resize(inspect_bytes);
+                (void)input.CopyPrefixTo(header);
+                prefix = header;
+            }
+            auto request = ParseV1Request(prefix);
             if (!request) {
                 if (request.error() != ProtocolError::Incomplete ||
                     input.byte_size() >= kMaxStreamHeaderBytes)
@@ -1255,7 +1263,7 @@ bool Connection::SetupHttp3() {
     http_settings.qpack_max_dtable_capacity = 4096;
     http_settings.qpack_blocked_streams = 32;
     if (nghttp3_conn_server_new(&core_->http, &callbacks, &http_settings,
-            core_->memory.Nghttp3(), this) != 0) return false;
+            QuicMemory::Nghttp3(), this) != 0) return false;
     nghttp3_conn_set_max_client_streams_bidi(core_->http, kMaxStreams);
     int64_t control = -1, encoder = -1, decoder = -1;
     return ngtcp2_conn_open_uni_stream(core_->quic, &control, nullptr) == 0 &&

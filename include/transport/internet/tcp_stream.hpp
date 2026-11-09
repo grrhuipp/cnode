@@ -16,7 +16,6 @@
 struct DetachedTcpState {
     int fd = -1;
     tcp::endpoint::protocol_type protocol = tcp::v4();
-    bool nonblocking = true;
     std::vector<uint8_t> pending_bytes;
 
     DetachedTcpState() noexcept = default;
@@ -117,7 +116,6 @@ private:
     static net::awaitable<DialResult> ConnectSocket(
         tcp::socket socket, const tcp::endpoint& endpoint, std::chrono::seconds timeout);
     friend class TlsStream;
-    void PrepareTlsIo();
     [[nodiscard]] bool CanRead() const noexcept;
     [[nodiscard]] bool CanWrite() const noexcept;
     [[nodiscard]] bool TryConsumeReadableBudget() noexcept;

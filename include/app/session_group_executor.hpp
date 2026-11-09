@@ -9,7 +9,6 @@
 #include <exception>
 #include <functional>
 #include <memory>
-#include <optional>
 #include <type_traits>
 #include <utility>
 
@@ -23,8 +22,6 @@ public:
     void RegisterWorker(uint32_t worker_id, net::io_context& reactor);
     [[nodiscard]] uint32_t WorkerCount() const noexcept;
     [[nodiscard]] static GroupCoordinator* ForContext(net::execution_context& context) noexcept;
-    [[nodiscard]] static std::optional<uint32_t> WorkerIdForContext(
-        net::execution_context& context) noexcept;
 
     struct ReservedOperation {
         ReservedOperation* next = nullptr;

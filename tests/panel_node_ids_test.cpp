@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "infra/panel_node_ids.hpp"
+#include "infra/panel_config.hpp"
 
 #include <limits>
 #include <stdexcept>

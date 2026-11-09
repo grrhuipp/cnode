@@ -280,51 +280,72 @@ net::awaitable<void> VlessEncryptionWriter::WriteBuffers(
                 static_cast<const uint8_t*>(buffers[idx].data()) + offset;
             const size_t first_rem = buffers[idx].size() - offset;
 
-            bool has_more = false;
-            if (first_rem < kVlessEncryptionMaxPlaintextSize) {
-                for (size_t j = idx + 1; j < buffers.size(); ++j) {
+            size_t planned_len = std::min(first_rem, kVlessEncryptionMaxPlaintextSize);
+            if (planned_len < kVlessEncryptionMaxPlaintextSize) {
+                for (size_t j = idx + 1;
+                     j < buffers.size() && planned_len < kVlessEncryptionMaxPlaintextSize;
+                     ++j) {
                     if (buffers[j].data() && buffers[j].size() > 0) {
-                        has_more = true;
-                        break;
+                        planned_len += std::min(
+                            buffers[j].size(),
+                            kVlessEncryptionMaxPlaintextSize - planned_len);
                     }
                 }
             }
 
-            if (!has_more) {
-                const size_t n = std::min(first_rem, kVlessEncryptionMaxPlaintextSize);
-                offset += n;
+            if (planned_len <= first_rem) {
+                offset += planned_len;
                 skip_empty();
                 co_await WritePlaintext(
-                    std::span<const uint8_t>{first_data, n}, record_started);
+                    std::span<const uint8_t>{first_data, planned_len}, record_started);
                 continue;
             }
 
-            static_assert(kVlessEncryptionMaxPlaintextSize <= buf::Buffer::kSize);
-            buf::BufferGuard chunk{buf::Buffer::New()};
-            if (!chunk) {
+            const auto step_cancellation = co_await net::this_coro::cancellation_state;
+            if (step_cancellation.cancelled() != net::cancellation_type::none) {
+                throw IoSystemError(io_error::operation_aborted,
+                                    "VLESS Encryption write cancelled");
+            }
+            const size_t frame_capacity =
+                kVlessEncryptionRecordHeaderSize + planned_len + kVlessEncryptionTagSize;
+            buf::ContiguousWriteBuffer frame_buffer;
+            uint8_t* frame_ptr = frame_buffer.TryPrepare(frame_capacity);
+            if (!frame_ptr) {
                 ThrowVlessEncryptionIoError("VLESS Encryption buffer allocation failed");
             }
-            uint8_t* dst = chunk->Tail().data();
+            uint8_t* dst = frame_ptr + kVlessEncryptionRecordHeaderSize;
             size_t filled = 0;
-            while (idx < buffers.size() && filled < kVlessEncryptionMaxPlaintextSize) {
+            while (idx < buffers.size() && filled < planned_len) {
                 const auto* data =
                     static_cast<const uint8_t*>(buffers[idx].data()) + offset;
                 const size_t rem = buffers[idx].size() - offset;
-                const size_t copy_len =
-                    std::min(rem, kVlessEncryptionMaxPlaintextSize - filled);
+                const size_t copy_len = std::min(rem, planned_len - filled);
                 std::memcpy(dst + filled, data, copy_len);
                 filled += copy_len;
                 offset += copy_len;
                 skip_empty();
             }
-            chunk->Produce(static_cast<uint32_t>(filled));
-            try {
-                co_await WritePlaintext(chunk->Bytes(), record_started);
-            } catch (...) {
-                OPENSSL_cleanse(dst, filled);
-                throw;
+            std::span<uint8_t> frame{frame_ptr, frame_capacity};
+            record_started = true;
+            const auto written = SealVlessEncryptionRecord(
+                aead_,
+                std::span<const uint8_t>{frame_ptr + kVlessEncryptionRecordHeaderSize, filled},
+                frame);
+            if (!written) {
+                ThrowVlessEncryptionIoError("VLESS Encryption record encrypt failed");
             }
-            OPENSSL_cleanse(dst, filled);
+            auto frame_view = frame.first(*written);
+            if (IsVlessEncryptionMaxNonce(aead_.Nonce()) &&
+                !RekeyAead(aead_, frame_view, united_key_)) {
+                ThrowVlessEncryptionIoError("VLESS Encryption write rekey failed");
+            }
+            if (header_xor_ &&
+                !header_xor_->XorOutboundInPlace(frame_view)) {
+                ThrowVlessEncryptionIoError("VLESS Encryption write xor failed");
+            }
+            net::const_buffer buffer{frame_view.data(), frame_view.size()};
+            co_await dst_.WriteBuffers(
+                std::span<const net::const_buffer>{&buffer, 1});
         }
     } catch (const transport::WriteClosed&) {
         state_ = State::Finished;

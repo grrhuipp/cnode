@@ -1,7 +1,11 @@
 #pragma once
 
 #include "common/allocator.hpp"
-#include <memory_resource>
+#include <algorithm>
+#include <cstddef>
+#include <cstring>
+#include <limits>
+#include <new>
 
 #include <nghttp3/nghttp3.h>
 #include <ngtcp2/ngtcp2.h>
@@ -13,19 +17,77 @@ namespace transport::internet::hysteria {
 // shared pool without a side table.
 class QuicMemory final {
 public:
-    QuicMemory() noexcept;
+    [[nodiscard]] static const ngtcp2_mem* Ngtcp2() noexcept {
+        static const ngtcp2_mem kMem{nullptr, &Allocate, &Free, &Callocate, &Reallocate};
+        return &kMem;
+    }
 
-    [[nodiscard]] const ngtcp2_mem* Ngtcp2() const noexcept { return &ngtcp2_; }
-    [[nodiscard]] const nghttp3_mem* Nghttp3() const noexcept { return &nghttp3_; }
+    [[nodiscard]] static const nghttp3_mem* Nghttp3() noexcept {
+        static const nghttp3_mem kMem{nullptr, &Allocate, &Free, &Callocate, &Reallocate};
+        return &kMem;
+    }
 
 private:
-    static void* Allocate(size_t size, void* user_data);
-    static void Free(void* pointer, void* user_data) noexcept;
-    static void* Callocate(size_t count, size_t size, void* user_data);
-    static void* Reallocate(void* pointer, size_t size, void* user_data);
+    struct alignas(std::max_align_t) AllocationHeader {
+        size_t payload_size;
+        size_t allocation_size;
+    };
 
-    ngtcp2_mem ngtcp2_;
-    nghttp3_mem nghttp3_;
+    static constexpr size_t kAlignment = alignof(std::max_align_t);
+
+    [[nodiscard]] static bool AllocationSize(size_t payload_size, size_t& result) noexcept {
+        if (payload_size > std::numeric_limits<size_t>::max() - sizeof(AllocationHeader))
+            return false;
+        result = sizeof(AllocationHeader) + payload_size;
+        return true;
+    }
+
+    static void* Allocate(size_t size, void*) {
+        try {
+            size_t allocation_size = 0;
+            if (!AllocationSize(size, allocation_size)) return nullptr;
+            void* raw =
+                memory::ThreadMemoryPool().Allocate(allocation_size, kAlignment);
+            if (!raw) return nullptr;
+            auto* header =
+                ::new (raw) AllocationHeader{size, allocation_size};
+            return header + 1;
+        } catch (...) {
+            return nullptr;
+        }
+    }
+
+    static void Free(void* pointer, void*) noexcept {
+        if (!pointer) return;
+        auto* header = static_cast<AllocationHeader*>(pointer) - 1;
+        const size_t allocation_size = header->allocation_size;
+        header->~AllocationHeader();
+        memory::ThreadMemoryPool().Deallocate(
+            header, allocation_size, kAlignment);
+    }
+
+    static void* Callocate(size_t count, size_t size, void* user_data) {
+        if (size != 0 && count > std::numeric_limits<size_t>::max() / size)
+            return nullptr;
+        const size_t bytes = count * size;
+        void* pointer = Allocate(bytes, user_data);
+        if (pointer) std::memset(pointer, 0, bytes);
+        return pointer;
+    }
+
+    static void* Reallocate(void* pointer, size_t size, void* user_data) {
+        if (!pointer) return Allocate(size, user_data);
+        if (size == 0) {
+            Free(pointer, user_data);
+            return nullptr;
+        }
+        auto* old_header = static_cast<AllocationHeader*>(pointer) - 1;
+        void* replacement = Allocate(size, user_data);
+        if (!replacement) return nullptr;
+        std::memcpy(replacement, pointer, std::min(old_header->payload_size, size));
+        Free(pointer, user_data);
+        return replacement;
+    }
 };
 
 }  // namespace transport::internet::hysteria

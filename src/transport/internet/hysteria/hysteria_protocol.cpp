@@ -1,5 +1,6 @@
 #include "hysteria_protocol.hpp"
 
+#include "common/byte_reader.hpp"
 #include "common/ip_address.hpp"
 
 #include <openssl/sha.h>
@@ -13,92 +14,72 @@ namespace {
 
 class Cursor final {
 public:
-    explicit Cursor(std::span<const uint8_t> input) noexcept : input_(input) {}
+    explicit Cursor(std::span<const uint8_t> input) noexcept : reader_(input) {}
 
-    [[nodiscard]] size_t position() const noexcept { return position_; }
-    [[nodiscard]] size_t remaining() const noexcept { return input_.size() - position_; }
+    [[nodiscard]] size_t position() const noexcept { return reader_.Position(); }
+    [[nodiscard]] size_t remaining() const noexcept { return reader_.Remaining(); }
 
     [[nodiscard]] tl::expected<uint8_t, ProtocolError> U8() noexcept {
-        if (remaining() < 1) return tl::unexpected(ProtocolError::Incomplete);
-        return input_[position_++];
+        const uint8_t value = reader_.ReadU8();
+        if (!reader_.Ok()) return tl::unexpected(ProtocolError::Incomplete);
+        return value;
     }
 
     [[nodiscard]] tl::expected<uint16_t, ProtocolError> U16() noexcept {
-        if (remaining() < 2) return tl::unexpected(ProtocolError::Incomplete);
-        const auto value = static_cast<uint16_t>(
-            (static_cast<uint16_t>(input_[position_]) << 8) |
-            input_[position_ + 1]);
-        position_ += 2;
+        const uint16_t value = reader_.ReadU16BE();
+        if (!reader_.Ok()) return tl::unexpected(ProtocolError::Incomplete);
         return value;
     }
 
     [[nodiscard]] tl::expected<uint32_t, ProtocolError> U32() noexcept {
-        if (remaining() < 4) return tl::unexpected(ProtocolError::Incomplete);
-        uint32_t value = 0;
-        for (size_t i = 0; i < 4; ++i) value = (value << 8) | input_[position_ + i];
-        position_ += 4;
+        const uint32_t value = reader_.ReadU32BE();
+        if (!reader_.Ok()) return tl::unexpected(ProtocolError::Incomplete);
         return value;
     }
 
     [[nodiscard]] tl::expected<uint64_t, ProtocolError> U64() noexcept {
-        if (remaining() < 8) return tl::unexpected(ProtocolError::Incomplete);
-        uint64_t value = 0;
-        for (size_t i = 0; i < 8; ++i) value = (value << 8) | input_[position_ + i];
-        position_ += 8;
+        const uint64_t value = reader_.ReadU64BE();
+        if (!reader_.Ok()) return tl::unexpected(ProtocolError::Incomplete);
         return value;
     }
 
     [[nodiscard]] tl::expected<uint64_t, ProtocolError> Varint() noexcept {
-        if (remaining() < 1) return tl::unexpected(ProtocolError::Incomplete);
-        const size_t width = size_t{1} << (input_[position_] >> 6);
-        if (remaining() < width) return tl::unexpected(ProtocolError::Incomplete);
-        uint64_t value = input_[position_] & 0x3fu;
-        for (size_t i = 1; i < width; ++i) value = (value << 8) | input_[position_ + i];
-        position_ += width;
-        return value;
+        const auto value = reader_.ReadQuicVarint();
+        if (!value) return tl::unexpected(ProtocolError::Incomplete);
+        return *value;
     }
 
     [[nodiscard]] tl::expected<std::span<const uint8_t>, ProtocolError>
     Bytes(size_t size) noexcept {
-        if (remaining() < size) return tl::unexpected(ProtocolError::Incomplete);
-        auto result = input_.subspan(position_, size);
-        position_ += size;
+        const auto result = reader_.ReadBytes(size);
+        if (!reader_.Ok()) return tl::unexpected(ProtocolError::Incomplete);
         return result;
     }
 
 private:
-    std::span<const uint8_t> input_;
-    size_t position_ = 0;
+    ByteReader reader_;
 };
 
-template <class Allocator>
-void AppendU16(std::vector<uint8_t, Allocator>& output, uint16_t value) {
-    output.push_back(static_cast<uint8_t>(value >> 8));
-    output.push_back(static_cast<uint8_t>(value));
+void AppendU16(memory::ByteVector& output, uint16_t value) {
+    std::array<uint8_t, 2> bytes{};
+    StoreU16BE(bytes.data(), value);
+    output.insert(output.end(), bytes.begin(), bytes.end());
 }
 
-template <class Allocator>
-void AppendU32(std::vector<uint8_t, Allocator>& output, uint32_t value) {
-    for (unsigned shift : {24u, 16u, 8u, 0u})
-        output.push_back(static_cast<uint8_t>(value >> shift));
+void AppendU32(memory::ByteVector& output, uint32_t value) {
+    std::array<uint8_t, 4> bytes{};
+    StoreU32BE(bytes.data(), value);
+    output.insert(output.end(), bytes.begin(), bytes.end());
 }
 
-void AppendU64(std::vector<uint8_t>& output, uint64_t value) {
-    for (unsigned shift : {56u, 48u, 40u, 32u, 24u, 16u, 8u, 0u})
-        output.push_back(static_cast<uint8_t>(value >> shift));
+void AppendU64(memory::ByteVector& output, uint64_t value) {
+    std::array<uint8_t, 8> bytes{};
+    StoreU64BE(bytes.data(), value);
+    output.insert(output.end(), bytes.begin(), bytes.end());
 }
 
-[[nodiscard]] size_t VarintWidth(uint64_t value) noexcept {
-    if (value <= 63) return 1;
-    if (value <= 16383) return 2;
-    if (value <= 1073741823) return 4;
-    if (value <= 4611686018427387903ULL) return 8;
-    return 0;
-}
-
-template <class Allocator>
-bool AppendVarint(std::vector<uint8_t, Allocator>& output, uint64_t value) {
-    const size_t width = VarintWidth(value);
+bool AppendVarint(memory::ByteVector& output, uint64_t value) {
+    const size_t width = QuicVarintSize(value);
     if (width == 0) return false;
     const uint8_t prefix = static_cast<uint8_t>(
         (width == 1 ? 0 : width == 2 ? 1 : width == 4 ? 2 : 3) << 6);
@@ -170,7 +151,7 @@ struct UdpTargetText {
 [[nodiscard]] tl::expected<size_t, ProtocolError> UdpHeaderSize(
     Version version, const UdpTargetText& text) {
     if (version == Version::V1) return 14 + text.host.size();
-    const size_t width = VarintWidth(text.authority_size);
+    const size_t width = QuicVarintSize(text.authority_size);
     if (width == 0 ||
         text.authority_size > std::numeric_limits<size_t>::max() - 8 - width)
         return tl::unexpected(ProtocolError::TooLarge);
@@ -203,10 +184,10 @@ ParseV1ClientHello(std::span<const uint8_t> input) {
     return hello;
 }
 
-std::vector<uint8_t> EncodeV1ServerHello(
+memory::ByteVector EncodeV1ServerHello(
     bool accepted, uint64_t send_bps, uint64_t receive_bps, std::string_view message) {
     message = message.substr(0, std::min(message.size(), kMaxMessageLength));
-    std::vector<uint8_t> output;
+    memory::ByteVector output;
     output.reserve(19 + message.size());
     output.push_back(accepted ? 1 : 0);
     AppendU64(output, send_bps);
@@ -238,10 +219,10 @@ ParseV1Request(std::span<const uint8_t> input) {
     return V1Request{*udp != 0, std::move(*target), cursor.position()};
 }
 
-std::vector<uint8_t> EncodeV1Response(
+memory::ByteVector EncodeV1Response(
     bool accepted, uint32_t udp_session_id, std::string_view message) {
     message = message.substr(0, std::min(message.size(), kMaxMessageLength));
-    std::vector<uint8_t> output;
+    memory::ByteVector output;
     output.reserve(7 + message.size());
     output.push_back(accepted ? 1 : 0);
     AppendU32(output, udp_session_id);
@@ -272,20 +253,6 @@ ParseV2TcpRequest(std::span<const uint8_t> input) {
     auto target = TargetAddress::Parse(text);
     if (!target) return tl::unexpected(ProtocolError::Invalid);
     return V2TcpRequest{std::move(*target), cursor.position()};
-}
-
-std::vector<uint8_t> EncodeV2TcpResponse(
-    bool accepted, std::string_view message, std::span<const uint8_t> padding) {
-    message = message.substr(0, std::min(message.size(), kMaxMessageLength));
-    padding = padding.first(std::min(padding.size(), kMaxPaddingLength));
-    std::vector<uint8_t> output;
-    output.reserve(1 + 8 + message.size() + padding.size());
-    output.push_back(accepted ? 0 : 1);
-    AppendVarint(output, message.size());
-    output.insert(output.end(), message.begin(), message.end());
-    AppendVarint(output, padding.size());
-    output.insert(output.end(), padding.begin(), padding.end());
-    return output;
 }
 
 tl::expected<UdpMessage, ProtocolError>

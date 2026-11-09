@@ -1,7 +1,7 @@
 #pragma once
 
 #include "proxy/inbound.hpp"
-#include "../validator.hpp"
+#include "common/sharded_user_stats.hpp"
 
 struct StatsShard;
 
@@ -14,7 +14,7 @@ namespace proxy::vmess::inbound {
 // ============================================================================
 class Handler final : public ::Inbound {
 public:
-    Handler(::vmess::TimedUserValidator& validator,
+    Handler(::UserOnlineTracker& validator,
             ::StatsShard& stats,
             ::ConnectionLimiter* limiter);
 
@@ -29,8 +29,8 @@ public:
         uint32_t pressure_idle_timeout) override;
 
 private:
-    ::vmess::TimedUserValidator& validator_;
-    ::StatsShard* stats_ = nullptr;
+    ::UserOnlineTracker& validator_;
+    ::StatsShard& stats_;
     ::ConnectionLimiter* limiter_;
 };
 

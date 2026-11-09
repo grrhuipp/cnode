@@ -1,7 +1,7 @@
 #include <stdexcept>
 #include <gtest/gtest.h>
 
-#include "ss_outbound_uot.hpp"
+#include "ss_outbound.hpp"
 
 #include <cstdlib>
 #include <iostream>

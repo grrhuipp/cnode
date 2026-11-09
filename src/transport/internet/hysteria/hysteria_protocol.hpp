@@ -38,7 +38,7 @@ inline constexpr size_t kMaxUdpPayloadLength = 4096;
 struct V1ClientHello {
     uint64_t send_bps = 0;
     uint64_t receive_bps = 0;
-    std::string auth;
+    memory::ThreadLocalString auth;
 };
 
 struct V1Request {
@@ -64,22 +64,18 @@ struct UdpMessage {
 [[nodiscard]] tl::expected<V1ClientHello, ProtocolError>
 ParseV1ClientHello(std::span<const uint8_t> input);
 
-[[nodiscard]] std::vector<uint8_t>
+[[nodiscard]] memory::ByteVector
 EncodeV1ServerHello(bool accepted, uint64_t send_bps, uint64_t receive_bps,
                     std::string_view message);
 
 [[nodiscard]] tl::expected<V1Request, ProtocolError>
 ParseV1Request(std::span<const uint8_t> input);
 
-[[nodiscard]] std::vector<uint8_t>
+[[nodiscard]] memory::ByteVector
 EncodeV1Response(bool accepted, uint32_t udp_session_id, std::string_view message);
 
 [[nodiscard]] tl::expected<V2TcpRequest, ProtocolError>
 ParseV2TcpRequest(std::span<const uint8_t> input);
-
-[[nodiscard]] std::vector<uint8_t>
-EncodeV2TcpResponse(bool accepted, std::string_view message,
-                    std::span<const uint8_t> padding = {});
 
 [[nodiscard]] tl::expected<UdpMessage, ProtocolError>
 ParseUdpMessage(Version version, std::span<const uint8_t> input);

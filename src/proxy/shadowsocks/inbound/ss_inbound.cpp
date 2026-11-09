@@ -18,6 +18,7 @@
 #include "common/session.hpp"
 
 #include "common/buffer_util.hpp"
+#include "common/byte_reader.hpp"
 #include "common/buf/multi_buffer.hpp"
 #include <openssl/rand.h>
 #include <openssl/crypto.h>
@@ -199,7 +200,7 @@ proxy::shadowsocks::inbound::Handler::Handler(
     ConnectionLimiter* limiter,
     ss::SsCipherInfo cipher_info)
     : validator_(validator)
-    , stats_(&stats)
+    , stats_(stats)
     , limiter_(limiter)
     , cipher_info_(cipher_info) {}
 
@@ -232,7 +233,7 @@ proxy::shadowsocks::inbound::Handler::Process(
     LOG_CONN_DEBUG(ctx, "processing connection from {}:{}", client_ip, ctx.inbound.source_port);
 
     if (co_await proxy::CheckInboundIpBanned(limiter_, ctx)) {
-        co_return proxy::RejectInbound(*stats_, stream.get(), ErrorCode::BLOCKED);
+        co_return proxy::RejectInbound(stats_, stream.get(), ErrorCode::BLOCKED);
     }
     std::unique_ptr<transport::MultiBufferReader> request_reader;
     std::unique_ptr<transport::MultiBufferWriter> response_writer;
@@ -250,7 +251,7 @@ proxy::shadowsocks::inbound::Handler::Process(
             tag,
             client_ip);
         if (!prepared) {
-            co_return proxy::RejectInbound(*stats_, stream.get(), prepared.error());
+            co_return proxy::RejectInbound(stats_, stream.get(), prepared.error());
         }
         request_reader = std::move(prepared->request_reader);
         response_writer = std::move(prepared->response_writer);
@@ -270,7 +271,7 @@ proxy::shadowsocks::inbound::Handler::Process(
             receiver.dispatch_policy,
             io_context,
             ctx,
-            *stats_,
+            stats_,
             timeouts);
     }
 
@@ -281,7 +282,7 @@ proxy::shadowsocks::inbound::Handler::Process(
         transport::Link{request_reader.get(), response_writer.get()},
         std::move(initial_payload),
         ctx,
-        *stats_,
+        stats_,
         timeouts);
 }
 
@@ -345,10 +346,6 @@ tl::expected<std::shared_ptr<InboundDatagramResponse>, ErrorCode>
 proxy::shadowsocks::inbound::Handler::CreateDatagramResponse(
     const InboundDatagramResult& decoded) {
     ss::KeyBytes key;
-    struct CleanseKey {
-        ss::KeyBytes& k;
-        ~CleanseKey() noexcept { OPENSSL_cleanse(k.bytes.data(), k.bytes.size()); }
-    } cleanse_key{key};
     if (!key.assign(std::span(decoded.session_owner.bytes).first(decoded.session_owner.size))) {
         return tl::unexpected(ErrorCode::INTERNAL);
     }
@@ -357,16 +354,9 @@ proxy::shadowsocks::inbound::Handler::CreateDatagramResponse(
     }
     if (!decoded.session_id) return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     ss::Ss2022UdpSessionState state;
-    struct CleanseStateKey {
-        ss::KeyBytes& k;
-        ~CleanseStateKey() noexcept { OPENSSL_cleanse(k.bytes.data(), k.bytes.size()); }
-    } cleanse_state_key{state.key};
     state.cipher_info = cipher_info_;
     state.key = key;
-    for (size_t i = 0; i < state.client_session_id.size(); ++i) {
-        state.client_session_id[i] = static_cast<uint8_t>(
-            *decoded.session_id >> ((state.client_session_id.size() - 1 - i) * 8));
-    }
+    StoreU64BE(state.client_session_id.data(), *decoded.session_id);
     if (RAND_bytes(state.server_session_id.data(), state.server_session_id.size()) != 1) {
         return tl::unexpected(ErrorCode::INTERNAL);
     }
@@ -432,13 +422,6 @@ buf::MultiBuffer ShadowsocksUdpResponseContext::Encode(UDPPacketView packet) {
 // 自注册（静态初始化）
 // ============================================================================
 namespace {
-::proxyman::inbound::PreparedKeyBytes ToPreparedKey(::ss::KeyBytes key) {
-    ::proxyman::inbound::PreparedKeyBytes prepared;
-    prepared.assign(key.span());
-    OPENSSL_cleanse(key.bytes.data(), key.bytes.size());
-    return prepared;
-}
-
 class ShadowsocksSettings final
     : public ::proxyman::inbound::ProtocolSettings {
 public:
@@ -459,42 +442,26 @@ const bool kSsInboundRegistered = [] {
     reg.datagram_transport =
         ::proxyman::inbound::DatagramTransport::Packet;
 
-    reg.create_runtime = []() -> std::unique_ptr<
-        ::proxyman::inbound::ProtocolRuntime> {
-        return std::make_unique<::proxy::UserOnlineProtocolRuntime>();
-    };
+    reg.create_runtime = &::proxy::CreateUserOnlineProtocolRuntime;
 
-    reg.create_tcp_handler =
+    const auto create_handler =
         [](::proxyman::inbound::ProtocolRuntime& runtime,
            ::StatsShard& stats,
            ::ConnectionLimiter* limiter,
            const ::proxyman::inbound::BuildRequest& req) -> std::unique_ptr<::Inbound> {
-            auto* ss_runtime = dynamic_cast<::proxy::UserOnlineProtocolRuntime*>(&runtime);
+            auto* tracker = runtime.OnlineTracker();
             const auto* settings = GetSettings(req);
-            if (!ss_runtime || !settings) {
+            if (!tracker || !settings) {
                 return nullptr;
             }
             return std::make_unique<::proxy::shadowsocks::inbound::Handler>(
-                ss_runtime->validator,
+                *tracker,
                 stats,
                 limiter,
                 settings->cipher);
         };
-
-    reg.create_datagram_handler =
-        [](::proxyman::inbound::ProtocolRuntime& runtime,
-           ::StatsShard& stats,
-           ::ConnectionLimiter* limiter,
-           const ::proxyman::inbound::BuildRequest& req)
-            -> std::unique_ptr<::Inbound> {
-            auto* ss_runtime = dynamic_cast<::proxy::UserOnlineProtocolRuntime*>(&runtime);
-            const auto* settings = GetSettings(req);
-            if (!ss_runtime || !settings) {
-                return nullptr;
-            }
-            return std::make_unique<::proxy::shadowsocks::inbound::Handler>(
-                ss_runtime->validator, stats, limiter, settings->cipher);
-        };
+    reg.create_tcp_handler = create_handler;
+    reg.create_datagram_handler = create_handler;
 
     reg.prepare_settings =
         [](std::string_view tag, const ::InboundProtocolSettings& config)
@@ -513,8 +480,8 @@ const bool kSsInboundRegistered = [] {
             settings->user_key = config.ss2022_user_key;
             if (::ss::Is2022AesCipher(cipher->type)) {
                 if (!config.identity_password.empty()) {
-                    settings->identity_key = ToPreparedKey(
-                        ::ss::BuildMasterKey(config.identity_password, *cipher));
+                    settings->identity_key =
+                        ::ss::BuildMasterKey(config.identity_password, *cipher);
                     if (settings->identity_key.empty()) {
                         LOG_WARN("Inbound '{}': invalid SS2022 identity password", tag);
                         return std::nullopt;
@@ -550,11 +517,9 @@ const bool kSsInboundRegistered = [] {
                 }
                 ::proxyman::inbound::PreparedShadowsocksUser info;
                 info.profile = ::proxy::MakeUserProfile(spec);
-                info.key_size = cipher_info.key_size;
-                info.salt_size = cipher_info.salt_size;
-                info.derived_key = ToPreparedKey(uuid_derived
+                info.derived_key = uuid_derived
                     ? ::ss::Build2022UserKeyFromUuid(spec.credential, cipher_info)
-                    : ::ss::BuildMasterKey(spec.credential, cipher_info));
+                    : ::ss::BuildMasterKey(spec.credential, cipher_info);
                 info.identity_key = settings->identity_key;
                 if (info.derived_key.empty()) {
                     LOG_WARN("Inbound '{}': invalid SS password for user '{}'",

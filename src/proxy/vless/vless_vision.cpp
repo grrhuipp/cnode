@@ -89,8 +89,10 @@ struct CompleteRecords {
                 bytes = bytes.subspan(n);
                 continue;
             }
-            header[header_bytes++] = bytes.front();
-            bytes = bytes.subspan(1);
+            const size_t n = std::min(header.size() - header_bytes, bytes.size());
+            std::memcpy(header.data() + header_bytes, bytes.data(), n);
+            header_bytes += n;
+            bytes = bytes.subspan(n);
             if (header_bytes == header.size()) {
                 valid = StartsWith(header, kTlsApplicationDataStart);
                 remaining = LoadU16BE(header.data() + 3);
@@ -252,7 +254,9 @@ net::awaitable<void> WriteVisionFramed(
             if (filter) {
                 traffic.FilterTLS(bytes);
             }
-            records.Add(bytes);
+            if (filter || traffic.is_tls) {
+                records.Add(bytes);
+            }
             remaining_bytes += bytes.size();
         }
     }
@@ -281,15 +285,10 @@ bool IsVisionFlow(std::string_view flow) noexcept {
 
 VisionReader::VisionReader(transport::MultiBufferReader& src,
                            std::array<uint8_t, 16> user_uuid,
-                           VisionTrafficState& traffic,
-                           std::span<const uint8_t> initial)
+                           VisionTrafficState& traffic)
     : src_(src)
     , user_uuid_(user_uuid)
-    , traffic_(traffic) {
-    if (!buf::AppendSpanToMultiBuffer(initial, pending_)) {
-        ThrowVisionAllocationFailure();
-    }
-}
+    , traffic_(traffic) {}
 
 void VisionReader::Decode(buf::MultiBuffer& out) {
     while (read_process_) {

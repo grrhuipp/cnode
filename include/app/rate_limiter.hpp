@@ -418,9 +418,16 @@ public:
         std::string_view tag = {}, std::string_view ip = {},
         bool check_ban = false) {
         check_ban = check_ban && TracksAuthBan() && !ip.empty();
+        if (!core_.TracksGlobalConnections() && !check_ban) {
+            return []() -> net::awaitable<Admission> {
+                co_return Admission{RejectReason::NONE, {}};
+            }();
+        }
         auto node = std::make_unique<Return>();
         node->owner = shared_from_this();
-        node->family = std::make_shared<Family>();
+        if (core_.TracksGlobalConnections()) {
+            node->family = std::make_shared<Family>();
+        }
         node->physical = true;
         auto reservation = Reservation(std::move(node));
         return coordinator_->PostCall(
@@ -435,7 +442,8 @@ public:
                         return Admission{reason, std::move(reservation)};
                 }
                 const auto reason = node.owner->core_.TryAcceptGlobal();
-                node.admitted = reason == RejectReason::NONE;
+                node.admitted = (reason == RejectReason::NONE) &&
+                    node.owner->core_.TracksGlobalConnections();
                 return Admission{reason, std::move(reservation)};
             });
     }
@@ -513,6 +521,14 @@ private:
     net::awaitable<Admission> Reserve(std::shared_ptr<Family> family,
         std::string_view tag, std::string_view ip, bool check_ban) {
         check_ban = check_ban && TracksAuthBan() && !ip.empty();
+        if (!core_.TracksGlobalConnections()) {
+            family.reset();
+        }
+        if (!core_.TracksGlobalConnections() && !core_.TracksIpConnections() && !check_ban) {
+            return []() -> net::awaitable<Admission> {
+                co_return Admission{RejectReason::NONE, {}};
+            }();
+        }
         auto node = std::make_unique<Return>();
         node->owner = shared_from_this();
         node->family = std::move(family);

@@ -85,12 +85,9 @@ set(CNODE_CORE_SOURCES
     src/infra/json.cpp
     src/infra/config.cpp
     src/infra/inbound_field_rules.cpp
-    src/infra/routing_ip_network.cpp
     src/infra/json_field.cpp
     src/infra/config_loader.cpp
     src/infra/config_semantics.cpp
-    src/infra/config_validation.cpp
-    src/infra/outbound_source_config.cpp
 
     # App - DNS
     src/app/dns/dns.cpp
@@ -111,14 +108,10 @@ set(CNODE_CORE_SOURCES
     src/transport/internet/timeout_scheduler.cpp
     src/transport/internet/tls_client_context.cpp
     src/transport/internet/tls_config.cpp
-    src/transport/internet/tls_server_name.cpp
     src/transport/internet/tls_stream.cpp
     src/transport/internet/autosign_cert.cpp
     src/transport/internet/autosign_context.cpp
-    src/transport/internet/reality_client_version.cpp
     src/transport/internet/reality_key.cpp
-    src/transport/internet/reality_key_share.cpp
-    src/transport/internet/reality_short_id.cpp
     src/transport/internet/reality_tls.cpp
     src/transport/internet/ws_stream.cpp
     src/transport/internet/grpc_hunk.cpp
@@ -129,7 +122,6 @@ set(CNODE_CORE_SOURCES
     src/transport/internet/transport_dialer.cpp
     src/transport/internet/outbound_target_builder.cpp
     src/transport/internet/hysteria/hysteria_protocol.cpp
-    src/transport/internet/hysteria/quic_memory.cpp
     src/transport/internet/hysteria/quic_stream.cpp
     src/transport/internet/hysteria/hysteria_ingress.cpp
     src/transport/internet/proxy_protocol.cpp
@@ -150,15 +142,8 @@ set(CNODE_CORE_SOURCES
     src/service/controller/controller.cpp
     src/service/controller/traffic_journal.cpp
     src/common/awaitable_batch.cpp
-    src/service/controller/node_runtime.cpp
     src/infra/panel_config.cpp
-    src/infra/panel_node_ids.cpp
     src/service/controller/panel_inbound.cpp
-    src/service/controller/control.cpp
-    src/app/bootstrap_runtime.cpp
-    src/app/bootstrap_monitor.cpp
-    src/app/bootstrap_setup.cpp
-    src/app/startup_inbounds.cpp
     src/app/prepared_inbound.cpp
     src/app/runtime_publication.cpp
     src/app/session_tracking.cpp
@@ -170,7 +155,6 @@ set(CNODE_CORE_SOURCES
     src/app/bootstrap.cpp
 
     # Sniff
-    src/sniff/sniffer.cpp
     src/sniff/tls_sniffer.cpp
     src/sniff/http_sniffer.cpp
     src/sniff/quic_sniffer.cpp
@@ -180,12 +164,8 @@ set(CNODE_CORE_SOURCES
 
     # Proxy - VMess
     src/proxy/vmess/vmess_crypto.cpp
-    src/proxy/vmess/account.cpp
     src/proxy/vmess/validator.cpp
     src/proxy/vmess/vmess_cipher.cpp
-    src/proxy/vmess/aead/authid.cpp
-    src/proxy/vmess/aead/kdf.cpp
-    src/proxy/vmess/aead/encrypt.cpp
     src/proxy/vmess/encoding/body.cpp
     src/proxy/vmess/encoding/client.cpp
     src/proxy/vmess/encoding/server.cpp
@@ -193,7 +173,6 @@ set(CNODE_CORE_SOURCES
     src/proxy/vmess/outbound/vmess_outbound.cpp
 
     # Proxy - VLESS
-    src/proxy/vless/credentials.cpp
     src/proxy/vless/vless_codec.cpp
     src/proxy/vless/vless_encryption.cpp
     src/proxy/vless/vless_encryption_crypto.cpp
@@ -201,7 +180,6 @@ set(CNODE_CORE_SOURCES
     src/proxy/vless/vless_encryption_io.cpp
     src/proxy/vless/vless_encryption_record.cpp
     src/proxy/vless/vless_encryption_runtime.cpp
-    src/proxy/vless/vless_ticket_service.cpp
     src/proxy/vless/vless_encryption_xor.cpp
     src/proxy/vless/udp_framing.cpp
     src/proxy/vless/vless_vision.cpp
@@ -226,15 +204,12 @@ set(CNODE_CORE_SOURCES
     src/proxy/shadowsocks/shadowsocks_protocol.cpp
     src/proxy/shadowsocks/ss_udp.cpp
     src/proxy/shadowsocks/inbound/ss_inbound.cpp
-    src/proxy/shadowsocks/outbound/ss_outbound_uot.cpp
     src/proxy/shadowsocks/outbound/ss_outbound.cpp
-    src/proxy/shadowsocks/outbound/ss_outbound_credentials.cpp
 
     # Proxy - AnyTLS
     src/proxy/anytls/anytls_codec.cpp
     src/proxy/anytls/padding.cpp
     src/proxy/anytls/inbound/anytls_inbound.cpp
-    src/proxy/anytls/outbound/anytls_outbound_settings.cpp
     src/proxy/anytls/outbound/anytls_outbound.cpp
 
     # Proxy - Freedom

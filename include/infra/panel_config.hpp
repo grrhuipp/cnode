@@ -3,7 +3,7 @@
 #include "core/constants.hpp"
 #include "common/defaults.hpp"
 #include "infra/json.hpp"
-#include "infra/panel_node_ids.hpp"
+#include <span>
 #include "transport/internet/outbound_bind.hpp"
 #include "transport/internet/inbound_listen.hpp"
 #include "transport/internet/proxy_protocol_mode.hpp"
@@ -21,6 +21,21 @@
 
 struct TlsPemMaterial;
 
+
+class PanelNodeIds {
+public:
+    PanelNodeIds() = default;
+
+    [[nodiscard]] bool Empty() const noexcept { return values_.empty(); }
+    [[nodiscard]] int Front() const noexcept { return values_.front(); }
+    [[nodiscard]] std::span<const int> Values() const noexcept { return values_; }
+
+    [[nodiscard]] static PanelNodeIds Parse(const json::value& value);
+    [[nodiscard]] static PanelNodeIds Single(int node_id);
+
+private:
+    std::vector<int> values_;
+};
 struct PanelApiUrlParts {
     std::string host;
     uint16_t port = 0;

@@ -60,20 +60,6 @@ constexpr QuicVersion kV2{
     return nullptr;
 }
 
-[[nodiscard]] bool ReadVarint(std::span<const uint8_t> data,
-                              size_t& offset,
-                              uint64_t& value) noexcept {
-    if (offset >= data.size()) return false;
-    const uint8_t first = data[offset];
-    const size_t length = static_cast<size_t>(1u) << (first >> 6);
-    if (offset + length > data.size()) return false;
-    value = first & 0x3f;
-    for (size_t i = 1; i < length; ++i) {
-        value = (value << 8) | data[offset + i];
-    }
-    offset += length;
-    return true;
-}
 
 bool HkdfExtract(std::span<const uint8_t> salt,
                  std::span<const uint8_t> ikm,
@@ -196,12 +182,15 @@ bool AesGcmDecrypt(std::span<const uint8_t, 16> key,
 }  // namespace
 
 SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
-    auto fail = [&]() {
+    auto release_state = [&]() noexcept {
         stopped_ = true;
         crypto_.clear();
         crypto_.shrink_to_fit();
         coverage_.clear();
         coverage_.shrink_to_fit();
+    };
+    auto fail = [&]() {
+        release_state();
         return SniffResult{};
     };
     if (stopped_) return {};
@@ -230,7 +219,9 @@ SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
             return fail();
         }
         if (remaining.size() < 7) return fail();
-        const uint32_t version = ByteReader(remaining.subspan(1, 4)).ReadU32BE();
+        ByteReader header(remaining);
+        (void)header.Skip(1);
+        const uint32_t version = header.ReadU32BE();
         const auto* spec = LookupVersion(version);
         if (!spec) return fail();
         const uint8_t packet_type = (remaining[0] >> 4) & 3;
@@ -241,26 +232,24 @@ SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
             return fail();
         }
 
-        size_t cursor = 5;
-        const uint8_t dcid_len = remaining[cursor++];
-        if (dcid_len > dcid_.size() || dcid_len > remaining.size() - cursor)
+        const uint8_t dcid_len = header.ReadU8();
+        const auto dcid = header.ReadBytes(dcid_len);
+        const uint8_t scid_len = header.ReadU8();
+        if (!header.Ok() || dcid_len > dcid_.size() || scid_len > 20 ||
+            !header.Skip(scid_len)) {
             return fail();
-        const auto dcid = remaining.subspan(cursor, dcid_len);
-        cursor += dcid_len;
-        if (cursor == remaining.size()) return fail();
-        const uint8_t scid_len = remaining[cursor++];
-        if (scid_len > 20 || scid_len > remaining.size() - cursor) return fail();
-        cursor += scid_len;
-        if (is_initial) {
-            uint64_t token_len = 0;
-            if (!ReadVarint(remaining, cursor, token_len) ||
-                token_len > remaining.size() - cursor) return fail();
-            cursor += static_cast<size_t>(token_len);
         }
-        uint64_t packet_len = 0;
-        if (!ReadVarint(remaining, cursor, packet_len) ||
-            packet_len > remaining.size() - cursor) return fail();
-        const size_t hdr_len = cursor;
+        if (is_initial) {
+            const auto token_len = header.ReadQuicVarint();
+            if (!token_len || *token_len > header.Remaining() ||
+                !header.Skip(static_cast<size_t>(*token_len))) {
+                return fail();
+            }
+        }
+        const auto packet_len_opt = header.ReadQuicVarint();
+        if (!packet_len_opt || *packet_len_opt > header.Remaining()) return fail();
+        const uint64_t packet_len = *packet_len_opt;
+        const size_t hdr_len = header.Position();
         const size_t next_offset = offset + hdr_len + static_cast<size_t>(packet_len);
         // Protected packet numbers and tags require at least this much space
         // for a header-protection sample, even when the payload is opaque.
@@ -325,14 +314,16 @@ SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
         largest_pn_ = std::max(largest_pn_, packet_number);
         decrypted_initial = true;
 
-        const auto plaintext = std::span<const uint8_t>(decrypted);
-        size_t frame = 0;
-        while (frame < plaintext.size()) {
+        ByteReader frames(decrypted);
+        auto consume = [&](uint64_t& value) {
+            const auto parsed = frames.ReadQuicVarint();
+            if (!parsed) return false;
+            value = *parsed;
+            return true;
+        };
+        while (!frames.Empty()) {
             uint64_t frame_type = 0;
-            if (!ReadVarint(plaintext, frame, frame_type)) return fail();
-            auto consume = [&](uint64_t& value) {
-                return ReadVarint(plaintext, frame, value);
-            };
+            if (!consume(frame_type)) return fail();
             switch (frame_type) {
                 case 0x00: // PADDING
                 case 0x01: // PING
@@ -343,7 +334,7 @@ SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
                     uint64_t ranges = 0;
                     if (!consume(ignored) || !consume(ignored) ||
                         !consume(ranges) || !consume(ignored) ||
-                        ranges > (plaintext.size() - frame) / 2) return fail();
+                        ranges > frames.Remaining() / 2) return fail();
                     for (uint64_t i = 0; i < ranges; ++i)
                         if (!consume(ignored) || !consume(ignored)) return fail();
                     if (frame_type == 0x03 &&
@@ -355,27 +346,28 @@ SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
                     uint64_t start = 0;
                     uint64_t length = 0;
                     if (!consume(start) || !consume(length) ||
-                        start > kMaxCrypto || length > kMaxCrypto - start ||
-                        length > plaintext.size() - frame) return fail();
+                        start > kMaxCrypto || length > kMaxCrypto - start) return fail();
+                    const auto chunk = frames.ReadBytes(static_cast<size_t>(length));
+                    if (!frames.Ok()) return fail();
                     if (length == 0) break;
                     const size_t end = static_cast<size_t>(start + length);
                     if (contiguous_ >= 4 &&
-                        end > 4 + ((static_cast<size_t>(crypto_[1]) << 16) |
-                                   (static_cast<size_t>(crypto_[2]) << 8) | crypto_[3])) {
+                        end > 4 + static_cast<size_t>(LoadU24BE(crypto_.data() + 1))) {
                         return fail();
                     }
                     if (crypto_.size() < end) {
                         Grow(crypto_, end);
                         Grow(coverage_, (end + 7) / 8);
                     }
-                    for (size_t i = static_cast<size_t>(start); i < end; ++i) {
-                        const uint8_t bit = static_cast<uint8_t>(1u << (i & 7));
-                        const uint8_t byte = plaintext[frame++];
-                        if ((coverage_[i / 8] & bit) != 0) {
-                            if (crypto_[i] != byte) return fail();
+                    for (size_t i = 0; i < chunk.size(); ++i) {
+                        const size_t pos = static_cast<size_t>(start) + i;
+                        const uint8_t bit = static_cast<uint8_t>(1u << (pos & 7));
+                        const uint8_t byte = chunk[i];
+                        if ((coverage_[pos / 8] & bit) != 0) {
+                            if (crypto_[pos] != byte) return fail();
                         } else {
-                            crypto_[i] = byte;
-                            coverage_[i / 8] |= bit;
+                            crypto_[pos] = byte;
+                            coverage_[pos / 8] |= bit;
                         }
                     }
                     while (contiguous_ < crypto_.size() &&
@@ -391,9 +383,7 @@ SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
 
         if (contiguous_ != 0 && crypto_[0] != 1) return fail();
         if (contiguous_ >= 4) {
-            const size_t handshake_size =
-                (static_cast<size_t>(crypto_[1]) << 16) |
-                (static_cast<size_t>(crypto_[2]) << 8) | crypto_[3];
+            const size_t handshake_size = LoadU24BE(crypto_.data() + 1);
             if (handshake_size > kMaxCrypto - 4 ||
                 crypto_.size() > handshake_size + 4) return fail();
             if (contiguous_ >= handshake_size + 4) {
@@ -404,11 +394,7 @@ SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
                 result.success = true;
                 result.protocol = constants::protocol::kQuic;
                 result.domain.assign(*sni);
-                stopped_ = true;
-                crypto_.clear();
-                crypto_.shrink_to_fit();
-                coverage_.clear();
-                coverage_.shrink_to_fit();
+                release_state();
                 return result;
             }
         }

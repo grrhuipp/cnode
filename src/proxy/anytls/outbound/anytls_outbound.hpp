@@ -3,6 +3,7 @@
 #include "common/allocator.hpp"
 #include "proxy/outbound.hpp"
 #include "transport/internet/outbound_sender.hpp"
+#include "infra/json.hpp"
 
 #include <array>
 #include "common/unsafe.hpp"
@@ -10,6 +11,8 @@
 #include <cstdint>
 #include <memory>
 #include <string_view>
+#include <tl/expected.hpp>
+#include <string>
 
 
 class AwaitableTaskGroup;
@@ -35,6 +38,9 @@ struct Settings {
         ::SecureZeroMemory(password_hash.data(), password_hash.size());
     }
 };
+
+[[nodiscard]] tl::expected<Settings, std::string> ParseSettings(
+    const json::object& source);
 
 // ============================================================================
 // Handler - AnyTLS outbound proxy

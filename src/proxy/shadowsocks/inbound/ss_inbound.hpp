@@ -44,7 +44,7 @@ public:
 
 private:
     ::UserOnlineTracker& validator_;
-    ::StatsShard* stats_ = nullptr;
+    ::StatsShard& stats_;
     ::ConnectionLimiter* limiter_;
     ::ss::SsCipherInfo cipher_info_;
     ::ss::Ss2022UdpReplayCache udp_replay_cache_;

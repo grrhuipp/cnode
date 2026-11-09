@@ -1,5 +1,6 @@
 #pragma once
 
+#include "app/proxyman/inbound/prepared_config.hpp"
 #include "common/unsafe.hpp"
 #include <algorithm>
 #include <array>
@@ -41,38 +42,7 @@ struct SsCipherInfo {
 // 密钥派生
 // ============================================================================
 
-struct KeyBytes {
-    static constexpr size_t kMaxSize = 32;
-
-    std::array<uint8_t, kMaxSize> bytes{};
-    size_t size = 0;
-
-
-    KeyBytes() = default;
-    KeyBytes(const KeyBytes&) = default;
-    KeyBytes& operator=(const KeyBytes&) = default;
-    KeyBytes(KeyBytes&&) noexcept = default;
-    KeyBytes& operator=(KeyBytes&&) noexcept = default;
-    ~KeyBytes() noexcept {
-        ::SecureZeroMemory(bytes.data(), bytes.size());
-    }
-    [[nodiscard]] const uint8_t* data() const noexcept { return bytes.data(); }
-    [[nodiscard]] uint8_t* data() noexcept { return bytes.data(); }
-    [[nodiscard]] bool empty() const noexcept { return size == 0; }
-    [[nodiscard]] std::span<const uint8_t> span() const noexcept {
-        return {bytes.data(), size};
-    }
-
-    bool assign(std::span<const uint8_t> src) noexcept {
-        if (src.size() > bytes.size()) {
-            size = 0;
-            return false;
-        }
-        std::copy(src.begin(), src.end(), bytes.begin());
-        size = src.size();
-        return true;
-    }
-};
+using KeyBytes = ::proxyman::inbound::PreparedKeyBytes;
 
 // 从密码派生主密钥（EVP_BytesToKey + MD5，Shadowsocks 标准）
 [[nodiscard]] KeyBytes DeriveKey(std::string_view password, size_t key_size);

@@ -3,13 +3,13 @@
 
 #include "common/domain_name.hpp"
 #include "common/ip_utils.hpp"
+#include "common/target_address.hpp"
 #include "common/unsafe.hpp"
 #include "core/constants.hpp"
 #include "transport/internet/http_headers.hpp"
 
 #include <algorithm>
 #include <array>
-#include <charconv>
 
 namespace {
 
@@ -18,20 +18,18 @@ struct HostPortView {
     uint16_t port = 0;
 };
 
-[[nodiscard]] std::string_view TrimOws(std::string_view value) noexcept {
-    return transport::internet::TrimHttpOws(value);
-}
-
-[[nodiscard]] bool ParsePort(std::string_view text, uint16_t& port) noexcept {
-    uint32_t value = 0;
-    const auto [end, error] = std::from_chars(
-        text.data(), text.data() + text.size(), value);
-    if (text.empty() || error != std::errc{} ||
-        end != text.data() + text.size() || value == 0 || value > 65535) {
+[[nodiscard]] bool SplitAndValidateHeaderField(
+    std::string_view line,
+    std::string_view& name,
+    std::string_view& value) noexcept {
+    const size_t colon = line.find(':');
+    if (colon == std::string_view::npos || colon == 0) {
         return false;
     }
-    port = static_cast<uint16_t>(value);
-    return true;
+    name = line.substr(0, colon);
+    value = transport::internet::TrimHttpOws(line.substr(colon + 1));
+    return transport::internet::IsValidHttpHeaderName(name) &&
+           transport::internet::IsValidHttpHeaderValue(value);
 }
 
 static constexpr std::array<std::string_view, 9> kHttpMethods{
@@ -103,16 +101,13 @@ static constexpr std::array<std::string_view, 9> kHttpMethods{
     if (prefix.empty()) return true;
     if (prefix.front() == ' ' || prefix.front() == '\t') return false;
 
-    const size_t colon = prefix.find(':');
-    if (colon == std::string_view::npos) {
+    if (prefix.find(':') == std::string_view::npos) {
         if (trailing_cr) return false;
         return transport::internet::IsValidHttpHeaderName(prefix);
     }
-    if (colon == 0) return false;
-    const std::string_view name = prefix.substr(0, colon);
-    const std::string_view value = TrimOws(prefix.substr(colon + 1));
-    return transport::internet::IsValidHttpHeaderName(name) &&
-           transport::internet::IsValidHttpHeaderValue(value);
+    std::string_view name;
+    std::string_view value;
+    return SplitAndValidateHeaderField(prefix, name, value);
 }
 
 [[nodiscard]] std::optional<HostPortView> ParseHostValue(
@@ -134,7 +129,7 @@ static constexpr std::array<std::string_view, 9> kHttpMethods{
         const std::string_view suffix = value.substr(close + 1);
         if (!suffix.empty() &&
             (suffix.front() != ':' ||
-             !ParsePort(suffix.substr(1), parsed.port))) {
+             !TargetAddress::ParsePort(suffix.substr(1), parsed.port))) {
             return std::nullopt;
         }
         return parsed;
@@ -149,7 +144,7 @@ static constexpr std::array<std::string_view, 9> kHttpMethods{
         parsed.host = value;
     } else {
         if (value.rfind(':') != colon || colon == 0 ||
-            !ParsePort(value.substr(colon + 1), parsed.port)) {
+            !TargetAddress::ParsePort(value.substr(colon + 1), parsed.port)) {
             return std::nullopt;
         }
         parsed.host = value.substr(0, colon);
@@ -209,14 +204,9 @@ SniffResult SniffHttp(std::span<const uint8_t> data) {
         // obs-fold is rejected (RFC 9112 §5.2).
         if (line.front() == ' ' || line.front() == '\t') return result;
 
-        const size_t colon = line.find(':');
-        if (colon == std::string_view::npos || colon == 0) {
-            return result;
-        }
-        const std::string_view name = line.substr(0, colon);
-        const std::string_view value = TrimOws(line.substr(colon + 1));
-        if (!transport::internet::IsValidHttpHeaderName(name) ||
-            !transport::internet::IsValidHttpHeaderValue(value)) {
+        std::string_view name;
+        std::string_view value;
+        if (!SplitAndValidateHeaderField(line, name, value)) {
             return result;
         }
         if (!transport::internet::EqualsAsciiCI(name, "host")) continue;

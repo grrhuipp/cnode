@@ -16,6 +16,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 
 
@@ -35,6 +36,55 @@ std::optional<uint16_t> ParsePanelHttpPort(std::string_view value) noexcept {
 
 }  // namespace
 
+
+PanelNodeIds PanelNodeIds::Parse(const json::value& value) {
+    if (!value.is_array()) {
+        throw std::invalid_argument("Panel NodeIDs must be an array");
+    }
+    if (value.as_array().empty()) {
+        throw std::invalid_argument("Panel NodeIDs must not be empty");
+    }
+
+    PanelNodeIds result;
+    std::unordered_set<int> unique;
+    result.values_.reserve(value.as_array().size());
+    unique.reserve(value.as_array().size());
+    for (const auto& item : value.as_array()) {
+        uint64_t raw = 0;
+        if (item.is_int64()) {
+            const int64_t signed_value = item.as_int64();
+            if (signed_value <= 0) {
+                throw std::invalid_argument("Panel NodeID must be positive");
+            }
+            raw = static_cast<uint64_t>(signed_value);
+        } else if (item.is_uint64()) {
+            raw = item.as_uint64();
+        } else {
+            throw std::invalid_argument("Panel NodeID must be an integer");
+        }
+        if (raw == 0 || raw > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+            throw std::invalid_argument(std::format(
+                "Panel NodeID {} must be between 1 and {}",
+                raw, std::numeric_limits<int>::max()));
+        }
+        const int node_id = static_cast<int>(raw);
+        if (!unique.insert(node_id).second) {
+            throw std::invalid_argument(std::format(
+                "Panel NodeID {} is duplicated", node_id));
+        }
+        result.values_.push_back(node_id);
+    }
+    return result;
+}
+
+PanelNodeIds PanelNodeIds::Single(int node_id) {
+    if (node_id <= 0) {
+        throw std::invalid_argument("Panel NodeID must be positive");
+    }
+    PanelNodeIds result;
+    result.values_.push_back(node_id);
+    return result;
+}
 bool IsValidPanelName(std::string_view name) noexcept {
     if (name.empty()) {
         return false;
@@ -205,18 +255,7 @@ PanelConfig PanelConfig::FromJson(const json::object& j) {
     if (!j.contains("name") && !cfg.NodeIDs.Empty()) {
         cfg.Name = std::format("{}-{}", cfg.NodeType, cfg.NodeIDs.Front());
     }
-    if (const auto* listen_ip = j.if_contains("listenIP")) {
-        if (!listen_ip->is_string()) {
-            throw std::invalid_argument("Panel listenIP must be a string");
-        }
-        auto parsed = InboundListen::Parse(listen_ip->as_string());
-        if (!parsed) {
-            throw std::invalid_argument(std::format(
-                "Panel listenIP '{}' must be auto or an IP address",
-                listen_ip->as_string()));
-        }
-        cfg.ListenIP = std::move(*parsed);
-    }
+    cfg.ListenIP = ParseInboundListen(j, "listenIP", "Panel listenIP", cfg.ListenIP);
     if (const auto* send_ip = j.if_contains("sendIP")) {
         if (!send_ip->is_string()) {
             throw std::invalid_argument("Panel sendIP must be a string");

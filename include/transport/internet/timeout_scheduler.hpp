@@ -24,7 +24,6 @@ public:
 
     [[nodiscard]] bool Valid() const noexcept { return owner_ != nullptr; }
     [[nodiscard]] bool ScheduleAfter(std::chrono::milliseconds delay);
-    [[nodiscard]] bool ScheduleAfter(std::chrono::milliseconds delay, net::io_context& context);
     void Cancel() noexcept;
 
 protected:

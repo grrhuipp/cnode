@@ -58,20 +58,14 @@ void QuicStreamState::OnStreamClosed() noexcept {
 }
 
 void QuicStreamState::RemoteReset() noexcept {
-    auto owner = std::exchange(owner_, {}).lock();
-    const auto stream_id = stream_id_;
-    const size_t unread = input_.byte_size();
-    cancelled_ = true;
-    input_done_ = true;
-    write_done_ = true;
-    input_.clear();
-    WakeReader();
-    NotifyWritable();
-    cancellation_.Stop();
-    if (owner && unread != 0) owner->ConsumeStream(stream_id, unread);
+    Abort(false);
 }
 
 void QuicStreamState::Cancel() noexcept {
+    Abort(true);
+}
+
+void QuicStreamState::Abort(bool cancel_transport) noexcept {
     if (cancelled_) return;
     auto owner = std::exchange(owner_, {}).lock();
     const auto stream_id = stream_id_;
@@ -84,7 +78,7 @@ void QuicStreamState::Cancel() noexcept {
     NotifyWritable();
     cancellation_.Stop();
     if (owner) {
-        owner->CancelStream(stream_id);
+        if (cancel_transport) owner->CancelStream(stream_id);
         if (unread != 0) owner->ConsumeStream(stream_id, unread);
     }
 }
@@ -94,6 +88,7 @@ net::awaitable<size_t> QuicStreamState::Read(net::mutable_buffer buffer) {
         if (!input_.empty()) {
             const size_t bytes = input_.ConsumePrefixTo(
                 {static_cast<uint8_t*>(buffer.data()), buffer.size()});
+            input_.ReleaseIfIdle();
             AcknowledgeInput(bytes);
             co_return bytes;
         }
@@ -197,12 +192,7 @@ net::awaitable<size_t> QuicStream::AsyncRead(net::mutable_buffer buffer) {
 }
 
 net::awaitable<size_t> QuicStream::AsyncWrite(net::const_buffer buffer) {
-    if (closed_) throw transport::LinkError(ErrorCode::CONNECTION_CLOSED);
-    buf::MultiBuffer payload;
-    const auto bytes = std::span(
-        static_cast<const uint8_t*>(buffer.data()), buffer.size());
-    if (!buf::AppendSpanToMultiBuffer(bytes, payload)) throw std::bad_alloc();
-    co_await state_->WriteMultiBuffer(std::move(payload));
+    co_await WriteBuffers(std::span(&buffer, 1));
     co_return buffer.size();
 }
 
@@ -221,6 +211,7 @@ net::awaitable<void> QuicStream::WriteMultiBuffer(buf::MultiBuffer payload) {
 
 net::awaitable<void> QuicStream::WriteBuffers(
     std::span<const net::const_buffer> buffers) {
+    if (closed_) throw transport::LinkError(ErrorCode::CONNECTION_CLOSED);
     buf::MultiBuffer payload;
     for (const auto& buffer : buffers) {
         const auto bytes = std::span(
@@ -287,12 +278,7 @@ bool UdpSessionStream::Push(
 
 void UdpSessionStream::Detach() noexcept {
     owner_.reset();
-    if (closed_) return;
-    closed_ = true;
-    input_.clear();
-    queued_buffer_count_ = 0;
-    WakeReader();
-    NotifyClosed();
+    Close();
 }
 
 net::awaitable<size_t> UdpSessionStream::AsyncRead(net::mutable_buffer) {

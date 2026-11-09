@@ -1461,19 +1461,34 @@ net::awaitable<XHttpSessionOwnerResolution> ResolveXHttpSessionOwner(
     XHttpSessionAccess access,
     bool bind_owner,
     transport::CancellationSource* cancellation = nullptr) {
+    auto& table = net::use_service<XHttpSessionTable>(io_context);
+    if (access != XHttpSessionAccess::Open) {
+        if (auto session = table.Get(
+                io_context, session_namespace, session_id, XHttpSessionAccess::Join)) {
+            co_return XHttpSessionOwnerResolution{
+                .owner = &io_context,
+                .session = std::move(session),
+            };
+        }
+    }
     auto* coordinator = GroupCoordinator::ForContext(io_context);
     if (!coordinator) {
         co_return XHttpSessionOwnerResolution{
             .owner = &io_context,
-            .session = net::use_service<XHttpSessionTable>(io_context).Get(
+            .session = table.Get(
                 io_context, session_namespace, session_id, access),
         };
     }
     for (;;) {
         auto claim = co_await coordinator->PostCall(
-            [coordinator, session_namespace, session_id, access, &io_context, bind_owner] {
+            [coordinator,
+             ns = std::string(session_namespace),
+             id = std::string(session_id),
+             access,
+             &io_context,
+             bind_owner] {
                 return net::use_service<XHttpSessionDirectory>(coordinator->Services()).Acquire(
-                    session_namespace, session_id, access, &io_context, bind_owner);
+                    ns, id, access, &io_context, bind_owner);
             });
         if (claim.retry) continue;
         if (claim.owner) {
@@ -1481,7 +1496,7 @@ net::awaitable<XHttpSessionOwnerResolution> ResolveXHttpSessionOwner(
                 co_return XHttpSessionOwnerResolution{.owner = claim.owner, .session = {}};
             }
             if (claim.record && claim.record->Retired()) continue;
-            auto session = net::use_service<XHttpSessionTable>(io_context).Get(
+            auto session = table.Get(
                 io_context, session_namespace, session_id, access, claim.record);
             if (session) claim.reservation = false;
             co_return XHttpSessionOwnerResolution{

@@ -351,7 +351,6 @@ struct TlsStream::Impl final : memory::ThreadAllocated, private transport::Cance
         if (!tcp) throw std::invalid_argument("TlsStream requires TcpStream");
         if (!tls_bio_method)
             throw std::logic_error("TlsStream::InitializeIo must precede Worker startup");
-        tcp->PrepareTlsIo();
         const auto snapshot = context.AcquireNative();
         if (!snapshot) throw std::runtime_error("TLS certificate expired without a renewed snapshot");
         ssl.reset(SSL_new(snapshot.get()));
@@ -372,7 +371,6 @@ struct TlsStream::Impl final : memory::ThreadAllocated, private transport::Cance
         : tcp(std::move(inner))
         , ssl(existing_ssl, SSL_free) {
         if (!tcp || !ssl) throw std::invalid_argument("TlsStream restore requires valid TcpStream and SSL");
-        tcp->PrepareTlsIo();
         BIO* bio = SSL_get_rbio(ssl.get());
         if (!bio) throw std::logic_error("TlsStream restore missing SSL BIO");
         BIO_set_data(bio, this);
@@ -852,11 +850,10 @@ TlsStream::TlsStream(std::unique_ptr<TcpStream> inner, const SslContext& ctx, bo
     : impl_(std::make_unique<Impl>(std::move(inner), ctx, is_server))
     , is_server_(is_server) {}
 
-TlsStream::TlsStream(std::unique_ptr<TcpStream> inner, SSL* existing_ssl,
-                     bool is_server, bool handshake_done)
+TlsStream::TlsStream(std::unique_ptr<TcpStream> inner, SSL* existing_ssl, bool is_server)
     : impl_(std::make_unique<Impl>(std::move(inner), existing_ssl))
     , is_server_(is_server)
-    , handshake_done_(handshake_done) {}
+    , handshake_done_(true) {}
 
 DetachedTlsState::~DetachedTlsState() noexcept {
     if (ssl) SSL_free(ssl);
@@ -866,7 +863,6 @@ DetachedTlsState::DetachedTlsState(DetachedTlsState&& other) noexcept
     : tcp(std::move(other.tcp))
     , ssl(std::exchange(other.ssl, nullptr))
     , is_server(other.is_server)
-    , handshake_done(other.handshake_done)
     , plaintext_prefix(std::move(other.plaintext_prefix)) {}
 
 DetachedTlsState& DetachedTlsState::operator=(DetachedTlsState&& other) noexcept {
@@ -875,7 +871,6 @@ DetachedTlsState& DetachedTlsState::operator=(DetachedTlsState&& other) noexcept
         tcp = std::move(other.tcp);
         ssl = std::exchange(other.ssl, nullptr);
         is_server = other.is_server;
-        handshake_done = other.handshake_done;
         plaintext_prefix = std::move(other.plaintext_prefix);
     }
     return *this;
@@ -890,7 +885,6 @@ std::optional<DetachedTlsState> TlsStream::DetachForHandoff(
     }
     DetachedTlsState state;
     state.is_server = is_server_;
-    state.handshake_done = handshake_done_;
     const size_t extra = impl_->prepended_plaintext
         ? impl_->prepended_plaintext->data.byte_size() : 0;
     if (plaintext_prefix.size() + extra != 0) {
@@ -927,7 +921,7 @@ std::unique_ptr<TlsStream> TlsStream::RestoreFromHandoff(
     if (!tcp) return nullptr;
     SSL* ssl = std::exchange(state.ssl, nullptr);
     std::unique_ptr<TlsStream> stream(
-        new TlsStream(std::move(tcp), ssl, state.is_server, state.handshake_done));
+        new TlsStream(std::move(tcp), ssl, state.is_server));
     if (!state.plaintext_prefix.empty()) {
         stream->PrependReadData(state.plaintext_prefix);
     }
@@ -994,19 +988,13 @@ net::awaitable<bool> TlsStream::Handshake() {
     if (reality_client_state_ &&
         !VerifyRealityClientHandshake(NativeSsl(), *reality_client_state_)) {
         memory::ThreadLocalString spider_x = std::move(reality_client_state_->spider_x);
-        memory::ThreadLocalString server_name = std::move(reality_client_state_->server_name);
-        if (server_name.empty()) {
-            if (const char* sni = SSL_get_servername(
-                    NativeSsl(), TLSEXT_NAMETYPE_host_name);
-                sni && *sni != '\0') {
-                server_name.assign(sni);
-            }
-        }
         ClearRealityClientState(NativeSsl(), reality_client_state_);
         if (!spider_x.empty()) {
-            const std::string_view host = server_name.empty()
-                ? std::string_view("localhost")
-                : std::string_view(server_name);
+            const char* sni = SSL_get_servername(
+                NativeSsl(), TLSEXT_NAMETYPE_host_name);
+            const std::string_view host = (sni && *sni != '\0')
+                ? std::string_view(sni)
+                : std::string_view("localhost");
             static constexpr std::string_view kReqPrefix = "GET ";
             static constexpr std::string_view kReqMid = " HTTP/1.1\r\nHost: ";
             static constexpr std::string_view kReqSuffix =
@@ -1024,7 +1012,6 @@ net::awaitable<bool> TlsStream::Handshake() {
             try {
                 co_await impl_->Write(request_buffers);
                 memory::ThreadLocalString{}.swap(spider_x);
-                memory::ThreadLocalString{}.swap(server_name);
                 (void)co_await impl_->ReadMultiBuffer();
             } catch (const std::exception&) {
                 // The camouflage exchange is best-effort; authentication still

@@ -34,7 +34,7 @@ bool InboundListen::operator==(const InboundListen& other) const noexcept {
 }
 
 std::optional<InboundListen> InboundListen::Parse(std::string_view value) {
-    if (value.empty() || transport::internet::EqualsAsciiCI(value, constants::network::kDualStackAuto)) {
+    if (value.empty() || transport::internet::EqualsAsciiCI(value, constants::binding::kAuto)) {
         return InboundListen{};
     }
     auto address = iputil::ParseLiteral(value);

@@ -33,8 +33,6 @@ TEST(SessionGroupExecutor, WorkerRouteRegistrationAndBoundedCoordinatorControl) 
     Require(GroupCoordinator::ForContext(control) == coordinator.get(), "control context binding missing");
     Require(GroupCoordinator::ForContext(first) == coordinator.get(), "worker 0 context binding missing");
     Require(GroupCoordinator::ForContext(second) == coordinator.get(), "worker 1 context binding missing");
-    Require(GroupCoordinator::WorkerIdForContext(first) == 0u, "worker 0 id mismatch");
-    Require(GroupCoordinator::WorkerIdForContext(second) == 1u, "worker 1 id mismatch");
 
     std::thread control_thread([&] { control.run(); });
     std::thread first_thread([&] { first.run(); });

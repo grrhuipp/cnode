@@ -9,6 +9,7 @@
 // ============================================================================
 
 #include "transport/async_stream.hpp"
+#include "common/byte_reader.hpp"
 #include "transport/internet/async_write_gate.hpp"
 #include "transport/internet/http_headers.hpp"
 
@@ -78,13 +79,12 @@ inline EncodedFrameHeader EncodeFrameHeader(
         out[offset++] = static_cast<uint8_t>(len_byte | static_cast<uint8_t>(payload_len));
     } else if (payload_len <= 65535) {
         out[offset++] = static_cast<uint8_t>(len_byte | 126);
-        out[offset++] = static_cast<uint8_t>(payload_len >> 8);
-        out[offset++] = static_cast<uint8_t>(payload_len & 0xFF);
+        StoreU16BE(out + offset, static_cast<uint16_t>(payload_len));
+        offset += 2;
     } else {
         out[offset++] = static_cast<uint8_t>(len_byte | 127);
-        for (int i = 7; i >= 0; --i) {
-            out[offset++] = static_cast<uint8_t>((static_cast<uint64_t>(payload_len) >> (i * 8)) & 0xFF);
-        }
+        StoreU64BE(out + offset, static_cast<uint64_t>(payload_len));
+        offset += 8;
     }
 
     // Mask key (如果需要)
@@ -165,10 +165,11 @@ private:
     net::awaitable<size_t> ReadSome(uint8_t* data, size_t size);
     net::awaitable<bool> FillHeader();
     net::awaitable<bool> PrepareNextDataFrame();
+    void ConsumePayloadBytes(std::span<uint8_t> bytes);
     void FinishDataFrame();
     void ValidateClose();
 
-    net::awaitable<WriteGate::Lease> AcquireWrite(net::cancellation_slot caller_slot);
+    net::awaitable<WriteGate::Lease> AcquireWrite();
     net::awaitable<void> WriteDataFrame(
         std::span<const net::const_buffer> buffers, size_t size);
     net::awaitable<void> WriteControlFrame(ws::Opcode opcode, std::span<const uint8_t> payload);

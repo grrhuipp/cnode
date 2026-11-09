@@ -4,6 +4,7 @@
 #include "common/allocator.hpp"
 #include "common/asio_types.hpp"
 #include "transport/link.hpp"
+#include "common/unsafe.hpp"
 
 #include <array>
 #include <cstdint>
@@ -49,8 +50,11 @@ public:
 
     VisionReader(transport::MultiBufferReader& src,
                  std::array<uint8_t, 16> user_uuid,
-                 VisionTrafficState& traffic,
-                 std::span<const uint8_t> initial = {});
+                 VisionTrafficState& traffic);
+    ~VisionReader() noexcept override {
+        ::SecureZeroMemory(user_uuid_.data(), user_uuid_.size());
+        ::SecureZeroMemory(header_.data(), header_.size());
+    }
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override;
 
@@ -79,6 +83,9 @@ public:
     VisionWriter(transport::MultiBufferWriter& dst,
                  std::array<uint8_t, 16> user_uuid,
                  VisionTrafficState& traffic);
+    ~VisionWriter() noexcept override {
+        ::SecureZeroMemory(user_uuid_.data(), user_uuid_.size());
+    }
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override;
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override;

@@ -328,8 +328,7 @@ void TestCancellationResume(vmess::Security security, uint8_t options,
     const size_t request_prefix = payload_size > buf::Buffer::kSize ? 1 : 0;
     Connection connection;
     connection.stream.PrependReadData(std::span<const uint8_t>(wire).first(request_prefix));
-    vmess::TimedUserValidator validator;
-    vmess::encoding::ServerSession session(validator, "cancellation-test");
+    vmess::encoding::ServerSession session("cancellation-test");
     session.SetRequest(request);
     auto reader = session.DecodeRequestBody(connection.stream);
 
@@ -370,8 +369,7 @@ void TestBatchCancellation(vmess::Security security, uint8_t options) {
     expected.insert(expected.end(), second_payload.begin(), second_payload.end());
 
     Connection connection;
-    vmess::TimedUserValidator validator;
-    vmess::encoding::ServerSession session(validator, "batch-cancellation-test");
+    vmess::encoding::ServerSession session("batch-cancellation-test");
     session.SetRequest(request);
     auto reader = session.DecodeRequestBody(connection.stream);
     memory::ByteVector prefix(first_wire.begin(), first_wire.end());
@@ -392,8 +390,7 @@ void TestTransportEOF(vmess::Security security, uint8_t options, size_t prefix_s
     const auto wire = encoder.Encode(payload);
     Connection connection;
     connection.stream.PrependReadData(std::span<const uint8_t>(wire).first(prefix_size));
-    vmess::TimedUserValidator validator;
-    vmess::encoding::ServerSession session(validator, "transport-eof-test");
+    vmess::encoding::ServerSession session("transport-eof-test");
     session.SetRequest(request);
     auto reader = session.DecodeRequestBody(connection.stream);
     CancelBlockedRead(connection, *reader, false);
@@ -422,8 +419,7 @@ void TestAuthenticationFailure(vmess::Security security, uint8_t options,
         : encoder.HeaderSize() + payload.size();
     wire[corrupt_offset] ^= 0x80;
     Connection connection;
-    vmess::TimedUserValidator validator;
-    vmess::encoding::ServerSession session(validator, "authentication-failure-test");
+    vmess::encoding::ServerSession session("authentication-failure-test");
     session.SetRequest(request);
     auto reader = session.DecodeRequestBody(connection.stream);
     connection.stream.PrependReadData(std::span<const uint8_t>(wire).first(1));
@@ -436,8 +432,7 @@ void TestAuthenticationFailure(vmess::Security security, uint8_t options,
     // Corrupted EOF chunk authentication tag must be rejected as connection_reset.
     {
         Connection eof_connection;
-        vmess::TimedUserValidator eof_validator;
-        vmess::encoding::ServerSession eof_session(eof_validator, "eof-auth-failure-test");
+        vmess::encoding::ServerSession eof_session("eof-auth-failure-test");
         eof_session.SetRequest(request);
         auto eof_reader = eof_session.DecodeRequestBody(eof_connection.stream);
         RequestEncoder eof_encoder(request);
@@ -498,8 +493,7 @@ void TestResponseAuthenticatedLength(vmess::Security security) {
         vmess::Option::GLOBAL_PADDING | vmess::Option::AUTHENTICATED_LENGTH;
     const auto request = MakeRequest(security, options, vmess::Command::TCP);
     Connection connection;
-    vmess::TimedUserValidator validator;
-    vmess::encoding::ServerSession session(validator, "response-length-test");
+    vmess::encoding::ServerSession session("response-length-test");
     session.SetRequest(request);
     auto writer = session.EncodeResponseBodyWithHeader(connection.stream);
     Check(writer != nullptr, "VMess response writer was not created");
@@ -570,8 +564,7 @@ memory::ByteVector MakeClientResponse(Connection& connection,
     memory::ByteVector header(connection.peer.available());
     Check(!header.empty() && net::read(connection.peer, net::buffer(header)) == header.size(),
           "VMess client request header was not written");
-    vmess::TimedUserValidator validator;
-    vmess::encoding::ServerSession server(validator, tag);
+    vmess::encoding::ServerSession server(tag);
     auto [request, consumed] = server.DecodeRequestHeader(header.data(), header.size());
     Check(request.has_value() && consumed == header.size(),
           "VMess server could not authenticate the client request");
@@ -735,7 +728,6 @@ void TestAuthenticatedHeaderFailure() {
     auto view = UserStore::PrepareWorkerView(snapshot);
     UserStore::CommitSnapshot(std::move(snapshot));
     UserStore::InstallWorkerView(std::move(view));
-    vmess::TimedUserValidator validator;
 
     for (int fault = 0; fault != 3; ++fault) {
         std::array<uint8_t, 49> plain{};
@@ -766,7 +758,7 @@ void TestAuthenticatedHeaderFailure() {
                   auth_id.data(), auth_id.size(), plain.data(), plain.size(),
                   wire.data() + 42, wire.data() + 42 + plain.size()), "failed to seal header");
         if (fault == 2) wire.back() ^= 1;
-        vmess::encoding::ServerSession session(validator, tag);
+        vmess::encoding::ServerSession session(tag);
         auto [request, consumed] = session.DecodeRequestHeader(wire.data(), wire.size());
         const auto* rejected = session.AuthenticatedRejectedHeader();
         if (fault == 0) {
@@ -801,8 +793,7 @@ void TestEmptyUdpWrite(vmess::Security security) {
         vmess::Option::GLOBAL_PADDING | vmess::Option::AUTHENTICATED_LENGTH;
     const auto request = MakeRequest(security, options, vmess::Command::UDP);
     Connection connection;
-    vmess::TimedUserValidator validator;
-    vmess::encoding::ServerSession session(validator, "empty-udp-test");
+    vmess::encoding::ServerSession session("empty-udp-test");
     session.SetRequest(request);
     auto writer = session.EncodeResponseBodyWithHeader(connection.stream);
     auto reject = [&](net::awaitable<void> operation) {
@@ -964,8 +955,7 @@ void TestWriteFailure(bool server_side, bool eof, IoErrorCode error,
     const std::array<uint8_t, 19> payload{0x41, 0x42, 0x43};
     const std::array<net::const_buffer, 1> buffers{net::buffer(payload)};
     vmess::encoding::ClientSession client(request.security, command);
-    vmess::TimedUserValidator validator;
-    vmess::encoding::ServerSession server(validator, "write-failure");
+    vmess::encoding::ServerSession server("write-failure");
     server.SetRequest(request);
     auto writer = server.EncodeResponseBodyWithHeader(stream);
     auto write = [&]() -> net::awaitable<void> {
@@ -1012,8 +1002,7 @@ void TestWriteEnd(bool server_side, vmess::Command command) {
     auto account = vmess::MemoryAccount::FromUUID("11111111-1111-4111-8111-111111111111");
     const auto auth_key = vmess::ExpandAuthIDEncryptKey(account->auth_key);
     vmess::encoding::ClientSession client(request.security, command);
-    vmess::TimedUserValidator validator;
-    vmess::encoding::ServerSession server(validator, "write-eof");
+    vmess::encoding::ServerSession server("write-eof");
     server.SetRequest(request);
     auto writer = server.EncodeResponseBodyWithHeader(connection.stream);
     const auto response = server_side ? memory::ByteVector{}
@@ -1289,8 +1278,7 @@ TEST(VmessUdpDatagram, LowerWriteClosedPreservesReverseRead) {
         const auto response = server_side ? memory::ByteVector{}
             : MakeClientResponse(
                   connection, client, *account, auth_key, request.target, request.command);
-        vmess::TimedUserValidator validator;
-        vmess::encoding::ServerSession server(validator, "lower-write-closed");
+        vmess::encoding::ServerSession server("lower-write-closed");
         server.SetRequest(request);
         auto writer = server.EncodeResponseBodyWithHeader(stream);
         const auto payload = MakePayload(17, 0x31);
@@ -1338,8 +1326,7 @@ TEST(VmessUdpDatagram, PreCancelledWritePreservesNextRecord) {
                     response = MakeClientResponse(
                         connection, client, *account, auth_key, request.target, command, &request);
                 }
-                vmess::TimedUserValidator validator;
-                vmess::encoding::ServerSession server(validator, "pre-cancel-write");
+                vmess::encoding::ServerSession server("pre-cancel-write");
                 server.SetRequest(request);
                 auto writer = server.EncodeResponseBodyWithHeader(connection.stream);
                 const memory::ByteVector payload(19, 0x63);
@@ -1419,7 +1406,7 @@ TEST(VmessUdpDatagram, PreCancelledWritePreservesNextRecord) {
                                           [](uint8_t byte) { return byte == 0x53; }),
                           "pre-cancelled VMess request damaged response keys");
                     TcpStream peer_stream(std::move(connection.peer));
-                    vmess::encoding::ServerSession peer(validator, "pre-cancel-request-peer");
+                    vmess::encoding::ServerSession peer("pre-cancel-request-peer");
                     peer.SetRequest(request);
                     auto reader = peer.DecodeRequestBody(peer_stream);
                     CheckPayload(ReadReady(connection, *reader), payload, request);

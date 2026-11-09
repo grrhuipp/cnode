@@ -58,8 +58,6 @@ inline PreparedShadowsocksUsers Users(size_t count, const ss::SsCipherInfo& ciph
     users.reserve(count);
     for (size_t i = 0; i < count; ++i) {
         PreparedShadowsocksUser user;
-        user.key_size = cipher.key_size;
-        user.salt_size = cipher.salt_size;
         user.derived_key.size = cipher.key_size;
         user.derived_key.bytes.fill(0x31);
         for (size_t byte = 0; byte < sizeof(i); ++byte)

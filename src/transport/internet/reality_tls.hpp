@@ -21,10 +21,8 @@ struct RealityClientState : memory::ThreadAllocated {
         OPENSSL_cleanse(auth_key.data(), auth_key.size());
         OPENSSL_cleanse(short_id.data(), short_id.size());
     }
-    std::array<uint8_t, 32> server_public{};
     transport::internet::RealityShortId short_id{};
     std::array<uint8_t, 32> auth_key{};
-    memory::ThreadLocalString server_name;
     memory::ThreadLocalString spider_x;
     const MLDSA65_public_key* mldsa65_verify_key = nullptr;
     memory::ByteVector client_hello_raw;
@@ -52,5 +50,5 @@ void ClearRealityServerConnState(SSL* ssl) noexcept;
 
 [[nodiscard]] std::unique_ptr<RealityServerConnState>
 VerifyRealityClientHello(
-    std::span<const uint8_t> handshake,
+    memory::ByteVector handshake,
     const SslContext& ctx);

@@ -46,14 +46,7 @@ public:
         QuicListener& listener, SocketState& socket,
         const udp::endpoint& remote, const ngtcp2_pkt_hd& header);
 
-    ~Connection() noexcept {
-        Close();
-        fragments_ = {};
-        connection_ids_ = {};
-        core_.reset();
-        base_context_.inbound = session::Inbound(memory::worker_pool_resource());
-        base_context_.content = session::Content(memory::worker_pool_resource());
-    }
+    ~Connection() noexcept { Close(); }
 
     Connection(const Connection&) = delete;
     Connection& operator=(const Connection&) = delete;
@@ -69,8 +62,7 @@ public:
     [[nodiscard]] bool Closed() const noexcept { return closed_; }
     [[nodiscard]] bool Retired() const noexcept { return retired_; }
     void Close() noexcept;
-    [[nodiscard]] net::any_io_executor Executor() const { return reactor_.get_executor(); }
-    [[nodiscard]] net::io_context& Reactor() const noexcept { return reactor_; }
+    [[nodiscard]] net::io_context& Reactor() const noexcept;
     [[nodiscard]] bool Authenticated() const noexcept { return authenticated_; }
     // Physical admission starts when the connection is accepted and resolves
     // before any credential is evaluated, as on the TCP path.
@@ -116,7 +108,6 @@ private:
             if (http) nghttp3_conn_del(http);
             if (ssl) SSL_free(ssl);
         }
-        QuicMemory memory;
         ngtcp2_conn* quic = nullptr;
         nghttp3_conn* http = nullptr;
         SSL* ssl = nullptr;
@@ -241,11 +232,10 @@ private:
         const ngtcp2_path*, ngtcp2_path_validation_result, void*);
 
     QuicListener* listener_;
-    net::io_context& reactor_;
     memory::ThreadLocalVector<ConnectionId> connection_ids_;
     AwaitableTaskGroup* tasks_ = nullptr;
     SignalChannel closed_signal_;
-    std::unique_ptr<Core> core_;
+    std::optional<Core> core_;
     session::Context base_context_;
     SignalChannel physical_ready_;
     ConnectionLimiter::Reservation physical_reservation_;

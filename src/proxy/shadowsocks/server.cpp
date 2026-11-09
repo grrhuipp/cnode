@@ -69,8 +69,8 @@ public:
                        const KeyBytes& request_salt,
                        AsyncStream& stream)
         : cipher_type_(cipher_info.type)
-        , key_size_(user.key_size)
-        , salt_size_(user.salt_size)
+        , key_size_(cipher_info.key_size)
+        , salt_size_(cipher_info.salt_size)
         , request_salt_(request_salt)
         , is_2022_(Is2022Cipher(cipher_info.type)) {
         if (user.derived_key.size <= master_key_.size()) {
@@ -89,128 +89,11 @@ public:
     ResponseBodyWriter(ResponseBodyWriter&&) = delete;
     ResponseBodyWriter& operator=(ResponseBodyWriter&&) = delete;
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
-        if (!stream_) {
-            throw IoSystemError(io_error::not_connected, "Shadowsocks response writer has no stream");
-        }
-        if (write_finished_) throw transport::WriteClosed();
-        auto& state = *this;
-        AsyncStream& stream = *stream_;
-
-        if (mb.byte_size() == 0) co_return;
-
-        const auto cancellation = co_await net::this_coro::cancellation_state;
-        if (cancellation.cancelled() != net::cancellation_type::none) {
-            throw IoSystemError(io_error::operation_aborted);
-        }
-        const uint64_t initial_nonce = write_nonce_;
-        try {
-            if (!state.write_init_) {
-                if (!state.is_2022_) {
-                    if (!InitResponseCipher(state)) {
-                        ThrowSsWriteError("Shadowsocks server init write cipher failed");
-                    }
-                } else {
-                    auto first_plain = state.FirstChunkView(mb);
-                    const auto first_plain_bytes = first_plain.Bytes();
-                    if (!InitResponseCipher2022(state, first_plain_bytes)) {
-                        ThrowSsWriteError("Shadowsocks server init write cipher failed");
-                    }
-                    state.skip_first_bytes_ = first_plain_bytes.size();
-                }
-            }
-
-            buf::MultiBuffer out_mb;
-            out_mb.reserve(mb.size());
-            for (auto* buf : mb) {
-                auto bytes = buf->Bytes();
-                if (bytes.empty()) continue;
-                detail::EncryptToMultiBuffer(
-                    *state.write_cipher_,
-                    state.write_nonce_,
-                    bytes,
-                    out_mb,
-                    &state.skip_first_bytes_);
-            }
-            mb.clear();
-
-            co_await state.FlushPendingAndWrite(stream, std::move(out_mb));
-        } catch (const transport::WriteClosed&) {
-            Finish();
-            throw;
-        } catch (const std::bad_alloc&) {
-            if (write_nonce_ != initial_nonce) Retire();
-            throw;
-        } catch (...) {
-            Retire();
-            throw;
-        }
+        co_await WriteEncrypted(mb, true);
     }
 
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
-        if (!stream_) {
-            throw IoSystemError(io_error::not_connected, "Shadowsocks response writer has no stream");
-        }
-        if (write_finished_) throw transport::WriteClosed();
-        auto& state = *this;
-        AsyncStream& stream = *stream_;
-
-        bool has_data = false;
-        for (const net::const_buffer& buffer : buffers) {
-            if (buffer.data() && buffer.size() > 0) {
-                has_data = true;
-                break;
-            }
-        }
-        if (!has_data) co_return;
-
-        const auto cancellation = co_await net::this_coro::cancellation_state;
-        if (cancellation.cancelled() != net::cancellation_type::none) {
-            throw IoSystemError(io_error::operation_aborted);
-        }
-        const uint64_t initial_nonce = write_nonce_;
-        try {
-            if (!state.write_init_) {
-                if (!state.is_2022_) {
-                    if (!InitResponseCipher(state)) {
-                        ThrowSsWriteError("Shadowsocks server init write cipher failed");
-                    }
-                } else {
-                    auto first_plain = state.FirstChunkView(buffers);
-                    const auto first_plain_bytes = first_plain.Bytes();
-                    if (!InitResponseCipher2022(state, first_plain_bytes)) {
-                        ThrowSsWriteError("Shadowsocks server init write cipher failed");
-                    }
-                    state.skip_first_bytes_ = first_plain_bytes.size();
-                }
-            }
-
-            buf::MultiBuffer out_mb;
-            out_mb.reserve(buffers.size());
-            for (const net::const_buffer& buffer : buffers) {
-                const auto* data = static_cast<const uint8_t*>(buffer.data());
-                const size_t size = buffer.size();
-                if (!data || size == 0) {
-                    continue;
-                }
-                detail::EncryptToMultiBuffer(
-                    *state.write_cipher_,
-                    state.write_nonce_,
-                    std::span<const uint8_t>{data, size},
-                    out_mb,
-                    &state.skip_first_bytes_);
-            }
-
-            co_await state.FlushPendingAndWrite(stream, std::move(out_mb));
-        } catch (const transport::WriteClosed&) {
-            Finish();
-            throw;
-        } catch (const std::bad_alloc&) {
-            if (write_nonce_ != initial_nonce) Retire();
-            throw;
-        } catch (...) {
-            Retire();
-            throw;
-        }
+        co_await WriteEncrypted(buffers, false);
     }
 
     net::awaitable<void> AsyncShutdownWrite() override {
@@ -287,18 +170,35 @@ private:
         }
     };
 
-    FirstChunk FirstChunkView(const buf::MultiBuffer& mb) const {
+    [[nodiscard]] static std::span<const uint8_t> ChunkBytes(const buf::Buffer* buffer) noexcept {
+        return buffer ? buffer->Bytes() : std::span<const uint8_t>{};
+    }
+
+    [[nodiscard]] static std::span<const uint8_t> ChunkBytes(const net::const_buffer& buffer) noexcept {
+        const auto* data = static_cast<const uint8_t*>(buffer.data());
+        return data ? std::span<const uint8_t>(data, buffer.size()) : std::span<const uint8_t>{};
+    }
+
+    template <typename BufferRange>
+    FirstChunk FirstChunkView(const BufferRange& buffers) const {
         FirstChunk first;
-        const size_t want = std::min(mb.byte_size(), kStreamChunkPayloadSize);
+        size_t want = 0;
+        for (const auto& buffer : buffers) {
+            want += ChunkBytes(buffer).size();
+            if (want >= kStreamChunkPayloadSize) {
+                want = kStreamChunkPayloadSize;
+                break;
+            }
+        }
         if (want == 0) {
             return first;
         }
 
-        for (auto* buffer : mb) {
-            if (!buffer || buffer->IsEmpty()) {
+        for (const auto& buffer : buffers) {
+            const auto bytes = ChunkBytes(buffer);
+            if (bytes.empty()) {
                 continue;
             }
-            const auto bytes = buffer->Bytes();
             if (bytes.size() >= want) {
                 first.direct = bytes.first(want);
                 return first;
@@ -307,11 +207,11 @@ private:
         }
 
         first.storage.reserve(want);
-        for (auto* buffer : mb) {
-            if (!buffer || buffer->IsEmpty() || first.storage.size() >= want) {
+        for (const auto& buffer : buffers) {
+            const auto bytes = ChunkBytes(buffer);
+            if (bytes.empty() || first.storage.size() >= want) {
                 continue;
             }
-            const auto bytes = buffer->Bytes();
             const size_t n = std::min(bytes.size(), want - first.storage.size());
             first.storage.insert(
                 first.storage.end(),
@@ -321,46 +221,73 @@ private:
         return first;
     }
 
-    FirstChunk FirstChunkView(std::span<const net::const_buffer> buffers) const {
-        FirstChunk first;
-        size_t total = 0;
-        for (const net::const_buffer& buffer : buffers) {
-            total += buffer.size();
-            if (total >= kStreamChunkPayloadSize) {
-                total = kStreamChunkPayloadSize;
+    template <typename BufferRange>
+    net::awaitable<void> WriteEncrypted(BufferRange& buffers, bool clear_after_encrypt) {
+        if (!stream_) {
+            throw IoSystemError(io_error::not_connected, "Shadowsocks response writer has no stream");
+        }
+        if (write_finished_) throw transport::WriteClosed();
+        AsyncStream& stream = *stream_;
+
+        bool has_data = false;
+        for (const auto& buffer : buffers) {
+            if (!ChunkBytes(buffer).empty()) {
+                has_data = true;
                 break;
             }
         }
-        if (total == 0) {
-            return first;
-        }
+        if (!has_data) co_return;
 
-        for (const net::const_buffer& buffer : buffers) {
-            if (!buffer.data() || buffer.size() == 0) {
-                continue;
-            }
-            if (buffer.size() >= total) {
-                first.direct = std::span<const uint8_t>(
-                    static_cast<const uint8_t*>(buffer.data()),
-                    total);
-                return first;
-            }
-            break;
+        const auto cancellation = co_await net::this_coro::cancellation_state;
+        if (cancellation.cancelled() != net::cancellation_type::none) {
+            throw IoSystemError(io_error::operation_aborted);
         }
+        const uint64_t initial_nonce = write_nonce_;
+        try {
+            if (!write_init_) {
+                if (!is_2022_) {
+                    if (!InitResponseCipher(*this)) {
+                        ThrowSsWriteError("Shadowsocks server init write cipher failed");
+                    }
+                } else {
+                    auto first_plain = FirstChunkView(buffers);
+                    const auto first_plain_bytes = first_plain.Bytes();
+                    if (!InitResponseCipher2022(*this, first_plain_bytes)) {
+                        ThrowSsWriteError("Shadowsocks server init write cipher failed");
+                    }
+                    skip_first_bytes_ = first_plain_bytes.size();
+                }
+            }
 
-        first.storage.reserve(total);
-        for (const net::const_buffer& buffer : buffers) {
-            if (!buffer.data() || buffer.size() == 0 || first.storage.size() >= total) {
-                continue;
+            buf::MultiBuffer out_mb;
+            out_mb.reserve(buffers.size());
+            for (const auto& buffer : buffers) {
+                const auto bytes = ChunkBytes(buffer);
+                if (bytes.empty()) continue;
+                detail::EncryptToMultiBuffer(
+                    *write_cipher_,
+                    write_nonce_,
+                    bytes,
+                    out_mb,
+                    &skip_first_bytes_);
             }
-            const auto* data = static_cast<const uint8_t*>(buffer.data());
-            const size_t n = std::min(buffer.size(), total - first.storage.size());
-            first.storage.insert(
-                first.storage.end(),
-                data,
-                data + static_cast<std::ptrdiff_t>(n));
+            if constexpr (std::is_same_v<std::remove_cvref_t<BufferRange>, buf::MultiBuffer>) {
+                if (clear_after_encrypt) {
+                    buffers.clear();
+                }
+            }
+
+            co_await FlushPendingAndWrite(stream, std::move(out_mb));
+        } catch (const transport::WriteClosed&) {
+            Finish();
+            throw;
+        } catch (const std::bad_alloc&) {
+            if (write_nonce_ != initial_nonce) Retire();
+            throw;
+        } catch (...) {
+            Retire();
+            throw;
         }
-        return first;
     }
 
     net::awaitable<void> FlushPendingAndWrite(

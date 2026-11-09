@@ -236,8 +236,7 @@ TEST_P(ProtocolDomainTest, VmessAuthenticatedRequestHeader) {
     const size_t header_size = wire.size();
     wire.insert(wire.end(), kPayload.begin(), kPayload.end());
 
-    vmess::TimedUserValidator validator;
-    vmess::encoding::ServerSession session(validator, VmessUsers::kTag);
+    vmess::encoding::ServerSession session(VmessUsers::kTag);
     const auto prefix = session.DecodeRequestHeader(wire.data(), 42);
     EXPECT_FALSE(prefix.first);
     EXPECT_EQ(session.RequiredHeaderBytes(), header_size);

@@ -44,62 +44,6 @@ namespace {
 
 using ::vless::VlessBufferedReader;
 
-class VlessUdpReader final : public transport::MultiBufferReader {
-public:
-    transport::CancellationSource& Cancellation() noexcept override { return src_.Cancellation(); }
-
-    VlessUdpReader(transport::MultiBufferReader& src,
-                   TargetAddress target,
-                   bool packet_addr)
-        : src_(src)
-        , target_(std::move(target))
-        , framer_(packet_addr) {}
-
-    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
-        return framer_.ReadDatagram(src_, target_);
-    }
-
-private:
-    transport::MultiBufferReader& src_;
-    TargetAddress target_;
-    ::vless::UdpFramer framer_;
-};
-
-class VlessUdpWriter final : public transport::MultiBufferWriter {
-public:
-    VlessUdpWriter(transport::MultiBufferWriter& dst, bool packet_addr)
-        : dst_(dst)
-        , packet_addr_(packet_addr) {}
-
-    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
-        return ::vless::WriteUdpDatagram(
-            dst_, std::move(mb), packet_addr_);
-    }
-
-    net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
-        if (packet_addr_) {
-            throw IoSystemError(
-                io_error::invalid_argument,
-                "packet-address VLESS UDP write requires a target");
-        }
-        // Without packet addresses the frame carries no target bytes.
-        co_await ::vless::WriteUdpDatagram(
-            dst_, TargetAddress{}, false, buffers);
-    }
-
-    net::awaitable<void> AsyncShutdownWrite() override {
-        return dst_.AsyncShutdownWrite();
-    }
-
-    bool WriteShutdownClosesLink() const noexcept override {
-        return dst_.WriteShutdownClosesLink();
-    }
-
-private:
-    transport::MultiBufferWriter& dst_;
-    bool packet_addr_ = false;
-};
-
 // Coalesces the fixed response header into the first downstream write.
 class VlessResponseHeaderWriter final : public transport::MultiBufferWriter {
 public:
@@ -436,7 +380,7 @@ proxy::vless::inbound::Handler::Handler(
     ConnectionLimiter* limiter,
     std::shared_ptr<const ::vless::VlessEncryptionConfig> decryption)
     : validator_(validator)
-    , stats_(&stats)
+    , stats_(stats)
     , limiter_(limiter)
     , decryption_(std::move(decryption)) {}
 
@@ -454,7 +398,7 @@ proxy::vless::inbound::Handler::Process(
     const std::string_view tag = ctx.inbound.tag;
     const std::string_view client_ip = ctx.inbound.source_ip;
     auto fail_abortive = [&](ErrorCode error) {
-        return proxy::RejectInbound(*stats_, stream.get(), error);
+        return proxy::RejectInbound(stats_, stream.get(), error);
     };
 
     if (co_await proxy::CheckInboundIpBanned(limiter_, ctx)) {
@@ -511,18 +455,17 @@ proxy::vless::inbound::Handler::Process(
             receiver.dispatch_policy,
             limiter_,
             ctx,
-            *stats_,
+            stats_,
             timeouts,
             pressure_idle_timeout);
     }
 
     if (net == Network::UDP) {
-        VlessUdpReader udp_reader(
-            *active_reader, ctx.outbound.target, packet_addr_udp);
-        VlessUdpWriter udp_writer(*active_writer, packet_addr_udp);
+        ::vless::UdpStreamEndpoint udp_endpoint(
+            *active_reader, *active_writer, ctx.outbound.target, packet_addr_udp);
         InitialPayload first_datagram;
         if (packet_addr_udp) {
-            auto packet = co_await udp_reader.ReadMultiBuffer();
+            auto packet = co_await udp_endpoint.ReadMultiBuffer();
             if (packet.empty()) co_return RelayResult{};
             const auto datagram = buf::InspectUdpDatagram(packet);
             if (!datagram.Valid() || !datagram.target || !datagram.target->IsValid())
@@ -536,10 +479,10 @@ proxy::vless::inbound::Handler::Process(
             io_context,
             receiver.dispatch_policy,
             std::move(stream),
-            transport::Link{&udp_reader, &udp_writer},
+            transport::Link{&udp_endpoint, &udp_endpoint},
             std::move(first_datagram),
             ctx,
-            *stats_,
+            stats_,
             timeouts);
     }
 
@@ -558,7 +501,7 @@ proxy::vless::inbound::Handler::Process(
             transport::Link{&vision_reader, &vision_writer},
             InitialPayload{},
             ctx,
-            *stats_,
+            stats_,
             timeouts);
     }
 
@@ -569,7 +512,7 @@ proxy::vless::inbound::Handler::Process(
         transport::Link{active_reader, active_writer},
         InitialPayload{},
         ctx,
-        *stats_,
+        stats_,
         timeouts);
 }
 
@@ -603,10 +546,7 @@ const bool kVlessInboundRegistered = [] {
     ::proxyman::inbound::ProxyRegistration reg;
     reg.user_protocol = ::proxyman::inbound::UserProtocol::Vless;
 
-    reg.create_runtime = []() -> std::unique_ptr<
-        ::proxyman::inbound::ProtocolRuntime> {
-        return std::make_unique<::proxy::UserOnlineProtocolRuntime>();
-    };
+    reg.create_runtime = &::proxy::CreateUserOnlineProtocolRuntime;
 
     reg.create_tcp_handler =
         [](::proxyman::inbound::ProtocolRuntime& runtime,
@@ -614,13 +554,13 @@ const bool kVlessInboundRegistered = [] {
            ::ConnectionLimiter* limiter,
            const ::proxyman::inbound::BuildRequest& req)
             -> std::unique_ptr<::Inbound> {
-            auto* vless_runtime = dynamic_cast<::proxy::UserOnlineProtocolRuntime*>(&runtime);
+            auto* tracker = runtime.OnlineTracker();
             const auto* settings = GetVlessSettings(req);
-            if (!vless_runtime || !settings) {
+            if (!tracker || !settings) {
                 return nullptr;
             }
             return std::make_unique<::proxy::vless::inbound::Handler>(
-                vless_runtime->validator,
+                *tracker,
                 stats,
                 limiter,
                 settings->decryption);

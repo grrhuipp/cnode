@@ -301,8 +301,7 @@ VerifyInboundCredential(
     return result;
 }
 
-template <typename Tracker = ::UserOnlineTracker>
-class InboundTrackerRuntime final : public ::proxyman::inbound::ProtocolRuntime {
+class UserOnlineProtocolRuntime final : public ::proxyman::inbound::ProtocolRuntime {
 public:
     [[nodiscard]] std::vector<::OnlineDevice>
     GetOnlineDevices(std::string_view tag) const override {
@@ -312,9 +311,8 @@ public:
     [[nodiscard]] ::UserOnlineTracker* OnlineTracker() noexcept override {
         return &validator;
     }
-    Tracker validator;
+    ::UserOnlineTracker validator;
 };
-using UserOnlineProtocolRuntime = InboundTrackerRuntime<::UserOnlineTracker>;
 
 [[nodiscard]] inline std::unique_ptr<::proxyman::inbound::ProtocolRuntime>
 CreateUserOnlineProtocolRuntime() {

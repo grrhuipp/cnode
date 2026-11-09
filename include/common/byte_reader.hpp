@@ -18,6 +18,12 @@
                                  static_cast<uint16_t>(in[1]));
 }
 
+[[nodiscard]] constexpr uint32_t LoadU24BE(const uint8_t* in) noexcept {
+    return (static_cast<uint32_t>(in[0]) << 16) |
+           (static_cast<uint32_t>(in[1]) << 8) |
+           static_cast<uint32_t>(in[2]);
+}
+
 [[nodiscard]] constexpr uint32_t LoadU32BE(const uint8_t* in) noexcept {
     return (static_cast<uint32_t>(in[0]) << 24) |
            (static_cast<uint32_t>(in[1]) << 16) |
@@ -32,6 +38,12 @@
 constexpr void StoreU16BE(uint8_t* out, uint16_t value) noexcept {
     out[0] = static_cast<uint8_t>(value >> 8);
     out[1] = static_cast<uint8_t>(value);
+}
+
+constexpr void StoreU24BE(uint8_t* out, uint32_t value) noexcept {
+    out[0] = static_cast<uint8_t>(value >> 16);
+    out[1] = static_cast<uint8_t>(value >> 8);
+    out[2] = static_cast<uint8_t>(value);
 }
 
 constexpr void StoreU32BE(uint8_t* out, uint32_t value) noexcept {
@@ -53,6 +65,14 @@ constexpr void StoreU64BE(uint8_t* out, uint64_t value) noexcept {
         ++size;
     }
     return size;
+}
+
+[[nodiscard]] constexpr size_t QuicVarintSize(uint64_t value) noexcept {
+    if (value <= 63) return 1;
+    if (value <= 16383) return 2;
+    if (value <= 1073741823) return 4;
+    if (value <= 4611686018427387903ULL) return 8;
+    return 0;
 }
 
 class ByteReader {
@@ -85,11 +105,38 @@ public:
         return result;
     }
 
+    [[nodiscard]] uint32_t ReadU24BE() noexcept {
+        if (!CanRead(3)) return 0;
+        const uint32_t result = LoadU24BE(data_ + pos_);
+        pos_ += 3;
+        return result;
+    }
+
     [[nodiscard]] uint32_t ReadU32BE() noexcept {
         if (!CanRead(4)) return 0;
         const uint32_t result = LoadU32BE(data_ + pos_);
         pos_ += 4;
         return result;
+    }
+
+    [[nodiscard]] uint64_t ReadU64BE() noexcept {
+        if (!CanRead(8)) return 0;
+        const uint64_t result = LoadU64BE(data_ + pos_);
+        pos_ += 8;
+        return result;
+    }
+
+    [[nodiscard]] std::optional<uint64_t> ReadQuicVarint() noexcept {
+        if (!CanRead(1)) return std::nullopt;
+        const uint8_t first = data_[pos_];
+        const size_t width = size_t{1} << (first >> 6);
+        if (!CanRead(width)) return std::nullopt;
+        uint64_t value = first & 0x3fu;
+        for (size_t i = 1; i < width; ++i) {
+            value = (value << 8) | data_[pos_ + i];
+        }
+        pos_ += width;
+        return value;
     }
 
     [[nodiscard]] std::optional<uint64_t> ReadVarintU64() noexcept {

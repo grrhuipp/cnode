@@ -1492,3 +1492,39 @@ CI失败场景修复后通过真实双进程、ML-KEM/X25519加密和回环对�
 - **TCP 接收与发送基准（`cnode_tcp_receive_benchmark` / `cnode_tcp_send_benchmark`）**：
   - `tcp-receive 1B`：单次 burst 墙钟耗时由 `9,999.3 / 9,900.3 ns` 降至 **`9,888.2 / 9,786.8 ns`（-1.1%）**，CPU 耗时由 `7,682.5 / 7,574.1 ns` 降至 **`7,602.5 / 7,493.2 ns`**。
   - `tcp-send 1B`：单次 burst 墙钟耗时由 `6,310.0 / 6,276.2 ns` 降至 **`6,276.0 / 6,260.8 ns`**；`8192B (1 piece)` 由 `10,355.0 / 10,192.8 ns` 降至 **`10,251.1 / 10,137.5 ns`**；`8192B (16 pieces)` 由 `11,372.3 / 11,228.2 ns` 降至 **`11,190.3 / 11,220.7 ns`**。
+
+## 2026-11-09（第七轮）：跨线程内存/借用防线加固、QUIC/REALITY/VLESS/SS 热路径瘦身、`ConnectionLimiter` 短路与 37 个碎片文件内聚
+
+### 架构与流程精简内容
+
+1. **跨线程内存池与借用安全防线加固 + `ConnectionLimiter` 默认零限额热路径短路**：
+   - `src/proxy/vless/vless_encryption_runtime.cpp`（合入原 `vless_ticket_service.cpp`）：将跨线程投递至主控线程 `coordinator->Services()` 的 `StoreKey::tag` 与 `TicketDirectoryService::stores_` 从 Worker 专属的 `memory::ThreadLocalString` / `ThreadLocalUnorderedMap` 修正为 `std::string` / `std::unordered_map`（消除长标签跨线程释放触发 `worker_memory::Deallocate` 终止隐患），并删除全仓仅此一处调用的 `GroupCoordinator::WorkerIdForContext`。
+   - `src/transport/internet/xhttp_session.cpp`：`ResolveXHttpSessionOwner` 在 `access != XHttpSessionAccess::Open` 时优先同步查询本 Worker 的 `XHttpSessionTable`（命中则零跨线程 `PostCall` 直接返回），需要跨线程调用 `coordinator->PostCall` 时将 `session_namespace` 与 `session_id` 转为 `std::string` 按值捕获，消除协程取消时悬垂 `std::string_view`。
+   - `include/app/rate_limiter.hpp`：当默认配置未启用全局连接限额/单 IP 限额及封禁检查时，`ReservePhysical` 与 `Reserve` 直接零分配、零跨线程 `PostCall`、零断开时 `eventfd` 回收返回 `Admission{RejectReason::NONE, {}}`；`Family` 仅在 `TracksGlobalConnections()` 为真时分配。
+2. **Hysteria/QUIC、REALITY、WebSocket 与嗅探层热路径瘦身及编解码统一**：
+   - `src/transport/internet/hysteria/*`：`QuicMemory` 内联并提供进程级静态 `QuicMemory::Ngtcp2()` / `QuicMemory::Nghttp3()`，删除每条 `Connection::Core` 上的 80B `memory` 成员；`Connection::core_` 由 `std::unique_ptr<Core>` 改为原位 `std::optional<Core>`（消除每条 QUIC 连接的额外堆分配与二次指针解引用）；删除 `Connection::reactor_`、`Executor()` 与零生产调用的 `EncodeV2TcpResponse`；`V1ClientHello::auth`、`EncodeV1ServerHello`、`EncodeV1Response` 改用 Worker PMR 分配器；`StartRawStream` 优先使用 `input.PrefixSpan` 零拷贝解析；`QuicStreamState` 提取 `Abort(bool)` 并补齐 `input_.ReleaseIfIdle()`。
+   - `src/transport/internet/reality_*`、`tls_stream.*`、`ws_stream.*`、`tcp_stream.*`：`RealityClientHelloReader::TakeHello()` 按值移动 `handshake` 进入 `VerifyRealityClientHello`（消除每次 REALITY 入站握手的整包二次分配与拷贝）；删除 `RealityClientState::server_public`（32B）、`server_name`（32B）、`DetachedTlsState::handshake_done`、`DetachedTcpState::nonblocking`、`TcpStream::PrepareTlsIo()`、`DatagramSocket::NativeHandle()` 与 `TimeoutEvent::ScheduleAfter(delay, context)`；`BaseWsStream` 提取 `ConsumePayloadBytes` 并收敛 `AcquireWrite()`。
+   - `include/common/byte_reader.hpp`、`src/sniff/*`：新增 `LoadU24BE`、`StoreU24BE`、`QuicVarintSize`、`ByteReader::ReadU24BE()`、`ReadU64BE()`、`ReadQuicVarint()`；统一 `tls_sniffer`（提取 `ReadRecordHeader`）、`quic_sniffer`、`http_sniffer`（复用公开的 `TargetAddress::ParsePort`）、`hysteria_protocol`、`http2_session`（`GrpcHunkPrefix`）与 `vless_codec` 的大端整数与 Varint 编解码。
+3. **VLESS、VMess、Shadowsocks、UoT 核心去重与瘦身**：
+   - `src/proxy/vless/*`：`VlessEncryptionWriter::WriteBuffers` 直接将多段输入拼入 `frame_buffer` 的明文偏移区并原地 `SealVlessEncryptionRecord`（消除 8KB `Buffer::New()` 中转借用、`memcpy` 与 `OPENSSL_cleanse`）；握手协程在派生读写密钥后立即释放 1.2KB PFS 状态；在 `udp_framing.hpp` 中提取统一的 `vless::UdpStreamEndpoint` 替代 `VlessUdpReader` / `VlessUdpWriter`；`VisionReader`/`VisionWriter` 补齐析构密钥擦除并避免非 TLS 流逐字节扫描。
+   - `src/proxy/vmess/*`、`src/proxy/inbound_admission.hpp`：移除无状态空类 `TimedUserValidator` 与单调用方模板 `InboundTrackerRuntime`，统一 `vmess`/`vless`/`ss` 入站 `create_runtime` 与 `runtime.OnlineTracker()`（消除全部 4 处 `dynamic_cast`）；修复 `FindByAuthIDForTag` 热点缓存回退重复解密并在 `Touch` 前保存局部指针防自别名覆盖。
+   - `src/proxy/shadowsocks/*`、`src/proxy/uot/uot.cpp`：统一 `ss::KeyBytes` 与 `PreparedKeyBytes`，删除 `PreparedShadowsocksUser::key_size` / `salt_size`（每 SS 用户减少 16B 常驻内存）；合并 `RequestBodyWriter` 与 `ResponseBodyWriter` 重复的 `WriteMultiBuffer` / `WriteBuffers` / `FirstChunkView` 实现；`uot::PacketReader::ReadMultiBuffer` 消除跨 `co_await` 的 780B `header_bytes` 栈数组。
+4. **37 个单用途碎片文件内聚与启动期静态用户释放**：
+   - 内联并删除 37 个冗余碎片 `.cpp` / `.hpp` 文件（含 `bootstrap_setup/runtime/monitor`、`startup_inbounds`、`controller/control.cpp`、`controller_impl.hpp`、`journal_executor.hpp`、`node_runtime.*`、`panel_node_ids.*`、`outbound_source_config.cpp`、`routing_ip_network.cpp`、`config_validation.cpp`、`sniffer.cpp`、`tls_server_name.cpp`、`reality_short_id.cpp`、`reality_client_version.cpp`、`reality_key_share.cpp`、`quic_memory.cpp`、`vless/credentials.cpp`、`vless_ticket_service.cpp`、`vmess/account.cpp`、`vmess/types.hpp`、`vmess/aead/*`、`ss_outbound_uot.*`、`ss_outbound_credentials.*`、`anytls_outbound_settings.*`）；在启动期 `UserStore::CommitSnapshot` 后立即释放静态入站 `PreparedInbound::users`。
+
+### 验证与性能/内存实证
+
+全量 **1,251/1,251** 测试通过（325 项 unit、926 项 E2E）。在同一环境与编译选项下执行 A/B/A/B 交错重复基准对照：
+
+- **64 活跃 VLESS 会话内存占用与统计采样（`cnode_runtime_sampling_benchmark`）**：
+  - **`resources=0`**：进程峰值 RSS（`process_peak_rss_bytes`）由 `14,716,928 / 16,809,984 B` 稳定降至 **`14,635,008 / 14,639,104 B`（减少 80 KiB ~ 2.07 MiB）**，采样延迟由 `68.68 / 83.09 ns` 降至 **`68.29 / 68.37 ns`**（`p50 = 30.0 ns`，`p95 = 40.0 ns`），0 次堆分配。
+  - **`resources=1`**：进程峰值 RSS 由 `15,163,392 / 17,252,352 B` 稳定降至 **`15,122,432 / 15,130,624 B`（减少 40 KiB ~ 2.02 MiB）**，活跃会话匿名内存由 `7,651,328 / 9,740,288 B` 降至 **`7,626,752 / 7,634,944 B`（减少 16 ~ 24 KiB）**。
+- **VLESS/TLS 真实进程基准（`cnode_tls_throughput_benchmark`）**：
+  - **`Download1` / `Download8`**：`Download1` 传输完成峰值 RSS 由 `14,143,488 / 14,168,064 B` 稳定降至 **`14,082,048 / 14,073,856 B`（减少 60 ~ 92 KiB）**；`Download8` 传输完成峰值 RSS 由 `14,581,760 / 14,561,280 B` 稳定降至 **`14,553,088 / 14,512,128 B`（减少 28 ~ 48 KiB）**，守护进程总 CPU 降至 **`0.1488 / 0.1415s`**。
+  - **`Upload1` / `Upload8`**：`Upload1` 传输完成峰值 RSS 由 `14,135,296 / 14,139,392 B` 稳定降至 **`14,065,664 / 14,073,856 B`（减少 64 ~ 68 KiB）**，单流上传吞吐升至 **`812.92 MiB/s`（+3.0%）**；`Upload8` 传输完成峰值 RSS 由 `14,376,960 / 14,376,960 B` 稳定降至 **`14,315,520 / 14,303,232 B`（减少 60 ~ 72 KiB）**，守护进程总 CPU 由 `0.1575 / 0.1576s` 稳定降至 **`0.1468 / 0.1525s`（-3.2% ~ -6.8%）**，上传吞吐达 **`701.13 / 665.77 MiB/s`**。
+- **Hysteria2 四 Worker 真实进程基准（`cnode_hysteria_throughput_benchmark`）**：
+  - **256 连接下载**：建连耗时由 `0.524 / 0.513s` 稳定降至 **`0.508 / 0.506s`**；全部连接空闲回收后驻留匿名内存由 `11,554,816 / 11,509,760 B` 稳定降至 **`11,386,880 / 11,239,424 B`（减少 164 ~ 264 KiB）**，吞吐升至 **`64.79 MiB/s`**。
+  - **16×64（1,024 流）上传与下载**：上传吞吐由 `56.53 / 55.83 MiB/s` 稳定升至 **`57.19 / 57.07 MiB/s`（+1.2% ~ +2.2%）**，守护进程 CPU 由 `3.792 / 4.035s` 降至 **`3.808 / 3.777s`**，进程高水位峰值（`vm_hwm_bytes`）由 `47,689,728 / 47,689,728 B` 稳定降至 **`46,972,928 / 46,968,832 B`（减少 700 ~ 704 KiB）**；下载吞吐由 `34.58 / 35.59 MiB/s` 升至 **`35.94 / 35.25 MiB/s`**，进程高水位峰值由 `359,636,992 / 357,539,840 B` 降至 **`358,789,120 / 357,216,256 B`（减少 316 ~ 828 KiB）**。
+- **TCP 接收与发送基准（`cnode_tcp_receive_benchmark` / `cnode_tcp_send_benchmark`）**：
+  - `tcp-send 1B`：单次 burst 墙钟耗时由 `6,298.4 / 6,306.5 ns` 稳定降至 **`6,259.3 / 6,266.1 ns`**，CPU 耗时由 `4,141.0 / 4,134.0 ns` 稳定降至 **`4,082.8 / 4,085.0 ns`（-1.2% ~ -1.4%）**；`65536B (16 pieces)` 第 2 轮墙钟耗时由 `47,243.4 ns` 降至 **`43,166.8 ns`（-8.6%）**。
+  - `tcp-receive 8192B`：第 1 轮墙钟耗时由 `11,334.5 ns` 降至 **`11,120.3 ns`（-1.9%）**。

@@ -157,7 +157,6 @@ DetachedTcpState::~DetachedTcpState() noexcept {
 DetachedTcpState::DetachedTcpState(DetachedTcpState&& other) noexcept
     : fd(std::exchange(other.fd, -1))
     , protocol(other.protocol)
-    , nonblocking(other.nonblocking)
     , pending_bytes(std::move(other.pending_bytes)) {}
 
 DetachedTcpState& DetachedTcpState::operator=(DetachedTcpState&& other) noexcept {
@@ -165,7 +164,6 @@ DetachedTcpState& DetachedTcpState::operator=(DetachedTcpState&& other) noexcept
         if (fd >= 0) ::close(fd);
         fd = std::exchange(other.fd, -1);
         protocol = other.protocol;
-        nonblocking = other.nonblocking;
         pending_bytes = std::move(other.pending_bytes);
     }
     return *this;
@@ -695,7 +693,6 @@ std::optional<DetachedTcpState> TcpStream::DetachForHandoff(
     const auto local_ep = impl_->socket.local_endpoint(ec);
     if (ec) return std::nullopt;
     state.protocol = local_ep.protocol();
-    state.nonblocking = impl_->socket.non_blocking();
     impl_->MarkCancelled();
     impl_->timeouts.Stop();
     state.fd = impl_->socket.release(ec);
@@ -714,8 +711,6 @@ std::unique_ptr<TcpStream> TcpStream::RestoreFromHandoff(
     socket.assign(state.protocol, state.fd, ec);
     if (ec) return nullptr;
     state.fd = -1;
-    socket.non_blocking(state.nonblocking, ec);
-    if (ec) return nullptr;
     auto stream = std::make_unique<TcpStream>(std::move(socket));
     if (!state.pending_bytes.empty()) {
         stream->PrependReadData(state.pending_bytes);
@@ -767,12 +762,6 @@ net::awaitable<IoErrorCode> TcpStream::WaitReadable(net::cancellation_slot cance
     co_return ec;
 }
 
-void TcpStream::PrepareTlsIo() {
-    // Asio's synchronous read_some otherwise waits internally even if an earlier
-    // asynchronous operation has made the native descriptor nonblocking.
-    impl_->socket.non_blocking(true);
-}
-
 bool TcpStream::CanRead() const noexcept {
     return impl_->socket.is_open() && !impl_->HasFlag(kReadShutdown);
 }
@@ -808,14 +797,31 @@ std::size_t TcpStream::ReadAvailable(
         error = io_error::eof;
         return 0;
     }
+    if (target.size() == 0) return 0;
     std::size_t n = ConsumePendingData(target);
     if (n == 0) {
-        n = impl_->socket.read_some(target, error);
-        if (error || n < target.size()) {
+        ssize_t received = 0;
+        do {
+            received = ::recv(
+                impl_->socket.native_handle(),
+                target.data(),
+                target.size(),
+                MSG_DONTWAIT);
+        } while (received < 0 && errno == EINTR);
+        if (received > 0) {
+            n = static_cast<std::size_t>(received);
+            if (n < target.size()) {
+                impl_->read_drain_budget = 0;
+            }
+        } else {
             impl_->read_drain_budget = 0;
+            error = received == 0
+                ? IoErrorCode(io_error::eof)
+                : IoErrorCode(errno, io_error::get_system_category());
+            return 0;
         }
     }
-    if (n != 0) TouchActivity();
+    TouchActivity();
     return n;
 }
 
@@ -1010,6 +1016,7 @@ size_t TcpStream::ConsumePendingData(net::mutable_buffer target) noexcept {
         std::span<uint8_t>(
             static_cast<uint8_t*>(target.data()),
             target.size()));
+    pending.ReleaseIfIdle();
     return consumed;
 }
 

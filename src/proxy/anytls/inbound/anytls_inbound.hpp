@@ -40,7 +40,7 @@ public:
 
 private:
     ::UserOnlineTracker& validator_;
-    ::StatsShard* stats_ = nullptr;
+    ::StatsShard& stats_;
     ::ConnectionLimiter* limiter_;
     std::shared_ptr<const ::anytls::PaddingScheme> padding_scheme_;
 };

@@ -11,6 +11,7 @@
 #include "transport/internet/stream_settings.hpp"
 #include "infra/log.hpp"
 #include "common/allocator.hpp"
+#include "common/byte_reader.hpp"
 #include "common/unsafe.hpp"
 
 #include <openssl/aead.h>
@@ -162,10 +163,7 @@ void FreeRealityServerConnState(void* /*parent*/,
 [[nodiscard]] bool HasHandshakeHeader(const SSL_CLIENT_HELLO& hello) noexcept {
     return hello.client_hello_len >= 4 &&
         hello.client_hello[0] == SSL3_MT_CLIENT_HELLO &&
-        (static_cast<size_t>(hello.client_hello[1]) << 16 |
-         static_cast<size_t>(hello.client_hello[2]) << 8 |
-         static_cast<size_t>(hello.client_hello[3])) ==
-            hello.client_hello_len - 4;
+        LoadU24BE(hello.client_hello + 1) == hello.client_hello_len - 4;
 }
 
 [[nodiscard]] memory::ByteVector FramedClientHello(const SSL_CLIENT_HELLO& hello) {
@@ -177,9 +175,7 @@ void FreeRealityServerConnState(void* /*parent*/,
     }
     framed.resize(4 + hello.client_hello_len);
     framed[0] = SSL3_MT_CLIENT_HELLO;
-    framed[1] = static_cast<uint8_t>((hello.client_hello_len >> 16) & 0xff);
-    framed[2] = static_cast<uint8_t>((hello.client_hello_len >> 8) & 0xff);
-    framed[3] = static_cast<uint8_t>(hello.client_hello_len & 0xff);
+    StoreU24BE(framed.data() + 1, static_cast<uint32_t>(hello.client_hello_len));
     std::copy_n(hello.client_hello, hello.client_hello_len, framed.data() + 4);
     return framed;
 }
@@ -324,10 +320,7 @@ BuildRealityClientAuthPlain(
     const auto now = static_cast<uint32_t>(
         std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch()).count());
-    plain[4] = static_cast<uint8_t>((now >> 24) & 0xff);
-    plain[5] = static_cast<uint8_t>((now >> 16) & 0xff);
-    plain[6] = static_cast<uint8_t>((now >> 8) & 0xff);
-    plain[7] = static_cast<uint8_t>(now & 0xff);
+    StoreU32BE(plain.data() + 4, now);
     std::copy(short_id.begin(), short_id.end(), plain.begin() + 8);
     return plain;
 }
@@ -340,9 +333,7 @@ BuildRealityClientAuthPlain(
         return nullptr;
     }
     auto state = std::make_unique<RealityClientState>();
-    state->server_public = *config.public_key;
     state->short_id = config.short_id;
-    state->server_name.assign(config.server_name.data(), config.server_name.size());
     state->spider_x.assign(config.spider_x.data(), config.spider_x.size());
     state->mldsa65_verify_key = mldsa65_verify_key;
     return state;
@@ -603,11 +594,7 @@ namespace {
         return false;
     }
 
-    const uint32_t client_time =
-        (static_cast<uint32_t>(plain[4]) << 24) |
-        (static_cast<uint32_t>(plain[5]) << 16) |
-        (static_cast<uint32_t>(plain[6]) << 8) |
-        static_cast<uint32_t>(plain[7]);
+    const uint32_t client_time = LoadU32BE(plain.data() + 4);
     if (!IsRealityClientTimeAllowed(client_time, state.max_time_diff_ms)) {
         return false;
     }
@@ -754,10 +741,7 @@ VerifyRealityClientHelloHandshake(
         handshake[0] != SSL3_MT_CLIENT_HELLO) {
         return nullptr;
     }
-    const size_t hello_len =
-        (static_cast<size_t>(handshake[1]) << 16) |
-        (static_cast<size_t>(handshake[2]) << 8) |
-        handshake[3];
+    const size_t hello_len = LoadU24BE(handshake.data() + 1);
     if (hello_len + 4 != handshake.size()) {
         return nullptr;
     }
@@ -1257,8 +1241,8 @@ bool TlsStream::SetRealityClient(const RealityConfig& reality) {
 
     if (SSL_set1_reality_peer_public_key(
             ssl,
-            state->server_public.data(),
-            state->server_public.size()) != 1) {
+            reality.public_key->data(),
+            reality.public_key->size()) != 1) {
         LOG_ERROR("REALITY client peer public key install failed");
         return false;
     }
@@ -1276,7 +1260,7 @@ bool TlsStream::SetRealityClient(const RealityConfig& reality) {
 }
 
 std::unique_ptr<RealityServerConnState> VerifyRealityClientHello(
-    std::span<const uint8_t> handshake,
+    memory::ByteVector handshake,
     const SslContext& ctx) {
     const SSL_CTX* ssl_ctx = ctx.Native();
     const auto* state = ssl_ctx
@@ -1286,8 +1270,7 @@ std::unique_ptr<RealityServerConnState> VerifyRealityClientHello(
     if (!state) {
         return nullptr;
     }
-    return VerifyRealityClientHelloHandshake(
-        memory::ByteVector(handshake.begin(), handshake.end()), *state);
+    return VerifyRealityClientHelloHandshake(std::move(handshake), *state);
 }
 
 bool TlsStream::SetRealityServerPreverified(

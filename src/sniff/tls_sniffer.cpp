@@ -23,8 +23,7 @@ constexpr size_t kMaxTlsSniffHandshakeBytes =
     kMaxTlsSniffWireBytes - kTlsRecordHeaderBytes;
 
 [[nodiscard]] size_t ClientHelloSize(std::span<const uint8_t> handshake) noexcept {
-    return 4 + ((static_cast<size_t>(handshake[1]) << 16) |
-                (static_cast<size_t>(handshake[2]) << 8) | handshake[3]);
+    return 4 + LoadU24BE(handshake.data() + 1);
 }
 
 [[nodiscard]] bool FitsTlsSniffWireBudget(
@@ -95,15 +94,47 @@ constexpr size_t kMaxTlsSniffHandshakeBytes =
     }
     return true;
 }
+
+[[nodiscard]] bool ReadRecordHeader(
+    ByteReader& reader,
+    bool& version_supports_need_more,
+    uint16_t& record_len,
+    SniffResult& result) noexcept {
+    if (reader.ReadU8() != kContentTypeHandshake) return false;
+    if (reader.Empty() ||
+        (reader.Remaining() == 1 && reader.ReadU8() == 0x03)) {
+        if (version_supports_need_more) {
+            result.need_more = true;
+            result.protocol = constants::protocol::kTls;
+        }
+        return false;
+    }
+    const uint16_t record_version = reader.ReadU16BE();
+    if (!reader.Ok()) return false;
+    if ((record_version < kTls10 || record_version > kTls13) &&
+        record_version != kSsl30) {
+        return false;
+    }
+    version_supports_need_more =
+        version_supports_need_more &&
+        record_version >= kTls10 && record_version <= kTls13;
+    if (reader.Remaining() < 2) {
+        if (version_supports_need_more) {
+            result.need_more = true;
+            result.protocol = constants::protocol::kTls;
+        }
+        return false;
+    }
+    record_len = reader.ReadU16BE();
+    return record_len != 0;
+}
 }  // namespace
 
 std::optional<std::string_view> ParseClientHelloServerName(
     std::span<const uint8_t> handshake) {
     ByteReader reader(handshake);
     if (reader.ReadU8() != kHandshakeClientHello) return std::nullopt;
-    const uint8_t size_high = reader.ReadU8();
-    const size_t body_size =
-        (static_cast<size_t>(size_high) << 16) | reader.ReadU16BE();
+    const size_t body_size = reader.ReadU24BE();
     ByteReader body(reader.ReadBytes(body_size));
     if (!reader.Ok()) return std::nullopt;
 
@@ -128,30 +159,9 @@ std::optional<std::string_view> ParseClientHelloServerName(
 SniffResult SniffTls(std::span<const uint8_t> data) {
     SniffResult result;
     ByteReader reader(data);
-    if (reader.ReadU8() != kContentTypeHandshake) return result;
-    if (reader.Empty() ||
-        (reader.Remaining() == 1 && reader.ReadU8() == 0x03)) {
-        result.need_more = true;
-        result.protocol = constants::protocol::kTls;
-        return result;
-    }
-    const uint16_t record_version = reader.ReadU16BE();
-    if (!reader.Ok()) return result;
-    if ((record_version < kTls10 || record_version > kTls13) &&
-        record_version != kSsl30) {
-        return result;
-    }
-    bool version_supports_need_more =
-        record_version >= kTls10 && record_version <= kTls13;
-    if (reader.Remaining() < 2) {
-        if (version_supports_need_more) {
-            result.need_more = true;
-            result.protocol = constants::protocol::kTls;
-        }
-        return result;
-    }
-    const uint16_t record_len = reader.ReadU16BE();
-    if (record_len == 0 ||
+    bool version_supports_need_more = true;
+    uint16_t record_len = 0;
+    if (!ReadRecordHeader(reader, version_supports_need_more, record_len, result) ||
         !FitsTlsSniffWireBudget(kTlsRecordHeaderBytes, record_len, {})) {
         return result;
     }
@@ -198,39 +208,8 @@ SniffResult SniffTls(std::span<const uint8_t> data) {
                 kMaxTlsSniffWireBytes - record_headers_bytes) {
             return result;
         }
-        if (reader.ReadU8() != kContentTypeHandshake) return result;
-        if (reader.Empty()) {
-            if (version_supports_need_more) {
-                result.need_more = true;
-                result.protocol = constants::protocol::kTls;
-            }
-            return result;
-        }
-        if (reader.Remaining() == 1) {
-            if (reader.ReadU8() != 0x03) return result;
-            if (version_supports_need_more) {
-                result.need_more = true;
-                result.protocol = constants::protocol::kTls;
-            }
-            return result;
-        }
-        const uint16_t next_version = reader.ReadU16BE();
-        if ((next_version < kTls10 || next_version > kTls13) &&
-            next_version != kSsl30) {
-            return result;
-        }
-        version_supports_need_more =
-            version_supports_need_more &&
-            next_version >= kTls10 && next_version <= kTls13;
-        if (reader.Remaining() < 2) {
-            if (version_supports_need_more) {
-                result.need_more = true;
-                result.protocol = constants::protocol::kTls;
-            }
-            return result;
-        }
-        const uint16_t next_len = reader.ReadU16BE();
-        if (next_len == 0 ||
+        uint16_t next_len = 0;
+        if (!ReadRecordHeader(reader, version_supports_need_more, next_len, result) ||
             next_len > kMaxTlsSniffHandshakeBytes - reassembled_size) {
             return result;
         }

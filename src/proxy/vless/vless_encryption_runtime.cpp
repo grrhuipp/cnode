@@ -1,9 +1,13 @@
 #include "vless_encryption_runtime.hpp"
 #include "vless_ticket_service.hpp"
 
+#include "app/session_group_executor.hpp"
 #include "common/allocator.hpp"
 #include "common/container_util.hpp"
+#include "infra/log.hpp"
 
+#include <asio/this_coro.hpp>
+#include <asio/use_awaitable.hpp>
 #include <blake3.h>
 #include <openssl/rand.h>
 
@@ -11,7 +15,9 @@
 #include <array>
 #include <chrono>
 #include <cstdlib>
-
+#include <string>
+#include <string_view>
+#include <unordered_map>
 namespace vless {
 namespace {
 
@@ -126,7 +132,7 @@ net::awaitable<tl::expected<void, VlessEncryptionHandshakeFailure>> ReadAndOpenP
 [[nodiscard]] VlessEncryptionHandshakeResult BuildClientRuntime(
     const VlessEncryptionConfig& config,
     const VlessEncryptionClientPfsHello& client_pfs,
-    VlessEncryptionClientPfsOpenResult server_open,
+    VlessEncryptionClientPfsOpenResult& server_open,
     VlessEncryptionAeadCipher cipher,
     std::span<const uint8_t, kVlessEncryptionIvSize> client_iv) noexcept {
     auto write_aead = VlessEncryptionAead::Create(
@@ -154,7 +160,7 @@ net::awaitable<tl::expected<void, VlessEncryptionHandshakeFailure>> ReadAndOpenP
     const VlessEncryptionConfig& config,
     std::span<const uint8_t, kVlessEncryptionClientPfsPublicSize>
         client_public_key,
-    VlessEncryptionServerPfsResponse response,
+    VlessEncryptionServerPfsResponse& response,
     VlessEncryptionAeadCipher cipher,
     std::span<const uint8_t, kVlessEncryptionIvSize> client_iv) noexcept {
     auto read_aead = VlessEncryptionAead::Create(
@@ -492,10 +498,22 @@ RunVlessEncryptionClientHandshake(
         cipher);
     memory::ByteVector{}.swap(encrypted_server_public);
     if (!server_open) {
+        pfs.reset();
         co_return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
     }
+    auto runtime = BuildClientRuntime(
+        config,
+        *pfs,
+        *server_open,
+        cipher,
+        nfs->iv);
+    pfs.reset();
+    if (!runtime) {
+        co_return tl::unexpected(runtime.error());
+    }
 
-    if (auto padding_result = co_await ReadAndOpenPadding(raw_reader, server_open->read_aead);
+    if (auto padding_result = co_await ReadAndOpenPadding(
+            raw_reader, std::get<VlessEncryptionAead>(runtime->read_keys));
         !padding_result) {
         co_return tl::unexpected(padding_result.error());
     }
@@ -504,12 +522,7 @@ RunVlessEncryptionClientHandshake(
         ticket_cache->Store(*server_open, std::chrono::steady_clock::now());
     }
 
-    co_return BuildClientRuntime(
-        config,
-        *pfs,
-        std::move(*server_open),
-        cipher,
-        nfs->iv);
+    co_return runtime;
 }
 
 net::awaitable<VlessEncryptionHandshakeResult>
@@ -632,11 +645,23 @@ RunVlessEncryptionServerHandshake(
         *client_public,
         cipher);
     if (!response) {
+        OPENSSL_cleanse(client_public->data(), client_public->size());
         co_return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
+    }
+    auto runtime = BuildServerRuntime(
+        config,
+        *client_public,
+        *response,
+        cipher,
+        nfs->iv);
+    OPENSSL_cleanse(client_public->data(), client_public->size());
+    client_public.reset();
+    if (!runtime) {
+        co_return tl::unexpected(runtime.error());
     }
     auto padding = BuildVlessEncryptionPadding(
         config,
-        response->write_aead);
+        runtime->write_aead);
     if (!padding) {
         co_return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
     }
@@ -644,6 +669,7 @@ RunVlessEncryptionServerHandshake(
     co_await WriteVlessBytes(raw_writer, response->encrypted_public_key);
     memory::ByteVector{}.swap(response->encrypted_public_key);
     co_await WriteVlessBytes(raw_writer, response->encrypted_ticket);
+    response.reset();
     co_await WriteVlessBytes(raw_writer, *padding);
     memory::ByteVector{}.swap(*padding);
     padding.reset();
@@ -653,13 +679,7 @@ RunVlessEncryptionServerHandshake(
         co_return tl::unexpected(padding_result.error());
     }
 
-
-    co_return BuildServerRuntime(
-        config,
-        *client_public,
-        std::move(*response),
-        cipher,
-        nfs->iv);
+    co_return runtime;
 }
 
 VlessEncryptedIo::VlessEncryptedIo(VlessBufferedReader& raw_reader,
@@ -674,5 +694,124 @@ VlessEncryptedIo::VlessEncryptedIo(VlessBufferedReader& raw_reader,
              runtime.united_key,
              std::move(runtime.write_xor))
     , plain_reader(reader) {}
+
+namespace {
+using Clock = std::chrono::steady_clock;
+using Ticket = std::array<uint8_t, kVlessEncryptionTicketSize>;
+using Resumed = VlessEncryptionServerTicketStore::ResumedSession;
+
+struct StoreKey {
+    const VlessEncryptionConfig* config = nullptr;
+    std::string tag;
+    bool operator==(const StoreKey&) const = default;
+};
+
+struct StoreKeyView {
+    const VlessEncryptionConfig* config = nullptr;
+    std::string_view tag;
+};
+
+struct StoreKeyHash {
+    using is_transparent = void;
+
+    size_t operator()(const StoreKey& key) const noexcept {
+        return (*this)(StoreKeyView{key.config, key.tag});
+    }
+    size_t operator()(const StoreKeyView& key) const noexcept {
+        return std::hash<const void*>{}(key.config) ^
+               std::hash<std::string_view>{}(key.tag);
+    }
+};
+
+struct StoreKeyEqual {
+    using is_transparent = void;
+
+    bool operator()(const StoreKey& a, const StoreKey& b) const noexcept {
+        return a == b;
+    }
+    bool operator()(const StoreKey& a, const StoreKeyView& b) const noexcept {
+        return a.config == b.config && std::string_view(a.tag) == b.tag;
+    }
+    bool operator()(const StoreKeyView& a, const StoreKey& b) const noexcept {
+        return a.config == b.config && a.tag == std::string_view(b.tag);
+    }
+};
+
+struct StoreEntry {
+    std::shared_ptr<const VlessEncryptionConfig> config;
+    VlessEncryptionServerTicketStore tickets;
+};
+
+class TicketDirectoryService final : public net::execution_context::service {
+public:
+    inline static net::execution_context::id id;
+    explicit TicketDirectoryService(net::execution_context& context) : service(context) {}
+
+    VlessEncryptionServerTicketStore& GetOrCreate(
+        std::shared_ptr<const VlessEncryptionConfig> config, std::string_view tag) {
+        if (auto it = stores_.find(StoreKeyView{config.get(), tag}); it != stores_.end()) {
+            return it->second.tickets;
+        }
+        StoreKey key{config.get(), std::string(tag)};
+        auto [it, inserted] = stores_.try_emplace(std::move(key));
+        if (inserted) it->second.config = std::move(config);
+        return it->second.tickets;
+    }
+
+    VlessEncryptionServerTicketStore* Find(
+        const VlessEncryptionConfig* config, std::string_view tag) {
+        auto it = stores_.find(StoreKeyView{config, tag});
+        return it == stores_.end() ? nullptr : &it->second.tickets;
+    }
+
+private:
+    void shutdown() override { stores_.clear(); }
+    std::unordered_map<StoreKey, StoreEntry, StoreKeyHash, StoreKeyEqual> stores_;
+};
+
+} // namespace
+
+net::awaitable<bool> AuthenticateVlessTicket(
+    std::shared_ptr<const VlessEncryptionConfig> config, std::string_view tag,
+    VlessEncryptionIssuedTicket ticket, std::array<uint8_t, 16> identity) {
+    if (!config) co_return false;
+    auto executor = co_await net::this_coro::executor;
+    auto* coordinator = GroupCoordinator::ForContext(
+        net::query(executor, net::execution::context));
+    if (!coordinator) co_return false;
+    std::string owned_tag(tag);
+    co_return co_await coordinator->PostCall(
+        [coordinator, config = std::move(config), tag = std::move(owned_tag),
+         ticket = std::move(ticket), identity]() mutable -> bool {
+            const auto now = Clock::now();
+            const auto expires = ticket.issued_at + std::chrono::seconds(ticket.seconds);
+            if (ticket.seconds == 0 || expires <= now) return false;
+            auto& store = net::use_service<TicketDirectoryService>(
+                coordinator->Services()).GetOrCreate(std::move(config), tag);
+            store.Store(ticket.ticket, ticket.pfs_key, ticket.seconds, ticket.issued_at);
+            return store.BindIdentity(ticket.ticket, identity, now);
+        });
+}
+
+net::awaitable<std::optional<Resumed>> LookupVlessTicket(
+    std::shared_ptr<const VlessEncryptionConfig> config, std::string_view tag,
+    Ticket ticket, VlessEncryptionNfsKey nfs) {
+    if (!config) co_return std::nullopt;
+    auto executor = co_await net::this_coro::executor;
+    auto* coordinator = GroupCoordinator::ForContext(
+        net::query(executor, net::execution::context));
+    if (!coordinator) co_return std::nullopt;
+    std::string owned_tag(tag);
+    co_return co_await coordinator->PostCall(
+        [coordinator, config = std::move(config), tag = std::move(owned_tag),
+         ticket, nfs = std::move(nfs)]() -> std::optional<Resumed> {
+            auto* store = net::use_service<TicketDirectoryService>(
+                coordinator->Services()).Find(config.get(), tag);
+            auto result = store ? store->Lookup(ticket, nfs, Clock::now()) : std::nullopt;
+            LOG_NET_DEBUG("inbound '{}' ticket lookup accepted={}",
+                          tag, result.has_value());
+            return result;
+        });
+}
 
 }  // namespace vless

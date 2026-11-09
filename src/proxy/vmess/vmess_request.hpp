@@ -11,7 +11,6 @@
 #include "common/buf/multi_buffer.hpp"
 #include "common/target_address.hpp"
 #include "app/proxyman/inbound/user_store.hpp"
-#include "types.hpp"
 #include "common/unsafe.hpp"
 #include <array>
 #include <cstddef>
@@ -22,6 +21,14 @@
 namespace vmess {
 
 // ============================================================================
+// Wire values of the request header security nibble.
+enum class Security : uint8_t {
+    AES_128_GCM       = 3,
+    CHACHA20_POLY1305 = 4,
+    NONE              = 5,
+    ZERO              = 6
+};
+
 // 协议常量
 // ============================================================================
 
@@ -46,7 +53,6 @@ enum class Command : uint8_t {
 
 namespace Option {
     constexpr uint8_t CHUNK_STREAM        = 0x01;
-    constexpr uint8_t CONNECTION_REUSE    = 0x02;
     constexpr uint8_t CHUNK_MASKING       = 0x04;
     constexpr uint8_t GLOBAL_PADDING      = 0x08;
     constexpr uint8_t AUTHENTICATED_LENGTH = 0x10;
@@ -76,12 +82,10 @@ namespace KDFSalt {
 // ============================================================================
 
 struct VMessRequest {
-    uint8_t version = VERSION;
     std::array<uint8_t, 16> body_iv{};
     std::array<uint8_t, 16> body_key{};
     uint8_t response_header = 0;
     uint8_t options         = 0;
-    uint8_t padding_len     = 0;
     Security security       = Security::AES_128_GCM;
     Command  command        = Command::TCP;
     TargetAddress target;

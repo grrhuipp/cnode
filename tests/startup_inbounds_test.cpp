@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "startup_inbounds.hpp"
+#include "app/prepared_inbound.hpp"
 #include "app/proxyman/inbound/factory.hpp"
 #include "app/proxyman/inbound/user_store.hpp"
 #include "core/constants.hpp"
