@@ -5,7 +5,6 @@
 #include "common/string_hash.hpp"
 #include "common/container_util.hpp"
 #include "vmess_crypto.hpp"
-#include "vmess_request.hpp"
 #include "app/session_group_executor.hpp"
 
 #include <algorithm>

@@ -94,6 +94,15 @@ void BaseWsStream::SetPendingData(const uint8_t* data, size_t len) {
     }
 }
 
+void BaseWsStream::SetPendingMultiBuffer(buf::MultiBuffer&& mb) {
+    if (mb.byte_size() == 0) {
+        mb.clear();
+        return;
+    }
+    pending_data_.MoveTo(mb);
+    pending_data_ = std::move(mb);
+}
+
 bool BaseWsStream::Utf8State::Consume(std::span<const uint8_t> bytes) noexcept {
     for (const uint8_t byte : bytes) {
         if (remaining != 0) {
@@ -629,8 +638,8 @@ net::awaitable<WsHandshakeResult> BaseWsStream::Handshake(
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
-    if (const auto read_ahead = head->ReadAhead(); !read_ahead.empty()) {
-        SetPendingData(read_ahead.data(), read_ahead.size());
+    if (auto read_ahead = head->TakeReadAheadMultiBuffer(); !read_ahead.empty()) {
+        SetPendingMultiBuffer(std::move(read_ahead));
     }
 
     LOG_CONN_DEBUG(conn_id, "WebSocket client handshake completed (host={} path={})",

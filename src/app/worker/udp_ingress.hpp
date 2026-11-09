@@ -1,31 +1,38 @@
 #pragma once
 
+#include "app/proxyman/inbound/handler.hpp"
 #include "common/allocator.hpp"
 #include "common/buf/multi_buffer.hpp"
 #include "common/buffer_util.hpp"
+#include "common/container_util.hpp"
 #include "common/error.hpp"
+#include "common/ip_utils.hpp"
 #include "common/session.hpp"
 #include "common/sharded_user_stats.hpp"
+#include "common/string_hash.hpp"
 #include "features/routing/dispatcher.hpp"
 #include "infra/config_types.hpp"
 #include "proxy/inbound.hpp"
+#include "proxy/inbound_datagram.hpp"
+#include "transport/internet/timeout_scheduler.hpp"
 #include "transport/link.hpp"
-#include "udp_client_session_key.hpp"
-#include "udp_resource_budget.hpp"
 
-#include <cstdint>
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <exception>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 
 struct TargetAddress;
 struct StatsShard;
 struct TimeoutsConfig;
 
-namespace app { struct DatagramSessionEnvironment; }
 namespace routing {
 class Dispatcher;
 }
@@ -36,8 +43,238 @@ struct ReceiverSettings;
 
 namespace worker_detail {
 
-class UdpAssociationReclaimer;
-struct UdpAssociationHook;
+class UdpIngress;
+
+struct ClientSessionKey final {
+    ClientSessionKey(InboundDatagramOwner authenticated_owner,
+                     std::optional<uint64_t> protocol_session_id,
+                     udp::endpoint client_endpoint = {},
+                     const proxyman::inbound::ProtocolSettings* configuration_identity = nullptr) noexcept
+        : owner(authenticated_owner), session_id(protocol_session_id),
+          endpoint(protocol_session_id ? udp::endpoint{} :
+              udp::endpoint(iputil::NormalizeAddress(client_endpoint.address()), client_endpoint.port())),
+          configuration(configuration_identity) {}
+
+    [[nodiscard]] bool operator==(const ClientSessionKey& other) const noexcept {
+        return configuration == other.configuration && owner.Same(other.owner) &&
+            session_id == other.session_id && (session_id.has_value() || endpoint == other.endpoint);
+    }
+
+    InboundDatagramOwner owner;
+    std::optional<uint64_t> session_id;
+    udp::endpoint endpoint;
+    const proxyman::inbound::ProtocolSettings* configuration = nullptr;
+};
+
+struct ClientSessionKeyHash final {
+    [[nodiscard]] size_t operator()(const ClientSessionKey& key) const noexcept {
+        size_t hash = 2166136261u;
+        const auto mix = [&hash](uint8_t byte) noexcept {
+            hash = (hash ^ byte) * 16777619u;
+        };
+        const auto configuration = reinterpret_cast<uintptr_t>(key.configuration);
+        for (size_t shift = 0; shift < sizeof(configuration) * 8; shift += 8)
+            mix(static_cast<uint8_t>(configuration >> shift));
+        mix(key.owner.size);
+        for (size_t i = 0; i < key.owner.size; ++i) mix(key.owner.bytes[i]);
+        mix(key.session_id.has_value());
+        if (key.session_id) {
+            for (unsigned shift = 0; shift < 64; shift += 8)
+                mix(static_cast<uint8_t>(*key.session_id >> shift));
+        } else {
+            const auto& address = key.endpoint.address();
+            mix(address.is_v4() ? 4 : 6);
+            if (address.is_v4()) {
+                for (auto byte : address.to_v4().to_bytes()) mix(byte);
+            } else {
+                const auto v6 = address.to_v6();
+                for (auto byte : v6.to_bytes()) mix(byte);
+                const auto scope = v6.scope_id();
+                for (size_t shift = 0; shift < sizeof(scope) * 8; shift += 8)
+                    mix(static_cast<uint8_t>(scope >> shift));
+            }
+            mix(static_cast<uint8_t>(key.endpoint.port() >> 8));
+            mix(static_cast<uint8_t>(key.endpoint.port()));
+        }
+        return hash;
+    }
+};
+
+// Worker-local UDP association and payload capacity budget.
+class UdpResourceBudget final {
+public:
+    struct Limits {
+        size_t associations = 4096;
+        size_t datagrams = 8192;
+        size_t payload_capacity = 64 * 1024 * 1024;
+    };
+    struct Usage {
+        size_t associations = 0;
+        size_t datagrams = 0;
+        size_t payload_capacity = 0;
+    };
+
+    class AssociationLease final {
+    public:
+        AssociationLease() noexcept = default;
+        ~AssociationLease() { Reset(); }
+        AssociationLease(const AssociationLease&) = delete;
+        AssociationLease& operator=(const AssociationLease&) = delete;
+        AssociationLease(AssociationLease&& other) noexcept
+            : budget_(std::exchange(other.budget_, nullptr)) {}
+        AssociationLease& operator=(AssociationLease&& other) noexcept {
+            if (this != &other) {
+                Reset();
+                budget_ = std::exchange(other.budget_, nullptr);
+            }
+            return *this;
+        }
+        explicit operator bool() const noexcept { return budget_ != nullptr; }
+    private:
+        friend class UdpResourceBudget;
+        explicit AssociationLease(UdpResourceBudget& budget) noexcept : budget_(&budget) {}
+        void Reset() noexcept {
+            if (budget_) --budget_->associations_;
+            budget_ = nullptr;
+        }
+        UdpResourceBudget* budget_ = nullptr;
+    };
+
+    class PayloadReservation final {
+    public:
+        PayloadReservation() noexcept = default;
+        ~PayloadReservation() { Reset(); }
+        PayloadReservation(const PayloadReservation&) = delete;
+        PayloadReservation& operator=(const PayloadReservation&) = delete;
+        PayloadReservation(PayloadReservation&& other) noexcept
+            : budget_(std::exchange(other.budget_, nullptr)), capacity_(other.capacity_) {}
+        PayloadReservation& operator=(PayloadReservation&& other) noexcept {
+            if (this != &other) {
+                Reset();
+                budget_ = std::exchange(other.budget_, nullptr);
+                capacity_ = other.capacity_;
+            }
+            return *this;
+        }
+        explicit operator bool() const noexcept { return budget_ != nullptr; }
+    private:
+        friend class UdpResourceBudget;
+        PayloadReservation(UdpResourceBudget& budget, size_t capacity) noexcept
+            : budget_(&budget), capacity_(capacity) {}
+        void Reset() noexcept {
+            if (budget_) {
+                --budget_->datagrams_;
+                budget_->payload_capacity_ -= capacity_;
+            }
+            budget_ = nullptr;
+        }
+        UdpResourceBudget* budget_ = nullptr;
+        size_t capacity_ = 0;
+    };
+
+    UdpResourceBudget() noexcept = default;
+    explicit UdpResourceBudget(Limits limits) noexcept : limits_(limits) {}
+    UdpResourceBudget(const UdpResourceBudget&) = delete;
+    UdpResourceBudget& operator=(const UdpResourceBudget&) = delete;
+
+    [[nodiscard]] Usage GetUsage() const noexcept {
+        return {associations_, datagrams_, payload_capacity_};
+    }
+    [[nodiscard]] AssociationLease AcquireAssociation() noexcept {
+        if (!Acquire(associations_, 1, limits_.associations)) return {};
+        return AssociationLease{*this};
+    }
+    [[nodiscard]] PayloadReservation ReservePayload(const buf::MultiBuffer& payload) noexcept {
+        size_t capacity = 0;
+        for (const auto* buffer : payload) {
+            if (!buffer) continue;
+            if (capacity > std::numeric_limits<size_t>::max() - buf::Buffer::kSize)
+                return {};
+            capacity += buf::Buffer::kSize;
+        }
+        if (!Acquire(datagrams_, 1, limits_.datagrams)) return {};
+        if (!Acquire(payload_capacity_, capacity, limits_.payload_capacity)) {
+            --datagrams_;
+            return {};
+        }
+        return PayloadReservation{*this, capacity};
+    }
+
+private:
+    static bool Acquire(size_t& counter, size_t amount, size_t limit) noexcept {
+        if (amount > limit || counter > limit - amount) return false;
+        counter += amount;
+        return true;
+    }
+    Limits limits_;
+    size_t associations_ = 0;
+    size_t datagrams_ = 0;
+    size_t payload_capacity_ = 0;
+};
+
+// Embedded in an association row; its address is stable while registered.
+struct UdpAssociationHook final {
+    using TimePoint = std::chrono::steady_clock::time_point;
+
+    UdpIngress* owner = nullptr;
+    std::string_view socket_key;
+    const ClientSessionKey* client_key = nullptr;
+    std::chrono::seconds idle_timeout{};
+    // Earliest instant the row may need reclaiming. Uplink activity does not
+    // move it; a due open row is re-checked against its last activity and
+    // re-armed. min() marks a closed row, max() an open row that never expires.
+    TimePoint deadline{};
+    std::size_t heap_index = 0;
+};
+
+// Idle expiry of a row last active at `last_active`; max() when disabled.
+[[nodiscard]] UdpAssociationHook::TimePoint UdpAssociationExpiry(
+    UdpAssociationHook::TimePoint last_active, std::chrono::seconds idle_timeout) noexcept;
+
+// Worker-local min-heap over association rows embedded in UdpIngress maps.
+// One maintenance event sleeps until the nearest row deadline and reclaims at
+// most a bounded batch per wake; no timer runs while no row can expire.
+class UdpAssociationReclaimer final : public memory::ThreadAllocated, private TimeoutEvent {
+public:
+    using FailureCallback = void (*)(void*, std::exception_ptr);
+    using TimePoint = UdpAssociationHook::TimePoint;
+
+    UdpAssociationReclaimer(TimeoutScheduler& scheduler,
+                            void* failure_context,
+                            FailureCallback on_failure) noexcept;
+    ~UdpAssociationReclaimer() noexcept;
+    UdpAssociationReclaimer(const UdpAssociationReclaimer&) = delete;
+    UdpAssociationReclaimer& operator=(const UdpAssociationReclaimer&) = delete;
+
+    // The only allocating step: call before inserting a row so Register
+    // cannot fail once the row exists.
+    void ReserveRow();
+    void Register(UdpAssociationHook& hook, UdpIngress& owner,
+                  std::string_view socket_key, const ClientSessionKey& client_key,
+                  std::chrono::seconds idle_timeout, TimePoint deadline) noexcept;
+    // Moves a registered row to a new deadline; unregistered hooks are ignored.
+    void Rearm(UdpAssociationHook& hook, TimePoint deadline) noexcept;
+    void Unregister(UdpAssociationHook& hook) noexcept;
+    void Stop() noexcept;
+
+private:
+    void OnTimeout() noexcept override;
+    void Schedule() noexcept;
+    void Place(std::size_t index, UdpAssociationHook* hook) noexcept;
+    void SiftUp(std::size_t index) noexcept;
+    void SiftDown(std::size_t index) noexcept;
+    void Repair(std::size_t index) noexcept;
+
+    TimeoutScheduler& scheduler_;
+    void* failure_context_ = nullptr;
+    FailureCallback on_failure_ = nullptr;
+    memory::ThreadLocalVector<UdpAssociationHook*> heap_;
+    TimePoint armed_deadline_{};
+    bool stopped_ = false;
+    bool failed_ = false;
+    bool running_batch_ = false;
+};
+
 struct UdpHandoffRecord;
 
 class UdpReplySink {
@@ -67,6 +304,26 @@ struct UdpDatagramContext {
     const app::DatagramSessionEnvironment* environment = nullptr;
 };
 
+// Only authenticated identity and execution ownership metadata live here.
+// Protocol continuity state is owned, but never interpreted, by this directory.
+struct UdpHandoffIdentity {
+    memory::ThreadLocalString listener;
+    memory::ThreadLocalString tag;
+    const proxyman::inbound::ProtocolSettings* configuration = nullptr;
+    ClientSessionKey client;
+    bool operator==(const UdpHandoffIdentity& other) const noexcept {
+        return configuration == other.configuration && listener == other.listener &&
+            tag == other.tag && client == other.client;
+    }
+};
+struct UdpHandoffIdentityHash {
+    size_t operator()(const UdpHandoffIdentity& key) const noexcept {
+        auto hash = ClientSessionKeyHash{}(key.client);
+        hash ^= std::hash<std::string_view>{}(key.listener) + (hash << 6) + (hash >> 2);
+        hash ^= std::hash<std::string_view>{}(key.tag) + (hash << 6) + (hash >> 2);
+        return hash ^ std::hash<const proxyman::inbound::ProtocolSettings*>{}(key.configuration);
+    }
+};
 // Worker-private owner for native UDP sockets, client sessions and reply queues.
 class UdpIngress final : public memory::ThreadAllocated {
 public:
@@ -188,8 +445,68 @@ private:
         std::shared_ptr<UdpHandoffRecord> record = {});
     void RegisterNativeJob(const ClientSessionPtr& session);
     void DetachNativeJob(ClientSession& session) noexcept;
-    struct Impl;
-    std::unique_ptr<Impl> impl_;
+    struct BoundSocket {
+        SocketPtr socket;
+        // Resolved once at attachment; the bound address never changes.
+        std::optional<tcp::endpoint> local_endpoint;
+        InboundDatagramAssociationIndex associations;
+    };
+    struct ReplyQueueState {
+        memory::ThreadLocalDeque<PendingUdpReply> pending;
+        size_t queued_bytes = 0;
+        uint64_t active_id = 0;
+        size_t active_payload_size = 0;
+    };
+    struct UdpClientSession {
+        ClientSessionPtr link;
+        // Valid uplink activity only; the reclaimer re-checks it lazily when the
+        // row's deadline passes, so packets never re-key the maintenance heap.
+        std::chrono::steady_clock::time_point last_active;
+        UdpAssociationHook reclaim_hook;
+    };
+    using UdpClientSessionMap = memory::ThreadLocalUnorderedMap<
+        ClientSessionKey,
+        UdpClientSession,
+        ClientSessionKeyHash>;
+    using UdpSocketMap = memory::ThreadLocalUnorderedMap<
+        memory::ThreadLocalString,
+        BoundSocket,
+        TransparentStringHash,
+        TransparentStringEq>;
+    using ReplyQueueMap = memory::ThreadLocalUnorderedMap<
+        memory::ThreadLocalString,
+        ReplyQueueState,
+        TransparentStringHash,
+        TransparentStringEq>;
+    using ClientSessionOuterMap = memory::ThreadLocalUnorderedMap<
+        memory::ThreadLocalString,
+        UdpClientSessionMap,
+        TransparentStringHash,
+        TransparentStringEq>;
+    enum class State : uint8_t { Running, Stopping, Drained };
+
+    [[nodiscard]] std::optional<PendingUdpReply> BeginReplySend(ReplyQueueState& queue);
+    void Link(UdpClientSession& row, std::string_view socket_key,
+              const ClientSessionKey& client_key, std::chrono::seconds idle_timeout) noexcept;
+    void SetLocalAssociation(const UdpAssociationHook& hook,
+                             InboundDatagramAssociation* association) noexcept;
+    void Unlink(UdpClientSession& row) noexcept;
+
+    memory::ThreadLocalString tag_;
+    std::unique_ptr<::Inbound> proxy_;
+    UdpAssociationReclaimer& reclaimer_;
+    UdpResourceBudget& budget_;
+    UdpSocketMap udp_sockets_;
+    ReplyQueueMap reply_queues_;
+    ClientSessionOuterMap client_sessions_;
+    SignalChannel completion_signal_;
+    memory::ThreadLocalUnorderedMap<UdpHandoffIdentity, std::shared_ptr<UdpHandoffRecord>,
+                                    UdpHandoffIdentityHash> handoff_records_;
+    ClientSession* jobs_ = nullptr;
+    size_t outstanding_jobs_ = 0;
+    size_t join_observers_ = 0;
+    uint64_t last_reply_id_ = 0;
+    State state_ = State::Running;
 };
 
 class UdpIngress::ClientSession final
@@ -278,4 +595,73 @@ private:
     UdpIngress* owner_ = nullptr;
 };
 
+
+struct UdpHandoffRecord {
+    std::unique_ptr<InboundDatagramAssociation> association;
+    std::weak_ptr<UdpIngress::ClientSession> session;
+    std::shared_ptr<const proxyman::inbound::ProtocolSettings> configuration;
+    explicit UdpHandoffRecord(const InboundDatagramAssociationPolicy& policy)
+        : association(policy.create()) {}
+};
+class UdpHandoffDirectory final {
+public:
+    UdpHandoffDirectory() = default;
+
+    // Worker-local directory. A tombstone is retained after its live
+    // association ends until the entire timestamp/replay protection expires.
+    static std::shared_ptr<UdpHandoffRecord> Claim(
+        memory::ThreadLocalUnorderedMap<UdpHandoffIdentity, std::shared_ptr<UdpHandoffRecord>,
+                                        UdpHandoffIdentityHash>& records,
+        const UdpHandoffIdentity& key,
+        std::shared_ptr<const proxyman::inbound::ProtocolSettings> configuration,
+        const InboundDatagramAssociationPolicy& policy) {
+        using Clock = InboundDatagramAssociation::Clock;
+        if (auto found = records.find(key); found != records.end()) {
+            if (&found->second->association->Policy() != &policy ||
+                std::exchange(found->second->association->claimed, true))
+                return {};
+            const auto protected_until = found->second->association->ProtectedUntil();
+            if (found->second->session.expired() &&
+                protected_until != Clock::time_point{} &&
+                protected_until < Clock::now()) {
+                try {
+                    auto record = memory::AllocateShared<UdpHandoffRecord>(policy);
+                    record->configuration = std::move(configuration);
+                    found->second = std::move(record);
+                } catch (...) {
+                    found->second->association->claimed = false;
+                    throw;
+                }
+            }
+            return found->second;
+        }
+        if (records.size() >= policy.capacity) {
+            const auto now = std::chrono::steady_clock::now();
+            for (auto it = records.begin(); it != records.end();) {
+                const auto& row = *it->second;
+                if (!row.association->claimed &&
+                    row.session.expired() && row.association->ProtectedUntil() < now)
+                    it = records.erase(it);
+                else ++it;
+            }
+            MaybeShrinkHashContainer(records);
+            if (records.size() >= policy.capacity) return {};
+        }
+        auto record = memory::AllocateShared<UdpHandoffRecord>(policy);
+        record->configuration = std::move(configuration);
+        records.emplace(key, record);
+        return record;
+    }
+
+    std::shared_ptr<UdpHandoffRecord> Claim(
+        const UdpHandoffIdentity& key,
+        std::shared_ptr<const proxyman::inbound::ProtocolSettings> configuration,
+        const InboundDatagramAssociationPolicy& policy) {
+        return Claim(records_, key, std::move(configuration), policy);
+    }
+
+private:
+    memory::ThreadLocalUnorderedMap<UdpHandoffIdentity, std::shared_ptr<UdpHandoffRecord>,
+                                    UdpHandoffIdentityHash> records_;
+};
 }  // namespace worker_detail

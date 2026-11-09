@@ -34,6 +34,26 @@ struct Http1MessageHead {
     [[nodiscard]] std::span<const uint8_t> ReadAhead() const noexcept {
         return {bytes + header_end, size - header_end};
     }
+    [[nodiscard]] buf::MultiBuffer TakeReadAheadMultiBuffer() {
+        if (size <= header_end) {
+            return {};
+        }
+        const size_t total_size = size;
+        if (storage && bytes == storage->data) {
+            size = header_end;
+            storage->Reset();
+            storage->Produce(static_cast<uint32_t>(total_size));
+            storage->Advance(static_cast<uint32_t>(header_end));
+            return buf::MultiBuffer{std::move(storage)};
+        }
+        buf::MultiBuffer mb;
+        const auto read_ahead = ReadAhead();
+        size = header_end;
+        if (!buf::AppendSpanToMultiBuffer(read_ahead, mb)) {
+            throw std::bad_alloc();
+        }
+        return mb;
+    }
 };
 
 // `initial` holds bytes already consumed while sniffing the protocol. Fails
@@ -139,6 +159,11 @@ using Http1ReadFraming =
     Http1ReadFraming read_framing,
     bool write_chunked,
     std::span<const uint8_t> read_ahead = {});
+[[nodiscard]] std::unique_ptr<AsyncStream> MakeHttp1BodyStream(
+    std::unique_ptr<AsyncStream> inner,
+    Http1ReadFraming read_framing,
+    bool write_chunked,
+    buf::MultiBuffer&& read_ahead);
 
 [[nodiscard]] net::awaitable<TransportBuildResult> DoHttp1ServerHandshake(
     std::unique_ptr<AsyncStream> stream,

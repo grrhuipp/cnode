@@ -7,7 +7,7 @@
 #include "app/stats.hpp"
 #include "features/routing/dispatcher.hpp"
 #include "../validator.hpp"
-#include "../encoding/server.hpp"
+#include "../encoding/body.hpp"
 #include "../vmess_crypto.hpp"
 #include "app/proxyman/inbound/factory.hpp"
 #include "app/proxyman/inbound/receiver_settings.hpp"

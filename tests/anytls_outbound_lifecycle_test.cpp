@@ -6,13 +6,11 @@
 #include "app/stats.hpp"
 #include "app/session_group_executor.hpp"
 #include "common/session.hpp"
-#include "common/memory_stats.hpp"
 #include "infra/runtime_config_types.hpp"
 #include "transport/internet/tls_stream.hpp"
 #include "transport/internet/tcp_stream.hpp"
 #include "transport/internet/outbound_target_builder.hpp"
 #include "transport/internet/timeout_scheduler.hpp"
-#include "transport/link_error.hpp"
 #include "../src/common/awaitable_task_group.hpp"
 
 #include <asio/as_tuple.hpp>

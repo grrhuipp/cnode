@@ -7,7 +7,6 @@
 #include "app/proxyman/outbound/factory.hpp"
 #include "app/stats.hpp"
 #include "app/worker.hpp"
-#include "app/worker_runtime_config.hpp"
 #include "infra/config_types.hpp"
 
 #include <asio/co_spawn.hpp>

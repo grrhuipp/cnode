@@ -122,6 +122,7 @@ public:
     bool WriteShutdownClosesLink() const noexcept override { return true; }
 
     void SetPendingData(const uint8_t* data, size_t len);
+    void SetPendingMultiBuffer(buf::MultiBuffer&& mb);
     net::awaitable<size_t> AsyncRead(net::mutable_buffer buffer) override;
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override;
     net::awaitable<size_t> AsyncWrite(net::const_buffer buffer) override;

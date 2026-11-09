@@ -3,7 +3,7 @@
 #include "common/allocator.hpp"
 #include "connection_timeouts.hpp"
 #include "common/buffer_util.hpp"
-#include "transport/link_error.hpp"
+#include "transport/link.hpp"
 
 #include <asio/as_tuple.hpp>
 #include <asio/bind_allocator.hpp>

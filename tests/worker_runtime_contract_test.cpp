@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "app/request_load_state.hpp"
+#include "app/proxyman/inbound/handler.hpp"
 
 TEST(WorkerRuntimeContract, Contract) {
     ::app::RequestLoadState load(3, 7);

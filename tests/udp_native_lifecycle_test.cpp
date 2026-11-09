@@ -1,16 +1,13 @@
 #include <stdexcept>
 #include <gtest/gtest.h>
 
-#include "worker/udp_association_reclaimer.hpp"
 #include "worker/udp_ingress.hpp"
-#include "worker/udp_handoff_directory.hpp"
 #include "ss_udp.hpp"
 #include "inbound/ss_inbound.hpp"
 
 #include "app/proxyman/inbound/receiver_settings.hpp"
 #include "app/stats.hpp"
 #include "common/sharded_user_stats.hpp"
-#include "common/user_profile.hpp"
 #include "common/session.hpp"
 #include "features/routing/dispatcher.hpp"
 #include "infra/config_types.hpp"

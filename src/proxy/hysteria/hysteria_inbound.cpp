@@ -1,7 +1,6 @@
 #include "../inbound_admission.hpp"
 #include "../../transport/internet/hysteria/hysteria_protocol.hpp"
 #include "../../transport/internet/hysteria/hysteria_ingress.hpp"
-#include "../../transport/internet/hysteria/quic_stream.hpp"
 
 #include "app/proxyman/inbound/factory.hpp"
 #include "app/proxyman/inbound/receiver_settings.hpp"
@@ -17,7 +16,6 @@
 #include "proxy/inbound.hpp"
 #include "transport/async_stream.hpp"
 #include "transport/link.hpp"
-#include "transport/link_error.hpp"
 
 #include <tl/expected.hpp>
 

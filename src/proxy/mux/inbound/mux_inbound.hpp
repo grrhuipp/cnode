@@ -1,7 +1,7 @@
 #pragma once
 
 #include "common/asio_types.hpp"
-#include "app/relay_types.hpp"
+#include "common/error.hpp"
 #include "transport/link.hpp"
 
 #include <cstdint>

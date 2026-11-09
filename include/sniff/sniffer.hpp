@@ -1,7 +1,7 @@
 #pragma once
 
 #include "common/allocator.hpp"
-#include "common/network.hpp"
+#include "common/target_address.hpp"
 #include "core/constants.hpp"
 
 #include <algorithm>

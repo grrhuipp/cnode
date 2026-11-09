@@ -3,8 +3,6 @@
 #include "app/proxyman/inbound/factory.hpp"
 #include "common/ip_address.hpp"
 
-#include "app/request_load_state.hpp"
-
 #include "app/rate_limiter.hpp"
 #include "app/stats.hpp"
 #include "common/allocator.hpp"
@@ -15,7 +13,6 @@
 #include "proxy/inbound.hpp"
 #include "transport/internet/proxy_protocol.hpp"
 #include "transport/internet/transport_stack.hpp"
-#include "transport/link_error.hpp"
 
 #include <exception>
 #include <new>

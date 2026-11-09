@@ -1,9 +1,8 @@
 #pragma once
 
 #include "hysteria_protocol.hpp"
-#include "quic_stream.hpp"
+#include "app/proxyman/inbound/handler.hpp"
 #include "app/proxyman/inbound/prepared_config.hpp"
-#include "app/session_capabilities.hpp"
 #include "app/rate_limiter.hpp"
 #include "common/allocator.hpp"
 #include "common/buf/multi_buffer.hpp"
@@ -12,6 +11,9 @@
 #include "common/asio_types.hpp"
 #include "common/string_hash.hpp"
 
+#include "common/target_address.hpp"
+#include "transport/async_stream.hpp"
+#include "transport/phase_deadline.hpp"
 #include <asio/steady_timer.hpp>
 #include <openssl/ssl.h>
 #include <nghttp3/nghttp3.h>
@@ -140,6 +142,154 @@ struct SslContextDeleter {
 };
 using SslContextPtr = std::unique_ptr<SSL_CTX, SslContextDeleter>;
 
+
+class QuicStreamState final : public memory::ThreadAllocated {
+public:
+    static constexpr size_t kMaxQueuedInputBytes = 512 * 1024;
+
+    QuicStreamState(net::io_context& io_context, int64_t stream_id, std::weak_ptr<Connection> owner);
+
+    [[nodiscard]] int64_t Id() const noexcept { return stream_id_; }
+    [[nodiscard]] net::io_context& IoContext() const noexcept { return io_context_; }
+    transport::CancellationSource& Cancellation() noexcept { return cancellation_; }
+    [[nodiscard]] bool PushInput(std::span<const uint8_t> data, bool fin);
+    // Bytes received but not yet read; the transport inspects a request
+    // prefix here before deciding who reads the stream.
+    [[nodiscard]] const buf::MultiBuffer& PendingInput() const noexcept { return input_; }
+    void DiscardInput(size_t bytes) noexcept;
+    void OnStreamClosed() noexcept;
+    void RemoteReset() noexcept;
+    void Cancel() noexcept;
+    net::awaitable<size_t> Read(net::mutable_buffer buffer);
+    net::awaitable<buf::MultiBuffer> ReadMultiBuffer();
+    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer payload);
+    void ShutdownWrite() noexcept;
+    void CheckWriteOpen() const;
+    // A notification is only a hint: the connection must recheck its queue
+    // and stream identity after every wait. ACKs broadcast to current waiters;
+    // shutdown/reset/cancel also wake them, but make the wait fail.
+    net::awaitable<void> WaitWritable();
+    void NotifyWritable() noexcept;
+
+    [[nodiscard]] bool Open() const noexcept { return !cancelled_; }
+    // Application completion does not retire transport output: queued bytes
+    // and FIN remain owned by the connection until native stream closure.
+    [[nodiscard]] bool DuplexFinished() const noexcept {
+        return !cancelled_ && input_done_ && input_.empty() && write_done_;
+    }
+
+private:
+    struct OutputWait final : memory::ThreadAllocated {
+        explicit OutputWait(net::any_io_executor executor)
+            : ready(std::move(executor), 0) {}
+        OutputWait(const OutputWait&) = delete;
+        OutputWait& operator=(const OutputWait&) = delete;
+        OutputWait(OutputWait&&) = delete;
+        OutputWait& operator=(OutputWait&&) = delete;
+
+        SignalChannel ready;
+        size_t waiters = 0;
+    };
+
+    void AcknowledgeInput(size_t bytes) noexcept;
+    void Abort(bool cancel_transport) noexcept;
+    void WakeReader() noexcept;
+
+    net::io_context& io_context_;
+    int64_t stream_id_;
+    std::weak_ptr<Connection> owner_;
+    SignalChannel input_signal_;
+    // Borrowed only while writers actually wait; idle streams retain no node.
+    std::unique_ptr<OutputWait> output_wait_;
+    buf::MultiBuffer input_;
+    bool input_done_ = false;
+    bool write_done_ = false;
+    bool cancelled_ = false;
+    transport::CancellationSource cancellation_;
+};
+
+// One Hysteria TCP request stream handed to the inbound handler.
+class QuicStream final : public AsyncStream {
+public:
+    // |state| must be non-null.
+    explicit QuicStream(std::shared_ptr<QuicStreamState> state);
+    ~QuicStream() noexcept override;
+    transport::CancellationSource& Cancellation() noexcept override { return state_->Cancellation(); }
+
+    net::awaitable<size_t> AsyncRead(net::mutable_buffer buffer) override;
+    net::awaitable<size_t> AsyncWrite(net::const_buffer buffer) override;
+    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override;
+    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer payload) override;
+    net::awaitable<void> WriteBuffers(
+        std::span<const net::const_buffer> buffers) override;
+    void ShutdownWrite() override;
+    void Cancel() noexcept override;
+    void Close() override;
+    void CloseAbortive() override;
+    [[nodiscard]] int NativeHandle() const override { return -1; }
+    [[nodiscard]] bool IsOpen() const override;
+
+protected:
+    StreamPhaseDeadline* LogicalPhaseDeadline() noexcept override { return &deadline_; }
+
+private:
+    std::shared_ptr<QuicStreamState> state_;
+    StreamPhaseDeadline deadline_;
+    bool closed_ = false;
+};
+
+// One Hysteria UDP session handed to the inbound handler. Every read yields
+// one reassembled datagram tagged with its target; every write sends one
+// datagram to the target it carries. Byte-stream I/O is not supported.
+// The owning connection keeps a raw pointer while the session is registered;
+// destruction unregisters it, and connection close detaches it first.
+class UdpSessionStream final : public AsyncStream {
+public:
+    // Bounds queued Buffer data capacity, not only the datagrams' payload sizes.
+    static constexpr size_t kMaxQueuedBytes = 512 * 1024;
+
+    UdpSessionStream(net::io_context& io_context, uint32_t session_id,
+                     TargetAddress first_target,
+                     std::weak_ptr<Connection> owner);
+    ~UdpSessionStream() noexcept override;
+
+    [[nodiscard]] uint32_t SessionId() const noexcept { return session_id_; }
+    // Target of the datagram that opened the session.
+    [[nodiscard]] const TargetAddress& FirstTarget() const noexcept { return first_target_; }
+
+    [[nodiscard]] bool Push(const TargetAddress& target, std::span<const uint8_t> payload);
+    // The owning connection closed; pending reads end and writes fail.
+    void Detach() noexcept;
+
+    transport::EofAction ReadEofAction() const noexcept override {
+        return transport::EofAction::WaitForPeer;
+    }
+    net::awaitable<size_t> AsyncRead(net::mutable_buffer buffer) override;
+    net::awaitable<size_t> AsyncWrite(net::const_buffer buffer) override;
+    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override;
+    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer packet) override;
+    void ShutdownWrite() override {}
+    void Cancel() noexcept override;
+    void Close() override;
+    [[nodiscard]] int NativeHandle() const override { return -1; }
+    [[nodiscard]] bool IsOpen() const override { return !closed_; }
+
+protected:
+    StreamPhaseDeadline* LogicalPhaseDeadline() noexcept override { return &deadline_; }
+
+private:
+    void WakeReader() noexcept;
+
+    uint32_t session_id_;
+    TargetAddress first_target_;
+    std::weak_ptr<Connection> owner_;
+    SignalChannel signal_;
+    memory::ThreadLocalDeque<buf::MultiBuffer> input_;
+    size_t queued_buffer_count_ = 0;
+    bool cancelled_ = false;
+    bool closed_ = false;
+    StreamPhaseDeadline deadline_;
+};
 // Worker-local sockets, receive staging, native send ownership and one expiry
 // timer. Each accepted QUIC connection stays on its accepting Worker, shared
 // by all its TCP streams and UDP sessions; listeners never transfer received

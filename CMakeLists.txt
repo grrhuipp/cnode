@@ -23,7 +23,6 @@ endif()
 option(CNODE_ENABLE_LTO "Enable Release link-time optimization" OFF)
 option(CNODE_RELEASE_DEBUG_SYMBOLS "Emit Release debug information for split symbols" ON)
 option(CNODE_RELEASE_FRAME_POINTERS "Keep Release frame pointers for profiling" ON)
-option(CNODE_MEMORY_STATS "Enable runtime live/peak memory object counters" OFF)
 set(CNODE_ASIO_RECYCLING_CACHE_SIZE 64 CACHE STRING "Asio per-thread small-block recycling cache size")
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -42,8 +41,7 @@ target_compile_options(cnode_build_options INTERFACE
 target_compile_definitions(cnode_build_options INTERFACE
     ASIO_STANDALONE ASIO_NO_DEPRECATED
     ASIO_RECYCLING_ALLOCATOR_CACHE_SIZE=${CNODE_ASIO_RECYCLING_CACHE_SIZE}
-    CNODE_USE_MIMALLOC
-    $<$<BOOL:${CNODE_MEMORY_STATS}>:CNODE_MEMORY_STATS>)
+    CNODE_USE_MIMALLOC)
 find_package(Threads REQUIRED)
 find_package(asio CONFIG REQUIRED)
 find_package(tl-expected CONFIG REQUIRED)
@@ -105,7 +103,6 @@ set(CNODE_CORE_SOURCES
     src/transport/internet/transport_stack.cpp
     src/transport/internet/transport_dialer.cpp
     src/transport/internet/hysteria/hysteria_protocol.cpp
-    src/transport/internet/hysteria/quic_stream.cpp
     src/transport/internet/hysteria/hysteria_ingress.cpp
     src/transport/internet/proxy_protocol.cpp
 
@@ -114,7 +111,6 @@ set(CNODE_CORE_SOURCES
     src/app/proxyman/inbound/factory.cpp
     src/app/proxyman/inbound/handler.cpp
     src/app/worker/udp_ingress.cpp
-    src/app/worker/udp_association_reclaimer.cpp
     src/app/proxyman/inbound/user_store.cpp
     src/app/proxyman/outbound/factory.cpp
     src/app/proxyman/outbound/handler.cpp
@@ -122,9 +118,7 @@ set(CNODE_CORE_SOURCES
     src/app/session_group_executor.cpp
     src/service/controller/controller.cpp
     src/service/controller/traffic_journal.cpp
-    src/service/controller/panel_inbound.cpp
     src/app/prepared_inbound.cpp
-    src/app/runtime_publication.cpp
     src/app/session_tracking.cpp
     src/proxy/mux/inbound/mux_inbound.cpp
     src/common/rule.cpp
@@ -143,22 +137,18 @@ set(CNODE_CORE_SOURCES
     src/proxy/vmess/validator.cpp
     src/proxy/vmess/vmess_cipher.cpp
     src/proxy/vmess/encoding/body.cpp
-    src/proxy/vmess/encoding/client.cpp
-    src/proxy/vmess/encoding/server.cpp
     src/proxy/vmess/inbound/vmess_inbound.cpp
     src/proxy/vmess/outbound/vmess_outbound.cpp
 
     # Proxy - VLESS
     src/proxy/vless/vless_codec.cpp
     src/proxy/vless/vless_encryption.cpp
-    src/proxy/vless/udp_framing.cpp
     src/proxy/vless/vless_vision.cpp
     src/proxy/vless/inbound/vless_inbound.cpp
     src/proxy/vless/outbound/vless_outbound.cpp
 
     # Proxy - Trojan
     src/proxy/trojan/trojan_codec.cpp
-    src/proxy/trojan/udp_framing.cpp
     src/proxy/trojan/inbound/trojan_inbound.cpp
     src/proxy/trojan/outbound/trojan_outbound.cpp
 
@@ -176,7 +166,6 @@ set(CNODE_CORE_SOURCES
 
     # Proxy - AnyTLS
     src/proxy/anytls/anytls_codec.cpp
-    src/proxy/anytls/padding.cpp
     src/proxy/anytls/inbound/anytls_inbound.cpp
     src/proxy/anytls/outbound/anytls_outbound.cpp
 
@@ -381,11 +370,11 @@ cnode_unit(xhttp_upload_stream_slot INCLUDES src/transport/internet)
 
 # Small isolated seams do not pull production objects compiled with other macros.
 target_compile_definitions(cnode_thread_memory_pool_test PRIVATE
-    CNODE_MEMORY_STATS CNODE_TEST_ALLOCATOR_FAULT)
+    CNODE_TEST_ALLOCATOR_FAULT)
 target_compile_definitions(cnode_awaitable_batch_test PRIVATE
     ASIO_DISABLE_AWAITABLE_FRAME_RECYCLING)
 target_compile_definitions(cnode_awaitable_task_group_test PRIVATE
-    ASIO_DISABLE_AWAITABLE_FRAME_RECYCLING CNODE_MEMORY_STATS)
+    ASIO_DISABLE_AWAITABLE_FRAME_RECYCLING)
 target_compile_options(cnode_awaitable_task_group_test PRIVATE
     "-include${CMAKE_CURRENT_SOURCE_DIR}/tests/async_allocation_fault.hpp")
 target_compile_options(cnode_timeout_scheduler_test PRIVATE

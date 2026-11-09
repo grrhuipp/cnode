@@ -2,7 +2,7 @@
 
 #include "common/asio_types.hpp"
 #include "common/buf/multi_buffer.hpp"
-#include "transport/link_error.hpp"
+#include "common/error.hpp"
 #include "transport/cancellation.hpp"
 
 #include <cstdint>
@@ -14,6 +14,18 @@
 class AsyncStream;
 
 namespace transport {
+
+// Logical I/O failures retain their application code across reader/writer
+// boundaries. They are not fabricated operating-system socket errors.
+class LinkError final : public std::exception {
+public:
+    explicit LinkError(ErrorCode code) noexcept : code_(code) {}
+    [[nodiscard]] ErrorCode code() const noexcept { return code_; }
+    const char* what() const noexcept override { return ErrorCodeToString(code_).data(); }
+
+private:
+    ErrorCode code_;
+};
 
 enum class EofAction : uint8_t {
     WaitForPeer,

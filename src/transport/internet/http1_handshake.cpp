@@ -53,6 +53,31 @@ public:
         }
     }
 
+    void SetPendingMultiBuffer(buf::MultiBuffer&& mb) {
+        if (closed_ || read_closed_) {
+            mb.clear();
+            return;
+        }
+        if (content_remaining_) {
+            const auto max_bytes = static_cast<size_t>(
+                std::min<uint64_t>(mb.byte_size(), *content_remaining_));
+            if (max_bytes < mb.byte_size()) {
+                buf::MultiBuffer trimmed;
+                if (!mb.MovePrefixTo(trimmed, max_bytes)) {
+                    throw std::bad_alloc();
+                }
+                mb.clear();
+                mb = std::move(trimmed);
+            }
+        }
+        if (mb.byte_size() == 0) {
+            mb.clear();
+            return;
+        }
+        pending_.MoveTo(mb);
+        pending_ = std::move(mb);
+    }
+
     net::awaitable<size_t> AsyncRead(net::mutable_buffer buffer) override {
         if (read_chunked_) {
             return ReadChunked(buffer);
@@ -496,8 +521,8 @@ net::awaitable<tl::expected<void, ErrorCode>> ReadClientResponse(
     }
     // HTTP handshakes run directly on TCP or TLS. Read-ahead returns to that
     // exact byte layer: TLS plaintext never enters the TCP ciphertext queue.
-    if (const auto read_ahead = head->ReadAhead(); !read_ahead.empty()) {
-        stream.PrependReadData(read_ahead);
+    if (auto read_ahead = head->TakeReadAheadMultiBuffer(); !read_ahead.empty()) {
+        stream.PrependReadMultiBuffer(std::move(read_ahead));
     }
     co_return tl::expected<void, ErrorCode>{};
 }
@@ -973,6 +998,17 @@ std::unique_ptr<AsyncStream> MakeHttp1BodyStream(
     return body;
 }
 
+std::unique_ptr<AsyncStream> MakeHttp1BodyStream(
+    std::unique_ptr<AsyncStream> inner,
+    Http1ReadFraming read_framing,
+    bool write_chunked,
+    buf::MultiBuffer&& read_ahead) {
+    auto body = std::make_unique<Http1BodyStream>(
+        std::move(inner), read_framing, write_chunked);
+    body->SetPendingMultiBuffer(std::move(read_ahead));
+    return body;
+}
+
 net::awaitable<TransportBuildResult> DoHttp1ServerHandshake(
     std::unique_ptr<AsyncStream> stream,
     const HttpConfig& cfg,
@@ -1041,8 +1077,8 @@ net::awaitable<TransportBuildResult> DoHttp1ServerHandshake(
         co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
     }
 
-    if (const auto read_ahead = head->ReadAhead(); !read_ahead.empty()) {
-        stream->PrependReadData(read_ahead);
+    if (auto read_ahead = head->TakeReadAheadMultiBuffer(); !read_ahead.empty()) {
+        stream->PrependReadMultiBuffer(std::move(read_ahead));
     }
     LOG_CONN_DEBUG(conn_id, "HTTP server handshake completed (path={})",
                    PublicHttpTargetForLog(EffectiveHttpPath(cfg.path)));
@@ -1148,8 +1184,8 @@ net::awaitable<TransportBuildResult> DoHttpUpgradeServerHandshake(
         co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
     }
 
-    if (const auto read_ahead = head->ReadAhead(); !read_ahead.empty()) {
-        stream->PrependReadData(read_ahead);
+    if (auto read_ahead = head->TakeReadAheadMultiBuffer(); !read_ahead.empty()) {
+        stream->PrependReadMultiBuffer(std::move(read_ahead));
     }
     LOG_CONN_DEBUG(conn_id, "HTTPUpgrade server handshake completed (path={})",
                    PublicHttpTargetForLog(EffectiveHttpPath(cfg.path)));
@@ -1169,8 +1205,8 @@ net::awaitable<TransportBuildResult> DoHttpUpgradeClientHandshake(
     if (!head) {
         co_return tl::unexpected(head.error());
     }
-    if (const auto read_ahead = head->ReadAhead(); !read_ahead.empty()) {
-        stream->PrependReadData(read_ahead);
+    if (auto read_ahead = head->TakeReadAheadMultiBuffer(); !read_ahead.empty()) {
+        stream->PrependReadMultiBuffer(std::move(read_ahead));
     }
     LOG_CONN_DEBUG(conn_id, "HTTPUpgrade client handshake completed (host={} path={})",
                    PublicHttpTargetForLog(effective_host), PublicHttpTargetForLog(req_path));
@@ -1256,15 +1292,15 @@ net::awaitable<TransportBuildResult> DoWsServerHandshake(
 
     // HTTP 头之后已读到的字节属于 WebSocket 帧流
     auto ws = std::make_unique<BaseWsStream>(std::move(stream), false);
-    const auto read_ahead = head->ReadAhead();
-    if (!read_ahead.empty()) {
-        ws->SetPendingData(read_ahead.data(), read_ahead.size());
+    const size_t pending_bytes = head->ReadAhead().size();
+    if (auto read_ahead = head->TakeReadAheadMultiBuffer(); !read_ahead.empty()) {
+        ws->SetPendingMultiBuffer(std::move(read_ahead));
     }
     LOG_CONN_TRACE(conn_id,
         "WebSocket server handshake accepted path='{}' host='{}' pending={}",
         PublicHttpTargetForLog(expected_path),
         PublicHttpTargetForLog(host),
-        read_ahead.size());
+        pending_bytes);
     LOG_CONN_DEBUG(conn_id, "WebSocket server handshake completed (path={})",
                    PublicHttpTargetForLog(expected_path));
     co_return std::unique_ptr<AsyncStream>(std::move(ws));

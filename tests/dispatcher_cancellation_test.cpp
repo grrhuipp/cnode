@@ -3,7 +3,7 @@
 #include "app/dispatcher/default_dispatcher.hpp"
 #include "app/dns/dns.hpp"
 #include "app/relay.hpp"
-#include "app/request_load_state.hpp"
+#include "app/proxyman/inbound/handler.hpp"
 #include "app/session_tracking.hpp"
 #include "common/rule.hpp"
 #include "app/proxyman/outbound/handler.hpp"

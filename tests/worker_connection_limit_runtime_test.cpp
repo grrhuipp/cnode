@@ -7,7 +7,6 @@
 #include "app/rate_limiter.hpp"
 #include "app/stats.hpp"
 #include "app/worker.hpp"
-#include "app/worker_runtime_config.hpp"
 #include "common/allocator.hpp"
 #include "proxy/inbound.hpp"
 #include "transport/async_stream.hpp"

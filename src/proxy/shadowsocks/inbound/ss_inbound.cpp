@@ -1,7 +1,6 @@
 #include "ss_inbound.hpp"
 #include "../../inbound_admission.hpp"
 #include "transport/async_stream.hpp"
-#include "transport/link_error.hpp"
 #include "common/address_codec.hpp"
 #include "../ss_udp.hpp"
 #include "../../uot/uot.hpp"

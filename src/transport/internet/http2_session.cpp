@@ -21,6 +21,7 @@
 #include <limits>
 #include <optional>
 #include <stdexcept>
+#include <type_traits>
 
 #include <tl/expected.hpp>
 
@@ -575,21 +576,25 @@ struct HpackHeaderField {
 // dynamic table unusable; callers must end the connection.
 class HpackDecoder final : public memory::ThreadAllocated {
 public:
-    using HeaderFields = memory::ThreadLocalVector<HpackHeaderField>;
-
-    std::optional<HeaderFields> Decode(std::span<const uint8_t> block) {
-        HeaderFields fields;
+    template <typename Visitor>
+    [[nodiscard]] bool Decode(std::span<const uint8_t> block, Visitor&& on_field) {
+        size_t field_count = 0;
         size_t header_list_size = 0;
-        const auto append_field = [&](HpackHeaderField field) {
-            const size_t field_size =
-                field.name.size() + field.value.size() + 32;
-            if (fields.size() >= kHpackMaxHeaderFields ||
+        const auto emit_field = [&](std::string_view name, std::string_view value) {
+            const size_t field_size = name.size() + value.size() + 32;
+            if (field_count >= kHpackMaxHeaderFields ||
                 field_size > kHpackMaxHeaderListSize - header_list_size) {
                 return false;
             }
+            ++field_count;
             header_list_size += field_size;
-            fields.push_back(std::move(field));
-            return true;
+            if constexpr (std::is_void_v<std::invoke_result_t<
+                              Visitor&, std::string_view, std::string_view>>) {
+                on_field(name, value);
+                return true;
+            } else {
+                return static_cast<bool>(on_field(name, value));
+            }
         };
         size_t offset = 0;
         bool allow_dynamic_resize = true;
@@ -598,44 +603,54 @@ public:
             if ((first & 0x80) != 0) {
                 allow_dynamic_resize = false;
                 const auto index = ReadInteger(block, offset, 7);
-                const auto field = index ? Lookup(*index) : std::nullopt;
-                if (!field ||
-                    !append_field(HpackHeaderField{
-                        memory::ThreadLocalString(field->name),
-                        memory::ThreadLocalString(field->value)})) {
-                    return std::nullopt;
+                const auto entry = index ? Lookup(*index) : std::nullopt;
+                if (!entry || !emit_field(entry->name, entry->value)) {
+                    return false;
                 }
                 continue;
             }
             if ((first & 0x40) != 0) {
                 allow_dynamic_resize = false;
                 auto field = ReadLiteral(block, offset, 6);
-                if (!field) {
-                    return std::nullopt;
+                if (!field || !emit_field(field->name, field->value)) {
+                    return false;
                 }
-                AddDynamic(*field);
-                if (!append_field(std::move(*field))) {
-                    return std::nullopt;
-                }
+                AddDynamic(std::move(*field));
                 continue;
             }
             if ((first & 0x20) != 0) {
                 if (!allow_dynamic_resize) {
-                    return std::nullopt;
+                    return false;
                 }
                 auto size = ReadInteger(block, offset, 5);
                 if (!size || !ResizeDynamic(*size)) {
-                    return std::nullopt;
+                    return false;
                 }
                 continue;
             }
             allow_dynamic_resize = false;
-            auto field = ReadLiteral(block, offset, 4);
-            if (!field || !append_field(std::move(*field))) {
-                return std::nullopt;
+            const auto name_index = ReadInteger(block, offset, 4);
+            if (!name_index) {
+                return false;
+            }
+            if (*name_index == 0) {
+                auto name = ReadString(block, offset);
+                auto value = name ? ReadString(block, offset) : std::nullopt;
+                if (!value || !emit_field(*name, *value)) {
+                    return false;
+                }
+            } else {
+                const auto indexed = Lookup(*name_index);
+                if (!indexed) {
+                    return false;
+                }
+                auto value = ReadString(block, offset);
+                if (!value || !emit_field(indexed->name, *value)) {
+                    return false;
+                }
             }
         }
-        return fields;
+        return true;
     }
 
     void Clear() noexcept {
@@ -935,14 +950,14 @@ private:
         return HpackHeaderField{std::move(name), std::move(*value)};
     }
 
-    void AddDynamic(const HpackHeaderField& field) {
+    void AddDynamic(HpackHeaderField&& field) {
         const size_t entry_size = field.name.size() + field.value.size() + 32;
         if (entry_size > dynamic_max_size_) {
             dynamic_table_.clear();
             dynamic_size_ = 0;
             return;
         }
-        dynamic_table_.push_front(field);
+        dynamic_table_.push_front(std::move(field));
         dynamic_size_ += entry_size;
         EvictDynamic();
     }
@@ -973,8 +988,9 @@ private:
 // decodes the whole block. Every block is decoded, including rejected
 // streams', to keep the connection-wide HPACK state in sync. Every failure
 // here is a connection error: the HPACK state can no longer be trusted.
-net::awaitable<tl::expected<HpackDecoder::HeaderFields, H2Error>> ReadH2HeaderFields(
-    AsyncStream& stream, HpackDecoder& decoder, H2Frame frame) {
+template <typename Visitor>
+net::awaitable<tl::expected<void, H2Error>> ReadH2HeaderFields(
+    AsyncStream& stream, HpackDecoder& decoder, H2Frame frame, Visitor&& on_field) {
     const uint32_t stream_id = frame.stream_id;
     const auto fragment = H2HeaderBlockFragment(frame);
     if (!fragment) {
@@ -985,11 +1001,12 @@ net::awaitable<tl::expected<HpackDecoder::HeaderFields, H2Error>> ReadH2HeaderFi
         co_return tl::unexpected(H2Error::ExcessiveLoad);
     }
     // RFC 7541 2.3 / RFC 9113 4.3: undecodable block is COMPRESSION_ERROR.
-    const auto decode = [&decoder](std::span<const uint8_t> block)
-        -> tl::expected<HpackDecoder::HeaderFields, H2Error> {
-        auto fields = decoder.Decode(block);
-        if (!fields) return tl::unexpected(H2Error::Compression);
-        return std::move(*fields);
+    const auto decode = [&decoder, &on_field](std::span<const uint8_t> block)
+        -> tl::expected<void, H2Error> {
+        if (!decoder.Decode(block, on_field)) {
+            return tl::unexpected(H2Error::Compression);
+        }
+        return {};
     };
     if ((frame.flags & kFlagEndHeaders) != 0) {
         co_return decode(*fragment);
@@ -1049,8 +1066,10 @@ struct H2RequestHeaders {
            EqualsAsciiCI(strip_port(authority), expected_host);
 }
 
-[[nodiscard]] std::optional<H2RequestHeaders> ParseH2RequestHeaders(
-    HpackDecoder::HeaderFields fields, std::string_view real_ip_header, bool trailers) {
+[[nodiscard]] net::awaitable<tl::expected<std::optional<H2RequestHeaders>, H2Error>>
+ParseH2RequestHeaders(
+    AsyncStream& stream, HpackDecoder& decoder, H2Frame frame,
+    std::string_view real_ip_header, bool trailers) {
     H2RequestHeaders request;
     std::optional<memory::ThreadLocalString> host;
     bool has_method = false;
@@ -1058,41 +1077,55 @@ struct H2RequestHeaders {
     bool has_authority = false;
     bool has_scheme = false;
     bool seen_regular = false;
+    bool valid = true;
     const auto take_once = [](bool& seen, memory::ThreadLocalString& out,
-                              memory::ThreadLocalString& value) {
+                              std::string_view value) {
         if (seen) return false;
         seen = true;
-        out = std::move(value);
+        out.assign(value);
         return true;
     };
-    for (auto& field : fields) {
-        const std::string_view name = field.name;
-        if (name.starts_with(':')) {
-            if (trailers || seen_regular) return std::nullopt;
-            bool accepted = false;
-            if (name == ":method") {
-                accepted = take_once(has_method, request.method, field.value);
-            } else if (name == ":path") {
-                accepted = take_once(has_path, request.path, field.value);
-            } else if (name == ":authority") {
-                accepted = take_once(has_authority, request.authority, field.value);
-            } else if (name == ":scheme") {
-                if (!has_scheme && !field.value.empty()) {
-                    has_scheme = true;
-                    accepted = true;
+    const auto decoded = co_await ReadH2HeaderFields(
+        stream, decoder, std::move(frame),
+        [&](std::string_view name, std::string_view value) {
+            if (!valid) return;
+            if (name.starts_with(':')) {
+                if (trailers || seen_regular) {
+                    valid = false;
+                    return;
                 }
+                bool accepted = false;
+                if (name == ":method") {
+                    accepted = take_once(has_method, request.method, value);
+                } else if (name == ":path") {
+                    accepted = take_once(has_path, request.path, value);
+                } else if (name == ":authority") {
+                    accepted = take_once(has_authority, request.authority, value);
+                } else if (name == ":scheme") {
+                    if (!has_scheme && !value.empty()) {
+                        has_scheme = true;
+                        accepted = true;
+                    }
+                }
+                if (!accepted) {
+                    valid = false;
+                }
+                return;
             }
-            if (!accepted) return std::nullopt;
-        } else {
-            if (!IsValidHttp2HeaderName(name)) return std::nullopt;
+            if (!IsValidHttp2HeaderName(name)) {
+                valid = false;
+                return;
+            }
             seen_regular = true;
             if (name == "host") {
-                if (host) return std::nullopt;
-                host = std::move(field.value);
+                if (host) {
+                    valid = false;
+                    return;
+                }
+                host.emplace(value);
             } else if (!trailers && !real_ip_header.empty() &&
                        EqualsAsciiCI(name, real_ip_header)) {
                 if (request.metadata.real_ip.empty()) {
-                    const std::string_view value(field.value);
                     const std::string_view real_ip =
                         TrimAscii(value.substr(0, value.find(',')));
                     if (!real_ip.empty()) {
@@ -1101,16 +1134,23 @@ struct H2RequestHeaders {
                     }
                 }
             }
-        }
+        });
+    if (!decoded) {
+        co_return tl::unexpected(decoded.error());
+    }
+    if (!valid) {
+        co_return std::optional<H2RequestHeaders>{};
     }
     if (host) {
-        if (has_authority && !EqualsAsciiCI(request.authority, *host)) return std::nullopt;
+        if (has_authority && !EqualsAsciiCI(request.authority, *host)) {
+            co_return std::optional<H2RequestHeaders>{};
+        }
         if (!has_authority) request.authority = std::move(*host);
     }
     if (!trailers && (request.method.empty() || request.path.empty() || !has_scheme)) {
-        return std::nullopt;
+        co_return std::optional<H2RequestHeaders>{};
     }
-    return request;
+    co_return std::optional<H2RequestHeaders>{std::move(request)};
 }
 
 // Client half of one request on a dedicated connection. Frames are pulled on
@@ -1750,32 +1790,40 @@ private:
     // Returns true when the response already ended the stream.
     net::awaitable<bool> ReadResponseHeaders(H2Frame frame) {
         const bool end_stream = (frame.flags & kFlagEndStream) != 0;
-        const auto fields = co_await ReadH2HeaderFields(
-            *inner_, response_decoder_, std::move(frame));
-        if (!fields) {
-            co_await FailConnection(fields.error());
-            ThrowHttp2StreamError("invalid HTTP/2 response header block");
-        }
-        std::string_view status;
+        std::array<char, 4> status_buf{};
+        size_t status_len = 0;
         bool has_status = false;
         bool seen_regular = false;
-        for (const auto& field : *fields) {
-            const std::string_view name = field.name;
-            if (name.starts_with(':')) {
-                if (seen_regular || name != ":status" || has_status) {
-                    co_await FailConnection(H2Error::Protocol);
-                    ThrowHttp2StreamError("invalid HTTP/2 response pseudo-headers");
+        const char* header_error = nullptr;
+        const auto decoded = co_await ReadH2HeaderFields(
+            *inner_, response_decoder_, std::move(frame),
+            [&](std::string_view name, std::string_view value) {
+                if (header_error) return;
+                if (name.starts_with(':')) {
+                    if (seen_regular || name != ":status" || has_status) {
+                        header_error = "invalid HTTP/2 response pseudo-headers";
+                        return;
+                    }
+                    has_status = true;
+                    status_len = std::min(value.size(), status_buf.size());
+                    std::memcpy(status_buf.data(), value.data(), status_len);
+                } else {
+                    if (!IsValidHttp2HeaderName(name)) {
+                        header_error = "invalid HTTP/2 response header name";
+                        return;
+                    }
+                    seen_regular = true;
                 }
-                has_status = true;
-                status = field.value;
-            } else {
-                if (!IsValidHttp2HeaderName(name)) {
-                    co_await FailConnection(H2Error::Protocol);
-                    ThrowHttp2StreamError("invalid HTTP/2 response header name");
-                }
-                seen_regular = true;
-            }
+            });
+        if (!decoded) {
+            co_await FailConnection(decoded.error());
+            ThrowHttp2StreamError("invalid HTTP/2 response header block");
         }
+        if (header_error) {
+            co_await FailConnection(H2Error::Protocol);
+            ThrowHttp2StreamError(header_error);
+        }
+        const std::string_view status(status_buf.data(), status_len);
         const auto is_digit = [](char ch) noexcept {
             return ch >= '0' && ch <= '9';
         };
@@ -1803,21 +1851,26 @@ private:
             co_await FailConnection(H2Error::Protocol);
             ThrowHttp2StreamError("invalid HTTP/2 response trailers");
         }
-        const auto fields = co_await ReadH2HeaderFields(
-            *inner_, response_decoder_, std::move(frame));
-        if (!fields) {
-            co_await FailConnection(fields.error());
+        const char* trailer_error = nullptr;
+        const auto decoded = co_await ReadH2HeaderFields(
+            *inner_, response_decoder_, std::move(frame),
+            [&](std::string_view name, std::string_view) {
+                if (trailer_error) return;
+                if (name.starts_with(':')) {
+                    trailer_error = "pseudo-header in HTTP/2 response trailers";
+                    return;
+                }
+                if (!IsValidHttp2HeaderName(name)) {
+                    trailer_error = "invalid HTTP/2 trailer header name";
+                }
+            });
+        if (!decoded) {
+            co_await FailConnection(decoded.error());
             ThrowHttp2StreamError("invalid HTTP/2 trailer header block");
         }
-        for (const auto& field : *fields) {
-            if (field.name.starts_with(':')) {
-                co_await FailConnection(H2Error::Protocol);
-                ThrowHttp2StreamError("pseudo-header in HTTP/2 response trailers");
-            }
-            if (!IsValidHttp2HeaderName(field.name)) {
-                co_await FailConnection(H2Error::Protocol);
-                ThrowHttp2StreamError("invalid HTTP/2 trailer header name");
-            }
+        if (trailer_error) {
+            co_await FailConnection(H2Error::Protocol);
+            ThrowHttp2StreamError(trailer_error);
         }
     }
     std::unique_ptr<AsyncStream> inner_;
@@ -2649,20 +2702,21 @@ private:
         const bool trailers = streams_.contains(stream_id);
         const std::string_view real_ip_header = http_config_
             ? std::string_view(http_config_->real_ip_header) : std::string_view{};
-        tl::expected<HpackDecoder::HeaderFields, H2Error> fields;
+        const bool closed_client_stream =
+            !trailers && (stream_id & 1u) != 0 && stream_id <= last_remote_stream_id_;
+        tl::expected<std::optional<H2RequestHeaders>, H2Error> parsed;
         try {
-            fields = co_await ReadH2HeaderFields(*stream_, hpack_decoder_, std::move(frame));
+            parsed = co_await ParseH2RequestHeaders(
+                *stream_, hpack_decoder_, std::move(frame),
+                real_ip_header, trailers || closed_client_stream);
         } catch (const std::bad_alloc&) {
             CancelAll();
             throw;
         }
-        if (!fields) {
-            co_return co_await FailConnection(fields.error());
+        if (!parsed) {
+            co_return co_await FailConnection(parsed.error());
         }
-        const bool closed_client_stream =
-            !trailers && (stream_id & 1u) != 0 && stream_id <= last_remote_stream_id_;
-        auto request = ParseH2RequestHeaders(
-            std::move(*fields), real_ip_header, trailers || closed_client_stream);
+        auto request = std::move(*parsed);
         if (closed_client_stream) {
             if (end_stream && request.has_value()) {
                 co_return true;

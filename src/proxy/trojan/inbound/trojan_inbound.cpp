@@ -3,7 +3,6 @@
 #include "common/sharded_user_stats.hpp"
 #include "transport/async_stream.hpp"
 #include "../trojan_codec.hpp"
-#include "../udp_framing.hpp"
 #include "app/rate_limiter.hpp"
 #include "app/stats.hpp"
 #include "features/routing/dispatcher.hpp"

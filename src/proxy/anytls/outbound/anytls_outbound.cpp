@@ -24,7 +24,6 @@
 #include "app/proxyman/outbound/factory.hpp"
 #include "transport/internet/outbound_target_builder.hpp"
 #include "transport/internet/timeout_scheduler.hpp"
-#include "transport/link_error.hpp"
 
 #include <asio/experimental/channel.hpp>
 #include <openssl/crypto.h>

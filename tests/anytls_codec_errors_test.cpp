@@ -2,7 +2,6 @@
 
 #include "anytls_codec.hpp"
 #include "transport/async_stream.hpp"
-#include "transport/link_error.hpp"
 
 #include <asio/co_spawn.hpp>
 #include <asio/post.hpp>

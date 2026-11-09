@@ -6,7 +6,6 @@
 #include "common/target_address.hpp"
 #include "transport/internet/datagram_socket.hpp"
 #include "transport/link.hpp"
-#include "transport/link_error.hpp"
 
 #include <asio/as_tuple.hpp>
 #include <asio/experimental/awaitable_operators.hpp>

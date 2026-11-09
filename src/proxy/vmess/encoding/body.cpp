@@ -1,6 +1,8 @@
 #include "body.hpp"
 
+#include "common/address_codec.hpp"
 #include "common/buffer_util.hpp"
+#include "common/byte_reader.hpp"
 #include "common/error.hpp"
 #include "infra/log.hpp"
 #include "transport/link.hpp"
@@ -10,10 +12,10 @@
 #include <asio/this_coro.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <new>
 #include <string_view>
-
 namespace vmess::encoding {
 
 namespace {
@@ -558,4 +560,583 @@ void BodyDecoder::FinishRecord() noexcept {
     pending_read_.ReleaseIfIdle();
 }
 
+
+// ============================================================================
+// ClientSession
+// ============================================================================
+
+namespace {
+
+// Version, body IV/key, response header, options, security, reserved,
+// command, largest address and FNV-1a checksum.
+constexpr size_t kRequestHeaderMax = 1 + 16 + 16 + 1 + 1 + 1 + 1 + 1 + kMaxEncodedAddressSize + 4;
+// AuthID, sealed length, connection nonce, sealed header.
+constexpr size_t kRequestPacketMax = 16 + 18 + 8 + kRequestHeaderMax + 16;
+constexpr size_t kResponseHeaderMax = 1024;
+[[nodiscard]] constexpr uint8_t ClientOptions(Security security) noexcept {
+    uint8_t options = Option::CHUNK_STREAM | Option::CHUNK_MASKING;
+    if (security != Security::NONE && security != Security::ZERO) {
+        options |= Option::GLOBAL_PADDING;
+    }
+    return options;
+}
+
+tl::expected<size_t, ErrorCode> BuildRequestHeaderPacket(
+    const MemoryAccount& user,
+    const AES_KEY& auth_id_key,
+    const TargetAddress& target,
+    Security security,
+    Command command,
+    const BodyKey& request_body,
+    uint8_t response_header,
+    ForwardedMetadataView forwarded,
+    std::array<uint8_t, kRequestPacketMax>& packet) {
+    std::array<uint8_t, kRequestHeaderMax> header{};
+    struct HeaderCleanseGuard {
+        std::array<uint8_t, kRequestHeaderMax>& buf;
+        ~HeaderCleanseGuard() noexcept { OPENSSL_cleanse(buf.data(), buf.size()); }
+    } cleanse_header{header};
+    ByteWriter writer(header.data(), header.size());
+    writer.WriteU8(VERSION);
+    writer.WriteBytes(request_body.iv.data(), request_body.iv.size());
+    writer.WriteBytes(request_body.key.data(), request_body.key.size());
+    writer.WriteU8(response_header);
+    writer.WriteU8(ClientOptions(security));
+    // High nibble: header padding length, always zero here.
+    writer.WriteU8(static_cast<uint8_t>(security));
+    writer.WriteU8(0);
+    writer.WriteU8(static_cast<uint8_t>(command));
+    if (!writer.Ok()) {
+        return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+    }
+    size_t header_len = writer.Position();
+    if (command == Command::TCP || command == Command::UDP) {
+        if (!target.IsValid() || (target.IsDomain() && target.host.size() > 253)) {
+            return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+        }
+        const size_t address_size = EncodeAddressTo(
+            target, header.data() + header_len, header.size() - header_len,
+            AddressWireFormat::PortFirst, forwarded);
+        if (address_size == 0) {
+            return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+        }
+        header_len += address_size;
+    } else if (command != Command::Mux) {
+        return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+    }
+    const uint32_t checksum = FNV1a32(header.data(), header_len);
+    header[header_len++] = static_cast<uint8_t>(checksum >> 24);
+    header[header_len++] = static_cast<uint8_t>(checksum >> 16);
+    header[header_len++] = static_cast<uint8_t>(checksum >> 8);
+    header[header_len++] = static_cast<uint8_t>(checksum);
+
+    const int64_t timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    uint8_t* auth_id = packet.data();
+    uint8_t* sealed_length = packet.data() + 16;
+    uint8_t* connection_nonce = packet.data() + 34;
+    uint8_t* sealed_header = packet.data() + 42;
+    GenerateAuthID(auth_id_key, timestamp, auth_id);
+    if (RAND_bytes(connection_nonce, 8) != 1) {
+        return tl::unexpected(ErrorCode::INTERNAL);
+    }
+    const std::span<const uint8_t, 16> auth_id_view(auth_id, 16);
+    const std::span<const uint8_t, 8> nonce_view(connection_nonce, 8);
+
+    const auto length_key = RequestHeaderLengthKey(user.cmd_key, auth_id_view, nonce_view);
+    const uint8_t length_plain[2] = {
+        static_cast<uint8_t>(header_len >> 8),
+        static_cast<uint8_t>(header_len),
+    };
+    if (!AES128GCMEncrypt(length_key.key.data(), length_key.nonce.data(),
+                          auth_id, 16,
+                          length_plain, sizeof(length_plain),
+                          sealed_length, sealed_length + 2)) {
+        return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+    }
+
+    const auto payload_key = RequestHeaderPayloadKey(user.cmd_key, auth_id_view, nonce_view);
+    if (!AES128GCMEncrypt(payload_key.key.data(), payload_key.nonce.data(),
+                          auth_id, 16,
+                          header.data(), header_len,
+                          sealed_header, sealed_header + header_len)) {
+        return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+    }
+    return 42 + header_len + 16;
+}
+
+[[noreturn]] void ThrowResponseHeaderError() {
+    throw IoSystemError(io_error::connection_reset, "VMess client read response header failed");
+}
+
+}  // namespace
+
+ClientSession::SessionKeys ClientSession::GenerateKeys() {
+    std::array<uint8_t, 33> random_bytes{};
+    if (RAND_bytes(random_bytes.data(), static_cast<int>(random_bytes.size())) != 1) {
+        throw IoSystemError(io_error::operation_aborted, "VMess client session random init failed");
+    }
+    SessionKeys keys;
+    std::memcpy(keys.request.key.data(), random_bytes.data(), 16);
+    std::memcpy(keys.request.iv.data(), random_bytes.data() + 16, 16);
+    keys.response_header = random_bytes[32];
+    keys.response = ResponseBodyKey(keys.request);
+    OPENSSL_cleanse(random_bytes.data(), random_bytes.size());
+    return keys;
+}
+
+ClientSession::ClientSession(Security security, Command command)
+    : security_(security)
+    , keys_(GenerateKeys())
+    , request_encoder_(BodyOptions{security, ClientOptions(security), command},
+                       keys_.request, keys_.request)
+    , response_decoder_(BodyOptions{security, ClientOptions(security), command},
+                        keys_.request, keys_.response) {}
+
+net::awaitable<VMessHandshakeResult> ClientSession::EncodeRequestHeader(
+    AsyncStream& stream,
+    const MemoryAccount& user,
+    const AES_KEY& auth_id_key,
+    const TargetAddress& target,
+    Command command,
+    ForwardedMetadataView forwarded) {
+    if (request_encoder_.Failed()) {
+        co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+    }
+    if (request_header_sent_) {
+        co_return VMessHandshakeResult{};
+    }
+    try {
+        request_encoder_.CheckWritable();
+    } catch (const transport::WriteClosed&) {
+        co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+    }
+    if ((co_await net::this_coro::cancellation_state).cancelled() !=
+        net::cancellation_type::none) {
+        co_return tl::unexpected(ErrorCode::CANCELLED);
+    }
+    std::array<uint8_t, kRequestPacketMax> packet{};
+    struct PacketCleanseGuard {
+        std::array<uint8_t, kRequestPacketMax>& buf;
+        ~PacketCleanseGuard() noexcept { OPENSSL_cleanse(buf.data(), buf.size()); }
+    } cleanse_packet{packet};
+    auto built = BuildRequestHeaderPacket(
+        user, auth_id_key, target, security_, command, keys_.request,
+        keys_.response_header, forwarded, packet);
+    if (!built) {
+        co_return tl::unexpected(built.error());
+    }
+    OPENSSL_cleanse(keys_.request.key.data(), keys_.request.key.size());
+    OPENSSL_cleanse(keys_.request.iv.data(), keys_.request.iv.size());
+    auto fail_request = [&]() {
+        request_encoder_.Abort();
+        stream.CloseAbortive();
+    };
+    try {
+        const std::array<net::const_buffer, 1> buffers{net::buffer(packet.data(), *built)};
+        co_await stream.WriteBuffers(buffers);
+    } catch (const transport::WriteClosed&) {
+        request_encoder_.Finish();
+        co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+    } catch (const transport::LinkError& e) {
+        fail_request();
+        co_return tl::unexpected(e.code());
+    } catch (const std::bad_alloc&) {
+        fail_request();
+        co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+    } catch (const IoSystemError& e) {
+        fail_request();
+        co_return tl::unexpected(MapAsioError(e.code()));
+    } catch (...) {
+        fail_request();
+        co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+    }
+    request_header_sent_ = true;
+    co_return VMessHandshakeResult{};
+}
+
+net::awaitable<void> ClientSession::EncodeRequestBody(
+    AsyncStream& stream,
+    buf::MultiBuffer mb) {
+    return request_encoder_.WriteMultiBuffer(
+        stream, std::move(mb), "VMess request write cancelled before start");
+}
+
+net::awaitable<void> ClientSession::EncodeRequestBody(
+    AsyncStream& stream,
+    std::span<const net::const_buffer> buffers) {
+    return request_encoder_.WriteBuffers(
+        stream, buffers, "VMess request write cancelled before start");
+}
+
+net::awaitable<void> ClientSession::EncodeRequestBodyEOF(AsyncStream& stream) {
+    return request_encoder_.WriteEOF(
+        stream, "VMess request EOF cancelled before start");
+}
+
+net::awaitable<void> ClientSession::DecodeResponseHeader(AsyncStream& stream) {
+    auto reset_header_state = [this]() noexcept {
+        memory::ByteVector{}.swap(response_header_sealed_);
+        response_length_read_ = 0;
+        response_header_read_ = 0;
+    };
+    auto fail_response = [&]() noexcept {
+        response_decoder_.Abort();
+        reset_header_state();
+        OPENSSL_cleanse(keys_.response.key.data(), keys_.response.key.size());
+        OPENSSL_cleanse(keys_.response.iv.data(), keys_.response.iv.size());
+    };
+    try {
+        if (response_header_sealed_.empty()) {
+            if (!co_await response_decoder_.ReadExact(
+                    stream, response_length_, response_length_read_)) {
+                ThrowResponseHeaderError();
+            }
+            const auto length_key = ResponseHeaderLengthKey(keys_.response.key, keys_.response.iv);
+            std::array<uint8_t, 2> length{};
+            size_t length_size = 0;
+            if (!AES128GCMDecryptTo(length_key.key.data(), length_key.nonce.data(),
+                                    length_key.nonce.size(),
+                                    response_length_.data(), response_length_.size(),
+                                    nullptr, 0,
+                                    length.data(), length.size(), length_size) ||
+                length_size != length.size()) {
+                ThrowResponseHeaderError();
+            }
+            const size_t header_len = (static_cast<size_t>(length[0]) << 8) | length[1];
+            if (header_len < 4 || header_len > kResponseHeaderMax) {
+                ThrowResponseHeaderError();
+            }
+            response_header_sealed_.resize(header_len + 16);
+        }
+
+        if (!co_await response_decoder_.ReadExact(
+                stream, response_header_sealed_, response_header_read_)) {
+            ThrowResponseHeaderError();
+        }
+        const auto payload_key = ResponseHeaderPayloadKey(keys_.response.key, keys_.response.iv);
+        const size_t header_len = response_header_sealed_.size() - 16;
+        size_t opened = 0;
+        if (!AES128GCMDecryptTo(payload_key.key.data(), payload_key.nonce.data(),
+                                payload_key.nonce.size(),
+                                response_header_sealed_.data(), response_header_sealed_.size(),
+                                nullptr, 0,
+                                response_header_sealed_.data(), header_len, opened) ||
+            opened != header_len ||
+            response_header_sealed_[0] != keys_.response_header) {
+            ThrowResponseHeaderError();
+        }
+        response_header_received_ = true;
+        OPENSSL_cleanse(keys_.response.key.data(), keys_.response.key.size());
+        OPENSSL_cleanse(keys_.response.iv.data(), keys_.response.iv.size());
+        reset_header_state();
+    } catch (const IoSystemError& error) {
+        if (error.code() != io_error::operation_aborted) {
+            fail_response();
+        }
+        throw;
+    } catch (...) {
+        fail_response();
+        throw;
+    }
+}
+
+net::awaitable<buf::MultiBuffer> ClientSession::DecodeResponse(AsyncStream& stream) {
+    if (response_header_received_) {
+        return response_decoder_.Read(stream);
+    }
+    return DecodeFirstResponse(stream);
+}
+
+net::awaitable<buf::MultiBuffer> ClientSession::DecodeFirstResponse(AsyncStream& stream) {
+    if (!response_header_received_) {
+        co_await DecodeResponseHeader(stream);
+    }
+    co_return co_await response_decoder_.Read(stream);
+}
+
+// ============================================================================
+// ServerSession
+// ============================================================================
+
+namespace {
+
+// AuthID (16) + sealed length (2 + 16) + connection nonce (8).
+constexpr size_t kRequestHeaderPrefixSize = 16 + 18 + 8;
+
+[[nodiscard]] bool IsSupportedSecurity(Security security) noexcept {
+    switch (security) {
+    case Security::AES_128_GCM:
+    case Security::CHACHA20_POLY1305:
+    case Security::NONE:
+    case Security::ZERO:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool ParseDecryptedHeader(const uint8_t* data, size_t len,
+                          uint64_t trace_conn_id,
+                          VMessRequest& request) {
+    static constexpr size_t kFixedHeaderSize = 38;
+    if (len < kFixedHeaderSize + 4) {
+        LOG_CONN_TRACE(trace_conn_id, "decrypted header too short len={} min={}",
+                         len,
+                         kFixedHeaderSize + 4);
+        return false;
+    }
+
+    ByteReader reader(data, len);
+
+    const uint8_t version = reader.ReadU8();
+    if (!reader.Ok() || version != VERSION) {
+        LOG_CONN_DEBUG(trace_conn_id, "unsupported version {}", version);
+        return false;
+    }
+
+    auto iv_span = reader.ReadBytes(16);
+    if (!reader.Ok()) return false;
+    std::memcpy(request.body_iv.data(), iv_span.data(), 16);
+
+    auto key_span = reader.ReadBytes(16);
+    if (!reader.Ok()) return false;
+    std::memcpy(request.body_key.data(), key_span.data(), 16);
+
+    request.response_header = reader.ReadU8();
+    request.options = reader.ReadU8();
+
+    uint8_t ps = reader.ReadU8();
+    const uint8_t padding_len = (ps >> 4) & 0x0F;
+    request.security = static_cast<Security>(ps & 0x0F);
+    // Reject before routing: an unknown body security can never be framed.
+    if (!IsSupportedSecurity(request.security)) {
+        LOG_CONN_DEBUG(trace_conn_id, "unsupported security {}", static_cast<int>(request.security));
+        return false;
+    }
+
+    reader.Skip(1);
+
+    request.command = static_cast<Command>(reader.ReadU8());
+    if (!reader.Ok()) return false;
+
+    if (request.command == Command::Mux) {
+        request.target = TargetAddress("v1.mux.cool", 0);
+    } else if (request.command == Command::TCP || request.command == Command::UDP) {
+        auto address = DecodeAddress(
+            std::span(data + reader.Position(), reader.Remaining()),
+            AddressWireFormat::PortFirst,
+            {.require_non_empty_domain = true, .allow_metadata = true});
+        if (address.status != AddressDecodeStatus::Complete) return false;
+        reader.Skip(address.consumed);
+        request.target = std::move(address.target);
+        request.forwarded = std::move(address.forwarded);
+        if (!request.target.IsValid()) return false;
+    } else {
+        LOG_CONN_DEBUG(trace_conn_id, "unsupported command {}", static_cast<int>(request.command));
+        return false;
+    }
+
+    reader.Skip(padding_len);
+    if (!reader.Ok()) return false;
+
+    size_t pos = reader.Position();
+    if (pos + 4 != len) return false;
+
+    uint32_t expected_fnv = FNV1a32(data, pos);
+    uint32_t actual_fnv = reader.ReadU32BE();
+
+    if (!reader.Ok() || expected_fnv != actual_fnv) {
+        LOG_CONN_DEBUG(trace_conn_id, "request header checksum mismatch");
+        return false;
+    }
+
+    LOG_CONN_TRACE(trace_conn_id, "header decoded target={} command={} security={} options={:#04x} padding={}",
+                     request.target,
+                     static_cast<int>(request.command),
+                     static_cast<int>(request.security),
+                     static_cast<int>(request.options),
+                     padding_len);
+
+    return true;
+}
+
+// `packet` starts at the AuthID and holds the whole sealed header.
+bool OpenRequestHeader(const uint8_t* packet,
+                       std::shared_ptr<const proxyman::inbound::UserStore::VmessCredential>& user,
+                       size_t header_len,
+                       uint64_t trace_conn_id,
+                       VMessRequest& request,
+                       std::string_view& failure_reason) {
+    const auto key = RequestHeaderPayloadKey(
+        user->cmd_key,
+        std::span<const uint8_t, 16>(packet, 16),
+        std::span<const uint8_t, 8>(packet + 34, 8));
+    memory::ByteVector plain(header_len);
+    struct PlainCleanseGuard {
+        memory::ByteVector& buf;
+        ~PlainCleanseGuard() noexcept {
+            if (!buf.empty()) OPENSSL_cleanse(buf.data(), buf.size());
+        }
+    } cleanse_plain{plain};
+    size_t written = 0;
+    if (!AES128GCMDecryptTo(key.key.data(), key.nonce.data(), key.nonce.size(),
+            packet + kRequestHeaderPrefixSize, header_len + 16, packet, 16,
+            plain.data(), plain.size(), written)) {
+        failure_reason = "authentication failed: request header integrity check failed";
+        LOG_CONN_DEBUG(trace_conn_id, "request header authentication failed");
+        return false;
+    }
+    request.user = std::move(user);
+    if (!ParseDecryptedHeader(plain.data(), written, trace_conn_id, request)) {
+        failure_reason = "invalid authenticated request header";
+        return false;
+    }
+    return true;
+}
+
+[[nodiscard]] BodyOptions RequestBodyOptions(const VMessRequest& request) noexcept {
+    return BodyOptions{request.security, request.options, request.command};
+}
+
+[[nodiscard]] BodyKey RequestBodyKey(const VMessRequest& request) noexcept {
+    return BodyKey{request.body_key, request.body_iv};
+}
+
+bool BuildResponseHeader(const VMessRequest& request,
+                         const BodyKey& response,
+                         std::array<uint8_t, kResponseHeaderSize>& out) {
+    // xray-core does not echo request body options in the response header.
+    const uint8_t payload[4] = {request.response_header, 0, 0, 0};
+    const uint8_t length[2] = {0, sizeof(payload)};
+
+    const auto length_key = ResponseHeaderLengthKey(response.key, response.iv);
+    if (!AES128GCMEncrypt(length_key.key.data(), length_key.nonce.data(), nullptr, 0,
+                          length, sizeof(length), out.data(), out.data() + 2)) {
+        return false;
+    }
+    const auto payload_key = ResponseHeaderPayloadKey(response.key, response.iv);
+    return AES128GCMEncrypt(payload_key.key.data(), payload_key.nonce.data(), nullptr, 0,
+                            payload, sizeof(payload), out.data() + 18, out.data() + 22);
+}
+
+}  // namespace
+
+RequestBodyReader::RequestBodyReader(const VMessRequest& request,
+                                     AsyncStream& stream)
+    : decoder_(RequestBodyOptions(request), RequestBodyKey(request), RequestBodyKey(request))
+    , stream_(&stream)
+    , is_udp_(request.command == Command::UDP)
+    , udp_target_(is_udp_ ? request.target : TargetAddress{}) {}
+
+net::awaitable<buf::MultiBuffer> RequestBodyReader::ReadUdpMultiBuffer() {
+    auto mb = co_await decoder_.Read(*stream_);
+    if (mb.byte_size() != 0 && !buf::SetUdpTarget(mb, udp_target_)) {
+        throw std::bad_alloc();
+    }
+    co_return mb;
+}
+
+ResponseBodyWriter::ResponseBodyWriter(
+    const VMessRequest& request,
+    const BodyKey& response,
+    AsyncStream& stream,
+    const std::array<uint8_t, kResponseHeaderSize>& response_header)
+    : encoder_(RequestBodyOptions(request), RequestBodyKey(request), response)
+    , stream_(&stream)
+    , udp_target_(request.command == Command::UDP ? request.target : TargetAddress{})
+    , response_header_(response_header) {}
+
+ServerSession::ServerSession(std::string_view tag)
+    : tag_(tag) {}
+
+std::pair<std::optional<VMessRequest>, size_t> ServerSession::DecodeRequestHeader(
+    const uint8_t* data, size_t len, uint64_t trace_conn_id) {
+    if (len < kRequestHeaderPrefixSize) {
+        required_header_bytes_ = kRequestHeaderPrefixSize;
+        return {std::nullopt, 0};
+    }
+    const std::span<const uint8_t, 16> auth_id(data, 16);
+    if (!header_user_) {
+        header_user_ = FindByAuthIDForTag(tag_, auth_id.data());
+        if (!header_user_) {
+            header_failure_reason_ = "authentication failed: no acceptable AuthID";
+            required_header_bytes_ = 0;
+            return {std::nullopt, 0};
+        }
+        const auto key = RequestHeaderLengthKey(
+            header_user_->cmd_key, auth_id, std::span<const uint8_t, 8>(data + 34, 8));
+        std::array<uint8_t, 2> plain{};
+        size_t written = 0;
+        if (!AES128GCMDecryptTo(key.key.data(), key.nonce.data(), key.nonce.size(),
+                data + 16, 18, auth_id.data(), auth_id.size(),
+                plain.data(), plain.size(), written) ||
+            written != plain.size()) {
+            header_failure_reason_ = "authentication failed: header length integrity check failed";
+            header_user_.reset();
+            required_header_bytes_ = 0;
+            return {std::nullopt, 0};
+        }
+        header_length_ = (static_cast<uint16_t>(plain[0]) << 8) | plain[1];
+        constexpr size_t kMinRequestHeaderLength = 38 + 4;
+        constexpr size_t kMaxRequestHeaderLength = 38 + kMaxEncodedAddressSize + 15 + 4;
+        if (header_length_ < kMinRequestHeaderLength ||
+            header_length_ > kMaxRequestHeaderLength) {
+            header_failure_reason_ = "invalid authenticated request header";
+            header_user_.reset();
+            required_header_bytes_ = 0;
+            return {std::nullopt, 0};
+        }
+        required_header_bytes_ =
+            kRequestHeaderPrefixSize + static_cast<size_t>(header_length_) + 16;
+    }
+    if (len < required_header_bytes_) return {std::nullopt, 0};
+
+    VMessRequest request;
+    const size_t consumed = required_header_bytes_;
+    required_header_bytes_ = 0;
+    if (!OpenRequestHeader(data, header_user_, header_length_, trace_conn_id, request,
+                           header_failure_reason_)) {
+        if (request.user) request_ = std::move(request);
+        header_user_.reset();
+        LOG_CONN_DEBUG(trace_conn_id, "request rejected > {}", header_failure_reason_);
+        return {std::nullopt, 0};
+    }
+    return {std::move(request), consumed};
+}
+
+void ServerSession::SetRequest(VMessRequest request) {
+    request_ = std::move(request);
+    request_set_ = true;
+}
+
+std::optional<RequestBodyReader> ServerSession::DecodeRequestBody(
+    AsyncStream& stream) {
+    if (!request_set_) {
+        return std::nullopt;
+    }
+    try {
+        return std::optional<RequestBodyReader>(std::in_place, request_, stream);
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+std::optional<ResponseBodyWriter> ServerSession::EncodeResponseBodyWithHeader(
+    AsyncStream& stream) {
+    if (!request_set_) {
+        return std::nullopt;
+    }
+    try {
+        const BodyKey response = ResponseBodyKey(RequestBodyKey(request_));
+        std::array<uint8_t, kResponseHeaderSize> response_header{};
+        if (!BuildResponseHeader(request_, response, response_header)) {
+            return std::nullopt;
+        }
+        return std::optional<ResponseBodyWriter>(
+            std::in_place, request_, response, stream, response_header);
+    } catch (...) {
+        return std::nullopt;
+    }
+}
 }  // namespace vmess::encoding

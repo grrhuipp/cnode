@@ -1625,3 +1625,32 @@ CI失败场景修复后通过真实双进程、ML-KEM/X25519加密和回环对�
 - **64 活跃会话统计采样与 TCP 收发基准（`cnode_runtime_sampling_benchmark` / `cnode_tcp_send_benchmark`）**：
   - `cnode_runtime_sampling_benchmark`：`resources=1` 进程峰值 RSS 由 `14,938,112 / 14,942,208 B` 稳定降至 **`14,917,632 / 14,901,248 B`（稳定减少 20 ~ 40 KiB）**；`resources=0` 采样延迟保持 **`68.38 / 68.30 ns`**（`p50 = 30.0 ns`，0 次堆分配）。
   - `tcp-send 8192B (8 pieces)`：单次 burst 墙钟耗时由 `10,680.4 / 10,725.7 ns` 稳定降至 **`10,658.9 / 10,648.3 ns`**；`65536B (16 pieces)` 第 2 轮墙钟耗时由 `44,652.5 ns` 降至 **`43,379.5 ns`（-2.9%）**。
+
+## 2026-11-09（第十一轮）：HTTP/1.1 预读零拷贝移交、HPACK 单遍流式归约、`UdpIngress::Impl` 内联与 32 个碎片文件合并
+
+### 架构与流程精简内容
+
+1. **HTTP/1.1 握手 `TakeReadAheadMultiBuffer()` 零拷贝回填与 HTTP/2 HPACK 单遍流式解码**：
+   - `src/transport/internet/http1_handshake.hpp/.cpp`、`include/transport/internet/ws_stream.hpp`、`src/transport/internet/ws_stream.cpp`、`src/transport/internet/xhttp_session.cpp`：为 `Http1MessageHead` 新增消费型 `TakeReadAheadMultiBuffer()`，在常规单块 `storage` 情况下直接调整游标并零拷贝移交原 8 KiB `BufferGuard` 至 `buf::MultiBuffer`；为 `Http1BodyStream` 与 `BaseWsStream` 新增 `SetPendingMultiBuffer(buf::MultiBuffer&&)`，在 `ReadClientResponse`、`DoHttp1ServerHandshake`、`DoHttpUpgradeServerHandshake`、`DoHttpUpgradeClientHandshake`、`DoWsServerHandshake` 中彻底消除预读应用层首包回填时的二次 `Buffer::New()` 分配与 `memcpy`。
+   - `src/transport/internet/http2_session.cpp`：将 `HpackDecoder::Decode` 改为接收回调的单遍流式归约，静态表命中、动态表命中及带索引名的字面量头字段直接以 `std::string_view` 透传给回调，仅在增量索引（`0x40`）时移动入 `dynamic_table_`，彻底消除每次 HTTP/2 / gRPC / XHTTP-over-H2 请求和响应解码時の `HeaderFields` 数组分配与静态表字符串拷贝。
+2. **内联 `UdpIngress::Impl`、修复 `unsafe::ptr_cast` 对齐断言并清理死编译开关 `CNODE_MEMORY_STATS`**：
+   - `src/app/worker/udp_ingress.hpp/.cpp`：将 `UdpIngress::Impl` 的成员直接内联为 `UdpIngress` 的私有成员，消除每 Worker 的 `std::unique_ptr<Impl>` 堆分配与所有 UDP 入站方法上的 `impl_->` 间接寻址。
+   - `include/common/unsafe.hpp`、`CMakeLists.txt`：移除从不生效的遗留宏 `#ifdef ACPP_DEBUG` 包装，改用 `<cassert>` 的 `assert(...)` 使对齐检查在 Debug 与单元测试（`-UNDEBUG`）下真实生效；移除无任何消费者的 `CNODE_MEMORY_STATS` CMake 选项与宏定义。
+3. **32 个单调用方碎片头文件与实现文件合并内聚（五轮累计清理 180 个冗余碎片文件）**：
+   - 合并并删除 `common`、`app`、`transport`、`proxy`、`service/controller` 下共 32 个单调用方碎片文件（含 `memory_stats.hpp`、`multi_buffer_batch.hpp`、`auth_failure_limit.hpp`、`common/network.hpp`、`user_profile.hpp`、`relay_types.hpp`、`token_bucket.hpp`、`session_capabilities.hpp`、`request_load_state.hpp`、`worker_runtime_config.hpp`、`runtime_publication.{hpp,cpp}`、`udp_{client_session_key,resource_budget,handoff_directory,association_reclaimer}.{hpp,cpp}`、`link_error.hpp`、`quic_stream.{hpp,cpp}`、`panel_inbound.{hpp,cpp}`、`anytls/padding.cpp`、`trojan/udp_framing.{hpp,cpp}`、`vless/udp_framing.{hpp,cpp}`、`vmess/vmess_request.hpp`、`vmess/encoding/{client,server}.{hpp,cpp}`）。
+
+### 验证与性能/内存实证
+
+全量 **1,251/1,251** 测试通过（325 项 unit、926 项 E2E）。在同一环境与编译选项下执行 A/B/A/B 交错重复基准对照：
+
+- **VLESS/TLS 真实进程基准（`cnode_tls_throughput_benchmark`）**：
+  - **守护进程启动匿名内存（`server_started` `smaps_rollup_anonymous_bytes`）**：4 项测试由 `5,951,488 ~ 5,963,776 B` 稳定降至 **`5,943,296 ~ 5,951,488 B`（稳定减少 8 ~ 20 KiB）**。
+  - **单流与 8 流上传（`Upload1` / `Upload8`）**：`Upload1` 第 2 轮单流上传吞吐由 `821.53 MiB/s` 升至 **`881.62 MiB/s`（+7.3%，16 MiB 传输仅耗时 `18.15 ms`）**，活跃匿名内存减少 **4 KiB**；`Upload8` 8 流上传活跃匿名内存由 `6,459,392 / 6,451,200 B` 两轮一致稳定降至 **`6,426,624 / 6,410,240 B`（稳定减少 32 ~ 40 KiB）**，第 2 轮吞吐升至 **`600.80 MiB/s`（+1.2%）**。
+  - **8 流下载（`Download8`）**：首轮 8 流下载吞吐由 `587.94 MiB/s` 升至 **`613.70 MiB/s`（+4.4%）**，守护进程总 CPU 由 `0.1410s` 降至 **`0.1390s`**。
+- **Hysteria2 四 Worker 真实进程基准（`cnode_hysteria_throughput_benchmark`）**：
+  - **16×64（1,024 流）上传（`Upload 16×64`）**：1,024 流就绪匿名内存由 `39,702,528 / 39,706,624 B` 两轮一致稳定降至 **`39,149,568 / 39,546,880 B`（稳定减少 156 ~ 540 KiB）**，就绪总 RSS 减少 **152 ~ 536 KiB**；负载峰值 RSS（`during_load_max_sampled_vm_rss_bytes`）由 `48,308,224 / 48,119,808 B` 两轮一致稳定降至 **`47,898,624 / 47,992,832 B`（稳定减少 124 ~ 400 KiB）**；1,024 流上传吞吐由 `55.51 / 55.42 MiB/s` 两轮一致升至 **`56.54 / 56.57 MiB/s`（+1.9% ~ +2.1%）**，守护进程总 CPU 由 `3.918 / 3.804s` 两轮一致降至 **`3.783 / 3.782s`（最高 -3.5%）**。
+  - **16×64（1,024 流）下载（`Download 16×64`）**：1,024 流就绪匿名内存由 `39,387,136 / 39,444,480 B` 两轮一致稳定降至 **`38,756,352 / 39,079,936 B`（稳定减少 356 ~ 616 KiB）**，就绪总 RSS 减少 **352 ~ 612 KiB**；第 2 轮下载吞吐由 `35.07 MiB/s` 升至 **`35.94 MiB/s`（+2.5%）**，守护进程总 CPU 由 `3.666s` 降至 **`3.574s`（-2.5%）**。
+  - **256 连接上传与下载**：256 连接上传就绪匿名内存两轮一致稳定减少 **28 ~ 76 KiB**；256 连接下载首轮负载峰值 RSS 减少 **608 KiB**，守护进程总 CPU 由 `1.466 / 1.484s` 两轮一致稳定降至 **`1.455 / 1.451s`（最高 -2.2%）**。
+- **64 活跃会话统计采样与 TCP 发送基准（`cnode_runtime_sampling_benchmark` / `cnode_tcp_send_benchmark`）**：
+  - `cnode_runtime_sampling_benchmark`：`resources=0` 采样延迟由 `68.45 / 69.59 ns` 两轮一致稳定降至 **`68.30 / 68.34 ns`**（`p50 = 30.0 ns`，首轮 `max = 40.0 ns`）；`resources=1` 采样延迟由 `107.90 / 86.07 ns` 稳定降至 **`86.10 / 85.98 ns`**，第 2 轮活跃匿名内存减少 **8 KiB**，0 次堆分配。
+  - `tcp-send 8192B (8 pieces)`：单次 burst 墙钟耗时由 `10,675.1 / 10,601.2 ns` 两轮一致稳定降至 **`10,556.3 / 10,583.9 ns`（最高 -1.1%）**；`65536B (16 pieces)` 第 2 轮墙钟耗时由 `44,311.5 ns` 降至 **`43,756.1 ns`（-1.3%）**。

@@ -1,6 +1,5 @@
 #pragma once
 
-#include "common/auth_failure_limit.hpp"
 #include "common/defaults.hpp"
 #include "features/routing/router.hpp"
 #include "infra/json.hpp"

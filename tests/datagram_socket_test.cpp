@@ -3,7 +3,7 @@
 #include "transport/internet/datagram_socket.hpp"
 
 #include "common/buf/multi_buffer.hpp"
-#include "transport/link_error.hpp"
+#include "transport/link.hpp"
 #include <optional>
 #include <thread>
 

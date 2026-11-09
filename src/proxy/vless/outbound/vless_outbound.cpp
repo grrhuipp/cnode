@@ -4,7 +4,6 @@
 #include "proxy/outbound.hpp"
 #include "../vless_codec.hpp"
 #include "../vless_encryption.hpp"
-#include "../udp_framing.hpp"
 #include "../vless_vision.hpp"
 #include "../../inbound_admission.hpp"
 #include "../../outbound_server.hpp"

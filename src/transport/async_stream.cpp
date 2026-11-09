@@ -1,7 +1,6 @@
 #include "transport/async_stream.hpp"
 #include "common/allocator.hpp"
 #include "common/buffer_util.hpp"
-#include "common/memory_stats.hpp"
 #include "transport/internet/tcp_stream.hpp"
 
 #include <new>

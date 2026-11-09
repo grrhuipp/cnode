@@ -2,6 +2,9 @@
 
 #include "app/worker_mailbox.hpp"
 #include "app/proxyman/inbound/user_store.hpp"
+#include "app/proxyman/inbound/prepared_config.hpp"
+#include "app/proxyman/outbound/prepared_config.hpp"
+#include "infra/runtime_config_types.hpp"
 #include "common/allocator.hpp"
 #include "common/asio_types.hpp"
 #include "transport/internet/timeout_scheduler.hpp"
@@ -35,7 +38,15 @@ class DNSWorker;
 struct OnlineDevice;
 struct PortBinding;
 struct StatsShard;
-struct WorkerRuntimeConfig;
+struct WorkerRuntimeConfig {
+    TimeoutsConfig timeouts;
+    LimitsConfig limits;
+    RoutingConfig routing;
+    std::vector<proxyman::outbound::PreparedOutboundConfig> outbounds;
+    uint32_t workers = 0;
+    uint32_t pressure_threshold = 1;
+    uint32_t pressure_idle_timeout = 0;
+};
 struct WorkerRuntimeStatsSnapshot;
 namespace rule {
 struct DetectRule;

@@ -8,7 +8,6 @@
 #include "app/stats.hpp"
 #include "common/allocator.hpp"
 #include "transport/async_stream.hpp"
-#include "transport/link_error.hpp"
 #include "common/buffer_util.hpp"
 #include "common/container_util.hpp"
 #include "infra/log.hpp"

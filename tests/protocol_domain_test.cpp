@@ -4,9 +4,8 @@
 #include "common/address_codec.hpp"
 #include "common/buf/multi_buffer.hpp"
 #include "proxy/trojan/trojan_codec.hpp"
-#include "proxy/trojan/udp_framing.hpp"
 #include "proxy/vless/vless_codec.hpp"
-#include "proxy/vmess/encoding/server.hpp"
+#include "proxy/vmess/encoding/body.hpp"
 #include "proxy/vmess/vmess_crypto.hpp"
 
 #include <algorithm>

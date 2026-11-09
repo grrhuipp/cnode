@@ -4,7 +4,7 @@
 #include "common/domain_name.hpp"
 #include "common/ip_utils.hpp"
 #include "common/ip_address.hpp"
-#include "common/network.hpp"
+#include "core/constants.hpp"
 
 #include <charconv>
 #include <format>
@@ -12,6 +12,40 @@
 #include <string>
 #include <string_view>
 
+// ============================================================================
+// 网络类型
+// ============================================================================
+enum class Network : uint8_t {
+    TCP = 0,
+    UDP = 1,
+    MUX = 2,   // VMess Command=Mux（Mux.Cool 多路复用流）
+};
+
+constexpr const char* NetworkToString(Network n) {
+    switch (n) {
+        case Network::TCP: return constants::protocol::kTcp.data();
+        case Network::UDP: return constants::protocol::kUdp.data();
+        case Network::MUX: return constants::protocol::kMux.data();
+        default: return "unknown";
+    }
+}
+
+// ============================================================================
+// 地址类型（内部表示，与具体协议无关）
+// ============================================================================
+enum class AddressType : uint8_t {
+    Invalid = 0,
+    IPv4 = 1,
+    Domain = 3,
+    IPv6 = 4
+};
+
+struct UserProfile {
+    int64_t user_id = 0;
+    std::string email;
+    uint64_t speed_limit = 0;
+    uint32_t device_limit = 0;
+};
 
 // ============================================================================
 // 目标地址

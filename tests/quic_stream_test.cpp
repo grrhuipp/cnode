@@ -1,8 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "quic_stream.hpp"
-#include "common/memory_stats.hpp"
-#include "transport/link_error.hpp"
+#include "hysteria_ingress.hpp"
 
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/cancellation_signal.hpp>

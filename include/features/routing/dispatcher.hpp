@@ -2,7 +2,7 @@
 
 #include "common/asio_types.hpp"
 #include "common/initial_payload.hpp"
-#include "app/relay_types.hpp"
+#include "common/error.hpp"
 #include "features/routing/dispatch_policy.hpp"
 #include "transport/link.hpp"
 

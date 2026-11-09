@@ -1,7 +1,5 @@
 #pragma once
 
-#include "common/memory_stats.hpp"
-
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -32,6 +30,22 @@
 #endif
 
 namespace memory {
+
+#ifdef CNODE_TEST_BUFFER_STATS
+namespace detail {
+inline thread_local uint64_t test_buffers_live = 0;
+inline thread_local uint64_t test_buffers_peak = 0;
+}
+inline void OnBufferNew() noexcept {
+    ++detail::test_buffers_live;
+    if (detail::test_buffers_live > detail::test_buffers_peak)
+        detail::test_buffers_peak = detail::test_buffers_live;
+}
+inline void OnBufferFree() noexcept { --detail::test_buffers_live; }
+#else
+inline void OnBufferNew() noexcept {}
+inline void OnBufferFree() noexcept {}
+#endif
 
 inline constexpr std::size_t kThreadMemoryPoolTargetBytes = 64 * 1024;
 inline constexpr std::size_t kThreadMemoryPoolMaxClass = 16 * 1024;

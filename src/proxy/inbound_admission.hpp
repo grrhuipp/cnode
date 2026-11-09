@@ -1,18 +1,14 @@
 #pragma once
 
 #include "common/error.hpp"
-#include "transport/link_error.hpp"
-
 #include "app/proxyman/inbound/factory.hpp"
 #include "app/proxyman/inbound/user_store.hpp"
 #include "app/rate_limiter.hpp"
-#include "app/relay_types.hpp"
 #include "app/stats.hpp"
 #include "common/asio_types.hpp"
 #include "common/session.hpp"
 #include "common/sharded_user_stats.hpp"
 #include "common/target_address.hpp"
-#include "common/user_profile.hpp"
 #include "infra/log.hpp"
 #include "infra/config_types.hpp"
 #include "transport/async_stream.hpp"

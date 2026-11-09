@@ -1,7 +1,7 @@
 #pragma once
 class ConnectionLimiter;
 struct ConnectionFamily;
-#include "common/auth_failure_limit.hpp"
+#include "common/defaults.hpp"
 #include "app/session_group_executor.hpp"
 // ============================================================================
 // Process-wide connection/admission control. Session domains share this bounded

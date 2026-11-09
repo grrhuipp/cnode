@@ -3,7 +3,6 @@
 #include "common/allocator.hpp"
 #include "common/asio_types.hpp"
 #include "common/error.hpp"
-#include "app/relay_types.hpp"
 #include "proxy/inbound_datagram.hpp"
 
 #include <tl/expected.hpp>

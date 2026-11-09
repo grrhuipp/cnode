@@ -2,7 +2,7 @@
 
 #include "app/proxyman/inbound/prepared_config.hpp"
 #include "common/string_hash.hpp"
-#include "common/user_profile.hpp"
+#include "common/target_address.hpp"
 
 #include <openssl/aes.h>
 

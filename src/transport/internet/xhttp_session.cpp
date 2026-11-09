@@ -9,7 +9,6 @@
 #include "transport/internet/tcp_stream.hpp"
 #include "transport/phase_deadline.hpp"
 #include "transport/internet/tls_stream.hpp"
-#include "transport/link_error.hpp"
 #include <asio/as_tuple.hpp>
 #include <asio/co_spawn.hpp>
 #include <asio/post.hpp>
@@ -1640,7 +1639,7 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
             stream_handler->OnInboundTransportReady(*stream);
 
             auto downlink = MakeHttp1BodyStream(
-                std::move(stream), Http1BodyUntilClose{}, true, head->ReadAhead());
+                std::move(stream), Http1BodyUntilClose{}, true, head->TakeReadAheadMultiBuffer());
             LOG_CONN_DEBUG(conn_id, "XHTTP server split downlink ready session={} mode={}",
                           PublicHttpTargetForLog(meta.session_id),
                           xhttp_cfg.AcceptsStreamUp() ? "stream-up" : "packet-up");
@@ -1750,7 +1749,7 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
             }
             if (!content_length) {
                 auto body = MakeHttp1BodyStream(
-                    std::move(stream), Http1BodyChunked{}, false, head->ReadAhead());
+                    std::move(stream), Http1BodyChunked{}, false, head->TakeReadAheadMultiBuffer());
                 head->storage = buf::BufferGuard{};
                 try {
                     XHttpPacketUpSession::Upload upload(*session, *body);
@@ -1781,7 +1780,7 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
 
             // A Content-Length body is read from the connection itself, so the
             // bytes after it stay queued in order for the next request head.
-            stream->PrependReadData(head->ReadAhead());
+            stream->PrependReadMultiBuffer(head->TakeReadAheadMultiBuffer());
             const bool keep_alive = RequestKeepsConnection(request_line, request);
             const size_t body_bytes = content_length->bytes;
             head->storage = buf::BufferGuard{};
@@ -1879,7 +1878,7 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
                 co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
             }
             auto body = MakeHttp1BodyStream(
-                std::move(stream), *body_framing, false, head->ReadAhead());
+                std::move(stream), *body_framing, false, head->TakeReadAheadMultiBuffer());
             if (stream_handler) stream_handler->OnInboundTransportReady(*body);
             accepting = false;
             LOG_CONN_DEBUG(conn_id, "XHTTP server stream-up upload ready session={}",
@@ -1905,7 +1904,7 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
             co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
         }
         auto body = MakeHttp1BodyStream(
-            std::move(stream), *body_framing, true, head->ReadAhead());
+            std::move(stream), *body_framing, true, head->TakeReadAheadMultiBuffer());
         LOG_CONN_DEBUG(conn_id, "XHTTP server H1 stream-one ready");
         if (!stream_handler) {
             co_return body;
@@ -2004,7 +2003,7 @@ net::awaitable<TransportBuildResult> DoXHttp1ClientRequest(
     LOG_CONN_DEBUG(conn_id, "XHTTP client H1 downlink ready path={}",
                   PublicHttpTargetForLog(detail::EffectiveHttpPath(cfg.path)));
     co_return MakeHttp1BodyStream(
-        std::move(stream), read_framing, false, head->ReadAhead());
+        std::move(stream), read_framing, false, head->TakeReadAheadMultiBuffer());
 }
 
 }  // namespace transport::internet

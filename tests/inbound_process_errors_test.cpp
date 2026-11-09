@@ -1,14 +1,12 @@
 #include <gtest/gtest.h>
 
 #include "app/proxyman/inbound/handler.hpp"
-#include "app/request_load_state.hpp"
 #include "app/rate_limiter.hpp"
 #include "app/session_group_executor.hpp"
 #include "common/allocator.hpp"
 #include "common/session.hpp"
 #include "transport/internet/tls_stream.hpp"
 #include "transport/internet/transport_stack.hpp"
-#include "transport/link_error.hpp"
 #include "anytls_codec.hpp"
 #include "../src/common/awaitable_task_group.hpp"
 

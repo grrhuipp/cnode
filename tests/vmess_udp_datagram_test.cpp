@@ -1,8 +1,6 @@
 #include <stdexcept>
 #include <gtest/gtest.h>
 
-#include "encoding/client.hpp"
-#include "encoding/server.hpp"
 #include "vmess_cipher.hpp"
 #include "encoding/body.hpp"
 #include "vmess_crypto.hpp"

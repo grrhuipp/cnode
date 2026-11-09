@@ -17,7 +17,6 @@
 #include "app/proxyman/inbound/factory.hpp"
 #include "app/proxyman/inbound/receiver_settings.hpp"
 #include "transport/async_stream.hpp"
-#include "transport/link_error.hpp"
 #include "transport/internet/timeout_scheduler.hpp"
 #include "app/proxyman/inbound/user_store.hpp"
 #include "common/address_codec.hpp"

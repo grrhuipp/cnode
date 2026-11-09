@@ -4,7 +4,6 @@
 #include "common/unsafe.hpp"
 #include "proxy/outbound.hpp"
 #include "../trojan_codec.hpp"
-#include "../udp_framing.hpp"
 #include "../../inbound_admission.hpp"
 #include "../../outbound_server.hpp"
 #include "../../outbound_stream_endpoint.hpp"
@@ -17,7 +16,6 @@
 #include "common/container_util.hpp"
 #include "infra/config_types.hpp"
 #include "transport/link.hpp"
-#include "transport/link_error.hpp"
 #include "transport/internet/outbound_target_builder.hpp"
 
 #include <algorithm>

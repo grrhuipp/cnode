@@ -3,8 +3,7 @@
 #include "common/allocator.hpp"
 #include "common/asio_types.hpp"
 #include "common/error.hpp"
-#include "common/buf/multi_buffer_batch.hpp"
-#include "app/relay_types.hpp"
+#include "common/buf/multi_buffer.hpp"
 #include "transport/link.hpp"
 
 #include <chrono>

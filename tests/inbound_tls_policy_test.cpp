@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "panel_inbound.hpp"
+#include "node_transaction.hpp"
 
 TEST(InboundTlsPolicy, Contract) {
     ::api::NodeInfo node;

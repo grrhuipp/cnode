@@ -2,7 +2,6 @@
 #include <gtest/gtest.h>
 
 #include "worker/udp_ingress.hpp"
-#include "worker/udp_association_reclaimer.hpp"
 #include "app/proxyman/inbound/receiver_settings.hpp"
 #include "app/stats.hpp"
 #include "common/sharded_user_stats.hpp"
