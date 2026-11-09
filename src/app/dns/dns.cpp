@@ -2,7 +2,6 @@
 #include "app/worker_mailbox.hpp"
 #include "common/byte_reader.hpp"
 #include "common/domain_name.hpp"
-#include "common/ip_address.hpp"
 #include "common/ip_utils.hpp"
 #include "infra/log.hpp"
 

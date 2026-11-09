@@ -5,14 +5,13 @@
 #include "ss_udp.hpp"
 #include "inbound/ss_inbound.hpp"
 
-#include "app/proxyman/inbound/receiver_settings.hpp"
+#include "app/proxyman/inbound/handler.hpp"
 #include "app/stats.hpp"
 #include "common/sharded_user_stats.hpp"
 #include "common/session.hpp"
 #include "features/routing/dispatcher.hpp"
 #include "infra/config_types.hpp"
 #include "proxy/inbound.hpp"
-#include "proxy/inbound_datagram.hpp"
 #include "transport/async_stream.hpp"
 
 #include <asio/as_tuple.hpp>

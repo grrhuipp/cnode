@@ -1,6 +1,6 @@
 #pragma once
 
-#include "app/proxyman/inbound/prepared_config.hpp"
+#include "app/proxyman/inbound/user_store.hpp"
 #include "common/allocator.hpp"
 #include "common/buf/length_prefixed_packet_buffer.hpp"
 #include "common/buf/multi_buffer.hpp"

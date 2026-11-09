@@ -95,14 +95,12 @@ set(CNODE_CORE_SOURCES
     src/transport/internet/tcp_stream.cpp
     src/transport/internet/timeout_scheduler.cpp
     src/transport/internet/tls_stream.cpp
-    src/transport/internet/reality_tls.cpp
     src/transport/internet/ws_stream.cpp
     src/transport/internet/http1_handshake.cpp
     src/transport/internet/xhttp_session.cpp
     src/transport/internet/http2_session.cpp
     src/transport/internet/transport_stack.cpp
     src/transport/internet/transport_dialer.cpp
-    src/transport/internet/hysteria/hysteria_protocol.cpp
     src/transport/internet/hysteria/hysteria_ingress.cpp
     src/transport/internet/proxy_protocol.cpp
 
@@ -131,7 +129,6 @@ set(CNODE_CORE_SOURCES
 
     # Proxy - VMess
     src/proxy/vmess/vmess_crypto.cpp
-    src/proxy/vmess/validator.cpp
     src/proxy/vmess/encoding/body.cpp
     src/proxy/vmess/inbound/vmess_inbound.cpp
     src/proxy/vmess/outbound/vmess_outbound.cpp
@@ -240,8 +237,8 @@ function(cnode_unit name)
 endfunction()
 
 cnode_unit(anytls_codec_errors INCLUDES src/proxy/anytls)
-cnode_unit(anytls_outbound_lifecycle LIBRARY cnode_test_core INCLUDES src/proxy/anytls/outbound)
-cnode_unit(anytls_outbound_settings INCLUDES src/proxy/anytls/outbound)
+cnode_unit(anytls_outbound_lifecycle LIBRARY cnode_test_core INCLUDES src/proxy/anytls src/proxy/anytls/outbound)
+cnode_unit(anytls_outbound_settings INCLUDES src/proxy/anytls src/proxy/anytls/outbound)
 cnode_unit(anytls_padding)
 cnode_unit(asio_operation_allocator)
 cnode_unit(async_write_gate INCLUDES src/transport/internet)

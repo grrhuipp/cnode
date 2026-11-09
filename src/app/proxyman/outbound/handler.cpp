@@ -1,7 +1,6 @@
 #include "app/proxyman/outbound/handler.hpp"
 
 #include "app/dns/dns.hpp"
-#include "app/proxyman/outbound/factory.hpp"
 #include <map>
 #include <stdexcept>
 #include <utility>
@@ -70,10 +69,10 @@ void HandlerLookup::Refresh() noexcept {
 }
 
 void HandlerLookup::Sync(uint64_t generation) {
-    const auto snapshot = configuration_.Capture();
+    const auto& snapshot = configuration_.Entries();
     memory::ThreadLocalVector<Entry> next;
-    next.reserve(snapshot->size());
-    for (const auto& config : *snapshot) {
+    next.reserve(snapshot.size());
+    for (const auto& config : snapshot) {
         std::shared_ptr<Handler> handler;
         for (auto& entry : entries_) {
             if (entry.config == config) {
@@ -98,11 +97,10 @@ std::shared_ptr<Handler> HandlerLookup::Instantiate(const OutboundConfiguration:
 
 OutboundConfiguration::OutboundConfiguration(
     const std::vector<PreparedOutboundConfig>& configurations) {
-    auto snapshot = std::make_shared<Snapshot>();
-    snapshot->reserve(configurations.size());
+    entries_.reserve(configurations.size());
     for (const auto& config : configurations)
-        snapshot->push_back(Prepare(config));
-    Publish(std::move(snapshot));
+        entries_.push_back(Prepare(config));
+    generation_ = 1;
 }
 
 OutboundConfiguration::~OutboundConfiguration() = default;
@@ -116,40 +114,27 @@ OutboundConfiguration::Entry OutboundConfiguration::Prepare(
     return std::make_shared<const PreparedOutboundConfig>(configuration);
 }
 
-void OutboundConfiguration::Publish(std::shared_ptr<const Snapshot> snapshot) noexcept {
-    snapshot_ = std::move(snapshot);
-    ++generation_;
-}
-
 uint64_t OutboundConfiguration::Generation() const noexcept {
     return generation_;
 }
 
-std::shared_ptr<const OutboundConfiguration::Snapshot>
-OutboundConfiguration::Capture() const noexcept {
-    return snapshot_;
-}
-
 void OutboundConfiguration::Replace(const PreparedOutboundConfig& configuration) {
-    auto snapshot = std::make_shared<Snapshot>(*Capture());
-    snapshot->reserve(snapshot->size() + 1);
     auto candidate = Prepare(configuration);
-    for (auto& entry : *snapshot) {
+    for (auto& entry : entries_) {
         if (entry->tag != configuration.tag) continue;
         entry = std::move(candidate);
-        Publish(std::move(snapshot));
+        ++generation_;
         return;
     }
-    snapshot->push_back(std::move(candidate));
-    Publish(std::move(snapshot));
+    entries_.push_back(std::move(candidate));
+    ++generation_;
 }
 
 void OutboundConfiguration::Remove(std::string_view tag) {
-    auto snapshot = std::make_shared<Snapshot>(*Capture());
-    std::erase_if(*snapshot, [tag](const Entry& entry) {
+    std::erase_if(entries_, [tag](const Entry& entry) {
         return entry->tag == tag;
     });
-    Publish(std::move(snapshot));
+    ++generation_;
 }
 
 // ============================================================================

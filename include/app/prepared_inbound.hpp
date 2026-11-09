@@ -1,7 +1,6 @@
 #pragma once
 
-#include "app/proxyman/inbound/prepared_config.hpp"
-#include "app/proxyman/inbound/receiver_settings.hpp"
+#include "app/proxyman/inbound/handler.hpp"
 #include "app/proxyman/inbound/user_store.hpp"
 #include "common/asio_types.hpp"
 #include "transport/internet/inbound_listen.hpp"

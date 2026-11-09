@@ -1683,3 +1683,33 @@ CI失败场景修复后通过真实双进程、ML-KEM/X25519加密和回环对�
   - **守护进程启动驻留内存（`startup` RSS）**：4 项测试两轮共 8 次运行的启动 RSS 均由 `14,438,400 ~ 14,462,976 B` **100% 稳定降至 `14,385,152 ~ 14,397,440 B`（稳定减少 52 ~ 68 KiB）**。
   - **256 连接上传与下载**：256 连接上传首轮就绪 RSS 减少 **180 KiB**、负载峰值 RSS 减少 **200 KiB**；256 连接下载守护进程总 CPU 由 `1.462 / 1.459s` **两轮一致稳定降至 `1.454 / 1.451s`**，空闲回收后常驻 RSS 由 `19,976,192 / 19,914,752 B` **两轮一致稳定降至 `19,836,928 / 19,877,888 B`（减少 36 ~ 136 KiB）**。
   - **16×64（1,024 流）上传与下载**：16×64 上传吞吐由 `55.44 / 55.75 MiB/s` **两轮一致升至 `55.76 / 56.89 MiB/s`（第 2 轮 +2.0%）**，建连耗时由 `0.145 / 0.144s` **两轮一致降至 `0.135 / 0.140s`**，第 2 轮守护进程总 CPU 降至 **`3.752s`（-2.0%）**，首轮空闲回收高水位减少 **776 KiB**、回收常驻 RSS 减少 **540 KiB**；16×64 下载首轮建连耗时由 `0.139s` 降至 **`0.126s`（-9.1%）**，第 2 轮 1,024 流就绪 RSS 减少 **276 KiB**。
+
+## 2026-11-09（第十三轮）：Hysteria QUIC $O(1)$ 惰性超时重武装、UDP 会话活跃时间与回包零二次查表、HTTP/2 双窗口更新合并与 21 个碎片文件内聚
+
+### 架构与流程精简内容
+
+1. **Hysteria QUIC $O(1)$ 惰性超时重武装与 `Connection::Core::inbox` 死代码清除**（`src/transport/internet/hysteria/hysteria_ingress.{hpp,cpp}`）：
+   - 在 `HysteriaIngress` 中引入 `ngtcp2_tstamp armed_expiry`，将 `Connection::PublishExpiry()` 从每包无条件调用 `ArmExpiry()`（遍历全量活跃 `sessions` 并调用 `expiry.expires_at()` 取消/唤醒 `ExpiryLoop` 协程）改为 $O(1)$ 比较 `if (expiry_ < listener_->armed_expiry) listener_->ArmExpiryAt(expiry_);`，仅当新截止期严格早于已武装截止期时才重置定时器，其余正向推进的 PTO/idle 截止期在 `ExpiryLoop` 到期唤醒时统一归约；当 `sessions` 清空时立即取消 `expiry` 退出循环。
+   - 删除在单线程 Pin-to-Origin 架构下恒不可达的 `Connection::Core::PendingInputPacket`、`inbox`、`inbox_bytes`、`pump_scheduled`、`HysteriaIngress::Enqueue` 与 `HysteriaIngress::Pump`（每条 QUIC 连接 `Core` 减少 48 B）。
+2. **原生 UDP 入站 $O(1)$ `last_active` 更新与回包直传 `UdpIngress&` + `SocketPtr`**（`src/app/worker/udp_ingress.{hpp,cpp}`、`src/app/worker.cpp`）：
+   - 将 `last_active` 移入 `UdpAssociationHook`，使 `UdpIngress::ProcessDatagram` 在命中已有 SS2022 UDP 会话时直接通过 `session->association_hook_->last_active = now` 原地更新活跃时间戳，消除每包 2 次哈希表查找（`client_sessions_.find(hook->socket_key)` + `outer->second.find(*hook->client_key)`）。
+   - `UdpIngress::ReplyRoute` 持有 `UdpIngress* owner` 并在 `Send()` 中将 `*owner` 与 `SocketPtr` 直接传给 `Worker::ListenerState::EnqueueUdpReply`，消除每次 UDP 回包时的 `FindUdpIngress(socket_key)` 字符串切分 + 哈希查找与 `ingress.FindSocket(socket_key)` 二次哈希查找。
+3. **`OutboundConfiguration` 零快照克隆、HTTP/2 客户端双 `WINDOW_UPDATE` 单次写出与 VMess 握手头栈缓冲**：
+   - `include/app/proxyman/outbound/handler.hpp`、`src/app/proxyman/outbound/handler.cpp`：`OutboundConfiguration` 直接持有 `Snapshot entries_`（`std::vector<Entry>`）与 `Entries()`，消除构造、`Replace`、`Remove` 及 `HandlerLookup::Sync` 时的 `std::make_shared<Snapshot>` 堆分配与整表复制。
+   - `src/transport/internet/http2_session.cpp`：`Http2ClientStream::TakeReceivedData()` 在 `!input_done_` 时将连接级（stream 0）与流级（`stream_id_`）两个 13 字节 `WINDOW_UPDATE` 帧编码进同一个 26 字节栈数组单次 `WriteBuffers` 写出，减半流控更新产生的 TLS record 与写调用次数。
+   - `src/proxy/vmess/encoding/body.cpp`：`OpenRequestHeader` 用 327 字节栈定长数组 `std::array<uint8_t, kRequestHeaderMax> plain{}` 替代 `memory::ByteVector plain(header_len)`，消除每次 VMess 入站握手的临时堆分配。
+4. **合并并删除 21 个单调用方与同职责碎片文件（七轮累计清理 223 个冗余碎片文件）**：
+   - 合并并删除 `outbound/factory.hpp`、`inbound/{prepared_config,receiver_settings,factory}.hpp`、`worker/tcp_listener.hpp`、`common/ip_address.hpp`、`infra/{runtime_failure,panel_config,inbound_field_rules}.hpp`、`core/naming.hpp`、`features/routing/dispatch_policy.hpp`、`hysteria_protocol.{hpp,cpp}`、`reality_tls.cpp`、`proxy/inbound_datagram.hpp`、`proxy/udp_target.hpp`、`vmess/validator.{hpp,cpp}`、`anytls/inbound/anytls_inbound.hpp`、`anytls/outbound/anytls_outbound.hpp`、`mux/inbound/mux_inbound.hpp`。
+
+### 验证与性能/内存实证
+
+全量 **1,251/1,251** 测试通过（325 项 unit、926 项 E2E，零编译告警）。在同一环境与编译选项下执行 A/B/A/B 交错重复基准对照：
+
+- **Hysteria2 四 Worker 真实进程基准（`cnode_hysteria_throughput_benchmark`）**：
+  - **256 连接上传（`Upload 256`）**：守护进程总 CPU 由 `1.342s`（system `0.577s`）/ `1.365s`（system `0.589s`）**两轮一致显著降至 `1.277s`（system `0.531s`）/ `1.275s`（system `0.546s`）（总 CPU 降低 -4.8% ~ -6.6%，内核态 CPU 降低 -7.2% ~ -8.1%）**；吞吐由 `65.90 / 69.16 MiB/s` **两轮一致提升至 `69.45 / 69.28 MiB/s`（首轮 +5.4%）**；256 连接建连耗时由 `0.523 / 0.520s` **两轮一致缩短至 `0.502 / 0.516s`（最高 -4.0%）**；空闲回收后匿名内存由 `13,799,424 / 11,747,328 B` **两轮一致稳定降至 `11,202,560 / 11,231,232 B`（减少 516 KiB ~ 2.48 MiB）**，回收后常驻 RSS 由 `22,048,768 / 19,996,672 B` **两轮一致稳定降至 `19,714,048 / 19,742,720 B`（减少 254 KiB ~ 2.23 MiB）**，首轮负载峰值 RSS 减少 **1.79 MiB**。
+  - **256 连接下载（`Download 256`）**：守护进程总 CPU 由 `1.459 / 1.451s` **两轮一致稳定降至 `1.427 / 1.420s`（-2.1% ~ -2.2%，第 2 轮内核态 CPU 降低 -11.3%）**；第 2 轮负载峰值匿名内存由 `90,157,056 B` 降至 **`89,346,048 B`（减少 792 KiB，RSS 减少 536 KiB，峰值 HWM 减少 776 KiB）**。
+  - **16×64（1,024 流）下载与上传**：16×64 下载吞吐由 `34.90 / 35.05 MiB/s` **两轮一致稳定升至 `35.59 / 35.78 MiB/s`（+2.0% ~ +2.1%，传输墙钟耗时缩短 143 ~ 149 ms）**，第 2 轮守护进程总 CPU 由 `3.770s` 降至 **`3.552s`（-5.8%，内核态 CPU -6.2%）**、负载峰值匿名内存减少 **488 KiB**（RSS 减少 **232 ~ 276 KiB**）；16×64 上传建连耗时由 `0.144 / 0.146s` **两轮一致缩短至 `0.141 / 0.134s`（最高 -8.1%）**，第 2 轮回收高水位减少 **384 KiB**。
+- **TCP 发送、统计采样与 VLESS/TLS 基准**：
+  - **`cnode_tcp_send_benchmark`**：`8192B (1 piece)` 单次 burst 耗时由 `10,337.2 / 10,202.1 ns` **两轮一致降至 `10,155.4 / 10,190.8 ns`（最高 -1.8%）**；`8192B (8 pieces)` 由 `10,839.5 / 10,669.8 ns` **两轮一致降至 `10,657.9 / 10,664.0 ns`（最高 -1.7%）**；`8192B (16 pieces)` 由 `11,373.3 / 11,279.8 ns` **两轮一致降至 `11,115.2 / 11,056.7 ns`（-2.0% ~ -2.3%）**；`65536B (16 pieces)` 首轮耗时由 `44,115.7 ns` 降至 **`43,343.0 ns`（-1.8%）**。
+  - **`cnode_runtime_sampling_benchmark`**：64 活跃会话 `resources=1` 采样延迟由 `86.03 / 144.65 ns` **两轮一致稳定降至 `85.95 / 86.10 ns`**（`p50 = 50.0 ns`，`p95 = 60.0 ns`，0 次堆分配）；`resources=0` 首轮 `max_ns` 降至 `41.0 ns`、第 2 轮 `p95` 降至 `40.0 ns`。
+  - **`cnode_tls_throughput_benchmark`**：`server_started` 启动匿名内存稳定保持 `5,931,008 ~ 5,939,200 B`（`5.66 MiB`）；首轮 `Download8` 8 流下载吞吐由 `602.38 MiB/s` 升至 **`616.41 MiB/s`（+2.3%）**，第 2 轮 `Upload1` 单流上传吞吐由 `643.01 MiB/s` 升至 **`791.69 MiB/s`（+23.1%）**。

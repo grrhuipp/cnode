@@ -2,7 +2,6 @@
 
 #include "common/asio_types.hpp"
 #include "common/error.hpp"
-#include "infra/runtime_failure.hpp"
 
 #include <asio/async_result.hpp>
 #include <asio/co_spawn.hpp>

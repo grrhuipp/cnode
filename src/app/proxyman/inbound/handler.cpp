@@ -1,6 +1,4 @@
 #include "app/proxyman/inbound/handler.hpp"
-#include "app/proxyman/inbound/factory.hpp"
-#include "common/ip_address.hpp"
 
 #include "app/rate_limiter.hpp"
 #include "app/stats.hpp"

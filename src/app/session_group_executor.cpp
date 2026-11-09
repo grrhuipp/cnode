@@ -1,5 +1,5 @@
 #include "app/session_group_executor.hpp"
-#include "infra/runtime_failure.hpp"
+#include "common/error.hpp"
 #include "infra/log.hpp"
 
 #include <asio/this_coro.hpp>

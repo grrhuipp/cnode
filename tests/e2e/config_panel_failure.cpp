@@ -1,5 +1,5 @@
 #include "support.hpp"
-#include "infra/runtime_failure.hpp"
+#include "common/error.hpp"
 
 #include <cstdlib>
 #include <new>

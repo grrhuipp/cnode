@@ -1,7 +1,7 @@
 #pragma once
 
 #include "common/error.hpp"
-#include "app/proxyman/inbound/factory.hpp"
+#include "app/proxyman/inbound/handler.hpp"
 #include "app/proxyman/inbound/user_store.hpp"
 #include "app/rate_limiter.hpp"
 #include "app/stats.hpp"

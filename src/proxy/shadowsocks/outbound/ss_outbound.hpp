@@ -2,7 +2,6 @@
 
 #include "proxy/outbound.hpp"
 #include "../../outbound_stream_endpoint.hpp"
-#include "../../udp_target.hpp"
 #include "../shadowsocks_protocol.hpp"
 #include "../ss_udp.hpp"
 #include "../../uot/uot.hpp"

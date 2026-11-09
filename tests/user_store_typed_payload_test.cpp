@@ -1,6 +1,5 @@
 #include <gtest/gtest.h>
 
-#include "app/proxyman/inbound/prepared_config.hpp"
 #include "app/proxyman/inbound/user_store.hpp"
 #include <array>
 #include <iostream>

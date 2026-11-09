@@ -13,7 +13,6 @@
 #include "features/routing/dispatcher.hpp"
 #include "infra/config_types.hpp"
 #include "proxy/inbound.hpp"
-#include "proxy/inbound_datagram.hpp"
 #include "transport/internet/timeout_scheduler.hpp"
 #include "transport/link.hpp"
 
@@ -220,6 +219,9 @@ struct UdpAssociationHook final {
     std::string_view socket_key;
     const ClientSessionKey* client_key = nullptr;
     std::chrono::seconds idle_timeout{};
+    // Valid uplink activity only; the reclaimer re-checks it lazily when the
+    // row's deadline passes, so packets never re-key the maintenance heap.
+    TimePoint last_active{};
     // Earliest instant the row may need reclaiming. Uplink activity does not
     // move it; a due open row is re-checked against its last activity and
     // re-armed. min() marks a closed row, max() an open row that never expires.
@@ -287,6 +289,16 @@ public:
         udp::endpoint endpoint,
         buf::MultiBuffer payload,
         uint32_t worker_id) = 0;
+
+    [[nodiscard]] virtual bool EnqueueUdpReply(
+        UdpIngress& ingress,
+        std::string_view socket_key,
+        const std::shared_ptr<udp::socket>& sock,
+        udp::endpoint endpoint,
+        buf::MultiBuffer payload,
+        uint32_t worker_id) {
+        return EnqueueUdpReply(socket_key, sock.get(), std::move(endpoint), std::move(payload), worker_id);
+    }
 };
 
 struct UdpDatagramContext {
@@ -352,6 +364,7 @@ public:
         std::shared_ptr<::InboundDatagramResponse> response;
         UdpReplySink* sink = nullptr;
         uint32_t worker_id = 0;
+        UdpIngress* owner = nullptr;
 
         [[nodiscard]] bool Valid() const noexcept { return response && sink; }
         [[nodiscard]] bool Send(UDPPacketView packet, const udp::endpoint& endpoint);
@@ -459,9 +472,6 @@ private:
     };
     struct UdpClientSession {
         ClientSessionPtr link;
-        // Valid uplink activity only; the reclaimer re-checks it lazily when the
-        // row's deadline passes, so packets never re-key the maintenance heap.
-        std::chrono::steady_clock::time_point last_active;
         UdpAssociationHook reclaim_hook;
     };
     using UdpClientSessionMap = memory::ThreadLocalUnorderedMap<

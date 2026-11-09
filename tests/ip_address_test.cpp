@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "common/ip_address.hpp"
+#include "common/ip_utils.hpp"
 
 #include <array>
 #include <cstdio>

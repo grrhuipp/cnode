@@ -1,11 +1,11 @@
 #include <gtest/gtest.h>
 
 #include "app/prepared_inbound.hpp"
-#include "app/proxyman/inbound/factory.hpp"
+#include "app/proxyman/inbound/handler.hpp"
 #include "app/proxyman/inbound/user_store.hpp"
 #include "core/constants.hpp"
 #include "infra/config_types.hpp"
-#include "features/routing/dispatch_policy.hpp"
+#include "features/routing/dispatcher.hpp"
 #include "proxy/inbound.hpp"
 #include "transport/internet/stream_settings.hpp"
 

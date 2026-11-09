@@ -2,12 +2,12 @@
 
 #include "api/api.hpp"
 #include "app/prepared_inbound.hpp"
-#include "app/proxyman/outbound/factory.hpp"
+#include "app/proxyman/outbound/handler.hpp"
 #include "app/session_tracking.hpp"
 #include "common/sharded_user_stats.hpp"
 #include "core/constants.hpp"
 #include "infra/config_types.hpp"
-#include "infra/panel_config.hpp"
+#include "infra/config.hpp"
 
 #include <asio/as_tuple.hpp>
 #include <asio/steady_timer.hpp>

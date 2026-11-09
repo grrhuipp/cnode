@@ -2,10 +2,8 @@
 
 #include "../common/awaitable_batch.hpp"
 #include "infra/config.hpp"
-#include "app/proxyman/inbound/factory.hpp"
 #include "app/worker.hpp"
 #include "core/constants.hpp"
-#include "core/naming.hpp"
 #include "infra/config_types.hpp"
 #include "transport/internet/stream_settings.hpp"
 

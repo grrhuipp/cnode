@@ -2,9 +2,8 @@
 
 #include "app/dns/dns.hpp"
 #include "app/prepared_inbound.hpp"
-#include "app/proxyman/inbound/factory.hpp"
-#include "app/proxyman/inbound/receiver_settings.hpp"
-#include "app/proxyman/outbound/factory.hpp"
+#include "app/proxyman/inbound/handler.hpp"
+#include "app/proxyman/outbound/handler.hpp"
 #include "app/stats.hpp"
 #include "app/worker.hpp"
 #include "infra/config_types.hpp"

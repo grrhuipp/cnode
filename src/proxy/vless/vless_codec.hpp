@@ -9,7 +9,7 @@
 #include "common/error.hpp"
 #include "common/target_address.hpp"
 #include "common/unsafe.hpp"
-#include "core/naming.hpp"
+#include "core/constants.hpp"
 #include "transport/link.hpp"
 
 #include <openssl/sha.h>

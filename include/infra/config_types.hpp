@@ -3,7 +3,7 @@
 #include "common/asio_types.hpp"
 #include "common/defaults.hpp"
 #include "core/constants.hpp"
-#include "features/routing/dispatch_policy.hpp"
+#include "features/routing/dispatcher.hpp"
 #include "infra/json.hpp"
 #include "infra/runtime_config_types.hpp"
 #include "proxy/sniff_config.hpp"

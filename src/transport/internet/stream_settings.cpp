@@ -1,5 +1,5 @@
 #include "transport/internet/stream_settings.hpp"
-#include "core/naming.hpp"
+#include "core/constants.hpp"
 
 #include <algorithm>
 #include <atomic>

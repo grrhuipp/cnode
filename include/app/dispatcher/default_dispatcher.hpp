@@ -1,6 +1,5 @@
 #pragma once
 
-#include "features/routing/dispatch_policy.hpp"
 #include "features/routing/dispatcher.hpp"
 #include "features/routing/router.hpp"
 #include "common/allocator.hpp"

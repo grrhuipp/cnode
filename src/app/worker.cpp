@@ -2,7 +2,6 @@
 #include "app/session_group_executor.hpp"
 #include "worker/udp_receive_loop.hpp"
 #include "app/prepared_inbound.hpp"
-#include "app/proxyman/inbound/receiver_settings.hpp"
 #include "app/rate_limiter.hpp"
 #include "../common/awaitable_task_group.hpp"
 #include "../transport/internet/hysteria/hysteria_ingress.hpp"
@@ -16,10 +15,7 @@
 #include "common/container_util.hpp"
 #include "common/string_hash.hpp"
 #include "infra/log.hpp"
-#include "infra/runtime_failure.hpp"
-#include "app/proxyman/inbound/factory.hpp"
 #include "app/proxyman/inbound/user_store.hpp"
-#include "worker/tcp_listener.hpp"
 #include "worker/udp_ingress.hpp"
 #include "app/session_tracking.hpp"
 #include "app/dns/dns.hpp"
@@ -208,6 +204,13 @@ struct Worker::ListenerState : worker_detail::UdpReplySink {
     [[nodiscard]] bool EnqueueUdpReply(
         std::string_view socket_key,
         udp::socket* sock,
+        udp::endpoint endpoint,
+        buf::MultiBuffer payload,
+        uint32_t worker_id) override;
+    [[nodiscard]] bool EnqueueUdpReply(
+        worker_detail::UdpIngress& ingress,
+        std::string_view socket_key,
+        const worker_detail::UdpIngress::SocketPtr& sock,
         udp::endpoint endpoint,
         buf::MultiBuffer payload,
         uint32_t worker_id) override;
@@ -880,21 +883,34 @@ bool Worker::ListenerState::EnqueueUdpReply(
     buf::MultiBuffer payload,
     uint32_t worker_id) {
     auto* ingress = FindUdpIngress(socket_key);
-    if (!ingress || !sock || !sock->is_open() || payload.empty()) {
+    if (!ingress || !sock) {
         return false;
     }
     auto owned_sock = ingress->FindSocket(socket_key);
     if (!owned_sock || owned_sock.get() != sock) {
         return false;
     }
+    return EnqueueUdpReply(*ingress, socket_key, owned_sock, std::move(endpoint), std::move(payload), worker_id);
+}
 
-    const auto admitted = ingress->EnqueueReply(
+bool Worker::ListenerState::EnqueueUdpReply(
+    worker_detail::UdpIngress& ingress,
+    std::string_view socket_key,
+    const worker_detail::UdpIngress::SocketPtr& sock,
+    udp::endpoint endpoint,
+    buf::MultiBuffer payload,
+    uint32_t worker_id) {
+    if (!sock || !sock->is_open() || payload.empty() || !ingress.OwnsSocket(socket_key, sock.get())) {
+        return false;
+    }
+
+    const auto admitted = ingress.EnqueueReply(
         socket_key, std::move(endpoint), std::move(payload));
     if (admitted == worker_detail::UdpIngress::ReplyEnqueueResult::Rejected) {
         return false;
     }
     if (admitted == worker_detail::UdpIngress::ReplyEnqueueResult::StartSend) {
-        StartUdpReplySend(*ingress, socket_key, std::move(owned_sock), worker_id);
+        StartUdpReplySend(ingress, socket_key, sock, worker_id);
     }
     return true;
 }

@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "infra/config.hpp"
-#include "core/naming.hpp"
+#include "core/constants.hpp"
 
 #include <vector>
 

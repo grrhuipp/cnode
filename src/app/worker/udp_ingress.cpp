@@ -1,10 +1,8 @@
 #include "udp_ingress.hpp"
 #include "app/proxyman/inbound/handler.hpp"
 #include "../../common/awaitable_task_group.hpp"
-#include "app/proxyman/inbound/factory.hpp"
 #include "../../proxy/inbound_admission.hpp"
 
-#include "app/proxyman/inbound/receiver_settings.hpp"
 #include "common/initial_payload.hpp"
 #include "common/ip_utils.hpp"
 #include "common/session.hpp"
@@ -14,7 +12,6 @@
 #include "features/routing/dispatcher.hpp"
 #include "infra/config_types.hpp"
 #include "infra/log.hpp"
-#include "infra/runtime_failure.hpp"
 #include "transport/async_stream.hpp"
 
 #include <asio/as_tuple.hpp>
@@ -228,7 +225,7 @@ template <typename SessionRow>
     std::chrono::steady_clock::time_point now,
     std::chrono::seconds idle_timeout) noexcept {
     return !session.link || session.link->Closed() ||
-        (idle_timeout.count() > 0 && now - session.last_active > idle_timeout);
+        (idle_timeout.count() > 0 && now - session.reclaim_hook.last_active > idle_timeout);
 }
 
 template <class Function>
@@ -258,6 +255,9 @@ template <class Function>
 bool UdpIngress::ReplyRoute::Send(UDPPacketView packet, const udp::endpoint& endpoint) {
     auto payload = response->Encode(packet);
     if (payload.empty()) return false;
+    if (owner != nullptr) {
+        return sink->EnqueueUdpReply(*owner, socket_key, socket, endpoint, std::move(payload), worker_id);
+    }
     return sink->EnqueueUdpReply(socket_key, socket.get(), endpoint, std::move(payload), worker_id);
 }
 
@@ -426,7 +426,7 @@ std::optional<UdpIngress::PendingUdpReply> UdpIngress::BeginReplySend(
 void UdpIngress::Link(UdpClientSession& row, std::string_view socket_key,
                       const ClientSessionKey& client_key, std::chrono::seconds idle_timeout) noexcept {
     reclaimer_.Register(row.reclaim_hook, *this, socket_key, client_key, idle_timeout,
-                        UdpAssociationExpiry(row.last_active, idle_timeout));
+                        UdpAssociationExpiry(row.reclaim_hook.last_active, idle_timeout));
     row.link->association_hook_ = &row.reclaim_hook;
 }
 
@@ -752,7 +752,7 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
                     auto session = row->second.link;
                     if (session->handoff_record_ && !session->Closed() &&
                         session->handoff_record_->association.get() == decoded->committed_association) {
-                        row->second.last_active = now;
+                        row->second.reclaim_hook.last_active = now;
                         session->UpdateReplyEndpoint(datagram.client_endpoint);
                         (void)session->Push(decoded->target, std::move(decoded->payload));
                     }
@@ -782,11 +782,7 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
             }
             session->UpdateReplyEndpoint(datagram.client_endpoint);
             if (auto* hook = session->association_hook_) {
-                auto outer = client_sessions_.find(hook->socket_key);
-                if (outer != client_sessions_.end()) {
-                    auto row = outer->second.find(*hook->client_key);
-                    if (row != outer->second.end()) row->second.last_active = now;
-                }
+                hook->last_active = now;
             }
             (void)session->Push(decoded->target, std::move(decoded->payload));
             return;
@@ -837,7 +833,7 @@ void UdpIngress::ProcessDecoded(const UdpDatagramContext& datagram,
             } else if (row->second.link && !row->second.link->Closed()) {
                 current_session = row->second.link;
                 if (current_session->Owns(decoded->session_owner)) {
-                    row->second.last_active = now;
+                    row->second.reclaim_hook.last_active = now;
                 }
             }
         }
@@ -880,7 +876,8 @@ void UdpIngress::ProcessDecoded(const UdpDatagramContext& datagram,
             .socket = stable_socket,
             .response = std::move(*response),
             .sink = &datagram.reply_sink,
-            .worker_id = worker_id};
+            .worker_id = worker_id,
+            .owner = this};
         auto client_session = CreateClientSession(
             socket_key, client_session_key, datagram.io_context,
             std::move(reply), datagram.client_endpoint,
@@ -1089,9 +1086,10 @@ UdpIngress::ClientSessionPtr UdpIngress::CreateClientSession(
     auto session_it = sessions.find(client_key);
     if (session_it == sessions.end()) {
         try {
+            UdpClientSession candidate{.link = session, .reclaim_hook = {}};
+            candidate.reclaim_hook.last_active = last_active;
             auto [inserted_it, inserted] = sessions.try_emplace(
-                client_key,
-                UdpClientSession{.link = session, .last_active = last_active, .reclaim_hook = {}});
+                client_key, std::move(candidate));
             if (inserted) {
                 Link(inserted_it->second, sessions_it->first, inserted_it->first,
                      idle_timeout);
@@ -1107,7 +1105,7 @@ UdpIngress::ClientSessionPtr UdpIngress::CreateClientSession(
         if (previous) previous->association_hook_ = nullptr;
         SetLocalAssociation(row.reclaim_hook, nullptr);
         row.link = session;
-        row.last_active = last_active;
+        row.reclaim_hook.last_active = last_active;
         row.reclaim_hook.idle_timeout = idle_timeout;
         session->association_hook_ = &row.reclaim_hook;
         reclaimer_.Rearm(row.reclaim_hook, UdpAssociationExpiry(last_active, idle_timeout));
@@ -1133,14 +1131,14 @@ void UdpIngress::ReclaimAssociation(
     }
     if (!ShouldReclaim(row->second, now, hook.idle_timeout)) {
         // Uplink activity moved last_active without touching the heap.
-        reclaimer_.Rearm(hook, UdpAssociationExpiry(row->second.last_active,
+        reclaimer_.Rearm(hook, UdpAssociationExpiry(row->second.reclaim_hook.last_active,
                                                     hook.idle_timeout));
         return;
     }
     auto session = row->second.link;
     const bool idle = session && !session->Closed() &&
         hook.idle_timeout.count() > 0 &&
-        now - row->second.last_active > hook.idle_timeout;
+        now - row->second.reclaim_hook.last_active > hook.idle_timeout;
     Unlink(row->second);
     outer->second.erase(row);
     // Release the last group before Close(): cancellation subscribers may

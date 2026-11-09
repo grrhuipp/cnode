@@ -4,7 +4,7 @@
 #include "common/defaults.hpp"
 #include "common/domain_name.hpp"
 #include "common/error.hpp"
-#include "common/ip_address.hpp"
+#include "common/ip_utils.hpp"
 #include "common/target_address.hpp"
 #include "transport/async_stream.hpp"
 #include "common/allocator.hpp"

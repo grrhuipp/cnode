@@ -1,8 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "app/proxyman/inbound/user_store.hpp"
-#include "app/proxyman/inbound/prepared_config.hpp"
-#include "validator.hpp"
+#include "encoding/body.hpp"
 #include "vmess_crypto.hpp"
 #include <chrono>
 #include <iostream>

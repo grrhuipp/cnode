@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "transport/internet/inbound_listen.hpp"
-#include "worker/tcp_listener.hpp"
+#include "app/worker.hpp"
 
 #include <array>
 #include <chrono>

@@ -1,6 +1,5 @@
 #include "app/proxyman/inbound/user_store.hpp"
 
-#include "app/proxyman/inbound/prepared_config.hpp"
 #include <openssl/crypto.h>
 #include <algorithm>
 #include <atomic>

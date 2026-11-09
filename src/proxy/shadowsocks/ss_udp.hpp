@@ -5,7 +5,7 @@
 #include "shadowsocks_protocol.hpp"
 #include "app/proxyman/inbound/user_store.hpp"
 #include "common/target_address.hpp"
-#include "proxy/inbound_datagram.hpp"
+#include "proxy/inbound.hpp"
 
 #include "common/unsafe.hpp"
 #include <algorithm>

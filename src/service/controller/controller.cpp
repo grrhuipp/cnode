@@ -5,18 +5,16 @@
 
 #include "api/api.hpp"
 #include "app/prepared_inbound.hpp"
-#include "app/proxyman/inbound/factory.hpp"
-#include "app/proxyman/inbound/prepared_config.hpp"
+#include "app/proxyman/inbound/handler.hpp"
 #include "app/proxyman/inbound/user_store.hpp"
-#include "app/proxyman/outbound/factory.hpp"
+#include "app/proxyman/outbound/handler.hpp"
 #include "app/worker.hpp"
 #include "common/asio_types.hpp"
 #include "core/constants.hpp"
-#include "core/naming.hpp"
-#include "features/routing/dispatch_policy.hpp"
+#include "features/routing/dispatcher.hpp"
+#include "infra/config.hpp"
 #include "infra/json.hpp"
 #include "infra/log.hpp"
-#include "infra/panel_config.hpp"
 #include "transport/internet/http_headers.hpp"
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/co_spawn.hpp>

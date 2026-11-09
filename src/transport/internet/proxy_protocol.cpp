@@ -1,6 +1,5 @@
 #include "transport/internet/proxy_protocol.hpp"
 #include "common/byte_reader.hpp"
-#include "common/ip_address.hpp"
 #include "infra/log.hpp"
 #include "common/ip_utils.hpp"
 

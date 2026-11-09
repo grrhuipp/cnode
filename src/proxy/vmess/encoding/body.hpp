@@ -8,8 +8,9 @@
 // 方向，因此编码器与解码器各只保留一份实现。
 // ============================================================================
 
-#include "../validator.hpp"
 #include "../vmess_crypto.hpp"
+#include "app/proxyman/inbound/user_store.hpp"
+#include "common/asio_types.hpp"
 #include "common/address_codec.hpp"
 #include "common/allocator.hpp"
 #include "common/buf/multi_buffer.hpp"
@@ -29,6 +30,19 @@
 #include <utility>
 
 namespace vmess {
+
+// 通过 AuthID 查找用户，限定 tag（优化：O(N_tag) 而非 O(N_total)）
+[[nodiscard]] std::shared_ptr<const proxyman::inbound::UserStore::VmessCredential>
+FindByAuthIDForTag(std::string_view tag,
+                   const uint8_t* auth_id,
+                   int64_t* out_timestamp = nullptr);
+
+// Records AEAD request body key/IV for replay protection.
+// Returns false if the same user/key/IV tuple is still inside the replay window.
+[[nodiscard]] net::awaitable<bool> RegisterSessionIfNew(
+    const proxyman::inbound::UserStore::VmessCredential& user,
+    const std::array<uint8_t, 16>& body_key,
+    const std::array<uint8_t, 16>& body_iv);
 
 inline void ValidateFixedUdpDatagram(const buf::MultiBuffer& payload,
                                      const TargetAddress& fixed_target) {

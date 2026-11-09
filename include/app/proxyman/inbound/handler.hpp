@@ -1,24 +1,30 @@
 #pragma once
 
 #include "common/allocator.hpp"
+#include "common/sharded_user_stats.hpp"
 #include "common/string_hash.hpp"
 #include "app/rate_limiter.hpp"
-#include "app/proxyman/inbound/receiver_settings.hpp"
-#include "app/proxyman/inbound/factory.hpp"
+#include "app/proxyman/inbound/user_store.hpp"
 #include "app/stats.hpp"
 #include "features/routing/dispatcher.hpp"
 #include "infra/config_types.hpp"
 #include "proxy/inbound.hpp"
 #include "transport/async_stream.hpp"
+#include "transport/internet/proxy_protocol.hpp"
 #include "transport/internet/stream_settings.hpp"
 
 #include <algorithm>
 #include <cstdint>
 #include <memory>
+#include <optional>
+#include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
+struct InboundProtocolSettings;
+struct InboundUserSpec;
 struct OnlineDevice;
 namespace app {
 // Worker-local request pressure; physical and dispatch counts are not added together.
@@ -94,6 +100,158 @@ class DNS;
 class InboundTransportStreamHandler;
 
 namespace proxyman::inbound {
+
+// ============================================================================
+// ReceiverSettings - xray-style proxyman receiver settings
+//
+// 对齐 xray-core app/proxyman ReceiverConfig 的职责：监听、传输、嗅探、
+// 出站选择策略这些 receiver 语义。冷路径构建；inbound Handler
+// 热路径只读，Dispatcher 只接收其中的窄 DispatchPolicy。
+// ============================================================================
+struct ReceiverSettings {
+    std::string      inbound_tag;             // 主标签（map key）
+    std::vector<std::string> inbound_tags;   // 所有标签（路由匹配任一）
+    std::string      protocol;          // "vmess" / "trojan" 等协议名
+    std::string      accounting_key{};  // Opaque stable reporting identity; empty disables per-user reporting.
+    StreamSettings   stream_settings;  // 传输层配置（network/security）
+    routing::DispatchPolicy dispatch_policy;
+    ProxyProtocolMode proxy_protocol = ProxyProtocolMode::Auto;
+
+    [[nodiscard]] const std::vector<std::string>* RouteInboundTags() const noexcept {
+        return inbound_tags.empty() ? nullptr : &inbound_tags;
+    }
+};
+
+[[nodiscard]] inline ReceiverSettings MakeReceiverSettings(
+    std::string inbound_tag,
+    std::vector<std::string> inbound_tags,
+    std::string protocol,
+    StreamSettings stream_settings,
+    SniffConfig sniff_config,
+    ProxyProtocolMode proxy_protocol,
+    routing::OutboundSelectionPolicy outbound_policy,
+    std::string accounting_key) {
+    std::erase(inbound_tags, inbound_tag);
+    return ReceiverSettings{
+        .inbound_tag = std::move(inbound_tag),
+        .inbound_tags = std::move(inbound_tags),
+        .protocol = std::move(protocol),
+        .accounting_key = std::move(accounting_key),
+        .stream_settings = std::move(stream_settings),
+        .dispatch_policy = {
+            .sniffing = std::move(sniff_config),
+            .outbound = std::move(outbound_policy),
+        },
+        .proxy_protocol = proxy_protocol,
+    };
+}
+
+enum class DatagramHandlerBuildStatus : uint8_t {
+    Unsupported,
+    Failed,
+    Ready,
+};
+
+enum class DatagramTransport : uint8_t {
+    None,
+    Packet,
+    Quic,
+};
+
+struct DatagramHandlerBuildResult {
+    DatagramHandlerBuildStatus status =
+        DatagramHandlerBuildStatus::Unsupported;
+    std::unique_ptr<::Inbound> handler;
+};
+
+// ============================================================================
+// ProtocolRuntime - 每个 Worker 的协议私有可变状态
+// ============================================================================
+class ProtocolRuntime : public memory::ThreadAllocated {
+public:
+    virtual ~ProtocolRuntime() noexcept = default;
+
+    [[nodiscard]] virtual ::UserOnlineTracker* OnlineTracker() noexcept {
+        return nullptr;
+    }
+};
+
+// ============================================================================
+// ProxyRegistration - 入站协议注册项
+// ============================================================================
+struct ProxyRegistration {
+    // Required when either user builder is present. This maps arbitrary
+    // registration names to one concrete UserStore partition.
+    std::optional<UserProtocol> user_protocol;
+    DatagramTransport datagram_transport = DatagramTransport::None;
+
+    // 创建当前 Worker 独占的协议运行态（必须）。
+    std::unique_ptr<ProtocolRuntime> (*create_runtime)() = nullptr;
+
+    // 创建 TCP 入站处理器（必须）
+    std::unique_ptr<::Inbound> (*create_tcp_handler)(
+        ProtocolRuntime& runtime,
+        ::StatsShard& stats,
+        ::ConnectionLimiter* limiter,
+        const BuildRequest& req) = nullptr;
+
+    // 创建 UDP 入站处理器（可选）
+    std::unique_ptr<::Inbound> (*create_datagram_handler)(
+        ProtocolRuntime& runtime,
+        ::StatsShard& stats,
+        ::ConnectionLimiter* limiter,
+        const BuildRequest& req) = nullptr;
+
+    // Parse protocol-specific source fields on the cold path. The returned
+    // immutable type remains private to the protocol implementation.
+    std::optional<std::shared_ptr<const ProtocolSettings>>
+    (*prepare_settings)(
+        std::string_view tag,
+        const ::InboundProtocolSettings& settings) = nullptr;
+
+    // 用户构建属于冷路径，结果发布到进程级只读 UserStore 快照。所有来源共用；
+    // 来源间的凭据差异只存在于 InboundProtocolSettings / InboundUserSpec 数据中。
+    std::optional<UserSet> (*build_users)(
+        const BuildRequest& req,
+        std::span<const ::InboundUserSpec> users) = nullptr;
+};
+
+// Registration errors are programming errors during static initialization and
+// therefore fail fast instead of returning an ignorable status.
+void RegisterProxy(std::string_view protocol, ProxyRegistration registration);
+
+[[nodiscard]] bool HasProxy(std::string_view protocol);
+
+[[nodiscard]] std::optional<UserProtocol> RegisteredUserProtocol(
+    std::string_view protocol);
+
+[[nodiscard]] DatagramTransport RegisteredDatagramTransport(
+    std::string_view protocol);
+[[nodiscard]] std::unique_ptr<ProtocolRuntime> NewProtocolRuntime(
+    std::string_view protocol);
+
+[[nodiscard]] std::unique_ptr<::Inbound> NewHandler(
+    std::string_view protocol,
+    ProtocolRuntime& runtime,
+    ::StatsShard& stats,
+    ::ConnectionLimiter* limiter,
+    const BuildRequest& req);
+
+[[nodiscard]] DatagramHandlerBuildResult NewDatagramHandler(
+    std::string_view protocol,
+    ProtocolRuntime& runtime,
+    ::StatsShard& stats,
+    ::ConnectionLimiter* limiter,
+    const BuildRequest& req);
+
+[[nodiscard]] std::optional<BuildRequest> PrepareBuildRequest(
+    std::string_view protocol,
+    std::string_view tag,
+    const ::InboundProtocolSettings& settings);
+
+[[nodiscard]] std::optional<UserSet> BuildUsers(
+    const BuildRequest& req,
+    std::span<const ::InboundUserSpec> users);
 
 // ============================================================================
 // Handler - address-stable Worker inbound transport host.

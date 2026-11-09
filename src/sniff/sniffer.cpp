@@ -3,7 +3,6 @@
 #include "common/allocator.hpp"
 #include "common/byte_reader.hpp"
 #include "common/domain_name.hpp"
-#include "common/ip_address.hpp"
 #include "common/ip_utils.hpp"
 #include "common/target_address.hpp"
 #include "common/unsafe.hpp"

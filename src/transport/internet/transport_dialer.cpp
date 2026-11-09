@@ -1,7 +1,6 @@
 #include "transport/internet/outbound_target_builder.hpp"
 #include "app/dns/dns.hpp"
 #include "common/allocator.hpp"
-#include "common/ip_address.hpp"
 #include "common/ip_utils.hpp"
 #include "core/constants.hpp"
 #include "transport/internet/http_headers.hpp"

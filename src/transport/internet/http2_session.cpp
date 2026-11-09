@@ -1461,12 +1461,32 @@ private:
         received_.pop_front();
 
         if (credit != 0) {
-            co_await SendWindowUpdate(*inner_, 0, credit);
-            conn_recv_window_ += credit;
             // After END_STREAM the peer sends no more DATA on this stream.
             if (!input_done_) {
-                co_await SendWindowUpdate(*inner_, stream_id_, credit);
+                std::array<uint8_t, 26> frames{};
+                const uint32_t inc = credit & 0x7fff'ffffu;
+                StoreU24BE(frames.data(), 4);
+                frames[3] = static_cast<uint8_t>(H2FrameType::WINDOW_UPDATE);
+                frames[4] = 0;
+                StoreU32BE(frames.data() + 5, 0);
+                StoreU32BE(frames.data() + 9, inc);
+                StoreU24BE(frames.data() + 13, 4);
+                frames[16] = static_cast<uint8_t>(H2FrameType::WINDOW_UPDATE);
+                frames[17] = 0;
+                StoreU32BE(frames.data() + 18, stream_id_ & 0x7fff'ffffu);
+                StoreU32BE(frames.data() + 22, inc);
+                const net::const_buffer buf = net::buffer(frames);
+                try {
+                    co_await inner_->WriteBuffers(std::span<const net::const_buffer>(&buf, 1));
+                } catch (...) {
+                    inner_->CloseAbortive();
+                    throw;
+                }
+                conn_recv_window_ += credit;
                 stream_recv_window_ += credit;
+            } else {
+                co_await SendWindowUpdate(*inner_, 0, credit);
+                conn_recv_window_ += credit;
             }
         }
         co_return true;

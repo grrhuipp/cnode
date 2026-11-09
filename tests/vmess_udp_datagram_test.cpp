@@ -4,7 +4,7 @@
 #include "vmess_crypto.hpp"
 #include "encoding/body.hpp"
 #include "transport/internet/tcp_stream.hpp"
-#include "app/proxyman/inbound/prepared_config.hpp"
+#include "app/proxyman/inbound/user_store.hpp"
 
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/cancellation_signal.hpp>

@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "proxy/udp_target.hpp"
+#include "proxy/outbound_stream_endpoint.hpp"
 #include "app/dns/dns.hpp"
 #include "app/relay.hpp"
 #include "transport/async_stream.hpp"

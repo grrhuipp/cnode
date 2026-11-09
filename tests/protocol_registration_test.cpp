@@ -1,9 +1,9 @@
 #include <gtest/gtest.h>
 
-#include "app/proxyman/inbound/factory.hpp"
+#include "app/proxyman/inbound/handler.hpp"
 #include "app/stats.hpp"
 #include "app/proxyman/inbound/user_store.hpp"
-#include "app/proxyman/outbound/factory.hpp"
+#include "app/proxyman/outbound/handler.hpp"
 #include "infra/config_types.hpp"
 #include "proxy/inbound.hpp"
 #include "transport/async_stream.hpp"

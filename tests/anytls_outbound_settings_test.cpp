@@ -1,7 +1,7 @@
 #include <stdexcept>
 #include <gtest/gtest.h>
 
-#include "anytls_outbound.hpp"
+#include "anytls_codec.hpp"
 
 #include <cstdlib>
 #include <iostream>

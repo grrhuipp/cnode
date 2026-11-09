@@ -1,8 +1,6 @@
 #pragma once
 
-#include "hysteria_protocol.hpp"
 #include "app/proxyman/inbound/handler.hpp"
-#include "app/proxyman/inbound/prepared_config.hpp"
 #include "app/rate_limiter.hpp"
 #include "common/allocator.hpp"
 #include "common/buf/multi_buffer.hpp"
@@ -33,11 +31,89 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <cstddef>
+#include <vector>
+#include <tl/expected.hpp>
 
 class InboundTransportStreamHandler;
 class AwaitableTaskGroup;
 
 namespace transport::internet::hysteria {
+
+enum class Version : uint8_t {
+    V1,
+    V2,
+};
+
+enum class ProtocolError : uint8_t {
+    Incomplete,
+    Invalid,
+    TooLarge,
+    UnsupportedVersion,
+};
+
+inline constexpr uint8_t kV1ProtocolVersion = 3;
+inline constexpr uint64_t kV2TcpRequestType = 0x401;
+inline constexpr size_t kMaxAuthLength = 4096;
+inline constexpr size_t kMaxAddressLength = 2048;
+inline constexpr size_t kMaxMessageLength = 2048;
+inline constexpr size_t kMaxPaddingLength = 4096;
+inline constexpr size_t kMaxUdpPayloadLength = 4096;
+
+struct V1ClientHello {
+    uint64_t send_bps = 0;
+    uint64_t receive_bps = 0;
+    memory::ThreadLocalString auth;
+};
+
+struct V1Request {
+    bool udp = false;
+    TargetAddress target;
+    size_t header_bytes = 0;
+};
+
+struct V2TcpRequest {
+    TargetAddress target;
+    size_t header_bytes = 0;
+};
+
+struct UdpMessage {
+    uint32_t session_id = 0;
+    uint16_t packet_id = 0;
+    uint8_t fragment_id = 0;
+    uint8_t fragment_count = 1;
+    TargetAddress target;
+    std::span<const uint8_t> payload;
+};
+
+[[nodiscard]] tl::expected<V1ClientHello, ProtocolError>
+ParseV1ClientHello(std::span<const uint8_t> input);
+
+[[nodiscard]] memory::ByteVector
+EncodeV1ServerHello(bool accepted, uint64_t send_bps, uint64_t receive_bps,
+                    std::string_view message);
+
+[[nodiscard]] tl::expected<V1Request, ProtocolError>
+ParseV1Request(std::span<const uint8_t> input);
+
+[[nodiscard]] memory::ByteVector
+EncodeV1Response(bool accepted, uint32_t udp_session_id, std::string_view message);
+
+[[nodiscard]] tl::expected<V2TcpRequest, ProtocolError>
+ParseV2TcpRequest(std::span<const uint8_t> input);
+
+[[nodiscard]] tl::expected<UdpMessage, ProtocolError>
+ParseUdpMessage(Version version, std::span<const uint8_t> input);
+
+// V2 的空目标按无地址续片计长；是否必须带目标仍由报文语义校验决定。
+[[nodiscard]] tl::expected<size_t, ProtocolError>
+UdpMessageHeaderSize(Version version, const TargetAddress& target);
+
+// 输出归属当前分配域，可直接移动到连接的待发送队列。
+[[nodiscard]] tl::expected<memory::ByteVector, ProtocolError>
+EncodeUdpMessage(Version version, const UdpMessage& message);
+
+[[nodiscard]] std::array<uint8_t, 32> HashCredential(std::string_view credential) noexcept;
 
 // Prepared Hysteria settings, built by the proxy registration on the cold
 // path. The QUIC transport selects ALPN/auth/framing by version and announces
@@ -325,14 +401,9 @@ private:
     void Dissociate(const ngtcp2_cid& cid) noexcept;
     void DissociateAll(Connection& connection) noexcept;
     SocketState* Resolve(const udp::endpoint& local) noexcept;
-    void Enqueue(const std::shared_ptr<Connection>& connection,
-                 const std::shared_ptr<SocketState>& socket,
-                 const udp::endpoint& remote,
-                 memory::ThreadLocalVector<uint8_t> bytes);
-    void Pump(const std::shared_ptr<Connection>& connection);
     net::awaitable<void> ReceiveLoop(std::shared_ptr<SocketState> socket);
     net::awaitable<void> SendLoop(std::shared_ptr<SocketState> socket);
-    void ArmExpiry();
+    void ArmExpiryAt(ngtcp2_tstamp deadline);
     net::awaitable<void> ExpiryLoop();
 
     app::DatagramSessionEnvironment environment;
@@ -350,6 +421,7 @@ private:
     net::steady_timer changed;
     net::steady_timer expiry;
     size_t tasks = 0;
+    ngtcp2_tstamp armed_expiry = std::numeric_limits<ngtcp2_tstamp>::max();
     bool stopping = false;
     bool started = false;
     bool expiry_running = false;
@@ -442,14 +514,6 @@ private:
         // Registered sessions; each unregisters itself on destruction and is
         // detached here first when the connection closes.
         memory::ThreadLocalUnorderedMap<uint32_t, UdpSessionStream*> udp_sessions;
-        struct PendingInputPacket {
-            std::shared_ptr<SocketState> socket;
-            udp::endpoint remote;
-            memory::ThreadLocalVector<uint8_t> bytes;
-        };
-        memory::ThreadLocalDeque<PendingInputPacket> inbox;
-        size_t inbox_bytes = 0;
-        bool pump_scheduled = false;
     };
     struct PendingFragments {
         TargetAddress target;

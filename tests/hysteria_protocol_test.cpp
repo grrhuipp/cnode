@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "hysteria_protocol.hpp"
+#include "hysteria_ingress.hpp"
 
 #include <algorithm>
 #include <array>

@@ -1,9 +1,7 @@
 #include "../inbound_admission.hpp"
-#include "../../transport/internet/hysteria/hysteria_protocol.hpp"
 #include "../../transport/internet/hysteria/hysteria_ingress.hpp"
 
-#include "app/proxyman/inbound/factory.hpp"
-#include "app/proxyman/inbound/receiver_settings.hpp"
+#include "app/proxyman/inbound/handler.hpp"
 #include "app/stats.hpp"
 #include "common/buf/multi_buffer.hpp"
 #include "common/buf/length_prefixed_packet_buffer.hpp"

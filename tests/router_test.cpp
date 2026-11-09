@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "app/router/router.hpp"
-#include "app/proxyman/inbound/receiver_settings.hpp"
+#include "app/proxyman/inbound/handler.hpp"
 #include "common/session.hpp"
 #include "infra/runtime_config_types.hpp"
 

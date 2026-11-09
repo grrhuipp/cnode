@@ -1,4 +1,3 @@
-#include "mux_inbound.hpp"
 #include "../../inbound_admission.hpp"
 #include "../../../common/awaitable_task_group.hpp"
 #include "features/routing/dispatcher.hpp"

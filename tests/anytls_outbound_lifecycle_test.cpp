@@ -1,7 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "anytls_outbound.hpp"
-#include "../anytls_codec.hpp"
+#include "anytls_codec.hpp"
 #include "app/dns/dns.hpp"
 #include "app/stats.hpp"
 #include "app/session_group_executor.hpp"

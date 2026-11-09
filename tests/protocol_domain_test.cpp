@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "app/proxyman/inbound/prepared_config.hpp"
+#include "app/proxyman/inbound/user_store.hpp"
 #include "common/address_codec.hpp"
 #include "common/buf/multi_buffer.hpp"
 #include "proxy/trojan/trojan_codec.hpp"
