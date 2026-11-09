@@ -440,11 +440,13 @@ UserStore::ShadowsocksUsersView UserStore::ShadowsocksUsers(std::string_view tag
 size_t UserStore::ShadowsocksUsersView::IdentityGroupEnd(size_t begin) const noexcept {
     const auto& list = *users;
     const auto& key = list[begin].identity_key;
-    const auto end = std::partition_point(list.begin() + begin, list.end(),
-        [&](const auto& user) {
-            return user.identity_key.size == key.size &&
-                CRYPTO_memcmp(user.identity_key.data(), key.data(), key.size) == 0;
-        });
+    const auto same_group = [&key](const auto& user) {
+        return user.identity_key.size == key.size &&
+            CRYPTO_memcmp(user.identity_key.data(), key.data(), key.size) == 0;
+    };
+    // 有序快照首尾同组即可确认只有一组；多组遍历时不再重复探测末项。
+    if (begin == 0 && same_group(list.back())) return list.size();
+    const auto end = std::partition_point(list.begin() + begin, list.end(), same_group);
     return static_cast<size_t>(end - list.begin());
 }
 

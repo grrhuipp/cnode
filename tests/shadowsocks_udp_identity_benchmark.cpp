@@ -192,7 +192,7 @@ TEST(ShadowsocksUdpIdentityBenchmark, AuthenticationMatrix) {
         struct ClearView {
             ~ClearView() { UserStore::ClearWorkerView(); }
         } clear_view;
-        // 76 identity + 16 no-identity deferred rows; two ordinary replay
+        // 112 identity + 16 no-identity deferred rows; two ordinary replay
         // controls (256 users, four groups, last position, 1200-byte payload).
         // This is codec/authentication work, NOT full UDP ingress: deferred rows
         // exclude directory/association replay commit, routing and network I/O.
@@ -200,7 +200,7 @@ TEST(ShadowsocksUdpIdentityBenchmark, AuthenticationMatrix) {
             const auto cipher = ss::ParseCipherMethod(cipher_name);
             ASSERT_TRUE(cipher.has_value());
             for (size_t count : {1u, 16u, 256u, 4096u}) {
-                for (size_t groups : {0u, 1u, 4u}) {
+                for (size_t groups : {0u, 1u, 4u, 16u}) {
                     if (groups > count || (groups == 0 && count != 1 && count != 256)) continue;
                     Install(Users(count, *cipher, groups));
                     const auto users = UserStore::ShadowsocksUsers(kTag);
