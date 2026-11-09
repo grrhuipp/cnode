@@ -1,4 +1,5 @@
 #include "transport/internet/transport_dialer.hpp"
+#include "app/session_group_executor.hpp"
 #include "common/buffer_util.hpp"
 #include "transport/internet/async_write_gate.hpp"
 #include "common/session.hpp"
@@ -248,6 +249,12 @@ protected:
                 tcp->TouchActivity();
             }
         }
+    }
+    net::io_context& CurrentIoContext() const noexcept {
+        if (const auto domain = ExecutionDomain::Current()) {
+            return domain->Reactor();
+        }
+        return io_context_;
     }
 
     virtual void CloseUpload(bool /*abortive*/) {}
@@ -620,7 +627,7 @@ private:
             ~OpeningScope() { opening = false; }
         } opening_scope{upload_opening_};
 
-        auto tcp_result = co_await DialSingleCandidate(io_context_, target_, candidate_);
+        auto tcp_result = co_await DialSingleCandidate(CurrentIoContext(), target_, candidate_);
         if (!tcp_result.Ok()) {
             if (tcp_result.error == ErrorCode::DIAL_TIMEOUT) {
                 upload_write_expired_ = true;
@@ -773,7 +780,7 @@ private:
         (void)ec;  // 20 digits always fit a uint64_t.
         path.append(seq_text.data(), static_cast<size_t>(seq_end - seq_text.data()));
 
-        auto tcp_result = co_await DialSingleCandidate(io_context_, target_, candidate_);
+        auto tcp_result = co_await DialSingleCandidate(CurrentIoContext(), target_, candidate_);
         if (!tcp_result.Ok()) {
             if (tcp_result.error == ErrorCode::DIAL_TIMEOUT) {
                 upload_write_expired_ = true;

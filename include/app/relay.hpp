@@ -1,6 +1,7 @@
 #pragma once
 
 #include "app/relay_types.hpp"
+#include "app/session_group_executor.hpp"
 #include "common/session.hpp"
 #include "common/buf/multi_buffer_batch.hpp"
 #include "transport/async_stream.hpp"
@@ -382,7 +383,10 @@ net::awaitable<RelayResult> DoRelayLink(
         };
         auto shutdown_client = [&]() -> net::awaitable<void> {
             if (!client_control && !state.down.write_shutdown) {
-                AsyncDelay delay(io_context);
+                auto& current_io = ExecutionDomain::Current()
+                    ? ExecutionDomain::Current()->Reactor()
+                    : io_context;
+                AsyncDelay delay(current_io);
                 auto wait_grace = [&]() -> net::awaitable<void> {
                     co_await delay.WaitFor(relay_detail::kRelayCloseGraceTimeout);
                     const auto cancellation = co_await net::this_coro::cancellation_state;

@@ -845,5 +845,500 @@ TEST(QuicUdp, ConcurrentMultiSessionMigrationAndEphemeralAnyTlsStreams) {
     EXPECT_GT(panel_user_pulls.load(), 2u);
     EXPECT_GT(panel_reports.load(), 0u);
 }
+
+TEST(QuicUdp, AllProtocolsAndTransportsFullMatrixConcurrentMigration) {
+    TempDir gateway_root, upstream_root;
+    constexpr size_t second_hop_count = 9;
+    constexpr size_t first_hop_count = 20;
+
+    std::vector<std::unique_ptr<Targets>> tcp_targets;
+    std::vector<Socket> udp_targets;
+    std::vector<uint16_t> tcp_ports(second_hop_count), udp_ports(second_hop_count);
+    tcp_targets.reserve(second_hop_count);
+    udp_targets.reserve(second_hop_count);
+    for (size_t q = 0; q < second_hop_count; ++q) {
+        tcp_targets.push_back(std::make_unique<Targets>([](Socket& socket) {
+            for (;;) {
+                const auto bytes = socket.Read(16384, 30s);
+                if (bytes.empty()) break;
+                socket.Write(bytes);
+            }
+        }));
+        udp_targets.push_back(Socket::BindUdp());
+        tcp_ports[q] = tcp_targets[q]->Port();
+        udp_ports[q] = udp_targets[q].Port();
+    }
+
+    const auto ss2022_id_key = udp::Base64(udp::Sequence(16, 193));
+    const auto ss2022_user_key = udp::Base64(udp::Sequence(16, 7));
+    const auto ss2022_combined_key = ss2022_id_key + ":" + ss2022_user_key;
+    const auto ss2022_256_id_key = udp::Base64(udp::Sequence(32, 193));
+    const auto ss2022_256_user_key = udp::Base64(udp::Sequence(32, 7));
+    const auto ss2022_256_combined_key = ss2022_256_id_key + ":" + ss2022_256_user_key;
+    const auto ss2022_chacha_key = udp::Base64(udp::Sequence(32, 41));
+    auto base64_url_hex = [](std::string_view hex) {
+        std::string raw;
+        for (size_t offset = 0; offset < hex.size(); offset += 2)
+            raw.push_back(static_cast<char>(std::stoul(std::string(hex.substr(offset, 2)), nullptr, 16)));
+        auto encoded = udp::Base64(raw);
+        while (encoded.ends_with('=')) encoded.pop_back();
+        std::replace(encoded.begin(), encoded.end(), '+', '-');
+        std::replace(encoded.begin(), encoded.end(), '/', '_');
+        return encoded;
+    };
+    const auto vless_enc_priv = base64_url_hex(
+        "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
+    const auto vless_enc_pub = base64_url_hex(
+        "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a");
+    auto reality_fallback_guard = Socket::Listen();
+
+    std::vector<udp::PortReservation> final_reservations;
+    final_reservations.reserve(second_hop_count);
+    for (size_t q = 0; q < second_hop_count; ++q) {
+        final_reservations.emplace_back(q == 4 || q == 6);
+    }
+    std::vector<udp::PortReservation> mid_reservations;
+    mid_reservations.reserve(first_hop_count);
+    for (size_t p = 0; p < first_hop_count; ++p) {
+        mid_reservations.emplace_back(false);
+    }
+    auto hy2_reservation = Socket::BindUdp();
+    const auto hy2_port = hy2_reservation.Port();
+
+    auto make_stream = [&](std::string_view net, std::string_view sec, bool server,
+                           std::string_view path_or_mode = {}) -> Json {
+        Json s = sec == "tls" ? TlsSettings(server) : Json{{"security", sec}};
+        s["network"] = net;
+        if (sec == "reality") {
+            if (server) {
+                s["realitySettings"] = {
+                    {"dest", "127.0.0.1:" + std::to_string(reality_fallback_guard.Port())},
+                    {"serverNames", Json::array({"example.com"})},
+                    {"privateKey", "6Epi9xRmv1RL-Kiqrj6Fl523a9eagFMTc-oyzGC5IU8"},
+                    {"shortIds", Json::array({"0123456789abcdef"})}};
+            } else {
+                s["realitySettings"] = {
+                    {"serverName", "example.com"},
+                    {"publicKey", "VPI8d_RKeP4K4eF69AY-QjrV325NaSe03p-a0zkcH3Q"},
+                    {"shortId", "0123456789abcdef"},
+                    {"fingerprint", "chrome"}};
+            }
+        }
+        if (net == "ws") s["wsSettings"] = {{"path", "/ws"}};
+        else if (net == "httpupgrade") s["httpupgradeSettings"] = {{"path", "/up"}, {"host", "localhost"}};
+        else if (net == "h2") s["httpSettings"] = {{"path", "/h2"}};
+        else if (net == "grpc") s["grpcSettings"] = {{"serviceName", "svc"}};
+        else if (net == "xhttp") s["xhttpSettings"] = {{"path", "/xh"}, {"mode", path_or_mode}};
+        return s;
+    };
+
+    Json gateway_inbounds = Json::array();
+    Json gateway_outbounds = Json::array({
+        {{"tag", "direct-out"}, {"protocol", "freedom"}, {"settings", Json::object()}}});
+    Json gateway_rules = Json::array();
+
+    Json upstream_inbounds = Json::array();
+    Json upstream_outbounds = Json::array({
+        {{"tag", "out-0"}, {"protocol", "freedom"}, {"settings", Json::object()}}});
+    Json upstream_rules = Json::array();
+
+    // Configure second-hop outbounds (upstream -> gateway final-<q> -> direct-out -> targets[q]).
+    for (size_t q = 0; q < second_hop_count; ++q) {
+        upstream_rules.push_back({
+            {"port", std::to_string(tcp_ports[q]) + "," + std::to_string(udp_ports[q])},
+            {"outboundTag", "out-" + std::to_string(q)}});
+        if (q == 0) continue;
+        const auto fport = final_reservations[q].port;
+        const auto ftag = "final-" + std::to_string(q);
+        const auto otag = "out-" + std::to_string(q);
+        if (q == 1) {
+            gateway_inbounds.push_back({{"tag", ftag}, {"protocol", "vless"},
+                {"listen", "127.0.0.1"}, {"port", fport}, {"outboundTag", "direct-out"},
+                {"settings", {{"decryption", "none"}, {"clients", Json::array({{{"id", UserId}}})}}}});
+            upstream_outbounds.push_back({{"tag", otag}, {"protocol", "vless"},
+                {"settings", {{"address", "127.0.0.1"}, {"port", fport}, {"id", UserId}, {"encryption", "none"}}}});
+        } else if (q == 2) {
+            gateway_inbounds.push_back({{"tag", ftag}, {"protocol", "vmess"},
+                {"listen", "127.0.0.1"}, {"port", fport}, {"outboundTag", "direct-out"},
+                {"settings", {{"clients", Json::array({{{"id", UserId}}})}}}});
+            upstream_outbounds.push_back({{"tag", otag}, {"protocol", "vmess"},
+                {"settings", {{"address", "127.0.0.1"}, {"port", fport}, {"id", UserId}, {"security", "aes-128-gcm"}}}});
+        } else if (q == 3) {
+            gateway_inbounds.push_back({{"tag", ftag}, {"protocol", "trojan"},
+                {"listen", "127.0.0.1"}, {"port", fport}, {"outboundTag", "direct-out"},
+                {"settings", {{"clients", Json::array({{{"password", "secret"}}})}}},
+                {"streamSettings", TlsSettings(true)}});
+            upstream_outbounds.push_back({{"tag", otag}, {"protocol", "trojan"},
+                {"settings", {{"address", "127.0.0.1"}, {"port", fport}, {"password", "secret"}}},
+                {"streamSettings", TlsSettings(false)}});
+        } else if (q == 4) {
+            gateway_inbounds.push_back({{"tag", ftag}, {"protocol", "shadowsocks"},
+                {"listen", "127.0.0.1"}, {"port", fport}, {"outboundTag", "direct-out"},
+                {"settings", {{"method", "aes-128-gcm"}, {"clients", Json::array({{{"password", "secret"}}})}}}});
+            upstream_outbounds.push_back({{"tag", otag}, {"protocol", "shadowsocks"},
+                {"settings", {{"address", "127.0.0.1"}, {"port", fport},
+                    {"method", "aes-128-gcm"}, {"password", "secret"}}}});
+        } else if (q == 5) {
+            gateway_inbounds.push_back({{"tag", ftag}, {"protocol", "shadowsocks"},
+                {"listen", "127.0.0.1"}, {"port", fport}, {"outboundTag", "direct-out"},
+                {"settings", {{"method", "chacha20-ietf-poly1305"}, {"clients", Json::array({{{"password", "secret"}}})}}}});
+            upstream_outbounds.push_back({{"tag", otag}, {"protocol", "shadowsocks"},
+                {"settings", {{"address", "127.0.0.1"}, {"port", fport},
+                    {"method", "chacha20-ietf-poly1305"}, {"password", "secret"},
+                    {"uot", {{"enabled", true}, {"version", 2}}}}}});
+        } else if (q == 6) {
+            gateway_inbounds.push_back({{"tag", ftag}, {"protocol", "shadowsocks"},
+                {"listen", "127.0.0.1"}, {"port", fport}, {"outboundTag", "direct-out"},
+                {"settings", {{"method", "2022-blake3-aes-128-gcm"}, {"password", ss2022_id_key},
+                    {"clients", Json::array({{{"password", ss2022_user_key}}})}}}});
+            upstream_outbounds.push_back({{"tag", otag}, {"protocol", "shadowsocks"},
+                {"settings", {{"address", "127.0.0.1"}, {"port", fport},
+                    {"method", "2022-blake3-aes-128-gcm"}, {"password", ss2022_combined_key}}}});
+        } else if (q == 7) {
+            gateway_inbounds.push_back({{"tag", ftag}, {"protocol", "anytls"},
+                {"listen", "127.0.0.1"}, {"port", fport}, {"outboundTag", "direct-out"},
+                {"settings", {{"clients", Json::array({{{"password", "secret"}}})}}},
+                {"streamSettings", TlsSettings(true)}});
+            upstream_outbounds.push_back({{"tag", otag}, {"protocol", "anytls"},
+                {"settings", {{"address", "127.0.0.1"}, {"port", fport},
+                    {"password", "secret"}, {"minIdleSession", 1}}},
+                {"streamSettings", TlsSettings(false)}});
+        } else if (q == 8) {
+            gateway_inbounds.push_back({{"tag", ftag}, {"protocol", "shadowsocks"},
+                {"listen", "127.0.0.1"}, {"port", fport}, {"outboundTag", "direct-out"},
+                {"settings", {{"method", "2022-blake3-chacha20-poly1305"},
+                    {"clients", Json::array({{{"password", ss2022_chacha_key}}})}}}});
+            upstream_outbounds.push_back({{"tag", otag}, {"protocol", "shadowsocks"},
+                {"settings", {{"address", "127.0.0.1"}, {"port", fport},
+                    {"method", "2022-blake3-chacha20-poly1305"}, {"password", ss2022_chacha_key},
+                    {"uot", {{"enabled", true}, {"version", 2}}}}}});
+        }
+    }
+
+    struct FirstHopSpec {
+        const char* name;
+        const char* protocol;
+        const char* network;
+        const char* security;
+        const char* extra;
+        bool supports_udp;
+    };
+    constexpr std::array<FirstHopSpec, first_hop_count> first_hops{{
+        {"vless-tcp", "vless", "tcp", "none", "", true},
+        {"vless-vision-tls", "vless", "tcp", "tls", "vision", false},
+        {"vless-enc-native", "vless", "tcp", "none", "enc-native", true},
+        {"vless-enc-xorpub", "vless", "tcp", "none", "enc-xorpub", true},
+        {"vless-reality", "vless", "tcp", "reality", "", true},
+        {"vless-ws-tls", "vless", "ws", "tls", "", true},
+        {"vless-httpupgrade", "vless", "httpupgrade", "none", "", true},
+        {"vless-h2-tls", "vless", "h2", "tls", "", true},
+        {"vless-grpc-tls", "vless", "grpc", "tls", "", true},
+        {"vless-xhttp-stream-one-tls", "vless", "xhttp", "tls", "stream-one", true},
+        {"vless-xhttp-packet-tls", "vless", "xhttp", "tls", "packet-up", true},
+        {"vless-xhttp-stream-tls", "vless", "xhttp", "tls", "stream-up", true},
+        {"vmess-tcp", "vmess", "tcp", "none", "", true},
+        {"vmess-ws-tls", "vmess", "ws", "tls", "", true},
+        {"trojan-tls", "trojan", "tcp", "tls", "", true},
+        {"trojan-grpc-tls", "trojan", "grpc", "tls", "", true},
+        {"ss-legacy-uot", "shadowsocks", "tcp", "none", "legacy", true},
+        {"ss2022-eih-128-uot", "shadowsocks", "tcp", "none", "2022-128", true},
+        {"ss2022-eih-256-uot", "shadowsocks", "tcp", "none", "2022-256", true},
+        {"anytls-tls", "anytls", "tcp", "tls", "", true},
+    }};
+
+    Json hy2_clients = Json::array();
+    for (size_t p = 0; p < first_hop_count; ++p) {
+        const auto& spec = first_hops[p];
+        const auto mport = mid_reservations[p].port;
+        const auto mtag = "mid-" + std::to_string(p);
+        const auto htag = "hop-" + std::to_string(p);
+        const auto email = "hop-" + std::to_string(p) + "@matrix.test";
+        hy2_clients.push_back({{"password", "pw-" + std::to_string(p)}, {"email", email}});
+        gateway_rules.push_back({{"user", Json::array({email})}, {"outboundTag", htag}});
+
+        Json in_stream = make_stream(spec.network, spec.security, true, spec.extra);
+        Json out_stream = make_stream(spec.network, spec.security, false, spec.extra);
+        if (std::string_view(spec.protocol) == "vless") {
+            Json client_entry = {{"id", UserId}};
+            std::string decryption = "none";
+            std::string encryption = "none";
+            if (std::string_view(spec.extra) == "vision") {
+                client_entry["flow"] = "xtls-rprx-vision";
+            } else if (std::string_view(spec.extra) == "enc-native") {
+                decryption = "mlkem768x25519plus.native.600s." + vless_enc_priv;
+                encryption = "mlkem768x25519plus.native.0rtt." + vless_enc_pub;
+            } else if (std::string_view(spec.extra) == "enc-xorpub") {
+                decryption = "mlkem768x25519plus.xorpub.600s." + vless_enc_priv;
+                encryption = "mlkem768x25519plus.xorpub.0rtt." + vless_enc_pub;
+            }
+            Json out_settings = {{"address", "127.0.0.1"}, {"port", mport}, {"id", UserId}, {"encryption", encryption}};
+            if (std::string_view(spec.extra) == "vision") out_settings["flow"] = "xtls-rprx-vision";
+            upstream_inbounds.push_back({{"tag", mtag}, {"protocol", "vless"},
+                {"listen", "127.0.0.1"}, {"port", mport}, {"fallbackTag", "out-0"},
+                {"settings", {{"decryption", decryption}, {"clients", Json::array({client_entry})}}},
+                {"streamSettings", std::move(in_stream)}});
+            gateway_outbounds.push_back({{"tag", htag}, {"protocol", "vless"},
+                {"settings", std::move(out_settings)}, {"streamSettings", std::move(out_stream)}});
+        } else if (std::string_view(spec.protocol) == "vmess") {
+            upstream_inbounds.push_back({{"tag", mtag}, {"protocol", "vmess"},
+                {"listen", "127.0.0.1"}, {"port", mport}, {"fallbackTag", "out-0"},
+                {"settings", {{"clients", Json::array({{{"id", UserId}}})}}},
+                {"streamSettings", std::move(in_stream)}});
+            gateway_outbounds.push_back({{"tag", htag}, {"protocol", "vmess"},
+                {"settings", {{"address", "127.0.0.1"}, {"port", mport}, {"id", UserId},
+                    {"security", std::string_view(spec.network) == "ws" ? "chacha20-poly1305" : "aes-128-gcm"}}},
+                {"streamSettings", std::move(out_stream)}});
+        } else if (std::string_view(spec.protocol) == "trojan") {
+            upstream_inbounds.push_back({{"tag", mtag}, {"protocol", "trojan"},
+                {"listen", "127.0.0.1"}, {"port", mport}, {"fallbackTag", "out-0"},
+                {"settings", {{"clients", Json::array({{{"password", "secret"}}})}}},
+                {"streamSettings", std::move(in_stream)}});
+            gateway_outbounds.push_back({{"tag", htag}, {"protocol", "trojan"},
+                {"settings", {{"address", "127.0.0.1"}, {"port", mport}, {"password", "secret"}}},
+                {"streamSettings", std::move(out_stream)}});
+        } else if (std::string_view(spec.protocol) == "shadowsocks") {
+            if (std::string_view(spec.extra) == "legacy") {
+                upstream_inbounds.push_back({{"tag", mtag}, {"protocol", "shadowsocks"},
+                    {"listen", "127.0.0.1"}, {"port", mport}, {"fallbackTag", "out-0"},
+                    {"settings", {{"method", "aes-128-gcm"}, {"clients", Json::array({{{"password", "secret"}}})}}}});
+                gateway_outbounds.push_back({{"tag", htag}, {"protocol", "shadowsocks"},
+                    {"settings", {{"address", "127.0.0.1"}, {"port", mport},
+                        {"method", "aes-128-gcm"}, {"password", "secret"},
+                        {"uot", {{"enabled", true}, {"version", 2}}}}}});
+            } else if (std::string_view(spec.extra) == "2022-128") {
+                upstream_inbounds.push_back({{"tag", mtag}, {"protocol", "shadowsocks"},
+                    {"listen", "127.0.0.1"}, {"port", mport}, {"fallbackTag", "out-0"},
+                    {"settings", {{"method", "2022-blake3-aes-128-gcm"}, {"password", ss2022_id_key},
+                        {"clients", Json::array({{{"password", ss2022_user_key}}})}}}});
+                gateway_outbounds.push_back({{"tag", htag}, {"protocol", "shadowsocks"},
+                    {"settings", {{"address", "127.0.0.1"}, {"port", mport},
+                        {"method", "2022-blake3-aes-128-gcm"}, {"password", ss2022_combined_key},
+                        {"uot", {{"enabled", true}, {"version", 2}}}}}});
+            } else {
+                upstream_inbounds.push_back({{"tag", mtag}, {"protocol", "shadowsocks"},
+                    {"listen", "127.0.0.1"}, {"port", mport}, {"fallbackTag", "out-0"},
+                    {"settings", {{"method", "2022-blake3-aes-256-gcm"}, {"password", ss2022_256_id_key},
+                        {"clients", Json::array({{{"password", ss2022_256_user_key}}})}}}});
+                gateway_outbounds.push_back({{"tag", htag}, {"protocol", "shadowsocks"},
+                    {"settings", {{"address", "127.0.0.1"}, {"port", mport},
+                        {"method", "2022-blake3-aes-256-gcm"}, {"password", ss2022_256_combined_key},
+                        {"uot", {{"enabled", true}, {"version", 2}}}}}});
+            }
+        } else if (std::string_view(spec.protocol) == "anytls") {
+            upstream_inbounds.push_back({{"tag", mtag}, {"protocol", "anytls"},
+                {"listen", "127.0.0.1"}, {"port", mport}, {"fallbackTag", "out-0"},
+                {"settings", {{"clients", Json::array({{{"password", "secret"}}})}}},
+                {"streamSettings", std::move(in_stream)}});
+            gateway_outbounds.push_back({{"tag", htag}, {"protocol", "anytls"},
+                {"settings", {{"address", "127.0.0.1"}, {"port", mport},
+                    {"password", "secret"}, {"minIdleSession", 1}}},
+                {"streamSettings", std::move(out_stream)}});
+        }
+    }
+
+    auto hy2_inbound = HysteriaInbound(hy2_port);
+    hy2_inbound["tag"] = "hy2-matrix-in";
+    hy2_inbound["fallbackTag"] = "direct-out";
+    hy2_inbound["settings"]["upMbps"] = 1000;
+    hy2_inbound["settings"]["downMbps"] = 1000;
+    hy2_inbound["settings"]["clients"] = std::move(hy2_clients);
+    gateway_inbounds.push_back(std::move(hy2_inbound));
+
+    const Json base_config = {
+        {"workers", 4},
+        {"timeouts", {{"handshake", 15}, {"dial", 10}, {"read", 20}, {"write", 30},
+                      {"connIdle", 60}, {"uplinkOnly", 10}, {"downlinkOnly", 10}}}};
+    auto gw_cfg = base_config;
+    gw_cfg["log"] = {{"enable", true}, {"loglevel", "debug"}, {"logDir", (gateway_root.Path() / "logs").string()}};
+    WriteJson(gateway_root.Path(), "config.json", gw_cfg);
+    WriteJson(gateway_root.Path(), "inbounds.json", gateway_inbounds);
+    WriteJson(gateway_root.Path(), "outbounds.json", gateway_outbounds);
+    WriteJson(gateway_root.Path(), "routing.json", {{"rules", gateway_rules}});
+
+    auto up_cfg = base_config;
+    up_cfg["log"] = {{"enable", false}, {"logDir", (upstream_root.Path() / "logs").string()}};
+    WriteJson(upstream_root.Path(), "config.json", up_cfg);
+    WriteJson(upstream_root.Path(), "inbounds.json", upstream_inbounds);
+    WriteJson(upstream_root.Path(), "outbounds.json", upstream_outbounds);
+    WriteJson(upstream_root.Path(), "routing.json", {{"rules", upstream_rules}});
+
+    for (auto& res : final_reservations) res.Release();
+    for (auto& res : mid_reservations) res.Release();
+    hy2_reservation.Close();
+
+    Child upstream({Binary().string(), "--config-dir", upstream_root.Path().string()},
+        upstream_root.Path() / "upstream.log");
+    upstream.WaitForLog("server started");
+    Child gateway({Binary().string(), "--config-dir", gateway_root.Path().string()},
+        gateway_root.Path() / "gateway.log");
+    gateway.WaitForLog("server started");
+
+    struct HopClient {
+        std::unique_ptr<Peer> peer;
+        std::array<int64_t, second_hop_count> tcp_streams{};
+        std::array<std::string, second_hop_count> tcp_expected{};
+    };
+    std::vector<HopClient> clients(first_hop_count);
+    for (size_t p = 0; p < first_hop_count; ++p) {
+        clients[p].peer = std::make_unique<Peer>(hy2_port, "pw-" + std::to_string(p));
+        for (size_t q = 0; q < second_hop_count; ++q) {
+            const auto target = "127.0.0.1:" + std::to_string(tcp_ports[q]);
+            const auto init = "init-" + std::to_string(p) + "-" + std::to_string(q) + ":";
+            clients[p].tcp_streams[q] = clients[p].peer->Open(target, init);
+            clients[p].tcp_expected[q] = init;
+        }
+    }
+
+    auto pump_matrix = [&] {
+        for (auto& client : clients) client.peer->Pump(Milliseconds(1));
+        for (size_t q = 0; q < second_hop_count; ++q) {
+            for (size_t step = 0; step < 32; ++step) {
+                std::array<char, 4096> bytes{};
+                sockaddr_in source{};
+                socklen_t length = sizeof(source);
+                const auto count = ::recvfrom(udp_targets[q].Fd(), bytes.data(), bytes.size(),
+                    MSG_DONTWAIT, reinterpret_cast<sockaddr*>(&source), &length);
+                if (count < 0) {
+                    if (errno == EINTR) continue;
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                    throw std::system_error(errno, std::generic_category(), "matrix UDP recv");
+                }
+                const auto sent = ::sendto(udp_targets[q].Fd(), bytes.data(),
+                    static_cast<size_t>(count), MSG_NOSIGNAL,
+                    reinterpret_cast<const sockaddr*>(&source), sizeof(source));
+                ASSERT_EQ(sent, count);
+            }
+        }
+    };
+
+    auto decode_udp = [](std::string_view wire, uint32_t expected_session,
+                         std::string_view expected_address) {
+        udp::Require(wire.size() >= 9 &&
+            ReadBigEndian(wire.substr(0, 4)) == expected_session &&
+            static_cast<uint8_t>(wire[7]) == 1, "matrix HY2 UDP header mismatch");
+        const size_t width = size_t{1} << (static_cast<uint8_t>(wire[8]) >> 6);
+        udp::Require(width <= wire.size() - 8, "matrix HY2 UDP address width");
+        size_t length = static_cast<uint8_t>(wire[8]) & 0x3f;
+        for (size_t i = 1; i < width; ++i)
+            length = (length << 8) | static_cast<uint8_t>(wire[8 + i]);
+        udp::Require(length <= wire.size() - 8 - width &&
+            wire.substr(8 + width, length) == expected_address,
+            "matrix HY2 UDP source address mismatch");
+        return std::string(wire.substr(8 + width + length));
+    };
+
+    constexpr size_t matrix_rounds = 4;
+    for (size_t round = 0; round < matrix_rounds; ++round) {
+        for (size_t p = 0; p < first_hop_count; ++p) {
+            if ((round & 1) == 0) {
+                const auto path = clients[p].peer->AddPath();
+                clients[p].peer->SwitchPath(path);
+            } else {
+                clients[p].peer->SwitchPath(0);
+            }
+        }
+        std::vector<std::array<bool, second_hop_count>> udp_done(first_hop_count);
+        std::vector<std::array<std::string, second_hop_count>> udp_expected(first_hop_count);
+        for (size_t p = 0; p < first_hop_count; ++p) {
+            for (size_t q = 0; q < second_hop_count; ++q) {
+                const auto chunk = "r" + std::to_string(round) + "-" +
+                    std::to_string(p) + "x" + std::to_string(q) + ";";
+                clients[p].peer->Send(clients[p].tcp_streams[q], chunk);
+                clients[p].tcp_expected[q] += chunk;
+                if (first_hops[p].supports_udp) {
+                    udp_done[p][q] = false;
+                    udp_expected[p][q] = "u" + std::to_string(round) + "-" +
+                        std::to_string(p) + "x" + std::to_string(q);
+                    const uint32_t sid = static_cast<uint32_t>(0x4000 + p * 16 + q);
+                    const auto addr = "127.0.0.1:" + std::to_string(udp_ports[q]);
+                    clients[p].peer->SendDatagram(UdpWire(
+                        sid, static_cast<uint16_t>(round * 16 + q + 1), 0, 1, addr, udp_expected[p][q]));
+                } else {
+                    udp_done[p][q] = true;
+                }
+            }
+        }
+
+        const auto deadline = std::chrono::steady_clock::now() + 25s;
+        auto next_retry = std::chrono::steady_clock::now() + 250ms;
+        for (;;) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                for (size_t p = 0; p < first_hop_count; ++p) {
+                    for (size_t q = 0; q < second_hop_count; ++q) {
+                        const bool tcp_ok = clients[p].peer->PayloadEquals(
+                            clients[p].tcp_streams[q], clients[p].tcp_expected[q]);
+                        if (!tcp_ok || !udp_done[p][q]) {
+                            std::cerr << "matrix timeout round=" << round
+                                      << " first_hop=" << first_hops[p].name
+                                      << " second_hop=" << q
+                                      << " tcp_ok=" << tcp_ok
+                                      << " udp_ok=" << udp_done[p][q] << "\n";
+                        }
+                    }
+                }
+                for (auto& target : tcp_targets) target->Join();
+                FAIL() << "full protocol matrix round=" << round << " timed out";
+            }
+            pump_matrix();
+            const auto now = std::chrono::steady_clock::now();
+            const bool retry = now >= next_retry;
+            if (retry) next_retry = now + 250ms;
+            bool all_complete = true;
+            for (size_t p = 0; p < first_hop_count; ++p) {
+                while (clients[p].peer->HasDatagram()) {
+                    const auto wire = clients[p].peer->ReadDatagram();
+                    ASSERT_GE(wire.size(), 9u);
+                    const uint32_t sid = static_cast<uint32_t>(ReadBigEndian(std::string_view(wire).substr(0, 4)));
+                    ASSERT_GE(sid, 0x4000u);
+                    const size_t q = (sid - 0x4000u) % 16;
+                    ASSERT_LT(q, second_hop_count);
+                    const auto addr = "127.0.0.1:" + std::to_string(udp_ports[q]);
+                    const auto body = decode_udp(wire, sid, addr);
+                    if (body == udp_expected[p][q]) udp_done[p][q] = true;
+                }
+                for (size_t q = 0; q < second_hop_count; ++q) {
+                    if (!clients[p].peer->PayloadEquals(clients[p].tcp_streams[q], clients[p].tcp_expected[q]))
+                        all_complete = false;
+                    if (!udp_done[p][q]) {
+                        all_complete = false;
+                        if (retry) {
+                            const uint32_t sid = static_cast<uint32_t>(0x4000 + p * 16 + q);
+                            const auto addr = "127.0.0.1:" + std::to_string(udp_ports[q]);
+                            clients[p].peer->SendDatagram(UdpWire(
+                                sid, static_cast<uint16_t>(round * 16 + q + 1), 0, 1, addr, udp_expected[p][q]));
+                        }
+                    }
+                }
+            }
+            if (all_complete) break;
+        }
+    }
+
+    for (size_t p = 0; p < first_hop_count; ++p) {
+        EXPECT_FALSE(clients[p].peer->Closed());
+        for (size_t q = 0; q < second_hop_count; ++q)
+            clients[p].peer->Send(clients[p].tcp_streams[q], "", true);
+    }
+    const auto close_deadline = std::chrono::steady_clock::now() + 15s;
+    for (;;) {
+        ASSERT_LT(std::chrono::steady_clock::now(), close_deadline);
+        pump_matrix();
+        bool all_closed = true;
+        for (size_t p = 0; p < first_hop_count; ++p)
+            for (size_t q = 0; q < second_hop_count; ++q)
+                all_closed &= clients[p].peer->StreamClosed(clients[p].tcp_streams[q]);
+        if (all_closed) break;
+    }
+    EXPECT_EQ(gateway.Stop(10s), 0);
+    EXPECT_EQ(upstream.Stop(10s), 0);
+    for (auto& target : tcp_targets) target->Join();
+    std::string logs = ReadFile(gateway.LogPath());
+    for (const auto& entry : std::filesystem::directory_iterator(gateway_root.Path() / "logs")) {
+        if (entry.is_regular_file()) logs += ReadFile(entry.path());
+    }
+    EXPECT_NE(logs.find("QUIC passive handoff committed"), std::string::npos);
+    EXPECT_NE(logs.find("path_evidence=challenge"), std::string::npos);
+    EXPECT_NE(logs.find("path_evidence=reused"), std::string::npos);
+}
 } // namespace
 } // namespace cnode::e2e::quic
