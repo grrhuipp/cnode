@@ -6,10 +6,8 @@
 #include "core/naming.hpp"
 #include "infra/json_field.hpp"
 #include "infra/inbound_field_rules.hpp"
-#include "infra/proxy_protocol_config.hpp"
 #include "infra/outbound_bind_config.hpp"
 #include "infra/log.hpp"
-#include "http2_initial_window.hpp"
 #include <algorithm>
 #include <cctype>
 #include <charconv>

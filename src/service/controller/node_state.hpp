@@ -17,7 +17,7 @@ namespace controller {
 // Constructed before runtime mutations and immutable after publication.
 struct NodeSnapshot {
     api::NodeInfo config;
-    std::vector<api::UserInfo> users;
+    std::shared_ptr<const std::vector<api::UserInfo>> users;
     std::string users_etag;
     std::string config_etag;
     std::shared_ptr<const std::vector<rule::DetectRule>> rules;

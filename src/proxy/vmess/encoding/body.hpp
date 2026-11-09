@@ -12,6 +12,7 @@
 #include "common/allocator.hpp"
 #include "common/buf/multi_buffer.hpp"
 #include "transport/link.hpp"
+#include "transport/async_stream.hpp"
 
 #include <array>
 #include <cstddef>
@@ -90,9 +91,27 @@ public:
     void Encode(const buf::MultiBuffer& payload, buf::MultiBuffer& out);
     void Encode(std::span<const net::const_buffer> payload, buf::MultiBuffer& out);
     // Zero-length chunk ending this direction; repeated EOF emits no bytes.
-    void EncodeEnd(buf::MultiBuffer& out);
     [[nodiscard]] size_t EncodeEndTo(std::span<uint8_t, 128> out);
     [[nodiscard]] bool PacketMode() const noexcept { return cipher_.PacketMode(); }
+
+    net::awaitable<void> WriteMultiBuffer(
+        AsyncStream& stream,
+        buf::MultiBuffer mb,
+        const char* cancel_what,
+        std::span<const uint8_t> first_header = std::span<const uint8_t>{},
+        bool* header_sent = nullptr,
+        const TargetAddress* udp_target = nullptr);
+    net::awaitable<void> WriteBuffers(
+        AsyncStream& stream,
+        std::span<const net::const_buffer> buffers,
+        const char* cancel_what,
+        std::span<const uint8_t> first_header = std::span<const uint8_t>{},
+        bool* header_sent = nullptr);
+    net::awaitable<void> WriteEOF(
+        AsyncStream& stream,
+        const char* cancel_what,
+        std::span<const uint8_t> first_header = std::span<const uint8_t>{},
+        bool* header_sent = nullptr);
 
     // Framing failures and failed downstream writes retire this direction.
     // A clean downstream WriteClosed instead finishes it without touching reads.
@@ -143,6 +162,7 @@ public:
 private:
     enum class State { Active, Finished, Failed };
 
+    [[nodiscard]] bool TryConsumePending(std::span<uint8_t> out, size_t& filled) noexcept;
     net::awaitable<buf::MultiBuffer> ReadChunk(transport::MultiBufferReader& src);
     [[noreturn]] void Fail(const char* what);
     void FinishRecord() noexcept;

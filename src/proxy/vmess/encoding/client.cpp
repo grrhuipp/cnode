@@ -203,90 +203,20 @@ net::awaitable<VMessHandshakeResult> ClientSession::EncodeRequestHeader(
 net::awaitable<void> ClientSession::EncodeRequestBody(
     AsyncStream& stream,
     buf::MultiBuffer mb) {
-    request_encoder_.CheckWritable();
-    if ((co_await net::this_coro::cancellation_state).cancelled() !=
-        net::cancellation_type::none) {
-        throw IoSystemError(io_error::operation_aborted,
-                            "VMess request write cancelled before start");
-    }
-    bool write_started = false;
-    try {
-        buf::MultiBuffer chunks;
-        request_encoder_.Encode(mb, chunks);
-        mb.clear();
-        if (chunks.byte_size() != 0) {
-            write_started = true;
-            co_await stream.WriteMultiBuffer(std::move(chunks));
-        }
-    } catch (const transport::WriteClosed&) {
-        request_encoder_.Finish();
-        throw;
-    } catch (...) {
-        if (write_started || request_encoder_.Failed()) {
-            request_encoder_.Abort();
-            stream.CloseAbortive();
-        }
-        throw;
-    }
+    return request_encoder_.WriteMultiBuffer(
+        stream, std::move(mb), "VMess request write cancelled before start");
 }
 
 net::awaitable<void> ClientSession::EncodeRequestBody(
     AsyncStream& stream,
     std::span<const net::const_buffer> buffers) {
-    request_encoder_.CheckWritable();
-    if ((co_await net::this_coro::cancellation_state).cancelled() !=
-        net::cancellation_type::none) {
-        throw IoSystemError(io_error::operation_aborted,
-                            "VMess request write cancelled before start");
-    }
-    bool write_started = false;
-    try {
-        buf::MultiBuffer chunks;
-        request_encoder_.Encode(buffers, chunks);
-        if (chunks.byte_size() != 0) {
-            write_started = true;
-            co_await stream.WriteMultiBuffer(std::move(chunks));
-        }
-    } catch (const transport::WriteClosed&) {
-        request_encoder_.Finish();
-        throw;
-    } catch (...) {
-        if (write_started || request_encoder_.Failed()) {
-            request_encoder_.Abort();
-            stream.CloseAbortive();
-        }
-        throw;
-    }
+    return request_encoder_.WriteBuffers(
+        stream, buffers, "VMess request write cancelled before start");
 }
 
 net::awaitable<void> ClientSession::EncodeRequestBodyEOF(AsyncStream& stream) {
-    if (request_encoder_.Finished()) co_return;
-    request_encoder_.CheckWritable();
-    if ((co_await net::this_coro::cancellation_state).cancelled() !=
-        net::cancellation_type::none) {
-        throw IoSystemError(io_error::operation_aborted,
-                            "VMess request EOF cancelled before start");
-    }
-    bool write_started = false;
-    try {
-        std::array<uint8_t, 128> eof_chunk{};
-        const size_t eof_len = request_encoder_.EncodeEndTo(eof_chunk);
-        if (eof_len == 0) co_return;
-        const std::array<net::const_buffer, 1> buffers{
-            net::buffer(eof_chunk.data(), eof_len),
-        };
-        write_started = true;
-        co_await stream.WriteBuffers(buffers);
-    } catch (const transport::WriteClosed&) {
-        request_encoder_.Finish();
-        throw;
-    } catch (...) {
-        if (write_started || request_encoder_.Failed()) {
-            request_encoder_.Abort();
-            stream.CloseAbortive();
-        }
-        throw;
-    }
+    return request_encoder_.WriteEOF(
+        stream, "VMess request EOF cancelled before start");
 }
 
 net::awaitable<void> ClientSession::DecodeResponseHeader(AsyncStream& stream) {
@@ -357,6 +287,13 @@ net::awaitable<void> ClientSession::DecodeResponseHeader(AsyncStream& stream) {
 }
 
 net::awaitable<buf::MultiBuffer> ClientSession::DecodeResponse(AsyncStream& stream) {
+    if (response_header_received_) {
+        return response_decoder_.Read(stream);
+    }
+    return DecodeFirstResponse(stream);
+}
+
+net::awaitable<buf::MultiBuffer> ClientSession::DecodeFirstResponse(AsyncStream& stream) {
     if (!response_header_received_) {
         co_await DecodeResponseHeader(stream);
     }

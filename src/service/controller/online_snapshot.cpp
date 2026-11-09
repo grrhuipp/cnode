@@ -6,6 +6,9 @@
 namespace controller {
 
 OnlineSnapshot BuildOnlineSnapshot(std::vector<OnlineDevice> devices) {
+    std::erase_if(devices, [](const OnlineDevice& d) {
+        return d.user_id <= 0 || d.ip.empty();
+    });
     std::sort(devices.begin(), devices.end());
     devices.erase(std::unique(devices.begin(), devices.end()), devices.end());
 
@@ -13,9 +16,6 @@ OnlineSnapshot BuildOnlineSnapshot(std::vector<OnlineDevice> devices) {
     result.entries.reserve(devices.size());
     std::optional<int64_t> last_user_id;
     for (auto& device : devices) {
-        if (device.user_id <= 0 || device.ip.empty()) {
-            continue;
-        }
         if (!last_user_id || *last_user_id != device.user_id) {
             ++result.user_count;
             last_user_id = device.user_id;

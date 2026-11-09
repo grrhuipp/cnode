@@ -25,7 +25,6 @@
 #include <cstdint>
 #include <format>
 #include <map>
-#include <regex>
 #include <stdexcept>
 #include <vector>
 #include <openssl/x509_vfy.h>
@@ -132,72 +131,6 @@ WriteRequestAndReadResponse(Stream& stream, std::string_view request) {
         co_return result;
     }
     co_return co_await http::ReadResponse(stream);
-}
-
-std::vector<rule::DetectRule>
-ExtractBlockDetectRules(const json::object& config) {
-    std::vector<rule::DetectRule> rules;
-    const auto* routes_value = config.if_contains("routes");
-    if (!routes_value || routes_value->is_null()) {
-        return rules;
-    }
-    if (!routes_value->is_array()) {
-        throw std::invalid_argument("routes must be an array");
-    }
-
-    const auto& routes = routes_value->as_array();
-    rules.reserve(routes.size());
-    for (size_t i = 0; i < routes.size(); ++i) {
-        const auto& route_value = routes[i];
-        if (!route_value.is_object()) {
-            throw std::invalid_argument("route entries must be objects");
-        }
-
-        const auto& route = route_value.as_object();
-        const auto* action = route.if_contains("action");
-        if (action && !action->is_null() && !action->is_string()) {
-            throw std::invalid_argument("route action must be a string");
-        }
-        if (!action || !action->is_string() || action->as_string() != "block") {
-            continue;
-        }
-
-        const auto* match_value = route.if_contains("match");
-        if (!match_value || !match_value->is_array()) {
-            throw std::invalid_argument("block route match must be an array");
-        }
-
-        const auto& matches = match_value->as_array();
-        if (matches.empty()) {
-            throw std::invalid_argument("block route match must not be empty");
-        }
-        for (size_t j = 0; j < matches.size(); ++j) {
-            const auto& match = matches[j];
-            if (!match.is_string()) {
-                throw std::invalid_argument("block route match entries must be strings");
-            }
-            const std::string_view entry = match.as_string();
-            if (entry.empty()) {
-                throw std::invalid_argument("block route match entries must not be empty");
-            }
-            for (const unsigned char ch : entry) {
-                if (ch < 0x20 || ch == 0x7f) {
-                    throw std::invalid_argument(
-                        "block route match entries must not contain control characters");
-                }
-            }
-            try {
-                rules.push_back(rule::DetectRule{
-                    .Pattern = std::regex(std::string(entry)),
-                });
-            } catch (const std::regex_error& entry_error) {
-                throw std::invalid_argument(std::format(
-                    "Invalid block route detect rule {} (match {}): {}",
-                    i, j, entry_error.what()));
-            }
-        }
-    }
-    return rules;
 }
 
 }  // namespace

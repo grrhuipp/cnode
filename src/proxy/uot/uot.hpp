@@ -5,6 +5,7 @@
 #include "common/error.hpp"
 #include "common/target_address.hpp"
 #include "common/address_codec.hpp"
+#include "features/routing/dispatcher.hpp"
 #include "transport/async_stream.hpp"
 #include "transport/link.hpp"
 
@@ -74,6 +75,18 @@ ReadUotRequestHeader(
     transport::MultiBufferReader& reader,
     buf::MultiBuffer pending = {},
     ErrorCode v1_eof_error = ErrorCode::PROTOCOL_DECODE_FAILED);
+
+[[nodiscard]] net::awaitable<RelayResult> DispatchPreparedUotRequest(
+    PreparedRequest prepared,
+    std::unique_ptr<AsyncStream> stream,
+    transport::MultiBufferReader& request_reader,
+    transport::MultiBufferWriter& response_writer,
+    routing::Dispatcher& dispatcher,
+    const routing::DispatchPolicy& dispatch_policy,
+    net::io_context& io_context,
+    session::Context& ctx,
+    StatsShard& stats,
+    const TimeoutsConfig& timeouts);
 class PacketReader final : public transport::MultiBufferReader {
 public:
     transport::CancellationSource& Cancellation() noexcept override { return reader_.Cancellation(); }

@@ -1404,3 +1404,31 @@ CI失败场景修复后通过真实双进程、ML-KEM/X25519加密和回环对�
   - 64 活跃会话统计采样保持 **`68.49 / 68.33 ns`**（`resources=0`，`p50 = 30.0 ns`）与 **`85.91 / 86.03 ns`**（`resources=1`，`p50 = 50.0 ns`），0 次堆分配，内存池 `settled_pool_bytes = 233,472 B`。
   - VLESS/TLS 启动驻留 RSS（`server_started`）由 `13,082,624 / 13,086,720 B` 降至 **`13,021,184 / 13,017,088 B`（减少 60 ~ 68 KiB）**，8 流上传吞吐达 **`597.92 / 674.52 MiB/s`**。
   - Hysteria2 256 连接下载负载峰值 RSS 由 `98,988,032 / 98,164,736 B` 降至 **`97,865,728 / 97,308,672 B`（减少 836 KiB ~ 1.07 MiB）**；16×64（1,024 流）下载守护进程 CPU 由 `4.002 / 3.960s` 降至 **`3.886 / 3.911s`**。
+
+## 2026-11-09（第四轮）：VMess 写状态机收敛、单包 AEAD 统一、入站 UoT 去重与控制面 `users` 零拷贝
+
+### 架构与流程精简内容
+
+1. **单包无状态 AEAD 加解密辅助收敛**：
+   - `src/proxy/aead.hpp`、`src/proxy/shadowsocks/ss_udp.cpp`、`src/proxy/vmess/aead/encrypt.cpp`：在 `src/proxy/aead.hpp` 中提取栈上 RAII 守卫 `ScopedAeadCtx` 与单包无状态辅助函数 `SealOneShotAead`、`SealScatterOneShotAead`、`OpenOneShotAead`，统一 Shadowsocks UDP 与 VMess AEAD 头/长度加解密，消除重复的 `EVP_AEAD_CTX` 初始化、cleanup 与 `OPENSSL_cleanse` 样板代码。
+2. **VMess 客户端与服务端 Body 写出状态机收敛与移除死接口 `BodyEncoder::EncodeEnd`**：
+   - `src/proxy/vmess/encoding/body.hpp/.cpp`、`client.cpp`、`server.cpp`、`tests/vmess_udp_datagram_test.cpp`：在 `BodyEncoder` 上提供统一的 `WriteMultiBuffer`、`WriteBuffers`、`WriteEOF` 异步流写出方法，统一处理可写性检查、协程取消状态检查、固定 UDP 目标校验、首包响应头合并写出以及 `WriteClosed` / 异常流中止状态机；`ClientSession` 与 `ResponseBodyWriter` 简化为单行委托调用并删除 `ResponseBodyWriter::Flush`，消除约 110 行重复代码；移除零生产调用的 `BodyEncoder::EncodeEnd(buf::MultiBuffer&)`。
+3. **入站 UoT（UDP-over-TCP）接入与分发编排收敛**：
+   - `src/proxy/uot/uot.hpp/.cpp`、`src/proxy/anytls/inbound/anytls_inbound.cpp`、`src/proxy/shadowsocks/inbound/ss_inbound.cpp`：提取 `proxy::uot::DispatchPreparedUotRequest` 统一完成 `BindInboundRequestTarget`、`InitialPayload` 提取、`PacketReader`/`PacketWriter` 构造与 `dispatcher.Dispatch` 调用，消除 AnyTLS 与 Shadowsocks 入站 UoT 分发重复样板。
+4. **控制面 `NodeSnapshot::users` 零拷贝共享、在线设备上报快速路径与微型头文件合并**：
+   - `src/service/controller/node_state.hpp`、`controller.cpp`、`online_snapshot.cpp`、`src/api/v2board/online_report.cpp`、`node_info_json.hpp/.cpp`、`v2board.cpp`：将 `NodeSnapshot::users` 改为 `std::shared_ptr<const std::vector<api::UserInfo>>`，消除 304 刷新时对全量用户的深拷贝；`BuildOnlineSnapshot` 先 `std::erase_if` 剔除无效项再排序去重，且 `BuildOnlineReportPayload` 对已排序去重的规范输入直接在 `std::span` 上零分配、零二次排序分段构造 `alive_body`；将 `ExtractBlockDetectRules` 归位至 `node_info_json`。
+   - `include/infra/inbound_field_rules.hpp`：合并并删除单用途微型头文件 `include/infra/proxy_protocol_config.hpp` 与 `src/infra/http2_initial_window.hpp`。
+
+### 验证与性能/内存实证
+
+全量 **1,251/1,251** 测试通过（325 项 unit、926 项 E2E，用时 232.25 秒）。在同一环境与编译选项下执行 A/B/A/B 交错重复基准对照：
+
+- **TCP 接收与发送基准（`cnode_tcp_receive_benchmark` / `cnode_tcp_send_benchmark`）**：
+  - `tcp-send 65536B (1 piece)`：单次 burst 墙钟耗时由 `46,274.8 / 44,953.8 ns` 降至 **`44,411.0 / 43,840.3 ns`（-2.5% ~ -4.0%）**，CPU 耗时由 `42,423.5 / 41,111.8 ns` 降至 **`40,700.8 / 40,165.4 ns`**。
+  - `tcp-send 65536B (8 pieces)`：单次 burst 墙钟耗时由 `47,616.9 / 45,397.3 ns` 降至 **`44,816.9 / 44,164.9 ns`（-2.7% ~ -5.9%）**。
+  - `tcp-send 65536B (16 pieces)`：单次 burst 墙钟耗时由 `48,258.1 / 46,723.0 ns` 降至 **`45,557.4 / 45,581.7 ns`（-2.4% ~ -5.6%）**。
+  - `tcp-receive 8192B`：单次 burst 墙钟耗时保持 **`14,321.1 ns`**（CPU 耗时 **`11,994.7 ns`**）。
+- **运行时统计采样与真实进程基准（`cnode_runtime_sampling_benchmark` / `cnode_tls_throughput_benchmark` / `cnode_hysteria_throughput_benchmark`）**：
+  - 64 活跃会话统计采样保持 **`68.41 / 68.29 ns`**（`resources=0`，`p50 = 30.0 ns`，`max = 40.0 ns`）与 **`86.38 / 86.02 ns`**（`resources=1`，`p50 = 50.0 ns`），0 次堆分配，峰值 RSS 由 `14,819,328 / 14,852,096 B` 降至 **`14,794,752 / 14,835,712 B`**。
+  - VLESS/TLS 8 流上传吞吐（`Upload8`）由 `582.78 / 588.81 MiB/s` 升至 **`738.30 / 747.91 MiB/s`（+26.7% ~ +27.0%）**；8 流下载吞吐（`Download8`）由 `556.95 / 613.16 MiB/s` 升至 **`591.31 / 619.09 MiB/s`**；启动驻留 RSS 保持 `13,017,088 B`。
+  - Hysteria2 256 连接上传守护进程总 CPU 由 `1.397 / 1.398s` 降至 **`1.395 / 1.387s`**，建连耗时由 `0.529 / 0.529s` 降至 **`0.505 / 0.523s`**；16×64（1,024 流）上传守护进程总 CPU 由 `4.058 / 4.004s` 降至 **`4.055 / 3.960s`**，下载吞吐保持 **`35.48 MiB/s`**。

@@ -1,7 +1,7 @@
 #include <stdexcept>
 #include <gtest/gtest.h>
 
-#include "http2_initial_window.hpp"
+#include "infra/inbound_field_rules.hpp"
 #include "http2_settings.hpp"
 
 #include <cstdlib>

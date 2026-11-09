@@ -38,7 +38,7 @@ std::shared_ptr<const NodeSnapshot> Snapshot(uint16_t port, size_t version = 1) 
     snapshot->config.Port = port;
     snapshot->config.Path = std::to_string(version);
     snapshot->tag = Tag(snapshot->config);
-    snapshot->users.resize(version);
+    snapshot->users = std::make_shared<const std::vector<::api::UserInfo>>(version);
     snapshot->users_etag = "users-" + std::to_string(version);
     snapshot->config_etag = "config-" + std::to_string(version);
     snapshot->rules = std::make_shared<const std::vector<::rule::DetectRule>>(version);
@@ -200,12 +200,12 @@ void Seed(Runtime& runtime, NodeState& state, std::shared_ptr<const NodeSnapshot
     state.committed = snapshot;
     state.phase = NodeRuntimePhase::Ready;
     runtime.resources[snapshot->tag] = {
-        true, true, snapshot->users.size(), snapshot->rules ? snapshot->rules->size() : 0, snapshot->config.Path};
+        true, true, snapshot->users ? snapshot->users->size() : 0, snapshot->rules ? snapshot->rules->size() : 0, snapshot->config.Path};
 }
 
 bool Matches(const Runtime& runtime, const NodeSnapshot& snapshot) {
     const auto& actual = runtime.resources.at(snapshot.tag);
-    return actual.inbound && actual.outbound && actual.users == snapshot.users.size() &&
+    return actual.inbound && actual.outbound && actual.users == (snapshot.users ? snapshot.users->size() : 0) &&
         actual.rules == (snapshot.rules ? snapshot.rules->size() : 0) && actual.version == snapshot.config.Path;
 }
 
@@ -221,7 +221,7 @@ void TestSuccessAndRefresh() {
     auto first = Snapshot(1000);
     Require(!Run(ApplyNodeChange(runtime, state, Change(first, state))), "create failed");
     auto refresh = std::make_shared<NodeSnapshot>(*first);
-    refresh->users.resize(2);
+    refresh->users = std::make_shared<const std::vector<::api::UserInfo>>(2);
     ReplaceUsers(*refresh, 2);
     refresh->users_etag = "users-2";
     refresh->rules = std::make_shared<const std::vector<::rule::DetectRule>>(2);
@@ -229,7 +229,7 @@ void TestSuccessAndRefresh() {
     Require(state.committed == refresh && state.phase == NodeRuntimePhase::Ready &&
         !state.HasPendingCleanup() && Matches(runtime, *refresh), "refresh must publish the complete new snapshot");
     Require(runtime.counts["add-in:" + first->tag] == 1, "refresh must preserve the existing listener");
-    Require(first->users.size() == 1 && first->rules && first->rules->size() == 1, "published old snapshots must remain immutable");
+    Require(first->users && first->users->size() == 1 && first->rules && first->rules->size() == 1, "published old snapshots must remain immutable");
     Require(state.committed->users_etag == "users-2" && first->users_etag == "users-1",
         "user validators must be published with their immutable snapshot");
 }
@@ -280,7 +280,7 @@ void TestRefreshRollbackFailure() {
     NodeState state;
     const auto old = Snapshot(1000);
     auto next = std::make_shared<NodeSnapshot>(*old);
-    next->users.resize(2);
+    next->users = std::make_shared<const std::vector<::api::UserInfo>>(2);
     ReplaceUsers(*next, 2);
     next->rules = std::make_shared<const std::vector<::rule::DetectRule>>(2);
     Seed(runtime, state, old);

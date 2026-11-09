@@ -462,39 +462,23 @@ net::awaitable<ErrorCode> AnyTLSDemuxSession::ProcessUdpSubstream(
     proxy::uot::Version uot_version,
     buf::MultiBuffer pending,
     std::chrono::steady_clock::time_point opened_at) {
-    std::optional<proxy::uot::PacketReader> uot_reader;
-    InitialPayload initial_payload;
-    bool is_connect = false;
-    session::Context& ctx = sub.ctx;
-    {
-        std::optional<proxy::uot::PreparedRequest> prepared;
-        auto read_header = [&]() -> net::awaitable<ErrorCode> {
-            auto uot_header = co_await proxy::uot::ReadUotRequestHeader(
-                uot_version, sub, std::move(pending), ErrorCode::CONNECTION_CLOSED);
-            if (!uot_header) co_return uot_header.error();
-            prepared.emplace(std::move(*uot_header));
-            co_return ErrorCode::OK;
-        };
-        if (const auto error = co_await RunHandshakePhase(sub, opened_at, read_header);
-            error != ErrorCode::OK) {
-            co_return error;
-        }
-        if (sub.IsClosed()) co_return ErrorCode::CONNECTION_CLOSED;
-
-        is_connect = prepared->is_connect;
-        initial_payload = InitialPayload{std::move(prepared->initial_decoded)};
-        proxy::BindInboundRequestTarget(
-            ctx,
-            proxy::InboundRequestTarget{
-                Network::UDP,
-                prepared->destination,
-                std::move(prepared->forwarded)});
-        uot_reader.emplace(sub, std::move(*prepared));
+    std::optional<proxy::uot::PreparedRequest> prepared;
+    auto read_header = [&]() -> net::awaitable<ErrorCode> {
+        auto uot_header = co_await proxy::uot::ReadUotRequestHeader(
+            uot_version, sub, std::move(pending), ErrorCode::CONNECTION_CLOSED);
+        if (!uot_header) co_return uot_header.error();
+        prepared.emplace(std::move(*uot_header));
+        co_return ErrorCode::OK;
+    };
+    if (const auto error = co_await RunHandshakePhase(sub, opened_at, read_header);
+        error != ErrorCode::OK) {
+        co_return error;
     }
-    proxy::uot::PacketWriter uot_writer(sub, is_connect, ctx.outbound.target);
-    (void)co_await dispatcher_.Dispatch(io_context_, policy_, nullptr,
-        transport::Link{&*uot_reader, &uot_writer},
-        std::move(initial_payload), ctx, stats_, timeouts_);
+    if (sub.IsClosed()) co_return ErrorCode::CONNECTION_CLOSED;
+
+    (void)co_await proxy::uot::DispatchPreparedUotRequest(
+        std::move(*prepared), nullptr, sub, sub,
+        dispatcher_, policy_, io_context_, sub.ctx, stats_, timeouts_);
     co_return ErrorCode::OK;
 }
 

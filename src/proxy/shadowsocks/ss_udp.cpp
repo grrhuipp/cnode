@@ -201,21 +201,10 @@ struct Parsed2022Body {
     const auto* algorithm = DatagramAead(cipher_type);
     if (!algorithm || plaintext.size() >
             std::numeric_limits<size_t>::max() - SsAeadCipher::kTagSize) return false;
-    // One datagram, one synchronous stack-owned AEAD context. No connection
-    // cache or EVP_CIPHER_CTX allocation is needed for this bounded operation.
-    // EVP_AEAD_CTX_init accepts uninitialized storage, including on failure.
-    // Avoid clearing it before init; the post-operation cleanse remains required.
-    EVP_AEAD_CTX context;
-    size_t written = 0;
-    const size_t capacity = plaintext.size() + SsAeadCipher::kTagSize;
-    const bool ok = EVP_AEAD_CTX_init(&context, algorithm, key.data(), key.size(),
-                                    SsAeadCipher::kTagSize, nullptr) == 1 &&
-        EVP_AEAD_CTX_seal(&context, output, &written, capacity,
-                         nonce.data(), nonce.size(), plaintext.data(), plaintext.size(),
-                         nullptr, 0) == 1;
-    EVP_AEAD_CTX_cleanup(&context);
-    OPENSSL_cleanse(&context, sizeof(context));
-    return ok && written == capacity;
+    return proxy::SealOneShotAead(
+        algorithm, key, nonce, plaintext, {},
+        {output, plaintext.size() + SsAeadCipher::kTagSize},
+        SsAeadCipher::kTagSize);
 }
 
 [[nodiscard]] bool AeadDecrypt(SsCipherType cipher_type,
@@ -225,17 +214,12 @@ struct Parsed2022Body {
                                uint8_t* output) {
     const auto* algorithm = DatagramAead(cipher_type);
     if (!algorithm || ciphertext.size() < SsAeadCipher::kTagSize) return false;
-    EVP_AEAD_CTX context;
-    size_t written = 0;
     const size_t capacity = ciphertext.size() - SsAeadCipher::kTagSize;
-    const bool ok = EVP_AEAD_CTX_init(&context, algorithm, key.data(), key.size(),
-                                    SsAeadCipher::kTagSize, nullptr) == 1 &&
-        EVP_AEAD_CTX_open(&context, output, &written, capacity,
-                         nonce.data(), nonce.size(), ciphertext.data(), ciphertext.size(),
-                         nullptr, 0) == 1;
-    EVP_AEAD_CTX_cleanup(&context);
-    OPENSSL_cleanse(&context, sizeof(context));
-    return ok && written == capacity;
+    size_t written = 0;
+    return proxy::OpenOneShotAead(
+               algorithm, key, nonce, ciphertext, {},
+               {output, capacity}, written, SsAeadCipher::kTagSize) &&
+           written == capacity;
 }
 
 [[nodiscard]] uint32_t Load32LE(const uint8_t* data) noexcept {

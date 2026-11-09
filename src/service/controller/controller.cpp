@@ -205,7 +205,7 @@ std::vector<Controller::NodeStatsInfo> Controller::Impl::GetNodeStats() const {
         info.node_id     = panel->config.NodeIDs.Front();
         info.network      = std::string(ResolvedNodeNetwork(state));
         info.port       = state.config.Port;
-        info.total_users  = state.users.size();
+        info.total_users  = state.users ? state.users->size() : 0;
         info.online_users = panel->stats.online_count;
         info.bytes_up     = panel->stats.bytes_up;
         info.bytes_down   = panel->stats.bytes_down;
@@ -403,7 +403,9 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(PanelRuntime& panel) {
     candidate->config_etag = config_result.not_modified
         ? old_state->config_etag : std::move(config_result.etag);
     candidate->tag = tag;
-    candidate->users = next_users ? std::move(*next_users) : old_state->users;
+    candidate->users = next_users
+        ? std::make_shared<const std::vector<api::UserInfo>>(std::move(*next_users))
+        : old_state->users;
     candidate->users_etag = next_users
         ? std::move(users_result.etag) : old_state->users_etag;
     candidate->rules = config_result.not_modified
@@ -414,7 +416,7 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(PanelRuntime& panel) {
         controller::NodeConfigChanged(old_state->config, candidate->config);
     if (rebuild_settings) {
         candidate->inbound = std::make_shared<const PreparedInbound>(PrepareInbound(
-            controller::MapPanelInbound(panel.config, candidate->config, candidate->users)));
+            controller::MapPanelInbound(panel.config, candidate->config, *candidate->users)));
         candidate->outbound =
             std::make_shared<const proxyman::outbound::PreparedOutboundConfig>(
                 BuildPanelAutoOutbound(tag, panel.config));
@@ -424,7 +426,7 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(PanelRuntime& panel) {
         auto inbound = std::make_shared<PreparedInbound>(*old_state->inbound);
         inbound->users = PrepareInboundUsers(
             inbound->build_request,
-            controller::MapPanelUsers(candidate->config, candidate->users));
+            controller::MapPanelUsers(candidate->config, *candidate->users));
         candidate->inbound = std::move(inbound);
         candidate->outbound = old_state->outbound;
     } else {
@@ -504,7 +506,7 @@ void Controller::Impl::logPanelStatus(const PanelRuntime& panel) const {
         protocol,
         committed_state.config.Port,
         ResolvedNodeNetwork(committed_state),
-        committed_state.users.size(),
+        committed_state.users ? committed_state.users->size() : 0,
         committed_state.rules ? committed_state.rules->size() : 0,
         pull_interval.count(),
         push_interval.count());

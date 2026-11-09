@@ -4,12 +4,17 @@
 // mapping (src/api/v2board) and the local configuration (src/infra/config.cpp)
 // accept. Sources only translate their wire keys into these inputs.
 
+#include "core/naming.hpp"
 #include "infra/json.hpp"
+#include "infra/json_field.hpp"
+#include "transport/internet/proxy_protocol_mode.hpp"
 #include "transport/internet/stream_settings.hpp"
 
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <stdexcept>
+#include <utility>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -91,4 +96,50 @@ struct RealityServerInput {
 [[nodiscard]] tl::expected<std::string, std::string> ParseAnyTlsPaddingScheme(
     const json::value& value, std::string_view field);
 
+// ---------------------------------------------------------------------------
+// Proxy Protocol & HTTP/2 initial window
+// ---------------------------------------------------------------------------
+
+// Header presence policy is independent of v1/v2 format detection.
+[[nodiscard]] inline ProxyProtocolMode ParseProxyProtocolMode(
+    const json::object& object, std::string_view key,
+    ProxyProtocolMode fallback = ProxyProtocolMode::Auto) {
+    const auto* value = object.if_contains(key);
+    if (!value) return fallback;
+    if (value->is_string()) {
+        const auto mode = naming::LowerAscii(value->as_string());
+        if (mode == "off") return ProxyProtocolMode::Off;
+        if (mode == "auto") return ProxyProtocolMode::Auto;
+        if (mode == "on") return ProxyProtocolMode::On;
+    }
+    throw std::invalid_argument(
+        "proxyProtocol must be off, auto or on");
+}
+
+inline constexpr uint32_t kHttp2MaxInitialWindow = 0x7fffffffU;
+
+[[nodiscard]] inline tl::expected<std::optional<uint32_t>, std::string>
+ParseHttp2InitialWindow(const json::object& source) {
+    if (source.contains("initial_windows_size") ||
+        source.contains("initial_window_size")) {
+        return tl::unexpected(std::string(
+            "initial_windows_size/initial_window_size is not supported; use initialWindowSize"));
+    }
+    auto parsed = ParseJsonUint64(
+        source,
+        "initialWindowSize",
+        kHttp2MaxInitialWindow);
+    if (!parsed) {
+        return tl::unexpected(std::move(parsed.error()));
+    }
+    if (!*parsed) {
+        return std::optional<uint32_t>{};
+    }
+    return std::optional<uint32_t>{static_cast<uint32_t>(**parsed)};
+}
+
 }  // namespace infra
+
+using infra::kHttp2MaxInitialWindow;
+using infra::ParseHttp2InitialWindow;
+using infra::ParseProxyProtocolMode;

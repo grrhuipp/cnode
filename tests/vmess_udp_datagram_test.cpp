@@ -845,8 +845,8 @@ void TestEmptyUdpWrite(vmess::Security security) {
         encoder.Encode(std::span<const net::const_buffer>{}, encoded);
     });
     Check(encoded.empty(), "VMess request encoder emitted a forbidden empty chunk");
-    encoder.EncodeEnd(encoded);
-    Check(!encoded.empty(), "VMess explicit EOF marker was disabled");
+    std::array<uint8_t, 128> eof_chunk{};
+    Check(encoder.EncodeEndTo(eof_chunk) != 0, "VMess explicit EOF marker was disabled");
 }
 
 // Publish a real TCP prefix before a deterministic transport failure. Later
@@ -1216,7 +1216,8 @@ TEST(VmessUdpDatagram, BodyEncoderRejectsAliasBeforeAdvancing) {
     Check(std::equal(actual.Bytes().begin(), actual.Bytes().end(),
                      expected.begin(), expected.end()),
           "VMess alias rejection advanced nonce or mask");
-    encoder.EncodeEnd(encoded);
+    std::array<uint8_t, 128> eof_chunk{};
+    Check(encoder.EncodeEndTo(eof_chunk) != 0, "VMess EOF marker failed");
     CheckWriteClosed([&]() -> std::exception_ptr {
         try { encoder.Encode(payload, encoded); }
         catch (...) { return std::current_exception(); }

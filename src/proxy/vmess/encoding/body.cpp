@@ -1,5 +1,6 @@
 #include "body.hpp"
 
+#include "../udp_datagram.hpp"
 #include "common/buf/contiguous_buffer_view.hpp"
 #include "common/buffer_util.hpp"
 #include "common/error.hpp"
@@ -176,13 +177,6 @@ void BodyEncoder::Encode(std::span<const net::const_buffer> payload, buf::MultiB
     }
 }
 
-void BodyEncoder::EncodeEnd(buf::MultiBuffer& out) {
-    if (state_ == State::Finished) return;
-    CheckWritable();
-    EncodeChunk({}, out);
-    Finish();
-}
-
 void BodyEncoder::EncodeStream(std::span<const uint8_t> bytes, buf::MultiBuffer& out) {
     while (!bytes.empty()) {
         const size_t chunk_size = std::min(bytes.size(), stream_chunk_size_);
@@ -218,6 +212,127 @@ size_t BodyEncoder::EncodeEndTo(std::span<uint8_t, 128> out) {
         return length_size + chunk_size;
     } catch (...) {
         Abort();
+        throw;
+    }
+}
+
+net::awaitable<void> BodyEncoder::WriteMultiBuffer(
+    AsyncStream& stream,
+    buf::MultiBuffer mb,
+    const char* cancel_what,
+    std::span<const uint8_t> first_header,
+    bool* header_sent,
+    const TargetAddress* udp_target) {
+    CheckWritable();
+    if ((co_await net::this_coro::cancellation_state).cancelled() !=
+        net::cancellation_type::none) {
+        throw IoSystemError(io_error::operation_aborted, cancel_what);
+    }
+    bool frame_generated = false;
+    try {
+        if (udp_target && PacketMode()) {
+            ValidateFixedUdpDatagram(mb, *udp_target);
+        }
+        buf::MultiBuffer chunks;
+        Encode(mb, chunks);
+        frame_generated = chunks.byte_size() != 0;
+        mb.clear();
+        if (frame_generated) {
+            if (header_sent && !*header_sent) {
+                *header_sent = true;
+                ConstBufferSpanBuilder<1 + buf::MultiBuffer::kInlineCapacity> framed;
+                framed.Append(net::buffer(first_header.data(), first_header.size()));
+                framed.AppendMultiBuffer(chunks);
+                co_await stream.WriteBuffers(framed.Span());
+                chunks.clear();
+            } else {
+                co_await stream.WriteMultiBuffer(std::move(chunks));
+            }
+        }
+    } catch (const transport::WriteClosed&) {
+        Finish();
+        throw;
+    } catch (...) {
+        if (frame_generated || Failed()) {
+            Abort();
+            stream.CloseAbortive();
+        }
+        throw;
+    }
+}
+
+net::awaitable<void> BodyEncoder::WriteBuffers(
+    AsyncStream& stream,
+    std::span<const net::const_buffer> buffers,
+    const char* cancel_what,
+    std::span<const uint8_t> first_header,
+    bool* header_sent) {
+    CheckWritable();
+    if ((co_await net::this_coro::cancellation_state).cancelled() !=
+        net::cancellation_type::none) {
+        throw IoSystemError(io_error::operation_aborted, cancel_what);
+    }
+    bool frame_generated = false;
+    try {
+        buf::MultiBuffer chunks;
+        Encode(buffers, chunks);
+        frame_generated = chunks.byte_size() != 0;
+        if (frame_generated) {
+            if (header_sent && !*header_sent) {
+                *header_sent = true;
+                ConstBufferSpanBuilder<1 + buf::MultiBuffer::kInlineCapacity> framed;
+                framed.Append(net::buffer(first_header.data(), first_header.size()));
+                framed.AppendMultiBuffer(chunks);
+                co_await stream.WriteBuffers(framed.Span());
+                chunks.clear();
+            } else {
+                co_await stream.WriteMultiBuffer(std::move(chunks));
+            }
+        }
+    } catch (const transport::WriteClosed&) {
+        Finish();
+        throw;
+    } catch (...) {
+        if (frame_generated || Failed()) {
+            Abort();
+            stream.CloseAbortive();
+        }
+        throw;
+    }
+}
+
+net::awaitable<void> BodyEncoder::WriteEOF(
+    AsyncStream& stream,
+    const char* cancel_what,
+    std::span<const uint8_t> first_header,
+    bool* header_sent) {
+    if (Finished()) co_return;
+    CheckWritable();
+    if ((co_await net::this_coro::cancellation_state).cancelled() !=
+        net::cancellation_type::none) {
+        throw IoSystemError(io_error::operation_aborted, cancel_what);
+    }
+    bool frame_generated = false;
+    try {
+        std::array<uint8_t, 128> eof_chunk{};
+        const size_t eof_len = EncodeEndTo(eof_chunk);
+        if (eof_len == 0) co_return;
+        frame_generated = true;
+        ConstBufferSpanBuilder<2> buffers;
+        if (header_sent && !*header_sent) {
+            *header_sent = true;
+            buffers.Append(net::buffer(first_header.data(), first_header.size()));
+        }
+        buffers.Append(net::buffer(eof_chunk.data(), eof_len));
+        co_await stream.WriteBuffers(buffers.Span());
+    } catch (const transport::WriteClosed&) {
+        Finish();
+        throw;
+    } catch (...) {
+        if (frame_generated || Failed()) {
+            Abort();
+            stream.CloseAbortive();
+        }
         throw;
     }
 }
@@ -273,6 +388,16 @@ BodyDecoder::BodyDecoder(const BodyOptions& options,
                          const BodyKey& direction_key)
     : cipher_(options, request_body, direction_key, proxy::AeadDirection::Decrypt) {}
 
+bool BodyDecoder::TryConsumePending(std::span<uint8_t> out, size_t& filled) noexcept {
+    if (filled < out.size() && pending_read_.byte_size() != 0) {
+        filled += pending_read_.ConsumePrefixTo(out.subspan(filled));
+        if (pending_read_.empty()) {
+            pending_read_.ReleaseIfIdle();
+        }
+    }
+    return filled == out.size();
+}
+
 net::awaitable<bool> BodyDecoder::ReadExact(transport::MultiBufferReader& src,
                                             std::span<uint8_t> out,
                                             size_t& filled) {
@@ -282,16 +407,13 @@ net::awaitable<bool> BodyDecoder::ReadExact(transport::MultiBufferReader& src,
     if (state_ == State::Finished) {
         co_return false;
     }
-    while (filled < out.size()) {
+    while (!TryConsumePending(out, filled)) {
+        pending_read_.ReleaseIfIdle();
+        pending_read_ = co_await src.ReadMultiBuffer();
         if (pending_read_.byte_size() == 0) {
-            pending_read_.ReleaseIfIdle();
-            pending_read_ = co_await ReadMultiBufferOrThrowOnCancel(
-                src, "VMess read cancelled");
-            if (pending_read_.byte_size() == 0) {
-                co_return false;
-            }
+            co_await ThrowIfCancelledOnEof("VMess read cancelled");
+            co_return false;
         }
-        filled += pending_read_.ConsumePrefixTo(out.subspan(filled));
     }
     co_return true;
 }
@@ -339,8 +461,9 @@ net::awaitable<buf::MultiBuffer> BodyDecoder::ReadChunk(transport::MultiBufferRe
     const size_t overhead = cipher_.Overhead();
     if (!header_decoded_) {
         const size_t length_size = cipher_.LengthSize();
-        if (!co_await ReadExact(src, std::span<uint8_t>(header_.data(), length_size),
-                                header_read_)) {
+        const auto header_span = std::span<uint8_t>(header_.data(), length_size);
+        if (!TryConsumePending(header_span, header_read_) &&
+            !co_await ReadExact(src, header_span, header_read_)) {
             if (header_read_ != 0) {
                 Fail("VMess body length truncated");
             }
@@ -367,8 +490,9 @@ net::awaitable<buf::MultiBuffer> BodyDecoder::ReadChunk(transport::MultiBufferRe
     if (chunk_len == overhead + padding_len_) {
         // The EOF chunk is at most a tag plus 63 padding bytes; the decoded
         // length no longer needs the inline header storage.
-        if (!co_await ReadExact(src, std::span<uint8_t>(header_.data(), chunk_len),
-                                body_read_)) {
+        const auto eof_span = std::span<uint8_t>(header_.data(), chunk_len);
+        if (!TryConsumePending(eof_span, body_read_) &&
+            !co_await ReadExact(src, eof_span, body_read_)) {
             Fail("VMess body EOF chunk truncated");
         }
         if (overhead > 0 &&
@@ -396,7 +520,9 @@ net::awaitable<buf::MultiBuffer> BodyDecoder::ReadChunk(transport::MultiBufferRe
     }
 
     uint8_t* sealed = read_buffer_.Data();
-    if (!co_await ReadExact(src, std::span<uint8_t>(sealed, chunk_len), body_read_)) {
+    const auto body_span = std::span<uint8_t>(sealed, chunk_len);
+    if (!TryConsumePending(body_span, body_read_) &&
+        !co_await ReadExact(src, body_span, body_read_)) {
         Fail("VMess body chunk truncated");
     }
     const ssize_t opened = cipher_.Payload().Decrypt(sealed, data_len, sealed);

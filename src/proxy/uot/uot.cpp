@@ -1,4 +1,5 @@
 #include "uot.hpp"
+#include "../inbound_admission.hpp"
 #include "common/byte_reader.hpp"
 #include "common/address_codec.hpp"
 
@@ -28,8 +29,9 @@ net::awaitable<PendingStatus> EnsurePending(
     buf::MultiBuffer& pending,
     size_t required) {
     while (pending.byte_size() < required) {
-        auto next = co_await ReadMultiBufferOrThrowOnCancel(reader);
+        auto next = co_await reader.ReadMultiBuffer();
         if (next.byte_size() == 0) {
+            co_await ThrowIfCancelledOnEof();
             co_return PendingStatus::Eof;
         }
         buf::AppendPacketStreamInput(pending, std::move(next));
@@ -152,6 +154,38 @@ net::awaitable<tl::expected<PreparedRequest, ErrorCode>> ReadUotRequestHeader(
     } catch (const IoSystemError& e) {
         co_return tl::unexpected(MapAsioError(e.code()));
     }
+}
+
+net::awaitable<RelayResult> DispatchPreparedUotRequest(
+    PreparedRequest prepared,
+    std::unique_ptr<AsyncStream> stream,
+    transport::MultiBufferReader& request_reader,
+    transport::MultiBufferWriter& response_writer,
+    routing::Dispatcher& dispatcher,
+    const routing::DispatchPolicy& dispatch_policy,
+    net::io_context& io_context,
+    session::Context& ctx,
+    StatsShard& stats,
+    const TimeoutsConfig& timeouts) {
+    const bool is_connect = prepared.is_connect;
+    InitialPayload initial_payload{std::move(prepared.initial_decoded)};
+    proxy::BindInboundRequestTarget(
+        ctx,
+        proxy::InboundRequestTarget{
+            Network::UDP,
+            prepared.destination,
+            std::move(prepared.forwarded)});
+    PacketReader uot_reader(request_reader, std::move(prepared));
+    PacketWriter uot_writer(response_writer, is_connect, ctx.outbound.target);
+    co_return co_await dispatcher.Dispatch(
+        io_context,
+        dispatch_policy,
+        std::move(stream),
+        transport::Link{&uot_reader, &uot_writer},
+        std::move(initial_payload),
+        ctx,
+        stats,
+        timeouts);
 }
 
 PacketReader::PacketReader(transport::MultiBufferReader& reader,

@@ -159,43 +159,29 @@ net::awaitable<RelayResult> DispatchSsUotSession(
     session::Context& ctx,
     StatsShard& stats,
     const TimeoutsConfig& timeouts) {
-    std::optional<proxy::uot::PacketReader> uot_reader;
-    InitialPayload initial_payload;
-    bool is_connect = false;
-    {
-        tl::expected<proxy::uot::PreparedRequest, ErrorCode> prepared =
-            tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
-        try {
-            prepared = co_await proxy::uot::ReadUotRequestHeader(
-                uot_version, request_reader, std::move(pending));
-        } catch (const transport::LinkError& e) {
-            prepared = tl::unexpected(e.code());
-        } catch (const IoSystemError& e) {
-            prepared = tl::unexpected(
-                stream ? proxy::ClassifyHandshakeReadException(*stream, e)
-                       : MapAsioError(e.code()));
-        }
-        if (!prepared) {
-            co_return proxy::RejectInbound(stats, stream.get(), prepared.error());
-        }
-        is_connect = prepared->is_connect;
-        initial_payload = InitialPayload{std::move(prepared->initial_decoded)};
-        proxy::BindInboundRequestTarget(
-            ctx,
-            proxy::InboundRequestTarget{
-                Network::UDP,
-                prepared->destination,
-                std::move(prepared->forwarded)});
-        uot_reader.emplace(request_reader, std::move(*prepared));
+    tl::expected<proxy::uot::PreparedRequest, ErrorCode> prepared =
+        tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+    try {
+        prepared = co_await proxy::uot::ReadUotRequestHeader(
+            uot_version, request_reader, std::move(pending));
+    } catch (const transport::LinkError& e) {
+        prepared = tl::unexpected(e.code());
+    } catch (const IoSystemError& e) {
+        prepared = tl::unexpected(
+            stream ? proxy::ClassifyHandshakeReadException(*stream, e)
+                   : MapAsioError(e.code()));
     }
-    proxy::uot::PacketWriter uot_writer(response_writer, is_connect, ctx.outbound.target);
-
-    co_return co_await dispatcher.Dispatch(
-        io_context,
-        dispatch_policy,
+    if (!prepared) {
+        co_return proxy::RejectInbound(stats, stream.get(), prepared.error());
+    }
+    co_return co_await proxy::uot::DispatchPreparedUotRequest(
+        std::move(*prepared),
         std::move(stream),
-        transport::Link{&*uot_reader, &uot_writer},
-        std::move(initial_payload),
+        request_reader,
+        response_writer,
+        dispatcher,
+        dispatch_policy,
+        io_context,
         ctx,
         stats,
         timeouts);
