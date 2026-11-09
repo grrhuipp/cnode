@@ -7,7 +7,6 @@
 // 不包含加密实现、用户管理或解析逻辑。
 // ============================================================================
 
-#include "common.hpp"
 #include "common/allocator.hpp"
 #include "common/buf/multi_buffer.hpp"
 #include "common/target_address.hpp"
@@ -15,6 +14,8 @@
 #include "types.hpp"
 #include "common/unsafe.hpp"
 #include <array>
+#include <cstddef>
+#include <optional>
 #include <cstdint>
 #include <memory>
 

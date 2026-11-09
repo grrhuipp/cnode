@@ -67,8 +67,8 @@ BuildOutboundTransportTarget(OutboundTargetOptions options);
 // The Handler owns it next to its sender settings and passes it by reference
 // into proxy::Outbound::Process. Every outbound connection of that tag leaves
 // through here: the stream settings, transport security and sendThrough are the
-// Handler's, never a protocol's private copy. Bound to the executing domain's
-// reactor and DNS client; the sender settings must outlive the dialer.
+// Handler's, never a protocol's private copy. Bound to the Worker's reactor
+// and DNS client; the sender settings must outlive the dialer.
 // ============================================================================
 class OutboundDialer final {
 public:
@@ -97,8 +97,7 @@ public:
     OutboundDialer(const OutboundDialer&) = delete;
     OutboundDialer& operator=(const OutboundDialer&) = delete;
 
-    // Resolve at use time: io_context_ is only the non-domain fallback.
-    [[nodiscard]] net::io_context& IoContext() const noexcept;
+    [[nodiscard]] net::io_context& IoContext() const noexcept { return io_context_; }
     [[nodiscard]] app::dns::DNS& Dns() const noexcept { return dns_; }
 
     [[nodiscard]] bool Passthrough() const noexcept { return sender_.passthrough; }
@@ -161,7 +160,7 @@ private:
     net::io_context& io_context_;
     app::dns::DNS& dns_;
     const OutboundSenderSettings& sender_;
-    TransportSecurity security_;  // This domain's contexts for sender_.stream_settings.
+    TransportSecurity security_;  // Contexts for sender_.stream_settings.
     std::chrono::seconds timeout_;
 };
 

@@ -33,22 +33,6 @@
 
 namespace worker_detail {
 
-void UdpReplyFence::Lease::Reset() noexcept {
-    if (!fence_) return;
-    if (--fence_->pending_ == 0) {
-        try { (void)fence_->drained_.try_send(IoErrorCode{}); }
-        catch (...) { FailRuntime("udp-reply", "failed to signal association reply drain"); }
-    }
-    fence_.reset();
-}
-
-net::awaitable<void> UdpReplyFence::AsyncDrain() {
-    while (pending_ != 0) {
-        auto [ec] = co_await drained_.async_receive(net::as_tuple(net::use_awaitable));
-        if (ec) throw IoSystemError(ec);
-    }
-}
-
 void UdpIngress::PendingUdpReply::PrepareSendBuffers() {
     send_buffers.Clear();
     send_buffers.AppendMultiBuffer(payload);
@@ -137,10 +121,9 @@ template <class Function>
 }  // namespace
 
 bool UdpIngress::ReplyRoute::Send(UDPPacketView packet, const udp::endpoint& endpoint) {
-    memory::ScopedWorkerAllocation reply_allocation;
     auto payload = response->Encode(packet);
     if (payload.empty()) return false;
-    return sink->EnqueueUdpReply(socket_key, socket.get(), endpoint, std::move(payload), worker_id, fence);
+    return sink->EnqueueUdpReply(socket_key, socket.get(), endpoint, std::move(payload), worker_id);
 }
 
 struct UdpIngress::ClientSession::Impl : memory::ThreadAllocated {
@@ -156,9 +139,10 @@ struct UdpIngress::ClientSession::Impl : memory::ThreadAllocated {
         uint32_t worker_id = 0;
         // Owned copy of the authenticating credential's profile.
         UserProfile profile;
-        // Owned only by standalone dispatcher fixtures; production uses capabilities.
-        std::shared_ptr<UserOnlineTracker> tracker;
+        std::shared_ptr<UserOnlineTracker> tracker_owner;
+        UserOnlineTracker* tracker = nullptr;
         ConnectionLimiter* limiter = nullptr;
+        uint32_t* active_sessions = nullptr;
     };
 
     Impl(net::io_context& io_context,
@@ -204,9 +188,6 @@ struct UdpIngress::ClientSession::Impl : memory::ThreadAllocated {
     bool job_linked = false;
     // The row hook naming this session as its live link; cleared on unlink.
     UdpAssociationHook* association_hook = nullptr;
-    std::shared_ptr<app::PhysicalSessionCapabilities> capabilities;
-    std::shared_ptr<app::PhysicalSessionRegistry> registry;
-    std::shared_ptr<app::PhysicalSessionRecord> registration;
     std::shared_ptr<UdpHandoffRecord> handoff_record;
     UdpIngress* owner = nullptr;
 };
@@ -452,7 +433,6 @@ struct UdpIngress::Impl : memory::ThreadAllocated {
 };
 
 void UdpIngress::ClientSession::CloseWithError(ErrorCode error) noexcept {
-    memory::ScopedWorkerAllocation worker_allocation;
     if (impl_->closed) {
         return;
     }
@@ -524,9 +504,6 @@ bool UdpIngress::ReplaceHandler(
     std::unique_ptr<::Inbound> proxy) noexcept {
     if (!proxy) {
         return false;
-    }
-    if (impl_->proxy) {
-        proxy->AdoptWorkerStateFrom(*impl_->proxy);
     }
     impl_->proxy = std::move(proxy);
     return true;
@@ -645,55 +622,13 @@ void UdpIngress::RegisterNativeJob(const ClientSessionPtr& session) {
 // packets arriving meanwhile wait in the bounded association queue, and a
 // rejection closes the association, dropping them. The frame owns the
 // connection reservations and the online-device guard until it ends.
-net::awaitable<void> UdpIngress::RunNativeFlow(ClientSessionPtr client_session) {
-    auto& state = *client_session->impl_;
-    auto& request = *state.request;
-    auto profile = std::move(request.profile);
-    request.profile = {};
-    request.tracker.reset();
-    std::exception_ptr failure;
-    try {
-        co_await state.capabilities->ProcessNativeDatagram(
-            transport::Link{client_session.get(), client_session.get()},
-             std::move(profile), request.context);
-    } catch (...) { failure = std::current_exception(); }
-    client_session->Close();
-    // The borrowed structured task group is still alive in this child.
-    state.capabilities->RequestStop();
-    if (failure) std::rethrow_exception(failure);
-}
-
 net::awaitable<void> UdpIngress::RunNativeDispatch(ClientSessionPtr client_session) {
     auto& job = *client_session->impl_;
     auto& request = *job.request;
-    if (job.capabilities) {
-        if (job.registry) {
-            memory::ScopedWorkerAllocation registration_allocation;
-            job.registration = job.registry->Register(job.capabilities);
-            job.registration->conn_id = request.context.conn_id;
-        }
-        std::exception_ptr failure;
-        try {
-            co_await RunAwaitableTaskGroup(request.io_context->get_executor(),
-                [client_session](AwaitableTaskGroup& tasks) {
-                    auto& state = *client_session->impl_;
-                    state.capabilities->Initialize(*state.request->io_context, tasks);
-                    if (state.registration)
-                        state.registration->initialized.store(true, std::memory_order_release);
-                    tasks.Spawn(RunNativeFlow(client_session));
-                });
-        } catch (...) { failure = std::current_exception(); }
-        client_session->Close();
-        try { co_await job.capabilities->AsyncJoin(); }
-        catch (...) { if (!failure) failure = std::current_exception(); }
-        if (job.registration) {
-            try { co_await job.registry->Retire(std::move(job.registration)); }
-            catch (...) { if (!failure) failure = std::current_exception(); }
-        }
-        job.capabilities.reset();
-        if (failure) std::rethrow_exception(failure);
-        co_return;
-    }
+    if (request.active_sessions) ++*request.active_sessions;
+    auto active_guard = MakeScopeExit([active = request.active_sessions]() noexcept {
+        if (active) --*active;
+    });
     request.stats->OnConnectionAccepted();
     auto connection_stats = MakeScopeExit([stats = request.stats]() noexcept {
         stats->OnConnectionClosed();
@@ -701,10 +636,11 @@ net::awaitable<void> UdpIngress::RunNativeDispatch(ClientSessionPtr client_sessi
     std::optional<NativeAssociationAdmission> admission;
     try {
         admission = co_await AdmitNativeAssociation(
-            request.context, request.profile, request.tracker.get(), request.limiter,
+            request.context, request.profile, request.tracker, request.limiter,
             *request.stats);
         request.profile = {};
-        request.tracker.reset();
+        request.tracker = nullptr;
+        request.tracker_owner.reset();
         if (!admission || client_session->Closed()) {
             client_session->Close();
             co_return;
@@ -817,7 +753,7 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
             identity, datagram.environment->prepared->settings, *decoded->association_policy);
         if (!record) return;
         auto release_claim = MakeScopeExit([record]() noexcept {
-            record->association->claimed.store(false, std::memory_order_release);
+            record->association->claimed = false;
         });
         if (auto session = record->session.lock()) {
             if (session->Closed() ||
@@ -847,8 +783,7 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
 }
 
 void UdpIngress::ProcessDecoded(const UdpDatagramContext& datagram,
-    InboundDatagramResult result, std::shared_ptr<UdpHandoffRecord> record,
-    std::shared_ptr<InboundDatagramResponse> prepared_response) {
+    InboundDatagramResult result, std::shared_ptr<UdpHandoffRecord> record) {
     auto* decoded = &result;
     const auto socket_key = datagram.socket_key;
     const auto now = std::chrono::steady_clock::now();
@@ -903,9 +838,7 @@ void UdpIngress::ProcessDecoded(const UdpDatagramContext& datagram,
                 client_key_log());
             return;
         }
-        auto response = prepared_response
-            ? tl::expected<std::shared_ptr<InboundDatagramResponse>, ErrorCode>(std::move(prepared_response))
-            : impl_->proxy->CreateDatagramResponse(*decoded);
+        auto response = impl_->proxy->CreateDatagramResponse(*decoded);
         if (!response || !*response) {
             LOG_NET_DEBUG("UDP response preparation failed worker={} client={}",
                           datagram.worker_id, client_key_log());
@@ -928,9 +861,7 @@ void UdpIngress::ProcessDecoded(const UdpDatagramContext& datagram,
             .socket = stable_socket,
             .response = std::move(*response),
             .sink = &datagram.reply_sink,
-            .worker_id = worker_id,
-            .fence = std::make_shared<UdpReplyFence>(datagram.io_context)};
-
+            .worker_id = worker_id};
         auto client_session = CreateClientSession(
             socket_key, client_session_key, datagram.io_context,
             std::move(reply), datagram.client_endpoint,
@@ -946,23 +877,15 @@ void UdpIngress::ProcessDecoded(const UdpDatagramContext& datagram,
         auto& session_impl = *client_session->impl_;
         session_impl.owner = this;
         session_impl.handoff_record = record;
-        if (datagram.environment) {
-            const auto& env = *datagram.environment;
-            session_impl.registry = env.registry;
-            session_impl.capabilities = app::PhysicalSessionCapabilities::Create(
-                env.configuration, env.limiter, env.request_load, *env.dns_worker,
-                env.prepared, env.receiver);
-            if (record) {
-                record->session = client_session;
-                record->owner = worker_id;
-                auto socket = impl_->udp_sockets.find(socket_key);
-                if (socket == impl_->udp_sockets.end() ||
-                    socket->second.socket.get() != datagram.sock) return;
-                socket->second.associations.insert_or_assign(
-                    InboundDatagramAssociationKey{decoded->session_owner, *decoded->session_id,
-                        client_session_key.configuration},
-                    record->association.get());
-            }
+        if (datagram.environment && record) {
+            record->session = client_session;
+            auto socket = impl_->udp_sockets.find(socket_key);
+            if (socket == impl_->udp_sockets.end() ||
+                socket->second.socket.get() != datagram.sock) return;
+            socket->second.associations.insert_or_assign(
+                InboundDatagramAssociationKey{decoded->session_owner, *decoded->session_id,
+                    client_session_key.configuration},
+                record->association.get());
         }
         session_impl.request.emplace(datagram.receiver->dispatch_policy);
         auto& request = *session_impl.request;
@@ -985,17 +908,28 @@ void UdpIngress::ProcessDecoded(const UdpDatagramContext& datagram,
         ctx.inbound.source_port = datagram.client_endpoint.port();
         ctx.inbound.local_endpoint = local_endpoint;
         request.profile = *decoded->user;
-        request.tracker = datagram.environment ? nullptr : decoded->tracker;
-        request.limiter = datagram.environment ? nullptr : decoded->limiter;
+        if (datagram.environment) {
+            const auto& env = *datagram.environment;
+            request.dispatcher = env.dispatcher;
+            request.stats = env.stats;
+            request.limiter = env.limiter;
+            request.tracker_owner = std::move(decoded->tracker);
+            request.tracker = env.tracker ? env.tracker : request.tracker_owner.get();
+            request.active_sessions = env.active_sessions;
+        } else {
+            request.dispatcher = datagram.dispatcher;
+            request.stats = &datagram.stats;
+            request.limiter = decoded->limiter;
+            request.tracker_owner = std::move(decoded->tracker);
+            request.tracker = request.tracker_owner.get();
+        }
         ::proxy::BindAuthenticatedInbound(
             ctx, request.profile,
             ::proxy::InboundRequestTarget{
                 Network::UDP,
                 decoded->target,
                 std::move(decoded->forwarded)});
-        request.dispatcher = datagram.dispatcher;
         request.io_context = &datagram.io_context;
-        request.stats = datagram.environment ? nullptr : &datagram.stats;
         request.timeouts = datagram.timeouts;
         request.worker_id = worker_id;
         if (!packet_session->Push(decoded->target, std::move(decoded->payload))) {
@@ -1052,8 +986,7 @@ void UdpIngress::ProcessDecoded(const UdpDatagramContext& datagram,
 UdpIngress::ReplyEnqueueResult UdpIngress::EnqueueReply(
     std::string_view socket_key,
     udp::endpoint endpoint,
-    buf::MultiBuffer payload,
-    std::shared_ptr<UdpReplyFence> fence) {
+    buf::MultiBuffer payload) {
     const size_t payload_size = payload.byte_size();
     if (payload_size == 0 || payload_size > kMaxQueuedUdpBytes) {
         return ReplyEnqueueResult::Rejected;
@@ -1076,7 +1009,6 @@ UdpIngress::ReplyEnqueueResult UdpIngress::EnqueueReply(
     reply.endpoint = std::move(endpoint);
     reply.payload_size = payload_size;
     reply.reservation = std::move(reservation);
-    reply.fence = UdpReplyFence::Lease(std::move(fence));
     reply.payload = std::move(payload);
     queue.pending.push_back(std::move(reply));
     queue.queued_bytes += payload_size;

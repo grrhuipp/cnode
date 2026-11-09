@@ -1,6 +1,5 @@
 #pragma once
 
-#include "common.hpp"
 #include "common/allocator.hpp"
 #include "common/address_codec.hpp"
 #include "common/target_address.hpp"
@@ -8,6 +7,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string_view>
 

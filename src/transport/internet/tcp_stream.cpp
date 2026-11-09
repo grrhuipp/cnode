@@ -129,8 +129,6 @@ struct TcpStream::Impl : memory::ThreadAllocated {
             ~Subscription() { if (slot.is_connected()) slot.clear(); }
         } subscription{cancellation};
         const auto cancelled_at = cancellation_epoch_;
-        if (state.cancelled || cancelled_at != cancellation_epoch_)
-            co_return IoErrorCode(io_error::operation_aborted);
         if (cancellation.is_connected()) {
             cancellation.assign([&state](net::cancellation_type kind) {
                 if (kind == net::cancellation_type::none) return;

@@ -7,12 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
-#include <limits>
-#include <memory>
-
 namespace transport::internet::hysteria {
-class Connection;
-
 inline constexpr size_t kServerConnectionIdLength = 18;
 inline constexpr uint8_t kServerCidMagic0 = 0xa5;
 inline constexpr uint8_t kServerCidMagic1 = 0x5a;
@@ -91,12 +86,6 @@ struct ConnectionIdHash {
         }
         return hash ^ id.size;
     }
-};
-
-struct QuicOwnership {
-    std::weak_ptr<Connection> connection;
-    bool retired = false;
-    ngtcp2_tstamp expiry = std::numeric_limits<ngtcp2_tstamp>::max();
 };
 
 } // namespace transport::internet::hysteria

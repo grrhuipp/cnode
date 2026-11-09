@@ -29,6 +29,10 @@ enum class Version : uint8_t {
     V2 = 2,
 };
 
+[[nodiscard]] constexpr std::string_view MagicAddress(Version version) noexcept {
+    return version == Version::V1 ? kV1MagicAddress : kMagicAddress;
+}
+
 struct Request {
     bool is_connect = false;
     TargetAddress destination;

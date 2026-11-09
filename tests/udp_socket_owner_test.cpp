@@ -18,7 +18,6 @@
 
 #include <algorithm>
 #include <array>
-#include <barrier>
 #include <chrono>
 #include <cstring>
 #include <cstdlib>
@@ -26,7 +25,6 @@
 #include <memory>
 #include <memory_resource>
 #include <string_view>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -44,22 +42,8 @@ struct DatagramScript {
 
 class DummyDatagramHandler final : public ::Inbound {
 public:
-    explicit DummyDatagramHandler(
-        std::shared_ptr<int> adopted_state = {}, DatagramScript* script = nullptr)
-        : adopted_state_(std::move(adopted_state)), script_(script) {}
-
-    void AdoptWorkerStateFrom(
-        ::Inbound& previous) noexcept override {
-        const auto* old = dynamic_cast<const DummyDatagramHandler*>(&previous);
-        if (!old) {
-            return;
-        }
-        worker_state_ = old->worker_state_;
-        if (adopted_state_) {
-            *adopted_state_ = worker_state_;
-        }
-    }
-
+    explicit DummyDatagramHandler(DatagramScript* script = nullptr)
+        : script_(script) {}
     ::net::awaitable<::RelayResult> Process(
         std::unique_ptr<::AsyncStream>,
         ::routing::Dispatcher&,
@@ -94,9 +78,7 @@ public:
     }
 
 private:
-    std::shared_ptr<int> adopted_state_;
     DatagramScript* script_ = nullptr;
-    int worker_state_ = 73;
     std::shared_ptr<::UserOnlineTracker> tracker_ = std::make_shared<::UserOnlineTracker>();
     ::UserProfile profile_;
 };
@@ -161,8 +143,7 @@ public:
 
 struct RecordingReplySink final : ::worker_detail::UdpReplySink {
     bool EnqueueUdpReply(std::string_view, ::udp::socket*, ::udp::endpoint peer,
-                         ::buf::MultiBuffer payload, uint32_t,
-                         std::shared_ptr<::worker_detail::UdpReplyFence> = {}) override {
+                         ::buf::MultiBuffer payload, uint32_t) override {
         ++calls;
         endpoint = peer;
         bytes.clear();
@@ -225,51 +206,44 @@ void VerifyMigratedBudgetReservations() {
             source.AcquireAssociation() || source.ReservePayload(payload))
             Fail("migration source budget did not enforce its exact limits");
     }
-    std::barrier start(2);
-    std::thread receiver(
-        [&, associations = std::move(associations),
-         reservations = std::move(reservations)]() mutable {
-            auto target_association = target.AcquireAssociation();
-            auto target_payload = target.ReservePayload(payload);
-            if (!target_association || !target_payload)
-                Fail("failed to reserve receiving Worker resources");
-            start.arrive_and_wait();
-            // Only leases cross threads; the payload remains owned by this test.
-            // Concurrent source admission must not race these migrated releases.
-            for (size_t i = 0; i < kMigrating; ++i) {
-                associations[i] = {};
-                reservations[i] = {};
-            }
-            const auto usage = target.GetUsage();
-            if (usage.associations != 1 || usage.datagrams != 1 ||
-                usage.payload_capacity != ::buf::Buffer::kSize)
-                Fail("migrated release was charged to the receiving Worker");
-        });
-    start.arrive_and_wait();
-    for (size_t i = 0; i < 4096; ++i) {
-        auto association = source.AcquireAssociation();
-        auto reservation = source.ReservePayload(payload);
-        if (!association || !reservation)
-            Fail("migrated release lost source Worker admission capacity");
-        const auto usage = source.GetUsage();
-        if (usage.associations > kMigrating + 1 ||
-            usage.datagrams > kMigrating + 1 ||
-            usage.payload_capacity > (kMigrating + 1) * ::buf::Buffer::kSize)
-            Fail("concurrent migrated release underflowed the source budget");
+    {
+        auto moved_associations = std::move(associations);
+        auto moved_reservations = std::move(reservations);
+        auto target_association = target.AcquireAssociation();
+        auto target_payload = target.ReservePayload(payload);
+        if (!target_association || !target_payload)
+            Fail("failed to reserve target Worker resources");
+        for (size_t i = 0; i < kMigrating; ++i) {
+            moved_associations[i] = {};
+            moved_reservations[i] = {};
+        }
+        const auto usage = target.GetUsage();
+        if (usage.associations != 1 || usage.datagrams != 1 ||
+            usage.payload_capacity != ::buf::Buffer::kSize)
+            Fail("moved release was charged to the wrong budget");
     }
-    receiver.join();
     for (size_t i = 0; i < kMigrating; ++i) {
         if (associations[i] || reservations[i])
-            Fail("moved migration reservation retained source ownership");
+            Fail("moved reservation retained source ownership");
+    }
+    {
+        std::array<Budget::AssociationLease, kMigrating + 1> restored_associations;
+        std::array<Budget::PayloadReservation, kMigrating + 1> restored_reservations;
+        for (size_t i = 0; i < kMigrating + 1; ++i) {
+            restored_associations[i] = source.AcquireAssociation();
+            restored_reservations[i] = source.ReservePayload(payload);
+            if (!restored_associations[i] || !restored_reservations[i])
+                Fail("moved release lost source budget admission capacity");
+        }
     }
     for (auto* budget : {&source, &target}) {
         const auto usage = budget->GetUsage();
         if (usage.associations || usage.datagrams || usage.payload_capacity)
-            Fail("cross-Worker reservation destruction leaked resource accounting");
+            Fail("reservation destruction leaked resource accounting");
         auto association = budget->AcquireAssociation();
         auto reservation = budget->ReservePayload(payload);
         if (!association || !reservation)
-            Fail("cross-Worker release did not restore admission");
+            Fail("release did not restore admission");
     }
 }
 
@@ -470,7 +444,7 @@ TEST(UdpSocketOwner, Contract) {
 
     ::worker_detail::UdpIngress::ClientSession failing_reply_session(
         io_context,
-        {.socket_key = {}, .socket = {}, .response = failing_response, .sink = &failed_sink, .worker_id = 0, .fence = {}},
+        {.socket_key = {}, .socket = {}, .response = failing_response, .sink = &failed_sink, .worker_id = 0},
         reply_endpoint_a,
         default_owner, udp_budget, udp_budget.AcquireAssociation());
     ::buf::BufferGuard reply_buffer{::buf::Buffer::New()};
@@ -495,7 +469,7 @@ TEST(UdpSocketOwner, Contract) {
     ::worker_detail::UdpIngress::ClientSession raw_reply_session(
         io_context,
         {.socket_key = {}, .socket = {}, .response = std::make_shared<CountingUdpResponseContext>(),
-         .sink = &raw_sink, .worker_id = 0, .fence = {}},
+         .sink = &raw_sink, .worker_id = 0},
         reply_endpoint_a,
         default_owner, udp_budget, udp_budget.AcquireAssociation());
     std::array<::net::const_buffer, 1> raw_reply_buffers{
@@ -529,7 +503,7 @@ TEST(UdpSocketOwner, Contract) {
     ::worker_detail::UdpIngress::ClientSession large_reply_session(
         io_context,
         {.socket_key = {}, .socket = {}, .response = std::make_shared<CountingUdpResponseContext>(),
-         .sink = &large_sink, .worker_id = 0, .fence = {}},
+         .sink = &large_sink, .worker_id = 0},
         reply_endpoint_a,
         default_owner, udp_budget, udp_budget.AcquireAssociation());
     bool large_reply_failed = false;
@@ -682,7 +656,7 @@ TEST(UdpSocketOwner, Contract) {
     DatagramScript uplink_script;
     uplink_script.target = callback_source;
     ::worker_detail::UdpIngress worker(
-        "test-inbound", std::make_unique<DummyDatagramHandler>(nullptr, &uplink_script),
+        "test-inbound", std::make_unique<DummyDatagramHandler>(&uplink_script),
         udp_reclaimer, udp_budget, io_context);
     // Uplink payloads reach a row only through the authenticated datagram path.
     NoDispatch uplink_dispatcher;
@@ -1124,16 +1098,12 @@ TEST(UdpSocketOwner, Contract) {
     auto response_context = std::make_shared<CountingUdpResponseContext>();
     ::worker_detail::UdpIngress::ClientSession snapshot_reply_session(
         io_context,
-        {.socket_key = {}, .socket = {}, .response = response_context, .sink = &snapshot_sink, .worker_id = 0, .fence = {}},
+        {.socket_key = {}, .socket = {}, .response = response_context, .sink = &snapshot_sink, .worker_id = 0},
         reply_endpoint_a,
         default_owner, udp_budget, udp_budget.AcquireAssociation());
-    auto adopted_worker_state = std::make_shared<int>(-1);
     if (!worker.ReplaceHandler(
-            std::make_unique<DummyDatagramHandler>(adopted_worker_state, &uplink_script))) {
+            std::make_unique<DummyDatagramHandler>(&uplink_script))) {
         Fail("valid UDP handler replacement was rejected");
-    }
-    if (*adopted_worker_state != 73) {
-        Fail("UDP handler replacement discarded Worker-local protocol state");
     }
     if (owner_session->Closed()) {
         Fail("UDP handler replacement closed a live client session");

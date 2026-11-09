@@ -7,6 +7,10 @@
 #include <asio/co_spawn.hpp>
 #include <asio/post.hpp>
 #include <asio/write.hpp>
+#include <asio/executor_work_guard.hpp>
+#include <asio/read.hpp>
+#include <asio/use_future.hpp>
+#include <thread>
 #include <array>
 #include <chrono>
 #include <cstdio>
@@ -121,7 +125,7 @@ net::awaitable<void> BoundedReplayWindow(net::io_context& io) {
 
 net::awaitable<void> DomainsJoinBySession(net::io_context& io) {
     auto coordinator = std::make_shared<::GroupCoordinator>(io);
-    coordinator->RegisterWorker(1, io, io.get_executor());
+    coordinator->RegisterWorker(1, io);
     auto scenario = [&]() -> net::awaitable<void> {
         auto first = co_await GetXHttpPacketSession(
             io, "group", "session-a", XHttpSessionAccess::Open);
@@ -245,6 +249,124 @@ void UploadResponseIsDrained() {
     RunUntil(io, [&] { return joined; }, "upload response reader was not joined at teardown");
     if (failure) std::rethrow_exception(failure);
 }
+
+void CrossWorkerUploadHandoffDoesNotEscapeOriginSink() {
+    net::io_context control, worker0, worker1;
+    auto work_c = net::make_work_guard(control);
+    auto work_0 = net::make_work_guard(worker0);
+    auto work_1 = net::make_work_guard(worker1);
+    auto coordinator = std::make_shared<::GroupCoordinator>(control);
+    coordinator->RegisterWorker(0, worker0);
+    coordinator->RegisterWorker(1, worker1);
+
+    std::thread thread_c([&] { control.run(); });
+    std::thread thread_0([&] {
+        ::memory::ConfigureProcessAllocator();
+        worker0.run();
+    });
+    std::thread thread_1([&] {
+        ::memory::ConfigureProcessAllocator();
+        worker1.run();
+    });
+
+    struct OriginBoundSink final
+        : ::memory::ThreadAllocated
+        , ::InboundTransportStreamHandler {
+        explicit OriginBoundSink(std::thread::id owner)
+            : owner_thread(owner), local_tag(128, 'x') {}
+        ~OriginBoundSink() noexcept override {
+            if (std::this_thread::get_id() != owner_thread) std::terminate();
+        }
+        net::awaitable<void> OnInboundTransportStream(
+            std::unique_ptr<::AsyncStream> s, ::InboundTransportMetadata) override {
+            logical = std::move(s);
+            co_return;
+        }
+        std::chrono::seconds TransportHandshakeTimeout() const noexcept override { return 5s; }
+        std::chrono::seconds TransportIdleTimeout() const noexcept override { return 10s; }
+        std::thread::id owner_thread;
+        ::memory::ThreadLocalString local_tag;
+        std::unique_ptr<::AsyncStream> logical;
+    };
+
+    ::HttpConfig http_cfg;
+    http_cfg.path = "/fixture";
+    ::XHttpConfig xhttp_cfg;
+    xhttp_cfg.path = "/fixture";
+    xhttp_cfg.normalized_path = "/fixture/";
+    xhttp_cfg.mode = ::XHttpMode::PacketUp;
+    xhttp_cfg.session_namespace = "cross-worker-handoff";
+
+    ::tcp::acceptor acceptor(control, {net::ip::address_v4::loopback(), 0});
+    const auto endpoint = acceptor.local_endpoint();
+
+    for (int round = 0; round < 16; ++round) {
+        const std::string session_id = "s-" + std::to_string(round);
+        ::tcp::socket client_up(control), server_up(worker1);
+        client_up.connect(endpoint);
+        acceptor.accept(server_up);
+
+        ::tcp::socket client_down(control), server_down(worker0);
+        client_down.connect(endpoint);
+        acceptor.accept(server_down);
+
+        // Start PacketUp on worker1 before PacketDown arrives on worker0 on even rounds.
+        auto up_future = net::co_spawn(worker1,
+            [&, sock = std::move(server_up)]() mutable -> net::awaitable<void> {
+                auto sink = ::memory::AllocateShared<OriginBoundSink>(std::this_thread::get_id());
+                auto res = co_await DoXHttp1ServerHandshake(
+                    worker1, std::make_unique<::TcpStream>(std::move(sock)),
+                    http_cfg, xhttp_cfg, 1, nullptr, {}, sink);
+                Require(res.has_value() && !*res, "packet-up handoff failed");
+            }, net::use_future);
+
+        const std::string post_req =
+            "POST /fixture/" + session_id + "/0 HTTP/1.1\r\n"
+            "Host: localhost\r\n"
+            "Content-Length: 5\r\n"
+            "Connection: close\r\n\r\n"
+            "hello";
+        net::write(client_up, net::buffer(post_req));
+
+        auto down_future = net::co_spawn(worker0,
+            [&, sock = std::move(server_down)]() mutable -> net::awaitable<std::string> {
+                auto sink = ::memory::AllocateShared<OriginBoundSink>(std::this_thread::get_id());
+                auto res = co_await DoXHttp1ServerHandshake(
+                    worker0, std::make_unique<::TcpStream>(std::move(sock)),
+                    http_cfg, xhttp_cfg, 2, nullptr, {}, sink);
+                Require(res.has_value() && !*res && sink->logical != nullptr,
+                        "packet-down did not produce logical stream");
+                std::array<char, 5> buf{};
+                const size_t n = co_await sink->logical->AsyncRead(net::buffer(buf));
+                Require(n == 5, "short read on logical stream");
+                sink->logical->Close();
+                co_return std::string(buf.data(), n);
+            }, net::use_future);
+
+        const std::string get_req =
+            "GET /fixture/" + session_id + " HTTP/1.1\r\n"
+            "Host: localhost\r\n\r\n";
+        net::write(client_down, net::buffer(get_req));
+
+        up_future.get();
+        Require(down_future.get() == "hello", "mismatched payload after cross-worker handoff");
+    }
+
+    auto stop_future = net::co_spawn(control, [&]() -> net::awaitable<void> {
+        coordinator->CloseAdmission();
+        co_await coordinator->AsyncJoin();
+        coordinator->ReleaseServices();
+        co_await coordinator->Finalize();
+    }, net::use_future);
+    stop_future.get();
+    coordinator.reset();
+    work_0.reset();
+    work_1.reset();
+    work_c.reset();
+    thread_0.join();
+    thread_1.join();
+    thread_c.join();
+}
 } // namespace
 
 TEST(XhttpSessionLifecycle, Contract) {
@@ -255,6 +377,7 @@ TEST(XhttpSessionLifecycle, Contract) {
         RunTableScenario(BoundedReplayWindow);
         RunTableScenario(DomainsJoinBySession);
         UploadResponseIsDrained();
+        CrossWorkerUploadHandoffDoesNotEscapeOriginSink();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());
         FAIL() << error.what();

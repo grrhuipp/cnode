@@ -29,13 +29,6 @@
 namespace transport::internet {
 namespace {
 
-// Capture once at the physical session entry, before native I/O can suspend.
-// This executor follows group ownership without relocating the session or its
-// coroutine frames. Plain io_context callers (including tests) remain valid.
-net::any_io_executor CaptureHttp2Executor(net::io_context& io_context) {
-    return io_context.get_executor();
-}
-
 constexpr size_t kHttp2FrameHeaderSize = 9;
 constexpr size_t kHttp2MaxFramePayload = 16 * 1024;
 constexpr size_t kHttp2MaxHeaderBlockSize = 64 * 1024;
@@ -1982,7 +1975,9 @@ public:
     // Cancel() aborts the wait; stream teardown wakes it for a re-check.
     net::awaitable<void> WaitSendCredit();
     void WakeSendWaiter() noexcept {
-        (void)credit_signal_.try_send(IoErrorCode{});
+        if (credit_signal_) {
+            (void)credit_signal_->try_send(IoErrorCode{});
+        }
     }
 
     net::awaitable<size_t> AsyncRead(net::mutable_buffer buffer);
@@ -1994,7 +1989,9 @@ public:
 
     void ReleaseOwner() noexcept {
         owner_released_ = true;
-        (void)owner_signal_.try_send(IoErrorCode{});
+        if (owner_signal_) {
+            (void)owner_signal_->try_send(IoErrorCode{});
+        }
     }
     static net::awaitable<void> JoinOwner(
         std::shared_ptr<Http2ServerSubStreamState> state,
@@ -2021,8 +2018,8 @@ private:
     [[nodiscard]] std::shared_ptr<Http2ServerSession> LockWritableSession() const;
 
     SignalChannel input_signal_;
-    SignalChannel owner_signal_;
-    SignalChannel credit_signal_;
+    std::optional<SignalChannel> owner_signal_;
+    std::optional<SignalChannel> credit_signal_;
     H2SendWindow send_window_;
     int64_t receive_window_ = H2SendWindow::kDefault;
     uint32_t consumed_credit_ = 0;
@@ -2154,21 +2151,6 @@ private:
     bool closed_ = false;
 };
 
-[[nodiscard]] memory::ThreadLocalString ResolveGrpcRequestPath(const GrpcConfig& cfg) {
-    if (!cfg.request_path.empty()) {
-        return memory::ThreadLocalString(cfg.request_path);
-    }
-    if (!cfg.service_name.empty() && cfg.service_name.front() == '/') {
-        return memory::ThreadLocalString(cfg.service_name);
-    }
-    memory::ThreadLocalString path;
-    path.reserve(cfg.service_name.size() + 10);
-    path.push_back('/');
-    path.append(cfg.service_name);
-    path.append(cfg.multi_mode ? "/TunMulti" : "/Tun");
-    return path;
-}
-
 class Http2ServerSession final
     : public memory::ThreadAllocated
     , public std::enable_shared_from_this<Http2ServerSession>
@@ -2190,10 +2172,8 @@ public:
                        const HttpConfig* http_config,
                        const XHttpConfig* xhttp_config,
                        const GrpcConfig* grpc_config,
-                       uint32_t initial_receive_window,
-                       net::any_io_executor executor)
+                       uint32_t initial_receive_window)
         : io_context_(io_context)
-        , executor_(std::move(executor))
         , stream_(std::move(stream))
         , stream_handler_(std::move(stream_handler))
         , payload_codec_(payload_codec)
@@ -2211,7 +2191,7 @@ public:
             }
             response_header_block_ = EncodeHttpResponseHeaders(http_config_->headers);
         } else if (grpc_config_ && grpc_config_->request_path.empty()) {
-            grpc_request_path_ = ResolveGrpcRequestPath(*grpc_config_);
+            grpc_request_path_ = memory::ThreadLocalString(grpc_config_->RequestPath());
         }
         Resubscribe(stream_->Cancellation());
     }
@@ -2226,7 +2206,7 @@ public:
 
     net::awaitable<void> Run() {
         try {
-            co_await RunAwaitableTaskGroup(executor_,
+            co_await RunAwaitableTaskGroup(io_context_.get_executor(),
                 [this](AwaitableTaskGroup& tasks) {
                     tasks_ = &tasks;
                     tasks.Spawn(RunReadLoop());
@@ -2442,10 +2422,6 @@ public:
     }
 
 private:
-    [[nodiscard]] net::io_context& CurrentIoContext() const noexcept {
-        return io_context_;
-    }
-
     net::awaitable<void> FlushReceiveCredit() {
         try {
             while (!cancelled_) {
@@ -2816,7 +2792,7 @@ private:
             }
         }
         auto sub = memory::AllocateShared<Http2ServerSubStreamState>(
-            executor_, shared_from_this(), stream_id, payload_codec_, peer_initial_window_);
+            io_context_.get_executor(), shared_from_this(), stream_id, payload_codec_, peer_initial_window_);
         sub->ReceiveWindow() = local_settings_acked_ ? initial_receive_window_ :
             std::max<int64_t>(initial_receive_window_, H2SendWindow::kDefault);
         streams_.emplace(stream_id, sub);
@@ -2875,7 +2851,7 @@ private:
                 co_return co_await ResetStream(stream_id, H2Error::Protocol);
             }
             auto xsession = co_await GetXHttpPacketSession(
-                CurrentIoContext(), xhttp_config_->session_namespace,
+                io_context_, xhttp_config_->session_namespace,
                 meta.session_id, XHttpSessionAccess::Open);
             if (!xsession || !xsession->AttachDownlink()) {
                 co_return co_await ResetStream(stream_id, H2Error::Protocol);
@@ -2904,7 +2880,7 @@ private:
                 co_return co_await ResetStream(stream_id, H2Error::Protocol);
             }
             auto xsession = co_await GetXHttpPacketSession(
-                CurrentIoContext(), xhttp_config_->session_namespace,
+                io_context_, xhttp_config_->session_namespace,
                 meta.session_id, XHttpSessionAccess::Open);
             if (!xsession) {
                 co_return co_await ResetStream(stream_id, H2Error::Protocol);
@@ -2957,7 +2933,7 @@ private:
                 co_return co_await ResetStream(stream_id, H2Error::Protocol);
             }
             auto xsession = co_await GetXHttpPacketSession(
-                CurrentIoContext(), xhttp_config_->session_namespace,
+                io_context_, xhttp_config_->session_namespace,
                 meta.session_id, XHttpSessionAccess::Upload);
             if (!xsession) {
                 co_return co_await ResetStream(stream_id, H2Error::Protocol);
@@ -3052,7 +3028,6 @@ private:
     }
 
     net::io_context& io_context_;
-    net::any_io_executor executor_;
     std::unique_ptr<AsyncStream> stream_;
     std::shared_ptr<InboundTransportStreamHandler> stream_handler_;
     AsyncWriteGate write_gate_;
@@ -3087,8 +3062,12 @@ net::awaitable<void> Http2ServerSubStreamState::JoinOwner(
     std::shared_ptr<XHttpPacketUpSession> upload_session) {
     bool cancelled = false;
     try {
-        if (!state->owner_released_)
-            co_await state->owner_signal_.async_receive(net::use_awaitable);
+        if (!state->owner_released_) {
+            if (!state->owner_signal_) {
+                state->owner_signal_.emplace(state->input_signal_.get_executor(), 1);
+            }
+            co_await state->owner_signal_->async_receive(net::use_awaitable);
+        }
     } catch (...) {
         cancelled = true;
         if (upload_session) upload_session->Close();
@@ -3096,8 +3075,12 @@ net::awaitable<void> Http2ServerSubStreamState::JoinOwner(
     }
     if (cancelled) {
         co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
-        if (!state->owner_released_)
-            co_await state->owner_signal_.async_receive(net::use_awaitable);
+        if (!state->owner_released_) {
+            if (!state->owner_signal_) {
+                state->owner_signal_.emplace(state->input_signal_.get_executor(), 1);
+            }
+            co_await state->owner_signal_->async_receive(net::use_awaitable);
+        }
     }
 }
 
@@ -3108,8 +3091,6 @@ Http2ServerSubStreamState::Http2ServerSubStreamState(
     H2PayloadCodec payload_codec,
     int64_t initial_send_window)
     : input_signal_(executor, 1)
-    , owner_signal_(executor, 1)
-    , credit_signal_(executor, 1)
     , send_window_(initial_send_window)
     , session_(std::move(session))
     , stream_id_(stream_id)
@@ -3117,7 +3098,10 @@ Http2ServerSubStreamState::Http2ServerSubStreamState(
 
 net::awaitable<void> Http2ServerSubStreamState::WaitSendCredit() {
     const uint64_t epoch = write_abort_epoch_;
-    auto [ec] = co_await credit_signal_.async_receive(net::as_tuple(net::use_awaitable));
+    if (!credit_signal_) {
+        credit_signal_.emplace(input_signal_.get_executor(), 1);
+    }
+    auto [ec] = co_await credit_signal_->async_receive(net::as_tuple(net::use_awaitable));
     if (ec || epoch != write_abort_epoch_) {
         throw IoSystemError(io_error::operation_aborted, "HTTP/2 send window wait aborted");
     }
@@ -3606,16 +3590,16 @@ net::awaitable<TransportBuildResult> StartHttp2ServerSession(
     uint64_t conn_id,
     const HttpConfig* http_config,
     const XHttpConfig* xhttp_config,
-    const GrpcConfig* grpc_config,
-    net::any_io_executor executor) {
+    const GrpcConfig* grpc_config) {
     // SETTINGS is a receiver-selected limit, not a promise to allocate an
     // arbitrarily large configured window.
     initial_window = std::min<uint32_t>(initial_window, kHttp2MaxQueuedStreamBytes);
     auto session = memory::AllocateShared<Http2ServerSession>(
         io_context, std::move(stream), std::move(stream_handler), payload_codec,
-        conn_id, http_config, xhttp_config, grpc_config, initial_window, std::move(executor));
-    auto settings = EncodeInitialWindowSetting(initial_window);
-    settings.resize(12);
+        conn_id, http_config, xhttp_config, grpc_config, initial_window);
+    const auto initial_window_setting = EncodeInitialWindowSetting(initial_window);
+    std::array<uint8_t, 12> settings{};
+    std::copy(initial_window_setting.begin(), initial_window_setting.end(), settings.begin());
     settings[6] = 0;
     settings[7] = 3; // SETTINGS_MAX_CONCURRENT_STREAMS
     StoreU32BE(settings.data() + 8, kHttp2MaxConcurrentStreams);
@@ -3671,7 +3655,6 @@ net::awaitable<TransportBuildResult> DoGrpcServerHandshake(
     net::io_context& io_context,
     std::shared_ptr<InboundTransportStreamHandler> stream_handler,
     uint64_t conn_id) {
-    auto executor = CaptureHttp2Executor(io_context);
     std::array<uint8_t, kHttp2ClientPreface.size()> preface{};
     if (!co_await ReadFullFromStream(*stream, preface.data(), preface.size()) ||
         std::string_view(unsafe::ptr_cast<const char>(preface.data()), preface.size()) !=
@@ -3689,8 +3672,7 @@ net::awaitable<TransportBuildResult> DoGrpcServerHandshake(
         conn_id,
         nullptr,
         nullptr,
-        &cfg,
-        std::move(executor));
+        &cfg);
 }
 
 net::awaitable<TransportBuildResult> RunHttp2ServerSession(
@@ -3709,8 +3691,7 @@ net::awaitable<TransportBuildResult> RunHttp2ServerSession(
         conn_id,
         &cfg,
         xhttp_cfg,
-        nullptr,
-        CaptureHttp2Executor(io_context));
+        nullptr);
 }
 
 net::awaitable<TransportBuildResult> DoGrpcClientHandshake(
@@ -3719,10 +3700,10 @@ net::awaitable<TransportBuildResult> DoGrpcClientHandshake(
     std::string_view authority,
     bool tls,
     uint64_t conn_id) {
-    memory::ThreadLocalString fallback_path;
+    std::string fallback_path;
     std::string_view path = cfg.request_path;
     if (path.empty()) {
-        fallback_path = ResolveGrpcRequestPath(cfg);
+        fallback_path = cfg.RequestPath();
         path = fallback_path;
     }
     const uint32_t initial_window = std::min<uint32_t>(

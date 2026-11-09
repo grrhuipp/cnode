@@ -1,6 +1,6 @@
 #pragma once
 
-#include "app/bootstrap_inbounds.hpp"
+#include "app/prepared_inbound.hpp"
 #include "common/asio_types.hpp"
 
 #include <asio/executor_work_guard.hpp>
@@ -23,6 +23,10 @@ class GeoDatabase;
 struct RuntimeContext;
 struct WorkerRuntimeConfig;
 
+
+struct InboundStartup {
+    std::vector<PreparedInbound> entries;
+};
 
 struct WorkerPool {
     // Cold construction failure unwinds in reverse declaration order:

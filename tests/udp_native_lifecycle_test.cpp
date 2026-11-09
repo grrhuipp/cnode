@@ -165,8 +165,7 @@ class ReplySink final : public ::worker_detail::UdpReplySink {
 public:
     bool EnqueueUdpReply(std::string_view, ::udp::socket*,
                          ::udp::endpoint, ::buf::MultiBuffer,
-                         uint32_t,
-                         std::shared_ptr<::worker_detail::UdpReplyFence> = {}) override {
+                         uint32_t) override {
         return true;
     }
 };
@@ -372,7 +371,6 @@ void VerifyUplinkRefresh(::net::io_context& io, Reclaimer& reclaimer) {
 
 void VerifyProtocolLocalAssociation() {
     using namespace ::proxyman::inbound;
-    auto previous_view = UserStore::CaptureWorkerView();
     UserOnlineTracker tracker;
     StatsShard stats{};
     const ProtocolSettings configuration{};
@@ -426,7 +424,7 @@ void VerifyProtocolLocalAssociation() {
             Fail("failed to commit authenticated first packet");
         index.emplace(InboundDatagramAssociationKey{
             decoded->session_owner, *decoded->session_id, &configuration}, association.get());
-        association->claimed.store(false, std::memory_order_release);
+        association->claimed = false;
         if (handler.Process(request)) Fail("local protocol reopened the cold replay window");
 
         auto newer = encode(2);
@@ -445,12 +443,12 @@ void VerifyProtocolLocalAssociation() {
 
         auto claimed = encode(3);
         request.payload = claimed;
-        association->claimed.store(true, std::memory_order_release);
+        association->claimed = true;
         auto pending = handler.Process(request);
         if (!pending || pending->committed_association ||
             !association->Check(3, 0, first, InboundDatagramCheck::Commit))
             Fail("claimed local state was mutated before exclusive control commit");
-        association->claimed.store(false, std::memory_order_release);
+        association->claimed = false;
         if (handler.Process(request)) Fail("control commit did not reach the local replay authority");
 
         auto scoped = encode(4);
@@ -465,7 +463,7 @@ void VerifyProtocolLocalAssociation() {
         scoped.back() ^= 1;
         if (!handler.Process(request)) Fail("invalid ciphertext poisoned local replay state");
     }
-    UserStore::InstallWorkerView(std::move(previous_view));
+    UserStore::ClearWorkerView();
 }
 
 void VerifyHandoffDirectoryNamespaces() {
@@ -484,15 +482,15 @@ void VerifyHandoffDirectoryNamespaces() {
         .client = ClientSessionKey{owner, 0x00123456789abcdeULL}};
     const ::udp::endpoint endpoint{::net::ip::address_v4::loopback(), 48234};
     auto record = directory.Claim(key, configuration, policy);
-    if (!record || !record->association->claimed.load(std::memory_order_acquire) ||
+    if (!record || !record->association->claimed ||
         directory.Claim(key, configuration, policy) || !record->association->Check(7, 0, endpoint, ::InboundDatagramCheck::Commit))
         Fail("directory allowed duplicate ownership claims");
-    record->association->claimed.store(false, std::memory_order_release);
+    record->association->claimed = false;
     auto reclaimed = directory.Claim(key, configuration, policy);
     if (reclaimed != record || reclaimed->association->Check(7, 0, endpoint, ::InboundDatagramCheck::Commit) ||
         directory.Claim(key, configuration, policy))
         Fail("directory claim lost unique ownership or committed replay");
-    record->association->claimed.store(false, std::memory_order_release);
+    record->association->claimed = false;
 
     const auto expect_isolated = [&](
         const UdpHandoffIdentity& identity,
@@ -501,12 +499,12 @@ void VerifyHandoffDirectoryNamespaces() {
         if (!isolated || isolated == record || !isolated->association->Check(7, 1, endpoint, ::InboundDatagramCheck::Commit) ||
             directory.Claim(identity, snapshot, policy))
             Fail("directory merged distinct authenticated namespaces");
-        isolated->association->claimed.store(false, std::memory_order_release);
+        isolated->association->claimed = false;
         auto repeated = directory.Claim(identity, snapshot, policy);
         if (repeated != isolated || repeated->association->Check(7, 1, endpoint, ::InboundDatagramCheck::Commit) ||
             !repeated->association->Check(6, 1, endpoint, ::InboundDatagramCheck::Commit) || repeated->association->Check(5, 0, endpoint, ::InboundDatagramCheck::Commit))
             Fail("directory failed to retain isolated namespace replay");
-        repeated->association->claimed.store(false, std::memory_order_release);
+        repeated->association->claimed = false;
     };
     for (size_t i = 0; i < credential.size(); ++i) {
         auto distinct = key;
@@ -554,7 +552,7 @@ void VerifyHandoffDirectoryTombstone(::net::io_context& io, Reclaimer& reclaimer
     if (!session || !record || !record->association->Check(31, 0, endpoint, ::InboundDatagramCheck::Commit))
         Fail("failed to prepare live directory association");
     record->session = session;
-    record->association->claimed.store(false, std::memory_order_release);
+    record->association->claimed = false;
     ingress.CleanupClientSessions(key.listener);
     if (!session->Closed() || record->session.expired())
         Fail("closed association did not retain its outstanding session owner");
@@ -571,7 +569,7 @@ void VerifyHandoffDirectoryTombstone(::net::io_context& io, Reclaimer& reclaimer
         resumed->association->Check(30, 1, endpoint, ::InboundDatagramCheck::Commit) || !resumed->association->Check(32, 1, endpoint, ::InboundDatagramCheck::Commit) ||
         resumed->association->Check(30, 0, endpoint, ::InboundDatagramCheck::Commit) || !resumed->association->Check(30, 1, endpoint, ::InboundDatagramCheck::Commit))
         Fail("association closure reopened a protected replay window");
-    resumed->association->claimed.store(false, std::memory_order_release);
+    resumed->association->claimed = false;
     ingress.RequestStop();
 }
 
@@ -593,7 +591,7 @@ void VerifyHandoffDirectoryCapacity() {
         auto record = directory.Claim(key, configuration, policy);
         if (!record || !record->association->Check(11, 0, endpoint, ::InboundDatagramCheck::Commit))
             Fail("directory rejected a session before reaching capacity");
-        record->association->claimed.store(false, std::memory_order_release);
+        record->association->claimed = false;
         if (i == 0) first = std::move(record);
     }
     key.client.session_id = ::ss::Ss2022UdpReplayCache::kMaxSessions;
@@ -610,45 +608,13 @@ void VerifyHandoffDirectoryCapacity() {
         Fail("failed to commit an expired protocol retention deadline");
     if (directory.Claim(key, configuration, policy))
         Fail("directory reclaimed a still-claimed expired tombstone");
-    first->association->claimed.store(false, std::memory_order_release);
+    first->association->claimed = false;
     auto replacement = directory.Claim(key, configuration, policy);
     if (!replacement || replacement == first || !replacement->association->Check(11, 0, endpoint, ::InboundDatagramCheck::Commit))
         Fail("directory did not reclaim an expired unclaimed tombstone");
-    replacement->association->claimed.store(false, std::memory_order_release);
+    replacement->association->claimed = false;
     if (directory.Claim(protected_key, configuration, policy))
         Fail("directory exceeded capacity after reclaiming one expired tombstone");
-}
-
-void VerifyAssociationReplyDrain() {
-    ::net::io_context io;
-    auto fence = std::make_shared<::worker_detail::UdpReplyFence>(io);
-    auto unrelated = std::make_shared<::worker_detail::UdpReplyFence>(io);
-    ::worker_detail::UdpReplyFence::Lease queued(fence);
-    ::worker_detail::UdpReplyFence::Lease active(fence);
-    ::worker_detail::UdpReplyFence::Lease other_active(unrelated);
-    bool drained = false;
-    ::net::co_spawn(io, fence->AsyncDrain(),
-        [&](std::exception_ptr failure) {
-            if (failure) Fail("association reply fence failed");
-            drained = true;
-        });
-    io.poll();
-    io.restart();
-    if (drained) Fail("reply drain ignored queued and active sends");
-    queued = {};
-    io.poll();
-    io.restart();
-    if (drained) Fail("reply drain returned before active sender completion");
-    auto sender_lease = std::move(active);
-    active = {};
-    io.poll();
-    io.restart();
-    if (drained) Fail("moving a reply lease released the active send");
-    sender_lease = {};
-    io.poll();
-    io.restart();
-    if (!drained) Fail("reply drain waited on another association's sender");
-    other_active = {};
 }
 
 } // namespace
@@ -670,7 +636,6 @@ TEST(UdpNativeLifecycle, Contract) {
         std::pmr::memory_resource* previous;
         ~RestoreDefaultResource() { std::pmr::set_default_resource(previous); }
     } resource_scope{std::pmr::set_default_resource(&owner_resource)};
-    VerifyAssociationReplyDrain();
     ::net::io_context io;
     auto& scheduler = ::TimeoutScheduler::ForIoContext(io);
     Reclaimer reclaimer(scheduler, nullptr, [](void*, std::exception_ptr) { std::terminate(); });

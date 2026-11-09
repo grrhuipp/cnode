@@ -10,7 +10,7 @@ namespace proxy::shadowsocks::outbound {
 
 namespace {
 
-tl::expected<SsUotVersion, std::string> ParseVersionValue(
+tl::expected<proxy::uot::Version, std::string> ParseVersionValue(
     const json::value& value,
     std::string_view field) {
     const auto raw = JsonUnsignedInteger(value);
@@ -18,39 +18,39 @@ tl::expected<SsUotVersion, std::string> ParseVersionValue(
         return tl::unexpected(std::format("{} must be 1 or 2", field));
     }
 
-    if (*raw == 1) return SsUotVersion::V1;
-    if (*raw == 2) return SsUotVersion::V2;
+    if (*raw == 1) return proxy::uot::Version::V1;
+    if (*raw == 2) return proxy::uot::Version::V2;
 
     return tl::unexpected(std::format("{} must be 1 or 2", field));
 }
 
-tl::expected<std::optional<SsUotVersion>, std::string> ReadTopLevelVersion(
+tl::expected<std::optional<proxy::uot::Version>, std::string> ReadTopLevelVersion(
     const json::object& source) {
     const auto* value = source.if_contains("uotVersion");
     if (!value) {
-        return std::optional<SsUotVersion>{};
+        return std::optional<proxy::uot::Version>{};
     }
     auto parsed = ParseVersionValue(*value, "uotVersion");
     if (!parsed) {
         return tl::unexpected(std::move(parsed.error()));
     }
-    return std::optional<SsUotVersion>{*parsed};
+    return std::optional<proxy::uot::Version>{*parsed};
 }
 
-tl::expected<std::optional<SsUotVersion>, std::string> ParseActivation(
+tl::expected<std::optional<proxy::uot::Version>, std::string> ParseActivation(
     const json::value& value,
     std::string_view field,
-    std::optional<SsUotVersion> top_level_version) {
+    std::optional<proxy::uot::Version> top_level_version) {
     if (value.is_bool()) {
         if (!value.as_bool()) {
             if (top_level_version) {
                 return tl::unexpected(std::format(
                     "{} is disabled but a UoT version is configured", field));
             }
-            return std::optional<SsUotVersion>{};
+            return std::optional<proxy::uot::Version>{};
         }
-        return std::optional<SsUotVersion>{
-            top_level_version.value_or(SsUotVersion::V2)};
+        return std::optional<proxy::uot::Version>{
+            top_level_version.value_or(proxy::uot::Version::V2)};
     }
 
     if (!value.is_object()) {
@@ -78,19 +78,19 @@ tl::expected<std::optional<SsUotVersion>, std::string> ParseActivation(
             return tl::unexpected(std::format(
                 "{} is disabled but version is configured", field));
         }
-        return std::optional<SsUotVersion>{};
+        return std::optional<proxy::uot::Version>{};
     }
     if (!version_value) {
-        return std::optional<SsUotVersion>{SsUotVersion::V2};
+        return std::optional<proxy::uot::Version>{proxy::uot::Version::V2};
     }
     auto version = ParseVersionValue(*version_value, std::format("{}.version", field));
     if (!version) return tl::unexpected(std::move(version.error()));
-    return std::optional<SsUotVersion>{*version};
+    return std::optional<proxy::uot::Version>{*version};
 }
 
 }  // namespace
 
-tl::expected<std::optional<SsUotVersion>, std::string>
+tl::expected<std::optional<proxy::uot::Version>, std::string>
 ParseUotVersion(const json::object& source) {
     auto top_level_version = ReadTopLevelVersion(source);
     if (!top_level_version) {
@@ -102,7 +102,7 @@ ParseUotVersion(const json::object& source) {
         if (*top_level_version) {
             return tl::unexpected("UoT version requires uot");
         }
-        return std::optional<SsUotVersion>{};
+        return std::optional<proxy::uot::Version>{};
     }
     return ParseActivation(*uot, "uot", *top_level_version);
 }

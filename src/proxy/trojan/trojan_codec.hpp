@@ -7,11 +7,12 @@
 // ============================================================================
 
 #include "credentials.hpp"
-#include "common.hpp"
 #include "common/target_address.hpp"
 #include "common/address_codec.hpp"
 
 #include <array>
+#include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <span>
 #include <string_view>

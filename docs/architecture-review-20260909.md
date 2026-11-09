@@ -1267,3 +1267,80 @@ CI失败场景修复后通过真实双进程、ML-KEM/X25519加密和回环对�
 - **运行时统计采样（`cnode_runtime_sampling_benchmark`）**：消除每连接 `ExecutionDomain::LocalLease` 与跨域延迟采样后，64 活跃会话（256 轮，含资源统计）单次采样耗时由 2,001.8 ns（p50 1,913 ns / p95 1,944 ns）降至 389.9 ns（p50 351 ns / p95 370 ns，-80.5%），匿名 RSS 由 7,749,632 B 降至 7,602,176 B（-144 KiB），峰值 RSS 由 14,581,760 B 降至 14,069,760 B（-500 KiB）。
 - **VLESS/TLS 真实进程吞吐与内存（`cnode_tls_throughput_benchmark`）**：单流上传吞吐由 672.20 / 688.66 MiB/s 提升至 756.82 / 778.92 MiB/s（CPU 由 0.0294 / 0.0293s 降至 0.0267 / 0.0255s），8 流上传吞吐由 579.75 / 581.97 MiB/s 升至 579.79 / 605.48 MiB/s；8 流预热/活跃匿名内存由 6,545,408 / 6,549,504 B 降至 6,492,160 / 6,500,352 B，进程峰值 RSS（HWM）由 14.96 MiB 降至 14.37 MiB（减少约 595 KiB）。
 - **Hysteria2 四 Worker 真实进程基准（`cnode_hysteria_throughput_benchmark`）**：256 连接单流上传/下载的活跃匿名内存由 33.80 / 33.90 MiB 降至 32.45 / 32.45 MiB（减少 1.28 / 1.38 MiB），负载峰值 RSS 减少 1.75 / 1.81 MiB，守护进程 CPU 减少 4.2% / 6.5%；16 连接 × 64 流（1,024 并发流）上传/下载的建连耗时由 1.153 / 1.115s 降至 1.101 / 1.065s，活跃匿名内存由 45.76 / 44.34 MiB 降至 43.03 / 43.32 MiB（减少 2.61 / 0.96 MiB），负载峰值 RSS 减少 3.40 / 3.97 MiB。临时基线构建目录在验证后清理。
+
+## 2026-11-09：Worker-Local 单层运行时收敛与 QUIC 收发路径精简
+
+### 双层迁移遗留结构清理
+
+在 Pin-to-Origin 架构落地后，继续清除原为支撑跨 Worker 会话迁移而保留的连接级克隆与中转层：
+
+1. **删除 `PhysicalSessionCapabilities`、`PhysicalSessionRegistry`、`LazyProtocol` 与 `DomainTrafficSnapshot`**：
+   - 原实现为每条 TCP、QUIC 和原生 UDP 会话单独创建 `PhysicalSessionCapabilities` 与 `PhysicalSessionRecord`，在单连接内部重复实例化 `proxyman::inbound::Handler`（`LazyProtocol`）、`proxyman::outbound::HandlerLookup`、`dispatcher::DefaultDispatcher`、`dns::DNS`、`SessionTrackingState` 与 `StatsShard`，并在采样或关闭时遍历 `runtime_->connections` 全表归并。
+   - 收敛后，每个数据 Worker 仅维护唯一一套 `inbound_handlers`、`outbound_handlers`（`HandlerLookup`）、`DefaultDispatcher`、`dns::DNS`、`SessionTrackingState` 与 `StatsShard`；`ProtocolRuntime` 直接暴露本协议唯一的 `OnlineTracker()`。所有 TCP、QUIC 与原生 UDP 会话直接复用所属 Worker 的组件；`CollectRuntimeStats` 由 $O(\text{活跃连接数})$ 降为 $O(1)$，`SnapshotTraffic` / `CommitTraffic` / `RollbackTraffic` / `GetOnlineDevices` 直接读取 Worker 唯一状态，删除 `src/app/session_capabilities.cpp` 及 `SessionTrackingState::ExtractAvailableTraffic` / `MergeCompletedTraffic`。
+2. **`OutboundConfiguration` 单线程化**：移除每个 Worker 私有 `OutboundConfiguration` 中的 `publication_mutex_`、`std::atomic<std::shared_ptr<const Snapshot>>` 与原子代际计数，改为所属 Worker 线程内的直接读写。
+3. **删除原生 UDP `UdpReplyFence` 死代码**：移除无调用方的 `UdpReplyFence::AsyncDrain` 及每个 UDP 关联/回包上的 `UdpReplyFence::Lease` 引用计数。
+4. **Hysteria2 (QUIC) 内联 `inbox` 批量 `Flush` 与非阻塞直发**：
+   - 删除 `QuicListener::inboxes` 哈希表与每包 `AllocateShared<Inbox>()` / `inboxes.erase()`，将 `inbox`（`RingDeque`，空态 0 字节分配）内联至 `Connection::Core`；`Pump` 排空当前批次全部输入包后仅执行一次 `Flush()`。
+   - `QuicListener::Queue` 在输出队列为空时优先执行非阻塞 `send_to`，直接发送成功时省去 `ByteVector` 分配拷贝、`socket.output` 入队、`SignalChannel` 通知与 `SendLoop` 协程切换；删除 `QuicListener::Drain` 与 `SocketState::sending` / `drained`。
+5. **`QuicMemory` 直连 `ThreadMemoryPool()`**：移除 `Connection` 的 `AllocationDomain` 包装，`QuicMemory` 直接向所属 Worker 的 `ThreadMemoryPool()` 分配与归还块，消除每次 `ngtcp2` / `nghttp3` 内存操作的 `ScopedAllocationDomain` 与 `domain_memory_resource` 虚调用开销。
+6. **本地构建默认关闭 LTO**：更新 `AGENTS.md`、`CMakeLists.txt`、`mise.toml`、`.github/workflows/ci.yml` 与 `README.md`，本地开发与测试默认 `CNODE_ENABLE_LTO=OFF`，仅 CI 开启 `-DCNODE_ENABLE_LTO=ON`。
+
+### 验证与性能/内存实证
+
+全量 **1,254/1,254** 测试通过（328 项 unit、926 项 E2E）。在相同 LTO Release 编译选项下与 `b2a3d63` 及 `bb393dc` 基线对照：
+
+- **运行时统计采样（`cnode_runtime_sampling_benchmark`，64 活跃 VLESS 会话，256 轮）**：
+  - 单次采样耗时由 `bb393dc` 的 2,001.8 ns（p50 1,913 ns）、`b2a3d63` 的 389.9 ns（p50 351 ns）进一步降至 **222.5 ns（p50 111.0 ns / p95 130.0 ns，较基线 -88.9% / p50 快 17.2 倍，$O(1)$ 恒定时间）**。
+  - 64 条活跃会话的内存池占用（`settled_pool_bytes`）由 `438,272 B` 降至 **`303,104 B`**（减少 `135,168 B`，**每条连接减少 `2,112 B` / `2.06 KiB`**）；匿名 RSS 由 `7,749,632 B` 降至 `7,462,912 B`（-280 KiB），进程峰值 RSS 由 `14,581,760 B` 降至 `13,869,056 B`（-696 KiB）。
+- **Hysteria2 四 Worker 真实进程基准（`cnode_hysteria_throughput_benchmark`，256 物理连接）**：
+  - **上传（Upload 256）**：建连耗时由 `0.547s`（`bb393dc`）/ `0.535s`（`b2a3d63`）降至 **`0.507s`**；守护进程总 CPU 由 `1.790s` / `1.714s` 降至 **`1.664s`（-7.0%）**；256 连接就绪匿名内存由 `33.80 MiB` / `32.45 MiB` 降至 **`31.61 MiB`**（较基线减少 **2.09 MiB**）；负载峰值 RSS 由 `43.16 MiB` 降至 **`40.82 MiB`**（减少 **2.23 MiB**）。
+  - **下载（Download 256）**：建连耗时由 `0.564s` / `0.544s` 降至 **`0.502s`（-11.0%）**；守护进程总 CPU 由 `2.061s` / `1.927s` 降至 **`1.829s`（-11.3%）**；256 连接就绪匿名内存由 `33.90 MiB` / `32.45 MiB` 降至 **`31.71 MiB`**（较基线减少 **2.09 MiB**）；负载峰值 RSS 由 `104.05 MiB` 降至 **`100.65 MiB`**（减少 **3.24 MiB**）。
+
+### 远端 CI 42603174265 修复：XHTTP 跨 Worker 移交禁止捕获原 Worker `stream_handler`
+
+- **问题根因**：[CI 42603174265](https://github.com/grrhuipp/cnode/actions/runs/42603174265) 在 `e2e.http2_worker_migration`（`FourWorkersTcpTls/Http2WorkerMigration.SourceIndependentSessionsMergeAndDetachWithActiveReads/(true, "packet-up")`）中因守护进程触发 `terminate called without an active exception` 退出而失败。`DoXHttp1ServerHandshake` 在将跨 Worker 的 `packet-up` / `stream-up` 连接通过 `net::co_spawn(*owner_reactor, ...)` 移交至目标 Worker 时，闭包按值捕获了原接收 Worker 通过 `memory::AllocateShared` 在本线程 `ThreadMemoryPool` 上分配的 `stream_handler`（`LogicalTransportStreamSink`）。`asio::detail::co_spawn_entry_point` 在目标 Worker 线程上先向原 Worker 派发完成通知，随后才在目标 Worker 线程销毁 `co_spawn_state` 及其闭包参数；当原 Worker 先一步从 `ProcessAcceptedTCP` 返回并释放 `metadata_owner` 时，目标 Worker 成为 `stream_handler` 的最后一个 `shared_ptr` 持有者并在目标 Worker 线程上调用原 Worker 内存池的 `Deallocate`，触发 `worker_memory::Deallocate` 的跨线程检查 `std::terminate()`。同时 `XHttpSessionDirectory::Acquire` 原先在协调器线程构造含 `RingDeque` 的 `SignalChannel` 交由等待 Worker 跨线程 `close()` / 析构。
+- **修复方案**：
+  1. `DoXHttp1ServerHandshake` 跨 Worker 移交闭包不再捕获原 Worker 的 `stream_handler`，仅提取纯值超时参数（`handshake_timeout`、`idle_timeout`），并在目标 Worker 线程本地按需构造和销毁窄 `UploadTransportStreamHandler`；同连接后续 keep-alive 请求同样支持在请求头静止边界按目标会话归属移交。
+  2. `XHttpSessionDirectory::Acquire` 将跨线程等待通知由 `SignalChannel` 替换为绑定等待方 `io_context` 的 `OwnerWaiter`（`steady_timer` + 原子通知标记 + `net::post` 同线程取消），消除跨线程 `RingDeque` / channel 访问与释放。
+  3. `xhttp_session_lifecycle_test` 新增双 Worker 线程 + 协调器线程回归测试，使用析构即校验所属线程的 `OriginBoundSink` 覆盖上行先到等待与跨 Worker 移交。
+
+## 2026-11-09：移除 `AllocationDomain` 租约体系与全栈单线程化/碎片层精简
+
+### 架构与设计精简内容
+
+1. **清除 `AllocationDomain` / `domain_memory_resource` 执行域租约遗留体系与容器瘦身**：
+   - 移除 `ExecutionDomain` 与 `PhysicalSessionCapabilities` 后，生产代码已不再实例化 `memory::AllocationDomain`（`detail::current_allocation_domain` 恒为 `nullptr`），但 `include/common/allocator.hpp` 与 `include/common/buf/multi_buffer.hpp` 仍保留了完整的域租约检查与弱引用跟踪。
+   - 删除 `AllocationDomain`、`domain_memory_resource`、`ScopedAllocationDomain`、`ScopedWorkerAllocation`、`CurrentAllocationDomain`、`RetainResource`、`TrackResourceLifetime`、`RequireAllocationLease`、`AdoptPmr`、`worker_memory::DomainOf` / `SetDomain`、生产零调用的 `request_memory`、`buf::Buffer::RequireLease()`（14 个热路径访问器）及 `Buffer::Adopt()` / `MultiBuffer::Adopt()`；在 `worker_memory` 上直接提供 $O(1)$ 的 `OutstandingAllocations()`。
+   - 移除 `ThreadLocalAllocator<T>` 与 `RingDeque<T>` 中的 `std::weak_ptr<void>` 生命周期跟踪字段，将 `sizeof(ThreadLocalAllocator<T>)` 从 32 字节缩减为 8 字节（单指针），每个 `session::Context` 实例减少 312 字节；删除 `session::SessionPoolResource()` 冗余静态包装与全仓 19 处 `ScopedWorkerAllocation` 调用。
+2. **修复动态出站退役毒化 Worker XHTTP 出站任务组 & 精简 `proxyman/outbound`**：
+   - 移除 `OutboundPoolHost::AsyncJoin()` 中误对所属 Worker `io_context_` 调用的 `JoinXHttpClientTasks(reactor_)`（仅由 `Worker::StopRuntimeTask()` 在 Worker 停机排空阶段统一调用一次），防止单个出站动态退役后将该 Worker 的 `XHttpClientTaskOwner::joining_` 永久置为 `true` 导致后续 XHTTP 出站流报 `operation_aborted`。
+   - 删除生产零调用的 `PreparedOutboundCreator::StatelessCreateFn` 分支。
+3. **XHTTP 跨 Worker 边界收敛、H1 上行单次 Coordinator 往返与取消源去重**：
+   - `GetXHttpPacketSession` 在 `claim.owner != &io_context` 时直接返回 `nullptr`（Fail-Closed），禁止跨 Worker `co_spawn` 共享单线程 PMR 对象 `XHttpPacketUpSession`。
+   - 扩展 `XHttpSessionOwnerResolution` 在归属当前 `io_context` 时直接从本地 `XHttpSessionTable` 解析并返回 `session`，使 `DoXHttp1ServerHandshake` 省去第二次 `GetXHttpPacketSession` 协调器往返。
+   - `XHttpPacketUpSession::AwaitDownlink` 改用栈上局部 `SignalChannel` 等待，不再向 `TimeoutScheduler` 最小堆插入 `max()` 定时事件。
+   - 删除 `XHttpPacketUpServerStream` 与 `XHttpSplitOutboundStreamBase` 中遮蔽基类 `AsyncStream::cancellation_` 的重复成员，修复 `XHttpPacketUpServerStream::Close()` 与 `OnCancellation` 通知不同取消源的问题。
+4. **Hysteria2 (QUIC) 连接所有权内联与 $O(1)$ CID 解绑 / $O(N)$ 超时扫描**：
+   - 删除 `struct QuicOwnership` 堆分配包装，将 `retired_` 与 `expiry_` 内联至 `Connection`。
+   - `QuicListener::DissociateAll` 改为按 `connection.connection_ids_` 定向擦除（由全表 $O(\text{总 CID 数})$ 降为 $O(\text{本连接 CID 数})$）；`ArmExpiry()` 与 `ExpiryLoop()` 改为直接遍历唯一连接表 `sessions`，消除 `ExpiryLoop()` 中的 `std::find` $O(N^2)$ 去重。
+5. **原生 UDP 与策略/协调器单线程化及碎片文件清理**：
+   - `UdpResourceBudget`、`InboundDatagramAssociation`（`claimed`、`protected_until_`）与 `UdpHandoffDirectory` 移除跨线程迁移时代遗留的原子操作与系统默认分配器穿透，统一使用单线程算术与 `ThreadLocalUnorderedMap`；删除死虚函数 `Inbound::AdoptWorkerStateFrom` 与 `UdpIngress::ProcessDecoded` 的死参数 `response`。
+   - `rule::DetectRulePolicy` 移除 `std::mutex`、原子代际计数、CoW 整表复制与 `thread_local LocalCache`，改为 Worker 本地单线程直读直写；删除死重载 `Worker::UpdateRule(std::string_view, std::vector<DetectRule>)`。
+   - `GroupCoordinator` 删除无生产调用的 `WorkerTarget`、`WorkerRoute` 链表、`FindWorker`、`FindWorkerId` 及 `RegisterWorker` 的多余 `executor` 参数；统一 `UserOnlineTracker::TryConnectSession` 与 `proxy::AdmitAuthenticatedInbound` 为单一入口，删除 `ConnectionLimiter::Coordinator()` 与 `DatagramSessionEnvironment::coordinator`。
+   - `AnyTLS` 出站 `SessionPool` 移除恒为 `0` 的 `worker` 字段与 `PaddingState` 中多余的 `net::dispatch`；合并 `SsUotVersion` 至 `proxy::uot::Version`；删除 `freedom_outbound.cpp` 中不可达的 `!target.IsDomain()` 死分支；`Http2ServerSubStreamState` 的 `owner_signal_` 与 `credit_signal_` 改为 `std::optional<SignalChannel>` 惰性构造；删除 `StreamSettings::flags` 冗余位掩码、遗留头 `include/common.hpp`、死错误码 `TLS_CERT_INVALID` 及 8 个单函数碎片文件（`bootstrap_inbounds.hpp/.cpp`、`bootstrap_panels.hpp/.cpp`、`bootstrap_shutdown.hpp/.cpp`、`http2_settings.cpp`、`http2_initial_window.cpp`）。
+
+### 验证与性能/内存实证
+
+全量 **1,251/1,251** 测试通过（325 项 unit、926 项真实进程 E2E，用时 233.09 秒），静态 ELF 主程序验证通过，主程序体积由 137 MiB 降至 134 MiB。在同一环境、固定负载与相同编译选项（`CNODE_ENABLE_LTO=OFF`、Release）下执行 A/B/A/B 交错重复基准对照：
+
+- **容器与缓冲微基准（`cnode_allocator_append_benchmark`）**：
+  - `multibuffer-transfer` 1/8/9/16 块耗时由 `132.1~132.4` / `458.8~467.7` / `610.7~615.6` / `923.1~943.2 ns` 降至 **`90.3~91.5` / `313.4~315.8` / `415.0~426.1` / `647.5~651.6 ns`（耗时减少 30.4% ~ 32.1%）**。
+  - `buffer-span (multibuffer)` 1/8/9/16 块耗时由 `8.96~15.20` / `22.23~70.75` / `115.28~158.80` / `152.51~225.70 ns` 降至 **`5.46~5.52` / `14.65~14.66` / `92.93~93.29` / `105.91~110.31 ns`（耗时减少 19% ~ 79%）**。
+- **活跃会话内存池与采样基准（`cnode_runtime_sampling_benchmark`）**：
+  - **64 活跃 VLESS 会话**：内存池映射（`settled_pool_bytes`）由 `303,104 B` 降至 **`233,472 B`（减少 `69,632 B` / -23.0%，每条连接再省 `1,088 B`）**；稳态匿名 RSS 由 `7,573,504 / 9,670,656 B` 降至 **`7,413,760 / 7,417,856 B`（至少减少 156 KiB）**；单次采样耗时 p50 稳定在 **`100.0 ns`**（p95 `101.0 ns`）。
+  - **512 活跃 VLESS 会话**：内存池映射（`settled_pool_bytes`）由 `1,126,400 B` 降至 **`946,176 B`（减少 `180,224 B` / -16.0%）**；稳态匿名 RSS 由 `20,627,456 B` 降至 **`19,980,288 B`（减少 632 KiB）**；进程峰值 RSS 由 `28,356,608 B` 降至 **`27,664,384 B`（减少 676 KiB）**；单次采样耗时由 `174.6 ns`（p50 `130 ns`）降至 **`142.1 ns`（p50 `101 ns`，-18.6%）**。
+- **VLESS/TLS 真实进程基准（`cnode_tls_throughput_benchmark`）**：
+  - 8 流上传吞吐由 `206.84 / 552.08 MiB/s` 升至 **`587.66 / 609.22 MiB/s`**，守护进程 CPU 由 `0.3069 / 0.1844s` 降至 **`0.1708 / 0.1649s`**，活跃匿名内存由 `6,590,464 / 6,516,736 B` 降至 **`6,455,296 / 6,471,680 B`**，峰值 RSS 由 `14,643,200 / 14,626,816 B` 降至 **`14,610,432 / 14,462,976 B`**。
+- **Hysteria2 四 Worker 真实进程基准（`cnode_hysteria_throughput_benchmark`）**：
+  - **256 连接单流上传/下载**：上传守护进程总 CPU 由 `4.284 / 1.706s` 降至 **`1.409 / 1.437s`（-15.8% ~ -17.4%）**，活跃匿名内存由 `32.10 / 32.34 MiB` 降至 **`31.45 / 31.44 MiB`（减少 632 ~ 876 KiB）**，负载峰值 RSS 由 `40.28 / 40.78 MiB` 降至 **`39.82 / 39.63 MiB`（最高减少 1.09 MiB）**；下载守护进程总 CPU 由 `1.820 / 1.821s` 降至 **`1.545 / 1.621s`（-11.0% ~ -15.1%）**，256 连接就绪匿名内存由 `30.67 / 31.65 MiB` 降至 **`30.61 / 30.68 MiB`**。
+  - **16 连接 × 64 流（1,024 并发流）**：上传守护进程总 CPU 由 `4.879 / 4.343s` 降至 **`4.337 / 3.949s`（-9.1%）**，吞吐升至 **`56.41 / 57.00 MiB/s`**；下载守护进程总 CPU 由 `5.146 / 4.316s` 降至 **`3.933 / 4.005s`（-7.2% ~ -23.6%）**。

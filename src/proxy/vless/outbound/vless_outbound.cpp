@@ -638,9 +638,9 @@ const bool kVlessRegistered = (::proxyman::outbound::RegisterProxy(
             }
             encryption = json_string(*user, "encryption");
             vless_config.flow = json_string(*user, "flow");
-            const std::string user_packet_encoding = json_string(*user, "packetEncoding");
-            if (!user_packet_encoding.empty()) {
-                packet_encoding = user_packet_encoding;
+            packet_encoding = json_string(*user, "packetEncoding");
+            if (packet_encoding.empty()) {
+                packet_encoding = json_string(s, "packetEncoding");
             }
             if (encryption.empty()) {
                 encryption = json_string(s, "encryption");
@@ -661,9 +661,6 @@ const bool kVlessRegistered = (::proxyman::outbound::RegisterProxy(
             uuid = json_string(s, "id");
             encryption = json_string(s, "encryption");
             vless_config.flow = json_string(s, "flow");
-            packet_encoding = json_string(s, "packetEncoding");
-        }
-        if (packet_encoding.empty()) {
             packet_encoding = json_string(s, "packetEncoding");
         }
         if (invalid_field) {

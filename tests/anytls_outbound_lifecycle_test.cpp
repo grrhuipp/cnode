@@ -1133,7 +1133,7 @@ bool RunPoolLifecycle(bool join_before_retirement) {
 bool RunDomainPoolIsolation() {
     net::io_context io;
     auto coordinator = std::make_shared<GroupCoordinator>(io, 2);
-    coordinator->RegisterWorker(0, io, io.get_executor());
+    coordinator->RegisterWorker(0, io);
     app::dns::Config dns_config;
     dns_config.servers = {{net::ip::address_v4::loopback(), 1}};
     app::dns::DNSWorker dns_worker(io, dns_config, 8);

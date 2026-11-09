@@ -221,8 +221,7 @@ TEST(BufferSpanBuilder, SelfAppendWithinCapacityKeepsBorrowedStorage) {
 }
 
 TEST(BufferSpanBuilder, SparseExternalAppendUsesOnlyNonemptyCapacity) {
-    ::memory::AllocationDomain domain;
-    ::memory::ScopedAllocationDomain lease(domain);
+    const auto baseline = ::memory::ThreadMemoryPool().OutstandingAllocations();
     const std::string text = "abcd";
     const std::array prefix{
         ::net::buffer(text.data(), 1), ::net::buffer(text.data() + 1, 1),
@@ -233,37 +232,35 @@ TEST(BufferSpanBuilder, SparseExternalAppendUsesOnlyNonemptyCapacity) {
     builder.AppendBuffers(prefix);
     builder.AppendBuffers(suffix);
     EXPECT_EQ(Flatten(builder.Span()), "abcd");
-    EXPECT_EQ(domain.OutstandingAllocations(), 0u);
+    EXPECT_EQ(::memory::ThreadMemoryPool().OutstandingAllocations() - baseline, 0u);
     builder.AppendBuffers(suffix);
     EXPECT_EQ(Flatten(builder.Span()), "abcdd");
-    EXPECT_EQ(domain.OutstandingAllocations(), 1u);
+    EXPECT_EQ(::memory::ThreadMemoryPool().OutstandingAllocations() - baseline, 1u);
     builder.Clear();
-    EXPECT_EQ(domain.OutstandingAllocations(), 0u);
+    EXPECT_EQ(::memory::ThreadMemoryPool().OutstandingAllocations(), baseline);
 }
 
 TEST(BufferSpanBuilder, SpillUsesActiveDomainAndClearReleasesItsStorage) {
+    const auto baseline = ::memory::ThreadMemoryPool().OutstandingAllocations();
     ::ConstBufferSpanBuilder<2> builder;
     const std::string text = "abc";
     builder.Append(::net::buffer(text.data(), 1));
     builder.Append(::net::buffer(text.data() + 1, 1));
     for (int cycle = 0; cycle < 2; ++cycle) {
-        ::memory::AllocationDomain domain;
-        ::memory::ScopedAllocationDomain lease(domain);
         if (cycle != 0) {
             builder.Append(::net::buffer(text.data(), 1));
             builder.Append(::net::buffer(text.data() + 1, 1));
         }
         builder.Append(::net::buffer(text.data() + 2, 1));
         EXPECT_EQ(Flatten(builder.Span()), text);
-        EXPECT_EQ(domain.OutstandingAllocations(), 1u);
+        EXPECT_EQ(::memory::ThreadMemoryPool().OutstandingAllocations() - baseline, 1u);
         builder.Clear();
-        EXPECT_EQ(domain.OutstandingAllocations(), 0u);
+        EXPECT_EQ(::memory::ThreadMemoryPool().OutstandingAllocations(), baseline);
     }
 }
 
 TEST(BufferSpanBuilder, SparseMultiBufferPreservesSlicesAcrossInlineAndSpilledAppends) {
-    ::memory::AllocationDomain domain;
-    ::memory::ScopedAllocationDomain lease(domain);
+    const auto baseline = ::memory::ThreadMemoryPool().OutstandingAllocations();
     ::buf::MultiBuffer payload;
     const void* slice = nullptr;
     for (int index = 0; index < 3; ++index) {
@@ -277,7 +274,8 @@ TEST(BufferSpanBuilder, SparseMultiBufferPreservesSlicesAcrossInlineAndSpilledAp
         }
         payload.push_back(std::move(block));
     }
-    const auto payload_allocations = domain.OutstandingAllocations();
+    const auto payload_allocations =
+        ::memory::ThreadMemoryPool().OutstandingAllocations() - baseline;
     ::ConstBufferSpanBuilder<4> builder;
     const std::string prefix = "P";
     builder.Append(::net::buffer(prefix));
@@ -291,13 +289,14 @@ TEST(BufferSpanBuilder, SparseMultiBufferPreservesSlicesAcrossInlineAndSpilledAp
             EXPECT_EQ(builder.Span()[index].data(), slice);
             EXPECT_EQ(builder.Span()[index].size(), 2u);
         }
-        EXPECT_EQ(domain.OutstandingAllocations(),
+        EXPECT_EQ(::memory::ThreadMemoryPool().OutstandingAllocations() - baseline,
             payload_allocations + static_cast<size_t>(appended >= 4));
     }
     builder.Clear();
-    EXPECT_EQ(domain.OutstandingAllocations(), payload_allocations);
+    EXPECT_EQ(::memory::ThreadMemoryPool().OutstandingAllocations() - baseline,
+              payload_allocations);
     payload.clear();
-    EXPECT_EQ(domain.OutstandingAllocations(), 0u);
+    EXPECT_EQ(::memory::ThreadMemoryPool().OutstandingAllocations(), baseline);
 }
 
 TEST(BufferSpanBuilder, FailedMultiBufferAppendPreservesPrefixAndCanRetry) {
@@ -331,8 +330,7 @@ TEST(BufferSpanBuilder, FailedMultiBufferAppendPreservesPrefixAndCanRetry) {
 }
 
 TEST(ContiguousBufferView, MultiBufferBorrowAndOwnedCopyPreserveBinaryPayload) {
-    ::memory::AllocationDomain domain;
-    ::memory::ScopedAllocationDomain lease(domain);
+    const auto baseline = ::memory::ThreadMemoryPool().OutstandingAllocations();
     for (const bool fragmented : {false, true}) {
         SCOPED_TRACE(fragmented);
         std::array<uint8_t, 6> expected{0, 0x42, 0, 0x7f, 0x80, 0xff};
@@ -349,7 +347,7 @@ TEST(ContiguousBufferView, MultiBufferBorrowAndOwnedCopyPreserveBinaryPayload) {
             const ContiguousView view(std::as_const(source));
             if (fragmented) {
                 source.clear();
-                EXPECT_EQ(domain.OutstandingAllocations(), 1);
+                EXPECT_EQ(::memory::ThreadMemoryPool().OutstandingAllocations() - baseline, 1u);
             } else {
                 EXPECT_EQ(view.Bytes().data(), source.FrontSpan().data());
                 (*source.begin())->Bytes()[1] = expected[1] = 0x99;
@@ -358,13 +356,12 @@ TEST(ContiguousBufferView, MultiBufferBorrowAndOwnedCopyPreserveBinaryPayload) {
             EXPECT_TRUE(std::equal(view.Bytes().begin(), view.Bytes().end(), expected.begin()));
         }
         source.clear();
-        EXPECT_EQ(domain.OutstandingAllocations(), 0);
+        EXPECT_EQ(::memory::ThreadMemoryPool().OutstandingAllocations(), baseline);
     }
 }
 
 TEST(ContiguousBufferView, TemporaryDescriptorsDoNotOwnOrExtendPayloadLifetime) {
-    ::memory::AllocationDomain domain;
-    ::memory::ScopedAllocationDomain lease(domain);
+    const auto baseline = ::memory::ThreadMemoryPool().OutstandingAllocations();
     for (const bool fragmented : {false, true}) {
         SCOPED_TRACE(fragmented);
         std::array<uint8_t, 3> first{1, 0, 2}, second{3, 0xff, 4};
@@ -386,7 +383,7 @@ TEST(ContiguousBufferView, TemporaryDescriptorsDoNotOwnOrExtendPayloadLifetime) 
             ASSERT_EQ(view.Bytes().size(), expected.size());
             EXPECT_TRUE(std::equal(view.Bytes().begin(), view.Bytes().end(), expected.begin()));
         }
-        EXPECT_EQ(domain.OutstandingAllocations(), 0);
+        EXPECT_EQ(::memory::ThreadMemoryPool().OutstandingAllocations(), baseline);
     }
 }
 

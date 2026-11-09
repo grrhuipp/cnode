@@ -217,15 +217,6 @@ proxy::shadowsocks::inbound::Handler::Handler(
     , limiter_(limiter)
     , cipher_info_(cipher_info) {}
 
-void proxy::shadowsocks::inbound::Handler::AdoptWorkerStateFrom(
-    Inbound& previous) noexcept {
-    auto* previous_handler = dynamic_cast<Handler*>(&previous);
-    if (!previous_handler) {
-        return;
-    }
-    udp_replay_cache_ = std::move(previous_handler->udp_replay_cache_);
-}
-
 // ----------------------------------------------------------------------------
 // Process
 // 流程：
@@ -349,7 +340,7 @@ proxy::shadowsocks::inbound::Handler::Process(
             // identity together establish the concrete protocol state type.
             if (&association->Policy() != result.association_policy)
                 return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
-            if (!association->claimed.load(std::memory_order_acquire)) {
+            if (!association->claimed) {
                 auto& state = static_cast<ss::Ss2022UdpAssociation&>(*association);
                 if (!state.ss::Ss2022UdpAssociation::Check(*decoded->packet_id, request.worker_id,
                         request.client_endpoint, InboundDatagramCheck::Commit))
@@ -367,7 +358,6 @@ proxy::shadowsocks::inbound::Handler::Process(
 tl::expected<std::shared_ptr<InboundDatagramResponse>, ErrorCode>
 proxy::shadowsocks::inbound::Handler::CreateDatagramResponse(
     const InboundDatagramResult& decoded) {
-    memory::ScopedWorkerAllocation worker_allocation;
     ss::KeyBytes key;
     struct CleanseKey {
         ss::KeyBytes& k;

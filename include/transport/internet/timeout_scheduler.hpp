@@ -15,8 +15,6 @@ class TimeoutScheduler;
 // expiry detaches it before calling OnTimeout, which may rearm or destroy it.
 class TimeoutEvent {
 public:
-    struct WorkerLocal {};
-    explicit TimeoutEvent(WorkerLocal) noexcept {}
     TimeoutEvent() noexcept = default;
     explicit TimeoutEvent(net::io_context& context) noexcept;
     TimeoutEvent(const TimeoutEvent&) = delete;
@@ -54,9 +52,7 @@ private:
     friend class TimeoutScheduler;
 };
 
-// One indexed heap and native timer per Worker, shared by all its domains.
-// Embedded events retain lightweight domain ownership. Native expiry only queues
-// a domain notification; host callbacks run under that domain's business lease.
+// One indexed heap and native timer per Worker reactor.
 class TimeoutScheduler {
 public:
     struct ResourceStats {
@@ -69,8 +65,7 @@ public:
     // Call on the owner after all users join; drain cancellation before
     // destroying the io_context and its PMR-backed scheduler service.
     static void ReleaseForIoContext(net::io_context& io_context);
-    // In a domain, detach only its events (including queued expiries). Worker
-    // control-plane callers additionally join the shared timer cancellation.
+    // Detach all events and join any in-flight native timer cancellation.
     static net::awaitable<void> AsyncReleaseForIoContext(net::io_context& io_context);
 
     // Rearming an existing event reuses its heap slot. False means released.
@@ -88,7 +83,6 @@ private:
     friend class TimeoutSchedulerService;
     friend class TimeoutEvent;
     explicit TimeoutScheduler(net::io_context& io_context);
-    [[nodiscard]] static TimeoutScheduler& ForWorker(net::io_context& io_context);
     void Release() noexcept;
     struct Impl;
     std::unique_ptr<Impl> impl_;

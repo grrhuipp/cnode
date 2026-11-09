@@ -11,8 +11,11 @@
 #include "transport/internet/tcp_stream.hpp"
 #include "transport/phase_deadline.hpp"
 #include "transport/internet/tls_stream.hpp"
+#include "transport/link_error.hpp"
+#include <asio/as_tuple.hpp>
 #include <asio/co_spawn.hpp>
-#include "transport/internet/async_delay.hpp"
+#include <asio/post.hpp>
+#include <asio/steady_timer.hpp>
 
 #include <array>
 #include <charconv>
@@ -98,11 +101,11 @@ class XHttpPacketUpServerStream final : public AsyncStream {
     private:
         void OnCancellation(transport::Cancellation cancellation) noexcept override {
             if (cancellation.terminal) {
-                owner.cancellation_.Stop(cancellation.reason);
+                owner.NotifyClosed(cancellation.reason);
                 owner.downlink_->Cancel();
             } else {
                 Resubscribe(owner.session_->Cancellation());
-                owner.cancellation_.CancelPending(cancellation.reason);
+                owner.NotifyCancellation(cancellation.reason);
             }
         }
     };
@@ -112,11 +115,11 @@ class XHttpPacketUpServerStream final : public AsyncStream {
     private:
         void OnCancellation(transport::Cancellation cancellation) noexcept override {
             if (cancellation.terminal) {
-                owner.cancellation_.Stop(cancellation.reason);
+                owner.NotifyClosed(cancellation.reason);
                 owner.session_->Close();
             } else {
                 Resubscribe(owner.downlink_->Cancellation());
-                owner.cancellation_.CancelPending(cancellation.reason);
+                owner.NotifyCancellation(cancellation.reason);
             }
         }
     };
@@ -135,8 +138,6 @@ public:
         downlink_cancel_.Resubscribe(downlink_->Cancellation());
         (void)session_->AttachDownlink();
     }
-
-    transport::CancellationSource& Cancellation() noexcept override { return cancellation_; }
 
     ~XHttpPacketUpServerStream() noexcept override {
         Close();
@@ -268,9 +269,15 @@ protected:
     }
 
 private:
+    void NotifyCancellation(ErrorCode reason = ErrorCode::CANCELLED) noexcept {
+        Cancellation().CancelPending(reason);
+    }
+    void NotifyClosed(ErrorCode reason = ErrorCode::CANCELLED) noexcept {
+        Cancellation().Stop(reason);
+    }
+
     std::shared_ptr<XHttpPacketUpSession> session_;
     std::unique_ptr<AsyncStream> downlink_;
-    transport::CancellationSource cancellation_;
     StreamPhaseDeadline deadline_;
     SessionCancellation session_cancel_{*this};
     DownlinkCancellation downlink_cancel_{*this};
@@ -687,6 +694,30 @@ public:
     explicit XHttpSessionDirectory(net::execution_context& context)
         : net::execution_context::service(context) {}
 
+    struct OwnerWaiter final : std::enable_shared_from_this<OwnerWaiter> {
+        net::io_context& io;
+        net::steady_timer timer;
+        std::atomic<bool> notified{false};
+
+        explicit OwnerWaiter(net::io_context& io_context)
+            : io(io_context)
+            , timer(io_context, net::steady_timer::time_point::max()) {}
+
+        void Notify() noexcept {
+            if (notified.exchange(true, std::memory_order_acq_rel)) return;
+            try {
+                net::post(io, [self = shared_from_this()] {
+                    self->timer.cancel();
+                });
+            } catch (...) {}
+        }
+
+        void CancelOnOwner() noexcept {
+            notified.store(true, std::memory_order_release);
+            timer.cancel();
+        }
+    };
+
     struct Record {
         enum class State : uint8_t { Reserved, Live, Retired };
         XHttpSessionDirectory* directory;
@@ -698,7 +729,7 @@ public:
         Record* next = nullptr;
         bool processed = false;
         bool activated = false;
-        std::vector<std::shared_ptr<SignalChannel>> owner_waiters;
+        std::vector<std::shared_ptr<OwnerWaiter>> owner_waiters;
 
         Record(XHttpSessionDirectory& directory, net::io_context* owner)
             : directory(&directory), owner(owner) {}
@@ -715,7 +746,7 @@ public:
             auto waiters = std::move(owner_waiters);
             owner_waiters.clear();
             for (auto& waiter : waiters) {
-                if (waiter) waiter->close();
+                if (waiter) waiter->Notify();
             }
         }
     };
@@ -723,7 +754,7 @@ public:
     struct Claim {
         net::io_context* owner = nullptr;
         std::shared_ptr<Record> record;
-        std::shared_ptr<SignalChannel> wait_owner;
+        std::shared_ptr<OwnerWaiter> wait_owner;
         bool reservation = false;
         bool retry = false;
         Claim() = default;
@@ -760,9 +791,10 @@ public:
             }
             Claim pending;
             pending.record = record;
-            pending.wait_owner = std::make_shared<SignalChannel>(
-                static_cast<net::io_context&>(context()).get_executor(), 1);
-            record->owner_waiters.push_back(pending.wait_owner);
+            if (current) {
+                pending.wait_owner = std::make_shared<OwnerWaiter>(*current);
+                record->owner_waiters.push_back(pending.wait_owner);
+            }
             return pending;
         }
         if (access == XHttpSessionAccess::Join ||
@@ -788,9 +820,10 @@ public:
         if (!bind_owner) {
             Claim pending;
             pending.record = std::move(record);
-            pending.wait_owner = std::make_shared<SignalChannel>(
-                static_cast<net::io_context&>(context()).get_executor(), 1);
-            pending.record->owner_waiters.push_back(pending.wait_owner);
+            if (current) {
+                pending.wait_owner = std::make_shared<OwnerWaiter>(*current);
+                pending.record->owner_waiters.push_back(pending.wait_owner);
+            }
             return pending;
         }
         return {current, std::move(record), true};
@@ -1143,31 +1176,32 @@ bool XHttpPacketUpSession::AttachDownlink() noexcept {
 
 net::awaitable<bool> XHttpPacketUpSession::AwaitDownlink(
     transport::CancellationSource& cancellation) {
-    AsyncDelay wait(io_context_);
+    SignalChannel wake(io_context_.get_executor(), 1);
     struct ReadyWatch final : transport::CancellationSubscription {
-        explicit ReadyWatch(AsyncDelay& wait) noexcept : wait(wait) {}
-        AsyncDelay& wait;
+        explicit ReadyWatch(SignalChannel& wake) noexcept : wake(wake) {}
+        SignalChannel& wake;
 
     private:
         void OnCancellation(transport::Cancellation) noexcept override {
-            wait.Cancel();
+            (void)wake.try_send(IoErrorCode{});
         }
-    } ready{wait};
+    } ready{wake};
     struct ConnectionCancellation final : transport::CancellationSubscription {
-        explicit ConnectionCancellation(AsyncDelay& wait) noexcept : wait(wait) {}
-        AsyncDelay& wait;
+        explicit ConnectionCancellation(SignalChannel& wake) noexcept : wake(wake) {}
+        SignalChannel& wake;
         bool cancelled = false;
 
     private:
         void OnCancellation(transport::Cancellation) noexcept override {
             cancelled = true;
-            wait.Cancel();
+            (void)wake.try_send(IoErrorCode{});
         }
-    } watch{wait};
+    } watch{wake};
     ready.Resubscribe(downlink_ready_);
     watch.Resubscribe(cancellation);
     while (!downlink_attached_ && !closed_ && !watch.cancelled) {
-        co_await wait.WaitFor(std::chrono::milliseconds::max());
+        auto [ec] = co_await wake.async_receive(net::as_tuple(net::use_awaitable));
+        (void)ec;
         if ((co_await net::this_coro::cancellation_state).cancelled() !=
             net::cancellation_type::none) {
             co_return false;
@@ -1382,7 +1416,47 @@ std::unique_ptr<AsyncStream> RestoreXHttpStream(
     return nullptr;
 }
 
-net::awaitable<net::io_context*> ResolveXHttpSessionOwner(
+class UploadTransportStreamHandler final
+    : public memory::ThreadAllocated
+    , public InboundTransportStreamHandler {
+public:
+    UploadTransportStreamHandler(std::chrono::seconds handshake_timeout,
+                                 std::chrono::seconds idle_timeout) noexcept
+        : handshake_timeout_(handshake_timeout)
+        , idle_timeout_(idle_timeout) {}
+
+    net::awaitable<void> OnInboundTransportStream(
+        std::unique_ptr<AsyncStream>, InboundTransportMetadata) override {
+        co_return;
+    }
+
+    void OnInboundTransportReady(AsyncStream& stream) override {
+        if (stream.ConsumePhaseDeadline()) {
+            throw transport::LinkError(ErrorCode::TIMEOUT);
+        }
+        stream.ClearPhaseDeadline();
+        stream.SetIdleTimeout(idle_timeout_);
+    }
+
+    void OnInboundTransportRequest(AsyncStream& stream) override {
+        stream.SetIdleTimeout(handshake_timeout_);
+        (void)stream.StartPhaseDeadline(handshake_timeout_);
+    }
+
+    [[nodiscard]] std::chrono::seconds TransportHandshakeTimeout() const noexcept override {
+        return handshake_timeout_;
+    }
+
+    [[nodiscard]] std::chrono::seconds TransportIdleTimeout() const noexcept override {
+        return idle_timeout_;
+    }
+
+private:
+    std::chrono::seconds handshake_timeout_;
+    std::chrono::seconds idle_timeout_;
+};
+
+net::awaitable<XHttpSessionOwnerResolution> ResolveXHttpSessionOwner(
     net::io_context& io_context,
     std::string_view session_namespace,
     std::string_view session_id,
@@ -1390,7 +1464,13 @@ net::awaitable<net::io_context*> ResolveXHttpSessionOwner(
     bool bind_owner,
     transport::CancellationSource* cancellation = nullptr) {
     auto* coordinator = GroupCoordinator::ForContext(io_context);
-    if (!coordinator) co_return &io_context;
+    if (!coordinator) {
+        co_return XHttpSessionOwnerResolution{
+            .owner = &io_context,
+            .session = net::use_service<XHttpSessionTable>(io_context).Get(
+                io_context, session_namespace, session_id, access),
+        };
+    }
     for (;;) {
         auto claim = co_await coordinator->PostCall(
             [coordinator, session_namespace, session_id, access, &io_context, bind_owner] {
@@ -1399,36 +1479,42 @@ net::awaitable<net::io_context*> ResolveXHttpSessionOwner(
             });
         if (claim.retry) continue;
         if (claim.owner) {
-            // If we reserved the owner slot for PacketDown, create the local
-            // session entry immediately before releasing the claim guard.
-            if (claim.reservation && claim.owner == &io_context) {
-                (void)net::use_service<XHttpSessionTable>(io_context).Get(
-                    io_context, session_namespace, session_id, access, claim.record);
-                claim.reservation = false;
+            if (claim.owner != &io_context) {
+                co_return XHttpSessionOwnerResolution{.owner = claim.owner, .session = {}};
             }
-            co_return claim.owner;
+            if (claim.record && claim.record->Retired()) continue;
+            auto session = net::use_service<XHttpSessionTable>(io_context).Get(
+                io_context, session_namespace, session_id, access, claim.record);
+            if (session) claim.reservation = false;
+            co_return XHttpSessionOwnerResolution{
+                .owner = claim.owner,
+                .session = std::move(session),
+            };
         }
-        if (!claim.wait_owner) co_return nullptr;
+        if (!claim.wait_owner) co_return XHttpSessionOwnerResolution{};
         struct CancelWait final : transport::CancellationSubscription {
-            std::shared_ptr<SignalChannel> channel;
+            std::shared_ptr<XHttpSessionDirectory::OwnerWaiter> waiter;
             bool cancelled = false;
-            explicit CancelWait(std::shared_ptr<SignalChannel> ch) noexcept
-                : channel(std::move(ch)) {}
+            explicit CancelWait(
+                std::shared_ptr<XHttpSessionDirectory::OwnerWaiter> w) noexcept
+                : waiter(std::move(w)) {}
             void OnCancellation(transport::Cancellation) noexcept override {
                 cancelled = true;
-                if (channel) channel->close();
+                if (waiter) waiter->CancelOnOwner();
             }
         } cancel_wait{claim.wait_owner};
         if (cancellation) cancel_wait.Resubscribe(*cancellation);
-        if (cancel_wait.cancelled) co_return nullptr;
-        IoErrorCode ec;
-        std::tie(ec) = co_await claim.wait_owner->async_receive(
-            net::as_tuple(net::use_awaitable));
-        (void)ec;
+        if (cancel_wait.cancelled) co_return XHttpSessionOwnerResolution{};
+        if (!claim.wait_owner->notified.load(std::memory_order_acquire)) {
+            IoErrorCode ec;
+            std::tie(ec) = co_await claim.wait_owner->timer.async_wait(
+                net::as_tuple(net::use_awaitable));
+            (void)ec;
+        }
         if (cancel_wait.cancelled ||
             (co_await net::this_coro::cancellation_state).cancelled() !=
                 net::cancellation_type::none) {
-            co_return nullptr;
+            co_return XHttpSessionOwnerResolution{};
         }
     }
 }
@@ -1454,18 +1540,7 @@ net::awaitable<std::shared_ptr<XHttpPacketUpSession>> GetXHttpPacketSession(
             });
         if (claim.retry) continue;
         if (!claim.owner) co_return nullptr;
-        if (claim.owner != &io_context) {
-            co_return co_await net::co_spawn(
-                *claim.owner,
-                [owner = claim.owner, ns = std::string(session_namespace),
-                 id = std::string(session_id), access,
-                 record = claim.record]() -> net::awaitable<std::shared_ptr<XHttpPacketUpSession>> {
-                    if (record && record->Retired()) co_return nullptr;
-                    co_return net::use_service<XHttpSessionTable>(*owner).Get(
-                        *owner, ns, id, access, record);
-                },
-                net::use_awaitable);
-        }
+        if (claim.owner != &io_context) co_return nullptr;
         if (claim.record->Retired()) continue;
         auto session = net::use_service<XHttpSessionTable>(io_context).Get(
             io_context, session_namespace, session_id, access, claim.record);
@@ -1649,16 +1724,24 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
             co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
         }
 
-        if (!persistent &&
-            (meta.kind == XHttpRequestMeta::Kind::PacketUp ||
-             meta.kind == XHttpRequestMeta::Kind::StreamUp)) {
+        if (meta.kind == XHttpRequestMeta::Kind::PacketUp && !xhttp_cfg.AcceptsPacketUp()) {
+            co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
+        }
+        if (meta.kind == XHttpRequestMeta::Kind::StreamUp && !xhttp_cfg.AcceptsStreamUp()) {
+            co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
+        }
+
+        std::shared_ptr<XHttpPacketUpSession> resolved_session;
+        if (meta.kind == XHttpRequestMeta::Kind::PacketUp ||
+            meta.kind == XHttpRequestMeta::Kind::StreamUp) {
             const auto access = meta.kind == XHttpRequestMeta::Kind::StreamUp
                 ? XHttpSessionAccess::Open
                 : XHttpSessionAccess::Upload;
             const bool bind_immediately = (stream_handler == nullptr);
-            auto* owner_reactor = co_await ResolveXHttpSessionOwner(
+            auto resolution = co_await ResolveXHttpSessionOwner(
                 io_context, xhttp_cfg.session_namespace, meta.session_id,
                 access, bind_immediately, &stream->Cancellation());
+            auto* owner_reactor = resolution.owner;
             if (!owner_reactor) {
                 if (stream->ConsumePhaseDeadline() || stream->ConsumeIdleTimeout()) {
                     co_return tl::unexpected(ErrorCode::TIMEOUT);
@@ -1676,31 +1759,43 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
                 if (!detached) {
                     co_return tl::unexpected(ErrorCode::SOCKET_READ_FAILED);
                 }
+                const bool has_stream_handler = (stream_handler != nullptr);
+                const auto handshake_timeout = stream_handler
+                    ? stream_handler->TransportHandshakeTimeout()
+                    : std::chrono::seconds{0};
+                const auto idle_timeout = stream_handler
+                    ? stream_handler->TransportIdleTimeout()
+                    : std::chrono::seconds{0};
                 auto handed = co_await net::co_spawn(
                     *owner_reactor,
                     [owner_reactor, detached = std::move(*detached),
-                     cfg, xhttp_cfg, conn_id,
-                     stream_handler]() mutable -> net::awaitable<tl::expected<void, ErrorCode>> {
+                     cfg, xhttp_cfg, conn_id, has_stream_handler,
+                     handshake_timeout, idle_timeout]() mutable
+                        -> net::awaitable<tl::expected<void, ErrorCode>> {
                         auto restored = RestoreXHttpStream(*owner_reactor, std::move(detached));
                         if (!restored) co_return tl::unexpected(ErrorCode::SOCKET_READ_FAILED);
-                        if (stream_handler) stream_handler->OnInboundTransportRequest(*restored);
+                        std::shared_ptr<InboundTransportStreamHandler> local_handler;
+                        if (has_stream_handler) {
+                            local_handler = memory::AllocateShared<UploadTransportStreamHandler>(
+                                handshake_timeout, idle_timeout);
+                            local_handler->OnInboundTransportRequest(*restored);
+                        }
                         auto result = co_await DoXHttp1ServerHandshake(
                             *owner_reactor, std::move(restored), cfg, xhttp_cfg,
-                            conn_id, nullptr, {}, stream_handler);
+                            conn_id, nullptr, {}, local_handler);
+                        local_handler.reset();
                         if (!result) co_return tl::unexpected(result.error());
+                        if (*result) co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
                         co_return tl::expected<void, ErrorCode>{};
                     },
                     net::use_awaitable);
                 if (!handed) co_return tl::unexpected(handed.error());
                 co_return std::unique_ptr<AsyncStream>{};
             }
+            resolved_session = std::move(resolution.session);
         }
         if (meta.kind == XHttpRequestMeta::Kind::PacketUp) {
-            if (!xhttp_cfg.AcceptsPacketUp()) {
-                co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
-            }
-            auto session = co_await GetXHttpPacketSession(
-                io_context, xhttp_cfg.session_namespace, meta.session_id, XHttpSessionAccess::Upload);
+            auto session = std::move(resolved_session);
             const auto* content_length = std::get_if<Http1BodyContentLength>(&*body_framing);
             if (!content_length) {
                 // The chunked decoder buffers past the body's last chunk, so
@@ -1820,11 +1915,7 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
         }
 
         if (meta.kind == XHttpRequestMeta::Kind::StreamUp) {
-            if (!xhttp_cfg.AcceptsStreamUp()) {
-                co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
-            }
-            auto session = co_await GetXHttpPacketSession(
-                io_context, xhttp_cfg.session_namespace, meta.session_id, XHttpSessionAccess::Open);
+            auto session = std::move(resolved_session);
             if (!session || !session->CanAttachStream()) {
                 co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
             }

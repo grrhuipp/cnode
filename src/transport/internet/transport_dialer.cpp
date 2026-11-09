@@ -199,10 +199,6 @@ public:
         }
     }
 
-    transport::CancellationSource& Cancellation() noexcept override {
-        return cancellation_;
-    }
-
     void Close() override {
         CloseImpl(false);
     }
@@ -235,11 +231,11 @@ protected:
     }
 
     void NotifyCancellation(ErrorCode reason = ErrorCode::CANCELLED) noexcept {
-        cancellation_.CancelPending(reason);
+        Cancellation().CancelPending(reason);
     }
 
     void NotifyClosed(ErrorCode reason = ErrorCode::CANCELLED) noexcept {
-        cancellation_.Stop(reason);
+        Cancellation().Stop(reason);
     }
 
     void TouchDownlinkActivity() noexcept {
@@ -248,9 +244,6 @@ protected:
                 tcp->TouchActivity();
             }
         }
-    }
-    net::io_context& CurrentIoContext() const noexcept {
-        return io_context_;
     }
 
     virtual void CloseUpload(bool /*abortive*/) {}
@@ -316,7 +309,6 @@ protected:
     OutboundDialCandidate candidate_;
     memory::ThreadLocalString upload_path_;
     transport::internet::AsyncWriteGate upload_gate_;
-    transport::CancellationSource cancellation_;
     DownlinkCancellation downlink_cancel_{*this};
     std::chrono::seconds write_timeout_{0};
     uint64_t conn_id_ = 0;
@@ -623,7 +615,7 @@ private:
             ~OpeningScope() { opening = false; }
         } opening_scope{upload_opening_};
 
-        auto tcp_result = co_await DialSingleCandidate(CurrentIoContext(), target_, candidate_);
+        auto tcp_result = co_await DialSingleCandidate(io_context_, target_, candidate_);
         if (!tcp_result.Ok()) {
             if (tcp_result.error == ErrorCode::DIAL_TIMEOUT) {
                 upload_write_expired_ = true;
@@ -776,7 +768,7 @@ private:
         (void)ec;  // 20 digits always fit a uint64_t.
         path.append(seq_text.data(), static_cast<size_t>(seq_end - seq_text.data()));
 
-        auto tcp_result = co_await DialSingleCandidate(CurrentIoContext(), target_, candidate_);
+        auto tcp_result = co_await DialSingleCandidate(io_context_, target_, candidate_);
         if (!tcp_result.Ok()) {
             if (tcp_result.error == ErrorCode::DIAL_TIMEOUT) {
                 upload_write_expired_ = true;

@@ -19,8 +19,7 @@ uint64_t CpuNs() {
 
 TEST(ShadowsocksIdentityBenchmark, AuthenticationMatrix) {
     memory::ConfigureProcessAllocator();
-    memory::AllocationDomain domain;
-    memory::ScopedAllocationDomain lease(domain);
+    const auto baseline = memory::ThreadMemoryPool().OutstandingAllocations();
     const size_t iterations = [] {
         const char* value = std::getenv("CNODE_BENCH_ITERATIONS");
         return value ? std::max(size_t{1}, static_cast<size_t>(std::stoull(value))) : size_t{512};
@@ -71,7 +70,9 @@ TEST(ShadowsocksIdentityBenchmark, AuthenticationMatrix) {
                             auto result = Authenticate(io, wire, cipher, hint);
                             Require(bool(result));
                             Require(result->user->profile.user_id == users[position].profile.user_id);
-                            live_peak = std::max(live_peak, domain.OutstandingAllocations());
+                            live_peak = std::max(
+                                live_peak,
+                                memory::ThreadMemoryPool().OutstandingAllocations() - baseline);
                         }
                         const auto finish = std::chrono::steady_clock::now();
                         cpu_ns += CpuNs() - cpu_start;
@@ -100,6 +101,6 @@ TEST(ShadowsocksIdentityBenchmark, AuthenticationMatrix) {
             UserStore::ClearWorkerView();
         }
     }
-    EXPECT_EQ(domain.OutstandingAllocations(), 0u);
+    EXPECT_EQ(memory::ThreadMemoryPool().OutstandingAllocations(), baseline);
 }
 } // namespace

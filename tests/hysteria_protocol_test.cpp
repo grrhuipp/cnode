@@ -25,11 +25,7 @@ constexpr uint8_t kV2SinglePacket[]{
     'e', 'x', 'a', 'm', 'p', 'l', 'e', '.', 'c', 'o', 'm', ':', '5', '3',
     'd', 'n', 's'};
 
-class HysteriaProtocol : public ::testing::Test {
-private:
-    memory::AllocationDomain domain_;
-    memory::ScopedAllocationDomain lease_{domain_};
-};
+class HysteriaProtocol : public ::testing::Test {};
 
 TEST_F(HysteriaProtocol, V1HelloAndTcpRequest) {
     const std::vector<uint8_t> hello{

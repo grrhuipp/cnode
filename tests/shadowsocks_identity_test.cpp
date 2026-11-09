@@ -8,8 +8,6 @@ namespace {
 using namespace ss_identity_test;
 class ShadowsocksIdentity : public testing::Test {
 protected:
-    memory::AllocationDomain domain;
-    memory::ScopedAllocationDomain lease{domain};
     net::io_context io;
     void TearDown() override { UserStore::ClearWorkerView(); }
 };

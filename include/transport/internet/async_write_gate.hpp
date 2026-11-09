@@ -81,8 +81,6 @@ public:
         while (busy_ && !cancelled_) {
             if (!signal_) {
                 auto executor = co_await net::this_coro::executor;
-                std::optional<memory::ScopedAllocationDomain> scope;
-                if (allocation_domain_) scope.emplace(*allocation_domain_);
                 signal_.emplace(std::move(executor), 1);
             }
             ++waiters_;
@@ -149,7 +147,6 @@ private:
         }
     }
 
-    memory::AllocationDomain* allocation_domain_ = memory::CurrentAllocationDomain();
     std::optional<SignalChannel> signal_;
     std::size_t waiters_ = 0;
     bool busy_ = false;

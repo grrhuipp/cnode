@@ -1,14 +1,13 @@
 #include "app/bootstrap_setup.hpp"
 #include "startup_inbounds.hpp"
 
-#include "app/bootstrap_inbounds.hpp"
-#include "app/bootstrap_panels.hpp"
+#include "api/panel_factory.hpp"
 #include "app/bootstrap_runtime.hpp"
 #include "app/dns/dns.hpp"
 #include "app/dns/dns_worker.hpp"
 #include "infra/config.hpp"
+#include "infra/panel_config.hpp"
 #include "app/proxyman/inbound/user_store.hpp"
-#include "app/runtime_publication.hpp"
 #include "proxyman/outbound/registration.hpp"
 #include "app/worker.hpp"
 #include "app/session_group_executor.hpp"
@@ -18,9 +17,6 @@
 #include "app/stats.hpp"
 #include "geo/geodata.hpp"
 #include "transport/internet/tls_stream.hpp"
-
-#include <asio/co_spawn.hpp>
-#include <asio/use_future.hpp>
 
 #include <algorithm>
 #include <filesystem>
@@ -126,6 +122,36 @@ WorkerRuntimeConfig MakeWorkerRuntimeConfig(
     return runtime_config;
 }
 
+void SetupPanels(net::io_context& main_ctx,
+                 Controller& controller,
+                 const Config& config,
+                 app::dns::DNS& panel_dns_service) {
+    if (config.panels.empty()) {
+        return;
+    }
+
+    for (const auto& panel_config : config.panels) {
+        for (int node_id : panel_config.NodeIDs.Values()) {
+            api::Config api_config;
+            api_config.Name = panel_config.Name;
+            api_config.APIHost = panel_config.APIHost;
+            api_config.Key = panel_config.Key;
+            api_config.RequestTimeout = panel_config.RequestTimeout;
+            api_config.NodeID = node_id;
+            api_config.NodeType = panel_config.NodeType;
+
+            PanelConfig node_panel_config = panel_config;
+            node_panel_config.NodeIDs = PanelNodeIds::Single(node_id);
+
+            auto panel = api::CreatePanelClient(main_ctx, api_config, panel_dns_service);
+            controller.AddPanel(std::move(panel), node_panel_config);
+            const PanelLogContext log_context{panel_config.Name, panel_config.APIHost,
+                node_id, panel_config.NodeType};
+            LOG_PANEL_INFO(log_context, "Panel node configured");
+        }
+    }
+}
+
 }  // namespace
 
 WorkerPool CreateWorkerPool(const WorkerRuntimeConfig& runtime_config,
@@ -183,17 +209,9 @@ BootstrapEnvironment CreateBootstrapEnvironment(
         user_updates.push_back({inbound.binding.tag, *inbound.users});
     }
     const auto previous_users = proxyman::inbound::UserStore::CaptureSnapshot();
-    {
-        constexpr bool kNotStopping = false;
-        std::optional<UserPublicationRollback> rollback;
-        net::io_context publication_ctx;
-        auto published = net::co_spawn(publication_ctx,
-            PublishUsers(publication_ctx.get_executor(), {},
-                proxyman::inbound::UserStore::PrepareUsers(user_updates),
-                rollback, kNotStopping),
-            net::use_future);
-        publication_ctx.run();
-        published.get();
+    if (!user_updates.empty()) {
+        proxyman::inbound::UserStore::CommitSnapshot(
+            proxyman::inbound::UserStore::PrepareUsers(user_updates));
     }
     try {
         env.worker_pool = CreateWorkerPool(

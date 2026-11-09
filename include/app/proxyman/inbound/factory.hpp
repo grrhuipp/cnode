@@ -18,6 +18,7 @@ struct InboundProtocolSettings;
 struct InboundUserSpec;
 struct StatsShard;
 
+class UserOnlineTracker;
 
 namespace proxyman::inbound {
 
@@ -48,6 +49,10 @@ public:
 
     [[nodiscard]] virtual std::vector<::OnlineDevice>
     GetOnlineDevices(std::string_view tag) const = 0;
+
+    [[nodiscard]] virtual ::UserOnlineTracker* OnlineTracker() noexcept {
+        return nullptr;
+    }
 };
 
 // ============================================================================

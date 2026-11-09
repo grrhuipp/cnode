@@ -49,12 +49,6 @@ HandlerRegistry::HandlerPtr HandlerRegistry::GetHandler(std::string_view tag) no
     return it == impl_->handlers.end() ? nullptr : it->second;
 }
 
-std::shared_ptr<const Handler>
-HandlerRegistry::GetHandler(std::string_view tag) const noexcept {
-    auto it = impl_->handlers.find(tag);
-    return it == impl_->handlers.end() ? nullptr : it->second;
-}
-
 std::unique_ptr<::Inbound> HandlerRegistry::NewHandler(
     ::ConnectionLimiter* limiter,
     const BuildRequest& req) {

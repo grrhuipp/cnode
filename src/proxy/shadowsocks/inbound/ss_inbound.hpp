@@ -22,9 +22,6 @@ public:
             ::ConnectionLimiter* limiter,
             ::ss::SsCipherInfo cipher_info);
 
-    void AdoptWorkerStateFrom(
-        ::Inbound& previous) noexcept override;
-
     // 解析首包：读 salt + 首 chunk，尝试所有用户密钥，解析 SOCKS5 地址
     ::net::awaitable<::RelayResult> Process(
         std::unique_ptr<::AsyncStream> stream,

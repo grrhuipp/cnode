@@ -119,7 +119,6 @@ public:
     // 注销监听与 handler；等待 UDP 原生分发任务实际结束后才返回。
     net::awaitable<void> UnregisterListenerTask(std::string tag);
 
-    void UpdateRule(std::string_view tag, std::vector<rule::DetectRule> rules);
     void UpdateRule(std::string_view tag, std::shared_ptr<const std::vector<rule::DetectRule>> rules);
     void InstallUserView(proxyman::inbound::UserStore::WorkerView view);
 

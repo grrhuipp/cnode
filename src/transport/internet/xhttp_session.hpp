@@ -146,6 +146,11 @@ enum class XHttpSessionAccess : uint8_t {
     Upload,
 };
 
+struct XHttpSessionOwnerResolution {
+    net::io_context* owner = nullptr;
+    std::shared_ptr<XHttpPacketUpSession> session;
+};
+
 // Configuration namespace + id select an execution domain, then Join unifies
 // the physical connection groups before touching that domain's session table.
 // Retirement is allocation-free and reserves its own metadata queue node;

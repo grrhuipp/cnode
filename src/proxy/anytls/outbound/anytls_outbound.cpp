@@ -11,7 +11,6 @@
 #include "../../uot/uot.hpp"
 #include "transport/internet/async_write_gate.hpp"
 #include "app/dns/dns.hpp"
-#include "app/session_group_executor.hpp"
 #include "app/relay.hpp"
 #include "app/stats.hpp"
 #include "common/allocator.hpp"
@@ -28,7 +27,6 @@
 #include "transport/link_error.hpp"
 
 #include <asio/experimental/channel.hpp>
-#include <asio/dispatch.hpp>
 #include <openssl/crypto.h>
 #include <algorithm>
 #include <chrono>
@@ -70,24 +68,16 @@ ErrorCode SessionExceptionError(const std::exception_ptr& failure,
 }
 
 
-template <class T, class... Args>
-[[nodiscard]] std::shared_ptr<T> AllocateWorkerShared(Args&&... args) {
-    memory::ScopedWorkerAllocation worker_allocation;
-    return memory::AllocateShared<T>(std::forward<Args>(args)...);
-}
-
 }  // namespace
 
 // The cache host alone publishes and reads the next-handshake snapshot. Each
 // physical reader awaits its control update (at most one outstanding per
 // session); it never forwards payload or changes another session's scheme.
 struct Handler::PaddingState {
-    explicit PaddingState(net::io_context& io) : executor(io.get_executor()) {}
     void Publish(std::shared_ptr<const PaddingScheme> next) noexcept {
         scheme = std::move(next);
     }
 
-    const net::any_io_executor executor;
     std::shared_ptr<const PaddingScheme> scheme{DefaultPaddingScheme()};
 };
 
@@ -248,7 +238,6 @@ struct Handler::ClientSession : memory::ThreadAllocated {
         , padding_state_(std::move(padding_state))
         , opening_scheme_(std::move(opening_scheme))
         , scheme_(opening_scheme_)
-        , allocation_domain(memory::CurrentAllocationDomain())
         , local_endpoint(stream->LocalEndpoint())
         , remote_endpoint(stream->RemoteEndpoint()) {}
 
@@ -259,7 +248,6 @@ struct Handler::ClientSession : memory::ThreadAllocated {
     // Releasing it also records that settings have been sent successfully.
     std::shared_ptr<const PaddingScheme> opening_scheme_;
     std::shared_ptr<const PaddingScheme> scheme_;
-    memory::AllocationDomain* const allocation_domain = nullptr;
     const std::optional<tcp::endpoint> local_endpoint;
     const std::optional<tcp::endpoint> remote_endpoint;
     uint32_t next_sid = 1;
@@ -306,8 +294,6 @@ struct Handler::ClientSession : memory::ThreadAllocated {
     }
 
     std::shared_ptr<LogicalStream> RegisterLogicalStream(uint32_t sid) {
-        std::optional<memory::ScopedAllocationDomain> scope;
-        if (allocation_domain) scope.emplace(*allocation_domain);
         auto logical = memory::AllocateShared<LogicalStream>(
             net::any_io_executor(io_context_.get_executor()));
         logical_streams[sid] = logical;
@@ -517,11 +503,8 @@ struct Handler::ClientSession : memory::ThreadAllocated {
                                 co_return;
                             }
                             if (auto parsed = ParsePaddingScheme(*text)) {
-                                scheme_ = AllocateWorkerShared<const PaddingScheme>(std::move(*parsed));
-                                net::dispatch(padding_state_->executor,
-                                    [state = padding_state_, next = scheme_]() mutable noexcept {
-                                        state->Publish(std::move(next));
-                                    });
+                                scheme_ = memory::AllocateShared<const PaddingScheme>(std::move(*parsed));
+                                padding_state_->Publish(scheme_);
                             }
                         }
                         break;
@@ -665,7 +648,7 @@ public:
             if (!state_ || !session_) return;
             auto state = std::move(state_);
             auto session = std::move(session_);
-            if (reusable_) state->Release(session, 0);
+            if (reusable_) state->Release(session);
             else state->Remove(session);
         }
         std::shared_ptr<State> state_;
@@ -676,19 +659,18 @@ public:
     SessionPool(net::io_context& io_context, AwaitableTaskGroup& tasks,
                 Clock::duration check_interval, Clock::duration idle_timeout,
                 size_t minimum_idle, std::string_view tag)
-        : state_(AllocateWorkerShared<State>(io_context, tasks, check_interval,
-                                             idle_timeout, minimum_idle, tag)) {}
+        : state_(memory::AllocateShared<State>(io_context, tasks, check_interval,
+                                               idle_timeout, minimum_idle, tag)) {}
     SessionPool(const SessionPool&) = delete;
     SessionPool& operator=(const SessionPool&) = delete;
     ~SessionPool() noexcept { state_->Retire(); }
-    [[nodiscard]] net::any_io_executor Executor() const { return state_->executor; }
 
     template<class Accept>
-    [[nodiscard]] Lease AcquireIf(uint32_t worker, Accept&& accept) {
+    [[nodiscard]] Lease AcquireIf(Accept&& accept) {
         state_->CheckActive();
         state_->Prune();
         for (auto it = state_->entries.rbegin(); it != state_->entries.rend(); ++it) {
-            if (it->worker == worker && it->idle_since && accept(*it->session)) {
+            if (it->idle_since && accept(*it->session)) {
                 it->idle_since.reset();
                 return Lease(state_, it->session);
             }
@@ -696,8 +678,8 @@ public:
         return {};
     }
 
-    [[nodiscard]] Lease Acquire(uint32_t worker) {
-        return AcquireIf(worker, [](const ClientSession&) { return true; });
+    [[nodiscard]] Lease Acquire() {
+        return AcquireIf([](const ClientSession&) { return true; });
     }
 
     [[nodiscard]] Lease Adopt(std::shared_ptr<ClientSession> session) {
@@ -706,7 +688,7 @@ public:
             if (!session) {
                 throw std::invalid_argument("cannot adopt a closed AnyTLS session");
             }
-            state_->entries.push_back({session, std::nullopt, 0});
+            state_->entries.push_back({session, std::nullopt});
             if (!state_->Valid()) state_->Schedule();
             state_->Start(session);
             return Lease(state_, std::move(session));
@@ -721,13 +703,12 @@ private:
         struct Entry {
             std::shared_ptr<ClientSession> session;
             std::optional<Clock::time_point> idle_since;
-            uint32_t worker;
         };
 
         State(net::io_context& io_context, AwaitableTaskGroup& owner_tasks,
               Clock::duration check, Clock::duration timeout,
               size_t minimum, std::string_view name)
-            : TimeoutEvent(io_context), executor(io_context.get_executor()),
+            : TimeoutEvent(io_context),
               tasks(owner_tasks),
               check_interval(check), idle_timeout(timeout),
               minimum_idle(minimum), tag(name) {
@@ -787,14 +768,13 @@ private:
             }
         }
 
-        void Release(const std::shared_ptr<ClientSession>& session, uint32_t worker) noexcept {
+        void Release(const std::shared_ptr<ClientSession>& session) noexcept {
             auto it = std::find_if(entries.begin(), entries.end(),
                 [&](const auto& entry) { return entry.session == session; });
             if (retired || it == entries.end()) {
                 Remove(session);
                 return;
             }
-            it->worker = worker;
             it->idle_since = Clock::now();
             // Keep most recently returned idle sessions at the back, without
             // allocating a second list or changing the ownership count.
@@ -860,7 +840,6 @@ private:
             for (const auto& entry : closing) Close(entry.session);
         }
 
-        const net::any_io_executor executor;
         AwaitableTaskGroup& tasks;
         const Clock::duration check_interval;
         const Clock::duration idle_timeout;
@@ -1042,7 +1021,7 @@ Handler::Handler(std::string_view tag,
                  AwaitableTaskGroup& tasks)
     : tag_(tag)
     , settings_(std::move(settings))
-    , padding_(AllocateWorkerShared<PaddingState>(io_context))
+    , padding_(memory::AllocateShared<PaddingState>())
     , pool_(std::make_unique<SessionPool>(
           io_context, tasks, settings_->idle_session_check_interval,
           settings_->idle_session_timeout, settings_->min_idle_sessions, tag_)) {}
@@ -1072,7 +1051,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     try {
         opening_scheme = padding_->scheme;
         transport_lease = ordered_bind
-            ? pool_->AcquireIf(0, [&](const ClientSession& physical) {
+            ? pool_->AcquireIf([&](const ClientSession& physical) {
                 const auto& remote = physical.remote_endpoint;
                 const auto& local = physical.local_endpoint;
                 if (!remote || !local) return false;
@@ -1081,7 +1060,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
                 return !selected.address ||
                     iputil::NormalizeAddress(local->address()) == *selected.address;
             })
-            : pool_->Acquire(0);
+            : pool_->Acquire();
         session = transport_lease.Get();
         if (!session) {
             auto dialed = co_await DialPhysicalSession(dialer, *settings_,
@@ -1090,15 +1069,8 @@ net::awaitable<OutboundProcessResult> Handler::Process(
             if (!dialed) {
                 result = tl::unexpected(dialed.error());
             } else {
-                auto* raw_session = new ClientSession(
+                session = memory::AllocateShared<ClientSession>(
                     dialer.IoContext(), std::move(*dialed), padding_, std::move(opening_scheme));
-                {
-                    memory::ScopedWorkerAllocation worker_allocation;
-                    session = std::shared_ptr<ClientSession>(
-                        raw_session,
-                        [](ClientSession* value) noexcept { delete value; },
-                        memory::ThreadLocalAllocator<ClientSession>{});
-                }
                 transport_lease = pool_->Adopt(session);
             }
         }
@@ -1218,7 +1190,6 @@ net::awaitable<OutboundProcessResult> Handler::ProcessSession(
                 }
                 throw transport::LinkError(payload.error());
             }
-            payload->Adopt();
             if (is_udp) {
                 for (auto* buffer : *payload) {
                     if (buffer && !buffer->IsEmpty()) {

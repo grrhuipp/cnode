@@ -326,10 +326,6 @@ OutboundDialer::OutboundDialer(net::io_context& io_context,
     , security_(sender.stream_settings, StreamEndpointRole::Outbound)
     , timeout_(timeout) {}
 
-net::io_context& OutboundDialer::IoContext() const noexcept {
-    return io_context_;
-}
-
 ForwardedMetadataView OutboundDialer::ForwardedMetadata(
     const session::Context& ctx) const noexcept {
     return sender_.passthrough ? ctx.inbound.MakeForwardedMetadata()

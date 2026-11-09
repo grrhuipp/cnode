@@ -23,21 +23,13 @@ struct Context;
 
 using ID = uint64_t;
 
-[[nodiscard]] inline std::pmr::memory_resource* SessionPoolResource() noexcept {
-    static memory::ThreadMemoryResource fallback_resource;
-    auto* resource = memory::CurrentResource();
-    return resource != std::pmr::new_delete_resource()
-        ? resource
-        : &fallback_resource;
-}
-
 // 高 32 位为 worker_id，低 32 位为 Worker 线程本地序号，避免全局原子计数器的跨线程争用。
 [[nodiscard]] ID NewID(uint32_t worker_id) noexcept;
 
 // xray-core common/session.Inbound 对应的连接入站元数据。
 // 配置标签、协议与安全方式在会话中按值保存在 Worker 本地 PMR 存储。
 struct Inbound {
-    Inbound() : Inbound(SessionPoolResource()) {}
+    Inbound() : Inbound(memory::CurrentResource()) {}
     explicit Inbound(std::pmr::memory_resource* resource)
         : source_ip(resource)
         , client_ip_source("socket", resource)
@@ -165,7 +157,7 @@ struct Outbound {
 
 // xray-core common/session.Content 对应的内容元数据。
 struct Content {
-    Content() : Content(SessionPoolResource()) {}
+    Content() : Content(memory::CurrentResource()) {}
     explicit Content(std::pmr::memory_resource* resource)
         : protocol(resource) {}
     Network network = Network::TCP;

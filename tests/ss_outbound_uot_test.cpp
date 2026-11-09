@@ -9,7 +9,7 @@
 
 namespace {
 
-using ::SsUotVersion;
+using UotVersion = ::proxy::uot::Version;
 
 [[noreturn]] void Fail(std::string_view message) {
     std::cerr << message << '\n';
@@ -40,16 +40,16 @@ TEST(SsOutboundUot, ValidFormsAreNormalized) {
 
     auto default_version = Parse(R"({"uot":true})");
     Check(default_version.has_value() &&
-              *default_version == SsUotVersion::V2,
+              *default_version == UotVersion::V2,
           "boolean UoT did not default to v2");
 
     auto v1 = Parse(R"({"uot":true,"uotVersion":1})");
-    Check(v1.has_value() && *v1 == SsUotVersion::V1,
+    Check(v1.has_value() && *v1 == UotVersion::V1,
           "boolean UoT v1 mismatch");
 
     auto object = Parse(
         R"({"uot":{"enabled":true,"version":2}})");
-    Check(object.has_value() && *object == SsUotVersion::V2,
+    Check(object.has_value() && *object == UotVersion::V2,
           "object UoT v2 mismatch");
 }
 

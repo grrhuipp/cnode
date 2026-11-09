@@ -9,22 +9,13 @@
 #include <sys/eventfd.h>
 #include <unistd.h>
 #include <cerrno>
+#include <algorithm>
 #include <atomic>
-#include <mutex>
 #include <stdexcept>
 #include <system_error>
+#include <vector>
 
 namespace {
-
-// Cold-published immutable routes live until coordinator retirement. No
-// published node is removed or mutated, so readers need no lock.
-struct WorkerRoute {
-    GroupCoordinator::WorkerTarget target;
-    WorkerRoute* next = nullptr;
-    explicit WorkerRoute(GroupCoordinator::WorkerTarget value)
-        : target(std::move(value)) {}
-};
-
 class WorkerCoordinatorService final : public net::execution_context::service {
 public:
     static net::execution_context::id id;
@@ -33,28 +24,23 @@ public:
 
     void Bind(std::weak_ptr<GroupCoordinator> coordinator,
               std::optional<uint32_t> worker_id) {
-        const std::lock_guard<std::mutex> lock(mutex_);
         coordinator_ = std::move(coordinator);
         worker_id_ = worker_id;
     }
 
     [[nodiscard]] GroupCoordinator* Coordinator() const noexcept {
-        const std::lock_guard<std::mutex> lock(mutex_);
         return coordinator_.lock().get();
     }
 
     [[nodiscard]] std::optional<uint32_t> WorkerId() const noexcept {
-        const std::lock_guard<std::mutex> lock(mutex_);
         return worker_id_;
     }
 
 private:
     void shutdown() override {
-        const std::lock_guard<std::mutex> lock(mutex_);
         coordinator_.reset();
     }
 
-    mutable std::mutex mutex_;
     std::weak_ptr<GroupCoordinator> coordinator_;
     std::optional<uint32_t> worker_id_;
 };
@@ -78,29 +64,8 @@ struct GroupCoordinator::ReservedState {
     std::atomic<bool> started{false};
     bool stopping = false;
     bool joined = false;
-    std::atomic<WorkerRoute*> routes{nullptr};
+    std::vector<const net::io_context*> workers;
     std::atomic<uint32_t> worker_count{0};
-    ~ReservedState() {
-        auto* route = routes.load(std::memory_order_relaxed);
-        while (route) {
-            auto* next = route->next;
-            delete route;
-            route = next;
-        }
-    }
-    static WorkerRoute* FindRoute(WorkerRoute* first,
-                                  const GroupCoordinator::WorkerTarget& target) {
-        if (!target.reactor || !target.executor)
-            throw std::invalid_argument("worker registration requires a valid reactor and executor");
-        for (auto* route = first; route; route = route->next) {
-            if (route->target.worker_id != target.worker_id) continue;
-            if (route->target.reactor != target.reactor ||
-                route->target.executor != target.executor)
-                throw std::invalid_argument("worker route changed within coordinator");
-            return route;
-        }
-        return nullptr;
-    }
 };
 
 GroupCoordinator::GroupCoordinator(net::io_context& io, size_t capacity)
@@ -124,42 +89,15 @@ void GroupCoordinator::Start() {
     net::post(reactor_, [self = shared_from_this()] { self->EnsureStarted(); });
 }
 
-void GroupCoordinator::RegisterWorker(uint32_t worker_id, net::io_context& reactor,
-                                      net::any_io_executor executor) {
+void GroupCoordinator::RegisterWorker(uint32_t worker_id, net::io_context& reactor) {
     net::use_service<WorkerCoordinatorService>(reactor).Bind(weak_from_this(), worker_id);
     net::use_service<WorkerCoordinatorService>(reactor_).Bind(weak_from_this(), std::nullopt);
-    WorkerTarget target{worker_id, &reactor, std::move(executor)};
-    auto* previous = reserved_->routes.load(std::memory_order_acquire);
-    std::unique_ptr<WorkerRoute> candidate;
-    for (;;) {
-        if (ReservedState::FindRoute(previous, target)) return;
-        if (!candidate) candidate = std::make_unique<WorkerRoute>(target);
-        candidate->next = previous;
-        if (reserved_->routes.compare_exchange_weak(previous, candidate.get(),
-                std::memory_order_release, std::memory_order_acquire)) {
-            (void)candidate.release();
-            reserved_->worker_count.fetch_add(1, std::memory_order_release);
-            return;
-        }
+    if (std::find(reserved_->workers.begin(), reserved_->workers.end(), &reactor) !=
+        reserved_->workers.end()) {
+        return;
     }
-}
-
-std::optional<GroupCoordinator::WorkerTarget> GroupCoordinator::FindWorker(
-    uint32_t worker_id) const noexcept {
-    for (auto* route = reserved_->routes.load(std::memory_order_acquire);
-         route; route = route->next) {
-        if (route->target.worker_id == worker_id) return route->target;
-    }
-    return std::nullopt;
-}
-
-std::optional<uint32_t> GroupCoordinator::FindWorkerId(
-    const net::io_context& reactor) const noexcept {
-    for (auto* route = reserved_->routes.load(std::memory_order_acquire);
-         route; route = route->next) {
-        if (route->target.reactor == &reactor) return route->target.worker_id;
-    }
-    return std::nullopt;
+    reserved_->workers.push_back(&reactor);
+    reserved_->worker_count.fetch_add(1, std::memory_order_release);
 }
 
 uint32_t GroupCoordinator::WorkerCount() const noexcept {

@@ -2,6 +2,7 @@
 
 #include "proxy/outbound.hpp"
 #include "ss_outbound_credentials.hpp"
+#include "../../uot/uot.hpp"
 #include "transport/internet/outbound_sender.hpp"
 
 #include <chrono>
@@ -16,14 +17,9 @@
 // ============================================================================
 // SS Outbound 配置
 // ============================================================================
-enum class SsUotVersion : uint8_t {
-    V1 = 1,
-    V2 = 2,
-};
-
 struct SsOutboundConfig {
     OutboundServer server;
-    std::optional<SsUotVersion> uot_version;
+    std::optional<proxy::uot::Version> uot_version;
 };
 
 // ============================================================================

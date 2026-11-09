@@ -40,10 +40,6 @@ class Inbound : public memory::ThreadAllocated {
 public:
     virtual ~Inbound() noexcept = default;
 
-    // Worker-local protocol state may be transferred during an atomic handler
-    // replacement. Live sessions keep the state they already captured.
-    virtual void AdoptWorkerStateFrom(Inbound&) noexcept {}
-
     // -----------------------------------------------------------------------
     // 从已建立的传输流中解析协议头，并移交给 dispatcher。
     //

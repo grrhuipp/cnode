@@ -9,7 +9,7 @@
 
 namespace proxy::shadowsocks::outbound {
 
-[[nodiscard]] tl::expected<std::optional<SsUotVersion>, std::string>
+[[nodiscard]] tl::expected<std::optional<proxy::uot::Version>, std::string>
 ParseUotVersion(const json::object& source);
 
 }  // namespace proxy::shadowsocks::outbound

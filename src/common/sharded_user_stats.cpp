@@ -99,19 +99,6 @@ net::awaitable<std::optional<UserOnlineSessionGuard>> UserOnlineTracker::TryConn
     auto* coordinator = GroupCoordinator::ForContext(
         net::query(executor, net::execution::context));
     if (!coordinator) throw std::logic_error("user admission requires a registered coordinator");
-    co_return co_await TryConnectSession(
-        *coordinator, tag, user_id, client_ip, device_limit);
-}
-
-net::awaitable<std::optional<UserOnlineSessionGuard>> UserOnlineTracker::TryConnectSession(
-    GroupCoordinator& coordinator,
-    std::string_view tag,
-    int64_t user_id,
-    std::string_view client_ip,
-    uint32_t device_limit) {
-    if (user_id <= 0 || client_ip.empty()) {
-        co_return std::optional<UserOnlineSessionGuard>(std::in_place);
-    }
     std::string owned_tag(tag);
     std::string owned_client_ip(client_ip);
     const auto uid = static_cast<uint64_t>(user_id);
@@ -121,12 +108,12 @@ net::awaitable<std::optional<UserOnlineSessionGuard>> UserOnlineTracker::TryConn
     auto reservation = std::make_shared<DeviceReservation>();
     reservation->node = std::make_unique<DeviceReturn>();
     auto& node = *reservation->node;
-    node.coordinator = &coordinator;
+    node.coordinator = coordinator;
     node.tag = std::move(owned_tag);
     node.ip = std::move(owned_client_ip);
     node.user = uid;
     guard->quota_reservation_ = reservation;
-    const bool admitted = co_await coordinator.PostCall(
+    const bool admitted = co_await coordinator->PostCall(
         [reservation, device_limit] {
             auto& node = *reservation->node;
             node.quota = net::use_service<DeviceQuotaService>(
@@ -156,7 +143,6 @@ net::awaitable<std::optional<UserOnlineSessionGuard>> UserOnlineTracker::TryConn
             return true;
         });
     if (!admitted) co_return std::nullopt;
-    memory::ScopedWorkerAllocation worker_allocation;
     auto tag_it = impl_->devices.find(node.tag);
     bool tag_inserted = false;
     if (tag_it == impl_->devices.end()) {

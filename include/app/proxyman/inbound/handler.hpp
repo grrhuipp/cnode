@@ -35,21 +35,9 @@ class Handler final
     : public memory::ThreadAllocated
     , public std::enable_shared_from_this<Handler> {
 public:
-    // Plain cold inputs for building the protocol handler on first use.
-    struct LazyProtocol {
-        std::shared_ptr<const BuildRequest> prepared;
-        StatsShard* stats = nullptr;
-        ConnectionLimiter* limiter = nullptr;
-    };
     // Prepared TransportSecurity is shared; SSL contexts are never rebuilt for
     // each short HTTP packet upload.
     Handler(inbound::ReceiverSettings receiver, std::unique_ptr<Inbound> proxy,
-            ConnectionLimiter& limiter);
-    Handler(std::shared_ptr<const inbound::ReceiverSettings> receiver,
-            std::unique_ptr<Inbound> proxy,
-            ConnectionLimiter& limiter);
-    Handler(std::shared_ptr<const inbound::ReceiverSettings> receiver,
-            LazyProtocol lazy,
             ConnectionLimiter& limiter);
 
     Handler(const Handler&) = delete;
@@ -95,12 +83,6 @@ public:
         const session::Context& session_ctx,
         std::shared_ptr<ConnectionLimiter::Family> family);
 
-    // Null until a lazily built protocol has handled its first request.
-    [[nodiscard]] const ProtocolRuntime* Runtime() const noexcept {
-        return runtime_.get();
-    }
-    // Releases lazily built protocol state; the caller has joined all requests.
-    void ReleaseProtocol() noexcept;
 
 private:
     class LogicalTransportStreamSink;
@@ -119,8 +101,6 @@ private:
 
     std::shared_ptr<const inbound::ReceiverSettings> receiver_;
     TransportSecurity security_;
-    LazyProtocol lazy_;
-    std::unique_ptr<ProtocolRuntime> runtime_;
     std::unique_ptr<Inbound> proxy_;
     ConnectionLimiter& limiter_;
 };

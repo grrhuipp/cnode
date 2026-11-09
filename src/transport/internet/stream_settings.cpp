@@ -89,30 +89,12 @@ void NormalizeInPlace(StreamSettings& settings) {
         settings.security_mode = SecurityMode::Unsupported;
     }
 
-    settings.flags = kFlagNone;
-    if (settings.network_mode == NetworkMode::Ws) {
-        settings.flags |= kFlagWs;
-    }
-    if (settings.network_mode == NetworkMode::HttpUpgrade) {
-        settings.flags |= kFlagHttpUpgrade;
-    }
     if (settings.network_mode == NetworkMode::Grpc) {
-        settings.flags |= kFlagGrpc;
         settings.network = std::string(constants::protocol::kGrpc);
-    }
-    if (settings.network_mode == NetworkMode::Http) {
-        settings.flags |= kFlagHttp;
+    } else if (settings.network_mode == NetworkMode::Http) {
         settings.network = settings.http.force_http2 ? "h2" : std::string(constants::protocol::kHttp);
-    }
-    if (settings.network_mode == NetworkMode::XHttp) {
-        settings.flags |= kFlagXHttp;
+    } else if (settings.network_mode == NetworkMode::XHttp) {
         settings.network = std::string(constants::protocol::kXHttp);
-    }
-    if (settings.security_mode == SecurityMode::Tls) {
-        settings.flags |= kFlagTls;
-    }
-    if (settings.security_mode == SecurityMode::Reality) {
-        settings.flags |= kFlagReality;
     }
 
     const bool tls_like_for_alpn = settings.IsTls();

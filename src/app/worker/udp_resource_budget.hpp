@@ -2,15 +2,13 @@
 
 #include "common/buf/multi_buffer.hpp"
 
-#include <atomic>
 #include <cstddef>
 #include <limits>
 #include <utility>
 
 namespace worker_detail {
 
-// Limits are Worker-scoped. Reservation release is atomic so a frozen native
-// association can transfer its leases without borrowing the old Worker thread.
+// Worker-local UDP association and payload capacity budget.
 class UdpResourceBudget final {
 public:
     struct Limits {
@@ -44,7 +42,7 @@ public:
         friend class UdpResourceBudget;
         explicit AssociationLease(UdpResourceBudget& budget) noexcept : budget_(&budget) {}
         void Reset() noexcept {
-            if (budget_) budget_->associations_.fetch_sub(1, std::memory_order_relaxed);
+            if (budget_) --budget_->associations_;
             budget_ = nullptr;
         }
         UdpResourceBudget* budget_ = nullptr;
@@ -73,8 +71,8 @@ public:
             : budget_(&budget), capacity_(capacity) {}
         void Reset() noexcept {
             if (budget_) {
-                budget_->datagrams_.fetch_sub(1, std::memory_order_relaxed);
-                budget_->payload_capacity_.fetch_sub(capacity_, std::memory_order_relaxed);
+                --budget_->datagrams_;
+                budget_->payload_capacity_ -= capacity_;
             }
             budget_ = nullptr;
         }
@@ -88,9 +86,7 @@ public:
     UdpResourceBudget& operator=(const UdpResourceBudget&) = delete;
 
     [[nodiscard]] Usage GetUsage() const noexcept {
-        return {associations_.load(std::memory_order_relaxed),
-                datagrams_.load(std::memory_order_relaxed),
-                payload_capacity_.load(std::memory_order_relaxed)};
+        return {associations_, datagrams_, payload_capacity_};
     }
     [[nodiscard]] AssociationLease AcquireAssociation() noexcept {
         if (!Acquire(associations_, 1, limits_.associations)) return {};
@@ -106,25 +102,22 @@ public:
         }
         if (!Acquire(datagrams_, 1, limits_.datagrams)) return {};
         if (!Acquire(payload_capacity_, capacity, limits_.payload_capacity)) {
-            datagrams_.fetch_sub(1, std::memory_order_relaxed);
+            --datagrams_;
             return {};
         }
         return PayloadReservation{*this, capacity};
     }
 
 private:
-    static bool Acquire(std::atomic<size_t>& counter, size_t amount, size_t limit) noexcept {
-        auto value = counter.load(std::memory_order_relaxed);
-        do {
-            if (amount > limit || value > limit - amount) return false;
-        } while (!counter.compare_exchange_weak(value, value + amount,
-                     std::memory_order_relaxed));
+    static bool Acquire(size_t& counter, size_t amount, size_t limit) noexcept {
+        if (amount > limit || counter > limit - amount) return false;
+        counter += amount;
         return true;
     }
     Limits limits_;
-    std::atomic<size_t> associations_{0};
-    std::atomic<size_t> datagrams_{0};
-    std::atomic<size_t> payload_capacity_{0};
+    size_t associations_ = 0;
+    size_t datagrams_ = 0;
+    size_t payload_capacity_ = 0;
 };
 
 } // namespace worker_detail

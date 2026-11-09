@@ -240,23 +240,21 @@ TEST(DnsCache, Contract) {
 
 TEST(DnsCache, ZeroTtlAddressesInvalidateOldAnswersAndReleaseTheirStorage) {
     ::memory::ConfigureProcessAllocator();
-    ::memory::AllocationDomain domain;
-    ::memory::ScopedAllocationDomain lease(domain);
+    const auto baseline = ::memory::ThreadMemoryPool().OutstandingAllocations();
     {
         DnsCache cache(2, 60, 3600);
-        const auto empty_allocations = domain.OutstandingAllocations();
+        const auto empty_allocations = ::memory::ThreadMemoryPool().OutstandingAllocations();
         cache.Store("ttl.example", Answer("192.0.2.1", 400));
         auto current = Answer("192.0.2.2");
         current.ttl = 0;
         cache.Store("ttl.example", current);
         EXPECT_FALSE(cache.GetResult("ttl.example"));
         EXPECT_EQ(cache.GetStats().entries, 0);
-        EXPECT_EQ(domain.OutstandingAllocations(), empty_allocations);
-
+        EXPECT_EQ(::memory::ThreadMemoryPool().OutstandingAllocations(), empty_allocations);
         cache.Store("uncached.example", current);
         EXPECT_FALSE(cache.GetResult("uncached.example"));
         EXPECT_EQ(cache.GetStats().entries, 0);
-        EXPECT_EQ(domain.OutstandingAllocations(), empty_allocations);
+        EXPECT_EQ(::memory::ThreadMemoryPool().OutstandingAllocations(), empty_allocations);
 
         DnsResult negative;
         negative.error = ErrorCode::DNS_NO_RECORD;
@@ -267,7 +265,7 @@ TEST(DnsCache, ZeroTtlAddressesInvalidateOldAnswersAndReleaseTheirStorage) {
         cache.Store("ttl.example", current);
         EXPECT_FALSE(cache.GetResult("ttl.example"));
         EXPECT_EQ(cache.GetStats().entries, 0);
-        EXPECT_EQ(domain.OutstandingAllocations(), empty_allocations);
+        EXPECT_EQ(::memory::ThreadMemoryPool().OutstandingAllocations(), empty_allocations);
 
         const auto retained = Answer("192.0.2.3");
         cache.Store("ttl.example", retained);
@@ -275,5 +273,5 @@ TEST(DnsCache, ZeroTtlAddressesInvalidateOldAnswersAndReleaseTheirStorage) {
         ASSERT_TRUE(cached);
         EXPECT_EQ(cached->addresses, retained.addresses);
     }
-    EXPECT_EQ(domain.OutstandingAllocations(), 0);
+    EXPECT_EQ(::memory::ThreadMemoryPool().OutstandingAllocations(), baseline);
 }

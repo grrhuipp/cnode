@@ -46,11 +46,9 @@ struct Settings {
 // ============================================================================
 class Handler final : public Outbound {
 public:
-    // `tasks` accounts and joins physical readers, but each reader executes in
-    // its own leaseable domain. The host retains the original configuration/
-    // credential namespace; idle sessions are selected only on their current
-    // Worker. Negotiated padding is published on that host, then captured with
-    // checkout for each new handshake. The host task owner outlives Handler.
+    // `tasks` accounts and joins physical readers on the Worker thread.
+    // Idle sessions are pooled locally; negotiated padding is published to
+    // PaddingState and captured for each new handshake.
     Handler(std::string_view tag,
             net::io_context& io_context,
             std::shared_ptr<const Settings> settings,

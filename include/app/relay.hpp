@@ -1,7 +1,6 @@
 #pragma once
 
 #include "app/relay_types.hpp"
-#include "app/session_group_executor.hpp"
 #include "common/session.hpp"
 #include "common/buf/multi_buffer_batch.hpp"
 #include "transport/async_stream.hpp"

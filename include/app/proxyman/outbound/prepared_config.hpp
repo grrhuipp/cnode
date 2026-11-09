@@ -34,22 +34,14 @@ struct PreparedOutboundCreator {
         const std::shared_ptr<const OutboundProtocolSettings>& settings,
         ::net::io_context& io_context,
         ::AwaitableTaskGroup& tasks);
-    using StatelessCreateFn = std::unique_ptr<::Outbound> (*)(
-        std::string_view tag,
-        ::net::io_context& io_context,
-        ::AwaitableTaskGroup& tasks);
 
     std::shared_ptr<const OutboundProtocolSettings> settings;
     CreateFn create_fn = nullptr;
-    StatelessCreateFn stateless_fn = nullptr;
     // Mutable protocol state that must survive individual inbound connections.
     // Such handlers live in a stable, joinable execution domain per tag.
     bool persistent_state = false;
 
     PreparedOutboundCreator() noexcept = default;
-
-    PreparedOutboundCreator(StatelessCreateFn fn) noexcept
-        : stateless_fn(fn) {}
 
     PreparedOutboundCreator(
         std::shared_ptr<const OutboundProtocolSettings> s,
@@ -58,17 +50,14 @@ struct PreparedOutboundCreator {
         , create_fn(fn) {}
 
     [[nodiscard]] explicit operator bool() const noexcept {
-        return create_fn != nullptr || stateless_fn != nullptr;
+        return create_fn != nullptr;
     }
 
     [[nodiscard]] std::unique_ptr<::Outbound> operator()(
         std::string_view tag,
         ::net::io_context& io_context,
         ::AwaitableTaskGroup& tasks) const {
-        if (create_fn) {
-            return create_fn(tag, settings, io_context, tasks);
-        }
-        return stateless_fn(tag, io_context, tasks);
+        return create_fn(tag, settings, io_context, tasks);
     }
 };
 

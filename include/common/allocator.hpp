@@ -39,7 +39,6 @@ inline constexpr std::size_t kThreadMemoryPoolMaxClass = 16 * 1024;
 inline constexpr std::size_t kLargeBlockGranularity = 4 * 1024;
 inline constexpr std::size_t kMaxCachedBlockBytes = 1024 * 1024;
 inline constexpr std::size_t kMaxCachedBlockAlignment = 64;
-inline constexpr std::size_t request_arena_initial_bytes = std::size_t{4} * 1024;
 inline constexpr std::size_t default_retained_block_bytes = std::size_t{8} * 1024 * 1024;
 inline constexpr std::size_t max_retained_block_bytes = static_cast<std::size_t>(PTRDIFF_MAX);
 inline constexpr std::chrono::milliseconds kThreadMemoryPoolPurgeDelay{10};
@@ -63,8 +62,6 @@ inline void DisableTransparentHugePages() noexcept {
     return (value + unit - 1) & ~(unit - 1);
 }
 
-class AllocationDomain;
-class domain_memory_resource;
 class worker_memory;
 [[nodiscard]] worker_memory& ThreadMemoryPool() noexcept;
 
@@ -74,8 +71,6 @@ inline thread_local size_t rejected_process_allocations = 0;
 #endif
 
 namespace detail {
-inline thread_local AllocationDomain* current_allocation_domain = nullptr;
-inline thread_local bool allocate_for_worker = false;
 
 [[nodiscard]] inline std::uintptr_t CurrentThreadToken() noexcept {
     thread_local std::uint8_t anchor = 0;
@@ -148,15 +143,10 @@ private:
 }
 
 struct memory_pool_config {
-    std::size_t request_initial_buffer_bytes_{request_arena_initial_bytes};
     std::size_t retained_block_bytes_{default_retained_block_bytes};
 };
 
 inline void validate_memory_pool_config(const memory_pool_config& config) {
-    if (config.request_initial_buffer_bytes_ == 0) {
-        throw std::invalid_argument(
-            "memory pool request initial buffer size must be greater than zero");
-    }
     if (config.retained_block_bytes_ > max_retained_block_bytes) {
         throw std::invalid_argument(
             "memory pool retained block bytes exceed the addressable maximum");
@@ -201,7 +191,6 @@ public:
     explicit worker_memory(std::pmr::memory_resource& upstream,
                            const memory_pool_config& config = {})
         : upstream_((validate_memory_pool_config(config), &upstream))
-        , request_initial_buffer_bytes_(config.request_initial_buffer_bytes_)
         , retained_block_bytes_(config.retained_block_bytes_) {}
 
     worker_memory(const worker_memory&) = delete;
@@ -212,16 +201,6 @@ public:
         return *reinterpret_cast<Chunk*>(
             *(reinterpret_cast<const std::uintptr_t*>(pointer) - 1))->pool;
     }
-    [[nodiscard]] static domain_memory_resource* DomainOf(
-        const void* pointer) noexcept {
-        return reinterpret_cast<domain_memory_resource*>(
-            (reinterpret_cast<const SlotHeader*>(pointer) - 1)->next_free);
-    }
-    static void SetDomain(void* pointer, domain_memory_resource* domain) noexcept {
-        (reinterpret_cast<SlotHeader*>(pointer) - 1)->next_free =
-            reinterpret_cast<SlotHeader*>(domain);
-    }
-
 
     ~worker_memory() override {
         if (pooling_) {
@@ -236,6 +215,10 @@ public:
 
     [[nodiscard]] Footprint GetFootprint() const noexcept {
         return footprint_;
+    }
+
+    [[nodiscard]] std::size_t OutstandingAllocations() const noexcept {
+        return live_allocations_;
     }
 
     void Purge() noexcept {
@@ -280,10 +263,6 @@ public:
     }
     [[nodiscard]] std::pmr::memory_resource* resource() && = delete;
     [[nodiscard]] std::pmr::memory_resource* resource() const&& = delete;
-
-    [[nodiscard]] std::size_t request_initial_buffer_bytes() const noexcept {
-        return request_initial_buffer_bytes_;
-    }
 
     [[nodiscard]] static Layout Describe(
         std::size_t bytes, std::size_t alignment, std::size_t depth = 0) noexcept {
@@ -333,6 +312,7 @@ private:
             node->next_free = nullptr;
             if (!chunk->free_head) UnlinkRecyclable(*chunk);
             ++chunk->live;
+            ++live_allocations_;
             return node + 1;
         }
         if (cls.current && CanCarve(*cls.current)) return Carve(*cls.current);
@@ -454,8 +434,9 @@ private:
         }
     }
     void DeallocateLocal(SlotHeader& header, Chunk& chunk) noexcept {
-        if (chunk.live == 0) std::terminate();
+        if (chunk.live == 0 || live_allocations_ == 0) std::terminate();
         --chunk.live;
+        --live_allocations_;
         if (chunk.live == 0) {
             if (chunk.direct) {
                 ReleaseChunk(chunk);
@@ -537,6 +518,7 @@ private:
         chunk.bump += chunk.stride;
         if (chunk.idle) MarkUsed(chunk);
         ++chunk.live;
+        ++live_allocations_;
         return header + 1;
     }
     [[nodiscard]] void* AllocateLargeCached(
@@ -549,6 +531,7 @@ private:
                 MarkLargeUsed(*chunk);
                 footprint_.direct_bytes += chunk->map_bytes;
                 chunk->live = 1;
+                ++live_allocations_;
                 (reinterpret_cast<SlotHeader*>(chunk->large_user_ptr) - 1)->next_free = nullptr;
                 return chunk->large_user_ptr;
             }
@@ -565,6 +548,7 @@ private:
         chunk->slot_capacity = class_bytes;
         chunk->large_user_ptr = header + 1;
         chunk->live = 1;
+        ++live_allocations_;
         return chunk->large_user_ptr;
     }
     [[nodiscard]] void* AllocateDirect(
@@ -581,6 +565,7 @@ private:
             nullptr, reinterpret_cast<std::uintptr_t>(chunk)};
         chunk->slot_capacity = bytes;
         chunk->live = 1;
+        ++live_allocations_;
         return header + 1;
     }
     [[nodiscard]] Chunk* MapRegion(
@@ -702,232 +687,21 @@ private:
 
     std::pmr::memory_resource* upstream_;
     std::uintptr_t owner_token_ = 0;
-    std::size_t request_initial_buffer_bytes_;
     std::size_t retained_block_bytes_;
+    std::size_t live_allocations_ = 0;
     std::unique_ptr<PoolState, PoolStateDeleter> pooling_;
     Footprint footprint_{};
     IdleWakeup* wakeup_ = nullptr;
 };
 
-// A connection owns only this routing resource and its execution lease. The
-// complete size-class pool remains Worker-local; live slots retain this
-// resource without retaining the connection host.
-class domain_memory_resource final : public std::pmr::memory_resource {
-public:
-    [[nodiscard]] std::shared_ptr<void> Lifetime() const noexcept {
-        return lifetime_.lock();
-    }
-    [[nodiscard]] const std::weak_ptr<domain_memory_resource>& WeakLifetime() const noexcept {
-        return lifetime_;
-    }
-    [[nodiscard]] std::size_t OutstandingAllocations() const noexcept {
-        RequireLease();
-        return live_allocations_;
-    }
-    void RequireLease() const noexcept;
-    void Adopt(void* pointer) noexcept {
-        if (!pointer) return;
-        RequireLease();
-        auto* source = worker_memory::DomainOf(pointer);
-        if (!source || source == this) return;
-        if (source->owner_token_ != owner_token_) std::terminate();
-        if (source->live_allocations_ == 0) std::terminate();
-        if (live_allocations_++ == 0) live_lifetime_ = lifetime_.lock();
-        worker_memory::SetDomain(pointer, this);
-        std::shared_ptr<void> retiring;
-        if (--source->live_allocations_ == 0)
-            retiring = std::move(source->live_lifetime_);
-    }
-
-private:
-    friend class AllocationDomain;
-
-    void* do_allocate(std::size_t bytes, std::size_t alignment) override {
-        RequireLease();
-        void* pointer = ThreadMemoryPool().Allocate(bytes, alignment);
-        if (!pointer) throw std::bad_alloc();
-        worker_memory::SetDomain(pointer, this);
-        if (live_allocations_++ == 0) live_lifetime_ = lifetime_.lock();
-        return pointer;
-    }
-    void do_deallocate(
-        void* pointer, std::size_t bytes, std::size_t alignment) override {
-        if (!pointer) return;
-        RequireLease();
-        if (worker_memory::DomainOf(pointer) != this || live_allocations_ == 0)
-            std::terminate();
-        worker_memory::SetDomain(pointer, nullptr);
-        std::shared_ptr<void> retiring;
-        if (--live_allocations_ == 0) retiring = std::move(live_lifetime_);
-        worker_memory::OwnerOf(pointer).Deallocate(pointer, bytes, alignment);
-    }
-    [[nodiscard]] bool do_is_equal(
-        const std::pmr::memory_resource& other) const noexcept override {
-        return this == &other;
-    }
-
-    const std::uintptr_t owner_token_ = detail::CurrentThreadToken();
-    std::weak_ptr<domain_memory_resource> lifetime_;
-    std::shared_ptr<void> live_lifetime_;
-    std::size_t live_allocations_ = 0;
-};
-
-class AllocationDomain final {
-public:
-    AllocationDomain()
-        : resource_(std::make_shared<domain_memory_resource>()) {
-        resource_->lifetime_ = resource_;
-    }
-    AllocationDomain(const AllocationDomain&) = delete;
-    AllocationDomain& operator=(const AllocationDomain&) = delete;
-    ~AllocationDomain() {
-        if (active_scopes_ != 0) std::terminate();
-    }
-    [[nodiscard]] domain_memory_resource& memory() noexcept { return *resource_; }
-    [[nodiscard]] std::pmr::memory_resource* resource() noexcept {
-        return resource_.get();
-    }
-    [[nodiscard]] std::size_t OutstandingAllocations() const noexcept {
-        return resource_->OutstandingAllocations();
-    }
-
-private:
-    friend class ScopedAllocationDomain;
-    const std::uintptr_t owner_token_ = detail::CurrentThreadToken();
-    std::size_t active_scopes_ = 0;
-    std::shared_ptr<domain_memory_resource> resource_;
-};
-
-inline void domain_memory_resource::RequireLease() const noexcept {
-    const auto* current = detail::current_allocation_domain;
-    if (!current || &const_cast<AllocationDomain*>(current)->memory() != this)
-        std::terminate();
-}
-
-[[nodiscard]] inline std::shared_ptr<void> RetainResource(
-    std::pmr::memory_resource* resource) noexcept {
-    if (auto* domain = dynamic_cast<domain_memory_resource*>(resource))
-        return domain->Lifetime();
-    return {};
-}
-
-class ScopedAllocationDomain final {
-public:
-    explicit ScopedAllocationDomain(AllocationDomain& domain) noexcept
-        : domain_(domain), previous_(detail::current_allocation_domain) {
-        if (domain_.owner_token_ != detail::CurrentThreadToken()) std::terminate();
-        ++domain_.active_scopes_;
-        detail::current_allocation_domain = &domain_;
-    }
-    ~ScopedAllocationDomain() {
-        if (detail::current_allocation_domain != &domain_ ||
-            domain_.active_scopes_ == 0) std::terminate();
-        --domain_.active_scopes_;
-        detail::current_allocation_domain = previous_;
-    }
-    ScopedAllocationDomain(const ScopedAllocationDomain&) = delete;
-    ScopedAllocationDomain& operator=(const ScopedAllocationDomain&) = delete;
-
-private:
-    AllocationDomain& domain_;
-    AllocationDomain* previous_;
-};
-
-// Shared listener output remains on this Worker after the producing session
-// releases its lease. Only new allocations change owner; existing borrowed
-// session memory still requires the active domain lease. Never span a suspend.
-class ScopedWorkerAllocation final {
-public:
-    ScopedWorkerAllocation() noexcept
-        : previous_(std::exchange(detail::allocate_for_worker, true)) {}
-    ~ScopedWorkerAllocation() { detail::allocate_for_worker = previous_; }
-    ScopedWorkerAllocation(const ScopedWorkerAllocation&) = delete;
-    ScopedWorkerAllocation& operator=(const ScopedWorkerAllocation&) = delete;
-private:
-    bool previous_;
-};
-
-[[nodiscard]] inline AllocationDomain* CurrentAllocationDomain() noexcept {
-    return detail::current_allocation_domain;
-}
-
 [[nodiscard]] inline std::pmr::memory_resource* worker_pool_resource() noexcept;
 
 [[nodiscard]] inline std::pmr::memory_resource* CurrentResource() noexcept {
-    if (detail::allocate_for_worker) {
-        auto* default_resource = std::pmr::get_default_resource();
-        if (default_resource == worker_pool_resource() ||
-            default_resource == std::pmr::new_delete_resource()) {
-            return worker_pool_resource();
-        }
-        return default_resource;
-    }
-    if (auto* domain = CurrentAllocationDomain()) return domain->resource();
-    return std::pmr::get_default_resource();
+    auto* default_resource = std::pmr::get_default_resource();
+    return default_resource == std::pmr::new_delete_resource()
+        ? worker_pool_resource()
+        : default_resource;
 }
-
-
-
-// Request/handshake lifetime monotonic arena. Its overflow blocks pass through
-// the connection's lightweight resource into the current Worker pool.
-class request_memory final : private std::pmr::memory_resource {
-public:
-    explicit request_memory(worker_memory& worker)
-        : arena_(worker.request_initial_buffer_bytes(), worker.resource()) {}
-    request_memory(worker_memory& worker, std::span<std::byte> initial_buffer)
-        : arena_(initial_buffer.data(), initial_buffer.size(), worker.resource()) {}
-    explicit request_memory(domain_memory_resource& owner)
-        : lease_(&owner)
-        , arena_(ThreadMemoryPool().request_initial_buffer_bytes(), &owner) {}
-    request_memory(domain_memory_resource& owner,
-                   std::span<std::byte> initial_buffer)
-        : lease_(&owner)
-        , arena_(initial_buffer.data(), initial_buffer.size(), &owner) {}
-
-    request_memory(const request_memory&) = delete;
-    request_memory& operator=(const request_memory&) = delete;
-    ~request_memory() override {
-        if (lease_) lease_->RequireLease();
-    }
-
-    template <typename t_type = std::byte>
-    [[nodiscard]] std::pmr::polymorphic_allocator<t_type> allocator() & noexcept {
-        return std::pmr::polymorphic_allocator<t_type>(this);
-    }
-    template <typename t_type = std::byte>
-    [[nodiscard]] std::pmr::polymorphic_allocator<t_type> allocator() && = delete;
-
-    [[nodiscard]] std::pmr::memory_resource* resource() & noexcept { return this; }
-    [[nodiscard]] std::pmr::memory_resource* resource() const& noexcept {
-        return const_cast<request_memory*>(this);
-    }
-    [[nodiscard]] std::pmr::memory_resource* resource() && = delete;
-    [[nodiscard]] std::pmr::memory_resource* resource() const&& = delete;
-
-    [[nodiscard]] std::pmr::memory_resource* upstream_resource() & noexcept {
-        return arena_.upstream_resource();
-    }
-    [[nodiscard]] std::pmr::memory_resource* upstream_resource() const& noexcept {
-        return arena_.upstream_resource();
-    }
-    [[nodiscard]] std::pmr::memory_resource* upstream_resource() && = delete;
-    [[nodiscard]] std::pmr::memory_resource* upstream_resource() const&& = delete;
-
-private:
-    void* do_allocate(std::size_t bytes, std::size_t alignment) override {
-        if (lease_) lease_->RequireLease();
-        return arena_.allocate(bytes, alignment);
-    }
-    void do_deallocate(void*, std::size_t, std::size_t) override {
-        if (lease_) lease_->RequireLease();
-    }
-    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
-        return this == &other;
-    }
-    domain_memory_resource* lease_ = nullptr;
-    mutable std::pmr::monotonic_buffer_resource arena_;
-};
-
 [[nodiscard]] inline worker_memory& ThreadMemoryPool() noexcept {
     thread_local worker_memory pool;
     return pool;
@@ -947,40 +721,14 @@ inline thread_local size_t rejected_pmr_allocations = 0;
         return nullptr;
     }
 #endif
-    if (detail::allocate_for_worker)
-        return ThreadMemoryPool().Allocate(size, alignment);
-    if (auto* domain = CurrentAllocationDomain()) {
-        try {
-            return domain->resource()->allocate(size, alignment);
-        } catch (...) {
-            return nullptr;
-        }
-    }
     return ThreadMemoryPool().Allocate(size, alignment);
 }
 
 inline void DeallocatePmr(void* p, size_t size = 0,
                           size_t alignment = 0) noexcept {
     if (!p) return;
-    if (auto* domain = worker_memory::DomainOf(p)) {
-        domain->deallocate(p, size, alignment);
-        return;
-    }
     worker_memory::OwnerOf(p).Deallocate(p, size, alignment);
 }
-
-inline void RequireAllocationLease(const void* pointer) noexcept {
-    if (!pointer) return;
-    if (auto* domain = worker_memory::DomainOf(pointer))
-        domain->RequireLease();
-}
-
-inline void AdoptPmr(void* pointer) noexcept {
-    if (!pointer) return;
-    if (auto* domain = CurrentAllocationDomain())
-        domain->memory().Adopt(pointer);
-}
-
 // Native Asio operation storage can be allocated, delivered, cancelled, or
 // destroyed by different reactor threads. It never belongs to a session pool.
 template <class T>
@@ -1034,33 +782,6 @@ protected:
     static ThreadMemoryResource resource;
     return &resource;
 }
-inline void TrackResourceLifetime(
-    std::pmr::memory_resource* resource,
-    std::weak_ptr<void>& lifetime,
-    bool& tracked) noexcept {
-    if (!resource || resource == worker_pool_resource() ||
-        resource == process_resource()) {
-        lifetime.reset();
-        tracked = false;
-        return;
-    }
-    if (const auto* current = detail::current_allocation_domain) {
-        auto* domain = const_cast<AllocationDomain*>(current);
-        if (resource == domain->resource()) {
-            lifetime = domain->memory().WeakLifetime();
-            tracked = !lifetime.expired();
-            return;
-        }
-    }
-    if (auto* domain = dynamic_cast<domain_memory_resource*>(resource)) {
-        lifetime = domain->WeakLifetime();
-        tracked = !lifetime.expired();
-        return;
-    }
-    lifetime.reset();
-    tracked = false;
-}
-
 
 inline void ConfigureProcessAllocator() noexcept {
     DisableTransparentHugePages();
@@ -1101,33 +822,14 @@ public:
     using propagate_on_container_swap = std::true_type;
     ThreadLocalAllocator() noexcept : ThreadLocalAllocator(CurrentResource()) {}
     ThreadLocalAllocator(std::pmr::memory_resource* resource) noexcept
-        : resource_(resource ? resource : CurrentResource()) {
-        TrackResource();
-    }
+        : resource_(resource ? resource : CurrentResource()) {}
     ThreadLocalAllocator(const ThreadLocalAllocator&) noexcept = default;
     ThreadLocalAllocator& operator=(const ThreadLocalAllocator&) noexcept = default;
-    ThreadLocalAllocator(ThreadLocalAllocator&& other) noexcept
-        : resource_(other.resource_)
-        , lifetime_(other.lifetime_)
-        , lifetime_tracked_(other.lifetime_tracked_) {}
-    ThreadLocalAllocator& operator=(ThreadLocalAllocator&& other) noexcept {
-        if (this != &other) {
-            resource_ = other.resource_;
-            lifetime_ = other.lifetime_;
-            lifetime_tracked_ = other.lifetime_tracked_;
-        }
-        return *this;
-    }
+    ThreadLocalAllocator(ThreadLocalAllocator&&) noexcept = default;
+    ThreadLocalAllocator& operator=(ThreadLocalAllocator&&) noexcept = default;
     template <class U>
     ThreadLocalAllocator(const ThreadLocalAllocator<U>& other) noexcept
-        : resource_((other.RefreshResource(), other.resource_))
-        , lifetime_(other.lifetime_)
-        , lifetime_tracked_(other.lifetime_tracked_) {}
-    template <class U>
-    ThreadLocalAllocator(ThreadLocalAllocator<U>&& other) noexcept
-        : resource_((other.RefreshResource(), other.resource_))
-        , lifetime_(std::move(other.lifetime_))
-        , lifetime_tracked_(other.lifetime_tracked_) {}
+        : resource_(other.resource_) {}
     template <class U>
     ThreadLocalAllocator(const std::pmr::polymorphic_allocator<U>& other) noexcept
         : ThreadLocalAllocator(other.resource()) {}
@@ -1136,48 +838,29 @@ public:
         return {};
     }
     [[nodiscard]] std::pmr::memory_resource* resource() const noexcept {
-        RefreshResource();
         return resource_;
     }
     [[nodiscard]] T* allocate(std::size_t count) {
-        RefreshResource();
         return std::pmr::polymorphic_allocator<T>(resource_).allocate(count);
     }
     void deallocate(T* pointer, std::size_t count) noexcept {
-        RefreshResource();
         std::pmr::polymorphic_allocator<T>(resource_).deallocate(pointer, count);
     }
     template <class U, class... Args>
         requires (UsesAllocatorConstruction<std::remove_cv_t<U>>::value)
     void construct(U* pointer, Args&&... args) {
-        RefreshResource();
-        // touching the resource; only allocator-consuming construction pins it.
         std::pmr::polymorphic_allocator<T>(resource_).construct(
             pointer, std::forward<Args>(args)...);
     }
     template <class U>
     [[nodiscard]] bool operator==(const ThreadLocalAllocator<U>& other) const noexcept {
-        RefreshResource();
-        other.RefreshResource();
         return resource_ == other.resource_ || resource_->is_equal(*other.resource_);
     }
 
 private:
     template <class> friend class ThreadLocalAllocator;
 
-    void TrackResource() noexcept {
-        TrackResourceLifetime(resource_, lifetime_, lifetime_tracked_);
-    }
-
-    void RefreshResource() const noexcept {
-        if (!lifetime_tracked_ || !lifetime_.expired()) return;
-        resource_ = CurrentResource();
-        TrackResourceLifetime(resource_, lifetime_, lifetime_tracked_);
-    }
-
-    mutable std::pmr::memory_resource* resource_;
-    mutable std::weak_ptr<void> lifetime_;
-    mutable bool lifetime_tracked_ = false;
+    std::pmr::memory_resource* resource_;
 };
 template <class T, class... Args>
 [[nodiscard]] std::shared_ptr<T> AllocateShared(Args&&... args) {
@@ -1200,12 +883,9 @@ public:
 
     RingDeque() noexcept : RingDeque(CurrentResource()) {}
     explicit RingDeque(std::pmr::memory_resource* resource) noexcept
-        : resource_(resource ? resource : CurrentResource()) {
-        TrackResource();
-    }
+        : resource_(resource ? resource : CurrentResource()) {}
     explicit RingDeque(const allocator_type& alloc) noexcept
         : RingDeque(alloc.resource()) {}
-
     RingDeque(const RingDeque& other)
         : RingDeque(CurrentResource()) {
         if (!other.empty()) {
@@ -1224,8 +904,6 @@ public:
 
     RingDeque(RingDeque&& other) noexcept
         : resource_(other.resource_)
-        , resource_lifetime_(other.resource_lifetime_)
-        , lifetime_tracked_(other.lifetime_tracked_)
         , data_(std::exchange(other.data_, nullptr))
         , head_(std::exchange(other.head_, 0))
         , size_(std::exchange(other.size_, 0))
@@ -1233,7 +911,7 @@ public:
 
     RingDeque& operator=(const RingDeque& other) {
         if (this != &other) {
-            RingDeque tmp(ResolvedResource());
+            RingDeque tmp(resource_);
             if (!other.empty()) {
                 tmp.Reserve(other.size_);
                 for (std::size_t i = 0; i < other.size_; ++i) {
@@ -1264,7 +942,7 @@ public:
     }
 
     [[nodiscard]] allocator_type get_allocator() const noexcept {
-        return allocator_type(ResolvedResource());
+        return allocator_type(resource_);
     }
 
     [[nodiscard]] bool empty() const noexcept { return size_ == 0; }
@@ -1364,7 +1042,6 @@ public:
                 return;
             }
             try {
-                RefreshResource();
                 T* next_data = static_cast<T*>(
                     resource_->allocate(target_cap * sizeof(T), alignof(T)));
                 for (std::size_t i = 0; i < size_; ++i) {
@@ -1384,8 +1061,6 @@ public:
     void swap(RingDeque& other) noexcept {
         if (this == &other) return;
         std::swap(resource_, other.resource_);
-        std::swap(resource_lifetime_, other.resource_lifetime_);
-        std::swap(lifetime_tracked_, other.lifetime_tracked_);
         std::swap(data_, other.data_);
         std::swap(head_, other.head_);
         std::swap(size_, other.size_);
@@ -1433,7 +1108,6 @@ private:
             next_cap *= 2;
         }
         if (next_cap <= capacity_) return;
-        RefreshResource();
         T* next_data = static_cast<T*>(
             resource_->allocate(next_cap * sizeof(T), alignof(T)));
         std::size_t constructed = 0;
@@ -1470,7 +1144,6 @@ private:
         if (next_cap > std::numeric_limits<std::size_t>::max() / sizeof(T)) {
             throw std::bad_alloc();
         }
-        RefreshResource();
         T* next_data = static_cast<T*>(
             resource_->allocate(next_cap * sizeof(T), alignof(T)));
         T* new_elem = next_data + (at_back ? size_ : 0);
@@ -1507,24 +1180,7 @@ private:
         return *new_elem;
     }
 
-    void TrackResource() noexcept {
-        TrackResourceLifetime(resource_, resource_lifetime_, lifetime_tracked_);
-    }
-
-    void RefreshResource() const noexcept {
-        if (!lifetime_tracked_ || !resource_lifetime_.expired()) return;
-        resource_ = CurrentResource();
-        TrackResourceLifetime(resource_, resource_lifetime_, lifetime_tracked_);
-    }
-
-    [[nodiscard]] std::pmr::memory_resource* ResolvedResource() const noexcept {
-        RefreshResource();
-        return resource_;
-    }
-
-    mutable std::pmr::memory_resource* resource_;
-    mutable std::weak_ptr<void> resource_lifetime_;
-    mutable bool lifetime_tracked_ = false;
+    std::pmr::memory_resource* resource_;
     T* data_ = nullptr;
     std::size_t head_ = 0;
     std::size_t size_ = 0;

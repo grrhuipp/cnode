@@ -158,7 +158,6 @@ void TestPrivateAllocatorIsolation(CountingResource& resource) {
 
 void TestQueuedReadinessIsolation() {
     using namespace ::memory;
-    AllocationDomain domain;
     net::io_context reactor;
     ::tcp::acceptor acceptor(reactor, {net::ip::address_v4::loopback(), 0});
     ::tcp::socket socket(reactor), peer(reactor);
@@ -167,14 +166,12 @@ void TestQueuedReadinessIsolation() {
     ::buf::Buffer* payload = nullptr;
     bool consumed = false;
     {
-        ScopedAllocationDomain lease(domain);
         payload = ::buf::Buffer::New();
         Require(payload != nullptr, "payload allocation failed");
-        const auto outstanding = domain.OutstandingAllocations();
+        const auto outstanding = ThreadMemoryPool().OutstandingAllocations();
         socket.async_wait(::tcp::socket::wait_read,
             net::bind_allocator(ProcessAllocator<std::byte>{},
                 [&](::IoErrorCode ec) {
-                    ScopedAllocationDomain active(domain);
                     Require(!ec, "readiness failed");
                     const auto count = socket.read_some(net::buffer(payload->Tail().data(), 1));
                     payload->Produce(static_cast<uint32_t>(count));
@@ -182,8 +179,8 @@ void TestQueuedReadinessIsolation() {
                     ::buf::Buffer::Free(payload);
                     payload = nullptr;
                 }));
-        Require(domain.OutstandingAllocations() == outstanding,
-                "queued operation must not borrow the connection domain");
+        Require(ThreadMemoryPool().OutstandingAllocations() == outstanding,
+                "queued operation must not borrow the worker pool");
     }
     const char value = 'q';
     peer.write_some(net::buffer(&value, 1));
@@ -193,18 +190,17 @@ void TestQueuedReadinessIsolation() {
 
 void TestPendingOperationDestruction() {
     using namespace ::memory;
-    AllocationDomain domain;
     auto reactor = std::make_unique<net::io_context>();
     auto timer = std::make_unique<net::steady_timer>(*reactor, 1h);
     {
-        ScopedAllocationDomain lease(domain);
+        const auto baseline = ThreadMemoryPool().OutstandingAllocations();
         timer->async_wait(net::bind_allocator(ProcessAllocator<std::byte>{},
             [](::IoErrorCode) {}));
-        Require(domain.OutstandingAllocations() == 0,
+        Require(ThreadMemoryPool().OutstandingAllocations() == baseline,
                 "pending operation storage must belong to process allocator");
     }
-    // Asio destroys the still-pending handler without calling it and without
-    // entering a domain when its reactor is destroyed on another thread.
+    // Asio destroys the still-pending handler without calling it when its
+    // reactor is destroyed on another thread.
     std::thread shutdown([&] { timer.reset(); reactor.reset(); });
     shutdown.join();
 }

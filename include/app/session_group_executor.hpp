@@ -5,7 +5,6 @@
 #include "app/worker_mailbox.hpp"
 
 #include <asio/execution.hpp>
-#include <asio/any_io_executor.hpp>
 #include <cstdint>
 #include <exception>
 #include <functional>
@@ -17,20 +16,11 @@
 
 class GroupCoordinator : public std::enable_shared_from_this<GroupCoordinator> {
 public:
-    struct WorkerTarget {
-        uint32_t worker_id = 0;
-        net::io_context* reactor = nullptr;
-        net::any_io_executor executor;
-    };
-
     explicit GroupCoordinator(net::io_context& io, size_t capacity = 1024);
     ~GroupCoordinator();
     void Start();
     // Register fixed Worker routes before their request admission starts.
-    void RegisterWorker(uint32_t worker_id, net::io_context& reactor,
-                        net::any_io_executor executor);
-    [[nodiscard]] std::optional<WorkerTarget> FindWorker(uint32_t worker_id) const noexcept;
-    [[nodiscard]] std::optional<uint32_t> FindWorkerId(const net::io_context& reactor) const noexcept;
+    void RegisterWorker(uint32_t worker_id, net::io_context& reactor);
     [[nodiscard]] uint32_t WorkerCount() const noexcept;
     [[nodiscard]] static GroupCoordinator* ForContext(net::execution_context& context) noexcept;
     [[nodiscard]] static std::optional<uint32_t> WorkerIdForContext(

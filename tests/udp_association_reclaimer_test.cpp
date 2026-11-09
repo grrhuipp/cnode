@@ -129,8 +129,7 @@ public:
 class AcceptedReplySink final : public ::worker_detail::UdpReplySink {
 public:
     bool EnqueueUdpReply(std::string_view, ::udp::socket*, ::udp::endpoint,
-                         ::buf::MultiBuffer, uint32_t,
-                         std::shared_ptr<::worker_detail::UdpReplyFence> = {}) override {
+                         ::buf::MultiBuffer, uint32_t) override {
         ++packets;
         return true;
     }
@@ -202,8 +201,7 @@ class DiscardReplySink final : public ::worker_detail::UdpReplySink {
 public:
     bool EnqueueUdpReply(std::string_view, ::udp::socket*,
                          ::udp::endpoint, ::buf::MultiBuffer,
-                         uint32_t,
-                         std::shared_ptr<::worker_detail::UdpReplyFence> = {}) override {
+                         uint32_t) override {
         return false;
     }
 };
@@ -467,7 +465,7 @@ TEST(UdpAssociationReclaimer, Contract) {
     auto downlink = downlink_ingress.CreateClientSession(
         "activity", Key(1), io,
         {.socket_key = {}, .socket = {}, .response = std::make_shared<AcceptedReplyResponse>(),
-         .sink = &accepted_reply, .worker_id = 0, .fence = {}},
+         .sink = &accepted_reply, .worker_id = 0},
         {::net::ip::address_v4::loopback(), 10001}, Key(1).owner,
         Clock::now() - downlink_idle + 200ms, downlink_idle);
     ::buf::BufferGuard reply{::buf::Buffer::New()};

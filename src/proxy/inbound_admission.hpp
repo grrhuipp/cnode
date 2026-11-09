@@ -72,15 +72,17 @@ inline void BindAuthenticatedInbound(
     if (request) BindInboundRequestTarget(ctx, std::move(*request));
 }
 
-namespace detail {
-
+// The single session-level online-device admission for every inbound
+// protocol, after BindAuthenticatedInbound. The returned guard owns the
+// device reservation for the whole authenticated session; substreams inherit.
 [[nodiscard]] inline net::awaitable<std::optional<UserOnlineSessionGuard>>
-FinishAuthenticatedAdmission(
+AdmitAuthenticatedInbound(
     UserOnlineTracker& tracker,
     session::Context& ctx,
-    const UserProfile& profile,
-    net::awaitable<std::optional<UserOnlineSessionGuard>> reservation) {
-    auto user_session = co_await std::move(reservation);
+    const UserProfile& profile) {
+    auto user_session = co_await tracker.TryConnectSession(
+        ctx.inbound.tag, profile.user_id, ctx.inbound.source_ip,
+        profile.device_limit);
     if (!user_session) {
         LOG_CONN_DEBUG(ctx, "User {} exceeded device limit ({}/{})",
                        profile.user_id,
@@ -99,37 +101,6 @@ FinishAuthenticatedAdmission(
                        ctx.inbound.source_ip, ctx.inbound.source_port);
     }
     co_return user_session;
-}
-
-}  // namespace detail
-
-// The single session-level online-device admission for every inbound
-// protocol, after BindAuthenticatedInbound. The returned guard owns the
-// device reservation for the whole authenticated session; substreams inherit.
-// `coordinator` owns the process-wide device quota.
-[[nodiscard]] inline net::awaitable<std::optional<UserOnlineSessionGuard>>
-AdmitAuthenticatedInbound(
-    UserOnlineTracker& tracker,
-    GroupCoordinator& coordinator,
-    session::Context& ctx,
-    const UserProfile& profile) {
-    return detail::FinishAuthenticatedAdmission(
-        tracker, ctx, profile,
-        tracker.TryConnectSession(coordinator, ctx.inbound.tag, profile.user_id,
-                                  ctx.inbound.source_ip, profile.device_limit));
-}
-
-// Sessions running inside an execution domain admit through its coordinator;
-// registered users without one are a logic error.
-[[nodiscard]] inline net::awaitable<std::optional<UserOnlineSessionGuard>>
-AdmitAuthenticatedInbound(
-    UserOnlineTracker& tracker,
-    session::Context& ctx,
-    const UserProfile& profile) {
-    return detail::FinishAuthenticatedAdmission(
-        tracker, ctx, profile,
-        tracker.TryConnectSession(ctx.inbound.tag, profile.user_id,
-                                  ctx.inbound.source_ip, profile.device_limit));
 }
 // Ownership of every admission an association holds until it ends.
 struct NativeAssociationAdmission {
@@ -178,15 +149,8 @@ inline net::awaitable<std::optional<NativeAssociationAdmission>> AdmitNativeAsso
         RejectNativeAssociation(ctx, stats, "missing user admission");
         co_return std::nullopt;
     }
-    // The credential's stable session capability owns the tracker; quota
-    // reservations remain tied to their original coordinator across handoff.
-    std::optional<UserOnlineSessionGuard> user_session;
-    if (limiter) {
-        user_session = co_await proxy::AdmitAuthenticatedInbound(
-            *tracker, limiter->Coordinator(), ctx, profile);
-    } else {
-        user_session = co_await proxy::AdmitAuthenticatedInbound(*tracker, ctx, profile);
-    }
+    auto user_session =
+        co_await proxy::AdmitAuthenticatedInbound(*tracker, ctx, profile);
     if (!user_session) {
         stats.OnError();
         co_return std::nullopt;
@@ -313,6 +277,9 @@ public:
         return validator.GetOnlineDevices(tag);
     }
 
+    [[nodiscard]] ::UserOnlineTracker* OnlineTracker() noexcept override {
+        return &validator;
+    }
     Tracker validator;
 };
 using UserOnlineProtocolRuntime = InboundTrackerRuntime<::UserOnlineTracker>;

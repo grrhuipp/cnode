@@ -47,17 +47,6 @@ enum class SecurityMode : uint8_t {
     Unsupported = 255,
 };
 
-enum StreamFlags : uint8_t {
-    kFlagNone        = 0,
-    kFlagWs          = 1 << 0,
-    kFlagTls         = 1 << 1,
-    kFlagHttpUpgrade = 1 << 2,
-    kFlagGrpc        = 1 << 3,
-    kFlagHttp        = 1 << 4,
-    kFlagXHttp       = 1 << 5,
-    kFlagReality     = 1 << 6,
-};
-
 // ============================================================================
 // WebSocket 传输配置
 // ============================================================================
@@ -286,22 +275,21 @@ struct StreamSettings {
     // 归一化后的缓存字段（热路径使用）
     NetworkMode  network_mode  = NetworkMode::Tcp;
     SecurityMode security_mode = SecurityMode::None;
-    uint8_t      flags         = kFlagNone;
     // Explicit outbound Host/:authority of the ws/httpupgrade/grpc/xhttp
     // layer; empty means derive it from the dial address.
     std::string configured_http_host;
-    // Configuration-prepared, read-only security shared by all physical domains.
+    // Configuration-prepared, read-only security shared by all Workers.
     // Not part of wire configuration identity; rebuild on config changes.
     std::shared_ptr<const TransportSecurity> prepared_security;
 
-    bool IsTls() const noexcept { return (flags & kFlagTls) != 0; }
-    bool IsReality() const noexcept { return (flags & kFlagReality) != 0; }
+    bool IsTls() const noexcept { return security_mode == SecurityMode::Tls; }
+    bool IsReality() const noexcept { return security_mode == SecurityMode::Reality; }
     bool IsTlsLike() const noexcept { return IsTls() || IsReality(); }
-    bool IsWs()  const noexcept { return (flags & kFlagWs)  != 0; }
-    bool IsHttpUpgrade() const noexcept { return (flags & kFlagHttpUpgrade) != 0; }
-    bool IsHttp() const noexcept { return (flags & kFlagHttp) != 0; }
-    bool IsGrpc() const noexcept { return (flags & kFlagGrpc) != 0; }
-    bool IsXHttp() const noexcept { return (flags & kFlagXHttp) != 0; }
+    bool IsWs() const noexcept { return network_mode == NetworkMode::Ws; }
+    bool IsHttpUpgrade() const noexcept { return network_mode == NetworkMode::HttpUpgrade; }
+    bool IsHttp() const noexcept { return network_mode == NetworkMode::Http; }
+    bool IsGrpc() const noexcept { return network_mode == NetworkMode::Grpc; }
+    bool IsXHttp() const noexcept { return network_mode == NetworkMode::XHttp; }
     bool IsUnsupported() const noexcept {
         return network_mode == NetworkMode::Unsupported ||
                security_mode == SecurityMode::Unsupported;

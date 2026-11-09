@@ -21,7 +21,7 @@ struct TimeoutScheduler::Impl {
 
     net::io_context& context;
     net::steady_timer timer;
-    // Shared Worker bookkeeping must never allocate from a session domain.
+    // Shared Worker bookkeeping uses the process allocator.
     std::vector<TimeoutEvent*, memory::ProcessAllocator<TimeoutEvent*>> heap;
     uint64_t next_sequence = 0;
     std::optional<SignalChannel> join;
@@ -195,22 +195,19 @@ void TimeoutEvent::Cancel() noexcept {
 }
 bool TimeoutEvent::ScheduleAfter(std::chrono::milliseconds delay) {
     if (!context_) throw std::logic_error("timeout event has no scheduling context");
-    return TimeoutScheduler::ForWorker(*context_).ScheduleAfter(delay, *this);
+    return TimeoutScheduler::ForIoContext(*context_).ScheduleAfter(delay, *this);
 }
 bool TimeoutEvent::ScheduleAfter(std::chrono::milliseconds delay, net::io_context& context) {
     if (!context_) context_ = &context;
     return ScheduleAfter(delay);
 }
 
-TimeoutScheduler& TimeoutScheduler::ForWorker(net::io_context& context) {
+TimeoutScheduler& TimeoutScheduler::ForIoContext(net::io_context& context) {
     if (tl_cached_context == &context && tl_cached_scheduler) return *tl_cached_scheduler;
     auto& service = asio::use_service<TimeoutSchedulerService>(context);
     tl_cached_context = &context;
     tl_cached_scheduler = &service.Scheduler();
     return *tl_cached_scheduler;
-}
-TimeoutScheduler& TimeoutScheduler::ForIoContext(net::io_context& context) {
-    return ForWorker(context);
 }
 void TimeoutScheduler::ReleaseForIoContext(net::io_context& context) {
     if (asio::has_service<TimeoutSchedulerService>(context))

@@ -73,7 +73,6 @@ enum class ErrorCode : int {
 
     // TLS 错误 (600-699)
     TLS_HANDSHAKE_FAILED = 600,
-    TLS_CERT_INVALID = 601,
 
     // DNS 错误 (800-899)
     DNS_RESOLVE_FAILED = 800,
@@ -131,7 +130,6 @@ constexpr std::string_view ErrorCodeToString(ErrorCode code) {
         case ErrorCode::RELAY_TIMEOUT: return "RELAY_TIMEOUT";
 
         case ErrorCode::TLS_HANDSHAKE_FAILED: return "TLS_HANDSHAKE_FAILED";
-        case ErrorCode::TLS_CERT_INVALID: return "TLS_CERT_INVALID";
 
         case ErrorCode::DNS_RESOLVE_FAILED: return "DNS_RESOLVE_FAILED";
         case ErrorCode::DNS_TIMEOUT: return "DNS_TIMEOUT";

@@ -163,6 +163,14 @@ public:
         (void)stream.StartPhaseDeadline(timeouts_.HandshakeTimeout());
     }
 
+    std::chrono::seconds TransportHandshakeTimeout() const noexcept override {
+        return timeouts_.HandshakeTimeout();
+    }
+
+    std::chrono::seconds TransportIdleTimeout() const noexcept override {
+        return timeouts_.IdleTimeout();
+    }
+
     net::awaitable<void> OnInboundTransportStream(
         std::unique_ptr<AsyncStream> stream,
         InboundTransportMetadata metadata) override {
@@ -191,48 +199,15 @@ private:
 
 Handler::Handler(inbound::ReceiverSettings receiver, std::unique_ptr<Inbound> proxy,
                  ConnectionLimiter& limiter)
-    : Handler(std::make_shared<const inbound::ReceiverSettings>(std::move(receiver)),
-              std::move(proxy), limiter) {}
-
-Handler::Handler(std::shared_ptr<const inbound::ReceiverSettings> receiver,
-                 std::unique_ptr<Inbound> proxy,
-                 ConnectionLimiter& limiter)
-    : receiver_(receiver ? std::move(receiver)
-                         : throw std::invalid_argument("missing receiver settings"))
+    : receiver_(std::make_shared<const inbound::ReceiverSettings>(std::move(receiver)))
     , security_(receiver_->stream_settings, StreamEndpointRole::Inbound)
     , proxy_(std::move(proxy))
     , limiter_(limiter) {}
 
-Handler::Handler(std::shared_ptr<const inbound::ReceiverSettings> receiver,
-                 LazyProtocol lazy,
-                 ConnectionLimiter& limiter)
-    : receiver_(receiver ? std::move(receiver)
-                         : throw std::invalid_argument("missing receiver settings"))
-    , security_(receiver_->stream_settings, StreamEndpointRole::Inbound)
-    , lazy_(lazy.prepared && lazy.stats
-                ? std::move(lazy)
-                : throw std::invalid_argument("missing lazy protocol source"))
-    , limiter_(limiter) {}
-
 Inbound& Handler::Proxy() {
-    if (proxy_) return *proxy_;
-    if (!lazy_.prepared) throw std::logic_error("inbound handler has no protocol");
-    if (!runtime_) {
-        runtime_ = NewProtocolRuntime(lazy_.prepared->protocol);
-        if (!runtime_) throw std::invalid_argument("missing session protocol runtime");
-    }
-    proxy_ = NewHandler(lazy_.prepared->protocol, *runtime_, *lazy_.stats,
-                        lazy_.limiter, *lazy_.prepared);
-    if (!proxy_) throw std::invalid_argument("missing session inbound handler");
+    if (!proxy_) throw std::logic_error("inbound handler has no protocol");
     return *proxy_;
 }
-
-void Handler::ReleaseProtocol() noexcept {
-    // Handler state may refer to runtime state; release in reverse order.
-    if (lazy_.prepared) proxy_.reset();
-    runtime_.reset();
-}
-
 std::shared_ptr<InboundTransportStreamHandler> Handler::NewAuthenticatedStreamSink(
     net::io_context& io_context,
     routing::Dispatcher& dispatcher,

@@ -57,9 +57,6 @@ public:
     void CommitTraffic(std::string_view tag, const UserTrafficCounters& snapshot);
     // Re-expose a failed durable snapshot without touching later traffic.
     void RollbackTraffic(std::string_view tag, const UserTrafficCounters& snapshot);
-    // Move counters not covered by an in-flight snapshot into another ledger.
-    [[nodiscard]] UserTrafficCounters ExtractAvailableTraffic(std::string_view tag);
-    void MergeCompletedTraffic(std::string_view tag, UserTrafficCounters& source);
 
 private:
     struct AccountBucket {

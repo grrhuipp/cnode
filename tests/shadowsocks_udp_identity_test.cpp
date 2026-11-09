@@ -8,8 +8,6 @@ using namespace ss_identity_test;
 
 class ShadowsocksUdpIdentity : public testing::Test {
 protected:
-    memory::AllocationDomain domain;
-    memory::ScopedAllocationDomain lease{domain};
     const TargetAddress target{"127.0.0.1", 443};
     const std::array<uint8_t, 5> payload{0x17, 0x29, 0x41, 0, 0xff};
 

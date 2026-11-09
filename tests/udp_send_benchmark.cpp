@@ -79,8 +79,7 @@ net::awaitable<Measurement> Transfer(
 
 TEST(UdpSendBenchmark, VerifiedDatagrams) {
     memory::ConfigureProcessAllocator();
-    memory::AllocationDomain domain;
-    memory::ScopedAllocationDomain lease(domain);
+    const auto baseline = memory::ThreadMemoryPool().OutstandingAllocations();
     for (const size_t size : {0u, 1u, 1200u, 60000u}) {
         for (const bool owned : {false, true}) {
             SCOPED_TRACE(::testing::Message() << "bytes=" << size << " owned=" << owned);
@@ -128,6 +127,6 @@ TEST(UdpSendBenchmark, VerifiedDatagrams) {
                 process_memory.file_resident_bytes);
         }
     }
-    EXPECT_EQ(domain.OutstandingAllocations(), 0u);
+    EXPECT_EQ(memory::ThreadMemoryPool().OutstandingAllocations(), baseline);
 }
 } // namespace

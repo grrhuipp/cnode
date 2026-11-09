@@ -301,15 +301,6 @@ void UserStore::InstallWorkerView(WorkerView view) noexcept {
     LocalView() = std::move(view);
 }
 
-UserStore::WorkerView UserStore::ExchangeWorkerView(WorkerView view) noexcept {
-    LocalView().swap(view);
-    return view;
-}
-
-UserStore::WorkerView UserStore::CaptureWorkerView() noexcept {
-    return LocalView();
-}
-
 void UserStore::ClearWorkerView() noexcept {
     InstallWorkerView({});
 }

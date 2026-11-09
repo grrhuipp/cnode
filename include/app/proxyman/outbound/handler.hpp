@@ -5,17 +5,14 @@
 #include "proxy/outbound.hpp"
 #include "transport/internet/outbound_target_builder.hpp"
 
-#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string_view>
 #include <vector>
 
 class AwaitableTaskGroup;
-class GroupCoordinator;
 namespace app::dns {
 class DNS;
 }  // namespace app::dns
@@ -52,8 +49,7 @@ public:
     OutboundConfiguration& operator=(const OutboundConfiguration&) = delete;
 
     // Cold Worker setup/publication only; no Worker state is captured by hosts.
-    void BindHosts(net::io_context& reactor, uint32_t worker_id,
-                   std::shared_ptr<GroupCoordinator> coordinator);
+    void BindHosts(net::io_context& reactor);
     // Called only after the Worker's requests have drained.
     net::awaitable<void> AsyncJoinHosts();
 
@@ -71,9 +67,8 @@ private:
     void Publish(std::shared_ptr<const Snapshot> snapshot) noexcept;
 
     std::unique_ptr<Hosts> hosts_;
-    std::mutex publication_mutex_;
-    std::atomic<std::shared_ptr<const Snapshot>> snapshot_;
-    std::atomic<uint64_t> generation_{0};
+    std::shared_ptr<const Snapshot> snapshot_;
+    uint64_t generation_ = 0;
 };
 
 // ============================================================================

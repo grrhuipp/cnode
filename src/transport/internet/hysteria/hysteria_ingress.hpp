@@ -13,10 +13,9 @@ namespace transport::internet::hysteria {
 class QuicListener;
 
 // Worker-local sockets, receive staging and protocol expiry. Each accepted
-// QUIC connection has an independent stable capability/domain, shared by all
-// its TCP streams and UDP sessions. A different receiving Worker may claim
-// that domain only after exclusive QUIC path validation; listeners never
-// transfer received payloads or move their shared sockets.
+// QUIC connection stays on its accepting Worker, shared by all its TCP
+// streams and UDP sessions; listeners never transfer received payloads or
+// move their shared sockets.
 class HysteriaIngress final : public memory::ThreadAllocated {
 public:
     using SocketPtr = std::shared_ptr<udp::socket>;

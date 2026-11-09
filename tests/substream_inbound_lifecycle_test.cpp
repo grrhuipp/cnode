@@ -49,18 +49,15 @@ class DomainFixture {
 public:
     explicit DomainFixture(net::io_context& io)
         : io_(io),
-          previous_users_(UserStore::ExchangeWorkerView({})),
           coordinator_(std::make_shared<GroupCoordinator>(io)) {
-        coordinator_->RegisterWorker(0, io, io.get_executor());
+        UserStore::ClearWorkerView();
+        coordinator_->RegisterWorker(0, io);
     }
     ~DomainFixture() {
         Shutdown();
-        memory::ScopedAllocationDomain allocation(memory_);
         users_.reset();
-        UserStore::InstallWorkerView(std::move(previous_users_));
+        UserStore::ClearWorkerView();
     }
-
-    memory::AllocationDomain& Memory() noexcept { return memory_; }
     net::any_io_executor Executor() { return io_.get_executor(); }
 
     void InstallUsers(std::span<const UserStore::UserUpdate> updates) {
@@ -73,7 +70,6 @@ public:
 
     void Shutdown() {
         if (!coordinator_) return;
-        memory::ScopedAllocationDomain allocation(memory_);
         coordinator_->CloseAdmission();
         std::exception_ptr failure;
         bool joined = false;
@@ -91,9 +87,7 @@ public:
 
 private:
     net::io_context& io_;
-    memory::AllocationDomain memory_;
     UserStore::WorkerView users_;
-    UserStore::WorkerView previous_users_;
     std::shared_ptr<GroupCoordinator> coordinator_;
 };
 
@@ -276,7 +270,6 @@ net::awaitable<RelayResult> RunMux(std::unique_ptr<AsyncStream> stream,
 bool RunCase(int mode, bool baseline, bool blocked_writes = false, bool mux = false) {
     net::io_context io;
     DomainFixture domain(io);
-    memory::ScopedAllocationDomain allocation(domain.Memory());
     StreamState stream(io);
     const auto hash = anytls::PasswordHash("lifecycle-test");
     stream.input.assign(hash.begin(), hash.end());
@@ -419,7 +412,6 @@ void RunHandshakeCase(int mode, bool baseline = false) {
         "synack-memory-error", "synack-link-error", "synack-unexpected-error"};
     net::io_context io;
     DomainFixture domain(io);
-    memory::ScopedAllocationDomain allocation(domain.Memory());
     StreamState stream(io);
     const auto hash = anytls::PasswordHash("handshake-test");
     stream.input.assign(hash.begin(), hash.end());
@@ -529,7 +521,6 @@ void RunIdentityCase(int mode, bool baseline) {
         "descending", "zero", "syn-payload", "wraparound", "valid-gap", "fin-before-target", "payload-after-retirement"};
     net::io_context io;
     DomainFixture domain(io);
-    memory::ScopedAllocationDomain allocation(domain.Memory());
     StreamState stream(io);
     const auto hash = anytls::PasswordHash("identity-test");
     stream.input.assign(hash.begin(), hash.end());
@@ -644,7 +635,6 @@ void RunParsingCase(int mode) {
         "invalid-type", "empty-domain", "zero-port", "truncated", "cancel-pending", "oversized-domain", "invalid-uot-request"};
     net::io_context io;
     DomainFixture execution(io);
-    memory::ScopedAllocationDomain allocation(execution.Memory());
     StreamState stream(io);
     const auto hash = anytls::PasswordHash("parsing-test");
     stream.input.assign(hash.begin(), hash.end());
@@ -765,7 +755,6 @@ void RunQueueCase(int mode, bool baseline = false, uint32_t seed = 0) {
         "byte-budget-backpressure", "cancel-full-queue", "maximum-tiny-fragments", "random-fragments"};
     net::io_context io;
     DomainFixture domain(io);
-    memory::ScopedAllocationDomain allocation(domain.Memory());
     StreamState stream(io);
     const auto hash = anytls::PasswordHash("queue-test");
     stream.input.assign(hash.begin(), hash.end());
@@ -945,7 +934,6 @@ public:
 void RunMuxUdpCase(int mode) {
     net::io_context io;
     DomainFixture domain(io);
-    memory::ScopedAllocationDomain allocation(domain.Memory());
     StreamState stream(io);
     MuxUdpDispatcher dispatcher(io);
     dispatcher.pause = mode >= 2;

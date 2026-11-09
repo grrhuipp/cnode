@@ -34,6 +34,12 @@ public:
     // A persistent HTTP/1 connection began its next request, which gets a
     // fresh transport handshake budget; OnInboundTransportReady ends it.
     virtual void OnInboundTransportRequest(AsyncStream&) {}
+    [[nodiscard]] virtual std::chrono::seconds TransportHandshakeTimeout() const noexcept {
+        return std::chrono::seconds{0};
+    }
+    [[nodiscard]] virtual std::chrono::seconds TransportIdleTimeout() const noexcept {
+        return std::chrono::seconds{0};
+    }
 };
 
 // REALITY dest fallback stays in the transport layer (as in Xray) but reuses

@@ -35,8 +35,6 @@ public:
     using HandlerPtr = std::shared_ptr<Handler>;
 
     [[nodiscard]] HandlerPtr GetHandler(std::string_view tag) noexcept;
-    [[nodiscard]] std::shared_ptr<const Handler>
-    GetHandler(std::string_view tag) const noexcept;
 
     [[nodiscard]] std::unique_ptr<::Inbound> NewHandler(
         ::ConnectionLimiter* limiter,

@@ -216,10 +216,10 @@ void Check2022(const TargetAddress& target,
     const auto prepare_view = [](const proxyman::inbound::PreparedShadowsocksUsers& prepared) {
         using proxyman::inbound::UserStore;
         constexpr std::string_view tag = "ss-udp-datagram-test";
-        auto previous = UserStore::ExchangeWorkerView(UserStore::PrepareWorkerView(
+        UserStore::InstallWorkerView(UserStore::PrepareWorkerView(
             UserStore::PrepareUsers(tag, proxyman::inbound::UserSet{prepared})));
         auto view = UserStore::ShadowsocksUsers(tag);
-        UserStore::InstallWorkerView(std::move(previous));
+        UserStore::ClearWorkerView();
         return view;
     };
     const auto users = prepare_view(prepared_users);

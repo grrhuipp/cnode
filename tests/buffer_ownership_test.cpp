@@ -429,8 +429,7 @@ TEST(BufferOwnership, Contract) {
 }
 
 TEST(BufferOwnership, PartialConsumptionReturnsSpillStorageWithoutCopyingPayload) {
-    ::memory::AllocationDomain domain;
-    ::memory::ScopedAllocationDomain lease(domain);
+    const auto baseline = ::memory::ThreadMemoryPool().OutstandingAllocations();
     ::buf::MultiBuffer payload;
     payload.reserve(4096);
     for (size_t i = 0; i < 4096; ++i)
@@ -442,7 +441,7 @@ TEST(BufferOwnership, PartialConsumptionReturnsSpillStorageWithoutCopyingPayload
     EXPECT_EQ(payload.DropPrefixBytes(4096 - ::buf::MultiBuffer::kInlineCapacity),
               4096 - ::buf::MultiBuffer::kInlineCapacity);
     ASSERT_EQ(payload.size(), ::buf::MultiBuffer::kInlineCapacity);
-    EXPECT_EQ(domain.OutstandingAllocations(), payload.size());
+    EXPECT_EQ(::memory::ThreadMemoryPool().OutstandingAllocations() - baseline, payload.size());
     EXPECT_TRUE(Consistent(payload));
     EXPECT_EQ(payload.back(), last);
     EXPECT_TRUE(last->UDP().SameEndpoint(endpoint));
@@ -456,12 +455,11 @@ TEST(BufferOwnership, PartialConsumptionReturnsSpillStorageWithoutCopyingPayload
         EXPECT_EQ(buffer->Bytes()[0], static_cast<uint8_t>(4096 - ::buf::MultiBuffer::kInlineCapacity + i));
     }
     EXPECT_TRUE(moved.empty());
-    EXPECT_EQ(domain.OutstandingAllocations(), 0);
+    EXPECT_EQ(::memory::ThreadMemoryPool().OutstandingAllocations(), baseline);
 }
 
 TEST(BufferOwnership, MovedInlineAndSpilledContainersRemainReusable) {
-    memory::AllocationDomain domain;
-    memory::ScopedAllocationDomain lease(domain);
+    const auto baseline = memory::ThreadMemoryPool().OutstandingAllocations();
     for (const size_t source_count : {0u, 1u, 8u, 9u, 16u}) {
         for (const size_t destination_count : {0u, 1u, 9u}) {
             SCOPED_TRACE(source_count);
@@ -493,7 +491,7 @@ TEST(BufferOwnership, MovedInlineAndSpilledContainersRemainReusable) {
             source.clear();
             destination.clear();
             transferred.clear();
-            EXPECT_EQ(domain.OutstandingAllocations(), 0u);
+            EXPECT_EQ(memory::ThreadMemoryPool().OutstandingAllocations(), baseline);
         }
     }
 }
@@ -625,14 +623,13 @@ TEST(BufferOwnership, UnrepresentableWriteCapacityReturnsFailureAndAllowsReuse) 
     EXPECT_EXIT(([] {
         bool passed = true;
         for (const size_t initial_size : {size_t{32}, size_t{buf::Buffer::kSize + 1}}) {
-            memory::AllocationDomain domain;
-            memory::ScopedAllocationDomain lease(domain);
+            const auto baseline = memory::ThreadMemoryPool().OutstandingAllocations();
             {
                 buf::ContiguousWriteBuffer storage;
                 (void)storage.Prepare(initial_size);
                 passed &= storage.TryPrepare(std::numeric_limits<size_t>::max()) == nullptr;
                 passed &= storage.Empty() && storage.Data() == nullptr;
-                passed &= domain.OutstandingAllocations() == 0;
+                passed &= memory::ThreadMemoryPool().OutstandingAllocations() == baseline;
 
                 const auto expected = Pattern(
                     initial_size <= buf::Buffer::kSize ? buf::Buffer::kSize + 1 : 33);
@@ -644,7 +641,7 @@ TEST(BufferOwnership, UnrepresentableWriteCapacityReturnsFailureAndAllowsReuse) 
                 passed &= Flatten(output) == expected && Consistent(output);
                 passed &= storage.Empty() && storage.Data() == nullptr;
             }
-            passed &= domain.OutstandingAllocations() == 0;
+            passed &= memory::ThreadMemoryPool().OutstandingAllocations() == baseline;
         }
         std::_Exit(passed ? 0 : 1);
     }()), ::testing::ExitedWithCode(0), "");

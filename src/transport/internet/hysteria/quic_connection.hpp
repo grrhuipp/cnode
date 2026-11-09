@@ -59,7 +59,7 @@ public:
     Connection& operator=(const Connection&) = delete;
 
     bool Feed(SocketState& socket, const udp::endpoint& remote,
-              std::span<const uint8_t> packet);
+              std::span<const uint8_t> packet, bool flush = true);
     void OnExpiry();
     [[nodiscard]] ngtcp2_tstamp Expiry() const noexcept {
         return std::min(fragment_expiry_,
@@ -67,8 +67,8 @@ public:
                                 : std::numeric_limits<ngtcp2_tstamp>::max());
     }
     [[nodiscard]] bool Closed() const noexcept { return closed_; }
+    [[nodiscard]] bool Retired() const noexcept { return retired_; }
     void Close() noexcept;
-    [[nodiscard]] const std::shared_ptr<QuicOwnership>& Ownership() const noexcept { return ownership_; }
     [[nodiscard]] net::any_io_executor Executor() const { return reactor_.get_executor(); }
     [[nodiscard]] net::io_context& Reactor() const noexcept { return reactor_; }
     [[nodiscard]] bool Authenticated() const noexcept { return authenticated_; }
@@ -110,8 +110,7 @@ private:
         bool delivered = false;
     };
     struct Core {
-        explicit Core(memory::AllocationDomain& domain)
-            : memory(domain) {}
+        Core() = default;
         ~Core() {
             if (quic) ngtcp2_conn_del(quic);
             if (http) nghttp3_conn_del(http);
@@ -135,6 +134,14 @@ private:
         // Registered sessions; each unregisters itself on destruction and is
         // detached here first when the connection closes.
         memory::ThreadLocalUnorderedMap<uint32_t, UdpSessionStream*> udp_sessions;
+        struct PendingInputPacket {
+            std::shared_ptr<SocketState> socket;
+            udp::endpoint remote;
+            memory::ThreadLocalVector<uint8_t> bytes;
+        };
+        memory::ThreadLocalDeque<PendingInputPacket> inbox;
+        size_t inbox_bytes = 0;
+        bool pump_scheduled = false;
     };
     struct PendingFragments {
         TargetAddress target;
@@ -235,12 +242,7 @@ private:
 
     QuicListener* listener_;
     net::io_context& reactor_;
-    memory::AllocationDomain allocation_;
-    std::shared_ptr<app::PhysicalSessionCapabilities> capabilities_;
-    std::shared_ptr<QuicOwnership> ownership_;
     memory::ThreadLocalVector<ConnectionId> connection_ids_;
-    std::shared_ptr<app::PhysicalSessionRegistry> registry_;
-    std::shared_ptr<app::PhysicalSessionRecord> registry_record_;
     AwaitableTaskGroup* tasks_ = nullptr;
     SignalChannel closed_signal_;
     std::unique_ptr<Core> core_;
@@ -252,6 +254,7 @@ private:
     memory::ThreadLocalUnorderedMap<uint64_t, PendingFragments> fragments_;
     // 续期或删除后允许保留较早的唤醒；到期时重算，避免逐片扫描。
     ngtcp2_tstamp fragment_expiry_ = std::numeric_limits<ngtcp2_tstamp>::max();
+    ngtcp2_tstamp expiry_ = std::numeric_limits<ngtcp2_tstamp>::max();
     uint32_t next_udp_session_id_ = 1;
     uint16_t next_udp_packet_id_ = 0;
     PhysicalAdmission physical_ = PhysicalAdmission::Pending;
@@ -259,6 +262,7 @@ private:
     bool authenticated_ = false;
     bool stats_open_ = false;
     bool in_ngtcp2_callback_ = false;
+    bool retired_ = false;
     bool closed_ = false;
 };
 

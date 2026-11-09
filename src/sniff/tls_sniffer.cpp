@@ -182,7 +182,7 @@ SniffResult SniffTls(std::span<const uint8_t> data) {
         return result;
     }
 
-    std::array<uint8_t, kMaxTlsSniffHandshakeBytes> reassembled{};
+    std::array<uint8_t, kMaxTlsSniffHandshakeBytes> reassembled;
     std::copy_n(record.data(), record.size(), reassembled.data());
     size_t reassembled_size = record.size();
     size_t record_headers_bytes = kTlsRecordHeaderBytes;

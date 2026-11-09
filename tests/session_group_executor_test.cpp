@@ -26,8 +26,8 @@ TEST(SessionGroupExecutor, WorkerRouteRegistrationAndBoundedCoordinatorControl) 
     auto second_work = net::make_work_guard(second);
 
     auto coordinator = std::make_shared<GroupCoordinator>(control, 2);
-    coordinator->RegisterWorker(0, first, first.get_executor());
-    coordinator->RegisterWorker(1, second, second.get_executor());
+    coordinator->RegisterWorker(0, first);
+    coordinator->RegisterWorker(1, second);
 
     Require(coordinator->WorkerCount() == 2, "worker count mismatch");
     Require(GroupCoordinator::ForContext(control) == coordinator.get(), "control context binding missing");
@@ -35,11 +35,6 @@ TEST(SessionGroupExecutor, WorkerRouteRegistrationAndBoundedCoordinatorControl) 
     Require(GroupCoordinator::ForContext(second) == coordinator.get(), "worker 1 context binding missing");
     Require(GroupCoordinator::WorkerIdForContext(first) == 0u, "worker 0 id mismatch");
     Require(GroupCoordinator::WorkerIdForContext(second) == 1u, "worker 1 id mismatch");
-    Require(coordinator->FindWorker(0).has_value() && coordinator->FindWorker(0)->reactor == &first,
-            "FindWorker(0) failed");
-    Require(coordinator->FindWorker(1).has_value() && coordinator->FindWorker(1)->reactor == &second,
-            "FindWorker(1) failed");
-    Require(!coordinator->FindWorker(99).has_value(), "FindWorker(99) unexpectedly succeeded");
 
     std::thread control_thread([&] { control.run(); });
     std::thread first_thread([&] { first.run(); });

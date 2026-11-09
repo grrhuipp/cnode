@@ -3,8 +3,7 @@
 #include "udp_ingress.hpp"
 #include "common/container_util.hpp"
 
-#include <atomic>
-#include <unordered_map>
+#include <utility>
 
 namespace worker_detail {
 
@@ -31,9 +30,7 @@ struct UdpHandoffIdentityHash {
 struct UdpHandoffRecord {
     std::unique_ptr<InboundDatagramAssociation> association;
     std::weak_ptr<UdpIngress::ClientSession> session;
-    uint32_t owner = 0;
     std::shared_ptr<const proxyman::inbound::ProtocolSettings> configuration;
-
     explicit UdpHandoffRecord(const InboundDatagramAssociationPolicy& policy)
         : association(policy.create()) {}
 };
@@ -41,7 +38,7 @@ class UdpHandoffDirectory final {
 public:
     UdpHandoffDirectory() = default;
 
-    // Called only on GroupCoordinator. A tombstone is retained after its live
+    // Worker-local directory. A tombstone is retained after its live
     // association ends until the entire timestamp/replay protection expires.
     std::shared_ptr<UdpHandoffRecord> Claim(
         const UdpHandoffIdentity& key,
@@ -50,18 +47,18 @@ public:
         using Clock = InboundDatagramAssociation::Clock;
         if (auto found = records_.find(key); found != records_.end()) {
             if (&found->second->association->Policy() != &policy ||
-                found->second->association->claimed.exchange(true, std::memory_order_acq_rel))
+                std::exchange(found->second->association->claimed, true))
                 return {};
             const auto protected_until = found->second->association->ProtectedUntil();
             if (found->second->session.expired() &&
                 protected_until != Clock::time_point{} &&
                 protected_until < Clock::now()) {
                 try {
-                    auto record = std::make_shared<UdpHandoffRecord>(policy);
+                    auto record = memory::AllocateShared<UdpHandoffRecord>(policy);
                     record->configuration = std::move(configuration);
                     found->second = std::move(record);
                 } catch (...) {
-                    found->second->association->claimed.store(false, std::memory_order_release);
+                    found->second->association->claimed = false;
                     throw;
                 }
             }
@@ -71,7 +68,7 @@ public:
             const auto now = std::chrono::steady_clock::now();
             for (auto it = records_.begin(); it != records_.end();) {
                 const auto& row = *it->second;
-                if (!row.association->claimed.load(std::memory_order_acquire) &&
+                if (!row.association->claimed &&
                     row.session.expired() && row.association->ProtectedUntil() < now)
                     it = records_.erase(it);
                 else ++it;
@@ -79,13 +76,13 @@ public:
             MaybeShrinkHashContainer(records_);
             if (records_.size() >= policy.capacity) return {};
         }
-        auto record = std::make_shared<UdpHandoffRecord>(policy);
+        auto record = memory::AllocateShared<UdpHandoffRecord>(policy);
         record->configuration = std::move(configuration);
         records_.emplace(key, record);
         return record;
     }
 private:
-    std::unordered_map<UdpHandoffIdentity, std::shared_ptr<UdpHandoffRecord>,
-                       UdpHandoffIdentityHash> records_;
+    memory::ThreadLocalUnorderedMap<UdpHandoffIdentity, std::shared_ptr<UdpHandoffRecord>,
+                                    UdpHandoffIdentityHash> records_;
 };
 } // namespace worker_detail

@@ -150,7 +150,7 @@ mise exec -- ctest --test-dir build/musl --no-tests=error \
   -R '^e2e\.reference_hysteria\..*/V2_' -V
 ```
 
-本地与 CI 使用同一份 mise 固定工具链、vcpkg 依赖基线和配置入口，均为 `Release` 并开启 LTO；测试配置统一运行 `mise run test:configure`。宿主发行版无需相同，不要求容器。密码学故障注入测试单独保留链接器可拦截的调用边界。CTest 使用不指定数量的 `--parallel`，按可用 CPU 自动调度。
+本地与 CI 使用同一份 mise 固定工具链、vcpkg 依赖基线和配置入口，均为 `Release`；本地默认关闭 LTO（`CNODE_ENABLE_LTO=OFF`），仅 CI 开启 LTO（`-DCNODE_ENABLE_LTO=ON`）；测试配置统一运行 `mise run test:configure`。宿主发行版无需相同，不要求容器。密码学故障注入测试单独保留链接器可拦截的调用边界。CTest 使用不指定数量的 `--parallel`，按可用 CPU 自动调度。
 
 CI 只对源码、测试、构建配置变更自动运行，纯文档和部署脚本变更不触发编译；也可手动运行。不设置工作流级并发分组，不同提交可同时运行。`build` job 复用同一构建树，`verify` 步骤统一执行单元、E2E 与静态 ELF 检查。vcpkg 缓存按依赖配置保存、ccache 按提交增量保存，两者在对应阶段成功后立即保存，不因后续测试失败丢失。仅分支 push 在验证通过后打包，`release` job 的 `publish` 步骤下载并发布产物；PR 和手动运行只验证。
 

@@ -1,8 +1,8 @@
 #include "app/bootstrap_runtime.hpp"
 
-#include "app/bootstrap_inbounds.hpp"
 #include "app/bootstrap_monitor.hpp"
-#include "app/bootstrap_shutdown.hpp"
+#include "app/bootstrap_setup.hpp"
+#include "app/runtime_publication.hpp"
 #include "app/dns/dns_worker.hpp"
 #include "infra/log.hpp"
 #include "infra/runtime_failure.hpp"
@@ -15,16 +15,50 @@
 #include <asio/co_spawn.hpp>
 #include <asio/post.hpp>
 #include <asio/redirect_error.hpp>
+#include <asio/signal_set.hpp>
 #include <asio/steady_timer.hpp>
 #include <atomic>
 #include <chrono>
+#include <csignal>
 #include <cstdlib>
 #include <exception>
 #include <format>
+#include <functional>
 #include <thread>
 #include <stdexcept>
 
 namespace {
+
+net::awaitable<void> StartWorkerInbounds(
+    Worker& worker,
+    std::vector<PreparedInbound> inbounds) {
+    worker.StartRuntime();
+
+    for (const auto& inbound : inbounds) {
+        const auto failure = co_await InstallInbound(worker, inbound);
+        if (failure != InboundInstallFailure::None) {
+            throw std::runtime_error(std::format(
+                "static inbound startup failed worker={} tag={} port={} stage={}",
+                worker.Id(), inbound.binding.tag, inbound.binding.port,
+                InboundInstallFailureName(failure)));
+        }
+    }
+}
+
+[[nodiscard]] std::unique_ptr<net::signal_set> InstallShutdownHandler(
+    net::io_context& io_context, std::function<void()> request_stop) {
+    auto signals = std::make_unique<net::signal_set>(io_context);
+    signals->add(SIGINT);
+    signals->add(SIGTERM);
+
+    signals->async_wait([request_stop = std::move(request_stop)](const IoErrorCode& ec, int signo) {
+        if (ec) return;
+        LOG_CONSOLE("Shutdown requested: signal={}", signo);
+        request_stop();
+    });
+
+    return signals;
+}
 
 // All state transitions run on main_ctx. Data threads may only publish one
 // failure notification, and remain in run() until their live owner has joined.

@@ -48,8 +48,7 @@ net::awaitable<Measurement> Transfer(
 }
 
 TEST(TcpSendBenchmark, VerifiedBursts) {
-    memory::AllocationDomain domain;
-    memory::ScopedAllocationDomain lease(domain);
+    const auto baseline = memory::ThreadMemoryPool().OutstandingAllocations();
     for (const std::size_t burst : {1u, 8192u, 65536u}) {
         for (const std::size_t pieces : {1u, 8u, 16u}) {
             if (pieces > burst) continue;
@@ -95,6 +94,6 @@ TEST(TcpSendBenchmark, VerifiedBursts) {
                 measured.wall_ns / iterations, measured.cpu_ns / iterations);
         }
     }
-    EXPECT_EQ(domain.OutstandingAllocations(), 0u);
+    EXPECT_EQ(memory::ThreadMemoryPool().OutstandingAllocations(), baseline);
 }
 } // namespace

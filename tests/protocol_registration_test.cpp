@@ -125,7 +125,9 @@ CreateOutboundConfig(
     const ::infra::OutboundSourceConfig&) {
     return ::proxyman::outbound::PreparedOutboundProxy{
         .create = ::proxyman::outbound::PreparedOutboundCreator{
+            {},
             [](std::string_view tag,
+               const std::shared_ptr<const ::proxyman::outbound::OutboundProtocolSettings>&,
                ::net::io_context&,
                ::AwaitableTaskGroup&) -> std::unique_ptr<::Outbound> {
                 return std::make_unique<DummyOutbound>(std::string(tag));
@@ -139,7 +141,9 @@ CreateNullOutboundConfig(
     const ::infra::OutboundSourceConfig&) {
     return ::proxyman::outbound::PreparedOutboundProxy{
         .create = ::proxyman::outbound::PreparedOutboundCreator{
+            {},
             [](std::string_view,
+               const std::shared_ptr<const ::proxyman::outbound::OutboundProtocolSettings>&,
                ::net::io_context&,
                ::AwaitableTaskGroup&) -> std::unique_ptr<::Outbound> {
                 return nullptr;

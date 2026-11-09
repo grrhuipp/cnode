@@ -15,7 +15,7 @@ namespace {
 TEST(ExecutorBenchmark, NativeIoContextDispatch) {
     net::io_context worker;
     auto coordinator = std::make_shared<GroupCoordinator>(worker, 64);
-    coordinator->RegisterWorker(0, worker, worker.get_executor());
+    coordinator->RegisterWorker(0, worker);
 
     constexpr std::size_t kIterations = 10000;
     std::size_t completed = 0;

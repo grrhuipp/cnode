@@ -40,7 +40,7 @@ void Require(bool condition, const char* message) {
 
 bool Same(const StreamSettings& a, const StreamSettings& b) {
     return a.network == b.network && a.security == b.security &&
-        a.network_mode == b.network_mode && a.security_mode == b.security_mode && a.flags == b.flags &&
+        a.network_mode == b.network_mode && a.security_mode == b.security_mode &&
         a.http.force_http2 == b.http.force_http2 && a.tls.min_version == b.tls.min_version &&
         a.tls.max_version == b.tls.max_version && a.tls.alpn == b.tls.alpn &&
         a.tls.server_name == b.tls.server_name && a.tls.allow_insecure == b.tls.allow_insecure;

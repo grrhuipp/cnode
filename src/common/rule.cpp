@@ -11,8 +11,7 @@
 
 namespace rule {
 
-DetectRulePolicy::DetectRulePolicy()
-    : rules_(std::make_shared<const InboundRule>()) {}
+DetectRulePolicy::DetectRulePolicy() = default;
 DetectRulePolicy::~DetectRulePolicy() = default;
 
 void DetectRulePolicy::UpdateRule(std::string_view tag,
@@ -27,50 +26,21 @@ void DetectRulePolicy::UpdateRule(std::string_view tag,
 void DetectRulePolicy::UpdateSharedRule(std::string_view tag,
                                         RuleListPtr new_rule_list) {
     if (tag.empty()) return;
-    static std::atomic<uint64_t> next_generation{1};
-    const std::lock_guard lock(update_mutex_);
-    auto next = rules_ ? std::make_shared<InboundRule>(*rules_)
-                       : std::make_shared<InboundRule>();
     if (!new_rule_list || new_rule_list->empty()) {
-        if (auto it = next->find(tag); it != next->end()) next->erase(it);
-    } else {
-        next->insert_or_assign(std::string(tag), std::move(new_rule_list));
+        if (auto it = rules_.find(tag); it != rules_.end()) {
+            rules_.erase(it);
+        }
+        return;
     }
-    const bool non_empty = !next->empty();
-    rules_ = std::move(next);
-    generation_.store(next_generation.fetch_add(1, std::memory_order_relaxed) + 1,
-                      std::memory_order_release);
-    has_rules_.store(non_empty, std::memory_order_release);
+    rules_.insert_or_assign(std::string(tag), std::move(new_rule_list));
 }
 
 bool DetectRulePolicy::Blocked(const session::Context& ctx) {
-    if (ctx.inbound.user_id <= 0) {
+    if (ctx.inbound.user_id <= 0 || rules_.empty()) {
         return false;
     }
-    if (!has_rules_.load(std::memory_order_acquire)) {
-        return false;
-    }
-
-    struct LocalCache {
-        const DetectRulePolicy* owner = nullptr;
-        uint64_t generation = 0;
-        std::shared_ptr<const InboundRule> snapshot;
-    };
-    thread_local LocalCache tl_cache;
-
-    const uint64_t gen = generation_.load(std::memory_order_acquire);
-    if (tl_cache.owner != this || tl_cache.generation != gen || !tl_cache.snapshot) {
-        const std::lock_guard lock(update_mutex_);
-        tl_cache.owner = this;
-        tl_cache.generation = generation_.load(std::memory_order_relaxed);
-        tl_cache.snapshot = rules_;
-    }
-    const auto& rules = tl_cache.snapshot;
-    if (!rules) {
-        return false;
-    }
-    const auto rules_it = rules->find(ctx.inbound.tag);
-    if (rules_it == rules->end() || !rules_it->second || rules_it->second->empty()) {
+    const auto rules_it = rules_.find(ctx.inbound.tag);
+    if (rules_it == rules_.end() || !rules_it->second || rules_it->second->empty()) {
         return false;
     }
     const auto& rule_list = *rules_it->second;

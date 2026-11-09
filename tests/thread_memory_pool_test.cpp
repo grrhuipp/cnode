@@ -430,16 +430,7 @@ bool RunLargeBlockCache() {
 bool RunRequestArenaAndContext() {
     CountingResource upstream;
     {
-        worker_memory worker(upstream, {.request_initial_buffer_bytes_ = 512});
-        std::array<std::byte, 256> initial{};
-        request_memory parent(worker, initial);
-        const auto before = upstream.allocations;
-        void* in_place = parent.resource()->allocate(128, 16);
-        std::memset(in_place, 0x5a, 128);
-        if (upstream.allocations != before || parent.upstream_resource() != worker.resource()) {
-            return false;
-        }
-
+        worker_memory worker(upstream);
         auto* prev = std::pmr::set_default_resource(worker.resource());
         {
             ::session::Context ctx;
@@ -450,13 +441,6 @@ bool RunRequestArenaAndContext() {
             }
             ctx.inbound.tag = "panel/multi-tier-arena-test/node-100/vless/443";
             ctx.inbound.user_email = "arena-user-with-long-identifier@example.com";
-            request_memory stage(worker);
-            std::pmr::vector<int> arena_vec(stage.allocator<int>());
-            arena_vec.resize(64, 99);
-            if (arena_vec.back() != 99 || stage.upstream_resource() != worker.resource()) {
-                std::pmr::set_default_resource(prev);
-                return false;
-            }
         }
         {
             worker_memory deque_pool(upstream);
@@ -498,208 +482,60 @@ bool RejectsLeaseViolation(Action action) {
     return WIFEXITED(status) && WEXITSTATUS(status) == 73;
 }
 
-bool RunDomainMigration() {
-    struct Payload : ThreadAllocated {
-        explicit Payload(domain_memory_resource& memory) : arena(memory) {}
-        ThreadLocalVector<int> vector{1, 2, 3};
-        ThreadLocalString string = ThreadLocalString(80, 's');
-        ThreadLocalDeque<int> queue;
-        ThreadLocalUnorderedMap<int, ThreadLocalString> map;
-        ::buf::MultiBuffer buffers;
-        std::shared_ptr<int> shared = AllocateShared<int>(42);
-        request_memory arena;
-    };
-    AllocationDomain domain;
-    Payload* payload = nullptr;
-    std::pmr::memory_resource* original = nullptr;
-    {
-        ScopedAllocationDomain lease(domain);
-        original = domain.resource();
-        payload = new Payload(domain.memory());
-        payload->queue.push_back(9);
-        payload->map.try_emplace(1, 80, 'm');
-        for (int i = 0; i != 12; ++i) {
-            ::buf::BufferGuard buffer(::buf::Buffer::New());
-            if (!buffer) return false;
-            buffer->Tail()[0] = static_cast<uint8_t>(i);
-            buffer->Produce(1);
-            payload->buffers.push_back(std::move(buffer));
-        }
-        (void)payload->arena.resource()->allocate(9000, 16);
-        if (payload->vector.get_allocator().resource() != original ||
-            payload->string.get_allocator().resource() != original ||
-            payload->map.get_allocator().resource() != original ||
-            payload->map.at(1).get_allocator().resource() != original)
-            return false;
-        {
-            ScopedAllocationDomain nested(domain);
-            if (CurrentAllocationDomain() != &domain) return false;
-        }
-    }
-    bool intact = false;
-    {
-        ScopedAllocationDomain lease(domain);
-        intact = payload->vector.back() == 3 && payload->string.size() == 80 &&
-            payload->queue.front() == 9 && *payload->shared == 42 &&
-            payload->buffers.byte_size() == 12;
-        payload->vector.resize(1024, 8);
-        payload->string.append(120, 't');
-        (void)payload->arena.resource()->allocate(12000, 16);
-        delete payload;
-        intact = intact && domain.OutstandingAllocations() == 0;
-    }
-    ThreadMemoryPool().PurgeIdle();
-    return intact && ThreadMemoryPool().GetFootprint().mapped_bytes == 0 &&
-        CurrentAllocationDomain() == nullptr;
-}
-
-bool RunLeaseRejection() {
-    const bool no_lease = RejectsLeaseViolation([] {
-        AllocationDomain domain;
-        (void)domain.resource()->allocate(32, 16);
-    });
-    const bool other_domain = RejectsLeaseViolation([] {
-        AllocationDomain first, second;
-        ::buf::Buffer* buffer;
-        { ScopedAllocationDomain lease(first); buffer = ::buf::Buffer::New(); }
-        ScopedAllocationDomain wrong(second);
-        ::buf::Buffer::Free(buffer);
-    });
-    const bool concurrent = RejectsLeaseViolation([] {
-        AllocationDomain domain;
-        ScopedAllocationDomain lease(domain);
-        std::thread intruder([&] { ScopedAllocationDomain forbidden(domain); });
-        intruder.join();
-    });
-    const bool arena_bypass = RejectsLeaseViolation([] {
-        AllocationDomain first, second;
-        ScopedAllocationDomain lease(first);
-        std::array<std::byte, 512> initial;
-        request_memory arena(first.memory(), initial);
-        ScopedAllocationDomain wrong(second);
-        (void)arena.resource()->allocate(16, 8);
+bool RunCrossThreadRejection() {
+    const bool cross_thread_allocate = RejectsLeaseViolation([] {
+        worker_memory pool;
+        void* block = pool.Allocate(256, 16);
+        if (!block) std::_Exit(1);
+        std::thread wrong([&] { (void)pool.Allocate(256, 16); });
+        wrong.join();
     });
     const bool cross_thread_free = RejectsLeaseViolation([] {
         void* block = AllocatePmr(256, 16);
-        if (!block) std::terminate();
+        if (!block) std::_Exit(1);
         std::thread wrong([block] { DeallocatePmr(block); });
         wrong.join();
     });
-    return no_lease && other_domain && concurrent && arena_bypass && cross_thread_free;
-}
-
-bool RunJoinedDomainBorrow() {
-    auto first = std::make_unique<AllocationDomain>();
-    AllocationDomain second;
-    auto* resource = first->resource();
-    std::weak_ptr<void> arena = first->memory().Lifetime();
-    struct Raw : ThreadAllocated { int value = 17; };
-    Raw* raw;
-    ::buf::Buffer* buffer;
-    ThreadLocalVector<int>* vector;
-    ThreadLocalVector<int>* empty;
-    ThreadLocalDeque<int>* empty_queue;
-    {
-        ScopedAllocationDomain lease(*first);
-        buffer = ::buf::Buffer::New();
-        if (!buffer) return false;
-        buffer->Produce(1);
-        vector = new ThreadLocalVector<int>(32, 7);
-        empty = new ThreadLocalVector<int>;
-        empty_queue = new ThreadLocalDeque<int>;
-        raw = new Raw;
-        {
-            ThreadLocalVector<int> moved;
-            moved = std::move(*vector);
-            if (buffer->Len() != 1 || moved.get_allocator().resource() != resource ||
-                raw->value != 17)
-                return false;
-            moved.resize(10000, 8);
-            ::buf::Buffer::Free(buffer);
-            delete raw;
-        }
-    }
-    first.reset();
-    if (!arena.expired()) return false;
-    bool intact = false;
-    {
-        ScopedAllocationDomain lease(second);
-        vector->push_back(31);
-        intact = vector->get_allocator().resource() == second.resource() &&
-            vector->front() == 31;
-        delete vector;
-        {
-            ThreadLocalDeque<ThreadLocalString> nested_deque;
-            nested_deque.emplace_back(64, 'q');
-            const auto& self_alias = nested_deque;
-            nested_deque = self_alias;
-            intact = intact && nested_deque.size() == 1 &&
-                nested_deque.front().size() == 64 &&
-                nested_deque.front().find_first_not_of('q') == ThreadLocalString::npos &&
-                nested_deque.front().get_allocator().resource() == second.resource();
-            nested_deque.clear();
-            for (int i = 0; i < 8; ++i) {
-                nested_deque.emplace_back(32, static_cast<char>('a' + i));
-                nested_deque.push_back(nested_deque.front());
-                nested_deque.push_front(nested_deque.back());
-            }
-            nested_deque.clear();
-        }
-        empty->push_back(31);
-        intact = intact && empty->get_allocator().resource() == second.resource();
-        delete empty;
-        empty_queue->push_back(42);
-        intact = intact && empty_queue->get_allocator().resource() == second.resource();
-        delete empty_queue;
-    }
-    return intact;
+    return cross_thread_allocate && cross_thread_free;
 }
 
 bool RunWorkerSharedDomainPacking() {
     constexpr std::array<std::size_t, 13> strides{
         64, 80, 96, 112, 128, 144, 160, 176, 192, 448, 512, 640, 1792};
-    constexpr std::size_t domains_count = 1000;
-    std::vector<std::unique_ptr<AllocationDomain>> domains;
-    std::vector<std::array<void*, strides.size()>> blocks(domains_count);
-    domains.reserve(domains_count);
-    ThreadMemoryPool().PurgeIdle();
-    const auto before = ThreadMemoryPool().GetFootprint().mapped_bytes;
+    constexpr std::size_t batches_count = 1000;
+    std::vector<std::array<void*, strides.size()>> blocks(batches_count);
+    auto& pool = ThreadMemoryPool();
+    pool.PurgeIdle();
+    if (pool.OutstandingAllocations() != 0) return false;
+    const auto before = pool.GetFootprint().mapped_bytes;
     std::size_t live_stride_bytes = 0;
-    for (const auto stride : strides) live_stride_bytes += stride * domains_count;
+    for (const auto stride : strides) live_stride_bytes += stride * batches_count;
 
-    for (std::size_t index = 0; index < domains_count; ++index) {
-        auto domain = std::make_unique<AllocationDomain>();
-        {
-            ScopedAllocationDomain lease(*domain);
-            for (std::size_t slot = 0; slot < strides.size(); ++slot) {
-                blocks[index][slot] =
-                    domain->resource()->allocate(strides[slot] - 16, 16);
-            }
+    for (std::size_t index = 0; index < batches_count; ++index) {
+        for (std::size_t slot = 0; slot < strides.size(); ++slot) {
+            blocks[index][slot] =
+                pool.Allocate(strides[slot] - 16, 16);
+            if (!blocks[index][slot]) return false;
         }
-        domains.push_back(std::move(domain));
     }
-    const auto mapped =
-        ThreadMemoryPool().GetFootprint().mapped_bytes - before;
-    if (sizeof(AllocationDomain) > 64 ||
-        sizeof(domain_memory_resource) > 128 ||
+    const auto mapped = pool.GetFootprint().mapped_bytes - before;
+    if (sizeof(ThreadLocalAllocator<std::byte>) != sizeof(void*) ||
+        pool.OutstandingAllocations() != batches_count * strides.size() ||
         mapped > live_stride_bytes * 2) return false;
 
     std::printf(
-        "worker-shared domain packing: domains=%zu live-stride=%zu mapped=%zu "
-        "domain=%zu resource=%zu\n",
-        domains_count, live_stride_bytes, mapped, sizeof(AllocationDomain),
-        sizeof(domain_memory_resource));
-    for (std::size_t index = 0; index < domains_count; ++index) {
-        ScopedAllocationDomain lease(*domains[index]);
+        "worker-shared domain packing: batches=%zu live-stride=%zu mapped=%zu "
+        "allocator=%zu\n",
+        batches_count, live_stride_bytes, mapped,
+        sizeof(ThreadLocalAllocator<std::byte>));
+    for (std::size_t index = 0; index < batches_count; ++index) {
         for (std::size_t slot = 0; slot < strides.size(); ++slot) {
-            domains[index]->resource()->deallocate(
-                blocks[index][slot], strides[slot] - 16, 16);
+            pool.Deallocate(blocks[index][slot], strides[slot] - 16, 16);
         }
-        if (domains[index]->OutstandingAllocations() != 0) return false;
     }
-    domains.clear();
-    ThreadMemoryPool().PurgeIdle();
-    return ThreadMemoryPool().GetFootprint().mapped_bytes == before;
+    if (pool.OutstandingAllocations() != 0) return false;
+    pool.PurgeIdle();
+    return pool.GetFootprint().mapped_bytes == before;
 }
 
 bool RunAll() {
@@ -711,11 +547,9 @@ bool RunAll() {
         Case{"ownership/PMR/OOM", RunOwnershipAndPmr}, Case{"Buffer", RunBuffer},
         Case{"shared allocation/alignment/exception", RunSharedAllocation},
         Case{"large block cache", RunLargeBlockCache},
-        Case{"request arena and session context", RunRequestArenaAndContext},
-        Case{"domain migration/RAII", RunDomainMigration},
-        Case{"lease violations", RunLeaseRejection},
-        Case{"joined domains release empty resource ownership", RunJoinedDomainBorrow},
-        Case{"Worker-shared domains compact sparse objects", RunWorkerSharedDomainPacking}}) {
+        Case{"session context and idle deque", RunRequestArenaAndContext},
+        Case{"cross-thread violations", RunCrossThreadRejection},
+        Case{"Worker-shared pool compacts sparse objects", RunWorkerSharedDomainPacking}}) {
         if (!test.run()) {
             std::fprintf(stderr, "pool case failed: %s\n", test.name);
             return false;
@@ -855,8 +689,7 @@ TEST(ThreadMemoryPool, AllocatorAwareDequeInsertionKeepsDestinationResource) {
 }
 
 TEST(ThreadMemoryPool, ByteVectorInsertPreservesReservedAndGrowingPrefixes) {
-    memory::AllocationDomain domain;
-    memory::ScopedAllocationDomain lease(domain);
+    const auto baseline = memory::ThreadMemoryPool().OutstandingAllocations();
     {
         memory::ThreadLocalVector<uint8_t> bytes;
         std::vector<uint8_t> expected;
@@ -869,13 +702,13 @@ TEST(ThreadMemoryPool, ByteVectorInsertPreservesReservedAndGrowingPrefixes) {
             expected.insert(expected.end(), input.begin(), input.end());
             ASSERT_EQ(bytes.size(), expected.size());
             EXPECT_TRUE(std::equal(expected.begin(), expected.end(), bytes.begin()));
-            EXPECT_EQ(bytes.get_allocator().resource(), domain.resource());
+            EXPECT_EQ(bytes.get_allocator().resource(), memory::CurrentResource());
         }
         bytes.clear();
         bytes.insert(bytes.end(), expected.begin(), expected.end());
         EXPECT_TRUE(std::equal(expected.begin(), expected.end(), bytes.begin(), bytes.end()));
     }
-    EXPECT_EQ(domain.OutstandingAllocations(), 0u);
+    EXPECT_EQ(memory::ThreadMemoryPool().OutstandingAllocations(), baseline);
 }
 
 TEST(ThreadMemoryPool, VectorPairAndMapConstructionPropagatesNestedAllocators) {
@@ -953,83 +786,4 @@ TEST(ThreadMemoryPool, TrivialCopyStillUsesAllocatorExtendedConstruction) {
         }
     }
     EXPECT_EQ(destination.live, 0u);
-}
-
-TEST(ThreadMemoryPool, RetiredAllocatorRebindsForNestedPairConstructionWithoutAllocate) {
-    using Pair = std::pair<memory::ThreadLocalString, memory::ThreadLocalString>;
-    auto retired = std::make_unique<memory::AllocationDomain>();
-    memory::ThreadLocalAllocator<Pair> allocator(retired->resource());
-    std::weak_ptr<void> lifetime = retired->memory().Lifetime();
-    retired.reset();
-    ASSERT_TRUE(lifetime.expired());
-
-    memory::AllocationDomain current;
-    memory::ScopedAllocationDomain lease(current);
-    {
-        // Stack storage avoids allocate()/resource() rebinding the allocator
-        // before construct() gets the chance to resolve the retired resource.
-        alignas(Pair) std::byte storage[sizeof(Pair)];
-        auto* pointer = reinterpret_cast<Pair*>(storage);
-        allocator.construct(pointer, std::piecewise_construct,
-            std::forward_as_tuple(80, 'a'), std::forward_as_tuple(90, 'b'));
-        auto destroy = [](Pair* pair) { std::destroy_at(pair); };
-        std::unique_ptr<Pair, decltype(destroy)> pair(pointer, destroy);
-        EXPECT_EQ(pair->first.get_allocator().resource(), current.resource());
-        EXPECT_EQ(pair->second.get_allocator().resource(), current.resource());
-        EXPECT_EQ(pair->first, memory::ThreadLocalString(80, 'a'));
-        EXPECT_EQ(pair->second, memory::ThreadLocalString(90, 'b'));
-    }
-    EXPECT_EQ(current.OutstandingAllocations(), 0u);
-}
-
-TEST(ThreadMemoryPool, DrainedBorrowedQueueReleasesRetiredDomainAndRebinds) {
-    auto retired = std::make_unique<memory::AllocationDomain>();
-    memory::AllocationDomain current;
-    std::weak_ptr<void> lifetime = retired->memory().Lifetime();
-    memory::RingDeque<int> queue(retired->resource());
-    {
-        memory::ScopedAllocationDomain lease(*retired);
-        queue.push_back(42);
-        EXPECT_EQ(queue.front(), 42);
-        queue.pop_front();
-    }
-    retired.reset();
-    ASSERT_TRUE(lifetime.expired());
-    {
-        memory::ScopedAllocationDomain lease(current);
-        EXPECT_EQ(queue.capacity(), 0u);
-        queue.push_back(73);
-        EXPECT_EQ(queue.front(), 73);
-        EXPECT_EQ(queue.get_allocator().resource(), current.resource());
-        queue.pop_front();
-        EXPECT_EQ(current.OutstandingAllocations(), 0u);
-    }
-    EXPECT_TRUE(lifetime.expired());
-    memory::ThreadMemoryPool().PurgeIdle();
-}
-
-TEST(ThreadMemoryPool, BorrowedQueueConstructsNestedPayloadsAfterHostRetirement) {
-    auto retired = std::make_unique<memory::AllocationDomain>();
-    memory::AllocationDomain current;
-    auto* original = retired->resource();
-    std::weak_ptr<void> lifetime = retired->memory().Lifetime();
-    memory::RingDeque<memory::ThreadLocalString> queue(original);
-    {
-        memory::ScopedAllocationDomain lease(*retired);
-        queue.emplace_back(80, 'a');
-        queue.clear();
-    }
-    retired.reset();
-    ASSERT_TRUE(lifetime.expired());
-    {
-        memory::ScopedAllocationDomain lease(current);
-        queue.emplace_back(80, 'f');
-        EXPECT_EQ(queue.front().get_allocator().resource(), current.resource());
-        EXPECT_EQ(queue.front().size(), 80u);
-        EXPECT_EQ(queue.front().find_first_not_of('f'), memory::ThreadLocalString::npos);
-        queue.clear();
-        EXPECT_EQ(current.OutstandingAllocations(), 0u);
-    }
-    EXPECT_TRUE(lifetime.expired());
-    memory::ThreadMemoryPool().PurgeIdle();
 }

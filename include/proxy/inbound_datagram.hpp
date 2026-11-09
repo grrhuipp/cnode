@@ -9,7 +9,6 @@
 #include <algorithm>
 #include "common/unsafe.hpp"
 #include <array>
-#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -82,22 +81,19 @@ public:
         return policy_;
     }
     [[nodiscard]] Clock::time_point ProtectedUntil() const noexcept {
-        return Clock::time_point(Clock::duration(protected_until_.load(std::memory_order_relaxed)));
+        return protected_until_;
     }
-    // A coordinator claim fences new local packets; source-executor drainage
-    // then excludes the already executing callback before control inspection.
-    std::atomic<bool> claimed{true};
+    // Guards against re-entrant local commits while handoff inspection/creation runs.
+    bool claimed{true};
 
 protected:
     void ProtectUntil(Clock::time_point deadline) noexcept {
-        // The coordinator reads only this deadline, never the mutable protocol
-        // state. The claim's acquire/release pair publishes ownership changes.
-        protected_until_.store(deadline.time_since_epoch().count(), std::memory_order_relaxed);
+        protected_until_ = deadline;
     }
 
 private:
     const InboundDatagramAssociationPolicy& policy_;
-    std::atomic<Clock::duration::rep> protected_until_{0};
+    Clock::time_point protected_until_{};
 };
 
 struct InboundDatagramAssociationPolicy {

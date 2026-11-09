@@ -117,11 +117,7 @@ SendShadowsocksHandshake(
     const OutboundDialer& dialer,
     const session::Context& ctx) {
     const TargetAddress protocol_target = use_uot
-        ? TargetAddress(
-            *prepared.config.uot_version == SsUotVersion::V1
-                ? proxy::uot::kV1MagicAddress
-                : proxy::uot::kMagicAddress,
-            0)
+        ? TargetAddress(proxy::uot::MagicAddress(*prepared.config.uot_version), 0)
         : target;
 
     stream.SetIdleTimeout(handshake_timeout);
@@ -254,7 +250,7 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
                         request_session->request_salt.bytes.size());
 
         if (use_uot &&
-            *prepared_->config.uot_version != SsUotVersion::V1) {
+            *prepared_->config.uot_version != proxy::uot::Version::V1) {
             if (auto ok = co_await WriteUotRequest(
                     *target_endpoint,
                     ctx.outbound.target,
@@ -304,7 +300,7 @@ const bool kSsOutboundRegistered = (::proxyman::outbound::RegisterProxy(
         std::string method(::constants::protocol::kAes256Gcm);
         std::string address;
         uint16_t port = 8388;
-        std::optional<::SsUotVersion> uot_version;
+        std::optional<::proxy::uot::Version> uot_version;
         // A present field of the wrong type is a configuration error, never
         // an implicit default.
         auto read_ss_server = [&](const ::json::object& obj) {

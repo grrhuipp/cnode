@@ -139,7 +139,6 @@ void TrafficJournal::Append(const app::UserTrafficSnapshot& traffic) {
         }
     };
     merge_rows(traffic);
-    for (const auto& token : traffic.domains) merge_rows(token.counters);
     if (merged.empty()) return;
     json::array rows;
     for (const auto& [uid, value] : merged) {

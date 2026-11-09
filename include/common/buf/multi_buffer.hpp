@@ -37,35 +37,26 @@ struct Buffer {
     // 回包=来源。TCP relay 路径通常不携带 endpoint，因此懒构造 TargetAddress。
     std::optional<TargetAddress> udp_;
 
-    // The slot records its connection domain while live. Joined domains may
-    // borrow it only while their common execution group is leased.
-    void RequireLease() const noexcept {
-        memory::RequireAllocationLease(this);
-    }
-
     // 有效数据视图 [start, end)
     std::span<uint8_t> Bytes() noexcept {
-        RequireLease();
         return {data + start, end - start};
     }
     std::span<const uint8_t> Bytes() const noexcept {
-        RequireLease();
         return {data + start, end - start};
     }
 
     // 可写尾部 [end, kSize)
-    std::span<uint8_t> Tail() noexcept { RequireLease(); return {data + end, kSize - end}; }
+    std::span<uint8_t> Tail() noexcept { return {data + end, kSize - end}; }
 
-    uint32_t Len()       const noexcept { RequireLease(); return end - start; }
-    uint32_t Available() const noexcept { RequireLease(); return kSize - end; }
-    bool     IsEmpty()   const noexcept { RequireLease(); return start == end; }
+    uint32_t Len()       const noexcept { return end - start; }
+    uint32_t Available() const noexcept { return kSize - end; }
+    bool     IsEmpty()   const noexcept { return start == end; }
 
     // 消费 n 字节（移动 start 游标，零 memmove）
-    void Advance(uint32_t n) noexcept { RequireLease(); start += n; }
+    void Advance(uint32_t n) noexcept { start += n; }
 
     // 写入 n 字节后调用（移动 end 游标）
-    void Produce(uint32_t n) noexcept { RequireLease(); end += n; }
-
+    void Produce(uint32_t n) noexcept { end += n; }
     // 将有效数据挪回 data[0]，为尾部追加腾出空间。只在已经消费过头部
     // 且调用方明确需要合并极小跨界片段时使用，避免常规 Advance 做 memmove。
     void CompactToFront() noexcept {
@@ -82,7 +73,6 @@ struct Buffer {
 
     // 重置游标（复用 buffer），同时清除 UDP endpoint 标记。
     void Reset() noexcept {
-        RequireLease();
         start = 0;
         end = 0;
         udp_.reset();
@@ -90,29 +80,17 @@ struct Buffer {
 
     // 设置/清除本 Buffer 的 UDP 对端地址。
     void SetUDP(const TargetAddress& dest) {
-        RequireLease();
         udp_ = dest;
     }
     void SetUDP(TargetAddress&& dest) {
-        RequireLease();
         udp_ = std::move(dest);
     }
     void ClearUDP() noexcept {
-        RequireLease();
         udp_.reset();
     }
-    [[nodiscard]] bool HasUDP() const noexcept { RequireLease(); return udp_.has_value(); }
-    [[nodiscard]] TargetAddress& UDP() noexcept { RequireLease(); return *udp_; }
-    [[nodiscard]] const TargetAddress& UDP() const noexcept { RequireLease(); return *udp_; }
-    void Adopt() {
-        RequireLease();
-        memory::AdoptPmr(this);
-        if (udp_ && udp_->IsDomain() &&
-            udp_->host.get_allocator().resource() != memory::CurrentResource()) {
-            udp_->host = memory::ThreadLocalString(
-                std::string_view(udp_->host), memory::CurrentResource());
-        }
-    }
+    [[nodiscard]] bool HasUDP() const noexcept { return udp_.has_value(); }
+    [[nodiscard]] TargetAddress& UDP() noexcept { return *udp_; }
+    [[nodiscard]] const TargetAddress& UDP() const noexcept { return *udp_; }
     // 从当前会话域（或控制面 Worker-local PMR）取得固定 8KB 块。只初始化游标，payload 保持
     // 未初始化，避免热路径无谓 memset。
     [[nodiscard]] static Buffer* New() noexcept {
@@ -132,7 +110,6 @@ struct Buffer {
         if (!b) {
             return;
         }
-        b->RequireLease();
         memory::OnBufferFree();
         b->~Buffer();
         memory::DeallocatePmr(b, sizeof(Buffer), alignof(Buffer));
@@ -255,20 +232,6 @@ public:
         return spill_ ? spill_->back() : inline_buffers_[inline_start_ + size_ - 1];
     }
 
-    void Adopt() {
-        for (Buffer* buffer : *this) {
-            if (buffer) buffer->Adopt();
-        }
-        if (spill_ && spill_->get_allocator().resource() != memory::CurrentResource()) {
-            memory::ThreadLocalVector<Buffer*> adopted;
-            adopted.reserve(size());
-            for (size_t i = spill_start_; i < spill_->size(); ++i) {
-                adopted.push_back((*spill_)[i]);
-            }
-            spill_.emplace(std::move(adopted));
-            spill_start_ = 0;
-        }
-    }
 
     void reserve(size_t n) {
         if (!spill_) {

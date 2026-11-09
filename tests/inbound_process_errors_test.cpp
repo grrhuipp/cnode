@@ -35,9 +35,7 @@ template<class Scenario>
 bool RunFixture(const RateLimitConfig& config, Scenario scenario) {
     net::io_context io;
     auto coordinator = std::make_shared<GroupCoordinator>(io);
-    coordinator->RegisterWorker(0, io, io.get_executor());
-    memory::AllocationDomain allocation;
-    memory::ScopedAllocationDomain lease(allocation);
+    coordinator->RegisterWorker(0, io);
     auto limiter = ConnectionLimiter::Acquire(config, coordinator);
     bool result = false;
     bool finalized = false;
@@ -84,9 +82,7 @@ void Raise(int fault) {
 
 class Stream final : public AsyncStream {
 public:
-    explicit Stream(State& state) : state_(state) {
-        Check(memory::CurrentAllocationDomain() != nullptr);
-    }
+    explicit Stream(State& state) : state_(state) {}
     State& GetState() noexcept { return state_; }
     ~Stream() override { if (state_.active != 0) std::terminate(); state_.destroyed = true; }
     net::awaitable<size_t> AsyncRead(net::mutable_buffer buffer) override {

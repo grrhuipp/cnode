@@ -42,6 +42,8 @@
 #include "common/error.hpp"
 #include "app/proxyman/inbound/handler.hpp"
 #include "proxy/inbound.hpp"
+#include "app/dispatcher/default_dispatcher.hpp"
+#include "app/proxyman/outbound/handler.hpp"
 
 #include <asio/bind_executor.hpp>
 #include <asio/ip/v6_only.hpp>
@@ -110,6 +112,7 @@ struct Worker::ListenerState : worker_detail::UdpReplySink {
     size_t udp_receive_loops = 0;
     size_t tcp_tasks = 0;
     size_t udp_reply_sends = 0;
+    uint32_t active_sessions = 0;
     bool stopping = false;
     struct TaskCancellation final
         : memory::ThreadAllocated
@@ -144,6 +147,7 @@ struct Worker::ListenerState : worker_detail::UdpReplySink {
                std::unique_ptr<TaskCancellation> registration) {
         auto cancel_slot = registration->signal.slot();
         ++tcp_tasks;
+        if (!listener) ++active_sessions;
         try {
             net::co_spawn(worker.io_context_,
                 std::move(task),
@@ -152,6 +156,7 @@ struct Worker::ListenerState : worker_detail::UdpReplySink {
                         std::exception_ptr error) mutable {
                         registration.reset();
                         --tcp_tasks;
+                        if (!listener) --active_sessions;
                         NotifyCompletion();
                         if (!error) return;
                         try { std::rethrow_exception(error); }
@@ -171,7 +176,11 @@ struct Worker::ListenerState : worker_detail::UdpReplySink {
                             } catch (...) {} // Reporting must not fail completion under memory pressure.
                         }
                     }));
-        } catch (...) { --tcp_tasks; throw; }
+        } catch (...) {
+            --tcp_tasks;
+            if (!listener) --active_sessions;
+            throw;
+        }
     }
 
     [[nodiscard]] bool StartListening(Worker& worker, const PortBinding& binding);
@@ -193,9 +202,10 @@ struct Worker::ListenerState : worker_detail::UdpReplySink {
         SlotPtr slot);
 
     static net::awaitable<void> ProcessReceivedConnection(
-        std::shared_ptr<app::PhysicalSessionRecord> record,
-        tcp::socket socket, tcp::endpoint remote_ep,
-        uint32_t accepted_worker);
+        Worker& worker,
+        std::shared_ptr<proxyman::inbound::Handler> inbound_handler,
+        TaskCancellation& registration,
+        tcp::socket socket, tcp::endpoint remote_ep);
 
     net::awaitable<void> UdpReceiveLoop(
         Worker& worker,
@@ -211,8 +221,7 @@ struct Worker::ListenerState : worker_detail::UdpReplySink {
         udp::socket* sock,
         udp::endpoint endpoint,
         buf::MultiBuffer payload,
-        uint32_t worker_id,
-        std::shared_ptr<worker_detail::UdpReplyFence> fence) override;
+        uint32_t worker_id) override;
     void StartUdpReplySend(worker_detail::UdpIngress& ingress,
                            std::string_view socket_key,
                            worker_detail::UdpIngress::SocketPtr sock,
@@ -259,10 +268,11 @@ struct Worker::RuntimeState {
     geo::GeoDatabase* geo_database = nullptr;
     std::shared_ptr<app::RequestLoadState> request_load;
     app::dns::DNSWorker& dns_worker;
-    std::shared_ptr<const app::SessionConfiguration> session_configuration;
-    app::PhysicalSessionRegistry::Records connections;
-    std::shared_ptr<app::PhysicalSessionRegistry> session_registry;
-
+    std::unique_ptr<app::dns::DNS> dns;
+    std::unique_ptr<ResidentTaskGroup> outbound_tasks;
+    std::unique_ptr<proxyman::outbound::OutboundConfiguration> outbounds;
+    std::unique_ptr<proxyman::outbound::HandlerLookup> outbound_handlers;
+    std::unique_ptr<app::dispatcher::DefaultDispatcher> dispatcher;
 
     // Constructed on this Worker's executor; outlives managers, retired
     // listeners and their request guards. Runtime teardown stays on that thread.
@@ -364,7 +374,7 @@ Worker::~Worker() = default;
 void Worker::SetGroupCoordinator(std::shared_ptr<GroupCoordinator> coordinator) {
     if (!coordinator || runtime_->started)
         throw std::logic_error("group coordinator must be installed before startup");
-    coordinator->RegisterWorker(id_, io_context_, io_context_.get_executor());
+    coordinator->RegisterWorker(id_, io_context_);
     group_coordinator_ = std::move(coordinator);
 }
 
@@ -373,7 +383,7 @@ void Worker::StartRuntime() {
         throw IoSystemError(net::error::operation_aborted);
     if (!group_coordinator_) {
         group_coordinator_ = std::make_shared<GroupCoordinator>(io_context_);
-        group_coordinator_->RegisterWorker(id_, io_context_, io_context_.get_executor());
+        group_coordinator_->RegisterWorker(id_, io_context_);
         owns_group_coordinator_ = true;
     }
     runtime_->Start(*this);
@@ -449,7 +459,6 @@ net::awaitable<void> Worker::DrainRuntimeTask() {
         IoErrorCode ec;
         co_await listeners.changed.async_wait(net::redirect_error(net::use_awaitable, ec));
     }
-    if (runtime_->session_registry) co_await runtime_->session_registry->AsyncJoin();
 }
 
 net::awaitable<void> Worker::AsyncDrain() {
@@ -488,10 +497,6 @@ void Worker::BeginStopOnWorker() noexcept {
         if (task->stream) task->stream->Cancel();
         task->signal.emit(net::cancellation_type::all);
     }
-    for (const auto& [key, record] : runtime_->connections) {
-        (void)key;
-        if (record->capabilities) record->capabilities->RequestStop();
-    }
 }
 
 net::awaitable<void> Worker::StopRuntimeTask() {
@@ -507,12 +512,15 @@ net::awaitable<void> Worker::StopRuntimeTask() {
     // They must finish before traversing or destroying those stable slots.
     co_await mailbox_->AsyncJoinAccepted();
     co_await DrainRuntimeTask();
-    if (runtime_->session_configuration)
-        co_await runtime_->session_configuration->outbounds->AsyncJoinHosts();
+    if (runtime_->outbound_tasks) {
+        runtime_->outbound_tasks->Tasks().Cancel();
+        co_await runtime_->outbound_tasks->AsyncJoin();
+    }
+    if (runtime_->outbounds)
+        co_await runtime_->outbounds->AsyncJoinHosts();
     co_await transport::internet::JoinXHttpClientTasks(io_context_);
     runtime_->memory_reclaimer.Stop();
     co_await TimeoutScheduler::AsyncReleaseForIoContext(io_context_);
-    runtime_->connections.clear();
     runtime_.reset();
     proxyman::inbound::UserStore::ClearWorkerView();
     if (owns_group_coordinator_ && group_coordinator_) {
@@ -568,12 +576,15 @@ void Worker::RuntimeState::Start(Worker& worker) {
     router = std::make_shared<app::router::Router>(config->routing, geo_database);
     LOG_DEBUG("router initialized worker={} rules={}",
               worker.id_, config->routing.rules.size());
-    session_configuration = std::make_shared<const app::SessionConfiguration>(
-        *config, router, detect_rule_policy);
-    session_configuration->outbounds->BindHosts(io_context, worker.id_,
-        worker.group_coordinator_);
-    session_registry = std::make_shared<app::PhysicalSessionRegistry>(
-        io_context, worker.id_, stats, *session_tracking, connections);
+    dns = std::make_unique<app::dns::DNS>(dns_worker);
+    outbound_tasks = std::make_unique<ResidentTaskGroup>(io_context.get_executor());
+    outbounds = std::make_unique<proxyman::outbound::OutboundConfiguration>(config->outbounds);
+    outbounds->BindHosts(io_context);
+    outbound_handlers = std::make_unique<proxyman::outbound::HandlerLookup>(
+        *outbounds, io_context, *dns, timeouts.DialTimeout(), outbound_tasks->Tasks());
+    dispatcher = std::make_unique<app::dispatcher::DefaultDispatcher>(
+        *router, *outbound_handlers, *detect_rule_policy,
+        *session_tracking, *dns, *request_load);
     started = true;
     startup_config.reset();
 }
@@ -801,7 +812,7 @@ bool Worker::ListenerState::EnqueueUdpReply(
     udp::socket* sock,
     udp::endpoint endpoint,
     buf::MultiBuffer payload,
-    uint32_t worker_id, std::shared_ptr<worker_detail::UdpReplyFence> fence) {
+    uint32_t worker_id) {
     auto* ingress = FindUdpIngress(socket_key);
     if (!ingress || !sock || !sock->is_open() || payload.empty()) {
         return false;
@@ -812,7 +823,7 @@ bool Worker::ListenerState::EnqueueUdpReply(
     }
 
     const auto admitted = ingress->EnqueueReply(
-        socket_key, std::move(endpoint), std::move(payload), std::move(fence));
+        socket_key, std::move(endpoint), std::move(payload));
     if (admitted == worker_detail::UdpIngress::ReplyEnqueueResult::Rejected) {
         return false;
     }
@@ -940,45 +951,13 @@ net::awaitable<void> Worker::ListenerState::AcceptLoop(
             continue;
         }
 
-        auto capabilities = app::PhysicalSessionCapabilities::Create(
-            worker.runtime_->session_configuration, worker.runtime_->connection_limiter,
-            worker.runtime_->request_load, worker.runtime_->dns_worker,
-            slot->prepared, inbound_handler->SharedReceiverSettings());
-        auto record = worker.runtime_->session_registry->Register(
-            std::move(capabilities));
-        ++tcp_tasks;
-        try {
-            net::co_spawn(worker.io_context_.get_executor(),
-                ProcessReceivedConnection(record, std::move(socket), remote_ep, worker.id_),
-                net::bind_executor(worker.io_context_.get_executor(),
-                    [this, &worker, record](std::exception_ptr error) {
-                        --tcp_tasks;
-                        NotifyCompletion();
-                        try {
-                            worker.runtime_->session_registry->CompleteOnOwner(record);
-                        } catch (...) {
-                            worker.ReportFailure(std::current_exception());
-                        }
-                        if (error) {
-                            try {
-                                try { std::rethrow_exception(error); }
-                                catch (const IoSystemError& failure) {
-                                    if (failure.code() != net::error::operation_aborted &&
-                                        failure.code() != net::error::eof)
-                                        LOG_CONN_WARN(record->conn_id, "session domain ended worker={} > {}", worker.id_, failure.what());
-                                } catch (const std::exception& failure) {
-                                    LOG_CONN_WARN(record->conn_id, "session domain ended worker={} > {}", worker.id_, failure.what());
-                                } catch (...) {
-                                    LOG_CONN_WARN(record->conn_id, "session domain ended worker={} > unknown error", worker.id_);
-                                }
-                            } catch (...) {} // Completion must remain safe when logging cannot allocate.
-                        }
-                    }));
-        } catch (...) {
-            --tcp_tasks;
-            worker.runtime_->session_registry->CancelRegistration(record);
-            throw;
-        }
+        auto registration = std::make_unique<TaskCancellation>(*this);
+        auto* registration_ptr = registration.get();
+        Spawn(worker,
+            ProcessReceivedConnection(
+                worker, std::move(inbound_handler), *registration_ptr,
+                std::move(socket), remote_ep),
+            false, std::move(registration));
     }
 }
 
@@ -987,49 +966,40 @@ net::awaitable<void> Worker::ListenerState::AcceptLoop(
 // ============================================================================
 
 net::awaitable<void> Worker::ListenerState::ProcessReceivedConnection(
-    std::shared_ptr<app::PhysicalSessionRecord> record, tcp::socket socket,
-    tcp::endpoint remote_ep, uint32_t accepted_worker) {
-    std::exception_ptr failure;
-    record->conn_id = session::NewID(accepted_worker);
-    try {
-        auto& reactor = static_cast<net::io_context&>(socket.get_executor().context());
-        record->capabilities->Initialize(reactor);
-        record->initialized.store(true, std::memory_order_release);
-        const auto& listener = record->capabilities->Receiver();
-        auto tcp_stream = std::make_unique<TcpStream>(std::move(socket));
-        session::Context ctx;
-        ctx.conn_id = record->conn_id;
-        ctx.worker_id = accepted_worker;
-        ctx.inbound.tag = listener.inbound_tag;
-        if (const auto* route_tags = listener.RouteInboundTags()) {
-            ctx.inbound.tags.reserve(route_tags->size());
-            for (const auto& tag : *route_tags) ctx.inbound.tags.emplace_back(tag);
-        }
-        const auto local_ep = tcp_stream->LocalEndpoint();
-        if (!local_ep.address().is_unspecified()) {
-            const auto local_addr = iputil::NormalizeAddress(local_ep.address());
-            ctx.inbound.local_endpoint = tcp::endpoint(local_addr, local_ep.port());
-        }
-        const auto normalized_remote = iputil::NormalizeAddress(remote_ep.address());
-        ctx.inbound.source_addr = normalized_remote;
-        ctx.inbound.source_ip = iputil::AddressText(normalized_remote).View();
-        ctx.inbound.source_port = remote_ep.port();
-        LOG_CONN_DEBUG(ctx, "accepted TCP worker={} source={}:{}",
-                       accepted_worker, ctx.inbound.source_ip, ctx.inbound.source_port);
-        co_await record->capabilities->ProcessTCP(std::move(tcp_stream), ctx);
-    } catch (...) { failure = std::current_exception(); }
-    try { co_await record->capabilities->AsyncJoin(); }
-    catch (...) { if (!failure) failure = std::current_exception(); }
-    try {
-        record->completed_traffic =
-            record->capabilities->Tracking().ExtractAvailableTraffic(
-                record->accounting_key);
-    } catch (...) {
-        if (!failure) failure = std::current_exception();
+    Worker& worker,
+    std::shared_ptr<proxyman::inbound::Handler> inbound_handler,
+    TaskCancellation& registration,
+    tcp::socket socket,
+    tcp::endpoint remote_ep) {
+    app::RequestLoadState::PhysicalConnectionScope physical(*worker.runtime_->request_load);
+    const auto& listener = inbound_handler->ReceiverSettings();
+    auto tcp_stream = std::make_unique<TcpStream>(std::move(socket));
+    registration.stream = tcp_stream.get();
+    registration.Resubscribe(tcp_stream->Cancellation());
+    session::Context ctx;
+    ctx.conn_id = session::NewID(worker.id_);
+    ctx.worker_id = worker.id_;
+    ctx.inbound.tag = listener.inbound_tag;
+    if (const auto* route_tags = listener.RouteInboundTags()) {
+        ctx.inbound.tags.reserve(route_tags->size());
+        for (const auto& tag : *route_tags) ctx.inbound.tags.emplace_back(tag);
     }
-    if (record->capabilities->Initialized())
-        record->final_stats = record->capabilities->Stats().Snapshot();
-    if (failure) std::rethrow_exception(failure);
+    const auto local_ep = tcp_stream->LocalEndpoint();
+    if (!local_ep.address().is_unspecified()) {
+        const auto local_addr = iputil::NormalizeAddress(local_ep.address());
+        ctx.inbound.local_endpoint = tcp::endpoint(local_addr, local_ep.port());
+    }
+    const auto normalized_remote = iputil::NormalizeAddress(remote_ep.address());
+    ctx.inbound.source_addr = normalized_remote;
+    ctx.inbound.source_ip = iputil::AddressText(normalized_remote).View();
+    ctx.inbound.source_port = remote_ep.port();
+    LOG_CONN_DEBUG(ctx, "accepted TCP worker={} source={}:{}",
+                   worker.id_, ctx.inbound.source_ip, ctx.inbound.source_port);
+    co_await inbound_handler->ProcessAcceptedTCP(
+        worker.io_context_, *worker.runtime_->dispatcher,
+        worker.runtime_->stats, *worker.runtime_->request_load,
+        worker.runtime_->timeouts, std::move(tcp_stream), ctx,
+        worker.runtime_->dns.get());
 }
 
 // ============================================================================
@@ -1091,15 +1061,18 @@ bool Worker::RegisterInbound(
     }
     slot_it->second->handler = registered;
     slot_it->second->prepared = std::move(prepared);
+    auto* protocol_runtime = runtime_->inbound_handlers->GetOrCreateRuntime(req.protocol);
     slot_it->second->datagram_environment = app::DatagramSessionEnvironment{
-        .configuration = runtime_->session_configuration,
-        .limiter = runtime_->connection_limiter,
-        .request_load = runtime_->request_load,
-        .dns_worker = &runtime_->dns_worker,
+        .timeouts = runtime_->timeouts,
+        .dispatcher = runtime_->dispatcher.get(),
+        .stats = &runtime_->stats,
+        .limiter = runtime_->connection_limiter.get(),
+        .request_load = runtime_->request_load.get(),
+        .tracker = protocol_runtime ? protocol_runtime->OnlineTracker() : nullptr,
+        .active_sessions = &runtime_->listener_state->active_sessions,
+        .handler = registered,
         .prepared = slot_it->second->prepared,
         .receiver = registered->SharedReceiverSettings(),
-        .coordinator = group_coordinator_,
-        .registry = runtime_->session_registry,
     };
     return true;
 }
@@ -1110,7 +1083,8 @@ void Worker::AddOutbound(proxyman::outbound::PreparedOutboundConfig config) {
         !runtime_ || runtime_->listener_state->stopping)
         throw IoSystemError(net::error::operation_aborted);
     ColdMutationGuard mutation(runtime_->cold_mutation_active, runtime_->listener_state.get());
-    runtime_->session_configuration->outbounds->Replace(config);
+    runtime_->outbounds->Replace(config);
+    if (runtime_->outbound_handlers) runtime_->outbound_handlers->Refresh();
 
     LOG_DEBUG("registered dynamic outbound worker={} protocol={} tag={}",
               id_, config.protocol, config.tag);
@@ -1122,18 +1096,13 @@ void Worker::RemoveOutbound(std::string_view tag) {
         !runtime_ || runtime_->listener_state->stopping)
         throw IoSystemError(net::error::operation_aborted);
     ColdMutationGuard mutation(runtime_->cold_mutation_active, runtime_->listener_state.get());
-    runtime_->session_configuration->outbounds->Remove(tag);
+    runtime_->outbounds->Remove(tag);
+    if (runtime_->outbound_handlers) runtime_->outbound_handlers->Refresh();
 }
 
 void Worker::InstallUserView(proxyman::inbound::UserStore::WorkerView view) {
     if (stop_requested_.load(std::memory_order_relaxed) || !runtime_) return;
-    proxyman::inbound::UserStore::InstallWorkerView(view);
-    for (const auto& [key, record] : runtime_->connections) {
-        (void)key;
-        if (record->finished.load(std::memory_order_acquire) ||
-            !record->capabilities) continue;
-        record->capabilities->UpdateUserView(view);
-    }
+    proxyman::inbound::UserStore::InstallWorkerView(std::move(view));
 }
 
 net::awaitable<void> Worker::UnregisterListenerTask(std::string tag) {
@@ -1178,14 +1147,6 @@ net::awaitable<void> Worker::UnregisterListenerTask(std::string tag) {
     co_return;
 }
 
-void Worker::UpdateRule(std::string_view tag, std::vector<rule::DetectRule> rules) {
-    if (stop_requested_.load(std::memory_order_acquire) ||
-        drain_requested_.load(std::memory_order_relaxed) ||
-        !runtime_ || runtime_->listener_state->stopping)
-        throw IoSystemError(net::error::operation_aborted);
-    runtime_->detect_rule_policy->UpdateRule(tag, std::move(rules));
-}
-
 void Worker::UpdateRule(
     std::string_view tag,
     std::shared_ptr<const std::vector<rule::DetectRule>> rules) {
@@ -1201,26 +1162,8 @@ void Worker::UpdateRule(
 // ============================================================================
 
 net::awaitable<app::UserTrafficSnapshot> Worker::SnapshotTraffic(std::string tag) {
-    app::UserTrafficSnapshot result;
-    if (!runtime_ || !runtime_->session_tracking) co_return result;
-    auto worker_counters = runtime_->session_tracking->SnapshotTraffic(tag);
-    result.users = std::move(worker_counters.users);
-    for (const auto& [key, record] : runtime_->connections) {
-        (void)key;
-        if (!record->initialized.load(std::memory_order_acquire) ||
-            record->finished.load(std::memory_order_acquire) ||
-            !record->capabilities ||
-            (!tag.empty() && record->accounting_key != tag))
-            continue;
-        auto owner = record->capabilities->TrackingOwner();
-        auto counters = owner->SnapshotTraffic(tag);
-        if (counters.empty()) continue;
-        result.domains.push_back({
-            std::move(owner),
-            std::move(counters),
-        });
-    }
-    co_return result;
+    if (!runtime_ || !runtime_->session_tracking) co_return app::UserTrafficSnapshot{};
+    co_return app::UserTrafficSnapshot{runtime_->session_tracking->SnapshotTraffic(tag)};
 }
 
 net::awaitable<void> Worker::CommitTraffic(
@@ -1228,9 +1171,6 @@ net::awaitable<void> Worker::CommitTraffic(
     co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
     if (!runtime_ || !runtime_->session_tracking) co_return;
     runtime_->session_tracking->CommitTraffic(tag, snapshot);
-    for (const auto& token : snapshot.domains) {
-        token.owner->CommitTraffic(tag, token.counters);
-    }
 }
 
 net::awaitable<void> Worker::RollbackTraffic(
@@ -1238,32 +1178,14 @@ net::awaitable<void> Worker::RollbackTraffic(
     co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
     if (!runtime_ || !runtime_->session_tracking) co_return;
     runtime_->session_tracking->RollbackTraffic(tag, snapshot);
-    for (const auto& token : snapshot.domains) {
-        token.owner->RollbackTraffic(tag, token.counters);
-        auto available = token.owner->ExtractAvailableTraffic(tag);
-        runtime_->session_tracking->MergeCompletedTraffic(tag, available);
-    }
 }
 
 net::awaitable<std::vector<OnlineDevice>> Worker::GetOnlineDevices(std::string tag) const {
-    std::vector<OnlineDevice> result;
-    if (!runtime_ || !runtime_->inbound_handlers) co_return result;
+    if (!runtime_ || !runtime_->inbound_handlers) co_return std::vector<OnlineDevice>{};
     auto handler = runtime_->inbound_handlers->GetHandler(tag);
-    if (handler) {
-        result = runtime_->inbound_handlers->GetOnlineDevices(handler->ReceiverSettings().protocol, tag);
-    }
-    for (const auto& [key, record] : runtime_->connections) {
-        (void)key;
-        if (record->finished.load(std::memory_order_acquire) ||
-            !record->initialized.load(std::memory_order_acquire) ||
-            !record->capabilities ||
-            record->inbound_tag != tag)
-            continue;
-        auto devices = record->capabilities->GetOnlineDevices(tag);
-        result.insert(result.end(), std::make_move_iterator(devices.begin()),
-                      std::make_move_iterator(devices.end()));
-    }
-    co_return result;
+    if (!handler) co_return std::vector<OnlineDevice>{};
+    co_return runtime_->inbound_handlers->GetOnlineDevices(
+        handler->ReceiverSettings().protocol, tag);
 }
 
 // ============================================================================
@@ -1281,11 +1203,7 @@ WorkerRuntimeStatsSnapshot Worker::CollectNativeRuntimeStats(bool include_resour
     snapshot.memory.pool_chunks = pool.chunks;
     snapshot.stats = runtime_->stats.Snapshot();
     snapshot.worker_id = id_;
-    snapshot.active_connections = 0;
-    for (const auto& [key, record] : runtime_->connections) {
-        (void)key;
-        if (!record->finished.load(std::memory_order_acquire)) ++snapshot.active_connections;
-    }
+    snapshot.active_connections = runtime_->listener_state->active_sessions;
     if (!include_resources) return snapshot;
     auto& resources = snapshot.resources.emplace();
     resources.udp_resource_drops = runtime_->listener_state->udp_resource_drops;
@@ -1319,23 +1237,7 @@ WorkerRuntimeStatsSnapshot Worker::CollectNativeRuntimeStats(bool include_resour
 }
 
 net::awaitable<WorkerRuntimeStatsSnapshot> Worker::CollectRuntimeStats(bool include_resources) const {
-    auto result = CollectNativeRuntimeStats(include_resources);
-    auto add_stats = [&result](const StatsSnapshot& stats) {
-        result.stats.connections_total += stats.connections_total;
-        result.stats.connections_active += stats.connections_active;
-        result.stats.bytes_in += stats.bytes_in;
-        result.stats.bytes_out += stats.bytes_out;
-        result.stats.errors += stats.errors;
-    };
-    for (const auto& [key, record] : runtime_->connections) {
-        (void)key;
-        if (record->finished.load(std::memory_order_acquire) ||
-            !record->initialized.load(std::memory_order_acquire) ||
-            !record->capabilities)
-            continue;
-        add_stats(record->capabilities->Stats().Snapshot());
-    }
-    co_return result;
+    co_return CollectNativeRuntimeStats(include_resources);
 }
 
 void Worker::CollectHeap() {

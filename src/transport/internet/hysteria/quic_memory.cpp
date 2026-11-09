@@ -24,19 +24,17 @@ constexpr size_t kAlignment = alignof(std::max_align_t);
 
 }  // namespace
 
-QuicMemory::QuicMemory(memory::AllocationDomain& domain) noexcept
-    : domain_(&domain)
-    , ngtcp2_{this, &Allocate, &Free, &Callocate, &Reallocate}
+QuicMemory::QuicMemory() noexcept
+    : ngtcp2_{this, &Allocate, &Free, &Callocate, &Reallocate}
     , nghttp3_{this, &Allocate, &Free, &Callocate, &Reallocate} {}
 
-void* QuicMemory::Allocate(size_t size, void* user_data) {
+void* QuicMemory::Allocate(size_t size, void*) {
     try {
-        auto& self = *static_cast<QuicMemory*>(user_data);
-        memory::ScopedAllocationDomain scope(*self.domain_);
         size_t allocation_size = 0;
         if (!AllocationSize(size, allocation_size)) return nullptr;
         void* raw =
-            self.domain_->resource()->allocate(allocation_size, kAlignment);
+            memory::ThreadMemoryPool().Allocate(allocation_size, kAlignment);
+        if (!raw) return nullptr;
         auto* header =
             ::new (raw) AllocationHeader{size, allocation_size};
         return header + 1;
@@ -45,14 +43,12 @@ void* QuicMemory::Allocate(size_t size, void* user_data) {
     }
 }
 
-void QuicMemory::Free(void* pointer, void* user_data) noexcept {
+void QuicMemory::Free(void* pointer, void*) noexcept {
     if (!pointer) return;
-    auto& self = *static_cast<QuicMemory*>(user_data);
-    memory::ScopedAllocationDomain scope(*self.domain_);
     auto* header = static_cast<AllocationHeader*>(pointer) - 1;
     const size_t allocation_size = header->allocation_size;
     header->~AllocationHeader();
-    self.domain_->resource()->deallocate(
+    memory::ThreadMemoryPool().Deallocate(
         header, allocation_size, kAlignment);
 }
 

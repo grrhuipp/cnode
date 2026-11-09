@@ -38,10 +38,7 @@ int64_t CpuNanoseconds(const timespec& value) {
 }
 
 TEST(AllocatorAppendBenchmark, TrackedResource) {
-    memory::AllocationDomain domain;
-    memory::ScopedAllocationDomain lease(domain);
-    ASSERT_TRUE(memory::RetainResource(domain.resource()));
-
+    const auto baseline = memory::ThreadMemoryPool().OutstandingAllocations();
     for (const std::size_t append_bytes : {64u, 1024u, 16384u, 65536u}) {
         std::vector<uint8_t> input(append_bytes);
         for (std::size_t index = 0; index < input.size(); ++index)
@@ -69,11 +66,12 @@ TEST(AllocatorAppendBenchmark, TrackedResource) {
                     for (std::size_t offset = 0; offset < probe.size(); offset += append_bytes)
                         ASSERT_TRUE(std::equal(input.begin(), input.end(), probe.begin() + offset));
                 }
-                EXPECT_EQ(probe.get_allocator().resource(), domain.resource());
-                sampled_live_allocations = domain.OutstandingAllocations();
+                EXPECT_EQ(probe.get_allocator().resource(), memory::CurrentResource());
+                sampled_live_allocations =
+                    memory::ThreadMemoryPool().OutstandingAllocations() - baseline;
                 sampled_capacity = probe.capacity();
             }
-            ASSERT_EQ(domain.OutstandingAllocations(), 0u);
+            ASSERT_EQ(memory::ThreadMemoryPool().OutstandingAllocations(), baseline);
 
             Bytes reserved;
             if (!growing) reserved.reserve(append_bytes);
@@ -105,7 +103,8 @@ TEST(AllocatorAppendBenchmark, TrackedResource) {
                 EXPECT_TRUE(std::equal(input.begin(), input.end(), reserved.begin()));
             }
             const auto after = memory::ThreadMemoryPool().GetFootprint();
-            const auto live_after = domain.OutstandingAllocations();
+            const auto live_after =
+                memory::ThreadMemoryPool().OutstandingAllocations() - baseline;
             EXPECT_EQ(live_after, growing ? 0u : 1u);
             const double bytes = static_cast<double>(iterations * appends * append_bytes);
             const double wall_ns = std::chrono::duration<double, std::nano>(wall_end - wall_start).count();
@@ -120,7 +119,7 @@ TEST(AllocatorAppendBenchmark, TrackedResource) {
                 after.idle_bytes, after.direct_bytes);
         }
     }
-    EXPECT_EQ(domain.OutstandingAllocations(), 0u);
+    EXPECT_EQ(memory::ThreadMemoryPool().OutstandingAllocations(), baseline);
     memory::ThreadMemoryPool().PurgeIdle();
 }
 
@@ -146,8 +145,7 @@ buf::MultiBuffer TransferBuffers(std::size_t count) {
 }
 
 TEST(MultiBufferBenchmark, TrackedTransfers) {
-    memory::AllocationDomain domain;
-    memory::ScopedAllocationDomain lease(domain);
+    const auto baseline = memory::ThreadMemoryPool().OutstandingAllocations();
     for (const std::size_t blocks : {1u, 8u, 9u, 16u}) {
         SCOPED_TRACE(blocks);
         memory::ThreadMemoryPool().PurgeIdle();
@@ -163,7 +161,7 @@ TEST(MultiBufferBenchmark, TrackedTransfers) {
             }
             ASSERT_TRUE(probe.empty());
         }
-        ASSERT_EQ(domain.OutstandingAllocations(), 0u);
+        ASSERT_EQ(memory::ThreadMemoryPool().OutstandingAllocations(), baseline);
         const std::size_t iterations = 262144 / blocks;
         const auto before = memory::ThreadMemoryPool().GetFootprint();
         timespec cpu_start{}, cpu_end{};
@@ -177,22 +175,21 @@ TEST(MultiBufferBenchmark, TrackedTransfers) {
         const auto finish = std::chrono::steady_clock::now();
         ASSERT_EQ(::clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu_end), 0);
         const auto after = memory::ThreadMemoryPool().GetFootprint();
-        EXPECT_EQ(domain.OutstandingAllocations(), 0u);
+        EXPECT_EQ(memory::ThreadMemoryPool().OutstandingAllocations(), baseline);
         const double wall_ns = std::chrono::duration<double, std::nano>(finish - start).count();
         const double cpu_ns = static_cast<double>(CpuNanoseconds(cpu_end) - CpuNanoseconds(cpu_start));
         std::printf("multibuffer-transfer blocks=%zu operations=%zu "
                     "wall_ns_per_operation=%.3f cpu_ns_per_operation=%.3f "
                     "live_after=%zu mapped_before=%zu mapped_after=%zu idle_after=%zu\n",
             blocks, iterations, wall_ns / iterations, cpu_ns / iterations,
-            domain.OutstandingAllocations(), before.mapped_bytes, after.mapped_bytes,
-            after.idle_bytes);
+            memory::ThreadMemoryPool().OutstandingAllocations() - baseline,
+            before.mapped_bytes, after.mapped_bytes, after.idle_bytes);
     }
     memory::ThreadMemoryPool().PurgeIdle();
 }
 
 TEST(BufferSpanBenchmark, TrackedDescriptors) {
-    memory::AllocationDomain domain;
-    memory::ScopedAllocationDomain lease(domain);
+    const auto baseline = memory::ThreadMemoryPool().OutstandingAllocations();
     for (const std::size_t blocks : {1u, 8u, 9u, 16u}) {
         memory::ThreadMemoryPool().PurgeIdle();
         {
@@ -204,7 +201,8 @@ TEST(BufferSpanBenchmark, TrackedDescriptors) {
                 input[position++] = net::buffer(bytes.data(), bytes.size());
             }
             const auto descriptors = std::span(input).first(blocks);
-            const auto payload_allocations = domain.OutstandingAllocations();
+            const auto payload_allocations =
+                memory::ThreadMemoryPool().OutstandingAllocations() - baseline;
             for (const bool from_multibuffer : {false, true}) {
                 SCOPED_TRACE(blocks);
                 SCOPED_TRACE(from_multibuffer);
@@ -218,7 +216,8 @@ TEST(BufferSpanBenchmark, TrackedDescriptors) {
                         EXPECT_EQ(probe.Span()[index].size(), input[index].size());
                     }
                 }
-                ASSERT_EQ(domain.OutstandingAllocations(), payload_allocations);
+                ASSERT_EQ(memory::ThreadMemoryPool().OutstandingAllocations() - baseline,
+                          payload_allocations);
                 const std::size_t iterations = 1048576 / blocks;
                 const auto before = memory::ThreadMemoryPool().GetFootprint();
                 timespec cpu_start{}, cpu_end{};
@@ -234,7 +233,8 @@ TEST(BufferSpanBenchmark, TrackedDescriptors) {
                 const auto finish = std::chrono::steady_clock::now();
                 ASSERT_EQ(::clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu_end), 0);
                 const auto after = memory::ThreadMemoryPool().GetFootprint();
-                EXPECT_EQ(domain.OutstandingAllocations(), payload_allocations);
+                EXPECT_EQ(memory::ThreadMemoryPool().OutstandingAllocations() - baseline,
+                          payload_allocations);
                 const double wall_ns = std::chrono::duration<double, std::nano>(finish - start).count();
                 const double cpu_ns = static_cast<double>(CpuNanoseconds(cpu_end) - CpuNanoseconds(cpu_start));
                 std::printf("buffer-span source=%s blocks=%zu operations=%zu "
@@ -245,7 +245,7 @@ TEST(BufferSpanBenchmark, TrackedDescriptors) {
                     before.mapped_bytes, after.mapped_bytes, after.idle_bytes);
             }
         }
-        ASSERT_EQ(domain.OutstandingAllocations(), 0u);
+        ASSERT_EQ(memory::ThreadMemoryPool().OutstandingAllocations(), baseline);
     }
     memory::ThreadMemoryPool().PurgeIdle();
 }
@@ -266,8 +266,7 @@ uint64_t FillAndDrain(memory::RingDeque<uint64_t>& queue,
 }
 
 TEST(RingDequeBenchmark, TrackedFillAndDrain) {
-    memory::AllocationDomain domain;
-    memory::ScopedAllocationDomain lease(domain);
+    const auto baseline = memory::ThreadMemoryPool().OutstandingAllocations();
     for (const std::size_t batch : {1u, 8u, 64u}) {
         SCOPED_TRACE(batch);
         memory::ThreadMemoryPool().PurgeIdle();
@@ -278,7 +277,7 @@ TEST(RingDequeBenchmark, TrackedFillAndDrain) {
             queue.pop_front();
         }
         ASSERT_EQ(queue.capacity(), 0u);
-        ASSERT_EQ(domain.OutstandingAllocations(), 0u);
+        ASSERT_EQ(memory::ThreadMemoryPool().OutstandingAllocations(), baseline);
         constexpr std::size_t warmup = 128;
         const std::size_t iterations = 262144 / batch;
         const uint64_t batch_sum = batch * (batch - 1) / 2;
@@ -293,15 +292,15 @@ TEST(RingDequeBenchmark, TrackedFillAndDrain) {
         const auto after = memory::ThreadMemoryPool().GetFootprint();
         EXPECT_EQ(checksum, iterations * batch_sum);
         EXPECT_EQ(queue.capacity(), 0u);
-        EXPECT_EQ(domain.OutstandingAllocations(), 0u);
+        EXPECT_EQ(memory::ThreadMemoryPool().OutstandingAllocations(), baseline);
         const double wall_ns = std::chrono::duration<double, std::nano>(finish - start).count();
         const double cpu_ns = static_cast<double>(CpuNanoseconds(cpu_end) - CpuNanoseconds(cpu_start));
         std::printf("ring-deque batch=%zu operations=%zu "
                     "wall_ns_per_operation=%.3f cpu_ns_per_operation=%.3f "
                     "live_after=%zu mapped_before=%zu mapped_after=%zu idle_after=%zu\n",
             batch, iterations, wall_ns / iterations, cpu_ns / iterations,
-            domain.OutstandingAllocations(), before.mapped_bytes, after.mapped_bytes,
-            after.idle_bytes);
+            memory::ThreadMemoryPool().OutstandingAllocations() - baseline,
+            before.mapped_bytes, after.mapped_bytes, after.idle_bytes);
     }
     memory::ThreadMemoryPool().PurgeIdle();
 }

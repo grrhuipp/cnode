@@ -36,34 +36,6 @@ class UdpAssociationReclaimer;
 struct UdpAssociationHook;
 struct UdpHandoffRecord;
 
-// Each encoded reply retains a lease until its actual listener send completes.
-class UdpReplyFence final {
-public:
-    explicit UdpReplyFence(net::io_context& io) : drained_(io, 1) {}
-    class Lease final {
-    public:
-        Lease() = default;
-        explicit Lease(std::shared_ptr<UdpReplyFence> fence) : fence_(std::move(fence)) {
-            if (fence_) ++fence_->pending_;
-        }
-        Lease(Lease&& other) noexcept : fence_(std::move(other.fence_)) {}
-        Lease& operator=(Lease&& other) noexcept {
-            if (this != &other) { Reset(); fence_ = std::move(other.fence_); }
-            return *this;
-        }
-        ~Lease() { Reset(); }
-        Lease(const Lease&) = delete;
-        Lease& operator=(const Lease&) = delete;
-    private:
-        void Reset() noexcept;
-        std::shared_ptr<UdpReplyFence> fence_;
-    };
-    net::awaitable<void> AsyncDrain();
-private:
-    size_t pending_ = 0;
-    SignalChannel drained_;
-};
-
 class UdpReplySink {
 public:
     virtual ~UdpReplySink() noexcept = default;
@@ -73,8 +45,7 @@ public:
         udp::socket* sock,
         udp::endpoint endpoint,
         buf::MultiBuffer payload,
-        uint32_t worker_id,
-        std::shared_ptr<UdpReplyFence> fence = {}) = 0;
+        uint32_t worker_id) = 0;
 };
 
 struct UdpDatagramContext {
@@ -105,7 +76,6 @@ public:
         buf::MultiBuffer payload;
         size_t payload_size = 0;
         UdpResourceBudget::PayloadReservation reservation;
-        UdpReplyFence::Lease fence;
         ConstBufferSpanBuilder<buf::MultiBuffer::kInlineCapacity> send_buffers;
 
         void PrepareSendBuffers();
@@ -121,7 +91,6 @@ public:
         std::shared_ptr<::InboundDatagramResponse> response;
         UdpReplySink* sink = nullptr;
         uint32_t worker_id = 0;
-        std::shared_ptr<UdpReplyFence> fence;
 
         [[nodiscard]] bool Valid() const noexcept { return response && sink; }
         [[nodiscard]] bool Send(UDPPacketView packet, const udp::endpoint& endpoint);
@@ -167,8 +136,7 @@ public:
     [[nodiscard]] ReplyEnqueueResult EnqueueReply(
         std::string_view socket_key,
         udp::endpoint endpoint,
-        buf::MultiBuffer payload,
-        std::shared_ptr<UdpReplyFence> fence = {});
+        buf::MultiBuffer payload);
     // Hands the oldest queued datagram to the sender admitted by StartSend.
     [[nodiscard]] std::optional<PendingUdpReply> BeginReplySend(std::string_view socket_key);
     // Completes the active send and hands the next queued datagram to the same
@@ -212,11 +180,9 @@ private:
                             std::chrono::steady_clock::time_point now) noexcept;
     void RetireNativeJob(ClientSession& session) noexcept;
     static net::awaitable<void> RunNativeDispatch(ClientSessionPtr session);
-    static net::awaitable<void> RunNativeFlow(ClientSessionPtr session);
     void ProcessDecoded(const UdpDatagramContext& datagram,
         InboundDatagramResult decoded,
-        std::shared_ptr<UdpHandoffRecord> record = {},
-        std::shared_ptr<InboundDatagramResponse> response = {});
+        std::shared_ptr<UdpHandoffRecord> record = {});
     void RegisterNativeJob(const ClientSessionPtr& session);
     void DetachNativeJob(ClientSession& session) noexcept;
     struct Impl;

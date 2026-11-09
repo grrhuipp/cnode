@@ -20,7 +20,7 @@ if(NOT VCPKG_TARGET_TRIPLET STREQUAL "x64-linux-musl")
     message(FATAL_ERROR "cnode requires the x64-linux-musl vcpkg triplet")
 endif()
 
-option(CNODE_ENABLE_LTO "Enable Release link-time optimization" ON)
+option(CNODE_ENABLE_LTO "Enable Release link-time optimization" OFF)
 option(CNODE_RELEASE_DEBUG_SYMBOLS "Emit Release debug information for split symbols" ON)
 option(CNODE_RELEASE_FRAME_POINTERS "Keep Release frame pointers for profiling" ON)
 option(CNODE_MEMORY_STATS "Enable runtime live/peak memory object counters" OFF)
@@ -87,7 +87,6 @@ set(CNODE_CORE_SOURCES
     src/infra/inbound_field_rules.cpp
     src/infra/routing_ip_network.cpp
     src/infra/json_field.cpp
-    src/infra/http2_initial_window.cpp
     src/infra/config_loader.cpp
     src/infra/config_semantics.cpp
     src/infra/config_validation.cpp
@@ -123,7 +122,6 @@ set(CNODE_CORE_SOURCES
     src/transport/internet/reality_short_id.cpp
     src/transport/internet/reality_tls.cpp
     src/transport/internet/ws_stream.cpp
-    src/transport/internet/http2_settings.cpp
     src/transport/internet/grpc_hunk.cpp
     src/transport/internet/http1_handshake.cpp
     src/transport/internet/xhttp_session.cpp
@@ -150,7 +148,6 @@ set(CNODE_CORE_SOURCES
     src/app/proxyman/outbound/handler.cpp
     src/app/worker.cpp
     src/app/session_group_executor.cpp
-    src/app/session_capabilities.cpp
     src/service/controller/controller.cpp
     src/service/controller/traffic_journal.cpp
     src/common/awaitable_batch.cpp
@@ -161,12 +158,9 @@ set(CNODE_CORE_SOURCES
     src/infra/panel_node_ids.cpp
     src/service/controller/panel_inbound.cpp
     src/service/controller/control.cpp
-    src/app/bootstrap_inbounds.cpp
-    src/app/bootstrap_panels.cpp
     src/app/bootstrap_cli.cpp
     src/app/bootstrap_runtime.cpp
     src/app/bootstrap_monitor.cpp
-    src/app/bootstrap_shutdown.cpp
     src/app/bootstrap_setup.cpp
     src/app/startup_inbounds.cpp
     src/app/prepared_inbound.cpp

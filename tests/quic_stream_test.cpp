@@ -28,8 +28,6 @@ void Require(bool value, const char* reason) {
 template <class Scenario>
 void RunInDomain(Scenario scenario) {
     net::io_context io;
-    memory::AllocationDomain allocation;
-    memory::ScopedAllocationDomain lease(allocation);
     std::exception_ptr failure;
     bool completed = false;
     auto run = [&]() -> net::awaitable<void> {

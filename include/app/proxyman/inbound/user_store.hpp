@@ -170,10 +170,6 @@ public:
     // Install/Clear execute only on the destination Worker's thread.
     [[nodiscard]] static WorkerView PrepareWorkerView(PublishedSnapshot snapshot);
     static void InstallWorkerView(WorkerView view) noexcept;
-    // Domain callback entry/exit swaps a lease without dropping the suspended
-    // Worker's view. Credential aliases retain their immutable snapshot.
-    [[nodiscard]] static WorkerView ExchangeWorkerView(WorkerView view) noexcept;
-    [[nodiscard]] static WorkerView CaptureWorkerView() noexcept;
     static void ClearWorkerView() noexcept;
     [[nodiscard]] static uint64_t WorkerViewRevision() noexcept;
     // Shared by Workers using the same protocol/tag credential publication;

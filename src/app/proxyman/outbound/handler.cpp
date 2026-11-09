@@ -2,10 +2,8 @@
 
 #include "app/dns/dns.hpp"
 #include "app/proxyman/outbound/factory.hpp"
-#include "app/session_group_executor.hpp"
 #include "infra/log.hpp"
 #include "../../../common/awaitable_task_group.hpp"
-#include "../../../transport/internet/xhttp_session.hpp"
 
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/co_spawn.hpp>
@@ -82,8 +80,6 @@ public:
             try { co_await tasks_->AsyncJoin(); }
             catch (...) { failure = std::current_exception(); }
         }
-        try { co_await transport::internet::JoinXHttpClientTasks(reactor_); }
-        catch (...) { if (!failure) failure = std::current_exception(); }
         ReleaseInstance();
         join_failure_ = failure;
         joined_.store(true, std::memory_order_release);
@@ -211,7 +207,6 @@ void HandlerLookup::Refresh() noexcept {
 }
 
 void HandlerLookup::Sync(uint64_t generation) {
-    memory::ScopedWorkerAllocation worker_allocation;
     const auto snapshot = configuration_.Capture();
     memory::ThreadLocalVector<Entry> next;
     next.reserve(snapshot->size());
@@ -231,7 +226,6 @@ void HandlerLookup::Sync(uint64_t generation) {
 }
 
 std::shared_ptr<Handler> HandlerLookup::Instantiate(const OutboundConfiguration::Entry& config) {
-    memory::ScopedWorkerAllocation worker_allocation;
     return memory::AllocateShared<Handler>(config, io_context_, dns_, dial_timeout_, tasks_);
 }
 
@@ -244,8 +238,6 @@ struct OutboundConfiguration::Hosts {
         std::shared_ptr<OutboundPoolHost> host;
     };
     net::io_context& reactor;
-    uint32_t worker_id;
-    std::shared_ptr<GroupCoordinator> coordinator;
     std::vector<Resident> residents;
 
     std::shared_ptr<OutboundPoolHost> Create(const PreparedOutboundConfig& config) {
@@ -285,27 +277,22 @@ OutboundConfiguration::Entry OutboundConfiguration::Prepare(
 }
 
 void OutboundConfiguration::Publish(std::shared_ptr<const Snapshot> snapshot) noexcept {
-    snapshot_.store(std::move(snapshot), std::memory_order_release);
-    // Pairs with the acquire load in Generation(): a reader seeing this value
-    // also sees the snapshot stored above.
-    generation_.fetch_add(1, std::memory_order_release);
+    snapshot_ = std::move(snapshot);
+    ++generation_;
 }
 
 uint64_t OutboundConfiguration::Generation() const noexcept {
-    return generation_.load(std::memory_order_acquire);
+    return generation_;
 }
 
 std::shared_ptr<const OutboundConfiguration::Snapshot>
 OutboundConfiguration::Capture() const noexcept {
-    return snapshot_.load(std::memory_order_acquire);
+    return snapshot_;
 }
 
-void OutboundConfiguration::BindHosts(net::io_context& reactor, uint32_t worker_id,
-    std::shared_ptr<GroupCoordinator> coordinator) {
-    const std::lock_guard lock(publication_mutex_);
+void OutboundConfiguration::BindHosts(net::io_context& reactor) {
     if (hosts_) throw std::logic_error("outbound hosts already bound");
-    hosts_ = std::make_unique<Hosts>(Hosts{
-        reactor, worker_id, std::move(coordinator), {}});
+    hosts_ = std::make_unique<Hosts>(Hosts{reactor, {}});
     auto snapshot = std::make_shared<Snapshot>();
     const auto previous = Capture();
     snapshot->reserve(previous->size());
@@ -327,7 +314,6 @@ net::awaitable<void> OutboundConfiguration::AsyncJoinHosts() {
 }
 
 void OutboundConfiguration::Replace(const PreparedOutboundConfig& configuration) {
-    const std::lock_guard lock(publication_mutex_);
     if (hosts_) hosts_->Prune();
     auto snapshot = std::make_shared<Snapshot>(*Capture());
     snapshot->reserve(snapshot->size() + 1);
@@ -350,7 +336,6 @@ void OutboundConfiguration::Replace(const PreparedOutboundConfig& configuration)
 }
 
 void OutboundConfiguration::Remove(std::string_view tag) {
-    const std::lock_guard lock(publication_mutex_);
     if (hosts_) hosts_->Prune();
     auto snapshot = std::make_shared<Snapshot>(*Capture());
     std::erase_if(*snapshot, [tag](const Entry& entry) {

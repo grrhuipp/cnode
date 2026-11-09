@@ -8,11 +8,11 @@
 // 底层 OpenSSL 失败属于系统故障，统一以异常上报，不返回未初始化输出。
 // ============================================================================
 
-#include "common.hpp"
 #include "common/allocator.hpp"
 #include <openssl/aes.h>
 #include "common/unsafe.hpp"
 #include <array>
+#include <cstddef>
 #include <span>
 #include <string_view>
 #include <cstdint>

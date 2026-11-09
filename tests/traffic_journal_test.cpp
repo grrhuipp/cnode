@@ -112,14 +112,12 @@ TEST(TrafficJournal, Contract) {
             TrafficJournal isolated(config);
             Check(isolated.Directory() != directory && isolated.UnknownCount() == 0,
                   "different panel identity reused accounting state");
-            ::app::UserTrafficSnapshot domain_only;
-            ::app::DomainTrafficSnapshot first, second;
-            first.counters.users.emplace(42, ::app::UserTraffic{5, 8});
-            second.counters.users.emplace(42, ::app::UserTraffic{12, 21});
-            domain_only.domains.push_back(std::move(first));
-            domain_only.domains.push_back(std::move(second));
-            Check(!domain_only.empty(), "domain-only traffic was mistaken for an empty snapshot");
-            isolated.Append(domain_only);
+            ::app::UserTrafficSnapshot first, second;
+            first.users.emplace(42, ::app::UserTraffic{5, 8});
+            second.users.emplace(42, ::app::UserTraffic{12, 21});
+            Check(!first.empty() && !second.empty(), "traffic snapshot was mistaken for empty");
+            isolated.Append(first);
+            isolated.Append(second);
             auto batch = isolated.Prepare();
             CheckSample(batch);
             isolated.Begin(batch);

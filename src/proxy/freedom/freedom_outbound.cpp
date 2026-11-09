@@ -179,23 +179,6 @@ net::awaitable<tl::expected<memory::ThreadLocalVector<net::ip::address>, ErrorCo
 Handler::ResolveTargets(::app::dns::DNS& dns, session::Context& ctx) {
     const auto& target = ctx.outbound.target;
 
-    if (!target.IsDomain()) {
-        if (!target.resolved_addr) {
-            co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
-        }
-        if ((domain_strategy_ == DomainStrategy::ForceIPv4 ||
-             domain_strategy_ == DomainStrategy::ForceIPv6) &&
-            !(target.resolved_addr->is_v6()
-                ? AcceptsIPv6(domain_strategy_)
-                : AcceptsIPv4(domain_strategy_))) {
-            co_return tl::unexpected(ErrorCode::DNS_NO_RECORD);
-        }
-        memory::ThreadLocalVector<net::ip::address> addresses;
-        addresses.reserve(1);
-        addresses.push_back(*target.resolved_addr);
-        co_return addresses;
-    }
-
     // 需要 DNS 解析
     auto dns_result = co_await dns.Resolve(target.host);
 

@@ -29,22 +29,6 @@ struct UserTrafficCounters {
     auto end() const noexcept { return users.end(); }
 };
 
-struct DomainTrafficSnapshot {
-    std::shared_ptr<SessionTrackingState> owner;
-    UserTrafficCounters counters;
-};
-
-struct UserTrafficSnapshot : UserTrafficCounters {
-    // Commit tokens retain only the small accounting ledger. Closed physical
-    // connection domains are never kept alive until the reporting interval.
-    std::vector<DomainTrafficSnapshot> domains;
-    [[nodiscard]] bool empty() const noexcept {
-        if (!users.empty()) return false;
-        for (const auto& token : domains) {
-            if (!token.counters.empty()) return false;
-        }
-        return true;
-    }
-};
+struct UserTrafficSnapshot : UserTrafficCounters {};
 
 }  // namespace app
