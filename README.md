@@ -76,11 +76,11 @@ SS2022 TCP 身份匹配微基准覆盖 1/16/256/4096 个用户、无 identity ke
 
 SS2022 UDP 身份匹配基准包含 130 格：AES-128/256、1/16/256/4096 个用户、1/4/16 个 identity key 组、已发布快照的首/中/末用户、0/1200 B 载荷，并保留无 identity 与普通重放接收对照。预热和测量次数与 TCP 身份基准相同；每批最多预编码 32 个唯一包，编码在计时外，计时包含解码认证、目标/载荷/归属校验及结果释放。主矩阵只测延迟提交重放的认证阶段，不含入站目录的重放提交、路由或网络 I/O，不代表 UDP 转发吞吐。
 
-SS 加密原语与身份模式 UDP 互操作可在构建 `cnode_tests` 后单独验证；覆盖 AES-128/256 单块及双块独立向量、单块重叠、双块原地操作与部分重叠拒绝，以及真实进程的数据转发与重放隔离：
+SS 加密原语与 UDP 认证可在构建 `cnode_tests` 后单独验证；覆盖 AES-128/256 单块及双块独立向量、单块重叠、双块原地操作与部分重叠拒绝、AES/ChaCha20 不匹配密钥长度拒绝及失败后的正常编解码，以及身份模式的真实进程数据转发与重放隔离：
 
 ```sh
 mise exec -- ctest --test-dir build/musl --no-tests=error --output-on-failure \
-  -R '^(shadowsocks_stream_crypto|e2e\.udp_ss2022_identity)\.'
+  -R '^(shadowsocks_stream_crypto|shadowsocks_udp_datagram|e2e\.udp_ss2022_identity)\.'
 ```
 
 运行时统计基准先建立真实 VLESS → Freedom 回环链路，覆盖 0/1/64/512 条物理连接、有/无资源统计，预热 16 轮后采集 64/256 轮。计时只包含 `Worker::CollectRuntimeStats` 与结果校验，不包含建连、载荷转发和停机；计时外等待既有空闲池回收截止期，再报告回收后的占用，不强制清池。这三项基准输出 CPU、延迟分位数、内存池映射和进程 RSS/峰值，并区分匿名页与文件页；峰值读取 Linux `/proc/self/status` 的 `VmHWM`，包含准备阶段。分配计数仅统计拦截到的 throwing C++ `new` 和 `mi_malloc_aligned` 入口，不等于全部 PMR 分配，两类不能相加。使用 CTest 使每个参数在独立进程运行：

@@ -70,9 +70,18 @@ void CheckClassic(const TargetAddress& target,
     std::vector<uint8_t> encoded(encoded_size);
     Check(ss::EncodeUdpPacketTo(
               target, payload.data(), payload.size(), key.span(),
+              cipher.type, cipher.key_size - 1, cipher.salt_size,
+              encoded.data(), encoded.size()) == 0,
+          "datagram AEAD accepted an incompatible encryption key length");
+    Check(ss::EncodeUdpPacketTo(
+              target, payload.data(), payload.size(), key.span(),
               cipher.type, cipher.key_size, cipher.salt_size,
               encoded.data(), encoded.size()) == encoded.size(),
           "classic Shadowsocks UDP encoding failed");
+    Check(!ss::DecodeUdpPacketWithKey(
+              encoded.data(), encoded.size(), key.span(),
+              cipher.type, cipher.key_size - 1, cipher.salt_size),
+          "datagram AEAD accepted an incompatible decryption key length");
 
     auto decoded = ss::DecodeUdpPacketWithKey(
         encoded.data(), encoded.size(), key.span(),

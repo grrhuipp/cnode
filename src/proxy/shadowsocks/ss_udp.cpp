@@ -203,7 +203,9 @@ struct Parsed2022Body {
             std::numeric_limits<size_t>::max() - SsAeadCipher::kTagSize) return false;
     // One datagram, one synchronous stack-owned AEAD context. No connection
     // cache or EVP_CIPHER_CTX allocation is needed for this bounded operation.
-    EVP_AEAD_CTX context{};
+    // EVP_AEAD_CTX_init accepts uninitialized storage, including on failure.
+    // Avoid clearing it before init; the post-operation cleanse remains required.
+    EVP_AEAD_CTX context;
     size_t written = 0;
     const size_t capacity = plaintext.size() + SsAeadCipher::kTagSize;
     const bool ok = EVP_AEAD_CTX_init(&context, algorithm, key.data(), key.size(),
@@ -223,7 +225,7 @@ struct Parsed2022Body {
                                uint8_t* output) {
     const auto* algorithm = DatagramAead(cipher_type);
     if (!algorithm || ciphertext.size() < SsAeadCipher::kTagSize) return false;
-    EVP_AEAD_CTX context{};
+    EVP_AEAD_CTX context;
     size_t written = 0;
     const size_t capacity = ciphertext.size() - SsAeadCipher::kTagSize;
     const bool ok = EVP_AEAD_CTX_init(&context, algorithm, key.data(), key.size(),
