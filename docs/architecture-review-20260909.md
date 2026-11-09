@@ -1303,6 +1303,7 @@ CI失败场景修复后通过真实双进程、ML-KEM/X25519加密和回环对�
   1. `DoXHttp1ServerHandshake` 跨 Worker 移交闭包不再捕获原 Worker 的 `stream_handler`，仅提取纯值超时参数（`handshake_timeout`、`idle_timeout`），并在目标 Worker 线程本地按需构造和销毁窄 `UploadTransportStreamHandler`；同连接后续 keep-alive 请求同样支持在请求头静止边界按目标会话归属移交。
   2. `XHttpSessionDirectory::Acquire` 将跨线程等待通知由 `SignalChannel` 替换为绑定等待方 `io_context` 的 `OwnerWaiter`（`steady_timer` + 原子通知标记 + `net::post` 同线程取消），消除跨线程 `RingDeque` / channel 访问与释放。
   3. `xhttp_session_lifecycle_test` 新增双 Worker 线程 + 协调器线程回归测试，使用析构即校验所属线程的 `OriginBoundSink` 覆盖上行先到等待与跨 Worker 移交。
+  4. 修复 `e2e.quic_udp` 全矩阵测试中 Shadowsocks 跳点仅预留 TCP 端口未同步预留 UDP 端口导致的并发 `Address in use`，并在 `anytls_padding` 系列测试中确保客户端 `Roundtrip` 收完响应与 EOF 后再发送 `kCmdAlert`（`ForceReconnect`），消除高并发下 `HeartResponse` 先于下行转发完成触发的提前断连竞态。
 
 ## 2026-11-09：移除 `AllocationDomain` 租约体系与全栈单线程化/碎片层精简
 

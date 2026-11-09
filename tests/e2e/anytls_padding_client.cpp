@@ -38,6 +38,7 @@ TEST_P(AnyTlsClientPadding, LearnedPoliciesAreScopedToOutboundClientAcrossPhysic
     WriteJson(root.Path(), "routing.json", {{"rules", rules}});
     TlsContext tls(true);
     constexpr std::array<size_t, 5> sequence{0, 1, 0, 1, 0};
+    std::atomic<size_t> roundtrip_done{0};
     std::atomic<size_t> completed{0};
     std::array<unsigned, 2> connections{};
     PeerThread peer([&] {
@@ -59,6 +60,7 @@ TEST_P(AnyTlsClientPadding, LearnedPoliciesAreScopedToOutboundClientAcrossPhysic
                 const size_t data = (key == 0 ? 64 : 80) - (7 + Request.size()) - 7;
                 EXPECT_EQ(observed.waste, (std::vector<size_t>{opening, data}));
             }
+            Until([&] { return roundtrip_done.load() == index + 1; }, 10s);
             ForceReconnect(socket);
             completed.store(index + 1);
         }
@@ -69,6 +71,7 @@ TEST_P(AnyTlsClientPadding, LearnedPoliciesAreScopedToOutboundClientAcrossPhysic
     child.WaitForLog("server started");
     for (size_t index = 0; index < sequence.size(); ++index) {
         Roundtrip(front[sequence[index]]);
+        roundtrip_done.store(index + 1);
         Until([&] { return completed.load() == index + 1; }, 10s);
     }
     peer.Join();

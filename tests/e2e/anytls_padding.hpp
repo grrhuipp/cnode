@@ -186,6 +186,7 @@ inline std::vector<Observation> PhysicalSessions(const std::vector<PhysicalCase>
     const auto front = reservation.Port();
     Configure(root.Path(), VlessInbound(front), AnyOutbound(listener.Port(), password));
     TlsContext tls(true);
+    std::atomic<size_t> roundtrip_done{0};
     std::atomic<size_t> completed{0};
     std::vector<Observation> observations;
     PeerThread peer([&] {
@@ -201,6 +202,7 @@ inline std::vector<Observation> PhysicalSessions(const std::vector<PhysicalCase>
             else EXPECT_LT(observed.authentication, cases[i].high);
             if (cases[i].waste) EXPECT_EQ(observed.waste, *cases[i].waste);
             observations.push_back(std::move(observed));
+            Until([&] { return roundtrip_done.load() == i + 1; }, 10s);
             ForceReconnect(socket);
             completed.store(i + 1);
         }
@@ -218,6 +220,7 @@ inline std::vector<Observation> PhysicalSessions(const std::vector<PhysicalCase>
     if (!reference) child.WaitForLog("server started");
     for (size_t i = 0; i < cases.size(); ++i) {
         Roundtrip(front, reference);
+        roundtrip_done.store(i + 1);
         Until([&] { return completed.load() == i + 1; }, 10s);
     }
     peer.Join();

@@ -891,12 +891,12 @@ TEST(QuicUdp, AllProtocolsAndTransportsFullMatrixConcurrentMigration) {
     std::vector<udp::PortReservation> final_reservations;
     final_reservations.reserve(second_hop_count);
     for (size_t q = 0; q < second_hop_count; ++q) {
-        final_reservations.emplace_back(q == 4 || q == 6);
+        final_reservations.emplace_back(true);
     }
     std::vector<udp::PortReservation> mid_reservations;
     mid_reservations.reserve(first_hop_count);
     for (size_t p = 0; p < first_hop_count; ++p) {
-        mid_reservations.emplace_back(false);
+        mid_reservations.emplace_back(true);
     }
     auto hy2_reservation = Socket::BindUdp();
     const auto hy2_port = hy2_reservation.Port();
