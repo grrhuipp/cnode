@@ -87,7 +87,12 @@ struct DatagramSocket::Impl final : memory::ThreadAllocated {
 
     void OnTimeout(ErrorCode reason) noexcept { Close(reason); }
 
-    void MarkCancelled() noexcept { ++cancellation_epoch_; }
+    static constexpr uint8_t kReadDrainBudget = 16;
+
+    void MarkCancelled() noexcept {
+        ++cancellation_epoch_;
+        read_drain_budget = 0;
+    }
 
     net::awaitable<IoErrorCode> Wait(
         udp::socket::wait_type type, net::cancellation_slot cancellation) {
@@ -133,7 +138,8 @@ struct DatagramSocket::Impl final : memory::ThreadAllocated {
         WriteOperation& operation, udp::endpoint destination,
         std::span<const net::const_buffer> buffers);
     net::awaitable<void> SendMultiBuffer(
-        WriteOperation& operation, udp::endpoint destination, buf::MultiBuffer payload);
+        WriteOperation& operation, udp::endpoint destination,
+        buf::MultiBuffer payload);
 
     udp::socket socket;
     Timeouts timeouts;
@@ -141,12 +147,12 @@ struct DatagramSocket::Impl final : memory::ThreadAllocated {
     uint64_t generation = 0;
     uint64_t cancellation_epoch_ = 0;
     ErrorCode cancellation_reason = ErrorCode::OK;
+    uint8_t read_drain_budget = 0;
     bool ipv6 = false;
     bool closed = false;
     bool counted = false;
     bool read_active = false;
     bool write_active = false;
-
     inline static thread_local std::size_t active_sockets = 0;
 };
 
@@ -156,18 +162,31 @@ net::awaitable<ReceivedDatagram> DatagramSocket::Impl::Receive(ReadOperation& op
     const auto cancellation_state = co_await net::this_coro::cancellation_state;
 
     for (;;) {
-        // An idle wait holds no payload buffer; buffers exist only between
-        // readiness and the synchronous receive below.
-        const auto wait_ec = co_await Wait(udp::socket::wait_read, cancellation_state.slot());
-        if (wait_ec) {
-            if (operation.Cancelled()) ThrowCancelled(operation.CancellationReason());
-            throw IoSystemError(wait_ec);
-        }
         if (operation.Cancelled()) ThrowCancelled(operation.CancellationReason());
+        if (cancellation_state.cancelled() != net::cancellation_type::none)
+            throw IoSystemError(io_error::operation_aborted);
+        bool fresh_wait = false;
+        if (read_drain_budget != 0) {
+            --read_drain_budget;
+        } else {
+            // An idle wait holds no payload buffer; buffers exist only between
+            // readiness and the synchronous receive below.
+            const auto wait_ec = co_await Wait(udp::socket::wait_read, cancellation_state.slot());
+            if (wait_ec) {
+                read_drain_budget = 0;
+                if (operation.Cancelled()) ThrowCancelled(operation.CancellationReason());
+                throw IoSystemError(wait_ec);
+            }
+            if (operation.Cancelled()) ThrowCancelled(operation.CancellationReason());
+            fresh_wait = true;
+        }
 
         IoErrorCode available_ec;
         const std::size_t available = socket.available(available_ec);
-        if (available_ec) throw IoSystemError(available_ec);
+        if (available_ec) {
+            read_drain_budget = 0;
+            throw IoSystemError(available_ec);
+        }
         const std::size_t wanted = std::clamp<std::size_t>(available, 1, kMaxDatagramBytes);
         const std::size_t count = (wanted + buf::Buffer::kSize - 1) / buf::Buffer::kSize;
 
@@ -175,7 +194,10 @@ net::awaitable<ReceivedDatagram> DatagramSocket::Impl::Receive(ReadOperation& op
         std::array<net::mutable_buffer, kMaxReceiveBuffers> buffers;
         for (std::size_t i = 0; i < count; ++i) {
             guards[i] = buf::BufferGuard(buf::Buffer::New());
-            if (!guards[i]) ThrowLink(ErrorCode::RESOURCE_EXHAUSTED);
+            if (!guards[i]) {
+                read_drain_budget = 0;
+                ThrowLink(ErrorCode::RESOURCE_EXHAUSTED);
+            }
             buffers[i] = net::buffer(guards[i]->Tail().data(), guards[i]->Available());
         }
 
@@ -187,8 +209,17 @@ net::awaitable<ReceivedDatagram> DatagramSocket::Impl::Receive(ReadOperation& op
         const std::size_t received = socket.receive_from(
             std::span<net::mutable_buffer>(buffers.data(), count), source,
             MSG_TRUNC, receive_ec);
-        if (receive_ec == io_error::would_block || receive_ec == io_error::try_again) continue;
-        if (receive_ec) throw IoSystemError(receive_ec);
+        if (receive_ec == io_error::would_block || receive_ec == io_error::try_again) {
+            read_drain_budget = 0;
+            continue;
+        }
+        if (receive_ec) {
+            read_drain_budget = 0;
+            throw IoSystemError(receive_ec);
+        }
+        if (fresh_wait) {
+            read_drain_budget = kReadDrainBudget - 1;
+        }
         if (received > count * buf::Buffer::kSize) continue;
         if (source.address().is_v6() != ipv6) ThrowLink(ErrorCode::INTERNAL);
 
@@ -268,7 +299,41 @@ net::awaitable<void> DatagramSocket::Impl::SendMultiBuffer(
     }
     if (total != payload.byte_size()) ThrowLink(ErrorCode::INVALID_ARGUMENT);
 
-    ConstBufferSpanBuilder<kMaxNativeBuffers> spans;
+    const auto cancellation_state = co_await net::this_coro::cancellation_state;
+    if (operation.Cancelled()) ThrowCancelled(operation.CancellationReason());
+    if (cancellation_state.cancelled() != net::cancellation_type::none)
+        throw IoSystemError(io_error::operation_aborted);
+    if (payload.size() <= buf::MultiBuffer::kInlineCapacity) {
+        IoErrorCode send_ec;
+        std::size_t sent = 0;
+        {
+            std::array<net::const_buffer, buf::MultiBuffer::kInlineCapacity> inline_buffers;
+            std::size_t count = 0;
+            for (const auto* buffer : payload) {
+                const auto bytes = buffer->Bytes();
+                if (!bytes.empty()) {
+                    inline_buffers[count++] = net::buffer(bytes.data(), bytes.size());
+                }
+            }
+            if (count == 0) {
+                inline_buffers[0] = net::const_buffer{};
+                count = 1;
+            }
+            sent = socket.send_to(
+                std::span<const net::const_buffer>(inline_buffers.data(), count),
+                destination, 0, send_ec);
+        }
+        if (!send_ec) {
+            if (sent != total) ThrowLink(ErrorCode::INTERNAL);
+            timeouts.TouchActivity();
+            co_return;
+        }
+        if (send_ec != io_error::would_block && send_ec != io_error::try_again) {
+            throw IoSystemError(send_ec);
+        }
+    }
+
+    ConstBufferSpanBuilder<buf::MultiBuffer::kInlineCapacity> spans;
     try {
         spans.AppendMultiBuffer(payload);
     } catch (const std::bad_alloc&) {

@@ -25,6 +25,7 @@
 #include "../tls_client_context.hpp"
 #include "../../../proxy/inbound_admission.hpp"
 #include "../../../common/awaitable_task_group.hpp"
+#include "../../../app/udp_receive_buffer.hpp"
 
 #include <nghttp3/nghttp3.h>
 #include <ngtcp2/ngtcp2.h>
@@ -1620,13 +1621,19 @@ void QuicListener::Pump(const std::shared_ptr<Connection>& connection) {
         fed = true;
         (void)connection->Feed(*packet.socket, packet.remote, packet.bytes, false);
     }
+    if (core.inbox.empty()) {
+        memory::ThreadLocalDeque<Connection::Core::PendingInputPacket>{
+            core.inbox.get_allocator()}.swap(core.inbox);
+    }
     if (fed && !connection->Closed()) {
         connection->Flush();
     }
 }
 
 net::awaitable<void> QuicListener::ReceiveLoop(std::shared_ptr<SocketState> socket) {
+    detail::UdpReceiveBuffer receive_buffer;
     while (!stopping && socket->socket && socket->socket->is_open()) {
+        receive_buffer.Release();
         auto [wait_error] = co_await socket->socket->async_wait(
             udp::socket::wait_read, net::as_tuple(net::use_awaitable));
         if (wait_error == net::error::operation_aborted || stopping ||
@@ -1644,15 +1651,22 @@ net::awaitable<void> QuicListener::ReceiveLoop(std::shared_ptr<SocketState> sock
                 if (error == net::error::operation_aborted) co_return;
                 continue;
             }
-            memory::ThreadLocalVector<uint8_t> payload(available);
+            const auto storage = receive_buffer.Prepare(available);
+            if (storage.size() == 0) {
+                std::array<uint8_t, 1> discard{};
+                (void)socket->socket->receive_from(
+                    net::buffer(discard), socket->remote, 0, error);
+                if (error == net::error::operation_aborted) co_return;
+                continue;
+            }
             const size_t bytes = socket->socket->receive_from(
-                net::buffer(payload), socket->remote, MSG_TRUNC, error);
+                storage, socket->remote, MSG_TRUNC, error);
             if (error == net::error::operation_aborted) co_return;
-            if (error || bytes == 0 || bytes > payload.size()) continue;
-            payload.resize(bytes);
+            if (error || bytes == 0 || bytes > storage.size()) continue;
+            const auto packet = receive_buffer.Data(bytes);
             ngtcp2_version_cid version_cid{};
             if (ngtcp2_pkt_decode_version_cid(
-                    &version_cid, payload.data(), bytes,
+                    &version_cid, packet.data(), packet.size(),
                     kServerConnectionIdLength) != 0)
                 continue;
             if (version_cid.dcidlen > NGTCP2_MAX_CIDLEN) continue;
@@ -1661,16 +1675,23 @@ net::awaitable<void> QuicListener::ReceiveLoop(std::shared_ptr<SocketState> sock
             std::shared_ptr<Connection> connection =
                 found == connections.end() ? nullptr : found->second;
             if (!connection) {
-                if ((payload[0] & 0x80) == 0) continue;
+                if ((packet[0] & 0x80) == 0) continue;
                 if (connections.size() >= kMaxConnections) {
                     LOG_DEBUG("Hysteria listener connection capacity reached worker={}", worker_id);
                     continue;
                 }
                 ngtcp2_pkt_hd header{};
-                if (ngtcp2_accept(&header, payload.data(), payload.size()) != 0) continue;
+                if (ngtcp2_accept(&header, packet.data(), packet.size()) != 0) continue;
                 connection = Connection::Create(*this, *socket, socket->remote, header);
             }
-            Enqueue(connection, socket, socket->remote, std::move(payload));
+            if (connection && connection->core_ && connection->core_->quic &&
+                connection->tasks_ && connection->core_->inbox.empty() &&
+                !connection->Closed() && !connection->retired_) {
+                (void)connection->Feed(*socket, socket->remote, packet, true);
+            } else {
+                Enqueue(connection, socket, socket->remote,
+                        memory::ThreadLocalVector<uint8_t>(packet.begin(), packet.end()));
+            }
         } catch (const std::bad_alloc&) {
             if (stopping) co_return;
         } catch (const std::exception& failure) {

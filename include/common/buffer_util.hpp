@@ -133,23 +133,27 @@ private:
         }
     }
 
-    std::array<net::const_buffer, StackCapacity> stack_{};
+    std::array<net::const_buffer, StackCapacity> stack_;
     std::optional<memory::ThreadLocalVector<net::const_buffer>> spill_;
     size_t count_ = 0;
 };
+
+inline net::awaitable<void> ThrowIfCancelledOnEof(const char* cancel_what = nullptr) {
+    const auto cancellation = co_await net::this_coro::cancellation_state;
+    if (cancellation.cancelled() != net::cancellation_type::none) {
+        if (cancel_what) {
+            throw IoSystemError(io_error::operation_aborted, cancel_what);
+        }
+        throw IoSystemError(io_error::operation_aborted);
+    }
+}
 
 template <typename Reader>
 [[nodiscard]] net::awaitable<buf::MultiBuffer> ReadMultiBufferOrThrowOnCancel(
     Reader& reader, const char* cancel_what = nullptr) {
     buf::MultiBuffer raw = co_await reader.ReadMultiBuffer();
     if (raw.byte_size() == 0) {
-        const auto cancellation = co_await net::this_coro::cancellation_state;
-        if (cancellation.cancelled() != net::cancellation_type::none) {
-            if (cancel_what) {
-                throw IoSystemError(io_error::operation_aborted, cancel_what);
-            }
-            throw IoSystemError(io_error::operation_aborted);
-        }
+        co_await ThrowIfCancelledOnEof(cancel_what);
     }
     co_return raw;
 }

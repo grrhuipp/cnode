@@ -54,6 +54,7 @@ private:
 
     [[nodiscard]] static SessionKeys GenerateKeys();
     net::awaitable<void> DecodeResponseHeader(AsyncStream& stream);
+    net::awaitable<buf::MultiBuffer> DecodeFirstResponse(AsyncStream& stream);
 
     Security security_ = Security::AES_128_GCM;
     SessionKeys keys_;

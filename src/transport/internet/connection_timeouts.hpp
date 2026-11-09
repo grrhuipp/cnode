@@ -95,6 +95,8 @@ public:
     [[nodiscard]] bool IsPending(bool is_read) const noexcept {
         return is_read ? read_pending_ : write_pending_;
     }
+    void CheckCanBeginRead() const { CheckCanBegin(read_pending_); }
+    void CheckCanBeginWrite() const { CheckCanBegin(write_pending_); }
     void BeginRead() {
         CheckCanBegin(read_pending_);
         read_pending_ = true;

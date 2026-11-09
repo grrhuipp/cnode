@@ -115,15 +115,16 @@ public:
     }
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
-        co_await ReadVlessResponseHeader(
-            reader_, response_header_, "VLESS response header read failed");
+        if (!response_header_.complete) {
+            return ReadInitialMultiBuffer();
+        }
         if (auto* udp_framer = std::get_if<::vless::UdpFramer>(&io_state_)) {
-            co_return co_await udp_framer->ReadDatagram(reader_, udp_target_);
+            return udp_framer->ReadDatagram(reader_, udp_target_);
         }
         if (auto* vision_io = std::get_if<VisionIoState>(&io_state_)) {
-            co_return co_await vision_io->reader.ReadMultiBuffer();
+            return vision_io->reader.ReadMultiBuffer();
         }
-        co_return co_await reader_.ReadMultiBuffer();
+        return reader_.ReadMultiBuffer();
     }
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
@@ -160,6 +161,18 @@ public:
     }
 
 private:
+    net::awaitable<buf::MultiBuffer> ReadInitialMultiBuffer() {
+        co_await ReadVlessResponseHeader(
+            reader_, response_header_, "VLESS response header read failed");
+        if (auto* udp_framer = std::get_if<::vless::UdpFramer>(&io_state_)) {
+            co_return co_await udp_framer->ReadDatagram(reader_, udp_target_);
+        }
+        if (auto* vision_io = std::get_if<VisionIoState>(&io_state_)) {
+            co_return co_await vision_io->reader.ReadMultiBuffer();
+        }
+        co_return co_await reader_.ReadMultiBuffer();
+    }
+
     VlessBufferedReader& reader_;
     transport::MultiBufferWriter& writer_;
     VlessResponseHeaderState response_header_;

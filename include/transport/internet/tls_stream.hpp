@@ -120,6 +120,7 @@ public:
     net::awaitable<std::size_t> AsyncRead(net::mutable_buffer buf) override;
     net::awaitable<std::size_t> AsyncWrite(net::const_buffer buf) override;
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override;
+    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override;
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override;
     void ShutdownRead() override;
     void ShutdownWrite() override;
@@ -150,6 +151,9 @@ private:
     TlsStream(std::unique_ptr<TcpStream> inner, SSL* existing_ssl,
               bool is_server, bool handshake_done);
 
+    net::awaitable<std::size_t> AsyncReadSlow(net::mutable_buffer buf);
+    net::awaitable<buf::MultiBuffer> ReadMultiBufferSlow();
+    net::awaitable<void> WriteBuffersSlow(std::span<const net::const_buffer> buffers);
     SSL* NativeSsl() noexcept;
     const SSL* NativeSsl() const noexcept;
 

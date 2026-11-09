@@ -159,11 +159,12 @@ private:
 
     [[noreturn]] void ProtocolFailure(const char* reason);
     void CheckWritable() const;
+    [[nodiscard]] bool HasPendingBytes() noexcept;
+    [[nodiscard]] bool TryFillHeaderFromPending() noexcept;
     net::awaitable<bool> EnsurePendingData();
     net::awaitable<size_t> ReadSome(uint8_t* data, size_t size);
     net::awaitable<bool> FillHeader();
     net::awaitable<bool> PrepareNextDataFrame();
-    net::awaitable<size_t> ReadPayload(net::mutable_buffer buffer);
     void FinishDataFrame();
     void ValidateClose();
 

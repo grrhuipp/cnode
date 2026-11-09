@@ -369,6 +369,13 @@ void VisionReader::Decode(buf::MultiBuffer& out) {
 }
 
 net::awaitable<buf::MultiBuffer> VisionReader::ReadMultiBuffer() {
+    if (!read_process_ && pending_.empty() && traffic_.packets_to_filter <= 0) {
+        return src_.ReadMultiBuffer();
+    }
+    return ReadFramedMultiBuffer();
+}
+
+net::awaitable<buf::MultiBuffer> VisionReader::ReadFramedMultiBuffer() {
     while (true) {
         buf::MultiBuffer out;
         Decode(out);
@@ -431,9 +438,12 @@ void VisionTrafficState::FilterTLS(std::span<const uint8_t> data) noexcept {
 
 net::awaitable<void> VisionWriter::WriteMultiBuffer(buf::MultiBuffer mb) {
     if (!write_process_) {
-        co_await dst_.WriteMultiBuffer(std::move(mb));
-        co_return;
+        return dst_.WriteMultiBuffer(std::move(mb));
     }
+    return WriteFramedMultiBuffer(std::move(mb));
+}
+
+net::awaitable<void> VisionWriter::WriteFramedMultiBuffer(buf::MultiBuffer mb) {
     co_await WriteVisionFramed(
         dst_, user_uuid_, send_uuid_, write_process_, traffic_, mb);
     mb.clear();
@@ -441,15 +451,17 @@ net::awaitable<void> VisionWriter::WriteMultiBuffer(buf::MultiBuffer mb) {
 
 net::awaitable<void> VisionWriter::WriteBuffers(std::span<const net::const_buffer> buffers) {
     if (!write_process_) {
-        co_await dst_.WriteBuffers(buffers);
-        co_return;
+        return dst_.WriteBuffers(buffers);
     }
+    return WriteFramedBuffers(buffers);
+}
+
+net::awaitable<void> VisionWriter::WriteFramedBuffers(std::span<const net::const_buffer> buffers) {
     co_await WriteVisionFramed(
         dst_, user_uuid_, send_uuid_, write_process_, traffic_, buffers);
 }
 
 net::awaitable<void> VisionWriter::AsyncShutdownWrite() {
-    co_await dst_.AsyncShutdownWrite();
+    return dst_.AsyncShutdownWrite();
 }
-
 }  // namespace vless

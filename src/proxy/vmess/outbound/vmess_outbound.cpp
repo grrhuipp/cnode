@@ -42,12 +42,10 @@ public:
         , is_udp_(is_udp)
         , udp_target_(std::move(udp_target)) {}
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
-        auto mb = co_await session_.DecodeResponse(stream_);
-        if (is_udp_ && mb.byte_size() != 0 &&
-            !buf::SetUdpTarget(mb, udp_target_)) {
-            throw std::bad_alloc();
+        if (!is_udp_) {
+            return session_.DecodeResponse(stream_);
         }
-        co_return mb;
+        return ReadUdpMultiBuffer();
     }
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
@@ -74,6 +72,14 @@ public:
     }
 
 private:
+    net::awaitable<buf::MultiBuffer> ReadUdpMultiBuffer() {
+        auto mb = co_await session_.DecodeResponse(stream_);
+        if (mb.byte_size() != 0 && !buf::SetUdpTarget(mb, udp_target_)) {
+            throw std::bad_alloc();
+        }
+        co_return mb;
+    }
+
     vmess::encoding::ClientSession& session_;
     bool is_udp_ = false;
     TargetAddress udp_target_;

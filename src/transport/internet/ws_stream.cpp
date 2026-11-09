@@ -126,15 +126,31 @@ bool BaseWsStream::Utf8State::Consume(std::span<const uint8_t> bytes) noexcept {
     throw IoSystemError(io_error::connection_reset, reason);
 }
 
-net::awaitable<bool> BaseWsStream::EnsurePendingData() {
-    if (closed_ || read_closed_) co_return false;
+bool BaseWsStream::HasPendingBytes() noexcept {
+    if (closed_ || read_closed_) return false;
     while (!pending_data_.empty()) {
         if (const buf::Buffer* front = *pending_data_.begin();
             front && !front->IsEmpty()) {
-            co_return true;
+            return true;
         }
         pending_data_.drop_front(1);
     }
+    return false;
+}
+
+bool BaseWsStream::TryFillHeaderFromPending() noexcept {
+    if (header_used_ < header_required_ && HasPendingBytes()) {
+        header_used_ += pending_data_.ConsumePrefixTo(
+            std::span<uint8_t>(header_.data() + header_used_,
+                               header_required_ - header_used_));
+        pending_data_.ReleaseIfIdle();
+    }
+    return header_used_ == header_required_;
+}
+
+net::awaitable<bool> BaseWsStream::EnsurePendingData() {
+    if (HasPendingBytes()) co_return true;
+    if (closed_ || read_closed_) co_return false;
     buf::MultiBuffer next;
     try {
         next = co_await inner_->ReadMultiBuffer();
@@ -149,22 +165,19 @@ net::awaitable<bool> BaseWsStream::EnsurePendingData() {
         co_return false;
     }
     pending_data_.AppendAndCoalesce(std::move(next));
-    co_return !pending_data_.empty();
+    co_return HasPendingBytes();
 }
 
 net::awaitable<size_t> BaseWsStream::ReadSome(uint8_t* data, size_t size) {
-    if (!co_await EnsurePendingData()) co_return 0;
+    if (!HasPendingBytes() && !co_await EnsurePendingData()) co_return 0;
     const size_t n = pending_data_.ConsumePrefixTo(std::span<uint8_t>(data, size));
     pending_data_.ReleaseIfIdle();
     co_return n;
 }
 
 net::awaitable<bool> BaseWsStream::FillHeader() {
-    while (header_used_ < header_required_) {
-        const size_t n = co_await ReadSome(
-            header_.data() + header_used_, header_required_ - header_used_);
-        if (n == 0) co_return false;
-        header_used_ += n;
+    while (!TryFillHeaderFromPending()) {
+        if (!co_await EnsurePendingData()) co_return false;
     }
     co_return true;
 }
@@ -196,7 +209,7 @@ net::awaitable<bool> BaseWsStream::PrepareNextDataFrame() {
     while (!closed_ && !read_closed_ && !peer_closed_cleanly_) {
         switch (read_stage_) {
             case ReadStage::Header: {
-                if (!co_await FillHeader()) co_return false;
+                if (!TryFillHeaderFromPending() && !co_await FillHeader()) co_return false;
                 // No extensions are negotiated. RFC 6455 §§5.2–5.5 require
                 // rejecting reserved bits/opcodes, wrong mask direction and
                 // fragmented or oversized control frames before their body.
@@ -233,7 +246,7 @@ net::awaitable<bool> BaseWsStream::PrepareNextDataFrame() {
                 break;
             }
             case ReadStage::Length: {
-                if (!co_await FillHeader()) co_return false;
+                if (!TryFillHeaderFromPending() && !co_await FillHeader()) co_return false;
                 uint64_t length = 0;
                 for (size_t i = 2; i < header_required_; ++i)
                     length = (length << 8) | header_[i];
@@ -248,7 +261,7 @@ net::awaitable<bool> BaseWsStream::PrepareNextDataFrame() {
                 break;
             }
             case ReadStage::Mask: {
-                if (!co_await FillHeader()) co_return false;
+                if (!TryFillHeaderFromPending() && !co_await FillHeader()) co_return false;
                 if (frame_masked_)
                     std::memcpy(frame_mask_key_.data(),
                                 header_.data() + header_required_ - 4, 4);
@@ -314,14 +327,22 @@ net::awaitable<bool> BaseWsStream::PrepareNextDataFrame() {
     co_return false;
 }
 
-net::awaitable<size_t> BaseWsStream::ReadPayload(net::mutable_buffer buffer) {
+net::awaitable<size_t> BaseWsStream::AsyncRead(net::mutable_buffer buffer) {
+    if (buffer.size() == 0) co_return 0;
+    if (!(read_stage_ == ReadStage::Payload && frame_payload_remaining_ != 0 &&
+          !closed_ && !read_closed_ && !peer_closed_cleanly_) &&
+        !co_await PrepareNextDataFrame()) {
+        co_return 0;
+    }
     const size_t size = static_cast<size_t>(std::min<uint64_t>(
         buffer.size(), frame_payload_remaining_));
     auto* data = static_cast<uint8_t*>(buffer.data());
     // A single read-some commits its bytes immediately. Filling the requested
     // buffer would both delay small messages and lose an unreported prefix if
     // a later lower-layer read were cancelled.
-    const size_t n = co_await ReadSome(data, size);
+    if (!HasPendingBytes() && !co_await EnsurePendingData()) co_return 0;
+    const size_t n = pending_data_.ConsumePrefixTo(std::span<uint8_t>(data, size));
+    pending_data_.ReleaseIfIdle();
     if (n == 0) co_return 0;
     if (frame_masked_)
         ws::MaskData(data, n, frame_mask_key_.data(), frame_mask_offset_);
@@ -333,14 +354,13 @@ net::awaitable<size_t> BaseWsStream::ReadPayload(net::mutable_buffer buffer) {
     co_return n;
 }
 
-net::awaitable<size_t> BaseWsStream::AsyncRead(net::mutable_buffer buffer) {
-    if (buffer.size() == 0 || !co_await PrepareNextDataFrame()) co_return 0;
-    co_return co_await ReadPayload(buffer);
-}
-
 net::awaitable<buf::MultiBuffer> BaseWsStream::ReadMultiBuffer() {
-    if (!co_await PrepareNextDataFrame()) co_return buf::MultiBuffer{};
-    if (!co_await EnsurePendingData()) co_return buf::MultiBuffer{};
+    if (!(read_stage_ == ReadStage::Payload && frame_payload_remaining_ != 0 &&
+          !closed_ && !read_closed_ && !peer_closed_cleanly_) &&
+        !co_await PrepareNextDataFrame()) {
+        co_return buf::MultiBuffer{};
+    }
+    if (!HasPendingBytes() && !co_await EnsurePendingData()) co_return buf::MultiBuffer{};
     if (buf::Buffer* front = *pending_data_.begin();
         front && front->Len() <= frame_payload_remaining_) {
         buf::BufferGuard output = pending_data_.pop_front();
@@ -357,8 +377,19 @@ net::awaitable<buf::MultiBuffer> BaseWsStream::ReadMultiBuffer() {
     }
     buf::BufferGuard output{buf::Buffer::New()};
     if (!output) throw std::bad_alloc();
-    const size_t n = co_await ReadPayload(net::buffer(output->Tail().data(), output->Available()));
+    const size_t size = static_cast<size_t>(std::min<uint64_t>(
+        output->Available(), frame_payload_remaining_));
+    auto* data = output->Tail().data();
+    const size_t n = pending_data_.ConsumePrefixTo(std::span<uint8_t>(data, size));
+    pending_data_.ReleaseIfIdle();
     if (n == 0) co_return buf::MultiBuffer{};
+    if (frame_masked_)
+        ws::MaskData(data, n, frame_mask_key_.data(), frame_mask_offset_);
+    frame_mask_offset_ += n;
+    frame_payload_remaining_ -= n;
+    if (text_message_ && !text_utf8_.Consume(std::span<const uint8_t>(data, n)))
+        ProtocolFailure("WebSocket invalid UTF-8 text message");
+    if (frame_payload_remaining_ == 0) FinishDataFrame();
     output->Produce(static_cast<uint32_t>(n));
     co_return buf::MultiBuffer{std::move(output)};
 }
@@ -382,6 +413,7 @@ net::awaitable<BaseWsStream::WriteGate::Lease> BaseWsStream::AcquireWrite(
 
 net::awaitable<void> BaseWsStream::WriteDataFrame(
     std::span<const net::const_buffer> buffers, size_t size) {
+    if (size == 0) co_return;
     const auto state = co_await net::this_coro::cancellation_state;
     if (closed_ || state.cancelled() != net::cancellation_type::none)
         throw IoSystemError(io_error::operation_aborted);
@@ -443,7 +475,7 @@ net::awaitable<void> BaseWsStream::WriteBuffers(
     CheckWritable();
     size_t size = 0;
     for (const auto& buffer : buffers) AddPayloadSize(size, buffer.size());
-    if (size != 0) co_await WriteDataFrame(buffers, size);
+    return WriteDataFrame(buffers, size);
 }
 
 net::awaitable<size_t> BaseWsStream::AsyncWrite(net::const_buffer buffer) {

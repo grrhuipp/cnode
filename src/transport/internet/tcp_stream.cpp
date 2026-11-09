@@ -97,6 +97,8 @@ enum Flag : uint8_t {
 };
 
 struct TcpStream::Impl : memory::ThreadAllocated {
+    static constexpr uint8_t kReadDrainBudget = 16;
+
     explicit Impl(tcp::socket sock, TcpStream& owner)
         : socket(std::move(sock))
         , owner(owner)
@@ -112,7 +114,10 @@ struct TcpStream::Impl : memory::ThreadAllocated {
         owner.Close();
     }
 
-    void MarkCancelled() noexcept { ++cancellation_epoch_; }
+    void MarkCancelled() noexcept {
+        ++cancellation_epoch_;
+        read_drain_budget = 0;
+    }
 
     tcp::socket::executor_type GetExecutor() noexcept {
         return socket.get_executor();
@@ -141,6 +146,7 @@ struct TcpStream::Impl : memory::ThreadAllocated {
     transport::internet::detail::ConnectionTimeouts<Impl> timeouts;
     buf::MultiBuffer pending_data;
     std::uint64_t cancellation_epoch_ = 0;
+    uint8_t read_drain_budget = 0;
     uint8_t flags = 0;
 };
 
@@ -184,6 +190,7 @@ TcpStream::~TcpStream() {
 
 net::awaitable<std::size_t> TcpStream::AsyncRead(net::mutable_buffer buf) {
     if (!impl_->socket.is_open() || impl_->HasFlag(kReadShutdown)) {
+        impl_->read_drain_budget = 0;
         co_return 0;
     }
 
@@ -212,11 +219,15 @@ net::awaitable<std::size_t> TcpStream::AsyncRead(net::mutable_buffer buf) {
 // TcpStream::ReadMultiBuffer
 //
 // Readiness is delivered without payload. The execution domain then performs
-// nonblocking recv directly into its single pool Buffer.
+// nonblocking recv directly into its single pool Buffer within a bounded drain
+// budget until EAGAIN or a short read requires re-arming readiness.
 // pending_data remains ordered before unread socket bytes.
 // ============================================================================
 net::awaitable<buf::MultiBuffer> TcpStream::ReadMultiBuffer() {
-    if (!impl_->socket.is_open() || impl_->HasFlag(kReadShutdown)) co_return buf::MultiBuffer{};
+    if (!impl_->socket.is_open() || impl_->HasFlag(kReadShutdown)) {
+        impl_->read_drain_budget = 0;
+        co_return buf::MultiBuffer{};
+    }
 
     // 先消费 pending_data；MultiBuffer move 即转移剩余 Buffer 所有权。
     if (!impl_->pending_data.empty()) {
@@ -225,16 +236,49 @@ net::awaitable<buf::MultiBuffer> TcpStream::ReadMultiBuffer() {
         co_return pending;
     }
 
-    OperationTimeoutScope<decltype(impl_->timeouts), true> timeout_scope{impl_->timeouts};
+    impl_->timeouts.CheckCanBeginRead();
+    const auto cancellation = co_await net::this_coro::cancellation_state;
+    std::optional<WriteCompletion> completion;
+    std::optional<OperationTimeoutScope<decltype(impl_->timeouts), true>> timeout_scope;
+
     for (;;) {
-        const IoErrorCode wait_ec = co_await WaitReadable();
-        if (wait_ec) {
-            if (wait_ec == io_error::eof) {
-                co_return buf::MultiBuffer{};
-            }
-            throw IoSystemError(wait_ec);
+        if ((completion ? completion->Cancelled() : Cancellation().Stopped()) ||
+            cancellation.cancelled() != net::cancellation_type::none) {
+            impl_->read_drain_budget = 0;
+            throw IoSystemError(io_error::operation_aborted);
         }
 
+        bool fresh_wait = false;
+        if (impl_->read_drain_budget != 0) {
+            --impl_->read_drain_budget;
+        } else {
+            if (!completion) completion.emplace(Cancellation());
+            if (!timeout_scope) timeout_scope.emplace(impl_->timeouts);
+            if (completion->Cancelled() ||
+                cancellation.cancelled() != net::cancellation_type::none) {
+                impl_->read_drain_budget = 0;
+                throw IoSystemError(io_error::operation_aborted);
+            }
+            const IoErrorCode wait_ec = co_await impl_->Wait(
+                tcp::socket::wait_read, cancellation.slot());
+            if (completion->Cancelled() && !wait_ec) {
+                impl_->read_drain_budget = 0;
+                throw IoSystemError(io_error::operation_aborted);
+            }
+            if (wait_ec) {
+                impl_->read_drain_budget = 0;
+                if (wait_ec == io_error::eof) {
+                    co_return buf::MultiBuffer{};
+                }
+                throw IoSystemError(wait_ec);
+            }
+            fresh_wait = true;
+        }
+
+        if (!impl_->socket.is_open() || impl_->HasFlag(kReadShutdown)) {
+            impl_->read_drain_budget = 0;
+            co_return buf::MultiBuffer{};
+        }
         if (!impl_->pending_data.empty()) {
             buf::MultiBuffer pending = std::move(impl_->pending_data);
             TouchActivity();
@@ -245,20 +289,32 @@ net::awaitable<buf::MultiBuffer> TcpStream::ReadMultiBuffer() {
         if (!buffer) {
             throw std::bad_alloc();
         }
+        const auto avail = buffer->Available();
         const auto received = ::recv(
             impl_->socket.native_handle(),
             buffer->Tail().data(),
-            buffer->Available(),
+            avail,
             MSG_DONTWAIT);
         if (received > 0) {
+            if (static_cast<size_t>(received) < avail) {
+                impl_->read_drain_budget = 0;
+            } else if (fresh_wait) {
+                impl_->read_drain_budget = Impl::kReadDrainBudget - 1;
+            }
             buffer->Produce(static_cast<uint32_t>(received));
             TouchActivity();
             co_return buf::MultiBuffer{std::move(buffer)};
         }
         if (received == 0) {
+            impl_->read_drain_budget = 0;
             co_return buf::MultiBuffer{};
         }
-        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+        if (errno == EINTR) {
+            if (fresh_wait) impl_->read_drain_budget = 1;
+            continue;
+        }
+        impl_->read_drain_budget = 0;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
             continue;
         }
         throw IoSystemError(IoErrorCode(errno, io_error::get_system_category()));
@@ -271,6 +327,88 @@ net::awaitable<buf::MultiBuffer> TcpStream::ReadMultiBuffer() {
 // Scatter-send executes only on the domain owner; native asynchronous work
 // consists solely of readiness notifications and never retains payload spans.
 // ============================================================================
+bool TcpStream::DrainWriteAvailable(
+    std::span<const net::const_buffer>& buffers,
+    std::size_t& offset,
+    bool cancelled_or_stopped,
+    bool deferred,
+    net::cancellation_type coro_cancelled) {
+    while (!buffers.empty()) {
+        if (cancelled_or_stopped ||
+            (!deferred && coro_cancelled != net::cancellation_type::none)) {
+            throw IoSystemError(io_error::operation_aborted);
+        }
+        IoErrorCode error;
+        const auto sent = WriteAvailable(buffers, offset, error);
+        if (error) {
+            if (error == io_error::interrupted) continue;
+            if (error != io_error::would_block && error != io_error::try_again) {
+                throw IoSystemError(error);
+            }
+            return false;
+        }
+        auto remaining = sent;
+        while (!buffers.empty() && remaining >= buffers.front().size() - offset) {
+            remaining -= buffers.front().size() - offset;
+            buffers = buffers.subspan(1);
+            offset = 0;
+        }
+        offset += remaining;
+        while (!buffers.empty() && buffers.front().size() == 0) {
+            buffers = buffers.subspan(1);
+        }
+    }
+    return true;
+}
+
+net::awaitable<void> TcpStream::WriteMultiBuffer(buf::MultiBuffer mb) {
+    if (mb.byte_size() == 0) {
+        mb.clear();
+        co_return;
+    }
+    if (!impl_->socket.is_open() || impl_->HasFlag(kWriteShutdown)) {
+        mb.clear();
+        throw IoSystemError(io_error::broken_pipe);
+    }
+    ConstBufferSpanBuilder<buf::MultiBuffer::kInlineCapacity> builder;
+    try {
+        builder.AppendMultiBuffer(mb);
+        auto buffers = builder.Span();
+        while (!buffers.empty() && buffers.front().size() == 0) buffers = buffers.subspan(1);
+        if (buffers.empty()) {
+            mb.clear();
+            co_return;
+        }
+        impl_->timeouts.CheckCanBeginWrite();
+        const auto cancellation = co_await net::this_coro::cancellation_state;
+        const bool deferred = IsWriteCancellationDeferred();
+        size_t offset = 0;
+        if (DrainWriteAvailable(
+                buffers, offset, Cancellation().Stopped(), deferred, cancellation.cancelled())) {
+            mb.clear();
+            co_return;
+        }
+        std::array<net::const_buffer, 1> head{};
+        if (offset != 0) {
+            head[0] = buffers.front() + offset;
+            if (buffers.size() == 1) {
+                co_await WriteBuffers(head);
+            } else {
+                ConstBufferSpanBuilder<buf::MultiBuffer::kInlineCapacity> remaining_builder;
+                remaining_builder.Append(head[0]);
+                remaining_builder.AppendBuffers(buffers.subspan(1));
+                co_await WriteBuffers(remaining_builder.Span());
+            }
+        } else {
+            co_await WriteBuffers(buffers);
+        }
+    } catch (...) {
+        mb.clear();
+        throw;
+    }
+    mb.clear();
+}
+
 net::awaitable<void> TcpStream::WriteBuffers(
     std::span<const net::const_buffer> buffers) {
     if (!impl_->socket.is_open() || impl_->HasFlag(kWriteShutdown)) {
@@ -279,43 +417,34 @@ net::awaitable<void> TcpStream::WriteBuffers(
 
     while (!buffers.empty() && buffers.front().size() == 0) buffers = buffers.subspan(1);
     if (buffers.empty()) co_return;
-    WriteCompletion completion(Cancellation());
-    OperationTimeoutScope<decltype(impl_->timeouts), false> timeout_scope{impl_->timeouts};
+    impl_->timeouts.CheckCanBeginWrite();
     const auto cancellation = co_await net::this_coro::cancellation_state;
     const bool deferred = IsWriteCancellationDeferred();
+    size_t offset = 0;
+    if (DrainWriteAvailable(
+            buffers, offset, Cancellation().Stopped(), deferred, cancellation.cancelled())) {
+        co_return;
+    }
+
+    WriteCompletion completion(Cancellation());
+    OperationTimeoutScope<decltype(impl_->timeouts), false> timeout_scope{impl_->timeouts};
     const auto slot = deferred ? net::cancellation_slot{} : cancellation.slot();
     const bool previous_throw = co_await net::this_coro::throw_if_cancelled();
     co_await net::this_coro::throw_if_cancelled(false);
     std::exception_ptr failure;
     try {
-        size_t offset = 0;
-        while (!buffers.empty()) {
-            if (completion.Cancelled() ||
-                (!deferred && cancellation.cancelled() != net::cancellation_type::none))
-                throw IoSystemError(io_error::operation_aborted);
-            IoErrorCode error;
-            const auto sent = WriteAvailable(buffers, offset, error);
-            if (error) {
-                if (error == io_error::interrupted) continue;
-                if (error != io_error::would_block && error != io_error::try_again)
-                    throw IoSystemError(error);
-                const auto ec = co_await impl_->Wait(tcp::socket::wait_write, slot);
-                if (ec) throw IoSystemError(ec);
-                continue;
+        for (;;) {
+            const auto ec = co_await impl_->Wait(tcp::socket::wait_write, slot);
+            if (ec) throw IoSystemError(ec);
+            if (DrainWriteAvailable(
+                    buffers, offset, completion.Cancelled(), deferred, cancellation.cancelled())) {
+                break;
             }
-            auto remaining = sent;
-            while (!buffers.empty() && remaining >= buffers.front().size() - offset) {
-                remaining -= buffers.front().size() - offset;
-                buffers = buffers.subspan(1);
-                offset = 0;
-            }
-            offset += remaining;
         }
     } catch (...) { failure = std::current_exception(); }
     co_await net::this_coro::throw_if_cancelled(previous_throw);
     if (failure) std::rethrow_exception(failure);
 }
-
 net::awaitable<std::size_t> TcpStream::AsyncWrite(net::const_buffer buf) {
     const size_t size = buf.size();
     co_await WriteBuffers(std::span<const net::const_buffer>(&buf, 1));
@@ -324,6 +453,7 @@ net::awaitable<std::size_t> TcpStream::AsyncWrite(net::const_buffer buf) {
 
 void TcpStream::ShutdownRead() {
     ReleasePendingData();
+    impl_->read_drain_budget = 0;
     if (!impl_->socket.is_open() || impl_->HasFlag(kReadShutdown)) {
         return;
     }
@@ -388,26 +518,39 @@ net::awaitable<std::pair<IoErrorCode, std::size_t>> TcpStream::AsyncReceiveSome(
     net::mutable_buffer buffer,
     bool peek) {
     if (!impl_->socket.is_open() || impl_->HasFlag(kReadShutdown)) {
+        impl_->read_drain_budget = 0;
         co_return std::make_pair(io_error::not_connected, std::size_t{0});
     }
 
     if (buffer.size() == 0) co_return std::make_pair(IoErrorCode{}, size_t{0});
-    WriteCompletion completion(Cancellation());
+    impl_->timeouts.CheckCanBeginRead();
     const auto cancellation = co_await net::this_coro::cancellation_state;
-    OperationTimeoutScope<decltype(impl_->timeouts), true> timeout_scope{impl_->timeouts, true};
+    std::optional<WriteCompletion> completion;
+    std::optional<OperationTimeoutScope<decltype(impl_->timeouts), true>> timeout_scope;
     for (;;) {
-        if (completion.Cancelled() || cancellation.cancelled() != net::cancellation_type::none)
+        if ((completion ? completion->Cancelled() : Cancellation().Stopped()) ||
+            cancellation.cancelled() != net::cancellation_type::none) {
+            impl_->read_drain_budget = 0;
             co_return std::make_pair(IoErrorCode(io_error::operation_aborted), size_t{0});
+        }
         const auto received = ::recv(impl_->socket.native_handle(), buffer.data(), buffer.size(),
                                     MSG_DONTWAIT | (peek ? MSG_PEEK : 0));
         if (received > 0) {
+            if (peek || static_cast<size_t>(received) < buffer.size()) {
+                impl_->read_drain_budget = 0;
+            }
             if (!peek) TouchActivity();
             co_return std::make_pair(IoErrorCode{}, static_cast<size_t>(received));
         }
+        impl_->read_drain_budget = 0;
         if (received == 0) co_return std::make_pair(IoErrorCode(io_error::eof), size_t{0});
         if (errno == EINTR) continue;
         if (errno != EAGAIN && errno != EWOULDBLOCK)
             co_return std::make_pair(IoErrorCode(errno, std::system_category()), size_t{0});
+        if (!completion) completion.emplace(Cancellation());
+        if (!timeout_scope) timeout_scope.emplace(impl_->timeouts, true);
+        if (completion->Cancelled() || cancellation.cancelled() != net::cancellation_type::none)
+            co_return std::make_pair(IoErrorCode(io_error::operation_aborted), size_t{0});
         const auto ec = co_await impl_->Wait(tcp::socket::wait_read, cancellation.slot());
         if (ec) co_return std::make_pair(ec, size_t{0});
     }
@@ -598,6 +741,7 @@ tcp::socket::executor_type TcpStream::GetExecutor() noexcept {
 
 net::awaitable<IoErrorCode> TcpStream::WaitReadable(net::cancellation_slot cancellation) {
     if (!impl_->socket.is_open() || impl_->HasFlag(kReadShutdown)) {
+        impl_->read_drain_budget = 0;
         co_return io_error::eof;
     }
     if (impl_->pending_data.byte_size() != 0) {
@@ -606,16 +750,20 @@ net::awaitable<IoErrorCode> TcpStream::WaitReadable(net::cancellation_slot cance
 
     WriteCompletion completion(Cancellation());
     OperationTimeoutScope<decltype(impl_->timeouts), true> timeout_scope{impl_->timeouts, true};
+    const auto coro_cancellation = co_await net::this_coro::cancellation_state;
     if (!cancellation.is_connected())
-        cancellation = (co_await net::this_coro::cancellation_state).slot();
+        cancellation = coro_cancellation.slot();
     if (completion.Cancelled() ||
-        (co_await net::this_coro::cancellation_state).cancelled() != net::cancellation_type::none) {
+        coro_cancellation.cancelled() != net::cancellation_type::none) {
+        impl_->read_drain_budget = 0;
         co_return IoErrorCode(io_error::operation_aborted);
     }
     const auto ec = co_await impl_->Wait(tcp::socket::wait_read, cancellation);
     if (completion.Cancelled() && !ec) {
+        impl_->read_drain_budget = 0;
         co_return IoErrorCode(io_error::operation_aborted);
     }
+    impl_->read_drain_budget = ec ? 0 : static_cast<uint8_t>(Impl::kReadDrainBudget - 1);
     co_return ec;
 }
 
@@ -633,15 +781,40 @@ bool TcpStream::CanWrite() const noexcept {
     return impl_->socket.is_open() && !impl_->HasFlag(kWriteShutdown);
 }
 
+bool TcpStream::TryConsumeReadableBudget() noexcept {
+    if (!CanRead()) {
+        impl_->read_drain_budget = 0;
+        return false;
+    }
+    if (!impl_->pending_data.empty()) {
+        return true;
+    }
+    if (impl_->read_drain_budget != 0) {
+        --impl_->read_drain_budget;
+        return true;
+    }
+    return false;
+}
+
+void TcpStream::ResetReadableBudget() noexcept {
+    impl_->read_drain_budget = 0;
+}
+
 std::size_t TcpStream::ReadAvailable(
     net::mutable_buffer target, IoErrorCode& error) noexcept {
     error.clear();
     if (!CanRead()) {
+        impl_->read_drain_budget = 0;
         error = io_error::eof;
         return 0;
     }
     std::size_t n = ConsumePendingData(target);
-    if (n == 0) n = impl_->socket.read_some(target, error);
+    if (n == 0) {
+        n = impl_->socket.read_some(target, error);
+        if (error || n < target.size()) {
+            impl_->read_drain_budget = 0;
+        }
+    }
     if (n != 0) TouchActivity();
     return n;
 }

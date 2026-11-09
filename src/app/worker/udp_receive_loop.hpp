@@ -34,6 +34,11 @@ net::awaitable<void> RunUdpReceiveLoop(
         bool, IsOwned&, const std::shared_ptr<udp::socket>&>);
     static_assert(std::is_same_v<std::invoke_result_t<
         ProcessDatagram&, const udp::endpoint&, std::span<const uint8_t>>, void>);
+    static constexpr size_t kMaxReceiveBatch = 32;
+    if (socket && socket->is_open() && !socket->non_blocking()) {
+        IoErrorCode ignored;
+        socket->non_blocking(true, ignored);
+    }
     detail::UdpReceiveBuffer receive_buffer;
     while (true) {
         receive_buffer.Release();
@@ -53,57 +58,77 @@ net::awaitable<void> RunUdpReceiveLoop(
             throw IoSystemError(wait_error);
         }
 
-        IoErrorCode available_error;
-        const size_t available = socket->available(available_error);
-        if (available_error) {
-            if (IsTransientReceiveError(available_error)) {
+        for (size_t drained = 0; drained < kMaxReceiveBatch; ++drained) {
+            if (!is_owned(socket)) {
+                receive_buffer.Release();
+                co_return;
+            }
+            IoErrorCode available_error;
+            const size_t available = socket->available(available_error);
+            if (available_error) {
+                if (available_error == io_error::would_block ||
+                    available_error == io_error::try_again) {
+                    break;
+                }
+                if (IsTransientReceiveError(available_error)) {
+                    continue;
+                }
+                throw IoSystemError(available_error);
+            }
+
+            const auto storage = receive_buffer.Prepare(available);
+            if (storage.size() == 0) {
+                udp::endpoint discarded_peer;
+                std::array<uint8_t, 1> discard_byte{};
+                IoErrorCode discard_error;
+                (void)socket->receive_from(
+                    net::buffer(discard_byte), discarded_peer, 0, discard_error);
+                if (discard_error == io_error::would_block ||
+                    discard_error == io_error::try_again) {
+                    break;
+                }
+                if (IsTransientReceiveError(discard_error)) {
+                    continue;
+                }
+                if (discard_error && discard_error != io_error::message_size) {
+                    throw IoSystemError(discard_error);
+                }
+                ++resource_drops;
                 continue;
             }
-            throw IoSystemError(available_error);
-        }
 
-        const auto storage = receive_buffer.Prepare(available);
-        if (storage.size() == 0) {
-            udp::endpoint discarded_peer;
-            std::array<uint8_t, 1> discard_byte{};
-            IoErrorCode discard_error;
-            (void)socket->receive_from(
-                net::buffer(discard_byte), discarded_peer, 0, discard_error);
-            if (IsTransientReceiveError(discard_error)) {
+            udp::endpoint peer;
+            IoErrorCode receive_error;
+            const size_t received_bytes = socket->receive_from(
+                storage, peer, 0, receive_error);
+            if (!is_owned(socket)) {
+                receive_buffer.Release();
+                co_return;
+            }
+            if (receive_error == io_error::would_block ||
+                receive_error == io_error::try_again) {
+                break;
+            }
+            if (receive_error == io_error::message_size) {
+                ++resource_drops;
                 continue;
             }
-            if (discard_error && discard_error != io_error::message_size) {
-                throw IoSystemError(discard_error);
+            if (receive_error) {
+                if (IsTransientReceiveError(receive_error)) {
+                    continue;
+                }
+                throw IoSystemError(receive_error);
             }
-            ++resource_drops;
-            continue;
-        }
-
-        udp::endpoint peer;
-        auto [receive_error, received_bytes] = co_await socket->async_receive_from(
-            storage, peer, net::as_tuple(net::use_awaitable));
-        if (!is_owned(socket)) {
-            co_return;
-        }
-        if (receive_error == io_error::message_size) {
-            ++resource_drops;
-            continue;
-        }
-        if (receive_error) {
-            if (IsTransientReceiveError(receive_error)) {
+            if (received_bytes == 0) {
                 continue;
             }
-            throw IoSystemError(receive_error);
-        }
-        if (received_bytes == 0) {
-            continue;
-        }
 
-        const auto payload = receive_buffer.Data(received_bytes);
-        try {
-            process_datagram(peer, payload);
-        } catch (const std::bad_alloc&) {
-            ++resource_drops;
+            const auto payload = receive_buffer.Data(received_bytes);
+            try {
+                process_datagram(peer, payload);
+            } catch (const std::bad_alloc&) {
+                ++resource_drops;
+            }
         }
     }
 }

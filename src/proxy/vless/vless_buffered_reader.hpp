@@ -86,12 +86,16 @@ public:
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
         if (pending_.byte_size() != 0) {
-            co_return std::move(pending_);
+            return TakePending();
         }
-        co_return co_await src_.ReadMultiBuffer();
+        return src_.ReadMultiBuffer();
     }
 
 private:
+    net::awaitable<buf::MultiBuffer> TakePending() {
+        co_return std::move(pending_);
+    }
+
     transport::MultiBufferReader& src_;
     buf::MultiBuffer pending_;
 };

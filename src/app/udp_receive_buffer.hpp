@@ -25,18 +25,23 @@ public:
     }
 
     [[nodiscard]] net::mutable_buffer Prepare(size_t available_bytes) {
-        Release();
-
         const size_t capacity = std::clamp<size_t>(
             available_bytes, 1, kMaxWireBytes);
         if (capacity <= buf::Buffer::kSize) {
-            small_ = buf::BufferGuard{buf::Buffer::New()};
+            if (large_.capacity() != 0) {
+                memory::ByteVector empty{large_.get_allocator()};
+                large_.swap(empty);
+            }
             if (!small_) {
-                return {};
+                small_ = buf::BufferGuard{buf::Buffer::New()};
+                if (!small_) {
+                    return {};
+                }
             }
             return net::buffer(small_->data, buf::Buffer::kSize);
         }
 
+        small_ = buf::BufferGuard{};
         try {
             large_.resize(capacity);
         } catch (const std::bad_alloc&) {

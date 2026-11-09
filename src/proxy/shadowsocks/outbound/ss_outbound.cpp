@@ -61,19 +61,10 @@ public:
                           cipher_info, master_key, request_salt) {}
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
-        if (auto* pending = std::get_if<PendingResponseState>(&response_state_)) {
-            auto reader_result = co_await ss::ReadTCPResponse(
-                pending->cipher_info, pending->master_key, pending->request_salt, stream_);
-            if (!reader_result) {
-                OPENSSL_cleanse(pending->master_key.bytes.data(), pending->master_key.bytes.size());
-                pending->master_key.size = 0;
-                OPENSSL_cleanse(pending->request_salt.bytes.data(), pending->request_salt.bytes.size());
-                pending->request_salt.size = 0;
-                throw transport::LinkError(reader_result.error());
-            }
-            response_state_.emplace<ss::detail::BodyReader>(std::move(*reader_result));
+        if (auto* reader = std::get_if<ss::detail::BodyReader>(&response_state_)) {
+            return reader->ReadMultiBuffer();
         }
-        co_return co_await std::get<ss::detail::BodyReader>(response_state_).ReadMultiBuffer();
+        return ReadInitialMultiBuffer();
     }
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
@@ -93,6 +84,22 @@ public:
     }
 
 private:
+    net::awaitable<buf::MultiBuffer> ReadInitialMultiBuffer() {
+        if (auto* pending = std::get_if<PendingResponseState>(&response_state_)) {
+            auto reader_result = co_await ss::ReadTCPResponse(
+                pending->cipher_info, pending->master_key, pending->request_salt, stream_);
+            if (!reader_result) {
+                OPENSSL_cleanse(pending->master_key.bytes.data(), pending->master_key.bytes.size());
+                pending->master_key.size = 0;
+                OPENSSL_cleanse(pending->request_salt.bytes.data(), pending->request_salt.bytes.size());
+                pending->request_salt.size = 0;
+                throw transport::LinkError(reader_result.error());
+            }
+            response_state_.emplace<ss::detail::BodyReader>(std::move(*reader_result));
+        }
+        co_return co_await std::get<ss::detail::BodyReader>(response_state_).ReadMultiBuffer();
+    }
+
     ss::RequestBodyWriter request_writer_;
     std::variant<PendingResponseState, ss::detail::BodyReader> response_state_;
 };

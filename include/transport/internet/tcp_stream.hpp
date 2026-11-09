@@ -51,7 +51,8 @@ public:
     // WriteBuffers   : scatter-write (WSASend / writev)，多 Buffer 合并为单次系统调用
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override;
     bool EnableRawRead() noexcept override { return true; }
-    net::awaitable<void>        WriteBuffers(std::span<const net::const_buffer> buffers) override;
+    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override;
+    net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override;
     void ShutdownRead() override;
     void ShutdownWrite() override;
     void Close() override;
@@ -119,12 +120,20 @@ private:
     void PrepareTlsIo();
     [[nodiscard]] bool CanRead() const noexcept;
     [[nodiscard]] bool CanWrite() const noexcept;
+    [[nodiscard]] bool TryConsumeReadableBudget() noexcept;
+    void ResetReadableBudget() noexcept;
     [[nodiscard]] std::size_t ReadAvailable(
         net::mutable_buffer target, IoErrorCode& error) noexcept;
     // One nonblocking attempt; only WriteBuffers waits and owns write deadlines.
     [[nodiscard]] std::size_t WriteAvailable(
         std::span<const net::const_buffer> buffers, std::size_t offset,
         IoErrorCode& error) noexcept;
+    [[nodiscard]] bool DrainWriteAvailable(
+        std::span<const net::const_buffer>& buffers,
+        std::size_t& offset,
+        bool cancelled_or_stopped,
+        bool deferred,
+        net::cancellation_type coro_cancelled);
 
     net::awaitable<std::pair<IoErrorCode, std::size_t>> AsyncReceiveSome(
         net::mutable_buffer buffer,

@@ -107,37 +107,18 @@ public:
         : dst_(dst) {}
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
-        if (mb.byte_size() == 0) {
-            mb.clear();
-            co_return;
-        }
         if (header_sent_) {
-            co_await dst_.WriteMultiBuffer(std::move(mb));
-            co_return;
+            return dst_.WriteMultiBuffer(std::move(mb));
         }
-        header_sent_ = true;
-        ConstBufferSpanBuilder<1 + buf::MultiBuffer::kInlineCapacity> out;
-        out.Append(HeaderBuffer());
-        out.AppendMultiBuffer(mb);
-        co_await dst_.WriteBuffers(out.Span());
-        mb.clear();
+        return WriteFirstMultiBuffer(std::move(mb));
     }
 
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
-        if (std::ranges::all_of(buffers, [](const net::const_buffer& b) { return b.size() == 0; })) {
-            co_return;
-        }
         if (header_sent_) {
-            co_await dst_.WriteBuffers(buffers);
-            co_return;
+            return dst_.WriteBuffers(buffers);
         }
-        header_sent_ = true;
-        ConstBufferSpanBuilder<1 + buf::MultiBuffer::kInlineCapacity> out;
-        out.Append(HeaderBuffer());
-        out.AppendBuffers(buffers);
-        co_await dst_.WriteBuffers(out.Span());
+        return WriteFirstBuffers(buffers);
     }
-
     net::awaitable<void> AsyncShutdownWrite() override {
         if (!header_sent_) {
             header_sent_ = true;
@@ -152,6 +133,30 @@ public:
     }
 
 private:
+    net::awaitable<void> WriteFirstMultiBuffer(buf::MultiBuffer mb) {
+        if (mb.byte_size() == 0) {
+            mb.clear();
+            co_return;
+        }
+        header_sent_ = true;
+        ConstBufferSpanBuilder<1 + buf::MultiBuffer::kInlineCapacity> out;
+        out.Append(HeaderBuffer());
+        out.AppendMultiBuffer(mb);
+        co_await dst_.WriteBuffers(out.Span());
+        mb.clear();
+    }
+
+    net::awaitable<void> WriteFirstBuffers(std::span<const net::const_buffer> buffers) {
+        if (std::ranges::all_of(buffers, [](const net::const_buffer& b) { return b.size() == 0; })) {
+            co_return;
+        }
+        header_sent_ = true;
+        ConstBufferSpanBuilder<1 + buf::MultiBuffer::kInlineCapacity> out;
+        out.Append(HeaderBuffer());
+        out.AppendBuffers(buffers);
+        co_await dst_.WriteBuffers(out.Span());
+    }
+
     [[nodiscard]] static net::const_buffer HeaderBuffer() noexcept {
         return net::const_buffer(::vless::kResponseHeader.data(),
                                  ::vless::kResponseHeader.size());

@@ -92,8 +92,9 @@ net::awaitable<buf::MultiBuffer> ReadUdpDatagram(
         if (framer.Next(packet)) {
             co_return std::move(packet.payload);
         }
-        buf::MultiBuffer raw = co_await ReadMultiBufferOrThrowOnCancel(stream);
+        buf::MultiBuffer raw = co_await stream.ReadMultiBuffer();
         if (raw.byte_size() == 0) {
+            co_await ThrowIfCancelledOnEof();
             framer.Finish();
             co_return buf::MultiBuffer{};
         }

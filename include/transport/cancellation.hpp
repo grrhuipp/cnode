@@ -25,6 +25,7 @@ public:
 
     void CancelPending(ErrorCode reason = ErrorCode::CANCELLED) noexcept;
     void Stop(ErrorCode reason = ErrorCode::CANCELLED) noexcept;
+    [[nodiscard]] bool Stopped() const noexcept { return terminal_reason_ != ErrorCode::OK; }
 
 private:
     friend class CancellationSubscription;

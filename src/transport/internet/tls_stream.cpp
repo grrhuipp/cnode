@@ -287,6 +287,7 @@ struct TlsStream::Impl final : memory::ThreadAllocated, private transport::Cance
         std::optional<memory::ByteVector> output;
         IoErrorCode transport_error;
         std::exception_ptr failure;
+        std::uint64_t generation = 0;
         unsigned long library_error = 0;
         int ssl_error = SSL_ERROR_NONE;
         int result = 0;
@@ -506,6 +507,7 @@ struct TlsStream::Impl final : memory::ThreadAllocated, private transport::Cance
         call.library_error = ERR_get_error();
         while (ERR_get_error() != 0) {}
         invocation = nullptr;
+        call.generation = input_generation;
     }
 
     [[noreturn]] void Fail(const Invocation& call) {
@@ -542,75 +544,121 @@ struct TlsStream::Impl final : memory::ThreadAllocated, private transport::Cance
         if (ec) throw IoSystemError(ec);
     }
 
-    net::awaitable<int> Perform(
-        Kind kind, net::mutable_buffer target = {}, net::const_buffer source = {},
-        buf::BufferGuard* allocated = nullptr) {
-        const auto epoch = cancel_epoch;
-        const bool deferred = (kind == Kind::Write && tcp->IsWriteCancellationDeferred());
-        auto lease = engine_gate.TryAcquire();
-        if (!lease) lease = co_await engine_gate.Acquire(deferred);
-        CheckCancellation(epoch);
-        if (!lease) throw IoSystemError(io_error::operation_aborted);
-        for (;;) {
-            // A local receive shutdown is not a truncated peer TLS record.
-            // Recheck after input/engine waits before SSL or buffer allocation.
-            if (kind == Kind::Read && !tcp->CanRead()) co_return 0;
-            if (allocated && !*allocated) {
-                *allocated = buf::BufferGuard{buf::Buffer::New()};
-                if (!*allocated) throw std::bad_alloc();
-                target = net::buffer((*allocated)->Tail().data(), (*allocated)->Available());
+    net::awaitable<void> FlushPendingOutput(
+        Invocation& call, Gate::Lease& lease, std::uint64_t epoch,
+        bool deferred, bool release_lease) {
+        try {
+            // Reserve the physical turn before the first suspension
+            // or another SSL call can generate a subsequent record.
+            OutputTurn turn(*this);
+            if (release_lease) lease.Reset();
+            if (turn.previous) {
+                IoErrorCode ec;
+                if (deferred) {
+                    std::tie(ec) = co_await turn.wake->async_receive(
+                        net::bind_cancellation_slot(
+                            net::cancellation_slot{},
+                            net::bind_allocator(memory::ProcessAllocator<std::byte>{},
+                                net::as_tuple(net::use_awaitable))));
+                } else {
+                    std::tie(ec) = co_await turn.wake->async_receive(
+                        net::bind_allocator(memory::ProcessAllocator<std::byte>{},
+                            net::as_tuple(net::use_awaitable)));
+                }
+                if (ec) throw IoSystemError(io_error::operation_aborted);
+                CheckCancellation(epoch);
             }
-            int result, error;
-            std::uint64_t generation;
+            const net::const_buffer out_buf = net::buffer(*call.output);
+            co_await tcp->WriteBuffers(std::span<const net::const_buffer>(&out_buf, 1));
+            CheckCancellation(epoch);
+        } catch (...) {
+            Abort();
+            throw;
+        }
+    }
+    // Returns true if completed synchronously without pending BIO output;
+    // otherwise `lease` and `pending_call` are ready for `FinishPerform`.
+    bool TryInvokeOnce(Kind kind, Gate::Lease& lease,
+                       std::optional<Invocation>& pending_call,
+                       std::uint64_t epoch, net::mutable_buffer target,
+                       net::const_buffer source, buf::BufferGuard* allocated,
+                       int& sync_result) {
+        lease = engine_gate.TryAcquire();
+        if (!lease) return false;
+        CheckCancellation(epoch);
+        if (kind == Kind::Read && !tcp->CanRead()) {
+            sync_result = 0;
+            return true;
+        }
+        if (allocated && !*allocated) {
+            *allocated = buf::BufferGuard{buf::Buffer::New()};
+            if (!*allocated) throw std::bad_alloc();
+            target = net::buffer((*allocated)->Tail().data(), (*allocated)->Available());
+        }
+        auto& call = pending_call.emplace();
+        Invoke(call, kind, target, source);
+        if (call.failure || call.transport_error) Fail(call);
+        CheckCancellation(epoch);
+        if (allocated && call.result <= 0 && call.ssl_error == SSL_ERROR_WANT_READ)
+            *allocated = {};
+        if (!call.output) {
+            if (call.result > 0) {
+                sync_result = call.result;
+                return true;
+            }
+            if (kind == Kind::Read && call.ssl_error == SSL_ERROR_ZERO_RETURN) {
+                sync_result = 0;
+                return true;
+            }
+            if (call.ssl_error != SSL_ERROR_WANT_READ) Fail(call);
+        }
+        return false;
+    }
+
+    net::awaitable<int> FinishPerform(
+        Kind kind, Gate::Lease lease, std::optional<Invocation> pending_call,
+        std::uint64_t epoch, bool deferred,
+        net::mutable_buffer target, net::const_buffer source,
+        buf::BufferGuard* allocated) {
+        if (!lease) {
+            lease = engine_gate.TryAcquire();
+            if (!lease) lease = co_await engine_gate.Acquire(deferred);
+            CheckCancellation(epoch);
+            if (!lease) throw IoSystemError(io_error::operation_aborted);
+        }
+        for (;;) {
+            int result = 0;
+            int error = SSL_ERROR_NONE;
+            std::uint64_t generation = 0;
             {
-                Invocation call;
-                Invoke(call, kind, target, source);
-                generation = input_generation;
+                std::optional<Invocation> current;
+                if (pending_call) {
+                    current = std::move(pending_call);
+                    pending_call.reset();
+                } else {
+                    if (kind == Kind::Read && !tcp->CanRead()) co_return 0;
+                    if (allocated && !*allocated) {
+                        *allocated = buf::BufferGuard{buf::Buffer::New()};
+                        if (!*allocated) throw std::bad_alloc();
+                        target = net::buffer((*allocated)->Tail().data(), (*allocated)->Available());
+                    }
+                    auto& call = current.emplace();
+                    Invoke(call, kind, target, source);
+                    if (call.failure || call.transport_error) Fail(call);
+                    CheckCancellation(epoch);
+                    if (allocated && call.result <= 0 && call.ssl_error == SSL_ERROR_WANT_READ)
+                        *allocated = {};
+                }
+                auto& call = *current;
+                generation = call.generation;
                 result = call.result;
                 error = call.ssl_error;
-                // A failed direct send is terminal even if SSL has already set
-                // SSL_SENT_SHUTDOWN while constructing close_notify.
-                if (call.failure || call.transport_error) Fail(call);
-                // Synchronous transport progress may retire the connection
-                // while reconciling its activity deadline.
-                CheckCancellation(epoch);
-                // No empty relay buffer survives a read retry, even when TLS
-                // consumed only a partial record or a post-handshake message.
-                if (allocated && result <= 0 && error == SSL_ERROR_WANT_READ)
-                    *allocated = {};
                 const bool shutdown_sent = kind == Kind::Shutdown &&
                     (SSL_get_shutdown(ssl.get()) & SSL_SENT_SHUTDOWN) != 0;
                 if (call.output) {
-                    try {
-                        // Reserve the physical turn before the first suspension
-                        // or another SSL call can generate a subsequent record.
-                        OutputTurn turn(*this);
-                        if (result > 0 || shutdown_sent || error == SSL_ERROR_WANT_READ)
-                            lease.Reset();
-                        if (turn.previous) {
-                            IoErrorCode ec;
-                            if (deferred) {
-                                std::tie(ec) = co_await turn.wake->async_receive(
-                                    net::bind_cancellation_slot(
-                                        net::cancellation_slot{},
-                                        net::bind_allocator(memory::ProcessAllocator<std::byte>{},
-                                            net::as_tuple(net::use_awaitable))));
-                            } else {
-                                std::tie(ec) = co_await turn.wake->async_receive(
-                                    net::bind_allocator(memory::ProcessAllocator<std::byte>{},
-                                        net::as_tuple(net::use_awaitable)));
-                            }
-                            if (ec) throw IoSystemError(io_error::operation_aborted);
-                            CheckCancellation(epoch);
-                        }
-                        const auto size = co_await tcp->AsyncWrite(net::buffer(*call.output));
-                        if (size != call.output->size())
-                            throw IoSystemError(io_error::broken_pipe);
-                        CheckCancellation(epoch);
-                    } catch (...) {
-                        Abort();
-                        throw;
-                    }
+                    co_await FlushPendingOutput(
+                        call, lease, epoch, deferred,
+                        result > 0 || shutdown_sent || error == SSL_ERROR_WANT_READ);
                 }
                 if (result > 0) co_return result;
                 // TLS close_notify sends our half-close without waiting for the
@@ -627,27 +675,88 @@ struct TlsStream::Impl final : memory::ThreadAllocated, private transport::Cance
                 // operation retains its original SSL_write retry arguments.
                 lease.Reset();
                 co_await WaitForInput(epoch, generation, deferred);
-                if (!lease) {
-                    lease = engine_gate.TryAcquire();
-                    if (!lease) lease = co_await engine_gate.Acquire(deferred);
-                    CheckCancellation(epoch);
-                    if (!lease) throw IoSystemError(io_error::operation_aborted);
-                }
+            }
+            if (!lease) {
+                lease = engine_gate.TryAcquire();
+                if (!lease) lease = co_await engine_gate.Acquire(deferred);
+                CheckCancellation(epoch);
+                if (!lease) throw IoSystemError(io_error::operation_aborted);
             }
         }
     }
 
-    net::awaitable<int> Read(net::mutable_buffer target, buf::BufferGuard* allocated) {
-        ActiveDirection active(read_active);
-        if ((SSL_get_shutdown(ssl.get()) & SSL_RECEIVED_SHUTDOWN) != 0) co_return 0;
-        // Socket wait has no payload allocation. Always retry SSL first when its
-        // reusable read buffer contains a record or retained plaintext.
-        if (allocated && SSL_pending(ssl.get()) == 0 && SSL_has_pending(ssl.get()) == 0)
-            co_await WaitForInput(cancel_epoch, input_generation);
-        co_return co_await Perform(Kind::Read, target, {}, allocated);
+    net::awaitable<int> Perform(Kind kind) {
+        return FinishPerform(
+            kind, {}, std::nullopt, cancel_epoch,
+            (kind == Kind::Write && tcp->IsWriteCancellationDeferred()), {}, {}, nullptr);
     }
 
-    net::awaitable<void> Write(std::span<const net::const_buffer> buffers) {
+    net::awaitable<std::size_t> AsyncRead(net::mutable_buffer target) {
+        if (!tcp->CanRead() || target.size() == 0) co_return 0;
+        ActiveDirection active(read_active);
+        try {
+            if ((SSL_get_shutdown(ssl.get()) & SSL_RECEIVED_SHUTDOWN) != 0) co_return 0;
+            const auto epoch = cancel_epoch;
+            Gate::Lease lease;
+            std::optional<Invocation> call;
+            int sync_result = 0;
+            if (TryInvokeOnce(Kind::Read, lease, call, epoch, target, {}, nullptr, sync_result))
+                co_return static_cast<std::size_t>(sync_result);
+            co_return static_cast<std::size_t>(co_await FinishPerform(
+                Kind::Read, std::move(lease), std::move(call), epoch, false,
+                target, {}, nullptr));
+        } catch (const IoSystemError& error) {
+            if (error.code() == io_error::eof && !tcp->CanRead()) co_return 0;
+            throw;
+        }
+    }
+
+    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() {
+        if (!tcp->CanRead()) co_return buf::MultiBuffer{};
+        ActiveDirection active(read_active);
+        try {
+            if ((SSL_get_shutdown(ssl.get()) & SSL_RECEIVED_SHUTDOWN) != 0)
+                co_return buf::MultiBuffer{};
+            // Socket wait has no payload allocation. Always retry SSL first when its
+            // reusable read buffer contains a record/retained plaintext or when TCP
+            // still holds bounded nonblocking drain budget from the last readiness.
+            if (SSL_pending(ssl.get()) == 0 && SSL_has_pending(ssl.get()) == 0 &&
+                !tcp->TryConsumeReadableBudget()) {
+                co_await WaitForInput(cancel_epoch, input_generation);
+            }
+            const auto epoch = cancel_epoch;
+            buf::BufferGuard out;
+            Gate::Lease lease;
+            std::optional<Invocation> call;
+            int n = 0;
+            if (!TryInvokeOnce(Kind::Read, lease, call, epoch, {}, {}, &out, n)) {
+                n = co_await FinishPerform(
+                    Kind::Read, std::move(lease), std::move(call), epoch, false,
+                    {}, {}, &out);
+            }
+            if (n == 0) co_return buf::MultiBuffer{};
+            out->Produce(static_cast<uint32_t>(n));
+            co_return buf::MultiBuffer{std::move(out)};
+        } catch (const IoSystemError& error) {
+            if (error.code() == io_error::eof && !tcp->CanRead())
+                co_return buf::MultiBuffer{};
+            throw;
+        }
+    }
+
+    net::awaitable<void> Write(
+        std::span<const net::const_buffer> buffers,
+        buf::MultiBuffer owned = {}) {
+        struct ClearOwned {
+            buf::MultiBuffer& mb;
+            ~ClearOwned() noexcept { mb.clear(); }
+        } clear_owned{owned};
+        ConstBufferSpanBuilder<buf::MultiBuffer::kInlineCapacity> owned_spans;
+        if (!owned.empty()) {
+            if (owned.byte_size() == 0) co_return;
+            owned_spans.AppendMultiBuffer(owned);
+            buffers = owned_spans.Span();
+        }
         ActiveDirection active(write_active);
         try {
             // Bound each application operation's output independently of the
@@ -686,7 +795,17 @@ struct TlsStream::Impl final : memory::ThreadAllocated, private transport::Cance
                     }
                     fragment = net::buffer(target.data(), packed);
                 }
-                auto n = static_cast<std::size_t>(co_await Perform(Kind::Write, {}, fragment));
+                const auto epoch = cancel_epoch;
+                Gate::Lease lease;
+                std::optional<Invocation> call;
+                int sync_result = 0;
+                if (!TryInvokeOnce(
+                        Kind::Write, lease, call, epoch, {}, fragment, nullptr, sync_result)) {
+                    sync_result = co_await FinishPerform(
+                        Kind::Write, std::move(lease), std::move(call), epoch,
+                        tcp->IsWriteCancellationDeferred(), {}, fragment, nullptr);
+                }
+                auto n = static_cast<std::size_t>(sync_result);
                 while (n != 0) {
                     const auto step = std::min(n, buffers[index].size() - offset);
                     offset += step;
@@ -701,7 +820,6 @@ struct TlsStream::Impl final : memory::ThreadAllocated, private transport::Cance
             throw;
         }
     }
-
     std::unique_ptr<TcpStream> tcp;
     std::unique_ptr<SSL, decltype(&SSL_free)> ssl;
     Gate engine_gate;
@@ -907,8 +1025,7 @@ net::awaitable<bool> TlsStream::Handshake() {
                 co_await impl_->Write(request_buffers);
                 memory::ThreadLocalString{}.swap(spider_x);
                 memory::ThreadLocalString{}.swap(server_name);
-                buf::BufferGuard drain;
-                (void)co_await impl_->Read({}, &drain);
+                (void)co_await impl_->ReadMultiBuffer();
             } catch (const std::exception&) {
                 // The camouflage exchange is best-effort; authentication still
                 // fails regardless of the origin's response or close behavior.
@@ -918,6 +1035,7 @@ net::awaitable<bool> TlsStream::Handshake() {
         co_return false;
     }
 
+    impl_->tcp->ResetReadableBudget();
     handshake_done_ = true;
     co_return true;
 }
@@ -964,6 +1082,14 @@ void TlsStream::PrependReadData(std::span<const uint8_t> data) {
 }
 
 net::awaitable<std::size_t> TlsStream::AsyncRead(net::mutable_buffer buffer) {
+    if (handshake_done_ && !impl_->prepended_plaintext &&
+        (!impl_->raw_read || SSL_pending(NativeSsl()) != 0)) {
+        return impl_->AsyncRead(buffer);
+    }
+    return AsyncReadSlow(buffer);
+}
+
+net::awaitable<std::size_t> TlsStream::AsyncReadSlow(net::mutable_buffer buffer) {
     if (!impl_->tcp->CanRead() || buffer.size() == 0) co_return 0;
     if (impl_->prepended_plaintext) {
         const auto n = impl_->prepended_plaintext->data.ConsumePrefixTo(
@@ -977,15 +1103,18 @@ net::awaitable<std::size_t> TlsStream::AsyncRead(net::mutable_buffer buffer) {
         Impl::ActiveDirection active(impl_->read_active);
         co_return co_await impl_->tcp->AsyncRead(buffer);
     }
-    try {
-        co_return static_cast<std::size_t>(co_await impl_->Read(buffer, nullptr));
-    } catch (const IoSystemError& error) {
-        if (error.code() == io_error::eof && !impl_->tcp->CanRead()) co_return 0;
-        throw;
-    }
+    co_return co_await impl_->AsyncRead(buffer);
 }
 
 net::awaitable<buf::MultiBuffer> TlsStream::ReadMultiBuffer() {
+    if (handshake_done_ && !impl_->prepended_plaintext &&
+        (!impl_->raw_read || SSL_pending(NativeSsl()) != 0)) {
+        return impl_->ReadMultiBuffer();
+    }
+    return ReadMultiBufferSlow();
+}
+
+net::awaitable<buf::MultiBuffer> TlsStream::ReadMultiBufferSlow() {
     if (!impl_->tcp->CanRead()) co_return buf::MultiBuffer{};
     if (impl_->prepended_plaintext) {
         auto data = std::move(impl_->prepended_plaintext->data);
@@ -998,17 +1127,7 @@ net::awaitable<buf::MultiBuffer> TlsStream::ReadMultiBuffer() {
         Impl::ActiveDirection active(impl_->read_active);
         co_return co_await impl_->tcp->ReadMultiBuffer();
     }
-    buf::BufferGuard out;
-    try {
-        const int n = co_await impl_->Read({}, &out);
-        if (n == 0) co_return buf::MultiBuffer{};
-        out->Produce(static_cast<uint32_t>(n));
-        co_return buf::MultiBuffer{std::move(out)};
-    } catch (const IoSystemError& error) {
-        if (error.code() == io_error::eof && !impl_->tcp->CanRead())
-            co_return buf::MultiBuffer{};
-        throw;
-    }
+    co_return co_await impl_->ReadMultiBuffer();
 }
 
 net::awaitable<std::size_t> TlsStream::AsyncWrite(net::const_buffer buffer) {
@@ -1017,7 +1136,24 @@ net::awaitable<std::size_t> TlsStream::AsyncWrite(net::const_buffer buffer) {
     co_return buffer.size();
 }
 
+net::awaitable<void> TlsStream::WriteMultiBuffer(buf::MultiBuffer mb) {
+    if (mb.byte_size() != 0 && handshake_done_ && !shutdown_initiated_ &&
+        impl_->tcp->CanWrite() && !impl_->tcp->IsWriteCancellationDeferred()) {
+        return impl_->Write({}, std::move(mb));
+    }
+    return AsyncStream::WriteMultiBuffer(std::move(mb));
+}
+
 net::awaitable<void> TlsStream::WriteBuffers(
+    std::span<const net::const_buffer> buffers) {
+    if (handshake_done_ && !shutdown_initiated_ &&
+        impl_->tcp->CanWrite() && !impl_->tcp->IsWriteCancellationDeferred()) {
+        return impl_->Write(buffers);
+    }
+    return WriteBuffersSlow(buffers);
+}
+
+net::awaitable<void> TlsStream::WriteBuffersSlow(
     std::span<const net::const_buffer> buffers) {
     if (!impl_->tcp->CanWrite() || shutdown_initiated_)
         throw IoSystemError(io_error::broken_pipe);

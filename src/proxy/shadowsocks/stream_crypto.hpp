@@ -190,8 +190,9 @@ public:
                 throw;
             }
             ciphertext_.ReleaseIfIdle();
-            auto raw = co_await ReadMultiBufferOrThrowOnCancel(stream_);
+            auto raw = co_await stream_.ReadMultiBuffer();
             if (raw.byte_size() == 0) {
+                co_await ThrowIfCancelledOnEof();
                 if (length_ || ciphertext_.byte_size() != 0) {
                     try { throw transport::LinkError(ErrorCode::PROTOCOL_DECODE_FAILED); }
                     catch (...) {
