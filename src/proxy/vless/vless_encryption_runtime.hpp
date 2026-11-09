@@ -2,10 +2,7 @@
 
 #include "vless_buffered_reader.hpp"
 #include "vless_encryption.hpp"
-#include "vless_encryption_handshake.hpp"
 #include "vless_encryption_io.hpp"
-#include "vless_encryption_record.hpp"
-#include "vless_encryption_xor.hpp"
 
 #include "common/allocator.hpp"
 #include "common/asio_types.hpp"
@@ -174,5 +171,21 @@ RunVlessEncryptionServerHandshake(
     transport::MultiBufferWriter& raw_writer,
     std::shared_ptr<const VlessEncryptionConfig> config,
     std::string_view inbound_tag);
+
+// Directory entries carry only routing/lifetime metadata. PFS secrets and the
+// mutable replay set are accessed exclusively on the ticket owner's domain.
+
+[[nodiscard]] net::awaitable<bool> AuthenticateVlessTicket(
+    std::shared_ptr<const VlessEncryptionConfig> config,
+    std::string_view inbound_tag,
+    VlessEncryptionIssuedTicket ticket,
+    std::array<uint8_t, 16> identity);
+
+[[nodiscard]] net::awaitable<std::optional<VlessEncryptionServerTicketStore::ResumedSession>>
+LookupVlessTicket(
+    std::shared_ptr<const VlessEncryptionConfig> config,
+    std::string_view inbound_tag,
+    std::array<uint8_t, kVlessEncryptionTicketSize> ticket,
+    VlessEncryptionNfsKey nfs_key);
 
 }  // namespace vless

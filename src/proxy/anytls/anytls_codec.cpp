@@ -1,6 +1,5 @@
 #include "anytls_codec.hpp"
 #include "common/byte_reader.hpp"
-#include "padding.hpp"
 #include "common/allocator.hpp"
 #include "transport/async_stream.hpp"
 
@@ -400,21 +399,32 @@ WriteBuffersAsFramesWithPadding(AsyncStream& stream,
     return WritePaddedBufferFrames(stream, records, cmd, sid, buffers);
 }
 
-net::awaitable<tl::expected<FrameHeader, ErrorCode>>
-ReadFrameHeader(AsyncStream& stream) {
-    std::array<uint8_t, kFrameHeaderSize> header{};
-    size_t offset = 0;
-    while (offset < header.size()) {
+namespace {
+
+net::awaitable<tl::expected<void, ErrorCode>>
+ReadExact(AsyncStream& stream, std::span<uint8_t> out) {
+    while (!out.empty()) {
         try {
             const auto n = co_await stream.AsyncRead(
-                net::buffer(header.data() + offset, header.size() - offset));
+                net::buffer(out.data(), out.size()));
             if (n == 0) {
                 co_return tl::unexpected(ErrorCode::CONNECTION_CLOSED);
             }
-            offset += n;
+            out = out.subspan(n);
         } catch (const IoSystemError& e) {
             co_return tl::unexpected(MapAsioError(e.code()));
         }
+    }
+    co_return tl::expected<void, ErrorCode>{};
+}
+
+}  // namespace
+
+net::awaitable<tl::expected<FrameHeader, ErrorCode>>
+ReadFrameHeader(AsyncStream& stream) {
+    std::array<uint8_t, kFrameHeaderSize> header{};
+    if (auto ok = co_await ReadExact(stream, header); !ok) {
+        co_return tl::unexpected(ok.error());
     }
 
     FrameHeader out;
@@ -426,47 +436,28 @@ ReadFrameHeader(AsyncStream& stream) {
 
 net::awaitable<tl::expected<memory::ThreadLocalString, ErrorCode>>
 ReadFrameText(AsyncStream& stream, uint16_t length) {
-    memory::ThreadLocalString text;
-    if (length == 0) {
-        co_return text;
-    }
-    std::array<char, 1024> scratch{};
-    size_t remaining = length;
-    while (remaining > 0) {
-        const size_t want = std::min(remaining, scratch.size());
-        try {
-            const auto n = co_await stream.AsyncRead(
-                net::buffer(scratch.data(), want));
-            if (n == 0) {
-                co_return tl::unexpected(ErrorCode::CONNECTION_CLOSED);
-            }
-            text.append(scratch.data(), n);
-            remaining -= n;
-        } catch (const IoSystemError& e) {
-            co_return tl::unexpected(MapAsioError(e.code()));
-        }
+    memory::ThreadLocalString text(length, '\0');
+    if (auto ok = co_await ReadExact(
+            stream,
+            std::span<uint8_t>(reinterpret_cast<uint8_t*>(text.data()), length));
+        !ok) {
+        co_return tl::unexpected(ok.error());
     }
     co_return text;
 }
 
 net::awaitable<tl::expected<void, ErrorCode>>
 DiscardFramePayload(AsyncStream& stream, uint16_t length) {
-    if (length == 0) {
-        co_return tl::expected<void, ErrorCode>{};
-    }
-    std::array<uint8_t, 512> scratch{};
+    std::array<uint8_t, 256> scratch{};
     size_t remaining = length;
     while (remaining > 0) {
         const size_t want = std::min(remaining, scratch.size());
-        try {
-            const auto n = co_await stream.AsyncRead(net::buffer(scratch.data(), want));
-            if (n == 0) {
-                co_return tl::unexpected(ErrorCode::CONNECTION_CLOSED);
-            }
-            remaining -= n;
-        } catch (const IoSystemError& e) {
-            co_return tl::unexpected(MapAsioError(e.code()));
+        if (auto ok = co_await ReadExact(
+                stream, std::span<uint8_t>(scratch.data(), want));
+            !ok) {
+            co_return tl::unexpected(ok.error());
         }
+        remaining -= want;
     }
     co_return tl::expected<void, ErrorCode>{};
 }
@@ -481,18 +472,10 @@ ReadFramePayload(AsyncStream& stream, uint16_t length) {
             co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
         }
         const size_t want = std::min<size_t>(remaining, buffer->Available());
-        size_t offset = 0;
-        while (offset < want) {
-            try {
-                const auto n = co_await stream.AsyncRead(
-                    net::buffer(buffer->Tail().data() + offset, want - offset));
-                if (n == 0) {
-                    co_return tl::unexpected(ErrorCode::CONNECTION_CLOSED);
-                }
-                offset += n;
-            } catch (const IoSystemError& e) {
-                co_return tl::unexpected(MapAsioError(e.code()));
-            }
+        if (auto ok = co_await ReadExact(
+                stream, std::span<uint8_t>(buffer->Tail().data(), want));
+            !ok) {
+            co_return tl::unexpected(ok.error());
         }
         buffer->Produce(static_cast<uint32_t>(want));
         remaining -= want;

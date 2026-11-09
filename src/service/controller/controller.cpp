@@ -19,7 +19,6 @@
 #include "app/traffic_types.hpp"
 #include "app/worker.hpp"
 #include "common/asio_types.hpp"
-#include "common/online_device.hpp"
 #include "core/constants.hpp"
 #include "core/naming.hpp"
 #include "infra/log.hpp"
@@ -920,21 +919,17 @@ Controller::Impl::GetOnlineSnapshot(const std::string& tag) {
     ThrowIfStopping();
     std::vector<std::vector<OnlineDevice>> per_worker(workers_.size());
 
-    std::vector<net::awaitable<void>> tasks;
-    tasks.reserve(workers_.size());
-    for (size_t i = 0; i < workers_.size(); ++i) {
-        tasks.push_back(
-            [](Impl* controller, Worker* w, std::string_view t,
-               std::vector<OnlineDevice>& out) -> net::awaitable<void> {
+    co_await RunWorkerMutationBatch(
+        io_context_.get_executor(), workers_,
+        [this, &tag, &per_worker](Worker& worker, size_t index) {
+            return [](Impl* controller, Worker* w, std::string_view t,
+                      std::vector<OnlineDevice>& out) -> net::awaitable<void> {
                 controller->ThrowIfStopping();
                 out = co_await w->PostCall([w, t] {
                     return w->GetOnlineDevices(t);
                 });
-            }(this, workers_[i].get(), tag, per_worker[i])
-        );
-    }
-    co_await RunAwaitableBatch(
-        io_context_.get_executor(), std::move(tasks));
+            }(this, &worker, tag, per_worker[index]);
+        });
     ThrowIfStopping();
 
     size_t total_online = 0;

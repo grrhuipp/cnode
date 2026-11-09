@@ -9,7 +9,6 @@
 #include "infra/log.hpp"
 #include "common/unsafe.hpp"
 #include "autosign_cert.hpp"
-#include "autosign_context.hpp"
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/tls1.h>
@@ -152,7 +151,6 @@ std::unique_ptr<SslContext> SslContext::CreateServerAutoSign(const TlsConfig& co
             auto replacement = CreateAutoSignSnapshot(config);
             return replacement ? std::move(replacement->native_owner_) : std::shared_ptr<SSL_CTX>{};
         });
-    context->shared_state_ = nullptr;
     return context;
 }
 
@@ -197,12 +195,20 @@ std::unique_ptr<SslContext> SslContext::CreateAutoSignSnapshot(const TlsConfig& 
 
 bool SslContext::ConfigureServerAlpn(
     const std::vector<std::string>& protocols) {
-    auto& wire = shared_state_->server_alpn_wire;
-    if (!EncodeTlsAlpnProtocols(protocols, wire)) return false;
-
-    if (!wire.empty()) {
-        SSL_CTX_set_alpn_select_cb(native_owner_.get(), SelectServerAlpnCallback, &wire);
+    if (protocols.empty()) return true;
+    auto wire = std::make_unique<std::vector<unsigned char>>();
+    if (!EncodeTlsAlpnProtocols(protocols, *wire)) return false;
+    static const int index = SSL_CTX_get_ex_new_index(
+        0, nullptr, nullptr, nullptr,
+        [](void*, void* ptr, CRYPTO_EX_DATA*, int, long, void*) {
+            delete static_cast<std::vector<unsigned char>*>(ptr);
+        });
+    if (index < 0 ||
+        SSL_CTX_set_ex_data(native_owner_.get(), index, wire.get()) != 1) {
+        return false;
     }
+    SSL_CTX_set_alpn_select_cb(
+        native_owner_.get(), SelectServerAlpnCallback, wire.release());
     return true;
 }
 
@@ -351,9 +357,14 @@ struct TlsStream::Impl final : memory::ThreadAllocated, private transport::Cance
         if (!tcp) throw std::invalid_argument("TlsStream requires TcpStream");
         if (!tls_bio_method)
             throw std::logic_error("TlsStream::InitializeIo must precede Worker startup");
-        const auto snapshot = context.AcquireNative();
-        if (!snapshot) throw std::runtime_error("TLS certificate expired without a renewed snapshot");
-        ssl.reset(SSL_new(snapshot.get()));
+        SSL_CTX* raw = context.Native();
+        std::shared_ptr<SSL_CTX> snapshot;
+        if (raw == nullptr) {
+            snapshot = context.AcquireNative();
+            raw = snapshot.get();
+            if (!raw) throw std::runtime_error("TLS certificate expired without a renewed snapshot");
+        }
+        ssl.reset(SSL_new(raw));
         if (!ssl) throw std::bad_alloc();
         SSL_set_mode(ssl.get(), SSL_MODE_RELEASE_BUFFERS);
         SSL_set_read_ahead(ssl.get(), 0);

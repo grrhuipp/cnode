@@ -1528,3 +1528,37 @@ CI失败场景修复后通过真实双进程、ML-KEM/X25519加密和回环对�
 - **TCP 接收与发送基准（`cnode_tcp_receive_benchmark` / `cnode_tcp_send_benchmark`）**：
   - `tcp-send 1B`：单次 burst 墙钟耗时由 `6,298.4 / 6,306.5 ns` 稳定降至 **`6,259.3 / 6,266.1 ns`**，CPU 耗时由 `4,141.0 / 4,134.0 ns` 稳定降至 **`4,082.8 / 4,085.0 ns`（-1.2% ~ -1.4%）**；`65536B (16 pieces)` 第 2 轮墙钟耗时由 `47,243.4 ns` 降至 **`43,166.8 ns`（-8.6%）**。
   - `tcp-receive 8192B`：第 1 轮墙钟耗时由 `11,334.5 ns` 降至 **`11,120.3 ns`（-1.9%）**。
+
+## 2026-11-09（第八轮）：`RequestLoadState` 去共享原子化、VMess/SS 入站零堆分配、`SslContext`/`HysteriaIngress` 去包装与 28 个碎片文件内聚
+
+### 架构与流程精简内容
+
+1. **`app::RequestLoadState` 下沉为纯 Worker 本地非原子状态 + 消除 Pimpl / 多余堆分配包装**：
+   - `include/app/request_load_state.hpp`、`src/app/worker.cpp`、`src/app/bootstrap.cpp`：删除旧跨 Worker 迁移遗留的 `RequestLoadState::Acquire` 与 `RequestLoadState::Service`，将 `physical_connections_` 与 `active_dispatches_` 从跨核争用的 `std::atomic<uint32_t>` 改为纯单线程 `uint32_t`，由 `Worker::RuntimeState` 直接按值持有，`ComputePressureThreshold` 按单 Worker 均分阈值。
+   - `include/app/session_capabilities.hpp`、`include/app/proxyman/inbound/handler.hpp`、`src/app/proxyman/inbound/handler.cpp`、`src/app/worker.cpp`：删除 `DatagramSessionEnvironment::receiver`、`Handler::SharedReceiverSettings()` 与 `Worker::ListenerSlot::prepared`，将 `Handler::receiver_` 从 `std::shared_ptr<const ReceiverSettings>` 改为值成员；在 `Worker::UnregisterListenerTask` 中重置 `datagram_environment`；在 `Worker::ListenerState` 中提取 `HasBindingConflict` 与 `OpenAndBindUdpSocket` 消除 ~75 行重复代码。
+   - `include/common/sharded_user_stats.hpp`、`src/common/sharded_user_stats.cpp`、`src/transport/internet/hysteria/*`、`src/proxy/anytls/outbound/*`：内联 `UserOnlineTracker::Impl`（消除单成员 Pimpl 堆分配）并提取泛型 `AcquireDeviceCount<Map>`；将 `QuicListener` 直接合并入 `HysteriaIngress`（消除 `std::unique_ptr<QuicListener>` 纯转发包装）并删除 `Connection::retired_` / `Retired()` / `Authenticated()`；合并 `anytls::outbound::Handler::SessionPool` 与 `SessionPool::State`。
+2. **VMess / Shadowsocks TCP 入站零堆分配化与协议热路径零拷贝**：
+   - `src/proxy/vmess/encoding/server.hpp/.cpp`、`src/proxy/vmess/inbound/vmess_inbound.cpp`：公开具体类 `RequestBodyReader` 与 `ResponseBodyWriter`（仅在 `Command::UDP` 时拷贝 `udp_target_`），使 `DecodeRequestBody` 与 `EncodeResponseBodyWithHeader` 返回 `std::optional` 在协程栈上原位构造（消除每条 VMess 入站连接的 2 次 `std::make_unique` 堆分配），并将 `ParseHandshake` 的 `header_buf` 改为定长 `std::array`。
+   - `src/proxy/shadowsocks/stream_crypto.hpp`、`server.hpp/.cpp`、`inbound/ss_inbound.cpp`：公开支持移动的 `ResponseBodyWriter` 并使 `detail::BodyReader` 支持移动，`ReadTCPSessionResult::body_reader` 与 `WriteTCPResponse` 改为按值返回並在 `ss_inbound.cpp` 栈上直接持有（消除每条 SS TCP 入站连接的 2 次 `std::make_unique` 堆分配）；删除 Legacy 分支冗余的 `request_salt` 拷贝与 8 处重复的 `KeyBytes` 手动擦除。
+   - `src/proxy/vless/*`、`src/proxy/vmess/outbound/*`、`src/proxy/trojan/*`、`src/proxy/mux/inbound/mux_inbound.cpp`：将 1-RTT PFS 握手定长缓冲改为 `std::array`；`VMessOutboundEndpoint`、`VlessOutboundEndpoint`、`VlessMuxUdpEndpoint`、`trojan::UdpStreamEndpoint` 改为借用 `const TargetAddress&` 与 `ForwardedMetadataView`；合并 `vmess_outbound` / `vless_outbound` 中 `vnext` 与扁平配置的重复解析；删除 `MuxReply::payload_size` 与 `frame_buf_bytes`。
+3. **`SslContext` 双重 `ex_data` 与非自签握手原子争用消除 + `inbound_field_rules` 跨层解耦 + 28 个碎片文件合并**：
+   - `include/transport/internet/tls_stream.hpp`、`src/transport/internet/tls_stream.cpp`、`tls_client_context.cpp`、`reality_tls.cpp`：删除虚基类 `SslContext::ContextState`、`SslContext::SharedState` 与 `shared_state_`（消除 `CreateClient` 无意义的堆分配与 REALITY 双重 `SSL_CTX_set_ex_data`）；`TlsStream::Impl` 优先使用 `context.Native()` 裸指针，消除非自签 TLS/REALITY 握手跨 Worker 拷贝 `shared_ptr<SSL_CTX>` 的原子争用。
+   - 新建公开契约头 `include/proxy/anytls_padding.hpp` 替代 `src/proxy/anytls/padding.hpp`，彻底消除 `src/infra/inbound_field_rules.cpp` 对 `../proxy/anytls/` 的跨层反向依赖。
+   - 内联并删除 28 个碎片文件（`vless_ticket_service.hpp`、`vless_encryption_{crypto,record,xor,handshake}.{hpp,cpp}`、`autosign_context.{hpp,cpp}`、`xhttp_{packet_session_key,upload_stream_slot,packet_queue}.hpp`、`reality_server_name.hpp`、`http2_settings.hpp`、`http_path_match.hpp`、`grpc_hunk.cpp`、`src/common/error.cpp`、`src/common/awaitable_batch.cpp`、`src/app/stats.cpp`、`include/common/online_device.hpp`、`src/infra/runtime_failure.cpp`、`src/infra/config_loader.cpp`、`src/infra/config_semantics.{hpp,cpp}`、`src/infra/json_field.cpp`）。
+
+### 验证与性能/内存实证
+
+全量 **1,251/1,251** 测试通过（325 项 unit、926 项 E2E）。在同一环境与编译选项下执行 A/B/A/B 交错重复基准对照：
+
+- **VLESS/TLS 真实进程基准（`cnode_tls_throughput_benchmark`）**：
+  - **守护进程启动驻留内存（`server_started` RSS）**：4 项测试（`Download1`、`Download8`、`Upload1`、`Upload8`）的启动 RSS 均由 `13,148,160 ~ 13,156,352 B` 稳定降至 **`13,021,184 ~ 13,037,568 B`（稳定减少 112 ~ 132 KiB）**。
+  - **上传吞吐与耗时**：`Upload8` 8 流上传吞吐由 `672.22 / 663.53 MiB/s` 升至 **`790.79 / 659.23 MiB/s`（峰值 +17.6%，128 MiB 传输耗时仅 `0.1619s`）**；`Upload1` 单流上传吞吐由 `779.04 / 781.27 MiB/s` 升至 **`773.54 / 791.36 MiB/s`**，整进程墙钟耗时由 `226 / 174 ms` 降至 **`176 / 124 ms`**。
+  - **下载守护进程 CPU**：`Download1` 守护进程总 CPU 由 `0.0290 / 0.0291s` 稳定降至 **`0.0273 / 0.0284s`（最高 -5.8%）**；`Download8` 守护进程总 CPU 由 `0.1429 / 0.1414s` 降至 **`0.1415 / 0.1418s`**。
+- **Hysteria2 四 Worker 真实进程基准（`cnode_hysteria_throughput_benchmark`）**：
+  - **守护进程启动驻留内存（`startup` RSS）**：256 连接上传/下载与 16×64 下载的启动 RSS 均由 `14,368,768 ~ 14,405,632 B` 稳定降至 **`14,258,176 ~ 14,274,560 B`（稳定减少 104 ~ 136 KiB）**。
+  - **256 连接上传与下载**：256 连接上传就绪 RSS（`all_sessions_and_tcp_targets_ready`）由 `38,678,528 / 38,735,872 B` 稳定降至 **`38,637,568 / 38,617,088 B`（减少 40 ~ 116 KiB）**，建连耗时由 `0.515 / 0.517s` 稳定降至 **`0.513 / 0.506s`**；256 连接下载建连耗时由 `0.497 / 0.496s` 进一步稳定降至 **`0.492 / 0.492s`**，下载吞吐达 **`64.84 / 65.61 MiB/s`**。
+  - **16×64（1,024 流）上传与下载**：16×64 上传吞吐峰值由 `55.27 / 56.15 MiB/s` 升至 **`57.35 / 55.69 MiB/s`（峰值 +3.8%）**，守护进程总 CPU 最低降至 **`3.667s`**，建连耗时最低降至 **`0.130s`**；16×64 下载 1,024 流就绪 RSS 由 `47,886,336 / 47,677,440 B` 降至 **`46,927,872 / 47,693,824 B`（最高减少 936 KiB）**，空闲回收后驻留 RSS 最低降至 **`23,449,600 B`**。
+- **64 活跃会话统计采样与 TCP 收发基准（`cnode_runtime_sampling_benchmark` / `cnode_tcp_receive_benchmark` / `cnode_tcp_send_benchmark`）**：
+  - `cnode_runtime_sampling_benchmark`：`resources=0` 采样延迟保持 **`68.25 / 68.34 ns`**（`p50 = 30.0 ns`，`max = 41.0 ns`），`resources=1` 采样延迟由 `87.16 / 86.18 ns` 降至 **`86.03 / 86.02 ns`**，0 次堆分配。
+  - `tcp-receive 65536B`：单次 burst 墙钟耗时由 `50,777.6 / 51,694.0 ns` 稳定降至 **`49,723.2 / 49,029.1 ns`（-2.1% ~ -5.2%）**，CPU 耗时由 `46,939.0 / 47,646.9 ns` 稳定降至 **`45,851.9 / 45,184.7 ns`（-2.3% ~ -5.2%）**。
+  - `tcp-send 8192B (1 piece)`：单次 burst 墙钟耗时由 `10,394.9 / 10,306.9 ns` 稳定降至 **`10,212.2 / 10,221.7 ns`（-0.8% ~ -1.8%）**，CPU 耗时由 `8,138.3 / 8,063.8 ns` 稳定降至 **`7,996.5 / 7,996.9 ns`**。

@@ -76,18 +76,11 @@ if(CNODE_IO_URING)
         ASIO_HAS_IO_URING ASIO_DISABLE_EPOLL CNODE_IO_URING_ENABLED)
 endif()
 set(CNODE_CORE_SOURCES
-    # Common (pure utilities)
-    src/common/error.cpp
-
     # Infra (logging, config)
     src/infra/log.cpp
-    src/infra/runtime_failure.cpp
     src/infra/json.cpp
     src/infra/config.cpp
     src/infra/inbound_field_rules.cpp
-    src/infra/json_field.cpp
-    src/infra/config_loader.cpp
-    src/infra/config_semantics.cpp
 
     # App - DNS
     src/app/dns/dns.cpp
@@ -110,11 +103,9 @@ set(CNODE_CORE_SOURCES
     src/transport/internet/tls_config.cpp
     src/transport/internet/tls_stream.cpp
     src/transport/internet/autosign_cert.cpp
-    src/transport/internet/autosign_context.cpp
     src/transport/internet/reality_key.cpp
     src/transport/internet/reality_tls.cpp
     src/transport/internet/ws_stream.cpp
-    src/transport/internet/grpc_hunk.cpp
     src/transport/internet/http1_handshake.cpp
     src/transport/internet/xhttp_session.cpp
     src/transport/internet/http2_session.cpp
@@ -141,7 +132,6 @@ set(CNODE_CORE_SOURCES
     src/app/session_group_executor.cpp
     src/service/controller/controller.cpp
     src/service/controller/traffic_journal.cpp
-    src/common/awaitable_batch.cpp
     src/infra/panel_config.cpp
     src/service/controller/panel_inbound.cpp
     src/app/prepared_inbound.cpp
@@ -151,7 +141,6 @@ set(CNODE_CORE_SOURCES
     src/common/rule.cpp
     src/common/session.cpp
     src/common/sharded_user_stats.cpp
-    src/app/stats.cpp
     src/app/bootstrap.cpp
 
     # Sniff
@@ -175,12 +164,8 @@ set(CNODE_CORE_SOURCES
     # Proxy - VLESS
     src/proxy/vless/vless_codec.cpp
     src/proxy/vless/vless_encryption.cpp
-    src/proxy/vless/vless_encryption_crypto.cpp
-    src/proxy/vless/vless_encryption_handshake.cpp
     src/proxy/vless/vless_encryption_io.cpp
-    src/proxy/vless/vless_encryption_record.cpp
     src/proxy/vless/vless_encryption_runtime.cpp
-    src/proxy/vless/vless_encryption_xor.cpp
     src/proxy/vless/udp_framing.cpp
     src/proxy/vless/vless_vision.cpp
     src/proxy/vless/inbound/vless_inbound.cpp
@@ -293,18 +278,18 @@ endfunction()
 cnode_unit(anytls_codec_errors INCLUDES src/proxy/anytls)
 cnode_unit(anytls_outbound_lifecycle LIBRARY cnode_test_core INCLUDES src/proxy/anytls/outbound)
 cnode_unit(anytls_outbound_settings INCLUDES src/proxy/anytls/outbound)
-cnode_unit(anytls_padding INCLUDES src/proxy/anytls)
+cnode_unit(anytls_padding)
 cnode_unit(asio_operation_allocator)
 cnode_unit(async_write_gate INCLUDES src/transport/internet)
 cnode_unit(autosign_cert INCLUDES src/transport/internet)
 cnode_unit(autosign_context INCLUDES src/transport/internet)
-cnode_unit(awaitable_batch LIBRARY cnode_build_options SOURCES src/common/awaitable_batch.cpp INCLUDES src/common)
+cnode_unit(awaitable_batch LIBRARY cnode_build_options INCLUDES src/common)
 cnode_unit(awaitable_task_group LIBRARY cnode_build_options INCLUDES src/common)
 cnode_unit(ban_tracking_contract)
 cnode_unit(buffer_ownership)
 cnode_unit(buffer_span_builder)
 cnode_unit(cancellation_source)
-cnode_unit(config_semantics INCLUDES src/infra)
+cnode_unit(config_semantics)
 cnode_unit(connection_timeouts)
 cnode_unit(datagram_socket)
 cnode_unit(dispatcher_cancellation)
@@ -375,7 +360,7 @@ cnode_unit(substream_inbound_lifecycle LIBRARY cnode_test_core INCLUDES src/prox
 cnode_unit(target_address)
 cnode_unit(tcp_read LIBRARY cnode_test_core)
 cnode_unit(thread_memory_pool LIBRARY cnode_build_options)
-cnode_unit(timeout_scheduler LIBRARY cnode_build_options SOURCES tests/timeout_scheduler_new.cpp src/transport/internet/timeout_scheduler.cpp src/app/session_group_executor.cpp src/infra/runtime_failure.cpp src/infra/log.cpp)
+cnode_unit(timeout_scheduler LIBRARY cnode_build_options SOURCES tests/timeout_scheduler_new.cpp src/transport/internet/timeout_scheduler.cpp src/app/session_group_executor.cpp src/infra/log.cpp)
 cnode_unit(tls_client_certificate INCLUDES src/transport/internet)
 cnode_unit(tls_record_buffer LIBRARY cnode_test_core)
 cnode_unit(tls_sniffer)
@@ -546,8 +531,6 @@ foreach(source IN LISTS e2e_sources)
     cnode_e2e("${name}" "${source}")
     if(name MATCHES "^udp_" OR name STREQUAL "quic_udp")
         target_link_libraries(cnode_e2e_${name} PRIVATE unofficial-sodium::sodium)
-    elseif(name STREQUAL "config_panel_failure")
-        target_sources(cnode_e2e_${name} PRIVATE src/infra/runtime_failure.cpp)
     elseif(name STREQUAL "config_panel_integrity")
         target_compile_definitions(cnode_e2e_${name} PRIVATE
             CNODE_TEST_JOURNAL_BINARY="$<TARGET_FILE:cnode_traffic_journal>")

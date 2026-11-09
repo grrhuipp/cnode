@@ -20,7 +20,6 @@
 #include "common/buf/multi_buffer.hpp"
 #include "common/ip_utils.hpp"
 #include "common/container_util.hpp"
-#include "common/online_device.hpp"
 #include "common/string_hash.hpp"
 #include "infra/log.hpp"
 #include "infra/runtime_failure.hpp"
@@ -83,7 +82,6 @@ struct Worker::ListenerSlot {
     // Registry owns active slots; listener frames lease retired slots until
     // their native close completions finish. No per-request slot leases.
     std::shared_ptr<proxyman::inbound::Handler> handler;
-    std::shared_ptr<const proxyman::inbound::BuildRequest> prepared;
     app::DatagramSessionEnvironment datagram_environment;
     std::unique_ptr<worker_detail::TcpListenerOwner> tcp_listeners;
     std::unique_ptr<worker_detail::UdpIngress> udp_ingress;
@@ -231,6 +229,20 @@ struct Worker::ListenerState : worker_detail::UdpReplySink {
         worker_detail::UdpIngress::SocketPtr sock,
         worker_detail::UdpIngress::PendingUdpReply packet,
         uint32_t worker_id);
+
+private:
+    [[nodiscard]] bool HasBindingConflict(
+        const Worker& worker,
+        const PortBinding& binding,
+        bool tcp) const;
+    [[nodiscard]] static bool OpenAndBindUdpSocket(
+        const Worker& worker,
+        std::string_view listener_kind,
+        udp::socket& socket,
+        const net::ip::address& address,
+        std::string_view listen_addr,
+        uint16_t port,
+        bool dual_stack);
 };
 
 // Worker-owned listeners, configuration publication and admission ledgers.
@@ -248,6 +260,8 @@ struct Worker::RuntimeState {
               proxyman::inbound::UserStore::CaptureSnapshot()))
         , stats(stats_ref)
         , geo_database(geo_database_ref)
+        , request_load(runtime_config.pressure_threshold,
+                       runtime_config.pressure_idle_timeout)
         , dns_worker(dns_worker)
         , listener_state(std::make_unique<ListenerState>(io_context))
         {}
@@ -266,7 +280,7 @@ struct Worker::RuntimeState {
     proxyman::inbound::UserStore::WorkerView initial_user_view;
     StatsShard& stats;
     geo::GeoDatabase* geo_database = nullptr;
-    std::shared_ptr<app::RequestLoadState> request_load;
+    app::RequestLoadState request_load;
     app::dns::DNSWorker& dns_worker;
     std::unique_ptr<app::dns::DNS> dns;
     std::unique_ptr<ResidentTaskGroup> outbound_tasks;
@@ -567,11 +581,6 @@ void Worker::RuntimeState::Start(Worker& worker) {
             .ip_ban = config->limits.ip_ban,
         }, worker.group_coordinator_);
     }
-    if (!request_load) {
-        request_load = app::RequestLoadState::Acquire(
-            config->pressure_threshold, config->pressure_idle_timeout,
-            *worker.group_coordinator_);
-    }
     router = std::make_shared<app::router::Router>(config->routing, geo_database);
     LOG_DEBUG("router initialized worker={} rules={}",
               worker.id_, config->routing.rules.size());
@@ -583,7 +592,7 @@ void Worker::RuntimeState::Start(Worker& worker) {
         *outbounds, io_context, *dns, timeouts.DialTimeout(), outbound_tasks->Tasks());
     dispatcher = std::make_unique<app::dispatcher::DefaultDispatcher>(
         *router, *outbound_handlers, *detect_rule_policy,
-        *session_tracking, *dns, *request_load);
+        *session_tracking, *dns, request_load);
     started = true;
     startup_config.reset();
 }
@@ -591,6 +600,79 @@ void Worker::RuntimeState::Start(Worker& worker) {
 // ============================================================================
 // SO_REUSEPORT 监听管理（仅在 Worker io_context 上调用）
 // ============================================================================
+
+bool Worker::ListenerState::HasBindingConflict(
+    const Worker& worker,
+    const PortBinding& binding,
+    bool tcp) const {
+    for (const auto& [tag, slot] : listener_slots) {
+        const auto& existing = tcp ? slot->tcp_binding : slot->udp_binding;
+        if (tag != std::string_view(binding.tag) && existing &&
+            existing->port == binding.port &&
+            existing->listen.Overlaps(binding.listen)) {
+            LOG_ERROR("{} listener conflict worker={} tag={} owner={} port={}",
+                      tcp ? "TCP" : "UDP", worker.id_, binding.tag, tag, binding.port);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool Worker::ListenerState::OpenAndBindUdpSocket(
+    const Worker& worker,
+    std::string_view listener_kind,
+    udp::socket& socket,
+    const net::ip::address& address,
+    std::string_view listen_addr,
+    uint16_t port,
+    bool dual_stack) {
+    const udp::endpoint endpoint(address, port);
+    IoErrorCode error;
+    std::string_view operation = "open";
+    socket.open(endpoint.protocol(), error);
+    if (!error && address.is_v6()) {
+        operation = "set IPV6_V6ONLY";
+        socket.set_option(net::ip::v6_only(true), error);
+    }
+    if (!error) {
+        operation = "set SO_REUSEADDR";
+        socket.set_option(net::socket_base::reuse_address(true), error);
+    }
+    if (!error) {
+        operation = "SO_REUSEPORT";
+        int optval = 1;
+        if (::setsockopt(socket.native_handle(), SOL_SOCKET, SO_REUSEPORT,
+                         &optval, sizeof(optval)) < 0) {
+            error = IoErrorCode(errno, std::system_category());
+        }
+    }
+    if (!error) {
+        // The OOM path must consume a datagram without allocating another
+        // async operation. Asio's synchronous receive requires user-level
+        // nonblocking mode, not merely native_non_blocking.
+        operation = "set nonblocking";
+        socket.non_blocking(true, error);
+    }
+    if (!error) {
+        operation = "bind";
+        socket.bind(endpoint, error);
+    }
+    if (!error) {
+        return true;
+    }
+    if (dual_stack) {
+        LOG_WARN("{} listener operation failed worker={} operation={} endpoint={} > {}; continuing dual-stack bind",
+                 listener_kind, worker.id_, operation,
+                 iputil::FormatEndpointForLog(listen_addr, port),
+                 error.message());
+    } else {
+        LOG_ERROR("{} listener operation failed worker={} operation={} endpoint={} > {}",
+                  listener_kind, worker.id_, operation,
+                  iputil::FormatEndpointForLog(listen_addr, port),
+                  error.message());
+    }
+    return false;
+}
 
 bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& binding) {
     auto inbound_handler = worker.runtime_->inbound_handlers->GetHandler(binding.tag);
@@ -600,14 +682,8 @@ bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
         return false;
     }
 
-    for (const auto& [tag, slot] : listener_slots) {
-        if (tag != std::string_view(binding.tag) && slot->tcp_binding &&
-            slot->tcp_binding->port == binding.port &&
-            slot->tcp_binding->listen.Overlaps(binding.listen)) {
-            LOG_ERROR("TCP listener conflict worker={} tag={} owner={} port={}",
-                      worker.id_, binding.tag, tag, binding.port);
-            return false;
-        }
+    if (HasBindingConflict(worker, binding, true)) {
+        return false;
     }
 
     auto existing_slot = listener_slots.find(binding.tag);
@@ -970,7 +1046,7 @@ net::awaitable<void> Worker::ListenerState::ProcessReceivedConnection(
     TaskCancellation& registration,
     tcp::socket socket,
     tcp::endpoint remote_ep) {
-    app::RequestLoadState::PhysicalConnectionScope physical(*worker.runtime_->request_load);
+    app::RequestLoadState::PhysicalConnectionScope physical(worker.runtime_->request_load);
     const auto& listener = inbound_handler->ReceiverSettings();
     auto tcp_stream = std::make_unique<TcpStream>(std::move(socket));
     registration.stream = tcp_stream.get();
@@ -996,7 +1072,7 @@ net::awaitable<void> Worker::ListenerState::ProcessReceivedConnection(
                    worker.id_, ctx.inbound.source_ip, ctx.inbound.source_port);
     co_await inbound_handler->ProcessAcceptedTCP(
         worker.io_context_, *worker.runtime_->dispatcher,
-        worker.runtime_->stats, *worker.runtime_->request_load,
+        worker.runtime_->stats, worker.runtime_->request_load,
         worker.runtime_->timeouts, std::move(tcp_stream), ctx,
         worker.runtime_->dns.get());
 }
@@ -1059,19 +1135,17 @@ bool Worker::RegisterInbound(
         return false;
     }
     slot_it->second->handler = registered;
-    slot_it->second->prepared = std::move(prepared);
     auto* protocol_runtime = runtime_->inbound_handlers->GetOrCreateRuntime(req.protocol);
     slot_it->second->datagram_environment = app::DatagramSessionEnvironment{
         .timeouts = runtime_->timeouts,
         .dispatcher = runtime_->dispatcher.get(),
         .stats = &runtime_->stats,
         .limiter = runtime_->connection_limiter.get(),
-        .request_load = runtime_->request_load.get(),
+        .request_load = &runtime_->request_load,
         .tracker = protocol_runtime ? protocol_runtime->OnlineTracker() : nullptr,
         .active_sessions = &runtime_->listener_state->active_sessions,
         .handler = registered,
-        .prepared = slot_it->second->prepared,
-        .receiver = registered->SharedReceiverSettings(),
+        .prepared = std::move(prepared),
     };
     return true;
 }
@@ -1129,7 +1203,7 @@ net::awaitable<void> Worker::UnregisterListenerTask(std::string tag) {
     if (auto slot_it = runtime_->listener_state->listener_slots.find(tag);
             slot_it != runtime_->listener_state->listener_slots.end()) {
         slot_it->second->handler.reset();
-        slot_it->second->prepared.reset();
+        slot_it->second->datagram_environment = {};
         if (!slot_it->second->tcp_binding && !slot_it->second->udp_binding &&
             !slot_it->second->udp_ingress &&
             !slot_it->second->retiring_udp_ingress &&
@@ -1282,18 +1356,12 @@ net::awaitable<bool> Worker::ListenerState::StartQuicListening(
     // Every Worker binds its own SO_REUSEPORT socket; the kernel spreads new
     // QUIC connections by 4-tuple and each Worker serves only the connections
     // it accepted (no packet forwarding between Workers).
-    for (const auto& [tag, slot] : listener_slots) {
-        if (tag != std::string_view(binding.tag) && slot->udp_binding &&
-            slot->udp_binding->port == binding.port &&
-            slot->udp_binding->listen.Overlaps(binding.listen)) {
-            LOG_ERROR("UDP listener conflict worker={} tag={} owner={} port={}",
-                      worker.id_, binding.tag, tag, binding.port);
-            co_return false;
-        }
+    if (HasBindingConflict(worker, binding, false)) {
+        co_return false;
     }
     auto slot_it = listener_slots.find(binding.tag);
     if (slot_it == listener_slots.end() || !slot_it->second->handler ||
-        !slot_it->second->prepared) {
+        !slot_it->second->datagram_environment.prepared) {
         LOG_ERROR("QUIC listener unavailable worker={} tag={} > missing prepared inbound",
                   worker.id_, binding.tag);
         co_return false;
@@ -1306,46 +1374,11 @@ net::awaitable<bool> Worker::ListenerState::StartQuicListening(
     for (const auto& address : candidates) {
         const iputil::AddressText text(address);
         const auto listen_text = text.View();
-        udp::endpoint endpoint(address, binding.port);
         auto socket = replacement->MakeSocket();
-        IoErrorCode error;
-        std::string_view operation = "open";
-        socket->open(endpoint.protocol(), error);
-        if (!error && address.is_v6()) {
-            operation = "set IPV6_V6ONLY";
-            socket->set_option(net::ip::v6_only(true), error);
-        }
-        if (!error) {
-            operation = "set SO_REUSEADDR";
-            socket->set_option(net::socket_base::reuse_address(true), error);
-        }
-        if (!error) {
-            operation = "SO_REUSEPORT";
-            int optval = 1;
-            if (::setsockopt(socket->native_handle(), SOL_SOCKET, SO_REUSEPORT,
-                             &optval, sizeof(optval)) < 0)
-                error = IoErrorCode(errno, std::system_category());
-        }
-        if (!error) {
-            operation = "set nonblocking";
-            socket->non_blocking(true, error);
-        }
-        if (!error) {
-            operation = "bind";
-            socket->bind(endpoint, error);
-        }
-        if (error) {
-            if (candidates.size() > 1) {
-                LOG_WARN("QUIC listener operation failed worker={} operation={} endpoint={} > {}; continuing dual-stack bind",
-                         worker.id_, operation,
-                         iputil::FormatEndpointForLog(listen_text, binding.port),
-                         error.message());
-                continue;
-            }
-            LOG_ERROR("QUIC listener operation failed worker={} operation={} endpoint={} > {}",
-                      worker.id_, operation,
-                      iputil::FormatEndpointForLog(listen_text, binding.port),
-                      error.message());
+        if (!OpenAndBindUdpSocket(
+                worker, "QUIC", *socket, address, listen_text, binding.port,
+                candidates.size() > 1)) {
+            if (candidates.size() > 1) continue;
             co_return false;
         }
         const auto key = BuildListenerKey(
@@ -1380,14 +1413,8 @@ net::awaitable<bool> Worker::ListenerState::StartUdpListening(
     const PortBinding& binding,
     std::unique_ptr<Inbound> handler) {
     // TCP and UDP listeners both remain local to the Worker that bound them.
-    for (const auto& [tag, slot] : listener_slots) {
-        if (tag != std::string_view(binding.tag) && slot->udp_binding &&
-            slot->udp_binding->port == binding.port &&
-            slot->udp_binding->listen.Overlaps(binding.listen)) {
-            LOG_ERROR("UDP listener conflict worker={} tag={} owner={} port={}",
-                      worker.id_, binding.tag, tag, binding.port);
-            co_return false;
-        }
+    if (HasBindingConflict(worker, binding, false)) {
+        co_return false;
     }
 
     auto existing_slot = listener_slots.find(binding.tag);
@@ -1428,64 +1455,12 @@ net::awaitable<bool> Worker::ListenerState::StartUdpListening(
     for (const auto& addr : listen_candidates) {
         const iputil::AddressText listen_text(addr);
         const auto listen_addr = listen_text.View();
-        IoErrorCode ec;
-        udp::endpoint ep(addr, binding.port);
         auto candidate_sock =
             replacement_ingress->MakeSocket(worker.runtime_->io_context);
-
-        auto fail_candidate = [&](std::string_view op, std::string_view msg) -> bool {
-            if (listen_candidates.size() > 1) {
-                LOG_WARN("UDP listener operation failed worker={} operation={} endpoint={} > {}; continuing dual-stack bind",
-                         worker.id_,
-                         op,
-                         iputil::FormatEndpointForLog(listen_addr, binding.port),
-                         msg);
-                return true;
-            }
-            LOG_ERROR("UDP listener operation failed worker={} operation={} endpoint={} > {}",
-                      worker.id_, op, iputil::FormatEndpointForLog(listen_addr, binding.port), msg);
-            return false;
-        };
-
-        candidate_sock->open(ep.protocol(), ec);
-        if (ec) {
-            if (fail_candidate("open", ec.message())) continue;
-            break;
-        }
-
-        if (addr.is_v6()) {
-            candidate_sock->set_option(net::ip::v6_only(true), ec);
-            if (ec) {
-                if (fail_candidate("set IPV6_V6ONLY", ec.message())) continue;
-                break;
-            }
-        }
-
-        candidate_sock->set_option(net::socket_base::reuse_address(true), ec);
-        if (ec) {
-            if (fail_candidate("set SO_REUSEADDR", ec.message())) continue;
-            break;
-        }
-
-        // SO_REUSEPORT：每 Worker 独立绑定，内核负载均衡。
-        int optval = 1;
-        if (::setsockopt(candidate_sock->native_handle(), SOL_SOCKET, SO_REUSEPORT,
-                         &optval, sizeof(optval)) < 0) {
-            if (fail_candidate("SO_REUSEPORT", strerror(errno))) continue;
-            break;
-        }
-
-        // The OOM path must consume a datagram without allocating another
-        // async operation. Asio's synchronous receive requires user-level
-        // nonblocking mode, not merely native_non_blocking.
-        candidate_sock->non_blocking(true, ec);
-        if (ec) {
-            if (fail_candidate("set nonblocking", ec.message())) continue;
-            break;
-        }
-        candidate_sock->bind(ep, ec);
-        if (ec) {
-            if (fail_candidate("bind", ec.message())) continue;
+        if (!OpenAndBindUdpSocket(
+                worker, "UDP", *candidate_sock, addr, listen_addr, binding.port,
+                listen_candidates.size() > 1)) {
+            if (listen_candidates.size() > 1) continue;
             break;
         }
 

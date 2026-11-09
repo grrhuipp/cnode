@@ -51,11 +51,6 @@
 
 namespace transport::internet::hysteria {
 
-struct SslContextDeleter {
-    void operator()(SSL_CTX* context) const noexcept { SSL_CTX_free(context); }
-};
-using SslContextPtr = std::unique_ptr<SSL_CTX, SslContextDeleter>;
-
 namespace {
 
 constexpr size_t kMaxPacketSize = 64 * 1024;
@@ -187,58 +182,12 @@ struct SocketState final : memory::ThreadAllocated {
     SignalChannel changed;
 };
 
-// Worker-local sockets, receive staging, native send ownership and one expiry timer.
-class QuicListener final : public memory::ThreadAllocated {
-public:
-    QuicListener(uint32_t worker_id, net::io_context& io,
-                 app::DatagramSessionEnvironment environment);
-
-    [[nodiscard]] const proxyman::inbound::ReceiverSettings& Receiver() const noexcept {
-        return *environment.receiver;
-    }
-
-    void Spawn(net::awaitable<void> task);
-    [[nodiscard]] bool Queue(SocketState& socket, std::span<const uint8_t> data,
-                             udp::endpoint remote,
-                             std::shared_ptr<Connection> connection, bool terminal = false);
-    void Associate(const ngtcp2_cid& cid, std::shared_ptr<Connection> connection);
-    void Dissociate(const ngtcp2_cid& cid) noexcept;
-    void DissociateAll(Connection& connection) noexcept;
-    SocketState* Resolve(const udp::endpoint& local) noexcept;
-    void Enqueue(const std::shared_ptr<Connection>& connection,
-                 const std::shared_ptr<SocketState>& socket,
-                 const udp::endpoint& remote,
-                 memory::ThreadLocalVector<uint8_t> bytes);
-    void Pump(const std::shared_ptr<Connection>& connection);
-    app::DatagramSessionEnvironment environment;
-    size_t connection_tasks = 0;
-    memory::ThreadLocalUnorderedMap<Connection*, std::shared_ptr<Connection>> sessions;
-    net::awaitable<void> ReceiveLoop(std::shared_ptr<SocketState> socket);
-    net::awaitable<void> SendLoop(std::shared_ptr<SocketState> socket);
-    void ArmExpiry();
-    net::awaitable<void> ExpiryLoop();
-    void Stop() noexcept;
-
-    uint32_t worker_id;
-    net::io_context& io;
-    Version version = Version::V2;
-    uint64_t upload_bytes_per_second = 0;
-    uint64_t download_bytes_per_second = 0;
-    SslContextPtr ssl_context;
-    memory::ThreadLocalUnorderedMap<memory::ThreadLocalString,
-        std::shared_ptr<SocketState>, TransparentStringHash, TransparentStringEq> sockets;
-    memory::ThreadLocalUnorderedMap<
-        ConnectionId, std::shared_ptr<Connection>, ConnectionIdHash> connections;
-    net::steady_timer changed;
-    net::steady_timer expiry;
-    size_t tasks = 0;
-    bool stopping = false;
-    bool started = false;
-    bool expiry_running = false;
-};
+const proxyman::inbound::ReceiverSettings& HysteriaIngress::Receiver() const noexcept {
+    return environment.handler->ReceiverSettings();
+}
 
 Connection::Connection(
-    QuicListener& listener, SocketState& socket, const udp::endpoint& remote)
+    HysteriaIngress& listener, SocketState& socket, const udp::endpoint& remote)
     : listener_(&listener)
     , closed_signal_(listener.io.get_executor(), 1)
     , core_(std::in_place)
@@ -253,7 +202,7 @@ net::io_context& Connection::Reactor() const noexcept {
 }
 
 std::shared_ptr<Connection> Connection::Create(
-    QuicListener& listener, SocketState& socket,
+    HysteriaIngress& listener, SocketState& socket,
     const udp::endpoint& remote, const ngtcp2_pkt_hd& header) {
     auto connection = std::shared_ptr<Connection>(
         new Connection(listener, socket, remote));
@@ -261,7 +210,7 @@ std::shared_ptr<Connection> Connection::Create(
     try {
         listener.Associate(header.dcid, connection);
         listener.sessions.emplace(connection.get(), connection);
-        ++listener.connection_tasks;
+        ++listener.tasks;
         tracked = true;
         net::co_spawn(connection->Reactor(), connection->Run(header),
             [connection](std::exception_ptr error) {
@@ -269,7 +218,7 @@ std::shared_ptr<Connection> Connection::Create(
                 connection->Close();
                 owner->sessions.erase(connection.get());
                 MaybeShrinkHashContainer(owner->sessions);
-                --owner->connection_tasks;
+                --owner->tasks;
                 owner->changed.cancel();
                 if (error && !IsOperationCancelled(error))
                     LOG_ERROR("Hysteria connection task failed worker={}", owner->worker_id);
@@ -278,7 +227,7 @@ std::shared_ptr<Connection> Connection::Create(
         connection->Close();
         listener.sessions.erase(connection.get());
         MaybeShrinkHashContainer(listener.sessions);
-        if (tracked) --listener.connection_tasks;
+        if (tracked) --listener.tasks;
         throw;
     }
     return connection;
@@ -976,7 +925,6 @@ void Connection::Close() noexcept {
         }
         core_->datagrams.clear();
         core_->h3_requests.clear();
-        retired_ = true;
         listener_->DissociateAll(*this);
     }
     if (physical_ == PhysicalAdmission::Pending) (void)physical_ready_.try_send(IoErrorCode{});
@@ -1500,7 +1448,7 @@ void Connection::CloseUdpSession(uint32_t session_id) noexcept {
     }
 }
 
-QuicListener::QuicListener(
+HysteriaIngress::HysteriaIngress(
     uint32_t worker_id_value, net::io_context& io_value,
     app::DatagramSessionEnvironment environment_value)
     : environment(std::move(environment_value)),
@@ -1515,7 +1463,9 @@ QuicListener::QuicListener(
     if (!ssl_context) throw std::invalid_argument("invalid Hysteria TLS settings");
 }
 
-void QuicListener::Spawn(net::awaitable<void> task) {
+HysteriaIngress::~HysteriaIngress() noexcept { RequestStop(); }
+
+void HysteriaIngress::Spawn(net::awaitable<void> task) {
     ++tasks;
     try {
     net::co_spawn(io, std::move(task), [this](std::exception_ptr error) {
@@ -1535,9 +1485,9 @@ void QuicListener::Spawn(net::awaitable<void> task) {
     }
 }
 
-bool QuicListener::Queue(SocketState& socket, std::span<const uint8_t> data,
-                         udp::endpoint remote, std::shared_ptr<Connection> connection,
-                         bool terminal) {
+bool HysteriaIngress::Queue(SocketState& socket, std::span<const uint8_t> data,
+                            udp::endpoint remote, std::shared_ptr<Connection> connection,
+                            bool terminal) {
     if (stopping || !socket.socket || !socket.socket->is_open()) return false;
     if (socket.output.empty()) {
         IoErrorCode error;
@@ -1556,7 +1506,7 @@ bool QuicListener::Queue(SocketState& socket, std::span<const uint8_t> data,
     return true;
 }
 
-void QuicListener::Associate(
+void HysteriaIngress::Associate(
     const ngtcp2_cid& cid, std::shared_ptr<Connection> connection) {
     const auto id = ConnectionId(cid);
     if (std::find(connection->connection_ids_.begin(), connection->connection_ids_.end(), id) ==
@@ -1570,12 +1520,12 @@ void QuicListener::Associate(
         throw std::runtime_error("QUIC local CID collision");
 }
 
-void QuicListener::Dissociate(const ngtcp2_cid& cid) noexcept {
+void HysteriaIngress::Dissociate(const ngtcp2_cid& cid) noexcept {
     connections.erase(ConnectionId(cid));
     MaybeShrinkHashContainer(connections);
 }
 
-void QuicListener::DissociateAll(Connection& connection) noexcept {
+void HysteriaIngress::DissociateAll(Connection& connection) noexcept {
     for (const auto& id : connection.connection_ids_) {
         connections.erase(id);
     }
@@ -1583,7 +1533,7 @@ void QuicListener::DissociateAll(Connection& connection) noexcept {
     MaybeShrinkHashContainer(connections);
 }
 
-SocketState* QuicListener::Resolve(const udp::endpoint& local) noexcept {
+SocketState* HysteriaIngress::Resolve(const udp::endpoint& local) noexcept {
     for (auto& [key, socket] : sockets) {
         (void)key;
         if (socket->local == local && socket->socket && socket->socket->is_open())
@@ -1592,13 +1542,11 @@ SocketState* QuicListener::Resolve(const udp::endpoint& local) noexcept {
     return nullptr;
 }
 
-
-void QuicListener::Enqueue(const std::shared_ptr<Connection>& connection,
-                           const std::shared_ptr<SocketState>& socket,
-                           const udp::endpoint& remote,
-                           memory::ThreadLocalVector<uint8_t> bytes) {
-    if (!connection || !connection->core_ || connection->Closed() ||
-        connection->retired_) {
+void HysteriaIngress::Enqueue(const std::shared_ptr<Connection>& connection,
+                              const std::shared_ptr<SocketState>& socket,
+                              const udp::endpoint& remote,
+                              memory::ThreadLocalVector<uint8_t> bytes) {
+    if (!connection || !connection->core_ || connection->Closed()) {
         return;
     }
     auto& core = *connection->core_;
@@ -1609,14 +1557,14 @@ void QuicListener::Enqueue(const std::shared_ptr<Connection>& connection,
     if (core.pump_scheduled) return;
     core.pump_scheduled = true;
     net::post(io, [this, connection] {
-        if (connection->Closed() || connection->retired_) return;
+        if (connection->Closed()) return;
         Pump(connection);
     });
 }
 
-void QuicListener::Pump(const std::shared_ptr<Connection>& connection) {
+void HysteriaIngress::Pump(const std::shared_ptr<Connection>& connection) {
     if (!connection->core_ || !connection->core_->quic || !connection->tasks_ ||
-        connection->Closed() || connection->retired_) {
+        connection->Closed()) {
         return;
     }
     auto& core = *connection->core_;
@@ -1638,8 +1586,8 @@ void QuicListener::Pump(const std::shared_ptr<Connection>& connection) {
     }
 }
 
-net::awaitable<void> QuicListener::ReceiveLoop(std::shared_ptr<SocketState> socket) {
-    detail::UdpReceiveBuffer receive_buffer;
+net::awaitable<void> HysteriaIngress::ReceiveLoop(std::shared_ptr<SocketState> socket) {
+    ::detail::UdpReceiveBuffer receive_buffer;
     while (!stopping && socket->socket && socket->socket->is_open()) {
         receive_buffer.Release();
         auto [wait_error] = co_await socket->socket->async_wait(
@@ -1694,7 +1642,7 @@ net::awaitable<void> QuicListener::ReceiveLoop(std::shared_ptr<SocketState> sock
             }
             if (connection && connection->core_ && connection->core_->quic &&
                 connection->tasks_ && connection->core_->inbox.empty() &&
-                !connection->Closed() && !connection->retired_) {
+                !connection->Closed()) {
                 (void)connection->Feed(*socket, socket->remote, packet, true);
             } else {
                 Enqueue(connection, socket, socket->remote,
@@ -1712,7 +1660,7 @@ net::awaitable<void> QuicListener::ReceiveLoop(std::shared_ptr<SocketState> sock
     }
 }
 
-net::awaitable<void> QuicListener::SendLoop(std::shared_ptr<SocketState> socket) {
+net::awaitable<void> HysteriaIngress::SendLoop(std::shared_ptr<SocketState> socket) {
     while (!stopping && socket->socket && socket->socket->is_open()) {
         if (socket->output.empty()) {
             auto [error] = co_await socket->changed.async_receive(
@@ -1722,7 +1670,7 @@ net::awaitable<void> QuicListener::SendLoop(std::shared_ptr<SocketState> socket)
         }
         auto packet = std::move(socket->output.front());
         socket->output.pop_front();
-        if (stopping || (packet.connection && packet.connection->retired_ && !packet.terminal)) {
+        if (stopping || (packet.connection && packet.connection->Closed() && !packet.terminal)) {
             continue;
         }
         auto [error, bytes] = co_await socket->socket->async_send_to(
@@ -1733,11 +1681,11 @@ net::awaitable<void> QuicListener::SendLoop(std::shared_ptr<SocketState> socket)
     }
 }
 
-void QuicListener::ArmExpiry() {
+void HysteriaIngress::ArmExpiry() {
     ngtcp2_tstamp nearest = std::numeric_limits<ngtcp2_tstamp>::max();
     for (const auto& [raw, connection] : sessions) {
         (void)raw;
-        if (!connection->retired_)
+        if (!connection->Closed())
             nearest = std::min(nearest, connection->expiry_);
     }
     const auto expiry_time = ExpiryTimePoint(nearest);
@@ -1752,7 +1700,7 @@ void QuicListener::ArmExpiry() {
     }
 }
 
-net::awaitable<void> QuicListener::ExpiryLoop() {
+net::awaitable<void> HysteriaIngress::ExpiryLoop() {
     while (!stopping) {
         auto [error] = co_await expiry.async_wait(
             net::as_tuple(net::use_awaitable));
@@ -1764,7 +1712,7 @@ net::awaitable<void> QuicListener::ExpiryLoop() {
         memory::ThreadLocalVector<std::shared_ptr<Connection>> due;
         for (const auto& [raw, connection] : sessions) {
             (void)raw;
-            if (!connection->retired_ && connection->expiry_ <= now)
+            if (!connection->Closed() && connection->expiry_ <= now)
                 due.push_back(connection);
         }
         for (auto& connection : due) {
@@ -1776,7 +1724,7 @@ net::awaitable<void> QuicListener::ExpiryLoop() {
             std::numeric_limits<ngtcp2_tstamp>::max();
         for (const auto& [raw, connection] : sessions) {
             (void)raw;
-            if (!connection->retired_)
+            if (!connection->Closed())
                 nearest = std::min(nearest, connection->expiry_);
         }
         const auto expiry_time = ExpiryTimePoint(nearest);
@@ -1786,7 +1734,40 @@ net::awaitable<void> QuicListener::ExpiryLoop() {
     expiry_running = false;
 }
 
-void QuicListener::Stop() noexcept {
+HysteriaIngress::SocketPtr HysteriaIngress::MakeSocket() {
+    return memory::AllocateShared<udp::socket>(io);
+}
+
+HysteriaIngress::SocketPtr HysteriaIngress::AttachSocket(
+    std::string_view socket_key, SocketPtr socket) {
+    if (!socket || !socket->is_open() || started || stopping)
+        return {};
+    const auto* coordinator = GroupCoordinator::ForContext(io);
+    const uint32_t worker_count = coordinator ? coordinator->WorkerCount() : 1;
+    (void)AttachQuicReuseportBpf(socket->native_handle(), worker_count);
+    auto state = memory::AllocateShared<SocketState>(io);
+    state->socket = std::move(socket);
+    state->key.assign(socket_key);
+    IoErrorCode error;
+    state->local = state->socket->local_endpoint(error);
+    if (error) return {};
+    state->socket->non_blocking(true, error);
+    if (error) return {};
+    auto [it, inserted] = sockets.try_emplace(state->key, state);
+    return inserted ? it->second->socket : SocketPtr{};
+}
+
+void HysteriaIngress::Start() {
+    if (started || stopping) return;
+    started = true;
+    for (auto& [key, socket] : sockets) {
+        (void)key;
+        Spawn(ReceiveLoop(socket));
+        Spawn(SendLoop(socket));
+    }
+}
+
+void HysteriaIngress::RequestStop() noexcept {
     if (stopping) return;
     stopping = true;
     IoErrorCode ignored;
@@ -1803,55 +1784,10 @@ void QuicListener::Stop() noexcept {
     }
 }
 
-HysteriaIngress::HysteriaIngress(
-    uint32_t worker_id, net::io_context& io_context,
-    app::DatagramSessionEnvironment environment)
-    : listener_(std::make_unique<QuicListener>(
-          worker_id, io_context, std::move(environment))) {}
-
-HysteriaIngress::~HysteriaIngress() noexcept { RequestStop(); }
-
-HysteriaIngress::SocketPtr HysteriaIngress::MakeSocket() {
-    return memory::AllocateShared<udp::socket>(listener_->io);
-}
-
-HysteriaIngress::SocketPtr HysteriaIngress::AttachSocket(
-    std::string_view socket_key, SocketPtr socket) {
-    if (!socket || !socket->is_open() || listener_->started || listener_->stopping)
-        return {};
-    const auto* coordinator = GroupCoordinator::ForContext(listener_->io);
-    const uint32_t worker_count = coordinator ? coordinator->WorkerCount() : 1;
-    (void)AttachQuicReuseportBpf(socket->native_handle(), worker_count);
-    auto state = memory::AllocateShared<SocketState>(listener_->io);
-    state->socket = std::move(socket);
-    state->key.assign(socket_key);
-    IoErrorCode error;
-    state->local = state->socket->local_endpoint(error);
-    if (error) return {};
-    state->socket->non_blocking(true, error);
-    if (error) return {};
-    auto [it, inserted] = listener_->sockets.try_emplace(state->key, state);
-    return inserted ? it->second->socket : SocketPtr{};
-}
-
-void HysteriaIngress::Start() {
-    if (listener_->started || listener_->stopping) return;
-    listener_->started = true;
-    for (auto& [key, socket] : listener_->sockets) {
-        (void)key;
-        listener_->Spawn(listener_->ReceiveLoop(socket));
-        listener_->Spawn(listener_->SendLoop(socket));
-    }
-}
-
-void HysteriaIngress::RequestStop() noexcept {
-    if (listener_) listener_->Stop();
-}
-
 net::awaitable<void> HysteriaIngress::AsyncJoin() {
     RequestStop();
-    while (listener_->tasks != 0 || listener_->connection_tasks != 0) {
-        auto [error] = co_await listener_->changed.async_wait(
+    while (tasks != 0) {
+        auto [error] = co_await changed.async_wait(
             net::as_tuple(net::use_awaitable));
         (void)error;
     }

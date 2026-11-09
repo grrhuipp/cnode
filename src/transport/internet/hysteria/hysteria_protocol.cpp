@@ -12,54 +12,6 @@
 namespace transport::internet::hysteria {
 namespace {
 
-class Cursor final {
-public:
-    explicit Cursor(std::span<const uint8_t> input) noexcept : reader_(input) {}
-
-    [[nodiscard]] size_t position() const noexcept { return reader_.Position(); }
-    [[nodiscard]] size_t remaining() const noexcept { return reader_.Remaining(); }
-
-    [[nodiscard]] tl::expected<uint8_t, ProtocolError> U8() noexcept {
-        const uint8_t value = reader_.ReadU8();
-        if (!reader_.Ok()) return tl::unexpected(ProtocolError::Incomplete);
-        return value;
-    }
-
-    [[nodiscard]] tl::expected<uint16_t, ProtocolError> U16() noexcept {
-        const uint16_t value = reader_.ReadU16BE();
-        if (!reader_.Ok()) return tl::unexpected(ProtocolError::Incomplete);
-        return value;
-    }
-
-    [[nodiscard]] tl::expected<uint32_t, ProtocolError> U32() noexcept {
-        const uint32_t value = reader_.ReadU32BE();
-        if (!reader_.Ok()) return tl::unexpected(ProtocolError::Incomplete);
-        return value;
-    }
-
-    [[nodiscard]] tl::expected<uint64_t, ProtocolError> U64() noexcept {
-        const uint64_t value = reader_.ReadU64BE();
-        if (!reader_.Ok()) return tl::unexpected(ProtocolError::Incomplete);
-        return value;
-    }
-
-    [[nodiscard]] tl::expected<uint64_t, ProtocolError> Varint() noexcept {
-        const auto value = reader_.ReadQuicVarint();
-        if (!value) return tl::unexpected(ProtocolError::Incomplete);
-        return *value;
-    }
-
-    [[nodiscard]] tl::expected<std::span<const uint8_t>, ProtocolError>
-    Bytes(size_t size) noexcept {
-        const auto result = reader_.ReadBytes(size);
-        if (!reader_.Ok()) return tl::unexpected(ProtocolError::Incomplete);
-        return result;
-    }
-
-private:
-    ByteReader reader_;
-};
-
 void AppendU16(memory::ByteVector& output, uint16_t value) {
     std::array<uint8_t, 2> bytes{};
     StoreU16BE(bytes.data(), value);
@@ -162,25 +114,23 @@ struct UdpTargetText {
 
 tl::expected<V1ClientHello, ProtocolError>
 ParseV1ClientHello(std::span<const uint8_t> input) {
-    Cursor cursor(input);
-    const auto version = cursor.U8();
-    if (!version) return tl::unexpected(version.error());
-    if (*version != kV1ProtocolVersion)
+    ByteReader reader(input);
+    const uint8_t version = reader.ReadU8();
+    if (!reader.Ok()) return tl::unexpected(ProtocolError::Incomplete);
+    if (version != kV1ProtocolVersion)
         return tl::unexpected(ProtocolError::UnsupportedVersion);
-    const auto send_bps = cursor.U64();
-    if (!send_bps) return tl::unexpected(send_bps.error());
-    const auto receive_bps = cursor.U64();
-    if (!receive_bps) return tl::unexpected(receive_bps.error());
-    const auto auth_size = cursor.U16();
-    if (!auth_size) return tl::unexpected(auth_size.error());
-    if (*auth_size > kMaxAuthLength) return tl::unexpected(ProtocolError::TooLarge);
-    const auto auth = cursor.Bytes(*auth_size);
-    if (!auth) return tl::unexpected(auth.error());
-    if (cursor.remaining() != 0) return tl::unexpected(ProtocolError::Invalid);
+    const uint64_t send_bps = reader.ReadU64BE();
+    const uint64_t receive_bps = reader.ReadU64BE();
+    const uint16_t auth_size = reader.ReadU16BE();
+    if (!reader.Ok()) return tl::unexpected(ProtocolError::Incomplete);
+    if (auth_size > kMaxAuthLength) return tl::unexpected(ProtocolError::TooLarge);
+    const auto auth = reader.ReadBytes(auth_size);
+    if (!reader.Ok()) return tl::unexpected(ProtocolError::Incomplete);
+    if (!reader.Empty()) return tl::unexpected(ProtocolError::Invalid);
     V1ClientHello hello;
-    hello.send_bps = *send_bps;
-    hello.receive_bps = *receive_bps;
-    hello.auth.assign(reinterpret_cast<const char*>(auth->data()), auth->size());
+    hello.send_bps = send_bps;
+    hello.receive_bps = receive_bps;
+    hello.auth.assign(reinterpret_cast<const char*>(auth.data()), auth.size());
     return hello;
 }
 
@@ -199,24 +149,23 @@ memory::ByteVector EncodeV1ServerHello(
 
 tl::expected<V1Request, ProtocolError>
 ParseV1Request(std::span<const uint8_t> input) {
-    Cursor cursor(input);
-    const auto udp = cursor.U8();
-    if (!udp) return tl::unexpected(udp.error());
-    if (*udp > 1) return tl::unexpected(ProtocolError::Invalid);
-    const auto host_size = cursor.U16();
-    if (!host_size) return tl::unexpected(host_size.error());
-    if (*host_size > kMaxAddressLength)
+    ByteReader reader(input);
+    const uint8_t udp = reader.ReadU8();
+    if (!reader.Ok()) return tl::unexpected(ProtocolError::Incomplete);
+    if (udp > 1) return tl::unexpected(ProtocolError::Invalid);
+    const uint16_t host_size = reader.ReadU16BE();
+    if (!reader.Ok()) return tl::unexpected(ProtocolError::Incomplete);
+    if (host_size > kMaxAddressLength)
         return tl::unexpected(ProtocolError::TooLarge);
-    const auto host = cursor.Bytes(*host_size);
-    if (!host) return tl::unexpected(host.error());
-    const auto port = cursor.U16();
-    if (!port) return tl::unexpected(port.error());
-    if (*udp != 0 && host->empty() && *port == 0)
-        return V1Request{true, {}, cursor.position()};
-    if (host->empty()) return tl::unexpected(ProtocolError::Invalid);
-    auto target = ParseV1Target(*host, *port);
+    const auto host = reader.ReadBytes(host_size);
+    const uint16_t port = reader.ReadU16BE();
+    if (!reader.Ok()) return tl::unexpected(ProtocolError::Incomplete);
+    if (udp != 0 && host.empty() && port == 0)
+        return V1Request{true, {}, reader.Position()};
+    if (host.empty()) return tl::unexpected(ProtocolError::Invalid);
+    auto target = ParseV1Target(host, port);
     if (!target) return tl::unexpected(target.error());
-    return V1Request{*udp != 0, std::move(*target), cursor.position()};
+    return V1Request{udp != 0, std::move(*target), reader.Position()};
 }
 
 memory::ByteVector EncodeV1Response(
@@ -233,95 +182,94 @@ memory::ByteVector EncodeV1Response(
 
 tl::expected<V2TcpRequest, ProtocolError>
 ParseV2TcpRequest(std::span<const uint8_t> input) {
-    Cursor cursor(input);
-    const auto request_type = cursor.Varint();
-    if (!request_type) return tl::unexpected(request_type.error());
+    ByteReader reader(input);
+    const auto request_type = reader.ReadQuicVarint();
+    if (!request_type) return tl::unexpected(ProtocolError::Incomplete);
     if (*request_type != kV2TcpRequestType) return tl::unexpected(ProtocolError::Invalid);
-    const auto address_size = cursor.Varint();
-    if (!address_size) return tl::unexpected(address_size.error());
+    const auto address_size = reader.ReadQuicVarint();
+    if (!address_size) return tl::unexpected(ProtocolError::Incomplete);
     if (*address_size == 0 || *address_size > kMaxAddressLength)
         return tl::unexpected(ProtocolError::TooLarge);
-    const auto address = cursor.Bytes(static_cast<size_t>(*address_size));
-    if (!address) return tl::unexpected(address.error());
-    const auto padding_size = cursor.Varint();
-    if (!padding_size) return tl::unexpected(padding_size.error());
+    const auto address = reader.ReadBytes(static_cast<size_t>(*address_size));
+    if (!reader.Ok()) return tl::unexpected(ProtocolError::Incomplete);
+    const auto padding_size = reader.ReadQuicVarint();
+    if (!padding_size) return tl::unexpected(ProtocolError::Incomplete);
     if (*padding_size > kMaxPaddingLength) return tl::unexpected(ProtocolError::TooLarge);
-    const auto padding = cursor.Bytes(static_cast<size_t>(*padding_size));
-    if (!padding) return tl::unexpected(padding.error());
+    if (!reader.Skip(static_cast<size_t>(*padding_size)))
+        return tl::unexpected(ProtocolError::Incomplete);
     const auto text = std::string_view(
-        reinterpret_cast<const char*>(address->data()), address->size());
+        reinterpret_cast<const char*>(address.data()), address.size());
     auto target = TargetAddress::Parse(text);
     if (!target) return tl::unexpected(ProtocolError::Invalid);
-    return V2TcpRequest{std::move(*target), cursor.position()};
+    return V2TcpRequest{std::move(*target), reader.Position()};
 }
 
 tl::expected<UdpMessage, ProtocolError>
 ParseUdpMessage(Version version, std::span<const uint8_t> input) {
-    Cursor cursor(input);
-    const auto session_id = cursor.U32();
-    if (!session_id) return tl::unexpected(session_id.error());
+    ByteReader reader(input);
+    const uint32_t session_id = reader.ReadU32BE();
+    if (!reader.Ok()) return tl::unexpected(ProtocolError::Incomplete);
 
     UdpMessage result;
-    result.session_id = *session_id;
+    result.session_id = session_id;
     if (version == Version::V1) {
-        const auto host_size = cursor.U16();
-        if (!host_size) return tl::unexpected(host_size.error());
-        if (*host_size == 0 || *host_size > kMaxAddressLength)
+        const uint16_t host_size = reader.ReadU16BE();
+        if (!reader.Ok()) return tl::unexpected(ProtocolError::Incomplete);
+        if (host_size == 0 || host_size > kMaxAddressLength)
             return tl::unexpected(ProtocolError::TooLarge);
-        const auto host = cursor.Bytes(*host_size);
-        if (!host) return tl::unexpected(host.error());
-        const auto port = cursor.U16();
-        if (!port) return tl::unexpected(port.error());
-        auto target = ParseV1Target(*host, *port);
+        const auto host = reader.ReadBytes(host_size);
+        const uint16_t port = reader.ReadU16BE();
+        if (!reader.Ok()) return tl::unexpected(ProtocolError::Incomplete);
+        auto target = ParseV1Target(host, port);
         if (!target) return tl::unexpected(target.error());
         result.target = std::move(*target);
-        const auto packet_id = cursor.U16();
-        const auto fragment_id = cursor.U8();
-        const auto fragment_count = cursor.U8();
-        const auto payload_size = cursor.U16();
-        if (!packet_id || !fragment_id || !fragment_count || !payload_size)
+        const uint16_t packet_id = reader.ReadU16BE();
+        const uint8_t fragment_id = reader.ReadU8();
+        const uint8_t fragment_count = reader.ReadU8();
+        const uint16_t payload_size = reader.ReadU16BE();
+        if (!reader.Ok())
             return tl::unexpected(ProtocolError::Incomplete);
-        if (!ValidFragmentIndex(version, *fragment_id, *fragment_count))
+        if (!ValidFragmentIndex(version, fragment_id, fragment_count))
             return tl::unexpected(ProtocolError::Invalid);
-        if (*payload_size > kMaxUdpPayloadLength)
+        if (payload_size > kMaxUdpPayloadLength)
             return tl::unexpected(ProtocolError::TooLarge);
-        const auto payload = cursor.Bytes(*payload_size);
-        if (!payload) return tl::unexpected(payload.error());
-        if (cursor.remaining() != 0) return tl::unexpected(ProtocolError::Invalid);
-        result.packet_id = *packet_id;
-        result.fragment_id = *fragment_id;
-        result.fragment_count = *fragment_count;
-        result.payload = *payload;
+        const auto payload = reader.ReadBytes(payload_size);
+        if (!reader.Ok()) return tl::unexpected(ProtocolError::Incomplete);
+        if (!reader.Empty()) return tl::unexpected(ProtocolError::Invalid);
+        result.packet_id = packet_id;
+        result.fragment_id = fragment_id;
+        result.fragment_count = fragment_count;
+        result.payload = payload;
         return result;
     }
 
-    const auto packet_id = cursor.U16();
-    const auto fragment_id = cursor.U8();
-    const auto fragment_count = cursor.U8();
-    const auto address_size = cursor.Varint();
-    if (!packet_id || !fragment_id || !fragment_count || !address_size)
+    const uint16_t packet_id = reader.ReadU16BE();
+    const uint8_t fragment_id = reader.ReadU8();
+    const uint8_t fragment_count = reader.ReadU8();
+    const auto address_size = reader.ReadQuicVarint();
+    if (!reader.Ok() || !address_size)
         return tl::unexpected(ProtocolError::Incomplete);
-    if (!ValidFragmentIndex(version, *fragment_id, *fragment_count))
+    if (!ValidFragmentIndex(version, fragment_id, fragment_count))
         return tl::unexpected(ProtocolError::Invalid);
     if (*address_size > kMaxAddressLength)
         return tl::unexpected(ProtocolError::TooLarge);
-    const auto address = cursor.Bytes(static_cast<size_t>(*address_size));
-    if (!address) return tl::unexpected(address.error());
-    if (!address->empty()) {
+    const auto address = reader.ReadBytes(static_cast<size_t>(*address_size));
+    if (!reader.Ok()) return tl::unexpected(ProtocolError::Incomplete);
+    if (!address.empty()) {
         const auto text = std::string_view(
-            reinterpret_cast<const char*>(address->data()), address->size());
+            reinterpret_cast<const char*>(address.data()), address.size());
         auto target = TargetAddress::Parse(text);
         if (!target) return tl::unexpected(ProtocolError::Invalid);
         result.target = std::move(*target);
-    } else if (RequiresUdpTarget(version, *fragment_id, *fragment_count)) {
+    } else if (RequiresUdpTarget(version, fragment_id, fragment_count)) {
         return tl::unexpected(ProtocolError::Invalid);
     }
-    if (cursor.remaining() > kMaxUdpPayloadLength)
+    if (reader.Remaining() > kMaxUdpPayloadLength)
         return tl::unexpected(ProtocolError::TooLarge);
-    result.packet_id = *packet_id;
-    result.fragment_id = *fragment_id;
-    result.fragment_count = *fragment_count;
-    result.payload = *cursor.Bytes(cursor.remaining());
+    result.packet_id = packet_id;
+    result.fragment_id = fragment_id;
+    result.fragment_count = fragment_count;
+    result.payload = reader.ReadBytes(reader.Remaining());
     return result;
 }
 

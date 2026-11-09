@@ -2,7 +2,7 @@
 #include <gtest/gtest.h>
 
 #include "infra/inbound_field_rules.hpp"
-#include "http2_settings.hpp"
+#include "http2_session.hpp"
 
 #include <cstdlib>
 #include <iostream>

@@ -595,11 +595,9 @@ std::vector<rule::DetectRule> ExtractBlockDetectRules(
                 throw std::invalid_argument(
                     "block route match entries must not be empty");
             }
-            for (const unsigned char ch : entry) {
-                if (ch < 0x20 || ch == 0x7f) {
-                    throw std::invalid_argument(
-                        "block route match entries must not contain control characters");
-                }
+            if (ContainsControlCharacter(entry)) {
+                throw std::invalid_argument(
+                    "block route match entries must not contain control characters");
             }
             try {
                 rules.push_back(rule::DetectRule{

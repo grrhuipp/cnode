@@ -15,6 +15,15 @@ namespace api::v2board {
     return value.is_array() && value.as_array().empty();
 }
 
+[[nodiscard]] inline bool ContainsControlCharacter(std::string_view value) noexcept {
+    for (const unsigned char ch : value) {
+        if (ch < 0x20 || ch == 0x7f) {
+            return true;
+        }
+    }
+    return false;
+}
+
 [[nodiscard]] inline std::optional<uint64_t> PanelUnsignedInteger(
     const json::value& value) noexcept {
     if (const auto parsed = JsonUnsignedInteger(value)) {

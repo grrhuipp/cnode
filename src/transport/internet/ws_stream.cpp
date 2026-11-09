@@ -1,6 +1,5 @@
 #include "transport/internet/ws_stream.hpp"
 #include "http1_handshake.hpp"
-#include "http_path_match.hpp"
 #include "common/binary_text_codec.hpp"
 #include "common/unsafe.hpp"
 #include "common/buffer_util.hpp"

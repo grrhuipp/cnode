@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -9,6 +10,8 @@
 #include <vector>
 
 namespace anytls {
+
+inline constexpr size_t kMaxFramePayload = 0xffff;
 
 struct PaddingRecord {
     bool copy_payload = false;

@@ -1,7 +1,7 @@
 #include <stdexcept>
 #include <gtest/gtest.h>
 
-#include "http_path_match.hpp"
+#include "transport/internet/http_headers.hpp"
 
 #include <cstdlib>
 #include <iostream>

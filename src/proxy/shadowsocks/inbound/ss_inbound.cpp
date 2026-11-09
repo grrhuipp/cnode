@@ -42,13 +42,6 @@ public:
         : ss2022_session_(std::move(session)) {}
 
 
-    ~ShadowsocksUdpResponseContext() noexcept override {
-        OPENSSL_cleanse(reply_key_.bytes.data(), reply_key_.bytes.size());
-        if (ss2022_session_) {
-            OPENSSL_cleanse(ss2022_session_->key.bytes.data(),
-                            ss2022_session_->key.bytes.size());
-        }
-    }
     [[nodiscard]] buf::MultiBuffer Encode(UDPPacketView packet) override;
 
 private:
@@ -64,8 +57,8 @@ private:
 };
 
 struct PreparedSsTcpSession {
-    std::unique_ptr<transport::MultiBufferReader> request_reader;
-    std::unique_ptr<transport::MultiBufferWriter> response_writer;
+    ss::detail::BodyReader request_reader;
+    ss::ResponseBodyWriter response_writer;
     InitialPayload initial_payload;
     UserOnlineSessionGuard user_session;
     std::optional<proxy::uot::Version> uot_version;
@@ -127,8 +120,6 @@ PrepareSsTcpSession(
 
     auto response_writer_result = ss::WriteTCPResponse(
         *matched, cipher_info, session_result->request_salt, stream);
-    OPENSSL_cleanse(session_result->request_salt.bytes.data(),
-                    session_result->request_salt.bytes.size());
     if (!request_reader) {
         co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
     }
@@ -140,8 +131,8 @@ PrepareSsTcpSession(
     session_result->user.reset();
 
     co_return PreparedSsTcpSession{
-        .request_reader = std::move(request_reader),
-        .response_writer = std::move(response_writer_result.value()),
+        .request_reader = std::move(*request_reader),
+        .response_writer = std::move(*response_writer_result),
         .initial_payload = std::move(session_result->initial_payload),
         .user_session = std::move(*user_session),
         .uot_version = uot_version,
@@ -235,38 +226,26 @@ proxy::shadowsocks::inbound::Handler::Process(
     if (co_await proxy::CheckInboundIpBanned(limiter_, ctx)) {
         co_return proxy::RejectInbound(stats_, stream.get(), ErrorCode::BLOCKED);
     }
-    std::unique_ptr<transport::MultiBufferReader> request_reader;
-    std::unique_ptr<transport::MultiBufferWriter> response_writer;
-    InitialPayload initial_payload;
-    UserOnlineSessionGuard user_session;
-    std::optional<proxy::uot::Version> uot_version;
-    {
-        auto prepared = co_await PrepareSsTcpSession(
-            *stream,
-            cipher_info_,
-            last_matched_index_,
-            validator_,
-            limiter_,
-            ctx,
-            tag,
-            client_ip);
-        if (!prepared) {
-            co_return proxy::RejectInbound(stats_, stream.get(), prepared.error());
-        }
-        request_reader = std::move(prepared->request_reader);
-        response_writer = std::move(prepared->response_writer);
-        initial_payload = std::move(prepared->initial_payload);
-        user_session = std::move(prepared->user_session);
-        uot_version = prepared->uot_version;
+    auto prepared = co_await PrepareSsTcpSession(
+        *stream,
+        cipher_info_,
+        last_matched_index_,
+        validator_,
+        limiter_,
+        ctx,
+        tag,
+        client_ip);
+    if (!prepared) {
+        co_return proxy::RejectInbound(stats_, stream.get(), prepared.error());
     }
 
-    if (uot_version) {
+    if (prepared->uot_version) {
         co_return co_await DispatchSsUotSession(
-            *uot_version,
+            *prepared->uot_version,
             std::move(stream),
-            *request_reader,
-            *response_writer,
-            std::move(initial_payload).MoveToMultiBuffer(),
+            prepared->request_reader,
+            prepared->response_writer,
+            std::move(prepared->initial_payload).MoveToMultiBuffer(),
             dispatcher,
             receiver.dispatch_policy,
             io_context,
@@ -279,8 +258,8 @@ proxy::shadowsocks::inbound::Handler::Process(
         io_context,
         receiver.dispatch_policy,
         std::move(stream),
-        transport::Link{request_reader.get(), response_writer.get()},
-        std::move(initial_payload),
+        transport::Link{&prepared->request_reader, &prepared->response_writer},
+        std::move(prepared->initial_payload),
         ctx,
         stats_,
         timeouts);
@@ -304,8 +283,6 @@ proxy::shadowsocks::inbound::Handler::Process(
         // UDP datagrams use the socket peer address, never a PROXY protocol source.
         return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
     }
-    OPENSSL_cleanse(decoded->session_owner.bytes.data(),
-                    decoded->session_owner.bytes.size());
     const auto& user = users[decoded->user_index];
 
     InboundDatagramResult result;
@@ -336,7 +313,7 @@ proxy::shadowsocks::inbound::Handler::Process(
             }
         }
     }
-    result.user_owner = std::shared_ptr<const UserProfile>(users.users, &user.profile);
+    result.user_owner = std::shared_ptr<const UserProfile>(std::move(users.users), &user.profile);
     result.user = result.user_owner.get();
     result.limiter = limiter_;
     return result;

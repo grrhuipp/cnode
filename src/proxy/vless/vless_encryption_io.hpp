@@ -5,9 +5,7 @@
 #include "common/buf/multi_buffer.hpp"
 #include "transport/link.hpp"
 
-#include "vless_encryption_crypto.hpp"
-#include "vless_encryption_record.hpp"
-#include "vless_encryption_xor.hpp"
+#include "vless_encryption.hpp"
 #include "vless_buffered_reader.hpp"
 
 #include <array>

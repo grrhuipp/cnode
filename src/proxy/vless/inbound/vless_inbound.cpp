@@ -7,7 +7,6 @@
 #include "../vless_encryption.hpp"
 #include "../vless_encryption_io.hpp"
 #include "../vless_encryption_runtime.hpp"
-#include "../vless_ticket_service.hpp"
 #include "app/worker_mailbox.hpp"
 #include "../vless_buffered_reader.hpp"
 #include "../udp_framing.hpp"

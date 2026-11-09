@@ -8,7 +8,6 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <exception>
 #include <limits>
 #include <list>
@@ -790,13 +789,6 @@ inline void ConfigureProcessAllocator() noexcept {
     mi_option_set(mi_option_purge_delay, 10);
 #endif
     std::pmr::set_default_resource(worker_pool_resource());
-}
-
-inline void CollectSteady() noexcept {
-    ThreadMemoryPool().Purge();
-#if defined(CNODE_USE_MIMALLOC) && !defined(__SANITIZE_ADDRESS__)
-    mi_collect(false);
-#endif
 }
 
 inline void CollectBurst() noexcept {

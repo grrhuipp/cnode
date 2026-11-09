@@ -33,7 +33,7 @@ class AwaitableTaskGroup;
 
 namespace transport::internet::hysteria {
 
-class QuicListener;
+class HysteriaIngress;
 struct SocketState;
 
 // One accepted Hysteria QUIC connection: ngtcp2/nghttp3 state, connection
@@ -43,7 +43,7 @@ struct SocketState;
 class Connection final : public std::enable_shared_from_this<Connection> {
 public:
     static std::shared_ptr<Connection> Create(
-        QuicListener& listener, SocketState& socket,
+        HysteriaIngress& listener, SocketState& socket,
         const udp::endpoint& remote, const ngtcp2_pkt_hd& header);
 
     ~Connection() noexcept { Close(); }
@@ -60,10 +60,8 @@ public:
                                 : std::numeric_limits<ngtcp2_tstamp>::max());
     }
     [[nodiscard]] bool Closed() const noexcept { return closed_; }
-    [[nodiscard]] bool Retired() const noexcept { return retired_; }
     void Close() noexcept;
     [[nodiscard]] net::io_context& Reactor() const noexcept;
-    [[nodiscard]] bool Authenticated() const noexcept { return authenticated_; }
     // Physical admission starts when the connection is accepted and resolves
     // before any credential is evaluated, as on the TCP path.
     net::awaitable<void> ReservePhysicalAdmission();
@@ -78,7 +76,7 @@ public:
     void CloseUdpSession(uint32_t session_id) noexcept;
 
 private:
-    friend class QuicListener;
+    friend class HysteriaIngress;
     struct H3Request {
         memory::ThreadLocalString method;
         memory::ThreadLocalString path;
@@ -149,7 +147,7 @@ private:
     enum class PhysicalAdmission : uint8_t { Pending, Admitted, Rejected };
     enum class AdmitResult : uint8_t { Admitted, AuthFailed, Limited, DeviceLimited };
 
-    Connection(QuicListener& listener, SocketState& socket, const udp::endpoint& remote);
+    Connection(HysteriaIngress& listener, SocketState& socket, const udp::endpoint& remote);
 
     static ngtcp2_conn* GetConn(ngtcp2_crypto_conn_ref* ref) {
         return static_cast<Connection*>(ref->user_data)->core_->quic;
@@ -231,7 +229,7 @@ private:
     static int PathValidated(ngtcp2_conn*, uint32_t, const ngtcp2_path*,
         const ngtcp2_path*, ngtcp2_path_validation_result, void*);
 
-    QuicListener* listener_;
+    HysteriaIngress* listener_;
     memory::ThreadLocalVector<ConnectionId> connection_ids_;
     AwaitableTaskGroup* tasks_ = nullptr;
     SignalChannel closed_signal_;
@@ -252,7 +250,6 @@ private:
     bool authenticated_ = false;
     bool stats_open_ = false;
     bool in_ngtcp2_callback_ = false;
-    bool retired_ = false;
     bool closed_ = false;
 };
 

@@ -3,8 +3,6 @@
 
 #include "grpc_hunk.hpp"
 #include "http1_handshake.hpp"
-#include "http2_settings.hpp"
-#include "http_path_match.hpp"
 #include "xhttp_session.hpp"
 #include "../../common/awaitable_task_group.hpp"
 #include "common/allocator.hpp"
@@ -492,7 +490,7 @@ private:
     std::span<const uint8_t> payload) {
     std::optional<uint32_t> initial_window;
     for (size_t offset = 0; offset + 6 <= payload.size(); offset += 6) {
-        const uint16_t id = static_cast<uint16_t>((payload[offset] << 8) | payload[offset + 1]);
+        const uint16_t id = LoadU16BE(payload.data() + offset);
         if (id != 4) continue;
         const uint32_t value = LoadU32BE(payload.data() + offset + 2);
         if (value > H2SendWindow::kMax) return tl::unexpected(H2Error::FlowControl);
@@ -3269,7 +3267,11 @@ net::awaitable<void> Http2ServerSubStreamState::WriteBuffers(
         if (buffer.size() == 0) {
             continue;
         }
-        (void)co_await AsyncWrite(buffer);
+        const auto* data = static_cast<const uint8_t*>(buffer.data());
+        if (!co_await session->WriteGrpcMessageSerialized(
+                stream_id_, std::span<const uint8_t>(data, buffer.size()))) {
+            ThrowHttp2StreamError("gRPC server stream write failed");
+        }
     }
 }
 

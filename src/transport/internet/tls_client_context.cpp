@@ -275,20 +275,5 @@ std::unique_ptr<SslContext> SslContext::CreateClient(const TlsConfig& config) {
     return std::unique_ptr<SslContext>(new SslContext(ctx));
 }
 
-SslContext::SslContext(SSL_CTX* ctx, std::unique_ptr<ContextState> context_state) {
-    std::unique_ptr<SSL_CTX, decltype(&SSL_CTX_free)> guard(ctx, SSL_CTX_free);
-    static const int index = SSL_CTX_get_ex_new_index(
-        0, nullptr, nullptr, nullptr,
-        [](void*, void* ptr, CRYPTO_EX_DATA*, int, long, void*) {
-            delete static_cast<SharedState*>(ptr);
-        });
-    auto state = std::make_unique<SharedState>();
-    state->context = std::move(context_state);
-    if (index < 0 || SSL_CTX_set_ex_data(ctx, index, state.get()) != 1)
-        throw std::bad_alloc();
-    shared_state_ = state.release();
-    native_owner_ = std::shared_ptr<SSL_CTX>(guard.release(), SSL_CTX_free);
-}
-
 SslContext::~SslContext() = default;
 

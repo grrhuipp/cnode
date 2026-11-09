@@ -96,7 +96,7 @@ public:
                           VlessBufferedReader& reader,
                           transport::MultiBufferWriter& writer,
                           bool is_udp,
-                          TargetAddress udp_target,
+                          const TargetAddress& udp_target,
                           bool packet_addr,
                           bool vision,
                           std::array<uint8_t, 16> user_uuid)
@@ -104,7 +104,7 @@ public:
         , reader_(reader)
         , writer_(writer)
         , is_udp_(is_udp)
-        , udp_target_(std::move(udp_target))
+        , udp_target_(udp_target)
         , packet_addr_(packet_addr) {
         if (is_udp_) {
             io_state_.emplace<::vless::UdpFramer>(packet_addr);
@@ -177,7 +177,7 @@ private:
     transport::MultiBufferWriter& writer_;
     VlessResponseHeaderState response_header_;
     bool is_udp_ = false;
-    TargetAddress udp_target_;
+    const TargetAddress& udp_target_;
     bool packet_addr_ = false;
     std::variant<std::monostate, VisionIoState, ::vless::UdpFramer> io_state_;
 };
@@ -188,14 +188,13 @@ public:
     VlessMuxUdpEndpoint(AsyncStream& control,
                         VlessBufferedReader& reader,
                         transport::MultiBufferWriter& writer,
-                        TargetAddress udp_target,
-                        ForwardedMetadataView forwarded)
+                        const TargetAddress& udp_target,
+                        ForwardedMetadataView forwarded) noexcept
         : OutboundStreamEndpointBase(control)
         , reader_(reader)
         , writer_(writer)
-        , udp_target_(std::move(udp_target)) {
-        forwarded_ = ForwardedMetadata::FromView(forwarded);
-    }
+        , udp_target_(udp_target)
+        , forwarded_(forwarded) {}
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
         if (peer_ended_) {
@@ -319,8 +318,7 @@ private:
         const size_t header_len = !session_started_
             ? mux::EncodeNewHeaderTo(
                   write_frame, session_id_, mux::NetworkType::UDP,
-                  target, *payload_size, true,
-                  forwarded_ ? forwarded_->View() : ForwardedMetadataView{})
+                  target, *payload_size, true, forwarded_)
             : mux::EncodeKeepUDPHeaderTo(
                   write_frame, session_id_, target, *payload_size);
         if (header_len == 0) {
@@ -334,13 +332,13 @@ private:
         frame.AppendBuffers(payload);
         co_await writer_.WriteBuffers(frame.Span());
         session_started_ = true;
-        forwarded_.reset();
+        forwarded_ = {};
     }
 
     VlessBufferedReader& reader_;
     transport::MultiBufferWriter& writer_;
-    TargetAddress udp_target_;
-    std::optional<ForwardedMetadata> forwarded_;
+    const TargetAddress& udp_target_;
+    ForwardedMetadataView forwarded_;
     VlessResponseHeaderState response_header_;
     bool session_started_ = false;
     bool end_sent_ = false;
@@ -620,51 +618,40 @@ const bool kVlessRegistered = (::proxyman::outbound::RegisterProxy(
         if (!vnext_server) {
             return std::nullopt;
         }
+        const ::json::object& server_obj = *vnext_server ? **vnext_server : s;
+        const ::json::object* user_obj = &s;
         if (*vnext_server) {
-            const auto& server = **vnext_server;
-            const auto* user = ::proxy::ParseRequiredSingleObjectArray(
-                server, "users", "VLESS", cfg.tag);
-            if (!user) {
+            user_obj = ::proxy::ParseRequiredSingleObjectArray(
+                server_obj, "users", "VLESS", cfg.tag);
+            if (!user_obj) {
                 return std::nullopt;
             }
-            address = json_string(server, "address");
-            const auto source_port = ::ReadJsonPort(server, "port");
-            if (source_port.Invalid()) {
-                return std::nullopt;
-            }
-            if (source_port.Valid()) {
-                port = source_port.value;
-            }
-            uuid = json_string(*user, "id");
-            if (uuid.empty()) {
-                uuid = json_string(*user, "uuid");
-            }
-            encryption = json_string(*user, "encryption");
-            vless_config.flow = json_string(*user, "flow");
-            packet_encoding = json_string(*user, "packetEncoding");
+        } else if (s.if_contains("users")) {
+            LOG_ERROR("VLESS outbound '{}': users requires vnext", cfg.tag);
+            return std::nullopt;
+        }
+        address = json_string(server_obj, "address");
+        const auto source_port = ::ReadJsonPort(server_obj, "port");
+        if (source_port.Invalid()) {
+            return std::nullopt;
+        }
+        if (source_port.Valid()) {
+            port = source_port.value;
+        }
+        uuid = json_string(*user_obj, "id");
+        if (*vnext_server && uuid.empty()) {
+            uuid = json_string(*user_obj, "uuid");
+        }
+        encryption = json_string(*user_obj, "encryption");
+        vless_config.flow = json_string(*user_obj, "flow");
+        packet_encoding = json_string(*user_obj, "packetEncoding");
+        if (*vnext_server) {
             if (packet_encoding.empty()) {
                 packet_encoding = json_string(s, "packetEncoding");
             }
             if (encryption.empty()) {
                 encryption = json_string(s, "encryption");
             }
-        } else {
-            if (s.if_contains("users")) {
-                LOG_ERROR("VLESS outbound '{}': users requires vnext", cfg.tag);
-                return std::nullopt;
-            }
-            address = json_string(s, "address");
-            const auto source_port = ::ReadJsonPort(s, "port");
-            if (source_port.Invalid()) {
-                return std::nullopt;
-            }
-            if (source_port.Valid()) {
-                port = source_port.value;
-            }
-            uuid = json_string(s, "id");
-            encryption = json_string(s, "encryption");
-            vless_config.flow = json_string(s, "flow");
-            packet_encoding = json_string(s, "packetEncoding");
         }
         if (invalid_field) {
             return std::nullopt;

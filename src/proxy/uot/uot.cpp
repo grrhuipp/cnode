@@ -260,13 +260,10 @@ PacketWriter::PacketWriter(transport::MultiBufferWriter& writer,
 net::awaitable<void> PacketWriter::WritePacket(
     const TargetAddress& destination,
     std::span<const net::const_buffer> payload) {
-    size_t payload_size = 0;
-    for (const auto& buffer : payload) {
-        if (buffer.size() >
-            std::numeric_limits<uint16_t>::max() - payload_size) {
-            ThrowDecodeFailure();
-        }
-        payload_size += buffer.size();
+    const auto payload_size = buf::TrySumBufferSizes(
+        payload, std::numeric_limits<uint16_t>::max());
+    if (!payload_size) {
+        ThrowDecodeFailure();
     }
 
     std::array<uint8_t, kMaxBaseEncodedAddressSize + 2> header{};
@@ -278,7 +275,7 @@ net::awaitable<void> PacketWriter::WritePacket(
             ThrowDecodeFailure();
         }
     }
-    StoreU16BE(header.data() + header_size, static_cast<uint16_t>(payload_size));
+    StoreU16BE(header.data() + header_size, static_cast<uint16_t>(*payload_size));
     header_size += 2;
 
     ConstBufferSpanBuilder<8> buffers;

@@ -10,8 +10,7 @@
 #include "transport/internet/reality_client_version.hpp"
 #include "transport/internet/reality_key.hpp"
 #include "transport/internet/reality_short_id.hpp"
-#include "../proxy/anytls/anytls_codec.hpp"
-#include "../proxy/anytls/padding.hpp"
+#include "proxy/anytls_padding.hpp"
 
 #include <format>
 

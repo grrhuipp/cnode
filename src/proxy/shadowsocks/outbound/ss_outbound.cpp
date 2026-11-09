@@ -41,11 +41,6 @@ public:
                              const ss::KeyBytes& salt)
             : cipher_info(info), master_key(key), request_salt(salt) {}
 
-        ~PendingResponseState() noexcept {
-            OPENSSL_cleanse(master_key.bytes.data(), master_key.bytes.size());
-            OPENSSL_cleanse(request_salt.bytes.data(), request_salt.bytes.size());
-        }
-
         PendingResponseState(const PendingResponseState&) = delete;
         PendingResponseState& operator=(const PendingResponseState&) = delete;
     };
@@ -253,8 +248,6 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
             prepared_->credentials.MasterKey(),
             request_session->request_salt,
             *stream);
-        OPENSSL_cleanse(request_session->request_salt.bytes.data(),
-                        request_session->request_salt.bytes.size());
 
         if (use_uot &&
             *prepared_->config.uot_version != proxy::uot::Version::V1) {

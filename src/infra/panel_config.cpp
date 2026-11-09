@@ -2,6 +2,7 @@
 
 #include "common/domain_name.hpp"
 #include "common/ip_utils.hpp"
+#include "common/target_address.hpp"
 #include "core/naming.hpp"
 #include "infra/json_field.hpp"
 #include "infra/inbound_field_rules.hpp"
@@ -10,7 +11,6 @@
 #include "transport/internet/tls_config.hpp"
 #include "transport/internet/tls_stream.hpp"
 
-#include <charconv>
 #include <format>
 #include <limits>
 #include <optional>
@@ -22,16 +22,17 @@
 
 namespace {
 
-std::optional<uint16_t> ParsePanelHttpPort(std::string_view value) noexcept {
-    uint32_t parsed = 0;
-    const auto [end, ec] = std::from_chars(
-        value.data(), value.data() + value.size(), parsed);
-    if (value.empty() || ec != std::errc{} ||
-        end != value.data() + value.size() || parsed == 0 ||
-        parsed > std::numeric_limits<uint16_t>::max()) {
-        return std::nullopt;
+std::shared_ptr<const TlsPemMaterial> LoadValidatedPanelTlsPem(
+    std::string cert_file, std::string key_file) {
+    TlsConfig tls;
+    tls.cert_file = std::move(cert_file);
+    tls.key_file = std::move(key_file);
+    LoadTlsPemMaterial(tls);
+    if (!SslContext::CreateServer(tls)) {
+        throw std::invalid_argument(
+            "Panel TLS certificate or private key is invalid");
     }
-    return static_cast<uint16_t>(parsed);
+    return std::move(tls.pem);
 }
 
 }  // namespace
@@ -173,12 +174,8 @@ std::optional<PanelApiUrlParts> ParsePanelApiUrl(std::string_view url) {
         return std::nullopt;
     }
     uint16_t port = use_ssl ? 443 : 80;
-    if (has_explicit_port) {
-        const auto parsed_port = ParsePanelHttpPort(explicit_port);
-        if (!parsed_port) {
-            return std::nullopt;
-        }
-        port = *parsed_port;
+    if (has_explicit_port && !TargetAddress::ParsePort(explicit_port, port)) {
+        return std::nullopt;
     }
 
     const auto literal_address = iputil::ParseLiteral(host);
@@ -290,15 +287,7 @@ PanelConfig PanelConfig::FromJson(const json::object& j) {
                 "Panel TLSCert and TLSKey must be configured together");
         }
         if (!cfg.TLSCert.empty()) {
-            TlsConfig tls;
-            tls.cert_file = cfg.TLSCert;
-            tls.key_file = cfg.TLSKey;
-            LoadTlsPemMaterial(tls);
-            if (!SslContext::CreateServer(tls)) {
-                throw std::invalid_argument(
-                    "Panel TLS certificate or private key is invalid");
-            }
-            cfg.TLSPem = std::move(tls.pem);
+            cfg.TLSPem = LoadValidatedPanelTlsPem(cfg.TLSCert, cfg.TLSKey);
         }
     }
     return cfg;
@@ -368,17 +357,10 @@ bool PanelConfig::Validate() const {
             return false;
         }
         if (!TLSPem && !TLSCert.empty()) {
-            TlsConfig tls;
-            tls.cert_file = TLSCert;
-            tls.key_file = TLSKey;
             try {
-                LoadTlsPemMaterial(tls);
+                (void)LoadValidatedPanelTlsPem(TLSCert, TLSKey);
             } catch (const std::exception& e) {
                 LOG_PANEL_ERROR(log_context, "Panel TLS material is invalid: {}", e.what());
-                return false;
-            }
-            if (!SslContext::CreateServer(tls)) {
-                LOG_PANEL_ERROR(log_context, "Panel TLS certificate or private key is invalid");
                 return false;
             }
         }

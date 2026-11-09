@@ -87,7 +87,7 @@ private:
     memory::ThreadLocalString tag_;
     std::shared_ptr<const Settings> settings_;
     std::shared_ptr<PaddingState> padding_;
-    std::unique_ptr<SessionPool> pool_;
+    std::shared_ptr<SessionPool> pool_;
 };
 
 }  // namespace proxy::anytls::outbound

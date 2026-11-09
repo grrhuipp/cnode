@@ -165,16 +165,6 @@ struct PreparedTCPRequestHandshake {
     buf::MultiBuffer handshake_mb;
     std::optional<SsAeadCipher> write_cipher;
     KeyBytes request_salt;
-
-    PreparedTCPRequestHandshake() = default;
-    PreparedTCPRequestHandshake(const PreparedTCPRequestHandshake&) = delete;
-    PreparedTCPRequestHandshake& operator=(const PreparedTCPRequestHandshake&) = delete;
-    PreparedTCPRequestHandshake(PreparedTCPRequestHandshake&&) noexcept = default;
-    PreparedTCPRequestHandshake& operator=(PreparedTCPRequestHandshake&&) noexcept = default;
-
-    ~PreparedTCPRequestHandshake() noexcept {
-        OPENSSL_cleanse(request_salt.bytes.data(), request_salt.bytes.size());
-    }
 };
 
 tl::expected<PreparedTCPRequestHandshake, ErrorCode>
@@ -386,12 +376,6 @@ WriteTCPRequest2022(const TargetAddress& target,
     buf::MultiBuffer handshake_mb;
     std::optional<SsAeadCipher> write_cipher;
     KeyBytes request_salt;
-    struct CleanseRequestSalt {
-        KeyBytes& salt;
-        ~CleanseRequestSalt() noexcept {
-            OPENSSL_cleanse(salt.bytes.data(), salt.bytes.size());
-        }
-    } cleanse_request_salt{request_salt};
     {
         auto prepared = PrepareTCPRequest2022(
             target, cipher_info, master_key, psk_chain, forwarded);

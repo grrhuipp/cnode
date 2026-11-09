@@ -568,7 +568,7 @@ net::awaitable<std::unique_ptr<transport::MultiBufferWriter>> CreateTcpWriter(
         Check(request_salt.assign(key.span()), "TCP request salt fixture failed");
         auto result = ss::WriteTCPResponse(user, cipher, request_salt, stream);
         Check(bool(result), "public TCP response writer creation failed");
-        co_return std::move(*result);
+        co_return std::make_unique<ss::ResponseBodyWriter>(std::move(*result));
     }
     auto result = co_await ss::WriteTCPRequest(
         TargetAddress("1.1.1.1", 443), cipher, key, {}, stream);

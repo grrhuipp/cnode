@@ -3,7 +3,6 @@
 #include "tls_client_context.hpp"
 #include "transport/internet/reality_client_version.hpp"
 #include "transport/internet/reality_key.hpp"
-#include "transport/internet/reality_server_name.hpp"
 #include "transport/internet/reality_short_id.hpp"
 #include "transport/internet/tls_server_name.hpp"
 
@@ -109,8 +108,8 @@ using UniqueAsn1Object = std::unique_ptr<ASN1_OBJECT, Asn1ObjectDeleter>;
 using UniqueAsn1OctetString = std::unique_ptr<ASN1_OCTET_STRING, Asn1OctetStringDeleter>;
 using UniqueX509Extension = std::unique_ptr<X509_EXTENSION, X509ExtensionDeleter>;
 
-struct RealityServerState final : SslContext::ContextState {
-    ~RealityServerState() override {
+struct RealityServerState final {
+    ~RealityServerState() {
         OPENSSL_cleanse(private_key.data(), private_key.size());
         for (auto& id : short_ids) OPENSSL_cleanse(id.data(), id.size());
     }
@@ -126,7 +125,7 @@ struct RealityServerState final : SslContext::ContextState {
     std::vector<uint8_t> certificate_template;
 };
 
-struct RealityClientContextState final : SslContext::ContextState {
+struct RealityClientContextState final {
     MLDSA65_public_key mldsa65_verify_key;
 };
 
@@ -141,12 +140,18 @@ void FreeRealityServerConnState(void* /*parent*/,
 
 [[nodiscard]] int RealityStateExIndex() {
     static const int index = SSL_CTX_get_ex_new_index(
-        0, nullptr, nullptr, nullptr, nullptr);
+        0, nullptr, nullptr, nullptr,
+        [](void*, void* ptr, CRYPTO_EX_DATA*, int, long, void*) {
+            delete static_cast<RealityServerState*>(ptr);
+        });
     return index;
 }
 [[nodiscard]] int RealityClientContextStateExIndex() {
     static const int index = SSL_CTX_get_ex_new_index(
-        0, nullptr, nullptr, nullptr, nullptr);
+        0, nullptr, nullptr, nullptr,
+        [](void*, void* ptr, CRYPTO_EX_DATA*, int, long, void*) {
+            delete static_cast<RealityClientContextState*>(ptr);
+        });
     return index;
 }
 
@@ -221,12 +226,9 @@ void FreeRealityServerConnState(void* /*parent*/,
     return auth_key;
 }
 
-[[nodiscard]] std::optional<std::array<uint8_t, kRealityPlainAuthSize>>
-OpenRealitySessionId(
-    std::span<const uint8_t, 32> auth_key,
-    std::span<const uint8_t, kRealityAesGcmNonceSize> nonce,
-    std::span<const uint8_t, kRealitySessionIdSize> ciphertext,
-    std::span<const uint8_t> aad) noexcept {
+template <typename Op>
+[[nodiscard]] bool WithRealitySessionIdAead(
+    std::span<const uint8_t, 32> auth_key, Op&& op) noexcept {
     EVP_AEAD_CTX aead;
     EVP_AEAD_CTX_zero(&aead);
     struct CleanseAead {
@@ -236,19 +238,26 @@ OpenRealitySessionId(
             OPENSSL_cleanse(&ctx, sizeof(ctx));
         }
     } cleanse_aead{aead};
-    if (EVP_AEAD_CTX_init(&aead,
-                          EVP_aead_aes_256_gcm(),
-                          auth_key.data(),
-                          auth_key.size(),
-                          EVP_AEAD_DEFAULT_TAG_LENGTH,
-                          nullptr) != 1) {
-        return std::nullopt;
-    }
+    return EVP_AEAD_CTX_init(&aead,
+                             EVP_aead_aes_256_gcm(),
+                             auth_key.data(),
+                             auth_key.size(),
+                             EVP_AEAD_DEFAULT_TAG_LENGTH,
+                             nullptr) == 1 &&
+           op(aead);
+}
 
+[[nodiscard]] std::optional<std::array<uint8_t, kRealityPlainAuthSize>>
+OpenRealitySessionId(
+    std::span<const uint8_t, 32> auth_key,
+    std::span<const uint8_t, kRealityAesGcmNonceSize> nonce,
+    std::span<const uint8_t, kRealitySessionIdSize> ciphertext,
+    std::span<const uint8_t> aad) noexcept {
     std::array<uint8_t, kRealityPlainAuthSize> plain{};
     const ScopedCleanse wipe_plain{plain.data(), plain.size()};
     size_t plain_len = 0;
-    const int ok = EVP_AEAD_CTX_open(&aead,
+    if (!WithRealitySessionIdAead(auth_key, [&](EVP_AEAD_CTX& aead) noexcept {
+            return EVP_AEAD_CTX_open(&aead,
                                      plain.data(),
                                      &plain_len,
                                      plain.size(),
@@ -257,9 +266,9 @@ OpenRealitySessionId(
                                      ciphertext.data(),
                                      ciphertext.size(),
                                      aad.data(),
-                                     aad.size());
-    // CleanseAead handles cleanup and zeroing.
-    if (ok != 1 || plain_len != plain.size()) {
+                                     aad.size()) == 1 &&
+                   plain_len == plain.size();
+        })) {
         return std::nullopt;
     }
     return plain;
@@ -271,27 +280,10 @@ SealRealitySessionId(
     std::span<const uint8_t, kRealityAesGcmNonceSize> nonce,
     std::span<const uint8_t, kRealityPlainAuthSize> plain,
     std::span<const uint8_t> aad) noexcept {
-    EVP_AEAD_CTX aead;
-    EVP_AEAD_CTX_zero(&aead);
-    struct CleanseAead {
-        EVP_AEAD_CTX& ctx;
-        ~CleanseAead() noexcept {
-            EVP_AEAD_CTX_cleanup(&ctx);
-            OPENSSL_cleanse(&ctx, sizeof(ctx));
-        }
-    } cleanse_aead{aead};
-    if (EVP_AEAD_CTX_init(&aead,
-                          EVP_aead_aes_256_gcm(),
-                          auth_key.data(),
-                          auth_key.size(),
-                          EVP_AEAD_DEFAULT_TAG_LENGTH,
-                          nullptr) != 1) {
-        return std::nullopt;
-    }
-
     std::array<uint8_t, kRealitySessionIdSize> out{};
     size_t out_len = 0;
-    const int ok = EVP_AEAD_CTX_seal(&aead,
+    if (!WithRealitySessionIdAead(auth_key, [&](EVP_AEAD_CTX& aead) noexcept {
+            return EVP_AEAD_CTX_seal(&aead,
                                      out.data(),
                                      &out_len,
                                      out.size(),
@@ -300,9 +292,9 @@ SealRealitySessionId(
                                      plain.data(),
                                      plain.size(),
                                      aad.data(),
-                                     aad.size());
-    // CleanseAead handles cleanup and zeroing.
-    if (ok != 1 || out_len != out.size()) {
+                                     aad.size()) == 1 &&
+                   out_len == out.size();
+        })) {
         return std::nullopt;
     }
     return out;
@@ -737,42 +729,30 @@ VerifyRealityClientHelloHandshake(
     memory::ByteVector handshake,
     const RealityServerState& state) {
     // This is the reassembled handshake, including its four-byte header.
-    if (handshake.size() < 4 + 2 + 32 + 1 + 32 ||
-        handshake[0] != SSL3_MT_CLIENT_HELLO) {
+    ByteReader reader(handshake);
+    const uint8_t msg_type = reader.ReadU8();
+    const uint32_t hello_len = reader.ReadU24BE();
+    if (!reader.Ok() || msg_type != SSL3_MT_CLIENT_HELLO ||
+        hello_len != reader.Remaining()) {
         return nullptr;
     }
-    const size_t hello_len = LoadU24BE(handshake.data() + 1);
-    if (hello_len + 4 != handshake.size()) {
+    (void)reader.ReadU16BE();
+    const auto random = reader.ReadBytes(kRealityRandomSize);
+    if (reader.ReadU8() != kRealitySessionIdSize ||
+        !reader.Skip(kRealitySessionIdSize)) {
         return nullptr;
     }
-
-    const auto body = std::span<const uint8_t>(handshake).subspan(4);
-    const auto random = body.subspan(2, kRealityRandomSize);
-    const size_t session_id_len = body[34];
-    if (session_id_len != kRealitySessionIdSize || body.size() < 35 + session_id_len + 2) {
-        return nullptr;
-    }
-    size_t pos = 35 + kRealitySessionIdSize;
-
-    const size_t cipher_suites_len =
-        (static_cast<size_t>(body[pos]) << 8) | body[pos + 1];
-    pos += 2;
+    const uint16_t cipher_suites_len = reader.ReadU16BE();
     if (cipher_suites_len == 0 || (cipher_suites_len & 1u) != 0 ||
-        pos + cipher_suites_len + 1 > body.size()) {
+        !reader.Skip(cipher_suites_len)) {
         return nullptr;
     }
-    pos += cipher_suites_len;
-
-    const size_t comp_methods_len = body[pos++];
-    if (comp_methods_len == 0 || pos + comp_methods_len + 2 > body.size()) {
+    const uint8_t comp_methods_len = reader.ReadU8();
+    if (comp_methods_len == 0 || !reader.Skip(comp_methods_len)) {
         return nullptr;
     }
-    pos += comp_methods_len;
-
-    const size_t extensions_len =
-        (static_cast<size_t>(body[pos]) << 8) | body[pos + 1];
-    pos += 2;
-    if (pos + extensions_len != body.size()) {
+    const auto extensions_bytes = reader.ReadBytes(reader.ReadU16BE());
+    if (!reader.Ok() || !reader.Empty()) {
         return nullptr;
     }
 
@@ -783,21 +763,13 @@ VerifyRealityClientHelloHandshake(
     std::optional<std::array<uint8_t, kRealityX25519KeySize>> peer_public;
     bool supports_tls13 = false;
 
-    size_t ext_pos = pos;
-    while (ext_pos < body.size()) {
-        if (ext_pos + 4 > body.size()) {
+    ByteReader extensions(extensions_bytes);
+    while (!extensions.Empty()) {
+        const uint16_t ext_type = extensions.ReadU16BE();
+        const auto ext_data = extensions.ReadBytes(extensions.ReadU16BE());
+        if (!extensions.Ok()) {
             return nullptr;
         }
-        const uint16_t ext_type =
-            static_cast<uint16_t>((body[ext_pos] << 8) | body[ext_pos + 1]);
-        const size_t ext_len =
-            (static_cast<size_t>(body[ext_pos + 2]) << 8) | body[ext_pos + 3];
-        ext_pos += 4;
-        if (ext_pos + ext_len > body.size()) {
-            return nullptr;
-        }
-        const auto ext_data = body.subspan(ext_pos, ext_len);
-        ext_pos += ext_len;
 
         if (ext_type == TLSEXT_TYPE_server_name) {
             if (has_sni) {
@@ -825,15 +797,16 @@ VerifyRealityClientHelloHandshake(
                 return nullptr;
             }
             has_supported_versions = true;
-            if (ext_data.size() < 3 ||
-                static_cast<size_t>(ext_data[0]) + 1 != ext_data.size() ||
-                (ext_data[0] & 1u) != 0) {
+            ByteReader versions_outer(ext_data);
+            const uint8_t versions_len = versions_outer.ReadU8();
+            const auto versions_bytes = versions_outer.ReadBytes(versions_len);
+            if (!versions_outer.Ok() || !versions_outer.Empty() ||
+                versions_len == 0 || (versions_len & 1u) != 0) {
                 return nullptr;
             }
-            for (size_t i = 1; i + 1 < ext_data.size(); i += 2) {
-                const uint16_t ver =
-                    static_cast<uint16_t>((ext_data[i] << 8) | ext_data[i + 1]);
-                if (ver == TLS1_3_VERSION) {
+            ByteReader versions(versions_bytes);
+            while (!versions.Empty()) {
+                if (versions.ReadU16BE() == TLS1_3_VERSION) {
                     supports_tls13 = true;
                 }
             }
@@ -1142,18 +1115,20 @@ std::unique_ptr<SslContext> SslContext::CreateServerReality(
     SSL_CTX_set_options(ctx, SSL_OP_NO_TICKET);
     SSL_CTX_set_reality_ignore_peer_signature_algorithm_prefs(ctx, 1);
 
-    if (SSL_CTX_set_ex_data(ctx, RealityStateExIndex(), state.get()) != 1) {
+    const int state_index = RealityStateExIndex();
+    if (state_index < 0 ||
+        SSL_CTX_set_ex_data(ctx, state_index, state.get()) != 1) {
         LOG_ERROR("failed to attach REALITY server state");
         SSL_CTX_free(ctx);
         return nullptr;
     }
+    auto* raw_state = state.release();
     SSL_CTX_set_select_certificate_cb(ctx, RealitySelectCertificateCallback);
-    if (state->mldsa65_key) {
+    if (raw_state->mldsa65_key) {
         SSL_CTX_set_msg_callback(ctx, RealityServerMsgCallback);
     }
 
-    auto out = std::unique_ptr<SslContext>(
-        new SslContext(ctx, std::move(state)));
+    auto out = std::unique_ptr<SslContext>(new SslContext(ctx));
     if (!out->ConfigureServerAlpn(tls_config.alpn)) {
         LOG_ERROR("invalid REALITY server ALPN policy");
         return nullptr;
@@ -1194,9 +1169,8 @@ std::unique_ptr<SslContext> SslContext::CreateClientReality(
         return nullptr;
     }
 
-    std::unique_ptr<RealityClientContextState> state;
     if (reality.mldsa65_verify) {
-        state = std::make_unique<RealityClientContextState>();
+        auto state = std::make_unique<RealityClientContextState>();
         CBS encoded;
         CBS_init(&encoded, reality.mldsa65_verify->data(),
                  reality.mldsa65_verify->size());
@@ -1205,15 +1179,17 @@ std::unique_ptr<SslContext> SslContext::CreateClientReality(
             SSL_CTX_free(ctx);
             return nullptr;
         }
-        if (SSL_CTX_set_ex_data(
-                ctx, RealityClientContextStateExIndex(), state.get()) != 1) {
+        const int state_index = RealityClientContextStateExIndex();
+        if (state_index < 0 ||
+            SSL_CTX_set_ex_data(ctx, state_index, state.get()) != 1) {
             LOG_ERROR("failed to attach REALITY client state to TLS context");
             SSL_CTX_free(ctx);
             return nullptr;
         }
+        (void)state.release();
     }
 
-    return std::unique_ptr<SslContext>(new SslContext(ctx, std::move(state)));
+    return std::unique_ptr<SslContext>(new SslContext(ctx));
 }
 
 bool TlsStream::SetRealityClient(const RealityConfig& reality) {

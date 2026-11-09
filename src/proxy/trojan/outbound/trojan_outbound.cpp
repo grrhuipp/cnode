@@ -109,18 +109,12 @@ proxy::trojan::outbound::Handler::Process(
         co_return tl::unexpected(dialed.error());
     }
     auto stream = std::move(*dialed);
-    auto fail_abortive = [&](ErrorCode error) {
-        if (stream) {
-            stream->CloseAbortive();
-        }
-        return tl::unexpected(error);
-    };
-
     const bool is_udp = ctx.content.network == Network::UDP;
     if (auto ok = co_await SendTrojanHandshake(
             *stream, *config_, target, is_udp, timeouts.HandshakeTimeout(),
             ctx, dialer); !ok) {
-        co_return fail_abortive(ok.error());
+        stream->CloseAbortive();
+        co_return tl::unexpected(ok.error());
     }
 
     stream->SetIdleTimeout(relay_idle_timeout);
@@ -128,27 +122,17 @@ proxy::trojan::outbound::Handler::Process(
     stream->SetWriteTimeout(relay_write_timeout);
     stream->ClearPhaseDeadline();
 
-    try {
-        if (is_udp) {
-            ::trojan::UdpStreamEndpoint udp_endpoint(
-                *stream, std::move(target), transport::EofAction::WaitForPeer);
-            co_return co_await DoRelayLink(
-                dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
-                udp_endpoint, ctx, stats, relay_config, std::move(first_payload));
-        }
-
+    if (is_udp) {
+        ::trojan::UdpStreamEndpoint udp_endpoint(
+            *stream, target, transport::EofAction::WaitForPeer);
         co_return co_await DoRelayLink(
             dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
-            *stream, ctx, stats, relay_config, std::move(first_payload));
-    } catch (const IoSystemError& e) {
-        co_return fail_abortive(MapAsioError(e.code()));
-    } catch (const transport::LinkError& e) {
-        co_return fail_abortive(e.code());
-    } catch (const std::bad_alloc&) {
-        co_return fail_abortive(ErrorCode::RESOURCE_EXHAUSTED);
-    } catch (...) {
-        co_return fail_abortive(ErrorCode::INTERNAL);
+            udp_endpoint, ctx, stats, relay_config, std::move(first_payload));
     }
+
+    co_return co_await DoRelayLink(
+        dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
+        *stream, ctx, stats, relay_config, std::move(first_payload));
 }
 
 

@@ -1,4 +1,5 @@
 #include "transport/internet/proxy_protocol.hpp"
+#include "common/byte_reader.hpp"
 #include "common/ip_address.hpp"
 #include "infra/log.hpp"
 #include "common/ip_utils.hpp"
@@ -6,7 +7,6 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
-#include <cstdio>
 #include <cstring>
 #include <optional>
 #include <string_view>
@@ -172,8 +172,7 @@ ProxyProtocolResult ParseV2(const uint8_t* data, size_t len) {
         return MakeInvalid();
     }
 
-    const uint16_t extra_len =
-        static_cast<uint16_t>((data[14] << 8) | data[15]);
+    const uint16_t extra_len = LoadU16BE(data + 14);
     const size_t total = kHeaderSize + extra_len;
     if (total > kProxyHeaderMaxBytes) return MakeInvalid();
     if (len < total) return MakeIncomplete();
@@ -193,7 +192,7 @@ ProxyProtocolResult ParseV2(const uint8_t* data, size_t len) {
         if (extra_len < 12) return MakeInvalid();
         net::ip::address_v4::bytes_type bytes{addr[0], addr[1], addr[2], addr[3]};
         r.src_addr = iputil::NormalizeAddress(net::ip::address_v4(bytes));
-        r.src_port = static_cast<uint16_t>((addr[8] << 8) | addr[9]);
+        r.src_port = LoadU16BE(addr + 8);
 
     } else if (family == 0x02) {
         // IPv6：src(16) + dst(16) + src_port(2) + dst_port(2) = 36B
@@ -201,7 +200,7 @@ ProxyProtocolResult ParseV2(const uint8_t* data, size_t len) {
         net::ip::address_v6::bytes_type bytes{};
         std::copy_n(addr, bytes.size(), bytes.begin());
         r.src_addr = iputil::NormalizeAddress(net::ip::address_v6(bytes));
-        r.src_port = static_cast<uint16_t>((addr[32] << 8) | addr[33]);
+        r.src_port = LoadU16BE(addr + 32);
     }
     // UNSPEC and UNIX carry no network source: keep the real peer.
 
@@ -270,44 +269,41 @@ size_t EncodeProxyProtocolHeader(
     const uint16_t dst_port = dst.port();
 
     if (version == 1) {
-        if (src_addr.is_v4() && dst_addr.is_v4()) {
-            const iputil::AddressText src_text(src_addr);
-            const iputil::AddressText dst_text(dst_addr);
-            const auto src_view = src_text.View();
-            const auto dst_view = dst_text.View();
-            const int written = std::snprintf(
-                reinterpret_cast<char*>(out.data()),
-                out.size(),
-                "PROXY TCP4 %.*s %.*s %u %u\r\n",
-                static_cast<int>(src_view.size()), src_view.data(),
-                static_cast<int>(dst_view.size()), dst_view.data(),
-                static_cast<unsigned int>(src_port),
-                static_cast<unsigned int>(dst_port));
-            return (written > 0 && static_cast<size_t>(written) < out.size())
-                ? static_cast<size_t>(written)
-                : 0;
+        const bool is_v4 = src_addr.is_v4() && dst_addr.is_v4();
+        const auto to_text_addr = [is_v4](const net::ip::address& addr) {
+            if (is_v4 || addr.is_v6()) return addr;
+            return net::ip::address(
+                net::ip::make_address_v6(net::ip::v4_mapped, addr.to_v4()));
+        };
+        const iputil::AddressText src_text(to_text_addr(src_addr));
+        const iputil::AddressText dst_text(to_text_addr(dst_addr));
+        char* const first = reinterpret_cast<char*>(out.data());
+        char* const last = first + out.size();
+        char* ptr = first;
+        const auto append_str = [&](std::string_view sv) noexcept {
+            if (sv.size() > static_cast<size_t>(last - ptr)) return false;
+            std::memcpy(ptr, sv.data(), sv.size());
+            ptr += sv.size();
+            return true;
+        };
+        const auto append_port = [&](uint16_t port) noexcept {
+            const auto [next, ec] = std::to_chars(ptr, last, port);
+            if (ec != std::errc{}) return false;
+            ptr = next;
+            return true;
+        };
+        if (!append_str(is_v4 ? "PROXY TCP4 " : "PROXY TCP6 ") ||
+            !append_str(src_text.View()) ||
+            !append_str(" ") ||
+            !append_str(dst_text.View()) ||
+            !append_str(" ") ||
+            !append_port(src_port) ||
+            !append_str(" ") ||
+            !append_port(dst_port) ||
+            !append_str("\r\n")) {
+            return 0;
         }
-        const auto src_v6 = src_addr.is_v6()
-            ? src_addr.to_v6()
-            : net::ip::make_address_v6(net::ip::v4_mapped, src_addr.to_v4());
-        const auto dst_v6 = dst_addr.is_v6()
-            ? dst_addr.to_v6()
-            : net::ip::make_address_v6(net::ip::v4_mapped, dst_addr.to_v4());
-        const iputil::AddressText src_text(src_v6);
-        const iputil::AddressText dst_text(dst_v6);
-        const auto src_view = src_text.View();
-        const auto dst_view = dst_text.View();
-        const int written = std::snprintf(
-            reinterpret_cast<char*>(out.data()),
-            out.size(),
-            "PROXY TCP6 %.*s %.*s %u %u\r\n",
-            static_cast<int>(src_view.size()), src_view.data(),
-            static_cast<int>(dst_view.size()), dst_view.data(),
-            static_cast<unsigned int>(src_port),
-            static_cast<unsigned int>(dst_port));
-        return (written > 0 && static_cast<size_t>(written) < out.size())
-            ? static_cast<size_t>(written)
-            : 0;
+        return static_cast<size_t>(ptr - first);
     }
 
     if (version == 2) {
@@ -315,16 +311,13 @@ size_t EncodeProxyProtocolHeader(
         out[12] = 0x21;  // v2 + PROXY command
         if (src_addr.is_v4() && dst_addr.is_v4()) {
             out[13] = 0x11;  // AF_INET + STREAM
-            out[14] = 0x00;
-            out[15] = 12;
+            StoreU16BE(out.data() + 14, 12);
             const auto src_bytes = src_addr.to_v4().to_bytes();
             const auto dst_bytes = dst_addr.to_v4().to_bytes();
             std::memcpy(out.data() + 16, src_bytes.data(), 4);
             std::memcpy(out.data() + 20, dst_bytes.data(), 4);
-            out[24] = static_cast<uint8_t>(src_port >> 8);
-            out[25] = static_cast<uint8_t>(src_port & 0xff);
-            out[26] = static_cast<uint8_t>(dst_port >> 8);
-            out[27] = static_cast<uint8_t>(dst_port & 0xff);
+            StoreU16BE(out.data() + 24, src_port);
+            StoreU16BE(out.data() + 26, dst_port);
             return 28;
         }
         const auto src_v6 = src_addr.is_v6()
@@ -334,16 +327,13 @@ size_t EncodeProxyProtocolHeader(
             ? dst_addr.to_v6()
             : net::ip::make_address_v6(net::ip::v4_mapped, dst_addr.to_v4());
         out[13] = 0x21;  // AF_INET6 + STREAM
-        out[14] = 0x00;
-        out[15] = 36;
+        StoreU16BE(out.data() + 14, 36);
         const auto src_bytes = src_v6.to_bytes();
         const auto dst_bytes = dst_v6.to_bytes();
         std::memcpy(out.data() + 16, src_bytes.data(), 16);
         std::memcpy(out.data() + 32, dst_bytes.data(), 16);
-        out[48] = static_cast<uint8_t>(src_port >> 8);
-        out[49] = static_cast<uint8_t>(src_port & 0xff);
-        out[50] = static_cast<uint8_t>(dst_port >> 8);
-        out[51] = static_cast<uint8_t>(dst_port & 0xff);
+        StoreU16BE(out.data() + 48, src_port);
+        StoreU16BE(out.data() + 50, dst_port);
         return 52;
     }
 

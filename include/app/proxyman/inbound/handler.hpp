@@ -46,18 +46,12 @@ public:
     Handler& operator=(Handler&&) = delete;
 
     [[nodiscard]] std::string_view Tag() const noexcept {
-        return receiver_->inbound_tag;
+        return receiver_.inbound_tag;
     }
 
     [[nodiscard]] const inbound::ReceiverSettings& ReceiverSettings() const noexcept {
-        return *receiver_;
-    }
-
-    [[nodiscard]] const std::shared_ptr<const inbound::ReceiverSettings>&
-    SharedReceiverSettings() const noexcept {
         return receiver_;
     }
-
     net::awaitable<void> ProcessAcceptedTCP(
         net::io_context& io_context,
         routing::Dispatcher& dispatcher,
@@ -99,7 +93,7 @@ private:
         session::Context& ctx,
         const std::shared_ptr<ConnectionLimiter::Family>& family);
 
-    std::shared_ptr<const inbound::ReceiverSettings> receiver_;
+    const inbound::ReceiverSettings receiver_;
     TransportSecurity security_;
     std::unique_ptr<Inbound> proxy_;
     ConnectionLimiter& limiter_;

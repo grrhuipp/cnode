@@ -24,7 +24,6 @@
 #include <cctype>
 #include <cstdint>
 #include <format>
-#include <map>
 #include <stdexcept>
 #include <vector>
 #include <openssl/x509_vfy.h>
@@ -522,22 +521,25 @@ APIClient::ReportUserTraffic(const std::vector<::api::UserTraffic>& data) {
     const int node_id = config_.NodeID;
 
     // V2Board UniProxy push 格式: {user_id: [upload, download], ...}
-    std::map<int64_t, ::api::UserTraffic> aggregated;
+    json::object body;
     for (const auto& t : data) {
         if (t.UID <= 0 || (t.Upload <= 0 && t.Download <= 0)) {
             continue;
         }
         const int64_t up = std::max<int64_t>(0, t.Upload);
         const int64_t down = std::max<int64_t>(0, t.Download);
-        auto& entry = aggregated[t.UID];
-        entry.UID = t.UID;
-        entry.Upload = (up > INT64_MAX - entry.Upload) ? INT64_MAX : (entry.Upload + up);
-        entry.Download = (down > INT64_MAX - entry.Download) ? INT64_MAX : (entry.Download + down);
+        auto& entry = body[std::to_string(t.UID)];
+        if (!entry.is_array()) {
+            entry = json::array{up, down};
+            continue;
+        }
+        auto& pair = entry.as_array();
+        const int64_t prev_up = pair[0].as_int64();
+        const int64_t prev_down = pair[1].as_int64();
+        pair[0] = (up > INT64_MAX - prev_up) ? INT64_MAX : (prev_up + up);
+        pair[1] = (down > INT64_MAX - prev_down) ? INT64_MAX : (prev_down + down);
     }
-    json::object body;
-    for (const auto& [uid, t] : aggregated) {
-        body[std::to_string(uid)] = json::array{t.Upload, t.Download};
-    }
+    const size_t reported_users = body.size();
 
     // 路径包含 node_id 和 node_type
     std::string path = std::format("/api/v1/server/UniProxy/push?node_id={}&node_type={}",
@@ -551,7 +553,7 @@ APIClient::ReportUserTraffic(const std::vector<::api::UserTraffic>& data) {
         co_return false;
     }
 
-    LOG_PANEL_DEBUG(log_context_, "Traffic API accepted: users={} (not a billing commit acknowledgement)", aggregated.size());
+    LOG_PANEL_DEBUG(log_context_, "Traffic API accepted: users={} (not a billing commit acknowledgement)", reported_users);
     co_return true;
 }
 

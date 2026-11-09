@@ -1,8 +1,7 @@
 #include <stdexcept>
 #include <gtest/gtest.h>
 
-#include "vless_encryption_crypto.hpp"
-#include "vless_encryption_handshake.hpp"
+#include "vless_encryption.hpp"
 #include "vless_encryption_io.hpp"
 
 #include "common/error.hpp"

@@ -13,7 +13,6 @@ namespace {
 
 // AuthID (16) + sealed length (2 + 16) + connection nonce (8).
 constexpr size_t kRequestHeaderPrefixSize = 16 + 18 + 8;
-constexpr size_t kResponseHeaderSize = 38;
 
 [[nodiscard]] bool IsSupportedSecurity(Security security) noexcept {
     switch (security) {
@@ -171,91 +170,32 @@ bool BuildResponseHeader(const VMessRequest& request,
                             payload, sizeof(payload), out.data() + 18, out.data() + 22);
 }
 
-class RequestBodyReader final
-    : public memory::ThreadAllocated
-    , public transport::MultiBufferReader {
-public:
-    transport::CancellationSource& Cancellation() noexcept override { return stream_.Cancellation(); }
-    transport::EofAction ReadEofAction() const noexcept override {
-        return is_udp_ ? transport::EofAction::WaitForPeer : stream_.ReadEofAction();
-    }
-
-    RequestBodyReader(const VMessRequest& request,
-                      AsyncStream& stream)
-        : decoder_(RequestBodyOptions(request), RequestBodyKey(request), RequestBodyKey(request))
-        , stream_(stream)
-        , is_udp_(request.command == Command::UDP)
-        , udp_target_(request.target) {}
-
-    RequestBodyReader(const RequestBodyReader&) = delete;
-    RequestBodyReader& operator=(const RequestBodyReader&) = delete;
-
-    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
-        if (!is_udp_) {
-            return decoder_.Read(stream_);
-        }
-        return ReadUdpMultiBuffer();
-    }
-
-private:
-    net::awaitable<buf::MultiBuffer> ReadUdpMultiBuffer() {
-        auto mb = co_await decoder_.Read(stream_);
-        if (mb.byte_size() != 0 && !buf::SetUdpTarget(mb, udp_target_)) {
-            throw std::bad_alloc();
-        }
-        co_return mb;
-    }
-
-    BodyDecoder decoder_;
-    AsyncStream& stream_;
-    bool is_udp_ = false;
-    TargetAddress udp_target_;
-};
-
-// The response header is coalesced into the first body write.
-class ResponseBodyWriter final
-    : public memory::ThreadAllocated
-    , public transport::MultiBufferWriter {
-public:
-    ResponseBodyWriter(const VMessRequest& request,
-                       const BodyKey& response,
-                       AsyncStream& stream,
-                       const std::array<uint8_t, kResponseHeaderSize>& response_header)
-        : encoder_(RequestBodyOptions(request), RequestBodyKey(request), response)
-        , stream_(stream)
-        , udp_target_(request.target)
-        , response_header_(response_header) {}
-
-    ResponseBodyWriter(const ResponseBodyWriter&) = delete;
-    ResponseBodyWriter& operator=(const ResponseBodyWriter&) = delete;
-
-    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
-        return encoder_.WriteMultiBuffer(
-            stream_, std::move(mb), "VMess response write cancelled before start",
-            response_header_, &header_sent_, &udp_target_);
-    }
-
-    net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
-        return encoder_.WriteBuffers(
-            stream_, buffers, "VMess response write cancelled before start",
-            response_header_, &header_sent_);
-    }
-
-    net::awaitable<void> AsyncShutdownWrite() override {
-        return encoder_.WriteEOF(
-            stream_, "VMess response EOF cancelled before start",
-            response_header_, &header_sent_);
-    }
-
-private:
-    BodyEncoder encoder_;
-    AsyncStream& stream_;
-    TargetAddress udp_target_;
-    std::array<uint8_t, kResponseHeaderSize> response_header_;
-    bool header_sent_ = false;
-};
-
 }  // namespace
+
+RequestBodyReader::RequestBodyReader(const VMessRequest& request,
+                                     AsyncStream& stream)
+    : decoder_(RequestBodyOptions(request), RequestBodyKey(request), RequestBodyKey(request))
+    , stream_(&stream)
+    , is_udp_(request.command == Command::UDP)
+    , udp_target_(is_udp_ ? request.target : TargetAddress{}) {}
+
+net::awaitable<buf::MultiBuffer> RequestBodyReader::ReadUdpMultiBuffer() {
+    auto mb = co_await decoder_.Read(*stream_);
+    if (mb.byte_size() != 0 && !buf::SetUdpTarget(mb, udp_target_)) {
+        throw std::bad_alloc();
+    }
+    co_return mb;
+}
+
+ResponseBodyWriter::ResponseBodyWriter(
+    const VMessRequest& request,
+    const BodyKey& response,
+    AsyncStream& stream,
+    const std::array<uint8_t, kResponseHeaderSize>& response_header)
+    : encoder_(RequestBodyOptions(request), RequestBodyKey(request), response)
+    , stream_(&stream)
+    , udp_target_(request.command == Command::UDP ? request.target : TargetAddress{})
+    , response_header_(response_header) {}
 
 ServerSession::ServerSession(std::string_view tag)
     : tag_(tag) {}
@@ -320,33 +260,33 @@ void ServerSession::SetRequest(VMessRequest request) {
     request_set_ = true;
 }
 
-std::unique_ptr<transport::MultiBufferReader> ServerSession::DecodeRequestBody(
+std::optional<RequestBodyReader> ServerSession::DecodeRequestBody(
     AsyncStream& stream) {
     if (!request_set_) {
-        return nullptr;
+        return std::nullopt;
     }
     try {
-        return std::make_unique<RequestBodyReader>(request_, stream);
+        return std::optional<RequestBodyReader>(std::in_place, request_, stream);
     } catch (...) {
-        return nullptr;
+        return std::nullopt;
     }
 }
 
-std::unique_ptr<transport::MultiBufferWriter> ServerSession::EncodeResponseBodyWithHeader(
+std::optional<ResponseBodyWriter> ServerSession::EncodeResponseBodyWithHeader(
     AsyncStream& stream) {
     if (!request_set_) {
-        return nullptr;
+        return std::nullopt;
     }
     try {
         const BodyKey response = ResponseBodyKey(RequestBodyKey(request_));
         std::array<uint8_t, kResponseHeaderSize> response_header{};
         if (!BuildResponseHeader(request_, response, response_header)) {
-            return nullptr;
+            return std::nullopt;
         }
-        return std::make_unique<ResponseBodyWriter>(
-            request_, response, stream, response_header);
+        return std::optional<ResponseBodyWriter>(
+            std::in_place, request_, response, stream, response_header);
     } catch (...) {
-        return nullptr;
+        return std::nullopt;
     }
 }
 

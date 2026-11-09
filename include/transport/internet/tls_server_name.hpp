@@ -1,11 +1,13 @@
 #pragma once
 
 #include "common/byte_reader.hpp"
+#include "common/domain_name.hpp"
 
 #include <algorithm>
 #include <bitset>
 #include <cstdint>
 #include <span>
+#include <string>
 #include <string_view>
 #include <tl/expected.hpp>
 
@@ -46,6 +48,14 @@ ParseTlsServerNameExtension(std::span<const uint8_t> extension) noexcept {
         return tl::unexpected(TlsServerNameExtensionError::InvalidFormat);
     }
     return host_name;
+}
+
+[[nodiscard]] inline bool IsRealityServerNameAllowed(
+    std::span<const std::string> allowed,
+    std::string_view requested) noexcept {
+    return std::ranges::any_of(allowed, [requested](const std::string& name) {
+        return domain::DnsHostnamesEqual(name, requested);
+    });
 }
 
 }  // namespace transport::internet

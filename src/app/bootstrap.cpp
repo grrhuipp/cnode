@@ -287,9 +287,13 @@ uint32_t ComputePressureThreshold(const WorkerRuntimeConfig& config) {
     if (configured_max > 0) {
         effective_max = std::min(effective_max, configured_max);
     }
+    if (effective_max == 0) {
+        return 0;
+    }
+    const uint32_t per_worker_max = effective_max / workers;
     return std::max<uint32_t>(
         1, static_cast<uint32_t>(
-               static_cast<uint64_t>(effective_max) * defaults::kPressurePercent / 100));
+               static_cast<uint64_t>(per_worker_max) * defaults::kPressurePercent / 100));
 }
 
 uint32_t ComputePressureIdleTimeout(const WorkerRuntimeConfig& config) {

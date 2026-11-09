@@ -2,6 +2,7 @@
 
 #include "common/asio_types.hpp"
 #include "common/buf/multi_buffer.hpp"
+#include "common/byte_reader.hpp"
 
 #include <array>
 #include <cstring>
@@ -85,9 +86,15 @@ public:
         if (state_ == State::Failed) return PopResult::Invalid;
         if (state_ == State::Finished) return PopResult::Finished;
         if (pending_.byte_size() < 2) return PopResult::NeedMore;
-        std::array<uint8_t, 2> length{};
-        (void)pending_.CopyPrefixTo(length);
-        const size_t bytes = (static_cast<size_t>(length[0]) << 8) | length[1];
+        const auto front = pending_.FrontSpan();
+        size_t bytes = 0;
+        if (front.size() >= 2) {
+            bytes = LoadU16BE(front.data());
+        } else {
+            std::array<uint8_t, 2> length{};
+            (void)pending_.CopyPrefixTo(length);
+            bytes = LoadU16BE(length.data());
+        }
         if (pending_.byte_size() < bytes + 2) return PopResult::NeedMore;
         (void)pending_.DropPrefixBytes(2);
         if (!pending_.MovePrefixTo(payload, bytes)) {

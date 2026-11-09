@@ -1,7 +1,6 @@
 #include "http1_handshake.hpp"
 #include "common/binary_text_codec.hpp"
 
-#include "http_path_match.hpp"
 #include "common/allocator.hpp"
 #include "common/buffer_util.hpp"
 #include "infra/log.hpp"

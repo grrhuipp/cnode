@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "config_semantics.hpp"
+#include "infra/config.hpp"
 #include "core/naming.hpp"
 
 #include <vector>

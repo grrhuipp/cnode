@@ -7,10 +7,11 @@
 // notices release quotas without blocking. Reporting reads domain-local leases.
 // ============================================================================
 
-#include "common/online_device.hpp"
 #include "common/allocator.hpp"
 #include "common/asio_types.hpp"
+#include "common/string_hash.hpp"
 
+#include <compare>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -20,14 +21,23 @@
 #include <utility>
 #include <vector>
 
+struct OnlineDevice {
+    int64_t user_id = 0;
+    std::string ip;
+
+    OnlineDevice() = default;
+    OnlineDevice(int64_t user_id_value, std::string ip_value)
+        : user_id(user_id_value), ip(std::move(ip_value)) {}
+
+    friend auto operator<=>(const OnlineDevice&, const OnlineDevice&) = default;
+};
 
 class UserOnlineSessionGuard;
 
 class UserOnlineTracker {
 public:
-    UserOnlineTracker();
-    ~UserOnlineTracker();
-
+    UserOnlineTracker() = default;
+    ~UserOnlineTracker() = default;
     // UserOnlineSessionGuard 借用本对象地址：禁止拷贝，且不声明移动。
     UserOnlineTracker(const UserOnlineTracker&) = delete;
     UserOnlineTracker& operator=(const UserOnlineTracker&) = delete;
@@ -52,8 +62,19 @@ public:
 private:
     friend class UserOnlineSessionGuard;
     struct DeviceReservation;
-    struct Impl;
-    std::unique_ptr<Impl> impl_;
+    using DeviceIpMap =
+        memory::ThreadLocalUnorderedMap<memory::ThreadLocalString,
+                                        uint32_t,
+                                        TransparentStringHash,
+                                        TransparentStringEq>;
+    using UserDeviceMap = memory::ThreadLocalUnorderedMap<uint64_t, DeviceIpMap>;
+    using TagDeviceMap =
+        memory::ThreadLocalUnorderedMap<memory::ThreadLocalString,
+                                        UserDeviceMap,
+                                        TransparentStringHash,
+                                        TransparentStringEq>;
+
+    TagDeviceMap devices_;
 };
 
 class UserOnlineSessionGuard {

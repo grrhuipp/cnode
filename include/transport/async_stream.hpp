@@ -19,7 +19,6 @@
 
 
 class TcpStream;
-class BaseWsStream;  // 允许 WS 包装链透传底层 TCP 能力
 
 // ============================================================================
 // AsyncStream - 异步流抽象接口
@@ -228,7 +227,6 @@ protected:
     }
     // 仅 transport/internet 包装链和 AsyncStream 自身能力方法使用。
     // 不能作为 app/proxy/relay 公开逃逸到 TcpStream 的入口。
-    friend class BaseWsStream;
     static TcpStream* BaseTcpStreamOf(AsyncStream& stream) {
         return stream.BaseTcpStream();
     }

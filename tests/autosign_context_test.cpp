@@ -1,7 +1,6 @@
 #include <gtest/gtest.h>
 
 #include "autosign_cert.hpp"
-#include "autosign_context.hpp"
 
 #include <openssl/ssl.h>
 #include <openssl/x509.h>

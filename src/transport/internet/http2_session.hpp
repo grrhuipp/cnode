@@ -2,6 +2,7 @@
 
 #include "transport/internet/transport_stack.hpp"
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <string_view>
@@ -10,6 +11,18 @@ namespace transport::internet {
 
 inline constexpr std::string_view kHttp2ClientPreface =
     "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+[[nodiscard]] constexpr std::array<uint8_t, 6> EncodeInitialWindowSetting(
+    uint32_t value) noexcept {
+    return {{
+        0,
+        4,  // SETTINGS_INITIAL_WINDOW_SIZE
+        static_cast<uint8_t>(value >> 24),
+        static_cast<uint8_t>(value >> 16),
+        static_cast<uint8_t>(value >> 8),
+        static_cast<uint8_t>(value),
+    }};
+}
 // Server receive policy (RFC 9113 5.2, 6.1, 6.9):
 // - Body credit returns on logical consumption, not DATA arrival; padding and
 //   discarded/reset bodies return connection credit without reopening streams.

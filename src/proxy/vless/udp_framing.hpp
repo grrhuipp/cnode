@@ -68,11 +68,11 @@ class UdpStreamEndpoint final
 public:
     UdpStreamEndpoint(transport::MultiBufferReader& src,
                       transport::MultiBufferWriter& dst,
-                      TargetAddress target,
-                      bool packet_addr) noexcept
+                      const TargetAddress& target,
+                      bool packet_addr)
         : src_(src)
         , dst_(dst)
-        , target_(std::move(target))
+        , target_(packet_addr ? TargetAddress{} : target)
         , framer_(packet_addr)
         , packet_addr_(packet_addr) {}
 

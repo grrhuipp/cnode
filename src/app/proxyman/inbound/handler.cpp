@@ -190,8 +190,8 @@ private:
 
 Handler::Handler(inbound::ReceiverSettings receiver, std::unique_ptr<Inbound> proxy,
                  ConnectionLimiter& limiter)
-    : receiver_(std::make_shared<const inbound::ReceiverSettings>(std::move(receiver)))
-    , security_(receiver_->stream_settings, StreamEndpointRole::Inbound)
+    : receiver_(std::move(receiver))
+    , security_(receiver_.stream_settings, StreamEndpointRole::Inbound)
     , proxy_(std::move(proxy))
     , limiter_(limiter) {}
 
@@ -222,7 +222,7 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
     std::unique_ptr<AsyncStream> stream,
     session::Context& ctx,
     const std::shared_ptr<ConnectionLimiter::Family>& family) {
-    const inbound::ReceiverSettings& listener = *receiver_;
+    const inbound::ReceiverSettings& listener = receiver_;
     ConnectionStatsScope connection_stats(stats);
 
     ctx.inbound.accounting_key.assign(listener.accounting_key);
@@ -265,7 +265,7 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
     std::unique_ptr<AsyncStream> raw_conn,
     session::Context& ctx,
     app::dns::DNS* dns_service) {
-    const inbound::ReceiverSettings& listener = *receiver_;
+    const inbound::ReceiverSettings& listener = receiver_;
     ConnectionStatsScope connection_stats(stats);
 
     ctx.inbound.accounting_key.assign(listener.accounting_key);

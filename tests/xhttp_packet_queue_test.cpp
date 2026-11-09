@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "xhttp_packet_queue.hpp"
+#include "xhttp_session.hpp"
 
 #include <algorithm>
 #include <cstdlib>

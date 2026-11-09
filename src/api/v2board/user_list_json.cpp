@@ -34,15 +34,6 @@ tl::expected<uint64_t, std::string> ParseOptionalLimit(
     return *limit;
 }
 
-bool ContainsControlCharacter(std::string_view value) noexcept {
-    for (const unsigned char ch : value) {
-        if (ch < 0x20 || ch == 0x7f) {
-            return true;
-        }
-    }
-    return false;
-}
-
 tl::expected<std::string, std::string> ParseOptionalString(
     const json::object& source,
     std::string_view field,

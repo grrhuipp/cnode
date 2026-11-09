@@ -60,169 +60,134 @@ net::awaitable<tl::expected<void, ErrorCode>> ReadStreamPayload(
             proxy::ClassifyHandshakeReadException(stream, error));
     }
 }
-class ResponseBodyWriter final
-    : public memory::ThreadAllocated
-    , public transport::MultiBufferWriter {
-public:
-    ResponseBodyWriter(const proxyman::inbound::UserStore::ShadowsocksCredential& user,
-                       const SsCipherInfo& cipher_info,
-                       const KeyBytes& request_salt,
-                       AsyncStream& stream)
-        : cipher_type_(cipher_info.type)
-        , key_size_(cipher_info.key_size)
-        , salt_size_(cipher_info.salt_size)
-        , request_salt_(request_salt)
-        , is_2022_(Is2022Cipher(cipher_info.type)) {
-        if (user.derived_key.size <= master_key_.size()) {
-            std::memcpy(master_key_.data(), user.derived_key.data(), user.derived_key.size);
-        } else {
-            key_size_ = 0;
+struct FirstChunk {
+    std::span<const uint8_t> direct;
+    memory::ByteVector storage;
+
+    [[nodiscard]] std::span<const uint8_t> Bytes() const noexcept {
+        if (!storage.empty()) {
+            return std::span<const uint8_t>(storage.data(), storage.size());
         }
-        stream_ = &stream;
+        return direct;
     }
-    ~ResponseBodyWriter() override {
-        ClearHandshakeKeys();
-    }
+};
 
-    ResponseBodyWriter(const ResponseBodyWriter&) = delete;
-    ResponseBodyWriter& operator=(const ResponseBodyWriter&) = delete;
-    ResponseBodyWriter(ResponseBodyWriter&&) = delete;
-    ResponseBodyWriter& operator=(ResponseBodyWriter&&) = delete;
-    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
-        co_await WriteEncrypted(mb, true);
-    }
+[[nodiscard]] std::span<const uint8_t> ChunkBytes(const buf::Buffer* buffer) noexcept {
+    return buffer ? buffer->Bytes() : std::span<const uint8_t>{};
+}
 
-    net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
-        co_await WriteEncrypted(buffers, false);
-    }
+[[nodiscard]] std::span<const uint8_t> ChunkBytes(const net::const_buffer& buffer) noexcept {
+    const auto* data = static_cast<const uint8_t*>(buffer.data());
+    return data ? std::span<const uint8_t>(data, buffer.size()) : std::span<const uint8_t>{};
+}
 
-    net::awaitable<void> AsyncShutdownWrite() override {
-        if (!stream_) {
-            throw IoSystemError(io_error::not_connected, "Shadowsocks response writer has no stream");
-        }
-        if (write_finished_) co_return;
-        const auto cancellation = co_await net::this_coro::cancellation_state;
-        if (cancellation.cancelled() != net::cancellation_type::none) {
-            throw IoSystemError(io_error::operation_aborted);
-        }
-        const uint64_t initial_nonce = write_nonce_;
-        bool shutdown_started = false;
-        try {
-            if (!write_init_) {
-                const bool ok = is_2022_
-                    ? InitResponseCipher2022(*this, {})
-                    : InitResponseCipher(*this);
-                if (!ok) {
-                    ThrowSsWriteError("Shadowsocks server init write cipher failed");
-                }
-                co_await FlushPendingAndWrite(*stream_, {});
-            }
-            shutdown_started = true;
-            co_await stream_->AsyncShutdownWrite();
-            Finish();
-        } catch (const transport::WriteClosed&) {
-            Finish();
-            throw;
-        } catch (const std::bad_alloc&) {
-            if (write_nonce_ != initial_nonce || shutdown_started) Retire();
-            throw;
-        } catch (...) {
-            Retire();
-            throw;
-        }
-    }
-
-    bool WriteShutdownClosesLink() const noexcept override {
-        return stream_ && stream_->WriteShutdownClosesLink();
-    }
-
-private:
-    void ClearHandshakeKeys() noexcept {
-        OPENSSL_cleanse(master_key_.data(), master_key_.size());
-        OPENSSL_cleanse(request_salt_.bytes.data(), request_salt_.bytes.size());
-        request_salt_.size = 0;
-    }
-
-    void Finish() {
-        write_finished_ = true;
-        write_cipher_.reset();
-        pending_prefix_.clear();
-        ClearHandshakeKeys();
-    }
-
-    void Retire() {
-        auto* stream = std::exchange(stream_, nullptr);
-        write_cipher_.reset();
-        pending_prefix_.clear();
-        ClearHandshakeKeys();
-        if (stream) stream->CloseAbortive();
-    }
-
-    struct FirstChunk {
-        std::span<const uint8_t> direct;
-        memory::ByteVector storage;
-
-        [[nodiscard]] std::span<const uint8_t> Bytes() const noexcept {
-            if (!storage.empty()) {
-                return std::span<const uint8_t>(storage.data(), storage.size());
-            }
-            return direct;
-        }
-    };
-
-    [[nodiscard]] static std::span<const uint8_t> ChunkBytes(const buf::Buffer* buffer) noexcept {
-        return buffer ? buffer->Bytes() : std::span<const uint8_t>{};
-    }
-
-    [[nodiscard]] static std::span<const uint8_t> ChunkBytes(const net::const_buffer& buffer) noexcept {
-        const auto* data = static_cast<const uint8_t*>(buffer.data());
-        return data ? std::span<const uint8_t>(data, buffer.size()) : std::span<const uint8_t>{};
-    }
-
-    template <typename BufferRange>
-    FirstChunk FirstChunkView(const BufferRange& buffers) const {
-        FirstChunk first;
-        size_t want = 0;
-        for (const auto& buffer : buffers) {
-            want += ChunkBytes(buffer).size();
-            if (want >= kStreamChunkPayloadSize) {
-                want = kStreamChunkPayloadSize;
-                break;
-            }
-        }
-        if (want == 0) {
-            return first;
-        }
-
-        for (const auto& buffer : buffers) {
-            const auto bytes = ChunkBytes(buffer);
-            if (bytes.empty()) {
-                continue;
-            }
-            if (bytes.size() >= want) {
-                first.direct = bytes.first(want);
-                return first;
-            }
+template <typename BufferRange>
+FirstChunk FirstChunkView(const BufferRange& buffers) {
+    FirstChunk first;
+    size_t want = 0;
+    for (const auto& buffer : buffers) {
+        want += ChunkBytes(buffer).size();
+        if (want >= kStreamChunkPayloadSize) {
+            want = kStreamChunkPayloadSize;
             break;
         }
-
-        first.storage.reserve(want);
-        for (const auto& buffer : buffers) {
-            const auto bytes = ChunkBytes(buffer);
-            if (bytes.empty() || first.storage.size() >= want) {
-                continue;
-            }
-            const size_t n = std::min(bytes.size(), want - first.storage.size());
-            first.storage.insert(
-                first.storage.end(),
-                bytes.data(),
-                bytes.data() + static_cast<std::ptrdiff_t>(n));
-        }
+    }
+    if (want == 0) {
         return first;
     }
 
-    template <typename BufferRange>
-    net::awaitable<void> WriteEncrypted(BufferRange& buffers, bool clear_after_encrypt) {
+    for (const auto& buffer : buffers) {
+        const auto bytes = ChunkBytes(buffer);
+        if (bytes.empty()) {
+            continue;
+        }
+        if (bytes.size() >= want) {
+            first.direct = bytes.first(want);
+            return first;
+        }
+        break;
+    }
+
+    first.storage.reserve(want);
+    for (const auto& buffer : buffers) {
+        const auto bytes = ChunkBytes(buffer);
+        if (bytes.empty() || first.storage.size() >= want) {
+            continue;
+        }
+        const size_t n = std::min(bytes.size(), want - first.storage.size());
+        first.storage.insert(
+            first.storage.end(),
+            bytes.data(),
+            bytes.data() + static_cast<std::ptrdiff_t>(n));
+    }
+    return first;
+}
+
+}  // namespace
+
+net::awaitable<void> ResponseBodyWriter::WriteMultiBuffer(buf::MultiBuffer mb) {
+    co_await WriteEncrypted(mb, true);
+}
+
+net::awaitable<void> ResponseBodyWriter::WriteBuffers(
+    std::span<const net::const_buffer> buffers) {
+    co_await WriteEncrypted(buffers, false);
+}
+
+net::awaitable<void> ResponseBodyWriter::AsyncShutdownWrite() {
+    if (!stream_) {
+        throw IoSystemError(io_error::not_connected, "Shadowsocks response writer has no stream");
+    }
+    if (write_finished_) co_return;
+    const auto cancellation = co_await net::this_coro::cancellation_state;
+    if (cancellation.cancelled() != net::cancellation_type::none) {
+        throw IoSystemError(io_error::operation_aborted);
+    }
+    const uint64_t initial_nonce = write_nonce_;
+    bool shutdown_started = false;
+    try {
+        if (!write_init_) {
+            const bool ok = is_2022_
+                ? InitResponseCipher2022(*this, {})
+                : InitResponseCipher(*this);
+            if (!ok) {
+                ThrowSsWriteError("Shadowsocks server init write cipher failed");
+            }
+            co_await FlushPendingAndWrite(*stream_, {});
+        }
+        shutdown_started = true;
+        co_await stream_->AsyncShutdownWrite();
+        Finish();
+    } catch (const transport::WriteClosed&) {
+        Finish();
+        throw;
+    } catch (const std::bad_alloc&) {
+        if (write_nonce_ != initial_nonce || shutdown_started) Retire();
+        throw;
+    } catch (...) {
+        Retire();
+        throw;
+    }
+}
+
+void ResponseBodyWriter::Finish() {
+    write_finished_ = true;
+    write_cipher_.reset();
+    pending_prefix_.clear();
+    ClearHandshakeKeys();
+}
+
+void ResponseBodyWriter::Retire() {
+    auto* stream = std::exchange(stream_, nullptr);
+    write_cipher_.reset();
+    pending_prefix_.clear();
+    ClearHandshakeKeys();
+    if (stream) stream->CloseAbortive();
+}
+
+template <typename BufferRange>
+net::awaitable<void> ResponseBodyWriter::WriteEncrypted(
+    BufferRange& buffers, bool clear_after_encrypt) {
         if (!stream_) {
             throw IoSystemError(io_error::not_connected, "Shadowsocks response writer has no stream");
         }
@@ -290,9 +255,9 @@ private:
         }
     }
 
-    net::awaitable<void> FlushPendingAndWrite(
-        AsyncStream& stream,
-        buf::MultiBuffer out_mb) {
+net::awaitable<void> ResponseBodyWriter::FlushPendingAndWrite(
+    AsyncStream& stream,
+    buf::MultiBuffer out_mb) {
         if (out_mb.byte_size() == 0 && pending_prefix_.byte_size() == 0) {
             co_return;
         }
@@ -315,7 +280,7 @@ private:
 
     // Synchronous key setup; the salt and header are staged in pending_prefix_
     // and sent with the first response write.
-    static bool InitResponseCipher(ResponseBodyWriter& state) {
+bool ResponseBodyWriter::InitResponseCipher(ResponseBodyWriter& state) {
         if (state.salt_size_ > 64 || state.key_size_ > 64) {
             return false;
         }
@@ -355,9 +320,9 @@ private:
         return true;
     }
 
-    static bool InitResponseCipher2022(
-        ResponseBodyWriter& state,
-        std::span<const uint8_t> first_payload) {
+bool ResponseBodyWriter::InitResponseCipher2022(
+    ResponseBodyWriter& state,
+    std::span<const uint8_t> first_payload) {
         if (state.salt_size_ > KeyBytes::kMaxSize ||
             state.key_size_ > KeyBytes::kMaxSize ||
             state.request_salt_.size != state.salt_size_ ||
@@ -445,22 +410,7 @@ private:
         state.write_init_ = true;
         return true;
     }
-
-    SsCipherType cipher_type_;
-    size_t key_size_;
-    size_t salt_size_;
-    std::array<uint8_t, 32> master_key_{};
-    KeyBytes request_salt_;
-    std::optional<SsAeadCipher> write_cipher_;
-    buf::MultiBuffer pending_prefix_;
-    uint64_t write_nonce_ = 0;
-    bool write_init_ = false;
-    bool write_finished_ = false;
-    bool is_2022_ = false;
-    size_t skip_first_bytes_ = 0;
-    AsyncStream* stream_ = nullptr;
-};
-
+namespace {
 bool DecryptIdentityHeader(
     const proxyman::inbound::PreparedKeyBytes& identity_key,
     const SsCipherInfo& cipher_info,
@@ -671,7 +621,7 @@ net::awaitable<tl::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession2022
     variable_mb.ReleaseIfIdle();
     result.initial_payload = InitialPayload(std::move(variable_mb));
 
-    result.body_reader = std::make_unique<detail::BodyReader>(
+    result.body_reader.emplace(
         std::move(read_cipher), 2, stream, kSs2022MaxChunkPayload);
     co_return result;
     } catch (const std::bad_alloc&) {
@@ -712,7 +662,6 @@ net::awaitable<tl::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession(
         !read_res) {
         co_return tl::unexpected(read_res.error());
     }
-    result.request_salt.assign(std::span<const uint8_t>(salt.data(), salt_size));
     std::array<uint8_t, 2 + SsAeadCipher::kTagSize> enc_len{};
     if (auto read_res = co_await ReadFull(stream, enc_len.data(), enc_len.size());
         !read_res) {
@@ -805,7 +754,7 @@ net::awaitable<tl::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession(
     payload_mb.ReleaseIfIdle();
     result.initial_payload = InitialPayload(std::move(payload_mb));
 
-    result.body_reader = std::make_unique<detail::BodyReader>(
+    result.body_reader.emplace(
         std::move(read_cipher), read_nonce, stream);
     co_return result;
     } catch (const std::bad_alloc&) {
@@ -816,13 +765,13 @@ net::awaitable<tl::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession(
     }
 }
 
-tl::expected<std::unique_ptr<transport::MultiBufferWriter>, ErrorCode> WriteTCPResponse(
+tl::expected<ResponseBodyWriter, ErrorCode> WriteTCPResponse(
     const proxyman::inbound::UserStore::ShadowsocksCredential& user,
     const SsCipherInfo& cipher_info,
     const KeyBytes& request_salt,
     AsyncStream& stream) {
     try {
-        return std::make_unique<ResponseBodyWriter>(user, cipher_info, request_salt, stream);
+        return ResponseBodyWriter(user, cipher_info, request_salt, stream);
     } catch (...) {
         return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
     }

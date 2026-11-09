@@ -66,12 +66,11 @@ struct MuxReply {
     bool is_error = false;   // END carries OptionError (child refused)
     bool dispatch_done = false;
     bool is_udp = false;     // true → EncodeKeepUDP（带源地址）
-    TargetAddress udp_src;   // UDP 源地址（is_udp == true 时有效）
+    std::optional<TargetAddress> udp_src;   // UDP 源地址（is_udp == true 时有效）
     buf::MultiBuffer payload;
-    size_t payload_size = 0;
 
     [[nodiscard]] size_t PayloadSize() const noexcept {
-        return payload_size;
+        return payload.byte_size();
     }
 };
 
@@ -577,7 +576,6 @@ public:
             reply.session_id = session_id_;
             reply.is_end = false;
             reply.is_udp = false;
-            reply.payload_size = chunk_size;
             if (mb.byte_size() == chunk_size) {
                 reply.payload = std::move(mb);
             } else if (!mb.MovePrefixTo(reply.payload, chunk_size)) {
@@ -752,7 +750,6 @@ public:
         reply.is_end = false;
         reply.is_udp = true;
         reply.udp_src = *datagram.target;
-        reply.payload_size = datagram.payload_size;
         mb.MoveTo(reply.payload, true);
         reply_queue_.PushUdpPrepared(
             std::move(reply), datagram.payload_size + kMuxReplyOverhead);
@@ -858,7 +855,6 @@ net::awaitable<RelayResult> ProcessInbound(
 
     // 帧累积缓冲区（处理粘包）：持有从流读取的 Buffer，解析前短暂 flatten。
     buf::MultiBuffer frame_buf;
-    size_t frame_buf_bytes = 0;
 
     parent_ctx.traffic.bytes_up = 0;
     parent_ctx.traffic.bytes_down = 0;
@@ -958,12 +954,12 @@ net::awaitable<RelayResult> ProcessInbound(
                     header_len = mux::EncodeKeepUDPHeaderTo(
                         write_frame,
                         reply.session_id,
-                        reply.udp_src,
+                        *reply.udp_src,
                         payload_size);
                     if (header_len == 0) {
                         LOG_CONN_DEBUG(parent_ctx,
                             "UDP reply header encode failed sid={} src={} payload={}B",
-                            reply.session_id, reply.udp_src, payload_size);
+                            reply.session_id, *reply.udp_src, payload_size);
                         reply.payload.clear();
                         co_return true;
                     }
@@ -1098,7 +1094,6 @@ net::awaitable<RelayResult> ProcessInbound(
                     parent_ctx.traffic.bytes_up += read_bytes;
                     result.bytes_up += read_bytes;
                     frame_buf.AppendAndCoalesce(std::move(read_mb));
-                    frame_buf_bytes += read_bytes;
                 } else {
                     read_mb.clear();
                 }
@@ -1108,7 +1103,7 @@ net::awaitable<RelayResult> ProcessInbound(
             // 3. 循环解析并分发 Mux 帧
             // --------------------------------------------------------------------
             bool decoded_any_frame = false;
-            while (running && frame_buf_bytes > 0 &&
+            while (running && frame_buf.byte_size() > 0 &&
                    !reply_queue.ShouldBackpressureClientFrames() &&
                    !reply_queue.tcp_overflowed) {
                 const auto opt_hdr = mux::DecodeFrame(frame_buf);
@@ -1140,8 +1135,7 @@ net::awaitable<RelayResult> ProcessInbound(
                 } else {
                     frame_buf.DropPrefixBytes(hdr.frame_size);
                 }
-                frame_buf_bytes -= std::min(frame_buf_bytes, hdr.frame_size);
-                if (frame_buf_bytes == 0) {
+                if (frame_buf.byte_size() == 0) {
                     frame_buf.ReleaseIfIdle();
                 }
 
@@ -1321,7 +1315,7 @@ net::awaitable<RelayResult> ProcessInbound(
                     running = false;
                     break;
                 }
-                if (frame_buf_bytes != 0) {
+                if (frame_buf.byte_size() != 0) {
                     result.error = ErrorCode::PROTOCOL_DECODE_FAILED;
                     running = false;
                     break;

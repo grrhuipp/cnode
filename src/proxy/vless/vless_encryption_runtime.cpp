@@ -1,5 +1,4 @@
 #include "vless_encryption_runtime.hpp"
-#include "vless_ticket_service.hpp"
 
 #include "app/session_group_executor.hpp"
 #include "common/allocator.hpp"
@@ -467,13 +466,12 @@ RunVlessEncryptionClientHandshake(
     co_await WriteVlessBytes(raw_writer, nfs->bytes);
     memory::ByteVector{}.swap(nfs->bytes);
     co_await WriteVlessBytes(raw_writer, pfs->encrypted);
-    memory::ByteVector{}.swap(pfs->encrypted);
     co_await WriteVlessBytes(raw_writer, *padding);
     memory::ByteVector{}.swap(*padding);
     padding.reset();
 
-    memory::ByteVector encrypted_server_public(
-        kVlessEncryptionEncryptedServerPfsPublicSize);
+    std::array<uint8_t, kVlessEncryptionEncryptedServerPfsPublicSize>
+        encrypted_server_public{};
     if (!co_await raw_reader.ReadExact(
             encrypted_server_public.data(),
             encrypted_server_public.size())) {
@@ -491,12 +489,9 @@ RunVlessEncryptionClientHandshake(
         *pfs,
         nfs->iv,
         nfs->nfs_key,
-        std::span<const uint8_t, kVlessEncryptionEncryptedServerPfsPublicSize>(
-            encrypted_server_public.data(),
-            kVlessEncryptionEncryptedServerPfsPublicSize),
+        encrypted_server_public,
         encrypted_ticket,
         cipher);
-    memory::ByteVector{}.swap(encrypted_server_public);
     if (!server_open) {
         pfs.reset();
         co_return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
@@ -620,8 +615,8 @@ RunVlessEncryptionServerHandshake(
         co_return runtime;
     }
 
-    memory::ByteVector encrypted_client_public(
-        kVlessEncryptionEncryptedClientPfsPublicSize);
+    std::array<uint8_t, kVlessEncryptionEncryptedClientPfsPublicSize>
+        encrypted_client_public{};
     if (!co_await raw_reader.ReadExact(
             encrypted_client_public.data(),
             encrypted_client_public.size())) {
@@ -629,11 +624,7 @@ RunVlessEncryptionServerHandshake(
     }
 
     auto client_public = OpenEncryptedClientPfsPublic(
-        *nfs_aead,
-        std::span<const uint8_t, kVlessEncryptionEncryptedClientPfsPublicSize>(
-            encrypted_client_public.data(),
-            kVlessEncryptionEncryptedClientPfsPublicSize));
-    memory::ByteVector{}.swap(encrypted_client_public);
+        *nfs_aead, encrypted_client_public);
     if (!client_public) {
         co_return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
     }
@@ -667,7 +658,6 @@ RunVlessEncryptionServerHandshake(
     }
 
     co_await WriteVlessBytes(raw_writer, response->encrypted_public_key);
-    memory::ByteVector{}.swap(response->encrypted_public_key);
     co_await WriteVlessBytes(raw_writer, response->encrypted_ticket);
     response.reset();
     co_await WriteVlessBytes(raw_writer, *padding);

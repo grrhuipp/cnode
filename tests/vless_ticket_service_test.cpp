@@ -1,7 +1,7 @@
 #include <stdexcept>
 #include <gtest/gtest.h>
 
-#include "vless_ticket_service.hpp"
+#include "vless_encryption_runtime.hpp"
 #include "app/session_group_executor.hpp"
 #include <asio/co_spawn.hpp>
 #include <asio/executor_work_guard.hpp>

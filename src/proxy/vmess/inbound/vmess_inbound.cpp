@@ -37,14 +37,14 @@ ParseHandshake(AsyncStream& stream,
                ConnectionLimiter* limiter,
                session::Context& ctx,
                std::string_view client_ip) {
-    memory::ByteVector header_buf;
+    std::array<uint8_t, ::vmess::encoding::kMaxRequestHeaderWireSize> header_buf{};
     size_t total_read = 0;
     std::optional<::vmess::VMessRequest> request;
     size_t consumed = 0;
     while (!request) {
         const size_t required = vmess_session.RequiredHeaderBytes();
         if (required > header_buf.size()) {
-            header_buf.resize(required);
+            co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
         }
         while (total_read < required) {
             size_t n = 0;
@@ -85,8 +85,6 @@ ParseHandshake(AsyncStream& stream,
             co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
         }
     }
-
-    memory::ByteVector{}.swap(header_buf);
 
     if (!request->user) {
         co_await proxy::RecordInboundAuthFailure(
@@ -163,8 +161,8 @@ proxy::vmess::inbound::Handler::Process(
     LOG_CONN_DEBUG(ctx, "processing connection from {}:{}", client_ip, ctx.inbound.source_port);
 
     std::optional<UserOnlineSessionGuard> user_session;
-    std::unique_ptr<transport::MultiBufferReader> request_reader;
-    std::unique_ptr<transport::MultiBufferWriter> response_writer;
+    std::optional<::vmess::encoding::RequestBodyReader> request_reader;
+    std::optional<::vmess::encoding::ResponseBodyWriter> response_writer;
     try {
         if (co_await proxy::CheckInboundIpBanned(limiter_, ctx)) {
             co_return proxy::RejectInbound(stats_, stream.get(), ErrorCode::BLOCKED);
@@ -193,7 +191,7 @@ proxy::vmess::inbound::Handler::Process(
     if (net == Network::MUX) {
         co_return co_await mux::ProcessInbound(
             io_context,
-            transport::Link{request_reader.get(), response_writer.get()},
+            transport::Link{&*request_reader, &*response_writer},
             *stream,
             dispatcher,
             receiver.dispatch_policy,
@@ -208,7 +206,7 @@ proxy::vmess::inbound::Handler::Process(
         io_context,
         receiver.dispatch_policy,
         std::move(stream),
-        transport::Link{request_reader.get(), response_writer.get()},
+        transport::Link{&*request_reader, &*response_writer},
         InitialPayload{},
         ctx,
         stats_,

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "api/api.hpp"
-#include "common/online_device.hpp"
+#include "common/sharded_user_stats.hpp"
 
 #include <algorithm>
 #include <cstddef>

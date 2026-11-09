@@ -165,17 +165,20 @@ ReadAndDecryptStreamPayload(
 // consumed once; partial ciphertext remains owned across cancellation. Return
 // one record at a time, leaving a subsequent corrupt record for the next read
 // rather than discarding its error after producing earlier plaintext.
-class BodyReader final : public memory::ThreadAllocated,
-                         public transport::MultiBufferReader {
+class BodyReader final : public transport::MultiBufferReader {
 public:
     BodyReader(SsAeadCipher cipher, uint64_t nonce, transport::MultiBufferReader& stream,
                size_t max_payload = kMaxChunkPayload, buf::MultiBuffer pending = {})
-        : cipher_(std::move(cipher)), nonce_(nonce), stream_(stream),
+        : cipher_(std::move(cipher)), nonce_(nonce), stream_(&stream),
           max_payload_(max_payload), plaintext_(std::move(pending)) {}
 
-    transport::CancellationSource& Cancellation() noexcept override { return stream_.Cancellation(); }
-    transport::EofAction ReadEofAction() const noexcept override { return stream_.ReadEofAction(); }
+    BodyReader(const BodyReader&) = delete;
+    BodyReader& operator=(const BodyReader&) = delete;
+    BodyReader(BodyReader&&) noexcept = default;
+    BodyReader& operator=(BodyReader&&) noexcept = default;
 
+    transport::CancellationSource& Cancellation() noexcept override { return stream_->Cancellation(); }
+    transport::EofAction ReadEofAction() const noexcept override { return stream_->ReadEofAction(); }
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
         if (failure_) std::rethrow_exception(failure_);
         if (plaintext_.byte_size() != 0) co_return std::move(plaintext_);
@@ -190,7 +193,7 @@ public:
                 throw;
             }
             ciphertext_.ReleaseIfIdle();
-            auto raw = co_await stream_.ReadMultiBuffer();
+            auto raw = co_await stream_->ReadMultiBuffer();
             if (raw.byte_size() == 0) {
                 co_await ThrowIfCancelledOnEof();
                 if (length_ || ciphertext_.byte_size() != 0) {
@@ -254,7 +257,7 @@ private:
 
     SsAeadCipher cipher_;
     uint64_t nonce_;
-    transport::MultiBufferReader& stream_;
+    transport::MultiBufferReader* stream_ = nullptr;
     size_t max_payload_;
     buf::MultiBuffer plaintext_;
     buf::MultiBuffer ciphertext_;

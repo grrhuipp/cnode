@@ -4,9 +4,12 @@
 
 #include <array>
 #include <cstdint>
-#include <vector>
+#include <format>
+#include <stdexcept>
+#include <string>
+#include <string_view>
 #include <utility>
-
+#include <vector>
 
 /**
  * 连接统计系统
@@ -159,7 +162,13 @@ private:
 class ShardedStats {
 public:
     // Requires at least one Worker; each Worker owns exactly one shard.
-    explicit ShardedStats(uint32_t num_workers);
+    explicit ShardedStats(uint32_t num_workers)
+        : shards_(num_workers)
+        , last_sample_time_(steady_clock::now()) {
+        if (shards_.empty()) {
+            throw std::invalid_argument("stats require at least one worker shard");
+        }
+    }
 
     // A Worker id outside the configured range has no owner shard; sharing
     // another Worker's executor-exclusive shard would race, so it throws.
@@ -167,10 +176,58 @@ public:
         return shards_.at(worker_id);
     }
 
-    [[nodiscard]] StatsSnapshot WithCurrentRate(StatsSnapshot snapshot) const;
+    [[nodiscard]] StatsSnapshot WithCurrentRate(StatsSnapshot snapshot) const {
+        snapshot.bytes_in_rate  = current_in_rate_;
+        snapshot.bytes_out_rate = current_out_rate_;
+        return snapshot;
+    }
 
     // 采样（每秒调用）
-    void SampleNow(const StatsSnapshot& snapshot);
+    void SampleNow(const StatsSnapshot& snapshot) {
+        auto now = steady_clock::now();
+        auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - last_sample_time_).count();
+        if (elapsed_ms <= 0) return;
+
+        const uint64_t delta_in = snapshot.bytes_in >= last_bytes_in_
+            ? snapshot.bytes_in - last_bytes_in_
+            : 0;
+        const uint64_t delta_out = snapshot.bytes_out >= last_bytes_out_
+            ? snapshot.bytes_out - last_bytes_out_
+            : 0;
+
+        // 写入环形缓冲区：start_time = 本周期起始（上次采样时间）
+        samples_[sample_index_] = {delta_in, delta_out, last_sample_time_, true};
+        sample_index_ = (sample_index_ + 1) % kWindowSize;
+
+        // 滑动窗口：遍历所有有效采样点，累加增量 / 计算时间跨度
+        uint64_t window_in  = 0;
+        uint64_t window_out = 0;
+        time_point oldest_start = now;
+        bool has_valid = false;
+
+        for (const auto& s : samples_) {
+            if (!s.valid) continue;
+            window_in  += s.bytes_in;
+            window_out += s.bytes_out;
+            if (s.start_time < oldest_start) oldest_start = s.start_time;
+            has_valid = true;
+        }
+
+        if (has_valid) {
+            // 时间窗口 = 最旧采样起始 → 本次采样结束（now）
+            auto window_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - oldest_start).count();
+            if (window_ms > 0) {
+                current_in_rate_ = window_in  * 1000.0 / window_ms;
+                current_out_rate_ = window_out * 1000.0 / window_ms;
+            }
+        }
+
+        last_bytes_in_    = snapshot.bytes_in;
+        last_bytes_out_   = snapshot.bytes_out;
+        last_sample_time_ = now;
+    }
 
 private:
     std::vector<StatsShard> shards_;
@@ -195,4 +252,21 @@ private:
     double current_in_rate_ = 0;
     double current_out_rate_ = 0;
 };
+
+// 格式化字节数
+[[nodiscard]] inline std::string FormatBytes(uint64_t bytes) {
+    constexpr std::string_view units[] = {"B", "KB", "MB", "GB", "TB"};
+    int unit_index = 0;
+    double value = static_cast<double>(bytes);
+
+    while (value >= 1024 && unit_index < 4) {
+        value /= 1024;
+        unit_index++;
+    }
+
+    if (unit_index == 0) {
+        return std::format("{}{}", bytes, units[unit_index]);
+    }
+    return std::format("{:.2f}{}", value, units[unit_index]);
+}
 

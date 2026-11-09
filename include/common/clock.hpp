@@ -35,6 +35,4 @@ inline std::string FormatLocalTime(
     return written > 0 ? std::string(buffer, written) : std::string{};
 }
 
-// 格式化字节数
-std::string FormatBytes(uint64_t bytes);
 

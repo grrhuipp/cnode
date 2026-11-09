@@ -35,14 +35,6 @@ public:
         }
     }
 
-    ~UdpRequest() noexcept override {
-        ::SecureZeroMemory(master_key_.bytes.data(), master_key_.bytes.size());
-        if (ss2022_state_) {
-            ::SecureZeroMemory(ss2022_state_->key.bytes.data(),
-                                     ss2022_state_->key.bytes.size());
-        }
-    }
-
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
         // Keep one absolute read budget across unauthenticated or wrong-source
         // packets. Only an authenticated payload is valid receive activity.
@@ -57,8 +49,6 @@ public:
                 : ss::DecodeUdpPacketWithKey(bytes.data(), bytes.size(), master_key_.span(),
                     cipher_info_.type, cipher_info_.key_size, cipher_info_.salt_size);
             if (!decoded) continue;
-            ::SecureZeroMemory(decoded->session_owner.bytes.data(),
-                                     decoded->session_owner.bytes.size());
             if (!decoded->target.IsValid()) continue;
             socket_.TouchActivity();
             co_return std::move(decoded->payload);

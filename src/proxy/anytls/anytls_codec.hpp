@@ -5,7 +5,7 @@
 #include "common/buf/multi_buffer.hpp"
 #include "common/error.hpp"
 #include "common/target_address.hpp"
-
+#include "proxy/anytls_padding.hpp"
 #include <array>
 #include <cstdint>
 #include <tl/expected.hpp>
@@ -30,7 +30,6 @@ inline constexpr uint8_t kCmdHeartResponse = 9;
 inline constexpr uint8_t kCmdServerSettings = 10;
 
 inline constexpr size_t kFrameHeaderSize = 7;
-inline constexpr size_t kMaxFramePayload = 0xffff;
 
 inline constexpr uint32_t kProtocolVersion = 2;
 
@@ -76,9 +75,6 @@ private:
     size_t count_ = 0;
     bool spilled_ = false;
 };
-
-struct PaddingRecord;
-class PaddingScheme;
 
 [[nodiscard]] memory::ThreadLocalString ClientSettings(const PaddingScheme& scheme);
 [[nodiscard]] tl::expected<void, ErrorCode> AppendFrameBytesTo(

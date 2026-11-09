@@ -3,7 +3,7 @@
 #include "common/allocator.hpp"
 #include "app/proxyman/inbound/prepared_config.hpp"
 #include "app/rate_limiter_fwd.hpp"
-#include "common/online_device.hpp"
+#include "common/sharded_user_stats.hpp"
 
 #include <memory>
 #include <optional>
@@ -17,8 +17,6 @@ class Inbound;
 struct InboundProtocolSettings;
 struct InboundUserSpec;
 struct StatsShard;
-
-class UserOnlineTracker;
 
 namespace proxyman::inbound {
 

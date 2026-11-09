@@ -5,9 +5,10 @@
 #include "../../../common/awaitable_task_group.hpp"
 
 #include "../anytls_codec.hpp"
-#include "../padding.hpp"
+#include "proxy/anytls_padding.hpp"
 #include "common/buf/length_prefixed_packet_buffer.hpp"
 #include "../../outbound_server.hpp"
+#include "../../outbound_stream_endpoint.hpp"
 #include "../../handshake_timeout.hpp"
 #include "../../uot/uot.hpp"
 #include "transport/internet/async_write_gate.hpp"
@@ -679,9 +680,15 @@ struct Handler::ClientSession : memory::ThreadAllocated {
 // Stable admission-namespace pool. A checkout is busy before any
 // suspension. The host owns only pool metadata and task completion accounting;
 // every reader, writer and negotiated state belongs to the physical domain.
-class Handler::SessionPool final : public memory::ThreadAllocated {
+class Handler::SessionPool final
+    : public std::enable_shared_from_this<SessionPool>
+    , public TimeoutEvent {
     using Clock = std::chrono::steady_clock;
-    struct State;
+
+    struct Entry {
+        std::shared_ptr<ClientSession> session;
+        std::optional<Clock::time_point> idle_since;
+    };
 
     static void Close(const std::shared_ptr<ClientSession>& session,
                       ErrorCode error = ErrorCode::CANCELLED) noexcept {
@@ -699,7 +706,7 @@ public:
         Lease& operator=(Lease&& other) noexcept {
             if (this != &other) {
                 Discard();
-                state_ = std::move(other.state_);
+                pool_ = std::move(other.pool_);
                 session_ = std::move(other.session_);
                 reusable_ = std::exchange(other.reusable_, false);
             }
@@ -713,37 +720,44 @@ public:
 
     private:
         friend class SessionPool;
-        Lease(std::shared_ptr<State> state, std::shared_ptr<ClientSession> session) noexcept
-            : state_(std::move(state)), session_(std::move(session)) {}
+        Lease(std::shared_ptr<SessionPool> pool, std::shared_ptr<ClientSession> session) noexcept
+            : pool_(std::move(pool)), session_(std::move(session)) {}
         void Discard() noexcept {
-            if (!state_ || !session_) return;
-            auto state = std::move(state_);
+            if (!pool_ || !session_) return;
+            auto pool = std::move(pool_);
             auto session = std::move(session_);
-            if (reusable_) state->Release(session);
-            else state->Remove(session);
+            if (reusable_) pool->Release(session);
+            else pool->Remove(session);
         }
-        std::shared_ptr<State> state_;
+        std::shared_ptr<SessionPool> pool_;
         std::shared_ptr<ClientSession> session_;
         bool reusable_ = false;
     };
 
-    SessionPool(net::io_context& io_context, AwaitableTaskGroup& tasks,
-                Clock::duration check_interval, Clock::duration idle_timeout,
-                size_t minimum_idle, std::string_view tag)
-        : state_(memory::AllocateShared<State>(io_context, tasks, check_interval,
-                                               idle_timeout, minimum_idle, tag)) {}
+    SessionPool(net::io_context& io_context, AwaitableTaskGroup& owner_tasks,
+                Clock::duration check, Clock::duration timeout,
+                size_t minimum, std::string_view name)
+        : TimeoutEvent(io_context)
+        , tasks_(owner_tasks)
+        , check_interval_(check)
+        , idle_timeout_(timeout)
+        , minimum_idle_(minimum)
+        , tag_(name) {
+        if (check <= Clock::duration::zero() || timeout <= Clock::duration::zero()) {
+            throw std::invalid_argument("AnyTLS session intervals must be positive");
+        }
+    }
     SessionPool(const SessionPool&) = delete;
     SessionPool& operator=(const SessionPool&) = delete;
-    ~SessionPool() noexcept { state_->Retire(); }
 
     template<class Accept>
     [[nodiscard]] Lease AcquireIf(Accept&& accept) {
-        state_->CheckActive();
-        state_->Prune();
-        for (auto it = state_->entries.rbegin(); it != state_->entries.rend(); ++it) {
+        CheckActive();
+        Prune();
+        for (auto it = entries_.rbegin(); it != entries_.rend(); ++it) {
             if (it->idle_since && accept(*it->session)) {
                 it->idle_since.reset();
-                return Lease(state_, it->session);
+                return Lease(this->shared_from_this(), it->session);
             }
         }
         return {};
@@ -755,173 +769,152 @@ public:
 
     [[nodiscard]] Lease Adopt(std::shared_ptr<ClientSession> session) {
         try {
-            state_->CheckActive();
+            CheckActive();
             if (!session) {
                 throw std::invalid_argument("cannot adopt a closed AnyTLS session");
             }
-            state_->entries.push_back({session, std::nullopt});
-            if (!state_->Valid()) state_->Schedule();
-            state_->Start(session);
-            return Lease(state_, std::move(session));
+            entries_.push_back({session, std::nullopt});
+            if (!Valid()) Schedule();
+            Start(session);
+            return Lease(this->shared_from_this(), std::move(session));
         } catch (...) {
-            state_->Remove(session);
+            Remove(session);
             throw;
         }
     }
 
+    void Retire() noexcept {
+        retired_ = true;
+        Cancel();
+        memory::ThreadLocalVector<Entry> closing(entries_.get_allocator());
+        closing.swap(entries_);
+        for (const auto& entry : closing) Close(entry.session);
+    }
+
 private:
-    struct State final : std::enable_shared_from_this<State>, TimeoutEvent {
-        struct Entry {
-            std::shared_ptr<ClientSession> session;
-            std::optional<Clock::time_point> idle_since;
-        };
+    void CheckActive() const {
+        if (failure_) std::rethrow_exception(failure_);
+        if (retired_) throw std::logic_error("AnyTLS session pool is retired");
+    }
 
-        State(net::io_context& io_context, AwaitableTaskGroup& owner_tasks,
-              Clock::duration check, Clock::duration timeout,
-              size_t minimum, std::string_view name)
-            : TimeoutEvent(io_context),
-              tasks(owner_tasks),
-              check_interval(check), idle_timeout(timeout),
-              minimum_idle(minimum), tag(name) {
-            if (check <= Clock::duration::zero() || timeout <= Clock::duration::zero()) {
-                throw std::invalid_argument("AnyTLS session intervals must be positive");
-            }
-        }
+    void Remove(const std::shared_ptr<ClientSession>& session) noexcept {
+        // Keep an owner while erasing the index, before cancellation can
+        // notify logical requests or finish the physical operation.
+        const auto closing = session;
+        std::erase_if(entries_, [&](const auto& entry) { return entry.session == session; });
+        StopIfEmpty();
+        Close(closing);
+    }
 
-        void CheckActive() const {
-            if (failure) std::rethrow_exception(failure);
-            if (retired) throw std::logic_error("AnyTLS session pool is retired");
-        }
+    void Start(const std::shared_ptr<ClientSession>& session) {
+        tasks_.Spawn(RunPhysical(this->shared_from_this(), session));
+    }
 
-        void Remove(const std::shared_ptr<ClientSession>& session) noexcept {
-            // Keep an owner while erasing the index, before cancellation can
-            // notify logical requests or finish the physical operation.
-            const auto closing = session;
-            std::erase_if(entries, [&](const auto& entry) { return entry.session == session; });
-            StopIfEmpty();
-            Close(closing);
-        }
-
-        void Start(const std::shared_ptr<ClientSession>& session) {
-            tasks.Spawn(RunPhysical(this->shared_from_this(), session));
-        }
-
-        // A resident group child must contain every failure: an escaping
-        // exception would stop all physical sessions of this Worker.
-        static net::awaitable<void> RunPhysical(std::shared_ptr<State> owner,
-                                                std::shared_ptr<ClientSession> session) {
-            std::exception_ptr failure;
-            try {
-                auto cancellation = co_await net::this_coro::cancellation_state;
-                cancellation.slot().assign([session](net::cancellation_type type) {
-                    if (type != net::cancellation_type::none) Close(session);
-                });
-                struct ClearSlot {
-                    net::cancellation_slot slot;
-                    ~ClearSlot() { slot.clear(); }
-                } clear{cancellation.slot()};
-                co_await session->Run();
-            } catch (...) {
-                failure = std::current_exception();
-            }
-            const ErrorCode error = failure ? SessionExceptionError(failure)
-                                            : ErrorCode::CONNECTION_CLOSED;
-            // A loop that returned or threw must never remain reusable.
-            // CloseAll retains the first terminal cause.
-            Close(session, error);
-            owner->Remove(session);
-            if (failure && error != ErrorCode::CANCELLED &&
-                error != ErrorCode::CONNECTION_CLOSED && error != ErrorCode::SOCKET_EOF) {
-                try {
-                    LOG_WARN("AnyTLS outbound '{}': physical session task failed: {}",
-                        owner->tag, ErrorCodeToString(error));
-                } catch (...) {}
-            }
-        }
-
-        void Release(const std::shared_ptr<ClientSession>& session) noexcept {
-            auto it = std::find_if(entries.begin(), entries.end(),
-                [&](const auto& entry) { return entry.session == session; });
-            if (retired || it == entries.end()) {
-                Remove(session);
-                return;
-            }
-            it->idle_since = Clock::now();
-            // Keep most recently returned idle sessions at the back, without
-            // allocating a second list or changing the ownership count.
-            std::rotate(it, it + 1, entries.end());
-        }
-
-        void Prune() noexcept {
-            const auto now = Clock::now();
-            size_t retained_idle = 0;
-            for (size_t i = entries.size(); i-- > 0;) {
-                const auto& entry = entries[i];
-                bool remove = false;
-                if (entry.idle_since) {
-                    if (retained_idle >= minimum_idle &&
-                        now - *entry.idle_since >= idle_timeout) {
-                        remove = true;
-                    } else {
-                        ++retained_idle;
-                    }
-                }
-                if (remove) {
-                    const auto closing = entry.session;
-                    entries.erase(entries.begin() + static_cast<std::ptrdiff_t>(i));
-                    Close(closing);
-                }
-            }
-            StopIfEmpty();
-        }
-
-        void StopIfEmpty() noexcept {
-            if (!entries.empty()) return;
-            Cancel();
-            memory::ThreadLocalVector<Entry>{entries.get_allocator()}.swap(entries);
-        }
-
-        void Schedule() {
-            if (!ScheduleAfter(std::chrono::ceil<std::chrono::milliseconds>(check_interval)))
-                throw IoSystemError(io_error::operation_aborted);
-        }
-
-        void OnTimeout() noexcept override {
-            // Pruning can drop the last indexed session and notify its users.
-            // Keep this event's owner alive until rescheduling has finished.
-            const auto self = this->shared_from_this();
-            if (retired) return;
-            try {
-                Prune();
-                if (!entries.empty()) Schedule();
-            } catch (...) {
-                failure = std::current_exception();
-                Retire();
-                try {
-                    LOG_ERROR("AnyTLS outbound '{}': idle session scheduler failed", tag);
-                } catch (...) {}
-            }
-        }
-
-        void Retire() noexcept {
-            retired = true;
-            Cancel();
-            memory::ThreadLocalVector<Entry> closing(entries.get_allocator());
-            closing.swap(entries);
-            for (const auto& entry : closing) Close(entry.session);
-        }
-
-        AwaitableTaskGroup& tasks;
-        const Clock::duration check_interval;
-        const Clock::duration idle_timeout;
-        const size_t minimum_idle;
-        const memory::ThreadLocalString tag;
-        memory::ThreadLocalVector<Entry> entries;
-        bool retired = false;
+    // A resident group child must contain every failure: an escaping
+    // exception would stop all physical sessions of this Worker.
+    static net::awaitable<void> RunPhysical(std::shared_ptr<SessionPool> owner,
+                                            std::shared_ptr<ClientSession> session) {
         std::exception_ptr failure;
-    };
+        try {
+            auto cancellation = co_await net::this_coro::cancellation_state;
+            cancellation.slot().assign([session](net::cancellation_type type) {
+                if (type != net::cancellation_type::none) Close(session);
+            });
+            struct ClearSlot {
+                net::cancellation_slot slot;
+                ~ClearSlot() { slot.clear(); }
+            } clear{cancellation.slot()};
+            co_await session->Run();
+        } catch (...) {
+            failure = std::current_exception();
+        }
+        const ErrorCode error = failure ? SessionExceptionError(failure)
+                                        : ErrorCode::CONNECTION_CLOSED;
+        // A loop that returned or threw must never remain reusable.
+        // CloseAll retains the first terminal cause.
+        Close(session, error);
+        owner->Remove(session);
+        if (failure && error != ErrorCode::CANCELLED &&
+            error != ErrorCode::CONNECTION_CLOSED && error != ErrorCode::SOCKET_EOF) {
+            try {
+                LOG_WARN("AnyTLS outbound '{}': physical session task failed: {}",
+                    owner->tag_, ErrorCodeToString(error));
+            } catch (...) {}
+        }
+    }
 
-    const std::shared_ptr<State> state_;
+    void Release(const std::shared_ptr<ClientSession>& session) noexcept {
+        auto it = std::find_if(entries_.begin(), entries_.end(),
+            [&](const auto& entry) { return entry.session == session; });
+        if (retired_ || it == entries_.end()) {
+            Remove(session);
+            return;
+        }
+        it->idle_since = Clock::now();
+        // Keep most recently returned idle sessions at the back, without
+        // allocating a second list or changing the ownership count.
+        std::rotate(it, it + 1, entries_.end());
+    }
+
+    void Prune() noexcept {
+        const auto now = Clock::now();
+        size_t retained_idle = 0;
+        for (size_t i = entries_.size(); i-- > 0;) {
+            const auto& entry = entries_[i];
+            bool remove = false;
+            if (entry.idle_since) {
+                if (retained_idle >= minimum_idle_ &&
+                    now - *entry.idle_since >= idle_timeout_) {
+                    remove = true;
+                } else {
+                    ++retained_idle;
+                }
+            }
+            if (remove) {
+                const auto closing = entry.session;
+                entries_.erase(entries_.begin() + static_cast<std::ptrdiff_t>(i));
+                Close(closing);
+            }
+        }
+        StopIfEmpty();
+    }
+
+    void StopIfEmpty() noexcept {
+        if (!entries_.empty()) return;
+        Cancel();
+        memory::ThreadLocalVector<Entry>{entries_.get_allocator()}.swap(entries_);
+    }
+
+    void Schedule() {
+        if (!ScheduleAfter(std::chrono::ceil<std::chrono::milliseconds>(check_interval_)))
+            throw IoSystemError(io_error::operation_aborted);
+    }
+
+    void OnTimeout() noexcept override {
+        // Pruning can drop the last indexed session and notify its users.
+        // Keep this event's owner alive until rescheduling has finished.
+        const auto self = this->shared_from_this();
+        if (retired_) return;
+        try {
+            Prune();
+            if (!entries_.empty()) Schedule();
+        } catch (...) {
+            failure_ = std::current_exception();
+            Retire();
+            try {
+                LOG_ERROR("AnyTLS outbound '{}': idle session scheduler failed", tag_);
+            } catch (...) {}
+        }
+    }
+
+    AwaitableTaskGroup& tasks_;
+    const Clock::duration check_interval_;
+    const Clock::duration idle_timeout_;
+    const size_t minimum_idle_;
+    const memory::ThreadLocalString tag_;
+    memory::ThreadLocalVector<Entry> entries_;
+    bool retired_ = false;
+    std::exception_ptr failure_;
 };
 
 struct Handler::LogicalStreamLease {
@@ -1091,11 +1084,13 @@ Handler::Handler(std::string_view tag,
     : tag_(tag)
     , settings_(std::move(settings))
     , padding_(memory::AllocateShared<PaddingState>())
-    , pool_(std::make_unique<SessionPool>(
+    , pool_(memory::AllocateShared<SessionPool>(
           io_context, tasks, settings_->idle_session_check_interval,
           settings_->idle_session_timeout, settings_->min_idle_sessions, tag_)) {}
 
-Handler::~Handler() noexcept = default;
+Handler::~Handler() noexcept {
+    if (pool_) pool_->Retire();
+}
 
 net::awaitable<OutboundProcessResult> Handler::Process(
     session::Context& ctx,

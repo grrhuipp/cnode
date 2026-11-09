@@ -496,7 +496,7 @@ void TestResponseAuthenticatedLength(vmess::Security security) {
     vmess::encoding::ServerSession session("response-length-test");
     session.SetRequest(request);
     auto writer = session.EncodeResponseBodyWithHeader(connection.stream);
-    Check(writer != nullptr, "VMess response writer was not created");
+    Check(writer.has_value(), "VMess response writer was not created");
 
     const std::array<std::pair<size_t, uint8_t>, 2> chunks{{{113, 0x5a}, {257, 0x3c}}};
     for (const auto& [size, value] : chunks) {
@@ -573,7 +573,7 @@ memory::ByteVector MakeClientResponse(Connection& connection,
     const bool is_udp = request->command == vmess::Command::UDP;
     server.SetRequest(std::move(*request));
     auto writer = server.EncodeResponseBodyWithHeader(connection.stream);
-    Check(writer != nullptr, "VMess server response writer was not created");
+    Check(writer.has_value(), "VMess server response writer was not created");
     WriteReady(connection, *writer,
                buf::MultiBuffer{MakeBuffer(113, is_udp ? &udp_target : nullptr, 0x53)});
     memory::ByteVector response(connection.peer.available());

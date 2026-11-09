@@ -1,6 +1,6 @@
 #include "app/prepared_inbound.hpp"
 
-#include "../infra/config_semantics.hpp"
+#include "infra/config.hpp"
 #include "app/proxyman/inbound/factory.hpp"
 #include "core/constants.hpp"
 #include "core/naming.hpp"

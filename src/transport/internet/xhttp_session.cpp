@@ -1,8 +1,6 @@
 #include "xhttp_session.hpp"
 
 #include "http1_handshake.hpp"
-#include "http_path_match.hpp"
-#include "xhttp_packet_session_key.hpp"
 #include "app/session_group_executor.hpp"
 #include "../../common/awaitable_task_group.hpp"
 #include "common/buffer_util.hpp"
@@ -658,29 +656,7 @@ net::awaitable<std::optional<buf::MultiBuffer>> ReadXHttpPacketBody(
 // Coordinator-owned metadata only. Each admitted record reserves its own
 // retirement node: noexcept close cannot lose an event to mailbox exhaustion.
 class XHttpSessionDirectory final : public net::execution_context::service {
-    struct KeyRef {
-        std::string_view session_namespace;
-        std::string_view id;
-    };
-    struct Key {
-        std::string session_namespace;
-        std::string id;
-        operator KeyRef() const noexcept { return {session_namespace, id}; }
-    };
-    struct Hash {
-        using is_transparent = void;
-        size_t operator()(KeyRef key) const noexcept {
-            const auto a = std::hash<std::string_view>{}(key.session_namespace);
-            const auto b = std::hash<std::string_view>{}(key.id);
-            return a ^ (b + size_t{0x9e3779b9} + (a << 6) + (a >> 2));
-        }
-    };
-    struct Equal {
-        using is_transparent = void;
-        bool operator()(KeyRef a, KeyRef b) const noexcept {
-            return a.session_namespace == b.session_namespace && a.id == b.id;
-        }
-    };
+    using Key = ::detail::BasicXHttpPacketSessionKey<std::string>;
 
 public:
     static net::execution_context::id id;
@@ -771,7 +747,7 @@ public:
                   XHttpSessionAccess access, net::io_context* current,
                   bool bind_owner = true) {
         DrainRetirements();
-        auto found = entries_.find(KeyRef{session_namespace, session_id});
+        auto found = entries_.find(::detail::XHttpPacketSessionKeyRef{session_id, session_namespace});
         if (found != entries_.end() && !found->second->Retired()) {
             auto& record = found->second;
             if (!record->owner && bind_owner && current) {
@@ -802,7 +778,7 @@ public:
         auto record = std::make_shared<Record>(*this, bind_owner ? current : nullptr);
         if (found == entries_.end()) {
             found = entries_.try_emplace(
-                Key{std::string(session_namespace), std::string(session_id)}, record).first;
+                Key{std::string(session_id), std::string(session_namespace)}, record).first;
         } else {
             Unlink(*found->second);
             --ended_;
@@ -884,7 +860,7 @@ private:
     }
 
     static constexpr size_t kMaxActive = 64 * 1024;
-    std::unordered_map<Key, std::shared_ptr<Record>, Hash, Equal> entries_;
+    std::unordered_map<Key, std::shared_ptr<Record>, ::detail::XHttpPacketSessionKeyHash, ::detail::XHttpPacketSessionKeyEq> entries_;
     std::atomic<Record*> incoming_{nullptr};
     Record* first_ = nullptr;
     Record* last_ = nullptr;

@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "xhttp_upload_stream_slot.hpp"
+#include "xhttp_session.hpp"
 
 #include <cstdlib>
 #include <memory>

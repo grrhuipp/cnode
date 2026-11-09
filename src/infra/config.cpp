@@ -9,15 +9,26 @@
 #include "infra/outbound_bind_config.hpp"
 #include "infra/log.hpp"
 #include <algorithm>
+#include <array>
 #include <cctype>
+#include <cerrno>
 #include <charconv>
+#include <cstdio>
 #include <format>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <regex>
 #include <stdexcept>
+#include <string>
+#include <string_view>
+#include <system_error>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
+#include <variant>
+#include <vector>
 
 
 std::optional<RoutingIpNetwork> RoutingIpNetwork::Parse(std::string_view value) {
@@ -363,17 +374,13 @@ std::string_view TrimRoutingListItem(std::string_view value) noexcept {
 uint16_t ParseRoutingPortNumber(std::string_view value,
                                 std::string_view field) {
     value = TrimRoutingListItem(value);
-    uint32_t parsed = 0;
-    const auto [end, ec] = std::from_chars(
-        value.data(), value.data() + value.size(), parsed);
-    if (value.empty() || ec != std::errc{} ||
-        end != value.data() + value.size() || parsed == 0 ||
-        parsed > std::numeric_limits<uint16_t>::max()) {
+    uint16_t port = 0;
+    if (!TargetAddress::ParsePort(value, port)) {
         throw std::invalid_argument(std::format(
             "routing {} value '{}' must be an integer between 1 and 65535",
             field, value));
     }
-    return static_cast<uint16_t>(parsed);
+    return port;
 }
 
 RoutingPortRange ParseRoutingPortRange(std::string_view value,
@@ -531,16 +538,11 @@ udp::endpoint ParseDnsServer(std::string_view text) {
         port_text = text.substr(colon + 1);
         explicit_port = true;
     }
-    uint32_t port = 53;
-    bool valid_port = !explicit_port;
-    if (explicit_port && !port_text.empty()) {
-        const auto [end, parsed] = std::from_chars(port_text.data(), port_text.data() + port_text.size(), port);
-        valid_port = parsed == std::errc{} && end == port_text.data() + port_text.size() &&
-            port > 0 && port <= std::numeric_limits<uint16_t>::max();
-    }
+    uint16_t port = 53;
+    const bool valid_port = !explicit_port || TargetAddress::ParsePort(port_text, port);
     if (const auto address = iputil::ParseLiteral(host);
         valid_port && address && (!text.starts_with('[') || address->is_v6())) {
-        return {*address, static_cast<uint16_t>(port)};
+        return {*address, port};
     }
     throw std::invalid_argument(std::format(
         "dns server '{}' must be an IP, IPv4:port or [IPv6]:port with port 1..65535", text));
@@ -1545,5 +1547,498 @@ std::optional<Config> ParseConfig(const json::object& j) {
         Log::WriteConsole(LogLevel::ERROR, std::format("Failed to parse config: {}", e.what()));
         return std::nullopt;
     }
+}
+
+namespace {
+
+// 文件不存在表示“未配置”，是否允许缺省由调用方决定；打开、读取失败与 JSON
+// 损坏都属于配置损坏，在此分别记录原因后阻断加载。以 fopen 的 errno 判定缺失，
+// 不做 exists() 预检，避免检查与打开之间的竞态；ferror 区分读取故障与文件结束。
+struct ConfigFileAbsent {};
+struct ConfigFileInvalid {};
+using ConfigFileLoad = std::variant<json::value, ConfigFileAbsent, ConfigFileInvalid>;
+
+struct FileCloser {
+    void operator()(std::FILE* file) const noexcept { std::fclose(file); }
+};
+
+ConfigFileLoad LoadJsonFile(const std::filesystem::path& path) {
+    const auto file_name = path.filename().string();
+    const std::unique_ptr<std::FILE, FileCloser> file(std::fopen(path.c_str(), "rb"));
+    if (!file) {
+        const int error = errno;
+        if (error == ENOENT) {
+            return ConfigFileAbsent{};
+        }
+        Log::WriteConsole(LogLevel::ERROR, std::format(
+            "Configuration read failed: file={} reason={}",
+            file_name, std::generic_category().message(error)));
+        return ConfigFileInvalid{};
+    }
+
+    std::string content;
+    std::array<char, 16 * 1024> chunk;
+    for (;;) {
+        const size_t read = std::fread(chunk.data(), 1, chunk.size(), file.get());
+        if (read < chunk.size() && std::ferror(file.get())) {
+            const int error = errno;
+            Log::WriteConsole(LogLevel::ERROR, std::format(
+                "Configuration read failed: file={} reason={}",
+                file_name, std::generic_category().message(error)));
+            return ConfigFileInvalid{};
+        }
+        content.append(chunk.data(), read);
+        if (read < chunk.size()) {
+            break;
+        }
+    }
+
+    try {
+        return json::parse(content, json::KeyComparison::AsciiCaseInsensitive);
+    } catch (const std::exception& e) {
+        Log::WriteConsole(LogLevel::ERROR, std::format(
+            "Configuration parsing failed: file={} reason={}", file_name, e.what()));
+        return ConfigFileInvalid{};
+    }
+}
+
+// 侧车文件缺失即未配置；存在但读取、解析或校验失败都阻断加载。
+template <typename ApplyFn>
+bool LoadSidecarFile(const std::filesystem::path& config_dir,
+                     std::string_view file_name,
+                     ApplyFn&& apply) {
+    auto loaded = LoadJsonFile(config_dir / file_name);
+    if (std::holds_alternative<ConfigFileAbsent>(loaded)) {
+        return true;
+    }
+    auto* value = std::get_if<json::value>(&loaded);
+    if (!value) {
+        Log::WriteConsole(LogLevel::ERROR, std::format(
+            "Configuration sidecar load failed: file={}", file_name));
+        return false;
+    }
+    try {
+        apply(*value);
+    } catch (const std::exception& e) {
+        Log::WriteConsole(LogLevel::ERROR, std::format(
+            "Configuration sidecar parsing failed: file={} reason={}", file_name, e.what()));
+        return false;
+    }
+    return true;
+}
+
+template <typename AddFn>
+void LoadConfigItems(const json::value& value, AddFn&& add) {
+    if (!value.is_array()) {
+        throw std::invalid_argument("config list must be an array of objects");
+    }
+    for (const auto& item : value.as_array()) {
+        if (!item.is_object()) {
+            throw std::invalid_argument("config list entries must be objects");
+        }
+        add(item.as_object());
+    }
+}
+
+void LoadInboundItems(
+    std::vector<StaticInboundConfig>& inbounds,
+    const json::value& value) {
+    LoadConfigItems(value, [&](const json::object& item) {
+        inbounds.push_back(StaticInboundConfig::FromJson(item));
+    });
+}
+
+void LoadOutboundItems(
+    std::vector<infra::OutboundSourceConfig>& outbounds,
+    const json::value& value) {
+    LoadConfigItems(value, [&](const json::object& item) {
+        outbounds.push_back(infra::OutboundSourceConfig::FromJson(item));
+    });
+}
+
+std::vector<std::string> GetUsedRouteRuleTags(
+    const RoutingConfig& routing,
+    const std::vector<std::string> RouteRuleConfig::* field) {
+    std::vector<std::string> tags;
+    for (const auto& rule : routing.rules) {
+        for (const auto& tag : rule.*field) {
+            if (std::ranges::find(tags, tag) == tags.end()) {
+                tags.push_back(tag);
+            }
+        }
+    }
+    return tags;
+}
+
+}  // namespace
+
+std::optional<Config> LoadConfig(const std::filesystem::path& path) {
+    std::filesystem::path config_dir;
+    json::value main_config;
+
+    std::error_code ec;
+    const bool is_dir = std::filesystem::is_directory(path, ec);
+    if (ec && ec != std::errc::no_such_file_or_directory && ec != std::errc::not_a_directory) {
+        Log::WriteConsole(LogLevel::ERROR, std::format(
+            "Configuration path stat failed: path={} reason={}",
+            path.string(), ec.message()));
+        return std::nullopt;
+    }
+
+    if (is_dir) {
+        config_dir = path;
+
+        auto loaded = LoadJsonFile(path / constants::paths::kDefaultConfigFile);
+        if (std::holds_alternative<ConfigFileInvalid>(loaded)) {
+            Log::WriteConsole(LogLevel::ERROR, std::format(
+                "Main configuration load failed: file={}",
+                constants::paths::kDefaultConfigFile));
+            return std::nullopt;
+        }
+        if (auto* loaded_config = std::get_if<json::value>(&loaded)) {
+            main_config = std::move(*loaded_config);
+        } else {
+            main_config = json::object{};
+        }
+    } else {
+        auto file_path = path;
+
+        config_dir = file_path.parent_path();
+        if (config_dir.empty()) {
+            config_dir = ".";
+        }
+
+        auto loaded = LoadJsonFile(file_path);
+        auto* loaded_config = std::get_if<json::value>(&loaded);
+        if (!loaded_config) {
+            // 显式指定的配置文件不存在同样是错误，不回落到默认配置。
+            Log::WriteConsole(LogLevel::ERROR, std::format(
+                "Main configuration load failed: file={} missing={}",
+                file_path.filename().string(),
+                std::holds_alternative<ConfigFileAbsent>(loaded)));
+            return std::nullopt;
+        }
+        main_config = std::move(*loaded_config);
+    }
+
+    if (!main_config.is_object()) {
+        Log::WriteConsole(LogLevel::ERROR, "Main configuration must be an object");
+        return std::nullopt;
+    }
+    auto cfg_opt = ParseConfig(main_config.as_object());
+    if (!cfg_opt) {
+        return std::nullopt;
+    }
+
+    Config& cfg = *cfg_opt;
+    cfg.config_dir = config_dir;
+    if (!cfg.panels.empty()) {
+        const auto journal_dir = std::filesystem::absolute(config_dir / "traffic-journal", ec);
+        if (ec) {
+            Log::WriteConsole(LogLevel::ERROR, std::format(
+                "Traffic journal path resolution failed: reason={}", ec.message()));
+            return std::nullopt;
+        }
+        for (auto& panel : cfg.panels) {
+            panel.TrafficJournalDir = journal_dir;
+        }
+    }
+
+    const bool sidecars_loaded =
+        LoadSidecarFile(config_dir, constants::paths::kInboundFile,
+            [&](const json::value& value) {
+                LoadInboundItems(cfg.static_inbounds, value);
+            }) &&
+        LoadSidecarFile(config_dir, constants::paths::kOutboundFile,
+            [&](const json::value& value) {
+                LoadOutboundItems(cfg.outbounds, value);
+            }) &&
+        LoadSidecarFile(config_dir, constants::paths::kRouteFile,
+            [&](const json::value& value) {
+                if (!value.is_object() || value.as_object().contains("routing")) {
+                    throw std::invalid_argument(
+                        "routing sidecar must be a direct routing object");
+                }
+                cfg.routing = RoutingConfig::FromJson(value.as_object());
+            });
+    if (!sidecars_loaded) {
+        return std::nullopt;
+    }
+
+    bool has_direct = false;
+    bool has_blackhole = false;
+    for (const auto& ob : cfg.outbounds) {
+        if (ob.tag == constants::protocol::kDirect) has_direct = true;
+        if (ob.tag == constants::protocol::kBlackhole) has_blackhole = true;
+    }
+
+    if (!has_direct) {
+        infra::OutboundSourceConfig direct;
+        direct.tag = std::string(constants::protocol::kDirect);
+        direct.protocol = std::string(constants::protocol::kFreedom);
+        cfg.outbounds.insert(cfg.outbounds.begin(), std::move(direct));
+    }
+
+    if (!has_blackhole) {
+        infra::OutboundSourceConfig blackhole;
+        blackhole.tag = std::string(constants::protocol::kBlackhole);
+        blackhole.protocol = std::string(constants::protocol::kBlackhole);
+        cfg.outbounds.push_back(std::move(blackhole));
+    }
+
+    return cfg;
+}
+
+ConfigSemanticValidation ValidateOutboundSelectionSemantics(
+    std::span<const infra::OutboundSourceConfig> outbounds,
+    std::span<const RouteRuleConfig> rules,
+    std::span<const StaticInboundConfig> inbounds) {
+    if (outbounds.empty()) {
+        return {.error = ConfigSemanticError::NoOutbounds, .index = 0, .tag = {}};
+    }
+
+    std::unordered_set<std::string_view> tags;
+    tags.reserve(outbounds.size());
+    for (size_t i = 0; i < outbounds.size(); ++i) {
+        const std::string_view tag = outbounds[i].tag;
+        if (tag.empty()) {
+            return {
+                .error = ConfigSemanticError::EmptyOutboundTag,
+                .index = i,
+                .tag = {},
+            };
+        }
+        if (tag.starts_with(naming::kPanelNodeTagPrefix)) {
+            return {.error = ConfigSemanticError::ReservedOutboundTag, .index = i, .tag = tag};
+        }
+        if (!tags.insert(tag).second) {
+            return {
+                .error = ConfigSemanticError::DuplicateOutboundTag,
+                .index = i,
+                .tag = tag,
+            };
+        }
+    }
+
+    for (size_t i = 0; i < rules.size(); ++i) {
+        const std::string_view tag = rules[i].outbound_tag;
+        if (tag.empty()) {
+            return {
+                .error = ConfigSemanticError::EmptyRouteOutboundTag,
+                .index = i,
+                .tag = {},
+            };
+        }
+        if (!tags.contains(tag)) {
+            return {
+                .error = ConfigSemanticError::UnknownRouteOutboundTag,
+                .index = i,
+                .tag = tag,
+            };
+        }
+    }
+
+    for (size_t i = 0; i < inbounds.size(); ++i) {
+        if (!inbounds[i].outbound_tag) continue;
+        const std::string_view tag = *inbounds[i].outbound_tag;
+        if (tag.empty()) {
+            return {
+                .error = ConfigSemanticError::EmptyStaticInboundOutboundTag,
+                .index = i,
+                .tag = tag,
+            };
+        }
+        if (!tags.contains(tag)) {
+            return {
+                .error = ConfigSemanticError::UnknownStaticInboundOutboundTag,
+                .index = i,
+                .tag = tag,
+            };
+        }
+    }
+
+    return {};
+}
+
+std::string StaticInboundSemanticValidation::Message() const {
+    switch (error) {
+        case StaticInboundSemanticError::None: return {};
+        case StaticInboundSemanticError::InvalidPort:
+            return std::format("at index {} has an invalid port", index);
+        case StaticInboundSemanticError::EmptyTag:
+            return std::format("at index {} has an empty tag", index);
+        case StaticInboundSemanticError::ReservedTag:
+            return std::format("at index {} uses reserved panel tag '{}'", index, detail);
+        case StaticInboundSemanticError::DuplicateTag:
+            return std::format("at index {} duplicates tag '{}' from index {}", index, detail, conflicting_index);
+        case StaticInboundSemanticError::DuplicateEndpoint:
+            return std::format("at index {} duplicates listen endpoint '{}' from index {}", index, detail, conflicting_index);
+    }
+    throw std::logic_error("unknown static inbound validation result");
+}
+
+StaticInboundSemanticValidation ValidateStaticInboundSemantics(
+    std::span<const StaticInboundConfig> inbounds) {
+    std::unordered_map<std::string, size_t> tags;
+    tags.reserve(inbounds.size());
+
+    for (size_t i = 0; i < inbounds.size(); ++i) {
+        const auto& inbound = inbounds[i];
+        if (inbound.port == 0) {
+            return {
+                .error = StaticInboundSemanticError::InvalidPort,
+                .index = i,
+                .conflicting_index = 0,
+                .detail = {},
+            };
+        }
+
+        auto validate_tag = [&](std::string tag) -> StaticInboundSemanticValidation {
+            if (tag.empty()) {
+                return {
+                    .error = StaticInboundSemanticError::EmptyTag,
+                    .index = i,
+                    .conflicting_index = 0,
+                    .detail = {},
+                };
+            }
+            if (tag.starts_with(naming::kPanelNodeTagPrefix)) {
+                return {.error = StaticInboundSemanticError::ReservedTag,
+                        .index = i, .conflicting_index = 0, .detail = std::move(tag)};
+            }
+            if (const auto [it, inserted] = tags.emplace(std::move(tag), i); !inserted) {
+                return {
+                    .error = StaticInboundSemanticError::DuplicateTag,
+                    .index = i,
+                    .conflicting_index = it->second,
+                    .detail = it->first,
+                };
+            }
+            return {};
+        };
+
+        if (inbound.tags.empty()) {
+            if (auto err = validate_tag(
+                    naming::BuildProtocolPortTag(inbound.protocol, inbound.port));
+                !err.Ok()) {
+                return err;
+            }
+        } else {
+            for (const auto& tag : inbound.tags) {
+                if (auto err = validate_tag(tag); !err.Ok()) {
+                    return err;
+                }
+            }
+        }
+
+        for (size_t previous = 0; previous < i; ++previous) {
+            if (inbounds[previous].port == inbound.port &&
+                inbounds[previous].listen.Overlaps(inbound.listen)) {
+                return {
+                    .error = StaticInboundSemanticError::DuplicateEndpoint,
+                    .index = i,
+                    .conflicting_index = previous,
+                    .detail = std::to_string(inbound.port),
+                };
+            }
+        }
+    }
+
+    return {};
+}
+
+bool ValidateConfig(const Config& config) {
+    if (config.workers == 0 || config.workers > defaults::kMaxWorkers) {
+        LOG_CONSOLE_ERROR("Worker count must be between 1 and {}", defaults::kMaxWorkers);
+        return false;
+    }
+
+    if (config.dns.servers.empty()) {
+        LOG_CONSOLE_ERROR("At least one DNS server is required");
+        return false;
+    }
+
+    if (config.timeouts.handshake == 0 ||
+        config.timeouts.dial == 0 ||
+        config.timeouts.read == 0 ||
+        config.timeouts.write == 0 ||
+        config.timeouts.idle == 0 ||
+        config.timeouts.uplink_only == 0 ||
+        config.timeouts.downlink_only == 0 ||
+        config.dns.timeout == 0) {
+        LOG_CONSOLE_ERROR("Timeout values must be positive");
+        return false;
+    }
+
+    if (config.dns.min_ttl > config.dns.max_ttl) {
+        LOG_CONSOLE_ERROR("DNS minTTL must be less than or equal to maxTTL");
+        return false;
+    }
+
+    std::unordered_set<std::string> panel_nodes;
+    for (const auto& panel : config.panels) {
+        if (!panel.Validate()) {
+            return false;
+        }
+        for (const int node_id : panel.NodeIDs.Values()) {
+            auto key = naming::BuildPanelNodeAccountingKey(panel.Name, node_id);
+            if (!panel_nodes.insert(key).second) {
+                const PanelLogContext log_context{panel.Name, panel.APIHost, node_id, panel.NodeType};
+                LOG_PANEL_ERROR(log_context, "Duplicate panel node identity");
+                return false;
+            }
+        }
+    }
+
+    const auto inbound_semantic = ValidateStaticInboundSemantics(config.static_inbounds);
+    if (!inbound_semantic.Ok()) {
+        LOG_CONSOLE_ERROR("Static inbound {}", inbound_semantic.Message());
+        return false;
+    }
+
+    const auto semantic = ValidateOutboundSelectionSemantics(
+        config.outbounds, config.routing.rules, config.static_inbounds);
+    switch (semantic.error) {
+        case ConfigSemanticError::None:
+            break;
+        case ConfigSemanticError::NoOutbounds:
+            LOG_CONSOLE_ERROR("At least one outbound is required");
+            return false;
+        case ConfigSemanticError::EmptyOutboundTag:
+            LOG_CONSOLE_ERROR("Outbound at index {} has an empty tag", semantic.index);
+            return false;
+        case ConfigSemanticError::ReservedOutboundTag:
+            LOG_CONSOLE_ERROR("Outbound at index {} uses reserved panel tag '{}'", semantic.index, semantic.tag);
+            return false;
+        case ConfigSemanticError::DuplicateOutboundTag:
+            LOG_CONSOLE_ERROR("Duplicate outbound tag '{}' at index {}",
+                      semantic.tag, semantic.index);
+            return false;
+        case ConfigSemanticError::EmptyRouteOutboundTag:
+            LOG_CONSOLE_ERROR("Routing rule at index {} has an empty outbound tag",
+                      semantic.index);
+            return false;
+        case ConfigSemanticError::UnknownRouteOutboundTag:
+            LOG_CONSOLE_ERROR("Routing rule at index {} references unknown outbound '{}'",
+                      semantic.index, semantic.tag);
+            return false;
+        case ConfigSemanticError::EmptyStaticInboundOutboundTag:
+            LOG_CONSOLE_ERROR("Static inbound at index {} has an empty outboundTag", semantic.index);
+            return false;
+        case ConfigSemanticError::UnknownStaticInboundOutboundTag:
+            LOG_CONSOLE_ERROR("Static inbound at index {} references unknown outboundTag '{}'",
+                      semantic.index, semantic.tag);
+            return false;
+    }
+
+    return true;
+}
+
+std::vector<std::string> GetUsedGeoIPTags(const RoutingConfig& routing) {
+    return GetUsedRouteRuleTags(routing, &RouteRuleConfig::geoip);
+}
+
+std::vector<std::string> GetUsedGeoSiteTags(const RoutingConfig& routing) {
+    return GetUsedRouteRuleTags(routing, &RouteRuleConfig::geosite);
 }
 

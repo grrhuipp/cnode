@@ -1,7 +1,6 @@
 #include <gtest/gtest.h>
 
 #include "anytls_codec.hpp"
-#include "padding.hpp"
 #include "transport/async_stream.hpp"
 #include "transport/link_error.hpp"
 

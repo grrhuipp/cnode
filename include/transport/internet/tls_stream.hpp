@@ -2,7 +2,7 @@
 
 #include "transport/async_stream.hpp"
 #include "transport/internet/tcp_stream.hpp"
-#include <openssl/ossl_typ.h>
+#include <openssl/ssl.h>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -33,10 +33,6 @@ struct DetachedTlsState {
 // ============================================================================
 class SslContext {
 public:
-    struct ContextState {
-        virtual ~ContextState() noexcept = default;
-    };
-
     // 创建服务端上下文（从文件加载证书）
     static std::unique_ptr<SslContext> CreateServer(const TlsConfig& config);
 
@@ -58,8 +54,7 @@ public:
 
     ~SslContext();
 
-    SSL_CTX* Native() { return native_owner_.get(); }
-    const SSL_CTX* Native() const { return native_owner_.get(); }
+    SSL_CTX* Native() const noexcept { return native_owner_.get(); }
     // Pin a published immutable context until SSL_new takes its own reference.
     [[nodiscard]] std::shared_ptr<SSL_CTX> AcquireNative() const noexcept;
 
@@ -69,17 +64,10 @@ public:
 
 private:
     static std::unique_ptr<SslContext> CreateAutoSignSnapshot(const TlsConfig& config);
-    struct SharedState {
-        std::unique_ptr<ContextState> context;
-        std::vector<unsigned char> server_alpn_wire;
-    };
-    // SSL_CTX owns callback data until its last SSL reference is released,
-    // even after the configuration wrapper/Worker that created it disappears.
-    explicit SslContext(SSL_CTX* ctx, std::unique_ptr<ContextState> context_state = nullptr);
+    explicit SslContext(SSL_CTX* ctx) noexcept : native_owner_(ctx, SSL_CTX_free) {}
     [[nodiscard]] bool ConfigureServerAlpn(
         const std::vector<std::string>& protocols);
 
-    SharedState* shared_state_ = nullptr;
     std::shared_ptr<SSL_CTX> native_owner_;
     std::shared_ptr<AutoSignContextRenewal> renewal_;
 };

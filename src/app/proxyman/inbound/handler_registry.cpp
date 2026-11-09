@@ -3,7 +3,6 @@
 #include "app/proxyman/inbound/factory.hpp"
 #include "app/proxyman/inbound/handler.hpp"
 #include "common/allocator.hpp"
-#include "common/online_device.hpp"
 #include "common/string_hash.hpp"
 
 namespace proxyman::inbound {

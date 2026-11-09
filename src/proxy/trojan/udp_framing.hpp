@@ -56,10 +56,10 @@ class UdpStreamEndpoint final : public proxy::OutboundStreamEndpointBase {
 public:
     explicit UdpStreamEndpoint(
         AsyncStream& stream,
-        TargetAddress fallback_target = {},
-        transport::EofAction read_eof_action = transport::EofAction::ShutdownPeerWrite)
+        const TargetAddress& fallback_target = EmptyTarget(),
+        transport::EofAction read_eof_action = transport::EofAction::ShutdownPeerWrite) noexcept
         : OutboundStreamEndpointBase(stream)
-        , fallback_target_(std::move(fallback_target))
+        , fallback_target_(fallback_target)
         , read_eof_action_(read_eof_action) {}
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
@@ -84,7 +84,12 @@ public:
     }
 
 private:
-    TargetAddress fallback_target_;
+    static const TargetAddress& EmptyTarget() noexcept {
+        static const TargetAddress kEmpty{};
+        return kEmpty;
+    }
+
+    const TargetAddress& fallback_target_;
     UdpFramer framer_;
     transport::EofAction read_eof_action_;
 };

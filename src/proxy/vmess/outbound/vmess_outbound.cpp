@@ -36,11 +36,11 @@ public:
     VMessOutboundEndpoint(vmess::encoding::ClientSession& session,
                           AsyncStream& stream,
                           bool is_udp,
-                          TargetAddress udp_target)
+                          const TargetAddress& udp_target) noexcept
         : OutboundStreamEndpointBase(stream)
         , session_(session)
         , is_udp_(is_udp)
-        , udp_target_(std::move(udp_target)) {}
+        , udp_target_(udp_target) {}
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
         if (!is_udp_) {
             return session_.DecodeResponse(stream_);
@@ -82,7 +82,7 @@ private:
 
     vmess::encoding::ClientSession& session_;
     bool is_udp_ = false;
-    TargetAddress udp_target_;
+    const TargetAddress& udp_target_;
 };
 
 net::awaitable<tl::expected<void, ErrorCode>>
@@ -222,63 +222,41 @@ const bool kVMessRegistered = (::proxyman::outbound::RegisterProxy(
             return std::nullopt;
         };
 
-        std::string address;
-        uint16_t port = 443;
-        auto security = ::vmess::Security::AES_128_GCM;
-        std::string uuid;
-
         const auto vnext_server = ::proxy::ParseOptionalSingleObjectArray(
             s, "vnext", "VMess", cfg.tag);
         if (!vnext_server) {
             return std::nullopt;
         }
+        const ::json::object& server_obj = *vnext_server ? **vnext_server : s;
+        const ::json::object* user_obj = &s;
         if (*vnext_server) {
-            const auto& server = **vnext_server;
-            const auto* user = ::proxy::ParseRequiredSingleObjectArray(
-                server, "users", "VMess", cfg.tag);
-            if (!user) {
+            user_obj = ::proxy::ParseRequiredSingleObjectArray(
+                server_obj, "users", "VMess", cfg.tag);
+            if (!user_obj) {
                 return std::nullopt;
             }
-            address = json_string(server, "address");
-            const auto source_port = ::ReadJsonPort(server, "port");
-            if (source_port.Invalid()) {
-                return std::nullopt;
-            }
-            if (source_port.Valid()) {
-                port = source_port.value;
-            }
-            uuid = json_string(*user, "id");
-            if (!has_supported_alter_id(*user)) {
-                return std::nullopt;
-            }
-            auto parsed_security = parse_security(json_string(*user, "security"));
-            if (!parsed_security) {
-                return std::nullopt;
-            }
-            security = *parsed_security;
-        } else {
-            if (s.if_contains("users")) {
-                LOG_ERROR("VMess outbound '{}': users requires vnext", cfg.tag);
-                return std::nullopt;
-            }
-            address = json_string(s, "address");
-            const auto source_port = ::ReadJsonPort(s, "port");
-            if (source_port.Invalid()) {
-                return std::nullopt;
-            }
-            if (source_port.Valid()) {
-                port = source_port.value;
-            }
-            uuid = json_string(s, "id");
-            if (!has_supported_alter_id(s)) {
-                return std::nullopt;
-            }
-            auto parsed_security = parse_security(json_string(s, "security"));
-            if (!parsed_security) {
-                return std::nullopt;
-            }
-            security = *parsed_security;
+        } else if (s.if_contains("users")) {
+            LOG_ERROR("VMess outbound '{}': users requires vnext", cfg.tag);
+            return std::nullopt;
         }
+        std::string address = json_string(server_obj, "address");
+        uint16_t port = 443;
+        const auto source_port = ::ReadJsonPort(server_obj, "port");
+        if (source_port.Invalid()) {
+            return std::nullopt;
+        }
+        if (source_port.Valid()) {
+            port = source_port.value;
+        }
+        std::string uuid = json_string(*user_obj, "id");
+        if (!has_supported_alter_id(*user_obj)) {
+            return std::nullopt;
+        }
+        auto parsed_security = parse_security(json_string(*user_obj, "security"));
+        if (!parsed_security) {
+            return std::nullopt;
+        }
+        const auto security = *parsed_security;
         if (invalid_field) {
             return std::nullopt;
         }
