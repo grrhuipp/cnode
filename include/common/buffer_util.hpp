@@ -158,3 +158,16 @@ template <typename Reader>
     co_return raw;
 }
 
+namespace buf {
+
+[[nodiscard]] inline std::span<const uint8_t> ChunkBytes(const Buffer* buffer) noexcept {
+    return buffer ? buffer->Bytes() : std::span<const uint8_t>{};
+}
+
+[[nodiscard]] inline std::span<const uint8_t> ChunkBytes(const net::const_buffer& buffer) noexcept {
+    const auto* data = static_cast<const uint8_t*>(buffer.data());
+    return data ? std::span<const uint8_t>(data, buffer.size()) : std::span<const uint8_t>{};
+}
+
+}  // namespace buf
+

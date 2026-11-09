@@ -1,7 +1,5 @@
 #include "app/proxyman/outbound/factory.hpp"
 
-#include "registration.hpp"
-
 #include <map>
 #include <stdexcept>
 

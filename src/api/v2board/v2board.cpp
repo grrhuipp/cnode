@@ -7,10 +7,7 @@
 #include "infra/log.hpp"
 #include "infra/panel_config.hpp"
 #include "http_response.hpp"
-#include "request_task.hpp"
-#include "node_info_json.hpp"
-#include "online_report.hpp"
-#include "user_list_json.hpp"
+#include "panel_json_compat.hpp"
 
 #include <asio/ip/tcp.hpp>
 #include <asio/ssl.hpp>

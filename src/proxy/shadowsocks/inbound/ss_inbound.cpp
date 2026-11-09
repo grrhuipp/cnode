@@ -313,9 +313,7 @@ proxy::shadowsocks::inbound::Handler::Process(
             }
         }
     }
-    result.user_owner = std::shared_ptr<const UserProfile>(std::move(users.users), &user.profile);
-    result.user = result.user_owner.get();
-    result.limiter = limiter_;
+    result.user = &user.profile;
     return result;
 }
 

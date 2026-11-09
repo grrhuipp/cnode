@@ -438,7 +438,16 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
         throw IoSystemError(net::error::operation_aborted);
     }
 
-    RouteResult dispatch = co_await RouteAsync(ctx, policy);
+    const TargetAddress& route_target = ctx.outbound.route_target.IsValid()
+        ? ctx.outbound.route_target
+        : ctx.outbound.target;
+    RouteResult dispatch =
+        (!detail::RequiresRouting(policy.outbound) ||
+         !route_target.IsDomain() ||
+         route_target.resolved_addr ||
+         router_.DomainStrategy() == routing::DomainStrategy::AsIs)
+            ? FinishRoute(ctx, SelectRoute(ctx, policy))
+            : co_await RouteAsync(ctx, policy);
     auto outbound_handler = std::move(dispatch.handler);
     if (!outbound_handler) {
         if (dispatch.error == ErrorCode::BLOCKED) {

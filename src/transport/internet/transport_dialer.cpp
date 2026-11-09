@@ -1,4 +1,4 @@
-#include "transport/internet/transport_dialer.hpp"
+#include "transport/internet/outbound_target_builder.hpp"
 #include "common/buffer_util.hpp"
 #include "transport/internet/async_write_gate.hpp"
 #include "common/session.hpp"
@@ -791,17 +791,12 @@ net::awaitable<DialResult> DialSingleCandidate(
 
     auto bind_local = candidate.bind_local;
 
-    DialResult tcp_result;
     if (bind_local) {
-        tcp_result = co_await TcpStream::ConnectWithBind(
+        co_return co_await TcpStream::ConnectWithBind(
             io_context, *bind_local, candidate.endpoint, target.timeout);
-    } else {
-        tcp_result = co_await TcpStream::Connect(
-            io_context, candidate.endpoint, target.timeout);
     }
-
-    tcp_result.attempted_remote_addr = candidate.endpoint.address();
-    co_return tcp_result;
+    co_return co_await TcpStream::Connect(
+        io_context, candidate.endpoint, target.timeout);
 }
 
 net::awaitable<DialResult> DialAndBuildXHttpRequestCandidate(
@@ -832,30 +827,21 @@ net::awaitable<DialResult> DialAndBuildXHttpRequestCandidate(
         packet_payload,
         ctx.conn_id);
     if (!build_result) {
-        const ErrorCode code = build_result.error();
-        memory::ThreadLocalString msg("xhttp client request failed: ");
-        msg.append(ErrorCodeToString(code));
-        auto result = DialResult::Fail(code, msg);
-        result.attempted_remote_addr = candidate.endpoint.address();
-        co_return result;
+        co_return DialResult::Fail(build_result.error());
     }
 
     auto stream = std::move(*build_result);
     if (kind != XHttpClientRequestKind::PacketUp && !stream) {
-        auto result = DialResult::Fail(
+        co_return DialResult::Fail(
             ErrorCode::SOCKET_EOF,
             "xhttp client request returned no stream");
-        result.attempted_remote_addr = candidate.endpoint.address();
-        co_return result;
     }
     if (stream) {
         stream->ClearPhaseDeadline();
         stream->SetIdleTimeout(std::chrono::seconds(0));
     }
 
-    auto result = DialResult::Success(std::move(stream));
-    result.attempted_remote_addr = candidate.endpoint.address();
-    co_return result;
+    co_return DialResult::Success(std::move(stream));
 }
 
 net::awaitable<DialResult> DialAndBuildSingleCandidate(
@@ -880,12 +866,7 @@ net::awaitable<DialResult> DialAndBuildSingleCandidate(
         target.ws_host,
         ctx.conn_id);
     if (!build_result) {
-        const ErrorCode code = build_result.error();
-        memory::ThreadLocalString msg("outbound transport build failed: ");
-        msg.append(ErrorCodeToString(code));
-        auto result = DialResult::Fail(code, msg);
-        result.attempted_remote_addr = candidate.endpoint.address();
-        co_return result;
+        co_return DialResult::Fail(build_result.error());
     }
 
     auto stream = std::move(*build_result);
@@ -893,9 +874,7 @@ net::awaitable<DialResult> DialAndBuildSingleCandidate(
     // 后续 outbound handler / relay 阶段会重新设置 idle/read/write timeout。
     stream->SetIdleTimeout(std::chrono::seconds(0));
 
-    auto result = DialResult::Success(std::move(stream));
-    result.attempted_remote_addr = candidate.endpoint.address();
-    co_return result;
+    co_return DialResult::Success(std::move(stream));
 }
 
 net::awaitable<DialResult> DialAndBuildCandidatesSequential(
@@ -1001,7 +980,7 @@ net::awaitable<DialResult> DialXHttpSplitOutboundTransport(
     }
 
     if (mode == XHttpMode::PacketUp) {
-        auto result = DialResult::Success(
+        co_return DialResult::Success(
             std::make_unique<XHttpPacketUpClientStream>(
                 io_context,
                 std::move(downlink),
@@ -1009,11 +988,9 @@ net::awaitable<DialResult> DialXHttpSplitOutboundTransport(
                 *upload_candidate,
                 upload_path,
                 ctx.conn_id));
-        result.attempted_remote_addr = selected->endpoint.address();
-        co_return result;
     }
 
-    auto result = DialResult::Success(
+    co_return DialResult::Success(
         std::make_unique<XHttpSplitClientStream>(
             io_context,
             std::move(downlink),
@@ -1021,8 +998,6 @@ net::awaitable<DialResult> DialXHttpSplitOutboundTransport(
             *upload_candidate,
             upload_path,
             ctx.conn_id));
-    result.attempted_remote_addr = selected->endpoint.address();
-    co_return result;
 }
 
 }  // namespace

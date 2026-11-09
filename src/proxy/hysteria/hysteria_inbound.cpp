@@ -1,6 +1,6 @@
 #include "../inbound_admission.hpp"
 #include "../../transport/internet/hysteria/hysteria_protocol.hpp"
-#include "../../transport/internet/hysteria/hysteria_settings.hpp"
+#include "../../transport/internet/hysteria/hysteria_ingress.hpp"
 #include "../../transport/internet/hysteria/quic_stream.hpp"
 
 #include "app/proxyman/inbound/factory.hpp"

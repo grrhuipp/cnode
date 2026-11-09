@@ -1227,7 +1227,7 @@ void Worker::UpdateRule(
         drain_requested_.load(std::memory_order_relaxed) ||
         !runtime_ || runtime_->listener_state->stopping)
         throw IoSystemError(net::error::operation_aborted);
-    runtime_->detect_rule_policy->UpdateSharedRule(tag, std::move(rules));
+    runtime_->detect_rule_policy->UpdateRule(tag, std::move(rules));
 }
 
 // ============================================================================

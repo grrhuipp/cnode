@@ -3,12 +3,12 @@
 // RFC 4648 binary-to-text codecs: Base16 digits and unpadded base64url
 // decoding. Single authority for these alphabets.
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <span>
 #include <string_view>
-
 
 // RFC 4648 §8 / RFC 5234 HEXDIG digit value, accepting both letter cases;
 // -1 for any other character.
@@ -68,3 +68,33 @@ struct Base64UrlDecoded {
     return decoded;
 }
 
+
+// Parses exactly 32 hexadecimal digits; '-' separators are ignored wherever
+// they appear. Signs, whitespace and prefixes are rejected.
+[[nodiscard]] constexpr std::optional<std::array<uint8_t, 16>>
+ParseUuid(std::string_view text) noexcept {
+    std::array<uint8_t, 16> out{};
+    size_t nibble_index = 0;
+    for (const char ch : text) {
+        if (ch == '-') {
+            continue;
+        }
+        const int value = HexDigitValue(static_cast<unsigned char>(ch));
+        if (value < 0 || nibble_index >= 32) {
+            return std::nullopt;
+        }
+        uint8_t& byte = out[nibble_index / 2];
+        byte = (nibble_index & 1) == 0
+            ? static_cast<uint8_t>(value << 4)
+            : static_cast<uint8_t>(byte | value);
+        ++nibble_index;
+    }
+    if (nibble_index != 32) {
+        return std::nullopt;
+    }
+    return out;
+}
+
+namespace proxy {
+using ::ParseUuid;
+}  // namespace proxy

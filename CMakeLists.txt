@@ -84,14 +84,12 @@ set(CNODE_CORE_SOURCES
 
     # App - DNS
     src/app/dns/dns.cpp
-    src/app/dns/cache.cpp
 
     # Geo
     src/geo/geodata.cpp
 
     # Transport - common stream interface
     src/transport/async_stream.cpp
-    src/transport/internet/inbound_listen.cpp
     src/transport/internet/stream_settings.cpp
     src/transport/internet/outbound_bind.cpp
 
@@ -100,10 +98,8 @@ set(CNODE_CORE_SOURCES
     src/transport/internet/tcp_stream.cpp
     src/transport/internet/timeout_scheduler.cpp
     src/transport/internet/tls_client_context.cpp
-    src/transport/internet/tls_config.cpp
     src/transport/internet/tls_stream.cpp
     src/transport/internet/autosign_cert.cpp
-    src/transport/internet/reality_key.cpp
     src/transport/internet/reality_tls.cpp
     src/transport/internet/ws_stream.cpp
     src/transport/internet/http1_handshake.cpp
@@ -122,7 +118,6 @@ set(CNODE_CORE_SOURCES
     src/app/proxyman/inbound/factory.cpp
     src/app/proxyman/inbound/handler.cpp
     src/app/proxyman/inbound/handler_registry.cpp
-    src/app/worker/tcp_listener.cpp
     src/app/worker/udp_ingress.cpp
     src/app/worker/udp_association_reclaimer.cpp
     src/app/proxyman/inbound/user_store.cpp
@@ -164,7 +159,6 @@ set(CNODE_CORE_SOURCES
     # Proxy - VLESS
     src/proxy/vless/vless_codec.cpp
     src/proxy/vless/vless_encryption.cpp
-    src/proxy/vless/vless_encryption_io.cpp
     src/proxy/vless/vless_encryption_runtime.cpp
     src/proxy/vless/udp_framing.cpp
     src/proxy/vless/vless_vision.cpp
@@ -208,8 +202,6 @@ set(CNODE_CORE_SOURCES
 
     # API / panel clients
     src/api/v2board/node_info_json.cpp
-    src/api/v2board/online_report.cpp
-    src/api/v2board/user_list_json.cpp
     src/api/v2board/v2board.cpp
 )
 

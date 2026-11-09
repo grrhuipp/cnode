@@ -1,7 +1,6 @@
 #pragma once
 
 #include "infra/config_types.hpp"
-#include "infra/outbound_source_config.hpp"
 #include "infra/panel_config.hpp"
 #include "infra/runtime_config_types.hpp"
 #include <cstddef>

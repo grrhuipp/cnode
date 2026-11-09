@@ -44,10 +44,7 @@ struct FixtureState {
 };
 thread_local FixtureState* fixture = nullptr;
 
-class Runtime final : public proxyman::inbound::ProtocolRuntime {
-public:
-    std::vector<OnlineDevice> GetOnlineDevices(std::string_view) const override { return {}; }
-};
+class Runtime final : public proxyman::inbound::ProtocolRuntime {};
 
 // Observe actor identity without extending its lifetime. Request admission still
 // travels through the real Worker handlers and physical session capabilities.

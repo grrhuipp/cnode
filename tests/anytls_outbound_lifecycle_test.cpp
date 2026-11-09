@@ -11,7 +11,6 @@
 #include "transport/internet/tls_stream.hpp"
 #include "transport/internet/tcp_stream.hpp"
 #include "transport/internet/outbound_target_builder.hpp"
-#include "transport/internet/transport_dialer.hpp"
 #include "transport/internet/timeout_scheduler.hpp"
 #include "transport/link_error.hpp"
 #include "../src/common/awaitable_task_group.hpp"

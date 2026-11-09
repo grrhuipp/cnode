@@ -1,7 +1,8 @@
-#include "trojan_outbound.hpp"
 #include "common/domain_name.hpp"
 #include "common/ip_address.hpp"
 #include "common/ip_utils.hpp"
+#include "common/unsafe.hpp"
+#include "proxy/outbound.hpp"
 #include "../trojan_codec.hpp"
 #include "../udp_framing.hpp"
 #include "../../handshake_timeout.hpp"
@@ -9,8 +10,7 @@
 #include "../../outbound_stream_endpoint.hpp"
 #include "app/relay.hpp"
 #include "app/proxyman/outbound/factory.hpp"
-#include "../../../app/proxyman/outbound/registration.hpp"
-#include "infra/json_field.hpp"
+#include "infra/json.hpp"
 #include "app/dns/dns.hpp"
 #include "common/allocator.hpp"
 #include "common/buffer_util.hpp"
@@ -29,6 +29,47 @@
 #include <utility>
 #include <vector>
 
+#include <chrono>
+#include <memory>
+
+struct TrojanOutboundConfig {
+    OutboundServer server;
+    trojan::PasswordHash password_hash{};
+
+    TrojanOutboundConfig() = default;
+    TrojanOutboundConfig(const TrojanOutboundConfig&) = default;
+    TrojanOutboundConfig& operator=(const TrojanOutboundConfig&) = default;
+    TrojanOutboundConfig(TrojanOutboundConfig&&) noexcept = default;
+    TrojanOutboundConfig& operator=(TrojanOutboundConfig&&) noexcept = default;
+    ~TrojanOutboundConfig() noexcept {
+        ::SecureZeroMemory(password_hash.data(), password_hash.size());
+    }
+};
+
+namespace proxy::trojan::outbound {
+
+class Handler final : public ::Outbound {
+public:
+    explicit Handler(std::shared_ptr<const ::TrojanOutboundConfig> config);
+
+    ~Handler() override;
+
+    ::net::awaitable<::OutboundProcessResult> Process(
+        ::session::Context& ctx,
+        ::transport::Link inbound,
+        ::OutboundDialer& dialer,
+        const ::TimeoutsConfig& timeouts,
+        ::StatsShard& stats,
+        const ::RelayConfig& relay_config,
+        ::buf::MultiBufferBatch first_payload,
+        std::chrono::seconds relay_idle_timeout,
+        std::chrono::seconds relay_write_timeout) override;
+
+private:
+    std::shared_ptr<const ::TrojanOutboundConfig> config_;
+};
+
+}  // namespace proxy::trojan::outbound
 
 namespace {
 

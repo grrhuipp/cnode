@@ -139,7 +139,6 @@ struct UdpIngress::ClientSession::Impl : memory::ThreadAllocated {
         uint32_t worker_id = 0;
         // Owned copy of the authenticating credential's profile.
         UserProfile profile;
-        std::shared_ptr<UserOnlineTracker> tracker_owner;
         UserOnlineTracker* tracker = nullptr;
         ConnectionLimiter* limiter = nullptr;
         uint32_t* active_sessions = nullptr;
@@ -466,10 +465,6 @@ UdpIngress::~UdpIngress() noexcept {
 }
 
 
-std::string_view UdpIngress::Tag() const noexcept {
-    return impl_->tag;
-}
-
 UdpIngress::ResourceStats UdpIngress::GetResourceStats() const noexcept {
     ResourceStats stats{};
     for (const auto& [socket_key, sessions] : impl_->client_sessions) {
@@ -512,7 +507,9 @@ bool UdpIngress::ReplaceHandler(
 void UdpIngress::RequestStop() noexcept {
     if (impl_->state != Impl::State::Running) return;
     impl_->state = Impl::State::Stopping;
-    CloseAllSockets();
+    while (!impl_->udp_sockets.empty()) {
+        CloseSocket(impl_->udp_sockets.begin()->first);
+    }
     CleanupAllClientSessions();
     impl_->reply_queues.clear();
 
@@ -640,7 +637,6 @@ net::awaitable<void> UdpIngress::RunNativeDispatch(ClientSessionPtr client_sessi
             *request.stats);
         request.profile = {};
         request.tracker = nullptr;
-        request.tracker_owner.reset();
         if (!admission || client_session->Closed()) {
             client_session->Close();
             co_return;
@@ -719,7 +715,6 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
         }
         return;
     }
-    if (!buf::SetUdpTarget(decoded->payload, decoded->target)) return;
     if (datagram.environment && decoded->association_policy &&
         decoded->session_id && decoded->packet_id) {
         if (!datagram.environment->prepared || !datagram.environment->prepared->settings) return;
@@ -913,15 +908,11 @@ void UdpIngress::ProcessDecoded(const UdpDatagramContext& datagram,
             request.dispatcher = env.dispatcher;
             request.stats = env.stats;
             request.limiter = env.limiter;
-            request.tracker_owner = std::move(decoded->tracker);
-            request.tracker = env.tracker ? env.tracker : request.tracker_owner.get();
+            request.tracker = env.tracker;
             request.active_sessions = env.active_sessions;
         } else {
             request.dispatcher = datagram.dispatcher;
             request.stats = &datagram.stats;
-            request.limiter = decoded->limiter;
-            request.tracker_owner = std::move(decoded->tracker);
-            request.tracker = request.tracker_owner.get();
         }
         ::proxy::BindAuthenticatedInbound(
             ctx, request.profile,
@@ -1270,12 +1261,6 @@ void UdpIngress::CloseSocket(std::string_view socket_key) noexcept {
         IoErrorCode ec;
         socket->cancel(ec);
         socket->close(ec);
-    }
-}
-
-void UdpIngress::CloseAllSockets() noexcept {
-    while (!impl_->udp_sockets.empty()) {
-        CloseSocket(impl_->udp_sockets.begin()->first);
     }
 }
 

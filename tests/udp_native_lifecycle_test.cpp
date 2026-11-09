@@ -69,7 +69,6 @@ public:
         const ::InboundDatagramRequest& request) override {
         ::InboundDatagramResult result;
         result.user = &profile_;
-        result.tracker = tracker_;
         constexpr std::array<uint8_t, 1> owner{0x47};
         if (!result.session_owner.Assign(owner))
             return tl::unexpected(::ErrorCode::RESOURCE_EXHAUSTED);
@@ -89,7 +88,6 @@ public:
     }
 
 private:
-    std::shared_ptr<::UserOnlineTracker> tracker_ = std::make_shared<::UserOnlineTracker>();
     ::UserProfile profile_;
 };
 

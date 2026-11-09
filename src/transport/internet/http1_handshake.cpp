@@ -137,24 +137,11 @@ public:
             }
             co_return;
         }
-        std::array<char, sizeof(size_t) * 2 + 2> prefix{};
-        auto [ptr, ec] = std::to_chars(
-            prefix.data(),
-            prefix.data() + prefix.size() - 2,
-            len,
-            16);
-        if (ec != std::errc{}) {
+        Http1ChunkPrefixBuffer prefix{};
+        ConstBufferSpanBuilder<16> chunk_buffers;
+        if (!AppendHttp1Chunk(chunk_buffers, prefix, buffers, len)) {
             throw IoSystemError(io_error::fault, "http1 chunk size encode failed");
         }
-        *ptr++ = '\r';
-        *ptr++ = '\n';
-
-        constexpr std::array<char, 2> kChunkTail{'\r', '\n'};
-        ConstBufferSpanBuilder<16> chunk_buffers;
-        chunk_buffers.Append(
-            net::buffer(prefix.data(), static_cast<size_t>(ptr - prefix.data())));
-        chunk_buffers.AppendBuffers(buffers);
-        chunk_buffers.Append(net::buffer(kChunkTail.data(), kChunkTail.size()));
         try {
             co_await inner_->WriteBuffers(chunk_buffers.Span());
         } catch (...) {
@@ -397,11 +384,10 @@ private:
                     pending_.clear();
                     co_return false;
                 }
-                const size_t colon = line_.find(':');
-                if (colon == std::string::npos || colon == 0 ||
-                    !IsValidHttpHeaderName(std::string_view(line_).substr(0, colon)) ||
-                    !IsValidHttpHeaderValue(
-                        TrimHttpOws(std::string_view(line_).substr(colon + 1)))) {
+                std::string_view trailer_name;
+                std::string_view trailer_value;
+                if (!SplitAndValidateHttpHeaderLine(
+                        line_, trailer_name, trailer_value)) {
                     FailBodyRead("invalid HTTP/1 chunk trailer line");
                 }
                 const size_t line_bytes = line_.size() + 2;
@@ -470,11 +456,6 @@ private:
     return EqualsAsciiCI(key, "Host");
 }
 
-[[nodiscard]] std::string_view ConfiguredHostHeader(const HttpHeaders& headers) noexcept {
-    const std::string* host = FindHttpHeader(headers, "Host");
-    return host ? std::string_view(*host) : std::string_view{};
-}
-
 [[nodiscard]] bool IsReservedUpgradeHeader(std::string_view key) noexcept {
     return EqualsAsciiCI(key, "Host") ||
            EqualsAsciiCI(key, "Upgrade") ||
@@ -494,30 +475,6 @@ void LogHeadReadFailure(std::string_view scope, uint64_t conn_id, ErrorCode erro
     } else if (error == ErrorCode::PROTOCOL_DECODE_FAILED) {
         LOG_CONN_DEBUG(conn_id, "{} HTTP/1 message head too large or incomplete", scope);
     }
-}
-
-// Request line, CRLF and fields; transport-specific framing headers are added
-// by the caller before the configured fields.
-void AppendRequestStart(memory::ThreadLocalString& request,
-                        std::string_view method,
-                        std::string_view path,
-                        std::string_view host) {
-    request.append(method);
-    request.push_back(' ');
-    request.append(path);
-    request.append(" HTTP/1.1\r\n");
-    request.append("Host: ");
-    request.append(host);
-    request.append("\r\n");
-}
-
-void AppendHeaderLine(memory::ThreadLocalString& out,
-                      std::string_view name,
-                      std::string_view value) {
-    out.append(name);
-    out.append(": ");
-    out.append(value);
-    out.append("\r\n");
 }
 
 // Reads the response head of a client handshake and requires `status_code`.
@@ -597,12 +554,7 @@ net::awaitable<tl::expected<void, ErrorCode>> ReadHttp1MessageHead(
             if (!mb.empty()) {
                 head.size += mb.ConsumePrefixTo(
                     std::span<uint8_t>(data + head.size, capacity - head.size));
-                for (size_t i = mb.size(); i > 0; --i) {
-                    if (const buf::Buffer* b = *(mb.begin() + (i - 1)); b && !b->IsEmpty()) {
-                        stream.PrependReadData(b->Bytes());
-                    }
-                }
-                mb.clear();
+                stream.PrependReadMultiBuffer(std::move(mb));
             }
         } else {
             head.storage = buf::BufferGuard{buf::Buffer::New()};
@@ -909,19 +861,30 @@ std::string SanitizeHttpRequestLineForLog(const Http1RequestLine& line) {
     return out;
 }
 
-std::string_view ExpectedHttpHost(const HttpConfig& cfg) {
-    return cfg.host.empty() ? ConfiguredHostHeader(cfg.headers)
-                            : std::string_view(cfg.host);
+void AppendRequestStart(memory::ThreadLocalString& request,
+                        std::string_view method,
+                        std::string_view path,
+                        std::string_view host) {
+    request.append(method);
+    request.push_back(' ');
+    request.append(path);
+    request.append(" HTTP/1.1\r\n");
+    request.append("Host: ");
+    request.append(host);
+    request.append("\r\n");
 }
 
-std::string_view ResolveHttpUpgradeHost(std::string_view fallback_host,
-                                        std::string_view configured_host,
-                                        const HttpHeaders* headers) noexcept {
-    const std::string_view raw_host = !configured_host.empty()
-        ? configured_host
-        : (headers ? ConfiguredHostHeader(*headers) : std::string_view{});
-    const std::string_view trimmed = TrimAscii(raw_host);
-    return trimmed.empty() ? fallback_host : trimmed;
+void AppendHeaderLine(memory::ThreadLocalString& out,
+                      std::string_view name,
+                      std::string_view value) {
+    out.append(name);
+    out.append(": ");
+    out.append(value);
+    out.append("\r\n");
+}
+
+std::string_view ExpectedHttpHost(const HttpConfig& cfg) {
+    return ResolveConfiguredHttpHost(cfg.host, &cfg.headers);
 }
 
 net::awaitable<tl::expected<Http1MessageHead, ErrorCode>>
@@ -1164,7 +1127,7 @@ net::awaitable<TransportBuildResult> DoHttpUpgradeServerHandshake(
     }
 
     if (const std::string_view expected_host =
-            ResolveHttpUpgradeHost({}, cfg.host, &cfg.headers);
+            ResolveConfiguredHttpHost(cfg.host, &cfg.headers);
         !expected_host.empty() && !EqualsAsciiCI(host, expected_host)) {
         LOG_CONN_DEBUG(conn_id,
             "HTTPUpgrade server host mismatch expected='{}' actual='{}'",
@@ -1200,7 +1163,7 @@ net::awaitable<TransportBuildResult> DoHttpUpgradeClientHandshake(
     uint64_t conn_id) {
     const std::string_view req_path = EffectiveHttpPath(cfg.path);
     const std::string_view effective_host =
-        ResolveHttpUpgradeHost(host, cfg.host, &cfg.headers);
+        ResolveConfiguredHttpHost(cfg.host, &cfg.headers, host);
     auto head = co_await ExecuteHttp1UpgradeClientHandshake(
         *stream, "HTTPUpgrade", conn_id, effective_host, req_path, &cfg.headers);
     if (!head) {

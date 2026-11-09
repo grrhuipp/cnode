@@ -3,7 +3,6 @@
 #include "../../outbound_stream_endpoint.hpp"
 #include "../../udp_target.hpp"
 #include "../ss_udp.hpp"
-#include "common/buf/contiguous_buffer_view.hpp"
 
 #include "common/unsafe.hpp"
 #include <array>

@@ -188,6 +188,7 @@ public:
      */
     virtual bool IsOpen() const = 0;
     virtual void PrependReadData(std::span<const uint8_t> data);
+    virtual void PrependReadMultiBuffer(buf::MultiBuffer&& mb);
 
     // ========================================================================
     // Tcp 能力透传
@@ -265,11 +266,6 @@ bool ConsumeWriteSideTimeout(Stream& stream) {
 // ============================================================================
 struct DialResult : ResultStatus {
     std::unique_ptr<AsyncStream> stream;  // 成功时有效
-    int32_t native_error_code = 0;
-    // The endpoint address used by the most recent transport dial attempt.
-    // This is transport metadata only; an outbound decides whether the
-    // endpoint represents the final destination or a proxy next hop.
-    std::optional<net::ip::address> attempted_remote_addr;
 
     [[nodiscard]] bool Ok() const noexcept {
         return ResultStatus::Ok() && stream != nullptr;
@@ -283,11 +279,9 @@ struct DialResult : ResultStatus {
 
     [[nodiscard]] static DialResult Fail(
         ErrorCode code,
-        std::string_view msg = "",
-        int32_t native_error = 0) {
+        std::string_view msg = "") {
         DialResult r;
         r.SetError(code, msg);
-        r.native_error_code = native_error;
         return r;
     }
 };

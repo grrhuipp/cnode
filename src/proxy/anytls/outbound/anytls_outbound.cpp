@@ -1,7 +1,6 @@
 #include "anytls_outbound.hpp"
 #include "common/address_codec.hpp"
-#include "../credentials.hpp"
-#include "infra/json_field.hpp"
+#include "infra/json.hpp"
 #include "../../../common/awaitable_task_group.hpp"
 
 #include "../anytls_codec.hpp"
@@ -23,7 +22,6 @@
 #include "infra/runtime_failure.hpp"
 #include "infra/config_types.hpp"
 #include "app/proxyman/outbound/factory.hpp"
-#include "../../../app/proxyman/outbound/registration.hpp"
 #include "transport/internet/outbound_target_builder.hpp"
 #include "transport/internet/timeout_scheduler.hpp"
 #include "transport/link_error.hpp"
@@ -1219,8 +1217,8 @@ net::awaitable<OutboundProcessResult> Handler::ProcessSession(
 
     struct LogicalEndpoint final : transport::MultiBufferReader,
                                    transport::MultiBufferWriter {
-        std::shared_ptr<ClientSession> session;
-        std::shared_ptr<ClientSession::LogicalStream> logical;
+        ClientSession& session;
+        ClientSession::LogicalStream& logical;
         uint32_t sid = 0;
         bool cancelled = false;
         size_t pending_writes = 0;
@@ -1233,15 +1231,15 @@ net::awaitable<OutboundProcessResult> Handler::ProcessSession(
             PendingWrite& operator=(const PendingWrite&) = delete;
         };
 
-        LogicalEndpoint(std::shared_ptr<ClientSession> s,
-                        std::shared_ptr<ClientSession::LogicalStream> l,
-                        uint32_t stream_id)
-            : session(std::move(s))
-            , logical(std::move(l))
+        LogicalEndpoint(ClientSession& s,
+                        ClientSession::LogicalStream& l,
+                        uint32_t stream_id) noexcept
+            : session(s)
+            , logical(l)
             , sid(stream_id) {}
 
         net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
-            auto payload = co_await logical->ReadPayload();
+            auto payload = co_await logical.ReadPayload();
             if (!payload) {
                 if (payload.error() == ErrorCode::OK) {
                     co_return buf::MultiBuffer{};
@@ -1261,12 +1259,12 @@ net::awaitable<OutboundProcessResult> Handler::ProcessSession(
             if (cancelled) {
                 throw transport::LinkError(ErrorCode::CANCELLED);
             }
-            logical->CheckWrite();
+            logical.CheckWrite();
 
             PendingWrite pending(pending_writes);
-            auto ok = co_await session->WritePayloadFrames(sid, *logical, std::move(mb));
+            auto ok = co_await session.WritePayloadFrames(sid, logical, std::move(mb));
             if (!ok) {
-                logical->Close(ok.error());
+                logical.Close(ok.error());
                 throw transport::LinkError(ok.error());
             }
         }
@@ -1275,57 +1273,57 @@ net::awaitable<OutboundProcessResult> Handler::ProcessSession(
             if (cancelled) {
                 throw transport::LinkError(ErrorCode::CANCELLED);
             }
-            logical->CheckWrite();
+            logical.CheckWrite();
             PendingWrite pending(pending_writes);
-            auto ok = co_await session->WritePayloadBuffers(sid, *logical, buffers);
+            auto ok = co_await session.WritePayloadBuffers(sid, logical, buffers);
             if (!ok) {
-                logical->Close(ok.error());
+                logical.Close(ok.error());
                 throw transport::LinkError(ok.error());
             }
         }
 
         net::awaitable<void> AsyncShutdownWrite() override {
-            if (!cancelled && logical->BeginLocalClose()) {
+            if (!cancelled && logical.BeginLocalClose()) {
                 PendingWrite pending(pending_writes);
-                if (auto ok = co_await session->WriteFrameSerialized(kCmdFIN, sid, {}); !ok) {
+                if (auto ok = co_await session.WriteFrameSerialized(kCmdFIN, sid, {}); !ok) {
                     throw transport::LinkError(ok.error());
                 }
             }
         }
 
-        transport::CancellationSource& Cancellation() noexcept override { return logical->Cancellation(); }
+        transport::CancellationSource& Cancellation() noexcept override { return logical.Cancellation(); }
 
         void Cancel() noexcept {
             cancelled = true;
-            logical->Close(ErrorCode::CANCELLED);
+            logical.Close(ErrorCode::CANCELLED);
             // Relay also calls Cancel after a successful join. Preserve that
             // idle transport, but abort a pending gate/write: a partial frame
             // cannot safely be handed to the next request.
-            if (pending_writes != 0) session->CloseAll(ErrorCode::CANCELLED);
+            if (pending_writes != 0) session.CloseAll(ErrorCode::CANCELLED);
         }
 
         void SetIdleTimeout(std::chrono::seconds timeout) {
-            session->stream->SetIdleTimeout(timeout);
+            session.stream->SetIdleTimeout(timeout);
         }
         void SetReadTimeout(std::chrono::seconds timeout) {
-            session->stream->SetReadTimeout(timeout);
+            session.stream->SetReadTimeout(timeout);
         }
         void SetWriteTimeout(std::chrono::seconds timeout) {
-            session->stream->SetWriteTimeout(timeout);
+            session.stream->SetWriteTimeout(timeout);
         }
         PhaseDeadlineHandle StartPhaseDeadline(std::chrono::seconds timeout) {
-            return session->stream->StartPhaseDeadline(timeout);
+            return session.stream->StartPhaseDeadline(timeout);
         }
-        void ClearPhaseDeadline() { session->stream->ClearPhaseDeadline(); }
-        bool ConsumeIdleTimeout() noexcept { return session->stream->ConsumeIdleTimeout(); }
-        bool ConsumeReadTimeout() noexcept { return session->stream->ConsumeReadTimeout(); }
-        bool ConsumeWriteTimeout() noexcept { return session->stream->ConsumeWriteTimeout(); }
-        bool ConsumePhaseDeadline() noexcept { return session->stream->ConsumePhaseDeadline(); }
+        void ClearPhaseDeadline() { session.stream->ClearPhaseDeadline(); }
+        bool ConsumeIdleTimeout() noexcept { return session.stream->ConsumeIdleTimeout(); }
+        bool ConsumeReadTimeout() noexcept { return session.stream->ConsumeReadTimeout(); }
+        bool ConsumeWriteTimeout() noexcept { return session.stream->ConsumeWriteTimeout(); }
+        bool ConsumePhaseDeadline() noexcept { return session.stream->ConsumePhaseDeadline(); }
     };
 
     LogicalEndpoint target_endpoint(
-        session,
-        logical,
+        *session,
+        *logical,
         sid);
 
     RelayResult result;

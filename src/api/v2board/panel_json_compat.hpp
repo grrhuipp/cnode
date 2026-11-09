@@ -1,12 +1,18 @@
 #pragma once
 
+#include "api/api.hpp"
+#include "infra/json.hpp"
 #include "transport/internet/http_headers.hpp"
-#include "infra/json_field.hpp"
 
 #include <charconv>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
+#include <string>
 #include <string_view>
+#include <tl/expected.hpp>
+#include <vector>
 
 namespace api::v2board {
 
@@ -64,4 +70,24 @@ namespace api::v2board {
     return std::nullopt;
 }
 
+
+struct OnlineReportPayload {
+    json::object alive_body;
+    size_t user_count = 0;
+    size_t device_count = 0;
+};
+
+[[nodiscard]] tl::expected<::api::NodeInfo, std::string> ParseNodeInfo(
+    const json::object& source,
+    std::string_view node_type);
+
+[[nodiscard]] std::vector<rule::DetectRule> ExtractBlockDetectRules(
+    const json::object& config);
+
+[[nodiscard]] tl::expected<std::vector<::api::UserInfo>, std::string>
+ParseUserList(const json::object& source);
+
+[[nodiscard]] OnlineReportPayload BuildOnlineReportPayload(
+    std::span<const ::api::OnlineUser> online_devices,
+    int node_id);
 }  // namespace api::v2board

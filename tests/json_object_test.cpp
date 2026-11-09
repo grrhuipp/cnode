@@ -1,7 +1,7 @@
 #include <stdexcept>
 #include <gtest/gtest.h>
 
-#include "infra/json_field.hpp"
+#include "infra/json.hpp"
 
 #include <cstdlib>
 #include <iostream>

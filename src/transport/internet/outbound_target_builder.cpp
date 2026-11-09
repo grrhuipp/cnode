@@ -8,7 +8,6 @@
 #include "core/constants.hpp"
 #include "common/session.hpp"
 #include "infra/log.hpp"
-#include "transport/internet/transport_dialer.hpp"
 
 #include <algorithm>
 #include <memory>

@@ -500,11 +500,13 @@ void LoadCategories(
         }
         const auto entry = list.Bytes();
         auto parsed_code = EntryCountryCode(entry, path);
-        if (!std::ranges::binary_search(wanted, parsed_code.code, less_ignore_case)) {
+        const auto wanted_it = std::ranges::lower_bound(
+            wanted, parsed_code.code, less_ignore_case);
+        if (wanted_it == wanted.end() ||
+            less_ignore_case(parsed_code.code, *wanted_it)) {
             continue;
         }
-        auto code = LowerTag(parsed_code.code);
-        auto [it, inserted] = out.try_emplace(std::move(code), memory::process_resource());
+        auto [it, inserted] = out.try_emplace(*wanted_it, memory::process_resource());
         if (!inserted) {
             ThrowCorrupt(path, std::format("duplicate {} tag '{}'", kind, it->first));
         }

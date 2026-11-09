@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "credentials.hpp"
+#include "vless_codec.hpp"
 
 #include <array>
 #include <iostream>

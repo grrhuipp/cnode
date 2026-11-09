@@ -98,8 +98,12 @@ struct ReenterOnCancel {
 
     void Cancel() noexcept {
         ++calls;
-        if (close_all) ingress->CloseAllSockets();
-        else ingress->CloseSocket(key);
+        if (close_all) {
+            ingress->CloseSocket("all-a");
+            ingress->CloseSocket("all-b");
+        } else {
+            ingress->CloseSocket(key);
+        }
     }
 };
 
@@ -144,7 +148,6 @@ public:
         const ::InboundDatagramRequest& request) override {
         ::InboundDatagramResult result;
         result.user = &profile_;
-        result.tracker = tracker_;
         const std::array<uint8_t, 1> owner{0x71};
         if (!result.session_owner.Assign(owner)) {
             return tl::unexpected(::ErrorCode::RESOURCE_EXHAUSTED);
@@ -164,7 +167,6 @@ public:
         return std::make_shared<DatagramResponse>();
     }
 private:
-    std::shared_ptr<::UserOnlineTracker> tracker_ = std::make_shared<::UserOnlineTracker>();
     ::UserProfile profile_;
 };
 
@@ -627,7 +629,7 @@ TEST(UdpAssociationReclaimer, Contract) {
     ReenterOnCancel all_reentry{.ingress = &all_ingress, .key = {}, .close_all = true};
     ReentryCancellation all_subscription(all_reentry);
     all_subscription.Resubscribe(all_session->Cancellation());
-    all_ingress.CloseAllSockets();
+    all_ingress.RequestStop();
     if (all_ingress.FindSocket("all-a") || all_ingress.FindSocket("all-b") ||
         !all_session->Closed() || all_reentry.calls != 1 ||
         all_ingress.GetResourceStats().associations != 0) {

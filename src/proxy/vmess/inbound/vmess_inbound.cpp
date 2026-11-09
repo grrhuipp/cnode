@@ -1,13 +1,14 @@
-#include "vmess_inbound.hpp"
 #include "../../mux/inbound/mux_inbound.hpp"
 #include "../../inbound_admission.hpp"
+#include "proxy/inbound.hpp"
+#include "common/sharded_user_stats.hpp"
 #include "transport/async_stream.hpp"
 #include "app/rate_limiter.hpp"
 #include "app/stats.hpp"
 #include "features/routing/dispatcher.hpp"
 #include "../validator.hpp"
 #include "../encoding/server.hpp"
-#include "../account.hpp"
+#include "../vmess_crypto.hpp"
 #include "app/proxyman/inbound/factory.hpp"
 #include "app/proxyman/inbound/receiver_settings.hpp"
 #include "infra/config_types.hpp"
@@ -132,6 +133,31 @@ ParseHandshake(AsyncStream& stream,
 
 }  // namespace
 
+namespace proxy::vmess::inbound {
+
+class Handler final : public ::Inbound {
+public:
+    Handler(::UserOnlineTracker& validator,
+            ::StatsShard& stats,
+            ::ConnectionLimiter* limiter);
+
+    ::net::awaitable<::RelayResult> Process(
+        std::unique_ptr<::AsyncStream> stream,
+        ::routing::Dispatcher& dispatcher,
+        const ::proxyman::inbound::ReceiverSettings& receiver,
+        ::net::io_context& io_context,
+        ::session::Context& ctx,
+        const ::TimeoutsConfig& timeouts,
+        uint32_t pressure_idle_timeout) override;
+
+private:
+    ::UserOnlineTracker& validator_;
+    ::StatsShard& stats_;
+    ::ConnectionLimiter* limiter_;
+};
+
+}  // namespace proxy::vmess::inbound
+
 // ============================================================================
 // proxy/vmess/inbound.Handler 实现（代理层，无传输层知识）
 // ============================================================================
@@ -167,15 +193,17 @@ proxy::vmess::inbound::Handler::Process(
         if (co_await proxy::CheckInboundIpBanned(limiter_, ctx)) {
             co_return proxy::RejectInbound(stats_, stream.get(), ErrorCode::BLOCKED);
         }
-        ::vmess::encoding::ServerSession vmess_session(tag);
-        auto parsed_session = co_await ParseHandshake(
-            *stream, vmess_session, validator_, limiter_, ctx, client_ip);
-        if (!parsed_session) {
-            co_return proxy::RejectInbound(stats_, stream.get(), parsed_session.error());
+        {
+            ::vmess::encoding::ServerSession vmess_session(tag);
+            auto parsed_session = co_await ParseHandshake(
+                *stream, vmess_session, validator_, limiter_, ctx, client_ip);
+            if (!parsed_session) {
+                co_return proxy::RejectInbound(stats_, stream.get(), parsed_session.error());
+            }
+            user_session.emplace(std::move(*parsed_session));
+            request_reader = vmess_session.DecodeRequestBody(*stream);
+            response_writer = vmess_session.EncodeResponseBodyWithHeader(*stream);
         }
-        user_session.emplace(std::move(*parsed_session));
-        request_reader = vmess_session.DecodeRequestBody(*stream);
-        response_writer = vmess_session.EncodeResponseBodyWithHeader(*stream);
     } catch (const WorkerMailboxFull&) {
         co_return proxy::RejectInbound(stats_, stream.get(), ErrorCode::RESOURCE_EXHAUSTED);
     } catch (const IoSystemError& e) {

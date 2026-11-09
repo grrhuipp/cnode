@@ -7,9 +7,7 @@
 #include "core/naming.hpp"
 #include "proxy/sniff_config.hpp"
 #include "transport/internet/http_headers.hpp"
-#include "transport/internet/reality_client_version.hpp"
 #include "transport/internet/reality_key.hpp"
-#include "transport/internet/reality_short_id.hpp"
 #include "proxy/anytls_padding.hpp"
 
 #include <format>

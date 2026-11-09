@@ -15,16 +15,7 @@ DetectRulePolicy::DetectRulePolicy() = default;
 DetectRulePolicy::~DetectRulePolicy() = default;
 
 void DetectRulePolicy::UpdateRule(std::string_view tag,
-                                  std::vector<DetectRule> new_rule_list) {
-    if (new_rule_list.empty()) {
-        UpdateSharedRule(tag, RuleListPtr{});
-        return;
-    }
-    UpdateSharedRule(tag, std::make_shared<const RuleList>(std::move(new_rule_list)));
-}
-
-void DetectRulePolicy::UpdateSharedRule(std::string_view tag,
-                                        RuleListPtr new_rule_list) {
+                                  RuleListPtr new_rule_list) {
     if (tag.empty()) return;
     const auto it = rules_.find(tag);
     if (!new_rule_list || new_rule_list->empty()) {

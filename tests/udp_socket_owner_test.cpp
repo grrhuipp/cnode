@@ -62,7 +62,6 @@ public:
         if (!script_) return tl::unexpected(::ErrorCode::PROTOCOL_AUTH_FAILED);
         ::InboundDatagramResult result;
         result.user = &profile_;
-        result.tracker = tracker_;
         result.session_owner = script_->owner;
         result.session_id = script_->session_id;
         result.target = script_->target;
@@ -79,7 +78,6 @@ public:
 
 private:
     DatagramScript* script_ = nullptr;
-    std::shared_ptr<::UserOnlineTracker> tracker_ = std::make_shared<::UserOnlineTracker>();
     ::UserProfile profile_;
 };
 

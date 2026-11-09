@@ -62,6 +62,7 @@ public:
     // Return bytes read ahead by a completed handshake before unread socket data.
     // Only for this byte layer; a TLS owner must retain plaintext at its own layer.
     void PrependReadData(std::span<const uint8_t> data) override;
+    void PrependReadMultiBuffer(buf::MultiBuffer&& mb) override;
     [[nodiscard]] std::optional<DetachedTcpState> DetachForHandoff(
         std::span<const uint8_t> prefix = {});
     [[nodiscard]] static std::unique_ptr<TcpStream> RestoreFromHandoff(

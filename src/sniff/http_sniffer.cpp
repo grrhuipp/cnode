@@ -18,20 +18,6 @@ struct HostPortView {
     uint16_t port = 0;
 };
 
-[[nodiscard]] bool SplitAndValidateHeaderField(
-    std::string_view line,
-    std::string_view& name,
-    std::string_view& value) noexcept {
-    const size_t colon = line.find(':');
-    if (colon == std::string_view::npos || colon == 0) {
-        return false;
-    }
-    name = line.substr(0, colon);
-    value = transport::internet::TrimHttpOws(line.substr(colon + 1));
-    return transport::internet::IsValidHttpHeaderName(name) &&
-           transport::internet::IsValidHttpHeaderValue(value);
-}
-
 static constexpr std::array<std::string_view, 9> kHttpMethods{
     "GET", "POST", "PUT", "DELETE", "HEAD",
     "OPTIONS", "PATCH", "CONNECT", "TRACE"};
@@ -107,7 +93,7 @@ static constexpr std::array<std::string_view, 9> kHttpMethods{
     }
     std::string_view name;
     std::string_view value;
-    return SplitAndValidateHeaderField(prefix, name, value);
+    return transport::internet::SplitAndValidateHttpHeaderLine(prefix, name, value);
 }
 
 [[nodiscard]] std::optional<HostPortView> ParseHostValue(
@@ -206,7 +192,7 @@ SniffResult SniffHttp(std::span<const uint8_t> data) {
 
         std::string_view name;
         std::string_view value;
-        if (!SplitAndValidateHeaderField(line, name, value)) {
+        if (!transport::internet::SplitAndValidateHttpHeaderLine(line, name, value)) {
             return result;
         }
         if (!transport::internet::EqualsAsciiCI(name, "host")) continue;

@@ -1,17 +1,17 @@
-#include "vmess_outbound.hpp"
 #include "common/domain_name.hpp"
 #include "common/ip_address.hpp"
+#include "common/unsafe.hpp"
+#include "proxy/outbound.hpp"
 #include "../encoding/client.hpp"
 #include "../vmess_crypto.hpp"
-#include "../udp_datagram.hpp"
+#include "../vmess_request.hpp"
 #include "../../handshake_timeout.hpp"
 #include "../../outbound_server.hpp"
 #include "../../outbound_stream_endpoint.hpp"
 #include "app/relay.hpp"
 #include "app/dns/dns.hpp"
 #include "app/proxyman/outbound/factory.hpp"
-#include "../../../app/proxyman/outbound/registration.hpp"
-#include "infra/json_field.hpp"
+#include "infra/json.hpp"
 #include "infra/log.hpp"
 #include "infra/config_types.hpp"
 #include "core/naming.hpp"
@@ -28,6 +28,46 @@
 #include "common/buffer_util.hpp"
 #include "common/buf/length_prefixed_packet_buffer.hpp"
 
+#include <openssl/aes.h>
+#include <memory>
+
+struct VMessOutboundConfig {
+    OutboundServer server;
+    vmess::Security security = vmess::Security::AES_128_GCM;
+};
+
+namespace proxy::vmess::outbound {
+
+struct PreparedSettings {
+    VMessOutboundConfig config;
+    ::vmess::MemoryAccount user;
+    AES_KEY auth_id_key{};  // Encrypt schedule of user.auth_key, built on prepare.
+
+    ~PreparedSettings() noexcept {
+        ::SecureZeroMemory(&auth_id_key, sizeof(auth_id_key));
+    }
+};
+
+class Handler final : public ::Outbound {
+public:
+    explicit Handler(std::shared_ptr<const PreparedSettings> prepared);
+
+    ::net::awaitable<::OutboundProcessResult> Process(
+        ::session::Context& ctx,
+        ::transport::Link inbound,
+        ::OutboundDialer& dialer,
+        const ::TimeoutsConfig& timeouts,
+        ::StatsShard& stats,
+        const ::RelayConfig& relay_config,
+        ::buf::MultiBufferBatch first_payload,
+        std::chrono::seconds relay_idle_timeout,
+        std::chrono::seconds relay_write_timeout) override;
+
+private:
+    std::shared_ptr<const PreparedSettings> prepared_;
+};
+
+}  // namespace proxy::vmess::outbound
 
 namespace {
 

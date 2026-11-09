@@ -1,8 +1,6 @@
 #pragma once
 
-#include "app/dns/config.hpp"
 #include "app/dns/dns.hpp"
-#include "app/dns/stats.hpp"
 
 #include <cstddef>
 #include <memory>

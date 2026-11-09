@@ -1,24 +1,217 @@
 #pragma once
 
-#include "vless_buffered_reader.hpp"
 #include "vless_encryption.hpp"
-#include "vless_encryption_io.hpp"
 
 #include "common/allocator.hpp"
 #include "common/asio_types.hpp"
-
+#include "common/buf/multi_buffer.hpp"
+#include "common/error.hpp"
+#include "transport/link.hpp"
 #include <tl/expected.hpp>
 #include <openssl/mem.h>
 #include <openssl/siphash.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
-#include <optional>
+#include <cstdint>
+#include <cstring>
 #include <memory>
+#include <optional>
+#include <span>
 #include <string_view>
 #include <utility>
+#include <variant>
 
 namespace vless {
+
+class VlessBufferedReader final : public transport::MultiBufferReader {
+public:
+    transport::CancellationSource& Cancellation() noexcept override { return src_.Cancellation(); }
+    transport::EofAction ReadEofAction() const noexcept override { return src_.ReadEofAction(); }
+    [[nodiscard]] bool EnableRawRead() noexcept override { return src_.EnableRawRead(); }
+
+    explicit VlessBufferedReader(transport::MultiBufferReader& src) noexcept
+        : src_(src) {}
+
+    net::awaitable<bool> ReadExact(uint8_t* data,
+                                   size_t len,
+                                   bool eof_ok_at_start = false,
+                                   size_t* progress = nullptr) {
+        size_t local_done = 0;
+        size_t& done = progress ? *progress : local_done;
+        while (done < len) {
+            if (pending_.byte_size() != 0) {
+                const size_t n = pending_.ConsumePrefixTo(
+                    std::span<uint8_t>(data + done, len - done));
+                if (pending_.empty()) {
+                    pending_.ReleaseIfIdle();
+                }
+                done += n;
+                if (n > 0) {
+                    continue;
+                }
+            }
+
+            buf::MultiBuffer mb = co_await src_.ReadMultiBuffer();
+            const bool received = mb.byte_size() != 0;
+            if (received) mb.MoveTo(pending_);
+            // Retain concurrently received bytes before observing cancellation.
+            if ((co_await net::this_coro::cancellation_state).cancelled() !=
+                net::cancellation_type::none) {
+                throw IoSystemError(io_error::operation_aborted);
+            }
+            if (!received) {
+                co_return done == 0 && eof_ok_at_start ? false : done == len;
+            }
+        }
+        co_return true;
+    }
+
+    net::awaitable<bool> DiscardExact(size_t len, size_t* progress = nullptr) {
+        size_t local_done = 0;
+        size_t& done = progress ? *progress : local_done;
+        while (done < len) {
+            if (pending_.byte_size() != 0) {
+                const size_t n = pending_.DropPrefixBytes(len - done);
+                if (pending_.empty()) {
+                    pending_.ReleaseIfIdle();
+                }
+                done += n;
+                if (n > 0) {
+                    continue;
+                }
+            }
+
+            buf::MultiBuffer mb = co_await src_.ReadMultiBuffer();
+            const bool received = mb.byte_size() != 0;
+            if (received) mb.MoveTo(pending_);
+            // Retain concurrently received bytes before observing cancellation.
+            if ((co_await net::this_coro::cancellation_state).cancelled() !=
+                net::cancellation_type::none) {
+                throw IoSystemError(io_error::operation_aborted);
+            }
+            if (!received) {
+                co_return done == len;
+            }
+        }
+        co_return true;
+    }
+
+    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
+        if (pending_.byte_size() != 0) {
+            return TakePending();
+        }
+        return src_.ReadMultiBuffer();
+    }
+
+private:
+    net::awaitable<buf::MultiBuffer> TakePending() {
+        co_return std::move(pending_);
+    }
+
+    transport::MultiBufferReader& src_;
+    buf::MultiBuffer pending_;
+};
+
+inline net::awaitable<void> WriteVlessBytes(
+    transport::MultiBufferWriter& writer,
+    std::span<const uint8_t> data) {
+    net::const_buffer buffer{data.data(), data.size()};
+    co_await writer.WriteBuffers(std::span<const net::const_buffer>{&buffer, 1});
+}
+
+// 记录层只报告首个认证响应前的拒绝，不借用握手凭据。
+// 宿主必须地址稳定，并比延迟读端活得更久；取消本身不构成拒绝。
+struct VlessEncryptionTicketRejection {
+    VlessEncryptionTicketRejection() noexcept = default;
+    VlessEncryptionTicketRejection(const VlessEncryptionTicketRejection&) = delete;
+    VlessEncryptionTicketRejection& operator=(const VlessEncryptionTicketRejection&) = delete;
+    VlessEncryptionTicketRejection(VlessEncryptionTicketRejection&&) = delete;
+    VlessEncryptionTicketRejection& operator=(VlessEncryptionTicketRejection&&) = delete;
+
+    bool rejected = false;
+};
+
+// 0-RTT client read side: it is keyed by the server random that prefixes the
+// first response bytes, which also seeds the header XOR when enabled.
+struct VlessEncryptionDeferredRead {
+    VlessEncryptionAeadCipher cipher = VlessEncryptionAeadCipher::Aes256Gcm;
+    bool header_xor = false;
+    VlessEncryptionTicketRejection* ticket_rejection = nullptr;
+};
+using VlessEncryptionReadKeys =
+    std::variant<VlessEncryptionAead, VlessEncryptionDeferredRead>;
+
+class VlessEncryptionReader final : public transport::MultiBufferReader {
+public:
+    transport::CancellationSource& Cancellation() noexcept override { return src_.Cancellation(); }
+    transport::EofAction ReadEofAction() const noexcept override { return src_.ReadEofAction(); }
+
+    // A deferred read side must not come with a header XOR; it derives its own.
+    VlessEncryptionReader(transport::MultiBufferReader& src,
+                          VlessEncryptionReadKeys keys,
+                          const VlessEncryptionUnitedKey& united_key,
+                          std::optional<VlessEncryptionHeaderXor>
+                              header_xor) noexcept;
+
+    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override;
+    [[nodiscard]] bool EnableRawRead() noexcept override;
+    void RejectDeferredTicket() noexcept;
+
+private:
+    [[nodiscard]] VlessEncryptionAead& KeyDeferredRead(
+        const VlessEncryptionDeferredRead& deferred);
+
+    VlessBufferedReader src_;
+    VlessEncryptionReadKeys keys_;
+    VlessEncryptionUnitedKey united_key_;
+    std::optional<VlessEncryptionHeaderXor> header_xor_;
+    // Read progress survives a cancelled sniff continuation. Header XOR is
+    // applied once, before waiting for the rest of the encrypted record.
+    // `bytes_read_` tracks the server random until the read side is keyed.
+    std::array<uint8_t, kVlessEncryptionCtrIvSize> server_random_{};
+    std::array<uint8_t, kVlessEncryptionRecordHeaderSize> read_header_{};
+    buf::ContiguousWriteBuffer read_record_;
+    size_t header_read_ = 0;
+    size_t bytes_read_ = 0;
+    size_t encrypted_size_ = 0;
+    bool raw_read_ = false;
+    VlessEncryptionTicketRejection* unverified_ticket_ = nullptr;
+};
+
+class VlessEncryptionWriter final : public transport::MultiBufferWriter {
+public:
+    VlessEncryptionWriter(transport::MultiBufferWriter& dst,
+                          VlessEncryptionAead aead,
+                          const VlessEncryptionUnitedKey& united_key,
+                          std::optional<VlessEncryptionHeaderXor>
+                              header_xor) noexcept;
+    VlessEncryptionWriter(const VlessEncryptionWriter&) = delete;
+    VlessEncryptionWriter& operator=(const VlessEncryptionWriter&) = delete;
+    VlessEncryptionWriter(VlessEncryptionWriter&&) = delete;
+    VlessEncryptionWriter& operator=(VlessEncryptionWriter&&) = delete;
+
+    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override;
+    net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override;
+    net::awaitable<void> AsyncShutdownWrite() override;
+    bool WriteShutdownClosesLink() const noexcept override {
+        return dst_.WriteShutdownClosesLink();
+    }
+
+private:
+    enum class State : uint8_t { Active, Finished, Failed };
+
+    void CheckWritable() const;
+    net::awaitable<void> WritePlaintext(std::span<const uint8_t> data,
+                                       bool& record_started);
+
+    transport::MultiBufferWriter& dst_;
+    VlessEncryptionAead aead_;
+    VlessEncryptionUnitedKey united_key_;
+    std::optional<VlessEncryptionHeaderXor> header_xor_;
+    State state_ = State::Active;
+};
 
 struct VlessEncryptionIssuedTicket {
     std::array<uint8_t, kVlessEncryptionTicketSize> ticket{};

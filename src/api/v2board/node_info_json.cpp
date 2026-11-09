@@ -1,20 +1,22 @@
-#include "node_info_json.hpp"
+#include "panel_json_compat.hpp"
 
 #include "core/constants.hpp"
 #include "core/naming.hpp"
 #include "infra/inbound_field_rules.hpp"
-#include "infra/json_field.hpp"
+#include "infra/json.hpp"
 #include "transport/internet/http_headers.hpp"
-#include "panel_json_compat.hpp"
 
+#include <algorithm>
 #include <format>
 #include <limits>
 #include <optional>
 #include <regex>
 #include <stdexcept>
+#include <string>
+#include <string_view>
+#include <unordered_set>
 #include <utility>
 #include <vector>
-
 namespace api::v2board {
 
 namespace {
@@ -613,4 +615,197 @@ std::vector<rule::DetectRule> ExtractBlockDetectRules(
     return rules;
 }
 
+
+namespace {
+
+constexpr uint64_t kBytesPerSecondPerMbps = 1024ULL * 1024ULL / 8ULL;
+constexpr uint64_t kMaxSpeedLimitMbps =
+    std::numeric_limits<uint64_t>::max() / kBytesPerSecondPerMbps;
+
+tl::expected<uint64_t, std::string> ParseOptionalLimit(
+    const json::object& source,
+    std::string_view field,
+    size_t user_index) {
+    const auto* value = source.if_contains(field);
+    if (!value || value->is_null()) return 0;
+
+    const auto limit = PanelUnsignedInteger(*value);
+    if (!limit) {
+        return tl::unexpected(std::format(
+            "users[{}].{} must be a non-negative integer or null", user_index, field));
+    }
+    return *limit;
+}
+
+tl::expected<std::string, std::string> ParseOptionalString(
+    const json::object& source,
+    std::string_view field,
+    size_t user_index) {
+    const auto* value = source.if_contains(field);
+    if (!value || value->is_null()) return std::string{};
+    if (!value->is_string()) {
+        return tl::unexpected(std::format(
+            "users[{}].{} must be a string or null", user_index, field));
+    }
+    if (ContainsControlCharacter(value->as_string())) {
+        return tl::unexpected(std::format(
+            "users[{}].{} contains control characters", user_index, field));
+    }
+    return std::string(value->as_string());
+}
+
+bool IsValidDevice(const ::api::OnlineUser& device) noexcept {
+    return device.UID > 0 && !device.IP.empty();
+}
+
+bool DeviceLess(const ::api::OnlineUser& lhs, const ::api::OnlineUser& rhs) noexcept {
+    if (lhs.UID != rhs.UID) return lhs.UID < rhs.UID;
+    return lhs.IP < rhs.IP;
+}
+
+bool IsCanonicalDeviceList(std::span<const ::api::OnlineUser> devices) noexcept {
+    for (size_t i = 0; i < devices.size(); ++i) {
+        if (!IsValidDevice(devices[i])) {
+            return false;
+        }
+        if (i > 0 && !DeviceLess(devices[i - 1], devices[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+OnlineReportPayload BuildFromCanonicalDevices(
+    std::span<const ::api::OnlineUser> devices,
+    int node_id) {
+    OnlineReportPayload result;
+    if (devices.empty()) {
+        return result;
+    }
+    const std::string suffix = "_" + std::to_string(node_id);
+    result.device_count = devices.size();
+
+    for (size_t i = 0; i < devices.size();) {
+        const int64_t uid = devices[i].UID;
+        size_t j = i;
+        json::array alive_devices;
+        while (j < devices.size() && devices[j].UID == uid) {
+            alive_devices.push_back(devices[j].IP + suffix);
+            ++j;
+        }
+        result.alive_body[std::to_string(uid)] = std::move(alive_devices);
+        ++result.user_count;
+        i = j;
+    }
+    return result;
+}
+
+}  // namespace
+
+tl::expected<std::vector<::api::UserInfo>, std::string>
+ParseUserList(const json::object& source) {
+    const auto* users_value = source.if_contains("users");
+    if (!users_value) {
+        return tl::unexpected("users is required");
+    }
+    if (!users_value->is_array()) {
+        return tl::unexpected("users must be an array");
+    }
+
+    const auto& users_array = users_value->as_array();
+    std::vector<::api::UserInfo> users;
+    users.reserve(users_array.size());
+    // A repeated id would merge accounting for two users. Credentials are
+    // compared after protocol derivation, when the UserStore snapshot is built.
+    std::unordered_set<int64_t> seen_ids;
+    seen_ids.reserve(users_array.size());
+    for (size_t i = 0; i < users_array.size(); ++i) {
+        const auto& user_value = users_array[i];
+        if (!user_value.is_object()) {
+            return tl::unexpected(std::format("users[{}] must be an object", i));
+        }
+        const auto& source_user = user_value.as_object();
+        ::api::UserInfo user;
+
+        const auto* id = source_user.if_contains("id");
+        const auto parsed_id = id ? PanelUnsignedInteger(*id) : std::nullopt;
+        if (!parsed_id || *parsed_id == 0 ||
+            *parsed_id > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+            return tl::unexpected(std::format(
+                "users[{}].id must be a positive int64", i));
+        }
+        user.UID = static_cast<int64_t>(*parsed_id);
+        if (!seen_ids.insert(user.UID).second) {
+            return tl::unexpected(std::format("users[{}].id duplicates another user", i));
+        }
+
+        const auto* uuid = source_user.if_contains("uuid");
+        if (!uuid || !uuid->is_string() || uuid->as_string().empty()) {
+            return tl::unexpected(std::format(
+                "users[{}].uuid must be a non-empty string", i));
+        }
+        if (ContainsControlCharacter(uuid->as_string())) {
+            return tl::unexpected(std::format(
+                "users[{}].uuid contains control characters", i));
+        }
+        user.UUID = std::string(uuid->as_string());
+
+        auto flow = ParseOptionalString(source_user, "flow", i);
+        if (!flow) return tl::unexpected(std::move(flow.error()));
+        user.Flow = naming::LowerAscii(std::move(*flow));
+
+        auto speed_limit = ParseOptionalLimit(source_user, "speed_limit", i);
+        if (!speed_limit) {
+            return tl::unexpected(std::move(speed_limit.error()));
+        }
+        if (*speed_limit > kMaxSpeedLimitMbps) {
+            return tl::unexpected(std::format(
+                "users[{}].speed_limit exceeds {} Mbps",
+                i, kMaxSpeedLimitMbps));
+        }
+        user.SpeedLimit = *speed_limit * kBytesPerSecondPerMbps;
+
+        auto device_limit = ParseOptionalLimit(source_user, "device_limit", i);
+        if (!device_limit) {
+            return tl::unexpected(std::move(device_limit.error()));
+        }
+        if (*device_limit > std::numeric_limits<uint32_t>::max()) {
+            return tl::unexpected(std::format(
+                "users[{}].device_limit exceeds {}",
+                i, std::numeric_limits<uint32_t>::max()));
+        }
+        user.DeviceLimit = static_cast<uint32_t>(*device_limit);
+
+        auto email = ParseOptionalString(source_user, "email", i);
+        if (!email) return tl::unexpected(std::move(email.error()));
+        user.Email = std::move(*email);
+        users.push_back(std::move(user));
+    }
+    return users;
+}
+
+OnlineReportPayload BuildOnlineReportPayload(
+    std::span<const ::api::OnlineUser> online_devices,
+    int node_id) {
+    if (IsCanonicalDeviceList(online_devices)) {
+        return BuildFromCanonicalDevices(online_devices, node_id);
+    }
+
+    std::vector<::api::OnlineUser> valid;
+    valid.reserve(online_devices.size());
+    for (const auto& device : online_devices) {
+        if (IsValidDevice(device)) {
+            valid.push_back(device);
+        }
+    }
+
+    std::ranges::sort(valid, DeviceLess);
+    const auto duplicate_tail = std::ranges::unique(
+        valid, [](const ::api::OnlineUser& lhs, const ::api::OnlineUser& rhs) {
+            return lhs.UID == rhs.UID && lhs.IP == rhs.IP;
+        });
+    valid.erase(duplicate_tail.begin(), duplicate_tail.end());
+
+    return BuildFromCanonicalDevices(valid, node_id);
+}
 }  // namespace api::v2board

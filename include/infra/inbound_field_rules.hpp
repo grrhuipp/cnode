@@ -6,9 +6,8 @@
 
 #include "core/naming.hpp"
 #include "infra/json.hpp"
-#include "infra/json_field.hpp"
 #include "transport/internet/inbound_listen.hpp"
-#include "transport/internet/proxy_protocol_mode.hpp"
+#include "transport/internet/proxy_protocol.hpp"
 #include "transport/internet/stream_settings.hpp"
 
 #include <cstdint>

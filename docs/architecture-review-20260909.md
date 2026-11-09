@@ -1562,3 +1562,35 @@ CI失败场景修复后通过真实双进程、ML-KEM/X25519加密和回环对�
   - `cnode_runtime_sampling_benchmark`：`resources=0` 采样延迟保持 **`68.25 / 68.34 ns`**（`p50 = 30.0 ns`，`max = 41.0 ns`），`resources=1` 采样延迟由 `87.16 / 86.18 ns` 降至 **`86.03 / 86.02 ns`**，0 次堆分配。
   - `tcp-receive 65536B`：单次 burst 墙钟耗时由 `50,777.6 / 51,694.0 ns` 稳定降至 **`49,723.2 / 49,029.1 ns`（-2.1% ~ -5.2%）**，CPU 耗时由 `46,939.0 / 47,646.9 ns` 稳定降至 **`45,851.9 / 45,184.7 ns`（-2.3% ~ -5.2%）**。
   - `tcp-send 8192B (1 piece)`：单次 burst 墙钟耗时由 `10,394.9 / 10,306.9 ns` 稳定降至 **`10,212.2 / 10,221.7 ns`（-0.8% ~ -1.8%）**，CPU 耗时由 `8,138.3 / 8,063.8 ns` 稳定降至 **`7,996.5 / 7,996.9 ns`**。
+
+## 2026-11-09（第九轮）：路由同步快路径、UDP 入站逐包零拷贝、出站 Handler 自注册去双实现、零拷贝预读前置与 47 个碎片文件内聚
+
+### 架构与流程精简内容
+
+1. **分发路由同步快路径与原生 UDP 逐包零原子争用**：
+   - `src/app/dispatcher/default_dispatcher.cpp`：在 `DispatchPreparedLink` 中优先执行同步路由 `RouteSync`（仅在命中 `IPIfNonMatch` / `IPOnDemand` 需异步 DNS 解析时才回退 `RouteAsync`），消除普通请求分发热路径无条件挂起 `RouteAsync` 协程帧的分配与调度开销。
+   - `include/proxy/inbound_datagram.hpp`、`src/app/worker/udp_ingress.cpp`、`src/proxy/shadowsocks/inbound/ss_inbound.cpp`、`src/proxy/inbound_admission.hpp`：移除 `InboundDatagramResult` 中 3 个死字段（`user_owner`、`tracker`、`limiter`）与 `ClientSession::Impl::RequestData::tracker_owner`；消除 `UdpIngress::ProcessDatagram` 中重复调用的 `buf::SetUdpTarget`；将 `AdmitNativeAssociation` 统一为 `if (tracker) tracker->Acquire(...)`，同步淘汰 4 个无调用的 UDP 虚函数，消除 SS UDP 入站每包跨核拷贝 `shared_ptr<const UserProfile>` 的原子引用计数争用。
+   - `src/app/dns/dns.cpp`、`src/app/dns/inflight_resolves.hpp`、`src/app/router/router.cpp`、`src/geo/geodata.cpp`：当 `DNSWorker` 收到 `resolve_ip_literals=false` 的直连域名请求时直接原位移动构造返回（省去多余拷贝）；`InflightResolves::Run` 在单等待者常见路径下直接移动返回结果；`Router::Impl` 与 `GeoDatabase::LoadCategories` 改用原位构造避免临时字符串拷贝。
+2. **出站 Handler 构造与自注册去双实现、传输层零拷贝预读前置与 `DialResult` 瘦身**：
+   - `src/service/controller/controller.cpp`、`src/proxy/{freedom,blackhole,trojan,vless,vmess}/outbound/*`、`src/app/proxyman/outbound/factory.cpp`：将 `BuildPanelAutoOutbound` 改为直接通过 `proxyman::outbound::PrepareOutboundConfig(infra::OutboundSourceConfig{...})` 统一构建面板自动 Freedom 出站，彻底消除控制面私有重复的 Freedom 出站构建逻辑，并将 8 个仅 20~35 行的协议出站自注册 `.cpp` 内联入 `proxyman/outbound/factory.cpp`。
+   - `include/transport/async_stream.hpp`、`src/transport/async_stream.cpp`、`include/transport/internet/{tcp_stream,tls_stream}.hpp`、`src/transport/internet/{tcp_stream,tls_stream,http1_handshake,xhttp_session,transport_stack,transport_dialer}.cpp`：移除 `DialResult` 中两个只写不读死字段（`native_error_code`、`attempted_remote_addr`）及每次拨号失败无条件执行的 `attempted_remote_addr` 堆字符串格式化；新增虚方法 `PrependReadMultiBuffer(buf::MultiBuffer&& mb)` 并将 4 处逆序逐块拷贝的 `PrependReadData` 升级为零拷贝缓冲移交；`TlsStream::DetachForHandoff` 复用 `CopyPrefixTo` 消除逐块复制循环。
+   - `include/transport/internet/http_headers.hpp`、`src/sniff/{http_sniffer,tls_sniffer}.cpp`、`src/transport/internet/http1_handshake.cpp`：提取公共 `ResolveConfiguredHttpHost` 与 `SplitAndValidateHttpHeaderLine` 统一 5 处重复的 HTTP Host/Authority 与 Header 行解析。
+3. **47 个单调用方碎片头文件与实现文件合并内聚（两轮累计精简 75 个碎片文件）**：
+   - 合并并删除 `app`、`common`、`transport`、`proxy`、`infra`、`service/controller`、`api/v2board` 下共 47 个单调用方小碎片文件（含 `tcp_listener.cpp`、`dns/config.hpp`、`dns/stats.hpp`、`dns/cache.cpp`、`outbound/registration.hpp`、`rule_types.hpp`、`contiguous_buffer_view.hpp`、`dial_target.hpp`、`proxy_protocol_mode.hpp`、`reality_short_id.hpp`、`reality_client_version.hpp`、`hysteria_settings.hpp`、`quic_handoff.hpp`、8 个协议 outbound `.hpp`、`trojan/credentials.hpp`、`trojan/udp_framing.hpp`、`vless/{credentials,udp_framing,vless_buffered_reader,vless_encryption_io}.hpp`、`vmess/{account,udp_datagram}.hpp`、`shadowsocks/shadowsocks_crypto.hpp`、`infra/{json_field,outbound_source_config}.hpp`、`controller/{node_state,node_transaction,node_transition,online_snapshot}.hpp`、`v2board/{request_task,node_info_json,user_list_json,online_report}.{hpp,cpp}` 等）。
+
+### 验证与性能/内存实证
+
+全量 **1,251/1,251** 测试通过（325 项 unit、926 项 E2E）。在同一环境与编译选项下执行 A/B/A/B 交错重复基准对照：
+
+- **64 活跃 VLESS 会话内存占用与统计采样（`cnode_runtime_sampling_benchmark`）**：
+  - **`resources=0`**：进程峰值 RSS（`process_peak_rss_bytes`）由 `14,721,024 / 14,712,832 B` 稳定降至 **`14,434,304 / 14,438,400 B`（稳定减少 268 ~ 280 KiB / -1.9%）**；活跃会话匿名内存（`anonymous_rss_bytes` / `settled_anonymous_rss_bytes`）由 `7,413,760 / 7,401,472 B` 稳定降至 **`7,344,128 / 7,344,128 B`（稳定减少 56 ~ 68 KiB）**；采样延迟保持 **`68.30 / 68.30 ns`**（`p50 = 30.0 ns`，`max = 41.0 ns`），0 次堆分配。
+  - **`resources=1`**：进程峰值 RSS 由 `15,142,912 / 15,134,720 B` 稳定降至 **`14,946,304 / 14,942,208 B`（稳定减少 188 ~ 192 KiB）**；活跃会话匿名内存由 `7,634,944 / 7,626,752 B` 稳定降至 **`7,589,888 / 7,585,792 B`（稳定减少 40 ~ 44 KiB）**；采样延迟保持 **`85.99 / 86.02 ns`**（`p50 = 50.0 ns`），0 次堆分配。
+- **VLESS/TLS 真实进程基准（`cnode_tls_throughput_benchmark`）**：
+  - **8 流下载（`Download8`）内存与吞吐**：传输完成活跃匿名内存（`smaps_rollup_anonymous_bytes`）由 `6,692,864 / 6,656,000 B` 稳定降至 **`6,627,328 / 6,610,944 B`（减少 44 ~ 64 KiB）**，峰值 RSS 由 `14,811,136 / 14,774,272 B` 稳定降至 **`14,745,600 / 14,729,216 B`（稳定减少 44 ~ 64 KiB）**；8 流下载吞吐由 `596.03 / 596.67 MiB/s` 稳定升至 **`603.48 / 603.41 MiB/s`（+1.2%）**。
+  - **单流与 8 流上传（`Upload1` / `Upload8`）**：`Upload1` 单流上传吞吐升至 **`817.50 MiB/s`**；`Upload8` 传输完成活跃匿名内存由 `6,447,104 / 6,455,296 B` 稳定降至 **`6,426,624 / 6,422,528 B`（减少 20 ~ 32 KiB）**，峰值 RSS 减少 **20 ~ 32 KiB**，上传吞吐由 `544.61 / 674.07 MiB/s` 升至 **`658.98 / 675.35 MiB/s`（首轮 +21.0%）**。
+- **Hysteria2 四 Worker 真实进程基准（`cnode_hysteria_throughput_benchmark`）**：
+  - **256 连接上传与下载**：256 条 QUIC 连接上传建连耗时由 `0.510 / 0.514s` 稳定降至 **`0.500 / 0.500s`**，空闲回收高水位（`vm_hwm_bytes`）由 `38,641,664 / 38,248,448 B` 降至 **`38,252,544 / 38,248,448 B`（最高减少 380 KiB）**，吞吐达 **`68.94 / 69.38 MiB/s`**；256 连接下载守护进程总 CPU 由 `1.482 / 1.514s` 稳定降至 **`1.480 / 1.474s`（最高 -2.6%）**。
+  - **16×64（1,024 流）上传与下载**：1,024 流上传吞吐由 `54.60 / 55.42 MiB/s` 升至 **`55.39 / 57.70 MiB/s`（峰值 +4.1%）**，守护进程总 CPU 由 `4.005 / 3.990s` 稳定降至 **`3.912 / 3.720s`（-2.3% ~ -6.8%）**，首轮负载峰值匿名内存由 `40,353,792 B` 降至 **`39,071,744 B`（减少 1.22 MiB）**，空闲回收高水位减少 **1.50 MiB**；1,024 流下载建连耗时由 `0.125 / 0.153s` 稳定降至 **`0.116 / 0.123s`**。
+- **TCP 接收与发送基准（`cnode_tcp_receive_benchmark` / `cnode_tcp_send_benchmark`）**：
+  - `tcp-receive 1B`：单次 burst 墙钟耗时由 `9,891.5 / 9,756.7 ns` 稳定降至 **`9,773.5 / 9,689.8 ns`（-0.7% ~ -1.2%）**，CPU 耗时由 `7,598.5 / 7,459.7 ns` 稳定降至 **`7,522.4 / 7,411.4 ns`**；`65536B` 墙钟耗时由 `48,768.1 / 49,059.4 ns` 稳定降至 **`48,560.3 / 48,281.4 ns`（最高 -1.6%）**。
+  - `tcp-send 8192B (16 pieces)`：单次 burst 墙钟耗时由 `11,313.1 / 11,285.2 ns` 稳定降至 **`10,990.7 / 11,281.5 ns`（最高 -2.9%）**。

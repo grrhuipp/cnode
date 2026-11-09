@@ -1,22 +1,60 @@
-#include "freedom_outbound.hpp"
 #include "app/dns/dns.hpp"
+#include "app/proxyman/outbound/factory.hpp"
+#include "app/proxyman/outbound/prepared_config.hpp"
 #include "app/relay.hpp"
+#include "common/allocator.hpp"
 #include "common/ip_utils.hpp"
 #include "common/session.hpp"
+#include "common/target_address.hpp"
 #include "core/constants.hpp"
-#include "app/proxyman/outbound/factory.hpp"
-#include "../../app/proxyman/outbound/registration.hpp"
-#include "outbound/udp_request.hpp"
-#include "transport/internet/outbound_target_builder.hpp"
-#include "transport/internet/transport_dialer.hpp"
 #include "infra/log.hpp"
 #include "infra/outbound_bind_config.hpp"
+#include "outbound/udp_request.hpp"
+#include "proxy/freedom_domain_strategy.hpp"
+#include "proxy/outbound.hpp"
+#include "transport/internet/outbound_target_builder.hpp"
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <limits>
+#include <memory>
+#include <optional>
+#include <string_view>
+#include <tl/expected.hpp>
 
 namespace proxy::freedom::outbound {
+
+struct FreedomSettings {
+    DomainStrategy domain_strategy = DomainStrategy::AsIs;
+    std::optional<TargetAddress> redirect;
+};
+
+class Handler final : public Outbound {
+public:
+    explicit Handler(const FreedomSettings& settings);
+
+    net::awaitable<OutboundProcessResult> Process(
+        session::Context& ctx,
+        transport::Link inbound,
+        OutboundDialer& dialer,
+        const TimeoutsConfig& timeouts,
+        StatsShard& stats,
+        const RelayConfig& relay_config,
+        buf::MultiBufferBatch first_payload,
+        std::chrono::seconds relay_idle_timeout,
+        std::chrono::seconds relay_write_timeout) override;
+
+private:
+    net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, ErrorCode>>
+    DialTarget(OutboundDialer& dialer, session::Context& ctx);
+
+    net::awaitable<tl::expected<memory::ThreadLocalVector<net::ip::address>, ErrorCode>>
+    ResolveTargets(::app::dns::DNS& dns, session::Context& ctx);
+
+    DomainStrategy domain_strategy_;
+    std::optional<TargetAddress> redirect_target_;
+};
 
 namespace {
 
@@ -226,7 +264,8 @@ Handler::ResolveTargets(::app::dns::DNS& dns, session::Context& ctx) {
     co_return addresses;
 }
 
-proxyman::outbound::PreparedOutboundCreator PrepareOutbound(FreedomSettings settings) {
+[[nodiscard]] proxyman::outbound::PreparedOutboundCreator
+PrepareOutbound(FreedomSettings settings) {
     return proxyman::outbound::MakePreparedOutboundCreator<
         FreedomSettings,
         +[](std::string_view, std::shared_ptr<const FreedomSettings> config,
@@ -234,7 +273,6 @@ proxyman::outbound::PreparedOutboundCreator PrepareOutbound(FreedomSettings sett
             return std::make_unique<Handler>(*config);
         }>(std::move(settings));
 }
-
 }  // namespace proxy::freedom::outbound
 
 // ============================================================================

@@ -245,10 +245,13 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
     rule::DetectRulePolicy request_policy;
     if (which == Case::PolicyBlockedForce || which == Case::PolicyBlockedRoute ||
         which == Case::PolicyAllowed) {
-        request_policy.UpdateRule(ctx.inbound.tag, {{
-            .Pattern = std::regex(which == Case::PolicyAllowed
-                ? "198\\.51\\.100\\.1" : "192\\.0\\.2\\.1"),
-        }});
+        request_policy.UpdateRule(
+            ctx.inbound.tag,
+            std::make_shared<const rule::DetectRulePolicy::RuleList>(
+                rule::DetectRulePolicy::RuleList{{
+                    .Pattern = std::regex(which == Case::PolicyAllowed
+                        ? "198\\.51\\.100\\.1" : "192\\.0\\.2\\.1"),
+                }}));
     }
     Outbounds outbound_handlers(outbounds, io, dns);
     app::dispatcher::DefaultDispatcher dispatcher(

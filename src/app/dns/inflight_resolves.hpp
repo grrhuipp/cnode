@@ -135,7 +135,11 @@ public:
         const auto cancellation = co_await net::this_coro::cancellation_state;
         if (cancellation.cancelled() == net::cancellation_type::none) {
             if (pending->failure) std::rethrow_exception(pending->failure);
-            if (pending->result) co_return *pending->result;
+            if (pending->result) {
+                co_return pending->waiters == 1
+                    ? std::move(*pending->result)
+                    : *pending->result;
+            }
         }
         DnsResult cancelled;
         cancelled.error = ErrorCode::CANCELLED;

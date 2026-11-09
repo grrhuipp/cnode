@@ -1,7 +1,6 @@
 #include "traffic_journal.hpp"
 
 #include "infra/json.hpp"
-#include "infra/json_field.hpp"
 #include <openssl/sha.h>
 #include <sys/file.h>
 #include <sys/stat.h>

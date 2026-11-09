@@ -1,7 +1,7 @@
 #include <stdexcept>
 #include <gtest/gtest.h>
 
-#include "online_snapshot.hpp"
+#include "node_transaction.hpp"
 
 #include <cstdlib>
 #include <iostream>

@@ -2,10 +2,7 @@
 
 #include "../../common/awaitable_batch.hpp"
 #include "../../common/monitor_loop.hpp"
-#include "../../proxy/freedom/freedom_outbound.hpp"
-#include "node_state.hpp"
 #include "node_transaction.hpp"
-#include "online_snapshot.hpp"
 #include "panel_inbound.hpp"
 #include "traffic_journal.hpp"
 
@@ -14,6 +11,7 @@
 #include "app/proxyman/inbound/factory.hpp"
 #include "app/proxyman/inbound/prepared_config.hpp"
 #include "app/proxyman/inbound/user_store.hpp"
+#include "app/proxyman/outbound/factory.hpp"
 #include "app/proxyman/outbound/prepared_config.hpp"
 #include "app/runtime_publication.hpp"
 #include "app/traffic_types.hpp"
@@ -185,22 +183,45 @@ struct Controller::Impl : std::enable_shared_from_this<Controller::Impl> {
 };
 namespace {
 
+[[nodiscard]] std::string_view DomainStrategyName(
+    proxy::freedom::outbound::DomainStrategy strategy) noexcept {
+    using proxy::freedom::outbound::DomainStrategy;
+    switch (strategy) {
+        case DomainStrategy::AsIs: return "AsIs";
+        case DomainStrategy::UseIP: return "UseIP";
+        case DomainStrategy::UseIPv6v4: return "UseIPv6v4";
+        case DomainStrategy::UseIPv4: return "UseIPv4";
+        case DomainStrategy::UseIPv4v6: return "UseIPv4v6";
+        case DomainStrategy::UseIPv6: return "UseIPv6";
+        case DomainStrategy::ForceIP: return "ForceIP";
+        case DomainStrategy::ForceIPv6v4: return "ForceIPv6v4";
+        case DomainStrategy::ForceIPv6: return "ForceIPv6";
+        case DomainStrategy::ForceIPv4v6: return "ForceIPv4v6";
+        case DomainStrategy::ForceIPv4: return "ForceIPv4";
+    }
+    return "AsIs";
+}
+
 [[nodiscard]] proxyman::outbound::PreparedOutboundConfig BuildPanelAutoOutbound(
     const std::string& tag,
     const PanelConfig& panel_config) {
-    proxy::freedom::outbound::FreedomSettings settings;
-    settings.domain_strategy = panel_config.EnableDNS
-        ? panel_config.DNSType : proxy::freedom::outbound::DomainStrategy::AsIs;
-    return proxyman::outbound::PreparedOutboundConfig{
+    const auto strategy = panel_config.EnableDNS
+        ? panel_config.DNSType
+        : proxy::freedom::outbound::DomainStrategy::AsIs;
+    infra::OutboundSourceConfig source{
         .tag = tag,
         .protocol = std::string(constants::protocol::kFreedom),
+        .settings = json::object{{"domainStrategy", DomainStrategyName(strategy)}},
+        .stream_settings = {},
         // The panel sendIP is the auto outbound Handler's sendThrough.
-        .sender = OutboundSenderSettings{
-            .stream_settings = {},
-            .send_through = panel_config.SendIP,
-        },
-        .create = proxy::freedom::outbound::PrepareOutbound(std::move(settings)),
+        .send_through = panel_config.SendIP,
+        .passthrough = false,
     };
+    auto prepared = proxyman::outbound::PrepareOutboundConfig(source);
+    if (!prepared) {
+        throw std::logic_error("failed to prepare panel auto freedom outbound");
+    }
+    return std::move(*prepared);
 }
 
 std::unique_ptr<api::API> ValidatePanelRuntimeArgs(

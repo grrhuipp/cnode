@@ -1,8 +1,6 @@
 #pragma once
 
-#include "transport/internet/reality_client_version.hpp"
 #include "transport/internet/reality_key.hpp"
-#include "transport/internet/reality_short_id.hpp"
 
 #include "core/constants.hpp"
 #include "infra/json.hpp"

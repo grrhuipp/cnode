@@ -15,7 +15,6 @@
 #include "transport/internet/outbound_target_builder.hpp"
 #include "transport/internet/tcp_stream.hpp"
 #include "transport/internet/tls_stream.hpp"
-#include "transport/internet/transport_dialer.hpp"
 #include "transport/internet/ws_stream.hpp"
 
 #include <algorithm>
@@ -63,11 +62,10 @@ std::unique_ptr<TcpStream> TakeOwnedTcpStream(std::unique_ptr<AsyncStream>& stre
 // A configured Host wins over the dial-derived authority.
 [[nodiscard]] std::string_view ResolveHttpAuthority(std::string_view fallback,
                                                     const HttpConfig& http) {
-    if (const std::string_view configured = TrimAscii(transport::internet::ExpectedHttpHost(http));
-        !configured.empty()) {
-        return configured;
-    }
-    return fallback.empty() ? std::string_view("www.example.com") : fallback;
+    return transport::internet::ResolveConfiguredHttpHost(
+        http.host,
+        &http.headers,
+        fallback.empty() ? std::string_view("www.example.com") : fallback);
 }
 
 [[nodiscard]] bool OffersHttp2(const StreamSettings& s) {
@@ -221,13 +219,7 @@ net::awaitable<TransportBuildResult> AcceptInboundSecurity(
                     reader.Append(front.first(take));
                     pending.DropPrefixBytes(take);
                 }
-                for (size_t i = pending.size(); i > 0; --i) {
-                    if (const buf::Buffer* b = *(pending.begin() + (i - 1));
-                        b && !b->IsEmpty()) {
-                        tcp->PrependReadData(b->Bytes());
-                    }
-                }
-                pending.clear();
+                tcp->PrependReadMultiBuffer(std::move(pending));
             } catch (...) {
                 co_return tl::unexpected(ErrorCode::TLS_HANDSHAKE_FAILED);
             }

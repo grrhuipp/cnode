@@ -1,7 +1,7 @@
 #pragma once
 
+#include "infra/config_types.hpp"
 #include "infra/log.hpp"
-#include "infra/outbound_source_config.hpp"
 #include "transport/internet/outbound_sender.hpp"
 #include "transport/internet/stream_settings.hpp"
 #include "transport/internet/transport_security.hpp"

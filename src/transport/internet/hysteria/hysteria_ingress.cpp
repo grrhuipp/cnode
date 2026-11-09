@@ -2,7 +2,6 @@
 
 #include "quic_connection.hpp"
 #include "hysteria_protocol.hpp"
-#include "hysteria_settings.hpp"
 #include "quic_memory.hpp"
 #include "quic_stream.hpp"
 

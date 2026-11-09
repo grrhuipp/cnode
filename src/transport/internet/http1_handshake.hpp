@@ -1,11 +1,14 @@
 #pragma once
 
 #include "common/buf/multi_buffer.hpp"
+#include "common/buffer_util.hpp"
 #include "common/unsafe.hpp"
 #include "transport/internet/transport_stack.hpp"
 
 #include <tl/expected.hpp>
 
+#include <array>
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -73,10 +76,38 @@ void RecordExtractedRealIp(std::string_view head,
 [[nodiscard]] std::string_view PublicHttpMethodForLog(std::string_view value);
 [[nodiscard]] std::string SanitizeHttpRequestLineForLog(const Http1RequestLine& line);
 [[nodiscard]] std::string_view ExpectedHttpHost(const HttpConfig& cfg);
-[[nodiscard]] std::string_view ResolveHttpUpgradeHost(
-    std::string_view fallback_host,
-    std::string_view configured_host,
-    const HttpHeaders* headers) noexcept;
+void AppendRequestStart(memory::ThreadLocalString& request,
+                        std::string_view method,
+                        std::string_view path,
+                        std::string_view host);
+void AppendHeaderLine(memory::ThreadLocalString& out,
+                      std::string_view name,
+                      std::string_view value);
+
+using Http1ChunkPrefixBuffer = std::array<char, sizeof(size_t) * 2 + 2>;
+
+template <size_t StackCapacity>
+[[nodiscard]] inline bool AppendHttp1Chunk(
+    ConstBufferSpanBuilder<StackCapacity>& out,
+    Http1ChunkPrefixBuffer& prefix,
+    std::span<const net::const_buffer> payloads,
+    size_t payload_len) {
+    static constexpr std::array<char, 2> kChunkTail{'\r', '\n'};
+    auto [ptr, ec] = std::to_chars(
+        prefix.data(),
+        prefix.data() + prefix.size() - 2,
+        payload_len,
+        16);
+    if (ec != std::errc{}) {
+        return false;
+    }
+    *ptr++ = '\r';
+    *ptr++ = '\n';
+    out.Append(net::buffer(prefix.data(), static_cast<size_t>(ptr - prefix.data())));
+    out.AppendBuffers(payloads);
+    out.Append(net::buffer(kChunkTail.data(), kChunkTail.size()));
+    return true;
+}
 [[nodiscard]] net::awaitable<tl::expected<Http1MessageHead, ErrorCode>>
 ExecuteHttp1UpgradeClientHandshake(
     AsyncStream& stream,

@@ -1,4 +1,4 @@
-#include "shadowsocks_crypto.hpp"
+#include "shadowsocks_protocol.hpp"
 
 #include "core/constants.hpp"
 #include "core/naming.hpp"

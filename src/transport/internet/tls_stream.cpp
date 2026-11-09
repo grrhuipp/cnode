@@ -899,16 +899,16 @@ std::optional<DetachedTlsState> TlsStream::DetachForHandoff(
     const size_t extra = impl_->prepended_plaintext
         ? impl_->prepended_plaintext->data.byte_size() : 0;
     if (plaintext_prefix.size() + extra != 0) {
-        state.plaintext_prefix.reserve(plaintext_prefix.size() + extra);
-        state.plaintext_prefix.insert(
-            state.plaintext_prefix.end(), plaintext_prefix.begin(), plaintext_prefix.end());
+        state.plaintext_prefix.resize(plaintext_prefix.size() + extra);
+        if (!plaintext_prefix.empty()) {
+            std::memcpy(
+                state.plaintext_prefix.data(),
+                plaintext_prefix.data(),
+                plaintext_prefix.size());
+        }
         if (impl_->prepended_plaintext) {
-            for (const auto* b : impl_->prepended_plaintext->data) {
-                if (!b) continue;
-                const auto span = b->Bytes();
-                state.plaintext_prefix.insert(
-                    state.plaintext_prefix.end(), span.begin(), span.end());
-            }
+            (void)impl_->prepended_plaintext->data.CopyPrefixTo(
+                std::span<uint8_t>(state.plaintext_prefix).subspan(plaintext_prefix.size()));
         }
     }
     impl_->prepended_plaintext.reset();
@@ -1071,12 +1071,24 @@ void TlsStream::PrependReadData(std::span<const uint8_t> data) {
     if (!buf::AppendSpanToMultiBuffer(data, prefix)) {
         throw std::bad_alloc();
     }
+    PrependReadMultiBuffer(std::move(prefix));
+}
+
+void TlsStream::PrependReadMultiBuffer(buf::MultiBuffer&& mb) {
+    if (mb.byte_size() == 0) {
+        mb.clear();
+        return;
+    }
+    if (!impl_->tcp->CanRead()) {
+        mb.clear();
+        throw IoSystemError(io_error::operation_aborted, "TLS read closed");
+    }
     if (impl_->prepended_plaintext) {
-        impl_->prepended_plaintext->data.MoveTo(prefix);
+        impl_->prepended_plaintext->data.MoveTo(mb);
     } else {
         impl_->prepended_plaintext = std::make_unique<Impl::PrependedPlaintext>();
     }
-    impl_->prepended_plaintext->data = std::move(prefix);
+    impl_->prepended_plaintext->data = std::move(mb);
 }
 
 net::awaitable<std::size_t> TlsStream::AsyncRead(net::mutable_buffer buffer) {

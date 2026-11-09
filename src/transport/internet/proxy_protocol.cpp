@@ -18,8 +18,8 @@ constexpr uint8_t kSignatureV2[12] = {
     0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A
 };
 
-bool PrefixMatches(const uint8_t* data, size_t len, const uint8_t* prefix, size_t prefix_len) {
-    return len <= prefix_len && std::memcmp(data, prefix, len) == 0;
+bool PrefixMatches(const uint8_t* data, size_t len, const uint8_t* prefix, size_t prefix_len) noexcept {
+    return std::memcmp(data, prefix, std::min(len, prefix_len)) == 0;
 }
 
 ProxyProtocolResult MakeIncomplete() {
@@ -220,16 +220,6 @@ ProxyProtocolResult ParseProxyProtocolHeader(std::span<const uint8_t> bytes) {
         if (len < sizeof(kSignatureV2)) {
             return MakeIncomplete();
         }
-    }
-
-    static constexpr char kProxyPrefix[] = "PROXY ";
-    if (PrefixMatches(data, len, reinterpret_cast<const uint8_t*>(kProxyPrefix), sizeof(kProxyPrefix) - 1)) {
-        if (len < sizeof(kProxyPrefix) - 1) {
-            return MakeIncomplete();
-        }
-    }
-
-    if (len >= sizeof(kSignatureV2) && std::memcmp(data, kSignatureV2, sizeof(kSignatureV2)) == 0) {
         LOG_NET_DEBUG("PROXY protocol v2 binary header detected ({} bytes)", len);
         auto r = ParseV2(data, len);
         if (r.success()) {
@@ -242,7 +232,11 @@ ProxyProtocolResult ParseProxyProtocolHeader(std::span<const uint8_t> bytes) {
         return r;
     }
 
-    if (len >= 6 && std::memcmp(data, "PROXY ", 6) == 0) {
+    static constexpr char kProxyPrefix[] = "PROXY ";
+    if (PrefixMatches(data, len, reinterpret_cast<const uint8_t*>(kProxyPrefix), sizeof(kProxyPrefix) - 1)) {
+        if (len < sizeof(kProxyPrefix) - 1) {
+            return MakeIncomplete();
+        }
         LOG_NET_DEBUG("PROXY protocol v1 text header detected");
         auto r = ParseV1(data, len);
         if (r.success()) {

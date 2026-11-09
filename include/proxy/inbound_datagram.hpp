@@ -17,8 +17,6 @@
 #include <string_view>
 
 
-class ConnectionLimiter;
-class UserOnlineTracker;
 namespace proxyman::inbound {
 class ProtocolSettings;
 }
@@ -151,14 +149,8 @@ struct InboundDatagramResult {
     const InboundDatagramAssociationPolicy* association_policy = nullptr;
     // Borrowed only until the synchronous ProcessDatagram call returns.
     InboundDatagramAssociation* committed_association = nullptr;
-    // Production authentication aliases an owned credential snapshot. The raw
-    // view is synchronous-only for protocols without an owning snapshot;
-    // ingress must copy the profile before any asynchronous handoff.
-    std::shared_ptr<const UserProfile> user_owner;
+    // Synchronous-only view into the Worker's current user snapshot;
+    // ingress copies the profile before any asynchronous handoff.
     const UserProfile* user = nullptr;
-    // Standalone injected dispatchers must supply an owning admission tracker.
-    // Production datagrams use their stable session capability's tracker instead.
-    std::shared_ptr<UserOnlineTracker> tracker;
-    ConnectionLimiter* limiter = nullptr;
 };
 

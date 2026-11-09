@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "reality_key_share.hpp"
+#include "reality_tls.hpp"
 
 #include <algorithm>
 #include <cstdio>

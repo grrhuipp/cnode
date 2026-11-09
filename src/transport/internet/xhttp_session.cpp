@@ -58,12 +58,7 @@ net::awaitable<size_t> ReadToMultiBufferTail(AsyncStream& stream,
     if (!first) {
         co_return 0;
     }
-    for (size_t i = chunk.size(); i > 0; --i) {
-        if (const buf::Buffer* b = *(chunk.begin() + (i - 1)); b && !b->IsEmpty()) {
-            stream.PrependReadData(b->Bytes());
-        }
-    }
-    chunk.clear();
+    stream.PrependReadMultiBuffer(std::move(chunk));
     const size_t n = std::min<size_t>(max_read, first->Len());
     if (n < first->Len()) {
         stream.PrependReadData(first->Bytes().subspan(n));
@@ -75,19 +70,14 @@ net::awaitable<size_t> ReadToMultiBufferTail(AsyncStream& stream,
 
 // Strict 1*DIGIT; rejects signs, whitespace and overflow.
 [[nodiscard]] std::optional<uint64_t> ParseU64Decimal(std::string_view value) {
-    if (value.empty()) {
+    if (value.empty() || value.front() < '0' || value.front() > '9') {
         return std::nullopt;
     }
     uint64_t out = 0;
-    for (char ch : value) {
-        if (ch < '0' || ch > '9') {
-            return std::nullopt;
-        }
-        const uint64_t digit = static_cast<uint64_t>(ch - '0');
-        if (out > (std::numeric_limits<uint64_t>::max() - digit) / 10) {
-            return std::nullopt;
-        }
-        out = out * 10 + digit;
+    const char* const end = value.data() + value.size();
+    const auto [ptr, ec] = std::from_chars(value.data(), end, out);
+    if (ec != std::errc{} || ptr != end) {
+        return std::nullopt;
     }
     return out;
 }
@@ -467,10 +457,7 @@ private:
             EqualsAsciiCI(key, "Connection")) {
             continue;
         }
-        response.append(key);
-        response.append(": ");
-        response.append(value);
-        response.append("\r\n");
+        AppendHeaderLine(response, key, value);
     }
     response.append("\r\n");
     return response;
@@ -507,12 +494,7 @@ net::awaitable<bool> DiscardHttp1Body(AsyncStream& connection, uint64_t length) 
             co_return false;
         }
         length -= n;
-        for (size_t i = mb.size(); i > 0; --i) {
-            if (const buf::Buffer* b = *(mb.begin() + (i - 1)); b && !b->IsEmpty()) {
-                connection.PrependReadData(b->Bytes());
-            }
-        }
-        mb.clear();
+        connection.PrependReadMultiBuffer(std::move(mb));
     }
     co_return true;
 }
@@ -622,32 +604,21 @@ net::awaitable<std::optional<buf::MultiBuffer>> ReadXHttpPacketBody(
 
     memory::ThreadLocalString request;
     request.reserve(reserve_size);
-    request.append(method);
-    request.push_back(' ');
-    request.append(req_path);
-    request.append(" HTTP/1.1\r\n");
-    request.append("Host: ");
-    request.append(host);
-    request.append("\r\n");
+    AppendRequestStart(request, method, req_path, host);
     if (chunked_upload) {
         request.append("Transfer-Encoding: chunked\r\n");
         // Match Xray's H1 DisableKeepAlives: Go's server otherwise drains the
         // request body on its first response flush, stealing live upload bytes.
         request.append("Connection: close\r\n");
     } else if (!content_length.empty()) {
-        request.append("Content-Length: ");
-        request.append(content_length);
-        request.append("\r\n");
+        AppendHeaderLine(request, "Content-Length", content_length);
     }
     for (const auto& [key, value] : cfg.headers) {
         if (key.empty() || IsBodyFramingOrHostHeader(key) ||
             (chunked_upload && EqualsAsciiCI(key, "Connection"))) {
             continue;
         }
-        request.append(key);
-        request.append(": ");
-        request.append(value);
-        request.append("\r\n");
+        AppendHeaderLine(request, key, value);
     }
     request.append("\r\n");
     return request;
@@ -1527,20 +1498,16 @@ std::unique_ptr<AsyncStream> MakeXHttpSplitStream(
 }
 
 HttpConfig XHttpStreamOneHttpConfig(const XHttpConfig& cfg, bool outbound) {
+    if (outbound) {
+        return XHttpClientHttpConfig(
+            cfg, cfg.normalized_path, "POST", true, XHttpClientRequestKind::StreamUp);
+    }
     HttpConfig http;
     http.path = cfg.normalized_path;
     http.host = cfg.host;
-    http.method = outbound ? "POST" : "";
     http.headers = cfg.headers;
     http.force_http2 = true;
-    if (outbound && !cfg.no_grpc_header && !FindHttpHeader(http.headers, "Content-Type")) {
-        http.headers.emplace("content-type", "application/grpc");
-    }
-    // normalized_path never carries a query, so the padding always opens one.
-    if (outbound && !FindHttpHeader(http.headers, "Referer")) {
-        http.headers.emplace("referer", BuildXHttpReferer(http.host, http.path, true));
-    }
-    if (!outbound && !cfg.no_sse_header && !FindHttpHeader(http.headers, "Content-Type")) {
+    if (!cfg.no_sse_header && !FindHttpHeader(http.headers, "Content-Type")) {
         http.headers.emplace("content-type", "text/event-stream");
     }
     return http;
@@ -1987,22 +1954,10 @@ net::awaitable<TransportBuildResult> DoXHttp1ClientRequest(
         // this upload connection's response while the downlink joins.
         ConstBufferSpanBuilder<20> out;
         out.Append(net::buffer(request.data(), request.size()));
-        std::array<char, sizeof(size_t) * 2 + 2> prefix{};
-        constexpr std::array<char, 2> kChunkTail{'\r', '\n'};
-        if (payload_len > 0) {
-            auto [ptr, ec] = std::to_chars(
-                prefix.data(),
-                prefix.data() + prefix.size() - 2,
-                payload_len,
-                16);
-            if (ec != std::errc{}) {
-                co_return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
-            }
-            *ptr++ = '\r';
-            *ptr++ = '\n';
-            out.Append(net::buffer(prefix.data(), static_cast<size_t>(ptr - prefix.data())));
-            out.AppendBuffers(packet_payload);
-            out.Append(net::buffer(kChunkTail.data(), kChunkTail.size()));
+        Http1ChunkPrefixBuffer prefix{};
+        if (payload_len > 0 &&
+            !AppendHttp1Chunk(out, prefix, packet_payload, payload_len)) {
+            co_return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
         }
         try {
             co_await stream->WriteBuffers(out.Span());

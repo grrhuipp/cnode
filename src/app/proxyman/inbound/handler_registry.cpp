@@ -107,7 +107,9 @@ void HandlerRegistry::RemoveHandler(std::string_view tag) {
 std::vector<::OnlineDevice>
 HandlerRegistry::GetOnlineDevices(std::string_view protocol, std::string_view tag) const {
     if (auto it = impl_->runtimes.find(protocol); it != impl_->runtimes.end()) {
-        return it->second->GetOnlineDevices(tag);
+        if (auto* tracker = it->second->OnlineTracker()) {
+            return tracker->GetOnlineDevices(tag);
+        }
     }
     return {};
 }

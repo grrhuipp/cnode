@@ -2,7 +2,7 @@
 #include <gtest/gtest.h>
 
 #include "ss_udp.hpp"
-#include "shadowsocks_crypto.hpp"
+#include "shadowsocks_protocol.hpp"
 #include "client.hpp"
 #include "server.hpp"
 #include <asio/bind_cancellation_slot.hpp>
@@ -12,7 +12,6 @@
 #include <asio/redirect_error.hpp>
 #include <asio/steady_timer.hpp>
 #include <asio/use_future.hpp>
-#include "common/buf/contiguous_buffer_view.hpp"
 
 #include <algorithm>
 #include <array>

@@ -3,19 +3,28 @@
 #include "common/rule.hpp"
 #include "common/session.hpp"
 
+#include <memory>
 #include <regex>
 #include <string_view>
 #include <vector>
 
+namespace {
+
+::rule::DetectRulePolicy::RuleListPtr MakeRules(
+    std::initializer_list<::rule::DetectRule> rules) {
+    return std::make_shared<const ::rule::DetectRulePolicy::RuleList>(rules);
+}
+
+}  // namespace
 TEST(RuleLifecycle, Contract) {
     ::rule::DetectRulePolicy detect_rule_policy;
     constexpr std::string_view tag = "panel|vmess|443";
 
-    detect_rule_policy.UpdateRule(tag, {
+    detect_rule_policy.UpdateRule(tag, MakeRules({
         ::rule::DetectRule{
             .Pattern = std::regex("blocked\\.example"),
         },
-    });
+    }));
 
     ::session::Context ctx;
     ctx.inbound.tag = tag;
@@ -36,21 +45,21 @@ TEST(RuleLifecycle, Contract) {
     ASSERT_FALSE((policy.Blocked(ctx)));
     ctx.inbound.tag = tag;
 
-    detect_rule_policy.UpdateRule(tag, {
+    detect_rule_policy.UpdateRule(tag, MakeRules({
         ::rule::DetectRule{
             .Pattern = std::regex("replacement\\.example"),
         },
-    });
+    }));
     ASSERT_FALSE((policy.Blocked(ctx)));
     ctx.outbound.target = ::TargetAddress("replacement.example", 443);
     ASSERT_FALSE((!policy.Blocked(ctx)));
     detect_rule_policy.UpdateRule(tag, {});
     // Verify route_only (route_target) and original_target cannot bypass block rules.
-    detect_rule_policy.UpdateRule(tag, {
+    detect_rule_policy.UpdateRule(tag, MakeRules({
         ::rule::DetectRule{
             .Pattern = std::regex("sniffed\\.blocked\\.example"),
         },
-    });
+    }));
     ctx.outbound.target = ::TargetAddress("1.1.1.1", 443);
     ctx.outbound.route_target = ::TargetAddress("sniffed.blocked.example", 443);
     ASSERT_FALSE((!policy.Blocked(ctx)));
@@ -59,11 +68,11 @@ TEST(RuleLifecycle, Contract) {
     ASSERT_FALSE((!policy.Blocked(ctx)));
     ctx.outbound.original_target = {};
     // A domain target whose resolved_addr matches an IP block rule must also be blocked.
-    detect_rule_policy.UpdateRule(tag, {
+    detect_rule_policy.UpdateRule(tag, MakeRules({
         ::rule::DetectRule{
             .Pattern = std::regex("192\\.0\\.2\\.99"),
         },
-    });
+    }));
     ctx.outbound.target = ::TargetAddress("allowed.example", 443);
     ctx.outbound.target.resolved_addr = ::net::ip::make_address("192.0.2.99");
     ASSERT_FALSE((!policy.Blocked(ctx)));

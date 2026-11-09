@@ -1,13 +1,17 @@
-#include "blackhole_outbound.hpp"
 #include "app/proxyman/outbound/factory.hpp"
-#include "../../app/proxyman/outbound/registration.hpp"
 #include "common/buf/multi_buffer.hpp"
 #include "common/session.hpp"
 #include "core/constants.hpp"
 #include "core/naming.hpp"
-#include "infra/json_field.hpp"
+#include "infra/json.hpp"
 #include "infra/log.hpp"
+#include "proxy/outbound.hpp"
 
+#include <chrono>
+#include <cstdint>
+#include <span>
+#include <string>
+#include <string_view>
 namespace proxy::blackhole::outbound {
 
 namespace {
@@ -19,6 +23,29 @@ constexpr std::string_view kHttp403Response =
     "\r\n";
 
 }  // namespace
+
+struct BlackholeSettings {
+    bool http_response = false;  // response.type == "http"
+};
+
+class Handler final : public Outbound {
+public:
+    explicit Handler(const BlackholeSettings& settings);
+
+    net::awaitable<OutboundProcessResult> Process(
+        session::Context& ctx,
+        transport::Link inbound,
+        OutboundDialer& dialer,
+        const TimeoutsConfig& timeouts,
+        StatsShard& stats,
+        const RelayConfig& relay_config,
+        buf::MultiBufferBatch first_payload,
+        std::chrono::seconds relay_idle_timeout,
+        std::chrono::seconds relay_write_timeout) override;
+
+private:
+    bool http_response_;
+};
 
 // ============================================================================
 // Handler 实现

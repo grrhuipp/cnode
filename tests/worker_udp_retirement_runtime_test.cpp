@@ -4,7 +4,7 @@
 #include "app/port_binding.hpp"
 #include "app/proxyman/inbound/factory.hpp"
 #include "app/proxyman/inbound/receiver_settings.hpp"
-#include "../src/app/proxyman/outbound/registration.hpp"
+#include "app/proxyman/outbound/factory.hpp"
 #include "app/stats.hpp"
 #include "app/worker.hpp"
 #include "app/worker_runtime_config.hpp"
@@ -13,7 +13,7 @@
 #include "common/user_profile.hpp"
 #include "common/allocator.hpp"
 #include "common/session.hpp"
-#include "infra/outbound_source_config.hpp"
+#include "infra/config_types.hpp"
 #include "proxy/inbound.hpp"
 #include "proxy/inbound_datagram.hpp"
 #include "proxy/outbound.hpp"
@@ -126,17 +126,16 @@ private:
 
 struct Settings final : ::proxyman::inbound::ProtocolSettings {};
 struct Runtime final : ::proxyman::inbound::ProtocolRuntime {
-    std::vector<::OnlineDevice> GetOnlineDevices(std::string_view) const override {
-        return {};
+    ::UserOnlineTracker* OnlineTracker() noexcept override {
+        return &tracker;
     }
-    std::shared_ptr<::UserOnlineTracker> tracker = std::make_shared<::UserOnlineTracker>();
+    ::UserOnlineTracker tracker;
 };
 
 class NativeDecoder final : public ::Inbound {
 public:
-    NativeDecoder(FixtureState& state, std::shared_ptr<::UserOnlineTracker> tracker,
-                  ::ConnectionLimiter* limiter)
-        : state_(state), tracker_(tracker), limiter_(limiter) {
+    explicit NativeDecoder(FixtureState& state)
+        : state_(state) {
         ++state_.handlers_created;
         profile_.user_id = 71;
         profile_.email = "udp-owner@example.test";
@@ -164,8 +163,6 @@ public:
         const std::array<uint8_t, 8> owner{0x44, 0x4e, 0x53, 0x2d, 0x6f, 0x77, 0x6e, 0x72};
         if (!decoded.session_owner.Assign(owner)) throw std::bad_alloc();
         decoded.user = &profile_;
-        decoded.tracker = tracker_;
-        decoded.limiter = limiter_;
         auto* first = ::buf::Buffer::New();
         if (!first) throw std::bad_alloc();
         first->data[0] = 0x51;
@@ -180,8 +177,6 @@ public:
     }
 private:
     FixtureState& state_;
-    std::shared_ptr<::UserOnlineTracker> tracker_;
-    ::ConnectionLimiter* limiter_;
     ::UserProfile profile_;
 };
 
@@ -190,12 +185,11 @@ std::unique_ptr<::proxyman::inbound::ProtocolRuntime> MakeRuntime() {
     return std::make_unique<Runtime>();
 }
 std::unique_ptr<::Inbound> MakeHandler(
-    ::proxyman::inbound::ProtocolRuntime& runtime, ::StatsShard&,
-    ::ConnectionLimiter* limiter,
+    ::proxyman::inbound::ProtocolRuntime&, ::StatsShard&,
+    ::ConnectionLimiter*,
     const ::proxyman::inbound::BuildRequest&) {
     if (!g_state) throw std::logic_error("fixture state not installed on Worker thread");
-    return std::make_unique<NativeDecoder>(
-        *g_state, static_cast<Runtime&>(runtime).tracker, limiter);
+    return std::make_unique<NativeDecoder>(*g_state);
 }
 void RegisterProtocol() {
     static const bool registered = [] {

@@ -609,7 +609,7 @@ net::awaitable<WsHandshakeResult> BaseWsStream::Handshake(
     } cleanse_ws_key{ws_key_buf};
     const std::string_view ws_key(reinterpret_cast<const char*>(ws_key_buf.data()), 24);
     const std::string_view req_path = EffectiveHttpPath(path);
-    host = transport::internet::ResolveHttpUpgradeHost(host, {}, headers);
+    host = transport::internet::ResolveConfiguredHttpHost({}, headers, host);
     auto head = co_await transport::internet::ExecuteHttp1UpgradeClientHandshake(
         *inner_, "WebSocket", conn_id, host, req_path, headers, ws_key);
     if (!head) {

@@ -1,7 +1,6 @@
 #include <gtest/gtest.h>
 
 #include "common/buffer_util.hpp"
-#include "common/buf/contiguous_buffer_view.hpp"
 #include "common/initial_payload.hpp"
 
 #include <array>

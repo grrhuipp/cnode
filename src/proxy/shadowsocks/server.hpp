@@ -2,7 +2,6 @@
 
 #include "common/initial_payload.hpp"
 #include "common/target_address.hpp"
-#include "shadowsocks_crypto.hpp"
 #include "shadowsocks_protocol.hpp"
 #include "stream_crypto.hpp"
 #include "app/proxyman/inbound/user_store.hpp"
@@ -26,15 +25,15 @@ public:
                        const KeyBytes& request_salt,
                        AsyncStream& stream)
         : cipher_type_(cipher_info.type)
-        , key_size_(cipher_info.key_size)
-        , salt_size_(cipher_info.salt_size)
+        , key_size_(cipher_info.key_size == cipher_info.salt_size &&
+                    cipher_info.key_size <= KeyBytes::kMaxSize &&
+                    user.derived_key.size <= KeyBytes::kMaxSize
+                        ? static_cast<uint8_t>(cipher_info.key_size)
+                        : uint8_t{0})
         , request_salt_(request_salt)
-        , is_2022_(Is2022Cipher(cipher_info.type))
         , stream_(&stream) {
-        if (user.derived_key.size <= master_key_.size()) {
+        if (key_size_ != 0) {
             std::memcpy(master_key_.data(), user.derived_key.data(), user.derived_key.size);
-        } else {
-            key_size_ = 0;
         }
     }
 
@@ -48,7 +47,6 @@ public:
     ResponseBodyWriter(ResponseBodyWriter&& other) noexcept
         : cipher_type_(other.cipher_type_)
         , key_size_(other.key_size_)
-        , salt_size_(other.salt_size_)
         , master_key_(other.master_key_)
         , request_salt_(other.request_salt_)
         , write_cipher_(std::move(other.write_cipher_))
@@ -56,7 +54,6 @@ public:
         , write_nonce_(other.write_nonce_)
         , write_init_(other.write_init_)
         , write_finished_(other.write_finished_)
-        , is_2022_(other.is_2022_)
         , skip_first_bytes_(other.skip_first_bytes_)
         , stream_(std::exchange(other.stream_, nullptr)) {
         other.ClearHandshakeKeys();
@@ -67,7 +64,6 @@ public:
             ClearHandshakeKeys();
             cipher_type_ = other.cipher_type_;
             key_size_ = other.key_size_;
-            salt_size_ = other.salt_size_;
             master_key_ = other.master_key_;
             request_salt_ = other.request_salt_;
             write_cipher_ = std::move(other.write_cipher_);
@@ -75,14 +71,12 @@ public:
             write_nonce_ = other.write_nonce_;
             write_init_ = other.write_init_;
             write_finished_ = other.write_finished_;
-            is_2022_ = other.is_2022_;
             skip_first_bytes_ = other.skip_first_bytes_;
             stream_ = std::exchange(other.stream_, nullptr);
             other.ClearHandshakeKeys();
         }
         return *this;
     }
-
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override;
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override;
     net::awaitable<void> AsyncShutdownWrite() override;
@@ -111,8 +105,7 @@ private:
                                        std::span<const uint8_t> first_payload);
 
     SsCipherType cipher_type_;
-    size_t key_size_;
-    size_t salt_size_;
+    uint8_t key_size_ = 0;
     std::array<uint8_t, 32> master_key_{};
     KeyBytes request_salt_;
     std::optional<SsAeadCipher> write_cipher_;
@@ -120,7 +113,6 @@ private:
     uint64_t write_nonce_ = 0;
     bool write_init_ = false;
     bool write_finished_ = false;
-    bool is_2022_ = false;
     size_t skip_first_bytes_ = 0;
     AsyncStream* stream_ = nullptr;
 };

@@ -9,8 +9,8 @@
 #include "proxy/sniff_config.hpp"
 #include "transport/internet/stream_settings.hpp"
 #include "transport/internet/inbound_listen.hpp"
-#include "transport/internet/proxy_protocol_mode.hpp"
-
+#include "transport/internet/outbound_bind.hpp"
+#include "transport/internet/proxy_protocol.hpp"
 #include <cstdint>
 #include <filesystem>
 #include <optional>
@@ -120,4 +120,18 @@ struct StaticInboundConfig {
     std::optional<std::string> outbound_tag;
     static StaticInboundConfig FromJson(const json::object& j);
 };
+
+namespace infra {
+
+struct OutboundSourceConfig {
+    std::string tag;
+    std::string protocol;
+    json::object settings;
+    StreamSettings stream_settings;
+    std::optional<OutboundBind> send_through;
+    bool passthrough = false;
+    static OutboundSourceConfig FromJson(const json::object& j);
+};
+
+}  // namespace infra
 

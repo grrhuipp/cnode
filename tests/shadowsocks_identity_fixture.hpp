@@ -3,7 +3,7 @@
 #include "app/proxyman/inbound/user_store.hpp"
 #include "client.hpp"
 #include "server.hpp"
-#include "shadowsocks_crypto.hpp"
+#include "shadowsocks_protocol.hpp"
 #include <asio/co_spawn.hpp>
 #include <asio/use_future.hpp>
 #include <algorithm>

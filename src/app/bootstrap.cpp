@@ -24,7 +24,7 @@
 #include "infra/log.hpp"
 #include "infra/panel_config.hpp"
 #include "infra/runtime_failure.hpp"
-#include "proxyman/outbound/registration.hpp"
+#include "app/proxyman/outbound/factory.hpp"
 #include "service/controller/controller.hpp"
 #include "transport/internet/timeout_scheduler.hpp"
 #include "transport/internet/tls_stream.hpp"

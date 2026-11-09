@@ -9,6 +9,12 @@
 #include <span>
 #include <string>
 
+enum class ProxyProtocolMode : uint8_t {
+    Off,
+    Auto,
+    On,
+};
+
 enum class ProxyProtocolParseStatus : uint8_t {
     NotProxy = 0,
     Incomplete,

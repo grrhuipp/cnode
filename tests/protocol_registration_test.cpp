@@ -7,7 +7,6 @@
 #include "infra/config_types.hpp"
 #include "proxy/inbound.hpp"
 #include "transport/async_stream.hpp"
-#include "registration.hpp"
 #include "../src/common/awaitable_task_group.hpp"
 
 #include <iostream>
@@ -27,13 +26,7 @@ bool Throws(Function&& function) {
     return false;
 }
 
-class DummyRuntime final : public ::proxyman::inbound::ProtocolRuntime {
-public:
-    std::vector<::OnlineDevice>
-    GetOnlineDevices(std::string_view) const override {
-        return {};
-    }
-};
+class DummyRuntime final : public ::proxyman::inbound::ProtocolRuntime {};
 
 class DummyDatagramHandler final : public ::Inbound {
 public:

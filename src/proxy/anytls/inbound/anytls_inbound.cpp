@@ -5,7 +5,6 @@
 #include "../anytls_codec.hpp"
 #include "proxy/anytls_padding.hpp"
 #include "common/buf/length_prefixed_packet_buffer.hpp"
-#include "../credentials.hpp"
 #include "../../uot/uot.hpp"
 #include "transport/internet/async_write_gate.hpp"
 #include "app/stats.hpp"
@@ -231,16 +230,42 @@ public:
 
     net::awaitable<tl::expected<void, ErrorCode>>
     WriteFrameSerialized(uint8_t cmd, uint32_t sid, std::span<const uint8_t> payload) {
+        const auto sub = sid != 0 ? FindStream(sid) : nullptr;
+        struct WriteCancelSubscription final : transport::CancellationSubscription {
+            transport::internet::AsyncWriteGate& gate;
+            AsyncStream* stream = nullptr;
+            net::cancellation_signal gate_cancel;
+            bool writing = false;
+            explicit WriteCancelSubscription(transport::internet::AsyncWriteGate& g) noexcept
+                : gate(g) {}
+            void OnCancellation(transport::Cancellation) noexcept override {
+                if (!writing) gate_cancel.emit(net::cancellation_type::terminal);
+                else if (stream) stream->Cancel();
+            }
+        } cancel_sub(write_gate_);
+        if (cmd == anytls::kCmdSYNACK && sub) {
+            cancel_sub.Resubscribe(sub->Cancellation());
+        }
         auto write_lease = write_gate_.TryAcquire();
-        if (!write_lease) write_lease = co_await write_gate_.Acquire();
+        if (!write_lease) {
+            write_lease = co_await write_gate_.Acquire(
+                false,
+                (cmd == anytls::kCmdSYNACK && sub)
+                    ? cancel_sub.gate_cancel.slot()
+                    : net::cancellation_slot{});
+        }
         if (!write_lease || cancelled_ || !stream_) {
             co_return tl::unexpected(ErrorCode::CONNECTION_CLOSED);
         }
-        if (auto sub = FindStream(sid)) {
+        if (sub) {
             if (cmd == anytls::kCmdFIN && sub->RemoteClosed())
                 co_return tl::expected<void, ErrorCode>{};
-            if (cmd == anytls::kCmdSYNACK && sub->IsClosed())
+            if (cmd == anytls::kCmdSYNACK && (sub->IsClosed() || sub->Cancellation().Stopped()))
                 co_return tl::unexpected(ErrorCode::CONNECTION_CLOSED);
+        }
+        if (cmd == anytls::kCmdSYNACK && sub) {
+            cancel_sub.stream = stream_.get();
+            cancel_sub.writing = true;
         }
 
         try {
@@ -362,46 +387,37 @@ private:
     template<class Phase>
     net::awaitable<ErrorCode> RunHandshakePhase(
         AnyTLSSubStream& sub, std::chrono::steady_clock::time_point opened_at, Phase& phase) {
+        const auto deadline_tp = opened_at + timeouts_.HandshakeTimeout();
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline_tp) {
+            sub.Cancel();
+            co_return ErrorCode::TIMEOUT;
+        }
+        const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(deadline_tp - now);
         bool timed_out = false;
+        struct HandshakeDeadline final : TimeoutEvent {
+            HandshakeDeadline(bool& timed_out, AnyTLSSubStream& sub) noexcept
+                : timed_out(timed_out), sub(sub) {}
+            void OnTimeout() override {
+                timed_out = true;
+                sub.Cancel();
+            }
+            bool& timed_out;
+            AnyTLSSubStream& sub;
+        } deadline(timed_out, sub);
+        if (!TimeoutScheduler::ForIoContext(io_context_).ScheduleAfter(remaining, deadline))
+            throw IoSystemError(io_error::operation_aborted);
         ErrorCode phase_error = ErrorCode::INTERNAL;
-        auto bounded = [&](AwaitableTaskGroup& tasks) -> net::awaitable<void> {
-            const auto deadline_tp = opened_at + timeouts_.HandshakeTimeout();
-            const auto now = std::chrono::steady_clock::now();
-            if (now >= deadline_tp) {
-                timed_out = true;
-                sub.Cancel();
-                co_return;
-            }
-            const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(deadline_tp - now);
-            // Embedded in this child; cannot outlive the task group it borrows.
-            // Cancellation covers both reads and SYNACK I/O.
-            struct HandshakeDeadline final : TimeoutEvent {
-                HandshakeDeadline(bool& timed_out, AnyTLSSubStream& sub, AwaitableTaskGroup& tasks)
-                    : timed_out(timed_out), sub(sub), tasks(tasks) {}
-                void OnTimeout() override {
-                    timed_out = true;
-                    sub.Cancel();
-                    tasks.Cancel();
-                }
-                bool& timed_out;
-                AnyTLSSubStream& sub;
-                AwaitableTaskGroup& tasks;
-            } deadline(timed_out, sub, tasks);
-            if (!TimeoutScheduler::ForIoContext(io_context_).ScheduleAfter(remaining, deadline))
-                throw IoSystemError(io_error::operation_aborted);
-            phase_error = co_await phase();
-            // Ready continuations can run before an already-due timer callback.
-            // Do not dispatch a header that completed beyond its absolute budget.
-            if (std::chrono::steady_clock::now() >= deadline_tp) {
-                timed_out = true;
-                sub.Cancel();
-            }
-        };
         try {
-            co_await RunAwaitableTaskGroup(co_await net::this_coro::executor,
-                [&](AwaitableTaskGroup& tasks) { tasks.Spawn(bounded(tasks)); });
+            phase_error = co_await phase();
         } catch (const IoSystemError&) {
             if (!timed_out) throw;
+        }
+        // Ready continuations can run before an already-due timer callback.
+        // Do not dispatch a header that completed beyond its absolute budget.
+        if (!timed_out && std::chrono::steady_clock::now() >= deadline_tp) {
+            timed_out = true;
+            sub.Cancel();
         }
         co_return timed_out ? ErrorCode::TIMEOUT : phase_error;
     }

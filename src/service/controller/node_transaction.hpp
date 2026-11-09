@@ -1,18 +1,182 @@
 #pragma once
 
-#include "node_state.hpp"
-#include "node_transition.hpp"
+#include "api/api.hpp"
+#include "app/prepared_inbound.hpp"
+#include "app/runtime_publication.hpp"
+#include "app/proxyman/outbound/prepared_config.hpp"
+#include "common/sharded_user_stats.hpp"
 
 #include <asio/as_tuple.hpp>
 #include <asio/steady_timer.hpp>
 #include <asio/this_coro.hpp>
 #include <asio/use_awaitable.hpp>
 
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <exception>
+#include <memory>
+#include <optional>
 #include <stdexcept>
+#include <string>
 #include <utility>
-
+#include <vector>
 namespace controller {
+
+// Constructed before runtime mutations and immutable after publication.
+struct NodeSnapshot {
+    api::NodeInfo config;
+    std::shared_ptr<const std::vector<api::UserInfo>> users;
+    std::string users_etag;
+    std::string config_etag;
+    std::shared_ptr<const std::vector<rule::DetectRule>> rules;
+    std::string tag;
+    // Prepared by the shared inbound builder; carries the prepared users.
+    std::shared_ptr<const PreparedInbound> inbound;
+    std::shared_ptr<const proxyman::outbound::PreparedOutboundConfig> outbound;
+};
+
+enum class NodeRuntimePhase { Stopped, Ready, Updating, RecoveryRequired };
+
+struct NodeState {
+    std::shared_ptr<const NodeSnapshot> committed;
+    NodeRuntimePhase phase = NodeRuntimePhase::Stopped;
+    // A failed transition can leave only its old and candidate tags behind.
+    // No new transition starts until both have been cleaned successfully.
+    std::array<std::shared_ptr<const NodeSnapshot>, 2> pending_cleanup;
+    std::optional<UserPublicationRollback> user_recovery;
+
+    [[nodiscard]] bool HasPendingCleanup() const noexcept {
+        return pending_cleanup[0] || pending_cleanup[1] || user_recovery.has_value();
+    }
+
+    // Controller-executor admission uses the same snapshots as recovery.
+    // Keep both endpoints reserved until every old/candidate Worker effect is
+    // joined and either committed, compensated or cleaned.
+    [[nodiscard]] bool ReservesPort(uint16_t port) const noexcept {
+        if (phase != NodeRuntimePhase::Stopped && committed && committed->config.Port == port) {
+            return true;
+        }
+        for (const auto& target : pending_cleanup) {
+            if (target && target->config.Port == port) return true;
+        }
+        return false;
+    }
+};
+
+struct PreparedNodeChange {
+    std::shared_ptr<const NodeSnapshot> next;
+    bool replace_users = true;
+    bool replace_rules = true;
+};
+
+enum class NodeTransitionMode {
+    Refresh,
+    Create,
+    Recover,
+    StageNewEndpoint,
+    ReplaceInPlace,
+    SwapSameEndpoint,
+};
+
+struct NodeTransitionPlan {
+    NodeTransitionMode mode = NodeTransitionMode::Refresh;
+
+    [[nodiscard]] bool Transitioning() const noexcept {
+        return mode != NodeTransitionMode::Refresh;
+    }
+
+    [[nodiscard]] bool DestructiveSwap() const noexcept {
+        return mode == NodeTransitionMode::SwapSameEndpoint;
+    }
+
+    [[nodiscard]] bool RetireOldInboundBeforeCommit() const noexcept {
+        return mode == NodeTransitionMode::StageNewEndpoint;
+    }
+};
+
+[[nodiscard]] inline bool NodeConfigChanged(
+    const api::NodeInfo& current,
+    const api::NodeInfo& candidate) noexcept {
+    return current.Port != candidate.Port
+        || current.NodeType != candidate.NodeType
+        || current.TransportProtocol != candidate.TransportProtocol
+        || current.Path != candidate.Path
+        || current.Host != candidate.Host
+        || current.EnableTLS != candidate.EnableTLS
+        || current.EnableReality != candidate.EnableReality
+        || current.Flow != candidate.Flow
+        || current.ServiceName != candidate.ServiceName
+        || current.Reality != candidate.Reality
+        || current.TLSServerName != candidate.TLSServerName
+        || current.CypherMethod != candidate.CypherMethod
+        || current.ShadowsocksServerKey != candidate.ShadowsocksServerKey
+        || current.PaddingScheme != candidate.PaddingScheme
+        || current.HysteriaUpMbps != candidate.HysteriaUpMbps
+        || current.HysteriaDownMbps != candidate.HysteriaDownMbps;
+}
+
+[[nodiscard]] inline NodeTransitionPlan PlanNodeTransition(
+    const api::NodeInfo* current,
+    bool current_started,
+    const api::NodeInfo& candidate) noexcept {
+    if (current == nullptr) {
+        return {NodeTransitionMode::Create};
+    }
+    if (!current_started) {
+        return {NodeTransitionMode::Recover};
+    }
+    if (!NodeConfigChanged(*current, candidate)) {
+        return {NodeTransitionMode::Refresh};
+    }
+    if (current->Port != candidate.Port) {
+        return {NodeTransitionMode::StageNewEndpoint};
+    }
+    if (current->NodeType == candidate.NodeType) {
+        return {NodeTransitionMode::ReplaceInPlace};
+    }
+    return {NodeTransitionMode::SwapSameEndpoint};
+}
+
+[[nodiscard]] constexpr std::chrono::seconds PanelInterval(
+    int configured_seconds,
+    uint32_t fallback_seconds) noexcept {
+    return std::chrono::seconds(
+        configured_seconds > 0
+            ? static_cast<uint32_t>(configured_seconds)
+            : fallback_seconds);
+}
+
+struct OnlineSnapshot {
+    std::vector<api::OnlineUser> entries;
+    size_t user_count = 0;
+};
+
+[[nodiscard]] inline OnlineSnapshot
+BuildOnlineSnapshot(std::vector<OnlineDevice> devices) {
+    std::erase_if(devices, [](const OnlineDevice& d) {
+        return d.user_id <= 0 || d.ip.empty();
+    });
+    std::sort(devices.begin(), devices.end());
+    devices.erase(std::unique(devices.begin(), devices.end()), devices.end());
+
+    OnlineSnapshot result;
+    result.entries.reserve(devices.size());
+    std::optional<int64_t> last_user_id;
+    for (auto& device : devices) {
+        if (!last_user_id || *last_user_id != device.user_id) {
+            ++result.user_count;
+            last_user_id = device.user_id;
+        }
+        result.entries.push_back(api::OnlineUser{
+            .UID = device.user_id,
+            .IP = std::move(device.ip),
+        });
+    }
+    return result;
+}
 
 // One address-stable wait slot belongs to each panel fixed before Start. FIFO
 // admission spans the complete all-Worker transaction, not just one publication:

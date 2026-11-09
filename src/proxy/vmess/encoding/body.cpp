@@ -1,7 +1,5 @@
 #include "body.hpp"
 
-#include "../udp_datagram.hpp"
-#include "common/buf/contiguous_buffer_view.hpp"
 #include "common/buffer_util.hpp"
 #include "common/error.hpp"
 #include "infra/log.hpp"
@@ -216,6 +214,28 @@ size_t BodyEncoder::EncodeEndTo(std::span<uint8_t, 128> out) {
     }
 }
 
+net::awaitable<void> BodyEncoder::WriteEncodedChunks(
+    AsyncStream& stream,
+    buf::MultiBuffer chunks,
+    std::span<const uint8_t> first_header,
+    bool* header_sent,
+    bool& frame_generated) {
+    frame_generated = chunks.byte_size() != 0;
+    if (!frame_generated) {
+        co_return;
+    }
+    if (header_sent && !*header_sent) {
+        *header_sent = true;
+        ConstBufferSpanBuilder<1 + buf::MultiBuffer::kInlineCapacity> framed;
+        framed.Append(net::buffer(first_header.data(), first_header.size()));
+        framed.AppendMultiBuffer(chunks);
+        co_await stream.WriteBuffers(framed.Span());
+        chunks.clear();
+    } else {
+        co_await stream.WriteMultiBuffer(std::move(chunks));
+    }
+}
+
 net::awaitable<void> BodyEncoder::WriteMultiBuffer(
     AsyncStream& stream,
     buf::MultiBuffer mb,
@@ -235,20 +255,9 @@ net::awaitable<void> BodyEncoder::WriteMultiBuffer(
         }
         buf::MultiBuffer chunks;
         Encode(mb, chunks);
-        frame_generated = chunks.byte_size() != 0;
         mb.clear();
-        if (frame_generated) {
-            if (header_sent && !*header_sent) {
-                *header_sent = true;
-                ConstBufferSpanBuilder<1 + buf::MultiBuffer::kInlineCapacity> framed;
-                framed.Append(net::buffer(first_header.data(), first_header.size()));
-                framed.AppendMultiBuffer(chunks);
-                co_await stream.WriteBuffers(framed.Span());
-                chunks.clear();
-            } else {
-                co_await stream.WriteMultiBuffer(std::move(chunks));
-            }
-        }
+        co_await WriteEncodedChunks(
+            stream, std::move(chunks), first_header, header_sent, frame_generated);
     } catch (const transport::WriteClosed&) {
         Finish();
         throw;
@@ -276,19 +285,8 @@ net::awaitable<void> BodyEncoder::WriteBuffers(
     try {
         buf::MultiBuffer chunks;
         Encode(buffers, chunks);
-        frame_generated = chunks.byte_size() != 0;
-        if (frame_generated) {
-            if (header_sent && !*header_sent) {
-                *header_sent = true;
-                ConstBufferSpanBuilder<1 + buf::MultiBuffer::kInlineCapacity> framed;
-                framed.Append(net::buffer(first_header.data(), first_header.size()));
-                framed.AppendMultiBuffer(chunks);
-                co_await stream.WriteBuffers(framed.Span());
-                chunks.clear();
-            } else {
-                co_await stream.WriteMultiBuffer(std::move(chunks));
-            }
-        }
+        co_await WriteEncodedChunks(
+            stream, std::move(chunks), first_header, header_sent, frame_generated);
     } catch (const transport::WriteClosed&) {
         Finish();
         throw;
@@ -300,7 +298,6 @@ net::awaitable<void> BodyEncoder::WriteBuffers(
         throw;
     }
 }
-
 net::awaitable<void> BodyEncoder::WriteEOF(
     AsyncStream& stream,
     const char* cancel_what,

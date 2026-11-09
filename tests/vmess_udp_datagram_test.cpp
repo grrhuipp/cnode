@@ -1,8 +1,6 @@
 #include <stdexcept>
 #include <gtest/gtest.h>
 
-#include "udp_datagram.hpp"
-#include "common/buf/contiguous_buffer_view.hpp"
 #include "encoding/client.hpp"
 #include "encoding/server.hpp"
 #include "vmess_cipher.hpp"

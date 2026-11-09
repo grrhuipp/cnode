@@ -3,7 +3,7 @@
 #include "hysteria_protocol.hpp"
 #include "quic_memory.hpp"
 #include "quic_stream.hpp"
-#include "quic_handoff.hpp"
+#include "hysteria_ingress.hpp"
 #include "app/session_capabilities.hpp"
 
 #include "app/rate_limiter.hpp"

@@ -667,9 +667,21 @@ void TcpStream::PrependReadData(std::span<const uint8_t> data) {
     if (!buf::AppendSpanToMultiBuffer(data, prefix)) {
         throw std::bad_alloc();
     }
+    PrependReadMultiBuffer(std::move(prefix));
+}
+
+void TcpStream::PrependReadMultiBuffer(buf::MultiBuffer&& mb) {
+    if (mb.byte_size() == 0) {
+        mb.clear();
+        return;
+    }
+    if (!impl_->socket.is_open() || impl_->HasFlag(kReadShutdown)) {
+        mb.clear();
+        throw IoSystemError(io_error::operation_aborted, "TCP read closed");
+    }
     // MoveTo reserves before transferring; allocation failure preserves old data.
-    impl_->pending_data.MoveTo(prefix);
-    impl_->pending_data = std::move(prefix);
+    impl_->pending_data.MoveTo(mb);
+    impl_->pending_data = std::move(mb);
 }
 
 std::optional<DetachedTcpState> TcpStream::DetachForHandoff(
@@ -678,15 +690,14 @@ std::optional<DetachedTcpState> TcpStream::DetachForHandoff(
         return std::nullopt;
     }
     DetachedTcpState state;
-    const size_t total = prefix.size() + impl_->pending_data.byte_size();
-    if (total != 0) {
-        state.pending_bytes.reserve(total);
-        state.pending_bytes.insert(state.pending_bytes.end(), prefix.begin(), prefix.end());
-        for (const auto* b : impl_->pending_data) {
-            if (!b) continue;
-            const auto span = b->Bytes();
-            state.pending_bytes.insert(state.pending_bytes.end(), span.begin(), span.end());
+    const size_t extra = impl_->pending_data.byte_size();
+    if (prefix.size() + extra != 0) {
+        state.pending_bytes.resize(prefix.size() + extra);
+        if (!prefix.empty()) {
+            std::memcpy(state.pending_bytes.data(), prefix.data(), prefix.size());
         }
+        (void)impl_->pending_data.CopyPrefixTo(
+            std::span<uint8_t>(state.pending_bytes).subspan(prefix.size()));
     }
     ReleasePendingData();
     IoErrorCode ec;
@@ -922,7 +933,7 @@ net::awaitable<DialResult> TcpStream::ConnectSocket(
     if (deadline.timed_out)
         co_return DialResult::Fail(ErrorCode::DIAL_TIMEOUT, "connection timed out");
     if (connect_ec)
-        co_return DialResult::Fail(MapAsioError(connect_ec), connect_ec.message(), connect_ec.value());
+        co_return DialResult::Fail(MapAsioError(connect_ec), connect_ec.message());
     co_return DialResult::Success(std::move(stream));
 }
 
@@ -938,7 +949,7 @@ net::awaitable<DialResult> TcpStream::Connect(
     tcp::socket socket(io_context);
     socket.open(endpoint.protocol(), ec);
     if (ec)
-        co_return DialResult::Fail(ErrorCode::SOCKET_CREATE_FAILED, ec.message(), ec.value());
+        co_return DialResult::Fail(ErrorCode::SOCKET_CREATE_FAILED, ec.message());
     co_return co_await ConnectSocket(std::move(socket), endpoint, timeout);
 }
 
@@ -956,14 +967,12 @@ net::awaitable<DialResult> TcpStream::ConnectWithBind(
     IoErrorCode ec;
     socket.open(remote_endpoint.protocol(), ec);
     if (ec) {
-        co_return DialResult::Fail(
-            ErrorCode::SOCKET_CREATE_FAILED, ec.message(), ec.value());
+        co_return DialResult::Fail(ErrorCode::SOCKET_CREATE_FAILED, ec.message());
     }
 
     socket.bind(tcp::endpoint(local_addr, 0), ec);
     if (ec) {
-        co_return DialResult::Fail(
-            ErrorCode::SOCKET_BIND_FAILED, ec.message(), ec.value());
+        co_return DialResult::Fail(ErrorCode::SOCKET_BIND_FAILED, ec.message());
     }
 
     co_return co_await ConnectSocket(std::move(socket), remote_endpoint, timeout);

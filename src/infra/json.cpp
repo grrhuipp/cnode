@@ -1,5 +1,4 @@
 #include "infra/json.hpp"
-#include "infra/json_field.hpp"
 #include "common/binary_text_codec.hpp"
 
 #include <charconv>

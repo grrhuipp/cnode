@@ -6,7 +6,7 @@
 #include "common/target_address.hpp"
 #include "transport/async_stream.hpp"
 #include "transport/link_error.hpp"
-#include "transport/internet/dial_target.hpp"
+#include "common/allocator.hpp"
 #include "transport/internet/outbound_bind.hpp"
 #include "transport/internet/outbound_sender.hpp"
 #include "transport/internet/stream_settings.hpp"
@@ -17,8 +17,10 @@
 #include <optional>
 #include <span>
 #include <string_view>
+#include <string>
 #include <tl/expected.hpp>
 #include <utility>
+#include <vector>
 
 namespace app::dns {
 class DNS;
@@ -28,6 +30,35 @@ class DNS;
 namespace session {
 struct Context;
 }  // namespace session
+
+class SslContext;
+
+// 单个候选拨号地址
+struct OutboundDialCandidate {
+    tcp::endpoint endpoint;
+    std::optional<net::ip::address> bind_local;  // 可按候选 IP 单独决定绑定地址
+};
+
+// 出站传输目标（仅携带已解析拨号候选）：transport/internet 的拨号输入，
+// 不属于 proxy 出站协议壳。
+struct OutboundTransportTarget {
+    std::optional<OutboundDialCandidate> single_candidate; // 单个已解析候选，避免每连接 vector 分配
+    memory::ThreadLocalVector<OutboundDialCandidate> candidates; // 已解析候选地址（按优先级排序）
+    std::string_view tls_server_name;               // TLS SNI（冷路径配置视图，可空）
+    memory::ThreadLocalString ws_host;              // HTTP Host/authority（WS、HTTPUpgrade、gRPC、XHTTP，已按端口格式化）
+    const StreamSettings* stream_settings = nullptr; // 必填：冷路径准备好的传输层组合配置
+    SslContext* security_context = nullptr;          // TLS/REALITY 时必填：出站 handler 的 Worker 私有上下文
+    std::chrono::seconds timeout{defaults::kDialTimeout};
+
+    // XHTTP packet-up / stream-up 可用独立下行入口；仅保存已解析候选和不可变配置视图。
+    std::shared_ptr<const OutboundTransportTarget> xhttp_download_target;
+
+    [[nodiscard]] std::span<const OutboundDialCandidate> Candidates() const noexcept {
+        return single_candidate
+            ? std::span<const OutboundDialCandidate>(&*single_candidate, 1)
+            : std::span<const OutboundDialCandidate>(candidates);
+    }
+};
 
 struct OutboundTargetOptions {
     app::dns::DNS* dns_service = nullptr;
@@ -59,6 +90,14 @@ std::string_view ResolveOutboundTlsServerName(
 [[nodiscard]]
 net::awaitable<tl::expected<OutboundTransportTarget, ErrorCode>>
 BuildOutboundTransportTarget(OutboundTargetOptions options);
+
+// 统一出站传输连接：
+// 消费冷路径预构建候选，建立 TCP 连接，并按 StreamSettings 完成 TLS/WS。
+[[nodiscard]]
+net::awaitable<DialResult> DialOutboundTransport(
+    net::io_context& io_context,
+    session::Context& ctx,
+    const OutboundTransportTarget& target);
 
 // ============================================================================
 // OutboundDialer - Xray internet.Dialer of one proxyman outbound Handler

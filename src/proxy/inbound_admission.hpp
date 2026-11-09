@@ -147,17 +147,15 @@ inline net::awaitable<std::optional<NativeAssociationAdmission>> AdmitNativeAsso
         }
         admitted.ip = std::move(ip.reservation);
     }
-    if (!tracker) {
-        RejectNativeAssociation(ctx, stats, "missing user admission");
-        co_return std::nullopt;
+    if (tracker) {
+        auto user_session =
+            co_await proxy::AdmitAuthenticatedInbound(*tracker, ctx, profile);
+        if (!user_session) {
+            stats.OnError();
+            co_return std::nullopt;
+        }
+        admitted.user_session = std::move(*user_session);
     }
-    auto user_session =
-        co_await proxy::AdmitAuthenticatedInbound(*tracker, ctx, profile);
-    if (!user_session) {
-        stats.OnError();
-        co_return std::nullopt;
-    }
-    admitted.user_session = std::move(*user_session);
     co_return std::move(admitted);
 }
 
@@ -303,11 +301,6 @@ VerifyInboundCredential(
 
 class UserOnlineProtocolRuntime final : public ::proxyman::inbound::ProtocolRuntime {
 public:
-    [[nodiscard]] std::vector<::OnlineDevice>
-    GetOnlineDevices(std::string_view tag) const override {
-        return validator.GetOnlineDevices(tag);
-    }
-
     [[nodiscard]] ::UserOnlineTracker* OnlineTracker() noexcept override {
         return &validator;
     }

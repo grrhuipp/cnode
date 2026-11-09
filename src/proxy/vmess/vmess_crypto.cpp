@@ -1,8 +1,7 @@
 #include "vmess_crypto.hpp"
-#include "account.hpp"
 #include "vmess_request.hpp"
 #include "../aead.hpp"
-#include "../uuid.hpp"
+#include "common/binary_text_codec.hpp"
 #include "common/unsafe.hpp"
 
 #include <openssl/aead.h>

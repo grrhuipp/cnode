@@ -4,13 +4,12 @@
 #include "app/port_binding.hpp"
 #include "app/proxyman/inbound/factory.hpp"
 #include "app/proxyman/inbound/receiver_settings.hpp"
-#include "../src/app/proxyman/outbound/registration.hpp"
+#include "app/proxyman/outbound/factory.hpp"
 #include "app/stats.hpp"
 #include "app/worker.hpp"
 #include "app/worker_runtime_config.hpp"
 #include "app/worker_stats.hpp"
 #include "infra/config_types.hpp"
-#include "infra/outbound_source_config.hpp"
 
 #include <asio/co_spawn.hpp>
 #include <asio/post.hpp>

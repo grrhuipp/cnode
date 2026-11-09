@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../account.hpp"
+#include "../vmess_crypto.hpp"
 #include "body.hpp"
 #include "transport/async_stream.hpp"
 #include "transport/link.hpp"

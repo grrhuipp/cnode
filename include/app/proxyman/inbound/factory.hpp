@@ -45,9 +45,6 @@ class ProtocolRuntime : public memory::ThreadAllocated {
 public:
     virtual ~ProtocolRuntime() noexcept = default;
 
-    [[nodiscard]] virtual std::vector<::OnlineDevice>
-    GetOnlineDevices(std::string_view tag) const = 0;
-
     [[nodiscard]] virtual ::UserOnlineTracker* OnlineTracker() noexcept {
         return nullptr;
     }

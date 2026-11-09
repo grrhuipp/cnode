@@ -1,4 +1,4 @@
-#include "shadowsocks_crypto.hpp"
+#include "shadowsocks_protocol.hpp"
 #include "common/byte_reader.hpp"
 #include "stream_crypto.hpp"
 #include "server.hpp"
@@ -72,14 +72,7 @@ struct FirstChunk {
     }
 };
 
-[[nodiscard]] std::span<const uint8_t> ChunkBytes(const buf::Buffer* buffer) noexcept {
-    return buffer ? buffer->Bytes() : std::span<const uint8_t>{};
-}
-
-[[nodiscard]] std::span<const uint8_t> ChunkBytes(const net::const_buffer& buffer) noexcept {
-    const auto* data = static_cast<const uint8_t*>(buffer.data());
-    return data ? std::span<const uint8_t>(data, buffer.size()) : std::span<const uint8_t>{};
-}
+using buf::ChunkBytes;
 
 template <typename BufferRange>
 FirstChunk FirstChunkView(const BufferRange& buffers) {
@@ -147,7 +140,7 @@ net::awaitable<void> ResponseBodyWriter::AsyncShutdownWrite() {
     bool shutdown_started = false;
     try {
         if (!write_init_) {
-            const bool ok = is_2022_
+            const bool ok = Is2022Cipher(cipher_type_)
                 ? InitResponseCipher2022(*this, {})
                 : InitResponseCipher(*this);
             if (!ok) {
@@ -210,7 +203,7 @@ net::awaitable<void> ResponseBodyWriter::WriteEncrypted(
         const uint64_t initial_nonce = write_nonce_;
         try {
             if (!write_init_) {
-                if (!is_2022_) {
+                if (!Is2022Cipher(cipher_type_)) {
                     if (!InitResponseCipher(*this)) {
                         ThrowSsWriteError("Shadowsocks server init write cipher failed");
                     }
@@ -262,11 +255,8 @@ net::awaitable<void> ResponseBodyWriter::FlushPendingAndWrite(
             co_return;
         }
         if (pending_prefix_.byte_size() != 0) {
-            buf::MultiBuffer merged;
-            merged.reserve(pending_prefix_.size() + out_mb.size());
-            pending_prefix_.MoveTo(merged);
-            out_mb.MoveTo(merged);
-            out_mb = std::move(merged);
+            out_mb.MoveTo(pending_prefix_);
+            out_mb = std::move(pending_prefix_);
         }
         try {
             co_await stream.WriteMultiBuffer(std::move(out_mb));
@@ -281,12 +271,13 @@ net::awaitable<void> ResponseBodyWriter::FlushPendingAndWrite(
     // Synchronous key setup; the salt and header are staged in pending_prefix_
     // and sent with the first response write.
 bool ResponseBodyWriter::InitResponseCipher(ResponseBodyWriter& state) {
-        if (state.salt_size_ > 64 || state.key_size_ > 64) {
+        const size_t key_size = state.key_size_;
+        if (key_size == 0 || key_size > 64) {
             return false;
         }
 
         std::array<uint8_t, 64> server_salt{};
-        if (RAND_bytes(server_salt.data(), static_cast<int>(state.salt_size_)) != 1) {
+        if (RAND_bytes(server_salt.data(), static_cast<int>(key_size)) != 1) {
             return false;
         }
 
@@ -299,19 +290,19 @@ bool ResponseBodyWriter::InitResponseCipher(ResponseBodyWriter& state) {
                 OPENSSL_cleanse(subkey.data(), subkey.size());
             }
         } cleanse_init_legacy{server_salt, write_subkey};
-        if (!DeriveSubkey(state.master_key_.data(), state.key_size_,
-                          server_salt.data(), state.salt_size_,
+        if (!DeriveSubkey(state.master_key_.data(), key_size,
+                          server_salt.data(), key_size,
                           write_subkey.data())) {
             return false;
         }
 
-        state.write_cipher_.emplace(state.cipher_type_, write_subkey.data(), state.key_size_,
+        state.write_cipher_.emplace(state.cipher_type_, write_subkey.data(), key_size,
                                      proxy::AeadDirection::Encrypt);
         OPENSSL_cleanse(write_subkey.data(), write_subkey.size());
         state.write_nonce_ = 0;
 
         if (!buf::AppendSpanToMultiBuffer(
-                std::span<const uint8_t>(server_salt.data(), state.salt_size_),
+                std::span<const uint8_t>(server_salt.data(), key_size),
                 state.pending_prefix_)) {
             return false;
         }
@@ -323,15 +314,16 @@ bool ResponseBodyWriter::InitResponseCipher(ResponseBodyWriter& state) {
 bool ResponseBodyWriter::InitResponseCipher2022(
     ResponseBodyWriter& state,
     std::span<const uint8_t> first_payload) {
-        if (state.salt_size_ > KeyBytes::kMaxSize ||
-            state.key_size_ > KeyBytes::kMaxSize ||
-            state.request_salt_.size != state.salt_size_ ||
+        const size_t key_size = state.key_size_;
+        if (key_size == 0 ||
+            key_size > KeyBytes::kMaxSize ||
+            state.request_salt_.size != key_size ||
             first_payload.size() > kSs2022MaxChunkPayload) {
             return false;
         }
 
         std::array<uint8_t, 32> server_salt{};
-        if (RAND_bytes(server_salt.data(), static_cast<int>(state.salt_size_)) != 1) {
+        if (RAND_bytes(server_salt.data(), static_cast<int>(key_size)) != 1) {
             return false;
         }
 
@@ -350,21 +342,21 @@ bool ResponseBodyWriter::InitResponseCipher2022(
                 OPENSSL_cleanse(plain.data(), plain.size());
             }
         } cleanse_init_2022{server_salt, write_subkey, fixed_plain};
-        if (!Derive2022Subkey(state.master_key_.data(), state.key_size_,
-                              server_salt.data(), state.salt_size_,
+        if (!Derive2022Subkey(state.master_key_.data(), key_size,
+                              server_salt.data(), key_size,
                               write_subkey.data())) {
             return false;
         }
 
-        state.write_cipher_.emplace(state.cipher_type_, write_subkey.data(), state.key_size_,
+        state.write_cipher_.emplace(state.cipher_type_, write_subkey.data(), key_size,
                                      proxy::AeadDirection::Encrypt);
         OPENSSL_cleanse(write_subkey.data(), write_subkey.size());
 
-        const size_t fixed_plain_size = 1 + 8 + state.salt_size_ + 2;
+        const size_t fixed_plain_size = 1 + 8 + key_size + 2;
         fixed_plain[0] = 1;
         StoreU64BE(fixed_plain.data() + 1, UnixSecondsNow());
-        std::memcpy(fixed_plain.data() + 9, state.request_salt_.data(), state.salt_size_);
-        StoreU16BE(fixed_plain.data() + 9 + state.salt_size_,
+        std::memcpy(fixed_plain.data() + 9, state.request_salt_.data(), key_size);
+        StoreU16BE(fixed_plain.data() + 9 + key_size,
                  static_cast<uint16_t>(first_payload.size()));
 
         std::array<uint8_t, kFixedCipherMaxSize> fixed_cipher{};
@@ -378,7 +370,7 @@ bool ResponseBodyWriter::InitResponseCipher2022(
 
         state.pending_prefix_.clear();
         if (!buf::AppendSpanToMultiBuffer(
-                std::span<const uint8_t>(server_salt.data(), state.salt_size_),
+                std::span<const uint8_t>(server_salt.data(), key_size),
                 state.pending_prefix_) ||
             !buf::AppendSpanToMultiBuffer(
                 std::span<const uint8_t>(fixed_cipher.data(), fixed_cipher_size),

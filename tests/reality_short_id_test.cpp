@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "transport/internet/reality_short_id.hpp"
+#include "transport/internet/reality_key.hpp"
 
 #include <cstdio>
 

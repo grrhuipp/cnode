@@ -228,15 +228,6 @@ void AppendVisionFramed(
     }
 }
 
-[[nodiscard]] std::span<const uint8_t> VisionChunkBytes(const buf::Buffer* buffer) noexcept {
-    return buffer ? buffer->Bytes() : std::span<const uint8_t>{};
-}
-
-[[nodiscard]] std::span<const uint8_t> VisionChunkBytes(const net::const_buffer& buffer) noexcept {
-    const auto* data = static_cast<const uint8_t*>(buffer.data());
-    return data ? std::span<const uint8_t>(data, buffer.size()) : std::span<const uint8_t>{};
-}
-
 template <typename BufferRange>
 net::awaitable<void> WriteVisionFramed(
     transport::MultiBufferWriter& dst,
@@ -249,7 +240,7 @@ net::awaitable<void> WriteVisionFramed(
     const bool filter = traffic.packets_to_filter > 0;
     size_t remaining_bytes = 0;
     for (const auto& buffer : buffers) {
-        const auto bytes = VisionChunkBytes(buffer);
+        const auto bytes = buf::ChunkBytes(buffer);
         if (!bytes.empty()) {
             if (filter) {
                 traffic.FilterTLS(bytes);
@@ -265,7 +256,7 @@ net::awaitable<void> WriteVisionFramed(
     VisionHeaderArena header_owner;
     VisionFrameBufferBuilder out;
     for (const auto& buffer : buffers) {
-        const auto bytes = VisionChunkBytes(buffer);
+        const auto bytes = buf::ChunkBytes(buffer);
         if (!bytes.empty()) {
             remaining_bytes -= bytes.size();
             AppendVisionFramed(

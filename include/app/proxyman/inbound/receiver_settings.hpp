@@ -1,7 +1,7 @@
 #pragma once
 
 #include "features/routing/dispatch_policy.hpp"
-#include "transport/internet/proxy_protocol_mode.hpp"
+#include "transport/internet/proxy_protocol.hpp"
 #include "transport/internet/stream_settings.hpp"
 
 #include <string>

@@ -3,7 +3,7 @@
 #include "common/asio_types.hpp"
 #include "common/defaults.hpp"
 #include "common/error.hpp"
-#include "common/rule_types.hpp"
+#include "common/rule.hpp"
 #include "core/constants.hpp"
 #include "transport/internet/stream_settings.hpp"
 

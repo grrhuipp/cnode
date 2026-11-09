@@ -121,6 +121,7 @@ public:
     // Return decrypted handshake read-ahead before OpenSSL's unread plaintext.
     // Never forwards these bytes to the TCP ciphertext layer.
     void PrependReadData(std::span<const uint8_t> data) override;
+    void PrependReadMultiBuffer(buf::MultiBuffer&& mb) override;
     // Vision cmd2 read-direction cutover; retain already-decrypted bytes,
     // then read the raw TCP stream without touching the independent writer.
     [[nodiscard]] bool EnableRawRead() noexcept override;

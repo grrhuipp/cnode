@@ -55,6 +55,18 @@ using HttpHeaders = std::unordered_map<std::string, std::string>;
     return nullptr;
 }
 
+[[nodiscard]] inline std::string_view ResolveConfiguredHttpHost(
+    std::string_view configured_host,
+    const HttpHeaders* headers,
+    std::string_view fallback = {}) noexcept {
+    const std::string* header_host = headers ? FindHttpHeader(*headers, "Host") : nullptr;
+    const std::string_view raw = !configured_host.empty()
+        ? configured_host
+        : (header_host ? std::string_view(*header_host) : std::string_view{});
+    const std::string_view trimmed = TrimAscii(raw);
+    return trimmed.empty() ? fallback : trimmed;
+}
+
 [[nodiscard]] inline bool IsValidHttpHeaderName(
     std::string_view name) noexcept {
     if (name.empty()) return false;
@@ -149,6 +161,19 @@ using HttpHeaders = std::unordered_map<std::string, std::string>;
         }
     }
     return true;
+}
+
+[[nodiscard]] inline bool SplitAndValidateHttpHeaderLine(
+    std::string_view line,
+    std::string_view& name,
+    std::string_view& value) noexcept {
+    const size_t colon = line.find(':');
+    if (colon == std::string_view::npos || colon == 0) {
+        return false;
+    }
+    name = line.substr(0, colon);
+    value = TrimHttpOws(line.substr(colon + 1));
+    return IsValidHttpHeaderName(name) && IsValidHttpHeaderValue(value);
 }
 
 [[nodiscard]] inline bool IsValidHttpRequestTarget(

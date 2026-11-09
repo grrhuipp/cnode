@@ -109,6 +109,24 @@ net::awaitable<void> RunInboundProxy(
     }
 }
 
+void RejectConnection(
+    const session::Context& ctx,
+    StatsShard& stats,
+    ConnectionLimiter::RejectReason reject,
+    bool before_transport_handshake = false) {
+    const char* reason = ConnectionLimiter::RejectReasonToString(reject);
+    if (before_transport_handshake &&
+        reject == ConnectionLimiter::RejectReason::IP_BANNED) {
+        LOG_CONN_DEBUG(ctx, "connection rejected source={}:{} > IP banned before transport handshake",
+                       ctx.inbound.source_ip, ctx.inbound.source_port);
+    } else {
+        LOG_CONN_DEBUG(ctx, "connection rejected from {}:{} > {}",
+                       ctx.inbound.source_ip, ctx.inbound.source_port, reason);
+    }
+    LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, reason));
+    stats.OnError();
+}
+
 }  // namespace
 
 class Handler::LogicalTransportStreamSink final
@@ -137,6 +155,8 @@ public:
         , family_(std::move(family)) {
         base_ctx_.InitSubstreamFrom(base_ctx);
         base_ctx_.conn_id = base_ctx.conn_id;
+        base_ctx_.inbound.accounting_key.assign(handler_->receiver_.accounting_key);
+        base_ctx_.inbound.connection_family = family_;
         if (identity == SessionIdentity::Unauthenticated) {
             base_ctx_.inbound.user_id = 0;
             base_ctx_.inbound.user_email.clear();
@@ -225,22 +245,12 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
     const inbound::ReceiverSettings& listener = receiver_;
     ConnectionStatsScope connection_stats(stats);
 
-    ctx.inbound.accounting_key.assign(listener.accounting_key);
-    // Protocol substreams (Mux.Cool, AnyTLS) inside this logical stream
-    // reserve against the same physical family.
-    ctx.inbound.connection_family = family;
-
     auto admission = co_await limiter_.ReserveLogical(
         family, ctx.inbound.tag, ctx.inbound.source_ip,
         ctx.inbound.HasProxyProtocolClientIP());
     const auto reject = admission.reason;
     if (reject != ConnectionLimiter::RejectReason::NONE) {
-        LOG_CONN_DEBUG(ctx, "connection rejected from {}:{} > {}",
-                       ctx.inbound.source_ip, ctx.inbound.source_port,
-                       ConnectionLimiter::RejectReasonToString(reject));
-        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected,
-                                  ConnectionLimiter::RejectReasonToString(reject)));
-        stats.OnError();
+        RejectConnection(ctx, stats, reject);
         co_return;
     }
     auto connection_limit = std::move(admission.reservation);
@@ -332,17 +342,7 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
         ctx.inbound.HasProxyProtocolClientIP());
     auto reject = physical_admission.reason;
     if (reject != ConnectionLimiter::RejectReason::NONE) {
-        if (reject == ConnectionLimiter::RejectReason::IP_BANNED) {
-            LOG_CONN_DEBUG(ctx, "connection rejected source={}:{} > IP banned before transport handshake",
-                           ctx.inbound.source_ip, ctx.inbound.source_port);
-        } else {
-            LOG_CONN_DEBUG(ctx, "connection rejected from {}:{} > {}",
-                           ctx.inbound.source_ip, ctx.inbound.source_port,
-                           ConnectionLimiter::RejectReasonToString(reject));
-        }
-        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected,
-                                  ConnectionLimiter::RejectReasonToString(reject)));
-        stats.OnError();
+        RejectConnection(ctx, stats, reject, true);
         co_return;
     }
     auto connection_limit = std::move(physical_admission.reservation);
@@ -407,12 +407,7 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
         ctx.inbound.HasProxyProtocolClientIP());
     reject = ip_admission.reason;
     if (reject != ConnectionLimiter::RejectReason::NONE) {
-        LOG_CONN_DEBUG(ctx, "connection rejected from {}:{} > {}",
-                       ctx.inbound.source_ip, ctx.inbound.source_port,
-                       ConnectionLimiter::RejectReasonToString(reject));
-        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected,
-                                  ConnectionLimiter::RejectReasonToString(reject)));
-        stats.OnError();
+        RejectConnection(ctx, stats, reject);
         co_return;
     }
     auto ip_limit = std::move(ip_admission.reservation);

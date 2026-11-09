@@ -1,7 +1,6 @@
 #include <gtest/gtest.h>
 
 #include "trojan_codec.hpp"
-#include "credentials.hpp"
 
 #include <algorithm>
 #include <array>

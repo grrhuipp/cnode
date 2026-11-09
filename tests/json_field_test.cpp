@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "infra/json_field.hpp"
+#include "infra/json.hpp"
 
 #include <cstdint>
 #include <cstdlib>

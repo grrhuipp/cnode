@@ -4,7 +4,7 @@
 #include "common/ip_utils.hpp"
 #include "common/target_address.hpp"
 #include "core/naming.hpp"
-#include "infra/json_field.hpp"
+#include "infra/json.hpp"
 #include "infra/inbound_field_rules.hpp"
 #include "infra/outbound_bind_config.hpp"
 #include "infra/log.hpp"
@@ -932,20 +932,9 @@ std::shared_ptr<const XHttpDownloadSettings> ParseXHttpDownloadSettings(
     if (!address_val->is_string() || address_val->as_string().empty()) {
         throw std::invalid_argument("xhttp download address must be a non-empty string");
     }
-    std::string address(address_val->as_string());
-    if (!iputil::ParseLiteral(address)) {
-        if (!domain::IsValidDnsHostname(
-                address, domain::TrailingDotPolicy::Allow)) {
-            throw std::invalid_argument(
-                "xhttp download address must be an IP literal or DNS hostname");
-        }
-        domain::NormalizeDnsHostnameInPlace(address);
-        if (iputil::ParseLiteral(address).has_value()) {
-            throw std::invalid_argument(
-                "xhttp download address must be an IP literal or DNS hostname");
-        }
-    }
-    settings->address = std::move(address);
+    settings->address = RequireField(infra::NormalizeTlsServerName(
+        domain::WithoutTrailingRootDot(address_val->as_string()),
+        "xhttp download address"));
 
     if (!j.contains("port")) {
         throw std::invalid_argument("xhttp download port is required");

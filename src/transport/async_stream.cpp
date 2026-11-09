@@ -128,6 +128,17 @@ void AsyncStream::PrependReadData(std::span<const uint8_t> data) {
         "HTTP handshake requires a TCP or TLS byte stream");
 }
 
+void AsyncStream::PrependReadMultiBuffer(buf::MultiBuffer&& mb) {
+    if (mb.byte_size() == 0) {
+        mb.clear();
+        return;
+    }
+    mb.clear();
+    throw IoSystemError(
+        io_error::operation_not_supported,
+        "HTTP handshake requires a TCP or TLS byte stream");
+}
+
 transport::CancellationSource& AsyncStream::Cancellation() noexcept {
     if (LogicalPhaseDeadline()) return cancellation_;
     if (auto* tcp = BaseTcpStream(); tcp && static_cast<AsyncStream*>(tcp) != this)

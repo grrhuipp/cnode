@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "transport/internet/reality_client_version.hpp"
+#include "transport/internet/reality_key.hpp"
 
 #include <array>
 #include <cstdio>

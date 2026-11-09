@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "quic_handoff.hpp"
+#include "hysteria_ingress.hpp"
 #include "common/asio_types.hpp"
 
 #include <openssl/rand.h>

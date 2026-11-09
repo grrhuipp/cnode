@@ -1,6 +1,6 @@
 #pragma once
 
-#include "shadowsocks_crypto.hpp"
+#include "shadowsocks_protocol.hpp"
 
 #include "common/allocator.hpp"
 #include "common/buf/multi_buffer.hpp"

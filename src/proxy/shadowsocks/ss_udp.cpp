@@ -1,6 +1,6 @@
 #include "ss_udp.hpp"
 #include "common/byte_reader.hpp"
-#include "shadowsocks_crypto.hpp"
+#include "shadowsocks_protocol.hpp"
 #include "common/address_codec.hpp"
 #include "common/allocator.hpp"
 #include "common/container_util.hpp"

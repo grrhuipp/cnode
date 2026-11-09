@@ -1,8 +1,8 @@
-#include "trojan_inbound.hpp"
 #include "../../inbound_admission.hpp"
+#include "proxy/inbound.hpp"
+#include "common/sharded_user_stats.hpp"
 #include "transport/async_stream.hpp"
 #include "../trojan_codec.hpp"
-#include "../credentials.hpp"
 #include "../udp_framing.hpp"
 #include "app/rate_limiter.hpp"
 #include "app/stats.hpp"
@@ -119,6 +119,31 @@ ParseTrojanRequest(AsyncStream& stream,
 }
 
 }  // namespace
+
+namespace proxy::trojan::inbound {
+
+class Handler final : public ::Inbound {
+public:
+    Handler(::UserOnlineTracker& validator,
+            ::StatsShard& stats,
+            ::ConnectionLimiter* limiter);
+
+    ::net::awaitable<::RelayResult> Process(
+        std::unique_ptr<::AsyncStream> stream,
+        ::routing::Dispatcher& dispatcher,
+        const ::proxyman::inbound::ReceiverSettings& receiver,
+        ::net::io_context& io_context,
+        ::session::Context& ctx,
+        const ::TimeoutsConfig& timeouts,
+        uint32_t pressure_idle_timeout) override;
+
+private:
+    ::UserOnlineTracker& validator_;
+    ::StatsShard& stats_;
+    ::ConnectionLimiter* limiter_;
+};
+
+}  // namespace proxy::trojan::inbound
 
 // ============================================================================
 // proxy/trojan/inbound.Handler 实现（代理层，无传输层知识）

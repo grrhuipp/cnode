@@ -323,37 +323,47 @@ Router::Impl::Impl(
             compound.SetProtocolCondition(rc.protocol);
         }
 
-        ::geo::CidrSet source_ip_matcher(memory::process_resource());
-        for (const auto& value : rc.source) {
-            source_ip_matcher.Insert(NetworkBytes(value), value.Prefix());
-        }
-        if (!source_ip_matcher.Empty()) {
-            compound.source_ip_matcher.emplace(std::move(source_ip_matcher));
-        }
-
-        ::geo::CidrSet ip_matcher(memory::process_resource());
-        for (const auto& value : rc.ip) {
-            ip_matcher.Insert(NetworkBytes(value), value.Prefix());
-        }
-        if (!ip_matcher.Empty()) {
-            compound.ip_matcher.emplace(std::move(ip_matcher));
+        if (!rc.source.empty()) {
+            auto& source_ip_matcher =
+                compound.source_ip_matcher.emplace(memory::process_resource());
+            for (const auto& value : rc.source) {
+                source_ip_matcher.Insert(NetworkBytes(value), value.Prefix());
+            }
+            if (source_ip_matcher.Empty()) {
+                compound.source_ip_matcher.reset();
+            }
         }
 
-        ::geo::DomainRuleSet domain_matcher(memory::process_resource());
-        for (const auto& value : rc.domain_suffix) {
-            domain_matcher.AddSuffix(value);
+        if (!rc.ip.empty()) {
+            auto& ip_matcher =
+                compound.ip_matcher.emplace(memory::process_resource());
+            for (const auto& value : rc.ip) {
+                ip_matcher.Insert(NetworkBytes(value), value.Prefix());
+            }
+            if (ip_matcher.Empty()) {
+                compound.ip_matcher.reset();
+            }
         }
-        for (const auto& value : rc.domain_keyword) {
-            domain_matcher.AddKeyword(value);
-        }
-        for (const auto& value : rc.domain_full) {
-            domain_matcher.AddFull(value);
-        }
-        for (const auto& value : rc.domain_regex) {
-            domain_matcher.AddRegex(value);
-        }
-        if (!domain_matcher.Empty()) {
-            compound.domain_matcher.emplace(std::move(domain_matcher));
+
+        if (!rc.domain_suffix.empty() || !rc.domain_keyword.empty() ||
+            !rc.domain_full.empty() || !rc.domain_regex.empty()) {
+            auto& domain_matcher =
+                compound.domain_matcher.emplace(memory::process_resource());
+            for (const auto& value : rc.domain_suffix) {
+                domain_matcher.AddSuffix(value);
+            }
+            for (const auto& value : rc.domain_keyword) {
+                domain_matcher.AddKeyword(value);
+            }
+            for (const auto& value : rc.domain_full) {
+                domain_matcher.AddFull(value);
+            }
+            for (const auto& value : rc.domain_regex) {
+                domain_matcher.AddRegex(value);
+            }
+            if (domain_matcher.Empty()) {
+                compound.domain_matcher.reset();
+            }
         }
 
         if (!rc.geosite.empty()) {

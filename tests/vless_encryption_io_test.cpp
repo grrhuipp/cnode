@@ -2,7 +2,7 @@
 #include <gtest/gtest.h>
 
 #include "vless_encryption.hpp"
-#include "vless_encryption_io.hpp"
+#include "vless_encryption_runtime.hpp"
 
 #include "common/error.hpp"
 

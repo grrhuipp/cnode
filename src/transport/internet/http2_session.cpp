@@ -3534,6 +3534,45 @@ net::awaitable<bool> SendHttp2ClientRequest(AsyncStream& stream,
         header_block);
 }
 
+net::awaitable<TransportBuildResult> OpenHttp2ClientStream(
+    std::unique_ptr<AsyncStream> stream,
+    std::optional<uint32_t> configured_initial_window,
+    std::span<const uint8_t> header_block,
+    H2PayloadCodec payload_codec,
+    bool end_stream,
+    std::string_view label,
+    std::string_view authority,
+    std::string_view path,
+    uint64_t conn_id) {
+    const uint32_t initial_window = std::min<uint32_t>(
+        configured_initial_window.value_or(kDefaultInitialWindow),
+        kHttp2MaxQueuedStreamBytes);
+    const uint32_t conn_window = std::min<uint32_t>(
+        configured_initial_window.value_or(H2SendWindow::kDefault),
+        kHttp2MaxQueuedStreamBytes);
+    if (!co_await SendHttp2ClientRequest(
+            *stream,
+            initial_window,
+            conn_window,
+            header_block,
+            end_stream)) {
+        co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+    }
+
+    LOG_CONN_DEBUG(conn_id,
+        "{} client handshake sent authority={} path={}",
+        label,
+        authority.empty() ? std::string_view("-") : PublicHttpTargetForLog(authority),
+        PublicHttpTargetForLog(path));
+    co_return std::make_unique<Http2ClientStream>(
+        std::move(stream),
+        1,
+        payload_codec,
+        initial_window,
+        conn_window,
+        end_stream);
+}
+
 }  // namespace
 
 net::awaitable<TransportBuildResult> DoGrpcServerHandshake(
@@ -3588,37 +3627,22 @@ net::awaitable<TransportBuildResult> DoGrpcClientHandshake(
     bool tls,
     uint64_t conn_id) {
     const std::string_view path = cfg.request_path;
-    const uint32_t initial_window = std::min<uint32_t>(
-        cfg.initial_window_size.value_or(kDefaultInitialWindow),
-        kHttp2MaxQueuedStreamBytes);
-    const uint32_t conn_window = std::min<uint32_t>(
-        cfg.initial_window_size.value_or(H2SendWindow::kDefault),
-        kHttp2MaxQueuedStreamBytes);
     const auto headers = EncodeGrpcRequestHeaders(
         authority,
         path,
         tls,
         cfg.user_agent.empty() ? std::string_view("grpc-go/1.0")
                                : std::string_view(cfg.user_agent));
-    if (!co_await SendHttp2ClientRequest(
-            *stream,
-            initial_window,
-            conn_window,
-            headers,
-            false)) {
-        co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
-    }
-
-    LOG_CONN_DEBUG(conn_id,
-        "gRPC client handshake sent authority={} path={}",
-        authority.empty() ? std::string_view("-") : PublicHttpTargetForLog(authority),
-        PublicHttpTargetForLog(path));
-    co_return std::make_unique<Http2ClientStream>(
+    co_return co_await OpenHttp2ClientStream(
         std::move(stream),
-        1,
+        cfg.initial_window_size,
+        headers,
         H2PayloadCodec::GrpcHunk,
-        initial_window,
-        conn_window);
+        false,
+        "gRPC",
+        authority,
+        path,
+        conn_id);
 }
 
 net::awaitable<TransportBuildResult> DoHttp2ClientHandshake(
@@ -3628,33 +3652,17 @@ net::awaitable<TransportBuildResult> DoHttp2ClientHandshake(
     bool tls,
     uint64_t conn_id) {
     const auto headers = EncodeHttpRequestHeaders(authority, tls, cfg);
-    const uint32_t initial_window = std::min<uint32_t>(
-        cfg.initial_window_size.value_or(kDefaultInitialWindow),
-        kHttp2MaxQueuedStreamBytes);
-    const uint32_t conn_window = std::min<uint32_t>(
-        cfg.initial_window_size.value_or(H2SendWindow::kDefault),
-        kHttp2MaxQueuedStreamBytes);
-    const bool request_body_expected = !EqualsAsciiCI(cfg.method, "GET");
-    if (!co_await SendHttp2ClientRequest(
-            *stream,
-            initial_window,
-            conn_window,
-            headers,
-            !request_body_expected)) {
-        co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
-    }
-
-    LOG_CONN_DEBUG(conn_id,
-        "HTTP/2 client handshake sent authority={} path={}",
-        authority.empty() ? std::string_view("-") : PublicHttpTargetForLog(authority),
-        PublicHttpTargetForLog(detail::EffectiveHttpPath(cfg.path)));
-    co_return std::make_unique<Http2ClientStream>(
+    const bool end_stream = EqualsAsciiCI(cfg.method, "GET");
+    co_return co_await OpenHttp2ClientStream(
         std::move(stream),
-        1,
+        cfg.initial_window_size,
+        headers,
         H2PayloadCodec::RawData,
-        initial_window,
-        conn_window,
-        !request_body_expected);
+        end_stream,
+        "HTTP/2",
+        authority,
+        detail::EffectiveHttpPath(cfg.path),
+        conn_id);
 }
 
 }  // namespace transport::internet

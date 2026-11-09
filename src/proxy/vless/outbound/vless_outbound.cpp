@@ -1,12 +1,10 @@
-#include "vless_outbound.hpp"
 #include "common/domain_name.hpp"
 #include "common/ip_address.hpp"
-
+#include "common/unsafe.hpp"
+#include "proxy/outbound.hpp"
 #include "../vless_codec.hpp"
 #include "../vless_encryption.hpp"
-#include "../vless_encryption_io.hpp"
 #include "../vless_encryption_runtime.hpp"
-#include "../vless_buffered_reader.hpp"
 #include "../udp_framing.hpp"
 #include "../vless_vision.hpp"
 #include "../../handshake_timeout.hpp"
@@ -14,8 +12,7 @@
 #include "../../outbound_stream_endpoint.hpp"
 #include "app/dns/dns.hpp"
 #include "app/proxyman/outbound/factory.hpp"
-#include "../../../app/proxyman/outbound/registration.hpp"
-#include "infra/json_field.hpp"
+#include "infra/json.hpp"
 #include "app/relay.hpp"
 #include "common/allocator.hpp"
 #include "common/buffer_util.hpp"
@@ -28,7 +25,6 @@
 #include "core/naming.hpp"
 #include "infra/log.hpp"
 #include "infra/config_types.hpp"
-#include "../credentials.hpp"
 #include "transport/async_stream.hpp"
 #include "transport/internet/outbound_target_builder.hpp"
 #include "transport/link.hpp"
@@ -45,6 +41,52 @@
 #include <utility>
 #include <vector>
 
+#include <chrono>
+#include <cstdint>
+
+struct VlessOutboundConfig {
+    OutboundServer server;
+    std::array<uint8_t, 16> uuid_bytes{};
+    std::shared_ptr<const vless::VlessEncryptionConfig> encryption;
+    std::string flow;
+    bool packet_xudp = true;
+    bool packet_addr = false;
+
+    VlessOutboundConfig() = default;
+    VlessOutboundConfig(const VlessOutboundConfig&) = default;
+    VlessOutboundConfig& operator=(const VlessOutboundConfig&) = default;
+    VlessOutboundConfig(VlessOutboundConfig&&) noexcept = default;
+    VlessOutboundConfig& operator=(VlessOutboundConfig&&) noexcept = default;
+    ~VlessOutboundConfig() noexcept {
+        ::SecureZeroMemory(uuid_bytes.data(), uuid_bytes.size());
+    }
+};
+
+namespace proxy::vless::outbound {
+
+class Handler final : public ::Outbound {
+public:
+    explicit Handler(std::shared_ptr<const ::VlessOutboundConfig> config);
+
+    ~Handler() override;
+
+    ::net::awaitable<::OutboundProcessResult> Process(
+        ::session::Context& ctx,
+        ::transport::Link inbound,
+        ::OutboundDialer& dialer,
+        const ::TimeoutsConfig& timeouts,
+        ::StatsShard& stats,
+        const ::RelayConfig& relay_config,
+        ::buf::MultiBufferBatch first_payload,
+        std::chrono::seconds relay_idle_timeout,
+        std::chrono::seconds relay_write_timeout) override;
+
+private:
+    std::shared_ptr<const ::VlessOutboundConfig> config_;
+    std::shared_ptr<::vless::VlessEncryptionClientTicketCache> encryption_tickets_;
+};
+
+}  // namespace proxy::vless::outbound
 
 namespace {
 

@@ -13,11 +13,25 @@
 #include "common/unsafe.hpp"
 #include <array>
 #include <cstddef>
+#include <cstdint>
+#include <optional>
 #include <span>
 #include <string_view>
-#include <cstdint>
 
 namespace vmess {
+
+struct MemoryAccount {
+    std::array<uint8_t, 16> uuid_bytes{};
+    std::array<uint8_t, 16> cmd_key{};
+    std::array<uint8_t, 16> auth_key{};
+
+    ~MemoryAccount() noexcept {
+        ::SecureZeroMemory(uuid_bytes.data(), uuid_bytes.size());
+        ::SecureZeroMemory(cmd_key.data(), cmd_key.size());
+        ::SecureZeroMemory(auth_key.data(), auth_key.size());
+    }
+    static std::optional<MemoryAccount> FromUUID(std::string_view uuid_str);
+};
 
 // ============================================================================
 // 哈希函数

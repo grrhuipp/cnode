@@ -40,24 +40,21 @@ namespace {
 // Explicit host precedence per layer: dedicated field, then a configured
 // Host header. gRPC has no Host header; its :authority comes from `authority`.
 [[nodiscard]] std::string ConfiguredHttpHost(const StreamSettings& settings) {
-    const auto header_host = [](const transport::internet::HttpHeaders& headers) {
-        const auto* host = transport::internet::FindHttpHeader(headers, "Host");
-        return host ? *host : std::string{};
-    };
+    using transport::internet::ResolveConfiguredHttpHost;
     switch (settings.network_mode) {
     case NetworkMode::Ws:
-        return header_host(settings.ws.headers);
+        return std::string(ResolveConfiguredHttpHost({}, &settings.ws.headers));
     case NetworkMode::HttpUpgrade:
-        return settings.http_upgrade.host.empty()
-            ? header_host(settings.http_upgrade.headers) : settings.http_upgrade.host;
+        return std::string(ResolveConfiguredHttpHost(
+            settings.http_upgrade.host, &settings.http_upgrade.headers));
     case NetworkMode::Http:
-        return settings.http.host.empty()
-            ? header_host(settings.http.headers) : settings.http.host;
+        return std::string(ResolveConfiguredHttpHost(
+            settings.http.host, &settings.http.headers));
     case NetworkMode::Grpc:
         return settings.grpc.authority;
     case NetworkMode::XHttp:
-        return settings.xhttp.host.empty()
-            ? header_host(settings.xhttp.headers) : settings.xhttp.host;
+        return std::string(ResolveConfiguredHttpHost(
+            settings.xhttp.host, &settings.xhttp.headers));
     default:
         return {};
     }

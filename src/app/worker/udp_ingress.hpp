@@ -122,7 +122,6 @@ public:
     UdpIngress(const UdpIngress&) = delete;
     UdpIngress& operator=(const UdpIngress&) = delete;
 
-    [[nodiscard]] std::string_view Tag() const noexcept;
     [[nodiscard]] ResourceStats GetResourceStats() const noexcept;
 
     // Keep Worker-local sockets stable while replacing cold-path protocol state.
@@ -172,7 +171,6 @@ public:
         const udp::socket* socket) const noexcept;
     [[nodiscard]] size_t SocketCount() const noexcept;
     void CloseSocket(std::string_view socket_key) noexcept;
-    void CloseAllSockets() noexcept;
 
 private:
     friend class UdpAssociationReclaimer;

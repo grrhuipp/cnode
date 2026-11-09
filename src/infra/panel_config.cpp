@@ -4,7 +4,7 @@
 #include "common/ip_utils.hpp"
 #include "common/target_address.hpp"
 #include "core/naming.hpp"
-#include "infra/json_field.hpp"
+#include "infra/json.hpp"
 #include "infra/inbound_field_rules.hpp"
 #include "infra/log.hpp"
 #include "transport/internet/http_headers.hpp"
