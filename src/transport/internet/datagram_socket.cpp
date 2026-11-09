@@ -254,14 +254,19 @@ net::awaitable<void> DatagramSocket::Impl::SendBuffers(
     if (buffers.empty()) buffers = single; // Preserve an actual zero-length datagram.
     const auto cancellation_state = co_await net::this_coro::cancellation_state;
     for (;;) {
-        const auto wait_ec = co_await Wait(udp::socket::wait_write, cancellation_state.slot());
         if (operation.Cancelled()) ThrowCancelled(operation.CancellationReason());
-        if (wait_ec) throw IoSystemError(wait_ec);
+        if (cancellation_state.cancelled() != net::cancellation_type::none)
+            throw IoSystemError(io_error::operation_aborted);
         IoErrorCode send_ec;
-        // Only the resumed group owner inspects the buffer sequence or sends
-        // payload. Reactor readiness stores no pointers into private storage.
+        // Send synchronously under the current domain lease. Native readiness
+        // is needed only for backpressure and never retains payload pointers.
         const auto sent = socket.send_to(buffers, destination, 0, send_ec);
-        if (send_ec == io_error::would_block || send_ec == io_error::try_again) continue;
+        if (send_ec == io_error::would_block || send_ec == io_error::try_again) {
+            const auto wait_ec = co_await Wait(udp::socket::wait_write, cancellation_state.slot());
+            if (operation.Cancelled()) ThrowCancelled(operation.CancellationReason());
+            if (wait_ec) throw IoSystemError(wait_ec);
+            continue;
+        }
         if (send_ec) throw IoSystemError(send_ec);
         if (sent != total) ThrowLink(ErrorCode::INTERNAL);
         break;
@@ -302,15 +307,20 @@ net::awaitable<void> DatagramSocket::Impl::SendMultiBuffer(
     }
     const auto cancellation_state = co_await net::this_coro::cancellation_state;
     for (;;) {
-        const auto wait_ec = co_await Wait(udp::socket::wait_write, cancellation_state.slot());
         if (operation.Cancelled()) ThrowCancelled(operation.CancellationReason());
-        if (wait_ec) throw IoSystemError(wait_ec);
+        if (cancellation_state.cancelled() != net::cancellation_type::none)
+            throw IoSystemError(io_error::operation_aborted);
         IoErrorCode send_ec;
         const auto sent = payload.empty() || payload.size() > kMaxNativeBuffers
             ? socket.send_to(std::span<const net::const_buffer>(single.data(), 1),
                              destination, 0, send_ec)
             : socket.send_to(sequence, destination, 0, send_ec);
-        if (send_ec == io_error::would_block || send_ec == io_error::try_again) continue;
+        if (send_ec == io_error::would_block || send_ec == io_error::try_again) {
+            const auto wait_ec = co_await Wait(udp::socket::wait_write, cancellation_state.slot());
+            if (operation.Cancelled()) ThrowCancelled(operation.CancellationReason());
+            if (wait_ec) throw IoSystemError(wait_ec);
+            continue;
+        }
         if (send_ec) throw IoSystemError(send_ec);
         if (sent != total) ThrowLink(ErrorCode::INTERNAL);
         break;

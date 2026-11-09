@@ -401,3 +401,39 @@ TEST(DatagramSocket, Contract) {
         FAIL() << error.what();
     }
 }
+
+TEST(DatagramSocket, CancelledWriteDoesNotSend) {
+    for (const bool owned : {false, true}) {
+        SCOPED_TRACE(owned);
+        ::net::io_context io;
+        DatagramSocket sender(io, ::net::ip::address_v4::loopback());
+        ::udp::socket peer(io, {::net::ip::address_v4::loopback(), 0});
+        peer.non_blocking(true);
+        ::net::cancellation_signal cancellation;
+        const std::array<uint8_t, 1> payload{42};
+        const std::array<::net::const_buffer, 1> buffers{::net::buffer(payload)};
+        auto send = [&]() -> ::net::awaitable<void> {
+            // Disabling implicit throws does not authorize sending after
+            // cancellation; the operation must observe the sticky state.
+            co_await ::net::this_coro::throw_if_cancelled(false);
+            auto operation = sender.StartWrite();
+            cancellation.emit(::net::cancellation_type::terminal);
+            if (owned) co_await operation.SendTo(peer.local_endpoint(), MakePayload(payload));
+            else co_await operation.SendTo(peer.local_endpoint(), buffers);
+        };
+        auto result = ::net::co_spawn(io, send(),
+            ::net::bind_cancellation_slot(cancellation.slot(), ::net::use_future));
+        io.run();
+        bool aborted = false;
+        try { result.get(); }
+        catch (const std::system_error& error) {
+            aborted = error.code() == ::io_error::operation_aborted;
+        }
+        EXPECT_TRUE(aborted);
+        std::array<uint8_t, 1> received{};
+        ::udp::endpoint source;
+        ::IoErrorCode error;
+        (void)peer.receive_from(::net::buffer(received), source, 0, error);
+        EXPECT_TRUE(error == ::io_error::would_block || error == ::io_error::try_again);
+    }
+}

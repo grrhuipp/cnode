@@ -532,6 +532,10 @@ if(BUILD_BENCHMARKS)
         tests/tcp_send_benchmark.cpp)
     target_link_libraries(cnode_tcp_send_benchmark PRIVATE
         "$<LINK_LIBRARY:WHOLE_ARCHIVE,cnode_core,mimalloc-static>" GTest::gtest_main)
+    add_executable(cnode_udp_send_benchmark EXCLUDE_FROM_ALL
+        tests/udp_send_benchmark.cpp)
+    target_link_libraries(cnode_udp_send_benchmark PRIVATE
+        "$<LINK_LIBRARY:WHOLE_ARCHIVE,cnode_core,mimalloc-static>" GTest::gtest_main)
     add_executable(cnode_shadowsocks_identity_benchmark EXCLUDE_FROM_ALL
         tests/shadowsocks_identity_benchmark.cpp)
     target_include_directories(cnode_shadowsocks_identity_benchmark PRIVATE
@@ -548,7 +552,7 @@ if(BUILD_BENCHMARKS)
         tests/runtime_sampling_benchmark.cpp)
     target_link_libraries(cnode_runtime_sampling_benchmark PRIVATE
         "$<LINK_LIBRARY:WHOLE_ARCHIVE,cnode_core,mimalloc-static>" GTest::gtest_main)
-    foreach(target IN ITEMS cnode_shadowsocks_identity_benchmark
+    foreach(target IN ITEMS cnode_udp_send_benchmark cnode_shadowsocks_identity_benchmark
                             cnode_shadowsocks_udp_identity_benchmark cnode_runtime_sampling_benchmark)
         target_sources(${target} PRIVATE tests/benchmark_memory.cpp)
         target_link_options(${target} PRIVATE
@@ -558,7 +562,7 @@ if(BUILD_BENCHMARKS)
     endforeach()
     foreach(target IN ITEMS cnode_allocator_append_benchmark cnode_tls_throughput_benchmark
                             cnode_tcp_receive_benchmark cnode_executor_benchmark
-                            cnode_tcp_send_benchmark cnode_shadowsocks_identity_benchmark
+                            cnode_tcp_send_benchmark cnode_udp_send_benchmark cnode_shadowsocks_identity_benchmark
                             cnode_shadowsocks_udp_identity_benchmark cnode_runtime_sampling_benchmark)
         target_compile_options(${target} PRIVATE -UNDEBUG)
         add_dependencies(cnode_benchmarks ${target})
