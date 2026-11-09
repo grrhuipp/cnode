@@ -114,21 +114,10 @@ net::awaitable<void> WriteUdpDatagram(
             "Trojan UDP datagram contains missing or mixed endpoints");
     }
 
-    std::array<uint8_t, 272> header{};
-    const size_t header_size = EncodeUdpPacketHeaderTo(
-        *datagram.target,
-        datagram.payload_size,
-        header.data(),
-        header.size());
-    if (header_size == 0) {
-        throw IoSystemError(
-            io_error::message_size, "invalid Trojan UDP datagram size or target");
-    }
-
-    ConstBufferSpanBuilder<1 + buf::MultiBuffer::kInlineCapacity> framed;
-    framed.Append(net::buffer(header.data(), header_size));
-    framed.AppendMultiBuffer(payload);
-    co_await writer.WriteBuffers(framed.Span());
+    ConstBufferSpanBuilder<16> buffers;
+    buffers.AppendMultiBuffer(payload);
+    co_await WriteUdpDatagram(writer, *datagram.target, buffers.Span());
+    payload.clear();
 }
 
 net::awaitable<void> WriteUdpDatagram(

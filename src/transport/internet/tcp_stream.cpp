@@ -120,33 +120,8 @@ struct TcpStream::Impl : memory::ThreadAllocated {
 
     net::awaitable<IoErrorCode> Wait(
         tcp::socket::wait_type type, net::cancellation_slot cancellation) {
-        struct State {
-            net::cancellation_signal native;
-            bool cancelled = false;
-        } state;
-        struct Subscription {
-            net::cancellation_slot slot;
-            ~Subscription() { if (slot.is_connected()) slot.clear(); }
-        } subscription{cancellation};
-        const auto cancelled_at = cancellation_epoch_;
-        if (cancellation.is_connected()) {
-            cancellation.assign([&state](net::cancellation_type kind) {
-                if (kind == net::cancellation_type::none) return;
-                state.cancelled = true;
-                state.native.emit(kind);
-            });
-        }
-        auto [error] = co_await socket.async_wait(
-            type,
-            net::bind_cancellation_slot(
-                state.native.slot(),
-                net::bind_allocator(
-                    memory::ProcessAllocator<std::byte>{},
-                    net::as_tuple(net::use_awaitable))));
-        state.native.slot().clear();
-        if (state.cancelled || cancelled_at != cancellation_epoch_)
-            co_return IoErrorCode(io_error::operation_aborted);
-        co_return error;
+        return transport::internet::detail::WaitSocket(
+            socket, type, cancellation, cancellation_epoch_);
     }
 
     [[nodiscard]] bool HasFlag(Flag flag) const noexcept {

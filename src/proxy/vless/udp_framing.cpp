@@ -201,18 +201,10 @@ net::awaitable<void> WriteUdpDatagram(
             "VLESS UDP datagram target differs from the fixed session target");
     }
 
-    std::array<uint8_t, 32> header{};
-    const size_t header_size = EncodeUdpHeaderTo(
-        *datagram.target, packet_addr, datagram.payload_size, header);
-    if (header_size == 0) {
-        throw IoSystemError(
-            io_error::message_size, "invalid VLESS UDP datagram size or target");
-    }
-
-    ConstBufferSpanBuilder<1 + buf::MultiBuffer::kInlineCapacity> framed;
-    framed.Append(net::buffer(header.data(), header_size));
-    framed.AppendMultiBuffer(payload);
-    co_await writer.WriteBuffers(framed.Span());
+    ConstBufferSpanBuilder<16> buffers;
+    buffers.AppendMultiBuffer(payload);
+    co_await WriteUdpDatagram(writer, *datagram.target, packet_addr, buffers.Span());
+    payload.clear();
 }
 
 net::awaitable<void> WriteUdpDatagram(

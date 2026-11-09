@@ -1,13 +1,12 @@
 #include "vless_ticket_service.hpp"
 
 #include "app/session_group_executor.hpp"
+#include "common/allocator.hpp"
 #include "infra/log.hpp"
 
 #include <asio/this_coro.hpp>
 #include <asio/use_awaitable.hpp>
-#include <string>
-#include <unordered_map>
-
+#include <string_view>
 namespace vless {
 namespace {
 using Clock = std::chrono::steady_clock;
@@ -16,13 +15,38 @@ using Resumed = VlessEncryptionServerTicketStore::ResumedSession;
 
 struct StoreKey {
     const VlessEncryptionConfig* config = nullptr;
-    std::string tag;
+    memory::ThreadLocalString tag;
     bool operator==(const StoreKey&) const = default;
 };
 
+struct StoreKeyView {
+    const VlessEncryptionConfig* config = nullptr;
+    std::string_view tag;
+};
+
 struct StoreKeyHash {
+    using is_transparent = void;
+
     size_t operator()(const StoreKey& key) const noexcept {
-        return std::hash<const void*>{}(key.config) ^ std::hash<std::string>{}(key.tag);
+        return (*this)(StoreKeyView{key.config, key.tag});
+    }
+    size_t operator()(const StoreKeyView& key) const noexcept {
+        return std::hash<const void*>{}(key.config) ^
+               std::hash<std::string_view>{}(key.tag);
+    }
+};
+
+struct StoreKeyEqual {
+    using is_transparent = void;
+
+    bool operator()(const StoreKey& a, const StoreKey& b) const noexcept {
+        return a == b;
+    }
+    bool operator()(const StoreKey& a, const StoreKeyView& b) const noexcept {
+        return a.config == b.config && std::string_view(a.tag) == b.tag;
+    }
+    bool operator()(const StoreKeyView& a, const StoreKey& b) const noexcept {
+        return a.config == b.config && a.tag == std::string_view(b.tag);
     }
 };
 
@@ -38,7 +62,10 @@ public:
 
     VlessEncryptionServerTicketStore& GetOrCreate(
         std::shared_ptr<const VlessEncryptionConfig> config, std::string_view tag) {
-        StoreKey key{config.get(), std::string(tag)};
+        if (auto it = stores_.find(StoreKeyView{config.get(), tag}); it != stores_.end()) {
+            return it->second.tickets;
+        }
+        StoreKey key{config.get(), memory::ThreadLocalString(tag)};
         auto [it, inserted] = stores_.try_emplace(std::move(key));
         if (inserted) it->second.config = std::move(config);
         return it->second.tickets;
@@ -46,13 +73,13 @@ public:
 
     VlessEncryptionServerTicketStore* Find(
         const VlessEncryptionConfig* config, std::string_view tag) {
-        auto it = stores_.find(StoreKey{config, std::string(tag)});
+        auto it = stores_.find(StoreKeyView{config, tag});
         return it == stores_.end() ? nullptr : &it->second.tickets;
     }
 
 private:
     void shutdown() override { stores_.clear(); }
-    std::unordered_map<StoreKey, StoreEntry, StoreKeyHash> stores_;
+    memory::ThreadLocalUnorderedMap<StoreKey, StoreEntry, StoreKeyHash, StoreKeyEqual> stores_;
 };
 
 } // namespace
@@ -65,7 +92,7 @@ net::awaitable<bool> AuthenticateVlessTicket(
     auto* coordinator = GroupCoordinator::ForContext(
         net::query(executor, net::execution::context));
     if (!coordinator) co_return false;
-    std::string owned_tag(tag);
+    memory::ThreadLocalString owned_tag(tag);
     co_return co_await coordinator->PostCall(
         [coordinator, config = std::move(config), tag = std::move(owned_tag),
          ticket = std::move(ticket), identity]() mutable -> bool {
@@ -88,7 +115,7 @@ net::awaitable<std::optional<Resumed>> LookupVlessTicket(
     auto* coordinator = GroupCoordinator::ForContext(context);
     if (!coordinator) co_return std::nullopt;
     const auto receiver = GroupCoordinator::WorkerIdForContext(context).value_or(0);
-    std::string owned_tag(tag);
+    memory::ThreadLocalString owned_tag(tag);
     co_return co_await coordinator->PostCall(
         [coordinator, config = std::move(config), tag = std::move(owned_tag),
          ticket, nfs = std::move(nfs), receiver]() -> std::optional<Resumed> {

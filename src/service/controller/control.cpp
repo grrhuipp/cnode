@@ -99,10 +99,10 @@ Controller::Impl::GetOnlineSnapshot(const std::string& tag) {
     tasks.reserve(workers_.size());
     for (size_t i = 0; i < workers_.size(); ++i) {
         tasks.push_back(
-            [](Impl* controller, Worker* w, std::string t,
+            [](Impl* controller, Worker* w, std::string_view t,
                std::vector<OnlineDevice>& out) -> net::awaitable<void> {
                 controller->ThrowIfStopping();
-                out = co_await w->PostCall([w, t = std::move(t)] {
+                out = co_await w->PostCall([w, t] {
                     return w->GetOnlineDevices(t);
                 });
             }(this, workers_[i].get(), tag, per_worker[i])

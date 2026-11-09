@@ -131,9 +131,11 @@ net::awaitable<bool> NodeRuntime::AddInbound(const PreparedInbound& inbound) {
 
 net::awaitable<void> NodeRuntime::UpdateRules(
     const std::string& tag,
-    const std::vector<rule::DetectRule>& new_rule_list) {
+    std::shared_ptr<const std::vector<rule::DetectRule>> new_rule_list) {
     ThrowIfStopping();
-    auto shared_rules = std::make_shared<const std::vector<rule::DetectRule>>(new_rule_list);
+    auto shared_rules = new_rule_list
+        ? std::move(new_rule_list)
+        : std::make_shared<const std::vector<rule::DetectRule>>();
     co_await RunWorkerMutationBatch(
         io_context_.get_executor(), workers_,
         [this, &tag, &shared_rules](Worker& worker, size_t) {

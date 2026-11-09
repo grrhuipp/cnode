@@ -544,7 +544,6 @@ memory::ByteVector MakeClientResponse(Connection& connection,
     using namespace proxyman::inbound;
     constexpr auto tag = "vmess-client-response";
     PreparedVmessUser user;
-    user.uuid = account.uuid;
     user.uuid_bytes = account.uuid_bytes;
     user.auth_key = account.auth_key;
     user.cmd_key = account.cmd_key;

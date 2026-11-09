@@ -14,10 +14,7 @@
 #include <array>
 #include <charconv>
 #include <tl/expected.hpp>
-#include <istream>
-#include <limits>
 #include <optional>
-#include <sstream>
 #include <string>
 #include <string_view>
 
@@ -44,12 +41,14 @@ inline std::string TrimHeaderValue(std::string_view value) {
 
 
 inline bool AppendStreambuf(net::streambuf& buffer, std::string& out) {
+    const auto data = buffer.data();
+    const size_t size = data.size();
     if (out.size() > kMaxHttpBodySize ||
-        buffer.size() > kMaxHttpBodySize - out.size()) {
+        size > kMaxHttpBodySize - out.size()) {
         return false;
     }
-    std::istream is(&buffer);
-    out.append(std::istreambuf_iterator<char>(is), std::istreambuf_iterator<char>());
+    out.append(static_cast<const char*>(data.data()), size);
+    buffer.consume(size);
     return true;
 }
 
@@ -89,14 +88,10 @@ net::awaitable<tl::expected<std::string, std::string>> ReadCrlfLine(
             if (*line_size > kMaxHttpLineSize) {
                 co_return tl::unexpected("HTTP line too large");
             }
-            std::string line(*line_size, '\0');
-            std::istream input(&buffer);
-            input.read(line.data(), static_cast<std::streamsize>(*line_size));
-            char terminator[2]{};
-            input.read(terminator, 2);
-            if (!input || terminator[0] != '\r' || terminator[1] != '\n') {
-                co_return tl::unexpected("invalid CRLF line");
-            }
+            const auto data = buffer.data();
+            const auto* chars = static_cast<const char*>(data.data());
+            std::string line(chars, *line_size);
+            buffer.consume(*line_size + 2);
             co_return line;
         }
         // A maximum-length line can have its CR buffered while the LF is
@@ -173,9 +168,7 @@ net::awaitable<tl::expected<std::string, std::string>> ReadChunkedBody(
         }
 
         if (decoded.size() > kMaxHttpBodySize ||
-            *chunk_size > kMaxHttpBodySize - decoded.size() ||
-            *chunk_size > static_cast<size_t>(
-                std::numeric_limits<std::streamsize>::max())) {
+            *chunk_size > kMaxHttpBodySize - decoded.size()) {
             co_return tl::unexpected("invalid chunked HTTP response: body too large");
         }
 
@@ -193,18 +186,16 @@ net::awaitable<tl::expected<std::string, std::string>> ReadChunkedBody(
             }
         }
 
-        const size_t old_size = decoded.size();
-        decoded.resize(old_size + *chunk_size);
-        std::istream body_stream(&buffer);
-        body_stream.read(
-            decoded.data() + old_size,
-            static_cast<std::streamsize>(*chunk_size));
-        char terminator[2]{};
-        body_stream.read(terminator, 2);
-        if (!body_stream || terminator[0] != '\r' || terminator[1] != '\n') {
+        const auto data = buffer.data();
+        const auto* chars = static_cast<const char*>(data.data());
+        if (data.size() < required ||
+            chars[*chunk_size] != '\r' ||
+            chars[*chunk_size + 1] != '\n') {
             co_return tl::unexpected(
                 "invalid chunked HTTP response: missing chunk terminator");
         }
+        decoded.append(chars, *chunk_size);
+        buffer.consume(required);
     }
 }
 

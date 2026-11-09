@@ -82,8 +82,8 @@ void AddPayloadSize(size_t& total, size_t size) {
 }  // namespace
 
 BaseWsStream::BaseWsStream(
-    std::unique_ptr<AsyncStream> inner, uint64_t conn_id, bool is_client)
-    : inner_(std::move(inner)), conn_id_(conn_id), is_client_(is_client) {}
+    std::unique_ptr<AsyncStream> inner, bool is_client)
+    : inner_(std::move(inner)), is_client_(is_client) {}
 
 BaseWsStream::~BaseWsStream() noexcept {
     Close();
@@ -578,14 +578,15 @@ const TcpStream* BaseWsStream::BaseTcpStream() const {
     return BaseTcpStreamOf(std::as_const(*inner_));
 }
 
-net::awaitable<WsHandshakeResult> WsClientStream::Handshake(
+net::awaitable<WsHandshakeResult> BaseWsStream::Handshake(
     std::string_view host,
     std::string_view path,
-    const transport::internet::HttpHeaders* headers) {
+    const transport::internet::HttpHeaders* headers,
+    uint64_t conn_id) {
     // RFC 6455 §4.1: 密钥必须是随机生成的 16 字节 base64 编码
     uint8_t raw_key[16];
     if (RAND_bytes(raw_key, sizeof(raw_key)) != 1) [[unlikely]] {
-        LOG_CONN_DEBUG(conn_id_, "WebSocket client failed to generate handshake nonce");
+        LOG_CONN_DEBUG(conn_id, "WebSocket client failed to generate handshake nonce");
         co_return tl::unexpected(ErrorCode::INTERNAL);
     }
     std::array<uint8_t, 25> ws_key_buf{};
@@ -599,7 +600,7 @@ net::awaitable<WsHandshakeResult> WsClientStream::Handshake(
     const std::string_view req_path = EffectiveHttpPath(path);
     host = transport::internet::ResolveHttpUpgradeHost(host, {}, headers);
     auto head = co_await transport::internet::ExecuteHttp1UpgradeClientHandshake(
-        *inner_, "WebSocket", conn_id_, host, req_path, headers, ws_key);
+        *inner_, "WebSocket", conn_id, host, req_path, headers, ws_key);
     if (!head) {
         co_return tl::unexpected(head.error());
     }
@@ -607,13 +608,13 @@ net::awaitable<WsHandshakeResult> WsClientStream::Handshake(
     const std::string_view accept = TrimAscii(
         transport::internet::ExtractHeaderValueCI(head->Text(), "Sec-WebSocket-Accept"));
     if (accept.empty()) {
-        LOG_CONN_DEBUG(conn_id_, "WebSocket client missing Sec-WebSocket-Accept");
+        LOG_CONN_DEBUG(conn_id, "WebSocket client missing Sec-WebSocket-Accept");
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
     const auto expected_accept = ws::EncodeWsAccept(ws_key);
     if (accept != std::string_view(expected_accept.data(), expected_accept.size())) {
-        LOG_CONN_DEBUG(conn_id_, "WebSocket client received invalid Sec-WebSocket-Accept");
+        LOG_CONN_DEBUG(conn_id, "WebSocket client received invalid Sec-WebSocket-Accept");
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
@@ -621,7 +622,7 @@ net::awaitable<WsHandshakeResult> WsClientStream::Handshake(
         SetPendingData(read_ahead.data(), read_ahead.size());
     }
 
-    LOG_CONN_DEBUG(conn_id_, "WebSocket client handshake completed (host={} path={})",
+    LOG_CONN_DEBUG(conn_id, "WebSocket client handshake completed (host={} path={})",
                    transport::internet::PublicHttpTargetForLog(host),
                    transport::internet::PublicHttpTargetForLog(req_path));
     co_return WsHandshakeResult{};

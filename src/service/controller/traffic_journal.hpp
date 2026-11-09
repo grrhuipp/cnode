@@ -5,7 +5,6 @@
 #include "infra/panel_config.hpp"
 
 #include <filesystem>
-#include <mutex>
 #include <vector>
 
 namespace controller {
@@ -39,7 +38,6 @@ private:
     std::filesystem::path directory_;
     int lock_fd_ = -1;
     int directory_fd_ = -1;
-    std::mutex mutex_;
     bool failed_ = false;
 };
 

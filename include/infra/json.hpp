@@ -73,7 +73,6 @@ public:
     [[nodiscard]] bool is_int64() const noexcept;
     [[nodiscard]] bool is_uint64() const noexcept;
     [[nodiscard]] bool is_double() const noexcept;
-    [[nodiscard]] bool is_number() const noexcept;
     [[nodiscard]] bool is_object() const noexcept;
     [[nodiscard]] bool is_array() const noexcept;
 
@@ -135,8 +134,6 @@ public:
     [[nodiscard]] iterator end() noexcept { return values_.end(); }
     [[nodiscard]] const_iterator begin() const noexcept { return values_.begin(); }
     [[nodiscard]] const_iterator end() const noexcept { return values_.end(); }
-    [[nodiscard]] const_iterator cbegin() const noexcept { return values_.cbegin(); }
-    [[nodiscard]] const_iterator cend() const noexcept { return values_.cend(); }
 
     [[nodiscard]] bool empty() const noexcept { return values_.empty(); }
     [[nodiscard]] size_t size() const noexcept { return values_.size(); }
@@ -172,8 +169,6 @@ public:
     [[nodiscard]] iterator end() noexcept { return values_.end(); }
     [[nodiscard]] const_iterator begin() const noexcept { return values_.begin(); }
     [[nodiscard]] const_iterator end() const noexcept { return values_.end(); }
-    [[nodiscard]] const_iterator cbegin() const noexcept { return values_.cbegin(); }
-    [[nodiscard]] const_iterator cend() const noexcept { return values_.cend(); }
 
     [[nodiscard]] bool empty() const noexcept { return values_.empty(); }
     [[nodiscard]] size_t size() const noexcept { return values_.size(); }

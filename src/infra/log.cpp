@@ -42,8 +42,7 @@ using namespace std::chrono_literals;
 
 enum class LogChannel {
     Error,
-    Access,
-    Console
+    Access
 };
 
 struct LogRecord {
@@ -296,11 +295,13 @@ std::string PanelOrigin(std::string_view host) {
     return std::format("{}://{}", scheme, authority);
 }
 
-std::string FormatConsoleRecord(const LogRecord& record,
+std::string FormatConsoleRecord(int64_t timestamp_us,
+                                LogLevel level,
+                                std::string_view message,
                                 const PanelLogContext* panel = nullptr) {
     auto line = std::format("time=\"{}\" level={} msg={}",
-        FormatConsoleTimestamp(record.timestamp_us), ConsoleLevelName(record.level),
-        EscapeLogText(record.message, true));
+        FormatConsoleTimestamp(timestamp_us), ConsoleLevelName(level),
+        EscapeLogText(message, true));
     if (panel) {
         if (!panel->host.empty()) line.append(" Host=").append(ConsoleField(PanelOrigin(panel->host)));
         if (panel->node_id > 0) line.append(std::format(" ID={}", panel->node_id));
@@ -311,7 +312,6 @@ std::string FormatConsoleRecord(const LogRecord& record,
 }
 
 std::string FormatRecord(const LogRecord& record) {
-    if (record.channel == LogChannel::Console) return FormatConsoleRecord(record);
     const auto timestamp = FormatLogTimestamp(record.timestamp_us);
     const auto message = EscapeLogText(record.message);
     if (record.channel == LogChannel::Access) {
@@ -747,15 +747,7 @@ private:
             return;
         }
         if (output.fd >= 0) {
-            LogRecord record{
-                .channel = LogChannel::Console,
-                .level = LogLevel::ERROR,
-                .timestamp_us = NowMicros(),
-                .message = std::string(text),
-                .source_file = {},
-                .connection = std::nullopt,
-            };
-            Send(output, FormatConsoleRecord(record) + '\n');
+            Send(output, FormatConsoleRecord(NowMicros(), LogLevel::ERROR, text) + '\n');
             ::close(output.fd);
         }
     }
@@ -777,18 +769,11 @@ private:
         const auto now = std::chrono::steady_clock::now();
         if (unreported_drops_ != 0 && (force || now >= next_report)) {
             next_report = now + 1s;
-            LogRecord diagnostic{
-                .channel = LogChannel::Console,
-                .level = LogLevel::WARN,
-                .timestamp_us = NowMicros(),
-                .message = std::format(
-                    "console queue/write-failure dropped {} records; stdout_failed={} stderr_failed={} stdout_partial_record={} stderr_partial_record={}",
-                    unreported_drops_, stdout_.failed, error_output_->failed,
-                    stdout_.partial_write, error_output_->partial_write),
-                .source_file = {},
-                .connection = std::nullopt,
-            };
-            auto line = FormatConsoleRecord(diagnostic) + '\n';
+            const auto message = std::format(
+                "console queue/write-failure dropped {} records; stdout_failed={} stderr_failed={} stdout_partial_record={} stderr_partial_record={}",
+                unreported_drops_, stdout_.failed, error_output_->failed,
+                stdout_.partial_write, error_output_->partial_write);
+            auto line = FormatConsoleRecord(NowMicros(), LogLevel::WARN, message) + '\n';
             if (Send(*error_output_, line)) unreported_drops_ = 0;
         }
     }
@@ -836,16 +821,8 @@ private:
 
 AsyncConsole g_console;
 
-void WriteStderrFallback(LogLevel level, const std::string& msg) {
-    LogRecord record{
-        .channel = LogChannel::Console,
-        .level = level,
-        .timestamp_us = NowMicros(),
-        .message = msg,
-        .source_file = "src/infra/log.cpp",
-        .connection = std::nullopt,
-    };
-    g_console.Enqueue(FormatConsoleRecord(record), true);
+void WriteStderrFallback(LogLevel level, std::string_view msg) {
+    g_console.Enqueue(FormatConsoleRecord(NowMicros(), level, msg), true);
 }
 
 class AsyncLogBackend {
@@ -894,10 +871,8 @@ public:
 
         const auto resolved_error_path = ResolveTargetPath(error_target_, current_date_);
         const auto resolved_access_path = ResolveTargetPath(access_target_, current_date_);
-        if (Log::ResolveTargetPath(
-                log_dir_, error_path, error_target_.fallback_prefix, rotate_daily_, current_date_) ==
-            Log::ResolveTargetPath(
-                log_dir_, access_path, access_target_.fallback_prefix, rotate_daily_, current_date_)) {
+        if (resolved_error_path.lexically_normal() ==
+            resolved_access_path.lexically_normal()) {
             return false;
         }
         if (!OpenFiles(resolved_error_path, resolved_access_path)) {
@@ -1247,8 +1222,6 @@ private:
             case LogChannel::Access:
                 WriteLine(access_file_, access_target_, record);
                 break;
-            case LogChannel::Console:
-                break;
         }
     }
 
@@ -1497,26 +1470,19 @@ void Log::WriteConsole(LogLevel level,
     if (level != LogLevel::ERROR && !ShouldLog(level)) return;
     if (message.empty()) return;
     const int64_t timestamp_us = NowMicros();
+    auto console_line = FormatConsoleRecord(timestamp_us, level, message);
     if (level >= LogLevel::WARN && ShouldLog(level) &&
         initialized_.load(std::memory_order_acquire)) {
         g_async_log_backend.Enqueue(LogRecord{
             .channel = LogChannel::Error,
             .level = level,
             .timestamp_us = timestamp_us,
-            .message = message,
+            .message = std::move(message),
             .source_file = location.file_name(),
             .connection = std::nullopt,
         });
     }
-    LogRecord record{
-        .channel = LogChannel::Console,
-        .level = level,
-        .timestamp_us = timestamp_us,
-        .message = std::move(message),
-        .source_file = location.file_name(),
-        .connection = std::nullopt,
-    };
-    g_console.Enqueue(FormatConsoleRecord(record), level == LogLevel::ERROR);
+    g_console.Enqueue(std::move(console_line), level == LogLevel::ERROR);
 }
 
 void Log::WritePanel(LogLevel level,
@@ -1547,15 +1513,9 @@ void Log::WritePanel(LogLevel level,
         });
     }
     if (level < LogLevel::INFO) return;
-    LogRecord record{
-        .channel = LogChannel::Console,
-        .level = level,
-        .timestamp_us = timestamp_us,
-        .message = std::move(message),
-        .source_file = location.file_name(),
-        .connection = std::nullopt,
-    };
-    g_console.Enqueue(FormatConsoleRecord(record, &context), level == LogLevel::ERROR);
+    g_console.Enqueue(
+        FormatConsoleRecord(timestamp_us, level, message, &context),
+        level == LogLevel::ERROR);
 }
 
 std::filesystem::path Log::ResolveTargetPath(

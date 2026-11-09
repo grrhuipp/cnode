@@ -38,7 +38,6 @@ struct RealityServerConnState : memory::ThreadAllocated {
     }
     std::array<uint8_t, 32> auth_key{};
     memory::ByteVector client_hello_raw;
-    bool authenticated = false;
 };
 
 [[nodiscard]] bool VerifyRealityClientHandshake(

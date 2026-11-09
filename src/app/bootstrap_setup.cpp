@@ -1,7 +1,7 @@
 #include "app/bootstrap_setup.hpp"
 #include "startup_inbounds.hpp"
 
-#include "api/panel_factory.hpp"
+#include "api/api.hpp"
 #include "app/bootstrap_runtime.hpp"
 #include "app/dns/dns.hpp"
 #include "app/dns/dns_worker.hpp"

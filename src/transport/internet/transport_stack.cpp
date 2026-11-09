@@ -593,11 +593,12 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
 
     // 5. WebSocket 层（客户端）
     if (s.IsWs()) {
-        auto ws = std::make_unique<WsClientStream>(std::move(stream), conn_id);
+        auto ws = std::make_unique<BaseWsStream>(std::move(stream), true);
         auto ws_result = co_await ws->Handshake(
             dial_host,
             s.ws.path.empty() ? "/" : s.ws.path,
-            &s.ws.headers);
+            &s.ws.headers,
+            conn_id);
         if (!ws_result) {
             LogLayerFailure(conn_id, "WebSocket client handshake", ws_result.error());
             co_return tl::unexpected(ws_result.error());

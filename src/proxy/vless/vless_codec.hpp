@@ -30,7 +30,6 @@ enum class Command : uint8_t {
 
 struct RequestHeader {
     std::array<uint8_t, 16> uuid{};
-    uint8_t addons_len = 0;
     memory::ThreadLocalString flow;
     Command command = Command::TCP;
     TargetAddress target;

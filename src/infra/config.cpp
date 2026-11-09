@@ -543,19 +543,19 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
         }
         for (std::string& val : arr) {
             // 解析前缀
-            if (val.substr(0, 8) == "geosite:") {
+            if (val.starts_with("geosite:")) {
                 rule.geosite.push_back(RequireRoutingSelector(
                     val.substr(8), "geosite tag", true));
-            } else if (val.substr(0, 5) == "full:") {
+            } else if (val.starts_with("full:")) {
                 rule.domain_full.push_back(RequireRoutingDomainName(
                     val.substr(5), "full"));
-            } else if (val.substr(0, 8) == "keyword:") {
+            } else if (val.starts_with("keyword:")) {
                 rule.domain_keyword.push_back(RequireRoutingDomainKeyword(
                     val.substr(8)));
-            } else if (val.substr(0, 7) == "regexp:") {
+            } else if (val.starts_with("regexp:")) {
                 rule.domain_regex.push_back(RequireRoutingDomainRegexp(
                     val.substr(7)));
-            } else if (val.substr(0, 7) == "domain:") {
+            } else if (val.starts_with("domain:")) {
                 rule.domain_suffix.push_back(RequireRoutingDomainName(
                     val.substr(7), "suffix"));
             } else {
@@ -633,7 +633,7 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
             throw std::invalid_argument("routing ip must not be empty");
         }
         for (std::string& val : arr) {
-            if (val.substr(0, 6) == "geoip:") {
+            if (val.starts_with("geoip:")) {
                 rule.geoip.push_back(RequireRoutingSelector(
                     val.substr(6), "geoip tag", true));
             } else {
@@ -870,18 +870,8 @@ std::shared_ptr<const XHttpDownloadSettings> ParseXHttpDownloadSettings(
     }
     settings->port = parsed_port.value;
 
-    if (j.contains("send_through") || j.contains("send_through_strategy")) {
-        throw std::invalid_argument("xhttp download binding must use sendThrough/sendThroughStrategy");
-    }
-    const auto* send_through = j.if_contains("sendThrough");
-    const auto* strategy = j.if_contains("sendThroughStrategy");
-    if (strategy && !send_through) {
-        throw std::invalid_argument(
-            "xhttp download sendThroughStrategy requires sendThrough");
-    }
-    if (send_through) {
-        settings->send_through = infra::ParseOutboundBindConfig(
-            *send_through, strategy);
+    if (auto bind = infra::ParseOptionalOutboundBind(j, "xhttp download")) {
+        settings->send_through = std::move(*bind);
     }
 
     settings->stream_settings = StreamSettings::FromJson(
@@ -1167,8 +1157,6 @@ StreamSettings StreamSettings::FromJson(
             throw std::invalid_argument(
                 "reality requires TLS minVersion and maxVersion 1.3");
         }
-        cfg.tls.min_version = TlsVersion::V1_3;
-        cfg.tls.max_version = TlsVersion::V1_3;
         if (role == StreamEndpointRole::Outbound) {
             if (!cfg.reality.public_key) {
                 throw std::invalid_argument(
@@ -1177,9 +1165,6 @@ StreamSettings StreamSettings::FromJson(
         } else {
             RequireField(infra::ValidateInboundReality(cfg.reality));
         }
-    }
-    if (cfg.tls.server_name.empty() && !cfg.reality.server_name.empty()) {
-        cfg.tls.server_name = cfg.reality.server_name;
     }
 
     // WS 配置
@@ -1216,27 +1201,21 @@ StreamSettings StreamSettings::FromJson(
 // ============================================================================
 namespace {
 
-struct StaticClient {
-    std::string id;
-    std::string password;
-    std::string email;
-    std::string flow;
-};
-
 // Static clients name their credential `id` or `password` depending on the
 // protocol; resolve that alias here so every source yields one credential.
-[[nodiscard]] std::string StaticCredential(std::string_view protocol, StaticClient& client) {
-    if (protocol == constants::protocol::kVmess) return std::move(client.id);
+[[nodiscard]] std::string StaticCredential(
+    std::string_view protocol, std::string id, std::string password) {
+    if (protocol == constants::protocol::kVmess) return id;
     if (protocol == constants::protocol::kTrojan ||
         protocol == constants::protocol::kShadowsocks) {
-        return std::move(client.password);
+        return password;
     }
     if (protocol == constants::protocol::kAnyTLS ||
         protocol == constants::protocol::kHysteria ||
         protocol == constants::protocol::kHysteria2) {
-        return std::move(client.password.empty() ? client.id : client.password);
+        return password.empty() ? std::move(id) : std::move(password);
     }
-    return std::move(client.id.empty() ? client.password : client.id);
+    return id.empty() ? std::move(password) : std::move(id);
 }
 
 void ParseStaticSettings(
@@ -1265,18 +1244,19 @@ void ParseStaticSettings(
         }
     }
 
-    const bool ss2022_method = config.method.rfind("2022-", 0) == 0;
-    StaticClient top_level_user;
+    const bool ss2022_method = config.method.starts_with("2022-");
+    std::string top_level_password;
+    std::string top_level_email;
     if (protocol == constants::protocol::kShadowsocks ||
         protocol == constants::protocol::kTrojan ||
         protocol == constants::protocol::kAnyTLS ||
         protocol == constants::protocol::kHysteria ||
         protocol == constants::protocol::kHysteria2) {
-        top_level_user.password = JsonStringOr(settings, "password", "");
+        top_level_password = JsonStringOr(settings, "password", "");
         if (protocol == constants::protocol::kShadowsocks) {
-            config.identity_password = top_level_user.password;
+            config.identity_password = top_level_password;
         }
-        top_level_user.email = JsonStringOr(settings, "email", "");
+        top_level_email = JsonStringOr(settings, "email", "");
     }
 
     if (settings.contains("users")) {
@@ -1284,51 +1264,50 @@ void ParseStaticSettings(
             "static inbound settings.users is not supported; use settings.clients");
     }
 
-    std::vector<StaticClient> clients;
-    bool saw_user_array = false;
-    if (const auto* client_values = settings.if_contains("clients")) {
-        if (!client_values->is_array()) {
-            throw std::invalid_argument("clients must be an array");
-        }
-        clients.reserve(client_values->as_array().size() + 1);
+    const auto* client_values = settings.if_contains("clients");
+    if (client_values && !client_values->is_array()) {
+        throw std::invalid_argument("clients must be an array");
+    }
+    const bool saw_user_array =
+        client_values && !client_values->as_array().empty();
+
+    if (!top_level_password.empty() &&
+        ((protocol == constants::protocol::kShadowsocks &&
+          (!ss2022_method || !saw_user_array)) ||
+         ((protocol == constants::protocol::kTrojan ||
+           protocol == constants::protocol::kAnyTLS ||
+           protocol == constants::protocol::kHysteria ||
+           protocol == constants::protocol::kHysteria2) &&
+          !saw_user_array))) {
+        cfg.users.push_back(InboundUserSpec{
+            .user_id = 0,
+            .email = std::move(top_level_email),
+            .credential = std::move(top_level_password),
+            .flow = {},
+            .speed_limit = 0,
+            .device_limit = 0,
+        });
+    }
+
+    if (client_values) {
+        cfg.users.reserve(cfg.users.size() + client_values->as_array().size());
         for (const auto& client : client_values->as_array()) {
             if (!client.is_object()) {
                 throw std::invalid_argument("clients entries must be objects");
             }
             const auto& client_obj = client.as_object();
-            clients.push_back(StaticClient{
-                .id = JsonStringOr(client_obj, "id", ""),
-                .password = JsonStringOr(client_obj, "password", ""),
+            cfg.users.push_back(InboundUserSpec{
+                .user_id = 0,
                 .email = JsonStringOr(client_obj, "email", ""),
+                .credential = StaticCredential(
+                    protocol,
+                    JsonStringOr(client_obj, "id", ""),
+                    JsonStringOr(client_obj, "password", "")),
                 .flow = naming::LowerAscii(JsonStringOr(client_obj, "flow", "")),
+                .speed_limit = 0,
+                .device_limit = 0,
             });
         }
-        saw_user_array = !clients.empty();
-    }
-
-    if (protocol == constants::protocol::kShadowsocks &&
-        !top_level_user.password.empty() &&
-        (!ss2022_method || !saw_user_array)) {
-        clients.insert(clients.begin(), std::move(top_level_user));
-    } else if ((protocol == constants::protocol::kTrojan ||
-                protocol == constants::protocol::kAnyTLS ||
-                protocol == constants::protocol::kHysteria ||
-                protocol == constants::protocol::kHysteria2) &&
-               !top_level_user.password.empty() &&
-               !saw_user_array) {
-        clients.insert(clients.begin(), std::move(top_level_user));
-    }
-
-    cfg.users.reserve(clients.size());
-    for (auto& client : clients) {
-        cfg.users.push_back(InboundUserSpec{
-            .user_id = 0,
-            .email = std::move(client.email),
-            .credential = StaticCredential(protocol, client),
-            .flow = std::move(client.flow),
-            .speed_limit = 0,
-            .device_limit = 0,
-        });
     }
 
     // A single static SS2022 user whose PSK is the server PSK is the

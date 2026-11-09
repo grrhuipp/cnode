@@ -41,7 +41,7 @@ std::shared_ptr<const NodeSnapshot> Snapshot(uint16_t port, size_t version = 1) 
     snapshot->users.resize(version);
     snapshot->users_etag = "users-" + std::to_string(version);
     snapshot->config_etag = "config-" + std::to_string(version);
-    snapshot->rules.resize(version);
+    snapshot->rules = std::make_shared<const std::vector<::rule::DetectRule>>(version);
     ::StreamSettings stream;
     stream.ws.path = snapshot->config.Path;
     snapshot->inbound = std::make_shared<const ::PreparedInbound>(::PreparedInbound{
@@ -162,10 +162,12 @@ struct Runtime {
         const auto& tag = outbound.tag;
         Step("add-out:" + tag, [&] { resources[tag].outbound = true; });
     }
-    net::awaitable<void> UpdateRules(const std::string& tag, const std::vector<::rule::DetectRule>& rules) {
+    net::awaitable<void> UpdateRules(
+        const std::string& tag,
+        std::shared_ptr<const std::vector<::rule::DetectRule>> rules) {
         ++operations_started;
         co_await net::post(net::use_awaitable);
-        Step("rules:" + tag, [&] { resources[tag].rules = rules.size(); });
+        Step("rules:" + tag, [&] { resources[tag].rules = rules ? rules->size() : 0; });
     }
     net::awaitable<void> ApplyUsers(const std::string& tag, const UserSet& users) {
         ++operations_started;
@@ -198,13 +200,13 @@ void Seed(Runtime& runtime, NodeState& state, std::shared_ptr<const NodeSnapshot
     state.committed = snapshot;
     state.phase = NodeRuntimePhase::Ready;
     runtime.resources[snapshot->tag] = {
-        true, true, snapshot->users.size(), snapshot->rules.size(), snapshot->config.Path};
+        true, true, snapshot->users.size(), snapshot->rules ? snapshot->rules->size() : 0, snapshot->config.Path};
 }
 
 bool Matches(const Runtime& runtime, const NodeSnapshot& snapshot) {
     const auto& actual = runtime.resources.at(snapshot.tag);
     return actual.inbound && actual.outbound && actual.users == snapshot.users.size() &&
-        actual.rules == snapshot.rules.size() && actual.version == snapshot.config.Path;
+        actual.rules == (snapshot.rules ? snapshot.rules->size() : 0) && actual.version == snapshot.config.Path;
 }
 
 bool Empty(const Runtime& runtime, const std::string& tag) {
@@ -222,12 +224,12 @@ void TestSuccessAndRefresh() {
     refresh->users.resize(2);
     ReplaceUsers(*refresh, 2);
     refresh->users_etag = "users-2";
-    refresh->rules.resize(2);
+    refresh->rules = std::make_shared<const std::vector<::rule::DetectRule>>(2);
     Require(!Run(ApplyNodeChange(runtime, state, Change(refresh, state))), "refresh failed");
     Require(state.committed == refresh && state.phase == NodeRuntimePhase::Ready &&
         !state.HasPendingCleanup() && Matches(runtime, *refresh), "refresh must publish the complete new snapshot");
     Require(runtime.counts["add-in:" + first->tag] == 1, "refresh must preserve the existing listener");
-    Require(first->users.size() == 1 && first->rules.size() == 1, "published old snapshots must remain immutable");
+    Require(first->users.size() == 1 && first->rules && first->rules->size() == 1, "published old snapshots must remain immutable");
     Require(state.committed->users_etag == "users-2" && first->users_etag == "users-1",
         "user validators must be published with their immutable snapshot");
 }
@@ -280,7 +282,7 @@ void TestRefreshRollbackFailure() {
     auto next = std::make_shared<NodeSnapshot>(*old);
     next->users.resize(2);
     ReplaceUsers(*next, 2);
-    next->rules.resize(2);
+    next->rules = std::make_shared<const std::vector<::rule::DetectRule>>(2);
     Seed(runtime, state, old);
     runtime.faults = {{"users:" + old->tag, 1, true}, {"rules:" + old->tag, 2, false}};
     Require(static_cast<bool>(Run(ApplyNodeChange(runtime, state, Change(next, state)))) &&

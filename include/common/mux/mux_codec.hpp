@@ -65,8 +65,6 @@ struct FrameHeader {
     TargetAddress target;
 
     std::optional<ForwardedMetadata> forwarded;
-    // New UDP 帧是否携带 8 字节 GlobalID（XUDP），其取值不参与本端语义
-    bool          has_global_id = false;
 
     // 载荷
     bool     has_data  = false;

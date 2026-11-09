@@ -161,21 +161,13 @@ proxy::vmess::inbound::Handler::Process(
 
     LOG_CONN_DEBUG(ctx, "processing connection from {}:{}", client_ip, ctx.inbound.source_port);
 
-    try {
-        if (co_await proxy::CheckInboundIpBanned(limiter_, ctx)) {
-            co_return proxy::RejectInbound(*stats_, stream.get(), ErrorCode::BLOCKED);
-        }
-    } catch (const WorkerMailboxFull&) {
-        co_return proxy::RejectInbound(*stats_, stream.get(), ErrorCode::RESOURCE_EXHAUSTED);
-    } catch (const IoSystemError& e) {
-        co_return proxy::RejectInbound(
-            *stats_, stream.get(),
-            e.code() == net::error::operation_aborted ? ErrorCode::CANCELLED : MapAsioError(e.code()));
-    }
     std::optional<UserOnlineSessionGuard> user_session;
     std::unique_ptr<transport::MultiBufferReader> request_reader;
     std::unique_ptr<transport::MultiBufferWriter> response_writer;
     try {
+        if (co_await proxy::CheckInboundIpBanned(limiter_, ctx)) {
+            co_return proxy::RejectInbound(*stats_, stream.get(), ErrorCode::BLOCKED);
+        }
         ::vmess::encoding::ServerSession vmess_session(validator_, tag);
         auto parsed_session = co_await ParseHandshake(
             *stream, vmess_session, validator_, limiter_, ctx, client_ip);
@@ -183,8 +175,8 @@ proxy::vmess::inbound::Handler::Process(
             co_return proxy::RejectInbound(*stats_, stream.get(), parsed_session.error());
         }
         user_session.emplace(std::move(*parsed_session));
-        request_reader = vmess_session.DecodeRequestBody(*stream, ctx.outbound.target);
-        response_writer = vmess_session.EncodeResponseBodyWithHeader(*stream, ctx.outbound.target);
+        request_reader = vmess_session.DecodeRequestBody(*stream);
+        response_writer = vmess_session.EncodeResponseBodyWithHeader(*stream);
     } catch (const WorkerMailboxFull&) {
         co_return proxy::RejectInbound(*stats_, stream.get(), ErrorCode::RESOURCE_EXHAUSTED);
     } catch (const IoSystemError& e) {
@@ -234,7 +226,7 @@ BuildPreparedVmessUser(const ::InboundUserSpec& spec) {
         return std::nullopt;
     }
     return ::proxyman::inbound::PreparedVmessUser{
-        .uuid = std::move(user->uuid),
+        .uuid = spec.credential,
         .uuid_bytes = user->uuid_bytes,
         .cmd_key = user->cmd_key,
         .auth_key = user->auth_key,

@@ -45,9 +45,6 @@ struct TimeoutsConfig {
         return std::chrono::seconds(dial);
     }
 
-    [[nodiscard]] std::chrono::seconds ReadTimeout() const noexcept {
-        return std::chrono::seconds(read);
-    }
 
     [[nodiscard]] std::chrono::seconds WriteTimeout() const noexcept {
         return std::chrono::seconds(write);

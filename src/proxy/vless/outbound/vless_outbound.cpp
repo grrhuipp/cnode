@@ -80,7 +80,7 @@ net::awaitable<void> ReadVlessResponseHeader(VlessBufferedReader& reader,
 
 class VlessOutboundEndpoint final : public proxy::OutboundStreamEndpointBase {
 public:
-    struct VisionIoState : memory::ThreadAllocated {
+    struct VisionIoState {
         ::vless::VisionTrafficState traffic;
         ::vless::VisionReader reader;
         ::vless::VisionWriter writer;
@@ -90,10 +90,6 @@ public:
                       std::array<uint8_t, 16> user_uuid)
             : reader(src, user_uuid, traffic)
             , writer(dst, user_uuid, traffic) {}
-    };
-    struct UdpIoState : memory::ThreadAllocated {
-        explicit UdpIoState(bool packet_addr) : framer(packet_addr) {}
-        ::vless::UdpFramer framer;
     };
 
     VlessOutboundEndpoint(AsyncStream& control,
@@ -111,7 +107,7 @@ public:
         , udp_target_(std::move(udp_target))
         , packet_addr_(packet_addr) {
         if (is_udp_) {
-            io_state_.emplace<UdpIoState>(packet_addr);
+            io_state_.emplace<::vless::UdpFramer>(packet_addr);
         } else if (vision) {
             io_state_.emplace<VisionIoState>(reader_, writer_, user_uuid);
         }
@@ -121,8 +117,8 @@ public:
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
         co_await ReadVlessResponseHeader(
             reader_, response_header_, "VLESS response header read failed");
-        if (auto* udp_io = std::get_if<UdpIoState>(&io_state_)) {
-            co_return co_await udp_io->framer.ReadDatagram(reader_, udp_target_);
+        if (auto* udp_framer = std::get_if<::vless::UdpFramer>(&io_state_)) {
+            co_return co_await udp_framer->ReadDatagram(reader_, udp_target_);
         }
         if (auto* vision_io = std::get_if<VisionIoState>(&io_state_)) {
             co_return co_await vision_io->reader.ReadMultiBuffer();
@@ -170,7 +166,7 @@ private:
     bool is_udp_ = false;
     TargetAddress udp_target_;
     bool packet_addr_ = false;
-    std::variant<std::monostate, VisionIoState, UdpIoState> io_state_;
+    std::variant<std::monostate, VisionIoState, ::vless::UdpFramer> io_state_;
 };
 
 
@@ -185,13 +181,7 @@ public:
         , reader_(reader)
         , writer_(writer)
         , udp_target_(std::move(udp_target)) {
-        if (!forwarded.Empty()) {
-            auto& owned = forwarded_.emplace();
-            owned.user_id = forwarded.user_id;
-            owned.user_email.assign(forwarded.user_email.data(), forwarded.user_email.size());
-            owned.client_ip = forwarded.client_ip;
-            owned.inbound_tag.assign(forwarded.inbound_tag.data(), forwarded.inbound_tag.size());
-        }
+        forwarded_ = ForwardedMetadata::FromView(forwarded);
     }
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
@@ -401,7 +391,7 @@ SendVlessHandshake(
     std::chrono::seconds handshake_timeout,
     VlessBufferedReader& protocol_reader,
     transport::MultiBufferWriter& protocol_writer,
-    std::unique_ptr<::vless::VlessEncryptedIo>& encrypted_io,
+    std::optional<::vless::VlessEncryptedIo>& encrypted_io,
     VlessBufferedReader*& active_reader,
     transport::MultiBufferWriter*& active_writer,
     const OutboundDialer& dialer,
@@ -434,7 +424,7 @@ SendVlessHandshake(
                 }
                 co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
             }
-            encrypted_io = std::make_unique<::vless::VlessEncryptedIo>(
+            encrypted_io.emplace(
                 protocol_reader, protocol_writer, std::move(*runtime));
             active_reader = &encrypted_io->plain_reader;
             active_writer = &encrypted_io->writer;
@@ -536,7 +526,7 @@ proxy::vless::outbound::Handler::Process(
     transport::MultiBufferWriter& protocol_writer = *stream;
     VlessBufferedReader* active_reader = &protocol_reader;
     transport::MultiBufferWriter* active_writer = &protocol_writer;
-    std::unique_ptr<::vless::VlessEncryptedIo> encrypted_io;
+    std::optional<::vless::VlessEncryptedIo> encrypted_io;
 
     if (auto ok = co_await SendVlessHandshake(
             *stream, *config_, tickets, target,

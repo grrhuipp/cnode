@@ -83,6 +83,22 @@ public:
         return result;
     }
 
+    [[nodiscard]] std::optional<uint64_t> ReadVarintU64() noexcept {
+        uint64_t value = 0;
+        for (uint8_t shift = 0; shift < 64; shift += 7) {
+            const uint8_t byte = ReadU8();
+            if (!Ok()) return std::nullopt;
+            if (shift == 63 && byte > 1) {
+                error_ = true;
+                return std::nullopt;
+            }
+            value |= static_cast<uint64_t>(byte & 0x7f) << shift;
+            if ((byte & 0x80) == 0) return value;
+        }
+        error_ = true;
+        return std::nullopt;
+    }
+
     // Empty span and latched error when fewer than len bytes remain.
     [[nodiscard]] std::span<const uint8_t> ReadBytes(size_t len) noexcept {
         if (!CanRead(len) || len == 0) return {};

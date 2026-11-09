@@ -2,6 +2,7 @@
 
 #include "common/allocator.hpp"
 #include "connection_timeouts.hpp"
+#include "common/buffer_util.hpp"
 #include "transport/link_error.hpp"
 
 #include <asio/as_tuple.hpp>
@@ -42,30 +43,6 @@ void ValidateDestination(const udp::endpoint& destination, bool ipv6) {
         ThrowLink(ErrorCode::INVALID_ARGUMENT);
 }
 
-struct MultiBufferSequence {
-    struct Iterator {
-        using iterator_category = std::forward_iterator_tag;
-        using value_type = net::const_buffer;
-        using difference_type = std::ptrdiff_t;
-        using pointer = void;
-        using reference = value_type;
-
-        buf::Buffer* const* current = nullptr;
-        net::const_buffer operator*() const noexcept {
-            const auto bytes = (*current)->Bytes();
-            return net::buffer(bytes.data(), bytes.size());
-        }
-        Iterator& operator++() noexcept { ++current; return *this; }
-        Iterator operator++(int) noexcept { auto copy = *this; ++*this; return copy; }
-        friend bool operator==(const Iterator& lhs, const Iterator& rhs) noexcept {
-            return lhs.current == rhs.current;
-        }
-    };
-
-    const buf::MultiBuffer& payload;
-    Iterator begin() const noexcept { return {payload.begin()}; }
-    Iterator end() const noexcept { return {payload.end()}; }
-};
 
 void ValidateBuffers(
     std::span<const net::const_buffer> buffers, std::size_t maximum, std::size_t& total) {
@@ -114,33 +91,7 @@ struct DatagramSocket::Impl final : memory::ThreadAllocated {
 
     net::awaitable<IoErrorCode> Wait(
         udp::socket::wait_type type, net::cancellation_slot cancellation) {
-        struct State {
-            net::cancellation_signal native;
-            bool cancelled = false;
-        } state;
-        struct Subscription {
-            net::cancellation_slot slot;
-            ~Subscription() { if (slot.is_connected()) slot.clear(); }
-        } subscription{cancellation};
-        const auto cancelled_at = cancellation_epoch_;
-        if (cancellation.is_connected()) {
-            cancellation.assign([&state](net::cancellation_type kind) {
-                if (kind == net::cancellation_type::none) return;
-                state.cancelled = true;
-                state.native.emit(kind);
-            });
-        }
-        auto [error] = co_await socket.async_wait(
-            type,
-            net::bind_cancellation_slot(
-                state.native.slot(),
-                net::bind_allocator(
-                    memory::ProcessAllocator<std::byte>{},
-                    net::as_tuple(net::use_awaitable))));
-        state.native.slot().clear();
-        if (state.cancelled || cancelled_at != cancellation_epoch_)
-            co_return IoErrorCode(io_error::operation_aborted);
-        co_return error;
+        return detail::WaitSocket(socket, type, cancellation, cancellation_epoch_);
     }
     void Close(ErrorCode reason) noexcept {
         if (closed) return;
@@ -317,42 +268,13 @@ net::awaitable<void> DatagramSocket::Impl::SendMultiBuffer(
     }
     if (total != payload.byte_size()) ThrowLink(ErrorCode::INVALID_ARGUMENT);
 
-    memory::ByteVector merged;
-    MultiBufferSequence sequence{payload};
-    std::array<net::const_buffer, 1> single{};
-    if (payload.size() > kMaxNativeBuffers) {
-        try {
-            merged.reserve(total);
-            for (const auto* buffer : payload) {
-                const auto bytes = buffer->Bytes();
-                merged.insert(merged.end(), bytes.begin(), bytes.end());
-            }
-        } catch (const std::bad_alloc&) {
-            ThrowLink(ErrorCode::RESOURCE_EXHAUSTED);
-        }
-        single[0] = net::buffer(merged.data(), merged.size());
+    ConstBufferSpanBuilder<kMaxNativeBuffers> spans;
+    try {
+        spans.AppendMultiBuffer(payload);
+    } catch (const std::bad_alloc&) {
+        ThrowLink(ErrorCode::RESOURCE_EXHAUSTED);
     }
-    const auto cancellation_state = co_await net::this_coro::cancellation_state;
-    for (;;) {
-        if (operation.Cancelled()) ThrowCancelled(operation.CancellationReason());
-        if (cancellation_state.cancelled() != net::cancellation_type::none)
-            throw IoSystemError(io_error::operation_aborted);
-        IoErrorCode send_ec;
-        const auto sent = payload.empty() || payload.size() > kMaxNativeBuffers
-            ? socket.send_to(std::span<const net::const_buffer>(single.data(), 1),
-                             destination, 0, send_ec)
-            : socket.send_to(sequence, destination, 0, send_ec);
-        if (send_ec == io_error::would_block || send_ec == io_error::try_again) {
-            const auto wait_ec = co_await Wait(udp::socket::wait_write, cancellation_state.slot());
-            if (operation.Cancelled()) ThrowCancelled(operation.CancellationReason());
-            if (wait_ec) throw IoSystemError(wait_ec);
-            continue;
-        }
-        if (send_ec) throw IoSystemError(send_ec);
-        if (sent != total) ThrowLink(ErrorCode::INTERNAL);
-        break;
-    }
-    timeouts.TouchActivity();
+    co_await SendBuffers(operation, std::move(destination), spans.Span());
 }
 
 DatagramSocket::ReadOperation::ReadOperation(Impl& impl)

@@ -8,10 +8,15 @@
 #include "transport/internet/stream_settings.hpp"
 
 #include <chrono>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
 
+
+namespace app::dns {
+class DNS;
+}  // namespace app::dns
 
 namespace api {
 
@@ -161,6 +166,11 @@ public:
     ReportUserTraffic(const std::vector<api::UserTraffic>& data) = 0;
 
 };
+
+[[nodiscard]] std::unique_ptr<API> CreatePanelClient(
+    net::io_context& io_context,
+    const Config& config,
+    app::dns::DNS& dns_service);
 
 }  // namespace api
 

@@ -318,10 +318,8 @@ TEST(MuxCodec, Contract) {
     const auto global_id_frame = Decode(encoded);
     const auto fragmented_global_id_frame = DecodeSplit(encoded, 5);
     Check(global_id_frame.has_value() && global_id_frame->frame_size != 0 &&
-              global_id_frame->has_global_id &&
               fragmented_global_id_frame.has_value() &&
-              fragmented_global_id_frame->frame_size == global_id_frame->frame_size &&
-              fragmented_global_id_frame->has_global_id,
+              fragmented_global_id_frame->frame_size == global_id_frame->frame_size,
           "exact eight-byte Mux GlobalID was rejected");
 
     encoded.push_back(0x43);

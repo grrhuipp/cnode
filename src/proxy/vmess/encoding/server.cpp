@@ -186,12 +186,11 @@ public:
     }
 
     RequestBodyReader(const VMessRequest& request,
-                      AsyncStream& stream,
-                      TargetAddress udp_target)
+                      AsyncStream& stream)
         : decoder_(RequestBodyOptions(request), RequestBodyKey(request), RequestBodyKey(request))
         , stream_(stream)
         , is_udp_(request.command == Command::UDP)
-        , udp_target_(std::move(udp_target)) {}
+        , udp_target_(request.target) {}
 
     RequestBodyReader(const RequestBodyReader&) = delete;
     RequestBodyReader& operator=(const RequestBodyReader&) = delete;
@@ -220,11 +219,10 @@ public:
     ResponseBodyWriter(const VMessRequest& request,
                        const BodyKey& response,
                        AsyncStream& stream,
-                       TargetAddress udp_target,
                        const std::array<uint8_t, kResponseHeaderSize>& response_header)
         : encoder_(RequestBodyOptions(request), RequestBodyKey(request), response)
         , stream_(stream)
-        , udp_target_(std::move(udp_target))
+        , udp_target_(request.target)
         , response_header_(response_header) {}
 
     ResponseBodyWriter(const ResponseBodyWriter&) = delete;
@@ -415,21 +413,19 @@ void ServerSession::SetRequest(VMessRequest request) {
 }
 
 std::unique_ptr<transport::MultiBufferReader> ServerSession::DecodeRequestBody(
-    AsyncStream& stream,
-    const TargetAddress& udp_target) {
+    AsyncStream& stream) {
     if (!request_set_) {
         return nullptr;
     }
     try {
-        return std::make_unique<RequestBodyReader>(request_, stream, udp_target);
+        return std::make_unique<RequestBodyReader>(request_, stream);
     } catch (...) {
         return nullptr;
     }
 }
 
 std::unique_ptr<transport::MultiBufferWriter> ServerSession::EncodeResponseBodyWithHeader(
-    AsyncStream& stream,
-    const TargetAddress& udp_target) {
+    AsyncStream& stream) {
     if (!request_set_) {
         return nullptr;
     }
@@ -440,7 +436,7 @@ std::unique_ptr<transport::MultiBufferWriter> ServerSession::EncodeResponseBodyW
             return nullptr;
         }
         return std::make_unique<ResponseBodyWriter>(
-            request_, response, stream, udp_target, response_header);
+            request_, response, stream, response_header);
     } catch (...) {
         return nullptr;
     }

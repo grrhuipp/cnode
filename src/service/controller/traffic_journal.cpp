@@ -11,7 +11,6 @@
 #include <cerrno>
 #include <cstdlib>
 #include <limits>
-#include <map>
 #include <stdexcept>
 #include <system_error>
 #include <unordered_map>
@@ -111,7 +110,6 @@ void TrafficJournal::CheckHealthy() const {
     if (failed_) throw std::runtime_error("traffic journal I/O failed; reporting suspended until restart and reconciliation");
 }
 void TrafficJournal::Suspend() noexcept {
-    std::lock_guard lock(mutex_);
     failed_ = true;
 }
 void TrafficJournal::SyncDirectory() {
@@ -119,31 +117,17 @@ void TrafficJournal::SyncDirectory() {
 }
 void TrafficJournal::Append(const app::UserTrafficSnapshot& traffic) {
     if (traffic.empty()) return;
-    std::lock_guard lock(mutex_);
     CheckHealthy();
     constexpr uint64_t max_value = static_cast<uint64_t>(INT64_MAX);
-    std::map<int64_t, app::UserTraffic> merged;
-    const auto merge_rows = [&](const app::UserTrafficCounters& counters) {
-        for (const auto& [uid, value] : counters) {
-            if (uid <= 0 || value.upload > max_value || value.download > max_value) {
-                throw std::runtime_error("traffic exceeds UniProxy signed integer range");
-            }
-            if (value.upload == 0 && value.download == 0) continue;
-            auto& merged_entry = merged[uid];
-            if (merged_entry.upload > max_value - value.upload ||
-                merged_entry.download > max_value - value.download) {
-                throw std::runtime_error("traffic exceeds UniProxy signed integer range");
-            }
-            merged_entry.upload += value.upload;
-            merged_entry.download += value.download;
-        }
-    };
-    merge_rows(traffic);
-    if (merged.empty()) return;
     json::array rows;
-    for (const auto& [uid, value] : merged) {
+    for (const auto& [uid, value] : traffic.users) {
+        if (uid <= 0 || value.upload > max_value || value.download > max_value) {
+            throw std::runtime_error("traffic exceeds UniProxy signed integer range");
+        }
+        if (value.upload == 0 && value.download == 0) continue;
         rows.push_back(json::array{uid, value.upload, value.download});
     }
+    if (rows.empty()) return;
     const auto text = json::serialize(json::value(std::move(rows)));
     size_t bytes = 0, records = 0;
     for (const auto& entry : std::filesystem::directory_iterator(directory_)) {
@@ -199,7 +183,6 @@ void TrafficJournal::Append(const app::UserTrafficSnapshot& traffic) {
     }
 }
 TrafficJournal::Batch TrafficJournal::Prepare() {
-    std::lock_guard lock(mutex_);
     CheckHealthy();
     try {
         Batch result;
@@ -243,7 +226,6 @@ TrafficJournal::Batch TrafficJournal::Prepare() {
     }
 }
 void TrafficJournal::Begin(Batch& batch) {
-    std::lock_guard lock(mutex_);
     CheckHealthy();
     if (batch.records.empty()) return;
     try {
@@ -261,7 +243,6 @@ void TrafficJournal::Begin(Batch& batch) {
     } catch (...) { failed_ = true; throw; }
 }
 void TrafficJournal::Acknowledge(const Batch& batch) {
-    std::lock_guard lock(mutex_);
     CheckHealthy();
     if (batch.records.empty()) return;
     try {
@@ -270,7 +251,6 @@ void TrafficJournal::Acknowledge(const Batch& batch) {
     } catch (...) { failed_ = true; throw; }
 }
 size_t TrafficJournal::UnknownCount() {
-    std::lock_guard lock(mutex_);
     size_t count = 0;
     for (const auto& entry : std::filesystem::directory_iterator(directory_)) {
         if (entry.path().extension() == ".unknown") ++count;

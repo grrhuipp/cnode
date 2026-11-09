@@ -526,7 +526,7 @@ void WsResume(bool client, bool multi_buffer, size_t size, size_t cut, uint8_t o
     ::tcp::socket socket(io), peer(io);
     socket.connect(acceptor.local_endpoint());
     acceptor.accept(peer);
-    ::BaseWsStream stream(std::make_unique<::TcpStream>(std::move(socket)), 0, client);
+    ::BaseWsStream stream(std::make_unique<::TcpStream>(std::move(socket)), client);
     std::string payload(size, '\0');
     for (size_t i = 0; i < size; ++i) payload[i] = static_cast<char>(i % 251);
     if (opcode == 8) payload = size == 0 ? "" : std::string("\x03\xe8", 2) + "bye";
@@ -627,7 +627,7 @@ void WsWriteBoundary(WsConcurrent action, bool owned) {
     socket.connect(acceptor.local_endpoint());
     acceptor.accept(peer);
     socket.set_option(net::socket_base::send_buffer_size(4096));
-    ::WsClientStream stream(std::make_unique<::TcpStream>(std::move(socket)), 0);
+    ::BaseWsStream stream(std::make_unique<::TcpStream>(std::move(socket)), true);
     std::string payload(1024 * 1024 + 19, '\0');
     for (size_t i = 0; i < payload.size(); ++i) payload[i] = static_cast<char>(i % 251);
     bool data_done = false, control_done = false;
@@ -732,7 +732,7 @@ void WsReject(std::string_view frame, bool client, bool multi_buffer) {
     ::tcp::socket socket(io), peer(io);
     socket.connect(acceptor.local_endpoint());
     acceptor.accept(peer);
-    ::BaseWsStream stream(std::make_unique<::TcpStream>(std::move(socket)), 0, client);
+    ::BaseWsStream stream(std::make_unique<::TcpStream>(std::move(socket)), client);
     stream.SetPendingData(reinterpret_cast<const uint8_t*>(frame.data()), frame.size());
     peer.shutdown(::tcp::socket::shutdown_send);
     bool rejected = false, done = false;

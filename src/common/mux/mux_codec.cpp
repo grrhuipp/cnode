@@ -80,7 +80,6 @@ constexpr size_t kMaxFramePrefixBytes = 2 + kMaxFrameMetadataBytes + 2;
             if (!meta.Skip(8)) {
                 return false;
             }
-            out.has_global_id = true;
         }
     }
 

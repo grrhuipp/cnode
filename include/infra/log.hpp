@@ -150,11 +150,6 @@ private:
         if (::Log::ShouldLog(::LogLevel::ERROR)) \
             ::Log::WriteConsole(::LogLevel::ERROR, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__)); \
     } while (0)
-#define LOG_CONSOLE_DEBUG(fmt_str, ...) \
-    do { \
-        if (::Log::ShouldLog(::LogLevel::DEBUG)) \
-            ::Log::WriteConsole(::LogLevel::DEBUG, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__)); \
-    } while (0)
 
 #define LOG_PANEL_INFO(ctx, fmt_str, ...) \
     do { \
@@ -177,11 +172,6 @@ private:
             ::Log::WritePanel(::LogLevel::DEBUG, ctx, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__)); \
     } while (0)
 
-#define LOG_TRACE(fmt_str, ...) \
-    do { \
-        if (::Log::ShouldLog(::LogLevel::TRACE)) \
-            ::Log::WriteSystem(::LogLevel::TRACE, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__)); \
-    } while (0)
 #define LOG_DEBUG(fmt_str, ...) \
     do { \
         if (::Log::ShouldLog(::LogLevel::DEBUG)) \
@@ -213,11 +203,6 @@ private:
         if (::Log::ShouldLog(::LogLevel::DEBUG)) \
             ::Log::WriteConnection(::LogLevel::DEBUG, ctx, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__)); \
     } while (0)
-#define LOG_CONN_INFO(ctx, fmt_str, ...) \
-    do { \
-        if (::Log::ShouldLog(::LogLevel::INFO)) \
-            ::Log::WriteConnection(::LogLevel::INFO, ctx, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__)); \
-    } while (0)
 #define LOG_CONN_WARN(ctx, fmt_str, ...) \
     do { \
         if (::Log::ShouldLog(::LogLevel::WARN)) \
@@ -231,11 +216,6 @@ private:
 
 // Connection diagnostics without a session Context (transport parsing,
 // listener admission, and other pre-session paths).
-#define LOG_NET_TRACE(fmt_str, ...) \
-    do { \
-        if (::Log::ShouldLog(::LogLevel::TRACE)) \
-            ::Log::WriteConnection(::LogLevel::TRACE, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__)); \
-    } while (0)
 #define LOG_NET_DEBUG(fmt_str, ...) \
     do { \
         if (::Log::ShouldLog(::LogLevel::DEBUG)) \

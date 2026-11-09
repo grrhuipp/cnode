@@ -4,6 +4,12 @@
 #include "transport/phase_deadline.hpp"
 #include "transport/internet/timeout_scheduler.hpp"
 
+#include "common/allocator.hpp"
+#include <asio/as_tuple.hpp>
+#include <asio/bind_allocator.hpp>
+#include <asio/bind_cancellation_slot.hpp>
+#include <asio/cancellation_signal.hpp>
+#include <asio/use_awaitable.hpp>
 #include <chrono>
 #include <cstdint>
 #include <new>
@@ -225,5 +231,40 @@ private:
     bool idle_enabled_ = false, read_pending_ = false, write_pending_ = false, stopped_ = false;
     bool idle_expired_ = false, read_expired_ = false, write_expired_ = false, phase_expired_ = false;
 };
+
+template <class Socket>
+net::awaitable<IoErrorCode> WaitSocket(
+    Socket& socket,
+    typename Socket::wait_type type,
+    net::cancellation_slot cancellation,
+    const std::uint64_t& cancellation_epoch) {
+    struct State {
+        net::cancellation_signal native;
+        bool cancelled = false;
+    } state;
+    struct Subscription {
+        net::cancellation_slot slot;
+        ~Subscription() { if (slot.is_connected()) slot.clear(); }
+    } subscription{cancellation};
+    const auto cancelled_at = cancellation_epoch;
+    if (cancellation.is_connected()) {
+        cancellation.assign([&state](net::cancellation_type kind) {
+            if (kind == net::cancellation_type::none) return;
+            state.cancelled = true;
+            state.native.emit(kind);
+        });
+    }
+    auto [error] = co_await socket.async_wait(
+        type,
+        net::bind_cancellation_slot(
+            state.native.slot(),
+            net::bind_allocator(
+                memory::ProcessAllocator<std::byte>{},
+                net::as_tuple(net::use_awaitable))));
+    state.native.slot().clear();
+    if (state.cancelled || cancelled_at != cancellation_epoch)
+        co_return IoErrorCode(io_error::operation_aborted);
+    co_return error;
+}
 
 }  // namespace transport::internet::detail

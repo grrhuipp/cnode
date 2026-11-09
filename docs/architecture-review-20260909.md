@@ -1373,3 +1373,34 @@ CI失败场景修复后通过真实双进程、ML-KEM/X25519加密和回环对�
 - **VLESS/TLS 与 Hysteria2 真实进程基准（`cnode_tls_throughput_benchmark` / `cnode_hysteria_throughput_benchmark`）**：
   - VLESS/TLS 8 流上传吞吐由 `580.65 / 259.62 MiB/s` 升至 **`602.35 / 609.21 MiB/s`**，守护进程 CPU 为 **`0.1692 / 0.1665s`**，峰值 RSS 由 `14,450,688 / 14,479,360 B` 降至 **`14,397,440 / 14,450,688 B`**。
   - Hysteria2 256 连接上传/下载守护进程 CPU 为 `1.451s / 1.558s`，传输完成活跃匿名内存由 `31,428,608 B` 降至 **`31,244,288 B`（减少 180 KiB）**，负载峰值 RSS 由 `39,608,320 / 39,493,632 B` 降至 **`39,350,272 B`（减少 140 ~ 252 KiB）**；16×64（1,024 流）上传就绪匿名内存由 `40.28 / 40.16 MiB` 降至 **`39.95 MiB`（减少 204 ~ 320 KiB）**，负载峰值 RSS 由 `48.82 / 48.68 MiB` 降至 **`48.57 MiB`**。
+
+## 2026-11-09（再续）：主链路 `route_target` 零冗余拷贝、传输/协议层去重与控制面单层化
+
+### 架构与流程精简内容
+
+1. **主链路 `route_target` 零冗余拷贝与消除 `DetectRulePolicy::Blocked` 二次正则扫描**：
+   - `src/proxy/inbound_admission.hpp` (`BindInboundRequestTarget`)：初始绑定时将 `ctx.outbound.route_target` 置为空 `{}`（仅在 `ApplySniffOverride` 的 `sniffing.route_only` 分支才填充 `route_target`），消除每次域名请求在嗅探前多做一次 `TargetAddress` 字符串分配与拷贝，并修复 DNS 路由填充 `target.resolved_addr` 后 `DetectRulePolicy::Blocked` 因 `original_target.resolved_addr` 为空而对同一 `host:port` 将全部审计正则规则重跑第二遍的问题。
+   - `src/proxy/freedom/freedom_outbound.cpp`：删除路由已结束后的 `ctx.outbound.route_target` 死写入，并复用 `infra::ParseOptionalOutboundBind` 统一 `sendThrough` / `sendThroughStrategy` 校验。
+2. **传输层 `WaitSocket` / `SendMultiBuffer` 收敛、WebSocket 类树扁平化与 REALITY 冗余清理**：
+   - `src/transport/internet/connection_timeouts.hpp`、`tcp_stream.cpp`、`datagram_socket.cpp`：提取泛型 `detail::WaitSocket` 统一 TCP 与 UDP 套接字 readiness 等待（`TcpStream::Impl::Wait` 与 `DatagramSocket::Impl::Wait` 直接返回 `awaitable` 省去一层协程包装）；`DatagramSocket::Impl::SendMultiBuffer` 经 `ConstBufferSpanBuilder` 直接委托给 `SendBuffers`，删除 `MultiBufferSequence` 与 40 行重复发送循环。
+   - `include/transport/internet/ws_stream.hpp`、`src/transport/internet/ws_stream.cpp`：将 `BaseWsStream` 标记为 `final`，移除稳态转发期从不读取的 8 字节 `conn_id_` 常驻字段（改为 `Handshake` 参数传入），删除空壳派生类 `WsServerStream` 与 `WsClientStream`。
+   - `src/transport/internet/reality_tls.hpp/.cpp`：提取 `ComputeRealityTranscriptHmac` 复用客户端与服务端 Transcript HMAC 计算，删除恒为 `true` 的 `RealityServerConnState::authenticated` 字段，并在 `VerifyRealityClientHelloHandshake` 中原地掩码/恢复 `session_id` 消除额外 `aad` 整包拷贝。
+3. **协议层 Protobuf Varint 权威实现、VLESS 0-RTT 内存池化与 `VlessEncryptedIo` 零堆分配**：
+   - `include/common/byte_reader.hpp`、`src/transport/internet/grpc_hunk.cpp`、`src/proxy/vless/vless_codec.cpp`：在 `ByteReader` 中提供权威 `ReadVarintU64()`，消除 `grpc_hunk.cpp` 与 `vless_codec.cpp` 的重复 Varint 实现；在 `ParseHeaderAddons` 内闭环校验非空 `flow`，移除 `vless::RequestHeader::addons_len` 与 `mux::FrameHeader::has_global_id` 冗余字段。
+   - `src/proxy/vless/vless_ticket_service.cpp`：改用 `memory::ThreadLocalString` 与带透明查找的 `memory::ThreadLocalUnorderedMap`，消除 0-RTT Ticket 查询/签发向系统全局分配器的穿透；`vless_inbound.cpp` 与 `vless_outbound.cpp` 将 `VlessEncryptedIo` 改为协程帧内 `std::optional` 原地构造，并移除单字段包装 `UdpIoState`。
+   - `src/proxy/vless/udp_framing.cpp`、`src/proxy/trojan/udp_framing.cpp`：`WriteUdpDatagram(MultiBuffer)` 委托给 `span<const_buffer>` 重载；内联并删除微型碎片文件 `src/proxy/trojan/credentials.cpp` 与 `src/transport/internet/reality_server_name.cpp`；移除 VMess 出站无读者且未擦除的 `MemoryAccount::uuid` 字段与 `ServerSession` 双参数转发重载。
+4. **控制面与 V2Board 客户端单层化、流量日志去锁去红黑树与 `NodeSnapshot::rules` 零拷贝共享**：
+   - `include/api/api.hpp`、`src/api/v2board/v2board.cpp`、`http_response.hpp`、`online_report.cpp`：合并删除 `include/api/panel_factory.hpp`，消除 `APIClient::Impl` 双层 Pimpl 与纯转发虚函数，提取 `FetchConditionalResource` 复用条件 GET 逻辑；`http_response.hpp` 改用 `buffer.data()` 块拷贝替代 `std::istreambuf_iterator<char>` 逐字节流迭代；`BuildOnlineReportPayload` 改用单次排序去重线性构造替代 `std::map<int64_t, std::set<std::string>>` 红黑树。
+   - `src/service/controller/*`：`TrafficJournal` 移除无并发争用的 `std::mutex` 与 `Append` 中的 `std::map` 二次聚合；`NodeSnapshot::rules` 与 `NodeRuntime::UpdateRules` 改为 `std::shared_ptr<const std::vector<rule::DetectRule>>` 消除 304 刷新与规则发布时的两次 `std::vector<std::regex>` 深拷贝；合并删除微型碎片头文件 `tls_policy.hpp` 与 `panel_schedule.hpp`；清理 `infra/json`、`infra/log`、`runtime_config_types` 中的零调用死函数/死宏。
+
+### 验证与性能/内存实证
+
+全量 **1,251/1,251** 测试通过（325 项 unit、926 项 E2E）。在同一环境与编译选项下执行 A/B/A/B 交错重复基准对照：
+
+- **TCP 接收与发送基准（`cnode_tcp_receive_benchmark` / `cnode_tcp_send_benchmark`）**：
+  - `tcp-receive 8192B`：单次 burst 墙钟耗时由 `15,702.0 / 15,723.7 ns` 降至 **`14,213.2 / 14,291.8 ns`（稳定下降 -9.1% ~ -9.5%）**，CPU 耗时由 `13,100.4 / 13,146.9 ns` 降至 **`11,905.7 / 11,984.1 ns`（-8.8% ~ -9.1%）**；`1B` burst 墙钟耗时由 `11,777.3 / 11,504.2 ns` 降至 **`10,383.8 / 11,230.2 ns`（最高 -11.8%）**。
+  - `tcp-send 65536B (16 pieces)`：单次 burst 墙钟耗时由 `47,772.7 / 46,866.1 ns` 降至 **`46,123.8 / 44,497.0 ns`（-3.5% ~ -5.1%）**。
+- **运行时统计采样与真实进程基准（`cnode_runtime_sampling_benchmark` / `cnode_tls_throughput_benchmark` / `cnode_hysteria_throughput_benchmark`）**：
+  - 64 活跃会话统计采样保持 **`68.49 / 68.33 ns`**（`resources=0`，`p50 = 30.0 ns`）与 **`85.91 / 86.03 ns`**（`resources=1`，`p50 = 50.0 ns`），0 次堆分配，内存池 `settled_pool_bytes = 233,472 B`。
+  - VLESS/TLS 启动驻留 RSS（`server_started`）由 `13,082,624 / 13,086,720 B` 降至 **`13,021,184 / 13,017,088 B`（减少 60 ~ 68 KiB）**，8 流上传吞吐达 **`597.92 / 674.52 MiB/s`**。
+  - Hysteria2 256 连接下载负载峰值 RSS 由 `98,988,032 / 98,164,736 B` 降至 **`97,865,728 / 97,308,672 B`（减少 836 KiB ~ 1.07 MiB）**；16×64（1,024 流）下载守护进程 CPU 由 `4.002 / 3.960s` 降至 **`3.886 / 3.911s`**。

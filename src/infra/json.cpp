@@ -206,7 +206,6 @@ bool value::is_string() const noexcept { return std::holds_alternative<std::stri
 bool value::is_int64() const noexcept { return std::holds_alternative<int64_t>(data_); }
 bool value::is_uint64() const noexcept { return std::holds_alternative<uint64_t>(data_); }
 bool value::is_double() const noexcept { return std::holds_alternative<double>(data_); }
-bool value::is_number() const noexcept { return is_int64() || is_uint64() || is_double(); }
 bool value::is_object() const noexcept { return std::holds_alternative<object_ptr>(data_); }
 bool value::is_array() const noexcept { return std::holds_alternative<array_ptr>(data_); }
 

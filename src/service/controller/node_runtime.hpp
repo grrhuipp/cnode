@@ -31,7 +31,7 @@ public:
     net::awaitable<void> RemoveOutbound(const std::string& tag);
     net::awaitable<bool> AddInbound(const PreparedInbound& inbound);
     net::awaitable<void> AddOutbound(const proxyman::outbound::PreparedOutboundConfig& prepared);
-    net::awaitable<void> UpdateRules(const std::string& tag, const std::vector<rule::DetectRule>& rules);
+    net::awaitable<void> UpdateRules(const std::string& tag, std::shared_ptr<const std::vector<rule::DetectRule>> rules);
     net::awaitable<void> ApplyUsers(const std::string& tag, const proxyman::inbound::UserSet& users);
     net::awaitable<void> ClearUsers(const std::string& tag, const std::string& protocol);
     net::awaitable<void> RecoverUsers();

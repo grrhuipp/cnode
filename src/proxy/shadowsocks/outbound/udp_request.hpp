@@ -22,13 +22,7 @@ public:
                ForwardedMetadataView forwarded = {})
         : OutboundDatagramEndpointBase(io, bind_address), dns_(dns), server_(std::move(server)),
           cipher_info_(cipher_info), master_key_(master_key), psk_chain_(psk_chain) {
-        if (!forwarded.Empty()) {
-            auto& owned = forwarded_.emplace();
-            owned.user_id = forwarded.user_id;
-            owned.user_email.assign(forwarded.user_email.data(), forwarded.user_email.size());
-            owned.client_ip = forwarded.client_ip;
-            owned.inbound_tag.assign(forwarded.inbound_tag.data(), forwarded.inbound_tag.size());
-        }
+        forwarded_ = ForwardedMetadata::FromView(forwarded);
         if (ss::Is2022Cipher(cipher_info_.type)) {
             ss2022_state_.emplace();
             if (!ss::Init2022UdpSessionState(*ss2022_state_, cipher_info_, master_key_))

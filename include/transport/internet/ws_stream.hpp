@@ -103,12 +103,18 @@ inline EncodedFrameHeader EncodeFrameHeader(
 
 // One read operation owns the incremental decoder; one gate owns every complete
 // physical write, including control frames and the closing handshake.
-class BaseWsStream : public AsyncStream {
+class BaseWsStream final : public AsyncStream {
 public:
     static constexpr size_t kMaxFrameSize = 4 * 1024 * 1024;
 
-    BaseWsStream(std::unique_ptr<AsyncStream> inner, uint64_t conn_id, bool is_client);
+    BaseWsStream(std::unique_ptr<AsyncStream> inner, bool is_client);
     ~BaseWsStream() noexcept override;
+
+    net::awaitable<WsHandshakeResult> Handshake(
+        std::string_view host,
+        std::string_view path,
+        const transport::internet::HttpHeaders* headers = nullptr,
+        uint64_t conn_id = 0);
 
     transport::EofAction ReadEofAction() const noexcept override {
         return transport::EofAction::CloseLink;
@@ -134,15 +140,13 @@ public:
     bool IsOpen() const override;
     int NativeHandle() const override;
 
-protected:
+private:
     TcpStream* BaseTcpStream() override;
     const TcpStream* BaseTcpStream() const override;
 
     std::unique_ptr<AsyncStream> inner_;
-    uint64_t conn_id_;
     bool is_client_;
 
-private:
     using WriteGate = transport::internet::AsyncWriteGate;
     enum class ReadStage { Header, Length, Mask, Payload, Control };
 
@@ -194,20 +198,4 @@ private:
     WriteGate write_gate_;
 };
 
-class WsServerStream final : public BaseWsStream {
-public:
-    WsServerStream(std::unique_ptr<AsyncStream> inner, uint64_t conn_id)
-        : BaseWsStream(std::move(inner), conn_id, false) {}
-};
-
-class WsClientStream final : public BaseWsStream {
-public:
-    WsClientStream(std::unique_ptr<AsyncStream> inner, uint64_t conn_id)
-        : BaseWsStream(std::move(inner), conn_id, true) {}
-
-    net::awaitable<WsHandshakeResult> Handshake(
-        std::string_view host,
-        std::string_view path,
-        const transport::internet::HttpHeaders* headers = nullptr);
-};
 

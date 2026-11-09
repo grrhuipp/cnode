@@ -211,6 +211,17 @@ struct ForwardedMetadata {
                inbound_tag.empty();
     }
 
+    [[nodiscard]] static std::optional<ForwardedMetadata> FromView(
+        ForwardedMetadataView view) {
+        if (view.Empty()) return std::nullopt;
+        ForwardedMetadata owned;
+        owned.user_id = view.user_id;
+        owned.user_email.assign(view.user_email.data(), view.user_email.size());
+        owned.client_ip = view.client_ip;
+        owned.inbound_tag.assign(view.inbound_tag.data(), view.inbound_tag.size());
+        return owned;
+    }
+
     [[nodiscard]] ForwardedMetadataView View() const& noexcept {
         return ForwardedMetadataView{
             .user_id = user_id,

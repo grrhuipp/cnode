@@ -125,7 +125,6 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     if (redirect_target_) {
         LOG_CONN_DEBUG(ctx, "redirect {} -> {}",
                        ctx.outbound.target, *redirect_target_);
-        ctx.outbound.route_target = *redirect_target_;
         ctx.outbound.target = *redirect_target_;
     }
 
@@ -253,17 +252,12 @@ const bool kFreedomRegistered = (::proxyman::outbound::RegisterProxy(
         ::OutboundSenderSettings sender{.stream_settings = {},
                                             .send_through = ::OutboundBind::Auto()};
 
-        if (s.contains("send_through")) return std::nullopt;
-        const auto* nested_send_through = s.if_contains("sendThrough");
-        const auto* nested_strategy = s.if_contains("sendThroughStrategy");
-        if (nested_strategy && !nested_send_through) return std::nullopt;
-        if (nested_send_through) {
-            try {
-                sender.send_through = ::infra::ParseOutboundBindConfig(
-                    *nested_send_through, nested_strategy);
-            } catch (const std::invalid_argument&) {
-                return std::nullopt;
+        try {
+            if (auto bind = ::infra::ParseOptionalOutboundBind(s, "freedom")) {
+                sender.send_through = std::move(*bind);
             }
+        } catch (const std::invalid_argument&) {
+            return std::nullopt;
         }
         const auto domain_strategy =
             ::proxy::freedom::outbound::ParseConfiguredDomainStrategy(s);

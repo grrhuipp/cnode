@@ -3,7 +3,6 @@
 #include "node_transaction.hpp"
 #include "node_runtime.hpp"
 #include "panel_inbound.hpp"
-#include "panel_schedule.hpp"
 #include "../../proxy/freedom/freedom_outbound.hpp"
 
 #include "app/prepared_inbound.hpp"
@@ -399,7 +398,8 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(PanelRuntime& panel) {
         co_return;
     }
     auto candidate = std::make_shared<controller::NodeSnapshot>();
-    candidate->config = fetched_config;
+    candidate->config = config_result.not_modified
+        ? old_state->config : std::move(*config_result.node_info);
     candidate->config_etag = config_result.not_modified
         ? old_state->config_etag : std::move(config_result.etag);
     candidate->tag = tag;
@@ -407,7 +407,9 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(PanelRuntime& panel) {
     candidate->users_etag = next_users
         ? std::move(users_result.etag) : old_state->users_etag;
     candidate->rules = config_result.not_modified
-        ? old_state->rules : std::move(config_result.rules);
+        ? old_state->rules
+        : std::make_shared<const std::vector<rule::DetectRule>>(
+              std::move(config_result.rules));
     const bool rebuild_settings = !old_state ||
         controller::NodeConfigChanged(old_state->config, candidate->config);
     if (rebuild_settings) {
@@ -443,11 +445,11 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(PanelRuntime& panel) {
         throw std::logic_error("node admission requires completed local cleanup");
     }
     for (const auto& other : panels_) {
-        if (other.get() != &panel && other->node.ReservesPort(fetched_config.Port) &&
+        if (other.get() != &panel && other->node.ReservesPort(change.next->config.Port) &&
             other->config.ListenIP.Overlaps(panel.config.ListenIP)) {
             throw std::runtime_error(std::format(
                 "panel listener endpoint conflict owner={}/{} port={}",
-                other->config.Name, other->config.NodeIDs.Front(), fetched_config.Port));
+                other->config.Name, other->config.NodeIDs.Front(), change.next->config.Port));
         }
     }
     co_await controller::ApplyNodeChange(runtime, panel.node, std::move(change));
@@ -503,7 +505,7 @@ void Controller::Impl::logPanelStatus(const PanelRuntime& panel) const {
         committed_state.config.Port,
         ResolvedNodeNetwork(committed_state),
         committed_state.users.size(),
-        committed_state.rules.size(),
+        committed_state.rules ? committed_state.rules->size() : 0,
         pull_interval.count(),
         push_interval.count());
 }

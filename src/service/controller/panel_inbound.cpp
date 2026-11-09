@@ -1,5 +1,4 @@
 #include "panel_inbound.hpp"
-#include "tls_policy.hpp"
 
 #include "core/constants.hpp"
 #include "core/naming.hpp"
@@ -32,9 +31,6 @@ namespace {
         stream.tls.key_file = panel_config.TLSKey;
         stream.tls.server_name = node_config.TLSServerName;
         stream.tls.pem = panel_config.TLSPem;
-        if (!panel_config.TLSPem && !stream.tls.cert_file.empty()) {
-            LoadTlsPemMaterial(stream.tls);
-        }
     }
 
     // Fill the transport sub-config first: normalization derives cached

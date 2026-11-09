@@ -1,4 +1,4 @@
-#include "api/panel_factory.hpp"
+#include "api/api.hpp"
 #include "common/ip_address.hpp"
 #include "common/ip_utils.hpp"
 #include "core/naming.hpp"
@@ -33,29 +33,6 @@
 namespace api::v2board {
 
 namespace ssl = net::ssl;
-
-class APIClient final : public ::api::API {
-public:
-    APIClient(net::io_context& io_context, const ::api::Config& config,
-              ::app::dns::DNS& dns_service);
-    ~APIClient() override;
-
-    net::awaitable<NodeInfoFetchResult>
-    GetNodeInfo(std::string committed_etag) override;
-
-    net::awaitable<UserListFetchResult>
-    GetUserList(std::string committed_etag) override;
-
-    net::awaitable<bool>
-    ReportNodeOnlineUsers(const std::vector<::api::OnlineUser>& online_users) override;
-
-    net::awaitable<bool>
-    ReportUserTraffic(const std::vector<::api::UserTraffic>& data) override;
-
-private:
-    struct Impl;
-    std::unique_ptr<Impl> impl_;
-};
 
 namespace {
 
@@ -229,12 +206,29 @@ ExtractBlockDetectRules(const json::object& config) {
 // APIClient 实现
 // ============================================================================
 
-struct APIClient::Impl {
-    Impl(net::io_context& io_context,
-         const ::api::Config& config,
-         ::app::dns::DNS& dns_service);
+class APIClient final : public ::api::API {
+public:
+    APIClient(net::io_context& io_context,
+              const ::api::Config& config,
+              ::app::dns::DNS& dns_service);
+    ~APIClient() override = default;
 
-    [[nodiscard]] const std::string& ApiNodeType() const noexcept;
+    net::awaitable<NodeInfoFetchResult>
+    GetNodeInfo(std::string committed_etag) override;
+
+    net::awaitable<UserListFetchResult>
+    GetUserList(std::string committed_etag) override;
+
+    net::awaitable<bool>
+    ReportNodeOnlineUsers(const std::vector<::api::OnlineUser>& online_users) override;
+
+    net::awaitable<bool>
+    ReportUserTraffic(const std::vector<::api::UserTraffic>& data) override;
+
+private:
+    [[nodiscard]] const std::string& ApiNodeType() const noexcept {
+        return api_node_type_;
+    }
 
     // Parameters are owned by the coroutine frame: RunRequest starts the
     // exchange lazily and may cancel it after the caller's arguments are gone.
@@ -250,10 +244,14 @@ struct APIClient::Impl {
                  std::string body_text,
                  std::string if_none_match);
 
-    net::awaitable<NodeInfoFetchResult> GetNodeInfo(std::string committed_etag);
-    net::awaitable<UserListFetchResult> GetUserList(std::string committed_etag);
-    net::awaitable<bool> ReportNodeOnlineUsers(const std::vector<::api::OnlineUser>& online_users);
-    net::awaitable<bool> ReportUserTraffic(const std::vector<::api::UserTraffic>& data);
+    template <typename FetchResult>
+    net::awaitable<tl::expected<HttpResponse, FetchResult>>
+    FetchConditionalResource(std::string_view endpoint,
+                             std::string committed_etag,
+                             const PanelLogContext& log_context,
+                             std::string_view missing_etag_error,
+                             std::string_view pull_failure_label,
+                             bool log_not_modified = false);
 
     net::io_context& io_context_;
     ::api::Config config_;
@@ -266,13 +264,12 @@ struct APIClient::Impl {
     std::unique_ptr<net::ssl::context> https_context_;
 };
 
-APIClient::Impl::Impl(net::io_context& io_context,
-                      const ::api::Config& config,
-                      ::app::dns::DNS& dns_service)
+APIClient::APIClient(net::io_context& io_context,
+                     const ::api::Config& config,
+                     ::app::dns::DNS& dns_service)
     : io_context_(io_context)
     , config_(config)
     , dns_service_(dns_service) {
-
     if (config_.RequestTimeout <= std::chrono::seconds::zero() ||
         config_.RequestTimeout > std::chrono::seconds(defaults::kMaxPanelRequestTimeout)) {
         throw std::invalid_argument("API RequestTimeout is outside the supported range");
@@ -306,16 +303,11 @@ APIClient::Impl::Impl(net::io_context& io_context,
     }
 }
 
-const std::string& APIClient::Impl::ApiNodeType() const noexcept {
-    return api_node_type_;
-}
-
-
 net::awaitable<HttpResponse>
-APIClient::Impl::HttpRequest(HttpMethod method,
-                             std::string path,
-                             std::string body_text,
-                             std::string if_none_match) {
+APIClient::HttpRequest(HttpMethod method,
+                       std::string path,
+                       std::string body_text,
+                       std::string if_none_match) {
     return http::RunRequest(
         HttpExchange(method, std::move(path), std::move(body_text),
                      std::move(if_none_match)),
@@ -323,10 +315,10 @@ APIClient::Impl::HttpRequest(HttpMethod method,
 }
 
 net::awaitable<HttpResponse>
-APIClient::Impl::HttpExchange(HttpMethod method,
-                              std::string path,
-                              std::string body_text,
-                              std::string if_none_match) {
+APIClient::HttpExchange(HttpMethod method,
+                        std::string path,
+                        std::string body_text,
+                        std::string if_none_match) {
     HttpResponse result;
     const PanelLogContext log_context{config_.Name, config_.APIHost, config_.NodeID, config_.NodeType};
 
@@ -476,33 +468,51 @@ APIClient::Impl::HttpExchange(HttpMethod method,
 
 }
 
-net::awaitable<NodeInfoFetchResult>
-APIClient::Impl::GetNodeInfo(std::string committed_etag) {
-    const int node_id = config_.NodeID;
-    const PanelLogContext log_context{config_.Name, config_.APIHost, node_id, config_.NodeType};
-
-    // GET /api/v1/server/UniProxy/config?node_id=X&node_type=Y
-    std::string path = std::format("/api/v1/server/UniProxy/config?node_id={}&node_type={}",
-                                   node_id, ApiNodeType());
-
+template <typename FetchResult>
+net::awaitable<tl::expected<HttpResponse, FetchResult>>
+APIClient::FetchConditionalResource(std::string_view endpoint,
+                                    std::string committed_etag,
+                                    const PanelLogContext& log_context,
+                                    std::string_view missing_etag_error,
+                                    std::string_view pull_failure_label,
+                                    bool log_not_modified) {
+    std::string path = std::format("/api/v1/server/UniProxy/{}?node_id={}&node_type={}",
+                                   endpoint, config_.NodeID, ApiNodeType());
     auto resp = co_await HttpRequest(HttpMethod::Get, std::move(path), {}, committed_etag);
     if (resp.not_modified) {
         if (committed_etag.empty()) {
-            co_return NodeInfoFetchResult::Fail(
+            co_return tl::unexpected(FetchResult::Fail(
                 ErrorCode::PANEL_INVALID_RESPONSE,
-                "received 304 without a committed node ETag");
+                std::string(missing_etag_error)));
         }
-        co_return NodeInfoFetchResult::NotModified();
+        if (log_not_modified) {
+            LOG_PANEL_DEBUG(log_context, "Node users unchanged: HTTP status=304");
+        }
+        co_return tl::unexpected(FetchResult::NotModified());
     }
-
     if (resp.status != 200) {
         const auto error_message = FormatHttpFailure(resp);
-        LOG_PANEL_DEBUG(log_context, "Node configuration pull failed: {}", error_message);
-        co_return NodeInfoFetchResult::Fail(
+        LOG_PANEL_DEBUG(log_context, "{}: {}", pull_failure_label, error_message);
+        co_return tl::unexpected(FetchResult::Fail(
             ErrorCode::PANEL_API_FAILED,
-            error_message);
+            error_message));
     }
+    co_return resp;
+}
 
+net::awaitable<NodeInfoFetchResult>
+APIClient::GetNodeInfo(std::string committed_etag) {
+    const PanelLogContext log_context{config_.Name, config_.APIHost, config_.NodeID, config_.NodeType};
+    auto fetched = co_await FetchConditionalResource<NodeInfoFetchResult>(
+        "config",
+        std::move(committed_etag),
+        log_context,
+        "received 304 without a committed node ETag",
+        "Node configuration pull failed");
+    if (!fetched) {
+        co_return std::move(fetched.error());
+    }
+    auto& resp = *fetched;
     try {
         auto jv = json::parse(resp.body);
         if (!jv.is_object()) {
@@ -537,37 +547,22 @@ APIClient::Impl::GetNodeInfo(std::string committed_etag) {
 }
 
 net::awaitable<UserListFetchResult>
-APIClient::Impl::GetUserList(std::string committed_etag) {
-    const int node_id = config_.NodeID;
-    const PanelLogContext log_context{config_.Name, config_.APIHost, node_id, config_.NodeType};
-
-    // GET /api/v1/server/UniProxy/user?node_id=X&node_type=Y
-    std::string path = std::format("/api/v1/server/UniProxy/user?node_id={}&node_type={}",
-                                   node_id, ApiNodeType());
+APIClient::GetUserList(std::string committed_etag) {
+    const PanelLogContext log_context{config_.Name, config_.APIHost, config_.NodeID, config_.NodeType};
 
     // Only the owner of a committed user snapshot may supply its validator.
     // A successful fetch alone must not acknowledge a failed runtime update.
-    auto resp = co_await HttpRequest(HttpMethod::Get, std::move(path), {}, committed_etag);
-
-    // 304 Not Modified - 交给上层直接跳过用户重建，避免额外常驻缓存和拷贝
-    if (resp.not_modified) {
-        if (committed_etag.empty()) {
-            co_return UserListFetchResult::Fail(
-                ErrorCode::PANEL_INVALID_RESPONSE,
-                "received 304 without a committed user ETag");
-        }
-        LOG_PANEL_DEBUG(log_context, "Node users unchanged: HTTP status=304");
-        co_return UserListFetchResult::NotModified();
+    auto fetched = co_await FetchConditionalResource<UserListFetchResult>(
+        "user",
+        std::move(committed_etag),
+        log_context,
+        "received 304 without a committed user ETag",
+        "User list pull failed",
+        true);
+    if (!fetched) {
+        co_return std::move(fetched.error());
     }
-
-    if (resp.status != 200) {
-        const auto error_message = FormatHttpFailure(resp);
-        LOG_PANEL_DEBUG(log_context, "User list pull failed: {}", error_message);
-        co_return UserListFetchResult::Fail(
-            ErrorCode::PANEL_API_FAILED,
-            error_message);
-    }
-
+    auto& resp = *fetched;
     try {
         auto jv = json::parse(resp.body);
         if (!jv.is_object()) {
@@ -596,7 +591,7 @@ APIClient::Impl::GetUserList(std::string committed_etag) {
 }
 
 net::awaitable<bool>
-APIClient::Impl::ReportUserTraffic(const std::vector<::api::UserTraffic>& data) {
+APIClient::ReportUserTraffic(const std::vector<::api::UserTraffic>& data) {
     const int node_id = config_.NodeID;
     const PanelLogContext log_context{config_.Name, config_.APIHost, node_id, config_.NodeType};
 
@@ -635,7 +630,7 @@ APIClient::Impl::ReportUserTraffic(const std::vector<::api::UserTraffic>& data) 
 }
 
 net::awaitable<bool>
-APIClient::Impl::ReportNodeOnlineUsers(const std::vector<::api::OnlineUser>& online_users) {
+APIClient::ReportNodeOnlineUsers(const std::vector<::api::OnlineUser>& online_users) {
     const int node_id = config_.NodeID;
     const PanelLogContext log_context{config_.Name, config_.APIHost, node_id, config_.NodeType};
     auto report = BuildOnlineReportPayload(online_users, node_id);
@@ -654,34 +649,6 @@ APIClient::Impl::ReportNodeOnlineUsers(const std::vector<::api::OnlineUser>& onl
 
     LOG_PANEL_DEBUG(log_context, "Online devices reported: users={} devices={}", report.user_count, report.device_count);
     co_return true;
-}
-
-APIClient::APIClient(net::io_context& io_context,
-                     const ::api::Config& config,
-                     ::app::dns::DNS& dns_service)
-    : impl_(std::make_unique<Impl>(io_context, config, dns_service)) {}
-
-APIClient::~APIClient() = default;
-
-
-net::awaitable<NodeInfoFetchResult>
-APIClient::GetNodeInfo(std::string committed_etag) {
-    return impl_->GetNodeInfo(std::move(committed_etag));
-}
-
-net::awaitable<UserListFetchResult>
-APIClient::GetUserList(std::string committed_etag) {
-    return impl_->GetUserList(std::move(committed_etag));
-}
-
-net::awaitable<bool>
-APIClient::ReportNodeOnlineUsers(const std::vector<::api::OnlineUser>& online_users) {
-    return impl_->ReportNodeOnlineUsers(online_users);
-}
-
-net::awaitable<bool>
-APIClient::ReportUserTraffic(const std::vector<::api::UserTraffic>& data) {
-    return impl_->ReportUserTraffic(data);
 }
 
 }  // namespace api::v2board

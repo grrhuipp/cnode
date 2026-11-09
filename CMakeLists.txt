@@ -118,7 +118,6 @@ set(CNODE_CORE_SOURCES
     src/transport/internet/reality_client_version.cpp
     src/transport/internet/reality_key.cpp
     src/transport/internet/reality_key_share.cpp
-    src/transport/internet/reality_server_name.cpp
     src/transport/internet/reality_short_id.cpp
     src/transport/internet/reality_tls.cpp
     src/transport/internet/ws_stream.cpp
@@ -214,7 +213,6 @@ set(CNODE_CORE_SOURCES
 
     # Proxy - Trojan
     src/proxy/trojan/trojan_codec.cpp
-    src/proxy/trojan/credentials.cpp
     src/proxy/trojan/udp_framing.cpp
     src/proxy/trojan/inbound/trojan_inbound.cpp
     src/proxy/trojan/outbound/trojan_outbound.cpp

@@ -61,8 +61,10 @@ void ApplySniffOverride(
     if (!sniffed.IsValid() || !sniffed.IsDomain()) {
         return;
     }
-    ctx.outbound.route_target = sniffed;
-    if (!sniffing.route_only) {
+    if (sniffing.route_only) {
+        ctx.outbound.route_target = std::move(sniffed);
+    } else {
+        ctx.outbound.route_target = {};
         ctx.outbound.target = std::move(sniffed);
     }
 }

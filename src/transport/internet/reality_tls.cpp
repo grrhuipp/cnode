@@ -426,6 +426,40 @@ int RealityClientHelloCallback(SSL* /*ssl*/,
     return 1;
 }
 
+
+[[nodiscard]] bool ComputeRealityTranscriptHmac(
+    std::span<const uint8_t, 32> auth_key,
+    std::span<const uint8_t, 32> ed25519_public,
+    std::span<const uint8_t> client_hello,
+    std::span<const uint8_t> server_hello,
+    std::span<uint8_t, 64> out) noexcept {
+    HMAC_CTX hmac_ctx;
+    HMAC_CTX_init(&hmac_ctx);
+    struct CleanseHmac {
+        HMAC_CTX& ctx;
+        ~CleanseHmac() noexcept {
+            HMAC_CTX_cleanup(&ctx);
+            OPENSSL_cleanse(&ctx, sizeof(ctx));
+        }
+    } cleanse_hmac{hmac_ctx};
+    unsigned int out_len = 0;
+    return HMAC_Init_ex(&hmac_ctx,
+                        auth_key.data(),
+                        auth_key.size(),
+                        EVP_sha512(),
+                        nullptr) == 1 &&
+           HMAC_Update(&hmac_ctx,
+                       ed25519_public.data(),
+                       ed25519_public.size()) == 1 &&
+           HMAC_Update(&hmac_ctx,
+                       client_hello.data(),
+                       client_hello.size()) == 1 &&
+           HMAC_Update(&hmac_ctx,
+                       server_hello.data(),
+                       server_hello.size()) == 1 &&
+           HMAC_Final(&hmac_ctx, out.data(), &out_len) == 1 &&
+           out_len == out.size();
+}
 }  // namespace
 
 bool VerifyRealityClientHandshake(
@@ -509,36 +543,14 @@ bool VerifyRealityClientHandshake(
             return false;
         }
 
-        HMAC_CTX hmac_ctx;
-        HMAC_CTX_init(&hmac_ctx);
         std::array<uint8_t, 64> mldsa_msg{};
-        struct CleanseHmac {
-            HMAC_CTX& ctx;
-            std::array<uint8_t, 64>& msg;
-            ~CleanseHmac() noexcept {
-                HMAC_CTX_cleanup(&ctx);
-                OPENSSL_cleanse(&ctx, sizeof(ctx));
-                OPENSSL_cleanse(msg.data(), msg.size());
-            }
-        } cleanse_hmac{hmac_ctx, mldsa_msg};
-        unsigned int mldsa_msg_len = 0;
-        const bool hmac_ok =
-            HMAC_Init_ex(&hmac_ctx,
-                         state.auth_key.data(),
-                         state.auth_key.size(),
-                         EVP_sha512(),
-                         nullptr) == 1 &&
-            HMAC_Update(&hmac_ctx, peer_public.data(), peer_public.size()) == 1 &&
-            HMAC_Update(&hmac_ctx,
-                        state.client_hello_raw.data(),
-                        state.client_hello_raw.size()) == 1 &&
-            HMAC_Update(&hmac_ctx,
-                        state.server_hello_raw.data(),
-                        state.server_hello_raw.size()) == 1 &&
-            HMAC_Final(&hmac_ctx, mldsa_msg.data(), &mldsa_msg_len) == 1 &&
-            mldsa_msg_len == mldsa_msg.size();
-        // CleanseHmac handles cleanup and zeroing.
-        if (!hmac_ok) {
+        const ScopedCleanse wipe_mldsa_msg{mldsa_msg.data(), mldsa_msg.size()};
+        if (!ComputeRealityTranscriptHmac(
+                state.auth_key,
+                peer_public,
+                state.client_hello_raw,
+                state.server_hello_raw,
+                mldsa_msg)) {
             return false;
         }
 
@@ -702,41 +714,19 @@ void RealityServerMsgCallback(int is_write,
 
     auto* conn_state = static_cast<RealityServerConnState*>(
         SSL_get_ex_data(ssl, RealityConnStateExIndex()));
-    if (!conn_state || !conn_state->authenticated) {
+    if (!conn_state) {
         SSL_certs_clear(ssl);
         return;
     }
 
-    HMAC_CTX hmac_ctx;
-    HMAC_CTX_init(&hmac_ctx);
     std::array<uint8_t, 64> mldsa_msg{};
-    struct CleanseHmac {
-        HMAC_CTX& ctx;
-        std::array<uint8_t, 64>& msg;
-        ~CleanseHmac() noexcept {
-            HMAC_CTX_cleanup(&ctx);
-            OPENSSL_cleanse(&ctx, sizeof(ctx));
-            OPENSSL_cleanse(msg.data(), msg.size());
-        }
-    } cleanse_hmac{hmac_ctx, mldsa_msg};
-    unsigned int mldsa_msg_len = 0;
-    const bool hmac_ok =
-        HMAC_Init_ex(&hmac_ctx,
-                     conn_state->auth_key.data(),
-                     conn_state->auth_key.size(),
-                     EVP_sha512(),
-                     nullptr) == 1 &&
-        HMAC_Update(&hmac_ctx,
-                    state->ed25519_public.data(),
-                    state->ed25519_public.size()) == 1 &&
-        HMAC_Update(&hmac_ctx,
-                    conn_state->client_hello_raw.data(),
-                    conn_state->client_hello_raw.size()) == 1 &&
-        HMAC_Update(&hmac_ctx, bytes, len) == 1 &&
-        HMAC_Final(&hmac_ctx, mldsa_msg.data(), &mldsa_msg_len) == 1 &&
-        mldsa_msg_len == mldsa_msg.size();
-    // CleanseHmac handles cleanup and zeroing.
-    if (!hmac_ok) {
+    const ScopedCleanse wipe_mldsa_msg{mldsa_msg.data(), mldsa_msg.size()};
+    if (!ComputeRealityTranscriptHmac(
+            conn_state->auth_key,
+            state->ed25519_public,
+            conn_state->client_hello_raw,
+            std::span<const uint8_t>(bytes, len),
+            mldsa_msg)) {
         SSL_certs_clear(ssl);
         return;
     }
@@ -757,7 +747,7 @@ void RealityServerMsgCallback(int is_write,
 
 [[nodiscard]] std::unique_ptr<RealityServerConnState>
 VerifyRealityClientHelloHandshake(
-    std::span<const uint8_t> handshake,
+    memory::ByteVector handshake,
     const RealityServerState& state) {
     // This is the reassembled handshake, including its four-byte header.
     if (handshake.size() < 4 + 2 + 32 + 1 + 32 ||
@@ -772,13 +762,12 @@ VerifyRealityClientHelloHandshake(
         return nullptr;
     }
 
-    const auto body = handshake.subspan(4);
+    const auto body = std::span<const uint8_t>(handshake).subspan(4);
     const auto random = body.subspan(2, kRealityRandomSize);
     const size_t session_id_len = body[34];
     if (session_id_len != kRealitySessionIdSize || body.size() < 35 + session_id_len + 2) {
         return nullptr;
     }
-    const auto session_id = body.subspan(35, kRealitySessionIdSize);
     size_t pos = 35 + kRealitySessionIdSize;
 
     const size_t cipher_suites_len =
@@ -884,25 +873,24 @@ VerifyRealityClientHelloHandshake(
     }
     const ScopedCleanse wipe_auth{auth_key->data(), auth_key->size()};
 
-    memory::ByteVector aad(handshake.begin(), handshake.end());
-    std::fill_n(aad.data() + 4 + 35, kRealitySessionIdSize, uint8_t{0});
+    std::array<uint8_t, kRealitySessionIdSize> session_id{};
+    std::copy_n(handshake.data() + 4 + 35, kRealitySessionIdSize, session_id.data());
+    std::fill_n(handshake.data() + 4 + 35, kRealitySessionIdSize, uint8_t{0});
     auto plain = OpenRealitySessionId(
         *auth_key,
         std::span<const uint8_t, kRealityAesGcmNonceSize>(
             random.data() + 20, kRealityAesGcmNonceSize),
-        std::span<const uint8_t, kRealitySessionIdSize>(
-            session_id.data(), session_id.size()),
-        aad);
+        session_id,
+        handshake);
     if (!plain) return nullptr;
     const ScopedCleanse wipe_plain{plain->data(), plain->size()};
     if (!IsRealityClientAuthAllowed(state, *plain)) return nullptr;
 
     auto conn_state = std::make_unique<RealityServerConnState>();
     conn_state->auth_key = *auth_key;
-    conn_state->authenticated = true;
     if (state.mldsa65_key) {
-        std::copy(session_id.begin(), session_id.end(), aad.data() + 4 + 35);
-        conn_state->client_hello_raw = std::move(aad);
+        std::copy(session_id.begin(), session_id.end(), handshake.data() + 4 + 35);
+        conn_state->client_hello_raw = std::move(handshake);
     }
     return conn_state;
 }
@@ -931,10 +919,9 @@ VerifyRealityClientHelloHandshake(
     auto* conn_state = static_cast<RealityServerConnState*>(
         SSL_get_ex_data(hello->ssl, RealityConnStateExIndex()));
     std::unique_ptr<RealityServerConnState> verified;
-    if (!conn_state || !conn_state->authenticated) {
-        ClearRealityServerConnState(hello->ssl);
-        const auto framed = FramedClientHello(*hello);
-        verified = VerifyRealityClientHelloHandshake(framed, *state);
+    if (!conn_state) {
+        verified = VerifyRealityClientHelloHandshake(
+            FramedClientHello(*hello), *state);
         if (!verified) {
             return fail("client hello verification failed");
         }
@@ -1299,7 +1286,8 @@ std::unique_ptr<RealityServerConnState> VerifyRealityClientHello(
     if (!state) {
         return nullptr;
     }
-    return VerifyRealityClientHelloHandshake(handshake, *state);
+    return VerifyRealityClientHelloHandshake(
+        memory::ByteVector(handshake.begin(), handshake.end()), *state);
 }
 
 bool TlsStream::SetRealityServerPreverified(

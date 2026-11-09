@@ -1256,8 +1256,8 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                     if (hdr.network == mux::NetworkType::UDP) {
                         // ---- 新建 UDP 子会话 ----
                         LOG_CONN_DEBUG(parent_ctx,
-                            "new UDP sid={} target={} data={}B global_id={}",
-                            hdr.session_id, hdr.target, hdr.data_len, hdr.has_global_id);
+                            "new UDP sid={} target={} data={}B",
+                            hdr.session_id, hdr.target, hdr.data_len);
 
                         auto sub_state = std::make_unique<UdpSubState>(
                             io_context,

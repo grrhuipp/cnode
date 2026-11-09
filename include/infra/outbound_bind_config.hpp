@@ -4,8 +4,10 @@
 #include "transport/internet/outbound_bind.hpp"
 #include "transport/internet/http_headers.hpp"
 
+#include <optional>
 #include <stdexcept>
 #include <string_view>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -61,6 +63,26 @@ namespace infra {
         throw std::invalid_argument("sendThrough array contains an invalid IP/CIDR or is empty");
     }
     return std::move(*result);
+}
+
+[[nodiscard]] inline std::optional<OutboundBind> ParseOptionalOutboundBind(
+    const json::object& source, std::string_view context) {
+    if (source.contains("send_through") ||
+        source.contains("send_through_strategy")) {
+        throw std::invalid_argument(
+            std::string(context) +
+            " binding must use sendThrough/sendThroughStrategy without underscores");
+    }
+    const auto* send_through = source.if_contains("sendThrough");
+    const auto* strategy = source.if_contains("sendThroughStrategy");
+    if (strategy && !send_through) {
+        throw std::invalid_argument(
+            std::string(context) + " sendThroughStrategy requires sendThrough");
+    }
+    if (!send_through) {
+        return std::nullopt;
+    }
+    return ParseOutboundBindConfig(*send_through, strategy);
 }
 
 }  // namespace infra

@@ -248,7 +248,7 @@ CompleteVlessInboundHandshake(
     const std::shared_ptr<const ::vless::VlessEncryptionConfig>& decryption,
     VlessBufferedReader& protocol_reader,
     transport::MultiBufferWriter& protocol_writer,
-    std::unique_ptr<::vless::VlessEncryptedIo>& encrypted_io,
+    std::optional<::vless::VlessEncryptedIo>& encrypted_io,
     VlessBufferedReader*& active_reader,
     transport::MultiBufferWriter*& active_writer,
     ::UserOnlineTracker& validator,
@@ -288,7 +288,7 @@ CompleteVlessInboundHandshake(
             }
             issued_ticket = std::move(runtime->issued_ticket);
             resumed_identity = runtime->resumed_identity;
-            encrypted_io = std::make_unique<::vless::VlessEncryptedIo>(
+            encrypted_io.emplace(
                 protocol_reader, protocol_writer, std::move(*runtime));
             active_reader = &encrypted_io->plain_reader;
             active_writer = &encrypted_io->writer;
@@ -352,11 +352,6 @@ CompleteVlessInboundHandshake(
             net,
             std::move(request.target),
             std::move(request.forwarded)});
-    if (request.addons_len != 0 && request.flow.empty()) {
-        LOG_CONN_WARN(ctx, "request rejected from {}:{} > unsupported addons", client_ip, ctx.inbound.source_port);
-        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "unsupported request addons"));
-        co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
-    }
     const bool use_vision = ::vless::IsVisionFlow(request.flow);
     if (!request.flow.empty()) {
         if (std::string_view(request.flow) != user_info->flow) {
@@ -465,7 +460,7 @@ proxy::vless::inbound::Handler::Process(
     transport::MultiBufferWriter& protocol_writer = *stream;
     VlessBufferedReader* active_reader = &protocol_reader;
     transport::MultiBufferWriter* active_writer = &protocol_writer;
-    std::unique_ptr<::vless::VlessEncryptedIo> encrypted_io;
+    std::optional<::vless::VlessEncryptedIo> encrypted_io;
 
     UserOnlineSessionGuard user_session;
     Network net = Network::TCP;

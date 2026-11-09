@@ -26,7 +26,6 @@ std::optional<MemoryAccount> MemoryAccount::FromUUID(
     }
 
     MemoryAccount account;
-    account.uuid = uuid_str;
     account.uuid_bytes = *uuid_bytes;
     account.profile.user_id = user_id;
     account.profile.email = email;

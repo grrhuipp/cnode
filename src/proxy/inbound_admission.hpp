@@ -58,7 +58,7 @@ inline void BindInboundRequestTarget(
     ctx.content.network = request.network;
     ctx.outbound.original_target = request.target;
     ctx.outbound.target = std::move(request.target);
-    ctx.outbound.route_target = ctx.outbound.original_target;
+    ctx.outbound.route_target = {};
 }
 // The single writer of an authenticated identity and its request target into
 // the session. Protocols call it as soon as the credential matches, so their

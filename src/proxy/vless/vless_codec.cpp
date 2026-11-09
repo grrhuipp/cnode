@@ -16,26 +16,6 @@ namespace {
 constexpr uint64_t kProtoWireLengthDelimited = 2;
 constexpr uint64_t kProtoAddonsFlowField = 1;
 
-std::optional<uint64_t> ReadProtoVarint(ByteReader& reader) noexcept {
-    uint64_t value = 0;
-    uint8_t shift = 0;
-    for (size_t i = 0; i < 10; ++i) {
-        const uint8_t byte = reader.ReadU8();
-        if (!reader.Ok()) {
-            return std::nullopt;
-        }
-        if (shift == 63 && (byte & 0xFE) != 0) {
-            return std::nullopt;
-        }
-        value |= static_cast<uint64_t>(byte & 0x7F) << shift;
-        if ((byte & 0x80) == 0) {
-            return value;
-        }
-        shift += 7;
-    }
-    return std::nullopt;
-}
-
 bool WriteProtoVarint(ByteWriter& writer, size_t value) noexcept {
     while (value >= 0x80) {
         if (!writer.WriteU8(static_cast<uint8_t>((value & 0x7F) | 0x80))) {
@@ -60,7 +40,7 @@ bool ParseHeaderAddons(std::span<const uint8_t> data,
     ByteReader reader(data);
     bool seen_flow = false;
     while (!reader.Empty()) {
-        auto tag = ReadProtoVarint(reader);
+        auto tag = reader.ReadVarintU64();
         if (!tag || *tag == 0) {
             return false;
         }
@@ -71,8 +51,8 @@ bool ParseHeaderAddons(std::span<const uint8_t> data,
             seen_flow) {
             return false;
         }
-        auto flow_len = ReadProtoVarint(reader);
-        if (!flow_len || *flow_len > reader.Remaining()) {
+        auto flow_len = reader.ReadVarintU64();
+        if (!flow_len || *flow_len == 0 || *flow_len > reader.Remaining()) {
             return false;
         }
         const auto flow = reader.ReadStringView(static_cast<size_t>(*flow_len));
@@ -169,7 +149,6 @@ RequestHeaderDecodeResult DecodeRequestHeader(std::span<const uint8_t> data) {
 
     header.command = static_cast<Command>(command);
     std::memcpy(header.uuid.data(), data.data() + kUuidOffset, header.uuid.size());
-    header.addons_len = addons_len;
     if (!ParseHeaderAddons(data.subspan(kAddonsLenOffset + 1, addons_len), header)) {
         result.status = RequestHeaderDecodeStatus::InvalidAddons;
         return result;

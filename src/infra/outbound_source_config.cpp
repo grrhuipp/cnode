@@ -32,17 +32,7 @@ OutboundSourceConfig OutboundSourceConfig::FromJson(const json::object& j) {
             **stream_settings, StreamEndpointRole::Outbound);
     }
 
-    if (j.contains("send_through") || j.contains("send_through_strategy")) {
-        throw std::invalid_argument("outbound binding must use sendThrough/sendThroughStrategy without underscores");
-    }
-    const auto* send_through = j.if_contains("sendThrough");
-    const auto* strategy = j.if_contains("sendThroughStrategy");
-    if (strategy && !send_through) {
-        throw std::invalid_argument("sendThroughStrategy requires sendThrough");
-    }
-    if (send_through) {
-        cfg.send_through = ParseOutboundBindConfig(*send_through, strategy);
-    }
+    cfg.send_through = ParseOptionalOutboundBind(j, "outbound");
     cfg.passthrough = JsonBoolOr(j, "passthrough", false);
 
     return cfg;

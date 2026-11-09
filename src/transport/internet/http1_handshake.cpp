@@ -1320,7 +1320,7 @@ net::awaitable<TransportBuildResult> DoWsServerHandshake(
     }
 
     // HTTP 头之后已读到的字节属于 WebSocket 帧流
-    auto ws = std::make_unique<WsServerStream>(std::move(stream), conn_id);
+    auto ws = std::make_unique<BaseWsStream>(std::move(stream), false);
     const auto read_ahead = head->ReadAhead();
     if (!read_ahead.empty()) {
         ws->SetPendingData(read_ahead.data(), read_ahead.size());

@@ -1,4 +1,5 @@
 #include "grpc_hunk.hpp"
+#include "common/byte_reader.hpp"
 
 #include <algorithm>
 #include <cassert>
@@ -8,73 +9,58 @@
 namespace transport::internet {
 namespace {
 
-bool ReadVarint(std::span<const uint8_t> bytes, size_t& offset, uint64_t& value) noexcept {
-    value = 0;
-    for (unsigned shift = 0; shift < 64 && offset < bytes.size(); shift += 7) {
-        const uint8_t byte = bytes[offset++];
-        if (shift == 63 && byte > 1) return false;
-        value |= uint64_t(byte & 0x7f) << shift;
-        if ((byte & 0x80) == 0) return true;
-    }
-    return false;
-}
-
-bool ReadKey(std::span<const uint8_t> bytes, size_t& offset, uint32_t& key) noexcept {
-    uint64_t value = 0;
-    if (!ReadVarint(bytes, offset, value) || value > UINT32_MAX || (value >> 3) == 0) return false;
-    key = static_cast<uint32_t>(value);
+bool ReadKey(ByteReader& reader, uint32_t& key) noexcept {
+    const auto value = reader.ReadVarintU64();
+    if (!value || *value > UINT32_MAX || (*value >> 3) == 0) return false;
+    key = static_cast<uint32_t>(*value);
     return true;
 }
 
-bool SkipField(std::span<const uint8_t> bytes, size_t& offset, uint32_t key, unsigned depth) noexcept {
-    uint64_t size = 0;
+bool SkipField(ByteReader& reader, uint32_t key, unsigned depth) noexcept {
     switch (key & 7) {
     case 0:
-        return ReadVarint(bytes, offset, size);
+        return reader.ReadVarintU64().has_value();
     case 1:
-        size = 8;
-        break;
-    case 2:
-        if (!ReadVarint(bytes, offset, size)) return false;
-        break;
+        return reader.Skip(8);
+    case 2: {
+        const auto size = reader.ReadVarintU64();
+        if (!size || *size > reader.Remaining()) return false;
+        return reader.Skip(static_cast<size_t>(*size));
+    }
     case 3:
         if (depth == 100) return false;
-        while (offset < bytes.size()) {
+        while (!reader.Empty()) {
             uint32_t nested = 0;
-            if (!ReadKey(bytes, offset, nested)) return false;
+            if (!ReadKey(reader, nested)) return false;
             if ((nested & 7) == 4) return (nested >> 3) == (key >> 3);
-            if (!SkipField(bytes, offset, nested, depth + 1)) return false;
+            if (!SkipField(reader, nested, depth + 1)) return false;
         }
         return false;
     case 5:
-        size = 4;
-        break;
+        return reader.Skip(4);
     default:
         return false;
     }
-    if (size > bytes.size() - offset) return false;
-    offset += static_cast<size_t>(size);
-    return true;
 }
 
 struct DataField { size_t offset = 0; size_t size = 0; };
 
 std::optional<DataField> DecodeMessage(std::span<const uint8_t> bytes) noexcept {
     DataField data;
-    size_t offset = 0;
-    while (offset < bytes.size()) {
+    ByteReader reader(bytes);
+    while (!reader.Empty()) {
         uint32_t key = 0;
-        if (!ReadKey(bytes, offset, key)) return std::nullopt;
+        if (!ReadKey(reader, key)) return std::nullopt;
         if (key == 0x0a) {
-            uint64_t size = 0;
-            if (!ReadVarint(bytes, offset, size) || size > bytes.size() - offset) return std::nullopt;
-            data = {offset, static_cast<size_t>(size)};
-            offset += data.size;
-        } else if (!SkipField(bytes, offset, key, 0)) {
+            const auto size = reader.ReadVarintU64();
+            if (!size || *size > reader.Remaining()) return std::nullopt;
+            data = {reader.Position(), static_cast<size_t>(*size)};
+            if (!reader.Skip(data.size)) return std::nullopt;
+        } else if (!SkipField(reader, key, 0)) {
             return std::nullopt;
         }
     }
-    return data;
+    return reader.Ok() ? std::optional<DataField>(data) : std::nullopt;
 }
 
 }  // namespace
