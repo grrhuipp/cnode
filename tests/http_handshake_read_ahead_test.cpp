@@ -6,7 +6,7 @@
 #include "transport/internet/tls_stream.hpp"
 #include "transport/internet/tls_config.hpp"
 #include "transport/internet/transport_stack.hpp"
-#include "transport/internet/transport_security.hpp"
+#include "transport/internet/stream_settings.hpp"
 #include "transport/internet/ws_stream.hpp"
 #include "../src/transport/internet/http1_handshake.hpp"
 

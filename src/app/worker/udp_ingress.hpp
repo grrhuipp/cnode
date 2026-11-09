@@ -4,6 +4,10 @@
 #include "common/buf/multi_buffer.hpp"
 #include "common/buffer_util.hpp"
 #include "common/error.hpp"
+#include "common/session.hpp"
+#include "common/sharded_user_stats.hpp"
+#include "features/routing/dispatcher.hpp"
+#include "infra/config_types.hpp"
 #include "proxy/inbound.hpp"
 #include "transport/link.hpp"
 #include "udp_client_session_key.hpp"
@@ -179,6 +183,7 @@ private:
     void RetireNativeJob(ClientSession& session) noexcept;
     static net::awaitable<void> RunNativeDispatch(ClientSessionPtr session);
     void ProcessDecoded(const UdpDatagramContext& datagram,
+        const net::ip::address& client_address,
         InboundDatagramResult decoded,
         std::shared_ptr<UdpHandoffRecord> record = {});
     void RegisterNativeJob(const ClientSessionPtr& session);
@@ -219,9 +224,58 @@ public:
 
 private:
     friend class UdpIngress;
+
+    struct RequestData {
+        explicit RequestData(routing::DispatchPolicy dispatch_policy)
+            : context(), policy(std::move(dispatch_policy)) {}
+        session::Context context;
+        routing::DispatchPolicy policy;
+        routing::Dispatcher* dispatcher = nullptr;
+        net::io_context* io_context = nullptr;
+        StatsShard* stats = nullptr;
+        TimeoutsConfig timeouts;
+        uint32_t worker_id = 0;
+        // Owned copy of the authenticating credential's profile.
+        UserProfile profile;
+        UserOnlineTracker* tracker = nullptr;
+        ConnectionLimiter* limiter = nullptr;
+        uint32_t* active_sessions = nullptr;
+    };
+
+    struct QueuedInput {
+        buf::MultiBuffer payload;
+        size_t bytes = 0;
+        UdpResourceBudget::PayloadReservation reservation;
+    };
+
+    void WakeReader() {
+        (void)reader_signal_.try_send(IoErrorCode{});
+    }
     void CloseWithError(ErrorCode error) noexcept;
-    struct Impl;
-    std::unique_ptr<Impl> impl_;
+
+    UdpResourceBudget::AssociationLease association_;
+    UdpResourceBudget* budget_;
+    SignalChannel reader_signal_;
+    ReplyRoute reply_;
+    udp::endpoint reply_endpoint_;
+    memory::ThreadLocalDeque<QueuedInput> input_queue_;
+    size_t queued_bytes_ = 0;
+    bool closed_ = false;
+    ErrorCode terminal_error_ = ErrorCode::OK;
+    ::InboundDatagramOwner session_owner_;
+    transport::CancellationSource cancellation_;
+    std::optional<RequestData> request_;
+    ClientSession* job_previous_ = nullptr;
+    ClientSession* job_next_ = nullptr;
+    ClientSession* notify_next_ = nullptr;
+    std::weak_ptr<ClientSession> job_pin_;
+    UdpIngress::ClientSessionPtr notification_pin_;
+    bool job_registered_ = false;
+    bool job_linked_ = false;
+    // The row hook naming this session as its live link; cleared on unlink.
+    UdpAssociationHook* association_hook_ = nullptr;
+    std::shared_ptr<UdpHandoffRecord> handoff_record_;
+    UdpIngress* owner_ = nullptr;
 };
 
 }  // namespace worker_detail

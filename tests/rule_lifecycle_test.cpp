@@ -31,7 +31,7 @@ TEST(RuleLifecycle, Contract) {
     ctx.inbound.user_id = 42;
     ctx.inbound.user_email = "alice@example.com";
     ctx.outbound.target = ::TargetAddress("blocked.example", 443);
-    ::features::policy::RequestPolicy& policy = detect_rule_policy;
+    ::rule::DetectRulePolicy& policy = detect_rule_policy;
     ASSERT_FALSE((!policy.Blocked(ctx)));
 
     ASSERT_FALSE((!policy.Blocked(ctx)));

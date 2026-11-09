@@ -1,7 +1,7 @@
 #include "quic_stream.hpp"
 
 #include "hysteria_protocol.hpp"
-#include "quic_connection.hpp"
+#include "hysteria_ingress.hpp"
 
 #include "common/buf/multi_buffer.hpp"
 #include "transport/link_error.hpp"

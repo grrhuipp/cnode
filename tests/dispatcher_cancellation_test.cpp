@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "app/dispatcher/default_dispatcher.hpp"
-#include "app/dns/dns_worker.hpp"
+#include "app/dns/dns.hpp"
 #include "app/relay.hpp"
 #include "app/request_load_state.hpp"
 #include "app/session_tracking.hpp"

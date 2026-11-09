@@ -1,24 +1,24 @@
 #pragma once
 
+#include "features/routing/dispatch_policy.hpp"
 #include "features/routing/dispatcher.hpp"
+#include "features/routing/router.hpp"
 #include "common/allocator.hpp"
 
+#include <cassert>
 #include <cstdint>
 #include <memory>
-
-
-namespace routing {
-class Router;
-}  // namespace routing
+#include <string_view>
+#include <variant>
 
 namespace proxyman::outbound {
 class Handler;
 class HandlerLookup;
 }  // namespace proxyman::outbound
 
-namespace features::policy {
-class RequestPolicy;
-}  // namespace features::policy
+namespace rule {
+class DetectRulePolicy;
+}  // namespace rule
 namespace app {
 class SessionTrackingState;
 class RequestLoadState;
@@ -32,8 +32,39 @@ class AwaitableTaskGroup;
 namespace app::dispatcher {
 
 namespace detail {
-struct OutboundSelection;
+
+enum class SelectionSource : uint8_t {
+    Forced,
+    Rule,
+    Fallback,
+};
+
+struct OutboundSelection {
+    std::string_view outbound_tag;
+    SelectionSource source = SelectionSource::Fallback;
+};
+
+[[nodiscard]] inline bool RequiresRouting(
+    const routing::OutboundSelectionPolicy& policy) noexcept {
+    return std::holds_alternative<routing::RouteWithFallback>(policy);
 }
+
+[[nodiscard]] inline OutboundSelection SelectOutbound(
+    const routing::OutboundSelectionPolicy& policy,
+    const routing::RouteDecision& rule = {}) noexcept {
+    if (const auto* forced = std::get_if<routing::ForceOutbound>(&policy)) {
+        return OutboundSelection{forced->outbound_tag, SelectionSource::Forced};
+    }
+
+    const auto* routed = std::get_if<routing::RouteWithFallback>(&policy);
+    assert(routed != nullptr);
+    if (rule.matched) {
+        return OutboundSelection{rule.outbound_tag, SelectionSource::Rule};
+    }
+    return OutboundSelection{routed->outbound_tag, SelectionSource::Fallback};
+}
+
+}  // namespace detail
 
 // ============================================================================
 // DefaultDispatcher - app/dispatcher implementation
@@ -47,7 +78,7 @@ public:
     DefaultDispatcher(
         const routing::Router& router,
         proxyman::outbound::HandlerLookup& outbound_handlers,
-        features::policy::RequestPolicy& request_policy,
+        rule::DetectRulePolicy& request_policy,
         app::SessionTrackingState& session_tracking,
         app::dns::DNS& dns_service,
         app::RequestLoadState& request_load) noexcept;
@@ -93,7 +124,7 @@ private:
 
     const routing::Router& router_;
     proxyman::outbound::HandlerLookup& outbound_handlers_;
-    features::policy::RequestPolicy& request_policy_;
+    rule::DetectRulePolicy& request_policy_;
     app::SessionTrackingState& session_tracking_;
     app::dns::DNS& dns_service_;
     app::RequestLoadState& request_load_;

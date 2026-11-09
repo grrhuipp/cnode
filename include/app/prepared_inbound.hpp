@@ -1,17 +1,29 @@
 #pragma once
 
-#include "app/port_binding.hpp"
 #include "app/proxyman/inbound/prepared_config.hpp"
 #include "app/proxyman/inbound/receiver_settings.hpp"
+#include "transport/internet/inbound_listen.hpp"
 
+#include <cstdint>
 #include <memory>
 #include <span>
+#include <string>
 #include <vector>
 
 
 struct InboundSpec;
 struct InboundUserSpec;
 struct StaticInboundConfig;
+
+// ============================================================================
+// PortBinding - 端口绑定描述（Worker 独立监听时传递）
+// ============================================================================
+struct PortBinding {
+    uint16_t    port     = 0;
+    std::string protocol;           // "vmess" / "trojan"
+    std::string tag;                // inbound tag
+    InboundListen listen;
+};
 
 // Cold-path result shared by static and panel sources. Every field is
 // immutable after preparation; Workers copy only what they install.

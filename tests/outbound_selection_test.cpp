@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "app/dispatcher/outbound_selection.hpp"
+#include "app/dispatcher/default_dispatcher.hpp"
 
 #include <concepts>
 #include <stdexcept>

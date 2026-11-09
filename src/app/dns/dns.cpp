@@ -1,5 +1,5 @@
 #include "cache_internal.hpp"
-#include "app/dns/dns_worker.hpp"
+#include "app/dns/dns.hpp"
 #include "app/worker_mailbox.hpp"
 #include "common/byte_reader.hpp"
 #include "common/domain_name.hpp"

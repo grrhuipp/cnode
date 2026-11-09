@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 
-#include "proxy/freedom/outbound/udp_request.hpp"
-#include "app/dns/dns_worker.hpp"
+#include "proxy/udp_target.hpp"
+#include "app/dns/dns.hpp"
 #include "app/relay.hpp"
 #include "transport/async_stream.hpp"
 #include "transport/internet/timeout_scheduler.hpp"

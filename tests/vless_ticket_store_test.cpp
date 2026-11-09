@@ -1,7 +1,7 @@
 #include <stdexcept>
 #include <gtest/gtest.h>
 
-#include "vless_encryption_runtime.hpp"
+#include "vless_encryption.hpp"
 #include <array>
 #include <chrono>
 #include <cstdlib>

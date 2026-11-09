@@ -45,7 +45,7 @@ struct OperationTimeoutScope {
 };
 
 // Explicit cancellation also covers a successful readiness notification that
-// was queued before Cancel. Only the owning execution domain touches payload.
+// was queued before Cancel. Only the owning Worker touches payload.
 class WriteCompletion final : private transport::CancellationSubscription {
 public:
     explicit WriteCompletion(transport::CancellationSource& source) noexcept {
@@ -216,7 +216,7 @@ net::awaitable<std::size_t> TcpStream::AsyncRead(net::mutable_buffer buf) {
 // ============================================================================
 // TcpStream::ReadMultiBuffer
 //
-// Readiness is delivered without payload. The execution domain then performs
+// Readiness is delivered without payload. The owning Worker then performs
 // nonblocking recv directly into its single pool Buffer within a bounded drain
 // budget until EAGAIN or a short read requires re-arming readiness.
 // pending_data remains ordered before unread socket bytes.
@@ -322,7 +322,7 @@ net::awaitable<buf::MultiBuffer> TcpStream::ReadMultiBuffer() {
 // ============================================================================
 // TcpStream 写路径
 //
-// Scatter-send executes only on the domain owner; native asynchronous work
+// Scatter-send executes only on the owning Worker; native asynchronous work
 // consists solely of readiness notifications and never retains payload spans.
 // ============================================================================
 bool TcpStream::DrainWriteAvailable(

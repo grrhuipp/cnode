@@ -5,7 +5,7 @@
 #include "core/constants.hpp"
 #include "core/naming.hpp"
 #include "infra/config_types.hpp"
-#include "transport/internet/transport_security.hpp"
+#include "transport/internet/stream_settings.hpp"
 
 #include <stdexcept>
 #include <utility>

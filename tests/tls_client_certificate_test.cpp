@@ -2,7 +2,6 @@
 
 #include "transport/internet/tls_stream.hpp"
 #include "autosign_cert.hpp"
-#include "tls_client_context.hpp"
 
 #include <openssl/pem.h>
 #include <openssl/ssl.h>

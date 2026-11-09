@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "transport/internet/outbound_bind.hpp"
-#include "infra/outbound_bind_config.hpp"
+#include "infra/config.hpp"
 #include "common/target_address.hpp"
 
 #include <asio/ip/network_v4.hpp>

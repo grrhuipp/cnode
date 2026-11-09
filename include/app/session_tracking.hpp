@@ -1,8 +1,8 @@
 #pragma once
 
-#include "app/traffic_types.hpp"
 #include "common/string_hash.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -14,6 +14,25 @@ struct Traffic;
 }  // namespace session
 
 namespace app {
+
+struct UserTraffic {
+    uint64_t upload = 0;
+    uint64_t download = 0;
+};
+
+struct UserTrafficCounters {
+    std::unordered_map<int64_t, UserTraffic> users;
+
+    [[nodiscard]] bool empty() const noexcept { return users.empty(); }
+    [[nodiscard]] size_t size() const noexcept { return users.size(); }
+
+    auto begin() noexcept { return users.begin(); }
+    auto end() noexcept { return users.end(); }
+    auto begin() const noexcept { return users.begin(); }
+    auto end() const noexcept { return users.end(); }
+};
+
+using UserTrafficSnapshot = UserTrafficCounters;
 
 class SessionTrackingState {
     struct Account {

@@ -7,7 +7,7 @@
 #include "infra/config_types.hpp"
 #include "features/routing/dispatch_policy.hpp"
 #include "proxy/inbound.hpp"
-#include "transport/internet/transport_security.hpp"
+#include "transport/internet/stream_settings.hpp"
 
 #include <iostream>
 #include <span>

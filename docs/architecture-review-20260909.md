@@ -1594,3 +1594,34 @@ CI失败场景修复后通过真实双进程、ML-KEM/X25519加密和回环对�
 - **TCP 接收与发送基准（`cnode_tcp_receive_benchmark` / `cnode_tcp_send_benchmark`）**：
   - `tcp-receive 1B`：单次 burst 墙钟耗时由 `9,891.5 / 9,756.7 ns` 稳定降至 **`9,773.5 / 9,689.8 ns`（-0.7% ~ -1.2%）**，CPU 耗时由 `7,598.5 / 7,459.7 ns` 稳定降至 **`7,522.4 / 7,411.4 ns`**；`65536B` 墙钟耗时由 `48,768.1 / 49,059.4 ns` 稳定降至 **`48,560.3 / 48,281.4 ns`（最高 -1.6%）**。
   - `tcp-send 8192B (16 pieces)`：单次 burst 墙钟耗时由 `11,313.1 / 11,285.2 ns` 稳定降至 **`10,990.7 / 11,281.5 ns`（最高 -2.9%）**。
+
+## 2026-11-09（第十轮）：Hysteria QUIC 首包同步直喂、`ConnectionLimiter` 跨线程零字符串分配、UDP 会话去 Pimpl、Shadowsocks 零死表与 36 个碎片文件内聚
+
+### 架构与流程精简内容
+
+1. **Hysteria QUIC 新连接首包同步直喂与 `QuicSniffer` 首包零分配快路径**：
+   - `src/transport/internet/hysteria/hysteria_ingress.cpp`、`src/transport/internet/hysteria/hysteria_ingress.hpp`：将 `Connection::Initialize(header)` 与 `listener.Associate` 移入 `Connection::Create` 同步完成（初始化失败直接返回 `nullptr`，无需 `co_spawn`），并允许 `HysteriaIngress::ReceiveLoop` 对 Long Header 握手包（`(packet[0] & 0x80) != 0`）直接同步调用 `connection->Feed(*socket, socket->remote, packet, true)`，使 100% 的新建 QUIC 连接首包在同一事件循环迭代内同步处理并写出 ServerHello，彻底消除新连接首包必触发的 `ThreadLocalVector<uint8_t>` 整包拷贝、`core_->inbox` 队列块分配与 `net::post(Pump)`。
+   - `src/sniff/sniffer.cpp`（合并自 `tls_sniffer.cpp`、`http_sniffer.cpp`、`quic_sniffer.cpp`）：为 `AesGcmDecrypt` 增加栈上 `std::array<uint8_t, 1536>` 快路径；当 `QuicSniffer::Sniff` 首帧已完整包含整个 ClientHello 时直接调用内部 `ParseClientHelloServerName`，跳过 `crypto_` / `coverage_` 的 PMR 分配与逐字节位图循环。
+2. **`ConnectionLimiter` 跨线程零字符串分配、内联 `UdpIngress::ClientSession::Impl` / `HandlerRegistry::Impl` 与消除单实现纯虚接口 `RequestPolicy`**：
+   - `include/app/rate_limiter.hpp`：公开 `ConnectionLimiterCore::IpBanKey` / `ComputeIpBanKey` 并新增接收预计算 `AuthCredentialKey` 与 `ip_hash` 的 `CheckIPBan`、`TryAcceptIP`、`OnAuthFailTracked` 重载；在 `ConnectionLimiter` 的 `ReservePhysical`、`Reserve`、`IsBanned`、`OnAuthFailTracked` 中于发起 `coordinator_->PostCall` 前在当前 Worker 线程预计算定长栈值 `ban_key` 与 `ip_hash`，彻底消除跨线程闭包中的 `std::string(tag)` 与 `std::string(ip)` 堆分配。
+   - `src/app/worker/udp_ingress.hpp/.cpp`、`include/common/target_address.hpp`、`include/app/proxyman/inbound/handler_registry.hpp`、`src/app/proxyman/inbound/handler.cpp`、`include/app/proxyman/outbound/handler.hpp/.cpp`：将 `UdpIngress::ClientSession::Impl` 直接内联入 `ClientSession`（每条 UDP 关联减少 1 次堆分配与所有数据包读写路径上的二次解引用），复用 `ProcessDatagram` 已归一化的客户端地址，并消除 `TargetAddress::SameEndpoint` 与 `formatter` 中重复的 `NormalizeAddress`；内联 `HandlerRegistry::Impl`；将 `outbound::Handler::dialer_` 改为直接值成员；消除 `ApplyHttpRealIp` / `ApplyProxyProtocolResult` 中对 `ctx.inbound.source_ip` 的移动掏空；删除单实现纯虚接口 `features::policy::RequestPolicy`，使 `DefaultDispatcher` 直接调用 `rule::DetectRulePolicy::Blocked`。
+3. **Shadowsocks 入站 UDP 回包上下文去死重放表、`ResponseBodyWriter` 零分配首包加密与 37 个碎片文件合并（净减 36 个文件）**：
+   - `src/proxy/shadowsocks/ss_udp.hpp/.cpp`、`src/proxy/shadowsocks/inbound/ss_inbound.hpp/.cpp`、`src/proxy/shadowsocks/shadowsocks_protocol.cpp`：从 `Ss2022UdpSessionState` 拆出不含 `receive_replay_cache` 的发送状态 `Ss2022UdpTxState`，并在 `ShadowsocksUdpResponseContext` 中用 `std::variant<ClassicState, ss::Ss2022UdpTxState>` 替代双份密钥成员与 `std::optional<Ss2022UdpSessionState>`，彻底消除每条入站 SS2022 UDP 关联中从不使用的 `Ss2022UdpReplayCache`（`ThreadLocalUnorderedMap`）；删除 `FirstChunk` / `FirstChunkView`（消除首包跨块时的 `ByteVector` 堆分配），将 `ResponseBodyWriter` 握手期 `master_key` 与 `request_salt` 收纳进 `std::optional<PendingHandshake>` 并在首包加密后立即释放；`ParseCipherMethod` 改用 `EqualsAsciiCI` 消除临时 `std::string` 分配。
+   - 合并并删除 37 个单调用方碎片文件（新建合并后的 `src/sniff/sniffer.cpp`，净减 36 个文件，近四轮累计清理 **148 个冗余碎片文件**），并清理 `src/proxy/vmess/aead`、`src/proxy/freedom/outbound`、`include/features/policy` 3 个空目录。
+
+### 验证与性能/内存实证
+
+全量 **1,251/1,251** 测试通过（325 项 unit、926 项 E2E）。在同一环境与编译选项下执行 A/B/A/B 交错重复基准对照：
+
+- **VLESS/TLS 真实进程基准（`cnode_tls_throughput_benchmark`）**：
+  - **守护进程启动驻留内存（`server_started` RSS）**：4 项测试（`Download1`、`Download8`、`Upload1`、`Upload8`）的启动 RSS 均由 `13,406,208 ~ 13,418,496 B` 稳定降至 **`13,148,160 ~ 13,156,352 B`（稳定减少 250 ~ 260 KiB）**。
+  - **传输完成峰值与常驻内存（`measured_transfer_complete_connections_open` RSS）**：`Download1` 由 `14,356,480 / 14,364,672 B` 稳定降至 **`14,139,392 / 14,143,488 B`（稳定减少 212 ~ 216 KiB）**；`Download8` 由 `14,700,544 / 14,757,888 B` 稳定降至 **`14,569,472 / 14,532,608 B`（稳定减少 128 ~ 220 KiB）**；`Upload1` 由 `14,336,000 / 16,412,672 B` 稳定降至 **`14,131,200 / 14,127,104 B`（减少 200 KiB ~ 2.18 MiB）**；`Upload8` 由 `14,553,088 / 14,544,896 B` 稳定降至 **`14,360,576 / 14,352,384 B`（两轮一致稳定减少 188 KiB）**。
+  - **吞吐与守护进程 CPU**：`Upload8` 8 流上传吞吐由 `639.85 / 532.82 MiB/s` 提升至 **`711.20 / 642.82 MiB/s`（+11.2% ~ +20.6%）**；`Download1` 单流下载吞吐由 `549.22 / 536.62 MiB/s` 稳定升至 **`560.10 / 550.64 MiB/s`（+2.0% ~ +2.6%）**，守护进程总 CPU 由 `0.0293 / 0.0300s` 稳定降至 **`0.0270 / 0.0294s`（最高 -7.8%）**；`Download8` 守护进程总 CPU 由 `0.1412 / 0.1410s` 稳定降至 **`0.1397 / 0.1394s`**。
+- **Hysteria2 四 Worker 真实进程基准（`cnode_hysteria_throughput_benchmark`）**：
+  - **守护进程启动驻留内存（`startup` RSS）**：4 项测试的启动 RSS 均由 `14,647,296 ~ 14,663,680 B` 稳定降至 **`14,381,056 ~ 14,401,536 B`（稳定减少 248 ~ 260 KiB）**。
+  - **256 连接上传（`Upload 256`）**：256 连接就绪匿名内存由 `30,359,552 / 30,400,512 B` 稳定降至 **`30,126,080 / 30,195,712 B`（稳定减少 200 ~ 228 KiB）**，就绪总 RSS 由 `38,739,968 / 38,780,928 B` 稳定降至 **`38,305,792 / 38,375,424 B`（稳定减少 396 ~ 424 KiB）**；负载峰值 RSS（`during_load_max_sampled_vm_rss_bytes`）由 `39,309,312 / 39,448,576 B` 稳定降至 **`38,854,656 / 39,022,592 B`（稳定减少 416 ~ 444 KiB）**；256 连接建连耗时由 `0.5158 / 0.5117s` 稳定降至 **`0.5060 / 0.5037s`**。
+  - **256 连接下载（`Download 256`）**：256 连接就绪 RSS 由 `40,714,240 / 38,711,296 B` 稳定降至 **`38,416,384 / 38,653,952 B`（减少 56 KiB ~ 2.19 MiB）**；负载峰值 RSS 由 `99,299,328 / 98,430,976 B` 稳定降至 **`96,804,864 / 97,726,464 B`（稳定减少 688 KiB ~ 2.38 MiB）**；空闲回收后常驻 RSS 由 `22,315,008 / 20,164,608 B` 稳定降至 **`20,115,456 / 19,845,120 B`（稳定减少 312 KiB ~ 2.10 MiB）**。
+  - **16×64（1,024 流）上传与下载**：16×64 上传负载峰值 RSS 由 `47,833,088 / 48,889,856 B` 稳定降至 **`47,767,552 / 48,443,392 B`（减少 64 ~ 436 KiB）**；16×64 下载第 2 轮 1,024 流就绪 RSS 减少 **1.03 MiB**，守护进程总 CPU 由 `3.768s` 降至 **`3.555s`（-5.7%）**。
+- **64 活跃会话统计采样与 TCP 收发基准（`cnode_runtime_sampling_benchmark` / `cnode_tcp_send_benchmark`）**：
+  - `cnode_runtime_sampling_benchmark`：`resources=1` 进程峰值 RSS 由 `14,938,112 / 14,942,208 B` 稳定降至 **`14,917,632 / 14,901,248 B`（稳定减少 20 ~ 40 KiB）**；`resources=0` 采样延迟保持 **`68.38 / 68.30 ns`**（`p50 = 30.0 ns`，0 次堆分配）。
+  - `tcp-send 8192B (8 pieces)`：单次 burst 墙钟耗时由 `10,680.4 / 10,725.7 ns` 稳定降至 **`10,658.9 / 10,648.3 ns`**；`65536B (16 pieces)` 第 2 轮墙钟耗时由 `44,652.5 ns` 降至 **`43,379.5 ns`（-2.9%）**。

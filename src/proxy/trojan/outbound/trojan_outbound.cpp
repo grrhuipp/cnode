@@ -5,7 +5,7 @@
 #include "proxy/outbound.hpp"
 #include "../trojan_codec.hpp"
 #include "../udp_framing.hpp"
-#include "../../handshake_timeout.hpp"
+#include "../../inbound_admission.hpp"
 #include "../../outbound_server.hpp"
 #include "../../outbound_stream_endpoint.hpp"
 #include "app/relay.hpp"

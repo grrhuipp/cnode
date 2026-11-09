@@ -1,13 +1,14 @@
 #pragma once
 
-#include "app/rate_limiter_fwd.hpp"
 #include "common/allocator.hpp"
-
+#include "common/string_hash.hpp"
 #include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
 
+class ConnectionLimiter;
+struct ConnectionFamily;
 class Inbound;
 struct OnlineDevice;
 struct StatsShard;
@@ -57,8 +58,20 @@ public:
     GetOnlineDevices(std::string_view protocol, std::string_view tag) const;
 
 private:
-    struct Impl;
-    std::unique_ptr<Impl> impl_;
+    using HandlerMap = memory::ThreadLocalUnorderedMap<
+        memory::ThreadLocalString,
+        std::shared_ptr<Handler>,
+        TransparentStringHash,
+        TransparentStringEq>;
+    using RuntimeMap = memory::ThreadLocalUnorderedMap<
+        memory::ThreadLocalString,
+        std::unique_ptr<ProtocolRuntime>,
+        TransparentStringHash,
+        TransparentStringEq>;
+
+    StatsShard& stats_;
+    RuntimeMap runtimes_;
+    HandlerMap handlers_;
 };
 
 }  // namespace proxyman::inbound

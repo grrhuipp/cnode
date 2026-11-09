@@ -1,4 +1,6 @@
 #include "app/proxyman/inbound/handler.hpp"
+#include "app/proxyman/inbound/handler_registry.hpp"
+#include "app/proxyman/inbound/factory.hpp"
 #include "common/ip_address.hpp"
 
 #include "app/request_load_state.hpp"
@@ -37,18 +39,17 @@ void ApplyHttpRealIp(
     if (!literal) return;
     const auto address = iputil::NormalizeAddress(*literal);
     const auto normalized_ip = iputil::AddressText(address);
-    const auto previous_ip = std::move(ctx.inbound.source_ip);
+    LOG_CONN_DEBUG(
+        ctx,
+        "HTTP transport client address overridden by header: {} -> {}",
+        ctx.inbound.source_ip,
+        normalized_ip.View());
     ctx.inbound.source_addr = address;
     ctx.inbound.source_ip = normalized_ip.View();
     // Forwarded address headers do not reliably carry the original client
     // port. Zero is explicit unknown; retaining the CDN port is a false tuple.
     ctx.inbound.source_port = 0;
     ctx.inbound.client_ip_source = session::Inbound::ClientIpSource::HttpHeader;
-    LOG_CONN_DEBUG(
-        ctx,
-        "HTTP transport client address overridden by header: {} -> {}",
-        previous_ip,
-        normalized_ip.View());
 }
 
 void ApplyProxyProtocolResult(
@@ -60,17 +61,16 @@ void ApplyProxyProtocolResult(
 
     const auto normalized_addr = iputil::NormalizeAddress(*result.src_addr);
     const auto normalized_ip = iputil::AddressText(normalized_addr);
-    const auto proxy_ip = std::move(ctx.inbound.source_ip);
+    LOG_CONN_DEBUG(
+        ctx,
+        "PROXY protocol applied proxy={} real_ip={}:{}",
+        ctx.inbound.source_ip,
+        normalized_ip.View(),
+        result.src_port);
     ctx.inbound.source_addr = normalized_addr;
     ctx.inbound.source_ip = normalized_ip.View();
     ctx.inbound.source_port = result.src_port;
     ctx.inbound.client_ip_source = session::Inbound::ClientIpSource::ProxyProtocol;
-    LOG_CONN_DEBUG(
-        ctx,
-        "PROXY protocol applied proxy={} real_ip={}:{}",
-        proxy_ip,
-        ctx.inbound.source_ip,
-        ctx.inbound.source_port);
 }
 
 // 物理连接与逻辑子流共用的协议处理收尾：Process 自身已分类上报结果，
@@ -135,8 +135,6 @@ public:
     // HTTP/2-family transports authenticate per stream in the protocol, so
     // their children start anonymous; a transport that authenticated the
     // session (Hysteria) passes its bound identity to every child.
-    enum class SessionIdentity : uint8_t { Unauthenticated, Authenticated };
-
     LogicalTransportStreamSink(std::shared_ptr<Handler> handler,
                                net::io_context& io_context,
                                routing::Dispatcher& dispatcher,
@@ -144,7 +142,7 @@ public:
                                app::RequestLoadState& request_load,
                                const TimeoutsConfig& timeouts,
                                const session::Context& base_ctx,
-                               SessionIdentity identity,
+                               bool authenticated,
                                std::shared_ptr<ConnectionLimiter::Family> family)
         : handler_(std::move(handler))
         , io_context_(io_context)
@@ -157,7 +155,7 @@ public:
         base_ctx_.conn_id = base_ctx.conn_id;
         base_ctx_.inbound.accounting_key.assign(handler_->receiver_.accounting_key);
         base_ctx_.inbound.connection_family = family_;
-        if (identity == SessionIdentity::Unauthenticated) {
+        if (!authenticated) {
             base_ctx_.inbound.user_id = 0;
             base_ctx_.inbound.user_email.clear();
         }
@@ -229,8 +227,7 @@ std::shared_ptr<InboundTransportStreamHandler> Handler::NewAuthenticatedStreamSi
     std::shared_ptr<ConnectionLimiter::Family> family) {
     return memory::AllocateShared<LogicalTransportStreamSink>(
         shared_from_this(), io_context, dispatcher, stats, request_load, timeouts,
-        session_ctx, LogicalTransportStreamSink::SessionIdentity::Authenticated,
-        std::move(family));
+        session_ctx, true, std::move(family));
 }
 
 net::awaitable<void> Handler::ProcessPreparedTransportStream(
@@ -369,7 +366,7 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
             request_load,
             timeouts,
             ctx,
-            LogicalTransportStreamSink::SessionIdentity::Unauthenticated,
+            false,
             connection_limit.FamilyLease());
     }
     // The physical reservation above stays held while a REALITY fallback runs
@@ -419,6 +416,93 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
     co_await RunInboundProxy(
         Proxy(), std::move(stream), dispatcher, listener, io_context, ctx, timeouts,
         request_load.PressureIdleTimeout(), stats);
+}
+
+// ============================================================================
+// HandlerRegistry
+// ============================================================================
+
+HandlerRegistry::HandlerRegistry(StatsShard& stats)
+    : stats_(stats) {}
+
+HandlerRegistry::~HandlerRegistry() noexcept = default;
+
+HandlerRegistry::HandlerPtr HandlerRegistry::GetHandler(std::string_view tag) noexcept {
+    auto it = handlers_.find(tag);
+    return it == handlers_.end() ? nullptr : it->second;
+}
+
+std::unique_ptr<::Inbound> HandlerRegistry::NewHandler(
+    ::ConnectionLimiter* limiter,
+    const BuildRequest& req) {
+    auto* runtime = GetOrCreateRuntime(req.protocol);
+    if (!runtime) {
+        return nullptr;
+    }
+    return ::proxyman::inbound::NewHandler(
+        req.protocol, *runtime, stats_, limiter, req);
+}
+
+DatagramHandlerBuildResult HandlerRegistry::NewDatagramHandler(
+    ::ConnectionLimiter* limiter,
+    const BuildRequest& req) {
+    auto* runtime = GetOrCreateRuntime(req.protocol);
+    if (!runtime) {
+        return {DatagramHandlerBuildStatus::Failed, nullptr};
+    }
+    return ::proxyman::inbound::NewDatagramHandler(
+        req.protocol, *runtime, stats_, limiter, req);
+}
+
+ProtocolRuntime* HandlerRegistry::GetOrCreateRuntime(
+    std::string_view protocol) {
+    if (auto it = runtimes_.find(protocol); it != runtimes_.end()) {
+        return it->second.get();
+    }
+    auto runtime = NewProtocolRuntime(protocol);
+    if (!runtime) return nullptr;
+    auto result = runtimes_.emplace(
+        memory::ThreadLocalString(protocol), std::move(runtime));
+    return result.first->second.get();
+}
+
+HandlerRegistry::HandlerPtr HandlerRegistry::ReplaceHandler(std::unique_ptr<Handler> handler) {
+    if (!handler) {
+        return nullptr;
+    }
+
+    memory::ThreadLocalString tag(handler->Tag());
+    auto shared_handler = std::shared_ptr<Handler>(
+        handler.release(), std::default_delete<Handler>{},
+        memory::ThreadLocalAllocator<Handler>{});
+    auto it = handlers_.find(tag);
+    if (it == handlers_.end()) {
+        auto [inserted_it, inserted] = handlers_.try_emplace(
+            std::move(tag), std::move(shared_handler));
+        return inserted ? inserted_it->second : nullptr;
+    }
+
+    it->second = std::move(shared_handler);
+    return it->second;
+}
+
+void HandlerRegistry::RemoveHandler(std::string_view tag) {
+    auto it = handlers_.find(tag);
+    if (it == handlers_.end()) {
+        return;
+    }
+
+    handlers_.erase(it);
+}
+
+std::vector<::OnlineDevice>
+HandlerRegistry::GetOnlineDevices(std::string_view protocol, std::string_view tag) const {
+    if (auto it = runtimes_.find(protocol); it != runtimes_.end()) {
+        if (auto* tracker = it->second->OnlineTracker()) {
+            return tracker->GetOnlineDevices(tag);
+        }
+    }
+    return {};
 }
 
 }  // namespace proxyman::inbound

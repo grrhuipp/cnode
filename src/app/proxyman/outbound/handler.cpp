@@ -14,9 +14,9 @@ namespace proxyman::outbound {
 Handler::Handler(OutboundConfiguration::Entry config, net::io_context& io_context,
                  app::dns::DNS& dns, std::chrono::seconds dial_timeout,
                  AwaitableTaskGroup& tasks)
-    : config_(std::move(config)) {
-    dialer_.emplace(io_context, dns, config_->sender, dial_timeout);
-    proxy_ = NewProxy(*config_, io_context, tasks);
+    : config_(std::move(config))
+    , dialer_(io_context, dns, config_->sender, dial_timeout)
+    , proxy_(NewProxy(*config_, io_context, tasks)) {
 }
 
 
@@ -32,7 +32,7 @@ net::awaitable<OutboundProcessResult> Handler::Dispatch(
     std::chrono::seconds relay_idle_timeout,
     std::chrono::seconds relay_write_timeout) {
     // Not a coroutine: the callee frame is the request's outbound frame.
-    return proxy_->Process(ctx, inbound, *dialer_, timeouts, stats, relay_config,
+    return proxy_->Process(ctx, inbound, dialer_, timeouts, stats, relay_config,
                            std::move(first_payload), relay_idle_timeout,
                            relay_write_timeout);
 }

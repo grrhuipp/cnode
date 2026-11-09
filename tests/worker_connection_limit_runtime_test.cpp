@@ -1,14 +1,13 @@
 #include <gtest/gtest.h>
 
-#include "app/dns/dns_worker.hpp"
-#include "app/port_binding.hpp"
+#include "app/dns/dns.hpp"
+#include "app/prepared_inbound.hpp"
 #include "app/proxyman/inbound/factory.hpp"
 #include "app/proxyman/inbound/receiver_settings.hpp"
 #include "app/rate_limiter.hpp"
 #include "app/stats.hpp"
 #include "app/worker.hpp"
 #include "app/worker_runtime_config.hpp"
-#include "app/worker_stats.hpp"
 #include "common/allocator.hpp"
 #include "proxy/inbound.hpp"
 #include "transport/async_stream.hpp"

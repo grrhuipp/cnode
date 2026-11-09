@@ -80,7 +80,6 @@ set(CNODE_CORE_SOURCES
     src/infra/log.cpp
     src/infra/json.cpp
     src/infra/config.cpp
-    src/infra/inbound_field_rules.cpp
 
     # App - DNS
     src/app/dns/dns.cpp
@@ -97,9 +96,7 @@ set(CNODE_CORE_SOURCES
     src/transport/internet/datagram_socket.cpp
     src/transport/internet/tcp_stream.cpp
     src/transport/internet/timeout_scheduler.cpp
-    src/transport/internet/tls_client_context.cpp
     src/transport/internet/tls_stream.cpp
-    src/transport/internet/autosign_cert.cpp
     src/transport/internet/reality_tls.cpp
     src/transport/internet/ws_stream.cpp
     src/transport/internet/http1_handshake.cpp
@@ -107,7 +104,6 @@ set(CNODE_CORE_SOURCES
     src/transport/internet/http2_session.cpp
     src/transport/internet/transport_stack.cpp
     src/transport/internet/transport_dialer.cpp
-    src/transport/internet/outbound_target_builder.cpp
     src/transport/internet/hysteria/hysteria_protocol.cpp
     src/transport/internet/hysteria/quic_stream.cpp
     src/transport/internet/hysteria/hysteria_ingress.cpp
@@ -117,7 +113,6 @@ set(CNODE_CORE_SOURCES
     src/app/dispatcher/default_dispatcher.cpp
     src/app/proxyman/inbound/factory.cpp
     src/app/proxyman/inbound/handler.cpp
-    src/app/proxyman/inbound/handler_registry.cpp
     src/app/worker/udp_ingress.cpp
     src/app/worker/udp_association_reclaimer.cpp
     src/app/proxyman/inbound/user_store.cpp
@@ -127,7 +122,6 @@ set(CNODE_CORE_SOURCES
     src/app/session_group_executor.cpp
     src/service/controller/controller.cpp
     src/service/controller/traffic_journal.cpp
-    src/infra/panel_config.cpp
     src/service/controller/panel_inbound.cpp
     src/app/prepared_inbound.cpp
     src/app/runtime_publication.cpp
@@ -139,9 +133,7 @@ set(CNODE_CORE_SOURCES
     src/app/bootstrap.cpp
 
     # Sniff
-    src/sniff/tls_sniffer.cpp
-    src/sniff/http_sniffer.cpp
-    src/sniff/quic_sniffer.cpp
+    src/sniff/sniffer.cpp
 
     # Common - Mux
     src/common/mux/mux_codec.cpp
@@ -159,7 +151,6 @@ set(CNODE_CORE_SOURCES
     # Proxy - VLESS
     src/proxy/vless/vless_codec.cpp
     src/proxy/vless/vless_encryption.cpp
-    src/proxy/vless/vless_encryption_runtime.cpp
     src/proxy/vless/udp_framing.cpp
     src/proxy/vless/vless_vision.cpp
     src/proxy/vless/inbound/vless_inbound.cpp
@@ -178,8 +169,6 @@ set(CNODE_CORE_SOURCES
     src/proxy/hysteria/hysteria_inbound.cpp
 
     # Proxy - Shadowsocks
-    src/proxy/shadowsocks/client.cpp
-    src/proxy/shadowsocks/server.cpp
     src/proxy/shadowsocks/shadowsocks_protocol.cpp
     src/proxy/shadowsocks/ss_udp.cpp
     src/proxy/shadowsocks/inbound/ss_inbound.cpp
@@ -201,7 +190,6 @@ set(CNODE_CORE_SOURCES
     src/app/router/router.cpp
 
     # API / panel clients
-    src/api/v2board/node_info_json.cpp
     src/api/v2board/v2board.cpp
 )
 

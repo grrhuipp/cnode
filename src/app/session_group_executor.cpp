@@ -2,7 +2,6 @@
 #include "infra/runtime_failure.hpp"
 #include "infra/log.hpp"
 
-#include <asio/post.hpp>
 #include <asio/this_coro.hpp>
 #include <asio/use_awaitable.hpp>
 #include <asio/posix/stream_descriptor.hpp>
@@ -80,6 +79,7 @@ void GroupCoordinator::Start() {
     if (reserved_->started.load(std::memory_order_acquire)) return;
     net::post(reactor_, [self = shared_from_this()] { self->EnsureStarted(); });
 }
+
 
 void GroupCoordinator::RegisterWorker(uint32_t, net::io_context& reactor) {
     net::use_service<WorkerCoordinatorService>(reactor_).Bind(weak_from_this(), false);

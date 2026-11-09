@@ -6,7 +6,12 @@
 #include "core/naming.hpp"
 #include "infra/json.hpp"
 #include "infra/inbound_field_rules.hpp"
-#include "infra/outbound_bind_config.hpp"
+#include "proxy/anytls_padding.hpp"
+#include "proxy/sniff_config.hpp"
+#include "transport/internet/http_headers.hpp"
+#include "transport/internet/reality_key.hpp"
+#include "transport/internet/tls_config.hpp"
+#include "transport/internet/tls_stream.hpp"
 #include "infra/log.hpp"
 #include <algorithm>
 #include <array>
@@ -2031,3 +2036,606 @@ std::vector<std::string> GetUsedGeoSiteTags(const RoutingConfig& routing) {
     return GetUsedRouteRuleTags(routing, &RouteRuleConfig::geosite);
 }
 
+
+namespace {
+
+std::shared_ptr<const TlsPemMaterial> LoadValidatedPanelTlsPem(
+    std::string cert_file, std::string key_file) {
+    TlsConfig tls;
+    tls.cert_file = std::move(cert_file);
+    tls.key_file = std::move(key_file);
+    LoadTlsPemMaterial(tls);
+    if (!SslContext::CreateServer(tls)) {
+        throw std::invalid_argument(
+            "Panel TLS certificate or private key is invalid");
+    }
+    return std::move(tls.pem);
+}
+
+}  // namespace
+
+PanelNodeIds PanelNodeIds::Parse(const json::value& value) {
+    if (!value.is_array()) {
+        throw std::invalid_argument("Panel NodeIDs must be an array");
+    }
+    if (value.as_array().empty()) {
+        throw std::invalid_argument("Panel NodeIDs must not be empty");
+    }
+
+    PanelNodeIds result;
+    std::unordered_set<int> unique;
+    result.values_.reserve(value.as_array().size());
+    unique.reserve(value.as_array().size());
+    for (const auto& item : value.as_array()) {
+        uint64_t raw = 0;
+        if (item.is_int64()) {
+            const int64_t signed_value = item.as_int64();
+            if (signed_value <= 0) {
+                throw std::invalid_argument("Panel NodeID must be positive");
+            }
+            raw = static_cast<uint64_t>(signed_value);
+        } else if (item.is_uint64()) {
+            raw = item.as_uint64();
+        } else {
+            throw std::invalid_argument("Panel NodeID must be an integer");
+        }
+        if (raw == 0 || raw > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+            throw std::invalid_argument(std::format(
+                "Panel NodeID {} must be between 1 and {}",
+                raw, std::numeric_limits<int>::max()));
+        }
+        const int node_id = static_cast<int>(raw);
+        if (!unique.insert(node_id).second) {
+            throw std::invalid_argument(std::format(
+                "Panel NodeID {} is duplicated", node_id));
+        }
+        result.values_.push_back(node_id);
+    }
+    return result;
+}
+
+PanelNodeIds PanelNodeIds::Single(int node_id) {
+    if (node_id <= 0) {
+        throw std::invalid_argument("Panel NodeID must be positive");
+    }
+    PanelNodeIds result;
+    result.values_.push_back(node_id);
+    return result;
+}
+
+bool IsValidPanelName(std::string_view name) noexcept {
+    if (name.empty()) {
+        return false;
+    }
+    for (const unsigned char ch : name) {
+        if (ch < 0x20 || ch == 0x7f || ch == '/' || ch == '\\') {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool IsValidPanelKey(std::string_view key) noexcept {
+    if (key.empty()) {
+        return false;
+    }
+    for (const unsigned char ch : key) {
+        if (ch <= 0x20 || ch == 0x7f || ch == '?' || ch == '#' || ch == '&') {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::optional<PanelApiUrlParts> ParsePanelApiUrl(std::string_view url) {
+    const size_t scheme_pos = url.find("://");
+    if (scheme_pos == std::string_view::npos) {
+        return std::nullopt;
+    }
+    const std::string_view scheme = url.substr(0, scheme_pos);
+    const bool is_http =
+        transport::internet::EqualsAsciiCI(scheme, constants::protocol::kHttp);
+    const bool is_https =
+        transport::internet::EqualsAsciiCI(scheme, constants::protocol::kHttps);
+    if (!is_http && !is_https) {
+        return std::nullopt;
+    }
+    const bool use_ssl = is_https;
+    const std::string_view rest = url.substr(scheme_pos + 3);
+    const size_t path_pos = rest.find('/');
+    const std::string_view authority = path_pos == std::string_view::npos
+        ? rest
+        : rest.substr(0, path_pos);
+    std::string_view path_prefix = path_pos == std::string_view::npos
+        ? std::string_view{}
+        : rest.substr(path_pos);
+
+    if (!transport::internet::IsValidHttpAuthority(authority)) {
+        return std::nullopt;
+    }
+    for (const unsigned char ch : path_prefix) {
+        if (ch <= 0x20 || ch == 0x7f || ch == '?' || ch == '#') {
+            return std::nullopt;
+        }
+    }
+
+    std::string_view host;
+    std::string_view explicit_port;
+    bool has_explicit_port = false;
+    if (authority.front() == '[') {
+        const size_t close_bracket = authority.find(']');
+        if (close_bracket == std::string_view::npos) {
+            return std::nullopt;
+        }
+        host = authority.substr(1, close_bracket - 1);
+        if (close_bracket + 1 < authority.size()) {
+            if (authority[close_bracket + 1] != ':') {
+                return std::nullopt;
+            }
+            has_explicit_port = true;
+            explicit_port = authority.substr(close_bracket + 2);
+        }
+    } else {
+        const size_t first_colon = authority.find(':');
+        const size_t last_colon = authority.rfind(':');
+        if (first_colon != std::string_view::npos && first_colon == last_colon) {
+            host = authority.substr(0, first_colon);
+            has_explicit_port = true;
+            explicit_port = authority.substr(last_colon + 1);
+        } else {
+            host = authority;
+        }
+    }
+
+    if (host.empty()) {
+        return std::nullopt;
+    }
+    uint16_t port = use_ssl ? 443 : 80;
+    if (has_explicit_port && !TargetAddress::ParsePort(explicit_port, port)) {
+        return std::nullopt;
+    }
+
+    const auto literal_address = iputil::ParseLiteral(host);
+    if (authority.front() == '[') {
+        if (!literal_address || !literal_address->is_v6()) {
+            return std::nullopt;
+        }
+    } else if (host.find(':') != std::string_view::npos ||
+               (!literal_address &&
+                !domain::IsValidDnsHostname(host, domain::TrailingDotPolicy::Allow))) {
+        return std::nullopt;
+    }
+    std::string normalized_host(host);
+    if (!literal_address) {
+        domain::NormalizeDnsHostnameInPlace(normalized_host);
+        if (iputil::ParseLiteral(normalized_host).has_value()) {
+            return std::nullopt;
+        }
+    }
+
+    while (!path_prefix.empty() && path_prefix.back() == '/') {
+        path_prefix.remove_suffix(1);
+    }
+
+    return PanelApiUrlParts{
+        .host = std::move(normalized_host),
+        .port = port,
+        .path_prefix = std::string(path_prefix),
+        .use_ssl = use_ssl,
+    };
+}
+
+PanelConfig PanelConfig::FromJson(const json::object& j) {
+    static constexpr std::string_view kLegacyKeys[] = {
+        "api_host", "request_timeout", "node_type", "node_ids",
+        "listen_ip", "send_ip", "enable_dns", "dns_type",
+        "proxy_protocol", "tls_enable", "tls_cert", "tls_key",
+    };
+    for (const std::string_view key : kLegacyKeys) {
+        if (j.contains(key)) {
+            throw std::invalid_argument(std::format(
+                "Panel config key '{}' is not supported; use keys without underscores",
+                key));
+        }
+    }
+
+    PanelConfig cfg;
+    cfg.Name      = JsonStringOr(j, "name", "");
+    if (j.contains("name") && cfg.Name.empty()) {
+        throw std::invalid_argument("Panel name must not be empty");
+    }
+    cfg.Type = JsonStringOr(j, "type", constants::panel::kV2BoardType);
+    if (transport::internet::EqualsAsciiCI(cfg.Type, constants::panel::kV2BoardType)) {
+        cfg.Type = std::string(constants::panel::kV2BoardType);
+    }
+    cfg.APIHost   = JsonStringOr(j, "apiHost", "");
+    cfg.Key       = JsonStringOr(j, "key", "");
+
+    if (const auto* timeout = j.if_contains("requestTimeout")) {
+        const auto seconds = JsonUnsignedInteger(*timeout);
+        if (!seconds || *seconds == 0 || *seconds > defaults::kMaxPanelRequestTimeout) {
+            throw std::invalid_argument(std::format(
+                "Panel requestTimeout must be an integer between 1 and {} seconds",
+                defaults::kMaxPanelRequestTimeout));
+        }
+        cfg.RequestTimeout = std::chrono::seconds(static_cast<int64_t>(*seconds));
+    }
+
+    cfg.NodeType = naming::LowerAscii(
+        JsonStringOr(j, "nodeType", constants::panel::kDefaultNodeType));
+
+    if (const auto* node_ids = j.if_contains("nodeIDs")) {
+        cfg.NodeIDs = PanelNodeIds::Parse(*node_ids);
+    }
+    if (!j.contains("name") && !cfg.NodeIDs.Empty()) {
+        cfg.Name = std::format("{}-{}", cfg.NodeType, cfg.NodeIDs.Front());
+    }
+    cfg.ListenIP = ParseInboundListen(j, "listenIP", "Panel listenIP", cfg.ListenIP);
+    if (const auto* send_ip = j.if_contains("sendIP")) {
+        if (!send_ip->is_string()) {
+            throw std::invalid_argument("Panel sendIP must be a string");
+        }
+        auto parsed = OutboundBind::Parse(send_ip->as_string());
+        if (!parsed) {
+            throw std::invalid_argument(std::format(
+                "Panel sendIP '{}' must be auto, wildcard, or an IP address",
+                send_ip->as_string()));
+        }
+        cfg.SendIP = std::move(*parsed);
+    }
+    cfg.EnableDNS = JsonBoolOr(j, "enableDNS", cfg.EnableDNS);
+    if (const auto* value = j.if_contains("dnsType")) {
+        if (!value->is_string()) {
+            throw std::invalid_argument("Panel dnsType must be a domain strategy string");
+        }
+        const auto strategy =
+            proxy::freedom::outbound::ParseDomainStrategy(value->as_string());
+        if (!strategy) {
+            throw std::invalid_argument("Panel dnsType is not a supported domain strategy");
+        }
+        cfg.DNSType = *strategy;
+    }
+    cfg.ProxyProtocol = ParseProxyProtocolMode(j, "proxyProtocol", cfg.ProxyProtocol);
+    cfg.TLSEnable = JsonBoolOr(j, "tlsEnable", cfg.TLSEnable);
+    cfg.TLSCert   = JsonStringOr(j, "tlsCert", cfg.TLSCert);
+    cfg.TLSKey    = JsonStringOr(j, "tlsKey", cfg.TLSKey);
+    if (cfg.TLSEnable) {
+        if (cfg.TLSCert.empty() != cfg.TLSKey.empty()) {
+            throw std::invalid_argument(
+                "Panel TLSCert and TLSKey must be configured together");
+        }
+        if (!cfg.TLSCert.empty()) {
+            cfg.TLSPem = LoadValidatedPanelTlsPem(cfg.TLSCert, cfg.TLSKey);
+        }
+    }
+    return cfg;
+}
+
+bool PanelConfig::Validate() const {
+    const PanelLogContext log_context{Name, APIHost, NodeIDs.Empty() ? 0 : NodeIDs.Front(), NodeType};
+    if (RequestTimeout <= std::chrono::seconds::zero() ||
+        RequestTimeout > std::chrono::seconds(defaults::kMaxPanelRequestTimeout)) {
+        LOG_PANEL_ERROR(log_context, "Panel RequestTimeout must be between 1 and {} seconds",
+                        defaults::kMaxPanelRequestTimeout);
+        return false;
+    }
+    if (Name.empty()) {
+        LOG_PANEL_ERROR(log_context, "Panel name is required");
+        return false;
+    }
+    if (!IsValidPanelName(Name)) {
+        LOG_PANEL_ERROR(log_context, "Panel name must not contain control characters");
+        return false;
+    }
+    if (APIHost.empty()) {
+        LOG_PANEL_ERROR(log_context, "Panel ApiHost is required");
+        return false;
+    }
+    if (!ParsePanelApiUrl(APIHost)) {
+        LOG_PANEL_ERROR(log_context, "Panel ApiHost is invalid");
+        return false;
+    }
+    if (Key.empty()) {
+        LOG_PANEL_ERROR(log_context, "Panel ApiKey is required");
+        return false;
+    }
+    if (!IsValidPanelKey(Key)) {
+        LOG_PANEL_ERROR(log_context, "Panel ApiKey contains invalid characters");
+        return false;
+    }
+    if (NodeIDs.Empty()) {
+        LOG_PANEL_ERROR(log_context, "Panel NodeIDs is required");
+        return false;
+    }
+    if (Type != constants::panel::kV2BoardType) {
+        LOG_PANEL_ERROR(log_context, "Panel Type must be {}", constants::panel::kV2BoardType);
+        return false;
+    }
+    if (NodeType != constants::protocol::kVmess &&
+        NodeType != constants::protocol::kVless &&
+        NodeType != constants::protocol::kTrojan &&
+        NodeType != constants::protocol::kShadowsocks &&
+        NodeType != constants::protocol::kAnyTLS &&
+        NodeType != constants::protocol::kHysteria &&
+        NodeType != constants::protocol::kHysteria2) {
+        LOG_PANEL_ERROR(log_context,
+                  "Panel NodeType must be {}, {}, {}, {}, {}, {} or {}",
+                  constants::protocol::kVmess,
+                  constants::protocol::kVless,
+                  constants::protocol::kTrojan,
+                  constants::protocol::kShadowsocks,
+                  constants::protocol::kAnyTLS,
+                  constants::protocol::kHysteria,
+                  constants::protocol::kHysteria2);
+        return false;
+    }
+    if (TLSEnable) {
+        if (TLSCert.empty() != TLSKey.empty()) {
+            LOG_PANEL_ERROR(log_context, "Panel TLSCert and TLSKey must be configured together");
+            return false;
+        }
+        if (!TLSPem && !TLSCert.empty()) {
+            try {
+                (void)LoadValidatedPanelTlsPem(TLSCert, TLSKey);
+            } catch (const std::exception& e) {
+                LOG_PANEL_ERROR(log_context, "Panel TLS material is invalid: {}", e.what());
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+namespace infra {
+
+bool IsValidRealityServerName(std::string_view name) noexcept {
+    return !name.empty() && !iputil::ParseLiteral(name) &&
+           domain::IsValidDnsHostname(name, domain::TrailingDotPolicy::Forbid);
+}
+
+tl::expected<void, std::string> ApplyRealityServerInput(
+    const RealityServerInput& input, RealityConfig& out) {
+    if (input.private_key) {
+        if (input.private_key->empty()) {
+            return tl::unexpected("REALITY privateKey must not be empty");
+        }
+        auto parsed = transport::internet::ParseRealityKey(*input.private_key);
+        if (!parsed) {
+            return tl::unexpected("REALITY privateKey is invalid");
+        }
+        out.private_key = *parsed;
+    }
+
+    std::vector<std::string> server_names;
+    server_names.reserve(input.server_names.size());
+    for (const auto& name : input.server_names) {
+        // An empty entry explicitly permits a REALITY ClientHello without SNI.
+        if (!name.empty() && !IsValidRealityServerName(name)) {
+            return tl::unexpected(
+                "REALITY serverNames contains an invalid hostname");
+        }
+        server_names.push_back(naming::LowerAscii(name));
+    }
+
+    std::vector<transport::internet::RealityShortId> short_ids;
+    short_ids.reserve(input.short_ids.size());
+    for (const auto& short_id : input.short_ids) {
+        auto parsed = transport::internet::ParseRealityShortId(short_id);
+        if (!parsed) {
+            return tl::unexpected("REALITY shortIds contains an invalid value");
+        }
+        short_ids.push_back(*parsed);
+    }
+
+    std::string dest_host;
+    uint16_t dest_port = 0;
+    if (input.dest) {
+        const auto parsed = TargetAddress::Parse(*input.dest);
+        if (!parsed) {
+            return tl::unexpected("REALITY dest is invalid");
+        }
+        dest_host = parsed->IsIP()
+            ? iputil::NormalizeAddressString(*parsed->resolved_addr)
+            : std::string(parsed->host);
+        dest_port = parsed->port;
+    }
+
+    if (input.xver > 2) {
+        return tl::unexpected("REALITY xver must be between 0 and 2");
+    }
+    if (input.xver != 0 && (dest_host.empty() || dest_port == 0)) {
+        return tl::unexpected(
+            "REALITY xver 1 and 2 require dest for PROXY protocol forwarding");
+    }
+
+    std::optional<transport::internet::RealityKey> mldsa65_seed;
+    if (input.mldsa65_seed) {
+        auto parsed =
+            transport::internet::ParseRealityMldsa65Seed(*input.mldsa65_seed);
+        if (input.mldsa65_seed->empty() || !parsed) {
+            return tl::unexpected("REALITY mldsa65Seed is invalid");
+        }
+        mldsa65_seed = *parsed;
+    }
+
+    const auto min_client_version =
+        transport::internet::ParseRealityClientVersion(input.min_client_ver);
+    if (!min_client_version) {
+        return tl::unexpected("REALITY minClientVer is invalid");
+    }
+    const auto max_client_version =
+        transport::internet::ParseRealityClientVersion(input.max_client_ver);
+    if (!max_client_version) {
+        return tl::unexpected("REALITY maxClientVer is invalid");
+    }
+    if (*min_client_version && *max_client_version &&
+        transport::internet::RealityClientVersionValue(**min_client_version) >
+            transport::internet::RealityClientVersionValue(**max_client_version)) {
+        return tl::unexpected(
+            "REALITY minClientVer must not exceed maxClientVer");
+    }
+
+    out.server_names = std::move(server_names);
+    out.short_ids = std::move(short_ids);
+    out.dest_host = std::move(dest_host);
+    out.dest_port = dest_port;
+    out.xver = static_cast<uint8_t>(input.xver);
+    if (mldsa65_seed) {
+        out.mldsa65_seed = *mldsa65_seed;
+    }
+    out.min_client_version = *min_client_version;
+    out.max_client_version = *max_client_version;
+    out.max_time_diff = input.max_time_diff;
+    return {};
+}
+
+tl::expected<void, std::string> ValidateInboundReality(
+    const RealityConfig& config) {
+    if (!config.private_key) {
+        return tl::unexpected("inbound REALITY requires privateKey");
+    }
+    if (config.server_names.empty()) {
+        return tl::unexpected(
+            "inbound REALITY requires at least one serverName");
+    }
+    if (config.short_ids.empty()) {
+        return tl::unexpected("inbound REALITY requires at least one shortId");
+    }
+    return {};
+}
+
+tl::expected<std::string, std::string> NormalizeTlsServerName(
+    std::string_view value, std::string_view field) {
+    if (value.empty()) {
+        return std::string{};
+    }
+    if (!iputil::ParseLiteral(value) &&
+        !domain::IsValidDnsHostname(value, domain::TrailingDotPolicy::Forbid)) {
+        return tl::unexpected(std::format(
+            "{} must be an IP address or DNS hostname", field));
+    }
+    return naming::LowerAscii(std::string(value));
+}
+
+tl::expected<std::string, std::string> NormalizeTransportPath(
+    std::string_view value, std::string_view field) {
+    if (value.empty()) {
+        return std::string(constants::binding::kRootPath);
+    }
+    if (!transport::internet::IsValidHttpRequestTarget(value)) {
+        return tl::unexpected(std::format(
+            "{} must be a valid HTTP request target", field));
+    }
+    return std::string(value);
+}
+
+tl::expected<std::string, std::string> NormalizeHttpAuthority(
+    std::string_view value, std::string_view field) {
+    if (value.empty()) {
+        return std::string{};
+    }
+    if (!transport::internet::IsValidHttpAuthority(value)) {
+        return tl::unexpected(std::format(
+            "{} must be a valid HTTP authority", field));
+    }
+    return naming::LowerAscii(std::string(value));
+}
+
+tl::expected<void, std::string> ValidateGrpcServiceName(
+    std::string_view value, std::string_view field) {
+    for (const unsigned char ch : value) {
+        if (ch <= 0x20 || ch == 0x7f || ch == '#') {
+            return tl::unexpected(std::format(
+                "{} contains invalid characters", field));
+        }
+    }
+    GrpcConfig probe;
+    probe.service_name = std::string(value);
+    if (!transport::internet::IsValidHttpRequestTarget(probe.RequestPath())) {
+        return tl::unexpected(std::format(
+            "{} path must be a valid HTTP request target", field));
+    }
+    return {};
+}
+
+tl::expected<uint8_t, std::string> ParseSniffDestOverride(
+    std::span<const std::string> protocols) {
+    uint8_t bits = 0;
+    for (const auto& raw : protocols) {
+        const std::string protocol = naming::LowerAscii(raw);
+        if (protocol == "fakedns" || protocol == "fakedns+others") {
+            return tl::unexpected(
+                "sniffing destOverride fakedns is not supported");
+        }
+        const uint8_t bit = SniffConfig::DestOverrideBit(protocol);
+        if (bit == 0) {
+            return tl::unexpected(std::format(
+                "sniffing destOverride contains unsupported value '{}'",
+                protocol));
+        }
+        bits |= bit;
+    }
+    return bits;
+}
+
+tl::expected<std::string, std::string> ParseAnyTlsPaddingScheme(
+    const json::value& value, std::string_view field) {
+    std::string scheme;
+    if (value.is_null()) {
+        return scheme;
+    }
+    if (value.is_string()) {
+        scheme = std::string(value.as_string());
+    } else if (value.is_array()) {
+        bool first = true;
+        for (const auto& item : value.as_array()) {
+            if (!item.is_string()) {
+                return tl::unexpected(std::format(
+                    "{} must contain only strings", field));
+            }
+            if (!first) {
+                scheme.push_back('\n');
+            }
+            scheme.append(item.as_string());
+            first = false;
+        }
+    } else {
+        return tl::unexpected(std::format(
+            "{} must be a string, array of strings, or null", field));
+    }
+    if (scheme.empty()) {
+        return scheme;
+    }
+    // The advertised raw scheme must fit in one UpdatePaddingScheme frame.
+    if (scheme.size() > anytls::kMaxFramePayload) {
+        return tl::unexpected(std::format(
+            "{} exceeds {} bytes", field, anytls::kMaxFramePayload));
+    }
+    if (!anytls::ParsePaddingScheme(scheme)) {
+        return tl::unexpected(std::format("{} is invalid", field));
+    }
+    return scheme;
+}
+
+InboundListen ParseInboundListen(
+    const json::object& object,
+    std::string_view key,
+    std::string_view field_label,
+    InboundListen fallback) {
+    const auto* value = object.if_contains(key);
+    if (!value) {
+        return fallback;
+    }
+    if (!value->is_string()) {
+        throw std::invalid_argument(std::format("{} must be a string", field_label));
+    }
+    auto parsed = InboundListen::Parse(value->as_string());
+    if (!parsed) {
+        throw std::invalid_argument(std::format(
+            "{} '{}' must be auto or an IP address",
+            field_label, value->as_string()));
+    }
+    return std::move(*parsed);
+}
+
+}  // namespace infra

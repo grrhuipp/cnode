@@ -5,7 +5,7 @@
 #include "../encoding/client.hpp"
 #include "../vmess_crypto.hpp"
 #include "../vmess_request.hpp"
-#include "../../handshake_timeout.hpp"
+#include "../../inbound_admission.hpp"
 #include "../../outbound_server.hpp"
 #include "../../outbound_stream_endpoint.hpp"
 #include "app/relay.hpp"

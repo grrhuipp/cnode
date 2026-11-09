@@ -2,7 +2,6 @@
 
 #include "common/allocator.hpp"
 #include "app/proxyman/inbound/prepared_config.hpp"
-#include "app/rate_limiter_fwd.hpp"
 #include "common/sharded_user_stats.hpp"
 
 #include <memory>
@@ -13,6 +12,8 @@
 #include <vector>
 
 
+class ConnectionLimiter;
+struct ConnectionFamily;
 class Inbound;
 struct InboundProtocolSettings;
 struct InboundUserSpec;

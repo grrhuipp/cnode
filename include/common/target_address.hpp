@@ -67,8 +67,7 @@ struct TargetAddress {
             return IsDomain() && other.IsDomain() &&
                    domain::DnsHostnamesEqual(host, other.host);
         }
-        return iputil::NormalizeAddress(*resolved_addr) ==
-               iputil::NormalizeAddress(*other.resolved_addr);
+        return *resolved_addr == *other.resolved_addr;
     }
 
     bool IsDomain() const noexcept {
@@ -243,12 +242,10 @@ struct std::formatter<::TargetAddress> {
     template <class FormatContext>
     auto format(const ::TargetAddress& target, FormatContext& ctx) const {
         std::optional<::iputil::AddressText> ip_storage;
-        std::optional<::net::ip::address> normalized_resolved;
         std::string_view host(target.host.data(), target.host.size());
         const bool use_resolved = host.empty() && target.resolved_addr.has_value();
         if (use_resolved) {
-            normalized_resolved = ::iputil::NormalizeAddress(*target.resolved_addr);
-            ip_storage.emplace(*normalized_resolved);
+            ip_storage.emplace(*target.resolved_addr);
             host = ip_storage->View();
         }
         if (host.empty()) {
@@ -256,7 +253,7 @@ struct std::formatter<::TargetAddress> {
         }
 
         const bool needs_brackets = use_resolved
-            ? normalized_resolved->is_v6()
+            ? target.resolved_addr->is_v6()
             : host.find(':') != std::string_view::npos;
         if (needs_brackets) {
             return std::format_to(ctx.out(), "[{}]:{}", host, target.port);

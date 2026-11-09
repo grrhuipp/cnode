@@ -4,7 +4,6 @@
 #include "common/asio_types.hpp"
 #include "common/error.hpp"
 #include "app/relay_types.hpp"
-#include "app/rate_limiter_fwd.hpp"
 #include "proxy/inbound_datagram.hpp"
 
 #include <tl/expected.hpp>
@@ -12,6 +11,8 @@
 #include <cstdint>
 
 
+class ConnectionLimiter;
+struct ConnectionFamily;
 class AsyncStream;
 struct TimeoutsConfig;
 

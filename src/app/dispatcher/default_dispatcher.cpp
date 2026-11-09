@@ -1,6 +1,5 @@
 #include "app/dispatcher/default_dispatcher.hpp"
 
-#include "outbound_selection.hpp"
 #include "../../common/awaitable_task_group.hpp"
 
 #include "app/stats.hpp"
@@ -8,7 +7,7 @@
 #include "app/request_load_state.hpp"
 #include "app/dns/dns.hpp"
 #include "common/session.hpp"
-#include "features/policy/request_policy.hpp"
+#include "common/rule.hpp"
 #include "app/proxyman/outbound/handler.hpp"
 #include "infra/runtime_config_types.hpp"
 #include "infra/log.hpp"
@@ -301,7 +300,7 @@ struct ActiveSessionScope {
 DefaultDispatcher::DefaultDispatcher(
     const routing::Router& router,
     proxyman::outbound::HandlerLookup& outbound_handlers,
-    features::policy::RequestPolicy& request_policy,
+    rule::DetectRulePolicy& request_policy,
     app::SessionTrackingState& session_tracking,
     app::dns::DNS& dns_service,
     app::RequestLoadState& request_load) noexcept

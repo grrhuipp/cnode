@@ -18,8 +18,7 @@
 
 namespace transport::internet::detail {
 
-// Domain-owned aggregate deadlines. The sole embedded event follows the domain's
-// current Worker scheduler without retaining a pre-handoff scheduler reference.
+// Stream/socket aggregate deadlines on the owning Worker's timeout scheduler.
 template<class Owner>
 class ConnectionTimeouts final : private TimeoutEvent {
 public:

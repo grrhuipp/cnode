@@ -2,7 +2,7 @@
 
 #include "anytls_outbound.hpp"
 #include "../anytls_codec.hpp"
-#include "app/dns/dns_worker.hpp"
+#include "app/dns/dns.hpp"
 #include "app/stats.hpp"
 #include "app/session_group_executor.hpp"
 #include "common/session.hpp"

@@ -116,12 +116,33 @@ private:
 //   - 无 chunk 分帧（整包一次性 AEAD）
 // ============================================================================
 
-struct Ss2022UdpSessionState {
+struct Ss2022UdpTxState {
     SsCipherInfo cipher_info{};
     KeyBytes key;
     std::array<uint8_t, 8> client_session_id{};
     std::array<uint8_t, 8> server_session_id{};
     uint64_t next_packet_id = 0;
+
+    Ss2022UdpTxState() = default;
+    Ss2022UdpTxState(const Ss2022UdpTxState&) = default;
+    Ss2022UdpTxState& operator=(const Ss2022UdpTxState&) = default;
+    Ss2022UdpTxState(Ss2022UdpTxState&&) noexcept = default;
+    Ss2022UdpTxState& operator=(Ss2022UdpTxState&&) noexcept = default;
+
+    void Clear() noexcept {
+        ::SecureZeroMemory(key.bytes.data(), key.bytes.size());
+        key.size = 0;
+        ::SecureZeroMemory(client_session_id.data(), client_session_id.size());
+        ::SecureZeroMemory(server_session_id.data(), server_session_id.size());
+        next_packet_id = 0;
+    }
+
+    ~Ss2022UdpTxState() noexcept {
+        Clear();
+    }
+};
+
+struct Ss2022UdpSessionState : Ss2022UdpTxState {
     Ss2022UdpReplayCache receive_replay_cache;
 };
 
@@ -199,7 +220,7 @@ struct SsUdpDecodeResult {
     const TargetAddress& target,
     const uint8_t* payload,
     size_t payload_len,
-    Ss2022UdpSessionState& state,
+    Ss2022UdpTxState& state,
     std::span<const KeyBytes> psk_chain,
     uint8_t* output,
     size_t output_size,
@@ -209,7 +230,7 @@ struct SsUdpDecodeResult {
     const TargetAddress& target,
     const uint8_t* payload,
     size_t payload_len,
-    Ss2022UdpSessionState& state,
+    Ss2022UdpTxState& state,
     uint8_t* output,
     size_t output_size);
 

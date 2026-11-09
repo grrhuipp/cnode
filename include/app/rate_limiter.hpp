@@ -1,5 +1,6 @@
 #pragma once
-#include "app/rate_limiter_fwd.hpp"
+class ConnectionLimiter;
+struct ConnectionFamily;
 #include "common/auth_failure_limit.hpp"
 #include "app/session_group_executor.hpp"
 // ============================================================================
@@ -140,6 +141,17 @@ public:
         return hash == 0 ? 1 : hash;
     }
 
+    [[nodiscard]] AuthCredentialKey IpBanKey(
+        std::string_view tag, std::string_view ip) const noexcept {
+        return ip_fingerprint_->Hash(tag, std::span(
+            reinterpret_cast<const uint8_t*>(ip.data()), ip.size()), 0);
+    }
+    [[nodiscard]] std::optional<AuthCredentialKey> ComputeIpBanKey(
+        std::string_view tag, std::string_view ip) const noexcept {
+        if (!TracksAuthBan() || ip.empty()) return std::nullopt;
+        return IpBanKey(tag, ip);
+    }
+
     [[nodiscard]] RejectReason TryAcceptGlobal() noexcept {
         if (!TracksGlobalConnections()) return RejectReason::NONE;
         if (total_ >= cfg_.max_connections) return RejectReason::MAX_CONNECTIONS;
@@ -148,26 +160,38 @@ public:
     }
 
     [[nodiscard]] RejectReason CheckIPBan(
+        const AuthCredentialKey& ban_key, uint64_t now = NowSeconds()) const noexcept {
+        if (!TracksAuthBan()) return RejectReason::NONE;
+        return ip_failures_->Check(ban_key, cfg_.ip_ban, now, RejectReason::IP_BANNED);
+    }
+    [[nodiscard]] RejectReason CheckIPBan(
         std::string_view tag, std::string_view ip, uint64_t now = NowSeconds()) const noexcept {
         if (!TracksAuthBan() || ip.empty()) return RejectReason::NONE;
-        return ip_failures_->Check(IpBanKey(tag, ip), cfg_.ip_ban, now,
-                                   RejectReason::IP_BANNED);
+        return CheckIPBan(IpBanKey(tag, ip), now);
     }
 
     [[nodiscard]] RejectReason TryAcceptIP(
-        std::string_view tag, std::string_view ip, bool check_auth_ban = true,
+        uint64_t ip_hash, const std::optional<AuthCredentialKey>& ban_key,
         uint64_t now = NowSeconds()) noexcept {
-        if (check_auth_ban && TracksAuthBan()) {
-            const auto reason = CheckIPBan(tag, ip, now);
+        if (ban_key) {
+            const auto reason = CheckIPBan(*ban_key, now);
             if (reason != RejectReason::NONE) return reason;
         }
         if (!TracksIpConnections()) return RejectReason::NONE;
-        auto* slot = FindOrCreateConnection(IpHash(ip));
+        auto* slot = FindOrCreateConnection(ip_hash);
         if (!slot) return RejectReason::TRACKING_CAPACITY;
         if (slot->conns >= cfg_.max_conn_per_ip)
             return RejectReason::MAX_CONNECTIONS_PER_IP;
         ++slot->conns;
         return RejectReason::NONE;
+    }
+    [[nodiscard]] RejectReason TryAcceptIP(
+        std::string_view tag, std::string_view ip, bool check_auth_ban = true,
+        uint64_t now = NowSeconds()) noexcept {
+        return TryAcceptIP(
+            TracksIpConnections() ? IpHash(ip) : 0,
+            check_auth_ban ? ComputeIpBanKey(tag, ip) : std::nullopt,
+            now);
     }
 
     void ReleaseGlobal() noexcept {
@@ -187,13 +211,19 @@ public:
     }
 
     void OnAuthFailTracked(
+        const std::optional<AuthCredentialKey>& ip_ban_key,
+        std::optional<AuthCredentialKey> credential = std::nullopt,
+        uint64_t now = NowSeconds()) noexcept {
+        if (ip_ban_key && TracksAuthBan())
+            ip_failures_->Record(*ip_ban_key, cfg_.ip_ban, now);
+        if (credential)
+            credential_failures_->Record(*credential, kCredentialBan, now);
+    }
+    void OnAuthFailTracked(
         std::string_view tag, std::string_view ip,
         std::optional<AuthCredentialKey> credential = std::nullopt,
         uint64_t now = NowSeconds()) noexcept {
-        if (TracksAuthBan() && !ip.empty())
-            ip_failures_->Record(IpBanKey(tag, ip), cfg_.ip_ban, now);
-        if (credential)
-            credential_failures_->Record(*credential, kCredentialBan, now);
+        OnAuthFailTracked(ComputeIpBanKey(tag, ip), credential, now);
     }
 
     [[nodiscard]] bool IsBanned(
@@ -307,11 +337,6 @@ private:
         std::array<Slot, kSlotCount> slots_{};
     };
 
-    [[nodiscard]] AuthCredentialKey IpBanKey(
-        std::string_view tag, std::string_view ip) const noexcept {
-        return ip_fingerprint_->Hash(tag, std::span(
-            reinterpret_cast<const uint8_t*>(ip.data()), ip.size()), 0);
-    }
     [[nodiscard]] ConnectionSlot* FindOrCreateConnection(uint64_t hash) noexcept {
         const size_t index = hash & kMask;
         ConnectionSlot* idle = nullptr;
@@ -417,8 +442,8 @@ public:
     net::awaitable<Admission> ReservePhysical(
         std::string_view tag = {}, std::string_view ip = {},
         bool check_ban = false) {
-        check_ban = check_ban && TracksAuthBan() && !ip.empty();
-        if (!core_.TracksGlobalConnections() && !check_ban) {
+        const auto ban_key = check_ban ? core_.ComputeIpBanKey(tag, ip) : std::nullopt;
+        if (!core_.TracksGlobalConnections() && !ban_key) {
             return []() -> net::awaitable<Admission> {
                 co_return Admission{RejectReason::NONE, {}};
             }();
@@ -431,13 +456,10 @@ public:
         node->physical = true;
         auto reservation = Reservation(std::move(node));
         return coordinator_->PostCall(
-            [reservation = std::move(reservation),
-             tag = std::string(check_ban ? tag : std::string_view{}),
-             ip = std::string(check_ban ? ip : std::string_view{}),
-             check_ban]() mutable {
+            [reservation = std::move(reservation), ban_key]() mutable {
                 auto& node = *reservation.node_;
-                if (check_ban) {
-                    const auto reason = node.owner->core_.CheckIPBan(tag, ip);
+                if (ban_key) {
+                    const auto reason = node.owner->core_.CheckIPBan(*ban_key);
                     if (reason != RejectReason::NONE)
                         return Admission{reason, std::move(reservation)};
                 }
@@ -469,23 +491,21 @@ public:
             });
     }
     net::awaitable<bool> IsBanned(std::string_view tag, std::string_view ip) {
-        if (!TracksAuthBan() || ip.empty())
+        const auto ban_key = core_.ComputeIpBanKey(tag, ip);
+        if (!ban_key)
             return []() -> net::awaitable<bool> { co_return false; }();
-        return coordinator_->PostCall([self = shared_from_this(),
-            tag = std::string(tag), ip = std::string(ip)] {
-            return self->core_.IsBanned(tag, ip);
+        return coordinator_->PostCall([self = shared_from_this(), ban_key = *ban_key] {
+            return self->core_.CheckIPBan(ban_key) == RejectReason::IP_BANNED;
         });
     }
     net::awaitable<void> OnAuthFailTracked(
         std::string_view tag, std::string_view ip,
         std::optional<AuthCredentialKey> credential = std::nullopt) {
-        const bool track_ip = TracksAuthBan() && !ip.empty();
-        if (!track_ip && !credential)
+        const auto ip_ban_key = core_.ComputeIpBanKey(tag, ip);
+        if (!ip_ban_key && !credential)
             return []() -> net::awaitable<void> { co_return; }();
-        return coordinator_->PostCall([self = shared_from_this(),
-            tag = std::string(track_ip ? tag : std::string_view{}),
-            ip = std::string(track_ip ? ip : std::string_view{}), credential] {
-            self->core_.OnAuthFailTracked(tag, ip, credential);
+        return coordinator_->PostCall([self = shared_from_this(), ip_ban_key, credential] {
+            self->core_.OnAuthFailTracked(ip_ban_key, credential);
         });
     }
 private:
@@ -520,36 +540,37 @@ private:
     }
     net::awaitable<Admission> Reserve(std::shared_ptr<Family> family,
         std::string_view tag, std::string_view ip, bool check_ban) {
-        check_ban = check_ban && TracksAuthBan() && !ip.empty();
+        const auto ban_key = check_ban ? core_.ComputeIpBanKey(tag, ip) : std::nullopt;
         if (!core_.TracksGlobalConnections()) {
             family.reset();
         }
-        if (!core_.TracksGlobalConnections() && !core_.TracksIpConnections() && !check_ban) {
+        if (!core_.TracksGlobalConnections() && !core_.TracksIpConnections() && !ban_key) {
             return []() -> net::awaitable<Admission> {
                 co_return Admission{RejectReason::NONE, {}};
             }();
         }
+        const uint64_t ip_hash = core_.TracksIpConnections()
+            ? ConnectionLimiterCore::IpHash(ip) : 0;
         auto node = std::make_unique<Return>();
         node->owner = shared_from_this();
         node->family = std::move(family);
         node->child = bool(node->family);
         auto reservation = Reservation(std::move(node));
         return coordinator_->PostCall([reservation = std::move(reservation),
-            tag = std::string(check_ban ? tag : std::string_view{}),
-            ip = std::string(ip), check_ban]() mutable {
+            ip_hash, ban_key]() mutable {
             auto& node = *reservation.node_;
             auto& core = node.owner->core_;
             const bool extra_global = node.child &&
                 (node.family->children != 0 || !node.family->physical);
             auto reason = extra_global ? core.TryAcceptGlobal() : RejectReason::NONE;
             if (reason == RejectReason::NONE) {
-                reason = core.TryAcceptIP(tag, ip, check_ban);
+                reason = core.TryAcceptIP(ip_hash, ban_key);
                 if (reason != RejectReason::NONE && extra_global) core.ReleaseGlobal();
             }
             if (reason == RejectReason::NONE) {
                 const bool tracked_ip = core.TracksIpConnections();
                 if (tracked_ip) {
-                    node.ip_hash = ConnectionLimiterCore::IpHash(ip);
+                    node.ip_hash = ip_hash;
                 }
                 if (node.child) {
                     ++node.family->children;

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "api/api.hpp"
-#include "app/traffic_types.hpp"
+#include "app/session_tracking.hpp"
 #include "infra/panel_config.hpp"
 
 #include <filesystem>

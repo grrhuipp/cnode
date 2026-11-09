@@ -36,10 +36,9 @@ inline constexpr std::string_view kHttp2ClientPreface =
 //   their memory reservation until consumed or discarded.
 // - XHTTP uploads retain their additional shared session budget.
 
-// Each server captures its physical entry's ExecutionDomain executor (or the
-// supplied io_context executor when no domain exists). The read pump, logical
-// requests, upload joins, close/reset work, and credit writer share that owned
-// task group and join before return; migration does not move their storage.
+// The read pump, logical requests, upload joins, close/reset work, and credit
+// writer share the session's owned task group on the Worker reactor and join
+// before return.
 // gRPC server: reads the client preface, then serves the connection until it
 // ends. Logical streams are delivered to `stream_handler`.
 [[nodiscard]] net::awaitable<TransportBuildResult> DoGrpcServerHandshake(

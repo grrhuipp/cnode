@@ -27,10 +27,6 @@ struct SniffResult {
 // TLS 嗅探（从 ClientHello SNI 扩展中提取域名）
 [[nodiscard]] SniffResult SniffTls(std::span<const uint8_t> data);
 
-// QUIC CRYPTO 里是裸 handshake，没有 TLS record 头。返回值借用 handshake。
-[[nodiscard]] std::optional<std::string_view> ParseClientHelloServerName(
-    std::span<const uint8_t> handshake);
-
 // HTTP 嗅探（从 Host 头提取域名）
 [[nodiscard]] SniffResult SniffHttp(std::span<const uint8_t> data);
 

@@ -1,8 +1,6 @@
 #include "hysteria_ingress.hpp"
 
-#include "quic_connection.hpp"
 #include "hysteria_protocol.hpp"
-#include "quic_memory.hpp"
 #include "quic_stream.hpp"
 
 #include "app/proxyman/inbound/handler.hpp"
@@ -21,10 +19,10 @@
 #include "infra/log.hpp"
 #include "transport/internet/transport_stack.hpp"
 #include "transport/internet/timeout_scheduler.hpp"
-#include "../tls_client_context.hpp"
+#include "../autosign_cert.hpp"
 #include "../../../proxy/inbound_admission.hpp"
 #include "../../../common/awaitable_task_group.hpp"
-#include "../../../app/udp_receive_buffer.hpp"
+#include "../../../app/worker/udp_receive_loop.hpp"
 
 #include <nghttp3/nghttp3.h>
 #include <ngtcp2/ngtcp2.h>
@@ -44,6 +42,7 @@
 #include <chrono>
 #include <cstring>
 #include <limits>
+#include <new>
 #include <optional>
 #include <stdexcept>
 #include <utility>
@@ -52,6 +51,84 @@ namespace transport::internet::hysteria {
 
 namespace {
 
+
+// ngtcp2/nghttp3 do not provide allocation sizes to free(). Prefix each block
+// with its exact PMR layout so Free can return slots to the current Worker's
+// shared pool without a side table.
+class QuicMemory final {
+public:
+    [[nodiscard]] static const ngtcp2_mem* Ngtcp2() noexcept {
+        static const ngtcp2_mem kMem{nullptr, &Allocate, &Free, &Callocate, &Reallocate};
+        return &kMem;
+    }
+
+    [[nodiscard]] static const nghttp3_mem* Nghttp3() noexcept {
+        static const nghttp3_mem kMem{nullptr, &Allocate, &Free, &Callocate, &Reallocate};
+        return &kMem;
+    }
+
+private:
+    struct alignas(std::max_align_t) AllocationHeader {
+        size_t payload_size;
+        size_t allocation_size;
+    };
+
+    static constexpr size_t kAlignment = alignof(std::max_align_t);
+
+    [[nodiscard]] static bool AllocationSize(size_t payload_size, size_t& result) noexcept {
+        if (payload_size > std::numeric_limits<size_t>::max() - sizeof(AllocationHeader))
+            return false;
+        result = sizeof(AllocationHeader) + payload_size;
+        return true;
+    }
+
+    static void* Allocate(size_t size, void*) {
+        try {
+            size_t allocation_size = 0;
+            if (!AllocationSize(size, allocation_size)) return nullptr;
+            void* raw =
+                memory::ThreadMemoryPool().Allocate(allocation_size, kAlignment);
+            if (!raw) return nullptr;
+            auto* header =
+                ::new (raw) AllocationHeader{size, allocation_size};
+            return header + 1;
+        } catch (...) {
+            return nullptr;
+        }
+    }
+
+    static void Free(void* pointer, void*) noexcept {
+        if (!pointer) return;
+        auto* header = static_cast<AllocationHeader*>(pointer) - 1;
+        const size_t allocation_size = header->allocation_size;
+        header->~AllocationHeader();
+        memory::ThreadMemoryPool().Deallocate(
+            header, allocation_size, kAlignment);
+    }
+
+    static void* Callocate(size_t count, size_t size, void* user_data) {
+        if (size != 0 && count > std::numeric_limits<size_t>::max() / size)
+            return nullptr;
+        const size_t bytes = count * size;
+        void* pointer = Allocate(bytes, user_data);
+        if (pointer) std::memset(pointer, 0, bytes);
+        return pointer;
+    }
+
+    static void* Reallocate(void* pointer, size_t size, void* user_data) {
+        if (!pointer) return Allocate(size, user_data);
+        if (size == 0) {
+            Free(pointer, user_data);
+            return nullptr;
+        }
+        auto* old_header = static_cast<AllocationHeader*>(pointer) - 1;
+        void* replacement = Allocate(size, user_data);
+        if (!replacement) return nullptr;
+        std::memcpy(replacement, pointer, std::min(old_header->payload_size, size));
+        Free(pointer, user_data);
+        return replacement;
+    }
+};
 constexpr size_t kMaxPacketSize = 64 * 1024;
 constexpr size_t kMaxQueuedSocketPackets = 1024;
 constexpr size_t kMaxConnections = 65536;
@@ -205,13 +282,17 @@ std::shared_ptr<Connection> Connection::Create(
     const udp::endpoint& remote, const ngtcp2_pkt_hd& header) {
     auto connection = std::shared_ptr<Connection>(
         new Connection(listener, socket, remote));
+    if (!connection->Initialize(header)) return nullptr;
     bool tracked = false;
     try {
         listener.Associate(header.dcid, connection);
+        listener.Associate(connection->core_->server_cid, connection);
         listener.sessions.emplace(connection.get(), connection);
+        listener.environment.stats->OnConnectionAccepted();
+        connection->stats_open_ = true;
         ++listener.tasks;
         tracked = true;
-        net::co_spawn(connection->Reactor(), connection->Run(header),
+        net::co_spawn(connection->Reactor(), connection->Run(),
             [connection](std::exception_ptr error) {
                 auto* owner = connection->listener_;
                 connection->Close();
@@ -397,19 +478,12 @@ void Connection::SpawnOwned(net::awaitable<void> task) {
     }(shared_from_this(), std::move(task)));
 }
 
-net::awaitable<void> Connection::Run(ngtcp2_pkt_hd header) {
+net::awaitable<void> Connection::Run() {
     std::exception_ptr failure;
     if (listener_->environment.active_sessions) ++*listener_->environment.active_sessions;
     try {
         co_await RunAwaitableTaskGroup(Reactor().get_executor(), [&](AwaitableTaskGroup& tasks) {
             tasks_ = &tasks;
-            if (!Initialize(header)) {
-                Close();
-                return;
-            }
-            listener_->Associate(core_->server_cid, shared_from_this());
-            listener_->environment.stats->OnConnectionAccepted();
-            stats_open_ = true;
             tasks.Spawn(WaitClosed());
             tasks.Spawn(ReservePhysicalAdmission());
             listener_->Pump(shared_from_this());
@@ -1638,10 +1712,11 @@ net::awaitable<void> HysteriaIngress::ReceiveLoop(std::shared_ptr<SocketState> s
                 ngtcp2_pkt_hd header{};
                 if (ngtcp2_accept(&header, packet.data(), packet.size()) != 0) continue;
                 connection = Connection::Create(*this, *socket, socket->remote, header);
+                if (!connection) continue;
             }
             if (connection && connection->core_ && connection->core_->quic &&
-                connection->tasks_ && connection->core_->inbox.empty() &&
-                !connection->Closed()) {
+                connection->core_->inbox.empty() && !connection->Closed() &&
+                (connection->tasks_ || (packet[0] & 0x80) != 0)) {
                 (void)connection->Feed(*socket, socket->remote, packet, true);
             } else {
                 Enqueue(connection, socket, socket->remote,

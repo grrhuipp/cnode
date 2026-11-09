@@ -8,7 +8,6 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
-#include <optional>
 #include <string_view>
 #include <vector>
 
@@ -90,7 +89,7 @@ private:
     // Destroyed in reverse order: the protocol instance before the dialer,
     // the dialer before the sender settings it borrows from config_.
     OutboundConfiguration::Entry config_;
-    std::optional<OutboundDialer> dialer_;
+    OutboundDialer dialer_;
     std::unique_ptr<::Outbound> proxy_;
 };
 

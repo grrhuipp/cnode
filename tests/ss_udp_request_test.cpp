@@ -1,8 +1,8 @@
 #include <gtest/gtest.h>
 
-#include "proxy/shadowsocks/outbound/udp_request.hpp"
+#include "proxy/shadowsocks/outbound/ss_outbound.hpp"
 #include "proxy/shadowsocks/ss_udp.hpp"
-#include "app/dns/dns_worker.hpp"
+#include "app/dns/dns.hpp"
 
 #include <asio/co_spawn.hpp>
 #include <asio/redirect_error.hpp>

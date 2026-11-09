@@ -59,15 +59,15 @@ public:
         } catch (...) {
             TimeoutEvent::Cancel();
         }
-        // Domain failure/release can already have detached the event. The
-        // waiter still needs its cancellation wakeup; its receive deliberately
-        // does not use the parent's cancellation slot.
+        // Scheduler shutdown can already have detached the event. The waiter
+        // still needs its cancellation wakeup; its receive deliberately does
+        // not use the parent's cancellation slot.
         (void)wake_.try_send_via_dispatch(IoErrorCode{});
     }
 
 private:
-    // Runs under the event's domain lease (or its fixed Worker for a control
-    // delay). Dispatch completes the existing waiter without a completion node.
+    // Runs on the Worker reactor. Dispatch completes the existing waiter
+    // without a completion node.
     void OnTimeout() override { (void)wake_.try_send_via_dispatch(IoErrorCode{}); }
     SignalChannel wake_;
     bool waiting_ = false;

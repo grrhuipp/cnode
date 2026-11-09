@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "app/dns/dns_worker.hpp"
+#include "app/dns/dns.hpp"
 #include "common/allocator.hpp"
 #include "app/dns/datagram_exchange.hpp"
 #include <asio/bind_cancellation_slot.hpp>

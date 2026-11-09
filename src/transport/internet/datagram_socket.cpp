@@ -267,8 +267,8 @@ net::awaitable<void> DatagramSocket::Impl::SendBuffers(
         if (cancellation_state.cancelled() != net::cancellation_type::none)
             throw IoSystemError(io_error::operation_aborted);
         IoErrorCode send_ec;
-        // Send synchronously under the current domain lease. Native readiness
-        // is needed only for backpressure and never retains payload pointers.
+        // Send synchronously on the owning Worker. Native readiness is needed
+        // only for backpressure and never retains payload pointers.
         const auto sent = socket.send_to(buffers, destination, 0, send_ec);
         if (send_ec == io_error::would_block || send_ec == io_error::try_again) {
             const auto wait_ec = co_await Wait(udp::socket::wait_write, cancellation_state.slot());

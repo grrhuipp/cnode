@@ -14,7 +14,6 @@
 #include "app/proxyman/outbound/factory.hpp"
 #include "app/proxyman/outbound/prepared_config.hpp"
 #include "app/runtime_publication.hpp"
-#include "app/traffic_types.hpp"
 #include "app/worker.hpp"
 #include "common/asio_types.hpp"
 #include "core/constants.hpp"

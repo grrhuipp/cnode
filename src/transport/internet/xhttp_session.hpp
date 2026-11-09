@@ -392,11 +392,10 @@ enum class XHttpSessionAccess : uint8_t {
     Upload,
 };
 
-// Configuration namespace + id select an execution domain, then Join unifies
-// the physical connection groups before touching that domain's session table.
+// Configuration namespace + id select a session on the Worker's session table.
 // Retirement is allocation-free and reserves its own metadata queue node;
-// the next coordinator lookup drains events, never scans the live table.
-// Limits: 1024 live entries per domain, 65536 live directory records per pool,
+// the next lookup drains events, never scans the live table.
+// Limits: 1024 live entries per Worker, 65536 live directory records per pool,
 // and the most recent 1024 ended ids in each bounded FIFO replay window.
 [[nodiscard]] net::awaitable<std::shared_ptr<XHttpPacketUpSession>> GetXHttpPacketSession(
     net::io_context& io_context,
@@ -404,8 +403,8 @@ enum class XHttpSessionAccess : uint8_t {
     std::string_view session_id,
     XHttpSessionAccess access);
 
-// Physical-session teardown joins upload-response readers before releasing
-// their domain's transport hosts. Standalone callers pass their io_context.
+// Teardown joins upload-response readers before releasing their Worker's
+// transport hosts. Standalone callers pass their io_context.
 [[nodiscard]] net::awaitable<void> JoinXHttpClientTasks(net::execution_context& services);
 
 // Logical stream reading the session uploads and writing the downlink.

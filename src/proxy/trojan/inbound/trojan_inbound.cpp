@@ -17,7 +17,6 @@
 #include "common/session.hpp"
 #include "common/buf/multi_buffer.hpp"
 #include "transport/link.hpp"
-#include "app/udp_types.hpp"
 #include <array>
 #include <openssl/crypto.h>
 #include <span>

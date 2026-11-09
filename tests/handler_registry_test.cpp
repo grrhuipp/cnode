@@ -3,7 +3,6 @@
 #include "app/proxyman/inbound/handler_registry.hpp"
 #include "app/proxyman/outbound/handler.hpp"
 #include "app/dns/dns.hpp"
-#include "app/dns/dns_worker.hpp"
 #include "common/session.hpp"
 #include "app/stats.hpp"
 #include "infra/runtime_config_types.hpp"

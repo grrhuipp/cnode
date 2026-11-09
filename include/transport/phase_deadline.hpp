@@ -40,9 +40,9 @@ private:
     uint32_t captured_generation_ = 0;
 };
 
-// One logical stream's phase deadline, owned inline by that stream. Its embedded
-// event follows the execution domain across native handoff. The stream must
-// outlive this member; no private timer or background task is owned here.
+// One logical stream's phase deadline, owned inline by that stream on its
+// Worker scheduler. The stream must outlive this member; no private timer or
+// background task is owned here.
 class StreamPhaseDeadline final : private TimeoutEvent {
 public:
     StreamPhaseDeadline(net::io_context& io_context, AsyncStream& owner);

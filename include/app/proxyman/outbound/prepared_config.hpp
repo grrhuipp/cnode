@@ -2,7 +2,7 @@
 
 #include "common/asio_types.hpp"
 #include "proxy/outbound.hpp"
-#include "transport/internet/outbound_sender.hpp"
+#include "transport/internet/outbound_target_builder.hpp"
 
 #include <memory>
 #include <string>
@@ -25,8 +25,8 @@ struct TypedOutboundProtocolSettings final : OutboundProtocolSettings {
     T value;
 };
 
-// Constructs the protocol instance for one executing domain: its native reactor
-// and resident task group (joined before the domain's teardown). Dialing goes
+// Constructs the protocol instance for one Worker: its native reactor and
+// resident task group (joined before the Worker's teardown). Dialing goes
 // through the owning Handler's OutboundDialer, never through creator state.
 struct PreparedOutboundCreator {
     using CreateFn = std::unique_ptr<::Outbound> (*)(

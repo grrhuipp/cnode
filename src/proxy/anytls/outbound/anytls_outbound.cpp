@@ -8,7 +8,7 @@
 #include "common/buf/length_prefixed_packet_buffer.hpp"
 #include "../../outbound_server.hpp"
 #include "../../outbound_stream_endpoint.hpp"
-#include "../../handshake_timeout.hpp"
+#include "../../inbound_admission.hpp"
 #include "../../uot/uot.hpp"
 #include "transport/internet/async_write_gate.hpp"
 #include "app/dns/dns.hpp"

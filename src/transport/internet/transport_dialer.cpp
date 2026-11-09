@@ -1,4 +1,10 @@
 #include "transport/internet/outbound_target_builder.hpp"
+#include "app/dns/dns.hpp"
+#include "common/allocator.hpp"
+#include "common/ip_address.hpp"
+#include "common/ip_utils.hpp"
+#include "core/constants.hpp"
+#include "transport/internet/http_headers.hpp"
 #include "common/buffer_util.hpp"
 #include "transport/internet/async_write_gate.hpp"
 #include "common/session.hpp"
@@ -6,10 +12,12 @@
 #include "transport/internet/transport_stack.hpp"
 #include "infra/log.hpp"
 
+#include <algorithm>
 #include <array>
 #include <charconv>
 #include <chrono>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -999,6 +1007,7 @@ net::awaitable<DialResult> DialXHttpSplitOutboundTransport(
             upload_path,
             ctx.conn_id));
 }
+
 
 }  // namespace
 

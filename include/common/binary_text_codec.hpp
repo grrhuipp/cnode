@@ -95,6 +95,3 @@ ParseUuid(std::string_view text) noexcept {
     return out;
 }
 
-namespace proxy {
-using ::ParseUuid;
-}  // namespace proxy

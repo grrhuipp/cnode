@@ -9,7 +9,7 @@
 #include "infra/config_types.hpp"
 #include "proxy/inbound.hpp"
 #include "transport/async_stream.hpp"
-#include "transport/internet/transport_security.hpp"
+#include "transport/internet/stream_settings.hpp"
 
 #include <memory>
 #include <string_view>
@@ -26,9 +26,9 @@ class InboundTransportStreamHandler;
 namespace proxyman::inbound {
 
 // ============================================================================
-// Handler - address-stable session-domain inbound transport host.
-// Listener descriptors may use an eagerly prepared protocol; physical domains
-// create protocol state only when a real logical request reaches the proxy.
+// Handler - address-stable Worker inbound transport host.
+// Listener descriptors may use an eagerly prepared protocol; Workers create
+// protocol state only when a real logical request reaches the proxy.
 // Either way each request crosses exactly one virtual Inbound::Process.
 // ============================================================================
 class Handler final

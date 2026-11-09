@@ -1,11 +1,15 @@
 #pragma once
 
-#include "../udp_receive_buffer.hpp"
+#include "common/allocator.hpp"
+#include "common/asio_types.hpp"
+#include "common/buf/multi_buffer.hpp"
 
 #include <asio/as_tuple.hpp>
 #include <asio/use_awaitable.hpp>
 
+#include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <new>
@@ -14,6 +18,66 @@
 #include <type_traits>
 #include <utility>
 
+namespace detail {
+
+class UdpReceiveBuffer final {
+public:
+    static constexpr size_t kMaxWireBytes = 65535;
+
+    void Release() noexcept {
+        small_ = buf::BufferGuard{};
+        if (large_.capacity() != 0) {
+            memory::ByteVector empty{large_.get_allocator()};
+            large_.swap(empty);
+        }
+    }
+
+    [[nodiscard]] net::mutable_buffer Prepare(size_t available_bytes) {
+        const size_t capacity = std::clamp<size_t>(
+            available_bytes, 1, kMaxWireBytes);
+        if (capacity <= buf::Buffer::kSize) {
+            if (large_.capacity() != 0) {
+                memory::ByteVector empty{large_.get_allocator()};
+                large_.swap(empty);
+            }
+            if (!small_) {
+                small_ = buf::BufferGuard{buf::Buffer::New()};
+                if (!small_) {
+                    return {};
+                }
+            }
+            return net::buffer(small_->data, buf::Buffer::kSize);
+        }
+
+        small_ = buf::BufferGuard{};
+        try {
+            large_.resize(capacity);
+        } catch (const std::bad_alloc&) {
+            Release();
+            return {};
+        }
+        return net::buffer(large_.data(), large_.size());
+    }
+
+    [[nodiscard]] std::span<const uint8_t> Data(size_t bytes) const noexcept {
+        if (!large_.empty()) {
+            return std::span<const uint8_t>(
+                large_.data(), std::min(bytes, large_.size()));
+        }
+        if (small_) {
+            return std::span<const uint8_t>(
+                small_->data,
+                std::min(bytes, static_cast<size_t>(buf::Buffer::kSize)));
+        }
+        return {};
+    }
+
+private:
+    buf::BufferGuard small_;
+    memory::ByteVector large_;
+};
+
+}  // namespace detail
 namespace worker_detail {
 
 [[nodiscard]] inline bool IsTransientReceiveError(

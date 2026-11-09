@@ -9,7 +9,7 @@
 #include "features/routing/dispatcher.hpp"
 #include "infra/config_types.hpp"
 #include "transport/async_stream.hpp"
-#include "udp_receive_buffer.hpp"
+#include "worker/udp_receive_loop.hpp"
 
 #include <asio/as_tuple.hpp>
 #include <asio/co_spawn.hpp>

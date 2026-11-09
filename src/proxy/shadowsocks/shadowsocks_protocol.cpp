@@ -1,7 +1,7 @@
 #include "shadowsocks_protocol.hpp"
 
 #include "core/constants.hpp"
-#include "core/naming.hpp"
+#include "transport/internet/http_headers.hpp"
 
 #include <blake3.h>
 #include <openssl/base64.h>
@@ -23,25 +23,25 @@ namespace ss {
 // ParseCipherMethod
 // ============================================================================
 std::optional<SsCipherInfo> ParseCipherMethod(std::string_view method) {
-    const std::string lower = naming::LowerAscii(std::string(method));
+    using transport::internet::EqualsAsciiCI;
 
-    if (lower == constants::protocol::kAes128Gcm) {
+    if (EqualsAsciiCI(method, constants::protocol::kAes128Gcm)) {
         return SsCipherInfo{SsCipherType::AES_128_GCM, 16, 16};
     }
-    if (lower == constants::protocol::kAes256Gcm) {
+    if (EqualsAsciiCI(method, constants::protocol::kAes256Gcm)) {
         return SsCipherInfo{SsCipherType::AES_256_GCM, 32, 32};
     }
-    if (lower == constants::protocol::kChacha20IetfPoly1305 ||
-        lower == "chacha20-poly1305") {
+    if (EqualsAsciiCI(method, constants::protocol::kChacha20IetfPoly1305) ||
+        EqualsAsciiCI(method, "chacha20-poly1305")) {
         return SsCipherInfo{SsCipherType::CHACHA20_POLY1305, 32, 32};
     }
-    if (lower == constants::protocol::kSs2022Blake3Aes128Gcm) {
+    if (EqualsAsciiCI(method, constants::protocol::kSs2022Blake3Aes128Gcm)) {
         return SsCipherInfo{SsCipherType::AES_128_GCM_2022, 16, 16};
     }
-    if (lower == constants::protocol::kSs2022Blake3Aes256Gcm) {
+    if (EqualsAsciiCI(method, constants::protocol::kSs2022Blake3Aes256Gcm)) {
         return SsCipherInfo{SsCipherType::AES_256_GCM_2022, 32, 32};
     }
-    if (lower == constants::protocol::kSs2022Blake3Chacha20Poly1305) {
+    if (EqualsAsciiCI(method, constants::protocol::kSs2022Blake3Chacha20Poly1305)) {
         return SsCipherInfo{SsCipherType::CHACHA20_POLY1305_2022, 32, 32};
     }
     return std::nullopt;

@@ -1,6 +1,5 @@
 #pragma once
 
-#include "features/policy/request_policy.hpp"
 #include "common/allocator.hpp"
 #include "common/string_hash.hpp"
 
@@ -9,13 +8,17 @@
 #include <string_view>
 #include <vector>
 
+namespace session {
+struct Context;
+}  // namespace session
+
 namespace rule {
 
 struct DetectRule {
     std::regex Pattern;
 };
 
-class DetectRulePolicy final : public features::policy::RequestPolicy {
+class DetectRulePolicy final {
 public:
     using RuleList = std::vector<DetectRule>;
     using RuleListPtr = std::shared_ptr<const RuleList>;
@@ -35,7 +38,7 @@ public:
 
     void UpdateRule(std::string_view tag, RuleListPtr new_rule_list);
     [[nodiscard]] bool Blocked(
-        const session::Context& ctx) override;
+        const session::Context& ctx);
 private:
     InboundRule rules_;
 };

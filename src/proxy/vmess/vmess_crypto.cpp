@@ -277,7 +277,7 @@ HeaderAeadKey ResponseHeaderPayloadKey(std::span<const uint8_t, 16> response_key
 }
 
 std::optional<MemoryAccount> MemoryAccount::FromUUID(std::string_view uuid_str) {
-    auto uuid_bytes = proxy::ParseUuid(uuid_str);
+    auto uuid_bytes = ::ParseUuid(uuid_str);
     if (!uuid_bytes) {
         return std::nullopt;
     }

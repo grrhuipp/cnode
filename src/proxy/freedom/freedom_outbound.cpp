@@ -8,9 +8,8 @@
 #include "common/target_address.hpp"
 #include "core/constants.hpp"
 #include "infra/log.hpp"
-#include "infra/outbound_bind_config.hpp"
-#include "outbound/udp_request.hpp"
-#include "proxy/freedom_domain_strategy.hpp"
+#include "../udp_target.hpp"
+#include "infra/config.hpp"
 #include "proxy/outbound.hpp"
 #include "transport/internet/outbound_target_builder.hpp"
 

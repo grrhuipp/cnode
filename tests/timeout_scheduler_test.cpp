@@ -3,7 +3,7 @@
 #include "transport/internet/timeout_scheduler.hpp"
 #include "transport/internet/async_delay.hpp"
 #include "app/session_group_executor.hpp"
-#include "../src/app/worker_memory_reclaimer.hpp"
+#include "app/worker.hpp"
 
 #include <asio/co_spawn.hpp>
 #include <asio/bind_cancellation_slot.hpp>
