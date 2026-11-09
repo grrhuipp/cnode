@@ -547,7 +547,7 @@ bool DecryptIdentityHeader(
     const bool ok =
         Derive2022IdentitySubkey(identity_key.data(), cipher_info.key_size,
                                  salt.data(), salt.size(), block_key.data()) &&
-        AesBlockCrypt(
+        AesBlocksCrypt<16>(
             std::span<const uint8_t>(block_key.data(), cipher_info.key_size),
             encrypted_identity, std::span<uint8_t, 16>(identity_hash), false);
     OPENSSL_cleanse(block_key.data(), block_key.size());

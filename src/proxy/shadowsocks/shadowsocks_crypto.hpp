@@ -59,7 +59,7 @@ static constexpr size_t kMaxChunkPayload = 0x3FFF;
 // ============================================================================
 // SS2022 (AEAD-2022) 共享原语
 //
-// Unix 时间戳、AES-ECB 单块（identity header）等握手辅助逻辑，
+// Unix 时间戳、AES-ECB 头块等握手辅助逻辑，
 // 客户端（client.cpp）与服务端（server.cpp）完全一致，集中在协议私有头里避免
 // 两份逐字复制。仅服务握手语义，不对外暴露为请求链路对象。
 // ============================================================================
@@ -77,23 +77,34 @@ inline bool TimestampFresh(uint64_t remote, uint64_t now) noexcept {
     return remote <= now + kMaxSkew && remote + kMaxSkew >= now;
 }
 
-inline bool AesBlockCrypt(std::span<const uint8_t> key,
-                          std::span<const uint8_t, 16> input,
-                          std::span<uint8_t, 16> output,
-                          bool encrypt) {
+template<size_t Size>
+    requires (Size == 16 || Size == 32)
+inline bool AesBlocksCrypt(std::span<const uint8_t> key,
+                           std::span<const uint8_t, Size> input,
+                           std::span<uint8_t, Size> output,
+                           bool encrypt) {
     if (key.size() != 16 && key.size() != 32) return false;
+    // BoringSSL 保证单块可重叠；双块只能原地或不重叠，防止覆盖尚未读取的块。
+    if constexpr (Size == 32) {
+        const auto source = reinterpret_cast<uintptr_t>(input.data());
+        const auto destination = reinterpret_cast<uintptr_t>(output.data());
+        if (source != destination &&
+            (source < destination ? destination - source : source - destination) < Size)
+            return false;
+    }
 
-    // A single SS2022 header block needs no EVP session or heap allocation.
-    // BoringSSL's public AES APIs retain hardware/software dispatch. The schedule
-    // belongs only to this synchronous operation, never to an idle connection.
+    // 同一同步操作内的同密钥头块只展开一次；密钥表用毕擦除，不进入连接或用户快照。
+    // BoringSSL 保留软硬件分派。
     AES_KEY schedule;
     const auto bits = static_cast<unsigned>(key.size() * 8);
     const int status = encrypt
         ? AES_set_encrypt_key(key.data(), bits, &schedule)
         : AES_set_decrypt_key(key.data(), bits, &schedule);
     if (status == 0) {
-        if (encrypt) AES_encrypt(input.data(), output.data(), &schedule);
-        else AES_decrypt(input.data(), output.data(), &schedule);
+        for (size_t offset = 0; offset < Size; offset += AES_BLOCK_SIZE) {
+            if (encrypt) AES_encrypt(input.data() + offset, output.data() + offset, &schedule);
+            else AES_decrypt(input.data() + offset, output.data() + offset, &schedule);
+        }
     }
     OPENSSL_cleanse(&schedule, sizeof(schedule));
     return status == 0;

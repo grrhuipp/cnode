@@ -443,19 +443,17 @@ struct PlaintextScratch {
         return std::nullopt;
     }
 
-    std::array<uint8_t, 16> encrypted_separate{};
-    std::memcpy(encrypted_separate.data(), datagram, encrypted_separate.size());
-
-    std::array<uint8_t, 16> separate{};
-    std::array<uint8_t, 16> identity_hash{};
+    std::array<std::array<uint8_t, 16>, 2> headers{};
+    // 按整个数组对象的字节表示写入，避免跨子数组构造 span 或复制 PSK 哈希。
+    static_assert(sizeof(headers) == kSs2022UdpSeparateHeaderSize * 2);
+    auto& separate = headers[0];
+    auto& identity_hash = headers[1];
     struct CleanseIdentityHeaders {
-        std::array<uint8_t, 16>& sep;
-        std::array<uint8_t, 16>& id;
+        std::array<std::array<uint8_t, 16>, 2>& bytes;
         ~CleanseIdentityHeaders() noexcept {
-            OPENSSL_cleanse(sep.data(), sep.size());
-            OPENSSL_cleanse(id.data(), id.size());
+            OPENSSL_cleanse(&bytes, sizeof(bytes));
         }
-    } cleanse_headers{separate, identity_hash};
+    } cleanse_headers{headers};
     PlaintextScratch scratch;
     for (size_t group = 0; group < users.size();) {
         const auto& first = users[group];
@@ -466,29 +464,24 @@ struct PlaintextScratch {
         size_t candidate = group;
         group = end;
         const auto& header_key = has_identity ? first.identity_key : first.derived_key;
-        if (header_key.empty() ||
-            !AesBlockCrypt(header_key.span(), encrypted_separate, separate, false)) {
+        const size_t body_offset = has_identity
+            ? kSs2022UdpSeparateHeaderSize * 2 : kSs2022UdpSeparateHeaderSize;
+        if (datagram_len < body_offset + kMinBodyPlain + SsAeadCipher::kTagSize ||
+            header_key.empty()) {
             continue;
         }
+        const auto encrypted = std::span<const uint8_t>(datagram, body_offset);
+        auto decrypted = std::span<uint8_t, 32>(reinterpret_cast<uint8_t*>(&headers), sizeof(headers));
+        const bool decoded = has_identity
+            ? AesBlocksCrypt<32>(header_key.span(), encrypted.first<32>(), decrypted, false)
+            : AesBlocksCrypt<16>(header_key.span(), encrypted.first<16>(), separate, false);
+        if (!decoded) continue;
 
-        size_t body_offset = kSs2022UdpSeparateHeaderSize;
         if (has_identity) {
-            if (datagram_len < kSs2022UdpSeparateHeaderSize * 2 +
-                    kMinBodyPlain + SsAeadCipher::kTagSize) {
-                continue;
-            }
-            std::array<uint8_t, 16> identity_cipher{};
-            std::memcpy(identity_cipher.data(),
-                        datagram + kSs2022UdpSeparateHeaderSize,
-                        identity_cipher.size());
-            if (!AesBlockCrypt(header_key.span(), identity_cipher, identity_hash, false)) {
-                continue;
-            }
             for (size_t j = 0; j < identity_hash.size(); ++j) {
                 identity_hash[j] ^= separate[j];
             }
             candidate = users.IdentityHashLowerBound(candidate, end, identity_hash);
-            body_offset += kSs2022UdpSeparateHeaderSize;
         }
 
         const size_t ciphertext_len = datagram_len - body_offset;
@@ -723,7 +716,7 @@ struct PlaintextScratch {
         header_key = &psk_chain.front();
     }
     if (header_key->empty() ||
-        !AesBlockCrypt(header_key->span(), separate,
+        !AesBlocksCrypt<16>(header_key->span(), separate,
                        std::span<uint8_t, 16>(output, 16), true)) {
         return 0;
     }
@@ -738,7 +731,7 @@ struct PlaintextScratch {
             for (size_t j = 0; j < identity_plain.size(); ++j) {
                 identity_plain[j] ^= separate[j];
             }
-            const bool encrypted_identity = AesBlockCrypt(
+            const bool encrypted_identity = AesBlocksCrypt<16>(
                 psk_chain[i].span(),
                 identity_plain,
                 std::span<uint8_t, 16>(output + pos, 16),
@@ -1253,7 +1246,7 @@ std::optional<SsUdpDecodeResult> Decode2022UdpResponsePacket(
         std::array<uint8_t, 16> encrypted_separate{};
         std::memcpy(encrypted_separate.data(), datagram, encrypted_separate.size());
         std::array<uint8_t, 16> separate{};
-        if (!AesBlockCrypt(state.key.span(), encrypted_separate, separate, false)) {
+        if (!AesBlocksCrypt<16>(state.key.span(), encrypted_separate, separate, false)) {
             return std::nullopt;
         }
         std::memcpy(

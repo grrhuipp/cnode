@@ -210,7 +210,7 @@ bool WriteIdentityHeadersTo(const SsCipherInfo& cipher_info,
         }
 
         std::array<uint8_t, 16> encrypted{};
-        const bool ok = AesBlockCrypt(
+        const bool ok = AesBlocksCrypt<16>(
             std::span<const uint8_t>(block_key.data(), cipher_info.key_size),
             std::span<const uint8_t, 16>(user_hash),
             std::span<uint8_t, 16>(encrypted),

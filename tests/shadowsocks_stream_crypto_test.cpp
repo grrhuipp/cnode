@@ -74,14 +74,23 @@ void TestAesBlock() {
             std::array<uint8_t, 18> guarded;
             guarded.fill(0xa5);
             auto output = std::span<uint8_t>(guarded).subspan<1, 16>();
-            Check(ss::AesBlockCrypt(key, plain, output, true), "AES block encrypt failed");
+            Check(ss::AesBlocksCrypt<16>(key, plain, output, true), "AES block encrypt failed");
             Check(std::equal(output.begin(), output.end(), expected[index].begin()), "AES known answer mismatch");
-            Check(ss::AesBlockCrypt(key, output, output, false), "AES in-place decrypt failed");
+            Check(ss::AesBlocksCrypt<16>(key, output, output, false), "AES in-place decrypt failed");
             Check(std::equal(output.begin(), output.end(), plain.begin()), "AES plaintext mismatch");
-            Check(ss::AesBlockCrypt(key, output, output, true), "AES in-place encrypt failed");
+            Check(ss::AesBlocksCrypt<16>(key, output, output, true), "AES in-place encrypt failed");
             Check(std::equal(output.begin(), output.end(), expected[index].begin()), "AES in-place ciphertext mismatch");
             Check(guarded.front() == 0xa5 && guarded.back() == 0xa5, "AES wrote outside output block");
         }
+        std::array<uint8_t, 17> overlap{};
+        std::copy(plain.begin(), plain.end(), overlap.begin());
+        auto first = std::span<uint8_t>(overlap).first<16>();
+        auto shifted = std::span<uint8_t>(overlap).subspan<1, 16>();
+        Check(ss::AesBlocksCrypt<16>(key, first, shifted, true), "AES overlapping encrypt failed");
+        Check(std::equal(shifted.begin(), shifted.end(), expected[index].begin()),
+              "AES overlapping ciphertext mismatch");
+        Check(ss::AesBlocksCrypt<16>(key, shifted, first, false), "AES overlapping decrypt failed");
+        Check(std::equal(first.begin(), first.end(), plain.begin()), "AES overlapping plaintext mismatch");
     }
 #if defined(CNODE_WRAP_MALLOC)
     Check(system_allocations == before, "AES block operation allocated heap memory");
@@ -91,7 +100,7 @@ void TestAesBlock() {
     for (size_t size : {size_t(0),size_t(1),size_t(15),size_t(17),size_t(24),size_t(31),size_t(33)}) {
         auto output = plain;
         for (bool encrypt : {false, true}) {
-            Check(!ss::AesBlockCrypt(std::span<const uint8_t>(keys).first(size), plain, output, encrypt),
+            Check(!ss::AesBlocksCrypt<16>(std::span<const uint8_t>(keys).first(size), plain, output, encrypt),
                   "AES accepted unsupported key size");
             Check(output == plain, "AES invalid key modified output");
         }
@@ -500,4 +509,53 @@ TEST(ShadowsocksStreamCrypto, Contract) {
     }
     TestReaderResume(ss::SsCipherType::AES_256_GCM, 2, false, 1);
     std::cout << "shadowsocks_stream_crypto_test: ok\n";
+}
+
+TEST(ShadowsocksStreamCrypto, AesBlocksMatchIndependentVectors) {
+    // NIST SP 800-38A F.1.1/F.1.5 的前两块，独立验证批处理而非自生成回环。
+    // https://nvlpubs.nist.gov/nistpubs/Legacy/SP/nistspecialpublication800-38a.pdf
+    const std::array<uint8_t, 32> plain{
+        0x6b,0xc1,0xbe,0xe2,0x2e,0x40,0x9f,0x96,0xe9,0x3d,0x7e,0x11,0x73,0x93,0x17,0x2a,
+        0xae,0x2d,0x8a,0x57,0x1e,0x03,0xac,0x9c,0x9e,0xb7,0x6f,0xac,0x45,0xaf,0x8e,0x51};
+    const std::array<std::array<uint8_t, 32>, 2> keys{{
+        {0x2b,0x7e,0x15,0x16,0x28,0xae,0xd2,0xa6,0xab,0xf7,0x15,0x88,0x09,0xcf,0x4f,0x3c},
+        {0x60,0x3d,0xeb,0x10,0x15,0xca,0x71,0xbe,0x2b,0x73,0xae,0xf0,0x85,0x7d,0x77,0x81,
+         0x1f,0x35,0x2c,0x07,0x3b,0x61,0x08,0xd7,0x2d,0x98,0x10,0xa3,0x09,0x14,0xdf,0xf4}}};
+    const std::array<std::array<uint8_t, 32>, 2> expected{{
+        {0x3a,0xd7,0x7b,0xb4,0x0d,0x7a,0x36,0x60,0xa8,0x9e,0xca,0xf3,0x24,0x66,0xef,0x97,
+         0xf5,0xd3,0xd5,0x85,0x03,0xb9,0x69,0x9d,0xe7,0x85,0x89,0x5a,0x96,0xfd,0xba,0xaf},
+        {0xf3,0xee,0xd1,0xbd,0xb5,0xd2,0xa0,0x3c,0x06,0x4b,0x5a,0x7e,0x3d,0xb1,0x81,0xf8,
+         0x59,0x1c,0xcb,0x10,0xd4,0x10,0xed,0x26,0xdc,0x5b,0xa7,0x4a,0x31,0x36,0x28,0x70}}};
+    for (size_t index = 0; index < keys.size(); ++index) {
+        const auto key = std::span<const uint8_t>(keys[index]).first(index ? 32 : 16);
+        std::array<uint8_t, 66> guarded;
+        guarded.fill(0xa5);
+        auto input = std::span<uint8_t>(guarded).subspan<1, 32>();
+        auto output = std::span<uint8_t>(guarded).subspan<33, 32>();
+        std::copy(plain.begin(), plain.end(), input.begin());
+        ASSERT_TRUE(ss::AesBlocksCrypt<32>(key, input, output, true));
+        EXPECT_TRUE(std::equal(output.begin(), output.end(), expected[index].begin()));
+        ASSERT_TRUE(ss::AesBlocksCrypt<32>(key, output, output, false));
+        EXPECT_TRUE(std::equal(output.begin(), output.end(), plain.begin()));
+        ASSERT_TRUE(ss::AesBlocksCrypt<32>(key, output, output, true));
+        EXPECT_TRUE(std::equal(output.begin(), output.end(), expected[index].begin()));
+        EXPECT_TRUE(std::equal(input.begin(), input.end(), plain.begin()));
+        EXPECT_EQ(guarded.front(), 0xa5);
+        EXPECT_EQ(guarded.back(), 0xa5);
+    }
+}
+
+TEST(ShadowsocksStreamCrypto, AesBlocksRejectPartialOverlapWithoutMutation) {
+    const std::array<uint8_t, 16> key{};
+    std::array<uint8_t, 64> output;
+    output.fill(0xa5);
+    const auto original = output;
+    for (bool encrypt : {false, true}) {
+        EXPECT_FALSE(ss::AesBlocksCrypt<32>(key, std::span(output).first<32>(),
+            std::span(output).subspan<1, 32>(), encrypt));
+        EXPECT_EQ(output, original);
+        EXPECT_FALSE(ss::AesBlocksCrypt<32>(key, std::span(output).subspan<1, 32>(),
+            std::span(output).first<32>(), encrypt));
+        EXPECT_EQ(output, original);
+    }
 }
