@@ -17,14 +17,7 @@ using VMessHandshakeResult = tl::expected<void, ErrorCode>;
 
 class ClientSession final {
 public:
-    // `user`, its prepared `auth_id_key` and `target` are borrowed until the
-    // request header is sent.
-    ClientSession(const MemoryAccount& user,
-                  const AES_KEY& auth_id_key,
-                  const TargetAddress& target,
-                  Security security,
-                  Command command,
-                  ForwardedMetadataView forwarded = {});
+    ClientSession(Security security, Command command);
 
     ClientSession(const ClientSession&) = delete;
     ClientSession& operator=(const ClientSession&) = delete;
@@ -32,7 +25,13 @@ public:
     // Pre-start cancellation preserves framing. Once framing starts, failures
     // (including cancellation) retire request writes. Clean EOF/WriteClosed
     // ends only the request direction; responses remain readable.
-    net::awaitable<VMessHandshakeResult> EncodeRequestHeader(AsyncStream& stream);
+    net::awaitable<VMessHandshakeResult> EncodeRequestHeader(
+        AsyncStream& stream,
+        const MemoryAccount& user,
+        const AES_KEY& auth_id_key,
+        const TargetAddress& target,
+        Command command,
+        ForwardedMetadataView forwarded = {});
     net::awaitable<void> EncodeRequestBody(
         AsyncStream& stream,
         buf::MultiBuffer mb);
@@ -56,12 +55,7 @@ private:
     [[nodiscard]] static SessionKeys GenerateKeys();
     net::awaitable<void> DecodeResponseHeader(AsyncStream& stream);
 
-    const MemoryAccount* user_ = nullptr;
-    const AES_KEY* auth_id_key_ = nullptr;
-    const TargetAddress* target_ = nullptr;
-    ForwardedMetadataView forwarded_{};
     Security security_ = Security::AES_128_GCM;
-    Command command_ = Command::TCP;
     SessionKeys keys_;
     bool request_header_sent_ = false;
     BodyEncoder request_encoder_;

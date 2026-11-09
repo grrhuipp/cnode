@@ -577,7 +577,7 @@ net::awaitable<std::unique_ptr<transport::MultiBufferWriter>> CreateTcpWriter(
     auto result = co_await ss::WriteTCPRequest(
         TargetAddress("1.1.1.1", 443), cipher, key, {}, stream);
     Check(bool(result), "public TCP request writer creation failed");
-    co_return std::move(result->request_writer);
+    co_return std::make_unique<ss::RequestBodyWriter>(std::move(result->request_writer));
 }
 
 void CheckTcpWriterFailure(const ss::SsCipherInfo& cipher, bool response, bool scatter,

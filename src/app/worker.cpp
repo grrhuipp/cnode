@@ -587,7 +587,7 @@ void Worker::RuntimeState::Start(Worker& worker) {
     session_configuration = std::make_shared<const app::SessionConfiguration>(
         *config, router, detect_rule_policy);
     session_configuration->outbounds->BindHosts(io_context, worker.id_,
-        worker.group_coordinator_, dns_worker, timeouts.DialTimeout());
+        worker.group_coordinator_);
     session_registry = std::make_shared<app::PhysicalSessionRegistry>(
         io_context, worker.id_, stats, *session_tracking, connections);
     started = true;
@@ -1208,6 +1208,16 @@ void Worker::UpdateRule(std::string_view tag, std::vector<rule::DetectRule> rule
     runtime_->detect_rule_policy->UpdateRule(tag, std::move(rules));
 }
 
+void Worker::UpdateRule(
+    std::string_view tag,
+    std::shared_ptr<const std::vector<rule::DetectRule>> rules) {
+    if (stop_requested_.load(std::memory_order_acquire) ||
+        drain_requested_.load(std::memory_order_relaxed) ||
+        !runtime_ || runtime_->listener_state->stopping)
+        throw IoSystemError(net::error::operation_aborted);
+    runtime_->detect_rule_policy->UpdateSharedRule(tag, std::move(rules));
+}
+
 // ============================================================================
 // 数据收集（在 Worker 线程执行）
 // ============================================================================
@@ -1421,10 +1431,6 @@ net::awaitable<WorkerRuntimeStatsSnapshot> Worker::CollectRuntimeStats(bool incl
         stats.connections_active = 0;
         add_stats(stats);
         if (result.active_connections > 0) --result.active_connections;
-    }
-    if (runtime_->session_configuration && runtime_->session_configuration->outbounds) {
-        co_await runtime_->session_configuration->outbounds->CollectRuntimeStats(
-            result, include_resources);
     }
     co_return result;
 }

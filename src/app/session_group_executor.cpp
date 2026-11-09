@@ -41,6 +41,42 @@ struct LeaseIdentity {
     std::shared_ptr<void> keepalive;
     explicit LeaseIdentity(uint64_t value) : group(value) {}
 };
+template <class T, class Executor>
+net::awaitable<T> AwaitUncancelled(Executor&& executor, net::awaitable<T> task) {
+    const bool throw_if_cancelled = co_await net::this_coro::throw_if_cancelled();
+    co_await net::this_coro::throw_if_cancelled(false);
+    std::exception_ptr failure;
+    if constexpr (std::is_void_v<T>) {
+        try {
+            co_await net::co_spawn(std::forward<Executor>(executor), std::move(task),
+                net::bind_cancellation_slot(net::cancellation_slot{}, net::use_awaitable));
+        } catch (...) {
+            failure = std::current_exception();
+        }
+        co_await net::this_coro::throw_if_cancelled(throw_if_cancelled);
+        if (failure) std::rethrow_exception(failure);
+    } else {
+        std::optional<T> result;
+        try {
+            result.emplace(co_await net::co_spawn(std::forward<Executor>(executor), std::move(task),
+                net::bind_cancellation_slot(net::cancellation_slot{}, net::use_awaitable)));
+        } catch (...) {
+            failure = std::current_exception();
+        }
+        co_await net::this_coro::throw_if_cancelled(throw_if_cancelled);
+        if (failure) std::rethrow_exception(failure);
+        co_return std::move(*result);
+    }
+}
+
+template <class T>
+net::awaitable<T> AwaitUncancelled(net::awaitable<T> task) {
+    if constexpr (std::is_void_v<T>) {
+        co_await AwaitUncancelled(co_await net::this_coro::executor, std::move(task));
+    } else {
+        co_return co_await AwaitUncancelled(co_await net::this_coro::executor, std::move(task));
+    }
+}
 }
 
 struct GroupCoordinator::ReservedState {
@@ -875,48 +911,18 @@ ExecutionDomain::Handoff::~Handoff() {
 }
 net::awaitable<void> ExecutionDomain::Handoff::Validate(std::function<void()> validation) {
     auto transaction = transaction_;
-    const bool throw_if_cancelled = co_await net::this_coro::throw_if_cancelled();
-    co_await net::this_coro::throw_if_cancelled(false);
-    std::exception_ptr failure;
-    try {
-        co_await net::co_spawn(transaction->coordinator->Reactor(),
-            transaction->Validate(std::move(validation)),
-            net::bind_cancellation_slot(net::cancellation_slot{}, net::use_awaitable));
-    } catch (...) {
-        failure = std::current_exception();
-    }
-    co_await net::this_coro::throw_if_cancelled(throw_if_cancelled);
-    if (failure) std::rethrow_exception(failure);
+    co_await AwaitUncancelled(transaction->coordinator->Reactor(),
+        transaction->Validate(std::move(validation)));
 }
 net::awaitable<void> ExecutionDomain::Handoff::Commit() {
     auto transaction = transaction_;
-    const bool throw_if_cancelled = co_await net::this_coro::throw_if_cancelled();
-    co_await net::this_coro::throw_if_cancelled(false);
-    std::exception_ptr failure;
-    try {
-        co_await net::co_spawn(transaction->coordinator->Reactor(),
-            transaction->Resolve(true),
-            net::bind_cancellation_slot(net::cancellation_slot{}, net::use_awaitable));
-    } catch (...) {
-        failure = std::current_exception();
-    }
-    co_await net::this_coro::throw_if_cancelled(throw_if_cancelled);
-    if (failure) std::rethrow_exception(failure);
+    co_await AwaitUncancelled(transaction->coordinator->Reactor(),
+        transaction->Resolve(true));
 }
 net::awaitable<void> ExecutionDomain::Handoff::Cancel() {
     auto transaction = transaction_;
-    const bool throw_if_cancelled = co_await net::this_coro::throw_if_cancelled();
-    co_await net::this_coro::throw_if_cancelled(false);
-    std::exception_ptr failure;
-    try {
-        co_await net::co_spawn(transaction->coordinator->Reactor(),
-            transaction->Resolve(false),
-            net::bind_cancellation_slot(net::cancellation_slot{}, net::use_awaitable));
-    } catch (...) {
-        failure = std::current_exception();
-    }
-    co_await net::this_coro::throw_if_cancelled(throw_if_cancelled);
-    if (failure) std::rethrow_exception(failure);
+    co_await AwaitUncancelled(transaction->coordinator->Reactor(),
+        transaction->Resolve(false));
 }
 
 net::awaitable<std::shared_ptr<ExecutionDomain::Handoff>> ExecutionDomain::Prepare(
@@ -963,70 +969,26 @@ net::awaitable<std::shared_ptr<ExecutionDomain::Handoff>>
 ExecutionDomain::PreparePassiveHandoff(HandoffTarget target) {
     if (auto current = Current(); current && current->SharesGroup(*this))
         throw std::logic_error("passive handoff must originate outside its frozen group");
-    const bool throw_if_cancelled = co_await net::this_coro::throw_if_cancelled();
-    co_await net::this_coro::throw_if_cancelled(false);
-    std::shared_ptr<Handoff> handoff;
-    std::exception_ptr failure;
-    try {
-        handoff = co_await net::co_spawn(co_await net::this_coro::executor,
-            state_->coordinator->Post(Prepare(shared_from_this(), std::move(target))),
-            net::bind_cancellation_slot(net::cancellation_slot{}, net::use_awaitable));
-    } catch (...) {
-        failure = std::current_exception();
-    }
-    co_await net::this_coro::throw_if_cancelled(throw_if_cancelled);
-    if (failure) std::rethrow_exception(failure);
-    co_return handoff;
+    co_return co_await AwaitUncancelled(
+        state_->coordinator->Post(Prepare(shared_from_this(), std::move(target))));
 }
 net::awaitable<void> ExecutionDomain::Join(std::shared_ptr<ExecutionDomain> other) {
     if (!other || Current().get() != this || state_->coordinator != other->state_->coordinator)
         throw std::logic_error("group join requires compatible execution domains");
     if (other.get() == this) co_return;
-    const bool throw_if_cancelled = co_await net::this_coro::throw_if_cancelled();
-    co_await net::this_coro::throw_if_cancelled(false);
-    std::exception_ptr failure;
-    try {
-        co_await net::co_spawn(co_await net::this_coro::executor,
-            state_->coordinator->Post(MergeGroups(shared_from_this(), std::move(other))),
-            net::bind_cancellation_slot(net::cancellation_slot{}, net::use_awaitable));
-    } catch (...) {
-        failure = std::current_exception();
-    }
-    co_await net::this_coro::throw_if_cancelled(throw_if_cancelled);
-    if (failure) std::rethrow_exception(failure);
+    co_await AwaitUncancelled(
+        state_->coordinator->Post(MergeGroups(shared_from_this(), std::move(other))));
 }
 net::awaitable<bool> ExecutionDomain::AttachExclusive(std::shared_ptr<ExecutionDomain> other) {
     if (!other || Current().get() != this || state_->coordinator != other->state_->coordinator)
         throw std::logic_error("exclusive attachment requires compatible domains");
-    const bool throw_if_cancelled = co_await net::this_coro::throw_if_cancelled();
-    co_await net::this_coro::throw_if_cancelled(false);
-    bool attached = false;
-    std::exception_ptr failure;
-    try {
-        attached = co_await net::co_spawn(co_await net::this_coro::executor,
-            state_->coordinator->Post(MergeGroups(shared_from_this(), std::move(other), true)),
-            net::bind_cancellation_slot(net::cancellation_slot{}, net::use_awaitable));
-    } catch (...) {
-        failure = std::current_exception();
-    }
-    co_await net::this_coro::throw_if_cancelled(throw_if_cancelled);
-    if (failure) std::rethrow_exception(failure);
-    co_return attached;
+    co_return co_await AwaitUncancelled(
+        state_->coordinator->Post(MergeGroups(shared_from_this(), std::move(other), true)));
 }
 net::awaitable<void> ExecutionDomain::DetachExclusive(std::shared_ptr<ExecutionDomain> other) {
     if (!other || Current().get() != this || state_->coordinator != other->state_->coordinator)
         throw std::logic_error("exclusive detachment requires compatible domains");
-    const bool throw_if_cancelled = co_await net::this_coro::throw_if_cancelled();
-    co_await net::this_coro::throw_if_cancelled(false);
-    std::exception_ptr failure;
-    try {
-        co_await net::co_spawn(co_await net::this_coro::executor,
-            state_->coordinator->Post(SplitGroup(shared_from_this(), std::move(other))),
-            net::bind_cancellation_slot(net::cancellation_slot{}, net::use_awaitable));
-    } catch (...) {
-        failure = std::current_exception();
-    }
-    co_await net::this_coro::throw_if_cancelled(throw_if_cancelled);
-    if (failure) std::rethrow_exception(failure);
+    co_await AwaitUncancelled(
+        state_->coordinator->Post(SplitGroup(shared_from_this(), std::move(other))));
 }
 

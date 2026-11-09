@@ -359,8 +359,8 @@ TEST(UotSs2022, V1FirstEmptyDatagramSurvivesPreparation) {
             proxy::uot::Version::V1, source);
         Check(prepared.has_value() && prepared->destination.SameEndpoint(target),
               "UoT v1 first empty UDP message was mistaken for EOF");
+        auto empty = std::move(prepared->initial_decoded);
         proxy::uot::PacketReader reader(source, std::move(*prepared));
-        auto empty = co_await reader.ReadMultiBuffer();
         const auto datagram = buf::InspectUdpDatagram(empty);
         Check(datagram.Valid() && datagram.payload_size == 0 &&
                   datagram.target->SameEndpoint(target),

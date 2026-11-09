@@ -16,10 +16,8 @@
 
 class AwaitableTaskGroup;
 class GroupCoordinator;
-struct WorkerRuntimeStatsSnapshot;
 namespace app::dns {
 class DNS;
-class DNSWorker;
 }  // namespace app::dns
 
 namespace proxyman::outbound {
@@ -55,12 +53,9 @@ public:
 
     // Cold Worker setup/publication only; no Worker state is captured by hosts.
     void BindHosts(net::io_context& reactor, uint32_t worker_id,
-                   std::shared_ptr<GroupCoordinator> coordinator,
-                   app::dns::DNSWorker& dns_worker, std::chrono::seconds dial_timeout);
+                   std::shared_ptr<GroupCoordinator> coordinator);
     // Called only after the Worker's requests have drained.
     net::awaitable<void> AsyncJoinHosts();
-    net::awaitable<void> CollectRuntimeStats(WorkerRuntimeStatsSnapshot& result,
-                                             bool include_resources);
 
     // Incremented after each snapshot store (release). A reader that observes
     // a generation (acquire) then captures a snapshot at least that new.

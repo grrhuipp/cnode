@@ -249,8 +249,9 @@ struct StreamCancellation final : transport::CancellationSubscription {
 
 TEST(QuicStreamClose, CompletedDuplexLeavesTransportAliveUntilNativeRetirement) {
     RunInDomain([](net::io_context& io) -> net::awaitable<void> {
+        (void)io;
         auto state = memory::AllocateShared<QuicStreamState>(
-            io, 4, std::weak_ptr<transport::internet::hysteria::Connection>{});
+            4, std::weak_ptr<transport::internet::hysteria::Connection>{});
         StreamCancellation cancellation;
         cancellation.Resubscribe(state->Cancellation());
         {
@@ -281,8 +282,9 @@ TEST(QuicStreamClose, CompletedDuplexLeavesTransportAliveUntilNativeRetirement) 
 
 TEST(QuicStreamClose, UnreadFinTailIsDiscardedAndCancelled) {
     RunInDomain([](net::io_context& io) -> net::awaitable<void> {
+        (void)io;
         auto state = memory::AllocateShared<QuicStreamState>(
-            io, 8, std::weak_ptr<transport::internet::hysteria::Connection>{});
+            8, std::weak_ptr<transport::internet::hysteria::Connection>{});
         transport::internet::hysteria::QuicStream stream(state);
         StreamCancellation cancellation;
         cancellation.Resubscribe(stream.Cancellation());
@@ -313,8 +315,9 @@ class QuicStreamHalfClose : public testing::TestWithParam<bool> {};
 TEST_P(QuicStreamHalfClose, CloseAbortsIncompleteDuplex) {
     const bool remote_fin = GetParam();
     RunInDomain([remote_fin](net::io_context& io) -> net::awaitable<void> {
+        (void)io;
         auto state = memory::AllocateShared<QuicStreamState>(
-            io, 12, std::weak_ptr<transport::internet::hysteria::Connection>{});
+            12, std::weak_ptr<transport::internet::hysteria::Connection>{});
         transport::internet::hysteria::QuicStream stream(state);
         StreamCancellation cancellation;
         cancellation.Resubscribe(stream.Cancellation());
@@ -345,8 +348,9 @@ class QuicStreamAbort : public testing::TestWithParam<bool> {};
 TEST_P(QuicStreamAbort, ExplicitAbortCancelsEvenCompletedDuplex) {
     const bool abortive_close = GetParam();
     RunInDomain([abortive_close](net::io_context& io) -> net::awaitable<void> {
+        (void)io;
         auto state = memory::AllocateShared<QuicStreamState>(
-            io, 16, std::weak_ptr<transport::internet::hysteria::Connection>{});
+            16, std::weak_ptr<transport::internet::hysteria::Connection>{});
         transport::internet::hysteria::QuicStream stream(state);
         StreamCancellation cancellation;
         cancellation.Resubscribe(stream.Cancellation());
@@ -376,7 +380,8 @@ INSTANTIATE_TEST_SUITE_P(Operations, QuicStreamAbort, testing::Bool(),
 
 TEST(QuicStreamWriteWait, BroadcastsWithoutLeavingStaleReadiness) {
     RunInDomain([](net::io_context& io) -> net::awaitable<void> {
-        QuicStreamState state(io, 4, {});
+        (void)io;
+        QuicStreamState state(4, {});
         const auto executor = co_await net::this_coro::executor;
         SignalChannel joined(executor, 2);
         std::exception_ptr failure;
@@ -415,8 +420,9 @@ class QuicStreamWriteWaitEnd : public testing::TestWithParam<WriteWaitEnd> {};
 TEST_P(QuicStreamWriteWaitEnd, SettlesPendingAndSubsequentWaits) {
     const auto ending = GetParam();
     RunInDomain([ending](net::io_context& io) -> net::awaitable<void> {
+        (void)io;
         auto state = memory::AllocateShared<QuicStreamState>(
-            io, 8, std::weak_ptr<transport::internet::hysteria::Connection>{});
+            8, std::weak_ptr<transport::internet::hysteria::Connection>{});
         transport::internet::hysteria::QuicStream stream(state);
         const std::array<uint8_t, 3> tail{0x21, 0x43, 0x65};
         Require(state->PushInput(tail, false), "input tail was not admitted");
@@ -491,7 +497,8 @@ INSTANTIATE_TEST_SUITE_P(Lifecycle, QuicStreamWriteWaitEnd,
 
 TEST(QuicStreamWriteWait, RemoteFinLeavesWriterWaitingForOutputCredit) {
     RunInDomain([](net::io_context& io) -> net::awaitable<void> {
-        QuicStreamState state(io, 12, {});
+        (void)io;
+        QuicStreamState state(12, {});
         const auto executor = co_await net::this_coro::executor;
         SignalChannel joined(executor, 1);
         std::exception_ptr failure;
@@ -522,7 +529,8 @@ TEST(QuicStreamWriteWait, RemoteFinLeavesWriterWaitingForOutputCredit) {
 
 TEST(QuicStreamWriteWait, CoroutineCancellationDoesNotBecomeAnAck) {
     RunInDomain([](net::io_context& io) -> net::awaitable<void> {
-        QuicStreamState state(io, 16, {});
+        (void)io;
+        QuicStreamState state(16, {});
         const auto executor = co_await net::this_coro::executor;
         SignalChannel joined(executor, 1);
         net::cancellation_signal cancellation;

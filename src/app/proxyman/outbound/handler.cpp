@@ -3,7 +3,6 @@
 #include "app/dns/dns.hpp"
 #include "app/proxyman/outbound/factory.hpp"
 #include "app/session_group_executor.hpp"
-#include "app/worker_stats.hpp"
 #include "infra/log.hpp"
 #include "../../../common/awaitable_task_group.hpp"
 #include "../../../transport/internet/xhttp_session.hpp"
@@ -75,11 +74,6 @@ public:
         return joined_.load(std::memory_order_acquire);
     }
 
-    [[nodiscard]] WorkerRuntimeStatsSnapshot CollectRuntimeStats(
-        bool /*include_resources*/) const noexcept {
-        // Worker-level collection accounts the shared scheduler exactly once.
-        return {};
-    }
 
     net::awaitable<void> AsyncJoin() {
         co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
@@ -206,9 +200,12 @@ Handler::Handler(OutboundConfiguration::Entry config, net::io_context& io_contex
                  app::dns::DNS& dns, std::chrono::seconds dial_timeout,
                  AwaitableTaskGroup& tasks)
     : config_(std::move(config)) {
-    dialer_.emplace(io_context, dns, config_->sender, dial_timeout);
+    auto& reactor = ExecutionDomain::Current()
+        ? ExecutionDomain::Current()->Reactor()
+        : io_context;
+    dialer_.emplace(reactor, dns, config_->sender, dial_timeout);
     if (config_->host) host_ = config_->host;
-    else proxy_ = NewProxy(*config_, io_context, tasks);
+    else proxy_ = NewProxy(*config_, reactor, tasks);
 }
 
 
@@ -288,7 +285,10 @@ void HandlerLookup::Sync(uint64_t generation) {
 
 std::shared_ptr<Handler> HandlerLookup::Instantiate(const OutboundConfiguration::Entry& config) {
     memory::ScopedWorkerAllocation worker_allocation;
-    return memory::AllocateShared<Handler>(config, io_context_, dns_, dial_timeout_, tasks_);
+    auto& reactor = ExecutionDomain::Current()
+        ? ExecutionDomain::Current()->Reactor()
+        : io_context_;
+    return memory::AllocateShared<Handler>(config, reactor, dns_, dial_timeout_, tasks_);
 }
 
 // ============================================================================
@@ -369,8 +369,7 @@ OutboundConfiguration::Capture() const noexcept {
 }
 
 void OutboundConfiguration::BindHosts(net::io_context& reactor, uint32_t worker_id,
-    std::shared_ptr<GroupCoordinator> coordinator, app::dns::DNSWorker& /*dns_worker*/,
-    std::chrono::seconds /*dial_timeout*/) {
+    std::shared_ptr<GroupCoordinator> coordinator) {
     const std::lock_guard lock(publication_mutex_);
     if (hosts_) throw std::logic_error("outbound hosts already bound");
     hosts_ = std::make_unique<Hosts>(Hosts{
@@ -403,55 +402,6 @@ net::awaitable<void> OutboundConfiguration::AsyncJoinHosts() {
     // Release all domain roots before the coordinator's Finalize barrier.
     hosts_.reset();
     if (failure) std::rethrow_exception(failure);
-}
-
-net::awaitable<void> OutboundConfiguration::CollectRuntimeStats(
-    WorkerRuntimeStatsSnapshot& result, bool include_resources) {
-    struct Sample {
-        std::weak_ptr<OutboundPoolHost> host;
-        std::weak_ptr<ExecutionDomain> domain;
-    };
-    std::vector<Sample> samples;
-    {
-        const std::lock_guard lock(publication_mutex_);
-        if (!hosts_) co_return;
-        hosts_->Prune();
-        samples.reserve(hosts_->residents.size());
-        for (const auto& resident : hosts_->residents) {
-            if (resident.host && !resident.host->IsJoined() && resident.domain) {
-                samples.push_back(Sample{
-                    .host = resident.host,
-                    .domain = resident.domain,
-                });
-            }
-        }
-    }
-    for (const auto& sample : samples) {
-        auto domain = sample.domain.lock();
-        if (!domain) continue;
-        auto executor = domain->Executor();
-        const auto values = co_await net::co_spawn(std::move(executor),
-            [weak_host = sample.host, domain = std::move(domain), include_resources]() mutable
-                -> net::awaitable<WorkerRuntimeStatsSnapshot> {
-                WorkerRuntimeStatsSnapshot snapshot;
-                auto host = weak_host.lock();
-                if (host && !host->IsJoined()) {
-                    snapshot = host->CollectRuntimeStats(include_resources);
-                }
-                host.reset();
-                domain.reset();
-                co_return snapshot;
-            }, net::use_awaitable);
-        result.memory.pool_mapped_bytes += values.memory.pool_mapped_bytes;
-        result.memory.pool_direct_bytes += values.memory.pool_direct_bytes;
-        result.memory.pool_idle_bytes += values.memory.pool_idle_bytes;
-        result.memory.pool_chunks += values.memory.pool_chunks;
-        if (values.resources && result.resources) {
-            result.resources->timeout_events += values.resources->timeout_events;
-            result.resources->timeout_heap_capacity += values.resources->timeout_heap_capacity;
-            result.resources->timeout_waiters += values.resources->timeout_waiters;
-        }
-    }
 }
 
 void OutboundConfiguration::Replace(const PreparedOutboundConfig& configuration) {

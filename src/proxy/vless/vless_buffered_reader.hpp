@@ -54,6 +54,36 @@ public:
         co_return true;
     }
 
+    net::awaitable<bool> DiscardExact(size_t len, size_t* progress = nullptr) {
+        size_t local_done = 0;
+        size_t& done = progress ? *progress : local_done;
+        while (done < len) {
+            if (pending_.byte_size() != 0) {
+                const size_t n = pending_.DropPrefixBytes(len - done);
+                if (pending_.empty()) {
+                    pending_.ReleaseIfIdle();
+                }
+                done += n;
+                if (n > 0) {
+                    continue;
+                }
+            }
+
+            buf::MultiBuffer mb = co_await src_.ReadMultiBuffer();
+            const bool received = mb.byte_size() != 0;
+            if (received) mb.MoveTo(pending_);
+            // Retain concurrently received bytes before observing cancellation.
+            if ((co_await net::this_coro::cancellation_state).cancelled() !=
+                net::cancellation_type::none) {
+                throw IoSystemError(io_error::operation_aborted);
+            }
+            if (!received) {
+                co_return done == len;
+            }
+        }
+        co_return true;
+    }
+
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
         if (pending_.byte_size() != 0) {
             co_return std::move(pending_);

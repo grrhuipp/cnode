@@ -207,7 +207,6 @@ public:
     worker_memory(const worker_memory&) = delete;
     worker_memory& operator=(const worker_memory&) = delete;
 
-    void RequireLease() const noexcept {}
 
     [[nodiscard]] static worker_memory& OwnerOf(const void* pointer) noexcept {
         return *reinterpret_cast<Chunk*>(
@@ -263,7 +262,6 @@ public:
     }
 
     [[nodiscard]] bool BindIdleWakeup(IdleWakeup& owner) noexcept {
-        RequireLease();
         if (wakeup_ && wakeup_ != &owner) return false;
         wakeup_ = &owner;
         if (pooling_ && pooling_->idle_head) wakeup_->OnPoolIdle();
@@ -271,7 +269,6 @@ public:
     }
 
     void UnbindIdleWakeup(IdleWakeup& owner) noexcept {
-        RequireLease();
         if (wakeup_ == &owner) wakeup_ = nullptr;
     }
 
@@ -758,6 +755,9 @@ public:
     [[nodiscard]] std::shared_ptr<void> Lifetime() const noexcept {
         return lifetime_.lock();
     }
+    [[nodiscard]] const std::weak_ptr<domain_memory_resource>& WeakLifetime() const noexcept {
+        return lifetime_;
+    }
     [[nodiscard]] std::size_t OutstandingAllocations() const noexcept {
         RequireLease();
         return live_allocations_;
@@ -1054,6 +1054,8 @@ struct ThreadAllocated {
         if (void* p = AllocatePmr(size, static_cast<std::size_t>(alignment))) return p;
         throw std::bad_alloc();
     }
+    static void* operator new(std::size_t, void* p) noexcept { return p; }
+    static void operator delete(void*, void*) noexcept {}
     static void operator delete(void* p) noexcept { DeallocatePmr(p); }
     static void operator delete(void* p, std::size_t) noexcept { DeallocatePmr(p); }
     static void operator delete(void* p, std::align_val_t) noexcept { DeallocatePmr(p); }
@@ -1085,6 +1087,33 @@ protected:
     static ThreadMemoryResource resource;
     return &resource;
 }
+inline void TrackResourceLifetime(
+    std::pmr::memory_resource* resource,
+    std::weak_ptr<void>& lifetime,
+    bool& tracked) noexcept {
+    if (!resource || resource == worker_pool_resource() ||
+        resource == process_resource()) {
+        lifetime.reset();
+        tracked = false;
+        return;
+    }
+    if (const auto* current = detail::current_allocation_domain) {
+        auto* domain = const_cast<AllocationDomain*>(current);
+        if (resource == domain->resource()) {
+            lifetime = domain->memory().WeakLifetime();
+            tracked = !lifetime.expired();
+            return;
+        }
+    }
+    if (auto* domain = dynamic_cast<domain_memory_resource*>(resource)) {
+        lifetime = domain->WeakLifetime();
+        tracked = !lifetime.expired();
+        return;
+    }
+    lifetime.reset();
+    tracked = false;
+}
+
 
 inline void ConfigureProcessAllocator() noexcept {
     DisableTransparentHugePages();
@@ -1144,10 +1173,14 @@ public:
     }
     template <class U>
     ThreadLocalAllocator(const ThreadLocalAllocator<U>& other) noexcept
-        : ThreadLocalAllocator(other.resource()) {}
+        : resource_((other.RefreshResource(), other.resource_))
+        , lifetime_(other.lifetime_)
+        , lifetime_tracked_(other.lifetime_tracked_) {}
     template <class U>
     ThreadLocalAllocator(ThreadLocalAllocator<U>&& other) noexcept
-        : ThreadLocalAllocator(other.resource()) {}
+        : resource_((other.RefreshResource(), other.resource_))
+        , lifetime_(std::move(other.lifetime_))
+        , lifetime_tracked_(other.lifetime_tracked_) {}
     template <class U>
     ThreadLocalAllocator(const std::pmr::polymorphic_allocator<U>& other) noexcept
         : ThreadLocalAllocator(other.resource()) {}
@@ -1156,30 +1189,29 @@ public:
         return {};
     }
     [[nodiscard]] std::pmr::memory_resource* resource() const noexcept {
-        auto lifetime = PinResource();
+        RefreshResource();
         return resource_;
     }
     [[nodiscard]] T* allocate(std::size_t count) {
-        auto lifetime = PinResource();
+        RefreshResource();
         return std::pmr::polymorphic_allocator<T>(resource_).allocate(count);
     }
     void deallocate(T* pointer, std::size_t count) noexcept {
-        auto lifetime = PinResource();
+        RefreshResource();
         std::pmr::polymorphic_allocator<T>(resource_).deallocate(pointer, count);
     }
     template <class U, class... Args>
         requires (UsesAllocatorConstruction<std::remove_cv_t<U>>::value)
     void construct(U* pointer, Args&&... args) {
-        auto lifetime = PinResource();
-        // Ordinary elements use allocator_traits' construct_at fallback without
+        RefreshResource();
         // touching the resource; only allocator-consuming construction pins it.
         std::pmr::polymorphic_allocator<T>(resource_).construct(
             pointer, std::forward<Args>(args)...);
     }
     template <class U>
     [[nodiscard]] bool operator==(const ThreadLocalAllocator<U>& other) const noexcept {
-        auto left_lifetime = PinResource();
-        auto right_lifetime = other.PinResource();
+        RefreshResource();
+        other.RefreshResource();
         return resource_ == other.resource_ || resource_->is_equal(*other.resource_);
     }
 
@@ -1187,19 +1219,13 @@ private:
     template <class> friend class ThreadLocalAllocator;
 
     void TrackResource() noexcept {
-        auto lifetime = RetainResource(resource_);
-        lifetime_ = lifetime;
-        lifetime_tracked_ = static_cast<bool>(lifetime);
+        TrackResourceLifetime(resource_, lifetime_, lifetime_tracked_);
     }
 
-    [[nodiscard]] std::shared_ptr<void> PinResource() const noexcept {
-        if (!lifetime_tracked_) return {};
-        if (auto lifetime = lifetime_.lock()) return lifetime;
+    void RefreshResource() const noexcept {
+        if (!lifetime_tracked_ || !lifetime_.expired()) return;
         resource_ = CurrentResource();
-        auto lifetime = RetainResource(resource_);
-        lifetime_ = lifetime;
-        lifetime_tracked_ = static_cast<bool>(lifetime);
-        return lifetime;
+        TrackResourceLifetime(resource_, lifetime_, lifetime_tracked_);
     }
 
     mutable std::pmr::memory_resource* resource_;
@@ -1374,7 +1400,7 @@ public:
         ReleaseStorage();
     }
 
-    void shrink_to_fit() noexcept {
+    [[gnu::noinline]] void shrink_to_fit() noexcept {
         if (size_ == 0) {
             ReleaseStorage();
             return;
@@ -1391,7 +1417,7 @@ public:
                 return;
             }
             try {
-                auto lifetime = PinResource();
+                RefreshResource();
                 T* next_data = static_cast<T*>(
                     resource_->allocate(target_cap * sizeof(T), alignof(T)));
                 for (std::size_t i = 0; i < size_; ++i) {
@@ -1460,7 +1486,7 @@ private:
             next_cap *= 2;
         }
         if (next_cap <= capacity_) return;
-        auto lifetime = PinResource();
+        RefreshResource();
         T* next_data = static_cast<T*>(
             resource_->allocate(next_cap * sizeof(T), alignof(T)));
         std::size_t constructed = 0;
@@ -1497,7 +1523,7 @@ private:
         if (next_cap > std::numeric_limits<std::size_t>::max() / sizeof(T)) {
             throw std::bad_alloc();
         }
-        auto lifetime = PinResource();
+        RefreshResource();
         T* next_data = static_cast<T*>(
             resource_->allocate(next_cap * sizeof(T), alignof(T)));
         T* new_elem = next_data + (at_back ? size_ : 0);
@@ -1535,23 +1561,17 @@ private:
     }
 
     void TrackResource() noexcept {
-        auto lifetime = RetainResource(resource_);
-        resource_lifetime_ = lifetime;
-        lifetime_tracked_ = static_cast<bool>(lifetime);
+        TrackResourceLifetime(resource_, resource_lifetime_, lifetime_tracked_);
     }
 
-    [[nodiscard]] std::shared_ptr<void> PinResource() const noexcept {
-        if (!lifetime_tracked_) return {};
-        if (auto lifetime = resource_lifetime_.lock()) return lifetime;
+    void RefreshResource() const noexcept {
+        if (!lifetime_tracked_ || !resource_lifetime_.expired()) return;
         resource_ = CurrentResource();
-        auto lifetime = RetainResource(resource_);
-        resource_lifetime_ = lifetime;
-        lifetime_tracked_ = static_cast<bool>(lifetime);
-        return lifetime;
+        TrackResourceLifetime(resource_, resource_lifetime_, lifetime_tracked_);
     }
 
     [[nodiscard]] std::pmr::memory_resource* ResolvedResource() const noexcept {
-        auto lifetime = PinResource();
+        RefreshResource();
         return resource_;
     }
 

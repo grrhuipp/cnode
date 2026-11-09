@@ -15,12 +15,12 @@
 namespace transport::internet::hysteria {
 
 QuicStreamState::QuicStreamState(
-    net::io_context& io_context, int64_t stream_id,
+    int64_t stream_id,
     std::weak_ptr<Connection> owner)
     : domain_(ExecutionDomain::Current())
     , stream_id_(stream_id)
     , owner_(std::move(owner))
-    , input_signal_(domain_->Executor(), 1) { (void)io_context; }
+    , input_signal_(domain_->Executor(), 1) {}
 
 bool QuicStreamState::PushInput(std::span<const uint8_t> data, bool fin) {
     if (cancelled_ || input_done_ ||
@@ -256,11 +256,10 @@ bool QuicStream::IsOpen() const {
 UdpSessionStream::UdpSessionStream(
     net::io_context& io_context, uint32_t session_id,
     TargetAddress first_target, std::weak_ptr<Connection> owner)
-    : domain_(ExecutionDomain::Current())
-    , session_id_(session_id)
+    : session_id_(session_id)
     , first_target_(std::move(first_target))
     , owner_(std::move(owner))
-    , signal_(domain_->Executor(), 1)
+    , signal_(ExecutionDomain::Current()->Executor(), 1)
     , deadline_(io_context, *this) {}
 
 UdpSessionStream::~UdpSessionStream() noexcept {

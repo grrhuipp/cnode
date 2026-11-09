@@ -37,11 +37,6 @@ std::array<char, 28> EncodeWsAccept(std::string_view ws_key) noexcept {
     return out;
 }
 
-std::string ComputeWsAccept(std::string_view ws_key) {
-    const auto accept = EncodeWsAccept(ws_key);
-    return std::string(accept.data(), accept.size());
-}
-
 }  // namespace ws
 
 namespace {

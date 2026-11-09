@@ -537,6 +537,9 @@ void TestResponseAuthenticatedLength(vmess::Security security) {
 memory::ByteVector MakeClientResponse(Connection& connection,
                                      vmess::encoding::ClientSession& client,
                                      const vmess::MemoryAccount& account,
+                                     const AES_KEY& auth_id_key,
+                                     const TargetAddress& target,
+                                     vmess::Command command,
                                      vmess::VMessRequest* authenticated_request = nullptr) {
     using namespace proxyman::inbound;
     constexpr auto tag = "vmess-client-response";
@@ -556,7 +559,8 @@ memory::ByteVector MakeClientResponse(Connection& connection,
     bool completed = false;
     std::exception_ptr failure;
     connection.io.restart();
-    net::co_spawn(connection.io, client.EncodeRequestHeader(connection.stream),
+    net::co_spawn(connection.io,
+        client.EncodeRequestHeader(connection.stream, account, auth_id_key, target, command),
         [&](std::exception_ptr error, vmess::encoding::VMessHandshakeResult result) {
             failure = error;
             Check(result.has_value(), "VMess client request header failed");
@@ -601,9 +605,9 @@ void TestClientAuthenticationFailure(size_t corrupt_offset,
     const auto auth_id_key = vmess::ExpandAuthIDEncryptKey(account->auth_key);
     const TargetAddress target("127.0.0.1", 5353);
     Connection connection;
-    vmess::encoding::ClientSession client(
-        *account, auth_id_key, target, vmess::Security::AES_128_GCM, command);
-    const auto response = MakeClientResponse(connection, client, *account);
+    vmess::encoding::ClientSession client(vmess::Security::AES_128_GCM, command);
+    const auto response = MakeClientResponse(
+        connection, client, *account, auth_id_key, target, command);
     auto corrupted = response;
     corrupted[corrupt_offset] ^= 0x80;
     const size_t prefix_size = corrupt_offset < 18 ? 18
@@ -624,9 +628,9 @@ void TestClientTruncation(vmess::Command command, size_t cut) {
     const auto auth_id_key = vmess::ExpandAuthIDEncryptKey(account->auth_key);
     const TargetAddress target("127.0.0.1", 5353);
     Connection connection;
-    vmess::encoding::ClientSession client(
-        *account, auth_id_key, target, vmess::Security::AES_128_GCM, command);
-    const auto response = MakeClientResponse(connection, client, *account);
+    vmess::encoding::ClientSession client(vmess::Security::AES_128_GCM, command);
+    const auto response = MakeClientResponse(
+        connection, client, *account, auth_id_key, target, command);
     connection.stream.PrependReadData(std::span<const uint8_t>(response).first(cut));
     connection.peer.shutdown(tcp::socket::shutdown_send);
     CheckReadFailed(connection, client.DecodeResponse(connection.stream),
@@ -642,8 +646,9 @@ void TestClientHeaderCancellation(vmess::Security security, vmess::Command comma
     const auto auth_id_key = vmess::ExpandAuthIDEncryptKey(account->auth_key);
     const TargetAddress target("127.0.0.1", 5353);
     Connection connection;
-    vmess::encoding::ClientSession client(*account, auth_id_key, target, security, command);
-    const auto response = MakeClientResponse(connection, client, *account);
+    vmess::encoding::ClientSession client(security, command);
+    const auto response = MakeClientResponse(
+        connection, client, *account, auth_id_key, target, command);
     size_t supplied = 0;
     for (const size_t cut : {size_t{0}, size_t{1}, size_t{17}, size_t{18}, size_t{23}, size_t{37}}) {
         connection.stream.PrependReadData(
@@ -931,11 +936,14 @@ void CheckWriteClosed(std::exception_ptr failure) {
 }
 
 vmess::encoding::VMessHandshakeResult CompleteHeader(
-    Connection& connection, vmess::encoding::ClientSession& client, AsyncStream& stream) {
+    Connection& connection, vmess::encoding::ClientSession& client, AsyncStream& stream,
+    const vmess::MemoryAccount& account, const AES_KEY& auth_key,
+    const TargetAddress& target, vmess::Command command) {
     vmess::encoding::VMessHandshakeResult result;
     std::exception_ptr failure;
     connection.io.restart();
-    net::co_spawn(connection.io, client.EncodeRequestHeader(stream),
+    net::co_spawn(connection.io,
+        client.EncodeRequestHeader(stream, account, auth_key, target, command),
         [&](std::exception_ptr error, vmess::encoding::VMessHandshakeResult value) {
             failure = error;
             result = std::move(value);
@@ -956,10 +964,7 @@ void TestWriteFailure(bool server_side, bool eof, IoErrorCode error,
     InterruptedWriteStream stream(connection, error);
     const std::array<uint8_t, 19> payload{0x41, 0x42, 0x43};
     const std::array<net::const_buffer, 1> buffers{net::buffer(payload)};
-    auto account = vmess::MemoryAccount::FromUUID("11111111-1111-4111-8111-111111111111");
-    const auto auth_key = vmess::ExpandAuthIDEncryptKey(account->auth_key);
-    vmess::encoding::ClientSession client(
-        *account, auth_key, request.target, request.security, command);
+    vmess::encoding::ClientSession client(request.security, command);
     vmess::TimedUserValidator validator;
     vmess::encoding::ServerSession server(validator, "write-failure");
     server.SetRequest(request);
@@ -1007,14 +1012,13 @@ void TestWriteEnd(bool server_side, vmess::Command command) {
     Connection connection;
     auto account = vmess::MemoryAccount::FromUUID("11111111-1111-4111-8111-111111111111");
     const auto auth_key = vmess::ExpandAuthIDEncryptKey(account->auth_key);
-    vmess::encoding::ClientSession client(
-        *account, auth_key, request.target, request.security, command);
+    vmess::encoding::ClientSession client(request.security, command);
     vmess::TimedUserValidator validator;
     vmess::encoding::ServerSession server(validator, "write-eof");
     server.SetRequest(request);
     auto writer = server.EncodeResponseBodyWithHeader(connection.stream);
     const auto response = server_side ? memory::ByteVector{}
-        : MakeClientResponse(connection, client, *account);
+        : MakeClientResponse(connection, client, *account, auth_key, request.target, command);
     auto finish = [&]() -> net::awaitable<void> {
         if (server_side) co_await writer->AsyncShutdownWrite();
         else co_await client.EncodeRequestBodyEOF(connection.stream);
@@ -1153,12 +1157,14 @@ TEST(VmessUdpDatagram, RequestHeaderWriteFailureIsTerminal) {
         const auto auth_key = vmess::ExpandAuthIDEncryptKey(account->auth_key);
         const TargetAddress target("127.0.0.1", 5353);
         vmess::encoding::ClientSession client(
-            *account, auth_key, target, vmess::Security::AES_128_GCM, vmess::Command::TCP);
-        const auto first = CompleteHeader(connection, client, stream);
+            vmess::Security::AES_128_GCM, vmess::Command::TCP);
+        const auto first = CompleteHeader(
+            connection, client, stream, *account, auth_key, target, vmess::Command::TCP);
         Check(!first && first.error() == MapAsioError(error),
               "VMess request header changed the original write error");
         Check(!stream.published.empty(), "VMess request header fault had no wire prefix");
-        const auto next = CompleteHeader(connection, client, stream);
+        const auto next = CompleteHeader(
+            connection, client, stream, *account, auth_key, target, vmess::Command::TCP);
         Check(!next, "VMess retried a request header after its key was erased");
         CheckWriteError(CompleteWrite(connection, client.EncodeRequestBody(
             stream, buf::MultiBuffer{MakeBuffer(13, nullptr)})), io_error::connection_reset);
@@ -1225,13 +1231,15 @@ TEST(VmessUdpDatagram, RequestHeaderInputRejectionPreservesKeys) {
     const auto auth_key = vmess::ExpandAuthIDEncryptKey(account->auth_key);
     TargetAddress target;
     vmess::encoding::ClientSession client(
-        *account, auth_key, target, vmess::Security::AES_128_GCM, vmess::Command::TCP);
-    const auto rejected = CompleteHeader(connection, client, connection.stream);
+        vmess::Security::AES_128_GCM, vmess::Command::TCP);
+    const auto rejected = CompleteHeader(
+        connection, client, connection.stream, *account, auth_key, target, vmess::Command::TCP);
     Check(!rejected && rejected.error() == ErrorCode::PROTOCOL_INVALID_ADDRESS,
           "VMess invalid request target changed its error");
     Check(connection.peer.available() == 0, "VMess invalid target published header bytes");
     target = TargetAddress("127.0.0.1", 5353);
-    const auto response = MakeClientResponse(connection, client, *account);
+    const auto response = MakeClientResponse(
+        connection, client, *account, auth_key, target, vmess::Command::TCP);
     connection.stream.PrependReadData(response);
     const auto decoded = ReadReady(connection, client.DecodeResponse(connection.stream));
     const buf::ContiguousBufferView bytes(decoded);
@@ -1277,10 +1285,10 @@ TEST(VmessUdpDatagram, LowerWriteClosedPreservesReverseRead) {
         stream.write_closed = true;
         auto account = vmess::MemoryAccount::FromUUID("11111111-1111-4111-8111-111111111111");
         const auto auth_key = vmess::ExpandAuthIDEncryptKey(account->auth_key);
-        vmess::encoding::ClientSession client(
-            *account, auth_key, request.target, request.security, request.command);
+        vmess::encoding::ClientSession client(request.security, request.command);
         const auto response = server_side ? memory::ByteVector{}
-            : MakeClientResponse(connection, client, *account);
+            : MakeClientResponse(
+                  connection, client, *account, auth_key, request.target, request.command);
         vmess::TimedUserValidator validator;
         vmess::encoding::ServerSession server(validator, "lower-write-closed");
         server.SetRequest(request);
@@ -1324,11 +1332,11 @@ TEST(VmessUdpDatagram, PreCancelledWritePreservesNextRecord) {
                 auto account = vmess::MemoryAccount::FromUUID(
                     "11111111-1111-4111-8111-111111111111");
                 const auto auth_key = vmess::ExpandAuthIDEncryptKey(account->auth_key);
-                vmess::encoding::ClientSession client(
-                    *account, auth_key, request.target, request.security, command);
+                vmess::encoding::ClientSession client(request.security, command);
                 memory::ByteVector response;
                 if (!server_side && entry != 3) {
-                    response = MakeClientResponse(connection, client, *account, &request);
+                    response = MakeClientResponse(
+                        connection, client, *account, auth_key, request.target, command, &request);
                 }
                 vmess::TimedUserValidator validator;
                 vmess::encoding::ServerSession server(validator, "pre-cancel-write");
@@ -1356,7 +1364,8 @@ TEST(VmessUdpDatagram, PreCancelledWritePreservesNextRecord) {
                     bool cancelled = false;
                     try {
                         if (entry == 3) {
-                            const auto result = co_await client.EncodeRequestHeader(connection.stream);
+                            const auto result = co_await client.EncodeRequestHeader(
+                                connection.stream, *account, auth_key, request.target, command);
                             cancelled = !result &&
                                 result.error() == MapAsioError(io_error::operation_aborted);
                         } else if (entry == 2) {
@@ -1381,7 +1390,8 @@ TEST(VmessUdpDatagram, PreCancelledWritePreservesNextRecord) {
                 if (failure) std::rethrow_exception(failure);
 
                 if (!server_side && entry == 3) {
-                    response = MakeClientResponse(connection, client, *account, &request);
+                    response = MakeClientResponse(
+                        connection, client, *account, auth_key, request.target, command, &request);
                 }
                 auto resume = [&]() -> net::awaitable<void> {
                     co_await write_payload();

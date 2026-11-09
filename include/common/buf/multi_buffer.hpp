@@ -85,7 +85,7 @@ struct Buffer {
         RequireLease();
         start = 0;
         end = 0;
-        ClearUDP();
+        udp_.reset();
     }
 
     // 设置/清除本 Buffer 的 UDP 对端地址。
@@ -133,7 +133,6 @@ struct Buffer {
             return;
         }
         b->RequireLease();
-        memory::RequireAllocationLease(b);
         memory::OnBufferFree();
         b->~Buffer();
         memory::DeallocatePmr(b, sizeof(Buffer), alignof(Buffer));
@@ -584,7 +583,7 @@ public:
 
     // A tagged zero-byte datagram is a message, not idle retained storage.
     void ReleaseIfIdle() noexcept {
-        if (total_bytes_ == 0 && !HasUDP()) clear();
+        if (!empty() && total_bytes_ == 0 && !HasUDP()) clear();
     }
 
     void RecordTailProduced(size_t bytes) {
@@ -876,6 +875,12 @@ UdpDatagramInfo InspectUdpDatagram(const MultiBuffer&&) = delete;
     const size_t tail_bytes = tail && !tail->HasUDP()
         ? std::min(data.size(), static_cast<size_t>(tail->Available())) : 0;
 
+    if (tail_bytes == data.size()) {
+        std::memmove(tail->Tail().data(), data.data(), tail_bytes);
+        tail->Produce(static_cast<uint32_t>(tail_bytes));
+        out_mb.RecordTailProduced(tail_bytes);
+        return true;
+    }
     // Build only the new suffix. Existing buffers and tail bytes remain
     // untouched until every data block and pointer slot is available.
     MultiBuffer suffix;
@@ -945,7 +950,9 @@ public:
 
     void Reset() noexcept {
         pooled_.reset();
-        memory::ByteVector{heap_.get_allocator()}.swap(heap_);
+        if (heap_.capacity() != 0) {
+            memory::ByteVector{heap_.get_allocator()}.swap(heap_);
+        }
     }
 
     [[nodiscard]] bool TryAppendTo(size_t size, MultiBuffer& out) noexcept {

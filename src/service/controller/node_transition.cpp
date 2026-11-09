@@ -18,8 +18,7 @@ bool NodeConfigChanged(const api::NodeInfo& current,
         || current.ShadowsocksServerKey != candidate.ShadowsocksServerKey
         || current.PaddingScheme != candidate.PaddingScheme
         || current.HysteriaUpMbps != candidate.HysteriaUpMbps
-        || current.HysteriaDownMbps != candidate.HysteriaDownMbps
-        || current.Sniffing != candidate.Sniffing;
+        || current.HysteriaDownMbps != candidate.HysteriaDownMbps;
 }
 
 NodeTransitionPlan PlanNodeTransition(const api::NodeInfo* current,

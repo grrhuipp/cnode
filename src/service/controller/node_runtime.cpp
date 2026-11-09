@@ -139,18 +139,19 @@ net::awaitable<void> NodeRuntime::UpdateRules(
     const std::string& tag,
     const std::vector<rule::DetectRule>& new_rule_list) {
     ThrowIfStopping();
+    auto shared_rules = std::make_shared<const std::vector<rule::DetectRule>>(new_rule_list);
     co_await RunWorkerMutationBatch(
         io_context_.get_executor(), workers_,
-        [this, &tag, &new_rule_list](Worker& worker, size_t) {
+        [this, &tag, &shared_rules](Worker& worker, size_t) {
             return [](NodeRuntime* runtime, Worker* current,
                       std::string current_tag,
-                      std::vector<rule::DetectRule> rules) -> net::awaitable<void> {
+                      std::shared_ptr<const std::vector<rule::DetectRule>> rules) -> net::awaitable<void> {
                 runtime->ThrowIfStopping();
                 co_await current->PostCall(
                     [current, tag = std::move(current_tag), rules = std::move(rules)]() mutable {
                         current->UpdateRule(tag, std::move(rules));
                     });
-            }(this, &worker, tag, new_rule_list);
+            }(this, &worker, tag, shared_rules);
         });
 }
 

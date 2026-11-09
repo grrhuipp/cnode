@@ -95,7 +95,6 @@ private:
     // 非 connect 仅使用帧内地址，请求目标已由会话上下文拥有。
     TargetAddress destination_;
     buf::MultiBuffer pending_;
-    buf::MultiBuffer initial_decoded_;
 };
 
 class PacketWriter final : public transport::MultiBufferWriter {

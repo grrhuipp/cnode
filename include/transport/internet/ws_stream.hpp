@@ -97,7 +97,6 @@ inline EncodedFrameHeader EncodeFrameHeader(
     return header;
 }
 
-[[nodiscard]] std::string ComputeWsAccept(std::string_view ws_key);
 [[nodiscard]] std::array<char, 28> EncodeWsAccept(std::string_view ws_key) noexcept;
 
 }  // namespace ws

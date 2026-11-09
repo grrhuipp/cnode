@@ -329,7 +329,7 @@ bool PanelConfig::Validate() const {
             LOG_PANEL_ERROR(log_context, "Panel TLSCert and TLSKey must be configured together");
             return false;
         }
-        if (!TLSCert.empty() && !TLSPem) {
+        if (!TLSPem && !TLSCert.empty()) {
             TlsConfig tls;
             tls.cert_file = TLSCert;
             tls.key_file = TLSKey;

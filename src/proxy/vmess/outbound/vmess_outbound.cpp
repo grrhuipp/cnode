@@ -83,13 +83,19 @@ net::awaitable<tl::expected<void, ErrorCode>>
 SendVMessHandshake(
     AsyncStream& stream,
     ::vmess::encoding::ClientSession& vmess_session,
+    const ::vmess::MemoryAccount& user,
+    const AES_KEY& auth_id_key,
+    const TargetAddress& target,
+    ::vmess::Command command,
+    ForwardedMetadataView forwarded,
     std::chrono::seconds handshake_timeout,
     session::Context& ctx) {
     stream.SetIdleTimeout(handshake_timeout);
     PhaseDeadlineHandle outbound_protocol_deadline =
         stream.StartPhaseDeadline(handshake_timeout);
 
-    auto handshake_result = co_await vmess_session.EncodeRequestHeader(stream);
+    auto handshake_result = co_await vmess_session.EncodeRequestHeader(
+        stream, user, auth_id_key, target, command, forwarded);
     if (!handshake_result) {
         const bool timed_out = proxy::ConsumeOutboundHandshakeTimeout(
             stream, outbound_protocol_deadline);
@@ -136,16 +142,14 @@ proxy::vmess::outbound::Handler::Process(
     auto stream = std::move(*dialed);
 
     const bool is_udp = ctx.content.network == Network::UDP;
+    const auto command = is_udp ? ::vmess::Command::UDP : ::vmess::Command::TCP;
     ::vmess::encoding::ClientSession vmess_session(
-        prepared_->user,
-        prepared_->auth_id_key,
-        target,
-        prepared_->config.security,
-        is_udp ? ::vmess::Command::UDP : ::vmess::Command::TCP,
-        dialer.ForwardedMetadata(ctx));
+        prepared_->config.security, command);
 
     if (auto ok = co_await SendVMessHandshake(
-            *stream, vmess_session, timeouts.HandshakeTimeout(), ctx); !ok) {
+            *stream, vmess_session, prepared_->user, prepared_->auth_id_key,
+            target, command, dialer.ForwardedMetadata(ctx),
+            timeouts.HandshakeTimeout(), ctx); !ok) {
         stream->CloseAbortive();
         co_return tl::unexpected(ok.error());
     }
@@ -217,37 +221,40 @@ const bool kVMessRegistered = (::proxyman::outbound::RegisterProxy(
         auto security = ::vmess::Security::AES_128_GCM;
         std::string uuid;
 
-        bool parsed_xray = false;
-        if (const auto* vnext_p = s.if_contains("vnext");
-                vnext_p && vnext_p->is_array() && !vnext_p->as_array().empty() &&
-                vnext_p->as_array()[0].is_object()) {
-            const auto& server = vnext_p->as_array()[0].as_object();
-            if (const auto* users_p = server.if_contains("users");
-                    users_p && users_p->is_array() && !users_p->as_array().empty() &&
-                    users_p->as_array()[0].is_object()) {
-                const auto& user = users_p->as_array()[0].as_object();
-                address = json_string(server, "address");
-                const auto source_port = ::ReadJsonPort(server, "port");
-                if (source_port.Invalid()) {
-                    return std::nullopt;
-                }
-                if (source_port.Valid()) {
-                    port = source_port.value;
-                }
-                uuid = json_string(user, "id");
-                if (!has_supported_alter_id(user)) {
-                    return std::nullopt;
-                }
-                auto parsed_security = parse_security(json_string(user, "security"));
-                if (!parsed_security) {
-                    return std::nullopt;
-                }
-                security = *parsed_security;
-                parsed_xray = true;
-            }
+        const auto vnext_server = ::proxy::ParseOptionalSingleObjectArray(
+            s, "vnext", "VMess", cfg.tag);
+        if (!vnext_server) {
+            return std::nullopt;
         }
-
-        if (!parsed_xray) {
+        if (*vnext_server) {
+            const auto& server = **vnext_server;
+            const auto* user = ::proxy::ParseRequiredSingleObjectArray(
+                server, "users", "VMess", cfg.tag);
+            if (!user) {
+                return std::nullopt;
+            }
+            address = json_string(server, "address");
+            const auto source_port = ::ReadJsonPort(server, "port");
+            if (source_port.Invalid()) {
+                return std::nullopt;
+            }
+            if (source_port.Valid()) {
+                port = source_port.value;
+            }
+            uuid = json_string(*user, "id");
+            if (!has_supported_alter_id(*user)) {
+                return std::nullopt;
+            }
+            auto parsed_security = parse_security(json_string(*user, "security"));
+            if (!parsed_security) {
+                return std::nullopt;
+            }
+            security = *parsed_security;
+        } else {
+            if (s.if_contains("users")) {
+                LOG_ERROR("VMess outbound '{}': users requires vnext", cfg.tag);
+                return std::nullopt;
+            }
             address = json_string(s, "address");
             const auto source_port = ::ReadJsonPort(s, "port");
             if (source_port.Invalid()) {

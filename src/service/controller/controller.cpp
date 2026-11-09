@@ -402,7 +402,6 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(PanelRuntime& panel) {
     candidate->config = fetched_config;
     candidate->config_etag = config_result.not_modified
         ? old_state->config_etag : std::move(config_result.etag);
-    candidate->protocol = protocol;
     candidate->tag = tag;
     candidate->users = next_users ? std::move(*next_users) : old_state->users;
     candidate->users_etag = next_users
@@ -489,7 +488,7 @@ void Controller::Impl::logPanelStatus(const PanelRuntime& panel) const {
     }
 
     const auto& committed_state = *panel.node.committed;
-    const auto& protocol = committed_state.protocol;
+    const auto& protocol = committed_state.config.NodeType;
     const auto pull_interval = controller::PanelInterval(
         committed_state.config.PullInterval,
         defaults::kPanelPullInterval);

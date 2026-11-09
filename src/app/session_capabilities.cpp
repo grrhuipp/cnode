@@ -120,9 +120,9 @@ SessionConfiguration::SessionConfiguration(const WorkerRuntimeConfig& config,
 struct PhysicalSessionCapabilities::Impl final : memory::ThreadAllocated {
     using HandlerLookup = proxyman::outbound::HandlerLookup;
 
-    Impl(PhysicalSessionCapabilities& owner_value, net::io_context& io,
+    Impl(PhysicalSessionCapabilities& owner_value,
          AwaitableTaskGroup* external_tasks = nullptr)
-        : owner(owner_value), reactor(io), dns(owner.dns_worker_),
+        : owner(owner_value), dns(owner.dns_worker_),
           resident_tasks(external_tasks ? nullptr :
               std::make_unique<ResidentTaskGroup>(owner.Domain()->Executor())),
           tasks(external_tasks ? *external_tasks : resident_tasks->Tasks()) {
@@ -132,7 +132,7 @@ struct PhysicalSessionCapabilities::Impl final : memory::ThreadAllocated {
                 owner.prepared_, &owner.stats_, owner.limiter_.get()},
             *owner.limiter_);
         outbounds = std::make_unique<HandlerLookup>(
-            *owner.configuration_->outbounds, io, dns,
+            *owner.configuration_->outbounds, owner.Domain()->Reactor(), dns,
             owner.configuration_->timeouts.DialTimeout(), tasks);
         dispatcher = std::make_unique<dispatcher::DefaultDispatcher>(
             *owner.configuration_->router, *outbounds, *owner.configuration_->policy,
@@ -140,7 +140,6 @@ struct PhysicalSessionCapabilities::Impl final : memory::ThreadAllocated {
     }
 
     PhysicalSessionCapabilities& owner;
-    net::io_context& reactor;
     dns::DNS dns;
     std::unique_ptr<ResidentTaskGroup> resident_tasks;
     AwaitableTaskGroup& tasks;
@@ -204,16 +203,16 @@ std::shared_ptr<ExecutionDomain> PhysicalSessionCapabilities::Domain() const noe
     return domain_.lock();
 }
 
-void PhysicalSessionCapabilities::Initialize(net::io_context& reactor) {
+void PhysicalSessionCapabilities::Initialize(net::io_context& /*reactor*/) {
     if (stopping_) throw IoSystemError(net::error::operation_aborted);
-    if (!impl_) impl_ = std::make_unique<Impl>(*this, reactor);
+    if (!impl_) impl_ = std::make_unique<Impl>(*this);
     initialized_ = true;
 }
 
-void PhysicalSessionCapabilities::Initialize(net::io_context& reactor,
+void PhysicalSessionCapabilities::Initialize(net::io_context& /*reactor*/,
                                              AwaitableTaskGroup& tasks) {
     if (stopping_) throw IoSystemError(net::error::operation_aborted);
-    if (!impl_) impl_ = std::make_unique<Impl>(*this, reactor, &tasks);
+    if (!impl_) impl_ = std::make_unique<Impl>(*this, &tasks);
     initialized_ = true;
 }
 
@@ -234,12 +233,13 @@ PhysicalSessionCapabilities::MakeAuthenticatedStreamSink(
 }
 
 net::awaitable<void> PhysicalSessionCapabilities::ProcessNativeDatagram(
-    transport::Link link, const UserProfile& profile, session::Context& context) {
+    transport::Link link, UserProfile profile, session::Context& context) {
     if (stopping_) throw IoSystemError(net::error::operation_aborted);
     if (!impl_) throw std::logic_error("domain not initialized");
     ConnectionStatsScope connection_stats(stats_);
     auto admission = co_await proxy::AdmitNativeAssociation(
         context, profile, &Tracker(), limiter_.get(), stats_);
+    profile = {};
     if (!admission || stopping_) co_return;
     auto result = co_await impl_->dispatcher->Dispatch(
         Domain()->Reactor(), receiver_->dispatch_policy, nullptr, link,
@@ -257,7 +257,7 @@ net::awaitable<void> PhysicalSessionCapabilities::ProcessTCP(
     if (!impl_) throw std::logic_error("domain not initialized");
     RequestLoadState::PhysicalConnectionScope physical(*request_load_);
     co_await net::co_spawn(Domain()->Executor(), impl_->handler->ProcessAcceptedTCP(
-        impl_->reactor, *impl_->dispatcher, stats_, *request_load_,
+        Domain()->Reactor(), *impl_->dispatcher, stats_, *request_load_,
         configuration_->timeouts, std::move(stream), context, &impl_->dns),
         net::bind_cancellation_slot(impl_->stop.slot(), net::use_awaitable));
 }
@@ -298,8 +298,7 @@ net::awaitable<void> PhysicalSessionCapabilities::AsyncJoin() {
     impl_->outbounds.reset();
     handler->ReleaseProtocol();
     handler.reset();
-    auto& reactor = impl_->reactor;
-    try { co_await TimeoutScheduler::AsyncReleaseForIoContext(reactor); }
+    try { co_await TimeoutScheduler::AsyncReleaseForIoContext(Domain()->Reactor()); }
     catch (...) { if (!failure) failure = std::current_exception(); }
     joined_ = true;
     user_view_.reset();

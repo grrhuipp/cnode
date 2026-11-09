@@ -24,70 +24,68 @@
 #include <memory>
 #include <span>
 #include <utility>
+#include <variant>
 
 
 namespace {
 
 class ShadowsocksOutboundEndpoint final : public proxy::OutboundStreamEndpointBase {
 public:
-    ShadowsocksOutboundEndpoint(std::unique_ptr<transport::MultiBufferWriter> request_writer,
+    struct PendingResponseState {
+        ss::SsCipherInfo cipher_info;
+        ss::KeyBytes master_key;
+        ss::KeyBytes request_salt;
+
+        PendingResponseState(const ss::SsCipherInfo& info,
+                             const ss::KeyBytes& key,
+                             const ss::KeyBytes& salt)
+            : cipher_info(info), master_key(key), request_salt(salt) {}
+
+        ~PendingResponseState() noexcept {
+            OPENSSL_cleanse(master_key.bytes.data(), master_key.bytes.size());
+            OPENSSL_cleanse(request_salt.bytes.data(), request_salt.bytes.size());
+        }
+
+        PendingResponseState(const PendingResponseState&) = delete;
+        PendingResponseState& operator=(const PendingResponseState&) = delete;
+    };
+
+    ShadowsocksOutboundEndpoint(ss::RequestBodyWriter request_writer,
                                 const ss::SsCipherInfo& cipher_info,
                                 const ss::KeyBytes& master_key,
                                 const ss::KeyBytes& request_salt,
                                 AsyncStream& stream)
         : OutboundStreamEndpointBase(stream)
         , request_writer_(std::move(request_writer))
-        , cipher_info_(cipher_info)
-        , master_key_(master_key)
-        , request_salt_(request_salt) {}
-
-    ~ShadowsocksOutboundEndpoint() override {
-        OPENSSL_cleanse(master_key_.bytes.data(), master_key_.bytes.size());
-        OPENSSL_cleanse(request_salt_.bytes.data(), request_salt_.bytes.size());
-    }
+        , response_state_(std::in_place_type<PendingResponseState>,
+                          cipher_info, master_key, request_salt) {}
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
-        if (!response_reader_) {
+        if (auto* pending = std::get_if<PendingResponseState>(&response_state_)) {
             auto reader_result = co_await ss::ReadTCPResponse(
-                cipher_info_, master_key_, request_salt_, stream_);
-            OPENSSL_cleanse(master_key_.bytes.data(), master_key_.bytes.size());
-            master_key_.size = 0;
-            OPENSSL_cleanse(request_salt_.bytes.data(), request_salt_.bytes.size());
-            request_salt_.size = 0;
+                pending->cipher_info, pending->master_key, pending->request_salt, stream_);
             if (!reader_result) {
+                OPENSSL_cleanse(pending->master_key.bytes.data(), pending->master_key.bytes.size());
+                pending->master_key.size = 0;
+                OPENSSL_cleanse(pending->request_salt.bytes.data(), pending->request_salt.bytes.size());
+                pending->request_salt.size = 0;
                 throw transport::LinkError(reader_result.error());
             }
-            response_reader_ = std::move(reader_result.value());
+            response_state_.emplace<ss::detail::BodyReader>(std::move(*reader_result));
         }
-        co_return co_await response_reader_->ReadMultiBuffer();
+        co_return co_await std::get<ss::detail::BodyReader>(response_state_).ReadMultiBuffer();
     }
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
-        if (!request_writer_) {
-            mb.clear();
-            throw IoSystemError(
-                io_error::not_connected,
-                "Shadowsocks request writer is not initialized");
-        }
-        return request_writer_->WriteMultiBuffer(std::move(mb));
+        return request_writer_.WriteMultiBuffer(std::move(mb));
     }
 
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
-        if (!request_writer_) {
-            throw IoSystemError(
-                io_error::not_connected,
-                "Shadowsocks request writer is not initialized");
-        }
-        return request_writer_->WriteBuffers(buffers);
+        return request_writer_.WriteBuffers(buffers);
     }
 
     net::awaitable<void> AsyncShutdownWrite() override {
-        if (!request_writer_) {
-            throw IoSystemError(
-                io_error::not_connected,
-                "Shadowsocks request writer is not initialized");
-        }
-        return request_writer_->AsyncShutdownWrite();
+        return request_writer_.AsyncShutdownWrite();
     }
 
     operator AsyncStream&() noexcept {
@@ -95,11 +93,8 @@ public:
     }
 
 private:
-    std::unique_ptr<transport::MultiBufferWriter> request_writer_;
-    ss::SsCipherInfo cipher_info_;
-    ss::KeyBytes master_key_;
-    ss::KeyBytes request_salt_;
-    std::unique_ptr<transport::MultiBufferReader> response_reader_;
+    ss::RequestBodyWriter request_writer_;
+    std::variant<PendingResponseState, ss::detail::BodyReader> response_state_;
 };
 
 TargetAddress MakeServerTarget(const OutboundServer& server) {
@@ -350,17 +345,10 @@ const bool kSsOutboundRegistered = (::proxyman::outbound::RegisterProxy(
             return true;
         };
 
-        if (const auto* servers_p = cfg.settings.if_contains("servers")) {
-            if (!servers_p->is_array() ||
-                servers_p->as_array().size() != 1 ||
-                !servers_p->as_array()[0].is_object()) {
-                LOG_ERROR("Shadowsocks outbound '{}': servers must be a single-element object array", cfg.tag);
-                return std::nullopt;
-            }
-            if (!read_ss_server(servers_p->as_array()[0].as_object())) {
-                return std::nullopt;
-            }
-        } else if (!read_ss_server(cfg.settings)) {
+        const auto server_obj = ::proxy::ParseOptionalSingleObjectArray(
+            cfg.settings, "servers", "Shadowsocks", cfg.tag);
+        if (!server_obj ||
+            !read_ss_server(*server_obj ? **server_obj : cfg.settings)) {
             return std::nullopt;
         }
         auto next_hop = ::proxy::PrepareNextHop(

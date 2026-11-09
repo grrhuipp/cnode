@@ -46,6 +46,10 @@ public:
         assert(!staged_ && pending_ == 0);
     }
 
+    [[nodiscard]] net::any_io_executor GetExecutor() noexcept {
+        return domain_ ? domain_->Executor() : net::any_io_executor(socket.get_executor());
+    }
+
     // User cancellation is separate from the handoff epoch, including Cancel
     // racing a successful notification already queued to the domain.
     void MarkCancelled() noexcept { ++cancellation_epoch_; }

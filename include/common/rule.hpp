@@ -19,6 +19,12 @@ namespace rule {
 // neither rules nor their allocation lifetime depend on the accepting Worker.
 class DetectRulePolicy final : public features::policy::RequestPolicy {
 public:
+    using RuleList = std::vector<DetectRule>;
+    using RuleListPtr = std::shared_ptr<const RuleList>;
+    using InboundRule = std::unordered_map<std::string, RuleListPtr,
+                                          TransparentStringHash,
+                                          TransparentStringEq>;
+
     DetectRulePolicy();
     ~DetectRulePolicy();
 
@@ -28,15 +34,14 @@ public:
     DetectRulePolicy& operator=(DetectRulePolicy&&) = delete;
 
     void UpdateRule(std::string_view tag, std::vector<DetectRule> new_rule_list);
+    void UpdateSharedRule(std::string_view tag, RuleListPtr new_rule_list);
     [[nodiscard]] bool Blocked(
         const session::Context& ctx) override;
 private:
-    using RuleList = std::vector<DetectRule>;
-    using InboundRule = std::unordered_map<std::string, RuleList,
-                                          TransparentStringHash,
-                                          TransparentStringEq>;
     std::mutex update_mutex_;
-    std::atomic<std::shared_ptr<const InboundRule>> rules_;
+    std::shared_ptr<const InboundRule> rules_;
+    std::atomic<uint64_t> generation_{1};
+    std::atomic<bool> has_rules_{false};
 };
 
 }  // namespace rule

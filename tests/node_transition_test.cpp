@@ -62,12 +62,6 @@ TEST(NodeTransition, Contract) {
     changed = current;
     changed.NodeType = "shadowsocks";
     ASSERT_FALSE((!::controller::NodeConfigChanged(current, changed)));
-    changed = current;
-    changed.Sniffing.enabled = !current.Sniffing.enabled;
-    ASSERT_FALSE((!::controller::NodeConfigChanged(current, changed)));
-    changed = current;
-    changed.Sniffing.dest_override = ::SniffConfig::kHttp;
-    ASSERT_FALSE((!::controller::NodeConfigChanged(current, changed)));
 
     changed = current;
     changed.PullInterval = current.PullInterval + 1;

@@ -83,9 +83,14 @@ public:
     AnyTLSSubStream(net::io_context& io_context,
                     AnyTLSDemuxSession& session,
                     uint32_t sid)
-        : io_context_(io_context)
-        , input_signal_(io_context, 1)
-        , input_space_signal_(io_context, 1)
+        : input_signal_(ExecutionDomain::Current()
+                            ? ExecutionDomain::Current()->Executor()
+                            : net::any_io_executor(io_context.get_executor()),
+                        1)
+        , input_space_signal_(ExecutionDomain::Current()
+                                  ? ExecutionDomain::Current()->Executor()
+                                  : net::any_io_executor(io_context.get_executor()),
+                              1)
         , session_(session)
         , sid_(sid) {}
 
@@ -180,20 +185,13 @@ private:
     transport::CancellationSource cancellation_;
 
     void WakeInputReader() noexcept {
-        if (io_context_.stopped()) {
-            return;
-        }
         (void)input_signal_.try_send(IoErrorCode{});
     }
 
     void WakeInputWriter() noexcept {
-        if (io_context_.stopped()) {
-            return;
-        }
         (void)input_space_signal_.try_send(IoErrorCode{});
     }
 
-    net::io_context& io_context_;
     SignalChannel input_signal_;
     SignalChannel input_space_signal_;
     AnyTLSDemuxSession& session_; // Run joins all users before destroying the session.
@@ -471,6 +469,7 @@ net::awaitable<ErrorCode> AnyTLSDemuxSession::ProcessUdpSubstream(
     buf::MultiBuffer pending,
     std::chrono::steady_clock::time_point opened_at) {
     std::optional<proxy::uot::PacketReader> uot_reader;
+    InitialPayload initial_payload;
     bool is_connect = false;
     session::Context& ctx = sub.ctx;
     {
@@ -489,6 +488,7 @@ net::awaitable<ErrorCode> AnyTLSDemuxSession::ProcessUdpSubstream(
         if (sub.IsClosed()) co_return ErrorCode::CONNECTION_CLOSED;
 
         is_connect = prepared->is_connect;
+        initial_payload = InitialPayload{std::move(prepared->initial_decoded)};
         proxy::BindInboundRequestTarget(
             ctx,
             proxy::InboundRequestTarget{
@@ -500,7 +500,7 @@ net::awaitable<ErrorCode> AnyTLSDemuxSession::ProcessUdpSubstream(
     proxy::uot::PacketWriter uot_writer(sub, is_connect, ctx.outbound.target);
     (void)co_await dispatcher_.Dispatch(io_context_, policy_, nullptr,
         transport::Link{&*uot_reader, &uot_writer},
-        InitialPayload{}, ctx, stats_, timeouts_);
+        std::move(initial_payload), ctx, stats_, timeouts_);
     co_return ErrorCode::OK;
 }
 

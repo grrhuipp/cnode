@@ -21,7 +21,6 @@ struct NodeSnapshot {
     std::string users_etag;
     std::string config_etag;
     std::vector<rule::DetectRule> rules;
-    std::string protocol;
     std::string tag;
     // Prepared by the shared inbound builder; carries the prepared users.
     std::shared_ptr<const PreparedInbound> inbound;

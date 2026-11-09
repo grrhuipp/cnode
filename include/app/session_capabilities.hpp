@@ -92,7 +92,7 @@ public:
     MakeAuthenticatedStreamSink(const session::Context& context,
                                 std::shared_ptr<ConnectionFamily> family);
     net::awaitable<void> ProcessNativeDatagram(
-        transport::Link link, const UserProfile& profile, session::Context& context);
+        transport::Link link, UserProfile profile, session::Context& context);
     net::awaitable<void> ProcessTCP(std::unique_ptr<AsyncStream> stream,
                                   session::Context& context);
     void RequestStop() noexcept;

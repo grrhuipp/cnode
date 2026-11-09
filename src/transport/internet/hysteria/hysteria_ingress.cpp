@@ -862,7 +862,7 @@ int Connection::OpenStream(ngtcp2_conn*, int64_t stream_id, void* user_data) {
     auto& self = *static_cast<Connection*>(user_data);
     if (!ngtcp2_is_bidi_stream(stream_id)) return 0;
     auto state = memory::AllocateShared<QuicStreamState>(
-        self.Reactor(), stream_id,
+        stream_id,
         self.weak_from_this());
     auto [it, inserted] = self.core_->streams.try_emplace(
         stream_id, std::move(state));

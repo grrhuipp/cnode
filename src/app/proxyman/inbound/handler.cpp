@@ -23,6 +23,13 @@ namespace proxyman::inbound {
 
 namespace {
 
+net::io_context& SessionReactor(net::io_context& fallback) noexcept {
+    if (auto domain = ExecutionDomain::Current()) {
+        return domain->Reactor();
+    }
+    return fallback;
+}
+
 std::string_view RealIpHeader(const StreamSettings& settings) noexcept {
     if (settings.IsWs()) return settings.ws.real_ip_header;
     if (settings.IsHttpUpgrade()) return settings.http_upgrade.real_ip_header;
@@ -173,10 +180,8 @@ public:
         session::Context ctx;
         ctx.InitSubstreamFrom(base_ctx_);
         ApplyHttpRealIp(ctx, metadata.real_ip);
-        const auto domain = ExecutionDomain::Current();
-        auto& reactor = domain ? domain->Reactor() : io_context_;
         co_await handler_->ProcessPreparedTransportStream(
-            reactor, dispatcher_, stats_, request_load_, timeouts_,
+            io_context_, dispatcher_, stats_, request_load_, timeouts_,
             std::move(stream), ctx, family_);
     }
 
@@ -294,7 +299,7 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
                    listener.stream_settings.network);
 
     co_await RunInboundProxy(
-        Proxy(), std::move(stream), dispatcher, listener, io_context, ctx, timeouts,
+        Proxy(), std::move(stream), dispatcher, listener, SessionReactor(io_context), ctx, timeouts,
         request_load.PressureIdleTimeout(), stats);
 }
 

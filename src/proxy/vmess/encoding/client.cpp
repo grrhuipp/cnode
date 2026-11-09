@@ -130,25 +130,21 @@ ClientSession::SessionKeys ClientSession::GenerateKeys() {
     return keys;
 }
 
-ClientSession::ClientSession(const MemoryAccount& user,
-                             const AES_KEY& auth_id_key,
-                             const TargetAddress& target,
-                             Security security,
-                             Command command,
-                             ForwardedMetadataView forwarded)
-    : user_(&user)
-    , auth_id_key_(&auth_id_key)
-    , target_(&target)
-    , forwarded_(forwarded)
-    , security_(security)
-    , command_(command)
+ClientSession::ClientSession(Security security, Command command)
+    : security_(security)
     , keys_(GenerateKeys())
     , request_encoder_(BodyOptions{security, ClientOptions(security), command},
                        keys_.request, keys_.request)
     , response_decoder_(BodyOptions{security, ClientOptions(security), command},
                         keys_.request, keys_.response) {}
 
-net::awaitable<VMessHandshakeResult> ClientSession::EncodeRequestHeader(AsyncStream& stream) {
+net::awaitable<VMessHandshakeResult> ClientSession::EncodeRequestHeader(
+    AsyncStream& stream,
+    const MemoryAccount& user,
+    const AES_KEY& auth_id_key,
+    const TargetAddress& target,
+    Command command,
+    ForwardedMetadataView forwarded) {
     if (request_encoder_.Failed()) {
         co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
     }
@@ -170,12 +166,11 @@ net::awaitable<VMessHandshakeResult> ClientSession::EncodeRequestHeader(AsyncStr
         ~PacketCleanseGuard() noexcept { OPENSSL_cleanse(buf.data(), buf.size()); }
     } cleanse_packet{packet};
     auto built = BuildRequestHeaderPacket(
-        *user_, *auth_id_key_, *target_, security_, command_, keys_.request,
-        keys_.response_header, forwarded_, packet);
+        user, auth_id_key, target, security_, command, keys_.request,
+        keys_.response_header, forwarded, packet);
     if (!built) {
         co_return tl::unexpected(built.error());
     }
-    forwarded_ = {};
     OPENSSL_cleanse(keys_.request.key.data(), keys_.request.key.size());
     OPENSSL_cleanse(keys_.request.iv.data(), keys_.request.iv.size());
     auto fail_request = [&]() {
@@ -202,10 +197,6 @@ net::awaitable<VMessHandshakeResult> ClientSession::EncodeRequestHeader(AsyncStr
         co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
     }
     request_header_sent_ = true;
-    user_ = nullptr;
-    auth_id_key_ = nullptr;
-    target_ = nullptr;
-    forwarded_ = {};
     co_return VMessHandshakeResult{};
 }
 

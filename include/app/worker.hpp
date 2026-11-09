@@ -120,6 +120,7 @@ public:
     net::awaitable<void> UnregisterListenerTask(std::string tag);
 
     void UpdateRule(std::string_view tag, std::vector<rule::DetectRule> rules);
+    void UpdateRule(std::string_view tag, std::shared_ptr<const std::vector<rule::DetectRule>> rules);
     void InstallUserView(proxyman::inbound::UserStore::WorkerView view);
 
     // ── 数据收集（在所属 Worker 线程执行，无竞争）──

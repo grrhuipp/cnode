@@ -20,8 +20,7 @@ class QuicStreamState final : public memory::ThreadAllocated {
 public:
     static constexpr size_t kMaxQueuedInputBytes = 512 * 1024;
 
-    QuicStreamState(net::io_context& io_context, int64_t stream_id,
-                    std::weak_ptr<Connection> owner);
+    QuicStreamState(int64_t stream_id, std::weak_ptr<Connection> owner);
 
     [[nodiscard]] int64_t Id() const noexcept { return stream_id_; }
     [[nodiscard]] net::io_context& IoContext() const noexcept { return domain_->Reactor(); }
@@ -153,7 +152,6 @@ protected:
 private:
     void WakeReader() noexcept;
 
-    std::shared_ptr<ExecutionDomain> domain_;
     uint32_t session_id_;
     TargetAddress first_target_;
     std::weak_ptr<Connection> owner_;

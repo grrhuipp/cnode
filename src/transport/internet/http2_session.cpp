@@ -313,20 +313,18 @@ void AppendHpackLiteralNewName(memory::ByteVector& out,
     return h;
 }
 
-[[nodiscard]] memory::ByteVector EncodeGrpcResponseHeaders() {
-    memory::ByteVector h;
-    h.reserve(32);
-    AppendHpackIndexed(h, 8); // :status: 200
-    AppendHpackLiteralIndexedName(h, 31, "application/grpc");
-    return h;
-}
+// :status: 200 (indexed 8) + content-type: application/grpc (literal indexed 31).
+constexpr std::array<uint8_t, 20> kGrpcResponseHeaderBlock{
+    0x88, 0x0f, 0x10, 0x10,
+    'a', 'p', 'p', 'l', 'i', 'c', 'a', 't', 'i', 'o', 'n', '/', 'g', 'r', 'p', 'c',
+};
 
-[[nodiscard]] memory::ByteVector EncodeGrpcTrailers() {
-    memory::ByteVector h;
-    h.reserve(24);
-    AppendHpackLiteralNewName(h, "grpc-status", "0");
-    return h;
-}
+// grpc-status: 0 (literal new name).
+constexpr std::array<uint8_t, 15> kGrpcTrailerBlock{
+    0x00, 0x0b,
+    'g', 'r', 'p', 'c', '-', 's', 't', 'a', 't', 'u', 's',
+    0x01, '0',
+};
 
 [[nodiscard]] bool IsConnectionSpecificHttp2Header(std::string_view key) noexcept {
     return EqualsAsciiCI(key, "host") ||
@@ -1943,7 +1941,7 @@ class Http2ServerSession;
 // until its Http2ServerSubStream is destroyed.
 class Http2ServerSubStreamState final : public memory::ThreadAllocated {
 public:
-    Http2ServerSubStreamState(net::io_context& io_context,
+    Http2ServerSubStreamState(const net::any_io_executor& executor,
                               std::shared_ptr<Http2ServerSession> session,
                               uint32_t stream_id,
                               H2PayloadCodec payload_codec,
@@ -1955,8 +1953,11 @@ public:
         return session_.lock();
     }
     [[nodiscard]] net::io_context& IoContext() const noexcept {
-        if (auto domain = ExecutionDomain::Current()) return domain->Reactor();
-        return io_context_;
+        return ExecutionDomain::Current()
+            ? ExecutionDomain::Current()->Reactor()
+            : static_cast<net::io_context&>(net::query(
+                  const_cast<SignalChannel&>(input_signal_).get_executor(),
+                  net::execution::context));
     }
     void SetUploadBudget(const std::shared_ptr<XHttpPacketUpSession>& budget) noexcept {
         upload_budget_ = budget;
@@ -1985,7 +1986,7 @@ public:
     // Cancel() aborts the wait; stream teardown wakes it for a re-check.
     net::awaitable<void> WaitSendCredit();
     void WakeSendWaiter() noexcept {
-        if (!IoContext().stopped()) (void)credit_signal_.try_send(IoErrorCode{});
+        (void)credit_signal_.try_send(IoErrorCode{});
     }
 
     net::awaitable<size_t> AsyncRead(net::mutable_buffer buffer);
@@ -2011,9 +2012,6 @@ private:
     };
 
     void WakeInputReader() noexcept {
-        if (IoContext().stopped()) {
-            return;
-        }
         (void)input_signal_.try_send(IoErrorCode{});
     }
 
@@ -2026,7 +2024,6 @@ private:
     void ReleaseDecoderStorage() noexcept;
     [[nodiscard]] std::shared_ptr<Http2ServerSession> LockWritableSession() const;
 
-    net::io_context& io_context_;
     SignalChannel input_signal_;
     SignalChannel owner_signal_;
     SignalChannel credit_signal_;
@@ -2217,12 +2214,8 @@ public:
                 throw std::invalid_argument("HTTP/2 raw session requires an HTTP config");
             }
             response_header_block_ = EncodeHttpResponseHeaders(http_config_->headers);
-        } else {
-            if (grpc_config_) {
-                grpc_request_path_ = ResolveGrpcRequestPath(*grpc_config_);
-            }
-            response_header_block_ = EncodeGrpcResponseHeaders();
-            trailer_block_ = EncodeGrpcTrailers();
+        } else if (grpc_config_ && grpc_config_->request_path.empty()) {
+            grpc_request_path_ = ResolveGrpcRequestPath(*grpc_config_);
         }
         Resubscribe(stream_->Cancellation());
     }
@@ -2425,7 +2418,7 @@ public:
 
     net::awaitable<bool> WriteTrailersSerialized(uint32_t stream_id) {
         return WriteFrameSerialized(
-            H2FrameType::HEADERS, kFlagEndHeaders | kFlagEndStream, stream_id, trailer_block_);
+            H2FrameType::HEADERS, kFlagEndHeaders | kFlagEndStream, stream_id, kGrpcTrailerBlock);
     }
 
     net::awaitable<void> RunReadLoop() {
@@ -2453,6 +2446,10 @@ public:
     }
 
 private:
+    [[nodiscard]] net::io_context& CurrentIoContext() const noexcept {
+        return ExecutionDomain::Current() ? ExecutionDomain::Current()->Reactor() : io_context_;
+    }
+
     net::awaitable<void> FlushReceiveCredit() {
         try {
             while (!cancelled_) {
@@ -2572,8 +2569,12 @@ private:
             if (stream_handler_) stream_handler_->OnInboundTransportReady(*stream_);
             ready_ = true;
         }
+        const std::span<const uint8_t> response_headers =
+            payload_codec_ == H2PayloadCodec::RawData
+                ? std::span<const uint8_t>(response_header_block_)
+                : std::span<const uint8_t>(kGrpcResponseHeaderBlock);
         if (!co_await WriteFrameSerialized(
-                H2FrameType::HEADERS, kFlagEndHeaders, stream_id, response_header_block_)) {
+                H2FrameType::HEADERS, kFlagEndHeaders, stream_id, response_headers)) {
             co_return false;
         }
         if (end_stream) {
@@ -2805,8 +2806,11 @@ private:
             }
         }
         if (payload_codec_ == H2PayloadCodec::GrpcHunk && grpc_config_) {
+            const std::string_view expected_path = !grpc_config_->request_path.empty()
+                ? std::string_view(grpc_config_->request_path)
+                : std::string_view(grpc_request_path_);
             if (!EqualsAsciiCI(request->method, "POST") ||
-                !detail::PathMatchesExactly(grpc_request_path_, request->path)) {
+                !detail::PathMatchesExactly(expected_path, request->path)) {
                 co_return co_await ResetStream(stream_id, H2Error::Protocol);
             }
             if (const std::string_view expected_authority = TrimAscii(grpc_config_->authority);
@@ -2816,7 +2820,7 @@ private:
             }
         }
         auto sub = memory::AllocateShared<Http2ServerSubStreamState>(
-            io_context_, shared_from_this(), stream_id, payload_codec_, peer_initial_window_);
+            executor_, shared_from_this(), stream_id, payload_codec_, peer_initial_window_);
         sub->ReceiveWindow() = local_settings_acked_ ? initial_receive_window_ :
             std::max<int64_t>(initial_receive_window_, H2SendWindow::kDefault);
         streams_.emplace(stream_id, sub);
@@ -2875,7 +2879,7 @@ private:
                 co_return co_await ResetStream(stream_id, H2Error::Protocol);
             }
             auto xsession = co_await GetXHttpPacketSession(
-                io_context_, xhttp_config_->session_namespace,
+                CurrentIoContext(), xhttp_config_->session_namespace,
                 meta.session_id, XHttpSessionAccess::Open);
             if (!xsession || !xsession->AttachDownlink()) {
                 co_return co_await ResetStream(stream_id, H2Error::Protocol);
@@ -2904,7 +2908,7 @@ private:
                 co_return co_await ResetStream(stream_id, H2Error::Protocol);
             }
             auto xsession = co_await GetXHttpPacketSession(
-                io_context_, xhttp_config_->session_namespace,
+                CurrentIoContext(), xhttp_config_->session_namespace,
                 meta.session_id, XHttpSessionAccess::Open);
             if (!xsession) {
                 co_return co_await ResetStream(stream_id, H2Error::Protocol);
@@ -2957,7 +2961,7 @@ private:
                 co_return co_await ResetStream(stream_id, H2Error::Protocol);
             }
             auto xsession = co_await GetXHttpPacketSession(
-                io_context_, xhttp_config_->session_namespace,
+                CurrentIoContext(), xhttp_config_->session_namespace,
                 meta.session_id, XHttpSessionAccess::Upload);
             if (!xsession) {
                 co_return co_await ResetStream(stream_id, H2Error::Protocol);
@@ -3065,7 +3069,6 @@ private:
     memory::ThreadLocalString grpc_request_path_;
     // HPACK blocks encoded once per connection; neither uses the dynamic table.
     memory::ByteVector response_header_block_;
-    memory::ByteVector trailer_block_;
     HpackDecoder hpack_decoder_;
     uint64_t conn_id_ = 0;
     uint32_t last_remote_stream_id_ = 0;
@@ -3103,21 +3106,14 @@ net::awaitable<void> Http2ServerSubStreamState::JoinOwner(
 }
 
 Http2ServerSubStreamState::Http2ServerSubStreamState(
-    net::io_context& io_context,
+    const net::any_io_executor& executor,
     std::shared_ptr<Http2ServerSession> session,
     uint32_t stream_id,
     H2PayloadCodec payload_codec,
     int64_t initial_send_window)
-    : io_context_(io_context)
-    , input_signal_(ExecutionDomain::Current()
-          ? ExecutionDomain::Current()->Executor()
-          : net::any_io_executor(io_context.get_executor()), 1)
-    , owner_signal_(ExecutionDomain::Current()
-          ? ExecutionDomain::Current()->Executor()
-          : net::any_io_executor(io_context.get_executor()), 1)
-    , credit_signal_(ExecutionDomain::Current()
-          ? ExecutionDomain::Current()->Executor()
-          : net::any_io_executor(io_context.get_executor()), 1)
+    : input_signal_(executor, 1)
+    , owner_signal_(executor, 1)
+    , credit_signal_(executor, 1)
     , send_window_(initial_send_window)
     , session_(std::move(session))
     , stream_id_(stream_id)

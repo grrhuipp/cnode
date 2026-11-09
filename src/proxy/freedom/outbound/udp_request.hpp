@@ -12,7 +12,7 @@ class UdpRequest final : public ::proxy::OutboundDatagramEndpointBase {
 public:
     UdpRequest(net::io_context& io, app::dns::DNS& dns,
                const net::ip::address& bind_address)
-        : OutboundDatagramEndpointBase(io, bind_address), io_(io), dns_(dns) {}
+        : OutboundDatagramEndpointBase(io, bind_address), dns_(dns) {}
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
         auto read = socket_.StartRead();
@@ -43,15 +43,12 @@ public:
             co_await write.SendTo(udp::endpoint(*datagram.target->resolved_addr, datagram.target->port),
                                  std::move(payload));
         } else {
-            auto& reactor = ExecutionDomain::Current()
-                ? ExecutionDomain::Current()->Reactor() : io_;
-            auto target = co_await ResolveUdpEndpoint(dns_, *datagram.target, socket_, write, reactor);
+            auto target = co_await ResolveUdpEndpoint(dns_, *datagram.target, socket_, write);
             if (!target) throw transport::LinkError(target.error());
             co_await write.SendTo(*target, std::move(payload));
         }
     }
 private:
-    net::io_context& io_;
     app::dns::DNS& dns_;
 };
 

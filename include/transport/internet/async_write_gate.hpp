@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common/asio_types.hpp"
+#include "app/session_group_executor.hpp"
 
 #include <asio/as_tuple.hpp>
 #include <asio/bind_cancellation_slot.hpp>
@@ -60,8 +61,6 @@ public:
     };
 
     AsyncWriteGate() noexcept = default;
-    explicit AsyncWriteGate(net::any_io_executor executor) noexcept
-        : executor_(std::move(executor)) {}
     AsyncWriteGate(const AsyncWriteGate&) = delete;
     AsyncWriteGate& operator=(const AsyncWriteGate&) = delete;
 
@@ -82,7 +81,7 @@ public:
         }
         while (busy_ && !cancelled_) {
             if (!signal_) {
-                auto executor = executor_ ? *executor_ : co_await net::this_coro::executor;
+                auto executor = domain_ ? domain_->Executor() : co_await net::this_coro::executor;
                 std::optional<memory::ScopedAllocationDomain> scope;
                 if (allocation_domain_) scope.emplace(*allocation_domain_);
                 signal_.emplace(std::move(executor), 1);
@@ -152,7 +151,7 @@ private:
     }
 
     memory::AllocationDomain* allocation_domain_ = memory::CurrentAllocationDomain();
-    std::optional<net::any_io_executor> executor_;
+    ExecutionDomain* domain_ = ExecutionDomain::Current().get();
     std::optional<SignalChannel> signal_;
     std::size_t waiters_ = 0;
     bool busy_ = false;

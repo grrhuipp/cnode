@@ -23,8 +23,7 @@ inline net::awaitable<tl::expected<udp::endpoint, ErrorCode>> ResolveUdpEndpoint
     app::dns::DNS& dns,
     const TargetAddress& target,
     transport::internet::DatagramSocket& socket,
-    const transport::internet::DatagramSocket::WriteOperation& write,
-    net::io_context& io_context) {
+    const transport::internet::DatagramSocket::WriteOperation& write) {
     const auto parent_cancellation = co_await net::this_coro::cancellation_state;
     if (write.Cancelled()) co_return tl::unexpected(write.CancellationReason());
     if (parent_cancellation.cancelled() != net::cancellation_type::none)
@@ -38,10 +37,10 @@ inline net::awaitable<tl::expected<udp::endpoint, ErrorCode>> ResolveUdpEndpoint
     if (!target.IsDomain()) co_return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
 
     struct CancellationWait final : transport::CancellationSubscription {
-        explicit CancellationWait(net::io_context& io)
+        explicit CancellationWait(net::any_io_executor executor)
             : wake(ExecutionDomain::Current()
                        ? ExecutionDomain::Current()->Executor()
-                       : net::any_io_executor(io.get_executor()),
+                       : std::move(executor),
                    1) {}
         SignalChannel wake;
         ErrorCode reason = ErrorCode::OK;
@@ -51,7 +50,7 @@ inline net::awaitable<tl::expected<udp::endpoint, ErrorCode>> ResolveUdpEndpoint
             reason = event.reason;
             wake.close();
         }
-    } cancellation(io_context);
+    } cancellation(co_await net::this_coro::executor);
     cancellation.Resubscribe(socket.Cancellation());
     if (cancellation.reason != ErrorCode::OK)
         co_return tl::unexpected(cancellation.reason);

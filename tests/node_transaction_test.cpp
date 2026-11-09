@@ -37,7 +37,6 @@ std::shared_ptr<const NodeSnapshot> Snapshot(uint16_t port, size_t version = 1) 
     auto snapshot = std::make_shared<NodeSnapshot>();
     snapshot->config.Port = port;
     snapshot->config.Path = std::to_string(version);
-    snapshot->protocol = snapshot->config.NodeType;
     snapshot->tag = Tag(snapshot->config);
     snapshot->users.resize(version);
     snapshot->users_etag = "users-" + std::to_string(version);
@@ -46,9 +45,9 @@ std::shared_ptr<const NodeSnapshot> Snapshot(uint16_t port, size_t version = 1) 
     ::StreamSettings stream;
     stream.ws.path = snapshot->config.Path;
     snapshot->inbound = std::make_shared<const ::PreparedInbound>(::PreparedInbound{
-        .binding = {.port = port, .protocol = snapshot->protocol, .tag = snapshot->tag, .listen = {}},
+        .binding = {.port = port, .protocol = snapshot->config.NodeType, .tag = snapshot->tag, .listen = {}},
         .receiver = ::proxyman::inbound::MakeReceiverSettings(
-            snapshot->tag, {}, snapshot->protocol, std::move(stream), {},
+            snapshot->tag, {}, snapshot->config.NodeType, std::move(stream), {},
             ::ProxyProtocolMode::Auto, ::routing::RouteWithFallback(snapshot->tag), {}),
         .build_request = {},
         .users = std::make_shared<const UserSet>(

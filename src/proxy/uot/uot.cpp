@@ -168,8 +168,7 @@ PacketReader::PacketReader(transport::MultiBufferReader& reader,
     : reader_(reader)
     , is_connect_(prepared.is_connect)
     , destination_(prepared.is_connect ? std::move(prepared.destination) : TargetAddress{})
-    , pending_(std::move(prepared.pending))
-    , initial_decoded_(std::move(prepared.initial_decoded)) {}
+    , pending_(std::move(prepared.pending)) {}
 
 buf::MultiBuffer PacketReader::TakePending() noexcept {
     buf::MultiBuffer out = std::move(pending_);
@@ -177,10 +176,6 @@ buf::MultiBuffer PacketReader::TakePending() noexcept {
     return out;
 }
 net::awaitable<buf::MultiBuffer> PacketReader::ReadMultiBuffer() {
-    if (!initial_decoded_.empty()) {
-        co_return std::move(initial_decoded_);
-    }
-
     for (;;) {
         if (co_await EnsurePending(reader_, pending_, 1) != PendingStatus::Ready)
             co_return buf::MultiBuffer{};

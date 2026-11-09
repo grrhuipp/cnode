@@ -109,10 +109,8 @@ struct Handler::PaddingState {
 struct Handler::ClientSession : memory::ThreadAllocated {
     class LogicalStream final {
     public:
-        explicit LogicalStream(net::io_context& io_context,
-                               net::any_io_executor executor)
-            : io_context_(io_context)
-            , syn_signal_(executor, 1)
+        explicit LogicalStream(net::any_io_executor executor)
+            : syn_signal_(executor, 1)
             , payload_signal_(executor, 1)
             , payload_space_signal_(std::move(executor), 1) {}
 
@@ -179,22 +177,22 @@ struct Handler::ClientSession : memory::ThreadAllocated {
             WakeOpenWaiter();
         }
 
-        net::awaitable<tl::expected<void, ErrorCode>> WaitOpenResult(std::chrono::seconds timeout) {
+        net::awaitable<tl::expected<void, ErrorCode>> WaitOpenResult(
+            std::chrono::seconds timeout, net::io_context& io_context) {
             auto result = OpenResult();
             if (!result) {
                 // The finite wait owns its deadline. ACK, FIN and errors are
                 // persistent state; a channel notification is only a wakeup.
                 struct OpenDeadline final : TimeoutEvent {
-                    explicit OpenDeadline(LogicalStream& owner) noexcept : owner(owner) {}
+                    OpenDeadline(LogicalStream& owner, net::io_context& io) noexcept
+                        : TimeoutEvent(io), owner(owner) {}
                     void OnTimeout() override {
                         if (!owner.OpenResult()) owner.Close(ErrorCode::TIMEOUT);
                     }
                     LogicalStream& owner;
-                } deadline(*this);
-                const auto domain = ExecutionDomain::Current();
+                } deadline(*this, io_context);
                 if (!deadline.ScheduleAfter(
-                        std::chrono::duration_cast<std::chrono::milliseconds>(timeout),
-                        domain ? domain->Reactor() : io_context_))
+                        std::chrono::duration_cast<std::chrono::milliseconds>(timeout)))
                     co_return tl::unexpected(ErrorCode::CANCELLED);
                 do {
                     const auto [ec] = co_await syn_signal_.async_receive(
@@ -247,7 +245,6 @@ struct Handler::ClientSession : memory::ThreadAllocated {
         }
 
         transport::CancellationSource cancellation_;
-        net::io_context& io_context_;
         SignalChannel syn_signal_;
         SignalChannel payload_signal_;
         SignalChannel payload_space_signal_;
@@ -269,8 +266,7 @@ struct Handler::ClientSession : memory::ThreadAllocated {
         , domain(ExecutionDomain::Current())
         , allocation_domain(memory::CurrentAllocationDomain())
         , local_endpoint(stream->LocalEndpoint())
-        , remote_endpoint(stream->RemoteEndpoint())
-        , write_gate(SessionExecutor(io_context)) {}
+        , remote_endpoint(stream->RemoteEndpoint()) {}
 
     net::io_context& io_context_;
     std::unique_ptr<AsyncStream> stream;
@@ -330,7 +326,6 @@ struct Handler::ClientSession : memory::ThreadAllocated {
         std::optional<memory::ScopedAllocationDomain> scope;
         if (allocation_domain) scope.emplace(*allocation_domain);
         auto logical = memory::AllocateShared<LogicalStream>(
-            domain ? domain->Reactor() : io_context_,
             domain ? domain->Executor() : net::any_io_executor(io_context_.get_executor()));
         logical_streams[sid] = logical;
         return logical;
@@ -690,7 +685,7 @@ public:
         friend class SessionPool;
         Lease(std::shared_ptr<State> state, std::shared_ptr<ClientSession> session) noexcept
             : state_(std::move(state)), session_(std::move(session)),
-              owner_domain_(state_->domain) {}
+              owner_domain_(ExecutionDomain::Current()) {}
         void Discard() noexcept {
             if (!state_ || !session_) return;
             // Detach has completed: the physical domain's native owner is
@@ -773,8 +768,8 @@ private:
         State(net::io_context& io_context, AwaitableTaskGroup& owner_tasks,
               Clock::duration check, Clock::duration timeout,
               size_t minimum, std::string_view name)
-            : domain(ExecutionDomain::Current()), executor(SessionExecutor(io_context)),
-              tasks(owner_tasks), io_context(io_context),
+            : TimeoutEvent(io_context), executor(SessionExecutor(io_context)),
+              tasks(owner_tasks),
               check_interval(check), idle_timeout(timeout),
               minimum_idle(minimum), tag(name) {
             if (check <= Clock::duration::zero() || timeout <= Clock::duration::zero()) {
@@ -887,8 +882,7 @@ private:
         }
 
         void Schedule() {
-            if (!ScheduleAfter(std::chrono::ceil<std::chrono::milliseconds>(check_interval),
-                    domain ? domain->Reactor() : io_context))
+            if (!ScheduleAfter(std::chrono::ceil<std::chrono::milliseconds>(check_interval)))
                 throw IoSystemError(io_error::operation_aborted);
         }
 
@@ -917,10 +911,8 @@ private:
             for (const auto& entry : closing) Close(entry.session);
         }
 
-        const std::shared_ptr<ExecutionDomain> domain;
         const net::any_io_executor executor;
         AwaitableTaskGroup& tasks;
-        net::io_context& io_context;
         const Clock::duration check_interval;
         const Clock::duration idle_timeout;
         const size_t minimum_idle;
@@ -1244,7 +1236,6 @@ net::awaitable<OutboundProcessResult> Handler::ProcessSession(
     buf::MultiBufferBatch first_payload, std::chrono::seconds relay_idle_timeout,
     std::chrono::seconds relay_write_timeout,
     std::shared_ptr<ClientSession> session, bool& reusable) {
-    auto& io_context = session->domain ? session->domain->Reactor() : dialer.IoContext();
     if (session->IsClosed()) co_return tl::unexpected(session->ClosedError());
     if (session->next_sid != 1) {
         LOG_CONN_DEBUG(ctx, "reusing idle session sid={}", session->next_sid);
@@ -1284,7 +1275,7 @@ net::awaitable<OutboundProcessResult> Handler::ProcessSession(
             co_return tl::unexpected(error);
         }
         if (sid >= 2 && session->session_version == SessionVersion::V2) {
-            if (auto ok = co_await logical->WaitOpenResult(kSynAckTimeout); !ok) {
+            if (auto ok = co_await logical->WaitOpenResult(kSynAckTimeout, dialer.IoContext()); !ok) {
                 const bool timed_out =
                     proxy::ConsumeOutboundHandshakeTimeout(stream, deadline);
                 const ErrorCode error = timed_out ? ErrorCode::TIMEOUT : ok.error();
@@ -1434,7 +1425,7 @@ net::awaitable<OutboundProcessResult> Handler::ProcessSession(
     RelayResult result;
     auto relay_endpoint = [&](auto& endpoint) {
         return DoRelayLink(
-            io_context, *inbound.reader, *inbound.writer, inbound.control,
+            dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
             endpoint, ctx, stats, relay_config, std::move(first_payload));
     };
 

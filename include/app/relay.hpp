@@ -143,7 +143,10 @@ struct RelayDirectionState {
 };
 
 struct RelayState {
-    explicit RelayState(net::io_context& io) : wake(io, 1) {}
+    explicit RelayState(net::io_context& io)
+        : wake(ExecutionDomain::Current()
+              ? ExecutionDomain::Current()->Executor()
+              : net::any_io_executor(io.get_executor()), 1) {}
 
     void Mark(bool client_side) noexcept {
         if (!close_side_known && !local_failure) {
@@ -195,9 +198,12 @@ net::awaitable<RelayResult> DoRelayLink(
 
     using namespace net::experimental::awaitable_operators;
     using relay_detail::RelayPhase;
-    relay_detail::RelayState state(io_context);
+    auto& initial_io = ExecutionDomain::Current()
+        ? ExecutionDomain::Current()->Reactor()
+        : io_context;
+    relay_detail::RelayState state(initial_io);
     std::optional<relay_detail::RelayRateLimits> limits;
-    if (config.speed_limit != 0) limits.emplace(io_context, config.speed_limit);
+    if (config.speed_limit != 0) limits.emplace(initial_io, config.speed_limit);
     ctx.traffic.bytes_up = ctx.traffic.bytes_down = 0;
     const auto parent_cancellation = co_await net::this_coro::cancellation_state;
 

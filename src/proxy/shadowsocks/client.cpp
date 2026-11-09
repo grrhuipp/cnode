@@ -22,23 +22,9 @@ using detail::MakeNonce;
 using detail::ReadFull;
 using detail::ThrowSsWriteError;
 
-class RequestBodyWriter final
-    : public memory::ThreadAllocated
-    , public transport::MultiBufferWriter {
-public:
-    RequestBodyWriter(SsAeadCipher write_cipher,
-                      uint64_t write_nonce,
-                      AsyncStream& stream)
-        : write_cipher_(std::move(write_cipher))
-        , write_nonce_(write_nonce)
-        , stream_(&stream) {}
+}  // namespace
 
-    RequestBodyWriter(const RequestBodyWriter&) = delete;
-    RequestBodyWriter& operator=(const RequestBodyWriter&) = delete;
-    RequestBodyWriter(RequestBodyWriter&&) = delete;
-    RequestBodyWriter& operator=(RequestBodyWriter&&) = delete;
-
-    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
+net::awaitable<void> RequestBodyWriter::WriteMultiBuffer(buf::MultiBuffer mb) {
         if (!stream_) {
             throw IoSystemError(io_error::not_connected, "Shadowsocks request writer has no stream");
         }
@@ -85,7 +71,7 @@ public:
         }
     }
 
-    net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
+net::awaitable<void> RequestBodyWriter::WriteBuffers(std::span<const net::const_buffer> buffers) {
         if (!stream_) {
             throw IoSystemError(io_error::not_connected, "Shadowsocks request writer has no stream");
         }
@@ -131,7 +117,7 @@ public:
         }
     }
 
-    net::awaitable<void> AsyncShutdownWrite() override {
+net::awaitable<void> RequestBodyWriter::AsyncShutdownWrite() {
         if (!stream_) {
             throw IoSystemError(io_error::not_connected, "Shadowsocks request writer has no stream");
         }
@@ -152,28 +138,7 @@ public:
         }
     }
 
-    bool WriteShutdownClosesLink() const noexcept override {
-        return stream_ && stream_->WriteShutdownClosesLink();
-    }
-
-private:
-    void Finish() {
-        write_finished_ = true;
-        write_cipher_.reset();
-    }
-
-    void Retire() {
-        auto* stream = std::exchange(stream_, nullptr);
-        write_cipher_.reset();
-        if (stream) stream->CloseAbortive();
-    }
-
-    std::optional<SsAeadCipher> write_cipher_;
-    uint64_t write_nonce_ = 0;
-    bool write_finished_ = false;
-    AsyncStream* stream_ = nullptr;
-};
-
+namespace {
 
 bool WriteIdentityHeadersTo(const SsCipherInfo& cipher_info,
                             std::span<const KeyBytes> psk_chain,
@@ -477,11 +442,10 @@ WriteTCPRequest2022(const TargetAddress& target,
         co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
     }
 
-    WriteTCPRequestResult result;
-    result.request_writer = std::make_unique<RequestBodyWriter>(
-        std::move(*write_cipher), 2, stream);
-    result.request_salt = request_salt;
-    co_return result;
+    co_return WriteTCPRequestResult{
+        .request_writer = RequestBodyWriter(std::move(*write_cipher), 2, stream),
+        .request_salt = request_salt,
+    };
 }
 
 }  // namespace
@@ -519,10 +483,10 @@ WriteTCPRequest(const TargetAddress& target,
             co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
         }
 
-        WriteTCPRequestResult result;
-        result.request_writer = std::make_unique<RequestBodyWriter>(
-            std::move(*write_cipher), 2, stream);
-        co_return result;
+        co_return WriteTCPRequestResult{
+            .request_writer = RequestBodyWriter(std::move(*write_cipher), 2, stream),
+            .request_salt = {},
+        };
     } catch (const std::bad_alloc&) {
         co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
     } catch (const IoSystemError&) {
@@ -532,7 +496,7 @@ WriteTCPRequest(const TargetAddress& target,
     }
 }
 
-net::awaitable<tl::expected<std::unique_ptr<transport::MultiBufferReader>, ErrorCode>>
+net::awaitable<tl::expected<detail::BodyReader, ErrorCode>>
 ReadTCPResponse(const SsCipherInfo& cipher_info,
                 const KeyBytes& master_key,
                 const KeyBytes& request_salt,
@@ -616,7 +580,7 @@ ReadTCPResponse(const SsCipherInfo& cipher_info,
                 next_nonce = 2;
             }
 
-            co_return std::make_unique<detail::BodyReader>(
+            co_return detail::BodyReader(
                 std::move(read_cipher), next_nonce, stream,
                 kSs2022MaxChunkPayload, std::move(pending));
         }
@@ -645,7 +609,7 @@ ReadTCPResponse(const SsCipherInfo& cipher_info,
                                  proxy::AeadDirection::Decrypt);
         OPENSSL_cleanse(server_salt.data(), server_salt.size());
         OPENSSL_cleanse(read_subkey.data(), read_subkey.size());
-        co_return std::make_unique<detail::BodyReader>(
+        co_return detail::BodyReader(
             std::move(read_cipher), 0, stream);
     } catch (const std::bad_alloc&) {
         co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);

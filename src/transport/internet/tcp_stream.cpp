@@ -100,9 +100,7 @@ struct TcpStream::Impl : memory::ThreadAllocated,
     explicit Impl(tcp::socket socket, TcpStream& owner)
         : NativeSocketHandoff(std::move(socket))
         , owner(owner)
-        , timeouts(SocketIoContext(this->socket), *this)
-        , executor(ExecutionDomain::Current() ? ExecutionDomain::Current()->Executor()
-                                             : this->socket.get_executor()) {}
+        , timeouts(SocketIoContext(this->socket), *this) {}
 
     void OnTimeout(ErrorCode reason) noexcept {
         // A deadline is terminal, not a graceful EOF. Select reset before
@@ -130,7 +128,6 @@ struct TcpStream::Impl : memory::ThreadAllocated,
 
     TcpStream& owner;
     transport::internet::detail::ConnectionTimeouts<Impl> timeouts;
-    net::any_io_executor executor;
     buf::MultiBuffer pending_data;
     uint8_t flags = 0;
 };
@@ -515,7 +512,7 @@ bool TcpStream::IsWriteCancellationDeferred() const noexcept {
 }
 
 tcp::socket::executor_type TcpStream::GetExecutor() noexcept {
-    return impl_->executor;
+    return impl_->GetExecutor();
 }
 
 net::awaitable<IoErrorCode> TcpStream::WaitReadable(net::cancellation_slot cancellation) {

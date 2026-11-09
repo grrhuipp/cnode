@@ -169,7 +169,7 @@ net::awaitable<void> CleanPendingNodeRuntime(Runtime& runtime, NodeState& state)
                        target->tag == state.pending_cleanup[0]->tag)) continue;
         co_await runtime.RemoveInbound(target->tag);
         co_await runtime.RemoveOutbound(target->tag);
-        co_await runtime.ClearUsers(target->tag, target->protocol);
+        co_await runtime.ClearUsers(target->tag, target->config.NodeType);
         co_await runtime.UpdateRules(target->tag, {});
     }
     if (runtime.IsStopping()) throw IoSystemError(net::error::operation_aborted);
@@ -258,7 +258,7 @@ net::awaitable<void> ApplyNodeChange(
                 old_outbound_retired = true;
                 co_await runtime.RemoveOutbound(old_tag);
                 old_users_cleared = true;
-                co_await runtime.ClearUsers(old_tag, old->protocol);
+                co_await runtime.ClearUsers(old_tag, old->config.NodeType);
                 old_rules_retired = true;
                 co_await runtime.UpdateRules(old_tag, {});
             }
@@ -301,7 +301,7 @@ net::awaitable<void> ApplyNodeChange(
             catch (...) { restored = false; }
         }
         if (users_attempted && (different_tag || recovering_old)) {
-            try { co_await runtime.ClearUsers(tag, next->protocol); }
+            try { co_await runtime.ClearUsers(tag, next->config.NodeType); }
             catch (...) { restored = false; }
         }
     }

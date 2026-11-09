@@ -380,7 +380,6 @@ void TimeoutEvent::Cancel() noexcept {
 }
 bool TimeoutEvent::ScheduleAfter(std::chrono::milliseconds delay) {
     if (auto domain = domain_.lock()) {
-        DomainTimeouts::ForDomain(domain).RequireArmable();
         return TimeoutScheduler::ForWorker(domain->Reactor()).ScheduleAfter(delay, *this);
     }
     if (domain_bound_) return false;

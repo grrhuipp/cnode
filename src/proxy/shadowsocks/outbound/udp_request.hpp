@@ -20,7 +20,7 @@ public:
                const ss::SsCipherInfo& cipher_info, const ss::KeyBytes& master_key,
                std::span<const ss::KeyBytes> psk_chain,
                ForwardedMetadataView forwarded = {})
-        : OutboundDatagramEndpointBase(io, bind_address), io_(io), dns_(dns), server_(std::move(server)),
+        : OutboundDatagramEndpointBase(io, bind_address), dns_(dns), server_(std::move(server)),
           cipher_info_(cipher_info), master_key_(master_key), psk_chain_(psk_chain) {
         if (!forwarded.Empty()) {
             auto& owned = forwarded_.emplace();
@@ -79,10 +79,7 @@ public:
         if (write_closed_) throw transport::WriteClosed{};
         auto write = socket_.StartWrite();
         if (!server_endpoint_) {
-            auto& reactor = ExecutionDomain::Current()
-                ? ExecutionDomain::Current()->Reactor()
-                : io_;
-            auto server = co_await ResolveUdpEndpoint(dns_, server_, socket_, write, reactor);
+            auto server = co_await ResolveUdpEndpoint(dns_, server_, socket_, write);
             if (!server) throw transport::LinkError(server.error());
             server_endpoint_ = *server;
         }
@@ -116,7 +113,6 @@ private:
             output, output_size, forwarded);
     }
 
-    net::io_context& io_;
     app::dns::DNS& dns_;
     const TargetAddress server_;
     std::optional<udp::endpoint> server_endpoint_;

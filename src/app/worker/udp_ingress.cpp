@@ -892,11 +892,15 @@ void UdpIngress::ReleaseControl() noexcept {
 // connection reservations and the online-device guard until it ends.
 net::awaitable<void> UdpIngress::RunNativeFlow(ClientSessionPtr client_session) {
     auto& state = *client_session->impl_;
+    auto& request = *state.request;
+    auto profile = std::move(request.profile);
+    request.profile = {};
+    request.tracker.reset();
     std::exception_ptr failure;
     try {
         co_await state.capabilities->ProcessNativeDatagram(
             transport::Link{client_session.get(), client_session.get()},
-            state.request->profile, state.request->context);
+             std::move(profile), request.context);
     } catch (...) { failure = std::current_exception(); }
     client_session->Close();
     // The borrowed structured task group is still alive in this child.
@@ -946,6 +950,8 @@ net::awaitable<void> UdpIngress::RunNativeDispatch(ClientSessionPtr client_sessi
         admission = co_await AdmitNativeAssociation(
             request.context, request.profile, request.tracker.get(), request.limiter,
             *request.stats);
+        request.profile = {};
+        request.tracker.reset();
         if (!admission || client_session->Closed()) {
             client_session->Close();
             co_return;
@@ -1354,6 +1360,7 @@ void UdpIngress::ProcessDecoded(const UdpDatagramContext& datagram,
                 datagram.io_context, worker_id, datagram.io_context.get_executor(),
                 session_impl.capabilities, env.coordinator);
             session_impl.capabilities->BindDomain(session_impl.domain);
+            session_impl.reader_signal = SignalChannel(session_impl.domain->Executor(), 1);
             if (record) {
                 record->session = client_session;
                 record->domain = session_impl.domain;

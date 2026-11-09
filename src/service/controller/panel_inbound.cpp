@@ -32,7 +32,7 @@ namespace {
         stream.tls.key_file = panel_config.TLSKey;
         stream.tls.server_name = node_config.TLSServerName;
         stream.tls.pem = panel_config.TLSPem;
-        if (!stream.tls.pem) {
+        if (!panel_config.TLSPem && !stream.tls.cert_file.empty()) {
             LoadTlsPemMaterial(stream.tls);
         }
     }
@@ -124,7 +124,7 @@ InboundSpec MapPanelInbound(
         },
         .users = MapPanelUsers(node_config, users),
         .stream_settings = MapPanelStreamSettings(panel_config, node_config),
-        .sniffing = node_config.Sniffing,
+        .sniffing = SniffConfig{},
         .outbound_policy = std::move(outbound_policy),
     };
 }

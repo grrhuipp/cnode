@@ -72,9 +72,8 @@ net::awaitable<void> ReadVlessResponseHeader(VlessBufferedReader& reader,
         state.fixed[0] != vless::kVersion) {
         throw IoSystemError(io_error::connection_reset, failure);
     }
-    std::array<uint8_t, 255> ignored_addons;
-    if (!co_await reader.ReadExact(
-            ignored_addons.data(), state.fixed[1], false, &state.addons_read)) {
+    if (state.fixed[1] != 0 &&
+        !co_await reader.DiscardExact(state.fixed[1], &state.addons_read)) {
         throw IoSystemError(io_error::connection_reset, failure);
     }
     state.complete = true;
@@ -648,10 +647,18 @@ const bool kVlessRegistered = (::proxyman::outbound::RegisterProxy(
 
         const auto& s = cfg.settings;
         std::string packet_encoding;
-        if (const auto* vnext_p = s.if_contains("vnext");
-                vnext_p && vnext_p->is_array() && !vnext_p->as_array().empty() &&
-                vnext_p->as_array()[0].is_object()) {
-            const auto& server = vnext_p->as_array()[0].as_object();
+        const auto vnext_server = ::proxy::ParseOptionalSingleObjectArray(
+            s, "vnext", "VLESS", cfg.tag);
+        if (!vnext_server) {
+            return std::nullopt;
+        }
+        if (*vnext_server) {
+            const auto& server = **vnext_server;
+            const auto* user = ::proxy::ParseRequiredSingleObjectArray(
+                server, "users", "VLESS", cfg.tag);
+            if (!user) {
+                return std::nullopt;
+            }
             address = json_string(server, "address");
             const auto source_port = ::ReadJsonPort(server, "port");
             if (source_port.Invalid()) {
@@ -660,26 +667,24 @@ const bool kVlessRegistered = (::proxyman::outbound::RegisterProxy(
             if (source_port.Valid()) {
                 port = source_port.value;
             }
-
-            if (const auto* users_p = server.if_contains("users");
-                    users_p && users_p->is_array() && !users_p->as_array().empty() &&
-                    users_p->as_array()[0].is_object()) {
-                const auto& user = users_p->as_array()[0].as_object();
-                uuid = json_string(user, "id");
-                if (uuid.empty()) {
-                    uuid = json_string(user, "uuid");
-                }
-                encryption = json_string(user, "encryption");
-                vless_config.flow = json_string(user, "flow");
-                const std::string user_packet_encoding = json_string(user, "packetEncoding");
-                if (!user_packet_encoding.empty()) {
-                    packet_encoding = user_packet_encoding;
-                }
+            uuid = json_string(*user, "id");
+            if (uuid.empty()) {
+                uuid = json_string(*user, "uuid");
+            }
+            encryption = json_string(*user, "encryption");
+            vless_config.flow = json_string(*user, "flow");
+            const std::string user_packet_encoding = json_string(*user, "packetEncoding");
+            if (!user_packet_encoding.empty()) {
+                packet_encoding = user_packet_encoding;
             }
             if (encryption.empty()) {
                 encryption = json_string(s, "encryption");
             }
         } else {
+            if (s.if_contains("users")) {
+                LOG_ERROR("VLESS outbound '{}': users requires vnext", cfg.tag);
+                return std::nullopt;
+            }
             address = json_string(s, "address");
             const auto source_port = ::ReadJsonPort(s, "port");
             if (source_port.Invalid()) {

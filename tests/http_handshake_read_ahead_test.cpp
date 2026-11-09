@@ -842,7 +842,10 @@ void UpgradeHeaderTokens(bool outbound, bool websocket,
             if (websocket) {
                 const auto key = ::transport::internet::TrimAscii(
                     ::transport::internet::ExtractHeaderValueCI(request, "Sec-WebSocket-Key"));
-                message += "Sec-WebSocket-Accept: " + ::ws::ComputeWsAccept(key) + "\r\n";
+                const auto accept = ::ws::EncodeWsAccept(key);
+                message += "Sec-WebSocket-Accept: ";
+                message += std::string_view(accept.data(), accept.size());
+                message += "\r\n";
             }
         } else {
             message = "GET /up HTTP/1.1\r\nHost: localhost\r\n"
@@ -1016,7 +1019,10 @@ void HttpLogHandshake(std::string_view network, bool outbound,
         if (outbound && network == "ws") {
             const auto key = ::transport::internet::TrimAscii(
                 ::transport::internet::ExtractHeaderValueCI(request, "Sec-WebSocket-Key"));
-            message += "Sec-WebSocket-Accept: " + ::ws::ComputeWsAccept(key) + "\r\n";
+            const auto accept = ::ws::EncodeWsAccept(key);
+            message += "Sec-WebSocket-Accept: ";
+            message += std::string_view(accept.data(), accept.size());
+            message += "\r\n";
         }
         message += "\r\n";
         co_await net::async_write(peer, net::buffer(message), net::use_awaitable);

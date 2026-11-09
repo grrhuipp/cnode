@@ -298,7 +298,7 @@ struct TlsStream::Impl final : memory::ThreadAllocated, private transport::Cance
     // while allowing reads during a backpressured physical write.
     struct OutputTurn {
         OutputTurn(Impl& owner) : owner(owner), previous(owner.output_tail) {
-            if (previous) wake.emplace(owner.Executor(), 1);
+            if (previous) wake.emplace(owner.tcp->GetExecutor(), 1);
             if (previous) previous->next = this;
             owner.output_tail = this;
         }
@@ -347,9 +347,7 @@ struct TlsStream::Impl final : memory::ThreadAllocated, private transport::Cance
 
     Impl(std::unique_ptr<TcpStream> inner, const SslContext& context, bool server)
         : tcp(std::move(inner))
-        , ssl(nullptr, SSL_free)
-        , engine_gate(tcp ? tcp->GetExecutor() : net::any_io_executor{})
-        , input_gate(tcp ? tcp->GetExecutor() : net::any_io_executor{}) {
+        , ssl(nullptr, SSL_free) {
         if (!tcp) throw std::invalid_argument("TlsStream requires TcpStream");
         if (!tls_bio_method)
             throw std::logic_error("TlsStream::InitializeIo must precede Worker startup");
@@ -373,10 +371,6 @@ struct TlsStream::Impl final : memory::ThreadAllocated, private transport::Cance
 
     ~Impl() {
         Unsubscribe();
-    }
-
-    ::tcp::socket::executor_type Executor() {
-        return tcp->GetExecutor();
     }
 
     void OnCancellation(transport::Cancellation event) noexcept override {

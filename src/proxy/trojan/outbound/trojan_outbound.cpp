@@ -243,17 +243,10 @@ const bool kTrojanRegistered = (::proxyman::outbound::RegisterProxy(
             return true;
         };
 
-        if (const auto* servers_p = s.if_contains("servers")) {
-            if (!servers_p->is_array() ||
-                servers_p->as_array().size() != 1 ||
-                !servers_p->as_array()[0].is_object()) {
-                LOG_ERROR("trojan outbound '{}': servers must be a single-element object array", cfg.tag);
-                return std::nullopt;
-            }
-            if (!read_trojan_server(servers_p->as_array()[0].as_object())) {
-                return std::nullopt;
-            }
-        } else if (!read_trojan_server(s)) {
+        const auto server_obj = ::proxy::ParseOptionalSingleObjectArray(
+            s, "servers", "trojan", cfg.tag);
+        if (!server_obj ||
+            !read_trojan_server(*server_obj ? **server_obj : s)) {
             return std::nullopt;
         }
         if (password.empty()) {

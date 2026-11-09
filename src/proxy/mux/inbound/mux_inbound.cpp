@@ -79,11 +79,8 @@ struct MuxReply {
 class TcpSubState;
 
 struct ReplyQueueState {
-    explicit ReplyQueueState(net::io_context& io_context, SignalChannel& main_signal)
-        : io_context_(io_context)
-        , main_signal_(main_signal) {}
-
-    net::io_context& io_context_;
+    explicit ReplyQueueState(SignalChannel& main_signal)
+        : main_signal_(main_signal) {}
     memory::ThreadLocalDeque<MuxReply> queue;
     size_t tcp_queued_bytes = 0;   // TCP 子会话回包字节（含 overhead）
     size_t udp_queued_bytes = 0;   // UDP 子会话回包字节（含 overhead）
@@ -193,9 +190,6 @@ struct ReplyQueueState {
     }
 
     void WakeReplyWriter() noexcept {
-        if (io_context_.stopped()) {
-            return;
-        }
         (void)main_signal_.try_send(IoErrorCode{});
     }
 
@@ -211,9 +205,6 @@ struct ReplyQueueState {
     void MarkSubLoopDone() noexcept {
         if (active_sub_loops > 0) {
             --active_sub_loops;
-        }
-        if (io_context_.stopped()) {
-            return;
         }
         WakeReplyWriter();
     }
@@ -265,11 +256,11 @@ private:
 
 struct ClientReadQueueState {
     explicit ClientReadQueueState(net::io_context& io_context, SignalChannel& main_signal)
-        : io_context_(io_context)
-        , space_signal(io_context, 1)
+        : space_signal(ExecutionDomain::Current()
+                           ? ExecutionDomain::Current()->Executor()
+                           : net::any_io_executor(io_context.get_executor()),
+                       1)
         , main_signal_(main_signal) {}
-
-    net::io_context& io_context_;
     SignalChannel space_signal;
     SignalChannel& main_signal_;
     memory::ThreadLocalDeque<QueuedInput> queue;
@@ -280,16 +271,10 @@ struct ClientReadQueueState {
     ErrorCode error = ErrorCode::OK;
 
     void WakeMain() noexcept {
-        if (io_context_.stopped()) {
-            return;
-        }
         (void)main_signal_.try_send(IoErrorCode{});
     }
 
     void WakeSpace() noexcept {
-        if (io_context_.stopped()) {
-            return;
-        }
         (void)space_signal.try_send(IoErrorCode{});
     }
 
@@ -440,10 +425,12 @@ public:
 
 protected:
     MuxSubSession(net::io_context& io_context, uint16_t session_id, ReplyQueueState& reply_queue)
-        : io_context_(io_context)
-        , session_id_(session_id)
+        : session_id_(session_id)
         , reply_queue_(reply_queue)
-        , input_signal_(io_context, 1) {}
+        , input_signal_(ExecutionDomain::Current()
+                            ? ExecutionDomain::Current()->Executor()
+                            : net::any_io_executor(io_context.get_executor()),
+                        1) {}
     // Derived destructors call Cancel() so their OnCancel still runs.
     ~MuxSubSession() noexcept override = default;
 
@@ -493,7 +480,6 @@ protected:
             dispatch_done_notified_ || notify_dispatch_done;
     }
 
-    net::io_context& io_context_;
     const uint16_t session_id_;
     ReplyQueueState& reply_queue_;
     bool input_done_ = false;
@@ -501,9 +487,6 @@ protected:
 
 private:
     void WakeInputReader() noexcept {
-        if (io_context_.stopped()) {
-            return;
-        }
         (void)input_signal_.try_send(IoErrorCode{});
     }
 
@@ -525,7 +508,10 @@ public:
         uint16_t session_id,
         ReplyQueueState& reply_queue)
         : MuxSubSession(io_context, session_id, reply_queue)
-        , output_signal_(io_context, 1) {}
+        , output_signal_(ExecutionDomain::Current()
+                             ? ExecutionDomain::Current()->Executor()
+                             : net::any_io_executor(io_context.get_executor()),
+                         1) {}
     ~TcpSubState() noexcept override {
         Cancel();
     }
@@ -687,9 +673,6 @@ private:
     }
 
     void WakeOutputWriter() noexcept {
-        if (io_context_.stopped()) {
-            return;
-        }
         (void)output_signal_.try_send(IoErrorCode{});
     }
 
@@ -936,8 +919,12 @@ net::awaitable<RelayResult> ProcessInboundImpl(
         std::min(timeouts.WriteTimeout(), relay_idle_timeout));
 
     // 回包队列：单线程，无锁；running 保护回调不在 ProcessInbound 退出后继续推送。
-    SignalChannel main_signal{io_context, 1};
-    ReplyQueueState reply_queue{io_context, main_signal};
+    SignalChannel main_signal{
+        ExecutionDomain::Current()
+            ? ExecutionDomain::Current()->Executor()
+            : net::any_io_executor(io_context.get_executor()),
+        1};
+    ReplyQueueState reply_queue{main_signal};
     ClientReadQueueState client_reads{io_context, main_signal};
 
     // TCP / UDP 共用同一个 session_id 命名空间。

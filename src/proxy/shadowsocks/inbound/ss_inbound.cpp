@@ -160,6 +160,7 @@ net::awaitable<RelayResult> DispatchSsUotSession(
     StatsShard& stats,
     const TimeoutsConfig& timeouts) {
     std::optional<proxy::uot::PacketReader> uot_reader;
+    InitialPayload initial_payload;
     bool is_connect = false;
     {
         tl::expected<proxy::uot::PreparedRequest, ErrorCode> prepared =
@@ -178,6 +179,7 @@ net::awaitable<RelayResult> DispatchSsUotSession(
             co_return proxy::RejectInbound(stats, stream.get(), prepared.error());
         }
         is_connect = prepared->is_connect;
+        initial_payload = InitialPayload{std::move(prepared->initial_decoded)};
         proxy::BindInboundRequestTarget(
             ctx,
             proxy::InboundRequestTarget{
@@ -193,7 +195,7 @@ net::awaitable<RelayResult> DispatchSsUotSession(
         dispatch_policy,
         std::move(stream),
         transport::Link{&*uot_reader, &uot_writer},
-        InitialPayload{},
+        std::move(initial_payload),
         ctx,
         stats,
         timeouts);

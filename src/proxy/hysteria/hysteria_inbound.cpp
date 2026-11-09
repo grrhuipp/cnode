@@ -133,12 +133,11 @@ public:
         session::Context& ctx,
         const TimeoutsConfig& timeouts,
         uint32_t /*pressure_idle_timeout*/) override {
-        auto& reactor = SessionReactor(io_context);
         if (auto* session = dynamic_cast<wire::UdpSessionStream*>(stream.get())) {
             BindInboundRequestTarget(
                 ctx, InboundRequestTarget{Network::UDP, session->FirstTarget()});
             co_return co_await dispatcher.Dispatch(
-                reactor, receiver.dispatch_policy, std::move(stream),
+                SessionReactor(io_context), receiver.dispatch_policy, std::move(stream),
                 transport::Link{session, session}, InitialPayload{},
                 ctx, stats_, timeouts);
         }
@@ -173,7 +172,7 @@ public:
 
         auto* tcp_stream = stream.get();
         co_return co_await dispatcher.Dispatch(
-            reactor, receiver.dispatch_policy, std::move(stream),
+            SessionReactor(io_context), receiver.dispatch_policy, std::move(stream),
             transport::Link{tcp_stream, tcp_stream},
             std::move(initial_payload),
             ctx, stats_, timeouts);
