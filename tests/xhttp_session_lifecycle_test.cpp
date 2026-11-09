@@ -251,22 +251,26 @@ void UploadResponseIsDrained() {
 }
 
 void CrossWorkerUploadHandoffDoesNotEscapeOriginSink() {
-    net::io_context control, worker0, worker1;
+    net::io_context control;
+    auto worker0 = std::make_unique<net::io_context>();
+    auto worker1 = std::make_unique<net::io_context>();
     auto work_c = net::make_work_guard(control);
-    auto work_0 = net::make_work_guard(worker0);
-    auto work_1 = net::make_work_guard(worker1);
+    auto work_0 = std::make_optional(net::make_work_guard(*worker0));
+    auto work_1 = std::make_optional(net::make_work_guard(*worker1));
     auto coordinator = std::make_shared<::GroupCoordinator>(control);
-    coordinator->RegisterWorker(0, worker0);
-    coordinator->RegisterWorker(1, worker1);
+    coordinator->RegisterWorker(0, *worker0);
+    coordinator->RegisterWorker(1, *worker1);
 
     std::thread thread_c([&] { control.run(); });
     std::thread thread_0([&] {
         ::memory::ConfigureProcessAllocator();
-        worker0.run();
+        worker0->run();
+        worker0.reset();
     });
     std::thread thread_1([&] {
         ::memory::ConfigureProcessAllocator();
-        worker1.run();
+        worker1->run();
+        worker1.reset();
     });
 
     struct OriginBoundSink final
@@ -302,20 +306,20 @@ void CrossWorkerUploadHandoffDoesNotEscapeOriginSink() {
 
     for (int round = 0; round < 16; ++round) {
         const std::string session_id = "s-" + std::to_string(round);
-        ::tcp::socket client_up(control), server_up(worker1);
+        ::tcp::socket client_up(control), server_up(*worker1);
         client_up.connect(endpoint);
         acceptor.accept(server_up);
 
-        ::tcp::socket client_down(control), server_down(worker0);
+        ::tcp::socket client_down(control), server_down(*worker0);
         client_down.connect(endpoint);
         acceptor.accept(server_down);
 
         // Start PacketUp on worker1 before PacketDown arrives on worker0 on even rounds.
-        auto up_future = net::co_spawn(worker1,
+        auto up_future = net::co_spawn(*worker1,
             [&, sock = std::move(server_up)]() mutable -> net::awaitable<void> {
                 auto sink = ::memory::AllocateShared<OriginBoundSink>(std::this_thread::get_id());
                 auto res = co_await DoXHttp1ServerHandshake(
-                    worker1, std::make_unique<::TcpStream>(std::move(sock)),
+                    *worker1, std::make_unique<::TcpStream>(std::move(sock)),
                     http_cfg, xhttp_cfg, 1, nullptr, {}, sink);
                 Require(res.has_value() && !*res, "packet-up handoff failed");
             }, net::use_future);
@@ -328,11 +332,11 @@ void CrossWorkerUploadHandoffDoesNotEscapeOriginSink() {
             "hello";
         net::write(client_up, net::buffer(post_req));
 
-        auto down_future = net::co_spawn(worker0,
+        auto down_future = net::co_spawn(*worker0,
             [&, sock = std::move(server_down)]() mutable -> net::awaitable<std::string> {
                 auto sink = ::memory::AllocateShared<OriginBoundSink>(std::this_thread::get_id());
                 auto res = co_await DoXHttp1ServerHandshake(
-                    worker0, std::make_unique<::TcpStream>(std::move(sock)),
+                    *worker0, std::make_unique<::TcpStream>(std::move(sock)),
                     http_cfg, xhttp_cfg, 2, nullptr, {}, sink);
                 Require(res.has_value() && !*res && sink->logical != nullptr,
                         "packet-down did not produce logical stream");
