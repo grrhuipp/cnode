@@ -403,6 +403,13 @@ struct Handler::ClientSession : memory::ThreadAllocated {
         }
     }
 
+    // 填充分支把方案内的记录借给跨挂起点的写协程，读循环可能同时替换 scheme_，
+    // 因此只在该包有填充记录时持有快照；无填充分支在调用内同步消费方案。
+    std::shared_ptr<const PaddingScheme> SchemeGuardFor(uint32_t packet_index) const noexcept {
+        if (scheme_->RecordFor(packet_index).empty()) return {};
+        return scheme_;
+    }
+
     net::awaitable<tl::expected<void, ErrorCode>>
     WriteOpenPacket(memory::ByteVector packet) {
         auto write_lease = write_gate.TryAcquire();
@@ -441,9 +448,9 @@ struct Handler::ClientSession : memory::ThreadAllocated {
 
         try {
             const uint32_t this_packet = NextPacketIndex();
-            auto scheme_snapshot = scheme_;
+            const auto scheme_guard = SchemeGuardFor(this_packet);
             auto ok = co_await WriteMultiBufferAsFramesWithPadding(
-                *stream, *scheme_snapshot, this_packet, kCmdPSH, sid, std::move(mb));
+                *stream, *scheme_, this_packet, kCmdPSH, sid, std::move(mb));
             if (!ok) {
                 CloseAll(ok.error());
                 co_return tl::unexpected(ok.error());
@@ -478,9 +485,9 @@ struct Handler::ClientSession : memory::ThreadAllocated {
 
         try {
             const uint32_t this_packet = NextPacketIndex();
-            auto scheme_snapshot = scheme_;
+            const auto scheme_guard = SchemeGuardFor(this_packet);
             auto ok = co_await WriteBuffersAsFramesWithPadding(
-                *stream, *scheme_snapshot, this_packet, kCmdPSH, sid, buffers);
+                *stream, *scheme_, this_packet, kCmdPSH, sid, buffers);
             if (!ok) {
                 CloseAll(ok.error());
                 co_return tl::unexpected(ok.error());
@@ -1017,9 +1024,10 @@ tl::expected<memory::ByteVector, ErrorCode> BuildOpenPacket(
     const TargetAddress& original_target,
     ForwardedMetadataView forwarded,
     const PaddingScheme* opening_scheme) {
-    const TargetAddress stream_target = is_udp
+    const TargetAddress uot_magic_target = is_udp
         ? TargetAddress(proxy::uot::kMagicAddress, 0)
-        : original_target;
+        : TargetAddress{};
+    const TargetAddress& stream_target = is_udp ? uot_magic_target : original_target;
     std::array<uint8_t, kMaxEncodedAddressSize> target{};
     const size_t target_size = (stream_target.IsValid() ||
         proxy::uot::VersionFromMagicAddress(stream_target))

@@ -70,7 +70,7 @@ public:
     }
 
 private:
-    std::unique_ptr<EVP_AEAD_CTX, decltype(&EVP_AEAD_CTX_free)> ctx_{nullptr, EVP_AEAD_CTX_free};
+    bssl::UniquePtr<EVP_AEAD_CTX> ctx_;
     bool ready_ = false;
 };
 

@@ -47,9 +47,6 @@ private:
     net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, ErrorCode>>
     DialTarget(OutboundDialer& dialer, session::Context& ctx);
 
-    net::awaitable<tl::expected<memory::ThreadLocalVector<net::ip::address>, ErrorCode>>
-    ResolveTargets(::app::dns::DNS& dns, session::Context& ctx);
-
     DomainStrategy domain_strategy_;
     std::optional<TargetAddress> redirect_target_;
 };
@@ -201,24 +198,19 @@ Handler::DialTarget(OutboundDialer& dialer, session::Context& ctx) {
     }
 
     LOG_CONN_DEBUG(ctx, "resolving target {}", target);
-    auto addresses = co_await ResolveTargets(dialer.Dns(), ctx);
-    if (!addresses || addresses->empty()) {
-        co_return tl::unexpected(addresses ? ErrorCode::DNS_RESOLVE_FAILED : addresses.error());
-    }
-    co_return co_await dialer.Dial(
-        ctx, std::span<const net::ip::address>(addresses->data(), addresses->size()),
-        target.port);
-}
-
-net::awaitable<tl::expected<memory::ThreadLocalVector<net::ip::address>, ErrorCode>>
-Handler::ResolveTargets(::app::dns::DNS& dns, session::Context& ctx) {
-    const auto& target = ctx.outbound.target;
-
-    // 需要 DNS 解析
-    auto dns_result = co_await dns.Resolve(target.host);
-
+    auto dns_result = co_await dialer.Dns().Resolve(target.host);
     if (!dns_result.Ok()) {
         co_return tl::unexpected(ErrorCode::DNS_RESOLVE_FAILED);
+    }
+    if (dns_result.addresses.empty()) {
+        co_return tl::unexpected(ErrorCode::DNS_NO_RECORD);
+    }
+
+    // 保序且两族都接受时过滤是恒等变换：直接借用解析结果，dns_result 存活至拨号结束。
+    if (PreservesDnsOrder(domain_strategy_) &&
+        AcceptsIPv4(domain_strategy_) && AcceptsIPv6(domain_strategy_)) {
+        co_return co_await dialer.Dial(
+            ctx, std::span<const net::ip::address>(dns_result.addresses), target.port);
     }
 
     memory::ThreadLocalVector<net::ip::address> addresses;
@@ -258,8 +250,9 @@ Handler::ResolveTargets(::app::dns::DNS& dns, session::Context& ctx) {
     if (addresses.empty()) {
         co_return tl::unexpected(ErrorCode::DNS_NO_RECORD);
     }
-
-    co_return addresses;
+    co_return co_await dialer.Dial(
+        ctx, std::span<const net::ip::address>(addresses.data(), addresses.size()),
+        target.port);
 }
 
 [[nodiscard]] proxyman::outbound::PreparedOutboundCreator

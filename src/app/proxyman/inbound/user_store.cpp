@@ -112,29 +112,26 @@ BuildVmessUsers(const std::vector<PreparedVmessUser>& users) {
     return list;
 }
 
-template <typename UserMap, typename PreparedUser, auto KeyMember>
+template <typename UserMap, auto KeyMember, typename PreparedUser, typename Project>
 std::shared_ptr<const UserMap>
-BuildKeyedUsers(const std::vector<PreparedUser>& users, std::string_view protocol) {
+BuildKeyedUsers(const std::vector<PreparedUser>& users, std::string_view protocol,
+                Project project) {
     auto map = std::make_shared<UserMap>();
     map->reserve(users.size());
     for (const auto& user : users) {
-        if (!map->try_emplace(user.*KeyMember, user).second) {
+        if (!map->try_emplace(user.*KeyMember, project(user)).second) {
             ThrowAmbiguousCredential(protocol);
         }
     }
     return map;
 }
 
-std::shared_ptr<const UserStore::TrojanUserMap>
-BuildTrojanUsers(const std::vector<PreparedTrojanUser>& users) {
-    auto map = std::make_shared<UserStore::TrojanUserMap>();
-    map->reserve(users.size());
-    for (const auto& user : users) {
-        if (!map->try_emplace(user.password_hash, UserStore::TrojanCredential{user.profile}).second) {
-            ThrowAmbiguousCredential("Trojan");
-        }
-    }
-    return map;
+UserStore::ProfileCredential ProjectProfile(const auto& user) {
+    return UserStore::ProfileCredential{user.profile};
+}
+
+UserStore::VlessCredential ProjectVless(const PreparedVlessUser& user) {
+    return UserStore::VlessCredential{.flow = user.flow, .profile = user.profile};
 }
 
 std::shared_ptr<const UserStore::ShadowsocksUserList>
@@ -281,18 +278,19 @@ UserStore::PublishedSnapshot UserStore::PrepareUsers(
         if (const auto* vmess = std::get_if<PreparedVmessUsers>(&users)) {
             SetOrErase(next->vmess, tag, BuildVmessUsers(*vmess));
         } else if (const auto* vless = std::get_if<PreparedVlessUsers>(&users)) {
-            SetOrErase(next->vless, tag,
-                       BuildKeyedUsers<VlessUserMap, PreparedVlessUser, &PreparedVlessUser::uuid_bytes>(*vless, "VLESS"));
+            SetOrErase(next->vless, tag, BuildKeyedUsers<VlessUserMap, &PreparedVlessUser::uuid_bytes>(
+                *vless, "VLESS", ProjectVless));
         } else if (const auto* trojan = std::get_if<PreparedTrojanUsers>(&users)) {
-            SetOrErase(next->trojan, tag, BuildTrojanUsers(*trojan));
+            SetOrErase(next->trojan, tag, BuildKeyedUsers<TrojanUserMap, &PreparedTrojanUser::password_hash>(
+                *trojan, "Trojan", ProjectProfile<PreparedTrojanUser>));
         } else if (const auto* shadowsocks = std::get_if<PreparedShadowsocksUsers>(&users)) {
             SetOrErase(next->shadowsocks, tag, BuildShadowsocksUsers(*shadowsocks));
         } else if (const auto* anytls = std::get_if<PreparedAnyTlsUsers>(&users)) {
-            SetOrErase(next->anytls, tag,
-                       BuildKeyedUsers<AnyTlsUserMap, PreparedAnyTlsUser, &PreparedAnyTlsUser::password_hash>(*anytls, "AnyTLS"));
+            SetOrErase(next->anytls, tag, BuildKeyedUsers<AnyTlsUserMap, &PreparedAnyTlsUser::password_hash>(
+                *anytls, "AnyTLS", ProjectProfile<PreparedAnyTlsUser>));
         } else if (const auto* hysteria = std::get_if<PreparedHysteriaUsers>(&users)) {
-            SetOrErase(next->hysteria, tag,
-                       BuildKeyedUsers<HysteriaUserMap, PreparedHysteriaUser, &PreparedHysteriaUser::credential_hash>(*hysteria, "Hysteria"));
+            SetOrErase(next->hysteria, tag, BuildKeyedUsers<HysteriaUserMap, &PreparedHysteriaUser::credential_hash>(
+                *hysteria, "Hysteria", ProjectProfile<PreparedHysteriaUser>));
         }
         const auto protocol = UserProtocolOf(users);
         if (protocol == UserProtocol::Vmess || protocol == UserProtocol::Shadowsocks) continue;

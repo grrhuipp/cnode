@@ -267,12 +267,10 @@ tl::expected<void, ErrorCode> AppendFrameBytesTo(
     if (payload.size() > kMaxFramePayload) {
         return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
+    const auto header = BuildFrameHeaderBytes(cmd, sid, payload.size());
     const size_t offset = out.size();
-    out.resize(offset + kFrameHeaderSize + payload.size());
-    auto* header = out.data() + offset;
-    header[0] = cmd;
-    StoreU32BE(header + 1, sid);
-    StoreU16BE(header + 5, static_cast<uint16_t>(payload.size()));
+    out.resize(offset + header.size() + payload.size());
+    std::memcpy(out.data() + offset, header.data(), header.size());
     if (!payload.empty()) {
         std::memcpy(out.data() + offset + kFrameHeaderSize, payload.data(), payload.size());
     }

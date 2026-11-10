@@ -219,6 +219,8 @@ struct DatagramSource {
     void Send(Ingress& ingress, ::net::io_context& io, std::string_view socket_key,
               ::udp::socket* sock, uint16_t client_port,
               std::span<const uint8_t> packet, const ::TimeoutsConfig& timeouts) {
+        const ::app::DatagramSessionEnvironment environment{
+            .timeouts = timeouts, .dispatcher = &dispatcher, .stats = &stats};
         ingress.ProcessDatagram(::worker_detail::UdpDatagramContext{
             .socket_key = socket_key,
             .sock = sock,
@@ -226,10 +228,8 @@ struct DatagramSource {
             .payload = packet,
             .receiver = &receiver,
             .io_context = io,
-            .dispatcher = &dispatcher,
-            .stats = stats,
-            .timeouts = timeouts,
             .reply_sink = reply_sink,
+            .environment = environment,
         });
     }
 };

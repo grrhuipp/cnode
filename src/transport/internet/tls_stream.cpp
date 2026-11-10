@@ -331,9 +331,11 @@ struct TlsStream::Impl final : memory::ThreadAllocated, private transport::Cance
         IoErrorCode transport_error;
         std::exception_ptr failure;
         std::uint64_t generation = 0;
-        unsigned long library_error = 0;
+        std::uint32_t library_error = 0;  // ERR_get_error() width
         int ssl_error = SSL_ERROR_NONE;
         int result = 0;
+        // The direct BIO send hit EAGAIN and nothing was sent after it.
+        bool write_blocked = false;
     };
 
     // At most one reader and one writer can own output. The turns live in those
@@ -403,8 +405,6 @@ struct TlsStream::Impl final : memory::ThreadAllocated, private transport::Cance
         }
         ssl.reset(SSL_new(raw));
         if (!ssl) throw std::bad_alloc();
-        SSL_set_mode(ssl.get(), SSL_MODE_RELEASE_BUFFERS);
-        SSL_set_read_ahead(ssl.get(), 0);
         SSL_set_max_send_fragment(ssl.get(), buf::Buffer::kSize);
         BIO* bio = BIO_new(tls_bio_method.get());
         if (!bio) throw std::bad_alloc();
@@ -507,6 +507,7 @@ struct TlsStream::Impl final : memory::ThreadAllocated, private transport::Cance
                 call.transport_error = error;
                 return -1;
             }
+            call.write_blocked = error == io_error::would_block || error == io_error::try_again;
             if (sent == count) return static_cast<int>(count);
         }
         try {
@@ -533,7 +534,9 @@ struct TlsStream::Impl final : memory::ThreadAllocated, private transport::Cance
 
     void Invoke(Invocation& call, Kind kind, net::mutable_buffer target,
                 net::const_buffer source) noexcept {
-        ERR_clear_error();
+        // BoringSSL ERR_clear_error frees and wipes every queue slot even when
+        // empty; the queue is normally empty here, so only clear stale errors.
+        if (ERR_peek_error() != 0) ERR_clear_error();
         invocation = &call;
         switch (kind) {
             case Kind::Handshake: call.result = SSL_do_handshake(ssl.get()); break;
@@ -551,7 +554,7 @@ struct TlsStream::Impl final : memory::ThreadAllocated, private transport::Cance
         // before any other SSL call, callback, or coroutine suspension.
         if (call.result <= 0) call.ssl_error = SSL_get_error(ssl.get(), call.result);
         call.library_error = ERR_get_error();
-        while (ERR_get_error() != 0) {}
+        if (call.library_error != 0) ERR_clear_error();
         invocation = nullptr;
         call.generation = input_generation;
     }
@@ -615,7 +618,10 @@ struct TlsStream::Impl final : memory::ThreadAllocated, private transport::Cance
                 CheckCancellation(epoch);
             }
             const net::const_buffer out_buf = net::buffer(*call.output);
-            co_await tcp->WriteBuffers(std::span<const net::const_buffer>(&out_buf, 1));
+            // Without a previous turn nothing suspended since the BIO send,
+            // so its EAGAIN still holds: wait for writability before sending.
+            co_await tcp->WriteBuffersFrom(std::span<const net::const_buffer>(&out_buf, 1), 0,
+                                           !turn.previous && call.write_blocked);
             CheckCancellation(epoch);
         } catch (...) {
             Abort();
@@ -1091,9 +1097,10 @@ std::string_view TlsStream::NegotiatedAlpn() const {
 bool TlsStream::EnableRawRead() noexcept {
     if (!handshake_done_ || impl_->handshaking || impl_->read_active ||
         impl_->invocation || !impl_->tcp->CanRead()) return false;
-    // With read-ahead disabled, completed SSL_read never fetches the next
-    // record. Refuse an outstanding partial encrypted record rather than
-    // losing it or mistaking it for raw Vision bytes.
+    // BoringSSL reads only the bytes the current TLS record still needs, so a
+    // completed SSL_read never fetches the next record. Refuse an outstanding
+    // partial encrypted record rather than losing it or mistaking it for raw
+    // Vision bytes.
     if (SSL_has_pending(NativeSsl()) && SSL_pending(NativeSsl()) == 0) return false;
     impl_->raw_read = true;
     return true;

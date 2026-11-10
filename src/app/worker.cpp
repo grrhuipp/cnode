@@ -1604,11 +1604,9 @@ net::awaitable<void> Worker::ListenerState::UdpReceiveLoop(
             .payload = received,
             .receiver = receiver,
             .io_context = worker.runtime_->io_context,
-            .stats = worker.runtime_->stats,
-            .timeouts = worker.runtime_->timeouts,
             .worker_id = worker.id_,
             .reply_sink = *this,
-            .environment = &listener_slot->datagram_environment,
+            .environment = listener_slot->datagram_environment,
         });
     };
     return worker_detail::RunUdpReceiveLoop(

@@ -229,47 +229,45 @@ buf::MultiBuffer PacketReader::TakePending() noexcept {
     return out;
 }
 net::awaitable<buf::MultiBuffer> PacketReader::ReadMultiBuffer() {
-    for (;;) {
-        if (pending_.byte_size() < 1 &&
-            co_await EnsurePending(reader_, pending_, 1) != PendingStatus::Ready)
-            co_return buf::MultiBuffer{};
-        TargetAddress packet_target;
-        if (!is_connect_) {
-            auto address = co_await ::ReadAddress(
-                reader_, pending_, AddressWireFormat::Uot, 0,
-                {.require_non_empty_domain = true, .allow_metadata = false});
-            if (!address || !address->target.IsValid()) {
-                ThrowDecodeFailure();
-            }
-            packet_target = std::move(address->target);
-            (void)pending_.DropPrefixBytes(address->consumed);
-        }
-        if (pending_.byte_size() < 2 &&
-            co_await EnsurePending(reader_, pending_, 2) != PendingStatus::Ready) {
+    if (pending_.byte_size() < 1 &&
+        co_await EnsurePending(reader_, pending_, 1) != PendingStatus::Ready)
+        co_return buf::MultiBuffer{};
+    TargetAddress packet_target;
+    if (!is_connect_) {
+        auto address = co_await ::ReadAddress(
+            reader_, pending_, AddressWireFormat::Uot, 0,
+            {.require_non_empty_domain = true, .allow_metadata = false});
+        if (!address || !address->target.IsValid()) {
             ThrowDecodeFailure();
         }
-
-        std::array<uint8_t, 2> len_bytes{};
-        if (pending_.CopyPrefixTo(len_bytes) != len_bytes.size()) {
-            ThrowDecodeFailure();
-        }
-        const size_t payload_size = LoadU16BE(len_bytes.data());
-        (void)pending_.DropPrefixBytes(len_bytes.size());
-        if (pending_.byte_size() < payload_size &&
-            co_await EnsurePending(reader_, pending_, payload_size) !=
-                PendingStatus::Ready) {
-            ThrowDecodeFailure();
-        }
-        buf::MultiBuffer packet;
-        if (!pending_.MovePrefixTo(packet, payload_size)) {
-            ThrowDecodeFailure();
-        }
-        pending_.ReleaseIfIdle();
-        if (!buf::SetUdpTarget(packet, is_connect_ ? destination_ : packet_target)) {
-            throw std::bad_alloc();
-        }
-        co_return packet;
+        packet_target = std::move(address->target);
+        (void)pending_.DropPrefixBytes(address->consumed);
     }
+    if (pending_.byte_size() < 2 &&
+        co_await EnsurePending(reader_, pending_, 2) != PendingStatus::Ready) {
+        ThrowDecodeFailure();
+    }
+
+    std::array<uint8_t, 2> len_bytes{};
+    if (pending_.CopyPrefixTo(len_bytes) != len_bytes.size()) {
+        ThrowDecodeFailure();
+    }
+    const size_t payload_size = LoadU16BE(len_bytes.data());
+    (void)pending_.DropPrefixBytes(len_bytes.size());
+    if (pending_.byte_size() < payload_size &&
+        co_await EnsurePending(reader_, pending_, payload_size) !=
+            PendingStatus::Ready) {
+        ThrowDecodeFailure();
+    }
+    buf::MultiBuffer packet;
+    if (!pending_.MovePrefixTo(packet, payload_size)) {
+        ThrowDecodeFailure();
+    }
+    pending_.ReleaseIfIdle();
+    if (!buf::SetUdpTarget(packet, is_connect_ ? destination_ : packet_target)) {
+        throw std::bad_alloc();
+    }
+    co_return packet;
 }
 
 PacketWriter::PacketWriter(transport::MultiBufferWriter& writer,
@@ -331,7 +329,7 @@ net::awaitable<void> PacketWriter::WriteBuffers(
 }
 
 net::awaitable<void> PacketWriter::AsyncShutdownWrite() {
-    co_await writer_.AsyncShutdownWrite();
+    return writer_.AsyncShutdownWrite();
 }
 
 }  // namespace proxy::uot

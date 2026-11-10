@@ -517,28 +517,23 @@ void EncodeWindowUpdateFrame(uint8_t* out,
     StoreU32BE(out + 9, increment & 0x7fff'ffffu);
 }
 
-net::awaitable<void> SendWindowUpdate(AsyncStream& stream,
-                                      uint32_t stream_id,
-                                      uint32_t increment) {
-    std::array<uint8_t, 13> frame{};
-    EncodeWindowUpdateFrame(frame.data(), stream_id, increment);
-    const net::const_buffer buf = net::buffer(frame);
-    try {
-        co_await stream.WriteBuffers(std::span<const net::const_buffer>(&buf, 1));
-    } catch (...) {
-        stream.CloseAbortive();
-        throw;
-    }
-}
-
-net::awaitable<void> SendDualWindowUpdate(AsyncStream& stream,
-                                          uint32_t conn_increment,
-                                          uint32_t stream_id,
-                                          uint32_t stream_increment) {
+// One write carries the connection frame, then the stream frame; a zero
+// increment omits its frame (callers never pass two zeros).
+net::awaitable<void> SendWindowUpdates(AsyncStream& stream,
+                                       uint32_t conn_increment,
+                                       uint32_t stream_id,
+                                       uint32_t stream_increment) {
     std::array<uint8_t, 26> frames{};
-    EncodeWindowUpdateFrame(frames.data(), 0, conn_increment);
-    EncodeWindowUpdateFrame(frames.data() + 13, stream_id, stream_increment);
-    const net::const_buffer buf = net::buffer(frames);
+    size_t size = 0;
+    if (conn_increment != 0) {
+        EncodeWindowUpdateFrame(frames.data(), 0, conn_increment);
+        size = 13;
+    }
+    if (stream_increment != 0) {
+        EncodeWindowUpdateFrame(frames.data() + size, stream_id, stream_increment);
+        size += 13;
+    }
+    const net::const_buffer buf = net::buffer(frames.data(), size);
     try {
         co_await stream.WriteBuffers(std::span<const net::const_buffer>(&buf, 1));
     } catch (...) {
@@ -1451,7 +1446,7 @@ private:
                                             stream_send_window_.Available()});
             if (credit == 0) {
                 lease.Reset();
-                co_await AdvanceFrames(writer_wake_, writer_waiting_);
+                co_await AdvanceFrames(writer_wake_);
                 continue;
             }
             const auto payload = cursor.Next(credit);
@@ -1481,7 +1476,7 @@ private:
     net::awaitable<bool> TakeReceivedData() {
         while (received_.empty()) {
             if (read_closed_ || input_done_) co_return false;
-            co_await AdvanceFrames(reader_wake_, reader_waiting_);
+            co_await AdvanceFrames(reader_wake_);
         }
         if (read_closed_) co_return false;
         AsyncWriteGate::Lease lease;
@@ -1500,11 +1495,11 @@ private:
         if (credit != 0) {
             // After END_STREAM the peer sends no more DATA on this stream.
             if (!input_done_) {
-                co_await SendDualWindowUpdate(*inner_, credit, stream_id_, credit);
+                co_await SendWindowUpdates(*inner_, credit, stream_id_, credit);
                 conn_recv_window_ += credit;
                 stream_recv_window_ += credit;
             } else {
-                co_await SendWindowUpdate(*inner_, 0, credit);
+                co_await SendWindowUpdates(*inner_, credit, stream_id_, 0);
                 conn_recv_window_ += credit;
             }
         }
@@ -1512,26 +1507,23 @@ private:
     }
 
     // Pumps one frame, or waits for the pump another operation is running.
-    net::awaitable<void> AdvanceFrames(std::optional<SignalChannel>& wake,
-                                       bool& waiting) {
+    // The channel lives in this frame; `waiter` publishes it only while
+    // suspended. Nothing suspends between the pumping_ check and publishing,
+    // so the pump cannot finish unseen.
+    net::awaitable<void> AdvanceFrames(SignalChannel*& waiter) {
         if (pump_failure_) std::rethrow_exception(pump_failure_);
         if (!pumping_) {
             co_await PumpFrame();
             co_return;
         }
         const uint64_t epoch = abort_epoch_;
-        if (!wake) wake.emplace(co_await net::this_coro::executor, 1);
-        else wake->reset();
-        waiting = true;
+        SignalChannel wake(co_await net::this_coro::executor, 1);
+        waiter = &wake;
         struct WaitScope {
-            SignalChannel& channel;
-            bool& waiting;
-            ~WaitScope() noexcept {
-                waiting = false;
-                channel.reset();
-            }
-        } scope{*wake, waiting};
-        auto [ec] = co_await wake->async_receive(net::as_tuple(net::use_awaitable));
+            SignalChannel*& waiter;
+            ~WaitScope() noexcept { waiter = nullptr; }
+        } scope{waiter};
+        auto [ec] = co_await wake.async_receive(net::as_tuple(net::use_awaitable));
         if (ec || epoch != abort_epoch_) {
             throw IoSystemError(io_error::operation_aborted, "HTTP/2 frame wait aborted");
         }
@@ -1587,11 +1579,11 @@ private:
     }
 
     void WakePumpWaiters() noexcept {
-        if (std::exchange(reader_waiting_, false) && reader_wake_) {
-            (void)reader_wake_->try_send(IoErrorCode{});
+        if (auto* wake = std::exchange(reader_wake_, nullptr)) {
+            (void)wake->try_send(IoErrorCode{});
         }
-        if (std::exchange(writer_waiting_, false) && writer_wake_) {
-            (void)writer_wake_->try_send(IoErrorCode{});
+        if (auto* wake = std::exchange(writer_wake_, nullptr)) {
+            (void)wake->try_send(IoErrorCode{});
         }
     }
 
@@ -1785,7 +1777,7 @@ private:
                 auto lease = write_gate_.TryAcquire();
                 if (!lease) lease = co_await AcquireWrite();
                 conn_recv_window_ += flow_len;
-                co_await SendWindowUpdate(*inner_, 0, static_cast<uint32_t>(flow_len));
+                co_await SendWindowUpdates(*inner_, static_cast<uint32_t>(flow_len), stream_id_, 0);
             }
             co_return;
         }
@@ -1803,9 +1795,9 @@ private:
                 conn_recv_window_ += flow_len;
                 if (!input_done_) {
                     stream_recv_window_ += flow_len;
-                    co_await SendDualWindowUpdate(*inner_, inc, stream_id_, inc);
+                    co_await SendWindowUpdates(*inner_, inc, stream_id_, inc);
                 } else {
-                    co_await SendWindowUpdate(*inner_, 0, inc);
+                    co_await SendWindowUpdates(*inner_, inc, stream_id_, 0);
                 }
             }
             co_return;
@@ -1936,15 +1928,14 @@ private:
     int64_t stream_recv_window_ = H2SendWindow::kDefault;
     uint32_t local_initial_window_ = H2SendWindow::kDefault;
     bool local_settings_acked_ = false;
-    // Frame pump: one reader of inner_ at a time; the other side waits on its
-    // own channel. Abort bumps the epoch so pending waits fail instead of
-    // re-checking a stream that Cancel()/Close() ended.
-    std::optional<SignalChannel> reader_wake_;
-    std::optional<SignalChannel> writer_wake_;
+    // Frame pump: one reader of inner_ at a time; the other side waits on a
+    // channel in its own frame, published here only while it waits (one
+    // reader and one writer at most). Abort bumps the epoch so pending waits
+    // fail instead of re-checking a stream that Cancel()/Close() ended.
+    SignalChannel* reader_wake_ = nullptr;
+    SignalChannel* writer_wake_ = nullptr;
     std::exception_ptr pump_failure_;
     uint64_t abort_epoch_ = 0;
-    bool reader_waiting_ = false;
-    bool writer_waiting_ = false;
     bool pumping_ = false;
     bool read_closed_ = false;
     bool write_closed_ = false;
@@ -1981,8 +1972,10 @@ public:
     }
 
     // Queues a received DATA payload. False asks the session to reset the
-    // stream: the per-stream or XHTTP session budget is exhausted.
-    bool EnqueueData(memory::ByteVector frame_payload, size_t offset, size_t size);
+    // stream: the per-stream or XHTTP session budget is exhausted. `session`
+    // is the demultiplexer delivering the frame.
+    bool EnqueueData(Http2ServerSession& session, memory::ByteVector frame_payload,
+                     size_t offset, size_t size);
     void CloseInput();
     void CancelFromSession(IoErrorCode error = io_error::operation_aborted) noexcept;
     [[nodiscard]] bool InputEnded() const noexcept { return input_done_ && !cancelled_; }
@@ -2041,14 +2034,17 @@ private:
     net::awaitable<bool> EnsureHunkPayload();
     net::awaitable<bool> WaitForDataFrame();
     [[nodiscard]] size_t ConsumeReadablePayload(net::mutable_buffer buffer) noexcept;
-    void PopFrontDataFrame() noexcept;
+    // `session` is the caller's lock of session_ for the current synchronous
+    // step; null when the session is gone.
+    void PopFrontDataFrame(Http2ServerSession* session) noexcept;
     void DropQueuedData() noexcept;
-    void ConsumeData(size_t size) noexcept;
-    void ReleaseDecoderStorage() noexcept;
+    void ConsumeData(Http2ServerSession* session, size_t size) noexcept;
+    void ReleaseDecoderStorage(Http2ServerSession* session) noexcept;
     [[nodiscard]] std::shared_ptr<Http2ServerSession> LockWritableSession() const;
 
     SignalChannel input_signal_;
-    std::optional<SignalChannel> owner_signal_;
+    // JoinOwner's frame-local channel, published only while it waits.
+    SignalChannel* owner_signal_ = nullptr;
     std::optional<SignalChannel> credit_signal_;
     H2SendWindow send_window_;
     int64_t receive_window_ = H2SendWindow::kDefault;
@@ -2265,13 +2261,15 @@ public:
     }
     // No per-frame task queue: consumption coalesces into a single writer.
     // Discarded input returns connection credit too, but never resurrects a
-    // reset/half-closed stream's receive window (RFC 9113 6.9).
-    void ReturnReceiveCredit(uint32_t stream_id, size_t size) noexcept {
+    // reset/half-closed stream's receive window (RFC 9113 6.9). `sub` is null
+    // for connection-only credit. A state leaves streams_ only through
+    // CancelFromSession, so AcceptsData() alone stands for "open in streams_".
+    // May CancelAll, which can drop the session's last reference to `sub`.
+    void ReturnReceiveCredit(Http2ServerSubStreamState* sub, size_t size) noexcept {
         if (size == 0 || cancelled_) return;
         consumed_connection_credit_ += static_cast<uint32_t>(size);
-        if (auto it = streams_.find(stream_id);
-            it != streams_.end() && it->second->AcceptsData()) {
-            it->second->ConsumedCredit() += static_cast<uint32_t>(size);
+        if (sub && sub->AcceptsData()) {
+            sub->ConsumedCredit() += static_cast<uint32_t>(size);
         }
         if (credit_flush_running_) return;
         credit_flush_running_ = true;
@@ -2435,6 +2433,23 @@ public:
                     throw IoSystemError(io_error::connection_reset, "HTTP/2 missing END_STREAM");
                 }
 
+                // DATA, the dominant frame, is accounted synchronously; only
+                // fault reporting suspends.
+                if (frame->type == H2FrameType::DATA) {
+                    if (!IsKnownClientStream(frame->stream_id)) {
+                        (void)co_await FailConnection(H2Error::Protocol);
+                        break;
+                    }
+                    if (const auto fault = ReceiveData(*frame)) {
+                        if (fault->connection) {
+                            (void)co_await FailConnection(fault->error);
+                        } else if (!co_await ResetStream(frame->stream_id, fault->error) &&
+                                   fault->error == H2Error::ExcessiveLoad) {
+                            CancelAll();
+                        }
+                    }
+                    continue;
+                }
                 if (!co_await DispatchFrame(std::move(*frame))) break;
             }
         } catch (const IoSystemError& error) {
@@ -2478,14 +2493,8 @@ private:
                     }
                 }
                 if (conn_increment == 0 && stream_increment == 0) break;
-                if (conn_increment != 0 && stream_increment != 0) {
-                    co_await SendDualWindowUpdate(
-                        *stream_, conn_increment, target_stream_id, stream_increment);
-                } else {
-                    const uint32_t id = stream_increment != 0 ? target_stream_id : 0;
-                    const uint32_t inc = stream_increment != 0 ? stream_increment : conn_increment;
-                    co_await SendWindowUpdate(*stream_, id, inc);
-                }
+                co_await SendWindowUpdates(
+                    *stream_, conn_increment, target_stream_id, stream_increment);
                 if (!more_streams && consumed_connection_credit_ == 0) break;
             }
         } catch (...) {
@@ -2614,7 +2623,8 @@ private:
         return stream_id != 0 && (stream_id & 1u) != 0 && stream_id <= last_remote_stream_id_;
     }
 
-    // Returns false once the connection must stop reading.
+    // Non-DATA frames (RunReadLoop accounts DATA itself). Returns false once
+    // the connection must stop reading.
     net::awaitable<bool> DispatchFrame(H2Frame frame) {
         switch (frame.type) {
         case H2FrameType::SETTINGS:
@@ -2662,19 +2672,6 @@ private:
             if (exhausted) co_return co_await ResetStream(id, H2Error::RefusedStream);
             co_return false;
         }
-        case H2FrameType::DATA:
-            if (!IsKnownClientStream(frame.stream_id)) {
-                co_return co_await FailConnection(H2Error::Protocol);
-            }
-            if (const auto fault = ReceiveData(frame)) {
-                if (fault->connection) {
-                    (void)co_await FailConnection(fault->error);
-                } else if (!co_await ResetStream(frame.stream_id, fault->error) &&
-                           fault->error == H2Error::ExcessiveLoad) {
-                    CancelAll();
-                }
-            }
-            break;
         case H2FrameType::PRIORITY:
             if (frame.stream_id == 0) co_return co_await FailConnection(H2Error::Protocol);
             if (frame.payload.size() != 5) co_return co_await FailConnection(H2Error::FrameSize);
@@ -3019,26 +3016,28 @@ private:
         connection_receive_window_ -= static_cast<int64_t>(flow_size);
         auto it = streams_.find(frame.stream_id);
         if (it == streams_.end()) {
-            ReturnReceiveCredit(0, flow_size);
+            ReturnReceiveCredit(nullptr, flow_size);
             return std::nullopt;
         }
-        const auto sub = it->second;
-        if (flow_size != 0 && static_cast<int64_t>(flow_size) > sub->ReceiveWindow()) {
-            ReturnReceiveCredit(0, flow_size);
+        // Borrowed from streams_: every ReturnReceiveCredit below may CancelAll
+        // and destroy the state, so each one is the last use of `sub`.
+        auto& sub = *it->second;
+        if (flow_size != 0 && static_cast<int64_t>(flow_size) > sub.ReceiveWindow()) {
+            ReturnReceiveCredit(nullptr, flow_size);
             return DataFault{H2Error::FlowControl, false};
         }
-        sub->ReceiveWindow() -= static_cast<int64_t>(flow_size);
-        if (sub->InputEnded()) {
-            ReturnReceiveCredit(0, flow_size);
+        sub.ReceiveWindow() -= static_cast<int64_t>(flow_size);
+        if (sub.InputEnded()) {
+            ReturnReceiveCredit(nullptr, flow_size);
             return DataFault{H2Error::StreamClosed, false};
         }
         if ((frame.flags & kFlagPadded) != 0 &&
             (frame.payload.empty() || frame.payload.front() >= frame.payload.size())) {
             return DataFault{H2Error::Protocol, true};
         }
-        if (!sub->AcceptsData()) {
-            if ((frame.flags & kFlagEndStream) != 0) sub->CloseInput();
-            ReturnReceiveCredit(0, flow_size);
+        if (!sub.AcceptsData()) {
+            if ((frame.flags & kFlagEndStream) != 0) sub.CloseInput();
+            ReturnReceiveCredit(nullptr, flow_size);
             return std::nullopt;
         }
         const auto data = H2DataPayload(frame);
@@ -3048,19 +3047,19 @@ private:
         bool queued = data_size == 0;
         try {
             if (data_size != 0) {
-                queued = sub->EnqueueData(std::move(frame.payload), offset, data_size);
+                queued = sub.EnqueueData(*this, std::move(frame.payload), offset, data_size);
             }
         } catch (const std::bad_alloc&) {
             queued = false;
         }
         if (!queued) {
-            ReturnReceiveCredit(0, flow_size);
+            ReturnReceiveCredit(nullptr, flow_size);
             return DataFault{H2Error::ExcessiveLoad, false};
         }
-        if ((frame.flags & kFlagEndStream) != 0) sub->CloseInput();
+        if ((frame.flags & kFlagEndStream) != 0) sub.CloseInput();
         // Padding is consumed by the framing layer; body credit belongs to the
         // logical reader, not to this demultiplexer.
-        ReturnReceiveCredit(frame.stream_id, flow_size - data_size);
+        ReturnReceiveCredit(&sub, flow_size - data_size);
         return std::nullopt;
     }
 
@@ -3097,17 +3096,27 @@ private:
     bool credit_flush_running_ = false;
 };
 
+// The release signal lives in this frame and is published only while it
+// exists. ReleaseOwner sets owner_released_ before signalling, and nothing
+// suspends between checking it and receiving, so no release goes unseen.
 net::awaitable<void> Http2ServerSubStreamState::JoinOwner(
     std::shared_ptr<Http2ServerSubStreamState> state,
     std::shared_ptr<XHttpPacketUpSession> upload_session) {
+    std::optional<SignalChannel> owner_signal;
+    struct Unpublish {
+        SignalChannel*& published;
+        ~Unpublish() noexcept { published = nullptr; }
+    } unpublish{state->owner_signal_};
+    const auto wait_owner = [&] {
+        if (!owner_signal) {
+            owner_signal.emplace(state->input_signal_.get_executor(), 1);
+            state->owner_signal_ = &*owner_signal;
+        }
+        return owner_signal->async_receive(net::use_awaitable);
+    };
     bool cancelled = false;
     try {
-        if (!state->owner_released_) {
-            if (!state->owner_signal_) {
-                state->owner_signal_.emplace(state->input_signal_.get_executor(), 1);
-            }
-            co_await state->owner_signal_->async_receive(net::use_awaitable);
-        }
+        if (!state->owner_released_) co_await wait_owner();
     } catch (...) {
         cancelled = true;
         if (upload_session) upload_session->Close();
@@ -3115,12 +3124,7 @@ net::awaitable<void> Http2ServerSubStreamState::JoinOwner(
     }
     if (cancelled) {
         co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
-        if (!state->owner_released_) {
-            if (!state->owner_signal_) {
-                state->owner_signal_.emplace(state->input_signal_.get_executor(), 1);
-            }
-            co_await state->owner_signal_->async_receive(net::use_awaitable);
-        }
+        if (!state->owner_released_) co_await wait_owner();
     }
 }
 
@@ -3148,6 +3152,7 @@ net::awaitable<void> Http2ServerSubStreamState::WaitSendCredit() {
 }
 
 bool Http2ServerSubStreamState::EnqueueData(
+    Http2ServerSession& session,
     memory::ByteVector frame_payload,
     size_t offset,
     size_t size) {
@@ -3172,12 +3177,11 @@ bool Http2ServerSubStreamState::EnqueueData(
     }
     if (frame_payload.capacity() < buf::Buffer::kSize) frame_payload.reserve(buf::Buffer::kSize);
     const size_t storage = frame_payload.capacity();
-    const auto session = LockSession();
-    if (!session || storage > kHttp2MaxQueuedStreamStorage - queued_storage_ ||
-        !session->ReserveReceiveMemory(storage)) return false;
+    if (storage > kHttp2MaxQueuedStreamStorage - queued_storage_ ||
+        !session.ReserveReceiveMemory(storage)) return false;
     const auto upload_budget = upload_budget_.lock();
     if (upload_budget && !upload_budget->Reserve(storage)) {
-        session->ReleaseReceiveMemory(storage);
+        session.ReleaseReceiveMemory(storage);
         return false;
     }
     try {
@@ -3187,7 +3191,7 @@ bool Http2ServerSubStreamState::EnqueueData(
             .end = offset + size,
         });
     } catch (...) {
-        session->ReleaseReceiveMemory(storage);
+        session.ReleaseReceiveMemory(storage);
         if (upload_budget) upload_budget->Release(storage);
         throw;
     }
@@ -3409,11 +3413,11 @@ net::awaitable<void> Http2ServerSubStreamState::AsyncShutdownWrite() {
     }
 }
 
-void Http2ServerSubStreamState::PopFrontDataFrame() noexcept {
+void Http2ServerSubStreamState::PopFrontDataFrame(Http2ServerSession* session) noexcept {
     const auto& front = data_frames_.front();
     const size_t storage = front.payload.capacity();
     queued_storage_ -= storage;
-    if (auto session = LockSession()) session->ReleaseReceiveMemory(storage);
+    if (session) session->ReleaseReceiveMemory(storage);
     if (upload_reserved_ != 0) {
         if (auto budget = upload_budget_.lock()) {
             budget->Release(storage);
@@ -3435,22 +3439,21 @@ void Http2ServerSubStreamState::DropQueuedData() noexcept {
     upload_budget_.reset();
     data_frames_.clear();
     read_offset_ = 0;
-    ReleaseDecoderStorage();
-    if (auto session = LockSession()) {
+    const auto session = LockSession();
+    ReleaseDecoderStorage(session.get());
+    if (session) {
         session->ReleaseReceiveMemory(std::exchange(queued_storage_, 0));
-        session->ReturnReceiveCredit(0, discarded);
+        session->ReturnReceiveCredit(nullptr, discarded);
     }
 }
 
-void Http2ServerSubStreamState::ConsumeData(size_t size) noexcept {
+void Http2ServerSubStreamState::ConsumeData(Http2ServerSession* session, size_t size) noexcept {
     queued_bytes_ -= size;
-    if (auto session = LockSession()) session->ReturnReceiveCredit(stream_id_, size);
+    if (session) session->ReturnReceiveCredit(this, size);
 }
 
-void Http2ServerSubStreamState::ReleaseDecoderStorage() noexcept {
-    if (auto session = LockSession()) {
-        session->ReleaseReceiveMemory(std::exchange(decoder_reserved_, 0));
-    }
+void Http2ServerSubStreamState::ReleaseDecoderStorage(Http2ServerSession* session) noexcept {
+    if (session) session->ReleaseReceiveMemory(std::exchange(decoder_reserved_, 0));
 }
 
 bool Http2ServerSubStreamState::FrontDataReady() noexcept {
@@ -3462,7 +3465,7 @@ bool Http2ServerSubStreamState::FrontDataReady() noexcept {
         if (read_offset_ < front.end) {
             return true;
         }
-        PopFrontDataFrame();
+        PopFrontDataFrame(LockSession().get());
     }
     return false;
 }
@@ -3503,7 +3506,7 @@ net::awaitable<bool> Http2ServerSubStreamState::EnsureHunkPayload() {
     while (hunk_.Payload().empty()) {
         if (!co_await WaitForDataFrame()) {
             if (!hunk_.AtMessageBoundary()) {
-                ReleaseDecoderStorage();
+                ReleaseDecoderStorage(LockSession().get());
                 AbortLocal();
                 ThrowHttp2StreamError("truncated gRPC message");
             }
@@ -3529,7 +3532,7 @@ net::awaitable<bool> Http2ServerSubStreamState::EnsureHunkPayload() {
         decoder_reserved_ += reserve;
         const auto consumed = hunk_.Feed(bytes);
         if (!consumed) {
-            ReleaseDecoderStorage();
+            ReleaseDecoderStorage(session.get());
             AbortLocal();
             ThrowHttp2StreamError(consumed.error().data());
         }
@@ -3537,9 +3540,11 @@ net::awaitable<bool> Http2ServerSubStreamState::EnsureHunkPayload() {
         session->ReleaseReceiveMemory(unused_reservation);
         decoder_reserved_ -= unused_reservation;
         read_offset_ += *consumed;
-        if (read_offset_ == front.end) PopFrontDataFrame();
-        if (hunk_.Payload().empty() && hunk_.AtMessageBoundary()) ReleaseDecoderStorage();
-        ConsumeData(*consumed);
+        if (read_offset_ == front.end) PopFrontDataFrame(session.get());
+        if (hunk_.Payload().empty() && hunk_.AtMessageBoundary()) {
+            ReleaseDecoderStorage(session.get());
+        }
+        ConsumeData(session.get(), *consumed);
     }
     co_return true;
 }
@@ -3549,21 +3554,22 @@ size_t Http2ServerSubStreamState::ConsumeReadablePayload(
     auto* out = static_cast<uint8_t*>(buffer.data());
     const size_t capacity = buffer.size();
     if (payload_codec_ == H2PayloadCodec::RawData) {
+        const auto session = LockSession();
         const auto& front = data_frames_.front();
         const size_t n = std::min(capacity, front.end - read_offset_);
         std::memcpy(out, front.payload.data() + read_offset_, n);
         read_offset_ += n;
         if (read_offset_ == front.end) {
-            PopFrontDataFrame();
+            PopFrontDataFrame(session.get());
         }
-        ConsumeData(n);
+        ConsumeData(session.get(), n);
         return n;
     }
     const auto payload = hunk_.Payload();
     const size_t n = std::min(capacity, payload.size());
     std::memcpy(out, payload.data(), n);
     hunk_.Consume(n);
-    if (hunk_.Payload().empty()) ReleaseDecoderStorage();
+    if (hunk_.Payload().empty()) ReleaseDecoderStorage(LockSession().get());
     return n;
 }
 

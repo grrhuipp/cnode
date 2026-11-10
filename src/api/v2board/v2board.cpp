@@ -135,6 +135,24 @@ WriteRequestAndReadResponse(Stream& stream, std::string_view request) {
     co_return co_await http::ReadResponse(stream);
 }
 
+// 同进程的 HTTPS 面板客户端共享一份只读客户端 SSL_CTX（一份系统 CA store）。
+// SNI、主机名/IP 校验都设置在逐连接的 SSL 对象上；客户端会话不缓存在 ctx 中。
+// 仅在控制线程构造 APIClient 时调用；全部客户端释放后由下一次构造重建。
+std::shared_ptr<ssl::context> AcquireHttpsClientContext() {
+    static std::weak_ptr<ssl::context> shared;
+    if (auto context = shared.lock()) return context;
+    // Negotiate TLS 1.3 when the panel offers it; TLS 1.2 stays the floor
+    // (RFC 8996 deprecates TLS 1.0/1.1).
+    auto context = std::make_shared<ssl::context>(ssl::context::tls_client);
+    if (SSL_CTX_set_min_proto_version(context->native_handle(), TLS1_2_VERSION) != 1) {
+        throw std::runtime_error("V2Board: failed to set the HTTPS minimum TLS version");
+    }
+    context->set_default_verify_paths();
+    context->set_verify_mode(ssl::verify_peer);
+    shared = context;
+    return context;
+}
+
 }  // namespace
 
 // ============================================================================
@@ -196,7 +214,7 @@ private:
     std::string host_header_;
     ::app::dns::DNS& dns_service_;
 
-    std::unique_ptr<net::ssl::context> https_context_;
+    std::shared_ptr<ssl::context> https_context_;
 };
 
 APIClient::APIClient(net::io_context& io_context,
@@ -227,16 +245,7 @@ APIClient::APIClient(net::io_context& io_context,
     iputil::FormatHttpHostHeaderInto(
         host_header_, url_parts_.host, url_parts_.port, url_parts_.use_ssl);
 
-    if (url_parts_.use_ssl) {
-        // Negotiate TLS 1.3 when the panel offers it; TLS 1.2 stays the floor
-        // (RFC 8996 deprecates TLS 1.0/1.1).
-        https_context_ = std::make_unique<ssl::context>(ssl::context::tls_client);
-        if (SSL_CTX_set_min_proto_version(https_context_->native_handle(), TLS1_2_VERSION) != 1) {
-            throw std::runtime_error("V2Board: failed to set the HTTPS minimum TLS version");
-        }
-        https_context_->set_default_verify_paths();
-        https_context_->set_verify_mode(ssl::verify_peer);
-    }
+    if (url_parts_.use_ssl) https_context_ = AcquireHttpsClientContext();
 }
 
 net::awaitable<HttpResponse>

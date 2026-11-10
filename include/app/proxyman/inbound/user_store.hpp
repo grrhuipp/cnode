@@ -192,14 +192,21 @@ public:
         }
     };
 
-    struct TrojanCredential {
+    // Keyed credentials keep only what authentication reads afterwards; the
+    // credential key itself lives once, as the owning map's key.
+    struct ProfileCredential {
         Profile profile;
     };
 
-    using VlessCredential = PreparedVlessUser;
+    struct VlessCredential {
+        std::string flow;
+        Profile profile;
+    };
+
+    using TrojanCredential = ProfileCredential;
     using ShadowsocksCredential = PreparedShadowsocksUser;
-    using AnyTlsCredential = PreparedAnyTlsUser;
-    using HysteriaCredential = PreparedHysteriaUser;
+    using AnyTlsCredential = ProfileCredential;
+    using HysteriaCredential = ProfileCredential;
 
     using VmessUserMap = std::vector<VmessCredential>;
     using TrojanUserMap =

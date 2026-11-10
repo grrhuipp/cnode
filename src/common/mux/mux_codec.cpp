@@ -364,7 +364,6 @@ struct MuxReply {
     bool is_error = false;   // END carries OptionError (child refused)
     bool dispatch_done = false;
     bool is_udp = false;     // true → EncodeKeepUDP（带源地址）
-    std::optional<TargetAddress> udp_src;   // UDP 源地址（is_udp == true 时有效）
     buf::MultiBuffer payload;
 
     [[nodiscard]] size_t PayloadSize() const noexcept {
@@ -1049,8 +1048,7 @@ public:
         reply.session_id = session_id_;
         reply.is_end = false;
         reply.is_udp = true;
-        reply.udp_src = *datagram.target;
-        mb.MoveTo(reply.payload, true);
+        mb.MoveTo(reply.payload);
         reply_queue_.PushUdpPrepared(
             std::move(reply), datagram.payload_size + kMuxReplyOverhead);
         co_return;
@@ -1080,8 +1078,13 @@ net::awaitable<void> RunSubDispatch(
 
     try {
         // Held for the child's lifetime; a refusal ends only this child.
-        const auto admission =
-            co_await proxy::AdmitInboundSubstream(limiter, stats, sub->ctx);
+        std::optional<proxy::InboundSubstreamAdmission> admission;
+        if (proxy::SubstreamAdmissionTracked(limiter)) {
+            if (auto tracked = co_await proxy::AdmitInboundSubstream(limiter, stats, sub->ctx))
+                admission.emplace(std::move(*tracked));
+        } else {
+            admission.emplace(ConnectionStatsScope(stats), ConnectionLimiter::Reservation{});
+        }
         if (!admission) {
             sub->Reject();
         } else {
@@ -1251,15 +1254,19 @@ net::awaitable<RelayResult> ProcessInbound(
                 std::array<uint8_t, 2 + 4 + 1 + kMaxBaseEncodedAddressSize + 2> write_frame{};
                 size_t header_len = 0;
                 if (reply.is_udp) {
-                    header_len = mux::EncodeKeepUDPHeaderTo(
+                    // 入队前已校验整份 datagram 带同一合法目标；队列不改写 Buffer 标签。
+                    const auto datagram = buf::InspectUdpDatagram(reply.payload);
+                    header_len = datagram.target == nullptr ? 0 : mux::EncodeKeepUDPHeaderTo(
                         write_frame,
                         reply.session_id,
-                        *reply.udp_src,
+                        *datagram.target,
                         payload_size);
                     if (header_len == 0) {
                         LOG_CONN_DEBUG(parent_ctx,
                             "UDP reply header encode failed sid={} src={} payload={}B",
-                            reply.session_id, *reply.udp_src, payload_size);
+                            reply.session_id,
+                            datagram.target ? *datagram.target : TargetAddress{},
+                            payload_size);
                         reply.payload.clear();
                         co_return true;
                     }

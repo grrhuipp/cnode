@@ -457,7 +457,13 @@ WriteTCPRequest(const TargetAddress& target,
                 AsyncStream& stream,
                 ForwardedMetadataView forwarded = {});
 
-[[nodiscard]] net::awaitable<tl::expected<detail::BodyReader, ErrorCode>>
+// 2022 固定响应头可携带首段载荷；它在 reader 之前交付，reader 只负责后续记录。
+struct ReadTCPResponseResult {
+    detail::BodyReader reader;
+    buf::MultiBuffer initial_payload;
+};
+
+[[nodiscard]] net::awaitable<tl::expected<ReadTCPResponseResult, ErrorCode>>
 ReadTCPResponse(const SsCipherInfo& cipher_info,
                 const KeyBytes& master_key,
                 const KeyBytes& request_salt,

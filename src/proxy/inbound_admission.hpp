@@ -119,7 +119,7 @@ inline void BindInboundRequestTarget(
         ctx.inbound.ApplyForwardedMetadata(*request.forwarded);
     }
     ctx.content.network = request.network;
-    ctx.outbound.original_target = request.target;
+    ctx.outbound.original_target = {};
     ctx.outbound.target = std::move(request.target);
     ctx.outbound.route_target = {};
 }
@@ -238,6 +238,13 @@ private:
     ConnectionStatsScope connection_stats_;
     ConnectionLimiter::Reservation reservation_;
 };
+
+// Admission tracking off: callers build InboundSubstreamAdmission directly
+// instead of entering the AdmitInboundSubstream coroutine.
+[[nodiscard]] inline bool SubstreamAdmissionTracked(
+    const ConnectionLimiter* limiter) noexcept {
+    return limiter && limiter->TracksAdmission();
+}
 
 // The single substream admission entry. `ctx` is the child context inherited
 // from the session (InitSubstreamFrom), carrying the physical family lease.

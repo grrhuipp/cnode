@@ -503,7 +503,13 @@ net::awaitable<ErrorCode> AnyTLSDemuxSession::ProcessStream(
     AnyTLSSubStream& sub, std::chrono::steady_clock::time_point opened_at) {
     session::Context& ctx = sub.ctx;
     // Held for the stream's lifetime; a refusal ends only this stream.
-    const auto admission = co_await proxy::AdmitInboundSubstream(limiter_, stats_, ctx);
+    std::optional<proxy::InboundSubstreamAdmission> admission;
+    if (proxy::SubstreamAdmissionTracked(limiter_)) {
+        if (auto tracked = co_await proxy::AdmitInboundSubstream(limiter_, stats_, ctx))
+            admission.emplace(std::move(*tracked));
+    } else {
+        admission.emplace(ConnectionStatsScope(stats_), ConnectionLimiter::Reservation{});
+    }
     if (!admission) {
         if (session_version_ == anytls::SessionVersion::V2) {
             constexpr std::string_view message = "connection rejected";

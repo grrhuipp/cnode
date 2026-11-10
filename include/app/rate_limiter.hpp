@@ -21,6 +21,9 @@ struct ConnectionFamily;
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
+#include <new>
+#include <sys/mman.h>
 #include <openssl/crypto.h>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
@@ -120,12 +123,12 @@ public:
 
     explicit ConnectionLimiterCore(const RateLimitConfig& cfg)
         : cfg_(cfg),
-          connections_(cfg.max_conn_per_ip ? std::make_unique<ConnectionSlots>() : nullptr),
-          ip_failures_(cfg.ip_ban.enabled ? std::make_unique<FailureTable>() : nullptr),
+          connections_(cfg.max_conn_per_ip ? MapZeroed<ConnectionSlots>() : nullptr),
+          ip_failures_(cfg.ip_ban.enabled ? MapZeroed<FailureTable>() : nullptr),
           ip_fingerprint_(cfg.ip_ban.enabled
               ? std::optional<auth_limit_detail::Fingerprint>(std::in_place, false)
               : std::nullopt),
-          credential_failures_(std::make_unique<FailureTable>()) {}
+          credential_failures_(MapZeroed<FailureTable>()) {}
 
     [[nodiscard]] bool TracksGlobalConnections() const noexcept {
         return cfg_.max_connections > 0;
@@ -251,16 +254,17 @@ private:
         return hash;
     }
 
+    // 以下表项类型的全零字节即空状态：大表直接承载于匿名零页映射，不再逐字节清零。
     struct ConnectionSlot {
-        uint64_t hash = 0;
-        uint32_t conns = 0;
+        uint64_t hash;
+        uint32_t conns;
     };
     using ConnectionSlots = std::array<ConnectionSlot, kSlotCount>;
 
     struct FailureCounter {
-        uint64_t window_start = 0;
-        uint64_t ban_until = 0;
-        uint32_t failures = 0;
+        uint64_t window_start;
+        uint64_t ban_until;
+        uint32_t failures;
 
         [[nodiscard]] bool Banned(uint64_t now) const noexcept { return now < ban_until; }
         [[nodiscard]] bool Expired(
@@ -287,9 +291,9 @@ private:
     // 探测范围没有可用槽时，未知键查询返回 TRACKING_CAPACITY（fail closed）。
     class FailureTable {
         struct Slot {
-            AuthCredentialKey key{};
+            AuthCredentialKey key;
             FailureCounter counter;
-            bool occupied = false;
+            bool occupied;
         };
         [[nodiscard]] static size_t Index(const AuthCredentialKey& key) noexcept {
             uint64_t hash;
@@ -334,8 +338,26 @@ private:
             reusable->counter.Record(config, now);
         }
     private:
-        std::array<Slot, kSlotCount> slots_{};
+        std::array<Slot, kSlotCount> slots_;
     };
+
+    // 匿名映射按需缺页：未触及的槽只映射内核零页，构造开销与表大小无关。
+    template <class Table>
+    struct UnmapTable {
+        void operator()(Table* table) const noexcept { ::munmap(table, sizeof(Table)); }
+    };
+    template <class Table>
+    using ZeroMappedTable = std::unique_ptr<Table, UnmapTable<Table>>;
+    template <class Table>
+    [[nodiscard]] static ZeroMappedTable<Table> MapZeroed() {
+        static_assert(std::is_trivially_default_constructible_v<Table> &&
+                      std::is_trivially_destructible_v<Table>);
+        void* memory = ::mmap(nullptr, sizeof(Table), PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (memory == MAP_FAILED) throw std::bad_alloc();
+        // 平凡隐式生存期类型：映射提供的全零存储即其默认空状态。
+        return ZeroMappedTable<Table>(static_cast<Table*>(memory));
+    }
 
     [[nodiscard]] ConnectionSlot* FindOrCreateConnection(uint64_t hash) noexcept {
         const size_t index = hash & kMask;
@@ -356,10 +378,10 @@ private:
 
     const RateLimitConfig cfg_;
     uint32_t total_ = 0;
-    std::unique_ptr<ConnectionSlots> connections_;
-    std::unique_ptr<FailureTable> ip_failures_;
+    ZeroMappedTable<ConnectionSlots> connections_;
+    ZeroMappedTable<FailureTable> ip_failures_;
     const std::optional<auth_limit_detail::Fingerprint> ip_fingerprint_;
-    std::unique_ptr<FailureTable> credential_failures_;
+    ZeroMappedTable<FailureTable> credential_failures_;
 };
 
 // Lease shared by one physical connection and its logical children; carried in

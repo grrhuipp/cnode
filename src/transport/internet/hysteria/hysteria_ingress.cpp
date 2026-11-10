@@ -204,7 +204,6 @@ int SelectAlpn(SSL*, const uint8_t** out, uint8_t* outlen,
         return {};
     }
     SSL_CTX_set_min_proto_version(context.get(), TLS1_3_VERSION);
-    SSL_CTX_set_mode(context.get(), SSL_MODE_RELEASE_BUFFERS);
     static constexpr std::string_view kV1Alpn = "hysteria";
     static constexpr std::string_view kV2Alpn = "h3";
     auto* alpn = const_cast<std::string_view*>(

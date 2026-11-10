@@ -53,6 +53,8 @@ struct SsCipherInfo {
 [[nodiscard]] bool Is2022Cipher(SsCipherType type) noexcept;
 [[nodiscard]] bool Is2022AesCipher(SsCipherType type) noexcept;
 [[nodiscard]] SsCipherType BaseCipherType(SsCipherType type) noexcept;
+// TCP 流与 UDP 包共用的 2022/legacy → BoringSSL AEAD 映射；未知类型返回 nullptr。
+[[nodiscard]] const EVP_AEAD* AeadAlgorithm(SsCipherType type) noexcept;
 
 // ============================================================================
 // 密钥派生
@@ -322,9 +324,9 @@ ReadAndDecryptStreamPayload(
 class BodyReader final : public transport::MultiBufferReader {
 public:
     BodyReader(SsAeadCipher cipher, uint64_t nonce, transport::MultiBufferReader& stream,
-               size_t max_payload = kMaxChunkPayload, buf::MultiBuffer pending = {})
+               size_t max_payload = kMaxChunkPayload)
         : cipher_(std::move(cipher)), nonce_(nonce), stream_(&stream),
-          max_payload_(max_payload), plaintext_(std::move(pending)) {}
+          max_payload_(max_payload) {}
 
     BodyReader(const BodyReader&) = delete;
     BodyReader& operator=(const BodyReader&) = delete;
@@ -335,7 +337,6 @@ public:
     transport::EofAction ReadEofAction() const noexcept override { return stream_->ReadEofAction(); }
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
         if (failure_) std::rethrow_exception(failure_);
-        if (plaintext_.byte_size() != 0) co_return std::move(plaintext_);
         for (;;) {
             try {
                 auto record = DecodePending();
@@ -362,7 +363,6 @@ private:
     // Call only from a catch handler: latches and rethrows the active exception.
     [[noreturn]] void Fail() {
         ciphertext_.clear();
-        plaintext_.clear();
         failure_ = std::current_exception();
         throw;
     }
@@ -404,7 +404,6 @@ private:
     uint64_t nonce_;
     transport::MultiBufferReader* stream_ = nullptr;
     size_t max_payload_;
-    buf::MultiBuffer plaintext_;
     buf::MultiBuffer ciphertext_;
     std::optional<size_t> length_;
     std::exception_ptr failure_;

@@ -219,6 +219,8 @@ void VerifySocketIdentityRecycle(
     ::TimeoutsConfig timeouts;
     ReplySink reply_sink;
     auto receiver = MakeReceiver();
+    const ::app::DatagramSessionEnvironment environment{
+        .timeouts = timeouts, .dispatcher = &dispatcher, .stats = &stats};
     constexpr std::array<uint8_t, 1> packet{0x62};
     auto process = [&](const Ingress::SocketPtr& current) {
         ingress.ProcessDatagram(::worker_detail::UdpDatagramContext{
@@ -228,11 +230,9 @@ void VerifySocketIdentityRecycle(
             .payload = packet,
             .receiver = &receiver,
             .io_context = io,
-            .dispatcher = &dispatcher,
-            .stats = stats,
-            .timeouts = timeouts,
             .worker_id = 6,
             .reply_sink = reply_sink,
+            .environment = environment,
         });
     };
     process(old_socket);
@@ -314,6 +314,8 @@ void VerifyUplinkRefresh(::net::io_context& io, Reclaimer& reclaimer) {
     timeouts.idle = 1;
     ReplySink reply_sink;
     auto receiver = MakeReceiver();
+    const ::app::DatagramSessionEnvironment environment{
+        .timeouts = timeouts, .dispatcher = &dispatcher, .stats = &stats};
     constexpr std::array<uint8_t, 1> packet{0x62};
     auto process_packet = [&]() {
         ingress.ProcessDatagram(::worker_detail::UdpDatagramContext{
@@ -323,11 +325,9 @@ void VerifyUplinkRefresh(::net::io_context& io, Reclaimer& reclaimer) {
             .payload = packet,
             .receiver = &receiver,
             .io_context = io,
-            .dispatcher = &dispatcher,
-            .stats = stats,
-            .timeouts = timeouts,
             .worker_id = 4,
             .reply_sink = reply_sink,
+            .environment = environment,
         });
     };
     process_packet();
@@ -651,6 +651,8 @@ TEST(UdpNativeLifecycle, Contract) {
     ::TimeoutsConfig timeouts;
     ReplySink reply_sink;
     auto receiver = MakeReceiver();
+    const ::app::DatagramSessionEnvironment environment{
+        .timeouts = timeouts, .dispatcher = &dispatcher, .stats = &stats};
     constexpr std::array<uint8_t, 1> datagram{0x62};
     ingress.ProcessDatagram(::worker_detail::UdpDatagramContext{
         .socket_key = "native-socket",
@@ -659,11 +661,9 @@ TEST(UdpNativeLifecycle, Contract) {
         .payload = datagram,
         .receiver = &receiver,
         .io_context = io,
-        .dispatcher = &dispatcher,
-        .stats = stats,
-        .timeouts = timeouts,
         .worker_id = 3,
         .reply_sink = reply_sink,
+        .environment = environment,
     });
     constexpr std::array<uint8_t, 1> second_datagram{0x63};
     ingress.ProcessDatagram(::worker_detail::UdpDatagramContext{
@@ -673,11 +673,9 @@ TEST(UdpNativeLifecycle, Contract) {
         .payload = second_datagram,
         .receiver = &receiver,
         .io_context = io,
-        .dispatcher = &dispatcher,
-        .stats = stats,
-        .timeouts = timeouts,
         .worker_id = 3,
         .reply_sink = reply_sink,
+        .environment = environment,
     });
     receiver.inbound_tag.assign(256, 'x');
     receiver.inbound_tags.front().assign(256, 'y');
@@ -708,11 +706,9 @@ TEST(UdpNativeLifecycle, Contract) {
         .payload = datagram,
         .receiver = &receiver,
         .io_context = io,
-        .dispatcher = &dispatcher,
-        .stats = stats,
-        .timeouts = timeouts,
         .worker_id = 3,
         .reply_sink = reply_sink,
+        .environment = environment,
     });
     const auto replaced = ingress.GetResourceStats();
     if (!session_a || !session_b || session_a == session_b ||

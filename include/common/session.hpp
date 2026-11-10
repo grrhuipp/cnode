@@ -147,6 +147,7 @@ using ClientIpSource = Inbound::ClientIpSource;
 
 // xray-core common/session.Outbound 对应的出站目标/路由元数据。
 struct Outbound {
+    // 仅当嗅探改写了 target 时保存改写前的请求目标；否则为空（与 target 相同）。
     TargetAddress original_target;
     TargetAddress target;
     TargetAddress route_target;

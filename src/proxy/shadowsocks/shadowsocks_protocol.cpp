@@ -312,15 +312,13 @@ bool DeriveSubkey(const uint8_t* key, size_t key_size,
 // ============================================================================
 // SsAeadCipher
 // ============================================================================
-namespace {
-const EVP_AEAD* GetCipher(SsCipherType type) noexcept {
+const EVP_AEAD* AeadAlgorithm(SsCipherType type) noexcept {
     switch (BaseCipherType(type)) {
         case SsCipherType::AES_128_GCM: return EVP_aead_aes_128_gcm();
         case SsCipherType::AES_256_GCM: return EVP_aead_aes_256_gcm();
         case SsCipherType::CHACHA20_POLY1305: return EVP_aead_chacha20_poly1305();
         default: return nullptr;
     }
-}
 }
 
 SsAeadCipher::SsAeadCipher(SsCipherType type, proxy::AeadDirection direction)
@@ -338,7 +336,7 @@ SsAeadCipher::SsAeadCipher(SsCipherType type, const uint8_t* key, size_t key_siz
 
 bool SsAeadCipher::ResetKey(const uint8_t* key, size_t key_size) {
     const auto configure = [&](auto& context) {
-        return context.Configure(GetCipher(type_),
+        return context.Configure(AeadAlgorithm(type_),
                                   key ? std::span<const uint8_t>(key, key_size) : std::span<const uint8_t>{});
     };
     return std::visit(configure, context_);

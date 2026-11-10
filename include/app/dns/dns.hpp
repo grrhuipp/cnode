@@ -70,9 +70,7 @@ public:
         : capacity_(max_size)
         , min_ttl_(std::min(min_ttl, max_ttl))
         , max_ttl_(std::max(min_ttl, max_ttl))
-        , negative_event_(negative_event) {
-        if (capacity_ > 0) entries_.reserve(capacity_);
-    }
+        , negative_event_(negative_event) {}
 
     ~DnsCache() {
         for (const auto& node : order_) {
@@ -243,7 +241,8 @@ private:
 class DatagramExchange : public std::enable_shared_from_this<DatagramExchange> {
 public:
     struct Reply {
-        std::array<uint8_t, 512> bytes{};
+        // Only the first `size` bytes are defined.
+        std::array<uint8_t, 512> bytes;
         size_t size = 0;
         IoErrorCode error;
     };

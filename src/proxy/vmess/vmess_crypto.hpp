@@ -217,7 +217,8 @@ private:
 // ShakeMask — chunk 长度掩码生成器
 //
 // 使用 SHAKE128 生成伪随机掩码序列，避免流量分析。
-// 固定小缓冲区（覆盖 256 个 chunk），懒加载，避免每连接常驻 4KB mask 缓冲。
+// 缓冲恰为 SHAKE128 rate（168B，84 个 mask），每次 Refill 正好一次 Keccak 置换；
+// squeeze 可分段拼接，掩码字节流与缓冲大小无关。懒加载，不常驻大缓冲。
 // ============================================================================
 class ShakeMask {
 public:
@@ -233,7 +234,7 @@ public:
     uint16_t NextMask();
 
 private:
-    static constexpr size_t kBufferSize = 512;  // 批量 squeeze 大小
+    static constexpr size_t kBufferSize = 168;  // SHAKE128 rate；偶数保证 mask 不跨缓冲
 
     EVP_MD_CTX* ctx_ = nullptr;
     uint8_t buffer_[kBufferSize];

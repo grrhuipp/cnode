@@ -299,12 +299,10 @@ struct UdpDatagramContext {
     std::span<const uint8_t> payload;
     const proxyman::inbound::ReceiverSettings* receiver = nullptr;
     net::io_context& io_context;
-    routing::Dispatcher* dispatcher = nullptr;
-    StatsShard& stats;
-    const TimeoutsConfig& timeouts;
     uint32_t worker_id = 0;
     UdpReplySink& reply_sink;
-    const app::DatagramSessionEnvironment* environment = nullptr;
+    // Session environment of the listener that received the datagram.
+    const app::DatagramSessionEnvironment& environment;
 };
 
 // Only authenticated identity and execution ownership metadata live here.
@@ -334,15 +332,15 @@ public:
     // across their own asynchronous cancellation boundary.
     using SocketPtr = std::shared_ptr<udp::socket>;
 
+    // Owned by the sender frame; descriptors borrow the payload's Buffer blocks,
+    // which stay in place when the packet itself moves.
     struct PendingUdpReply {
         uint64_t id = 0;
         udp::endpoint endpoint;
         buf::MultiBuffer payload;
-        size_t payload_size = 0;
         UdpResourceBudget::PayloadReservation reservation;
         ConstBufferSpanBuilder<buf::MultiBuffer::kInlineCapacity> send_buffers;
 
-        void PrepareSendBuffers();
         [[nodiscard]] std::span<const net::const_buffer> SendBuffers() const noexcept;
     };
     class ClientSession;
@@ -456,8 +454,14 @@ private:
         std::optional<tcp::endpoint> local_endpoint;
         InboundDatagramAssociationIndex associations;
     };
+    struct QueuedUdpReply {
+        udp::endpoint endpoint;
+        buf::MultiBuffer payload;
+        size_t payload_size = 0;
+        UdpResourceBudget::PayloadReservation reservation;
+    };
     struct ReplyQueueState {
-        memory::ThreadLocalDeque<PendingUdpReply> pending;
+        memory::ThreadLocalDeque<QueuedUdpReply> pending;
         size_t queued_bytes = 0;
         uint64_t active_id = 0;
         size_t active_payload_size = 0;
@@ -553,7 +557,6 @@ private:
         net::io_context* io_context = nullptr;
         StatsShard* stats = nullptr;
         TimeoutsConfig timeouts;
-        uint32_t worker_id = 0;
         // Owned copy of the authenticating credential's profile.
         UserProfile profile;
         UserOnlineTracker* tracker = nullptr;
@@ -594,7 +597,6 @@ private:
     // The row hook naming this session as its live link; cleared on unlink.
     UdpAssociationHook* association_hook_ = nullptr;
     std::shared_ptr<UdpHandoffRecord> handoff_record_;
-    UdpIngress* owner_ = nullptr;
 };
 
 

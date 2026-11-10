@@ -258,7 +258,8 @@ net::awaitable<DnsResult> DNSWorker::Impl::QueryServer(
     std::string_view domain,
     bool query_aaaa) {
     DnsResult result;
-    std::array<uint8_t, 280> query{};
+    // BuildQueryTo and Exchange write every byte of [0, query_size).
+    std::array<uint8_t, 280> query;
     const size_t query_size = BuildQueryTo(query, domain, query_aaaa);
     auto response = co_await server.Exchange(
         std::span<uint8_t>(query.data(), query_size),

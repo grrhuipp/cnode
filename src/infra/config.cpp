@@ -557,7 +557,10 @@ DnsConfig DnsConfig::FromJson(const json::object& j) {
         if (!servers->is_array()) {
             throw std::invalid_argument("dns servers must be an array of IP endpoint strings");
         }
-        cfg.servers.clear();
+        if (servers->as_array().empty()) {
+            throw std::invalid_argument(
+                "dns servers must not be empty; omit it to use the system resolver");
+        }
         cfg.servers.reserve(servers->as_array().size());
         for (const auto& server : servers->as_array()) {
             if (!server.is_string()) {
@@ -1547,12 +1550,13 @@ namespace {
 struct ConfigFileAbsent {};
 struct ConfigFileInvalid {};
 using ConfigFileLoad = std::variant<json::value, ConfigFileAbsent, ConfigFileInvalid>;
+using ConfigFileRead = std::variant<std::string, ConfigFileAbsent, ConfigFileInvalid>;
 
 struct FileCloser {
     void operator()(std::FILE* file) const noexcept { std::fclose(file); }
 };
 
-ConfigFileLoad LoadJsonFile(const std::filesystem::path& path) {
+ConfigFileRead ReadConfigFile(const std::filesystem::path& path) {
     const auto file_name = path.filename().string();
     const std::unique_ptr<std::FILE, FileCloser> file(std::fopen(path.c_str(), "rb"));
     if (!file) {
@@ -1582,14 +1586,74 @@ ConfigFileLoad LoadJsonFile(const std::filesystem::path& path) {
             break;
         }
     }
+    return content;
+}
 
+ConfigFileLoad LoadJsonFile(const std::filesystem::path& path) {
+    auto read = ReadConfigFile(path);
+    auto* content = std::get_if<std::string>(&read);
+    if (!content) {
+        return std::holds_alternative<ConfigFileAbsent>(read)
+            ? ConfigFileLoad{ConfigFileAbsent{}} : ConfigFileLoad{ConfigFileInvalid{}};
+    }
     try {
-        return json::parse(content, json::KeyComparison::AsciiCaseInsensitive);
+        return json::parse(*content, json::KeyComparison::AsciiCaseInsensitive);
     } catch (const std::exception& e) {
         Log::WriteConsole(LogLevel::ERROR, std::format(
-            "Configuration parsing failed: file={} reason={}", file_name, e.what()));
+            "Configuration parsing failed: file={} reason={}",
+            path.filename().string(), e.what()));
         return ConfigFileInvalid{};
     }
+}
+
+// dns.servers 未配置时使用系统解析器的上游，语义对齐 resolv.conf(5) 与 glibc/musl
+// res_init：';' 或 '#' 开头的行是注释；行首关键字 "nameserver" 后跟空白，取下一个
+// 令牌（遇空白、';'、'#' 结束）；无法解析的地址按系统解析器行为跳过；至多采用前
+// MAXNS(3) 个；文件缺失或没有可用 nameserver 时使用本机 127.0.0.1。resolv.conf 不
+// 表达端口，固定 UDP 53。文件存在但读取失败属于系统配置损坏，阻断加载。只在启动
+// 加载时读取一次，运行期不跟随文件变化。
+constexpr const char* kSystemResolvConf = "/etc/resolv.conf";
+constexpr size_t kResolvConfMaxNameservers = 3;
+constexpr uint16_t kResolvConfNameserverPort = 53;
+
+std::optional<std::vector<udp::endpoint>> LoadSystemDnsServers() {
+    std::vector<udp::endpoint> servers;
+    auto read = ReadConfigFile(kSystemResolvConf);
+    if (std::holds_alternative<ConfigFileInvalid>(read)) {
+        return std::nullopt;
+    }
+    constexpr std::string_view kKeyword = "nameserver";
+    constexpr std::string_view kBlank = " \t\r\v\f";
+    if (const auto* content = std::get_if<std::string>(&read)) {
+        std::string_view rest = *content;
+        while (!rest.empty() && servers.size() < kResolvConfMaxNameservers) {
+            const auto line_end = rest.find('\n');
+            std::string_view line = rest.substr(0, line_end);
+            rest = line_end == std::string_view::npos ? std::string_view{} : rest.substr(line_end + 1);
+            if (!line.starts_with(kKeyword) || line.size() == kKeyword.size() ||
+                kBlank.find(line[kKeyword.size()]) == std::string_view::npos) {
+                continue;
+            }
+            line.remove_prefix(kKeyword.size());
+            const auto token_begin = line.find_first_not_of(kBlank);
+            if (token_begin == std::string_view::npos) {
+                continue;
+            }
+            line.remove_prefix(token_begin);
+            const std::string token(line.substr(0, line.find_first_of(" \t\r\v\f;#")));
+            // asio 的 make_address 与系统解析器同样经 inet_pton 解析，并把链路本地
+            // IPv6 的 "%接口名" 经 if_nametoindex 转为 scope ID。
+            std::error_code ec;
+            const auto address = net::ip::make_address(token, ec);
+            if (!ec) {
+                servers.emplace_back(address, kResolvConfNameserverPort);
+            }
+        }
+    }
+    if (servers.empty()) {
+        servers.emplace_back(net::ip::address_v4::loopback(), kResolvConfNameserverPort);
+    }
+    return servers;
 }
 
 // 侧车文件缺失即未配置；存在但读取、解析或校验失败都阻断加载。
@@ -1732,6 +1796,14 @@ std::optional<Config> LoadConfig(const std::filesystem::path& path) {
         for (auto& panel : cfg.panels) {
             panel.TrafficJournalDir = journal_dir;
         }
+    }
+
+    if (cfg.dns.servers.empty()) {
+        auto system_servers = LoadSystemDnsServers();
+        if (!system_servers) {
+            return std::nullopt;
+        }
+        cfg.dns.servers = std::move(*system_servers);
     }
 
     const bool sidecars_loaded =
@@ -1940,11 +2012,6 @@ StaticInboundSemanticValidation ValidateStaticInboundSemantics(
 bool ValidateConfig(const Config& config) {
     if (config.workers == 0 || config.workers > defaults::kMaxWorkers) {
         LOG_CONSOLE_ERROR("Worker count must be between 1 and {}", defaults::kMaxWorkers);
-        return false;
-    }
-
-    if (config.dns.servers.empty()) {
-        LOG_CONSOLE_ERROR("At least one DNS server is required");
         return false;
     }
 

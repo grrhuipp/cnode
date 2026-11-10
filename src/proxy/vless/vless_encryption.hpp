@@ -679,6 +679,9 @@ private:
     enum class State : uint8_t { Active, Finished, Failed };
 
     void CheckWritable() const;
+    // By value: the range must stay in this frame until the write completes.
+    template <typename BufferRange>
+    net::awaitable<void> WriteEncrypted(BufferRange source);
 
     transport::MultiBufferWriter& dst_;
     VlessEncryptionAead aead_;

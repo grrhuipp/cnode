@@ -55,7 +55,7 @@ void ApplySniffOverride(
     }
     const uint16_t final_port = result.port > 0
         ? result.port
-        : ctx.outbound.original_target.port;
+        : ctx.outbound.target.port;
     TargetAddress sniffed(sniff_domain, final_port);
     if (!sniffed.IsValid() || !sniffed.IsDomain()) {
         return;
@@ -64,6 +64,7 @@ void ApplySniffOverride(
         ctx.outbound.route_target = std::move(sniffed);
     } else {
         ctx.outbound.route_target = {};
+        ctx.outbound.original_target = std::move(ctx.outbound.target);
         ctx.outbound.target = std::move(sniffed);
     }
 }
@@ -326,7 +327,7 @@ net::awaitable<RelayResult> DefaultDispatcher::Dispatch(
         co_await RunAwaitableTaskGroup(co_await net::this_coro::executor, [&](AwaitableTaskGroup& group) {
             group.Spawn(DispatchPreparedLink(
                 io_context, policy, std::move(inbound), inbound_link,
-                std::move(first_packet), ctx, stats, timeouts, pressure_idle_timeout,
+                first_packet, ctx, stats, timeouts, pressure_idle_timeout,
                 result, group, cancellation_reason));
         });
     } catch (const std::bad_alloc&) {
@@ -361,7 +362,7 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
     const routing::DispatchPolicy& policy,
     std::unique_ptr<AsyncStream> inbound,
     transport::Link inbound_link,
-    InitialPayload first_packet,
+    InitialPayload& first_packet,
     session::Context& ctx,
     StatsShard& stats,
     const TimeoutsConfig& timeouts,
@@ -418,7 +419,7 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
     }
 
     LOG_CONN_DEBUG(ctx, "protocol authenticated target={} email={}",
-                   ctx.outbound.original_target, ctx.inbound.user_email);
+                   ctx.outbound.target, ctx.inbound.user_email);
 
     buf::MultiBufferBatch outbound_first_payload;
     const auto sniff_cancellation = co_await net::this_coro::cancellation_state;
@@ -672,7 +673,7 @@ void SessionTrackingState::RegisterActiveSession(
     std::string_view accounting_key,
     int64_t user_id,
     session::Traffic& traffic) {
-    if (accounting_key.empty() || user_id <= 0 || node.linked) return;
+    if (accounting_key.empty() || user_id <= 0 || node.bucket) return;
     auto entry = accounts_.find(accounting_key);
     const bool inserted = entry == accounts_.end();
     if (inserted) {
@@ -697,11 +698,10 @@ void SessionTrackingState::RegisterActiveSession(
     node.next = bucket.active_head;
     if (node.next) node.next->prev = &node;
     bucket.active_head = &node;
-    node.linked = true;
 }
 
 void SessionTrackingState::UnregisterActiveSession(ActiveSession& node) noexcept {
-    if (!node.linked) return;
+    if (!node.bucket) return;
     auto* bucket = node.bucket;
     if (node.prev) node.prev->next = node.next;
     else bucket->active_head = node.next;

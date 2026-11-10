@@ -584,19 +584,6 @@ std::unique_ptr<api::API> ValidatePanelRuntimeArgs(
         : std::string_view(state.config.TransportProtocol);
 }
 
-
-template <typename WorkerRange, typename TaskFactory>
-net::awaitable<void> RunWorkerMutationBatch(
-    net::any_io_executor executor,
-    WorkerRange& workers,
-    TaskFactory task_factory) {
-    std::vector<net::awaitable<void>> tasks;
-    tasks.reserve(workers.size());
-    for (size_t i = 0; i < workers.size(); ++i) {
-        tasks.push_back(task_factory(*workers[i], i));
-    }
-    co_await RunAwaitableBatch(executor, std::move(tasks));
-}
 }  // namespace
 
 // The concrete cold-path boundary for all-Worker mutations. Each asynchronous
@@ -612,7 +599,7 @@ public:
 
     net::awaitable<void> RemoveInbound(const std::string& tag) {
         ThrowIfStopping();
-        co_await RunWorkerMutationBatch(
+        co_await RunWorkerBatch(
             io_context_.get_executor(), workers_,
             [this, tag](Worker& worker, size_t) {
                 return [](NodeRuntime* runtime, Worker* current, std::string current_tag)
@@ -626,7 +613,7 @@ public:
 
     net::awaitable<void> RemoveOutbound(const std::string& tag) {
         ThrowIfStopping();
-        co_await RunWorkerMutationBatch(
+        co_await RunWorkerBatch(
             io_context_.get_executor(), workers_,
             [this, tag](Worker& worker, size_t) {
                 return [](NodeRuntime* runtime, Worker* current, std::string current_tag)
@@ -642,7 +629,7 @@ public:
     net::awaitable<void> AddOutbound(
         const proxyman::outbound::PreparedOutboundConfig& prepared) {
         ThrowIfStopping();
-        co_await RunWorkerMutationBatch(
+        co_await RunWorkerBatch(
             io_context_.get_executor(), workers_,
             [this, &prepared](Worker& worker, size_t) {
                 return [](NodeRuntime* runtime, Worker* current,
@@ -708,7 +695,7 @@ public:
         const std::string& tag,
         std::shared_ptr<const std::vector<rule::DetectRule>> new_rule_list) {
         ThrowIfStopping();
-        co_await RunWorkerMutationBatch(
+        co_await RunWorkerBatch(
             io_context_.get_executor(), workers_,
             [this, &tag, &new_rule_list](Worker& worker, size_t index) {
                 return [](NodeRuntime* runtime, Worker* current,
@@ -1279,7 +1266,7 @@ Controller::Impl::GetOnlineSnapshot(const std::string& tag) {
     ThrowIfStopping();
     std::vector<std::vector<OnlineDevice>> per_worker(workers_.size());
 
-    co_await RunWorkerMutationBatch(
+    co_await RunWorkerBatch(
         io_context_.get_executor(), workers_,
         [this, &tag, &per_worker](Worker& worker, size_t index) {
             return [](Impl* controller, Worker* w, std::string_view t,

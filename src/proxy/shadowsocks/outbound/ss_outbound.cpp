@@ -467,7 +467,7 @@ WriteTCPRequest(const TargetAddress& target,
     }
 }
 
-net::awaitable<tl::expected<detail::BodyReader, ErrorCode>>
+net::awaitable<tl::expected<ReadTCPResponseResult, ErrorCode>>
 ReadTCPResponse(const SsCipherInfo& cipher_info,
                 const KeyBytes& master_key,
                 const KeyBytes& request_salt,
@@ -551,9 +551,10 @@ ReadTCPResponse(const SsCipherInfo& cipher_info,
                 next_nonce = 2;
             }
 
-            co_return detail::BodyReader(
-                std::move(read_cipher), next_nonce, stream,
-                kSs2022MaxChunkPayload, std::move(pending));
+            co_return ReadTCPResponseResult{
+                detail::BodyReader(std::move(read_cipher), next_nonce, stream,
+                                   kSs2022MaxChunkPayload),
+                std::move(pending)};
         }
 
         std::array<uint8_t, 64> server_salt{};
@@ -580,8 +581,8 @@ ReadTCPResponse(const SsCipherInfo& cipher_info,
                                  proxy::AeadDirection::Decrypt);
         OPENSSL_cleanse(server_salt.data(), server_salt.size());
         OPENSSL_cleanse(read_subkey.data(), read_subkey.size());
-        co_return detail::BodyReader(
-            std::move(read_cipher), 0, stream);
+        co_return ReadTCPResponseResult{
+            detail::BodyReader(std::move(read_cipher), 0, stream), {}};
     } catch (const std::bad_alloc&) {
         co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
     } catch (const IoSystemError& e) {
@@ -656,7 +657,9 @@ private:
                 pending->request_salt.size = 0;
                 throw transport::LinkError(reader_result.error());
             }
-            response_state_.emplace<ss::detail::BodyReader>(std::move(*reader_result));
+            response_state_.emplace<ss::detail::BodyReader>(std::move(reader_result->reader));
+            if (reader_result->initial_payload.byte_size() != 0)
+                co_return std::move(reader_result->initial_payload);
         }
         co_return co_await std::get<ss::detail::BodyReader>(response_state_).ReadMultiBuffer();
     }
@@ -684,9 +687,10 @@ SendShadowsocksHandshake(
     const PhaseDeadlineHandle& outbound_protocol_deadline,
     const OutboundDialer& dialer,
     const session::Context& ctx) {
-    const TargetAddress protocol_target = use_uot
+    const TargetAddress uot_magic_target = use_uot
         ? TargetAddress(proxy::uot::MagicAddress(*prepared.config.uot_version), 0)
-        : target;
+        : TargetAddress{};
+    const TargetAddress& protocol_target = use_uot ? uot_magic_target : target;
 
     stream.SetIdleTimeout(handshake_timeout);
 

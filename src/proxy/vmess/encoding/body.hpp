@@ -178,11 +178,25 @@ private:
         buf::MultiBuffer chunks,
         std::span<const uint8_t> first_header,
         bool& header_sent);
+    // By value: an owned MultiBuffer stays in this frame until encoding consumes it.
+    template <typename Payload>
+    net::awaitable<void> WriteEncoded(
+        AsyncStream& stream,
+        Payload payload,
+        const char* cancel_what,
+        std::span<const uint8_t> first_header,
+        bool* header_sent,
+        const TargetAddress* udp_target);
     enum class State { Active, Finished, Failed };
 
     void EncodeStream(std::span<const uint8_t> bytes, buf::MultiBuffer& out);
     void EncodePacket(std::span<const uint8_t> bytes, buf::MultiBuffer& out);
     void EncodeChunk(std::span<const uint8_t> bytes, buf::MultiBuffer& out);
+    // Seals one chunk (length, ciphertext, random padding) into dst; returns its wire size.
+    size_t SealChunkTo(std::span<const uint8_t> bytes,
+                       size_t length_size,
+                       size_t padding,
+                       uint8_t* dst);
 
     BodyChunkCipher cipher_;
     size_t stream_chunk_size_ = 0;

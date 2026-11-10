@@ -20,6 +20,7 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <algorithm>
 #include <limits>
 #include <mutex>
@@ -75,6 +76,13 @@ std::mutex g_lifecycle_mutex;
 // The writer drains continuously. Keep a bounded burst window without paying
 // for 65K preallocated LogRecord slots throughout the process lifetime.
 constexpr size_t kAsyncLogQueueCapacity = 8 * 1024;
+// Blocks are allocated only when the queue reaches a new high-water mark and
+// are recycled through the queue's free list instead of being freed, so idle
+// processes hold none and steady bursts allocate nothing. pending_ still
+// bounds the record count at kAsyncLogQueueCapacity.
+struct AsyncLogQueueTraits : moodycamel::ConcurrentQueueDefaultTraits {
+    static constexpr bool RECYCLE_ALLOCATED_BLOCKS = true;
+};
 constexpr size_t kWriterBatchSize = 64;
 // Retry delay after a daily rotation fails to open the new files; the old
 // files stay active until a retry succeeds.
@@ -90,18 +98,6 @@ std::string_view LevelName(LogLevel level) noexcept {
         case LogLevel::NONE:  return "None";
     }
     return "?";
-}
-
-std::string FormatLogTimestamp(int64_t timestamp_us) {
-    const auto seconds = timestamp_us / 1'000'000;
-    const auto timestamp = static_cast<std::time_t>(seconds);
-    const auto tm = LocalTime(timestamp);
-    char buffer[32]{};
-    const auto written = std::strftime(
-        buffer, sizeof(buffer), "%Y/%m/%d %H:%M:%S", &tm);
-    if (written == 0) return {};
-    return std::format("{}.{:06}", std::string_view(buffer, written),
-                       timestamp_us % 1'000'000);
 }
 
 std::string FormatConsoleTimestamp(int64_t timestamp_us) {
@@ -315,40 +311,72 @@ std::string FormatConsoleRecord(int64_t timestamp_us,
     return line;
 }
 
-std::string FormatRecord(const LogRecord& record) {
-    auto line = FormatLogTimestamp(record.timestamp_us);
-    if (record.channel == LogChannel::Access) {
-        line.reserve(line.size() + 1 + record.message.size());
-        line.push_back(' ');
-        AppendEscapedLogText(line, record.message, false);
-        return line;
-    }
-    line.reserve(line.size() + 64 + record.message.size());
-    line.append(" [").append(LevelName(record.level)).append("] ");
-    if (record.connection && record.connection->conn_id != 0) {
-        line.append(std::format("[{}] ", record.connection->conn_id));
-    }
-    line.append(ComponentName(record.source_file)).append(": ");
-    if (record.connection) {
-        const auto& context = *record.connection;
-        if (!context.inbound_tag.empty()) {
-            line.push_back('[');
-            AppendEscapedLogText(line, context.inbound_tag, false);
-            if (!context.outbound_tag.empty() && context.inbound_tag != context.outbound_tag) {
-                line.append(" -> ");
-                AppendEscapedLogText(line, context.outbound_tag, false);
-            }
-            line.append("] ");
-        } else if (!context.outbound_tag.empty()) {
-            line.append("[outbound ");
-            AppendEscapedLogText(line, context.outbound_tag, false);
-            line.append("] ");
+// Writer-owned formatting state, serialized with the log files it feeds: one
+// reusable line buffer and the local-time prefix of the last formatted second.
+// A given second always maps to the same local time, so the bytes match a
+// fresh strftime for every record.
+class RecordFormatter {
+public:
+    const std::string& Format(const LogRecord& record) {
+        line_.clear();
+        AppendTimestamp(record.timestamp_us);
+        if (record.channel == LogChannel::Access) {
+            line_.reserve(line_.size() + 1 + record.message.size());
+            line_.push_back(' ');
+            AppendEscapedLogText(line_, record.message, false);
+            return line_;
         }
-        if (context.user_id > 0) line.append(std::format("user:{} ", context.user_id));
+        line_.reserve(line_.size() + 64 + record.message.size());
+        line_.append(" [").append(LevelName(record.level)).append("] ");
+        if (record.connection && record.connection->conn_id != 0) {
+            std::format_to(std::back_inserter(line_), "[{}] ", record.connection->conn_id);
+        }
+        line_.append(ComponentName(record.source_file)).append(": ");
+        if (record.connection) {
+            const auto& context = *record.connection;
+            if (!context.inbound_tag.empty()) {
+                line_.push_back('[');
+                AppendEscapedLogText(line_, context.inbound_tag, false);
+                if (!context.outbound_tag.empty() && context.inbound_tag != context.outbound_tag) {
+                    line_.append(" -> ");
+                    AppendEscapedLogText(line_, context.outbound_tag, false);
+                }
+                line_.append("] ");
+            } else if (!context.outbound_tag.empty()) {
+                line_.append("[outbound ");
+                AppendEscapedLogText(line_, context.outbound_tag, false);
+                line_.append("] ");
+            }
+            if (context.user_id > 0) {
+                std::format_to(std::back_inserter(line_), "user:{} ", context.user_id);
+            }
+        }
+        AppendEscapedLogText(line_, record.message, false);
+        return line_;
     }
-    AppendEscapedLogText(line, record.message, false);
-    return line;
-}
+
+private:
+    // An unformattable second contributes no timestamp at all.
+    void AppendTimestamp(int64_t timestamp_us) {
+        const auto seconds = timestamp_us / 1'000'000;
+        if (!has_cached_second_ || seconds != cached_second_) {
+            const auto tm = LocalTime(static_cast<std::time_t>(seconds));
+            second_prefix_size_ = std::strftime(
+                second_prefix_.data(), second_prefix_.size(), "%Y/%m/%d %H:%M:%S", &tm);
+            cached_second_ = seconds;
+            has_cached_second_ = true;
+        }
+        if (second_prefix_size_ == 0) return;
+        line_.append(second_prefix_.data(), second_prefix_size_);
+        std::format_to(std::back_inserter(line_), ".{:06}", timestamp_us % 1'000'000);
+    }
+
+    std::string line_;
+    std::array<char, 32> second_prefix_{};
+    size_t second_prefix_size_ = 0;
+    int64_t cached_second_ = 0;
+    bool has_cached_second_ = false;
+};
 
 std::string DateString(std::chrono::system_clock::time_point now) {
     return FormatLocalTime(now, "%Y-%m-%d");
@@ -837,7 +865,7 @@ void WriteStderrFallback(LogLevel level, std::string_view msg) {
 
 class AsyncLogBackend {
 public:
-    AsyncLogBackend() : queue_(kAsyncLogQueueCapacity) {}
+    AsyncLogBackend() : queue_(0) {}
 
     ~AsyncLogBackend() {
         Stop();
@@ -1199,7 +1227,7 @@ private:
             ++target.discarded;
             return false;
         }
-        file << FormatRecord(record) << '\n';
+        file << formatter_.Format(record) << '\n';
         if (!file) {
             SinkFailure(target, "write");
             ++target.discarded;
@@ -1297,7 +1325,7 @@ private:
         }
     }
 
-    moodycamel::ConcurrentQueue<LogRecord> queue_;
+    moodycamel::ConcurrentQueue<LogRecord, AsyncLogQueueTraits> queue_;
     moodycamel::LightweightSemaphore writer_wakeup_{0, 0};
     std::atomic_bool accepting_{false};
     std::atomic_bool running_{false};
@@ -1326,6 +1354,7 @@ private:
     };
     std::ofstream error_file_;
     std::ofstream access_file_;
+    RecordFormatter formatter_;
 };
 
 AsyncLogBackend g_async_log_backend;

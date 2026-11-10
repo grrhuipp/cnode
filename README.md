@@ -466,6 +466,8 @@ IP 目标、请求来源和访问日志共用数值地址文本转换：IPv4-map
 
 `dns.servers` 中每项可以是裸 IPv4/IPv6（默认 UDP 53），或指定端口的 `127.0.0.1:5353`、`[::1]:5353`。IPv6 带端口时必须使用方括号，端口为 1–65535 的十进制整数；只接受 IP，不使用域名解析 DNS 服务器。配置加载时完成地址与端口拆分并发布完整 endpoint，主控线程上的 DNSWorker 按列表顺序使用；解析、默认值和平台字符串兼容不进入查询路径。
 
+不写 `dns.servers`（或省略整个 `dns`）时使用系统 DNS：启动加载配置时按 resolv.conf(5) 读取一次 `/etc/resolv.conf` 的 `nameserver`（与 glibc/musl 一致：最多前 3 个、UDP 53、跳过无法解析的地址），文件缺失或没有可用 `nameserver` 时使用 `127.0.0.1:53`；文件存在但读取失败则启动报错。只取上游地址，`search`、`options` 等其他指令不生效，运行期修改 `/etc/resolv.conf` 需重启生效。显式写空数组 `"servers": []` 视为配置错误。
+
 IP 字段必须是完整地址：IPv4 使用四段无前导零的十进制格式，IPv6 可使用数字 scope ID（如 `fe80::1%3`），不接受 `%eth0` 等接口名。`sendThrough` 数组项也可使用规范 CIDR。单独的 host、listen、sendThrough 等字段不接受端口、方括号、空白或 NUL 后缀。方括号仅用于支持 endpoint 或 URL 的入口，且括号内必须是 IPv6；出站服务器字段也可以使用合法 DNS 主机名。旧版在部分平台上接受的地址简写或多余后缀不再兼容。
 
 连接超时和会话池空闲检查由所属 Worker 的 TimeoutScheduler 汇聚；原生等待结束后才释放调度器。事件嵌入宿主，取消不保留失效节点。限速、Mux 背压和 accept 退避使用可取消等待；协议协程直接在所属 Worker 的原生 `io_context` 上运行。

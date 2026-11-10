@@ -86,6 +86,15 @@ ProxyProtocolReadResult ProxyReadResult(
     return out;
 }
 
+// Gate before each nonblocking send attempt, including a skipped first attempt.
+void ThrowIfWriteAborted(bool cancelled_or_stopped, bool deferred,
+                         net::cancellation_type coro_cancelled) {
+    if (cancelled_or_stopped ||
+        (!deferred && coro_cancelled != net::cancellation_type::none)) {
+        throw IoSystemError(io_error::operation_aborted);
+    }
+}
+
 void SetupConnectedSocket(tcp::socket& sock);
 }
 
@@ -208,8 +217,8 @@ net::awaitable<std::size_t> TcpStream::AsyncRead(net::mutable_buffer buf) {
         // A reset is a truncation, not the peer's orderly end of stream.
         throw IoSystemError(ec);
     }
-
-    TouchActivity();
+    // AsyncReceiveSome already refreshed idle activity on every successful
+    // non-peek return.
     co_return n;
 }
 
@@ -332,10 +341,7 @@ bool TcpStream::DrainWriteAvailable(
     bool deferred,
     net::cancellation_type coro_cancelled) {
     while (!buffers.empty()) {
-        if (cancelled_or_stopped ||
-            (!deferred && coro_cancelled != net::cancellation_type::none)) {
-            throw IoSystemError(io_error::operation_aborted);
-        }
+        ThrowIfWriteAborted(cancelled_or_stopped, deferred, coro_cancelled);
         IoErrorCode error;
         const auto sent = WriteAvailable(buffers, offset, error);
         if (error) {
@@ -412,8 +418,9 @@ net::awaitable<void> TcpStream::WriteBuffersFrom(
     impl_->timeouts.CheckCanBeginWrite();
     const auto cancellation = co_await net::this_coro::cancellation_state;
     const bool deferred = IsWriteCancellationDeferred();
-    if (!blocked &&
-        DrainWriteAvailable(
+    if (blocked) {
+        ThrowIfWriteAborted(Cancellation().Stopped(), deferred, cancellation.cancelled());
+    } else if (DrainWriteAvailable(
             buffers, offset, Cancellation().Stopped(), deferred, cancellation.cancelled())) {
         co_return;
     }
@@ -514,7 +521,10 @@ net::awaitable<std::pair<IoErrorCode, std::size_t>> TcpStream::AsyncReceiveSome(
         co_return std::make_pair(io_error::not_connected, std::size_t{0});
     }
 
-    if (buffer.size() == 0) co_return std::make_pair(IoErrorCode{}, size_t{0});
+    if (buffer.size() == 0) {
+        if (!peek) TouchActivity();
+        co_return std::make_pair(IoErrorCode{}, size_t{0});
+    }
     impl_->timeouts.CheckCanBeginRead();
     const auto cancellation = co_await net::this_coro::cancellation_state;
     std::optional<WriteCompletion> completion;

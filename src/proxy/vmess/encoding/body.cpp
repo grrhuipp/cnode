@@ -25,6 +25,7 @@
 #include <cstring>
 #include <new>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 namespace vmess::encoding {
 
@@ -205,21 +206,9 @@ size_t BodyEncoder::EncodeEndTo(std::span<uint8_t, 128> out) {
         if (capacity > out.size()) {
             ThrowWriteError("VMess EOF chunk exceeds inline buffer");
         }
-        uint8_t* dst = out.data();
-        const ssize_t sealed = cipher_.Payload().Encrypt(nullptr, 0, dst + length_size);
-        if (sealed < 0) {
-            ThrowWriteError("VMess body encrypt failed");
-        }
-        const size_t chunk_size = static_cast<size_t>(sealed) + padding;
-        if (!cipher_.EncodeLength(chunk_size, dst)) {
-            ThrowWriteError("VMess body length encode failed");
-        }
-        if (padding > 0 &&
-            RAND_bytes(dst + length_size + sealed, static_cast<int>(padding)) != 1) {
-            ThrowWriteError("VMess body padding generation failed");
-        }
+        const size_t written = SealChunkTo({}, length_size, padding, out.data());
         Finish();
-        return length_size + chunk_size;
+        return written;
     } catch (...) {
         Abort();
         throw;
@@ -239,13 +228,15 @@ net::awaitable<void> BodyEncoder::WriteFirstEncodedChunks(
     chunks.clear();
 }
 
-net::awaitable<void> BodyEncoder::WriteMultiBuffer(
+template <typename Payload>
+net::awaitable<void> BodyEncoder::WriteEncoded(
     AsyncStream& stream,
-    buf::MultiBuffer mb,
+    Payload payload,
     const char* cancel_what,
     std::span<const uint8_t> first_header,
     bool* header_sent,
-    const TargetAddress* udp_target) {
+    [[maybe_unused]] const TargetAddress* udp_target) {
+    constexpr bool kOwnsPayload = std::is_same_v<Payload, buf::MultiBuffer>;
     CheckWritable();
     if ((co_await net::this_coro::cancellation_state).cancelled() !=
         net::cancellation_type::none) {
@@ -253,12 +244,16 @@ net::awaitable<void> BodyEncoder::WriteMultiBuffer(
     }
     bool frame_generated = false;
     try {
-        if (udp_target && PacketMode()) {
-            ValidateFixedUdpDatagram(mb, *udp_target);
+        if constexpr (kOwnsPayload) {
+            if (udp_target && PacketMode()) {
+                ValidateFixedUdpDatagram(payload, *udp_target);
+            }
         }
         buf::MultiBuffer chunks;
-        Encode(mb, chunks);
-        mb.clear();
+        Encode(payload, chunks);
+        if constexpr (kOwnsPayload) {
+            payload.clear();
+        }
         frame_generated = chunks.byte_size() != 0;
         if (frame_generated) {
             if (header_sent && !*header_sent) {
@@ -280,40 +275,24 @@ net::awaitable<void> BodyEncoder::WriteMultiBuffer(
     }
 }
 
+net::awaitable<void> BodyEncoder::WriteMultiBuffer(
+    AsyncStream& stream,
+    buf::MultiBuffer mb,
+    const char* cancel_what,
+    std::span<const uint8_t> first_header,
+    bool* header_sent,
+    const TargetAddress* udp_target) {
+    return WriteEncoded(stream, std::move(mb), cancel_what, first_header, header_sent,
+                        udp_target);
+}
+
 net::awaitable<void> BodyEncoder::WriteBuffers(
     AsyncStream& stream,
     std::span<const net::const_buffer> buffers,
     const char* cancel_what,
     std::span<const uint8_t> first_header,
     bool* header_sent) {
-    CheckWritable();
-    if ((co_await net::this_coro::cancellation_state).cancelled() !=
-        net::cancellation_type::none) {
-        throw IoSystemError(io_error::operation_aborted, cancel_what);
-    }
-    bool frame_generated = false;
-    try {
-        buf::MultiBuffer chunks;
-        Encode(buffers, chunks);
-        frame_generated = chunks.byte_size() != 0;
-        if (frame_generated) {
-            if (header_sent && !*header_sent) {
-                co_await WriteFirstEncodedChunks(
-                    stream, std::move(chunks), first_header, *header_sent);
-            } else {
-                co_await stream.WriteMultiBuffer(std::move(chunks));
-            }
-        }
-    } catch (const transport::WriteClosed&) {
-        Finish();
-        throw;
-    } catch (...) {
-        if (frame_generated || Failed()) {
-            Abort();
-            stream.CloseAbortive();
-        }
-        throw;
-    }
+    return WriteEncoded(stream, buffers, cancel_what, first_header, header_sent, nullptr);
 }
 net::awaitable<void> BodyEncoder::WriteEOF(
     AsyncStream& stream,
@@ -364,14 +343,10 @@ void BodyEncoder::EncodePacket(std::span<const uint8_t> bytes, buf::MultiBuffer&
     EncodeChunk(bytes, out);
 }
 
-void BodyEncoder::EncodeChunk(std::span<const uint8_t> bytes, buf::MultiBuffer& out) try {
-    const size_t padding = cipher_.NextPaddingSize();
-    const size_t length_size = cipher_.LengthSize();
-    const size_t capacity = length_size + bytes.size() + cipher_.Overhead() + padding;
-
-    buf::ContiguousWriteBuffer encoded;
-    uint8_t* dst = encoded.Prepare(capacity);
-
+size_t BodyEncoder::SealChunkTo(std::span<const uint8_t> bytes,
+                                size_t length_size,
+                                size_t padding,
+                                uint8_t* dst) {
     const ssize_t sealed = cipher_.Payload().Encrypt(
         bytes.data(), bytes.size(), dst + length_size);
     if (sealed < 0) {
@@ -386,8 +361,17 @@ void BodyEncoder::EncodeChunk(std::span<const uint8_t> bytes, buf::MultiBuffer& 
         RAND_bytes(dst + length_size + sealed, static_cast<int>(padding)) != 1) {
         ThrowWriteError("VMess body padding generation failed");
     }
+    return length_size + chunk_size;
+}
 
-    encoded.AppendTo(length_size + chunk_size, out);
+void BodyEncoder::EncodeChunk(std::span<const uint8_t> bytes, buf::MultiBuffer& out) try {
+    const size_t padding = cipher_.NextPaddingSize();
+    const size_t length_size = cipher_.LengthSize();
+    const size_t capacity = length_size + bytes.size() + cipher_.Overhead() + padding;
+
+    buf::ContiguousWriteBuffer encoded;
+    uint8_t* dst = encoded.Prepare(capacity);
+    encoded.AppendTo(SealChunkTo(bytes, length_size, padding, dst), out);
 } catch (...) {
     Abort();
     throw;

@@ -310,11 +310,12 @@ std::vector<proxyman::outbound::PreparedOutboundConfig> PrepareStartupOutbounds(
 
 WorkerRuntimeConfig MakeWorkerRuntimeConfig(
     const Config& config,
+    RoutingConfig routing,
     std::vector<proxyman::outbound::PreparedOutboundConfig> outbounds) {
     WorkerRuntimeConfig runtime_config;
     runtime_config.timeouts = config.timeouts;
     runtime_config.limits = config.limits;
-    runtime_config.routing = config.routing;
+    runtime_config.routing = std::move(routing);
     runtime_config.outbounds = std::move(outbounds);
     runtime_config.workers = config.workers;
     runtime_config.pressure_threshold = ComputePressureThreshold(runtime_config);
@@ -364,8 +365,11 @@ void SetupPanels(net::io_context& main_ctx,
     pool.io_contexts.reserve(workers);
     pool.work_guards.reserve(workers);
 
+    // 每个 Worker context 只由其数据线程运行（RunDataThread/RunEventLoop）。
+    // hint 1 让本线程发起的 post 进入线程私有队列；它仍是加锁调度器与反应器，
+    // 控制面与其他 Worker 的跨线程投递继续走加锁路径。
     for (uint32_t i = 0; i < workers; ++i) {
-        pool.io_contexts.push_back(std::make_unique<net::io_context>());
+        pool.io_contexts.push_back(std::make_unique<net::io_context>(ASIO_CONCURRENCY_HINT_1));
         pool.work_guards.push_back(net::make_work_guard(*pool.io_contexts[i]));
         auto& worker_stats = stats.GetShard(i);
         pool.workers.push_back(std::make_unique<Worker>(
@@ -378,25 +382,28 @@ void SetupPanels(net::io_context& main_ctx,
     return pool;
 }
 
+// Takes the loaded configuration by value: every runtime owner copies or moves
+// what it keeps, so the source is released once startup preparation returns.
 [[nodiscard]] BootstrapEnvironment CreateBootstrapEnvironment(
-    const Config& config,
+    Config config,
     bool test_mode) {
     TlsStream::InitializeIo();
     BootstrapEnvironment env;
     const bool enable_test_mode =
         test_mode || (config.panels.empty() && config.static_inbounds.empty());
     auto outbounds = PrepareStartupOutbounds(config.outbounds);
-    auto inbounds = PrepareStartupInbounds(config.static_inbounds, enable_test_mode);
+    auto inbounds = PrepareStartupInbounds(std::move(config.static_inbounds), enable_test_mode);
     constexpr int kMainIoConcurrencyHint =
         static_cast<int>(ASIO_CONCURRENCY_HINT_ID | ASIO_CONCURRENCY_HINT_LOCKING_SCHEDULER);
     env.main_ctx = std::make_unique<net::io_context>(kMainIoConcurrencyHint);
     env.dns_worker = std::make_unique<app::dns::DNSWorker>(
         *env.main_ctx, MakeDnsServiceConfig(config), defaults::kWorkerMailboxCapacity);
     env.panel_dns_service = std::make_unique<app::dns::DNS>(*env.dns_worker);
+    // Geo tags are read from the routing rules before they move to the Workers.
     env.geo_database = LoadGeoDatabase(config);
     env.stats = std::make_unique<ShardedStats>(config.workers);
     const WorkerRuntimeConfig worker_runtime_config =
-        MakeWorkerRuntimeConfig(config, std::move(outbounds));
+        MakeWorkerRuntimeConfig(config, std::move(config.routing), std::move(outbounds));
     // Every source and protocol payload is prepared before one RCU publication.
     // Workers do not exist yet: each captures the committed snapshot when it is
     // constructed below. These borrowed references stay in this call.
@@ -596,39 +603,30 @@ public:
         ThrowIfStopping();
         const auto& workers = env.worker_pool.workers;
         std::vector<WorkerRuntimeStatsSnapshot> snapshots(workers.size());
-        std::vector<net::awaitable<void>> tasks;
-        tasks.reserve(workers.size());
-        for (size_t i = 0; i < workers.size(); ++i) {
-            tasks.push_back(
-                [](const RuntimeOwner& owner, Worker* worker,
-                   WorkerRuntimeStatsSnapshot& out,
-                   bool collect_resources) -> net::awaitable<void> {
+        co_await RunWorkerBatch(env.main_ctx->get_executor(), workers,
+            [this, &snapshots, include_resources](Worker& worker, size_t index) {
+                return [](const RuntimeOwner& owner, Worker* current,
+                          WorkerRuntimeStatsSnapshot& out,
+                          bool collect_resources) -> net::awaitable<void> {
                     owner.ThrowIfStopping();
-                    out = co_await worker->PostCall([worker, collect_resources] {
-                        return worker->CollectRuntimeStats(collect_resources);
+                    out = co_await current->PostCall([current, collect_resources] {
+                        return current->CollectRuntimeStats(collect_resources);
                     });
-                }(*this, workers[i].get(), snapshots[i], include_resources)
-            );
-        }
-        co_await RunAwaitableBatch(
-            env.main_ctx->get_executor(), std::move(tasks));
+                }(*this, &worker, snapshots[index], include_resources);
+            });
         ThrowIfStopping();
         co_return snapshots;
     }
 
     net::awaitable<void> CollectWorkerHeaps() const {
         ThrowIfStopping();
-        const auto& workers = env.worker_pool.workers;
-        std::vector<net::awaitable<void>> tasks;
-        tasks.reserve(workers.size());
-        for (const auto& worker : workers) {
-            tasks.push_back(
-                [](const RuntimeOwner& owner, Worker* current) -> net::awaitable<void> {
+        co_await RunWorkerBatch(env.main_ctx->get_executor(), env.worker_pool.workers,
+            [this](Worker& worker, size_t) {
+                return [](const RuntimeOwner& owner, Worker* current) -> net::awaitable<void> {
                     owner.ThrowIfStopping();
                     co_await current->PostCall([current] { current->CollectHeap(); });
-                }(*this, worker.get()));
-        }
-        co_await RunAwaitableBatch(env.main_ctx->get_executor(), std::move(tasks));
+                }(*this, &worker);
+            });
         ThrowIfStopping();
         // The control thread may also hold short-lived PMR allocations.
         memory::CollectBurst();
@@ -1056,7 +1054,9 @@ int RunFromCommandLine(int argc, char* argv[]) {
 
     int result = 1;
     try {
-        auto env = CreateBootstrapEnvironment(config, cli.test_mode);
+        // The environment owns every runtime copy; nothing reads the Config again.
+        auto env = CreateBootstrapEnvironment(std::move(*config_opt), cli.test_mode);
+        config_opt.reset();
         result = RunApplicationRuntime(env);
     } catch (const std::exception& e) {
         Log::WriteConsole(LogLevel::ERROR, std::format("Failed to initialize runtime: {}", e.what()));

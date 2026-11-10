@@ -11,9 +11,9 @@
 #include <asio/cancellation_signal.hpp>
 #include <asio/use_awaitable.hpp>
 #include <chrono>
+#include <algorithm>
 #include <cstdint>
 #include <new>
-#include <optional>
 #include <stdexcept>
 
 namespace transport::internet::detail {
@@ -36,8 +36,7 @@ public:
         idle_enabled_ = timeout > std::chrono::seconds::zero();
         idle_timeout_ = idle_enabled_ ? timeout : std::chrono::seconds::zero();
         idle_expired_ = false;
-        if (idle_enabled_) idle_deadline_ = Deadline(timeout);
-        else idle_deadline_.reset();
+        idle_deadline_ = idle_enabled_ ? Deadline(timeout) : kNone;
         Reconcile();
     }
 
@@ -62,16 +61,16 @@ public:
         phase_expired_ = false;
         UpdateFlags();
         if (stopped_ || timeout <= std::chrono::seconds::zero()) {
-            phase_deadline_.reset();
+            phase_deadline_ = kNone;
             ReconcileNoThrow();
             return {};
         }
         phase_deadline_ = Deadline(timeout);
-        armed_deadline_.reset();
+        armed_deadline_ = kNone;
         try {
             Reconcile();
         } catch (...) {
-            phase_deadline_.reset();
+            phase_deadline_ = kNone;
             ReconcileNoThrow();
             throw;
         }
@@ -80,7 +79,7 @@ public:
 
     void ClearPhaseDeadline() noexcept {
         ++phase_generation_;
-        phase_deadline_.reset();
+        phase_deadline_ = kNone;
         phase_expired_ = false;
         UpdateFlags();
         ReconcileNoThrow();
@@ -102,9 +101,9 @@ public:
         read_expired_ = false;
         read_deadline_ = MakeDeadline(read_timeout_);
         try { Reconcile(); }
-        catch (...) { read_pending_ = false; read_deadline_.reset(); throw; }
+        catch (...) { read_pending_ = false; read_deadline_ = kNone; throw; }
     }
-    void EndRead() noexcept { read_pending_ = false; read_deadline_.reset(); ReconcileNoThrow(); }
+    void EndRead() noexcept { read_pending_ = false; read_deadline_ = kNone; ReconcileNoThrow(); }
 
     void BeginWrite() {
         CheckCanBegin(write_pending_);
@@ -112,9 +111,9 @@ public:
         write_expired_ = false;
         write_deadline_ = MakeDeadline(write_timeout_);
         try { Reconcile(); }
-        catch (...) { write_pending_ = false; write_deadline_.reset(); throw; }
+        catch (...) { write_pending_ = false; write_deadline_ = kNone; throw; }
     }
-    void EndWrite() noexcept { write_pending_ = false; write_deadline_.reset(); ReconcileNoThrow(); }
+    void EndWrite() noexcept { write_pending_ = false; write_deadline_ = kNone; ReconcileNoThrow(); }
 
     void TouchActivity() noexcept {
         if (stopped_ || !idle_enabled_) return;
@@ -128,12 +127,9 @@ public:
         stopped_ = true;
         idle_enabled_ = false;
         read_pending_ = write_pending_ = false;
-        idle_deadline_.reset();
-        read_deadline_.reset();
-        write_deadline_.reset();
-        phase_deadline_.reset();
+        idle_deadline_ = read_deadline_ = write_deadline_ = phase_deadline_ = kNone;
         Cancel();
-        armed_deadline_.reset();
+        armed_deadline_ = kNone;
     }
 
 private:
@@ -141,6 +137,9 @@ private:
     static constexpr uint8_t kReadMask = 1u << 1;
     static constexpr uint8_t kWriteMask = 1u << 2;
     static constexpr uint8_t kPhaseMask = 1u << 3;
+    // 无截止期哨兵：Deadline() 饱和到 max 与"未设置"在 Earliest/OnTimeout 中本就等价，
+    // armed_deadline_ 只记录 < max 的已调度时刻。
+    static constexpr TimePoint kNone = TimePoint::max();
 
     static TimePoint Deadline(std::chrono::seconds timeout) noexcept {
         const auto now = Clock::now();
@@ -148,8 +147,8 @@ private:
         if (timeout >= std::chrono::duration_cast<std::chrono::seconds>(remaining)) return TimePoint::max();
         return now + std::chrono::duration_cast<Clock::duration>(timeout);
     }
-    static std::optional<TimePoint> MakeDeadline(std::chrono::seconds timeout) noexcept {
-        if (timeout <= std::chrono::seconds::zero()) return std::nullopt;
+    static TimePoint MakeDeadline(std::chrono::seconds timeout) noexcept {
+        if (timeout <= std::chrono::seconds::zero()) return kNone;
         return Deadline(timeout);
     }
     static std::chrono::milliseconds DelayUntil(TimePoint deadline) noexcept {
@@ -172,25 +171,20 @@ private:
                  (write_expired_ ? kWriteMask : 0) | (phase_expired_ ? kPhaseMask : 0);
     }
     [[nodiscard]] TimePoint Earliest() const noexcept {
-        auto first = TimePoint::max();
-        if (idle_deadline_ && *idle_deadline_ < first) first = *idle_deadline_;
-        if (read_deadline_ && *read_deadline_ < first) first = *read_deadline_;
-        if (write_deadline_ && *write_deadline_ < first) first = *write_deadline_;
-        if (phase_deadline_ && *phase_deadline_ < first) first = *phase_deadline_;
-        return first;
+        return std::min({idle_deadline_, read_deadline_, write_deadline_, phase_deadline_});
     }
     void Reconcile() {
         if (stopped_) return;
         const auto first = Earliest();
-        if (first == TimePoint::max()) {
+        if (first == kNone) {
             Cancel();
-            armed_deadline_.reset();
+            armed_deadline_ = kNone;
             return;
         }
         // Earlier waits can safely wake later deadlines; avoid churn when idle
         // activity moves its deadline forward.
-        if (Valid() && armed_deadline_ && *armed_deadline_ <= first) return;
-        armed_deadline_.reset();
+        if (Valid() && armed_deadline_ <= first) return;
+        armed_deadline_ = kNone;
         if (!ScheduleAfter(DelayUntil(first))) {
             Cancel();
             return;
@@ -203,13 +197,13 @@ private:
         catch (...) { Fail(ErrorCode::INTERNAL); }
     }
     void OnTimeout() noexcept override {
-        armed_deadline_.reset();
+        armed_deadline_ = kNone;
         if (stopped_) return;
         const auto now = Clock::now();
-        if (idle_deadline_ && *idle_deadline_ <= now) idle_expired_ = true;
-        if (read_deadline_ && *read_deadline_ <= now) read_expired_ = true;
-        if (write_deadline_ && *write_deadline_ <= now) write_expired_ = true;
-        if (phase_deadline_ && *phase_deadline_ <= now) phase_expired_ = true;
+        if (idle_deadline_ <= now) idle_expired_ = true;
+        if (read_deadline_ <= now) read_expired_ = true;
+        if (write_deadline_ <= now) write_expired_ = true;
+        if (phase_deadline_ <= now) phase_expired_ = true;
         UpdateFlags();
         if (idle_expired_ || read_expired_ || write_expired_ || phase_expired_) {
             Stop();
@@ -224,8 +218,8 @@ private:
     }
 
     Owner& owner_;
-    std::optional<TimePoint> idle_deadline_, read_deadline_, write_deadline_, phase_deadline_;
-    std::optional<TimePoint> armed_deadline_;
+    TimePoint idle_deadline_ = kNone, read_deadline_ = kNone, write_deadline_ = kNone, phase_deadline_ = kNone;
+    TimePoint armed_deadline_ = kNone;
     std::chrono::seconds idle_timeout_{0}, read_timeout_{0}, write_timeout_{0};
     uint32_t phase_generation_ = 0;
     uint8_t flags_ = 0;

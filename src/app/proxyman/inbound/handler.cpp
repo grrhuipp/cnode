@@ -63,38 +63,19 @@ void ApplyProxyProtocolResult(
 
 // 物理连接与逻辑子流共用的协议处理收尾：Process 自身已分类上报结果，
 // 这里只把逃逸的异常收敛为一次错误统计，非预期异常额外记录。
-net::awaitable<void> RunInboundProxy(
-    Inbound& proxy,
-    std::unique_ptr<AsyncStream> stream,
-    routing::Dispatcher& dispatcher,
-    const inbound::ReceiverSettings& listener,
-    net::io_context& io_context,
-    session::Context& ctx,
-    const TimeoutsConfig& timeouts,
-    uint32_t pressure_idle_timeout,
-    StatsShard& stats) {
+// 只能在 catch 块内调用。
+void CountEscapedInboundFailure(const session::Context& ctx, StatsShard& stats) {
     try {
-        (void)co_await proxy.Process(
-            std::move(stream),
-            dispatcher,
-            listener,
-            io_context,
-            ctx,
-            timeouts,
-            pressure_idle_timeout);
+        throw;
     } catch (const transport::LinkError&) {
-        stats.OnError();
     } catch (const std::bad_alloc&) {
-        stats.OnError();
     } catch (const IoSystemError&) {
-        stats.OnError();
     } catch (const std::exception& e) {
         LOG_CONN_WARN(ctx, "inbound processing failed > {}", e.what());
-        stats.OnError();
     } catch (...) {
         LOG_CONN_WARN(ctx, "inbound processing failed > unknown error");
-        stats.OnError();
     }
+    stats.OnError();
 }
 
 void RejectConnection(
@@ -137,12 +118,12 @@ public:
         , dispatcher_(dispatcher)
         , stats_(stats)
         , request_load_(request_load)
-        , timeouts_(timeouts)
-        , family_(std::move(family)) {
+        , timeouts_(timeouts) {
+        // TCP 与 Hysteria 的 base_ctx 已携带本监听器的 accounting_key；
+        // 子流经 InitSubstreamFrom 继承 connection_family 作为逻辑准入的物理族。
         base_ctx_.InitSubstreamFrom(base_ctx);
         base_ctx_.conn_id = base_ctx.conn_id;
-        base_ctx_.inbound.accounting_key.assign(handler_->receiver_.accounting_key);
-        base_ctx_.inbound.connection_family = family_;
+        base_ctx_.inbound.connection_family = std::move(family);
         if (!authenticated) {
             base_ctx_.inbound.user_id = 0;
             base_ctx_.inbound.user_email.clear();
@@ -178,9 +159,38 @@ public:
         session::Context ctx;
         ctx.InitSubstreamFrom(base_ctx_);
         ApplyHttpRealIp(ctx, metadata.real_ip);
-        co_await handler_->ProcessPreparedTransportStream(
-            io_context_, dispatcher_, stats_, request_load_, timeouts_,
-            std::move(stream), ctx, family_);
+
+        Handler& handler = *handler_;
+        const inbound::ReceiverSettings& listener = handler.receiver_;
+        ConnectionStatsScope connection_stats(stats_);
+
+        ConnectionLimiter::Admission admission;
+        if (handler.limiter_.TracksAdmission()) {
+            admission = co_await handler.limiter_.ReserveLogical(
+                ctx.inbound.connection_family, ctx.inbound.tag, ctx.inbound.source_ip,
+                ctx.inbound.HasProxyProtocolClientIP());
+        }
+        const auto reject = admission.reason;
+        if (reject != ConnectionLimiter::RejectReason::NONE) {
+            RejectConnection(ctx, stats_, reject);
+            co_return;
+        }
+        auto connection_limit = std::move(admission.reservation);
+
+        (void)stream->StartPhaseDeadline(timeouts_.HandshakeTimeout());
+
+        LOG_CONN_DEBUG(ctx, "logical transport stream ready security={} network={}",
+                       listener.stream_settings.security,
+                       listener.stream_settings.network);
+
+        Inbound& proxy = handler.Proxy();
+        try {
+            (void)co_await proxy.Process(
+                std::move(stream), dispatcher_, listener, io_context_, ctx, timeouts_,
+                request_load_.PressureIdleTimeout());
+        } catch (...) {
+            CountEscapedInboundFailure(ctx, stats_);
+        }
     }
 
 private:
@@ -191,7 +201,6 @@ private:
     app::RequestLoadState& request_load_;
     TimeoutsConfig timeouts_;
     session::Context base_ctx_;
-    std::shared_ptr<ConnectionLimiter::Family> family_;
 };
 
 Handler::Handler(inbound::ReceiverSettings receiver, std::unique_ptr<Inbound> proxy,
@@ -216,42 +225,6 @@ std::shared_ptr<InboundTransportStreamHandler> Handler::NewAuthenticatedStreamSi
     return memory::AllocateShared<LogicalTransportStreamSink>(
         shared_from_this(), io_context, dispatcher, stats, request_load, timeouts,
         session_ctx, true, std::move(family));
-}
-
-net::awaitable<void> Handler::ProcessPreparedTransportStream(
-    net::io_context& io_context,
-    routing::Dispatcher& dispatcher,
-    StatsShard& stats,
-    app::RequestLoadState& request_load,
-    const TimeoutsConfig& timeouts,
-    std::unique_ptr<AsyncStream> stream,
-    session::Context& ctx,
-    const std::shared_ptr<ConnectionLimiter::Family>& family) {
-    const inbound::ReceiverSettings& listener = receiver_;
-    ConnectionStatsScope connection_stats(stats);
-
-    ConnectionLimiter::Admission admission;
-    if (limiter_.TracksAdmission()) {
-        admission = co_await limiter_.ReserveLogical(
-            family, ctx.inbound.tag, ctx.inbound.source_ip,
-            ctx.inbound.HasProxyProtocolClientIP());
-    }
-    const auto reject = admission.reason;
-    if (reject != ConnectionLimiter::RejectReason::NONE) {
-        RejectConnection(ctx, stats, reject);
-        co_return;
-    }
-    auto connection_limit = std::move(admission.reservation);
-
-    (void)stream->StartPhaseDeadline(timeouts.HandshakeTimeout());
-
-    LOG_CONN_DEBUG(ctx, "logical transport stream ready security={} network={}",
-                   listener.stream_settings.security,
-                   listener.stream_settings.network);
-
-    co_await RunInboundProxy(
-        Proxy(), std::move(stream), dispatcher, listener, io_context, ctx, timeouts,
-        request_load.PressureIdleTimeout(), stats);
 }
 
 net::awaitable<void> Handler::ProcessAcceptedTCP(
@@ -409,9 +382,14 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
                    listener.stream_settings.security,
                    listener.stream_settings.network);
 
-    co_await RunInboundProxy(
-        Proxy(), std::move(stream), dispatcher, listener, io_context, ctx, timeouts,
-        request_load.PressureIdleTimeout(), stats);
+    Inbound& proxy = Proxy();
+    try {
+        (void)co_await proxy.Process(
+            std::move(stream), dispatcher, listener, io_context, ctx, timeouts,
+            request_load.PressureIdleTimeout());
+    } catch (...) {
+        CountEscapedInboundFailure(ctx, stats);
+    }
 }
 
 // ============================================================================

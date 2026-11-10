@@ -1,5 +1,6 @@
 #pragma once
 
+#include "common/allocator.hpp"
 #include "common/error.hpp"
 #include "common/session.hpp"
 #include "common/buf/multi_buffer.hpp"
@@ -14,6 +15,7 @@
 #include <asio/use_awaitable.hpp>
 #include <chrono>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <algorithm>
 #include <cstddef>
@@ -128,7 +130,8 @@ inline constexpr uint64_t kRelayStatsFlushBytes = 64 * 1024;
 inline constexpr auto kRelayCloseGraceTimeout = std::chrono::seconds(1);
 
 // All state and subscriptions live until both directions and the watchdog join.
-struct RelayRateLimits {
+// Allocated only for speed-limited relays so unlimited frames do not carry it.
+struct RelayRateLimits : memory::ThreadAllocated {
     TokenBucket up;
     TokenBucket down;
     AsyncDelay up_wait;
@@ -300,8 +303,11 @@ net::awaitable<RelayResult> DoRelayLink(
     using namespace net::experimental::awaitable_operators;
     using relay_detail::RelayPhase;
     relay_detail::RelayState state(io_context);
-    std::optional<relay_detail::RelayRateLimits> limits;
-    if (config.speed_limit != 0) limits.emplace(io_context, config.speed_limit);
+    std::unique_ptr<relay_detail::RelayRateLimits> limits;
+    if (config.speed_limit != 0) {
+        limits = std::make_unique<relay_detail::RelayRateLimits>(
+            io_context, config.speed_limit);
+    }
     ctx.traffic.bytes_up = ctx.traffic.bytes_down = 0;
     const auto parent_cancellation = co_await net::this_coro::cancellation_state;
 
@@ -341,7 +347,7 @@ net::awaitable<RelayResult> DoRelayLink(
             relay_detail::CancelIfSupported(target);
             notifying = false;
         }
-    } cancellation(client_control, target, state, limits ? &*limits : nullptr);
+    } cancellation(client_control, target, state, limits.get());
     cancellation.client_cancel.Resubscribe(client_reader.Cancellation());
     cancellation.target_cancel.Resubscribe(target.Cancellation());
 

@@ -203,7 +203,6 @@ bool CompoundRoutingRule::MatchInboundTag(const session::Context& ctx) const {
     }
 
     for (const auto& tag : ctx.inbound.tags) {
-        if (tag == ctx.inbound.tag) continue;
         if (ContainsSortedString(inbound_tag_values, tag)) {
             return true;
         }

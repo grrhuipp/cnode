@@ -177,21 +177,12 @@ struct Parsed2022Body {
     return parsed;
 }
 
-[[nodiscard]] const EVP_AEAD* DatagramAead(SsCipherType type) noexcept {
-    switch (BaseCipherType(type)) {
-        case SsCipherType::AES_128_GCM: return EVP_aead_aes_128_gcm();
-        case SsCipherType::AES_256_GCM: return EVP_aead_aes_256_gcm();
-        case SsCipherType::CHACHA20_POLY1305: return EVP_aead_chacha20_poly1305();
-        default: return nullptr;
-    }
-}
-
 [[nodiscard]] bool AeadEncrypt(SsCipherType cipher_type,
                                std::span<const uint8_t> key,
                                std::span<const uint8_t, 12> nonce,
                                std::span<const uint8_t> plaintext,
                                uint8_t* output) {
-    const auto* algorithm = DatagramAead(cipher_type);
+    const auto* algorithm = AeadAlgorithm(cipher_type);
     if (!algorithm || plaintext.size() >
             std::numeric_limits<size_t>::max() - SsAeadCipher::kTagSize) return false;
     return proxy::SealOneShotAead(
@@ -205,7 +196,7 @@ struct Parsed2022Body {
                                std::span<const uint8_t, 12> nonce,
                                std::span<const uint8_t> ciphertext,
                                uint8_t* output) {
-    const auto* algorithm = DatagramAead(cipher_type);
+    const auto* algorithm = AeadAlgorithm(cipher_type);
     if (!algorithm || ciphertext.size() < SsAeadCipher::kTagSize) return false;
     const size_t capacity = ciphertext.size() - SsAeadCipher::kTagSize;
     size_t written = 0;

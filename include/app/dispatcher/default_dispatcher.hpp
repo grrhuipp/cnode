@@ -104,7 +104,7 @@ private:
         const routing::DispatchPolicy& policy,
         std::unique_ptr<AsyncStream> inbound,
         transport::Link inbound_link,
-        InitialPayload first_packet,
+        InitialPayload& first_packet,
         session::Context& ctx,
         StatsShard& stats,
         const TimeoutsConfig& timeouts,

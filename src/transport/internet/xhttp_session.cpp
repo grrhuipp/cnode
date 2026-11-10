@@ -939,8 +939,7 @@ net::execution_context::id XHttpSessionTable::id;
 XHttpPacketUpSession::XHttpPacketUpSession(
     net::io_context& io_context)
     : io_context_(io_context)
-    , input_signal_(net::any_io_executor(io_context.get_executor()), 1)
-    , upload_signal_(net::any_io_executor(io_context.get_executor()), 1) {}
+    , input_signal_(net::any_io_executor(io_context.get_executor()), 1) {}
 XHttpPacketUpSession::~XHttpPacketUpSession() noexcept {
     Unsubscribe();
     Retire();
@@ -1036,11 +1035,21 @@ bool XHttpPacketUpSession::AttachStream(std::unique_ptr<AsyncStream> stream) {
     return true;
 }
 
+// The wake channel lives in this frame and stays published for the whole
+// join, so a release signalled between two receives stays buffered. Nothing
+// suspends between a condition check and its receive, and at most one join
+// exists per session: only the first AttachStream succeeds.
 net::awaitable<void> XHttpPacketUpSession::JoinAttachedUpload() {
+    SignalChannel upload_signal(io_context_.get_executor(), 1);
+    upload_signal_ = &upload_signal;
+    struct Unpublish {
+        SignalChannel*& published;
+        ~Unpublish() noexcept { published = nullptr; }
+    } unpublish{upload_signal_};
     std::exception_ptr failure;
     try {
         while (!stream_input_.Empty() || upload_reads_ != 0)
-            co_await upload_signal_.async_receive(net::use_awaitable);
+            co_await upload_signal.async_receive(net::use_awaitable);
     } catch (...) {
         failure = std::current_exception();
         Close();
@@ -1048,7 +1057,7 @@ net::awaitable<void> XHttpPacketUpSession::JoinAttachedUpload() {
     if (failure) {
         co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
         while (!stream_input_.Empty() || upload_reads_ != 0)
-            co_await upload_signal_.async_receive(net::use_awaitable);
+            co_await upload_signal.async_receive(net::use_awaitable);
         std::rethrow_exception(failure);
     }
 }
@@ -1092,7 +1101,7 @@ void XHttpPacketUpSession::Close() noexcept {
     if (auto stream = stream_input_.Take()) {
         stream->Close();
     }
-    (void)upload_signal_.try_send(IoErrorCode{});
+    if (upload_signal_) (void)upload_signal_->try_send(IoErrorCode{});
     downlink_ready_.Stop();
     Wake();
 }

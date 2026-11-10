@@ -1903,3 +1903,28 @@ done
 tc -s qdisc show dev lo
 BASH
 ```
+
+## 2026-11-11：多子系统冗余状态清除、常驻内存瘦身与启动预分配下放（基线 `e53803d`）
+
+### 精简与优化内容
+
+1. **主链路**：`RunInboundProxy` 改为 catch 内调用的非协程 `CountEscapedInboundFailure`，逻辑子流 `ProcessPreparedTransportStream` 并入唯一调用方 sink（每条 TCP 连接少 1 个、每条 HTTP/2/gRPC/XHTTP/Hysteria 逻辑流少 2 个常驻协程帧），删除重复的 `family_` 与 `accounting_key` 赋值；`DispatchPreparedLink` 借用 `Dispatch` 帧内首包，`outbound::Handler::Dispatch` 首包形参改为右值引用，避免同一会话内常驻第二份已移空的批次；`RelayRateLimits`（560 B）只在限速时于 Worker PMR 分配；`ActiveSession::linked` 与 `bucket != nullptr` 等价，删除后 72 → 64 B；`original_target` 仅在嗅探改写目标时保存，唯一读者 `DetectRulePolicy::Blocked` 的判定在两种语义下逐分支等价；Mux/AnyTLS 子流在未启用连接限额时不再进入准入协程；Router 删除恒等的重复入站标签检查。
+2. **传输层**：TLS 每次 SSL 调用只在错误队列非空时 `ERR_clear_error`（BoringSSL 对空队列也逐槽 free/memset）；删除对 BoringSSL 为空操作的 `SSL_MODE_RELEASE_BUFFERS` 与 `SSL_set_read_ahead`；TLS BIO 直接发送遇 EAGAIN 后、UDP 内联发送遇 EAGAIN 后直接等待可写，不再立即重复一次必然失败的 send（中间无挂起点，取消判定保留单一实现）；`ConnectionTimeouts` 五个 `optional<TimePoint>` 改为 `max()` 哨兵（176 → 136 B）；删除 `AsyncRead` 重复的活动刷新。
+3. **HTTP/2 / XHTTP**：服务端 DATA 帧在读循环内同步记账，不再经 `DispatchFrame` 协程；子流读取每个同步段只锁会话一次，接收额度直接按子流指针归还，不再每次查流表；`ReceiveData` 借用子流不再拷贝 `shared_ptr`；合并单/双 WINDOW_UPDATE 发送函数（线上字节不变）；仅等待时使用的 `SignalChannel`（192 B）改为等待方协程帧内持有（服务端流、客户端流两个、XHTTP 会话各省一个）；`XHttpPacketQueue` 判重与插入共用一次查找。
+4. **协议**：Mux UDP 回包从 Buffer 标签取源地址，删除每个回包元素的 `optional<TargetAddress>`；VMess `ShakeMask` 缓冲 512 → 168 B（SHAKE128 rate，掩码字节流不变，528 → 184 B）；VLESS Encryption 与 VMess 写路径合并为单帧模板，EOF 块与普通块共用 `SealChunkTo`；Shadowsocks 删除 `BodyReader::plaintext_`（368 → 216 B），2022 首段载荷由端点在 reader 之前交付，AEAD 算法映射收敛为 `ss::AeadAlgorithm`；AnyTLS 稳态无填充写不再复制方案 `shared_ptr`，帧头复用 `BuildFrameHeaderBytes`；`AeadContext` 改用 `bssl::UniquePtr`（24 → 16 B）；Freedom 在保序且双栈接受时直接借用 DNS 结果拨号并合并解析帧；UoT 删除死循环外壳与转发协程；SS/AnyTLS 出站握手目标改为引用。
+5. **Worker / 内存**：Worker `io_context` 使用 `ASIO_CONCURRENCY_HINT_1`（每个 context 只由其数据线程运行，仍为加锁调度器，跨线程投递路径不变）；`MultiBuffer` 合并互斥使用的两个起点字段（136 → 128 B）；原生 UDP 回复队列元素不再内嵌发送描述符构造器；连接限额与认证失败表承载于匿名零页映射，构造时不再写零 1 MiB；`UdpDatagramContext` 删除仅测试使用的无 environment 回退分支及冗余字段，`ClientSession::owner_` 等死字段删除。
+6. **控制面 / 基础设施**：启动后释放整份 `Config`（静态入站与路由移入运行时）；UserStore 中 AnyTLS/Hysteria/VLESS 凭据只保存读取字段（节点 136 → 104/120 B），Trojan 构建并入同一模板；日志队列按需分配并复用块（不再静态预分配约 1.2 MiB），写线程复用行缓冲并按秒缓存时间前缀；DNS 缓存不再预留 10240 个桶，查询缓冲不再清零；同进程 HTTPS 面板客户端共享一份只读 `SSL_CTX`；按 Worker 扇出统一为 `RunWorkerBatch`。
+
+### 验证与性能/内存实证
+
+全量 1251 项中首次运行仅 `dns_cache.ZeroTtlAddressesInvalidateOldAnswersAndReleaseTheirStorage` 失败：测试以构造后分配数作基线，而桶数组改为首次插入时分配并保留。测试改为预热桶数组后再测量条目存储回收，断言意图不变。此后 UDP 内联发送快路径恢复为原手写描述符数组（见下），`datagram|udp|quic_udp|uot|dns_cache` 相关 168 项复测通过；构建零告警。两路独立只读复审均无发现。
+
+编译期实测 `sizeof`（基线 → 本轮）：`MultiBuffer` 136 → 128，`MultiBufferBatch` 192 → 184，`ConnectionTimeouts` 176 → 136，`ActiveSession` 72 → 64，VMess `ShakeMask` 528 → 184，SS `BodyReader` 368 → 216，`AeadContext` 24 → 16，AnyTLS/VLESS 用户节点 136 → 104/120 B。
+
+内存（同环境交错运行，Linux x86-64 musl Release、LTO 关闭、4 Worker）：
+
+- 空闲测试模式守护进程（均重新拷贝二进制后测量）：VmRSS 13.08 → 11.68 MiB，匿名 6.49 → 5.08 MiB，可执行文件代码页驻留同为 4720 kB。曾观察到候选总 RSS 多约 2 MiB，逐映射核对为被反复覆盖复制的二进制文件页缓存状态造成，重新拷贝后消失，不是代码改动。
+- `cnode_runtime_sampling_benchmark`（3 轮）：512 会话匿名 17.03 → 14.04 MiB，64 会话 6.89 → 4.76 MiB；扣除固定部分后每会话约 −2 KiB。
+- HY2 真实进程（剔除启动时主机负载 15 的第 1 轮，余 3 轮）：各负载会话就绪、预热后、QUIC 回收后匿名内存均下降 1.5–3.1 MiB；负载峰值 RSS 下降 0.4–4.8%。TLS 基准 `server_started` 匿名 5.66 → 4.33 MiB。
+
+CPU 与吞吐（HY2 3 轮均值，守护进程完整生命周期 CPU）：256×1 上传/下载 CPU −5.9% / −9.0%，16×64 上传/下载 −4.9% / −7.2%，吞吐 +1.1% ~ +3.9%。**未结论项**：4×256 稀疏上传/下载吞吐均值 −4.4% / −5.2%（区间重叠，3 轮不足以判定），TLS 16 MiB 短跑吞吐 3 轮波动超过 100 MiB/s、未完成计划中的 15 轮补测；TLS 守护进程 CPU 持平或略降。进程内 UDP 发送单测每次发送 CPU 中位数 +4~6%，将内联快路径恢复为原写法后仍然存在，同时 `perf stat` 整进程用户态指令数相同、task-clock −2.8%，判断为代码布局导致的单测口径差异，未宣称 UDP 发送收益；TCP 收发单测差异在 ±2% 内。以上未结论项需后续补测确认。

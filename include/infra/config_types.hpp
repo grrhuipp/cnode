@@ -148,10 +148,8 @@ struct LogConfig {
 // DNS 配置
 // ============================================================================
 struct DnsConfig {
-    std::vector<udp::endpoint> servers{
-        {net::ip::address_v4({8, 8, 8, 8}), 53},
-        {net::ip::address_v4({1, 1, 1, 1}), 53},
-    };
+    // 空表示未配置：LoadConfig 按 /etc/resolv.conf 采用系统 DNS；显式空数组在解析时拒绝。
+    std::vector<udp::endpoint> servers;
     uint32_t timeout = defaults::kDnsTimeout;
     uint32_t cache_size = defaults::kDnsCacheSize;
     uint32_t min_ttl = defaults::kDnsMinTTL;

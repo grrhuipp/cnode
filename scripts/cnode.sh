@@ -31,7 +31,7 @@ usage() {
     done
     echo ""
     echo "可选选项:"
-    echo "  -dns <ip>              DNS 服务器（默认 1.1.1.1）"
+    echo "  -dns <ip>              DNS 服务器（默认使用系统 /etc/resolv.conf）"
     echo "  -tls_enable true       启用 TLS（trojan 需要）"
     echo "  -tls_cert <path>       TLS 证书路径"
     echo "  -tls_key <path>        TLS 私钥路径"
@@ -354,9 +354,11 @@ init_config() {
 
     # config.json（cnode 配置；仅新安装创建。已有配置文件不覆盖）
     if [ ! -f "$CONFIG_JSON" ]; then
-        DNS_SERVER="1.1.1.1"
+        # 未指定 -dns 时不写 servers，cnode 使用 /etc/resolv.conf 中的系统 DNS。
+        DNS_SERVERS_LINE=""
         if [ -n "$dns" ] && echo "$dns" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
-            DNS_SERVER="$dns"
+            DNS_SERVERS_LINE="    \"servers\": [\"$dns\"],
+"
         fi
 
         cat > "$CONFIG_JSON" <<EOF
@@ -369,8 +371,7 @@ init_config() {
   },
   "workers": 0,
   "dns": {
-    "servers": ["$DNS_SERVER"],
-    "timeout": 5,
+${DNS_SERVERS_LINE}    "timeout": 5,
     "cacheSize": 10000,
     "minTTL": 60,
     "maxTTL": 3600

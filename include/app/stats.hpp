@@ -305,7 +305,7 @@ public:
         session::Traffic* traffic = nullptr;
         uint64_t last_reported_up = 0;
         uint64_t last_reported_down = 0;
-        bool linked = false;
+        // 非空即已挂入 bucket 的活跃链表。
         AccountBucket* bucket = nullptr;
         Account* account = nullptr;
     };

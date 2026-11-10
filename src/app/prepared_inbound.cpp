@@ -163,18 +163,16 @@ net::awaitable<void> InstallUserViews(
     std::span<const std::unique_ptr<Worker>> workers,
     std::span<const Store::WorkerView> views,
     const bool& stopping) {
-    std::vector<net::awaitable<void>> tasks;
-    tasks.reserve(workers.size());
-    for (size_t i = 0; i < workers.size(); ++i) {
-        tasks.push_back([](Worker* worker, Store::WorkerView view,
-                           const bool* stopping_flag) -> net::awaitable<void> {
-            ThrowIfStopping(*stopping_flag);
-            co_await worker->PostCall([worker, view = std::move(view)]() mutable {
-                worker->InstallUserView(std::move(view));
-            });
-        }(workers[i].get(), views[i], &stopping));
-    }
-    co_await RunAwaitableBatch(std::move(executor), std::move(tasks));
+    return RunWorkerBatch(std::move(executor), workers,
+        [views, &stopping](Worker& worker, size_t index) {
+            return [](Worker* current, Store::WorkerView view,
+                      const bool* stopping_flag) -> net::awaitable<void> {
+                ThrowIfStopping(*stopping_flag);
+                co_await current->PostCall([current, view = std::move(view)]() mutable {
+                    current->InstallUserView(std::move(view));
+                });
+            }(&worker, views[index], &stopping);
+        });
 }
 
 }  // namespace

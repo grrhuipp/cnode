@@ -292,7 +292,7 @@ public:
 
     // Logical-stream sink for a transport session that authenticated its
     // client itself (Hysteria QUIC, as Xray's hysteria hub). Each delivered
-    // stream runs ProcessPreparedTransportStream with a child of |session_ctx|
+    // stream runs the inbound protocol with a child of |session_ctx|
     // that keeps the session's identity and client endpoint, and takes a
     // logical admission under the session's physical |family|.
     [[nodiscard]] std::shared_ptr<InboundTransportStreamHandler>
@@ -310,16 +310,6 @@ private:
     class LogicalTransportStreamSink;
 
     Inbound& Proxy();
-
-    net::awaitable<void> ProcessPreparedTransportStream(
-        net::io_context& io_context,
-        routing::Dispatcher& dispatcher,
-        StatsShard& stats,
-        app::RequestLoadState& request_load,
-        const TimeoutsConfig& timeouts,
-        std::unique_ptr<AsyncStream> stream,
-        session::Context& ctx,
-        const std::shared_ptr<ConnectionLimiter::Family>& family);
 
     const inbound::ReceiverSettings receiver_;
     TransportSecurity security_;
@@ -395,8 +385,8 @@ struct DatagramSessionEnvironment final {
     RequestLoadState* request_load = nullptr;
     UserOnlineTracker* tracker = nullptr;
     uint32_t* active_sessions = nullptr;
-    std::shared_ptr<proxyman::inbound::Handler> handler;
-    std::shared_ptr<const proxyman::inbound::BuildRequest> prepared;
+    std::shared_ptr<proxyman::inbound::Handler> handler{};
+    std::shared_ptr<const proxyman::inbound::BuildRequest> prepared{};
 };
 
 } // namespace app

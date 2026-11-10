@@ -661,7 +661,8 @@ TEST(UdpSocketOwner, Contract) {
     // Uplink payloads reach a row only through the authenticated datagram path.
     NoDispatch uplink_dispatcher;
     ::StatsShard uplink_stats;
-    const ::TimeoutsConfig uplink_timeouts{};
+    const ::app::DatagramSessionEnvironment uplink_environment{
+        .timeouts = {}, .dispatcher = &uplink_dispatcher, .stats = &uplink_stats};
     // Consulted only when a datagram starts an association, which never happens here.
     const ::proxyman::inbound::ReceiverSettings uplink_receiver{
         .inbound_tag = {},
@@ -693,12 +694,9 @@ TEST(UdpSocketOwner, Contract) {
             .payload = datagram,
             .receiver = &uplink_receiver,
             .io_context = io_context,
-            .dispatcher = &uplink_dispatcher,
-            .stats = uplink_stats,
-            .timeouts = uplink_timeouts,
             .worker_id = 0,
             .reply_sink = uplink_sink,
-            .environment = nullptr,
+            .environment = uplink_environment,
         });
     };
     const auto read_marker = [&](::worker_detail::UdpIngress::ClientSession& session) {

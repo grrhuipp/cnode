@@ -243,6 +243,12 @@ TEST(DnsCache, ZeroTtlAddressesInvalidateOldAnswersAndReleaseTheirStorage) {
     const auto baseline = ::memory::ThreadMemoryPool().OutstandingAllocations();
     {
         DnsCache cache(2, 60, 3600);
+        // The bucket array grows on first insertion and is retained; only entry
+        // storage is expected to return after a zero-TTL invalidation.
+        auto warm = Answer("192.0.2.9");
+        cache.Store("warm.example", warm);
+        warm.ttl = 0;
+        cache.Store("warm.example", warm);
         const auto empty_allocations = ::memory::ThreadMemoryPool().OutstandingAllocations();
         cache.Store("ttl.example", Answer("192.0.2.1", 400));
         auto current = Answer("192.0.2.2");

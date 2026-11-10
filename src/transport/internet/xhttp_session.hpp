@@ -134,9 +134,15 @@ public:
             payload.clear();
             return true;
         }
-        if (seq > next_seq_ && pending_.contains(seq)) {
-            payload.clear();
-            return true;
+        // Duplicate check and insertion share one search; the checks below
+        // leave pending_ untouched, so the hint stays valid.
+        auto hint = pending_.end();
+        if (seq > next_seq_) {
+            hint = pending_.lower_bound(seq);
+            if (hint != pending_.end() && hint->first == seq) {
+                payload.clear();
+                return true;
+            }
         }
 
         const size_t bytes = payload.byte_size();
@@ -169,7 +175,7 @@ public:
             return true;
         }
 
-        pending_.emplace(seq, std::move(payload));
+        pending_.emplace_hint(hint, seq, std::move(payload));
         ++queued_packets_;
         queued_bytes_ += bytes;
         queued_capacity_ += capacity;
@@ -220,12 +226,12 @@ public:
     [[nodiscard]] size_t QueuedPackets() const noexcept { return queued_packets_; }
 
 private:
+    // Keys enter pending_ above next_seq_ and are unique, and next_seq_ only
+    // advances one step before this runs, so no key is ever below next_seq_:
+    // the next packet, if present, is the smallest key.
     void PromoteReadyPackets() {
-        while (true) {
-            auto it = pending_.find(next_seq_);
-            if (it == pending_.end()) {
-                return;
-            }
+        while (!pending_.empty() && pending_.begin()->first == next_seq_) {
+            auto it = pending_.begin();
             ready_.push_back(std::move(it->second));
             pending_.erase(it);
             ++next_seq_;
@@ -330,7 +336,7 @@ private:
         ~UploadRead() {
             stream.reset();
             --session.upload_reads_;
-            (void)session.upload_signal_.try_send(IoErrorCode{});
+            if (session.upload_signal_) (void)session.upload_signal_->try_send(IoErrorCode{});
         }
     };
 
@@ -343,7 +349,8 @@ private:
     ::detail::XHttpPacketQueue packet_queue_;
     ::detail::XHttpUploadStreamSlot stream_input_;
     transport::CancellationSource cancellation_;
-    SignalChannel upload_signal_;
+    // JoinAttachedUpload's frame-local channel, published only while it runs.
+    SignalChannel* upload_signal_ = nullptr;
     // Event that AttachDownlink and Close broadcast to AwaitDownlink waiters.
     transport::CancellationSource downlink_ready_;
     size_t upload_reads_ = 0;

@@ -134,9 +134,11 @@ struct DatagramSocket::Impl final : memory::ThreadAllocated {
     }
 
     net::awaitable<ReceivedDatagram> Receive(ReadOperation& operation);
+    // `blocked`: the caller's send of these same buffers just hit EAGAIN
+    // without suspending since, so the first pass waits instead of sending.
     net::awaitable<void> SendBuffers(
         WriteOperation& operation, udp::endpoint destination,
-        std::span<const net::const_buffer> buffers);
+        std::span<const net::const_buffer> buffers, bool blocked);
     net::awaitable<void> SendMultiBuffer(
         WriteOperation& operation, udp::endpoint destination,
         buf::MultiBuffer payload);
@@ -237,7 +239,7 @@ net::awaitable<ReceivedDatagram> DatagramSocket::Impl::Receive(ReadOperation& op
 
 net::awaitable<void> DatagramSocket::Impl::SendBuffers(
     WriteOperation& operation, udp::endpoint destination,
-    std::span<const net::const_buffer> buffers) {
+    std::span<const net::const_buffer> buffers, bool blocked) {
     if (operation.Cancelled()) ThrowCancelled(operation.CancellationReason());
     if (closed) ThrowCancelled(cancellation_reason);
     ValidateDestination(destination, ipv6);
@@ -262,23 +264,25 @@ net::awaitable<void> DatagramSocket::Impl::SendBuffers(
     }
     if (buffers.empty()) buffers = single; // Preserve an actual zero-length datagram.
     const auto cancellation_state = co_await net::this_coro::cancellation_state;
-    for (;;) {
+    for (;; blocked = false) {
         if (operation.Cancelled()) ThrowCancelled(operation.CancellationReason());
         if (cancellation_state.cancelled() != net::cancellation_type::none)
             throw IoSystemError(io_error::operation_aborted);
-        IoErrorCode send_ec;
-        // Send synchronously on the owning Worker. Native readiness is needed
-        // only for backpressure and never retains payload pointers.
-        const auto sent = socket.send_to(buffers, destination, 0, send_ec);
-        if (send_ec == io_error::would_block || send_ec == io_error::try_again) {
-            const auto wait_ec = co_await Wait(udp::socket::wait_write, cancellation_state.slot());
-            if (operation.Cancelled()) ThrowCancelled(operation.CancellationReason());
-            if (wait_ec) throw IoSystemError(wait_ec);
-            continue;
+        if (!blocked) {
+            IoErrorCode send_ec;
+            // Send synchronously on the owning Worker. Native readiness is needed
+            // only for backpressure and never retains payload pointers.
+            const auto sent = socket.send_to(buffers, destination, 0, send_ec);
+            if (!send_ec) {
+                if (sent != total) ThrowLink(ErrorCode::INTERNAL);
+                break;
+            }
+            if (send_ec != io_error::would_block && send_ec != io_error::try_again)
+                throw IoSystemError(send_ec);
         }
-        if (send_ec) throw IoSystemError(send_ec);
-        if (sent != total) ThrowLink(ErrorCode::INTERNAL);
-        break;
+        const auto wait_ec = co_await Wait(udp::socket::wait_write, cancellation_state.slot());
+        if (operation.Cancelled()) ThrowCancelled(operation.CancellationReason());
+        if (wait_ec) throw IoSystemError(wait_ec);
     }
     timeouts.TouchActivity();
 }
@@ -304,23 +308,21 @@ net::awaitable<void> DatagramSocket::Impl::SendMultiBuffer(
     if (cancellation_state.cancelled() != net::cancellation_type::none)
         throw IoSystemError(io_error::operation_aborted);
     if (payload.size() <= buf::MultiBuffer::kInlineCapacity) {
+        std::array<net::const_buffer, buf::MultiBuffer::kInlineCapacity> inline_buffers;
+        std::size_t count = 0;
+        for (const auto* buffer : payload) {
+            const auto bytes = buffer->Bytes();
+            if (!bytes.empty()) {
+                inline_buffers[count++] = net::buffer(bytes.data(), bytes.size());
+            }
+        }
+        const std::span<const net::const_buffer> buffers(inline_buffers.data(), count);
         IoErrorCode send_ec;
         std::size_t sent = 0;
         {
-            std::array<net::const_buffer, buf::MultiBuffer::kInlineCapacity> inline_buffers;
-            std::size_t count = 0;
-            for (const auto* buffer : payload) {
-                const auto bytes = buffer->Bytes();
-                if (!bytes.empty()) {
-                    inline_buffers[count++] = net::buffer(bytes.data(), bytes.size());
-                }
-            }
-            if (count == 0) {
-                inline_buffers[0] = net::const_buffer{};
-                count = 1;
-            }
+            const net::const_buffer empty_datagram{};
             sent = socket.send_to(
-                std::span<const net::const_buffer>(inline_buffers.data(), count),
+                count == 0 ? std::span<const net::const_buffer>(&empty_datagram, 1) : buffers,
                 destination, 0, send_ec);
         }
         if (!send_ec) {
@@ -331,15 +333,17 @@ net::awaitable<void> DatagramSocket::Impl::SendMultiBuffer(
         if (send_ec != io_error::would_block && send_ec != io_error::try_again) {
             throw IoSystemError(send_ec);
         }
+        // Nothing suspended since the EAGAIN: wait before resending these descriptors.
+        co_await SendBuffers(operation, std::move(destination), buffers, true);
+        co_return;
     }
-
     ConstBufferSpanBuilder<buf::MultiBuffer::kInlineCapacity> spans;
     try {
         spans.AppendMultiBuffer(payload);
     } catch (const std::bad_alloc&) {
         ThrowLink(ErrorCode::RESOURCE_EXHAUSTED);
     }
-    co_await SendBuffers(operation, std::move(destination), spans.Span());
+    co_await SendBuffers(operation, std::move(destination), spans.Span(), false);
 }
 
 DatagramSocket::ReadOperation::ReadOperation(Impl& impl)
@@ -409,7 +413,7 @@ ErrorCode DatagramSocket::WriteOperation::CancellationReason() const noexcept {
 net::awaitable<void> DatagramSocket::WriteOperation::SendTo(
     udp::endpoint destination, std::span<const net::const_buffer> buffers) {
     CheckAvailable();
-    return impl_->SendBuffers(*this, std::move(destination), buffers);
+    return impl_->SendBuffers(*this, std::move(destination), buffers, false);
 }
 
 net::awaitable<void> DatagramSocket::WriteOperation::SendTo(

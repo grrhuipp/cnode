@@ -32,6 +32,7 @@
 #include <memory>
 #include <new>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 namespace vless {
@@ -2568,32 +2569,28 @@ void VlessEncryptionWriter::CheckWritable() const {
     }
 }
 
-net::awaitable<void> VlessEncryptionWriter::WriteMultiBuffer(
-    buf::MultiBuffer mb) {
+template <typename BufferRange>
+net::awaitable<void> VlessEncryptionWriter::WriteEncrypted(BufferRange source) {
+    constexpr bool kOwnsBuffers = std::is_same_v<BufferRange, buf::MultiBuffer>;
     CheckWritable();
     const auto cancellation = co_await net::this_coro::cancellation_state;
     if (cancellation.cancelled() != net::cancellation_type::none) {
         throw IoSystemError(io_error::operation_aborted,
                             "VLESS Encryption write cancelled");
     }
-    if (mb.empty()) {
-        co_return;
-    }
-    ConstBufferSpanBuilder<buf::MultiBuffer::kInlineCapacity> buffers;
-    buffers.AppendMultiBuffer(mb);
-    if (!buffers.empty()) {
-        co_await WriteBuffers(buffers.Span());
-    }
-    mb.clear();
-}
-
-net::awaitable<void> VlessEncryptionWriter::WriteBuffers(
-    std::span<const net::const_buffer> buffers) {
-    CheckWritable();
-    const auto cancellation = co_await net::this_coro::cancellation_state;
-    if (cancellation.cancelled() != net::cancellation_type::none) {
-        throw IoSystemError(io_error::operation_aborted,
-                            "VLESS Encryption write cancelled");
+    struct NoBuilder {};
+    [[maybe_unused]] std::conditional_t<kOwnsBuffers,
+                       ConstBufferSpanBuilder<buf::MultiBuffer::kInlineCapacity>,
+                       NoBuilder> builder;
+    std::span<const net::const_buffer> buffers;
+    if constexpr (kOwnsBuffers) {
+        if (source.empty()) {
+            co_return;
+        }
+        builder.AppendMultiBuffer(source);
+        buffers = builder.Span();
+    } else {
+        buffers = source;
     }
     bool record_started = false;
     try {
@@ -2694,6 +2691,18 @@ net::awaitable<void> VlessEncryptionWriter::WriteBuffers(
         }
         throw;
     }
+    if constexpr (kOwnsBuffers) {
+        source.clear();
+    }
+}
+
+net::awaitable<void> VlessEncryptionWriter::WriteMultiBuffer(buf::MultiBuffer mb) {
+    return WriteEncrypted(std::move(mb));
+}
+
+net::awaitable<void> VlessEncryptionWriter::WriteBuffers(
+    std::span<const net::const_buffer> buffers) {
+    return WriteEncrypted(buffers);
 }
 
 net::awaitable<void> VlessEncryptionWriter::AsyncShutdownWrite() {
