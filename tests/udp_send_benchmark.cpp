@@ -95,7 +95,7 @@ TEST(UdpSendBenchmark, VerifiedDatagrams) {
             size_t warm_rss = 0;
             auto exercise = [&]() -> net::awaitable<Measurement> {
                 (void)co_await Transfer(sender, peer, payload, owned, 128);
-                pool_before = memory::ThreadMemoryPool().GetFootprint().mapped_bytes;
+                pool_before = memory::ThreadMemoryPool().GetFootprint().committed_bytes;
                 warm_rss = benchmark::ResidentBytes();
                 co_return co_await Transfer(sender, peer, payload, owned, iterations);
             };
@@ -109,7 +109,7 @@ TEST(UdpSendBenchmark, VerifiedDatagrams) {
             io.run();
             ASSERT_TRUE(finished) << "UDP send benchmark exceeded overall deadline";
             const auto measured = result.get();
-            const auto pool_after = memory::ThreadMemoryPool().GetFootprint().mapped_bytes;
+            const auto pool_after = memory::ThreadMemoryPool().GetFootprint().committed_bytes;
             const auto process_memory = benchmark::ReadProcessMemory();
             // Both endpoints and exact verification are timed. The owned path
             // also includes payload construction and release, not just sendto.

@@ -39,18 +39,6 @@ private:
     std::size_t index_ = 0;
 };
 
-// The allocator's one maintenance wakeup must not inspect the scheduler's heap:
-// it can be updated reentrantly while that heap's PMR storage is reallocating.
-class TimeoutMaintenance {
-protected:
-    TimeoutMaintenance() noexcept = default;
-    ~TimeoutMaintenance() = default;
-    virtual void OnMaintenance() noexcept = 0;
-
-private:
-    friend class TimeoutScheduler;
-};
-
 // One indexed heap and native timer per Worker reactor.
 class TimeoutScheduler {
 public:
@@ -71,10 +59,6 @@ public:
     // Failure leaves this event unarmed; unrelated events remain scheduled.
     [[nodiscard]] bool ScheduleAfter(std::chrono::milliseconds delay, TimeoutEvent& event);
     void Cancel(TimeoutEvent& event) noexcept;
-
-    [[nodiscard]] bool SetMaintenanceDeadline(
-        TimeoutMaintenance& owner, std::chrono::steady_clock::time_point deadline);
-    void CancelMaintenance(TimeoutMaintenance& owner) noexcept;
 
     [[nodiscard]] ResourceStats GetResourceStats() const noexcept;
 

@@ -51,7 +51,7 @@ TEST(AllocatorAppendBenchmark, TrackedResource) {
                 ? std::min(kGrowingAppends, kOperationByteLimit / append_bytes) : 1;
             const std::size_t iterations = kBytesPerWorkload / (append_bytes * appends);
             ASSERT_GT(iterations, 0u);
-            memory::ThreadMemoryPool().PurgeIdle();
+            memory::ThreadMemoryPool().Collect();
 
             // Validate the exact append path outside timing, including every
             // preserved prefix after geometric growth. This also warms the pool.
@@ -112,15 +112,15 @@ TEST(AllocatorAppendBenchmark, TrackedResource) {
             std::printf("allocator-append mode=%s append_bytes=%zu appends_per_operation=%zu "
                         "operations=%zu bytes=%.0f wall_ns_per_byte=%.3f cpu_ns_per_byte=%.3f "
                         "sample_capacity=%zu sample_live_allocations=%zu live_after=%zu "
-                        "mapped_before=%zu mapped_after=%zu idle_after=%zu direct_after=%zu\n",
+                        "committed_before=%zu committed_after=%zu used_after=%zu pages_after=%zu\n",
                 growing ? "fresh-growing" : "pre-reserved", append_bytes, appends,
                 iterations, bytes, wall_ns / bytes, cpu_ns / bytes, sampled_capacity,
-                sampled_live_allocations, live_after, before.mapped_bytes, after.mapped_bytes,
-                after.idle_bytes, after.direct_bytes);
+                sampled_live_allocations, live_after, before.committed_bytes, after.committed_bytes,
+                after.used_bytes, after.pages);
         }
     }
     EXPECT_EQ(memory::ThreadMemoryPool().OutstandingAllocations(), baseline);
-    memory::ThreadMemoryPool().PurgeIdle();
+    memory::ThreadMemoryPool().Collect();
 }
 
 buf::MultiBuffer TransferBuffers(std::size_t count) {
@@ -148,7 +148,7 @@ TEST(MultiBufferBenchmark, TrackedTransfers) {
     const auto baseline = memory::ThreadMemoryPool().OutstandingAllocations();
     for (const std::size_t blocks : {1u, 8u, 9u, 16u}) {
         SCOPED_TRACE(blocks);
-        memory::ThreadMemoryPool().PurgeIdle();
+        memory::ThreadMemoryPool().Collect();
         {
             auto probe = TransferBuffers(blocks);
             ASSERT_EQ(probe.size(), blocks);
@@ -180,18 +180,18 @@ TEST(MultiBufferBenchmark, TrackedTransfers) {
         const double cpu_ns = static_cast<double>(CpuNanoseconds(cpu_end) - CpuNanoseconds(cpu_start));
         std::printf("multibuffer-transfer blocks=%zu operations=%zu "
                     "wall_ns_per_operation=%.3f cpu_ns_per_operation=%.3f "
-                    "live_after=%zu mapped_before=%zu mapped_after=%zu idle_after=%zu\n",
+                    "live_after=%zu committed_before=%zu committed_after=%zu used_after=%zu\n",
             blocks, iterations, wall_ns / iterations, cpu_ns / iterations,
             memory::ThreadMemoryPool().OutstandingAllocations() - baseline,
-            before.mapped_bytes, after.mapped_bytes, after.idle_bytes);
+            before.committed_bytes, after.committed_bytes, after.used_bytes);
     }
-    memory::ThreadMemoryPool().PurgeIdle();
+    memory::ThreadMemoryPool().Collect();
 }
 
 TEST(BufferSpanBenchmark, TrackedDescriptors) {
     const auto baseline = memory::ThreadMemoryPool().OutstandingAllocations();
     for (const std::size_t blocks : {1u, 8u, 9u, 16u}) {
-        memory::ThreadMemoryPool().PurgeIdle();
+        memory::ThreadMemoryPool().Collect();
         {
             auto payload = TransferBuffers(blocks);
             std::array<net::const_buffer, 16> input;
@@ -239,15 +239,15 @@ TEST(BufferSpanBenchmark, TrackedDescriptors) {
                 const double cpu_ns = static_cast<double>(CpuNanoseconds(cpu_end) - CpuNanoseconds(cpu_start));
                 std::printf("buffer-span source=%s blocks=%zu operations=%zu "
                             "wall_ns_per_operation=%.3f cpu_ns_per_operation=%.3f "
-                            "mapped_before=%zu mapped_after=%zu idle_after=%zu\n",
+                            "committed_before=%zu committed_after=%zu used_after=%zu\n",
                     from_multibuffer ? "multibuffer" : "descriptors", blocks, iterations,
                     wall_ns / iterations, cpu_ns / iterations,
-                    before.mapped_bytes, after.mapped_bytes, after.idle_bytes);
+                    before.committed_bytes, after.committed_bytes, after.used_bytes);
             }
         }
         ASSERT_EQ(memory::ThreadMemoryPool().OutstandingAllocations(), baseline);
     }
-    memory::ThreadMemoryPool().PurgeIdle();
+    memory::ThreadMemoryPool().Collect();
 }
 
 uint64_t FillAndDrain(memory::RingDeque<uint64_t>& queue,
@@ -269,7 +269,7 @@ TEST(RingDequeBenchmark, TrackedFillAndDrain) {
     const auto baseline = memory::ThreadMemoryPool().OutstandingAllocations();
     for (const std::size_t batch : {1u, 8u, 64u}) {
         SCOPED_TRACE(batch);
-        memory::ThreadMemoryPool().PurgeIdle();
+        memory::ThreadMemoryPool().Collect();
         memory::RingDeque<uint64_t> queue;
         for (std::size_t value = 0; value < batch; ++value) queue.push_back(value);
         for (std::size_t value = 0; value < batch; ++value) {
@@ -297,11 +297,11 @@ TEST(RingDequeBenchmark, TrackedFillAndDrain) {
         const double cpu_ns = static_cast<double>(CpuNanoseconds(cpu_end) - CpuNanoseconds(cpu_start));
         std::printf("ring-deque batch=%zu operations=%zu "
                     "wall_ns_per_operation=%.3f cpu_ns_per_operation=%.3f "
-                    "live_after=%zu mapped_before=%zu mapped_after=%zu idle_after=%zu\n",
+                    "live_after=%zu committed_before=%zu committed_after=%zu used_after=%zu\n",
             batch, iterations, wall_ns / iterations, cpu_ns / iterations,
             memory::ThreadMemoryPool().OutstandingAllocations() - baseline,
-            before.mapped_bytes, after.mapped_bytes, after.idle_bytes);
+            before.committed_bytes, after.committed_bytes, after.used_bytes);
     }
-    memory::ThreadMemoryPool().PurgeIdle();
+    memory::ThreadMemoryPool().Collect();
 }
 } // namespace

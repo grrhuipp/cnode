@@ -66,31 +66,20 @@ TEST_P(RuntimeSamplingBenchmark, EstablishedVlessSessions) {
         const auto process_memory = benchmark::ReadProcessMemory();
         std::sort(latency.begin(), latency.end());
         const auto wall_ns = std::chrono::duration<double, std::nano>(finish - start).count();
-        // A faster burst can finish before the existing idle-pool deadline.
-        // Let production maintenance run; never force-purge to hide retention.
-        {
-            net::steady_timer settle(fixture.io);
-            settle.expires_after(memory::kThreadMemoryPoolPurgeDelay * 2);
-            co_await settle.async_wait(net::use_awaitable);
-        }
-        const auto settled = memory::ThreadMemoryPool().GetFootprint();
-        const auto settled_memory = benchmark::ReadProcessMemory();
         std::printf("runtime-sampling sessions=%zu rounds=%zu resources=%u warmup=%zu "
                     "scope=worker_collect_only wall_ns_per_sample=%.3f cpu_ns_per_sample=%.3f "
                     "p50_ns=%.3f p95_ns=%.3f max_ns=%.3f cxx_new_calls=%" PRIu64 " "
                     "mi_aligned_calls=%" PRIu64 " idle_rss_bytes=%zu warm_rss_bytes=%zu "
-                    "after_rss_bytes=%zu process_peak_rss_bytes=%zu pool_before_bytes=%zu "
-                    "pool_after_bytes=%zu pool_idle_bytes=%zu anonymous_rss_bytes=%zu "
-                    "file_rss_bytes=%zu settled_pool_bytes=%zu settled_pool_idle_bytes=%zu "
-                    "settled_anonymous_rss_bytes=%zu settled_file_rss_bytes=%zu checksum=%" PRIu64 "\n",
+                    "after_rss_bytes=%zu process_peak_rss_bytes=%zu pool_committed_before=%zu "
+                    "pool_committed_after=%zu pool_used_after=%zu anonymous_rss_bytes=%zu "
+                    "file_rss_bytes=%zu checksum=%" PRIu64 "\n",
             sessions, rounds, static_cast<unsigned>(resources), warmup,
             wall_ns / rounds, static_cast<double>(cpu_finish - cpu_start) / rounds,
             latency[rounds / 2], latency[(rounds * 95 - 1) / 100], latency.back(),
             counts.cpp_calls, counts.aligned_calls, idle_rss, warm_rss, after_rss,
-            process_memory.peak_resident_bytes, before.mapped_bytes, after.mapped_bytes,
-            after.idle_bytes, process_memory.anonymous_resident_bytes, process_memory.file_resident_bytes,
-            settled.mapped_bytes, settled.idle_bytes,
-            settled_memory.anonymous_resident_bytes, settled_memory.file_resident_bytes, checksum);
+            process_memory.peak_resident_bytes, before.committed_bytes, after.committed_bytes,
+            after.used_bytes, process_memory.anonymous_resident_bytes, process_memory.file_resident_bytes,
+            checksum);
         // Setup, authentication, payload verification and shutdown are outside
         // timing. Run each parameter in a fresh process for comparable peak RSS.
         co_return;

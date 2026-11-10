@@ -169,21 +169,18 @@ bool TestWaitInitiationFailureAndRecovery() {
     return failed_calls == 0 && recovered_calls == 1;
 }
 
-bool TestHeapGrowthAndReentrantMaintenance() {
+bool TestHeapGrowthAndRelease() {
     ResourceScope resource;
     auto& pool = memory::ThreadMemoryPool();
-    pool.PurgeIdle();
+    const auto baseline = pool.OutstandingAllocations();
     bool passed = false;
     {
         net::io_context io;
         auto& scheduler = TimeoutScheduler::ForIoContext(io);
-        WorkerMemoryReclaimer reclaimer;
-        reclaimer.Start(scheduler);
         std::size_t fired = 0;
         std::deque<CounterEvent> events(12000);
         for (std::size_t i = 0; i != events.size(); ++i) {
             events[i].counter = &fired;
-            pool.PurgeIdle();
             (void)scheduler.ScheduleAfter(48h - std::chrono::seconds(i), events[i]);
         }
         const auto before = rejected_allocations;
@@ -206,8 +203,7 @@ bool TestHeapGrowthAndReentrantMaintenance() {
         io.restart();
         io.run();
     }
-    pool.PurgeIdle();
-    return passed && pool.GetFootprint().mapped_bytes == 0;
+    return passed && pool.OutstandingAllocations() == baseline;
 }
 
 bool TestShardAndRecycledContextOwnership() {
@@ -263,92 +259,6 @@ bool TestMaximumDelay() {
         timeout_allocation_test::rejected_asio_allocations == asio_before;
 }
 
-bool TestPoolMaintenance() {
-    net::io_context io;
-    auto& scheduler = TimeoutScheduler::ForIoContext(io);
-    auto& pool = memory::ThreadMemoryPool();
-    pool.PurgeIdle();
-    WorkerMemoryReclaimer reclaimer;
-    reclaimer.Start(scheduler);
-    std::vector<void*> buffers;
-    for (int i = 0; i < 12; ++i) {
-        auto* p = memory::AllocatePmr(8192, 16);
-        if (!p) return false;
-        buffers.push_back(p);
-    }
-    auto* held = buffers.back();
-    *static_cast<unsigned char*>(held) = 0xA5;
-    for (auto* p : buffers) if (p != held) memory::DeallocatePmr(p);
-    bool idle_returned = false;
-    Event probe([&] {
-        idle_returned = pool.GetFootprint().idle_bytes == 0 &&
-            *static_cast<unsigned char*>(held) == 0xA5;
-        memory::DeallocatePmr(held);
-    });
-    (void)scheduler.ScheduleAfter(50ms, probe);
-    io.run();
-    if (!idle_returned || pool.GetFootprint().idle_bytes != 0) return false;
-
-    io.restart();
-    auto* p = memory::AllocatePmr(8192, 8);
-    memory::DeallocatePmr(p);
-    p = memory::AllocatePmr(8192, 16);
-    *static_cast<unsigned char*>(p) = 0x5A;
-    bool reused_survived = false;
-    Event reuse_probe([&] {
-        reused_survived = pool.GetFootprint().idle_bytes == 0 &&
-            *static_cast<unsigned char*>(p) == 0x5A;
-        memory::DeallocatePmr(p);
-    });
-    (void)scheduler.ScheduleAfter(30ms, reuse_probe);
-    io.run();
-    if (!reused_survived || pool.GetFootprint().idle_bytes != 0) return false;
-
-    io.restart();
-    p = memory::AllocatePmr(8192, 16);
-    const auto before = memory::rejected_process_allocations;
-    memory::reject_next_process_allocation = true;
-    memory::DeallocatePmr(p);
-    memory::reject_next_process_allocation = false;
-    if (memory::rejected_process_allocations != before + 1 ||
-        pool.GetFootprint().idle_bytes) return false;
-    p = memory::AllocatePmr(8192, 16);
-    memory::DeallocatePmr(p);
-    io.run();
-    if (pool.GetFootprint().idle_bytes) return false;
-    TimeoutScheduler::ReleaseForIoContext(io);
-    p = memory::AllocatePmr(8192, 16);
-    memory::DeallocatePmr(p);
-    return pool.GetFootprint().idle_bytes == 0;
-}
-
-bool TestMaintenanceIsolation() {
-    struct Maintenance final : TimeoutMaintenance {
-        void OnMaintenance() noexcept override { ++calls; }
-        int calls = 0;
-    } first, other;
-    net::io_context io;
-    auto& scheduler = TimeoutScheduler::ForIoContext(io);
-    (void)scheduler.SetMaintenanceDeadline(first, std::chrono::steady_clock::now() + 5ms);
-    bool conflict = false;
-    try { (void)scheduler.SetMaintenanceDeadline(other, std::chrono::steady_clock::now()); }
-    catch (const std::logic_error&) { conflict = true; }
-    scheduler.CancelMaintenance(other);
-    CounterEvent cancelled;
-    (void)scheduler.ScheduleAfter(1ms, cancelled);
-    scheduler.Cancel(cancelled);
-    io.run();
-    if (!conflict || first.calls != 1 || other.calls != 0) return false;
-    io.restart();
-    (void)scheduler.SetMaintenanceDeadline(first, std::chrono::steady_clock::now() + 1h);
-    const auto before = timeout_allocation_test::rejected_asio_allocations;
-    timeout_allocation_test::reject_asio_allocations = reject_allocations = true;
-    scheduler.CancelMaintenance(first);
-    timeout_allocation_test::reject_asio_allocations = reject_allocations = false;
-    io.run();
-    return first.calls == 1 && timeout_allocation_test::rejected_asio_allocations == before;
-}
-
 bool TestOwnerThreadServiceDestruction() {
     ResourceScope resource;
     std::promise<bool> finished;
@@ -365,10 +275,7 @@ bool TestOwnerThreadServiceDestruction() {
             io->run();
             const bool drained = !scheduler.GetResourceStats().wait_pending;
             io.reset();
-            auto& pool = memory::ThreadMemoryPool();
-            pool.PurgeIdle();
-            const auto footprint = pool.GetFootprint();
-            finished.set_value(drained && footprint.mapped_bytes == 0 && footprint.direct_bytes == 0);
+            finished.set_value(drained && memory::ThreadMemoryPool().OutstandingAllocations() == 0);
         } catch (...) { finished.set_value(false); }
     });
     owner.join();
@@ -456,11 +363,9 @@ TEST(TimeoutScheduler, Contract) {
         {"reentrant owner destruction and exception isolation", TestReentrantDestructionAndExceptions},
         {"self rearm and I/O fairness", TestSelfRearmAndFairness},
         {"failed wait initiation and recovery", TestWaitInitiationFailureAndRecovery},
-        {"heap growth with PMR maintenance reentrancy", TestHeapGrowthAndReentrantMaintenance},
+        {"heap growth and release under allocation failure", TestHeapGrowthAndRelease},
         {"scheduler shard and recycled context ownership", TestShardAndRecycledContextOwnership},
         {"maximum and negative delay", TestMaximumDelay},
-        {"pool idle wakeup and OOM recovery", TestPoolMaintenance},
-        {"maintenance isolation", TestMaintenanceIsolation},
         {"owner-thread service destruction", TestOwnerThreadServiceDestruction},
         {"delay cancellation and reuse", TestDelayCancellationAndReuse},
         {"delay concurrent wait and maximum", TestDelayConcurrentWaitAndMaximum},

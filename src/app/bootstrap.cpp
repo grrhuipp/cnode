@@ -740,24 +740,24 @@ public:
             const double mem_mb = static_cast<double>(ReadResidentMemoryBytes()) / (1024.0 * 1024.0);
 
             size_t total_udp_sockets = 0;
-            size_t pool_mapped_bytes = 0;
-            size_t pool_direct_bytes = 0;
-            size_t pool_idle_bytes = 0;
-            size_t pool_chunks = 0;
+            size_t pool_committed_bytes = 0;
+            size_t pool_used_bytes = 0;
+            size_t pool_live_allocations = 0;
+            size_t pool_pages = 0;
             for (const auto& worker_snapshot : worker_snapshots) {
                 total_udp_sockets += worker_snapshot.memory.udp_sockets;
-                pool_mapped_bytes += worker_snapshot.memory.pool_mapped_bytes;
-                pool_direct_bytes += worker_snapshot.memory.pool_direct_bytes;
-                pool_idle_bytes += worker_snapshot.memory.pool_idle_bytes;
-                pool_chunks += worker_snapshot.memory.pool_chunks;
+                const auto& r = *worker_snapshot.resources;
+                pool_committed_bytes += r.pool_committed_bytes;
+                pool_used_bytes += r.pool_used_bytes;
+                pool_live_allocations += r.pool_live_allocations;
+                pool_pages += r.pool_pages;
             }
             const auto total_users = proxyman::inbound::UserStore::TotalUsers();
             LOG_CONSOLE("Runtime activity: conn={} users={} udp_sockets={}",
                         total_conns, total_users, total_udp_sockets);
-            LOG_CONSOLE("Runtime memory: resident={:.1f}MB pool_mapped={}MB pool_direct={}MB pool_idle={}KB pool_chunks={}",
-                        mem_mb, pool_mapped_bytes / (1024 * 1024),
-                        pool_direct_bytes / (1024 * 1024), pool_idle_bytes / 1024,
-                        pool_chunks);
+            LOG_CONSOLE("Runtime memory: resident={:.1f}MB pool_committed={}MB pool_used={}MB pool_live={} pool_pages={}",
+                        mem_mb, pool_committed_bytes / (1024 * 1024),
+                        pool_used_bytes / (1024 * 1024), pool_live_allocations, pool_pages);
             LOG_CONSOLE("Runtime traffic: traffic_in={} traffic_out={} rate_down={} rate_up={}",
                         ::FormatBytes(snapshot.bytes_in), ::FormatBytes(snapshot.bytes_out),
                         FormatRate(snapshot.bytes_in_rate), FormatRate(snapshot.bytes_out_rate));
@@ -774,9 +774,9 @@ public:
                 LOG_CONSOLE("Worker activity: id={} conn={} udp_sockets={} timeout_heap={}/{} timeout_waiters={}",
                             worker.worker_id, worker.active_connections, worker.memory.udp_sockets,
                             r.timeout_events, r.timeout_heap_capacity, r.timeout_waiters);
-                LOG_CONSOLE("Worker memory: id={} pool_mapped={} pool_direct={} pool_idle={} pool_chunks={}",
-                            worker.worker_id, worker.memory.pool_mapped_bytes, worker.memory.pool_direct_bytes,
-                            worker.memory.pool_idle_bytes, worker.memory.pool_chunks);
+                LOG_CONSOLE("Worker memory: id={} pool_committed={} pool_used={} pool_live={} pool_pages={}",
+                            worker.worker_id, r.pool_committed_bytes, r.pool_used_bytes,
+                            r.pool_live_allocations, r.pool_pages);
                 LOG_CONSOLE("Worker UDP resources: id={} udp_listeners={} udp_receive_loops={} udp_resource_drops={} udp_associations={} udp_closed={} udp_reply_senders={}",
                             worker.worker_id, r.udp_listeners, r.udp_receive_loops, r.udp_resource_drops,
                             r.udp_associations, r.udp_closed_associations, r.udp_reply_senders);

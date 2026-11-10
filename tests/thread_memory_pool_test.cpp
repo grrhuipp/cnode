@@ -33,117 +33,33 @@ bool Intact(void* p, size_t bytes, uint8_t pattern) {
 
 bool RunBoundaries() {
     Pool pool;
-    for (size_t bytes = 0; bytes <= kThreadMemoryPoolMaxClass + 32; ++bytes) {
-        const auto layout = Pool::Describe(bytes, 16);
+    for (size_t bytes = 0; bytes <= 16 * 1024 + 32; ++bytes) {
         void* p = pool.Allocate(bytes, 16);
-        if (!p || reinterpret_cast<uintptr_t>(p) % 16 || layout.slots == 0) return false;
+        if (!p || reinterpret_cast<uintptr_t>(p) % 16) return false;
         std::memset(p, 0xa5, bytes);
         pool.Deallocate(p, bytes, 16);
     }
-    pool.PurgeIdle();
-    for (size_t bytes : {1u, 31u, 128u, 2048u, 4000u, 8192u, 17408u, 32768u, 65536u}) {
+    for (size_t bytes : {1u, 24u, 31u, 128u, 2048u, 4000u, 8192u, 17408u, 32768u, 65536u}) {
         for (size_t alignment = 1; alignment <= 65536; alignment *= 2) {
             for (int round = 0; round < 8; ++round) {
                 void* p = pool.Allocate(bytes, alignment);
                 if (!p || reinterpret_cast<uintptr_t>(p) % alignment) return false;
                 std::memset(p, 0x6b, bytes);
                 pool.Deallocate(p, bytes, alignment);
-                if (pool.GetFootprint().direct_bytes) return false;
             }
         }
     }
-    pool.PurgeIdle();
     constexpr auto maximum = std::numeric_limits<size_t>::max();
-    return !pool.Allocate(maximum, 16) && !pool.Allocate(maximum - 64, 16) &&
+    return !pool.Allocate(maximum, 16) && !pool.Allocate(maximum - 8, 16) &&
         !pool.Allocate(1024, 0) && !pool.Allocate(1024, 3) &&
-        !pool.Allocate(1024, maximum) && pool.GetFootprint().mapped_bytes == 0;
-}
-
-bool RunGeometry() {
-    // Finer classes and a single header, with no protocol-specific exceptions.
-    if (Pool::Describe(240, 8).slot_bytes != 256 ||
-        Pool::Describe(632, 8).slot_bytes != 704 ||
-        Pool::Describe(8296, 8).slot_bytes != 8448 ||
-        Pool::Describe(17408, 8).slot_bytes != 20480) return false;
-    size_t last_stride = 0;
-    for (size_t bytes = 1; bytes <= kThreadMemoryPoolMaxClass - 16; ++bytes) {
-        const auto layout = Pool::Describe(bytes, 8, 4);
-        if (layout.slot_bytes == last_stride) continue;
-        last_stride = layout.slot_bytes;
-        Pool pool;
-        std::vector<void*> blocks;
-        size_t expected_maps = 0;
-        for (size_t depth = 0; depth < 5; ++depth) {
-            const auto tier = Pool::Describe(bytes, 16, depth);
-            if (!tier.slots || tier.direct || tier.map_bytes % kAllocationPageBytes ||
-                tier.slot_bytes % 16 || tier.map_bytes > std::max(kAllocationPageBytes, kThreadMemoryPoolTargetBytes))
-                return false;
-            expected_maps += tier.map_bytes;
-            for (size_t i = 0; i < tier.slots; ++i) {
-                void* p = pool.Allocate(bytes, i % 2 ? 8 : 16);
-                if (!p || reinterpret_cast<uintptr_t>(p) % 16) return false;
-                std::memset(p, 0x5a, bytes);
-                blocks.push_back(p);
-                if (pool.GetFootprint().chunks != depth + 1) return false;
-            }
-            if (pool.GetFootprint().mapped_bytes != expected_maps || pool.GetFootprint().direct_bytes)
-                return false;
-        }
-        for (auto* p : blocks) {
-            if (!Intact(p, bytes, 0x5a)) return false;
-            pool.Deallocate(p);
-        }
-        if (pool.GetFootprint().idle_bytes != expected_maps) return false;
-        pool.PurgeIdle();
-        if (pool.GetFootprint().mapped_bytes || pool.GetFootprint().chunks) return false;
-    }
-    return true;
-}
-
-bool RunFragmented() {
-    Pool pool;
-    std::array<void*, 512> blocks{};
-    std::array<void*, 48> pinned{};
-    for (auto& pin : pinned) {
-        for (auto& block : blocks) {
-            block = pool.Allocate(128, 16);
-            if (!block) return false;
-            std::memset(block, 0x5a, 128);
-        }
-        pin = blocks[0];
-        for (size_t i = 1; i < blocks.size(); ++i) pool.Deallocate(blocks[i]);
-        if (pool.GetFootprint().mapped_bytes > 8 * kThreadMemoryPoolTargetBytes) return false;
-    }
-    for (auto* pin : pinned) {
-        if (!Intact(pin, 128, 0x5a)) return false;
-        pool.Deallocate(pin);
-    }
-    pool.PurgeIdle();
-
-    // Mixed 8/16-byte callers reuse identical, baseline-aligned slots. An
-    // oversized next request must not inflate the old slot into its neighbor.
-    void* first = pool.Allocate(600, 8);
-    void* held = pool.Allocate(600, 16);
-    if (!first || !held) return false;
-    std::memset(held, 0x6b, 600);
-    pool.Deallocate(first);
-    void* reused = pool.Allocate(624, 16);
-    if (reused != first) return false;
-    std::memset(reused, 0xa5, 624);
-    pool.Deallocate(reused);
-    void* larger = pool.Allocate(625, 8);
-    if (!larger || larger == first) return false;
-    std::memset(larger, 0xa7, 625);
-    if (!Intact(held, 600, 0x6b)) return false;
-    pool.Deallocate(larger);
-    pool.Deallocate(held);
-    return true;
+        !pool.Allocate(1024, maximum) && pool.OutstandingAllocations() == 0;
 }
 
 bool RunMixed() {
     Pool pool;
     struct Slot { void* ptr = nullptr; size_t bytes = 0; size_t alignment = 0; uint8_t pattern = 0; };
     std::array<Slot, 256> slots{};
+    size_t live = 0;
     uint32_t state = 0xb35dff21u;
     const auto next = [&state] {
         state ^= state << 13; state ^= state >> 17; state ^= state << 5;
@@ -155,6 +71,7 @@ bool RunMixed() {
             if (!Intact(slot.ptr, slot.bytes, slot.pattern)) return false;
             pool.Deallocate(slot.ptr, slot.bytes, slot.alignment);
             slot.ptr = nullptr;
+            --live;
         } else {
             slot.bytes = 8 + next() % (step % 5 ? 2000 : 34000);
             slot.alignment = step % 8 ? (next() % 2 ? 8 : 16) : size_t{1} << (3 + next() % 8);
@@ -162,105 +79,46 @@ bool RunMixed() {
             slot.ptr = pool.Allocate(slot.bytes, slot.alignment);
             if (!slot.ptr || reinterpret_cast<uintptr_t>(slot.ptr) % slot.alignment) return false;
             std::memset(slot.ptr, slot.pattern, slot.bytes);
+            ++live;
         }
-        if (step % 97 == 0) for (const auto& live : slots)
-            if (live.ptr && !Intact(live.ptr, live.bytes, live.pattern)) return false;
+        if (step % 997 == 0 && pool.OutstandingAllocations() != live) return false;
+        if (step % 97 == 0) for (const auto& held : slots)
+            if (held.ptr && !Intact(held.ptr, held.bytes, held.pattern)) return false;
     }
     for (const auto& slot : slots) {
         if (slot.ptr && !Intact(slot.ptr, slot.bytes, slot.pattern)) return false;
         pool.Deallocate(slot.ptr, slot.bytes, slot.alignment);
     }
-    pool.PurgeIdle();
-    return pool.GetFootprint().mapped_bytes == 0;
+    pool.Collect();
+    return pool.OutstandingAllocations() == 0;
 }
 
-bool RunPinnedChunks() {
+bool RunCollectReleasesEmptyPages() {
     Pool pool;
-    constexpr size_t bytes = 8192;
     std::vector<void*> blocks;
-    for (size_t depth = 0; depth < 5; ++depth) {
-        const auto layout = Pool::Describe(bytes, 16, depth);
-        for (size_t i = 0; i < layout.slots; ++i) {
-            auto* p = pool.Allocate(bytes, 16);
-            if (!p) return false;
-            std::memset(p, 0xa5, bytes);
-            blocks.push_back(p);
-        }
+    for (size_t i = 0; i < 4096; ++i) {
+        void* p = pool.Allocate(i % 2 ? 96 : 8192, 16);
+        if (!p) return false;
+        blocks.push_back(p);
     }
-    void* held = blocks.back();
-    const auto held_map = Pool::Describe(bytes, 16, 4).map_bytes;
-    for (auto* p : blocks) if (p != held) pool.Deallocate(p);
-    std::this_thread::sleep_for(kThreadMemoryPoolPurgeDelay + 5ms);
-    pool.Purge();
-    if (pool.GetFootprint().mapped_bytes != held_map || pool.GetFootprint().idle_bytes ||
-        !Intact(held, bytes, 0xa5)) return false;
-    auto* reused = pool.Allocate(bytes, 8);
-    if (!reused || pool.GetFootprint().chunks != 1) return false;
-    pool.Deallocate(reused);
-    pool.Deallocate(held);
-    pool.PurgeIdle();
-    return !pool.GetFootprint().mapped_bytes;
-}
-
-bool RunIdleQueue() {
-    Pool pool;
-    struct Observer final : Pool::IdleWakeup {
-        int wakeups = 0;
-        void OnPoolIdle() noexcept override { ++wakeups; }
-    } observer, other;
-    if (!pool.BindIdleWakeup(observer)) return false;
-    if (pool.BindIdleWakeup(other)) return false;
-    std::array<void*, 3> blocks{};
-    constexpr std::array<size_t, 3> sizes{64, 256, 8192};
-    size_t idle_bytes = 0;
-    for (size_t i = 0; i < 3; ++i) {
-        blocks[i] = pool.Allocate(sizes[i], 16);
-        if (!blocks[i]) return false;
-        idle_bytes += Pool::Describe(sizes[i], 16).map_bytes;
-    }
+    const auto loaded = pool.GetFootprint();
+    if (pool.OutstandingAllocations() != blocks.size() || loaded.pages == 0 ||
+        loaded.committed_bytes < loaded.used_bytes) return false;
     for (auto* p : blocks) pool.Deallocate(p);
-    if (observer.wakeups != 1 || pool.GetFootprint().idle_bytes != idle_bytes) return false;
-    for (size_t i : {1, 0, 2}) {
-        blocks[i] = pool.Allocate(sizes[i], 8);
-        idle_bytes -= Pool::Describe(sizes[i], 16).map_bytes;
-        if (!blocks[i] || pool.GetFootprint().idle_bytes != idle_bytes) return false;
-        std::memset(blocks[i], 0x5a, sizes[i]);
-    }
-    pool.Deallocate(blocks[0]);
-    const auto deadline = pool.NextPurgeDeadline();
-    std::this_thread::sleep_until(deadline + 5ms);
-    pool.Deallocate(blocks[1]);
-    if (pool.GetFootprint().chunks != 2 || pool.NextPurgeDeadline() <= deadline ||
-        !Intact(blocks[2], sizes[2], 0x5a)) return false;
-    pool.Deallocate(blocks[2]);
-    std::this_thread::sleep_until(pool.NextPurgeDeadline() + kThreadMemoryPoolPurgeDelay);
-    pool.Purge();
-    if (pool.GetFootprint().chunks || pool.GetFootprint().idle_bytes) return false;
-    pool.UnbindIdleWakeup(observer);
-    // A scheduling-OOM fallback may immediately destroy the just-freed chunk.
-    struct ImmediatePurge final : Pool::IdleWakeup {
-        explicit ImmediatePurge(Pool& pool) : pool(pool) {}
-        void OnPoolIdle() noexcept override { pool.PurgeIdle(); }
-        Pool& pool;
-    } immediate(pool);
-    if (!pool.BindIdleWakeup(immediate)) return false;
-    void* p = pool.Allocate(256, 16);
-    if (!p) return false;
-    pool.Deallocate(p);
-    pool.UnbindIdleWakeup(immediate);
-    return !pool.GetFootprint().mapped_bytes;
+    pool.Collect();
+    const auto collected = pool.GetFootprint();
+    return pool.OutstandingAllocations() == 0 && collected.used_bytes == 0 &&
+        collected.committed_bytes < loaded.committed_bytes;
 }
 
 bool RunOwnershipAndPmr() {
     auto& pool = ThreadMemoryPool();
-    pool.PurgeIdle();
+    const auto baseline = pool.OutstandingAllocations();
     void* p = AllocatePmr(8192, 16);
-    if (!p) return false;
+    if (!p || pool.OutstandingAllocations() != baseline + 1) return false;
     std::memset(p, 0xa5, 8192);
     DeallocatePmr(p);
-    if (pool.GetFootprint().mapped_bytes == 0) return false;
-    pool.PurgeIdle();
-    if (pool.GetFootprint().mapped_bytes != 0) return false;
+    if (pool.OutstandingAllocations() != baseline) return false;
     reject_next_pmr_allocation = true;
     if (AllocatePmr(17) || reject_next_pmr_allocation) return false;
     for (size_t alignment : {8u, 16u, 64u, 4096u}) {
@@ -268,33 +126,29 @@ bool RunOwnershipAndPmr() {
         if (!p || reinterpret_cast<uintptr_t>(p) % alignment) return false;
         DeallocatePmr(p);
     }
-    pool.PurgeIdle();
-    return pool.GetFootprint().mapped_bytes == 0 && !AllocatePmr(std::numeric_limits<size_t>::max());
+    return pool.OutstandingAllocations() == baseline &&
+        !AllocatePmr(std::numeric_limits<size_t>::max());
 }
 
 bool RunBuffer() {
     using ::buf::Buffer;
     auto& pool = ThreadMemoryPool();
-    pool.PurgeIdle();
+    const auto baseline = pool.OutstandingAllocations();
     std::array<Buffer*, 64> buffers{};
     for (auto& p : buffers) {
         p = Buffer::New();
-        if (!p) return false;
+        if (!p || p->Len() || p->HasUDP()) return false;
         std::memset(p->data, 0x5a, Buffer::kSize);
         p->Produce(1);
     }
-    const auto maps = pool.GetFootprint().mapped_bytes;
-    auto* freed = buffers.back();
-    Buffer::Free(freed);
+    if (pool.OutstandingAllocations() != baseline + buffers.size()) return false;
+    Buffer::Free(buffers.back());
     buffers.back() = Buffer::New();
-    if (buffers.back() != freed || freed->Len() || freed->HasUDP() ||
-        pool.GetFootprint().mapped_bytes != maps || pool.GetFootprint().direct_bytes) return false;
-    for (auto* p : buffers) {
-        if (p != freed && !Intact(p->data, Buffer::kSize, 0x5a)) return false;
-        Buffer::Free(p);
-    }
-    pool.PurgeIdle();
-    return !pool.GetFootprint().mapped_bytes;
+    if (!buffers.back() || buffers.back()->Len() || buffers.back()->HasUDP()) return false;
+    for (size_t i = 0; i + 1 < buffers.size(); ++i)
+        if (!Intact(buffers[i]->data, Buffer::kSize, 0x5a)) return false;
+    for (auto* p : buffers) Buffer::Free(p);
+    return pool.OutstandingAllocations() == baseline;
 }
 
 bool RunSharedAllocation() {
@@ -320,14 +174,12 @@ bool RunSharedAllocation() {
         weak = object;
         passed &= *object->payload == 42 &&
             reinterpret_cast<uintptr_t>(object.get()) % alignof(SharedObject) == 0 &&
-            object->shared_from_this() == object && pool.GetFootprint().mapped_bytes != 0;
+            object->shared_from_this() == object && pool.OutstandingAllocations() == 1;
     }
-    passed &= destroyed == 1 && weak.expired();
-    pool.PurgeIdle();
-    passed &= pool.GetFootprint().mapped_bytes != 0;
+    // The control block outlives the object while a weak reference remains.
+    passed &= destroyed == 1 && weak.expired() && pool.OutstandingAllocations() == 1;
     weak.reset();
-    pool.PurgeIdle();
-    passed &= pool.GetFootprint().mapped_bytes == 0;
+    passed &= pool.OutstandingAllocations() == 0;
 
     bool threw = false;
     try {
@@ -335,8 +187,7 @@ bool RunSharedAllocation() {
     } catch (const std::runtime_error&) {
         threw = true;
     }
-    pool.PurgeIdle();
-    passed &= threw && pool.GetFootprint().mapped_bytes == 0;
+    passed &= threw && pool.OutstandingAllocations() == 0;
     std::pmr::set_default_resource(previous);
     return passed;
 }
@@ -400,73 +251,34 @@ struct AllocatorAwareEntry {
     }
 };
 
-bool RunLargeBlockCache() {
-    CountingResource upstream;
+bool RunSessionContextAndIdleDeque() {
+    Pool worker;
+    auto* prev = std::pmr::set_default_resource(worker.resource());
+    bool passed = true;
     {
-        worker_memory pool(upstream, {.retained_block_bytes_ = 2 * 36864});
-        auto* resource = pool.resource();
-        // 40000 and 38000 both round to the same 40 KiB class in the block cache.
-        void* first = resource->allocate(40000, 16);
-        std::memset(first, 0x33, 40000);
-        resource->deallocate(first, 40000, 16);
-        const auto allocs_after_free = upstream.allocations;
-        void* second = resource->allocate(38000, 16);
-        if (second != first || upstream.allocations != allocs_after_free) return false;
-        resource->deallocate(second, 38000, 16);
-        pool.PurgeIdle();
-        if (upstream.live != 0 || upstream.live_bytes != 0) return false;
-
-        // Retention budget keeps 2 blocks of 32 KiB class and returns the 3rd immediately.
-        std::array<void*, 3> blocks{};
-        for (auto& b : blocks) b = resource->allocate(30000, 16);
-        for (auto* b : blocks) resource->deallocate(b, 30000, 16);
-        if (upstream.live != 2) return false;
-        pool.PurgeIdle();
-        if (upstream.live != 0) return false;
+        ::session::Context ctx;
+        passed &= ctx.inbound.tag.get_allocator().resource() == worker.resource() &&
+            ctx.content.protocol.get_allocator().resource() == worker.resource();
+        ctx.inbound.tag = "panel/multi-tier-arena-test/node-100/vless/443";
+        ctx.inbound.user_email = "arena-user-with-long-identifier@example.com";
+        passed &= worker.OutstandingAllocations() == 2;
     }
-    return upstream.live == 0 && upstream.allocations == upstream.returns;
+    passed &= worker.OutstandingAllocations() == 0;
+    {
+        ThreadLocalDeque<int> idle_deque(worker.resource());
+        passed &= worker.OutstandingAllocations() == 0 && idle_deque.capacity() == 0;
+        for (int i = 0; i < 16; ++i) idle_deque.push_back(i);
+        for (int i = 0; i < 16; ++i) {
+            passed &= idle_deque.front() == i;
+            idle_deque.pop_front();
+        }
+        passed &= idle_deque.empty() && idle_deque.capacity() == 0 &&
+            worker.OutstandingAllocations() == 0;
+    }
+    std::pmr::set_default_resource(prev);
+    return passed;
 }
 
-bool RunRequestArenaAndContext() {
-    CountingResource upstream;
-    {
-        worker_memory worker(upstream);
-        auto* prev = std::pmr::set_default_resource(worker.resource());
-        {
-            ::session::Context ctx;
-            if (ctx.inbound.tag.get_allocator().resource() != worker.resource() ||
-                ctx.content.protocol.get_allocator().resource() != worker.resource()) {
-                std::pmr::set_default_resource(prev);
-                return false;
-            }
-            ctx.inbound.tag = "panel/multi-tier-arena-test/node-100/vless/443";
-            ctx.inbound.user_email = "arena-user-with-long-identifier@example.com";
-        }
-        {
-            worker_memory deque_pool(upstream);
-            ThreadLocalDeque<int> idle_deque(deque_pool.resource());
-            if (deque_pool.GetFootprint().mapped_bytes != 0 || idle_deque.capacity() != 0) {
-                std::pmr::set_default_resource(prev);
-                return false;
-            }
-            for (int i = 0; i < 16; ++i) idle_deque.push_back(i);
-            for (int i = 0; i < 16; ++i) {
-                if (idle_deque.front() != i) {
-                    std::pmr::set_default_resource(prev);
-                    return false;
-                }
-                idle_deque.pop_front();
-            }
-            if (!idle_deque.empty() || idle_deque.capacity() != 0 ||
-                deque_pool.GetFootprint().idle_bytes != deque_pool.GetFootprint().mapped_bytes) {
-                std::pmr::set_default_resource(prev);
-                return false;
-            }
-        }
-        std::pmr::set_default_resource(prev);
-    }
-    return upstream.live == 0 && upstream.allocations == upstream.returns;
-}
 
 template <class Action>
 bool RejectsLeaseViolation(Action action) {
@@ -496,60 +308,25 @@ bool RunCrossThreadRejection() {
         std::thread wrong([block] { DeallocatePmr(block); });
         wrong.join();
     });
-    return cross_thread_allocate && cross_thread_free;
-}
-
-bool RunWorkerSharedDomainPacking() {
-    constexpr std::array<std::size_t, 13> strides{
-        64, 80, 96, 112, 128, 144, 160, 176, 192, 448, 512, 640, 1792};
-    constexpr std::size_t batches_count = 1000;
-    std::vector<std::array<void*, strides.size()>> blocks(batches_count);
-    auto& pool = ThreadMemoryPool();
-    pool.PurgeIdle();
-    if (pool.OutstandingAllocations() != 0) return false;
-    const auto before = pool.GetFootprint().mapped_bytes;
-    std::size_t live_stride_bytes = 0;
-    for (const auto stride : strides) live_stride_bytes += stride * batches_count;
-
-    for (std::size_t index = 0; index < batches_count; ++index) {
-        for (std::size_t slot = 0; slot < strides.size(); ++slot) {
-            blocks[index][slot] =
-                pool.Allocate(strides[slot] - 16, 16);
-            if (!blocks[index][slot]) return false;
-        }
-    }
-    const auto mapped = pool.GetFootprint().mapped_bytes - before;
-    if (sizeof(ThreadLocalAllocator<std::byte>) != sizeof(void*) ||
-        pool.OutstandingAllocations() != batches_count * strides.size() ||
-        mapped > live_stride_bytes * 2) return false;
-
-    std::printf(
-        "worker-shared domain packing: batches=%zu live-stride=%zu mapped=%zu "
-        "allocator=%zu\n",
-        batches_count, live_stride_bytes, mapped,
-        sizeof(ThreadLocalAllocator<std::byte>));
-    for (std::size_t index = 0; index < batches_count; ++index) {
-        for (std::size_t slot = 0; slot < strides.size(); ++slot) {
-            pool.Deallocate(blocks[index][slot], strides[slot] - 16, 16);
-        }
-    }
-    if (pool.OutstandingAllocations() != 0) return false;
-    pool.PurgeIdle();
-    return pool.GetFootprint().mapped_bytes == before;
+    const bool foreign_pool_free = RejectsLeaseViolation([] {
+        worker_memory owner, other;
+        void* block = owner.Allocate(256, 16);
+        if (!block || !other.Allocate(16, 16)) std::_Exit(1);
+        other.Deallocate(block);
+    });
+    return cross_thread_allocate && cross_thread_free && foreign_pool_free;
 }
 
 bool RunAll() {
     struct Case { const char* name; bool (*run)(); };
     for (const auto& test : std::array{
-        Case{"boundaries/alignment/overflow", RunBoundaries}, Case{"geometry", RunGeometry},
-        Case{"fragmented/mixed alignment", RunFragmented}, Case{"mixed lifetime", RunMixed},
-        Case{"pinned chunks", RunPinnedChunks}, Case{"idle FIFO", RunIdleQueue},
+        Case{"boundaries/alignment/overflow", RunBoundaries},
+        Case{"mixed lifetime", RunMixed},
+        Case{"collect releases empty pages", RunCollectReleasesEmptyPages},
         Case{"ownership/PMR/OOM", RunOwnershipAndPmr}, Case{"Buffer", RunBuffer},
         Case{"shared allocation/alignment/exception", RunSharedAllocation},
-        Case{"large block cache", RunLargeBlockCache},
-        Case{"session context and idle deque", RunRequestArenaAndContext},
-        Case{"cross-thread violations", RunCrossThreadRejection},
-        Case{"Worker-shared pool compacts sparse objects", RunWorkerSharedDomainPacking}}) {
+        Case{"session context and idle deque", RunSessionContextAndIdleDeque},
+        Case{"cross-thread and foreign-pool violations", RunCrossThreadRejection}}) {
         if (!test.run()) {
             std::fprintf(stderr, "pool case failed: %s\n", test.name);
             return false;

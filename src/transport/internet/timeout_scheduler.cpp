@@ -30,9 +30,6 @@ struct TimeoutScheduler::Impl {
     bool released = false;
     bool dispatching = false;
     std::chrono::steady_clock::time_point armed_deadline{};
-    std::chrono::steady_clock::time_point maintenance_deadline =
-        std::chrono::steady_clock::time_point::max();
-    TimeoutMaintenance* maintenance = nullptr;
 
     static bool Before(const TimeoutEvent* lhs, const TimeoutEvent* rhs) noexcept {
         if (lhs->deadline_ != rhs->deadline_) return lhs->deadline_ < rhs->deadline_;
@@ -94,15 +91,9 @@ struct TimeoutScheduler::Impl {
         wakeup_requested = true;
     }
     void ArmTimer() {
-        const auto deadline = heap.empty() ? maintenance_deadline
-            : std::min(heap.front()->deadline_, maintenance_deadline);
-        ArmDeadline(deadline);
-    }
-    void ArmDeadline(std::chrono::steady_clock::time_point deadline) {
-        // A live event at max() still needs a cancellable native wait. Only an
-        // empty heap uses max() to mean that no deadline is armed.
-        if (released || dispatching ||
-            (deadline == std::chrono::steady_clock::time_point::max() && heap.empty())) return;
+        // A live event at max() still needs a cancellable native wait.
+        if (released || dispatching || heap.empty()) return;
+        const auto deadline = heap.front()->deadline_;
         if (wait_pending) {
             if (deadline < armed_deadline) RequestWakeup();
             return;
@@ -115,8 +106,7 @@ struct TimeoutScheduler::Impl {
         wakeup_requested = false;
     }
     void ReconcileCancellation() noexcept {
-        if (heap.empty() && maintenance_deadline == std::chrono::steady_clock::time_point::max())
-            RequestWakeup();
+        if (heap.empty()) RequestWakeup();
     }
     void OnTimer(const IoErrorCode& ec);
     void Release() noexcept;
@@ -139,11 +129,6 @@ void TimeoutScheduler::Impl::OnTimer(const IoErrorCode& ec) {
             Remove(*event);
             event->OnTimeout();
         }
-        if (!released && maintenance && maintenance_deadline <= std::chrono::steady_clock::now()) {
-            auto* owner = maintenance;
-            maintenance_deadline = std::chrono::steady_clock::time_point::max();
-            owner->OnMaintenance();
-        }
     } catch (...) {
         dispatching = false;
         if (!released) ArmTimer();
@@ -155,8 +140,6 @@ void TimeoutScheduler::Impl::OnTimer(const IoErrorCode& ec) {
 
 void TimeoutScheduler::Impl::Release() noexcept {
     released = true;
-    maintenance_deadline = std::chrono::steady_clock::time_point::max();
-    maintenance = nullptr;
     RequestWakeup();
     while (!heap.empty()) heap.back()->Cancel();
     decltype(heap){}.swap(heap);
@@ -256,23 +239,6 @@ void TimeoutScheduler::Cancel(TimeoutEvent& event) noexcept {
     if (event.owner_ != this) return;
     impl_->Remove(event);
     impl_->ReconcileCancellation();
-}
-bool TimeoutScheduler::SetMaintenanceDeadline(
-    TimeoutMaintenance& owner, std::chrono::steady_clock::time_point deadline) {
-    if (impl_->released) return false;
-    if (impl_->maintenance && impl_->maintenance != &owner)
-        throw std::logic_error("timeout maintenance owner conflict");
-    impl_->maintenance = &owner;
-    impl_->maintenance_deadline = deadline;
-    impl_->ArmDeadline(deadline);
-    return true;
-}
-void TimeoutScheduler::CancelMaintenance(TimeoutMaintenance& owner) noexcept {
-    if (impl_->maintenance != &owner) return;
-    const auto old_deadline = std::exchange(impl_->maintenance_deadline,
-        std::chrono::steady_clock::time_point::max());
-    impl_->maintenance = nullptr;
-    if (impl_->armed_deadline >= old_deadline) impl_->RequestWakeup();
 }
 TimeoutScheduler::ResourceStats TimeoutScheduler::GetResourceStats() const noexcept {
     return {.active_events = impl_->heap.size(), .heap_capacity = impl_->heap.capacity(),

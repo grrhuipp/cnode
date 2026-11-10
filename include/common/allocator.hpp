@@ -24,10 +24,7 @@
 #include <vector>
 
 #include <sys/prctl.h>
-#include <unistd.h>
-#if defined(CNODE_USE_MIMALLOC) && !defined(__SANITIZE_ADDRESS__)
 #include <mimalloc.h>
-#endif
 
 namespace memory {
 
@@ -46,22 +43,6 @@ inline void OnBufferFree() noexcept { --detail::test_buffers_live; }
 inline void OnBufferNew() noexcept {}
 inline void OnBufferFree() noexcept {}
 #endif
-
-inline constexpr std::size_t kThreadMemoryPoolTargetBytes = 64 * 1024;
-inline constexpr std::size_t kThreadMemoryPoolMaxClass = 16 * 1024;
-inline constexpr std::size_t kLargeBlockGranularity = 4 * 1024;
-inline constexpr std::size_t kMaxCachedBlockBytes = 1024 * 1024;
-inline constexpr std::size_t kMaxCachedBlockAlignment = 64;
-inline constexpr std::size_t default_retained_block_bytes = std::size_t{8} * 1024 * 1024;
-inline constexpr std::size_t max_retained_block_bytes = static_cast<std::size_t>(PTRDIFF_MAX);
-inline constexpr std::chrono::milliseconds kThreadMemoryPoolPurgeDelay{10};
-
-inline const std::size_t kAllocationPageBytes = []() noexcept -> std::size_t {
-    const long page = ::sysconf(_SC_PAGESIZE);
-    if (page > 0 && (page & (page - 1)) == 0)
-        return static_cast<std::size_t>(page);
-    return 4096;
-}();
 
 inline void DisableTransparentHugePages() noexcept {
     (void)::prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
@@ -155,112 +136,55 @@ private:
     return resource;
 }
 
-struct memory_pool_config {
-    std::size_t retained_block_bytes_{default_retained_block_bytes};
-};
-
-inline void validate_memory_pool_config(const memory_pool_config& config) {
-    if (config.retained_block_bytes_ > max_retained_block_bytes) {
-        throw std::invalid_argument(
-            "memory pool retained block bytes exceed the addressable maximum");
-    }
-}
-
-// Two-tier Worker-local memory pool:
-// - Tier 1 (<= 16 KiB): size-class slabs with baseline 16-byte slot alignment.
-// - Tier 2 (16 KiB < size <= 1 MiB, alignment <= 64): 4 KiB-rounded LIFO block
-//   cache bounded by retained_block_bytes_.
-// - Larger or over-aligned blocks pass straight through to upstream_.
+// Worker-local pool: one mimalloc first-class heap. mimalloc keeps this heap's
+// blocks in pages of their own (never shared with another heap), segregated by
+// size class with page metadata outside the blocks. A page whose blocks are all
+// free returns to the shared arena and is purged after mi_option_purge_delay;
+// Collect() forces that for this heap's thread-local state.
+//
+// Single-thread ownership: the first allocation binds the owner thread and the
+// heap's thread-bound theap. Allocation, release and Collect() on any other
+// thread terminate, as does releasing a block this heap does not own.
 class worker_memory final : public std::pmr::memory_resource {
 public:
-    using Clock = std::chrono::steady_clock;
-
-    class IdleWakeup {
-    protected:
-        IdleWakeup() = default;
-        ~IdleWakeup() = default;
-        virtual void OnPoolIdle() noexcept = 0;
-    private:
-        friend class worker_memory;
-    };
-
+    // Page-level view of this heap; computed by visiting its pages.
     struct Footprint {
-        std::size_t mapped_bytes = 0;
-        std::size_t direct_bytes = 0;
-        std::size_t idle_bytes = 0;
-        std::size_t chunks = 0;
+        std::size_t committed_bytes = 0;
+        std::size_t used_bytes = 0;
+        std::size_t pages = 0;
     };
 
-    struct Layout {
-        std::size_t slot_bytes = 0;
-        std::size_t map_bytes = 0;
-        std::size_t slots = 0;
-        bool direct = false;
-    };
-
-    explicit worker_memory(const memory_pool_config& config = {})
-        : worker_memory(*process_resource(), config) {}
-
-    explicit worker_memory(std::pmr::memory_resource& upstream,
-                           const memory_pool_config& config = {})
-        : upstream_((validate_memory_pool_config(config), &upstream))
-        , retained_block_bytes_(config.retained_block_bytes_) {}
+    worker_memory() : heap_(mi_heap_new()) {
+        if (!heap_) throw std::bad_alloc();
+    }
 
     worker_memory(const worker_memory&) = delete;
     worker_memory& operator=(const worker_memory&) = delete;
 
-
-    [[nodiscard]] static worker_memory& OwnerOf(const void* pointer) noexcept {
-        return *reinterpret_cast<Chunk*>(
-            *(reinterpret_cast<const std::uintptr_t*>(pointer) - 1))->pool;
-    }
-
     ~worker_memory() override {
-        if (pooling_) {
-            for (auto* chunk = pooling_->all; chunk; chunk = chunk->all_next) {
-                if (chunk->live != 0) std::terminate();
-            }
-            while (pooling_->all) {
-                ReleaseChunk(*pooling_->all);
-            }
-        }
+        // The owner thread's mimalloc state may already be torn down at thread
+        // exit; only the heap itself is touched here, never theap_.
+        if (live_allocations_ != 0) std::terminate();
+        mi_heap_delete(heap_);
     }
 
+    // Visits every page of this heap: diagnostics and tests only, never on a
+    // request path. Requires that no other thread uses this heap meanwhile.
     [[nodiscard]] Footprint GetFootprint() const noexcept {
-        return footprint_;
+        Footprint footprint;
+        (void)mi_heap_visit_blocks(heap_, false, &AccumulateArea, &footprint);
+        return footprint;
     }
 
     [[nodiscard]] std::size_t OutstandingAllocations() const noexcept {
         return live_allocations_;
     }
 
-    void Purge() noexcept {
-        if (!pooling_ || !pooling_->idle_head) return;
-        ReleaseExpiredChunks(Clock::now());
-    }
-
-    void PurgeIdle() noexcept {
-        if (!pooling_) return;
-        while (pooling_->idle_head) {
-            ReleaseChunk(*pooling_->idle_head);
-        }
-    }
-
-    [[nodiscard]] Clock::time_point NextPurgeDeadline() const noexcept {
-        return pooling_ && pooling_->idle_head
-            ? pooling_->idle_head->idle_at + kThreadMemoryPoolPurgeDelay
-            : Clock::time_point::max();
-    }
-
-    [[nodiscard]] bool BindIdleWakeup(IdleWakeup& owner) noexcept {
-        if (wakeup_ && wakeup_ != &owner) return false;
-        wakeup_ = &owner;
-        if (pooling_ && pooling_->idle_head) wakeup_->OnPoolIdle();
-        return true;
-    }
-
-    void UnbindIdleWakeup(IdleWakeup& owner) noexcept {
-        if (wakeup_ == &owner) wakeup_ = nullptr;
+    // Returns this heap's empty pages to the arena and purges them now.
+    void Collect() noexcept {
+        if (!theap_) return;
+        RequireOwnerThread();
+        mi_theap_collect(theap_, true);
     }
 
     [[nodiscard]] std::pmr::memory_resource* resource() & noexcept { return this; }
@@ -270,82 +194,32 @@ public:
     [[nodiscard]] std::pmr::memory_resource* resource() && = delete;
     [[nodiscard]] std::pmr::memory_resource* resource() const&& = delete;
 
-    [[nodiscard]] static Layout Describe(
-        std::size_t bytes, std::size_t alignment, std::size_t depth = 0) noexcept {
-        if (!ValidAlignment(alignment)) return {};
-        bytes = std::max(bytes, std::size_t{1});
-        if (alignment > kSlotAlignment || bytes > kThreadMemoryPoolMaxClass - sizeof(SlotHeader)) {
-            const bool cacheable =
-                alignment <= kMaxCachedBlockAlignment && bytes <= kMaxCachedBlockBytes;
-            const std::size_t payload_bytes =
-                cacheable ? RoundUp(bytes, kLargeBlockGranularity) : bytes;
-            alignment = std::max(alignment, kSlotAlignment);
-            constexpr auto limit = std::numeric_limits<std::size_t>::max();
-            const auto overhead = sizeof(Chunk) + sizeof(SlotHeader);
-            if (alignment - 1 > limit - overhead ||
-                payload_bytes > limit - overhead - (alignment - 1)) return {};
-            const auto needed = overhead + alignment - 1 + payload_bytes;
-            if (needed > limit - (kAllocationPageBytes - 1)) return {};
-            return {payload_bytes, RoundUp(needed, kAllocationPageBytes), 1, !cacheable};
-        }
-        return PooledLayout(Stride(bytes), depth);
-    }
-
     [[nodiscard]] void* Allocate(std::size_t bytes, std::size_t alignment) noexcept {
         const auto token = detail::CurrentThreadToken();
-        if (owner_token_ == 0) owner_token_ = token;
-        if (owner_token_ != token) std::terminate();
-        return AllocateImpl(bytes, alignment);
-    }
-
-private:
-    [[nodiscard]] void* AllocateImpl(std::size_t bytes, std::size_t alignment) noexcept {
+        if (owner_token_ != token) {
+            if (owner_token_ != 0) std::terminate();
+            owner_token_ = token;
+        }
+        if (!theap_ && !(theap_ = mi_heap_theap(heap_))) return nullptr;
         if (!ValidAlignment(alignment)) return nullptr;
-        bytes = std::max(bytes, std::size_t{1});
-        auto* pooling = EnsurePooling();
-        if (!pooling) return nullptr;
-        if (alignment > kSlotAlignment || bytes > kThreadMemoryPoolMaxClass - sizeof(SlotHeader)) {
-            if (alignment <= kMaxCachedBlockAlignment && bytes <= kMaxCachedBlockBytes) {
-                return AllocateLargeCached(bytes, alignment);
-            }
-            return AllocateDirect(bytes, alignment);
+        void* block = nullptr;
+        if (alignment > kNaturalAlignment) {
+            block = mi_theap_malloc_aligned(theap_, bytes, alignment);
+        } else if (bytes <= std::numeric_limits<std::size_t>::max() - (alignment - 1)) {
+            // A size class that is a multiple of the alignment starts every
+            // block on that alignment, so no aligned slow path is needed.
+            block = mi_theap_malloc(theap_, RoundUp(bytes, alignment));
         }
-        const auto stride = Stride(bytes);
-        auto& cls = pooling->classes[ClassIndex(stride)];
-        if (Chunk* chunk = cls.recyclable) {
-            auto* node = chunk->free_head;
-            chunk->free_head = node->next_free;
-            node->next_free = nullptr;
-            if (!chunk->free_head) UnlinkRecyclable(*chunk);
-            ++chunk->live;
-            ++live_allocations_;
-            return node + 1;
-        }
-        if (cls.current && CanCarve(*cls.current)) return Carve(*cls.current);
-        if (cls.idle) {
-            cls.current = cls.idle;
-            return Carve(*cls.current);
-        }
-        auto* chunk = MapRegion(
-            PooledLayout(stride, cls.chunks), ClassIndex(stride), kSlotAlignment, false);
-        if (!chunk) return nullptr;
-        ++cls.chunks;
-        cls.current = chunk;
-        return Carve(*chunk);
+        if (block) ++live_allocations_;
+        return block;
     }
 
-public:
-    void Deallocate(void* pointer, std::size_t bytes = 0,
-                    std::size_t alignment = 0) noexcept {
+    void Deallocate(void* pointer, std::size_t = 0, std::size_t = 0) noexcept {
         if (!pointer) return;
-        auto* header = reinterpret_cast<SlotHeader*>(pointer) - 1;
-        auto* chunk = reinterpret_cast<Chunk*>(header->owner);
-        if (!chunk || chunk->pool != this ||
-            bytes > chunk->slot_capacity ||
-            (alignment && (!ValidAlignment(alignment) ||
-             (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) != 0))) return;
-        if (chunk->owner != detail::CurrentThreadToken()) std::terminate();
-        DeallocateLocal(*header, *chunk);
+        RequireOwnerThread();
+        if (mi_heap_of(pointer) != heap_) std::terminate();
+        mi_free(pointer);
+        --live_allocations_;
     }
 
 protected:
@@ -361,343 +235,26 @@ protected:
     }
 
 private:
-    static constexpr std::size_t kSlotAlignment = 16;
-    static constexpr std::size_t kClassCount = 25 + (kThreadMemoryPoolMaxClass - 1024) / 256;
-    static constexpr std::size_t kLargeBinCount =
-        kMaxCachedBlockBytes / kLargeBlockGranularity;
+    // Every mimalloc page starts its first block on 16 bytes (MI_MAX_ALIGN_SIZE).
+    static constexpr std::size_t kNaturalAlignment = 16;
 
-    struct Chunk;
-    struct alignas(kSlotAlignment) SlotHeader {
-        SlotHeader* next_free = nullptr;
-        std::uintptr_t owner = 0;
-    };
-    struct Chunk {
-        worker_memory* pool = nullptr;
-        std::uintptr_t owner = 0;
-        Chunk* all_next = nullptr;
-        Chunk* all_prev = nullptr;
-        Chunk* rec_next = nullptr;
-        Chunk* rec_prev = nullptr;
-        Chunk* idle_next = nullptr;
-        Chunk* idle_prev = nullptr;
-        Chunk* class_idle_next = nullptr;
-        Chunk* class_idle_prev = nullptr;
-        std::size_t map_bytes = 0;
-        std::size_t map_alignment = kSlotAlignment;
-        std::size_t stride = 0;
-        std::size_t slot_capacity = 0;
-        std::size_t class_index = 0;
-        std::size_t live = 0;
-        Clock::time_point idle_at{};
-        SlotHeader* free_head = nullptr;
-        void* large_user_ptr = nullptr;
-        std::byte* bump = nullptr;
-        std::byte* end = nullptr;
-        bool direct = false;
-        bool large_cached = false;
-        bool idle = false;
-        bool in_recyclable = false;
-    };
-    struct Class {
-        Chunk* current = nullptr;
-        Chunk* recyclable = nullptr;
-        Chunk* idle = nullptr;
-        std::size_t chunks = 0;
-    };
-    struct PoolState {
-        std::size_t cached_large_bytes = 0;
-        std::array<Class, kClassCount> classes{};
-        std::array<Chunk*, kLargeBinCount> large_bins{};
-        Chunk* all = nullptr;
-        Chunk* idle_head = nullptr;
-        Chunk* idle_tail = nullptr;
-    };
-    struct PoolStateDeleter {
-        void operator()(PoolState* state) const noexcept {
-            if (!state) return;
-            state->~PoolState();
-            process_resource()->deallocate(
-                state, sizeof(PoolState), alignof(PoolState));
-        }
-    };
-
-    [[nodiscard]] PoolState* EnsurePooling() noexcept {
-        if (pooling_) return pooling_.get();
-        try {
-            auto* storage = process_resource()->allocate(
-                sizeof(PoolState), alignof(PoolState));
-            pooling_.reset(::new (storage) PoolState);
-        } catch (...) {
-            return nullptr;
-        }
-        return pooling_.get();
-    }
-    // Keep expiry scanning shared; reuse the phase clock.
-    [[gnu::noinline]] void ReleaseExpiredChunks(Clock::time_point now) noexcept {
-        while (pooling_->idle_head &&
-               now - pooling_->idle_head->idle_at >= kThreadMemoryPoolPurgeDelay) {
-            ReleaseChunk(*pooling_->idle_head);
-        }
-    }
-    void DeallocateLocal(SlotHeader& header, Chunk& chunk) noexcept {
-        if (chunk.live == 0 || live_allocations_ == 0) std::terminate();
-        --chunk.live;
-        --live_allocations_;
-        if (chunk.live == 0) {
-            if (chunk.direct) {
-                ReleaseChunk(chunk);
-            } else if (chunk.large_cached) {
-                if (chunk.stride > retained_block_bytes_ - pooling_->cached_large_bytes) {
-                    ReleaseChunk(chunk);
-                } else {
-                    const bool first_idle = pooling_->idle_head == nullptr;
-                    MarkLargeIdle(chunk);
-                    if (!first_idle) ReleaseExpiredChunks(chunk.idle_at);
-                    if (first_idle && wakeup_) wakeup_->OnPoolIdle();
-                }
-            } else {
-                auto& cls = pooling_->classes[chunk.class_index];
-                if (cls.current == &chunk) cls.current = nullptr;
-                UnlinkRecyclable(chunk);
-                chunk.free_head = nullptr;
-                chunk.bump = reinterpret_cast<std::byte*>(&chunk) + ChunkLead();
-                const bool first_idle = pooling_->idle_head == nullptr;
-                MarkIdle(chunk);
-                if (!first_idle) ReleaseExpiredChunks(chunk.idle_at);
-                if (first_idle && wakeup_) wakeup_->OnPoolIdle();
-            }
-            return;
-        }
-        header.next_free = chunk.free_head;
-        chunk.free_head = &header;
-        if (!chunk.in_recyclable) {
-            auto& cls = pooling_->classes[chunk.class_index];
-            chunk.in_recyclable = true;
-            chunk.rec_next = cls.recyclable;
-            if (chunk.rec_next) chunk.rec_next->rec_prev = &chunk;
-            cls.recyclable = &chunk;
-        }
+    static bool AccumulateArea(const mi_heap_t*, const mi_heap_area_t* area, void*,
+                               std::size_t, void* argument) noexcept {
+        auto& footprint = *static_cast<Footprint*>(argument);
+        footprint.committed_bytes += area->committed;
+        footprint.used_bytes += area->used * area->full_block_size;
+        ++footprint.pages;
+        return true;
     }
 
-    [[nodiscard]] static constexpr std::size_t ChunkLead() noexcept {
-        return RoundUp(sizeof(Chunk), kSlotAlignment);
-    }
-    [[nodiscard]] static std::size_t Stride(std::size_t bytes) noexcept {
-        const auto required = std::max(std::size_t{64}, bytes + sizeof(SlotHeader));
-        return RoundUp(required, required <= 256 ? 16 : required <= 1024 ? 64 : 256);
-    }
-    [[nodiscard]] static std::size_t ClassIndex(std::size_t stride) noexcept {
-        if (stride <= 256) return (stride - 64) / 16;
-        if (stride <= 1024) return 13 + (stride - 320) / 64;
-        return 25 + (stride - 1280) / 256;
-    }
-    [[nodiscard]] static constexpr std::size_t LargeBinIndex(std::size_t class_bytes) noexcept {
-        return class_bytes / kLargeBlockGranularity - 1;
-    }
-    [[nodiscard]] static Layout PooledLayout(std::size_t stride, std::size_t depth) noexcept {
-        const auto page = kAllocationPageBytes;
-        const auto target = std::max(page, kThreadMemoryPoolTargetBytes);
-        const auto min_pages = RoundUp(ChunkLead() + stride, page) / page;
-        const auto max_pages = std::max(
-            min_pages,
-            std::min(min_pages << std::min(depth, std::size_t{4}), target / page));
-        Layout best{
-            stride,
-            min_pages * page,
-            (min_pages * page - ChunkLead()) / stride,
-            false};
-        for (std::size_t n = min_pages; n <= max_pages; ++n) {
-            const auto map_bytes = n * page;
-            if (map_bytes < ChunkLead() + stride) continue;
-            const auto slots = (map_bytes - ChunkLead()) / stride;
-            if (map_bytes * best.slots < best.map_bytes * slots)
-                best = {stride, map_bytes, slots, false};
-        }
-        return best;
-    }
-    [[nodiscard]] static bool CanCarve(const Chunk& chunk) noexcept {
-        return static_cast<std::size_t>(chunk.end - chunk.bump) >= chunk.stride;
-    }
-    [[nodiscard]] void* Carve(Chunk& chunk) noexcept {
-        auto* header = ::new (chunk.bump) SlotHeader{
-            nullptr, reinterpret_cast<std::uintptr_t>(&chunk)};
-        chunk.bump += chunk.stride;
-        if (chunk.idle) MarkUsed(chunk);
-        ++chunk.live;
-        ++live_allocations_;
-        return header + 1;
-    }
-    [[nodiscard]] void* AllocateLargeCached(
-        std::size_t bytes, std::size_t alignment) noexcept {
-        const std::size_t class_bytes = RoundUp(bytes, kLargeBlockGranularity);
-        const std::size_t bin = LargeBinIndex(class_bytes);
-        const std::size_t eff_align = std::max(alignment, kSlotAlignment);
-        for (Chunk* chunk = pooling_->large_bins[bin]; chunk; chunk = chunk->class_idle_next) {
-            if ((reinterpret_cast<std::uintptr_t>(chunk->large_user_ptr) & (eff_align - 1)) == 0) {
-                MarkLargeUsed(*chunk);
-                footprint_.direct_bytes += chunk->map_bytes;
-                chunk->live = 1;
-                ++live_allocations_;
-                (reinterpret_cast<SlotHeader*>(chunk->large_user_ptr) - 1)->next_free = nullptr;
-                return chunk->large_user_ptr;
-            }
-        }
-        const auto layout = Describe(class_bytes, eff_align);
-        if (!layout.slots) return nullptr;
-        auto* chunk = MapRegion(layout, bin, eff_align, true);
-        if (!chunk) return nullptr;
-        const auto address = RoundUp(
-            reinterpret_cast<std::uintptr_t>(chunk) + sizeof(Chunk) + sizeof(SlotHeader),
-            eff_align);
-        auto* header = ::new (reinterpret_cast<SlotHeader*>(address) - 1) SlotHeader{
-            nullptr, reinterpret_cast<std::uintptr_t>(chunk)};
-        chunk->slot_capacity = class_bytes;
-        chunk->large_user_ptr = header + 1;
-        chunk->live = 1;
-        ++live_allocations_;
-        return chunk->large_user_ptr;
-    }
-    [[nodiscard]] void* AllocateDirect(
-        std::size_t bytes, std::size_t alignment) noexcept {
-        const std::size_t eff_align = std::max(alignment, kSlotAlignment);
-        const auto layout = Describe(bytes, eff_align);
-        if (!layout.slots) return nullptr;
-        auto* chunk = MapRegion(layout, 0, eff_align, false);
-        if (!chunk) return nullptr;
-        const auto address = RoundUp(
-            reinterpret_cast<std::uintptr_t>(chunk) + sizeof(Chunk) + sizeof(SlotHeader),
-            eff_align);
-        auto* header = ::new (reinterpret_cast<SlotHeader*>(address) - 1) SlotHeader{
-            nullptr, reinterpret_cast<std::uintptr_t>(chunk)};
-        chunk->slot_capacity = bytes;
-        chunk->live = 1;
-        ++live_allocations_;
-        return header + 1;
-    }
-    [[nodiscard]] Chunk* MapRegion(
-        Layout layout, std::size_t class_index, std::size_t map_alignment,
-        bool large_cached) noexcept {
-        void* mapped = nullptr;
-        try {
-            mapped = upstream_->allocate(layout.map_bytes, map_alignment);
-        } catch (...) {
-            return nullptr;
-        }
-        if (!mapped) return nullptr;
-        auto* chunk = ::new (mapped) Chunk;
-        chunk->pool = this;
-        chunk->owner = detail::CurrentThreadToken();
-        chunk->map_bytes = layout.map_bytes;
-        chunk->map_alignment = map_alignment;
-        chunk->stride = layout.slot_bytes;
-        chunk->slot_capacity = layout.slot_bytes >= sizeof(SlotHeader)
-            ? layout.slot_bytes - sizeof(SlotHeader)
-            : 0;
-        chunk->class_index = class_index;
-        chunk->direct = layout.direct && !large_cached;
-        chunk->large_cached = large_cached;
-        chunk->bump = static_cast<std::byte*>(mapped) + ChunkLead();
-        chunk->end = static_cast<std::byte*>(mapped) + layout.map_bytes;
-        footprint_.mapped_bytes += layout.map_bytes;
-        footprint_.direct_bytes += (chunk->direct || chunk->large_cached) ? layout.map_bytes : 0;
-        ++footprint_.chunks;
-        chunk->all_next = pooling_->all;
-        if (pooling_->all) pooling_->all->all_prev = chunk;
-        pooling_->all = chunk;
-        return chunk;
-    }
-    void ReleaseChunk(Chunk& chunk) noexcept {
-        const bool was_idle = chunk.idle;
-        if (chunk.large_cached) {
-            MarkLargeUsed(chunk);
-        } else if (!chunk.direct) {
-            auto& cls = pooling_->classes[chunk.class_index];
-            if (cls.current == &chunk) cls.current = nullptr;
-            UnlinkRecyclable(chunk);
-            MarkUsed(chunk);
-            --cls.chunks;
-        }
-        if (chunk.all_prev) chunk.all_prev->all_next = chunk.all_next;
-        else pooling_->all = chunk.all_next;
-        if (chunk.all_next) chunk.all_next->all_prev = chunk.all_prev;
-        footprint_.mapped_bytes -= chunk.map_bytes;
-        if (chunk.direct || (chunk.large_cached && !was_idle)) {
-            footprint_.direct_bytes -= chunk.map_bytes;
-        }
-        --footprint_.chunks;
-        const auto bytes = chunk.map_bytes;
-        const auto alignment = chunk.map_alignment;
-        void* raw = &chunk;
-        chunk.~Chunk();
-        upstream_->deallocate(raw, bytes, alignment);
-    }
-    void LinkIdleQueue(Chunk& chunk) noexcept {
-        chunk.idle = true;
-        footprint_.idle_bytes += chunk.map_bytes;
-        chunk.idle_at = Clock::now();
-        chunk.idle_prev = pooling_->idle_tail;
-        if (pooling_->idle_tail) pooling_->idle_tail->idle_next = &chunk;
-        else pooling_->idle_head = &chunk;
-        pooling_->idle_tail = &chunk;
-    }
-    void UnlinkIdleQueue(Chunk& chunk) noexcept {
-        chunk.idle = false;
-        footprint_.idle_bytes -= chunk.map_bytes;
-        if (chunk.idle_prev) chunk.idle_prev->idle_next = chunk.idle_next;
-        else pooling_->idle_head = chunk.idle_next;
-        if (chunk.idle_next) chunk.idle_next->idle_prev = chunk.idle_prev;
-        else pooling_->idle_tail = chunk.idle_prev;
-        chunk.idle_prev = chunk.idle_next = nullptr;
-    }
-    void MarkIdle(Chunk& chunk) noexcept {
-        LinkIdleQueue(chunk);
-        auto& cls = pooling_->classes[chunk.class_index];
-        chunk.class_idle_next = cls.idle;
-        if (cls.idle) cls.idle->class_idle_prev = &chunk;
-        cls.idle = &chunk;
-    }
-    void MarkUsed(Chunk& chunk) noexcept {
-        if (!chunk.idle) return;
-        UnlinkIdleQueue(chunk);
-        if (chunk.class_idle_prev) chunk.class_idle_prev->class_idle_next = chunk.class_idle_next;
-        else pooling_->classes[chunk.class_index].idle = chunk.class_idle_next;
-        if (chunk.class_idle_next) chunk.class_idle_next->class_idle_prev = chunk.class_idle_prev;
-        chunk.class_idle_prev = chunk.class_idle_next = nullptr;
-    }
-    void MarkLargeIdle(Chunk& chunk) noexcept {
-        footprint_.direct_bytes -= chunk.map_bytes;
-        LinkIdleQueue(chunk);
-        pooling_->cached_large_bytes += chunk.stride;
-        auto*& head = pooling_->large_bins[chunk.class_index];
-        chunk.class_idle_next = head;
-        if (head) head->class_idle_prev = &chunk;
-        head = &chunk;
-    }
-    void MarkLargeUsed(Chunk& chunk) noexcept {
-        if (!chunk.idle) return;
-        UnlinkIdleQueue(chunk);
-        pooling_->cached_large_bytes -= chunk.stride;
-        if (chunk.class_idle_prev) chunk.class_idle_prev->class_idle_next = chunk.class_idle_next;
-        else pooling_->large_bins[chunk.class_index] = chunk.class_idle_next;
-        if (chunk.class_idle_next) chunk.class_idle_next->class_idle_prev = chunk.class_idle_prev;
-        chunk.class_idle_prev = chunk.class_idle_next = nullptr;
-    }
-    void UnlinkRecyclable(Chunk& chunk) noexcept {
-        if (!chunk.in_recyclable) return;
-        if (chunk.rec_prev) chunk.rec_prev->rec_next = chunk.rec_next;
-        else pooling_->classes[chunk.class_index].recyclable = chunk.rec_next;
-        if (chunk.rec_next) chunk.rec_next->rec_prev = chunk.rec_prev;
-        chunk.rec_prev = chunk.rec_next = nullptr;
-        chunk.in_recyclable = false;
+    void RequireOwnerThread() const noexcept {
+        if (owner_token_ != detail::CurrentThreadToken()) std::terminate();
     }
 
-    std::pmr::memory_resource* upstream_;
+    mi_heap_t* const heap_;
+    mi_theap_t* theap_ = nullptr;
     std::uintptr_t owner_token_ = 0;
-    std::size_t retained_block_bytes_;
     std::size_t live_allocations_ = 0;
-    std::unique_ptr<PoolState, PoolStateDeleter> pooling_;
-    Footprint footprint_{};
-    IdleWakeup* wakeup_ = nullptr;
 };
 
 [[nodiscard]] inline std::pmr::memory_resource* worker_pool_resource() noexcept;
@@ -730,10 +287,11 @@ inline thread_local size_t rejected_pmr_allocations = 0;
     return ThreadMemoryPool().Allocate(size, alignment);
 }
 
+// Releases a block of the calling thread's pool; a block of any other pool or
+// thread terminates.
 inline void DeallocatePmr(void* p, size_t size = 0,
                           size_t alignment = 0) noexcept {
-    if (!p) return;
-    worker_memory::OwnerOf(p).Deallocate(p, size, alignment);
+    ThreadMemoryPool().Deallocate(p, size, alignment);
 }
 // Native Asio operation storage can be allocated, delivered, cancelled, or
 // destroyed by different reactor threads. It never belongs to a session pool.
@@ -791,18 +349,14 @@ protected:
 
 inline void ConfigureProcessAllocator() noexcept {
     DisableTransparentHugePages();
-#if defined(CNODE_USE_MIMALLOC) && !defined(__SANITIZE_ADDRESS__)
     mi_option_set(mi_option_allow_thp, 0);
     mi_option_set(mi_option_purge_delay, 10);
-#endif
     std::pmr::set_default_resource(worker_pool_resource());
 }
 
 inline void CollectBurst() noexcept {
-    ThreadMemoryPool().PurgeIdle();
-#if defined(CNODE_USE_MIMALLOC) && !defined(__SANITIZE_ADDRESS__)
+    ThreadMemoryPool().Collect();
     mi_collect(true);
-#endif
 }
 
 template <class T>

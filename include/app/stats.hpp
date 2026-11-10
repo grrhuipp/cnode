@@ -40,10 +40,6 @@ struct StatsSnapshot {
 
 struct WorkerMemoryStats {
     size_t udp_sockets = 0;
-    size_t pool_mapped_bytes = 0;
-    size_t pool_direct_bytes = 0;
-    size_t pool_idle_bytes = 0;
-    size_t pool_chunks = 0;
 };
 
 // Sampled only on the owning Worker; passed to the control plane by value.
@@ -62,6 +58,11 @@ struct WorkerResourceStats {
     size_t timeout_events = 0;
     size_t timeout_heap_capacity = 0;
     size_t timeout_waiters = 0;
+    // mimalloc page view of the Worker pool heap (page visit; diagnostics only).
+    size_t pool_committed_bytes = 0;
+    size_t pool_used_bytes = 0;
+    size_t pool_live_allocations = 0;
+    size_t pool_pages = 0;
 };
 
 struct WorkerRuntimeStatsSnapshot {

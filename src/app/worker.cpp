@@ -290,7 +290,6 @@ struct Worker::RuntimeState {
     std::unique_ptr<rule::DetectRulePolicy> detect_rule_policy;
     bool started = false;
     bool cold_mutation_active = false;
-    WorkerMemoryReclaimer memory_reclaimer;
 };
 
 namespace {
@@ -519,7 +518,6 @@ net::awaitable<void> Worker::StopRuntimeTask() {
         co_await runtime_->outbound_tasks->AsyncJoin();
     }
     co_await transport::internet::JoinXHttpClientTasks(io_context_);
-    runtime_->memory_reclaimer.Stop();
     co_await TimeoutScheduler::AsyncReleaseForIoContext(io_context_);
     runtime_.reset();
     proxyman::inbound::UserStore::ClearWorkerView();
@@ -550,7 +548,6 @@ void Worker::RuntimeState::Start(Worker& worker) {
     }
 
     auto& scheduler = TimeoutScheduler::ForIoContext(io_context);
-    memory_reclaimer.Start(scheduler);
     udp_association_reclaimer =
         std::make_unique<worker_detail::UdpAssociationReclaimer>(
             scheduler, &worker,
@@ -1250,16 +1247,17 @@ WorkerRuntimeStatsSnapshot Worker::CollectRuntimeStats(bool include_resources) c
     WorkerRuntimeStatsSnapshot snapshot;
     // Sample this Worker-owned transport and pool state on its own event loop.
     snapshot.memory.udp_sockets = transport::internet::DatagramSocket::ActiveCount();
-    const auto pool = memory::ThreadMemoryPool().GetFootprint();
-    snapshot.memory.pool_mapped_bytes = pool.mapped_bytes;
-    snapshot.memory.pool_direct_bytes = pool.direct_bytes;
-    snapshot.memory.pool_idle_bytes = pool.idle_bytes;
-    snapshot.memory.pool_chunks = pool.chunks;
     snapshot.stats = runtime_->stats.Snapshot();
     snapshot.worker_id = id_;
     snapshot.active_connections = runtime_->listener_state->active_sessions;
     if (!include_resources) return snapshot;
     auto& resources = snapshot.resources.emplace();
+    auto& pool = memory::ThreadMemoryPool();
+    const auto footprint = pool.GetFootprint();
+    resources.pool_committed_bytes = footprint.committed_bytes;
+    resources.pool_used_bytes = footprint.used_bytes;
+    resources.pool_live_allocations = pool.OutstandingAllocations();
+    resources.pool_pages = footprint.pages;
     resources.udp_resource_drops = runtime_->listener_state->udp_resource_drops;
     resources.udp_receive_loops = runtime_->listener_state->udp_receive_loops;
     auto collect_udp = [&](const worker_detail::UdpIngress* ingress) {

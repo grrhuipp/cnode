@@ -174,7 +174,7 @@ void RunCase(const char* cipher_name, const ss::SsCipherInfo& cipher,
         latencies[(iterations - 1) * 95 / 100], latencies[(iterations - 1) * 99 / 100],
         double(counts.cpp_calls) / iterations, double(counts.cpp_bytes) / iterations,
         double(counts.aligned_calls) / iterations, pmr_before, pmr_after, live_peak,
-        pool_before.mapped_bytes, pool_after.mapped_bytes, idle_rss, warm_rss, after_rss,
+        pool_before.committed_bytes, pool_after.committed_bytes, idle_rss, warm_rss, after_rss,
         process_memory.peak_resident_bytes, process_memory.anonymous_resident_bytes,
         process_memory.file_resident_bytes);
 }
