@@ -7,6 +7,7 @@
 #include <cassert>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string_view>
 #include <variant>
 
@@ -119,7 +120,8 @@ private:
         const detail::OutboundSelection& selection) const;
     [[nodiscard]] net::awaitable<RouteResult> RouteAsync(
         session::Context& ctx,
-        const routing::DispatchPolicy& policy);
+        const routing::DispatchPolicy& policy,
+        std::optional<detail::OutboundSelection> initial_selection);
 
     const routing::Router& router_;
     proxyman::outbound::HandlerLookup& outbound_handlers_;

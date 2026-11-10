@@ -19,10 +19,9 @@
  * 连接统计系统
  *
  * 设计要点：
- * 1. 使用本地累加器减少 atomic 操作
- * 2. 批量提交统计数据
- * 3. Cache line 对齐避免伪共享
- * 4. 分离热点数据和冷数据
+ * 1. 每个 Worker 独占一个分片，只在所属 Worker 线程读写，无原子与锁
+ * 2. 转发经本地累加器批量提交
+ * 3. Cache line 对齐只隔离相邻 Worker 的分片，避免伪共享
  */
 
 // ============================================================================
@@ -91,37 +90,11 @@ struct LocalStatsAccumulator {
 };
 
 // ============================================================================
-// 优化的统计分片（64 字节对齐）
-//
-// 热点数据（频繁更新）和冷数据（偶尔更新）分离
+// 统计分片：一个 Worker 一片，占一个缓存行
 // ============================================================================
-
-// 热点数据 - 流量统计（每次 I/O 都更新）；alignas 隔离冷热数据所在缓存行
-struct alignas(64) HotStatsShard {
+struct alignas(64) StatsShard {
     uint64_t bytes_in = 0;
     uint64_t bytes_out = 0;
-
-    void AddBytesIn(uint64_t n) {
-        bytes_in += n;
-    }
-
-    void AddBytesOut(uint64_t n) {
-        bytes_out += n;
-    }
-
-    // 批量添加（从本地累加器）
-    void CommitAccumulator(const LocalStatsAccumulator& acc) {
-        if (acc.bytes_in > 0) {
-            bytes_in += acc.bytes_in;
-        }
-        if (acc.bytes_out > 0) {
-            bytes_out += acc.bytes_out;
-        }
-    }
-};
-
-// 冷数据 - 连接统计（每个连接开始/结束时更新）
-struct alignas(64) ColdStatsShard {
     uint64_t connections_total = 0;
     uint64_t connections_active = 0;
     uint64_t errors = 0;
@@ -130,42 +103,23 @@ struct alignas(64) ColdStatsShard {
         ++connections_total;
         ++connections_active;
     }
-
-    void OnConnectionClosed() {
-        --connections_active;
-    }
-
-    void OnError() {
-        ++errors;
-    }
-};
-
-// ============================================================================
-// 组合的统计分片
-// ============================================================================
-struct alignas(64) StatsShard {
-    HotStatsShard hot;
-    ColdStatsShard cold;
-
-    void OnConnectionAccepted() { cold.OnConnectionAccepted(); }
-    void OnConnectionClosed() { cold.OnConnectionClosed(); }
-    void AddBytesIn(uint64_t bytes) { hot.AddBytesIn(bytes); }
-    void AddBytesOut(uint64_t bytes) { hot.AddBytesOut(bytes); }
-    void OnError() { cold.OnError(); }
+    void OnConnectionClosed() { --connections_active; }
+    void OnError() { ++errors; }
 
     [[nodiscard]] StatsSnapshot Snapshot() const {
         StatsSnapshot snapshot;
-        snapshot.connections_total = cold.connections_total;
-        snapshot.connections_active = cold.connections_active;
-        snapshot.bytes_in = hot.bytes_in;
-        snapshot.bytes_out = hot.bytes_out;
-        snapshot.errors = cold.errors;
+        snapshot.connections_total = connections_total;
+        snapshot.connections_active = connections_active;
+        snapshot.bytes_in = bytes_in;
+        snapshot.bytes_out = bytes_out;
+        snapshot.errors = errors;
         return snapshot;
     }
 
-    // 批量提交
+    // 批量提交（从本地累加器）
     void CommitAccumulator(const LocalStatsAccumulator& acc) {
-        hot.CommitAccumulator(acc);
+        bytes_in += acc.bytes_in;
+        bytes_out += acc.bytes_out;
     }
 };
 

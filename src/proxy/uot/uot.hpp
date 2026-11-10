@@ -127,10 +127,6 @@ public:
     bool WriteShutdownClosesLink() const noexcept override { return writer_.WriteShutdownClosesLink(); }
 
 private:
-    net::awaitable<void> WritePacket(
-        const TargetAddress& destination,
-        std::span<const net::const_buffer> payload);
-
     transport::MultiBufferWriter& writer_;
     bool is_connect_ = false;
     TargetAddress destination_;

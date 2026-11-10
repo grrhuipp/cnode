@@ -714,7 +714,6 @@ void TestAuthenticatedHeaderFailure() {
     using namespace proxyman::inbound;
     constexpr auto tag = "vmess-header-classification";
     PreparedVmessUser user;
-    user.uuid = "11111111-1111-4111-8111-111111111111";
     user.auth_key.fill(0x19);
     user.cmd_key.fill(0x27);
     user.profile.user_id = 73;

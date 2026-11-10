@@ -512,25 +512,26 @@ public:
     explicit VlessBufferedReader(transport::MultiBufferReader& src) noexcept
         : src_(src) {}
 
+    // Drains already buffered bytes only; true once `done` reaches `len`.
+    [[nodiscard]] bool ReadBuffered(uint8_t* data, size_t len, size_t& done) noexcept {
+        while (done < len && pending_.byte_size() != 0) {
+            const size_t n = pending_.ConsumePrefixTo(
+                std::span<uint8_t>(data + done, len - done));
+            if (n == 0) {
+                break;
+            }
+            done += n;
+        }
+        return done >= len;
+    }
+
     net::awaitable<bool> ReadExact(uint8_t* data,
                                    size_t len,
                                    bool eof_ok_at_start = false,
                                    size_t* progress = nullptr) {
         size_t local_done = 0;
         size_t& done = progress ? *progress : local_done;
-        while (done < len) {
-            if (pending_.byte_size() != 0) {
-                const size_t n = pending_.ConsumePrefixTo(
-                    std::span<uint8_t>(data + done, len - done));
-                if (pending_.empty()) {
-                    pending_.ReleaseIfIdle();
-                }
-                done += n;
-                if (n > 0) {
-                    continue;
-                }
-            }
-
+        while (!ReadBuffered(data, len, done)) {
             buf::MultiBuffer mb = co_await src_.ReadMultiBuffer();
             const bool received = mb.byte_size() != 0;
             if (received) mb.MoveTo(pending_);
@@ -552,9 +553,6 @@ public:
         while (done < len) {
             if (pending_.byte_size() != 0) {
                 const size_t n = pending_.DropPrefixBytes(len - done);
-                if (pending_.empty()) {
-                    pending_.ReleaseIfIdle();
-                }
                 done += n;
                 if (n > 0) {
                     continue;
@@ -681,8 +679,6 @@ private:
     enum class State : uint8_t { Active, Finished, Failed };
 
     void CheckWritable() const;
-    net::awaitable<void> WritePlaintext(std::span<const uint8_t> data,
-                                       bool& record_started);
 
     transport::MultiBufferWriter& dst_;
     VlessEncryptionAead aead_;

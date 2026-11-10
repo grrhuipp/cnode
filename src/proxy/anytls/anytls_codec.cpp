@@ -9,7 +9,6 @@
 #include <array>
 #include <charconv>
 #include <cstring>
-#include <format>
 #include <random>
 #include <utility>
 

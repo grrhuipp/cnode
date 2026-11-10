@@ -5,6 +5,7 @@
 #include "common/buffer_util.hpp"
 #include "common/byte_reader.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <limits>
@@ -164,11 +165,18 @@ bool UdpFramer::Next(FramedUdpPacket& out) {
     }
     if (state_ == State::Finished) return false;
     if (!target_) {
-        // SOCKS5 address, length and CRLF only.
-        std::array<uint8_t, kMaxEncodedAddressSize + 4> header{};
-        const size_t copied = pending_.CopyPrefixTo(header);
+        // SOCKS5 address without metadata, length and CRLF only.
+        std::array<uint8_t, kMaxBaseEncodedAddressSize + 4> scratch;
+        const size_t copied = std::min(pending_.byte_size(), scratch.size());
+        std::span<const uint8_t> header = pending_.FrontSpan();
+        if (header.size() >= copied) {
+            header = header.first(copied);
+        } else {
+            (void)pending_.CopyPrefixTo(std::span<uint8_t>(scratch.data(), copied));
+            header = std::span<const uint8_t>(scratch.data(), copied);
+        }
         auto address = DecodeAddress(
-            std::span<const uint8_t>(header.data(), copied),
+            header,
             AddressWireFormat::Socks5,
             {.require_non_empty_domain = true, .allow_metadata = false});
         if (address.status == AddressDecodeStatus::Incomplete) return false;
@@ -249,9 +257,26 @@ net::awaitable<void> WriteUdpDatagram(
             "Trojan UDP datagram contains missing or mixed endpoints");
     }
 
-    ConstBufferSpanBuilder<16> buffers;
-    buffers.AppendMultiBuffer(payload);
-    co_await WriteUdpDatagram(writer, *datagram.target, buffers.Span());
+    if (datagram.payload_size > std::numeric_limits<uint16_t>::max()) {
+        throw IoSystemError(
+            io_error::message_size, "Trojan UDP datagram is too large");
+    }
+
+    std::array<uint8_t, 272> header{};
+    const size_t header_size = EncodeUdpPacketHeaderTo(
+        *datagram.target,
+        datagram.payload_size,
+        header.data(),
+        header.size());
+    if (header_size == 0) {
+        throw IoSystemError(
+            io_error::invalid_argument, "invalid Trojan UDP target");
+    }
+
+    ConstBufferSpanBuilder<1 + buf::MultiBuffer::kInlineCapacity> framed;
+    framed.Append(net::buffer(header.data(), header_size));
+    framed.AppendMultiBuffer(payload);
+    co_await writer.WriteBuffers(framed.Span());
     payload.clear();
 }
 

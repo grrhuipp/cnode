@@ -88,12 +88,6 @@ BaseWsStream::~BaseWsStream() noexcept {
     Close();
 }
 
-void BaseWsStream::SetPendingData(const uint8_t* data, size_t len) {
-    if (!buf::AppendSpanToMultiBuffer(std::span<const uint8_t>(data, len), pending_data_)) {
-        throw std::bad_alloc();
-    }
-}
-
 void BaseWsStream::SetPendingMultiBuffer(buf::MultiBuffer&& mb) {
     if (mb.byte_size() == 0) {
         mb.clear();
@@ -183,13 +177,6 @@ net::awaitable<size_t> BaseWsStream::ReadSome(uint8_t* data, size_t size) {
     co_return n;
 }
 
-net::awaitable<bool> BaseWsStream::FillHeader() {
-    while (!TryFillHeaderFromPending()) {
-        if (!co_await EnsurePendingData()) co_return false;
-    }
-    co_return true;
-}
-
 void BaseWsStream::ConsumePayloadBytes(std::span<uint8_t> bytes) {
     if (frame_masked_)
         ws::MaskData(bytes.data(), bytes.size(), frame_mask_key_.data(), frame_mask_offset_);
@@ -226,7 +213,8 @@ net::awaitable<bool> BaseWsStream::PrepareNextDataFrame() {
     while (!closed_ && !read_closed_ && !peer_closed_cleanly_) {
         switch (read_stage_) {
             case ReadStage::Header: {
-                if (!TryFillHeaderFromPending() && !co_await FillHeader()) co_return false;
+                while (!TryFillHeaderFromPending())
+                    if (!co_await EnsurePendingData()) co_return false;
                 // No extensions are negotiated. RFC 6455 §§5.2–5.5 require
                 // rejecting reserved bits/opcodes, wrong mask direction and
                 // fragmented or oversized control frames before their body.
@@ -263,7 +251,8 @@ net::awaitable<bool> BaseWsStream::PrepareNextDataFrame() {
                 break;
             }
             case ReadStage::Length: {
-                if (!TryFillHeaderFromPending() && !co_await FillHeader()) co_return false;
+                while (!TryFillHeaderFromPending())
+                    if (!co_await EnsurePendingData()) co_return false;
                 const uint64_t length = header_required_ == 4
                     ? LoadU16BE(header_.data() + 2)
                     : LoadU64BE(header_.data() + 2);
@@ -278,7 +267,8 @@ net::awaitable<bool> BaseWsStream::PrepareNextDataFrame() {
                 break;
             }
             case ReadStage::Mask: {
-                if (!TryFillHeaderFromPending() && !co_await FillHeader()) co_return false;
+                while (!TryFillHeaderFromPending())
+                    if (!co_await EnsurePendingData()) co_return false;
                 if (frame_masked_)
                     std::memcpy(frame_mask_key_.data(),
                                 header_.data() + header_required_ - 4, 4);
@@ -397,14 +387,12 @@ void BaseWsStream::CheckWritable() const {
         throw IoSystemError(io_error::broken_pipe, "WebSocket write after Close");
 }
 
-net::awaitable<BaseWsStream::WriteGate::Lease> BaseWsStream::AcquireWrite() {
-    const auto state = co_await net::this_coro::cancellation_state;
-    if (closed_ || state.cancelled() != net::cancellation_type::none)
-        throw IoSystemError(io_error::operation_aborted);
-    if (auto lease = write_gate_.TryAcquire()) co_return lease;
+// Contended path only; callers take the uncontended gate inline.
+net::awaitable<BaseWsStream::WriteGate::Lease> BaseWsStream::AcquireWrite(
+    net::cancellation_slot cancellation) {
     // Cancel() is reusable, so only this acquisition is cancelled. Closing the
     // shared gate is reserved for terminal shutdown, not a sniff deadline.
-    WriteGateWait wait(Cancellation(), state.slot());
+    WriteGateWait wait(Cancellation(), cancellation);
     if (wait.Cancelled()) throw IoSystemError(io_error::operation_aborted);
     auto lease = co_await write_gate_.Acquire(false, wait.Slot());
     if (!lease || wait.Cancelled()) throw IoSystemError(io_error::operation_aborted);
@@ -414,7 +402,11 @@ net::awaitable<BaseWsStream::WriteGate::Lease> BaseWsStream::AcquireWrite() {
 net::awaitable<void> BaseWsStream::WriteDataFrame(
     std::span<const net::const_buffer> buffers, size_t size) {
     if (size == 0) co_return;
-    auto lease = co_await AcquireWrite();
+    const auto state = co_await net::this_coro::cancellation_state;
+    if (closed_ || state.cancelled() != net::cancellation_type::none)
+        throw IoSystemError(io_error::operation_aborted);
+    auto lease = write_gate_.TryAcquire();
+    if (!lease) lease = co_await AcquireWrite(state.slot());
     CheckWritable();
     uint8_t mask[4]{};
     if (is_client_ && RAND_bytes(mask, sizeof(mask)) != 1)
@@ -494,7 +486,11 @@ net::awaitable<void> BaseWsStream::WriteMultiBuffer(buf::MultiBuffer buffers) {
         AddPayloadSize(size, buffer->Len());
     }
     if (size == 0) co_return;
-    auto lease = co_await AcquireWrite();
+    const auto state = co_await net::this_coro::cancellation_state;
+    if (closed_ || state.cancelled() != net::cancellation_type::none)
+        throw IoSystemError(io_error::operation_aborted);
+    auto lease = write_gate_.TryAcquire();
+    if (!lease) lease = co_await AcquireWrite(state.slot());
     CheckWritable();
     uint8_t mask[4]{};
     if (is_client_ && RAND_bytes(mask, sizeof(mask)) != 1)
@@ -522,7 +518,11 @@ net::awaitable<void> BaseWsStream::WriteMultiBuffer(buf::MultiBuffer buffers) {
 net::awaitable<void> BaseWsStream::WriteControlFrame(
     ws::Opcode opcode, std::span<const uint8_t> payload) {
     const bool closing = opcode == ws::Opcode::CLOSE;
-    auto lease = co_await AcquireWrite();
+    const auto state = co_await net::this_coro::cancellation_state;
+    if (closed_ || state.cancelled() != net::cancellation_type::none)
+        throw IoSystemError(io_error::operation_aborted);
+    auto lease = write_gate_.TryAcquire();
+    if (!lease) lease = co_await AcquireWrite(state.slot());
     if (write_closed_ || (!closing && close_requested_)) co_return;
     if (closing) close_requested_ = true;
     uint8_t mask[4]{};

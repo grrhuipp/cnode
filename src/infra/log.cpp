@@ -246,10 +246,8 @@ std::string ComponentName(std::string_view file) {
     return normalized;
 }
 
-std::string EscapeLogText(std::string_view text, bool quoted = false) {
+void AppendEscapedLogText(std::string& result, std::string_view text, bool quoted) {
     constexpr char hex[] = "0123456789abcdef";
-    std::string result;
-    result.reserve(text.size() + (quoted ? 2 : 0));
     if (quoted) result.push_back('"');
     for (const unsigned char ch : text) {
         switch (ch) {
@@ -270,6 +268,12 @@ std::string EscapeLogText(std::string_view text, bool quoted = false) {
         }
     }
     if (quoted) result.push_back('"');
+}
+
+std::string EscapeLogText(std::string_view text, bool quoted = false) {
+    std::string result;
+    result.reserve(text.size() + (quoted ? 2 : 0));
+    AppendEscapedLogText(result, text, quoted);
     return result;
 }
 
@@ -312,12 +316,15 @@ std::string FormatConsoleRecord(int64_t timestamp_us,
 }
 
 std::string FormatRecord(const LogRecord& record) {
-    const auto timestamp = FormatLogTimestamp(record.timestamp_us);
-    const auto message = EscapeLogText(record.message);
+    auto line = FormatLogTimestamp(record.timestamp_us);
     if (record.channel == LogChannel::Access) {
-        return std::format("{} {}", timestamp, message);
+        line.reserve(line.size() + 1 + record.message.size());
+        line.push_back(' ');
+        AppendEscapedLogText(line, record.message, false);
+        return line;
     }
-    auto line = std::format("{} [{}] ", timestamp, LevelName(record.level));
+    line.reserve(line.size() + 64 + record.message.size());
+    line.append(" [").append(LevelName(record.level)).append("] ");
     if (record.connection && record.connection->conn_id != 0) {
         line.append(std::format("[{}] ", record.connection->conn_id));
     }
@@ -326,17 +333,20 @@ std::string FormatRecord(const LogRecord& record) {
         const auto& context = *record.connection;
         if (!context.inbound_tag.empty()) {
             line.push_back('[');
-            line.append(EscapeLogText(context.inbound_tag));
+            AppendEscapedLogText(line, context.inbound_tag, false);
             if (!context.outbound_tag.empty() && context.inbound_tag != context.outbound_tag) {
-                line.append(" -> ").append(EscapeLogText(context.outbound_tag));
+                line.append(" -> ");
+                AppendEscapedLogText(line, context.outbound_tag, false);
             }
             line.append("] ");
         } else if (!context.outbound_tag.empty()) {
-            line.append("[outbound ").append(EscapeLogText(context.outbound_tag)).append("] ");
+            line.append("[outbound ");
+            AppendEscapedLogText(line, context.outbound_tag, false);
+            line.append("] ");
         }
         if (context.user_id > 0) line.append(std::format("user:{} ", context.user_id));
     }
-    line.append(message);
+    AppendEscapedLogText(line, record.message, false);
     return line;
 }
 

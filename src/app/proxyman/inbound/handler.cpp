@@ -19,13 +19,6 @@ namespace proxyman::inbound {
 
 namespace {
 
-std::string_view RealIpHeader(const StreamSettings& settings) noexcept {
-    if (settings.IsWs()) return settings.ws.real_ip_header;
-    if (settings.IsHttpUpgrade()) return settings.http_upgrade.real_ip_header;
-    if (settings.IsHttp()) return settings.http.real_ip_header;
-    return {};
-}
-
 void ApplyHttpRealIp(
     session::Context& ctx,
     std::string_view real_ip) {
@@ -237,9 +230,12 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
     const inbound::ReceiverSettings& listener = receiver_;
     ConnectionStatsScope connection_stats(stats);
 
-    auto admission = co_await limiter_.ReserveLogical(
-        family, ctx.inbound.tag, ctx.inbound.source_ip,
-        ctx.inbound.HasProxyProtocolClientIP());
+    ConnectionLimiter::Admission admission;
+    if (limiter_.TracksAdmission()) {
+        admission = co_await limiter_.ReserveLogical(
+            family, ctx.inbound.tag, ctx.inbound.source_ip,
+            ctx.inbound.HasProxyProtocolClientIP());
+    }
     const auto reject = admission.reason;
     if (reject != ConnectionLimiter::RejectReason::NONE) {
         RejectConnection(ctx, stats, reject);
@@ -329,9 +325,12 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
         ApplyProxyProtocolResult(ctx, proxy_read.result);
     }
 
-    auto physical_admission = co_await limiter_.ReservePhysical(
-        ctx.inbound.tag, ctx.inbound.source_ip,
-        ctx.inbound.HasProxyProtocolClientIP());
+    ConnectionLimiter::Admission physical_admission;
+    if (limiter_.TracksAdmission()) {
+        physical_admission = co_await limiter_.ReservePhysical(
+            ctx.inbound.tag, ctx.inbound.source_ip,
+            ctx.inbound.HasProxyProtocolClientIP());
+    }
     auto reject = physical_admission.reason;
     if (reject != ConnectionLimiter::RejectReason::NONE) {
         RejectConnection(ctx, stats, reject, true);
@@ -348,7 +347,6 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
                    listener.stream_settings.network);
 
     InboundTransportMetadata local_metadata;
-    local_metadata.real_ip_header.assign(RealIpHeader(listener.stream_settings));
     std::shared_ptr<LogicalTransportStreamSink> logical_stream_handler;
     if (listener.stream_settings.IsGrpc() ||
         listener.stream_settings.IsHttp() ||
@@ -394,9 +392,12 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
 
     ApplyHttpRealIp(ctx, local_metadata.real_ip);
     local_metadata = {};
-    auto ip_admission = co_await limiter_.ReserveIP(
-        ctx.inbound.tag, ctx.inbound.source_ip,
-        ctx.inbound.HasProxyProtocolClientIP());
+    ConnectionLimiter::Admission ip_admission;
+    if (limiter_.TracksAdmission()) {
+        ip_admission = co_await limiter_.ReserveIP(
+            ctx.inbound.tag, ctx.inbound.source_ip,
+            ctx.inbound.HasProxyProtocolClientIP());
+    }
     reject = ip_admission.reason;
     if (reject != ConnectionLimiter::RejectReason::NONE) {
         RejectConnection(ctx, stats, reject);

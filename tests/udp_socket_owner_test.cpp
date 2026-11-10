@@ -139,7 +139,8 @@ public:
 };
 
 struct RecordingReplySink final : ::worker_detail::UdpReplySink {
-    bool EnqueueUdpReply(std::string_view, ::udp::socket*, ::udp::endpoint peer,
+    bool EnqueueUdpReply(::worker_detail::UdpIngress&, std::string_view,
+                         const std::shared_ptr<::udp::socket>&, ::udp::endpoint peer,
                          ::buf::MultiBuffer payload, uint32_t) override {
         ++calls;
         endpoint = peer;
@@ -439,9 +440,19 @@ TEST(UdpSocketOwner, Contract) {
     const auto failing_response = std::make_shared<CountingUdpResponseContext>();
     failing_response->fail = true;
 
+    auto& udp_scheduler = ::TimeoutScheduler::ForIoContext(io_context);
+    ::worker_detail::UdpAssociationReclaimer udp_reclaimer(
+        udp_scheduler, nullptr, [](void*, std::exception_ptr) { std::terminate(); });
+    DatagramScript uplink_script;
+    uplink_script.target = callback_source;
+    ::worker_detail::UdpIngress worker(
+        "test-inbound", std::make_unique<DummyDatagramHandler>(&uplink_script),
+        udp_reclaimer, udp_budget, io_context);
+
     ::worker_detail::UdpIngress::ClientSession failing_reply_session(
         io_context,
-        {.socket_key = {}, .socket = {}, .response = failing_response, .sink = &failed_sink, .worker_id = 0},
+        {.socket_key = {}, .socket = {}, .response = failing_response, .sink = &failed_sink, .worker_id = 0,
+         .owner = &worker},
         reply_endpoint_a,
         default_owner, udp_budget, udp_budget.AcquireAssociation());
     ::buf::BufferGuard reply_buffer{::buf::Buffer::New()};
@@ -466,7 +477,7 @@ TEST(UdpSocketOwner, Contract) {
     ::worker_detail::UdpIngress::ClientSession raw_reply_session(
         io_context,
         {.socket_key = {}, .socket = {}, .response = std::make_shared<CountingUdpResponseContext>(),
-         .sink = &raw_sink, .worker_id = 0},
+         .sink = &raw_sink, .worker_id = 0, .owner = &worker},
         reply_endpoint_a,
         default_owner, udp_budget, udp_budget.AcquireAssociation());
     std::array<::net::const_buffer, 1> raw_reply_buffers{
@@ -500,7 +511,7 @@ TEST(UdpSocketOwner, Contract) {
     ::worker_detail::UdpIngress::ClientSession large_reply_session(
         io_context,
         {.socket_key = {}, .socket = {}, .response = std::make_shared<CountingUdpResponseContext>(),
-         .sink = &large_sink, .worker_id = 0},
+         .sink = &large_sink, .worker_id = 0, .owner = &worker},
         reply_endpoint_a,
         default_owner, udp_budget, udp_budget.AcquireAssociation());
     bool large_reply_failed = false;
@@ -647,14 +658,6 @@ TEST(UdpSocketOwner, Contract) {
     second->bind(endpoint, ec);
     if (ec) Fail("owned UDP socket did not release its bound port");
 
-    auto& udp_scheduler = ::TimeoutScheduler::ForIoContext(io_context);
-    ::worker_detail::UdpAssociationReclaimer udp_reclaimer(
-        udp_scheduler, nullptr, [](void*, std::exception_ptr) { std::terminate(); });
-    DatagramScript uplink_script;
-    uplink_script.target = callback_source;
-    ::worker_detail::UdpIngress worker(
-        "test-inbound", std::make_unique<DummyDatagramHandler>(&uplink_script),
-        udp_reclaimer, udp_budget, io_context);
     // Uplink payloads reach a row only through the authenticated datagram path.
     NoDispatch uplink_dispatcher;
     ::StatsShard uplink_stats;
@@ -1094,7 +1097,8 @@ TEST(UdpSocketOwner, Contract) {
     auto response_context = std::make_shared<CountingUdpResponseContext>();
     ::worker_detail::UdpIngress::ClientSession snapshot_reply_session(
         io_context,
-        {.socket_key = {}, .socket = {}, .response = response_context, .sink = &snapshot_sink, .worker_id = 0},
+        {.socket_key = {}, .socket = {}, .response = response_context, .sink = &snapshot_sink, .worker_id = 0,
+         .owner = &worker},
         reply_endpoint_a,
         default_owner, udp_budget, udp_budget.AcquireAssociation());
     if (!worker.ReplaceHandler(

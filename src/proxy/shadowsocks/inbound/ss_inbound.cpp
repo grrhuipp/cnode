@@ -76,12 +76,12 @@ net::awaitable<tl::expected<void, ErrorCode>> ReadStreamPayload(
 }  // namespace
 
 net::awaitable<void> ResponseBodyWriter::WriteMultiBuffer(buf::MultiBuffer mb) {
-    co_await WriteEncrypted(mb, true);
+    return WriteEncrypted(std::move(mb));
 }
 
 net::awaitable<void> ResponseBodyWriter::WriteBuffers(
     std::span<const net::const_buffer> buffers) {
-    co_await WriteEncrypted(buffers, false);
+    return WriteEncrypted(buffers);
 }
 
 net::awaitable<void> ResponseBodyWriter::AsyncShutdownWrite() {
@@ -137,8 +137,7 @@ void ResponseBodyWriter::Retire() {
 }
 
 template <typename BufferRange>
-net::awaitable<void> ResponseBodyWriter::WriteEncrypted(
-    BufferRange& buffers, bool clear_after_encrypt) {
+net::awaitable<void> ResponseBodyWriter::WriteEncrypted(BufferRange buffers) {
     if (!stream_) {
         throw IoSystemError(io_error::not_connected, "Shadowsocks response writer has no stream");
     }
@@ -181,10 +180,8 @@ net::awaitable<void> ResponseBodyWriter::WriteEncrypted(
                 out_mb,
                 &skip_first_bytes_);
         }
-        if constexpr (std::is_same_v<std::remove_cvref_t<BufferRange>, buf::MultiBuffer>) {
-            if (clear_after_encrypt) {
-                buffers.clear();
-            }
+        if constexpr (std::is_same_v<BufferRange, buf::MultiBuffer>) {
+            buffers.clear();
         }
 
         co_await FlushPendingAndWrite(stream, std::move(out_mb));
@@ -946,7 +943,8 @@ proxy::shadowsocks::inbound::Handler::Process(
 
     LOG_CONN_DEBUG(ctx, "processing connection from {}:{}", client_ip, ctx.inbound.source_port);
 
-    if (co_await proxy::CheckInboundIpBanned(limiter_, ctx)) {
+    if (proxy::BeginInboundAuthentication(limiter_, ctx) &&
+        co_await proxy::CheckInboundIpBanned(*limiter_, ctx)) {
         co_return proxy::RejectInbound(stats_, stream.get(), ErrorCode::BLOCKED);
     }
     auto prepared = co_await PrepareSsTcpSession(

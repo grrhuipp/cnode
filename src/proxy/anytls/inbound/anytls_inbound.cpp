@@ -283,8 +283,7 @@ public:
             mb.clear();
             co_return tl::unexpected(ErrorCode::CONNECTION_CLOSED);
         }
-        if (auto sub = FindStream(sid)) sub->CheckWrite();
-        else throw transport::WriteClosed();
+        CheckStreamWrite(sid);
 
         try {
             auto result = co_await anytls::WriteMultiBufferAsFrameBatch(
@@ -318,8 +317,7 @@ public:
             co_return tl::unexpected(ErrorCode::CONNECTION_CLOSED);
         }
 
-        if (auto sub = FindStream(sid)) sub->CheckWrite();
-        else throw transport::WriteClosed();
+        CheckStreamWrite(sid);
         try {
             auto result = co_await anytls::WriteBuffersAsFrameBatch(*stream_, cmd, sid, buffers);
             if (!result) CancelAll();
@@ -347,6 +345,12 @@ private:
     std::shared_ptr<AnyTLSSubStream> FindStream(uint32_t sid) const {
         const auto it = streams_.find(sid);
         return it == streams_.end() ? nullptr : it->second;
+    }
+
+    void CheckStreamWrite(uint32_t sid) const {
+        const auto it = streams_.find(sid);
+        if (it == streams_.end() || !it->second) throw transport::WriteClosed();
+        it->second->CheckWrite();
     }
 
     void CancelAll() noexcept {
@@ -517,9 +521,6 @@ net::awaitable<ErrorCode> AnyTLSDemuxSession::ProcessStream(
                                             .allow_metadata = true});
         if (!parsed) co_return parsed.error();
         pending.DropPrefixBytes(parsed->consumed);
-        if (pending.empty()) {
-            pending.ReleaseIfIdle();
-        }
         uot_version = proxy::uot::VersionFromMagicAddress(parsed->target);
         if (!parsed->target.IsValid() && !uot_version) {
             co_return ErrorCode::PROTOCOL_INVALID_ADDRESS;
@@ -850,7 +851,8 @@ Handler::Process(
         co_return result;
     }
 
-    if (co_await proxy::CheckInboundIpBanned(limiter_, ctx)) {
+    if (proxy::BeginInboundAuthentication(limiter_, ctx) &&
+        co_await proxy::CheckInboundIpBanned(*limiter_, ctx)) {
         co_return proxy::RejectInbound(stats_, stream.get(), ErrorCode::BLOCKED);
     }
 

@@ -435,7 +435,11 @@ public:
         if (buffer.size() == 0) {
             co_return 0;
         }
-        auto lease = co_await AcquireUploadGate();
+        auto lease = upload_gate_.TryAcquire();
+        if (!lease) lease = co_await upload_gate_.Acquire();
+        if (!lease || closed_ || write_closed_ || upload_failed_) {
+            ThrowXHttpPacketError("xhttp stream-up upload unavailable");
+        }
         if (!upload_ &&
             buffer.size() <= kMaxDeferredUploadBytes - pending_initial_.byte_size()) {
             const auto* data = static_cast<const uint8_t*>(buffer.data());
@@ -477,7 +481,11 @@ public:
         }
         transport::internet::AsyncWriteGate::Lease lease;
         try {
-            lease = co_await AcquireUploadGate();
+            lease = upload_gate_.TryAcquire();
+            if (!lease) lease = co_await upload_gate_.Acquire();
+            if (!lease || closed_ || write_closed_ || upload_failed_) {
+                ThrowXHttpPacketError("xhttp stream-up upload unavailable");
+            }
             if (upload_) {
                 co_await upload_->WriteMultiBuffer(std::move(mb));
                 TouchDownlinkActivity();
@@ -510,7 +518,11 @@ public:
         if (!has_data) {
             co_return;
         }
-        auto lease = co_await AcquireUploadGate();
+        auto lease = upload_gate_.TryAcquire();
+        if (!lease) lease = co_await upload_gate_.Acquire();
+        if (!lease || closed_ || write_closed_ || upload_failed_) {
+            ThrowXHttpPacketError("xhttp stream-up upload unavailable");
+        }
         if (upload_) {
             co_await upload_->WriteBuffers(buffers);
             TouchDownlinkActivity();
@@ -640,15 +652,6 @@ private:
     [[nodiscard]] bool ReaderMustSendDeferredUpload() const noexcept {
         return !upload_ && !upload_opening_ && !write_closed_ &&
                pending_initial_.byte_size() != 0;
-    }
-
-    net::awaitable<transport::internet::AsyncWriteGate::Lease> AcquireUploadGate() {
-        auto lease = upload_gate_.TryAcquire();
-        if (!lease) lease = co_await upload_gate_.Acquire();
-        if (!lease || closed_ || write_closed_ || upload_failed_) {
-            ThrowXHttpPacketError("xhttp stream-up upload unavailable");
-        }
-        co_return lease;
     }
 
     net::awaitable<void> FlushDeferredUploadForRead() {
@@ -803,15 +806,11 @@ net::awaitable<DialResult> DialSingleCandidate(
     net::io_context& io_context,
     const OutboundTransportTarget& target,
     const OutboundDialCandidate& candidate) {
-
-    auto bind_local = candidate.bind_local;
-
-    if (bind_local) {
-        co_return co_await TcpStream::ConnectWithBind(
-            io_context, *bind_local, candidate.endpoint, target.timeout);
-    }
-    co_return co_await TcpStream::Connect(
-        io_context, candidate.endpoint, target.timeout);
+    return TcpStream::Connect(
+        io_context,
+        candidate.endpoint,
+        candidate.bind_local ? &*candidate.bind_local : nullptr,
+        target.timeout);
 }
 
 net::awaitable<DialResult> DialAndBuildXHttpRequestCandidate(
@@ -867,6 +866,12 @@ net::awaitable<DialResult> DialAndBuildSingleCandidate(
 
     auto tcp_result = co_await DialSingleCandidate(io_context, target, candidate);
     if (!tcp_result.Ok()) {
+        co_return tcp_result;
+    }
+    // A raw TCP stream gets no transport layer: nothing below would suspend
+    // between arming and clearing the handshake deadlines.
+    if (target.stream_settings->network_mode == NetworkMode::Tcp &&
+        target.stream_settings->security_mode == SecurityMode::None) {
         co_return tcp_result;
     }
 
@@ -1380,8 +1385,9 @@ BuildOutboundTransportTarget(OutboundTargetOptions options) {
         : (default_ordered ? default_ordered->v6 : OutboundBind::Selection{});
 
     std::optional<OutboundDialer::OrderedBind> download_ordered;
-    if (options.stream_settings->IsXHttp() &&
-        options.stream_settings->xhttp.download_settings) {
+    const bool has_download = options.stream_settings->IsXHttp() &&
+        options.stream_settings->xhttp.download_settings;
+    if (has_download) {
         download_ordered = SelectOrderedBind(
             options.stream_settings->xhttp.download_settings->send_through,
             options.inbound_source_ip,
@@ -1422,6 +1428,7 @@ BuildOutboundTransportTarget(OutboundTargetOptions options) {
 
     if (options.literal_address) {
         append_single(*options.literal_address);
+        if (!has_download) co_return target;
         co_return co_await AttachXHttpDownloadTarget(
             std::move(target),
             options,
@@ -1430,6 +1437,7 @@ BuildOutboundTransportTarget(OutboundTargetOptions options) {
     }
     if (auto literal = iputil::ParseLiteral(options.address)) {
         append_single(*literal);
+        if (!has_download) co_return target;
         co_return co_await AttachXHttpDownloadTarget(
             std::move(target),
             options,

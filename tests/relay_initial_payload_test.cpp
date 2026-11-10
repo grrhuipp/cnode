@@ -628,33 +628,6 @@ net::awaitable<bool> TestBackpressuredWrite(net::io_context& io, bool controlled
     co_return passed;
 }
 
-bool TestInitialPayloadAllocation() {
-    static_assert(alignof(buf::Buffer) <= alignof(std::max_align_t));
-    struct FreeBuffer { void operator()(buf::Buffer* value) const { buf::Buffer::Free(value); } };
-    std::array<std::unique_ptr<buf::Buffer, FreeBuffer>, 64> pinned;
-    for (auto& value : pinned) {
-        value.reset(buf::Buffer::New());
-        if (!value) throw std::bad_alloc();
-    }
-    std::array<uint8_t, 17> bytes{};
-    bytes.fill(0x33);
-    InitialPayload initial;
-    initial.assign(bytes);
-    const auto before = memory::rejected_pmr_allocations;
-    bool failed = false;
-    memory::reject_next_pmr_allocation = true;
-    try { auto payload = std::move(initial).MoveToMultiBuffer(); }
-    catch (const std::bad_alloc&) { failed = true; }
-    memory::reject_next_pmr_allocation = false;
-    const bool retained = initial.size() == bytes.size() &&
-        std::equal(initial.span().begin(), initial.span().end(), bytes.begin(), bytes.end());
-    auto recovered = std::move(initial).MoveToMultiBuffer();
-    const bool passed = failed && retained && memory::rejected_pmr_allocations > before &&
-        initial.empty() && recovered.byte_size() == bytes.size();
-    std::printf("initial allocation: failed=%d retained=%d recovered=%zu passed=%d\n",
-        failed, retained, recovered.byte_size(), passed);
-    return passed;
-}
 }  // namespace
 
 class RelayInitialPayload : public ::testing::TestWithParam<std::string> {};
@@ -708,7 +681,7 @@ TEST_P(RelayInitialPayload, Lifecycle) {
         }
         { ASSERT_TRUE(passed); return; }
     }
-    bool passed = TestInitialPayloadAllocation() && TestBatchOwnership();
+    bool passed = TestBatchOwnership();
     for (int mode = 0; mode < 16; ++mode) {
         net::io_context io;
         auto future = net::co_spawn(io, TestRateCancellation(io, mode), net::use_future);

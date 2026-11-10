@@ -23,7 +23,6 @@ TEST(VmessAuthSnapshot, Contract) {
     using namespace ::proxyman::inbound;
     try {
         PreparedVmessUser user;
-        user.uuid = "11111111-1111-1111-1111-111111111111";
         user.auth_key.fill(0x19);
         user.profile.user_id = 1;
         constexpr auto tag = "snapshot-lifetime";
@@ -51,7 +50,6 @@ TEST(VmessAuthSnapshot, Contract) {
               "expired hot-cache credentials authenticated");
 
         PreparedVmessUser other = user;
-        other.uuid = "22222222-2222-2222-2222-222222222222";
         other.auth_key.fill(0x27);
         other.profile.user_id = 2;
         const UserSet other_users = PreparedVmessUsers{other};

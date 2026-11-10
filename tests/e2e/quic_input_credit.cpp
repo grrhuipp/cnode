@@ -159,7 +159,7 @@ void FinishBackpressuredWriter(OutputEnd ending) {
         const auto command = socket.ReadExact(1);
         if (command == "D") {
             // Downlink starts before the client supplies the large uplink, so
-            // this specifically pressures Connection::WriteStream, not input.
+            // this specifically pressures Connection::QueueStreamOutput, not input.
             if (ending != OutputEnd::Resume) {
                 try {
                     socket.Write(payload);

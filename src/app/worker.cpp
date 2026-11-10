@@ -201,12 +201,6 @@ struct Worker::ListenerState : worker_detail::UdpReplySink {
     [[nodiscard]] worker_detail::UdpIngress*
     FindUdpIngress(std::string_view socket_key) noexcept;
     [[nodiscard]] bool EnqueueUdpReply(
-        std::string_view socket_key,
-        udp::socket* sock,
-        udp::endpoint endpoint,
-        buf::MultiBuffer payload,
-        uint32_t worker_id) override;
-    [[nodiscard]] bool EnqueueUdpReply(
         worker_detail::UdpIngress& ingress,
         std::string_view socket_key,
         const worker_detail::UdpIngress::SocketPtr& sock,
@@ -873,23 +867,6 @@ net::awaitable<void> Worker::ListenerState::RetireUdpListening(std::string_view 
         slot_it->second->retiring_quic_ingress.reset();
     }
     co_return;
-}
-
-bool Worker::ListenerState::EnqueueUdpReply(
-    std::string_view socket_key,
-    udp::socket* sock,
-    udp::endpoint endpoint,
-    buf::MultiBuffer payload,
-    uint32_t worker_id) {
-    auto* ingress = FindUdpIngress(socket_key);
-    if (!ingress || !sock) {
-        return false;
-    }
-    auto owned_sock = ingress->FindSocket(socket_key);
-    if (!owned_sock || owned_sock.get() != sock) {
-        return false;
-    }
-    return EnqueueUdpReply(*ingress, socket_key, owned_sock, std::move(endpoint), std::move(payload), worker_id);
 }
 
 bool Worker::ListenerState::EnqueueUdpReply(

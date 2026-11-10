@@ -32,40 +32,6 @@ constexpr std::string_view kXHttpRefererPadding =
     "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
 static_assert(kXHttpRefererPadding.size() == 100);
 
-net::awaitable<size_t> ReadToMultiBufferTail(AsyncStream& stream,
-                                             buf::MultiBuffer& out,
-                                             size_t max_read) {
-    if (max_read == 0) {
-        co_return 0;
-    }
-    if (!out.empty() && out.back()->Available() != 0) {
-        auto* tail = out.back();
-        const size_t n = co_await stream.AsyncRead(net::buffer(
-            tail->Tail().data(), std::min(max_read, size_t{tail->Available()})));
-        tail->Produce(static_cast<uint32_t>(n));
-        out.RecordTailProduced(n);
-        co_return n;
-    }
-    buf::MultiBuffer chunk = co_await stream.ReadMultiBuffer();
-    buf::BufferGuard first;
-    while (!chunk.empty()) {
-        first = chunk.pop_front();
-        if (first && !first->IsEmpty()) break;
-        first.reset();
-    }
-    if (!first) {
-        co_return 0;
-    }
-    stream.PrependReadMultiBuffer(std::move(chunk));
-    const size_t n = std::min<size_t>(max_read, first->Len());
-    if (n < first->Len()) {
-        stream.PrependReadData(first->Bytes().subspan(n));
-        first->end = first->start + static_cast<uint32_t>(n);
-    }
-    out.push_back(std::move(first));
-    co_return n;
-}
-
 // Strict 1*DIGIT; rejects signs, whitespace and overflow.
 [[nodiscard]] std::optional<uint64_t> ParseU64Decimal(std::string_view value) {
     if (value.empty() || value.front() < '0' || value.front() > '9') {
@@ -1011,7 +977,35 @@ net::awaitable<size_t> XHttpPacketUpSession::Upload::Read(
         }
         reserved_ += buf::Buffer::kSize;
     }
-    co_return co_await ReadToMultiBufferTail(stream_, payload, limit);
+    if (limit == 0) {
+        co_return 0;
+    }
+    if (!payload.empty() && payload.back()->Available() != 0) {
+        auto* tail = payload.back();
+        const size_t n = co_await stream_.AsyncRead(net::buffer(
+            tail->Tail().data(), std::min(limit, size_t{tail->Available()})));
+        tail->Produce(static_cast<uint32_t>(n));
+        payload.RecordTailProduced(n);
+        co_return n;
+    }
+    buf::MultiBuffer chunk = co_await stream_.ReadMultiBuffer();
+    buf::BufferGuard first;
+    while (!chunk.empty()) {
+        first = chunk.pop_front();
+        if (first && !first->IsEmpty()) break;
+        first.reset();
+    }
+    if (!first) {
+        co_return 0;
+    }
+    stream_.PrependReadMultiBuffer(std::move(chunk));
+    const size_t n = std::min<size_t>(limit, first->Len());
+    if (n < first->Len()) {
+        stream_.PrependReadData(first->Bytes().subspan(n));
+        first->end = first->start + static_cast<uint32_t>(n);
+    }
+    payload.push_back(std::move(first));
+    co_return n;
 }
 
 bool XHttpPacketUpSession::Upload::Commit(uint64_t seq, buf::MultiBuffer payload) {
@@ -1756,7 +1750,7 @@ net::awaitable<TransportBuildResult> RunXHttp1ServerHandshake(
         if (method.empty() || meta.kind == XHttpRequestMeta::Kind::Unknown) {
             co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
         }
-        if (const std::string_view expected_host = TrimAscii(ExpectedHttpHost(cfg));
+        if (const std::string_view expected_host = ExpectedHttpHost(cfg);
             !expected_host.empty() && !EqualsAsciiCI(host, expected_host)) {
             LOG_CONN_DEBUG(conn_id,
                 "XHTTP server host mismatch expected='{}' actual='{}'",

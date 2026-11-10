@@ -410,7 +410,11 @@ net::awaitable<RelayResult> DoRelayLink(
                 if (limits) {
                     auto& bucket = upload ? limits->up : limits->down;
                     auto& wait = upload ? limits->up_wait : limits->down_wait;
-                    co_await wait.WaitFor(bucket.Consume(count));
+                    // An under-budget packet must not pay for a wait coroutine.
+                    if (const auto delay = bucket.Consume(count);
+                        delay > std::chrono::milliseconds::zero()) {
+                        co_await wait.WaitFor(delay);
+                    }
                 }
                 if (state.Ending()) break;
                 if (direction_cancellation.cancelled() != net::cancellation_type::none)
@@ -446,10 +450,6 @@ net::awaitable<RelayResult> DoRelayLink(
         }
         relay_detail::FlushRelayStats(stats, acc);
     };
-    auto transfer = [&]() -> net::awaitable<void> {
-        co_await (direction(client_reader, target, &target, true) &&
-                  direction(target, client_writer, client_control, false));
-    };
     auto watch_stop = [&]() -> net::awaitable<void> {
         if (!state.Ending())
             (void)co_await state.wake.async_receive(net::as_tuple(net::use_awaitable));
@@ -458,7 +458,9 @@ net::awaitable<RelayResult> DoRelayLink(
     try {
         // The winning branch cancels AND joins its sibling, including a split
         // reader that has no control object and a writer blocked by backpressure.
-        (void)co_await (transfer() || watch_stop());
+        (void)co_await ((direction(client_reader, target, &target, true) &&
+                         direction(target, client_writer, client_control, false)) ||
+                        watch_stop());
     } catch (...) {
         cancellation.Stop(relay_detail::CaptureFailure());
     }

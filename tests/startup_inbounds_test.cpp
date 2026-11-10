@@ -9,6 +9,8 @@
 #include "proxy/inbound.hpp"
 #include "transport/internet/stream_settings.hpp"
 
+#include <algorithm>
+#include <array>
 #include <iostream>
 #include <span>
 #include <stdexcept>
@@ -18,12 +20,19 @@ namespace {
 using namespace ::proxyman::inbound;
 size_t user_builds = 0;
 
+// Marks a prepared user with the credential text it was built from.
+std::array<uint8_t, 16> CredentialMarker(std::string_view credential) {
+    std::array<uint8_t, 16> marker{};
+    std::copy_n(credential.begin(), std::min(credential.size(), marker.size()), marker.begin());
+    return marker;
+}
+
 std::optional<UserSet> FakeBuildUsers(const BuildRequest&, std::span<const InboundUserSpec> specs) {
     ++user_builds;
     PreparedVmessUsers users;
     for (const auto& spec : specs) {
         if (spec.credential == "reject") return std::nullopt;
-        users.push_back(PreparedVmessUser{.uuid = spec.credential, .profile = {}});
+        users.push_back(PreparedVmessUser{.uuid_bytes = CredentialMarker(spec.credential), .profile = {}});
     }
     return users;
 }
@@ -59,7 +68,7 @@ TEST(StartupInbounds, Contract) {
     {
         auto snapshot = UserStore::PrepareUsers(
             "static-owner", UserSet{PreparedVmessUsers{
-                PreparedVmessUser{.uuid = "sentinel", .profile = {}}}});
+                PreparedVmessUser{.profile = {}}}});
         auto view = UserStore::PrepareWorkerView(snapshot);
         UserStore::CommitSnapshot(std::move(snapshot));
         UserStore::InstallWorkerView(std::move(view));
@@ -81,7 +90,8 @@ TEST(StartupInbounds, Contract) {
         prepared[1].receiver.stream_settings.network_mode != NetworkMode::Tcp ||
         prepared[1].receiver.stream_settings.security_mode != SecurityMode::None ||
         !prepared[1].receiver.dispatch_policy.sniffing.enabled || !prepared[1].binding.listen.IsAuto() ||
-        std::get<PreparedVmessUsers>(*prepared[1].users).front().uuid != constants::test::kTestVmessUuid ||
+        std::get<PreparedVmessUsers>(*prepared[1].users).front().uuid_bytes !=
+            CredentialMarker(constants::test::kTestVmessUuid) ||
         UserStore::VmessUsers("static-owner").users != old ||
         !UserStore::VmessUsers(constants::test::kTestInboundTag).empty()));
 

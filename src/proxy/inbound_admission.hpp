@@ -80,18 +80,27 @@ namespace proxy {
     }
 }
 
-[[nodiscard]] inline net::awaitable<bool> CheckInboundIpBanned(
-    ConnectionLimiter* limiter,
-    session::Context& ctx) {
+// Start of every protocol's authentication: clears any inherited identity and
+// reports whether the client address needs the coordinator's ban lookup
+// (only PROXY-protocol addresses under an enabled auth-ban policy).
+[[nodiscard]] inline bool BeginInboundAuthentication(
+    const ConnectionLimiter* limiter,
+    session::Context& ctx) noexcept {
     ctx.inbound.user_id = 0;
     ctx.inbound.user_email.clear();
-    if (limiter && limiter->TracksAuthBan() && ctx.inbound.HasProxyProtocolClientIP() &&
-        co_await limiter->IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {
-        LOG_CONN_DEBUG(ctx, "Rejected banned IP {}", ctx.inbound.source_ip);
-        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "IP banned"));
-        co_return true;
+    return limiter && limiter->TracksAuthBan() && ctx.inbound.HasProxyProtocolClientIP();
+}
+
+// Coordinator lookup for an address BeginInboundAuthentication flagged.
+[[nodiscard]] inline net::awaitable<bool> CheckInboundIpBanned(
+    ConnectionLimiter& limiter,
+    session::Context& ctx) {
+    if (!co_await limiter.IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {
+        co_return false;
     }
-    co_return false;
+    LOG_CONN_DEBUG(ctx, "Rejected banned IP {}", ctx.inbound.source_ip);
+    LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "IP banned"));
+    co_return true;
 }
 
 // Request target resolved by a protocol together with its credential. Session
@@ -182,7 +191,7 @@ inline net::awaitable<std::optional<NativeAssociationAdmission>> AdmitNativeAsso
     ConnectionLimiter* limiter,
     StatsShard& stats) {
     NativeAssociationAdmission admitted;
-    if (limiter) {
+    if (limiter && limiter->TracksAdmission()) {
         const bool check_ban = ctx.inbound.HasProxyProtocolClientIP();
         auto physical = co_await limiter->ReservePhysical(
             ctx.inbound.tag, ctx.inbound.source_ip, check_ban);
@@ -240,7 +249,7 @@ AdmitInboundSubstream(
     const session::Context& ctx) {
     ConnectionStatsScope connection_stats(stats);
     ConnectionLimiter::Reservation reservation;
-    if (limiter) {
+    if (limiter && limiter->TracksAdmission()) {
         auto admission = co_await limiter->ReserveLogical(
             ctx.inbound.connection_family, ctx.inbound.tag, ctx.inbound.source_ip,
             ctx.inbound.HasProxyProtocolClientIP());
@@ -290,22 +299,6 @@ inline net::awaitable<void> RecordInboundAuthFailure(
     }
 }
 
-[[nodiscard]] inline net::awaitable<ErrorCode> CheckInboundCredential(
-    ConnectionLimiter& limiter,
-    session::Context& ctx,
-    AuthCredentialKey credential,
-    proxyman::inbound::UserProtocol protocol,
-    uint64_t credential_revision) {
-    const auto reason = co_await limiter.CheckCredential(std::move(credential));
-    if (proxyman::inbound::UserStore::CredentialRevision(protocol, ctx.inbound.tag) !=
-        credential_revision) co_return ErrorCode::OK;
-    if (reason == ConnectionLimiter::RejectReason::NONE) co_return ErrorCode::OK;
-    co_await RecordInboundAuthFailure(
-        &limiter, ctx, ConnectionLimiter::RejectReasonToString(reason));
-    co_return reason == ConnectionLimiter::RejectReason::TRACKING_CAPACITY
-        ? ErrorCode::RESOURCE_EXHAUSTED : ErrorCode::BLOCKED;
-}
-
 struct PreparedInboundCredential {
     std::optional<AuthCredentialKey> key;
     ErrorCode error = ErrorCode::OK;
@@ -322,9 +315,20 @@ VerifyInboundCredential(
         proxyman::inbound::UserStore::CredentialRevision(protocol, ctx.inbound.tag);
     const auto key = limiter->FingerprintCredential(
         ctx.inbound.tag, raw_credential, credential_revision);
-    const auto error = co_await CheckInboundCredential(
-        *limiter, ctx, key, protocol, credential_revision);
-    co_return PreparedInboundCredential{.key = key, .error = error};
+    const auto reason = co_await limiter->CheckCredential(key);
+    // A user publication that raced the lookup retires this fingerprint; the
+    // protocol then matches against the current snapshot on its own.
+    if (proxyman::inbound::UserStore::CredentialRevision(protocol, ctx.inbound.tag) !=
+            credential_revision ||
+        reason == ConnectionLimiter::RejectReason::NONE) {
+        co_return PreparedInboundCredential{.key = key, .error = ErrorCode::OK};
+    }
+    co_await RecordInboundAuthFailure(
+        limiter, ctx, ConnectionLimiter::RejectReasonToString(reason));
+    co_return PreparedInboundCredential{
+        .key = key,
+        .error = reason == ConnectionLimiter::RejectReason::TRACKING_CAPACITY
+            ? ErrorCode::RESOURCE_EXHAUSTED : ErrorCode::BLOCKED};
 }
 
 [[nodiscard]] inline UserProfile MakeUserProfile(const InboundUserSpec& spec) {

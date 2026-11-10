@@ -237,8 +237,10 @@ public:
         if (peer_ended_) {
             co_return buf::MultiBuffer{};
         }
-        co_await ReadVlessResponseHeader(
-            reader_, response_header_, "VLESS mux response header read failed");
+        if (!response_header_.complete) {
+            co_await ReadVlessResponseHeader(
+                reader_, response_header_, "VLESS mux response header read failed");
+        }
 
         while (true) {
             auto header = mux::DecodeFrame(pending_);
@@ -294,8 +296,9 @@ public:
                 co_return payload;
             }
 
-            buf::MultiBuffer raw = co_await ReadMultiBufferOrThrowOnCancel(reader_);
+            buf::MultiBuffer raw = co_await reader_.ReadMultiBuffer();
             if (raw.byte_size() == 0) {
+                co_await ThrowIfCancelledOnEof();
                 if (pending_.byte_size() != 0) {
                     throw transport::LinkError(ErrorCode::PROTOCOL_DECODE_FAILED);
                 }
@@ -321,7 +324,7 @@ public:
     }
 
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
-        co_await WriteDatagram(udp_target_, buffers);
+        return WriteDatagram(udp_target_, buffers);
     }
 
     net::awaitable<void> AsyncShutdownWrite() override {

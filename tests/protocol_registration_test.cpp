@@ -103,7 +103,7 @@ std::optional<::proxyman::inbound::UserSet> BuildVmessUsers(
     std::span<const ::InboundUserSpec>) {
     return ::proxyman::inbound::UserSet{
         ::proxyman::inbound::PreparedVmessUsers{
-            ::proxyman::inbound::PreparedVmessUser{.uuid = "alias-user", .profile = {}}}};
+            ::proxyman::inbound::PreparedVmessUser{.profile = {}}}};
 }
 
 std::optional<::proxyman::inbound::UserSet> BuildTrojanUsers(

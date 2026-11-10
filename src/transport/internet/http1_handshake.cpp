@@ -40,19 +40,6 @@ public:
         Close();
     }
 
-    void SetPendingData(std::span<const uint8_t> data) {
-        if (content_remaining_) {
-            data = data.first(
-                static_cast<size_t>(std::min<uint64_t>(data.size(), *content_remaining_)));
-        }
-        if (data.empty() || closed_ || read_closed_) {
-            return;
-        }
-        if (!buf::AppendSpanToMultiBuffer(data, pending_)) {
-            throw std::bad_alloc();
-        }
-    }
-
     void SetPendingMultiBuffer(buf::MultiBuffer&& mb) {
         if (closed_ || read_closed_) {
             mb.clear();
@@ -112,7 +99,7 @@ public:
             }
             co_return co_await inner_->ReadMultiBuffer();
         }
-        if (!co_await EnsureChunkPayload()) {
+        if (chunk_remaining_ == 0 && !co_await EnsureChunkPayload()) {
             co_return buf::MultiBuffer{};
         }
         if (pending_.byte_size() == 0) {
@@ -452,7 +439,7 @@ private:
             co_return 0;
         }
 
-        if (!co_await EnsureChunkPayload()) co_return 0;
+        if (chunk_remaining_ == 0 && !co_await EnsureChunkPayload()) co_return 0;
         const size_t want = std::min(capacity, chunk_remaining_);
         const size_t n = co_await ReadRaw(net::buffer(out, want));
         if (n == 0) {
@@ -767,7 +754,6 @@ void RecordExtractedRealIp(std::string_view head,
     val = TrimAscii(val.substr(0, val.find(',')));
     if (!val.empty()) {
         metadata->real_ip.assign(val);
-        metadata->real_ip_header.assign(header_name);
     }
 }
 
@@ -996,17 +982,6 @@ std::unique_ptr<AsyncStream> MakeHttp1BodyStream(
     std::unique_ptr<AsyncStream> inner,
     Http1ReadFraming read_framing,
     bool write_chunked,
-    std::span<const uint8_t> read_ahead) {
-    auto body = std::make_unique<Http1BodyStream>(
-        std::move(inner), read_framing, write_chunked);
-    body->SetPendingData(read_ahead);
-    return body;
-}
-
-std::unique_ptr<AsyncStream> MakeHttp1BodyStream(
-    std::unique_ptr<AsyncStream> inner,
-    Http1ReadFraming read_framing,
-    bool write_chunked,
     buf::MultiBuffer&& read_ahead) {
     auto body = std::make_unique<Http1BodyStream>(
         std::move(inner), read_framing, write_chunked);
@@ -1055,7 +1030,7 @@ net::awaitable<TransportBuildResult> DoHttp1ServerHandshake(
             PublicHttpMethodForLog(method));
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
-    if (const std::string_view expected_host = TrimAscii(ExpectedHttpHost(cfg));
+    if (const std::string_view expected_host = ExpectedHttpHost(cfg);
         !expected_host.empty() && !EqualsAsciiCI(host, expected_host)) {
         LOG_CONN_DEBUG(conn_id,
             "HTTP server host mismatch expected='{}' actual='{}'",

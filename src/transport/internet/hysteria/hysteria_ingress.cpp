@@ -237,6 +237,137 @@ int SelectAlpn(SSL*, const uint8_t** out, uint8_t* outlen,
     return output;
 }
 
+void AppendU16(memory::ByteVector& output, uint16_t value) {
+    std::array<uint8_t, 2> bytes{};
+    StoreU16BE(bytes.data(), value);
+    output.insert(output.end(), bytes.begin(), bytes.end());
+}
+
+void AppendU32(memory::ByteVector& output, uint32_t value) {
+    std::array<uint8_t, 4> bytes{};
+    StoreU32BE(bytes.data(), value);
+    output.insert(output.end(), bytes.begin(), bytes.end());
+}
+
+void AppendU64(memory::ByteVector& output, uint64_t value) {
+    std::array<uint8_t, 8> bytes{};
+    StoreU64BE(bytes.data(), value);
+    output.insert(output.end(), bytes.begin(), bytes.end());
+}
+
+bool AppendVarint(memory::ByteVector& output, uint64_t value) {
+    const size_t width = QuicVarintSize(value);
+    if (width == 0) return false;
+    const uint8_t prefix = static_cast<uint8_t>(
+        (width == 1 ? 0 : width == 2 ? 1 : width == 4 ? 2 : 3) << 6);
+    output.push_back(static_cast<uint8_t>((value >> ((width - 1) * 8)) | prefix));
+    for (size_t i = 1; i < width; ++i)
+        output.push_back(static_cast<uint8_t>(value >> ((width - 1 - i) * 8)));
+    return true;
+}
+
+[[nodiscard]] std::string_view TargetHost(
+    const TargetAddress& target, std::optional<iputil::AddressText>& storage) {
+    if (target.IsDomain()) return {target.host.data(), target.host.size()};
+    if (!target.resolved_addr) return {};
+    storage.emplace(*target.resolved_addr);
+    return storage->View();
+}
+
+[[nodiscard]] tl::expected<TargetAddress, ProtocolError>
+ParseV1Target(std::span<const uint8_t> host, uint16_t port) {
+    if (host.empty() || host.size() > kMaxAddressLength || port == 0)
+        return tl::unexpected(ProtocolError::Invalid);
+    TargetAddress target(
+        std::string_view(reinterpret_cast<const char*>(host.data()), host.size()), port);
+    if (!target.IsValid()) return tl::unexpected(ProtocolError::Invalid);
+    return target;
+}
+
+[[nodiscard]] bool ValidFragmentIndex(Version version, uint8_t index, uint8_t count) noexcept {
+    // HY2 declares Fragment ID irrelevant for an unfragmented packet.
+    return count != 0 && ((version == Version::V2 && count == 1) || index < count);
+}
+
+[[nodiscard]] bool RequiresUdpTarget(Version version, uint8_t index, uint8_t count) noexcept {
+    return version == Version::V1 || count == 1 || index == 0;
+}
+
+struct UdpTargetText {
+    // host 借用调用方的 target 或 address_storage，只用于同步计长与编码。
+    std::string_view host;
+    std::array<char, 5> port{};
+    size_t port_size = 0;
+    size_t authority_size = 0;
+    bool bracket_v6 = false;
+};
+
+[[nodiscard]] tl::expected<UdpTargetText, ProtocolError> PrepareUdpTargetText(
+    Version version, const TargetAddress& target,
+    std::optional<iputil::AddressText>& address_storage) {
+    UdpTargetText text;
+    if (target.IsValid()) text.host = TargetHost(target, address_storage);
+    if (version == Version::V1) {
+        if (text.host.empty() || text.host.size() > kMaxAddressLength)
+            return tl::unexpected(ProtocolError::Invalid);
+        return text;
+    }
+    if (text.host.empty()) return text;
+    const auto [end, error] = std::to_chars(
+        text.port.data(), text.port.data() + text.port.size(), target.port);
+    if (error != std::errc{}) return tl::unexpected(ProtocolError::Invalid);
+    text.port_size = static_cast<size_t>(end - text.port.data());
+    text.bracket_v6 = text.host.find(':') != std::string_view::npos;
+    const size_t suffix = (text.bracket_v6 ? 2 : 0) + 1 + text.port_size;
+    if (text.host.size() > std::numeric_limits<size_t>::max() - suffix)
+        return tl::unexpected(ProtocolError::TooLarge);
+    text.authority_size = text.host.size() + suffix;
+    return text;
+}
+
+[[nodiscard]] tl::expected<size_t, ProtocolError> UdpHeaderSize(
+    Version version, const UdpTargetText& text) {
+    if (version == Version::V1) return 14 + text.host.size();
+    const size_t width = QuicVarintSize(text.authority_size);
+    if (width == 0 ||
+        text.authority_size > std::numeric_limits<size_t>::max() - 8 - width)
+        return tl::unexpected(ProtocolError::TooLarge);
+    return 8 + width + text.authority_size;
+}
+
+// |message.target| is not read: |text| and |port| carry the destination.
+[[nodiscard]] tl::expected<memory::ByteVector, ProtocolError> EncodeUdpMessageTo(
+    Version version, const UdpMessage& message, const UdpTargetText& text,
+    uint16_t port, size_t header_size) {
+    memory::ByteVector output;
+    output.reserve(header_size + message.payload.size());
+    AppendU32(output, message.session_id);
+    if (version == Version::V1) {
+        AppendU16(output, static_cast<uint16_t>(text.host.size()));
+        output.insert(output.end(), text.host.begin(), text.host.end());
+        AppendU16(output, port);
+        AppendU16(output, message.packet_id);
+        output.push_back(message.fragment_id);
+        output.push_back(message.fragment_count);
+        AppendU16(output, static_cast<uint16_t>(message.payload.size()));
+    } else {
+        AppendU16(output, message.packet_id);
+        output.push_back(message.fragment_id);
+        output.push_back(message.fragment_count);
+        if (!AppendVarint(output, text.authority_size))
+            return tl::unexpected(ProtocolError::TooLarge);
+        if (!text.host.empty()) {
+            if (text.bracket_v6) output.push_back('[');
+            output.insert(output.end(), text.host.begin(), text.host.end());
+            if (text.bracket_v6) output.push_back(']');
+            output.push_back(':');
+            output.insert(output.end(), text.port.data(), text.port.data() + text.port_size);
+        }
+    }
+    output.insert(output.end(), message.payload.begin(), message.payload.end());
+    return output;
+}
+
 }  // namespace
 
 
@@ -244,7 +375,6 @@ struct SocketState final : memory::ThreadAllocated {
     explicit SocketState(net::io_context& io)
         : changed(io, 1) {}
     HysteriaIngress::SocketPtr socket;
-    memory::ThreadLocalString key;
     udp::endpoint local;
     udp::endpoint remote;
     struct Output {
@@ -423,7 +553,6 @@ bool Connection::Initialize(const ngtcp2_pkt_hd& header) {
     callbacks.recv_tx_key = &ReceiveTxKey;
     callbacks.recv_datagram = &ReceiveDatagram;
     callbacks.path_validation = &PathValidated;
-    callbacks.begin_path_validation = &PathValidationStarted;
 
     const auto& timeouts = listener_->environment.timeouts;
     ngtcp2_settings quic_settings;
@@ -521,11 +650,6 @@ void Connection::PublishExpiry() noexcept {
     }
 }
 
-int Connection::PathValidationStarted(ngtcp2_conn*, uint32_t,
-    const ngtcp2_path*, const ngtcp2_path*, void*) {
-    return 0;
-}
-
 int Connection::PathValidated(ngtcp2_conn*, uint32_t,
     const ngtcp2_path* path, const ngtcp2_path*,
     ngtcp2_path_validation_result result, void* user_data) {
@@ -546,9 +670,9 @@ int Connection::PathValidated(ngtcp2_conn*, uint32_t,
     return 0;
 }
 
-bool Connection::Feed(SocketState& socket, const udp::endpoint& remote,
-                      std::span<const uint8_t> packet, bool flush) {
-    if (!core_ || closed_) return false;
+void Connection::Feed(SocketState& socket, const udp::endpoint& remote,
+                      std::span<const uint8_t> packet) {
+    if (!core_ || closed_) return;
     auto local_addr = MakeAddress(socket.local);
     auto remote_addr = MakeAddress(remote);
     ngtcp2_path path{local_addr, remote_addr, &core_->path_binding};
@@ -568,7 +692,7 @@ bool Connection::Feed(SocketState& socket, const udp::endpoint& remote,
         if (result != NGTCP2_ERR_DRAINING && result != NGTCP2_ERR_IDLE_CLOSE)
             listener_->environment.stats->OnError();
         Close();
-        return false;
+        return;
     }
     if (foreign_path) {
         ngtcp2_conn_info info{};
@@ -578,7 +702,7 @@ bool Connection::Feed(SocketState& socket, const udp::endpoint& remote,
                 LOG_DEBUG("QUIC path packet rejected receiving_worker={} remote={}:{} reason=no-path-evidence",
                     listener_->worker_id, iputil::AddressText(remote.address()).View(), remote.port());
             } catch (...) {}
-            return !closed_;
+            return;
         }
         const auto* selected = ngtcp2_conn_get_path(core_->quic);
         auto selected_local = EndpointFromAddress(selected->local);
@@ -596,8 +720,7 @@ bool Connection::Feed(SocketState& socket, const udp::endpoint& remote,
             } catch (...) {}
         }
     }
-    if (flush) Flush();
-    return !closed_;
+    Flush();
 }
 
 void Connection::OnExpiry() {
@@ -618,34 +741,25 @@ void Connection::OnExpiry() {
     Flush();
 }
 
-net::awaitable<void> Connection::WriteStream(
-    int64_t stream_id, buf::MultiBuffer payload) {
+std::shared_ptr<QuicStreamState> Connection::QueueStreamOutput(
+    int64_t stream_id, buf::MultiBuffer& payload) {
+    if (!core_ || closed_)
+        throw transport::LinkError(ErrorCode::CONNECTION_CLOSED);
+    auto it = core_->streams.find(stream_id);
+    if (it == core_->streams.end())
+        throw transport::LinkError(ErrorCode::CONNECTION_CLOSED);
+    auto& stream = it->second;
+    stream.state->CheckWriteOpen();
     const size_t bytes = payload.byte_size();
-    for (;;) {
-        std::shared_ptr<QuicStreamState> state;
-        {
-            if (!core_ || closed_)
-                throw transport::LinkError(ErrorCode::CONNECTION_CLOSED);
-            auto it = core_->streams.find(stream_id);
-            if (it == core_->streams.end())
-                throw transport::LinkError(ErrorCode::CONNECTION_CLOSED);
-            state = it->second.state;
-            state->CheckWriteOpen();
-            if (bytes > kMaxStreamOutputBytes)
-                throw transport::LinkError(ErrorCode::RESOURCE_EXHAUSTED);
-            if (it->second.queued_bytes <= kMaxStreamOutputBytes - bytes) {
-                if (bytes != 0) {
-                    it->second.output.push_back(std::move(payload));
-                }
-                it->second.queued_bytes += bytes;
-                Flush();
-                co_return;
-            }
-        }
-        // Only the stable state survives suspension, never a map iterator.
-        // ACKs release retained buffers; packet transmission alone does not.
-        co_await state->WaitWritable();
+    if (bytes > kMaxStreamOutputBytes)
+        throw transport::LinkError(ErrorCode::RESOURCE_EXHAUSTED);
+    if (stream.queued_bytes > kMaxStreamOutputBytes - bytes) return stream.state;
+    if (bytes != 0) {
+        stream.output.push_back(std::move(payload));
     }
+    stream.queued_bytes += bytes;
+    Flush();
+    return nullptr;
 }
 
 void Connection::ConsumeStream(int64_t stream_id, size_t bytes) noexcept {
@@ -688,28 +802,33 @@ int Connection::AckStreamData(ngtcp2_conn*, int64_t stream_id, uint64_t offset,
     auto it = self.core_->streams.find(stream_id);
     if (it == self.core_->streams.end() || length == 0) return 0;
     auto& stream = it->second;
-    uint64_t merged_start = offset;
-    uint64_t merged_end = offset + length;
-    auto range = stream.acked_ranges.lower_bound(offset);
-    if (range != stream.acked_ranges.begin()) {
-        auto previous = std::prev(range);
-        if (previous->second >= offset) range = previous;
-    }
-    while (range != stream.acked_ranges.end() &&
-           range->first <= merged_end) {
-        merged_start = std::min(merged_start, range->first);
-        merged_end = std::max(merged_end, range->second);
-        range = stream.acked_ranges.erase(range);
-    }
-    stream.acked_ranges.emplace(merged_start, merged_end);
     const uint64_t previous_acknowledged = stream.acknowledged;
-    for (;;) {
-        auto first = stream.acked_ranges.begin();
-        if (first == stream.acked_ranges.end() ||
-            first->first > stream.acknowledged) break;
-        stream.acknowledged =
-            std::max(stream.acknowledged, first->second);
-        stream.acked_ranges.erase(first);
+    if (stream.acked_ranges.empty() && offset <= stream.acknowledged) {
+        // In-order ACK: the merged range would be consumed at once.
+        stream.acknowledged = std::max(stream.acknowledged, offset + length);
+    } else {
+        uint64_t merged_start = offset;
+        uint64_t merged_end = offset + length;
+        auto range = stream.acked_ranges.lower_bound(offset);
+        if (range != stream.acked_ranges.begin()) {
+            auto previous = std::prev(range);
+            if (previous->second >= offset) range = previous;
+        }
+        while (range != stream.acked_ranges.end() &&
+               range->first <= merged_end) {
+            merged_start = std::min(merged_start, range->first);
+            merged_end = std::max(merged_end, range->second);
+            range = stream.acked_ranges.erase(range);
+        }
+        stream.acked_ranges.emplace(merged_start, merged_end);
+        for (;;) {
+            auto first = stream.acked_ranges.begin();
+            if (first == stream.acked_ranges.end() ||
+                first->first > stream.acknowledged) break;
+            stream.acknowledged =
+                std::max(stream.acknowledged, first->second);
+            stream.acked_ranges.erase(first);
+        }
     }
     size_t released = static_cast<size_t>(
         stream.acknowledged - previous_acknowledged);
@@ -917,7 +1036,7 @@ void Connection::Flush() {
             if (!output_socket || !output_remote ||
                 !listener_->Queue(*output_socket,
                     std::span<const uint8_t>(packet.data(), static_cast<size_t>(written)),
-                    *output_remote, shared_from_this())) {
+                    *output_remote, *this)) {
                 Close();
                 return;
             }
@@ -975,7 +1094,7 @@ void Connection::Flush() {
         if (!output_socket || !output_remote ||
             !listener_->Queue(*output_socket,
                 std::span<const uint8_t>(packet.data(), static_cast<size_t>(written)),
-                *output_remote, shared_from_this())) {
+                *output_remote, *this)) {
             Close();
             return;
         }
@@ -1016,9 +1135,12 @@ void Connection::Close() noexcept {
 }
 
 net::awaitable<void> Connection::ReservePhysicalAdmission() {
-    auto admission = co_await listener_->environment.limiter->ReservePhysical(
-        base_context_.inbound.tag, base_context_.inbound.source_ip,
-        base_context_.inbound.HasProxyProtocolClientIP());
+    ConnectionLimiter::Admission admission;
+    if (auto& limiter = *listener_->environment.limiter; limiter.TracksAdmission()) {
+        admission = co_await limiter.ReservePhysical(
+            base_context_.inbound.tag, base_context_.inbound.source_ip,
+            base_context_.inbound.HasProxyProtocolClientIP());
+    }
     const auto reject = admission.reason;
     if (closed_) co_return;
     if (reject != ConnectionLimiter::RejectReason::NONE) {
@@ -1064,7 +1186,7 @@ void Connection::Refuse() noexcept {
                 if (auto* socket = OutputSocket(path))
                     (void)listener_->Queue(*socket,
                         std::span<const uint8_t>(packet.data(), static_cast<size_t>(written)),
-                        core_->remote, shared_from_this(), true);
+                        core_->remote, *this, true);
             } catch (const std::bad_alloc&) {
                 // The close frame is advisory; state is dropped regardless.
             }
@@ -1478,7 +1600,10 @@ bool Connection::SendUdpMessage(
     const auto message_budget = static_cast<size_t>(
         frame_budget <= 65 ? frame_budget - 2 : frame_budget - kUdpDatagramFrameOverhead);
     const auto version = listener_->version;
-    const auto header_size = UdpMessageHeaderSize(version, target);
+    std::optional<iputil::AddressText> address_storage;
+    const auto text = PrepareUdpTargetText(version, target, address_storage);
+    if (!text) return false;
+    const auto header_size = UdpHeaderSize(version, *text);
     if (!header_size || *header_size > message_budget) return false;
     const size_t fragment_payload = message_budget - *header_size;
     if (!payload.empty() && fragment_payload == 0) return false;
@@ -1492,16 +1617,19 @@ bool Connection::SendUdpMessage(
         .session_id = session_id,
         .packet_id = next_udp_packet_id_++,
         .fragment_count = static_cast<uint8_t>(fragments),
-        .target = target,
+        .target = {},
         .payload = {},
     };
+    // The first fragment always carries the target.
+    if (text->host.empty()) return false;
     try {
         for (size_t index = 0; index < fragments; ++index) {
             const size_t offset = index * fragment_payload;
             message.fragment_id = static_cast<uint8_t>(index);
             message.payload = payload.subspan(
                 offset, std::min(fragment_payload, payload.size() - offset));
-            auto encoded = EncodeUdpMessage(version, message);
+            auto encoded = EncodeUdpMessageTo(
+                version, message, *text, target.port, *header_size);
             if (!encoded) {
                 while (core_->datagrams.size() > initial_datagrams)
                     core_->datagrams.pop_back();
@@ -1563,7 +1691,7 @@ void HysteriaIngress::Spawn(net::awaitable<void> task) {
 }
 
 bool HysteriaIngress::Queue(SocketState& socket, std::span<const uint8_t> data,
-                            udp::endpoint remote, std::shared_ptr<Connection> connection,
+                            const udp::endpoint& remote, Connection& connection,
                             bool terminal) {
     if (stopping || !socket.socket || !socket.socket->is_open()) return false;
     if (socket.output.empty()) {
@@ -1578,7 +1706,7 @@ bool HysteriaIngress::Queue(SocketState& socket, std::span<const uint8_t> data,
     if (socket.output.size() >= kMaxQueuedSocketPackets) return false;
     socket.output.push_back({
         memory::ByteVector(data.begin(), data.end()),
-        std::move(remote), std::move(connection), terminal});
+        remote, connection.shared_from_this(), terminal});
     (void)socket.changed.try_send(IoErrorCode{});
     return true;
 }
@@ -1675,9 +1803,9 @@ net::awaitable<void> HysteriaIngress::ReceiveLoop(std::shared_ptr<SocketState> s
                 connection = Connection::Create(*this, *socket, socket->remote, header);
                 if (!connection) continue;
             }
-            if (connection && connection->core_ && connection->core_->quic &&
+            if (connection->core_ && connection->core_->quic &&
                 !connection->Closed()) {
-                (void)connection->Feed(*socket, socket->remote, packet, true);
+                connection->Feed(*socket, socket->remote, packet);
             }
         } catch (const std::bad_alloc&) {
             if (stopping) co_return;
@@ -1775,13 +1903,13 @@ HysteriaIngress::SocketPtr HysteriaIngress::AttachSocket(
     (void)AttachQuicReuseportBpf(socket->native_handle(), worker_count);
     auto state = memory::AllocateShared<SocketState>(io);
     state->socket = std::move(socket);
-    state->key.assign(socket_key);
     IoErrorCode error;
     state->local = state->socket->local_endpoint(error);
     if (error) return {};
     state->socket->non_blocking(true, error);
     if (error) return {};
-    auto [it, inserted] = sockets.try_emplace(state->key, state);
+    auto [it, inserted] = sockets.try_emplace(
+        memory::ThreadLocalString(socket_key), state);
     return inserted ? it->second->socket : SocketPtr{};
 }
 
@@ -1939,7 +2067,12 @@ net::awaitable<void> QuicStreamState::WriteMultiBuffer(buf::MultiBuffer payload)
         payload.clear();
         throw transport::LinkError(ErrorCode::CONNECTION_CLOSED);
     }
-    co_await owner->WriteStream(stream_id_, std::move(payload));
+    // Only the stable state survives suspension, never a map iterator or
+    // this object. ACKs release retained buffers; packet transmission alone
+    // does not.
+    const int64_t stream_id = stream_id_;
+    while (auto state = owner->QueueStreamOutput(stream_id, payload))
+        co_await state->WaitWritable();
 }
 
 void QuicStreamState::ShutdownWrite() noexcept {
@@ -1994,8 +2127,8 @@ QuicStream::~QuicStream() noexcept {
 }
 
 net::awaitable<size_t> QuicStream::AsyncRead(net::mutable_buffer buffer) {
-    if (closed_) co_return 0;
-    co_return co_await state_->Read(buffer);
+    if (!closed_) return state_->Read(buffer);
+    return []() -> net::awaitable<size_t> { co_return 0; }();
 }
 
 net::awaitable<size_t> QuicStream::AsyncWrite(net::const_buffer buffer) {
@@ -2004,16 +2137,17 @@ net::awaitable<size_t> QuicStream::AsyncWrite(net::const_buffer buffer) {
 }
 
 net::awaitable<buf::MultiBuffer> QuicStream::ReadMultiBuffer() {
-    if (closed_) co_return buf::MultiBuffer{};
-    co_return co_await state_->ReadMultiBuffer();
+    if (!closed_) return state_->ReadMultiBuffer();
+    return []() -> net::awaitable<buf::MultiBuffer> { co_return buf::MultiBuffer{}; }();
 }
 
 net::awaitable<void> QuicStream::WriteMultiBuffer(buf::MultiBuffer payload) {
-    if (closed_) {
-        payload.clear();
+    if (!closed_) return state_->WriteMultiBuffer(std::move(payload));
+    return [](buf::MultiBuffer rejected) -> net::awaitable<void> {
+        rejected.clear();
         throw transport::LinkError(ErrorCode::CONNECTION_CLOSED);
-    }
-    co_await state_->WriteMultiBuffer(std::move(payload));
+        co_return;
+    }(std::move(payload));
 }
 
 net::awaitable<void> QuicStream::WriteBuffers(
@@ -2170,108 +2304,6 @@ void UdpSessionStream::Close() {
 void UdpSessionStream::WakeReader() noexcept {
     (void)signal_.try_send(IoErrorCode{});
 }
-
-namespace {
-
-void AppendU16(memory::ByteVector& output, uint16_t value) {
-    std::array<uint8_t, 2> bytes{};
-    StoreU16BE(bytes.data(), value);
-    output.insert(output.end(), bytes.begin(), bytes.end());
-}
-
-void AppendU32(memory::ByteVector& output, uint32_t value) {
-    std::array<uint8_t, 4> bytes{};
-    StoreU32BE(bytes.data(), value);
-    output.insert(output.end(), bytes.begin(), bytes.end());
-}
-
-void AppendU64(memory::ByteVector& output, uint64_t value) {
-    std::array<uint8_t, 8> bytes{};
-    StoreU64BE(bytes.data(), value);
-    output.insert(output.end(), bytes.begin(), bytes.end());
-}
-
-bool AppendVarint(memory::ByteVector& output, uint64_t value) {
-    const size_t width = QuicVarintSize(value);
-    if (width == 0) return false;
-    const uint8_t prefix = static_cast<uint8_t>(
-        (width == 1 ? 0 : width == 2 ? 1 : width == 4 ? 2 : 3) << 6);
-    output.push_back(static_cast<uint8_t>((value >> ((width - 1) * 8)) | prefix));
-    for (size_t i = 1; i < width; ++i)
-        output.push_back(static_cast<uint8_t>(value >> ((width - 1 - i) * 8)));
-    return true;
-}
-
-[[nodiscard]] std::string_view TargetHost(
-    const TargetAddress& target, std::optional<iputil::AddressText>& storage) {
-    if (target.IsDomain()) return {target.host.data(), target.host.size()};
-    if (!target.resolved_addr) return {};
-    storage.emplace(*target.resolved_addr);
-    return storage->View();
-}
-
-[[nodiscard]] tl::expected<TargetAddress, ProtocolError>
-ParseV1Target(std::span<const uint8_t> host, uint16_t port) {
-    if (host.empty() || host.size() > kMaxAddressLength || port == 0)
-        return tl::unexpected(ProtocolError::Invalid);
-    TargetAddress target(
-        std::string_view(reinterpret_cast<const char*>(host.data()), host.size()), port);
-    if (!target.IsValid()) return tl::unexpected(ProtocolError::Invalid);
-    return target;
-}
-
-[[nodiscard]] bool ValidFragmentIndex(Version version, uint8_t index, uint8_t count) noexcept {
-    // HY2 declares Fragment ID irrelevant for an unfragmented packet.
-    return count != 0 && ((version == Version::V2 && count == 1) || index < count);
-}
-
-[[nodiscard]] bool RequiresUdpTarget(Version version, uint8_t index, uint8_t count) noexcept {
-    return version == Version::V1 || count == 1 || index == 0;
-}
-
-struct UdpTargetText {
-    // host 借用调用方的 target 或 address_storage，只用于同步计长与编码。
-    std::string_view host;
-    std::array<char, 5> port{};
-    size_t port_size = 0;
-    size_t authority_size = 0;
-    bool bracket_v6 = false;
-};
-
-[[nodiscard]] tl::expected<UdpTargetText, ProtocolError> PrepareUdpTargetText(
-    Version version, const TargetAddress& target,
-    std::optional<iputil::AddressText>& address_storage) {
-    UdpTargetText text;
-    if (target.IsValid()) text.host = TargetHost(target, address_storage);
-    if (version == Version::V1) {
-        if (text.host.empty() || text.host.size() > kMaxAddressLength)
-            return tl::unexpected(ProtocolError::Invalid);
-        return text;
-    }
-    if (text.host.empty()) return text;
-    const auto [end, error] = std::to_chars(
-        text.port.data(), text.port.data() + text.port.size(), target.port);
-    if (error != std::errc{}) return tl::unexpected(ProtocolError::Invalid);
-    text.port_size = static_cast<size_t>(end - text.port.data());
-    text.bracket_v6 = text.host.find(':') != std::string_view::npos;
-    const size_t suffix = (text.bracket_v6 ? 2 : 0) + 1 + text.port_size;
-    if (text.host.size() > std::numeric_limits<size_t>::max() - suffix)
-        return tl::unexpected(ProtocolError::TooLarge);
-    text.authority_size = text.host.size() + suffix;
-    return text;
-}
-
-[[nodiscard]] tl::expected<size_t, ProtocolError> UdpHeaderSize(
-    Version version, const UdpTargetText& text) {
-    if (version == Version::V1) return 14 + text.host.size();
-    const size_t width = QuicVarintSize(text.authority_size);
-    if (width == 0 ||
-        text.authority_size > std::numeric_limits<size_t>::max() - 8 - width)
-        return tl::unexpected(ProtocolError::TooLarge);
-    return 8 + width + text.authority_size;
-}
-
-}  // namespace
 
 tl::expected<V1ClientHello, ProtocolError>
 ParseV1ClientHello(std::span<const uint8_t> input) {
@@ -2458,34 +2490,8 @@ EncodeUdpMessage(Version version, const UdpMessage& message) {
     if (!header_size) return tl::unexpected(header_size.error());
     if (message.payload.size() > std::numeric_limits<size_t>::max() - *header_size)
         return tl::unexpected(ProtocolError::TooLarge);
-
-    memory::ByteVector output;
-    output.reserve(*header_size + message.payload.size());
-    AppendU32(output, message.session_id);
-    if (version == Version::V1) {
-        AppendU16(output, static_cast<uint16_t>(text->host.size()));
-        output.insert(output.end(), text->host.begin(), text->host.end());
-        AppendU16(output, message.target.port);
-        AppendU16(output, message.packet_id);
-        output.push_back(message.fragment_id);
-        output.push_back(message.fragment_count);
-        AppendU16(output, static_cast<uint16_t>(message.payload.size()));
-    } else {
-        AppendU16(output, message.packet_id);
-        output.push_back(message.fragment_id);
-        output.push_back(message.fragment_count);
-        if (!AppendVarint(output, text->authority_size))
-            return tl::unexpected(ProtocolError::TooLarge);
-        if (!text->host.empty()) {
-            if (text->bracket_v6) output.push_back('[');
-            output.insert(output.end(), text->host.begin(), text->host.end());
-            if (text->bracket_v6) output.push_back(']');
-            output.push_back(':');
-            output.insert(output.end(), text->port.data(), text->port.data() + text->port_size);
-        }
-    }
-    output.insert(output.end(), message.payload.begin(), message.payload.end());
-    return output;
+    return EncodeUdpMessageTo(
+        version, message, *text, message.target.port, *header_size);
 }
 
 std::array<uint8_t, 32> HashCredential(std::string_view credential) noexcept {

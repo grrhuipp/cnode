@@ -36,7 +36,6 @@ struct Parsed2022Body {
     TargetAddress target;
     std::span<const uint8_t> payload;
     std::optional<ForwardedMetadata> forwarded;
-    std::array<uint8_t, 8> client_session_id{};
 };
 
 
@@ -110,8 +109,7 @@ struct Parsed2022Body {
 }
 
 [[nodiscard]] std::optional<Parsed2022Body> Parse2022ClientBodyPlaintext(
-    std::span<const uint8_t> plaintext,
-    std::span<const uint8_t, 8> client_session_id) {
+    std::span<const uint8_t> plaintext) {
     constexpr size_t kMinHeader = 1 + 8 + 2;
     if (plaintext.size() < kMinHeader || plaintext[0] != kSs2022ClientPacket) {
         return std::nullopt;
@@ -139,8 +137,6 @@ struct Parsed2022Body {
     parsed.target = std::move(addr.target);
     parsed.forwarded = std::move(addr.forwarded);
     parsed.payload = plaintext.subspan(pos);
-    std::copy(client_session_id.begin(), client_session_id.end(),
-              parsed.client_session_id.begin());
     return parsed;
 }
 
@@ -178,9 +174,6 @@ struct Parsed2022Body {
     Parsed2022Body parsed;
     parsed.target = std::move(addr.target);
     parsed.payload = plaintext.subspan(pos);
-    std::copy(expected_client_session_id.begin(),
-              expected_client_session_id.end(),
-              parsed.client_session_id.begin());
     return parsed;
 }
 
@@ -507,7 +500,7 @@ struct PlaintextScratch {
             }
             std::array<uint8_t, 8> client_session_id{};
             std::memcpy(client_session_id.data(), separate.data(), client_session_id.size());
-            auto parsed = Parse2022ClientBodyPlaintext(scratch.Span(), client_session_id);
+            auto parsed = Parse2022ClientBodyPlaintext(scratch.Span());
             if (!parsed) {
                 return std::nullopt;
             }
@@ -568,7 +561,7 @@ struct PlaintextScratch {
             plaintext.data() + kSs2022UdpSessionIdSize);
         const auto body = plaintext.subspan(
             kSs2022UdpSessionIdSize + kSs2022UdpPacketIdSize);
-        auto parsed = Parse2022ClientBodyPlaintext(body, client_session_id);
+        auto parsed = Parse2022ClientBodyPlaintext(body);
         if (!parsed) {
             return std::nullopt;
         }

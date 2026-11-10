@@ -240,38 +240,40 @@ KeyBytes BuildMasterKey(std::string_view password, const SsCipherInfo& info) {
     return DeriveKey(password, info.key_size);
 }
 
-bool Derive2022Subkey(const uint8_t* key, size_t key_size,
-                      const uint8_t* salt, size_t salt_size,
-                      uint8_t* out_subkey) {
-    if (!key || !salt || !out_subkey ||
-        key_size == 0 || key_size > KeyBytes::kMaxSize ||
-        salt_size == 0 || salt_size > KeyBytes::kMaxSize) {
-        return false;
-    }
-    blake3_hasher hasher;
-    blake3_hasher_init_derive_key(&hasher, "shadowsocks 2022 session subkey");
-    blake3_hasher_update(&hasher, key, key_size);
-    blake3_hasher_update(&hasher, salt, salt_size);
-    blake3_hasher_finalize(&hasher, out_subkey, key_size);
-    OPENSSL_cleanse(&hasher, sizeof(hasher));
-    return true;
-}
+namespace {
 
-bool Derive2022IdentitySubkey(const uint8_t* key, size_t key_size,
-                              const uint8_t* salt, size_t salt_size,
-                              uint8_t* out_key) {
+bool Derive2022ContextKey(const char* context,
+                          const uint8_t* key, size_t key_size,
+                          const uint8_t* salt, size_t salt_size,
+                          uint8_t* out_key) {
     if (!key || !salt || !out_key ||
         key_size == 0 || key_size > KeyBytes::kMaxSize ||
         salt_size == 0 || salt_size > KeyBytes::kMaxSize) {
         return false;
     }
     blake3_hasher hasher;
-    blake3_hasher_init_derive_key(&hasher, "shadowsocks 2022 identity subkey");
+    blake3_hasher_init_derive_key(&hasher, context);
     blake3_hasher_update(&hasher, key, key_size);
     blake3_hasher_update(&hasher, salt, salt_size);
     blake3_hasher_finalize(&hasher, out_key, key_size);
     OPENSSL_cleanse(&hasher, sizeof(hasher));
     return true;
+}
+
+}  // namespace
+
+bool Derive2022Subkey(const uint8_t* key, size_t key_size,
+                      const uint8_t* salt, size_t salt_size,
+                      uint8_t* out_subkey) {
+    return Derive2022ContextKey("shadowsocks 2022 session subkey",
+                                key, key_size, salt, salt_size, out_subkey);
+}
+
+bool Derive2022IdentitySubkey(const uint8_t* key, size_t key_size,
+                              const uint8_t* salt, size_t salt_size,
+                              uint8_t* out_key) {
+    return Derive2022ContextKey("shadowsocks 2022 identity subkey",
+                                key, key_size, salt, salt_size, out_key);
 }
 
 bool Hash2022Psk(std::span<const uint8_t> key, std::span<uint8_t, 16> out_hash) {

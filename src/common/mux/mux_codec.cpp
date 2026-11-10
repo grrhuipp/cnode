@@ -34,8 +34,6 @@ namespace {
 // 元数据必须被完整消费，超出最大合法布局（含 GlobalID）的 MetaLen 无需等待数据即可判定非法；
 // Xray-core 解码端同样拒绝超长 metaLen。
 constexpr size_t kMaxFrameMetadataBytes = 4 + 1 + kMaxEncodedAddressSize + 8;
-// MetaLen + 元数据 + DataLen：解码所需的全部连续前缀
-constexpr size_t kMaxFramePrefixBytes = 2 + kMaxFrameMetadataBytes + 2;
 
 [[nodiscard]] bool ParsePortThenAddress(
     ByteReader& reader,
@@ -172,7 +170,7 @@ std::optional<FrameHeader> DecodeFrame(const buf::MultiBuffer& data) {
     if (front.size() >= needed_prefix) {
         return DecodeFramePrefix(front, total_len);
     }
-    std::array<uint8_t, kMaxFramePrefixBytes> prefix{};
+    std::array<uint8_t, kMaxFrameHeaderBytes> prefix{};
     const size_t copied = data.CopyPrefixTo(
         std::span<uint8_t>(prefix.data(), needed_prefix));
     return DecodeFramePrefix(std::span<const uint8_t>(prefix.data(), copied), total_len);
@@ -835,7 +833,9 @@ public:
     }
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
-        co_await WaitForOutputWindow();
+        if (reply_queue_.ShouldBackpressureTcpReads()) {
+            co_await WaitForOutputWindow();
+        }
         if (cancelled_ || !reply_queue_.running) {
             mb.clear();
             throw IoSystemError(
@@ -1406,11 +1406,11 @@ net::awaitable<RelayResult> ProcessInbound(
             while (running && frame_buf.byte_size() > 0 &&
                    !reply_queue.ShouldBackpressureClientFrames() &&
                    !reply_queue.tcp_overflowed) {
-                const auto opt_hdr = mux::DecodeFrame(frame_buf);
+                auto opt_hdr = mux::DecodeFrame(frame_buf);
                 if (!opt_hdr) break;  // 数据不足，等待下次读取
                 decoded_any_frame = true;
 
-                const mux::FrameHeader& hdr = *opt_hdr;
+                mux::FrameHeader& hdr = *opt_hdr;
                 if (hdr.frame_size == 0) {
                     LOG_CONN_DEBUG(parent_ctx, "invalid frame");
                     result.error = ErrorCode::PROTOCOL_DECODE_FAILED;
@@ -1465,7 +1465,7 @@ net::awaitable<RelayResult> ProcessInbound(
                             rejected_ctx,
                             proxy::InboundRequestTarget{
                                 is_udp ? Network::UDP : Network::TCP,
-                                hdr.target,
+                                std::move(hdr.target),
                                 std::move(hdr.forwarded)});
                         LOG_CONN_DEBUG(rejected_ctx,
                             "refused NEW sid={} active={}",
@@ -1505,7 +1505,7 @@ net::awaitable<RelayResult> ProcessInbound(
                         sub_state->ctx,
                         proxy::InboundRequestTarget{
                             is_udp ? Network::UDP : Network::TCP,
-                            hdr.target,
+                            std::move(hdr.target),
                             std::move(hdr.forwarded)});
                     if (hdr.has_data) {
                         sub_state->PushClientFramePayload(

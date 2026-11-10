@@ -188,7 +188,8 @@ proxy::vmess::inbound::Handler::Process(
     std::optional<::vmess::encoding::RequestBodyReader> request_reader;
     std::optional<::vmess::encoding::ResponseBodyWriter> response_writer;
     try {
-        if (co_await proxy::CheckInboundIpBanned(limiter_, ctx)) {
+        if (proxy::BeginInboundAuthentication(limiter_, ctx) &&
+            co_await proxy::CheckInboundIpBanned(*limiter_, ctx)) {
             co_return proxy::RejectInbound(stats_, stream.get(), ErrorCode::BLOCKED);
         }
         {
@@ -251,7 +252,6 @@ BuildPreparedVmessUser(const ::InboundUserSpec& spec) {
         return std::nullopt;
     }
     return ::proxyman::inbound::PreparedVmessUser{
-        .uuid = spec.credential,
         .uuid_bytes = user->uuid_bytes,
         .cmd_key = user->cmd_key,
         .auth_key = user->auth_key,

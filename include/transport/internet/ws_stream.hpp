@@ -121,7 +121,6 @@ public:
     }
     bool WriteShutdownClosesLink() const noexcept override { return true; }
 
-    void SetPendingData(const uint8_t* data, size_t len);
     void SetPendingMultiBuffer(buf::MultiBuffer&& mb);
     net::awaitable<size_t> AsyncRead(net::mutable_buffer buffer) override;
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override;
@@ -164,13 +163,12 @@ private:
     [[nodiscard]] bool TryFillHeaderFromPending() noexcept;
     net::awaitable<bool> EnsurePendingData();
     net::awaitable<size_t> ReadSome(uint8_t* data, size_t size);
-    net::awaitable<bool> FillHeader();
     net::awaitable<bool> PrepareNextDataFrame();
     void ConsumePayloadBytes(std::span<uint8_t> bytes);
     void FinishDataFrame();
     void ValidateClose();
 
-    net::awaitable<WriteGate::Lease> AcquireWrite();
+    net::awaitable<WriteGate::Lease> AcquireWrite(net::cancellation_slot cancellation);
     net::awaitable<void> WriteDataFrame(
         std::span<const net::const_buffer> buffers, size_t size);
     net::awaitable<void> WriteControlFrame(ws::Opcode opcode, std::span<const uint8_t> payload);

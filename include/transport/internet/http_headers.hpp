@@ -59,10 +59,12 @@ using HttpHeaders = std::unordered_map<std::string, std::string>;
     std::string_view configured_host,
     const HttpHeaders* headers,
     std::string_view fallback = {}) noexcept {
-    const std::string* header_host = headers ? FindHttpHeader(*headers, "Host") : nullptr;
-    const std::string_view raw = !configured_host.empty()
-        ? configured_host
-        : (header_host ? std::string_view(*header_host) : std::string_view{});
+    std::string_view raw = configured_host;
+    if (raw.empty() && headers) {
+        if (const std::string* header_host = FindHttpHeader(*headers, "Host")) {
+            raw = *header_host;
+        }
+    }
     const std::string_view trimmed = TrimAscii(raw);
     return trimmed.empty() ? fallback : trimmed;
 }

@@ -70,32 +70,18 @@ public:
         const bool throw_if_cancelled = co_await net::this_coro::throw_if_cancelled();
         co_await net::this_coro::throw_if_cancelled(false);
         std::exception_ptr failure;
-        if constexpr (std::is_void_v<Result>) {
-            try {
-                co_await net::co_spawn(
-                    pool_,
-                    Invoke(std::move(slot), std::move(function)),
-                    net::bind_cancellation_slot(net::cancellation_slot{}, net::use_awaitable));
-            } catch (...) {
-                failure = std::current_exception();
-            }
-            co_await net::this_coro::throw_if_cancelled(throw_if_cancelled);
-            if (failure) std::rethrow_exception(failure);
-            co_return;
-        } else {
-            std::optional<Result> result;
-            try {
-                result.emplace(co_await net::co_spawn(
-                    pool_,
-                    Invoke(std::move(slot), std::move(function)),
-                    net::bind_cancellation_slot(net::cancellation_slot{}, net::use_awaitable)));
-            } catch (...) {
-                failure = std::current_exception();
-            }
-            co_await net::this_coro::throw_if_cancelled(throw_if_cancelled);
-            if (failure) std::rethrow_exception(failure);
-            co_return std::move(*result);
+        std::optional<Result> result;
+        try {
+            result.emplace(co_await net::co_spawn(
+                pool_,
+                Invoke(std::move(slot), std::move(function)),
+                net::bind_cancellation_slot(net::cancellation_slot{}, net::use_awaitable)));
+        } catch (...) {
+            failure = std::current_exception();
         }
+        co_await net::this_coro::throw_if_cancelled(throw_if_cancelled);
+        if (failure) std::rethrow_exception(failure);
+        co_return std::move(*result);
     }
 private:
     struct Slot {
@@ -108,12 +94,7 @@ private:
     template<class Function>
     static net::awaitable<std::invoke_result_t<Function>> Invoke(
         [[maybe_unused]] Slot slot, Function function) {
-        if constexpr (std::is_void_v<std::invoke_result_t<Function>>) {
-            function();
-            co_return;
-        } else {
-            co_return function();
-        }
+        co_return function();
     }
     static constexpr size_t kCapacity = 64;
     net::thread_pool pool_{1};
@@ -499,7 +480,7 @@ struct Controller::Impl : std::enable_shared_from_this<Controller::Impl> {
     net::awaitable<void> userInfoMonitor(PanelRuntime& panel,
                                          std::string tag);
 
-    net::awaitable<bool> collectTraffic(PanelRuntime& panel,
+    net::awaitable<void> collectTraffic(PanelRuntime& panel,
                                         bool* appended_out = nullptr);
     net::awaitable<controller::OnlineSnapshot>
     GetOnlineSnapshot(const std::string& tag);
@@ -744,7 +725,7 @@ public:
     }
 
     net::awaitable<void> RecoverUsers() {
-        co_await ::RollbackUsers(
+        return ::RollbackUsers(
             io_context_.get_executor(), workers_, panel_.node.user_recovery, stopping_);
     }
 
@@ -796,11 +777,11 @@ void Controller::RequestStop() noexcept {
 }
 
 net::awaitable<void> Controller::AsyncJoin() {
-    co_await impl_->AsyncJoin();
+    return impl_->AsyncJoin();
 }
 
 net::awaitable<void> Controller::FlushTraffic() {
-    co_await impl_->FlushTraffic();
+    return impl_->FlushTraffic();
 }
 
 std::vector<Controller::NodeStatsInfo> Controller::GetNodeStats() const {
@@ -1227,14 +1208,13 @@ void Controller::Impl::logPanelStatus(const PanelRuntime& panel) const {
         push_interval.count());
 }
 
-net::awaitable<bool>
+net::awaitable<void>
 Controller::Impl::collectTraffic(PanelRuntime& panel, bool* appended_out) {
     // Do not abandon a durable append before its matching Worker commit.
     // Shutdown joins this critical section before taking its final snapshot.
     co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
     // Only this panel loop may snapshot/commit its accounting key. The disk
     // executor never touches Worker-owned state and has bounded admission.
-    bool appended = false;
     for (const auto& worker : workers_) {
         auto* w = worker.get();
         auto snapshot = co_await w->PostCall([w, &panel] {
@@ -1263,7 +1243,6 @@ Controller::Impl::collectTraffic(PanelRuntime& panel, bool* appended_out) {
             }
             std::rethrow_exception(append_failure);
         }
-        appended = true;
         if (appended_out) *appended_out = true;
         // A successful append is durable. A failed commit must suspend further
         // collection, otherwise the same in-memory delta could be persisted twice.
@@ -1276,7 +1255,6 @@ Controller::Impl::collectTraffic(PanelRuntime& panel, bool* appended_out) {
             throw;
         }
     }
-    co_return appended;
 }
 
 net::awaitable<void> Controller::Impl::FlushTraffic() {

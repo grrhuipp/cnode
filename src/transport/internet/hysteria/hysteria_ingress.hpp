@@ -224,7 +224,6 @@ public:
 
     QuicStreamState(net::io_context& io_context, int64_t stream_id, std::weak_ptr<Connection> owner);
 
-    [[nodiscard]] int64_t Id() const noexcept { return stream_id_; }
     [[nodiscard]] net::io_context& IoContext() const noexcept { return io_context_; }
     transport::CancellationSource& Cancellation() noexcept { return cancellation_; }
     [[nodiscard]] bool PushInput(std::span<const uint8_t> data, bool fin);
@@ -328,7 +327,6 @@ public:
                      std::weak_ptr<Connection> owner);
     ~UdpSessionStream() noexcept override;
 
-    [[nodiscard]] uint32_t SessionId() const noexcept { return session_id_; }
     // Target of the datagram that opened the session.
     [[nodiscard]] const TargetAddress& FirstTarget() const noexcept { return first_target_; }
 
@@ -394,8 +392,8 @@ private:
     [[nodiscard]] const proxyman::inbound::ReceiverSettings& Receiver() const noexcept;
     void Spawn(net::awaitable<void> task);
     [[nodiscard]] bool Queue(SocketState& socket, std::span<const uint8_t> data,
-                             udp::endpoint remote,
-                             std::shared_ptr<Connection> connection, bool terminal = false);
+                             const udp::endpoint& remote,
+                             Connection& connection, bool terminal = false);
     void Associate(const ngtcp2_cid& cid, std::shared_ptr<Connection> connection);
     void Dissociate(const ngtcp2_cid& cid) noexcept;
     void DissociateAll(Connection& connection) noexcept;
@@ -441,8 +439,8 @@ public:
     Connection(const Connection&) = delete;
     Connection& operator=(const Connection&) = delete;
 
-    bool Feed(SocketState& socket, const udp::endpoint& remote,
-              std::span<const uint8_t> packet, bool flush = true);
+    void Feed(SocketState& socket, const udp::endpoint& remote,
+              std::span<const uint8_t> packet);
     void OnExpiry();
     [[nodiscard]] ngtcp2_tstamp Expiry() const noexcept {
         return std::min(fragment_expiry_,
@@ -457,7 +455,10 @@ public:
     net::awaitable<void> ReservePhysicalAdmission();
 
     // Request stream and UDP session operations.
-    net::awaitable<void> WriteStream(int64_t stream_id, buf::MultiBuffer payload);
+    // Queues |payload| and returns null, or leaves it untouched and returns
+    // the stream state whose WaitWritable() precedes the next attempt.
+    [[nodiscard]] std::shared_ptr<QuicStreamState> QueueStreamOutput(
+        int64_t stream_id, buf::MultiBuffer& payload);
     void ConsumeStream(int64_t stream_id, size_t bytes) noexcept;
     void ShutdownStreamWrite(int64_t stream_id) noexcept;
     void CancelStream(int64_t stream_id) noexcept;
@@ -606,8 +607,6 @@ private:
         void* user_data);
     static int ReceiveDatagram(ngtcp2_conn*, uint32_t flags,
         const uint8_t* data, size_t length, void* user_data);
-    static int PathValidationStarted(ngtcp2_conn*, uint32_t,
-        const ngtcp2_path*, const ngtcp2_path*, void*);
     static int PathValidated(ngtcp2_conn*, uint32_t, const ngtcp2_path*,
         const ngtcp2_path*, ngtcp2_path_validation_result, void*);
 

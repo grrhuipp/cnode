@@ -1713,3 +1713,67 @@ CI失败场景修复后通过真实双进程、ML-KEM/X25519加密和回环对�
   - **`cnode_tcp_send_benchmark`**：`8192B (1 piece)` 单次 burst 耗时由 `10,337.2 / 10,202.1 ns` **两轮一致降至 `10,155.4 / 10,190.8 ns`（最高 -1.8%）**；`8192B (8 pieces)` 由 `10,839.5 / 10,669.8 ns` **两轮一致降至 `10,657.9 / 10,664.0 ns`（最高 -1.7%）**；`8192B (16 pieces)` 由 `11,373.3 / 11,279.8 ns` **两轮一致降至 `11,115.2 / 11,056.7 ns`（-2.0% ~ -2.3%）**；`65536B (16 pieces)` 首轮耗时由 `44,115.7 ns` 降至 **`43,343.0 ns`（-1.8%）**。
   - **`cnode_runtime_sampling_benchmark`**：64 活跃会话 `resources=1` 采样延迟由 `86.03 / 144.65 ns` **两轮一致稳定降至 `85.95 / 86.10 ns`**（`p50 = 50.0 ns`，`p95 = 60.0 ns`，0 次堆分配）；`resources=0` 首轮 `max_ns` 降至 `41.0 ns`、第 2 轮 `p95` 降至 `40.0 ns`。
   - **`cnode_tls_throughput_benchmark`**：`server_started` 启动匿名内存稳定保持 `5,931,008 ~ 5,939,200 B`（`5.66 MiB`）；首轮 `Download8` 8 流下载吞吐由 `602.38 MiB/s` 升至 **`616.41 MiB/s`（+2.3%）**，第 2 轮 `Upload1` 单流上传吞吐由 `643.01 MiB/s` 升至 **`791.69 MiB/s`（+23.1%）**。
+
+## 2026-11-10：会话驻留帧瘦身、空转协程与死状态清除（基线 `1be6301`）
+
+### 架构与流程精简内容
+
+1. **主链路：会话期常驻协程帧瘦身与空转协程清除**：
+   - `include/common/initial_payload.hpp`：生产代码只以 `MultiBuffer` 构造首包、判空并一次性移交；删除 256 B 内联缓冲及仅测试调用的 `assign/append/span/PrefixSpan/CopyPrefixTo/size/IsContiguous`。`Dispatch` 与 `DispatchPreparedLink` 两个会话期常驻帧不再各自内嵌这块缓冲，也不再在每次构造/移动时清零并复制 256 B。
+   - `src/common/awaitable_task_group.hpp`：同执行器路径由非协程 `Launch` 直接返回 `async_initiate` 的 awaitable，删除每个请求/会话任务组的 `RunOnExecutor` 包装帧；跨执行器入口语义不变。
+   - `src/app/dispatcher/default_dispatcher.cpp`：`IPIfNonMatch` 下域名先同步选路，规则命中即完成，不再为其构造 `RouteAsync` 帧；`RouteAsync` 只在确需 DNS 时进入，删除两段不可达的前置分支与重复的 `DomainStrategy()` 虚调用；嗅探补读把 `cache_more` 并入 `read_more`（每次补读少一帧）。
+   - `include/app/relay.hpp`：限速等待仅在令牌桶给出正延迟时才构造 `WaitFor` 协程（限速用户每包每方向少一帧）；删除只转发 `direction && direction` 的 `transfer` 帧（每条 relay 少一个常驻帧）。
+   - `include/app/rate_limiter.hpp`、`src/app/proxyman/inbound/handler.cpp`、`src/proxy/inbound_admission.hpp`、`hysteria_ingress.cpp`：新增 `ConnectionLimiter::TracksAdmission()`；未配置连接配额与封禁（默认配置）时 7 处准入调用不再 `co_await` 一个立即返回的空协程（每 TCP 连接 2 帧、每逻辑流/子流 1 帧、每原生 UDP 关联 2 帧、每 QUIC 连接 1 帧，并省去逻辑流一次 `shared_ptr<Family>` 引用计数往返）。`CheckInboundIpBanned` 拆为同步的 `BeginInboundAuthentication`（清身份并判定是否需要查询）与仅在需要时进入的协程，5 个协议入口同步迁移；单调用方 `CheckInboundCredential` 并入 `VerifyInboundCredential`。
+   - 删除只写不读的 `InboundTransportMetadata::real_ip_header`（每条 TCP 连接、每次 HTTP/1 握手与每个 h2 请求各一次 PMR 字符串赋值）及 `RealIpHeader()`。
+2. **公共内存与统计**：
+   - `include/common/buf/multi_buffer.hpp`：`ContiguousWriteBuffer` 超 8 KiB 的路径改为向构造时绑定的资源借未初始化块（原 `ByteVector::resize` 对每条 VLESS Encryption 满记录清零 8–16 KiB），与池化 `Buffer` 路径的语义一致；`Buffer::New` 删除重复的游标写入。
+   - `include/common/allocator.hpp`：`Deallocate` 与 large-bin 扫描中的 `% alignment` 改为位掩码（对齐已校验为 2 的幂，每次 PMR 释放少一次 64 位除法）；删除无调用方的 `worker_memory::allocator()`。
+   - `include/app/stats.hpp`：`StatsShard` 扁平化为单缓存行（128 → 64 B），删除无调用方的 `HotStatsShard`/`ColdStatsShard` 分层与 `AddBytesIn/Out` 转发。
+3. **传输层**：
+   - `tcp_stream.{hpp,cpp}`：`WriteMultiBuffer` 首次非阻塞发送遇 EAGAIN 后经 `WriteBuffersFrom(..., blocked)` 直接等待可写，不再紧接着重复一次 `send` 并重建 iovec；`Connect`/`ConnectWithBind`/`ConnectSocket` 合并为单一 `Connect(io, endpoint, bind_local, timeout)`。
+   - `transport_dialer.cpp`：`DialSingleCandidate` 改为非协程转发；裸 TCP、无安全层的拨号成功后直接返回，不再为不会挂起的 `BuildOutboundTransport` 武装再解除握手期限；XHTTP 下载目标只在配置了 `downloadSettings` 时进入 `AttachXHttpDownloadTarget`；`AcquireUploadGate` 内联到三个调用点。
+   - `ws_stream.{hpp,cpp}`、`http1_handshake.{hpp,cpp}`：`FillHeader` 内联，`AcquireWrite` 仅在写门争用时进入协程；chunked 读仅在块耗尽时调用 `EnsureChunkPayload`；删除生产无调用方的 `MakeHttp1BodyStream` span 重载与两处 `SetPendingData`。
+   - `http2_session.cpp`、`xhttp_session.{hpp,cpp}`、`http_headers.hpp`：服务端 `ReceiveData` 改为同步返回 `DataFault`（每个 DATA 帧少一帧和一次 `H2Frame` 移动，各故障分支的记账与上报顺序不变）；`EnsureReadablePayload` 改为非协程分派，已有可读数据时同步判定；单个 `WINDOW_UPDATE` 以 13 字节单缓冲写出；`RunHttp2ServerSession` 不再保留一个连接期常驻转发帧；删除恒等冗余的 `H2Frame::length`、`QueuedPacket::bytes` 与三处恒真条件；`ResolveConfiguredHttpHost` 只在未显式配置 Host 时扫描 header；`Upload::Read` 内联 `ReadToMultiBufferTail`。
+   - `hysteria_ingress.{hpp,cpp}`：`Connection::WriteStream` 改为同步的 `QueueStreamOutput`，`QuicStream` 读写直接返回状态对象的协程（每次流写 3 → 1 帧、读 2 → 1 帧）；`AckStreamData` 对按序 ACK 直接推进 `acknowledged`（不再为每次 ACK 分配并释放一个 map 节点，乱序仍走原合并路径）；`Queue` 按引用接收端点与连接，只在真正入队时取 `shared_from_this()`；`SendUdpMessage` 的目标文本与头长只计算一次并去掉 `TargetAddress` 拷贝；删除 `Feed` 恒真的 `flush` 参数、空回调 `PathValidationStarted`、`SocketState::key` 与两个无调用访问器。
+4. **协议层**：
+   - VLESS：`VlessEncryptionWriter::WritePlaintext` 并入 `WriteBuffers`（每条记录少一帧，去掉约 45 行重复的封记录代码）；`VlessBufferedReader::ReadBuffered` 同步消费已缓冲字节；`ReadMultiBufferOrThrowOnCancel` 包装协程内联后删除；Vision 头 arena 由 `std::deque` 改为 `ThreadLocalList`（每次带填充的写少 2 次分配）；XUDP 读在响应头完成后不再进入 `ReadVlessResponseHeader`；UDP 分帧直接组装 iovec。
+   - Trojan：`UdpFramer::Next` 在前缀连续时零拷贝解码地址（去掉每数据报 485 B 的清零与复制）；`WriteUdpDatagram(MultiBuffer)` 直接组装 iovec。
+   - Mux：TCP 子流仅在回包队列背压时等待输出窗口；NEW 帧的 `target`/`forwarded` 改为真正移动（原先对 `const` 引用 `std::move` 退化为深拷贝）；删除重复常量。
+   - VMess：认证热缓存未命中时删除对全表每个用户最多 32 次的“已试”重扫；`WriteEncodedChunks` 只保留首包合并响应头的分支，稳态直写；删除只写不读的 `PreparedVmessUser::uuid` 明文副本。
+   - Shadowsocks：入站 `ResponseBodyWriter` 与出站 `RequestBodyWriter` 统一为按值持有范围的单帧 `WriteEncrypted`（出站明文缓冲在加密完成后、写挂起前归还池）；出站 relay 的转发 lambda 不再占一个连接期帧；`Derive2022Subkey`/`Derive2022IdentitySubkey` 共用一份实现；删除 `Parsed2022Body::client_session_id`、`SsCipherInfo::tag_size` 等死字段。
+   - AnyTLS / UoT / 原生 UDP：AnyTLS 写前的子流检查不再拷贝 `shared_ptr`；UoT 已缓冲时不进入 `EnsurePending`，`WritePacket` 改为同步编码头；`UdpIngress::EnqueueReply` 单次查表，`ProcessDecoded` 复用入口时间戳；删除生产不可达的五参数 `EnqueueUdpReply` 虚重载。
+   - 删除 8 处恒不生效的 `if (x.empty()) x.ReleaseIfIdle();`。
+5. **控制面与基础设施**：
+   - `log.cpp`：`FormatRecord` 在时间戳串上原地追加转义后的消息（每条访问日志少 2 次分配和 1 次整行复制）；`json.cpp`：`ParseString` 按连续普通字符段批量追加；`controller.cpp`：删除 `JournalExecutor` 从未实例化的 `void` 分支、`collectTraffic` 无人读取的返回值与 3 个纯转发协程。
+
+### 评估后未采纳
+
+- **Hysteria `ReceiveLoop` 批量排空**：已实现并实测（16×64 上传，同一份代码仅切换该循环，三轮交错，均值）。每次可读最多连续处理 32 包使守护进程 CPU 由 `3.93 s` 降至 `3.45 s`，但消费者运行前有更多流输入各占一个 8 KiB 块，就绪匿名内存由 `34.06 MiB` 升至 `35.62 MiB`、负载结束时由 `34.50 MiB` 升至 `36.69 MiB`、回收后由 `11.92 MiB` 升至 `12.43 MiB`；逐包让出事件循环的变体内存接近持平（`34.36 / 34.86 / 12.13 MiB`），CPU 为 `3.75 s`，收益与轮间波动同量级。按“优化不得以内存换 CPU”两者均未采纳，收包循环保持每次可读处理一包。
+- HTTP/2 帧 payload 按对端声明长度一次性分配（违反防未验证预分配）；Shadowsocks 握手多段读合并（改变探测方可见的读取时序）；`GroupCoordinator::PostReserved` 合并 eventfd 唤醒（配额归还时序会依赖被抢占线程）。
+- 无读者的 `timeouts.read` 配置键（移除会改变校验报错文本）与 XHTTP 入站每连接的 `XHttpStreamOneHttpConfig` 预计算（需新增归一化派生字段）留待单独处理。
+
+### 验证与性能/内存实证
+
+全量 **1,251/1,251** 测试通过（325 项 unit、926 项真实进程 E2E），零编译告警。过程中两处修正：
+
+- 首次全量运行 `buffer_ownership.BufferOwnership.Contract` 失败：删除 `InitialPayload` 的字节接口后，线程池首次使用落入了被跟踪的故障矩阵，运行时为 `thread_local` 池登记析构的一次性节点被计为泄漏。测试入口先预热线程池后通过，生产代码未因此改动。
+- 独立只读复审指出，合并后的 VLESS Encryption 写路径在进入聚合分支前就以“首块指针 + 整条记录长度”构造 span（未解引用，但范围越出首块）；已改为在各自分支内构造。
+
+基准环境：Linux x86-64、mise 固定的 Clang 工具链、Release、`CNODE_ENABLE_LTO=OFF`、4 Worker；基线为 `1be6301` 的构建产物，候选为本次工作区，两者交错运行。HY2、TCP 发送、采样与 UDP 发送各 3 轮，TLS 每项 9 次（`Upload8` 另补 30 次）。更早的一批数据被同机并发的无关构建污染（负载均值约 70），已整批弃用并在空闲时重跑；下列数值为均值，方括号内为最小..最大。
+
+- **Hysteria2 四 Worker 真实进程基准（`cnode_hysteria_throughput_benchmark`）**：吞吐与 CPU 的差异都在轮间波动之内，收益在内存。
+
+  | 场景 | 吞吐 MiB/s | 守护进程 CPU s | 就绪匿名内存 MiB | 负载峰值 RSS MiB | 回收后匿名内存 MiB |
+  | --- | --- | --- | --- | --- | --- |
+  | 256×1 上传 | 68.21 → 69.36 | 1.317 → 1.291 | 28.90 → 27.82 | 37.37 → 36.28 | 10.73 → 10.36 |
+  | 256×1 下载 | 64.17 → 64.18 | 1.424 → 1.464 | 29.62 → 27.84 | 94.28 → 92.64 | 11.70 → 10.30 |
+  | 16×64 上传 | 56.39 → 56.05 | 3.788 → 3.798 | 37.13 → 33.49 | 45.41 → 41.82 | 11.55 → 11.59 |
+  | 16×64 下载 | 35.49 → 35.23 | 3.656 → 3.633 | 37.75 → 34.26 | 342.29 → 338.49 | 15.14 → 14.85 |
+
+  1,024 条流就绪时匿名内存减少 `3.5 ~ 3.6 MiB`（约每流 3.5 KiB），256 条时减少约 `1.1 MiB`（下载场景基线含一个启动即多占约 2 MiB 的样本，均值差为 `1.8 MiB`）；回收后驻留不高于基线（16×64 上传 `11.55[11.41..11.68]` 对 `11.59[11.40..11.78]`，在波动内）。
+- **已建立 VLESS 会话的进程内基准（`cnode_runtime_sampling_benchmark`）**：512 会话空闲 RSS 由 `26,824,704 B` 降至 `25,448,448 B`（−1.31 MiB），匿名内存由 `19,513,344 B` 降至 `17,850,368 B`（−8.5%，约每会话 −3.2 KiB）；`resources=1` 的进程峰值 RSS 由 `27,630,251 B` 降至 `25,701,035 B`。64 会话匿名内存由 `7,327,744 B` 降至 `7,229,440 B`，但该测试二进制的文件映射 RSS 由 `7,114,752 B` 升至 `7,467,008 B`，合计空闲 RSS 上升 248 KiB。关闭内核 fault-around 后逐映射核对：这是该测试二进制重排后触达的代码页变多（`1,812 kB → 2,216 kB`），守护进程二进制在 256 连接 HY2 负载结束时触达的代码页反而略少（`3,208 kB → 3,176 kB`）。采样延迟不变（`resources=0` `70.5 → 70.7 ns`，`resources=1` `88.4 → 89.2 ns`，0 次堆分配）。
+- **守护进程启动驻留**：默认内核参数下 `server_started` RSS 由 `12.408 MiB` 升至 `12.514 MiB`、HY2 `startup` 由 `13.726 MiB` 升至 `13.772 MiB`，同期匿名内存持平或略降（`5.666 → 5.659 MiB`、`6.797 → 6.791 MiB`）。关闭 fault-around（`fault_around_bytes=4096`，测后恢复 `65536`）复测，启动 RSS 为 `9,207,808 B → 9,199,616 B`，文件映射部分 `3,268,608 B → 3,272,704 B`（多 1 页）：差值来自内核按 64 KiB 连带映射已触达页的邻页，而二进制布局变了，不是多用了内存。
+- **VLESS/TLS 真实进程基准（`cnode_tls_throughput_benchmark`，每次仅传 16 MiB，波动大）**：`Download1` `541.6 → 542.1 MiB/s`，`Download8` `586.8 → 599.0 MiB/s`，`Upload1` `794.7 → 786.9 MiB/s`；`Upload8` 9 次均值曾为 `667.7 → 617.8 MiB/s`，补到 30 次后为 `616.8 → 640.7 MiB/s`（中位数 `622.9 → 641.2`）。结论是吞吐无可测变化。
+- **`cnode_tcp_send_benchmark` / `cnode_udp_send_benchmark`**：`8192B (1 piece)` 单次 burst 由 `10,436.5 ns` 降至 `10,218.2 ns`（−2.1%），`8192B (8 pieces)` 由 `10,921.9 ns` 降至 `10,687.7 ns`（−2.1%），`8192B (16 pieces)` 由 `11,361.0 ns` 降至 `11,166.4 ns`（−1.7%），`65536B (8 pieces)` 由 `43,543.5 ns` 降至 `42,717.0 ns`（−1.9%），其余档位持平；UDP 发送各档均值在 `−5.2% ~ +0.3%` 之间，其中 `0B` 与 `60000B owned` 两档的差值主要来自单轮离群值，不计为收益。
+
+未覆盖：限速用户、`IPIfNonMatch` 路由命中、WebSocket/XHTTP/gRPC 传输、Mux/AnyTLS/Shadowsocks/VMess/Trojan 稳态转发没有专项基准，这些路径只由单元与 E2E 测试验证行为不变，未宣称可测的吞吐收益。

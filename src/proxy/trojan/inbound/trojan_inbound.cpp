@@ -170,7 +170,8 @@ proxy::trojan::inbound::Handler::Process(
 
     LOG_CONN_DEBUG(ctx, "processing connection from {}:{}", client_ip, ctx.inbound.source_port);
 
-    if (co_await proxy::CheckInboundIpBanned(limiter_, ctx)) {
+    if (proxy::BeginInboundAuthentication(limiter_, ctx) &&
+        co_await proxy::CheckInboundIpBanned(*limiter_, ctx)) {
         co_return proxy::RejectInbound(stats_, stream.get(), ErrorCode::BLOCKED);
     }
     std::optional<UserOnlineSessionGuard> user_session;

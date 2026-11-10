@@ -156,7 +156,8 @@ public:
 
 class ReplySink final : public ::worker_detail::UdpReplySink {
 public:
-    bool EnqueueUdpReply(std::string_view, ::udp::socket*,
+    bool EnqueueUdpReply(::worker_detail::UdpIngress&, std::string_view,
+                         const std::shared_ptr<::udp::socket>&,
                          ::udp::endpoint, ::buf::MultiBuffer,
                          uint32_t) override {
         return true;

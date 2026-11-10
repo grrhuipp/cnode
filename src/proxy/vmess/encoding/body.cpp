@@ -226,26 +226,17 @@ size_t BodyEncoder::EncodeEndTo(std::span<uint8_t, 128> out) {
     }
 }
 
-net::awaitable<void> BodyEncoder::WriteEncodedChunks(
+net::awaitable<void> BodyEncoder::WriteFirstEncodedChunks(
     AsyncStream& stream,
     buf::MultiBuffer chunks,
     std::span<const uint8_t> first_header,
-    bool* header_sent,
-    bool& frame_generated) {
-    frame_generated = chunks.byte_size() != 0;
-    if (!frame_generated) {
-        co_return;
-    }
-    if (header_sent && !*header_sent) {
-        *header_sent = true;
-        ConstBufferSpanBuilder<1 + buf::MultiBuffer::kInlineCapacity> framed;
-        framed.Append(net::buffer(first_header.data(), first_header.size()));
-        framed.AppendMultiBuffer(chunks);
-        co_await stream.WriteBuffers(framed.Span());
-        chunks.clear();
-    } else {
-        co_await stream.WriteMultiBuffer(std::move(chunks));
-    }
+    bool& header_sent) {
+    header_sent = true;
+    ConstBufferSpanBuilder<1 + buf::MultiBuffer::kInlineCapacity> framed;
+    framed.Append(net::buffer(first_header.data(), first_header.size()));
+    framed.AppendMultiBuffer(chunks);
+    co_await stream.WriteBuffers(framed.Span());
+    chunks.clear();
 }
 
 net::awaitable<void> BodyEncoder::WriteMultiBuffer(
@@ -268,8 +259,15 @@ net::awaitable<void> BodyEncoder::WriteMultiBuffer(
         buf::MultiBuffer chunks;
         Encode(mb, chunks);
         mb.clear();
-        co_await WriteEncodedChunks(
-            stream, std::move(chunks), first_header, header_sent, frame_generated);
+        frame_generated = chunks.byte_size() != 0;
+        if (frame_generated) {
+            if (header_sent && !*header_sent) {
+                co_await WriteFirstEncodedChunks(
+                    stream, std::move(chunks), first_header, *header_sent);
+            } else {
+                co_await stream.WriteMultiBuffer(std::move(chunks));
+            }
+        }
     } catch (const transport::WriteClosed&) {
         Finish();
         throw;
@@ -297,8 +295,15 @@ net::awaitable<void> BodyEncoder::WriteBuffers(
     try {
         buf::MultiBuffer chunks;
         Encode(buffers, chunks);
-        co_await WriteEncodedChunks(
-            stream, std::move(chunks), first_header, header_sent, frame_generated);
+        frame_generated = chunks.byte_size() != 0;
+        if (frame_generated) {
+            if (header_sent && !*header_sent) {
+                co_await WriteFirstEncodedChunks(
+                    stream, std::move(chunks), first_header, *header_sent);
+            } else {
+                co_await stream.WriteMultiBuffer(std::move(chunks));
+            }
+        }
     } catch (const transport::WriteClosed&) {
         Finish();
         throw;
@@ -400,9 +405,6 @@ BodyDecoder::BodyDecoder(const BodyOptions& options,
 bool BodyDecoder::TryConsumePending(std::span<uint8_t> out, size_t& filled) noexcept {
     if (filled < out.size() && pending_read_.byte_size() != 0) {
         filled += pending_read_.ConsumePrefixTo(out.subspan(filled));
-        if (pending_read_.empty()) {
-            pending_read_.ReleaseIfIdle();
-        }
     }
     return filled == out.size();
 }
@@ -1385,7 +1387,6 @@ FindByAuthIDForTag(
         return {};
     }
 
-    uint32_t tried_hot_mask = 0;
     if (revision != 0) {
         for (size_t i = 0; i < tls_hot_cache.size; ++i) {
             const auto& entry = tls_hot_cache.entries[i];
@@ -1396,25 +1397,11 @@ FindByAuthIDForTag(
                     tls_hot_cache.Touch(user, view.users.get(), now);
                     return view.Share(*user);
                 }
-                tried_hot_mask |= (uint32_t{1} << i);
             }
         }
     }
 
     for (const auto& user : *view.users) {
-        if (tried_hot_mask != 0) {
-            bool already_tried = false;
-            for (size_t i = 0; i < tls_hot_cache.size; ++i) {
-                if ((tried_hot_mask & (uint32_t{1} << i)) != 0 &&
-                    tls_hot_cache.entries[i].user == &user) {
-                    already_tried = true;
-                    break;
-                }
-            }
-            if (already_tried) {
-                continue;
-            }
-        }
         if (tryUser(user)) {
             if (revision != 0) {
                 tls_hot_cache.Touch(&user, view.users.get(), now);

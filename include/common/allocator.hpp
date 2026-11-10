@@ -263,13 +263,6 @@ public:
         if (wakeup_ == &owner) wakeup_ = nullptr;
     }
 
-    template <typename t_type = std::byte>
-    [[nodiscard]] std::pmr::polymorphic_allocator<t_type> allocator() & noexcept {
-        return std::pmr::polymorphic_allocator<t_type>(this);
-    }
-    template <typename t_type = std::byte>
-    [[nodiscard]] std::pmr::polymorphic_allocator<t_type> allocator() && = delete;
-
     [[nodiscard]] std::pmr::memory_resource* resource() & noexcept { return this; }
     [[nodiscard]] std::pmr::memory_resource* resource() const& noexcept {
         return const_cast<worker_memory*>(this);
@@ -350,7 +343,7 @@ public:
         if (!chunk || chunk->pool != this ||
             bytes > chunk->slot_capacity ||
             (alignment && (!ValidAlignment(alignment) ||
-             reinterpret_cast<std::uintptr_t>(pointer) % alignment != 0))) return;
+             (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) != 0))) return;
         if (chunk->owner != detail::CurrentThreadToken()) std::terminate();
         DeallocateLocal(*header, *chunk);
     }
@@ -540,7 +533,7 @@ private:
         const std::size_t bin = LargeBinIndex(class_bytes);
         const std::size_t eff_align = std::max(alignment, kSlotAlignment);
         for (Chunk* chunk = pooling_->large_bins[bin]; chunk; chunk = chunk->class_idle_next) {
-            if (reinterpret_cast<std::uintptr_t>(chunk->large_user_ptr) % eff_align == 0) {
+            if ((reinterpret_cast<std::uintptr_t>(chunk->large_user_ptr) & (eff_align - 1)) == 0) {
                 MarkLargeUsed(*chunk);
                 footprint_.direct_bytes += chunk->map_bytes;
                 chunk->live = 1;

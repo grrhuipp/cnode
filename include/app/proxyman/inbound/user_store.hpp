@@ -71,14 +71,12 @@ struct PreparedKeyBytes {
 };
 
 struct PreparedVmessUser {
-    std::string uuid;
     std::array<uint8_t, 16> uuid_bytes{};
     std::array<uint8_t, 16> cmd_key{};
     std::array<uint8_t, 16> auth_key{};
     ::UserProfile profile;
 
     ~PreparedVmessUser() noexcept {
-        ::SecureZeroMemory(uuid.data(), uuid.size());
         ::SecureZeroMemory(uuid_bytes.data(), uuid_bytes.size());
         ::SecureZeroMemory(cmd_key.data(), cmd_key.size());
         ::SecureZeroMemory(auth_key.data(), auth_key.size());

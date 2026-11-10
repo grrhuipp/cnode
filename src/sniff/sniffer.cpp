@@ -652,7 +652,7 @@ SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
     input_bytes_ += data.size();
 
     // Released on return: no plaintext is held while waiting for the next datagram.
-    std::array<uint8_t, 1536> stack_decrypted{};
+    std::array<uint8_t, 1536> stack_decrypted;
     memory::ByteVector heap_decrypted;
     std::span<const uint8_t> decrypted;
     size_t offset = 0;

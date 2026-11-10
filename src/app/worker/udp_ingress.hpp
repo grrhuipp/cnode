@@ -284,21 +284,12 @@ public:
     virtual ~UdpReplySink() noexcept = default;
 
     [[nodiscard]] virtual bool EnqueueUdpReply(
-        std::string_view socket_key,
-        udp::socket* sock,
-        udp::endpoint endpoint,
-        buf::MultiBuffer payload,
-        uint32_t worker_id) = 0;
-
-    [[nodiscard]] virtual bool EnqueueUdpReply(
         UdpIngress& ingress,
         std::string_view socket_key,
         const std::shared_ptr<udp::socket>& sock,
         udp::endpoint endpoint,
         buf::MultiBuffer payload,
-        uint32_t worker_id) {
-        return EnqueueUdpReply(socket_key, sock.get(), std::move(endpoint), std::move(payload), worker_id);
-    }
+        uint32_t worker_id) = 0;
 };
 
 struct UdpDatagramContext {
@@ -455,6 +446,7 @@ private:
     void ProcessDecoded(const UdpDatagramContext& datagram,
         const net::ip::address& client_address,
         InboundDatagramResult decoded,
+        std::chrono::steady_clock::time_point now,
         std::shared_ptr<UdpHandoffRecord> record = {});
     void RegisterNativeJob(const ClientSessionPtr& session);
     void DetachNativeJob(ClientSession& session) noexcept;

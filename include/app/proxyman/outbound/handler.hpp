@@ -124,8 +124,8 @@ void RegisterProxy(
 // Xray app/proxyman/outbound.Manager: prepared handler configs by tag. Worker-
 // level dispatch and every physical session read the same snapshot through
 // HandlerLookup; dynamic add/replace/remove updates only this publication.
-// Cold mutations serialize on the publication mutex; readers take the
-// immutable snapshot only when the generation changed.
+// Mutations and lookups run on the owning Worker; a lookup resynchronizes
+// its cached handlers only when the generation changed.
 // ============================================================================
 class OutboundConfiguration final {
 public:

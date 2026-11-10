@@ -44,6 +44,25 @@ net::awaitable<PendingStatus> EnsurePending(
     throw IoSystemError(io_error::connection_reset, "invalid UoT stream");
 }
 
+using PacketHeader = std::array<uint8_t, kMaxBaseEncodedAddressSize + 2>;
+
+// Returns the encoded size. The caller's frame owns `header` across the write.
+size_t EncodePacketHeader(bool is_connect,
+                          const TargetAddress& destination,
+                          uint16_t payload_size,
+                          PacketHeader& header) {
+    size_t header_size = 0;
+    if (!is_connect) {
+        header_size = EncodeAddressTo(
+            destination, header.data(), header.size() - 2, AddressWireFormat::Uot);
+        if (header_size == 0) {
+            ThrowDecodeFailure();
+        }
+    }
+    StoreU16BE(header.data() + header_size, payload_size);
+    return header_size + 2;
+}
+
 }  // namespace
 
 std::optional<Version> VersionFromMagicAddress(
@@ -211,7 +230,8 @@ buf::MultiBuffer PacketReader::TakePending() noexcept {
 }
 net::awaitable<buf::MultiBuffer> PacketReader::ReadMultiBuffer() {
     for (;;) {
-        if (co_await EnsurePending(reader_, pending_, 1) != PendingStatus::Ready)
+        if (pending_.byte_size() < 1 &&
+            co_await EnsurePending(reader_, pending_, 1) != PendingStatus::Ready)
             co_return buf::MultiBuffer{};
         TargetAddress packet_target;
         if (!is_connect_) {
@@ -224,7 +244,8 @@ net::awaitable<buf::MultiBuffer> PacketReader::ReadMultiBuffer() {
             packet_target = std::move(address->target);
             (void)pending_.DropPrefixBytes(address->consumed);
         }
-        if (co_await EnsurePending(reader_, pending_, 2) != PendingStatus::Ready) {
+        if (pending_.byte_size() < 2 &&
+            co_await EnsurePending(reader_, pending_, 2) != PendingStatus::Ready) {
             ThrowDecodeFailure();
         }
 
@@ -234,8 +255,9 @@ net::awaitable<buf::MultiBuffer> PacketReader::ReadMultiBuffer() {
         }
         const size_t payload_size = LoadU16BE(len_bytes.data());
         (void)pending_.DropPrefixBytes(len_bytes.size());
-        if (co_await EnsurePending(reader_, pending_, payload_size) !=
-            PendingStatus::Ready) {
+        if (pending_.byte_size() < payload_size &&
+            co_await EnsurePending(reader_, pending_, payload_size) !=
+                PendingStatus::Ready) {
             ThrowDecodeFailure();
         }
         buf::MultiBuffer packet;
@@ -257,33 +279,6 @@ PacketWriter::PacketWriter(transport::MultiBufferWriter& writer,
     , is_connect_(is_connect)
     , destination_(std::move(destination)) {}
 
-net::awaitable<void> PacketWriter::WritePacket(
-    const TargetAddress& destination,
-    std::span<const net::const_buffer> payload) {
-    const auto payload_size = buf::TrySumBufferSizes(
-        payload, std::numeric_limits<uint16_t>::max());
-    if (!payload_size) {
-        ThrowDecodeFailure();
-    }
-
-    std::array<uint8_t, kMaxBaseEncodedAddressSize + 2> header{};
-    size_t header_size = 0;
-    if (!is_connect_) {
-        header_size = EncodeAddressTo(
-            destination, header.data(), header.size() - 2, AddressWireFormat::Uot);
-        if (header_size == 0) {
-            ThrowDecodeFailure();
-        }
-    }
-    StoreU16BE(header.data() + header_size, static_cast<uint16_t>(*payload_size));
-    header_size += 2;
-
-    ConstBufferSpanBuilder<8> buffers;
-    buffers.Append(net::buffer(header.data(), header_size));
-    buffers.AppendBuffers(payload);
-    co_await writer_.WriteBuffers(buffers.Span());
-}
-
 net::awaitable<void> PacketWriter::WriteMultiBuffer(buf::MultiBuffer mb) {
     const auto datagram = buf::InspectUdpDatagram(mb);
     if (datagram.status == buf::UdpDatagramStatus::Empty) {
@@ -302,9 +297,17 @@ net::awaitable<void> PacketWriter::WriteMultiBuffer(buf::MultiBuffer mb) {
         target = datagram.target;
     }
 
-    ConstBufferSpanBuilder<buf::MultiBuffer::kInlineCapacity> payload;
-    payload.AppendMultiBuffer(mb);
-    co_await WritePacket(*target, payload.Span());
+    if (datagram.payload_size > std::numeric_limits<uint16_t>::max()) {
+        ThrowDecodeFailure();
+    }
+
+    PacketHeader header{};
+    const size_t header_size = EncodePacketHeader(
+        is_connect_, *target, static_cast<uint16_t>(datagram.payload_size), header);
+    ConstBufferSpanBuilder<buf::MultiBuffer::kInlineCapacity + 1> buffers;
+    buffers.Append(net::buffer(header.data(), header_size));
+    buffers.AppendMultiBuffer(mb);
+    co_await writer_.WriteBuffers(buffers.Span());
 }
 
 net::awaitable<void> PacketWriter::WriteBuffers(
@@ -312,7 +315,19 @@ net::awaitable<void> PacketWriter::WriteBuffers(
     if (!destination_.IsValid()) {
         ThrowDecodeFailure();
     }
-    co_await WritePacket(destination_, buffers);
+    const auto payload_size = buf::TrySumBufferSizes(
+        buffers, std::numeric_limits<uint16_t>::max());
+    if (!payload_size) {
+        ThrowDecodeFailure();
+    }
+
+    PacketHeader header{};
+    const size_t header_size = EncodePacketHeader(
+        is_connect_, destination_, static_cast<uint16_t>(*payload_size), header);
+    ConstBufferSpanBuilder<8> framed;
+    framed.Append(net::buffer(header.data(), header_size));
+    framed.AppendBuffers(buffers);
+    co_await writer_.WriteBuffers(framed.Span());
 }
 
 net::awaitable<void> PacketWriter::AsyncShutdownWrite() {

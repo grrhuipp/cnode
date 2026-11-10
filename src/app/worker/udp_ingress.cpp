@@ -255,10 +255,7 @@ template <class Function>
 bool UdpIngress::ReplyRoute::Send(UDPPacketView packet, const udp::endpoint& endpoint) {
     auto payload = response->Encode(packet);
     if (payload.empty()) return false;
-    if (owner != nullptr) {
-        return sink->EnqueueUdpReply(*owner, socket_key, socket, endpoint, std::move(payload), worker_id);
-    }
-    return sink->EnqueueUdpReply(socket_key, socket.get(), endpoint, std::move(payload), worker_id);
+    return sink->EnqueueUdpReply(*owner, socket_key, socket, endpoint, std::move(payload), worker_id);
 }
 
 UdpIngress::ClientSession::ClientSession(
@@ -380,23 +377,8 @@ UdpIngress::ClientSession::WriteMultiBuffer(buf::MultiBuffer mb) {
             "UDP client reply contains missing or mixed endpoints");
     }
 
-    std::span<const uint8_t> payload;
-    memory::ByteVector coalesced;
-    if (datagram.buffer_count == 1) {
-        payload = datagram.single_buffer->Bytes();
-    } else {
-        coalesced.reserve(datagram.payload_size);
-        for (const buf::Buffer* buffer : mb) {
-            if (!buffer || buffer->IsEmpty()) {
-                continue;
-            }
-            const auto bytes = buffer->Bytes();
-            coalesced.insert(coalesced.end(), bytes.begin(), bytes.end());
-        }
-        payload = coalesced;
-    }
-
-    if (!reply_.Send(UDPPacketView{*datagram.target, payload}, reply_endpoint_)) {
+    const buf::ContiguousBufferView payload(mb);
+    if (!reply_.Send(UDPPacketView{*datagram.target, payload.Bytes()}, reply_endpoint_)) {
         mb.clear();
         throw IoSystemError(
             io_error::fault, "UDP client reply was rejected");
@@ -791,18 +773,18 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
                 datagram.client_endpoint, InboundDatagramCheck::Commit)) {
             return;
         }
-        ProcessDecoded(datagram, normalized_client_addr, std::move(*decoded), std::move(record));
+        ProcessDecoded(datagram, normalized_client_addr, std::move(*decoded), now, std::move(record));
         return;
     }
-    ProcessDecoded(datagram, normalized_client_addr, std::move(*decoded));
+    ProcessDecoded(datagram, normalized_client_addr, std::move(*decoded), now);
 }
 
 void UdpIngress::ProcessDecoded(const UdpDatagramContext& datagram,
     const net::ip::address& client_address,
-    InboundDatagramResult result, std::shared_ptr<UdpHandoffRecord> record) {
+    InboundDatagramResult result, std::chrono::steady_clock::time_point now,
+    std::shared_ptr<UdpHandoffRecord> record) {
     auto* decoded = &result;
     const auto socket_key = datagram.socket_key;
-    const auto now = std::chrono::steady_clock::now();
 
     auto client_key_log = [&]() {
         return TargetAddress(client_address, datagram.client_endpoint.port());
@@ -839,7 +821,7 @@ void UdpIngress::ProcessDecoded(const UdpDatagramContext& datagram,
         }
     }
     const bool need_new_session = !current_session;
-    ClientSessionPtr packet_session = current_session;
+    ClientSessionPtr packet_session = std::move(current_session);
     ClientSessionPtr preparation_session;
     auto preparation_guard = MakeScopeExit([&]() noexcept {
         if (preparation_session) preparation_session->Close();
@@ -1002,17 +984,17 @@ UdpIngress::ReplyEnqueueResult UdpIngress::EnqueueReply(
     if (payload_size == 0 || payload_size > kMaxQueuedUdpBytes) {
         return ReplyEnqueueResult::Rejected;
     }
-    if (auto it = reply_queues_.find(socket_key);
-        it != reply_queues_.end() &&
-        WouldOverflowUdpQueue(it->second.pending.size(), it->second.queued_bytes, payload_size)) {
+    auto queue_it = reply_queues_.find(socket_key);
+    if (queue_it != reply_queues_.end() &&
+        WouldOverflowUdpQueue(queue_it->second.pending.size(), queue_it->second.queued_bytes, payload_size)) {
         return ReplyEnqueueResult::Rejected;
     }
     auto reservation = budget_.ReservePayload(payload);
     if (!reservation) return ReplyEnqueueResult::Rejected;
 
-    auto [queue_it, inserted] = FindOrEmplaceStringKey(
-        reply_queues_, socket_key);
-    (void)inserted;
+    if (queue_it == reply_queues_.end()) {
+        queue_it = reply_queues_.try_emplace(memory::ThreadLocalString{socket_key}).first;
+    }
     auto& queue = queue_it->second;
     const bool should_start_send = queue.active_id == 0;
 

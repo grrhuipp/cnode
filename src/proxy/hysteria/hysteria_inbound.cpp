@@ -88,9 +88,6 @@ ReadTcpRequest(AsyncStream& stream, wire::Version version, session::Context& ctx
         }
         if (target) {
             (void)received.DropPrefixBytes(header_bytes);
-            if (received.empty()) {
-                received.ReleaseIfIdle();
-            }
             co_return TcpRequest{std::move(*target), std::move(received)};
         }
         if (target.error() == wire::ProtocolError::Incomplete &&

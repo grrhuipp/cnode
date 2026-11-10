@@ -93,29 +93,22 @@ public:
     net::awaitable<ProxyProtocolReadResult> ReadProxyProtocolHeader(
         std::chrono::seconds timeout);
 
-    // 静态工厂方法：连接到已解析的端点
+    // 静态工厂方法：连接到已解析的端点；bind_local 非空时先绑定本地地址。
+    // Own/register the same nonblocking fd even while connect is pending.
     [[nodiscard]]
     static net::awaitable<DialResult> Connect(
         net::io_context& io_context,
         const tcp::endpoint& endpoint,
-        std::chrono::seconds timeout = std::chrono::seconds(10));
-
-    // 静态工厂方法：绑定本地地址后连接
-    [[nodiscard]]
-    static net::awaitable<DialResult> ConnectWithBind(
-        net::io_context& io_context,
-        const net::ip::address& local_addr,
-        const tcp::endpoint& remote_endpoint,
-        std::chrono::seconds timeout = std::chrono::seconds(10));
+        const net::ip::address* bind_local,
+        std::chrono::seconds timeout);
 
 protected:
     TcpStream* BaseTcpStream() override { return this; }
     const TcpStream* BaseTcpStream() const override { return this; }
 
 private:
-    // Own/register the same nonblocking fd even while connect is pending.
-    static net::awaitable<DialResult> ConnectSocket(
-        tcp::socket socket, const tcp::endpoint& endpoint, std::chrono::seconds timeout);
+    net::awaitable<void> WriteBuffersFrom(
+        std::span<const net::const_buffer> buffers, std::size_t offset, bool blocked);
     friend class TlsStream;
     [[nodiscard]] bool CanRead() const noexcept;
     [[nodiscard]] bool CanWrite() const noexcept;
@@ -123,7 +116,7 @@ private:
     void ResetReadableBudget() noexcept;
     [[nodiscard]] std::size_t ReadAvailable(
         net::mutable_buffer target, IoErrorCode& error) noexcept;
-    // One nonblocking attempt; only WriteBuffers waits and owns write deadlines.
+    // One nonblocking attempt; only WriteBuffersFrom waits and owns write deadlines.
     [[nodiscard]] std::size_t WriteAvailable(
         std::span<const net::const_buffer> buffers, std::size_t offset,
         IoErrorCode& error) noexcept;

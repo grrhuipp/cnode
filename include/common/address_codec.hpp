@@ -508,8 +508,9 @@ template <typename Reader>
                 co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
             }
         }
-        auto next = co_await ReadMultiBufferOrThrowOnCancel(reader);
+        auto next = co_await reader.ReadMultiBuffer();
         if (next.byte_size() == 0) {
+            co_await ThrowIfCancelledOnEof();
             co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
         }
         pending.AppendAndCoalesce(std::move(next));

@@ -16,9 +16,8 @@ void Commit(UserStore::PublishedSnapshot snapshot) {
     UserStore::InstallWorkerView(std::move(view));
 }
 
-PreparedVmessUser Vmess(std::string uuid, int64_t id) {
+PreparedVmessUser Vmess(int64_t id) {
     PreparedVmessUser user;
-    user.uuid = std::move(uuid);
     user.profile.user_id = id;
     return user;
 }
@@ -37,12 +36,12 @@ PreparedHysteriaUser Hysteria(uint8_t hash_byte, int64_t id) {
 
 bool TestTypedUpdatesStayProtocolLocal() {
     constexpr std::string_view tag = "shared-tag";
-    Commit(UserStore::PrepareUsers(tag, UserSet{PreparedVmessUsers{Vmess("vmess-1", 1)}}));
+    Commit(UserStore::PrepareUsers(tag, UserSet{PreparedVmessUsers{Vmess(1)}}));
     Commit(UserStore::PrepareUsers(tag, UserSet{PreparedTrojanUsers{Trojan("hash-1", 2)}}));
     if (UserStore::VmessUsers(tag).size() != 1 || !UserStore::FindTrojanUser(tag, "hash-1")) return false;
 
     auto old = UserStore::VmessUsers(tag);
-    Commit(UserStore::PrepareUsers(tag, UserSet{PreparedVmessUsers{Vmess("vmess-2", 3)}}));
+    Commit(UserStore::PrepareUsers(tag, UserSet{PreparedVmessUsers{Vmess(3)}}));
     if (UserStore::VmessUsers(tag).size() != 1 ||
         UserStore::VmessUsers(tag)[0].profile.user_id != 3 ||
         old.size() != 1 || old[0].profile.user_id != 1 || !UserStore::FindTrojanUser(tag, "hash-1")) return false;
@@ -55,7 +54,7 @@ bool TestTypedUpdatesStayProtocolLocal() {
 
 bool TestTypedClearStaysProtocolLocal() {
     constexpr std::string_view tag = "clear-tag";
-    Commit(UserStore::PrepareUsers(tag, UserSet{PreparedVmessUsers{Vmess("vmess", 1)}}));
+    Commit(UserStore::PrepareUsers(tag, UserSet{PreparedVmessUsers{Vmess(1)}}));
     Commit(UserStore::PrepareUsers(tag, UserSet{PreparedTrojanUsers{Trojan("hash", 2)}}));
     Commit(UserStore::PrepareClearUsers(UserProtocol::Vmess, tag));
     return UserStore::VmessUsers(tag).empty() && UserStore::FindTrojanUser(tag, "hash");
@@ -66,10 +65,10 @@ bool TestTypedClearStaysProtocolLocal() {
 // update must fail before any snapshot is published.
 bool TestAmbiguousCredentialsRejected() {
     constexpr std::string_view tag = "ambiguous-tag";
-    Commit(UserStore::PrepareUsers(tag, UserSet{PreparedVmessUsers{Vmess("kept", 1)}}));
+    Commit(UserStore::PrepareUsers(tag, UserSet{PreparedVmessUsers{Vmess(1)}}));
     const auto before = UserStore::CaptureSnapshot();
-    auto upper = Vmess("6BA7B810-9DAD-11D1-80B4-00C04FD430C8", 2);
-    auto lower = Vmess("6ba7b8109dad11d180b400c04fd430c8", 3);
+    auto upper = Vmess(2);
+    auto lower = Vmess(3);
     upper.uuid_bytes.fill(0x6b);
     lower.uuid_bytes.fill(0x6b);
     PreparedVlessUser vless_a;

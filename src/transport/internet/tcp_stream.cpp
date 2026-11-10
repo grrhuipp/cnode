@@ -386,20 +386,7 @@ net::awaitable<void> TcpStream::WriteMultiBuffer(buf::MultiBuffer mb) {
             mb.clear();
             co_return;
         }
-        std::array<net::const_buffer, 1> head{};
-        if (offset != 0) {
-            head[0] = buffers.front() + offset;
-            if (buffers.size() == 1) {
-                co_await WriteBuffers(head);
-            } else {
-                ConstBufferSpanBuilder<buf::MultiBuffer::kInlineCapacity> remaining_builder;
-                remaining_builder.Append(head[0]);
-                remaining_builder.AppendBuffers(buffers.subspan(1));
-                co_await WriteBuffers(remaining_builder.Span());
-            }
-        } else {
-            co_await WriteBuffers(buffers);
-        }
+        co_await WriteBuffersFrom(buffers, offset, true);
     } catch (...) {
         mb.clear();
         throw;
@@ -409,6 +396,13 @@ net::awaitable<void> TcpStream::WriteMultiBuffer(buf::MultiBuffer mb) {
 
 net::awaitable<void> TcpStream::WriteBuffers(
     std::span<const net::const_buffer> buffers) {
+    return WriteBuffersFrom(buffers, 0, false);
+}
+
+// `blocked`: the caller's nonblocking attempt just hit EAGAIN without
+// suspending since, so go straight to the writable wait.
+net::awaitable<void> TcpStream::WriteBuffersFrom(
+    std::span<const net::const_buffer> buffers, std::size_t offset, bool blocked) {
     if (!impl_->socket.is_open() || impl_->HasFlag(kWriteShutdown)) {
         throw IoSystemError(io_error::broken_pipe);
     }
@@ -418,8 +412,8 @@ net::awaitable<void> TcpStream::WriteBuffers(
     impl_->timeouts.CheckCanBeginWrite();
     const auto cancellation = co_await net::this_coro::cancellation_state;
     const bool deferred = IsWriteCancellationDeferred();
-    size_t offset = 0;
-    if (DrainWriteAvailable(
+    if (!blocked &&
+        DrainWriteAvailable(
             buffers, offset, Cancellation().Stopped(), deferred, cancellation.cancelled())) {
         co_return;
     }
@@ -901,10 +895,26 @@ tcp::endpoint TcpStream::RemoteEndpoint() const {
 
 // Register the stable stream before connect suspends. A pending dial then
 // transfers its existing in-progress fd just like an established connection.
-net::awaitable<DialResult> TcpStream::ConnectSocket(
-    tcp::socket socket,
+net::awaitable<DialResult> TcpStream::Connect(
+    net::io_context& io_context,
     const tcp::endpoint& endpoint,
+    const net::ip::address* bind_local,
     std::chrono::seconds timeout) {
+
+    if (timeout.count() <= 0) {
+        co_return DialResult::Fail(ErrorCode::DIAL_TIMEOUT, "connection timed out");
+    }
+    IoErrorCode ec;
+    tcp::socket socket(io_context);
+    socket.open(endpoint.protocol(), ec);
+    if (ec)
+        co_return DialResult::Fail(ErrorCode::SOCKET_CREATE_FAILED, ec.message());
+    if (bind_local) {
+        socket.bind(tcp::endpoint(*bind_local, 0), ec);
+        if (ec)
+            co_return DialResult::Fail(ErrorCode::SOCKET_BIND_FAILED, ec.message());
+    }
+
     auto stream = std::make_unique<TcpStream>(std::move(socket));
     ConnectTimeout deadline(*stream);
     auto& scheduler = TimeoutScheduler::ForIoContext(SocketIoContext(stream->impl_->socket));
@@ -935,47 +945,6 @@ net::awaitable<DialResult> TcpStream::ConnectSocket(
     if (connect_ec)
         co_return DialResult::Fail(MapAsioError(connect_ec), connect_ec.message());
     co_return DialResult::Success(std::move(stream));
-}
-
-net::awaitable<DialResult> TcpStream::Connect(
-    net::io_context& io_context,
-    const tcp::endpoint& endpoint,
-    std::chrono::seconds timeout) {
-
-    if (timeout.count() <= 0) {
-        co_return DialResult::Fail(ErrorCode::DIAL_TIMEOUT, "connection timed out");
-    }
-    IoErrorCode ec;
-    tcp::socket socket(io_context);
-    socket.open(endpoint.protocol(), ec);
-    if (ec)
-        co_return DialResult::Fail(ErrorCode::SOCKET_CREATE_FAILED, ec.message());
-    co_return co_await ConnectSocket(std::move(socket), endpoint, timeout);
-}
-
-net::awaitable<DialResult> TcpStream::ConnectWithBind(
-    net::io_context& io_context,
-    const net::ip::address& local_addr,
-    const tcp::endpoint& remote_endpoint,
-    std::chrono::seconds timeout) {
-
-    if (timeout.count() <= 0) {
-        co_return DialResult::Fail(ErrorCode::DIAL_TIMEOUT, "connection timed out");
-    }
-
-    tcp::socket socket(io_context);
-    IoErrorCode ec;
-    socket.open(remote_endpoint.protocol(), ec);
-    if (ec) {
-        co_return DialResult::Fail(ErrorCode::SOCKET_CREATE_FAILED, ec.message());
-    }
-
-    socket.bind(tcp::endpoint(local_addr, 0), ec);
-    if (ec) {
-        co_return DialResult::Fail(ErrorCode::SOCKET_BIND_FAILED, ec.message());
-    }
-
-    co_return co_await ConnectSocket(std::move(socket), remote_endpoint, timeout);
 }
 
 // ============================================================================

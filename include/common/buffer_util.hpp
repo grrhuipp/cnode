@@ -148,16 +148,6 @@ inline net::awaitable<void> ThrowIfCancelledOnEof(const char* cancel_what = null
     }
 }
 
-template <typename Reader>
-[[nodiscard]] net::awaitable<buf::MultiBuffer> ReadMultiBufferOrThrowOnCancel(
-    Reader& reader, const char* cancel_what = nullptr) {
-    buf::MultiBuffer raw = co_await reader.ReadMultiBuffer();
-    if (raw.byte_size() == 0) {
-        co_await ThrowIfCancelledOnEof(cancel_what);
-    }
-    co_return raw;
-}
-
 namespace buf {
 
 [[nodiscard]] inline std::span<const uint8_t> ChunkBytes(const Buffer* buffer) noexcept {

@@ -158,12 +158,7 @@ using Http1ReadFraming =
     std::unique_ptr<AsyncStream> inner,
     Http1ReadFraming read_framing,
     bool write_chunked,
-    std::span<const uint8_t> read_ahead = {});
-[[nodiscard]] std::unique_ptr<AsyncStream> MakeHttp1BodyStream(
-    std::unique_ptr<AsyncStream> inner,
-    Http1ReadFraming read_framing,
-    bool write_chunked,
-    buf::MultiBuffer&& read_ahead);
+    buf::MultiBuffer&& read_ahead = {});
 
 [[nodiscard]] net::awaitable<TransportBuildResult> DoHttp1ServerHandshake(
     std::unique_ptr<AsyncStream> stream,

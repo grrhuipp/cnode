@@ -46,7 +46,6 @@ struct SsCipherInfo {
     SsCipherType type;
     size_t key_size;   // bytes（主密钥长度 == 子密钥长度 == salt 长度）
     size_t salt_size;  // bytes
-    static constexpr size_t tag_size = 16;
 };
 
 // 根据方法名获取密码参数（不区分大小写），含 AEAD 与 2022-blake3 方法。
@@ -342,10 +341,7 @@ public:
                 auto record = DecodePending();
                 if (record.byte_size() != 0) co_return record;
             } catch (...) {
-                ciphertext_.clear();
-                plaintext_.clear();
-                failure_ = std::current_exception();
-                throw;
+                Fail();
             }
             ciphertext_.ReleaseIfIdle();
             auto raw = co_await stream_->ReadMultiBuffer();
@@ -353,28 +349,22 @@ public:
                 co_await ThrowIfCancelledOnEof();
                 if (length_ || ciphertext_.byte_size() != 0) {
                     try { throw transport::LinkError(ErrorCode::PROTOCOL_DECODE_FAILED); }
-                    catch (...) {
-                        ciphertext_.clear();
-                        plaintext_.clear();
-                        failure_ = std::current_exception();
-                        throw;
-                    }
+                    catch (...) { Fail(); }
                 }
                 co_return buf::MultiBuffer{};
             }
-            try { AppendRaw(std::move(raw)); }
-            catch (...) {
-                ciphertext_.clear();
-                plaintext_.clear();
-                failure_ = std::current_exception();
-                throw;
-            }
+            try { buf::AppendCoalescedStreamInput(ciphertext_, std::move(raw)); }
+            catch (...) { Fail(); }
         }
     }
 
 private:
-    void AppendRaw(buf::MultiBuffer raw) {
-        buf::AppendCoalescedStreamInput(ciphertext_, std::move(raw));
+    // Call only from a catch handler: latches and rethrows the active exception.
+    [[noreturn]] void Fail() {
+        ciphertext_.clear();
+        plaintext_.clear();
+        failure_ = std::current_exception();
+        throw;
     }
 
     buf::MultiBuffer DecodePending() {

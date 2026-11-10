@@ -542,7 +542,11 @@ void WsResume(bool client, bool multi_buffer, size_t size, size_t cut, uint8_t o
     Require(cut < frame.size(), "invalid WS cancellation fixture boundary");
     // Handshake residual is deterministic: the entire prefix is consumed before
     // the first socket wait, then Cancel interrupts that actual lower read.
-    stream.SetPendingData(reinterpret_cast<const uint8_t*>(frame.data()), cut);
+    ::buf::MultiBuffer residual;
+    Require(::buf::AppendSpanToMultiBuffer(
+                {reinterpret_cast<const uint8_t*>(frame.data()), cut}, residual),
+            "WS residual fixture allocation failed");
+    stream.SetPendingMultiBuffer(std::move(residual));
     const std::string application = opcode == 2 || opcode == 1 ? payload : "application";
     bool cancelled = false;
     size_t completed = 0;
@@ -732,7 +736,11 @@ void WsReject(std::string_view frame, bool client, bool multi_buffer) {
     socket.connect(acceptor.local_endpoint());
     acceptor.accept(peer);
     ::BaseWsStream stream(std::make_unique<::TcpStream>(std::move(socket)), client);
-    stream.SetPendingData(reinterpret_cast<const uint8_t*>(frame.data()), frame.size());
+    ::buf::MultiBuffer residual;
+    Require(::buf::AppendSpanToMultiBuffer(
+                {reinterpret_cast<const uint8_t*>(frame.data()), frame.size()}, residual),
+            "WS residual fixture allocation failed");
+    stream.SetPendingMultiBuffer(std::move(residual));
     peer.shutdown(::tcp::socket::shutdown_send);
     bool rejected = false, done = false;
     std::exception_ptr failure;

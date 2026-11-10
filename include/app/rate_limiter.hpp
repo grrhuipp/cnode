@@ -479,6 +479,12 @@ public:
         return Reserve(std::move(family), tag, ip, check_ban);
     }
     [[nodiscard]] bool TracksAuthBan() const noexcept { return core_.TracksAuthBan(); }
+    // False when no quota or ban table is configured: every Reserve* call
+    // would return an empty admission, so callers skip the coroutine.
+    [[nodiscard]] bool TracksAdmission() const noexcept {
+        return core_.TracksGlobalConnections() || core_.TracksIpConnections() ||
+               core_.TracksAuthBan();
+    }
     [[nodiscard]] AuthCredentialKey FingerprintCredential(
         std::string_view tag, std::span<const uint8_t> credential,
         uint64_t credential_revision) const noexcept {

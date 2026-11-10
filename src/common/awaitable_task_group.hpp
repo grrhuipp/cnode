@@ -150,16 +150,15 @@ private:
     bool stopping_ = false;
 };
 
+// Not a coroutine: the awaitable returned by async_initiate owns the
+// initiation (executor and start) by value and runs it only when awaited on
+// `executor`, so the caller pays for no frame of its own here.
 template <typename Start>
-net::awaitable<void> RunOnExecutor(Start start) {
-    const auto cancellation = co_await net::this_coro::cancellation_state;
-    if (cancellation.cancelled() != net::cancellation_type::none) {
-        throw IoSystemError(net::error::operation_aborted);
-    }
-    const auto executor = co_await net::this_coro::executor;
+net::awaitable<void> Launch(net::any_io_executor executor, Start start) {
     auto token = net::use_awaitable;
-    co_await net::async_initiate<decltype(token), void(std::exception_ptr)>(
-        [executor, start = std::optional<Start>(std::move(start))](auto handler) mutable {
+    return net::async_initiate<decltype(token), void(std::exception_ptr)>(
+        [executor = std::move(executor),
+         start = std::optional<Start>(std::move(start))](auto handler) mutable {
             static_assert(std::is_nothrow_move_constructible_v<decltype(handler)>);
             auto slot = net::get_associated_cancellation_slot(handler);
             using State = Group<decltype(handler)>;
@@ -187,6 +186,16 @@ net::awaitable<void> RunOnExecutor(Start start) {
         }, token);
 }
 
+// Entry of a group spawned onto another executor.
+template <typename Start>
+net::awaitable<void> RunOnExecutor(Start start) {
+    const auto cancellation = co_await net::this_coro::cancellation_state;
+    if (cancellation.cancelled() != net::cancellation_type::none) {
+        throw IoSystemError(net::error::operation_aborted);
+    }
+    co_await Launch(co_await net::this_coro::executor, std::move(start));
+}
+
 }  // namespace task_group_detail
 
 // Start is stored by value in the coroutine, without std::function allocation
@@ -195,8 +204,12 @@ template <typename Start>
 net::awaitable<void> RunAwaitableTaskGroup(net::any_io_executor executor, Start start) {
     if ((co_await net::this_coro::executor) == executor) {
         // Normal Worker requests are already on their owner. Do not allocate
-        // another co_spawn operation just to return to the same executor.
-        co_await task_group_detail::RunOnExecutor(std::move(start));
+        // another co_spawn operation or wrapper frame to stay on that executor.
+        const auto cancellation = co_await net::this_coro::cancellation_state;
+        if (cancellation.cancelled() != net::cancellation_type::none) {
+            throw IoSystemError(net::error::operation_aborted);
+        }
+        co_await task_group_detail::Launch(std::move(executor), std::move(start));
     } else {
         co_await net::co_spawn(executor,
             task_group_detail::RunOnExecutor(std::move(start)), net::use_awaitable);

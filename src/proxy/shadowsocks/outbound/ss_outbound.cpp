@@ -26,6 +26,7 @@
 #include <optional>
 #include <memory>
 #include <span>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <format>
@@ -42,24 +43,24 @@ using detail::ThrowSsWriteError;
 }  // namespace
 
 net::awaitable<void> RequestBodyWriter::WriteMultiBuffer(buf::MultiBuffer mb) {
-    if (!stream_) {
-        throw IoSystemError(io_error::not_connected, "Shadowsocks request writer has no stream");
-    }
-    if (write_finished_) throw transport::WriteClosed();
-    if (mb.byte_size() == 0) {
-        co_return;
-    }
-    ConstBufferSpanBuilder<buf::MultiBuffer::kInlineCapacity> buffers;
-    buffers.AppendMultiBuffer(mb);
-    co_await WriteBuffers(buffers.Span());
-    mb.clear();
+    return WriteEncrypted(std::move(mb));
 }
 
 net::awaitable<void> RequestBodyWriter::WriteBuffers(std::span<const net::const_buffer> buffers) {
+    return WriteEncrypted(buffers);
+}
+
+template <typename BufferRange>
+net::awaitable<void> RequestBodyWriter::WriteEncrypted(BufferRange buffers) {
     if (!stream_) {
         throw IoSystemError(io_error::not_connected, "Shadowsocks request writer has no stream");
     }
     if (write_finished_) throw transport::WriteClosed();
+    if constexpr (std::is_same_v<BufferRange, buf::MultiBuffer>) {
+        if (buffers.byte_size() == 0) {
+            co_return;
+        }
+    }
     if (!write_cipher_) {
         ThrowSsWriteError("Shadowsocks client request writer is not initialized");
     }
@@ -73,17 +74,19 @@ net::awaitable<void> RequestBodyWriter::WriteBuffers(std::span<const net::const_
     try {
         buf::MultiBuffer out_mb;
         out_mb.reserve(buffers.size());
-        for (const net::const_buffer& buffer : buffers) {
-            const auto* data = static_cast<const uint8_t*>(buffer.data());
-            const size_t size = buffer.size();
-            if (!data || size == 0) {
+        for (const auto& buffer : buffers) {
+            const auto bytes = buf::ChunkBytes(buffer);
+            if (bytes.empty()) {
                 continue;
             }
             detail::EncryptToMultiBuffer(
                 *write_cipher_,
                 write_nonce_,
-                std::span<const uint8_t>{data, size},
+                bytes,
                 out_mb);
+        }
+        if constexpr (std::is_same_v<BufferRange, buf::MultiBuffer>) {
+            buffers.clear();
         }
         if (out_mb.byte_size() != 0) {
             write_started = true;
@@ -832,8 +835,8 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
     stream->SetWriteTimeout(relay_write_timeout);
     stream->ClearPhaseDeadline();
 
-    auto relay_endpoint = [&](auto& endpoint) -> net::awaitable<RelayResult> {
-        co_return co_await DoRelayLink(
+    auto relay_endpoint = [&](auto& endpoint) {
+        return DoRelayLink(
             dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
             endpoint, ctx, stats, relay_config, std::move(first_payload));
     };

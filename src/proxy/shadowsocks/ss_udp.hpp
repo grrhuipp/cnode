@@ -352,8 +352,9 @@ private:
     void Finish();
     void Retire();
 
+    // By value: the range must stay in this frame until the write completes.
     template <typename BufferRange>
-    net::awaitable<void> WriteEncrypted(BufferRange& buffers, bool clear_after_encrypt);
+    net::awaitable<void> WriteEncrypted(BufferRange buffers);
 
     net::awaitable<void> FlushPendingAndWrite(AsyncStream& stream, buf::MultiBuffer out_mb);
 
@@ -432,6 +433,9 @@ private:
         write_cipher_.reset();
         if (stream) stream->CloseAbortive();
     }
+
+    template <typename BufferRange>
+    net::awaitable<void> WriteEncrypted(BufferRange buffers);
 
     std::optional<SsAeadCipher> write_cipher_;
     uint64_t write_nonce_ = 0;

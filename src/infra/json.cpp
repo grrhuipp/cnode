@@ -393,13 +393,17 @@ private:
         std::string out;
 
         while (true) {
+            const size_t run = pos_;
+            while (pos_ < text_.size()) {
+                const char next = text_[pos_];
+                if (next == '"' || next == '\\' || static_cast<unsigned char>(next) < 0x20) break;
+                ++pos_;
+            }
+            out.append(text_.substr(run, pos_ - run));
+
             const char c = Take();
             if (c == '"') return out;
-            if (static_cast<unsigned char>(c) < 0x20) Fail("control character in string");
-            if (c != '\\') {
-                out.push_back(c);
-                continue;
-            }
+            if (c != '\\') Fail("control character in string");
 
             switch (Take()) {
                 case '"': out.push_back('"'); break;

@@ -296,8 +296,7 @@ private:
     static constexpr size_t kBlockSize = 128;
     std::array<uint8_t, kBlockSize> inline_{};
     size_t inline_used_ = 0;
-    std::deque<std::array<uint8_t, kBlockSize>,
-               memory::ThreadLocalAllocator<std::array<uint8_t, kBlockSize>>> overflow_;
+    memory::ThreadLocalList<std::array<uint8_t, kBlockSize>> overflow_;
     size_t overflow_used_ = 0;
 };
 
@@ -634,9 +633,23 @@ net::awaitable<void> WriteUdpDatagram(
             "VLESS UDP datagram target differs from the fixed session target");
     }
 
-    ConstBufferSpanBuilder<16> buffers;
-    buffers.AppendMultiBuffer(payload);
-    co_await WriteUdpDatagram(writer, *datagram.target, packet_addr, buffers.Span());
+    if (datagram.payload_size > std::numeric_limits<uint16_t>::max()) {
+        throw IoSystemError(
+            io_error::message_size, "VLESS UDP datagram is too large");
+    }
+
+    std::array<uint8_t, 32> header{};
+    const size_t header_size = EncodeUdpHeaderTo(
+        *datagram.target, packet_addr, datagram.payload_size, header);
+    if (header_size == 0) {
+        throw IoSystemError(
+            io_error::message_size, "invalid VLESS UDP datagram size or target");
+    }
+
+    ConstBufferSpanBuilder<1 + buf::MultiBuffer::kInlineCapacity> framed;
+    framed.Append(net::buffer(header.data(), header_size));
+    framed.AppendMultiBuffer(payload);
+    co_await writer.WriteBuffers(framed.Span());
     payload.clear();
 }
 
@@ -683,9 +696,6 @@ void VisionReader::Decode(buf::MultiBuffer& out) {
             if (content_remaining_ > 0) {
                 const size_t n = std::min(content_remaining_, pending_.byte_size());
                 if (n == 0) {
-                    if (pending_.empty()) {
-                        pending_.ReleaseIfIdle();
-                    }
                     return;
                 }
                 if (!pending_.MovePrefixTo(out, n)) {
@@ -698,9 +708,6 @@ void VisionReader::Decode(buf::MultiBuffer& out) {
                 padding_remaining_ -= pending_.DropPrefixBytes(
                     std::min(padding_remaining_, pending_.byte_size()));
                 if (padding_remaining_ > 0) {
-                    if (pending_.empty()) {
-                        pending_.ReleaseIfIdle();
-                    }
                     return;
                 }
             }
@@ -721,9 +728,6 @@ void VisionReader::Decode(buf::MultiBuffer& out) {
         header_read_ += pending_.ConsumePrefixTo(
             std::span<uint8_t>(header_).subspan(header_read_, header_len - header_read_));
         if (header_read_ < header_len) {
-            if (pending_.empty()) {
-                pending_.ReleaseIfIdle();
-            }
             return;
         }
         header_read_ = 0;
@@ -775,11 +779,16 @@ net::awaitable<buf::MultiBuffer> VisionReader::ReadFramedMultiBuffer() {
         }
 
         if (!read_process_) {
-            co_return co_await ReadMultiBufferOrThrowOnCancel(src_);
+            buf::MultiBuffer raw = co_await src_.ReadMultiBuffer();
+            if (raw.byte_size() == 0) {
+                co_await ThrowIfCancelledOnEof();
+            }
+            co_return raw;
         }
 
-        buf::MultiBuffer raw = co_await ReadMultiBufferOrThrowOnCancel(src_);
+        buf::MultiBuffer raw = co_await src_.ReadMultiBuffer();
         if (raw.byte_size() == 0) {
+            co_await ThrowIfCancelledOnEof();
             if (read_process_ && (header_read_ != 0 || frame_active_ || expect_uuid_)) {
                 throw IoSystemError(io_error::connection_reset, "VLESS Vision frame truncated");
             }

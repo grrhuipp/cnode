@@ -141,31 +141,41 @@ net::awaitable<bool> SniffInitialPayload(
         return read_to || idle_to;
     };
     try {
-        auto cache_more = [&]() -> net::awaitable<bool> {
-            buf::MultiBuffer payload;
+        struct ReadResult {
+            bool received = false;
+            std::exception_ptr error;
+        } read;
+        // One frame per sniff read: the read, its EOF/timeout classification
+        // and the capture of its failure for the timer race below.
+        auto read_more = [&]() -> net::awaitable<void> {
             try {
-                payload = co_await inbound_reader->ReadMultiBuffer();
-            } catch (const IoSystemError& e) {
-                if (e.code() == net::error::eof && cached_bytes > 0) {
-                    co_return false;
+                buf::MultiBuffer payload;
+                try {
+                    payload = co_await inbound_reader->ReadMultiBuffer();
+                } catch (const IoSystemError& e) {
+                    if (e.code() == net::error::eof && cached_bytes > 0) {
+                        co_return;
+                    }
+                    throw;
                 }
-                throw;
-            }
-            if (payload.empty()) {
-                if (consume_inbound_timeout()) {
-                    read_timed_out = true;
-                    throw IoSystemError(net::error::timed_out);
+                if (payload.empty()) {
+                    if (consume_inbound_timeout()) {
+                        read_timed_out = true;
+                        throw IoSystemError(net::error::timed_out);
+                    }
+                    co_return;
                 }
-                co_return false;
+                cached_bytes += payload.byte_size();
+                ++cached_datagrams;
+                if (datagram) {
+                    sniff_payload = std::move(payload);
+                } else {
+                    sniff_payload.AppendAndCoalesce(std::move(payload));
+                }
+                read.received = true;
+            } catch (...) {
+                read.error = std::current_exception();
             }
-            cached_bytes += payload.byte_size();
-            ++cached_datagrams;
-            if (datagram) {
-                sniff_payload = std::move(payload);
-            } else {
-                sniff_payload.AppendAndCoalesce(std::move(payload));
-            }
-            co_return true;
         };
         const auto sniff_started = std::chrono::steady_clock::now();
         if (!first_packet.empty()) {
@@ -210,17 +220,7 @@ net::awaitable<bool> SniffInitialPayload(
             if (remaining <= std::chrono::milliseconds::zero()) {
                 break;
             }
-            struct ReadResult {
-                bool received = false;
-                std::exception_ptr error;
-            } read;
-            auto read_more = [&]() -> net::awaitable<void> {
-                try {
-                    read.received = co_await cache_more();
-                } catch (...) {
-                    read.error = std::current_exception();
-                }
-            };
+            read = {};
             memory::ByteVector{}.swap(sniff_scratch);
             AsyncDelay delay(io_context);
             auto next = co_await (read_more() || delay.WaitFor(remaining));
@@ -269,8 +269,6 @@ net::awaitable<bool> SniffInitialPayload(
         result = MakeRelayError(ErrorCode::SOCKET_READ_FAILED);
         co_return false;
     }
-    sniff_payload.ReleaseIfIdle();
-    memory::ByteVector{sniff_scratch.get_allocator()}.swap(sniff_scratch);
     co_return true;
 }
 
@@ -440,13 +438,22 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
     const TargetAddress& route_target = ctx.outbound.route_target.IsValid()
         ? ctx.outbound.route_target
         : ctx.outbound.target;
+    // Only an unresolved domain under a resolving strategy can need DNS, and
+    // IPIfNonMatch needs it only after the domain itself matched no rule.
+    const auto strategy =
+        detail::RequiresRouting(policy.outbound) && route_target.IsDomain() &&
+                !route_target.resolved_addr
+            ? router_.DomainStrategy()
+            : routing::DomainStrategy::AsIs;
+    std::optional<detail::OutboundSelection> selection;
+    if (strategy != routing::DomainStrategy::IPOnDemand) {
+        selection = SelectRoute(ctx, policy);
+    }
     RouteResult dispatch =
-        (!detail::RequiresRouting(policy.outbound) ||
-         !route_target.IsDomain() ||
-         route_target.resolved_addr ||
-         router_.DomainStrategy() == routing::DomainStrategy::AsIs)
-            ? FinishRoute(ctx, SelectRoute(ctx, policy))
-            : co_await RouteAsync(ctx, policy);
+        (selection && (strategy == routing::DomainStrategy::AsIs ||
+                       selection->source != detail::SelectionSource::Fallback))
+            ? FinishRoute(ctx, *selection)
+            : co_await RouteAsync(ctx, policy, selection);
     auto outbound_handler = std::move(dispatch.handler);
     if (!outbound_handler) {
         if (dispatch.error == ErrorCode::BLOCKED) {
@@ -592,23 +599,15 @@ detail::OutboundSelection DefaultDispatcher::SelectRoute(
     return detail::SelectOutbound(policy.outbound, decision);
 }
 
+// Entered only for an unresolved domain whose strategy needs DNS: IPOnDemand
+// (no initial selection) or IPIfNonMatch after the domain fell back.
 net::awaitable<DefaultDispatcher::RouteResult> DefaultDispatcher::RouteAsync(
     session::Context& ctx,
-    const routing::DispatchPolicy& policy) {
+    const routing::DispatchPolicy& policy,
+    std::optional<detail::OutboundSelection> initial_selection) {
     TargetAddress& route_target = ctx.outbound.route_target.IsValid()
         ? ctx.outbound.route_target
         : ctx.outbound.target;
-    if (!detail::RequiresRouting(policy.outbound) ||
-        !route_target.IsDomain() ||
-        route_target.resolved_addr) {
-        co_return FinishRoute(ctx, SelectRoute(ctx, policy));
-    }
-
-    const auto strategy = router_.DomainStrategy();
-    if (strategy == routing::DomainStrategy::AsIs) {
-        co_return FinishRoute(ctx, SelectRoute(ctx, policy));
-    }
-
     const bool sync_dial_target =
         &route_target == &ctx.outbound.target ||
         (ctx.outbound.target.IsDomain() &&
@@ -643,14 +642,6 @@ net::awaitable<DefaultDispatcher::RouteResult> DefaultDispatcher::RouteAsync(
             set_resolved_address(addresses.front());
             return last;
         };
-
-    std::optional<detail::OutboundSelection> initial_selection;
-    if (strategy == routing::DomainStrategy::IPIfNonMatch) {
-        initial_selection = SelectRoute(ctx, policy);
-        if (initial_selection->source != detail::SelectionSource::Fallback) {
-            co_return FinishRoute(ctx, *initial_selection);
-        }
-    }
 
     auto dns_result = co_await dns_service_.Resolve(route_target.host);
     // DNS may return a failed result after cancellation. Do not publish that

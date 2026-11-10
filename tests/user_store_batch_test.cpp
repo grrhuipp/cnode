@@ -33,12 +33,11 @@ void operator delete[](void* memory, std::size_t) noexcept { std::free(memory); 
 
 TEST(UserStoreBatch, Contract) {
     const UserSet first_old = PreparedVmessUsers{PreparedVmessUser{
-        .uuid = "old-first",
         .profile = {.user_id = 101, .email = {}}}};
     const UserSet second_old = PreparedTrojanUsers{PreparedTrojanUser{
         .password_hash = "old-second",
         .profile = {.user_id = 102, .email = {}}}};
-    const UserSet unrelated = PreparedVmessUsers{PreparedVmessUser{.uuid = "unrelated", .profile = {}}};
+    const UserSet unrelated = PreparedVmessUsers{PreparedVmessUser{.profile = {}}};
     const std::array initial{
         UserStore::UserUpdate{"first", first_old}, UserStore::UserUpdate{"second", second_old},
         UserStore::UserUpdate{"unrelated", unrelated}};
@@ -49,11 +48,9 @@ TEST(UserStoreBatch, Contract) {
     const auto unrelated_view = UserStore::VmessUsers("unrelated").users;
     const UserSet first_new = PreparedVmessUsers{
         PreparedVmessUser{
-            .uuid = "new-first-1",
             .uuid_bytes = {1},
             .profile = {.user_id = 201, .email = {}}},
         PreparedVmessUser{
-            .uuid = "new-first-2",
             .uuid_bytes = {2},
             .profile = {.user_id = 202, .email = {}}}};
     const UserSet second_new = PreparedTrojanUsers{PreparedTrojanUser{

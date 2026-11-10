@@ -122,11 +122,15 @@ ReadVlessRequestHeader(VlessBufferedReader& active_reader,
         bool read_ok = false;
         size_t step_read = 0;
         try {
-            read_ok = co_await active_reader.ReadExact(
-                handshake.data() + total_read,
-                required - total_read,
-                false,
-                &step_read);
+            read_ok = active_reader.ReadBuffered(
+                          handshake.data() + total_read,
+                          required - total_read,
+                          step_read) ||
+                      co_await active_reader.ReadExact(
+                          handshake.data() + total_read,
+                          required - total_read,
+                          false,
+                          &step_read);
         } catch (const IoSystemError& error) {
             const ErrorCode classified =
                 proxy::ClassifyHandshakeReadException(stream, error);
@@ -421,7 +425,8 @@ proxy::vless::inbound::Handler::Process(
         return proxy::RejectInbound(stats_, stream.get(), error);
     };
 
-    if (co_await proxy::CheckInboundIpBanned(limiter_, ctx)) {
+    if (proxy::BeginInboundAuthentication(limiter_, ctx) &&
+        co_await proxy::CheckInboundIpBanned(*limiter_, ctx)) {
         co_return fail_abortive(ErrorCode::BLOCKED);
     }
 

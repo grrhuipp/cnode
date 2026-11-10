@@ -173,12 +173,11 @@ public:
     }
 
 private:
-    net::awaitable<void> WriteEncodedChunks(
+    net::awaitable<void> WriteFirstEncodedChunks(
         AsyncStream& stream,
         buf::MultiBuffer chunks,
         std::span<const uint8_t> first_header,
-        bool* header_sent,
-        bool& frame_generated);
+        bool& header_sent);
     enum class State { Active, Finished, Failed };
 
     void EncodeStream(std::span<const uint8_t> bytes, buf::MultiBuffer& out);

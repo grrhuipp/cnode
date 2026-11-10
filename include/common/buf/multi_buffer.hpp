@@ -100,8 +100,6 @@ struct Buffer {
             return nullptr;
         }
         auto* b = ::new (raw) Buffer;
-        b->start = 0;
-        b->end = 0;
         memory::OnBufferNew();
         return b;
     }
@@ -874,8 +872,32 @@ UdpDatagramInfo InspectUdpDatagram(const MultiBuffer&&) = delete;
     return true;
 }
 
+// One contiguous scratch block. Storage is uninitialized on both paths: the
+// caller fills what it later appends or reads back, exactly as with a pooled
+// Buffer. The oversized block is borrowed from the resource bound at
+// construction and returned on Reset.
 class ContiguousWriteBuffer {
 public:
+    ContiguousWriteBuffer() noexcept = default;
+    ContiguousWriteBuffer(const ContiguousWriteBuffer&) = delete;
+    ContiguousWriteBuffer& operator=(const ContiguousWriteBuffer&) = delete;
+    ContiguousWriteBuffer(ContiguousWriteBuffer&& other) noexcept
+        : pooled_(std::move(other.pooled_))
+        , allocator_(other.allocator_)
+        , heap_(std::exchange(other.heap_, nullptr))
+        , heap_size_(std::exchange(other.heap_size_, 0)) {}
+    ContiguousWriteBuffer& operator=(ContiguousWriteBuffer&& other) noexcept {
+        if (this != &other) {
+            Reset();
+            pooled_ = std::move(other.pooled_);
+            allocator_ = other.allocator_;
+            heap_ = std::exchange(other.heap_, nullptr);
+            heap_size_ = std::exchange(other.heap_size_, 0);
+        }
+        return *this;
+    }
+    ~ContiguousWriteBuffer() noexcept { Reset(); }
+
     [[nodiscard]] uint8_t* Prepare(size_t capacity) {
         Reset();
         if (capacity <= Buffer::kSize) {
@@ -885,12 +907,16 @@ public:
             }
             return pooled_->Tail().data();
         }
-        heap_.resize(capacity);
-        return heap_.data();
+        if (capacity > kMaxCapacity) {
+            throw std::length_error("ContiguousWriteBuffer capacity");
+        }
+        heap_ = allocator_.allocate(capacity);
+        heap_size_ = capacity;
+        return heap_;
     }
 
     [[nodiscard]] uint8_t* TryPrepare(size_t capacity) noexcept {
-        if (capacity > heap_.max_size()) {
+        if (capacity > kMaxCapacity) {
             Reset();
             return nullptr;
         }
@@ -905,17 +931,17 @@ public:
         if (pooled_) {
             return pooled_->Tail().data();
         }
-        return heap_.empty() ? nullptr : heap_.data();
+        return heap_;
     }
 
     [[nodiscard]] bool Empty() const noexcept {
-        return !pooled_ && heap_.empty();
+        return !pooled_ && !heap_;
     }
 
     void Reset() noexcept {
         pooled_.reset();
-        if (heap_.capacity() != 0) {
-            memory::ByteVector{heap_.get_allocator()}.swap(heap_);
+        if (heap_) {
+            allocator_.deallocate(std::exchange(heap_, nullptr), std::exchange(heap_size_, 0));
         }
     }
 
@@ -931,12 +957,12 @@ public:
                 Reset();
                 return true;
             }
-            if (size > heap_.size()) {
+            if (size > heap_size_) {
                 Reset();
                 return false;
             }
             const bool appended = AppendSpanToMultiBuffer(
-                std::span<const uint8_t>(heap_.data(), size), out);
+                std::span<const uint8_t>(heap_, size), out);
             Reset();
             return appended;
         } catch (...) {
@@ -952,8 +978,13 @@ public:
     }
 
 private:
+    static constexpr size_t kMaxCapacity =
+        static_cast<size_t>(std::numeric_limits<std::ptrdiff_t>::max());
+
     BufferGuard pooled_;
-    memory::ByteVector heap_;
+    memory::ThreadLocalAllocator<uint8_t> allocator_;
+    uint8_t* heap_ = nullptr;
+    size_t heap_size_ = 0;
 };
 
 // Presents fragmented buffer storage as one contiguous byte span. A single

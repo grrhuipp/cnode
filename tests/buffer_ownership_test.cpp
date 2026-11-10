@@ -63,14 +63,6 @@ buf::BufferGuard Buffer(size_t bytes, uint8_t value = 0x42) {
     return buffer;
 }
 
-bool Matches(const InitialPayload& payload, std::span<const uint8_t> expected) {
-    // Do not dereference an invalid inline view in the old implementation.
-    if (payload.size() != expected.size()) return false;
-    std::vector<uint8_t> actual(expected.size());
-    return payload.CopyPrefixTo(actual.data(), actual.size()) == expected.size() &&
-        std::equal(actual.begin(), actual.end(), expected.begin(), expected.end());
-}
-
 std::vector<uint8_t> Flatten(const buf::MultiBuffer& payload) {
     std::vector<uint8_t> result;
     for (const auto* buffer : payload) {
@@ -172,30 +164,6 @@ void FaultMatrix(const char* name, Function operation) {
     }
     std::printf("allocation points checked: %d\n", points);
     Check(passed && reached_success, name);
-}
-
-void InitialMatrix() {
-    for (int mode = 0; mode < 3; ++mode) {
-        FaultMatrix("initial append/assign is atomic and retryable", [mode](int budget, bool& complete) {
-            const auto before = Pattern(mode == 0 ? 17 : 65000);
-            const auto added = Pattern(mode == 2 ? 80000 : 20000);
-            InitialPayload payload;
-            payload.assign(before);
-            const auto operation = [&] {
-                if (mode == 2) payload.assign(added);
-                else payload.append(added);
-                return true;
-            };
-            complete = Inject(budget, operation);
-            const bool unchanged = complete || (failures != 0 && Matches(payload, before));
-            if (!complete) operation();
-            auto expected = mode == 2 ? std::vector<uint8_t>{} : before;
-            expected.insert(expected.end(), added.begin(), added.end());
-            const bool matched = Matches(payload, expected);
-            auto moved = std::move(payload).MoveToMultiBuffer();
-            return unchanged && matched && payload.empty() && Flatten(moved) == expected && Consistent(moved);
-        });
-    }
 }
 
 void AppendMatrix() {
@@ -361,21 +329,6 @@ void EdgeCases() {
           "reserved active slots remain allocation free after prefix consumption");
 
     auto bytes = Pattern(100);
-    InitialPayload initial;
-    initial.assign(bytes);
-    initial.append(initial.span());
-    auto twice = bytes;
-    twice.insert(twice.end(), bytes.begin(), bytes.end());
-    Check(Matches(initial, twice), "inline self append");
-    initial.assign(initial.span().subspan(5, 77));
-    Check(Matches(initial, std::span<const uint8_t>{bytes}.subspan(5, 77)), "self assignment");
-    initial.assign(Pattern(9000));
-    auto expected = Pattern(9000);
-    const auto prefix = initial.PrefixSpan(33);
-    expected.insert(expected.end(), prefix.begin(), prefix.end());
-    initial.append(prefix);
-    Check(Matches(initial, expected), "spilled self append");
-
     auto owned_bytes = Pattern(9000);
     auto owned = Packet(owned_bytes);
     const auto* original_buffer = *owned.begin();
@@ -420,7 +373,9 @@ void EdgeCases() {
 }
 
 TEST(BufferOwnership, Contract) {
-    InitialMatrix();
+    // The first pool use registers this thread's pool destructor with the
+    // runtime; keep that one-time allocation out of the tracked matrices.
+    { const auto warm = Buffer(0); }
     AppendMatrix();
     TransferMatrix();
     UdpPrefixTransfer();
@@ -594,7 +549,6 @@ TEST(BufferOwnership, EmptyUdpMessageSurvivesTransfersAndChecksEveryTarget) {
     const auto* original = *packet.begin();
     InitialPayload initial(std::move(packet));
     EXPECT_FALSE(initial.empty());
-    EXPECT_EQ(initial.size(), 0);
     auto moved = std::move(initial).MoveToMultiBuffer();
     moved.ReleaseIfIdle();
     EXPECT_TRUE(initial.empty());
