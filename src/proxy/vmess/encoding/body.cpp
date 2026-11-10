@@ -127,10 +127,11 @@ std::optional<size_t> BodyChunkCipher::DecodeLength(const uint8_t* in) {
 // BodyEncoder
 // ============================================================================
 
-BodyEncoder::BodyEncoder(const BodyOptions& options,
+BodyEncoder::BodyEncoder(memory::worker_memory& pool,
+                         const BodyOptions& options,
                          const BodyKey& request_body,
                          const BodyKey& direction_key)
-    : cipher_(options, request_body, direction_key, proxy::AeadDirection::Encrypt) {
+    : pool_(&pool), cipher_(options, request_body, direction_key, proxy::AeadDirection::Encrypt) {
     const size_t reserved =
         cipher_.LengthSize() + cipher_.Overhead() + cipher_.MaxPaddingSize();
     stream_chunk_size_ = std::min(MAX_CHUNK_SIZE - cipher_.Overhead(),
@@ -171,7 +172,7 @@ void BodyEncoder::Encode(const buf::MultiBuffer& payload, buf::MultiBuffer& out)
 void BodyEncoder::Encode(std::span<const net::const_buffer> payload, buf::MultiBuffer& out) {
     CheckWritable();
     if (PacketMode()) {
-        const buf::ContiguousBufferView packet(payload);
+        const buf::ContiguousBufferView packet(payload, pool_->resource());
         EncodePacket(packet.Bytes(), out);
         return;
     }
@@ -369,7 +370,7 @@ void BodyEncoder::EncodeChunk(std::span<const uint8_t> bytes, buf::MultiBuffer& 
     const size_t length_size = cipher_.LengthSize();
     const size_t capacity = length_size + bytes.size() + cipher_.Overhead() + padding;
 
-    buf::ContiguousWriteBuffer encoded;
+    buf::ContiguousWriteBuffer encoded(*pool_);
     uint8_t* dst = encoded.Prepare(capacity);
     encoded.AppendTo(SealChunkTo(bytes, length_size, padding, dst), out);
 } catch (...) {
@@ -381,10 +382,12 @@ void BodyEncoder::EncodeChunk(std::span<const uint8_t> bytes, buf::MultiBuffer& 
 // BodyDecoder
 // ============================================================================
 
-BodyDecoder::BodyDecoder(const BodyOptions& options,
+BodyDecoder::BodyDecoder(memory::worker_memory& pool,
+                         const BodyOptions& options,
                          const BodyKey& request_body,
                          const BodyKey& direction_key)
-    : cipher_(options, request_body, direction_key, proxy::AeadDirection::Decrypt) {}
+    : cipher_(options, request_body, direction_key, proxy::AeadDirection::Decrypt),
+      read_buffer_(pool) {}
 
 bool BodyDecoder::TryConsumePending(std::span<uint8_t> out, size_t& filled) noexcept {
     if (filled < out.size() && pending_read_.byte_size() != 0) {
@@ -682,12 +685,12 @@ ClientSession::SessionKeys ClientSession::GenerateKeys() {
     return keys;
 }
 
-ClientSession::ClientSession(Security security, Command command)
+ClientSession::ClientSession(memory::worker_memory& pool, Security security, Command command)
     : security_(security)
     , keys_(GenerateKeys())
-    , request_encoder_(BodyOptions{security, ClientOptions(security), command},
+    , request_encoder_(pool, BodyOptions{security, ClientOptions(security), command},
                        keys_.request, keys_.request)
-    , response_decoder_(BodyOptions{security, ClientOptions(security), command},
+    , response_decoder_(pool, BodyOptions{security, ClientOptions(security), command},
                         keys_.request, keys_.response) {}
 
 net::awaitable<VMessHandshakeResult> ClientSession::EncodeRequestHeader(
@@ -1026,14 +1029,15 @@ bool BuildResponseHeader(const VMessRequest& request,
 
 RequestBodyReader::RequestBodyReader(const VMessRequest& request,
                                      AsyncStream& stream)
-    : decoder_(RequestBodyOptions(request), RequestBodyKey(request), RequestBodyKey(request))
+    : decoder_(stream.Pool(), RequestBodyOptions(request), RequestBodyKey(request),
+               RequestBodyKey(request))
     , stream_(&stream)
     , is_udp_(request.command == Command::UDP)
     , udp_target_(is_udp_ ? request.target : TargetAddress{}) {}
 
 net::awaitable<buf::MultiBuffer> RequestBodyReader::ReadUdpMultiBuffer() {
     auto mb = co_await decoder_.Read(*stream_);
-    if (mb.byte_size() != 0 && !buf::SetUdpTarget(mb, udp_target_)) {
+    if (mb.byte_size() != 0 && !buf::SetUdpTarget(mb, udp_target_, stream_->Pool())) {
         throw std::bad_alloc();
     }
     co_return mb;
@@ -1044,7 +1048,7 @@ ResponseBodyWriter::ResponseBodyWriter(
     const BodyKey& response,
     AsyncStream& stream,
     const std::array<uint8_t, kResponseHeaderSize>& response_header)
-    : encoder_(RequestBodyOptions(request), RequestBodyKey(request), response)
+    : encoder_(stream.Pool(), RequestBodyOptions(request), RequestBodyKey(request), response)
     , stream_(&stream)
     , udp_target_(request.command == Command::UDP ? request.target : TargetAddress{})
     , response_header_(response_header) {}
@@ -1167,8 +1171,8 @@ struct SessionHistory {
     static constexpr int64_t kCleanupIntervalSeconds = 30;
     static constexpr size_t kMaxEntries = 65536;
 
-    memory::ThreadLocalUnorderedMap<SessionKey, int64_t, SessionKeyHash, SessionKeyEqual> entries;
-    memory::ThreadLocalDeque<std::pair<const SessionKey*, int64_t>> order;
+    memory::UnorderedMap<SessionKey, int64_t, SessionKeyHash, SessionKeyEqual> entries;
+    memory::RingDeque<std::pair<const SessionKey*, int64_t>> order;
     int64_t last_cleanup = 0;
 
     SessionHistory()

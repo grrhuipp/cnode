@@ -76,10 +76,12 @@ public:
         if (write_closed_) throw transport::WriteClosed();
     }
 
-    AnyTLSSubStream(net::io_context& io_context,
+    AnyTLSSubStream(memory::worker_memory& pool,
+                    net::io_context& io_context,
                     AnyTLSDemuxSession& session,
                     uint32_t sid)
-        : input_signal_(net::any_io_executor(io_context.get_executor()), 1)
+        : ctx(pool)
+        , input_signal_(net::any_io_executor(io_context.get_executor()), 1)
         , input_space_signal_(net::any_io_executor(io_context.get_executor()), 1)
         , session_(session)
         , sid_(sid) {}
@@ -361,7 +363,7 @@ private:
         write_gate_.Cancel();
         auto streams = std::exchange(
             streams_,
-            memory::ThreadLocalUnorderedMap<uint32_t, std::shared_ptr<AnyTLSSubStream>>{
+            memory::UnorderedMap<uint32_t, std::shared_ptr<AnyTLSSubStream>>{
                 streams_.get_allocator()});
         for (auto& [sid, sub] : streams) {
             (void)sid;
@@ -445,7 +447,7 @@ private:
     std::chrono::seconds control_idle_timeout_{};
     const PaddingScheme* padding_scheme_ = nullptr;
     transport::internet::AsyncWriteGate write_gate_;
-    memory::ThreadLocalUnorderedMap<uint32_t, std::shared_ptr<AnyTLSSubStream>> streams_;
+    memory::UnorderedMap<uint32_t, std::shared_ptr<AnyTLSSubStream>> streams_;
     uint32_t last_stream_id_ = 0;
     bool cancelled_ = false;
     std::optional<anytls::SessionVersion> session_version_;
@@ -482,7 +484,7 @@ net::awaitable<ErrorCode> AnyTLSDemuxSession::ProcessUdpSubstream(
     std::optional<proxy::uot::PreparedRequest> prepared;
     auto read_header = [&]() -> net::awaitable<ErrorCode> {
         auto uot_header = co_await proxy::uot::ReadUotRequestHeader(
-            uot_version, sub, std::move(pending), ErrorCode::CONNECTION_CLOSED);
+            uot_version, sub, std::move(pending), ErrorCode::CONNECTION_CLOSED, sub.ctx.pool);
         if (!uot_header) co_return uot_header.error();
         prepared.emplace(std::move(*uot_header));
         co_return ErrorCode::OK;
@@ -712,7 +714,9 @@ net::awaitable<RelayResult> AnyTLSDemuxSession::ReadFrames(AwaitableTaskGroup& t
                 continue;
             }
             const auto opened_at = std::chrono::steady_clock::now();
-            auto sub = memory::AllocateShared<AnyTLSSubStream>(io_context_, *this, sid);
+            auto& pool = session_ctx_.pool;
+            auto sub = memory::AllocateShared<AnyTLSSubStream>(
+                pool.resource(), pool, io_context_, *this, sid);
             sub->ctx.InitSubstreamFrom(session_ctx_);
             sub->ctx.content.network = Network::TCP;
             streams_.emplace(sid, sub);
@@ -916,13 +920,14 @@ const bool kInboundRegistered = [] {
         [](::proxyman::inbound::ProtocolRuntime& runtime,
            ::StatsShard& stats,
            ::ConnectionLimiter* limiter,
-           const ::proxyman::inbound::BuildRequest& req) -> std::unique_ptr<::Inbound> {
+           const ::proxyman::inbound::BuildRequest& req,
+           memory::worker_memory& pool) -> std::unique_ptr<::Inbound> {
             auto* tracker = runtime.OnlineTracker();
             const auto* settings = GetAnyTlsSettings(req);
             if (!tracker || !settings) {
                 return nullptr;
             }
-            return std::make_unique<::proxy::anytls::inbound::Handler>(
+            return memory::MakeUnique<::proxy::anytls::inbound::Handler>(pool,
                 *tracker,
                 stats,
                 limiter,

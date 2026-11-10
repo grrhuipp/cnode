@@ -26,10 +26,10 @@
 namespace {
 using namespace std::chrono_literals;
 
-buf::MultiBuffer Payload(size_t size) {
+buf::MultiBuffer Payload(size_t size, memory::worker_memory& pool) {
     std::vector<uint8_t> bytes(size, 0x42);
     buf::MultiBuffer payload;
-    if (!buf::AppendSpanToMultiBuffer(bytes, payload)) throw std::bad_alloc();
+    if (!buf::AppendSpanToMultiBuffer(bytes, payload, pool)) throw std::bad_alloc();
     return payload;
 }
 
@@ -70,7 +70,7 @@ net::awaitable<void> Wait(State& state) {
 
 class Stream final : public AsyncStream {
 public:
-    explicit Stream(State& state) : state_(state) {}
+    Stream(memory::worker_memory& pool, State& state) : AsyncStream(pool), state_(state) {}
     ~Stream() override {
         state_.destroyed = true;
         if (state_.notify_closed_on_destroy) NotifyClosed();
@@ -85,7 +85,7 @@ public:
         if (state_.allocation_failure) throw std::bad_alloc();
         if (state_.read_error != ErrorCode::OK) throw transport::LinkError(state_.read_error);
         if (state_.block) co_await Wait(state_);
-        co_return Payload(std::exchange(state_.payload_size, 0));
+        co_return Payload(std::exchange(state_.payload_size, 0), Pool());
     }
     void ShutdownWrite() override {}
     void Cancel() noexcept override { NotifyCancellation(); }
@@ -124,7 +124,7 @@ public:
             co_return result;
         }
         if (!probe_.relay) co_return RelayResult{};
-        Stream target(probe_.target_state);
+        Stream target(ctx.pool, probe_.target_state);
         co_return co_await DoRelayLink(dialer.IoContext(), *inbound.reader, *inbound.writer,
             inbound.control, target, ctx, stats, config, std::move(first));
     }
@@ -140,8 +140,9 @@ proxyman::outbound::PreparedOutboundConfig ProbeConfig(std::string tag, Outbound
         .create = proxyman::outbound::MakePreparedOutboundCreator<
             OutboundProbe*,
             +[](std::string_view, std::shared_ptr<OutboundProbe* const> probe,
-                net::io_context&, AwaitableTaskGroup&) -> std::unique_ptr<Outbound> {
-                return std::make_unique<TestOutbound>(**probe);
+                net::io_context&, AwaitableTaskGroup&,
+                memory::worker_memory& pool) -> std::unique_ptr<Outbound> {
+                return memory::MakeUnique<TestOutbound>(pool, **probe);
             }>(&probe),
     };
 }
@@ -156,11 +157,11 @@ struct OutboundProbes {
 };
 
 struct Outbounds {
-    Outbounds(OutboundProbes& probes, net::io_context& io, app::dns::DNS& dns)
+    Outbounds(memory::worker_memory& pool, OutboundProbes& probes, net::io_context& io, app::dns::DNS& dns)
         : configuration({ProbeConfig("direct", probes.direct),
                          ProbeConfig("second", probes.second)}),
           tasks(io.get_executor()),
-          lookup(configuration, io, dns, std::chrono::seconds(1), tasks.Tasks()) {}
+          lookup(pool, configuration, io, dns, std::chrono::seconds(1), tasks.Tasks()) {}
     proxyman::outbound::OutboundConfiguration configuration;
     ResidentTaskGroup tasks;
     proxyman::outbound::HandlerLookup lookup;
@@ -181,6 +182,7 @@ enum class Case { PreStopped, Sniff, Handshake, RoutingDns, Parent, Pending,
                   RoutedFallback, RuleMatch, PolicyBlockedForce, PolicyBlockedRoute, PolicyAllowed };
 
 bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
+    memory::worker_memory pool;
     net::io_context io;
     app::RequestLoadState load(100, 30);
     State source_state;
@@ -188,7 +190,7 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
     IoErrorCode phase_open_error;
     phase_socket.open(tcp::v4(), phase_open_error);
     if (phase_open_error) throw IoSystemError(phase_open_error);
-    TcpStream phase_stream(std::move(phase_socket));
+    TcpStream phase_stream(pool, std::move(phase_socket));
     source_state.load = &load;
     source_state.block = which == Case::Sniff;
     source_state.allocation_failure = which == Case::SniffMemory;
@@ -196,7 +198,7 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
     source_state.payload_size = 7;
     source_state.notify_closed_on_destroy = controlled &&
         (which == Case::RelayFailure || which == Case::RelayCancelled);
-    auto stream = std::make_unique<Stream>(source_state);
+    auto stream = memory::MakeUnique<Stream>(pool, pool, source_state);
     auto* reader = stream.get();
     OutboundProbes outbounds;
     Router router;
@@ -217,7 +219,7 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
         policy.outbound = routing::RouteWithFallback{"direct"};
     }
     policy.sniffing.enabled = which == Case::Sniff || which == Case::SniffMemory || which == Case::SniffLinkError;
-    session::Context ctx;
+    session::Context ctx(pool);
     ctx.conn_id = 1;
     ctx.inbound.tag = "dispatcher-test";
     ctx.inbound.accounting_key = "panel/fixture/1/";
@@ -252,7 +254,7 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
                         ? "198\\.51\\.100\\.1" : "192\\.0\\.2\\.1"),
                 }}));
     }
-    Outbounds outbound_handlers(outbounds, io, dns);
+    Outbounds outbound_handlers(pool, outbounds, io, dns);
     app::dispatcher::DefaultDispatcher dispatcher(
         router, outbound_handlers.lookup, request_policy, session_tracking, dns, load);
     if (which == Case::PreStopped) reader->Cancellation().Stop(reason);
@@ -351,11 +353,12 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
 }
 
 bool SiblingIsolation(bool controlled) {
+    memory::worker_memory pool;
     net::io_context io;
     app::RequestLoadState load(100, 30);
     State a, b;
-    auto first = std::make_unique<Stream>(a);
-    auto second = std::make_unique<Stream>(b);
+    auto first = memory::MakeUnique<Stream>(pool, pool, a);
+    auto second = memory::MakeUnique<Stream>(pool, pool, b);
     auto* source = first.get();
     OutboundProbes outbounds;
     for (auto* probe : {&outbounds.direct, &outbounds.second}) {
@@ -369,12 +372,12 @@ bool SiblingIsolation(bool controlled) {
     app::dns::Config dns_config{.servers = {dns_peer.local_endpoint()}};
     app::dns::DNSWorker dns_worker(io, dns_config, 8);
     app::dns::DNS dns(dns_worker);
-    Outbounds outbound_handlers(outbounds, io, dns);
+    Outbounds outbound_handlers(pool, outbounds, io, dns);
     app::dispatcher::DefaultDispatcher dispatcher(
         router, outbound_handlers.lookup, request_policy, session_tracking, dns, load);
     routing::DispatchPolicy policy_a{SniffConfig{.enabled = false, .domains_excluded = {}}, routing::ForceOutbound{"direct"}};
     routing::DispatchPolicy policy_b{SniffConfig{.enabled = false, .domains_excluded = {}}, routing::ForceOutbound{"second"}};
-    session::Context ctx_a, ctx_b;
+    session::Context ctx_a(pool), ctx_b(pool);
     ctx_a.outbound.target = ctx_b.outbound.target = TargetAddress("192.0.2.1", 443);
     StatsShard stats;
     TimeoutsConfig timeouts;

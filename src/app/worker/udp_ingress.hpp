@@ -236,7 +236,7 @@ struct UdpAssociationHook final {
 // Worker-local min-heap over association rows embedded in UdpIngress maps.
 // One maintenance event sleeps until the nearest row deadline and reclaims at
 // most a bounded batch per wake; no timer runs while no row can expire.
-class UdpAssociationReclaimer final : public memory::ThreadAllocated, private TimeoutEvent {
+class UdpAssociationReclaimer final : public memory::WorkerAllocated, private TimeoutEvent {
 public:
     using FailureCallback = void (*)(void*, std::exception_ptr);
     using TimePoint = UdpAssociationHook::TimePoint;
@@ -270,7 +270,7 @@ private:
     TimeoutScheduler& scheduler_;
     void* failure_context_ = nullptr;
     FailureCallback on_failure_ = nullptr;
-    memory::ThreadLocalVector<UdpAssociationHook*> heap_;
+    memory::Vector<UdpAssociationHook*> heap_;
     TimePoint armed_deadline_{};
     bool stopped_ = false;
     bool failed_ = false;
@@ -308,8 +308,8 @@ struct UdpDatagramContext {
 // Only authenticated identity and execution ownership metadata live here.
 // Protocol continuity state is owned, but never interpreted, by this directory.
 struct UdpHandoffIdentity {
-    memory::ThreadLocalString listener;
-    memory::ThreadLocalString tag;
+    memory::String listener;
+    memory::String tag;
     const proxyman::inbound::ProtocolSettings* configuration = nullptr;
     ClientSessionKey client;
     bool operator==(const UdpHandoffIdentity& other) const noexcept {
@@ -326,7 +326,7 @@ struct UdpHandoffIdentityHash {
     }
 };
 // Worker-private owner for native UDP sockets, client sessions and reply queues.
-class UdpIngress final : public memory::ThreadAllocated {
+class UdpIngress final : public memory::WorkerAllocated {
 public:
     // Handles remain Worker-local; receive/send operations retain them only
     // across their own asynchronous cancellation boundary.
@@ -348,7 +348,7 @@ public:
     // The native response path has one concrete owner, not an erased callback.
     // sink is Worker-local and outlives all joined session/reply operations.
     struct ReplyRoute {
-        memory::ThreadLocalString socket_key;
+        memory::String socket_key;
         SocketPtr socket;
         std::shared_ptr<::InboundDatagramResponse> response;
         UdpReplySink* sink = nullptr;
@@ -377,7 +377,7 @@ public:
     };
 
 
-    UdpIngress(std::string_view tag, std::unique_ptr<::Inbound> proxy,
+    UdpIngress(memory::worker_memory& pool, std::string_view tag, std::unique_ptr<::Inbound> proxy,
                UdpAssociationReclaimer& reclaimer, UdpResourceBudget& budget,
                net::io_context& io_context);
     ~UdpIngress() noexcept;
@@ -420,8 +420,9 @@ public:
     void CleanupClientSessions(std::string_view socket_key) noexcept;
     void CleanupAllClientSessions() noexcept;
 
-    [[nodiscard]] static SocketPtr MakeSocket(net::io_context& io_context) {
-        return memory::AllocateShared<udp::socket>(io_context);
+    [[nodiscard]] static SocketPtr MakeSocket(
+        net::io_context& io_context, memory::worker_memory& pool) {
+        return memory::AllocateShared<udp::socket>(pool.resource(), io_context);
     }
     // A socket key belongs to one receive loop. Duplicate attachment is
     // rejected instead of cancelling and replacing the live socket.
@@ -461,7 +462,7 @@ private:
         UdpResourceBudget::PayloadReservation reservation;
     };
     struct ReplyQueueState {
-        memory::ThreadLocalDeque<QueuedUdpReply> pending;
+        memory::RingDeque<QueuedUdpReply> pending;
         size_t queued_bytes = 0;
         uint64_t active_id = 0;
         size_t active_payload_size = 0;
@@ -470,22 +471,22 @@ private:
         ClientSessionPtr link;
         UdpAssociationHook reclaim_hook;
     };
-    using UdpClientSessionMap = memory::ThreadLocalUnorderedMap<
+    using UdpClientSessionMap = memory::UnorderedMap<
         ClientSessionKey,
         UdpClientSession,
         ClientSessionKeyHash>;
-    using UdpSocketMap = memory::ThreadLocalUnorderedMap<
-        memory::ThreadLocalString,
+    using UdpSocketMap = memory::UnorderedMap<
+        memory::String,
         BoundSocket,
         TransparentStringHash,
         TransparentStringEq>;
-    using ReplyQueueMap = memory::ThreadLocalUnorderedMap<
-        memory::ThreadLocalString,
+    using ReplyQueueMap = memory::UnorderedMap<
+        memory::String,
         ReplyQueueState,
         TransparentStringHash,
         TransparentStringEq>;
-    using ClientSessionOuterMap = memory::ThreadLocalUnorderedMap<
-        memory::ThreadLocalString,
+    using ClientSessionOuterMap = memory::UnorderedMap<
+        memory::String,
         UdpClientSessionMap,
         TransparentStringHash,
         TransparentStringEq>;
@@ -498,7 +499,8 @@ private:
                              InboundDatagramAssociation* association) noexcept;
     void Unlink(UdpClientSession& row) noexcept;
 
-    memory::ThreadLocalString tag_;
+    memory::worker_memory& pool_;
+    memory::String tag_;
     std::unique_ptr<::Inbound> proxy_;
     UdpAssociationReclaimer& reclaimer_;
     UdpResourceBudget& budget_;
@@ -506,7 +508,7 @@ private:
     ReplyQueueMap reply_queues_;
     ClientSessionOuterMap client_sessions_;
     SignalChannel completion_signal_;
-    memory::ThreadLocalUnorderedMap<UdpHandoffIdentity, std::shared_ptr<UdpHandoffRecord>,
+    memory::UnorderedMap<UdpHandoffIdentity, std::shared_ptr<UdpHandoffRecord>,
                                     UdpHandoffIdentityHash> handoff_records_;
     ClientSession* jobs_ = nullptr;
     size_t outstanding_jobs_ = 0;
@@ -521,7 +523,8 @@ class UdpIngress::ClientSession final
 public:
     transport::CancellationSource& Cancellation() noexcept override;
 
-    ClientSession(net::io_context& io_context,
+    ClientSession(memory::worker_memory& pool,
+                  net::io_context& io_context,
                   ReplyRoute reply,
                   udp::endpoint reply_endpoint,
                   ::InboundDatagramOwner session_owner,
@@ -544,13 +547,17 @@ public:
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override;
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override;
+    net::awaitable<void> WriteBuffers(
+        std::span<const net::const_buffer> buffers) override {
+        return WriteBuffersAsMultiBuffer(buffers, pool_);
+    }
 
 private:
     friend class UdpIngress;
 
     struct RequestData {
-        explicit RequestData(routing::DispatchPolicy dispatch_policy)
-            : context(), policy(std::move(dispatch_policy)) {}
+        RequestData(memory::worker_memory& pool, routing::DispatchPolicy dispatch_policy)
+            : context(pool), policy(std::move(dispatch_policy)) {}
         session::Context context;
         routing::DispatchPolicy policy;
         routing::Dispatcher* dispatcher = nullptr;
@@ -575,12 +582,13 @@ private:
     }
     void CloseWithError(ErrorCode error) noexcept;
 
+    memory::worker_memory& pool_;
     UdpResourceBudget::AssociationLease association_;
     UdpResourceBudget* budget_;
     SignalChannel reader_signal_;
     ReplyRoute reply_;
     udp::endpoint reply_endpoint_;
-    memory::ThreadLocalDeque<QueuedInput> input_queue_;
+    memory::RingDeque<QueuedInput> input_queue_;
     size_t queued_bytes_ = 0;
     bool closed_ = false;
     ErrorCode terminal_error_ = ErrorCode::OK;
@@ -614,7 +622,7 @@ public:
     // Worker-local directory. A tombstone is retained after its live
     // association ends until the entire timestamp/replay protection expires.
     static std::shared_ptr<UdpHandoffRecord> Claim(
-        memory::ThreadLocalUnorderedMap<UdpHandoffIdentity, std::shared_ptr<UdpHandoffRecord>,
+        memory::UnorderedMap<UdpHandoffIdentity, std::shared_ptr<UdpHandoffRecord>,
                                         UdpHandoffIdentityHash>& records,
         const UdpHandoffIdentity& key,
         std::shared_ptr<const proxyman::inbound::ProtocolSettings> configuration,
@@ -629,7 +637,8 @@ public:
                 protected_until != Clock::time_point{} &&
                 protected_until < Clock::now()) {
                 try {
-                    auto record = memory::AllocateShared<UdpHandoffRecord>(policy);
+                    auto record = memory::AllocateShared<UdpHandoffRecord>(
+                        records.get_allocator().resource(), policy);
                     record->configuration = std::move(configuration);
                     found->second = std::move(record);
                 } catch (...) {
@@ -651,7 +660,8 @@ public:
             MaybeShrinkHashContainer(records);
             if (records.size() >= policy.capacity) return {};
         }
-        auto record = memory::AllocateShared<UdpHandoffRecord>(policy);
+        auto record = memory::AllocateShared<UdpHandoffRecord>(
+            records.get_allocator().resource(), policy);
         record->configuration = std::move(configuration);
         records.emplace(key, record);
         return record;
@@ -665,7 +675,7 @@ public:
     }
 
 private:
-    memory::ThreadLocalUnorderedMap<UdpHandoffIdentity, std::shared_ptr<UdpHandoffRecord>,
+    memory::UnorderedMap<UdpHandoffIdentity, std::shared_ptr<UdpHandoffRecord>,
                                     UdpHandoffIdentityHash> records_;
 };
 }  // namespace worker_detail

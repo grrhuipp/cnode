@@ -628,8 +628,8 @@ public:
                 }(*this, &worker);
             });
         ThrowIfStopping();
-        // The control thread may also hold short-lived PMR allocations.
-        memory::CollectBurst();
+        // The control thread owns no Worker pool, only process-layer state.
+        memory::CollectProcessHeap();
     }
 
     net::awaitable<void> RuntimeSamplingLoop() {

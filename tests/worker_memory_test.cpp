@@ -112,65 +112,62 @@ bool RunCollectReleasesEmptyPages() {
 }
 
 bool RunOwnershipAndPmr() {
-    auto& pool = ThreadMemoryPool();
-    const auto baseline = pool.OutstandingAllocations();
-    void* p = AllocatePmr(8192, 16);
-    if (!p || pool.OutstandingAllocations() != baseline + 1) return false;
+    Pool pool;
+    void* p = pool.Allocate(8192, 16);
+    if (!p || pool.OutstandingAllocations() != 1) return false;
     std::memset(p, 0xa5, 8192);
-    DeallocatePmr(p);
-    if (pool.OutstandingAllocations() != baseline) return false;
+    pool.Deallocate(p);
+    if (pool.OutstandingAllocations() != 0) return false;
     reject_next_pmr_allocation = true;
-    if (AllocatePmr(17) || reject_next_pmr_allocation) return false;
+    if (pool.Allocate(17, 16) || reject_next_pmr_allocation) return false;
     for (size_t alignment : {8u, 16u, 64u, 4096u}) {
-        p = AllocatePmr(17408, alignment);
+        p = pool.Allocate(17408, alignment);
         if (!p || reinterpret_cast<uintptr_t>(p) % alignment) return false;
-        DeallocatePmr(p);
+        ReleaseWorkerBlock(p);
     }
-    return pool.OutstandingAllocations() == baseline &&
-        !AllocatePmr(std::numeric_limits<size_t>::max());
+    return pool.OutstandingAllocations() == 0 &&
+        !pool.Allocate(std::numeric_limits<size_t>::max(), 16);
 }
 
 bool RunBuffer() {
     using ::buf::Buffer;
-    auto& pool = ThreadMemoryPool();
-    const auto baseline = pool.OutstandingAllocations();
+    Pool pool;
     std::array<Buffer*, 64> buffers{};
     for (auto& p : buffers) {
-        p = Buffer::New();
-        if (!p || p->Len() || p->HasUDP()) return false;
+        p = Buffer::New(pool);
+        if (!p || p->Len() || p->HasUDP() || &p->Pool() != &pool) return false;
         std::memset(p->data, 0x5a, Buffer::kSize);
         p->Produce(1);
     }
-    if (pool.OutstandingAllocations() != baseline + buffers.size()) return false;
+    if (pool.OutstandingAllocations() != buffers.size()) return false;
     Buffer::Free(buffers.back());
-    buffers.back() = Buffer::New();
+    buffers.back() = Buffer::New(pool);
     if (!buffers.back() || buffers.back()->Len() || buffers.back()->HasUDP()) return false;
     for (size_t i = 0; i + 1 < buffers.size(); ++i)
         if (!Intact(buffers[i]->data, Buffer::kSize, 0x5a)) return false;
     for (auto* p : buffers) Buffer::Free(p);
-    return pool.OutstandingAllocations() == baseline;
+    return pool.OutstandingAllocations() == 0;
 }
 
 bool RunSharedAllocation() {
     struct alignas(64) SharedObject final
-        : ThreadAllocated, std::enable_shared_from_this<SharedObject> {
+        : WorkerAllocated, std::enable_shared_from_this<SharedObject> {
         SharedObject(std::unique_ptr<int> payload, int& destroyed)
             : payload(std::move(payload)), destroyed(destroyed) {}
         ~SharedObject() { ++destroyed; }
         std::unique_ptr<int> payload;
         int& destroyed;
     };
-    struct ThrowingObject final : ThreadAllocated {
+    struct ThrowingObject final : WorkerAllocated {
         ThrowingObject() { throw std::runtime_error("construction failed"); }
     };
 
     Pool pool;
-    auto* previous = std::pmr::set_default_resource(&pool);
     int destroyed = 0;
     bool passed = true;
     std::weak_ptr<SharedObject> weak;
     {
-        auto object = AllocateShared<SharedObject>(std::make_unique<int>(42), destroyed);
+        auto object = AllocateShared<SharedObject>(pool.resource(), std::make_unique<int>(42), destroyed);
         weak = object;
         passed &= *object->payload == 42 &&
             reinterpret_cast<uintptr_t>(object.get()) % alignof(SharedObject) == 0 &&
@@ -183,12 +180,11 @@ bool RunSharedAllocation() {
 
     bool threw = false;
     try {
-        (void)AllocateShared<ThrowingObject>();
+        (void)AllocateShared<ThrowingObject>(pool.resource());
     } catch (const std::runtime_error&) {
         threw = true;
     }
     passed &= threw && pool.OutstandingAllocations() == 0;
-    std::pmr::set_default_resource(previous);
     return passed;
 }
 
@@ -253,10 +249,9 @@ struct AllocatorAwareEntry {
 
 bool RunSessionContextAndIdleDeque() {
     Pool worker;
-    auto* prev = std::pmr::set_default_resource(worker.resource());
     bool passed = true;
     {
-        ::session::Context ctx;
+        ::session::Context ctx(worker);
         passed &= ctx.inbound.tag.get_allocator().resource() == worker.resource() &&
             ctx.content.protocol.get_allocator().resource() == worker.resource();
         ctx.inbound.tag = "panel/multi-tier-arena-test/node-100/vless/443";
@@ -265,7 +260,7 @@ bool RunSessionContextAndIdleDeque() {
     }
     passed &= worker.OutstandingAllocations() == 0;
     {
-        ThreadLocalDeque<int> idle_deque(worker.resource());
+        RingDeque<int> idle_deque(worker.resource());
         passed &= worker.OutstandingAllocations() == 0 && idle_deque.capacity() == 0;
         for (int i = 0; i < 16; ++i) idle_deque.push_back(i);
         for (int i = 0; i < 16; ++i) {
@@ -275,7 +270,6 @@ bool RunSessionContextAndIdleDeque() {
         passed &= idle_deque.empty() && idle_deque.capacity() == 0 &&
             worker.OutstandingAllocations() == 0;
     }
-    std::pmr::set_default_resource(prev);
     return passed;
 }
 
@@ -303,9 +297,10 @@ bool RunCrossThreadRejection() {
         wrong.join();
     });
     const bool cross_thread_free = RejectsLeaseViolation([] {
-        void* block = AllocatePmr(256, 16);
+        worker_memory pool;
+        void* block = pool.Allocate(256, 16);
         if (!block) std::_Exit(1);
-        std::thread wrong([block] { DeallocatePmr(block); });
+        std::thread wrong([&pool, block] { pool.Deallocate(block); });
         wrong.join();
     });
     const bool foreign_pool_free = RejectsLeaseViolation([] {
@@ -336,7 +331,7 @@ bool RunAll() {
 }
 } // namespace
 
-TEST(ThreadMemoryPool, Contract) {
+TEST(WorkerMemory, Contract) {
     bool worker = false;
     std::thread thread([&] { worker = RunAll(); });
     thread.join();
@@ -345,7 +340,7 @@ TEST(ThreadMemoryPool, Contract) {
     { ASSERT_TRUE(worker && main); return; }
 }
 
-TEST(ThreadMemoryPool, NestedDequeMovePreservesDescendantsAndResourceOwnership) {
+TEST(WorkerMemory, NestedDequeMovePreservesDescendantsAndResourceOwnership) {
     CountingResource outer_resource;
     CountingResource child_resource;
     memory::RingDeque<NestedDequeEntry> queue(&outer_resource);
@@ -383,7 +378,7 @@ TEST(ThreadMemoryPool, NestedDequeMovePreservesDescendantsAndResourceOwnership) 
     EXPECT_EQ(child_resource.live_bytes, 0u);
 }
 
-TEST(ThreadMemoryPool, AllocatorAwareDequeGrowthPreservesPayloadsAcrossAllocationFailures) {
+TEST(WorkerMemory, AllocatorAwareDequeGrowthPreservesPayloadsAcrossAllocationFailures) {
     for (std::size_t allowance = 0; allowance <= 3; ++allowance) {
         SCOPED_TRACE(allowance);
         CountingResource resource;
@@ -412,7 +407,7 @@ TEST(ThreadMemoryPool, AllocatorAwareDequeGrowthPreservesPayloadsAcrossAllocatio
     }
 }
 
-TEST(ThreadMemoryPool, AllocatorAwareDequeShrinkPreservesPayloadsAndReclaimsStorage) {
+TEST(WorkerMemory, AllocatorAwareDequeShrinkPreservesPayloadsAndReclaimsStorage) {
     ASSERT_EXIT({
         CountingResource resource;
         memory::RingDeque<AllocatorAwareEntry> queue(&resource);
@@ -442,7 +437,7 @@ TEST(ThreadMemoryPool, AllocatorAwareDequeShrinkPreservesPayloadsAndReclaimsStor
     }, ::testing::ExitedWithCode(0), "");
 }
 
-TEST(ThreadMemoryPool, AllocatorAwareDequeInsertionKeepsDestinationResource) {
+TEST(WorkerMemory, AllocatorAwareDequeInsertionKeepsDestinationResource) {
     CountingResource source;
     CountingResource destination;
     {
@@ -465,10 +460,10 @@ TEST(ThreadMemoryPool, AllocatorAwareDequeInsertionKeepsDestinationResource) {
     EXPECT_EQ(destination.live, 0u);
 }
 
-TEST(ThreadMemoryPool, ByteVectorInsertPreservesReservedAndGrowingPrefixes) {
-    const auto baseline = memory::ThreadMemoryPool().OutstandingAllocations();
+TEST(WorkerMemory, ByteVectorInsertPreservesReservedAndGrowingPrefixes) {
+    Pool pool;
     {
-        memory::ThreadLocalVector<uint8_t> bytes;
+        memory::Vector<uint8_t> bytes(pool.resource());
         std::vector<uint8_t> expected;
         bytes.reserve(1024);
         for (const std::size_t count : {64u, 900u, 1024u, 16384u, 65536u}) {
@@ -479,22 +474,22 @@ TEST(ThreadMemoryPool, ByteVectorInsertPreservesReservedAndGrowingPrefixes) {
             expected.insert(expected.end(), input.begin(), input.end());
             ASSERT_EQ(bytes.size(), expected.size());
             EXPECT_TRUE(std::equal(expected.begin(), expected.end(), bytes.begin()));
-            EXPECT_EQ(bytes.get_allocator().resource(), memory::CurrentResource());
+            EXPECT_EQ(bytes.get_allocator().resource(), pool.resource());
         }
         bytes.clear();
         bytes.insert(bytes.end(), expected.begin(), expected.end());
         EXPECT_TRUE(std::equal(expected.begin(), expected.end(), bytes.begin(), bytes.end()));
     }
-    EXPECT_EQ(memory::ThreadMemoryPool().OutstandingAllocations(), baseline);
+    EXPECT_EQ(pool.OutstandingAllocations(), 0u);
 }
 
-TEST(ThreadMemoryPool, VectorPairAndMapConstructionPropagatesNestedAllocators) {
+TEST(WorkerMemory, VectorPairAndMapConstructionPropagatesNestedAllocators) {
     CountingResource destination;
     {
-        // The destination differs from CurrentResource(), so default construction
+        // The destination differs from the process layer, so default construction
         // cannot accidentally satisfy the propagation checks.
-        memory::ThreadLocalVector<AllocatorAwareEntry> entries{
-            memory::ThreadLocalAllocator<AllocatorAwareEntry>(&destination)};
+        memory::Vector<AllocatorAwareEntry> entries{
+            memory::Allocator<AllocatorAwareEntry>(&destination)};
         for (int value = 0; value < 20; ++value) entries.emplace_back(value);
         for (int value = 0; value < 20; ++value) {
             ASSERT_EQ(entries[value].payload.size(), 1u);
@@ -502,25 +497,25 @@ TEST(ThreadMemoryPool, VectorPairAndMapConstructionPropagatesNestedAllocators) {
             EXPECT_EQ(entries[value].payload.get_allocator().resource(), &destination);
         }
 
-        using Strings = memory::ThreadLocalVector<memory::ThreadLocalString>;
-        using Pair = std::pair<memory::ThreadLocalString, Strings>;
-        memory::ThreadLocalVector<Pair> pairs{memory::ThreadLocalAllocator<Pair>(&destination)};
+        using Strings = memory::Vector<memory::String>;
+        using Pair = std::pair<memory::String, Strings>;
+        memory::Vector<Pair> pairs{memory::Allocator<Pair>(&destination)};
         pairs.emplace_back(std::piecewise_construct,
             std::forward_as_tuple(80, 'p'), std::tuple<>{});
         pairs.front().second.emplace_back(90, 'v');
         pairs.push_back(pairs.front());
         for (const auto& pair : pairs) {
-            EXPECT_EQ(pair.first, memory::ThreadLocalString(80, 'p'));
+            EXPECT_EQ(pair.first, memory::String(80, 'p'));
             EXPECT_EQ(pair.first.get_allocator().resource(), &destination);
             EXPECT_EQ(pair.second.get_allocator().resource(), &destination);
             ASSERT_EQ(pair.second.size(), 1u);
-            EXPECT_EQ(pair.second.front(), memory::ThreadLocalString(90, 'v'));
+            EXPECT_EQ(pair.second.front(), memory::String(90, 'v'));
             EXPECT_EQ(pair.second.front().get_allocator().resource(), &destination);
         }
 
-        using Map = memory::ThreadLocalMap<memory::ThreadLocalString, Strings>;
+        using Map = memory::Map<memory::String, Strings>;
         Map map{Map::allocator_type(&destination)};
-        map.try_emplace(memory::ThreadLocalString(100, 'k')).first->second.emplace_back(110, 'x');
+        map.try_emplace(memory::String(100, 'k')).first->second.emplace_back(110, 'x');
         map.emplace(std::piecewise_construct,
             std::forward_as_tuple(120, 'm'), std::tuple<>{}).first->second.emplace_back(130, 'y');
         ASSERT_EQ(map.size(), 2u);
@@ -530,15 +525,15 @@ TEST(ThreadMemoryPool, VectorPairAndMapConstructionPropagatesNestedAllocators) {
             ASSERT_EQ(values.size(), 1u);
             EXPECT_EQ(values.front().get_allocator().resource(), &destination);
             const bool first = key.front() == 'k';
-            EXPECT_EQ(key, memory::ThreadLocalString(first ? 100 : 120, first ? 'k' : 'm'));
-            EXPECT_EQ(values.front(), memory::ThreadLocalString(first ? 110 : 130, first ? 'x' : 'y'));
+            EXPECT_EQ(key, memory::String(first ? 100 : 120, first ? 'k' : 'm'));
+            EXPECT_EQ(values.front(), memory::String(first ? 110 : 130, first ? 'x' : 'y'));
         }
     }
     EXPECT_EQ(destination.live, 0u);
     EXPECT_EQ(destination.allocations, destination.returns);
 }
 
-TEST(ThreadMemoryPool, TrivialCopyStillUsesAllocatorExtendedConstruction) {
+TEST(WorkerMemory, TrivialCopyStillUsesAllocatorExtendedConstruction) {
     struct Entry {
         using allocator_type = std::pmr::polymorphic_allocator<std::byte>;
         std::pmr::memory_resource* resource;
@@ -552,7 +547,7 @@ TEST(ThreadMemoryPool, TrivialCopyStillUsesAllocatorExtendedConstruction) {
     static_assert(std::uses_allocator_v<Entry, std::pmr::polymorphic_allocator<Entry>>);
     CountingResource destination;
     {
-        memory::ThreadLocalVector<Entry> entries{memory::ThreadLocalAllocator<Entry>(&destination)};
+        memory::Vector<Entry> entries{memory::Allocator<Entry>(&destination)};
         const Entry source(42);
         entries.push_back(source);
         entries.reserve(entries.capacity() + 1);

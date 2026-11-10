@@ -18,6 +18,11 @@ class ConstBufferSpanBuilder {
 public:
     static_assert(StackCapacity > 0);
 
+    // Spilled descriptors live in `resource`; none named means the process layer.
+    ConstBufferSpanBuilder() noexcept = default;
+    explicit ConstBufferSpanBuilder(std::pmr::memory_resource* resource) noexcept
+        : resource_(resource) {}
+
     void Append(net::const_buffer buffer) {
         if (buffer.size() == 0) {
             return;
@@ -108,7 +113,7 @@ private:
 
     void EnsureSpillCapacity(size_t additional) {
         const bool preparing = !spill_;
-        if (preparing) spill_.emplace();
+        if (preparing) spill_.emplace(resource_);
         // Keep the inline prefix visible until the spill is populated. Preparing
         // in place avoids copying the allocator's lifetime reference on a move.
         try {
@@ -133,8 +138,9 @@ private:
         }
     }
 
+    std::pmr::memory_resource* resource_ = nullptr;
     std::array<net::const_buffer, StackCapacity> stack_;
-    std::optional<memory::ThreadLocalVector<net::const_buffer>> spill_;
+    std::optional<memory::Vector<net::const_buffer>> spill_;
     size_t count_ = 0;
 };
 

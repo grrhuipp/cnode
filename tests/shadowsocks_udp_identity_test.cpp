@@ -8,6 +8,7 @@ using namespace ss_identity_test;
 
 class ShadowsocksUdpIdentity : public testing::Test {
 protected:
+    memory::worker_memory pool;
     const TargetAddress target{"127.0.0.1", 443};
     const std::array<uint8_t, 5> payload{0x17, 0x29, 0x41, 0, 0xff};
 
@@ -37,12 +38,12 @@ protected:
         return packet;
     }
 
-    static auto Decode(const std::vector<uint8_t>& packet,
-                       const UserStore::ShadowsocksUsersView& view,
-                       const ss::SsCipherInfo& cipher, ss::Ss2022UdpReplayCache& replay,
-                       bool deferred = false) {
+    auto Decode(const std::vector<uint8_t>& packet,
+                const UserStore::ShadowsocksUsersView& view,
+                const ss::SsCipherInfo& cipher, ss::Ss2022UdpReplayCache& replay,
+                bool deferred = false) {
         return ss::DecodeUdpPacket(packet.data(), packet.size(), view,
-            cipher.type, cipher.key_size, cipher.salt_size, replay, deferred);
+            cipher.type, cipher.key_size, cipher.salt_size, replay, deferred, pool);
     }
 
     void ExpectUser(const ss::SsUdpDecodeResult& decoded,

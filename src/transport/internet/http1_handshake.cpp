@@ -28,7 +28,8 @@ public:
     Http1BodyStream(std::unique_ptr<AsyncStream> inner,
                     const Http1ReadFraming& read_framing,
                     bool write_chunked)
-        : inner_(std::move(inner))
+        : AsyncStream(inner->Pool())
+        , inner_(std::move(inner))
         , read_chunked_(std::holds_alternative<Http1BodyChunked>(read_framing))
         , write_chunked_(write_chunked) {
         if (const auto* length = std::get_if<Http1BodyContentLength>(&read_framing)) {
@@ -351,7 +352,7 @@ private:
     }
 
     void ResetLine() noexcept {
-        memory::ThreadLocalString{}.swap(line_);
+        memory::String{}.swap(line_);
     }
 
     [[noreturn]] void FailBodyRead(const char* what) {
@@ -456,7 +457,7 @@ private:
     size_t chunk_remaining_ = 0;
     // Unread Content-Length body bytes; empty unless the body is so framed.
     std::optional<uint64_t> content_remaining_;
-    memory::ThreadLocalString line_;
+    memory::String line_;
     size_t chunk_terminator_bytes_ = 0;
     size_t trailer_lines_ = 0;
     size_t trailer_bytes_ = 0;
@@ -574,7 +575,7 @@ net::awaitable<tl::expected<void, ErrorCode>> ReadHttp1MessageHead(
                 stream.PrependReadMultiBuffer(std::move(mb));
             }
         } else {
-            head.storage = buf::BufferGuard{buf::Buffer::New()};
+            head.storage = buf::BufferGuard{buf::Buffer::New(stream.Pool())};
             if (!head.storage) {
                 co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
             }
@@ -877,7 +878,7 @@ std::string SanitizeHttpRequestLineForLog(const Http1RequestLine& line) {
     return out;
 }
 
-void AppendRequestStart(memory::ThreadLocalString& request,
+void AppendRequestStart(memory::String& request,
                         std::string_view method,
                         std::string_view path,
                         std::string_view host) {
@@ -890,7 +891,7 @@ void AppendRequestStart(memory::ThreadLocalString& request,
     request.append("\r\n");
 }
 
-void AppendHeaderLine(memory::ThreadLocalString& out,
+void AppendHeaderLine(memory::String& out,
                       std::string_view name,
                       std::string_view value) {
     out.append(name);
@@ -923,7 +924,7 @@ ExecuteHttp1UpgradeClientHandshake(
         }
     }
 
-    memory::ThreadLocalString request;
+    memory::String request;
     request.reserve(reserve_size);
     AppendRequestStart(request, "GET", req_path, host);
     request.append("Upgrade: websocket\r\n");
@@ -942,7 +943,7 @@ ExecuteHttp1UpgradeClientHandshake(
     request.append("\r\n");
 
     const bool write_ok = co_await WriteFullToStream(stream, request);
-    memory::ThreadLocalString{}.swap(request);
+    memory::String{}.swap(request);
     if (!write_ok) {
         LOG_CONN_DEBUG(conn_id, "{} client failed to send upgrade request", scope);
         co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
@@ -983,8 +984,9 @@ std::unique_ptr<AsyncStream> MakeHttp1BodyStream(
     Http1ReadFraming read_framing,
     bool write_chunked,
     buf::MultiBuffer&& read_ahead) {
-    auto body = std::make_unique<Http1BodyStream>(
-        std::move(inner), read_framing, write_chunked);
+    auto& pool = inner->Pool();
+    auto body = memory::MakeUnique<Http1BodyStream>(
+        pool, std::move(inner), read_framing, write_chunked);
     body->SetPendingMultiBuffer(std::move(read_ahead));
     return body;
 }
@@ -1041,7 +1043,7 @@ net::awaitable<TransportBuildResult> DoHttp1ServerHandshake(
 
     RecordExtractedRealIp(request, cfg.real_ip_header, transport_metadata);
 
-    memory::ThreadLocalString response;
+    memory::String response;
     response.reserve(96 + cfg.headers.size() * 32);
     response.append("HTTP/1.1 200 OK\r\n");
     response.append("Cache-Control: no-store\r\n");
@@ -1080,7 +1082,7 @@ net::awaitable<TransportBuildResult> DoHttp1ClientHandshake(
         }
     }
 
-    memory::ThreadLocalString request;
+    memory::String request;
     request.reserve(reserve_size);
     AppendRequestStart(request, method, req_path, host);
     for (const auto& [key, value] : cfg.headers) {
@@ -1094,7 +1096,7 @@ net::awaitable<TransportBuildResult> DoHttp1ClientHandshake(
         LOG_CONN_DEBUG(conn_id, "HTTP client failed to send request");
         co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
     }
-    memory::ThreadLocalString{}.swap(request);
+    memory::String{}.swap(request);
     if (auto response = co_await ReadClientResponse(*stream, "HTTP", conn_id, "200");
         !response) {
         co_return tl::unexpected(response.error());
@@ -1256,7 +1258,7 @@ net::awaitable<TransportBuildResult> DoWsServerHandshake(
     // 提取真实客户端 IP（CDN 透传头）
     RecordExtractedRealIp(request, ws_cfg.real_ip_header, transport_metadata);
 
-    memory::ThreadLocalString response;
+    memory::String response;
     response.reserve(128);
     response.append("HTTP/1.1 101 Switching Protocols\r\n"
                     "Upgrade: websocket\r\n"
@@ -1271,7 +1273,8 @@ net::awaitable<TransportBuildResult> DoWsServerHandshake(
     }
 
     // HTTP 头之后已读到的字节属于 WebSocket 帧流
-    auto ws = std::make_unique<BaseWsStream>(std::move(stream), false);
+    auto& pool = stream->Pool();
+    auto ws = memory::MakeUnique<BaseWsStream>(pool, std::move(stream), false);
     const size_t pending_bytes = head->ReadAhead().size();
     if (auto read_ahead = head->TakeReadAheadMultiBuffer(); !read_ahead.empty()) {
         ws->SetPendingMultiBuffer(std::move(read_ahead));

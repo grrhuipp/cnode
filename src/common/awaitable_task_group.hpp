@@ -84,7 +84,8 @@ public:
                transport::CancellationSource* source = nullptr) override {
         if (stopping_) throw IoSystemError(net::error::operation_aborted);
         // Acquired and released on the group's executor, never on its caller's.
-        auto child = memory::AllocateShared<Child>();
+        // Coroutine bookkeeping names no Worker pool: process layer.
+        auto child = memory::AllocateShared<Child>(nullptr);
         if (source) {
             child->Bind(*source);
             // Stop is delivered synchronously on subscription. Do not start
@@ -164,7 +165,7 @@ net::awaitable<void> Launch(net::any_io_executor executor, Start start) {
             using State = Group<decltype(handler)>;
             std::shared_ptr<State> state;
             try {
-                state = memory::AllocateShared<State>(executor, std::move(handler));
+                state = memory::AllocateShared<State>(nullptr, executor, std::move(handler));
             } catch (...) {
                 start.reset();
                 std::move(handler)(std::current_exception());
@@ -286,8 +287,8 @@ public:
 private:
     void EnsureStarted() {
         if (group_) return;
-        auto join = memory::AllocateShared<JoinState>(executor_);
-        auto group = memory::AllocateShared<Group>(executor_, Completion{join});
+        auto join = memory::AllocateShared<JoinState>(nullptr, executor_);
+        auto group = memory::AllocateShared<Group>(nullptr, executor_, Completion{join});
         join_ = std::move(join);
         group_ = std::move(group);
     }

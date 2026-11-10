@@ -309,6 +309,9 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
 }
 
 struct PlaintextScratch {
+    explicit PlaintextScratch(memory::worker_memory& pool) noexcept : pool(pool) {}
+
+    memory::worker_memory& pool;
     buf::BufferGuard pooled;
     memory::ByteVector large;
     size_t len = 0;
@@ -326,7 +329,7 @@ struct PlaintextScratch {
         len = size;
         if (size <= buf::Buffer::kSize) {
             if (!pooled) {
-                pooled = buf::BufferGuard{buf::Buffer::New()};
+                pooled = buf::BufferGuard{buf::Buffer::New(pool)};
                 if (!pooled) {
                     return nullptr;
                 }
@@ -367,7 +370,7 @@ struct PlaintextScratch {
             }
         }
         return buf::AppendSpanToMultiBuffer(
-            std::span<const uint8_t>(large.data() + offset, payload_len), out);
+            std::span<const uint8_t>(large.data() + offset, payload_len), out, pool);
     }
 };
 
@@ -393,7 +396,7 @@ struct PlaintextScratch {
     const auto full = scratch.Span();
     const size_t payload_offset = static_cast<size_t>(parsed.payload.data() - full.data());
     if (!scratch.MoveSuffixTo(payload_offset, result.payload) ||
-        !buf::SetUdpTarget(result.payload, result.target)) {
+        !buf::SetUdpTarget(result.payload, result.target, scratch.pool)) {
         return std::nullopt;
     }
     return result;
@@ -405,7 +408,8 @@ struct PlaintextScratch {
     const proxyman::inbound::UserStore::ShadowsocksUsersView& users,
     const SsCipherInfo& cipher_info,
     Ss2022UdpReplayCache& replay_cache,
-    bool deferred_replay) {
+    bool deferred_replay,
+    memory::worker_memory& pool) {
 
     constexpr size_t kMinBodyPlain = 1 + 8 + 2 + kMinSocks5AddressSize;
     if (datagram_len < kSs2022UdpSeparateHeaderSize +
@@ -424,7 +428,7 @@ struct PlaintextScratch {
             OPENSSL_cleanse(&bytes, sizeof(bytes));
         }
     } cleanse_headers{headers};
-    PlaintextScratch scratch;
+    PlaintextScratch scratch(pool);
     for (size_t group = 0; group < users.size();) {
         const auto& first = users[group];
         const bool has_identity = !first.identity_key.empty();
@@ -515,7 +519,8 @@ struct PlaintextScratch {
     size_t datagram_len,
     const proxyman::inbound::UserStore::ShadowsocksUsersView& users,
     Ss2022UdpReplayCache& replay_cache,
-    bool deferred_replay) {
+    bool deferred_replay,
+    memory::worker_memory& pool) {
 
     constexpr size_t kMinPlain =
         kSs2022UdpSessionIdSize + kSs2022UdpPacketIdSize + 1 + 8 + 2 + kMinSocks5AddressSize;
@@ -528,7 +533,7 @@ struct PlaintextScratch {
     const uint8_t* ciphertext = datagram + nonce.size();
     const size_t ciphertext_len = datagram_len - nonce.size();
 
-    PlaintextScratch scratch;
+    PlaintextScratch scratch(pool);
     uint8_t* plain_dst = scratch.Prepare(ciphertext_len - SsAeadCipher::kTagSize);
     if (!plain_dst) {
         return std::nullopt;
@@ -962,7 +967,8 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacket(
     size_t key_size,
     size_t salt_size,
     Ss2022UdpReplayCache& replay_cache,
-    bool deferred_replay) {
+    bool deferred_replay,
+    memory::worker_memory& pool) {
 
     if (users.empty()) {
         return std::nullopt;
@@ -971,11 +977,11 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacket(
     const SsCipherInfo cipher_info{cipher_type, key_size, salt_size};
     if (Is2022AesCipher(cipher_type)) {
         return Decode2022UdpAesRequest(
-            datagram, datagram_len, users, cipher_info, replay_cache, deferred_replay);
+            datagram, datagram_len, users, cipher_info, replay_cache, deferred_replay, pool);
     }
     if (cipher_type == SsCipherType::CHACHA20_POLY1305_2022) {
         return Decode2022UdpChachaRequest(
-            datagram, datagram_len, users, replay_cache, deferred_replay);
+            datagram, datagram_len, users, replay_cache, deferred_replay, pool);
     }
 
     if (key_size > 64 || salt_size > 64) {
@@ -990,7 +996,7 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacket(
     const uint8_t* cipher = datagram + salt_size;
     const size_t cipherlen = datagram_len - salt_size;
     const size_t plaintext_len = cipherlen - SsAeadCipher::kTagSize;
-    PlaintextScratch scratch;
+    PlaintextScratch scratch(pool);
     uint8_t* plain_dst = scratch.Prepare(plaintext_len);
     if (!plain_dst) {
         return std::nullopt;
@@ -1032,7 +1038,7 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacket(
 
         const size_t payload_offset = std::min(addr.consumed, plaintext_len);
         if (!scratch.MoveSuffixTo(payload_offset, result.payload) ||
-            !buf::SetUdpTarget(result.payload, result.target)) {
+            !buf::SetUdpTarget(result.payload, result.target, pool)) {
             return std::nullopt;
         }
 
@@ -1076,7 +1082,8 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacketWithKey(
     std::span<const uint8_t> master_key,
     SsCipherType cipher_type,
     size_t key_size,
-    size_t salt_size) {
+    size_t salt_size,
+    memory::worker_memory& pool) {
 
     if (Is2022Cipher(cipher_type) ||
         key_size > 64 || salt_size > 64 ||
@@ -1100,7 +1107,7 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacketWithKey(
         return std::nullopt;
     }
 
-    PlaintextScratch scratch;
+    PlaintextScratch scratch(pool);
     uint8_t* plain_dst = scratch.Prepare(plaintext_len);
     if (!plain_dst) {
         OPENSSL_cleanse(subkey.data(), subkey.size());
@@ -1130,7 +1137,7 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacketWithKey(
 
     const size_t payload_offset = std::min(addr.consumed, plaintext_len);
     if (!scratch.MoveSuffixTo(payload_offset, result.payload) ||
-        !buf::SetUdpTarget(result.payload, result.target)) {
+        !buf::SetUdpTarget(result.payload, result.target, pool)) {
         return std::nullopt;
     }
     return result;
@@ -1197,13 +1204,14 @@ size_t Encode2022UdpResponsePacketTo(
 std::optional<SsUdpDecodeResult> Decode2022UdpResponsePacket(
     const uint8_t* datagram,
     size_t datagram_len,
-    Ss2022UdpSessionState& state) {
+    Ss2022UdpSessionState& state,
+    memory::worker_memory& pool) {
 
     if (!Is2022Cipher(state.cipher_info.type) || state.key.empty()) {
         return std::nullopt;
     }
 
-    PlaintextScratch scratch;
+    PlaintextScratch scratch(pool);
     std::span<const uint8_t> body_span;
     std::array<uint8_t, kSs2022UdpSessionIdSize> server_session_id{};
     uint64_t packet_id = 0;
@@ -1293,7 +1301,7 @@ std::optional<SsUdpDecodeResult> Decode2022UdpResponsePacket(
     const size_t payload_offset = static_cast<size_t>(
         parsed->payload.data() - scratch.Span().data());
     if (!scratch.MoveSuffixTo(payload_offset, result.payload) ||
-        !buf::SetUdpTarget(result.payload, result.target)) {
+        !buf::SetUdpTarget(result.payload, result.target, pool)) {
         return std::nullopt;
     }
     return result;

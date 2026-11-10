@@ -119,8 +119,9 @@ const bool kBlackholeRegistered = (::proxyman::outbound::RegisterProxy(
                 +[](std::string_view /*tag*/,
                     std::shared_ptr<const ::proxy::blackhole::outbound::BlackholeSettings> s,
                     ::net::io_context& /*io_context*/,
-                    ::AwaitableTaskGroup& /*tasks*/) -> std::unique_ptr<::Outbound> {
-                    return std::make_unique<::proxy::blackhole::outbound::Handler>(*s);
+                    ::AwaitableTaskGroup& /*tasks*/,
+                    memory::worker_memory& pool) -> std::unique_ptr<::Outbound> {
+                    return memory::MakeUnique<::proxy::blackhole::outbound::Handler>(pool, *s);
                 }>(std::move(settings)),
             .sender = {},
         };

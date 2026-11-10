@@ -159,7 +159,7 @@ struct Handler::PaddingState {
     std::shared_ptr<const PaddingScheme> scheme{DefaultPaddingScheme()};
 };
 
-struct Handler::ClientSession : memory::ThreadAllocated {
+struct Handler::ClientSession : memory::WorkerAllocated {
     class LogicalStream final {
     public:
         explicit LogicalStream(net::any_io_executor executor)
@@ -333,7 +333,7 @@ struct Handler::ClientSession : memory::ThreadAllocated {
     uint32_t packet_index = 1;
     std::optional<SessionVersion> session_version;
     transport::internet::AsyncWriteGate write_gate;
-    ::memory::ThreadLocalUnorderedMap<
+    ::memory::UnorderedMap<
         uint32_t,
         std::weak_ptr<LogicalStream>>
         logical_streams;
@@ -373,7 +373,7 @@ struct Handler::ClientSession : memory::ThreadAllocated {
 
     std::shared_ptr<LogicalStream> RegisterLogicalStream(uint32_t sid) {
         auto logical = memory::AllocateShared<LogicalStream>(
-            net::any_io_executor(io_context_.get_executor()));
+            stream->Pool().resource(), net::any_io_executor(io_context_.get_executor()));
         logical_streams[sid] = logical;
         return logical;
     }
@@ -390,7 +390,7 @@ struct Handler::ClientSession : memory::ThreadAllocated {
         write_gate.Cancel();
         auto streams = std::exchange(
             logical_streams,
-            ::memory::ThreadLocalUnorderedMap<uint32_t, std::weak_ptr<LogicalStream>>{
+            ::memory::UnorderedMap<uint32_t, std::weak_ptr<LogicalStream>>{
                 logical_streams.get_allocator()});
         for (auto& [sid, weak] : streams) {
             (void)sid;
@@ -577,7 +577,8 @@ struct Handler::ClientSession : memory::ThreadAllocated {
                                 co_return;
                             }
                             if (auto parsed = ParsePaddingScheme(*text)) {
-                                scheme_ = memory::AllocateShared<const PaddingScheme>(std::move(*parsed));
+                                scheme_ = memory::AllocateShared<const PaddingScheme>(
+                                    stream->Pool().resource(), std::move(*parsed));
                                 padding_state_->Publish(scheme_);
                             }
                         }
@@ -788,7 +789,7 @@ public:
     void Retire() noexcept {
         retired_ = true;
         Cancel();
-        memory::ThreadLocalVector<Entry> closing(entries_.get_allocator());
+        memory::Vector<Entry> closing(entries_.get_allocator());
         closing.swap(entries_);
         for (const auto& entry : closing) Close(entry.session);
     }
@@ -884,7 +885,7 @@ private:
     void StopIfEmpty() noexcept {
         if (!entries_.empty()) return;
         Cancel();
-        memory::ThreadLocalVector<Entry>{entries_.get_allocator()}.swap(entries_);
+        memory::Vector<Entry>{entries_.get_allocator()}.swap(entries_);
     }
 
     void Schedule() {
@@ -913,8 +914,8 @@ private:
     const Clock::duration check_interval_;
     const Clock::duration idle_timeout_;
     const size_t minimum_idle_;
-    const memory::ThreadLocalString tag_;
-    memory::ThreadLocalVector<Entry> entries_;
+    const memory::String tag_;
+    memory::Vector<Entry> entries_;
     bool retired_ = false;
     std::exception_ptr failure_;
 };
@@ -1080,15 +1081,17 @@ tl::expected<memory::ByteVector, ErrorCode> BuildOpenPacket(
 }  // namespace
 
 
-Handler::Handler(std::string_view tag,
+Handler::Handler(memory::worker_memory& pool,
+                 std::string_view tag,
                  net::io_context& io_context,
                  std::shared_ptr<const Settings> settings,
                  AwaitableTaskGroup& tasks)
-    : tag_(tag)
+    : worker_pool_(pool)
+    , tag_(tag)
     , settings_(std::move(settings))
-    , padding_(memory::AllocateShared<PaddingState>())
+    , padding_(memory::AllocateShared<PaddingState>(pool.resource()))
     , pool_(memory::AllocateShared<SessionPool>(
-          io_context, tasks, settings_->idle_session_check_interval,
+          pool.resource(), io_context, tasks, settings_->idle_session_check_interval,
           settings_->idle_session_timeout, settings_->min_idle_sessions, tag_)) {}
 
 Handler::~Handler() noexcept {
@@ -1137,7 +1140,8 @@ net::awaitable<OutboundProcessResult> Handler::Process(
                 result = tl::unexpected(dialed.error());
             } else {
                 session = memory::AllocateShared<ClientSession>(
-                    dialer.IoContext(), std::move(*dialed), padding_, std::move(opening_scheme));
+                    worker_pool_.resource(), dialer.IoContext(), std::move(*dialed), padding_,
+                    std::move(opening_scheme));
                 transport_lease = pool_->Adopt(session);
             }
         }
@@ -1340,7 +1344,7 @@ net::awaitable<OutboundProcessResult> Handler::ProcessSession(
 
     if (is_udp) {
         proxy::uot::FramedEndpoint uot_endpoint(
-            target_endpoint, true, original_target);
+            ctx.pool, target_endpoint, true, original_target);
         result = co_await relay_endpoint(uot_endpoint);
     } else {
         result = co_await relay_endpoint(target_endpoint);
@@ -1386,8 +1390,9 @@ const bool kOutboundRegistered = (::proxyman::outbound::RegisterProxy(
                 +[](std::string_view tag,
                     std::shared_ptr<const Settings> state,
                     ::net::io_context& io_context,
-                    ::AwaitableTaskGroup& tasks) -> std::unique_ptr<::Outbound> {
-                    return std::make_unique<::proxy::anytls::outbound::Handler>(
+                    ::AwaitableTaskGroup& tasks,
+                    memory::worker_memory& pool) -> std::unique_ptr<::Outbound> {
+                    return memory::MakeUnique<::proxy::anytls::outbound::Handler>(pool, pool,
                         tag, io_context, std::move(state), tasks);
                 }>(std::move(*settings)),
             .sender = ::OutboundSenderSettings{

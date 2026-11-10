@@ -240,12 +240,13 @@ const bool kTrojanInboundRegistered = [] {
         [](::proxyman::inbound::ProtocolRuntime& runtime,
            ::StatsShard& stats,
            ::ConnectionLimiter* limiter,
-           const ::proxyman::inbound::BuildRequest&) -> std::unique_ptr<::Inbound> {
+           const ::proxyman::inbound::BuildRequest&,
+           memory::worker_memory& pool) -> std::unique_ptr<::Inbound> {
             auto* tracker = runtime.OnlineTracker();
             if (!tracker) {
                 return nullptr;
             }
-            return std::make_unique<::proxy::trojan::inbound::Handler>(
+            return memory::MakeUnique<::proxy::trojan::inbound::Handler>(pool,
                 *tracker,
                 stats,
                 limiter);

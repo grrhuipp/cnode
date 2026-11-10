@@ -146,22 +146,23 @@ TEST_P(ProtocolDomainTest, TrojanUdpFrame) {
     constexpr std::array<uint8_t, 12> next_frame{
         1, 127, 0, 0, 1, 0, 53, 0, 1, '\r', '\n', 0x42};
     wire.insert(wire.end(), next_frame.begin(), next_frame.end());
-    trojan::UdpFramer framer;
+    memory::worker_memory pool;
+    trojan::UdpFramer framer(pool);
     trojan::FramedUdpPacket packet;
     if (!domain.accepted) {
         buf::MultiBuffer input;
-        ASSERT_TRUE(buf::AppendSpanToMultiBuffer(wire, input));
+        ASSERT_TRUE(buf::AppendSpanToMultiBuffer(wire, input, pool));
         framer.Feed(std::move(input));
         EXPECT_THROW((void)framer.Next(packet), IoSystemError);
         return;
     }
 
     buf::MultiBuffer prefix;
-    ASSERT_TRUE(buf::AppendSpanToMultiBuffer(std::span(wire).first(split), prefix));
+    ASSERT_TRUE(buf::AppendSpanToMultiBuffer(std::span(wire).first(split), prefix, pool));
     framer.Feed(std::move(prefix));
     EXPECT_FALSE(framer.Next(packet));
     buf::MultiBuffer remainder;
-    ASSERT_TRUE(buf::AppendSpanToMultiBuffer(std::span(wire).subspan(split), remainder));
+    ASSERT_TRUE(buf::AppendSpanToMultiBuffer(std::span(wire).subspan(split), remainder, pool));
     framer.Feed(std::move(remainder));
     ASSERT_TRUE(framer.Next(packet));
     ExpectTarget(packet.target, domain);

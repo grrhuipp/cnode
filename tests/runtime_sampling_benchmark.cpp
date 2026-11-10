@@ -41,7 +41,7 @@ TEST_P(RuntimeSamplingBenchmark, EstablishedVlessSessions) {
             (void)fixture.worker.CollectRuntimeStats(resources);
         std::vector<double> latency(rounds);
         const auto warm_rss = ResidentBytes();
-        const auto before = memory::ThreadMemoryPool().GetFootprint();
+        const auto before = fixture.worker.Pool().GetFootprint();
         benchmark::AllocationCounts counts;
         const auto cpu_start = CpuNanoseconds();
         const auto start = std::chrono::steady_clock::now();
@@ -61,7 +61,7 @@ TEST_P(RuntimeSamplingBenchmark, EstablishedVlessSessions) {
         }
         const auto finish = std::chrono::steady_clock::now();
         const auto cpu_finish = CpuNanoseconds();
-        const auto after = memory::ThreadMemoryPool().GetFootprint();
+        const auto after = fixture.worker.Pool().GetFootprint();
         const auto after_rss = ResidentBytes();
         const auto process_memory = benchmark::ReadProcessMemory();
         std::sort(latency.begin(), latency.end());

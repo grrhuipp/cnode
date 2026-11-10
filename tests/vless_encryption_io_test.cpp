@@ -40,6 +40,7 @@ static_assert(!std::is_move_assignable_v<vless::VlessEncryptionWriter>);
 
 
 
+
 [[noreturn]] void Fail(std::string_view message) {
     std::cerr << message << '\n';
     ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed");
@@ -89,11 +90,12 @@ public:
 
 class InterruptedReader final : public transport::MultiBufferReader {
 public:
-    InterruptedReader(const std::vector<uint8_t>& bytes,
+    InterruptedReader(memory::worker_memory& pool,
+                      const std::vector<uint8_t>& bytes,
                       std::vector<size_t> cutpoints,
                       net::cancellation_signal& signal,
                       bool empty_on_cancel)
-        : bytes_(bytes), cutpoints_(std::move(cutpoints)), signal_(signal),
+        : pool_(pool), bytes_(bytes), cutpoints_(std::move(cutpoints)), signal_(signal),
           empty_on_cancel_(empty_on_cancel) {}
 
     transport::CancellationSource& Cancellation() noexcept override {
@@ -137,7 +139,7 @@ public:
         buf::MultiBuffer out;
         Check(buf::AppendSpanToMultiBuffer(
                   std::span<const uint8_t>(bytes_.data() + offset_, end - offset_),
-                  out),
+                  out, pool_),
               "failed to allocate encrypted input fragment");
         offset_ = end;
         co_return out;
@@ -145,6 +147,7 @@ public:
 
 private:
     transport::CancellationSource cancellation_;
+    memory::worker_memory& pool_;
     const std::vector<uint8_t>& bytes_;
     std::vector<size_t> cutpoints_;
     net::cancellation_signal& signal_;
@@ -169,6 +172,7 @@ void RunResumeCase(vless::VlessEncryptionAeadCipher cipher,
                    bool header_xor,
                    bool empty_on_cancel,
                    bool lazy_context) {
+    memory::worker_memory pool;
     net::io_context io;
     net::cancellation_signal signal;
     const auto exercise = [&]() -> net::awaitable<void> {
@@ -193,7 +197,7 @@ void RunResumeCase(vless::VlessEncryptionAeadCipher cipher,
             capture.bytes.insert(capture.bytes.end(), context.begin(), context.end());
         }
         std::optional<vless::VlessEncryptionWriter> writer;
-        writer.emplace(capture, create_aead(), key,
+        writer.emplace(pool, capture, create_aead(), key,
                        MakeHeaderXor(header_xor, key.bytes, context));
         std::array<size_t, 5> boundaries{};
         for (size_t record = 0; record < plaintext.size(); ++record) {
@@ -227,11 +231,11 @@ void RunResumeCase(vless::VlessEncryptionAeadCipher cipher,
             body + 1, body + plaintext[1].size() / 2,
             boundaries[2] - 1,
         });
-        InterruptedReader source(capture.bytes, cutpoints, signal, empty_on_cancel);
+        InterruptedReader source(pool, capture.bytes, cutpoints, signal, empty_on_cancel);
         vless::VlessEncryptionTicketRejection rejection;
         std::optional<vless::VlessEncryptionReader> reader;
         if (lazy_context) {
-            reader.emplace(source,
+            reader.emplace(pool, source,
                            vless::VlessEncryptionDeferredRead{
                                .cipher = cipher,
                                .header_xor = header_xor,
@@ -239,7 +243,7 @@ void RunResumeCase(vless::VlessEncryptionAeadCipher cipher,
                            },
                            key, std::nullopt);
         } else {
-            reader.emplace(source, create_aead(), key,
+            reader.emplace(pool, source, create_aead(), key,
                            MakeHeaderXor(header_xor, key.bytes, context));
         }
 
@@ -303,6 +307,7 @@ void RunResumeCase(vless::VlessEncryptionAeadCipher cipher,
 void RunDeferredRejectionCase(vless::VlessEncryptionAeadCipher cipher,
                               bool header_xor,
                               unsigned boundary) {
+    memory::worker_memory pool;
     net::io_context io;
     net::cancellation_signal signal;
     const auto exercise = [&]() -> net::awaitable<void> {
@@ -313,7 +318,7 @@ void RunDeferredRejectionCase(vless::VlessEncryptionAeadCipher cipher,
         CaptureWriter capture;
         capture.bytes.insert(capture.bytes.end(), context.begin(), context.end());
         vless::VlessEncryptionWriter writer(
-            capture, std::move(*aead), key,
+            pool, capture, std::move(*aead), key,
             MakeHeaderXor(header_xor, key.bytes, context));
         constexpr std::string_view payload = "authenticated-ticket-response";
         const net::const_buffer buffer(payload.data(), payload.size());
@@ -327,10 +332,10 @@ void RunDeferredRejectionCase(vless::VlessEncryptionAeadCipher cipher,
             case 5: capture.bytes.back() ^= 1; break;
             case 6: break;
         }
-        InterruptedReader source(capture.bytes, {}, signal, false);
+        InterruptedReader source(pool, capture.bytes, {}, signal, false);
         vless::VlessEncryptionTicketRejection rejection;
         vless::VlessEncryptionReader reader(
-            source,
+            pool, source,
             vless::VlessEncryptionDeferredRead{
                 .cipher = cipher,
                 .header_xor = header_xor,
@@ -423,6 +428,7 @@ private:
 
 void RunWriterFailureCase(vless::VlessEncryptionAeadCipher cipher,
                           bool header_xor, WriteFault fault) {
+    memory::worker_memory pool;
     net::io_context io;
     net::cancellation_signal signal;
     const auto exercise = [&]() -> net::awaitable<void> {
@@ -432,7 +438,7 @@ void RunWriterFailureCase(vless::VlessEncryptionAeadCipher cipher,
         Check(aead.has_value(), "failed to create faulting writer AEAD");
         InterruptedWriter destination(fault, signal);
         vless::VlessEncryptionWriter writer(
-            destination, std::move(*aead), key,
+            pool, destination, std::move(*aead), key,
             MakeHeaderXor(header_xor, key.bytes, context));
         constexpr std::string_view payload = "encrypted-write-lifecycle";
         const net::const_buffer buffer(payload.data(), payload.size());
@@ -472,6 +478,7 @@ void RunWriterFailureCase(vless::VlessEncryptionAeadCipher cipher,
 
 void RunWriterShutdownCase(vless::VlessEncryptionAeadCipher cipher,
                            bool header_xor) {
+    memory::worker_memory pool;
     net::io_context io;
     const auto exercise = [&]() -> net::awaitable<void> {
         const std::array<uint8_t, vless::kVlessEncryptionCtrIvSize> context{};
@@ -480,7 +487,7 @@ void RunWriterShutdownCase(vless::VlessEncryptionAeadCipher cipher,
         Check(aead.has_value(), "failed to create shutdown writer AEAD");
         CaptureWriter destination;
         vless::VlessEncryptionWriter writer(
-            destination, std::move(*aead), key,
+            pool, destination, std::move(*aead), key,
             MakeHeaderXor(header_xor, key.bytes, context));
         constexpr std::string_view payload = "before-write-shutdown";
         const net::const_buffer buffer(payload.data(), payload.size());
@@ -507,6 +514,7 @@ void RunWriterShutdownCase(vless::VlessEncryptionAeadCipher cipher,
 
 void RunWriterPrecancelCase(vless::VlessEncryptionAeadCipher cipher,
                             bool header_xor) {
+    memory::worker_memory pool;
     net::io_context io;
     net::cancellation_signal signal;
     const auto exercise = [&]() -> net::awaitable<void> {
@@ -518,7 +526,7 @@ void RunWriterPrecancelCase(vless::VlessEncryptionAeadCipher cipher,
               "failed to create pre-cancel writer AEAD");
         CaptureWriter destination;
         vless::VlessEncryptionWriter writer(
-            destination, std::move(*aead), key,
+            pool, destination, std::move(*aead), key,
             MakeHeaderXor(header_xor, key.bytes, context));
         constexpr std::string_view payload = "recoverable-before-record-start";
         const net::const_buffer buffer(payload.data(), payload.size());
@@ -537,9 +545,9 @@ void RunWriterPrecancelCase(vless::VlessEncryptionAeadCipher cipher,
         co_await net::this_coro::reset_cancellation_state();
         co_await writer.WriteBuffers(
             std::span<const net::const_buffer>(&buffer, 1));
-        InterruptedReader source(destination.bytes, {}, signal, false);
+        InterruptedReader source(pool, destination.bytes, {}, signal, false);
         vless::VlessEncryptionReader reader(
-            source, std::move(*read_aead), key,
+            pool, source, std::move(*read_aead), key,
             MakeHeaderXor(header_xor, key.bytes, context));
         const auto decoded = Flatten(co_await reader.ReadMultiBuffer());
         Check(std::string_view(reinterpret_cast<const char*>(decoded.data()),

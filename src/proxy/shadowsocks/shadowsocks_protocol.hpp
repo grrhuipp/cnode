@@ -206,7 +206,8 @@ inline void EncryptToMultiBuffer(SsAeadCipher& cipher,
                                  uint64_t& nonce,
                                  std::span<const uint8_t> bytes,
                                  buf::MultiBuffer& out_mb,
-                                 size_t* skip_first_bytes = nullptr) {
+                                 size_t* skip_first_bytes,
+                                 memory::worker_memory& pool) {
     static constexpr size_t kLenHeaderSize = 2 + SsAeadCipher::kTagSize;
 
     const uint8_t* data = bytes.data();
@@ -223,7 +224,7 @@ inline void EncryptToMultiBuffer(SsAeadCipher& cipher,
 
     while (remaining > 0) {
         const size_t chunk_size = std::min(remaining, kStreamChunkPayloadSize);
-        buf::BufferGuard out{buf::Buffer::New()};
+        buf::BufferGuard out{buf::Buffer::New(pool)};
         if (!out) {
             throw std::bad_alloc();
         }
@@ -279,7 +280,8 @@ inline void EncryptToMultiBuffer(SsAeadCipher& cipher,
         if (payload_len != 0) output.push_back(std::move(block));
         return true;
     }
-    buf::ContiguousWriteBuffer plaintext;
+    // Fragmented input always owns at least the tag bytes, so it has a pool.
+    buf::ContiguousWriteBuffer plaintext(*ciphertext.OwnerPool());
     auto* bytes = plaintext.Prepare(wire_size);
     ciphertext.CopyPrefixTo({bytes, wire_size});
     ciphertext.clear();
@@ -298,7 +300,7 @@ ReadAndDecryptStreamPayload(
     buf::MultiBuffer ciphertext;
     size_t remaining = payload_len;
     while (remaining > 0) {
-        buf::BufferGuard block{buf::Buffer::New()};
+        buf::BufferGuard block{buf::Buffer::New(stream.Pool())};
         if (!block) co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
         const size_t count = std::min(remaining, size_t(block->Available()));
         if (!co_await ReadFull(stream, block->Tail().data(), count))
@@ -310,7 +312,7 @@ ReadAndDecryptStreamPayload(
     std::array<uint8_t, SsAeadCipher::kTagSize> tag{};
     if (!co_await ReadFull(stream, tag.data(), tag.size()))
         co_return tl::unexpected(ErrorCode::SOCKET_READ_FAILED);
-    if (!buf::AppendSpanToMultiBuffer(tag, ciphertext))
+    if (!buf::AppendSpanToMultiBuffer(tag, ciphertext, stream.Pool()))
         co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
     if (!DecryptStreamPayload(cipher, nonce, std::move(ciphertext), output))
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);

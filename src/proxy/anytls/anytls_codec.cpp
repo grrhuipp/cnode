@@ -249,8 +249,8 @@ tl::expected<PeerSettings, ErrorCode> ParsePeerSettings(std::string_view text) {
     return result;
 }
 
-memory::ThreadLocalString ClientSettings(const PaddingScheme& scheme) {
-    memory::ThreadLocalString settings;
+memory::String ClientSettings(const PaddingScheme& scheme) {
+    memory::String settings;
     const auto& digest = scheme.Digest();
     settings.reserve(28 + digest.size());
     settings.append("v=2\nclient=cnode\npadding-md5=");
@@ -498,9 +498,9 @@ ReadFrameHeader(AsyncStream& stream) {
     co_return out;
 }
 
-net::awaitable<tl::expected<memory::ThreadLocalString, ErrorCode>>
+net::awaitable<tl::expected<memory::String, ErrorCode>>
 ReadFrameText(AsyncStream& stream, uint16_t length) {
-    memory::ThreadLocalString text(length, '\0');
+    memory::String text(length, '\0');
     if (auto ok = co_await ReadExact(
             stream,
             std::span<uint8_t>(reinterpret_cast<uint8_t*>(text.data()), length));
@@ -531,7 +531,7 @@ ReadFramePayload(AsyncStream& stream, uint16_t length) {
     buf::MultiBuffer mb;
     size_t remaining = length;
     while (remaining > 0) {
-        buf::BufferGuard buffer{buf::Buffer::New()};
+        buf::BufferGuard buffer{buf::Buffer::New(stream.Pool())};
         if (!buffer) {
             co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
         }

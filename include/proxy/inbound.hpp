@@ -147,7 +147,7 @@ struct InboundDatagramAssociationKeyHash {
 
 // One index per listener on its receiving Worker. Entries borrow the state
 // owned by a live association row; detached/prepared rows carry null entries.
-using InboundDatagramAssociationIndex = memory::ThreadLocalUnorderedMap<
+using InboundDatagramAssociationIndex = memory::UnorderedMap<
     InboundDatagramAssociationKey, InboundDatagramAssociation*,
     InboundDatagramAssociationKeyHash>;
 
@@ -187,7 +187,7 @@ struct InboundDatagramResult {
 //   - VMessInbound: Process 解析 AEAD 头后提交 session::Context 给 dispatcher
 //   - TrojanInbound: Process 解析 SHA224+目标后提交 session::Context 给 dispatcher
 // ============================================================================
-class Inbound : public memory::ThreadAllocated {
+class Inbound : public memory::WorkerAllocated {
 public:
     virtual ~Inbound() noexcept = default;
 

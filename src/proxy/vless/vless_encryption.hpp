@@ -625,7 +625,8 @@ public:
     transport::EofAction ReadEofAction() const noexcept override { return src_.ReadEofAction(); }
 
     // A deferred read side must not come with a header XOR; it derives its own.
-    VlessEncryptionReader(transport::MultiBufferReader& src,
+    VlessEncryptionReader(memory::worker_memory& pool,
+                          transport::MultiBufferReader& src,
                           VlessEncryptionReadKeys keys,
                           const VlessEncryptionUnitedKey& united_key,
                           std::optional<VlessEncryptionHeaderXor>
@@ -658,7 +659,8 @@ private:
 
 class VlessEncryptionWriter final : public transport::MultiBufferWriter {
 public:
-    VlessEncryptionWriter(transport::MultiBufferWriter& dst,
+    VlessEncryptionWriter(memory::worker_memory& pool,
+                          transport::MultiBufferWriter& dst,
                           VlessEncryptionAead aead,
                           const VlessEncryptionUnitedKey& united_key,
                           std::optional<VlessEncryptionHeaderXor>
@@ -683,6 +685,7 @@ private:
     template <typename BufferRange>
     net::awaitable<void> WriteEncrypted(BufferRange source);
 
+    memory::worker_memory& pool_;
     transport::MultiBufferWriter& dst_;
     VlessEncryptionAead aead_;
     VlessEncryptionUnitedKey united_key_;
@@ -722,8 +725,9 @@ using VlessEncryptionHandshakeResult =
 // Record layer installed over the raw connection after a completed handshake.
 // `plain_reader` borrows `reader` and both borrow the raw endpoints, so the
 // owner is address-stable and must outlive every borrowed raw endpoint use.
-struct VlessEncryptedIo : memory::ThreadAllocated {
-    VlessEncryptedIo(VlessBufferedReader& raw_reader,
+struct VlessEncryptedIo : memory::WorkerAllocated {
+    VlessEncryptedIo(memory::worker_memory& pool,
+                     VlessBufferedReader& raw_reader,
                      transport::MultiBufferWriter& raw_writer,
                      VlessEncryptionRuntime runtime);
 
@@ -811,19 +815,19 @@ private:
         VlessEncryptionPfsKey pfs_key;
         std::chrono::steady_clock::time_point expires_at{};
         std::optional<std::array<uint8_t, 16>> identity;
-        memory::ThreadLocalUnorderedSet<NfsKeyDigest, KeyedHash, ConstantTimeEqual>
+        memory::UnorderedSet<NfsKeyDigest, KeyedHash, ConstantTimeEqual>
             seen_nfs_keys;
     };
 
     using SessionMap =
-        memory::ThreadLocalUnorderedMap<TicketArray, Session, KeyedHash, ConstantTimeEqual>;
+        memory::UnorderedMap<TicketArray, Session, KeyedHash, ConstantTimeEqual>;
 
     void Prune(std::chrono::steady_clock::time_point now);
     void EraseOldest();
     void Erase(SessionMap::iterator it) noexcept;
 
     SessionMap sessions_;
-    memory::ThreadLocalDeque<std::pair<TicketArray, std::chrono::steady_clock::time_point>> order_;
+    memory::RingDeque<std::pair<TicketArray, std::chrono::steady_clock::time_point>> order_;
     size_t seen_nfs_keys_ = 0;
 };
 

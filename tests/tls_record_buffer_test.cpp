@@ -31,25 +31,6 @@ void Require(bool value, const char* why) {
     if (!value) throw std::runtime_error(why);
 }
 
-class Resource final : public std::pmr::memory_resource {
-public:
-    std::size_t large_live = 0;
-private:
-    void* do_allocate(std::size_t size, std::size_t alignment) override {
-        void* p = pool.allocate(size, alignment);
-        if (size >= ::buf::Buffer::kSize) large_live += size;
-        return p;
-    }
-    void do_deallocate(void* p, std::size_t size, std::size_t alignment) override {
-        if (size >= ::buf::Buffer::kSize) large_live -= size;
-        pool.deallocate(p, size, alignment);
-    }
-    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
-        return this == &other;
-    }
-    ::memory::ThreadMemoryResource pool;
-};
-
 // An independent public-API TLS peer. Memory BIOs are test wire capture only:
 // they let the test split an authenticated TLS record at an exact byte boundary.
 class Peer {
@@ -133,8 +114,7 @@ public:
 };
 
 struct Fixture {
-    explicit Fixture(bool product_server = false, bool large_chain = false,
-                     const Resource* resource = nullptr) {
+    explicit Fixture(bool product_server = false, bool large_chain = false) {
         const auto dir = std::filesystem::path(ACPP_TEST_SOURCE_DIR) / "tests/fixtures/anytls-pool";
         ::TlsConfig server_config;
         server_config.cert_file = (dir / "cert.pem").string();
@@ -168,10 +148,10 @@ struct Fixture {
         other.set_option(net::socket_base::receive_buffer_size(32768));
         peer = std::make_unique<Peer>(std::move(other),
             product_server ? client->Native() : server->Native(), !product_server);
-        stream = std::make_unique<::TlsStream>(
-            std::make_unique<::TcpStream>(std::move(socket)),
+        stream = ::memory::MakeUnique<::TlsStream>(pool,
+            ::memory::MakeUnique<::TcpStream>(pool, pool, std::move(socket)),
             product_server ? *server : *client, product_server);
-        if (resource) retained_before_handshake = resource->large_live;
+        retained_before_handshake = PoolBytes();
         try {
             auto first = net::co_spawn(io, stream->Handshake(), net::use_future);
             auto second = net::co_spawn(io, peer->Handshake(), net::use_future);
@@ -185,6 +165,9 @@ struct Fixture {
     }
 
     ~Fixture() { CloseAndJoin(); }
+
+    // Bytes of live Worker-pool blocks (relay Buffers and TLS staging storage).
+    [[nodiscard]] std::size_t PoolBytes() const noexcept { return pool.GetFootprint().used_bytes; }
 
     void CloseAndJoin() {
         stream->CloseAbortive();
@@ -204,6 +187,7 @@ struct Fixture {
         return result.get();
     }
 
+    ::memory::worker_memory pool;
     net::io_context io;
     std::unique_ptr<::SslContext> server, client;
     std::unique_ptr<Peer> peer;
@@ -236,9 +220,9 @@ net::awaitable<std::string> ReadBytes(::TlsStream& stream, std::size_t count) {
     co_return result;
 }
 
-void FragmentedAndCoalesced(Resource& resource) {
+void FragmentedAndCoalesced() {
     Fixture fixture;
-    const auto idle_bytes = resource.large_live;
+    const auto idle_bytes = fixture.PoolBytes();
     auto first = fixture.peer->Encrypt(std::string(9000, 'a'));
     const auto second = fixture.peer->Encrypt("second-record");
     first.insert(first.end(), second.begin(), second.end());
@@ -247,7 +231,7 @@ void FragmentedAndCoalesced(Resource& resource) {
     fixture.io.restart();
     fixture.io.run_for(20ms);
     Require(read.wait_for(0s) != std::future_status::ready, "partial TLS header completed a read");
-    Require(::memory::detail::test_buffers_live == 0 && resource.large_live == idle_bytes,
+    Require(::memory::detail::test_buffers_live == 0 && fixture.PoolBytes() == idle_bytes,
             "partial record wait retained a relay or ciphertext staging buffer");
     fixture.stream->Cancel();
     bool cancelled = false;
@@ -266,7 +250,7 @@ void FragmentedAndCoalesced(Resource& resource) {
         plain += Flatten(fixture.Wait(next));
     }
     Require(plain == std::string(9000, 'a') + "second-record", "coalesced TLS records lost their suffix");
-    Require(resource.large_live == idle_bytes, "completed TLS read retained operation payload");
+    Require(fixture.PoolBytes() == idle_bytes, "completed TLS read retained operation payload");
 
     const auto record = fixture.peer->Encrypt("after-resource-failure");
     net::write(fixture.peer->socket, net::buffer(record));
@@ -290,9 +274,9 @@ void FragmentedAndCoalesced(Resource& resource) {
     Require(Flatten(fixture.Wait(retry)) == "fter-resource-failure", "OOM consumed retained plaintext");
 }
 
-void DuplexKeyUpdate(Resource& resource) {
+void DuplexKeyUpdate() {
     Fixture fixture;
-    const auto idle_bytes = resource.large_live;
+    const auto idle_bytes = fixture.PoolBytes();
     const std::string payload(512 * 1024, 'w');
     const std::array<net::const_buffer, 1> buffers{net::buffer(payload)};
     Require(fixture.stream->DeferWriteCancellation(), "TLS cancellation deferral unavailable");
@@ -316,7 +300,7 @@ void DuplexKeyUpdate(Resource& resource) {
     }
     Require(fixture.Wait(received) == payload, "logical cancellation truncated or interleaved physical TLS output");
     Require(Flatten(fixture.Wait(read)) == "concurrent-control-record", "full-duplex TLS control record stalled");
-    Require(resource.large_live == idle_bytes, "completed duplex TLS operation retained ciphertext");
+    Require(fixture.PoolBytes() == idle_bytes, "completed duplex TLS operation retained ciphertext");
 
     const std::string next_record = "after-backpressure-and-key-update";
     auto next_write = net::co_spawn(fixture.io,
@@ -326,7 +310,7 @@ void DuplexKeyUpdate(Resource& resource) {
     Require(fixture.Wait(next_write) == next_record.size() &&
                 fixture.Wait(next_read) == next_record,
             "resuming direct output after a queued TLS control record corrupted the sequence");
-    Require(resource.large_live == idle_bytes, "resumed TLS output retained ciphertext");
+    Require(fixture.PoolBytes() == idle_bytes, "resumed TLS output retained ciphertext");
 
     auto close = net::co_spawn(fixture.io, fixture.stream->AsyncShutdownWrite(), net::use_future);
     auto eof = net::co_spawn(fixture.io, fixture.peer->Read(1), net::use_future);
@@ -369,9 +353,9 @@ void BidirectionalBackpressure() {
             "TLS physical write gate blocked concurrent inbound progress");
 }
 
-void LargeHandshake(Resource& resource) {
-    Fixture fixture(true, true, &resource);
-    Require(resource.large_live == fixture.retained_before_handshake,
+void LargeHandshake() {
+    Fixture fixture(true, true);
+    Require(fixture.PoolBytes() == fixture.retained_before_handshake,
             "large handshake retained its output flight");
     const auto record = fixture.peer->Encrypt("after-large-flight");
     net::write(fixture.peer->socket, net::buffer(record));
@@ -396,22 +380,19 @@ void ReadDeadline() {
 
 TEST(TlsRecordBuffer, Contract) {
     ::TlsStream::InitializeIo();
-    Resource resource;
-    auto* previous = std::pmr::set_default_resource(&resource);
     bool passed = true;
     try {
-        FragmentedAndCoalesced(resource);
-        DuplexKeyUpdate(resource);
+        FragmentedAndCoalesced();
+        DuplexKeyUpdate();
         BidirectionalBackpressure();
-        LargeHandshake(resource);
+        LargeHandshake();
         ReadDeadline();
-        Require(resource.large_live == 0 && ::memory::detail::test_buffers_live == 0,
+        Require(::memory::detail::test_buffers_live == 0,
                 "TLS test retained operation payload");
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         passed = false;
     }
-    std::pmr::set_default_resource(previous);
     { ASSERT_TRUE(passed); return; }
 }
 

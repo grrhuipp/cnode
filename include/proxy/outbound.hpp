@@ -29,7 +29,7 @@ using OutboundProcessResult = tl::expected<RelayResult, ErrorCode>;
 // Handler's internet.Dialer); first_payload transfers ownership and all
 // application bytes enter relay.
 // ============================================================================
-class Outbound : public memory::ThreadAllocated {
+class Outbound : public memory::WorkerAllocated {
 public:
     virtual ~Outbound() noexcept = default;
 

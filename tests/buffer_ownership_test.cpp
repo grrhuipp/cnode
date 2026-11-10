@@ -55,12 +55,16 @@ void Check(bool passed, const char* name) {
     if (!passed) ++failed;
 }
 
-buf::BufferGuard Buffer(size_t bytes, uint8_t value = 0x42) {
-    buf::BufferGuard buffer{buf::Buffer::New()};
+buf::BufferGuard Buffer(size_t bytes, uint8_t value, memory::worker_memory& pool) {
+    buf::BufferGuard buffer{buf::Buffer::New(pool)};
     if (!buffer) throw std::bad_alloc();
     std::memset(buffer->Tail().data(), value, bytes);
     buffer->Produce(static_cast<uint32_t>(bytes));
     return buffer;
+}
+
+buf::BufferGuard Buffer(size_t bytes, memory::worker_memory& pool) {
+    return Buffer(bytes, 0x42, pool);
 }
 
 std::vector<uint8_t> Flatten(const buf::MultiBuffer& payload) {
@@ -87,52 +91,11 @@ std::vector<uint8_t> Pattern(size_t bytes) {
     return result;
 }
 
-buf::MultiBuffer Packet(std::span<const uint8_t> data) {
+buf::MultiBuffer Packet(std::span<const uint8_t> data, memory::worker_memory& pool) {
     buf::MultiBuffer result;
-    if (!buf::AppendSpanToMultiBuffer(data, result)) throw std::bad_alloc();
+    if (!buf::AppendSpanToMultiBuffer(data, result, pool)) throw std::bad_alloc();
     return result;
 }
-
-class FailingResource final : public std::pmr::memory_resource {
-public:
-    explicit FailingResource(std::pmr::memory_resource* upstream) noexcept
-        : upstream_(upstream) {}
-
-    void RejectNextAllocation() noexcept { reject_next_ = true; }
-    [[nodiscard]] size_t RejectedAllocations() const noexcept { return rejected_; }
-
-private:
-    void* do_allocate(size_t bytes, size_t alignment) override {
-        if (reject_next_) {
-            reject_next_ = false;
-            ++rejected_;
-            throw std::bad_alloc();
-        }
-        return upstream_->allocate(bytes, alignment);
-    }
-    void do_deallocate(void* pointer, size_t bytes, size_t alignment) override {
-        upstream_->deallocate(pointer, bytes, alignment);
-    }
-    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
-        return this == &other;
-    }
-
-    std::pmr::memory_resource* upstream_;
-    bool reject_next_ = false;
-    size_t rejected_ = 0;
-};
-
-class ScopedDefaultResource {
-public:
-    explicit ScopedDefaultResource(std::pmr::memory_resource* resource) noexcept
-        : previous_(std::pmr::set_default_resource(resource)) {}
-    ~ScopedDefaultResource() { std::pmr::set_default_resource(previous_); }
-    ScopedDefaultResource(const ScopedDefaultResource&) = delete;
-    ScopedDefaultResource& operator=(const ScopedDefaultResource&) = delete;
-
-private:
-    std::pmr::memory_resource* previous_;
-};
 
 template <typename Function>
 bool Inject(int budget, Function operation) {
@@ -166,27 +129,27 @@ void FaultMatrix(const char* name, Function operation) {
     Check(passed && reached_success, name);
 }
 
-void AppendMatrix() {
-    FaultMatrix("span append rolls back data and pointer allocation failures", [](int budget, bool& complete) {
+void AppendMatrix(memory::worker_memory& pool) {
+    FaultMatrix("span append rolls back data and pointer allocation failures", [&pool](int budget, bool& complete) {
         const auto before = Pattern(33);
         const auto added = Pattern(90000);
-        auto payload = Packet(before);
+        auto payload = Packet(before, pool);
         auto* original = *payload.begin();
-        complete = Inject(budget, [&] { return buf::AppendSpanToMultiBuffer(added, payload); });
+        complete = Inject(budget, [&] { return buf::AppendSpanToMultiBuffer(added, payload, pool); });
         const bool unchanged = complete || (failures != 0 && Flatten(payload) == before &&
             Consistent(payload) && payload.size() == 1 && *payload.begin() == original);
-        if (!complete && !buf::AppendSpanToMultiBuffer(added, payload)) return false;
+        if (!complete && !buf::AppendSpanToMultiBuffer(added, payload, pool)) return false;
         auto expected = before;
         expected.insert(expected.end(), added.begin(), added.end());
         return unchanged && Flatten(payload) == expected && Consistent(payload);
     });
 
     for (size_t count : {size_t{8}, size_t{16}}) {
-        FaultMatrix("consumed guard is released when pointer insertion fails", [count](int budget, bool& complete) {
+        FaultMatrix("consumed guard is released when pointer insertion fails", [count, &pool](int budget, bool& complete) {
             buf::MultiBuffer payload;
-            for (size_t i = 0; i < count; ++i) payload.push_back(Buffer(1));
+            for (size_t i = 0; i < count; ++i) payload.push_back(Buffer(1, pool));
             auto before = Flatten(payload);
-            auto extra = Buffer(5, 0x11);
+            auto extra = Buffer(5, 0x11, pool);
             complete = Inject(budget, [&] { payload.push_back(std::move(extra)); return true; });
             if (extra) return false;
             if (!complete) return failures != 0 && Flatten(payload) == before && Consistent(payload);
@@ -196,15 +159,15 @@ void AppendMatrix() {
     }
 }
 
-void TransferMatrix() {
+void TransferMatrix(memory::worker_memory& pool) {
     for (bool prefix : {false, true}) {
         FaultMatrix(prefix ? "prefix split preserves both containers on failure" :
                               "whole transfer preserves ownership and UDP metadata on failure",
-            [prefix](int budget, bool& complete) {
+            [prefix, &pool](int budget, bool& complete) {
                 const auto source_bytes = Pattern(buf::Buffer::kSize + 100);
                 const auto target_bytes = Pattern(buf::Buffer::kSize * 8);
-                auto source = Packet(source_bytes);
-                auto target = Packet(target_bytes);
+                auto source = Packet(source_bytes, pool);
+                auto target = Packet(target_bytes, pool);
                 auto* original = *source.begin();
                 const TargetAddress endpoint{"127.0.0.1", 1234};
                 original->SetUDP(endpoint);
@@ -229,7 +192,7 @@ void TransferMatrix() {
     }
 }
 
-void UdpPrefixTransfer() {
+void UdpPrefixTransfer(memory::worker_memory& pool) {
     const TargetAddress source_target{
         "split-copy-target-host-name-longer-than-sso.example.com", 14321};
     const TargetAddress destination_target{
@@ -238,14 +201,14 @@ void UdpPrefixTransfer() {
     constexpr size_t prefix_bytes = 23;
 
     for (int destination_kind = 0; destination_kind != 3; ++destination_kind) {
-        auto source = Packet(source_bytes);
+        auto source = Packet(source_bytes, pool);
         auto* source_buffer = *source.begin();
         source_buffer->SetUDP(source_target);
         buf::MultiBuffer destination;
         buf::Buffer* prior_tail = nullptr;
         std::vector<uint8_t> destination_before;
         if (destination_kind != 0) {
-            buf::BufferGuard tail = Buffer(31, 0x6D);
+            buf::BufferGuard tail = Buffer(31, 0x6D, pool);
             prior_tail = tail.get();
             if (destination_kind == 2) prior_tail->SetUDP(destination_target);
             destination.push_back(std::move(tail));
@@ -282,21 +245,21 @@ void UdpPrefixTransfer() {
     bool rolled_back = false;
     bool retry_metadata = false;
     bool retry_bytes = false;
-    FailingResource failing_resource{std::pmr::new_delete_resource()};
     {
-        ScopedDefaultResource default_resource{&failing_resource};
         const TargetAddress long_target{
             "split-copy-target-host-name-longer-than-sso.example.com", 14321};
-        auto source = Packet(source_bytes);
+        auto source = Packet(source_bytes, pool);
         auto* original = *source.begin();
         original->SetUDP(long_target);
         buf::MultiBuffer destination;
-        destination.reserve(1);
+        destination.reserve(1, pool);
         auto* const source_slot = original;
 
-        failing_resource.RejectNextAllocation();
+        memory::reject_next_process_allocation = true;
+        const auto rejected_before = memory::rejected_process_allocations;
         const bool moved_on_failed_copy = source.MovePrefixTo(destination, prefix_bytes);
-        rolled_back = !moved_on_failed_copy && failing_resource.RejectedAllocations() == 1 &&
+        rolled_back = !moved_on_failed_copy &&
+            memory::rejected_process_allocations == rejected_before + 1 &&
             source.size() == 1 && *source.begin() == source_slot &&
             Flatten(source) == source_bytes && source.byte_size() == source_bytes.size() &&
             original->HasUDP() && original->UDP().SameEndpoint(long_target) &&
@@ -316,21 +279,21 @@ void UdpPrefixTransfer() {
           "UDP target-copy allocation failure rolls back source and destination");
 }
 
-void EdgeCases() {
+void EdgeCases(memory::worker_memory& pool) {
     // A consumed spill prefix must not invalidate reserve's no-allocation
     // promise for active slots. This previously released a source slot first.
     buf::MultiBuffer target;
-    target.reserve(16);
-    for (size_t i = 0; i < 16; ++i) target.push_back(Buffer(1));
+    target.reserve(16, pool);
+    for (size_t i = 0; i < 16; ++i) target.push_back(Buffer(1, pool));
     target.drop_front(1);
-    auto source = buf::MultiBuffer{Buffer(3, 0x55)};
+    auto source = buf::MultiBuffer{Buffer(3, 0x55, pool)};
     Check(Inject(0, [&] { source.MoveTo(target); return true; }) && source.empty() &&
           target.size() == 16 && target.byte_size() == 18 && Consistent(target),
           "reserved active slots remain allocation free after prefix consumption");
 
     auto bytes = Pattern(100);
     auto owned_bytes = Pattern(9000);
-    auto owned = Packet(owned_bytes);
+    auto owned = Packet(owned_bytes, pool);
     const auto* original_buffer = *owned.begin();
     buf::MultiBuffer transferred;
     Check(Inject(0, [&] {
@@ -340,32 +303,32 @@ void EdgeCases() {
     }) && owned.empty() && *transferred.begin() == original_buffer &&
           Flatten(transferred) == owned_bytes, "logical stream remainder transfers without allocation or payload copy");
 
-    auto partial = Packet(bytes);
-    auto into = Packet(bytes);
+    auto partial = Packet(bytes, pool);
+    auto into = Packet(bytes, pool);
     const auto before = Flatten(into);
     Check(!partial.MovePrefixTo(into, 101) && Flatten(partial) == bytes && Flatten(into) == before,
           "short source does not partially transfer");
     Check(!partial.MovePrefixTo(partial, 1) && partial.MovePrefixTo(into, 0), "self and empty prefix");
     // Compact a consumed destination tail only after preparation succeeds.
-    into = buf::MultiBuffer{Buffer(buf::Buffer::kSize)};
+    into = buf::MultiBuffer{Buffer(buf::Buffer::kSize, pool)};
     into.DropPrefixBytes(100);
     Check(Inject(0, [&] { return partial.MovePrefixTo(into, 77); }) &&
           partial.byte_size() == 23 && into.byte_size() == buf::Buffer::kSize - 23 &&
           Consistent(partial) && Consistent(into), "prefix coalescing remains allocation free");
 
     const TargetAddress endpoint{"127.0.0.1", 1234};
-    auto udp = buf::MultiBuffer{Buffer(1)};
+    auto udp = buf::MultiBuffer{Buffer(1, pool)};
     udp.back()->SetUDP(endpoint);
-    Check(buf::AppendSpanToMultiBuffer(bytes, udp) && udp.size() == 2 &&
+    Check(buf::AppendSpanToMultiBuffer(bytes, udp, pool) && udp.size() == 2 &&
           (*udp.begin())->Len() == 1 && (*udp.begin())->UDP().SameEndpoint(endpoint) &&
           !udp.back()->HasUDP(), "span append respects UDP packet boundary");
 
     // Empty slots and whole-buffer transfers keep byte counts exact.
     buf::MultiBuffer sparse;
-    sparse.push_back(Buffer(0));
-    sparse.push_back(Buffer(3));
-    sparse.push_back(Buffer(0));
-    sparse.push_back(Buffer(5));
+    sparse.push_back(Buffer(0, pool));
+    sparse.push_back(Buffer(3, pool));
+    sparse.push_back(Buffer(0, pool));
+    sparse.push_back(Buffer(5, pool));
     buf::MultiBuffer moved;
     Check(sparse.MovePrefixTo(moved, 8) && sparse.byte_size() == 0 && moved.byte_size() == 8 &&
           moved.size() == 2 && Consistent(sparse) && Consistent(moved), "whole prefix skips empty slots");
@@ -373,22 +336,23 @@ void EdgeCases() {
 }
 
 TEST(BufferOwnership, Contract) {
+    memory::worker_memory pool;
     // The first pool use registers this thread's pool destructor with the
     // runtime; keep that one-time allocation out of the tracked matrices.
-    { const auto warm = Buffer(0); }
-    AppendMatrix();
-    TransferMatrix();
-    UdpPrefixTransfer();
-    EdgeCases();
+    { const auto warm = Buffer(0, pool); }
+    AppendMatrix(pool);
+    TransferMatrix(pool);
+    UdpPrefixTransfer(pool);
+    EdgeCases(pool);
     { ASSERT_EQ((failed ? 1 : 0), 0); return; }
 }
 
 TEST(BufferOwnership, PartialConsumptionReturnsSpillStorageWithoutCopyingPayload) {
-    const auto baseline = ::memory::ThreadMemoryPool().OutstandingAllocations();
+    memory::worker_memory pool;
     ::buf::MultiBuffer payload;
-    payload.reserve(4096);
+    payload.reserve(4096, pool);
     for (size_t i = 0; i < 4096; ++i)
-        payload.push_back(Buffer(1, static_cast<uint8_t>(i)));
+        payload.push_back(Buffer(1, static_cast<uint8_t>(i), pool));
     auto* const last = payload.back();
     const ::TargetAddress endpoint{"127.0.0.1", 1234};
     last->SetUDP(endpoint);
@@ -396,7 +360,7 @@ TEST(BufferOwnership, PartialConsumptionReturnsSpillStorageWithoutCopyingPayload
     EXPECT_EQ(payload.DropPrefixBytes(4096 - ::buf::MultiBuffer::kInlineCapacity),
               4096 - ::buf::MultiBuffer::kInlineCapacity);
     ASSERT_EQ(payload.size(), ::buf::MultiBuffer::kInlineCapacity);
-    EXPECT_EQ(::memory::ThreadMemoryPool().OutstandingAllocations() - baseline, payload.size());
+    EXPECT_EQ(pool.OutstandingAllocations(), payload.size());
     EXPECT_TRUE(Consistent(payload));
     EXPECT_EQ(payload.back(), last);
     EXPECT_TRUE(last->UDP().SameEndpoint(endpoint));
@@ -410,18 +374,18 @@ TEST(BufferOwnership, PartialConsumptionReturnsSpillStorageWithoutCopyingPayload
         EXPECT_EQ(buffer->Bytes()[0], static_cast<uint8_t>(4096 - ::buf::MultiBuffer::kInlineCapacity + i));
     }
     EXPECT_TRUE(moved.empty());
-    EXPECT_EQ(::memory::ThreadMemoryPool().OutstandingAllocations(), baseline);
+    EXPECT_EQ(pool.OutstandingAllocations(), 0u);
 }
 
 TEST(BufferOwnership, MovedInlineAndSpilledContainersRemainReusable) {
-    const auto baseline = memory::ThreadMemoryPool().OutstandingAllocations();
+    memory::worker_memory pool;
     for (const size_t source_count : {0u, 1u, 8u, 9u, 16u}) {
         for (const size_t destination_count : {0u, 1u, 9u}) {
             SCOPED_TRACE(source_count);
             SCOPED_TRACE(destination_count);
             auto expected = Pattern(source_count);
             buf::MultiBuffer source;
-            for (const auto byte : expected) source.push_back(Buffer(1, byte));
+            for (const auto byte : expected) source.push_back(Buffer(1, byte, pool));
             if (source_count > 1) {
                 source.drop_front(1);
                 expected.erase(expected.begin());
@@ -429,11 +393,11 @@ TEST(BufferOwnership, MovedInlineAndSpilledContainersRemainReusable) {
             buf::MultiBuffer transferred(std::move(source));
             EXPECT_TRUE(source.empty());
             EXPECT_EQ(source.byte_size(), 0u);
-            for (size_t i = 0; i < 9; ++i) source.push_back(Buffer(1, 0xa5));
+            for (size_t i = 0; i < 9; ++i) source.push_back(Buffer(1, 0xa5, pool));
 
             buf::MultiBuffer destination;
             for (size_t i = 0; i < destination_count; ++i)
-                destination.push_back(Buffer(1, 0xff));
+                destination.push_back(Buffer(1, 0xff, pool));
             destination = std::move(transferred);
             EXPECT_TRUE(transferred.empty());
             EXPECT_EQ(transferred.byte_size(), 0u);
@@ -441,34 +405,34 @@ TEST(BufferOwnership, MovedInlineAndSpilledContainersRemainReusable) {
             EXPECT_TRUE(Consistent(destination));
             EXPECT_EQ(Flatten(source), std::vector<uint8_t>(9, 0xa5));
 
-            transferred.push_back(Buffer(1, 0x73));
+            transferred.push_back(Buffer(1, 0x73, pool));
             EXPECT_EQ(Flatten(transferred), std::vector<uint8_t>{0x73});
             source.clear();
             destination.clear();
             transferred.clear();
-            EXPECT_EQ(memory::ThreadMemoryPool().OutstandingAllocations(), baseline);
+            EXPECT_EQ(pool.OutstandingAllocations(), 0u);
         }
     }
 }
 
 TEST(BufferOwnership, FailedFirstSpillPreservesInlinePayloadAndCanRetry) {
-    FailingResource resource(std::pmr::get_default_resource());
-    ScopedDefaultResource scope(&resource);
+    memory::worker_memory pool;
     const auto expected = Pattern(buf::MultiBuffer::kInlineCapacity);
     buf::MultiBuffer payload;
-    for (const auto byte : expected) payload.push_back(Buffer(1, byte));
+    for (const auto byte : expected) payload.push_back(Buffer(1, byte, pool));
     std::array<buf::Buffer*, buf::MultiBuffer::kInlineCapacity> original;
     std::copy(payload.begin(), payload.end(), original.begin());
 
-    resource.RejectNextAllocation();
-    EXPECT_THROW(payload.reserve(buf::MultiBuffer::kInlineCapacity + 1), std::bad_alloc);
-    EXPECT_EQ(resource.RejectedAllocations(), 1u);
+    const auto rejected_before = memory::rejected_pmr_allocations;
+    memory::reject_next_pmr_allocation = true;
+    EXPECT_THROW(payload.reserve(buf::MultiBuffer::kInlineCapacity + 1, pool), std::bad_alloc);
+    EXPECT_EQ(memory::rejected_pmr_allocations, rejected_before + 1);
     EXPECT_EQ(Flatten(payload), expected);
     EXPECT_TRUE(Consistent(payload));
     EXPECT_TRUE(std::equal(payload.begin(), payload.end(), original.begin(), original.end()));
 
-    payload.reserve(buf::MultiBuffer::kInlineCapacity + 1);
-    payload.push_back(Buffer(1, 0x91));
+    payload.reserve(buf::MultiBuffer::kInlineCapacity + 1, pool);
+    payload.push_back(Buffer(1, 0x91, pool));
     auto extended = expected;
     extended.push_back(0x91);
     EXPECT_EQ(Flatten(payload), extended);
@@ -476,45 +440,47 @@ TEST(BufferOwnership, FailedFirstSpillPreservesInlinePayloadAndCanRetry) {
 }
 
 TEST(BufferOwnership, CoalescingUsesExistingTailWhenMetadataAllocationIsUnavailable) {
-    FailingResource resource(std::pmr::get_default_resource());
-    ScopedDefaultResource scope(&resource);
+    memory::worker_memory pool;
     buf::MultiBuffer target, source;
     for (size_t i = 0; i < buf::MultiBuffer::kInlineCapacity; ++i)
-        target.push_back(Buffer(1, static_cast<uint8_t>(i)));
+        target.push_back(Buffer(1, static_cast<uint8_t>(i), pool));
     auto* const tail = target.back();
     for (size_t i = 0; i < 16; ++i)
-        source.push_back(Buffer(1, static_cast<uint8_t>(0x80 + i)));
-    source.push_back(Buffer(0));
+        source.push_back(Buffer(1, static_cast<uint8_t>(0x80 + i), pool));
+    source.push_back(Buffer(0, pool));
     auto expected = Flatten(target);
     const auto added = Flatten(source);
     expected.insert(expected.end(), added.begin(), added.end());
 
-    resource.RejectNextAllocation();
+    const auto rejected_before = memory::rejected_pmr_allocations;
+    memory::reject_next_pmr_allocation = true;
     ASSERT_NO_THROW(target.AppendAndCoalesce(std::move(source)));
     EXPECT_EQ(Flatten(target), expected);
     EXPECT_EQ(target.size(), buf::MultiBuffer::kInlineCapacity);
     EXPECT_EQ(target.back(), tail);
     EXPECT_TRUE(source.empty());
     EXPECT_TRUE(Consistent(target));
-    EXPECT_EQ(resource.RejectedAllocations(), 0);
+    EXPECT_EQ(memory::rejected_pmr_allocations, rejected_before);
+    memory::reject_next_pmr_allocation = false;
 }
 
 TEST(BufferOwnership, CoalescingPreparesNewSlotsBeforeChangingBytesOrUdpBoundaries) {
-    FailingResource resource(std::pmr::get_default_resource());
-    ScopedDefaultResource scope(&resource);
+    memory::worker_memory pool;
     buf::MultiBuffer target, source;
     for (size_t i = 0; i < buf::MultiBuffer::kInlineCapacity; ++i)
-        target.push_back(Buffer(1, static_cast<uint8_t>(i)));
+        target.push_back(Buffer(1, static_cast<uint8_t>(i), pool));
     for (uint8_t value = 0x80; value < 0x84; ++value)
-        source.push_back(Buffer(value == 0x81 ? 0 : 1, value));
+        source.push_back(Buffer(value == 0x81 ? 0 : 1, value, pool));
     auto* const datagram = *(source.begin() + 1);
     const TargetAddress endpoint{"127.0.0.1", 4321};
     datagram->SetUDP(endpoint);
     const auto before = Flatten(target);
     const auto added = Flatten(source);
 
-    resource.RejectNextAllocation();
+    const auto rejected_before = memory::rejected_pmr_allocations;
+    memory::reject_next_pmr_allocation = true;
     EXPECT_THROW(target.AppendAndCoalesce(std::move(source)), std::bad_alloc);
+    EXPECT_EQ(memory::rejected_pmr_allocations, rejected_before + 1);
     EXPECT_EQ(Flatten(target), before);
     EXPECT_EQ(Flatten(source), added);
     ASSERT_EQ(source.size(), 4);
@@ -537,15 +503,16 @@ TEST(BufferOwnership, CoalescingPreparesNewSlotsBeforeChangingBytesOrUdpBoundari
 }
 
 TEST(BufferOwnership, EmptyUdpMessageSurvivesTransfersAndChecksEveryTarget) {
+    memory::worker_memory pool;
     buf::MultiBuffer stream_empty;
-    stream_empty.push_back(Buffer(0));
+    stream_empty.push_back(Buffer(0, pool));
     stream_empty.ReleaseIfIdle();
     EXPECT_TRUE(stream_empty.empty());
 
     const TargetAddress first_target{"127.0.0.1", 1234};
     const TargetAddress second_target{"127.0.0.1", 4321};
     buf::MultiBuffer packet;
-    ASSERT_TRUE(buf::SetUdpTarget(packet, first_target));
+    ASSERT_TRUE(buf::SetUdpTarget(packet, first_target, pool));
     const auto* original = *packet.begin();
     InitialPayload initial(std::move(packet));
     EXPECT_FALSE(initial.empty());
@@ -565,8 +532,8 @@ TEST(BufferOwnership, EmptyUdpMessageSurvivesTransfersAndChecksEveryTarget) {
     EXPECT_TRUE(moved.empty());
 
     buf::MultiBuffer later;
-    later.push_back(Buffer(1));
-    ASSERT_TRUE(buf::SetUdpTarget(later, second_target));
+    later.push_back(Buffer(1, pool));
+    ASSERT_TRUE(buf::SetUdpTarget(later, second_target, pool));
     destination.AppendAndCoalesce(std::move(later));
     EXPECT_EQ(destination.size(), 2);
     EXPECT_EQ(destination.byte_size(), 1);
@@ -576,14 +543,14 @@ TEST(BufferOwnership, EmptyUdpMessageSurvivesTransfersAndChecksEveryTarget) {
 TEST(BufferOwnership, UnrepresentableWriteCapacityReturnsFailureAndAllowsReuse) {
     EXPECT_EXIT(([] {
         bool passed = true;
+        memory::worker_memory pool;
         for (const size_t initial_size : {size_t{32}, size_t{buf::Buffer::kSize + 1}}) {
-            const auto baseline = memory::ThreadMemoryPool().OutstandingAllocations();
             {
-                buf::ContiguousWriteBuffer storage;
+                buf::ContiguousWriteBuffer storage(pool);
                 (void)storage.Prepare(initial_size);
                 passed &= storage.TryPrepare(std::numeric_limits<size_t>::max()) == nullptr;
                 passed &= storage.Empty() && storage.Data() == nullptr;
-                passed &= memory::ThreadMemoryPool().OutstandingAllocations() == baseline;
+                passed &= pool.OutstandingAllocations() == 0;
 
                 const auto expected = Pattern(
                     initial_size <= buf::Buffer::kSize ? buf::Buffer::kSize + 1 : 33);
@@ -595,26 +562,27 @@ TEST(BufferOwnership, UnrepresentableWriteCapacityReturnsFailureAndAllowsReuse) 
                 passed &= Flatten(output) == expected && Consistent(output);
                 passed &= storage.Empty() && storage.Data() == nullptr;
             }
-            passed &= memory::ThreadMemoryPool().OutstandingAllocations() == baseline;
+            passed &= pool.OutstandingAllocations() == 0;
         }
         std::_Exit(passed ? 0 : 1);
     }()), ::testing::ExitedWithCode(0), "");
 }
 
 TEST(BufferOwnership, StreamInputTransfersInlineBlocksWhenMetadataAllocationIsUnavailable) {
-    FailingResource resource(std::pmr::get_default_resource());
-    ScopedDefaultResource scope(&resource);
+    memory::worker_memory pool;
     buf::MultiBuffer pending, input;
     std::array<const buf::Buffer*, buf::MultiBuffer::kInlineCapacity> original{};
     for (size_t i = 0; i < original.size(); ++i) {
-        input.push_back(Buffer(buf::Buffer::kSize, static_cast<uint8_t>(i)));
+        input.push_back(Buffer(buf::Buffer::kSize, static_cast<uint8_t>(i), pool));
         original[i] = input.back();
     }
 
-    resource.RejectNextAllocation();
+    const auto rejected_before = memory::rejected_pmr_allocations;
+    memory::reject_next_pmr_allocation = true;
     ASSERT_NO_THROW(buf::AppendPacketStreamInput(pending, std::move(input)));
     ASSERT_EQ(pending.size(), original.size());
-    EXPECT_EQ(resource.RejectedAllocations(), 0);
+    EXPECT_EQ(memory::rejected_pmr_allocations, rejected_before);
+    memory::reject_next_pmr_allocation = false;
     EXPECT_EQ(pending.byte_size(), original.size() * buf::Buffer::kSize);
     for (size_t i = 0; i < original.size(); ++i) {
         const auto* block = *(pending.begin() + i);
@@ -627,16 +595,16 @@ TEST(BufferOwnership, StreamInputTransfersInlineBlocksWhenMetadataAllocationIsUn
 }
 
 TEST(BufferOwnership, PacketStreamRetiresPartiallyAppendedInputOnRequiredAllocationFailure) {
-    FailingResource resource(std::pmr::get_default_resource());
-    ScopedDefaultResource scope(&resource);
+    memory::worker_memory pool;
     buf::LengthPrefixedPacketBuffer stream;
     buf::MultiBuffer input;
     for (size_t i = 0; i <= buf::MultiBuffer::kInlineCapacity; ++i)
-        input.push_back(Buffer(buf::Buffer::kSize, static_cast<uint8_t>(i)));
+        input.push_back(Buffer(buf::Buffer::kSize, static_cast<uint8_t>(i), pool));
 
-    resource.RejectNextAllocation();
+    const auto rejected_before = memory::rejected_pmr_allocations;
+    memory::reject_next_pmr_allocation = true;
     EXPECT_THROW(stream.Append(std::move(input)), std::bad_alloc);
-    EXPECT_EQ(resource.RejectedAllocations(), 1);
+    EXPECT_EQ(memory::rejected_pmr_allocations, rejected_before + 1);
     EXPECT_EQ(stream.PendingBytes(), 0);
     buf::MultiBuffer output;
     EXPECT_EQ(stream.Pop(output), buf::LengthPrefixedPacketBuffer::PopResult::Invalid);
@@ -647,20 +615,21 @@ TEST(BufferOwnership, PacketStreamRetiresPartiallyAppendedInputOnRequiredAllocat
 
 TEST(BufferOwnership, TruncatedPacketStreamCannotResumeAfterEof) {
     const std::array<uint8_t, 5> wire{0, 3, 0x11, 0x22, 0x33};
+    memory::worker_memory pool;
     for (size_t cut = 1; cut < wire.size(); ++cut) {
         SCOPED_TRACE(cut);
         buf::LengthPrefixedPacketBuffer stream;
-        stream.Append(Packet(std::span(wire).first(cut)));
+        stream.Append(Packet(std::span(wire).first(cut), pool));
         buf::MultiBuffer output;
         ASSERT_EQ(stream.Pop(output), buf::LengthPrefixedPacketBuffer::PopResult::NeedMore);
         EXPECT_THROW(stream.Finish(), IoSystemError);
         EXPECT_EQ(stream.PendingBytes(), 0);
-        EXPECT_THROW(stream.Append(Packet(std::span(wire).subspan(cut))), IoSystemError);
+        EXPECT_THROW(stream.Append(Packet(std::span(wire).subspan(cut), pool)), IoSystemError);
         EXPECT_EQ(stream.Pop(output), buf::LengthPrefixedPacketBuffer::PopResult::Invalid);
         EXPECT_TRUE(output.empty());
         EXPECT_THROW(stream.Finish(), IoSystemError);
         stream.Reset();
-        stream.Append(Packet(wire));
+        stream.Append(Packet(wire, pool));
         ASSERT_EQ(stream.Pop(output), buf::LengthPrefixedPacketBuffer::PopResult::Packet);
         EXPECT_EQ(Flatten(output), std::vector<uint8_t>({0x11, 0x22, 0x33}));
         stream.Finish();
@@ -668,20 +637,21 @@ TEST(BufferOwnership, TruncatedPacketStreamCannotResumeAfterEof) {
 }
 
 TEST(BufferOwnership, CleanPacketStreamEofRequiresExplicitResetBeforeReuse) {
+    memory::worker_memory pool;
     const std::array<uint8_t, 3> wire{0, 1, 0x73};
     buf::LengthPrefixedPacketBuffer stream;
-    stream.Append(Packet(wire));
+    stream.Append(Packet(wire, pool));
     buf::MultiBuffer output;
     ASSERT_EQ(stream.Pop(output), buf::LengthPrefixedPacketBuffer::PopResult::Packet);
     EXPECT_EQ(Flatten(output), std::vector<uint8_t>({0x73}));
     stream.Finish();
     stream.Finish();
     EXPECT_THROW(stream.Append({}), IoSystemError);
-    EXPECT_THROW(stream.Append(Packet(wire)), IoSystemError);
+    EXPECT_THROW(stream.Append(Packet(wire, pool)), IoSystemError);
     EXPECT_EQ(stream.Pop(output), buf::LengthPrefixedPacketBuffer::PopResult::Finished);
     EXPECT_TRUE(output.empty());
     stream.Reset();
-    stream.Append(Packet(wire));
+    stream.Append(Packet(wire, pool));
     ASSERT_EQ(stream.Pop(output), buf::LengthPrefixedPacketBuffer::PopResult::Packet);
     EXPECT_EQ(Flatten(output), std::vector<uint8_t>({0x73}));
     stream.Finish();

@@ -22,7 +22,7 @@ struct Context;
 using TransportBuildResult = tl::expected<std::unique_ptr<AsyncStream>, ErrorCode>;
 
 struct InboundTransportMetadata {
-    memory::ThreadLocalString real_ip;
+    memory::String real_ip;
 };
 class InboundTransportStreamHandler {
 public:

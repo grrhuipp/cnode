@@ -34,7 +34,8 @@ void operator delete(void* p, std::size_t) noexcept { std::free(p); }
 
 TEST(SessionAccessLog, Contract) {
     try {
-        ::session::Context ctx;
+        ::memory::worker_memory pool;
+        ::session::Context ctx(pool);
         ctx.inbound.source_addr = ::net::ip::make_address("192.0.2.10");
         ctx.inbound.source_port = 52000;
         ctx.inbound.tag = "panel/hj-anytls/1041/anytls/55911";
@@ -54,9 +55,9 @@ TEST(SessionAccessLog, Contract) {
 
         ctx.inbound.ApplyForwardedMetadata(::ForwardedMetadata{
             .user_id = 1001,
-            .user_email = ::memory::ThreadLocalString("alice@origin.example"),
+            .user_email = ::memory::String("alice@origin.example"),
             .client_ip = ::net::ip::make_address("203.0.113.88"),
-            .inbound_tag = ::memory::ThreadLocalString("panel/site-a/10/vless/443"),
+            .inbound_tag = ::memory::String("panel/site-a/10/vless/443"),
         });
         allocations = 0;
         count_allocations = true;

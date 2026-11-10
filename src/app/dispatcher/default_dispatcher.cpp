@@ -104,7 +104,7 @@ net::awaitable<bool> SniffInitialPayload(
     static constexpr size_t kSniffMaxDatagrams = 64;
     static constexpr auto kSniffWindow = std::chrono::milliseconds(200);
     buf::MultiBuffer sniff_payload;
-    memory::ByteVector sniff_scratch;
+    memory::ByteVector sniff_scratch(ctx.pool.resource());
     Sniffer sniffer;
     size_t cached_bytes = 0;
     size_t cached_datagrams = 0;
@@ -222,7 +222,7 @@ net::awaitable<bool> SniffInitialPayload(
                 break;
             }
             read = {};
-            memory::ByteVector{}.swap(sniff_scratch);
+            memory::ByteVector(ctx.pool.resource()).swap(sniff_scratch);
             AsyncDelay delay(io_context);
             auto next = co_await (read_more() || delay.WaitFor(remaining));
             if (sniff_cancellation.cancelled() != net::cancellation_type::none) {

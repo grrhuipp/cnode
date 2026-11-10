@@ -585,13 +585,13 @@ net::awaitable<void> SendWindowUpdates(AsyncStream& stream,
 }
 
 struct HpackHeaderField {
-    memory::ThreadLocalString name;
-    memory::ThreadLocalString value;
+    memory::String name;
+    memory::String value;
 };
 
 // Connection-scoped HPACK decoder (RFC 7541). A failed Decode leaves the
 // dynamic table unusable; callers must end the connection.
-class HpackDecoder final : public memory::ThreadAllocated {
+class HpackDecoder final : public memory::WorkerAllocated {
 public:
     template <typename Visitor>
     [[nodiscard]] bool Decode(std::span<const uint8_t> block, Visitor&& on_field) {
@@ -866,9 +866,9 @@ private:
         return std::nullopt;
     }
 
-    static std::optional<memory::ThreadLocalString> DecodeHuffman(
+    static std::optional<memory::String> DecodeHuffman(
         std::span<const uint8_t> data) {
-        memory::ThreadLocalString out;
+        memory::String out;
         out.reserve(data.size());
         uint16_t node = 0;
         uint32_t code = 0;
@@ -901,7 +901,7 @@ private:
         return out;
     }
 
-    static std::optional<memory::ThreadLocalString> ReadString(
+    static std::optional<memory::String> ReadString(
         std::span<const uint8_t> block,
         size_t& offset) {
         if (offset >= block.size()) {
@@ -917,7 +917,7 @@ private:
         if (huffman) {
             return DecodeHuffman(encoded);
         }
-        return memory::ThreadLocalString(
+        return memory::String(
             unsafe::ptr_cast<const char>(encoded.data()),
             encoded.size());
     }
@@ -946,7 +946,7 @@ private:
         if (!name_index) {
             return std::nullopt;
         }
-        memory::ThreadLocalString name;
+        memory::String name;
         if (*name_index == 0) {
             auto decoded = ReadString(block, offset);
             if (!decoded) {
@@ -996,7 +996,7 @@ private:
         }
     }
 
-    memory::ThreadLocalDeque<HpackHeaderField> dynamic_table_;
+    memory::RingDeque<HpackHeaderField> dynamic_table_;
     size_t dynamic_size_ = 0;
     size_t dynamic_max_size_ = kHpackMaxDynamicTableSize;
 };
@@ -1048,9 +1048,9 @@ net::awaitable<tl::expected<void, H2Error>> ReadH2HeaderFields(
 }
 
 struct H2RequestHeaders {
-    memory::ThreadLocalString method;
-    memory::ThreadLocalString path;
-    memory::ThreadLocalString authority;
+    memory::String method;
+    memory::String path;
+    memory::String authority;
     InboundTransportMetadata metadata;
 };
 
@@ -1088,14 +1088,14 @@ ParseH2RequestHeaders(
     AsyncStream& stream, HpackDecoder& decoder, H2Frame frame,
     std::string_view real_ip_header, bool trailers) {
     H2RequestHeaders request;
-    std::optional<memory::ThreadLocalString> host;
+    std::optional<memory::String> host;
     bool has_method = false;
     bool has_path = false;
     bool has_authority = false;
     bool has_scheme = false;
     bool seen_regular = false;
     bool valid = true;
-    const auto take_once = [](bool& seen, memory::ThreadLocalString& out,
+    const auto take_once = [](bool& seen, memory::String& out,
                               std::string_view value) {
         if (seen) return false;
         seen = true;
@@ -1184,7 +1184,8 @@ public:
                       uint32_t local_initial_window,
                       uint32_t conn_recv_window = H2SendWindow::kDefault,
                       bool write_closed = false)
-        : inner_(std::move(inner))
+        : AsyncStream(inner->Pool())
+        , inner_(std::move(inner))
         , stream_id_(stream_id)
         , payload_codec_(payload_codec)
         , conn_recv_window_(std::max<int64_t>(conn_recv_window, H2SendWindow::kDefault))
@@ -1224,7 +1225,7 @@ public:
         if (!ReadablePayloadReady() && !co_await EnsureReadablePayload()) {
             co_return buf::MultiBuffer{};
         }
-        buf::BufferGuard buffer{buf::Buffer::New()};
+        buf::BufferGuard buffer{buf::Buffer::New(Pool())};
         if (!buffer) {
             throw std::bad_alloc();
         }
@@ -1911,7 +1912,7 @@ private:
     H2PayloadCodec payload_codec_ = H2PayloadCodec::GrpcHunk;
     HpackDecoder response_decoder_;
     // Received DATA the reader has not taken yet.
-    memory::ThreadLocalDeque<ReceivedData> received_;
+    memory::RingDeque<ReceivedData> received_;
     // Current DATA frame payload; [data_offset_, data_end_) is unread body.
     memory::ByteVector data_frame_;
     size_t data_offset_ = 0;
@@ -1949,9 +1950,10 @@ class Http2ServerSession;
 // Shared between the session (frame demultiplexer) and the logical stream
 // owner. The session keeps it while the stream id is open; the owner keeps it
 // until its Http2ServerSubStream is destroyed.
-class Http2ServerSubStreamState final : public memory::ThreadAllocated {
+class Http2ServerSubStreamState final : public memory::WorkerAllocated {
 public:
-    Http2ServerSubStreamState(const net::any_io_executor& executor,
+    Http2ServerSubStreamState(memory::worker_memory& pool,
+                              const net::any_io_executor& executor,
                               std::shared_ptr<Http2ServerSession> session,
                               uint32_t stream_id,
                               H2PayloadCodec payload_codec,
@@ -1959,6 +1961,8 @@ public:
     ~Http2ServerSubStreamState() noexcept { DropQueuedData(); }
 
     transport::CancellationSource& Cancellation() noexcept { return cancellation_; }
+    // The connection's Worker pool; outlives the session and its substreams.
+    [[nodiscard]] memory::worker_memory& Pool() const noexcept { return pool_; }
     [[nodiscard]] std::shared_ptr<Http2ServerSession> LockSession() const noexcept {
         return session_.lock();
     }
@@ -2042,6 +2046,7 @@ private:
     void ReleaseDecoderStorage(Http2ServerSession* session) noexcept;
     [[nodiscard]] std::shared_ptr<Http2ServerSession> LockWritableSession() const;
 
+    memory::worker_memory& pool_;
     SignalChannel input_signal_;
     // JoinOwner's frame-local channel, published only while it waits.
     SignalChannel* owner_signal_ = nullptr;
@@ -2060,7 +2065,7 @@ private:
     size_t upload_reserved_ = 0;
     uint32_t stream_id_ = 0;
     H2PayloadCodec payload_codec_ = H2PayloadCodec::GrpcHunk;
-    memory::ThreadLocalDeque<QueuedDataFrame> data_frames_;
+    memory::RingDeque<QueuedDataFrame> data_frames_;
     // Read position inside data_frames_.front().
     size_t read_offset_ = 0;
     size_t queued_bytes_ = 0;
@@ -2078,7 +2083,7 @@ private:
 class Http2ServerSubStream final : public AsyncStream {
 public:
     explicit Http2ServerSubStream(std::shared_ptr<Http2ServerSubStreamState> state)
-        : state_(std::move(state)), deadline_(state_->IoContext(), *this) {}
+        : AsyncStream(state->Pool()), state_(std::move(state)), deadline_(state_->IoContext(), *this) {}
 
     transport::CancellationSource& Cancellation() noexcept override {
         return state_->Cancellation();
@@ -2174,7 +2179,7 @@ private:
 };
 
 class Http2ServerSession final
-    : public memory::ThreadAllocated
+    : public memory::WorkerAllocated
     , public std::enable_shared_from_this<Http2ServerSession>
     , private transport::CancellationSubscription {
 public:
@@ -2559,7 +2564,7 @@ private:
         }
         try {
             std::unique_ptr<AsyncStream> stream =
-                std::make_unique<Http2ServerSubStream>(sub);
+                memory::MakeUnique<Http2ServerSubStream>(sub->Pool(), sub);
             if (split_session) {
                 stream = MakeXHttpSplitStream(split_session, std::move(stream));
             }
@@ -2826,8 +2831,10 @@ private:
                 co_return co_await ResetStream(stream_id, H2Error::Protocol);
             }
         }
+        auto& pool = stream_->Pool();
         auto sub = memory::AllocateShared<Http2ServerSubStreamState>(
-            io_context_.get_executor(), shared_from_this(), stream_id, payload_codec_, peer_initial_window_);
+            pool.resource(), pool, io_context_.get_executor(), shared_from_this(), stream_id,
+            payload_codec_, peer_initial_window_);
         sub->ReceiveWindow() = local_settings_acked_ ? initial_receive_window_ :
             std::max<int64_t>(initial_receive_window_, H2SendWindow::kDefault);
         streams_.emplace(stream_id, sub);
@@ -2887,7 +2894,7 @@ private:
             }
             auto xsession = co_await GetXHttpPacketSession(
                 io_context_, xhttp_config_->session_namespace,
-                meta.session_id, XHttpSessionAccess::Open);
+                meta.session_id, XHttpSessionAccess::Open, stream_->Pool());
             if (!xsession || !xsession->AttachDownlink()) {
                 co_return co_await ResetStream(stream_id, H2Error::Protocol);
             }
@@ -2916,7 +2923,7 @@ private:
             }
             auto xsession = co_await GetXHttpPacketSession(
                 io_context_, xhttp_config_->session_namespace,
-                meta.session_id, XHttpSessionAccess::Open);
+                meta.session_id, XHttpSessionAccess::Open, stream_->Pool());
             if (!xsession) {
                 co_return co_await ResetStream(stream_id, H2Error::Protocol);
             }
@@ -2947,7 +2954,7 @@ private:
                           meta.session_id,
                           stream_id);
             sub->SetUploadBudget(xsession);
-            auto upload = std::make_unique<Http2ServerSubStream>(sub);
+            auto upload = memory::MakeUnique<Http2ServerSubStream>(sub->Pool(), sub);
             if (!xsession->AttachStream(std::move(upload))) {
                 LOG_CONN_DEBUG(conn_id_,
                     "XHTTP server rejected concurrent H2 stream-up session={}",
@@ -2969,7 +2976,7 @@ private:
             }
             auto xsession = co_await GetXHttpPacketSession(
                 io_context_, xhttp_config_->session_namespace,
-                meta.session_id, XHttpSessionAccess::Upload);
+                meta.session_id, XHttpSessionAccess::Upload, stream_->Pool());
             if (!xsession) {
                 co_return co_await ResetStream(stream_id, H2Error::Protocol);
             }
@@ -2977,7 +2984,8 @@ private:
                 co_return false;
             }
             sub->SetUploadBudget(xsession);
-            auto upload = std::make_unique<Http2ServerSubStream>(std::move(sub));
+            auto& pool = sub->Pool();
+            auto upload = memory::MakeUnique<Http2ServerSubStream>(pool, std::move(sub));
             bool spawn_failed = false;
             try {
                 Spawn(RunPacketUpload(std::move(upload), std::move(xsession), meta.seq));
@@ -3071,7 +3079,7 @@ private:
     std::unique_ptr<AsyncStream> stream_;
     std::shared_ptr<InboundTransportStreamHandler> stream_handler_;
     AsyncWriteGate write_gate_;
-    memory::ThreadLocalUnorderedMap<uint32_t, std::shared_ptr<Http2ServerSubStreamState>>
+    memory::UnorderedMap<uint32_t, std::shared_ptr<Http2ServerSubStreamState>>
         streams_;
     H2PayloadCodec payload_codec_ = H2PayloadCodec::GrpcHunk;
     const HttpConfig* http_config_ = nullptr;
@@ -3129,12 +3137,14 @@ net::awaitable<void> Http2ServerSubStreamState::JoinOwner(
 }
 
 Http2ServerSubStreamState::Http2ServerSubStreamState(
+    memory::worker_memory& pool,
     const net::any_io_executor& executor,
     std::shared_ptr<Http2ServerSession> session,
     uint32_t stream_id,
     H2PayloadCodec payload_codec,
     int64_t initial_send_window)
-    : input_signal_(executor, 1)
+    : pool_(pool)
+    , input_signal_(executor, 1)
     , send_window_(initial_send_window)
     , session_(std::move(session))
     , stream_id_(stream_id)
@@ -3356,7 +3366,7 @@ net::awaitable<buf::MultiBuffer> Http2ServerSubStreamState::ReadMultiBuffer() {
     if (!ReadablePayloadReady() && !co_await EnsureReadablePayload()) {
         co_return buf::MultiBuffer{};
     }
-    buf::BufferGuard buffer{buf::Buffer::New()};
+    buf::BufferGuard buffer{buf::Buffer::New(pool_)};
     if (!buffer) {
         throw std::bad_alloc();
     }
@@ -3622,8 +3632,9 @@ net::awaitable<TransportBuildResult> StartHttp2ServerSession(
     // SETTINGS is a receiver-selected limit, not a promise to allocate an
     // arbitrarily large configured window.
     initial_window = std::min<uint32_t>(initial_window, kHttp2MaxQueuedStreamBytes);
+    auto& pool = stream->Pool();
     auto session = memory::AllocateShared<Http2ServerSession>(
-        io_context, std::move(stream), std::move(stream_handler), payload_codec,
+        pool.resource(), io_context, std::move(stream), std::move(stream_handler), payload_codec,
         conn_id, http_config, xhttp_config, grpc_config, initial_window);
     const auto initial_window_setting = EncodeInitialWindowSetting(initial_window);
     std::array<uint8_t, 12> settings{};
@@ -3705,7 +3716,9 @@ net::awaitable<TransportBuildResult> OpenHttp2ClientStream(
         label,
         authority.empty() ? std::string_view("-") : PublicHttpTargetForLog(authority),
         PublicHttpTargetForLog(path));
-    co_return std::make_unique<Http2ClientStream>(
+    auto& pool = stream->Pool();
+    co_return memory::MakeUnique<Http2ClientStream>(
+        pool,
         std::move(stream),
         1,
         payload_codec,

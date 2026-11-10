@@ -88,13 +88,13 @@ private:
     static constexpr size_t kInlineFrames = buf::MultiBuffer::kInlineCapacity;
     std::array<std::array<uint8_t, kFrameHeaderSize>, kInlineFrames> headers_{};
     std::array<net::const_buffer, kInlineFrames * 2> buffers_{};
-    memory::ThreadLocalVector<std::array<uint8_t, kFrameHeaderSize>> spill_headers_;
-    memory::ThreadLocalVector<net::const_buffer> spill_buffers_;
+    memory::Vector<std::array<uint8_t, kFrameHeaderSize>> spill_headers_;
+    memory::Vector<net::const_buffer> spill_buffers_;
     size_t count_ = 0;
     bool spilled_ = false;
 };
 
-[[nodiscard]] memory::ThreadLocalString ClientSettings(const PaddingScheme& scheme);
+[[nodiscard]] memory::String ClientSettings(const PaddingScheme& scheme);
 [[nodiscard]] tl::expected<void, ErrorCode> AppendFrameBytesTo(
     memory::ByteVector& out,
     uint8_t cmd,
@@ -148,7 +148,7 @@ WriteBuffersAsFramesWithPadding(AsyncStream& stream,
 net::awaitable<tl::expected<FrameHeader, ErrorCode>>
 ReadFrameHeader(AsyncStream& stream);
 
-net::awaitable<tl::expected<memory::ThreadLocalString, ErrorCode>>
+net::awaitable<tl::expected<memory::String, ErrorCode>>
 ReadFrameText(AsyncStream& stream, uint16_t length);
 
 net::awaitable<tl::expected<void, ErrorCode>>
@@ -233,7 +233,8 @@ public:
     // `tasks` accounts and joins physical readers on the Worker thread.
     // Idle sessions are pooled locally; negotiated padding is published to
     // PaddingState and captured for each new handshake.
-    Handler(std::string_view tag,
+    Handler(memory::worker_memory& pool,
+            std::string_view tag,
             net::io_context& io_context,
             std::shared_ptr<const Settings> settings,
             AwaitableTaskGroup& tasks);
@@ -262,7 +263,8 @@ private:
         buf::MultiBufferBatch first_payload, std::chrono::seconds relay_idle_timeout,
         std::chrono::seconds relay_write_timeout,
         std::shared_ptr<ClientSession> session, bool& reusable);
-    memory::ThreadLocalString tag_;
+    memory::worker_memory& worker_pool_;
+    memory::String tag_;
     std::shared_ptr<const Settings> settings_;
     std::shared_ptr<PaddingState> padding_;
     std::shared_ptr<SessionPool> pool_;

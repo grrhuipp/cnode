@@ -51,13 +51,14 @@ std::string Flatten(const ::buf::MultiBuffer& data) {
 // Every case exercises one of the four HTTP handshake call sites, both byte
 // layers, and segmented/coalesced headers with payload larger than a TLS record.
 void Case(bool outbound, bool tls, bool upgrade, bool fragmented, bool abortive) {
+    ::memory::worker_memory pool;
     net::io_context io;
     net::experimental::channel<void(::IoErrorCode)> peer_finished(io, 1);
     ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
     ::tcp::socket socket(io), peer_socket(io);
     socket.connect(acceptor.local_endpoint());
     acceptor.accept(peer_socket);
-    auto raw = std::make_unique<::TcpStream>(std::move(socket));
+    auto raw = ::memory::MakeUnique<::TcpStream>(pool, pool, std::move(socket));
     const int native = raw->NativeHandle();
     raw->SetIdleTimeout(3s);
     raw->SetReadTimeout(2s);
@@ -271,13 +272,14 @@ void Case(bool outbound, bool tls, bool upgrade, bool fragmented, bool abortive)
 }
 
 void ConnectedSocketOptions() {
+    ::memory::worker_memory pool;
     net::io_context io;
     ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
     ::tcp::socket socket(io), peer(io);
     socket.connect(acceptor.local_endpoint());
     acceptor.accept(peer);
     const auto native = socket.native_handle();
-    ::TcpStream stream(std::move(socket));
+    ::TcpStream stream(pool, std::move(socket));
     const auto require_option = [&](int level, int option, int expected) {
         int value = 0;
         socklen_t size = sizeof(value);
@@ -292,6 +294,7 @@ void ConnectedSocketOptions() {
 }
 
 void WriteTimeoutResetsQueuedPayload() {
+    ::memory::worker_memory pool;
     net::io_context io;
     ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
     ::tcp::socket socket(io), peer(io);
@@ -299,7 +302,7 @@ void WriteTimeoutResetsQueuedPayload() {
     acceptor.accept(peer);
     socket.set_option(net::socket_base::send_buffer_size(4096));
     peer.set_option(net::socket_base::receive_buffer_size(4096));
-    ::TcpStream stream(std::move(socket));
+    ::TcpStream stream(pool, std::move(socket));
     stream.SetWriteTimeout(1s);
     bool completed = false;
     std::exception_ptr error;
@@ -338,12 +341,13 @@ void WriteTimeoutResetsQueuedPayload() {
 }
 
 void ExistingTcpResidual() {
+    ::memory::worker_memory pool;
     net::io_context io;
     ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
     ::tcp::socket socket(io), peer(io);
     socket.connect(acceptor.local_endpoint());
     acceptor.accept(peer);
-    ::TcpStream stream(std::move(socket));
+    ::TcpStream stream(pool, std::move(socket));
     // More than eight blocks exercises spill metadata while the old residual
     // is transferred behind the new prefix without copying its payload.
     const std::string tail(10 * ::buf::Buffer::kSize, 't');
@@ -368,6 +372,7 @@ void ExistingTcpResidual() {
 }
 
 void TlsReadTermination(bool multi_buffer, bool clean) {
+    ::memory::worker_memory pool;
     net::io_context io;
     ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
     ::tcp::socket socket(io), peer_socket(io);
@@ -382,7 +387,7 @@ void TlsReadTermination(bool multi_buffer, bool clean) {
     auto client_context = ::SslContext::CreateClient(client_config);
     Require(bool(client_context), "TLS termination client context creation failed");
     net::ssl::stream<::tcp::socket> peer(std::move(peer_socket), server_context);
-    ::TlsStream stream(std::make_unique<::TcpStream>(std::move(socket)),
+    ::TlsStream stream(::memory::MakeUnique<::TcpStream>(pool, pool, std::move(socket)),
                            *client_context, false);
     std::exception_ptr failure;
     unsigned completed = 0;
@@ -520,12 +525,13 @@ net::awaitable<void> RequireWireEof(::tcp::socket& peer) {
 }
 
 void WsResume(bool client, bool multi_buffer, size_t size, size_t cut, uint8_t opcode = 2) {
+    ::memory::worker_memory pool;
     net::io_context io;
     ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
     ::tcp::socket socket(io), peer(io);
     socket.connect(acceptor.local_endpoint());
     acceptor.accept(peer);
-    ::BaseWsStream stream(std::make_unique<::TcpStream>(std::move(socket)), client);
+    ::BaseWsStream stream(::memory::MakeUnique<::TcpStream>(pool, pool, std::move(socket)), client);
     std::string payload(size, '\0');
     for (size_t i = 0; i < size; ++i) payload[i] = static_cast<char>(i % 251);
     if (opcode == 8) payload = size == 0 ? "" : std::string("\x03\xe8", 2) + "bye";
@@ -544,7 +550,7 @@ void WsResume(bool client, bool multi_buffer, size_t size, size_t cut, uint8_t o
     // the first socket wait, then Cancel interrupts that actual lower read.
     ::buf::MultiBuffer residual;
     Require(::buf::AppendSpanToMultiBuffer(
-                {reinterpret_cast<const uint8_t*>(frame.data()), cut}, residual),
+                {reinterpret_cast<const uint8_t*>(frame.data()), cut}, residual, pool),
             "WS residual fixture allocation failed");
     stream.SetPendingMultiBuffer(std::move(residual));
     const std::string application = opcode == 2 || opcode == 1 ? payload : "application";
@@ -623,6 +629,7 @@ void WsResume(bool client, bool multi_buffer, size_t size, size_t cut, uint8_t o
 enum class WsConcurrent { Ping, Close, Cancel };
 
 void WsWriteBoundary(WsConcurrent action, bool owned) {
+    ::memory::worker_memory pool;
     net::io_context io;
     net::experimental::channel<void(::IoErrorCode)> close_now(io, 1);
     ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
@@ -630,7 +637,7 @@ void WsWriteBoundary(WsConcurrent action, bool owned) {
     socket.connect(acceptor.local_endpoint());
     acceptor.accept(peer);
     socket.set_option(net::socket_base::send_buffer_size(4096));
-    ::BaseWsStream stream(std::make_unique<::TcpStream>(std::move(socket)), true);
+    ::BaseWsStream stream(::memory::MakeUnique<::TcpStream>(pool, pool, std::move(socket)), true);
     std::string payload(1024 * 1024 + 19, '\0');
     for (size_t i = 0; i < payload.size(); ++i) payload[i] = static_cast<char>(i % 251);
     bool data_done = false, control_done = false;
@@ -643,7 +650,7 @@ void WsWriteBoundary(WsConcurrent action, bool owned) {
                 ::buf::MultiBuffer buffers;
                 size_t offset = 0;
                 while (offset < payload.size()) {
-                    ::buf::BufferGuard buffer{::buf::Buffer::New()};
+                    ::buf::BufferGuard buffer{::buf::Buffer::New(pool)};
                     if (!buffer) throw std::bad_alloc();
                     const size_t count = std::min(payload.size() - offset,
                                                   static_cast<size_t>(buffer->Available()));
@@ -730,15 +737,16 @@ void WsWriteBoundary(WsConcurrent action, bool owned) {
 }
 
 void WsReject(std::string_view frame, bool client, bool multi_buffer) {
+    ::memory::worker_memory pool;
     net::io_context io;
     ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
     ::tcp::socket socket(io), peer(io);
     socket.connect(acceptor.local_endpoint());
     acceptor.accept(peer);
-    ::BaseWsStream stream(std::make_unique<::TcpStream>(std::move(socket)), client);
+    ::BaseWsStream stream(::memory::MakeUnique<::TcpStream>(pool, pool, std::move(socket)), client);
     ::buf::MultiBuffer residual;
     Require(::buf::AppendSpanToMultiBuffer(
-                {reinterpret_cast<const uint8_t*>(frame.data()), frame.size()}, residual),
+                {reinterpret_cast<const uint8_t*>(frame.data()), frame.size()}, residual, pool),
             "WS residual fixture allocation failed");
     stream.SetPendingMultiBuffer(std::move(residual));
     peer.shutdown(::tcp::socket::shutdown_send);
@@ -818,12 +826,13 @@ void WsProtocolBoundaries() {
 
 void UpgradeHeaderTokens(bool outbound, bool websocket,
                          std::string_view connection, bool accepted) {
+    ::memory::worker_memory pool;
     net::io_context io;
     ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
     ::tcp::socket socket(io), peer(io);
     socket.connect(acceptor.local_endpoint());
     acceptor.accept(peer);
-    auto raw = std::make_unique<::TcpStream>(std::move(socket));
+    auto raw = ::memory::MakeUnique<::TcpStream>(pool, pool, std::move(socket));
     raw->SetIdleTimeout(2s);
     ::StreamSettings settings;
     settings.network = websocket ? "ws" : "httpupgrade";
@@ -882,12 +891,13 @@ void UpgradeHeaderTokens(bool outbound, bool websocket,
 }
 
 void ChunkExtensionBody(std::string_view wire, bool accepted, bool multi_buffer) {
+    ::memory::worker_memory pool;
     net::io_context io;
     ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
     ::tcp::socket socket(io), peer(io);
     socket.connect(acceptor.local_endpoint());
     acceptor.accept(peer);
-    auto raw = std::make_unique<::TcpStream>(std::move(socket));
+    auto raw = ::memory::MakeUnique<::TcpStream>(pool, pool, std::move(socket));
     raw->SetIdleTimeout(2s);
     auto stream = ::transport::internet::MakeHttp1BodyStream(
         std::move(raw), ::transport::internet::Http1BodyChunked{}, false);
@@ -980,12 +990,13 @@ void HttpLogHandshake(std::string_view network, bool outbound,
                       std::string_view line, bool accepted,
                       std::string_view path = "/up",
                       std::string_view host = "localhost") {
+    ::memory::worker_memory pool;
     net::io_context io;
     ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
     ::tcp::socket socket(io), peer(io);
     socket.connect(acceptor.local_endpoint());
     acceptor.accept(peer);
-    auto raw = std::make_unique<::TcpStream>(std::move(socket));
+    auto raw = ::memory::MakeUnique<::TcpStream>(pool, pool, std::move(socket));
     raw->SetIdleTimeout(2s);
     ::StreamSettings settings;
     settings.network = network;
@@ -1152,8 +1163,6 @@ void HttpLogRedaction() {
 
 TEST(HttpHandshakeReadAhead, Contract) {
     ::TlsStream::InitializeIo();
-    ::memory::ThreadMemoryResource resource;
-    auto* previous = std::pmr::set_default_resource(&resource);
     bool passed = true;
     try {
         ConnectedSocketOptions();
@@ -1176,6 +1185,5 @@ TEST(HttpHandshakeReadAhead, Contract) {
         std::cerr << error.what() << '\n';
         passed = false;
     }
-    std::pmr::set_default_resource(previous);
     { ASSERT_TRUE(passed); return; }
 }

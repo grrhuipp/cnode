@@ -2208,14 +2208,17 @@ RunVlessEncryptionServerHandshake(
     co_return runtime;
 }
 
-VlessEncryptedIo::VlessEncryptedIo(VlessBufferedReader& raw_reader,
+VlessEncryptedIo::VlessEncryptedIo(memory::worker_memory& pool,
+                                   VlessBufferedReader& raw_reader,
                                    transport::MultiBufferWriter& raw_writer,
                                    VlessEncryptionRuntime runtime)
-    : reader(raw_reader,
+    : reader(pool,
+             raw_reader,
              std::move(runtime.read_keys),
              runtime.united_key,
              std::move(runtime.read_xor))
-    , writer(raw_writer,
+    , writer(pool,
+             raw_writer,
              std::move(runtime.write_aead),
              runtime.united_key,
              std::move(runtime.write_xor))
@@ -2372,6 +2375,7 @@ namespace {
 }  // namespace
 
 VlessEncryptionReader::VlessEncryptionReader(
+    memory::worker_memory& pool,
     transport::MultiBufferReader& src,
     VlessEncryptionReadKeys keys,
     const VlessEncryptionUnitedKey& united_key,
@@ -2379,7 +2383,8 @@ VlessEncryptionReader::VlessEncryptionReader(
     : src_(src)
     , keys_(std::move(keys))
     , united_key_(united_key)
-    , header_xor_(std::move(header_xor)) {
+    , header_xor_(std::move(header_xor))
+    , read_record_(pool) {
     if (const auto* deferred = std::get_if<VlessEncryptionDeferredRead>(&keys_)) {
         unverified_ticket_ = deferred->ticket_rejection;
     }
@@ -2551,11 +2556,13 @@ net::awaitable<buf::MultiBuffer> VlessEncryptionReader::ReadMultiBuffer() {
 }
 
 VlessEncryptionWriter::VlessEncryptionWriter(
+    memory::worker_memory& pool,
     transport::MultiBufferWriter& dst,
     VlessEncryptionAead aead,
     const VlessEncryptionUnitedKey& united_key,
     std::optional<VlessEncryptionHeaderXor> header_xor) noexcept
-    : dst_(dst)
+    : pool_(pool)
+    , dst_(dst)
     , aead_(std::move(aead))
     , united_key_(united_key)
     , header_xor_(std::move(header_xor)) {}
@@ -2633,7 +2640,7 @@ net::awaitable<void> VlessEncryptionWriter::WriteEncrypted(BufferRange source) {
             }
             const size_t frame_capacity =
                 kVlessEncryptionRecordHeaderSize + planned_len + kVlessEncryptionTagSize;
-            buf::ContiguousWriteBuffer frame_buffer;
+            buf::ContiguousWriteBuffer frame_buffer(pool_);
             uint8_t* frame_ptr = frame_buffer.TryPrepare(frame_capacity);
             if (!frame_ptr) {
                 ThrowVlessEncryptionIoError("VLESS Encryption buffer allocation failed");

@@ -6,6 +6,7 @@
 #include "common/error.hpp"
 #include "common/ip_utils.hpp"
 #include "common/target_address.hpp"
+#include "common/session.hpp"
 #include "transport/async_stream.hpp"
 #include "common/allocator.hpp"
 #include "transport/internet/stream_settings.hpp"
@@ -23,11 +24,6 @@
 namespace app::dns {
 class DNS;
 }  // namespace app::dns
-
-
-namespace session {
-struct Context;
-}  // namespace session
 
 class SslContext;
 
@@ -76,9 +72,9 @@ struct OutboundDialCandidate {
 // 不属于 proxy 出站协议壳。
 struct OutboundTransportTarget {
     std::optional<OutboundDialCandidate> single_candidate; // 单个已解析候选，避免每连接 vector 分配
-    memory::ThreadLocalVector<OutboundDialCandidate> candidates; // 已解析候选地址（按优先级排序）
+    memory::Vector<OutboundDialCandidate> candidates; // 已解析候选地址（按优先级排序）
     std::string_view tls_server_name;               // TLS SNI（冷路径配置视图，可空）
-    memory::ThreadLocalString ws_host;              // HTTP Host/authority（WS、HTTPUpgrade、gRPC、XHTTP，已按端口格式化）
+    memory::String ws_host;              // HTTP Host/authority（WS、HTTPUpgrade、gRPC、XHTTP，已按端口格式化）
     const StreamSettings* stream_settings = nullptr; // 必填：冷路径准备好的传输层组合配置
     SslContext* security_context = nullptr;          // TLS/REALITY 时必填：出站 handler 的 Worker 私有上下文
     std::chrono::seconds timeout{defaults::kDialTimeout};
@@ -193,7 +189,7 @@ public:
     Dial(session::Context& ctx, std::span<const net::ip::address> addresses, uint16_t port);
 
     // Native UDP association: selects the sendThrough bind address, constructs
-    // Endpoint(io_context, dns, bind_address, args...) and records the egress.
+    // Endpoint(pool, io_context, dns, bind_address, args...) and records the egress.
     template <typename Endpoint, typename... Args>
     [[nodiscard]] tl::expected<void, ErrorCode> OpenDatagram(
         session::Context& ctx, const DatagramRemote& remote,
@@ -201,7 +197,7 @@ public:
         auto bind = SelectDatagramBind(ctx, remote);
         if (!bind) return tl::unexpected(bind.error());
         try {
-            endpoint.emplace(IoContext(), dns_, *bind, std::forward<Args>(args)...);
+            endpoint.emplace(ctx.pool, IoContext(), dns_, *bind, std::forward<Args>(args)...);
         } catch (const transport::LinkError& error) {
             ReportDatagramFailure(ctx, *bind, error.what());
             return tl::unexpected(error.code());

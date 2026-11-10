@@ -32,11 +32,11 @@ TargetAddress Target(const udp::endpoint& endpoint) {
     return TargetAddress(endpoint.address(), endpoint.port());
 }
 
-buf::MultiBuffer Packet(const TargetAddress& target, size_t size = 32) {
+buf::MultiBuffer Packet(const TargetAddress& target, size_t size, memory::worker_memory& pool) {
     std::vector<uint8_t> bytes(size);
     for (size_t i = 0; i < size; ++i) bytes[i] = static_cast<uint8_t>(i * 37);
     buf::MultiBuffer payload;
-    Check(buf::AppendSpanToMultiBuffer(bytes, payload), "packet allocation failed");
+    Check(buf::AppendSpanToMultiBuffer(bytes, payload, pool), "packet allocation failed");
     for (auto* buffer : payload) buffer->SetUDP(target);
     return payload;
 }
@@ -136,6 +136,7 @@ private:
 };
 
 struct Fixture {
+    memory::worker_memory pool;
     net::io_context io;
     DnsPeer dns_peer{io};
     app::dns::DNSWorker dns_worker;
@@ -168,7 +169,7 @@ struct Fixture {
 net::awaitable<void> RoundTrip(Fixture& fixture, UdpRequest& channel, size_t size) {
     udp::socket peer(fixture.io, udp::endpoint(net::ip::address_v4::loopback(), 0));
     const auto target = Target(peer.local_endpoint());
-    co_await channel.WriteMultiBuffer(Packet(target, size));
+    co_await channel.WriteMultiBuffer(Packet(target, size, fixture.pool));
     std::vector<uint8_t> received(65535);
     udp::endpoint source;
     const size_t count = co_await peer.async_receive_from(net::buffer(received), source, net::use_awaitable);
@@ -188,8 +189,8 @@ net::awaitable<void> RoundTrip(Fixture& fixture, UdpRequest& channel, size_t siz
 }
 
 net::awaitable<void> TestCancellationIsolation(Fixture& fixture) {
-    UdpRequest cancelled(fixture.io, fixture.dns, net::ip::address_v4::loopback());
-    UdpRequest survivor(fixture.io, fixture.dns, net::ip::address_v4::loopback());
+    UdpRequest cancelled(fixture.pool, fixture.io, fixture.dns, net::ip::address_v4::loopback());
+    UdpRequest survivor(fixture.pool, fixture.io, fixture.dns, net::ip::address_v4::loopback());
     struct Completion { bool finished = false; std::exception_ptr failure; };
     auto completion = std::make_shared<Completion>();
     net::co_spawn(fixture.io, cancelled.ReadMultiBuffer(),
@@ -250,8 +251,8 @@ net::awaitable<void> WaitForWrite(Fixture& fixture, const WriteCompletion& compl
 }
 
 net::awaitable<void> TestDnsWriteCancellation(Fixture& fixture, WriteAbort abort) {
-    UdpRequest request(fixture.io, fixture.dns, net::ip::address_v4::loopback());
-    UdpRequest survivor(fixture.io, fixture.dns, net::ip::address_v4::loopback());
+    UdpRequest request(fixture.pool, fixture.io, fixture.dns, net::ip::address_v4::loopback());
+    UdpRequest survivor(fixture.pool, fixture.io, fixture.dns, net::ip::address_v4::loopback());
     udp::socket sink(fixture.io, udp::endpoint(net::ip::address_v4::loopback(), 0));
     const auto port = sink.local_endpoint().port();
     const char* domain = abort == WriteAbort::RequestCancel ? "request-cancel.example" :
@@ -263,7 +264,7 @@ net::awaitable<void> TestDnsWriteCancellation(Fixture& fixture, WriteAbort abort
     auto complete = [completion](std::exception_ptr error) {
         RecordWriteCompletion(completion, error);
     };
-    auto write = request.WriteMultiBuffer(Packet(TargetAddress(domain, port), 32));
+    auto write = request.WriteMultiBuffer(Packet(TargetAddress(domain, port), 32, fixture.pool));
     if (abort == WriteAbort::ParentCancellation) {
         net::co_spawn(fixture.io, std::move(write),
             net::bind_cancellation_slot(parent_cancellation.slot(), complete));
@@ -310,7 +311,7 @@ net::awaitable<void> TestDnsWriteCancellation(Fixture& fixture, WriteAbort abort
 }
 
 net::awaitable<void> TestDeadlines(Fixture& fixture, int kind) {
-    UdpRequest channel(fixture.io, fixture.dns, net::ip::address_v4::loopback());
+    UdpRequest channel(fixture.pool, fixture.io, fixture.dns, net::ip::address_v4::loopback());
     PhaseDeadlineHandle phase;
     if (kind == 0) channel.SetIdleTimeout(1s);
     if (kind == 1) channel.SetReadTimeout(1s);
@@ -332,7 +333,7 @@ net::awaitable<void> TestDeadlines(Fixture& fixture, int kind) {
 }
 
 net::awaitable<void> TestIdleActivityAndClear(Fixture& fixture) {
-    UdpRequest channel(fixture.io, fixture.dns, net::ip::address_v4::loopback());
+    UdpRequest channel(fixture.pool, fixture.io, fixture.dns, net::ip::address_v4::loopback());
     channel.SetIdleTimeout(1s);
     const auto old_phase = channel.StartPhaseDeadline(1s);
     channel.ClearPhaseDeadline();
@@ -348,7 +349,7 @@ net::awaitable<void> TestIdleActivityAndClear(Fixture& fixture) {
 }
 
 net::awaitable<void> TestParentCancellation(Fixture& fixture) {
-    UdpRequest channel(fixture.io, fixture.dns, net::ip::address_v4::loopback());
+    UdpRequest channel(fixture.pool, fixture.io, fixture.dns, net::ip::address_v4::loopback());
     net::cancellation_signal cancellation;
     struct Completion { bool finished = false; std::exception_ptr failure; };
     auto completion = std::make_shared<Completion>();
@@ -361,7 +362,7 @@ net::awaitable<void> TestParentCancellation(Fixture& fixture) {
     cancellation.emit(net::cancellation_type::all);
     co_await Pause(fixture.io, 20ms);
     Check(completion->finished && completion->failure, "parent cancellation left the logical reader waiting");
-    UdpRequest survivor(fixture.io, fixture.dns, net::ip::address_v4::loopback());
+    UdpRequest survivor(fixture.pool, fixture.io, fixture.dns, net::ip::address_v4::loopback());
     co_await RoundTrip(fixture, survivor, 32);
 }
 
@@ -369,11 +370,11 @@ net::awaitable<void> TestRetiredTimer(Fixture& fixture) {
     // Queue timer readiness while no handler can execute. Destroy the owner
     // before yielding to the event loop; queued callbacks must not borrow it.
     {
-        UdpRequest old(fixture.io, fixture.dns, net::ip::address_v4::loopback());
+        UdpRequest old(fixture.pool, fixture.io, fixture.dns, net::ip::address_v4::loopback());
         old.StartPhaseDeadline(1s);
         std::this_thread::sleep_for(1050ms);
     }
-    UdpRequest current(fixture.io, fixture.dns, net::ip::address_v4::loopback());
+    UdpRequest current(fixture.pool, fixture.io, fixture.dns, net::ip::address_v4::loopback());
     co_await RoundTrip(fixture, current, 32);
     current.StartPhaseDeadline(std::chrono::seconds::max());
     co_await Pause(fixture.io, 20ms);
@@ -384,14 +385,16 @@ class OnePacketReader final : public transport::MultiBufferReader {
 public:
     transport::CancellationSource& Cancellation() noexcept override { return cancellation_; }
 
-    explicit OnePacketReader(TargetAddress target) : target_(std::move(target)) {}
+    OnePacketReader(memory::worker_memory& pool, TargetAddress target)
+        : pool_(pool), target_(std::move(target)) {}
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
         if (used_) co_return buf::MultiBuffer{};
         used_ = true;
-        co_return Packet(target_, 2000);
+        co_return Packet(target_, 2000, pool_);
     }
 private:
     transport::CancellationSource cancellation_;
+    memory::worker_memory& pool_;
 
     TargetAddress target_;
     bool used_ = false;
@@ -400,14 +403,15 @@ private:
 class IgnoreWriter final : public transport::MultiBufferWriter {
 public:
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer) override { co_return; }
+    net::awaitable<void> WriteBuffers(std::span<const net::const_buffer>) override { co_return; }
 };
 
 net::awaitable<void> TestRelayRateAndAccounting(Fixture& fixture) {
     udp::socket peer(fixture.io, udp::endpoint(net::ip::address_v4::loopback(), 0));
-    UdpRequest target(fixture.io, fixture.dns, net::ip::address_v4::loopback());
-    OnePacketReader input(Target(peer.local_endpoint()));
+    UdpRequest target(fixture.pool, fixture.io, fixture.dns, net::ip::address_v4::loopback());
+    OnePacketReader input(fixture.pool, Target(peer.local_endpoint()));
     IgnoreWriter output;
-    session::Context context;
+    session::Context context(fixture.pool);
     context.content.network = Network::UDP;
     StatsShard stats;
     const auto started = std::chrono::steady_clock::now();
@@ -422,12 +426,12 @@ net::awaitable<void> TestRelayRateAndAccounting(Fixture& fixture) {
 }
 
 net::awaitable<void> TestRelayErrorCode(Fixture& fixture) {
-    UdpRequest target(fixture.io, fixture.dns, net::ip::address_v4::loopback());
+    UdpRequest target(fixture.pool, fixture.io, fixture.dns, net::ip::address_v4::loopback());
     // Empty DNS server responses cannot be needed for a malformed datagram:
     // the channel preserves its validation failure as an application error.
-    OnePacketReader input(TargetAddress{});
+    OnePacketReader input(fixture.pool, TargetAddress{});
     IgnoreWriter output;
-    session::Context context;
+    session::Context context(fixture.pool);
     context.content.network = Network::UDP;
     StatsShard stats;
     auto result = co_await DoRelayLink(fixture.io, input, output, static_cast<AsyncStream*>(nullptr),
@@ -438,10 +442,10 @@ net::awaitable<void> TestRelayErrorCode(Fixture& fixture) {
 
 net::awaitable<void> TestRelayExternalCancellation(Fixture& fixture, bool deadline) {
     udp::socket peer(fixture.io, udp::endpoint(net::ip::address_v4::loopback(), 0));
-    UdpRequest target(fixture.io, fixture.dns, net::ip::address_v4::loopback());
-    OnePacketReader input(Target(peer.local_endpoint()));
+    UdpRequest target(fixture.pool, fixture.io, fixture.dns, net::ip::address_v4::loopback());
+    OnePacketReader input(fixture.pool, Target(peer.local_endpoint()));
     IgnoreWriter output;
-    session::Context context;
+    session::Context context(fixture.pool);
     context.content.network = Network::UDP;
     StatsShard stats;
     struct Cancellation final : TimeoutEvent {

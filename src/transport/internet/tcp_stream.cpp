@@ -105,7 +105,7 @@ enum Flag : uint8_t {
     kDeferWriteCancellation = 1u << 4,
 };
 
-struct TcpStream::Impl : memory::ThreadAllocated {
+struct TcpStream::Impl : memory::WorkerAllocated {
     static constexpr uint8_t kReadDrainBudget = 16;
 
     explicit Impl(tcp::socket sock, TcpStream& owner)
@@ -182,8 +182,9 @@ DetachedTcpState& DetachedTcpState::operator=(DetachedTcpState&& other) noexcept
 // TcpStream 实现
 // ============================================================================
 
-TcpStream::TcpStream(tcp::socket socket)
-    : impl_(std::make_unique<Impl>(std::move(socket), *this)) {
+TcpStream::TcpStream(memory::worker_memory& pool, tcp::socket socket)
+    : AsyncStream(pool)
+    , impl_(memory::MakeUnique<Impl>(pool, std::move(socket), *this)) {
     if (impl_->socket.is_open()) {
         SetupConnectedSocket(impl_->socket);
         impl_->socket.non_blocking(true);
@@ -292,7 +293,7 @@ net::awaitable<buf::MultiBuffer> TcpStream::ReadMultiBuffer() {
             co_return pending;
         }
 
-        buf::BufferGuard buffer{buf::Buffer::New()};
+        buf::BufferGuard buffer{buf::Buffer::New(Pool())};
         if (!buffer) {
             throw std::bad_alloc();
         }
@@ -649,7 +650,7 @@ net::awaitable<ProxyProtocolReadResult> TcpStream::ReadProxyProtocolHeader(
             ReleasePendingData();
             if (!buf::AppendSpanToMultiBuffer(
                     std::span<const uint8_t>(buf).subspan(result.consumed),
-                    impl_->pending_data)) {
+                    impl_->pending_data, Pool())) {
                 throw std::bad_alloc();
             }
         }
@@ -668,7 +669,7 @@ void TcpStream::PrependReadData(std::span<const uint8_t> data) {
         throw IoSystemError(io_error::operation_aborted, "TCP read closed");
     }
     buf::MultiBuffer prefix;
-    if (!buf::AppendSpanToMultiBuffer(data, prefix)) {
+    if (!buf::AppendSpanToMultiBuffer(data, prefix, Pool())) {
         throw std::bad_alloc();
     }
     PrependReadMultiBuffer(std::move(prefix));
@@ -719,14 +720,14 @@ std::optional<DetachedTcpState> TcpStream::DetachForHandoff(
 }
 
 std::unique_ptr<TcpStream> TcpStream::RestoreFromHandoff(
-    net::io_context& io_context, DetachedTcpState state) {
+    memory::worker_memory& pool, net::io_context& io_context, DetachedTcpState state) {
     if (state.fd < 0) return nullptr;
     tcp::socket socket(io_context);
     IoErrorCode ec;
     socket.assign(state.protocol, state.fd, ec);
     if (ec) return nullptr;
     state.fd = -1;
-    auto stream = std::make_unique<TcpStream>(std::move(socket));
+    auto stream = memory::MakeUnique<TcpStream>(pool, pool, std::move(socket));
     if (!state.pending_bytes.empty()) {
         stream->PrependReadData(state.pending_bytes);
     }
@@ -906,6 +907,7 @@ tcp::endpoint TcpStream::RemoteEndpoint() const {
 // Register the stable stream before connect suspends. A pending dial then
 // transfers its existing in-progress fd just like an established connection.
 net::awaitable<DialResult> TcpStream::Connect(
+    memory::worker_memory& pool,
     net::io_context& io_context,
     const tcp::endpoint& endpoint,
     const net::ip::address* bind_local,
@@ -925,7 +927,7 @@ net::awaitable<DialResult> TcpStream::Connect(
             co_return DialResult::Fail(ErrorCode::SOCKET_BIND_FAILED, ec.message());
     }
 
-    auto stream = std::make_unique<TcpStream>(std::move(socket));
+    auto stream = memory::MakeUnique<TcpStream>(pool, pool, std::move(socket));
     ConnectTimeout deadline(*stream);
     auto& scheduler = TimeoutScheduler::ForIoContext(SocketIoContext(stream->impl_->socket));
     if (!scheduler.ScheduleAfter(

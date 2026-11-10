@@ -32,7 +32,7 @@ struct BasicXHttpPacketSessionKey {
 };
 
 using XHttpPacketSessionKey =
-    BasicXHttpPacketSessionKey<memory::ThreadLocalString>;
+    BasicXHttpPacketSessionKey<memory::String>;
 
 struct XHttpPacketSessionKeyHash {
     using is_transparent = void;
@@ -75,7 +75,7 @@ public:
             }
         };
         std::shared_ptr<Stream> shared(stream.get(), DeleteAfterCommit{},
-                                      memory::ThreadLocalAllocator<Stream>{});
+                                      memory::Allocator<Stream>(stream->Pool().resource()));
         std::get_deleter<DeleteAfterCommit>(shared)->committed = true;
         (void)stream.release();
         current_ = std::move(shared);
@@ -246,8 +246,8 @@ private:
         }
     }
 
-    memory::ThreadLocalDeque<buf::MultiBuffer> ready_;
-    memory::ThreadLocalMap<uint64_t, buf::MultiBuffer> pending_;
+    memory::RingDeque<buf::MultiBuffer> ready_;
+    memory::Map<uint64_t, buf::MultiBuffer> pending_;
     size_t queued_bytes_ = 0;
     size_t queued_packets_ = 0;
     size_t queued_capacity_ = 0;
@@ -264,7 +264,7 @@ struct XHttpSessionTableEntry;
 
 // Execution-group-local logical XHTTP session joining uploads to one downlink.
 // Queued packets and in-flight uploads share one bounded payload budget.
-class XHttpPacketUpSession final : public memory::ThreadAllocated,
+class XHttpPacketUpSession final : public memory::WorkerAllocated,
                                    private transport::CancellationSubscription {
 public:
     explicit XHttpPacketUpSession(net::io_context& io_context);
@@ -399,7 +399,8 @@ enum class XHttpSessionAccess : uint8_t {
     net::io_context& io_context,
     std::string_view session_namespace,
     std::string_view session_id,
-    XHttpSessionAccess access);
+    XHttpSessionAccess access,
+    memory::worker_memory& pool);
 
 // Teardown joins upload-response readers before releasing their Worker's
 // transport hosts. Standalone callers pass their io_context.

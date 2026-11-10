@@ -32,8 +32,8 @@ struct DetachedTcpState {
 // ============================================================================
 class TcpStream final : public AsyncStream {
 public:
-    // 从已接受的 socket 构造
-    explicit TcpStream(tcp::socket socket);
+    // 从已接受的 socket 构造；pool 为所属 Worker 的内存池
+    TcpStream(memory::worker_memory& pool, tcp::socket socket);
 
     // 禁止拷贝
     TcpStream(const TcpStream&) = delete;
@@ -66,7 +66,7 @@ public:
     [[nodiscard]] std::optional<DetachedTcpState> DetachForHandoff(
         std::span<const uint8_t> prefix = {});
     [[nodiscard]] static std::unique_ptr<TcpStream> RestoreFromHandoff(
-        net::io_context& io_context, DetachedTcpState state);
+        memory::worker_memory& pool, net::io_context& io_context, DetachedTcpState state);
 
     // ── 超时控制 & 端点查询（仅 TcpStream 实现，非虚）─────────────────────────
     tcp::socket::executor_type GetExecutor() noexcept;
@@ -97,6 +97,7 @@ public:
     // Own/register the same nonblocking fd even while connect is pending.
     [[nodiscard]]
     static net::awaitable<DialResult> Connect(
+        memory::worker_memory& pool,
         net::io_context& io_context,
         const tcp::endpoint& endpoint,
         const net::ip::address* bind_local,

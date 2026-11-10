@@ -129,8 +129,8 @@ struct Runtime final : ::proxyman::inbound::ProtocolRuntime {
 
 class NativeDecoder final : public ::Inbound {
 public:
-    explicit NativeDecoder(FixtureState& state)
-        : state_(state) {
+    NativeDecoder(memory::worker_memory& pool, FixtureState& state)
+        : pool_(pool), state_(state) {
         ++state_.handlers_created;
         profile_.user_id = 71;
         profile_.email = "udp-owner@example.test";
@@ -158,7 +158,7 @@ public:
         const std::array<uint8_t, 8> owner{0x44, 0x4e, 0x53, 0x2d, 0x6f, 0x77, 0x6e, 0x72};
         if (!decoded.session_owner.Assign(owner)) throw std::bad_alloc();
         decoded.user = &profile_;
-        auto* first = ::buf::Buffer::New();
+        auto* first = ::buf::Buffer::New(pool_);
         if (!first) throw std::bad_alloc();
         first->data[0] = 0x51;
         first->data[1] = 0x52;
@@ -168,23 +168,26 @@ public:
     }
     tl::expected<std::shared_ptr<::InboundDatagramResponse>, ::ErrorCode>
     CreateDatagramResponse(const ::InboundDatagramResult&) override {
-        return ::memory::AllocateShared<TrackedResponse>(state_);
+        return ::memory::AllocateShared<TrackedResponse>(pool_.resource(), state_);
     }
 private:
+    memory::worker_memory& pool_;
     FixtureState& state_;
     ::UserProfile profile_;
 };
 
 thread_local FixtureState* g_state = nullptr;
-std::unique_ptr<::proxyman::inbound::ProtocolRuntime> MakeRuntime() {
-    return std::make_unique<Runtime>();
+std::unique_ptr<::proxyman::inbound::ProtocolRuntime> MakeRuntime(
+    memory::worker_memory& pool) {
+    return memory::MakeUnique<Runtime>(pool);
 }
 std::unique_ptr<::Inbound> MakeHandler(
     ::proxyman::inbound::ProtocolRuntime&, ::StatsShard&,
     ::ConnectionLimiter*,
-    const ::proxyman::inbound::BuildRequest&) {
+    const ::proxyman::inbound::BuildRequest&,
+    memory::worker_memory& pool) {
     if (!g_state) throw std::logic_error("fixture state not installed on Worker thread");
-    return std::make_unique<NativeDecoder>(*g_state);
+    return memory::MakeUnique<NativeDecoder>(pool, pool, *g_state);
 }
 void RegisterProtocol() {
     static const bool registered = [] {
@@ -286,11 +289,12 @@ private:
             +[](std::string_view requested_tag,
                 std::shared_ptr<const DelayedState> s,
                 ::net::io_context&,
-                ::AwaitableTaskGroup&) -> std::unique_ptr<::Outbound> {
+                ::AwaitableTaskGroup&,
+                memory::worker_memory& pool) -> std::unique_ptr<::Outbound> {
                 if (requested_tag != s->prepared_tag)
                     throw std::logic_error("prepared delayed outbound tag mismatch");
-                return std::make_unique<DelayedOutbound>(
-                    std::string(requested_tag), *s->owner_state);
+                return memory::MakeUnique<DelayedOutbound>(
+                    pool, std::string(requested_tag), *s->owner_state);
             }>(std::move(delayed)),
     };
 }

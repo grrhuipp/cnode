@@ -63,13 +63,13 @@ private:
     friend class UserOnlineSessionGuard;
     struct DeviceReservation;
     using DeviceIpMap =
-        memory::ThreadLocalUnorderedMap<memory::ThreadLocalString,
+        memory::UnorderedMap<memory::String,
                                         uint32_t,
                                         TransparentStringHash,
                                         TransparentStringEq>;
-    using UserDeviceMap = memory::ThreadLocalUnorderedMap<uint64_t, DeviceIpMap>;
+    using UserDeviceMap = memory::UnorderedMap<uint64_t, DeviceIpMap>;
     using TagDeviceMap =
-        memory::ThreadLocalUnorderedMap<memory::ThreadLocalString,
+        memory::UnorderedMap<memory::String,
                                         UserDeviceMap,
                                         TransparentStringHash,
                                         TransparentStringEq>;

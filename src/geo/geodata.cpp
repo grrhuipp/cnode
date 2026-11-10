@@ -150,7 +150,7 @@ bool DomainRuleSet::Match(std::string_view domain) const {
     }
 
     char stack_buf[256];
-    std::optional<memory::ThreadLocalString> heap_buf;
+    std::optional<memory::String> heap_buf;
     std::string_view lower_domain = domain;
     if (std::ranges::any_of(domain, [](char ch) { return 'A' <= ch && ch <= 'Z'; })) {
         char* lower = stack_buf;

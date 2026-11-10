@@ -107,6 +107,9 @@ struct Peer {
             }
             socket.send_to(net::buffer(packet), it->sender);
         }
+        // The resolver's next process-layer allocation after the full answer
+        // set arrives is its cache write.
+        if (fault_cache_write) ::memory::reject_next_process_allocation = true;
     }
     ::udp::socket socket, foreign;
     ::udp::endpoint sender;
@@ -116,7 +119,7 @@ struct Peer {
     std::map<uint16_t, std::bitset<65536>> ids;
     size_t packets = 0, batch_size = 4;
     bool hold = false, refuse = false, negative = false, nodata = false;
-    bool noise = false, duplicate_id = false;
+    bool noise = false, duplicate_id = false, fault_cache_write = false;
     int malformed_type = 0;
     std::optional<uint32_t> answer_ttl;
     int ttl_type = 0;
@@ -327,51 +330,35 @@ void TestIdRotation() {
     if (error) std::rethrow_exception(error);
 }
 
-class CacheFault : public std::pmr::memory_resource {
-public:
-    explicit CacheFault(std::pmr::memory_resource* resource) : upstream(resource) {}
-    size_t faults = 0;
-    bool fail_next = false;
-private:
-    void* do_allocate(size_t bytes, size_t alignment) override {
-        if (fail_next || (!faults && bytes == 4 * sizeof(net::ip::address))) {
-            fail_next = false;
-            ++faults;
-            throw std::bad_alloc();
-        }
-        return upstream->allocate(bytes, alignment);
-    }
-    void do_deallocate(void* p, size_t bytes, size_t alignment) override { upstream->deallocate(p, bytes, alignment); }
-    bool do_is_equal(const std::pmr::memory_resource& r) const noexcept override { return &r == this; }
-    std::pmr::memory_resource* upstream;
-};
-
 void TestCacheFailure() {
-    CacheFault resource(std::pmr::get_default_resource());
-    const auto original = std::pmr::set_default_resource(&resource);
-    try {
-        net::io_context io;
-        Peer peer(io);
-        ::app::dns::DNSWorker worker(io, Config(peer), 8);
-        DNS dns(worker);
-        std::exception_ptr error;
-        bool done = false;
-        auto run = [&]() -> net::awaitable<void> {
-            auto result = co_await dns.Resolve("cache-fault.example");
-            const auto failed_stats = co_await worker.GetCacheStats();
-            Require(result.Ok() && resource.faults == 1 && failed_stats.entries == 0,
-                    "cache allocation failure must not discard the acquired answer");
-            result = co_await dns.Resolve("cache-fault.example");
-            const auto recovered_stats = co_await worker.GetCacheStats();
-            Require(result.Ok() && recovered_stats.entries == 1,
-                    "cache must recover after write failure");
-        };
-        net::co_spawn(io, run(), [&](std::exception_ptr e) { error = e; done = true; peer.Stop(); });
-        io.run_for(3s);
-        Require(done, "cache fault test timed out");
-        if (error) std::rethrow_exception(error);
-    } catch (...) { std::pmr::set_default_resource(original); throw; }
-    std::pmr::set_default_resource(original);
+    const auto rejected = ::memory::rejected_process_allocations;
+    net::io_context io;
+    Peer peer(io);
+    ::app::dns::DNSWorker worker(io, Config(peer), 8);
+    DNS dns(worker);
+    std::exception_ptr error;
+    bool done = false;
+    auto run = [&]() -> net::awaitable<void> {
+        peer.fault_cache_write = true;
+        auto result = co_await dns.Resolve("cache-fault.example");
+        peer.fault_cache_write = false;
+        const bool fault_consumed = !::memory::reject_next_process_allocation;
+        ::memory::reject_next_process_allocation = false;
+        const auto failed_stats = co_await worker.GetCacheStats();
+        Require(result.Ok() && fault_consumed &&
+                ::memory::rejected_process_allocations == rejected + 1 &&
+                failed_stats.entries == 0,
+                "cache allocation failure must not discard the acquired answer");
+        result = co_await dns.Resolve("cache-fault.example");
+        const auto recovered_stats = co_await worker.GetCacheStats();
+        Require(result.Ok() && recovered_stats.entries == 1,
+                "cache must recover after write failure");
+    };
+    net::co_spawn(io, run(), [&](std::exception_ptr e) { error = e; done = true; peer.Stop(); });
+    io.run_for(3s);
+    ::memory::reject_next_process_allocation = false;
+    Require(done, "cache fault test timed out");
+    if (error) std::rethrow_exception(error);
 }
 
 void TestServiceStopJoin() {
@@ -500,43 +487,40 @@ void TestDatagramStopJoin(bool active) {
 }
 
 void TestDatagramAllocationFailureJoin() {
-    CacheFault resource(std::pmr::get_default_resource());
-    const auto original = std::pmr::set_default_resource(&resource);
-    try {
-        net::io_context io;
-        Peer peer(io);
-        auto transport = std::make_shared<::app::dns::DatagramExchange>(
-            io, peer.socket.local_endpoint());
-        std::weak_ptr weak = transport;
-        std::array<uint8_t, 19> query{0,0,1,0,0,1,0,0,0,0,0,0,1,'r',0,0,1,0,1};
-        resource.fail_next = true;
-        bool failed = false, joined = false;
-        std::exception_ptr failure;
-        auto run = [&]() -> net::awaitable<void> {
-            try {
-                (void)co_await transport->Exchange(query, 30s);
-            } catch (const std::bad_alloc&) {
-                failed = true;
-            }
-            transport->RequestStop();
-            co_await transport->AsyncJoin();
-            transport.reset();
-            Require(weak.expired(), "failed exchange startup must retain no receive owner");
-        };
-        net::co_spawn(io, run(), [&](std::exception_ptr error) {
-            failure = error;
-            joined = true;
-            peer.Stop();
-        });
-        io.run_for(2s);
-        if (failure) std::rethrow_exception(failure);
-        Require(joined && failed && resource.faults == 1 && peer.packets == 0,
-                "query registration allocation failure must unwind before stop and join");
-    } catch (...) {
-        std::pmr::set_default_resource(original);
-        throw;
-    }
-    std::pmr::set_default_resource(original);
+    const auto rejected = ::memory::rejected_process_allocations;
+    net::io_context io;
+    Peer peer(io);
+    auto transport = std::make_shared<::app::dns::DatagramExchange>(
+        io, peer.socket.local_endpoint());
+    std::weak_ptr weak = transport;
+    std::array<uint8_t, 19> query{0,0,1,0,0,1,0,0,0,0,0,0,1,'r',0,0,1,0,1};
+    bool failed = false, joined = false;
+    std::exception_ptr failure;
+    auto run = [&]() -> net::awaitable<void> {
+        // Query registration is the exchange's first process-layer allocation.
+        ::memory::reject_next_process_allocation = true;
+        try {
+            (void)co_await transport->Exchange(query, 30s);
+        } catch (const std::bad_alloc&) {
+            failed = true;
+        }
+        ::memory::reject_next_process_allocation = false;
+        transport->RequestStop();
+        co_await transport->AsyncJoin();
+        transport.reset();
+        Require(weak.expired(), "failed exchange startup must retain no receive owner");
+    };
+    net::co_spawn(io, run(), [&](std::exception_ptr error) {
+        failure = error;
+        joined = true;
+        peer.Stop();
+    });
+    io.run_for(2s);
+    ::memory::reject_next_process_allocation = false;
+    if (failure) std::rethrow_exception(failure);
+    Require(joined && failed && ::memory::rejected_process_allocations == rejected + 1 &&
+            peer.packets == 0,
+            "query registration allocation failure must unwind before stop and join");
 }
 }
 TEST(DnsDatagram, Contract) {

@@ -213,7 +213,7 @@ Handler::DialTarget(OutboundDialer& dialer, session::Context& ctx) {
             ctx, std::span<const net::ip::address>(dns_result.addresses), target.port);
     }
 
-    memory::ThreadLocalVector<net::ip::address> addresses;
+    memory::Vector<net::ip::address> addresses;
     addresses.reserve(dns_result.addresses.size());
 
     auto append_family = [&](const bool want_v6) {
@@ -260,8 +260,9 @@ PrepareOutbound(FreedomSettings settings) {
     return proxyman::outbound::MakePreparedOutboundCreator<
         FreedomSettings,
         +[](std::string_view, std::shared_ptr<const FreedomSettings> config,
-            net::io_context&, AwaitableTaskGroup&) -> std::unique_ptr<Outbound> {
-            return std::make_unique<Handler>(*config);
+            net::io_context&, AwaitableTaskGroup&,
+            memory::worker_memory& pool) -> std::unique_ptr<Outbound> {
+            return memory::MakeUnique<Handler>(pool, *config);
         }>(std::move(settings));
 }
 }  // namespace proxy::freedom::outbound

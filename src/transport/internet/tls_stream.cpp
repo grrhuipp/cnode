@@ -317,9 +317,15 @@ namespace {
 // stay with the library allocator; only our operation payload uses Worker PMR.
 std::unique_ptr<BIO_METHOD, decltype(&BIO_meth_free)> tls_bio_method{nullptr, BIO_meth_free};
 
+// The TLS layer allocates from the Worker pool of the TCP stream it wraps.
+memory::worker_memory& WrappedPool(const std::unique_ptr<TcpStream>& inner) {
+    if (!inner) throw std::invalid_argument("TlsStream requires TcpStream");
+    return inner->Pool();
+}
+
 }  // namespace
 
-struct TlsStream::Impl final : memory::ThreadAllocated, private transport::CancellationSubscription {
+struct TlsStream::Impl final : memory::WorkerAllocated, private transport::CancellationSubscription {
     using Gate = transport::internet::AsyncWriteGate;
     enum class Kind { Handshake, Read, Write, Shutdown };
 
@@ -386,7 +392,7 @@ struct TlsStream::Impl final : memory::ThreadAllocated, private transport::Cance
 
     // Decrypted read-ahead returned by a handshake consumer. Heap-held so an
     // idle connection without read-ahead carries no MultiBuffer state.
-    struct PrependedPlaintext : memory::ThreadAllocated {
+    struct PrependedPlaintext : memory::WorkerAllocated {
         buf::MultiBuffer data;
     };
 
@@ -411,6 +417,8 @@ struct TlsStream::Impl final : memory::ThreadAllocated, private transport::Cance
         BIO_set_data(bio, this);
         BIO_set_init(bio, 1);
         SSL_set_bio(ssl.get(), bio, bio);
+        // REALITY handshake callbacks allocate per-connection state from this pool.
+        SSL_set_app_data(ssl.get(), &tcp->Pool());
         if (server) SSL_set_accept_state(ssl.get());
         else SSL_set_connect_state(ssl.get());
         Resubscribe(tcp->Cancellation());
@@ -422,6 +430,7 @@ struct TlsStream::Impl final : memory::ThreadAllocated, private transport::Cance
         BIO* bio = SSL_get_rbio(ssl.get());
         if (!bio) throw std::logic_error("TlsStream restore missing SSL BIO");
         BIO_set_data(bio, this);
+        SSL_set_app_data(ssl.get(), &tcp->Pool());
         Resubscribe(tcp->Cancellation());
     }
 
@@ -643,7 +652,7 @@ struct TlsStream::Impl final : memory::ThreadAllocated, private transport::Cance
             return true;
         }
         if (allocated && !*allocated) {
-            *allocated = buf::BufferGuard{buf::Buffer::New()};
+            *allocated = buf::BufferGuard{buf::Buffer::New(tcp->Pool())};
             if (!*allocated) throw std::bad_alloc();
             target = net::buffer((*allocated)->Tail().data(), (*allocated)->Available());
         }
@@ -690,7 +699,7 @@ struct TlsStream::Impl final : memory::ThreadAllocated, private transport::Cance
                 } else {
                     if (kind == Kind::Read && !tcp->CanRead()) co_return 0;
                     if (allocated && !*allocated) {
-                        *allocated = buf::BufferGuard{buf::Buffer::New()};
+                        *allocated = buf::BufferGuard{buf::Buffer::New(tcp->Pool())};
                         if (!*allocated) throw std::bad_alloc();
                         target = net::buffer((*allocated)->Tail().data(), (*allocated)->Available());
                     }
@@ -834,7 +843,7 @@ struct TlsStream::Impl final : memory::ThreadAllocated, private transport::Cance
                         current, std::min<std::size_t>(current.size(), buf::Buffer::kSize));
                 } else {
                     if (!staging) {
-                        staging = buf::BufferGuard{buf::Buffer::New()};
+                        staging = buf::BufferGuard{buf::Buffer::New(tcp->Pool())};
                         if (!staging) throw std::bad_alloc();
                     }
                     const auto target = staging->Tail();
@@ -901,11 +910,13 @@ void TlsStream::InitializeIo() {
 }
 
 TlsStream::TlsStream(std::unique_ptr<TcpStream> inner, const SslContext& ctx, bool is_server)
-    : impl_(std::make_unique<Impl>(std::move(inner), ctx, is_server))
+    : AsyncStream(WrappedPool(inner))
+    , impl_(memory::MakeUnique<Impl>(Pool(), std::move(inner), ctx, is_server))
     , is_server_(is_server) {}
 
 TlsStream::TlsStream(std::unique_ptr<TcpStream> inner, SSL* existing_ssl, bool is_server)
-    : impl_(std::make_unique<Impl>(std::move(inner), existing_ssl))
+    : AsyncStream(WrappedPool(inner))
+    , impl_(memory::MakeUnique<Impl>(Pool(), std::move(inner), existing_ssl))
     , is_server_(is_server)
     , handshake_done_(true) {}
 
@@ -969,13 +980,13 @@ std::optional<DetachedTlsState> TlsStream::DetachForHandoff(
 }
 
 std::unique_ptr<TlsStream> TlsStream::RestoreFromHandoff(
-    net::io_context& io_context, DetachedTlsState state) {
+    memory::worker_memory& pool, net::io_context& io_context, DetachedTlsState state) {
     if (!state.ssl || state.tcp.fd < 0) return nullptr;
-    auto tcp = TcpStream::RestoreFromHandoff(io_context, std::move(state.tcp));
+    auto tcp = TcpStream::RestoreFromHandoff(pool, io_context, std::move(state.tcp));
     if (!tcp) return nullptr;
     SSL* ssl = std::exchange(state.ssl, nullptr);
     std::unique_ptr<TlsStream> stream(
-        new TlsStream(std::move(tcp), ssl, state.is_server));
+        new (pool) TlsStream(std::move(tcp), ssl, state.is_server));
     if (!state.plaintext_prefix.empty()) {
         stream->PrependReadData(state.plaintext_prefix);
     }
@@ -1041,7 +1052,7 @@ net::awaitable<bool> TlsStream::Handshake() {
 
     if (reality_client_state_ &&
         !VerifyRealityClientHandshake(NativeSsl(), *reality_client_state_)) {
-        memory::ThreadLocalString spider_x = std::move(reality_client_state_->spider_x);
+        memory::String spider_x = std::move(reality_client_state_->spider_x);
         ClearRealityClientState(NativeSsl(), reality_client_state_);
         if (!spider_x.empty()) {
             const char* sni = SSL_get_servername(
@@ -1065,7 +1076,7 @@ net::awaitable<bool> TlsStream::Handshake() {
             };
             try {
                 co_await impl_->Write(request_buffers);
-                memory::ThreadLocalString{}.swap(spider_x);
+                memory::String{}.swap(spider_x);
                 (void)co_await impl_->ReadMultiBuffer();
             } catch (const std::exception&) {
                 // The camouflage exchange is best-effort; authentication still
@@ -1112,7 +1123,7 @@ void TlsStream::PrependReadData(std::span<const uint8_t> data) {
         throw IoSystemError(io_error::operation_aborted, "TLS read closed");
     }
     buf::MultiBuffer prefix;
-    if (!buf::AppendSpanToMultiBuffer(data, prefix)) {
+    if (!buf::AppendSpanToMultiBuffer(data, prefix, Pool())) {
         throw std::bad_alloc();
     }
     PrependReadMultiBuffer(std::move(prefix));
@@ -1130,7 +1141,7 @@ void TlsStream::PrependReadMultiBuffer(buf::MultiBuffer&& mb) {
     if (impl_->prepended_plaintext) {
         impl_->prepended_plaintext->data.MoveTo(mb);
     } else {
-        impl_->prepended_plaintext = std::make_unique<Impl::PrependedPlaintext>();
+        impl_->prepended_plaintext = memory::MakeUnique<Impl::PrependedPlaintext>(Pool());
     }
     impl_->prepended_plaintext->data = std::move(mb);
 }
@@ -1300,7 +1311,8 @@ net::awaitable<std::unique_ptr<TlsStream>> WrapTlsServer(
     std::unique_ptr<TcpStream> inner,
     SslContext& ctx) {
 
-    auto stream = std::make_unique<TlsStream>(std::move(inner), ctx, true);
+    auto& pool = WrappedPool(inner);
+    auto stream = memory::MakeUnique<TlsStream>(pool, std::move(inner), ctx, true);
 
     if (!co_await stream->Handshake()) {
         co_return nullptr;
@@ -1314,7 +1326,8 @@ net::awaitable<std::unique_ptr<TlsStream>> WrapTlsClient(
     SslContext& ctx,
     std::string_view server_name) {
 
-    auto stream = std::make_unique<TlsStream>(std::move(inner), ctx, false);
+    auto& pool = WrappedPool(inner);
+    auto stream = memory::MakeUnique<TlsStream>(pool, std::move(inner), ctx, false);
 
     if (!server_name.empty() && !stream->SetServerIdentity(server_name)) {
         co_return nullptr;
@@ -1333,7 +1346,8 @@ net::awaitable<std::unique_ptr<TlsStream>> WrapRealityClient(
     const RealityConfig& reality,
     std::string_view server_name) {
 
-    auto stream = std::make_unique<TlsStream>(std::move(inner), ctx, false);
+    auto& pool = WrappedPool(inner);
+    auto stream = memory::MakeUnique<TlsStream>(pool, std::move(inner), ctx, false);
 
     const std::string_view effective_sni =
         server_name.empty() ? std::string_view(reality.server_name) : server_name;
@@ -2375,12 +2389,13 @@ BuildRealityClientAuthPlain(
 
 [[nodiscard]] std::unique_ptr<RealityClientState> BuildRealityClientState(
     const RealityConfig& config,
-    const MLDSA65_public_key* mldsa65_verify_key) {
+    const MLDSA65_public_key* mldsa65_verify_key,
+    memory::worker_memory& pool) {
     if (!config.public_key) {
         LOG_ERROR("REALITY client public key is missing");
         return nullptr;
     }
-    auto state = std::make_unique<RealityClientState>();
+    auto state = memory::MakeUnique<RealityClientState>(pool);
     state->short_id = config.short_id;
     state->spider_x.assign(config.spider_x.data(), config.spider_x.size());
     state->mldsa65_verify_key = mldsa65_verify_key;
@@ -2783,7 +2798,8 @@ void RealityServerMsgCallback(int is_write,
 [[nodiscard]] std::unique_ptr<RealityServerConnState>
 VerifyRealityClientHelloHandshake(
     memory::ByteVector handshake,
-    const RealityServerState& state) {
+    const RealityServerState& state,
+    memory::worker_memory& pool) {
     // This is the reassembled handshake, including its four-byte header.
     ByteReader reader(handshake);
     const uint8_t msg_type = reader.ReadU8();
@@ -2899,7 +2915,7 @@ VerifyRealityClientHelloHandshake(
     const ScopedCleanse wipe_plain{plain->data(), plain->size()};
     if (!IsRealityClientAuthAllowed(state, *plain)) return nullptr;
 
-    auto conn_state = std::make_unique<RealityServerConnState>();
+    auto conn_state = memory::MakeUnique<RealityServerConnState>(pool);
     conn_state->auth_key = *auth_key;
     if (state.mldsa65_key) {
         std::copy(session_id.begin(), session_id.end(), handshake.data() + 4 + 35);
@@ -2933,8 +2949,12 @@ VerifyRealityClientHelloHandshake(
         SSL_get_ex_data(hello->ssl, RealityConnStateExIndex()));
     std::unique_ptr<RealityServerConnState> verified;
     if (!conn_state) {
+        auto* pool = static_cast<memory::worker_memory*>(SSL_get_app_data(hello->ssl));
+        if (!pool) {
+            return fail("missing connection pool");
+        }
         verified = VerifyRealityClientHelloHandshake(
-            FramedClientHello(*hello), *state);
+            FramedClientHello(*hello), *state, *pool);
         if (!verified) {
             return fail("client hello verification failed");
         }
@@ -3266,7 +3286,7 @@ bool TlsStream::SetRealityClient(const RealityConfig& reality) {
         return false;
     }
 
-    auto state = BuildRealityClientState(reality, verify_key);
+    auto state = BuildRealityClientState(reality, verify_key, Pool());
     if (!state) {
         return false;
     }
@@ -3293,7 +3313,8 @@ bool TlsStream::SetRealityClient(const RealityConfig& reality) {
 
 std::unique_ptr<RealityServerConnState> VerifyRealityClientHello(
     memory::ByteVector handshake,
-    const SslContext& ctx) {
+    const SslContext& ctx,
+    memory::worker_memory& pool) {
     const SSL_CTX* ssl_ctx = ctx.Native();
     const auto* state = ssl_ctx
         ? static_cast<const RealityServerState*>(
@@ -3302,7 +3323,7 @@ std::unique_ptr<RealityServerConnState> VerifyRealityClientHello(
     if (!state) {
         return nullptr;
     }
-    return VerifyRealityClientHelloHandshake(std::move(handshake), *state);
+    return VerifyRealityClientHelloHandshake(std::move(handshake), *state, pool);
 }
 
 bool TlsStream::SetRealityServerPreverified(

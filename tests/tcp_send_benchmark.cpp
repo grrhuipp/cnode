@@ -48,7 +48,8 @@ net::awaitable<Measurement> Transfer(
 }
 
 TEST(TcpSendBenchmark, VerifiedBursts) {
-    const auto baseline = memory::ThreadMemoryPool().OutstandingAllocations();
+    memory::worker_memory pool;
+    const auto baseline = pool.OutstandingAllocations();
     for (const std::size_t burst : {1u, 8192u, 65536u}) {
         for (const std::size_t pieces : {1u, 8u, 16u}) {
             if (pieces > burst) continue;
@@ -62,7 +63,7 @@ TEST(TcpSendBenchmark, VerifiedBursts) {
             socket.connect(acceptor.local_endpoint());
             acceptor.accept(peer);
             peer.set_option(net::socket_base::receive_buffer_size(256 * 1024));
-            TcpStream stream(std::move(socket));
+            TcpStream stream(pool, std::move(socket));
             stream.SetWriteTimeout(2s);
             std::vector<uint8_t> payload(burst);
             for (std::size_t index = 0; index < burst; ++index)
@@ -94,6 +95,6 @@ TEST(TcpSendBenchmark, VerifiedBursts) {
                 measured.wall_ns / iterations, measured.cpu_ns / iterations);
         }
     }
-    EXPECT_EQ(memory::ThreadMemoryPool().OutstandingAllocations(), baseline);
+    EXPECT_EQ(pool.OutstandingAllocations(), baseline);
 }
 } // namespace

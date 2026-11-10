@@ -17,18 +17,23 @@ thread_local int fail_after = -1;
 class FailingResource final : public std::pmr::memory_resource {
 public:
     explicit FailingResource(std::pmr::memory_resource* upstream) : upstream_(upstream) {}
+    [[nodiscard]] size_t Live() const noexcept { return live_; }
 private:
     void* do_allocate(size_t size, size_t alignment) override {
         if (fail_after >= 0 && fail_after-- == 0) throw std::bad_alloc();
-        return upstream_->allocate(size, alignment);
+        void* pointer = upstream_->allocate(size, alignment);
+        ++live_;
+        return pointer;
     }
     void do_deallocate(void* pointer, size_t size, size_t alignment) override {
+        --live_;
         upstream_->deallocate(pointer, size, alignment);
     }
     bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
         return this == &other;
     }
     std::pmr::memory_resource* upstream_;
+    size_t live_ = 0;
 };
 
 class FailAllocation {
@@ -51,7 +56,7 @@ DnsResult Answer(std::string_view address, size_t count = 1) {
     return result;
 }
 
-void TestFailedInsertion(bool negative) {
+void TestFailedInsertion(bool negative, std::pmr::memory_resource* resource) {
     const std::array domains{std::string("cached.example"), std::string(60, 'a') + ".example"};
     const auto old_answer = Answer("192.0.2.1");
     const auto new_answer = Answer("192.0.2.2", 400);
@@ -63,7 +68,7 @@ void TestFailedInsertion(bool negative) {
     int failures = 0;
     bool completed = false;
     for (int allocation = 0; allocation < 20; ++allocation) {
-        DnsCache cache(1, 10, 600);
+        DnsCache cache(1, 10, 600, nullptr, resource);
         cache.Store(domains[0], old_answer);
         bool rejected = false;
         {
@@ -97,8 +102,8 @@ void TestFailedInsertion(bool negative) {
     Require(failures > 0 && completed, "allocation sweep must cover failures and success");
 }
 
-void TestCapacityAndResults() {
-    DnsCache cache(2, 10, 600);
+void TestCapacityAndResults(std::pmr::memory_resource* resource) {
+    DnsCache cache(2, 10, 600, nullptr, resource);
     const auto answer = Answer("192.0.2.3");
     cache.Store("one.example", answer);
     cache.Store("two.example", answer);
@@ -141,8 +146,8 @@ void TestCapacityAndResults() {
             "disabled caches must retain no entries");
 }
 
-void TestFailedReplacement() {
-    DnsCache cache(1, 10, 600);
+void TestFailedReplacement(std::pmr::memory_resource* resource) {
+    DnsCache cache(1, 10, 600, nullptr, resource);
     const auto original = Answer("192.0.2.1");
     const auto replacement = Answer("192.0.2.2", 400);
     cache.Store("same.example", original);
@@ -170,14 +175,14 @@ void RecordNegativeEvent(std::string_view domain, std::string_view reason,
     negative_events.push_back({std::string(domain), std::string(reason), std::string(event), hits});
 }
 
-void TestNegativeEventLifecycle() {
+void TestNegativeEventLifecycle(std::pmr::memory_resource* resource) {
     negative_events.clear();
     DnsResult negative;
     negative.error = ::ErrorCode::DNS_NO_RECORD;
     negative.error_msg = "NXDOMAIN";
     negative.ttl = 60;
     {
-        DnsCache cache(1, 0, 600, RecordNegativeEvent);
+        DnsCache cache(1, 0, 600, RecordNegativeEvent, resource);
         cache.Store("negative.example", negative);
         for (size_t i = 0; i < 128; ++i) {
             const auto result = cache.GetResult("negative.example");
@@ -221,46 +226,45 @@ void TestNegativeEventLifecycle() {
 
 TEST(DnsCache, Contract) {
     ::memory::ConfigureProcessAllocator();
-    FailingResource resource(std::pmr::get_default_resource());
-    auto* original = std::pmr::set_default_resource(&resource);
+    FailingResource resource(::memory::process_resource());
     bool passed = true;
     try {
-        TestFailedInsertion(false);
-        TestFailedInsertion(true);
-        TestFailedReplacement();
-        TestCapacityAndResults();
-        TestNegativeEventLifecycle();
+        TestFailedInsertion(false, &resource);
+        TestFailedInsertion(true, &resource);
+        TestFailedReplacement(&resource);
+        TestCapacityAndResults(&resource);
+        TestNegativeEventLifecycle(&resource);
+        Require(resource.Live() == 0, "destroyed caches must release all their storage");
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         passed = false;
     }
-    std::pmr::set_default_resource(original);
     { ASSERT_TRUE(passed); return; }
 }
 
 TEST(DnsCache, ZeroTtlAddressesInvalidateOldAnswersAndReleaseTheirStorage) {
     ::memory::ConfigureProcessAllocator();
-    const auto baseline = ::memory::ThreadMemoryPool().OutstandingAllocations();
+    FailingResource resource(::memory::process_resource());
     {
-        DnsCache cache(2, 60, 3600);
+        DnsCache cache(2, 60, 3600, nullptr, &resource);
         // The bucket array grows on first insertion and is retained; only entry
         // storage is expected to return after a zero-TTL invalidation.
         auto warm = Answer("192.0.2.9");
         cache.Store("warm.example", warm);
         warm.ttl = 0;
         cache.Store("warm.example", warm);
-        const auto empty_allocations = ::memory::ThreadMemoryPool().OutstandingAllocations();
+        const auto empty_allocations = resource.Live();
         cache.Store("ttl.example", Answer("192.0.2.1", 400));
         auto current = Answer("192.0.2.2");
         current.ttl = 0;
         cache.Store("ttl.example", current);
         EXPECT_FALSE(cache.GetResult("ttl.example"));
         EXPECT_EQ(cache.GetStats().entries, 0);
-        EXPECT_EQ(::memory::ThreadMemoryPool().OutstandingAllocations(), empty_allocations);
+        EXPECT_EQ(resource.Live(), empty_allocations);
         cache.Store("uncached.example", current);
         EXPECT_FALSE(cache.GetResult("uncached.example"));
         EXPECT_EQ(cache.GetStats().entries, 0);
-        EXPECT_EQ(::memory::ThreadMemoryPool().OutstandingAllocations(), empty_allocations);
+        EXPECT_EQ(resource.Live(), empty_allocations);
 
         DnsResult negative;
         negative.error = ErrorCode::DNS_NO_RECORD;
@@ -271,7 +275,7 @@ TEST(DnsCache, ZeroTtlAddressesInvalidateOldAnswersAndReleaseTheirStorage) {
         cache.Store("ttl.example", current);
         EXPECT_FALSE(cache.GetResult("ttl.example"));
         EXPECT_EQ(cache.GetStats().entries, 0);
-        EXPECT_EQ(::memory::ThreadMemoryPool().OutstandingAllocations(), empty_allocations);
+        EXPECT_EQ(resource.Live(), empty_allocations);
 
         const auto retained = Answer("192.0.2.3");
         cache.Store("ttl.example", retained);
@@ -279,5 +283,5 @@ TEST(DnsCache, ZeroTtlAddressesInvalidateOldAnswersAndReleaseTheirStorage) {
         ASSERT_TRUE(cached);
         EXPECT_EQ(cached->addresses, retained.addresses);
     }
-    EXPECT_EQ(::memory::ThreadMemoryPool().OutstandingAllocations(), baseline);
+    EXPECT_EQ(resource.Live(), 0u);
 }

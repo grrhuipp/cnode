@@ -52,6 +52,7 @@ public:
 
 class NativeInbound final : public ::Inbound {
 public:
+    explicit NativeInbound(memory::worker_memory& pool) : pool_(pool) {}
 
     ::net::awaitable<::RelayResult> Process(
         std::unique_ptr<::AsyncStream>, ::routing::Dispatcher&,
@@ -70,7 +71,7 @@ public:
         result.session_id = request.payload.front() == 0x63 ? 2 : 1;
         result.target = ::TargetAddress(
             ::net::ip::address_v4::loopback(), 53);
-        auto buffer = ::buf::BufferGuard{::buf::Buffer::New()};
+        auto buffer = ::buf::BufferGuard{::buf::Buffer::New(pool_)};
         if (!buffer) return tl::unexpected(::ErrorCode::RESOURCE_EXHAUSTED);
         buffer->Tail()[0] = request.payload.front();
         buffer->Produce(1);
@@ -79,10 +80,11 @@ public:
     }
     tl::expected<std::shared_ptr<::InboundDatagramResponse>, ::ErrorCode>
     CreateDatagramResponse(const ::InboundDatagramResult&) override {
-        return ::memory::AllocateShared<Response>();
+        return ::memory::AllocateShared<Response>(pool_.resource());
     }
 
 private:
+    memory::worker_memory& pool_;
     ::UserProfile profile_;
 };
 
@@ -201,13 +203,13 @@ public:
 
 
 void VerifySocketIdentityRecycle(
-    ::net::io_context& io, Reclaimer& reclaimer) {
+    ::net::io_context& io, Reclaimer& reclaimer, memory::worker_memory& pool) {
     io.restart();
     ::worker_detail::UdpResourceBudget budget({
         .associations = 2, .datagrams = 8, .payload_capacity = 64 * 1024});
-    Ingress ingress("native-reuse", std::make_unique<NativeInbound>(), reclaimer, budget, io);
-    Ingress other("native-other", std::make_unique<NativeInbound>(), reclaimer, budget, io);
-    auto old_socket = Ingress::MakeSocket(io);
+    Ingress ingress(pool, "native-reuse", memory::MakeUnique<NativeInbound>(pool, pool), reclaimer, budget, io);
+    Ingress other(pool, "native-other", memory::MakeUnique<NativeInbound>(pool, pool), reclaimer, budget, io);
+    auto old_socket = Ingress::MakeSocket(io, pool);
     ::IoErrorCode ec;
     old_socket->open(::udp::v4(), ec);
     if (ec) Fail("failed to open old socket identity test socket");
@@ -249,7 +251,7 @@ void VerifySocketIdentityRecycle(
         Fail("old socket session was not created");
     ingress.CloseSocket("identity-socket");
 
-    auto replacement_socket = Ingress::MakeSocket(io);
+    auto replacement_socket = Ingress::MakeSocket(io, pool);
     replacement_socket->open(::udp::v4(), ec);
     if (ec) Fail("failed to open replacement socket identity");
     replacement_socket->bind({::net::ip::address_v4::loopback(), 0}, ec);
@@ -296,11 +298,11 @@ void VerifySocketIdentityRecycle(
     ingress.RequestStop();
 }
 
-void VerifyUplinkRefresh(::net::io_context& io, Reclaimer& reclaimer) {
+void VerifyUplinkRefresh(::net::io_context& io, Reclaimer& reclaimer, memory::worker_memory& pool) {
     io.restart();
     ::worker_detail::UdpResourceBudget budget;
-    Ingress ingress("native-refresh", std::make_unique<NativeInbound>(), reclaimer, budget, io);
-    auto socket = Ingress::MakeSocket(io);
+    Ingress ingress(pool, "native-refresh", memory::MakeUnique<NativeInbound>(pool, pool), reclaimer, budget, io);
+    auto socket = Ingress::MakeSocket(io, pool);
     ::IoErrorCode ec;
     socket->open(::udp::v4(), ec);
     if (ec) Fail("failed to open UDP refresh test socket");
@@ -362,7 +364,7 @@ void VerifyUplinkRefresh(::net::io_context& io, Reclaimer& reclaimer) {
         Fail("idle-expired native dispatch did not join at actual completion");
 }
 
-void VerifyProtocolLocalAssociation() {
+void VerifyProtocolLocalAssociation(memory::worker_memory& pool) {
     using namespace ::proxyman::inbound;
     UserOnlineTracker tracker;
     StatsShard stats{};
@@ -385,7 +387,7 @@ void VerifyProtocolLocalAssociation() {
         UserSet users = PreparedShadowsocksUsers{std::move(user)};
         UserStore::InstallWorkerView(UserStore::PrepareWorkerView(
             UserStore::PrepareUsers("protocol-association", users)));
-        proxy::shadowsocks::inbound::Handler handler(tracker, stats, nullptr, *cipher);
+        proxy::shadowsocks::inbound::Handler handler(pool, tracker, stats, nullptr, *cipher);
         ss::Ss2022UdpSessionState encoder;
         if (!ss::Init2022UdpSessionState(encoder, *cipher, key))
             Fail("failed to initialize protocol association encoder");
@@ -519,7 +521,7 @@ void VerifyHandoffDirectoryNamespaces() {
     expect_isolated(settings, other_configuration);
 }
 
-void VerifyHandoffDirectoryTombstone(::net::io_context& io, Reclaimer& reclaimer) {
+void VerifyHandoffDirectoryTombstone(::net::io_context& io, Reclaimer& reclaimer, memory::worker_memory& pool) {
     using namespace ::worker_detail;
     UdpHandoffDirectory directory;
     const auto& policy = ::ss::Ss2022UdpAssociation::Policy();
@@ -533,7 +535,7 @@ void VerifyHandoffDirectoryTombstone(::net::io_context& io, Reclaimer& reclaimer
         .configuration = configuration.get(), .client = ClientSessionKey{owner, 9}};
     UdpResourceBudget budget;
     const ::udp::endpoint endpoint{::net::ip::address_v4::loopback(), 48234};
-    Ingress ingress("directory-tombstone", std::make_unique<NativeInbound>(),
+    Ingress ingress(pool, "directory-tombstone", memory::MakeUnique<NativeInbound>(pool, pool),
                     reclaimer, budget, io);
     auto session = ingress.CreateClientSession(
         key.listener, key.client, io, {},
@@ -622,21 +624,17 @@ TEST(UdpNativeLifecycle, Contract) {
         std::fflush(stderr);
         std::_Exit(99);
     });
-    ::memory::ThreadMemoryResource owner_resource;
-    struct RestoreDefaultResource {
-        std::pmr::memory_resource* previous;
-        ~RestoreDefaultResource() { std::pmr::set_default_resource(previous); }
-    } resource_scope{std::pmr::set_default_resource(&owner_resource)};
+    memory::worker_memory pool;
     ::net::io_context io;
     auto& scheduler = ::TimeoutScheduler::ForIoContext(io);
     Reclaimer reclaimer(scheduler, nullptr, [](void*, std::exception_ptr) { std::terminate(); });
     VerifyHandoffDirectoryNamespaces();
-    VerifyProtocolLocalAssociation();
-    VerifyHandoffDirectoryTombstone(io, reclaimer);
+    VerifyProtocolLocalAssociation(pool);
+    VerifyHandoffDirectoryTombstone(io, reclaimer, pool);
     VerifyHandoffDirectoryCapacity();
     ::worker_detail::UdpResourceBudget budget;
-    Ingress ingress("native-test", std::make_unique<NativeInbound>(), reclaimer, budget, io);
-    auto socket = Ingress::MakeSocket(io);
+    Ingress ingress(pool, "native-test", memory::MakeUnique<NativeInbound>(pool, pool), reclaimer, budget, io);
+    auto socket = Ingress::MakeSocket(io, pool);
     ::IoErrorCode ec;
     socket->open(::udp::v4(), ec);
     if (ec) Fail("failed to open native UDP test socket");
@@ -688,7 +686,7 @@ TEST(UdpNativeLifecycle, Contract) {
     if (installed.associations != 2 || installed.closed_associations != 0 ||
         installed.native_dispatches != 2)
         Fail("native UDP associations were not installed");
-    if (!ingress.ReplaceHandler(std::make_unique<NativeInbound>()))
+    if (!ingress.ReplaceHandler(memory::MakeUnique<NativeInbound>(pool, pool)))
         Fail("same-socket handler replacement was rejected");
 
     io.poll();
@@ -748,6 +746,6 @@ TEST(UdpNativeLifecycle, Contract) {
         ingress.GetResourceStats().native_dispatches != 0)
         Fail("native join lost parent cancellation state before drain completion");
 
-    VerifySocketIdentityRecycle(io, reclaimer);
-    VerifyUplinkRefresh(io, reclaimer);
+    VerifySocketIdentityRecycle(io, reclaimer, pool);
+    VerifyUplinkRefresh(io, reclaimer, pool);
 }

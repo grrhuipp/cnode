@@ -56,12 +56,11 @@ inline void DisableTransparentHugePages() noexcept {
     return (value + unit - 1) & ~(unit - 1);
 }
 
-class worker_memory;
-[[nodiscard]] worker_memory& ThreadMemoryPool() noexcept;
-
 #ifdef CNODE_TEST_ALLOCATOR_FAULT
 inline thread_local bool reject_next_process_allocation = false;
 inline thread_local size_t rejected_process_allocations = 0;
+inline thread_local bool reject_next_pmr_allocation = false;
+inline thread_local size_t rejected_pmr_allocations = 0;
 #endif
 
 namespace detail {
@@ -127,13 +126,22 @@ private:
 
 } // namespace detail
 
-// Process-lifetime, thread-safe resource backed by thread-local heaps without a
-// shared pooling layer.
+// Process-lifetime, thread-safe resource backed by mimalloc's thread-local
+// heaps without a shared pooling layer. The global default PMR resource is not
+// replaced.
 [[nodiscard]] inline std::pmr::memory_resource* process_resource() noexcept {
     alignas(detail::process_memory_resource) static std::byte
         storage[sizeof(detail::process_memory_resource)];
     static auto* const resource = ::new (storage) detail::process_memory_resource;
     return resource;
+}
+
+// Resolves a caller-supplied resource once at the ownership boundary: storage
+// that names no resource lives in the process layer, never in a Worker pool
+// chosen from thread state.
+[[nodiscard]] inline std::pmr::memory_resource* ResourceOrProcess(
+    std::pmr::memory_resource* resource) noexcept {
+    return resource ? resource : process_resource();
 }
 
 // Worker-local pool: one mimalloc first-class heap. mimalloc keeps this heap's
@@ -142,8 +150,10 @@ private:
 // free returns to the shared arena and is purged after mi_option_purge_delay;
 // Collect() forces that for this heap's thread-local state.
 //
-// Single-thread ownership: the first allocation binds the owner thread and the
-// heap's thread-bound theap. Allocation, release and Collect() on any other
+// The pool is owned explicitly (a Worker member, or a test-local object) and
+// passed to every allocation; nothing selects it from thread-local or default
+// PMR state. The first allocation binds the owner thread and the heap's
+// thread-bound theap. Allocation, sized release and Collect() on any other
 // thread terminate, as does releasing a block this heap does not own.
 class worker_memory final : public std::pmr::memory_resource {
 public:
@@ -151,6 +161,7 @@ public:
     struct Footprint {
         std::size_t committed_bytes = 0;
         std::size_t used_bytes = 0;
+        std::size_t live_allocations = 0;
         std::size_t pages = 0;
     };
 
@@ -164,7 +175,7 @@ public:
     ~worker_memory() override {
         // The owner thread's mimalloc state may already be torn down at thread
         // exit; only the heap itself is touched here, never theap_.
-        if (live_allocations_ != 0) std::terminate();
+        if (GetFootprint().live_allocations != 0) std::terminate();
         mi_heap_delete(heap_);
     }
 
@@ -176,8 +187,10 @@ public:
         return footprint;
     }
 
+    // Exact for blocks released on the owner thread: mimalloc updates a page's
+    // use count on every local free.
     [[nodiscard]] std::size_t OutstandingAllocations() const noexcept {
-        return live_allocations_;
+        return GetFootprint().live_allocations;
     }
 
     // Returns this heap's empty pages to the arena and purges them now.
@@ -202,6 +215,13 @@ public:
         }
         if (!theap_ && !(theap_ = mi_heap_theap(heap_))) return nullptr;
         if (!ValidAlignment(alignment)) return nullptr;
+#ifdef CNODE_TEST_ALLOCATOR_FAULT
+        if (reject_next_pmr_allocation) {
+            reject_next_pmr_allocation = false;
+            ++rejected_pmr_allocations;
+            return nullptr;
+        }
+#endif
         void* block = nullptr;
         if (alignment > kNaturalAlignment) {
             block = mi_theap_malloc_aligned(theap_, bytes, alignment);
@@ -210,7 +230,6 @@ public:
             // block on that alignment, so no aligned slow path is needed.
             block = mi_theap_malloc(theap_, RoundUp(bytes, alignment));
         }
-        if (block) ++live_allocations_;
         return block;
     }
 
@@ -219,7 +238,6 @@ public:
         RequireOwnerThread();
         if (mi_heap_of(pointer) != heap_) std::terminate();
         mi_free(pointer);
-        --live_allocations_;
     }
 
 protected:
@@ -243,6 +261,7 @@ private:
         auto& footprint = *static_cast<Footprint*>(argument);
         footprint.committed_bytes += area->committed;
         footprint.used_bytes += area->used * area->full_block_size;
+        footprint.live_allocations += area->used;
         ++footprint.pages;
         return true;
     }
@@ -254,45 +273,18 @@ private:
     mi_heap_t* const heap_;
     mi_theap_t* theap_ = nullptr;
     std::uintptr_t owner_token_ = 0;
-    std::size_t live_allocations_ = 0;
 };
 
-[[nodiscard]] inline std::pmr::memory_resource* worker_pool_resource() noexcept;
-
-[[nodiscard]] inline std::pmr::memory_resource* CurrentResource() noexcept {
-    auto* default_resource = std::pmr::get_default_resource();
-    return default_resource == std::pmr::new_delete_resource()
-        ? worker_pool_resource()
-        : default_resource;
-}
-[[nodiscard]] inline worker_memory& ThreadMemoryPool() noexcept {
-    thread_local worker_memory pool;
-    return pool;
+// Releases a block whose owning Worker pool is not at hand (unsized object
+// delete). The block must come from a Worker heap; mimalloc returns it to its
+// page. Owner-thread release is a caller invariant on this path.
+inline void ReleaseWorkerBlock(void* p) noexcept {
+    if (!p) return;
+    const mi_heap_t* const heap = mi_heap_of(p);
+    if (!heap || heap == mi_heap_main()) std::terminate();
+    mi_free(p);
 }
 
-#ifdef CNODE_TEST_ALLOCATOR_FAULT
-inline thread_local bool reject_next_pmr_allocation = false;
-inline thread_local size_t rejected_pmr_allocations = 0;
-#endif
-
-[[nodiscard]] inline void* AllocatePmr(
-    size_t size, size_t alignment = alignof(std::max_align_t)) noexcept {
-#ifdef CNODE_TEST_ALLOCATOR_FAULT
-    if (reject_next_pmr_allocation) {
-        reject_next_pmr_allocation = false;
-        ++rejected_pmr_allocations;
-        return nullptr;
-    }
-#endif
-    return ThreadMemoryPool().Allocate(size, alignment);
-}
-
-// Releases a block of the calling thread's pool; a block of any other pool or
-// thread terminates.
-inline void DeallocatePmr(void* p, size_t size = 0,
-                          size_t alignment = 0) noexcept {
-    ThreadMemoryPool().Deallocate(p, size, alignment);
-}
 // Native Asio operation storage can be allocated, delivered, cancelled, or
 // destroyed by different reactor threads. It never belongs to a session pool.
 template <class T>
@@ -304,63 +296,57 @@ public:
     template <class U> struct rebind { using other = ProcessAllocator<U>; };
 };
 
-struct ThreadAllocated {
-    static void* operator new(std::size_t size) {
-        if (void* p = AllocatePmr(size)) return p;
+// Objects allocated from an explicit Worker pool: `new (pool) T(...)`.
+// Deleting through a base pointer is fine: release does not need the pool.
+struct WorkerAllocated {
+    static void* operator new(std::size_t) = delete;
+    static void* operator new(std::size_t, std::align_val_t) = delete;
+    static void* operator new(std::size_t size, worker_memory& pool) {
+        if (void* p = pool.Allocate(size, alignof(std::max_align_t))) return p;
         throw std::bad_alloc();
     }
-    static void* operator new(std::size_t size, std::align_val_t alignment) {
-        if (void* p = AllocatePmr(size, static_cast<std::size_t>(alignment))) return p;
+    static void* operator new(std::size_t size, std::align_val_t alignment, worker_memory& pool) {
+        if (void* p = pool.Allocate(size, static_cast<std::size_t>(alignment))) return p;
         throw std::bad_alloc();
     }
     static void* operator new(std::size_t, void* p) noexcept { return p; }
     static void operator delete(void*, void*) noexcept {}
-    static void operator delete(void* p) noexcept { DeallocatePmr(p); }
-    static void operator delete(void* p, std::size_t) noexcept { DeallocatePmr(p); }
-    static void operator delete(void* p, std::align_val_t) noexcept { DeallocatePmr(p); }
-    static void operator delete(void* p, std::size_t, std::align_val_t) noexcept { DeallocatePmr(p); }
+    static void operator delete(void* p, worker_memory&) noexcept { ReleaseWorkerBlock(p); }
+    static void operator delete(void* p, std::align_val_t, worker_memory&) noexcept {
+        ReleaseWorkerBlock(p);
+    }
+    static void operator delete(void* p) noexcept { ReleaseWorkerBlock(p); }
+    static void operator delete(void* p, std::align_val_t) noexcept { ReleaseWorkerBlock(p); }
 };
 
-class ThreadMemoryResource final : public std::pmr::memory_resource {
-protected:
-    void* do_allocate(size_t bytes, size_t alignment) override {
-#ifdef CNODE_TEST_ALLOCATOR_FAULT
-        if (reject_next_pmr_allocation) {
-            reject_next_pmr_allocation = false;
-            ++rejected_pmr_allocations;
-            throw std::bad_alloc();
-        }
-#endif
-        if (void* p = ThreadMemoryPool().Allocate(bytes, alignment)) return p;
-        throw std::bad_alloc();
-    }
-    void do_deallocate(void* p, size_t bytes, size_t alignment) override {
-        DeallocatePmr(p, bytes, alignment);
-    }
-    [[nodiscard]] bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
-        return this == &other;
-    }
-};
-
-[[nodiscard]] inline std::pmr::memory_resource* worker_pool_resource() noexcept {
-    static ThreadMemoryResource resource;
-    return &resource;
+template <class T, class... Args>
+    requires std::is_base_of_v<WorkerAllocated, T>
+[[nodiscard]] std::unique_ptr<T> MakeUnique(worker_memory& pool, Args&&... args) {
+    return std::unique_ptr<T>(new (pool) T(std::forward<Args>(args)...));
 }
 
 inline void ConfigureProcessAllocator() noexcept {
     DisableTransparentHugePages();
     mi_option_set(mi_option_allow_thp, 0);
     mi_option_set(mi_option_purge_delay, 10);
-    std::pmr::set_default_resource(worker_pool_resource());
 }
 
-inline void CollectBurst() noexcept {
-    ThreadMemoryPool().Collect();
+// Forces this thread's process-layer mimalloc state to return empty pages now.
+inline void CollectProcessHeap() noexcept {
     mi_collect(true);
 }
 
+// Owner thread of `pool` only: also collects the pool heap.
+inline void CollectBurst(worker_memory& pool) noexcept {
+    pool.Collect();
+    CollectProcessHeap();
+}
+
+// PMR allocator bound to one resource. Default construction means the process
+// layer; a Worker pool is used only when passed in. Copies keep the source's
+// resource; move assignment and swap carry it along.
 template <class T>
-class ThreadLocalAllocator {
+class Allocator {
     template <class U>
     struct UsesAllocatorConstruction
         : std::uses_allocator<U, std::pmr::polymorphic_allocator<T>> {};
@@ -373,22 +359,22 @@ public:
     using value_type = T;
     using propagate_on_container_move_assignment = std::true_type;
     using propagate_on_container_swap = std::true_type;
-    ThreadLocalAllocator() noexcept : ThreadLocalAllocator(CurrentResource()) {}
-    ThreadLocalAllocator(std::pmr::memory_resource* resource) noexcept
-        : resource_(resource ? resource : CurrentResource()) {}
-    ThreadLocalAllocator(const ThreadLocalAllocator&) noexcept = default;
-    ThreadLocalAllocator& operator=(const ThreadLocalAllocator&) noexcept = default;
-    ThreadLocalAllocator(ThreadLocalAllocator&&) noexcept = default;
-    ThreadLocalAllocator& operator=(ThreadLocalAllocator&&) noexcept = default;
+    Allocator() noexcept : resource_(process_resource()) {}
+    Allocator(std::pmr::memory_resource* resource) noexcept
+        : resource_(ResourceOrProcess(resource)) {}
+    Allocator(const Allocator&) noexcept = default;
+    Allocator& operator=(const Allocator&) noexcept = default;
+    Allocator(Allocator&&) noexcept = default;
+    Allocator& operator=(Allocator&&) noexcept = default;
     template <class U>
-    ThreadLocalAllocator(const ThreadLocalAllocator<U>& other) noexcept
+    Allocator(const Allocator<U>& other) noexcept
         : resource_(other.resource_) {}
     template <class U>
-    ThreadLocalAllocator(const std::pmr::polymorphic_allocator<U>& other) noexcept
-        : ThreadLocalAllocator(other.resource()) {}
-    template <class U> struct rebind { using other = ThreadLocalAllocator<U>; };
-    [[nodiscard]] ThreadLocalAllocator select_on_container_copy_construction() const noexcept {
-        return {};
+    Allocator(const std::pmr::polymorphic_allocator<U>& other) noexcept
+        : Allocator(other.resource()) {}
+    template <class U> struct rebind { using other = Allocator<U>; };
+    [[nodiscard]] Allocator select_on_container_copy_construction() const noexcept {
+        return *this;
     }
     [[nodiscard]] std::pmr::memory_resource* resource() const noexcept {
         return resource_;
@@ -406,20 +392,20 @@ public:
             pointer, std::forward<Args>(args)...);
     }
     template <class U>
-    [[nodiscard]] bool operator==(const ThreadLocalAllocator<U>& other) const noexcept {
+    [[nodiscard]] bool operator==(const Allocator<U>& other) const noexcept {
         return resource_ == other.resource_ || resource_->is_equal(*other.resource_);
     }
 
 private:
-    template <class> friend class ThreadLocalAllocator;
+    template <class> friend class Allocator;
 
     std::pmr::memory_resource* resource_;
 };
 template <class T, class... Args>
-[[nodiscard]] std::shared_ptr<T> AllocateShared(Args&&... args) {
-    return std::allocate_shared<T>(ThreadLocalAllocator<T>{}, std::forward<Args>(args)...);
+[[nodiscard]] std::shared_ptr<T> AllocateShared(std::pmr::memory_resource* resource, Args&&... args) {
+    return std::allocate_shared<T>(Allocator<T>(resource), std::forward<Args>(args)...);
 }
-template <class T> using ThreadLocalVector = std::vector<T, ThreadLocalAllocator<T>>;
+template <class T> using Vector = std::vector<T, Allocator<T>>;
 
 // Zero-allocation-when-empty PMR ring deque. Allocates a contiguous power-of-2
 // array from its memory_resource on demand and returns it immediately when the
@@ -428,19 +414,19 @@ template <class T>
 class RingDeque {
 public:
     using value_type = T;
-    using allocator_type = ThreadLocalAllocator<T>;
+    using allocator_type = Allocator<T>;
     using size_type = std::size_t;
     using difference_type = std::ptrdiff_t;
     using reference = T&;
     using const_reference = const T&;
 
-    RingDeque() noexcept : RingDeque(CurrentResource()) {}
+    RingDeque() noexcept : RingDeque(nullptr) {}
     explicit RingDeque(std::pmr::memory_resource* resource) noexcept
-        : resource_(resource ? resource : CurrentResource()) {}
+        : resource_(ResourceOrProcess(resource)) {}
     explicit RingDeque(const allocator_type& alloc) noexcept
         : RingDeque(alloc.resource()) {}
     RingDeque(const RingDeque& other)
-        : RingDeque(CurrentResource()) {
+        : RingDeque(other.resource_) {
         if (!other.empty()) {
             Reserve(other.size_);
             try {
@@ -740,16 +726,15 @@ private:
     std::size_t capacity_ = 0;
 };
 
-template <class T> using ThreadLocalDeque = RingDeque<T>;
-template <class T> using ThreadLocalList = std::list<T, ThreadLocalAllocator<T>>;
+template <class T> using List = std::list<T, Allocator<T>>;
 template <class Key, class Value, class Compare = std::less<Key>>
-using ThreadLocalMap = std::map<Key, Value, Compare, ThreadLocalAllocator<std::pair<const Key, Value>>>;
+using Map = std::map<Key, Value, Compare, Allocator<std::pair<const Key, Value>>>;
 template <class Key, class Value, class Hash = std::hash<Key>, class Eq = std::equal_to<Key>>
-using ThreadLocalUnorderedMap = std::unordered_map<Key, Value, Hash, Eq,
-    ThreadLocalAllocator<std::pair<const Key, Value>>>;
+using UnorderedMap = std::unordered_map<Key, Value, Hash, Eq,
+    Allocator<std::pair<const Key, Value>>>;
 template <class Key, class Hash = std::hash<Key>, class Eq = std::equal_to<Key>>
-using ThreadLocalUnorderedSet = std::unordered_set<Key, Hash, Eq, ThreadLocalAllocator<Key>>;
-using ThreadLocalString = std::basic_string<char, std::char_traits<char>, ThreadLocalAllocator<char>>;
-using ByteVector = ThreadLocalVector<uint8_t>;
+using UnorderedSet = std::unordered_set<Key, Hash, Eq, Allocator<Key>>;
+using String = std::basic_string<char, std::char_traits<char>, Allocator<char>>;
+using ByteVector = Vector<uint8_t>;
 
 } // namespace memory

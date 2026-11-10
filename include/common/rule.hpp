@@ -22,8 +22,8 @@ class DetectRulePolicy final {
 public:
     using RuleList = std::vector<DetectRule>;
     using RuleListPtr = std::shared_ptr<const RuleList>;
-    using InboundRule = memory::ThreadLocalUnorderedMap<
-        memory::ThreadLocalString,
+    using InboundRule = memory::UnorderedMap<
+        memory::String,
         RuleListPtr,
         TransparentStringHash,
         TransparentStringEq>;

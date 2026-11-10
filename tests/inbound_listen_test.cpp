@@ -59,8 +59,9 @@ TEST(InboundListen, Contract) {
         ASSERT_FALSE((::InboundListen::Parse(value)));
     }
 
+    memory::worker_memory pool;
     ::net::io_context io_context;
-    ::worker_detail::TcpListenerOwner worker;
+    ::worker_detail::TcpListenerOwner worker(pool);
     auto acceptor = worker.CreateAcceptor("stable-listener", io_context);
     ASSERT_FALSE((!acceptor || !worker.OwnsAcceptor("stable-listener", acceptor.get())));
 
@@ -92,7 +93,7 @@ TEST(InboundListen, Contract) {
     ::worker_detail::TcpListenerOwner::AcceptorPtr retained;
     bool retired_accept_cancelled = false;
     {
-        ::worker_detail::TcpListenerOwner retiring;
+        ::worker_detail::TcpListenerOwner retiring(pool);
         retained = retiring.CreateAcceptor("retained-until-completion", io_context);
         retained->open(::tcp::v4(), ec);
         ASSERT_FALSE((ec));

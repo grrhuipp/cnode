@@ -44,12 +44,6 @@ struct CounterEvent final : TimeoutEvent {
     void OnTimeout() override { if (counter) ++*counter; }
 };
 
-struct ResourceScope {
-    memory::ThreadMemoryResource resource;
-    std::pmr::memory_resource* previous = std::pmr::set_default_resource(&resource);
-    ~ResourceScope() { std::pmr::set_default_resource(previous); }
-};
-
 bool TestCancellationAndRearm() {
     net::io_context io;
     auto& scheduler = TimeoutScheduler::ForIoContext(io);
@@ -170,9 +164,6 @@ bool TestWaitInitiationFailureAndRecovery() {
 }
 
 bool TestHeapGrowthAndRelease() {
-    ResourceScope resource;
-    auto& pool = memory::ThreadMemoryPool();
-    const auto baseline = pool.OutstandingAllocations();
     bool passed = false;
     {
         net::io_context io;
@@ -203,7 +194,7 @@ bool TestHeapGrowthAndRelease() {
         io.restart();
         io.run();
     }
-    return passed && pool.OutstandingAllocations() == baseline;
+    return passed;
 }
 
 bool TestShardAndRecycledContextOwnership() {
@@ -260,7 +251,6 @@ bool TestMaximumDelay() {
 }
 
 bool TestOwnerThreadServiceDestruction() {
-    ResourceScope resource;
     std::promise<bool> finished;
     auto result = finished.get_future();
     std::thread owner([&] {
@@ -275,7 +265,7 @@ bool TestOwnerThreadServiceDestruction() {
             io->run();
             const bool drained = !scheduler.GetResourceStats().wait_pending;
             io.reset();
-            finished.set_value(drained && memory::ThreadMemoryPool().OutstandingAllocations() == 0);
+            finished.set_value(drained);
         } catch (...) { finished.set_value(false); }
     });
     owner.join();

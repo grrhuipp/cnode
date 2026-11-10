@@ -44,7 +44,8 @@ void TestIO(CountingResource& resource) {
     ::tcp::socket socket(io), peer(io);
     socket.connect(acceptor.local_endpoint());
     acceptor.accept(peer);
-    ::TcpStream stream(std::move(socket));
+    ::memory::worker_memory pool;
+    ::TcpStream stream(pool, std::move(socket));
     constexpr size_t count = 128;
     size_t completed = 0;
     std::exception_ptr error;
@@ -100,7 +101,8 @@ void TestReadCancellation(CountingResource& resource, bool multi_buffer) {
     ::tcp::socket socket(io), peer(io);
     socket.connect(acceptor.local_endpoint());
     acceptor.accept(peer);
-    ::TcpStream stream(std::move(socket));
+    ::memory::worker_memory pool;
+    ::TcpStream stream(pool, std::move(socket));
     net::cancellation_signal signal;
     net::steady_timer timer(io, 5ms);
     bool completed = false, cancelled = false;
@@ -137,7 +139,8 @@ void TestPrivateAllocatorIsolation(CountingResource& resource) {
     ::tcp::socket socket(io), peer(io);
     socket.connect(acceptor.local_endpoint());
     acceptor.accept(peer);
-    ::TcpStream stream(std::move(socket));
+    ::memory::worker_memory pool;
+    ::TcpStream stream(pool, std::move(socket));
     net::cancellation_signal signal;
     net::steady_timer timer(io, 5ms);
     bool cancelled = false;
@@ -163,12 +166,13 @@ void TestQueuedReadinessIsolation() {
     ::tcp::socket socket(reactor), peer(reactor);
     socket.connect(acceptor.local_endpoint());
     acceptor.accept(peer);
+    worker_memory pool;
     ::buf::Buffer* payload = nullptr;
     bool consumed = false;
     {
-        payload = ::buf::Buffer::New();
+        payload = ::buf::Buffer::New(pool);
         Require(payload != nullptr, "payload allocation failed");
-        const auto outstanding = ThreadMemoryPool().OutstandingAllocations();
+        const auto outstanding = pool.OutstandingAllocations();
         socket.async_wait(::tcp::socket::wait_read,
             net::bind_allocator(ProcessAllocator<std::byte>{},
                 [&](::IoErrorCode ec) {
@@ -179,7 +183,7 @@ void TestQueuedReadinessIsolation() {
                     ::buf::Buffer::Free(payload);
                     payload = nullptr;
                 }));
-        Require(ThreadMemoryPool().OutstandingAllocations() == outstanding,
+        Require(pool.OutstandingAllocations() == outstanding,
                 "queued operation must not borrow the worker pool");
     }
     const char value = 'q';
@@ -192,13 +196,8 @@ void TestPendingOperationDestruction() {
     using namespace ::memory;
     auto reactor = std::make_unique<net::io_context>();
     auto timer = std::make_unique<net::steady_timer>(*reactor, 1h);
-    {
-        const auto baseline = ThreadMemoryPool().OutstandingAllocations();
-        timer->async_wait(net::bind_allocator(ProcessAllocator<std::byte>{},
-            [](::IoErrorCode) {}));
-        Require(ThreadMemoryPool().OutstandingAllocations() == baseline,
-                "pending operation storage must belong to process allocator");
-    }
+    timer->async_wait(net::bind_allocator(ProcessAllocator<std::byte>{},
+        [](::IoErrorCode) {}));
     // Asio destroys the still-pending handler without calling it when its
     // reactor is destroyed on another thread.
     std::thread shutdown([&] { timer.reset(); reactor.reset(); });
@@ -207,8 +206,7 @@ void TestPendingOperationDestruction() {
 } // namespace
 
 TEST(AsioOperationAllocator, Contract) {
-    ::memory::ThreadMemoryResource pool;
-    CountingResource resource(&pool);
+    CountingResource resource(::memory::process_resource());
     auto original = std::pmr::set_default_resource(&resource);
     bool passed = true;
     try {

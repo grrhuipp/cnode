@@ -31,6 +31,7 @@ void Check(bool condition) {
 
 template<class Scenario>
 bool RunFixture(const RateLimitConfig& config, Scenario scenario) {
+    memory::worker_memory pool;
     net::io_context io;
     auto coordinator = std::make_shared<GroupCoordinator>(io);
     coordinator->RegisterWorker(0, io);
@@ -40,7 +41,7 @@ bool RunFixture(const RateLimitConfig& config, Scenario scenario) {
     std::exception_ptr failure;
     auto run = [&]() -> net::awaitable<void> {
         try {
-            result = co_await scenario(io, *limiter);
+            result = co_await scenario(io, *limiter, pool);
         } catch (...) {
             failure = std::current_exception();
         }
@@ -80,7 +81,7 @@ void Raise(int fault) {
 
 class Stream final : public AsyncStream {
 public:
-    explicit Stream(State& state) : state_(state) {}
+    Stream(memory::worker_memory& pool, State& state) : AsyncStream(pool), state_(state) {}
     State& GetState() noexcept { return state_; }
     ~Stream() override { if (state_.active != 0) std::terminate(); state_.destroyed = true; }
     net::awaitable<size_t> AsyncRead(net::mutable_buffer buffer) override {
@@ -132,14 +133,15 @@ class Dispatcher final : public routing::Dispatcher {
 using Signal = net::experimental::channel<void(IoErrorCode, int)>;
 
 struct QuotaCase {
-    QuotaCase(net::io_context& io, ConnectionLimiter& connection_limiter,
+    QuotaCase(memory::worker_memory& worker_pool, net::io_context& io, ConnectionLimiter& connection_limiter,
               uint32_t global_limit, bool ip_rejection, bool reverse)
-        : limiter(connection_limiter), limit(global_limit),
+        : pool(worker_pool), limiter(connection_limiter), limit(global_limit),
           reject_ip(ip_rejection), reverse_completion(reverse),
           events(io, 8), gates{Signal(io, 1), Signal(io, 1), Signal(io, 1)} {
         for (int id = 0; id != 3; ++id) children[id].id = id;
     }
 
+    memory::worker_memory& pool;
     ConnectionLimiter& limiter;
     uint32_t limit;
     bool reject_ip;
@@ -174,7 +176,7 @@ private:
 
 net::awaitable<void> RunChild(
     QuotaCase& test, InboundTransportStreamHandler& sink, int id) {
-    co_await sink.OnInboundTransportStream(std::make_unique<Stream>(test.children[id]), {});
+    co_await sink.OnInboundTransportStream(memory::MakeUnique<Stream>(test.pool, test.pool, test.children[id]), {});
     Check(test.events.try_send(IoErrorCode{}, -id - 1));
 }
 
@@ -246,8 +248,8 @@ net::awaitable<void> ExerciseQuota(
 bool TestQuota(uint32_t limit, bool reject_ip, bool reverse) {
     return RunFixture(RateLimitConfig{
         .max_connections = limit, .max_conn_per_ip = reject_ip ? 1u : 0u},
-        [=](net::io_context& io, ConnectionLimiter& limiter) -> net::awaitable<bool> {
-            QuotaCase test(io, limiter, limit, reject_ip, reverse);
+        [=](net::io_context& io, ConnectionLimiter& limiter, memory::worker_memory& pool) -> net::awaitable<bool> {
+            QuotaCase test(pool, io, limiter, limit, reject_ip, reverse);
             State physical;
             proxyman::inbound::ReceiverSettings receiver{
                 .inbound_tag = "test", .inbound_tags = {}, .protocol = "fixture",
@@ -257,12 +259,12 @@ bool TestQuota(uint32_t limit, bool reject_ip, bool reverse) {
             receiver.stream_settings.network = "grpc";
             receiver.stream_settings = NormalizeStreamSettings(receiver.stream_settings);
             auto handler = std::make_shared<proxyman::inbound::Handler>(
-                std::move(receiver), std::make_unique<QuotaProxy>(test), limiter);
+                std::move(receiver), memory::MakeUnique<QuotaProxy>(pool, test), limiter);
             Dispatcher dispatcher;
             StatsShard stats;
             app::RequestLoadState load(100, 0);
             TimeoutsConfig timeouts;
-            session::Context context;
+            session::Context context(pool);
             context.inbound.tag = "test";
             context.inbound.source_ip = "192.0.2.1";
             struct ActiveQuota {
@@ -270,7 +272,7 @@ bool TestQuota(uint32_t limit, bool reject_ip, bool reverse) {
                 ~ActiveQuota() { quota_case = nullptr; }
             } active(test);
             co_await handler->ProcessAcceptedTCP(io, dispatcher, stats, load, timeouts,
-                std::make_unique<Stream>(physical), context);
+                memory::MakeUnique<Stream>(pool, pool, physical), context);
             co_await CheckGlobalSlots(limiter, limit, 0);
             co_await CheckIPRestored(limiter, context.inbound.source_ip, reject_ip);
             co_return test.completed && physical.destroyed &&
@@ -310,7 +312,7 @@ TEST(InboundProcessErrors, Contract) {
         bool returned = false;
         const bool ok = RunFixture(
             RateLimitConfig{.max_connections = 1, .max_conn_per_ip = 1},
-            [&](net::io_context& io, ConnectionLimiter& limiter) -> net::awaitable<bool> {
+            [&](net::io_context& io, ConnectionLimiter& limiter, memory::worker_memory& pool) -> net::awaitable<bool> {
         proxyman::inbound::ReceiverSettings receiver{
             .inbound_tag = "test", .inbound_tags = {}, .protocol = "fixture",
             .stream_settings = {},
@@ -319,16 +321,16 @@ TEST(InboundProcessErrors, Contract) {
         receiver.stream_settings.network = logical ? "grpc" : "tcp";
         receiver.stream_settings = NormalizeStreamSettings(receiver.stream_settings);
         auto handler = std::make_shared<proxyman::inbound::Handler>(
-            std::move(receiver), std::make_unique<Proxy>(fault, codec), limiter);
+            std::move(receiver), memory::MakeUnique<Proxy>(pool, fault, codec), limiter);
         Dispatcher dispatcher;
         StatsShard stats;
         app::RequestLoadState load(100, 0);
         TimeoutsConfig timeouts;
-        session::Context context;
+        session::Context context(pool);
         context.conn_id = 1;
         context.inbound.tag = "test";
         co_await handler->ProcessAcceptedTCP(io, dispatcher, stats, load, timeouts,
-            std::make_unique<Stream>(state), context);
+            memory::MakeUnique<Stream>(pool, pool, state), context);
         returned = true;
         co_await CheckGlobalSlots(limiter, 1, 0);
         co_await CheckIPRestored(limiter, context.inbound.source_ip, true);

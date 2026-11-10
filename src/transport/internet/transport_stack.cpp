@@ -138,9 +138,10 @@ net::awaitable<void> RunRealityFallbackProxy(
             client_tcp->LocalEndpoint(),
             proxy_header);
         first_ok = buf::AppendSpanToMultiBuffer(
-            std::span<const uint8_t>(proxy_header.data(), proxy_header_len), first);
+            std::span<const uint8_t>(proxy_header.data(), proxy_header_len), first,
+            client_tcp->Pool());
     }
-    first_ok = first_ok && buf::AppendSpanToMultiBuffer(initial_bytes, first);
+    first_ok = first_ok && buf::AppendSpanToMultiBuffer(initial_bytes, first, client_tcp->Pool());
     memory::ByteVector{}.swap(initial_bytes);
     if (!first_ok) {
         dest_stream->CloseAbortive();
@@ -223,7 +224,8 @@ net::awaitable<TransportBuildResult> AcceptInboundSecurity(
                 co_return tl::unexpected(ErrorCode::TLS_HANDSHAKE_FAILED);
             }
             if (reader.State() == RealityClientHelloReader::Status::Complete) {
-                reality_conn_state = VerifyRealityClientHello(reader.TakeHello(), *ctx);
+                reality_conn_state = VerifyRealityClientHello(
+                    reader.TakeHello(), *ctx, tcp->Pool());
             }
             initial_bytes = reader.TakeWire();
         }
@@ -245,7 +247,8 @@ net::awaitable<TransportBuildResult> AcceptInboundSecurity(
     }
     std::unique_ptr<TlsStream> tls;
     if (reality_conn_state) {
-        tls = std::make_unique<TlsStream>(std::move(tcp), *ctx, true);
+        auto& pool = tcp->Pool();
+        tls = memory::MakeUnique<TlsStream>(pool, std::move(tcp), *ctx, true);
         if (!tls->SetRealityServerPreverified(std::move(reality_conn_state))) {
             co_return tl::unexpected(ErrorCode::TLS_HANDSHAKE_FAILED);
         }
@@ -582,7 +585,8 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
 
     // 5. WebSocket 层（客户端）
     if (s.IsWs()) {
-        auto ws = std::make_unique<BaseWsStream>(std::move(stream), true);
+        auto& pool = stream->Pool();
+        auto ws = memory::MakeUnique<BaseWsStream>(pool, std::move(stream), true);
         auto ws_result = co_await ws->Handshake(
             dial_host,
             s.ws.path.empty() ? "/" : s.ws.path,

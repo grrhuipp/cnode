@@ -23,6 +23,7 @@ class Wire final : public AsyncStream {
 public:
     std::vector<uint8_t> bytes;
     size_t offset = 0;
+    explicit Wire(memory::worker_memory& pool) : AsyncStream(pool) {}
     net::awaitable<size_t> AsyncRead(net::mutable_buffer out) override {
         const size_t count = std::min(out.size(), bytes.size() - offset);
         if (count) std::memcpy(out.data(), bytes.data() + offset, count);
@@ -96,7 +97,7 @@ inline net::awaitable<void> PrepareWire(Wire& wire, const PreparedShadowsocksUse
     Require(bool(request));
     buf::MultiBuffer payload;
     const std::array<uint8_t, 3> data{0x17, 0x29, 0x41};
-    Require(buf::AppendSpanToMultiBuffer(data, payload));
+    Require(buf::AppendSpanToMultiBuffer(data, payload, wire.Pool()));
     co_await request->request_writer.WriteMultiBuffer(std::move(payload));
 }
 

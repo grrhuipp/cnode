@@ -207,12 +207,13 @@ private:
 // stream windows allow; 6.9.2: SETTINGS_INITIAL_WINDOW_SIZE credits the open
 // stream by the difference while the connection window stays independent.
 void ClientWaitsForPeerWindows() {
+    memory::worker_memory pool;
     net::io_context io;
     ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
     ::tcp::socket dialed(io), server(io);
     dialed.connect(acceptor.local_endpoint());
     acceptor.accept(server);
-    auto raw = std::make_unique<::TcpStream>(std::move(dialed));
+    auto raw = memory::MakeUnique<::TcpStream>(pool, pool, std::move(dialed));
     const auto settings = GrpcSettings();
     const std::string payload(200000, 'x');
     std::unique_ptr<::AsyncStream> stream;
@@ -266,11 +267,11 @@ void ClientWaitsForPeerWindows() {
 // gRPC client whose writer stays parked on send credit, so its frame pump is
 // what consumes the peer's frames while no reader runs.
 struct ParkedWriterClient {
-    explicit ParkedWriterClient(net::io_context& io)
+    ParkedWriterClient(memory::worker_memory& pool, net::io_context& io)
         : acceptor(io, {net::ip::address_v4::loopback(), 0}), dialed(io), server(io) {
         dialed.connect(acceptor.local_endpoint());
         acceptor.accept(server);
-        auto client = [this, raw = std::make_unique<::TcpStream>(std::move(dialed))]()
+        auto client = [this, raw = memory::MakeUnique<::TcpStream>(pool, pool, std::move(dialed))]()
             mutable -> net::awaitable<void> {
             auto result = co_await ::BuildOutboundTransport(std::move(raw), settings, nullptr);
             Require(result.has_value() && *result, "gRPC client handshake failed");
@@ -310,8 +311,9 @@ struct ParkedWriterClient {
 // client advertised even while only a writer short of send credit pumps
 // frames; DATA beyond the connection window is a FLOW_CONTROL_ERROR.
 void ClientEnforcesReceiveWindow() {
+    memory::worker_memory pool;
     net::io_context io;
-    ParkedWriterClient client(io);
+    ParkedWriterClient client(pool, io);
     RawPeer peer(client.server, 24);
     client.OpenResponse(io, peer);
 
@@ -339,8 +341,9 @@ void ClientEnforcesReceiveWindow() {
 // Credit for received DATA returns when the reader takes it, so a reader
 // that keeps up receives far more than one window.
 void ClientReturnsCreditAsReaderTakesData() {
+    memory::worker_memory pool;
     net::io_context io;
-    ParkedWriterClient client(io);
+    ParkedWriterClient client(pool, io);
     RawPeer peer(client.server, 24);
     client.OpenResponse(io, peer);
 
@@ -415,12 +418,13 @@ public:
 // The server honours the client's SETTINGS_INITIAL_WINDOW_SIZE per stream and
 // the 65535-octet connection window until WINDOW_UPDATE grants more.
 void ServerWaitsForPeerWindows() {
+    memory::worker_memory pool;
     net::io_context io;
     ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
     ::tcp::socket client(io), accepted(io);
     client.connect(acceptor.local_endpoint());
     acceptor.accept(accepted);
-    auto raw = std::make_unique<::TcpStream>(std::move(accepted));
+    auto raw = memory::MakeUnique<::TcpStream>(pool, pool, std::move(accepted));
     auto sink = std::make_shared<WritingSink>(io, 100000);
     const auto settings = GrpcSettings();
     bool returned = false;

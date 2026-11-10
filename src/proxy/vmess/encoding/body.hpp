@@ -129,7 +129,8 @@ private:
 
 class BodyEncoder {
 public:
-    BodyEncoder(const BodyOptions& options,
+    BodyEncoder(memory::worker_memory& pool,
+                const BodyOptions& options,
                 const BodyKey& request_body,
                 const BodyKey& direction_key);
 
@@ -198,6 +199,7 @@ private:
                        size_t padding,
                        uint8_t* dst);
 
+    memory::worker_memory* pool_;
     BodyChunkCipher cipher_;
     size_t stream_chunk_size_ = 0;
     State state_ = State::Active;
@@ -208,7 +210,8 @@ private:
 // chunks, so the next Read continues the same record.
 class BodyDecoder {
 public:
-    BodyDecoder(const BodyOptions& options,
+    BodyDecoder(memory::worker_memory& pool,
+                const BodyOptions& options,
                 const BodyKey& request_body,
                 const BodyKey& direction_key);
 
@@ -256,7 +259,7 @@ using VMessHandshakeResult = tl::expected<void, ErrorCode>;
 
 class ClientSession final {
 public:
-    ClientSession(Security security, Command command);
+    ClientSession(memory::worker_memory& pool, Security security, Command command);
 
     ClientSession(const ClientSession&) = delete;
     ClientSession& operator=(const ClientSession&) = delete;

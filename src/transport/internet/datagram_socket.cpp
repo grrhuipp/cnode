@@ -57,11 +57,13 @@ void ValidateBuffers(
 }
 }  // namespace
 
-struct DatagramSocket::Impl final : memory::ThreadAllocated {
+struct DatagramSocket::Impl final : memory::WorkerAllocated {
     using Timeouts = detail::ConnectionTimeouts<Impl>;
 
-    Impl(net::io_context& io_context, const net::ip::address& bind_address)
-        : socket(io_context)
+    Impl(memory::worker_memory& pool, net::io_context& io_context,
+         const net::ip::address& bind_address)
+        : pool(pool)
+        , socket(io_context)
         , timeouts(io_context, *this)
         , ipv6(bind_address.is_v6()) {
         if (active_sockets >= kMaxActiveSockets)
@@ -143,6 +145,8 @@ struct DatagramSocket::Impl final : memory::ThreadAllocated {
         WriteOperation& operation, udp::endpoint destination,
         buf::MultiBuffer payload);
 
+    // Receive payload Buffers come from the owning Worker's pool.
+    memory::worker_memory& pool;
     udp::socket socket;
     Timeouts timeouts;
     transport::CancellationSource cancellation;
@@ -195,7 +199,7 @@ net::awaitable<ReceivedDatagram> DatagramSocket::Impl::Receive(ReadOperation& op
         std::array<buf::BufferGuard, kMaxReceiveBuffers> guards;
         std::array<net::mutable_buffer, kMaxReceiveBuffers> buffers;
         for (std::size_t i = 0; i < count; ++i) {
-            guards[i] = buf::BufferGuard(buf::Buffer::New());
+            guards[i] = buf::BufferGuard(buf::Buffer::New(pool));
             if (!guards[i]) {
                 read_drain_budget = 0;
                 ThrowLink(ErrorCode::RESOURCE_EXHAUSTED);
@@ -423,8 +427,9 @@ net::awaitable<void> DatagramSocket::WriteOperation::SendTo(
 }
 
 DatagramSocket::DatagramSocket(
-    net::io_context& io_context, const net::ip::address& bind_address)
-    : impl_(std::make_unique<Impl>(io_context, bind_address)) {}
+    memory::worker_memory& pool, net::io_context& io_context,
+    const net::ip::address& bind_address)
+    : impl_(memory::MakeUnique<Impl>(pool, pool, io_context, bind_address)) {}
 
 DatagramSocket::~DatagramSocket() noexcept { Close(); }
 

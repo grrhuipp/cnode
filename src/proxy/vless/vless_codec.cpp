@@ -296,7 +296,7 @@ private:
     static constexpr size_t kBlockSize = 128;
     std::array<uint8_t, kBlockSize> inline_{};
     size_t inline_used_ = 0;
-    memory::ThreadLocalList<std::array<uint8_t, kBlockSize>> overflow_;
+    memory::List<std::array<uint8_t, kBlockSize>> overflow_;
     size_t overflow_used_ = 0;
 };
 
@@ -595,7 +595,7 @@ net::awaitable<buf::MultiBuffer> UdpFramer::ReadDatagram(
             const TargetAddress& target = packet.target
                 ? *packet.target
                 : session_target;
-            if (!buf::SetUdpTarget(packet.payload, target)) {
+            if (!buf::SetUdpTarget(packet.payload, target, *pool_)) {
                 pending_.Fail();
                 throw std::bad_alloc();
             }

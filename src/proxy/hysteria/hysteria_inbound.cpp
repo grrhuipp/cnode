@@ -81,7 +81,7 @@ ReadTcpRequest(AsyncStream& stream, wire::Version version, session::Context& ctx
                 !contiguous.empty()) {
                 target = ParseTcpRequest(version, contiguous, header_bytes);
             } else {
-                memory::ThreadLocalVector<uint8_t> header(inspect_bytes);
+                memory::Vector<uint8_t> header(inspect_bytes);
                 (void)received.CopyPrefixTo(header);
                 target = ParseTcpRequest(version, header, header_bytes);
             }
@@ -190,10 +190,11 @@ std::unique_ptr<::Inbound> CreateInbound(
     proxyman::inbound::ProtocolRuntime&,
     StatsShard& stats,
     ConnectionLimiter*,
-    const proxyman::inbound::BuildRequest& request) {
+    const proxyman::inbound::BuildRequest& request,
+    memory::worker_memory& pool) {
     const auto* settings = wire::GetSettings(request);
     if (!settings) return nullptr;
-    return std::make_unique<HysteriaInbound>(stats, settings->version);
+    return memory::MakeUnique<HysteriaInbound>(pool, stats, settings->version);
 }
 
 std::optional<proxyman::inbound::UserSet> BuildUsers(

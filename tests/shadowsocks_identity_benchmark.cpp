@@ -19,7 +19,8 @@ uint64_t CpuNs() {
 
 TEST(ShadowsocksIdentityBenchmark, AuthenticationMatrix) {
     memory::ConfigureProcessAllocator();
-    const auto baseline = memory::ThreadMemoryPool().OutstandingAllocations();
+    memory::worker_memory pool;
+    const auto baseline = pool.OutstandingAllocations();
     const size_t iterations = [] {
         const char* value = std::getenv("CNODE_BENCH_ITERATIONS");
         return value ? std::max(size_t{1}, static_cast<size_t>(std::stoull(value))) : size_t{512};
@@ -37,7 +38,7 @@ TEST(ShadowsocksIdentityBenchmark, AuthenticationMatrix) {
             const auto positions_end = std::unique(positions.begin(), positions.end());
             for (auto position_it = positions.begin(); position_it != positions_end; ++position_it) {
                 const size_t position = *position_it;
-                Wire wire;
+                Wire wire{pool};
                 Prepare(io, wire, users[position], cipher);
                 size_t actual_hint = 0, wrong_hint = 0;
                 const auto other_user = users[(position + 1) % count].profile.user_id;
@@ -56,7 +57,7 @@ TEST(ShadowsocksIdentityBenchmark, AuthenticationMatrix) {
                         Require(bool(Authenticate(io, wire, cipher, hint)));
                     }
                     std::vector<double> latencies(iterations);
-                    const auto pool_before = memory::ThreadMemoryPool().GetFootprint();
+                    const auto pool_before = pool.GetFootprint();
                     const size_t warm_rss = ResidentBytes();
                     benchmark::AllocationCounts counts;
                     uint64_t cpu_ns = 0;
@@ -72,13 +73,13 @@ TEST(ShadowsocksIdentityBenchmark, AuthenticationMatrix) {
                             Require(result->user->profile.user_id == users[position].profile.user_id);
                             live_peak = std::max(
                                 live_peak,
-                                memory::ThreadMemoryPool().OutstandingAllocations() - baseline);
+                                pool.OutstandingAllocations() - baseline);
                         }
                         const auto finish = std::chrono::steady_clock::now();
                         cpu_ns += CpuNs() - cpu_start;
                         latencies[i] = std::chrono::duration<double, std::nano>(finish - start).count();
                     }
-                    const auto pool_after = memory::ThreadMemoryPool().GetFootprint();
+                    const auto pool_after = pool.GetFootprint();
                     const size_t after_rss = ResidentBytes();
                     const auto process_memory = benchmark::ReadProcessMemory();
                     std::sort(latencies.begin(), latencies.end());
@@ -101,6 +102,6 @@ TEST(ShadowsocksIdentityBenchmark, AuthenticationMatrix) {
             UserStore::ClearWorkerView();
         }
     }
-    EXPECT_EQ(memory::ThreadMemoryPool().OutstandingAllocations(), baseline);
+    EXPECT_EQ(pool.OutstandingAllocations(), baseline);
 }
 } // namespace

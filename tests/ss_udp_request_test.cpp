@@ -26,6 +26,7 @@ void Check(bool condition, std::string_view message) {
 }
 
 struct Fixture {
+    memory::worker_memory pool;
     net::io_context io;
     app::dns::DNSWorker dns_worker{
         io, app::dns::Config{.servers = {{net::ip::address_v4::loopback(), 53}}}, 8};
@@ -76,9 +77,9 @@ std::vector<uint8_t> Pattern(size_t size, uint8_t seed = 17) {
 }
 
 buf::MultiBuffer MakePayload(
-    const TargetAddress& target, const std::vector<uint8_t>& bytes) {
+    const TargetAddress& target, const std::vector<uint8_t>& bytes, memory::worker_memory& pool) {
     buf::MultiBuffer payload;
-    Check(buf::AppendSpanToMultiBuffer(bytes, payload), "UDP test payload allocation failed");
+    Check(buf::AppendSpanToMultiBuffer(bytes, payload, pool), "UDP test payload allocation failed");
     for (auto* buffer : payload) buffer->SetUDP(target);
     return payload;
 }
@@ -116,9 +117,9 @@ net::awaitable<void> Pause(net::io_context& io, std::chrono::milliseconds delay)
 }
 
 net::awaitable<udp::endpoint> SendOneAndGetClientEndpoint(
-    UdpRequest& request, udp::socket& server) {
+    UdpRequest& request, udp::socket& server, memory::worker_memory& pool) {
     const auto inner_target = TargetAddress(net::ip::address_v4::loopback(), 5353);
-    co_await request.WriteMultiBuffer(MakePayload(inner_target, Pattern(48)));
+    co_await request.WriteMultiBuffer(MakePayload(inner_target, Pattern(48), pool));
     std::array<uint8_t, 65535> packet{};
     udp::endpoint client_endpoint;
     (void)co_await server.async_receive_from(
@@ -225,13 +226,13 @@ net::awaitable<void> TestAuthenticatedRoundTrip(Fixture& fixture) {
     udp::socket server(fixture.io, udp::endpoint(net::ip::address_v4::loopback(), 0));
     const auto cipher = MakeCipher();
     const TargetAddress proxy_next_hop = Target(server.local_endpoint());
-    UdpRequest request(fixture.io, fixture.dns,
+    UdpRequest request(fixture.pool, fixture.io, fixture.dns,
         net::ip::address_v4::loopback(), proxy_next_hop,
         cipher.info, cipher.key, {});
 
     const TargetAddress inner_target(net::ip::address_v4::loopback(), 5300);
     const auto request_bytes = Pattern(73, 4);
-    co_await request.WriteMultiBuffer(MakePayload(inner_target, request_bytes));
+    co_await request.WriteMultiBuffer(MakePayload(inner_target, request_bytes, fixture.pool));
 
     std::array<uint8_t, 65535> wire{};
     udp::endpoint client_endpoint;
@@ -239,7 +240,7 @@ net::awaitable<void> TestAuthenticatedRoundTrip(Fixture& fixture) {
         net::buffer(wire), client_endpoint, net::use_awaitable);
     const auto decoded_request = ss::DecodeUdpPacketWithKey(
         wire.data(), wire_size, cipher.key.span(), cipher.info.type,
-        cipher.info.key_size, cipher.info.salt_size);
+        cipher.info.key_size, cipher.info.salt_size, fixture.pool);
     Check(decoded_request.has_value(), "outbound request was not valid classic SS AEAD");
     Check(decoded_request->target.SameEndpoint(inner_target),
           "outbound request lost its inner target");
@@ -265,15 +266,15 @@ net::awaitable<void> TestAuthenticatedRoundTrip(Fixture& fixture) {
 net::awaitable<void> TestReadBudgetAgainstSameServerGarbage(Fixture& fixture) {
     udp::socket server(fixture.io, udp::endpoint(net::ip::address_v4::loopback(), 0));
     const auto cipher = MakeCipher();
-    UdpRequest request(fixture.io, fixture.dns,
+    UdpRequest request(fixture.pool, fixture.io, fixture.dns,
         net::ip::address_v4::loopback(), Target(server.local_endpoint()),
         cipher.info, cipher.key, {});
     request.SetReadTimeout(1s);
-    const auto client = co_await SendOneAndGetClientEndpoint(request, server);
+    const auto client = co_await SendOneAndGetClientEndpoint(request, server, fixture.pool);
     std::vector<uint8_t> garbage(64, 0xa7);
     Check(!ss::DecodeUdpPacketWithKey(
               garbage.data(), garbage.size(), cipher.key.span(), cipher.info.type,
-              cipher.info.key_size, cipher.info.salt_size),
+              cipher.info.key_size, cipher.info.salt_size, fixture.pool),
           "same-server noise must fail classic SS authentication");
     co_await ReadAgainstNoise(
         fixture, request, server, client, std::move(garbage), true);
@@ -283,17 +284,17 @@ net::awaitable<void> TestWrongSourceCannotExtendIdle(Fixture& fixture) {
     udp::socket server(fixture.io, udp::endpoint(net::ip::address_v4::loopback(), 0));
     udp::socket wrong_source(fixture.io, udp::endpoint(net::ip::address_v4::loopback(), 0));
     const auto cipher = MakeCipher();
-    UdpRequest request(fixture.io, fixture.dns,
+    UdpRequest request(fixture.pool, fixture.io, fixture.dns,
         net::ip::address_v4::loopback(), Target(server.local_endpoint()),
         cipher.info, cipher.key, {});
     request.SetIdleTimeout(1s);
-    const auto client = co_await SendOneAndGetClientEndpoint(request, server);
+    const auto client = co_await SendOneAndGetClientEndpoint(request, server, fixture.pool);
     const TargetAddress inner_target(net::ip::address_v4::loopback(), 8123);
     const auto plaintext = Pattern(36, 92);
     const auto authenticated_packet = EncodeClassic(inner_target, plaintext, cipher);
     const auto decoded = ss::DecodeUdpPacketWithKey(
         authenticated_packet.data(), authenticated_packet.size(), cipher.key.span(),
-        cipher.info.type, cipher.info.key_size, cipher.info.salt_size);
+        cipher.info.type, cipher.info.key_size, cipher.info.salt_size, fixture.pool);
     Check(decoded && decoded->target.SameEndpoint(inner_target) &&
           Flatten(decoded->payload) == plaintext,
           "wrong-source noise packet must be valid classic SS AEAD");
@@ -304,15 +305,15 @@ net::awaitable<void> TestWrongSourceCannotExtendIdle(Fixture& fixture) {
 net::awaitable<void> TestSameSourceGarbageCannotExtendIdle(Fixture& fixture) {
     udp::socket server(fixture.io, udp::endpoint(net::ip::address_v4::loopback(), 0));
     const auto cipher = MakeCipher();
-    UdpRequest request(fixture.io, fixture.dns,
+    UdpRequest request(fixture.pool, fixture.io, fixture.dns,
         net::ip::address_v4::loopback(), Target(server.local_endpoint()),
         cipher.info, cipher.key, {});
     request.SetIdleTimeout(1s);
-    const auto client = co_await SendOneAndGetClientEndpoint(request, server);
+    const auto client = co_await SendOneAndGetClientEndpoint(request, server, fixture.pool);
     std::vector<uint8_t> garbage(64, 0x5c);
     Check(!ss::DecodeUdpPacketWithKey(
               garbage.data(), garbage.size(), cipher.key.span(), cipher.info.type,
-              cipher.info.key_size, cipher.info.salt_size),
+              cipher.info.key_size, cipher.info.salt_size, fixture.pool),
           "same-server noise must fail classic SS authentication");
     co_await ReadAgainstNoise(
         fixture, request, server, client, std::move(garbage), false);
@@ -321,7 +322,7 @@ net::awaitable<void> TestSameSourceGarbageCannotExtendIdle(Fixture& fixture) {
 net::awaitable<void> TestMaximumWirePayload(Fixture& fixture) {
     udp::socket server(fixture.io, udp::endpoint(net::ip::address_v4::loopback(), 0));
     const auto cipher = MakeCipher();
-    UdpRequest request(fixture.io, fixture.dns,
+    UdpRequest request(fixture.pool, fixture.io, fixture.dns,
         net::ip::address_v4::loopback(), Target(server.local_endpoint()),
         cipher.info, cipher.key, {});
     const TargetAddress inner_target(net::ip::address_v4::loopback(), 5353);
@@ -336,7 +337,7 @@ net::awaitable<void> TestMaximumWirePayload(Fixture& fixture) {
     bool rejected = false;
     try {
         co_await request.WriteMultiBuffer(
-            MakePayload(inner_target, oversized_plaintext));
+            MakePayload(inner_target, oversized_plaintext, fixture.pool));
     } catch (const transport::LinkError& error) {
         rejected = error.code() == ErrorCode::INVALID_ARGUMENT;
     }
@@ -355,13 +356,13 @@ net::awaitable<void> TestMaximumWirePayload(Fixture& fixture) {
     Check(!nonblocking_error, "could not restore blocking loopback receiver");
 
     const auto valid_bytes = Pattern(29, 114);
-    co_await request.WriteMultiBuffer(MakePayload(inner_target, valid_bytes));
+    co_await request.WriteMultiBuffer(MakePayload(inner_target, valid_bytes, fixture.pool));
     std::array<uint8_t, 65535> wire{};
     const auto wire_size = co_await server.async_receive_from(
         net::buffer(wire), source, net::use_awaitable);
     const auto decoded = ss::DecodeUdpPacketWithKey(
         wire.data(), wire_size, cipher.key.span(), cipher.info.type,
-        cipher.info.key_size, cipher.info.salt_size);
+        cipher.info.key_size, cipher.info.salt_size, fixture.pool);
     Check(decoded && decoded->target.SameEndpoint(inner_target) &&
           Flatten(decoded->payload) == valid_bytes,
           "valid write did not recover after oversized-packet rejection");

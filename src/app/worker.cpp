@@ -81,16 +81,17 @@ struct Worker::ListenerSlot {
 
 struct Worker::ListenerState : worker_detail::UdpReplySink {
     using SlotPtr = std::shared_ptr<ListenerSlot>;
-    using ListenerSlotMap = memory::ThreadLocalUnorderedMap<
-        memory::ThreadLocalString, SlotPtr, TransparentStringHash, TransparentStringEq>;
-    using ListenerKeys = memory::ThreadLocalVector<memory::ThreadLocalString>;
+    using ListenerSlotMap = memory::UnorderedMap<
+        memory::String, SlotPtr, TransparentStringHash, TransparentStringEq>;
+    using ListenerKeys = memory::Vector<memory::String>;
 
+    memory::worker_memory& pool;
     ListenerSlotMap listener_slots;
     [[nodiscard]] auto FindOrCreateSlot(std::string_view tag) {
         const auto existing = listener_slots.find(tag);
         if (existing != listener_slots.end()) return std::pair{existing, false};
-        auto slot = memory::AllocateShared<ListenerSlot>();
-        return listener_slots.try_emplace(memory::ThreadLocalString(tag), std::move(slot));
+        auto slot = memory::AllocateShared<ListenerSlot>(pool.resource());
+        return listener_slots.try_emplace(memory::String(tag), std::move(slot));
     }
     uint64_t udp_resource_drops = 0;
     size_t udp_receive_loops = 0;
@@ -99,7 +100,7 @@ struct Worker::ListenerState : worker_detail::UdpReplySink {
     uint32_t active_sessions = 0;
     bool stopping = false;
     struct TaskCancellation final
-        : memory::ThreadAllocated
+        : memory::WorkerAllocated
         , transport::CancellationSubscription {
         explicit TaskCancellation(ListenerState& state) : owner(state), next(state.tasks) {
             if (next) next->previous = this;
@@ -124,8 +125,9 @@ struct Worker::ListenerState : worker_detail::UdpReplySink {
     };
     TaskCancellation* tasks = nullptr;
     net::steady_timer changed;
-    explicit ListenerState(net::io_context& io)
-        : changed(io, std::chrono::steady_clock::time_point::max()) {}
+    ListenerState(memory::worker_memory& pool, net::io_context& io)
+        : pool(pool), listener_slots(pool.resource()),
+          changed(io, std::chrono::steady_clock::time_point::max()) {}
     void NotifyCompletion() { changed.cancel(); }
     void Spawn(Worker& worker, net::awaitable<void> task, bool listener,
                std::unique_ptr<TaskCancellation> registration) {
@@ -180,8 +182,8 @@ struct Worker::ListenerState : worker_detail::UdpReplySink {
 
     net::awaitable<void> AcceptLoop(
         Worker& worker,
-        memory::ThreadLocalString listener_key,
-        memory::ThreadLocalString tag,
+        memory::String listener_key,
+        memory::String tag,
         worker_detail::TcpListenerOwner::AcceptorPtr acceptor,
         SlotPtr slot);
 
@@ -193,7 +195,7 @@ struct Worker::ListenerState : worker_detail::UdpReplySink {
 
     net::awaitable<void> UdpReceiveLoop(
         Worker& worker,
-        memory::ThreadLocalString socket_key,
+        memory::String socket_key,
         worker_detail::UdpIngress::SocketPtr sock,
         SlotPtr listener_slot,
         worker_detail::UdpIngress* expected_ingress);
@@ -212,7 +214,7 @@ struct Worker::ListenerState : worker_detail::UdpReplySink {
                            worker_detail::UdpIngress::SocketPtr sock,
                            uint32_t worker_id);
     net::awaitable<void> SendUdpReplies(
-        memory::ThreadLocalString socket_key,
+        memory::String socket_key,
         worker_detail::UdpIngress::SocketPtr sock,
         worker_detail::UdpIngress::PendingUdpReply packet,
         uint32_t worker_id);
@@ -235,7 +237,8 @@ private:
 // Worker-owned listeners, configuration publication and admission ledgers.
 // Every TCP, QUIC and native UDP request dispatches within its session domain.
 struct Worker::RuntimeState {
-    RuntimeState(net::io_context& io_context,
+    RuntimeState(memory::worker_memory& pool,
+                 net::io_context& io_context,
                  const WorkerRuntimeConfig& runtime_config,
                  StatsShard& stats_ref,
                  app::dns::DNSWorker& dns_worker,
@@ -250,7 +253,7 @@ struct Worker::RuntimeState {
         , request_load(runtime_config.pressure_threshold,
                        runtime_config.pressure_idle_timeout)
         , dns_worker(dns_worker)
-        , listener_state(std::make_unique<ListenerState>(io_context))
+        , listener_state(std::make_unique<ListenerState>(pool, io_context))
         {}
 
     ~RuntimeState() {
@@ -324,8 +327,8 @@ private:
     State* listener_state_ = nullptr;
 };
 
-memory::ThreadLocalString BuildListenerKey(std::string_view tag, std::string_view listen, uint16_t port) {
-    memory::ThreadLocalString key;
+memory::String BuildListenerKey(std::string_view tag, std::string_view listen, uint16_t port) {
+    memory::String key;
     key.reserve(tag.size() + listen.size() + 12);
     key.append(tag);
     key.push_back('|');
@@ -364,7 +367,7 @@ Worker::Worker(uint32_t id, net::io_context& io_context,
     : id_(id)
     , io_context_(io_context)
     , runtime_(std::make_unique<RuntimeState>(
-          io_context, runtime_config, stats, dns_worker, geo_database))
+          pool_, io_context, runtime_config, stats, dns_worker, geo_database))
     , mailbox_(std::make_unique<WorkerMailbox>(
           runtime_->io_context,
           defaults::kWorkerMailboxCapacity)) {}
@@ -442,7 +445,7 @@ net::awaitable<void> Worker::DrainRuntimeTask() {
         IoErrorCode ec;
         co_await listeners.changed.async_wait(net::redirect_error(net::use_awaitable, ec));
     }
-    memory::ThreadLocalVector<ListenerState::SlotPtr> slots;
+    memory::Vector<ListenerState::SlotPtr> slots;
     slots.reserve(listeners.listener_slots.size());
     for (auto& [tag, slot] : listeners.listener_slots) {
         (void)tag;
@@ -549,13 +552,15 @@ void Worker::RuntimeState::Start(Worker& worker) {
 
     auto& scheduler = TimeoutScheduler::ForIoContext(io_context);
     udp_association_reclaimer =
-        std::make_unique<worker_detail::UdpAssociationReclaimer>(
+        memory::MakeUnique<worker_detail::UdpAssociationReclaimer>(
+            worker.pool_,
             scheduler, &worker,
             +[](void* ctx, std::exception_ptr error) {
                 static_cast<Worker*>(ctx)->ReportFailure(std::move(error));
             });
     session_tracking = std::make_unique<app::SessionTrackingState>();
-    inbound_handlers = std::make_unique<proxyman::inbound::HandlerRegistry>(stats);
+    inbound_handlers = memory::MakeUnique<proxyman::inbound::HandlerRegistry>(
+        worker.pool_, worker.pool_, stats);
     detect_rule_policy = std::make_unique<rule::DetectRulePolicy>();
     const auto* config = startup_config.get();
     if (!connection_limiter) {
@@ -572,9 +577,10 @@ void Worker::RuntimeState::Start(Worker& worker) {
     outbound_tasks = std::make_unique<ResidentTaskGroup>(io_context.get_executor());
     outbounds = std::make_unique<proxyman::outbound::OutboundConfiguration>(
         config->outbounds);
-    outbound_handlers = std::make_unique<proxyman::outbound::HandlerLookup>(
+    outbound_handlers = memory::MakeUnique<proxyman::outbound::HandlerLookup>(
+        worker.pool_, worker.pool_,
         *outbounds, io_context, *dns, timeouts.DialTimeout(), outbound_tasks->Tasks());
-    dispatcher = std::make_unique<app::dispatcher::DefaultDispatcher>(
+    dispatcher = memory::MakeUnique<app::dispatcher::DefaultDispatcher>(worker.pool_,
         *router, *outbound_handlers, *detect_rule_policy,
         *session_tracking, *dns, request_load);
     started = true;
@@ -680,12 +686,13 @@ bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
     }
 
     ListenerSlot::SocketBinding committed_binding{binding.port, binding.listen};
-    auto replacement_listeners = std::make_unique<worker_detail::TcpListenerOwner>();
+    auto replacement_listeners =
+        memory::MakeUnique<worker_detail::TcpListenerOwner>(worker.pool_, worker.pool_);
     struct PreparedListener {
-        memory::ThreadLocalString key;
+        memory::String key;
         worker_detail::TcpListenerOwner::AcceptorPtr acceptor;
     };
-    memory::ThreadLocalVector<PreparedListener> prepared_listeners;
+    memory::Vector<PreparedListener> prepared_listeners;
 
     const auto listen_candidates = binding.listen.Candidates();
     prepared_listeners.reserve(listen_candidates.size());
@@ -789,8 +796,8 @@ bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
 
     for (auto& prepared : prepared_listeners) {
         const auto& listener_key = prepared.key;
-        auto registration = std::make_unique<TaskCancellation>(*this);
-        Spawn(worker, AcceptLoop(worker, listener_key, memory::ThreadLocalString(binding.tag),
+        auto registration = memory::MakeUnique<TaskCancellation>(worker.pool_, *this);
+        Spawn(worker, AcceptLoop(worker, listener_key, memory::String(binding.tag),
                                  std::move(prepared.acceptor), slot_it->second),
               true, std::move(registration));
 
@@ -898,7 +905,7 @@ void Worker::ListenerState::StartUdpReplySend(worker_detail::UdpIngress& ingress
         ++udp_reply_sends;
         try {
             net::co_spawn(sock->get_executor(),
-                SendUdpReplies(memory::ThreadLocalString{socket_key}, sock,
+                SendUdpReplies(memory::String{socket_key}, sock,
                                std::move(*packet), worker_id),
                 [this, worker_id](std::exception_ptr failure) {
                     --udp_reply_sends;
@@ -928,7 +935,7 @@ void Worker::ListenerState::StartUdpReplySend(worker_detail::UdpIngress& ingress
 }
 
 net::awaitable<void> Worker::ListenerState::SendUdpReplies(
-    memory::ThreadLocalString socket_key,
+    memory::String socket_key,
     worker_detail::UdpIngress::SocketPtr sock,
     worker_detail::UdpIngress::PendingUdpReply packet,
     uint32_t worker_id) {
@@ -964,8 +971,8 @@ net::awaitable<void> Worker::ListenerState::SendUdpReplies(
 
 net::awaitable<void> Worker::ListenerState::AcceptLoop(
     Worker& worker,
-    memory::ThreadLocalString listener_key,
-    memory::ThreadLocalString tag,
+    memory::String listener_key,
+    memory::String tag,
     worker_detail::TcpListenerOwner::AcceptorPtr acceptor,
     SlotPtr slot) {
     const auto owns_acceptor = [&]() {
@@ -1006,7 +1013,7 @@ net::awaitable<void> Worker::ListenerState::AcceptLoop(
             continue;
         }
 
-        auto registration = std::make_unique<TaskCancellation>(*this);
+        auto registration = memory::MakeUnique<TaskCancellation>(worker.pool_, *this);
         auto* registration_ptr = registration.get();
         Spawn(worker,
             ProcessReceivedConnection(
@@ -1028,10 +1035,10 @@ net::awaitable<void> Worker::ListenerState::ProcessReceivedConnection(
     tcp::endpoint remote_ep) {
     app::RequestLoadState::PhysicalConnectionScope physical(worker.runtime_->request_load);
     const auto& listener = inbound_handler->ReceiverSettings();
-    auto tcp_stream = std::make_unique<TcpStream>(std::move(socket));
+    auto tcp_stream = memory::MakeUnique<TcpStream>(worker.pool_, worker.pool_, std::move(socket));
     registration.stream = tcp_stream.get();
     registration.Resubscribe(tcp_stream->Cancellation());
-    session::Context ctx;
+    session::Context ctx(worker.pool_);
     ctx.conn_id = session::NewID(worker.id_);
     ctx.worker_id = worker.id_;
     ctx.inbound.tag = listener.inbound_tag;
@@ -1091,10 +1098,10 @@ bool Worker::RegisterInbound(
         return false;
     }
     auto inbound_handler =
-        std::make_unique<proxyman::inbound::Handler>(
+        memory::MakeUnique<proxyman::inbound::Handler>(pool_,
             std::move(receiver), std::move(handler), *runtime_->connection_limiter);
     const auto& settings = inbound_handler->ReceiverSettings();
-    const memory::ThreadLocalString key(settings.inbound_tag);
+    const memory::String key(settings.inbound_tag);
     auto [slot_it, slot_inserted] =
         runtime_->listener_state->FindOrCreateSlot(key);
     std::shared_ptr<proxyman::inbound::Handler> registered;
@@ -1252,7 +1259,7 @@ WorkerRuntimeStatsSnapshot Worker::CollectRuntimeStats(bool include_resources) c
     snapshot.active_connections = runtime_->listener_state->active_sessions;
     if (!include_resources) return snapshot;
     auto& resources = snapshot.resources.emplace();
-    auto& pool = memory::ThreadMemoryPool();
+    const auto& pool = pool_;
     const auto footprint = pool.GetFootprint();
     resources.pool_committed_bytes = footprint.committed_bytes;
     resources.pool_used_bytes = footprint.used_bytes;
@@ -1289,7 +1296,7 @@ WorkerRuntimeStatsSnapshot Worker::CollectRuntimeStats(bool include_resources) c
 }
 
 void Worker::CollectHeap() {
-    memory::CollectBurst();
+    memory::CollectBurst(pool_);
 }
 
 // ============================================================================
@@ -1347,7 +1354,8 @@ net::awaitable<bool> Worker::ListenerState::StartQuicListening(
                   worker.id_, binding.tag);
         co_return false;
     }
-    auto replacement = std::make_unique<transport::internet::hysteria::HysteriaIngress>(
+    auto replacement = memory::MakeUnique<transport::internet::hysteria::HysteriaIngress>(
+        worker.pool_, worker.pool_,
         worker.id_, worker.runtime_->io_context, slot_it->second->datagram_environment);
 
     size_t bound = 0;
@@ -1424,7 +1432,7 @@ net::awaitable<bool> Worker::ListenerState::StartUdpListening(
     }
     ListenerSlot::SocketBinding committed_binding{binding.port, binding.listen};
     auto replacement_ingress =
-        std::make_unique<worker_detail::UdpIngress>(
+        memory::MakeUnique<worker_detail::UdpIngress>(worker.pool_, worker.pool_,
             binding.tag, std::move(handler), *worker.runtime_->udp_association_reclaimer,
             worker.runtime_->udp_resource_budget, worker.runtime_->io_context);
     ListenerKeys prepared_socket_keys;
@@ -1437,7 +1445,7 @@ net::awaitable<bool> Worker::ListenerState::StartUdpListening(
         const iputil::AddressText listen_text(addr);
         const auto listen_addr = listen_text.View();
         auto candidate_sock =
-            replacement_ingress->MakeSocket(worker.runtime_->io_context);
+            replacement_ingress->MakeSocket(worker.runtime_->io_context, worker.pool_);
         if (!OpenAndBindUdpSocket(
                 worker, "UDP", *candidate_sock, addr, listen_addr, binding.port,
                 listen_candidates.size() > 1)) {
@@ -1464,11 +1472,11 @@ net::awaitable<bool> Worker::ListenerState::StartUdpListening(
     }
 
     struct PreparedReceive {
-        memory::ThreadLocalString socket_key;
+        memory::String socket_key;
         worker_detail::UdpIngress::SocketPtr socket;
         net::awaitable<void> receive;
     };
-    memory::ThreadLocalVector<PreparedReceive> prepared_receives;
+    memory::Vector<PreparedReceive> prepared_receives;
     ListenerSlotMap::iterator slot_it;
     bool inserted_slot = false;
     try {
@@ -1579,7 +1587,7 @@ net::awaitable<bool> Worker::ListenerState::StartUdpListening(
 
 net::awaitable<void> Worker::ListenerState::UdpReceiveLoop(
     Worker& worker,
-    memory::ThreadLocalString socket_key,
+    memory::String socket_key,
     worker_detail::UdpIngress::SocketPtr sock,
     SlotPtr listener_slot,
     worker_detail::UdpIngress* expected_ingress) {
@@ -1608,6 +1616,7 @@ net::awaitable<void> Worker::ListenerState::UdpReceiveLoop(
         });
     };
     return worker_detail::RunUdpReceiveLoop(
-        std::move(sock), std::move(is_owned), std::move(process_datagram), udp_resource_drops);
+        std::move(sock), std::move(is_owned), std::move(process_datagram), udp_resource_drops,
+        worker.pool_);
 }
 

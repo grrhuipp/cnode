@@ -34,7 +34,8 @@ namespace {
 net::awaitable<DialResult> DialSingleCandidate(
     net::io_context& io_context,
     const OutboundTransportTarget& target,
-    const OutboundDialCandidate& candidate);
+    const OutboundDialCandidate& candidate,
+    memory::worker_memory& pool);
 
 [[nodiscard]] bool IsXHttpSplitOutbound(const OutboundTransportTarget& target) noexcept {
     if (!target.stream_settings || !target.stream_settings->IsXHttp()) {
@@ -53,7 +54,7 @@ net::awaitable<DialResult> DialSingleCandidate(
     return std::nullopt;
 }
 
-void AppendU64Hex(memory::ThreadLocalString& out, uint64_t value) {
+void AppendU64Hex(memory::String& out, uint64_t value) {
     std::array<char, 16> buf{};
     auto [ptr, ec] = std::to_chars(buf.data(), buf.data() + buf.size(), value, 16);
     if (ec == std::errc{}) {
@@ -61,12 +62,12 @@ void AppendU64Hex(memory::ThreadLocalString& out, uint64_t value) {
     }
 }
 
-[[nodiscard]] memory::ThreadLocalString MakeXHttpSessionId(uint64_t conn_id) {
+[[nodiscard]] memory::String MakeXHttpSessionId(uint64_t conn_id) {
     thread_local uint64_t sequence = 0;
     const auto now = static_cast<uint64_t>(
         std::chrono::steady_clock::now().time_since_epoch().count());
 
-    memory::ThreadLocalString id;
+    memory::String id;
     id.reserve(48);
     AppendU64Hex(id, now);
     id.push_back('-');
@@ -76,10 +77,10 @@ void AppendU64Hex(memory::ThreadLocalString& out, uint64_t value) {
     return id;
 }
 
-[[nodiscard]] memory::ThreadLocalString BuildXHttpSplitPath(
+[[nodiscard]] memory::String BuildXHttpSplitPath(
     const XHttpConfig& cfg,
     std::string_view session_id) {
-    memory::ThreadLocalString path(cfg.normalized_path);
+    memory::String path(cfg.normalized_path);
     path.append(session_id);
     return path;
 }
@@ -156,10 +157,11 @@ protected:
                                  std::unique_ptr<AsyncStream> downlink,
                                  const OutboundTransportTarget& target,
                                  const OutboundDialCandidate& candidate,
-                                 memory::ThreadLocalString upload_path,
+                                 memory::String upload_path,
                                  uint64_t conn_id,
                                  const char* missing_settings_error)
-        : io_context_(io_context)
+        : AsyncStream(downlink->Pool())
+        , io_context_(io_context)
         , downlink_(std::move(downlink))
         , target_(target)
         , candidate_(candidate)
@@ -171,7 +173,7 @@ protected:
         }
         upload_path_.reserve(base_upload_path_size_ + 21);
         target_.single_candidate = candidate_;
-        memory::ThreadLocalVector<OutboundDialCandidate>{target_.candidates.get_allocator()}.swap(target_.candidates);
+        memory::Vector<OutboundDialCandidate>{target_.candidates.get_allocator()}.swap(target_.candidates);
         target_.xhttp_download_target.reset();
     }
 
@@ -310,7 +312,7 @@ protected:
         XHttpClientRequestKind kind,
         std::span<const net::const_buffer> payloads) {
         const bool stream_up = kind == XHttpClientRequestKind::StreamUp;
-        auto tcp_result = co_await DialSingleCandidate(io_context_, target_, candidate_);
+        auto tcp_result = co_await DialSingleCandidate(io_context_, target_, candidate_, Pool());
         if (!tcp_result.Ok()) {
             if (tcp_result.error == ErrorCode::DIAL_TIMEOUT) {
                 upload_write_expired_ = true;
@@ -370,7 +372,7 @@ protected:
     TcpStream* in_flight_upload_tcp_ = nullptr;
     OutboundTransportTarget target_;
     OutboundDialCandidate candidate_;
-    memory::ThreadLocalString upload_path_;
+    memory::String upload_path_;
     size_t base_upload_path_size_ = 0;
     transport::internet::AsyncWriteGate upload_gate_;
     DownlinkCancellation downlink_cancel_{*this};
@@ -397,7 +399,7 @@ public:
                            std::unique_ptr<AsyncStream> downlink,
                            const OutboundTransportTarget& target,
                            const OutboundDialCandidate& candidate,
-                           memory::ThreadLocalString upload_path,
+                           memory::String upload_path,
                            uint64_t conn_id)
         : XHttpSplitOutboundStreamBase(
               io_context,
@@ -445,7 +447,7 @@ public:
             const auto* data = static_cast<const uint8_t*>(buffer.data());
             if (!buf::AppendSpanToMultiBuffer(
                     std::span<const uint8_t>(data, buffer.size()),
-                    pending_initial_)) {
+                    pending_initial_, Pool())) {
                 throw std::bad_alloc();
             }
             co_return buffer.size();
@@ -704,7 +706,7 @@ public:
                               std::unique_ptr<AsyncStream> downlink,
                               const OutboundTransportTarget& target,
                               const OutboundDialCandidate& candidate,
-                              memory::ThreadLocalString upload_path,
+                              memory::String upload_path,
                               uint64_t conn_id)
         : XHttpSplitOutboundStreamBase(
               io_context,
@@ -805,8 +807,10 @@ private:
 net::awaitable<DialResult> DialSingleCandidate(
     net::io_context& io_context,
     const OutboundTransportTarget& target,
-    const OutboundDialCandidate& candidate) {
+    const OutboundDialCandidate& candidate,
+    memory::worker_memory& pool) {
     return TcpStream::Connect(
+        pool,
         io_context,
         candidate.endpoint,
         candidate.bind_local ? &*candidate.bind_local : nullptr,
@@ -822,7 +826,7 @@ net::awaitable<DialResult> DialAndBuildXHttpRequestCandidate(
     XHttpClientRequestKind kind,
     std::span<const net::const_buffer> packet_payload = {}) {
 
-    auto tcp_result = co_await DialSingleCandidate(io_context, target, candidate);
+    auto tcp_result = co_await DialSingleCandidate(io_context, target, candidate, ctx.pool);
     if (!tcp_result.Ok()) {
         co_return tcp_result;
     }
@@ -864,7 +868,7 @@ net::awaitable<DialResult> DialAndBuildSingleCandidate(
     const OutboundTransportTarget& target,
     const OutboundDialCandidate& candidate) {
 
-    auto tcp_result = co_await DialSingleCandidate(io_context, target, candidate);
+    auto tcp_result = co_await DialSingleCandidate(io_context, target, candidate, ctx.pool);
     if (!tcp_result.Ok()) {
         co_return tcp_result;
     }
@@ -946,10 +950,10 @@ net::awaitable<DialResult> DialXHttpSplitOutboundTransport(
             "invalid xhttp downlink target");
     }
 
-    const memory::ThreadLocalString session_id = MakeXHttpSessionId(ctx.conn_id);
-    const memory::ThreadLocalString downlink_path = BuildXHttpSplitPath(
+    const memory::String session_id = MakeXHttpSessionId(ctx.conn_id);
+    const memory::String downlink_path = BuildXHttpSplitPath(
         downlink_target.stream_settings->xhttp, session_id);
-    const memory::ThreadLocalString upload_path = BuildXHttpSplitPath(
+    const memory::String upload_path = BuildXHttpSplitPath(
         target.stream_settings->xhttp, session_id);
 
     DialResult last_result =
@@ -999,9 +1003,11 @@ net::awaitable<DialResult> DialXHttpSplitOutboundTransport(
             "missing xhttp upload candidate");
     }
 
+    auto& pool = downlink->Pool();
     if (mode == XHttpMode::PacketUp) {
         co_return DialResult::Success(
-            std::make_unique<XHttpPacketUpClientStream>(
+            memory::MakeUnique<XHttpPacketUpClientStream>(
+                pool,
                 io_context,
                 std::move(downlink),
                 target,
@@ -1011,7 +1017,8 @@ net::awaitable<DialResult> DialXHttpSplitOutboundTransport(
     }
 
     co_return DialResult::Success(
-        std::make_unique<XHttpSplitClientStream>(
+        memory::MakeUnique<XHttpSplitClientStream>(
+            pool,
             io_context,
             std::move(downlink),
             target,
@@ -1099,7 +1106,7 @@ bool AutoPrefersIPv6(const OutboundBind& bind,
 
 // The explicit host is resolved once by stream-settings normalization; only
 // the dial-address fallback is formatted per target.
-[[nodiscard]] memory::ThreadLocalString BuildHttpHostHeader(
+[[nodiscard]] memory::String BuildHttpHostHeader(
     const StreamSettings& settings,
     std::string_view fallback_host,
     uint16_t port) {
@@ -1108,7 +1115,7 @@ bool AutoPrefersIPv6(const OutboundBind& bind,
         return {};
     }
     if (!settings.configured_http_host.empty()) {
-        return memory::ThreadLocalString(settings.configured_http_host);
+        return memory::String(settings.configured_http_host);
     }
     if (settings.IsGrpc() && settings.IsReality()) {
         return {};
@@ -1117,7 +1124,7 @@ bool AutoPrefersIPv6(const OutboundBind& bind,
         (settings.IsReality() && !settings.reality.server_name.empty())
             ? std::string_view(settings.reality.server_name)
             : fallback_host;
-    memory::ThreadLocalString out;
+    memory::String out;
     iputil::FormatHttpHostHeaderInto(
         out, effective_host, port, settings.IsTlsLike());
     return out;
@@ -1172,8 +1179,9 @@ AttachXHttpDownloadTarget(
         co_return tl::unexpected(download_target.error());
     }
 
+    // Dial configuration value, not connection state: process layer.
     target.xhttp_download_target =
-        memory::AllocateShared<OutboundTransportTarget>(std::move(*download_target));
+        memory::AllocateShared<OutboundTransportTarget>(nullptr, std::move(*download_target));
     co_return target;
 }
 }  // namespace

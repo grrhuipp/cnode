@@ -41,8 +41,9 @@ struct DatagramScript {
 
 class DummyDatagramHandler final : public ::Inbound {
 public:
-    explicit DummyDatagramHandler(DatagramScript* script = nullptr)
-        : script_(script) {}
+    explicit DummyDatagramHandler(::memory::worker_memory& pool,
+                                  DatagramScript* script = nullptr)
+        : pool_(pool), script_(script) {}
     ::net::awaitable<::RelayResult> Process(
         std::unique_ptr<::AsyncStream>,
         ::routing::Dispatcher&,
@@ -64,7 +65,7 @@ public:
         result.session_owner = script_->owner;
         result.session_id = script_->session_id;
         result.target = script_->target;
-        if (!::buf::AppendSpanToMultiBuffer(request.payload, result.payload))
+        if (!::buf::AppendSpanToMultiBuffer(request.payload, result.payload, pool_))
             return tl::unexpected(::ErrorCode::RESOURCE_EXHAUSTED);
 #ifdef CNODE_TEST_ALLOCATOR_FAULT
         if (script_->fail_next_allocation) {
@@ -76,66 +77,30 @@ public:
     }
 
 private:
+    ::memory::worker_memory& pool_;
     DatagramScript* script_ = nullptr;
     ::UserProfile profile_;
-};
-
-class CountingThreadResource final : public std::pmr::memory_resource {
-public:
-    size_t allocations = 0;
-    size_t deallocations = 0;
-    size_t large_allocations = 0;
-    size_t large_deallocations = 0;
-
-private:
-    void* do_allocate(size_t bytes, size_t alignment) override {
-        ++allocations;
-        if (bytes >= 128) ++large_allocations;
-        if (void* ptr = ::memory::AllocatePmr(bytes, alignment)) {
-            return ptr;
-        }
-        throw std::bad_alloc();
-    }
-    void do_deallocate(void* ptr, size_t bytes, size_t alignment) override {
-        ++deallocations;
-        if (bytes >= 128) ++large_deallocations;
-        ::memory::DeallocatePmr(ptr, bytes, alignment);
-    }
-    [[nodiscard]] bool do_is_equal(
-        const std::pmr::memory_resource& other) const noexcept override {
-        return this == &other;
-    }
-};
-
-class ThreadResourceScope final {
-public:
-    ThreadResourceScope()
-        : previous_(std::pmr::set_default_resource(&resource)) {}
-    ~ThreadResourceScope() {
-        std::pmr::set_default_resource(previous_);
-    }
-
-    CountingThreadResource resource;
-
-private:
-    std::pmr::memory_resource* previous_;
 };
 
 class CountingUdpResponseContext final
     : public ::InboundDatagramResponse {
 public:
+    explicit CountingUdpResponseContext(::memory::worker_memory& pool) : pool_(pool) {}
     ::buf::MultiBuffer Encode(::UDPPacketView packet) override {
         if (fail) throw 9;
         ++calls;
         last_size = packet.data.size();
         ::buf::MultiBuffer encoded;
-        if (!::buf::AppendSpanToMultiBuffer(packet.data, encoded)) throw std::bad_alloc();
+        if (!::buf::AppendSpanToMultiBuffer(packet.data, encoded, pool_)) throw std::bad_alloc();
         return encoded;
     }
 
     size_t calls = 0;
     size_t last_size = 0;
     bool fail = false;
+
+private:
+    ::memory::worker_memory& pool_;
 };
 
 struct RecordingReplySink final : ::worker_detail::UdpReplySink {
@@ -178,6 +143,7 @@ public:
 
 void VerifyMigratedBudgetReservations() {
     using Budget = ::worker_detail::UdpResourceBudget;
+    ::memory::worker_memory pool;
     constexpr size_t kMigrating = 128;
     Budget source({
         .associations = kMigrating + 1, .datagrams = kMigrating + 1,
@@ -187,7 +153,7 @@ void VerifyMigratedBudgetReservations() {
         .payload_capacity = ::buf::Buffer::kSize});
     ::buf::MultiBuffer payload;
     const std::array<uint8_t, 1> bytes{0x73};
-    if (!::buf::AppendSpanToMultiBuffer(bytes, payload))
+    if (!::buf::AppendSpanToMultiBuffer(bytes, payload, pool))
         Fail("failed to prepare migrated reservation payload");
     std::array<Budget::AssociationLease, kMigrating> associations;
     std::array<Budget::PayloadReservation, kMigrating> reservations;
@@ -248,6 +214,7 @@ void VerifyMigratedBudgetReservations() {
 void VerifyWorkerBudget() {
     using Ingress = ::worker_detail::UdpIngress;
     using Result = Ingress::ReplyEnqueueResult;
+    ::memory::worker_memory pool;
     ::net::io_context io;
     auto& scheduler = ::TimeoutScheduler::ForIoContext(io);
     ::worker_detail::UdpAssociationReclaimer reclaimer(
@@ -255,8 +222,10 @@ void VerifyWorkerBudget() {
     ::worker_detail::UdpResourceBudget budget({
         .associations = 2, .datagrams = 3,
         .payload_capacity = 3 * ::buf::Buffer::kSize});
-    Ingress first("first", std::make_unique<DummyDatagramHandler>(), reclaimer, budget, io);
-    Ingress second("second", std::make_unique<DummyDatagramHandler>(), reclaimer, budget, io);
+    Ingress first(pool, "first", ::memory::MakeUnique<DummyDatagramHandler>(pool, pool),
+                  reclaimer, budget, io);
+    Ingress second(pool, "second", ::memory::MakeUnique<DummyDatagramHandler>(pool, pool),
+                   reclaimer, budget, io);
     ::InboundDatagramOwner owner;
     const std::array<uint8_t, 1> owner_bytes{0x53};
     if (!owner.Assign(owner_bytes)) Fail("failed to prepare budget test owner");
@@ -280,10 +249,10 @@ void VerifyWorkerBudget() {
             {}, endpoint, owner,
             std::chrono::steady_clock::now(), std::chrono::seconds::zero());
     };
-    const auto payload = [](size_t blocks = 1) {
+    const auto payload = [&](size_t blocks = 1) {
         ::buf::MultiBuffer result;
         for (size_t i = 0; i < blocks; ++i) {
-            ::buf::BufferGuard buffer{::buf::Buffer::New()};
+            ::buf::BufferGuard buffer{::buf::Buffer::New(pool)};
             if (!buffer) Fail("failed to prepare budget test payload");
             buffer->Tail()[0] = 0x55;
             buffer->Produce(1);
@@ -368,7 +337,8 @@ void VerifyWorkerBudget() {
     // The independent count limit is observable even with ample byte capacity.
     ::worker_detail::UdpResourceBudget count_budget({
         .associations = 1, .datagrams = 1, .payload_capacity = 1024 * 1024});
-    Ingress counted("counted", std::make_unique<DummyDatagramHandler>(), reclaimer,
+    Ingress counted(pool, "counted", ::memory::MakeUnique<DummyDatagramHandler>(pool, pool),
+                    reclaimer,
                     count_budget, io);
     if (counted.EnqueueReply("count", endpoint, payload()) != Result::StartSend ||
         counted.EnqueueReply("count", endpoint, payload()) != Result::Rejected ||
@@ -382,7 +352,8 @@ void VerifyWorkerBudget() {
     ::worker_detail::UdpResourceBudget empty_budget({
         .associations = 1, .datagrams = 2,
         .payload_capacity = 2 * ::buf::Buffer::kSize});
-    Ingress empty_ingress("empty", std::make_unique<DummyDatagramHandler>(), reclaimer,
+    Ingress empty_ingress(pool, "empty", ::memory::MakeUnique<DummyDatagramHandler>(pool, pool),
+                          reclaimer,
                           empty_budget, io);
     auto empty_session = create(empty_ingress, 1);
     if (!empty_session || !empty_session->Push(target, {}) ||
@@ -413,12 +384,9 @@ void VerifyWorkerBudget() {
 }  // namespace
 
 TEST(UdpSocketOwner, Contract) {
-    ThreadResourceScope thread_resource;
+    ::memory::worker_memory pool;
     VerifyWorkerBudget();
     VerifyMigratedBudgetReservations();
-    if (std::pmr::get_default_resource() != &thread_resource.resource) {
-        Fail("UDP PMR test resource was not installed");
-    }
 
     ::TargetAddress callback_source;
     callback_source.type = ::AddressType::IPv4;
@@ -437,7 +405,7 @@ TEST(UdpSocketOwner, Contract) {
     const std::array<uint8_t, 1> default_owner_bytes{1};
     if (!default_owner.Assign(default_owner_bytes)) Fail("failed to prepare owner");
     RecordingReplySink failed_sink, raw_sink, large_sink, snapshot_sink;
-    const auto failing_response = std::make_shared<CountingUdpResponseContext>();
+    const auto failing_response = std::make_shared<CountingUdpResponseContext>(pool);
     failing_response->fail = true;
 
     auto& udp_scheduler = ::TimeoutScheduler::ForIoContext(io_context);
@@ -446,16 +414,16 @@ TEST(UdpSocketOwner, Contract) {
     DatagramScript uplink_script;
     uplink_script.target = callback_source;
     ::worker_detail::UdpIngress worker(
-        "test-inbound", std::make_unique<DummyDatagramHandler>(&uplink_script),
+        pool, "test-inbound", ::memory::MakeUnique<DummyDatagramHandler>(pool, pool, &uplink_script),
         udp_reclaimer, udp_budget, io_context);
 
     ::worker_detail::UdpIngress::ClientSession failing_reply_session(
-        io_context,
+        pool, io_context,
         {.socket_key = {}, .socket = {}, .response = failing_response, .sink = &failed_sink, .worker_id = 0,
          .owner = &worker},
         reply_endpoint_a,
         default_owner, udp_budget, udp_budget.AcquireAssociation());
-    ::buf::BufferGuard reply_buffer{::buf::Buffer::New()};
+    ::buf::BufferGuard reply_buffer{::buf::Buffer::New(pool)};
     if (!reply_buffer) Fail("failed to allocate UDP callback test buffer");
     reply_buffer->Tail()[0] = 0x33;
     reply_buffer->Produce(1);
@@ -475,8 +443,8 @@ TEST(UdpSocketOwner, Contract) {
     io_context.restart();
 
     ::worker_detail::UdpIngress::ClientSession raw_reply_session(
-        io_context,
-        {.socket_key = {}, .socket = {}, .response = std::make_shared<CountingUdpResponseContext>(),
+        pool, io_context,
+        {.socket_key = {}, .socket = {}, .response = std::make_shared<CountingUdpResponseContext>(pool),
          .sink = &raw_sink, .worker_id = 0, .owner = &worker},
         reply_endpoint_a,
         default_owner, udp_budget, udp_budget.AcquireAssociation());
@@ -499,7 +467,7 @@ TEST(UdpSocketOwner, Contract) {
         ::buf::Buffer::kSize + 257, 0x6d);
     ::buf::MultiBuffer callback_large_buffers;
     if (!::buf::AppendSpanToMultiBuffer(
-            callback_large_payload, callback_large_buffers)) {
+            callback_large_payload, callback_large_buffers, pool)) {
         Fail("failed to allocate large UDP callback payload");
     }
     for (::buf::Buffer* buffer : callback_large_buffers) {
@@ -509,8 +477,8 @@ TEST(UdpSocketOwner, Contract) {
     }
 
     ::worker_detail::UdpIngress::ClientSession large_reply_session(
-        io_context,
-        {.socket_key = {}, .socket = {}, .response = std::make_shared<CountingUdpResponseContext>(),
+        pool, io_context,
+        {.socket_key = {}, .socket = {}, .response = std::make_shared<CountingUdpResponseContext>(pool),
          .sink = &large_sink, .worker_id = 0, .owner = &worker},
         reply_endpoint_a,
         default_owner, udp_budget, udp_budget.AcquireAssociation());
@@ -530,7 +498,7 @@ TEST(UdpSocketOwner, Contract) {
 
     ::buf::MultiBuffer migrated_reply_buffers;
     if (!::buf::AppendSpanToMultiBuffer(
-            callback_large_payload, migrated_reply_buffers)) {
+            callback_large_payload, migrated_reply_buffers, pool)) {
         Fail("failed to allocate migrated UDP reply payload");
     }
     for (::buf::Buffer* buffer : migrated_reply_buffers) {
@@ -553,17 +521,17 @@ TEST(UdpSocketOwner, Contract) {
     io_context.restart();
 
     ::worker_detail::UdpIngress::ClientSession bounded_input_session(
-        io_context,
+        pool, io_context,
         {},
         reply_endpoint_a,
         default_owner, udp_budget, udp_budget.AcquireAssociation());
     auto make_empty_payload = [&]() {
         return ::buf::MultiBuffer{};
     };
-    const auto make_tiny_payload = [] {
+    const auto make_tiny_payload = [&] {
         ::buf::MultiBuffer payload;
         const std::array<uint8_t, 1> bytes{0x7a};
-        if (!::buf::AppendSpanToMultiBuffer(bytes, payload))
+        if (!::buf::AppendSpanToMultiBuffer(bytes, payload, pool))
             Fail("failed to prepare UDP reply payload");
         return payload;
     };
@@ -586,7 +554,7 @@ TEST(UdpSocketOwner, Contract) {
         udp_budget.GetUsage().payload_capacity != before_empty_queue.payload_capacity)
         Fail("overflowed zero-length input queue retained reservations");
 
-    auto first = ::worker_detail::UdpIngress::MakeSocket(io_context);
+    auto first = ::worker_detail::UdpIngress::MakeSocket(io_context, pool);
     first->open(::udp::v4(), ec);
     if (ec) Fail("failed to open first UDP socket");
     first->bind(::udp::endpoint(::net::ip::address_v4::loopback(), 0), ec);
@@ -631,7 +599,7 @@ TEST(UdpSocketOwner, Contract) {
             ::IoErrorCode available_ec;
             const size_t available = large_receiver.available(available_ec);
             if (available_ec) co_return;
-            ::detail::UdpReceiveBuffer receive_buffer;
+            ::detail::UdpReceiveBuffer receive_buffer(pool);
             const auto storage = receive_buffer.Prepare(available);
             ::udp::endpoint sender_endpoint;
             auto [receive_ec, bytes] = co_await large_receiver.async_receive_from(
@@ -652,7 +620,7 @@ TEST(UdpSocketOwner, Contract) {
     }
     io_context.restart();
 
-    auto second = ::worker_detail::UdpIngress::MakeSocket(io_context);
+    auto second = ::worker_detail::UdpIngress::MakeSocket(io_context, pool);
     second->open(::udp::v4(), ec);
     if (ec) Fail("failed to open second UDP socket");
     second->bind(endpoint, ec);
@@ -676,7 +644,7 @@ TEST(UdpSocketOwner, Contract) {
     RecordingReplySink uplink_sink;
     const auto attach_uplink_socket = [&](std::string_view socket_key) {
         auto socket = worker.AttachSocket(
-            socket_key, ::worker_detail::UdpIngress::MakeSocket(io_context));
+            socket_key, ::worker_detail::UdpIngress::MakeSocket(io_context, pool));
         if (!socket) Fail("failed to attach UDP uplink test socket");
         return socket;
     };
@@ -761,6 +729,7 @@ TEST(UdpSocketOwner, Contract) {
         };
         auto enqueue_with_fault = [&]() {
             auto payload = make_tiny_payload();
+            // The reply deque grows from the Worker pool.
             ::memory::reject_next_pmr_allocation = true;
             return worker.EnqueueReply(
                 socket_key, reply_endpoint_a, std::move(payload));
@@ -1039,14 +1008,14 @@ TEST(UdpSocketOwner, Contract) {
 #endif
 
     ::worker_detail::UdpIngress::ClientSession overflow_session(
-        io_context,
+        pool, io_context,
         {},
         reply_endpoint_a,
         owner_a, udp_budget, udp_budget.AcquireAssociation());
     ::buf::MultiBuffer oversized_input;
     size_t oversized_bytes = 0;
     while (oversized_bytes <= 512 * 1024) {
-        ::buf::BufferGuard buffer{::buf::Buffer::New()};
+        ::buf::BufferGuard buffer{::buf::Buffer::New(pool)};
         if (!buffer) Fail("failed to allocate oversized UDP input");
         const size_t n = buffer->Available();
         std::memset(buffer->Tail().data(), 0x5a, n);
@@ -1082,7 +1051,7 @@ TEST(UdpSocketOwner, Contract) {
         Fail("failed to attach initial UDP socket");
     }
 
-    auto duplicate = ::worker_detail::UdpIngress::MakeSocket(io_context);
+    auto duplicate = ::worker_detail::UdpIngress::MakeSocket(io_context, pool);
     duplicate->open(::udp::v4(), ec);
     if (ec) Fail("failed to open duplicate UDP socket");
     if (worker.AttachSocket("stable-socket", std::move(duplicate)) != nullptr) {
@@ -1092,21 +1061,21 @@ TEST(UdpSocketOwner, Contract) {
         Fail("duplicate attachment replaced the live UDP socket");
     }
 
-    auto response_context = std::make_shared<CountingUdpResponseContext>();
+    auto response_context = std::make_shared<CountingUdpResponseContext>(pool);
     ::worker_detail::UdpIngress::ClientSession snapshot_reply_session(
-        io_context,
+        pool, io_context,
         {.socket_key = {}, .socket = {}, .response = response_context, .sink = &snapshot_sink, .worker_id = 0,
          .owner = &worker},
         reply_endpoint_a,
         default_owner, udp_budget, udp_budget.AcquireAssociation());
     if (!worker.ReplaceHandler(
-            std::make_unique<DummyDatagramHandler>(&uplink_script))) {
+            ::memory::MakeUnique<DummyDatagramHandler>(pool, pool, &uplink_script))) {
         Fail("valid UDP handler replacement was rejected");
     }
     if (owner_session->Closed()) {
         Fail("UDP handler replacement closed a live client session");
     }
-    ::buf::BufferGuard snapshot_reply{::buf::Buffer::New()};
+    ::buf::BufferGuard snapshot_reply{::buf::Buffer::New(pool)};
     if (!snapshot_reply) Fail("failed to allocate snapshot UDP reply");
     snapshot_reply->Tail()[0] = 0x55;
     snapshot_reply->Produce(1);
@@ -1149,15 +1118,9 @@ TEST(UdpSocketOwner, Contract) {
 
     const std::string long_socket_key(160, 's');
     const auto long_socket = attach_uplink_socket(long_socket_key);
-    const size_t pmr_allocations_before_cycles =
-        thread_resource.resource.allocations;
-    const size_t pmr_deallocations_before_cycles =
-        thread_resource.resource.deallocations;
+    const size_t allocations_before_cycles = pool.OutstandingAllocations();
     for (size_t cycle = 0; cycle < 1000; ++cycle) {
-        const size_t large_allocations_before =
-            thread_resource.resource.large_allocations;
-        const size_t large_deallocations_before =
-            thread_resource.resource.large_deallocations;
+        const size_t allocations_before = pool.OutstandingAllocations();
         const ::worker_detail::ClientSessionKey long_client_key{default_owner, cycle};
         auto cycle_session = worker.CreateClientSession(
             long_socket_key,
@@ -1171,9 +1134,9 @@ TEST(UdpSocketOwner, Contract) {
         if (!cycle_session) {
             Fail("failed to create a long-key UDP session");
         }
-        if (thread_resource.resource.large_allocations <=
-            large_allocations_before) {
-            Fail("long UDP map keys did not allocate through PMR");
+        const size_t allocations_with_session = pool.OutstandingAllocations();
+        if (allocations_with_session <= allocations_before) {
+            Fail("long UDP map keys did not allocate through the Worker pool");
         }
 #ifdef CNODE_TEST_ALLOCATOR_FAULT
         ::memory::reject_next_pmr_allocation = true;
@@ -1210,9 +1173,8 @@ TEST(UdpSocketOwner, Contract) {
             cycle_stats.active_reply_senders != 0) {
             Fail("UDP resource cycle retained map-owned state");
         }
-        if (thread_resource.resource.large_deallocations <=
-            large_deallocations_before) {
-            Fail("long UDP map keys were not released through PMR");
+        if (pool.OutstandingAllocations() >= allocations_with_session) {
+            Fail("long UDP map keys were not released through the Worker pool");
         }
         if ((cycle + 1) % 50 == 0) {
             io_context.run_for(std::chrono::milliseconds(1));
@@ -1220,9 +1182,8 @@ TEST(UdpSocketOwner, Contract) {
         }
     }
     worker.CloseSocket(long_socket_key);
-    if (thread_resource.resource.allocations <= pmr_allocations_before_cycles ||
-        thread_resource.resource.deallocations <= pmr_deallocations_before_cycles) {
-        Fail("long UDP keys did not allocate and release through the Worker PMR");
+    if (pool.OutstandingAllocations() > allocations_before_cycles) {
+        Fail("long UDP key cycles leaked Worker pool allocations");
     }
 
     bool attached_wait_cancelled = false;

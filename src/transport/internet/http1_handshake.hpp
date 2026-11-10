@@ -46,10 +46,11 @@ struct Http1MessageHead {
             storage->Advance(static_cast<uint32_t>(header_end));
             return buf::MultiBuffer{std::move(storage)};
         }
+        // Read-ahead bytes always live in `storage`; copy them into its pool.
         buf::MultiBuffer mb;
         const auto read_ahead = ReadAhead();
         size = header_end;
-        if (!buf::AppendSpanToMultiBuffer(read_ahead, mb)) {
+        if (!buf::AppendSpanToMultiBuffer(read_ahead, mb, storage->Pool())) {
             throw std::bad_alloc();
         }
         return mb;
@@ -96,11 +97,11 @@ void RecordExtractedRealIp(std::string_view head,
 [[nodiscard]] std::string_view PublicHttpMethodForLog(std::string_view value);
 [[nodiscard]] std::string SanitizeHttpRequestLineForLog(const Http1RequestLine& line);
 [[nodiscard]] std::string_view ExpectedHttpHost(const HttpConfig& cfg);
-void AppendRequestStart(memory::ThreadLocalString& request,
+void AppendRequestStart(memory::String& request,
                         std::string_view method,
                         std::string_view path,
                         std::string_view host);
-void AppendHeaderLine(memory::ThreadLocalString& out,
+void AppendHeaderLine(memory::String& out,
                       std::string_view name,
                       std::string_view value);
 

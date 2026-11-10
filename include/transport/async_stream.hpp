@@ -87,11 +87,16 @@ class TcpStream;
 // │ 4. TLS 流的 AsyncShutdownWrite() 必须发送 close_notify                  │
 // └─────────────────────────────────────────────────────────────────────────┘
 // ============================================================================
-class AsyncStream : public memory::ThreadAllocated,
+class AsyncStream : public memory::WorkerAllocated,
                     public transport::MultiBufferReader,
                     public transport::MultiBufferWriter {
 public:
+    explicit AsyncStream(memory::worker_memory& pool) noexcept : pool_(pool) {}
     virtual ~AsyncStream() noexcept = default;
+
+    // The Worker pool this stream, its payload Buffers and its per-connection
+    // state come from; it outlives the stream.
+    [[nodiscard]] memory::worker_memory& Pool() const noexcept { return pool_; }
 
     // Byte-stream EOF half-closes the peer writer; full-close transports
     // explicitly override this contract.
@@ -295,6 +300,7 @@ protected:
 
 private:
     transport::CancellationSource cancellation_;
+    memory::worker_memory& pool_;
 };
 
 // ============================================================================

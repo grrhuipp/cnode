@@ -34,18 +34,17 @@ public:
 private:
     void* do_allocate(size_t bytes, size_t alignment) override {
         async_allocation_test::Check();
-        auto* result = upstream_.allocate(bytes, alignment);
+        auto* result = ::memory::process_resource()->allocate(bytes, alignment);
         live.fetch_add(1, std::memory_order_relaxed);
         return result;
     }
     void do_deallocate(void* pointer, size_t bytes, size_t alignment) override {
-        upstream_.deallocate(pointer, bytes, alignment);
+        ::memory::process_resource()->deallocate(pointer, bytes, alignment);
         live.fetch_sub(1, std::memory_order_relaxed);
     }
     bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
         return this == &other;
     }
-    ::memory::ThreadMemoryResource upstream_;
 };
 
 void Check(bool condition, const char* message) {

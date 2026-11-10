@@ -16,7 +16,8 @@ using namespace std::chrono_literals;
 class LogicalStream final : public ::AsyncStream {
 public:
     LogicalStream(::net::io_context& io, ::TcpStream& physical, int& cancellations)
-        : physical_(physical), cancellations_(cancellations), deadline_(io, *this) {}
+        : ::AsyncStream(physical.Pool()), physical_(physical), cancellations_(cancellations),
+          deadline_(io, *this) {}
 
     ::net::awaitable<std::size_t> AsyncRead(::net::mutable_buffer) override {
         throw std::logic_error("deadline test does not perform byte reads");
@@ -66,8 +67,9 @@ private:
 };
 
 bool TestClearAndTimeoutIsolation() {
+    ::memory::worker_memory pool;
     ::net::io_context io;
-    ::TcpStream physical(::tcp::socket(io, ::tcp::v4()));
+    ::TcpStream physical(pool, ::tcp::socket(io, ::tcp::v4()));
     auto& scheduler = ::TimeoutScheduler::ForIoContext(io);
     int first_cancelled = 0, second_cancelled = 0;
     LogicalStream first(io, physical, first_cancelled);
@@ -104,8 +106,9 @@ bool TestClearAndTimeoutIsolation() {
 }
 
 bool TestReplacementDisabledAndClosed() {
+    ::memory::worker_memory pool;
     ::net::io_context io;
-    ::TcpStream physical(::tcp::socket(io, ::tcp::v4()));
+    ::TcpStream physical(pool, ::tcp::socket(io, ::tcp::v4()));
     auto& scheduler = ::TimeoutScheduler::ForIoContext(io);
     int cancellations = 0;
     LogicalStream stream(io, physical, cancellations);
@@ -133,13 +136,14 @@ bool TestReplacementDisabledAndClosed() {
 }
 
 bool TestDestructionCancelsOnlyOwnedEvent() {
+    ::memory::worker_memory pool;
     ::net::io_context io;
-    ::TcpStream physical(::tcp::socket(io, ::tcp::v4()));
+    ::TcpStream physical(pool, ::tcp::socket(io, ::tcp::v4()));
     auto& scheduler = ::TimeoutScheduler::ForIoContext(io);
     int destroyed_cancellations = 0, survivor_cancellations = 0;
     {
         LogicalStream survivor(io, physical, survivor_cancellations);
-        auto destroyed = std::make_unique<LogicalStream>(io, physical, destroyed_cancellations);
+        auto destroyed = ::memory::MakeUnique<LogicalStream>(pool, io, physical, destroyed_cancellations);
         if (!destroyed->StartPhaseDeadline(1s) || !survivor.StartPhaseDeadline(1s) ||
             scheduler.GetResourceStats().active_events != 2) return false;
         destroyed.reset();

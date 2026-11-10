@@ -73,7 +73,7 @@ net::awaitable<void> RequestBodyWriter::WriteEncrypted(BufferRange buffers) {
     bool write_started = false;
     try {
         buf::MultiBuffer out_mb;
-        out_mb.reserve(buffers.size());
+        out_mb.reserve(buffers.size(), stream_->Pool());
         for (const auto& buffer : buffers) {
             const auto bytes = buf::ChunkBytes(buffer);
             if (bytes.empty()) {
@@ -83,7 +83,9 @@ net::awaitable<void> RequestBodyWriter::WriteEncrypted(BufferRange buffers) {
                 *write_cipher_,
                 write_nonce_,
                 bytes,
-                out_mb);
+                out_mb,
+                nullptr,
+                stream_->Pool());
         }
         if constexpr (std::is_same_v<BufferRange, buf::MultiBuffer>) {
             buffers.clear();
@@ -191,7 +193,8 @@ PrepareTCPRequest2022(const TargetAddress& target,
                       const SsCipherInfo& cipher_info,
                       const KeyBytes& master_key,
                       std::span<const KeyBytes> psk_chain,
-                      ForwardedMetadataView forwarded) {
+                      ForwardedMetadataView forwarded,
+                      memory::worker_memory& pool) {
     if (cipher_info.salt_size > KeyBytes::kMaxSize ||
         cipher_info.key_size > KeyBytes::kMaxSize ||
         master_key.size < cipher_info.key_size) {
@@ -260,7 +263,7 @@ PrepareTCPRequest2022(const TargetAddress& target,
         return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
     }
 
-    buf::BufferGuard handshake{buf::Buffer::New()};
+    buf::BufferGuard handshake{buf::Buffer::New(pool)};
     if (!handshake) {
         return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
     }
@@ -305,7 +308,6 @@ PrepareTCPRequest2022(const TargetAddress& target,
     }
     handshake->Produce(static_cast<uint32_t>(variable_len + SsAeadCipher::kTagSize));
 
-    prepared.handshake_mb.reserve(1);
     prepared.handshake_mb.push_back(std::move(handshake));
     return prepared;
 }
@@ -314,7 +316,8 @@ tl::expected<PreparedTCPRequestHandshake, ErrorCode>
 PrepareTCPRequestLegacy(const TargetAddress& target,
                         const SsCipherInfo& cipher_info,
                         const KeyBytes& master_key,
-                        ForwardedMetadataView forwarded) {
+                        ForwardedMetadataView forwarded,
+                        memory::worker_memory& pool) {
     if (cipher_info.salt_size > 64 || cipher_info.key_size > 64 ||
         master_key.size < cipher_info.key_size) {
         return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
@@ -347,7 +350,7 @@ PrepareTCPRequestLegacy(const TargetAddress& target,
         return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
 
-    buf::BufferGuard out{buf::Buffer::New()};
+    buf::BufferGuard out{buf::Buffer::New(pool)};
     if (!out) {
         return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
     }
@@ -380,7 +383,6 @@ PrepareTCPRequestLegacy(const TargetAddress& target,
     }
     out->Produce(static_cast<uint32_t>(addr_size + SsAeadCipher::kTagSize));
 
-    prepared.handshake_mb.reserve(1);
     prepared.handshake_mb.push_back(std::move(out));
     return prepared;
 }
@@ -397,7 +399,7 @@ WriteTCPRequest2022(const TargetAddress& target,
     KeyBytes request_salt;
     {
         auto prepared = PrepareTCPRequest2022(
-            target, cipher_info, master_key, psk_chain, forwarded);
+            target, cipher_info, master_key, psk_chain, forwarded, stream.Pool());
         if (!prepared) {
             co_return tl::unexpected(prepared.error());
         }
@@ -438,7 +440,7 @@ WriteTCPRequest(const TargetAddress& target,
         std::optional<SsAeadCipher> write_cipher;
         {
             auto prepared = PrepareTCPRequestLegacy(
-                target, cipher_info, master_key, forwarded);
+                target, cipher_info, master_key, forwarded, stream.Pool());
             if (!prepared) {
                 co_return tl::unexpected(prepared.error());
             }
@@ -847,7 +849,7 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
 
     if (use_uot) {
         proxy::uot::FramedEndpoint uot_endpoint(
-            *target_endpoint, false, ctx.outbound.target);
+            ctx.pool, *target_endpoint, false, ctx.outbound.target);
         co_return co_await relay_endpoint(uot_endpoint);
     }
     co_return co_await relay_endpoint(*target_endpoint);
@@ -1073,8 +1075,9 @@ const bool kSsOutboundRegistered = (::proxyman::outbound::RegisterProxy(
                 +[](std::string_view,
                     std::shared_ptr<const PreparedSettings> state,
                     ::net::io_context& /*io_context*/,
-                    ::AwaitableTaskGroup& /*tasks*/) -> std::unique_ptr<::Outbound> {
-                    return std::make_unique<::proxy::shadowsocks::outbound::Handler>(
+                    ::AwaitableTaskGroup& /*tasks*/,
+                    memory::worker_memory& pool) -> std::unique_ptr<::Outbound> {
+                    return memory::MakeUnique<::proxy::shadowsocks::outbound::Handler>(pool,
                         std::move(state));
                 }>(PreparedSettings{
                     ::SsOutboundConfig{

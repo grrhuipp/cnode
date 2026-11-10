@@ -114,12 +114,13 @@ void RunUntil(net::io_context& io, Predicate predicate, const char* message) {
 }
 
 void ParentWaitsForCleanup(std::string_view network, bool protocol_error) {
+    memory::worker_memory pool;
     net::io_context io;
     ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
     ::tcp::socket client(io), accepted(io);
     client.connect(acceptor.local_endpoint());
     acceptor.accept(accepted);
-    auto raw = std::make_unique<::TcpStream>(std::move(accepted));
+    auto raw = memory::MakeUnique<::TcpStream>(pool, pool, std::move(accepted));
     auto sink = std::make_shared<CleanupSink>(io);
     const auto settings = FixtureSettings(network);
     bool returned = false;
@@ -180,12 +181,13 @@ bool HasProtocolReset(std::string_view wire, uint32_t stream) {
 // :authority makes the request malformed. It is a stream error: the request
 // never reaches the sink, and a later request on the same connection does.
 void ResetsMalformedRequest(std::string_view network, std::string_view extra_field) {
+    memory::worker_memory pool;
     net::io_context io;
     ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
     ::tcp::socket client(io), accepted(io);
     client.connect(acceptor.local_endpoint());
     acceptor.accept(accepted);
-    auto raw = std::make_unique<::TcpStream>(std::move(accepted));
+    auto raw = memory::MakeUnique<::TcpStream>(pool, pool, std::move(accepted));
     auto sink = std::make_shared<CleanupSink>(io);
     const auto settings = FixtureSettings(network);
     bool returned = false;

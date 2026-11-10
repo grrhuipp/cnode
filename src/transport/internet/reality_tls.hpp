@@ -100,21 +100,21 @@ private:
 
 class SslContext;
 
-struct RealityClientState : memory::ThreadAllocated {
+struct RealityClientState : memory::WorkerAllocated {
     ~RealityClientState() {
         OPENSSL_cleanse(auth_key.data(), auth_key.size());
         OPENSSL_cleanse(short_id.data(), short_id.size());
     }
     transport::internet::RealityShortId short_id{};
     std::array<uint8_t, 32> auth_key{};
-    memory::ThreadLocalString spider_x;
+    memory::String spider_x;
     const MLDSA65_public_key* mldsa65_verify_key = nullptr;
     memory::ByteVector client_hello_raw;
     memory::ByteVector server_hello_raw;
     bool auth_key_ready = false;
 };
 
-struct RealityServerConnState : memory::ThreadAllocated {
+struct RealityServerConnState : memory::WorkerAllocated {
     ~RealityServerConnState() {
         OPENSSL_cleanse(auth_key.data(), auth_key.size());
     }
@@ -135,7 +135,8 @@ void ClearRealityServerConnState(SSL* ssl) noexcept;
 [[nodiscard]] std::unique_ptr<RealityServerConnState>
 VerifyRealityClientHello(
     memory::ByteVector handshake,
-    const SslContext& ctx);
+    const SslContext& ctx,
+    memory::worker_memory& pool);
 
 // RFC 8446 sections 4.1.2 and 5.1: handshake messages may span records.
 // Retain the original wire image for fallback/replay, but authenticate the

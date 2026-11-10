@@ -94,9 +94,15 @@ class OutboundDatagramEndpointBase
     : public transport::MultiBufferReader
     , public transport::MultiBufferWriter {
 public:
-    OutboundDatagramEndpointBase(net::io_context& io,
+    OutboundDatagramEndpointBase(memory::worker_memory& pool, net::io_context& io,
                                  const net::ip::address& bind_address)
-        : socket_(io, bind_address) {}
+        : socket_(pool, io, bind_address), pool_(pool) {}
+
+    [[nodiscard]] memory::worker_memory& Pool() const noexcept { return pool_; }
+
+    net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
+        return WriteBuffersAsMultiBuffer(buffers, pool_);
+    }
 
     net::awaitable<void> AsyncShutdownWrite() override {
         write_closed_ = true;
@@ -153,6 +159,7 @@ public:
 
 protected:
     transport::internet::DatagramSocket socket_;
+    memory::worker_memory& pool_;
     bool write_closed_ = false;
 };
 
@@ -326,9 +333,9 @@ namespace proxy::freedom::outbound {
 // its concrete transport owns the socket, byte I/O and aggregate deadlines.
 class UdpRequest final : public ::proxy::OutboundDatagramEndpointBase {
 public:
-    UdpRequest(net::io_context& io, app::dns::DNS& dns,
+    UdpRequest(memory::worker_memory& pool, net::io_context& io, app::dns::DNS& dns,
                const net::ip::address& bind_address)
-        : OutboundDatagramEndpointBase(io, bind_address), dns_(dns) {}
+        : OutboundDatagramEndpointBase(pool, io, bind_address), dns_(dns) {}
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
         auto read = socket_.StartRead();
@@ -339,7 +346,7 @@ public:
             }
             const TargetAddress source(iputil::NormalizeAddress(packet.source.address()),
                                        packet.source.port());
-            if (!buf::SetUdpTarget(packet.payload, source))
+            if (!buf::SetUdpTarget(packet.payload, source, pool_))
                 throw transport::LinkError(ErrorCode::RESOURCE_EXHAUSTED);
             socket_.TouchActivity();
             co_return std::move(packet.payload);

@@ -26,10 +26,10 @@ uint64_t CpuNanoseconds() {
     return uint64_t(time.tv_sec) * 1000000000 + uint64_t(time.tv_nsec);
 }
 
-buf::MultiBuffer MakePayload(std::span<const uint8_t> bytes) {
+buf::MultiBuffer MakePayload(std::span<const uint8_t> bytes, memory::worker_memory& pool) {
     buf::MultiBuffer payload;
     while (!bytes.empty()) {
-        buf::BufferGuard buffer{buf::Buffer::New()};
+        buf::BufferGuard buffer{buf::Buffer::New(pool)};
         if (!buffer) throw std::bad_alloc();
         const auto count = std::min(bytes.size(), size_t(buffer->Available()));
         std::copy_n(bytes.begin(), count, buffer->Tail().begin());
@@ -48,7 +48,7 @@ struct Measurement {
 
 net::awaitable<Measurement> Transfer(
     DatagramSocket& sender, udp::socket& peer, const std::vector<uint8_t>& payload,
-    bool owned, size_t iterations) {
+    bool owned, size_t iterations, memory::worker_memory& pool) {
     std::vector<uint8_t> received(payload.size() + 1);
     const auto destination = peer.local_endpoint();
     const auto expected_source = sender.LocalEndpoint();
@@ -60,7 +60,7 @@ net::awaitable<Measurement> Transfer(
     for (size_t iteration = 0; iteration < iterations; ++iteration) {
         {
             auto write = sender.StartWrite();
-            if (owned) co_await write.SendTo(destination, MakePayload(payload));
+            if (owned) co_await write.SendTo(destination, MakePayload(payload, pool));
             else co_await write.SendTo(destination, buffers);
         }
         udp::endpoint source;
@@ -79,12 +79,13 @@ net::awaitable<Measurement> Transfer(
 
 TEST(UdpSendBenchmark, VerifiedDatagrams) {
     memory::ConfigureProcessAllocator();
-    const auto baseline = memory::ThreadMemoryPool().OutstandingAllocations();
+    memory::worker_memory pool;
+    const auto baseline = pool.OutstandingAllocations();
     for (const size_t size : {0u, 1u, 1200u, 60000u}) {
         for (const bool owned : {false, true}) {
             SCOPED_TRACE(::testing::Message() << "bytes=" << size << " owned=" << owned);
             net::io_context io;
-            DatagramSocket sender(io, net::ip::address_v4::loopback());
+            DatagramSocket sender(pool, io, net::ip::address_v4::loopback());
             sender.SetWriteTimeout(2s);
             udp::socket peer(io, {net::ip::address_v4::loopback(), 0});
             std::vector<uint8_t> payload(size);
@@ -94,10 +95,10 @@ TEST(UdpSendBenchmark, VerifiedDatagrams) {
             size_t pool_before = 0;
             size_t warm_rss = 0;
             auto exercise = [&]() -> net::awaitable<Measurement> {
-                (void)co_await Transfer(sender, peer, payload, owned, 128);
-                pool_before = memory::ThreadMemoryPool().GetFootprint().committed_bytes;
+                (void)co_await Transfer(sender, peer, payload, owned, 128, pool);
+                pool_before = pool.GetFootprint().committed_bytes;
                 warm_rss = benchmark::ResidentBytes();
-                co_return co_await Transfer(sender, peer, payload, owned, iterations);
+                co_return co_await Transfer(sender, peer, payload, owned, iterations, pool);
             };
             auto result = net::co_spawn(io, exercise(), net::use_future);
             io.run_for(30s);
@@ -109,7 +110,7 @@ TEST(UdpSendBenchmark, VerifiedDatagrams) {
             io.run();
             ASSERT_TRUE(finished) << "UDP send benchmark exceeded overall deadline";
             const auto measured = result.get();
-            const auto pool_after = memory::ThreadMemoryPool().GetFootprint().committed_bytes;
+            const auto pool_after = pool.GetFootprint().committed_bytes;
             const auto process_memory = benchmark::ReadProcessMemory();
             // Both endpoints and exact verification are timed. The owned path
             // also includes payload construction and release, not just sendto.
@@ -127,6 +128,6 @@ TEST(UdpSendBenchmark, VerifiedDatagrams) {
                 process_memory.file_resident_bytes);
         }
     }
-    EXPECT_EQ(memory::ThreadMemoryPool().OutstandingAllocations(), baseline);
+    EXPECT_EQ(pool.OutstandingAllocations(), baseline);
 }
 } // namespace

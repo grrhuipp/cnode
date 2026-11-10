@@ -60,14 +60,19 @@ struct DnsResult : ResultStatus {
     }
 };
 
-// One bounded cache owned by the main/control DNS executor.
+// One bounded cache owned by the main/control DNS executor. Its storage lives
+// in `resource` (process layer when none is named).
 class DnsCache {
 public:
     using NegativeEvent = void (*)(std::string_view domain, std::string_view reason,
                                   uint64_t hits, std::string_view event);
     explicit DnsCache(size_t max_size, uint32_t min_ttl, uint32_t max_ttl,
-                      NegativeEvent negative_event = nullptr)
-        : capacity_(max_size)
+                      NegativeEvent negative_event = nullptr,
+                      std::pmr::memory_resource* resource = nullptr)
+        : resource_(memory::ResourceOrProcess(resource))
+        , order_(resource_)
+        , entries_(resource_)
+        , capacity_(max_size)
         , min_ttl_(std::min(min_ttl, max_ttl))
         , max_ttl_(std::max(min_ttl, max_ttl))
         , negative_event_(negative_event) {}
@@ -90,7 +95,7 @@ public:
         const auto node = found->second;
         const auto now = steady_clock::now();
         if (now >= node->entry.expire_time) {
-            if (std::holds_alternative<memory::ThreadLocalString>(node->entry.answer)) {
+            if (std::holds_alternative<memory::String>(node->entry.answer)) {
                 // Keep only bounded recovery metadata, never serve an expired
                 // answer. It shares the cache's eviction slots, not a second map.
                 if (!node->entry.expired_negative) {
@@ -109,12 +114,12 @@ public:
 
         DnsCacheEntry& entry = node->entry;
         DnsResult result;
-        if (const auto* reason = std::get_if<memory::ThreadLocalString>(&entry.answer)) {
+        if (const auto* reason = std::get_if<memory::String>(&entry.answer)) {
             result.error = ErrorCode::DNS_NO_RECORD;
             result.error_msg.assign(reason->data(), reason->size());
             if (entry.negative_hits != UINT64_MAX) ++entry.negative_hits;
         } else {
-            const auto& addresses = std::get<memory::ThreadLocalVector<net::ip::address>>(entry.answer);
+            const auto& addresses = std::get<memory::Vector<net::ip::address>>(entry.answer);
             result.addresses.assign(addresses.begin(), addresses.end());
         }
         const auto remaining = std::chrono::duration_cast<std::chrono::seconds>(
@@ -144,11 +149,11 @@ public:
 
         DnsCacheEntry prepared;
         if (result.Ok()) {
-            auto& addresses = std::get<memory::ThreadLocalVector<net::ip::address>>(prepared.answer);
+            auto& addresses = prepared.answer.emplace<memory::Vector<net::ip::address>>(resource_);
             addresses.assign(result.addresses.begin(), result.addresses.end());
         } else {
-            prepared.answer.emplace<memory::ThreadLocalString>(
-                result.error_msg.data(), result.error_msg.size());
+            prepared.answer.emplace<memory::String>(
+                result.error_msg.data(), result.error_msg.size(), resource_);
         }
         const uint32_t ttl = result.ttl == 0 ? 0 : std::clamp(result.ttl, min_ttl_, max_ttl_);
         prepared.expire_time = steady_clock::now() + std::chrono::seconds(ttl);
@@ -167,7 +172,7 @@ public:
 
         // Stage both owners before eviction. If hash-node allocation fails, remove
         // the unindexed list node while all old entries and their views are intact.
-        order_.emplace_front(domain, std::move(prepared));
+        order_.emplace_front(domain, std::move(prepared), resource_);
         const auto node = order_.begin();
         try {
             entries_.emplace(std::string_view(node->domain), node);
@@ -198,22 +203,22 @@ public:
     }
 private:
     struct DnsCacheEntry {
-        std::variant<memory::ThreadLocalVector<net::ip::address>,
-                     memory::ThreadLocalString> answer;
+        std::variant<memory::Vector<net::ip::address>,
+                     memory::String> answer;
         time_point expire_time;
         uint64_t negative_hits = 0;
         bool expired_negative = false;
     };
     struct CacheNode {
-        memory::ThreadLocalString domain;
+        memory::String domain;
         DnsCacheEntry entry;
 
-        CacheNode(std::string_view name, DnsCacheEntry value)
-            : domain(name), entry(std::move(value)) {}
+        CacheNode(std::string_view name, DnsCacheEntry value, std::pmr::memory_resource* resource)
+            : domain(name, resource), entry(std::move(value)) {}
     };
-    using NodeList = memory::ThreadLocalList<CacheNode>;
+    using NodeList = memory::List<CacheNode>;
     void Report(const CacheNode& node, std::string_view event) const noexcept {
-        const auto* reason = std::get_if<memory::ThreadLocalString>(&node.entry.answer);
+        const auto* reason = std::get_if<memory::String>(&node.entry.answer);
         if (!negative_event_ || !reason) return;
         try {
             negative_event_(std::string_view(node.domain), std::string_view(*reason),
@@ -223,9 +228,10 @@ private:
         }
     }
 
+    std::pmr::memory_resource* resource_;
     // New and replaced entries move to the front. Read hits do not reorder.
     NodeList order_;
-    memory::ThreadLocalUnorderedMap<std::string_view, NodeList::iterator> entries_;
+    memory::UnorderedMap<std::string_view, NodeList::iterator> entries_;
     size_t capacity_;
     uint32_t min_ttl_;
     uint32_t max_ttl_;
@@ -457,7 +463,7 @@ private:
     udp::endpoint endpoint_;
     TimeoutScheduler& scheduler_;
     SignalChannel joined_;
-    memory::ThreadLocalUnorderedMap<uint16_t, Pending*> pending_;
+    memory::UnorderedMap<uint16_t, Pending*> pending_;
     std::array<uint8_t, 512> buffer_{};
     std::bitset<65536> used_ids_;
     size_t issued_ = 0;
@@ -474,7 +480,7 @@ class InflightResolves {
         Pending(net::io_context& io_context, std::string_view name)
             : domain(name), completion(io_context) {}
 
-        memory::ThreadLocalString domain;
+        memory::String domain;
         SignalChannel completion;
         std::optional<DnsResult> result;
         std::exception_ptr failure;
@@ -482,7 +488,7 @@ class InflightResolves {
         size_t waiters = 0;
     };
     using PendingPtr = std::shared_ptr<Pending>;
-    using Table = memory::ThreadLocalUnorderedMap<std::string_view, PendingPtr>;
+    using Table = memory::UnorderedMap<std::string_view, PendingPtr>;
 
     void Remove(Pending& pending) noexcept {
         const auto found = table_.find(std::string_view(pending.domain));
@@ -567,7 +573,8 @@ public:
                 rejected.error = ErrorCode::RESOURCE_EXHAUSTED;
                 co_return rejected;
             }
-            pending = memory::AllocateShared<Pending>(io_context_, domain);
+            // DNSWorker runs on the control loop: process layer.
+            pending = memory::AllocateShared<Pending>(nullptr, io_context_, domain);
             table_.emplace(std::string_view(pending->domain), pending);
             ++active_;
             try {

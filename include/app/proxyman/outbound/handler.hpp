@@ -41,7 +41,8 @@ struct PreparedOutboundCreator {
         std::string_view tag,
         const std::shared_ptr<const OutboundProtocolSettings>& settings,
         ::net::io_context& io_context,
-        ::AwaitableTaskGroup& tasks);
+        ::AwaitableTaskGroup& tasks,
+        memory::worker_memory& pool);
 
     std::shared_ptr<const OutboundProtocolSettings> settings;
     CreateFn create_fn = nullptr;
@@ -61,8 +62,9 @@ struct PreparedOutboundCreator {
     [[nodiscard]] std::unique_ptr<::Outbound> operator()(
         std::string_view tag,
         ::net::io_context& io_context,
-        ::AwaitableTaskGroup& tasks) const {
-        return create_fn(tag, settings, io_context, tasks);
+        ::AwaitableTaskGroup& tasks,
+        memory::worker_memory& pool) const {
+        return create_fn(tag, settings, io_context, tasks, pool);
     }
 };
 
@@ -75,10 +77,11 @@ template <typename State, auto Fn>
         +[](std::string_view tag,
             const std::shared_ptr<const OutboundProtocolSettings>& base,
             ::net::io_context& io_context,
-            ::AwaitableTaskGroup& tasks) -> std::unique_ptr<::Outbound> {
+            ::AwaitableTaskGroup& tasks,
+            memory::worker_memory& pool) -> std::unique_ptr<::Outbound> {
             const auto* holder = static_cast<const Holder*>(base.get());
             return Fn(tag, std::shared_ptr<const Decayed>(base, &holder->value),
-                      io_context, tasks);
+                      io_context, tasks, pool);
         }};
 }
 
@@ -114,7 +117,8 @@ void RegisterProxy(
 [[nodiscard]] std::unique_ptr<::Outbound> NewProxy(
     const PreparedOutboundConfig& config,
     ::net::io_context& io_context,
-    ::AwaitableTaskGroup& tasks);
+    ::AwaitableTaskGroup& tasks,
+    memory::worker_memory& pool);
 
 [[nodiscard]] bool HasProxy(std::string_view protocol);
 
@@ -158,11 +162,12 @@ private:
 // prepared sender settings (through its configuration entry), the tag's
 // OutboundDialer and the protocol instance.
 // ============================================================================
-class Handler final : public memory::ThreadAllocated {
+class Handler final : public memory::WorkerAllocated {
 public:
     // Stateless tag: the protocol instance and dialer live in the requesting
     // domain (reactor, DNS client and resident task group outlive the handler).
-    Handler(OutboundConfiguration::Entry config, net::io_context& io_context,
+    Handler(memory::worker_memory& pool,
+            OutboundConfiguration::Entry config, net::io_context& io_context,
             app::dns::DNS& dns, std::chrono::seconds dial_timeout,
             AwaitableTaskGroup& tasks);
     ~Handler();
@@ -197,9 +202,10 @@ private:
 // in the owning domain and keeps it until the tag is replaced or removed;
 // returned handles keep the handler alive for the whole request.
 // ============================================================================
-class HandlerLookup final : public memory::ThreadAllocated {
+class HandlerLookup final : public memory::WorkerAllocated {
 public:
-    HandlerLookup(const OutboundConfiguration& configuration,
+    HandlerLookup(memory::worker_memory& pool,
+                  const OutboundConfiguration& configuration,
                   net::io_context& io_context, app::dns::DNS& dns,
                   std::chrono::seconds dial_timeout, AwaitableTaskGroup& tasks);
     HandlerLookup(const HandlerLookup&) = delete;
@@ -226,13 +232,14 @@ private:
     [[nodiscard]] std::shared_ptr<Handler> Instantiate(
         const OutboundConfiguration::Entry& config);
 
+    memory::worker_memory& pool_;
     const OutboundConfiguration& configuration_;
     net::io_context& io_context_;
     app::dns::DNS& dns_;
     const std::chrono::seconds dial_timeout_;
     AwaitableTaskGroup& tasks_;
     uint64_t generation_ = 0;  // Publications start at 1.
-    memory::ThreadLocalVector<Entry> entries_;
+    memory::Vector<Entry> entries_;
 };
 
 }  // namespace proxyman::outbound

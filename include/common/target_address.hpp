@@ -51,7 +51,7 @@ struct UserProfile {
 // ============================================================================
 struct TargetAddress {
     AddressType type = AddressType::Invalid;
-    memory::ThreadLocalString host;  // 域名；IP 目标只保留 resolved_addr
+    memory::String host;  // 域名；IP 目标只保留 resolved_addr
     uint16_t port = 0;
 
     // DNS 解析后的地址
@@ -234,9 +234,9 @@ struct ForwardedMetadataView {
 // 链式代理透传的最初入站身份与真实客户端 IP 拥有型存储。
 struct ForwardedMetadata {
     int64_t user_id = 0;
-    memory::ThreadLocalString user_email;
+    memory::String user_email;
     std::optional<net::ip::address> client_ip;
-    memory::ThreadLocalString inbound_tag;
+    memory::String inbound_tag;
 
     [[nodiscard]] bool Empty() const noexcept {
         return user_id <= 0 && user_email.empty() &&

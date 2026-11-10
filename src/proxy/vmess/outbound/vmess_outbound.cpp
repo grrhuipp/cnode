@@ -112,7 +112,7 @@ public:
 private:
     net::awaitable<buf::MultiBuffer> ReadUdpMultiBuffer() {
         auto mb = co_await session_.DecodeResponse(stream_);
-        if (mb.byte_size() != 0 && !buf::SetUdpTarget(mb, udp_target_)) {
+        if (mb.byte_size() != 0 && !buf::SetUdpTarget(mb, udp_target_, stream_.Pool())) {
             throw std::bad_alloc();
         }
         co_return mb;
@@ -188,7 +188,7 @@ proxy::vmess::outbound::Handler::Process(
     const bool is_udp = ctx.content.network == Network::UDP;
     const auto command = is_udp ? ::vmess::Command::UDP : ::vmess::Command::TCP;
     ::vmess::encoding::ClientSession vmess_session(
-        prepared_->config.security, command);
+        ctx.pool, prepared_->config.security, command);
 
     if (auto ok = co_await SendVMessHandshake(
             *stream, vmess_session, prepared_->user, prepared_->auth_id_key,
@@ -317,8 +317,9 @@ const bool kVMessRegistered = (::proxyman::outbound::RegisterProxy(
                 +[](std::string_view,
                     std::shared_ptr<const PreparedSettings> state,
                     ::net::io_context& /*io_context*/,
-                    ::AwaitableTaskGroup& /*tasks*/) -> std::unique_ptr<::Outbound> {
-                    return std::make_unique<::proxy::vmess::outbound::Handler>(
+                    ::AwaitableTaskGroup& /*tasks*/,
+                    memory::worker_memory& pool) -> std::unique_ptr<::Outbound> {
+                    return memory::MakeUnique<::proxy::vmess::outbound::Handler>(pool,
                         std::move(state));
                 }>(PreparedSettings{
                     ::VMessOutboundConfig{

@@ -29,7 +29,7 @@ using ID = uint64_t;
 struct Inbound {
     enum class ClientIpSource : uint8_t { Socket, ProxyProtocol, HttpHeader };
 
-    Inbound() : Inbound(memory::CurrentResource()) {}
+    Inbound() : Inbound(nullptr) {}
     explicit Inbound(std::pmr::memory_resource* resource)
         : source_ip(resource)
         , tag(resource)
@@ -40,7 +40,7 @@ struct Inbound {
         , origin_user_email(resource)
         , origin_source_ip(resource) {}
     net::ip::address source_addr;
-    memory::ThreadLocalString source_ip;
+    memory::String source_ip;
     uint16_t source_port = 0;
     ClientIpSource client_ip_source = ClientIpSource::Socket;
 
@@ -48,18 +48,18 @@ struct Inbound {
         return client_ip_source == ClientIpSource::ProxyProtocol && !source_ip.empty();
     }
     std::optional<tcp::endpoint> local_endpoint;
-    memory::ThreadLocalString tag;
-    memory::ThreadLocalString accounting_key;
-    memory::ThreadLocalVector<memory::ThreadLocalString> tags;
+    memory::String tag;
+    memory::String accounting_key;
+    memory::Vector<memory::String> tags;
     int64_t user_id = 0;
-    memory::ThreadLocalString user_email;
+    memory::String user_email;
 
     // 链式代理透传自最初入站的标签、身份与真实客户端 IP。
-    memory::ThreadLocalString origin_tag;
+    memory::String origin_tag;
     int64_t origin_user_id = 0;
-    memory::ThreadLocalString origin_user_email;
+    memory::String origin_user_email;
     net::ip::address origin_source_addr;
-    memory::ThreadLocalString origin_source_ip;
+    memory::String origin_source_ip;
 
     // Connection-limit family lease of the physical connection this request
     // arrived on. Set by the inbound handler; substreams inherit it and take
@@ -159,11 +159,11 @@ struct Outbound {
 
 // xray-core common/session.Content 对应的内容元数据。
 struct Content {
-    Content() : Content(memory::CurrentResource()) {}
+    Content() : Content(nullptr) {}
     explicit Content(std::pmr::memory_resource* resource)
         : protocol(resource) {}
     Network network = Network::TCP;
-    memory::ThreadLocalString protocol;
+    memory::String protocol;
     uint64_t speed_limit = 0;
 };
 
@@ -174,8 +174,14 @@ struct Traffic {
 
 // Per-connection xray-style session metadata. The object itself stays
 // Worker-local; protocol, routing, outbound and relay code read/write the
-// records directly.
+// records directly and allocate per-connection state from `pool`.
 struct Context {
+    explicit Context(memory::worker_memory& pool)
+        : pool(pool), inbound(pool.resource()), content(pool.resource()) {}
+
+    // The owning Worker's pool; outlives every Context it serves.
+    memory::worker_memory& pool;
+
     // 连接标识
     ID conn_id = 0;
 
@@ -186,13 +192,10 @@ struct Context {
 
     uint32_t worker_id = 0;
 
-    Context() = default;
-
     Context(const Context&) = delete;
     Context& operator=(const Context&) = delete;
     Context(Context&&) = delete;
     Context& operator=(Context&&) = delete;
-
     void InitSubstreamFrom(const Context& parent, uint16_t sub_source_port = 0);
 };
 

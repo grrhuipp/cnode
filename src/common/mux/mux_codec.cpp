@@ -376,7 +376,7 @@ class TcpSubState;
 struct ReplyQueueState {
     explicit ReplyQueueState(SignalChannel& main_signal)
         : main_signal_(main_signal) {}
-    memory::ThreadLocalDeque<MuxReply> queue;
+    memory::RingDeque<MuxReply> queue;
     size_t tcp_queued_bytes = 0;   // TCP 子会话回包字节（含 overhead）
     size_t udp_queued_bytes = 0;   // UDP 子会话回包字节（含 overhead）
     uint32_t active_sub_loops = 0;
@@ -552,7 +552,7 @@ struct ClientReadQueueState {
         , main_signal_(main_signal) {}
     SignalChannel space_signal;
     SignalChannel& main_signal_;
-    memory::ThreadLocalDeque<QueuedInput> queue;
+    memory::RingDeque<QueuedInput> queue;
     size_t queued_bytes = 0;
     bool running = true;
     bool read_backpressured = false;
@@ -625,7 +625,7 @@ struct ClientReadQueueState {
 // notifications queued for the frame loop. Queued input is charged to the
 // connection-wide budget until it is read or discarded.
 class MuxSubSession
-    : public memory::ThreadAllocated
+    : public memory::WorkerAllocated
     , public transport::MultiBufferReader
     , public transport::MultiBufferWriter {
 public:
@@ -720,18 +720,26 @@ public:
         reply_queue_.ReleaseSubInput(std::exchange(queued_bytes_, 0));
     }
 
+    net::awaitable<void> WriteBuffers(
+        std::span<const net::const_buffer> buffers) override {
+        return WriteBuffersAsMultiBuffer(buffers, ctx.pool);
+    }
+
     session::Context ctx;
 
 protected:
     MuxSubSession(
+        memory::worker_memory& pool,
         net::io_context& io_context,
         uint16_t session_id,
         ReplyQueueState& reply_queue,
         bool is_udp)
-        : session_id_(session_id)
+        : ctx(pool)
+        , session_id_(session_id)
         , reply_queue_(reply_queue)
         , is_udp_(is_udp)
-        , input_signal_(net::any_io_executor(io_context.get_executor()), 1) {}
+        , input_signal_(net::any_io_executor(io_context.get_executor()), 1)
+        , input_queue_(pool.resource()) {}
 
     // Called once from Cancel() before queued input is discarded.
     virtual void OnCancel() noexcept {}
@@ -792,7 +800,7 @@ private:
 
     SignalChannel input_signal_;
     transport::CancellationSource cancellation_;
-    memory::ThreadLocalDeque<QueuedInput> input_queue_;
+    memory::RingDeque<QueuedInput> input_queue_;
     size_t queued_bytes_ = 0;
     ErrorCode terminal_error_ = ErrorCode::CANCELLED;
     bool end_sent_ = false;
@@ -804,10 +812,11 @@ private:
 class TcpSubState final : public MuxSubSession {
 public:
     TcpSubState(
+        memory::worker_memory& pool,
         net::io_context& io_context,
         uint16_t session_id,
         ReplyQueueState& reply_queue)
-        : MuxSubSession(io_context, session_id, reply_queue, false)
+        : MuxSubSession(pool, io_context, session_id, reply_queue, false)
         , output_signal_(net::any_io_executor(io_context.get_executor()), 1) {}
     ~TcpSubState() noexcept override {
         Cancel();
@@ -975,12 +984,13 @@ void ReplyQueueState::WakeWaitingWriters() noexcept {
 class UdpSubState final : public MuxSubSession {
 public:
     UdpSubState(
+        memory::worker_memory& pool,
         net::io_context& io_context,
         uint16_t session_id,
         ReplyQueueState& reply_queue,
         uint64_t parent_conn_id,
         TargetAddress default_target)
-        : MuxSubSession(io_context, session_id, reply_queue, true)
+        : MuxSubSession(pool, io_context, session_id, reply_queue, true)
         , parent_conn_id_(parent_conn_id)
         , default_target_(std::move(default_target)) {}
 
@@ -996,7 +1006,7 @@ public:
             mb.clear();
             return;
         }
-        if (!buf::SetUdpTarget(mb, packet_target ? *packet_target : default_target_)) {
+        if (!buf::SetUdpTarget(mb, packet_target ? *packet_target : default_target_, ctx.pool)) {
             throw std::bad_alloc();
         }
         // Empty datagrams still own a Buffer and a queue entry.
@@ -1154,7 +1164,7 @@ net::awaitable<RelayResult> ProcessInbound(
     ClientReadQueueState client_reads{io_context, main_signal};
 
     // TCP / UDP 共用同一个 session_id 命名空间。
-    memory::ThreadLocalUnorderedMap<uint16_t, std::unique_ptr<MuxSubSession>> sub_sessions;
+    memory::UnorderedMap<uint16_t, std::unique_ptr<MuxSubSession>> sub_sessions;
 
     // 帧累积缓冲区（处理粘包）：持有从流读取的 Buffer，解析前短暂 flatten。
     buf::MultiBuffer frame_buf;
@@ -1466,7 +1476,7 @@ net::awaitable<RelayResult> ProcessInbound(
                     // with an error END; the refused frame's payload is dropped.
                     if (sub_sessions.contains(hdr.session_id) ||
                         sub_sessions.size() >= kMaxConcurrentSubSessions) {
-                        session::Context rejected_ctx;
+                        session::Context rejected_ctx(parent_ctx.pool);
                         rejected_ctx.InitSubstreamFrom(parent_ctx);
                         proxy::BindInboundRequestTarget(
                             rejected_ctx,
@@ -1495,8 +1505,8 @@ net::awaitable<RelayResult> ProcessInbound(
                         LOG_CONN_DEBUG(parent_ctx,
                             "new UDP sid={} target={} data={}B",
                             sid, hdr.target, hdr.data_len);
-                        sub_state = std::make_unique<UdpSubState>(
-                            io_context,
+                        sub_state = memory::MakeUnique<UdpSubState>(
+                            parent_ctx.pool, parent_ctx.pool, io_context,
                             sid,
                             reply_queue,
                             parent_conn_id,
@@ -1504,8 +1514,8 @@ net::awaitable<RelayResult> ProcessInbound(
                     } else {
                         LOG_CONN_DEBUG(parent_ctx, "new TCP sid={} -> {}",
                             sid, hdr.target);
-                        sub_state = std::make_unique<TcpSubState>(
-                            io_context, sid, reply_queue);
+                        sub_state = memory::MakeUnique<TcpSubState>(
+                            parent_ctx.pool, parent_ctx.pool, io_context, sid, reply_queue);
                     }
                     sub_state->ctx.InitSubstreamFrom(parent_ctx);
                     proxy::BindInboundRequestTarget(

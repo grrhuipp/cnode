@@ -45,8 +45,8 @@ Frame Parse(const Capture& sink, size_t offset, bool first) {
 }
 class FragmentReader final : public transport::MultiBufferReader {
 public:
-    explicit FragmentReader(const std::vector<uint8_t>& bytes, size_t chunk = 1)
-        : bytes_(bytes), chunk_(chunk) {}
+    FragmentReader(memory::worker_memory& pool, const std::vector<uint8_t>& bytes, size_t chunk = 1)
+        : pool_(pool), bytes_(bytes), chunk_(chunk) {}
     bool EnableRawRead() noexcept override { switched_at = offset_; return true; }
     size_t switched_at = 0;
     transport::CancellationSource& Cancellation() noexcept override { return cancellation_; }
@@ -54,12 +54,13 @@ public:
         buf::MultiBuffer mb;
         if (offset_ < bytes_.size()) {
             const auto n = std::min(chunk_, bytes_.size() - offset_);
-            Check(buf::AppendSpanToMultiBuffer(std::span(bytes_).subspan(offset_, n), mb), "allocation");
+            Check(buf::AppendSpanToMultiBuffer(std::span(bytes_).subspan(offset_, n), mb, pool_), "allocation");
             offset_ += n;
         }
         co_return mb;
     }
 private:
+    memory::worker_memory& pool_;
     const std::vector<uint8_t>& bytes_;
     size_t offset_ = 0;
     size_t chunk_;
@@ -72,6 +73,7 @@ static_assert(vless::detail::VisionPaddingSize(900, false, 255) == 255);
 static_assert(vless::detail::VisionPaddingSize(8170, true, 255) == 1);
 static_assert(vless::detail::VisionPaddingSize(8171, true, 255) == 0);
 net::awaitable<void> Exercise() {
+    memory::worker_memory pool;
     const std::array<uint8_t, 16> uuid{};
     const std::array<uint8_t, 6> hello{0x16, 0x03, 0x01, 0, 1, 1};
     const std::array<uint8_t, 9> record{0x17, 0x03, 0x03, 0, 4, 1, 2, 3, 4};
@@ -143,7 +145,7 @@ net::awaitable<void> Exercise() {
             auto f = Parse(sink, 0, true);
             if (size == 899) Check(f.padding >= 1 && f.padding <= 500, "899-byte long padding");
             else Check(f.padding <= 255, "large-content short padding");
-            FragmentReader source(sink.bytes);
+            FragmentReader source(pool, sink.bytes);
             vless::VisionTrafficState read_state;
             vless::VisionReader reader(source, uuid, read_state);
             std::vector<uint8_t> decoded;
@@ -170,7 +172,7 @@ net::awaitable<void> Exercise() {
         // after that frame must precede future raw socket reads.
         std::vector<uint8_t> wire(uuid.begin(), uuid.end());
         wire.insert(wire.end(), {2, 0, 3, 0, 2, 10, 11, 12, 0, 0, 13, 14});
-        FragmentReader source(wire, chunk);
+        FragmentReader source(pool, wire, chunk);
         vless::VisionTrafficState state;
         vless::VisionReader reader(source, uuid, state);
         std::vector<uint8_t> decoded;

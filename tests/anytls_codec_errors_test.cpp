@@ -58,6 +58,7 @@ constexpr std::array names{"none", "memory", "link", "cancelled", "timeout", "re
 
 class Stream final : public AsyncStream {
 public:
+    explicit Stream(memory::worker_memory& pool) : AsyncStream(pool) {}
     Fault fault = Fault::None;
     size_t threshold = 0;
     size_t transferred = 0;
@@ -91,10 +92,10 @@ public:
     bool IsOpen() const override { return !closed; }
 };
 
-buf::MultiBuffer Payload(size_t count) {
+buf::MultiBuffer Payload(size_t count, memory::worker_memory& pool) {
     buf::MultiBuffer result;
     for (size_t i = 0; i < count; ++i) {
-        buf::BufferGuard block{buf::Buffer::New()};
+        buf::BufferGuard block{buf::Buffer::New(pool)};
         if (!block) throw std::bad_alloc();
         block->Tail()[0] = uint8_t(i);
         block->Produce(1);
@@ -121,12 +122,12 @@ net::awaitable<ErrorCode> Invoke(Stream& stream, int operation) {
         case 4: co_return Result(co_await anytls::WriteAll(stream, bytes));
         case 5: co_return Result(co_await anytls::WriteFrame(stream, 2, 1, bytes));
         case 6: {
-            auto body = Payload(1);
+            auto body = Payload(1, stream.Pool());
             co_return Result(co_await anytls::WriteFrame(stream, 2, 1, (*body.begin())->Bytes()));
         }
-        case 7: co_return Result(co_await anytls::WriteMultiBufferAsFrameBatch(stream, 2, 1, Payload(1)));
-        case 8: co_return Result(co_await anytls::WriteMultiBufferAsFrameBatch(stream, 2, 1, Payload(9)));
-        case 9: co_return Result(co_await anytls::WriteMultiBufferAsFramesWithPadding(stream, padding, 1, 2, 1, Payload(9)));
+        case 7: co_return Result(co_await anytls::WriteMultiBufferAsFrameBatch(stream, 2, 1, Payload(1, stream.Pool())));
+        case 8: co_return Result(co_await anytls::WriteMultiBufferAsFrameBatch(stream, 2, 1, Payload(9, stream.Pool())));
+        case 9: co_return Result(co_await anytls::WriteMultiBufferAsFramesWithPadding(stream, padding, 1, 2, 1, Payload(9, stream.Pool())));
         case 10: co_return Result(co_await anytls::WriteBuffersAsFramesWithPadding(stream, no_padding, 0, 2, 1, std::span(buffers).first(1)));
         case 11: co_return Result(co_await anytls::WriteBuffersAsFramesWithPadding(stream, no_padding, 0, 2, 1, buffers));
         case 12: co_return Result(co_await anytls::WriteBuffersAsFramesWithPadding(stream, padding, 1, 2, 1, buffers));
@@ -142,14 +143,14 @@ net::awaitable<ErrorCode> Invoke(Stream& stream, int operation) {
             co_return Result(co_await anytls::WritePacketWithPadding(stream, split, 1,
                 memory::ByteVector(bytes.begin(), bytes.end())));
         }
-        default: co_return Result(co_await anytls::WriteMultiBufferAsFramesWithPadding(stream, no_padding, 0, 2, 1, Payload(9)));
+        default: co_return Result(co_await anytls::WriteMultiBufferAsFramesWithPadding(stream, no_padding, 0, 2, 1, Payload(9, stream.Pool())));
     }
 }
 
-bool RunFrameBatch() {
+bool RunFrameBatch(memory::worker_memory& pool) {
     anytls::FrameBatch batch;
     for (size_t count : {size_t(1), size_t(9), size_t(1), size_t(0)}) {
-        auto payload = Payload(count);
+        auto payload = Payload(count, pool);
         if (!batch.Encode(2, 1, payload)) return false;
         const auto buffers = batch.Buffers();
         if (buffers.size() != count * 2) return false;
@@ -168,12 +169,12 @@ bool RunFrameBatch() {
     return true;
 }
 
-bool RunDeferredBatch() {
+bool RunDeferredBatch(memory::worker_memory& pool) {
     net::io_context io;
-    Stream stream;
+    Stream stream(pool);
     if (live != 0) std::abort();
     tracking = true;
-    auto pending = anytls::WriteMultiBufferAsFrameBatch(stream, 2, 1, Payload(1));
+    auto pending = anytls::WriteMultiBufferAsFrameBatch(stream, 2, 1, Payload(1, pool));
     const bool idle_before_await = stream.transferred == 0;
     bool returned = false;
     ErrorCode code = ErrorCode::INTERNAL;
@@ -192,9 +193,9 @@ bool RunDeferredBatch() {
     return passed;
 }
 
-bool Run(int operation, Fault fault, size_t threshold) {
+bool Run(int operation, Fault fault, size_t threshold, memory::worker_memory& pool) {
     net::io_context io;
-    Stream stream;
+    Stream stream(pool);
     stream.fault = fault;
     stream.threshold = threshold;
     if (live != 0) std::abort();
@@ -230,19 +231,20 @@ bool Run(int operation, Fault fault, size_t threshold) {
 }
 
 TEST(AnytlsCodecErrors, Contract) {
+    memory::worker_memory pool;
     size_t passed = 0, total = 0;
-    passed += RunFrameBatch(); ++total;
-    passed += RunDeferredBatch(); ++total;
+    passed += RunFrameBatch(pool); ++total;
+    passed += RunDeferredBatch(pool); ++total;
     for (int operation = 0; operation < 18; ++operation) {
-        passed += ::Run(operation, Fault::None, 0); ++total;
+        passed += ::Run(operation, Fault::None, 0, pool); ++total;
         for (int fault = 1; fault < 8; ++fault) {
             for (size_t threshold : {size_t(0), size_t(3)}) {
-                passed += ::Run(operation, Fault(fault), threshold); ++total;
+                passed += ::Run(operation, Fault(fault), threshold, pool); ++total;
             }
         }
     }
     for (int fault = 1; fault < 8; ++fault) {
-        passed += ::Run(16, Fault(fault), 65536); ++total;
+        passed += ::Run(16, Fault(fault), 65536, pool); ++total;
     }
     std::printf("codec cases=%zu passed=%zu failed=%zu released=%d\n", total, passed, total - passed, live == 0);
     { ASSERT_TRUE(passed == total); return; }

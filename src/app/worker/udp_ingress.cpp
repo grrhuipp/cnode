@@ -254,17 +254,20 @@ bool UdpIngress::ReplyRoute::Send(UDPPacketView packet, const udp::endpoint& end
 }
 
 UdpIngress::ClientSession::ClientSession(
+    memory::worker_memory& pool,
     net::io_context& io_context,
     ReplyRoute reply,
     udp::endpoint reply_endpoint,
     InboundDatagramOwner session_owner,
     UdpResourceBudget& budget,
     UdpResourceBudget::AssociationLease association)
-    : association_(std::move(association))
+    : pool_(pool)
+    , association_(std::move(association))
     , budget_(&budget)
     , reader_signal_(io_context, 1)
     , reply_(std::move(reply))
     , reply_endpoint_(std::move(reply_endpoint))
+    , input_queue_(pool.resource())
     , session_owner_(std::move(session_owner)) {}
 
 UdpIngress::ClientSession::~ClientSession() noexcept {
@@ -304,7 +307,7 @@ bool UdpIngress::ClientSession::Push(
         return false;
     }
 
-    if (!buf::SetUdpTarget(payload, target)) return false;
+    if (!buf::SetUdpTarget(payload, target, pool_)) return false;
     auto reservation = budget_->ReservePayload(payload);
     if (!reservation) return false;
 
@@ -457,16 +460,22 @@ void UdpIngress::ClientSession::CloseWithError(ErrorCode error) noexcept {
 }
 
 UdpIngress::UdpIngress(
+    memory::worker_memory& pool,
     std::string_view tag,
     std::unique_ptr<::Inbound> proxy,
     UdpAssociationReclaimer& reclaimer,
     UdpResourceBudget& budget,
     net::io_context& io_context)
-    : tag_(tag)
+    : pool_(pool)
+    , tag_(tag, pool.resource())
     , proxy_(std::move(proxy))
     , reclaimer_(reclaimer)
     , budget_(budget)
-    , completion_signal_(io_context, 1) {}
+    , udp_sockets_(pool.resource())
+    , reply_queues_(pool.resource())
+    , client_sessions_(pool.resource())
+    , completion_signal_(io_context, 1)
+    , handoff_records_(pool.resource()) {}
 
 UdpIngress::~UdpIngress() noexcept {
     if (outstanding_jobs_ != 0) {
@@ -706,7 +715,7 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
         if (decoded.error() == ErrorCode::PROTOCOL_AUTH_FAILED) {
             // Datagram sources are socket peers, never PROXY protocol clients,
             // so a credential failure is logged without feeding the ban table.
-            session::Context rejected;
+            session::Context rejected(pool_);
             rejected.worker_id = datagram.worker_id;
             rejected.inbound.tag = tag_;
             rejected.inbound.source_addr = normalized_client_addr;
@@ -741,7 +750,7 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
         }
         if (!decoded->user) return;
         UdpHandoffIdentity identity{
-            memory::ThreadLocalString(socket_key), memory::ThreadLocalString(tag_),
+            memory::String(socket_key), memory::String(tag_),
             prepared->settings.get(),
             ClientSessionKey{decoded->session_owner, decoded->session_id, {},
                              prepared->settings.get()}};
@@ -850,7 +859,7 @@ void UdpIngress::ProcessDecoded(const UdpDatagramContext& datagram,
 
         const uint32_t worker_id = datagram.worker_id;
         ReplyRoute reply{
-            .socket_key = memory::ThreadLocalString{socket_key},
+            .socket_key = memory::String{socket_key},
             .socket = stable_socket,
             .response = std::move(*response),
             .sink = &datagram.reply_sink,
@@ -879,7 +888,7 @@ void UdpIngress::ProcessDecoded(const UdpDatagramContext& datagram,
                     client_session_key.configuration},
                 record->association.get());
         }
-        client_session->request_.emplace(datagram.receiver->dispatch_policy);
+        client_session->request_.emplace(pool_, datagram.receiver->dispatch_policy);
         auto& request = *client_session->request_;
         auto& ctx = request.context;
         ctx.conn_id = session::NewID(datagram.worker_id);
@@ -982,7 +991,9 @@ UdpIngress::ReplyEnqueueResult UdpIngress::EnqueueReply(
     if (!reservation) return ReplyEnqueueResult::Rejected;
 
     if (queue_it == reply_queues_.end()) {
-        queue_it = reply_queues_.try_emplace(memory::ThreadLocalString{socket_key}).first;
+        queue_it = reply_queues_.try_emplace(
+            memory::String(socket_key, pool_.resource()),
+            ReplyQueueState{.pending = memory::RingDeque<QueuedUdpReply>(pool_.resource())}).first;
     }
     auto& queue = queue_it->second;
     const bool should_start_send = queue.active_id == 0;
@@ -1045,7 +1056,7 @@ UdpIngress::ClientSessionPtr UdpIngress::CreateClientSession(
     auto association = budget_.AcquireAssociation();
     if (!association) return nullptr;
     auto session = memory::AllocateShared<ClientSession>(
-        io_context,
+        pool_.resource(), pool_, io_context,
         std::move(reply),
         std::move(reply_endpoint),
         std::move(session_owner), budget_, std::move(association));
@@ -1156,7 +1167,7 @@ UdpIngress::SocketPtr UdpIngress::AttachSocket(
         local_endpoint.emplace(iputil::NormalizeAddress(local_ep.address()), local_ep.port());
     }
     udp_sockets_.try_emplace(
-        memory::ThreadLocalString{socket_key},
+        memory::String{socket_key},
         BoundSocket{
             .socket = socket,
             .local_endpoint = std::move(local_endpoint),

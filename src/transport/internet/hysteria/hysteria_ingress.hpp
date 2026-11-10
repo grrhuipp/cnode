@@ -62,7 +62,7 @@ inline constexpr size_t kMaxUdpPayloadLength = 4096;
 struct V1ClientHello {
     uint64_t send_bps = 0;
     uint64_t receive_bps = 0;
-    memory::ThreadLocalString auth;
+    memory::String auth;
 };
 
 struct V1Request {
@@ -218,12 +218,15 @@ struct SslContextDeleter {
 using SslContextPtr = std::unique_ptr<SSL_CTX, SslContextDeleter>;
 
 
-class QuicStreamState final : public memory::ThreadAllocated {
+class QuicStreamState final : public memory::WorkerAllocated {
 public:
     static constexpr size_t kMaxQueuedInputBytes = 512 * 1024;
 
-    QuicStreamState(net::io_context& io_context, int64_t stream_id, std::weak_ptr<Connection> owner);
+    QuicStreamState(memory::worker_memory& pool, net::io_context& io_context, int64_t stream_id,
+                    std::weak_ptr<Connection> owner);
 
+    // The connection's Worker pool; received input and stream objects come from it.
+    [[nodiscard]] memory::worker_memory& Pool() const noexcept { return pool_; }
     [[nodiscard]] net::io_context& IoContext() const noexcept { return io_context_; }
     transport::CancellationSource& Cancellation() noexcept { return cancellation_; }
     [[nodiscard]] bool PushInput(std::span<const uint8_t> data, bool fin);
@@ -253,7 +256,7 @@ public:
     }
 
 private:
-    struct OutputWait final : memory::ThreadAllocated {
+    struct OutputWait final : memory::WorkerAllocated {
         explicit OutputWait(net::any_io_executor executor)
             : ready(std::move(executor), 0) {}
         OutputWait(const OutputWait&) = delete;
@@ -269,6 +272,7 @@ private:
     void Abort(bool cancel_transport) noexcept;
     void WakeReader() noexcept;
 
+    memory::worker_memory& pool_;
     net::io_context& io_context_;
     int64_t stream_id_;
     std::weak_ptr<Connection> owner_;
@@ -322,7 +326,7 @@ public:
     // Bounds queued Buffer data capacity, not only the datagrams' payload sizes.
     static constexpr size_t kMaxQueuedBytes = 512 * 1024;
 
-    UdpSessionStream(net::io_context& io_context, uint32_t session_id,
+    UdpSessionStream(memory::worker_memory& pool, net::io_context& io_context, uint32_t session_id,
                      TargetAddress first_target,
                      std::weak_ptr<Connection> owner);
     ~UdpSessionStream() noexcept override;
@@ -357,7 +361,7 @@ private:
     TargetAddress first_target_;
     std::weak_ptr<Connection> owner_;
     SignalChannel signal_;
-    memory::ThreadLocalDeque<buf::MultiBuffer> input_;
+    memory::RingDeque<buf::MultiBuffer> input_;
     size_t queued_buffer_count_ = 0;
     bool cancelled_ = false;
     bool closed_ = false;
@@ -367,11 +371,11 @@ private:
 // timer. Each accepted QUIC connection stays on its accepting Worker, shared
 // by all its TCP streams and UDP sessions; listeners never transfer received
 // payloads or move their shared sockets.
-class HysteriaIngress final : public memory::ThreadAllocated {
+class HysteriaIngress final : public memory::WorkerAllocated {
 public:
     using SocketPtr = std::shared_ptr<udp::socket>;
 
-    HysteriaIngress(uint32_t worker_id, net::io_context& io_context,
+    HysteriaIngress(memory::worker_memory& pool, uint32_t worker_id, net::io_context& io_context,
                    app::DatagramSessionEnvironment environment);
     ~HysteriaIngress() noexcept;
 
@@ -403,17 +407,19 @@ private:
     void ArmExpiryAt(ngtcp2_tstamp deadline);
     net::awaitable<void> ExpiryLoop();
 
+    // The owning Worker's pool: sockets, connections' QUIC state and payloads.
+    memory::worker_memory& pool;
     app::DatagramSessionEnvironment environment;
-    memory::ThreadLocalUnorderedMap<Connection*, std::shared_ptr<Connection>> sessions;
+    memory::UnorderedMap<Connection*, std::shared_ptr<Connection>> sessions;
     uint32_t worker_id;
     net::io_context& io;
     Version version = Version::V2;
     uint64_t upload_bytes_per_second = 0;
     uint64_t download_bytes_per_second = 0;
     SslContextPtr ssl_context;
-    memory::ThreadLocalUnorderedMap<memory::ThreadLocalString,
+    memory::UnorderedMap<memory::String,
         std::shared_ptr<SocketState>, TransparentStringHash, TransparentStringEq> sockets;
-    memory::ThreadLocalUnorderedMap<
+    memory::UnorderedMap<
         ConnectionId, std::shared_ptr<Connection>, ConnectionIdHash> connections;
     net::steady_timer changed;
     net::steady_timer expiry;
@@ -469,16 +475,16 @@ public:
 private:
     friend class HysteriaIngress;
     struct H3Request {
-        memory::ThreadLocalString method;
-        memory::ThreadLocalString path;
-        memory::ThreadLocalString authority;
-        memory::ThreadLocalString auth;
+        memory::String method;
+        memory::String path;
+        memory::String authority;
+        memory::String auth;
     };
     struct StreamRecord {
         explicit StreamRecord(std::shared_ptr<QuicStreamState> state_value)
             : state(std::move(state_value)) {}
         std::shared_ptr<QuicStreamState> state;
-        memory::ThreadLocalDeque<buf::MultiBuffer> output;
+        memory::RingDeque<buf::MultiBuffer> output;
         size_t queued_bytes = 0;
         // Position in retained output; ACK reclamation rebases only the front.
         uint32_t output_index = 0;
@@ -501,6 +507,10 @@ private:
             if (http) nghttp3_conn_del(http);
             if (ssl) SSL_free(ssl);
         }
+        // Allocators bound to the Worker pool; ngtcp2/nghttp3 keep these pointers
+        // until ~Core deletes their connections.
+        ngtcp2_mem quic_mem{};
+        nghttp3_mem http_mem{};
         ngtcp2_conn* quic = nullptr;
         nghttp3_conn* http = nullptr;
         SSL* ssl = nullptr;
@@ -510,18 +520,18 @@ private:
         udp::endpoint local;
         udp::endpoint remote;
         ngtcp2_cid server_cid{};
-        memory::ThreadLocalUnorderedMap<int64_t, StreamRecord> streams;
+        memory::UnorderedMap<int64_t, StreamRecord> streams;
         // Intrusive round-robin of writable streams; callbacks unlink before erase.
         int64_t next_output_stream = -1;
-        memory::ThreadLocalUnorderedMap<int64_t, H3Request> h3_requests;
-        memory::ThreadLocalDeque<memory::ByteVector> datagrams;
+        memory::UnorderedMap<int64_t, H3Request> h3_requests;
+        memory::RingDeque<memory::ByteVector> datagrams;
         // Registered sessions; each unregisters itself on destruction and is
         // detached here first when the connection closes.
-        memory::ThreadLocalUnorderedMap<uint32_t, UdpSessionStream*> udp_sessions;
+        memory::UnorderedMap<uint32_t, UdpSessionStream*> udp_sessions;
     };
     struct PendingFragments {
         TargetAddress target;
-        memory::ThreadLocalVector<memory::ByteVector> payloads;
+        memory::Vector<memory::ByteVector> payloads;
         // One-based indices into arrived nonempty payloads; zero carries no bytes.
         std::array<uint8_t, 256> payload_slots{};
         std::bitset<256> received_fragments;
@@ -617,7 +627,7 @@ private:
         const ngtcp2_path*, ngtcp2_path_validation_result, void*);
 
     HysteriaIngress* listener_;
-    memory::ThreadLocalVector<ConnectionId> connection_ids_;
+    memory::Vector<ConnectionId> connection_ids_;
     AwaitableTaskGroup* tasks_ = nullptr;
     SignalChannel closed_signal_;
     std::optional<Core> core_;
@@ -626,7 +636,7 @@ private:
     ConnectionLimiter::Reservation physical_reservation_;
     std::optional<UserOnlineSessionGuard> online_session_;
     std::shared_ptr<InboundTransportStreamHandler> stream_sink_;
-    memory::ThreadLocalUnorderedMap<uint64_t, PendingFragments> fragments_;
+    memory::UnorderedMap<uint64_t, PendingFragments> fragments_;
     // 续期或删除后允许保留较早的唤醒；到期时重算，避免逐片扫描。
     ngtcp2_tstamp fragment_expiry_ = std::numeric_limits<ngtcp2_tstamp>::max();
     ngtcp2_tstamp expiry_ = std::numeric_limits<ngtcp2_tstamp>::max();

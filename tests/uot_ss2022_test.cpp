@@ -52,13 +52,14 @@ std::vector<uint8_t> Flatten(const buf::MultiBuffer& mb) {
     return out;
 }
 
-buf::MultiBuffer MakePacket(std::string_view payload, const TargetAddress& target) {
+buf::MultiBuffer MakePacket(std::string_view payload, const TargetAddress& target,
+                            memory::worker_memory& pool) {
     buf::MultiBuffer packet;
     Check(buf::AppendSpanToMultiBuffer(
         std::span<const uint8_t>(
             reinterpret_cast<const uint8_t*>(payload.data()), payload.size()),
-        packet), "packet allocation failed");
-    Check(buf::SetUdpTarget(packet, target), "packet target allocation failed");
+        packet, pool), "packet allocation failed");
+    Check(buf::SetUdpTarget(packet, target, pool), "packet target allocation failed");
     return packet;
 }
 
@@ -91,8 +92,9 @@ class FragmentReader final : public transport::MultiBufferReader {
 public:
     transport::CancellationSource& Cancellation() noexcept override { return cancellation_; }
 
-    FragmentReader(std::vector<uint8_t> bytes, std::vector<size_t> fragments)
-        : bytes_(std::move(bytes)), fragments_(std::move(fragments)) {}
+    FragmentReader(memory::worker_memory& pool, std::vector<uint8_t> bytes,
+                   std::vector<size_t> fragments)
+        : pool_(pool), bytes_(std::move(bytes)), fragments_(std::move(fragments)) {}
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
         if (offset_ >= bytes_.size()) {
@@ -104,7 +106,7 @@ public:
         const size_t size = std::min(requested, bytes_.size() - offset_);
         buf::MultiBuffer out;
         if (!buf::AppendSpanToMultiBuffer(
-                std::span<const uint8_t>(bytes_.data() + offset_, size), out)) {
+                std::span<const uint8_t>(bytes_.data() + offset_, size), out, pool_)) {
             Fail("reader allocation failed");
         }
         offset_ += size;
@@ -113,6 +115,7 @@ public:
 
 private:
     transport::CancellationSource cancellation_;
+    memory::worker_memory& pool_;
 
     std::vector<uint8_t> bytes_;
     std::vector<size_t> fragments_;
@@ -124,9 +127,10 @@ class FramedEndpointDouble final
     : public transport::MultiBufferReader
     , public transport::MultiBufferWriter {
 public:
-    explicit FramedEndpointDouble(std::vector<uint8_t> input = {},
+    explicit FramedEndpointDouble(memory::worker_memory& pool,
+                                  std::vector<uint8_t> input = {},
                                   std::vector<size_t> fragments = {})
-        : reader_(std::move(input), std::move(fragments)) {}
+        : reader_(pool, std::move(input), std::move(fragments)) {}
 
     transport::CancellationSource& Cancellation() noexcept override {
         return reader_.Cancellation();
@@ -253,15 +257,16 @@ TEST(UotSs2022, MagicAndRequestCodec) {
 
 TEST(UotSs2022, ConnectPacketRoundTrip) {
     const TargetAddress target("1.1.1.1", 53);
+    memory::worker_memory pool;
     CaptureWriter capture;
     proxy::uot::PacketWriter writer(capture, true, target);
     ::Run([&]() -> net::awaitable<void> {
-        co_await writer.WriteMultiBuffer(MakePacket("alpha", target));
-        co_await writer.WriteMultiBuffer(MakePacket("beta-payload", target));
+        co_await writer.WriteMultiBuffer(MakePacket("alpha", target, pool));
+        co_await writer.WriteMultiBuffer(MakePacket("beta-payload", target, pool));
     });
 
-    FragmentReader source(capture.bytes, {1, 1, 2, 3, 1, 4, 2});
-    proxy::uot::PacketReader reader(source, true, target);
+    FragmentReader source(pool, capture.bytes, {1, 1, 2, 3, 1, 4, 2});
+    proxy::uot::PacketReader reader(pool, source, true, target);
     ::Run([&]() -> net::awaitable<void> {
         auto first = co_await reader.ReadMultiBuffer();
         auto second = co_await reader.ReadMultiBuffer();
@@ -278,11 +283,12 @@ TEST(UotSs2022, ConnectPacketRoundTrip) {
 TEST(UotSs2022, LargeConnectPacketRoundTrip) {
     const TargetAddress target("1.1.1.1", 53);
     const std::string large_payload(buf::Buffer::kSize + 257, '\x6d');
+    memory::worker_memory pool;
 
     CaptureWriter capture;
     proxy::uot::PacketWriter writer(capture, true, target);
     ::Run([&]() -> net::awaitable<void> {
-        co_await writer.WriteMultiBuffer(MakePacket(large_payload, target));
+        co_await writer.WriteMultiBuffer(MakePacket(large_payload, target, pool));
     });
 
     Check(capture.bytes.size() == large_payload.size() + 2,
@@ -293,8 +299,8 @@ TEST(UotSs2022, LargeConnectPacketRoundTrip) {
           "large UoT frame length did not cover the complete datagram");
 
     FragmentReader source(
-        capture.bytes, {1, 2, 4096, 17, 2048, 3, 1024});
-    proxy::uot::PacketReader reader(source, true, target);
+        pool, capture.bytes, {1, 2, 4096, 17, 2048, 3, 1024});
+    proxy::uot::PacketReader reader(pool, source, true, target);
     ::Run([&]() -> net::awaitable<void> {
         auto decoded = co_await reader.ReadMultiBuffer();
         Check(Flatten(decoded) == std::vector<uint8_t>(
@@ -308,6 +314,7 @@ TEST(UotSs2022, LargeConnectPacketRoundTrip) {
 TEST(UotSs2022, EmptyDatagramsPreserveSequenceAndTargets) {
     const TargetAddress first("1.1.1.1", 53);
     const TargetAddress second("8.8.8.8", 5353);
+    memory::worker_memory pool;
     for (const bool connect : {false, true}) {
         CaptureWriter capture;
         proxy::uot::PacketWriter writer(capture, connect, first);
@@ -315,18 +322,18 @@ TEST(UotSs2022, EmptyDatagramsPreserveSequenceAndTargets) {
         ::Run([&]() -> net::awaitable<void> {
             co_await writer.WriteMultiBuffer({});
             Check(capture.bytes.empty(), "no UDP message wrote an empty frame");
-            co_await writer.WriteMultiBuffer(MakePacket("", first));
-            co_await writer.WriteMultiBuffer(MakePacket("data", first));
+            co_await writer.WriteMultiBuffer(MakePacket("", first, pool));
+            co_await writer.WriteMultiBuffer(MakePacket("data", first, pool));
             if (connect) {
                 co_await writer.WriteBuffers(std::span<const net::const_buffer>{});
             } else {
-                co_await writer.WriteMultiBuffer(MakePacket("", last));
+                co_await writer.WriteMultiBuffer(MakePacket("", last, pool));
             }
         });
         Check(capture.bytes.size() == (connect ? 10 : 31),
               "UoT empty datagrams did not write complete protocol headers");
-        FragmentReader source(capture.bytes, {1, 1, 1, 1, 1, 1, 1, 1});
-        proxy::uot::PacketReader reader(source, connect, first);
+        FragmentReader source(pool, capture.bytes, {1, 1, 1, 1, 1, 1, 1, 1});
+        proxy::uot::PacketReader reader(pool, source, connect, first);
         ::Run([&]() -> net::awaitable<void> {
             const std::array<size_t, 3> sizes{0, 4, 0};
             for (size_t index = 0; index < sizes.size(); ++index) {
@@ -347,20 +354,21 @@ TEST(UotSs2022, EmptyDatagramsPreserveSequenceAndTargets) {
 
 TEST(UotSs2022, V1FirstEmptyDatagramSurvivesPreparation) {
     const TargetAddress target("dns.example", 53);
+    memory::worker_memory pool;
     CaptureWriter capture;
     proxy::uot::PacketWriter writer(capture, false, target);
     ::Run([&]() -> net::awaitable<void> {
-        co_await writer.WriteMultiBuffer(MakePacket("", target));
-        co_await writer.WriteMultiBuffer(MakePacket("next", target));
+        co_await writer.WriteMultiBuffer(MakePacket("", target, pool));
+        co_await writer.WriteMultiBuffer(MakePacket("next", target, pool));
     });
-    FragmentReader source(capture.bytes, {1, 2, 3, 1});
+    FragmentReader source(pool, capture.bytes, {1, 2, 3, 1});
     ::Run([&]() -> net::awaitable<void> {
         auto prepared = co_await proxy::uot::ReadUotRequestHeader(
-            proxy::uot::Version::V1, source);
+            proxy::uot::Version::V1, source, {}, ErrorCode::PROTOCOL_DECODE_FAILED, pool);
         Check(prepared.has_value() && prepared->destination.SameEndpoint(target),
               "UoT v1 first empty UDP message was mistaken for EOF");
         auto empty = std::move(prepared->initial_decoded);
-        proxy::uot::PacketReader reader(source, std::move(*prepared));
+        proxy::uot::PacketReader reader(pool, source, std::move(*prepared));
         const auto datagram = buf::InspectUdpDatagram(empty);
         Check(datagram.Valid() && datagram.payload_size == 0 &&
                   datagram.target->SameEndpoint(target),
@@ -374,10 +382,11 @@ TEST(UotSs2022, V1FirstEmptyDatagramSurvivesPreparation) {
 
 TEST(UotSs2022, FramedEndpointWriteAndRead) {
     const TargetAddress target("1.1.1.1", 53);
-    FramedEndpointDouble underlying;
+    memory::worker_memory pool;
+    FramedEndpointDouble underlying(pool);
     underlying.suspend_write = true;
-    proxy::uot::FramedEndpoint endpoint(underlying, true, target);
-    auto pending_write = endpoint.WriteMultiBuffer(MakePacket("framed", target));
+    proxy::uot::FramedEndpoint endpoint(pool, underlying, true, target);
+    auto pending_write = endpoint.WriteMultiBuffer(MakePacket("framed", target, pool));
     Check(underlying.write_calls == 0 && underlying.bytes.empty(),
           "UoT framed write started before its awaitable was awaited");
     ::Run([&]() -> net::awaitable<void> {
@@ -404,8 +413,8 @@ TEST(UotSs2022, FramedEndpointWriteAndRead) {
     endpoint.Cancel();
     Check(underlying.cancel_calls == 1, "UoT framed endpoint did not forward cancellation");
 
-    FramedEndpointDouble encoded(underlying.bytes, {1, 1, 2, 1, 3});
-    proxy::uot::FramedEndpoint read_endpoint(encoded, true, target);
+    FramedEndpointDouble encoded(pool, underlying.bytes, {1, 1, 2, 1, 3});
+    proxy::uot::FramedEndpoint read_endpoint(pool, encoded, true, target);
     auto pending_read = read_endpoint.ReadMultiBuffer();
     Check(encoded.read_calls == 0,
           "UoT framed read started before its awaitable was awaited");
@@ -421,13 +430,14 @@ TEST(UotSs2022, FramedEndpointWriteAndRead) {
 
 TEST(UotSs2022, FramedEndpointWriteException) {
     const TargetAddress target("1.1.1.1", 53);
-    FramedEndpointDouble underlying;
+    memory::worker_memory pool;
+    FramedEndpointDouble underlying(pool);
     underlying.throw_on_write = true;
-    proxy::uot::FramedEndpoint endpoint(underlying, true, target);
+    proxy::uot::FramedEndpoint endpoint(pool, underlying, true, target);
     bool propagated = false;
     try {
         ::Run([&]() -> net::awaitable<void> {
-            co_await endpoint.WriteMultiBuffer(MakePacket("failure", target));
+            co_await endpoint.WriteMultiBuffer(MakePacket("failure", target, pool));
         });
     } catch (const std::runtime_error& error) {
         propagated = std::string_view(error.what()) == "synthetic write failure";
@@ -438,6 +448,7 @@ TEST(UotSs2022, FramedEndpointWriteException) {
 TEST(UotSs2022, NonConnectRequestAndPackets) {
     const TargetAddress initial("dns.example", 53);
     const TargetAddress second("8.8.8.8", 5353);
+    memory::worker_memory pool;
 
     const auto request = proxy::uot::EncodeRequest(false, initial);
     Check(request.has_value(), "non-connect request encode failed");
@@ -447,11 +458,11 @@ TEST(UotSs2022, NonConnectRequestAndPackets) {
         capture.bytes.end(), request->span().begin(), request->span().end());
     proxy::uot::PacketWriter writer(capture, false, initial);
     ::Run([&]() -> net::awaitable<void> {
-        co_await writer.WriteMultiBuffer(MakePacket("one", initial));
-        co_await writer.WriteMultiBuffer(MakePacket("two-two", second));
+        co_await writer.WriteMultiBuffer(MakePacket("one", initial, pool));
+        co_await writer.WriteMultiBuffer(MakePacket("two-two", second, pool));
     });
 
-    FragmentReader source(capture.bytes, {1, 2, 1, 3, 2, 5, 1, 4});
+    FragmentReader source(pool, capture.bytes, {1, 2, 1, 3, 2, 5, 1, 4});
     buf::MultiBuffer pending;
     ::Run([&]() -> net::awaitable<void> {
         auto decoded_request = co_await proxy::uot::ReadRequest(source, pending);
@@ -462,7 +473,7 @@ TEST(UotSs2022, NonConnectRequestAndPackets) {
               "fragmented UoT request target mismatch");
 
         proxy::uot::PacketReader reader(
-            source, false, decoded_request->destination, std::move(pending));
+            pool, source, false, decoded_request->destination, std::move(pending));
         auto first = co_await reader.ReadMultiBuffer();
         auto next = co_await reader.ReadMultiBuffer();
         Check(Flatten(first) == std::vector<uint8_t>({'o','n','e'}),
@@ -484,6 +495,7 @@ TEST(UotSs2022, SharedAddressCodec) {
         TargetAddress("192.0.2.1", 0x1234),
         TargetAddress("2001:db8::1", 0x1234),
         TargetAddress("example.com", 0x1234)};
+    memory::worker_memory pool;
     const std::array formats{AddressWireFormat::Socks5,
         AddressWireFormat::PortFirst, AddressWireFormat::Uot};
     for (const auto format : formats) {
@@ -533,7 +545,7 @@ TEST(UotSs2022, SharedAddressCodec) {
                 std::vector<uint8_t> input{0xaa};
                 input.insert(input.end(), encoded.begin(), encoded.begin() + size);
                 input.push_back(0xbb);
-                FragmentReader source(input, {1, split ? split : 1, 1});
+                FragmentReader source(pool, input, {1, split ? split : 1, 1});
                 buf::MultiBuffer pending;
                 ::Run([&]() -> net::awaitable<void> {
                     auto decoded = co_await ReadAddress(source, pending, format, 1);
@@ -551,7 +563,7 @@ TEST(UotSs2022, SharedAddressCodec) {
                           "incremental address lost the following frame byte");
                 });
                 if (split == size) continue;
-                FragmentReader truncated(
+                FragmentReader truncated(pool,
                     std::vector<uint8_t>(encoded.begin(), encoded.begin() + split), {1, 2});
                 buf::MultiBuffer incomplete;
                 ::Run([&]() -> net::awaitable<void> {
@@ -648,16 +660,17 @@ TEST(UotSs2022, SharedAddressCodec) {
 
 TEST(UotSs2022, PacketEofBoundaries) {
     const TargetAddress target("192.0.2.1", 53);
+    memory::worker_memory pool;
     for (bool connect : {false, true}) {
         CaptureWriter capture;
         proxy::uot::PacketWriter writer(capture, connect, target);
         ::Run([&]() -> net::awaitable<void> {
-            co_await writer.WriteMultiBuffer(MakePacket("end", target));
+            co_await writer.WriteMultiBuffer(MakePacket("end", target, pool));
         });
         for (size_t length = 0; length <= capture.bytes.size(); ++length) {
-            FragmentReader source(std::vector<uint8_t>(
+            FragmentReader source(pool, std::vector<uint8_t>(
                 capture.bytes.begin(), capture.bytes.begin() + length), {1, 1, 2});
-            proxy::uot::PacketReader reader(source, connect, target);
+            proxy::uot::PacketReader reader(pool, source, connect, target);
             bool failed = false;
             try {
                 ::Run([&]() -> net::awaitable<void> {
@@ -677,42 +690,8 @@ TEST(UotSs2022, PacketEofBoundaries) {
     }
 }
 
-TEST(UotSs2022, NonConnectIpPacketDoesNotDependOnUnusedRequestDomainStorage) {
-    class AllocationGate final : public std::pmr::memory_resource {
-    public:
-        explicit AllocationGate(std::pmr::memory_resource* upstream) : upstream_(upstream) {}
-        bool reject = false;
-        size_t live_bytes = 0;
-    private:
-        void* do_allocate(size_t bytes, size_t alignment) override {
-            if (reject) throw std::bad_alloc();
-            auto* result = upstream_->allocate(bytes, alignment);
-            live_bytes += bytes;
-            return result;
-        }
-        void do_deallocate(void* pointer, size_t bytes, size_t alignment) override {
-            live_bytes -= bytes;
-            upstream_->deallocate(pointer, bytes, alignment);
-        }
-        bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
-            return this == &other;
-        }
-        std::pmr::memory_resource* upstream_;
-    };
-    struct ResourceScope {
-        std::pmr::memory_resource* previous;
-        explicit ResourceScope(std::pmr::memory_resource* resource)
-            : previous(std::pmr::set_default_resource(resource)) {}
-        ~ResourceScope() { std::pmr::set_default_resource(previous); }
-    };
-    struct RejectAllocations {
-        AllocationGate& resource;
-        explicit RejectAllocations(AllocationGate& value) : resource(value) { resource.reject = true; }
-        ~RejectAllocations() { resource.reject = false; }
-    };
-    memory::ConfigureProcessAllocator();
-    AllocationGate resource(std::pmr::get_default_resource());
-    ResourceScope scope(&resource);
+TEST(UotSs2022, NonConnectIpPacketDecodesFromPendingWithUnusedDomainRequestAndReleasesPool) {
+    memory::worker_memory pool;
     const std::string domain = std::string(63, 'a') + "." +
         std::string(63, 'b') + "." + std::string(61, 'c');
     const std::array<uint8_t, 12> wire{0, 192, 0, 2, 7, 0x14, 0xe9, 0, 3, 'u', 'd', 'p'};
@@ -720,33 +699,28 @@ TEST(UotSs2022, NonConnectIpPacketDoesNotDependOnUnusedRequestDomainStorage) {
         SCOPED_TRACE(prepared_constructor);
         {
             buf::MultiBuffer pending;
-            ASSERT_TRUE(buf::AppendSpanToMultiBuffer(wire, pending));
-            FragmentReader source({}, {});
+            ASSERT_TRUE(buf::AppendSpanToMultiBuffer(wire, pending, pool));
+            FragmentReader source(pool, {}, {});
             std::optional<proxy::uot::PacketReader> reader;
             TargetAddress unused(domain, 53);
             if (prepared_constructor) {
                 proxy::uot::PreparedRequest prepared;
                 prepared.destination = std::move(unused);
                 prepared.pending = std::move(pending);
-                reader.emplace(source, std::move(prepared));
+                reader.emplace(pool, source, std::move(prepared));
             } else {
-                reader.emplace(source, false, std::move(unused), std::move(pending));
+                reader.emplace(pool, source, false, std::move(unused), std::move(pending));
             }
-            EXPECT_EQ(resource.live_bytes, 0) << "non-connect request target must not remain resident";
             ASSERT_NO_THROW(::Run([&]() -> net::awaitable<void> {
-                buf::MultiBuffer packet;
-                {
-                    RejectAllocations pressure(resource);
-                    packet = co_await reader->ReadMultiBuffer();
-                }
+                auto packet = co_await reader->ReadMultiBuffer();
                 const auto datagram = buf::InspectUdpDatagram(packet);
                 Check(datagram.Valid() &&
                       datagram.target->SameEndpoint(TargetAddress("192.0.2.7", 5353)) &&
                       Flatten(packet) == std::vector<uint8_t>({'u', 'd', 'p'}),
-                      "complete non-connect IP packet must survive unrelated allocation pressure");
+                      "complete non-connect IP packet must decode from pending bytes");
             }));
         }
-        EXPECT_EQ(resource.live_bytes, 0);
+        EXPECT_EQ(pool.OutstandingAllocations(), 0u);
     }
 }
 

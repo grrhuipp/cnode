@@ -154,7 +154,14 @@ public:
 
     virtual net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) = 0;
     virtual net::awaitable<void> WriteBuffers(
-        std::span<const net::const_buffer> buffers) {
+        std::span<const net::const_buffer> buffers) = 0;
+    virtual net::awaitable<void> AsyncShutdownWrite() { co_return; }
+    virtual bool WriteShutdownClosesLink() const noexcept { return false; }
+
+protected:
+    // Copies borrowed spans into Buffers of `pool`, then writes them as one batch.
+    net::awaitable<void> WriteBuffersAsMultiBuffer(
+        std::span<const net::const_buffer> buffers, memory::worker_memory& pool) {
         buf::MultiBuffer payload;
         for (const auto& buffer : buffers) {
             if (buffer.size() == 0) {
@@ -163,14 +170,12 @@ public:
             const auto bytes = std::span<const uint8_t>(
                 static_cast<const uint8_t*>(buffer.data()),
                 buffer.size());
-            if (!buf::AppendSpanToMultiBuffer(bytes, payload)) {
+            if (!buf::AppendSpanToMultiBuffer(bytes, payload, pool)) {
                 throw std::bad_alloc();
             }
         }
         co_await WriteMultiBuffer(std::move(payload));
     }
-    virtual net::awaitable<void> AsyncShutdownWrite() { co_return; }
-    virtual bool WriteShutdownClosesLink() const noexcept { return false; }
 };
 
 struct Link {

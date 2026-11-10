@@ -188,7 +188,7 @@ main
   -> Relay(TCP / UDP / Mux)
 ```
 
-每个数据 Worker 独立绑定同一组 `SO_REUSEPORT` 端口，并且各自持有唯一的单线程 Worker-local PMR 池，即一个 mimalloc 一等堆。连接与有状态会话一生固定在创建它的原 Worker（Origin Worker）上由原生 `io_context` 直接驱动，不设虚拟执行域、跨线程 remote-free 队列或运行期跨 Worker 会话搬迁。物理连接只持有轻量分配域和按阶段借用的 arena，不另建堆；同一 Worker 上的连接共享该堆按尺寸类划分的页，运行期 payload、Buffer、子流及可扩缩容器在所属 Worker 线程闭环借还，空页由 mimalloc 延迟 purge 归还系统。
+每个数据 Worker 独立绑定同一组 `SO_REUSEPORT` 端口，并且各自持有唯一的单线程 Worker-local PMR 池，即一个 mimalloc 一等堆。池由 Worker 对象持有，经构造参数、会话上下文、流和 Buffer 显式传递，不按线程或默认资源隐式选择；未显式指定资源的存储使用进程层 mimalloc。连接与有状态会话一生固定在创建它的原 Worker（Origin Worker）上由原生 `io_context` 直接驱动，不设虚拟执行域、跨线程 remote-free 队列或运行期跨 Worker 会话搬迁。物理连接只持有轻量分配域和按阶段借用的 arena，不另建堆；同一 Worker 上的连接共享该堆按尺寸类划分的页，运行期 payload、Buffer、子流及会话状态在所属 Worker 线程闭环借还，空页由 mimalloc 延迟 purge 归还系统。
 
 XHTTP 分离上行传输（Split-HTTP）由下行 `GET` 所在的原 Worker 唯一拥有完整会话、路由、出站连接与 Relay。当同 `session_id` 的独立上行连接（`stream-up` 或 `packet-up`）落到其他 Worker 时，收包 Worker 仅读取首个 HTTP 请求头识别 `session_id`，随即在该连接无在途 I/O、无出站与定时器的静止边界单次提取裸入站 `fd`（含 TLS 状态与预读字节）经有界控制入口移交原 Worker `assign` 接管；接管后该连接的所有后续请求与流字节均在原 Worker 本地原生读写，不跨 Worker 转发 `MultiBuffer` 载荷，也不跨 Worker 合组运行中的 HTTP/2 会话。短上传完成后事件驱动移除目录项，迟到上传由有界 tombstone 拒绝，不在满容量路径逐次扫描整张会话表。
 
@@ -198,9 +198,9 @@ QUIC 入站（Hysteria2）由全部数据 Worker 以 `SO_REUSEPORT` 监听同一
 
 Worker 路由在准入前冷注册，主控协调器运行在主控事件循环上，统一承载跨连接会话目录、全局与按 IP 的连接配额、认证失败封禁计数、按用户的在线设备配额、VMess 重放检查及 VLESS 0-RTT 票据目录。监听前完成配置校验、路由编译、不可变策略和 TLS／REALITY 上下文准备；控制面发布候选快照失败时保留旧配置。
 
-数据 Worker 的监听标签、端点索引与 socket 控制块使用所属线程的 PMR。注销完成后移除注册项；尚未结束的 accept / receive 循环仅保留收束所需的退役状态，并在原 Worker 上释放，不累计空标签条目，也不把监听所有权带入每个请求。
+数据 Worker 的监听标签、端点索引与 socket 控制块使用所属 Worker 池。注销完成后移除注册项；尚未结束的 accept / receive 循环仅保留收束所需的退役状态，并在原 Worker 上释放，不累计空标签条目，也不把监听所有权带入每个请求。
 
-出站配置与认证凭据在冷路径准备为不可变快照，handler 持有该快照，不在每次请求中重复解析或深拷贝。AnyTLS 空闲池由所属 Worker 本地独占，按配置快照与出站 tag 隔离；物理连接在所属 Worker 内创建、借用与归池，不同活跃请求不并发借用同一物理连接。padding 更新在池宿主串行发布，借用时一并取得下一次握手的不可变快照，不在请求路径读取 `atomic<shared_ptr>`，也不修改其他已建立会话的 padding 状态。替换配置停止旧池的新借用，已有请求继续使用旧快照，结束后收束旧池任务。空 PMR 容器只弱引用轻量分配域，不延长已退役物理连接寿命；若该容器随后复用，则在同线程首次分配前绑定当前分配域。
+出站配置与认证凭据在冷路径准备为不可变快照，handler 持有该快照，不在每次请求中重复解析或深拷贝。AnyTLS 空闲池由所属 Worker 本地独占，按配置快照与出站 tag 隔离；物理连接在所属 Worker 内创建、借用与归池，不同活跃请求不并发借用同一物理连接。padding 更新在池宿主串行发布，借用时一并取得下一次握手的不可变快照，不在请求路径读取 `atomic<shared_ptr>`，也不修改其他已建立会话的 padding 状态。替换配置停止旧池的新借用，已有请求继续使用旧快照，结束后收束旧池任务。PMR 容器在构造时绑定显式给出的资源，之后不再改绑。
 proxyman / ingress 在冷路径准备 receiver 语义，公开 Dispatcher 只接收请求所需的窄契约；强制出口和未命中回退属于 Dispatcher 编排，Router 只回答“哪条路由规则命中”。每个 receiver 必须在构建时明确选择 `ForceOutbound` 或 `RouteWithFallback`，不存在 Worker 全局默认出口，也不存在可进入热路径的空策略。cnode 使用强类型、只读 `DispatchPolicy`，不把完整 `ReceiverSettings` 或可变配置 context 传入 Dispatcher。面板 `DetectRule` 由 Worker-local 实现通过通用 `RequestPolicy` 接口提供 allow / block 结果，不进入 Router，也不让 Dispatcher 依赖面板规则管理器。
 
 HTTP 与 HTTPUpgrade 只在建链阶段处理 HTTP 握手，完成后继续使用原来的 TCP / TLS 流，不保留长期透传包装。握手提前读到的应用数据由实际读端按原顺序承接；TLS 明文残留不会进入底层 TCP 密文缓冲。残留读完或读端关闭后释放，取消、半关闭与 TLS 关闭仍沿原传输链路生效。

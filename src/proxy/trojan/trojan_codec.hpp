@@ -105,6 +105,8 @@ struct FramedUdpPacket {
 // payload, can be transferred. An empty container is reserved for stream EOF.
 class UdpFramer {
 public:
+    explicit UdpFramer(memory::worker_memory& pool) noexcept : pool_(&pool) {}
+
     void Feed(buf::MultiBuffer input);
     [[nodiscard]] bool Next(FramedUdpPacket& out);
     void Finish();
@@ -114,6 +116,7 @@ private:
     enum class State : uint8_t { Active, Finished, Failed };
     void Fail() noexcept;
 
+    memory::worker_memory* pool_;
     buf::MultiBuffer pending_;
     std::optional<TargetAddress> target_;
     size_t payload_size_ = 0;
@@ -141,6 +144,7 @@ public:
         transport::EofAction read_eof_action = transport::EofAction::ShutdownPeerWrite) noexcept
         : OutboundStreamEndpointBase(stream)
         , fallback_target_(fallback_target)
+        , framer_(stream.Pool())
         , read_eof_action_(read_eof_action) {}
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {

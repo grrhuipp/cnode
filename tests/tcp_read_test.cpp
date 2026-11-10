@@ -16,6 +16,7 @@ namespace {
 using namespace std::chrono_literals;
 
 struct ReadFixture {
+    memory::worker_memory pool;
     net::io_context io;
     tcp::acceptor acceptor{io, {net::ip::address_v4::loopback(), 0}};
     tcp::socket socket{io}, peer{io};
@@ -37,7 +38,7 @@ struct ReadFixture {
         io.run();
     }
     void Start() {
-        stream = std::make_unique<TcpStream>(std::move(socket));
+        stream = memory::MakeUnique<TcpStream>(pool, pool, std::move(socket));
         stream->SetReadTimeout(2s);
     }
     void Preload(const std::vector<uint8_t>& payload) {

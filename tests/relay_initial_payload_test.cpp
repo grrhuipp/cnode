@@ -28,11 +28,15 @@ struct TestEvent final : TimeoutEvent {
     F callback;
 };
 
-buf::MultiBuffer Payload(size_t size, uint8_t byte = 0x42) {
+buf::MultiBuffer Payload(size_t size, uint8_t byte, memory::worker_memory& pool) {
     std::vector<uint8_t> bytes(size, byte);
     buf::MultiBuffer result;
-    if (!buf::AppendSpanToMultiBuffer(bytes, result)) throw std::bad_alloc();
+    if (!buf::AppendSpanToMultiBuffer(bytes, result, pool)) throw std::bad_alloc();
     return result;
+}
+
+buf::MultiBuffer Payload(size_t size, memory::worker_memory& pool) {
+    return Payload(size, 0x42, pool);
 }
 
 struct Endpoint : TimeoutEvent {
@@ -171,13 +175,13 @@ struct Endpoint : TimeoutEvent {
     }
 };
 
-net::awaitable<bool> TestRateCancellation(net::io_context& io, int mode) {
+net::awaitable<bool> TestRateCancellation(net::io_context& io, int mode, memory::worker_memory& pool) {
     Endpoint client, target;
     client.io = &io;
     target.io = &io;
-    if (mode == 1 || mode == 3) target.input = Payload(4000);
-    else client.input = Payload(4000);
-    if (mode >= 6) target.input = Payload(4000);
+    if (mode == 1 || mode == 3) target.input = Payload(4000, pool);
+    else client.input = Payload(4000, pool);
+    if (mode >= 6) target.input = Payload(4000, pool);
     if (mode == 2) target.read_error = ErrorCode::SOCKET_READ_FAILED;
     if (mode >= 14) client.Cancel(mode == 15 ? ErrorCode::RESOURCE_EXHAUSTED : ErrorCode::CANCELLED);
     TestEvent external_cancel([&client, &target, mode] {
@@ -191,14 +195,14 @@ net::awaitable<bool> TestRateCancellation(net::io_context& io, int mode) {
     if (mode >= 6 && mode < 14)
         (void)TimeoutScheduler::ForIoContext(io).ScheduleAfter(50ms, external_cancel);
     StatsShard stats;
-    session::Context context;
+    session::Context context(pool);
     const RelayConfig config{.uplink_only = mode == 4 ? 0s : 1s,
                              .downlink_only = mode == 4 ? 0s : 1s, .speed_limit = 1000};
     const auto start = std::chrono::steady_clock::now();
     const bool controlled = !(mode == 1 || mode == 5 || mode == 7 || mode == 9 || mode == 11 || mode >= 12);
     const auto result = co_await DoRelayLink(io, client, client, controlled ? &client : nullptr,
         target, context, stats, config,
-        buf::MultiBufferBatch(mode >= 14 ? Payload(4000) : buf::MultiBuffer{}));
+        buf::MultiBufferBatch(mode >= 14 ? Payload(4000, pool) : buf::MultiBuffer{}));
     const auto elapsed = std::chrono::steady_clock::now() - start;
     const auto expected = mode == 12 || mode == 14 ? ErrorCode::CANCELLED :
         mode >= 10 ? ErrorCode::RESOURCE_EXHAUSTED : mode == 2 ? ErrorCode::SOCKET_READ_FAILED :
@@ -212,7 +216,8 @@ net::awaitable<bool> TestRateCancellation(net::io_context& io, int mode) {
     co_return passed;
 }
 
-net::awaitable<bool> TestPendingRead(net::io_context& io, bool controlled, int mode) {
+net::awaitable<bool> TestPendingRead(net::io_context& io, bool controlled, int mode,
+                                     memory::worker_memory& pool) {
     Endpoint client, target;
     client.io = &io;
     target.io = &io;
@@ -223,7 +228,7 @@ net::awaitable<bool> TestPendingRead(net::io_context& io, bool controlled, int m
     if (mode != 1) block(client);
     if (mode != 0 && mode != 4) block(target);
     StatsShard stats;
-    session::Context context;
+    session::Context context(pool);
     net::cancellation_signal parent;
     TestEvent external([&] {
         if (mode == 3) parent.emit(net::cancellation_type::terminal);
@@ -249,14 +254,15 @@ net::awaitable<bool> TestPendingRead(net::io_context& io, bool controlled, int m
     co_return passed;
 }
 
-net::awaitable<bool> TestTcpCancellation(net::io_context& io, bool controlled, int mode) {
+net::awaitable<bool> TestTcpCancellation(net::io_context& io, bool controlled, int mode,
+                                         memory::worker_memory& pool) {
     tcp::acceptor listener(io, tcp::endpoint(net::ip::address_v4::loopback(), 0));
     tcp::socket peer(io);
     peer.connect(listener.local_endpoint());
-    TcpStream target(listener.accept());
+    TcpStream target(pool, listener.accept());
     Endpoint client;
     client.io = &io;
-    client.input = Payload(4000);
+    client.input = Payload(4000, pool);
     std::array<uint8_t, 4000> response{};
     if (mode != 4) net::write(peer, net::buffer(response));
     if (mode == 0) target.SetIdleTimeout(1s);
@@ -267,7 +273,7 @@ net::awaitable<bool> TestTcpCancellation(net::io_context& io, bool controlled, i
     if (mode == 2 || mode == 3)
         (void)TimeoutScheduler::ForIoContext(io).ScheduleAfter(50ms, external);
     StatsShard stats;
-    session::Context context;
+    session::Context context(pool);
     const RelayConfig config{.speed_limit = 1000};
     const auto start = std::chrono::steady_clock::now();
     const auto result = co_await DoRelayLink(io, client, client, controlled ? &client : nullptr,
@@ -283,20 +289,21 @@ net::awaitable<bool> TestTcpCancellation(net::io_context& io, bool controlled, i
     co_return passed;
 }
 
-net::awaitable<bool> TestTcpPending(net::io_context& io, bool controlled, bool parent_cancel, bool limited) {
+net::awaitable<bool> TestTcpPending(net::io_context& io, bool controlled, bool parent_cancel, bool limited,
+                                    memory::worker_memory& pool) {
     tcp::acceptor listener(io, tcp::endpoint(net::ip::address_v4::loopback(), 0));
     tcp::socket client_peer(io), target_peer(io);
     client_peer.connect(listener.local_endpoint());
-    TcpStream client(listener.accept());
+    TcpStream client(pool, listener.accept());
     target_peer.connect(listener.local_endpoint());
-    TcpStream target(listener.accept());
+    TcpStream target(pool, listener.accept());
     net::cancellation_signal parent;
     TestEvent external([&] {
         if (parent_cancel) parent.emit(net::cancellation_type::terminal);
         else target.Cancel();
     });
     (void)TimeoutScheduler::ForIoContext(io).ScheduleAfter(50ms, external);
-    session::Context context;
+    session::Context context(pool);
     StatsShard stats;
     const RelayConfig config{.uplink_only = 1s, .downlink_only = 1s,
         .speed_limit = limited ? 1000u : 0u};
@@ -316,16 +323,17 @@ net::awaitable<bool> TestTcpPending(net::io_context& io, bool controlled, bool p
 }
 
 net::awaitable<bool> TestInitialPayload(net::io_context& io, bool controlled, int failure,
-                                      size_t prefix_size, size_t later_size, bool limited) {
+                                      size_t prefix_size, size_t later_size, bool limited,
+                                      memory::worker_memory& pool) {
     Endpoint client, target;
     client.io = target.io = &io;
-    client.input = Payload(later_size, 0x73);
+    client.input = Payload(later_size, 0x73, pool);
     if (failure == 1) target.write_error = ErrorCode::RESOURCE_EXHAUSTED;
     if (failure == 2) target.allocation_failure = true;
     if (failure == 3) target.write_error = ErrorCode::CANCELLED;
-    auto prefix = Payload(prefix_size);
+    auto prefix = Payload(prefix_size, pool);
     StatsShard stats;
-    session::Context context;
+    session::Context context(pool);
     const RelayConfig config{.uplink_only = 5s, .downlink_only = 5s,
                              .speed_limit = limited ? 1000u : 0u};
     RelayResult result;
@@ -359,14 +367,9 @@ net::awaitable<bool> TestInitialPayload(net::io_context& io, bool controlled, in
     co_return passed;
 }
 
-bool TestBatchOwnership() {
-    struct ResourceScope {
-        memory::ThreadMemoryResource resource;
-        std::pmr::memory_resource* previous = std::pmr::set_default_resource(&resource);
-        ~ResourceScope() { std::pmr::set_default_resource(previous); }
-    } resource_scope;
-    auto first = Payload(3);
-    auto second = Payload(5);
+bool TestBatchOwnership(memory::worker_memory& pool) {
+    auto first = Payload(3, pool);
+    auto second = Payload(5, pool);
     memory::reject_next_pmr_allocation = true;
     buf::MultiBufferBatch batch(std::move(first));
     bool passed = memory::reject_next_pmr_allocation && batch.byte_size() == 3;
@@ -375,18 +378,18 @@ bool TestBatchOwnership() {
     catch (const std::bad_alloc&) { failed = true; }
     memory::reject_next_pmr_allocation = false;
     passed = passed && failed && batch.byte_size() == 3;
-    batch.Push(Payload(7));
-    batch.Push(Payload(11));
+    batch.Push(Payload(7, pool));
+    batch.Push(Payload(11, pool));
     buf::MultiBufferBatch moved(std::move(batch));
     passed = passed && batch.empty() && batch.byte_size() == 0 &&
         moved.PopFront().byte_size() == 3 && moved.byte_size() == 18;
-    buf::MultiBufferBatch assigned(Payload(1));
+    buf::MultiBufferBatch assigned(Payload(1, pool));
     assigned = std::move(moved);
     passed = passed && moved.empty() && moved.byte_size() == 0 &&
         assigned.PopFront().byte_size() == 7 && assigned.PopFront().byte_size() == 11 &&
         assigned.empty() && assigned.byte_size() == 0 && assigned.PopFront().empty();
-    first = Payload(13);
-    second = Payload(17);
+    first = Payload(13, pool);
+    second = Payload(17, pool);
     memory::reject_next_pmr_allocation = true;
     assigned.Push(std::move(first));
     passed = passed && memory::reject_next_pmr_allocation;
@@ -401,12 +404,13 @@ bool TestBatchOwnership() {
     return passed;
 }
 
-net::awaitable<bool> TestDatagramBatch(net::io_context& io, bool controlled, int mode) {
+net::awaitable<bool> TestDatagramBatch(net::io_context& io, bool controlled, int mode,
+                                       memory::worker_memory& pool) {
     Endpoint client, target;
     client.io = target.io = &io;
-    auto packet = [](size_t size, uint8_t byte, uint16_t port) {
-        auto result = Payload(size, byte);
-        if (!buf::SetUdpTarget(result, TargetAddress("127.0.0.1", port))) throw std::bad_alloc();
+    auto packet = [&pool](size_t size, uint8_t byte, uint16_t port) {
+        auto result = Payload(size, byte, pool);
+        if (!buf::SetUdpTarget(result, TargetAddress("127.0.0.1", port), pool)) throw std::bad_alloc();
         return result;
     };
     buf::MultiBufferBatch batch;
@@ -424,7 +428,7 @@ net::awaitable<bool> TestDatagramBatch(net::io_context& io, bool controlled, int
         target.later_write_error = mode == 2 ? ErrorCode::RESOURCE_EXHAUSTED : ErrorCode::CANCELLED;
     }
     StatsShard stats;
-    session::Context context;
+    session::Context context(pool);
     context.content.network = Network::UDP;
     const RelayConfig config{.uplink_only = 5s, .downlink_only = 5s};
     const auto result = co_await DoRelayLink(io, client, client, controlled ? &client : nullptr,
@@ -459,7 +463,8 @@ net::awaitable<bool> TestDatagramBatch(net::io_context& io, bool controlled, int
     co_return passed;
 }
 
-net::awaitable<bool> TestFullClose(net::io_context& io, bool controlled, int mode) {
+net::awaitable<bool> TestFullClose(net::io_context& io, bool controlled, int mode,
+                                   memory::worker_memory& pool) {
     Endpoint client, target;
     client.io = target.io = &io;
     auto block = [&](Endpoint& endpoint, std::chrono::milliseconds timeout) {
@@ -469,16 +474,16 @@ net::awaitable<bool> TestFullClose(net::io_context& io, bool controlled, int mod
     uint64_t expected_down = 0;
     ErrorCode expected_error = ErrorCode::OK;
     if (mode == 0) {
-        client.input = Payload(4000);
+        client.input = Payload(4000, pool);
         target.eof_action = transport::EofAction::CloseLink;
         block(target, 50ms);
     } else if (mode == 1) {
-        target.input = Payload(4000);
+        target.input = Payload(4000, pool);
         target.shutdown_closes_link = true;
         block(client, 50ms);
     } else if (mode == 2) {
-        client.input = Payload(17);
-        target.input = Payload(4000);
+        client.input = Payload(17, pool);
+        target.input = Payload(4000, pool);
         target.write_closed = true;
         target.eof_action = transport::EofAction::CloseLink;
         expected_down = 4000;
@@ -490,7 +495,7 @@ net::awaitable<bool> TestFullClose(net::io_context& io, bool controlled, int mod
             mode == 4 ? ErrorCode::BLOCKED : ErrorCode::RELAY_WRITE_FAILED;
     }
     StatsShard stats;
-    session::Context context;
+    session::Context context(pool);
     const RelayConfig config{.uplink_only = 10s, .downlink_only = 10s, .speed_limit = 1000};
     const auto start = std::chrono::steady_clock::now();
     const auto result = co_await DoRelayLink(io, client, client, controlled ? &client : nullptr,
@@ -509,12 +514,13 @@ net::awaitable<bool> TestFullClose(net::io_context& io, bool controlled, int mod
         client.active_reads == 0 && target.active_reads == 0, target.shutdowns, passed ? "PASS" : "FAIL");
     co_return passed;
 }
-net::awaitable<bool> TestExceptionClassification(net::io_context& io, bool controlled, int mode) {
+net::awaitable<bool> TestExceptionClassification(net::io_context& io, bool controlled, int mode,
+                                                 memory::worker_memory& pool) {
     Endpoint client, target;
     client.io = target.io = &io;
     if (mode == 0) client.unknown_read_failure = true;
     else if (mode == 1) {
-        client.input = Payload(3);
+        client.input = Payload(3, pool);
         target.unknown_write_failure = true;
     } else {
         // Both children throw: their original causes must survive the join,
@@ -526,7 +532,7 @@ net::awaitable<bool> TestExceptionClassification(net::io_context& io, bool contr
         mode == 2 ? ErrorCode::RESOURCE_EXHAUSTED :
         mode == 3 ? ErrorCode::BLOCKED : ErrorCode::RELAY_WRITE_FAILED;
     StatsShard stats;
-    session::Context context;
+    session::Context context(pool);
     const auto result = co_await DoRelayLink(io, client, client, controlled ? &client : nullptr,
                                            target, context, stats);
     const bool passed = result.error == expected &&
@@ -539,15 +545,16 @@ net::awaitable<bool> TestExceptionClassification(net::io_context& io, bool contr
 }
 
 
-net::awaitable<bool> TestTcpHalfClose(net::io_context& io, bool controlled, bool upload_first) {
+net::awaitable<bool> TestTcpHalfClose(net::io_context& io, bool controlled, bool upload_first,
+                                      memory::worker_memory& pool) {
     using namespace net::experimental::awaitable_operators;
     tcp::acceptor listener(io, tcp::endpoint(net::ip::address_v4::loopback(), 0));
     tcp::socket client_peer(io), target_peer(io);
     client_peer.connect(listener.local_endpoint());
-    TcpStream client(listener.accept());
+    TcpStream client(pool, listener.accept());
     target_peer.connect(listener.local_endpoint());
-    TcpStream target(listener.accept());
-    session::Context context;
+    TcpStream target(pool, listener.accept());
+    session::Context context(pool);
     StatsShard stats;
     auto peers = [&]() -> net::awaitable<bool> {
         auto& first = upload_first ? client_peer : target_peer;
@@ -593,12 +600,13 @@ net::awaitable<bool> TestTcpHalfClose(net::io_context& io, bool controlled, bool
     co_return passed;
 }
 
-net::awaitable<bool> TestBackpressuredWrite(net::io_context& io, bool controlled, bool upload, int mode) {
+net::awaitable<bool> TestBackpressuredWrite(net::io_context& io, bool controlled, bool upload, int mode,
+                                            memory::worker_memory& pool) {
     Endpoint client, target;
     client.io = target.io = &io;
     auto& reader = upload ? client : target;
     auto& writer = upload ? target : client;
-    reader.input = Payload(17);
+    reader.input = Payload(17, pool);
     writer.pending_read.emplace(io);
     writer.pending_read->expires_at(std::chrono::steady_clock::time_point::max());
     writer.pending_write.emplace(io);
@@ -610,7 +618,7 @@ net::awaitable<bool> TestBackpressuredWrite(net::io_context& io, bool controlled
     });
     if (mode == 2) (void)target.StartPhaseDeadline(1s);
     else (void)TimeoutScheduler::ForIoContext(io).ScheduleAfter(50ms, stop);
-    session::Context context;
+    session::Context context(pool);
     StatsShard stats;
     const auto start = std::chrono::steady_clock::now();
     const auto result = co_await net::co_spawn(io,
@@ -634,6 +642,7 @@ class RelayInitialPayload : public ::testing::TestWithParam<std::string> {};
 
 TEST_P(RelayInitialPayload, Lifecycle) {
     std::string option = GetParam();
+    memory::worker_memory pool;
     const int argc = option.empty() ? 1 : 2;
     char* argv[] = {nullptr, option.data()};
     std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -641,13 +650,13 @@ TEST_P(RelayInitialPayload, Lifecycle) {
         bool passed = true;
         for (bool controlled : {false, true}) for (int mode = 0; mode < 6; ++mode) {
             net::io_context io;
-            auto future = net::co_spawn(io, TestFullClose(io, controlled, mode), net::use_future);
+            auto future = net::co_spawn(io, TestFullClose(io, controlled, mode, pool), net::use_future);
             io.run();
             passed = future.get() && passed;
         }
         for (bool controlled : {false, true}) for (int mode = 0; mode < 5; ++mode) {
             net::io_context io;
-            auto future = net::co_spawn(io, TestExceptionClassification(io, controlled, mode), net::use_future);
+            auto future = net::co_spawn(io, TestExceptionClassification(io, controlled, mode, pool), net::use_future);
             io.run();
             passed = future.get() && passed;
         }
@@ -657,7 +666,7 @@ TEST_P(RelayInitialPayload, Lifecycle) {
         bool source_passed = true;
         for (int mode = 12; mode < 16; ++mode) {
             net::io_context io;
-            auto future = net::co_spawn(io, TestRateCancellation(io, mode), net::use_future);
+            auto future = net::co_spawn(io, TestRateCancellation(io, mode, pool), net::use_future);
             io.run();
             source_passed = future.get() && source_passed;
         }
@@ -668,60 +677,60 @@ TEST_P(RelayInitialPayload, Lifecycle) {
         for (bool controlled : {false, true}) {
             for (bool upload_first : {false, true}) {
                 net::io_context io;
-                auto future = net::co_spawn(io, TestTcpHalfClose(io, controlled, upload_first), net::use_future);
+                auto future = net::co_spawn(io, TestTcpHalfClose(io, controlled, upload_first, pool), net::use_future);
                 io.run();
                 passed = future.get() && passed;
             }
             for (bool upload : {false, true}) for (int mode = 0; mode < 3; ++mode) {
                 net::io_context io;
-                auto future = net::co_spawn(io, TestBackpressuredWrite(io, controlled, upload, mode), net::use_future);
+                auto future = net::co_spawn(io, TestBackpressuredWrite(io, controlled, upload, mode, pool), net::use_future);
                 io.run();
                 passed = future.get() && passed;
             }
         }
         { ASSERT_TRUE(passed); return; }
     }
-    bool passed = TestBatchOwnership();
+    bool passed = TestBatchOwnership(pool);
     for (int mode = 0; mode < 16; ++mode) {
         net::io_context io;
-        auto future = net::co_spawn(io, TestRateCancellation(io, mode), net::use_future);
+        auto future = net::co_spawn(io, TestRateCancellation(io, mode, pool), net::use_future);
         io.run();
         passed = future.get() && passed;
     }
     for (bool controlled : {false, true}) {
         for (int mode = 0; mode < 4; ++mode) {
             net::io_context io;
-            auto future = net::co_spawn(io, TestDatagramBatch(io, controlled, mode), net::use_future);
+            auto future = net::co_spawn(io, TestDatagramBatch(io, controlled, mode, pool), net::use_future);
             io.run();
             passed = future.get() && passed;
         }
         for (bool parent : {false, true}) for (bool limited : {false, true}) {
             net::io_context io;
-            auto future = net::co_spawn(io, TestTcpPending(io, controlled, parent, limited), net::use_future);
+            auto future = net::co_spawn(io, TestTcpPending(io, controlled, parent, limited, pool), net::use_future);
             io.run();
             passed = future.get() && passed;
         }
         for (int mode = 0; mode < 5; ++mode) {
             net::io_context io;
-            auto future = net::co_spawn(io, TestPendingRead(io, controlled, mode), net::use_future);
+            auto future = net::co_spawn(io, TestPendingRead(io, controlled, mode, pool), net::use_future);
             io.run();
             passed = future.get() && passed;
         }
         for (int mode = 0; mode < 5; ++mode) {
             net::io_context io;
-            auto future = net::co_spawn(io, TestTcpCancellation(io, controlled, mode), net::use_future);
+            auto future = net::co_spawn(io, TestTcpCancellation(io, controlled, mode, pool), net::use_future);
             io.run();
             passed = future.get() && passed;
         }
         for (int failure = 0; failure != 4; ++failure) {
             net::io_context io;
-            auto future = net::co_spawn(io, TestInitialPayload(io, controlled, failure, 7, 5, false), net::use_future);
+            auto future = net::co_spawn(io, TestInitialPayload(io, controlled, failure, 7, 5, false, pool), net::use_future);
             io.run();
             passed = future.get() && passed;
         }
         for (auto sizes : {std::pair<size_t, size_t>{2000, 0}, {750, 750}}) {
             net::io_context io;
-            auto future = net::co_spawn(io, TestInitialPayload(io, controlled, 0, sizes.first, sizes.second, true), net::use_future);
+            auto future = net::co_spawn(io, TestInitialPayload(io, controlled, 0, sizes.first, sizes.second, true, pool), net::use_future);
             io.run();
             passed = future.get() && passed;
         }
