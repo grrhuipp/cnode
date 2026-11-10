@@ -17,7 +17,7 @@ inline thread_local bool reject_asio_allocations = false;
 inline thread_local std::size_t rejected_asio_allocations = 0;
 }
 
-namespace asio::detail {
+namespace asio {
 inline void* CheckedTimeoutAlignedNew(std::size_t alignment, std::size_t size) {
     if (timeout_allocation_test::reject_asio_allocations) {
         ++timeout_allocation_test::rejected_asio_allocations;

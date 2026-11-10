@@ -14,7 +14,9 @@ inline void Check() {
 }
 }
 
-namespace asio::detail {
+// asio::aligned_new is reached both qualified (recycling_allocator) and
+// unqualified from asio::detail, so the hook lives in namespace asio.
+namespace asio {
 inline void* CheckedAsyncAlignedNew(std::size_t alignment, std::size_t size) {
     async_allocation_test::Check();
     return aligned_new(alignment, size);

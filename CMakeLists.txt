@@ -23,7 +23,6 @@ endif()
 option(CNODE_ENABLE_LTO "Enable Release link-time optimization" OFF)
 option(CNODE_RELEASE_DEBUG_SYMBOLS "Emit Release debug information for split symbols" ON)
 option(CNODE_RELEASE_FRAME_POINTERS "Keep Release frame pointers for profiling" ON)
-set(CNODE_ASIO_RECYCLING_CACHE_SIZE 64 CACHE STRING "Asio per-thread small-block recycling cache size")
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -38,9 +37,11 @@ target_compile_options(cnode_build_options INTERFACE
     "$<$<CXX_COMPILER_ID:GNU>:-Wno-stringop-overread;-Wno-free-nonheap-object>"
     "$<$<AND:$<CONFIG:Release>,$<BOOL:${CNODE_RELEASE_DEBUG_SYMBOLS}>>:-g>"
     "$<$<AND:$<CONFIG:Release>,$<BOOL:${CNODE_RELEASE_FRAME_POINTERS}>>:-fno-omit-frame-pointer>")
+# Allocation reuse belongs to mimalloc alone: Asio's per-thread handler and
+# awaitable-frame caches would be a second cache layer over it.
 target_compile_definitions(cnode_build_options INTERFACE
     ASIO_STANDALONE ASIO_NO_DEPRECATED
-    ASIO_RECYCLING_ALLOCATOR_CACHE_SIZE=${CNODE_ASIO_RECYCLING_CACHE_SIZE}
+    ASIO_DISABLE_SMALL_BLOCK_RECYCLING ASIO_DISABLE_AWAITABLE_FRAME_RECYCLING
     CNODE_USE_MIMALLOC)
 find_package(Threads REQUIRED)
 find_package(asio CONFIG REQUIRED)
@@ -360,10 +361,6 @@ cnode_unit(xhttp_upload_stream_slot LIBRARY cnode_test_core INCLUDES src/transpo
 # Small isolated seams do not pull production objects compiled with other macros.
 target_compile_definitions(cnode_worker_memory_test PRIVATE
     CNODE_TEST_ALLOCATOR_FAULT)
-target_compile_definitions(cnode_awaitable_batch_test PRIVATE
-    ASIO_DISABLE_AWAITABLE_FRAME_RECYCLING)
-target_compile_definitions(cnode_awaitable_task_group_test PRIVATE
-    ASIO_DISABLE_AWAITABLE_FRAME_RECYCLING)
 target_compile_options(cnode_awaitable_task_group_test PRIVATE
     "-include${CMAKE_CURRENT_SOURCE_DIR}/tests/async_allocation_fault.hpp")
 target_compile_options(cnode_timeout_scheduler_test PRIVATE
