@@ -34,8 +34,8 @@ std::filesystem::path BenchmarkBinary() {
     return Binary();
 }
 
-std::string Payload() {
-    std::string bytes(MeasuredBytes, '\0');
+std::string Payload(size_t bytes_per_stream) {
+    std::string bytes(bytes_per_stream, '\0');
     uint32_t state = 0x63ac91e5;
     for (auto& byte : bytes) {
         state ^= state << 13;
@@ -57,6 +57,7 @@ class TcpTarget {
         size_t offset = 0;
         size_t bytes = 0;
         unsigned phases = 0;
+        bool measured = true;
         char reply = 'R';
     };
     Socket listener_ = Socket::Listen();
@@ -140,19 +141,21 @@ public:
                     ++connection.phases;
                 }
             } else if (state == State::Begin) {
-                Require(buffer[0] == 'B', "missing TCP target readiness request");
+                Require(buffer[0] == 'B' || buffer[0] == 'I', "missing TCP target readiness request");
+                connection.measured = buffer[0] == 'B';
                 state = State::Reply;
             } else if (buffer[0] == 'P') {
                 // Keep established sessions alive while other clients perform
                 // their blocking TLS/auth handshakes. No application reply is
                 // generated; QUIC ACKs still prove transport liveness.
             } else if (buffer[0] == 'D') {
-                Require(connection.phases == 2, "target closed before both transfers");
+                Require(connection.phases == (connection.measured ? 2u : 1u),
+                    "target closed before its expected transfers");
                 state = State::Eof;
             } else {
-                Require(connection.phases < 2 &&
+                Require(connection.phases < (connection.measured ? 2u : 1u) &&
                     buffer[0] == (connection.phases == 0 ? 'W' : 'M'), "unexpected target phase");
-                connection.bytes = connection.phases == 0 ? WarmupBytes : MeasuredBytes;
+                connection.bytes = connection.phases == 0 ? WarmupBytes : payload_.size();
                 connection.offset = 0;
                 state = upload_ ? State::Upload : State::Download;
             }
@@ -202,14 +205,17 @@ public:
 
 struct Stream {
     int64_t id;
+    bool measured = true;
     size_t header_bytes = 0;
     bool ready = false;
     bool verified = false;
+    bool transferring = false;
 };
 struct Client {
     std::unique_ptr<quic::Peer> peer;
     std::vector<Stream> streams;
     Deadline heartbeat = Clock::now() + 2s;
+    Deadline next_pump{};
 };
 
 class Driver {
@@ -218,16 +224,24 @@ public:
     std::vector<Client> clients;
     uint64_t heartbeat_bytes = 0;
     explicit Driver(TcpTarget& target, unsigned count) : target_(target) { clients.reserve(count); }
-    void Tick(Deadline deadline, bool heartbeat = true, bool allow_closed = false) {
+    void Tick(Deadline deadline, bool heartbeat = true, bool allow_closed = false,
+              Milliseconds peer_pump_delay = 0ms) {
         Remaining(deadline);
         target_.Tick();
         for (auto& client : clients) {
-            client.peer->Pump(0ms);
+            if (peer_pump_delay == 0ms || Clock::now() >= client.next_pump) {
+                client.peer->Pump(peer_pump_delay == 0ms ? 0ms : 1ms);
+                client.next_pump = Clock::now() + peer_pump_delay;
+            }
             if (!allow_closed) Require(!client.peer->Closed(), "physical QUIC session closed early");
             if (heartbeat && Clock::now() >= client.heartbeat) {
                 // Logical TCP streams have independent inactivity budgets;
                 // keeping only the physical connection active is insufficient.
+                // Never insert commands into a raw upload payload. In-flight
+                // transfers provide their own activity; idle streams still
+                // need heartbeats during another stream's measured phase.
                 for (const auto& stream : client.streams) {
+                    if (stream.transferring) continue;
                     client.peer->Send(stream.id, "P");
                     ++heartbeat_bytes;
                 }
@@ -246,6 +260,8 @@ public:
 
 Json Memory(std::string_view stage, const Child::MemorySnapshot& sample) {
     return {{"stage", stage}, {"vm_rss_bytes", sample.vm_rss_bytes},
+        {"sample_monotonic_ns", std::chrono::duration_cast<std::chrono::nanoseconds>(
+            Clock::now().time_since_epoch()).count()},
         {"vm_hwm_bytes", sample.vm_hwm_bytes},
         {"smaps_rollup_rss_bytes", sample.smaps_rollup_rss_bytes},
         {"smaps_rollup_pss_bytes", sample.smaps_rollup_pss_bytes},
@@ -276,20 +292,24 @@ struct LoadMemory {
 // budget, and compare the retained prefix once, not on every packet.
 double Transfer(Driver& driver, Child& child, bool upload, std::string_view payload,
                 std::string_view command, std::string_view expected, Deadline deadline,
-                LoadMemory* load = nullptr) {
+                LoadMemory* load = nullptr, Milliseconds peer_pump_delay = 0ms) {
+    const bool measured = command == "M";
     for (auto& client : driver.clients)
-        for (auto& stream : client.streams) stream.verified = false;
+        for (auto& stream : client.streams) stream.verified = measured && !stream.measured;
     const auto started = Clock::now();
+    for (auto& client : driver.clients) client.next_pump = started + peer_pump_delay;
     for (auto& client : driver.clients) {
-        for (const auto& stream : client.streams) {
+        for (auto& stream : client.streams) {
+            if (stream.verified) continue;
+            stream.transferring = true;
             client.peer->Send(stream.id, command);
             if (upload) client.peer->Send(stream.id, payload);
         }
-        driver.Tick(deadline);
+        driver.Tick(deadline, true, false, peer_pump_delay);
         if (load) load->Sample(child);
     }
     for (;;) {
-        driver.Tick(deadline);
+        driver.Tick(deadline, true, false, peer_pump_delay);
         bool complete = true;
         for (auto& client : driver.clients) {
             for (auto& stream : client.streams) {
@@ -298,6 +318,7 @@ double Transfer(Driver& driver, Child& child, bool upload, std::string_view payl
                     Require(client.peer->PayloadEquals(stream.id, expected),
                         "HY2 client payload or target completion marker mismatch");
                     stream.verified = true;
+                    stream.transferring = false;
                 } else {
                     Require(!client.peer->StreamClosed(stream.id), "HY2 stream closed before completion");
                     complete = false;
@@ -318,18 +339,28 @@ double Seconds(timeval value) {
     return static_cast<double>(value.tv_sec) + static_cast<double>(value.tv_usec) / 1000000.0;
 }
 
-struct Workload { unsigned connections; unsigned streams; bool upload; };
+struct Workload {
+    unsigned connections;
+    unsigned streams;
+    bool upload;
+    unsigned active_streams = streams;
+    size_t measured_bytes = MeasuredBytes;
+    Milliseconds peer_pump_delay = 0ms;
+};
 class HysteriaThroughputBenchmark : public testing::TestWithParam<Workload> {};
 
 TEST_P(HysteriaThroughputBenchmark, VerifiedTcpTransfer) {
     const auto workload = GetParam();
     const size_t streams = static_cast<size_t>(workload.connections) * workload.streams;
+    const size_t active_streams = static_cast<size_t>(workload.connections) * workload.active_streams;
+    Require(workload.active_streams > 0 && workload.active_streams <= workload.streams,
+        "invalid active stream count");
     rlimit descriptors{};
     Require(::getrlimit(RLIMIT_NOFILE, &descriptors) == 0, "getrlimit(RLIMIT_NOFILE) failed");
     Require(descriptors.rlim_cur >= streams + workload.connections + 64,
         "raise RLIMIT_NOFILE before benchmark (1024 physical case needs at least 2112)");
     const auto binary = BenchmarkBinary();
-    const auto payload = Payload();
+    const auto payload = Payload(workload.measured_bytes);
     const auto deadline = Clock::now() + 150s;
     TempDir root;
     TcpTarget target(payload, workload.upload, streams);
@@ -366,8 +397,10 @@ TEST_P(HysteriaThroughputBenchmark, VerifiedTcpTransfer) {
                 Client client;
                 client.peer = std::move(peer);
                 client.streams.reserve(workload.streams);
-                for (unsigned index = 0; index < workload.streams; ++index)
-                    client.streams.push_back({client.peer->Open(address, "B")});
+                for (unsigned index = 0; index < workload.streams; ++index) {
+                    const bool measured = index < workload.active_streams;
+                    client.streams.push_back({client.peer->Open(address, measured ? "B" : "I"), measured});
+                }
                 driver.clients.push_back(std::move(client));
             }
             driver.Tick(deadline);
@@ -384,6 +417,15 @@ TEST_P(HysteriaThroughputBenchmark, VerifiedTcpTransfer) {
     }
     Require(driver.clients.size() == workload.connections && target.Accepted() == streams,
         "physical connection/logical stream establishment count mismatch");
+    for (const auto& client : driver.clients) {
+        size_t retained_bytes = 0;
+        for (const auto& stream : client.streams) {
+            retained_bytes += stream.header_bytes + 2 + (workload.upload ? 0 : WarmupBytes);
+            if (stream.measured)
+                retained_bytes += 1 + (workload.upload ? 0 : workload.measured_bytes);
+        }
+        Require(retained_bytes <= 64 * MiB, "workload exceeds Peer retained receive budget");
+    }
     const double establishment = std::chrono::duration<double>(Clock::now() - establishment_started).count();
     memory.push_back(Memory("all_sessions_and_tcp_targets_ready", child.ReadMemorySnapshot()));
     std::string expected = "R";
@@ -392,12 +434,17 @@ TEST_P(HysteriaThroughputBenchmark, VerifiedTcpTransfer) {
     const double warmup = Transfer(driver, child, workload.upload,
         std::string_view(payload).substr(0, WarmupBytes), "W", expected, deadline);
     memory.push_back(Memory("warmup_complete_connections_open", child.ReadMemorySnapshot()));
+    const auto warmup_expected = expected;
     if (!workload.upload) expected += payload;
     expected += 'F';
     LoadMemory load;
-    const double elapsed = Transfer(driver, child, workload.upload, payload, "M", expected, deadline, &load);
+    // The target and deadline driver keep advancing between delayed Peer pumps.
+    // This is application-side peer pump delay, not simulated network RTT.
+    const double elapsed = Transfer(driver, child, workload.upload, payload, "M", expected,
+        deadline, &load, workload.peer_pump_delay);
     if (workload.upload)
-        Require(target.Verified() == streams * (WarmupBytes + MeasuredBytes), "target verified byte count mismatch");
+        Require(target.Verified() == streams * WarmupBytes + active_streams * workload.measured_bytes,
+            "target verified byte count mismatch");
     memory.push_back(Memory("loaded_transfer_complete_connections_open", child.ReadMemorySnapshot()));
     driver.Idle(2s, deadline);
     memory.push_back(Memory("idle_connections_open_after_2_seconds", child.ReadMemorySnapshot()));
@@ -412,6 +459,10 @@ TEST_P(HysteriaThroughputBenchmark, VerifiedTcpTransfer) {
                 closed &= client.peer->StreamClosed(stream.id);
         if (closed) break;
     }
+    for (const auto& client : driver.clients)
+        for (const auto& stream : client.streams)
+            client.peer->WaitPayload(stream.id, stream.measured ? expected : warmup_expected,
+                true, Remaining(deadline));
     memory.push_back(Memory("tcp_streams_closed_quic_sessions_open", child.ReadMemorySnapshot()));
     // Peer has no CONNECTION_CLOSE API. Keep pumping until the negotiated idle
     // timeout actually closes EVERY physical QUIC session; do not label mere
@@ -441,15 +492,22 @@ TEST_P(HysteriaThroughputBenchmark, VerifiedTcpTransfer) {
     const double lifetime = std::chrono::duration<double>(Clock::now() - lifetime_started).count();
     const double user_cpu = Seconds(usage_after.ru_utime) - Seconds(usage_before.ru_utime);
     const double system_cpu = Seconds(usage_after.ru_stime) - Seconds(usage_before.ru_stime);
-    const uint64_t total_bytes = streams * MeasuredBytes;
+    const uint64_t total_bytes = active_streams * workload.measured_bytes;
     const Json metrics{
         {"protocol", "hysteria2"}, {"transport", "tcp"}, {"binary", binary.string()},
         {"direction", workload.upload ? "upload" : "download"}, {"workers", Workers},
         {"physical_quic_connections", workload.connections}, {"tcp_streams_per_connection", workload.streams},
         {"tcp_streams_total", streams}, {"established_real_tcp_targets", target.Accepted()},
+        {"active_streams", active_streams}, {"active_streams_per_connection", workload.active_streams},
+        {"warmup_streams_total", streams}, {"measured_streams_total", active_streams},
+        {"workload_kind", workload.peer_pump_delay != 0ms ? "peer_pump_delay" :
+            (workload.active_streams != workload.streams ? "sparse_send" : "dense")},
+        {"peer_pump_delay_ms", workload.peer_pump_delay.count()},
+        {"peer_pump_delay_scope", "measured_phase_only_not_network_rtt"},
+        {"peer_retained_bytes_limit_per_connection", 64 * MiB},
         {"completed_real_tcp_targets", target.Completed()}, {"driver_threads", 1},
         {"additional_handshake_threads_max", 1}, {"target_threads", 0},
-        {"warmup_bytes_per_stream", WarmupBytes}, {"measured_bytes_per_stream", MeasuredBytes},
+        {"warmup_bytes_per_stream", WarmupBytes}, {"measured_bytes_per_stream", workload.measured_bytes},
         {"verified_warmup_bytes", streams * WarmupBytes}, {"verified_measured_bytes", total_bytes},
         {"verification_endpoint", workload.upload ? "real_tcp_target" : "independent_quic_peer"},
         {"heartbeat_application_bytes", driver.heartbeat_bytes}, {"target_io_chunk_bytes", ChunkBytes},
@@ -478,11 +536,18 @@ INSTANTIATE_TEST_SUITE_P(Concurrency, HysteriaThroughputBenchmark,
         Workload{256, 1, true}, Workload{256, 1, false},
         Workload{1024, 1, true}, Workload{1024, 1, false},
         Workload{1, 64, true}, Workload{1, 64, false},
-        Workload{16, 64, true}, Workload{16, 64, false}),
+        Workload{16, 64, true}, Workload{16, 64, false},
+        Workload{4, 256, true, 1, 4 * MiB}, Workload{4, 256, false, 1, 4 * MiB},
+        Workload{4, 64, false, 4, 4 * MiB, 10ms}),
     [](const auto& info) {
-        return std::string(info.param.upload ? "Upload_" : "Download_") +
+        auto name = std::string(info.param.upload ? "Upload_" : "Download_") +
             std::to_string(info.param.connections) + "Connections_" +
             std::to_string(info.param.streams) + "StreamsEach";
+        if (info.param.active_streams != info.param.streams)
+            name += "_" + std::to_string(info.param.active_streams) + "ActiveEach";
+        if (info.param.peer_pump_delay != 0ms)
+            name += "_PeerPumpDelay" + std::to_string(info.param.peer_pump_delay.count()) + "ms";
+        return name;
     });
 } // namespace
 } // namespace cnode::e2e

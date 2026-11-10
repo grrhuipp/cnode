@@ -142,6 +142,7 @@ constexpr size_t kMaxQueuedDatagrams = 1024;
 constexpr size_t kMaxUdpMessageSize = 1100;
 constexpr size_t kUdpDatagramFrameOverhead = 3; // type + 至多两字节 LEN。
 constexpr size_t kMaxStreamOutputBytes = 512 * 1024;
+static_assert(kMaxStreamOutputBytes <= UINT32_MAX);
 constexpr uint64_t kMaxConnectionData = 16 * 1024 * 1024;
 constexpr uint64_t kMaxStreamData = QuicStreamState::kMaxQueuedInputBytes;
 constexpr uint64_t kMaxStreams = 1024;
@@ -741,6 +742,38 @@ void Connection::OnExpiry() {
     Flush();
 }
 
+void Connection::ScheduleStreamOutput(int64_t stream_id, StreamRecord& stream) noexcept {
+    if (stream.output_next >= 0 || !stream.state->Open() || stream.flow_blocked ||
+        (stream.output_index == stream.output.size() && !stream.fin_pending))
+        return;
+    if (core_->next_output_stream < 0) {
+        stream.output_previous = stream_id;
+        stream.output_next = stream_id;
+        core_->next_output_stream = stream_id;
+        return;
+    }
+    auto& head = core_->streams.find(core_->next_output_stream)->second;
+    auto& tail = core_->streams.find(head.output_previous)->second;
+    stream.output_previous = head.output_previous;
+    stream.output_next = core_->next_output_stream;
+    tail.output_next = stream_id;
+    head.output_previous = stream_id;
+}
+
+void Connection::UnscheduleStreamOutput(int64_t stream_id, StreamRecord& stream) noexcept {
+    if (stream.output_next < 0) return;
+    if (stream.output_next == stream_id) {
+        core_->next_output_stream = -1;
+    } else {
+        core_->streams.find(stream.output_previous)->second.output_next = stream.output_next;
+        core_->streams.find(stream.output_next)->second.output_previous = stream.output_previous;
+        if (core_->next_output_stream == stream_id)
+            core_->next_output_stream = stream.output_next;
+    }
+    stream.output_previous = -1;
+    stream.output_next = -1;
+}
+
 std::shared_ptr<QuicStreamState> Connection::QueueStreamOutput(
     int64_t stream_id, buf::MultiBuffer& payload) {
     if (!core_ || closed_)
@@ -758,6 +791,7 @@ std::shared_ptr<QuicStreamState> Connection::QueueStreamOutput(
         stream.output.push_back(std::move(payload));
     }
     stream.queued_bytes += bytes;
+    ScheduleStreamOutput(stream_id, stream);
     Flush();
     return nullptr;
 }
@@ -774,6 +808,7 @@ void Connection::ShutdownStreamWrite(int64_t stream_id) noexcept {
     auto it = core_->streams.find(stream_id);
     if (it == core_->streams.end()) return;
     it->second.fin_pending = true;
+    ScheduleStreamOutput(stream_id, it->second);
     Flush();
 }
 
@@ -782,7 +817,10 @@ void Connection::CancelStream(int64_t stream_id) noexcept {
     std::shared_ptr<QuicStreamState> state;
     {
         auto it = core_->streams.find(stream_id);
-        if (it != core_->streams.end()) state = it->second.state;
+        if (it != core_->streams.end()) {
+            UnscheduleStreamOutput(stream_id, it->second);
+            state = it->second.state;
+        }
     }
     if (state) state->RemoteReset();
     if (closed_) return;
@@ -802,47 +840,24 @@ int Connection::AckStreamData(ngtcp2_conn*, int64_t stream_id, uint64_t offset,
     auto it = self.core_->streams.find(stream_id);
     if (it == self.core_->streams.end() || length == 0) return 0;
     auto& stream = it->second;
-    const uint64_t previous_acknowledged = stream.acknowledged;
-    if (stream.acked_ranges.empty() && offset <= stream.acknowledged) {
-        // In-order ACK: the merged range would be consumed at once.
-        stream.acknowledged = std::max(stream.acknowledged, offset + length);
-    } else {
-        uint64_t merged_start = offset;
-        uint64_t merged_end = offset + length;
-        auto range = stream.acked_ranges.lower_bound(offset);
-        if (range != stream.acked_ranges.begin()) {
-            auto previous = std::prev(range);
-            if (previous->second >= offset) range = previous;
-        }
-        while (range != stream.acked_ranges.end() &&
-               range->first <= merged_end) {
-            merged_start = std::min(merged_start, range->first);
-            merged_end = std::max(merged_end, range->second);
-            range = stream.acked_ranges.erase(range);
-        }
-        stream.acked_ranges.emplace(merged_start, merged_end);
-        for (;;) {
-            auto first = stream.acked_ranges.begin();
-            if (first == stream.acked_ranges.end() ||
-                first->first > stream.acknowledged) break;
-            stream.acknowledged =
-                std::max(stream.acknowledged, first->second);
-            stream.acked_ranges.erase(first);
-        }
-    }
-    size_t released = static_cast<size_t>(
-        stream.acknowledged - previous_acknowledged);
+    // ngtcp2 reports the newly acknowledged contiguous prefix, even when wire
+    // ACKs arrive out of order (ngtcp2_callbacks::acked_stream_data_offset).
+    size_t released = static_cast<size_t>(length);
     stream.queued_bytes -= std::min(stream.queued_bytes, released);
-    stream.output_offset -= std::min(stream.output_offset, released);
     while (released != 0 && !stream.output.empty()) {
         const size_t dropped =
             stream.output.front().DropPrefixBytes(released);
         released -= dropped;
-        if (stream.output.front().empty()) stream.output.pop_front();
+        if (stream.output_index == 0)
+            stream.output_offset -= static_cast<uint32_t>(
+                std::min<size_t>(stream.output_offset, dropped));
+        if (stream.output.front().empty()) {
+            stream.output.pop_front();
+            if (stream.output_index != 0) --stream.output_index;
+        }
         if (dropped == 0) break;
     }
-    if (stream.acknowledged != previous_acknowledged)
-        stream.state->NotifyWritable();
+    stream.state->NotifyWritable();
     return 0;
 }
 
@@ -881,6 +896,7 @@ int Connection::CloseStream(ngtcp2_conn* conn, uint32_t flags, int64_t stream_id
     std::shared_ptr<QuicStreamState> state;
     if (auto it = self.core_->streams.find(stream_id);
         it != self.core_->streams.end()) {
+        self.UnscheduleStreamOutput(stream_id, it->second);
         state = std::move(it->second.state);
         self.core_->streams.erase(it);
         MaybeShrinkHashContainer(self.core_->streams, 8);
@@ -973,40 +989,34 @@ void Connection::Flush() {
                 vectors[i] = {http_vectors[i].base, http_vectors[i].len};
             http_data = stream_id >= 0;
         }
-        if (!http_data && !core_->streams.empty()) {
-            auto next = core_->streams.find(core_->next_output_stream);
-            if (next == core_->streams.end()) next = core_->streams.begin();
-            for (size_t remaining = core_->streams.size();
-                 remaining != 0; --remaining) {
-                auto current = next++;
-                if (next == core_->streams.end()) next = core_->streams.begin();
-                auto& [id, stream] = *current;
-                if (!stream.state->Open() || stream.flow_blocked) continue;
-                const bool has_unsent =
-                    stream.output_offset < stream.queued_bytes;
-                if (!has_unsent && !stream.fin_pending) continue;
-                core_->next_output_stream = next->first;
-                stream_id = id;
-                fin = stream.fin_pending && !has_unsent;
-                size_t skip = stream.output_offset;
-                for (size_t output_index = 0;
-                     output_index < stream.output.size(); ++output_index) {
-                    const auto& multi = stream.output[output_index];
-                    for (const auto* buffer : multi) {
-                        auto bytes = buffer->Bytes();
-                        if (skip >= bytes.size()) {
-                            skip -= bytes.size();
-                            continue;
-                        }
-                        bytes = bytes.subspan(skip);
-                        skip = 0;
-                        vectors[vector_count++] = ngtcp2_vec{
-                            const_cast<uint8_t*>(bytes.data()), bytes.size()};
-                        if (vector_count == vectors.size()) break;
+        if (!http_data && core_->next_output_stream >= 0) {
+            stream_id = core_->next_output_stream;
+            auto& stream = core_->streams.find(stream_id)->second;
+            const bool has_unsent = stream.output_index < stream.output.size();
+            if (!stream.state->Open() || stream.flow_blocked ||
+                (!has_unsent && !stream.fin_pending)) {
+                UnscheduleStreamOutput(stream_id, stream);
+                continue;
+            }
+            core_->next_output_stream = stream.output_next;
+            fin = stream.fin_pending && !has_unsent;
+            size_t skip = stream.output_offset;
+            for (size_t output_index = stream.output_index;
+                 output_index < stream.output.size(); ++output_index) {
+                const auto& multi = stream.output[output_index];
+                for (const auto* buffer : multi) {
+                    auto bytes = buffer->Bytes();
+                    if (skip >= bytes.size()) {
+                        skip -= bytes.size();
+                        continue;
                     }
+                    bytes = bytes.subspan(skip);
+                    skip = 0;
+                    vectors[vector_count++] = ngtcp2_vec{
+                        const_cast<uint8_t*>(bytes.data()), bytes.size()};
                     if (vector_count == vectors.size()) break;
                 }
-                break;
+                if (vector_count == vectors.size()) break;
             }
         }
         auto local = MakeAddress(core_->local);
@@ -1062,8 +1072,10 @@ void Connection::Flush() {
                        it != core_->streams.end()) {
                 if (written == NGTCP2_ERR_STREAM_DATA_BLOCKED) {
                     it->second.flow_blocked = true;
+                    UnscheduleStreamOutput(stream_id, it->second);
                 } else {
                     auto state = it->second.state;
+                    UnscheduleStreamOutput(stream_id, it->second);
                     state->RemoteReset();
                 }
             }
@@ -1085,8 +1097,22 @@ void Connection::Flush() {
                 }
             } else if (auto it = core_->streams.find(stream_id);
                        it != core_->streams.end()) {
-                it->second.output_offset += static_cast<size_t>(accepted);
-                if (fin) it->second.fin_pending = false;
+                auto& stream = it->second;
+                size_t remaining = static_cast<size_t>(accepted);
+                while (remaining != 0) {
+                    const size_t available =
+                        stream.output[stream.output_index].byte_size() - stream.output_offset;
+                    if (remaining < available) {
+                        stream.output_offset += static_cast<uint32_t>(remaining);
+                        break;
+                    }
+                    remaining -= available;
+                    ++stream.output_index;
+                    stream.output_offset = 0;
+                }
+                if (fin) stream.fin_pending = false;
+                if (stream.output_index == stream.output.size() && !stream.fin_pending)
+                    UnscheduleStreamOutput(stream_id, stream);
             }
         }
         auto* output_socket = OutputSocket(write_path.path);
@@ -1317,6 +1343,7 @@ void Connection::OpenV1UdpSession(
     const auto response = EncodeV1Response(true, session_id, "");
     stream.output.push_back(CopyPacket(response));
     stream.queued_bytes += response.size();
+    ScheduleStreamOutput(stream_id, stream);
     Flush();
 }
 

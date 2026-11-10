@@ -480,9 +480,11 @@ private:
         std::shared_ptr<QuicStreamState> state;
         memory::ThreadLocalDeque<buf::MultiBuffer> output;
         size_t queued_bytes = 0;
-        size_t output_offset = 0;
-        uint64_t acknowledged = 0;
-        memory::ThreadLocalMap<uint64_t, uint64_t> acked_ranges;
+        // Position in retained output; ACK reclamation rebases only the front.
+        uint32_t output_index = 0;
+        uint32_t output_offset = 0;
+        int64_t output_previous = -1;
+        int64_t output_next = -1;
         bool fin_pending = false;
         bool flow_blocked = false;
         // A Hysteria request stream rather than an HTTP/3 or v1 control stream.
@@ -490,6 +492,8 @@ private:
         // Handed to the inbound handler, or consumed as a v1 UDP-session open.
         bool delivered = false;
     };
+    void ScheduleStreamOutput(int64_t stream_id, StreamRecord& stream) noexcept;
+    void UnscheduleStreamOutput(int64_t stream_id, StreamRecord& stream) noexcept;
     struct Core {
         Core() = default;
         ~Core() {
@@ -507,7 +511,7 @@ private:
         udp::endpoint remote;
         ngtcp2_cid server_cid{};
         memory::ThreadLocalUnorderedMap<int64_t, StreamRecord> streams;
-        // IDs, not iterators, survive stream retirement during packet writes.
+        // Intrusive round-robin of writable streams; callbacks unlink before erase.
         int64_t next_output_stream = -1;
         memory::ThreadLocalUnorderedMap<int64_t, H3Request> h3_requests;
         memory::ThreadLocalDeque<memory::ByteVector> datagrams;
@@ -598,8 +602,10 @@ private:
         void* user_data, void*) {
         auto& self = *static_cast<Connection*>(user_data);
         if (auto it = self.core_->streams.find(stream_id);
-            it != self.core_->streams.end())
+            it != self.core_->streams.end()) {
             it->second.flow_blocked = false;
+            self.ScheduleStreamOutput(stream_id, it->second);
+        }
         return self.core_->http
             ? nghttp3_conn_unblock_stream(self.core_->http, stream_id) : 0;
     }
