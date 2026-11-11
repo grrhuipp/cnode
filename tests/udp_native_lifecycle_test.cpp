@@ -21,6 +21,7 @@
 #include <asio/steady_timer.hpp>
 #include <asio/use_awaitable.hpp>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdio>
@@ -535,14 +536,13 @@ void VerifyHandoffDirectoryTombstone(::net::io_context& io, Reclaimer& reclaimer
     const ::udp::endpoint endpoint{::net::ip::address_v4::loopback(), 48234};
     Ingress ingress("directory-tombstone", std::make_unique<NativeInbound>(),
                     reclaimer, budget, io);
+    auto record = directory.Claim(key, configuration, policy);
     auto session = ingress.CreateClientSession(
         key.listener, key.client, io, {},
         {::net::ip::address_v4::loopback(), 48234},
-        owner, std::chrono::steady_clock::now(), 0s);
-    auto record = directory.Claim(key, configuration, policy);
+        owner, std::chrono::steady_clock::now(), 0s, record);
     if (!session || !record || !record->association->Check(31, 0, endpoint, ::InboundDatagramCheck::Commit))
         Fail("failed to prepare live directory association");
-    record->session = session;
     record->association->claimed = false;
     ingress.CleanupClientSessions(key.listener);
     if (!session->Closed() || record->session.expired())
@@ -550,6 +550,26 @@ void VerifyHandoffDirectoryTombstone(::net::io_context& io, Reclaimer& reclaimer
     session.reset();
     if (!record->session.expired() || budget.GetUsage().associations != 0)
         Fail("directory kept a closed association alive");
+    const std::weak_ptr<Ingress::ClientSession> empty_session;
+    if (record->session.owner_before(empty_session) ||
+        empty_session.owner_before(record->session))
+        Fail("replay tombstone retained the closed session allocation");
+    auto previous = ingress.CreateClientSession(
+        key.listener, key.client, io, {}, endpoint, owner,
+        std::chrono::steady_clock::now(), 0s, record);
+    auto replacement = ingress.CreateClientSession(
+        key.listener, key.client, io, {}, endpoint, owner,
+        std::chrono::steady_clock::now(), 0s, record);
+    if (!previous || !replacement || !previous->Closed())
+        Fail("failed to replace a retained session owner");
+    previous.reset();
+    if (record->session.lock() != replacement)
+        Fail("old session destruction detached its live replacement");
+    ingress.CleanupClientSessions(key.listener);
+    replacement.reset();
+    if (record->session.owner_before(empty_session) ||
+        empty_session.owner_before(record->session))
+        Fail("replacement retained its closed session allocation");
     const std::weak_ptr<UdpHandoffRecord> tombstone = record;
     record.reset();
     configuration.reset();
@@ -609,6 +629,80 @@ void VerifyHandoffDirectoryCapacity() {
 }
 
 } // namespace
+
+struct SessionAllocationCounts {
+    size_t allocations = 0;
+    size_t live_bytes = 0;
+    size_t peak_bytes = 0;
+};
+
+template <typename T>
+struct SessionAllocationCounter {
+    using value_type = T;
+    SessionAllocationCounts* counts;
+    explicit SessionAllocationCounter(SessionAllocationCounts& counts) : counts(&counts) {}
+    template <typename U>
+    SessionAllocationCounter(const SessionAllocationCounter<U>& other) : counts(other.counts) {}
+    T* allocate(size_t n) {
+        auto* result = std::allocator<T>{}.allocate(n);
+        ++counts->allocations;
+        counts->live_bytes += n * sizeof(T);
+        counts->peak_bytes = std::max(counts->peak_bytes, counts->live_bytes);
+        return result;
+    }
+    void deallocate(T* value, size_t n) {
+        counts->live_bytes -= n * sizeof(T);
+        std::allocator<T>{}.deallocate(value, n);
+    }
+    template <typename U>
+    bool operator==(const SessionAllocationCounter<U>& other) const noexcept {
+        return counts == other.counts;
+    }
+};
+
+TEST(UdpNativeLifecycle, ReplayTombstoneAllocationChurn) {
+    constexpr size_t count = 4096;
+    // The baseline reproduces the previous split binding: the directory owns
+    // a weak reference, but the session is not given the record at construction.
+    // Include final tombstone destruction in both timings; only the point at
+    // which the session's allocation is released differs.
+    for (size_t round = 0; round != 6; ++round) {
+        const bool bound_record = round % 2 != 0;
+        ::net::io_context io;
+        ::worker_detail::UdpResourceBudget budget;
+        SessionAllocationCounts counts;
+        std::vector<std::shared_ptr<::worker_detail::UdpHandoffRecord>> records;
+        records.reserve(count);
+        const auto started = std::chrono::steady_clock::now();
+        for (size_t index = 0; index != count; ++index) {
+            auto record = std::make_shared<::worker_detail::UdpHandoffRecord>(
+                ::ss::Ss2022UdpAssociation::Policy());
+            auto session = std::allocate_shared<Ingress::ClientSession>(
+                SessionAllocationCounter<Ingress::ClientSession>{counts}, io,
+                Ingress::ReplyRoute{}, ::udp::endpoint{}, ::InboundDatagramOwner{},
+                budget, budget.AcquireAssociation(), bound_record ? record : nullptr);
+            record->session = session;
+            session.reset();
+            records.push_back(std::move(record));
+        }
+        const auto retained_bytes = counts.live_bytes;
+        EXPECT_EQ(counts.allocations, count);
+        EXPECT_EQ(budget.GetUsage().associations, 0u);
+        if (bound_record) EXPECT_EQ(retained_bytes, 0u);
+        else EXPECT_GT(retained_bytes, 0u);
+        records.clear();
+        EXPECT_EQ(counts.live_bytes, 0u);
+        const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started).count();
+        std::cout << "udp-session-churn round=" << round
+                  << " bound_record=" << bound_record
+                  << " operations=" << count
+                  << " allocations=" << counts.allocations
+                  << " peak_bytes=" << counts.peak_bytes
+                  << " retained_bytes=" << retained_bytes
+                  << " ns_per_operation=" << elapsed / count << '\n';
+    }
+}
 
 TEST(UdpNativeLifecycle, Contract) {
     std::set_terminate([] {

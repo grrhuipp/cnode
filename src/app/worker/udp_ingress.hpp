@@ -416,7 +416,8 @@ public:
         udp::endpoint reply_endpoint,
         ::InboundDatagramOwner session_owner,
         std::chrono::steady_clock::time_point last_active,
-        std::chrono::seconds idle_timeout);
+        std::chrono::seconds idle_timeout,
+        std::shared_ptr<UdpHandoffRecord> record = {});
     void CleanupClientSessions(std::string_view socket_key) noexcept;
     void CleanupAllClientSessions() noexcept;
 
@@ -527,7 +528,8 @@ public:
                   udp::endpoint reply_endpoint,
                   ::InboundDatagramOwner session_owner,
                   UdpResourceBudget& budget,
-                  UdpResourceBudget::AssociationLease association);
+                  UdpResourceBudget::AssociationLease association,
+                  std::shared_ptr<UdpHandoffRecord> record = {});
     ~ClientSession() noexcept override;
 
     ClientSession(const ClientSession&) = delete;
