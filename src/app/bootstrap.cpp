@@ -1042,7 +1042,7 @@ int RunFromCommandLine(int argc, char* argv[]) {
                 config.routing.rules.size(),
                 config.panels.size());
     LOG_CONSOLE("Starting cnode v1.0.0: channel={} build={}", BUILD_CHANNEL, BUILD_ID);
-    LOG_CONSOLE("Runtime configured: workers={} io={} accept=SO_REUSEPORT allocator=thread-local",
+    LOG_CONSOLE("Runtime configured: workers={} io={} accept=SO_REUSEPORT allocator=mimalloc-worker-heap",
                 config.workers, IoBackendName());
     if (!ValidateConfig(config)) {
         Log::WriteConsole(LogLevel::ERROR, "Invalid configuration");
