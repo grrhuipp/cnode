@@ -43,7 +43,10 @@ inline void OnBufferNew() noexcept {}
 inline void OnBufferFree() noexcept {}
 #endif
 
-#ifdef CNODE_TEST_ALLOCATOR_FAULT
+// CNODE_TEST_ALLOCATOR: test-only allocator instrumentation (fault injection
+// and release-side ownership checks). It must be defined consistently for
+// every translation unit of one binary.
+#ifdef CNODE_TEST_ALLOCATOR
 inline thread_local bool reject_next_process_allocation = false;
 inline thread_local size_t rejected_process_allocations = 0;
 inline thread_local bool reject_next_pmr_allocation = false;
@@ -59,7 +62,7 @@ namespace detail {
 
 
 [[nodiscard]] inline void* AllocateProcessRaw(std::size_t bytes_value, std::size_t alignment) {
-#ifdef CNODE_TEST_ALLOCATOR_FAULT
+#ifdef CNODE_TEST_ALLOCATOR
     if (reject_next_process_allocation) {
         reject_next_process_allocation = false;
         ++rejected_process_allocations;
@@ -112,8 +115,11 @@ private:
 // The pool is owned explicitly (a Worker member, or a test-local object) and
 // passed to every allocation; nothing selects it from thread-local or default
 // PMR state. The first allocation binds the owner thread and the heap's
-// thread-bound theap. Allocation, sized release and Collect() on any other
-// thread terminate, as does releasing a block this heap does not own.
+// thread-bound theap, which only that thread may use: allocation and Collect()
+// on any other thread terminate. Release on the owner thread is an invariant;
+// mimalloc would accept a remote free, so the release-side thread and
+// owning-pool checks run in CNODE_TEST_ALLOCATOR builds only, keeping the
+// production free path to a single mi_free.
 class worker_memory final : public std::pmr::memory_resource {
 public:
     // Page-level view of this heap; computed by visiting its pages.
@@ -173,7 +179,7 @@ public:
             owner_token_ = token;
         }
         if (!theap_ && !(theap_ = mi_heap_theap(heap_))) return nullptr;
-#ifdef CNODE_TEST_ALLOCATOR_FAULT
+#ifdef CNODE_TEST_ALLOCATOR
         if (reject_next_pmr_allocation) {
             reject_next_pmr_allocation = false;
             ++rejected_pmr_allocations;
@@ -184,9 +190,11 @@ public:
     }
 
     void Deallocate(void* pointer, std::size_t = 0, std::size_t = 0) noexcept {
+#ifdef CNODE_TEST_ALLOCATOR
         if (!pointer) return;
         RequireOwnerThread();
         if (mi_heap_of(pointer) != heap_) std::terminate();
+#endif
         mi_free(pointer);
     }
 
@@ -223,12 +231,14 @@ private:
 };
 
 // Releases a block whose owning Worker pool is not at hand (unsized object
-// delete). The block must come from a Worker heap; mimalloc returns it to its
-// page. Owner-thread release is a caller invariant on this path.
+// delete). It must come from a Worker heap and be released on its owner
+// thread; CNODE_TEST_ALLOCATOR builds verify the former.
 inline void ReleaseWorkerBlock(void* p) noexcept {
+#ifdef CNODE_TEST_ALLOCATOR
     if (!p) return;
     const mi_heap_t* const heap = mi_heap_of(p);
     if (!heap || heap == mi_heap_main()) std::terminate();
+#endif
     mi_free(p);
 }
 

@@ -276,7 +276,7 @@ public:
         Check(buf::AppendSpanToMultiBuffer({wire_.data() + offset_, count}, raw, pool_),
               "wire input allocation failed");
         offset_ += count;
-#ifdef CNODE_TEST_ALLOCATOR_FAULT
+#ifdef CNODE_TEST_ALLOCATOR
         if (fail_payload_allocation) {
             fail_payload_allocation = false;
             memory::reject_next_pmr_allocation = true;
@@ -461,7 +461,7 @@ void TestContextLifetime() {
     fail_cipher_context = false;
     Check(failed, "EVP allocation failure created usable SS state");
 #endif
-#ifdef CNODE_TEST_ALLOCATOR_FAULT
+#ifdef CNODE_TEST_ALLOCATOR
     std::vector<uint8_t> wire;
     uint64_t counter = 0;
     const std::vector<uint8_t> large_plain(buf::Buffer::kSize + 1, 0x5a);

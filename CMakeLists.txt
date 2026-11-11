@@ -209,7 +209,7 @@ add_custom_target(cnode_tests DEPENDS cnode)
 add_library(cnode_test_core STATIC EXCLUDE_FROM_ALL ${CNODE_CORE_SOURCES})
 target_link_libraries(cnode_test_core PUBLIC cnode_build_options)
 target_compile_definitions(cnode_test_core PUBLIC
-    CNODE_TEST_ALLOCATOR_FAULT CNODE_TEST_BUFFER_STATS)
+    CNODE_TEST_ALLOCATOR CNODE_TEST_BUFFER_STATS)
 target_compile_options(cnode_test_core PRIVATE -UNDEBUG)
 
 function(cnode_unit name)
@@ -359,7 +359,7 @@ cnode_unit(xhttp_upload_stream_slot LIBRARY cnode_test_core INCLUDES src/transpo
 
 # Small isolated seams do not pull production objects compiled with other macros.
 target_compile_definitions(cnode_worker_memory_test PRIVATE
-    CNODE_TEST_ALLOCATOR_FAULT)
+    CNODE_TEST_ALLOCATOR)
 target_compile_options(cnode_awaitable_task_group_test PRIVATE
     "-include${CMAKE_CURRENT_SOURCE_DIR}/tests/async_allocation_fault.hpp")
 target_compile_options(cnode_timeout_scheduler_test PRIVATE
@@ -377,7 +377,7 @@ target_compile_definitions(cnode_vmess_cipher_test PRIVATE CNODE_TEST_CRYPTO_FAU
 target_link_options(cnode_vmess_cipher_test PRIVATE
     -Wl,--wrap=EVP_MD_CTX_new -Wl,--wrap=EVP_AEAD_CTX_new -Wl,--wrap=EVP_DigestSqueeze)
 target_compile_definitions(cnode_shadowsocks_stream_crypto_test PRIVATE
-    CNODE_TEST_ALLOCATOR_FAULT CNODE_WRAP_MALLOC)
+    CNODE_TEST_ALLOCATOR CNODE_WRAP_MALLOC)
 target_link_options(cnode_shadowsocks_stream_crypto_test PRIVATE
     -Wl,--wrap=malloc -Wl,--wrap=EVP_AEAD_CTX_new)
 

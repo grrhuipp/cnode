@@ -3,7 +3,7 @@
 // Test-only forced include: enable the process allocation boundary fault seam
 // in every translation unit, including native timer initiation under mimalloc,
 // and intercept Asio's remaining aligned allocation paths.
-#define CNODE_TEST_ALLOCATOR_FAULT
+#define CNODE_TEST_ALLOCATOR
 #include <asio/detail/memory.hpp>
 
 #include <cstddef>

@@ -67,7 +67,7 @@ public:
         result.target = script_->target;
         if (!::buf::AppendSpanToMultiBuffer(request.payload, result.payload, pool_))
             return tl::unexpected(::ErrorCode::RESOURCE_EXHAUSTED);
-#ifdef CNODE_TEST_ALLOCATOR_FAULT
+#ifdef CNODE_TEST_ALLOCATOR
         if (script_->fail_next_allocation) {
             script_->fail_next_allocation = false;
             ::memory::reject_next_pmr_allocation = true;
@@ -260,7 +260,7 @@ void VerifyWorkerBudget() {
         }
         return result;
     };
-#ifdef CNODE_TEST_ALLOCATOR_FAULT
+#ifdef CNODE_TEST_ALLOCATOR
     ::memory::reject_next_pmr_allocation = true;
     bool association_oom = false;
     try {
@@ -288,11 +288,11 @@ void VerifyWorkerBudget() {
 
     if (first.EnqueueReply("reply", endpoint, payload()) != Result::StartSend)
         Fail("failed to reserve a shared reply payload");
-#ifdef CNODE_TEST_ALLOCATOR_FAULT
+#ifdef CNODE_TEST_ALLOCATOR
     ::memory::reject_next_pmr_allocation = true;
 #endif
     auto active = first.BeginReplySend("reply");
-#ifdef CNODE_TEST_ALLOCATOR_FAULT
+#ifdef CNODE_TEST_ALLOCATOR
     const bool allocated = !::memory::reject_next_pmr_allocation;
     ::memory::reject_next_pmr_allocation = false;
     if (allocated) Fail("ordinary UDP send handoff allocated a packet node");
@@ -720,7 +720,7 @@ TEST(UdpSocketOwner, Contract) {
         Fail("UDP reply cleanup retained resource stats");
     }
 
-#ifdef CNODE_TEST_ALLOCATOR_FAULT
+#ifdef CNODE_TEST_ALLOCATOR
     auto exercise_reply_oom = [&](const std::string& socket_key) {
         const auto budget_before = udp_budget.GetUsage();
         auto enqueue_one = [&]() {
@@ -917,7 +917,7 @@ TEST(UdpSocketOwner, Contract) {
         Fail("UDP input stats did not drain both owner sessions");
     }
 
-#ifdef CNODE_TEST_ALLOCATOR_FAULT
+#ifdef CNODE_TEST_ALLOCATOR
     const auto input_baseline = worker.GetResourceStats();
     const auto input_budget_baseline = udp_budget.GetUsage();
     const std::string oom_input_socket = "oom-input-socket";
@@ -1138,7 +1138,7 @@ TEST(UdpSocketOwner, Contract) {
         if (allocations_with_session <= allocations_before) {
             Fail("long UDP map keys did not allocate through the Worker pool");
         }
-#ifdef CNODE_TEST_ALLOCATOR_FAULT
+#ifdef CNODE_TEST_ALLOCATOR
         ::memory::reject_next_pmr_allocation = true;
         if (worker.GetResourceStats().associations != 1 ||
             !::memory::reject_next_pmr_allocation) {
