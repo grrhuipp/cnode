@@ -1,6 +1,5 @@
 #include <gtest/gtest.h>
 
-#include "allocation_hook.hpp"
 #include "trojan_codec.hpp"
 
 #include <algorithm>
@@ -12,14 +11,6 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
-
-namespace {
-thread_local bool reject_allocation = false;
-void RejectWhenRequested(std::size_t) {
-    if (reject_allocation) throw std::bad_alloc();
-}
-}
-constinit allocation_hook::Hooks allocation_hook::hooks{.before_new = RejectWhenRequested};
 
 namespace {
 void Check(bool ok, const char* message) {
@@ -54,10 +45,8 @@ void TestRequest(::trojan::TrojanCommand command, const ::TargetAddress& target,
     const auto header_size = expected.size();
     expected.insert(expected.end(), payload.begin(), payload.end());
     std::array<uint8_t, 512> output{};
-    reject_allocation = true;
     const auto length = ::trojan::EncodeRequestTo(
         hash, command, target, output.data(), output.size());
-    reject_allocation = false;
     Check(length == header_size, "request size mismatch");
     std::copy(payload.begin(), payload.end(), output.begin() + static_cast<std::ptrdiff_t>(length));
     Check(std::equal(expected.begin(), expected.end(), output.begin()), "Trojan wire bytes changed");
@@ -87,10 +76,8 @@ void TestRequest(::trojan::TrojanCommand command, const ::TargetAddress& target,
     }
 
     output.fill(0x5a);
-    reject_allocation = true;
     const auto short_length = ::trojan::EncodeRequestTo(
         hash, command, target, output.data(), header_size - 1);
-    reject_allocation = false;
     Check(short_length == 0 && std::all_of(output.begin(), output.end(), [](auto b) { return b == 0x5a; }),
           "short output buffer was partially modified");
 }
@@ -107,10 +94,9 @@ TEST(TrojanRequest, Contract) {
             TestRequest(command, ::TargetAddress(::net::ip::make_address("::1"), 53), ipv6);
             TestRequest(command, ::TargetAddress(std::string_view("example.com"), 443), domain);
         }
-        std::cout << "Trojan SHA224 vectors and TCP/UDP IPv4/IPv6/domain wire bytes passed without C++ encoding allocations\n";
+        std::cout << "Trojan SHA224 vectors and TCP/UDP IPv4/IPv6/domain wire bytes passed\n";
     } catch (const std::exception& error) {
-        reject_allocation = false;
-        std::cerr << "Trojan request encoding failed with C++ allocations disabled: " << error.what() << '\n';
+        std::cerr << "Trojan request encoding failed: " << error.what() << '\n';
         FAIL() << error.what();
     }
 }

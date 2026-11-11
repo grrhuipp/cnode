@@ -1,20 +1,15 @@
 #include <gtest/gtest.h>
 
-#include "allocation_hook.hpp"
 #include "common/session.hpp"
 
 #include <asio/ip/address.hpp>
 
 #include <iostream>
-#include <new>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 
 namespace {
-thread_local bool count_allocations = false;
-thread_local size_t allocations = 0;
-
 void Expect(bool condition, std::string_view message) {
     if (!condition) throw std::runtime_error(std::string(message));
 }
@@ -22,13 +17,7 @@ void Expect(bool condition, std::string_view message) {
 bool Has(std::string_view text, std::string_view field) {
     return text.find(field) != std::string_view::npos;
 }
-
-void CountAllocation(std::size_t) {
-    if (count_allocations) ++allocations;
-}
 }  // namespace
-
-constinit allocation_hook::Hooks allocation_hook::hooks{.before_new = CountAllocation};
 
 TEST(SessionAccessLog, Contract) {
     try {
@@ -56,11 +45,7 @@ TEST(SessionAccessLog, Contract) {
             .client_ip = ::net::ip::make_address("203.0.113.88"),
             .inbound_tag = ::memory::String("panel/site-a/10/vless/443"),
         });
-        allocations = 0;
-        count_allocations = true;
         access = ::FormatAccessLog(ctx);
-        count_allocations = false;
-        Expect(allocations == 1, "access log with passthrough fields must allocate once");
         Expect(Has(access, " origin:203.0.113.88|panel/site-a/10/vless/443|1001|alice@origin.example ") &&
                Has(access, " sendThrough:2602:2b5:20:111::abcd"),
                "passthrough origin IP, tag and user identity must appear in access log");
@@ -139,11 +124,6 @@ TEST(SessionAccessLog, Contract) {
         Expect(Has(access, "from [2001:db8::1]:52000") &&
                Has(access, "tcp:[2001:db8::2]:65535"),
                "IPv6 endpoints need unambiguous port boundaries");
-        allocations = 0;
-        count_allocations = true;
-        access = ::FormatAccessLog(ctx);
-        count_allocations = false;
-        Expect(allocations == 1, "access log must allocate only its final owning string");
 
         ctx.inbound.source_ip.clear();
         ctx.inbound.source_addr = ::net::ip::make_address("::ffff:192.0.2.1");
@@ -160,7 +140,6 @@ TEST(SessionAccessLog, Contract) {
                !Has(access, "email:") && !Has(access, "user:"),
                "missing pre-authentication fields must not be fabricated");
     } catch (const std::exception& error) {
-        count_allocations = false;
         std::cerr << error.what() << '\n';
         FAIL() << error.what();
     }

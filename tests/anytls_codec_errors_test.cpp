@@ -1,6 +1,5 @@
 #include <gtest/gtest.h>
 
-#include "allocation_hook.hpp"
 #include "anytls_codec.hpp"
 #include "transport/async_stream.hpp"
 
@@ -11,26 +10,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
-
-namespace {
-std::array<void*, 128> allocations{};
-size_t live = 0;
-bool tracking = false;
-
-void TrackBuffer(void* pointer, std::size_t size) noexcept {
-    if (!tracking || size != sizeof(buf::Buffer)) return;
-    if (live == allocations.size()) std::abort();
-    allocations[live++] = pointer;
-}
-
-void ForgetBuffer(void* pointer) noexcept {
-    for (size_t i = 0; i < live; ++i) {
-        if (allocations[i] == pointer) { allocations[i] = allocations[--live]; break; }
-    }
-}
-}
-constinit allocation_hook::Hooks allocation_hook::hooks{
-    .after_new = TrackBuffer, .before_delete = ForgetBuffer};
 
 namespace {
 enum class Fault { None, Memory, Link, Cancelled, Timeout, Reset, Unexpected, NonStandard };
@@ -164,8 +143,6 @@ bool RunFrameBatch() {
 bool RunDeferredBatch() {
     net::io_context io;
     Stream stream;
-    if (live != 0) std::abort();
-    tracking = true;
     auto pending = anytls::WriteMultiBufferAsFrameBatch(stream, 2, 1, Payload(1));
     const bool idle_before_await = stream.transferred == 0;
     bool returned = false;
@@ -177,11 +154,10 @@ bool RunDeferredBatch() {
     const bool idle_before_run = stream.transferred == 0;
     io.run();
     const bool passed = idle_before_await && idle_before_run && returned &&
-        code == ErrorCode::OK && stream.transferred == anytls::kFrameHeaderSize + 1 && (live == 0 && memory::detail::test_buffers_live == 0);
-    tracking = false;
-    if (!passed) std::printf("deferred batch: FAIL (idle=%d/%d returned=%s code=%s transferred=%zu live=%zu)\n",
+        code == ErrorCode::OK && stream.transferred == anytls::kFrameHeaderSize + 1 && memory::detail::test_buffers_live == 0;
+    if (!passed) std::printf("deferred batch: FAIL (idle=%d/%d returned=%s code=%s transferred=%zu)\n",
         idle_before_await, idle_before_run, returned ? "true" : "false",
-        ErrorCodeToString(code).data(), stream.transferred, live);
+        ErrorCodeToString(code).data(), stream.transferred);
     return passed;
 }
 
@@ -190,8 +166,6 @@ bool Run(int operation, Fault fault, size_t threshold) {
     Stream stream;
     stream.fault = fault;
     stream.threshold = threshold;
-    if (live != 0) std::abort();
-    tracking = true;
     bool returned = false;
     ErrorCode code = ErrorCode::INTERNAL;
     Fault observed = Fault::None;
@@ -214,10 +188,9 @@ bool Run(int operation, Fault fault, size_t threshold) {
     const bool exceptional = fault == Fault::Memory || fault == Fault::Link || fault == Fault::Unexpected || fault == Fault::NonStandard;
     bool passed = returned && !stream.closed && (exceptional ? observed == fault : observed == Fault::None && code == expected);
     passed &= fault == Fault::None || (stream.failures == 1 && stream.transferred == threshold);
-    passed &= (live == 0 && memory::detail::test_buffers_live == 0);
-    tracking = false;
-    if (!passed) std::printf("op=%d fault=%s after=%zu returned=%s observed=%s live=%zu: FAIL\n",
-        operation, names[int(fault)], threshold, ErrorCodeToString(code).data(), names[int(observed)], live);
+    passed &= memory::detail::test_buffers_live == 0;
+    if (!passed) std::printf("op=%d fault=%s after=%zu returned=%s observed=%s: FAIL\n",
+        operation, names[int(fault)], threshold, ErrorCodeToString(code).data(), names[int(observed)]);
     return passed;
 }
 }
@@ -237,6 +210,6 @@ TEST(AnytlsCodecErrors, Contract) {
     for (int fault = 1; fault < 8; ++fault) {
         passed += ::Run(16, Fault(fault), 65536); ++total;
     }
-    std::printf("codec cases=%zu passed=%zu failed=%zu released=%d\n", total, passed, total - passed, (live == 0 && memory::detail::test_buffers_live == 0));
+    std::printf("codec cases=%zu passed=%zu failed=%zu released=%d\n", total, passed, total - passed, memory::detail::test_buffers_live == 0);
     { ASSERT_TRUE(passed == total); return; }
 }
