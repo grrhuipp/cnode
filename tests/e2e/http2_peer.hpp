@@ -24,9 +24,6 @@ inline constexpr std::string_view Preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 inline const std::string Ready = "ready", Echo = "other-stream-alive", Request = "request!";
 inline const std::string Response = std::string(2, '\0') + Ready;
 using Clock = std::chrono::steady_clock;
-inline void Require(bool value, std::string_view message) {
-    if (!value) throw std::runtime_error(std::string(message));
-}
 inline std::string Varint(uint64_t value) {
     std::string out;
     while (value >= 128) { out += static_cast<char>((value & 127) | 128); value >>= 7; }
@@ -269,7 +266,6 @@ inline std::string ReadAll(Socket& socket, Milliseconds timeout = 5s) {
     auto deadline = Clock::now() + timeout; std::string result;
     for (;;) { Require(Clock::now() < deadline, "EOF deadline"); auto data = socket.Read(65536, std::chrono::duration_cast<Milliseconds>(deadline - Clock::now())); if (data.empty()) return result; result += data; }
 }
-inline std::string Pattern(size_t length) { std::string out(length, '\0'); for (size_t i = 0; i < length; ++i) out[i] = static_cast<char>(i % 251); return out; }
 inline void H1Packet(uint16_t port, bool tls, std::string_view session, unsigned sequence, std::string_view payload, std::string_view source = {}) {
     Wire wire(port, tls, source, false);
     wire.Write("POST /fixture/" + std::string(session) + "/" + std::to_string(sequence) + " HTTP/1.1\r\nHost: localhost\r\nContent-Length: " + std::to_string(payload.size()) + "\r\nConnection: close\r\n\r\n" + std::string(payload));
@@ -285,6 +281,4 @@ public:
         auto out = pending_.substr(0, count); pending_.erase(0, count); return out;
     }
 };
-inline std::string Hex(size_t value) { constexpr char digits[] = "0123456789abcdef"; std::string out; do { out += digits[value & 15]; value >>= 4; } while (value); std::reverse(out.begin(), out.end()); return out; }
-inline std::string Chunk(std::string_view bytes) { return Hex(bytes.size()) + "\r\n" + std::string(bytes) + "\r\n"; }
 } // namespace cnode::e2e::http2

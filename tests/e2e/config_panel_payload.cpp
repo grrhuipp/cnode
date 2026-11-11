@@ -1,21 +1,11 @@
 #include "config_panel_common.hpp"
 
-#include <openssl/sha.h>
 #include <tuple>
 
 namespace cnode::e2e::config_panel {
 namespace {
 constexpr std::string_view Password = "MiXeD-Secret_42";
 constexpr std::string_view Banner = "initial-payload-peer-ready";
-std::string Sha224Hex(std::string_view text) {
-    unsigned char digest[SHA224_DIGEST_LENGTH];
-    SHA224(reinterpret_cast<const unsigned char*>(text.data()), text.size(), digest);
-    constexpr char digits[] = "0123456789abcdef";
-    std::string result;
-    result.reserve(2 * sizeof(digest));
-    for (const auto byte : digest) { result += digits[byte >> 4]; result += digits[byte & 15]; }
-    return result;
-}
 using PayloadCase = std::tuple<std::string, size_t, bool>;
 class InitialPayload : public testing::TestWithParam<PayloadCase> {};
 TEST_P(InitialPayload, PreservesAuthenticationTargetServerFirstGreetingAndByteOrder) {

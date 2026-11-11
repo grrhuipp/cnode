@@ -13,9 +13,6 @@
 #include <system_error>
 
 namespace cnode::e2e::tls {
-inline void Require(bool condition, std::string_view message) {
-    if (!condition) throw std::runtime_error(std::string(message));
-}
 inline Json Inbound(uint16_t port, Json stream = Json::object()) {
     return {{"tag", "in"}, {"protocol", "vless"}, {"listen", "127.0.0.1"}, {"port", port},
             {"outboundTag", "direct"}, {"settings", {{"clients", {{{"id", UserId}}}}}},
@@ -53,11 +50,7 @@ inline std::string Auth() {
     return std::string(reinterpret_cast<const char*>(hash.data()), hash.size()) + std::string(2, '\0') + AnyTlsFrame(4, 0, "v=2");
 }
 inline std::string TrojanRequest(std::string_view payload) {
-    std::array<unsigned char, SHA224_DIGEST_LENGTH> hash{};
-    SHA224(reinterpret_cast<const unsigned char*>("secret"), 6, hash.data());
-    std::string hex;
-    for (auto c : hash) { hex += "0123456789abcdef"[c >> 4]; hex += "0123456789abcdef"[c & 15]; }
-    return hex + "\r\n\1" + SocksAddress(443) + "\r\n" + std::string(payload);
+    return Sha224Hex("secret") + "\r\n\1" + SocksAddress(443) + "\r\n" + std::string(payload);
 }
 
 // Memory BIOs keep TLS record boundaries under test control while all plaintext

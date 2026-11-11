@@ -51,8 +51,7 @@ TEST_P(QuicInputCredit, RetiredRequestCannotExhaustUnrelatedStreams) {
 
     const size_t rounds = client_reset ? 272 : 40;
     const size_t size = client_reset ? 64 * 1024 : 768 * 1024;
-    std::string payload(size, '\0');
-    for (size_t i = 0; i < payload.size(); ++i) payload[i] = static_cast<char>(i % 251);
+    const std::string payload = Pattern(size);
     for (size_t round = 0; round < rounds; ++round) {
         try {
             if (!client_reset) dns.Hold();
@@ -129,8 +128,7 @@ TEST(QuicInputCredit, NormalFinKeepsConnectionReusableBeyondItsInitialWindow) {
     server.WaitForLog("server started");
     Peer peer(port);
     const std::string address = "127.0.0.1:" + std::to_string(target.Port());
-    std::string payload(2 * 1024 * 1024, '\0');
-    for (size_t i = 0; i < payload.size(); ++i) payload[i] = static_cast<char>(i % 251);
+    const std::string payload = Pattern(2 * 1024 * 1024);
     for (size_t round = 0; round < 9; ++round) {
         const auto stream = peer.Open(address);
         peer.Send(stream, payload, true);
@@ -151,8 +149,7 @@ enum class OutputEnd { Resume, Reset, Shutdown };
 void FinishBackpressuredWriter(OutputEnd ending) {
     TempDir root;
     constexpr size_t ReceiveWindow = 16 * 1024;
-    std::string payload(2 * 1024 * 1024, '\0');
-    for (size_t i = 0; i < payload.size(); ++i) payload[i] = static_cast<char>(i % 251);
+    const std::string payload = Pattern(2 * 1024 * 1024);
     std::atomic<bool> exact_uplink = false;
     std::atomic<bool> target_closed = false;
     Targets target([&](Socket& socket) {

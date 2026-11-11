@@ -48,7 +48,7 @@ TEST_P(Http2H1Deadline, IncompleteProxyExpiresButActiveTransportOutlivesHandshak
         else H1Packet(node.port, false, "active", sequence, data);
     };
     auto start = Clock::now(); send(0, VlessRequest(target.Port(), Ready));
-    if (upload) upload->Write(Hex(Echo.size()).substr(0, 1));
+    if (upload) upload->Write(HexSize(Echo.size()).substr(0, 1));
     EXPECT_EQ(chunks.Exact(Response.size()), Response);
     unsigned sequence = 1;
     while (Clock::now() - start < 2200ms) { std::this_thread::sleep_for(100ms); send(sequence++, Echo); EXPECT_EQ(chunks.Exact(Echo.size()), Echo); }

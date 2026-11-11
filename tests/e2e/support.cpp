@@ -683,6 +683,40 @@ void PeerThread::Join() {
     if (auto error = std::exchange(error_, nullptr)) std::rethrow_exception(error);
 }
 
+void Require(bool condition, std::string_view message) {
+    if (!condition) throw std::runtime_error(std::string(message));
+}
+std::string Pattern(size_t size) {
+    std::string bytes(size, '\0');
+    for (size_t index = 0; index < size; ++index) bytes[index] = static_cast<char>(index % 251);
+    return bytes;
+}
+std::string HexBytes(std::string_view bytes) {
+    constexpr char digits[] = "0123456789abcdef";
+    std::string result;
+    result.reserve(bytes.size() * 2);
+    for (const unsigned char byte : bytes) {
+        result += digits[byte >> 4];
+        result += digits[byte & 15];
+    }
+    return result;
+}
+std::string HexSize(size_t value) {
+    constexpr char digits[] = "0123456789abcdef";
+    std::string result;
+    do {
+        result += digits[value & 15];
+        value >>= 4;
+    } while (value);
+    std::reverse(result.begin(), result.end());
+    return result;
+}
+std::string Chunk(std::string_view bytes) { return HexSize(bytes.size()) + "\r\n" + std::string(bytes) + "\r\n"; }
+std::string Sha224Hex(std::string_view text) {
+    std::array<unsigned char, SHA224_DIGEST_LENGTH> digest{};
+    SHA224(reinterpret_cast<const unsigned char*>(text.data()), text.size(), digest.data());
+    return HexBytes({reinterpret_cast<const char*>(digest.data()), digest.size()});
+}
 std::string BigEndian(uint64_t value, size_t width) {
     if (width > sizeof(value)) throw std::invalid_argument("integer wire width exceeds 64 bits");
     std::string result(width, '\0');

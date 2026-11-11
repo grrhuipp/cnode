@@ -15,8 +15,6 @@
 #include <stdexcept>
 
 namespace cnode::e2e::sessions {
-inline void Require(bool value, std::string_view reason) { if (!value) throw std::runtime_error(std::string(reason)); }
-inline std::string Pattern(size_t size) { std::string out(size, '\0'); for (size_t i=0;i<size;++i) out[i]=static_cast<char>(i%251); return out; }
 inline bool Ready(int fd, Milliseconds timeout) {
     pollfd p{fd,POLLIN,0}; int result;
     do { result=::poll(&p,1,static_cast<int>(timeout.count())); } while(result<0 && errno==EINTR);

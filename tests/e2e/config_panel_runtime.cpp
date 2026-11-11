@@ -1,5 +1,5 @@
 #include "config_panel_common.hpp"
-#include "../panel_http_fixture.hpp"
+#include "panel_http_fixture.hpp"
 
 #include <ctime>
 #include <iomanip>

@@ -202,6 +202,17 @@ public:
 };
 
 inline constexpr std::string_view UserId = "b831381d-6324-4d53-ad4f-8cda48b30811";
+// 夹具与对端线程里的前置条件：失败即抛异常，由 PeerThread::Join 或 gtest 主线程报告。
+void Require(bool condition, std::string_view message);
+// 确定性载荷：第 i 字节为 i % 251，跨分片边界仍可逐字节核对。
+std::string Pattern(size_t size);
+// 小写十六进制：HexBytes 逐字节编码，HexSize 是无前导零的数值（HTTP chunk 长度行）。
+std::string HexBytes(std::string_view bytes);
+std::string HexSize(size_t value);
+// HTTP/1.1 chunked 编码的一个分块。
+std::string Chunk(std::string_view bytes);
+// Trojan 密码键：SHA-224 的小写十六进制。
+std::string Sha224Hex(std::string_view text);
 std::string UuidBytes(std::string_view uuid = UserId);
 std::string VlessRequest(uint16_t port, std::string_view payload = {}, uint8_t command = 1,
                          std::string_view host = "127.0.0.1", std::string_view user = UserId);
