@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include "allocation_hook.hpp"
 #include "transport/internet/timeout_scheduler.hpp"
 #include "transport/internet/async_delay.hpp"
 #include "app/session_group_executor.hpp"
@@ -19,6 +20,7 @@
 #include <future>
 #include <functional>
 #include <memory>
+#include <new>
 #include <optional>
 #include <stdexcept>
 #include <thread>
@@ -26,6 +28,19 @@
 #include <vector>
 #include <sys/eventfd.h>
 #include <unistd.h>
+
+namespace {
+void FailTimeoutAllocation(std::size_t) {
+    if (timeout_allocation_test::reject_allocations ||
+        (timeout_allocation_test::fail_after >= 0 &&
+         timeout_allocation_test::fail_after-- == 0)) {
+        ++timeout_allocation_test::rejected_allocations;
+        throw std::bad_alloc();
+    }
+}
+}  // namespace
+
+constinit allocation_hook::Hooks allocation_hook::hooks{.before_new = FailTimeoutAllocation};
 
 namespace {
 using namespace std::chrono_literals;

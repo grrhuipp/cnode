@@ -1,6 +1,7 @@
 #include <stdexcept>
 #include <gtest/gtest.h>
 
+#include "allocation_hook.hpp"
 #include "http2_session.hpp"
 
 #include <algorithm>
@@ -32,32 +33,27 @@ void Forget(void* pointer) noexcept {
         break;
     }
 }
+
+void Measure(std::size_t size) {
+    if (!measuring) return;
+    largest = std::max(largest, size);
+    allocated += size;
+    if (size > allocation_limit) { ++denied; throw std::bad_alloc(); }
+}
+
+void TrackLarge(void* pointer, std::size_t size) noexcept {
+    if (!measuring || size <= 4096) return;
+    for (auto& item : tracked) if (!item.pointer) {
+        item = {pointer, size}; live_large += size;
+        peak_large = std::max(peak_large, live_large);
+        return;
+    }
+    std::abort();
+}
 }  // namespace
 
-void* operator new(size_t size) {
-    if (measuring) {
-        largest = std::max(largest, size);
-        allocated += size;
-        if (size > allocation_limit) { ++denied; throw std::bad_alloc(); }
-    }
-    void* pointer = std::malloc(size ? size : 1);
-    if (!pointer) throw std::bad_alloc();
-    if (measuring && size > 4096) {
-        for (auto& item : tracked) if (!item.pointer) {
-            item = {pointer, size}; live_large += size;
-            peak_large = std::max(peak_large, live_large);
-            return pointer;
-        }
-        std::abort();
-    }
-    return pointer;
-}
-void operator delete(void* pointer) noexcept { Forget(pointer); std::free(pointer); }
-void operator delete(void* pointer, size_t) noexcept { ::operator delete(pointer); }
-void* operator new(size_t size, const std::nothrow_t&) noexcept {
-    try { return ::operator new(size); } catch (...) { return nullptr; }
-}
-void operator delete(void* pointer, const std::nothrow_t&) noexcept { ::operator delete(pointer); }
+constinit allocation_hook::Hooks allocation_hook::hooks{
+    .before_new = Measure, .after_new = TrackLarge, .before_delete = Forget};
 
 namespace {
 using Bytes = std::vector<uint8_t>;

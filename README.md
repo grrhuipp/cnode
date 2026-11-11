@@ -20,7 +20,7 @@ cnode 是面向 V2Board 面板的高性能 Linux 代理节点服务端。项目�
 
 ## 构建与测试
 
-仅构建 Linux x86-64 musl 全静态程序，使用 C++20。自有编译与测试规则集中在根 `CMakeLists.txt`；`mise.toml` 管理 CMake、Ninja、ccache 和带 SHA256 校验的 LLVM musl 工具链。依赖、版本基线和 overlay 入口统一放在 `vcpkg.json`；BoringSSL 提供 TLS/QUIC 密码实现，overlay 保留 REALITY 与 VMess 所需接口补丁。`cmake/` 仅保留 vcpkg 配方、补丁、triplet 和 musl 工具链。
+仅构建 Linux x86-64 musl 全静态程序，使用 C++20。自有编译与测试规则集中在根 `CMakeLists.txt`；`mise.toml` 管理 CMake、Ninja、ccache 和带 SHA256 校验的 LLVM musl 工具链。依赖和 overlay 入口统一放在 `vcpkg.json`，不设版本基线或固定版本覆盖：`mise run bootstrap`（`configure` 前自动执行）把 `build/vcpkg` 更新到上游最新提交，依赖使用其中的最新端口；设置 `CNODE_VCPKG_COMMIT` 可改用指定提交。BoringSSL 提供 TLS/QUIC 密码实现，overlay 保留 REALITY 与 VMess 所需接口补丁。`cmake/` 仅保留 vcpkg 配方、补丁、triplet 和 musl 工具链。
 
 以下命令适用于 Linux x86-64、Bash。先安装 [mise](https://mise.jdx.dev/getting-started.html)，以及宿主工具（Debian/Ubuntu）：
 
@@ -91,9 +91,9 @@ mise exec -- ctest --test-dir build/musl --no-tests=error \
   -R '^e2e\.reference_hysteria\..*/V2_' -V
 ```
 
-本地与 CI 使用同一份 mise 固定工具链、vcpkg 依赖基线和配置入口，均为 `Release`；本地默认关闭 LTO（`CNODE_ENABLE_LTO=OFF`），仅 CI 开启 LTO（`-DCNODE_ENABLE_LTO=ON`）；测试配置统一运行 `mise run test:configure`。宿主发行版无需相同，不要求容器。CTest 使用不指定数量的 `--parallel`，按可用 CPU 自动调度。
+本地与 CI 使用同一份 mise 固定工具链和配置入口，均为 `Release`；vcpkg 跟随上游最新提交，CI 每次运行先解析一次最新提交，再供引导与缓存键共用。本地默认关闭 LTO（`CNODE_ENABLE_LTO=OFF`），仅 CI 开启 LTO（`-DCNODE_ENABLE_LTO=ON`）；测试配置统一运行 `mise run test:configure`。宿主发行版无需相同，不要求容器。CTest 使用不指定数量的 `--parallel`，按可用 CPU 自动调度。
 
-CI 只对源码、测试、构建配置变更自动运行，纯文档和部署脚本变更不触发编译；也可手动运行。不设置工作流级并发分组，不同提交可同时运行。`build` job 复用同一构建树，`verify` 步骤统一执行单元、E2E 与静态 ELF 检查。vcpkg 缓存按依赖配置保存、ccache 按提交增量保存，两者在对应阶段成功后立即保存，不因后续测试失败丢失。仅分支 push 在验证通过后打包，`release` job 的 `publish` 步骤下载并发布产物；PR 和手动运行只验证。
+CI 只对源码、测试、构建配置变更自动运行，纯文档和部署脚本变更不触发编译；也可手动运行。不设置工作流级并发分组，不同提交可同时运行。`build` job 复用同一构建树，`verify` 步骤统一执行单元、E2E 与静态 ELF 检查。vcpkg 缓存按 vcpkg 提交与依赖配置保存、ccache 按提交增量保存，两者在对应阶段成功后立即保存，不因后续测试失败丢失。仅分支 push 在验证通过后打包，`release` job 的 `publish` 步骤下载并发布产物；PR 和手动运行只验证。
 
 ## 架构总览
 

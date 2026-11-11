@@ -1,10 +1,10 @@
 #include <gtest/gtest.h>
 
+#include "allocation_hook.hpp"
 #include "common/session.hpp"
 
 #include <asio/ip/address.hpp>
 
-#include <cstdlib>
 #include <iostream>
 #include <new>
 #include <stdexcept>
@@ -22,15 +22,13 @@ void Expect(bool condition, std::string_view message) {
 bool Has(std::string_view text, std::string_view field) {
     return text.find(field) != std::string_view::npos;
 }
+
+void CountAllocation(std::size_t) {
+    if (count_allocations) ++allocations;
+}
 }  // namespace
 
-void* operator new(std::size_t n) {
-    if (count_allocations) ++allocations;
-    if (void* p = std::malloc(n ? n : 1)) return p;
-    throw std::bad_alloc();
-}
-void operator delete(void* p) noexcept { std::free(p); }
-void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+constinit allocation_hook::Hooks allocation_hook::hooks{.before_new = CountAllocation};
 
 TEST(SessionAccessLog, Contract) {
     try {
