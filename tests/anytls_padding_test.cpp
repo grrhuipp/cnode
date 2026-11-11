@@ -1,11 +1,11 @@
 #include <gtest/gtest.h>
 
+#include "allocation_hook.hpp"
 #include "proxy/anytls_padding.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cstdio>
-#include <cstdlib>
 #include <new>
 #include <string_view>
 #include <string>
@@ -22,26 +22,19 @@ void Check(bool value, const char* name) {
     ++checks;
     if (!value) { ++failures; std::printf("padding-policy FAIL: %s\n", name); }
 }
+
+void MeasurePaddingAllocation(std::size_t size) {
+    if (!measuring) return;
+    largest_request = std::max(largest_request, size);
+    total_requested += size;
+    if (size > kAllocationLimit) {
+        ++rejected_requests;
+        throw std::bad_alloc();
+    }
+}
 }
 
-void* operator new(std::size_t size) {
-    if (measuring) {
-        largest_request = std::max(largest_request, size);
-        total_requested += size;
-        if (size > kAllocationLimit) {
-            ++rejected_requests;
-            throw std::bad_alloc();
-        }
-    }
-    if (void* result = std::malloc(size ? size : 1)) return result;
-    throw std::bad_alloc();
-}
-void operator delete(void* value) noexcept { std::free(value); }
-void operator delete(void* value, std::size_t) noexcept { ::operator delete(value); }
-void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
-    try { return ::operator new(size); } catch (...) { return nullptr; }
-}
-void operator delete(void* value, const std::nothrow_t&) noexcept { ::operator delete(value); }
+constinit allocation_hook::Hooks allocation_hook::hooks{.before_new = MeasurePaddingAllocation};
 
 TEST(AnytlsPadding, Contract) {
     (void)::anytls::DefaultPaddingScheme();

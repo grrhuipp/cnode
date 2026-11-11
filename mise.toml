@@ -14,18 +14,15 @@ CCACHE_COMPILERCHECK = "content"
 CCACHE_SLOPPINESS = "pch_defines,time_macros"
 
 [tasks.bootstrap]
-description = "准备 manifest 固定版本的 vcpkg（不安装项目依赖）"
+description = "将 vcpkg 更新到上游最新提交（CNODE_VCPKG_COMMIT 可指定解析好的提交；不安装项目依赖）"
 run = '''
 set -eu
-commit="$(jq -er '."builtin-baseline"' vcpkg.json)"
 mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
 if [ ! -d "$VCPKG_ROOT/.git" ]; then
     git clone --filter=blob:none --no-checkout https://github.com/microsoft/vcpkg.git "$VCPKG_ROOT"
 fi
-if [ "$(git -C "$VCPKG_ROOT" rev-parse HEAD 2>/dev/null || true)" != "$commit" ]; then
-    git -C "$VCPKG_ROOT" fetch origin "$commit"
-fi
-git -C "$VCPKG_ROOT" checkout --detach "$commit"
+git -C "$VCPKG_ROOT" fetch origin "${CNODE_VCPKG_COMMIT:-master}"
+git -C "$VCPKG_ROOT" checkout --detach FETCH_HEAD
 "$VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics
 '''
 
