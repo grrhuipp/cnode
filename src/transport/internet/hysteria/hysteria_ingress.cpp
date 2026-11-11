@@ -19,6 +19,7 @@
 #include "../../../proxy/inbound_admission.hpp"
 #include "../../../common/awaitable_task_group.hpp"
 #include "../../../app/worker/udp_receive_loop.hpp"
+#include "transport/internet/datagram_socket.hpp"
 
 #include <nghttp3/nghttp3.h>
 #include <ngtcp2/ngtcp2.h>
@@ -1791,15 +1792,18 @@ net::awaitable<void> HysteriaIngress::ReceiveLoop(std::shared_ptr<SocketState> s
         if (wait_error) continue;
         try {
             IoErrorCode error;
-            const size_t available = socket->socket->available(error);
-            if (error || available == 0 || available > kMaxPacketSize) {
+            const size_t datagram_size = PeekDatagramSize(*socket->socket, error);
+            // A probe error is either an empty queue or a pending socket error
+            // that the probe has already reported and cleared.
+            if (error) continue;
+            if (datagram_size == 0 || datagram_size > kMaxPacketSize) {
                 std::array<uint8_t, 1> discard{};
                 (void)socket->socket->receive_from(
                     net::buffer(discard), socket->remote, 0, error);
                 if (error == net::error::operation_aborted) co_return;
                 continue;
             }
-            const auto storage = receive_buffer.Prepare(available);
+            const auto storage = receive_buffer.Prepare(datagram_size);
             if (storage.size() == 0) {
                 std::array<uint8_t, 1> discard{};
                 (void)socket->socket->receive_from(

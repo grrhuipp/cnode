@@ -105,4 +105,14 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+// Length of the datagram at the head of `socket`'s receive queue, probed with a
+// non-consuming recv(MSG_PEEK | MSG_TRUNC | MSG_DONTWAIT); `error` is
+// would_block when the queue is empty, and a pending socket error (e.g. an ICMP
+// port unreachable) is reported and cleared like a receive would. Unlike
+// FIONREAD (socket.available()), it tells an empty queue from a zero-length
+// datagram, so a receive sized by it cannot truncate a datagram that arrived
+// after the probe. The owning Worker is the socket's only reader, so the
+// probed datagram is still the head at the following receive.
+[[nodiscard]] std::size_t PeekDatagramSize(udp::socket& socket, IoErrorCode& error) noexcept;
+
 }  // namespace transport::internet

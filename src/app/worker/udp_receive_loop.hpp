@@ -3,6 +3,7 @@
 #include "common/allocator.hpp"
 #include "common/asio_types.hpp"
 #include "common/buf/multi_buffer.hpp"
+#include "transport/internet/datagram_socket.hpp"
 
 #include <asio/as_tuple.hpp>
 #include <asio/use_awaitable.hpp>
@@ -132,20 +133,21 @@ net::awaitable<void> RunUdpReceiveLoop(
                 receive_buffer.Release();
                 co_return;
             }
-            IoErrorCode available_error;
-            const size_t available = socket->available(available_error);
-            if (available_error) {
-                if (available_error == io_error::would_block ||
-                    available_error == io_error::try_again) {
+            IoErrorCode probe_error;
+            const size_t datagram_size =
+                transport::internet::PeekDatagramSize(*socket, probe_error);
+            if (probe_error) {
+                if (probe_error == io_error::would_block ||
+                    probe_error == io_error::try_again) {
                     break;
                 }
-                if (IsTransientReceiveError(available_error)) {
+                if (IsTransientReceiveError(probe_error)) {
                     continue;
                 }
-                throw IoSystemError(available_error);
+                throw IoSystemError(probe_error);
             }
 
-            const auto storage = receive_buffer.Prepare(available);
+            const auto storage = receive_buffer.Prepare(datagram_size);
             if (storage.size() == 0) {
                 udp::endpoint discarded_peer;
                 std::array<uint8_t, 1> discard_byte{};

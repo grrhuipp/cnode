@@ -17,6 +17,9 @@
 #include <new>
 #include <utility>
 
+#include <cerrno>
+#include <sys/socket.h>
+
 namespace transport::internet {
 namespace {
 constexpr std::size_t kMaxActiveSockets = 4096;
@@ -56,6 +59,20 @@ void ValidateBuffers(
     }
 }
 }  // namespace
+
+std::size_t PeekDatagramSize(udp::socket& socket, IoErrorCode& error) noexcept {
+    for (;;) {
+        const ssize_t size = ::recv(
+            socket.native_handle(), nullptr, 0, MSG_PEEK | MSG_TRUNC | MSG_DONTWAIT);
+        if (size >= 0) {
+            error.clear();
+            return static_cast<std::size_t>(size);
+        }
+        if (errno == EINTR) continue;
+        error = IoErrorCode(errno, io_error::get_system_category());
+        return 0;
+    }
+}
 
 struct DatagramSocket::Impl final : memory::WorkerAllocated {
     using Timeouts = detail::ConnectionTimeouts<Impl>;
@@ -187,13 +204,17 @@ net::awaitable<ReceivedDatagram> DatagramSocket::Impl::Receive(ReadOperation& op
             fresh_wait = true;
         }
 
-        IoErrorCode available_ec;
-        const std::size_t available = socket.available(available_ec);
-        if (available_ec) {
+        IoErrorCode probe_ec;
+        const std::size_t datagram_size = PeekDatagramSize(socket, probe_ec);
+        if (probe_ec == io_error::would_block || probe_ec == io_error::try_again) {
             read_drain_budget = 0;
-            throw IoSystemError(available_ec);
+            continue;
         }
-        const std::size_t wanted = std::clamp<std::size_t>(available, 1, kMaxDatagramBytes);
+        if (probe_ec) {
+            read_drain_budget = 0;
+            throw IoSystemError(probe_ec);
+        }
+        const std::size_t wanted = std::clamp<std::size_t>(datagram_size, 1, kMaxDatagramBytes);
         const std::size_t count = (wanted + buf::Buffer::kSize - 1) / buf::Buffer::kSize;
 
         std::array<buf::BufferGuard, kMaxReceiveBuffers> guards;
@@ -210,8 +231,8 @@ net::awaitable<ReceivedDatagram> DatagramSocket::Impl::Receive(ReadOperation& op
         udp::endpoint source;
         IoErrorCode receive_ec;
         // MSG_TRUNC makes Linux return the full datagram length, so a datagram
-        // larger than the buffers (e.g. after a discarded one changed what
-        // available() measured) is detected and dropped, never forwarded cut.
+        // larger than kMaxDatagramBytes is detected and dropped, never
+        // forwarded cut.
         const std::size_t received = socket.receive_from(
             std::span<net::mutable_buffer>(buffers.data(), count), source,
             MSG_TRUNC, receive_ec);

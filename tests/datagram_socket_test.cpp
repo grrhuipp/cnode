@@ -395,3 +395,30 @@ TEST(DatagramSocket, CancelledWriteDoesNotSend) {
         EXPECT_TRUE(error == ::io_error::would_block || error == ::io_error::try_again);
     }
 }
+
+TEST(DatagramSocket, PeekDatagramSizeReportsHeadWithoutConsuming) {
+    ::net::io_context io;
+    ::udp::socket receiver(io, {::net::ip::address_v4::loopback(), 0});
+    ::udp::socket sender(io, ::udp::v4());
+    receiver.non_blocking(true);
+    ::IoErrorCode error;
+    EXPECT_EQ(::transport::internet::PeekDatagramSize(receiver, error), 0u);
+    // The empty-queue code must match the asio enum receive paths compare with.
+    EXPECT_TRUE(error == ::io_error::would_block || error == ::io_error::try_again);
+
+    const std::vector<uint8_t> large(19999, 0x5a);
+    sender.send_to(::net::buffer(large), receiver.local_endpoint());
+    sender.send_to(::net::const_buffer{}, receiver.local_endpoint());
+    std::vector<uint8_t> received(65536);
+    ::udp::endpoint source;
+    EXPECT_EQ(::transport::internet::PeekDatagramSize(receiver, error), large.size());
+    EXPECT_FALSE(error);
+    EXPECT_EQ(::transport::internet::PeekDatagramSize(receiver, error), large.size());
+    EXPECT_EQ(receiver.receive_from(::net::buffer(received), source), large.size());
+    // A zero-length datagram is a real datagram, not an empty queue.
+    EXPECT_EQ(::transport::internet::PeekDatagramSize(receiver, error), 0u);
+    EXPECT_FALSE(error);
+    EXPECT_EQ(receiver.receive_from(::net::buffer(received), source), 0u);
+    (void)::transport::internet::PeekDatagramSize(receiver, error);
+    EXPECT_TRUE(error == ::io_error::would_block || error == ::io_error::try_again);
+}
