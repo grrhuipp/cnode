@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "../src/transport/internet/connection_timeouts.hpp"
+#include "transport/internet/connection_timeouts.hpp"
 
 #include <chrono>
 #include <cstdio>

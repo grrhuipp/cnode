@@ -1,7 +1,7 @@
 #include <stdexcept>
 #include <gtest/gtest.h>
 
-#include "node_transaction.hpp"
+#include "service/controller/node_transaction.hpp"
 
 #include <cstdlib>
 #include <iostream>

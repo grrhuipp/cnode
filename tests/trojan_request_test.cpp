@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "trojan_codec.hpp"
+#include "proxy/trojan/trojan_codec.hpp"
 
 #include <algorithm>
 #include <array>

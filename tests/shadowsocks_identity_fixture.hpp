@@ -1,8 +1,8 @@
 #pragma once
 
 #include "app/proxyman/inbound/user_store.hpp"
-#include "ss_udp.hpp"
-#include "shadowsocks_protocol.hpp"
+#include "proxy/shadowsocks/ss_udp.hpp"
+#include "proxy/shadowsocks/shadowsocks_protocol.hpp"
 #include <asio/co_spawn.hpp>
 #include <asio/use_future.hpp>
 #include <algorithm>

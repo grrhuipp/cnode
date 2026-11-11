@@ -1,7 +1,7 @@
 #include <stdexcept>
 #include <gtest/gtest.h>
 
-#include "http2_session.hpp"
+#include "transport/internet/http2_session.hpp"
 
 #include <algorithm>
 #include <array>

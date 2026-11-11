@@ -1,7 +1,7 @@
 #include "shadowsocks_identity_fixture.hpp"
 #include "benchmark_memory.hpp"
 #include "common/allocator.hpp"
-#include "ss_udp.hpp"
+#include "proxy/shadowsocks/ss_udp.hpp"
 
 #include <gtest/gtest.h>
 #include <algorithm>

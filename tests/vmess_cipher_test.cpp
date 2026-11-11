@@ -1,7 +1,7 @@
 #include <stdexcept>
 #include <gtest/gtest.h>
 
-#include "vmess_crypto.hpp"
+#include "proxy/vmess/vmess_crypto.hpp"
 
 #include <algorithm>
 #include <array>

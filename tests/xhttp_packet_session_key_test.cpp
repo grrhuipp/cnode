@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "xhttp_session.hpp"
+#include "transport/internet/xhttp_session.hpp"
 
 #include <cstdlib>
 #include <unordered_map>

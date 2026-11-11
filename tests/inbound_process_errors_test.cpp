@@ -7,8 +7,8 @@
 #include "common/session.hpp"
 #include "transport/internet/tls_stream.hpp"
 #include "transport/internet/transport_stack.hpp"
-#include "anytls_codec.hpp"
-#include "../src/common/awaitable_task_group.hpp"
+#include "proxy/anytls/anytls_codec.hpp"
+#include "common/awaitable_task_group.hpp"
 
 #include <asio/co_spawn.hpp>
 #include <asio/post.hpp>

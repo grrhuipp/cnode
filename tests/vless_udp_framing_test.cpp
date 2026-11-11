@@ -1,7 +1,7 @@
 #include <stdexcept>
 #include <gtest/gtest.h>
 
-#include "vless_codec.hpp"
+#include "proxy/vless/vless_codec.hpp"
 #include "common/buf/length_prefixed_packet_buffer.hpp"
 #include "transport/internet/tcp_stream.hpp"
 

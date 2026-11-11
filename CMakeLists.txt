@@ -23,18 +23,16 @@ endif()
 option(CNODE_ENABLE_LTO "Enable Release link-time optimization" OFF)
 option(CNODE_RELEASE_DEBUG_SYMBOLS "Emit Release debug information for split symbols" ON)
 option(CNODE_RELEASE_FRAME_POINTERS "Keep Release frame pointers for profiling" ON)
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ${CNODE_ENABLE_LTO})
 
 add_library(cnode_build_options INTERFACE)
 target_compile_features(cnode_build_options INTERFACE cxx_std_20)
-target_include_directories(cnode_build_options INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_include_directories(cnode_build_options INTERFACE
+    "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_compile_options(cnode_build_options INTERFACE
     -Wall -Wextra -Wpedantic -Wno-unused-parameter -Wno-mismatched-new-delete
-    "$<$<CXX_COMPILER_ID:GNU>:-Wno-stringop-overread;-Wno-free-nonheap-object>"
     "$<$<AND:$<CONFIG:Release>,$<BOOL:${CNODE_RELEASE_DEBUG_SYMBOLS}>>:-g>"
     "$<$<AND:$<CONFIG:Release>,$<BOOL:${CNODE_RELEASE_FRAME_POINTERS}>>:-fno-omit-frame-pointer>")
 # Allocation reuse belongs to mimalloc alone: Asio's per-thread handler and
@@ -203,168 +201,69 @@ find_package(GTest CONFIG REQUIRED)
 include(GoogleTest)
 add_custom_target(cnode_tests DEPENDS cnode)
 
+# 单元测试、E2E 与基准共用的测试编译选项：Release 下断言同样生效，夹具从源码树读取。
+add_library(cnode_test_options INTERFACE)
+target_compile_options(cnode_test_options INTERFACE -UNDEBUG)
+target_compile_definitions(cnode_test_options INTERFACE
+    CNODE_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+
 # These recovery/lifetime fixtures observe buffer ownership and allocator failure.
 # One consistently instrumented archive avoids both ODR violations and a complete
 # production rebuild per fixture. Never link this archive together with cnode_core.
 add_library(cnode_test_core STATIC EXCLUDE_FROM_ALL ${CNODE_CORE_SOURCES})
-target_link_libraries(cnode_test_core PUBLIC cnode_build_options)
+target_link_libraries(cnode_test_core PUBLIC cnode_build_options PRIVATE cnode_test_options)
 target_compile_definitions(cnode_test_core PUBLIC
     CNODE_TEST_ALLOCATOR CNODE_TEST_BUFFER_STATS)
-target_compile_options(cnode_test_core PRIVATE -UNDEBUG)
+# 宏定义与 cnode_core 不同，不能 REUSE_FROM，单独生成一份 PCH。
+target_precompile_headers(cnode_test_core PRIVATE src/pch.hpp)
 
+# tests/<name>_test.cpp → cnode_<name>_test。默认链接 cnode_core；LIBRARY 改链接目标，
+# SOURCES 追加独立编译的源文件。
 function(cnode_unit name)
-    cmake_parse_arguments(TEST "" "LIBRARY;TIMEOUT" "SOURCES;INCLUDES" ${ARGN})
+    cmake_parse_arguments(TEST "" "LIBRARY" "SOURCES" ${ARGN})
     if(NOT TEST_LIBRARY)
         set(TEST_LIBRARY cnode_core)
     endif()
-    if(NOT TEST_TIMEOUT)
-        set(TEST_TIMEOUT 90)
-    endif()
     set(target cnode_${name}_test)
     add_executable(${target} EXCLUDE_FROM_ALL tests/${name}_test.cpp ${TEST_SOURCES})
-    target_link_libraries(${target} PRIVATE ${TEST_LIBRARY} GTest::gtest_main)
-    target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    foreach(directory IN LISTS TEST_INCLUDES)
-        target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/${directory})
-    endforeach()
-    target_compile_options(${target} PRIVATE -UNDEBUG -Wno-mismatched-new-delete)
+    target_link_libraries(${target} PRIVATE ${TEST_LIBRARY} cnode_test_options GTest::gtest_main)
     add_dependencies(cnode_tests ${target})
     gtest_discover_tests(${target} DISCOVERY_MODE PRE_TEST
-        TEST_PREFIX "${name}." PROPERTIES LABELS unit TIMEOUT ${TEST_TIMEOUT})
+        TEST_PREFIX "${name}." PROPERTIES LABELS unit TIMEOUT 90)
 endfunction()
 
-cnode_unit(anytls_codec_errors LIBRARY cnode_test_core INCLUDES src/proxy/anytls)
-cnode_unit(anytls_outbound_lifecycle LIBRARY cnode_test_core INCLUDES src/proxy/anytls src/proxy/anytls/outbound)
-cnode_unit(anytls_outbound_settings INCLUDES src/proxy/anytls src/proxy/anytls/outbound)
-cnode_unit(anytls_padding)
-cnode_unit(asio_operation_allocator)
-cnode_unit(async_write_gate INCLUDES src/transport/internet)
-cnode_unit(autosign_cert INCLUDES src/transport/internet)
-cnode_unit(autosign_context INCLUDES src/transport/internet)
-cnode_unit(awaitable_batch LIBRARY cnode_build_options INCLUDES src/common)
-cnode_unit(awaitable_task_group LIBRARY cnode_build_options INCLUDES src/common)
-cnode_unit(ban_tracking_contract)
-cnode_unit(buffer_ownership LIBRARY cnode_test_core)
-cnode_unit(buffer_span_builder LIBRARY cnode_test_core)
-cnode_unit(cancellation_source)
-cnode_unit(config_semantics)
-cnode_unit(connection_timeouts)
-cnode_unit(datagram_socket)
-cnode_unit(dispatcher_cancellation LIBRARY cnode_test_core)
-cnode_unit(dns_cache)
-cnode_unit(dns_datagram LIBRARY cnode_test_core)
-cnode_unit(dns_inflight)
-cnode_unit(domain_name)
-cnode_unit(geodata)
-cnode_unit(grpc_hunk INCLUDES src/transport/internet)
-cnode_unit(handler_registry)
-cnode_unit(http2_flow_control)
-cnode_unit(http2_initial_window INCLUDES src/infra src/transport/internet)
-cnode_unit(http2_receive_credit)
-cnode_unit(http2_server_errors)
-cnode_unit(http_handshake_read_ahead LIBRARY cnode_test_core)
-cnode_unit(http_path_match INCLUDES src/transport/internet)
-cnode_unit(http_sniffer)
-cnode_unit(hysteria_protocol INCLUDES src/transport/internet/hysteria)
-cnode_unit(inbound_listen INCLUDES src/app)
-cnode_unit(inbound_process_errors INCLUDES src/proxy/anytls)
-cnode_unit(inbound_tls_policy INCLUDES src/service/controller)
-cnode_unit(ip_address)
-cnode_unit(json_field)
-cnode_unit(json_object)
-cnode_unit(log_format)
-cnode_unit(monitor_loop)
-cnode_unit(mux_codec INCLUDES src/proxy/mux/inbound)
-cnode_unit(native_socket_handoff)
-cnode_unit(node_transaction INCLUDES src/service/controller)
-cnode_unit(node_transition INCLUDES src/service/controller)
-cnode_unit(online_snapshot INCLUDES src/service/controller)
-cnode_unit(outbound_bind)
-cnode_unit(outbound_selection)
-cnode_unit(panel_node_ids)
-cnode_unit(panel_schedule INCLUDES src/service/controller)
-cnode_unit(phase_deadline)
-cnode_unit(process_resources)
-cnode_unit(protocol_domain)
-cnode_unit(protocol_registration LIBRARY "$<LINK_LIBRARY:WHOLE_ARCHIVE,cnode_core>" INCLUDES src/app/proxyman/outbound)
-cnode_unit(proxy_protocol_literal)
-cnode_unit(quic_directory INCLUDES src/transport/internet/hysteria)
-cnode_unit(quic_sniffer)
-cnode_unit(quic_stream LIBRARY cnode_test_core INCLUDES src/transport/internet/hysteria)
-cnode_unit(reality_client_hello INCLUDES src/transport/internet)
-cnode_unit(reality_client_version)
-cnode_unit(reality_key_share INCLUDES src/transport/internet)
-cnode_unit(reality_key)
-cnode_unit(reality_server_name)
-cnode_unit(reality_short_id)
-cnode_unit(relay_initial_payload LIBRARY cnode_test_core)
-cnode_unit(router)
-cnode_unit(routing_ip_network)
-cnode_unit(rule_lifecycle)
-cnode_unit(runtime_sampling LIBRARY "$<LINK_LIBRARY:WHOLE_ARCHIVE,cnode_core>")
-cnode_unit(session_access_log)
-cnode_unit(session_group_executor)
-cnode_unit(shadowsocks_identity INCLUDES src/proxy/shadowsocks)
-cnode_unit(shadowsocks_stream_crypto LIBRARY cnode_build_options SOURCES src/proxy/shadowsocks/shadowsocks_protocol.cpp INCLUDES src/proxy/shadowsocks)
-cnode_unit(shadowsocks_udp_datagram INCLUDES src/proxy/shadowsocks)
-cnode_unit(shadowsocks_udp_identity INCLUDES src/proxy/shadowsocks)
-cnode_unit(sniff_config)
-cnode_unit(ss_outbound_credentials INCLUDES src/proxy/shadowsocks)
-cnode_unit(ss_outbound_uot INCLUDES src/proxy/shadowsocks)
-cnode_unit(ss_udp_request)
-cnode_unit(startup_inbounds INCLUDES src/app)
-cnode_unit(stream_settings)
-cnode_unit(substream_inbound_lifecycle LIBRARY cnode_test_core INCLUDES src/proxy/anytls/inbound src/proxy/mux/inbound)
-cnode_unit(target_address)
-cnode_unit(tcp_read LIBRARY cnode_test_core)
-cnode_unit(allocator LIBRARY cnode_test_core)
+# 只有特殊链接的单元测试在此显式登记；其余 tests/*_test.cpp 由下方 glob 按默认方式登记。
+foreach(name IN ITEMS
+        allocator anytls_codec_errors anytls_outbound_lifecycle buffer_ownership
+        buffer_span_builder dispatcher_cancellation dns_datagram http_handshake_read_ahead
+        quic_stream relay_initial_payload substream_inbound_lifecycle tcp_read
+        tls_record_buffer udp_socket_owner uot_ss2022 vless_udp_framing
+        xhttp_upload_stream_slot)
+    cnode_unit(${name} LIBRARY cnode_test_core)
+endforeach()
+foreach(name IN ITEMS protocol_registration runtime_sampling worker_udp_retirement_runtime)
+    cnode_unit(${name} LIBRARY "$<LINK_LIBRARY:WHOLE_ARCHIVE,cnode_core>")
+endforeach()
+cnode_unit(awaitable_batch LIBRARY cnode_build_options)
+cnode_unit(awaitable_task_group LIBRARY cnode_build_options)
+cnode_unit(shadowsocks_stream_crypto LIBRARY cnode_build_options SOURCES src/proxy/shadowsocks/shadowsocks_protocol.cpp)
 cnode_unit(timeout_scheduler LIBRARY cnode_build_options SOURCES tests/timeout_scheduler_new.cpp src/transport/internet/timeout_scheduler.cpp src/app/session_group_executor.cpp src/infra/log.cpp)
-cnode_unit(tls_client_certificate INCLUDES src/transport/internet)
-cnode_unit(tls_record_buffer LIBRARY cnode_test_core)
-cnode_unit(tls_sniffer)
-cnode_unit(token_bucket)
-cnode_unit(traffic_journal)
-cnode_unit(trojan_request INCLUDES src/proxy/trojan)
-cnode_unit(trojan_udp_framing INCLUDES src/proxy/trojan)
-cnode_unit(udp_association_reclaimer INCLUDES src/app)
-cnode_unit(udp_native_lifecycle INCLUDES src/app src/proxy/shadowsocks)
-cnode_unit(udp_request)
-cnode_unit(udp_socket_owner LIBRARY cnode_test_core INCLUDES src/app)
-cnode_unit(uot_ss2022 LIBRARY cnode_test_core INCLUDES src/proxy/uot src/proxy/shadowsocks)
-cnode_unit(user_store_batch)
-cnode_unit(user_store_typed_payload)
-cnode_unit(v2board_http_response INCLUDES src/api/v2board)
-cnode_unit(v2board_node_info_json INCLUDES src/api/v2board)
-cnode_unit(v2board_online_report INCLUDES src/api/v2board)
-cnode_unit(v2board_request_task INCLUDES src/api/v2board)
-cnode_unit(v2board_user_list_json INCLUDES src/api/v2board)
-cnode_unit(vless_credentials INCLUDES src/proxy/vless)
-cnode_unit(vless_encryption_io INCLUDES src/proxy/vless)
-cnode_unit(vless_ticket_service INCLUDES src/proxy/vless)
-cnode_unit(vless_ticket_store INCLUDES src/proxy/vless)
-cnode_unit(vless_udp_framing LIBRARY cnode_test_core INCLUDES src/proxy/vless)
-cnode_unit(vless_vision INCLUDES src/proxy/vless)
-cnode_unit(vmess_auth_snapshot INCLUDES src/proxy/vmess)
-cnode_unit(vmess_cipher LIBRARY cnode_build_options SOURCES src/proxy/vmess/vmess_crypto.cpp INCLUDES src/proxy/vmess)
-cnode_unit(vmess_udp_datagram INCLUDES src/proxy/vmess)
-cnode_unit(worker_connection_limit_runtime)
-cnode_unit(worker_mailbox)
-cnode_unit(worker_runtime_contract)
-cnode_unit(worker_udp_retirement_runtime LIBRARY "$<LINK_LIBRARY:WHOLE_ARCHIVE,cnode_core>")
-cnode_unit(xhttp_http1)
-cnode_unit(xhttp_packet_queue INCLUDES src/transport/internet)
-cnode_unit(xhttp_packet_session_key INCLUDES src/transport/internet)
-cnode_unit(xhttp_session_lifecycle INCLUDES src/transport/internet)
-cnode_unit(xhttp_upload_stream_slot LIBRARY cnode_test_core INCLUDES src/transport/internet)
+cnode_unit(vmess_cipher LIBRARY cnode_build_options SOURCES src/proxy/vmess/vmess_crypto.cpp)
+
+file(GLOB unit_sources CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/*_test.cpp")
+foreach(source IN LISTS unit_sources)
+    get_filename_component(name "${source}" NAME_WE)
+    string(REGEX REPLACE "_test$" "" name "${name}")
+    if(NOT TARGET cnode_${name}_test)
+        cnode_unit(${name})
+    endif()
+endforeach()
 
 # Small isolated seams do not pull production objects compiled with other macros.
 target_compile_options(cnode_awaitable_task_group_test PRIVATE
     "-include${CMAKE_CURRENT_SOURCE_DIR}/tests/async_allocation_fault.hpp")
 target_compile_options(cnode_timeout_scheduler_test PRIVATE
     "-include${CMAKE_CURRENT_SOURCE_DIR}/tests/timeout_scheduler_allocation.hpp")
-foreach(target IN ITEMS cnode_http_handshake_read_ahead_test cnode_tls_record_buffer_test)
-    target_compile_definitions(${target} PRIVATE ACPP_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
-endforeach()
 
 # Keep EVP allocation/error injection visible to the linker, including Release.
 foreach(target IN ITEMS cnode_vmess_cipher_test cnode_shadowsocks_stream_crypto_test)
@@ -384,18 +283,15 @@ find_package(nlohmann_json CONFIG REQUIRED)
 find_package(unofficial-sodium CONFIG REQUIRED)
 add_library(cnode_e2e_support STATIC EXCLUDE_FROM_ALL tests/e2e/support.cpp)
 target_link_libraries(cnode_e2e_support PUBLIC
-    cnode_build_options GTest::gtest nlohmann_json::nlohmann_json)
+    cnode_build_options cnode_test_options GTest::gtest nlohmann_json::nlohmann_json)
 target_include_directories(cnode_e2e_support PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e)
 target_compile_definitions(cnode_e2e_support PUBLIC
-    CNODE_TEST_BINARY="$<TARGET_FILE:cnode>"
-    CNODE_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
-target_compile_options(cnode_e2e_support PRIVATE -UNDEBUG)
+    CNODE_TEST_BINARY="$<TARGET_FILE:cnode>")
 
 function(cnode_e2e name source)
     set(target cnode_e2e_${name})
     add_executable(${target} EXCLUDE_FROM_ALL "${source}")
     target_link_libraries(${target} PRIVATE cnode_e2e_support GTest::gtest_main)
-    target_compile_options(${target} PRIVATE -UNDEBUG)
     add_dependencies(${target} cnode)
     add_dependencies(cnode_tests ${target})
     set(timeout 180)
@@ -411,68 +307,47 @@ endfunction()
 
 if(BUILD_BENCHMARKS)
     add_custom_target(cnode_benchmarks)
-    add_executable(cnode_allocator_append_benchmark EXCLUDE_FROM_ALL
-        tests/allocator_append_benchmark.cpp)
-    target_link_libraries(cnode_allocator_append_benchmark PRIVATE
-        cnode_build_options "$<LINK_LIBRARY:WHOLE_ARCHIVE,mimalloc-static>" GTest::gtest_main)
-    add_executable(cnode_tls_throughput_benchmark EXCLUDE_FROM_ALL
-        tests/e2e/tls_throughput_benchmark.cpp)
-    target_link_libraries(cnode_tls_throughput_benchmark PRIVATE
-        cnode_e2e_support GTest::gtest_main)
-    add_dependencies(cnode_tls_throughput_benchmark cnode)
-    add_executable(cnode_hysteria_throughput_benchmark EXCLUDE_FROM_ALL
-        tests/e2e/hysteria_throughput_benchmark.cpp)
-    target_link_libraries(cnode_hysteria_throughput_benchmark PRIVATE
-        cnode_e2e_support GTest::gtest_main)
-    add_dependencies(cnode_hysteria_throughput_benchmark cnode)
-    add_executable(cnode_tcp_receive_benchmark EXCLUDE_FROM_ALL
-        tests/tcp_receive_benchmark.cpp)
-    target_link_libraries(cnode_tcp_receive_benchmark PRIVATE
-        cnode_core GTest::gtest_main)
-    add_executable(cnode_executor_benchmark EXCLUDE_FROM_ALL
-        tests/executor_benchmark.cpp)
-    target_link_libraries(cnode_executor_benchmark PRIVATE
-        "$<LINK_LIBRARY:WHOLE_ARCHIVE,cnode_core,mimalloc-static>" GTest::gtest_main)
-    add_executable(cnode_tcp_send_benchmark EXCLUDE_FROM_ALL
-        tests/tcp_send_benchmark.cpp)
-    target_link_libraries(cnode_tcp_send_benchmark PRIVATE
-        "$<LINK_LIBRARY:WHOLE_ARCHIVE,cnode_core,mimalloc-static>" GTest::gtest_main)
-    add_executable(cnode_udp_send_benchmark EXCLUDE_FROM_ALL
-        tests/udp_send_benchmark.cpp)
-    target_link_libraries(cnode_udp_send_benchmark PRIVATE
-        "$<LINK_LIBRARY:WHOLE_ARCHIVE,cnode_core,mimalloc-static>" GTest::gtest_main)
-    add_executable(cnode_shadowsocks_identity_benchmark EXCLUDE_FROM_ALL
-        tests/shadowsocks_identity_benchmark.cpp)
-    target_include_directories(cnode_shadowsocks_identity_benchmark PRIVATE
-        src/proxy/shadowsocks)
-    target_link_libraries(cnode_shadowsocks_identity_benchmark PRIVATE
-        cnode_core "$<LINK_LIBRARY:WHOLE_ARCHIVE,mimalloc-static>" GTest::gtest_main)
-    add_executable(cnode_shadowsocks_udp_identity_benchmark EXCLUDE_FROM_ALL
-        tests/shadowsocks_udp_identity_benchmark.cpp)
-    target_include_directories(cnode_shadowsocks_udp_identity_benchmark PRIVATE
-        src/proxy/shadowsocks)
-    target_link_libraries(cnode_shadowsocks_udp_identity_benchmark PRIVATE
-        cnode_core "$<LINK_LIBRARY:WHOLE_ARCHIVE,mimalloc-static>" GTest::gtest_main)
-    add_executable(cnode_runtime_sampling_benchmark EXCLUDE_FROM_ALL
-        tests/runtime_sampling_benchmark.cpp)
-    target_link_libraries(cnode_runtime_sampling_benchmark PRIVATE
-        "$<LINK_LIBRARY:WHOLE_ARCHIVE,cnode_core,mimalloc-static>" GTest::gtest_main)
-    foreach(target IN ITEMS cnode_udp_send_benchmark cnode_shadowsocks_identity_benchmark
-                            cnode_shadowsocks_udp_identity_benchmark cnode_runtime_sampling_benchmark)
-        target_sources(${target} PRIVATE tests/benchmark_memory.cpp)
-        target_link_options(${target} PRIVATE
-            "-Wl,--wrap=_Znwm" "-Wl,--wrap=_Znam"
-            "-Wl,--wrap=_ZnwmSt11align_val_t" "-Wl,--wrap=_ZnamSt11align_val_t"
-            "-Wl,--wrap=mi_malloc_aligned")
-    endforeach()
-    foreach(target IN ITEMS cnode_allocator_append_benchmark cnode_tls_throughput_benchmark
-                            cnode_hysteria_throughput_benchmark cnode_tcp_receive_benchmark cnode_executor_benchmark
-                            cnode_tcp_send_benchmark cnode_udp_send_benchmark cnode_shadowsocks_identity_benchmark
-                            cnode_shadowsocks_udp_identity_benchmark cnode_runtime_sampling_benchmark)
-        target_compile_options(${target} PRIVATE -UNDEBUG)
+    # tests/<name>_benchmark.cpp → cnode_<name>_benchmark。E2E 基准取 tests/e2e/ 下的源文件，
+    # 链接 cnode_e2e_support 并驱动真实 cnode 进程；COUNT_ALLOCATIONS 通过链接期 --wrap
+    # 统计 operator new 与 mi_malloc_aligned 调用。
+    function(cnode_benchmark name)
+        cmake_parse_arguments(BENCHMARK "E2E;COUNT_ALLOCATIONS" "" "LIBRARY" ${ARGN})
+        set(target cnode_${name}_benchmark)
+        if(BENCHMARK_E2E)
+            add_executable(${target} EXCLUDE_FROM_ALL tests/e2e/${name}_benchmark.cpp)
+            target_link_libraries(${target} PRIVATE cnode_e2e_support)
+            add_dependencies(${target} cnode)
+        else()
+            add_executable(${target} EXCLUDE_FROM_ALL tests/${name}_benchmark.cpp)
+        endif()
+        target_link_libraries(${target} PRIVATE ${BENCHMARK_LIBRARY} cnode_test_options GTest::gtest_main)
+        if(BENCHMARK_COUNT_ALLOCATIONS)
+            target_sources(${target} PRIVATE tests/benchmark_memory.cpp)
+            target_link_options(${target} PRIVATE
+                "-Wl,--wrap=_Znwm" "-Wl,--wrap=_Znam"
+                "-Wl,--wrap=_ZnwmSt11align_val_t" "-Wl,--wrap=_ZnamSt11align_val_t"
+                "-Wl,--wrap=mi_malloc_aligned")
+        endif()
         add_dependencies(cnode_benchmarks ${target})
         gtest_discover_tests(${target} DISCOVERY_MODE PRE_TEST
             TEST_PREFIX "benchmark." PROPERTIES LABELS benchmark RUN_SERIAL TRUE TIMEOUT 180)
+    endfunction()
+
+    cnode_benchmark(allocator_append
+        LIBRARY cnode_build_options "$<LINK_LIBRARY:WHOLE_ARCHIVE,mimalloc-static>")
+    cnode_benchmark(tls_throughput E2E)
+    cnode_benchmark(hysteria_throughput E2E)
+    cnode_benchmark(tcp_receive LIBRARY cnode_core)
+    foreach(name IN ITEMS executor tcp_send)
+        cnode_benchmark(${name} LIBRARY "$<LINK_LIBRARY:WHOLE_ARCHIVE,cnode_core,mimalloc-static>")
+    endforeach()
+    foreach(name IN ITEMS udp_send runtime_sampling)
+        cnode_benchmark(${name} COUNT_ALLOCATIONS
+            LIBRARY "$<LINK_LIBRARY:WHOLE_ARCHIVE,cnode_core,mimalloc-static>")
+    endforeach()
+    foreach(name IN ITEMS shadowsocks_identity shadowsocks_udp_identity)
+        cnode_benchmark(${name} COUNT_ALLOCATIONS
+            LIBRARY cnode_core "$<LINK_LIBRARY:WHOLE_ARCHIVE,mimalloc-static>")
     endforeach()
 endif()
 

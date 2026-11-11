@@ -7,7 +7,7 @@
 #include "infra/config_types.hpp"
 #include "proxy/inbound.hpp"
 #include "transport/async_stream.hpp"
-#include "../src/common/awaitable_task_group.hpp"
+#include "common/awaitable_task_group.hpp"
 
 #include <iostream>
 #include <stdexcept>

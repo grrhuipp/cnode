@@ -1,8 +1,8 @@
 #include <gtest/gtest.h>
 
 #include "app/proxyman/inbound/user_store.hpp"
-#include "encoding/body.hpp"
-#include "vmess_crypto.hpp"
+#include "proxy/vmess/encoding/body.hpp"
+#include "proxy/vmess/vmess_crypto.hpp"
 #include <chrono>
 #include <iostream>
 #include <stdexcept>

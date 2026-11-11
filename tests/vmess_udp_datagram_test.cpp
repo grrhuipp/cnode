@@ -1,8 +1,8 @@
 #include <stdexcept>
 #include <gtest/gtest.h>
 
-#include "vmess_crypto.hpp"
-#include "encoding/body.hpp"
+#include "proxy/vmess/vmess_crypto.hpp"
+#include "proxy/vmess/encoding/body.hpp"
 #include "transport/internet/tcp_stream.hpp"
 #include "app/proxyman/inbound/user_store.hpp"
 

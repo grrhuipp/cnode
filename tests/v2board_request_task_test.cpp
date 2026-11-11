@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "http_response.hpp"
+#include "api/v2board/http_response.hpp"
 
 #include <asio/as_tuple.hpp>
 #include <asio/bind_cancellation_slot.hpp>

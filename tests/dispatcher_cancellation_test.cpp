@@ -12,7 +12,7 @@
 #include "infra/config_types.hpp"
 #include "proxy/outbound.hpp"
 #include "transport/internet/tcp_stream.hpp"
-#include "../src/common/awaitable_task_group.hpp"
+#include "common/awaitable_task_group.hpp"
 
 #include <asio/as_tuple.hpp>
 #include <asio/bind_cancellation_slot.hpp>

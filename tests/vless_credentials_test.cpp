@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "vless_codec.hpp"
+#include "proxy/vless/vless_codec.hpp"
 
 #include <array>
 #include <iostream>
