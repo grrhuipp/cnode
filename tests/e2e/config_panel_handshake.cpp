@@ -28,7 +28,7 @@ TEST(InboundHandshake, SegmentedVmessTrojanReplayFlowEofAndDeadline) {
     Configure(server_dir, Inbound(server_port, "vmess"), Direct());
     auto config = Json::parse(ReadFile(server_dir / "config.json"));
     config["timeouts"]["handshake"] = 2;
-    config["log"].update({{"enable", true}, {"loglevel", "debug"}});
+    config["log"].update({{"loglevel", "debug"}});
     WriteJson(server_dir, "config.json", config);
     auto server = Start(server_dir);
     server->WaitForLog("server started");
@@ -67,7 +67,7 @@ TEST(InboundHandshake, SegmentedVmessTrojanReplayFlowEofAndDeadline) {
     Configure(client_dir, Inbound(front_port), {{"protocol", "vmess"},
         {"settings", {{"address", "127.0.0.1"}, {"port", splitter.Port()}, {"id", UserId}}}});
     config = Json::parse(ReadFile(client_dir / "config.json"));
-    config["log"].update({{"enable", true}, {"loglevel", "debug"}});
+    config["log"].update({{"loglevel", "debug"}});
     WriteJson(client_dir, "config.json", config);
     auto client = Start(client_dir);
     client->WaitForLog("server started");

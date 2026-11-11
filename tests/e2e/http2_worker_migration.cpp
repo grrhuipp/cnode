@@ -17,7 +17,7 @@ TEST_P(Http2WorkerMigration, SourceIndependentSessionsMergeAndDetachWithActiveRe
         WriteJson(node.root.Path(), "routing.json", routing);
     }
     PatchConfig(node.root.Path(), [](Json& config) {
-        config["workers"] = 4; config["log"]["enable"] = true; config["log"]["loglevel"] = "debug";
+        config["workers"] = 4; config["log"]["loglevel"] = "debug";
         config["timeouts"]["handshake"] = 15; config["timeouts"]["connIdle"] = 30;
     });
     node.Start();

@@ -30,7 +30,6 @@ inline void Config(const std::filesystem::path& root, Json inbounds, Json outbou
     if (!config.contains("timeouts"))
         config["timeouts"] = {{"handshake", 5}, {"connIdle", 40}, {"write", 30},
                               {"uplinkOnly", 2}, {"downlinkOnly", 2}};
-    if (!config.contains("log")) config["log"] = {{"level", "debug"}};
     config["log"]["logDir"] = root.string();
     WriteJson(root, "config.json", config);
     WriteJson(root, "inbounds.json", inbounds);

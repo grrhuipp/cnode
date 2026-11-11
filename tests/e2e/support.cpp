@@ -229,7 +229,7 @@ void Configure(const std::filesystem::path& root, Json inbound, Json outbound, u
     outbound["tag"] = "fin-out";
     WriteJson(root, "config.json", {{"workers", workers},
         {"timeouts", {{"handshake", 5}, {"connIdle", 15}, {"write", 5}, {"uplinkOnly", 10}, {"downlinkOnly", 10}}},
-        {"log", {{"enable", false}, {"logDir", (root / "logs").string()}}}});
+        {"log", {{"logDir", (root / "logs").string()}}}});
     WriteJson(root, "inbounds.json", Json::array({inbound}));
     WriteJson(root, "outbounds.json", Json::array({outbound}));
     WriteJson(root, "routing.json", {{"rules", Json::array({{{"type", "field"},

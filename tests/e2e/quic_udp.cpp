@@ -528,10 +528,9 @@ TEST(QuicUdp, ConcurrentMultiSessionMigrationAndEphemeralAnyTlsStreams) {
     hy2_inbound["sniffing"]["enabled"] = true;
     hy2_inbound["settings"]["upMbps"] = 1000;
     hy2_inbound["settings"]["downMbps"] = 1000;
-    hy2_inbound["fallbackTag"] = "anytls-out";
 
     Json vless_inbound = {{"tag", "vless-in"}, {"protocol", "vless"},
-        {"listen", "127.0.0.1"}, {"port", vless_port}, {"fallbackTag", "anytls-out"},
+        {"listen", "127.0.0.1"}, {"port", vless_port},
         {"settings", {{"decryption", "none"},
             {"clients", Json::array({{{"id", UserId}}})}}}};
 
@@ -548,9 +547,8 @@ TEST(QuicUdp, ConcurrentMultiSessionMigrationAndEphemeralAnyTlsStreams) {
                       {"connIdle", 60}, {"uplinkOnly", 5}, {"downlinkOnly", 5}}},
         {"panels", Json::array({{{"name", "full-app"}, {"type", "V2board"},
             {"apiHost", "http://127.0.0.1:" + std::to_string(panel_listener.Port())},
-            {"key", "panel-secret"}, {"nodeIDs", {1}}, {"nodeType", "vless"},
-            {"fallbackTag", "anytls-out"}}})},
-        {"log", {{"enable", true}, {"loglevel", "debug"},
+            {"key", "panel-secret"}, {"nodeIDs", {1}}, {"nodeType", "vless"}}})},
+        {"log", {{"loglevel", "debug"},
                  {"logDir", (root.Path() / "logs").string()}}}});
     WriteJson(root.Path(), "inbounds.json",
         Json::array({std::move(hy2_inbound), std::move(vless_inbound), std::move(ss_inbound)}));
@@ -1067,14 +1065,14 @@ TEST(QuicUdp, AllProtocolsAndTransportsFullMatrixConcurrentMigration) {
             Json out_settings = {{"address", "127.0.0.1"}, {"port", mport}, {"id", UserId}, {"encryption", encryption}};
             if (std::string_view(spec.extra) == "vision") out_settings["flow"] = "xtls-rprx-vision";
             upstream_inbounds.push_back({{"tag", mtag}, {"protocol", "vless"},
-                {"listen", "127.0.0.1"}, {"port", mport}, {"fallbackTag", "out-0"},
+                {"listen", "127.0.0.1"}, {"port", mport},
                 {"settings", {{"decryption", decryption}, {"clients", Json::array({client_entry})}}},
                 {"streamSettings", std::move(in_stream)}});
             gateway_outbounds.push_back({{"tag", htag}, {"protocol", "vless"},
                 {"settings", std::move(out_settings)}, {"streamSettings", std::move(out_stream)}});
         } else if (std::string_view(spec.protocol) == "vmess") {
             upstream_inbounds.push_back({{"tag", mtag}, {"protocol", "vmess"},
-                {"listen", "127.0.0.1"}, {"port", mport}, {"fallbackTag", "out-0"},
+                {"listen", "127.0.0.1"}, {"port", mport},
                 {"settings", {{"clients", Json::array({{{"id", UserId}}})}}},
                 {"streamSettings", std::move(in_stream)}});
             gateway_outbounds.push_back({{"tag", htag}, {"protocol", "vmess"},
@@ -1083,7 +1081,7 @@ TEST(QuicUdp, AllProtocolsAndTransportsFullMatrixConcurrentMigration) {
                 {"streamSettings", std::move(out_stream)}});
         } else if (std::string_view(spec.protocol) == "trojan") {
             upstream_inbounds.push_back({{"tag", mtag}, {"protocol", "trojan"},
-                {"listen", "127.0.0.1"}, {"port", mport}, {"fallbackTag", "out-0"},
+                {"listen", "127.0.0.1"}, {"port", mport},
                 {"settings", {{"clients", Json::array({{{"password", "secret"}}})}}},
                 {"streamSettings", std::move(in_stream)}});
             gateway_outbounds.push_back({{"tag", htag}, {"protocol", "trojan"},
@@ -1092,7 +1090,7 @@ TEST(QuicUdp, AllProtocolsAndTransportsFullMatrixConcurrentMigration) {
         } else if (std::string_view(spec.protocol) == "shadowsocks") {
             if (std::string_view(spec.extra) == "legacy") {
                 upstream_inbounds.push_back({{"tag", mtag}, {"protocol", "shadowsocks"},
-                    {"listen", "127.0.0.1"}, {"port", mport}, {"fallbackTag", "out-0"},
+                    {"listen", "127.0.0.1"}, {"port", mport},
                     {"settings", {{"method", "aes-128-gcm"}, {"clients", Json::array({{{"password", "secret"}}})}}}});
                 gateway_outbounds.push_back({{"tag", htag}, {"protocol", "shadowsocks"},
                     {"settings", {{"address", "127.0.0.1"}, {"port", mport},
@@ -1100,7 +1098,7 @@ TEST(QuicUdp, AllProtocolsAndTransportsFullMatrixConcurrentMigration) {
                         {"uot", {{"enabled", true}, {"version", 2}}}}}});
             } else if (std::string_view(spec.extra) == "2022-128") {
                 upstream_inbounds.push_back({{"tag", mtag}, {"protocol", "shadowsocks"},
-                    {"listen", "127.0.0.1"}, {"port", mport}, {"fallbackTag", "out-0"},
+                    {"listen", "127.0.0.1"}, {"port", mport},
                     {"settings", {{"method", "2022-blake3-aes-128-gcm"}, {"password", ss2022_id_key},
                         {"clients", Json::array({{{"password", ss2022_user_key}}})}}}});
                 gateway_outbounds.push_back({{"tag", htag}, {"protocol", "shadowsocks"},
@@ -1109,7 +1107,7 @@ TEST(QuicUdp, AllProtocolsAndTransportsFullMatrixConcurrentMigration) {
                         {"uot", {{"enabled", true}, {"version", 2}}}}}});
             } else {
                 upstream_inbounds.push_back({{"tag", mtag}, {"protocol", "shadowsocks"},
-                    {"listen", "127.0.0.1"}, {"port", mport}, {"fallbackTag", "out-0"},
+                    {"listen", "127.0.0.1"}, {"port", mport},
                     {"settings", {{"method", "2022-blake3-aes-256-gcm"}, {"password", ss2022_256_id_key},
                         {"clients", Json::array({{{"password", ss2022_256_user_key}}})}}}});
                 gateway_outbounds.push_back({{"tag", htag}, {"protocol", "shadowsocks"},
@@ -1119,7 +1117,7 @@ TEST(QuicUdp, AllProtocolsAndTransportsFullMatrixConcurrentMigration) {
             }
         } else if (std::string_view(spec.protocol) == "anytls") {
             upstream_inbounds.push_back({{"tag", mtag}, {"protocol", "anytls"},
-                {"listen", "127.0.0.1"}, {"port", mport}, {"fallbackTag", "out-0"},
+                {"listen", "127.0.0.1"}, {"port", mport},
                 {"settings", {{"clients", Json::array({{{"password", "secret"}}})}}},
                 {"streamSettings", std::move(in_stream)}});
             gateway_outbounds.push_back({{"tag", htag}, {"protocol", "anytls"},
@@ -1131,7 +1129,6 @@ TEST(QuicUdp, AllProtocolsAndTransportsFullMatrixConcurrentMigration) {
 
     auto hy2_inbound = HysteriaInbound(hy2_port);
     hy2_inbound["tag"] = "hy2-matrix-in";
-    hy2_inbound["fallbackTag"] = "direct-out";
     hy2_inbound["settings"]["upMbps"] = 1000;
     hy2_inbound["settings"]["downMbps"] = 1000;
     hy2_inbound["settings"]["clients"] = std::move(hy2_clients);
@@ -1142,14 +1139,14 @@ TEST(QuicUdp, AllProtocolsAndTransportsFullMatrixConcurrentMigration) {
         {"timeouts", {{"handshake", 15}, {"dial", 10}, {"read", 20}, {"write", 30},
                       {"connIdle", 60}, {"uplinkOnly", 10}, {"downlinkOnly", 10}}}};
     auto gw_cfg = base_config;
-    gw_cfg["log"] = {{"enable", true}, {"loglevel", "debug"}, {"logDir", (gateway_root.Path() / "logs").string()}};
+    gw_cfg["log"] = {{"loglevel", "debug"}, {"logDir", (gateway_root.Path() / "logs").string()}};
     WriteJson(gateway_root.Path(), "config.json", gw_cfg);
     WriteJson(gateway_root.Path(), "inbounds.json", gateway_inbounds);
     WriteJson(gateway_root.Path(), "outbounds.json", gateway_outbounds);
     WriteJson(gateway_root.Path(), "routing.json", {{"rules", gateway_rules}});
 
     auto up_cfg = base_config;
-    up_cfg["log"] = {{"enable", false}, {"logDir", (upstream_root.Path() / "logs").string()}};
+    up_cfg["log"] = {{"logDir", (upstream_root.Path() / "logs").string()}};
     WriteJson(upstream_root.Path(), "config.json", up_cfg);
     WriteJson(upstream_root.Path(), "inbounds.json", upstream_inbounds);
     WriteJson(upstream_root.Path(), "outbounds.json", upstream_outbounds);

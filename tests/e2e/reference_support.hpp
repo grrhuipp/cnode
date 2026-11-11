@@ -105,7 +105,6 @@ inline Json XrayOutbound(uint16_t port, const Json& user) {
 inline void DebugConfig(const std::filesystem::path& root) {
     auto config = Json::parse(ReadFile(root / "config.json"));
     config["timeouts"]["handshake"] = 2;
-    config["log"]["enable"] = true;
     config["log"]["loglevel"] = "debug";
     WriteJson(root, "config.json", config);
 }

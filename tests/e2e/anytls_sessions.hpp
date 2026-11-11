@@ -289,7 +289,7 @@ struct PanelNode {
         : panel([this](Socket socket) { ServePanel(socket); }) {
         auto cert = SourceRoot() / "tests/fixtures/anytls-pool";
         Json config = {{"workers", 1},
-                       {"log", {{"enable", false}, {"logDir", (directory.Path() / "logs").string()}}},
+                       {"log", {{"logDir", (directory.Path() / "logs").string()}}},
                        {"timeouts", {{"connIdle", 10}, {"uplinkOnly", 3}, {"downlinkOnly", 3}}},
                        {"panels",
                         Json::array({{{"name", "session-test"},

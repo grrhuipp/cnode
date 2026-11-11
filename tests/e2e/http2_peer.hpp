@@ -105,7 +105,6 @@ public:
     }
     void Start() {
         PatchConfig(root.Path(), [](Json& config) {
-            config["log"]["enable"] = true;
             if (!config["log"].contains("loglevel")) config["log"]["loglevel"] = "debug";
         });
         child =

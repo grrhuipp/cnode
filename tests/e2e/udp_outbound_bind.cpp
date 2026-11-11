@@ -102,7 +102,7 @@ TEST_P(OutboundBind, OrderedSameFamilySelectionAndSystemFallback) {
         refused_v6.Close(); target.Close();
     }
     std::unique_ptr<DualStackDns> dns;
-    Json config = {{"workers", 1}, {"log", {{"enable", false}}}};
+    Json config = {{"workers", 1}, {"log", Json::object()}};
     if (item.domain) {
         dns = std::make_unique<DualStackDns>();
         config["dns"] = {{"servers", Json::array({"127.0.0.1:" + std::to_string(dns->Port())})}, {"timeout", 5}};
@@ -154,7 +154,7 @@ class RejectedBind : public testing::TestWithParam<RejectedCase> {};
 TEST_P(RejectedBind, ReportsInvalidSendThroughBeforeStartup) {
     TempDir root;
     PortReservation inbound;
-    ConfigFiles(root, {{"workers", 1}, {"log", {{"enable", false}}}}, Json::array({Inbound(inbound.port)}),
+    ConfigFiles(root, {{"workers", 1}, {"log", Json::object()}}, Json::array({Inbound(inbound.port)}),
         Json::array({Outbound(GetParam().addresses, GetParam().strategy)}));
     Child child({Binary().string(), "--config-dir", root.Path().string()}, root.Path() / "child.log");
     EXPECT_NE(child.Wait(5s), 0);
@@ -196,7 +196,7 @@ TEST_P(PassthroughHash, PreservesOriginAcrossAnyTlsAndVlessHops) {
         {{"tag", "us-to-jp"}, {"protocol", "vless"}, {"passthrough", true},
          {"settings", {{"address", "127.0.0.1"}, {"port", jp.port}, {"id", RelayUser}}}},
         {{"tag", last_tag}, {"protocol", "freedom"}, {"sendThrough", Json::array({"127.0.0.0/24"})}, {"sendThroughStrategy", ip_hash ? "ip_hash" : "user_hash"}}});
-    ConfigFiles(root, {{"workers", 1}, {"log", {{"enable", true}, {"rotateDaily", false}, {"access", (root.Path() / "access.log").string()}}}}, inbounds, outbounds);
+    ConfigFiles(root, {{"workers", 1}, {"log", {{"rotateDaily", false}, {"access", (root.Path() / "access.log").string()}}}}, inbounds, outbounds);
     auto target = Socket::Listen();
     Child child({Binary().string(), "--config-dir", root.Path().string()}, root.Path() / "child.log");
     child.WaitForLog("server started");
