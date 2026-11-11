@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "app/dns/dns.hpp"
+#include "app/relay.hpp"
 #include "app/prepared_inbound.hpp"
 #include "app/proxyman/inbound/handler.hpp"
 #include "app/rate_limiter.hpp"

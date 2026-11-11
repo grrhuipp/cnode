@@ -2,6 +2,7 @@
 class ConnectionLimiter;
 struct ConnectionFamily;
 #include "common/defaults.hpp"
+#include "common/hash.hpp"
 #include "app/session_group_executor.hpp"
 // ============================================================================
 // Process-wide connection/admission control. Session domains share this bounded
@@ -140,7 +141,7 @@ public:
 
     // 原连接配额表仍为 16384 槽、最多 32 次探测，与两张失败表完全独立。
     [[nodiscard]] static constexpr uint64_t IpHash(std::string_view ip) noexcept {
-        const auto hash = Fnv1a(kFnvOffset, ip);
+        const auto hash = Fnv1a64(ip);
         return hash == 0 ? 1 : hash;
     }
 
@@ -242,17 +243,6 @@ public:
 private:
     static constexpr size_t kMask = kSlotCount - 1;
     static_assert((kSlotCount & kMask) == 0);
-    static constexpr uint64_t kFnvOffset = 14695981039346656037ULL;
-    static constexpr uint64_t kFnvPrime = 1099511628211ULL;
-
-    [[nodiscard]] static constexpr uint64_t Fnv1a(
-        uint64_t hash, std::string_view bytes) noexcept {
-        for (const char byte : bytes) {
-            hash ^= static_cast<uint8_t>(byte);
-            hash *= kFnvPrime;
-        }
-        return hash;
-    }
 
     // 以下表项类型的全零字节即空状态。
     struct ConnectionSlot {

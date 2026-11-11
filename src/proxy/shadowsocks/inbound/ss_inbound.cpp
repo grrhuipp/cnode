@@ -1,4 +1,5 @@
 #include "proxy/shadowsocks/ss_udp.hpp"
+#include "common/scoped_cleanse.hpp"
 #include "proxy/inbound_admission.hpp"
 #include "transport/async_stream.hpp"
 #include "common/address_codec.hpp"
@@ -13,7 +14,6 @@
 #include "common/initial_payload.hpp"
 #include "common/session.hpp"
 
-#include "common/buffer_util.hpp"
 #include "common/byte_reader.hpp"
 #include "common/buf/multi_buffer.hpp"
 #include <openssl/rand.h>
@@ -230,14 +230,7 @@ bool ResponseBodyWriter::InitResponseCipher(ResponseBodyWriter& state) {
     }
 
     std::array<uint8_t, 64> write_subkey{};
-    struct CleanseInitLegacy {
-        std::array<uint8_t, 64>& salt;
-        std::array<uint8_t, 64>& subkey;
-        ~CleanseInitLegacy() noexcept {
-            OPENSSL_cleanse(salt.data(), salt.size());
-            OPENSSL_cleanse(subkey.data(), subkey.size());
-        }
-    } cleanse_init_legacy{server_salt, write_subkey};
+    ScopedCleanse cleanse_init_legacy{server_salt, write_subkey};
     if (!DeriveSubkey(state.pending_handshake_->master_key.data(), key_size,
                       server_salt.data(), key_size,
                       write_subkey.data())) {
@@ -292,16 +285,7 @@ bool ResponseBodyWriter::InitResponseCipher2022(
     constexpr size_t kFixedCipherMaxSize =
         kFixedPlainMaxSize + SsAeadCipher::kTagSize;
     std::array<uint8_t, kFixedPlainMaxSize> fixed_plain{};
-    struct CleanseInit2022 {
-        std::array<uint8_t, 32>& salt;
-        std::array<uint8_t, 32>& subkey;
-        std::array<uint8_t, kFixedPlainMaxSize>& plain;
-        ~CleanseInit2022() noexcept {
-            OPENSSL_cleanse(salt.data(), salt.size());
-            OPENSSL_cleanse(subkey.data(), subkey.size());
-            OPENSSL_cleanse(plain.data(), plain.size());
-        }
-    } cleanse_init_2022{server_salt, write_subkey, fixed_plain};
+    ScopedCleanse cleanse_init_2022{server_salt, write_subkey, fixed_plain};
     if (!Derive2022Subkey(state.pending_handshake_->master_key.data(), key_size,
                           server_salt.data(), key_size,
                           write_subkey.data())) {
@@ -457,10 +441,7 @@ net::awaitable<tl::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession2022
 
     SsAeadCipher read_cipher(cipher_info.type, proxy::AeadDirection::Decrypt);
     std::array<uint8_t, kSs2022RequestFixedHeaderSize> fixed_plain{};
-    struct CleanseRequestFixedPlain {
-        std::array<uint8_t, kSs2022RequestFixedHeaderSize>& buf;
-        ~CleanseRequestFixedPlain() noexcept { OPENSSL_cleanse(buf.data(), buf.size()); }
-    } cleanse_req_fixed{fixed_plain};
+    ScopedCleanse cleanse_req_fixed{fixed_plain};
     const size_t hint = last_matched_index;
 
     auto try_user = [&](size_t index) -> bool {
@@ -481,10 +462,7 @@ net::awaitable<tl::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession2022
 
     if (use_identity) {
         std::array<uint8_t, 16> identity_hash{};
-        struct CleanseIdentityHash {
-            std::array<uint8_t, 16>& hash;
-            ~CleanseIdentityHash() noexcept { OPENSSL_cleanse(hash.data(), hash.size()); }
-        } cleanse_identity{identity_hash};
+        ScopedCleanse cleanse_identity{identity_hash};
         const auto& list = *users.users;
         const auto try_candidates = [&](size_t begin, size_t end) {
             // The hash selects candidates, never authenticates a user:
@@ -620,10 +598,7 @@ net::awaitable<tl::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession(
     ReadTCPSessionResult result;
 
     std::array<uint8_t, KeyBytes::kMaxSize> salt{};
-    struct CleanseLegacySalt {
-        std::array<uint8_t, KeyBytes::kMaxSize>& buf;
-        ~CleanseLegacySalt() noexcept { OPENSSL_cleanse(buf.data(), buf.size()); }
-    } cleanse_legacy_salt{salt};
+    ScopedCleanse cleanse_legacy_salt{salt};
     if (auto read_res = co_await ReadFull(stream, salt.data(), salt_size);
         !read_res) {
         co_return tl::unexpected(read_res.error());
@@ -676,8 +651,7 @@ net::awaitable<tl::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession(
 
     uint64_t read_nonce = 1;  // nonce=0 was used for the length header.
 
-    const uint16_t payload_len =
-        static_cast<uint16_t>((len_plain[0] << 8) | len_plain[1]);
+    const uint16_t payload_len = LoadU16BE(len_plain.data());
     if (payload_len == 0 || payload_len > kMaxChunkPayload) {
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }

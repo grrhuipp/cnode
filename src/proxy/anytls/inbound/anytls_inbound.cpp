@@ -1,4 +1,7 @@
 #include "proxy/inbound_admission.hpp"
+#include "app/relay.hpp"
+#include "common/byte_reader.hpp"
+#include "common/scoped_cleanse.hpp"
 #include "common/awaitable_task_group.hpp"
 
 #include "proxy/anytls/anytls_codec.hpp"
@@ -18,7 +21,7 @@
 #include "transport/internet/timeout_scheduler.hpp"
 #include "app/proxyman/inbound/user_store.hpp"
 #include "common/address_codec.hpp"
-#include "common/container_util.hpp"
+#include "common/hash_container_shrink.hpp"
 
 #include <asio/experimental/channel.hpp>
 #include <openssl/crypto.h>
@@ -760,10 +763,7 @@ net::awaitable<tl::expected<void, ErrorCode>> ReadAuth(
     AsyncStream& stream,
     std::array<uint8_t, 32>& hash) {
     std::array<uint8_t, 34> auth{};
-    struct CleanseAuth {
-        std::array<uint8_t, 34>& buf;
-        ~CleanseAuth() noexcept { OPENSSL_cleanse(buf.data(), buf.size()); }
-    } cleanse_auth{auth};
+    ScopedCleanse cleanse_auth{auth};
     size_t offset = 0;
     while (offset < auth.size()) {
         try {
@@ -783,8 +783,7 @@ net::awaitable<tl::expected<void, ErrorCode>> ReadAuth(
         }
     }
     std::copy_n(auth.begin(), hash.size(), hash.begin());
-    const uint16_t padding = static_cast<uint16_t>(
-        (static_cast<uint16_t>(auth[32]) << 8) | auth[33]);
+    const uint16_t padding = LoadU16BE(&auth[32]);
     OPENSSL_cleanse(auth.data(), auth.size());
     if (auto ok = co_await anytls::DiscardFramePayload(stream, padding); !ok) {
         co_return tl::unexpected(
@@ -802,10 +801,7 @@ AuthenticateSession(
     const TimeoutsConfig& timeouts,
     std::chrono::seconds control_idle_timeout) {
     std::array<uint8_t, 32> auth_hash{};
-    struct CleanseHash {
-        std::array<uint8_t, 32>& buf;
-        ~CleanseHash() noexcept { OPENSSL_cleanse(buf.data(), buf.size()); }
-    } cleanse_hash{auth_hash};
+    ScopedCleanse cleanse_hash{auth_hash};
     if (auto ok = co_await ReadAuth(stream, auth_hash); !ok) {
         co_return tl::unexpected(ok.error());
     }

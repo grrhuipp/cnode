@@ -1,4 +1,5 @@
-#include "vmess_crypto.hpp"
+#include "proxy/vmess/vmess_crypto.hpp"
+#include "common/byte_reader.hpp"
 #include "proxy/aead.hpp"
 #include "common/binary_text_codec.hpp"
 #include "common/unsafe.hpp"
@@ -40,15 +41,6 @@ std::array<uint8_t, 32> SHA256Hash(const uint8_t* data, size_t len) {
     std::array<uint8_t, 32> result{};
     SHA256(data, len, result.data());
     return result;
-}
-
-uint32_t FNV1a32(const uint8_t* data, size_t len) {
-    uint32_t hash = 0x811c9dc5;
-    for (size_t i = 0; i < len; i++) {
-        hash ^= data[i];
-        hash *= 0x01000193;
-    }
-    return hash;
 }
 
 uint32_t CRC32(const uint8_t* data, size_t len) {
@@ -437,8 +429,7 @@ uint16_t ShakeMask::NextMask() {
         Refill();
     }
 
-    uint16_t result = (static_cast<uint16_t>(buffer_[offset_]) << 8) |
-                      static_cast<uint16_t>(buffer_[offset_ + 1]);
+    uint16_t result = LoadU16BE(&buffer_[offset_]);
     offset_ += 2;
     return result;
 }

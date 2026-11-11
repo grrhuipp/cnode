@@ -1,4 +1,5 @@
 #include "proxy/inbound_admission.hpp"
+#include "app/relay.hpp"
 #include "transport/internet/hysteria/hysteria_ingress.hpp"
 
 #include "app/proxyman/inbound/handler.hpp"

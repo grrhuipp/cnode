@@ -25,7 +25,7 @@ public:
     }
 
     [[nodiscard]] static std::optional<InboundListen> Parse(std::string_view value) {
-        if (value.empty() || transport::internet::EqualsAsciiCI(value, constants::binding::kAuto)) {
+        if (value.empty() || EqualsAsciiCI(value, constants::binding::kAuto)) {
             return InboundListen{};
         }
         auto address = iputil::ParseLiteral(value);

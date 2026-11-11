@@ -3,7 +3,6 @@
 #include "common/allocator.hpp"
 #include "common/asio_types.hpp"
 #include "common/buf/multi_buffer.hpp"
-#include <asio/this_coro.hpp>
 
 #include <array>
 #include <cstddef>
@@ -143,27 +142,3 @@ private:
     std::optional<memory::Vector<net::const_buffer>> spill_;
     size_t count_ = 0;
 };
-
-inline net::awaitable<void> ThrowIfCancelledOnEof(const char* cancel_what = nullptr) {
-    const auto cancellation = co_await net::this_coro::cancellation_state;
-    if (cancellation.cancelled() != net::cancellation_type::none) {
-        if (cancel_what) {
-            throw IoSystemError(io_error::operation_aborted, cancel_what);
-        }
-        throw IoSystemError(io_error::operation_aborted);
-    }
-}
-
-namespace buf {
-
-[[nodiscard]] inline std::span<const uint8_t> ChunkBytes(const Buffer* buffer) noexcept {
-    return buffer ? buffer->Bytes() : std::span<const uint8_t>{};
-}
-
-[[nodiscard]] inline std::span<const uint8_t> ChunkBytes(const net::const_buffer& buffer) noexcept {
-    const auto* data = static_cast<const uint8_t*>(buffer.data());
-    return data ? std::span<const uint8_t>(data, buffer.size()) : std::span<const uint8_t>{};
-}
-
-}  // namespace buf
-

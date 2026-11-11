@@ -1,6 +1,8 @@
-#include "vless_codec.hpp"
+#include "proxy/vless/vless_codec.hpp"
 #include "common/address_codec.hpp"
-#include "common/buffer_util.hpp"
+#include "common/const_buffer_span.hpp"
+#include "common/eof_cancellation.hpp"
+#include "common/buf/multi_buffer.hpp"
 #include "common/byte_reader.hpp"
 #include "common/error.hpp"
 
@@ -125,9 +127,7 @@ std::optional<PacketAddrHeader> DecodePacketAddrHeader(
         }
         net::ip::address_v4::bytes_type bytes{};
         std::memcpy(bytes.data(), data.data() + 1, bytes.size());
-        const uint16_t port =
-            (static_cast<uint16_t>(data[5]) << 8) |
-            static_cast<uint16_t>(data[6]);
+        const uint16_t port = LoadU16BE(&data[5]);
         return PacketAddrHeader{
             TargetAddress(net::ip::make_address_v4(bytes), port), 7};
     }
@@ -138,9 +138,7 @@ std::optional<PacketAddrHeader> DecodePacketAddrHeader(
         }
         net::ip::address_v6::bytes_type bytes{};
         std::memcpy(bytes.data(), data.data() + 1, bytes.size());
-        const uint16_t port =
-            (static_cast<uint16_t>(data[17]) << 8) |
-            static_cast<uint16_t>(data[18]);
+        const uint16_t port = LoadU16BE(&data[17]);
         return PacketAddrHeader{
             TargetAddress(net::ip::make_address_v6(bytes), port), 19};
     }

@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cerrno>
-#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -10,8 +9,8 @@
 #include <string_view>
 #include <system_error>
 
+#include "common/ascii.hpp"
 #include "common/asio_types.hpp"
-#include "common/defaults.hpp"
 
 
 // Live Worker state cannot be unwound safely after a runtime infrastructure
@@ -155,9 +154,9 @@ constexpr std::string_view ErrorCodeToString(ErrorCode code) {
 
         case ErrorCode::PANEL_API_FAILED: return "PANEL_API_FAILED";
         case ErrorCode::PANEL_INVALID_RESPONSE: return "PANEL_INVALID_RESPONSE";
-
-        default: return "UNKNOWN";
     }
+    // 不设 default，让 -Wswitch 在新增枚举值时报警；越界数值才会走到这里。
+    return "UNKNOWN";
 }
 
 // Local error logs use xray-style lowercase reasons, not the stable code name.
@@ -169,10 +168,8 @@ inline std::string ErrorCodeToLogReason(ErrorCode code) {
     for (const char ch : raw) {
         if (ch == '_') {
             reason.push_back(' ');
-        } else if (ch >= 'A' && ch <= 'Z') {
-            reason.push_back(static_cast<char>(ch - 'A' + 'a'));
         } else {
-            reason.push_back(ch);
+            reason.push_back(ToLowerAscii(ch));
         }
     }
     return reason;
@@ -198,10 +195,6 @@ struct ResultStatus {
         return error == ErrorCode::OK;
     }
 
-    [[nodiscard]] explicit operator bool() const noexcept {
-        return Ok();
-    }
-
     void SetError(ErrorCode code, std::string_view msg = {}) {
         error = code;
         error_msg = ErrorMessage(code, msg);
@@ -215,33 +208,9 @@ struct ResultStatus {
         return ErrorCode::OK;
     }
 
-    // asio::error 枚举在 POSIX 上即 system_category 的 errno，比较同时覆盖原始 errno。
+    // system category（errno）统一由下方 switch 映射；这里只处理其他 category。
     if (ec == io_error::eof) {
         return ErrorCode::SOCKET_EOF;
-    }
-    if (ec == io_error::operation_aborted) {
-        return ErrorCode::CANCELLED;
-    }
-    if (ec == io_error::no_buffer_space) {
-        return ErrorCode::RESOURCE_EXHAUSTED;
-    }
-    if (ec == io_error::timed_out) {
-        return ErrorCode::TIMEOUT;
-    }
-    if (ec == io_error::connection_refused) {
-        return ErrorCode::DIAL_REFUSED;
-    }
-    if (ec == io_error::connection_reset) {
-        return ErrorCode::SOCKET_CLOSED;
-    }
-    if (ec == io_error::broken_pipe) {
-        return ErrorCode::SOCKET_CLOSED;
-    }
-    if (ec == io_error::network_unreachable) {
-        return ErrorCode::DIAL_NETWORK_UNREACHABLE;
-    }
-    if (ec == io_error::host_unreachable) {
-        return ErrorCode::DIAL_HOST_UNREACHABLE;
     }
     if (ec == io_error::host_not_found) {
         return ErrorCode::DNS_RESOLVE_FAILED;
@@ -250,6 +219,7 @@ struct ResultStatus {
         return ErrorCode::DNS_SERVER_FAILED;
     }
 
+    // asio::error 的基础枚举在 POSIX 上即 system_category 的 errno。
     if (ec.category() == std::system_category() ||
         ec.category() == net::error::get_system_category()) {
         switch (ec.value()) {
@@ -288,23 +258,3 @@ struct ResultStatus {
     // 默认映射为内部错误
     return ErrorCode::INTERNAL;
 }
-
-// ============================================================================
-// Relay 配置
-// ============================================================================
-struct RelayConfig {
-    std::chrono::seconds uplink_only{defaults::kUplinkOnlyTimeout};     // 下行 EOF 后上行最多保留多久
-    std::chrono::seconds downlink_only{defaults::kDownlinkOnlyTimeout}; // 上行 EOF 后下行最多保留多久
-    uint64_t speed_limit = 0;              // bytes/s，0 = 不限速
-};
-
-// ============================================================================
-// Relay 结果
-// ============================================================================
-struct RelayResult : ResultStatus {
-    uint64_t bytes_up = 0;
-    uint64_t bytes_down = 0;
-    bool client_closed_first = false;
-    bool close_side_known = false;
-};
-

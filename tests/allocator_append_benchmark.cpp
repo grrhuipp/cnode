@@ -2,7 +2,7 @@
 
 #include "common/allocator.hpp"
 #include "common/buf/multi_buffer.hpp"
-#include "common/buffer_util.hpp"
+#include "common/const_buffer_span.hpp"
 
 #include <algorithm>
 #include <array>

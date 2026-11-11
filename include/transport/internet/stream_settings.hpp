@@ -4,7 +4,7 @@
 #include "common/binary_text_codec.hpp"
 #include "common/byte_reader.hpp"
 #include "common/domain_name.hpp"
-#include "common/unsafe.hpp"
+#include <openssl/mem.h>
 #include "core/constants.hpp"
 #include "infra/json.hpp"
 #include "transport/internet/http_headers.hpp"
@@ -460,15 +460,15 @@ struct RealityConfig {
     RealityConfig& operator=(RealityConfig&&) noexcept = default;
     ~RealityConfig() noexcept {
         if (private_key) {
-            ::SecureZeroMemory(private_key->data(), private_key->size());
+            OPENSSL_cleanse(private_key->data(), private_key->size());
         }
         for (auto& id : short_ids) {
-            ::SecureZeroMemory(id.data(), id.size());
+            OPENSSL_cleanse(id.data(), id.size());
         }
         if (mldsa65_seed) {
-            ::SecureZeroMemory(mldsa65_seed->data(), mldsa65_seed->size());
+            OPENSSL_cleanse(mldsa65_seed->data(), mldsa65_seed->size());
         }
-        ::SecureZeroMemory(short_id.data(), short_id.size());
+        OPENSSL_cleanse(short_id.data(), short_id.size());
     }
 
     [[nodiscard]] bool IsClient() const noexcept { return public_key.has_value(); }
@@ -477,7 +477,7 @@ struct RealityConfig {
         const auto opt_key_eq = [](const std::optional<transport::internet::RealityKey>& a,
                                    const std::optional<transport::internet::RealityKey>& b) noexcept {
             if (a.has_value() != b.has_value()) return false;
-            return !a || ::ConstantTimeEqual(a->data(), b->data(), a->size());
+            return !a || CRYPTO_memcmp(a->data(), b->data(), a->size()) == 0;
         };
         const auto short_ids_eq = [](const std::vector<transport::internet::RealityShortId>& a,
                                      const std::vector<transport::internet::RealityShortId>& b) noexcept {
@@ -485,7 +485,7 @@ struct RealityConfig {
             uint8_t diff = 0;
             for (size_t i = 0; i < a.size(); ++i) {
                 diff |= static_cast<uint8_t>(
-                    !::ConstantTimeEqual(a[i].data(), b[i].data(), a[i].size()));
+                    CRYPTO_memcmp(a[i].data(), b[i].data(), a[i].size()) != 0);
             }
             return diff == 0;
         };
@@ -505,7 +505,7 @@ struct RealityConfig {
                fingerprint == other.fingerprint &&
                server_name == other.server_name &&
                public_key == other.public_key &&
-               ::ConstantTimeEqual(short_id.data(), other.short_id.data(), short_id.size()) &&
+               CRYPTO_memcmp(short_id.data(), other.short_id.data(), short_id.size()) == 0 &&
                spider_x == other.spider_x &&
                verify_equal;
     }

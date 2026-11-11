@@ -734,7 +734,7 @@ void TestAuthenticatedHeaderFailure() {
         plain[39] = 53;
         plain[40] = 1;
         plain[41] = 1; plain[42] = 1; plain[43] = 1; plain[44] = 1;
-        const uint32_t checksum = vmess::FNV1a32(plain.data(), 45) ^ (fault == 1 ? 1u : 0u);
+        const uint32_t checksum = Fnv1a32(std::span<const uint8_t>(plain.data(), 45)) ^ (fault == 1 ? 1u : 0u);
         for (size_t i = 0; i != 4; ++i) {
             plain[45 + i] = static_cast<uint8_t>(checksum >> (24 - i * 8));
         }

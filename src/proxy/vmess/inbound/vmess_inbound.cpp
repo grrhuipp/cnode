@@ -1,4 +1,5 @@
 #include "common/mux/mux_codec.hpp"
+#include "app/relay.hpp"
 #include "proxy/inbound_admission.hpp"
 #include "proxy/inbound.hpp"
 #include "common/sharded_user_stats.hpp"

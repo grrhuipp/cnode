@@ -1,11 +1,12 @@
 #pragma once
 
 #include "common/allocator.hpp"
+#include "app/relay.hpp"
 #include "common/asio_types.hpp"
 #include "common/error.hpp"
 #include "common/buf/multi_buffer.hpp"
 #include "common/target_address.hpp"
-#include "common/unsafe.hpp"
+#include <openssl/mem.h>
 
 #include <tl/expected.hpp>
 #include <algorithm>
@@ -62,7 +63,7 @@ struct InboundDatagramOwner {
     InboundDatagramOwner(InboundDatagramOwner&&) noexcept = default;
     InboundDatagramOwner& operator=(InboundDatagramOwner&&) noexcept = default;
     ~InboundDatagramOwner() noexcept {
-        ::SecureZeroMemory(bytes.data(), bytes.size());
+        OPENSSL_cleanse(bytes.data(), bytes.size());
     }
 
     [[nodiscard]] bool Assign(std::span<const uint8_t> value) noexcept {
@@ -77,7 +78,7 @@ struct InboundDatagramOwner {
 
     [[nodiscard]] bool Same(const InboundDatagramOwner& other) const noexcept {
         return size == other.size &&
-            ::ConstantTimeEqual(bytes.data(), other.bytes.data(), size);
+            CRYPTO_memcmp(bytes.data(), other.bytes.data(), size) == 0;
     }
 
     std::array<uint8_t, kMaxBytes> bytes{};

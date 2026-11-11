@@ -19,6 +19,7 @@
 #include "transport/async_stream.hpp"
 #include "transport/link.hpp"
 #include <openssl/aes.h>
+#include <openssl/mem.h>
 #include <tl/expected.hpp>
 #include <array>
 #include <cstddef>
@@ -75,8 +76,8 @@ struct BodyKey {
     std::array<uint8_t, 16> key{};
     std::array<uint8_t, 16> iv{};
     ~BodyKey() noexcept {
-        ::SecureZeroMemory(key.data(), key.size());
-        ::SecureZeroMemory(iv.data(), iv.size());
+        OPENSSL_cleanse(key.data(), key.size());
+        OPENSSL_cleanse(iv.data(), iv.size());
     }
 };
 

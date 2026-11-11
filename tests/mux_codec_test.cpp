@@ -3,7 +3,6 @@
 
 #include "common/mux/mux_codec.hpp"
 #include "common/buf/multi_buffer.hpp"
-#include "common/buffer_util.hpp"
 #include "common/buf/length_prefixed_packet_buffer.hpp"
 
 #include <algorithm>

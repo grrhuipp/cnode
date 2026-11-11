@@ -847,7 +847,7 @@ void UpgradeHeaderTokens(bool outbound, bool websocket,
             } while (!request.ends_with("\r\n\r\n"));
             message = "HTTP/1.1 101 Switching Protocols\r\n";
             if (websocket) {
-                const auto key = ::transport::internet::TrimAscii(
+                const auto key = TrimAscii(
                     ::transport::internet::ExtractHeaderValueCI(request, "Sec-WebSocket-Key"));
                 const auto accept = ::ws::EncodeWsAccept(key);
                 message += "Sec-WebSocket-Accept: ";
@@ -1024,7 +1024,7 @@ void HttpLogHandshake(std::string_view network, bool outbound,
                    "User-Agent: http://user:review_password@example.com/?token=review_token#review_fragment\r\n"
                    "Content-Length: 0\r\n";
         if (outbound && network == "ws") {
-            const auto key = ::transport::internet::TrimAscii(
+            const auto key = TrimAscii(
                 ::transport::internet::ExtractHeaderValueCI(request, "Sec-WebSocket-Key"));
             const auto accept = ::ws::EncodeWsAccept(key);
             message += "Sec-WebSocket-Accept: ";

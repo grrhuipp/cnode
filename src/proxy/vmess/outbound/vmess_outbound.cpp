@@ -1,6 +1,6 @@
 #include "common/domain_name.hpp"
 #include "common/ip_utils.hpp"
-#include "common/unsafe.hpp"
+#include <openssl/mem.h>
 #include "proxy/outbound.hpp"
 #include "proxy/vmess/encoding/body.hpp"
 #include "proxy/vmess/vmess_crypto.hpp"
@@ -23,7 +23,6 @@
 #include <cstring>
 #include <new>
 #include <openssl/rand.h>
-#include "common/buffer_util.hpp"
 #include "common/buf/length_prefixed_packet_buffer.hpp"
 
 #include <openssl/aes.h>
@@ -42,7 +41,7 @@ struct PreparedSettings {
     AES_KEY auth_id_key{};  // Encrypt schedule of user.auth_key, built on prepare.
 
     ~PreparedSettings() noexcept {
-        ::SecureZeroMemory(&auth_id_key, sizeof(auth_id_key));
+        OPENSSL_cleanse(&auth_id_key, sizeof(auth_id_key));
     }
 };
 
@@ -241,7 +240,7 @@ const bool kVMessRegistered = (::proxyman::outbound::RegisterProxy(
         };
         auto parse_security = [&](std::string security)
             -> std::optional<::vmess::Security> {
-            security = ::naming::LowerAscii(std::move(security));
+            security = LowerAscii(std::move(security));
             if (security.empty() ||
                 security == ::constants::protocol::kAes128Gcm ||
                 security == ::constants::binding::kAuto) {

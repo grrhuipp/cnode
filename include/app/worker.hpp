@@ -6,7 +6,7 @@
 #include "infra/config_types.hpp"
 #include "common/allocator.hpp"
 #include "common/asio_types.hpp"
-#include "common/container_util.hpp"
+#include "common/hash_container_shrink.hpp"
 #include "common/string_hash.hpp"
 #include "transport/internet/timeout_scheduler.hpp"
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common/address_codec.hpp"
+#include "app/relay.hpp"
 #include "common/asio_types.hpp"
 #include "common/error.hpp"
 #include "common/target_address.hpp"

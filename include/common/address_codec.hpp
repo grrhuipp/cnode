@@ -2,7 +2,7 @@
 
 #include "common/asio_types.hpp"
 #include "common/buf/multi_buffer.hpp"
-#include "common/buffer_util.hpp"
+#include "common/eof_cancellation.hpp"
 #include "common/byte_reader.hpp"
 #include "common/error.hpp"
 #include "common/target_address.hpp"
@@ -61,24 +61,19 @@ namespace detail {
 
 [[nodiscard]] inline bool ReadAddressMetadataVarint(
     std::span<const uint8_t> data, size_t& pos, uint64_t& out) noexcept {
-    uint64_t value = 0;
-    unsigned shift = 0;
-    for (size_t i = 0; i < 10; ++i) {
-        if (pos >= data.size()) return false;
-        const uint8_t byte = data[pos++];
-        if (shift == 63 && byte > 1) return false;
-        value |= static_cast<uint64_t>(byte & 0x7Fu) << shift;
-        if ((byte & 0x80u) == 0) {
-            if ((i > 0 && byte == 0) || value == 0 ||
-                value > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
-                return false;
-            }
-            out = value;
-            return true;
-        }
-        shift += 7;
+    if (pos > data.size()) return false;
+    ByteReader reader(data.subspan(pos));
+    const auto value = reader.ReadVarintU64();
+    if (!value) return false;
+    const size_t consumed = reader.Position();
+    // 拒绝非最短编码（多字节且末字节为 0）、零值以及超出 int64 范围的值。
+    if ((consumed > 1 && data[pos + consumed - 1] == 0) || *value == 0 ||
+        *value > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+        return false;
     }
-    return false;
+    pos += consumed;
+    out = *value;
+    return true;
 }
 
 struct NormalizedMetadataView {

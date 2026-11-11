@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common/allocator.hpp"
+#include "app/relay.hpp"
 #include "common/asio_types.hpp"
 #include "infra/config_types.hpp"
 #include "proxy/outbound.hpp"

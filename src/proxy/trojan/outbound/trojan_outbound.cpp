@@ -1,6 +1,7 @@
 #include "common/domain_name.hpp"
+#include "common/scoped_cleanse.hpp"
 #include "common/ip_utils.hpp"
-#include "common/unsafe.hpp"
+#include <openssl/mem.h>
 #include "proxy/outbound.hpp"
 #include "proxy/trojan/trojan_codec.hpp"
 #include "proxy/inbound_admission.hpp"
@@ -9,8 +10,7 @@
 #include "app/proxyman/outbound/handler.hpp"
 #include "infra/json.hpp"
 #include "app/dns/dns.hpp"
-#include "common/buffer_util.hpp"
-#include "common/container_util.hpp"
+#include "common/hash_container_shrink.hpp"
 #include "infra/config_types.hpp"
 #include "transport/link.hpp"
 #include "transport/internet/outbound_target_builder.hpp"
@@ -37,7 +37,7 @@ struct TrojanOutboundConfig {
     TrojanOutboundConfig(TrojanOutboundConfig&&) noexcept = default;
     TrojanOutboundConfig& operator=(TrojanOutboundConfig&&) noexcept = default;
     ~TrojanOutboundConfig() noexcept {
-        ::SecureZeroMemory(password_hash.data(), password_hash.size());
+        OPENSSL_cleanse(password_hash.data(), password_hash.size());
     }
 };
 
@@ -82,10 +82,7 @@ SendTrojanHandshake(
         stream.StartPhaseDeadline(handshake_timeout);
 
     std::array<uint8_t, ::trojan::kRequestPrefixSize + kMaxEncodedAddressSize + 2> header_buf{};
-    struct CleanseHeader {
-        std::array<uint8_t, ::trojan::kRequestPrefixSize + kMaxEncodedAddressSize + 2>& buf;
-        ~CleanseHeader() noexcept { OPENSSL_cleanse(buf.data(), buf.size()); }
-    } cleanse_header{header_buf};
+    ScopedCleanse cleanse_header{header_buf};
     const size_t header_len = ::trojan::EncodeRequestTo(
         config.password_hash,
         is_udp ? ::trojan::TrojanCommand::UDP_ASSOCIATE
@@ -185,14 +182,7 @@ const bool kTrojanRegistered = (::proxyman::outbound::RegisterProxy(
         std::string address;
         uint16_t port = 443;
         std::string password;
-        struct CleansePassword {
-            std::string& str;
-            ~CleansePassword() noexcept {
-                if (!str.empty()) {
-                    OPENSSL_cleanse(str.data(), str.size());
-                }
-            }
-        } cleanse_password{password};
+        ScopedCleanse cleanse_password{password};
         std::string server_name;
         bool allow_insecure = false;
         std::vector<std::string> alpn;

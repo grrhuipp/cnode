@@ -1,8 +1,9 @@
 #include "transport/internet/ws_stream.hpp"
-#include "http1_handshake.hpp"
+#include "common/scoped_cleanse.hpp"
+#include "transport/internet/http1_handshake.hpp"
 #include "common/binary_text_codec.hpp"
 #include "common/unsafe.hpp"
-#include "common/buffer_util.hpp"
+#include "common/const_buffer_span.hpp"
 #include "infra/log.hpp"
 
 #include <openssl/base64.h>
@@ -38,7 +39,6 @@ std::array<char, 28> EncodeWsAccept(std::string_view ws_key) noexcept {
 }  // namespace ws
 
 namespace {
-using transport::internet::TrimAscii;
 using transport::internet::detail::EffectiveHttpPath;
 
 class WriteGateWait final : private transport::CancellationSubscription {
@@ -612,10 +612,7 @@ net::awaitable<WsHandshakeResult> BaseWsStream::Handshake(
     std::array<uint8_t, 25> ws_key_buf{};
     EVP_EncodeBlock(ws_key_buf.data(), raw_key, sizeof(raw_key));
     OPENSSL_cleanse(raw_key, sizeof(raw_key));
-    struct WsKeyCleanseGuard {
-        std::array<uint8_t, 25>& buf;
-        ~WsKeyCleanseGuard() noexcept { OPENSSL_cleanse(buf.data(), buf.size()); }
-    } cleanse_ws_key{ws_key_buf};
+    ScopedCleanse cleanse_ws_key{ws_key_buf};
     const std::string_view ws_key(reinterpret_cast<const char*>(ws_key_buf.data()), 24);
     const std::string_view req_path = EffectiveHttpPath(path);
     host = transport::internet::ResolveConfiguredHttpHost({}, headers, host);

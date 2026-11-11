@@ -1,8 +1,8 @@
 #include "transport/internet/datagram_socket.hpp"
 
 #include "common/allocator.hpp"
-#include "connection_timeouts.hpp"
-#include "common/buffer_util.hpp"
+#include "transport/internet/connection_timeouts.hpp"
+#include "common/const_buffer_span.hpp"
 #include "transport/link.hpp"
 
 #include <asio/as_tuple.hpp>

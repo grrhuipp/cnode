@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "app/proxyman/inbound/handler.hpp"
+#include "app/relay.hpp"
 #include "app/rate_limiter.hpp"
 #include "app/session_group_executor.hpp"
 #include "common/allocator.hpp"

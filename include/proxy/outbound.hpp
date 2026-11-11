@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common/asio_types.hpp"
+#include "app/relay.hpp"
 #include "common/error.hpp"
 #include "common/buf/multi_buffer.hpp"
 #include "transport/link.hpp"

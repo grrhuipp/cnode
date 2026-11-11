@@ -1,18 +1,20 @@
 #include "common/mux/mux_codec.hpp"
+#include "app/relay.hpp"
 #include "proxy/inbound_admission.hpp"
 #include "common/awaitable_task_group.hpp"
 #include "app/stats.hpp"
 #include "common/address_codec.hpp"
 #include "common/allocator.hpp"
 #include "common/buf/multi_buffer.hpp"
-#include "common/buffer_util.hpp"
+#include "common/const_buffer_span.hpp"
 #include "common/byte_reader.hpp"
-#include "common/container_util.hpp"
+#include "common/hash_container_shrink.hpp"
 #include "common/session.hpp"
 #include "features/routing/dispatcher.hpp"
 #include "infra/config_types.hpp"
 #include "infra/log.hpp"
 #include "transport/async_stream.hpp"
+#include "transport/failure.hpp"
 
 #include <asio/as_tuple.hpp>
 
@@ -1193,26 +1195,15 @@ net::awaitable<RelayResult> ProcessInbound(
                         co_return;
                     }
                 }
-            } catch (const transport::LinkError& e) {
-                ErrorCode ec = client_reads.running ? e.code() : ErrorCode::OK;
-                if (ConsumeReadSideTimeout(client_control)) {
-                    ec = ErrorCode::RELAY_TIMEOUT;
-                }
-                client_reads.MarkDone(ec);
-                co_return;
-            } catch (const IoSystemError& e) {
-                ErrorCode ec =
-                    client_reads.running ? MapAsioError(e.code()) : ErrorCode::OK;
-                if (ConsumeReadSideTimeout(client_control)) {
-                    ec = ErrorCode::RELAY_TIMEOUT;
-                }
-                client_reads.MarkDone(ec);
-                co_return;
-            } catch (const std::bad_alloc&) {
-                client_reads.MarkDone(ErrorCode::RESOURCE_EXHAUSTED);
-                co_return;
             } catch (...) {
-                client_reads.MarkDone(ErrorCode::INTERNAL);
+                // running 已撤销时由帧循环收尾，读侧异常不再作为结束原因。
+                ErrorCode ec = client_reads.running
+                    ? transport::ClassifyFailure(std::current_exception(), ErrorCode::INTERNAL)
+                    : ErrorCode::OK;
+                if (ConsumeReadSideTimeout(client_control)) {
+                    ec = ErrorCode::RELAY_TIMEOUT;
+                }
+                client_reads.MarkDone(ec);
                 co_return;
             }
         }
@@ -1220,6 +1211,15 @@ net::awaitable<RelayResult> ProcessInbound(
     };
 
     auto process_frames = [&](AwaitableTaskGroup& tasks) -> net::awaitable<void> {
+        // 写超时优先于异常分类；单纯的 operation_aborted 是收尾取消的回声，
+        // 不覆盖已记录的结束原因。
+        auto record_client_write_failure = [&](const std::exception_ptr& failure) {
+            if (ConsumeWriteSideTimeout(client_control)) {
+                result.error = ErrorCode::RELAY_TIMEOUT;
+            } else if (!IsOperationCancelled(failure)) {
+                result.error = transport::ClassifyFailure(failure, ErrorCode::INTERNAL);
+            }
+        };
         auto write_frame_to_client =
             [&](std::span<const uint8_t> frame) -> net::awaitable<bool> {
                 const size_t frame_size = frame.size();
@@ -1234,20 +1234,8 @@ net::awaitable<RelayResult> ProcessInbound(
                     parent_ctx.traffic.bytes_down += frame_size;
                     result.bytes_down += frame_size;
                     co_return true;
-                } catch (const IoSystemError& e) {
-                    if (ConsumeWriteSideTimeout(client_control)) {
-                        result.error = ErrorCode::RELAY_TIMEOUT;
-                    } else if (e.code() != io_error::operation_aborted) {
-                        result.error = MapAsioError(e.code());
-                    }
-                } catch (const transport::LinkError& e) {
-                    result.error = ConsumeWriteSideTimeout(client_control)
-                        ? ErrorCode::RELAY_TIMEOUT
-                        : e.code();
-                } catch (const std::bad_alloc&) {
-                    result.error = ErrorCode::RESOURCE_EXHAUSTED;
                 } catch (...) {
-                    result.error = ErrorCode::INTERNAL;
+                    record_client_write_failure(std::current_exception());
                 }
                 co_return false;
             };
@@ -1299,20 +1287,8 @@ net::awaitable<RelayResult> ProcessInbound(
                     parent_ctx.traffic.bytes_down += frame_size;
                     result.bytes_down += frame_size;
                     co_return true;
-                } catch (const IoSystemError& e) {
-                    if (ConsumeWriteSideTimeout(client_control)) {
-                        result.error = ErrorCode::RELAY_TIMEOUT;
-                    } else if (e.code() != io_error::operation_aborted) {
-                        result.error = MapAsioError(e.code());
-                    }
-                } catch (const transport::LinkError& e) {
-                    result.error = ConsumeWriteSideTimeout(client_control)
-                        ? ErrorCode::RELAY_TIMEOUT
-                        : e.code();
-                } catch (const std::bad_alloc&) {
-                    result.error = ErrorCode::RESOURCE_EXHAUSTED;
                 } catch (...) {
-                    result.error = ErrorCode::INTERNAL;
+                    record_client_write_failure(std::current_exception());
                 }
                 reply.payload.clear();
                 co_return false;
@@ -1645,10 +1621,8 @@ net::awaitable<RelayResult> ProcessInbound(
                 break;
             }
             }
-        } catch (const std::bad_alloc&) {
-            result.error = ErrorCode::RESOURCE_EXHAUSTED;
         } catch (...) {
-            result.error = ErrorCode::INTERNAL;
+            result.error = transport::ClassifyFailure(std::current_exception(), ErrorCode::INTERNAL);
         }
 
         // ------------------------------------------------------------------------
@@ -1685,15 +1659,9 @@ net::awaitable<RelayResult> ProcessInbound(
     }
 #endif
 
-    } catch (const std::bad_alloc&) {
-        stats.OnError();
-        result.error = ErrorCode::RESOURCE_EXHAUSTED;
-    } catch (const IoSystemError& error) {
-        stats.OnError();
-        result.error = MapAsioError(error.code());
     } catch (...) {
         stats.OnError();
-        result.error = ErrorCode::INTERNAL;
+        result.error = transport::ClassifyFailure(std::current_exception(), ErrorCode::INTERNAL);
     }
     if (result.error != ErrorCode::OK) {
         client_control.CloseAbortive();

@@ -86,7 +86,7 @@ struct VlessServerPfsKey {
     VlessServerPfsKey& operator=(VlessServerPfsKey&&) noexcept = default;
     ~VlessServerPfsKey() noexcept {
         if (!private_key.empty()) {
-            ::SecureZeroMemory(private_key.data(), private_key.size());
+            OPENSSL_cleanse(private_key.data(), private_key.size());
         }
     }
 };
@@ -799,7 +799,7 @@ private:
         }
     };
 
-    struct ConstantTimeEqual {
+    struct TimingSafeEq {
         template <size_t N>
         [[nodiscard]] bool operator()(const std::array<uint8_t, N>& a,
                                       const std::array<uint8_t, N>& b) const noexcept {
@@ -811,12 +811,12 @@ private:
         VlessEncryptionPfsKey pfs_key;
         std::chrono::steady_clock::time_point expires_at{};
         std::optional<std::array<uint8_t, 16>> identity;
-        memory::UnorderedSet<NfsKeyDigest, KeyedHash, ConstantTimeEqual>
+        memory::UnorderedSet<NfsKeyDigest, KeyedHash, TimingSafeEq>
             seen_nfs_keys;
     };
 
     using SessionMap =
-        memory::UnorderedMap<TicketArray, Session, KeyedHash, ConstantTimeEqual>;
+        memory::UnorderedMap<TicketArray, Session, KeyedHash, TimingSafeEq>;
 
     void Prune(std::chrono::steady_clock::time_point now);
     void EraseOldest();

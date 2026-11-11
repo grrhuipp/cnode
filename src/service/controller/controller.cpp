@@ -132,7 +132,7 @@ namespace {
         stream.ws.path = node_config.Path;
         if (!node_config.Host.empty()) {
             stream.ws.headers.emplace(
-                transport::internet::NormalizeHttpHeaderName("Host"),
+                LowerAscii("Host"),
                 node_config.Host);
         }
         break;

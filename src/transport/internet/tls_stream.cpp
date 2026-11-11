@@ -1,12 +1,13 @@
 #include "transport/internet/tls_stream.hpp"
 #include "transport/internet/tcp_stream.hpp"
-#include "reality_tls.hpp"
+#include "transport/internet/reality_tls.hpp"
 #include "transport/internet/async_write_gate.hpp"
 #include "transport/internet/stream_settings.hpp"
-#include "common/buffer_util.hpp"
+#include "common/const_buffer_span.hpp"
 #include "infra/log.hpp"
 #include "common/unsafe.hpp"
 #include "common/allocator.hpp"
+#include "common/scoped_cleanse.hpp"
 #include "common/binary_text_codec.hpp"
 #include "common/byte_reader.hpp"
 #include "common/domain_name.hpp"
@@ -115,7 +116,8 @@ int SelectServerAlpnCallback(
 
 std::unique_ptr<SslContext> SslContext::CreateServer(const TlsConfig& config) {
     const SSL_METHOD* method = TLS_server_method();
-    SSL_CTX* ctx = SSL_CTX_new(method);
+    bssl::UniquePtr<SSL_CTX> owner(SSL_CTX_new(method));
+    SSL_CTX* ctx = owner.get();
     if (!ctx) {
         LOG_ERROR("failed to create TLS server context");
         return nullptr;
@@ -124,22 +126,19 @@ std::unique_ptr<SslContext> SslContext::CreateServer(const TlsConfig& config) {
     if (!ConfigureTlsProtocolVersions(
             ctx, config.min_version, config.max_version)) {
         LOG_ERROR("invalid TLS server protocol version policy");
-        SSL_CTX_free(ctx);
         return nullptr;
     }
 
     if (!config.pem) {
         LOG_ERROR("TLS certificate files were not loaded with the configuration");
-        SSL_CTX_free(ctx);
         return nullptr;
     }
     if (!ConfigureTlsCertificatePem(ctx, *config.pem)) {
         LOG_ERROR("failed to load TLS certificate from {}", config.cert_file);
-        SSL_CTX_free(ctx);
         return nullptr;
     }
 
-    auto out = std::unique_ptr<SslContext>(new SslContext(ctx));
+    auto out = std::unique_ptr<SslContext>(new SslContext(owner.release()));
     if (!out->ConfigureServerAlpn(config.alpn)) {
         LOG_ERROR("invalid TLS server ALPN policy");
         return nullptr;
@@ -203,26 +202,25 @@ std::unique_ptr<SslContext> SslContext::CreateAutoSignSnapshot(const TlsConfig& 
         return nullptr;
     }
 
-    SSL_CTX* ctx = SSL_CTX_new(TLS_server_method());
+    bssl::UniquePtr<SSL_CTX> owner(SSL_CTX_new(TLS_server_method()));
+    SSL_CTX* ctx = owner.get();
     if (!ctx) return nullptr;
 
     if (!ConfigureTlsProtocolVersions(
             ctx, config.min_version, config.max_version)) {
         LOG_ERROR("invalid auto-sign TLS protocol version policy");
-        SSL_CTX_free(ctx);
         return nullptr;
     }
 
     if (SSL_CTX_use_certificate(ctx, material->Certificate()) != 1 ||
         SSL_CTX_use_PrivateKey(ctx, material->Key()) != 1) {
         LOG_ERROR("failed to install default self-signed TLS certificate");
-        SSL_CTX_free(ctx);
         return nullptr;
     }
 
     LOG_INFO("TLS auto-sign certificate created (domain={} validity=one year renewal=30 days before expiry)",
              default_name);
-    auto out = std::unique_ptr<SslContext>(new SslContext(ctx));
+    auto out = std::unique_ptr<SslContext>(new SslContext(owner.release()));
     if (!out->ConfigureServerAlpn(config.alpn)) {
         LOG_ERROR("invalid auto-sign TLS ALPN policy");
         return nullptr;
@@ -1358,19 +1356,17 @@ net::awaitable<std::unique_ptr<TlsStream>> WrapRealityClient(
 namespace transport::internet {
 namespace {
 
-EVP_PKEY* GenerateEcP256Key() {
-    EVP_PKEY_CTX* pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, nullptr);
+bssl::UniquePtr<EVP_PKEY> GenerateEcP256Key() {
+    bssl::UniquePtr<EVP_PKEY_CTX> pctx(EVP_PKEY_CTX_new_id(EVP_PKEY_EC, nullptr));
     EVP_PKEY* generated = nullptr;
     if (!pctx ||
-        EVP_PKEY_keygen_init(pctx) <= 0 ||
-        EVP_PKEY_CTX_set_ec_paramgen_curve_nid(pctx, NID_X9_62_prime256v1) <= 0 ||
-        EVP_PKEY_keygen(pctx, &generated) <= 0) {
-        if (pctx) EVP_PKEY_CTX_free(pctx);
-        if (generated) EVP_PKEY_free(generated);
+        EVP_PKEY_keygen_init(pctx.get()) <= 0 ||
+        EVP_PKEY_CTX_set_ec_paramgen_curve_nid(pctx.get(), NID_X9_62_prime256v1) <= 0 ||
+        EVP_PKEY_keygen(pctx.get(), &generated) <= 0) {
+        EVP_PKEY_free(generated);
         return nullptr;
     }
-    EVP_PKEY_CTX_free(pctx);
-    return generated;
+    return bssl::UniquePtr<EVP_PKEY>(generated);
 }
 
 bool PushGeneralName(GENERAL_NAMES* names, int type, ASN1_STRING* value) {
@@ -1420,21 +1416,15 @@ bool AddSubjectAlternativeNames(X509* certificate, const std::string& identity) 
         }
     }
 
-    X509_EXTENSION* extension = built
+    bssl::UniquePtr<X509_EXTENSION> extension(built
         ? X509V3_EXT_i2d(NID_subject_alt_name, 0, names)
-        : nullptr;
-    const bool added = extension && X509_add_ext(certificate, extension, -1) == 1;
-    if (extension) X509_EXTENSION_free(extension);
+        : nullptr);
+    const bool added = extension && X509_add_ext(certificate, extension.get(), -1) == 1;
     GENERAL_NAMES_free(names);
     return added;
 }
 
 }  // namespace
-
-AutoSignCertificate::~AutoSignCertificate() {
-    X509_free(certificate_);
-    EVP_PKEY_free(key_);
-}
 
 std::unique_ptr<AutoSignCertificate> AutoSignCertificate::Create(std::string_view identity) {
     // RFC 5280's commonName limit is 64 characters, not a DNS SAN limit.
@@ -1444,15 +1434,15 @@ std::unique_ptr<AutoSignCertificate> AutoSignCertificate::Create(std::string_vie
     if (identity.empty() || identity.ends_with('.')) return {};
     const std::string name_text(identity);
     const std::string_view cn = identity.size() <= 64
-        ? identity : std::string_view("acppnode self-signed certificate");
+        ? identity : std::string_view("cnode self-signed certificate");
     auto material = std::unique_ptr<AutoSignCertificate>(new AutoSignCertificate);
     material->key_ = GenerateEcP256Key();
-    material->certificate_ = X509_new();
+    material->certificate_.reset(X509_new());
     if (!material->key_ || !material->certificate_) {
         ERR_clear_error();
         return {};
     }
-    X509* x509 = material->certificate_;
+    X509* x509 = material->certificate_.get();
     X509_NAME* name = X509_get_subject_name(x509);
     // These credentials are regenerated on configuration reload/restart,
     // never in response to untrusted ClientHello traffic.
@@ -1461,7 +1451,7 @@ std::unique_ptr<AutoSignCertificate> AutoSignCertificate::Create(std::string_vie
         ASN1_INTEGER_set(X509_get_serialNumber(x509), 1) != 1 ||
         !X509_gmtime_adj(X509_get_notBefore(x509), -300) ||
         !X509_gmtime_adj(X509_get_notAfter(x509), kValiditySeconds) ||
-        X509_set_pubkey(x509, material->key_) != 1 ||
+        X509_set_pubkey(x509, material->key_.get()) != 1 ||
         !name ||
         X509_NAME_add_entry_by_txt(
             name, "CN", MBSTRING_ASC,
@@ -1469,7 +1459,7 @@ std::unique_ptr<AutoSignCertificate> AutoSignCertificate::Create(std::string_vie
             static_cast<int>(cn.size()), -1, 0) != 1 ||
         X509_set_issuer_name(x509, name) != 1 ||
         !AddSubjectAlternativeNames(x509, name_text) ||
-        X509_sign(x509, material->key_, EVP_sha256()) <= 0) {
+        X509_sign(x509, material->key_.get(), EVP_sha256()) <= 0) {
         ERR_clear_error();
         return {};
     }
@@ -1951,7 +1941,8 @@ bool ConfigureTlsServerIdentity(
 }
 
 std::unique_ptr<SslContext> SslContext::CreateClient(const TlsConfig& config) {
-    SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
+    bssl::UniquePtr<SSL_CTX> owner(SSL_CTX_new(TLS_client_method()));
+    SSL_CTX* ctx = owner.get();
     if (!ctx) {
         LOG_ERROR("failed to create TLS client context");
         return nullptr;
@@ -1960,35 +1951,29 @@ std::unique_ptr<SslContext> SslContext::CreateClient(const TlsConfig& config) {
     if (!ConfigureTlsProtocolVersions(
             ctx, config.min_version, config.max_version)) {
         LOG_ERROR("invalid TLS client protocol version policy");
-        SSL_CTX_free(ctx);
         return nullptr;
     }
     if (!ConfigureTlsClientAlpn(ctx, config.alpn)) {
         LOG_ERROR("invalid TLS client ALPN policy");
-        SSL_CTX_free(ctx);
         return nullptr;
     }
 
     if (config.cert_file.empty() != config.key_file.empty()) {
         LOG_ERROR("TLS client certificate and private key must be configured together");
-        SSL_CTX_free(ctx);
         return nullptr;
     }
     if ((config.HasCertificatePair() || !config.ca_file.empty()) && !config.pem) {
         LOG_ERROR("TLS client files were not loaded with the configuration");
-        SSL_CTX_free(ctx);
         return nullptr;
     }
     if (config.HasCertificatePair() &&
         !ConfigureTlsCertificatePem(ctx, *config.pem)) {
         LOG_ERROR("failed to load TLS client certificate from {}", config.cert_file);
-        SSL_CTX_free(ctx);
         return nullptr;
     }
 
     if (config.allow_insecure && !config.ca_file.empty()) {
         LOG_ERROR("TLS client CA cannot be used when certificate verification is disabled");
-        SSL_CTX_free(ctx);
         return nullptr;
     }
     if (config.allow_insecure) {
@@ -2002,12 +1987,11 @@ std::unique_ptr<SslContext> SslContext::CreateClient(const TlsConfig& config) {
             LOG_ERROR("failed to load TLS client trust store from {}",
                       config.ca_file.empty() ? "system defaults"
                                              : config.ca_file);
-            SSL_CTX_free(ctx);
             return nullptr;
         }
     }
 
-    return std::unique_ptr<SslContext>(new SslContext(ctx));
+    return std::unique_ptr<SslContext>(new SslContext(owner.release()));
 }
 
 SslContext::~SslContext() = default;
@@ -2074,7 +2058,7 @@ ParseRealityMldsa65PublicKey(std::string_view value) noexcept {
 
 std::optional<std::string>
 NormalizeRealityFingerprint(std::string_view value) {
-    const std::string normalized = naming::LowerAscii(std::string(value));
+    const std::string normalized = LowerAscii(std::string(value));
     if (normalized.empty() ||
         normalized == "chrome" ||
         normalized == "firefox" ||
@@ -2113,56 +2097,14 @@ constexpr std::array<uint8_t, 32> kTls13HelloRetryRequestRandom{{
     0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c,
 }};
 
-struct ScopedCleanse {
-    void* data;
-    size_t size;
-    ~ScopedCleanse() { OPENSSL_cleanse(data, size); }
-};
-
-struct EvpPkeyDeleter {
-    void operator()(EVP_PKEY* key) const noexcept {
-        EVP_PKEY_free(key);
-    }
-};
-
-struct X509Deleter {
-    void operator()(X509* cert) const noexcept {
-        X509_free(cert);
-    }
-};
-
 struct Mldsa65PrivateKeyDeleter {
     void operator()(MLDSA65_private_key* key) const noexcept {
         OPENSSL_cleanse(key, sizeof(*key));
         delete key;
     }
 };
-
-struct Asn1ObjectDeleter {
-    void operator()(ASN1_OBJECT* obj) const noexcept {
-        ASN1_OBJECT_free(obj);
-    }
-};
-
-struct Asn1OctetStringDeleter {
-    void operator()(ASN1_OCTET_STRING* str) const noexcept {
-        ASN1_OCTET_STRING_free(str);
-    }
-};
-
-struct X509ExtensionDeleter {
-    void operator()(X509_EXTENSION* ext) const noexcept {
-        X509_EXTENSION_free(ext);
-    }
-};
-
-using UniqueEvpPkey = std::unique_ptr<EVP_PKEY, EvpPkeyDeleter>;
 using UniqueMldsa65PrivateKey =
     std::unique_ptr<MLDSA65_private_key, Mldsa65PrivateKeyDeleter>;
-using UniqueX509 = std::unique_ptr<X509, X509Deleter>;
-using UniqueAsn1Object = std::unique_ptr<ASN1_OBJECT, Asn1ObjectDeleter>;
-using UniqueAsn1OctetString = std::unique_ptr<ASN1_OCTET_STRING, Asn1OctetStringDeleter>;
-using UniqueX509Extension = std::unique_ptr<X509_EXTENSION, X509ExtensionDeleter>;
 
 struct RealityServerState final {
     ~RealityServerState() {
@@ -2175,7 +2117,7 @@ struct RealityServerState final {
     std::optional<transport::internet::RealityClientVersion> min_client_version;
     std::optional<transport::internet::RealityClientVersion> max_client_version;
     uint64_t max_time_diff_ms = 0;
-    UniqueEvpPkey ed25519_key;
+    bssl::UniquePtr<EVP_PKEY> ed25519_key;
     std::array<uint8_t, 32> ed25519_public{};
     UniqueMldsa65PrivateKey mldsa65_key;
     std::vector<uint8_t> certificate_template;
@@ -2251,7 +2193,7 @@ void FreeRealityServerConnState(void* /*parent*/,
     std::span<const uint8_t, kRealityX25519KeySize> peer_public,
     std::span<const uint8_t, 20> random_salt) noexcept {
     std::array<uint8_t, kRealityX25519KeySize> shared{};
-    const ScopedCleanse wipe_shared{shared.data(), shared.size()};
+    const ScopedCleanse wipe_shared{shared};
     if (X25519(shared.data(), state.private_key.data(), peer_public.data()) != 1) {
         return std::nullopt;
     }
@@ -2266,7 +2208,7 @@ void FreeRealityServerConnState(void* /*parent*/,
     std::span<const uint8_t> shared,
     std::span<const uint8_t, 20> random_salt) noexcept {
     std::array<uint8_t, 32> auth_key{};
-    const ScopedCleanse wipe_auth{auth_key.data(), auth_key.size()};
+    const ScopedCleanse wipe_auth{auth_key};
     static constexpr std::string_view kRealityInfo = "REALITY";
     if (HKDF(auth_key.data(),
              auth_key.size(),
@@ -2310,7 +2252,7 @@ OpenRealitySessionId(
     std::span<const uint8_t, kRealitySessionIdSize> ciphertext,
     std::span<const uint8_t> aad) noexcept {
     std::array<uint8_t, kRealityPlainAuthSize> plain{};
-    const ScopedCleanse wipe_plain{plain.data(), plain.size()};
+    const ScopedCleanse wipe_plain{plain};
     size_t plain_len = 0;
     if (!WithRealitySessionIdAead(auth_key, [&](EVP_AEAD_CTX& aead) noexcept {
             return EVP_AEAD_CTX_open(&aead,
@@ -2442,12 +2384,12 @@ int RealityClientHelloCallback(SSL* /*ssl*/,
     if (!auth_key) {
         return 0;
     }
-    const ScopedCleanse wipe_auth{auth_key->data(), auth_key->size()};
+    const ScopedCleanse wipe_auth{*auth_key};
 
     auto plain = BuildRealityClientAuthPlain(
         std::span<const uint8_t, kRealityShortIdSize>(
             state->short_id.data(), state->short_id.size()));
-    const ScopedCleanse wipe_plain{plain.data(), plain.size()};
+    const ScopedCleanse wipe_plain{plain};
     auto encrypted = SealRealitySessionId(
         std::span<const uint8_t, 32>(auth_key->data(), auth_key->size()),
         std::span<const uint8_t, kRealityAesGcmNonceSize>(
@@ -2508,7 +2450,7 @@ bool VerifyRealityClientHandshake(
         return false;
     }
 
-    UniqueX509 cert(SSL_get_peer_certificate(ssl));
+    bssl::UniquePtr<X509> cert(SSL_get_peer_certificate(ssl));
     if (!cert) {
         LOG_NET_DEBUG("REALITY client verification failed > missing peer certificate");
         return false;
@@ -2543,7 +2485,7 @@ bool VerifyRealityClientHandshake(
     }
 
     std::array<uint8_t, 64> expected{};
-    const ScopedCleanse wipe_expected{expected.data(), expected.size()};
+    const ScopedCleanse wipe_expected{expected};
     unsigned int expected_len = 0;
     if (!HMAC(EVP_sha512(),
               state.auth_key.data(),
@@ -2583,7 +2525,7 @@ bool VerifyRealityClientHandshake(
         }
 
         std::array<uint8_t, 64> mldsa_msg{};
-        const ScopedCleanse wipe_mldsa_msg{mldsa_msg.data(), mldsa_msg.size()};
+        const ScopedCleanse wipe_mldsa_msg{mldsa_msg};
         if (!ComputeRealityTranscriptHmac(
                 state.auth_key,
                 peer_public,
@@ -2657,7 +2599,7 @@ namespace {
     return matched;
 }
 
-[[nodiscard]] UniqueX509 BuildRealityCertificate(
+[[nodiscard]] bssl::UniquePtr<X509> BuildRealityCertificate(
     const RealityServerState& state,
     std::span<const uint8_t, 32> auth_key,
     std::span<const uint8_t> mldsa65_signature = {}) {
@@ -2665,14 +2607,14 @@ namespace {
     // Only that HMAC (and optional transcript-bound ML-DSA) is per-session;
     // the ordinary Ed25519 certificate signature is prepared once at startup.
     const uint8_t* encoded = state.certificate_template.data();
-    UniqueX509 cert(d2i_X509(nullptr, &encoded, state.certificate_template.size()));
+    bssl::UniquePtr<X509> cert(d2i_X509(nullptr, &encoded, state.certificate_template.size()));
     if (!cert) return {};
 
     if (!mldsa65_signature.empty()) {
         static constexpr uint8_t kOidZero[] = {0x00};
-        UniqueAsn1Object oid(ASN1_OBJECT_create(
+        bssl::UniquePtr<ASN1_OBJECT> oid(ASN1_OBJECT_create(
             NID_undef, kOidZero, sizeof(kOidZero), nullptr, nullptr));
-        UniqueAsn1OctetString value(ASN1_OCTET_STRING_new());
+        bssl::UniquePtr<ASN1_OCTET_STRING> value(ASN1_OCTET_STRING_new());
         if (!oid ||
             !value ||
             ASN1_OCTET_STRING_set(
@@ -2681,7 +2623,7 @@ namespace {
                 static_cast<int>(mldsa65_signature.size())) != 1) {
             return {};
         }
-        UniqueX509Extension ext(X509_EXTENSION_create_by_OBJ(
+        bssl::UniquePtr<X509_EXTENSION> ext(X509_EXTENSION_create_by_OBJ(
             nullptr, oid.get(), 0, value.get()));
         if (!ext || X509_add_ext(cert.get(), ext.get(), 0) != 1) {
             return {};
@@ -2693,7 +2635,7 @@ namespace {
     }
 
     std::array<uint8_t, 64> signature{};
-    const ScopedCleanse wipe_signature{signature.data(), signature.size()};
+    const ScopedCleanse wipe_signature{signature};
     unsigned int signature_len = 0;
     if (!HMAC(EVP_sha512(),
               auth_key.data(),
@@ -2755,7 +2697,7 @@ void RealityServerMsgCallback(int is_write,
     }
 
     std::array<uint8_t, 64> mldsa_msg{};
-    const ScopedCleanse wipe_mldsa_msg{mldsa_msg.data(), mldsa_msg.size()};
+    const ScopedCleanse wipe_mldsa_msg{mldsa_msg};
     if (!ComputeRealityTranscriptHmac(
             conn_state->auth_key,
             state->ed25519_public,
@@ -2884,7 +2826,7 @@ VerifyRealityClientHelloHandshake(
     if (!auth_key) {
         return nullptr;
     }
-    const ScopedCleanse wipe_auth{auth_key->data(), auth_key->size()};
+    const ScopedCleanse wipe_auth{*auth_key};
 
     std::array<uint8_t, kRealitySessionIdSize> session_id{};
     std::copy_n(handshake.data() + 4 + 35, kRealitySessionIdSize, session_id.data());
@@ -2896,7 +2838,7 @@ VerifyRealityClientHelloHandshake(
         session_id,
         handshake);
     if (!plain) return nullptr;
-    const ScopedCleanse wipe_plain{plain->data(), plain->size()};
+    const ScopedCleanse wipe_plain{*plain};
     if (!IsRealityClientAuthAllowed(state, *plain)) return nullptr;
 
     auto conn_state = std::make_unique<RealityServerConnState>();
@@ -3001,7 +2943,7 @@ VerifyRealityClientHelloHandshake(
     }
 
     std::array<uint8_t, 32> seed{};
-    const ScopedCleanse wipe_seed{seed.data(), seed.size()};
+    const ScopedCleanse wipe_seed{seed};
     if (RAND_bytes(seed.data(), static_cast<int>(seed.size())) != 1) {
         LOG_ERROR("REALITY Ed25519 seed generation failed");
         return {};
@@ -3026,7 +2968,7 @@ VerifyRealityClientHelloHandshake(
         return {};
     }
 
-    UniqueX509 certificate(X509_new());
+    bssl::UniquePtr<X509> certificate(X509_new());
     if (!certificate ||
         X509_set_version(certificate.get(), 2) != 1 ||
         ASN1_INTEGER_set(X509_get_serialNumber(certificate.get()), 0) != 1 ||
@@ -3160,7 +3102,8 @@ std::unique_ptr<SslContext> SslContext::CreateServerReality(
         return nullptr;
     }
 
-    SSL_CTX* ctx = SSL_CTX_new(TLS_server_method());
+    bssl::UniquePtr<SSL_CTX> owner(SSL_CTX_new(TLS_server_method()));
+    SSL_CTX* ctx = owner.get();
     if (!ctx) {
         LOG_ERROR("failed to create REALITY server TLS context");
         return nullptr;
@@ -3175,7 +3118,6 @@ std::unique_ptr<SslContext> SslContext::CreateServerReality(
     if (state_index < 0 ||
         SSL_CTX_set_ex_data(ctx, state_index, state.get()) != 1) {
         LOG_ERROR("failed to attach REALITY server state");
-        SSL_CTX_free(ctx);
         return nullptr;
     }
     auto* raw_state = state.release();
@@ -3184,7 +3126,7 @@ std::unique_ptr<SslContext> SslContext::CreateServerReality(
         SSL_CTX_set_msg_callback(ctx, RealityServerMsgCallback);
     }
 
-    auto out = std::unique_ptr<SslContext>(new SslContext(ctx));
+    auto out = std::unique_ptr<SslContext>(new SslContext(owner.release()));
     if (!out->ConfigureServerAlpn(tls_config.alpn)) {
         LOG_ERROR("invalid REALITY server ALPN policy");
         return nullptr;
@@ -3204,7 +3146,8 @@ std::unique_ptr<SslContext> SslContext::CreateClientReality(
     }
 
     const SSL_METHOD* method = TLS_client_method();
-    SSL_CTX* ctx = SSL_CTX_new(method);
+    bssl::UniquePtr<SSL_CTX> owner(SSL_CTX_new(method));
+    SSL_CTX* ctx = owner.get();
     if (!ctx) {
         LOG_ERROR("failed to create REALITY client TLS context");
         return nullptr;
@@ -3216,12 +3159,10 @@ std::unique_ptr<SslContext> SslContext::CreateClientReality(
     SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nullptr);
     if (!ConfigureRealityClientFingerprint(ctx, reality.fingerprint) ||
         !ConfigureRealityClientKeyExchange(ctx, reality.fingerprint)) {
-        SSL_CTX_free(ctx);
         return nullptr;
     }
     if (!ConfigureTlsClientAlpn(ctx, tls_config.alpn)) {
         LOG_ERROR("invalid REALITY client ALPN policy");
-        SSL_CTX_free(ctx);
         return nullptr;
     }
 
@@ -3232,20 +3173,18 @@ std::unique_ptr<SslContext> SslContext::CreateClientReality(
                  reality.mldsa65_verify->size());
         if (MLDSA65_parse_public_key(&state->mldsa65_verify_key, &encoded) != 1) {
             LOG_ERROR("REALITY client ML-DSA-65 public key initialization failed");
-            SSL_CTX_free(ctx);
             return nullptr;
         }
         const int state_index = RealityClientContextStateExIndex();
         if (state_index < 0 ||
             SSL_CTX_set_ex_data(ctx, state_index, state.get()) != 1) {
             LOG_ERROR("failed to attach REALITY client state to TLS context");
-            SSL_CTX_free(ctx);
             return nullptr;
         }
         (void)state.release();
     }
 
-    return std::unique_ptr<SslContext>(new SslContext(ctx));
+    return std::unique_ptr<SslContext>(new SslContext(owner.release()));
 }
 
 bool TlsStream::SetRealityClient(const RealityConfig& reality) {

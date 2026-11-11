@@ -14,7 +14,7 @@
 #include "app/stats.hpp"
 #include "common/allocator.hpp"
 #include "common/ip_utils.hpp"
-#include "common/container_util.hpp"
+#include "common/hash_container_shrink.hpp"
 #include "common/session.hpp"
 #include "infra/log.hpp"
 #include "common/error.hpp"
@@ -22,15 +22,15 @@
 #include "app/proxyman/outbound/handler.hpp"
 #include "transport/internet/outbound_target_builder.hpp"
 #include "transport/internet/timeout_scheduler.hpp"
+#include "transport/failure.hpp"
+#include "common/scoped_cleanse.hpp"
 
 #include <asio/experimental/channel.hpp>
-#include <openssl/crypto.h>
 #include <algorithm>
 #include <chrono>
 #include <exception>
 #include <limits>
 #include <format>
-#include <new>
 #include <stdexcept>
 #include <memory>
 #include <optional>
@@ -53,18 +53,6 @@ namespace proxy::anytls::outbound {
 using namespace ::anytls;
 
 namespace {
-
-// Classify before CloseAll broadcasts cancellation to logical consumers. An
-// unknown physical write failure must not arrive at a relay as a read failure.
-ErrorCode SessionExceptionError(const std::exception_ptr& failure,
-                               ErrorCode unknown = ErrorCode::INTERNAL) noexcept {
-    try { std::rethrow_exception(failure); }
-    catch (const transport::LinkError& e) { return e.code(); }
-    catch (const std::bad_alloc&) { return ErrorCode::RESOURCE_EXHAUSTED; }
-    catch (const IoSystemError& e) { return MapAsioError(e.code()); }
-    catch (...) { return unknown; }
-}
-
 
 tl::expected<std::chrono::seconds, std::string> ReadPositiveSeconds(
     const json::object& source,
@@ -112,14 +100,7 @@ tl::expected<Settings, std::string> ParseSettings(const json::object& source) {
     auto source_password = ParseJsonString(source, "password");
     if (!source_password) return tl::unexpected(std::move(source_password.error()));
     auto password = std::move(*source_password).value_or(std::string{});
-    struct CleansePassword {
-        std::string& str;
-        ~CleansePassword() noexcept {
-            if (!str.empty()) {
-                OPENSSL_cleanse(str.data(), str.size());
-            }
-        }
-    } cleanse_password{password};
+    ScopedCleanse cleanse_password{password};
     auto check_interval = ReadPositiveSeconds(
         source,
         "idleSessionCheckInterval",
@@ -430,7 +411,8 @@ struct Handler::ClientSession {
             opening_scheme_.reset();
             co_return tl::expected<void, ErrorCode>{};
         } catch (...) {
-            CloseAll(SessionExceptionError(std::current_exception(), ErrorCode::RELAY_WRITE_FAILED));
+            // 未知异常按写失败归类：物理写失败不能以读失败形态到达 relay。
+            CloseAll(transport::ClassifyFailure(std::current_exception(), ErrorCode::RELAY_WRITE_FAILED));
             throw;
         }
     }
@@ -457,7 +439,7 @@ struct Handler::ClientSession {
             }
             co_return tl::expected<void, ErrorCode>{};
         } catch (...) {
-            CloseAll(SessionExceptionError(std::current_exception(), ErrorCode::RELAY_WRITE_FAILED));
+            CloseAll(transport::ClassifyFailure(std::current_exception(), ErrorCode::RELAY_WRITE_FAILED));
             throw;
         }
     }
@@ -494,7 +476,7 @@ struct Handler::ClientSession {
             }
             co_return tl::expected<void, ErrorCode>{};
         } catch (...) {
-            CloseAll(SessionExceptionError(std::current_exception(), ErrorCode::RELAY_WRITE_FAILED));
+            CloseAll(transport::ClassifyFailure(std::current_exception(), ErrorCode::RELAY_WRITE_FAILED));
             throw;
         }
     }
@@ -522,7 +504,7 @@ struct Handler::ClientSession {
             }
             co_return tl::expected<void, ErrorCode>{};
         } catch (...) {
-            CloseAll(SessionExceptionError(std::current_exception(), ErrorCode::RELAY_WRITE_FAILED));
+            CloseAll(transport::ClassifyFailure(std::current_exception(), ErrorCode::RELAY_WRITE_FAILED));
             throw;
         }
     }
@@ -831,7 +813,7 @@ private:
         } catch (...) {
             failure = std::current_exception();
         }
-        const ErrorCode error = failure ? SessionExceptionError(failure)
+        const ErrorCode error = failure ? transport::ClassifyFailure(failure, ErrorCode::INTERNAL)
                                         : ErrorCode::CONNECTION_CLOSED;
         // A loop that returned or threw must never remain reusable.
         // CloseAll retains the first terminal cause.
@@ -982,16 +964,7 @@ DialPhysicalSession(
     const size_t auth_packet_size = 34 + static_cast<size_t>(auth_padding_size);
     std::array<uint8_t, 256> inline_auth{};
     memory::ByteVector heap_auth;
-    struct CleanseAuthPacket {
-        std::array<uint8_t, 256>& stack_buf;
-        memory::ByteVector& heap_buf;
-        ~CleanseAuthPacket() noexcept {
-            OPENSSL_cleanse(stack_buf.data(), stack_buf.size());
-            if (!heap_buf.empty()) {
-                OPENSSL_cleanse(heap_buf.data(), heap_buf.size());
-            }
-        }
-    } cleanse_auth_packet{inline_auth, heap_auth};
+    ScopedCleanse cleanse_auth_packet{inline_auth, heap_auth};
     uint8_t* auth_ptr = inline_auth.data();
     if (auth_packet_size > inline_auth.size()) {
         heap_auth.assign(auth_packet_size, uint8_t{0});

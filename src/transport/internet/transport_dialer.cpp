@@ -1,10 +1,11 @@
 #include "transport/internet/outbound_target_builder.hpp"
 #include "app/dns/dns.hpp"
 #include "common/allocator.hpp"
+#include "common/hash.hpp"
 #include "common/ip_utils.hpp"
 #include "core/constants.hpp"
 #include "transport/internet/http_headers.hpp"
-#include "common/buffer_util.hpp"
+#include "common/const_buffer_span.hpp"
 #include "transport/internet/async_write_gate.hpp"
 #include "common/session.hpp"
 #include "transport/internet/tcp_stream.hpp"
@@ -1021,19 +1022,8 @@ net::awaitable<DialResult> DialXHttpSplitOutboundTransport(
 }
 
 
-uint64_t MixHash(uint64_t value) noexcept {
-    value += 0x9e3779b97f4a7c15ull;
-    value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ull;
-    value = (value ^ (value >> 27)) * 0x94d049bb133111ebull;
-    return value ^ (value >> 31);
-}
-
 uint64_t IpKeyHash(std::string_view ip) noexcept {
-    uint64_t value = 14695981039346656037ull;
-    for (const unsigned char byte : ip) {
-        value = (value ^ byte) * 1099511628211ull;
-    }
-    return MixHash(value);
+    return Mix64(Fnv1a64(ip));
 }
 
 uint64_t UserKeyHash(
@@ -1044,21 +1034,12 @@ uint64_t UserKeyHash(
     if (user_id <= 0 && user_email.empty()) {
         return IpKeyHash(fallback_ip);
     }
-    uint64_t value = 14695981039346656037ull;
-    for (const unsigned char byte : inbound_tag) {
-        value = (value ^ byte) * 1099511628211ull;
-    }
-    value = (value ^ 0xffu) * 1099511628211ull;
+    uint64_t value = Fnv1a64Step(Fnv1a64(inbound_tag), 0xff);
     const uint64_t uid = user_id > 0 ? static_cast<uint64_t>(user_id) : 0;
     for (unsigned shift = 0; shift < 64; shift += 8) {
-        value = (value ^ static_cast<unsigned char>(uid >> shift)) *
-                1099511628211ull;
+        value = Fnv1a64Step(value, static_cast<uint8_t>(uid >> shift));
     }
-    value = (value ^ 0xffu) * 1099511628211ull;
-    for (const unsigned char byte : user_email) {
-        value = (value ^ byte) * 1099511628211ull;
-    }
-    return MixHash(value);
+    return Mix64(Fnv1a64(user_email, Fnv1a64Step(value, 0xff)));
 }
 
 uint64_t RandomIndex() noexcept {
@@ -1237,7 +1218,7 @@ std::optional<net::ip::address> OutboundBind::BindAddressFor(
 std::optional<OutboundBind> OutboundBind::Parse(std::string_view value) {
     OutboundBind bind;
     if (value.empty()) return bind;
-    if (transport::internet::EqualsAsciiCI(value, constants::binding::kAuto)) return Auto();
+    if (EqualsAsciiCI(value, constants::binding::kAuto)) return Auto();
 
     auto address = iputil::ParseLiteral(value);
     if (!address) return std::nullopt;
@@ -1324,7 +1305,7 @@ OutboundBind::Selection OutboundBind::Select(
         const auto v6 = entry.network_or_ip.to_v6();
         auto bytes = v6.to_bytes();
         const uint64_t high = key;
-        const uint64_t low = policy_ == ChoicePolicy::Random ? RandomIndex() : MixHash(key);
+        const uint64_t low = policy_ == ChoicePolicy::Random ? RandomIndex() : Mix64(key);
         for (size_t i = 0; i < bytes.size(); ++i) {
             const unsigned bits = entry.prefix_length > i * 8
                 ? std::min<unsigned>(8, entry.prefix_length - static_cast<unsigned>(i * 8))

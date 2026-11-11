@@ -621,7 +621,7 @@ SniffResult SniffHttp(std::span<const uint8_t> data) {
         if (!transport::internet::SplitAndValidateHttpHeaderLine(line, name, value)) {
             return result;
         }
-        if (!transport::internet::EqualsAsciiCI(name, "host")) continue;
+        if (!EqualsAsciiCI(name, "host")) continue;
         // RFC 9112 §3.2: more than one Host field is a bad request.
         if (host) return result;
         host = ParseHostValue(value);

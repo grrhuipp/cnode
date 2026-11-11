@@ -1,13 +1,14 @@
 #pragma once
 
 #include "proxy/outbound_stream_endpoint.hpp"
+#include "app/relay.hpp"
 #include "common/allocator.hpp"
 #include "common/asio_types.hpp"
 #include "common/buf/multi_buffer.hpp"
 #include "common/error.hpp"
 #include "common/sharded_user_stats.hpp"
 #include "common/target_address.hpp"
-#include "common/unsafe.hpp"
+#include <openssl/mem.h>
 #include "infra/json.hpp"
 #include "proxy/anytls_padding.hpp"
 #include "proxy/inbound.hpp"
@@ -213,7 +214,7 @@ struct Settings {
     Settings(Settings&&) noexcept = default;
     Settings& operator=(Settings&&) noexcept = default;
     ~Settings() noexcept {
-        ::SecureZeroMemory(password_hash.data(), password_hash.size());
+        OPENSSL_cleanse(password_hash.data(), password_hash.size());
     }
 };
 

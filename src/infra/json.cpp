@@ -1,4 +1,5 @@
 #include "infra/json.hpp"
+#include "common/ascii.hpp"
 #include "common/binary_text_codec.hpp"
 
 #include <charconv>
@@ -19,15 +20,9 @@ void array_deleter::operator()(array* ptr) const noexcept {
 
 namespace {
 
-unsigned char LowerAscii(unsigned char c) noexcept {
-    return c >= 'A' && c <= 'Z' ? static_cast<unsigned char>(c + ('a' - 'A')) : c;
-}
-
 void NormalizeKey(std::string& key, KeyComparison comparison) noexcept {
     if (comparison != KeyComparison::AsciiCaseInsensitive) return;
-    for (char& c : key) {
-        c = static_cast<char>(LowerAscii(static_cast<unsigned char>(c)));
-    }
+    LowerAsciiInPlace(key);
 }
 
 }  // namespace
@@ -38,8 +33,8 @@ bool object::key_compare::operator()(std::string_view lhs,
 
     const size_t length = lhs.size() < rhs.size() ? lhs.size() : rhs.size();
     for (size_t i = 0; i < length; ++i) {
-        const auto left = LowerAscii(static_cast<unsigned char>(lhs[i]));
-        const auto right = LowerAscii(static_cast<unsigned char>(rhs[i]));
+        const auto left = ToLowerAscii(static_cast<unsigned char>(lhs[i]));
+        const auto right = ToLowerAscii(static_cast<unsigned char>(rhs[i]));
         if (left != right) return left < right;
     }
     return lhs.size() < rhs.size();
@@ -164,25 +159,17 @@ value::value(const object& v) : data_(object_ptr(new object(v))) {}
 value::value(object&& v) : data_(object_ptr(new object(std::move(v)))) {}
 value::value(const array& v) : data_(array_ptr(new array(v))) {}
 value::value(array&& v) : data_(array_ptr(new array(std::move(v)))) {}
-value::value(const value& other) : data_(nullptr) {
-    if (other.is_null()) {
-        data_ = nullptr;
-    } else if (other.is_bool()) {
-        data_ = other.as_bool();
-    } else if (other.is_int64()) {
-        data_ = other.as_int64();
-    } else if (other.is_uint64()) {
-        data_ = other.as_uint64();
-    } else if (other.is_double()) {
-        data_ = other.as_double();
-    } else if (other.is_string()) {
-        data_ = other.as_string();
-    } else if (other.is_object()) {
-        data_ = object_ptr(new object(other.as_object()));
-    } else if (other.is_array()) {
-        data_ = array_ptr(new array(other.as_array()));
-    }
-}
+value::value(const value& other)
+    : data_(std::visit([](const auto& alternative) -> data_type {
+          using Alternative = std::decay_t<decltype(alternative)>;
+          if constexpr (std::is_same_v<Alternative, object_ptr>) {
+              return object_ptr(new object(*alternative));
+          } else if constexpr (std::is_same_v<Alternative, array_ptr>) {
+              return array_ptr(new array(*alternative));
+          } else {
+              return alternative;
+          }
+      }, other.data_)) {}
 value::value(value&& other) noexcept = default;
 value& value::operator=(const value& other) {
     if (this != &other) {
@@ -541,43 +528,47 @@ void SerializeString(const std::string& s, std::string& out) {
     out.push_back('"');
 }
 
+template <typename... Handlers>
+struct Overloaded : Handlers... {
+    using Handlers::operator()...;
+};
+
 void SerializeValue(const value& v, std::string& out) {
-    if (v.is_null()) {
-        out += "null";
-    } else if (v.is_bool()) {
-        out += v.as_bool() ? "true" : "false";
-    } else if (v.is_int64()) {
-        out += std::to_string(v.as_int64());
-    } else if (v.is_uint64()) {
-        out += std::to_string(v.as_uint64());
-    } else if (v.is_double()) {
-        if (!std::isfinite(v.as_double())) {
-            throw std::invalid_argument("json number must be finite");
+    v.visit(Overloaded{
+        [&](std::nullptr_t) { out += "null"; },
+        [&](bool b) { out += b ? "true" : "false"; },
+        [&](int64_t n) { out += std::to_string(n); },
+        [&](uint64_t n) { out += std::to_string(n); },
+        [&](double d) {
+            if (!std::isfinite(d)) {
+                throw std::invalid_argument("json number must be finite");
+            }
+            out += std::format("{}", d);
+        },
+        [&](const std::string& s) { SerializeString(s, out); },
+        [&](const array& items) {
+            out.push_back('[');
+            bool first = true;
+            for (const auto& item : items) {
+                if (!first) out.push_back(',');
+                first = false;
+                SerializeValue(item, out);
+            }
+            out.push_back(']');
+        },
+        [&](const object& members) {
+            out.push_back('{');
+            bool first = true;
+            for (const auto& [key, item] : members) {
+                if (!first) out.push_back(',');
+                first = false;
+                SerializeString(key, out);
+                out.push_back(':');
+                SerializeValue(item, out);
+            }
+            out.push_back('}');
         }
-        out += std::format("{}", v.as_double());
-    } else if (v.is_string()) {
-        SerializeString(v.as_string(), out);
-    } else if (v.is_array()) {
-        out.push_back('[');
-        bool first = true;
-        for (const auto& item : v.as_array()) {
-            if (!first) out.push_back(',');
-            first = false;
-            SerializeValue(item, out);
-        }
-        out.push_back(']');
-    } else {
-        out.push_back('{');
-        bool first = true;
-        for (const auto& [key, item] : v.as_object()) {
-            if (!first) out.push_back(',');
-            first = false;
-            SerializeString(key, out);
-            out.push_back(':');
-            SerializeValue(item, out);
-        }
-        out.push_back('}');
-    }
+    });
 }
 
 }  // namespace

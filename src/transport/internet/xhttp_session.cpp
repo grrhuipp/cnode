@@ -1,9 +1,9 @@
-#include "xhttp_session.hpp"
+#include "transport/internet/xhttp_session.hpp"
 
-#include "http1_handshake.hpp"
+#include "transport/internet/http1_handshake.hpp"
 #include "app/session_group_executor.hpp"
 #include "common/awaitable_task_group.hpp"
-#include "common/buffer_util.hpp"
+#include "common/const_buffer_span.hpp"
 #include "infra/log.hpp"
 #include "transport/internet/http_headers.hpp"
 #include "transport/internet/tcp_stream.hpp"

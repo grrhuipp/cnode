@@ -1,4 +1,5 @@
 #include "app/proxyman/outbound/handler.hpp"
+#include "app/relay.hpp"
 
 #include "app/dns/dns.hpp"
 #include <map>

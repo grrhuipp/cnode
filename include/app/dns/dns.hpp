@@ -4,10 +4,11 @@
 #include "common/asio_types.hpp"
 #include "common/byte_reader.hpp"
 #include "common/clock.hpp"
-#include "common/container_util.hpp"
+#include "common/hash_container_shrink.hpp"
 #include "common/defaults.hpp"
 #include "common/error.hpp"
 #include "transport/internet/timeout_scheduler.hpp"
+#include "common/ascii.hpp"
 #include "common/awaitable_task_group.hpp"
 
 #include <asio/as_tuple.hpp>
@@ -389,9 +390,8 @@ private:
                 return pos + 4 <= packet.size() && expected + 4 == query.size() &&
                     std::equal(query.begin() + expected, query.end(), packet.begin() + pos);
             }
-            auto lower = [](uint8_t c) { return c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c; };
             for (size_t i = 0; i < length; ++i) {
-                if (lower(packet[pos++]) != lower(query[expected++])) return false;
+                if (ToLowerAscii(packet[pos++]) != ToLowerAscii(query[expected++])) return false;
             }
         }
         return false;

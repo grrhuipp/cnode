@@ -63,8 +63,8 @@ namespace {
 void NormalizeInPlace(StreamSettings& settings) {
     // 仅初始化/配置更新时调用，热路径不再做字符串比较
     settings.prepared_security.reset();
-    settings.network = naming::LowerAscii(std::move(settings.network));
-    settings.security = naming::LowerAscii(std::move(settings.security));
+    settings.network = LowerAscii(std::move(settings.network));
+    settings.security = LowerAscii(std::move(settings.security));
 
     settings.network_mode = ParseNetworkMode(settings.network);
     if (settings.network_mode == NetworkMode::Http && settings.network == "h2") {
@@ -126,7 +126,6 @@ void NormalizeInPlace(StreamSettings& settings) {
 }  // namespace
 
 NetworkMode ParseNetworkMode(std::string_view network) noexcept {
-    using transport::internet::EqualsAsciiCI;
     if (network.empty() || EqualsAsciiCI(network, constants::protocol::kTcp) ||
         EqualsAsciiCI(network, constants::protocol::kRaw)) {
         return NetworkMode::Tcp;

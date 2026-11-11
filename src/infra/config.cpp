@@ -91,7 +91,7 @@ OutboundSourceConfig OutboundSourceConfig::FromJson(const json::object& j) {
     OutboundSourceConfig cfg;
 
     cfg.tag = JsonStringOr(j, "tag", "");
-    cfg.protocol = naming::LowerAscii(JsonStringOr(j, "protocol", ""));
+    cfg.protocol = LowerAscii(JsonStringOr(j, "protocol", ""));
 
     auto settings = ParseJsonObject(j, "settings");
     if (!settings) {
@@ -164,7 +164,7 @@ namespace {
             throw std::invalid_argument(
                 "routing domain keyword contains control characters");
         }
-        ch = domain::ToLowerAscii(byte);
+        ch = ToLowerAscii(byte);
     }
     return value;
 }
@@ -205,7 +205,7 @@ namespace {
                 "routing {} contains control characters", field));
         }
         if (lowercase) {
-            ch = domain::ToLowerAscii(byte);
+            ch = ToLowerAscii(byte);
         }
     }
     return value;
@@ -349,7 +349,7 @@ void parse_http_headers(const json::object& j,
                 "HTTP header '{}' must be a string", name));
         }
         const std::string normalized =
-            transport::internet::NormalizeHttpHeaderName(name);
+            LowerAscii(name);
         if (!transport::internet::IsValidHttpHeaderValue(raw_value.as_string())) {
             throw std::invalid_argument(std::format(
                 "HTTP header '{}' contains invalid control characters",
@@ -479,7 +479,7 @@ void AppendRoutingPortField(const json::object& object,
 // ============================================================================
 LogConfig LogConfig::FromJson(const json::object& j) {
     LogConfig cfg;
-    cfg.level = naming::LowerAscii(JsonStringOr(j, "loglevel", cfg.level));
+    cfg.level = LowerAscii(JsonStringOr(j, "loglevel", cfg.level));
     if (!ParseLogLevel(cfg.level)) {
         throw std::invalid_argument(std::format(
             "loglevel '{}' must be none, trace, debug, info, warning, warn, or error",
@@ -862,7 +862,7 @@ WsConfig WsConfig::FromJson(const json::object& j) {
     cfg.path = RequireField(infra::NormalizeTransportPath(
         JsonStringOr(j, "path", ""), "ws path"));
     parse_http_headers(j, cfg.headers);
-    cfg.real_ip_header = naming::LowerAscii(
+    cfg.real_ip_header = LowerAscii(
         JsonStringOr(j, "realIpHeader", cfg.real_ip_header));
     require_http_header_name(cfg.real_ip_header, "ws realIpHeader");
     return cfg;
@@ -875,7 +875,7 @@ HttpUpgradeConfig HttpUpgradeConfig::FromJson(const json::object& j) {
     cfg.host = RequireField(infra::NormalizeHttpAuthority(
         JsonStringOr(j, "host", ""), "http upgrade host"));
     parse_http_headers(j, cfg.headers);
-    cfg.real_ip_header = naming::LowerAscii(JsonStringOr(j, "realIpHeader", ""));
+    cfg.real_ip_header = LowerAscii(JsonStringOr(j, "realIpHeader", ""));
     require_http_header_name(
         cfg.real_ip_header, "http upgrade realIpHeader");
     return cfg;
@@ -893,7 +893,7 @@ HttpConfig HttpConfig::FromJson(const json::object& j) {
         throw std::invalid_argument("http method must be a valid HTTP token");
     }
     parse_http_headers(j, cfg.headers);
-    cfg.real_ip_header = naming::LowerAscii(JsonStringOr(j, "realIpHeader", ""));
+    cfg.real_ip_header = LowerAscii(JsonStringOr(j, "realIpHeader", ""));
     require_http_header_name(cfg.real_ip_header, "http realIpHeader");
     cfg.force_http2 = JsonBoolOr(j, "forceHttp2", false);
     auto initial_window = ParseHttp2InitialWindow(j);
@@ -971,7 +971,7 @@ std::shared_ptr<const XHttpDownloadSettings> ParseXHttpDownloadSettings(
 
 // Xray-core SplitHTTPConfig.Build rejects any mode outside this set.
 XHttpMode ParseXHttpMode(std::string_view value) {
-    const std::string mode = naming::LowerAscii(std::string(value));
+    const std::string mode = LowerAscii(std::string(value));
     if (mode.empty() || mode == "auto") return XHttpMode::Auto;
     if (mode == "packet-up") return XHttpMode::PacketUp;
     if (mode == "stream-up") return XHttpMode::StreamUp;
@@ -1083,7 +1083,7 @@ RealityConfig RealityConfig::FromJson(const json::object& j) {
     } else if (j.contains("fingerprint")) {
         throw std::invalid_argument("realitySettings.fingerprint must not be empty");
     }
-    cfg.server_name = naming::LowerAscii(JsonStringOr(j, "serverName", ""));
+    cfg.server_name = LowerAscii(JsonStringOr(j, "serverName", ""));
     if (j.contains("serverName") &&
         !infra::IsValidRealityServerName(cfg.server_name)) {
         throw std::invalid_argument("REALITY serverName is invalid");
@@ -1124,9 +1124,9 @@ StreamSettings StreamSettings::FromJson(
     bool min_version_declared = false;
     bool max_version_declared = false;
 
-    cfg.network  = naming::LowerAscii(
+    cfg.network  = LowerAscii(
         JsonStringOr(j, "network", std::string(constants::protocol::kTcp)));
-    cfg.security = naming::LowerAscii(
+    cfg.security = LowerAscii(
         JsonStringOr(j, "security", std::string(constants::protocol::kNone)));
 
     // TLS 配置
@@ -1303,10 +1303,10 @@ void ParseStaticSettings(
     const json::object& settings,
     StaticInboundConfig& cfg) {
     auto& config = cfg.settings;
-    config.method = naming::LowerAscii(JsonStringOr(settings, "method", config.method));
+    config.method = LowerAscii(JsonStringOr(settings, "method", config.method));
     if (protocol == constants::protocol::kVless) {
         config.vless_decryption = JsonStringOr(settings, "decryption", std::string(constants::protocol::kNone));
-        if (transport::internet::EqualsAsciiCI(config.vless_decryption, constants::protocol::kNone)) {
+        if (EqualsAsciiCI(config.vless_decryption, constants::protocol::kNone)) {
             config.vless_decryption = std::string(constants::protocol::kNone);
         }
     }
@@ -1383,7 +1383,7 @@ void ParseStaticSettings(
                     protocol,
                     JsonStringOr(client_obj, "id", ""),
                     JsonStringOr(client_obj, "password", "")),
-                .flow = naming::LowerAscii(JsonStringOr(client_obj, "flow", "")),
+                .flow = LowerAscii(JsonStringOr(client_obj, "flow", "")),
                 .speed_limit = 0,
                 .device_limit = 0,
             });
@@ -1427,7 +1427,7 @@ StaticInboundConfig StaticInboundConfig::FromJson(const json::object& j) {
         if (!proto->is_string()) {
             throw std::invalid_argument("static inbound protocol must be a string");
         }
-        cfg.protocol = naming::LowerAscii(std::string(proto->as_string()));
+        cfg.protocol = LowerAscii(std::string(proto->as_string()));
     }
 
     cfg.listen = ParseInboundListen(j, "listen", "static inbound listen", cfg.listen);
@@ -2197,9 +2197,9 @@ std::optional<PanelApiUrlParts> ParsePanelApiUrl(std::string_view url) {
     }
     const std::string_view scheme = url.substr(0, scheme_pos);
     const bool is_http =
-        transport::internet::EqualsAsciiCI(scheme, constants::protocol::kHttp);
+        EqualsAsciiCI(scheme, constants::protocol::kHttp);
     const bool is_https =
-        transport::internet::EqualsAsciiCI(scheme, constants::protocol::kHttps);
+        EqualsAsciiCI(scheme, constants::protocol::kHttps);
     if (!is_http && !is_https) {
         return std::nullopt;
     }
@@ -2308,7 +2308,7 @@ PanelConfig PanelConfig::FromJson(const json::object& j) {
         throw std::invalid_argument("Panel name must not be empty");
     }
     cfg.Type = JsonStringOr(j, "type", constants::panel::kV2BoardType);
-    if (transport::internet::EqualsAsciiCI(cfg.Type, constants::panel::kV2BoardType)) {
+    if (EqualsAsciiCI(cfg.Type, constants::panel::kV2BoardType)) {
         cfg.Type = std::string(constants::panel::kV2BoardType);
     }
     cfg.APIHost   = JsonStringOr(j, "apiHost", "");
@@ -2324,7 +2324,7 @@ PanelConfig PanelConfig::FromJson(const json::object& j) {
         cfg.RequestTimeout = std::chrono::seconds(static_cast<int64_t>(*seconds));
     }
 
-    cfg.NodeType = naming::LowerAscii(
+    cfg.NodeType = LowerAscii(
         JsonStringOr(j, "nodeType", constants::panel::kDefaultNodeType));
 
     if (const auto* node_ids = j.if_contains("nodeIDs")) {
@@ -2477,7 +2477,7 @@ tl::expected<void, std::string> ApplyRealityServerInput(
             return tl::unexpected(
                 "REALITY serverNames contains an invalid hostname");
         }
-        server_names.push_back(naming::LowerAscii(name));
+        server_names.push_back(LowerAscii(name));
     }
 
     std::vector<transport::internet::RealityShortId> short_ids;
@@ -2577,7 +2577,7 @@ tl::expected<std::string, std::string> NormalizeTlsServerName(
         return tl::unexpected(std::format(
             "{} must be an IP address or DNS hostname", field));
     }
-    return naming::LowerAscii(std::string(value));
+    return LowerAscii(std::string(value));
 }
 
 tl::expected<std::string, std::string> NormalizeTransportPath(
@@ -2601,7 +2601,7 @@ tl::expected<std::string, std::string> NormalizeHttpAuthority(
         return tl::unexpected(std::format(
             "{} must be a valid HTTP authority", field));
     }
-    return naming::LowerAscii(std::string(value));
+    return LowerAscii(std::string(value));
 }
 
 tl::expected<void, std::string> ValidateGrpcServiceName(
@@ -2625,7 +2625,7 @@ tl::expected<uint8_t, std::string> ParseSniffDestOverride(
     std::span<const std::string> protocols) {
     uint8_t bits = 0;
     for (const auto& raw : protocols) {
-        const std::string protocol = naming::LowerAscii(raw);
+        const std::string protocol = LowerAscii(raw);
         if (protocol == "fakedns" || protocol == "fakedns+others") {
             return tl::unexpected(
                 "sniffing destOverride fakedns is not supported");

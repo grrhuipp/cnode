@@ -1,6 +1,6 @@
 #include "common/domain_name.hpp"
 #include "common/ip_utils.hpp"
-#include "common/unsafe.hpp"
+#include <openssl/mem.h>
 #include "proxy/outbound.hpp"
 #include "proxy/vless/vless_codec.hpp"
 #include "proxy/vless/vless_encryption.hpp"
@@ -10,7 +10,8 @@
 #include "app/proxyman/outbound/handler.hpp"
 #include "infra/json.hpp"
 #include "app/relay.hpp"
-#include "common/buffer_util.hpp"
+#include "common/const_buffer_span.hpp"
+#include "common/eof_cancellation.hpp"
 #include "common/buf/multi_buffer.hpp"
 #include "common/buf/length_prefixed_packet_buffer.hpp"
 #include "common/error.hpp"
@@ -52,7 +53,7 @@ struct VlessOutboundConfig {
     VlessOutboundConfig(VlessOutboundConfig&&) noexcept = default;
     VlessOutboundConfig& operator=(VlessOutboundConfig&&) noexcept = default;
     ~VlessOutboundConfig() noexcept {
-        ::SecureZeroMemory(uuid_bytes.data(), uuid_bytes.size());
+        OPENSSL_cleanse(uuid_bytes.data(), uuid_bytes.size());
     }
 };
 
@@ -710,7 +711,7 @@ const bool kVlessRegistered = (::proxyman::outbound::RegisterProxy(
                 std::move(*parsed.config));
         }
 
-        packet_encoding = ::naming::LowerAscii(std::move(packet_encoding));
+        packet_encoding = LowerAscii(std::move(packet_encoding));
         if (packet_encoding.empty() || packet_encoding == "xudp") {
             vless_config.packet_xudp = true;
             vless_config.packet_addr = false;

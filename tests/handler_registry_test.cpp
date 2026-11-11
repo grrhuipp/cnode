@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "app/proxyman/inbound/handler.hpp"
+#include "app/relay.hpp"
 #include "app/proxyman/outbound/handler.hpp"
 #include "app/dns/dns.hpp"
 #include "common/session.hpp"
