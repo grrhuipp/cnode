@@ -726,23 +726,10 @@ template <typename T>
 
 } // namespace
 
-class WorkerUdpRetirementRuntime : public ::testing::TestWithParam<std::string> {};
+class WorkerUdpRetirementRuntime : public ::testing::TestWithParam<RuntimeMode> {};
 
 TEST_P(WorkerUdpRetirementRuntime, Lifecycle) {
-    std::string option = GetParam();
-    const int argc = option.empty() ? 1 : 2;
-    char* argv[] = {nullptr, option.data()};
-    RuntimeMode mode = RuntimeMode::Dns;
-    if (argc == 2 && std::string_view(argv[1]) == "--delayed-retirement") {
-        mode = RuntimeMode::DelayedRetirement;
-    } else if (argc == 2 && std::string_view(argv[1]) == "--shutdown-dns") {
-        mode = RuntimeMode::ShutdownDns;
-    } else if (argc == 2 && std::string_view(argv[1]) == "--shutdown-delayed") {
-        mode = RuntimeMode::ShutdownDelayed;
-    } else if (argc != 1) {
-        std::cerr << "usage: worker_udp_retirement_runtime_test [--delayed-retirement | --shutdown-dns | --shutdown-delayed]\\n";
-        FAIL() << "unknown retirement test scenario";
-    }
+    const RuntimeMode mode = GetParam();
     try {
         RegisterProtocol();
         ::net::io_context control_io;
@@ -950,4 +937,15 @@ TEST_P(WorkerUdpRetirementRuntime, Lifecycle) {
     }
 }
 
-INSTANTIATE_TEST_SUITE_P(Scenarios, WorkerUdpRetirementRuntime, ::testing::Values("", "--delayed-retirement", "--shutdown-dns", "--shutdown-delayed"));
+INSTANTIATE_TEST_SUITE_P(Scenarios, WorkerUdpRetirementRuntime,
+    ::testing::Values(RuntimeMode::Dns, RuntimeMode::DelayedRetirement,
+                      RuntimeMode::ShutdownDns, RuntimeMode::ShutdownDelayed),
+    [](const ::testing::TestParamInfo<RuntimeMode>& info) -> std::string {
+        switch (info.param) {
+        case RuntimeMode::Dns: return "Dns";
+        case RuntimeMode::DelayedRetirement: return "DelayedRetirement";
+        case RuntimeMode::ShutdownDns: return "ShutdownDns";
+        case RuntimeMode::ShutdownDelayed: return "ShutdownDelayed";
+        }
+        return "Unknown";
+    });

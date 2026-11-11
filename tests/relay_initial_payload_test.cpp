@@ -627,105 +627,89 @@ net::awaitable<bool> TestBackpressuredWrite(net::io_context& io, bool controlled
     co_return passed;
 }
 
+template <class Scenario>
+bool RunScenario(Scenario scenario) {
+    net::io_context io;
+    auto future = net::co_spawn(io, scenario(io), net::use_future);
+    io.run();
+    return future.get();
+}
+
 }  // namespace
 
-class RelayInitialPayload : public ::testing::TestWithParam<std::string> {};
+class RelayInitialPayload : public ::testing::Test {
+protected:
+    void SetUp() override { std::setvbuf(stdout, nullptr, _IONBF, 0); }
+};
 
-TEST_P(RelayInitialPayload, Lifecycle) {
-    std::string option = GetParam();
-    const int argc = option.empty() ? 1 : 2;
-    char* argv[] = {nullptr, option.data()};
-    std::setvbuf(stdout, nullptr, _IONBF, 0);
-    if (argc == 2 && std::string_view(argv[1]) == "--full-close") {
-        bool passed = true;
-        for (bool controlled : {false, true}) for (int mode = 0; mode < 6; ++mode) {
-            net::io_context io;
-            auto future = net::co_spawn(io, TestFullClose(io, controlled, mode), net::use_future);
-            io.run();
-            passed = future.get() && passed;
-        }
-        for (bool controlled : {false, true}) for (int mode = 0; mode < 5; ++mode) {
-            net::io_context io;
-            auto future = net::co_spawn(io, TestExceptionClassification(io, controlled, mode), net::use_future);
-            io.run();
-            passed = future.get() && passed;
-        }
-        { ASSERT_TRUE(passed); return; }
+TEST_F(RelayInitialPayload, FullCloseAndExceptionClassification) {
+    bool passed = true;
+    for (bool controlled : {false, true}) for (int mode = 0; mode < 6; ++mode) {
+        passed = RunScenario([&](net::io_context& io) { return TestFullClose(io, controlled, mode); }) && passed;
     }
-    if (argc == 2 && std::string_view(argv[1]) == "--source-cancellation") {
-        bool source_passed = true;
-        for (int mode = 12; mode < 16; ++mode) {
-            net::io_context io;
-            auto future = net::co_spawn(io, TestRateCancellation(io, mode), net::use_future);
-            io.run();
-            source_passed = future.get() && source_passed;
-        }
-        { ASSERT_TRUE(source_passed); return; }
+    for (bool controlled : {false, true}) for (int mode = 0; mode < 5; ++mode) {
+        passed = RunScenario([&](net::io_context& io) {
+            return TestExceptionClassification(io, controlled, mode);
+        }) && passed;
     }
-    if (argc == 2 && std::string_view(argv[1]) == "--half-close-backpressure") {
-        bool passed = true;
-        for (bool controlled : {false, true}) {
-            for (bool upload_first : {false, true}) {
-                net::io_context io;
-                auto future = net::co_spawn(io, TestTcpHalfClose(io, controlled, upload_first), net::use_future);
-                io.run();
-                passed = future.get() && passed;
-            }
-            for (bool upload : {false, true}) for (int mode = 0; mode < 3; ++mode) {
-                net::io_context io;
-                auto future = net::co_spawn(io, TestBackpressuredWrite(io, controlled, upload, mode), net::use_future);
-                io.run();
-                passed = future.get() && passed;
-            }
-        }
-        { ASSERT_TRUE(passed); return; }
+    EXPECT_TRUE(passed);
+}
+
+TEST_F(RelayInitialPayload, SourceCancellation) {
+    bool passed = true;
+    for (int mode = 12; mode < 16; ++mode) {
+        passed = RunScenario([&](net::io_context& io) { return TestRateCancellation(io, mode); }) && passed;
     }
+    EXPECT_TRUE(passed);
+}
+
+TEST_F(RelayInitialPayload, HalfCloseBackpressure) {
+    bool passed = true;
+    for (bool controlled : {false, true}) {
+        for (bool upload_first : {false, true}) {
+            passed = RunScenario([&](net::io_context& io) {
+                return TestTcpHalfClose(io, controlled, upload_first);
+            }) && passed;
+        }
+        for (bool upload : {false, true}) for (int mode = 0; mode < 3; ++mode) {
+            passed = RunScenario([&](net::io_context& io) {
+                return TestBackpressuredWrite(io, controlled, upload, mode);
+            }) && passed;
+        }
+    }
+    EXPECT_TRUE(passed);
+}
+
+TEST_F(RelayInitialPayload, Lifecycle) {
     bool passed = TestBatchOwnership();
     for (int mode = 0; mode < 16; ++mode) {
-        net::io_context io;
-        auto future = net::co_spawn(io, TestRateCancellation(io, mode), net::use_future);
-        io.run();
-        passed = future.get() && passed;
+        passed = RunScenario([&](net::io_context& io) { return TestRateCancellation(io, mode); }) && passed;
     }
     for (bool controlled : {false, true}) {
         for (int mode = 0; mode < 4; ++mode) {
-            net::io_context io;
-            auto future = net::co_spawn(io, TestDatagramBatch(io, controlled, mode), net::use_future);
-            io.run();
-            passed = future.get() && passed;
+            passed = RunScenario([&](net::io_context& io) { return TestDatagramBatch(io, controlled, mode); }) && passed;
         }
         for (bool parent : {false, true}) for (bool limited : {false, true}) {
-            net::io_context io;
-            auto future = net::co_spawn(io, TestTcpPending(io, controlled, parent, limited), net::use_future);
-            io.run();
-            passed = future.get() && passed;
+            passed = RunScenario([&](net::io_context& io) {
+                return TestTcpPending(io, controlled, parent, limited);
+            }) && passed;
         }
         for (int mode = 0; mode < 5; ++mode) {
-            net::io_context io;
-            auto future = net::co_spawn(io, TestPendingRead(io, controlled, mode), net::use_future);
-            io.run();
-            passed = future.get() && passed;
+            passed = RunScenario([&](net::io_context& io) { return TestPendingRead(io, controlled, mode); }) && passed;
         }
         for (int mode = 0; mode < 5; ++mode) {
-            net::io_context io;
-            auto future = net::co_spawn(io, TestTcpCancellation(io, controlled, mode), net::use_future);
-            io.run();
-            passed = future.get() && passed;
+            passed = RunScenario([&](net::io_context& io) { return TestTcpCancellation(io, controlled, mode); }) && passed;
         }
         for (int failure = 0; failure != 4; ++failure) {
-            net::io_context io;
-            auto future = net::co_spawn(io, TestInitialPayload(io, controlled, failure, 7, 5, false), net::use_future);
-            io.run();
-            passed = future.get() && passed;
+            passed = RunScenario([&](net::io_context& io) {
+                return TestInitialPayload(io, controlled, failure, 7, 5, false);
+            }) && passed;
         }
         for (auto sizes : {std::pair<size_t, size_t>{2000, 0}, {750, 750}}) {
-            net::io_context io;
-            auto future = net::co_spawn(io, TestInitialPayload(io, controlled, 0, sizes.first, sizes.second, true), net::use_future);
-            io.run();
-            passed = future.get() && passed;
+            passed = RunScenario([&](net::io_context& io) {
+                return TestInitialPayload(io, controlled, 0, sizes.first, sizes.second, true);
+            }) && passed;
         }
     }
-    { ASSERT_TRUE(passed); return; }
+    EXPECT_TRUE(passed);
 }
-
-INSTANTIATE_TEST_SUITE_P(Scenarios, RelayInitialPayload, ::testing::Values("", "--full-close", "--source-cancellation", "--half-close-backpressure"));
