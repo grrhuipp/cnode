@@ -529,7 +529,7 @@ public:
                   ::InboundDatagramOwner session_owner,
                   UdpResourceBudget& budget,
                   UdpResourceBudget::AssociationLease association,
-                  std::shared_ptr<UdpHandoffRecord> record);
+                  std::shared_ptr<UdpHandoffRecord> record = {});
     ~ClientSession() noexcept override;
 
     ClientSession(const ClientSession&) = delete;
