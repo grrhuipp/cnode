@@ -388,12 +388,10 @@ target_compile_definitions(cnode_shadowsocks_stream_crypto_test PRIVATE
     CNODE_TEST_ALLOCATOR CNODE_WRAP_MALLOC)
 target_link_options(cnode_shadowsocks_stream_crypto_test PRIVATE
     -Wl,--wrap=malloc -Wl,--wrap=EVP_AEAD_CTX_new)
-foreach(target IN ITEMS cnode_anytls_codec_errors_test cnode_anytls_outbound_lifecycle_test
-                        cnode_anytls_padding_test
+foreach(target IN ITEMS cnode_anytls_outbound_lifecycle_test cnode_anytls_padding_test
                         cnode_awaitable_batch_test cnode_awaitable_task_group_test
                         cnode_cancellation_source_test cnode_dns_inflight_test cnode_grpc_hunk_test
-                        cnode_session_access_log_test cnode_stream_settings_test
-                        cnode_timeout_scheduler_test cnode_trojan_request_test
+                        cnode_stream_settings_test cnode_timeout_scheduler_test
                         cnode_user_store_batch_test)
     target_link_libraries(${target} PRIVATE cnode_allocation_hook)
 endforeach()
