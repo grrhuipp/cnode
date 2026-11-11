@@ -23,7 +23,6 @@
 #include <utility>
 #include <vector>
 
-#include <sys/prctl.h>
 #include <mimalloc.h>
 
 namespace memory {
@@ -43,18 +42,6 @@ inline void OnBufferFree() noexcept { --detail::test_buffers_live; }
 inline void OnBufferNew() noexcept {}
 inline void OnBufferFree() noexcept {}
 #endif
-
-inline void DisableTransparentHugePages() noexcept {
-    (void)::prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
-}
-
-[[nodiscard]] inline constexpr bool ValidAlignment(std::size_t alignment) noexcept {
-    return alignment != 0 && (alignment & (alignment - 1)) == 0;
-}
-[[nodiscard]] inline constexpr std::size_t RoundUp(
-    std::size_t value, std::size_t unit) noexcept {
-    return (value + unit - 1) & ~(unit - 1);
-}
 
 #ifdef CNODE_TEST_ALLOCATOR_FAULT
 inline thread_local bool reject_next_process_allocation = false;
@@ -79,36 +66,8 @@ namespace detail {
         throw std::bad_alloc();
     }
 #endif
-    if (!ValidAlignment(alignment)) {
-        throw std::bad_alloc();
-    }
-    const std::size_t actual_bytes = bytes_value == 0 ? 1 : bytes_value;
-#if defined(CNODE_USE_MIMALLOC) && !defined(__SANITIZE_ADDRESS__)
-    if (void* block = mi_malloc_aligned(actual_bytes, alignment)) {
-        return block;
-    }
+    if (void* block = mi_malloc_aligned(bytes_value, alignment)) return block;
     throw std::bad_alloc();
-#else
-    return std::pmr::new_delete_resource()->allocate(actual_bytes, alignment);
-#endif
-}
-
-inline void DeallocateProcessRaw(
-    void* block, std::size_t bytes_value, std::size_t alignment) noexcept {
-    if (!block) return;
-#if defined(CNODE_USE_MIMALLOC) && !defined(__SANITIZE_ADDRESS__)
-    if (bytes_value != 0 && ValidAlignment(alignment)) {
-        mi_free_size_aligned(block, bytes_value, alignment);
-    } else if (bytes_value != 0) {
-        mi_free_size(block, bytes_value);
-    } else {
-        mi_free(block);
-    }
-#else
-    const std::size_t actual_bytes = bytes_value == 0 ? 1 : bytes_value;
-    std::pmr::new_delete_resource()->deallocate(
-        block, actual_bytes, alignment ? alignment : alignof(std::max_align_t));
-#endif
 }
 
 class process_memory_resource final : public std::pmr::memory_resource {
@@ -116,8 +75,8 @@ private:
     void* do_allocate(std::size_t bytes_value, std::size_t alignment) override {
         return AllocateProcessRaw(bytes_value, alignment);
     }
-    void do_deallocate(void* block, std::size_t bytes_value, std::size_t alignment) override {
-        DeallocateProcessRaw(block, bytes_value, alignment);
+    void do_deallocate(void* block, std::size_t, std::size_t) override {
+        mi_free(block);
     }
     [[nodiscard]] bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
         return this == &other;
@@ -214,7 +173,6 @@ public:
             owner_token_ = token;
         }
         if (!theap_ && !(theap_ = mi_heap_theap(heap_))) return nullptr;
-        if (!ValidAlignment(alignment)) return nullptr;
 #ifdef CNODE_TEST_ALLOCATOR_FAULT
         if (reject_next_pmr_allocation) {
             reject_next_pmr_allocation = false;
@@ -222,15 +180,7 @@ public:
             return nullptr;
         }
 #endif
-        void* block = nullptr;
-        if (alignment > kNaturalAlignment) {
-            block = mi_theap_malloc_aligned(theap_, bytes, alignment);
-        } else if (bytes <= std::numeric_limits<std::size_t>::max() - (alignment - 1)) {
-            // A size class that is a multiple of the alignment starts every
-            // block on that alignment, so no aligned slow path is needed.
-            block = mi_theap_malloc(theap_, RoundUp(bytes, alignment));
-        }
-        return block;
+        return mi_theap_malloc_aligned(theap_, bytes, alignment);
     }
 
     void Deallocate(void* pointer, std::size_t = 0, std::size_t = 0) noexcept {
@@ -253,9 +203,6 @@ protected:
     }
 
 private:
-    // Every mimalloc page starts its first block on 16 bytes (MI_MAX_ALIGN_SIZE).
-    static constexpr std::size_t kNaturalAlignment = 16;
-
     static bool AccumulateArea(const mi_heap_t*, const mi_heap_area_t* area, void*,
                                std::size_t, void* argument) noexcept {
         auto& footprint = *static_cast<Footprint*>(argument);
@@ -323,14 +270,6 @@ template <class T, class... Args>
     requires std::is_base_of_v<WorkerAllocated, T>
 [[nodiscard]] std::unique_ptr<T> MakeUnique(worker_memory& pool, Args&&... args) {
     return std::unique_ptr<T>(new (pool) T(std::forward<Args>(args)...));
-}
-
-inline void ConfigureProcessAllocator() noexcept {
-    DisableTransparentHugePages();
-    mi_option_set(mi_option_allow_thp, 0);
-    // Empty pages stay committed for 1 s so bursty connection churn reuses them
-    // instead of decommitting and recommitting on every wave.
-    mi_option_set(mi_option_purge_delay, 1000);
 }
 
 // Forces this thread's process-layer mimalloc state to return empty pages now.

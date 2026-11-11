@@ -749,7 +749,6 @@ TEST_P(WorkerUdpRetirementRuntime, Lifecycle) {
         FAIL() << "unknown retirement test scenario";
     }
     try {
-        ::memory::ConfigureProcessAllocator();
         RegisterProtocol();
         ::net::io_context control_io;
         ::udp::socket dns_peer(control_io);

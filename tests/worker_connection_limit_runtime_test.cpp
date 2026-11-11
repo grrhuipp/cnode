@@ -274,7 +274,6 @@ void RunCase(app::dns::DNSWorker& dns, uint32_t global, uint32_t per_ip, bool li
 
 TEST(WorkerConnectionLimitRuntime, Contract) {
     try {
-        memory::ConfigureProcessAllocator();
         RegisterProtocol();
         net::io_context control;
         app::dns::Config config{.servers = {{net::ip::address_v4::loopback(), 53}}};

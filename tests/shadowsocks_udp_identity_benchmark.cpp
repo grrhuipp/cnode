@@ -180,7 +180,6 @@ void RunCase(const char* cipher_name, const ss::SsCipherInfo& cipher,
 }
 
 TEST(ShadowsocksUdpIdentityBenchmark, AuthenticationMatrix) {
-    memory::ConfigureProcessAllocator();
     memory::worker_memory pool;
     const auto baseline = pool.OutstandingAllocations();
     const size_t iterations = [] {

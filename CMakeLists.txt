@@ -41,8 +41,7 @@ target_compile_options(cnode_build_options INTERFACE
 # awaitable-frame caches would be a second cache layer over it.
 target_compile_definitions(cnode_build_options INTERFACE
     ASIO_STANDALONE ASIO_NO_DEPRECATED
-    ASIO_DISABLE_SMALL_BLOCK_RECYCLING ASIO_DISABLE_AWAITABLE_FRAME_RECYCLING
-    CNODE_USE_MIMALLOC)
+    ASIO_DISABLE_SMALL_BLOCK_RECYCLING ASIO_DISABLE_AWAITABLE_FRAME_RECYCLING)
 find_package(Threads REQUIRED)
 find_package(asio CONFIG REQUIRED)
 find_package(tl-expected CONFIG REQUIRED)

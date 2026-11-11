@@ -78,7 +78,6 @@ net::awaitable<Measurement> Transfer(
 }
 
 TEST(UdpSendBenchmark, VerifiedDatagrams) {
-    memory::ConfigureProcessAllocator();
     memory::worker_memory pool;
     const auto baseline = pool.OutstandingAllocations();
     for (const size_t size : {0u, 1u, 1200u, 60000u}) {

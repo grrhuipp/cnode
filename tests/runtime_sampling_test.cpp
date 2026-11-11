@@ -14,7 +14,6 @@ using runtime_sampling::Require;
 using namespace std::chrono_literals;
 
 TEST(RuntimeSampling, CreationFinishAndShutdownPreserveEveryTail) {
-    memory::ConfigureProcessAllocator();
     runtime_sampling::Fixture fixture;
     fixture.Run([&]() -> net::awaitable<void> {
         constexpr size_t sessions = 8;

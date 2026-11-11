@@ -18,7 +18,6 @@ uint64_t CpuNs() {
 }
 
 TEST(ShadowsocksIdentityBenchmark, AuthenticationMatrix) {
-    memory::ConfigureProcessAllocator();
     memory::worker_memory pool;
     const auto baseline = pool.OutstandingAllocations();
     const size_t iterations = [] {

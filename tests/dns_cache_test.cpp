@@ -225,7 +225,6 @@ void TestNegativeEventLifecycle(std::pmr::memory_resource* resource) {
 }  // namespace
 
 TEST(DnsCache, Contract) {
-    ::memory::ConfigureProcessAllocator();
     FailingResource resource(::memory::process_resource());
     bool passed = true;
     try {
@@ -243,7 +242,6 @@ TEST(DnsCache, Contract) {
 }
 
 TEST(DnsCache, ZeroTtlAddressesInvalidateOldAnswersAndReleaseTheirStorage) {
-    ::memory::ConfigureProcessAllocator();
     FailingResource resource(::memory::process_resource());
     {
         DnsCache cache(2, 60, 3600, nullptr, &resource);

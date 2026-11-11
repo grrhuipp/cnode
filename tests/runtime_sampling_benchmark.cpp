@@ -26,7 +26,6 @@ using Workload = std::tuple<size_t, size_t, bool>;
 class RuntimeSamplingBenchmark : public testing::TestWithParam<Workload> {};
 
 TEST_P(RuntimeSamplingBenchmark, EstablishedVlessSessions) {
-    memory::ConfigureProcessAllocator();
     const auto [sessions, rounds, resources] = GetParam();
     runtime_sampling::Fixture fixture;
     fixture.Run([&]() -> net::awaitable<void> {

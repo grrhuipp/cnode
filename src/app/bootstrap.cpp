@@ -1000,8 +1000,6 @@ int RunApplicationRuntime(BootstrapEnvironment& env) noexcept {
 // RunFromCommandLine
 // ============================================================================
 int RunFromCommandLine(int argc, char* argv[]) {
-    memory::ConfigureProcessAllocator();
-
     const CommandLineOptions cli = ParseCommandLine(argc, argv);
     if (cli.action == CommandLineAction::Help) {
         PrintUsage(std::cout, argv[0]);

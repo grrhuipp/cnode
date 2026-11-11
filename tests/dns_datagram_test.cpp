@@ -524,7 +524,6 @@ void TestDatagramAllocationFailureJoin() {
 }
 }
 TEST(DnsDatagram, Contract) {
-    ::memory::ConfigureProcessAllocator();
     try {
         TestQueries(false); TestQueries(true); TestIsolation(true); TestIsolation(false);
         TestSameDomainCancellation(0); TestSameDomainCancellation(1);
@@ -546,7 +545,6 @@ struct TtlCase {
 class DnsTtl : public testing::TestWithParam<TtlCase> {};
 
 TEST_P(DnsTtl, PreservesAddressesButDoesNotCacheZeroTtl) {
-    ::memory::ConfigureProcessAllocator();
     const auto [wire_ttl, expected_ttl, affected_type] = GetParam();
     net::io_context io;
     Peer peer(io);

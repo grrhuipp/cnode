@@ -267,14 +267,12 @@ void CrossWorkerUploadHandoffDoesNotEscapeOriginSink() {
     ::memory::worker_memory* pool0 = nullptr;
     ::memory::worker_memory* pool1 = nullptr;
     std::thread thread_0([&] {
-        ::memory::ConfigureProcessAllocator();
         ::memory::worker_memory pool;
         pool0 = &pool;
         worker0->run();
         worker0.reset();
     });
     std::thread thread_1([&] {
-        ::memory::ConfigureProcessAllocator();
         ::memory::worker_memory pool;
         pool1 = &pool;
         worker1->run();
