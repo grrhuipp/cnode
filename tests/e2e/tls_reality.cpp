@@ -63,12 +63,11 @@ TEST_P(RealityAuthentication, FragmentedClientHelloPreservesAuthentication) {
     const bool quantum = mode != "classic";
     const bool wrong = mode == "wrong-mldsa";
     TempDir server_root, client_root;
-    auto server_port = Socket::Listen(), entry_port = Socket::Listen();
+    auto server_port = Socket::ReserveTcp(), entry_port = Socket::ReserveTcp();
     const auto server_number = server_port.Port(), entry_number = entry_port.Port();
     auto destination = Socket::Listen(), target = Socket::Listen();
     const unsigned xver = mode == "firefox" ? 1 : 0;
     Config(server_root.Path(), Json::array({Inbound(server_number, ServerStream(destination.Port(), xver, quantum))}), Json::array({Direct()}));
-    server_port.Close();
     auto server = Start(server_root.Path());
     FragmentingProxy proxy(server_number);
     const std::string_view fingerprint =
@@ -78,7 +77,6 @@ TEST_P(RealityAuthentication, FragmentedClientHelloPreservesAuthentication) {
     // The default case omits the field; an explicit empty value is invalid.
     if (mode.empty()) outbound["streamSettings"]["realitySettings"].erase("fingerprint");
     Config(client_root.Path(), Json::array({Inbound(entry_number)}), Json::array({outbound}));
-    entry_port.Close();
     auto client = Start(client_root.Path());
     std::atomic<bool> stop_echo{false}, target_connected{false};
     PeerThread echo([&] {
@@ -131,7 +129,7 @@ class RealityFallback : public testing::TestWithParam<unsigned> {};
 TEST_P(RealityFallback, UnauthenticatedBytesAndProxyMetadataReachDestination) {
     const auto xver = GetParam();
     TempDir root;
-    auto reservation = Socket::Listen(), destination = Socket::Listen();
+    auto reservation = Socket::ReserveTcp(), destination = Socket::Listen();
     const auto port = reservation.Port();
     const std::string plain = xver == 2 ? std::string("\x16\x03\x01\0\x05hello", 10)
                                        : "GET /plain-http HTTP/1.1\r\nHost: example.com\r\n\r\n";
@@ -144,7 +142,6 @@ TEST_P(RealityFallback, UnauthenticatedBytesAndProxyMetadataReachDestination) {
         socket.Write("FALLBACK-OK");
     });
     Config(root.Path(), Json::array({Inbound(port, ServerStream(destination.Port(), xver))}), Json::array({Direct()}));
-    reservation.Close();
     auto child = Start(root.Path());
     auto socket = Socket::Connect(port);
     const auto source_port = socket.Port();
@@ -169,7 +166,7 @@ INSTANTIATE_TEST_SUITE_P(ProxyVersions, RealityFallback, testing::Values(0u, 1u,
 
 TEST(Reality, WrongShortIdTriggersTlsSpiderFallback) {
     TempDir server_root, client_root;
-    auto destination = Socket::Listen(), server_reservation = Socket::Listen(), entry_reservation = Socket::Listen();
+    auto destination = Socket::Listen(), server_reservation = Socket::ReserveTcp(), entry_reservation = Socket::ReserveTcp();
     const auto server_port = server_reservation.Port(), entry_port = entry_reservation.Port();
     std::string request;
     PeerThread fallback([&] {
@@ -181,7 +178,6 @@ TEST(Reality, WrongShortIdTriggersTlsSpiderFallback) {
     });
     Config(server_root.Path(), Json::array({Inbound(server_port, ServerStream(destination.Port()))}), Json::array({Direct()}));
     Config(client_root.Path(), Json::array({Inbound(entry_port)}), Json::array({ClientOutbound(server_port, "safari", false, false, true)}));
-    server_reservation.Close(); entry_reservation.Close();
     auto server = Start(server_root.Path());
     auto client = Start(client_root.Path());
     auto socket = Socket::Connect(entry_port);
@@ -241,7 +237,7 @@ private:
 
 TEST(Reality, V2BoardTlsTwoSynchronizesPostQuantumListenerAndUsers) {
     TempDir root;
-    auto node_reservation = Socket::Listen(), entry_reservation = Socket::Listen();
+    auto node_reservation = Socket::ReserveTcp(), entry_reservation = Socket::ReserveTcp();
     auto destination = Socket::Listen(), target = Socket::Listen();
     const auto node = node_reservation.Port(), entry = entry_reservation.Port();
     RealityPanel panel(node, destination.Port());
@@ -253,7 +249,6 @@ TEST(Reality, V2BoardTlsTwoSynchronizesPostQuantumListenerAndUsers) {
         {"apiHost", "http://127.0.0.1:" + std::to_string(panel.Port())}, {"key", "test-token"},
         {"nodeIDs", {1}}, {"nodeType", "vless"}, {"listenIP", "127.0.0.1"}, {"requestTimeout", 1}}}}};
     Config(root.Path(), Json::array({inbound}), Json::array({Direct(), outbound}), config);
-    node_reservation.Close(); entry_reservation.Close();
     auto child = Start(root.Path());
     Until([&] { return panel.users.load() > 0; }, 10s);
     std::this_thread::sleep_for(200ms);

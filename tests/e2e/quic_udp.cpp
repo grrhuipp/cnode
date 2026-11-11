@@ -437,7 +437,7 @@ TEST(QuicUdp, ConcurrentMultiSessionMigrationAndEphemeralAnyTlsStreams) {
             try { thread.Join(); } catch (...) {}
         }
     } dns_guard{stop_dns, dns_responder};
-    auto upstream_reservation = Socket::Listen();
+    auto upstream_reservation = Socket::ReserveTcp();
     const auto upstream_port = upstream_reservation.Port();
     Configure(upstream_root.Path(),
         {{"protocol", "anytls"}, {"listen", "127.0.0.1"}, {"port", upstream_port},
@@ -449,19 +449,18 @@ TEST(QuicUdp, ConcurrentMultiSessionMigrationAndEphemeralAnyTlsStreams) {
         {"servers", Json::array({"127.77.0.53:" + std::to_string(dns_socket.Port())})},
         {"timeout", 5}, {"cacheSize", 1024}};
     WriteJson(upstream_root.Path(), "config.json", upstream_config);
-    upstream_reservation.Close();
     Child upstream({Binary().string(), "--config-dir", upstream_root.Path().string()},
         upstream_root.Path() / "upstream.log");
     upstream.WaitForLog("server started");
     auto reservation = Socket::BindUdp();
     const auto port = reservation.Port();
-    auto vless_reservation = Socket::Listen();
+    auto vless_reservation = Socket::ReserveTcp();
     const auto vless_port = vless_reservation.Port();
     udp::PortReservation ss_reservation(true);
     const auto ss_port = ss_reservation.port;
     const auto ss_key = udp::Sequence(16);
 
-    auto panel_node_reservation = Socket::Listen();
+    auto panel_node_reservation = Socket::ReserveTcp();
     const auto panel_node_port = panel_node_reservation.Port();
     Socket panel_listener = Socket::Listen();
     std::atomic<int> panel_phase{0};
@@ -567,9 +566,7 @@ TEST(QuicUdp, ConcurrentMultiSessionMigrationAndEphemeralAnyTlsStreams) {
         {{"domain", Json::array({"domain:direct.route.test"})}, {"outboundTag", "direct-out"}},
         {{"domain", Json::array({"domain:blocked.route.test"})}, {"outboundTag", "block-out"}}})}});
     reservation.Close();
-    vless_reservation.Close();
-    ss_reservation.Release();
-    panel_node_reservation.Close();
+    ss_reservation.ReleaseUdp();
     Child server({Binary().string(), "--config-dir", root.Path().string()},
         root.Path() / "child.log");
     server.WaitForLog("server started");
@@ -1158,8 +1155,8 @@ TEST(QuicUdp, AllProtocolsAndTransportsFullMatrixConcurrentMigration) {
     WriteJson(upstream_root.Path(), "outbounds.json", upstream_outbounds);
     WriteJson(upstream_root.Path(), "routing.json", {{"rules", upstream_rules}});
 
-    for (auto& res : final_reservations) res.Release();
-    for (auto& res : mid_reservations) res.Release();
+    for (auto& res : final_reservations) res.ReleaseUdp();
+    for (auto& res : mid_reservations) res.ReleaseUdp();
     hy2_reservation.Close();
 
     Child upstream({Binary().string(), "--config-dir", upstream_root.Path().string()},

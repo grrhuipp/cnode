@@ -18,11 +18,11 @@ TEST_P(ConfigSources, RejectsInvalidSourcesAndStartsValidSources) {
     TestPortLock lock;
     TempDir directory;
     WriteFile(directory.Path() / "config.json", ExpandFixture(value.main));
+    std::vector<Socket> reservations;
     if (*value.sidecar) {
         std::string content = ExpandFixture(value.content);
         // Preserve raw duplicate keys and malformed JSON. Only replace the old
         // fixture's otherwise-valid listener port tokens, never invalid ports.
-        std::vector<Socket> reservations;
         if (std::string_view(value.sidecar) == "inbounds.json") {
             const std::regex port(R"("port":(12[0-9]{3}|43[0-9]{3})([,}]))");
             std::map<std::string, uint16_t> replacements;
@@ -31,7 +31,7 @@ TEST_P(ConfigSources, RejectsInvalidSourcesAndStartsValidSources) {
             while (std::regex_search(content, match, port)) {
                 const auto old = match[1].str();
                 if (!replacements.contains(old)) {
-                    reservations.push_back(Socket::Listen());
+                    reservations.push_back(Socket::ReserveTcp());
                     replacements[old] = reservations.back().Port();
                 }
                 relocated += match.prefix().str() + "\"port\":" + std::to_string(replacements[old]) + match[2].str();
@@ -58,9 +58,9 @@ INSTANTIATE_TEST_SUITE_P(CompleteMatrix, ConfigSources, testing::ValuesIn(Config
 class StaticRouting : public testing::TestWithParam<bool> {};
 TEST_P(StaticRouting, DefaultDirectForcedOutboundAndOptInRouting) {
     TempDir directory;
-    auto default_reservation = Socket::Listen();
-    auto forced_reservation = Socket::Listen();
-    auto routed_reservation = Socket::Listen();
+    auto default_reservation = Socket::ReserveTcp();
+    auto forced_reservation = Socket::ReserveTcp();
+    auto routed_reservation = Socket::ReserveTcp();
     const auto direct_port = default_reservation.Port(), forced_port = forced_reservation.Port(), routed_port = routed_reservation.Port();
     auto direct = Inbound(direct_port, "vless", UserA);
     direct["tag"] = "default-direct";
@@ -86,7 +86,6 @@ TEST_P(StaticRouting, DefaultDirectForcedOutboundAndOptInRouting) {
             socket.Write(Payload);
         }
     });
-    default_reservation.Close(); forced_reservation.Close(); routed_reservation.Close();
     Child child({Binary().string(), mixed ? "--config-file" : "--config-dir",
                  mixed ? (directory.Path() / "config.json").string() : directory.Path().string()}, directory.Path() / "child.log", directory.Path());
     child.WaitForLog("server started");
@@ -115,7 +114,7 @@ TEST(ConfigRouting, RejectsInvalidInboundRoutingControls) {
     for (const auto& override : overrides) {
         SCOPED_TRACE(override.dump());
         TempDir directory;
-        auto reservation = Socket::Listen();
+        auto reservation = Socket::ReserveTcp();
         auto inbound = Inbound(reservation.Port());
         inbound.update({{"routingEnabled", true}, {"outboundTag", "Chosen"}});
         inbound.update(override);
@@ -125,7 +124,6 @@ TEST(ConfigRouting, RejectsInvalidInboundRoutingControls) {
         WriteJson(directory.Path(), "inbounds.json", Json::array({inbound}));
         WriteJson(directory.Path(), "outbounds.json", Json::array({{{"tag", "Chosen"}, {"protocol", "freedom"}}}));
         WriteJson(directory.Path(), "routing.json", {{"rules", Json::array()}});
-        reservation.Close();
         auto child = Start(directory.Path());
         EXPECT_EQ(child->Wait(), 1) << ReadFile(child->LogPath());
     }

@@ -94,9 +94,10 @@ inline Json Inbound(uint16_t port, bool anytls=true) {
 inline Json Outbound(uint16_t port, unsigned minimum=1, unsigned idle=30) {
     return {{"protocol","anytls"},{"settings",{{"address","127.0.0.1"},{"port",port},{"password","secret"},{"minIdleSession",minimum},{"idleSessionTimeout",idle},{"idleSessionCheckInterval",1}}},{"streamSettings",TlsSettings(false)}};
 }
-// Keep node ports reserved while peers are constructed; release only at child startup.
+// The node port stays reserved for the cnode child's lifetime; a reference peer,
+// which binds without SO_REUSEADDR, gets it released at startup.
 struct Node {
-    TempDir directory; Socket port_reservation=Socket::Listen(); uint16_t port=port_reservation.Port(); std::unique_ptr<Child> child;
+    TempDir directory; Socket port_reservation=Socket::ReserveTcp(); uint16_t port=port_reservation.Port(); std::unique_ptr<Child> child;
     Node(bool inbound, uint16_t peer=0, Json timeouts=Json::object(), unsigned minimum=1, unsigned idle=30) {
         Configure(directory.Path(),Inbound(port,inbound),inbound?Json{{"protocol","freedom"},{"settings",Json::object()}}:Outbound(peer,minimum,idle));
         if(!timeouts.empty()) {auto config=Json::parse(ReadFile(directory.Path()/"config.json")); config["timeouts"].update(timeouts); WriteJson(directory.Path(),"config.json",config);}
@@ -106,7 +107,7 @@ struct Node {
     void Start(std::vector<std::string> command={}) {
         const bool native=command.empty();
         if(native) command={Binary().string(),"--config-dir",directory.Path().string()};
-        port_reservation.Close();
+        if(!native) port_reservation.Close();
         child=std::make_unique<Child>(std::move(command),directory.Path()/(native?"child.log":"reference.log"));
         if(native) child->WaitForLog("server started");
     }
@@ -118,7 +119,7 @@ inline void Open(TlsSocket& socket, uint32_t sid, uint16_t port, std::string_vie
 inline std::string Magic(bool v1) {return SocksAddress(0,v1?"sp.udp-over-tcp.arpa":"sp.v2.udp-over-tcp.arpa");}
 // Panel provisioning remains real: the rate-limited user travels through the HTTP panel adapter and user store.
 struct PanelNode {
-    TempDir directory; Socket port_reservation=Socket::Listen(); uint16_t port=port_reservation.Port(); std::atomic<unsigned> userRequests=0; Server panel; std::unique_ptr<Child> child;
+    TempDir directory; Socket port_reservation=Socket::ReserveTcp(); uint16_t port=port_reservation.Port(); std::atomic<unsigned> userRequests=0; Server panel; std::unique_ptr<Child> child;
     explicit PanelNode(bool anytls=true, Json timeouts=Json::object()):panel([this](Socket socket){
         for(;;) {std::string header; while(!header.ends_with("\r\n\r\n")){auto b=socket.Read(1);if(b.empty())return;header+=b;Require(header.size()<65536,"panel header too large");}
             auto lower=header; std::transform(lower.begin(),lower.end(),lower.begin(),[](unsigned char c){return static_cast<char>(std::tolower(c));});
@@ -132,7 +133,6 @@ struct PanelNode {
         auto cert=SourceRoot()/"tests/fixtures/anytls-pool";
         Json config={{"workers",1},{"log",{{"enable",false},{"logDir",(directory.Path()/"logs").string()}}},{"timeouts",{{"connIdle",10},{"uplinkOnly",3},{"downlinkOnly",3}}},{"panels",Json::array({{{"name","session-test"},{"type","V2board"},{"apiHost","http://127.0.0.1:"+std::to_string(panel.Port())},{"key","local-test-key"},{"nodeIDs",Json::array({1})},{"nodeType",anytls?"anytls":"vless"},{"listenIP","127.0.0.1"},{"tlsEnable",anytls},{"tlsCert",(cert/"cert.pem").string()},{"tlsKey",(cert/"key.pem").string()}}})}};
         config["timeouts"].update(timeouts);WriteJson(directory.Path(),"config.json",config);
-        port_reservation.Close();
         child=std::make_unique<Child>(std::vector<std::string>{Binary().string(),"--config-dir",directory.Path().string()},directory.Path()/"child.log");
         Until([&]{Require(child->Running(),"panel node exited");return userRequests.load()!=0;},8s);
     }

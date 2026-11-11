@@ -99,12 +99,11 @@ void CheckUsers(uint16_t node, uint16_t target, const std::vector<std::string_vi
 TEST(PanelUserSync, FailuresPreserveCommittedUsersAndValidatorsThenRevokeAndRecover) {
     TempDir directory;
     auto blocked = Socket::Listen();
-    auto reservation = Socket::Listen();
+    auto reservation = Socket::ReserveTcp();
     const auto node = reservation.Port();
     LoopServer echo(EchoPeer);
     SyncPanel panel(node, blocked.Port());
     PanelConfig(directory.Path(), panel.Port(), "user-sync", true);
-    reservation.Close();
     auto child = Start(directory.Path());
     panel.WaitCycles(*child);
     CheckUsers(node, echo.Port(), {UserA}, {UserB});

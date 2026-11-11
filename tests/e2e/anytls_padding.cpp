@@ -10,7 +10,7 @@ TEST_P(AnyTlsInboundPadding, SharedPreparedPolicyDistributesOriginalBytesOnlyOnD
     if (test.array) raw.pop_back();
     TempDir root;
     auto destination = Socket::Listen();
-    auto reservation = Socket::Listen();
+    auto reservation = Socket::ReserveTcp();
     const auto port = reservation.Port();
     Configure(root.Path(), AnyInbound(port, PolicySetting(raw, test.array)),
               {{"protocol", "freedom"}, {"settings", Json::object()}}, 2);
@@ -22,7 +22,6 @@ TEST_P(AnyTlsInboundPadding, SharedPreparedPolicyDistributesOriginalBytesOnlyOnD
             socket.Write(Banner);
         }
     });
-    reservation.Close();
     Child child({Binary().string(), "--config-dir", root.Path().string()}, root.Path() / "child.log");
     child.WaitForLog("server started");
     TlsContext tls(false);
@@ -57,7 +56,7 @@ TEST_P(AnyTlsOutboundPadding, SparseStopAndInvalidUpdatesKeepOnePhysicalSessionU
     const auto& test = GetParam();
     TempDir root;
     auto listener = Socket::Listen();
-    auto reservation = Socket::Listen();
+    auto reservation = Socket::ReserveTcp();
     const auto port = reservation.Port();
     Configure(root.Path(), VlessInbound(port), AnyOutbound(listener.Port(), "secret"));
     TlsContext tls(true);
@@ -105,7 +104,6 @@ TEST_P(AnyTlsOutboundPadding, SparseStopAndInvalidUpdatesKeepOnePhysicalSessionU
         }
         EXPECT_EQ(barriers.load(), 3U);
     });
-    reservation.Close();
     Child child({Binary().string(), "--config-dir", root.Path().string()}, root.Path() / "child.log");
     child.WaitForLog("server started");
     for (unsigned sid = 1; sid <= 3; ++sid) {

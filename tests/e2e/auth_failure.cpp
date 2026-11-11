@@ -39,7 +39,7 @@ TEST_P(IPBan, OptionalBanUsesTrustedSourceAndDoesNotCrossInboundTags) {
         EXPECT_EQ(socket.ReadExact(kRequest.size()), kRequest);
         socket.Write(kResponse);
     });
-    auto first = Socket::Listen(), second = Socket::Listen();
+    auto first = Socket::ReserveTcp(), second = Socket::ReserveTcp();
     const auto first_port = first.Port(), second_port = second.Port();
     auto first_inbound = tls::Inbound(first_port);
     first_inbound["tag"] = "first";
@@ -53,7 +53,6 @@ TEST_P(IPBan, OptionalBanUsesTrustedSourceAndDoesNotCrossInboundTags) {
     tls::Config(root.Path(), Json::array({first_inbound, second_inbound}),
                 Json::array({tls::Direct()}), config);
     UseTwoWorkers(root.Path());
-    first.Close(); second.Close();
     auto child = tls::Start(root.Path());
     for (unsigned i = 0; i < 2; ++i) {
         auto socket = Socket::Connect(first_port);

@@ -14,8 +14,7 @@ class RelayRun {
 public:
     explicit RelayRun(Case value)
         : value(std::move(value)), peer(Socket::BindUdp()), fallback(Socket::BindUdp()),
-          dns(Socket::BindUdp(0, IsQuic() ? "127.0.0.1" : "127.77.0.2")) {
-        PortReservation reservation(Native());
+          dns(Socket::BindUdp(0, IsQuic() ? "127.0.0.1" : "127.77.0.2")), reservation(Native()) {
         port = reservation.port;
         bool isolated = IsIsolation() || EmptyDatagrams();
         Json inbound = {{"tag", "udp-probe"}, {"protocol", "vless"}, {"listen", "127.0.0.1"},
@@ -52,7 +51,7 @@ public:
         WriteJson(root.Path(), "inbounds.json", Json::array({inbound}));
         WriteJson(root.Path(), "outbounds.json", outbounds);
         WriteJson(root.Path(), "routing.json", routing);
-        reservation.Release();
+        reservation.ReleaseUdp();
         child = std::make_unique<Child>(std::vector<std::string>{Binary().string(), "--config-dir", root.Path().string()}, root.Path() / "child.log");
         child->WaitForLog("server started");
     }
@@ -100,6 +99,7 @@ public:
     Case value;
     TempDir root;
     Socket peer, fallback, dns;
+    PortReservation reservation;
     uint16_t port = 0;
     std::unique_ptr<Child> child;
     std::vector<std::string> observed;

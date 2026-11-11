@@ -15,7 +15,7 @@ TEST_P(HttpUpgrade, PreservesReadAheadSegmentationAndDirectionalEof) {
     const bool secured = mode.ends_with("tls"), chained = mode.starts_with("chain");
     TempDir root;
     auto target = Socket::Listen();
-    auto upgrade_reservation = Socket::Listen(), raw_reservation = Socket::Listen();
+    auto upgrade_reservation = Socket::ReserveTcp(), raw_reservation = Socket::ReserveTcp();
     const auto upgrade_port = upgrade_reservation.Port(), raw_port = raw_reservation.Port();
     std::string payload;
     for (unsigned i = 0; i < 719; ++i) for (unsigned byte = 0; byte < 251; ++byte) payload += static_cast<char>(byte);
@@ -38,7 +38,6 @@ TEST_P(HttpUpgrade, PreservesReadAheadSegmentationAndDirectionalEof) {
               {"settings", {{"address", "127.0.0.1"}, {"port", upgrade_port}, {"id", UserId}, {"encryption", "none"}}},
               {"streamSettings", UpgradeTransport(secured, false)}};
     Config(root.Path(), Json::array({upgrade, raw}), Json::array({Direct(), next}));
-    upgrade_reservation.Close(); raw_reservation.Close();
     auto child = Start(root.Path());
     const std::string header = "GET /up HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\ncOnNeCtIoN: UpGrAdE\r\nUpgrade: websocket\r\n\r\n";
     const auto request = VlessRequest(target.Port());

@@ -182,11 +182,13 @@ TEST_P(HysteriaReference, AuthenticatedCrossWorkerReturnAndFailClosedShutdown) {
         while (true) { auto data = socket.Read(65536, 20s); if (data.empty()) break; socket.Write(data); }
     });
     UdpTarget udp_target;
+    Socket upstream_reservation;
     std::unique_ptr<Child> upstream;
     std::unique_ptr<Bridge> tap;
     Json outbound = Freedom();
     if (outbound_kind != "direct") {
-        const auto upstream_port = TcpPort();
+        upstream_reservation = Socket::ReserveTcp();
+        const auto upstream_port = upstream_reservation.Port();
         tap = std::make_unique<Bridge>(upstream_port);
         if (outbound_kind == "anytls") {
             Configure(upstream_root.Path(), {{"protocol", "anytls"}, {"listen", "127.0.0.1"}, {"port", upstream_port},

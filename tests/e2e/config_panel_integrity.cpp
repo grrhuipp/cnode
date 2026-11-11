@@ -91,13 +91,12 @@ class AccountingFault : public testing::TestWithParam<std::string> {};
 TEST_P(AccountingFault, QuarantinesAmbiguousRequestsAcrossRestartUntilExplicitReconciliation) {
     const auto mode = GetParam();
     TempDir directory;
-    auto reservation = Socket::Listen();
+    auto reservation = Socket::ReserveTcp();
     const auto node = reservation.Port();
     LoopServer echo(EchoPeer, "0.0.0.0");
     IntegrityPanel panel(node);
     panel.Mode(mode);
     PanelConfig(directory.Path(), panel.Port(), "integrity");
-    reservation.Close();
     auto child = Start(directory.Path());
     WaitEcho(*child, node, echo.Port());
     Until([&] { return panel.Posts(true) != 0; }, 12s);
@@ -157,13 +156,12 @@ INSTANTIATE_TEST_SUITE_P(HttpAmbiguity, AccountingFault, testing::Values("non2xx
 
 TEST(PanelIntegrity, GracefulShutdownPersistsUnsampledCountersAndReplaysExactlyOnce) {
     TempDir directory;
-    auto reservation = Socket::Listen();
+    auto reservation = Socket::ReserveTcp();
     const auto node = reservation.Port();
     LoopServer echo(EchoPeer);
     IntegrityPanel panel(node);
     panel.PushInterval(3600);
     PanelConfig(directory.Path(), panel.Port(), "integrity");
-    reservation.Close();
     auto child = Start(directory.Path());
     WaitEcho(*child, node, echo.Port());
     EXPECT_EQ(child->Stop(10s), 0);

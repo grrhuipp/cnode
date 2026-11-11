@@ -12,9 +12,9 @@ TEST(InboundHandshake, SegmentedVmessTrojanReplayFlowEofAndDeadline) {
     std::filesystem::create_directories(client_dir);
     std::filesystem::create_directories(trojan_dir);
     auto backend = Socket::Listen();
-    auto server_reservation = Socket::Listen();
-    auto front_reservation = Socket::Listen();
-    auto trojan_reservation = Socket::Listen();
+    auto server_reservation = Socket::ReserveTcp();
+    auto front_reservation = Socket::ReserveTcp();
+    auto trojan_reservation = Socket::ReserveTcp();
     const auto server_port = server_reservation.Port(), front_port = front_reservation.Port(), trojan_port = trojan_reservation.Port();
     const std::string payload = "vmess-inbound-handshake-regression";
     std::atomic<int> received{0};
@@ -31,7 +31,6 @@ TEST(InboundHandshake, SegmentedVmessTrojanReplayFlowEofAndDeadline) {
     config["timeouts"]["handshake"] = 2;
     config["log"].update({{"enable", true}, {"loglevel", "debug"}});
     WriteJson(server_dir, "config.json", config);
-    server_reservation.Close();
     auto server = Start(server_dir);
     server->WaitForLog("server started");
     auto splitter = Socket::Listen();
@@ -71,7 +70,6 @@ TEST(InboundHandshake, SegmentedVmessTrojanReplayFlowEofAndDeadline) {
     config = Json::parse(ReadFile(client_dir / "config.json"));
     config["log"].update({{"enable", true}, {"loglevel", "debug"}});
     WriteJson(client_dir, "config.json", config);
-    front_reservation.Close();
     auto client = Start(client_dir);
     client->WaitForLog("server started");
     {
@@ -116,7 +114,6 @@ TEST(InboundHandshake, SegmentedVmessTrojanReplayFlowEofAndDeadline) {
     trojan_inbound["settings"] = {{"clients", Json::array({{{"password", "segmented-secret"}}})}};
     trojan_inbound["streamSettings"] = TlsSettings(true);
     Configure(trojan_dir, trojan_inbound, Direct());
-    trojan_reservation.Close();
     auto trojan = Start(trojan_dir);
     trojan->WaitForLog("server started");
     TlsContext tls(false);

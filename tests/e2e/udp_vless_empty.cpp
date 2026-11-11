@@ -29,11 +29,9 @@ TEST_P(VlessEmptyDatagrams, TwoRealNodesPreserveEmptyMessagesTargetsAndAssociati
         {{"protocol", "vless"},
          {"settings", {{"address", "127.0.0.1"}, {"port", exit_port.port},
                        {"id", UserId}, {"encryption", "none"}, {"packetEncoding", encoding}}}});
-    exit_port.Release();
     Child exit({Binary().string(), "--config-dir", exit_root.Path().string()},
                exit_root.Path() / "child.log");
     exit.WaitForLog("server started");
-    entry_port.Release();
     Child entry({Binary().string(), "--config-dir", entry_root.Path().string()},
                 entry_root.Path() / "child.log");
     entry.WaitForLog("server started");

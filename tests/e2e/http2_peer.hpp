@@ -81,7 +81,7 @@ inline void PatchConfig(const std::filesystem::path& root, const std::function<v
     WriteJson(root, "config.json", value);
 }
 class Node {
-    Socket reservation_ = Socket::Listen();
+    Socket reservation_ = Socket::ReserveTcp();
 public:
     TempDir root;
     uint16_t port = reservation_.Port();
@@ -94,7 +94,6 @@ public:
             config["log"]["enable"] = true;
             if (!config["log"].contains("loglevel")) config["log"]["loglevel"] = "debug";
         });
-        reservation_.Close();
         child = std::make_unique<Child>(std::vector<std::string>{Binary().string(), "--config-dir", root.Path().string()}, root.Path() / "child.log");
         child->WaitForLog("server started");
     }

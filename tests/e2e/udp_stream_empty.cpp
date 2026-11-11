@@ -74,9 +74,8 @@ TEST_P(StreamUdpEmpty, PreservesEmptyFirstPacketRepliesAndAssociationLifetime) {
                 Json::array({tls::Direct()}), config);
     tls::Config(front_root.Path(), Json::array({tls::Inbound(front_port.port)}),
                 Json::array({front_outbound}), config);
-    back_port.Release();
+    back_port.ReleaseUdp();
     auto back = tls::Start(back_root.Path());
-    front_port.Release();
     auto front = tls::Start(front_root.Path());
 
     Client client(front_port.port, destination.Port(), false);

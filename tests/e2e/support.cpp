@@ -471,6 +471,17 @@ Socket Socket::Listen(uint16_t port, std::string_view address) {
     return socket;
 }
 
+Socket Socket::ReserveTcp(std::string_view address) {
+    const auto endpoint = NumericAddress(address, 0);
+    auto socket = NewSocket(endpoint.family, SOCK_STREAM);
+    const int one = 1;
+    if (::setsockopt(socket.Fd(), SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) < 0) SystemError("SO_REUSEADDR");
+    if (endpoint.family == AF_INET6 && ::setsockopt(socket.Fd(), IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof(one)) < 0)
+        SystemError("IPV6_V6ONLY");
+    if (::bind(socket.Fd(), endpoint.Get(), endpoint.size) < 0) SystemError("bind reservation");
+    return socket;
+}
+
 Socket Socket::Connect(uint16_t port, std::string_view address, Milliseconds timeout) {
     const auto deadline = Expires(timeout);
     const auto endpoint = NumericAddress(address, port);

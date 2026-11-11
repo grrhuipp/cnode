@@ -11,8 +11,8 @@ TEST_P(AnyTlsClientPadding, LearnedPoliciesAreScopedToOutboundClientAcrossPhysic
     TempDir root;
     auto listener_a = Socket::Listen();
     auto listener_b = Socket::Listen();
-    auto reserve_a = Socket::Listen();
-    auto reserve_b = Socket::Listen();
+    auto reserve_a = Socket::ReserveTcp();
+    auto reserve_b = Socket::ReserveTcp();
     const std::array<uint16_t, 2> front{reserve_a.Port(), reserve_b.Port()};
     const std::array<uint16_t, 2> remote{listener_a.Port(), test.shared ? listener_a.Port() : listener_b.Port()};
     const std::array<std::string, 2> passwords{"secret-a", "secret-b"};
@@ -65,8 +65,6 @@ TEST_P(AnyTlsClientPadding, LearnedPoliciesAreScopedToOutboundClientAcrossPhysic
             completed.store(index + 1);
         }
     });
-    reserve_a.Close();
-    reserve_b.Close();
     Child child({Binary().string(), "--config-dir", root.Path().string()}, root.Path() / "child.log");
     child.WaitForLog("server started");
     for (size_t index = 0; index < sequence.size(); ++index) {

@@ -152,7 +152,7 @@ TEST_P(TestMode, ExplicitAndImplicitListenerOwnership) {
     const auto mode = GetParam();
     TestPortLock lock;
     TempDir directory;
-    auto reservation = Socket::Listen();
+    auto reservation = Socket::ReserveTcp();
     const uint16_t port = mode == "port_collision" ? 10086 : reservation.Port();
     WriteJson(directory.Path(), "config.json", {{"workers", 2},
         {"log", {{"enable", false}, {"logDir", (directory.Path() / "logs").string()}}}});
@@ -161,7 +161,6 @@ TEST_P(TestMode, ExplicitAndImplicitListenerOwnership) {
         inbound["tag"] = mode == "tag_collision" ? "test-vmess-10086" : "static-test-owner";
         WriteJson(directory.Path(), "inbounds.json", Json::array({inbound}));
     }
-    reservation.Close();
     std::vector<std::string> args{Binary().string(), "--config-dir", directory.Path().string()};
     if (mode != "implicit") args.push_back("--test");
     Child child(args, directory.Path() / "child.log", directory.Path());

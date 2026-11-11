@@ -6,12 +6,11 @@ namespace {
 using namespace tls;
 TEST(TlsAutosign, LongConfiguredSanAndArbitrarySniUseOneCertificate) {
     TempDir root;
-    auto reservation = Socket::Listen();
+    auto reservation = Socket::ReserveTcp();
     auto port = reservation.Port();
     const std::string identity = std::string(63, 'a') + "." + std::string(63, 'b') + ".example.com";
     Config(root.Path(), Json::array({Inbound(port, {{"network", "tcp"}, {"security", "tls"},
         {"tlsSettings", {{"serverName", identity}}}})}), Json::array({Direct()}));
-    reservation.Close();
     auto child = Start(root.Path());
     const std::string payload = "reality-end-to-end-verification-payload";
     std::unique_ptr<X509, decltype(&X509_free)> certificate(nullptr, X509_free);

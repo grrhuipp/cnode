@@ -182,7 +182,7 @@ inline std::vector<Observation> PhysicalSessions(const std::vector<PhysicalCase>
                                                 std::string_view password, bool reference = false) {
     TempDir root;
     auto listener = Socket::Listen();
-    auto reservation = Socket::Listen();
+    auto reservation = Socket::ReserveTcp();
     const auto front = reservation.Port();
     Configure(root.Path(), VlessInbound(front), AnyOutbound(listener.Port(), password));
     TlsContext tls(true);
@@ -207,7 +207,6 @@ inline std::vector<Observation> PhysicalSessions(const std::vector<PhysicalCase>
             completed.store(i + 1);
         }
     });
-    reservation.Close();
     std::vector<std::string> command{Binary().string(), "--config-dir", root.Path().string()};
 #ifdef CNODE_REFERENCE_ANYTLS_CLIENT
     if (reference) command = {CNODE_REFERENCE_ANYTLS_CLIENT, "-l", "127.0.0.1:" + std::to_string(front),
@@ -216,6 +215,7 @@ inline std::vector<Observation> PhysicalSessions(const std::vector<PhysicalCase>
 #else
     if (reference) throw std::runtime_error("reference client path was not configured");
 #endif
+    if (reference) reservation.Close();
     Child child(command, root.Path() / "child.log");
     if (!reference) child.WaitForLog("server started");
     for (size_t i = 0; i < cases.size(); ++i) {

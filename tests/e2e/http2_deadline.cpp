@@ -388,8 +388,8 @@ TEST(Http2EncryptedDeadline, ExpiredChildReturnsQuotaBeforeBlockedSiblingResumes
             closed = true;
         } else for (;;) { auto bytes = socket.Read(65536, 30s); if (bytes.empty()) break; socket.Write(bytes); }
     });
+    Socket probe_reservation = Socket::ReserveTcp(); const auto probe_port = probe_reservation.Port();
     Node server, client; server.Setup("xhttp", false, "packet-up");
-    Socket probe_reservation = Socket::Listen(); const auto probe_port = probe_reservation.Port();
     auto inbounds = Json::parse(ReadFile(server.root.Path() / "inbounds.json"));
     // RFC 7748 section 6.1 public fixture vector, never deployment keys.
     inbounds.at(0)["settings"]["decryption"] = "mlkem768x25519plus.native.0s." +
@@ -400,7 +400,7 @@ TEST(Http2EncryptedDeadline, ExpiredChildReturnsQuotaBeforeBlockedSiblingResumes
     routing["rules"].at(0)["inboundTag"].push_back("probe-in");
     WriteJson(server.root.Path(), "routing.json", routing);
     PatchConfig(server.root.Path(), [](Json& config) { config["limits"] = {{"maxConnections", 3}, {"maxConnectionsPerIP", 3}}; });
-    probe_reservation.Close(); server.Start();
+    server.Start();
     Peer peer(server.port, false, "xhttp"); int receive_buffer = 65536; setsockopt(peer.wire.Fd(), SOL_SOCKET, SO_RCVBUF, &receive_buffer, sizeof(receive_buffer));
     EncryptedBridge bridge(server.port);
     auto outbound = Protocol("vless", bridge.Port());

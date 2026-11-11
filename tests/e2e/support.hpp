@@ -101,6 +101,12 @@ public:
     static Socket Listen(uint16_t port = 0, std::string_view address = "127.0.0.1");
     static Socket Connect(uint16_t port, std::string_view address = "127.0.0.1", Milliseconds timeout = 5s);
     static Socket BindUdp(uint16_t port = 0, std::string_view address = "127.0.0.1");
+    // Bound, never listening, SO_REUSEADDR: while open, the kernel hands the
+    // port to no bind(0) or connect() of any process, yet cnode (which sets
+    // SO_REUSEADDR) can still bind and listen on it. Keep it open for the
+    // lifetime of the cnode child that serves the port; close it first only
+    // for peers that bind without SO_REUSEADDR.
+    static Socket ReserveTcp(std::string_view address = "127.0.0.1");
     Socket Accept(Milliseconds timeout = 5s) const;
     uint16_t Port() const;
     int Fd() const noexcept { return fd_; }

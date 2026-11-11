@@ -26,7 +26,7 @@ TEST_P(InitialPayload, PreservesAuthenticationTargetServerFirstGreetingAndByteOr
     for (int i = 0; i < 9; ++i) tail += "later-payload-";
     const auto expected = prefix + tail;
     auto backend = Socket::Listen();
-    auto reservation = Socket::Listen();
+    auto reservation = Socket::ReserveTcp();
     const auto port = reservation.Port();
     Json outbound = {{"protocol", protocol}, {"settings", Json::object()}};
     if (protocol == "vless") outbound["settings"]["vnext"] = Json::array({
@@ -143,7 +143,6 @@ TEST_P(InitialPayload, PreservesAuthenticationTargetServerFirstGreetingAndByteOr
             socket.ShutdownWrite();
         }
     });
-    reservation.Close();
     auto child = Start(directory.Path());
     child->WaitForLog("server started");
     auto client = Socket::Connect(port);

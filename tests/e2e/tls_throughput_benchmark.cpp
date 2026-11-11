@@ -167,15 +167,13 @@ TEST_P(TlsThroughputBenchmark, VerifiedTransfer) {
         socket.ShutdownWrite();
         ++completed;
     });
-    auto reservation = Socket::Listen();
+    auto reservation = Socket::ReserveTcp();
     const auto port = reservation.Port();
     tls::Config(root.Path(), Json::array({tls::Inbound(port, TlsSettings(true))}),
                 Json::array({tls::Direct()}),
                 {{"log", {{"loglevel", "info"}}},
                  {"timeouts", {{"handshake", 10}, {"connIdle", 120}, {"write", 120},
                                {"uplinkOnly", 10}, {"downlinkOnly", 10}}}});
-    reservation.Close();
-
     // Child deliberately exposes no pid. No other child is spawned in this
     // test: the rusage difference after reap is this daemon's complete lifetime
     // CPU, including startup, handshakes, warmup, both phase markers and stop.

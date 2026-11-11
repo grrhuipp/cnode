@@ -92,7 +92,7 @@ TEST_P(DnsEndpoints, NormalizesEndpointFallsBackAndSharesCacheAcrossWorkers) {
     for (const auto& resolver : resolvers)
         servers.push_back((host == "::1" ? "[::1]" : host) + ":" + std::to_string(resolver->Port()));
     auto backend = Socket::Listen();
-    auto reservation = Socket::Listen();
+    auto reservation = Socket::ReserveTcp();
     const auto port = reservation.Port();
     Configure(directory.Path(), Inbound(port), Direct(), 2);
     auto config = Json::parse(ReadFile(directory.Path() / "config.json"));
@@ -105,7 +105,6 @@ TEST_P(DnsEndpoints, NormalizesEndpointFallsBackAndSharesCacheAcrossWorkers) {
             socket.Write(Banner);
         }
     });
-    reservation.Close();
     auto child = Start(directory.Path());
     child->WaitForLog("server started");
     const auto domain = mode + ".endpoint.test";
@@ -136,7 +135,7 @@ TEST_P(DnsAnswerTtl, RequeriesZeroTtlBeforeDialingTheNextDestination) {
     TempDir directory;
     Resolver resolver(false, "127.0.0.1", ttl);
     auto backend = Socket::Listen(0, "0.0.0.0");
-    auto reservation = Socket::Listen();
+    auto reservation = Socket::ReserveTcp();
     const auto port = reservation.Port();
     Configure(directory.Path(), Inbound(port), Direct(), 2);
     auto config = Json::parse(ReadFile(directory.Path() / "config.json"));
@@ -156,7 +155,6 @@ TEST_P(DnsAnswerTtl, RequeriesZeroTtlBeforeDialingTheNextDestination) {
             socket.Write(std::string(Banner) + std::string(1, last_octet));
         }
     });
-    reservation.Close();
     auto child = Start(directory.Path());
     child->WaitForLog("server started");
     for (size_t i = 0; i < 2; ++i) {
@@ -285,7 +283,7 @@ TEST_P(IpLiterals, ConsumesWholeAddressWithoutEndpointOrCStringCoercion) {
     SCOPED_TRACE(name);
     TempDir directory;
     auto backend = Socket::Listen();
-    auto reservation = Socket::Listen();
+    auto reservation = Socket::ReserveTcp();
     const auto port = reservation.Port();
     Configure(directory.Path(), Inbound(port), Direct());
     std::unique_ptr<PeerThread> peer;
@@ -294,7 +292,6 @@ TEST_P(IpLiterals, ConsumesWholeAddressWithoutEndpointOrCStringCoercion) {
         EXPECT_EQ(socket.ReadExact(Request.size()), Request);
         socket.Write(Banner);
     });
-    reservation.Close();
     auto child = Start(directory.Path());
     child->WaitForLog("server started");
     auto socket = Socket::Connect(port);

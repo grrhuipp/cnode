@@ -49,7 +49,7 @@ TEST_P(Ss2022UdpIdentity, AuthenticatesUsersAndPreservesReplayNamespaces) {
     WriteJson(root.Path(), "outbounds.json", Json::array({{
         {"tag", "direct"}, {"protocol", "freedom"}, {"settings", Json::object()}}}));
     const auto port = reservation.port;
-    reservation.Release();
+    reservation.ReleaseUdp();
     Child child({Binary().string(), "--config-dir", root.Path().string()}, root.Path() / "child.log");
     child.WaitForLog("server started");
     Client first(port, peer.Port(), true, false, "127.0.0.1", cipher);

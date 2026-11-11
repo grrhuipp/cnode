@@ -108,7 +108,6 @@ TEST_P(OutboundBind, OrderedSameFamilySelectionAndSystemFallback) {
         config["dns"] = {{"servers", Json::array({"127.0.0.1:" + std::to_string(dns->Port())})}, {"timeout", 5}};
     }
     ConfigFiles(root, config, Json::array({Inbound(inbound.port)}), Json::array({Outbound(item.addresses, item.strategy)}));
-    inbound.Release();
     Child child({Binary().string(), "--config-dir", root.Path().string()}, root.Path() / "child.log");
     child.WaitForLog("server started");
     if (item.succeeds) {
@@ -157,7 +156,6 @@ TEST_P(RejectedBind, ReportsInvalidSendThroughBeforeStartup) {
     PortReservation inbound;
     ConfigFiles(root, {{"workers", 1}, {"log", {{"enable", false}}}}, Json::array({Inbound(inbound.port)}),
         Json::array({Outbound(GetParam().addresses, GetParam().strategy)}));
-    inbound.Release();
     Child child({Binary().string(), "--config-dir", root.Path().string()}, root.Path() / "child.log");
     EXPECT_NE(child.Wait(5s), 0);
     EXPECT_NE(ReadFile(child.LogPath()).find("sendThrough"), std::string::npos);
@@ -199,7 +197,6 @@ TEST_P(PassthroughHash, PreservesOriginAcrossAnyTlsAndVlessHops) {
          {"settings", {{"address", "127.0.0.1"}, {"port", jp.port}, {"id", RelayUser}}}},
         {{"tag", last_tag}, {"protocol", "freedom"}, {"sendThrough", Json::array({"127.0.0.0/24"})}, {"sendThroughStrategy", ip_hash ? "ip_hash" : "user_hash"}}});
     ConfigFiles(root, {{"workers", 1}, {"log", {{"enable", true}, {"rotateDaily", false}, {"access", (root.Path() / "access.log").string()}}}}, inbounds, outbounds);
-    entry.Release(); entry_b.Release(); us.Release(); jp.Release();
     auto target = Socket::Listen();
     Child child({Binary().string(), "--config-dir", root.Path().string()}, root.Path() / "child.log");
     child.WaitForLog("server started");

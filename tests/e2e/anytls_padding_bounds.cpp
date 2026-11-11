@@ -19,11 +19,10 @@ TEST_P(AnyTlsPaddingBounds, ColdAdmissionUsesUtf8BytesAndExactUpdateFrameCapacit
     ASSERT_EQ(raw.size(), test.size);
     TempDir root;
     auto destination = Socket::Listen();
-    auto reservation = Socket::Listen();
+    auto reservation = Socket::ReserveTcp();
     const auto port = reservation.Port();
     Configure(root.Path(), AnyInbound(port, PolicySetting(raw, test.array)),
               {{"protocol", "freedom"}, {"settings", Json::object()}});
-    reservation.Close();
     Child child({Binary().string(), "--config-dir", root.Path().string()}, root.Path() / "child.log");
     Until([&] { return !child.Running() || ReadFile(child.LogPath()).find("server started") != std::string::npos; }, 8s);
     if (test.size > 65535) {

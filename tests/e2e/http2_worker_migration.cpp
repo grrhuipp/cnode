@@ -6,8 +6,8 @@ class Http2WorkerMigration : public testing::TestWithParam<std::tuple<bool, std:
 TEST_P(Http2WorkerMigration, SourceIndependentSessionsMergeAndDetachWithActiveReads) {
     auto [tls, mode] = GetParam();
     Targets target([](Socket& socket) { for (;;) { auto data = socket.Read(16384, 30s); if (data.empty()) break; socket.Write(data); } });
+    Socket extra_reservation = Socket::ReserveTcp(); const auto extra = extra_reservation.Port();
     Node node; node.Setup("xhttp", tls, mode == "stream-up" ? "stream-up" : "packet-up", 4);
-    Socket extra_reservation = Socket::Listen(); const auto extra = extra_reservation.Port();
     if (mode == "isolation") {
         auto inbounds = Json::parse(ReadFile(node.root.Path() / "inbounds.json"));
         auto second = inbounds.at(0); second["tag"] = "isolated-in"; second["port"] = extra; inbounds.push_back(second);
@@ -20,7 +20,7 @@ TEST_P(Http2WorkerMigration, SourceIndependentSessionsMergeAndDetachWithActiveRe
         config["workers"] = 4; config["log"]["enable"] = true; config["log"]["loglevel"] = "debug";
         config["timeouts"]["handshake"] = 15; config["timeouts"]["connIdle"] = 30;
     });
-    extra_reservation.Close(); node.Start();
+    node.Start();
     if (mode == "packet-up" || mode == "stream-up") {
         struct Session { std::string name; std::unique_ptr<Wire> down, upload; std::unique_ptr<Chunked> chunks; };
         std::vector<Session> sessions;

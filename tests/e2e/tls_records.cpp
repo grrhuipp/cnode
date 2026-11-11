@@ -6,10 +6,9 @@ using namespace tls;
 
 TEST(TlsRecords, CoalescedRecordsRemainReadableAfterIdleCollection) {
     TempDir root;
-    auto reservation = Socket::Listen();
+    auto reservation = Socket::ReserveTcp();
     auto port = reservation.Port();
     Config(root.Path(), Json::array({AnyInbound(port)}), Json::array({Direct()}));
-    reservation.Close();
     auto child = Start(root.Path());
     TlsContext context(false);
     WireTls client(Socket::Connect(port), context);
@@ -32,7 +31,7 @@ TEST_P(TlsReadCancellation, LogicalFinJoinsPendingReadAndEmitsCloseNotify) {
     const auto param = GetParam();
     TempDir root;
     auto listener = Socket::Listen();
-    auto reservation = Socket::Listen();
+    auto reservation = Socket::ReserveTcp();
     const auto port = reservation.Port();
     Json outbound{{"tag", "direct"}, {"protocol", "trojan"},
         {"settings", {{"servers", {{{"address", "127.0.0.1"}, {"port", listener.Port()}, {"password", "secret"}}}}}},
@@ -71,7 +70,6 @@ TEST_P(TlsReadCancellation, LogicalFinJoinsPendingReadAndEmitsCloseNotify) {
         Require(secured.Raw().Read(65536, 2s).empty(), "bytes after TLS shutdown");
         peer_eof = true;
     });
-    reservation.Close();
     auto child = Start(root.Path());
     TlsContext context(false);
     WireTls client(Socket::Connect(port), context);
@@ -111,7 +109,7 @@ INSTANTIATE_TEST_SUITE_P(ActiveAndCollected, TlsReadCancellation,
 TEST(TlsRecords, BlockedCiphertextWriteSurvivesIdleCollection) {
     TempDir root;
     auto listener = Socket::Listen();
-    auto reservation = Socket::Listen();
+    auto reservation = Socket::ReserveTcp();
     const auto port = reservation.Port();
     Config(root.Path(), Json::array({AnyInbound(port)}), Json::array({Direct()}));
     std::string data(16 * 1024 * 1024, '\0');
@@ -127,7 +125,6 @@ TEST(TlsRecords, BlockedCiphertextWriteSurvivesIdleCollection) {
         drained = true;
         Require(socket.Read(1, 20s).empty(), "data after logical FIN");
     });
-    reservation.Close();
     auto child = Start(root.Path());
     TlsContext context(false);
     WireTls client(Socket::Connect(port), context);

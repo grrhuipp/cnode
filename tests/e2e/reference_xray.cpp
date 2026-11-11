@@ -105,7 +105,8 @@ TEST_P(VisionReference, BidirectionalPaddingDirectAndInnerTlsEof) {
         if (mode) { TlsSocket tls(std::move(socket), target_tls, true); exchange(tls); }
         else exchange(socket);
     });
-    const auto server_port = TcpPort(), front_port = TcpPort();
+    auto server_reservation = Socket::ReserveTcp(), front_reservation = Socket::ReserveTcp();
+    const auto server_port = server_reservation.Port(), front_port = front_reservation.Port();
     Json xray;
     Json user{{"id", UserId}, {"encryption", "none"}, {"flow", "xtls-rprx-vision"}};
     if (xray_client) {
@@ -129,6 +130,7 @@ TEST_P(VisionReference, BidirectionalPaddingDirectAndInnerTlsEof) {
     }
     xray["log"]["loglevel"] = "debug";
     WriteJson(root.Path(), "xray.json", xray);
+    (xray_client ? front_reservation : server_reservation).Close();
     Child reference({CNODE_REFERENCE_XRAY, "run", "-config", (root.Path() / "xray.json").string()}, root.Path() / "xray.log");
     reference.WaitForLog("started");
     Child cnode({Binary().string(), "--config-dir", root.Path().string()}, root.Path() / "cnode.log");
@@ -184,7 +186,8 @@ TEST_P(EncryptionReference, CrossWorkerTicketsReplayAndHandshakeBoundaries) {
         EXPECT_EQ(socket.ReadExact(20), "vless-0rtt-real-xray");
         ++requests; socket.Write("accepted-once-per-nfs-key");
     });
-    const auto server_port = TcpPort(), front_port = TcpPort();
+    auto server_reservation = Socket::ReserveTcp();
+    const auto server_port = server_reservation.Port(), front_port = TcpPort();
     Bridge bridge(server_port);
     auto inbound = VlessInbound(server_port);
     inbound["proxyProtocol"] = "off";
@@ -268,7 +271,8 @@ TEST_P(EncryptionReference, CnodeOutboundResumesRealXrayTickets) {
         socket.Write("accepted-once-per-nfs-key");
         if (number == 0) Until([&] { return release_first.load(); }, 15s);
     });
-    const auto server_port = TcpPort(), front_port = TcpPort();
+    auto front_reservation = Socket::ReserveTcp();
+    const auto server_port = TcpPort(), front_port = front_reservation.Port();
     Bridge bridge(server_port);
     auto inbound = VlessInbound(server_port);
     inbound["settings"]["decryption"] = decryption;
@@ -317,7 +321,8 @@ TEST(XhttpReference, FourConcurrentStreamUpRequestsDrainUploadResponses) {
         socket.Write("ready");
         while (true) { const auto data = socket.Read(); if (data.empty()) break; socket.Write(data); }
     });
-    const auto xray_port = TcpPort(), front_port = TcpPort();
+    auto front_reservation = Socket::ReserveTcp();
+    const auto xray_port = TcpPort(), front_port = front_reservation.Port();
     const Json stream{{"network", "xhttp"}, {"security", "none"},
         {"xhttpSettings", {{"path", "/interop"}, {"mode", "stream-up"}}}};
     auto inbound = VlessInbound(xray_port); inbound["streamSettings"] = stream;

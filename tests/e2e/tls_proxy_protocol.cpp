@@ -13,7 +13,7 @@ void ExpectClosed(Socket& socket) {
 TEST(ProxyProtocol, OffAutoOnAndDefaultPreserveOptionalHeaderBoundaries) {
     TempDir root;
     auto target = Socket::Listen();
-    auto on = Socket::Listen(), off = Socket::Listen(), automatic = Socket::Listen(), fallback = Socket::Listen();
+    auto on = Socket::ReserveTcp(), off = Socket::ReserveTcp(), automatic = Socket::ReserveTcp(), fallback = Socket::ReserveTcp();
     const uint16_t required = on.Port(), disabled = off.Port(), auto_port = automatic.Port(), default_port = fallback.Port();
     Json inbounds = Json::array();
     for (const auto& [port, mode] : std::array<std::pair<uint16_t, std::string>, 4>{{{required, "on"}, {disabled, "off"}, {auto_port, "auto"}, {default_port, "default"}}}) {
@@ -25,7 +25,6 @@ TEST(ProxyProtocol, OffAutoOnAndDefaultPreserveOptionalHeaderBoundaries) {
     Json config{{"timeouts", {{"handshake", 2}, {"connIdle", 5}}},
         {"log", {{"loglevel", "info"}, {"access", "access.log"}, {"error", "error.log"}, {"rotateDaily", false}, {"gzip", false}}}};
     Config(root.Path(), inbounds, Json::array({Direct()}), config);
-    on.Close(); off.Close(); automatic.Close(); fallback.Close();
     auto child = Start(root.Path());
     const std::string payload = "proxy-mode-boundary";
     const auto request = VlessRequest(target.Port(), payload);
