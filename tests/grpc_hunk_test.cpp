@@ -2,7 +2,7 @@
 #include <gtest/gtest.h>
 
 #include "allocation_hook.hpp"
-#include "http2_session.hpp"
+#include "transport/internet/http2_session.hpp"
 
 #include <algorithm>
 #include <array>

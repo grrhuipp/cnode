@@ -41,22 +41,22 @@ TEST_P(QuicUdpFrameBudget, DownlinkPreservesSourcesWithinPeerFrameBudget) {
         uint16_t packet_id = 0;
         for (size_t index = 0; count == 0 || index < count; ++index) {
             const auto wire = peer.ReadDatagram();
-            udp::Require(wire.size() >= 9 && wire.size() < frame_limit, "HY2 frame exceeds peer budget");
+            Require(wire.size() >= 9 && wire.size() < frame_limit, "HY2 frame exceeds peer budget");
             const auto view = std::string_view(wire);
-            udp::Require(ReadBigEndian(view.substr(0, 4)) == expected_session, "HY2 reply changed session");
+            Require(ReadBigEndian(view.substr(0, 4)) == expected_session, "HY2 reply changed session");
             const auto current_packet = static_cast<uint16_t>(ReadBigEndian(view.substr(4, 2)));
             const auto current_count = static_cast<uint8_t>(wire[7]);
             const auto fragment = current_count == 1 ? uint8_t{0} : static_cast<uint8_t>(wire[6]);
             if (count == 0) { count = current_count; packet_id = current_packet; }
-            udp::Require(count != 0 && current_count == count && current_packet == packet_id &&
+            Require(count != 0 && current_count == count && current_packet == packet_id &&
                 fragment < count && !received.test(fragment), "HY2 fragment identity changed");
             const size_t width = size_t{1} << (static_cast<uint8_t>(wire[8]) >> 6);
-            udp::Require(width <= wire.size() - 8, "truncated HY2 address length");
+            Require(width <= wire.size() - 8, "truncated HY2 address length");
             size_t length = static_cast<uint8_t>(wire[8]) & 0x3f;
             for (size_t byte = 1; byte < width; ++byte)
                 length = (length << 8) | static_cast<uint8_t>(wire[8 + byte]);
-            udp::Require(length <= wire.size() - 8 - width, "truncated HY2 reply address");
-            udp::Require(view.substr(8 + width, length) == expected_source,
+            Require(length <= wire.size() - 8 - width, "truncated HY2 reply address");
+            Require(view.substr(8 + width, length) == expected_source,
                 "HY2 fragment lost its source address");
             parts[fragment] = view.substr(8 + width + length);
             received.set(fragment);
@@ -68,9 +68,9 @@ TEST_P(QuicUdpFrameBudget, DownlinkPreservesSourcesWithinPeerFrameBudget) {
     auto exchange = [&](std::string_view request, std::string_view response, std::string_view response_host) {
         peer.SendDatagram(UdpWire(session, 7, 0, 1, "127.0.0.1:53", request));
         auto packet = udp::Receive(next_hop);
-        udp::Require(udp::LegacyDecrypt(packet.payload) == request_header + std::string(request),
+        Require(udp::LegacyDecrypt(packet.payload) == request_header + std::string(request),
             "HY2 to SS changed target or payload");
-        if (origin) udp::Require(origin->SameEndpoint(packet), "HY2 session replaced its SS socket");
+        if (origin) Require(origin->SameEndpoint(packet), "HY2 session replaced its SS socket");
         else {
             origin.emplace();
             origin->address = packet.address;
@@ -98,14 +98,14 @@ TEST_P(QuicUdpFrameBudget, DownlinkPreservesSourcesWithinPeerFrameBudget) {
     if (frame_limit <= 273) {
         peer.SendDatagram(UdpWire(session, 7, 0, 1, "127.0.0.1:53", "unrepresentable-response"));
         auto rejected = udp::Receive(next_hop);
-        udp::Require(udp::LegacyDecrypt(rejected.payload) == request_header + "unrepresentable-response",
+        Require(udp::LegacyDecrypt(rejected.payload) == request_header + "unrepresentable-response",
             "unrepresentable reply lost its request context");
         udp::Reply(next_hop, rejected, udp::LegacyEncrypt(SocksAddress(54321, reply_host) +
             udp::Sequence(frame_limit == 273 ? 257 : 1)));
         constexpr auto sibling = session + 1;
         peer.SendDatagram(UdpWire(sibling, 7, 0, 1, "127.0.0.1:53", "sibling-request"));
         auto sibling_packet = udp::Receive(next_hop);
-        udp::Require(udp::LegacyDecrypt(sibling_packet.payload) == request_header + "sibling-request",
+        Require(udp::LegacyDecrypt(sibling_packet.payload) == request_header + "sibling-request",
             "sibling request did not survive the oversized reply");
         const std::string_view sibling_host = frame_limit == 18 ? "c" : "127.0.0.1";
         const std::string_view sibling_reply = frame_limit == 18 ? "" : "sibling-usable";
@@ -528,10 +528,9 @@ TEST(QuicUdp, ConcurrentMultiSessionMigrationAndEphemeralAnyTlsStreams) {
     hy2_inbound["sniffing"]["enabled"] = true;
     hy2_inbound["settings"]["upMbps"] = 1000;
     hy2_inbound["settings"]["downMbps"] = 1000;
-    hy2_inbound["fallbackTag"] = "anytls-out";
 
     Json vless_inbound = {{"tag", "vless-in"}, {"protocol", "vless"},
-        {"listen", "127.0.0.1"}, {"port", vless_port}, {"fallbackTag", "anytls-out"},
+        {"listen", "127.0.0.1"}, {"port", vless_port},
         {"settings", {{"decryption", "none"},
             {"clients", Json::array({{{"id", UserId}}})}}}};
 
@@ -548,9 +547,8 @@ TEST(QuicUdp, ConcurrentMultiSessionMigrationAndEphemeralAnyTlsStreams) {
                       {"connIdle", 60}, {"uplinkOnly", 5}, {"downlinkOnly", 5}}},
         {"panels", Json::array({{{"name", "full-app"}, {"type", "V2board"},
             {"apiHost", "http://127.0.0.1:" + std::to_string(panel_listener.Port())},
-            {"key", "panel-secret"}, {"nodeIDs", {1}}, {"nodeType", "vless"},
-            {"fallbackTag", "anytls-out"}}})},
-        {"log", {{"enable", true}, {"loglevel", "debug"},
+            {"key", "panel-secret"}, {"nodeIDs", {1}}, {"nodeType", "vless"}}})},
+        {"log", {{"loglevel", "debug"},
                  {"logDir", (root.Path() / "logs").string()}}}});
     WriteJson(root.Path(), "inbounds.json",
         Json::array({std::move(hy2_inbound), std::move(vless_inbound), std::move(ss_inbound)}));
@@ -638,15 +636,15 @@ TEST(QuicUdp, ConcurrentMultiSessionMigrationAndEphemeralAnyTlsStreams) {
 
     auto decode_udp_reply = [](std::string_view wire, uint32_t expected_session,
                                std::string_view expected_address) {
-        udp::Require(wire.size() >= 9 &&
+        Require(wire.size() >= 9 &&
             ReadBigEndian(wire.substr(0, 4)) == expected_session &&
             static_cast<uint8_t>(wire[7]) == 1, "concurrent HY2 UDP header mismatch");
         const size_t width = size_t{1} << (static_cast<uint8_t>(wire[8]) >> 6);
-        udp::Require(width <= wire.size() - 8, "truncated concurrent HY2 UDP address width");
+        Require(width <= wire.size() - 8, "truncated concurrent HY2 UDP address width");
         size_t length = static_cast<uint8_t>(wire[8]) & 0x3f;
         for (size_t i = 1; i < width; ++i)
             length = (length << 8) | static_cast<uint8_t>(wire[8 + i]);
-        udp::Require(length <= wire.size() - 8 - width &&
+        Require(length <= wire.size() - 8 - width &&
             wire.substr(8 + width, length) == expected_address,
             "concurrent HY2 UDP source address mismatch");
         return std::string(wire.substr(8 + width + length));
@@ -1067,14 +1065,14 @@ TEST(QuicUdp, AllProtocolsAndTransportsFullMatrixConcurrentMigration) {
             Json out_settings = {{"address", "127.0.0.1"}, {"port", mport}, {"id", UserId}, {"encryption", encryption}};
             if (std::string_view(spec.extra) == "vision") out_settings["flow"] = "xtls-rprx-vision";
             upstream_inbounds.push_back({{"tag", mtag}, {"protocol", "vless"},
-                {"listen", "127.0.0.1"}, {"port", mport}, {"fallbackTag", "out-0"},
+                {"listen", "127.0.0.1"}, {"port", mport},
                 {"settings", {{"decryption", decryption}, {"clients", Json::array({client_entry})}}},
                 {"streamSettings", std::move(in_stream)}});
             gateway_outbounds.push_back({{"tag", htag}, {"protocol", "vless"},
                 {"settings", std::move(out_settings)}, {"streamSettings", std::move(out_stream)}});
         } else if (std::string_view(spec.protocol) == "vmess") {
             upstream_inbounds.push_back({{"tag", mtag}, {"protocol", "vmess"},
-                {"listen", "127.0.0.1"}, {"port", mport}, {"fallbackTag", "out-0"},
+                {"listen", "127.0.0.1"}, {"port", mport},
                 {"settings", {{"clients", Json::array({{{"id", UserId}}})}}},
                 {"streamSettings", std::move(in_stream)}});
             gateway_outbounds.push_back({{"tag", htag}, {"protocol", "vmess"},
@@ -1083,7 +1081,7 @@ TEST(QuicUdp, AllProtocolsAndTransportsFullMatrixConcurrentMigration) {
                 {"streamSettings", std::move(out_stream)}});
         } else if (std::string_view(spec.protocol) == "trojan") {
             upstream_inbounds.push_back({{"tag", mtag}, {"protocol", "trojan"},
-                {"listen", "127.0.0.1"}, {"port", mport}, {"fallbackTag", "out-0"},
+                {"listen", "127.0.0.1"}, {"port", mport},
                 {"settings", {{"clients", Json::array({{{"password", "secret"}}})}}},
                 {"streamSettings", std::move(in_stream)}});
             gateway_outbounds.push_back({{"tag", htag}, {"protocol", "trojan"},
@@ -1092,7 +1090,7 @@ TEST(QuicUdp, AllProtocolsAndTransportsFullMatrixConcurrentMigration) {
         } else if (std::string_view(spec.protocol) == "shadowsocks") {
             if (std::string_view(spec.extra) == "legacy") {
                 upstream_inbounds.push_back({{"tag", mtag}, {"protocol", "shadowsocks"},
-                    {"listen", "127.0.0.1"}, {"port", mport}, {"fallbackTag", "out-0"},
+                    {"listen", "127.0.0.1"}, {"port", mport},
                     {"settings", {{"method", "aes-128-gcm"}, {"clients", Json::array({{{"password", "secret"}}})}}}});
                 gateway_outbounds.push_back({{"tag", htag}, {"protocol", "shadowsocks"},
                     {"settings", {{"address", "127.0.0.1"}, {"port", mport},
@@ -1100,7 +1098,7 @@ TEST(QuicUdp, AllProtocolsAndTransportsFullMatrixConcurrentMigration) {
                         {"uot", {{"enabled", true}, {"version", 2}}}}}});
             } else if (std::string_view(spec.extra) == "2022-128") {
                 upstream_inbounds.push_back({{"tag", mtag}, {"protocol", "shadowsocks"},
-                    {"listen", "127.0.0.1"}, {"port", mport}, {"fallbackTag", "out-0"},
+                    {"listen", "127.0.0.1"}, {"port", mport},
                     {"settings", {{"method", "2022-blake3-aes-128-gcm"}, {"password", ss2022_id_key},
                         {"clients", Json::array({{{"password", ss2022_user_key}}})}}}});
                 gateway_outbounds.push_back({{"tag", htag}, {"protocol", "shadowsocks"},
@@ -1109,7 +1107,7 @@ TEST(QuicUdp, AllProtocolsAndTransportsFullMatrixConcurrentMigration) {
                         {"uot", {{"enabled", true}, {"version", 2}}}}}});
             } else {
                 upstream_inbounds.push_back({{"tag", mtag}, {"protocol", "shadowsocks"},
-                    {"listen", "127.0.0.1"}, {"port", mport}, {"fallbackTag", "out-0"},
+                    {"listen", "127.0.0.1"}, {"port", mport},
                     {"settings", {{"method", "2022-blake3-aes-256-gcm"}, {"password", ss2022_256_id_key},
                         {"clients", Json::array({{{"password", ss2022_256_user_key}}})}}}});
                 gateway_outbounds.push_back({{"tag", htag}, {"protocol", "shadowsocks"},
@@ -1119,7 +1117,7 @@ TEST(QuicUdp, AllProtocolsAndTransportsFullMatrixConcurrentMigration) {
             }
         } else if (std::string_view(spec.protocol) == "anytls") {
             upstream_inbounds.push_back({{"tag", mtag}, {"protocol", "anytls"},
-                {"listen", "127.0.0.1"}, {"port", mport}, {"fallbackTag", "out-0"},
+                {"listen", "127.0.0.1"}, {"port", mport},
                 {"settings", {{"clients", Json::array({{{"password", "secret"}}})}}},
                 {"streamSettings", std::move(in_stream)}});
             gateway_outbounds.push_back({{"tag", htag}, {"protocol", "anytls"},
@@ -1131,7 +1129,6 @@ TEST(QuicUdp, AllProtocolsAndTransportsFullMatrixConcurrentMigration) {
 
     auto hy2_inbound = HysteriaInbound(hy2_port);
     hy2_inbound["tag"] = "hy2-matrix-in";
-    hy2_inbound["fallbackTag"] = "direct-out";
     hy2_inbound["settings"]["upMbps"] = 1000;
     hy2_inbound["settings"]["downMbps"] = 1000;
     hy2_inbound["settings"]["clients"] = std::move(hy2_clients);
@@ -1142,14 +1139,14 @@ TEST(QuicUdp, AllProtocolsAndTransportsFullMatrixConcurrentMigration) {
         {"timeouts", {{"handshake", 15}, {"dial", 10}, {"read", 20}, {"write", 30},
                       {"connIdle", 60}, {"uplinkOnly", 10}, {"downlinkOnly", 10}}}};
     auto gw_cfg = base_config;
-    gw_cfg["log"] = {{"enable", true}, {"loglevel", "debug"}, {"logDir", (gateway_root.Path() / "logs").string()}};
+    gw_cfg["log"] = {{"loglevel", "debug"}, {"logDir", (gateway_root.Path() / "logs").string()}};
     WriteJson(gateway_root.Path(), "config.json", gw_cfg);
     WriteJson(gateway_root.Path(), "inbounds.json", gateway_inbounds);
     WriteJson(gateway_root.Path(), "outbounds.json", gateway_outbounds);
     WriteJson(gateway_root.Path(), "routing.json", {{"rules", gateway_rules}});
 
     auto up_cfg = base_config;
-    up_cfg["log"] = {{"enable", false}, {"logDir", (upstream_root.Path() / "logs").string()}};
+    up_cfg["log"] = {{"logDir", (upstream_root.Path() / "logs").string()}};
     WriteJson(upstream_root.Path(), "config.json", up_cfg);
     WriteJson(upstream_root.Path(), "inbounds.json", upstream_inbounds);
     WriteJson(upstream_root.Path(), "outbounds.json", upstream_outbounds);
@@ -1206,15 +1203,15 @@ TEST(QuicUdp, AllProtocolsAndTransportsFullMatrixConcurrentMigration) {
 
     auto decode_udp = [](std::string_view wire, uint32_t expected_session,
                          std::string_view expected_address) {
-        udp::Require(wire.size() >= 9 &&
+        Require(wire.size() >= 9 &&
             ReadBigEndian(wire.substr(0, 4)) == expected_session &&
             static_cast<uint8_t>(wire[7]) == 1, "matrix HY2 UDP header mismatch");
         const size_t width = size_t{1} << (static_cast<uint8_t>(wire[8]) >> 6);
-        udp::Require(width <= wire.size() - 8, "matrix HY2 UDP address width");
+        Require(width <= wire.size() - 8, "matrix HY2 UDP address width");
         size_t length = static_cast<uint8_t>(wire[8]) & 0x3f;
         for (size_t i = 1; i < width; ++i)
             length = (length << 8) | static_cast<uint8_t>(wire[8 + i]);
-        udp::Require(length <= wire.size() - 8 - width &&
+        Require(length <= wire.size() - 8 - width &&
             wire.substr(8 + width, length) == expected_address,
             "matrix HY2 UDP source address mismatch");
         return std::string(wire.substr(8 + width + length));

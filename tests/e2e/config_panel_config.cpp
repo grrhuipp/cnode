@@ -70,7 +70,7 @@ TEST_P(StaticRouting, DefaultDirectForcedOutboundAndOptInRouting) {
     routed.update({{"tag", "routed"}, {"routingEnabled", true}});
     const bool mixed = GetParam();
     std::map<std::string, Json> files = {
-        {"config.json", {{"workers", 1}, {"log", {{"enable", mixed}, {"logDir", (directory.Path() / "CaseSensitiveLogs").string()}}}}},
+        {"config.json", {{"workers", 1}, {"log", {{"logDir", (directory.Path() / "CaseSensitiveLogs").string()}}}}},
         {"inbounds.json", Json::array({direct, forced, routed})},
         {"outbounds.json", Json::array({{{"tag", "Chosen"}, {"protocol", "freedom"}}, {{"tag", "chosen"}, {"protocol", "blackhole"}}})},
         {"routing.json", {{"rules", Json::array({{{"type", "field"}, {"inboundTag", {"default-direct", "forced", "routed"}}, {"outboundTag", "blackhole"}}})}}}

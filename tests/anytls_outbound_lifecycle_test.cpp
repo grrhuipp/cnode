@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "allocation_hook.hpp"
-#include "anytls_codec.hpp"
+#include "proxy/anytls/anytls_codec.hpp"
 #include "app/relay.hpp"
 #include "app/dns/dns.hpp"
 #include "app/stats.hpp"

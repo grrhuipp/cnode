@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "hysteria_ingress.hpp"
+#include "transport/internet/hysteria/hysteria_ingress.hpp"
 
 #include <algorithm>
 #include <array>

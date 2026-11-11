@@ -186,8 +186,8 @@ TEST_P(EncryptionReference, CrossWorkerTicketsReplayAndHandshakeBoundaries) {
         EXPECT_EQ(socket.ReadExact(20), "vless-0rtt-real-xray");
         ++requests; socket.Write("accepted-once-per-nfs-key");
     });
-    auto server_reservation = Socket::ReserveTcp();
-    const auto server_port = server_reservation.Port(), front_port = TcpPort();
+    auto server_reservation = Socket::ReserveTcp(), front_reservation = Socket::ReserveTcp();
+    const auto server_port = server_reservation.Port(), front_port = front_reservation.Port();
     Bridge bridge(server_port);
     auto inbound = VlessInbound(server_port);
     inbound["proxyProtocol"] = "off";
@@ -197,6 +197,7 @@ TEST_P(EncryptionReference, CrossWorkerTicketsReplayAndHandshakeBoundaries) {
         {"inbounds", Json::array({SocksInbound(front_port)})},
         {"outbounds", Json::array({XrayOutbound(bridge.Port(), {{"id", UserId}, {"encryption", encryption}})})}});
     Child cnode({Binary().string(), "--config-dir", root.Path().string()}, root.Path() / "cnode.log");
+    front_reservation.Close();
     Child reference({CNODE_REFERENCE_XRAY, "run", "-config", (root.Path() / "xray.json").string()}, root.Path() / "xray.log");
     for (size_t number = 0; number != 17; ++number) {
         auto socket = Connect(front_port); Socks(socket, target.Port()); socket.Write("vless-0rtt-real-xray");
@@ -271,8 +272,8 @@ TEST_P(EncryptionReference, CnodeOutboundResumesRealXrayTickets) {
         socket.Write("accepted-once-per-nfs-key");
         if (number == 0) Until([&] { return release_first.load(); }, 15s);
     });
-    auto front_reservation = Socket::ReserveTcp();
-    const auto server_port = TcpPort(), front_port = front_reservation.Port();
+    auto server_reservation = Socket::ReserveTcp(), front_reservation = Socket::ReserveTcp();
+    const auto server_port = server_reservation.Port(), front_port = front_reservation.Port();
     Bridge bridge(server_port);
     auto inbound = VlessInbound(server_port);
     inbound["settings"]["decryption"] = decryption;
@@ -280,6 +281,7 @@ TEST_P(EncryptionReference, CnodeOutboundResumesRealXrayTickets) {
         {"inbounds", Json::array({inbound})}, {"outbounds", Json::array({Freedom(true)})}});
     Configure(root.Path(), VlessInbound(front_port), {{"protocol", "vless"}, {"settings", {
         {"address", "127.0.0.1"}, {"port", bridge.Port()}, {"id", UserId}, {"encryption", encryption}}}});
+    server_reservation.Close();
     Child reference({CNODE_REFERENCE_XRAY, "run", "-config", (root.Path() / "xray.json").string()}, root.Path() / "xray.log");
     reference.WaitForLog("started");
     Child cnode({Binary().string(), "--config-dir", root.Path().string()}, root.Path() / "cnode.log");
@@ -321,13 +323,14 @@ TEST(XhttpReference, FourConcurrentStreamUpRequestsDrainUploadResponses) {
         socket.Write("ready");
         while (true) { const auto data = socket.Read(); if (data.empty()) break; socket.Write(data); }
     });
-    auto front_reservation = Socket::ReserveTcp();
-    const auto xray_port = TcpPort(), front_port = front_reservation.Port();
+    auto xray_reservation = Socket::ReserveTcp(), front_reservation = Socket::ReserveTcp();
+    const auto xray_port = xray_reservation.Port(), front_port = front_reservation.Port();
     const Json stream{{"network", "xhttp"}, {"security", "none"},
         {"xhttpSettings", {{"path", "/interop"}, {"mode", "stream-up"}}}};
     auto inbound = VlessInbound(xray_port); inbound["streamSettings"] = stream;
     WriteJson(root.Path(), "xray.json", {{"log", {{"loglevel", "debug"}}},
         {"inbounds", Json::array({inbound})}, {"outbounds", Json::array({Freedom(true)})}});
+    xray_reservation.Close();
     Child reference({CNODE_REFERENCE_XRAY, "run", "-config", (root.Path() / "xray.json").string()}, root.Path() / "xray.log");
     reference.WaitForLog("started");
     Bridge bridge(xray_port, true);

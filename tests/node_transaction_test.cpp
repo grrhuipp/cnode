@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "node_transaction.hpp"
+#include "service/controller/node_transaction.hpp"
 
 #include <asio/co_spawn.hpp>
 #include <asio/bind_cancellation_slot.hpp>

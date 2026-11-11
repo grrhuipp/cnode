@@ -1,9 +1,9 @@
 #include <stdexcept>
 #include <gtest/gtest.h>
 
-#include "uot.hpp"
+#include "proxy/uot/uot.hpp"
 
-#include "shadowsocks_protocol.hpp"
+#include "proxy/shadowsocks/shadowsocks_protocol.hpp"
 #include "common/address_codec.hpp"
 
 #include <asio/co_spawn.hpp>

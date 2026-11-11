@@ -51,8 +51,16 @@ private:
         if (data.empty() || mode == "ok") Reply(socket, 200, R"({"data":true})");
         else if (mode == "non2xx") Reply(socket, 503, R"({"message":"partial application is possible"})");
         else if (mode == "truncated") socket.Write("HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{");
-        else if (mode == "kill") std::this_thread::sleep_for(4s);
+        else if (mode == "kill") HoldUntilPeerCloses(socket);
         // lost: accept the full request and close without any response.
+    }
+    // kill：不回应，把请求挂到 cnode 被 SIGKILL、内核关闭连接为止。
+    static void HoldUntilPeerCloses(Socket& socket) {
+        try {
+            Require(socket.Read(1, 20s).empty(), "panel push sent bytes after its request");
+        } catch (const std::system_error& error) {
+            if (error.code() != std::errc::connection_reset) throw;
+        }
     }
     uint16_t node_;
     std::mutex mutex_;

@@ -132,7 +132,9 @@ TEST(TlsRecords, BlockedCiphertextWriteSurvivesIdleCollection) {
     Require(setsockopt(client.Raw().Fd(), SOL_SOCKET, SO_RCVBUF, &size, sizeof(size)) == 0, "receive buffer");
     client.Write(Auth() + AnyTlsFrame(1, 1) + AnyTlsFrame(2, 1, SocksAddress(listener.Port()) + "request!"));
     Until([&] { return started.load(); });
-    std::this_thread::sleep_for(12s);
+    // 空闲线程堆回收由 1s 运行时采样驱动：Worker 连续两次采样无活动即回收一次。
+    // 4s 覆盖至少三个采样周期，确保阻塞写期间回收已经发生。
+    std::this_thread::sleep_for(4s);
     EXPECT_FALSE(drained.load()) << "fixture failed to sustain ciphertext backpressure";
     EXPECT_TRUE(child->Running());
     size = 4 * 1024 * 1024;

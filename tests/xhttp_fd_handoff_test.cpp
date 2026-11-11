@@ -19,7 +19,7 @@ void Require(bool condition, const char* what) {
     if (!condition) throw std::runtime_error(what);
 }
 
-TEST(NativeSocketHandoff, TcpStaticBoundaryDetachAndRestorePreservesPrefixAndStream) {
+TEST(XhttpFdHandoff, TcpStaticBoundaryDetachAndRestorePreservesPrefixAndStream) {
     // io_b runs on this thread, io_a on thread_a; only detached native state crosses.
     net::io_context io_b, io_a;
     tcp::acceptor acceptor(io_b, {net::ip::address_v4::loopback(), 0});
@@ -69,7 +69,7 @@ TEST(NativeSocketHandoff, TcpStaticBoundaryDetachAndRestorePreservesPrefixAndStr
               "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
 }
 
-TEST(NativeSocketHandoff, TlsStaticBoundaryDetachAndRestorePreservesSessionAndPlaintext) {
+TEST(XhttpFdHandoff, TlsStaticBoundaryDetachAndRestorePreservesSessionAndPlaintext) {
     TlsStream::InitializeIo();
     TlsConfig tls_cfg;
     tls_cfg.server_name = "localhost";

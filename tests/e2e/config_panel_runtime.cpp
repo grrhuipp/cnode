@@ -1,5 +1,5 @@
 #include "config_panel_common.hpp"
-#include "../panel_http_fixture.hpp"
+#include "panel_http_fixture.hpp"
 
 #include <ctime>
 #include <iomanip>
@@ -84,10 +84,10 @@ void WaitEvent(Child& child, std::string_view event, int node, Milliseconds time
 
 void ShutdownConfig(const std::filesystem::path& root, const std::vector<uint16_t>& ports,
                     uint16_t panel, std::string_view listen) {
-    Json config = {{"workers", 2}, {"log", {{"enable", false}, {"logDir", (root / "logs").string()}}},
+    Json config = {{"workers", 2}, {"log", {{"logDir", (root / "logs").string()}}},
         {"dns", {{"servers", {"127.0.0.1", "::1"}}, {"timeout", 5}, {"cacheSize", 1000}, {"minTTL", 30}, {"maxTTL", 3600}}},
         {"limits", {{"maxConnections", 0}, {"maxConnectionsPerIP", 100}}},
-        {"timeouts", {{"handshake", 60}, {"dial", 10}, {"read", 15}, {"write", 30}, {"idle", 300}, {"uplinkOnly", 5}, {"downlinkOnly", 5}}},
+        {"timeouts", {{"handshake", 60}, {"dial", 10}, {"read", 15}, {"write", 30}, {"connIdle", 300}, {"uplinkOnly", 5}, {"downlinkOnly", 5}}},
         {"panels", Json::array({{{"name", "shutdown-panel"}, {"type", "V2board"},
             {"apiHost", "http://127.0.0.1:" + std::to_string(panel)}, {"key", "shutdown-key"}, {"nodeIDs", {1}},
             {"nodeType", "vmess"}, {"listenIP", "auto"}, {"sendIP", "auto"}}})}};
@@ -155,7 +155,7 @@ TEST_P(TestMode, ExplicitAndImplicitListenerOwnership) {
     auto reservation = Socket::ReserveTcp();
     const uint16_t port = mode == "port_collision" ? 10086 : reservation.Port();
     WriteJson(directory.Path(), "config.json", {{"workers", 2},
-        {"log", {{"enable", false}, {"logDir", (directory.Path() / "logs").string()}}}});
+        {"log", {{"logDir", (directory.Path() / "logs").string()}}}});
     if (mode != "implicit") {
         auto inbound = Inbound(port, "vmess", "22f6ee21-7dd1-4e62-9cf3-96ca6c7e8b72");
         inbound["tag"] = mode == "tag_collision" ? "test-vmess-10086" : "static-test-owner";
@@ -227,7 +227,8 @@ TEST_P(PanelRuntime, RequestLifecycleAndListenerOwnership) {
     ASSERT_TRUE(fixture.WaitForPost());
     if (mode == Mode::Timeout) EXPECT_TRUE(fixture.WaitForClientClose());
     if (mode == Mode::Heartbeat) {
-        std::this_thread::sleep_for(60s);
+        // 状态心跳周期固定 60s（defaults::kPanelStatusLogInterval，不可配置）：等第二条状态日志出现即止。
+        Until([&] { return Events(child->LogPath(), "Panel status:", 1) >= 2; }, 70s);
         EXPECT_TRUE(fixture.RequestPending());
     } else std::this_thread::sleep_for(500ms);
     EXPECT_EQ(child->Stop(10s), 0);

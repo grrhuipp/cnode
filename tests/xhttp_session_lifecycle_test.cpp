@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "xhttp_session.hpp"
+#include "transport/internet/xhttp_session.hpp"
 #include "transport/internet/tcp_stream.hpp"
 #include "app/session_group_executor.hpp"
 

@@ -1,7 +1,7 @@
 #include <stdexcept>
 #include <gtest/gtest.h>
 
-#include "worker/udp_ingress.hpp"
+#include "app/worker/udp_ingress.hpp"
 #include "app/relay.hpp"
 
 #include "app/proxyman/inbound/handler.hpp"

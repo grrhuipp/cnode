@@ -41,7 +41,7 @@ TEST_P(Ss2022UdpIdentity, AuthenticatesUsersAndPreservesReplayNamespaces) {
         clients.push_back({{"password", Base64(key)}});
     }
     WriteJson(root.Path(), "config.json", {{"workers", 1},
-        {"log", {{"enable", false}, {"logDir", (root.Path() / "logs").string()}}}});
+        {"log", {{"logDir", (root.Path() / "logs").string()}}}});
     WriteJson(root.Path(), "inbounds.json", Json::array({{
         {"tag", "identity-udp"}, {"protocol", "shadowsocks"}, {"listen", "127.0.0.1"},
         {"port", reservation.port}, {"outboundTag", "direct"},

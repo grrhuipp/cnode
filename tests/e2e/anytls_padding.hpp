@@ -26,13 +26,7 @@ inline std::string Digest(std::string_view bytes, const EVP_MD* algorithm, bool 
     if (EVP_Digest(bytes.data(), bytes.size(), digest, &size, algorithm, nullptr) != 1)
         throw std::runtime_error("fixture digest failed");
     if (!hex) return {reinterpret_cast<const char*>(digest), size};
-    constexpr char digits[] = "0123456789abcdef";
-    std::string result(size * 2, '\0');
-    for (unsigned i = 0; i < size; ++i) {
-        result[2 * i] = digits[digest[i] >> 4];
-        result[2 * i + 1] = digits[digest[i] & 15];
-    }
-    return result;
+    return HexBytes({reinterpret_cast<const char*>(digest), size});
 }
 inline std::string Settings(std::string_view policy, bool reference = false) {
     return "v=2\nclient=" + std::string(reference ? "anytls/0.0.13" : "cnode") +

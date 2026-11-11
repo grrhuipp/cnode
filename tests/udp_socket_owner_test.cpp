@@ -1,7 +1,7 @@
 #include <stdexcept>
 #include <gtest/gtest.h>
 
-#include "worker/udp_ingress.hpp"
+#include "app/worker/udp_ingress.hpp"
 #include "app/relay.hpp"
 #include "app/proxyman/inbound/handler.hpp"
 #include "app/stats.hpp"
@@ -9,7 +9,7 @@
 #include "features/routing/dispatcher.hpp"
 #include "infra/config_types.hpp"
 #include "transport/async_stream.hpp"
-#include "worker/udp_receive_loop.hpp"
+#include "app/worker/udp_receive_loop.hpp"
 
 #include <asio/as_tuple.hpp>
 #include <asio/co_spawn.hpp>

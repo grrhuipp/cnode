@@ -1,7 +1,7 @@
 #include <stdexcept>
 #include <gtest/gtest.h>
 
-#include "http_response.hpp"
+#include "api/v2board/http_response.hpp"
 
 #include <cstdlib>
 #include <iostream>

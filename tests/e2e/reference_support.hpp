@@ -12,24 +12,10 @@
 #include <cerrno>
 #include <mutex>
 #include <regex>
-#include <set>
 #include <fstream>
 #include <stdexcept>
 
 namespace cnode::e2e::reference {
-inline void Require(bool ok, std::string_view why) {
-    if (!ok) throw std::runtime_error(std::string(why));
-}
-inline uint16_t TcpPort() {
-    static std::mutex mutex;
-    static std::set<uint16_t> allocated;
-    std::lock_guard lock(mutex);
-    for (int attempt = 0; attempt != 100; ++attempt) {
-        const auto port = Socket::Listen().Port();
-        if (allocated.insert(port).second) return port;
-    }
-    throw std::runtime_error("unable to allocate a distinct ephemeral TCP port");
-}
 inline uint16_t UdpPort() { return Socket::BindUdp().Port(); }
 inline std::string Address(uint16_t port) { return "127.0.0.1:" + std::to_string(port); }
 inline std::string Digest(const std::filesystem::path& path) {
@@ -45,10 +31,7 @@ inline std::string Digest(const std::filesystem::path& path) {
     Require(input.eof(), "reference binary read failed");
     std::array<unsigned char, SHA256_DIGEST_LENGTH> digest{};
     SHA256_Final(digest.data(), &context);
-    constexpr char hex[] = "0123456789abcdef";
-    std::string result;
-    for (auto byte : digest) { result += hex[byte >> 4]; result += hex[byte & 15]; }
-    return result;
+    return HexBytes({reinterpret_cast<const char*>(digest.data()), digest.size()});
 }
 class BinaryGuard {
 public:
@@ -122,7 +105,6 @@ inline Json XrayOutbound(uint16_t port, const Json& user) {
 inline void DebugConfig(const std::filesystem::path& root) {
     auto config = Json::parse(ReadFile(root / "config.json"));
     config["timeouts"]["handshake"] = 2;
-    config["log"]["enable"] = true;
     config["log"]["loglevel"] = "debug";
     WriteJson(root, "config.json", config);
 }
@@ -238,9 +220,4 @@ private:
     std::vector<std::shared_ptr<Flight>> flights_;
     TcpServer server_;
 };
-inline std::string Pattern(size_t size) {
-    std::string bytes(size, '\0');
-    for (size_t i = 0; i < size; ++i) bytes[i] = static_cast<char>(i % 251);
-    return bytes;
-}
 } // namespace cnode::e2e::reference

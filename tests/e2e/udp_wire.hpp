@@ -25,9 +25,6 @@
 
 namespace cnode::e2e::udp {
 inline constexpr std::string_view SecondUser = "c942492e-7435-5e64-be5f-9ddb59c41922";
-inline void Require(bool condition, std::string_view message) {
-    if (!condition) throw std::runtime_error(std::string(message));
-}
 inline const unsigned char* Bytes(std::string_view s) {
     return reinterpret_cast<const unsigned char*>(s.data());
 }

@@ -2,7 +2,7 @@
 #include <gtest/gtest.h>
 
 #include "infra/config.hpp"
-#include "http2_session.hpp"
+#include "transport/internet/http2_session.hpp"
 
 #include <cstdlib>
 #include <iostream>

@@ -1,5 +1,4 @@
 #include "config_panel_common.hpp"
-#include <openssl/sha.h>
 
 namespace cnode::e2e::config_panel {
 namespace {
@@ -29,7 +28,7 @@ TEST(InboundHandshake, SegmentedVmessTrojanReplayFlowEofAndDeadline) {
     Configure(server_dir, Inbound(server_port, "vmess"), Direct());
     auto config = Json::parse(ReadFile(server_dir / "config.json"));
     config["timeouts"]["handshake"] = 2;
-    config["log"].update({{"enable", true}, {"loglevel", "debug"}});
+    config["log"].update({{"loglevel", "debug"}});
     WriteJson(server_dir, "config.json", config);
     auto server = Start(server_dir);
     server->WaitForLog("server started");
@@ -68,7 +67,7 @@ TEST(InboundHandshake, SegmentedVmessTrojanReplayFlowEofAndDeadline) {
     Configure(client_dir, Inbound(front_port), {{"protocol", "vmess"},
         {"settings", {{"address", "127.0.0.1"}, {"port", splitter.Port()}, {"id", UserId}}}});
     config = Json::parse(ReadFile(client_dir / "config.json"));
-    config["log"].update({{"enable", true}, {"loglevel", "debug"}});
+    config["log"].update({{"loglevel", "debug"}});
     WriteJson(client_dir, "config.json", config);
     auto client = Start(client_dir);
     client->WaitForLog("server started");
@@ -119,13 +118,7 @@ TEST(InboundHandshake, SegmentedVmessTrojanReplayFlowEofAndDeadline) {
     TlsContext tls(false);
     {
         TlsSocket stream(Socket::Connect(trojan_port), tls, false);
-        unsigned char digest[SHA224_DIGEST_LENGTH];
-        constexpr std::string_view password = "segmented-secret";
-        SHA224(reinterpret_cast<const unsigned char*>(password.data()), password.size(), digest);
-        constexpr char digits[] = "0123456789abcdef";
-        std::string header;
-        for (const auto byte : digest) { header += digits[byte >> 4]; header += digits[byte & 15]; }
-        header += "\r\n\1";
+        std::string header = Sha224Hex("segmented-secret") + "\r\n\1";
         header += SocksAddress(backend.Port());
         header += "\r\n";
         for (const auto byte : header) { stream.Write(std::string_view(&byte, 1)); std::this_thread::sleep_for(1ms); }

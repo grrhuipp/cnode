@@ -1,7 +1,6 @@
 #include "config_panel_common.hpp"
 
 #include <arpa/inet.h>
-#include <openssl/sha.h>
 #include <array>
 #include <tuple>
 
@@ -230,14 +229,7 @@ TEST_P(AbsoluteDomainInbound, SegmentedRaw254ByteNameAuthenticatesResolvesAndFor
                 BigEndian(destination.tcp.Port(), 2) + std::string(1, '\2') +
                 std::string(1, static_cast<char>(host.size())) + std::string(host);
         } else {
-            unsigned char digest[SHA224_DIGEST_LENGTH];
-            SHA224(reinterpret_cast<const unsigned char*>(password.data()), password.size(), digest);
-            constexpr char digits[] = "0123456789abcdef";
-            for (const auto byte : digest) {
-                header += digits[byte >> 4];
-                header += digits[byte & 15];
-            }
-            header += "\r\n\1";
+            header = Sha224Hex(password) + "\r\n\1";
             header += std::string(1, '\3') + std::string(1, static_cast<char>(host.size())) +
                 std::string(host) + BigEndian(destination.tcp.Port(), 2) + "\r\n";
         }

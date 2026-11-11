@@ -115,7 +115,7 @@ public:
 
 struct Fixture {
     explicit Fixture(bool product_server = false, bool large_chain = false) {
-        const auto dir = std::filesystem::path(ACPP_TEST_SOURCE_DIR) / "tests/fixtures/anytls-pool";
+        const auto dir = std::filesystem::path(CNODE_TEST_SOURCE_DIR) / "tests/fixtures/anytls-pool";
         ::TlsConfig server_config;
         server_config.cert_file = (dir / "cert.pem").string();
         server_config.key_file = (dir / "key.pem").string();

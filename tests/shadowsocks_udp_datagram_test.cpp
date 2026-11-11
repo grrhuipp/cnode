@@ -1,8 +1,8 @@
 #include <stdexcept>
 #include <gtest/gtest.h>
 
-#include "ss_udp.hpp"
-#include "shadowsocks_protocol.hpp"
+#include "proxy/shadowsocks/ss_udp.hpp"
+#include "proxy/shadowsocks/shadowsocks_protocol.hpp"
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/cancellation_signal.hpp>
 #include <asio/co_spawn.hpp>

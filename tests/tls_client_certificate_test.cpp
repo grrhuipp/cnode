@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "transport/internet/tls_stream.hpp"
-#include "reality_tls.hpp"
+#include "transport/internet/reality_tls.hpp"
 
 #include <openssl/pem.h>
 #include <openssl/ssl.h>

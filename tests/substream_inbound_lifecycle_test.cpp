@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "../anytls_codec.hpp"
+#include "proxy/anytls/anytls_codec.hpp"
 #include "app/relay.hpp"
 #include "app/proxyman/inbound/handler.hpp"
 #include "app/proxyman/inbound/user_store.hpp"

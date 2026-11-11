@@ -19,7 +19,6 @@ namespace cnode::e2e {
 namespace {
 using Clock = std::chrono::steady_clock;
 using Deadline = Clock::time_point;
-using tls::Require;
 
 constexpr size_t MiB = 1024 * 1024;
 constexpr size_t WarmupBytes = MiB;

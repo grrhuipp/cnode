@@ -177,7 +177,9 @@ TEST_P(HysteriaReference, AuthenticatedCrossWorkerReturnAndFailClosedShutdown) {
     BinaryGuard binaries{Binary(), binary};
     TempDir root, upstream_root;
     constexpr size_t tcp_streams = 32, udp_associations = 16, required_returns = 8;
-    const auto server_port = UdpPort(), socks_port = TcpPort(), control_port = TcpPort();
+    auto socks_reservation = Socket::ReserveTcp(), control_reservation = Socket::ReserveTcp();
+    const auto server_port = UdpPort(), socks_port = socks_reservation.Port(),
+               control_port = control_reservation.Port();
     TcpServer target([](Socket socket, size_t) {
         while (true) { auto data = socket.Read(65536, 20s); if (data.empty()) break; socket.Write(data); }
     });
@@ -216,6 +218,9 @@ TEST_P(HysteriaReference, AuthenticatedCrossWorkerReturnAndFailClosedShutdown) {
         else WriteFile(path, "server: " + Address(remote) + "\nauth: smoke-secret\ntls:\n  sni: localhost\n  insecure: true\nsocks5:\n  listen: " + Address(local) + "\n");
         return path.string();
     };
+    // 参考客户端自行监听 SOCKS 端口，启动前才释放预留。
+    socks_reservation.Close();
+    control_reservation.Close();
     Child client({binary, "client", "-c", config("client", relay.Port(), socks_port)}, root.Path() / "client.log");
     Child control_client({binary, "client", "-c", config("control", server_port, control_port)}, root.Path() / "control.log");
     std::vector<Socket> tcp, associations, udp;

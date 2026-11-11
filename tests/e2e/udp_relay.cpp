@@ -29,7 +29,7 @@ public:
         }
         Json config = {{"workers", 1}, {"timeouts", {{"write", 1}, {"connIdle", 30}, {"downlinkOnly", 1}}},
             {"dns", {{"servers", Json::array({std::string(IsQuic() ? "127.0.0.1:" : "127.77.0.2:") + std::to_string(dns.Port())})}, {"timeout", 10}}},
-            {"log", {{"enable", false}, {"logDir", (root.Path() / "logs").string()}}}};
+            {"log", {{"logDir", (root.Path() / "logs").string()}}}};
         if (Native() && !this->value.cipher.empty()) {
             size_t size = this->value.cipher == "aes" ? 16 : 32;
             inbound["settings"] = {{"method", this->value.cipher == "aes" ? "2022-blake3-aes-128-gcm" : "2022-blake3-chacha20-poly1305"},

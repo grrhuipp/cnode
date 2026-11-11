@@ -7,7 +7,7 @@
 #include "transport/internet/transport_stack.hpp"
 #include "transport/internet/stream_settings.hpp"
 #include "transport/internet/ws_stream.hpp"
-#include "../src/transport/internet/http1_handshake.hpp"
+#include "transport/internet/http1_handshake.hpp"
 
 #include <asio/co_spawn.hpp>
 #include <asio/experimental/channel.hpp>
@@ -64,7 +64,7 @@ void Case(bool outbound, bool tls, bool upgrade, bool fragmented, bool abortive)
     raw->SetWriteTimeout(2s);
     (void)raw->StartPhaseDeadline(3s);
 
-    const auto fixtures = std::filesystem::path(ACPP_TEST_SOURCE_DIR) / "tests/fixtures/anytls-pool";
+    const auto fixtures = std::filesystem::path(CNODE_TEST_SOURCE_DIR) / "tests/fixtures/anytls-pool";
     ::StreamSettings settings;
     settings.network = upgrade ? "httpupgrade" : "http";
     settings.http.path = settings.http_upgrade.path = "/up";
@@ -373,7 +373,7 @@ void TlsReadTermination(bool multi_buffer, bool clean) {
     ::tcp::socket socket(io), peer_socket(io);
     socket.connect(acceptor.local_endpoint());
     acceptor.accept(peer_socket);
-    const auto fixtures = std::filesystem::path(ACPP_TEST_SOURCE_DIR) / "tests/fixtures/anytls-pool";
+    const auto fixtures = std::filesystem::path(CNODE_TEST_SOURCE_DIR) / "tests/fixtures/anytls-pool";
     net::ssl::context server_context(net::ssl::context::tls_server);
     server_context.use_certificate_chain_file((fixtures / "cert.pem").string());
     server_context.use_private_key_file((fixtures / "key.pem").string(), net::ssl::context::pem);

@@ -1,7 +1,7 @@
 #include <stdexcept>
 #include <gtest/gtest.h>
 
-#include "ss_udp.hpp"
+#include "proxy/shadowsocks/ss_udp.hpp"
 
 #include <cstdlib>
 #include <iostream>
