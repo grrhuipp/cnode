@@ -1,6 +1,6 @@
 #include "common/mux/mux_codec.hpp"
-#include "../../proxy/inbound_admission.hpp"
-#include "../awaitable_task_group.hpp"
+#include "proxy/inbound_admission.hpp"
+#include "common/awaitable_task_group.hpp"
 #include "app/stats.hpp"
 #include "common/address_codec.hpp"
 #include "common/allocator.hpp"

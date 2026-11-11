@@ -8,7 +8,7 @@
 // 方向，因此编码器与解码器各只保留一份实现。
 // ============================================================================
 
-#include "../vmess_crypto.hpp"
+#include "proxy/vmess/vmess_crypto.hpp"
 #include "app/proxyman/inbound/user_store.hpp"
 #include "common/asio_types.hpp"
 #include "common/address_codec.hpp"

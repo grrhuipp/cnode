@@ -8,7 +8,7 @@
 // ============================================================================
 
 #include "app/proxyman/inbound/user_store.hpp"
-#include "../aead.hpp"
+#include "proxy/aead.hpp"
 #include "common/allocator.hpp"
 #include "common/buf/multi_buffer.hpp"
 #include "common/target_address.hpp"

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../outbound_stream_endpoint.hpp"
+#include "proxy/outbound_stream_endpoint.hpp"
 #include "common/allocator.hpp"
 #include "common/asio_types.hpp"
 #include "common/buf/multi_buffer.hpp"

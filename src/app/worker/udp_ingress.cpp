@@ -1,7 +1,7 @@
 #include "udp_ingress.hpp"
 #include "app/proxyman/inbound/handler.hpp"
-#include "../../common/awaitable_task_group.hpp"
-#include "../../proxy/inbound_admission.hpp"
+#include "common/awaitable_task_group.hpp"
+#include "proxy/inbound_admission.hpp"
 
 #include "common/initial_payload.hpp"
 #include "common/ip_utils.hpp"

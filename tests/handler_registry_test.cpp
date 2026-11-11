@@ -7,7 +7,7 @@
 #include "app/stats.hpp"
 #include "infra/config_types.hpp"
 #include "proxy/outbound.hpp"
-#include "../src/common/awaitable_task_group.hpp"
+#include "common/awaitable_task_group.hpp"
 
 #include <asio/co_spawn.hpp>
 #include <cstdio>

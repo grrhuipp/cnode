@@ -1,6 +1,6 @@
 #include "app/prepared_inbound.hpp"
 
-#include "../common/awaitable_batch.hpp"
+#include "common/awaitable_batch.hpp"
 #include "infra/config.hpp"
 #include "app/worker.hpp"
 #include "core/constants.hpp"

@@ -10,7 +10,7 @@
 #include "transport/internet/tcp_stream.hpp"
 #include "transport/internet/outbound_target_builder.hpp"
 #include "transport/internet/timeout_scheduler.hpp"
-#include "../src/common/awaitable_task_group.hpp"
+#include "common/awaitable_task_group.hpp"
 
 #include <asio/as_tuple.hpp>
 #include <asio/bind_cancellation_slot.hpp>

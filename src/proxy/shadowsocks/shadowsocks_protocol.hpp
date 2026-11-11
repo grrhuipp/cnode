@@ -6,7 +6,7 @@
 #include "common/buffer_util.hpp"
 #include "common/byte_reader.hpp"
 #include "common/unsafe.hpp"
-#include "../aead.hpp"
+#include "proxy/aead.hpp"
 #include "transport/async_stream.hpp"
 #include "transport/link.hpp"
 

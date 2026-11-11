@@ -1,6 +1,6 @@
 #include "app/dispatcher/default_dispatcher.hpp"
 
-#include "../../common/awaitable_task_group.hpp"
+#include "common/awaitable_task_group.hpp"
 
 #include "app/stats.hpp"
 #include "common/container_util.hpp"

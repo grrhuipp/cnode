@@ -7,7 +7,7 @@
 #include "common/target_address.hpp"
 #include "core/constants.hpp"
 #include "infra/log.hpp"
-#include "../outbound_stream_endpoint.hpp"
+#include "proxy/outbound_stream_endpoint.hpp"
 #include "infra/config.hpp"
 #include "proxy/outbound.hpp"
 #include "transport/internet/outbound_target_builder.hpp"

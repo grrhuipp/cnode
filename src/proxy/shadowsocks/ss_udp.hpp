@@ -1,7 +1,7 @@
 #pragma once
 
-#include "../outbound_stream_endpoint.hpp"
-#include "../uot/uot.hpp"
+#include "proxy/outbound_stream_endpoint.hpp"
+#include "proxy/uot/uot.hpp"
 #include "app/proxyman/inbound/user_store.hpp"
 #include "common/allocator.hpp"
 #include "common/buf/multi_buffer.hpp"

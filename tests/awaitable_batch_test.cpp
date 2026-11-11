@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "awaitable_batch.hpp"
+#include "common/awaitable_batch.hpp"
 
 #include <asio/as_tuple.hpp>
 #include <asio/async_result.hpp>

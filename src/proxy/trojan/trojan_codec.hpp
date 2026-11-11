@@ -6,7 +6,7 @@
 // 职责：协议常量、请求结构体、握手结果、编解码逻辑（TCP + UDP）
 // ============================================================================
 
-#include "../outbound_stream_endpoint.hpp"
+#include "proxy/outbound_stream_endpoint.hpp"
 #include "common/address_codec.hpp"
 #include "common/asio_types.hpp"
 #include "common/buf/multi_buffer.hpp"

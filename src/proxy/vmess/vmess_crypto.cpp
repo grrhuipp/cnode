@@ -1,5 +1,5 @@
 #include "vmess_crypto.hpp"
-#include "../aead.hpp"
+#include "proxy/aead.hpp"
 #include "common/binary_text_codec.hpp"
 #include "common/unsafe.hpp"
 

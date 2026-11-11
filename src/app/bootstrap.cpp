@@ -1,4 +1,6 @@
-#include "../common/awaitable_batch.hpp"
+#include "common/awaitable_batch.hpp"
+#include "common/monitor_loop.hpp"
+#include "app/process_descriptors.hpp"
 #include "api/api.hpp"
 #include "app/dns/dns.hpp"
 #include "app/prepared_inbound.hpp"
@@ -32,6 +34,7 @@
 #include <charconv>
 #include <chrono>
 #include <cmath>
+#include <cerrno>
 #include <csignal>
 #include <cstdlib>
 #include <exception>
@@ -52,6 +55,9 @@
 #include <utility>
 #include <vector>
 
+#include <dirent.h>
+#include <sys/resource.h>
+
 #ifndef BUILD_CHANNEL
 #define BUILD_CHANNEL "release"
 #endif
@@ -59,6 +65,28 @@
 #ifndef BUILD_ID
 #define BUILD_ID "dev"
 #endif
+
+ProcessDescriptors ReadProcessDescriptors() noexcept {
+    ProcessDescriptors result;
+    rlimit limits{};
+    if (::getrlimit(RLIMIT_NOFILE, &limits) == 0) {
+        result.soft_limit_unlimited = limits.rlim_cur == RLIM_INFINITY;
+        if (!result.soft_limit_unlimited) {
+            result.soft_limit = static_cast<size_t>(limits.rlim_cur);
+        }
+    }
+    if (DIR* directory = ::opendir("/proc/self/fd")) {
+        size_t count = 0;
+        errno = 0;
+        while (const auto* entry = ::readdir(directory)) {
+            if (entry->d_name[0] >= '0' && entry->d_name[0] <= '9') ++count;
+        }
+        const bool complete = errno == 0;
+        ::closedir(directory);
+        if (complete && count > 0) result.open = count - 1;
+    }
+    return result;
+}
 
 namespace {
 
@@ -544,10 +572,10 @@ public:
         : env(environment), main_work(net::make_work_guard(*env.main_ctx)),
           stop_event(*env.main_ctx, std::chrono::steady_clock::time_point::max()),
           monitor_loops{
-              std::make_shared<monitor_detail::MonitorLoop>(
+              std::make_shared<MonitorLoop>(
                   env.main_ctx->get_executor(), "sampling",
                   [this] { return RuntimeSamplingLoop(); }, ReportMonitorExit),
-              std::make_shared<monitor_detail::MonitorLoop>(
+              std::make_shared<MonitorLoop>(
                   env.main_ctx->get_executor(), "stats-output",
                   [this] { return RuntimeStatsOutputLoop(); }, ReportMonitorExit),
           } {}
@@ -881,7 +909,7 @@ public:
     BootstrapEnvironment& env;
     net::executor_work_guard<net::io_context::executor_type> main_work;
     net::steady_timer stop_event;
-    std::array<std::shared_ptr<monitor_detail::MonitorLoop>, 2> monitor_loops;
+    std::array<std::shared_ptr<MonitorLoop>, 2> monitor_loops;
     std::unique_ptr<net::signal_set> signals;
     size_t started_threads = 0;
     int exit_code = EXIT_SUCCESS;
