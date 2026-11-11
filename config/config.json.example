@@ -3,8 +3,7 @@
     "loglevel": "info",
     "access": "/var/log/cnode/access.log",
     "error": "/var/log/cnode/error.log",
-    "logDir": "/var/log/cnode",
-    "enable": false
+    "logDir": "/var/log/cnode"
   },
   "workers": 0,
   "limits": {
@@ -23,16 +22,14 @@
     "maxTTL": 3600
   },
   "timeouts": {
-    "_comment": "handshake 用于握手阶段的 idle + absolute deadline；read/write 用于独立的读写 deadline，同时更短者也会作为连接 idle timer；idle 用于 UDP/会话生命周期",
     "handshake": 10,
     "dial": 10,
     "read": 15,
     "write": 30,
-    "idle": 300
+    "connIdle": 300
   },
   "panels": [
     {
-      "_comment": "VMess - TLS 由外部 nginx/caddy 处理（默认）",
       "name": "vmess-panel",
       "type": "V2board",
       "apiHost": "https://your-panel.com",
@@ -47,7 +44,6 @@
       "tlsKey": ""
     },
     {
-      "_comment": "VMess - 程序处理 TLS，根据面板下发配置",
       "name": "vmess-tls-panel",
       "type": "V2board",
       "apiHost": "https://your-panel.com",
@@ -58,11 +54,10 @@
       "sendIP": "auto",
       "enableDNS": true,
       "tlsEnable": true,
-      "tlsCert": "/etc/acppnode/certs/fullchain.pem",
-      "tlsKey": "/etc/acppnode/certs/privkey.pem"
+      "tlsCert": "/opt/cnode/certs/fullchain.pem",
+      "tlsKey": "/opt/cnode/certs/privkey.pem"
     },
     {
-      "_comment": "Trojan - 程序处理 TLS，使用指定证书",
       "name": "trojan-panel-with-tls",
       "type": "V2board",
       "apiHost": "https://your-panel.com",
@@ -73,11 +68,10 @@
       "sendIP": "auto",
       "enableDNS": true,
       "tlsEnable": true,
-      "tlsCert": "/etc/acppnode/certs/fullchain.pem",
-      "tlsKey": "/etc/acppnode/certs/privkey.pem"
+      "tlsCert": "/opt/cnode/certs/fullchain.pem",
+      "tlsKey": "/opt/cnode/certs/privkey.pem"
     },
     {
-      "_comment": "Trojan - 程序处理 TLS，自动生成自签名证书（仅测试用）",
       "name": "trojan-panel-self-signed",
       "type": "V2board",
       "apiHost": "https://your-panel.com",
@@ -92,7 +86,6 @@
       "tlsKey": ""
     },
     {
-      "_comment": "Trojan - TLS 由外部 nginx/caddy 处理",
       "name": "trojan-panel-no-tls",
       "type": "V2board",
       "apiHost": "https://your-panel.com",
@@ -107,7 +100,6 @@
       "tlsKey": ""
     },
     {
-      "_comment": "AnyTLS - 程序处理 TLS；AnyTLS 用户密码按 sha256(password) 认证",
       "name": "anytls-panel-with-tls",
       "type": "V2board",
       "apiHost": "https://your-panel.com",
@@ -118,8 +110,8 @@
       "sendIP": "auto",
       "enableDNS": true,
       "tlsEnable": true,
-      "tlsCert": "/etc/acppnode/certs/fullchain.pem",
-      "tlsKey": "/etc/acppnode/certs/privkey.pem"
+      "tlsCert": "/opt/cnode/certs/fullchain.pem",
+      "tlsKey": "/opt/cnode/certs/privkey.pem"
     }
   ]
 }

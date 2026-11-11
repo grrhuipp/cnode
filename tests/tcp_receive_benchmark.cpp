@@ -1,3 +1,7 @@
+// TCP 接收基准：真实回环连接上的 1 B / 8 KiB / 64 KiB 突发，每种负载预热 128 轮、测量 4096 轮，
+// 逐字节校验载荷，输出每轮 CPU、墙钟耗时及读取次数。CPU 包含同进程收发双方与载荷校验，
+// 不是守护进程单侧 CPU，也不代表公网吞吐。
+
 #include <gtest/gtest.h>
 
 #include "common/allocator.hpp"

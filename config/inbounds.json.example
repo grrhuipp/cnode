@@ -70,8 +70,8 @@
       "security": "tls",
       "tlsSettings": {
         "serverName": "example.com",
-        "certFile": "/etc/cnode/certs/fullchain.pem",
-        "keyFile": "/etc/cnode/certs/privkey.pem"
+        "certFile": "/opt/cnode/certs/fullchain.pem",
+        "keyFile": "/opt/cnode/certs/privkey.pem"
       }
     },
     "outboundTag": "ipv6-first"
@@ -114,8 +114,8 @@
       "security": "tls",
       "tlsSettings": {
         "serverName": "example.com",
-        "certFile": "/etc/cnode/certs/fullchain.pem",
-        "keyFile": "/etc/cnode/certs/privkey.pem"
+        "certFile": "/opt/cnode/certs/fullchain.pem",
+        "keyFile": "/opt/cnode/certs/privkey.pem"
       }
     }
   },
@@ -139,8 +139,8 @@
       "security": "tls",
       "tlsSettings": {
         "serverName": "example.com",
-        "certFile": "/etc/cnode/certs/fullchain.pem",
-        "keyFile": "/etc/cnode/certs/privkey.pem"
+        "certFile": "/opt/cnode/certs/fullchain.pem",
+        "keyFile": "/opt/cnode/certs/privkey.pem"
       }
     }
   }

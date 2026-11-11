@@ -1,3 +1,13 @@
+// 真实 cnode 进程 VLESS/TLS 上传、下载基准：固定 1 个 Worker、1/8 条并发流，每流预热 1 MiB、
+// 测量 16 MiB；对端按完整 64 KiB 块接收并校验载荷。可用 CNODE_BENCHMARK_BINARY 指定待测二进制，
+// 新旧二进制应使用同一份基准。CPU 指标覆盖进程启动、握手、预热、传输和停机，不等于纯传输
+// 阶段 CPU；daemon_lifetime_wall_seconds 报告完整生命周期耗时。基准只输出测量值，不以耗时阈值判定成败。
+// 在服务启动、预热完成、测量完成但连接未关闭时读取 /proc/<pid>/status 的 VmRSS/VmHWM 与
+// smaps_rollup 的 RSS、PSS、匿名页及透明大页：RSS 含共享驻留页，不含测试驱动与内核 socket 缓冲；
+// HWM 是截至采样点的进程峰值；smaps_rollup 是采样值而非峰值，与 status 不是原子快照。
+// 比较内存前，以相同写入方式生成并预热新旧可执行文件副本，先用同字节二进制做 A/A 对照，
+// 避免把文件页缓存、映射与透明大页造成的驻留差异当作堆内存收益。
+
 #include "tls_wire.hpp"
 
 #include <condition_variable>

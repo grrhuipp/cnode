@@ -50,6 +50,3 @@ perf.data.txt
 
 # clangd index cache
 .cache/
-
-# Python test caches
-__pycache__/

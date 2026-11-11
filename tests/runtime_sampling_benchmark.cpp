@@ -1,3 +1,10 @@
+// 运行时统计基准：先建立真实 VLESS → Freedom 回环链路，覆盖 0/1/64/512 条物理连接、
+// 有/无资源统计，预热 16 轮后采集 64/256 轮。计时只包含 Worker::CollectRuntimeStats 与结果校验，
+// 不含建连、载荷转发和停机。
+// 输出 CPU、延迟分位数和进程 RSS/峰值，并区分匿名页与文件页；峰值读取 /proc/self/status 的
+// VmHWM，包含准备阶段，RSS 不代表单个 Worker 的占用。分配计数只统计被拦截的 throwing C++ new
+// 与 mi_malloc_aligned 入口，不等于全部分配，两类不能相加。用 CTest 运行使每个参数位于独立进程。
+
 #include <gtest/gtest.h>
 
 #include "runtime_sampling_fixture.hpp"

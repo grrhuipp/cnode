@@ -1,3 +1,8 @@
+// SS2022 TCP 身份匹配微基准：1/16/256/4096 个用户、无 identity key 或 1/4 个 key 组、
+// 输入首/中/末用户，以及 hint 命中/失效/缺失（失效 hint 固定指向另一名用户）。
+// 每格预热 32 次，默认测量 512 次，可用 CNODE_BENCH_ITERATIONS 调整。计时包含生产认证函数、
+// 协程驱动、结果校验与释放，不含客户端握手报文准备；不覆盖 TCP 传输或完整入站的重放检查。
+
 #include "shadowsocks_identity_fixture.hpp"
 #include "common/allocator.hpp"
 #include "benchmark_memory.hpp"

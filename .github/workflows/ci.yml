@@ -115,12 +115,10 @@ jobs:
           set -euo pipefail
           binary=build/musl/cnode
           mkdir -p build/release
-          cp "$binary" build/release/cnode-linux-amd64-musl
-          objcopy --only-keep-debug build/release/cnode-linux-amd64-musl build/release/cnode-linux-amd64-musl.debug
-          strip build/release/cnode-linux-amd64-musl
-          objcopy --add-gnu-debuglink=build/release/cnode-linux-amd64-musl.debug build/release/cnode-linux-amd64-musl
-          cp build/release/cnode-linux-amd64-musl build/release/cnode-linux-amd64
-          cp build/release/cnode-linux-amd64-musl.debug build/release/cnode-linux-amd64.debug
+          cp "$binary" build/release/cnode-linux-amd64
+          objcopy --only-keep-debug build/release/cnode-linux-amd64 build/release/cnode-linux-amd64.debug
+          strip build/release/cnode-linux-amd64
+          objcopy --add-gnu-debuglink=build/release/cnode-linux-amd64.debug build/release/cnode-linux-amd64
           printf 'build_id: %s\ncommit: %s\nvariant: musl+epoll (static)\n' "$BUILD_ID" "$GITHUB_SHA" > build/release/notes.md
 
       - name: upload
@@ -160,8 +158,8 @@ jobs:
           set -euo pipefail
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
             --name cnode-musl-assets --dir release-assets
-          test -s release-assets/cnode-linux-amd64-musl
           test -s release-assets/cnode-linux-amd64
+          test -s release-assets/cnode-linux-amd64.debug
 
           tag_ref="tags/$RELEASE_TAG"
           if gh api "repos/$GITHUB_REPOSITORY/git/ref/$tag_ref" >/dev/null 2>&1; then

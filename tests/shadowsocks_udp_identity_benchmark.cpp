@@ -1,3 +1,9 @@
+// SS2022 UDP 身份匹配基准，共 130 格：AES-128/256、1/16/256/4096 个用户、1/4/16 个 identity key 组、
+// 已发布快照的首/中/末用户、0/1200 B 载荷，并保留无 identity 与普通重放接收对照。
+// 预热与测量次数同 TCP 身份基准（CNODE_BENCH_ITERATIONS）。每批最多预编码 32 个唯一包，编码在
+// 计时外；计时包含解码认证、目标/载荷/归属校验及结果释放。主矩阵只测延迟提交重放的认证阶段，
+// 不含入站目录的重放提交、路由或网络 I/O，不代表 UDP 转发吞吐。
+
 #include "shadowsocks_identity_fixture.hpp"
 #include "benchmark_memory.hpp"
 #include "common/allocator.hpp"

@@ -1,3 +1,12 @@
+// 分配与容器微基准，与守护进程使用相同的全局 mimalloc。
+// - AllocatorAppendBenchmark：64 B～64 KiB 字节缓冲追加，分预留与按需增长两种模式。
+// - MultiBufferBenchmark：1/8/9/16 块 MultiBuffer 所有权移交，不复制 payload。
+// - BufferSpanBenchmark：分别以 span 与 MultiBuffer 为输入构建散布写描述符，覆盖内联容量
+//   与溢出边界，计时前校验借用视图的地址与长度。
+// - RingDequeBenchmark：每批 1/8/64 个元素填充并完全排空，预热 128 批后测量 262144/批大小 批，
+//   校验 FIFO、checksum 与排空后归还存储。
+// 输出 CPU/墙钟耗时；微基准不代表端到端吞吐。
+
 #include <gtest/gtest.h>
 
 #include "common/allocator.hpp"

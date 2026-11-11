@@ -1,3 +1,6 @@
+// 执行器投递微基准：向单个 Worker 的原生 io_context 投递 10000 个任务并运行至排空，
+// 输出总墙钟耗时；协调器构造与停机收束不计入计时。
+
 #include <gtest/gtest.h>
 
 #include "app/session_group_executor.hpp"

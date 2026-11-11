@@ -5,7 +5,7 @@
 # 无参数时更新二进制和 geodata；部署模式添加/覆盖一个 panel，已有 config.json 不会被覆盖，
 # 指定 URL 的 sidecar 文件会覆盖下载。
 
-ALLOWED_OPTIONS="name api_host api_key node_id node_type dns tls_enable tls_cert tls_key outbound_url route_url inbound_url v variant debug_file"
+ALLOWED_OPTIONS="name api_host api_key node_id node_type dns tls_enable tls_cert tls_key outbound_url route_url inbound_url v debug_file"
 REQUIRED_OPTIONS="name api_host api_key node_id node_type"
 
 INSTALL_DIR="/opt/cnode"
@@ -39,7 +39,6 @@ usage() {
     echo "  -route_url <url>       远程 routing.json 下载地址（指定则覆盖下载）"
     echo "  -inbound_url <url>     远程 inbounds.json 下载地址（指定则覆盖下载）"
     echo "  -v <version>           指定 release tag（默认 cnode-latest；latest 表示 GitHub latest）"
-    echo "  -variant <name>        二进制名称：default、musl（均为 musl 静态版）"
     echo "  -debug_file true       额外下载 release 对应的 .debug 符号文件"
     exit 1
 }
@@ -102,7 +101,7 @@ install_dependency() {
     elif command -v dnf >/dev/null 2>&1; then
         dnf install -y "$2"
     elif command -v pacman >/dev/null 2>&1; then
-        pacman -Syu --noconfirm "$2"
+        pacman -S --needed --noconfirm "$2"
     elif command -v zypper >/dev/null 2>&1; then
         zypper install -y "$2"
     else
@@ -131,19 +130,7 @@ install_cnode() {
             ;;
     esac
 
-    VARIANT="${variant:-default}"
-    case "$VARIANT" in
-        default)
-            ASSET_NAME="cnode-linux-amd64"
-            ;;
-        musl)
-            ASSET_NAME="cnode-linux-amd64-$VARIANT"
-            ;;
-        *)
-            echo "无效的 variant: $VARIANT（支持 default/musl）"
-            exit 1
-            ;;
-    esac
+    ASSET_NAME="cnode-linux-amd64"
 
     # 获取远程 build_id。GitHub API 在部分机房偶发不可达，API 失败时
     # 回退到 release 直链下载，只跳过 build_id 强校验。
@@ -177,22 +164,15 @@ install_cnode() {
     fi
 
     DEBUG_PATH="$INSTALL_DIR/$ASSET_NAME.debug"
-    INSTALLED_ASSET_PATH="$INSTALL_DIR/.cnode-asset"
 
-    # 比对本地版本，相同则跳过（早期版本不支持 -v，用 timeout 防止挂起）
+    # 比对本地版本，相同则跳过
     LOCAL_ID=""
     if [ -x "$BIN_PATH" ]; then
         LOCAL_ID=$(timeout 3 "$BIN_PATH" -v 2>/dev/null | tr -d '[:space:]')
     fi
-    LOCAL_ASSET=""
-    if [ -f "$INSTALLED_ASSET_PATH" ]; then
-        LOCAL_ASSET=$(cat "$INSTALLED_ASSET_PATH" 2>/dev/null || true)
-    elif [ "$ASSET_NAME" = "cnode-linux-amd64" ]; then
-        LOCAL_ASSET="$ASSET_NAME"
-    fi
 
     NEED_BINARY_UPDATE=1
-    if [ -n "$REMOTE_VERSION" ] && [ "$LOCAL_ID" = "$REMOTE_VERSION" ] && [ "$LOCAL_ASSET" = "$ASSET_NAME" ]; then
+    if [ -n "$REMOTE_VERSION" ] && [ "$LOCAL_ID" = "$REMOTE_VERSION" ]; then
         NEED_BINARY_UPDATE=0
     fi
 
@@ -232,7 +212,7 @@ install_cnode() {
         if [ -z "$UPDATE_TARGET" ]; then
             UPDATE_TARGET="release:$RELEASE_TAG"
         fi
-        echo "更新 cnode: ${LOCAL_ID:-none} (${LOCAL_ASSET:-unknown}) -> $UPDATE_TARGET ($ASSET_NAME)"
+        echo "更新 cnode: ${LOCAL_ID:-none} -> $UPDATE_TARGET"
         BINARY_TMP=$(mktemp "$INSTALL_DIR/.cnode.XXXXXX") || exit 1
         if ! curl -fsSL --connect-timeout 10 --max-time 180 --retry 3 \
             "$LATEST_URL" -o "$BINARY_TMP" || [ ! -s "$BINARY_TMP" ] ||
@@ -257,9 +237,8 @@ install_cnode() {
         fi
         BINARY_UPDATED=1
         echo "cnode 已更新: $NEW_ID"
-        echo "$ASSET_NAME" > "$INSTALLED_ASSET_PATH"
     else
-        echo "cnode 已是最新版本: $REMOTE_VERSION ($ASSET_NAME)"
+        echo "cnode 已是最新版本: $REMOTE_VERSION"
     fi
 
     if [ "$NEED_DEBUG_DOWNLOAD" -eq 1 ]; then
@@ -381,7 +360,7 @@ ${DNS_SERVERS_LINE}    "timeout": 5,
     "dial": 10,
     "read": 15,
     "write": 30,
-    "idle": 300
+    "connIdle": 300
   },
   "panels": []
 }
@@ -390,19 +369,25 @@ EOF
     fi
 
     # 远程配置文件（指定了 url 则每次覆盖下载）
-    if [ -n "$inbound_url" ]; then
-        echo "下载 inbounds.json: $inbound_url"
-        curl -sfL "$inbound_url" -o "$CONFIG_DIR/inbounds.json" || echo "警告: inbounds.json 下载失败"
-    fi
-    if [ -n "$outbound_url" ]; then
-        echo "下载 outbounds.json: $outbound_url"
-        curl -sfL "$outbound_url" -o "$CONFIG_DIR/outbounds.json" || echo "警告: outbounds.json 下载失败"
-    fi
-    if [ -n "$route_url" ]; then
-        echo "下载 routing.json: $route_url"
-        curl -sfL "$route_url" -o "$CONFIG_DIR/routing.json" || echo "警告: routing.json 下载失败"
-    fi
+    download_sidecar "$inbound_url" inbounds.json
+    download_sidecar "$outbound_url" outbounds.json
+    download_sidecar "$route_url" routing.json
+}
 
+# 下载到临时文件并通过 JSON 校验后再替换；失败时保留旧文件并退出。
+download_sidecar() {
+    [ -n "$1" ] || return 0
+    echo "下载 $2: $1"
+    SIDECAR_TMP=$(mktemp "$CONFIG_DIR/.$2.XXXXXX") || exit 1
+    if ! curl -fsSL --connect-timeout 10 --max-time 180 --retry 3 \
+        "$1" -o "$SIDECAR_TMP" \
+        || ! jq -e . "$SIDECAR_TMP" >/dev/null 2>&1 \
+        || ! chmod 0644 "$SIDECAR_TMP" \
+        || ! mv -f "$SIDECAR_TMP" "$CONFIG_DIR/$2"; then
+        rm -f "$SIDECAR_TMP"
+        echo "错误: $2 下载失败或不是有效 JSON，保留原文件。"
+        exit 1
+    fi
 }
 
 # ============================================================================
@@ -436,12 +421,7 @@ ensure_config_json_valid() {
 # 添加/覆盖 panel
 # ============================================================================
 
-add_panel() {
-    add_panel_json
-}
-
-add_panel_json() {
-    # config.json 分支：写入最终 panel schema。
+upsert_panel() {
     NODE_ID_JSON=$(echo "$node_id" | tr ',' '\n' | jq -s '.')
     PANEL_JSON=$(jq -n \
         --arg name "$name" \
@@ -527,7 +507,7 @@ main() {
     install_cnode
     install_service
     init_config
-    add_panel
+    upsert_panel
 
     # 重启 cnode
     systemctl restart "$SERVICE_NAME"
