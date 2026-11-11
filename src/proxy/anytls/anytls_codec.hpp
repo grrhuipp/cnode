@@ -233,8 +233,7 @@ public:
     // `tasks` accounts and joins physical readers on the Worker thread.
     // Idle sessions are pooled locally; negotiated padding is published to
     // PaddingState and captured for each new handshake.
-    Handler(memory::worker_memory& pool,
-            std::string_view tag,
+    Handler(std::string_view tag,
             net::io_context& io_context,
             std::shared_ptr<const Settings> settings,
             AwaitableTaskGroup& tasks);
@@ -263,7 +262,6 @@ private:
         buf::MultiBufferBatch first_payload, std::chrono::seconds relay_idle_timeout,
         std::chrono::seconds relay_write_timeout,
         std::shared_ptr<ClientSession> session, bool& reusable);
-    memory::worker_memory& worker_pool_;
     memory::String tag_;
     std::shared_ptr<const Settings> settings_;
     std::shared_ptr<PaddingState> padding_;

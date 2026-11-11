@@ -70,13 +70,12 @@ private:
 void RegisterProtocol() {
     proxyman::inbound::RegisterProxy(kProtocol, {
         .user_protocol = std::nullopt,
-        .create_runtime = [](memory::worker_memory& pool) -> std::unique_ptr<proxyman::inbound::ProtocolRuntime> {
-            return memory::MakeUnique<Runtime>(pool);
+        .create_runtime = []() -> std::unique_ptr<proxyman::inbound::ProtocolRuntime> {
+            return std::make_unique<Runtime>();
         },
         .create_tcp_handler = [](proxyman::inbound::ProtocolRuntime&, StatsShard&,
                                  ConnectionLimiter* limiter,
-                                 const proxyman::inbound::BuildRequest&,
-                                 memory::worker_memory& pool) -> std::unique_ptr<Inbound> {
+                                 const proxyman::inbound::BuildRequest&) -> std::unique_ptr<Inbound> {
             Require(fixture && limiter, "factory did not receive the shared limiter");
             if (fixture->created == 0) {
                 fixture->limiter = limiter->weak_from_this();
@@ -84,7 +83,7 @@ void RegisterProtocol() {
                 Require(fixture->limiter.lock().get() == limiter,
                         "handler replacement changed the live admission actor");
             }
-            return memory::MakeUnique<HoldingInbound>(pool, *fixture);
+            return std::make_unique<HoldingInbound>(*fixture);
         },
     });
 }

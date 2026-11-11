@@ -53,7 +53,7 @@ void Verify(const ss::SsUdpDecodeResult& result,
 void RunCase(const char* cipher_name, const ss::SsCipherInfo& cipher,
              const UserStore::ShadowsocksUsersView& users, size_t groups,
              size_t position, size_t payload_size, bool deferred_replay,
-             size_t iterations, size_t idle_rss, memory::worker_memory& pool) {
+             size_t iterations, size_t idle_rss) {
     SCOPED_TRACE(::testing::Message() << cipher_name << " users=" << users.size()
         << " groups=" << groups << " snapshot_position=" << position
         << " payload=" << payload_size << " deferred_replay=" << deferred_replay);
@@ -94,27 +94,22 @@ void RunCase(const char* cipher_name, const ss::SsCipherInfo& cipher,
     };
     const auto decode = [&](size_t i, bool deferred) {
         return ss::DecodeUdpPacket(wire.data() + i * wire_size, wire_size, users,
-            cipher.type, cipher.key_size, cipher.salt_size, replay_cache, deferred, pool);
+            cipher.type, cipher.key_size, cipher.salt_size, replay_cache, deferred);
     };
-    const auto authenticate = [&](size_t i, bool deferred, size_t& live_peak) {
+    const auto authenticate = [&](size_t i, bool deferred) {
         auto result = decode(i, deferred);
         Require(result.has_value());
         Verify(*result, users, position, target, payload, packet_ids[i]);
-        live_peak = std::max(live_peak, pool.OutstandingAllocations());
         // Result/payload release belongs to the timed call, not the next packet.
     };
-    size_t warm_live_peak = 0;
     prepare(kBatchSize);
     for (size_t i = 0; i < kBatchSize; ++i)
-        authenticate(i, deferred_replay, warm_live_peak);
+        authenticate(i, deferred_replay);
     Require(replay_cache.Size() == (deferred_replay ? 0u : 1u));
 
-    const auto pool_before = pool.GetFootprint();
-    const size_t pmr_before = pool.OutstandingAllocations();
     const size_t warm_rss = benchmark::ResidentBytes();
     benchmark::AllocationCounts counts;
     uint64_t cpu_ns = 0;
-    size_t live_peak = pmr_before;
     size_t final_batch_size = 0;
     for (size_t offset = 0; offset < iterations;) {
         const size_t count = std::min(kBatchSize, iterations - offset);
@@ -126,7 +121,7 @@ void RunCase(const char* cipher_name, const ss::SsCipherInfo& cipher,
             const auto cpu_start = CpuNs();
             for (size_t i = 0; i < count; ++i) {
                 const auto start = std::chrono::steady_clock::now();
-                authenticate(i, deferred_replay, live_peak);
+                authenticate(i, deferred_replay);
                 const auto finish = std::chrono::steady_clock::now();
                 latencies[offset + i] =
                     std::chrono::duration<double, std::nano>(finish - start).count();
@@ -137,8 +132,6 @@ void RunCase(const char* cipher_name, const ss::SsCipherInfo& cipher,
         offset += count;
         final_batch_size = count;
     }
-    const size_t pmr_after = pool.OutstandingAllocations();
-    const auto pool_after = pool.GetFootprint();
     const size_t after_rss = benchmark::ResidentBytes();
     const auto process_memory = benchmark::ReadProcessMemory();
 
@@ -147,16 +140,15 @@ void RunCase(const char* cipher_name, const ss::SsCipherInfo& cipher,
     // must fail. Deferred authentication accepts duplicates without consulting
     // or populating the cache, including after an ordinary commit populates it.
     const size_t last = final_batch_size - 1;
-    size_t control_live_peak = 0;
     if (deferred_replay) {
-        authenticate(last, true, control_live_peak);
-        authenticate(last, true, control_live_peak);
+        authenticate(last, true);
+        authenticate(last, true);
         Require(replay_cache.Size() == 0);
-        authenticate(last, false, control_live_peak);
+        authenticate(last, false);
         Require(replay_cache.Size() == 1);
     }
     Require(!decode(last, false));
-    authenticate(last, true, control_live_peak);
+    authenticate(last, true);
     Require(replay_cache.Size() == 1);
 
     std::sort(latencies.begin(), latencies.end());
@@ -165,23 +157,21 @@ void RunCase(const char* cipher_name, const ss::SsCipherInfo& cipher,
     std::printf("ss-udp-identity cipher=%s users=%zu groups=%zu snapshot_position=%zu "
         "payload_bytes=%zu replay=%s n=%zu cpu_ns=%.1f mean_ns=%.1f "
         "p50_ns=%.1f p95_ns=%.1f p99_ns=%.1f cpp_new_calls=%.3f cpp_bytes=%.1f "
-        "mi_aligned_calls=%.3f pmr_before=%zu pmr_after=%zu pmr_live_allocations_peak=%zu "
-        "pool_before=%zu pool_after=%zu idle_rss=%zu warm_rss=%zu after_rss=%zu "
+        "mi_aligned_calls=%.3f "
+        "idle_rss=%zu warm_rss=%zu after_rss=%zu "
         "process_peak_rss=%zu anonymous_rss=%zu file_rss=%zu\n",
         cipher_name, users.size(), groups, position, payload_size,
         deferred_replay ? "deferred-auth-only" : "ordinary-accept", iterations,
         double(cpu_ns) / iterations, total_ns / iterations, latencies[iterations / 2],
         latencies[(iterations - 1) * 95 / 100], latencies[(iterations - 1) * 99 / 100],
         double(counts.cpp_calls) / iterations, double(counts.cpp_bytes) / iterations,
-        double(counts.aligned_calls) / iterations, pmr_before, pmr_after, live_peak,
-        pool_before.committed_bytes, pool_after.committed_bytes, idle_rss, warm_rss, after_rss,
+        double(counts.aligned_calls) / iterations,
+        idle_rss, warm_rss, after_rss,
         process_memory.peak_resident_bytes, process_memory.anonymous_resident_bytes,
         process_memory.file_resident_bytes);
 }
 
 TEST(ShadowsocksUdpIdentityBenchmark, AuthenticationMatrix) {
-    memory::worker_memory pool;
-    const auto baseline = pool.OutstandingAllocations();
     const size_t iterations = [] {
         const char* value = std::getenv("CNODE_BENCH_ITERATIONS");
         return value ? std::max(size_t{1}, static_cast<size_t>(std::stoull(value))) : size_t{512};
@@ -211,10 +201,10 @@ TEST(ShadowsocksUdpIdentityBenchmark, AuthenticationMatrix) {
                         // never from the fixture's pre-sort input order.
                         for (size_t payload_size : {0u, 1200u}) {
                             RunCase(cipher_name, *cipher, users, groups, *it,
-                                    payload_size, true, iterations, idle_rss, pool);
+                                    payload_size, true, iterations, idle_rss);
                             if (count == 256 && groups == 4 && *it == count - 1 && payload_size == 1200)
                                 RunCase(cipher_name, *cipher, users, groups, *it,
-                                        payload_size, false, iterations, idle_rss, pool);
+                                        payload_size, false, iterations, idle_rss);
                         }
                     }
                     UserStore::ClearWorkerView();
@@ -222,6 +212,5 @@ TEST(ShadowsocksUdpIdentityBenchmark, AuthenticationMatrix) {
             }
         }
     }
-    EXPECT_EQ(pool.OutstandingAllocations(), baseline);
 }
 } // namespace

@@ -82,6 +82,7 @@ static_assert(!ExtractableInitialPayload<const ::InitialPayload&&>);
 // Retain poisoned retired blocks so stale descriptor reads fail deterministically.
 class RetiringResource final : public std::pmr::memory_resource {
 public:
+    size_t live = 0;
     void RejectNextAllocation() noexcept { reject_next_ = true; }
     ~RetiringResource() override {
         for (const auto& block : retired_)
@@ -93,10 +94,13 @@ private:
     bool reject_next_ = false;
     void* do_allocate(size_t bytes, size_t alignment) override {
         if (std::exchange(reject_next_, false)) throw std::bad_alloc();
-        return std::pmr::new_delete_resource()->allocate(bytes, alignment);
+        void* block = std::pmr::new_delete_resource()->allocate(bytes, alignment);
+        ++live;
+        return block;
     }
     void do_deallocate(void* pointer, size_t bytes, size_t alignment) override {
         std::memset(pointer, 0, bytes);
+        --live;
         retired_.push_back({pointer, bytes, alignment});
     }
     bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
@@ -195,28 +199,28 @@ TEST(BufferSpanBuilder, SelfAppendWithinCapacityKeepsBorrowedStorage) {
 }
 
 TEST(BufferSpanBuilder, SparseExternalAppendUsesOnlyNonemptyCapacity) {
-    memory::worker_memory pool;
+    RetiringResource resource;
     const std::string text = "abcd";
     const std::array prefix{
         ::net::buffer(text.data(), 1), ::net::buffer(text.data() + 1, 1),
         ::net::buffer(text.data() + 2, 1)};
     const std::array<::net::const_buffer, 3> suffix{
         ::net::const_buffer{}, ::net::buffer(text.data() + 3, 1), {}};
-    ::ConstBufferSpanBuilder<4> builder(pool.resource());
+    ::ConstBufferSpanBuilder<4> builder(&resource);
     builder.AppendBuffers(prefix);
     builder.AppendBuffers(suffix);
     EXPECT_EQ(Flatten(builder.Span()), "abcd");
-    EXPECT_EQ(pool.OutstandingAllocations(), 0u);
+    EXPECT_EQ(resource.live, 0u);
     builder.AppendBuffers(suffix);
     EXPECT_EQ(Flatten(builder.Span()), "abcdd");
-    EXPECT_EQ(pool.OutstandingAllocations(), 1u);
+    EXPECT_EQ(resource.live, 1u);
     builder.Clear();
-    EXPECT_EQ(pool.OutstandingAllocations(), 0u);
+    EXPECT_EQ(resource.live, 0u);
 }
 
 TEST(BufferSpanBuilder, SpillUsesConstructionResourceAndClearReleasesItsStorage) {
-    memory::worker_memory pool;
-    ::ConstBufferSpanBuilder<2> builder(pool.resource());
+    RetiringResource resource;
+    ::ConstBufferSpanBuilder<2> builder(&resource);
     const std::string text = "abc";
     builder.Append(::net::buffer(text.data(), 1));
     builder.Append(::net::buffer(text.data() + 1, 1));
@@ -227,18 +231,18 @@ TEST(BufferSpanBuilder, SpillUsesConstructionResourceAndClearReleasesItsStorage)
         }
         builder.Append(::net::buffer(text.data() + 2, 1));
         EXPECT_EQ(Flatten(builder.Span()), text);
-        EXPECT_EQ(pool.OutstandingAllocations(), 1u);
+        EXPECT_EQ(resource.live, 1u);
         builder.Clear();
-        EXPECT_EQ(pool.OutstandingAllocations(), 0u);
+        EXPECT_EQ(resource.live, 0u);
     }
 }
 
 TEST(BufferSpanBuilder, SparseMultiBufferPreservesSlicesAcrossInlineAndSpilledAppends) {
-    memory::worker_memory pool;
+    RetiringResource resource;
     ::buf::MultiBuffer payload;
     const void* slice = nullptr;
     for (int index = 0; index < 3; ++index) {
-        ::buf::BufferGuard block{::buf::Buffer::New(pool)};
+        ::buf::BufferGuard block{::buf::Buffer::New()};
         ASSERT_TRUE(block);
         if (index == 1) {
             std::memcpy(block->Tail().data(), "abc", 3);
@@ -248,8 +252,7 @@ TEST(BufferSpanBuilder, SparseMultiBufferPreservesSlicesAcrossInlineAndSpilledAp
         }
         payload.push_back(std::move(block));
     }
-    const auto payload_allocations = pool.OutstandingAllocations();
-    ::ConstBufferSpanBuilder<4> builder(pool.resource());
+    ::ConstBufferSpanBuilder<4> builder(&resource);
     const std::string prefix = "P";
     builder.Append(::net::buffer(prefix));
     std::string expected = prefix;
@@ -262,21 +265,17 @@ TEST(BufferSpanBuilder, SparseMultiBufferPreservesSlicesAcrossInlineAndSpilledAp
             EXPECT_EQ(builder.Span()[index].data(), slice);
             EXPECT_EQ(builder.Span()[index].size(), 2u);
         }
-        EXPECT_EQ(pool.OutstandingAllocations(),
-            payload_allocations + static_cast<size_t>(appended >= 4));
+        EXPECT_EQ(resource.live, static_cast<size_t>(appended >= 4));
     }
     builder.Clear();
-    EXPECT_EQ(pool.OutstandingAllocations(),
-              payload_allocations);
+    EXPECT_EQ(resource.live, 0u);
     payload.clear();
-    EXPECT_EQ(pool.OutstandingAllocations(), 0u);
 }
 
 TEST(BufferSpanBuilder, FailedMultiBufferAppendPreservesPrefixAndCanRetry) {
-    memory::worker_memory pool;
     ::buf::MultiBuffer payload;
     for (const char value : {'x', 'y'}) {
-        ::buf::BufferGuard block{::buf::Buffer::New(pool)};
+        ::buf::BufferGuard block{::buf::Buffer::New()};
         ASSERT_TRUE(block);
         block->Tail()[0] = static_cast<uint8_t>(value);
         block->Produce(1);
@@ -303,14 +302,14 @@ TEST(BufferSpanBuilder, FailedMultiBufferAppendPreservesPrefixAndCanRetry) {
 }
 
 TEST(ContiguousBufferView, MultiBufferBorrowAndOwnedCopyPreserveBinaryPayload) {
-    memory::worker_memory pool;
+    const auto live_before = ::memory::detail::test_buffers_live;
     for (const bool fragmented : {false, true}) {
         SCOPED_TRACE(fragmented);
         std::array<uint8_t, 6> expected{0, 0x42, 0, 0x7f, 0x80, 0xff};
         ::buf::MultiBuffer source;
         const size_t chunk_size = fragmented ? 3 : expected.size();
         for (size_t offset = 0; offset < expected.size(); offset += chunk_size) {
-            ::buf::BufferGuard block{::buf::Buffer::New(pool)};
+            ::buf::BufferGuard block{::buf::Buffer::New()};
             ASSERT_TRUE(block);
             std::memcpy(block->Tail().data(), expected.data() + offset, chunk_size);
             block->Produce(static_cast<uint32_t>(chunk_size));
@@ -320,7 +319,7 @@ TEST(ContiguousBufferView, MultiBufferBorrowAndOwnedCopyPreserveBinaryPayload) {
             const ContiguousView view(std::as_const(source));
             if (fragmented) {
                 source.clear();
-                EXPECT_EQ(pool.OutstandingAllocations(), 1u);
+                EXPECT_EQ(::memory::detail::test_buffers_live, live_before);
             } else {
                 EXPECT_EQ(view.Bytes().data(), source.FrontSpan().data());
                 (*source.begin())->Bytes()[1] = expected[1] = 0x99;
@@ -329,12 +328,12 @@ TEST(ContiguousBufferView, MultiBufferBorrowAndOwnedCopyPreserveBinaryPayload) {
             EXPECT_TRUE(std::equal(view.Bytes().begin(), view.Bytes().end(), expected.begin()));
         }
         source.clear();
-        EXPECT_EQ(pool.OutstandingAllocations(), 0u);
+        EXPECT_EQ(::memory::detail::test_buffers_live, live_before);
     }
 }
 
 TEST(ContiguousBufferView, TemporaryDescriptorsDoNotOwnOrExtendPayloadLifetime) {
-    memory::worker_memory pool;
+    RetiringResource resource;
     for (const bool fragmented : {false, true}) {
         SCOPED_TRACE(fragmented);
         std::array<uint8_t, 3> first{1, 0, 2}, second{3, 0xff, 4};
@@ -344,7 +343,7 @@ TEST(ContiguousBufferView, TemporaryDescriptorsDoNotOwnOrExtendPayloadLifetime) 
             std::array<::net::const_buffer, 3> descriptors{
                 ::net::buffer(first), {},
                 fragmented ? ::net::buffer(second) : ::net::const_buffer{}};
-            const ContiguousView view{std::span<const ::net::const_buffer>(descriptors), pool.resource()};
+            const ContiguousView view{std::span<const ::net::const_buffer>(descriptors), &resource};
             descriptors.fill({});
             if (fragmented) {
                 first.fill(0xaa);
@@ -356,7 +355,7 @@ TEST(ContiguousBufferView, TemporaryDescriptorsDoNotOwnOrExtendPayloadLifetime) 
             ASSERT_EQ(view.Bytes().size(), expected.size());
             EXPECT_TRUE(std::equal(view.Bytes().begin(), view.Bytes().end(), expected.begin()));
         }
-        EXPECT_EQ(pool.OutstandingAllocations(), 0u);
+        EXPECT_EQ(resource.live, 0u);
     }
 }
 

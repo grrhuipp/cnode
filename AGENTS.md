@@ -79,11 +79,11 @@
 - **显式阻塞卸载与延迟唤醒**：集中式控制面或阻塞/CPU 密集任务通过有界值通道交互或卸载至常驻有界线程池（不在池内自等待），同线程槽位移交与唤醒延迟至下一轮事件循环以防栈递归。
 - **结构化惰性并发**：异步任务惰性启动（未启动可丢弃），所有已启动任务必须由明确 owner 跟踪并通过 `co_await` / `join` 收束（严禁销毁挂起帧或静默 `detach`），挂起与完成竞争由原子状态机裁决。
 - **代际取消代理与析构守卫**：异步作用域与投递闭包挂载析构守卫防排空挂起，跨线程取消经持有原子可分离指针与代际 ID 的轻量代理投递，等待槽在持锁期间完成结果转移、置零代际解链与唤醒。
-- **全双工协同与四阶段停机**：全双工会话单向通道线性互斥且任一方向出错或关闭立即协同唤醒并排空另一方向，停机严格按“封闭入口停接入 → 取消或有界排空在途工作 → 收束全部 I/O 与完成通知 → 按依赖逆序释放组件与内存池”推进（`join()` 前校验防自等待死锁）。
-- **无全局锁两级内存池**：底层统一使用 mimalloc（daemon 全局替换 malloc/new，线程本地堆无全局锁），按“进程与控制面 `process_resource()`、每 Worker 唯一一个 mimalloc 一等堆（`mi_heap_new`）作为可回收 PMR 池、阶段级单调 Arena”分级管理。尺寸类分页、页元数据、空闲块复用、对齐分配、空页回收与延迟 purge 全部交给 mimalloc，严禁在其上自建 slab、块缓存、空闲队列、回收定时器、块头或对齐取整，也不开启 Asio 的 handler 小块与协程帧回收缓存（`ASIO_DISABLE_SMALL_BLOCK_RECYCLING`、`ASIO_DISABLE_AWAITABLE_FRAME_RECYCLING`）。分配器行为优先用 mimalloc 默认值与其构建选项（如 `MI_NO_THP`）表达，不在进程内另写等价的系统调用或运行期覆盖。连接与物理会话严禁另建 heap 或 pool，只能持有轻量分配域、懒借稳定块及 scoped arena；稳定 arena 仅容纳初始化后封存且与连接同寿命的结构，运行期 payload、Buffer、子流、队列与会话状态必须逐块向所属 Worker 池借还，禁止自建协议私有长期池或以连接级 monotonic arena 承载持续流量。
-- **显式池所有权（不得隐式选池）**：Worker 池由 `Worker` 成员持有，只经显式通道传递：构造注入的 `memory::worker_memory&`、`session::Context::pool`、`AsyncStream::Pool()`、`Buffer::Pool()` / `MultiBuffer::OwnerPool()`（派生存储沿用源数据的池）；Worker 内对象经 `memory::MakeUnique` / `new (pool)` 创建。未显式给出资源的存储（默认构造的 `memory::*` 容器、`nullptr` 资源、值类型与控制面数据）一律落在进程层 `process_resource()`。严禁 `thread_local` 选池、替换全局默认 PMR、按执行上下文查池或以默认值掩盖缺失的 Worker 池。
-- **QUIC 连接资源轻量化**：`ngtcp2` / `nghttp3` 的连接分配器必须借用所属 Worker 的唯一 PMR 池，连接只保存轻量分配域、协议状态和有界队列；严禁为每条 QUIC 连接创建独立 heap/pool、`ResidentTaskGroup` 或 `TimeoutSchedulerService`。UDP 收发队列与超时最小堆按 Worker/监听入口共享，连接关闭后 ACK 保留、分片、流队列与路径状态必须可达地释放。
-- **内存池纯单线程独占与同线程闭环回收**：Worker 池保持纯单线程无锁独占，分配与释放必须在同一所属 Worker 线程闭环完成，不设跨线程 remote-free 原子队列或执行域租约比对；严禁将绑定某 Worker 池的容器、Buffer 或会话对象跨线程传递或跨线程析构。这是调用方的所有权不变量：`worker_memory` 只做 mimalloc heap API 的薄适配（`mi_heap_malloc_aligned` / `mi_free`），不缓存 theap、不做线程或归属校验。停机必须先封闭准入、收束全部在途 I/O 与本地任务，再销毁 Worker 池。
+- **全双工协同与四阶段停机**：全双工会话单向通道线性互斥且任一方向出错或关闭立即协同唤醒并排空另一方向，停机严格按“封闭入口停接入 → 取消或有界排空在途工作 → 收束全部 I/O 与完成通知 → 按依赖逆序释放组件与阶段存储”推进（`join()` 前校验防自等待死锁）。
+- **原生线程堆与阶段内存**：底层统一使用 mimalloc，daemon 全局替换 malloc/new；`process_resource()` 是进程生命周期、线程安全的 PMR 适配器，分配直接落在调用线程的原生 mimalloc 堆，不另建 Worker、连接或协议级 heap/pool。尺寸类分页、页元数据、空闲块复用、对齐分配、空页回收与延迟 purge 全部交给 mimalloc，严禁在其上自建 slab、块缓存、空闲队列、回收线程、块头或对齐取整，也不开启 Asio 的 handler 小块与协程帧回收缓存（`ASIO_DISABLE_SMALL_BLOCK_RECYCLING`、`ASIO_DISABLE_AWAITABLE_FRAME_RECYCLING`）。分配器行为优先采用原生默认值与构建选项（如 `MI_NO_THP`），不重复系统调用或运行期覆盖。单调 Arena 只承载请求、握手等明确阶段，或初始化后封存的同寿命结构；持续流量的 payload、Buffer、子流、队列与会话状态必须逐块释放，禁止连接级 monotonic arena 承载持续流量。
+- **统一默认资源与显式 PMR**：未指定资源的 `memory::*` 容器、`nullptr` 资源与控制面数据统一使用 `process_resource()`；普通对象使用标准 RAII 与智能指针工厂，daemon 的全局分配覆盖确保其使用同一 mimalloc 后端。接受调用方 PMR 的通用边界保留显式资源优先级，调用方保证资源覆盖对象寿命；不维护无状态选池包装器，不按 Worker、执行上下文或应用层 `thread_local` 隐式选池，也不替换全局默认 PMR 对象。
+- **QUIC 连接资源轻量化**：`ngtcp2` / `nghttp3` 与数据面统一使用 mimalloc 后端，连接只保存协议状态和有界队列，不维护独立分配域、heap/pool、`ResidentTaskGroup` 或 `TimeoutSchedulerService`。UDP 收发队列与超时最小堆按 Worker/监听入口共享，连接关闭后 ACK 保留、分片、流队列与路径状态必须可达地释放。
+- **对象单线程归属与原生回收**：进程资源允许跨线程释放控制面与共享完成状态，但这不放宽数据面所有权；容器、Buffer、会话及在途 I/O 仍在所属 Worker 上使用、取消与析构，严禁跨 Worker 传递业务载荷。不自建 remote-free 队列或执行域租约比对。静默回收复用既有运行时采样，在统计活动转入静默后仅收集一次，再次有活动才重新武装，不另建回收线程或轮询定时器。已提交统计不等于网络静止；显式强制收集在待收集线程上执行，只影响可回收空页而不影响存活对象，不将 purge 延迟当作 RSS 归还期限。停机先封闭准入并收束全部在途 I/O 与本地任务，再按依赖逆序释放运行态。
 - **用时借、用完立还（极短内存生命周期）**：握手、认证、探测、路由与建连的临时缓冲及凭据限定在独立子协程内并在进入稳态转发前立即归还内存池，单帧/单记录处理完毕进入下次等待前立即归还按帧借用的密文/明文缓冲与溢出容器（禁仅 `clear()` 留大容量或跨挂起点声明大栈数组）。
 - **空闲极小化与反碎片布局**：空闲连接与子流等待可读前严禁预借数据缓冲，尚未启动子任务的连接级任务组只保留 executor，必须在首次 `Spawn` 时才构造 join 状态与自持有任务组；每会话队列采用空态 0 字节分配且排空即还池的环形或内联结构，定长小握手头与短帧头复用栈或小缓冲（SBO），连接超时统一由执行器单调度器承载。
 
@@ -111,10 +111,10 @@
 | request policy | 对统一 session 返回 allow / block | 选路、查找 outbound、解析协议、向分发层暴露面板规则类型 |
 | outbound | 拨号或下一跳、出站握手和编码、交给转发 | 路由、读取 panel 原始配置、绕过分发层、自建拨号目标编排 |
 | relay | 搬运数据和流量打点 | 解析协议、选 outbound、访问 panel、连接级大 scratch、wrapper |
-| Worker | 事件循环、accept、本执行器能力与分配器 | 协议校验器、具体出站类型、路由决策、panel 同步 |
+| Worker | 事件循环、accept、本执行器能力与生命周期 | 协议校验器、具体出站类型、路由决策、panel 同步 |
 | proxyman | 按 tag 持有已准备的 handler，receiver 只携带不可变窄策略 | 解析协议或 panel 字段、自己做路由、直接进入转发、暴露跨 Worker 可变 handler |
 | transport | 字节传输 | 代理协议解析、选 outbound、panel 配置、协议私有长期 pool |
-| control plane | 拉节点、用户和规则，归一化，构建 runtime，原子发布，按面板语义上报 | 进入热路径、改 live handler、访问 Worker 分配器、按协议构建认证凭据 |
+| control plane | 拉节点、用户和规则，归一化，构建 runtime，原子发布，按面板语义上报 | 进入热路径、改 live handler、访问 Worker 可变运行态、按协议构建认证凭据 |
 
 ## 协议实现
 
@@ -143,7 +143,7 @@
   - **分离上行传输（XHTTP Split-HTTP）**：下行 `GET` 所在的原 Worker 唯一拥有完整会话、路由、出站连接与 Relay。当同 `session_id` 的上行请求（`stream-up` 或 `packet-up`）经另一条物理连接落到其他 Worker 时，收包 Worker 仅读取首个 HTTP 请求头识别 `session_id`，随即在该连接无在途 I/O、无出站与定时器的静止边界，单次提取裸入站 `fd`（含 TLS 状态与预读字节）经有界控制邮箱移交原 Worker `assign` 接管；接管后该连接的所有后续请求与流字节均在原 Worker 本地原生读写，严禁跨 Worker 投递 `MultiBuffer` 载荷或合组运行中的 HTTP/2 会话。
   - **原生 UDP**：所有原生 UDP 入站关联及其出站资源（含原生 UDP socket 与 UDP-over-TCP 隧道/连接池流）均由接受并创建该关联的 Worker 本地独占（对齐 Xray-core / Shadowsocks-rust 的 Share-Nothing 模型），不跨 Worker 迁移出站连接，也不跨 Worker 转发 UDP 数据报。
 - Worker 的 live 能力由同一运行时对象统一构造、启动、暴露和关闭，不得散落成相互独立的生命周期。Worker 集合在启动期确定，运行时不能增删，进入运行后存活至进程退出。
-- 每个数据 Worker 独立拥有自己的入站、出站、路由、分发、策略、连接跟踪、流量计数、限速令牌桶和分配器，不得跨数据 Worker 共享，也不得在同一 Worker 内为同一能力维护两套 handler 实例、查找表或发布路径。明确例外只有两类全进程语义的单一 owner，均只能经有界投递或预留操作按值交互：DNSWorker 独占 DNS 查询、在途请求、socket、超时调度和缓存；全局准入协调器独占全局与按 IP 的连接配额、认证失败封禁计数、按用户的在线设备配额及跨连接入口路由目录，Worker 本地只保留展示与上报所需的镜像。
+- 每个数据 Worker 独立拥有自己的入站、出站、路由、分发、策略、连接跟踪、流量计数和限速令牌桶，不得跨数据 Worker 共享，也不得在同一 Worker 内为同一能力维护两套 handler 实例、查找表或发布路径。明确例外只有两类全进程语义的单一 owner，均只能经有界投递或预留操作按值交互：DNSWorker 独占 DNS 查询、在途请求、socket、超时调度和缓存；全局准入协调器独占全局与按 IP 的连接配额、认证失败封禁计数、按用户的在线设备配额及跨连接入口路由目录，Worker 本地只保留展示与上报所需的镜像。
 - 普通转发不得改走跨线程写队列、共享缓冲或多态写节点。
 
 ## 并发补充
@@ -183,7 +183,7 @@
 9. 连接常驻大 scratch，或协议私有长期池。
 10. 同一 manager 承担多个层级的职责。
 11. legacy 配置进入 runtime。
-12. 跨 Worker 直接访问私有对象，或让 Worker 私有指针、引用、分配器、handler、会话或流逃逸。
+12. 跨 Worker 直接访问私有对象，或让 Worker 私有指针、引用、阶段存储、handler、会话或流逃逸。
 13. 用无锁或原子共享 live handler、连接或缓冲池。
 14. 控制面按协议构建认证凭据，或面板用户绕过唯一用户快照。
 15. 绕开 DNSWorker 的有界入口，跨线程直接访问其 DNS、在途解析、socket、超时调度或缓存。
@@ -197,7 +197,7 @@
 23. 大小写归一化之外的多拼写配置别名、侧车外层冗余包装，或无读者的面板/会话死字段。
 24. `infra` 反向依赖 `app`，或用 `shared_ptr<void>`、`void*`、`std::function` 擦除已知的运行期配置、安全层或请求期状态。
 25. 同一地址编解码、同构 Validator、帧读写、准入编排或配置字段解析在多个协议或配置来源间复制。
-26. 只写不读的统计/跟踪状态，热路径每包/每请求拼接字符串键、格式化规则名与逐字节 `AsyncRead`，或绕过多级内存池穿透到系统全局分配器锁。
+26. 只写不读的统计/跟踪状态，热路径每包/每请求拼接字符串键、格式化规则名与逐字节 `AsyncRead`，或绕开统一 mimalloc 后端叠加第二套分配器、块头或缓存。
 
 ## 审查
 

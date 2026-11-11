@@ -595,7 +595,7 @@ net::awaitable<buf::MultiBuffer> UdpFramer::ReadDatagram(
             const TargetAddress& target = packet.target
                 ? *packet.target
                 : session_target;
-            if (!buf::SetUdpTarget(packet.payload, target, *pool_)) {
+            if (!buf::SetUdpTarget(packet.payload, target)) {
                 pending_.Fail();
                 throw std::bad_alloc();
             }

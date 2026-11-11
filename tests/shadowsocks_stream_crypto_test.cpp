@@ -196,9 +196,8 @@ void TestLargeRecord(size_t payload_size, ss::SsCipherType cipher_type) {
           "large Shadowsocks record encryption failed");
 
     ss::SsAeadCipher decryptor(cipher_type, key.data(), key.size(), proxy::AeadDirection::Decrypt);
-    memory::worker_memory pool;
     buf::MultiBuffer encrypted;
-    Check(buf::AppendSpanToMultiBuffer(ciphertext, encrypted, pool),
+    Check(buf::AppendSpanToMultiBuffer(ciphertext, encrypted),
           "encrypted fixture allocation failed");
     buf::MultiBuffer decoded;
     Check(ss::detail::DecryptStreamPayload(
@@ -232,9 +231,8 @@ void TestInvalidTagDoesNotPublishPartialPlaintext() {
 
     ss::SsAeadCipher decryptor(ss::SsCipherType::AES_256_GCM, key.data(), key.size(),
                                proxy::AeadDirection::Decrypt);
-    memory::worker_memory pool;
     buf::MultiBuffer encrypted;
-    Check(buf::AppendSpanToMultiBuffer(ciphertext, encrypted, pool),
+    Check(buf::AppendSpanToMultiBuffer(ciphertext, encrypted),
           "encrypted fixture allocation failed");
     buf::MultiBuffer decoded;
     Check(!ss::detail::DecryptStreamPayload(
@@ -246,9 +244,9 @@ void TestInvalidTagDoesNotPublishPartialPlaintext() {
 
 class WireReader final : public transport::MultiBufferReader {
 public:
-    explicit WireReader(memory::worker_memory& pool, const std::vector<uint8_t>& wire,
+    explicit WireReader(const std::vector<uint8_t>& wire,
                         size_t fragment = SIZE_MAX)
-        : pool_(pool), wire_(wire), fragment_(fragment) {}
+        : wire_(wire), fragment_(fragment) {}
 
     transport::CancellationSource& Cancellation() noexcept override { return cancellation_; }
 
@@ -273,13 +271,13 @@ public:
         if (cut_ < cuts.size()) count = std::min(count, cuts[cut_] - offset_);
         Check(count != 0, "invalid encrypted wire cutpoint");
         buf::MultiBuffer raw;
-        Check(buf::AppendSpanToMultiBuffer({wire_.data() + offset_, count}, raw, pool_),
+        Check(buf::AppendSpanToMultiBuffer({wire_.data() + offset_, count}, raw),
               "wire input allocation failed");
         offset_ += count;
 #ifdef CNODE_TEST_ALLOCATOR
         if (fail_payload_allocation) {
             fail_payload_allocation = false;
-            memory::reject_next_pmr_allocation = true;
+            memory::reject_next_process_allocation = true;
         }
 #endif
         co_return raw;
@@ -292,7 +290,6 @@ public:
     bool fail_payload_allocation = false;
 
 private:
-    memory::worker_memory& pool_;
     transport::CancellationSource cancellation_;
     const std::vector<uint8_t>& wire_;
     size_t fragment_;
@@ -336,10 +333,9 @@ void TestReaderResume(ss::SsCipherType type, uint64_t initial_nonce, bool empty_
     AppendRecord(encoder, nonce, {}, wire); // Empty authenticated data is not EOF.
     const size_t data = wire.size();
     AppendRecord(encoder, nonce, second, wire);
-    memory::worker_memory pool;
     net::io_context io;
     net::cancellation_signal signal;
-    WireReader source(pool, wire, fragment);
+    WireReader source(wire, fragment);
     source.signal = &signal;
     source.empty_on_cancel = empty_on_cancel;
     source.cuts = {boundary, boundary, boundary + 1, boundary + 17, boundary + 18,
@@ -376,9 +372,8 @@ void TestReaderResume(ss::SsCipherType type, uint64_t initial_nonce, bool empty_
 void CheckReaderFailure(const std::vector<uint8_t>& wire, ss::SsCipherType type,
                         uint64_t nonce, ErrorCode expected, bool preceding_record,
                         bool source_fault = false) {
-    memory::worker_memory pool;
     net::io_context io;
-    WireReader source(pool, wire);
+    WireReader source(wire);
     source.fail_at_eof = source_fault;
     ss::detail::BodyReader reader(
         ss::SsAeadCipher(type, kRecordKey.data(), RecordKeySize(type), proxy::AeadDirection::Decrypt),
@@ -466,9 +461,8 @@ void TestContextLifetime() {
     uint64_t counter = 0;
     const std::vector<uint8_t> large_plain(buf::Buffer::kSize + 1, 0x5a);
     AppendRecord(encoder, counter, large_plain, wire);
-    memory::worker_memory pool;
     net::io_context io;
-    WireReader source(pool, wire);
+    WireReader source(wire);
     source.fail_payload_allocation = true;
     ss::detail::BodyReader reader(
         ss::SsAeadCipher(ss::SsCipherType::AES_256_GCM, kRecordKey.data(), 32,

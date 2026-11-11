@@ -38,7 +38,6 @@ int64_t CpuNanoseconds(const timespec& value) {
 }
 
 TEST(AllocatorAppendBenchmark, TrackedResource) {
-    memory::worker_memory pool;
     for (const std::size_t append_bytes : {64u, 1024u, 16384u, 65536u}) {
         std::vector<uint8_t> input(append_bytes);
         for (std::size_t index = 0; index < input.size(); ++index)
@@ -51,14 +50,12 @@ TEST(AllocatorAppendBenchmark, TrackedResource) {
                 ? std::min(kGrowingAppends, kOperationByteLimit / append_bytes) : 1;
             const std::size_t iterations = kBytesPerWorkload / (append_bytes * appends);
             ASSERT_GT(iterations, 0u);
-            pool.Collect();
+            memory::CollectThreadHeap();
 
-            // Validate the exact append path outside timing, including every
-            // preserved prefix after geometric growth. This also warms the pool.
-            std::size_t sampled_live_allocations = 0;
+            // Validate the measured append path and preserved prefixes before timing.
             std::size_t sampled_capacity = 0;
             {
-                Bytes probe(pool.resource());
+                Bytes probe;
                 if (!growing) probe.reserve(append_bytes);
                 for (std::size_t part = 0; part < appends; ++part) {
                     Append(probe, input);
@@ -66,21 +63,17 @@ TEST(AllocatorAppendBenchmark, TrackedResource) {
                     for (std::size_t offset = 0; offset < probe.size(); offset += append_bytes)
                         ASSERT_TRUE(std::equal(input.begin(), input.end(), probe.begin() + offset));
                 }
-                EXPECT_EQ(probe.get_allocator().resource(), pool.resource());
-                sampled_live_allocations = pool.OutstandingAllocations();
                 sampled_capacity = probe.capacity();
             }
-            ASSERT_EQ(pool.OutstandingAllocations(), 0u);
 
-            Bytes reserved(pool.resource());
+            Bytes reserved;
             if (!growing) reserved.reserve(append_bytes);
-            const auto before = pool.GetFootprint();
             timespec cpu_start{}, cpu_end{};
             ASSERT_EQ(::clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu_start), 0);
             const auto wall_start = std::chrono::steady_clock::now();
             if (growing) {
                 for (std::size_t iteration = 0; iteration < iterations; ++iteration) {
-                    Bytes output(pool.resource());
+                    Bytes output;
                     for (std::size_t part = 0; part < appends; ++part) {
                         Append(output, input);
                         Observe(output);
@@ -101,30 +94,23 @@ TEST(AllocatorAppendBenchmark, TrackedResource) {
                 ASSERT_EQ(reserved.size(), input.size());
                 EXPECT_TRUE(std::equal(input.begin(), input.end(), reserved.begin()));
             }
-            const auto after = pool.GetFootprint();
-            const auto live_after = pool.OutstandingAllocations();
-            EXPECT_EQ(live_after, growing ? 0u : 1u);
             const double bytes = static_cast<double>(iterations * appends * append_bytes);
             const double wall_ns = std::chrono::duration<double, std::nano>(wall_end - wall_start).count();
             const double cpu_ns = static_cast<double>(CpuNanoseconds(cpu_end) - CpuNanoseconds(cpu_start));
             std::printf("allocator-append mode=%s append_bytes=%zu appends_per_operation=%zu "
                         "operations=%zu bytes=%.0f wall_ns_per_byte=%.3f cpu_ns_per_byte=%.3f "
-                        "sample_capacity=%zu sample_live_allocations=%zu live_after=%zu "
-                        "committed_before=%zu committed_after=%zu used_after=%zu pages_after=%zu\n",
+                        "sample_capacity=%zu\n",
                 growing ? "fresh-growing" : "pre-reserved", append_bytes, appends,
-                iterations, bytes, wall_ns / bytes, cpu_ns / bytes, sampled_capacity,
-                sampled_live_allocations, live_after, before.committed_bytes, after.committed_bytes,
-                after.used_bytes, after.pages);
+                iterations, bytes, wall_ns / bytes, cpu_ns / bytes, sampled_capacity);
         }
     }
-    EXPECT_EQ(pool.OutstandingAllocations(), 0u);
-    pool.Collect();
+    memory::CollectThreadHeap();
 }
 
-buf::MultiBuffer TransferBuffers(std::size_t count, memory::worker_memory& pool) {
+buf::MultiBuffer TransferBuffers(std::size_t count) {
     buf::MultiBuffer source;
     for (std::size_t index = 0; index < count; ++index) {
-        buf::BufferGuard buffer{buf::Buffer::New(pool)};
+        buf::BufferGuard buffer{buf::Buffer::New()};
         if (!buffer) throw std::bad_alloc();
         buffer->Tail()[0] = static_cast<uint8_t>(index);
         buffer->Produce(1);
@@ -143,12 +129,11 @@ buf::MultiBuffer TransferBuffers(std::size_t count, memory::worker_memory& pool)
 }
 
 TEST(MultiBufferBenchmark, TrackedTransfers) {
-    memory::worker_memory pool;
     for (const std::size_t blocks : {1u, 8u, 9u, 16u}) {
         SCOPED_TRACE(blocks);
-        pool.Collect();
+        memory::CollectThreadHeap();
         {
-            auto probe = TransferBuffers(blocks, pool);
+            auto probe = TransferBuffers(blocks);
             ASSERT_EQ(probe.size(), blocks);
             ASSERT_EQ(probe.byte_size(), blocks);
             for (std::size_t index = 0; index < blocks; ++index) {
@@ -159,39 +144,31 @@ TEST(MultiBufferBenchmark, TrackedTransfers) {
             }
             ASSERT_TRUE(probe.empty());
         }
-        ASSERT_EQ(pool.OutstandingAllocations(), 0u);
         const std::size_t iterations = 262144 / blocks;
-        const auto before = pool.GetFootprint();
         timespec cpu_start{}, cpu_end{};
         ASSERT_EQ(::clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu_start), 0);
         const auto start = std::chrono::steady_clock::now();
         for (std::size_t iteration = 0; iteration < iterations; ++iteration) {
-            auto payload = TransferBuffers(blocks, pool);
+            auto payload = TransferBuffers(blocks);
             payload.drop_front(blocks - 1);
             asm volatile("" : : "g"(&payload) : "memory");
         }
         const auto finish = std::chrono::steady_clock::now();
         ASSERT_EQ(::clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu_end), 0);
-        const auto after = pool.GetFootprint();
-        EXPECT_EQ(pool.OutstandingAllocations(), 0u);
         const double wall_ns = std::chrono::duration<double, std::nano>(finish - start).count();
         const double cpu_ns = static_cast<double>(CpuNanoseconds(cpu_end) - CpuNanoseconds(cpu_start));
         std::printf("multibuffer-transfer blocks=%zu operations=%zu "
-                    "wall_ns_per_operation=%.3f cpu_ns_per_operation=%.3f "
-                    "live_after=%zu committed_before=%zu committed_after=%zu used_after=%zu\n",
-            blocks, iterations, wall_ns / iterations, cpu_ns / iterations,
-            pool.OutstandingAllocations(),
-            before.committed_bytes, after.committed_bytes, after.used_bytes);
+                    "wall_ns_per_operation=%.3f cpu_ns_per_operation=%.3f\n",
+            blocks, iterations, wall_ns / iterations, cpu_ns / iterations);
     }
-    pool.Collect();
+    memory::CollectThreadHeap();
 }
 
 TEST(BufferSpanBenchmark, TrackedDescriptors) {
-    memory::worker_memory pool;
     for (const std::size_t blocks : {1u, 8u, 9u, 16u}) {
-        pool.Collect();
+        memory::CollectThreadHeap();
         {
-            auto payload = TransferBuffers(blocks, pool);
+            auto payload = TransferBuffers(blocks);
             std::array<net::const_buffer, 16> input;
             std::size_t position = 0;
             for (const auto* buffer : payload) {
@@ -199,12 +176,11 @@ TEST(BufferSpanBenchmark, TrackedDescriptors) {
                 input[position++] = net::buffer(bytes.data(), bytes.size());
             }
             const auto descriptors = std::span(input).first(blocks);
-            const auto payload_allocations = pool.OutstandingAllocations();
             for (const bool from_multibuffer : {false, true}) {
                 SCOPED_TRACE(blocks);
                 SCOPED_TRACE(from_multibuffer);
                 {
-                    ConstBufferSpanBuilder<8> probe(pool.resource());
+                    ConstBufferSpanBuilder<8> probe;
                     if (from_multibuffer) probe.AppendMultiBuffer(payload);
                     else probe.AppendBuffers(descriptors);
                     ASSERT_EQ(probe.size(), blocks);
@@ -213,14 +189,12 @@ TEST(BufferSpanBenchmark, TrackedDescriptors) {
                         EXPECT_EQ(probe.Span()[index].size(), input[index].size());
                     }
                 }
-                ASSERT_EQ(pool.OutstandingAllocations(), payload_allocations);
                 const std::size_t iterations = 1048576 / blocks;
-                const auto before = pool.GetFootprint();
                 timespec cpu_start{}, cpu_end{};
                 ASSERT_EQ(::clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu_start), 0);
                 const auto start = std::chrono::steady_clock::now();
                 for (std::size_t iteration = 0; iteration < iterations; ++iteration) {
-                    ConstBufferSpanBuilder<8> output(pool.resource());
+                    ConstBufferSpanBuilder<8> output;
                     if (from_multibuffer) output.AppendMultiBuffer(payload);
                     else output.AppendBuffers(descriptors);
                     const auto views = output.Span();
@@ -228,21 +202,16 @@ TEST(BufferSpanBenchmark, TrackedDescriptors) {
                 }
                 const auto finish = std::chrono::steady_clock::now();
                 ASSERT_EQ(::clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu_end), 0);
-                const auto after = pool.GetFootprint();
-                EXPECT_EQ(pool.OutstandingAllocations(), payload_allocations);
                 const double wall_ns = std::chrono::duration<double, std::nano>(finish - start).count();
                 const double cpu_ns = static_cast<double>(CpuNanoseconds(cpu_end) - CpuNanoseconds(cpu_start));
                 std::printf("buffer-span source=%s blocks=%zu operations=%zu "
-                            "wall_ns_per_operation=%.3f cpu_ns_per_operation=%.3f "
-                            "committed_before=%zu committed_after=%zu used_after=%zu\n",
+                            "wall_ns_per_operation=%.3f cpu_ns_per_operation=%.3f\n",
                     from_multibuffer ? "multibuffer" : "descriptors", blocks, iterations,
-                    wall_ns / iterations, cpu_ns / iterations,
-                    before.committed_bytes, after.committed_bytes, after.used_bytes);
+                    wall_ns / iterations, cpu_ns / iterations);
             }
         }
-        ASSERT_EQ(pool.OutstandingAllocations(), 0u);
     }
-    pool.Collect();
+    memory::CollectThreadHeap();
 }
 
 uint64_t FillAndDrain(memory::RingDeque<uint64_t>& queue,
@@ -261,42 +230,34 @@ uint64_t FillAndDrain(memory::RingDeque<uint64_t>& queue,
 }
 
 TEST(RingDequeBenchmark, TrackedFillAndDrain) {
-    memory::worker_memory pool;
     for (const std::size_t batch : {1u, 8u, 64u}) {
         SCOPED_TRACE(batch);
-        pool.Collect();
-        memory::RingDeque<uint64_t> queue(pool.resource());
+        memory::CollectThreadHeap();
+        memory::RingDeque<uint64_t> queue;
         for (std::size_t value = 0; value < batch; ++value) queue.push_back(value);
         for (std::size_t value = 0; value < batch; ++value) {
             ASSERT_EQ(queue.front(), value);
             queue.pop_front();
         }
         ASSERT_EQ(queue.capacity(), 0u);
-        ASSERT_EQ(pool.OutstandingAllocations(), 0u);
         constexpr std::size_t warmup = 128;
         const std::size_t iterations = 262144 / batch;
         const uint64_t batch_sum = batch * (batch - 1) / 2;
         ASSERT_EQ(FillAndDrain(queue, batch, warmup), warmup * batch_sum);
-        const auto before = pool.GetFootprint();
         timespec cpu_start{}, cpu_end{};
         ASSERT_EQ(::clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu_start), 0);
         const auto start = std::chrono::steady_clock::now();
         const auto checksum = FillAndDrain(queue, batch, iterations);
         const auto finish = std::chrono::steady_clock::now();
         ASSERT_EQ(::clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu_end), 0);
-        const auto after = pool.GetFootprint();
         EXPECT_EQ(checksum, iterations * batch_sum);
         EXPECT_EQ(queue.capacity(), 0u);
-        EXPECT_EQ(pool.OutstandingAllocations(), 0u);
         const double wall_ns = std::chrono::duration<double, std::nano>(finish - start).count();
         const double cpu_ns = static_cast<double>(CpuNanoseconds(cpu_end) - CpuNanoseconds(cpu_start));
         std::printf("ring-deque batch=%zu operations=%zu "
-                    "wall_ns_per_operation=%.3f cpu_ns_per_operation=%.3f "
-                    "live_after=%zu committed_before=%zu committed_after=%zu used_after=%zu\n",
-            batch, iterations, wall_ns / iterations, cpu_ns / iterations,
-            pool.OutstandingAllocations(),
-            before.committed_bytes, after.committed_bytes, after.used_bytes);
+                    "wall_ns_per_operation=%.3f cpu_ns_per_operation=%.3f\n",
+            batch, iterations, wall_ns / iterations, cpu_ns / iterations);
     }
-    pool.Collect();
+    memory::CollectThreadHeap();
 }
 } // namespace

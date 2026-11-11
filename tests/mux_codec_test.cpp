@@ -33,12 +33,11 @@ void Check(bool condition, std::string_view message) {
 std::optional<::mux::FrameHeader> DecodeSplit(
     std::span<const uint8_t> frame,
     size_t split) {
-    ::memory::worker_memory pool;
     ::buf::MultiBuffer buffers;
     ::buf::MultiBuffer suffix;
     split = std::min(split, frame.size());
-    Check(::buf::AppendSpanToMultiBuffer(frame.first(split), buffers, pool) &&
-              ::buf::AppendSpanToMultiBuffer(frame.subspan(split), suffix, pool),
+    Check(::buf::AppendSpanToMultiBuffer(frame.first(split), buffers) &&
+              ::buf::AppendSpanToMultiBuffer(frame.subspan(split), suffix),
           "failed to allocate Mux test input");
     // A separate suffix keeps the split as a real Buffer boundary.
     suffix.MoveTo(buffers);
@@ -99,7 +98,6 @@ void CheckInvalidAcrossLayouts(
 }  // namespace
 
 TEST(MuxCodec, Contract) {
-    memory::worker_memory pool;
     constexpr size_t kMaxPayload = std::numeric_limits<uint16_t>::max();
     std::vector<uint8_t> maximum(kMaxPayload, 0x5a);
     std::vector<uint8_t> oversized(kMaxPayload + 1, 0x6b);
@@ -112,7 +110,7 @@ TEST(MuxCodec, Contract) {
     std::copy(
         large_xudp_packet.begin(), large_xudp_packet.end(), xudp_wire.begin() + 2);
     buf::MultiBuffer xudp_input;
-    Check(buf::AppendSpanToMultiBuffer(xudp_wire, xudp_input, pool),
+    Check(buf::AppendSpanToMultiBuffer(xudp_wire, xudp_input),
           "failed to allocate large XUDP fixture");
     buf::LengthPrefixedPacketBuffer xudp_decoder;
     xudp_decoder.Append(std::move(xudp_input));
@@ -130,7 +128,7 @@ TEST(MuxCodec, Contract) {
     xudp_decoder.Reset();
     const std::array<uint8_t, 5> empty_then_packet{0, 0, 0, 1, 0x4f};
     buf::MultiBuffer empty_input;
-    Check(buf::AppendSpanToMultiBuffer(empty_then_packet, empty_input, pool),
+    Check(buf::AppendSpanToMultiBuffer(empty_then_packet, empty_input),
           "failed to allocate empty XUDP fixture");
     xudp_decoder.Append(std::move(empty_input));
     Check(xudp_decoder.Pop(decoded_xudp_packet) ==
@@ -146,7 +144,7 @@ TEST(MuxCodec, Contract) {
                                   std::vector<uint8_t>{0, 2, 0x41}}) {
         xudp_decoder.Reset();
         buf::MultiBuffer input;
-        Check(buf::AppendSpanToMultiBuffer(truncated, input, pool),
+        Check(buf::AppendSpanToMultiBuffer(truncated, input),
               "failed to allocate truncated XUDP fixture");
         xudp_decoder.Append(std::move(input));
         Check(xudp_decoder.Pop(decoded_xudp_packet) ==

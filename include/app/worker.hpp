@@ -56,14 +56,13 @@ struct DetectRule;
 namespace worker_detail {
 
 // Worker-private owner for one inbound tag's TCP acceptors.
-class TcpListenerOwner final : public memory::WorkerAllocated {
+class TcpListenerOwner final {
 public:
     // Handles remain Worker-local; accept loops retain them only until a
     // close/cancel completion has resumed and observed owner-map retirement.
     using AcceptorPtr = std::shared_ptr<tcp::acceptor>;
 
-    explicit TcpListenerOwner(memory::worker_memory& pool)
-        : pool_(pool), acceptors_(pool.resource()) {}
+    TcpListenerOwner() = default;
     ~TcpListenerOwner() noexcept { Close(); }
 
     TcpListenerOwner(const TcpListenerOwner&) = delete;
@@ -80,8 +79,8 @@ public:
     [[nodiscard]] AcceptorPtr CreateAcceptor(std::string_view listener_key,
                                              net::io_context& io_context) {
         if (acceptors_.contains(listener_key)) return nullptr;
-        auto acceptor = memory::AllocateShared<tcp::acceptor>(pool_.resource(), io_context);
-        acceptors_.try_emplace(memory::String(listener_key, pool_.resource()), acceptor);
+        auto acceptor = std::make_shared<tcp::acceptor>(io_context);
+        acceptors_.try_emplace(memory::String(listener_key), acceptor);
         return acceptor;
     }
 
@@ -107,7 +106,6 @@ public:
     }
 
 private:
-    memory::worker_memory& pool_;
     memory::UnorderedMap<memory::String, AcceptorPtr,
                                    TransparentStringHash, TransparentStringEq> acceptors_;
 };
@@ -137,8 +135,6 @@ public:
     // ── 基本访问 ─────────────────────────────────────────────────────────────
 
     [[nodiscard]] uint32_t Id() const noexcept { return id_; }
-    // The Worker pool; owner-thread use only (see memory::worker_memory).
-    [[nodiscard]] memory::worker_memory& Pool() noexcept { return pool_; }
 
     // Cross-thread control-plane entries. Full mailbox throws WorkerMailboxFull;
     // after RequestStop admission throws operation_aborted. PostTask carries a
@@ -210,7 +206,6 @@ public:
 
     // Resource traversal is requested only by the low-frequency diagnostics loop.
     [[nodiscard]] WorkerRuntimeStatsSnapshot CollectRuntimeStats(bool include_resources) const;
-    void CollectHeap();
 
 private:
     struct ListenerSlot;
@@ -223,9 +218,6 @@ private:
 
     // ── 成员 ────────────────────────────────────────────────────────────────
 
-    // Declared first: destroyed after the runtime, mailbox and coordinator have
-    // released every block they borrowed from it.
-    memory::worker_memory pool_;
     uint32_t              id_;
     net::io_context& io_context_;
     std::atomic<bool> stop_requested_{false};

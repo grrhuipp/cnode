@@ -129,7 +129,7 @@ public:
     [[nodiscard]] std::optional<DetachedTlsState> DetachForHandoff(
         std::span<const uint8_t> plaintext_prefix = {});
     [[nodiscard]] static std::unique_ptr<TlsStream> RestoreFromHandoff(
-        memory::worker_memory& pool, net::io_context& io_context, DetachedTlsState state);
+        net::io_context& io_context, DetachedTlsState state);
 protected:
     TcpStream* BaseTcpStream() override;
     const TcpStream* BaseTcpStream() const override;

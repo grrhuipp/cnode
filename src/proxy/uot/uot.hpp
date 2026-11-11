@@ -74,8 +74,7 @@ ReadUotRequestHeader(
     Version version,
     transport::MultiBufferReader& reader,
     buf::MultiBuffer pending,
-    ErrorCode v1_eof_error,
-    memory::worker_memory& pool);
+    ErrorCode v1_eof_error);
 
 [[nodiscard]] net::awaitable<RelayResult> DispatchPreparedUotRequest(
     PreparedRequest prepared,
@@ -96,21 +95,18 @@ public:
         return transport::EofAction::CloseLink;
     }
 
-    PacketReader(memory::worker_memory& pool,
-                 transport::MultiBufferReader& reader,
+    PacketReader(transport::MultiBufferReader& reader,
                  bool is_connect,
                  TargetAddress destination,
                  buf::MultiBuffer pending = {});
 
-    PacketReader(memory::worker_memory& pool,
-                 transport::MultiBufferReader& reader,
+    PacketReader(transport::MultiBufferReader& reader,
                  PreparedRequest prepared);
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override;
 
     [[nodiscard]] buf::MultiBuffer TakePending() noexcept;
 private:
-    memory::worker_memory& pool_;
     transport::MultiBufferReader& reader_;
     bool is_connect_ = false;
     // 非 connect 仅使用帧内地址，请求目标已由会话上下文拥有。
@@ -141,13 +137,12 @@ class FramedEndpoint final
     : public transport::MultiBufferReader
     , public transport::MultiBufferWriter {
 public:
-    FramedEndpoint(memory::worker_memory& pool,
-                   Underlying& underlying,
+    FramedEndpoint(Underlying& underlying,
                    bool is_connect,
                    TargetAddress destination,
                    buf::MultiBuffer pending = {})
         : underlying_(underlying)
-        , reader_(pool, underlying, is_connect, is_connect ? destination : TargetAddress{},
+        , reader_(underlying, is_connect, is_connect ? destination : TargetAddress{},
                   std::move(pending))
         , writer_(underlying, is_connect, std::move(destination)) {}
 

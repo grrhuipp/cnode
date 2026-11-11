@@ -27,11 +27,11 @@ using namespace std::chrono_literals;
 using ::transport::internet::DatagramSocket;
 using ::transport::internet::ReceivedDatagram;
 
-::buf::MultiBuffer MakePayload(std::span<const uint8_t> bytes, ::memory::worker_memory& pool) {
+::buf::MultiBuffer MakePayload(std::span<const uint8_t> bytes) {
     ::buf::MultiBuffer payload;
     std::size_t offset = 0;
     while (offset < bytes.size()) {
-        ::buf::BufferGuard buffer{::buf::Buffer::New(pool)};
+        ::buf::BufferGuard buffer{::buf::Buffer::New()};
         if (!buffer) throw std::bad_alloc();
         const auto count = std::min<std::size_t>(buffer->Available(), bytes.size() - offset);
         std::memcpy(buffer->Tail().data(), bytes.data() + offset, count);
@@ -68,10 +68,9 @@ using ::transport::internet::ReceivedDatagram;
 }
 
 bool TestIndependentBindingsAndLargeScatter() {
-    ::memory::worker_memory pool;
     ::net::io_context io;
-    DatagramSocket receiver(pool, io, ::net::ip::address_v4::loopback());
-    DatagramSocket sender(pool, io, ::net::ip::address_v4::loopback());
+    DatagramSocket receiver(io, ::net::ip::address_v4::loopback());
+    DatagramSocket sender(io, ::net::ip::address_v4::loopback());
     const auto target = receiver.LocalEndpoint();
     if (target.port() == sender.LocalEndpoint().port() || DatagramSocket::ActiveCount() < 2)
         return false;
@@ -81,7 +80,7 @@ bool TestIndependentBindingsAndLargeScatter() {
     auto read = receiver.StartRead();
     auto receiving = ::net::co_spawn(io, read.Receive(), ::net::use_future);
     auto sending = ::net::co_spawn(io,
-        SendPayload(sender, target, MakePayload(bytes, pool)), ::net::use_future);
+        SendPayload(sender, target, MakePayload(bytes)), ::net::use_future);
     io.run();
     sending.get();
     ReceivedDatagram packet = receiving.get();
@@ -97,7 +96,7 @@ bool TestIndependentBindingsAndLargeScatter() {
 
     ::buf::MultiBuffer fragmented;
     for (uint8_t i = 0; i < 100; ++i) {
-        ::buf::BufferGuard buffer{::buf::Buffer::New(pool)};
+        ::buf::BufferGuard buffer{::buf::Buffer::New()};
         if (!buffer) return false;
         buffer->Tail()[0] = i;
         buffer->Produce(1);
@@ -139,10 +138,9 @@ bool TestIndependentBindingsAndLargeScatter() {
 }
 
 bool TestZeroLengthAndCancellationIsolation() {
-    ::memory::worker_memory pool;
     ::net::io_context io;
-    DatagramSocket first(pool, io, ::net::ip::address_v4::loopback());
-    DatagramSocket second(pool, io, ::net::ip::address_v4::loopback());
+    DatagramSocket first(io, ::net::ip::address_v4::loopback());
+    DatagramSocket second(io, ::net::ip::address_v4::loopback());
     const auto count = DatagramSocket::ActiveCount();
 
     auto cancelled_read = first.StartRead();
@@ -172,9 +170,8 @@ bool TestZeroLengthAndCancellationIsolation() {
 }
 
 bool TestParentCancellationPropagation() {
-    ::memory::worker_memory pool;
     ::net::io_context io;
-    DatagramSocket socket(pool, io, ::net::ip::address_v4::loopback());
+    DatagramSocket socket(io, ::net::ip::address_v4::loopback());
     ::net::cancellation_signal parent_cancel;
     auto future = ::net::co_spawn(io, ParentRead(socket),
         ::net::bind_cancellation_slot(parent_cancel.slot(), ::net::use_future));
@@ -198,16 +195,15 @@ bool TestParentCancellationPropagation() {
 }
 
 bool TestIPv6MaximumAndFamilyValidation() {
-    ::memory::worker_memory pool;
     ::net::io_context io;
-    DatagramSocket receiver(pool, io, ::net::ip::address_v6::loopback());
-    DatagramSocket sender(pool, io, ::net::ip::address_v6::loopback());
-    DatagramSocket v4(pool, io, ::net::ip::address_v4::loopback());
+    DatagramSocket receiver(io, ::net::ip::address_v6::loopback());
+    DatagramSocket sender(io, ::net::ip::address_v6::loopback());
+    DatagramSocket v4(io, ::net::ip::address_v4::loopback());
     std::vector<uint8_t> bytes(65527, 0xA5);
     auto read = receiver.StartRead();
     auto receiving = ::net::co_spawn(io, read.Receive(), ::net::use_future);
     auto sending = ::net::co_spawn(io,
-        SendPayload(sender, receiver.LocalEndpoint(), MakePayload(bytes, pool)), ::net::use_future);
+        SendPayload(sender, receiver.LocalEndpoint(), MakePayload(bytes)), ::net::use_future);
     io.run();
     sending.get();
     const auto packet = receiving.get();
@@ -217,7 +213,7 @@ bool TestIPv6MaximumAndFamilyValidation() {
     {
         auto invalid_family = sender.StartWrite();
         auto family_future = ::net::co_spawn(io,
-            invalid_family.SendTo(v4.LocalEndpoint(), MakePayload(std::span<const uint8_t>{}, pool)),
+            invalid_family.SendTo(v4.LocalEndpoint(), MakePayload(std::span<const uint8_t>{})),
             ::net::use_future);
         io.restart();
         io.run();
@@ -230,7 +226,7 @@ bool TestIPv6MaximumAndFamilyValidation() {
     std::vector<uint8_t> too_large(65528, 0x5A);
     auto invalid_size = sender.StartWrite();
     auto size_future = ::net::co_spawn(io,
-        invalid_size.SendTo(receiver.LocalEndpoint(), MakePayload(too_large, pool)),
+        invalid_size.SendTo(receiver.LocalEndpoint(), MakePayload(too_large)),
         ::net::use_future);
     io.restart();
     io.run();
@@ -244,16 +240,15 @@ bool TestIPv6MaximumAndFamilyValidation() {
 
 bool TestCloseAndReadScopeTimeout() {
     const auto baseline = DatagramSocket::ActiveCount();
-    ::memory::worker_memory pool;
     ::net::io_context io;
-    DatagramSocket receiver(pool, io, ::net::ip::address_v4::loopback());
-    DatagramSocket sender(pool, io, ::net::ip::address_v4::loopback());
+    DatagramSocket receiver(io, ::net::ip::address_v4::loopback());
+    DatagramSocket sender(io, ::net::ip::address_v4::loopback());
     receiver.SetReadTimeout(1s);
     auto operation = receiver.StartRead();
     auto first = ::net::co_spawn(io, operation.Receive(), ::net::use_future);
     const std::array<uint8_t, 1> one_byte{7};
     auto send_one = ::net::co_spawn(io,
-        SendPayload(sender, receiver.LocalEndpoint(), MakePayload(one_byte, pool)),
+        SendPayload(sender, receiver.LocalEndpoint(), MakePayload(one_byte)),
         ::net::use_future);
     io.run_for(100ms);
     send_one.get();
@@ -270,7 +265,7 @@ bool TestCloseAndReadScopeTimeout() {
     catch (const ::transport::LinkError&) { timed_out = true; }
     if (!timed_out || !receiver.ConsumeReadTimeout()) return false;
 
-    DatagramSocket closed(pool, io, ::net::ip::address_v4::loopback());
+    DatagramSocket closed(io, ::net::ip::address_v4::loopback());
     auto pending = closed.StartRead();
     auto pending_future = ::net::co_spawn(io, pending.Receive(), ::net::use_future);
     io.restart();
@@ -287,31 +282,29 @@ bool TestSocketLimitAndReclamation() {
     constexpr std::size_t limit = 4096;
     const auto baseline = DatagramSocket::ActiveCount();
     if (baseline >= limit) return false;
-    ::memory::worker_memory pool;
     ::net::io_context io;
     std::vector<std::unique_ptr<DatagramSocket>> sockets;
     sockets.reserve(limit - baseline);
     for (std::size_t i = baseline; i < limit; ++i)
-        sockets.push_back(std::make_unique<DatagramSocket>(pool, io, ::net::ip::address_v4::loopback()));
+        sockets.push_back(std::make_unique<DatagramSocket>(io, ::net::ip::address_v4::loopback()));
     bool rejected = false;
-    try { DatagramSocket extra(pool, io, ::net::ip::address_v4::loopback()); }
+    try { DatagramSocket extra(io, ::net::ip::address_v4::loopback()); }
     catch (const ::transport::LinkError& error) {
         rejected = error.code() == ::ErrorCode::RESOURCE_EXHAUSTED;
     }
     if (!rejected || DatagramSocket::ActiveCount() != limit) return false;
     sockets.pop_back();
     {
-        DatagramSocket replacement(pool, io, ::net::ip::address_v4::loopback());
+        DatagramSocket replacement(io, ::net::ip::address_v4::loopback());
         if (DatagramSocket::ActiveCount() != limit) return false;
     }
     sockets.clear();
     return DatagramSocket::ActiveCount() == baseline;
 }
 bool TestZeroLengthNativeSends() {
-    ::memory::worker_memory pool;
     ::net::io_context io;
-    DatagramSocket sender(pool, io, ::net::ip::address_v4::loopback());
-    DatagramSocket receiver(pool, io, ::net::ip::address_v4::loopback());
+    DatagramSocket sender(io, ::net::ip::address_v4::loopback());
+    DatagramSocket receiver(io, ::net::ip::address_v4::loopback());
     for (bool owned : {false, true}) {
         auto operation = receiver.StartRead();
         auto receiving = ::net::co_spawn(io, operation.Receive(), ::net::use_future);
@@ -362,9 +355,8 @@ TEST(DatagramSocket, Contract) {
 TEST(DatagramSocket, CancelledWriteDoesNotSend) {
     for (const bool owned : {false, true}) {
         SCOPED_TRACE(owned);
-        ::memory::worker_memory pool;
         ::net::io_context io;
-        DatagramSocket sender(pool, io, ::net::ip::address_v4::loopback());
+        DatagramSocket sender(io, ::net::ip::address_v4::loopback());
         ::udp::socket peer(io, {::net::ip::address_v4::loopback(), 0});
         peer.non_blocking(true);
         ::net::cancellation_signal cancellation;
@@ -376,7 +368,7 @@ TEST(DatagramSocket, CancelledWriteDoesNotSend) {
             co_await ::net::this_coro::throw_if_cancelled(false);
             auto operation = sender.StartWrite();
             cancellation.emit(::net::cancellation_type::terminal);
-            if (owned) co_await operation.SendTo(peer.local_endpoint(), MakePayload(payload, pool));
+            if (owned) co_await operation.SendTo(peer.local_endpoint(), MakePayload(payload));
             else co_await operation.SendTo(peer.local_endpoint(), buffers);
         };
         auto result = ::net::co_spawn(io, send(),

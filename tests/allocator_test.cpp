@@ -5,8 +5,6 @@
 #include "common/session.hpp"
 #include <algorithm>
 #include <array>
-#include <barrier>
-#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -20,8 +18,6 @@
 
 namespace {
 using namespace ::memory;
-using Pool = worker_memory;
-using namespace std::chrono_literals;
 
 bool Intact(void* p, size_t bytes, uint8_t pattern) {
     const auto* data = static_cast<const uint8_t*>(p);
@@ -29,162 +25,27 @@ bool Intact(void* p, size_t bytes, uint8_t pattern) {
     return true;
 }
 
-bool RunBoundaries() {
-    Pool pool;
-    for (size_t bytes = 0; bytes <= 16 * 1024 + 32; ++bytes) {
-        void* p = pool.Allocate(bytes, 16);
-        if (!p || reinterpret_cast<uintptr_t>(p) % 16) return false;
-        std::memset(p, 0xa5, bytes);
-        pool.Deallocate(p, bytes, 16);
-    }
-    for (size_t bytes : {1u, 24u, 31u, 128u, 2048u, 4000u, 8192u, 17408u, 32768u, 65536u}) {
-        for (size_t alignment = 1; alignment <= 65536; alignment *= 2) {
-            for (int round = 0; round < 8; ++round) {
-                void* p = pool.Allocate(bytes, alignment);
-                if (!p || reinterpret_cast<uintptr_t>(p) % alignment) return false;
-                std::memset(p, 0x6b, bytes);
-                pool.Deallocate(p, bytes, alignment);
-            }
-        }
-    }
-    constexpr auto maximum = std::numeric_limits<size_t>::max();
-    return !pool.Allocate(maximum, 16) && !pool.Allocate(maximum - 8, 16) &&
-        !pool.Allocate(1024, 0) && !pool.Allocate(1024, 3) &&
-        !pool.Allocate(1024, maximum) && pool.OutstandingAllocations() == 0;
-}
-
-bool RunMixed() {
-    Pool pool;
-    struct Slot { void* ptr = nullptr; size_t bytes = 0; size_t alignment = 0; uint8_t pattern = 0; };
-    std::array<Slot, 256> slots{};
-    size_t live = 0;
-    uint32_t state = 0xb35dff21u;
-    const auto next = [&state] {
-        state ^= state << 13; state ^= state >> 17; state ^= state << 5;
-        return state;
-    };
-    for (int step = 0; step < 100000; ++step) {
-        auto& slot = slots[next() % slots.size()];
-        if (slot.ptr) {
-            if (!Intact(slot.ptr, slot.bytes, slot.pattern)) return false;
-            pool.Deallocate(slot.ptr, slot.bytes, slot.alignment);
-            slot.ptr = nullptr;
-            --live;
-        } else {
-            slot.bytes = 8 + next() % (step % 5 ? 2000 : 34000);
-            slot.alignment = step % 8 ? (next() % 2 ? 8 : 16) : size_t{1} << (3 + next() % 8);
-            slot.pattern = static_cast<uint8_t>(next());
-            slot.ptr = pool.Allocate(slot.bytes, slot.alignment);
-            if (!slot.ptr || reinterpret_cast<uintptr_t>(slot.ptr) % slot.alignment) return false;
-            std::memset(slot.ptr, slot.pattern, slot.bytes);
-            ++live;
-        }
-        if (step % 997 == 0 && pool.OutstandingAllocations() != live) return false;
-        if (step % 97 == 0) for (const auto& held : slots)
-            if (held.ptr && !Intact(held.ptr, held.bytes, held.pattern)) return false;
-    }
-    for (const auto& slot : slots) {
-        if (slot.ptr && !Intact(slot.ptr, slot.bytes, slot.pattern)) return false;
-        pool.Deallocate(slot.ptr, slot.bytes, slot.alignment);
-    }
-    pool.Collect();
-    return pool.OutstandingAllocations() == 0;
-}
-
-bool RunCollectReleasesEmptyPages() {
-    Pool pool;
-    std::vector<void*> blocks;
-    for (size_t i = 0; i < 4096; ++i) {
-        void* p = pool.Allocate(i % 2 ? 96 : 8192, 16);
-        if (!p) return false;
-        blocks.push_back(p);
-    }
-    const auto loaded = pool.GetFootprint();
-    if (pool.OutstandingAllocations() != blocks.size() || loaded.pages == 0 ||
-        loaded.committed_bytes < loaded.used_bytes) return false;
-    for (auto* p : blocks) pool.Deallocate(p);
-    pool.Collect();
-    const auto collected = pool.GetFootprint();
-    return pool.OutstandingAllocations() == 0 && collected.used_bytes == 0 &&
-        collected.committed_bytes < loaded.committed_bytes;
-}
-
-bool RunOwnershipAndPmr() {
-    Pool pool;
-    void* p = pool.Allocate(8192, 16);
-    if (!p || pool.OutstandingAllocations() != 1) return false;
-    std::memset(p, 0xa5, 8192);
-    pool.Deallocate(p);
-    if (pool.OutstandingAllocations() != 0) return false;
-    reject_next_pmr_allocation = true;
-    if (pool.Allocate(17, 16) || reject_next_pmr_allocation) return false;
-    for (size_t alignment : {8u, 16u, 64u, 4096u}) {
-        p = pool.Allocate(17408, alignment);
-        if (!p || reinterpret_cast<uintptr_t>(p) % alignment) return false;
-        pool.Deallocate(p);
-    }
-    return pool.OutstandingAllocations() == 0 &&
-        !pool.Allocate(std::numeric_limits<size_t>::max(), 16);
-}
 
 bool RunBuffer() {
     using ::buf::Buffer;
-    Pool pool;
+    const auto live_before = detail::test_buffers_live;
     std::array<Buffer*, 64> buffers{};
     for (auto& p : buffers) {
-        p = Buffer::New(pool);
-        if (!p || p->Len() || p->HasUDP() || &p->Pool() != &pool) return false;
+        p = Buffer::New();
+        if (!p || p->Len() || p->HasUDP()) return false;
         std::memset(p->data, 0x5a, Buffer::kSize);
         p->Produce(1);
     }
-    if (pool.OutstandingAllocations() != buffers.size()) return false;
+    if (detail::test_buffers_live != live_before + buffers.size()) return false;
     Buffer::Free(buffers.back());
-    buffers.back() = Buffer::New(pool);
+    buffers.back() = Buffer::New();
     if (!buffers.back() || buffers.back()->Len() || buffers.back()->HasUDP()) return false;
     for (size_t i = 0; i + 1 < buffers.size(); ++i)
         if (!Intact(buffers[i]->data, Buffer::kSize, 0x5a)) return false;
     for (auto* p : buffers) Buffer::Free(p);
-    return pool.OutstandingAllocations() == 0;
+    return detail::test_buffers_live == live_before;
 }
 
-bool RunSharedAllocation() {
-    struct alignas(64) SharedObject final
-        : WorkerAllocated, std::enable_shared_from_this<SharedObject> {
-        SharedObject(std::unique_ptr<int> payload, int& destroyed)
-            : payload(std::move(payload)), destroyed(destroyed) {}
-        ~SharedObject() { ++destroyed; }
-        std::unique_ptr<int> payload;
-        int& destroyed;
-    };
-    struct ThrowingObject final : WorkerAllocated {
-        ThrowingObject() { throw std::runtime_error("construction failed"); }
-    };
-
-    Pool pool;
-    int destroyed = 0;
-    bool passed = true;
-    std::weak_ptr<SharedObject> weak;
-    {
-        auto object = AllocateShared<SharedObject>(pool.resource(), std::make_unique<int>(42), destroyed);
-        weak = object;
-        passed &= *object->payload == 42 &&
-            reinterpret_cast<uintptr_t>(object.get()) % alignof(SharedObject) == 0 &&
-            object->shared_from_this() == object && pool.OutstandingAllocations() == 1;
-    }
-    // The control block outlives the object while a weak reference remains.
-    passed &= destroyed == 1 && weak.expired() && pool.OutstandingAllocations() == 1;
-    weak.reset();
-    passed &= pool.OutstandingAllocations() == 0;
-
-    bool threw = false;
-    try {
-        (void)AllocateShared<ThrowingObject>(pool.resource());
-    } catch (const std::runtime_error&) {
-        threw = true;
-    }
-    passed &= threw && pool.OutstandingAllocations() == 0;
-    return passed;
-}
 
 class CountingResource final : public std::pmr::memory_resource {
 public:
@@ -245,60 +106,8 @@ struct AllocatorAwareEntry {
     }
 };
 
-bool RunSessionContextAndIdleDeque() {
-    Pool worker;
-    bool passed = true;
-    {
-        ::session::Context ctx(worker);
-        passed &= ctx.inbound.tag.get_allocator().resource() == worker.resource() &&
-            ctx.content.protocol.get_allocator().resource() == worker.resource();
-        ctx.inbound.tag = "panel/multi-tier-arena-test/node-100/vless/443";
-        ctx.inbound.user_email = "arena-user-with-long-identifier@example.com";
-        passed &= worker.OutstandingAllocations() == 2;
-    }
-    passed &= worker.OutstandingAllocations() == 0;
-    {
-        RingDeque<int> idle_deque(worker.resource());
-        passed &= worker.OutstandingAllocations() == 0 && idle_deque.capacity() == 0;
-        for (int i = 0; i < 16; ++i) idle_deque.push_back(i);
-        for (int i = 0; i < 16; ++i) {
-            passed &= idle_deque.front() == i;
-            idle_deque.pop_front();
-        }
-        passed &= idle_deque.empty() && idle_deque.capacity() == 0 &&
-            worker.OutstandingAllocations() == 0;
-    }
-    return passed;
-}
 
-bool RunAll() {
-    struct Case { const char* name; bool (*run)(); };
-    for (const auto& test : std::array{
-        Case{"boundaries/alignment/overflow", RunBoundaries},
-        Case{"mixed lifetime", RunMixed},
-        Case{"collect releases empty pages", RunCollectReleasesEmptyPages},
-        Case{"ownership/PMR/OOM", RunOwnershipAndPmr}, Case{"Buffer", RunBuffer},
-        Case{"shared allocation/alignment/exception", RunSharedAllocation},
-        Case{"session context and idle deque", RunSessionContextAndIdleDeque}}) {
-        if (!test.run()) {
-            std::fprintf(stderr, "pool case failed: %s\n", test.name);
-            return false;
-        }
-    }
-    return true;
-}
-} // namespace
-
-TEST(WorkerMemory, Contract) {
-    bool worker = false;
-    std::thread thread([&] { worker = RunAll(); });
-    thread.join();
-    const bool main = RunAll();
-    std::printf("unified pool layout/ownership/reuse/purge: %s\n", worker && main ? "PASS" : "FAIL");
-    { ASSERT_TRUE(worker && main); return; }
-}
-
-TEST(WorkerMemory, NestedDequeMovePreservesDescendantsAndResourceOwnership) {
+TEST(Allocator, NestedDequeMovePreservesDescendantsAndResourceOwnership) {
     CountingResource outer_resource;
     CountingResource child_resource;
     memory::RingDeque<NestedDequeEntry> queue(&outer_resource);
@@ -336,7 +145,7 @@ TEST(WorkerMemory, NestedDequeMovePreservesDescendantsAndResourceOwnership) {
     EXPECT_EQ(child_resource.live_bytes, 0u);
 }
 
-TEST(WorkerMemory, AllocatorAwareDequeGrowthPreservesPayloadsAcrossAllocationFailures) {
+TEST(Allocator, AllocatorAwareDequeGrowthPreservesPayloadsAcrossAllocationFailures) {
     for (std::size_t allowance = 0; allowance <= 3; ++allowance) {
         SCOPED_TRACE(allowance);
         CountingResource resource;
@@ -365,7 +174,7 @@ TEST(WorkerMemory, AllocatorAwareDequeGrowthPreservesPayloadsAcrossAllocationFai
     }
 }
 
-TEST(WorkerMemory, AllocatorAwareDequeShrinkPreservesPayloadsAndReclaimsStorage) {
+TEST(Allocator, AllocatorAwareDequeShrinkPreservesPayloadsAndReclaimsStorage) {
     ASSERT_EXIT({
         CountingResource resource;
         memory::RingDeque<AllocatorAwareEntry> queue(&resource);
@@ -395,7 +204,7 @@ TEST(WorkerMemory, AllocatorAwareDequeShrinkPreservesPayloadsAndReclaimsStorage)
     }, ::testing::ExitedWithCode(0), "");
 }
 
-TEST(WorkerMemory, AllocatorAwareDequeInsertionKeepsDestinationResource) {
+TEST(Allocator, AllocatorAwareDequeInsertionKeepsDestinationResource) {
     CountingResource source;
     CountingResource destination;
     {
@@ -418,10 +227,10 @@ TEST(WorkerMemory, AllocatorAwareDequeInsertionKeepsDestinationResource) {
     EXPECT_EQ(destination.live, 0u);
 }
 
-TEST(WorkerMemory, ByteVectorInsertPreservesReservedAndGrowingPrefixes) {
-    Pool pool;
+TEST(Allocator, ByteVectorInsertPreservesReservedAndGrowingPrefixes) {
+    CountingResource resource;
     {
-        memory::Vector<uint8_t> bytes(pool.resource());
+        memory::Vector<uint8_t> bytes(&resource);
         std::vector<uint8_t> expected;
         bytes.reserve(1024);
         for (const std::size_t count : {64u, 900u, 1024u, 16384u, 65536u}) {
@@ -432,16 +241,16 @@ TEST(WorkerMemory, ByteVectorInsertPreservesReservedAndGrowingPrefixes) {
             expected.insert(expected.end(), input.begin(), input.end());
             ASSERT_EQ(bytes.size(), expected.size());
             EXPECT_TRUE(std::equal(expected.begin(), expected.end(), bytes.begin()));
-            EXPECT_EQ(bytes.get_allocator().resource(), pool.resource());
+            EXPECT_EQ(bytes.get_allocator().resource(), &resource);
         }
         bytes.clear();
         bytes.insert(bytes.end(), expected.begin(), expected.end());
         EXPECT_TRUE(std::equal(expected.begin(), expected.end(), bytes.begin(), bytes.end()));
     }
-    EXPECT_EQ(pool.OutstandingAllocations(), 0u);
+    EXPECT_EQ(resource.live, 0u);
 }
 
-TEST(WorkerMemory, VectorPairAndMapConstructionPropagatesNestedAllocators) {
+TEST(Allocator, VectorPairAndMapConstructionPropagatesNestedAllocators) {
     CountingResource destination;
     {
         // The destination differs from the process layer, so default construction
@@ -491,7 +300,7 @@ TEST(WorkerMemory, VectorPairAndMapConstructionPropagatesNestedAllocators) {
     EXPECT_EQ(destination.allocations, destination.returns);
 }
 
-TEST(WorkerMemory, TrivialCopyStillUsesAllocatorExtendedConstruction) {
+TEST(Allocator, TrivialCopyStillUsesAllocatorExtendedConstruction) {
     struct Entry {
         using allocator_type = std::pmr::polymorphic_allocator<std::byte>;
         std::pmr::memory_resource* resource;
@@ -517,3 +326,191 @@ TEST(WorkerMemory, TrivialCopyStillUsesAllocatorExtendedConstruction) {
     }
     EXPECT_EQ(destination.live, 0u);
 }
+
+TEST(Allocator, DefaultContainersUseProcessResourceWithoutChangingGlobalPmrDefault) {
+    CountingResource external_default;
+    struct DefaultGuard {
+        std::pmr::memory_resource* previous;
+        ~DefaultGuard() { std::pmr::set_default_resource(previous); }
+    } guard{std::pmr::set_default_resource(&external_default)};
+    auto* const resource = process_resource();
+    EXPECT_EQ(std::pmr::get_default_resource(), &external_default);
+    EXPECT_EQ(Allocator<int>().resource(), resource);
+    EXPECT_EQ(ProcessAllocator<int>().resource(), resource);
+    EXPECT_EQ(Allocator<int>(nullptr).resource(), resource);
+    Vector<int> values;
+    values.push_back(42);
+    String text(100, 'x');
+    RingDeque<int> queue;
+    queue.push_back(71);
+    ::session::Context context;
+    context.inbound.tag = "process-default-inbound-tag-longer-than-sso";
+    context.content.protocol = "process-default-protocol-longer-than-sso";
+    EXPECT_EQ(values.get_allocator().resource(), resource);
+    EXPECT_EQ(text.get_allocator().resource(), resource);
+    EXPECT_EQ(queue.get_allocator().resource(), resource);
+    EXPECT_EQ(context.inbound.tag.get_allocator().resource(), resource);
+    EXPECT_EQ(context.content.protocol.get_allocator().resource(), resource);
+    EXPECT_EQ(values.front(), 42);
+    EXPECT_EQ(queue.front(), 71);
+    EXPECT_EQ(external_default.allocations, 0u);
+    EXPECT_EQ(std::pmr::get_default_resource(), &external_default);
+}
+
+TEST(Allocator, ProcessResourcePreservesAlignmentAndMixedLivePayloads) {
+    auto* const resource = process_resource();
+    for (size_t bytes : {0u, 1u, 24u, 31u, 128u, 2048u, 4000u, 8192u, 17408u, 32768u, 65536u}) {
+        for (size_t alignment = 1; alignment <= 65536; alignment *= 2) {
+            void* block = resource->allocate(bytes, alignment);
+            const bool aligned = reinterpret_cast<uintptr_t>(block) % alignment == 0;
+            std::memset(block, 0x6b, bytes);
+            const bool intact = Intact(block, bytes, 0x6b);
+            resource->deallocate(block, bytes, alignment);
+            ASSERT_TRUE(aligned && intact);
+        }
+    }
+    struct Slot {
+        void* block = nullptr;
+        size_t bytes = 0, alignment = 0;
+        uint8_t pattern = 0;
+    };
+    std::array<Slot, 256> slots{};
+    bool intact = true;
+    uint32_t state = 0xb35dff21u;
+    const auto next = [&] {
+        state ^= state << 13; state ^= state >> 17; state ^= state << 5;
+        return state;
+    };
+    for (int step = 0; step < 100000; ++step) {
+        auto& slot = slots[next() % slots.size()];
+        if (slot.block) {
+            intact &= Intact(slot.block, slot.bytes, slot.pattern);
+            resource->deallocate(slot.block, slot.bytes, slot.alignment);
+            slot.block = nullptr;
+        } else {
+            slot.bytes = 8 + next() % (step % 5 ? 2000 : 34000);
+            slot.alignment = size_t{1} << (3 + next() % 8);
+            slot.pattern = static_cast<uint8_t>(next());
+            slot.block = resource->allocate(slot.bytes, slot.alignment);
+            intact &= reinterpret_cast<uintptr_t>(slot.block) % slot.alignment == 0;
+            std::memset(slot.block, slot.pattern, slot.bytes);
+        }
+        if (step % 97 == 0)
+            for (const auto& held : slots)
+                if (held.block) intact &= Intact(held.block, held.bytes, held.pattern);
+    }
+    for (const auto& slot : slots) {
+        if (!slot.block) continue;
+        intact &= Intact(slot.block, slot.bytes, slot.pattern);
+        resource->deallocate(slot.block, slot.bytes, slot.alignment);
+    }
+    EXPECT_TRUE(intact);
+}
+
+TEST(Allocator, ProcessResourceCanRetireRawStorageOnAnotherThread) {
+    auto* const resource = process_resource();
+    void* block = resource->allocate(17408, 4096);
+    std::memset(block, 0xa5, 17408);
+    bool intact = false;
+    std::thread retire([&] {
+        intact = Intact(block, 17408, 0xa5);
+        resource->deallocate(block, 17408, 4096);
+    });
+    retire.join();
+    EXPECT_TRUE(intact);
+}
+
+TEST(Allocator, BufferReusePreservesLivePayloadsAndAllocationFailureReturnsNull) {
+    EXPECT_TRUE(RunBuffer());
+    const auto live_before = detail::test_buffers_live;
+    const auto rejected_before = rejected_process_allocations;
+    reject_next_process_allocation = true;
+    auto* block = ::buf::Buffer::New();
+    const bool consumed = !reject_next_process_allocation;
+    reject_next_process_allocation = false;
+    if (block) ::buf::Buffer::Free(block);
+    EXPECT_EQ(block, nullptr);
+    EXPECT_TRUE(consumed);
+    EXPECT_EQ(rejected_process_allocations, rejected_before + 1);
+    EXPECT_EQ(detail::test_buffers_live, live_before);
+}
+
+TEST(Allocator, SharedAllocationPreservesAlignmentWeakLifetimeAndConstructorRollback) {
+    struct alignas(64) SharedObject : std::enable_shared_from_this<SharedObject> {
+        SharedObject(std::unique_ptr<int> payload, int& destroyed)
+            : payload(std::move(payload)), destroyed(destroyed) {}
+        ~SharedObject() { ++destroyed; }
+        std::unique_ptr<int> payload;
+        int& destroyed;
+    };
+    struct ThrowingObject {
+        ThrowingObject() { throw std::runtime_error("construction failed"); }
+    };
+    CountingResource resource;
+    int destroyed = 0;
+    std::weak_ptr<SharedObject> weak;
+    {
+        auto object = std::allocate_shared<SharedObject>(Allocator<SharedObject>(&resource),
+            std::make_unique<int>(42), destroyed);
+        weak = object;
+        EXPECT_EQ(*object->payload, 42);
+        EXPECT_EQ(reinterpret_cast<uintptr_t>(object.get()) % alignof(SharedObject), 0u);
+        EXPECT_EQ(object->shared_from_this(), object);
+        EXPECT_EQ(resource.live, 1u);
+    }
+    EXPECT_EQ(destroyed, 1);
+    EXPECT_TRUE(weak.expired());
+    EXPECT_EQ(resource.live, 1u);
+    weak.reset();
+    EXPECT_EQ(resource.live, 0u);
+    EXPECT_THROW((void)std::allocate_shared<ThrowingObject>(Allocator<ThrowingObject>(&resource)),
+        std::runtime_error);
+    EXPECT_EQ(resource.live, 0u);
+    EXPECT_EQ(resource.allocations, resource.returns);
+}
+
+TEST(Allocator, IdleDequeReleasesCallerOwnedStorageOnDrain) {
+    CountingResource resource;
+    RingDeque<int> queue(&resource);
+    EXPECT_EQ(queue.capacity(), 0u);
+    EXPECT_EQ(resource.live, 0u);
+    for (int value = 0; value < 16; ++value) queue.push_back(value);
+    for (int value = 0; value < 16; ++value) {
+        EXPECT_EQ(queue.front(), value);
+        queue.pop_front();
+    }
+    EXPECT_TRUE(queue.empty());
+    EXPECT_EQ(queue.capacity(), 0u);
+    EXPECT_EQ(resource.live, 0u);
+    EXPECT_EQ(resource.live_bytes, 0u);
+}
+
+TEST(Allocator, DefaultVectorAllocationFailurePreservesPayloadAndCanRetry) {
+    Vector<uint8_t> bytes;
+    bytes.reserve(8);
+    for (uint8_t value = 0; value < 8; ++value) bytes.push_back(value);
+    const std::array<uint8_t, 8> expected{0, 1, 2, 3, 4, 5, 6, 7};
+    const auto* const storage = bytes.data();
+    const auto capacity = bytes.capacity();
+    const auto rejected_before = rejected_process_allocations;
+    reject_next_process_allocation = true;
+    bool failed = false;
+    try { bytes.reserve(capacity + 1); }
+    catch (const std::bad_alloc&) { failed = true; }
+    const bool consumed = !reject_next_process_allocation;
+    reject_next_process_allocation = false;
+    EXPECT_TRUE(failed && consumed);
+    EXPECT_EQ(rejected_process_allocations, rejected_before + 1);
+    EXPECT_EQ(bytes.data(), storage);
+    EXPECT_EQ(bytes.capacity(), capacity);
+    EXPECT_TRUE(std::equal(bytes.begin(), bytes.end(), expected.begin(), expected.end()));
+    bytes.reserve(capacity + 1);
+    bytes.push_back(0x91);
+    ASSERT_EQ(bytes.size(), expected.size() + 1);
+    EXPECT_TRUE(std::equal(expected.begin(), expected.end(), bytes.begin()));
+    EXPECT_EQ(bytes.back(), 0x91);
+    EXPECT_THROW(bytes.reserve(std::numeric_limits<size_t>::max()), std::length_error);
+    EXPECT_EQ(bytes.size(), expected.size() + 1);
+    EXPECT_EQ(bytes.back(), 0x91);
+}
+} // namespace

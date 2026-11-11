@@ -28,8 +28,7 @@ public:
     Http1BodyStream(std::unique_ptr<AsyncStream> inner,
                     const Http1ReadFraming& read_framing,
                     bool write_chunked)
-        : AsyncStream(inner->Pool())
-        , inner_(std::move(inner))
+        : inner_(std::move(inner))
         , read_chunked_(std::holds_alternative<Http1BodyChunked>(read_framing))
         , write_chunked_(write_chunked) {
         if (const auto* length = std::get_if<Http1BodyContentLength>(&read_framing)) {
@@ -575,7 +574,7 @@ net::awaitable<tl::expected<void, ErrorCode>> ReadHttp1MessageHead(
                 stream.PrependReadMultiBuffer(std::move(mb));
             }
         } else {
-            head.storage = buf::BufferGuard{buf::Buffer::New(stream.Pool())};
+            head.storage = buf::BufferGuard{buf::Buffer::New()};
             if (!head.storage) {
                 co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
             }
@@ -984,9 +983,7 @@ std::unique_ptr<AsyncStream> MakeHttp1BodyStream(
     Http1ReadFraming read_framing,
     bool write_chunked,
     buf::MultiBuffer&& read_ahead) {
-    auto& pool = inner->Pool();
-    auto body = memory::MakeUnique<Http1BodyStream>(
-        pool, std::move(inner), read_framing, write_chunked);
+    auto body = std::make_unique<Http1BodyStream>(std::move(inner), read_framing, write_chunked);
     body->SetPendingMultiBuffer(std::move(read_ahead));
     return body;
 }
@@ -1273,8 +1270,7 @@ net::awaitable<TransportBuildResult> DoWsServerHandshake(
     }
 
     // HTTP 头之后已读到的字节属于 WebSocket 帧流
-    auto& pool = stream->Pool();
-    auto ws = memory::MakeUnique<BaseWsStream>(pool, std::move(stream), false);
+    auto ws = std::make_unique<BaseWsStream>(std::move(stream), false);
     const size_t pending_bytes = head->ReadAhead().size();
     if (auto read_ahead = head->TakeReadAheadMultiBuffer(); !read_ahead.empty()) {
         ws->SetPendingMultiBuffer(std::move(read_ahead));

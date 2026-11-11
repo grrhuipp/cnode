@@ -83,8 +83,7 @@ public:
 
     XHttpPacketUpServerStream(std::shared_ptr<XHttpPacketUpSession> session,
                               std::unique_ptr<AsyncStream> downlink)
-        : AsyncStream(downlink->Pool())
-        , session_(std::move(session))
+        : session_(std::move(session))
         , downlink_(std::move(downlink))
         , deadline_(session_->IoContext(), *this) {
         session_cancel_.Resubscribe(session_->Cancellation());
@@ -268,8 +267,7 @@ public:
     XHttpUploadClientStream(net::any_io_executor executor,
                            net::execution_context& services,
                            std::unique_ptr<AsyncStream> stream)
-        : AsyncStream(stream->Pool())
-        , state_(memory::AllocateShared<SharedState>(stream->Pool().resource(), std::move(stream))) {
+        : state_(std::make_shared<SharedState>(std::move(stream))) {
         net::use_service<XHttpClientTaskOwner>(services).Spawn(
             std::move(executor), DrainOwned(state_), drain_cancellation_);
     }
@@ -314,7 +312,7 @@ protected:
     const TcpStream* BaseTcpStream() const override { return BaseTcpStreamOf(*state_->stream); }
 
 private:
-    struct SharedState final : memory::WorkerAllocated {
+    struct SharedState final {
         explicit SharedState(std::unique_ptr<AsyncStream> s) noexcept
             : stream(std::move(s)) {}
         std::unique_ptr<AsyncStream> stream;
@@ -629,8 +627,6 @@ public:
         XHttpSessionDirectory* directory;
         const Key* key = nullptr;
         net::io_context* owner = nullptr;
-        // The owner Worker's pool; set and cleared together with `owner`.
-        memory::worker_memory* owner_pool = nullptr;
         std::atomic<State> state{State::Reserved};
         Record* incoming_next = nullptr;
         Record* previous = nullptr;
@@ -639,9 +635,8 @@ public:
         bool activated = false;
         std::vector<std::shared_ptr<OwnerWaiter>> owner_waiters;
 
-        Record(XHttpSessionDirectory& directory, net::io_context* owner,
-               memory::worker_memory* owner_pool)
-            : directory(&directory), owner(owner), owner_pool(owner_pool) {}
+        Record(XHttpSessionDirectory& directory, net::io_context* owner)
+            : directory(&directory), owner(owner) {}
         void Retire(bool only_reserved = false) noexcept;
         bool MarkLive() noexcept {
             auto expected = State::Reserved;
@@ -662,19 +657,15 @@ public:
 
     struct Claim {
         net::io_context* owner = nullptr;
-        memory::worker_memory* owner_pool = nullptr;
         std::shared_ptr<Record> record;
         std::shared_ptr<OwnerWaiter> wait_owner;
         bool reservation = false;
         bool retry = false;
         Claim() = default;
-        Claim(net::io_context* owner, memory::worker_memory* owner_pool,
-              std::shared_ptr<Record> record, bool reservation)
-            : owner(owner), owner_pool(owner_pool), record(std::move(record)),
-              reservation(reservation) {}
+        Claim(net::io_context* owner, std::shared_ptr<Record> record, bool reservation)
+            : owner(owner), record(std::move(record)), reservation(reservation) {}
         Claim(Claim&& other) noexcept
             : owner(std::exchange(other.owner, nullptr)),
-              owner_pool(std::exchange(other.owner_pool, nullptr)),
               record(std::move(other.record)),
               wait_owner(std::move(other.wait_owner)),
               reservation(std::exchange(other.reservation, false)),
@@ -688,19 +679,18 @@ public:
 
     Claim Acquire(std::string_view session_namespace, std::string_view session_id,
                   XHttpSessionAccess access, net::io_context* current,
-                  memory::worker_memory* current_pool, bool bind_owner = true) {
+                  bool bind_owner = true) {
         DrainRetirements();
         auto found = entries_.find(::detail::XHttpPacketSessionKeyRef{session_id, session_namespace});
         if (found != entries_.end() && !found->second->Retired()) {
             auto& record = found->second;
             if (!record->owner && bind_owner && current) {
                 record->owner = current;
-                record->owner_pool = current_pool;
                 record->NotifyOwnerWaiters();
-                return {current, current_pool, record, true};
+                return {current, record, true};
             }
             if (record->owner) {
-                return {record->owner, record->owner_pool, record, false};
+                return {record->owner, record, false};
             }
             Claim pending;
             pending.record = record;
@@ -720,7 +710,7 @@ public:
         }
         if (active_ == kMaxActive) return {};
         auto record = std::make_shared<Record>(
-            *this, bind_owner ? current : nullptr, bind_owner ? current_pool : nullptr);
+            *this, bind_owner ? current : nullptr);
         if (found == entries_.end()) {
             found = entries_.try_emplace(
                 Key{std::string(session_id), std::string(session_namespace)}, record).first;
@@ -740,7 +730,7 @@ public:
             }
             return pending;
         }
-        return {current, current_pool, std::move(record), true};
+        return {current, std::move(record), true};
     }
 
 private:
@@ -765,7 +755,6 @@ private:
             fifo = record->incoming_next;
             record->processed = true;
             record->owner = nullptr;
-            record->owner_pool = nullptr;
             record->NotifyOwnerWaiters();
             --active_;
             if (!record->activated) {
@@ -854,7 +843,7 @@ public:
 
     std::shared_ptr<XHttpPacketUpSession> Get(
         net::io_context& io, std::string_view session_namespace,
-        std::string_view id, XHttpSessionAccess access, memory::worker_memory& pool,
+        std::string_view id, XHttpSessionAccess access,
         std::shared_ptr<XHttpSessionDirectory::Record> record = {}) {
         const ::detail::XHttpPacketSessionKeyRef lookup{id, session_namespace};
         auto found = sessions_.find(lookup);
@@ -865,7 +854,7 @@ public:
             active_ == kXHttpMaxPacketSessions)
             return nullptr;
 
-        auto session = memory::AllocateShared<XHttpPacketUpSession>(pool.resource(), io);
+        auto session = std::make_shared<XHttpPacketUpSession>(io);
         const bool inserting = found == sessions_.end();
         if (found == sessions_.end()) {
             ::detail::XHttpPacketSessionKey key{
@@ -1358,12 +1347,12 @@ std::optional<DetachedXHttpStream> DetachXHttpStream(
 }
 
 std::unique_ptr<AsyncStream> RestoreXHttpStream(
-    memory::worker_memory& pool, net::io_context& io_context, DetachedXHttpStream detached) {
+    net::io_context& io_context, DetachedXHttpStream detached) {
     if (auto* tls = std::get_if<DetachedTlsState>(&detached.state)) {
-        return TlsStream::RestoreFromHandoff(pool, io_context, std::move(*tls));
+        return TlsStream::RestoreFromHandoff(io_context, std::move(*tls));
     }
     if (auto* tcp = std::get_if<DetachedTcpState>(&detached.state)) {
-        return TcpStream::RestoreFromHandoff(pool, io_context, std::move(*tcp));
+        return TcpStream::RestoreFromHandoff(io_context, std::move(*tcp));
     }
     return nullptr;
 }
@@ -1398,8 +1387,6 @@ struct XHttpUploadTimeouts {
 
 struct XHttpSessionOwnerResolution {
     net::io_context* owner = nullptr;
-    // The owner Worker's pool; restored handoff streams allocate from it.
-    memory::worker_memory* owner_pool = nullptr;
     std::shared_ptr<XHttpPacketUpSession> session;
 };
 
@@ -1409,15 +1396,13 @@ net::awaitable<XHttpSessionOwnerResolution> ResolveXHttpSessionOwner(
     std::string_view session_id,
     XHttpSessionAccess access,
     bool bind_owner,
-    memory::worker_memory& pool,
     transport::CancellationSource* cancellation = nullptr) {
     auto& table = net::use_service<XHttpSessionTable>(io_context);
     if (access != XHttpSessionAccess::Open) {
         if (auto session = table.Get(
-                io_context, session_namespace, session_id, XHttpSessionAccess::Join, pool)) {
+                io_context, session_namespace, session_id, XHttpSessionAccess::Join)) {
             co_return XHttpSessionOwnerResolution{
                 .owner = &io_context,
-                .owner_pool = &pool,
                 .session = std::move(session),
             };
         }
@@ -1426,9 +1411,8 @@ net::awaitable<XHttpSessionOwnerResolution> ResolveXHttpSessionOwner(
     if (!coordinator) {
         co_return XHttpSessionOwnerResolution{
             .owner = &io_context,
-            .owner_pool = &pool,
             .session = table.Get(
-                io_context, session_namespace, session_id, access, pool),
+                io_context, session_namespace, session_id, access),
         };
     }
     for (;;) {
@@ -1438,24 +1422,22 @@ net::awaitable<XHttpSessionOwnerResolution> ResolveXHttpSessionOwner(
              session_id,
              access,
              &io_context,
-             &pool,
              bind_owner] {
                 return net::use_service<XHttpSessionDirectory>(coordinator->Services()).Acquire(
-                    session_namespace, session_id, access, &io_context, &pool, bind_owner);
+                    session_namespace, session_id, access, &io_context, bind_owner);
             });
         if (claim.retry) continue;
         if (claim.owner) {
             if (claim.owner != &io_context) {
                 co_return XHttpSessionOwnerResolution{
-                    .owner = claim.owner, .owner_pool = claim.owner_pool, .session = {}};
+                    .owner = claim.owner, .session = {}};
             }
             if (claim.record && claim.record->Retired()) continue;
             auto session = table.Get(
-                io_context, session_namespace, session_id, access, pool, claim.record);
+                io_context, session_namespace, session_id, access, claim.record);
             if (session) claim.reservation = false;
             co_return XHttpSessionOwnerResolution{
                 .owner = claim.owner,
-                .owner_pool = claim.owner_pool,
                 .session = std::move(session),
             };
         }
@@ -1493,18 +1475,16 @@ net::awaitable<std::shared_ptr<XHttpPacketUpSession>> GetXHttpPacketSession(
     net::io_context& io_context,
     std::string_view session_namespace,
     std::string_view session_id,
-    XHttpSessionAccess access,
-    memory::worker_memory& pool) {
+    XHttpSessionAccess access) {
     co_return (co_await ResolveXHttpSessionOwner(
-        io_context, session_namespace, session_id, access, true, pool)).session;
+        io_context, session_namespace, session_id, access, true)).session;
 }
 
 std::unique_ptr<AsyncStream> MakeXHttpSplitStream(
     std::shared_ptr<XHttpPacketUpSession> session,
     std::unique_ptr<AsyncStream> downlink) {
-    auto& pool = downlink->Pool();
-    return memory::MakeUnique<XHttpPacketUpServerStream>(
-        pool, std::move(session), std::move(downlink));
+    return std::make_unique<XHttpPacketUpServerStream>(
+        std::move(session), std::move(downlink));
 }
 
 HttpConfig XHttpStreamOneHttpConfig(const XHttpConfig& cfg, bool outbound) {
@@ -1799,8 +1779,7 @@ net::awaitable<TransportBuildResult> RunXHttp1ServerHandshake(
                 co_return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
             }
             auto session = co_await GetXHttpPacketSession(
-                io_context, xhttp_cfg.session_namespace, meta.session_id, XHttpSessionAccess::Open,
-                stream->Pool());
+                io_context, xhttp_cfg.session_namespace, meta.session_id, XHttpSessionAccess::Open);
             if (!session) {
                 co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
             }
@@ -1865,9 +1844,8 @@ net::awaitable<TransportBuildResult> RunXHttp1ServerHandshake(
             const bool bind_immediately = !timeouts.active;
             auto resolution = co_await ResolveXHttpSessionOwner(
                 io_context, xhttp_cfg.session_namespace, meta.session_id,
-                access, bind_immediately, stream->Pool(), &stream->Cancellation());
+                access, bind_immediately, &stream->Cancellation());
             auto* owner_reactor = resolution.owner;
-            auto* owner_pool = resolution.owner_pool;
             if (!owner_reactor) {
                 if (stream->ConsumePhaseDeadline() || stream->ConsumeIdleTimeout()) {
                     co_return tl::unexpected(ErrorCode::TIMEOUT);
@@ -1893,14 +1871,14 @@ net::awaitable<TransportBuildResult> RunXHttp1ServerHandshake(
                 const auto idle_timeout = timeouts.idle_timeout;
                 auto handed = co_await net::co_spawn(
                     *owner_reactor,
-                    [owner_reactor, owner_pool, detached = std::move(*detached),
+                    [owner_reactor, detached = std::move(*detached),
                      &cfg, &xhttp_cfg, conn_id, has_stream_handler,
                      handshake_timeout, idle_timeout,
                      kind, session_id = std::move(session_id), seq,
                      framing, expect_100_continue, keep_alive]() mutable
                         -> net::awaitable<tl::expected<void, ErrorCode>> {
                         auto restored = RestoreXHttpStream(
-                            *owner_pool, *owner_reactor, std::move(detached));
+                            *owner_reactor, std::move(detached));
                         if (!restored) co_return tl::unexpected(ErrorCode::SOCKET_READ_FAILED);
                         if (has_stream_handler) {
                             restored->SetIdleTimeout(handshake_timeout);
@@ -1911,7 +1889,7 @@ net::awaitable<TransportBuildResult> RunXHttp1ServerHandshake(
                             : XHttpSessionAccess::Upload;
                         auto owner_resolution = co_await ResolveXHttpSessionOwner(
                             *owner_reactor, xhttp_cfg.session_namespace, session_id,
-                            owner_access, !has_stream_handler, *owner_pool,
+                            owner_access, !has_stream_handler,
                             &restored->Cancellation());
                         if (!owner_resolution.owner) {
                             if (restored->ConsumePhaseDeadline() || restored->ConsumeIdleTimeout()) {
@@ -2065,9 +2043,8 @@ net::awaitable<TransportBuildResult> DoXHttp1ClientRequest(
         const auto executor = co_await net::this_coro::executor;
         auto& services = net::query(executor, net::execution::context);
         auto body = MakeHttp1BodyStream(std::move(stream), Http1BodyUntilClose{}, true);
-        auto& pool = body->Pool();
-        co_return memory::MakeUnique<XHttpUploadClientStream>(
-            pool, executor, services, std::move(body));
+        co_return std::make_unique<XHttpUploadClientStream>(
+            executor, services, std::move(body));
     }
     if (!co_await WriteFullToStream(*stream, request)) {
         co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);

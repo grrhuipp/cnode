@@ -100,7 +100,7 @@ private:
 
 class SslContext;
 
-struct RealityClientState : memory::WorkerAllocated {
+struct RealityClientState {
     ~RealityClientState() {
         OPENSSL_cleanse(auth_key.data(), auth_key.size());
         OPENSSL_cleanse(short_id.data(), short_id.size());
@@ -114,7 +114,7 @@ struct RealityClientState : memory::WorkerAllocated {
     bool auth_key_ready = false;
 };
 
-struct RealityServerConnState : memory::WorkerAllocated {
+struct RealityServerConnState {
     ~RealityServerConnState() {
         OPENSSL_cleanse(auth_key.data(), auth_key.size());
     }
@@ -135,8 +135,7 @@ void ClearRealityServerConnState(SSL* ssl) noexcept;
 [[nodiscard]] std::unique_ptr<RealityServerConnState>
 VerifyRealityClientHello(
     memory::ByteVector handshake,
-    const SslContext& ctx,
-    memory::worker_memory& pool);
+    const SslContext& ctx);
 
 // RFC 8446 sections 4.1.2 and 5.1: handshake messages may span records.
 // Retain the original wire image for fallback/replay, but authenticate the

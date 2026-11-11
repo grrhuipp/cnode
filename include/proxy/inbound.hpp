@@ -187,7 +187,7 @@ struct InboundDatagramResult {
 //   - VMessInbound: Process 解析 AEAD 头后提交 session::Context 给 dispatcher
 //   - TrojanInbound: Process 解析 SHA224+目标后提交 session::Context 给 dispatcher
 // ============================================================================
-class Inbound : public memory::WorkerAllocated {
+class Inbound {
 public:
     virtual ~Inbound() noexcept = default;
 

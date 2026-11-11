@@ -531,7 +531,7 @@ ReadFramePayload(AsyncStream& stream, uint16_t length) {
     buf::MultiBuffer mb;
     size_t remaining = length;
     while (remaining > 0) {
-        buf::BufferGuard buffer{buf::Buffer::New(stream.Pool())};
+        buf::BufferGuard buffer{buf::Buffer::New()};
         if (!buffer) {
             co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
         }

@@ -34,8 +34,7 @@ void operator delete(void* p, std::size_t) noexcept { std::free(p); }
 
 TEST(SessionAccessLog, Contract) {
     try {
-        ::memory::worker_memory pool;
-        ::session::Context ctx(pool);
+        ::session::Context ctx;
         ctx.inbound.source_addr = ::net::ip::make_address("192.0.2.10");
         ctx.inbound.source_port = 52000;
         ctx.inbound.tag = "panel/hj-anytls/1041/anytls/55911";

@@ -40,7 +40,6 @@ TEST_P(RuntimeSamplingBenchmark, EstablishedVlessSessions) {
             (void)fixture.worker.CollectRuntimeStats(resources);
         std::vector<double> latency(rounds);
         const auto warm_rss = ResidentBytes();
-        const auto before = fixture.worker.Pool().GetFootprint();
         benchmark::AllocationCounts counts;
         const auto cpu_start = CpuNanoseconds();
         const auto start = std::chrono::steady_clock::now();
@@ -60,7 +59,6 @@ TEST_P(RuntimeSamplingBenchmark, EstablishedVlessSessions) {
         }
         const auto finish = std::chrono::steady_clock::now();
         const auto cpu_finish = CpuNanoseconds();
-        const auto after = fixture.worker.Pool().GetFootprint();
         const auto after_rss = ResidentBytes();
         const auto process_memory = benchmark::ReadProcessMemory();
         std::sort(latency.begin(), latency.end());
@@ -69,15 +67,14 @@ TEST_P(RuntimeSamplingBenchmark, EstablishedVlessSessions) {
                     "scope=worker_collect_only wall_ns_per_sample=%.3f cpu_ns_per_sample=%.3f "
                     "p50_ns=%.3f p95_ns=%.3f max_ns=%.3f cxx_new_calls=%" PRIu64 " "
                     "mi_aligned_calls=%" PRIu64 " idle_rss_bytes=%zu warm_rss_bytes=%zu "
-                    "after_rss_bytes=%zu process_peak_rss_bytes=%zu pool_committed_before=%zu "
-                    "pool_committed_after=%zu pool_used_after=%zu anonymous_rss_bytes=%zu "
+                    "after_rss_bytes=%zu process_peak_rss_bytes=%zu anonymous_rss_bytes=%zu "
                     "file_rss_bytes=%zu checksum=%" PRIu64 "\n",
             sessions, rounds, static_cast<unsigned>(resources), warmup,
             wall_ns / rounds, static_cast<double>(cpu_finish - cpu_start) / rounds,
             latency[rounds / 2], latency[(rounds * 95 - 1) / 100], latency.back(),
             counts.cpp_calls, counts.aligned_calls, idle_rss, warm_rss, after_rss,
-            process_memory.peak_resident_bytes, before.committed_bytes, after.committed_bytes,
-            after.used_bytes, process_memory.anonymous_resident_bytes, process_memory.file_resident_bytes,
+            process_memory.peak_resident_bytes, process_memory.anonymous_resident_bytes,
+            process_memory.file_resident_bytes,
             checksum);
         // Setup, authentication, payload verification and shutdown are outside
         // timing. Run each parameter in a fresh process for comparable peak RSS.

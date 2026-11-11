@@ -8,7 +8,6 @@ namespace {
 using namespace ss_identity_test;
 class ShadowsocksIdentity : public testing::Test {
 protected:
-    memory::worker_memory pool;
     net::io_context io;
     void TearDown() override { UserStore::ClearWorkerView(); }
 };
@@ -21,7 +20,7 @@ TEST_F(ShadowsocksIdentity, EveryGroupAndHintAuthenticatesItsOwnUser) {
             Install(users);
             size_t hint = std::numeric_limits<size_t>::max();
             for (size_t index : {0u, 18u, 9u, 18u, 0u}) {
-                Wire wire{pool};
+                Wire wire;
                 Prepare(io, wire, users[index], cipher);
                 auto result = Authenticate(io, wire, cipher, hint);
                 ASSERT_TRUE(result);
@@ -46,7 +45,7 @@ TEST_F(ShadowsocksIdentity, HashCollisionStillRequiresFixedHeaderAuthentication)
     // The prepared snapshot is the public authentication input contract.
     for (auto& user : users) user.psk_hash = users[4].psk_hash;
     Install(users);
-    Wire wire{pool};
+    Wire wire;
     Prepare(io, wire, users[4], cipher);
     for (size_t hint = 0; hint < users.size(); ++hint) {
         size_t current_hint = hint;
@@ -67,7 +66,7 @@ TEST_F(ShadowsocksIdentity, LastGroupHintMissAndCollisionPreserveAuthentication)
     auto users = Users(12, cipher, 3);
     for (size_t i = 2; i < users.size(); i += 3) users[i].psk_hash = users[11].psk_hash;
     Install(users);
-    Wire wire{pool};
+    Wire wire;
     Prepare(io, wire, users[11], cipher);
     const auto view = UserStore::ShadowsocksUsers(kTag);
     // Include hints in other groups, colliding candidates in the final group,
@@ -88,7 +87,7 @@ TEST_F(ShadowsocksIdentity, SnapshotReplacementRetainsOldOwnershipNotOldHints) {
     const auto cipher = *ss::ParseCipherMethod("2022-blake3-aes-256-gcm");
     auto users = Users(17, cipher, 3);
     Install(users);
-    Wire wire{pool};
+    Wire wire;
     Prepare(io, wire, users[16], cipher);
     size_t hint = 0;
     auto old = Authenticate(io, wire, cipher, hint);
@@ -111,7 +110,7 @@ TEST_F(ShadowsocksIdentity, InvalidCredentialCannotBorrowAnotherUsersIdentity) {
     const auto cipher = *ss::ParseCipherMethod("2022-blake3-aes-128-gcm");
     auto users = Users(5, cipher, 2);
     const auto client = users[2];
-    Wire wire{pool};
+    Wire wire;
     Prepare(io, wire, client, cipher);
     users[2].derived_key.size = 0;
     Install(users);
@@ -167,12 +166,12 @@ TEST_F(ShadowsocksIdentity, SortedSnapshotPreservesUdpOwnerAndReplayIsolation) {
         ASSERT_EQ(ss::Encode2022UdpRequestPacketTo(target, payload.data(), payload.size(),
             state, chain, packet.data(), packet.size()), size);
         auto result = ss::DecodeUdpPacket(packet.data(), packet.size(), view,
-            cipher.type, cipher.key_size, cipher.salt_size, replay, false, pool);
+            cipher.type, cipher.key_size, cipher.salt_size, replay, false);
         ASSERT_TRUE(result);
         ASSERT_LT(result->user_index, view.size());
         EXPECT_EQ(view[result->user_index].profile.user_id, users[index].profile.user_id);
         EXPECT_FALSE(ss::DecodeUdpPacket(packet.data(), packet.size(), view,
-            cipher.type, cipher.key_size, cipher.salt_size, replay, false, pool));
+            cipher.type, cipher.key_size, cipher.salt_size, replay, false));
     }
 }
 } // namespace

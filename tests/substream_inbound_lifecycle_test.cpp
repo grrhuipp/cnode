@@ -120,7 +120,7 @@ struct StreamState {
 
 class Stream final : public AsyncStream {
 public:
-    Stream(memory::worker_memory& pool, StreamState& state) : AsyncStream(pool), state_(state) {}
+    explicit Stream(StreamState& state) : state_(state) {}
     ~Stream() override { state_.destroyed = true; }
     net::awaitable<size_t> AsyncRead(net::mutable_buffer output) override {
         while (state_.offset == state_.input.size() && !state_.closed) {
@@ -180,7 +180,7 @@ public:
         std::array<uint8_t, 8192> data{};
         const auto count = co_await AsyncRead(net::buffer(data));
         buf::MultiBuffer result;
-        if (count && !buf::AppendSpanToMultiBuffer(std::span(data).first(count), result, Pool()))
+        if (count && !buf::AppendSpanToMultiBuffer(std::span(data).first(count), result))
             throw std::bad_alloc();
         co_return result;
     }
@@ -262,7 +262,6 @@ net::awaitable<RelayResult> RunMux(std::unique_ptr<AsyncStream> stream,
 }
 
 bool RunCase(int mode, bool baseline, bool blocked_writes = false, bool mux = false) {
-    memory::worker_memory pool;
     net::io_context io;
     DomainFixture domain(io);
     StreamState stream(io);
@@ -298,7 +297,7 @@ bool RunCase(int mode, bool baseline, bool blocked_writes = false, bool mux = fa
     Dispatcher dispatcher(io);
     ReceiverSettings receiver{.inbound_tag = {}, .inbound_tags = {}, .protocol = {},
         .stream_settings = {}, .dispatch_policy = {{}, routing::ForceOutbound{"direct"}}};
-    session::Context context(pool);
+    session::Context context;
     context.inbound.tag = "lifecycle";
     context.inbound.source_ip = "127.0.0.1";
     TimeoutsConfig timeouts;
@@ -309,8 +308,8 @@ bool RunCase(int mode, bool baseline, bool blocked_writes = false, bool mux = fa
     std::exception_ptr failure;
     ErrorCode returned_error = ErrorCode::INTERNAL;
     auto request = mux
-        ? RunMux(memory::MakeUnique<Stream>(pool, pool, stream), dispatcher, receiver, io, context, stats, timeouts)
-        : handler.Process(memory::MakeUnique<Stream>(pool, pool, stream), dispatcher, receiver, io, context, timeouts, 0);
+        ? RunMux(std::make_unique<Stream>(stream), dispatcher, receiver, io, context, stats, timeouts)
+        : handler.Process(std::make_unique<Stream>(stream), dispatcher, receiver, io, context, timeouts, 0);
     net::co_spawn(domain.Executor(), std::move(request),
         net::bind_cancellation_slot(cancellation.slot(), [&](std::exception_ptr error, RelayResult result) {
             returned = true;
@@ -405,7 +404,6 @@ void RunHandshakeCase(int mode, bool baseline = false) {
     constexpr std::array names{"partial-synack-timeout", "partial-synack-parent-cancel",
         "write-gate-timeout-isolation", "capacity-rejected-id-retired", "overdue-ready-header",
         "synack-memory-error", "synack-link-error", "synack-unexpected-error"};
-    memory::worker_memory pool;
     net::io_context io;
     DomainFixture domain(io);
     StreamState stream(io);
@@ -431,7 +429,7 @@ void RunHandshakeCase(int mode, bool baseline = false) {
     Dispatcher dispatcher(io);
     ReceiverSettings receiver{.inbound_tag = {}, .inbound_tags = {}, .protocol = {},
         .stream_settings = {}, .dispatch_policy = {{}, routing::ForceOutbound{"direct"}}};
-    session::Context context(pool);
+    session::Context context;
     context.inbound.tag = "handshake";
     TimeoutsConfig timeouts;
     timeouts.handshake = 1;
@@ -442,7 +440,7 @@ void RunHandshakeCase(int mode, bool baseline = false) {
     net::cancellation_signal cancellation;
     bool returned = false;
     int active_at_return = -1;
-    net::co_spawn(domain.Executor(), handler.Process(memory::MakeUnique<Stream>(pool, pool, stream), dispatcher,
+    net::co_spawn(domain.Executor(), handler.Process(std::make_unique<Stream>(stream), dispatcher,
         receiver, io, context, timeouts, 0), net::bind_cancellation_slot(cancellation.slot(),
         [&](std::exception_ptr, RelayResult) {
             returned = true; active_at_return = dispatcher.active;
@@ -515,7 +513,6 @@ void RunHandshakeCase(int mode, bool baseline = false) {
 void RunIdentityCase(int mode, bool baseline) {
     constexpr std::array names{"duplicate-active", "duplicate-pending", "reuse-completed",
         "descending", "zero", "syn-payload", "wraparound", "valid-gap", "fin-before-target", "payload-after-retirement"};
-    memory::worker_memory pool;
     net::io_context io;
     DomainFixture domain(io);
     StreamState stream(io);
@@ -542,14 +539,14 @@ void RunIdentityCase(int mode, bool baseline) {
     Dispatcher dispatcher(io);
     ReceiverSettings receiver{.inbound_tag = {}, .inbound_tags = {}, .protocol = {},
         .stream_settings = {}, .dispatch_policy = {{}, routing::ForceOutbound{"direct"}}};
-    session::Context context(pool);
+    session::Context context;
     context.inbound.tag = "identity";
     context.inbound.source_ip = "127.0.0.1";
     TimeoutsConfig timeouts;
     bool returned = false;
     ErrorCode result_error = ErrorCode::INTERNAL;
     std::exception_ptr failure;
-    net::co_spawn(domain.Executor(), handler.Process(memory::MakeUnique<Stream>(pool, pool, stream), dispatcher,
+    net::co_spawn(domain.Executor(), handler.Process(std::make_unique<Stream>(stream), dispatcher,
         receiver, io, context, timeouts, 0), [&](std::exception_ptr error, RelayResult result) {
             returned = true;
             failure = error;
@@ -630,7 +627,6 @@ public:
 void RunParsingCase(int mode) {
     constexpr std::array names{"coalesced", "ipv4-fragmented", "ipv6-fragmented", "max-domain",
         "invalid-type", "empty-domain", "zero-port", "truncated", "cancel-pending", "oversized-domain", "invalid-uot-request"};
-    memory::worker_memory pool;
     net::io_context io;
     DomainFixture execution(io);
     StreamState stream(io);
@@ -683,13 +679,13 @@ void RunParsingCase(int mode) {
     ParsingDispatcher dispatcher;
     ReceiverSettings receiver{.inbound_tag = {}, .inbound_tags = {}, .protocol = {},
         .stream_settings = {}, .dispatch_policy = {{}, routing::ForceOutbound{"direct"}}};
-    session::Context context(pool);
+    session::Context context;
     context.inbound.tag = "parsing";
     TimeoutsConfig timeouts;
     net::cancellation_signal cancellation;
     bool returned = false;
     std::exception_ptr failure;
-    net::co_spawn(execution.Executor(), handler.Process(memory::MakeUnique<Stream>(pool, pool, stream), dispatcher,
+    net::co_spawn(execution.Executor(), handler.Process(std::make_unique<Stream>(stream), dispatcher,
         receiver, io, context, timeouts, 0), net::bind_cancellation_slot(cancellation.slot(),
         [&](std::exception_ptr error, RelayResult) { returned = true; failure = error; }));
     io.poll();
@@ -751,7 +747,6 @@ public:
 void RunQueueCase(int mode, bool baseline = false, uint32_t seed = 0) {
     constexpr std::array names{"tiny-fragments", "whole-frame", "sparse-mixed", "boundary-fragments",
         "byte-budget-backpressure", "cancel-full-queue", "maximum-tiny-fragments", "random-fragments"};
-    memory::worker_memory pool;
     net::io_context io;
     DomainFixture domain(io);
     StreamState stream(io);
@@ -775,7 +770,7 @@ void RunQueueCase(int mode, bool baseline = false, uint32_t seed = 0) {
     QueueDispatcher dispatcher(io);
     ReceiverSettings receiver{.inbound_tag = {}, .inbound_tags = {}, .protocol = {},
         .stream_settings = {}, .dispatch_policy = {{}, routing::ForceOutbound{"direct"}}};
-    session::Context context(pool);
+    session::Context context;
     context.inbound.tag = "queue";
     TimeoutsConfig timeouts;
     net::cancellation_signal cancellation;
@@ -783,7 +778,7 @@ void RunQueueCase(int mode, bool baseline = false, uint32_t seed = 0) {
     int active_at_return = -1;
     Check(BufferCount() == 0, "buffer accounting must start empty");
     memory::detail::test_buffers_peak = 0;
-    net::co_spawn(domain.Executor(), handler.Process(memory::MakeUnique<Stream>(pool, pool, stream), dispatcher,
+    net::co_spawn(domain.Executor(), handler.Process(std::make_unique<Stream>(stream), dispatcher,
         receiver, io, context, timeouts, 0), net::bind_cancellation_slot(cancellation.slot(),
         [&](std::exception_ptr, RelayResult) {
             returned = true; active_at_return = dispatcher.active;
@@ -931,7 +926,6 @@ public:
 };
 
 void RunMuxUdpCase(int mode) {
-    memory::worker_memory pool;
     net::io_context io;
     DomainFixture domain(io);
     StreamState stream(io);
@@ -941,7 +935,7 @@ void RunMuxUdpCase(int mode) {
     proxyman::inbound::ReceiverSettings receiver{
         .inbound_tag = {}, .inbound_tags = {}, .protocol = {}, .stream_settings = {},
         .dispatch_policy = {{}, routing::ForceOutbound{"direct"}}};
-    session::Context context(pool);
+    session::Context context;
     context.inbound.tag = "mux-udp";
     TimeoutsConfig timeouts;
     const TargetAddress target("127.0.0.1", 53);
@@ -961,7 +955,7 @@ void RunMuxUdpCase(int mode) {
     net::cancellation_signal cancellation;
     Check(BufferCount() == 0, "Mux UDP fixture must start without live buffers");
     net::co_spawn(domain.Executor(),
-        RunMux(memory::MakeUnique<Stream>(pool, pool, stream), dispatcher, receiver, io, context, stats, timeouts),
+        RunMux(std::make_unique<Stream>(stream), dispatcher, receiver, io, context, stats, timeouts),
         net::bind_cancellation_slot(cancellation.slot(),
             [&](std::exception_ptr error, RelayResult) { failure = error; returned = true; }));
     io.poll();
@@ -1017,7 +1011,7 @@ void RunMuxUdpCase(int mode) {
                   "Mux UDP target, final END payload or zero/nonzero boundary changed");
         }
         buf::MultiBuffer output;
-        Check(buf::AppendSpanToMultiBuffer(stream.output, output, pool), "Mux reply fixture allocation failed");
+        Check(buf::AppendSpanToMultiBuffer(stream.output, output), "Mux reply fixture allocation failed");
         size_t replies = 0;
         while (!output.empty()) {
             const auto frame = mux::DecodeFrame(output);

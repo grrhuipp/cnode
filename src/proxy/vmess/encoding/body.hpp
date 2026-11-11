@@ -129,12 +129,11 @@ private:
 
 class BodyEncoder {
 public:
-    BodyEncoder(memory::worker_memory& pool,
-                const BodyOptions& options,
+    BodyEncoder(const BodyOptions& options,
                 const BodyKey& request_body,
                 const BodyKey& direction_key);
 
-    // Stream mode splits payload into chunks that fit one pooled buffer;
+    // Stream mode splits payload into chunks that fit one fixed-size Buffer;
     // packet mode seals the whole datagram as exactly one chunk, rejecting
     // empty UDP with NOT_SUPPORTED because an empty body is the EOF marker.
     // Input/output must be distinct; input rejection does not advance framing.
@@ -199,7 +198,6 @@ private:
                        size_t padding,
                        uint8_t* dst);
 
-    memory::worker_memory* pool_;
     BodyChunkCipher cipher_;
     size_t stream_chunk_size_ = 0;
     State state_ = State::Active;
@@ -210,8 +208,7 @@ private:
 // chunks, so the next Read continues the same record.
 class BodyDecoder {
 public:
-    BodyDecoder(memory::worker_memory& pool,
-                const BodyOptions& options,
+    BodyDecoder(const BodyOptions& options,
                 const BodyKey& request_body,
                 const BodyKey& direction_key);
 
@@ -259,7 +256,7 @@ using VMessHandshakeResult = tl::expected<void, ErrorCode>;
 
 class ClientSession final {
 public:
-    ClientSession(memory::worker_memory& pool, Security security, Command command);
+    ClientSession(Security security, Command command);
 
     ClientSession(const ClientSession&) = delete;
     ClientSession& operator=(const ClientSession&) = delete;

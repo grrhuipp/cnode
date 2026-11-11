@@ -9,7 +9,6 @@
 #include "app/proxyman/outbound/handler.hpp"
 #include "infra/json.hpp"
 #include "app/dns/dns.hpp"
-#include "common/allocator.hpp"
 #include "common/buffer_util.hpp"
 #include "common/container_util.hpp"
 #include "infra/config_types.hpp"
@@ -256,9 +255,8 @@ const bool kTrojanRegistered = (::proxyman::outbound::RegisterProxy(
                 +[](std::string_view,
                     std::shared_ptr<const ::TrojanOutboundConfig> cfg_state,
                     ::net::io_context& /*io_context*/,
-                    ::AwaitableTaskGroup& /*tasks*/,
-                    memory::worker_memory& pool) -> std::unique_ptr<::Outbound> {
-                    return memory::MakeUnique<::proxy::trojan::outbound::Handler>(pool,
+                    ::AwaitableTaskGroup& /*tasks*/) -> std::unique_ptr<::Outbound> {
+                    return std::make_unique<::proxy::trojan::outbound::Handler>(
                         std::move(cfg_state));
                 }>([] (::OutboundServer srv, const std::string& pwd) {
                     ::TrojanOutboundConfig cfg_val;

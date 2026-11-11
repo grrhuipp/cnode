@@ -131,7 +131,7 @@ inline constexpr auto kRelayCloseGraceTimeout = std::chrono::seconds(1);
 
 // All state and subscriptions live until both directions and the watchdog join.
 // Allocated only for speed-limited relays so unlimited frames do not carry it.
-struct RelayRateLimits : memory::WorkerAllocated {
+struct RelayRateLimits {
     TokenBucket up;
     TokenBucket down;
     AsyncDelay up_wait;
@@ -305,8 +305,7 @@ net::awaitable<RelayResult> DoRelayLink(
     relay_detail::RelayState state(io_context);
     std::unique_ptr<relay_detail::RelayRateLimits> limits;
     if (config.speed_limit != 0) {
-        limits = memory::MakeUnique<relay_detail::RelayRateLimits>(
-            ctx.pool,
+        limits = std::make_unique<relay_detail::RelayRateLimits>(
             io_context, config.speed_limit);
     }
     ctx.traffic.bytes_up = ctx.traffic.bytes_down = 0;

@@ -116,7 +116,7 @@ public:
         peer.connect(acceptor.local_endpoint());
         ::tcp::socket accepted(io);
         acceptor.accept(accepted);
-        raw = memory::MakeUnique<::TcpStream>(pool, pool, std::move(accepted));
+        raw = std::make_unique<::TcpStream>(std::move(accepted));
         net::co_spawn(io, Serve(), [this](std::exception_ptr error) {
             failure = error;
             returned = true;
@@ -259,7 +259,6 @@ public:
         if (failure) std::rethrow_exception(failure);
     }
 
-    memory::worker_memory pool;
     net::io_context io;
     ::tcp::acceptor acceptor;
     ::tcp::socket peer;

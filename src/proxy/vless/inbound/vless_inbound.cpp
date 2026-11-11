@@ -10,7 +10,6 @@
 #include "common/buffer_util.hpp"
 #include "app/rate_limiter.hpp"
 #include "app/stats.hpp"
-#include "common/allocator.hpp"
 #include "common/buf/multi_buffer.hpp"
 #include "common/error.hpp"
 #include "common/initial_payload.hpp"
@@ -233,7 +232,7 @@ CompleteVlessInboundHandshake(
             issued_ticket = std::move(runtime->issued_ticket);
             resumed_identity = runtime->resumed_identity;
             encrypted_io.emplace(
-                stream.Pool(), protocol_reader, protocol_writer, std::move(*runtime));
+                protocol_reader, protocol_writer, std::move(*runtime));
             active_reader = &encrypted_io->plain_reader;
             active_writer = &encrypted_io->writer;
         } catch (const IoSystemError& error) {
@@ -487,7 +486,7 @@ proxy::vless::inbound::Handler::Process(
 
     if (net == Network::UDP) {
         ::vless::UdpStreamEndpoint udp_endpoint(
-            ctx.pool, *active_reader, *active_writer, ctx.outbound.target, packet_addr_udp);
+            *active_reader, *active_writer, ctx.outbound.target, packet_addr_udp);
         InitialPayload first_datagram;
         if (packet_addr_udp) {
             auto packet = co_await udp_endpoint.ReadMultiBuffer();
@@ -577,15 +576,14 @@ const bool kVlessInboundRegistered = [] {
         [](::proxyman::inbound::ProtocolRuntime& runtime,
            ::StatsShard& stats,
            ::ConnectionLimiter* limiter,
-           const ::proxyman::inbound::BuildRequest& req,
-           memory::worker_memory& pool)
+           const ::proxyman::inbound::BuildRequest& req)
             -> std::unique_ptr<::Inbound> {
             auto* tracker = runtime.OnlineTracker();
             const auto* settings = GetVlessSettings(req);
             if (!tracker || !settings) {
                 return nullptr;
             }
-            return memory::MakeUnique<::proxy::vless::inbound::Handler>(pool,
+            return std::make_unique<::proxy::vless::inbound::Handler>(
                 *tracker,
                 stats,
                 limiter,

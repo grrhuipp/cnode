@@ -26,10 +26,10 @@ uint64_t CpuNanoseconds() {
     return uint64_t(time.tv_sec) * 1000000000 + uint64_t(time.tv_nsec);
 }
 
-buf::MultiBuffer MakePayload(std::span<const uint8_t> bytes, memory::worker_memory& pool) {
+buf::MultiBuffer MakePayload(std::span<const uint8_t> bytes) {
     buf::MultiBuffer payload;
     while (!bytes.empty()) {
-        buf::BufferGuard buffer{buf::Buffer::New(pool)};
+        buf::BufferGuard buffer{buf::Buffer::New()};
         if (!buffer) throw std::bad_alloc();
         const auto count = std::min(bytes.size(), size_t(buffer->Available()));
         std::copy_n(bytes.begin(), count, buffer->Tail().begin());
@@ -48,7 +48,7 @@ struct Measurement {
 
 net::awaitable<Measurement> Transfer(
     DatagramSocket& sender, udp::socket& peer, const std::vector<uint8_t>& payload,
-    bool owned, size_t iterations, memory::worker_memory& pool) {
+    bool owned, size_t iterations) {
     std::vector<uint8_t> received(payload.size() + 1);
     const auto destination = peer.local_endpoint();
     const auto expected_source = sender.LocalEndpoint();
@@ -60,7 +60,7 @@ net::awaitable<Measurement> Transfer(
     for (size_t iteration = 0; iteration < iterations; ++iteration) {
         {
             auto write = sender.StartWrite();
-            if (owned) co_await write.SendTo(destination, MakePayload(payload, pool));
+            if (owned) co_await write.SendTo(destination, MakePayload(payload));
             else co_await write.SendTo(destination, buffers);
         }
         udp::endpoint source;
@@ -78,26 +78,22 @@ net::awaitable<Measurement> Transfer(
 }
 
 TEST(UdpSendBenchmark, VerifiedDatagrams) {
-    memory::worker_memory pool;
-    const auto baseline = pool.OutstandingAllocations();
     for (const size_t size : {0u, 1u, 1200u, 60000u}) {
         for (const bool owned : {false, true}) {
             SCOPED_TRACE(::testing::Message() << "bytes=" << size << " owned=" << owned);
             net::io_context io;
-            DatagramSocket sender(pool, io, net::ip::address_v4::loopback());
+            DatagramSocket sender(io, net::ip::address_v4::loopback());
             sender.SetWriteTimeout(2s);
             udp::socket peer(io, {net::ip::address_v4::loopback(), 0});
             std::vector<uint8_t> payload(size);
             for (size_t i = 0; i < size; ++i)
                 payload[i] = static_cast<uint8_t>(i * 131 + i / 251);
             constexpr size_t iterations = 4096;
-            size_t pool_before = 0;
             size_t warm_rss = 0;
             auto exercise = [&]() -> net::awaitable<Measurement> {
-                (void)co_await Transfer(sender, peer, payload, owned, 128, pool);
-                pool_before = pool.GetFootprint().committed_bytes;
+                (void)co_await Transfer(sender, peer, payload, owned, 128);
                 warm_rss = benchmark::ResidentBytes();
-                co_return co_await Transfer(sender, peer, payload, owned, iterations, pool);
+                co_return co_await Transfer(sender, peer, payload, owned, iterations);
             };
             auto result = net::co_spawn(io, exercise(), net::use_future);
             io.run_for(30s);
@@ -109,24 +105,22 @@ TEST(UdpSendBenchmark, VerifiedDatagrams) {
             io.run();
             ASSERT_TRUE(finished) << "UDP send benchmark exceeded overall deadline";
             const auto measured = result.get();
-            const auto pool_after = pool.GetFootprint().committed_bytes;
             const auto process_memory = benchmark::ReadProcessMemory();
             // Both endpoints and exact verification are timed. The owned path
             // also includes payload construction and release, not just sendto.
             std::printf("udp-send payload_bytes=%zu owned=%d iterations=%zu "
                 "wall_ns=%.3f cpu_ns=%.3f cpp_new_calls=%.3f cpp_bytes=%.3f "
-                "mi_aligned_calls=%.3f pool_before=%zu pool_after=%zu "
+                "mi_aligned_calls=%.3f "
                 "warm_rss=%zu after_rss=%zu process_peak_rss=%zu anonymous_rss=%zu file_rss=%zu\n",
                 size, owned, iterations, measured.wall_ns / iterations,
                 double(measured.cpu_ns) / iterations,
                 double(measured.allocations.cpp_calls) / iterations,
                 double(measured.allocations.cpp_bytes) / iterations,
                 double(measured.allocations.aligned_calls) / iterations,
-                pool_before, pool_after, warm_rss, benchmark::ResidentBytes(),
+                warm_rss, benchmark::ResidentBytes(),
                 process_memory.peak_resident_bytes, process_memory.anonymous_resident_bytes,
                 process_memory.file_resident_bytes);
         }
     }
-    EXPECT_EQ(pool.OutstandingAllocations(), baseline);
 }
 } // namespace

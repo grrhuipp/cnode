@@ -130,8 +130,7 @@ net::awaitable<tl::expected<PreparedRequest, ErrorCode>> ReadUotRequestHeader(
     Version version,
     transport::MultiBufferReader& reader,
     buf::MultiBuffer pending,
-    ErrorCode v1_eof_error,
-    memory::worker_memory& pool) {
+    ErrorCode v1_eof_error) {
     PreparedRequest out;
     if (version == Version::V2) {
         try {
@@ -153,7 +152,7 @@ net::awaitable<tl::expected<PreparedRequest, ErrorCode>> ReadUotRequestHeader(
         }
     }
 
-    PacketReader packet_reader(pool, reader, false, TargetAddress{}, std::move(pending));
+    PacketReader packet_reader(reader, false, TargetAddress{}, std::move(pending));
     try {
         auto first_packet = co_await packet_reader.ReadMultiBuffer();
         if (first_packet.empty()) {
@@ -195,7 +194,7 @@ net::awaitable<RelayResult> DispatchPreparedUotRequest(
             Network::UDP,
             prepared.destination,
             std::move(prepared.forwarded)});
-    PacketReader uot_reader(ctx.pool, request_reader, std::move(prepared));
+    PacketReader uot_reader(request_reader, std::move(prepared));
     PacketWriter uot_writer(response_writer, is_connect, ctx.outbound.target);
     co_return co_await dispatcher.Dispatch(
         io_context,
@@ -208,22 +207,18 @@ net::awaitable<RelayResult> DispatchPreparedUotRequest(
         timeouts);
 }
 
-PacketReader::PacketReader(memory::worker_memory& pool,
-                           transport::MultiBufferReader& reader,
+PacketReader::PacketReader(transport::MultiBufferReader& reader,
                            bool is_connect,
                            TargetAddress destination,
                            buf::MultiBuffer pending)
-    : pool_(pool)
-    , reader_(reader)
+    : reader_(reader)
     , is_connect_(is_connect)
     , destination_(is_connect ? std::move(destination) : TargetAddress{})
     , pending_(std::move(pending)) {}
 
-PacketReader::PacketReader(memory::worker_memory& pool,
-                           transport::MultiBufferReader& reader,
+PacketReader::PacketReader(transport::MultiBufferReader& reader,
                            PreparedRequest prepared)
-    : pool_(pool)
-    , reader_(reader)
+    : reader_(reader)
     , is_connect_(prepared.is_connect)
     , destination_(prepared.is_connect ? std::move(prepared.destination) : TargetAddress{})
     , pending_(std::move(prepared.pending)) {}
@@ -269,7 +264,7 @@ net::awaitable<buf::MultiBuffer> PacketReader::ReadMultiBuffer() {
         ThrowDecodeFailure();
     }
     pending_.ReleaseIfIdle();
-    if (!buf::SetUdpTarget(packet, is_connect_ ? destination_ : packet_target, pool_)) {
+    if (!buf::SetUdpTarget(packet, is_connect_ ? destination_ : packet_target)) {
         throw std::bad_alloc();
     }
     co_return packet;

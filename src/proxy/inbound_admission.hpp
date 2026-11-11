@@ -373,8 +373,8 @@ public:
 };
 
 [[nodiscard]] inline std::unique_ptr<::proxyman::inbound::ProtocolRuntime>
-CreateUserOnlineProtocolRuntime(memory::worker_memory& pool) {
-    return memory::MakeUnique<UserOnlineProtocolRuntime>(pool);
+CreateUserOnlineProtocolRuntime() {
+    return std::make_unique<UserOnlineProtocolRuntime>();
 }
 
 template <typename PreparedUser, typename AssignCredential>

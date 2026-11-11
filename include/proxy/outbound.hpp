@@ -1,6 +1,5 @@
 #pragma once
 
-#include "common/allocator.hpp"
 #include "common/asio_types.hpp"
 #include "common/error.hpp"
 #include "common/buf/multi_buffer.hpp"
@@ -29,7 +28,7 @@ using OutboundProcessResult = tl::expected<RelayResult, ErrorCode>;
 // Handler's internet.Dialer); first_payload transfers ownership and all
 // application bytes enter relay.
 // ============================================================================
-class Outbound : public memory::WorkerAllocated {
+class Outbound {
 public:
     virtual ~Outbound() noexcept = default;
 

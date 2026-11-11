@@ -172,15 +172,10 @@ struct Traffic {
     uint64_t bytes_down = 0;
 };
 
-// Per-connection xray-style session metadata. The object itself stays
-// Worker-local; protocol, routing, outbound and relay code read/write the
-// records directly and allocate per-connection state from `pool`.
+// Per-connection xray-style metadata stays Worker-local even though its
+// allocations use the process-lifetime resource.
 struct Context {
-    explicit Context(memory::worker_memory& pool)
-        : pool(pool), inbound(pool.resource()), content(pool.resource()) {}
-
-    // The owning Worker's pool; outlives every Context it serves.
-    memory::worker_memory& pool;
+    Context() = default;
 
     // 连接标识
     ID conn_id = 0;

@@ -25,9 +25,7 @@ TEST(RuleLifecycle, Contract) {
             .Pattern = std::regex("blocked\\.example"),
         },
     }));
-
-    ::memory::worker_memory pool;
-    ::session::Context ctx(pool);
+    ::session::Context ctx;
     ctx.inbound.tag = tag;
     ctx.inbound.user_id = 42;
     ctx.inbound.user_email = "alice@example.com";

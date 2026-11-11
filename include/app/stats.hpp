@@ -58,11 +58,6 @@ struct WorkerResourceStats {
     size_t timeout_events = 0;
     size_t timeout_heap_capacity = 0;
     size_t timeout_waiters = 0;
-    // mimalloc page view of the Worker pool heap (page visit; diagnostics only).
-    size_t pool_committed_bytes = 0;
-    size_t pool_used_bytes = 0;
-    size_t pool_live_allocations = 0;
-    size_t pool_pages = 0;
 };
 
 struct WorkerRuntimeStatsSnapshot {

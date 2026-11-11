@@ -7,10 +7,10 @@
 
 namespace {
 
-::buf::MultiBuffer MakePayload(uint8_t value, size_t size, ::memory::worker_memory& pool) {
+::buf::MultiBuffer MakePayload(uint8_t value, size_t size) {
     ::buf::MultiBuffer payload;
     while (size > 0) {
-        ::buf::BufferGuard buffer{::buf::Buffer::New(pool)};
+        ::buf::BufferGuard buffer{::buf::Buffer::New()};
         if (!buffer) {
             std::abort();
         }
@@ -23,18 +23,17 @@ namespace {
     return payload;
 }
 
-::buf::MultiBuffer MakePayload(uint8_t value, ::memory::worker_memory& pool) {
-    return MakePayload(value, 1, pool);
+::buf::MultiBuffer MakePayload(uint8_t value) {
+    return MakePayload(value, 1);
 }
 
 }  // namespace
 
 TEST(XhttpPacketQueue, Contract) {
-    ::memory::worker_memory pool;
     ::detail::XHttpPacketQueue ordered;
-    ASSERT_FALSE((!ordered.Push(1, MakePayload(0x22, pool)) ||
-        !ordered.Push(1, MakePayload(0x99, pool)) ||
-        !ordered.Push(0, MakePayload(0x11, pool))));
+    ASSERT_FALSE((!ordered.Push(1, MakePayload(0x22)) ||
+        !ordered.Push(1, MakePayload(0x99)) ||
+        !ordered.Push(0, MakePayload(0x11))));
     auto first = ordered.Pop();
     auto second = ordered.Pop();
     ASSERT_FALSE((first.size() != 1 || second.size() != 1 ||
@@ -57,17 +56,17 @@ TEST(XhttpPacketQueue, Contract) {
             0,
             MakePayload(
                 0x55,
-                ::detail::XHttpPacketQueue::kMaxQueuedBytes + 1, pool))));
+                ::detail::XHttpPacketQueue::kMaxQueuedBytes + 1))));
     ::detail::XHttpPacketQueue capacity_bounded;
     constexpr size_t blocks = ::detail::XHttpPacketQueue::kMaxQueuedBytes /
                               ::buf::Buffer::kSize;
     for (size_t i = 0; i < blocks; ++i) {
-        ASSERT_FALSE((!capacity_bounded.Push(i, MakePayload(0x66, pool))));
+        ASSERT_FALSE((!capacity_bounded.Push(i, MakePayload(0x66))));
     }
-    ASSERT_FALSE((capacity_bounded.Push(blocks, MakePayload(0x77, pool)) ||
+    ASSERT_FALSE((capacity_bounded.Push(blocks, MakePayload(0x77)) ||
         capacity_bounded.UsedCapacity() != ::detail::XHttpPacketQueue::kMaxQueuedBytes));
     auto released = capacity_bounded.Pop();
-    ASSERT_FALSE((!capacity_bounded.Push(blocks, MakePayload(0x77, pool))));
+    ASSERT_FALSE((!capacity_bounded.Push(blocks, MakePayload(0x77))));
     capacity_bounded.Clear();
     ASSERT_FALSE((capacity_bounded.UsedCapacity() != 0));
 
@@ -75,9 +74,9 @@ TEST(XhttpPacketQueue, Contract) {
     constexpr size_t budget = ::detail::XHttpPacketQueue::kMaxQueuedBytes;
     ASSERT_FALSE((!shared_budget.Reserve(budget) ||
         shared_budget.Reserve(1) ||
-        shared_budget.Push(0, MakePayload(0x88, pool))));
+        shared_budget.Push(0, MakePayload(0x88))));
     shared_budget.Release(::buf::Buffer::kSize);
-    ASSERT_FALSE((!shared_budget.Push(0, MakePayload(0x88, pool)) ||
+    ASSERT_FALSE((!shared_budget.Push(0, MakePayload(0x88)) ||
         shared_budget.Reserve(1)));
     shared_budget.Clear();
     ASSERT_FALSE((shared_budget.UsedCapacity() != budget - ::buf::Buffer::kSize));
@@ -100,10 +99,10 @@ TEST(XhttpPacketQueue, Contract) {
          ::detail::XHttpPacketQueue::kInOrderHeadroomBytes) /
         ::buf::Buffer::kSize;
     for (size_t i = 0; i < ooo_blocks; ++i) {
-        ASSERT_FALSE((!ooo_headroom.Push(i + 1, MakePayload(0x33, ::buf::Buffer::kSize, pool))));
+        ASSERT_FALSE((!ooo_headroom.Push(i + 1, MakePayload(0x33, ::buf::Buffer::kSize))));
     }
-    ASSERT_FALSE((ooo_headroom.Push(ooo_blocks + 1, MakePayload(0x33, ::buf::Buffer::kSize, pool))));
-    ASSERT_FALSE((!ooo_headroom.Push(0, MakePayload(0x44, ::buf::Buffer::kSize, pool))));
+    ASSERT_FALSE((ooo_headroom.Push(ooo_blocks + 1, MakePayload(0x33, ::buf::Buffer::kSize))));
+    ASSERT_FALSE((!ooo_headroom.Push(0, MakePayload(0x44, ::buf::Buffer::kSize))));
     ASSERT_FALSE((!ooo_headroom.HasReady()));
     { ASSERT_EQ((EXIT_SUCCESS), 0); return; }
 }

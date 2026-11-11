@@ -121,8 +121,7 @@ struct FramedUdpPacket {
 
 class UdpFramer {
 public:
-    UdpFramer(memory::worker_memory& pool, bool packet_addr) noexcept
-        : pool_(&pool), packet_addr_(packet_addr) {}
+    explicit UdpFramer(bool packet_addr) noexcept : packet_addr_(packet_addr) {}
 
     void Feed(buf::MultiBuffer input);
     [[nodiscard]] bool Next(FramedUdpPacket& out);
@@ -137,7 +136,6 @@ public:
         const TargetAddress& session_target);
 
 private:
-    memory::worker_memory* pool_;
     bool packet_addr_ = false;
     buf::LengthPrefixedPacketBuffer pending_;
 };
@@ -158,15 +156,14 @@ class UdpStreamEndpoint final
     : public transport::MultiBufferReader
     , public transport::MultiBufferWriter {
 public:
-    UdpStreamEndpoint(memory::worker_memory& pool,
-                      transport::MultiBufferReader& src,
+    UdpStreamEndpoint(transport::MultiBufferReader& src,
                       transport::MultiBufferWriter& dst,
                       const TargetAddress& target,
                       bool packet_addr)
         : src_(src)
         , dst_(dst)
         , target_(packet_addr ? TargetAddress{} : target)
-        , framer_(pool, packet_addr)
+        , framer_(packet_addr)
         , packet_addr_(packet_addr) {}
 
     transport::CancellationSource& Cancellation() noexcept override {

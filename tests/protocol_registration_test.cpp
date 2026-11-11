@@ -70,16 +70,15 @@ public:
 };
 
 std::unique_ptr<::proxyman::inbound::ProtocolRuntime>
-CreateInboundRuntime(memory::worker_memory& pool) {
-    return memory::MakeUnique<DummyRuntime>(pool);
+CreateInboundRuntime() {
+    return std::make_unique<DummyRuntime>();
 }
 
 std::unique_ptr<::Inbound> CreateInboundHandler(
     ::proxyman::inbound::ProtocolRuntime&,
     ::StatsShard&,
     ::ConnectionLimiter*,
-    const ::proxyman::inbound::BuildRequest&,
-    memory::worker_memory&) {
+    const ::proxyman::inbound::BuildRequest&) {
     return nullptr;
 }
 
@@ -87,8 +86,7 @@ std::unique_ptr<::Inbound> FailDatagramHandler(
     ::proxyman::inbound::ProtocolRuntime&,
     ::StatsShard&,
     ::ConnectionLimiter*,
-    const ::proxyman::inbound::BuildRequest&,
-    memory::worker_memory&) {
+    const ::proxyman::inbound::BuildRequest&) {
     return nullptr;
 }
 
@@ -96,9 +94,8 @@ std::unique_ptr<::Inbound> CreateDatagramHandler(
     ::proxyman::inbound::ProtocolRuntime&,
     ::StatsShard&,
     ::ConnectionLimiter*,
-    const ::proxyman::inbound::BuildRequest&,
-    memory::worker_memory& pool) {
-    return memory::MakeUnique<DummyDatagramHandler>(pool);
+    const ::proxyman::inbound::BuildRequest&) {
+    return std::make_unique<DummyDatagramHandler>();
 }
 
 std::optional<::proxyman::inbound::UserSet> BuildVmessUsers(
@@ -125,9 +122,8 @@ CreateOutboundConfig(
             [](std::string_view tag,
                const std::shared_ptr<const ::proxyman::outbound::OutboundProtocolSettings>&,
                ::net::io_context&,
-               ::AwaitableTaskGroup&,
-               memory::worker_memory& pool) -> std::unique_ptr<::Outbound> {
-                return memory::MakeUnique<DummyOutbound>(pool, std::string(tag));
+               ::AwaitableTaskGroup&) -> std::unique_ptr<::Outbound> {
+                return std::make_unique<DummyOutbound>(std::string(tag));
             }},
         .sender = {.stream_settings = {}, .send_through = ::OutboundBind::Auto()},
     };
@@ -142,8 +138,7 @@ CreateNullOutboundConfig(
             [](std::string_view,
                const std::shared_ptr<const ::proxyman::outbound::OutboundProtocolSettings>&,
                ::net::io_context&,
-               ::AwaitableTaskGroup&,
-               memory::worker_memory&) -> std::unique_ptr<::Outbound> {
+               ::AwaitableTaskGroup&) -> std::unique_ptr<::Outbound> {
                 return nullptr;
             }},
         .sender = {},
@@ -157,7 +152,6 @@ CreateEmptyOutboundConfig(
 }
 
 bool TestInboundRegistration() {
-    memory::worker_memory pool;
     ::proxyman::inbound::ProxyRegistration valid;
     valid.create_runtime = &CreateInboundRuntime;
     valid.create_tcp_handler = &CreateInboundHandler;
@@ -212,7 +206,7 @@ bool TestInboundRegistration() {
         return false;
     }
     if (!::proxyman::inbound::HasProxy("test-inbound")) return false;
-    if (!::proxyman::inbound::NewProtocolRuntime("test-inbound", pool)) {
+    if (!::proxyman::inbound::NewProtocolRuntime("test-inbound")) {
         return false;
     }
 
@@ -220,7 +214,7 @@ bool TestInboundRegistration() {
     DummyRuntime runtime;
     ::StatsShard stats;
     auto unknown_udp = ::proxyman::inbound::NewDatagramHandler(
-        "unknown-udp", runtime, stats, nullptr, request, pool);
+        "unknown-udp", runtime, stats, nullptr, request);
     if (unknown_udp.status !=
             ::proxyman::inbound::DatagramHandlerBuildStatus::Failed ||
         unknown_udp.handler) {
@@ -228,7 +222,7 @@ bool TestInboundRegistration() {
     }
 
     auto unsupported_udp = ::proxyman::inbound::NewDatagramHandler(
-        "test-inbound", runtime, stats, nullptr, request, pool);
+        "test-inbound", runtime, stats, nullptr, request);
     if (unsupported_udp.status !=
             ::proxyman::inbound::DatagramHandlerBuildStatus::Unsupported ||
         unsupported_udp.handler) {
@@ -242,7 +236,7 @@ bool TestInboundRegistration() {
     ::proxyman::inbound::RegisterProxy(
         "failed-udp", failed_udp_registration);
     auto failed_udp = ::proxyman::inbound::NewDatagramHandler(
-        "failed-udp", runtime, stats, nullptr, request, pool);
+        "failed-udp", runtime, stats, nullptr, request);
     if (failed_udp.status !=
             ::proxyman::inbound::DatagramHandlerBuildStatus::Failed ||
         failed_udp.handler) {
@@ -256,7 +250,7 @@ bool TestInboundRegistration() {
     ::proxyman::inbound::RegisterProxy(
         "ready-udp", ready_udp_registration);
     auto ready_udp = ::proxyman::inbound::NewDatagramHandler(
-        "ready-udp", runtime, stats, nullptr, request, pool);
+        "ready-udp", runtime, stats, nullptr, request);
     if (ready_udp.status !=
             ::proxyman::inbound::DatagramHandlerBuildStatus::Ready ||
         !ready_udp.handler) {
@@ -304,7 +298,6 @@ bool TestInboundRegistration() {
 }
 
 bool TestOutboundRegistration() {
-    memory::worker_memory pool;
     if (!Throws<std::invalid_argument>([] {
             ::proxyman::outbound::RegisterProxy(
                 "", &CreateOutboundConfig);
@@ -344,7 +337,7 @@ bool TestOutboundRegistration() {
     ::net::io_context io_context;
     ::ResidentTaskGroup tasks(io_context.get_executor());
     auto proxy = ::proxyman::outbound::NewProxy(
-        *prepared, io_context, tasks.Tasks(), pool);
+        *prepared, io_context, tasks.Tasks());
     if (!proxy || static_cast<DummyOutbound&>(*proxy).tag != source.tag) {
         return false;
     }
@@ -363,7 +356,7 @@ bool TestOutboundRegistration() {
     prepared = ::proxyman::outbound::PrepareOutboundConfig(source);
     if (!prepared || !Throws<std::logic_error>([&] {
             (void)::proxyman::outbound::NewProxy(
-                *prepared, io_context, tasks.Tasks(), pool);
+                *prepared, io_context, tasks.Tasks());
         })) {
         return false;
     }
@@ -372,7 +365,7 @@ bool TestOutboundRegistration() {
     missing_creator.tag = "missing-runtime-creator";
     if (!Throws<std::logic_error>([&] {
             (void)::proxyman::outbound::NewProxy(
-                missing_creator, io_context, tasks.Tasks(), pool);
+                missing_creator, io_context, tasks.Tasks());
         })) {
         return false;
     }

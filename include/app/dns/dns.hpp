@@ -573,8 +573,7 @@ public:
                 rejected.error = ErrorCode::RESOURCE_EXHAUSTED;
                 co_return rejected;
             }
-            // DNSWorker runs on the control loop: process layer.
-            pending = memory::AllocateShared<Pending>(nullptr, io_context_, domain);
+            pending = std::make_shared<Pending>(io_context_, domain);
             table_.emplace(std::string_view(pending->domain), pending);
             ++active_;
             try {

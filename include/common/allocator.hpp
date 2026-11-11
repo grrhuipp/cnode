@@ -48,20 +48,29 @@ inline void OnBufferFree() noexcept {}
 #ifdef CNODE_TEST_ALLOCATOR
 inline thread_local bool reject_next_process_allocation = false;
 inline thread_local size_t rejected_process_allocations = 0;
-inline thread_local bool reject_next_pmr_allocation = false;
-inline thread_local size_t rejected_pmr_allocations = 0;
+inline thread_local std::ptrdiff_t process_allocation_budget = -1;
 #endif
 
 namespace detail {
-[[nodiscard]] inline void* AllocateProcessRaw(std::size_t bytes_value, std::size_t alignment) {
+[[nodiscard]] inline void* TryAllocateProcessRaw(
+    std::size_t bytes_value, std::size_t alignment) noexcept {
 #ifdef CNODE_TEST_ALLOCATOR
     if (reject_next_process_allocation) {
         reject_next_process_allocation = false;
         ++rejected_process_allocations;
-        throw std::bad_alloc();
+        return nullptr;
     }
+    if (process_allocation_budget == 0) {
+        ++rejected_process_allocations;
+        return nullptr;
+    }
+    if (process_allocation_budget > 0) --process_allocation_budget;
 #endif
-    if (void* block = mi_malloc_aligned(bytes_value, alignment)) return block;
+    return mi_malloc_aligned(bytes_value, alignment);
+}
+
+[[nodiscard]] inline void* AllocateProcessRaw(std::size_t bytes_value, std::size_t alignment) {
+    if (void* block = TryAllocateProcessRaw(bytes_value, alignment)) return block;
     throw std::bad_alloc();
 }
 
@@ -90,114 +99,13 @@ private:
     return resource;
 }
 
-// Resolves a caller-supplied resource once at the ownership boundary: storage
-// that names no resource lives in the process layer, never in a Worker pool
-// chosen from thread state.
+// Resolve a caller-owned resource once; omitted resources use the process layer.
 [[nodiscard]] inline std::pmr::memory_resource* ResourceOrProcess(
     std::pmr::memory_resource* resource) noexcept {
     return resource ? resource : process_resource();
 }
 
-// Worker-local pool: one mimalloc first-class heap. mimalloc keeps this heap's
-// blocks in pages of their own (never shared with another heap), segregated by
-// size class with page metadata outside the blocks. A page whose blocks are all
-// free returns to the shared arena and is purged after mi_option_purge_delay;
-// Collect() forces that for the calling thread's part of this heap.
-//
-// The pool is owned explicitly (a Worker member, or a test-local object) and
-// passed to every allocation; nothing selects it from thread-local or default
-// PMR state. It is a thin adapter over mimalloc's heap API, which resolves the
-// calling thread's heap state itself. Worker affinity is an ownership
-// invariant of the callers, not something this adapter enforces.
-class worker_memory final : public std::pmr::memory_resource {
-public:
-    // Page-level view of this heap; computed by visiting its pages.
-    struct Footprint {
-        std::size_t committed_bytes = 0;
-        std::size_t used_bytes = 0;
-        std::size_t live_allocations = 0;
-        std::size_t pages = 0;
-    };
-
-    worker_memory() : heap_(mi_heap_new()) {
-        if (!heap_) throw std::bad_alloc();
-    }
-
-    worker_memory(const worker_memory&) = delete;
-    worker_memory& operator=(const worker_memory&) = delete;
-
-    ~worker_memory() override {
-        mi_heap_delete(heap_);
-    }
-
-    // Visits every page of this heap: diagnostics and tests only, never on a
-    // request path. Requires that no other thread uses this heap meanwhile.
-    [[nodiscard]] Footprint GetFootprint() const noexcept {
-        Footprint footprint;
-        (void)mi_heap_visit_blocks(heap_, false, &AccumulateArea, &footprint);
-        return footprint;
-    }
-
-    [[nodiscard]] std::size_t OutstandingAllocations() const noexcept {
-        return GetFootprint().live_allocations;
-    }
-
-    // Returns the calling thread's empty pages of this heap to the arena and
-    // purges them now.
-    void Collect() noexcept {
-        mi_heap_collect(heap_, true);
-    }
-
-    [[nodiscard]] std::pmr::memory_resource* resource() & noexcept { return this; }
-    [[nodiscard]] std::pmr::memory_resource* resource() const& noexcept {
-        return const_cast<worker_memory*>(this);
-    }
-    [[nodiscard]] std::pmr::memory_resource* resource() && = delete;
-    [[nodiscard]] std::pmr::memory_resource* resource() const&& = delete;
-
-    [[nodiscard]] void* Allocate(std::size_t bytes, std::size_t alignment) noexcept {
-#ifdef CNODE_TEST_ALLOCATOR
-        if (reject_next_pmr_allocation) {
-            reject_next_pmr_allocation = false;
-            ++rejected_pmr_allocations;
-            return nullptr;
-        }
-#endif
-        return mi_heap_malloc_aligned(heap_, bytes, alignment);
-    }
-
-    void Deallocate(void* pointer, std::size_t = 0, std::size_t = 0) noexcept {
-        mi_free(pointer);
-    }
-
-protected:
-    void* do_allocate(std::size_t bytes, std::size_t alignment) override {
-        if (void* pointer = Allocate(bytes, alignment)) return pointer;
-        throw std::bad_alloc();
-    }
-    void do_deallocate(void* p, std::size_t bytes, std::size_t alignment) override {
-        Deallocate(p, bytes, alignment);
-    }
-    [[nodiscard]] bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
-        return this == &other;
-    }
-
-private:
-    static bool AccumulateArea(const mi_heap_t*, const mi_heap_area_t* area, void*,
-                               std::size_t, void* argument) noexcept {
-        auto& footprint = *static_cast<Footprint*>(argument);
-        footprint.committed_bytes += area->committed;
-        footprint.used_bytes += area->used * area->full_block_size;
-        footprint.live_allocations += area->used;
-        ++footprint.pages;
-        return true;
-    }
-
-    mi_heap_t* const heap_;
-};
-
-// Native Asio operation storage can be allocated, delivered, cancelled, or
-// destroyed by different reactor threads. It never belongs to a session pool.
+// Native Asio operation storage may retire on a different reactor thread.
 template <class T>
 class ProcessAllocator : public std::pmr::polymorphic_allocator<T> {
 public:
@@ -207,47 +115,13 @@ public:
     template <class U> struct rebind { using other = ProcessAllocator<U>; };
 };
 
-// Objects allocated from an explicit Worker pool: `new (pool) T(...)`.
-// mimalloc frees a block without knowing its heap, so delete needs no pool.
-struct WorkerAllocated {
-    static void* operator new(std::size_t) = delete;
-    static void* operator new(std::size_t, std::align_val_t) = delete;
-    static void* operator new(std::size_t size, worker_memory& pool) {
-        if (void* p = pool.Allocate(size, alignof(std::max_align_t))) return p;
-        throw std::bad_alloc();
-    }
-    static void* operator new(std::size_t size, std::align_val_t alignment, worker_memory& pool) {
-        if (void* p = pool.Allocate(size, static_cast<std::size_t>(alignment))) return p;
-        throw std::bad_alloc();
-    }
-    static void* operator new(std::size_t, void* p) noexcept { return p; }
-    static void operator delete(void*, void*) noexcept {}
-    static void operator delete(void* p, worker_memory&) noexcept { mi_free(p); }
-    static void operator delete(void* p, std::align_val_t, worker_memory&) noexcept { mi_free(p); }
-    static void operator delete(void* p) noexcept { mi_free(p); }
-    static void operator delete(void* p, std::align_val_t) noexcept { mi_free(p); }
-};
-
-template <class T, class... Args>
-    requires std::is_base_of_v<WorkerAllocated, T>
-[[nodiscard]] std::unique_ptr<T> MakeUnique(worker_memory& pool, Args&&... args) {
-    return std::unique_ptr<T>(new (pool) T(std::forward<Args>(args)...));
-}
-
-// Forces this thread's process-layer mimalloc state to return empty pages now.
-inline void CollectProcessHeap() noexcept {
+// Collects the calling thread's mimalloc heap and purges its empty pages.
+inline void CollectThreadHeap() noexcept {
     mi_collect(true);
 }
 
-// Called on the Worker thread that uses `pool`: also collects its pool pages.
-inline void CollectBurst(worker_memory& pool) noexcept {
-    pool.Collect();
-    CollectProcessHeap();
-}
-
-// PMR allocator bound to one resource. Default construction means the process
-// layer; a Worker pool is used only when passed in. Copies keep the source's
-// resource; move assignment and swap carry it along.
+// PMR allocator bound to one resource. Defaults use the process layer; copies
+// preserve the resource, and move assignment/swap carry it along.
 template <class T>
 class Allocator {
     template <class U>
@@ -304,10 +178,6 @@ private:
 
     std::pmr::memory_resource* resource_;
 };
-template <class T, class... Args>
-[[nodiscard]] std::shared_ptr<T> AllocateShared(std::pmr::memory_resource* resource, Args&&... args) {
-    return std::allocate_shared<T>(Allocator<T>(resource), std::forward<Args>(args)...);
-}
 template <class T> using Vector = std::vector<T, Allocator<T>>;
 
 // Zero-allocation-when-empty PMR ring deque. Allocates a contiguous power-of-2

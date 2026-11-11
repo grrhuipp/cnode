@@ -16,7 +16,6 @@ namespace {
 using namespace std::chrono_literals;
 
 struct ReadFixture {
-    memory::worker_memory pool;
     net::io_context io;
     tcp::acceptor acceptor{io, {net::ip::address_v4::loopback(), 0}};
     tcp::socket socket{io}, peer{io};
@@ -29,7 +28,7 @@ struct ReadFixture {
         acceptor.accept(peer);
     }
     ~ReadFixture() {
-        memory::reject_next_pmr_allocation = false;
+        memory::reject_next_process_allocation = false;
         if (stream) stream->Close();
         IoErrorCode ignored;
         peer.close(ignored);
@@ -38,7 +37,7 @@ struct ReadFixture {
         io.run();
     }
     void Start() {
-        stream = memory::MakeUnique<TcpStream>(pool, pool, std::move(socket));
+        stream = std::make_unique<TcpStream>(std::move(socket));
         stream->SetReadTimeout(2s);
     }
     void Preload(const std::vector<uint8_t>& payload) {
@@ -109,13 +108,13 @@ TEST(TcpRead, AllocationFailureDoesNotConsumeQueuedInput) {
     fixture.Start();
     fixture.stream->SetReadTimeout(0s);
     memory::detail::test_buffers_peak = 0;
-    memory::reject_next_pmr_allocation = true;
+    memory::reject_next_process_allocation = true;
     auto attempt = [&]() -> net::awaitable<void> {
         (void)co_await fixture.stream->ReadMultiBuffer();
     };
     auto failed = net::co_spawn(fixture.io, attempt(), net::use_future);
     EXPECT_THROW(fixture.Finish(std::move(failed)), std::bad_alloc);
-    EXPECT_FALSE(memory::reject_next_pmr_allocation);
+    EXPECT_FALSE(memory::reject_next_process_allocation);
     EXPECT_EQ(memory::detail::test_buffers_peak, 0u);
     EXPECT_EQ(memory::detail::test_buffers_live, 0u);
     fixture.stream->SetReadTimeout(2s);

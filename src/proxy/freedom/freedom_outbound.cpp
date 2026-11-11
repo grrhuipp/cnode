@@ -260,9 +260,8 @@ PrepareOutbound(FreedomSettings settings) {
     return proxyman::outbound::MakePreparedOutboundCreator<
         FreedomSettings,
         +[](std::string_view, std::shared_ptr<const FreedomSettings> config,
-            net::io_context&, AwaitableTaskGroup&,
-            memory::worker_memory& pool) -> std::unique_ptr<Outbound> {
-            return memory::MakeUnique<Handler>(pool, *config);
+            net::io_context&, AwaitableTaskGroup&) -> std::unique_ptr<Outbound> {
+            return std::make_unique<Handler>(*config);
         }>(std::move(settings));
 }
 }  // namespace proxy::freedom::outbound

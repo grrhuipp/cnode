@@ -76,12 +76,10 @@ public:
         if (write_closed_) throw transport::WriteClosed();
     }
 
-    AnyTLSSubStream(memory::worker_memory& pool,
-                    net::io_context& io_context,
+    AnyTLSSubStream(net::io_context& io_context,
                     AnyTLSDemuxSession& session,
                     uint32_t sid)
-        : ctx(pool)
-        , input_signal_(net::any_io_executor(io_context.get_executor()), 1)
+        : input_signal_(net::any_io_executor(io_context.get_executor()), 1)
         , input_space_signal_(net::any_io_executor(io_context.get_executor()), 1)
         , session_(session)
         , sid_(sid) {}
@@ -484,7 +482,7 @@ net::awaitable<ErrorCode> AnyTLSDemuxSession::ProcessUdpSubstream(
     std::optional<proxy::uot::PreparedRequest> prepared;
     auto read_header = [&]() -> net::awaitable<ErrorCode> {
         auto uot_header = co_await proxy::uot::ReadUotRequestHeader(
-            uot_version, sub, std::move(pending), ErrorCode::CONNECTION_CLOSED, sub.ctx.pool);
+            uot_version, sub, std::move(pending), ErrorCode::CONNECTION_CLOSED);
         if (!uot_header) co_return uot_header.error();
         prepared.emplace(std::move(*uot_header));
         co_return ErrorCode::OK;
@@ -714,9 +712,7 @@ net::awaitable<RelayResult> AnyTLSDemuxSession::ReadFrames(AwaitableTaskGroup& t
                 continue;
             }
             const auto opened_at = std::chrono::steady_clock::now();
-            auto& pool = session_ctx_.pool;
-            auto sub = memory::AllocateShared<AnyTLSSubStream>(
-                pool.resource(), pool, io_context_, *this, sid);
+            auto sub = std::make_shared<AnyTLSSubStream>(io_context_, *this, sid);
             sub->ctx.InitSubstreamFrom(session_ctx_);
             sub->ctx.content.network = Network::TCP;
             streams_.emplace(sid, sub);
@@ -920,14 +916,13 @@ const bool kInboundRegistered = [] {
         [](::proxyman::inbound::ProtocolRuntime& runtime,
            ::StatsShard& stats,
            ::ConnectionLimiter* limiter,
-           const ::proxyman::inbound::BuildRequest& req,
-           memory::worker_memory& pool) -> std::unique_ptr<::Inbound> {
+           const ::proxyman::inbound::BuildRequest& req) -> std::unique_ptr<::Inbound> {
             auto* tracker = runtime.OnlineTracker();
             const auto* settings = GetAnyTlsSettings(req);
             if (!tracker || !settings) {
                 return nullptr;
             }
-            return memory::MakeUnique<::proxy::anytls::inbound::Handler>(pool,
+            return std::make_unique<::proxy::anytls::inbound::Handler>(
                 *tracker,
                 stats,
                 limiter,

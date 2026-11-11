@@ -118,8 +118,7 @@ public:
         , dispatcher_(dispatcher)
         , stats_(stats)
         , request_load_(request_load)
-        , timeouts_(timeouts)
-        , base_ctx_(base_ctx.pool) {
+        , timeouts_(timeouts) {
         // TCP 与 Hysteria 的 base_ctx 已携带本监听器的 accounting_key；
         // 子流经 InitSubstreamFrom 继承 connection_family 作为逻辑准入的物理族。
         base_ctx_.InitSubstreamFrom(base_ctx);
@@ -157,7 +156,7 @@ public:
         if (!stream) {
             co_return;
         }
-        session::Context ctx(base_ctx_.pool);
+        session::Context ctx;
         ctx.InitSubstreamFrom(base_ctx_);
         ApplyHttpRealIp(ctx, metadata.real_ip);
 
@@ -223,8 +222,7 @@ std::shared_ptr<InboundTransportStreamHandler> Handler::NewAuthenticatedStreamSi
     const TimeoutsConfig& timeouts,
     const session::Context& session_ctx,
     std::shared_ptr<ConnectionLimiter::Family> family) {
-    return memory::AllocateShared<LogicalTransportStreamSink>(
-        session_ctx.pool.resource(),
+    return std::make_shared<LogicalTransportStreamSink>(
         shared_from_this(), io_context, dispatcher, stats, request_load, timeouts,
         session_ctx, true, std::move(family));
 }
@@ -326,8 +324,7 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
     if (listener.stream_settings.IsGrpc() ||
         listener.stream_settings.IsHttp() ||
         listener.stream_settings.IsXHttp()) {
-        logical_stream_handler = memory::AllocateShared<LogicalTransportStreamSink>(
-            ctx.pool.resource(),
+        logical_stream_handler = std::make_shared<LogicalTransportStreamSink>(
             shared_from_this(),
             io_context,
             dispatcher,
@@ -399,8 +396,8 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
 // HandlerRegistry
 // ============================================================================
 
-HandlerRegistry::HandlerRegistry(memory::worker_memory& pool, StatsShard& stats)
-    : pool_(pool), stats_(stats), runtimes_(pool.resource()), handlers_(pool.resource()) {}
+HandlerRegistry::HandlerRegistry(StatsShard& stats)
+    : stats_(stats) {}
 
 HandlerRegistry::~HandlerRegistry() noexcept = default;
 
@@ -417,7 +414,7 @@ std::unique_ptr<::Inbound> HandlerRegistry::NewHandler(
         return nullptr;
     }
     return ::proxyman::inbound::NewHandler(
-        req.protocol, *runtime, stats_, limiter, req, pool_);
+        req.protocol, *runtime, stats_, limiter, req);
 }
 
 DatagramHandlerBuildResult HandlerRegistry::NewDatagramHandler(
@@ -428,7 +425,7 @@ DatagramHandlerBuildResult HandlerRegistry::NewDatagramHandler(
         return {DatagramHandlerBuildStatus::Failed, nullptr};
     }
     return ::proxyman::inbound::NewDatagramHandler(
-        req.protocol, *runtime, stats_, limiter, req, pool_);
+        req.protocol, *runtime, stats_, limiter, req);
 }
 
 ProtocolRuntime* HandlerRegistry::GetOrCreateRuntime(
@@ -436,7 +433,7 @@ ProtocolRuntime* HandlerRegistry::GetOrCreateRuntime(
     if (auto it = runtimes_.find(protocol); it != runtimes_.end()) {
         return it->second.get();
     }
-    auto runtime = NewProtocolRuntime(protocol, pool_);
+    auto runtime = NewProtocolRuntime(protocol);
     if (!runtime) return nullptr;
     auto result = runtimes_.emplace(
         memory::String(protocol), std::move(runtime));
@@ -448,10 +445,8 @@ HandlerRegistry::HandlerPtr HandlerRegistry::ReplaceHandler(std::unique_ptr<Hand
         return nullptr;
     }
 
-    memory::String tag(handler->Tag(), pool_.resource());
-    auto shared_handler = std::shared_ptr<Handler>(
-        handler.release(), std::default_delete<Handler>{},
-        memory::Allocator<Handler>(pool_.resource()));
+    memory::String tag(handler->Tag());
+    auto shared_handler = std::shared_ptr<Handler>(std::move(handler));
     auto it = handlers_.find(tag);
     if (it == handlers_.end()) {
         auto [inserted_it, inserted] = handlers_.try_emplace(
@@ -544,14 +539,13 @@ DatagramTransport RegisteredDatagramTransport(
 }
 
 std::unique_ptr<ProtocolRuntime> NewProtocolRuntime(
-    std::string_view protocol,
-    memory::worker_memory& pool) {
+    std::string_view protocol) {
     auto& registrations = Registrations();
     auto it = registrations.find(protocol);
     if (it == registrations.end() || !it->second.create_runtime) {
         return nullptr;
     }
-    return it->second.create_runtime(pool);
+    return it->second.create_runtime();
 }
 
 std::unique_ptr<::Inbound> NewHandler(
@@ -559,14 +553,13 @@ std::unique_ptr<::Inbound> NewHandler(
     ProtocolRuntime& runtime,
     ::StatsShard& stats,
     ::ConnectionLimiter* limiter,
-    const BuildRequest& req,
-    memory::worker_memory& pool) {
+    const BuildRequest& req) {
     auto& registrations = Registrations();
     auto it = registrations.find(protocol);
     if (it == registrations.end() || !it->second.create_tcp_handler) {
         return nullptr;
     }
-    return it->second.create_tcp_handler(runtime, stats, limiter, req, pool);
+    return it->second.create_tcp_handler(runtime, stats, limiter, req);
 }
 
 DatagramHandlerBuildResult NewDatagramHandler(
@@ -574,8 +567,7 @@ DatagramHandlerBuildResult NewDatagramHandler(
     ProtocolRuntime& runtime,
     ::StatsShard& stats,
     ::ConnectionLimiter* limiter,
-    const BuildRequest& req,
-    memory::worker_memory& pool) {
+    const BuildRequest& req) {
     auto& registrations = Registrations();
     auto it = registrations.find(protocol);
     if (it == registrations.end()) {
@@ -585,7 +577,7 @@ DatagramHandlerBuildResult NewDatagramHandler(
         return {DatagramHandlerBuildStatus::Unsupported, nullptr};
     }
     auto handler =
-        it->second.create_datagram_handler(runtime, stats, limiter, req, pool);
+        it->second.create_datagram_handler(runtime, stats, limiter, req);
     if (!handler) {
         return {DatagramHandlerBuildStatus::Failed, nullptr};
     }

@@ -19,7 +19,7 @@
 
 namespace transport::internet {
 
-// HTTP/1 message head read into one pooled Buffer. Bytes past the blank line
+// HTTP/1 message head read into one Buffer. Bytes past the blank line
 // are read-ahead that the caller must hand to the next reader in order.
 struct Http1MessageHead {
     buf::BufferGuard storage;
@@ -46,11 +46,11 @@ struct Http1MessageHead {
             storage->Advance(static_cast<uint32_t>(header_end));
             return buf::MultiBuffer{std::move(storage)};
         }
-        // Read-ahead bytes always live in `storage`; copy them into its pool.
+        // Read-ahead bytes always live in `storage`; copy them before releasing it.
         buf::MultiBuffer mb;
         const auto read_ahead = ReadAhead();
         size = header_end;
-        if (!buf::AppendSpanToMultiBuffer(read_ahead, mb, storage->Pool())) {
+        if (!buf::AppendSpanToMultiBuffer(read_ahead, mb)) {
             throw std::bad_alloc();
         }
         return mb;

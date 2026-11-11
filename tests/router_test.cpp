@@ -48,9 +48,7 @@ void TestRulesAndOwnership() {
     const ::routing::Router& query = *router;
     Require(query.DomainStrategy() == ::routing::DomainStrategy::IPIfNonMatch,
             "domain strategy must be available through the feature contract");
-
-    ::memory::worker_memory pool;
-    ::session::Context ctx(pool);
+    ::session::Context ctx;
     ctx.content.network = ::Network::TCP;
     ctx.outbound.target = ::TargetAddress("WWW.EXAMPLE.COM.", 443);
     ctx.outbound.target.resolved_addr = ::net::ip::make_address("192.0.2.1");
@@ -102,13 +100,10 @@ void TestRulesAndOwnership() {
 void TestInboundMetadataOwnershipAndRouting() {
     using ::session::Context;
     {
-        ::memory::worker_memory pool;
         {
             {
-                Context ctx(pool);
-                Context copy(pool);
-                Require(pool.OutstandingAllocations() == 0,
-                        "a fresh Context must not pre-allocate an arena block");
+                Context ctx;
+                Context copy;
                 {
                     ::proxyman::inbound::ReceiverSettings receiver{
                         .inbound_tag = {}, .inbound_tags = {}, .protocol = {},
@@ -133,29 +128,23 @@ void TestInboundMetadataOwnershipAndRouting() {
                             ctx.inbound.user_email.size() == 108 && ctx.inbound.tags.size() == 2 &&
                             ctx.inbound.tags[1].size() == 112,
                         "inbound metadata must outlive its cold receiver source");
-                Require(pool.OutstandingAllocations() > 0,
-                        "long inbound metadata and its copy must allocate through the Worker pool");
-                Require(ctx.inbound.tag.get_allocator().resource() == pool.resource() &&
-                            ctx.inbound.accounting_key.get_allocator().resource() == pool.resource() &&
-                            ctx.inbound.user_email.get_allocator().resource() == pool.resource() &&
-                            ctx.inbound.tags.get_allocator().resource() == pool.resource() &&
-                            ctx.inbound.tags[0].get_allocator().resource() == pool.resource() &&
-                            copy.inbound.tag.get_allocator().resource() == pool.resource() &&
-                            copy.inbound.tags[0].get_allocator().resource() == pool.resource(),
-                        "inbound metadata and Context copies must use the Context pool resource");
+                Require(ctx.inbound.tag.get_allocator().resource() == ::memory::process_resource() &&
+                            ctx.inbound.accounting_key.get_allocator().resource() == ::memory::process_resource() &&
+                            ctx.inbound.user_email.get_allocator().resource() == ::memory::process_resource() &&
+                            ctx.inbound.tags.get_allocator().resource() == ::memory::process_resource() &&
+                            ctx.inbound.tags[0].get_allocator().resource() == ::memory::process_resource() &&
+                            copy.inbound.tag.get_allocator().resource() == ::memory::process_resource() &&
+                            copy.inbound.tags[0].get_allocator().resource() == ::memory::process_resource(),
+                        "inbound metadata and Context copies must use the process resource");
                 ctx.inbound.tag[0] = 'c';
-                const size_t allocs_before_ipv6 = pool.OutstandingAllocations();
                 ctx.outbound.target = ::TargetAddress("2001:db8:85a3::8a2e:370:7334", 443);
                 Require(ctx.outbound.target.IsIPv6() &&
-                            ctx.outbound.target.host.empty() &&
-                            pool.OutstandingAllocations() == allocs_before_ipv6,
-                        "IPv6 literal TargetAddress must not allocate on the heap");
+                            ctx.outbound.target.host.empty(),
+                        "IPv6 literal TargetAddress must use its inline address representation");
                 ctx.inbound.tags[1][0] = 'y';
                 Require(copy.inbound.tag[0] == 'm' && copy.inbound.tags[1][0] == 'x',
                         "copied inbound metadata must be independent owned values");
             }
-            Require(pool.OutstandingAllocations() == 0,
-                    "destroying metadata Contexts must release their Worker pool allocations");
         }
     }
 
@@ -170,9 +159,7 @@ void TestInboundMetadataOwnershipAndRouting() {
     extra_tag.outbound_tag = "extra-out";
     config.rules = {main_tag, extra_tag};
     const Router router(config, nullptr);
-
-    ::memory::worker_memory pool;
-    Context routed(pool);
+    Context routed;
     routed.inbound.tag = std::string(96, 'm');
     routed.inbound.tags.emplace_back(std::string(112, 'x'));
     routed.outbound.target = ::TargetAddress("main.example", 443);
@@ -211,8 +198,7 @@ void TestInvalidConstruction() {
                                    "unresolved geo rules must fail construction");
 
     const Router empty(::RoutingConfig{}, nullptr);
-    ::memory::worker_memory pool;
-    Require(!empty.Route(::session::Context(pool)).matched,
+    Require(!empty.Route(::session::Context{}).matched,
             "an empty router must have no implicit default");
 }
 

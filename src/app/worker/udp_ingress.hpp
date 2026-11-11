@@ -236,7 +236,7 @@ struct UdpAssociationHook final {
 // Worker-local min-heap over association rows embedded in UdpIngress maps.
 // One maintenance event sleeps until the nearest row deadline and reclaims at
 // most a bounded batch per wake; no timer runs while no row can expire.
-class UdpAssociationReclaimer final : public memory::WorkerAllocated, private TimeoutEvent {
+class UdpAssociationReclaimer final : private TimeoutEvent {
 public:
     using FailureCallback = void (*)(void*, std::exception_ptr);
     using TimePoint = UdpAssociationHook::TimePoint;
@@ -326,7 +326,7 @@ struct UdpHandoffIdentityHash {
     }
 };
 // Worker-private owner for native UDP sockets, client sessions and reply queues.
-class UdpIngress final : public memory::WorkerAllocated {
+class UdpIngress final {
 public:
     // Handles remain Worker-local; receive/send operations retain them only
     // across their own asynchronous cancellation boundary.
@@ -377,7 +377,7 @@ public:
     };
 
 
-    UdpIngress(memory::worker_memory& pool, std::string_view tag, std::unique_ptr<::Inbound> proxy,
+    UdpIngress(std::string_view tag, std::unique_ptr<::Inbound> proxy,
                UdpAssociationReclaimer& reclaimer, UdpResourceBudget& budget,
                net::io_context& io_context);
     ~UdpIngress() noexcept;
@@ -421,8 +421,8 @@ public:
     void CleanupAllClientSessions() noexcept;
 
     [[nodiscard]] static SocketPtr MakeSocket(
-        net::io_context& io_context, memory::worker_memory& pool) {
-        return memory::AllocateShared<udp::socket>(pool.resource(), io_context);
+        net::io_context& io_context) {
+        return std::make_shared<udp::socket>(io_context);
     }
     // A socket key belongs to one receive loop. Duplicate attachment is
     // rejected instead of cancelling and replacing the live socket.
@@ -499,7 +499,6 @@ private:
                              InboundDatagramAssociation* association) noexcept;
     void Unlink(UdpClientSession& row) noexcept;
 
-    memory::worker_memory& pool_;
     memory::String tag_;
     std::unique_ptr<::Inbound> proxy_;
     UdpAssociationReclaimer& reclaimer_;
@@ -523,8 +522,7 @@ class UdpIngress::ClientSession final
 public:
     transport::CancellationSource& Cancellation() noexcept override;
 
-    ClientSession(memory::worker_memory& pool,
-                  net::io_context& io_context,
+    ClientSession(net::io_context& io_context,
                   ReplyRoute reply,
                   udp::endpoint reply_endpoint,
                   ::InboundDatagramOwner session_owner,
@@ -549,15 +547,15 @@ public:
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override;
     net::awaitable<void> WriteBuffers(
         std::span<const net::const_buffer> buffers) override {
-        return WriteBuffersAsMultiBuffer(buffers, pool_);
+        return WriteBuffersAsMultiBuffer(buffers);
     }
 
 private:
     friend class UdpIngress;
 
     struct RequestData {
-        RequestData(memory::worker_memory& pool, routing::DispatchPolicy dispatch_policy)
-            : context(pool), policy(std::move(dispatch_policy)) {}
+        explicit RequestData(routing::DispatchPolicy dispatch_policy)
+            : policy(std::move(dispatch_policy)) {}
         session::Context context;
         routing::DispatchPolicy policy;
         routing::Dispatcher* dispatcher = nullptr;
@@ -582,7 +580,6 @@ private:
     }
     void CloseWithError(ErrorCode error) noexcept;
 
-    memory::worker_memory& pool_;
     UdpResourceBudget::AssociationLease association_;
     UdpResourceBudget* budget_;
     SignalChannel reader_signal_;
@@ -637,8 +634,7 @@ public:
                 protected_until != Clock::time_point{} &&
                 protected_until < Clock::now()) {
                 try {
-                    auto record = memory::AllocateShared<UdpHandoffRecord>(
-                        records.get_allocator().resource(), policy);
+                    auto record = std::make_shared<UdpHandoffRecord>(policy);
                     record->configuration = std::move(configuration);
                     found->second = std::move(record);
                 } catch (...) {
@@ -660,8 +656,7 @@ public:
             MaybeShrinkHashContainer(records);
             if (records.size() >= policy.capacity) return {};
         }
-        auto record = memory::AllocateShared<UdpHandoffRecord>(
-            records.get_allocator().resource(), policy);
+        auto record = std::make_shared<UdpHandoffRecord>(policy);
         record->configuration = std::move(configuration);
         records.emplace(key, record);
         return record;

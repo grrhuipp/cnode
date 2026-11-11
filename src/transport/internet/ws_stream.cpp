@@ -82,7 +82,7 @@ void AddPayloadSize(size_t& total, size_t size) {
 
 BaseWsStream::BaseWsStream(
     std::unique_ptr<AsyncStream> inner, bool is_client)
-    : AsyncStream(inner->Pool()), inner_(std::move(inner)), is_client_(is_client) {}
+    : inner_(std::move(inner)), is_client_(is_client) {}
 
 BaseWsStream::~BaseWsStream() noexcept {
     Close();
@@ -369,7 +369,7 @@ net::awaitable<buf::MultiBuffer> BaseWsStream::ReadMultiBuffer() {
         ConsumePayloadBytes(output->Bytes());
         co_return buf::MultiBuffer{std::move(output)};
     }
-    buf::BufferGuard output{buf::Buffer::New(Pool())};
+    buf::BufferGuard output{buf::Buffer::New()};
     if (!output) throw std::bad_alloc();
     const size_t size = static_cast<size_t>(std::min<uint64_t>(
         output->Available(), frame_payload_remaining_));
@@ -419,7 +419,7 @@ net::awaitable<void> BaseWsStream::WriteDataFrame(
             output.AppendBuffers(buffers);
             co_await inner_->WriteBuffers(output.Span());
         } else {
-            buf::BufferGuard scratch{buf::Buffer::New(Pool())};
+            buf::BufferGuard scratch{buf::Buffer::New()};
             if (!scratch) throw std::bad_alloc();
             std::memcpy(scratch->Tail().data(), header.bytes.data(), header.size);
             scratch->Produce(static_cast<uint32_t>(header.size));

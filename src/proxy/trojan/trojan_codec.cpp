@@ -203,7 +203,7 @@ bool UdpFramer::Next(FramedUdpPacket& out) {
     pending_.ReleaseIfIdle();
     out.target = std::move(*target_);
     target_.reset();
-    if (!buf::SetUdpTarget(out.payload, out.target, *pool_)) {
+    if (!buf::SetUdpTarget(out.payload, out.target)) {
         Fail();
         throw std::bad_alloc();
     }

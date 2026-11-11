@@ -618,91 +618,69 @@ public:
         co_return snapshots;
     }
 
-    net::awaitable<void> CollectWorkerHeaps() const {
-        ThrowIfStopping();
-        co_await RunWorkerBatch(env.main_ctx->get_executor(), env.worker_pool.workers,
-            [this](Worker& worker, size_t) {
-                return [](const RuntimeOwner& owner, Worker* current) -> net::awaitable<void> {
-                    owner.ThrowIfStopping();
-                    co_await current->PostCall([current] { current->CollectHeap(); });
-                }(*this, &worker);
-            });
-        ThrowIfStopping();
-        // The control thread owns no Worker pool, only process-layer state.
-        memory::CollectProcessHeap();
-    }
-
     net::awaitable<void> RuntimeSamplingLoop() {
         net::steady_timer timer(*env.main_ctx);
-        uint32_t last_sample_total_conns = 0;
-        uint64_t last_force_collect_total_connections = 0;
-        bool churn_collect_baseline_set = false;
-        auto last_force_collect_at = steady_clock::time_point{};
+        struct WorkerActivitySample {
+            uint64_t connections_total;
+            uint64_t connections_active;
+            uint64_t bytes_in;
+            uint64_t bytes_out;
+            uint64_t errors;
+            uint32_t active_sessions;
+            size_t udp_sockets;
+            bool operator==(const WorkerActivitySample&) const = default;
+        };
+        struct IdleHeapState {
+            std::optional<WorkerActivitySample> previous;
+            bool collected = false;
+        };
+        std::vector<IdleHeapState> heap_states(env.worker_pool.workers.size());
+        std::vector<Worker*> idle_workers;
+        idle_workers.reserve(env.worker_pool.workers.size());
         auto last_log_flush_at = steady_clock::time_point{};
         while (true) {
             auto worker_snapshots = co_await CollectWorkerRuntimeStats(false);
             auto aggregate_stats = AggregateWorkerStats(worker_snapshots);
             env.stats->SampleNow(aggregate_stats);
             constexpr auto kAsyncLogFlushInterval = std::chrono::seconds(5);
-            {
-                constexpr uint32_t kForceCollectMinPrevConns = 4096;
-                constexpr uint32_t kForceCollectDropFactor = 4;
-                constexpr uint32_t kForceCollectConnFloor = 64;
-                constexpr auto kForceCollectCooldown = std::chrono::seconds(5);
-                constexpr uint64_t kChurnForceCollectConnections = 2048;
-                constexpr uint32_t kChurnForceCollectMinConns = 512;
-                constexpr auto kChurnForceCollectCooldown = std::chrono::seconds(60);
-
-                uint32_t total_conns = 0;
-                for (const auto& worker_snapshot : worker_snapshots) {
-                    total_conns += worker_snapshot.active_connections;
+            idle_workers.clear();
+            for (size_t index = 0; index < worker_snapshots.size(); ++index) {
+                const auto& snapshot = worker_snapshots[index];
+                const WorkerActivitySample activity{
+                    .connections_total = snapshot.stats.connections_total,
+                    .connections_active = snapshot.stats.connections_active,
+                    .bytes_in = snapshot.stats.bytes_in,
+                    .bytes_out = snapshot.stats.bytes_out,
+                    .errors = snapshot.stats.errors,
+                    .active_sessions = snapshot.active_connections,
+                    .udp_sockets = snapshot.memory.udp_sockets,
+                };
+                auto& state = heap_states[index];
+                if (!state.previous || *state.previous != activity) {
+                    state.previous = activity;
+                    state.collected = false;
+                } else if (!state.collected) {
+                    idle_workers.push_back(env.worker_pool.workers[index].get());
                 }
-
-                uint32_t force_threshold = last_sample_total_conns / kForceCollectDropFactor;
-                if (force_threshold < kForceCollectConnFloor) {
-                    force_threshold = kForceCollectConnFloor;
-                }
-
-                const bool burst_drain =
-                    last_sample_total_conns >= kForceCollectMinPrevConns &&
-                    total_conns <= force_threshold;
-                const bool newly_idle = (total_conns == 0 && last_sample_total_conns > 0);
-                const auto now = steady_clock::now();
-                const bool cooldown_ok =
-                    last_force_collect_at.time_since_epoch().count() == 0 ||
-                    now - last_force_collect_at >= kForceCollectCooldown;
-                if (!churn_collect_baseline_set) {
-                    last_force_collect_total_connections = aggregate_stats.connections_total;
-                    churn_collect_baseline_set = true;
-                }
-                const uint64_t churn_since_force =
-                    aggregate_stats.connections_total >= last_force_collect_total_connections
-                        ? aggregate_stats.connections_total - last_force_collect_total_connections
-                        : 0;
-                const bool churn_collect_due =
-                    total_conns >= kChurnForceCollectMinConns &&
-                    churn_since_force >= kChurnForceCollectConnections &&
-                    (last_force_collect_at.time_since_epoch().count() == 0 ||
-                     now - last_force_collect_at >= kChurnForceCollectCooldown);
-
-                if (((burst_drain || newly_idle) && cooldown_ok) || churn_collect_due) {
-                    const char* reason =
-                        churn_collect_due ? "churn" : (newly_idle ? "idle" : "burst-drain");
-                    LOG_CONSOLE("Forcing worker heap collection: reason={} conn={} churn={}",
-                             reason, total_conns, churn_since_force);
-                    try {
-                        co_await CollectWorkerHeaps();
-                    } catch (const std::exception& error) {
-                        ThrowIfStopping();
-                        LOG_CONSOLE_WARN("Worker heap collection skipped: {}", error.what());
-                    }
-                    last_force_collect_at = now;
-                    last_force_collect_total_connections = aggregate_stats.connections_total;
-                    last_sample_total_conns = total_conns;
-                } else if ((burst_drain || newly_idle) && !cooldown_ok) {
-                    last_sample_total_conns = std::max(last_sample_total_conns, total_conns);
-                } else {
-                    last_sample_total_conns = total_conns;
+            }
+            if (!idle_workers.empty()) {
+                try {
+                    // Statistics quiet does not prove I/O quiescence. Native
+                    // collection is safe because it never releases live blocks.
+                    co_await RunWorkerBatch(env.main_ctx->get_executor(), idle_workers,
+                        [this](Worker& worker, size_t) {
+                            return [](const RuntimeOwner& owner, Worker* current) -> net::awaitable<void> {
+                                owner.ThrowIfStopping();
+                                co_await current->PostCall([] { memory::CollectThreadHeap(); });
+                            }(*this, &worker);
+                        });
+                    ThrowIfStopping();
+                    for (const Worker* worker : idle_workers)
+                        heap_states[worker->Id()].collected = true;
+                    memory::CollectThreadHeap();
+                } catch (const std::exception& error) {
+                    ThrowIfStopping();
+                    LOG_CONSOLE_WARN("Idle thread heap collection skipped: {}", error.what());
                 }
             }
             {
@@ -740,24 +718,13 @@ public:
             const double mem_mb = static_cast<double>(ReadResidentMemoryBytes()) / (1024.0 * 1024.0);
 
             size_t total_udp_sockets = 0;
-            size_t pool_committed_bytes = 0;
-            size_t pool_used_bytes = 0;
-            size_t pool_live_allocations = 0;
-            size_t pool_pages = 0;
             for (const auto& worker_snapshot : worker_snapshots) {
                 total_udp_sockets += worker_snapshot.memory.udp_sockets;
-                const auto& r = *worker_snapshot.resources;
-                pool_committed_bytes += r.pool_committed_bytes;
-                pool_used_bytes += r.pool_used_bytes;
-                pool_live_allocations += r.pool_live_allocations;
-                pool_pages += r.pool_pages;
             }
             const auto total_users = proxyman::inbound::UserStore::TotalUsers();
             LOG_CONSOLE("Runtime activity: conn={} users={} udp_sockets={}",
                         total_conns, total_users, total_udp_sockets);
-            LOG_CONSOLE("Runtime memory: resident={:.1f}MB pool_committed={}MB pool_used={}MB pool_live={} pool_pages={}",
-                        mem_mb, pool_committed_bytes / (1024 * 1024),
-                        pool_used_bytes / (1024 * 1024), pool_live_allocations, pool_pages);
+            LOG_CONSOLE("Runtime memory: resident={:.1f}MB", mem_mb);
             LOG_CONSOLE("Runtime traffic: traffic_in={} traffic_out={} rate_down={} rate_up={}",
                         ::FormatBytes(snapshot.bytes_in), ::FormatBytes(snapshot.bytes_out),
                         FormatRate(snapshot.bytes_in_rate), FormatRate(snapshot.bytes_out_rate));
@@ -774,9 +741,6 @@ public:
                 LOG_CONSOLE("Worker activity: id={} conn={} udp_sockets={} timeout_heap={}/{} timeout_waiters={}",
                             worker.worker_id, worker.active_connections, worker.memory.udp_sockets,
                             r.timeout_events, r.timeout_heap_capacity, r.timeout_waiters);
-                LOG_CONSOLE("Worker memory: id={} pool_committed={} pool_used={} pool_live={} pool_pages={}",
-                            worker.worker_id, r.pool_committed_bytes, r.pool_used_bytes,
-                            r.pool_live_allocations, r.pool_pages);
                 LOG_CONSOLE("Worker UDP resources: id={} udp_listeners={} udp_receive_loops={} udp_resource_drops={} udp_associations={} udp_closed={} udp_reply_senders={}",
                             worker.worker_id, r.udp_listeners, r.udp_receive_loops, r.udp_resource_drops,
                             r.udp_associations, r.udp_closed_associations, r.udp_reply_senders);
@@ -1042,7 +1006,7 @@ int RunFromCommandLine(int argc, char* argv[]) {
                 config.routing.rules.size(),
                 config.panels.size());
     LOG_CONSOLE("Starting cnode v1.0.0: channel={} build={}", BUILD_CHANNEL, BUILD_ID);
-    LOG_CONSOLE("Runtime configured: workers={} io={} accept=SO_REUSEPORT allocator=mimalloc-worker-heap",
+    LOG_CONSOLE("Runtime configured: workers={} io={} accept=SO_REUSEPORT allocator=mimalloc-thread-heap",
                 config.workers, IoBackendName());
     if (!ValidateConfig(config)) {
         Log::WriteConsole(LogLevel::ERROR, "Invalid configuration");

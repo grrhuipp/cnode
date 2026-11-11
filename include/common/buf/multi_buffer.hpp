@@ -23,8 +23,7 @@ struct Buffer;
 // ============================================================================
 // Buffer - relay/MultiBuffer 固定 8KB 数据块
 //
-// 数据面固定 8KB。New 从调用方显式给出的 Worker 池取块并记录该池；Free 与
-// MultiBuffer 的扩容/拆分都沿用块自身的池，不缓存空闲块。
+// 数据面固定 8KB，直接向进程资源借还；MultiBuffer 不缓存空闲块。
 // start/end 游标：Advance() 消费无需 memmove，Produce() 记录写入量。
 // ============================================================================
 struct Buffer {
@@ -93,35 +92,28 @@ struct Buffer {
     [[nodiscard]] bool HasUDP() const noexcept { return udp_.has_value(); }
     [[nodiscard]] TargetAddress& UDP() noexcept { return *udp_; }
     [[nodiscard]] const TargetAddress& UDP() const noexcept { return *udp_; }
-    [[nodiscard]] memory::worker_memory& Pool() const noexcept { return *pool_; }
 
-    // 从 pool 取得固定 8KB 块。只初始化游标，payload 保持未初始化，避免热路径
-    // 无谓 memset。
-    [[nodiscard]] static Buffer* New(memory::worker_memory& pool) noexcept {
-        void* raw = pool.Allocate(sizeof(Buffer), alignof(Buffer));
-        if (!raw) {
-            return nullptr;
-        }
-        auto* b = ::new (raw) Buffer(pool);
+    // 默认初始化不清零 payload；分配失败保持非抛出入口的 nullptr 语义。
+    [[nodiscard]] static Buffer* New() noexcept {
+        void* raw = memory::detail::TryAllocateProcessRaw(sizeof(Buffer), alignof(Buffer));
+        if (!raw) return nullptr;
+        auto* b = ::new (raw) Buffer;
         memory::OnBufferNew();
         return b;
     }
 
-    // 归还。Buffer 含非平凡成员（udp_），先析构再交回所属池。
+    // 非平凡成员必须在归还存储前析构。
     static void Free(Buffer* b) noexcept {
         if (!b) {
             return;
         }
         memory::OnBufferFree();
-        auto& pool = b->Pool();
         b->~Buffer();
-        pool.Deallocate(b, sizeof(Buffer), alignof(Buffer));
+        mi_free(b);
     }
 
 private:
-    explicit Buffer(memory::worker_memory& pool) noexcept : pool_(&pool) {}
-
-    memory::worker_memory* pool_;
+    Buffer() noexcept = default;
 };
 
 // RAII 守卫：离开作用域时自动释放单个 Buffer
@@ -240,10 +232,9 @@ public:
     }
 
 
-    // Spilled pointer slots come from `pool` when no owned buffer names one.
-    void reserve(size_t n, memory::worker_memory& pool) {
+    void reserve(size_t n) {
         if (!spill_) {
-            if (n > kInlineCapacity) EnsureSpill(pool, n);
+            if (n > kInlineCapacity) EnsureSpill(n);
             return;
         }
         if (n <= spill_->capacity() - start_) return;
@@ -253,14 +244,6 @@ public:
             start_ = 0;
         }
         spill_->reserve(n);
-    }
-
-    // Pool of the first owned buffer; null when the container owns none.
-    [[nodiscard]] memory::worker_memory* OwnerPool() const noexcept {
-        for (const Buffer* buffer : *this) {
-            if (buffer) return &buffer->Pool();
-        }
-        return nullptr;
     }
 
     // Consumes the guard even on failure. A failed insertion releases that
@@ -280,7 +263,7 @@ public:
             total_bytes_ += bytes;
             return;
         }
-        EnsureSpill(buffer->Pool());
+        EnsureSpill();
         spill_->push_back(buffer.get());
         (void)buffer.release();
         total_bytes_ += bytes;
@@ -447,7 +430,7 @@ public:
             !tail->HasUDP() && tail->Available() + tail->start >= remaining;
         BufferGuard split;
         if (split_source && !coalesce) {
-            split = BufferGuard{Buffer::New(split_source->Pool())};
+            split = BufferGuard{Buffer::New()};
             if (!split) return false;
             std::memcpy(split->Tail().data(), split_source->Bytes().data(), remaining);
             split->Produce(static_cast<uint32_t>(remaining));
@@ -456,7 +439,7 @@ public:
             if (split_source && split_source->HasUDP()) {
                 split->SetUDP(split_source->UDP());
             }
-            dst.ReserveAdditional(whole_buffers + (split ? 1 : 0), bytes, OwnerPool());
+            dst.ReserveAdditional(whole_buffers + (split ? 1 : 0), bytes);
         } catch (const std::bad_alloc&) {
             return false;
         } catch (const std::length_error&) {
@@ -590,7 +573,7 @@ public:
         if (std::addressof(dst) == this) {
             return;
         }
-        dst.ReserveAdditional(size(), total_bytes_, OwnerPool());
+        dst.ReserveAdditional(size(), total_bytes_);
         for (Buffer*& buffer : *this) {
             if (!buffer || (buffer->IsEmpty() && (clear_udp || !buffer->HasUDP()))) {
                 FreeSlot(buffer);
@@ -628,7 +611,7 @@ public:
                 }
             }
         }
-        ReserveAdditional(additional, next.total_bytes_, next.OwnerPool());
+        ReserveAdditional(additional, next.total_bytes_);
         for (Buffer*& buffer : next) {
             if (!buffer || (buffer->IsEmpty() && !buffer->HasUDP())) {
                 next.FreeSlot(buffer);
@@ -669,12 +652,11 @@ public:
     }
 
 private:
-    void ReserveAdditional(size_t buffers, size_t bytes, memory::worker_memory* pool) {
+    void ReserveAdditional(size_t buffers, size_t bytes) {
         if (buffers > std::numeric_limits<size_t>::max() - size() ||
             bytes > std::numeric_limits<size_t>::max() - total_bytes_)
             throw std::length_error("MultiBuffer size overflow");
-        // A source without buffers adds no slots.
-        if (pool) reserve(size() + buffers, *pool);
+        if (buffers != 0) reserve(size() + buffers);
     }
 
     void ReleaseOwnedBuffers() noexcept {
@@ -704,12 +686,12 @@ private:
         start_ = 0;
     }
 
-    void EnsureSpill(memory::worker_memory& pool, size_t capacity = kInlineCapacity * 2) {
+    void EnsureSpill(size_t capacity = kInlineCapacity * 2) {
         if (spill_) {
             return;
         }
         // Do not publish spilled state until the only fallible step succeeds.
-        memory::Vector<Buffer*> prepared(pool.resource());
+        memory::Vector<Buffer*> prepared;
         prepared.reserve(std::max(capacity, kInlineCapacity * 2));
         spill_.emplace(std::move(prepared));
         for (size_t i = 0; i < size_; ++i) {
@@ -770,10 +752,9 @@ private:
 
 // A completed UDP message owns a buffer even when it carries no data. An empty
 // container remains EOF/no message; callers must not tag an uncompleted read.
-[[nodiscard]] inline bool SetUdpTarget(MultiBuffer& packet, const TargetAddress& target,
-                                       memory::worker_memory& pool) {
+[[nodiscard]] inline bool SetUdpTarget(MultiBuffer& packet, const TargetAddress& target) {
     if (packet.empty()) {
-        BufferGuard buffer{Buffer::New(pool)};
+        BufferGuard buffer{Buffer::New()};
         if (!buffer) return false;
         buffer->SetUDP(target);
         packet.push_back(std::move(buffer));
@@ -842,8 +823,7 @@ struct UdpDatagramInfo {
 UdpDatagramInfo InspectUdpDatagram(const MultiBuffer&&) = delete;
 
 [[nodiscard]] inline bool AppendSpanToMultiBuffer(std::span<const uint8_t> data,
-                                                  MultiBuffer& out_mb,
-                                                  memory::worker_memory& pool) {
+                                                  MultiBuffer& out_mb) {
     if (data.empty()) return true;
     if (data.size() > std::numeric_limits<size_t>::max() - out_mb.byte_size())
         throw std::length_error("MultiBuffer byte size overflow");
@@ -864,7 +844,7 @@ UdpDatagramInfo InspectUdpDatagram(const MultiBuffer&&) = delete;
     try {
         size_t offset = tail_bytes;
         while (offset < data.size()) {
-            BufferGuard buffer{Buffer::New(pool)};
+            BufferGuard buffer{Buffer::New()};
             if (!buffer) return false;
             const size_t chunk = std::min(data.size() - offset,
                                           static_cast<size_t>(Buffer::kSize));
@@ -873,7 +853,7 @@ UdpDatagramInfo InspectUdpDatagram(const MultiBuffer&&) = delete;
             suffix.push_back(std::move(buffer));
             offset += chunk;
         }
-        out_mb.reserve(out_mb.size() + suffix.size(), pool);
+        out_mb.reserve(out_mb.size() + suffix.size());
     } catch (const std::bad_alloc&) {
         return false;
     }
@@ -887,28 +867,21 @@ UdpDatagramInfo InspectUdpDatagram(const MultiBuffer&&) = delete;
     return true;
 }
 
-// One contiguous scratch block. Storage is uninitialized on both paths: the
-// caller fills what it later appends or reads back, exactly as with a pooled
-// Buffer. Both the pooled Buffer and the oversized block come from the Worker
-// pool bound at construction; the oversized block is returned on Reset.
+// One uninitialized contiguous scratch block, returned on Reset rather than
+// retained across frames or idle waits.
 class ContiguousWriteBuffer {
 public:
-    explicit ContiguousWriteBuffer(memory::worker_memory& pool) noexcept
-        : pool_(&pool), allocator_(pool.resource()) {}
+    ContiguousWriteBuffer() noexcept = default;
     ContiguousWriteBuffer(const ContiguousWriteBuffer&) = delete;
     ContiguousWriteBuffer& operator=(const ContiguousWriteBuffer&) = delete;
     ContiguousWriteBuffer(ContiguousWriteBuffer&& other) noexcept
         : pooled_(std::move(other.pooled_))
-        , pool_(other.pool_)
-        , allocator_(other.allocator_)
         , heap_(std::exchange(other.heap_, nullptr))
         , heap_size_(std::exchange(other.heap_size_, 0)) {}
     ContiguousWriteBuffer& operator=(ContiguousWriteBuffer&& other) noexcept {
         if (this != &other) {
             Reset();
             pooled_ = std::move(other.pooled_);
-            pool_ = other.pool_;
-            allocator_ = other.allocator_;
             heap_ = std::exchange(other.heap_, nullptr);
             heap_size_ = std::exchange(other.heap_size_, 0);
         }
@@ -919,7 +892,7 @@ public:
     [[nodiscard]] uint8_t* Prepare(size_t capacity) {
         Reset();
         if (capacity <= Buffer::kSize) {
-            pooled_ = BufferGuard{Buffer::New(*pool_)};
+            pooled_ = BufferGuard{Buffer::New()};
             if (!pooled_) {
                 throw std::bad_alloc();
             }
@@ -928,7 +901,8 @@ public:
         if (capacity > kMaxCapacity) {
             throw std::length_error("ContiguousWriteBuffer capacity");
         }
-        heap_ = allocator_.allocate(capacity);
+        heap_ = static_cast<uint8_t*>(
+            memory::detail::AllocateProcessRaw(capacity, alignof(uint8_t)));
         heap_size_ = capacity;
         return heap_;
     }
@@ -959,7 +933,8 @@ public:
     void Reset() noexcept {
         pooled_.reset();
         if (heap_) {
-            allocator_.deallocate(std::exchange(heap_, nullptr), std::exchange(heap_size_, 0));
+            heap_size_ = 0;
+            mi_free(std::exchange(heap_, nullptr));
         }
     }
 
@@ -980,7 +955,7 @@ public:
                 return false;
             }
             const bool appended = AppendSpanToMultiBuffer(
-                std::span<const uint8_t>(heap_, size), out, *pool_);
+                std::span<const uint8_t>(heap_, size), out);
             Reset();
             return appended;
         } catch (...) {
@@ -1000,8 +975,6 @@ private:
         static_cast<size_t>(std::numeric_limits<std::ptrdiff_t>::max());
 
     BufferGuard pooled_;
-    memory::worker_memory* pool_;
-    memory::Allocator<uint8_t> allocator_;
     uint8_t* heap_ = nullptr;
     size_t heap_size_ = 0;
 };
@@ -1035,8 +1008,6 @@ public:
             bytes_ = single->Bytes();
             return;
         }
-        owned_ = memory::ByteVector(memory::Allocator<uint8_t>(
-            buffers.OwnerPool()->resource()));
         owned_.reserve(total_size);
         for (const Buffer* buffer : buffers) {
             if (!buffer || buffer->IsEmpty()) {
@@ -1049,7 +1020,7 @@ public:
     }
 
     ContiguousBufferView(std::span<const net::const_buffer> buffers,
-                         std::pmr::memory_resource* resource)
+                         std::pmr::memory_resource* resource = nullptr)
         : owned_(resource) {
         const net::const_buffer* single = nullptr;
         size_t buffer_count = 0;
@@ -1139,7 +1110,7 @@ public:
             first_ = std::move(payload);
             occupied_ = true;
         } else {
-            if (!overflow_) overflow_.emplace(payload.OwnerPool()->resource());
+            if (!overflow_) overflow_.emplace();
             overflow_->push_back(std::move(payload));
         }
         bytes_ += bytes;

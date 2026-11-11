@@ -196,8 +196,7 @@ struct SsUdpDecodeResult {
     size_t                       key_size,
     size_t                       salt_size,
     Ss2022UdpReplayCache&        replay_cache,
-    bool                         deferred_replay,
-    memory::worker_memory&       pool);
+    bool                         deferred_replay);
 
 // ============================================================================
 // EncodeUdpPacket — 编码 SS AEAD UDP 回包
@@ -226,8 +225,7 @@ struct SsUdpDecodeResult {
     std::span<const uint8_t> master_key,
     SsCipherType cipher_type,
     size_t key_size,
-    size_t salt_size,
-    memory::worker_memory& pool);
+    size_t salt_size);
 
 [[nodiscard]] bool Init2022UdpSessionState(
     Ss2022UdpSessionState& state,
@@ -255,8 +253,7 @@ struct SsUdpDecodeResult {
 [[nodiscard]] std::optional<SsUdpDecodeResult> Decode2022UdpResponsePacket(
     const uint8_t* datagram,
     size_t datagram_len,
-    Ss2022UdpSessionState& state,
-    memory::worker_memory& pool);
+    Ss2022UdpSessionState& state);
 
 class ResponseBodyWriter final : public transport::MultiBufferWriter {
 public:
@@ -402,9 +399,7 @@ WriteTCPResponse(const proxyman::inbound::UserStore::ShadowsocksCredential& user
                  const KeyBytes& request_salt,
                  AsyncStream& stream);
 
-class RequestBodyWriter final
-    : public memory::WorkerAllocated
-    , public transport::MultiBufferWriter {
+class RequestBodyWriter final : public transport::MultiBufferWriter {
 public:
     RequestBodyWriter(SsAeadCipher write_cipher,
                       uint64_t write_nonce,
@@ -478,8 +473,7 @@ namespace proxy::shadowsocks::inbound {
 
 class Handler final : public ::Inbound {
 public:
-    Handler(memory::worker_memory& pool,
-            ::UserOnlineTracker& validator,
+    Handler(::UserOnlineTracker& validator,
             ::StatsShard& stats,
             ::ConnectionLimiter* limiter,
             ::ss::SsCipherInfo cipher_info);
@@ -505,7 +499,6 @@ public:
     CreateDatagramResponse(const ::InboundDatagramResult& decoded) override;
 
 private:
-    memory::worker_memory& pool_;
     ::UserOnlineTracker& validator_;
     ::StatsShard& stats_;
     ::ConnectionLimiter* limiter_;
@@ -535,12 +528,12 @@ namespace proxy::shadowsocks::outbound {
 // packet target is encoded as supplied; only the server name is resolved here.
 class UdpRequest final : public ::proxy::OutboundDatagramEndpointBase {
 public:
-    UdpRequest(memory::worker_memory& pool, net::io_context& io, app::dns::DNS& dns,
+    UdpRequest(net::io_context& io, app::dns::DNS& dns,
                const net::ip::address& bind_address, TargetAddress server,
                const ss::SsCipherInfo& cipher_info, const ss::KeyBytes& master_key,
                std::span<const ss::KeyBytes> psk_chain,
                ForwardedMetadataView forwarded = {})
-        : OutboundDatagramEndpointBase(pool, io, bind_address), dns_(dns), server_(std::move(server)),
+        : OutboundDatagramEndpointBase(io, bind_address), dns_(dns), server_(std::move(server)),
           cipher_info_(cipher_info), master_key_(master_key), psk_chain_(psk_chain) {
         forwarded_ = ForwardedMetadata::FromView(forwarded);
         if (ss::Is2022Cipher(cipher_info_.type)) {
@@ -565,10 +558,9 @@ public:
             const buf::ContiguousBufferView view(packet.payload);
             const auto bytes = view.Bytes();
             auto decoded = ss2022_state_
-                ? ss::Decode2022UdpResponsePacket(bytes.data(), bytes.size(), *ss2022_state_,
-                    pool_)
+                ? ss::Decode2022UdpResponsePacket(bytes.data(), bytes.size(), *ss2022_state_)
                 : ss::DecodeUdpPacketWithKey(bytes.data(), bytes.size(), master_key_.span(),
-                    cipher_info_.type, cipher_info_.key_size, cipher_info_.salt_size, pool_);
+                    cipher_info_.type, cipher_info_.key_size, cipher_info_.salt_size);
             if (!decoded) continue;
             if (!decoded->target.IsValid()) continue;
             socket_.TouchActivity();
@@ -595,7 +587,7 @@ public:
         const size_t maximum = server_endpoint_->address().is_v6() ? 65527 : 65507;
         if (encoded_len == 0 || encoded_len > maximum)
             throw transport::LinkError(ErrorCode::INVALID_ARGUMENT);
-        buf::ContiguousWriteBuffer encoded(pool_);
+        buf::ContiguousWriteBuffer encoded;
         uint8_t* dst = encoded.Prepare(encoded_len);
         if (EncodePacketTo(*datagram.target, bytes, dst, encoded_len) != encoded_len)
             throw transport::LinkError(ErrorCode::INTERNAL);

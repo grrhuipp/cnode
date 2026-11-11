@@ -90,9 +90,9 @@ void Run(Factory&& factory) {
     future.get();
 }
 
-buf::MultiBuffer MakeInput(std::span<const uint8_t> bytes, memory::worker_memory& pool) {
+buf::MultiBuffer MakeInput(std::span<const uint8_t> bytes) {
     buf::MultiBuffer input;
-    Check(buf::AppendSpanToMultiBuffer(bytes, input, pool), "input allocation failed");
+    Check(buf::AppendSpanToMultiBuffer(bytes, input), "input allocation failed");
     return input;
 }
 
@@ -104,21 +104,20 @@ void CheckRejected(Fn&& fn, std::string_view message) {
 }
 
 void CheckFrameBoundaries() {
-    memory::worker_memory pool;
     const std::array<uint8_t, 25> wire{
         1, 127, 0, 0, 1, 0, 53, 0, 0, '\r', '\n',
         1, 127, 0, 0, 1, 0, 53, 0, 3, '\r', '\n', 0x11, 0x22, 0x33};
     for (size_t split = 0; split <= wire.size(); ++split) {
-        trojan::UdpFramer framer(pool);
+        trojan::UdpFramer framer;
         trojan::FramedUdpPacket packet;
-        framer.Feed(MakeInput(std::span(wire).first(split), pool));
+        framer.Feed(MakeInput(std::span(wire).first(split)));
         std::vector<size_t> sizes;
         while (framer.Next(packet)) {
             sizes.push_back(packet.payload.byte_size());
             Check(buf::InspectUdpDatagram(packet.payload).Valid(),
                   "Trojan frame did not produce a tagged UDP datagram");
         }
-        framer.Feed(MakeInput(std::span(wire).subspan(split), pool));
+        framer.Feed(MakeInput(std::span(wire).subspan(split)));
         while (framer.Next(packet)) {
             sizes.push_back(packet.payload.byte_size());
             Check(packet.target.SameEndpoint(TargetAddress("127.0.0.1", 53)),
@@ -133,8 +132,8 @@ void CheckFrameBoundaries() {
         framer.Finish();
     }
     for (size_t cut = 1; cut < 14; ++cut) {
-        trojan::UdpFramer truncated(pool);
-        truncated.Feed(MakeInput(std::span(wire).subspan(11, cut), pool));
+        trojan::UdpFramer truncated;
+        truncated.Feed(MakeInput(std::span(wire).subspan(11, cut)));
         trojan::FramedUdpPacket packet;
         Check(!truncated.Next(packet), "truncated Trojan frame delivered");
         CheckRejected([&] { truncated.Finish(); }, "truncated Trojan EOF accepted");
@@ -142,22 +141,22 @@ void CheckFrameBoundaries() {
     for (size_t corrupt : {size_t{0}, size_t{9}, size_t{10}}) {
         auto malformed = wire;
         malformed[corrupt] = 0xff;
-        trojan::UdpFramer invalid(pool);
-        invalid.Feed(MakeInput(malformed, pool));
+        trojan::UdpFramer invalid;
+        invalid.Feed(MakeInput(malformed));
         trojan::FramedUdpPacket packet;
         CheckRejected([&] { (void)invalid.Next(packet); }, "invalid Trojan frame accepted");
         CheckRejected([&] { (void)invalid.Next(packet); }, "Trojan stream resynchronized");
     }
-    trojan::UdpFramer empty_domain(pool);
+    trojan::UdpFramer empty_domain;
     const std::array<uint8_t, 2> empty_domain_prefix{3, 0};
-    empty_domain.Feed(MakeInput(empty_domain_prefix, pool));
+    empty_domain.Feed(MakeInput(empty_domain_prefix));
     trojan::FramedUdpPacket empty_domain_packet;
     CheckRejected([&] { (void)empty_domain.Next(empty_domain_packet); },
                   "empty Trojan domain accepted");
-    trojan::UdpFramer invalid_domain(pool);
+    trojan::UdpFramer invalid_domain;
     const std::array<uint8_t, 10> malformed_domain{
         3, 1, ' ', 0, 53, 0, 1, '\r', '\n', 0x42};
-    invalid_domain.Feed(MakeInput(malformed_domain, pool));
+    invalid_domain.Feed(MakeInput(malformed_domain));
     trojan::FramedUdpPacket invalid_packet;
     CheckRejected([&] { (void)invalid_domain.Next(invalid_packet); },
                   "invalid domain syntax accepted");
@@ -169,11 +168,11 @@ void CheckFrameBoundaries() {
     domain_frame.insert(domain_frame.end(), domain_name.begin(), domain_name.end());
     domain_frame.insert(domain_frame.end(), {0, 53, 0, 1, '\r', '\n', 0x42});
     for (size_t split = 0; split <= domain_frame.size(); ++split) {
-        trojan::UdpFramer domain(pool);
+        trojan::UdpFramer domain;
         trojan::FramedUdpPacket packet;
-        domain.Feed(MakeInput(std::span(domain_frame).first(split), pool));
+        domain.Feed(MakeInput(std::span(domain_frame).first(split)));
         const bool first = domain.Next(packet);
-        domain.Feed(MakeInput(std::span(domain_frame).subspan(split), pool));
+        domain.Feed(MakeInput(std::span(domain_frame).subspan(split)));
         Check(first || domain.Next(packet), "fragmented maximum domain frame lost");
         Check(std::string_view(packet.target.host) == domain_name && packet.target.port == 53 &&
                   Flatten(packet.payload) == std::vector<uint8_t>({0x42}),
@@ -181,16 +180,16 @@ void CheckFrameBoundaries() {
         Check(!domain.Next(packet), "domain frame decoded twice");
         domain.Finish();
     }
-    trojan::UdpFramer bounded(pool);
+    trojan::UdpFramer bounded;
     const std::vector<uint8_t> excess(buf::kPacketStreamPendingLimit + 1, 0);
-    CheckRejected([&] { bounded.Feed(MakeInput(excess, pool)); }, "unbounded Trojan input");
+    CheckRejected([&] { bounded.Feed(MakeInput(excess)); }, "unbounded Trojan input");
 
     std::vector<uint8_t> maximum{
         1, 127, 0, 0, 1, 0, 53, 0xff, 0xff, '\r', '\n'};
     maximum.resize(11 + 65535, 0x71);
-    trojan::UdpFramer fragmented(pool);
+    trojan::UdpFramer fragmented;
     for (const auto byte : maximum) {
-        fragmented.Feed(MakeInput(std::span<const uint8_t>(&byte, 1), pool));
+        fragmented.Feed(MakeInput(std::span<const uint8_t>(&byte, 1)));
     }
     trojan::FramedUdpPacket packet;
     Check(fragmented.Next(packet) &&
@@ -200,7 +199,6 @@ void CheckFrameBoundaries() {
 }
 
 void CheckCancelledReadPreservesFrame() {
-    memory::worker_memory pool;
     net::io_context io;
     tcp::acceptor listener(io, tcp::endpoint(net::ip::address_v4::loopback(), 0));
     tcp::socket sender(io);
@@ -209,11 +207,11 @@ void CheckCancelledReadPreservesFrame() {
     const std::array<uint8_t, 14> wire{
         1, 127, 0, 0, 1, 0, 53, 0, 3, '\r', '\n', 0x11, 0x22, 0x33};
     net::write(sender, net::buffer(wire.data(), 12));
-    trojan::UdpFramer framer(pool);
+    trojan::UdpFramer framer;
     auto future = net::co_spawn(io, [&]() -> net::awaitable<void> {
         std::array<uint8_t, 14> bytes{};
         co_await net::async_read(receiver, net::buffer(bytes.data(), 12), net::use_awaitable);
-        framer.Feed(MakeInput(std::span(bytes).first(12), pool));
+        framer.Feed(MakeInput(std::span(bytes).first(12)));
         trojan::FramedUdpPacket packet;
         Check(!framer.Next(packet), "partial Trojan frame delivered");
         net::post(io, [&] { receiver.cancel(); });
@@ -223,7 +221,7 @@ void CheckCancelledReadPreservesFrame() {
         Check(ec == net::error::operation_aborted, "Trojan read was not cancelled");
         net::write(sender, net::buffer(wire.data() + 12, wire.size() - 12));
         co_await net::async_read(receiver, net::buffer(bytes.data(), 2), net::use_awaitable);
-        framer.Feed(MakeInput(std::span(bytes).first(2), pool));
+        framer.Feed(MakeInput(std::span(bytes).first(2)));
         Check(framer.Next(packet) &&
                   Flatten(packet.payload) == std::vector<uint8_t>({0x11, 0x22, 0x33}),
               "cancelled read lost retained Trojan bytes");
@@ -236,13 +234,12 @@ void CheckCancelledReadPreservesFrame() {
 }  // namespace
 
 TEST(TrojanUdpFraming, Contract) {
-    memory::worker_memory pool;
     CheckFrameBoundaries();
     CheckCancelledReadPreservesFrame();
     const TargetAddress target("1.1.1.1", 53);
     const std::vector<uint8_t> source(buf::Buffer::kSize + 257, 0x6d);
     buf::MultiBuffer payload;
-    Check(buf::AppendSpanToMultiBuffer(source, payload, pool),
+    Check(buf::AppendSpanToMultiBuffer(source, payload),
           "failed to allocate Trojan UDP test payload");
     for (buf::Buffer* buffer : payload) {
         if (buffer && !buffer->IsEmpty()) {
@@ -265,7 +262,7 @@ TEST(TrojanUdpFraming, Contract) {
                          capture.bytes.begin() + expected_header.size()),
           "large Trojan UDP datagram was split or malformed");
 
-    trojan::UdpFramer framer(pool);
+    trojan::UdpFramer framer;
     size_t offset = 0;
     for (const size_t fragment : {size_t{1}, size_t{7}, size_t{4096},
                                   size_t{17}, size_t{2048}, size_t{3}}) {
@@ -273,11 +270,11 @@ TEST(TrojanUdpFraming, Contract) {
             break;
         }
         const size_t size = std::min(fragment, capture.bytes.size() - offset);
-        framer.Feed(MakeInput(std::span(capture.bytes).subspan(offset, size), pool));
+        framer.Feed(MakeInput(std::span(capture.bytes).subspan(offset, size)));
         offset += size;
     }
     if (offset < capture.bytes.size()) {
-        framer.Feed(MakeInput(std::span(capture.bytes).subspan(offset), pool));
+        framer.Feed(MakeInput(std::span(capture.bytes).subspan(offset)));
     }
 
     trojan::FramedUdpPacket decoded;
@@ -318,12 +315,11 @@ TEST(TrojanUdpFraming, Contract) {
 }
 
 TEST(TrojanUdpFraming, EmptyDatagramsAreNotEof) {
-    memory::worker_memory pool;
     const TargetAddress target("127.0.0.1", 53);
     CaptureWriter capture;
     ::Run([&]() -> net::awaitable<void> {
         buf::MultiBuffer empty;
-        Check(buf::SetUdpTarget(empty, target, pool), "empty UDP allocation failed");
+        Check(buf::SetUdpTarget(empty, target), "empty UDP allocation failed");
         co_await trojan::WriteUdpDatagram(capture, std::move(empty));
         const std::array<uint8_t, 1> data{0x42};
         const std::array<net::const_buffer, 1> buffers{net::buffer(data)};
@@ -337,10 +333,10 @@ TEST(TrojanUdpFraming, EmptyDatagramsAreNotEof) {
     tcp::acceptor listener(io, {net::ip::address_v4::loopback(), 0});
     tcp::socket peer(io);
     peer.connect(listener.local_endpoint());
-    TcpStream stream(pool, listener.accept());
+    TcpStream stream(listener.accept());
     net::write(peer, net::buffer(capture.bytes));
     peer.shutdown(tcp::socket::shutdown_send);
-    trojan::UdpFramer framer(pool);
+    trojan::UdpFramer framer;
     auto result = net::co_spawn(io, [&]() -> net::awaitable<void> {
         for (const size_t size : {size_t{0}, size_t{1}, size_t{0}}) {
             auto packet = co_await trojan::ReadUdpDatagram(stream, framer);
@@ -359,55 +355,52 @@ TEST(TrojanUdpFraming, EmptyDatagramsAreNotEof) {
 }
 
 TEST(TrojanUdpFraming, TruncatedEofCannotResume) {
-    memory::worker_memory pool;
     const std::array<uint8_t, 14> wire{
         1, 127, 0, 0, 1, 0, 53, 0, 3, '\r', '\n', 0x11, 0x22, 0x33};
     for (size_t cut = 1; cut < wire.size(); ++cut) {
         SCOPED_TRACE(cut);
-        trojan::UdpFramer framer(pool);
-        framer.Feed(MakeInput(std::span(wire).first(cut), pool));
+        trojan::UdpFramer framer;
+        framer.Feed(MakeInput(std::span(wire).first(cut)));
         trojan::FramedUdpPacket packet;
         ASSERT_FALSE(framer.Next(packet));
         EXPECT_THROW(framer.Finish(), IoSystemError);
-        EXPECT_THROW(framer.Feed(MakeInput(std::span(wire).subspan(cut), pool)), IoSystemError);
+        EXPECT_THROW(framer.Feed(MakeInput(std::span(wire).subspan(cut))), IoSystemError);
         EXPECT_THROW((void)framer.Next(packet), IoSystemError);
         EXPECT_THROW(framer.Finish(), IoSystemError);
     }
 }
 
 TEST(TrojanUdpFraming, CleanEofRejectsFurtherInput) {
-    memory::worker_memory pool;
     const std::array<uint8_t, 12> wire{
         1, 127, 0, 0, 1, 0, 53, 0, 1, '\r', '\n', 0x73};
-    trojan::UdpFramer framer(pool);
-    framer.Feed(MakeInput(wire, pool));
+    trojan::UdpFramer framer;
+    framer.Feed(MakeInput(wire));
     trojan::FramedUdpPacket packet;
     ASSERT_TRUE(framer.Next(packet));
     EXPECT_EQ(Flatten(packet.payload), std::vector<uint8_t>({0x73}));
     framer.Finish();
     framer.Finish();
     EXPECT_THROW(framer.Feed({}), IoSystemError);
-    EXPECT_THROW(framer.Feed(MakeInput(wire, pool)), IoSystemError);
+    EXPECT_THROW(framer.Feed(MakeInput(wire)), IoSystemError);
     EXPECT_FALSE(framer.Next(packet));
     EXPECT_TRUE(packet.payload.empty());
 }
 
 TEST(TrojanUdpFraming, ReadEofDoesNotConsumeAnotherTransport) {
-    memory::worker_memory pool;
     const std::array<uint8_t, 12> wire{
         1, 127, 0, 0, 1, 0, 53, 0, 1, '\r', '\n', 0x73};
     net::io_context io;
     tcp::acceptor listener(io, {net::ip::address_v4::loopback(), 0});
     tcp::socket ended_peer(io);
     ended_peer.connect(listener.local_endpoint());
-    TcpStream ended(pool, listener.accept());
+    TcpStream ended(listener.accept());
     ended_peer.shutdown(tcp::socket::shutdown_send);
     tcp::socket fresh_peer(io);
     fresh_peer.connect(listener.local_endpoint());
-    TcpStream fresh(pool, listener.accept());
+    TcpStream fresh(listener.accept());
     net::write(fresh_peer, net::buffer(wire));
     fresh_peer.shutdown(tcp::socket::shutdown_send);
-    trojan::UdpFramer framer(pool);
+    trojan::UdpFramer framer;
     auto result = net::co_spawn(io, [&]() -> net::awaitable<void> {
         Check((co_await trojan::ReadUdpDatagram(ended, framer)).empty(), "clean EOF produced a datagram");
         Check((co_await trojan::ReadUdpDatagram(fresh, framer)).empty(),

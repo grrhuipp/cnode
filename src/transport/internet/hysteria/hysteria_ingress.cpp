@@ -52,81 +52,32 @@ namespace transport::internet::hysteria {
 namespace {
 
 
-// ngtcp2/nghttp3 do not provide allocation sizes to free(). Prefix each block
-// with its exact PMR layout so Free can return slots to the connection's
-// Worker pool, carried in `user_data`, without a side table.
-class QuicMemory final {
-public:
-    [[nodiscard]] static ngtcp2_mem Ngtcp2(memory::worker_memory& pool) noexcept {
-        return {&pool, &Allocate, &Free, &Callocate, &Reallocate};
+// The C libraries need realloc semantics; use mimalloc's native API rather than
+// sized PMR deallocation, allocation headers or a per-connection resource.
+void* AllocateQuicMemory(size_t size, void*) {
+    return mi_malloc(size);
+}
+
+void FreeQuicMemory(void* pointer, void*) noexcept {
+    mi_free(pointer);
+}
+
+void* CallocateQuicMemory(size_t count, size_t size, void*) {
+    return mi_calloc(count, size);
+}
+
+void* ReallocateQuicMemory(void* pointer, size_t size, void*) {
+    if (size == 0) {
+        mi_free(pointer);
+        return nullptr;
     }
+    return mi_realloc(pointer, size);
+}
 
-    [[nodiscard]] static nghttp3_mem Nghttp3(memory::worker_memory& pool) noexcept {
-        return {&pool, &Allocate, &Free, &Callocate, &Reallocate};
-    }
-
-private:
-    struct alignas(std::max_align_t) AllocationHeader {
-        size_t payload_size;
-        size_t allocation_size;
-    };
-
-    static constexpr size_t kAlignment = alignof(std::max_align_t);
-
-    [[nodiscard]] static bool AllocationSize(size_t payload_size, size_t& result) noexcept {
-        if (payload_size > std::numeric_limits<size_t>::max() - sizeof(AllocationHeader))
-            return false;
-        result = sizeof(AllocationHeader) + payload_size;
-        return true;
-    }
-
-    static void* Allocate(size_t size, void* user_data) {
-        try {
-            size_t allocation_size = 0;
-            if (!AllocationSize(size, allocation_size)) return nullptr;
-            void* raw = static_cast<memory::worker_memory*>(user_data)->Allocate(
-                allocation_size, kAlignment);
-            if (!raw) return nullptr;
-            auto* header =
-                ::new (raw) AllocationHeader{size, allocation_size};
-            return header + 1;
-        } catch (...) {
-            return nullptr;
-        }
-    }
-
-    static void Free(void* pointer, void* user_data) noexcept {
-        if (!pointer) return;
-        auto* header = static_cast<AllocationHeader*>(pointer) - 1;
-        const size_t allocation_size = header->allocation_size;
-        header->~AllocationHeader();
-        static_cast<memory::worker_memory*>(user_data)->Deallocate(
-            header, allocation_size, kAlignment);
-    }
-
-    static void* Callocate(size_t count, size_t size, void* user_data) {
-        if (size != 0 && count > std::numeric_limits<size_t>::max() / size)
-            return nullptr;
-        const size_t bytes = count * size;
-        void* pointer = Allocate(bytes, user_data);
-        if (pointer) std::memset(pointer, 0, bytes);
-        return pointer;
-    }
-
-    static void* Reallocate(void* pointer, size_t size, void* user_data) {
-        if (!pointer) return Allocate(size, user_data);
-        if (size == 0) {
-            Free(pointer, user_data);
-            return nullptr;
-        }
-        auto* old_header = static_cast<AllocationHeader*>(pointer) - 1;
-        void* replacement = Allocate(size, user_data);
-        if (!replacement) return nullptr;
-        std::memcpy(replacement, pointer, std::min(old_header->payload_size, size));
-        Free(pointer, user_data);
-        return replacement;
-    }
-};
+const ngtcp2_mem kQuicMemory{
+    nullptr, &AllocateQuicMemory, &FreeQuicMemory, &CallocateQuicMemory, &ReallocateQuicMemory};
+const nghttp3_mem kHttp3Memory{
+    nullptr, &AllocateQuicMemory, &FreeQuicMemory, &CallocateQuicMemory, &ReallocateQuicMemory};
 constexpr size_t kMaxPacketSize = 64 * 1024;
 constexpr size_t kMaxQueuedSocketPackets = 1024;
 constexpr size_t kMaxConnections = 65536;
@@ -230,10 +181,9 @@ int SelectAlpn(SSL*, const uint8_t** out, uint8_t* outlen,
     return endpoint;
 }
 
-[[nodiscard]] buf::MultiBuffer CopyPacket(std::span<const uint8_t> bytes,
-                                          memory::worker_memory& pool) {
+[[nodiscard]] buf::MultiBuffer CopyPacket(std::span<const uint8_t> bytes) {
     buf::MultiBuffer output;
-    if (!buf::AppendSpanToMultiBuffer(bytes, output, pool)) throw std::bad_alloc();
+    if (!buf::AppendSpanToMultiBuffer(bytes, output)) throw std::bad_alloc();
     return output;
 }
 
@@ -371,7 +321,7 @@ struct UdpTargetText {
 }  // namespace
 
 
-struct SocketState final : memory::WorkerAllocated {
+struct SocketState final {
     explicit SocketState(net::io_context& io)
         : changed(io, 1) {}
     HysteriaIngress::SocketPtr socket;
@@ -396,7 +346,6 @@ Connection::Connection(
     : listener_(&listener)
     , closed_signal_(listener.io.get_executor(), 1)
     , core_(std::in_place)
-    , base_context_(listener.pool)
     , physical_ready_(listener.io.get_executor(), 1) {
     core_->local = socket.local;
     core_->remote = remote;
@@ -582,11 +531,10 @@ bool Connection::Initialize(const ngtcp2_pkt_hd& header) {
     auto local = MakeAddress(core_->local);
     auto remote = MakeAddress(core_->remote);
     ngtcp2_path path{local, remote, &core_->path_binding};
-    core_->quic_mem = QuicMemory::Ngtcp2(listener_->pool);
     if (ngtcp2_conn_server_new(
             &core_->quic, &header.scid, &core_->server_cid, &path,
             header.version, &callbacks, &quic_settings, &parameters,
-            &core_->quic_mem, this) != 0)
+            &kQuicMemory, this) != 0)
         return false;
 
     core_->conn_ref = {&GetConn, this};
@@ -865,10 +813,8 @@ int Connection::AckStreamData(ngtcp2_conn*, int64_t stream_id, uint64_t offset,
 int Connection::OpenStream(ngtcp2_conn*, int64_t stream_id, void* user_data) {
     auto& self = *static_cast<Connection*>(user_data);
     if (!ngtcp2_is_bidi_stream(stream_id)) return 0;
-    auto& pool = self.listener_->pool;
-    auto state = memory::AllocateShared<QuicStreamState>(
-        pool.resource(), pool, self.Reactor(), stream_id,
-        self.weak_from_this());
+    auto state = std::make_shared<QuicStreamState>(
+        self.Reactor(), stream_id, self.weak_from_this());
     auto [it, inserted] = self.core_->streams.try_emplace(
         stream_id, std::move(state));
     if (!inserted) return NGTCP2_ERR_CALLBACK_FAILURE;
@@ -1330,7 +1276,7 @@ void Connection::StartRawStream(int64_t stream_id, StreamRecord& stream) {
         }
     }
     stream.delivered = true;
-    SpawnOwned(DeliverStream(memory::MakeUnique<QuicStream>(listener_->pool, stream.state)));
+    SpawnOwned(DeliverStream(std::make_unique<QuicStream>(stream.state)));
 }
 
 void Connection::OpenV1UdpSession(
@@ -1343,7 +1289,7 @@ void Connection::OpenV1UdpSession(
     stream.delivered = true;
     stream.state->DiscardInput(header_bytes);
     const auto response = EncodeV1Response(true, session_id, "");
-    stream.output.push_back(CopyPacket(response, listener_->pool));
+    stream.output.push_back(CopyPacket(response));
     stream.queued_bytes += response.size();
     ScheduleStreamOutput(stream_id, stream);
     Flush();
@@ -1377,14 +1323,14 @@ net::awaitable<void> Connection::RunV1Control(int64_t stream_id) {
     const auto result = co_await AdmitConnection(hello->auth);
     if (result == AdmitResult::AuthFailed) {
         auto response = EncodeV1ServerHello(false, 0, 0, "authentication failed");
-        co_await state->WriteMultiBuffer(CopyPacket(response, listener_->pool));
+        co_await state->WriteMultiBuffer(CopyPacket(response));
         co_return;
     }
     if (result != AdmitResult::Admitted) co_return;
     auto response = EncodeV1ServerHello(
         true, listener_->download_bytes_per_second,
         listener_->upload_bytes_per_second, "");
-    co_await state->WriteMultiBuffer(CopyPacket(response, listener_->pool));
+    co_await state->WriteMultiBuffer(CopyPacket(response));
     if (closed_) co_return;
     memory::Vector<int64_t> waiting;
     for (const auto& [id, candidate] : core_->streams) {
@@ -1438,9 +1384,8 @@ bool Connection::SetupHttp3() {
     nghttp3_settings_default(&http_settings);
     http_settings.qpack_max_dtable_capacity = 4096;
     http_settings.qpack_blocked_streams = 32;
-    core_->http_mem = QuicMemory::Nghttp3(listener_->pool);
     if (nghttp3_conn_server_new(&core_->http, &callbacks, &http_settings,
-            &core_->http_mem, this) != 0) return false;
+            &kHttp3Memory, this) != 0) return false;
     nghttp3_conn_set_max_client_streams_bidi(core_->http, kMaxStreams);
     int64_t control = -1, encoder = -1, decoder = -1;
     return ngtcp2_conn_open_uni_stream(core_->quic, &control, nullptr) == 0 &&
@@ -1607,9 +1552,8 @@ void Connection::DeliverUdpPacket(
         return;
     }
     if (core_->udp_sessions.size() >= kMaxUdpSessions) return;
-    auto session = memory::MakeUnique<UdpSessionStream>(
-        listener_->pool, listener_->pool, Reactor(), session_id, target,
-        weak_from_this());
+    auto session = std::make_unique<UdpSessionStream>(
+        Reactor(), session_id, target, weak_from_this());
     if (!session->Push(target, payload)) return;
     core_->udp_sessions.emplace(session_id, session.get());
     SpawnOwned(DeliverStream(std::move(session)));
@@ -1684,10 +1628,9 @@ void Connection::CloseUdpSession(uint32_t session_id) noexcept {
 }
 
 HysteriaIngress::HysteriaIngress(
-    memory::worker_memory& pool_value, uint32_t worker_id_value, net::io_context& io_value,
+    uint32_t worker_id_value, net::io_context& io_value,
     app::DatagramSessionEnvironment environment_value)
-    : pool(pool_value),
-      environment(std::move(environment_value)),
+    : environment(std::move(environment_value)),
       worker_id(worker_id_value), io(io_value),
       changed(io, std::chrono::steady_clock::time_point::max()), expiry(io) {
     const auto* settings = GetSettings(*environment.prepared);
@@ -1780,7 +1723,7 @@ SocketState* HysteriaIngress::Resolve(const udp::endpoint& local) noexcept {
 
 
 net::awaitable<void> HysteriaIngress::ReceiveLoop(std::shared_ptr<SocketState> socket) {
-    ::detail::UdpReceiveBuffer receive_buffer(pool);
+    ::detail::UdpReceiveBuffer receive_buffer;
     while (!stopping && socket->socket && socket->socket->is_open()) {
         receive_buffer.Release();
         auto [wait_error] = co_await socket->socket->async_wait(
@@ -1925,7 +1868,7 @@ net::awaitable<void> HysteriaIngress::ExpiryLoop() {
 }
 
 HysteriaIngress::SocketPtr HysteriaIngress::MakeSocket() {
-    return memory::AllocateShared<udp::socket>(pool.resource(), io);
+    return std::make_shared<udp::socket>(io);
 }
 
 HysteriaIngress::SocketPtr HysteriaIngress::AttachSocket(
@@ -1935,7 +1878,7 @@ HysteriaIngress::SocketPtr HysteriaIngress::AttachSocket(
     const auto* coordinator = GroupCoordinator::ForContext(io);
     const uint32_t worker_count = coordinator ? coordinator->WorkerCount() : 1;
     (void)AttachQuicReuseportBpf(socket->native_handle(), worker_count);
-    auto state = memory::AllocateShared<SocketState>(pool.resource(), io);
+    auto state = std::make_shared<SocketState>(io);
     state->socket = std::move(socket);
     IoErrorCode error;
     state->local = state->socket->local_endpoint(error);
@@ -1984,12 +1927,10 @@ net::awaitable<void> HysteriaIngress::AsyncJoin() {
 }
 
 QuicStreamState::QuicStreamState(
-    memory::worker_memory& pool,
     net::io_context& io_context,
     int64_t stream_id,
     std::weak_ptr<Connection> owner)
-    : pool_(pool)
-    , io_context_(io_context)
+    : io_context_(io_context)
     , stream_id_(stream_id)
     , owner_(std::move(owner))
     , input_signal_(io_context.get_executor(), 1) {}
@@ -2000,7 +1941,7 @@ bool QuicStreamState::PushInput(std::span<const uint8_t> data, bool fin) {
             std::min(input_.byte_size(), kMaxQueuedInputBytes)) {
         return false;
     }
-    if (!buf::AppendSpanToMultiBuffer(data, input_, pool_)) return false;
+    if (!buf::AppendSpanToMultiBuffer(data, input_)) return false;
     input_done_ = fin;
     WakeReader();
     return true;
@@ -2126,7 +2067,7 @@ void QuicStreamState::CheckWriteOpen() const {
 net::awaitable<void> QuicStreamState::WaitWritable() {
     CheckWriteOpen();
     if (!output_wait_)
-        output_wait_ = memory::MakeUnique<OutputWait>(pool_, io_context_.get_executor());
+        output_wait_ = std::make_unique<OutputWait>(io_context_.get_executor());
     struct PendingWriteWait {
         QuicStreamState& owner;
         OutputWait& wait;
@@ -2155,8 +2096,7 @@ void QuicStreamState::WakeReader() noexcept {
 }
 
 QuicStream::QuicStream(std::shared_ptr<QuicStreamState> state)
-    : AsyncStream(state->Pool())
-    , state_(std::move(state))
+    : state_(std::move(state))
     , deadline_(state_->IoContext(), *this) {}
 
 QuicStream::~QuicStream() noexcept {
@@ -2194,7 +2134,7 @@ net::awaitable<void> QuicStream::WriteBuffers(
     for (const auto& buffer : buffers) {
         const auto bytes = std::span(
             static_cast<const uint8_t*>(buffer.data()), buffer.size());
-        if (!buf::AppendSpanToMultiBuffer(bytes, payload, Pool())) throw std::bad_alloc();
+        if (!buf::AppendSpanToMultiBuffer(bytes, payload)) throw std::bad_alloc();
     }
     co_await WriteMultiBuffer(std::move(payload));
 }
@@ -2224,10 +2164,9 @@ bool QuicStream::IsOpen() const {
 }
 
 UdpSessionStream::UdpSessionStream(
-    memory::worker_memory& pool, net::io_context& io_context, uint32_t session_id,
+    net::io_context& io_context, uint32_t session_id,
     TargetAddress first_target, std::weak_ptr<Connection> owner)
-    : AsyncStream(pool)
-    , session_id_(session_id)
+    : session_id_(session_id)
     , first_target_(std::move(first_target))
     , owner_(std::move(owner))
     , signal_(io_context.get_executor(), 1)
@@ -2247,8 +2186,8 @@ bool UdpSessionStream::Push(
     if (buffer_count > kMaxQueuedBytes / buf::Buffer::kSize - queued_buffer_count_)
         return false;
     buf::MultiBuffer packet;
-    if (!buf::AppendSpanToMultiBuffer(payload, packet, Pool()) ||
-        !buf::SetUdpTarget(packet, target, Pool())) return false;
+    if (!buf::AppendSpanToMultiBuffer(payload, packet) ||
+        !buf::SetUdpTarget(packet, target)) return false;
     input_.push_back(std::move(packet));
     queued_buffer_count_ += buffer_count;
     WakeReader();

@@ -11,11 +11,11 @@
 #include "app/proxyman/inbound/handler.hpp"
 #include "infra/config_types.hpp"
 #include "infra/log.hpp"
-#include "common/allocator.hpp"
 #include "common/initial_payload.hpp"
 #include "common/session.hpp"
 
 #include <cstring>
+#include <memory>
 #include <tl/expected.hpp>
 #include <span>
 #include <utility>
@@ -269,13 +269,12 @@ const bool kVmessInboundRegistered = [] {
         [](::proxyman::inbound::ProtocolRuntime& runtime,
            ::StatsShard& stats,
            ::ConnectionLimiter* limiter,
-           const ::proxyman::inbound::BuildRequest&,
-           memory::worker_memory& pool) -> std::unique_ptr<::Inbound> {
+           const ::proxyman::inbound::BuildRequest&) -> std::unique_ptr<::Inbound> {
             auto* tracker = runtime.OnlineTracker();
             if (!tracker) {
                 return nullptr;
             }
-            return memory::MakeUnique<::proxy::vmess::inbound::Handler>(pool,
+            return std::make_unique<::proxy::vmess::inbound::Handler>(
                 *tracker,
                 stats,
                 limiter);

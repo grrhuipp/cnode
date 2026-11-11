@@ -218,15 +218,13 @@ struct SslContextDeleter {
 using SslContextPtr = std::unique_ptr<SSL_CTX, SslContextDeleter>;
 
 
-class QuicStreamState final : public memory::WorkerAllocated {
+class QuicStreamState final {
 public:
     static constexpr size_t kMaxQueuedInputBytes = 512 * 1024;
 
-    QuicStreamState(memory::worker_memory& pool, net::io_context& io_context, int64_t stream_id,
+    QuicStreamState(net::io_context& io_context, int64_t stream_id,
                     std::weak_ptr<Connection> owner);
 
-    // The connection's Worker pool; received input and stream objects come from it.
-    [[nodiscard]] memory::worker_memory& Pool() const noexcept { return pool_; }
     [[nodiscard]] net::io_context& IoContext() const noexcept { return io_context_; }
     transport::CancellationSource& Cancellation() noexcept { return cancellation_; }
     [[nodiscard]] bool PushInput(std::span<const uint8_t> data, bool fin);
@@ -256,7 +254,7 @@ public:
     }
 
 private:
-    struct OutputWait final : memory::WorkerAllocated {
+    struct OutputWait final {
         explicit OutputWait(net::any_io_executor executor)
             : ready(std::move(executor), 0) {}
         OutputWait(const OutputWait&) = delete;
@@ -272,7 +270,6 @@ private:
     void Abort(bool cancel_transport) noexcept;
     void WakeReader() noexcept;
 
-    memory::worker_memory& pool_;
     net::io_context& io_context_;
     int64_t stream_id_;
     std::weak_ptr<Connection> owner_;
@@ -326,7 +323,7 @@ public:
     // Bounds queued Buffer data capacity, not only the datagrams' payload sizes.
     static constexpr size_t kMaxQueuedBytes = 512 * 1024;
 
-    UdpSessionStream(memory::worker_memory& pool, net::io_context& io_context, uint32_t session_id,
+    UdpSessionStream(net::io_context& io_context, uint32_t session_id,
                      TargetAddress first_target,
                      std::weak_ptr<Connection> owner);
     ~UdpSessionStream() noexcept override;
@@ -371,11 +368,11 @@ private:
 // timer. Each accepted QUIC connection stays on its accepting Worker, shared
 // by all its TCP streams and UDP sessions; listeners never transfer received
 // payloads or move their shared sockets.
-class HysteriaIngress final : public memory::WorkerAllocated {
+class HysteriaIngress final {
 public:
     using SocketPtr = std::shared_ptr<udp::socket>;
 
-    HysteriaIngress(memory::worker_memory& pool, uint32_t worker_id, net::io_context& io_context,
+    HysteriaIngress(uint32_t worker_id, net::io_context& io_context,
                    app::DatagramSessionEnvironment environment);
     ~HysteriaIngress() noexcept;
 
@@ -407,8 +404,6 @@ private:
     void ArmExpiryAt(ngtcp2_tstamp deadline);
     net::awaitable<void> ExpiryLoop();
 
-    // The owning Worker's pool: sockets, connections' QUIC state and payloads.
-    memory::worker_memory& pool;
     app::DatagramSessionEnvironment environment;
     memory::UnorderedMap<Connection*, std::shared_ptr<Connection>> sessions;
     uint32_t worker_id;
@@ -507,10 +502,6 @@ private:
             if (http) nghttp3_conn_del(http);
             if (ssl) SSL_free(ssl);
         }
-        // Allocators bound to the Worker pool; ngtcp2/nghttp3 keep these pointers
-        // until ~Core deletes their connections.
-        ngtcp2_mem quic_mem{};
-        nghttp3_mem http_mem{};
         ngtcp2_conn* quic = nullptr;
         nghttp3_conn* http = nullptr;
         SSL* ssl = nullptr;

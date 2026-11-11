@@ -85,12 +85,11 @@ struct Worker::ListenerState : worker_detail::UdpReplySink {
         memory::String, SlotPtr, TransparentStringHash, TransparentStringEq>;
     using ListenerKeys = memory::Vector<memory::String>;
 
-    memory::worker_memory& pool;
     ListenerSlotMap listener_slots;
     [[nodiscard]] auto FindOrCreateSlot(std::string_view tag) {
         const auto existing = listener_slots.find(tag);
         if (existing != listener_slots.end()) return std::pair{existing, false};
-        auto slot = memory::AllocateShared<ListenerSlot>(pool.resource());
+        auto slot = std::make_shared<ListenerSlot>();
         return listener_slots.try_emplace(memory::String(tag), std::move(slot));
     }
     uint64_t udp_resource_drops = 0;
@@ -99,9 +98,7 @@ struct Worker::ListenerState : worker_detail::UdpReplySink {
     size_t udp_reply_sends = 0;
     uint32_t active_sessions = 0;
     bool stopping = false;
-    struct TaskCancellation final
-        : memory::WorkerAllocated
-        , transport::CancellationSubscription {
+    struct TaskCancellation final : transport::CancellationSubscription {
         explicit TaskCancellation(ListenerState& state) : owner(state), next(state.tasks) {
             if (next) next->previous = this;
             state.tasks = this;
@@ -125,9 +122,8 @@ struct Worker::ListenerState : worker_detail::UdpReplySink {
     };
     TaskCancellation* tasks = nullptr;
     net::steady_timer changed;
-    ListenerState(memory::worker_memory& pool, net::io_context& io)
-        : pool(pool), listener_slots(pool.resource()),
-          changed(io, std::chrono::steady_clock::time_point::max()) {}
+    explicit ListenerState(net::io_context& io)
+        : changed(io, std::chrono::steady_clock::time_point::max()) {}
     void NotifyCompletion() { changed.cancel(); }
     void Spawn(Worker& worker, net::awaitable<void> task, bool listener,
                std::unique_ptr<TaskCancellation> registration) {
@@ -237,8 +233,7 @@ private:
 // Worker-owned listeners, configuration publication and admission ledgers.
 // Every TCP, QUIC and native UDP request dispatches within its session domain.
 struct Worker::RuntimeState {
-    RuntimeState(memory::worker_memory& pool,
-                 net::io_context& io_context,
+    RuntimeState(net::io_context& io_context,
                  const WorkerRuntimeConfig& runtime_config,
                  StatsShard& stats_ref,
                  app::dns::DNSWorker& dns_worker,
@@ -253,7 +248,7 @@ struct Worker::RuntimeState {
         , request_load(runtime_config.pressure_threshold,
                        runtime_config.pressure_idle_timeout)
         , dns_worker(dns_worker)
-        , listener_state(std::make_unique<ListenerState>(pool, io_context))
+        , listener_state(std::make_unique<ListenerState>(io_context))
         {}
 
     ~RuntimeState() {
@@ -367,7 +362,7 @@ Worker::Worker(uint32_t id, net::io_context& io_context,
     : id_(id)
     , io_context_(io_context)
     , runtime_(std::make_unique<RuntimeState>(
-          pool_, io_context, runtime_config, stats, dns_worker, geo_database))
+          io_context, runtime_config, stats, dns_worker, geo_database))
     , mailbox_(std::make_unique<WorkerMailbox>(
           runtime_->io_context,
           defaults::kWorkerMailboxCapacity)) {}
@@ -552,15 +547,13 @@ void Worker::RuntimeState::Start(Worker& worker) {
 
     auto& scheduler = TimeoutScheduler::ForIoContext(io_context);
     udp_association_reclaimer =
-        memory::MakeUnique<worker_detail::UdpAssociationReclaimer>(
-            worker.pool_,
+        std::make_unique<worker_detail::UdpAssociationReclaimer>(
             scheduler, &worker,
             +[](void* ctx, std::exception_ptr error) {
                 static_cast<Worker*>(ctx)->ReportFailure(std::move(error));
             });
     session_tracking = std::make_unique<app::SessionTrackingState>();
-    inbound_handlers = memory::MakeUnique<proxyman::inbound::HandlerRegistry>(
-        worker.pool_, worker.pool_, stats);
+    inbound_handlers = std::make_unique<proxyman::inbound::HandlerRegistry>(stats);
     detect_rule_policy = std::make_unique<rule::DetectRulePolicy>();
     const auto* config = startup_config.get();
     if (!connection_limiter) {
@@ -577,10 +570,9 @@ void Worker::RuntimeState::Start(Worker& worker) {
     outbound_tasks = std::make_unique<ResidentTaskGroup>(io_context.get_executor());
     outbounds = std::make_unique<proxyman::outbound::OutboundConfiguration>(
         config->outbounds);
-    outbound_handlers = memory::MakeUnique<proxyman::outbound::HandlerLookup>(
-        worker.pool_, worker.pool_,
+    outbound_handlers = std::make_unique<proxyman::outbound::HandlerLookup>(
         *outbounds, io_context, *dns, timeouts.DialTimeout(), outbound_tasks->Tasks());
-    dispatcher = memory::MakeUnique<app::dispatcher::DefaultDispatcher>(worker.pool_,
+    dispatcher = std::make_unique<app::dispatcher::DefaultDispatcher>(
         *router, *outbound_handlers, *detect_rule_policy,
         *session_tracking, *dns, request_load);
     started = true;
@@ -687,7 +679,7 @@ bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
 
     ListenerSlot::SocketBinding committed_binding{binding.port, binding.listen};
     auto replacement_listeners =
-        memory::MakeUnique<worker_detail::TcpListenerOwner>(worker.pool_, worker.pool_);
+        std::make_unique<worker_detail::TcpListenerOwner>();
     struct PreparedListener {
         memory::String key;
         worker_detail::TcpListenerOwner::AcceptorPtr acceptor;
@@ -796,7 +788,7 @@ bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
 
     for (auto& prepared : prepared_listeners) {
         const auto& listener_key = prepared.key;
-        auto registration = memory::MakeUnique<TaskCancellation>(worker.pool_, *this);
+        auto registration = std::make_unique<TaskCancellation>(*this);
         Spawn(worker, AcceptLoop(worker, listener_key, memory::String(binding.tag),
                                  std::move(prepared.acceptor), slot_it->second),
               true, std::move(registration));
@@ -1013,7 +1005,7 @@ net::awaitable<void> Worker::ListenerState::AcceptLoop(
             continue;
         }
 
-        auto registration = memory::MakeUnique<TaskCancellation>(worker.pool_, *this);
+        auto registration = std::make_unique<TaskCancellation>(*this);
         auto* registration_ptr = registration.get();
         Spawn(worker,
             ProcessReceivedConnection(
@@ -1035,10 +1027,10 @@ net::awaitable<void> Worker::ListenerState::ProcessReceivedConnection(
     tcp::endpoint remote_ep) {
     app::RequestLoadState::PhysicalConnectionScope physical(worker.runtime_->request_load);
     const auto& listener = inbound_handler->ReceiverSettings();
-    auto tcp_stream = memory::MakeUnique<TcpStream>(worker.pool_, worker.pool_, std::move(socket));
+    auto tcp_stream = std::make_unique<TcpStream>(std::move(socket));
     registration.stream = tcp_stream.get();
     registration.Resubscribe(tcp_stream->Cancellation());
-    session::Context ctx(worker.pool_);
+    session::Context ctx;
     ctx.conn_id = session::NewID(worker.id_);
     ctx.worker_id = worker.id_;
     ctx.inbound.tag = listener.inbound_tag;
@@ -1098,7 +1090,7 @@ bool Worker::RegisterInbound(
         return false;
     }
     auto inbound_handler =
-        memory::MakeUnique<proxyman::inbound::Handler>(pool_,
+        std::make_unique<proxyman::inbound::Handler>(
             std::move(receiver), std::move(handler), *runtime_->connection_limiter);
     const auto& settings = inbound_handler->ReceiverSettings();
     const memory::String key(settings.inbound_tag);
@@ -1252,19 +1244,13 @@ std::vector<OnlineDevice> Worker::GetOnlineDevices(std::string_view tag) const {
 
 WorkerRuntimeStatsSnapshot Worker::CollectRuntimeStats(bool include_resources) const {
     WorkerRuntimeStatsSnapshot snapshot;
-    // Sample this Worker-owned transport and pool state on its own event loop.
+    // Sample Worker-owned transports on their event loop.
     snapshot.memory.udp_sockets = transport::internet::DatagramSocket::ActiveCount();
     snapshot.stats = runtime_->stats.Snapshot();
     snapshot.worker_id = id_;
     snapshot.active_connections = runtime_->listener_state->active_sessions;
     if (!include_resources) return snapshot;
     auto& resources = snapshot.resources.emplace();
-    const auto& pool = pool_;
-    const auto footprint = pool.GetFootprint();
-    resources.pool_committed_bytes = footprint.committed_bytes;
-    resources.pool_used_bytes = footprint.used_bytes;
-    resources.pool_live_allocations = pool.OutstandingAllocations();
-    resources.pool_pages = footprint.pages;
     resources.udp_resource_drops = runtime_->listener_state->udp_resource_drops;
     resources.udp_receive_loops = runtime_->listener_state->udp_receive_loops;
     auto collect_udp = [&](const worker_detail::UdpIngress* ingress) {
@@ -1293,10 +1279,6 @@ WorkerRuntimeStatsSnapshot Worker::CollectRuntimeStats(bool include_resources) c
     resources.timeout_heap_capacity = timeouts.heap_capacity;
     resources.timeout_waiters = timeouts.wait_pending ? 1 : 0;
     return snapshot;
-}
-
-void Worker::CollectHeap() {
-    memory::CollectBurst(pool_);
 }
 
 // ============================================================================
@@ -1354,8 +1336,7 @@ net::awaitable<bool> Worker::ListenerState::StartQuicListening(
                   worker.id_, binding.tag);
         co_return false;
     }
-    auto replacement = memory::MakeUnique<transport::internet::hysteria::HysteriaIngress>(
-        worker.pool_, worker.pool_,
+    auto replacement = std::make_unique<transport::internet::hysteria::HysteriaIngress>(
         worker.id_, worker.runtime_->io_context, slot_it->second->datagram_environment);
 
     size_t bound = 0;
@@ -1432,7 +1413,7 @@ net::awaitable<bool> Worker::ListenerState::StartUdpListening(
     }
     ListenerSlot::SocketBinding committed_binding{binding.port, binding.listen};
     auto replacement_ingress =
-        memory::MakeUnique<worker_detail::UdpIngress>(worker.pool_, worker.pool_,
+        std::make_unique<worker_detail::UdpIngress>(
             binding.tag, std::move(handler), *worker.runtime_->udp_association_reclaimer,
             worker.runtime_->udp_resource_budget, worker.runtime_->io_context);
     ListenerKeys prepared_socket_keys;
@@ -1445,7 +1426,7 @@ net::awaitable<bool> Worker::ListenerState::StartUdpListening(
         const iputil::AddressText listen_text(addr);
         const auto listen_addr = listen_text.View();
         auto candidate_sock =
-            replacement_ingress->MakeSocket(worker.runtime_->io_context, worker.pool_);
+            replacement_ingress->MakeSocket(worker.runtime_->io_context);
         if (!OpenAndBindUdpSocket(
                 worker, "UDP", *candidate_sock, addr, listen_addr, binding.port,
                 listen_candidates.size() > 1)) {
@@ -1616,7 +1597,6 @@ net::awaitable<void> Worker::ListenerState::UdpReceiveLoop(
         });
     };
     return worker_detail::RunUdpReceiveLoop(
-        std::move(sock), std::move(is_owned), std::move(process_datagram), udp_resource_drops,
-        worker.pool_);
+        std::move(sock), std::move(is_owned), std::move(process_datagram), udp_resource_drops);
 }
 

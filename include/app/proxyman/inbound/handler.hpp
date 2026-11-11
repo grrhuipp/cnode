@@ -167,7 +167,7 @@ struct DatagramHandlerBuildResult {
 // ============================================================================
 // ProtocolRuntime - 每个 Worker 的协议私有可变状态
 // ============================================================================
-class ProtocolRuntime : public memory::WorkerAllocated {
+class ProtocolRuntime {
 public:
     virtual ~ProtocolRuntime() noexcept = default;
 
@@ -185,24 +185,22 @@ struct ProxyRegistration {
     std::optional<UserProtocol> user_protocol;
     DatagramTransport datagram_transport = DatagramTransport::None;
 
-    // 创建当前 Worker 独占的协议运行态（必须），对象与运行态取自该 Worker 池。
-    std::unique_ptr<ProtocolRuntime> (*create_runtime)(memory::worker_memory& pool) = nullptr;
+    // 创建当前 Worker 独占的协议运行态（必须）。
+    std::unique_ptr<ProtocolRuntime> (*create_runtime)() = nullptr;
 
     // 创建 TCP 入站处理器（必须）
     std::unique_ptr<::Inbound> (*create_tcp_handler)(
         ProtocolRuntime& runtime,
         ::StatsShard& stats,
         ::ConnectionLimiter* limiter,
-        const BuildRequest& req,
-        memory::worker_memory& pool) = nullptr;
+        const BuildRequest& req) = nullptr;
 
     // 创建 UDP 入站处理器（可选）
     std::unique_ptr<::Inbound> (*create_datagram_handler)(
         ProtocolRuntime& runtime,
         ::StatsShard& stats,
         ::ConnectionLimiter* limiter,
-        const BuildRequest& req,
-        memory::worker_memory& pool) = nullptr;
+        const BuildRequest& req) = nullptr;
 
     // Parse protocol-specific source fields on the cold path. The returned
     // immutable type remains private to the protocol implementation.
@@ -230,24 +228,21 @@ void RegisterProxy(std::string_view protocol, ProxyRegistration registration);
 [[nodiscard]] DatagramTransport RegisteredDatagramTransport(
     std::string_view protocol);
 [[nodiscard]] std::unique_ptr<ProtocolRuntime> NewProtocolRuntime(
-    std::string_view protocol,
-    memory::worker_memory& pool);
+    std::string_view protocol);
 
 [[nodiscard]] std::unique_ptr<::Inbound> NewHandler(
     std::string_view protocol,
     ProtocolRuntime& runtime,
     ::StatsShard& stats,
     ::ConnectionLimiter* limiter,
-    const BuildRequest& req,
-    memory::worker_memory& pool);
+    const BuildRequest& req);
 
 [[nodiscard]] DatagramHandlerBuildResult NewDatagramHandler(
     std::string_view protocol,
     ProtocolRuntime& runtime,
     ::StatsShard& stats,
     ::ConnectionLimiter* limiter,
-    const BuildRequest& req,
-    memory::worker_memory& pool);
+    const BuildRequest& req);
 
 [[nodiscard]] std::optional<BuildRequest> PrepareBuildRequest(
     std::string_view protocol,
@@ -264,9 +259,7 @@ void RegisterProxy(std::string_view protocol, ProxyRegistration registration);
 // protocol state only when a real logical request reaches the proxy.
 // Either way each request crosses exactly one virtual Inbound::Process.
 // ============================================================================
-class Handler final
-    : public memory::WorkerAllocated
-    , public std::enable_shared_from_this<Handler> {
+class Handler final : public std::enable_shared_from_this<Handler> {
 public:
     // Prepared TransportSecurity is shared; SSL contexts are never rebuilt for
     // each short HTTP packet upload.
@@ -328,9 +321,9 @@ private:
 // 对齐 xray-core features/inbound.Manager 的职责边界。它只在 Worker 线程访问，
 // 不加锁；跨线程控制面操作只能经所属 Worker 的有界 mailbox 投递。
 // ============================================================================
-class HandlerRegistry final : public memory::WorkerAllocated {
+class HandlerRegistry final {
 public:
-    HandlerRegistry(memory::worker_memory& pool, StatsShard& stats);
+    explicit HandlerRegistry(StatsShard& stats);
     ~HandlerRegistry() noexcept;
 
     HandlerRegistry(const HandlerRegistry&) = delete;
@@ -372,7 +365,6 @@ private:
         TransparentStringHash,
         TransparentStringEq>;
 
-    memory::worker_memory& pool_;
     StatsShard& stats_;
     RuntimeMap runtimes_;
     HandlerMap handlers_;

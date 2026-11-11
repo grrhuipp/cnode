@@ -73,7 +73,7 @@ struct OutboundSelection {
 // share its executor; routing/policy snapshots are immutable control products.
 // Hot dispatch consumes only the narrow DispatchPolicy.
 // ============================================================================
-class DefaultDispatcher final : public routing::Dispatcher, public memory::WorkerAllocated {
+class DefaultDispatcher final : public routing::Dispatcher {
 public:
     DefaultDispatcher(
         const routing::Router& router,

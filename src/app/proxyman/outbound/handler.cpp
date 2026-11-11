@@ -11,13 +11,12 @@ namespace proxyman::outbound {
 // Handler
 // ============================================================================
 
-Handler::Handler(memory::worker_memory& pool,
-                 OutboundConfiguration::Entry config, net::io_context& io_context,
+Handler::Handler(OutboundConfiguration::Entry config, net::io_context& io_context,
                  app::dns::DNS& dns, std::chrono::seconds dial_timeout,
                  AwaitableTaskGroup& tasks)
     : config_(std::move(config))
     , dialer_(io_context, dns, config_->sender, dial_timeout)
-    , proxy_(NewProxy(*config_, io_context, tasks, pool)) {
+    , proxy_(NewProxy(*config_, io_context, tasks)) {
 }
 
 
@@ -42,12 +41,11 @@ net::awaitable<OutboundProcessResult> Handler::Dispatch(
 // HandlerLookup
 // ============================================================================
 
-HandlerLookup::HandlerLookup(memory::worker_memory& pool,
-                             const OutboundConfiguration& configuration,
+HandlerLookup::HandlerLookup(const OutboundConfiguration& configuration,
                              net::io_context& io_context, app::dns::DNS& dns,
                              std::chrono::seconds dial_timeout, AwaitableTaskGroup& tasks)
-    : pool_(pool), configuration_(configuration), io_context_(io_context), dns_(dns),
-      dial_timeout_(dial_timeout), tasks_(tasks), entries_(pool.resource()) {}
+    : configuration_(configuration), io_context_(io_context), dns_(dns),
+      dial_timeout_(dial_timeout), tasks_(tasks) {}
 
 std::shared_ptr<Handler> HandlerLookup::GetHandler(std::string_view tag) {
     if (const auto generation = configuration_.Generation(); generation != generation_) {
@@ -72,7 +70,7 @@ void HandlerLookup::Refresh() noexcept {
 
 void HandlerLookup::Sync(uint64_t generation) {
     const auto& snapshot = configuration_.Entries();
-    memory::Vector<Entry> next(pool_.resource());
+    memory::Vector<Entry> next;
     next.reserve(snapshot.size());
     for (const auto& config : snapshot) {
         std::shared_ptr<Handler> handler;
@@ -90,8 +88,8 @@ void HandlerLookup::Sync(uint64_t generation) {
 }
 
 std::shared_ptr<Handler> HandlerLookup::Instantiate(const OutboundConfiguration::Entry& config) {
-    return memory::AllocateShared<Handler>(
-        pool_.resource(), pool_, config, io_context_, dns_, dial_timeout_, tasks_);
+    return std::make_shared<Handler>(
+        config, io_context_, dns_, dial_timeout_, tasks_);
 }
 
 // ============================================================================
@@ -202,13 +200,12 @@ std::optional<PreparedOutboundConfig> PrepareOutboundConfig(
 std::unique_ptr<::Outbound> NewProxy(
     const PreparedOutboundConfig& config,
     ::net::io_context& io_context,
-    ::AwaitableTaskGroup& tasks,
-    memory::worker_memory& pool) {
+    ::AwaitableTaskGroup& tasks) {
     if (!config.create) {
         throw std::logic_error(
             "prepared outbound '" + config.tag + "' has no creator");
     }
-    auto proxy = config.create(config.tag, io_context, tasks, pool);
+    auto proxy = config.create(config.tag, io_context, tasks);
     if (!proxy) {
         throw std::logic_error(
             "prepared outbound '" + config.tag + "' creator returned null");

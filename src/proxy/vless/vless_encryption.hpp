@@ -625,8 +625,7 @@ public:
     transport::EofAction ReadEofAction() const noexcept override { return src_.ReadEofAction(); }
 
     // A deferred read side must not come with a header XOR; it derives its own.
-    VlessEncryptionReader(memory::worker_memory& pool,
-                          transport::MultiBufferReader& src,
+    VlessEncryptionReader(transport::MultiBufferReader& src,
                           VlessEncryptionReadKeys keys,
                           const VlessEncryptionUnitedKey& united_key,
                           std::optional<VlessEncryptionHeaderXor>
@@ -659,8 +658,7 @@ private:
 
 class VlessEncryptionWriter final : public transport::MultiBufferWriter {
 public:
-    VlessEncryptionWriter(memory::worker_memory& pool,
-                          transport::MultiBufferWriter& dst,
+    VlessEncryptionWriter(transport::MultiBufferWriter& dst,
                           VlessEncryptionAead aead,
                           const VlessEncryptionUnitedKey& united_key,
                           std::optional<VlessEncryptionHeaderXor>
@@ -685,7 +683,6 @@ private:
     template <typename BufferRange>
     net::awaitable<void> WriteEncrypted(BufferRange source);
 
-    memory::worker_memory& pool_;
     transport::MultiBufferWriter& dst_;
     VlessEncryptionAead aead_;
     VlessEncryptionUnitedKey united_key_;
@@ -725,9 +722,8 @@ using VlessEncryptionHandshakeResult =
 // Record layer installed over the raw connection after a completed handshake.
 // `plain_reader` borrows `reader` and both borrow the raw endpoints, so the
 // owner is address-stable and must outlive every borrowed raw endpoint use.
-struct VlessEncryptedIo : memory::WorkerAllocated {
-    VlessEncryptedIo(memory::worker_memory& pool,
-                     VlessBufferedReader& raw_reader,
+struct VlessEncryptedIo {
+    VlessEncryptedIo(VlessBufferedReader& raw_reader,
                      transport::MultiBufferWriter& raw_writer,
                      VlessEncryptionRuntime runtime);
 

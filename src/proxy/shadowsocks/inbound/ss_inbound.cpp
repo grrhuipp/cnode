@@ -10,7 +10,6 @@
 #include "app/proxyman/inbound/handler.hpp"
 #include "infra/config_types.hpp"
 #include "infra/log.hpp"
-#include "common/allocator.hpp"
 #include "common/initial_payload.hpp"
 #include "common/session.hpp"
 
@@ -169,7 +168,7 @@ net::awaitable<void> ResponseBodyWriter::WriteEncrypted(BufferRange buffers) {
         }
 
         buf::MultiBuffer out_mb;
-        out_mb.reserve(buffers.size(), stream.Pool());
+        out_mb.reserve(buffers.size());
         for (const auto& buffer : buffers) {
             const auto bytes = ChunkBytes(buffer);
             if (bytes.empty()) continue;
@@ -178,8 +177,7 @@ net::awaitable<void> ResponseBodyWriter::WriteEncrypted(BufferRange buffers) {
                 write_nonce_,
                 bytes,
                 out_mb,
-                &skip_first_bytes_,
-                stream.Pool());
+                &skip_first_bytes_);
         }
         if constexpr (std::is_same_v<BufferRange, buf::MultiBuffer>) {
             buffers.clear();
@@ -253,7 +251,7 @@ bool ResponseBodyWriter::InitResponseCipher(ResponseBodyWriter& state) {
 
     if (!buf::AppendSpanToMultiBuffer(
             std::span<const uint8_t>(server_salt.data(), key_size),
-            state.pending_prefix_, state.stream_->Pool())) {
+            state.pending_prefix_)) {
         return false;
     }
     state.ClearHandshakeKeys();
@@ -334,16 +332,16 @@ bool ResponseBodyWriter::InitResponseCipher2022(
     state.pending_prefix_.clear();
     if (!buf::AppendSpanToMultiBuffer(
             std::span<const uint8_t>(server_salt.data(), key_size),
-            state.pending_prefix_, state.stream_->Pool()) ||
+            state.pending_prefix_) ||
         !buf::AppendSpanToMultiBuffer(
             std::span<const uint8_t>(fixed_cipher.data(), fixed_cipher_size),
-            state.pending_prefix_, state.stream_->Pool())) {
+            state.pending_prefix_)) {
         state.pending_prefix_.clear();
         return false;
     }
 
     if (want != 0) {
-        buf::BufferGuard payload_cipher{buf::Buffer::New(state.stream_->Pool())};
+        buf::BufferGuard payload_cipher{buf::Buffer::New()};
         if (!payload_cipher ||
             want + SsAeadCipher::kTagSize > payload_cipher->Available()) {
             state.pending_prefix_.clear();
@@ -754,12 +752,11 @@ namespace {
 
 class ShadowsocksUdpResponseContext final : public InboundDatagramResponse {
 public:
-    ShadowsocksUdpResponseContext(memory::worker_memory& pool, ss::KeyBytes reply_key,
-                                  ss::SsCipherInfo cipher_info)
-        : pool_(pool), state_(ClassicState{std::move(reply_key), cipher_info}) {}
+    ShadowsocksUdpResponseContext(ss::KeyBytes reply_key, ss::SsCipherInfo cipher_info)
+        : state_(ClassicState{std::move(reply_key), cipher_info}) {}
 
-    ShadowsocksUdpResponseContext(memory::worker_memory& pool, ss::Ss2022UdpTxState session)
-        : pool_(pool), state_(std::move(session)) {}
+    explicit ShadowsocksUdpResponseContext(ss::Ss2022UdpTxState session)
+        : state_(std::move(session)) {}
 
     [[nodiscard]] buf::MultiBuffer Encode(UDPPacketView packet) override;
 
@@ -775,7 +772,6 @@ private:
         uint8_t* out,
         size_t out_capacity);
 
-    memory::worker_memory& pool_;
     std::variant<ClassicState, ss::Ss2022UdpTxState> state_;
 };
 
@@ -879,7 +875,7 @@ net::awaitable<RelayResult> DispatchSsUotSession(
     try {
         prepared = co_await proxy::uot::ReadUotRequestHeader(
             uot_version, request_reader, std::move(pending),
-            ErrorCode::PROTOCOL_DECODE_FAILED, ctx.pool);
+            ErrorCode::PROTOCOL_DECODE_FAILED);
     } catch (const transport::LinkError& e) {
         prepared = tl::unexpected(e.code());
     } catch (const IoSystemError& e) {
@@ -910,13 +906,11 @@ net::awaitable<RelayResult> DispatchSsUotSession(
 // ============================================================================
 
 proxy::shadowsocks::inbound::Handler::Handler(
-    memory::worker_memory& pool,
     UserOnlineTracker& validator,
     StatsShard& stats,
     ConnectionLimiter* limiter,
     ss::SsCipherInfo cipher_info)
-    : pool_(pool)
-    , validator_(validator)
+    : validator_(validator)
     , stats_(stats)
     , limiter_(limiter)
     , cipher_info_(cipher_info) {}
@@ -1005,7 +999,7 @@ proxy::shadowsocks::inbound::Handler::Process(
     auto decoded = ss::DecodeUdpPacket(
         request.payload.data(), request.payload.size(), users,
         cipher_info_.type, cipher_info_.key_size, cipher_info_.salt_size,
-        udp_replay_cache_, request.associations != nullptr, pool_);
+        udp_replay_cache_, request.associations != nullptr);
     if (!decoded) {
         // UDP datagrams use the socket peer address, never a PROXY protocol source.
         return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
@@ -1052,8 +1046,7 @@ proxy::shadowsocks::inbound::Handler::CreateDatagramResponse(
         return tl::unexpected(ErrorCode::INTERNAL);
     }
     if (!ss::Is2022Cipher(cipher_info_.type)) {
-        return memory::AllocateShared<ShadowsocksUdpResponseContext>(
-            pool_.resource(), pool_, key, cipher_info_);
+        return std::make_shared<ShadowsocksUdpResponseContext>(key, cipher_info_);
     }
     if (!decoded.session_id) return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     ss::Ss2022UdpTxState state;
@@ -1063,8 +1056,7 @@ proxy::shadowsocks::inbound::Handler::CreateDatagramResponse(
     if (RAND_bytes(state.server_session_id.data(), state.server_session_id.size()) != 1) {
         return tl::unexpected(ErrorCode::INTERNAL);
     }
-    return memory::AllocateShared<ShadowsocksUdpResponseContext>(
-        pool_.resource(), pool_, std::move(state));
+    return std::make_shared<ShadowsocksUdpResponseContext>(std::move(state));
 }
 
 size_t ShadowsocksUdpResponseContext::EncodePacketTo(
@@ -1101,7 +1093,7 @@ buf::MultiBuffer ShadowsocksUdpResponseContext::Encode(UDPPacketView packet) {
         return {};
     }
 
-    buf::ContiguousWriteBuffer encoded(pool_);
+    buf::ContiguousWriteBuffer encoded;
     uint8_t* dst = encoded.TryPrepare(encoded_len);
     if (!dst) {
         return {};
@@ -1153,15 +1145,13 @@ const bool kSsInboundRegistered = [] {
         [](::proxyman::inbound::ProtocolRuntime& runtime,
            ::StatsShard& stats,
            ::ConnectionLimiter* limiter,
-           const ::proxyman::inbound::BuildRequest& req,
-           memory::worker_memory& pool) -> std::unique_ptr<::Inbound> {
+           const ::proxyman::inbound::BuildRequest& req) -> std::unique_ptr<::Inbound> {
             auto* tracker = runtime.OnlineTracker();
             const auto* settings = GetSettings(req);
             if (!tracker || !settings) {
                 return nullptr;
             }
-            return memory::MakeUnique<::proxy::shadowsocks::inbound::Handler>(
-                pool, pool,
+            return std::make_unique<::proxy::shadowsocks::inbound::Handler>(
                 *tracker,
                 stats,
                 limiter,

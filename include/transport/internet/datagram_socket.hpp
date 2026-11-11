@@ -72,7 +72,7 @@ public:
         bool send_started_ = false;
     };
 
-    DatagramSocket(memory::worker_memory& pool, net::io_context& io_context,
+    DatagramSocket(net::io_context& io_context,
                    const net::ip::address& bind_address);
     ~DatagramSocket() noexcept;
     DatagramSocket(const DatagramSocket&) = delete;

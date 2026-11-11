@@ -18,8 +18,6 @@ uint64_t CpuNs() {
 }
 
 TEST(ShadowsocksIdentityBenchmark, AuthenticationMatrix) {
-    memory::worker_memory pool;
-    const auto baseline = pool.OutstandingAllocations();
     const size_t iterations = [] {
         const char* value = std::getenv("CNODE_BENCH_ITERATIONS");
         return value ? std::max(size_t{1}, static_cast<size_t>(std::stoull(value))) : size_t{512};
@@ -37,7 +35,7 @@ TEST(ShadowsocksIdentityBenchmark, AuthenticationMatrix) {
             const auto positions_end = std::unique(positions.begin(), positions.end());
             for (auto position_it = positions.begin(); position_it != positions_end; ++position_it) {
                 const size_t position = *position_it;
-                Wire wire{pool};
+                Wire wire;
                 Prepare(io, wire, users[position], cipher);
                 size_t actual_hint = 0, wrong_hint = 0;
                 const auto other_user = users[(position + 1) % count].profile.user_id;
@@ -56,11 +54,9 @@ TEST(ShadowsocksIdentityBenchmark, AuthenticationMatrix) {
                         Require(bool(Authenticate(io, wire, cipher, hint)));
                     }
                     std::vector<double> latencies(iterations);
-                    const auto pool_before = pool.GetFootprint();
                     const size_t warm_rss = ResidentBytes();
                     benchmark::AllocationCounts counts;
                     uint64_t cpu_ns = 0;
-                    size_t live_peak = 0;
                     for (size_t i = 0; i < iterations; ++i) {
                         size_t hint = hint_value;
                         benchmark::AllocationCountScope allocation_scope(counts);
@@ -70,15 +66,11 @@ TEST(ShadowsocksIdentityBenchmark, AuthenticationMatrix) {
                             auto result = Authenticate(io, wire, cipher, hint);
                             Require(bool(result));
                             Require(result->user->profile.user_id == users[position].profile.user_id);
-                            live_peak = std::max(
-                                live_peak,
-                                pool.OutstandingAllocations() - baseline);
                         }
                         const auto finish = std::chrono::steady_clock::now();
                         cpu_ns += CpuNs() - cpu_start;
                         latencies[i] = std::chrono::duration<double, std::nano>(finish - start).count();
                     }
-                    const auto pool_after = pool.GetFootprint();
                     const size_t after_rss = ResidentBytes();
                     const auto process_memory = benchmark::ReadProcessMemory();
                     std::sort(latencies.begin(), latencies.end());
@@ -86,14 +78,14 @@ TEST(ShadowsocksIdentityBenchmark, AuthenticationMatrix) {
                     for (double value : latencies) total_ns += value;
                     std::printf("ss-identity users=%zu groups=%zu input_position=%zu hint=%s n=%zu "
                         "cpu_ns=%.1f mean_ns=%.1f p50_ns=%.1f p95_ns=%.1f p99_ns=%.1f "
-                        "cpp_new_calls=%.3f cpp_bytes=%.1f pmr_live_allocations_peak=%zu pool_before=%zu pool_after=%zu "
+                        "cpp_new_calls=%.3f cpp_bytes=%.1f "
                         "idle_rss=%zu warm_rss=%zu after_rss=%zu process_peak_rss=%zu "
                         "anonymous_rss=%zu file_rss=%zu\n",
                         count, groups, position, hint_mode, iterations, double(cpu_ns) / iterations,
                         total_ns / iterations, latencies[iterations / 2],
                         latencies[(iterations - 1) * 95 / 100], latencies[(iterations - 1) * 99 / 100],
-                        double(counts.cpp_calls) / iterations, double(counts.cpp_bytes) / iterations, live_peak,
-                        pool_before.committed_bytes, pool_after.committed_bytes, idle_rss, warm_rss,
+                        double(counts.cpp_calls) / iterations, double(counts.cpp_bytes) / iterations,
+                        idle_rss, warm_rss,
                         after_rss, process_memory.peak_resident_bytes,
                         process_memory.anonymous_resident_bytes, process_memory.file_resident_bytes);
                 }
@@ -101,6 +93,5 @@ TEST(ShadowsocksIdentityBenchmark, AuthenticationMatrix) {
             UserStore::ClearWorkerView();
         }
     }
-    EXPECT_EQ(pool.OutstandingAllocations(), baseline);
 }
 } // namespace

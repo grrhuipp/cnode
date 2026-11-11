@@ -59,14 +59,14 @@ size_t Count(std::string_view haystack, std::string_view needle) {
 
 // A client socket plus the server-side transport build running on its peer.
 struct Connection {
-    Connection(memory::worker_memory& pool, net::io_context& io, ::tcp::acceptor& acceptor,
+    Connection(net::io_context& io, ::tcp::acceptor& acceptor,
                const ::StreamSettings& settings,
                std::shared_ptr<::InboundTransportStreamHandler> sink)
         : client(io), accepted(io) {
         client.connect(acceptor.local_endpoint());
         acceptor.accept(accepted);
         client.non_blocking(true);
-        auto raw = memory::MakeUnique<::TcpStream>(pool, pool, std::move(accepted));
+        auto raw = std::make_unique<::TcpStream>(std::move(accepted));
         auto build = [this, &io, raw = std::move(raw), &settings,
                       sink = std::move(sink)]() mutable -> net::awaitable<void> {
             auto result = co_await ::BuildInboundTransport(
@@ -147,19 +147,18 @@ std::string PacketUp(std::string_view session, int seq, std::string_view body,
 // and an upload may precede its downlink GET on another connection. A late
 // upload for an ended session is answered without closing the connection.
 void PacketUpPersistsAndPrecedesDownlink() {
-    memory::worker_memory pool;
     net::io_context io;
     ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
     const auto settings = XHttpSettings(::XHttpMode::PacketUp);
     auto sink = std::make_shared<EchoSink>(io, "hello world", "pong");
 
-    Connection upload(pool, io, acceptor, settings, sink);
+    Connection upload(io, acceptor, settings, sink);
     upload.Write(PacketUp("s1", 0, "hello ") + PacketUp("s1", 1, "world"));
     Settle(io);
     Require(!upload.returned && upload.Received().empty(),
             "upload before its downlink was not held for the downlink");
 
-    Connection downlink(pool, io, acceptor, settings, sink);
+    Connection downlink(io, acceptor, settings, sink);
     downlink.Write("GET /fixture/s1 HTTP/1.1\r\nHost: localhost\r\n\r\n");
     RunUntil(io, [&] {
         return Count(upload.Received(), "HTTP/1.1 200 OK\r\n") == 2 &&
@@ -189,15 +188,14 @@ void PacketUpPersistsAndPrecedesDownlink() {
 // Uploads on separate connections may all reach a session before its downlink
 // GET; that GET releases every one of them, not just one.
 void ConcurrentUploadsPrecedeDownlink() {
-    memory::worker_memory pool;
     net::io_context io;
     ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
     const auto settings = XHttpSettings(::XHttpMode::PacketUp);
     auto sink = std::make_shared<EchoSink>(io, "abc", "ok");
 
-    Connection first(pool, io, acceptor, settings, sink);
-    Connection second(pool, io, acceptor, settings, sink);
-    Connection third(pool, io, acceptor, settings, sink);
+    Connection first(io, acceptor, settings, sink);
+    Connection second(io, acceptor, settings, sink);
+    Connection third(io, acceptor, settings, sink);
     first.Write(PacketUp("s2", 0, "a"));
     second.Write(PacketUp("s2", 1, "b"));
     third.Write(PacketUp("s2", 2, "c"));
@@ -205,7 +203,7 @@ void ConcurrentUploadsPrecedeDownlink() {
     Require(first.Received().empty() && second.Received().empty() && third.Received().empty(),
             "uploads were answered before their downlink");
 
-    Connection downlink(pool, io, acceptor, settings, sink);
+    Connection downlink(io, acceptor, settings, sink);
     downlink.Write("GET /fixture/s2 HTTP/1.1\r\nHost: localhost\r\n\r\n");
     RunUntil(io, [&] {
         return first.Received().starts_with("HTTP/1.1 200 OK\r\n") &&
@@ -233,17 +231,16 @@ void ConcurrentUploadsPrecedeDownlink() {
 // RFC 9112 9.6: "close" in any Connection field line ends the connection
 // after the response; a request pipelined behind it is not processed.
 void LaterConnectionCloseFieldEndsConnection() {
-    memory::worker_memory pool;
     net::io_context io;
     ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
     const auto settings = XHttpSettings(::XHttpMode::PacketUp);
     auto sink = std::make_shared<EchoSink>(io, "a", "ok");
 
-    Connection downlink(pool, io, acceptor, settings, sink);
+    Connection downlink(io, acceptor, settings, sink);
     downlink.Write("GET /fixture/s3 HTTP/1.1\r\nHost: localhost\r\n\r\n");
     RunUntil(io, [&] { return sink->started == 1; }, "downlink did not start");
 
-    Connection upload(pool, io, acceptor, settings, sink);
+    Connection upload(io, acceptor, settings, sink);
     upload.Write("POST /fixture/s3/0 HTTP/1.1\r\nHost: localhost\r\n"
                  "Connection: keep-alive\r\nContent-Length: 1\r\nConnection: close\r\n\r\na" +
                  PacketUp("s3", 1, "b"));
@@ -264,12 +261,11 @@ void LaterConnectionCloseFieldEndsConnection() {
 // Without a session id one POST carries both directions: the chunked request
 // body is the uplink and the chunked response body the downlink.
 void StreamOneOverHttp1() {
-    memory::worker_memory pool;
     net::io_context io;
     ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
     const auto settings = XHttpSettings(::XHttpMode::StreamOne);
     auto sink = std::make_shared<EchoSink>(io, "hello", "world");
-    Connection connection(pool, io, acceptor, settings, sink);
+    Connection connection(io, acceptor, settings, sink);
     connection.Write("POST /fixture/ HTTP/1.1\r\nHost: localhost\r\n"
                      "Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n");
     RunUntil(io, [&] {
@@ -288,13 +284,12 @@ void StreamOneOverHttp1() {
 // octets, so a request pipelined behind it never reaches the uplink. 6.1-6.3:
 // conflicting, repeated, unsupported or missing framing is refused.
 void StreamOneHonoursBodyFraming() {
-    memory::worker_memory pool;
     net::io_context io;
     ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
     const auto settings = XHttpSettings(::XHttpMode::StreamOne);
     // Asks for more than the body holds: only body EOF ends the read.
     auto sink = std::make_shared<EchoSink>(io, "hello!", "world");
-    Connection connection(pool, io, acceptor, settings, sink);
+    Connection connection(io, acceptor, settings, sink);
     connection.Write("POST /fixture/ HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello"
                      "POST /fixture/ HTTP/1.1\r\nHost: localhost\r\nContent-Length: 3\r\n\r\nbye");
     RunUntil(io, [&] {
@@ -313,7 +308,7 @@ void StreamOneHonoursBodyFraming() {
     };
     for (const std::string_view framing : kRejected) {
         auto rejecting = std::make_shared<EchoSink>(io, "hello", "world");
-        Connection rejected(pool, io, acceptor, settings, rejecting);
+        Connection rejected(io, acceptor, settings, rejecting);
         rejected.Write("POST /fixture/ HTTP/1.1\r\nHost: localhost\r\n" + std::string(framing) +
                        "\r\n5\r\nhello\r\n0\r\n\r\n");
         RunUntil(io, [&] { return rejected.returned; }, "invalid stream-one framing was not refused");

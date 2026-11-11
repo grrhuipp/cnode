@@ -66,8 +66,8 @@ inline net::awaitable<void> RunBatchOnExecutor(
             static_assert(std::is_nothrow_move_constructible_v<decltype(handler)>);
             std::shared_ptr<BatchState<decltype(handler)>> state;
             try {
-                state = memory::AllocateShared<BatchState<decltype(handler)>>(
-                    nullptr, std::move(handler), tasks.size());
+                state = std::make_shared<BatchState<decltype(handler)>>(
+                    std::move(handler), tasks.size());
             } catch (...) {
                 tasks.clear();
                 std::move(handler)(std::current_exception());

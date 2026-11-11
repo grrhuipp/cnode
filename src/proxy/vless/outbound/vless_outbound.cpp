@@ -10,7 +10,6 @@
 #include "app/proxyman/outbound/handler.hpp"
 #include "infra/json.hpp"
 #include "app/relay.hpp"
-#include "common/allocator.hpp"
 #include "common/buffer_util.hpp"
 #include "common/buf/multi_buffer.hpp"
 #include "common/buf/length_prefixed_packet_buffer.hpp"
@@ -144,7 +143,7 @@ public:
         , udp_target_(udp_target)
         , packet_addr_(packet_addr) {
         if (is_udp_) {
-            io_state_.emplace<::vless::UdpFramer>(control.Pool(), packet_addr);
+            io_state_.emplace<::vless::UdpFramer>(packet_addr);
         } else if (vision) {
             io_state_.emplace<VisionIoState>(reader_, writer_, user_uuid);
         }
@@ -290,7 +289,7 @@ public:
                 const TargetAddress& src = header->has_target
                     ? header->target
                     : udp_target_;
-                if (!buf::SetUdpTarget(payload, src, stream_.Pool())) {
+                if (!buf::SetUdpTarget(payload, src)) {
                     throw std::bad_alloc();
                 }
                 co_return payload;
@@ -476,7 +475,7 @@ SendVlessHandshake(
                 co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
             }
             encrypted_io.emplace(
-                stream.Pool(), protocol_reader, protocol_writer, std::move(*runtime));
+                protocol_reader, protocol_writer, std::move(*runtime));
             active_reader = &encrypted_io->plain_reader;
             active_writer = &encrypted_io->writer;
         } catch (...) {
@@ -762,9 +761,8 @@ const bool kVlessRegistered = (::proxyman::outbound::RegisterProxy(
                 +[](std::string_view,
                     std::shared_ptr<const ::VlessOutboundConfig> cfg_state,
                     ::net::io_context& /*io_context*/,
-                    ::AwaitableTaskGroup& /*tasks*/,
-                    memory::worker_memory& pool) -> std::unique_ptr<::Outbound> {
-                    return memory::MakeUnique<::proxy::vless::outbound::Handler>(pool,
+                    ::AwaitableTaskGroup& /*tasks*/) -> std::unique_ptr<::Outbound> {
+                    return std::make_unique<::proxy::vless::outbound::Handler>(
                         std::move(cfg_state));
                 }>(std::move(vless_config)),
             .sender = std::move(next_hop->sender),

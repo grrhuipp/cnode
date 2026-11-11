@@ -20,15 +20,14 @@ void Require(bool condition, const char* what) {
 }
 
 TEST(NativeSocketHandoff, TcpStaticBoundaryDetachAndRestorePreservesPrefixAndStream) {
-    // io_b runs on this thread, io_a on thread_a: one pool per running thread.
-    memory::worker_memory pool_b, pool_a;
+    // io_b runs on this thread, io_a on thread_a; only detached native state crosses.
     net::io_context io_b, io_a;
     tcp::acceptor acceptor(io_b, {net::ip::address_v4::loopback(), 0});
     tcp::socket client_sock(io_b), server_sock(io_b);
     client_sock.connect(acceptor.local_endpoint());
     acceptor.accept(server_sock);
 
-    auto server_stream = memory::MakeUnique<TcpStream>(pool_b, pool_b, std::move(server_sock));
+    auto server_stream = std::make_unique<TcpStream>(std::move(server_sock));
     const std::string payload = "POST /fixture/s1 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello";
     net::write(client_sock, net::buffer(payload));
 
@@ -47,7 +46,7 @@ TEST(NativeSocketHandoff, TcpStaticBoundaryDetachAndRestorePreservesPrefixAndStr
     auto restore_fut = net::co_spawn(
         io_a,
         [&, state = std::move(*detached)]() mutable -> net::awaitable<void> {
-            auto restored = TcpStream::RestoreFromHandoff(pool_a, io_a, std::move(state));
+            auto restored = TcpStream::RestoreFromHandoff(io_a, std::move(state));
             Require(restored != nullptr, "TCP RestoreFromHandoff failed");
             std::array<uint8_t, 128> buf{};
             while (received.size() < payload.size()) {
@@ -79,7 +78,6 @@ TEST(NativeSocketHandoff, TlsStaticBoundaryDetachAndRestorePreservesSessionAndPl
     auto client_ctx = SslContext::CreateClient(tls_cfg);
     Require(server_ctx && client_ctx, "failed to create TLS contexts");
 
-    memory::worker_memory pool_b, pool_a;
     net::io_context io_b, io_a;
     tcp::acceptor acceptor(io_b, {net::ip::address_v4::loopback(), 0});
     tcp::socket raw_client(io_b), raw_server(io_b);
@@ -96,7 +94,7 @@ TEST(NativeSocketHandoff, TlsStaticBoundaryDetachAndRestorePreservesSessionAndPl
         io_b,
         [&]() -> net::awaitable<void> {
             client_tls = co_await WrapTlsClient(
-                memory::MakeUnique<TcpStream>(pool_b, pool_b, std::move(raw_client)), *client_ctx, "localhost");
+                std::make_unique<TcpStream>(std::move(raw_client)), *client_ctx, "localhost");
             Require(client_tls != nullptr, "client TLS handshake failed");
             co_await client_tls->AsyncWrite(net::buffer(payload));
         },
@@ -106,7 +104,7 @@ TEST(NativeSocketHandoff, TlsStaticBoundaryDetachAndRestorePreservesSessionAndPl
         io_b,
         [&]() -> net::awaitable<void> {
             server_tls = co_await WrapTlsServer(
-                memory::MakeUnique<TcpStream>(pool_b, pool_b, std::move(raw_server)), *server_ctx);
+                std::make_unique<TcpStream>(std::move(raw_server)), *server_ctx);
             Require(server_tls != nullptr, "server TLS handshake failed");
             prefix_n = co_await server_tls->AsyncRead(net::buffer(prefix));
         },
@@ -125,7 +123,7 @@ TEST(NativeSocketHandoff, TlsStaticBoundaryDetachAndRestorePreservesSessionAndPl
     auto restore_fut = net::co_spawn(
         io_a,
         [&, state = std::move(*detached)]() mutable -> net::awaitable<void> {
-            auto restored = TlsStream::RestoreFromHandoff(pool_a, io_a, std::move(state));
+            auto restored = TlsStream::RestoreFromHandoff(io_a, std::move(state));
             Require(restored != nullptr, "TLS RestoreFromHandoff failed");
             std::array<uint8_t, 128> buf{};
             while (received.size() < payload.size()) {

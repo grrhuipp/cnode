@@ -10,13 +10,13 @@
 #include "app/proxyman/inbound/user_store.hpp"
 #include "infra/config_types.hpp"
 #include "infra/log.hpp"
-#include "common/allocator.hpp"
 #include "common/initial_payload.hpp"
 #include "common/session.hpp"
 #include "common/buf/multi_buffer.hpp"
 #include "transport/link.hpp"
 #include <array>
 #include <openssl/crypto.h>
+#include <memory>
 #include <span>
 #include <tl/expected.hpp>
 #include <optional>
@@ -240,13 +240,12 @@ const bool kTrojanInboundRegistered = [] {
         [](::proxyman::inbound::ProtocolRuntime& runtime,
            ::StatsShard& stats,
            ::ConnectionLimiter* limiter,
-           const ::proxyman::inbound::BuildRequest&,
-           memory::worker_memory& pool) -> std::unique_ptr<::Inbound> {
+           const ::proxyman::inbound::BuildRequest&) -> std::unique_ptr<::Inbound> {
             auto* tracker = runtime.OnlineTracker();
             if (!tracker) {
                 return nullptr;
             }
-            return memory::MakeUnique<::proxy::trojan::inbound::Handler>(pool,
+            return std::make_unique<::proxy::trojan::inbound::Handler>(
                 *tracker,
                 stats,
                 limiter);

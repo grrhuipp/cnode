@@ -75,7 +75,7 @@ public:
             }
         };
         std::shared_ptr<Stream> shared(stream.get(), DeleteAfterCommit{},
-                                      memory::Allocator<Stream>(stream->Pool().resource()));
+                                      memory::Allocator<Stream>());
         std::get_deleter<DeleteAfterCommit>(shared)->committed = true;
         (void)stream.release();
         current_ = std::move(shared);
@@ -264,8 +264,7 @@ struct XHttpSessionTableEntry;
 
 // Execution-group-local logical XHTTP session joining uploads to one downlink.
 // Queued packets and in-flight uploads share one bounded payload budget.
-class XHttpPacketUpSession final : public memory::WorkerAllocated,
-                                   private transport::CancellationSubscription {
+class XHttpPacketUpSession final : private transport::CancellationSubscription {
 public:
     explicit XHttpPacketUpSession(net::io_context& io_context);
     ~XHttpPacketUpSession() noexcept;
@@ -393,14 +392,13 @@ enum class XHttpSessionAccess : uint8_t {
 // Configuration namespace + id select a session on the Worker's session table.
 // Retirement is allocation-free and reserves its own metadata queue node;
 // the next lookup drains events, never scans the live table.
-// Limits: 1024 live entries per Worker, 65536 live directory records per pool,
+// Limits: 1024 live entries per Worker, 65536 live directory records per group,
 // and the most recent 1024 ended ids in each bounded FIFO replay window.
 [[nodiscard]] net::awaitable<std::shared_ptr<XHttpPacketUpSession>> GetXHttpPacketSession(
     net::io_context& io_context,
     std::string_view session_namespace,
     std::string_view session_id,
-    XHttpSessionAccess access,
-    memory::worker_memory& pool);
+    XHttpSessionAccess access);
 
 // Teardown joins upload-response readers before releasing their Worker's
 // transport hosts. Standalone callers pass their io_context.

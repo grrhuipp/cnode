@@ -56,10 +56,9 @@ PreparedOutboundConfig MakeConfig(std::string tag, Probe& probe) {
         .create = ::proxyman::outbound::MakePreparedOutboundCreator<
             Probe*,
             +[](std::string_view, std::shared_ptr<Probe* const> probe,
-                ::net::io_context&, ::AwaitableTaskGroup&,
-                memory::worker_memory& pool)
+                ::net::io_context&, ::AwaitableTaskGroup&)
                 -> std::unique_ptr<::Outbound> {
-                return memory::MakeUnique<CountingOutbound>(pool, **probe);
+                return std::make_unique<CountingOutbound>(**probe);
             }>(&probe),
     };
 }
@@ -67,7 +66,6 @@ PreparedOutboundConfig MakeConfig(std::string tag, Probe& probe) {
 using InboundRegistry = ::proxyman::inbound::HandlerRegistry;
 
 int Run() {
-    memory::worker_memory pool;
     ::net::io_context io;
     // Lookup tests never resolve names; one inert endpoint satisfies DNSWorker.
     ::app::dns::Config dns_config{
@@ -79,7 +77,7 @@ int Run() {
     Probe first_probe;
     Probe second_probe;
     OutboundConfiguration configuration({MakeConfig("direct", first_probe)});
-    HandlerLookup lookup(pool, configuration, io, dns, std::chrono::seconds(1), tasks.Tasks());
+    HandlerLookup lookup(configuration, io, dns, std::chrono::seconds(1), tasks.Tasks());
 
     // Lazy per-domain instantiation, memoized until the tag is republished.
     if (first_probe.created != 0) return 1;
@@ -89,7 +87,7 @@ int Run() {
     if (lookup.GetHandler("") || lookup.GetHandler("missing")) return 4;
 
     // Dispatch reaches the protocol exactly once, with the handler's dialer.
-    ::session::Context ctx(pool);
+    ::session::Context ctx;
     ::TimeoutsConfig timeouts;
     ::StatsShard stats;
     ::RelayConfig relay;

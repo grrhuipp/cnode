@@ -281,7 +281,7 @@ int io_fault_kind = 0;
 // The migration regression uses actual TCP sockets and the production native
 class Stream final : public AsyncStream {
 public:
-    Stream(memory::worker_memory& pool, std::shared_ptr<Wire> wire) : AsyncStream(pool), wire_(std::move(wire)) {}
+    explicit Stream(std::shared_ptr<Wire> wire) : wire_(std::move(wire)) {}
     ~Stream() override {
         if (wire_->active_reads != 0) std::terminate();
         wire_->destroyed = true;
@@ -411,8 +411,6 @@ private:
 
 class Client final : public transport::MultiBufferReader, public transport::MultiBufferWriter {
 public:
-    explicit Client(memory::worker_memory& worker_pool) : pool(worker_pool) {}
-    memory::worker_memory& pool;
     transport::CancellationSource source;
     size_t received = 0;
     int active_reads = 0;
@@ -432,7 +430,7 @@ public:
     }
     transport::CancellationSource& Cancellation() noexcept override { return source; }
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
-        co_return co_await WriteBuffersAsMultiBuffer(buffers, pool);
+        co_return co_await WriteBuffersAsMultiBuffer(buffers);
     }
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer bytes) override {
         if (queue_scenario && queue_scenario->mode >= 13 && !queue_scenario->consumer_started) {
@@ -476,7 +474,7 @@ public:
 // Only the external dial boundary is replaced. The production target builder,
 // Handler, codec, session pool, logical endpoint and relay execute unchanged.
 
-net::awaitable<DialResult> DialOutboundTransport(net::io_context& io, session::Context& ctx,
+net::awaitable<DialResult> DialOutboundTransport(net::io_context& io, session::Context&,
                                                 const OutboundTransportTarget&) {
     auto wire = std::make_shared<Wire>(io);
     wire->fail_settings = fail_first_session && dialed.empty();
@@ -488,7 +486,7 @@ net::awaitable<DialResult> DialOutboundTransport(net::io_context& io, session::C
     if (dialed.empty()) { wire->io_fault_mode = io_fault_mode; wire->io_fault_kind = io_fault_kind; }
     dialed.push_back(wire);
     DialResult result;
-    result.stream = memory::MakeUnique<Stream>(ctx.pool, ctx.pool, wire);
+    result.stream = std::make_unique<Stream>(wire);
     co_return result;
 }
 
@@ -525,7 +523,6 @@ OutboundServer LoopbackServer() {
 }
 
 bool RunClientPadding() {
-    memory::worker_memory pool;
     net::io_context io;
     app::dns::Config dns_config;
     dns_config.servers = {{net::ip::address_v4::loopback(), 1}};
@@ -539,8 +536,8 @@ bool RunClientPadding() {
     settings.idle_session_timeout = 60s;
     settings.min_idle_sessions = 1;
     auto make_handler = [&] {
-        return memory::MakeUnique<proxy::anytls::outbound::Handler>(
-            pool, pool, "same-client-tag", io,
+        return std::make_unique<proxy::anytls::outbound::Handler>(
+            "same-client-tag", io,
             std::make_shared<const proxy::anytls::outbound::Settings>(settings),
             tasks.Tasks());
     };
@@ -549,9 +546,8 @@ bool RunClientPadding() {
     fail_first_session = respond_on_auth = false;
     io_fault_mode = io_fault_kind = 0;
     client_padding_probe = true;
-    std::array<Client, 4> clients{Client(pool), Client(pool), Client(pool), Client(pool)};
-    std::array<session::Context, 4> contexts{
-        session::Context(pool), session::Context(pool), session::Context(pool), session::Context(pool)};
+    std::array<Client, 4> clients;
+    std::array<session::Context, 4> contexts;
     std::array<net::cancellation_signal, 4> cancellations;
     std::array<bool, 4> done{};
     std::array<bool, 4> failed{};
@@ -627,7 +623,6 @@ bool RunClientPadding() {
 }
 
 bool RunOpenOrder(int mode, bool before) {
-    memory::worker_memory pool;
     net::io_context io;
     app::dns::Config dns_config;
     dns_config.servers = {{net::ip::address_v4::loopback(), 1}};
@@ -643,7 +638,7 @@ bool RunOpenOrder(int mode, bool before) {
     OpenOrderScenario scenario{.mode = mode, .before_write_completion = before};
     open_order_scenario = &scenario;
     dialed.clear();
-    auto handler = memory::MakeUnique<proxy::anytls::outbound::Handler>(pool, pool, "open-order", io,
+    auto handler = std::make_unique<proxy::anytls::outbound::Handler>("open-order", io,
         std::make_shared<const proxy::anytls::outbound::Settings>(settings),
         tasks.Tasks());
     auto request = [&](Client& client, session::Context& ctx) -> net::awaitable<OutboundProcessResult> {
@@ -656,8 +651,8 @@ bool RunOpenOrder(int mode, bool before) {
         co_return co_await handler->Process(ctx,
             {&client, &client, nullptr}, outbound.dialer, timeouts, stats, config, {}, 10s, 10s);
     };
-    Client warm(pool), tested(pool), recovery(pool);
-    session::Context warm_ctx(pool), tested_ctx(pool), recovery_ctx(pool);
+    Client warm, tested, recovery;
+    session::Context warm_ctx, tested_ctx, recovery_ctx;
     bool warm_done = false, done = false, recovery_done = false;
     ErrorCode observed = ErrorCode::OK;
     std::exception_ptr failure;
@@ -717,7 +712,6 @@ bool RunOpenOrder(int mode, bool before) {
 }
 
 bool RunQueue(int mode, unsigned seed = 1) {
-    memory::worker_memory pool;
     net::io_context io;
     QueueScenario queue;
     queue.mode = mode;
@@ -766,7 +760,7 @@ bool RunQueue(int mode, unsigned seed = 1) {
     settings.idle_session_check_interval = 1s;
     settings.idle_session_timeout = 60s;
     settings.min_idle_sessions = 1;
-    auto handler = memory::MakeUnique<proxy::anytls::outbound::Handler>(pool, pool, "queue", io,
+    auto handler = std::make_unique<proxy::anytls::outbound::Handler>("queue", io,
         std::make_shared<const proxy::anytls::outbound::Settings>(settings),
         tasks.Tasks());
     queue_scenario = &queue;
@@ -775,9 +769,9 @@ bool RunQueue(int mode, unsigned seed = 1) {
     io_fault_mode = io_fault_kind = 0;
     memory::detail::test_buffers_peak = BufferCount();
     failed_allocation_size = 0;
-    Client client(pool);
+    Client client;
     auto control_wire = std::make_shared<Wire>(io);
-    Stream control(pool, control_wire);
+    Stream control(control_wire);
     const bool use_control = mode == 0 || mode == 10 || mode == 11;
     struct RequestTimeout final : TimeoutEvent {
         explicit RequestTimeout(Client& client) : client(client) {}
@@ -785,7 +779,7 @@ bool RunQueue(int mode, unsigned seed = 1) {
         Client& client;
     } request_timeout(client);
     if (mode == 15) (void)TimeoutScheduler::ForIoContext(io).ScheduleAfter(1s, request_timeout);
-    session::Context ctx(pool);
+    session::Context ctx;
     ctx.outbound.target = TargetAddress("192.0.2.1", 443);
     ctx.content.network = mode == 10 || mode == 11 ? Network::UDP : Network::TCP;
     StatsShard stats;
@@ -856,7 +850,6 @@ bool RunQueue(int mode, unsigned seed = 1) {
 }
 
 bool RunIoFault(int mode, int kind) {
-    memory::worker_memory pool;
     net::io_context io;
     app::dns::Config dns_config;
     dns_config.servers = {{net::ip::make_address("127.0.0.1"), 53}};
@@ -869,7 +862,7 @@ bool RunIoFault(int mode, int kind) {
     settings.idle_session_check_interval = 1s;
     settings.idle_session_timeout = 60s;
     settings.min_idle_sessions = 1;
-    auto handler = memory::MakeUnique<proxy::anytls::outbound::Handler>(pool, pool, "io-fault", io,
+    auto handler = std::make_unique<proxy::anytls::outbound::Handler>("io-fault", io,
         std::make_shared<const proxy::anytls::outbound::Settings>(settings),
         tasks.Tasks());
     dialed.clear();
@@ -878,7 +871,7 @@ bool RunIoFault(int mode, int kind) {
     io_fault_mode = mode;
     io_fault_kind = kind;
     auto control_wire = std::make_shared<Wire>(io);
-    Stream control(pool, control_wire);
+    Stream control(control_wire);
     auto request = [&](Client& client, session::Context& ctx, bool first) -> net::awaitable<OutboundProcessResult> {
         ctx.outbound.target = TargetAddress("192.0.2.1", 443);
         ctx.content.network = first && mode == 4 ? Network::UDP : Network::TCP;
@@ -888,7 +881,7 @@ bool RunIoFault(int mode, int kind) {
         config.uplink_only = config.downlink_only = 5s;
         buf::MultiBuffer payload;
         if (first && (mode == 3 || mode == 4)) {
-            buf::BufferGuard block{buf::Buffer::New(ctx.pool)};
+            buf::BufferGuard block{buf::Buffer::New()};
             if (!block) throw std::bad_alloc();
             std::memcpy(block->Tail().data(), "abc", 3);
             block->Produce(3);
@@ -903,9 +896,9 @@ bool RunIoFault(int mode, int kind) {
     // exception escapes Process unchanged; unknown physical reads are INTERNAL.
     const ErrorCode expected = kind == 1 ? ErrorCode::RESOURCE_EXHAUSTED : kind == 2 ? ErrorCode::BLOCKED :
         mode >= 3 ? ErrorCode::RELAY_WRITE_FAILED : ErrorCode::INTERNAL;
-    Client first(pool), second(pool);
+    Client first, second;
     first.eof = mode == 5;
-    session::Context first_ctx(pool), second_ctx(pool);
+    session::Context first_ctx, second_ctx;
     bool first_done = false, second_done = false;
     bool request_joined = false;
     ErrorCode observed = ErrorCode::OK;
@@ -953,7 +946,6 @@ bool RunIoFault(int mode, int kind) {
 }
 
 bool Run(int mode) {
-    memory::worker_memory pool;
     net::io_context io;
     app::dns::Config dns_config;
     dns_config.servers = {{net::ip::make_address("127.0.0.1"), 53}};
@@ -966,8 +958,8 @@ bool Run(int mode) {
     settings.idle_session_check_interval = 1s;
     settings.idle_session_timeout = 60s;
     settings.min_idle_sessions = 1;
-    auto handler = memory::MakeUnique<proxy::anytls::outbound::Handler>(
-        pool, pool, "test", io,
+    auto handler = std::make_unique<proxy::anytls::outbound::Handler>(
+        "test", io,
         std::make_shared<const proxy::anytls::outbound::Settings>(settings),
         tasks.Tasks());
     dialed.clear();
@@ -984,8 +976,8 @@ bool Run(int mode) {
         co_return co_await handler->Process(ctx,
             {&client, &client, nullptr}, outbound.dialer, timeouts, stats, config, {}, 10s, 10s);
     };
-    Client first(pool), second(pool);
-    session::Context ctx_first(pool), ctx_second(pool);
+    Client first, second;
+    session::Context ctx_first, ctx_second;
     bool first_done = false, second_done = false;
     OutboundProcessResult first_result, second_result;
     std::exception_ptr failure;
@@ -1048,7 +1040,6 @@ bool Run(int mode) {
 // waits for their cleanup; a Worker join with a live Handler cancels its idle
 // loops and later admissions fail instead of starting unowned work.
 bool RunPoolLifecycle(bool join_before_retirement) {
-    memory::worker_memory pool;
     net::io_context io;
     app::dns::Config dns_config;
     dns_config.servers = {{net::ip::make_address("127.0.0.1"), 53}};
@@ -1061,7 +1052,7 @@ bool RunPoolLifecycle(bool join_before_retirement) {
     settings.idle_session_check_interval = 1s;
     settings.idle_session_timeout = 1s;
     settings.min_idle_sessions = 1;
-    auto handler = memory::MakeUnique<proxy::anytls::outbound::Handler>(pool, pool, "pool", io,
+    auto handler = std::make_unique<proxy::anytls::outbound::Handler>("pool", io,
         std::make_shared<const proxy::anytls::outbound::Settings>(settings),
         tasks.Tasks());
     dialed.clear();
@@ -1077,9 +1068,8 @@ bool RunPoolLifecycle(bool join_before_retirement) {
         co_return co_await handler->Process(ctx,
             {&client, &client, nullptr}, outbound.dialer, timeouts, stats, config, {}, 10s, 10s);
     };
-    std::array<Client, 3> clients{Client(pool), Client(pool), Client(pool)};
-    std::array<session::Context, 3> contexts{
-        session::Context(pool), session::Context(pool), session::Context(pool)};
+    std::array<Client, 3> clients;
+    std::array<session::Context, 3> contexts;
     std::array<bool, 3> succeeded{};
     std::array<bool, 3> threw{};
     auto start = [&](size_t index) {
@@ -1139,7 +1129,6 @@ bool RunPoolLifecycle(bool join_before_retirement) {
 }
 
 bool RunDomainPoolIsolation() {
-    memory::worker_memory pool;
     net::io_context io;
     auto coordinator = std::make_shared<GroupCoordinator>(io, 2);
     coordinator->RegisterWorker(0, io);
@@ -1153,16 +1142,15 @@ bool RunDomainPoolIsolation() {
     settings.server = LoopbackServer();
     settings.idle_session_check_interval = 60s;
     settings.idle_session_timeout = 60s;
-    auto handler = memory::MakeUnique<proxy::anytls::outbound::Handler>(pool, pool, "isolation", io,
+    auto handler = std::make_unique<proxy::anytls::outbound::Handler>("isolation", io,
         std::make_shared<const proxy::anytls::outbound::Settings>(settings), tasks->Tasks());
     OpenOrderScenario scenario{.mode = 0, .before_write_completion = false};
     open_order_scenario = &scenario;
     fail_first_session = respond_on_auth = client_padding_probe = false;
     io_fault_mode = io_fault_kind = 0;
     dialed.clear();
-    std::array<Client, 4> clients{Client(pool), Client(pool), Client(pool), Client(pool)};
-    std::array<session::Context, 4> contexts{
-        session::Context(pool), session::Context(pool), session::Context(pool), session::Context(pool)};
+    std::array<Client, 4> clients;
+    std::array<session::Context, 4> contexts;
     std::array<bool, 4> done{};
     auto request = [&](size_t index) -> net::awaitable<OutboundProcessResult> {
         contexts[index].outbound.target = TargetAddress("192.0.2.1", 443);

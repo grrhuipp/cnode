@@ -44,8 +44,7 @@ void TestIO(CountingResource& resource) {
     ::tcp::socket socket(io), peer(io);
     socket.connect(acceptor.local_endpoint());
     acceptor.accept(peer);
-    ::memory::worker_memory pool;
-    ::TcpStream stream(pool, std::move(socket));
+    ::TcpStream stream(std::move(socket));
     constexpr size_t count = 128;
     size_t completed = 0;
     std::exception_ptr error;
@@ -101,8 +100,7 @@ void TestReadCancellation(CountingResource& resource, bool multi_buffer) {
     ::tcp::socket socket(io), peer(io);
     socket.connect(acceptor.local_endpoint());
     acceptor.accept(peer);
-    ::memory::worker_memory pool;
-    ::TcpStream stream(pool, std::move(socket));
+    ::TcpStream stream(std::move(socket));
     net::cancellation_signal signal;
     net::steady_timer timer(io, 5ms);
     bool completed = false, cancelled = false;
@@ -139,8 +137,7 @@ void TestPrivateAllocatorIsolation(CountingResource& resource) {
     ::tcp::socket socket(io), peer(io);
     socket.connect(acceptor.local_endpoint());
     acceptor.accept(peer);
-    ::memory::worker_memory pool;
-    ::TcpStream stream(pool, std::move(socket));
+    ::TcpStream stream(std::move(socket));
     net::cancellation_signal signal;
     net::steady_timer timer(io, 5ms);
     bool cancelled = false;
@@ -159,20 +156,19 @@ void TestPrivateAllocatorIsolation(CountingResource& resource) {
             "native operation initiation must not consult the private allocation resource");
 }
 
-void TestQueuedReadinessIsolation() {
+void TestQueuedReadinessIsolation(CountingResource& resource) {
     using namespace ::memory;
     net::io_context reactor;
     ::tcp::acceptor acceptor(reactor, {net::ip::address_v4::loopback(), 0});
     ::tcp::socket socket(reactor), peer(reactor);
     socket.connect(acceptor.local_endpoint());
     acceptor.accept(peer);
-    worker_memory pool;
     ::buf::Buffer* payload = nullptr;
     bool consumed = false;
     {
-        payload = ::buf::Buffer::New(pool);
+        payload = ::buf::Buffer::New();
         Require(payload != nullptr, "payload allocation failed");
-        const auto outstanding = pool.OutstandingAllocations();
+        const auto allocations = resource.allocations;
         socket.async_wait(::tcp::socket::wait_read,
             net::bind_allocator(ProcessAllocator<std::byte>{},
                 [&](::IoErrorCode ec) {
@@ -183,8 +179,8 @@ void TestQueuedReadinessIsolation() {
                     ::buf::Buffer::Free(payload);
                     payload = nullptr;
                 }));
-        Require(pool.OutstandingAllocations() == outstanding,
-                "queued operation must not borrow the worker pool");
+        Require(resource.allocations == allocations,
+                "queued operation must not consult the private PMR resource");
     }
     const char value = 'q';
     peer.write_some(net::buffer(&value, 1));
@@ -214,7 +210,7 @@ TEST(AsioOperationAllocator, Contract) {
         TestReadCancellation(resource, false);
         TestReadCancellation(resource, true);
         TestPrivateAllocatorIsolation(resource);
-        TestQueuedReadinessIsolation();
+        TestQueuedReadinessIsolation(resource);
         TestPendingOperationDestruction();
         Require(resource.live == 0 && !resource.wrong_thread,
                 "all private scheduler allocations must be released on their owner");

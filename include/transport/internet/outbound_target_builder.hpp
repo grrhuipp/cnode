@@ -189,7 +189,7 @@ public:
     Dial(session::Context& ctx, std::span<const net::ip::address> addresses, uint16_t port);
 
     // Native UDP association: selects the sendThrough bind address, constructs
-    // Endpoint(pool, io_context, dns, bind_address, args...) and records the egress.
+    // Endpoint(io_context, dns, bind_address, args...) and records the egress.
     template <typename Endpoint, typename... Args>
     [[nodiscard]] tl::expected<void, ErrorCode> OpenDatagram(
         session::Context& ctx, const DatagramRemote& remote,
@@ -197,7 +197,7 @@ public:
         auto bind = SelectDatagramBind(ctx, remote);
         if (!bind) return tl::unexpected(bind.error());
         try {
-            endpoint.emplace(ctx.pool, IoContext(), dns_, *bind, std::forward<Args>(args)...);
+            endpoint.emplace(IoContext(), dns_, *bind, std::forward<Args>(args)...);
         } catch (const transport::LinkError& error) {
             ReportDatagramFailure(ctx, *bind, error.what());
             return tl::unexpected(error.code());

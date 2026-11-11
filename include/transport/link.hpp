@@ -159,9 +159,9 @@ public:
     virtual bool WriteShutdownClosesLink() const noexcept { return false; }
 
 protected:
-    // Copies borrowed spans into Buffers of `pool`, then writes them as one batch.
+    // Copies borrowed spans into Buffers, then writes them as one batch.
     net::awaitable<void> WriteBuffersAsMultiBuffer(
-        std::span<const net::const_buffer> buffers, memory::worker_memory& pool) {
+        std::span<const net::const_buffer> buffers) {
         buf::MultiBuffer payload;
         for (const auto& buffer : buffers) {
             if (buffer.size() == 0) {
@@ -170,7 +170,7 @@ protected:
             const auto bytes = std::span<const uint8_t>(
                 static_cast<const uint8_t*>(buffer.data()),
                 buffer.size());
-            if (!buf::AppendSpanToMultiBuffer(bytes, payload, pool)) {
+            if (!buf::AppendSpanToMultiBuffer(bytes, payload)) {
                 throw std::bad_alloc();
             }
         }

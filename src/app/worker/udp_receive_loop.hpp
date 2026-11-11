@@ -25,8 +25,7 @@ class UdpReceiveBuffer final {
 public:
     static constexpr size_t kMaxWireBytes = 65535;
 
-    explicit UdpReceiveBuffer(memory::worker_memory& pool) noexcept
-        : pool_(pool), large_(pool.resource()) {}
+    UdpReceiveBuffer() = default;
 
     void Release() noexcept {
         small_ = buf::BufferGuard{};
@@ -45,7 +44,7 @@ public:
                 large_.swap(empty);
             }
             if (!small_) {
-                small_ = buf::BufferGuard{buf::Buffer::New(pool_)};
+                small_ = buf::BufferGuard{buf::Buffer::New()};
                 if (!small_) {
                     return {};
                 }
@@ -77,7 +76,6 @@ public:
     }
 
 private:
-    memory::worker_memory& pool_;
     buf::BufferGuard small_;
     memory::ByteVector large_;
 };
@@ -98,8 +96,7 @@ net::awaitable<void> RunUdpReceiveLoop(
     std::shared_ptr<udp::socket> socket,
     IsOwned is_owned,
     ProcessDatagram process_datagram,
-    uint64_t& resource_drops,
-    memory::worker_memory& pool) {
+    uint64_t& resource_drops) {
     static_assert(std::is_nothrow_invocable_r_v<
         bool, IsOwned&, const std::shared_ptr<udp::socket>&>);
     static_assert(std::is_same_v<std::invoke_result_t<
@@ -109,7 +106,7 @@ net::awaitable<void> RunUdpReceiveLoop(
         IoErrorCode ignored;
         socket->non_blocking(true, ignored);
     }
-    detail::UdpReceiveBuffer receive_buffer(pool);
+    detail::UdpReceiveBuffer receive_buffer;
     while (true) {
         receive_buffer.Release();
         if (!is_owned(socket)) {

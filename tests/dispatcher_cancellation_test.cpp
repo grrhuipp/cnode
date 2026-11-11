@@ -4,6 +4,7 @@
 #include "app/dns/dns.hpp"
 #include "app/relay.hpp"
 #include "app/proxyman/inbound/handler.hpp"
+#include "common/allocator.hpp"
 #include "common/rule.hpp"
 #include "app/proxyman/outbound/handler.hpp"
 #include "app/stats.hpp"
@@ -26,10 +27,10 @@
 namespace {
 using namespace std::chrono_literals;
 
-buf::MultiBuffer Payload(size_t size, memory::worker_memory& pool) {
+buf::MultiBuffer Payload(size_t size) {
     std::vector<uint8_t> bytes(size, 0x42);
     buf::MultiBuffer payload;
-    if (!buf::AppendSpanToMultiBuffer(bytes, payload, pool)) throw std::bad_alloc();
+    if (!buf::AppendSpanToMultiBuffer(bytes, payload)) throw std::bad_alloc();
     return payload;
 }
 
@@ -70,7 +71,7 @@ net::awaitable<void> Wait(State& state) {
 
 class Stream final : public AsyncStream {
 public:
-    Stream(memory::worker_memory& pool, State& state) : AsyncStream(pool), state_(state) {}
+    explicit Stream(State& state) : state_(state) {}
     ~Stream() override {
         state_.destroyed = true;
         if (state_.notify_closed_on_destroy) NotifyClosed();
@@ -85,7 +86,7 @@ public:
         if (state_.allocation_failure) throw std::bad_alloc();
         if (state_.read_error != ErrorCode::OK) throw transport::LinkError(state_.read_error);
         if (state_.block) co_await Wait(state_);
-        co_return Payload(std::exchange(state_.payload_size, 0), Pool());
+        co_return Payload(std::exchange(state_.payload_size, 0));
     }
     void ShutdownWrite() override {}
     void Cancel() noexcept override { NotifyCancellation(); }
@@ -124,7 +125,7 @@ public:
             co_return result;
         }
         if (!probe_.relay) co_return RelayResult{};
-        Stream target(ctx.pool, probe_.target_state);
+        Stream target(probe_.target_state);
         co_return co_await DoRelayLink(dialer.IoContext(), *inbound.reader, *inbound.writer,
             inbound.control, target, ctx, stats, config, std::move(first));
     }
@@ -140,9 +141,8 @@ proxyman::outbound::PreparedOutboundConfig ProbeConfig(std::string tag, Outbound
         .create = proxyman::outbound::MakePreparedOutboundCreator<
             OutboundProbe*,
             +[](std::string_view, std::shared_ptr<OutboundProbe* const> probe,
-                net::io_context&, AwaitableTaskGroup&,
-                memory::worker_memory& pool) -> std::unique_ptr<Outbound> {
-                return memory::MakeUnique<TestOutbound>(pool, **probe);
+                net::io_context&, AwaitableTaskGroup&) -> std::unique_ptr<Outbound> {
+                return std::make_unique<TestOutbound>(**probe);
             }>(&probe),
     };
 }
@@ -157,11 +157,11 @@ struct OutboundProbes {
 };
 
 struct Outbounds {
-    Outbounds(memory::worker_memory& pool, OutboundProbes& probes, net::io_context& io, app::dns::DNS& dns)
+    Outbounds(OutboundProbes& probes, net::io_context& io, app::dns::DNS& dns)
         : configuration({ProbeConfig("direct", probes.direct),
                          ProbeConfig("second", probes.second)}),
           tasks(io.get_executor()),
-          lookup(pool, configuration, io, dns, std::chrono::seconds(1), tasks.Tasks()) {}
+          lookup(configuration, io, dns, std::chrono::seconds(1), tasks.Tasks()) {}
     proxyman::outbound::OutboundConfiguration configuration;
     ResidentTaskGroup tasks;
     proxyman::outbound::HandlerLookup lookup;
@@ -182,7 +182,6 @@ enum class Case { PreStopped, Sniff, Handshake, RoutingDns, Parent, Pending,
                   RoutedFallback, RuleMatch, PolicyBlockedForce, PolicyBlockedRoute, PolicyAllowed };
 
 bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
-    memory::worker_memory pool;
     net::io_context io;
     app::RequestLoadState load(100, 30);
     State source_state;
@@ -190,7 +189,7 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
     IoErrorCode phase_open_error;
     phase_socket.open(tcp::v4(), phase_open_error);
     if (phase_open_error) throw IoSystemError(phase_open_error);
-    TcpStream phase_stream(pool, std::move(phase_socket));
+    TcpStream phase_stream(std::move(phase_socket));
     source_state.load = &load;
     source_state.block = which == Case::Sniff;
     source_state.allocation_failure = which == Case::SniffMemory;
@@ -198,7 +197,7 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
     source_state.payload_size = 7;
     source_state.notify_closed_on_destroy = controlled &&
         (which == Case::RelayFailure || which == Case::RelayCancelled);
-    auto stream = memory::MakeUnique<Stream>(pool, pool, source_state);
+    auto stream = std::make_unique<Stream>(source_state);
     auto* reader = stream.get();
     OutboundProbes outbounds;
     Router router;
@@ -219,7 +218,7 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
         policy.outbound = routing::RouteWithFallback{"direct"};
     }
     policy.sniffing.enabled = which == Case::Sniff || which == Case::SniffMemory || which == Case::SniffLinkError;
-    session::Context ctx(pool);
+    session::Context ctx;
     ctx.conn_id = 1;
     ctx.inbound.tag = "dispatcher-test";
     ctx.inbound.accounting_key = "panel/fixture/1/";
@@ -254,7 +253,7 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
                         ? "198\\.51\\.100\\.1" : "192\\.0\\.2\\.1"),
                 }}));
     }
-    Outbounds outbound_handlers(pool, outbounds, io, dns);
+    Outbounds outbound_handlers(outbounds, io, dns);
     app::dispatcher::DefaultDispatcher dispatcher(
         router, outbound_handlers.lookup, request_policy, session_tracking, dns, load);
     if (which == Case::PreStopped) reader->Cancellation().Stop(reason);
@@ -353,12 +352,11 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
 }
 
 bool SiblingIsolation(bool controlled) {
-    memory::worker_memory pool;
     net::io_context io;
     app::RequestLoadState load(100, 30);
     State a, b;
-    auto first = memory::MakeUnique<Stream>(pool, pool, a);
-    auto second = memory::MakeUnique<Stream>(pool, pool, b);
+    auto first = std::make_unique<Stream>(a);
+    auto second = std::make_unique<Stream>(b);
     auto* source = first.get();
     OutboundProbes outbounds;
     for (auto* probe : {&outbounds.direct, &outbounds.second}) {
@@ -372,12 +370,12 @@ bool SiblingIsolation(bool controlled) {
     app::dns::Config dns_config{.servers = {dns_peer.local_endpoint()}};
     app::dns::DNSWorker dns_worker(io, dns_config, 8);
     app::dns::DNS dns(dns_worker);
-    Outbounds outbound_handlers(pool, outbounds, io, dns);
+    Outbounds outbound_handlers(outbounds, io, dns);
     app::dispatcher::DefaultDispatcher dispatcher(
         router, outbound_handlers.lookup, request_policy, session_tracking, dns, load);
     routing::DispatchPolicy policy_a{SniffConfig{.enabled = false, .domains_excluded = {}}, routing::ForceOutbound{"direct"}};
     routing::DispatchPolicy policy_b{SniffConfig{.enabled = false, .domains_excluded = {}}, routing::ForceOutbound{"second"}};
-    session::Context ctx_a(pool), ctx_b(pool);
+    session::Context ctx_a, ctx_b;
     ctx_a.outbound.target = ctx_b.outbound.target = TargetAddress("192.0.2.1", 443);
     StatsShard stats;
     TimeoutsConfig timeouts;
@@ -418,25 +416,10 @@ bool SiblingIsolation(bool controlled) {
 }
 
 bool StableAccounting() {
-    struct Resource final : std::pmr::memory_resource {
-        std::pmr::memory_resource* upstream = std::pmr::get_default_resource();
-        bool reject = false;
-        size_t attempts = 0;
-        void* do_allocate(size_t bytes, size_t alignment) override {
-            if (reject) { ++attempts; throw std::bad_alloc(); }
-            return upstream->allocate(bytes, alignment);
-        }
-        void do_deallocate(void* p, size_t bytes, size_t alignment) override {
-            upstream->deallocate(p, bytes, alignment);
-        }
-        bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
-            return this == &other;
-        }
-    } resource;
     struct Restore {
-        std::pmr::memory_resource* previous;
-        ~Restore() { std::pmr::set_default_resource(previous); }
-    } restore{std::pmr::set_default_resource(&resource)};
+        bool previous = memory::reject_next_process_allocation;
+        ~Restore() { memory::reject_next_process_allocation = previous; }
+    } restore;
     app::SessionTrackingState tracking;
     app::SessionTrackingState::ActiveSession old_port, new_port, static_inbound;
     session::Traffic old_traffic, new_traffic, static_traffic;
@@ -457,18 +440,21 @@ bool StableAccounting() {
         uncommitted.users.at(42).download == 28;
     old_traffic.bytes_up += 19;
     new_traffic.bytes_down += 23;
-    resource.reject = true;
+    const auto rejections = memory::rejected_process_allocations;
+    memory::reject_next_process_allocation = true;
     tracking.UnregisterActiveSession(old_port);
     tracking.UnregisterActiveSession(new_port);
     tracking.UnregisterActiveSession(static_inbound);
-    resource.reject = false;
+    const bool teardown_allocation_free = memory::reject_next_process_allocation &&
+        memory::rejected_process_allocations == rejections;
+    memory::reject_next_process_allocation = false;
     // Completion during off-thread persistence must survive committing the
     // older snapshot. This also exercises account address stability on close.
     tracking.CommitTraffic(key, first);
     const auto remaining = tracking.SnapshotTraffic(key);
     tracking.CommitTraffic(key, remaining);
     passed &= remaining.users.at(42).upload == 19 && remaining.users.at(42).download == 23 &&
-        resource.attempts == 0 && tracking.SnapshotTraffic(key).empty() &&
+        teardown_allocation_free && tracking.SnapshotTraffic(key).empty() &&
         tracking.SnapshotTraffic({}).empty();
     tracking.RegisterActiveSession(new_port, key, 42, new_traffic);
     new_traffic.bytes_up = 3;

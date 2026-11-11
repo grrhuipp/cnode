@@ -190,11 +190,10 @@ std::unique_ptr<::Inbound> CreateInbound(
     proxyman::inbound::ProtocolRuntime&,
     StatsShard& stats,
     ConnectionLimiter*,
-    const proxyman::inbound::BuildRequest& request,
-    memory::worker_memory& pool) {
+    const proxyman::inbound::BuildRequest& request) {
     const auto* settings = wire::GetSettings(request);
     if (!settings) return nullptr;
-    return memory::MakeUnique<HysteriaInbound>(pool, stats, settings->version);
+    return std::make_unique<HysteriaInbound>(stats, settings->version);
 }
 
 std::optional<proxyman::inbound::UserSet> BuildUsers(

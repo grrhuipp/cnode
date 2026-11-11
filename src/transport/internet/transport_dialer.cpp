@@ -34,8 +34,7 @@ namespace {
 net::awaitable<DialResult> DialSingleCandidate(
     net::io_context& io_context,
     const OutboundTransportTarget& target,
-    const OutboundDialCandidate& candidate,
-    memory::worker_memory& pool);
+    const OutboundDialCandidate& candidate);
 
 [[nodiscard]] bool IsXHttpSplitOutbound(const OutboundTransportTarget& target) noexcept {
     if (!target.stream_settings || !target.stream_settings->IsXHttp()) {
@@ -160,8 +159,7 @@ protected:
                                  memory::String upload_path,
                                  uint64_t conn_id,
                                  const char* missing_settings_error)
-        : AsyncStream(downlink->Pool())
-        , io_context_(io_context)
+        : io_context_(io_context)
         , downlink_(std::move(downlink))
         , target_(target)
         , candidate_(candidate)
@@ -312,7 +310,7 @@ protected:
         XHttpClientRequestKind kind,
         std::span<const net::const_buffer> payloads) {
         const bool stream_up = kind == XHttpClientRequestKind::StreamUp;
-        auto tcp_result = co_await DialSingleCandidate(io_context_, target_, candidate_, Pool());
+        auto tcp_result = co_await DialSingleCandidate(io_context_, target_, candidate_);
         if (!tcp_result.Ok()) {
             if (tcp_result.error == ErrorCode::DIAL_TIMEOUT) {
                 upload_write_expired_ = true;
@@ -447,7 +445,7 @@ public:
             const auto* data = static_cast<const uint8_t*>(buffer.data());
             if (!buf::AppendSpanToMultiBuffer(
                     std::span<const uint8_t>(data, buffer.size()),
-                    pending_initial_, Pool())) {
+                    pending_initial_)) {
                 throw std::bad_alloc();
             }
             co_return buffer.size();
@@ -807,10 +805,8 @@ private:
 net::awaitable<DialResult> DialSingleCandidate(
     net::io_context& io_context,
     const OutboundTransportTarget& target,
-    const OutboundDialCandidate& candidate,
-    memory::worker_memory& pool) {
+    const OutboundDialCandidate& candidate) {
     return TcpStream::Connect(
-        pool,
         io_context,
         candidate.endpoint,
         candidate.bind_local ? &*candidate.bind_local : nullptr,
@@ -826,7 +822,7 @@ net::awaitable<DialResult> DialAndBuildXHttpRequestCandidate(
     XHttpClientRequestKind kind,
     std::span<const net::const_buffer> packet_payload = {}) {
 
-    auto tcp_result = co_await DialSingleCandidate(io_context, target, candidate, ctx.pool);
+    auto tcp_result = co_await DialSingleCandidate(io_context, target, candidate);
     if (!tcp_result.Ok()) {
         co_return tcp_result;
     }
@@ -868,7 +864,7 @@ net::awaitable<DialResult> DialAndBuildSingleCandidate(
     const OutboundTransportTarget& target,
     const OutboundDialCandidate& candidate) {
 
-    auto tcp_result = co_await DialSingleCandidate(io_context, target, candidate, ctx.pool);
+    auto tcp_result = co_await DialSingleCandidate(io_context, target, candidate);
     if (!tcp_result.Ok()) {
         co_return tcp_result;
     }
@@ -1003,11 +999,9 @@ net::awaitable<DialResult> DialXHttpSplitOutboundTransport(
             "missing xhttp upload candidate");
     }
 
-    auto& pool = downlink->Pool();
     if (mode == XHttpMode::PacketUp) {
         co_return DialResult::Success(
-            memory::MakeUnique<XHttpPacketUpClientStream>(
-                pool,
+            std::make_unique<XHttpPacketUpClientStream>(
                 io_context,
                 std::move(downlink),
                 target,
@@ -1017,8 +1011,7 @@ net::awaitable<DialResult> DialXHttpSplitOutboundTransport(
     }
 
     co_return DialResult::Success(
-        memory::MakeUnique<XHttpSplitClientStream>(
-            pool,
+        std::make_unique<XHttpSplitClientStream>(
             io_context,
             std::move(downlink),
             target,
@@ -1181,7 +1174,7 @@ AttachXHttpDownloadTarget(
 
     // Dial configuration value, not connection state: process layer.
     target.xhttp_download_target =
-        memory::AllocateShared<OutboundTransportTarget>(nullptr, std::move(*download_target));
+        std::make_shared<OutboundTransportTarget>(std::move(*download_target));
     co_return target;
 }
 }  // namespace
